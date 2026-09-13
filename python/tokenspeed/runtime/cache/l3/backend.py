@@ -422,19 +422,36 @@ def _local_checkpoint_code_files(model_dir: str) -> tuple[tuple[str, str], ...]:
 
     Walks package subdirectories so an imported helper such as
     ``model_helpers/attention.py`` cannot keep the L3 checkpoint id after
-    changing KV computation. ``__pycache__`` and hidden directories are
-    skipped; bytecode and VCS metadata are not part of the loaded model.
+    changing KV computation. Directory symlinks are followed the same way
+    Python imports them: two checkpoints that link ``model_helpers`` at
+    different package trees must not share a fingerprint. Real-path
+    identity skips cycles and the filesystem root. ``__pycache__`` and
+    hidden directories are skipped; bytecode and VCS metadata are not
+    part of the loaded model.
     """
 
     found: list[tuple[str, str]] = []
+    seen_real_dirs: set[str] = set()
+    filesystem_root = os.path.abspath(os.sep)
     for dirpath, dirnames, filenames in os.walk(
-        model_dir, topdown=True, onerror=None, followlinks=False
+        model_dir, topdown=True, onerror=None, followlinks=True
     ):
-        dirnames[:] = sorted(
-            name
-            for name in dirnames
-            if name != "__pycache__" and not name.startswith(".")
-        )
+        real_dir = os.path.realpath(dirpath)
+        if real_dir == filesystem_root or real_dir in seen_real_dirs:
+            dirnames[:] = []
+            continue
+        seen_real_dirs.add(real_dir)
+        keep: list[str] = []
+        for name in sorted(
+            entry
+            for entry in dirnames
+            if entry != "__pycache__" and not entry.startswith(".")
+        ):
+            child_real = os.path.realpath(os.path.join(dirpath, name))
+            if child_real == filesystem_root or child_real in seen_real_dirs:
+                continue
+            keep.append(name)
+        dirnames[:] = keep
         rel_dir = os.path.relpath(dirpath, model_dir)
         for name in sorted(filenames):
             if not _is_local_checkpoint_code(name):
@@ -465,7 +482,8 @@ def _local_checkpoint_fingerprint(
     hashed so two Mistral dumps with the same ``consolidated*.safetensors``
     candidates but different shard maps cannot share a namespace.
     Local ``*.py`` is hashed, including files imported from package
-    subdirectories, so two trees with identical JSON/weights but
+    subdirectories and from directory symlinks Python would follow on
+    import, so two trees with identical JSON/weights but
     different ``--trust-remote-code`` configuration modules cannot share
     a namespace. ``--load-format`` selects so a directory that contains
     more than one checkpoint encoding cannot share a namespace across

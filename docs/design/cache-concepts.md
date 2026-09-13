@@ -609,7 +609,10 @@ Its responsibilities:
   weight tensors), local `*.py` including imported package
   subdirectories (`--trust-remote-code` configuration, modeling modules,
   and helpers such as `model_helpers/attention.py` can derive
-  architecture fields that change KV without touching JSON or weights),
+  architecture fields that change KV without touching JSON or weights;
+  directory symlinks are followed the same way Python imports them, with
+  real-path cycle detection so a linked package cannot keep the
+  checkpoint id after its target changes),
   plus only the weight files `--load-format` selects
   (`auto` prefers `*.safetensors`, then `*.bin`, then `*.pt`;
   `sharded_state` hashes the files `model_loader_extra_config["pattern"]`

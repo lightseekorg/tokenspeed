@@ -459,6 +459,66 @@ class StorageKeyTest(unittest.TestCase):
             self.assertTrue(second_id.startswith("local-"))
             self.assertNotEqual(first_id, second_id)
 
+    def test_checkpoint_id_fingerprints_symlinked_custom_code_packages(self):
+        with tempfile.TemporaryDirectory() as root:
+            first_pkg = os.path.join(root, "pkg_a")
+            second_pkg = os.path.join(root, "pkg_b")
+            first_ckpt = os.path.join(root, "ckpt_a")
+            second_ckpt = os.path.join(root, "ckpt_b")
+            os.makedirs(first_pkg)
+            os.makedirs(second_pkg)
+            os.makedirs(first_ckpt)
+            os.makedirs(second_ckpt)
+            with open(os.path.join(first_pkg, "__init__.py"), "w") as handle:
+                handle.write("")
+            with open(os.path.join(first_pkg, "attention.py"), "w") as handle:
+                handle.write("def rotary_dim():\n    return 64\n")
+            with open(os.path.join(second_pkg, "__init__.py"), "w") as handle:
+                handle.write("")
+            with open(os.path.join(second_pkg, "attention.py"), "w") as handle:
+                handle.write("def rotary_dim():\n    return 128\n")
+            for directory, package in (
+                (first_ckpt, first_pkg),
+                (second_ckpt, second_pkg),
+            ):
+                with open(os.path.join(directory, "config.json"), "w") as handle:
+                    handle.write(
+                        '{"model_type":"x","auto_map":{"AutoConfig":"configuration.Config"}}'
+                    )
+                with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
+                    handle.write(b"weights")
+                with open(os.path.join(directory, "configuration.py"), "w") as handle:
+                    handle.write("from model_helpers.attention import rotary_dim\n")
+                os.symlink(package, os.path.join(directory, "model_helpers"))
+            first_id = self._checkpoint_id(
+                first_ckpt,
+                load_format="auto",
+                hf_config=SimpleNamespace(),
+                revision="",
+            )
+            second_id = self._checkpoint_id(
+                second_ckpt,
+                load_format="auto",
+                hf_config=SimpleNamespace(),
+                revision="",
+            )
+            self.assertTrue(first_id.startswith("local-"))
+            self.assertTrue(second_id.startswith("local-"))
+            self.assertNotEqual(first_id, second_id)
+            cycle = os.path.join(root, "cycle")
+            os.makedirs(cycle)
+            with open(os.path.join(cycle, "config.json"), "w") as handle:
+                handle.write("{}")
+            os.symlink(cycle, os.path.join(cycle, "loop"))
+            self.assertTrue(
+                self._checkpoint_id(
+                    cycle,
+                    load_format="auto",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                ).startswith("local-")
+            )
+
     def test_checkpoint_id_uses_selected_load_format_weight_files(self):
         with tempfile.TemporaryDirectory() as directory:
             with open(os.path.join(directory, "config.json"), "w") as handle:
