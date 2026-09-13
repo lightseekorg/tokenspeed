@@ -42,7 +42,7 @@ import threading
 from types import MappingProxyType
 
 import torch
-from tokenspeed_kernel.ops.gemm.triton_gemv import _select, _torch_decode_gemv
+from tokenspeed_kernel.ops.gemm.triton_gemv import _select, torch_decode_gemv
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -721,7 +721,7 @@ def _skinny_config(m: int, n: int, k: int):
     return shape_dynamic_skinny_gemm.default_config(m, n, k)
 
 
-def skinny_gemv(
+def cute_dsl_skinny_gemv(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
 ) -> torch.Tensor:
     """``x @ weight.T`` via the vendored CuTe skinny GEMM.
@@ -750,15 +750,15 @@ def skinny_gemv(
         or x.dtype != torch.bfloat16
         or not _usable_in_capture("skinny", dev, m, n, k)
     ):
-        return _torch_decode_gemv(x, weight, out)
+        return torch_decode_gemv(x, weight, out)
     config = _skinny_config(m, n, k)
     # default_config can emit a config supports() rejects; fall back, don't raise.
     if not shape_dynamic_skinny_gemm.supports(config, m, n, k):
-        return _torch_decode_gemv(x, weight, out)
+        return torch_decode_gemv(x, weight, out)
     # supports() cannot see pointer alignment; the kernel asserts it at launch.
     align = config.vector_width * x.element_size()
     if x.data_ptr() % align or weight.data_ptr() % align:
-        return _torch_decode_gemv(x, weight, out)
+        return torch_decode_gemv(x, weight, out)
     # DLPack refuses requires_grad tensors; detach is a zero-copy view.
     result = shape_dynamic_skinny_gemm(x.detach(), weight.detach(), config, out=out)
     _mark_warmed("skinny", dev, m, n, k)
@@ -786,7 +786,7 @@ def _tgv_bias(n: int, device_index: int) -> torch.Tensor:
     return bias
 
 
-def tgv_gemv(
+def flashinfer_tgv_gemv(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
 ) -> torch.Tensor:
     """``x @ weight.T`` via FlashInfer's TGV low-latency GEMM.
@@ -810,7 +810,7 @@ def tgv_gemv(
         or x.dtype != torch.bfloat16
         or not _usable_in_capture("tgv", dev, m, n, k)
     ):
-        return _torch_decode_gemv(x, weight, out)
+        return torch_decode_gemv(x, weight, out)
     bias = _tgv_bias(n, dev)
     # TGV is CuTe DSL inside FlashInfer: same DLPack no-grad rule.
     result = mm_bf16(
@@ -825,7 +825,7 @@ def tgv_gemv(
     return result
 
 
-def splitk_gemv(
+def flashinfer_splitk_gemv(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
 ) -> torch.Tensor:
     """``x @ weight.T`` via the split-K BF16 GEMM on its measured tactic.
@@ -851,7 +851,7 @@ def splitk_gemv(
         or not _usable_in_capture("splitk", dev, m, n, k)
         or not flashinfer_splitk.supports(m, n, k, tactic)
     ):
-        return _torch_decode_gemv(x, weight, out)
+        return torch_decode_gemv(x, weight, out)
     result = flashinfer_splitk.splitk_mm(
         x, weight, tactic, out, enable_pdl=pdl_enabled()
     )
@@ -859,7 +859,7 @@ def splitk_gemv(
     return result
 
 
-def ll_bf16_gemv(
+def cute_dsl_ll_bf16_gemv(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
 ) -> torch.Tensor:
     """``x @ weight.T`` via the low-latency BF16 GEMM.
@@ -883,7 +883,7 @@ def ll_bf16_gemv(
         or not _usable_in_capture("ll_bf16", dev, m, n, k)
         or not ll_bf16_mm_supported(x, weight)
     ):
-        return _torch_decode_gemv(x, weight, out)
+        return torch_decode_gemv(x, weight, out)
     result = ll_bf16_mm(x.detach(), weight.detach(), out=out)
     _mark_warmed("ll_bf16", dev, m, n, k)
     return result
@@ -944,7 +944,7 @@ def decode_gemv_routed(x: torch.Tensor, weight: torch.Tensor) -> bool:
     # its own spec.
     if not current_platform().is_cdna5 or k < 256:
         return False
-    return _select(m, n, k, True) is not _torch_decode_gemv
+    return _select(m, n, k, True) is not torch_decode_gemv
 
 
 @functools.lru_cache(maxsize=8)
@@ -1048,16 +1048,17 @@ def skinny_gemv_add3(
 
 def _register_route() -> None:
     impls = {
-        "skinny": skinny_gemv,
-        "tgv": tgv_gemv,
-        "ll_bf16": ll_bf16_gemv,
-        "splitk": splitk_gemv,
+        "skinny": cute_dsl_skinny_gemv,
+        "tgv": flashinfer_tgv_gemv,
+        "ll_bf16": cute_dsl_ll_bf16_gemv,
+        "splitk": flashinfer_splitk_gemv,
     }
     for (m, n, k), backend in MEASURED_ROUTE.items():
+        impl = impls[backend]
         register_kernel(
             "gemm",
             "decode_gemv",
-            name=f"{backend}_gemv_m{m}_n{n}_k{k}",
+            name=f"{impl.__name__}_m{m}_n{n}_k{k}",
             solution="flashinfer" if backend in ("tgv", "splitk") else "cute_dsl",
             capability=_CAPABILITY,
             signatures=_BF16_SIG,
@@ -1068,7 +1069,7 @@ def _register_route() -> None:
             },
             # Above the M == 1 rowcta spec so a measured win takes the shape.
             priority=Priority.SPECIALIZED + 2,
-        )(impls[backend])
+        )(impl)
 
 
 _register_route()

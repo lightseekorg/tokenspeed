@@ -351,7 +351,7 @@ def _register_cute_argmax(fn):
 
 
 @_register_cute_argmax
-def _argmax_cute(
+def cute_dsl_argmax(
     logits: torch.Tensor,
     *,
     out: torch.Tensor | None = None,
@@ -422,12 +422,10 @@ def _argmax_pair_cute(
     return out
 
 
-cute_dsl_argmax = _argmax_cute
-
 # Direct CuTe DSL module API. The common runtime-facing API lives in
 # tokenspeed_kernel.ops.sampling and selects among registered solutions.
 if _CUTE_AVAILABLE:
-    argmax = _argmax_cute
+    argmax = cute_dsl_argmax
     argmax_pair = _argmax_pair_cute
     _argmax_kernel_impl = _invoke_kernel
 else:
