@@ -184,7 +184,7 @@ class PlatformInfo:
         """Register host memory that GPU kernels will directly dereference."""
         if tensor.device.type != "cpu" or tensor.numel() == 0:
             return
-        if not self.is_nvidia:
+        if self.is_npu:
             # cudaHostRegister is NVIDIA-only. Ascend NPU kernels do not
             # require CUDA-style host registration.
             return
