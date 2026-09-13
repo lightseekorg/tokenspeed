@@ -21,6 +21,40 @@ from tokenspeed_kernel.platform import current_platform, pdl_enabled
 _ALLREDUCE_FUSION_LANE: torch.Tensor | None = None
 
 
+def _npu_allreduce_residual_rmsnorm(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    rank: int,
+    group: dist.ProcessGroup,
+    eps: float = 1e-6,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Ascend NPU fused add-rmsnorm: hccl all-reduce + residual RMSNorm.
+
+    torch.distributed.all_reduce uses the hccl backend on NPU; the residual
+    addition and RMS normalization run through ``npu_add_rms_norm`` via the
+    platform-routed :func:`tokenspeed_kernel.ops.layernorm.rmsnorm`.
+    """
+    del rank, kwargs  # npu fallback needs no fusion workspace.
+    torch.distributed.all_reduce(input_tensor, group=group)
+    from tokenspeed_kernel.ops.layernorm import rmsnorm
+
+    output, updated_residual = rmsnorm(
+        input_tensor,
+        weight,
+        eps,
+        residual=residual,
+    )
+    return output, updated_residual
+
+
+_platform = current_platform()
+if _platform.is_npu:
+    _allreduce_residual_rmsnorm = _npu_allreduce_residual_rmsnorm
+
+
 def allreduce_fusion_lane(
     like: torch.Tensor,
     width: int,

@@ -28,6 +28,7 @@ from math import prod
 
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.numerics.reference.gemm  # noqa: F401
+import tokenspeed_kernel.ops.gemm.ascend  # noqa: F401
 import tokenspeed_kernel.ops.gemm.cuda  # noqa: F401
 import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.gemm.gluon  # noqa: F401
@@ -165,6 +166,21 @@ def prepare_fp8_linear(
     n, k = weight.shape
     platform = current_platform()
     enable_pdl = pdl_enabled()
+    if platform.is_npu:
+        # Ascend NPU: torch_npu 2.10 cannot materialize FP8 tensors (casts and
+        # in-place copies into FP8 storage fail), so the FP8-linear contract is
+        # served through the dequantized ``npu`` solution: weights stay in
+        # BF16/FP16 and ``npu_mm_fp8_blockscale`` applies the block-scale math.
+        if weight.dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError(
+                "NPU fp8_linear requires dequantized bf16/fp16 weights, "
+                f"got {weight.dtype}"
+            )
+        return _PreparedFp8Linear(
+            override="npu_mm_fp8_blockscale",
+            block_size=(block_n, block_k),
+            prepared_weight_scales=weight_scales,
+        )
     deep_gemm_spec = KernelRegistry.get().get_by_name("deep_gemm_mm_fp8_blockscale")
     scale_requires_transform = (
         scale_format == "ue8m0" and weight_scales.dtype.is_floating_point
@@ -754,6 +770,8 @@ def dsv4_linear_fp32(
 # add instead of passing it to the kernel.
 _KERNELS_WITH_FUSED_BIAS: frozenset[str] = frozenset(
     {
+        "npu_bmm",
+        "npu_mm",
         "torch_bmm",
         "torch_mm",
         "triton_mm_fp8_scaled",

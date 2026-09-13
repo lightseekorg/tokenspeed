@@ -38,9 +38,12 @@ def segmented_rmsnorm(
     eps: float,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Apply independent RMSNorm to the final ``[segments, hidden]`` axes."""
-    if not x.is_cuda or not weight.is_cuda:
-        raise ValueError("segmented_rmsnorm requires CUDA tensors")
+    """Apply independent RMSNorm to the final ``[segments, hidden]`` axes.
+
+    CUDA tensors use the in-tree Triton kernel; NPU/CPU tensors fall back to a
+    portable torch implementation that computes the per-segment variance of the
+    trailing ``[segments, hidden]`` axes.
+    """
     if x.ndim < 2:
         raise ValueError(f"x must have at least 2 dimensions, got {x.ndim}")
     if weight.ndim != 2 or tuple(x.shape[-2:]) != tuple(weight.shape):
@@ -59,18 +62,26 @@ def segmented_rmsnorm(
     if x.numel() == 0:
         return out
 
+    if x.is_cuda and weight.is_cuda:
+        num_segments, hidden_size = weight.shape
+        n_rows = x.numel() // (num_segments * hidden_size)
+        block = triton.next_power_of_2(hidden_size)
+        num_warps = 8 if block >= 4096 else 4
+        _segmented_rmsnorm_kernel[(n_rows, num_segments)](
+            x,
+            weight,
+            out,
+            num_segments,
+            hidden_size,
+            eps,
+            BLOCK=block,
+            num_warps=num_warps,
+        )
+        return out
+
     num_segments, hidden_size = weight.shape
-    n_rows = x.numel() // (num_segments * hidden_size)
-    block = triton.next_power_of_2(hidden_size)
-    num_warps = 8 if block >= 4096 else 4
-    _segmented_rmsnorm_kernel[(n_rows, num_segments)](
-        x,
-        weight,
-        out,
-        num_segments,
-        hidden_size,
-        eps,
-        BLOCK=block,
-        num_warps=num_warps,
-    )
+    x_flat = x.reshape(-1, num_segments, hidden_size)
+    variance = x_flat.float().square().mean(dim=-1, keepdim=True)
+    inv_std = torch.rsqrt(variance + eps).to(x.dtype)
+    out.copy_((x_flat * inv_std * weight).reshape_as(x))
     return out

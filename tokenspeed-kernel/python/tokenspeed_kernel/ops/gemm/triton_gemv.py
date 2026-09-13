@@ -200,9 +200,39 @@ def torch_decode_gemv(
     return x @ weight.t()
 
 
+@register_kernel(
+    "gemm",
+    "decode_gemv",
+    name="decode_gemv_npu",
+    solution="npu",
+    capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+    signatures=_BF16_SIG,
+    traits={},
+    priority=Priority.PORTABLE + 1,
+    tags={"portability", "determinism"},
+)
+def _npu_decode_gemv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``x @ weight.T`` on Ascend NPU (torch.mm is native on the NPU runtime)."""
+    if out is not None:
+        return torch.mm(x, weight.t(), out=out)
+    return x @ weight.t()
+
+
 @functools.lru_cache(maxsize=64)
-def _select(m: int, n: int, k: int, on_cuda: bool):
-    if not on_cuda:
+def _select(m: int, n: int, k: int, on_cuda: bool, on_npu: bool = False):
+    if not on_cuda and not on_npu:
+        return torch_decode_gemv
+    if on_npu:
+        from tokenspeed_kernel.registry import KernelRegistry
+
+        reg = KernelRegistry.get()
+        spec = reg.get_by_name("decode_gemv_npu")
+        if spec is not None:
+            return reg.get_impl(spec.name)
         return torch_decode_gemv
     from tokenspeed_kernel.platform import current_platform
     from tokenspeed_kernel.registry import KernelRegistry
@@ -246,9 +276,13 @@ def decode_gemv(
             raise ValueError(f"out must match x and have shape {expected}")
         if not out.is_contiguous():
             return torch_decode_gemv(x, weight, out)
-    return _select(x.shape[0], weight.shape[0], weight.shape[1], x.is_cuda)(
-        x, weight, out
-    )
+    return _select(
+        x.shape[0],
+        weight.shape[0],
+        weight.shape[1],
+        x.is_cuda,
+        x.device.type == "npu",
+    )(x, weight, out)
 
 
 def rowcta_gemv_add3(

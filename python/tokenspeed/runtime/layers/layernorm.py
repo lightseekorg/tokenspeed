@@ -68,6 +68,26 @@ def _torch_allreduce_residual_rmsnorm(
     return output, updated_residual, None
 
 
+def _torch_rmsnorm_fused_parallel(
+    *,
+    input1: torch.Tensor,
+    weight1: torch.Tensor,
+    output1: torch.Tensor | None,
+    input2: torch.Tensor,
+    weight2: torch.Tensor,
+    output2: torch.Tensor | None,
+    eps: float,
+) -> None:
+    """Portable per-row RMSNorm for two tensors (NPU/CPU fallback)."""
+    for src, weight, dst in (
+        (input1, weight1, output1),
+        (input2, weight2, output2),
+    ):
+        var = src.float().square().mean(dim=-1, keepdim=True)
+        normalized = src * torch.rsqrt(var + eps).to(src.dtype) * weight
+        (dst if dst is not None else src).copy_(normalized)
+
+
 if _is_amd:
     from tokenspeed_kernel.ops.layernorm.triton import (
         rmsnorm_fused_parallel as triton_rmsnorm_fused_parallel,
@@ -257,7 +277,7 @@ class GemmaRMSNorm(torch.nn.Module):
             else:
                 return x
 
-        if _is_amd:
+        if _is_amd or _platform.is_npu:
             if x.shape[0] == 0:
                 if residual is not None:
                     return x, residual
@@ -428,6 +448,16 @@ class FusedRMSNorm(nn.Module):
                 input2=input_kv_a,
                 weight2=self.weight_kv_a,
                 output2=output_kv_a if output_kv_a is not None else input_kv_a,
+                eps=self.q_a_norm.variance_epsilon,
+            )
+        elif _platform.is_npu:
+            _torch_rmsnorm_fused_parallel(
+                input1=input_q_a,
+                weight1=self.weight_q_a,
+                output1=output_q_a,
+                input2=input_kv_a,
+                weight2=self.weight_kv_a,
+                output2=output_kv_a,
                 eps=self.q_a_norm.variance_epsilon,
             )
         else:
