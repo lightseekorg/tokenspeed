@@ -579,7 +579,7 @@ def test_argmax_pair_torch_fallback_on_cpu_tensor():
 def test_public_binding_dispatch_matches_arch():
     """The CuTe module owns only the NVIDIA CuTe direct API."""
     if cute_dsl.is_available():
-        assert cute_dsl.argmax is cute_dsl._argmax_cute
+        assert cute_dsl.argmax is cute_dsl.cute_dsl_argmax
         assert cute_dsl.argmax_pair is cute_dsl._argmax_pair_cute
     else:
         assert cute_dsl.argmax is cute_dsl._argmax_torch_fallback

@@ -90,8 +90,8 @@ if platform.is_nvidia and platform.is_blackwell and _fmha_sm100_importable():
     @register_kernel(
         "attention",
         "msa_extend_with_kvcache",
-        name="msa_minimax_extend_with_kvcache",
-        solution="msa",
+        name="cute_dsl_minimax_msa_extend_with_kvcache",
+        solution="cute_dsl",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
             max_arch_version=ArchVersion(10, 3),
@@ -101,7 +101,7 @@ if platform.is_nvidia and platform.is_blackwell and _fmha_sm100_importable():
         traits=_MINIMAX_MSA_CUTE_TRAITS,
         priority=Priority.SPECIALIZED,
     )
-    def msa_minimax_extend_with_kvcache(
+    def cute_dsl_minimax_msa_extend_with_kvcache(
         q: torch.Tensor,
         index_q: torch.Tensor,
         index_k: torch.Tensor,
