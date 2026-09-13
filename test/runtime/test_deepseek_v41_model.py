@@ -291,11 +291,14 @@ class _Backend:
 
 @pytest.mark.parametrize("device", ["cpu", "cuda:0"])
 @pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize(
     "rank,tp_size,world_size",
     [(0, 1, 1), (0, 4, 4), (1, 4, 4), (2, 4, 4), (3, 4, 4), (0, 1, 4)],
 )
-def test_fp32_lm_head_checkpoint_and_logits(device, fused, rank, tp_size, world_size):
+def test_lm_head_checkpoint_and_logits_follow_model_dtype(
+    device, fused, dtype, rank, tp_size, world_size
+):
     if device != "cpu" and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     config = _config()
@@ -304,7 +307,7 @@ def test_fp32_lm_head_checkpoint_and_logits(device, fused, rank, tp_size, world_
     adapter.mapping = _mapping(rank, tp_size, world_size)
     adapter.model = nn.Module()
     adapter.model.config = config
-    with set_default_torch_dtype(torch.bfloat16), torch.device(device):
+    with set_default_torch_dtype(dtype), torch.device(device):
         adapter.lm_head = adapter.resolve_lm_head(
             SimpleNamespace(text_config=config), _quant(), ""
         )
@@ -318,21 +321,22 @@ def test_fp32_lm_head_checkpoint_and_logits(device, fused, rank, tp_size, world_
     checkpoint[start : start + 2, 0] = 1
     checkpoint[start + 1, 1] = 2**-9
     adapter.load_weights([("head.weight", checkpoint)])
-    local = checkpoint[start : start + head.weight.shape[0]].to(device=device)
-    assert head.weight.dtype == torch.float32
-    torch.testing.assert_close(head.weight, local.float(), rtol=0, atol=0)
+    local = checkpoint[start : start + head.weight.shape[0]].to(
+        device=device, dtype=dtype
+    )
+    assert head.weight.dtype == dtype
+    torch.testing.assert_close(head.weight, local, rtol=0, atol=0)
 
     hidden = torch.ones(1, config.hidden_size, dtype=torch.bfloat16, device=device)
-    rounded = F.linear(hidden, local, bias=None)
-    expected = F.linear(hidden.float(), local.float(), bias=None)
-    assert rounded[0, 0] == rounded[0, 1] == 1
-    assert rounded.argmax(-1).item() == 0
-    assert expected.argmax(-1).item() == 1
+    expected = F.linear(hidden.to(dtype), local, bias=None)
+    # BF16 rounds the near tie; wider dtypes retain the second token's margin.
+    expected_token = 0 if dtype == torch.bfloat16 else 1
+    assert expected.argmax(-1).item() == expected_token
 
     processor = adapter.resolve_logits_processor(SimpleNamespace(text_config=config))
     assert not processor._use_fused_lm_head
-    # Check each real TP shard without collectives, including the fused helper's
-    # FP32 fallback even if that helper is enabled for V4.1 in the future.
+    # Check each real TP shard without collectives, including the fused helper
+    # even if that helper is enabled for V4.1 in the future.
     processor.skip_all_gather = True
     processor._use_fused_lm_head = fused
     output = processor(
@@ -344,9 +348,9 @@ def test_fp32_lm_head_checkpoint_and_logits(device, fused, rank, tp_size, world_
         ),
         aux_hidden_states=None,
     )
-    assert output.next_token_logits.dtype == torch.float32
+    assert output.next_token_logits.dtype == dtype
     torch.testing.assert_close(output.next_token_logits, expected, rtol=0, atol=0)
-    assert output.next_token_logits.argmax(-1).item() == 1
+    assert output.next_token_logits.argmax(-1).item() == expected_token
 
 
 def test_reference_fp8_floor_and_rounding():
@@ -1154,7 +1158,8 @@ def _checkpoint(config):
 )
 def test_strict_checkpoint_load_tp4_ep4(monkeypatch, rank, prefixed, reverse, tmp_path):
     config = _loader_config()
-    model = _loader_model(monkeypatch, config, rank, "cpu")
+    with set_default_torch_dtype(torch.bfloat16):
+        model = _loader_model(monkeypatch, config, rank, "cpu")
     weights = _checkpoint(config)
     for name in (
         "vision.blocks.0.weight",
@@ -1182,10 +1187,10 @@ def test_strict_checkpoint_load_tp4_ep4(monkeypatch, rank, prefixed, reverse, tm
     }
     assert report["loaded"] == len(weights) - sum(report["skipped"].values())
     assert v4.DeepseekV4MegaMoEExperts.finalize_weights.call_count == 3
-    assert model.lm_head.weight.dtype == torch.float32
+    assert model.lm_head.weight.dtype == torch.bfloat16
     torch.testing.assert_close(
         model.lm_head.weight,
-        weights["head.weight"].chunk(4, dim=0)[rank].float(),
+        weights["head.weight"].chunk(4, dim=0)[rank],
         rtol=0,
         atol=0,
     )

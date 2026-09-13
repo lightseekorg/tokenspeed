@@ -25,6 +25,7 @@ duplicate and missing local text tensors, and reports explicit vision/draft skip
 Dense FP8 codes stay unchanged: 32x32 E8M0 scale rows expand losslessly to 1x32.
 Only grouped wo_a is dequantized to BF16, after selecting this TP rank's rows.
 Engram tables load local FP8/E8M0 rows in bounded chunks without table conversion.
+The unquantized LM head follows the model loading dtype, including its logits.
 Packed routed experts use the V4 MoE loader, with zero-padded intermediate lanes
 for MegaMoE's TMA alignment (2304 -> 2560); shared experts are not padded.
 The generic model loader still owns
@@ -1219,15 +1220,16 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         return not is_engram_embed_checkpoint_name(self._checkpoint_name(name))
 
     def resolve_lm_head(self, config, quant_config, prefix):
-        # The reference promotes the BF16 checkpoint head before the logits GEMM.
+        """Keep the checkpoint head unquantized in the model loading dtype."""
         config = getattr(config, "text_config", config)
+        params_dtype = torch.get_default_dtype()
         if self.mapping.attn.has_dp:
             return ReplicatedLinear(
                 input_size=config.hidden_size,
                 output_size=config.vocab_size,
                 bias=False,
                 skip_bias_add=False,
-                params_dtype=torch.float32,
+                params_dtype=params_dtype,
                 quant_config=None,
                 prefix=add_prefix("lm_head", prefix),
             )
@@ -1235,7 +1237,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
             bias=False,
-            params_dtype=torch.float32,
+            params_dtype=params_dtype,
             org_num_embeddings=None,
             padding_size=64,
             quant_config=None,
