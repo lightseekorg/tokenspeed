@@ -445,7 +445,7 @@ class LogitsProcessor(nn.Module):
         )
         if key in self._LOGITS_DIST_ARGMAX_STATES:
             return self._LOGITS_DIST_ARGMAX_STATES[key]
-        if torch.cuda.is_current_stream_capturing():
+        if not current_platform().is_npu and torch.cuda.is_current_stream_capturing():
             return None  # never rendezvous inside capture; warmup probes first
 
         group = pg_manager.get_process_group("nccl", self.tp_group)
@@ -740,7 +740,7 @@ class LogitsProcessor(nn.Module):
             if self.do_argmax:
                 if (
                     self._dist_argmax_state is self._LOGITS_DIST_ARGMAX_UNINITIALIZED
-                    and not torch.cuda.is_current_stream_capturing()
+                    and (current_platform().is_npu or not torch.cuda.is_current_stream_capturing())
                 ):
                     self._dist_argmax_state = self._init_dist_argmax_state(lm_head)
 
@@ -755,7 +755,7 @@ class LogitsProcessor(nn.Module):
             state = self._all_gather_state
             if state is self._LOGITS_AG_STATE_UNINITIALIZED:
                 # create_state rendezvouses; leave it for an eager call.
-                if torch.cuda.is_current_stream_capturing():
+                if not current_platform().is_npu and torch.cuda.is_current_stream_capturing():
                     state = None
                 else:
                     state = self._all_gather_state = self._init_all_gather_state(
