@@ -145,7 +145,9 @@ class PrepTape:
         )
         # NPU fallback replay mirror: keep the original objects and register
         # refs (not the encoded descriptor) so _run_torch() can replay the op.
-        self._torch_stages[-1].append((op, dst, src, idx, n, m, stride, scalar))
+        # Only built on NPU, where the Triton kernel surface is bypassed.
+        if self._device.type == "npu":
+            self._torch_stages[-1].append((op, dst, src, idx, n, m, stride, scalar))
 
     def barrier(self) -> None:
         """Start a stream-ordered launch stage after the recorded operations.
@@ -155,7 +157,8 @@ class PrepTape:
         if self._descs is not None:
             raise RuntimeError("tape already finalized")
         self._stages.append([])
-        self._torch_stages.append([])
+        if self._device.type == "npu":
+            self._torch_stages.append([])
 
     def fill(self, dst: torch.Tensor, n: "int | Reg", value: "int | Reg") -> None:
         """``dst[0:n] = value``."""
@@ -266,18 +269,19 @@ class PrepTape:
             ]
         )
         # NPU fallback replay mirror (original objects / register refs).
-        self._torch_stages[-1].append(
-            (
-                _OP_STATE_PAGES,
-                state_in,
-                rows_ptr,
-                state_out,
-                bs,
-                max_slots,
-                page_size,
-                seq_lens_ptr,
+        if self._device.type == "npu":
+            self._torch_stages[-1].append(
+                (
+                    _OP_STATE_PAGES,
+                    state_in,
+                    rows_ptr,
+                    state_out,
+                    bs,
+                    max_slots,
+                    page_size,
+                    seq_lens_ptr,
+                )
             )
-        )
         self._keepalive += [state_in, state_out]
 
     # -- execution ---------------------------------------------------------

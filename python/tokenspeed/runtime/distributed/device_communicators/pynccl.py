@@ -38,12 +38,13 @@ try:
         ncclRedOpTypeEnum,
         ncclUniqueId,
     )
-except Exception:  # pragma: no cover - non-NVIDIA/AMD hosts
+except (ImportError, OSError):  # pragma: no cover - missing kernel pkg / native deps
     # The NCCL ctypes wrapper is only meaningful where NCCL exists (NVIDIA/
-    # AMD). On other platforms (e.g. Ascend NPU, where the HCCL counterpart
-    # PyHcclCommunicator lives below) the module must stay importable;
+    # AMD). If the import chain fails (kernel package missing, or a native
+    # dependency cannot be loaded) the module must stay importable;
     # PyNcclCommunicator then disables itself at construction because it
-    # cannot bind the library.
+    # cannot bind the library. Narrow to ImportError/OSError so unexpected
+    # import-time errors still fail fast on GPU instead of being swallowed.
     NCCLLibrary = None
     buffer_type = None
     cudaStream_t = None

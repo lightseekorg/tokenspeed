@@ -81,7 +81,7 @@ def create_flashinfer_kv_indices(
         page_kernel_lens,
         kv_indptr,
         kv_indices,
-        page_table.shape[1],
+        page_table_stride,
     )
 
 
