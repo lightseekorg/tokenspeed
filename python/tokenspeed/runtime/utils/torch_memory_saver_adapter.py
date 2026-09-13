@@ -29,9 +29,24 @@ except ImportError:
     pass
 
 
+def _torch_is_npu_available() -> bool:
+    """Return whether the torch runtime sees an Ascend NPU."""
+    try:
+        import torch  # noqa: F401
+
+        return bool(torch.npu.is_available())
+    except (ImportError, AttributeError):
+        return False
+
+
 class TorchMemorySaverAdapter(ABC):
     @staticmethod
     def create(enable: bool):
+        # NPU: torch_memory_saver is an NVIDIA CUDA-only optimization; keep the
+        # option but force-disable it on Ascend so --enable-memory-saver never
+        # instantiates a CUDA-backed region (C12).
+        if enable and _torch_is_npu_available():
+            enable = False
         return (
             _TorchMemorySaverAdapterReal() if enable else _TorchMemorySaverAdapterNoop()
         )

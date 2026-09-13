@@ -56,7 +56,6 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     filter_safetensors_files_by_weight_names,
     get_quant_config,
     initialize_dummy_weights,
-    instanttensor_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
     safetensors_weights_iterator,
@@ -257,7 +256,7 @@ class DefaultModelLoader(BaseModelLoader):
         # Some quantized models use .pt files for storing the weights.
         if load_format == LoadFormat.AUTO:
             allow_patterns = ["*.safetensors", "*.bin"]
-        elif load_format in (LoadFormat.SAFETENSORS, LoadFormat.INSTANTTENSOR):
+        elif load_format == LoadFormat.SAFETENSORS:
             use_safetensors = True
             allow_patterns = ["*.safetensors"]
         elif load_format == LoadFormat.MISTRAL:
@@ -356,8 +355,6 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_folder,
                 hf_weights_files,
             )
-        elif self.load_config.load_format == LoadFormat.INSTANTTENSOR:
-            weights_iterator = instanttensor_weights_iterator(hf_weights_files)
         elif use_safetensors:
             weights_iterator = safetensors_weights_iterator(
                 hf_weights_files,

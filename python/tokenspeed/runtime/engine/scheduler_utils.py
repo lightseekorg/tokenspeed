@@ -575,7 +575,9 @@ def block_tables_from_forward_op(
     # Fresh pinned stage per step (event-fenced; reuse races overlap).
     # arr is a read-only zero-copy view over the C++ buffer; np.copyto
     # reads it into our own writable pinned tensor (never writes back).
-    staged = torch.empty(total, dtype=torch.int32, pin_memory=device.type == "cuda")
+    staged = torch.empty(
+        total, dtype=torch.int32, pin_memory=device.type in ("cuda", "npu")
+    )
     staged_np = staged.numpy()
     for key, arr, offset in packable:
         np.copyto(staged_np[offset : offset + arr.size].reshape(arr.shape), arr)

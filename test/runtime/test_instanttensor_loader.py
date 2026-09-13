@@ -18,7 +18,7 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.configs.load_config import LoadConfig, LoadFormat
+from tokenspeed.runtime.configs.load_config import LoadConfig
 from tokenspeed.runtime.model_loader.loader import DefaultModelLoader
 from tokenspeed.runtime.model_loader.weight_utils import (
     _find_sub_byte_dtype,
@@ -36,24 +36,26 @@ IS_NVIDIA = current_platform().is_nvidia
 class TestInstantTensorConfig(unittest.TestCase):
     """Config/CLI wiring that needs neither a GPU nor instanttensor."""
 
-    def test_cli_flag_maps_to_load_format(self):
+    def test_cli_rejects_removed_instanttensor(self):
+        # C11 removes the instanttensor load-format option; the CLI must
+        # reject the removed value instead of silently accepting it.
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
-        args = parser.parse_args(
-            ["--model", "test/model", "--load-format", "instanttensor"]
-        )
-        self.assertEqual(args.load_format, "instanttensor")
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                ["--model", "test/model", "--load-format", "instanttensor"]
+            )
 
-    def test_load_config_normalizes_to_enum(self):
-        load_config = LoadConfig(load_format="instanttensor")
-        self.assertEqual(load_config.load_format, LoadFormat.INSTANTTENSOR)
+    def test_load_config_rejects_removed_instanttensor(self):
+        with self.assertRaises(ValueError):
+            LoadConfig(load_format="instanttensor")
 
-    def test_prepare_weights_treats_instanttensor_as_safetensors(self):
+    def test_prepare_weights_treats_safetensors_as_safetensors(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             # _prepare_weights only globs paths, never tensor data.
             open(os.path.join(tmpdir, "model.safetensors"), "wb").close()
 
-            loader = DefaultModelLoader(LoadConfig(load_format="instanttensor"))
+            loader = DefaultModelLoader(LoadConfig(load_format="safetensors"))
             _, hf_weights_files, use_safetensors = loader._prepare_weights(
                 tmpdir, revision=None, fall_back_to_pt=False
             )

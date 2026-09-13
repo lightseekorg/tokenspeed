@@ -60,7 +60,6 @@ PACKAGE_LIST = [
     "flashinfer-python",
     "hf_transfer",
     "huggingface_hub",
-    "instanttensor",
     "modelscope",
     "msgspec",
     "ninja",

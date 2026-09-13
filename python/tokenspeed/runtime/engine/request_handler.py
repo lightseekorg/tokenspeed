@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import zmq
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import (
     ProfilingState,
     profile_config_from_env,
@@ -472,6 +473,11 @@ class RequestHandler:
             "CPU": torch.profiler.ProfilerActivity.CPU,
             "GPU": torch.profiler.ProfilerActivity.CUDA,
         }
+        # NPU: torch_npu has no ProfilerActivity.NPU and the CUDA activity is
+        # meaningless on Ascend, so the GPU activity is skipped (the NPU-side
+        # profiling is driven by proton/msprof instead).
+        if current_platform().is_npu:
+            activity_map.pop("GPU", None)
         torchprof_activities = [
             activity_map[a] for a in activities if a in activity_map
         ]
@@ -484,10 +490,10 @@ class RequestHandler:
             )
             self.torch_profiler.start()
 
-        if "MEM" in activities:
+        if "MEM" in activities and not current_platform().is_npu:
             torch.cuda.memory._record_memory_history(max_entries=100000)
 
-        if "CUDA_PROFILER" in activities:
+        if "CUDA_PROFILER" in activities and not current_platform().is_npu:
             torch.cuda.cudart().cudaProfilerStart()
 
         if "PROTON" in activities:
@@ -504,7 +510,7 @@ class RequestHandler:
                 if self.torch_profiler is not None:
                     self.torch_profiler.stop()
                     self.torch_profiler = None
-                if "MEM" in activities:
+                if "MEM" in activities and not current_platform().is_npu:
                     torch.cuda.memory._record_memory_history(enabled=None)
                 return ProfileReqOutput(
                     success=False,
@@ -582,7 +588,11 @@ class RequestHandler:
             )
             self._profile_sync()
 
-        if self.profiler_activities is not None and "MEM" in self.profiler_activities:
+        if (
+            self.profiler_activities is not None
+            and "MEM" in self.profiler_activities
+            and not current_platform().is_npu
+        ):
             memory_profile_path = os.path.join(
                 self.profiler_output_dir,
                 f"{self.profile_id}-{self.profile_rank_tag}-memory{stage_suffix}.pickle",
@@ -590,7 +600,10 @@ class RequestHandler:
             torch.cuda.memory._dump_snapshot(memory_profile_path)
             torch.cuda.memory._record_memory_history(enabled=None)
 
-        if "CUDA_PROFILER" in self.profiler_activities:
+        if (
+            "CUDA_PROFILER" in self.profiler_activities
+            and not current_platform().is_npu
+        ):
             torch.cuda.cudart().cudaProfilerStop()
 
         proton_error: Exception | None = None

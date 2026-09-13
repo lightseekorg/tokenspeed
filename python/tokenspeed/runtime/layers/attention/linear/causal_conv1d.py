@@ -466,6 +466,15 @@ def causal_conv1d_fn(
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
+    # The Triton kernel walks x by strides, but the original API required the
+    # caller to hand in a channel-last (stride(0)==1) layout. Normalize any
+    # caller memory format (e.g. a plain contiguous (dim, seq) tensor) to the
+    # channel-last layout the kernel computes over, so results are identical
+    # regardless of the supplied memory format and the API no longer depends
+    # on channel_last allocation (NPU adaptation A22).
+    if x.dim() == 2 and x.stride(0) != 1:
+        x = x.transpose(0, 1).contiguous().transpose(0, 1)
+
     out = torch.empty_like(x)
     batch_ptr = prefill_metadata.batch_indices
     token_chunk_offset_ptr = prefill_metadata.chunk_offsets

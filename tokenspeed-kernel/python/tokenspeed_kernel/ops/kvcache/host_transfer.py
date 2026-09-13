@@ -80,7 +80,7 @@ LayerSlice = tuple[int, int]
 
 
 def _pinned_host_int64(shape: tuple[int, ...]) -> torch.Tensor:
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() or current_platform().is_npu:
         return torch.empty(shape, dtype=torch.int64, pin_memory=True)
     return torch.empty(shape, dtype=torch.int64, device="cpu")
 

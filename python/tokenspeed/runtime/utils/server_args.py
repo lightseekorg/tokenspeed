@@ -1028,7 +1028,6 @@ class ServerArgs:
                 "auto",
                 "pt",
                 "safetensors",
-                "instanttensor",
                 "npcache",
                 "dummy",
                 "extensible",
@@ -1039,9 +1038,6 @@ class ServerArgs:
             "is not available. "
             '"pt" will load the weights in the pytorch bin format. '
             '"safetensors" will load the weights in the safetensors format. '
-            '"instanttensor" accelerates safetensors loading on NVIDIA GPUs '
-            "via distributed loading, pipelined prefetching, and direct I/O "
-            "(with optional GPUDirect Storage support). "
             '"npcache" will load the weights in pytorch format and store '
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values.',
