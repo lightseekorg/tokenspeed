@@ -28,6 +28,8 @@ vendor tokenspeed-triton targets.
 
 from __future__ import annotations
 
+import torch
+
 from tokenspeed_kernel._triton import tl, triton
 
 _REG_FLAG = 1 << 62
@@ -112,6 +114,11 @@ def run_tape(descs, regs) -> None:
     if isinstance(descs, tuple):
         for stage in descs:
             run_tape(stage, regs)
+        return
+    # NPU: the prep tape is not enabled on the Triton kernel surface. The
+    # caller (PrepTape.run) replays the recorded ops with torch API calls on
+    # NPU; never launch the Triton kernel here (guarded even for direct calls).
+    if torch.device(descs.device).type == "npu":
         return
     n_ops = descs.shape[0]
     if n_ops == 0:

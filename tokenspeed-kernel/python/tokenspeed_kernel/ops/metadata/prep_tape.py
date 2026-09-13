@@ -111,6 +111,11 @@ class PrepTape:
     def __init__(self, device) -> None:
         self._device = torch.device(device)
         self._stages: list[list[list[int]]] = [[]]
+        # NPU fallback replay: the recorded ops with their original tensor
+        # objects / register refs, used by _run_torch() when the Triton kernel
+        # surface is bypassed on NPU. Mirrors _stages; never consumed by the
+        # CUDA/AMD Triton path.
+        self._torch_stages: list[list[tuple]] = [[]]
         self._keepalive: list[torch.Tensor] = []
         self._descs: torch.Tensor | tuple[torch.Tensor, ...] | None = None
         self._regs_dev = torch.zeros(32, dtype=torch.int64, device=self._device)
@@ -138,6 +143,9 @@ class PrepTape:
                 _ref(scalar),
             ]
         )
+        # NPU fallback replay mirror: keep the original objects and register
+        # refs (not the encoded descriptor) so _run_torch() can replay the op.
+        self._torch_stages[-1].append((op, dst, src, idx, n, m, stride, scalar))
 
     def barrier(self) -> None:
         """Start a stream-ordered launch stage after the recorded operations.
@@ -147,6 +155,7 @@ class PrepTape:
         if self._descs is not None:
             raise RuntimeError("tape already finalized")
         self._stages.append([])
+        self._torch_stages.append([])
 
     def fill(self, dst: torch.Tensor, n: "int | Reg", value: "int | Reg") -> None:
         """``dst[0:n] = value``."""
@@ -256,6 +265,19 @@ class PrepTape:
                 _ref(seq_lens_ptr),
             ]
         )
+        # NPU fallback replay mirror (original objects / register refs).
+        self._torch_stages[-1].append(
+            (
+                _OP_STATE_PAGES,
+                state_in,
+                rows_ptr,
+                state_out,
+                bs,
+                max_slots,
+                page_size,
+                seq_lens_ptr,
+            )
+        )
         self._keepalive += [state_in, state_out]
 
     # -- execution ---------------------------------------------------------
@@ -290,14 +312,76 @@ class PrepTape:
         registers -- the wrong row count, or a pointer to a freed table. The
         caching host allocator only hands a block back once the copy's stream
         event has completed, which is the fence this needs.
-        """
-        from tokenspeed_kernel.ops.metadata.triton_tape import run_tape
 
+        On NPU the Triton kernel surface is bypassed (the prep tape is not
+        enabled there); the recorded ops are replayed with torch ops instead.
+        """
         if self._descs is None:
             raise RuntimeError("finalize() the tape before run()")
         for k, v in regs.items():
             self._regs_host[int(k)] = v.data_ptr() if isinstance(v, torch.Tensor) else v
+        if self._device.type == "npu":
+            self._run_torch(regs)
+            return
+        from tokenspeed_kernel.ops.metadata.triton_tape import run_tape
+
         staging = torch.empty(32, dtype=torch.int64, pin_memory=True)
         staging.copy_(self._regs_host)
         self._regs_dev.copy_(staging, non_blocking=True)
         run_tape(self._descs, self._regs_dev)
+
+    def _run_torch(self, regs: dict) -> None:
+        """NPU fallback: replay the recorded ops with torch API calls.
+
+        Keeps the prep-tape host logic while never launching the Triton
+        kernel on NPU. Stages run in recording order on the current stream,
+        so explicit barriers stay ordered without extra synchronisation.
+        """
+
+        def resolve(v):
+            if isinstance(v, Reg):
+                return regs[int(v)]
+            if isinstance(v, int) and v >= 0 and (v & _REG_FLAG) != 0:
+                return regs[v & 0xFFFF]
+            return int(v)
+
+        for stage in self._torch_stages:
+            for op, dst, src, idx, n, m, stride, scalar in stage:
+                n = resolve(n)
+                m = resolve(m)
+                s = resolve(scalar)
+                if op == _OP_FILL:
+                    dst[:n].fill_(s)
+                elif op == _OP_COPY:
+                    soff = resolve(stride)
+                    dst[:n].copy_(src[soff : soff + n])
+                elif op == _OP_GATHER:
+                    idxv = idx[:n]
+                    cl = idxv.clamp(min=0).long()
+                    dst[:n] = torch.where(
+                        idxv >= 0, src[cl], torch.full_like(idxv, s)
+                    )
+                elif op == _OP_COPY2D:
+                    dst[:n, :m] = src[: n * m].view(n, m)
+                    dst[:n, m:] = s
+                elif op == _OP_FILLTAIL:
+                    dst[n:m].fill_(s)
+                elif op == _OP_STATE_PAGES:
+                    seq = resolve(scalar).to(torch.int64)
+                    rows = resolve(src)
+                    after = seq[:n]
+                    before = after - 1
+                    in_slot = torch.div(
+                        before - 1, stride, rounding_mode="floor"
+                    ).clamp(min=0)
+                    out_slot = torch.div(
+                        after - 1, stride, rounding_mode="floor"
+                    ).clamp(min=0, max=m - 1)
+                    o = torch.arange(n, device=after.device)
+                    s_in = rows[o, in_slot]
+                    s_in = torch.where(before > 0, s_in, torch.zeros_like(s_in))
+                    s_out = rows[o, out_slot]
+                    dst[:n] = s_in.to(dst.dtype)
+                    idx[:n] = s_out.to(idx.dtype)
+                else:
+                    raise RuntimeError(f"unknown prep-tape opcode {op}")
