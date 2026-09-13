@@ -286,9 +286,17 @@ prompt work), then the shared local-prefill phases
 (`scheduleLocalPrefillWork`): resident chunks, then new prompts.
 
 **Retraction: none.** A P node's pressure valve is the transfer itself — pages
-are pinned (`pd_transfer_pins_`) until the peer acknowledges, then released
-wholesale. Retracting a prompt whose KV is mid-transfer would strand the decode
-side.
+are pinned until the peer acknowledges, then released wholesale. Retracting a
+prompt whose KV is mid-transfer would strand the decode side.
+
+The PD pin is not recorded anywhere; it is a function of the FSM
+(`Scheduler::pdTransferInFlight`). On this role every page-holding state is
+pinned — the peer's decode reads the pages from the first scheduled chunk until
+the PD ACK finishes or aborts the request. On the D role the pin is exactly
+`RemotePrefilling`: the peer's prefill is writing the destination pages, and
+`RemotePrefillDone` ends it by leaving that state. A fused engine never
+transfers. Because the pin is the state, no event handler can forget to clear
+it, and `Abort`/`Finish`/`RemotePrefillDone` release it by transitioning.
 
 **Recovery: n/a.** The readmission path is unreachable on this role.
 
@@ -423,7 +431,7 @@ no victim and nothing could free that page.
   running beside a stalled prefill.
 - Retraction fires only when no prefill progressed and an admission failed
   (2). The chosen victim must be quiescent — no forward of its own in flight,
-  no PD pin on its pages — and an in-flight load-back or an in-flight pinned
+  no PD transfer against its pages (§3.1) — and an in-flight load-back or an in-flight pinned
   store defers all retraction; stream-ordered stores defer nothing.
 - Freed capacity is granted to the request it was freed for in the same plan
   build whenever the round's grammar admits the grant (2); the write-back →

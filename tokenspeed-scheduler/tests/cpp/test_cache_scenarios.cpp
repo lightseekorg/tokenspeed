@@ -418,6 +418,41 @@ TEST_F(MambaStateCheckpointPrefillRoleSuite, CompletesOneForwardBeforeRemoteDeco
     EXPECT_TRUE(forward->request_ids.empty());
 }
 
+// On the P role the PD pin is the request's page-holding state itself: it
+// appears with the first scheduled chunk, survives the PrefillDone hand-off,
+// and only the PD ACK -- which finishes the request -- releases it.
+TEST_F(MambaStateCheckpointPrefillRoleSuite, PdTransferPinFollowsThePageHoldingStates) {
+    RequestSpec first = MakeRequestSpec("r1", /*num_pages=*/3);
+    first.tokens.resize(10);
+    Submit(first);
+    EXPECT_FALSE(scheduler_->PdTransferPinned("r1")) << "a waiting prompt holds no pages";
+    SendBootstrapped("r1");
+    EXPECT_FALSE(scheduler_->PdTransferPinned("r1"));
+
+    PlanOnce();
+    EXPECT_TRUE(scheduler_->PdTransferPinned("r1")) << "the first scheduled chunk pins";
+    EXPECT_FALSE(scheduler_->ClearL1Cache()) << "a flush must wait for the transfer";
+
+    ExecutionEvent result;
+    result.With(forward::ExtendResult{.request_id = "r1", .tokens = {42}, .spec_candidate_ids = {}});
+    scheduler_->Advance(std::move(result));
+    ASSERT_TRUE(PlanOnce().remote_decode.has_value());
+    EXPECT_TRUE(scheduler_->PdTransferPinned("r1")) << "PrefillDone and the remote decode keep the pin";
+
+    ExecutionEvent finish;
+    finish.With(forward::Finish{.request_id = "r1"});
+    EXPECT_THROW(scheduler_->Advance(std::move(finish)), std::logic_error)
+        << "a local Finish cannot release pages the peer is still reading";
+    EXPECT_TRUE(scheduler_->PdTransferPinned("r1"));
+
+    ExecutionEvent succeeded;
+    succeeded.With(pd::SucceededEvent{"r1"});
+    scheduler_->Advance(std::move(succeeded));
+    EXPECT_FALSE(scheduler_->PdTransferPinned("r1")) << "the ACK finishes the request and with it the pin";
+    PlanOnce();
+    EXPECT_TRUE(scheduler_->ClearL1Cache());
+}
+
 TEST_F(MambaStateCheckpointPrefillRoleSuite, EmitsRemoteDecodeAlongsideOngoingPrefillWork) {
     // Everything dispatchable dispatches in one round: a ready remote decode
     // rides plan.remote_decode while another request's prefill keeps filling

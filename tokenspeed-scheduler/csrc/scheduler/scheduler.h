@@ -84,7 +84,8 @@ public:
     std::int32_t CacheGroupTotalPages(const std::string& group_id) const;
     std::int32_t CacheGroupAvailablePages(const std::string& group_id) const;
 
-    bool PdTransferPinned(const std::string& request_id) const { return pd_transfer_pins_.contains(request_id); }
+    // Test/diagnostic view of pdTransferInFlight by request id.
+    bool PdTransferPinned(const std::string& request_id) const;
     std::int32_t HostPoolCachedBlocks() const { return coordinator_.NumHostCachedBlocks(); }
     std::int32_t HostPoolFreeBlocks() const { return coordinator_.NumFreeHostLcmBlocks(); }
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
@@ -155,6 +156,13 @@ private:
 
     std::size_t groupIndex(const std::string& group_id) const;
     Request* findRequest(const std::string& request_id);
+    // A PD transfer is out against this request's pages, so nothing here may
+    // retract, finish or flush them. Derived from the FSM, never recorded: on
+    // the D role it is the peer's prefill writing the destination pages
+    // (RemotePrefilling); on the P role it is the peer's decode reading them,
+    // which begins with the first scheduled chunk and ends only with the PD
+    // ACK -- every page-holding state. A fused engine never transfers.
+    bool pdTransferInFlight(const Request& request) const;
 
     void handleEvent(const cache::WriteBackDone& event);
     void handleEvent(const cache::LoadBackDone& event);
@@ -284,7 +292,6 @@ private:
     std::vector<std::string> cache_group_ids_;
     std::int32_t max_single_request_tokens_{0};
 
-    std::unordered_set<std::string> pd_transfer_pins_;
     // Stamped onto each retraction; the readmission order lives on the
     // Retracted states themselves (nextReadmission).
     std::int64_t next_retraction_epoch_{1};

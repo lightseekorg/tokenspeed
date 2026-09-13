@@ -227,6 +227,23 @@ Request* Scheduler::findRequest(const std::string& request_id) {
     return it == requests_by_id_.end() ? nullptr : it->second;
 }
 
+bool Scheduler::pdTransferInFlight(const Request& request) const {
+    switch (config_.role) {
+        case Role::kD:
+            return request.Is<fsm::RemotePrefilling>();
+        case Role::kP:
+            return request.HoldsPages();
+        case Role::kFused:
+            return false;
+    }
+    return false;
+}
+
+bool Scheduler::PdTransferPinned(const std::string& request_id) const {
+    const auto it = requests_by_id_.find(request_id);
+    return it != requests_by_id_.end() && pdTransferInFlight(*it->second);
+}
+
 std::size_t Scheduler::groupIndex(const std::string& group_id) const {
     const auto it = std::ranges::find(cache_group_ids_, group_id);
     if (it == cache_group_ids_.end()) {
@@ -253,7 +270,8 @@ bool Scheduler::clearCache(bool include_host) {
     // this function's business. What IS its business are the writers the pins
     // do not cover: an asynchronous transfer still landing into a cached
     // block would race a clear that succeeded on the pin check alone.
-    const bool has_pd_transfers = !pd_transfer_pins_.empty();
+    const bool has_pd_transfers = std::ranges::any_of(
+        requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
     const bool has_tier_transfers = tier_transfers_.HasAnyInFlight();
     if (has_pd_transfers || has_tier_transfers) {
         spdlog::info("[Scheduler] flush L1 cache rejected: pd_transfers={} tier_transfers={}", has_pd_transfers,
