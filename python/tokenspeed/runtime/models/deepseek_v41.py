@@ -425,6 +425,10 @@ def v41_hc_mixes(
     sinkhorn_iters: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Derive pre/post/comb from the full HC stream; comb is [input HC, output HC]."""
+    if x.is_cuda:
+        from tokenspeed_kernel.ops.residual import mhc_mixes
+
+        return mhc_mixes(x, weight, scale, base, norm_eps, hc_eps, sinkhorn_iters)
     hc = x.shape[-2]
     flat = x.flatten(-2).float()
     mixes = F.linear(flat, weight.float()) * torch.rsqrt(
@@ -444,15 +448,33 @@ def v41_hc_mixes(
 
 def v41_hc_pre(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
     """Collapse copies with the PREVIOUS sublayer's pre-mix, accumulating FP32."""
-    return (pre_mix.unsqueeze(-1) * x.float()).sum(-2).to(x.dtype)
+    if not x.is_cuda:
+        return (pre_mix.unsqueeze(-1) * x.float()).sum(-2).to(x.dtype)
+    from tokenspeed_kernel.ops.residual.triton import mhc_apply_pre
+
+    return mhc_apply_pre(x, pre_mix)
 
 
 def v41_hc_post(
     x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor
 ) -> torch.Tensor:
     """Apply the current sublayer's post/comb, summing input—not output—HC copies."""
-    mixed = (comb.unsqueeze(-1) * residual.float().unsqueeze(-2)).sum(-3)
-    return (post.unsqueeze(-1) * x.float().unsqueeze(-2) + mixed).to(x.dtype)
+    if not x.is_cuda:
+        mixed = (comb.unsqueeze(-1) * residual.float().unsqueeze(-2)).sum(-3)
+        return (post.unsqueeze(-1) * x.float().unsqueeze(-2) + mixed).to(x.dtype)
+    from tokenspeed_kernel import mhc_post
+
+    return mhc_post(x, residual, post.unsqueeze(-1), comb, override=None, solution=None)
+
+
+def _v41_hc_input(x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
+    if not x.is_cuda:
+        return _norm(v41_hc_pre(x, pre), norm)
+    from tokenspeed_kernel.ops.residual.triton import mhc_pre_layer_norm_hc4
+
+    out = x.new_empty((x.shape[0], x.shape[-1]))
+    mhc_pre_layer_norm_hc4(pre, x, norm.weight, out, eps=norm.variance_epsilon)
+    return out
 
 
 class DeepseekV41Compressor(nn.Module):
@@ -944,7 +966,7 @@ class DeepseekV41DecoderLayer(nn.Module):
             self.hc_eps,
             self.hc_sinkhorn_iters,
         )
-        x = _norm(v41_hc_pre(residual, pre_mix), self.attn_norm)
+        x = _v41_hc_input(residual, pre_mix, self.attn_norm)
         hidden_states = v41_hc_post(self.attn(positions, x, ctx), residual, post, comb)
         residual = hidden_states
         ffn_pre, post, comb = v41_hc_mixes(
@@ -956,7 +978,7 @@ class DeepseekV41DecoderLayer(nn.Module):
             self.hc_eps,
             self.hc_sinkhorn_iters,
         )
-        x = _norm(v41_hc_pre(residual, attn_pre), self.ffn_norm)
+        x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
         if self.ffn.use_mega_moe:
             counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
             x = self.ffn(
