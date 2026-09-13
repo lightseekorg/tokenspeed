@@ -630,7 +630,9 @@ Its responsibilities:
   the local modules that file transitively imports from the directory
   inserted into `sys.path` — including on a Hugging Face hub snapshot,
   whose commit does not cover those files — so a custom input processor
-  cannot share a namespace with the same checkpoint bytes.
+  cannot share a namespace with the same checkpoint bytes. The path is
+  read without PyYAML using the same quoted-key, spaced-colon, and
+  document-level flow-mapping forms `yaml.safe_load` accepts.
   Mistral
   fingerprints include `consolidated.safetensors.index.json` so two dumps
   with the same `consolidated*.safetensors` candidates but different shard

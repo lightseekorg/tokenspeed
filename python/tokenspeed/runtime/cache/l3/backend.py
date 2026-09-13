@@ -37,9 +37,14 @@ from typing import Any, Protocol
 
 _HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
 _HF_HUB_REPO_DIR_RE = re.compile(r"(?:models|datasets|spaces)--.+")
-_EXT_DEF_FILE_RE = re.compile(
-    r"^ext_def_file:\s*(?:['\"]([^'\"]+)['\"]|(\S+))\s*(?:#.*)?$",
+_EXT_DEF_FILE_BLOCK_RE = re.compile(
+    r"^(?:['\"]ext_def_file['\"]|ext_def_file)\s*:\s*"
+    r"(?:['\"]([^'\"]+)['\"]|(\S+))\s*(?:#.*)?$",
     re.MULTILINE,
+)
+_EXT_DEF_FILE_FLOW_RE = re.compile(
+    r"(?:['\"]ext_def_file['\"]|ext_def_file)\s*:\s*"
+    r"(?:['\"]([^'\"]+)['\"]|([^\s,#}]+))"
 )
 _CHECKPOINT_METADATA_FILES = (
     "config.json",
@@ -391,22 +396,82 @@ def _normalize_load_format(load_format: str) -> str:
     return normalized
 
 
+def _ext_def_path_from_match(match: re.Match[str]) -> str | None:
+    path = None
+    for group in match.groups():
+        if group:
+            path = group
+            break
+    if not path or path in ("|", ">", "null", "~", "{}", "[]"):
+        return None
+    return path
+
+
+def _blank_nested_flow_maps(text: str) -> str:
+    """Keep only the outermost ``{...}`` mapping so nested keys cannot match."""
+
+    chars: list[str] = []
+    depth = 0
+    quote = ""
+    escape = False
+    for char in text:
+        if quote:
+            chars.append(" " if depth > 1 else char)
+            if escape:
+                escape = False
+                continue
+            if char == "\\":
+                escape = True
+                continue
+            if char == quote:
+                quote = ""
+            continue
+        if char in ("'", '"'):
+            quote = char
+            chars.append(" " if depth > 1 else char)
+            continue
+        if char == "{":
+            depth += 1
+            chars.append(char if depth == 1 else " ")
+            continue
+        if char == "}":
+            chars.append(char if depth == 1 else " ")
+            if depth > 0:
+                depth -= 1
+            continue
+        chars.append(" " if depth > 1 else char)
+    return "".join(chars)
+
+
+def _yaml_mapping_body(yaml_text: str) -> str:
+    body = yaml_text.lstrip("\ufeff").lstrip()
+    if body.startswith("---"):
+        body = body[3:].lstrip()
+    return body
+
+
 def _ext_def_file_from_yaml_text(yaml_text: str) -> str | None:
     """Return the top-level ``ext_def_file`` path from an extensible yaml.
 
     The L3 namespace must be the same whether or not PyYAML is installed
     (Mooncake L3 CI does not ship it). ``ExtensibleModelLoader`` reads
-    this as a top-level mapping key; the yaml bytes are hashed in full,
-    so nested processor config still rotates the id.
+    this as a top-level mapping key via ``yaml.safe_load``, including
+    quoted keys, spaces around ``:``, and a document-level flow mapping.
+    Nested ``ext_def_file`` keys and indented block entries are ignored.
+    The yaml bytes are hashed in full, so nested processor config still
+    rotates the id.
     """
 
-    match = _EXT_DEF_FILE_RE.search(yaml_text)
+    body = _yaml_mapping_body(yaml_text)
+    if body.startswith("{"):
+        match = _EXT_DEF_FILE_FLOW_RE.search(_blank_nested_flow_maps(body))
+        if match is None:
+            return None
+        return _ext_def_path_from_match(match)
+    match = _EXT_DEF_FILE_BLOCK_RE.search(yaml_text)
     if match is None:
         return None
-    path = match.group(1) or match.group(2)
-    if not path or path in ("|", ">", "null", "~", "{}", "[]"):
-        return None
-    return path
+    return _ext_def_path_from_match(match)
 
 
 def _contained_in_dir(path: str, root: str) -> bool:
@@ -572,7 +637,9 @@ def _extensible_fingerprint(ext_yaml: str, *, load_format: str) -> str:
     from the inserted ``sys.path`` directory. Non-extensible loaders
     must pass an empty path. Parsing does not import PyYAML: two hosts
     that share the yaml and extension code must produce the same digest
-    even when only one has the yaml package.
+    even when only one has the yaml package. Top-level ``ext_def_file``
+    is recognized with the same quoted-key, spaced-colon, and flow-mapping
+    forms ``yaml.safe_load`` accepts.
     """
 
     if load_format != "extensible":

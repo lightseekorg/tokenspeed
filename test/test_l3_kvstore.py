@@ -35,6 +35,7 @@ from tokenspeed.runtime.cache.l3.backend import (
     L3_RUNTIME_COMPAT,
     L3UnreadKeySet,
     MemoryKvStore,
+    _ext_def_file_from_yaml_text,
     cache_layout_signature,
     l3_cache_quantization_id,
     l3_checkpoint_id,
@@ -784,6 +785,42 @@ class StorageKeyTest(unittest.TestCase):
                     revision="",
                 )
 
+    def test_ext_def_file_parses_loader_yaml_forms(self):
+        self.assertEqual(
+            _ext_def_file_from_yaml_text("ext_def_file: ext.py\n"),
+            "ext.py",
+        )
+        self.assertEqual(
+            _ext_def_file_from_yaml_text("ext_def_file : ext.py\n"),
+            "ext.py",
+        )
+        self.assertEqual(
+            _ext_def_file_from_yaml_text('"ext_def_file": ext.py\n'),
+            "ext.py",
+        )
+        self.assertEqual(
+            _ext_def_file_from_yaml_text("'ext_def_file': 'ext.py'\n"),
+            "ext.py",
+        )
+        self.assertEqual(
+            _ext_def_file_from_yaml_text("{ext_def_file: ext.py, context: {}}\n"),
+            "ext.py",
+        )
+        self.assertEqual(
+            _ext_def_file_from_yaml_text('{"ext_def_file": "ext.py"}\n'),
+            "ext.py",
+        )
+        self.assertEqual(
+            _ext_def_file_from_yaml_text("---\n{ext_def_file: ext.py}\n"),
+            "ext.py",
+        )
+        self.assertIsNone(
+            _ext_def_file_from_yaml_text("context:\n  ext_def_file: nested.py\n")
+        )
+        self.assertIsNone(
+            _ext_def_file_from_yaml_text("{context: {ext_def_file: nested.py}}\n")
+        )
+
     def test_checkpoint_id_hashes_extensible_yaml_and_extension_code(self):
         commit = "d" * 40
         with tempfile.TemporaryDirectory() as root:
@@ -839,6 +876,52 @@ class StorageKeyTest(unittest.TestCase):
             self.assertNotEqual(quoted_id, extensible_id(quoted_yaml))
             with self.assertRaises(ValueError):
                 extensible_id("")
+
+    def test_checkpoint_id_hashes_extension_code_for_quoted_key_and_flow_yaml(self):
+        commit = "c" * 40
+        with tempfile.TemporaryDirectory() as root:
+            repo = os.path.join(root, "hub", "models--org--model")
+            snapshot = os.path.join(repo, "snapshots", commit)
+            os.makedirs(os.path.join(repo, "refs"))
+            os.makedirs(snapshot)
+            with open(os.path.join(snapshot, "config.json"), "w") as handle:
+                handle.write("{}")
+            with open(os.path.join(snapshot, "model.safetensors"), "wb") as handle:
+                handle.write(b"same-weights")
+            ext_path = os.path.join(root, "ext.py")
+            with open(ext_path, "w", encoding="utf-8") as handle:
+                handle.write("PROCESSOR = 'v1'\n")
+            quoted_key = os.path.join(root, "quoted-key.yaml")
+            spaced = os.path.join(root, "spaced.yaml")
+            flow = os.path.join(root, "flow.yaml")
+            with open(quoted_key, "w", encoding="utf-8") as handle:
+                handle.write(f'"ext_def_file": {ext_path}\n')
+            with open(spaced, "w", encoding="utf-8") as handle:
+                handle.write(f"ext_def_file : {ext_path}\n")
+            with open(flow, "w", encoding="utf-8") as handle:
+                handle.write(f"{{ext_def_file: {ext_path}, context: {{}}}}\n")
+
+            def extensible_id(ext_yaml: str) -> str:
+                return l3_checkpoint_id(
+                    snapshot,
+                    hf_config=SimpleNamespace(),
+                    revision="main",
+                    load_format="extensible",
+                    model_loader_extra_config={},
+                    ext_yaml=ext_yaml,
+                )
+
+            quoted_id = extensible_id(quoted_key)
+            spaced_id = extensible_id(spaced)
+            flow_id = extensible_id(flow)
+            self.assertTrue(quoted_id.startswith(f"{commit}:extensible:ext-"))
+            self.assertTrue(spaced_id.startswith(f"{commit}:extensible:ext-"))
+            self.assertTrue(flow_id.startswith(f"{commit}:extensible:ext-"))
+            with open(ext_path, "w", encoding="utf-8") as handle:
+                handle.write("PROCESSOR = 'v2'\n")
+            self.assertNotEqual(quoted_id, extensible_id(quoted_key))
+            self.assertNotEqual(spaced_id, extensible_id(spaced))
+            self.assertNotEqual(flow_id, extensible_id(flow))
 
     def test_checkpoint_id_fingerprints_extensible_local_weights_and_yaml(self):
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:

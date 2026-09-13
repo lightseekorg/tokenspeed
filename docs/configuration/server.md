@@ -349,7 +349,9 @@ configured shard pattern, default `model-rank-*-part-*`, not only rank
 also hashes `--ext-yaml` and the `ext_def_file` `ExtensibleLM` imports
 with the same cwd-relative `os.path.abspath` resolution as the loader,
 plus that module's transitive local helpers, including on a Hugging Face
-hub snapshot whose commit does not cover those files), and
+hub snapshot whose commit does not cover those files; the path is parsed
+without PyYAML for quoted keys, spaces around `:`, and a document-level
+flow mapping), and
 `--weight-version`), `--hf-overrides` (the effective
 HF text-config delta: `rope_theta`, `rope_scaling`, and other architecture
 fields), the packed Host layout (field payloads, not GPU-capacity
