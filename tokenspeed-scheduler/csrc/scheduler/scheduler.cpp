@@ -94,11 +94,6 @@ Scheduler::Scheduler(SchedulerConfig config)
     cache_group_ids_.reserve(config_.cache_groups.size());
     for (const CacheGroupConfig& group : config_.cache_groups) {
         cache_group_ids_.push_back(group.group_id);
-        const std::int32_t child_entries = config_.prefix_granularity / group.block_granularity;
-        if (cache_entries_per_event_boundary_ > std::numeric_limits<std::int32_t>::max() - child_entries) {
-            throw std::invalid_argument("Scheduler: cache entries per event boundary exceed int32 range");
-        }
-        cache_entries_per_event_boundary_ += child_entries;
     }
     max_single_request_tokens_ = calculateMaxSingleRequestTokens(coordinator_.TotalLcmBlocks());
 
@@ -317,8 +312,8 @@ std::vector<CacheKey> Scheduler::registerKvEventPrefixPages(const Request& reque
             .token_ids = std::vector<std::int32_t>(token_pages[i].begin(), token_pages[i].end()),
             .block_size = config_.prefix_granularity,
         };
-        const auto [it, inserted] = kv_event_pages_.try_emplace(key, std::move(event));
-        FatalCheck(inserted || it->second.block_hashes.front() == progress.block_hashes[i],
+        const auto [it, inserted] = kv_event_boundaries_.try_emplace(key, KvEventBoundary{.stored = std::move(event)});
+        FatalCheck(inserted || it->second.stored.block_hashes.front() == progress.block_hashes[i],
                    "one cache content hash mapped to different KV event blocks");
         registered_keys.push_back(std::move(key));
     }
@@ -327,37 +322,31 @@ std::vector<CacheKey> Scheduler::registerKvEventPrefixPages(const Request& reque
 
 void Scheduler::discardUncachedKvEventPages(std::span<const CacheKey> keys) {
     for (const CacheKey& key : keys) {
-        if (!cached_event_child_counts_.contains(key)) {
-            kv_event_pages_.erase(key);
+        if (coordinator_.DeviceBoundaryResidency(key) == CacheCoordinator::BoundaryResidency::kNone) {
+            kv_event_boundaries_.erase(key);
         }
     }
 }
 
 void Scheduler::handleCacheMutation(const CacheKey& key, CacheCoordinator::CacheMutation mutation) {
-    const CacheKey prefix_key = eventKey(key);
+    const CacheKey boundary = eventKey(key);
+    const auto it = kv_event_boundaries_.find(boundary);
+    FatalCheck(it != kv_event_boundaries_.end(), "cache mutation on a KV event boundary with no token descriptor");
+    KvEventBoundary& event_boundary = it->second;
+    const CacheCoordinator::BoundaryResidency residency = coordinator_.DeviceBoundaryResidency(boundary);
     if (mutation == CacheCoordinator::CacheMutation::kStored) {
-        std::int32_t& child_count = cached_event_child_counts_[prefix_key];
-        FatalCheck(child_count < cache_entries_per_event_boundary_, "duplicate child entry for one KV event boundary");
-        ++child_count;
-        if (child_count == cache_entries_per_event_boundary_) {
-            const auto page_it = kv_event_pages_.find(prefix_key);
-            FatalCheck(page_it != kv_event_pages_.end(), "cached KV event boundary has no token descriptor");
-            kv_events_.emplace_back(page_it->second);
+        if (!event_boundary.published && residency == CacheCoordinator::BoundaryResidency::kComplete) {
+            kv_events_.emplace_back(event_boundary.stored);
+            event_boundary.published = true;
         }
         return;
     }
-
-    auto count_it = cached_event_child_counts_.find(prefix_key);
-    FatalCheck(count_it != cached_event_child_counts_.end() && count_it->second > 0,
-               "removed KV event boundary was not registered");
-    if (count_it->second == cache_entries_per_event_boundary_) {
-        const auto page_it = kv_event_pages_.find(prefix_key);
-        FatalCheck(page_it != kv_event_pages_.end(), "removed KV event boundary has no token descriptor");
-        kv_events_.emplace_back(KvBlockRemovedEvent{.block_hashes = page_it->second.block_hashes});
+    if (event_boundary.published) {
+        kv_events_.emplace_back(KvBlockRemovedEvent{.block_hashes = event_boundary.stored.block_hashes});
+        event_boundary.published = false;
     }
-    if (--count_it->second == 0) {
-        cached_event_child_counts_.erase(count_it);
-        kv_event_pages_.erase(prefix_key);
+    if (residency == CacheCoordinator::BoundaryResidency::kNone) {
+        kv_event_boundaries_.erase(it);
     }
 }
 

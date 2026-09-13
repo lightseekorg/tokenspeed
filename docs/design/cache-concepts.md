@@ -530,7 +530,11 @@ Its responsibilities:
   ranking retraction (preemption) victims.
 * **Mutation reporting.** `SetCacheMutationSink` reports per-group cache
   insertions/removals; the scheduler folds them into one externally visible
-  prefix event.
+  prefix event. Whether a scheduler-level boundary is fully, partially or not
+  resident is the coordinator's answer (`DeviceBoundaryResidency`, read off
+  the group indexes), so the scheduler keeps no residency counters of its own
+  — only the token descriptor the event carries and whether that event is
+  currently out.
 
 `MakeCoordinator` is the factory: one `CacheGroup` per `CacheGroupSpec`
 (group_id = index), all sharing one scheduler-level `prefix_granularity`

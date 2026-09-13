@@ -115,6 +115,28 @@ bool CacheCoordinator::ClearCache() {
     return true;
 }
 
+CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(const CacheKey& boundary) const {
+    std::int32_t cached = 0;
+    std::int32_t total = 0;
+    for (std::size_t group_index = 0; group_index < groups_.size(); ++group_index) {
+        const std::int32_t pages_per_prefix_hash = prefix_granularity_ / geometry_[group_index].BlockGranularity();
+        for (std::int32_t offset = 0; offset < pages_per_prefix_hash; ++offset) {
+            const CacheKey key{
+                .namespace_id = boundary.namespace_id,
+                .group_id = groups_[group_index].Id(),
+                .content_hash = boundary.content_hash,
+                .page_offset = offset,
+            };
+            cached += groups_[group_index].Index().Contains(pool_, key) ? 1 : 0;
+            ++total;
+        }
+    }
+    if (cached == 0) {
+        return BoundaryResidency::kNone;
+    }
+    return cached == total ? BoundaryResidency::kComplete : BoundaryResidency::kPartial;
+}
+
 std::vector<CacheKey> CacheCoordinator::keysForGroup(std::span<const std::string> content_hashes,
                                                      std::uint32_t group_id) const {
     _assert(group_id < groups_.size(), "cache key group id out of range");

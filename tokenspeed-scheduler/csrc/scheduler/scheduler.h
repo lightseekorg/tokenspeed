@@ -304,11 +304,16 @@ private:
     std::unordered_map<std::string, Request*> requests_by_id_;
     std::vector<KvCacheEvent> kv_events_;
     std::unordered_map<std::string, KvEventHashProgress> kv_event_hash_progress_;
-    std::unordered_map<CacheKey, KvBlockStoredEvent, CacheKeyHash> kv_event_pages_;
-    // Number of resident child cache entries behind each scheduler-level
-    // boundary. A group may contribute more than one child entry.
-    std::unordered_map<CacheKey, std::int32_t, CacheKeyHash> cached_event_child_counts_;
-    std::int32_t cache_entries_per_event_boundary_{0};
+    // What the prefix index cannot tell us about a boundary: the token
+    // descriptor the external event carries, and whether that event is
+    // currently out (a BlockStored not yet followed by its BlockRemoved).
+    // Residency itself is the coordinator's answer, never mirrored here. A
+    // descriptor lives exactly as long as the boundary has a cached child.
+    struct KvEventBoundary {
+        KvBlockStoredEvent stored;
+        bool published{false};
+    };
+    std::unordered_map<CacheKey, KvEventBoundary, CacheKeyHash> kv_event_boundaries_;
 };
 
 }  // namespace tokenspeed

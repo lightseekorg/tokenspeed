@@ -217,6 +217,12 @@ public:
     // Reports real device-cache entry insertions and removals. The scheduler
     // folds the per-group mutations into one externally visible prefix event.
     void SetCacheMutationSink(CacheMutationSink sink) { cache_mutation_sink_ = std::move(sink); }
+    // Device residency of one scheduler-level prefix boundary: the child
+    // entries every group holds for that content hash (one per group page
+    // within the prefix granularity). The boundary key's group and offset are
+    // ignored; only its namespace and content hash identify the boundary.
+    enum class BoundaryResidency { kNone, kPartial, kComplete };
+    BoundaryResidency DeviceBoundaryResidency(const CacheKey& boundary) const;
 
 private:
     friend struct CacheCoordinatorTestAccess;
