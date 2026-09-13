@@ -827,8 +827,14 @@ class StorageKeyTest(unittest.TestCase):
             self.assertNotEqual(id_a, f"{commit}:extensible")
             self.assertNotEqual(id_a, id_b)
             self.assertEqual(id_a, extensible_id(yaml_a_copy))
+            quoted_yaml = os.path.join(root, "quoted.yaml")
+            with open(quoted_yaml, "w", encoding="utf-8") as handle:
+                handle.write('ext_def_file: "a.py"\n')
+            quoted_id = extensible_id(quoted_yaml)
+            self.assertNotEqual(quoted_id, id_a)
             write_ext_def("a.py", "PROCESSOR = 'a-changed'\n")
             self.assertNotEqual(id_a, extensible_id(yaml_a))
+            self.assertNotEqual(quoted_id, extensible_id(quoted_yaml))
             with self.assertRaises(ValueError):
                 extensible_id("")
 

@@ -36,6 +36,10 @@ from typing import Any, Protocol
 
 _HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
 _HF_HUB_REPO_DIR_RE = re.compile(r"(?:models|datasets|spaces)--.+")
+_EXT_DEF_FILE_RE = re.compile(
+    r"^ext_def_file:\s*(?:['\"]([^'\"]+)['\"]|(\S+))\s*(?:#.*)?$",
+    re.MULTILINE,
+)
 _CHECKPOINT_METADATA_FILES = (
     "config.json",
     "hf_quant_config.json",
@@ -383,13 +387,33 @@ def _normalize_load_format(load_format: str) -> str:
     return normalized
 
 
+def _ext_def_file_from_yaml_text(yaml_text: str) -> str | None:
+    """Return the top-level ``ext_def_file`` path from an extensible yaml.
+
+    The L3 namespace must be the same whether or not PyYAML is installed
+    (Mooncake L3 CI does not ship it). ``ExtensibleModelLoader`` reads
+    this as a top-level mapping key; the yaml bytes are hashed in full,
+    so nested processor config still rotates the id.
+    """
+
+    match = _EXT_DEF_FILE_RE.search(yaml_text)
+    if match is None:
+        return None
+    path = match.group(1) or match.group(2)
+    if not path or path in ("|", ">", "null", "~", "{}", "[]"):
+        return None
+    return path
+
+
 def _extensible_fingerprint(ext_yaml: str, *, load_format: str) -> str:
     """Hash ``--ext-yaml`` and the extension module it loads, if any.
 
     ``ExtensibleModelLoader`` reads both. A Hugging Face snapshot commit
     does not cover those files, so they must enter the checkpoint id
     before the snapshot shortcut returns. Non-extensible loaders must
-    pass an empty path.
+    pass an empty path. Parsing does not import PyYAML: two hosts that
+    share the yaml and ``ext_def_file`` must produce the same digest
+    even when only one has the yaml package.
     """
 
     if load_format != "extensible":
@@ -399,15 +423,15 @@ def _extensible_fingerprint(ext_yaml: str, *, load_format: str) -> str:
     yaml_path = os.path.abspath(ext_yaml)
     hasher = hashlib.sha256()
     hasher.update(b"ext_yaml")
-    _update_file_digest(hasher, yaml_path)
-    import yaml
-
-    with open(yaml_path, encoding="utf-8") as handle:
-        config = yaml.safe_load(handle)
-    if not isinstance(config, dict):
+    with open(yaml_path, "rb") as handle:
+        yaml_bytes = handle.read()
+    hasher.update(yaml_bytes)
+    try:
+        yaml_text = yaml_bytes.decode("utf-8")
+    except UnicodeDecodeError:
         return hasher.hexdigest()
-    ext_def = config.get("ext_def_file")
-    if not isinstance(ext_def, str) or not ext_def.strip():
+    ext_def = _ext_def_file_from_yaml_text(yaml_text)
+    if ext_def is None:
         return hasher.hexdigest()
     def_path = ext_def
     if not os.path.isabs(def_path):
