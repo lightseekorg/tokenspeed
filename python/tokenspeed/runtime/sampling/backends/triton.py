@@ -309,6 +309,18 @@ class TritonSamplingBackend(SamplingBackend):
             return
 
         rows = logits.shape[0]
+        if current_platform().is_npu:
+            # NPU fallback: the selected-token-logprobs Triton kernel is
+            # CUDA-only. Compute log_softmax on the sampled tokens with torch
+            # ops (logsumexp over the vocab row, no full softmax materialized).
+            # GPU platforms keep the Triton kernel path below.
+            logits_fp32 = logits.float()
+            sampled_idx = sampled.reshape(-1, 1).to(torch.int64)
+            selected = logits_fp32.gather(1, sampled_idx).squeeze(1)
+            logsumexp = torch.logsumexp(logits_fp32, dim=-1)
+            logits_output.next_token_logprobs = (selected - logsumexp)[:rows]
+            return
+
         selected_out = self._selected_logprob_out[:rows]
         logits_output.next_token_logprobs = selected_token_logprobs(
             logits, sampled, selected_out
