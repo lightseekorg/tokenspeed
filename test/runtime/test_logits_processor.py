@@ -126,6 +126,12 @@ def test_force_deterministic_rsag_disables_logits_symm_mem(
 def _set_fabric(monkeypatch, supported: bool) -> None:
     import tokenspeed_kernel.ops.communication.fabric as fabric
 
+    # These tests model NVIDIA multicast regardless of the runner's platform.
+    monkeypatch.setattr(
+        logits_processor_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_nvidia=True),
+    )
     # The topology is what makes these groups host-spread; without it the tests
     # would name a property their own setup never established.
     monkeypatch.setitem(
