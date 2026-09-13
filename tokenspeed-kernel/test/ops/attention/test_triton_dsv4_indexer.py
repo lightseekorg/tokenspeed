@@ -143,7 +143,7 @@ def test_decode_logits_and_topk(heads: int, topk: int) -> None:
         out=out,
         persistent_topk_workspace=None,
         override=None,
-        solution=None,
+        solution="triton",
     )
     assert actual.data_ptr() == out.data_ptr()
     assert (out[-1] == 77).all()
