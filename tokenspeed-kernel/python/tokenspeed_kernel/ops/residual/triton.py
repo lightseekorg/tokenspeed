@@ -2190,3 +2190,69 @@ def mhc_apply_pre(residual: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
             enable_fp_fusion=False,
         )
     return out
+
+
+@triton.jit
+def _normalized_dot_gate_kernel(
+    H,
+    KV,
+    QW,
+    KW,
+    Mask,
+    O,
+    D: tl.constexpr,
+    HC: tl.constexpr,
+    EPS: tl.constexpr,
+    B: tl.constexpr,
+):
+    row = tl.program_id(0)
+    hc = tl.program_id(1)
+    d = tl.arange(0, B)
+    h = tl.load(H + (row * HC + hc) * D + d, d < D, 0).to(tl.float32)
+    key = tl.load(KV + row * (HC + 1) * D + hc * D + d, d < D, 0).to(tl.float32)
+    qw = tl.load(QW + hc * D + d, d < D, 0).to(tl.float32)
+    kw = tl.load(KW + hc * D + d, d < D, 0).to(tl.float32)
+    weight = qw * kw
+    rstd = tl.rsqrt(tl.sum(h * h, 0) / D + EPS) * tl.rsqrt(
+        tl.sum(key * key, 0) / D + EPS
+    )
+    dot = tl.sum(h * weight * key, 0) * rstd * (D**-0.5)
+    magnitude = tl.sqrt(tl.maximum(tl.abs(dot), 1e-6))
+    signed = tl.where(dot.to(tl.int32, bitcast=True) < 0, -magnitude, magnitude)
+    gate = tl.sigmoid(signed)
+    gate = tl.where(tl.load(Mask + row), gate, 0.0)
+    value = tl.load(KV + row * (HC + 1) * D + HC * D + d, d < D, 0).to(tl.float32)
+    out = h + gate * value
+    tl.store(O + (row * HC + hc) * D + d, out, d < D)
+
+
+@register_kernel(
+    "residual",
+    "normalized_dot_gate",
+    name="triton_normalized_dot_gate",
+    solution="triton",
+    signatures=[format_signature(residual=dense_tensor_format(torch.bfloat16))],
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    priority=Priority.PORTABLE,
+)
+def normalized_dot_gate(residual, key_value, query_weight, key_weight, mask, eps):
+    """Apply a normalized, signed-square-root dot-product gate in one pass."""
+    hc, dim = residual.shape[-2:]
+    tokens = residual.numel() // (hc * dim)
+    out = torch.empty_like(residual)
+    if tokens:
+        _normalized_dot_gate_kernel[(tokens, hc)](
+            residual,
+            key_value,
+            query_weight,
+            key_weight,
+            mask,
+            out,
+            dim,
+            hc,
+            eps,
+            triton.next_power_of_2(dim),
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    return out

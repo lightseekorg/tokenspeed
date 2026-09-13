@@ -795,3 +795,55 @@ __all__ = [
     "mhc_post",
     "mhc_pre",
 ]
+
+
+def normalized_dot_gate(residual, key_value, query_weight, key_weight, mask, eps):
+    """Add a shared value to residual streams using a normalized dot gate.
+
+    Args:
+        residual: Contiguous BF16 residual streams [...,C,H].
+        key_value: BF16 [...,(C+1)*H], holding C keys followed by a shared value.
+        query_weight: BF16 query normalization weights [C,H].
+        key_weight: BF16 key normalization weights [C,H].
+        mask: Boolean [...] participation mask; false rows pass through unchanged.
+        eps: Positive epsilon for both RMS normalizations.
+
+    Returns:
+        BF16 [...,C,H]. Each stream uses sigmoid(signed_sqrt(dot)) as its
+        value gate; dot is the weighted normalized dot divided by sqrt(H).
+        The square-root magnitude is floored at sqrt(1e-6), matching Engram.
+    """
+    if residual.ndim < 3 or min(residual.shape[-2:]) < 1:
+        raise ValueError("normalized_dot_gate requires residual [...,C,H]")
+    hc, dim = residual.shape[-2:]
+    shape = residual.shape[:-2]
+    if (
+        key_value.shape != (*shape, (hc + 1) * dim)
+        or query_weight.shape != (hc, dim)
+        or key_weight.shape != (hc, dim)
+        or mask.shape != shape
+        or mask.dtype != _torch.bool
+        or eps <= 0
+    ):
+        raise ValueError("normalized_dot_gate shapes, mask or epsilon are invalid")
+    values = (residual, key_value, query_weight, key_weight)
+    if (
+        not residual.is_cuda
+        or any(t.dtype != _torch.bfloat16 for t in values)
+        or any(
+            not t.is_contiguous() or t.device != residual.device
+            for t in (*values, mask)
+        )
+    ):
+        raise ValueError(
+            "normalized_dot_gate requires contiguous colocated GPU BF16 operands"
+        )
+    kernel = select_kernel(
+        "residual",
+        "normalized_dot_gate",
+        format_signature(residual=dense_tensor_format(residual.dtype)),
+        traits=None,
+        override=None,
+        solution=None,
+    )
+    return kernel(residual, key_value, query_weight, key_weight, mask, eps)
