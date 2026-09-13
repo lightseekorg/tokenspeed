@@ -161,7 +161,8 @@ void MeasureEvictableCandidates(std::int32_t pool_size, std::int32_t iterations)
     for (std::int32_t i = 0; i < pool_size; ++i) {
         index.Register(pool, blocks[static_cast<std::size_t>(i)],
                        CacheKey{.group_id = 0, .content_hash = std::to_string(i), .page_offset = 0},
-                       /*access_epoch=*/static_cast<std::uint64_t>(i));
+                       /*access_epoch=*/static_cast<std::uint64_t>(i), /*logical_block_index=*/-1,
+                       CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr);
     }
     blocks.clear();
     Measure("evictable_candidates", pool_size, pool_size, iterations,
@@ -173,7 +174,8 @@ CacheCoordinator MakeAdmissionCoordinator(BlockPool& pool) {
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
-    return MakeCoordinator(specs, /*prefix_granularity=*/4, pool);
+    return MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*host_pool=*/nullptr,
+                           /*stream_device_cache_to_host=*/true);
 }
 
 void FillAdmissionCache(CacheCoordinator& coordinator, BlockPool& pool, std::int32_t pool_size) {
@@ -185,7 +187,8 @@ void FillAdmissionCache(CacheCoordinator& coordinator, BlockPool& pool, std::int
         coordinator.GroupPrefixIndex(0).Register(
             pool, block,
             CacheKey{.group_id = 0, .content_hash = "admission-cache-" + std::to_string(i), .page_offset = 0},
-            /*access_epoch=*/static_cast<std::uint64_t>(i + 1));
+            /*access_epoch=*/static_cast<std::uint64_t>(i + 1), /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+            /*newly_cached=*/nullptr);
     }
 }
 
@@ -197,7 +200,7 @@ void MeasureAdmission(std::int32_t pool_size, std::int32_t iterations) {
     std::array<GroupDemand, 1> no_demand{GroupDemand{.table = &table}};
     Measure("admit_no_demand_cached_pool", pool_size, 0, iterations, [&] {
         const std::optional<CacheCoordinator::AdmissionResult> result =
-            coordinator.Admit(coordinator.ProbePrefix({}), no_demand);
+            coordinator.Admit(coordinator.ProbePrefix({}), no_demand, /*request_access_epoch=*/std::nullopt);
         if (!result) {
             std::abort();
         }
@@ -208,7 +211,7 @@ void MeasureAdmission(std::int32_t pool_size, std::int32_t iterations) {
     std::uint64_t next_key = static_cast<std::uint64_t>(pool_size);
     Measure("admit_small_demand_evict_and_restore", pool_size, 1, iterations, [&] {
         const std::optional<CacheCoordinator::AdmissionResult> result =
-            coordinator.Admit(coordinator.ProbePrefix({}), demand);
+            coordinator.Admit(coordinator.ProbePrefix({}), demand, /*request_access_epoch=*/std::nullopt);
         if (!result) {
             std::abort();
         }
@@ -227,7 +230,8 @@ void MeasureAdmission(std::int32_t pool_size, std::int32_t iterations) {
         coordinator.GroupPrefixIndex(0).Register(
             pool, block,
             CacheKey{.group_id = 0, .content_hash = "admission-cache-" + std::to_string(next_key), .page_offset = 0},
-            /*access_epoch=*/next_key);
+            /*access_epoch=*/next_key, /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+            /*newly_cached=*/nullptr);
         return checksum;
     });
 }
@@ -283,7 +287,8 @@ void MeasureHostBlockAcquisition(std::int32_t pool_size, std::int32_t iterations
         coordinator.GroupPrefixIndex(0).Register(
             host_pool, block,
             CacheKey{.group_id = 0, .content_hash = "host-cache-" + std::to_string(i), .page_offset = 0},
-            /*access_epoch=*/static_cast<std::uint64_t>(i + 1));
+            /*access_epoch=*/static_cast<std::uint64_t>(i + 1), /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+            /*newly_cached=*/nullptr);
     }
 
     const std::array<std::uint32_t, 1> group_ids{0};
