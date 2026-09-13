@@ -416,8 +416,8 @@ frontend `server_args`.
 Context-parallel workers (`ENABLE_CP`) share
 `attn_tp_rank == 0` and are distinguished by `c{cp_rank}` plus `cp_size`
 in the hashed namespace. Without PP, only `cp_rank==0` owns the request
-socket and `recv_reqs` broadcasts across CP so exists MIN is
-rank-identical. GQA with TP above the KV-head count assigns
+socket and load reporting, and `recv_reqs` broadcasts across CP so exists
+MIN is rank-identical. GQA with TP above the KV-head count assigns
 different heads to the same `r{tp_rank}`, so `attn_tp_size` (resolved
 `mapping.attn.tp_size`) is also in the namespace.
 `global_segment_size` is split across

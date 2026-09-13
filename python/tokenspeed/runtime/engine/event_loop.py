@@ -849,6 +849,20 @@ class EventLoop:
         )
         return DistributedInitializer.initialize(distributed_config)
 
+    def _owns_request_io(self) -> bool:
+        """True when this rank owns the tokenizer ZMQ pair and load reports.
+
+        PP: only global rank 0. Otherwise attention TP rank 0 and CP rank 0,
+        because ``ENABLE_CP`` leaves every worker at ``attn_tp_rank == 0``.
+        Load reporting must use this same predicate: nonowners get a
+        ``NullSender`` with no ``set_load_snapshot``.
+        """
+
+        mapping = self.server_args.mapping
+        if mapping.has_pp:
+            return mapping.rank == 0
+        return self.attn_tp_rank == 0 and mapping.attn.cp_rank == 0
+
     def _init_interprocess_comm(self):
         context = zmq.Context(2)
         # Chunk-pipeline: request I/O is owned by GLOBAL rank 0 only —
@@ -856,12 +870,7 @@ class EventLoop:
         # frontend socket pair. recv_reqs broadcasts over the world group.
         # ENABLE_CP without PP: every worker is attn_tp_rank 0, so only
         # cp_rank 0 owns the socket; RequestHandler fans recv_reqs across CP.
-        owns_request_io = (
-            self.server_args.mapping.rank == 0
-            if self.server_args.mapping.has_pp
-            else (self.attn_tp_rank == 0 and self.server_args.mapping.attn.cp_rank == 0)
-        )
-        if owns_request_io:
+        if self._owns_request_io():
             if self.server_args.zmq_msgpack:
                 # SMG drives the scheduler directly: it binds the sockets and
                 # this engine connects in over the msgpack wire; the handshake
@@ -890,7 +899,7 @@ class EventLoop:
             self.send_to_tokenizer = NullSender()
 
     def _init_load_reporter(self) -> None:
-        reports_load = self.attn_tp_rank == 0
+        reports_load = self._owns_request_io()
         self.load_reporter = create_load_reporter(
             enabled=reports_load,
             # Bound only in direct-ZMQ mode, and only where it is used: other
