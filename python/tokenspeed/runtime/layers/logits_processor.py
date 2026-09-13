@@ -918,6 +918,14 @@ def fused_softcap_kernel(
 
 
 def fused_softcap(full_logits, final_logit_softcapping):
+    if getattr(full_logits, "is_npu", False):
+        # NPU: torch reference of fused_softcap_kernel — elementwise
+        # soft-capping in place (2*sigmoid(2x)-1 == stable tanh).
+        flat = full_logits.reshape(-1)
+        x = flat / final_logit_softcapping
+        x = 2 * torch.sigmoid(2 * x) - 1
+        flat.copy_(x * final_logit_softcapping)
+        return full_logits
     n_elements = full_logits.numel()
     BLOCK_SIZE = 1024
     grid = ((n_elements + BLOCK_SIZE - 1) // BLOCK_SIZE, 1, 1)

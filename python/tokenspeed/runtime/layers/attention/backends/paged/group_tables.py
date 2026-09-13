@@ -256,7 +256,7 @@ class GroupTableStacks:
                     f"cache group {gid!r} table has {src.shape[0]} request rows for "
                     f"a live batch of {actual_bs}"
                 )
-        if self.tables.is_cuda or getattr(self.tables, "is_npu", False):
+        if self.tables.is_cuda:
             stack_max_num_pages = self.tables.shape[2]
             block_cols = 128 if stack_max_num_pages >= 128 else 64
             for i, src in enumerate(srcs):
@@ -275,6 +275,8 @@ class GroupTableStacks:
                     BLOCK_COLS=block_cols,
                 )
             return
+        # CPU / NPU: the torch reference of the unpack kernel (unit tests use
+        # the CPU path; NPU takes it as the equivalent torch implementation).
         self._fill_torch(bs, actual_bs, srcs)
 
     def _fill_torch(

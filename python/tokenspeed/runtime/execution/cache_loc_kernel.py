@@ -186,6 +186,20 @@ def fused_decode_input_prep(
     per-iter indexSelect + add are gone too.
     """
     batch_size = req_pool_indices.shape[0]
+
+    if getattr(req_pool_indices, "is_npu", False):
+        # NPU: torch reference of fused_decode_input_prep_kernel — one
+        # gather + arithmetic instead of a Triton launch.
+        device = req_pool_indices.device
+        cache_start = valid_cache_lengths[req_pool_indices]  # [batch_size]
+        seq_lens_out_ptr.copy_(cache_start + uniform_input_length)
+        steps = torch.arange(uniform_input_length, dtype=torch.int64, device=device)
+        positions = cache_start.to(torch.int64).unsqueeze(1) + steps
+        positions_ptr[: batch_size * uniform_input_length].copy_(
+            positions.reshape(-1)
+        )
+        return
+
     BLOCK_SIZE = 128
     grid = (batch_size,)
     fused_decode_input_prep_kernel[grid](
@@ -255,6 +269,34 @@ def dflash_prepare_decode(
     publishes the block window through the draft router
     (``publish_draft_step_locations``), the single slot-math owner."""
     batch_size = req_pool_indices.shape[0]
+
+    if getattr(req_pool_indices, "is_npu", False):
+        # NPU: torch reference of dflash_prepare_decode_kernel. Note the
+        # kernel writes block_ids / block_positions in REQUEST order (the
+        # pool index only feeds the reads).
+        device = req_pool_indices.device
+        old_len = valid_cache_lengths[req_pool_indices].to(torch.int64)  # [bs]
+        accept_len = accept_lengths.to(torch.int64)
+        prefix_len = torch.minimum(
+            old_len + accept_len, torch.full_like(old_len, max_draft_prefix)
+        )
+        draft_seq_lens.copy_(prefix_len)
+
+        safe_accept = accept_len.clamp(1, verify_width)
+        tok_idx = req_pool_indices.to(torch.int64) * verify_width + safe_accept - 1
+        current_token = output_tokens[tok_idx]
+        req = torch.arange(batch_size, device=device, dtype=torch.int64)
+        block_ids_flat = block_ids.reshape(-1)
+        block_ids_flat[req * block_ids.stride(0)] = current_token
+
+        steps = torch.arange(draft_query_width, dtype=torch.int64, device=device)
+        block_positions_flat = block_positions.reshape(-1)
+        write_idx = (req * draft_query_width).unsqueeze(1) + steps
+        block_positions_flat[write_idx.reshape(-1)] = (
+            prefix_len.unsqueeze(1) + steps
+        ).reshape(-1).to(block_positions.dtype)
+        return
+
     BLOCK_SIZE = triton.next_power_of_2(draft_query_width)
     grid = (batch_size,)
     dflash_prepare_decode_kernel[grid](
@@ -288,6 +330,24 @@ def compute_out_cache_loc_uniform(
     """
     batch_size = cache_start.shape[0]
     max_pages = page_table.shape[1]
+
+    if getattr(cache_start, "is_npu", False):
+        # NPU: torch reference of compute_out_cache_loc_kernel (uniform
+        # mode): slot = page_table[req, pos // P] * P + pos % P, with
+        # overflow/hole pages (id <= 0) routed to slot 0.
+        device = cache_start.device
+        steps = torch.arange(uniform_input_length, dtype=torch.int64, device=device)
+        pos = cache_start.to(torch.int64).unsqueeze(1) + steps  # [bs, len]
+        page_idx = pos // page_size
+        overflow = page_idx >= max_pages
+        page_idx = page_idx.clamp_max(max_pages - 1)
+        pages = page_table[:batch_size].to(torch.int64).gather(1, page_idx)
+        locs = pages * page_size + pos % page_size
+        locs = torch.where(overflow | (pages <= 0), torch.zeros_like(locs), locs)
+        out_cache_loc_ptr[: batch_size * uniform_input_length].copy_(
+            locs.reshape(-1).to(out_cache_loc_ptr.dtype)
+        )
+        return
 
     BLOCK_SIZE = 128
     grid = (batch_size,)

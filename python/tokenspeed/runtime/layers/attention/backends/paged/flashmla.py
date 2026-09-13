@@ -50,6 +50,7 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.attention.utils import (
+    create_flashinfer_kv_indices,
     create_flashinfer_kv_indices_triton,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -780,7 +781,7 @@ class _PrefillIndicesUpdater:
             dtype=torch.int32,
             device=seq_lens.device,
         )
-        create_flashinfer_kv_indices_triton[(bs,)](
+        create_flashinfer_kv_indices(
             page_table,
             paged_kernel_lens,
             kv_indptr,

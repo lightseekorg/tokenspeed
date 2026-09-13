@@ -176,7 +176,7 @@ def decode_write_locations(
             f"decode write-location buffer holds {out.shape[1]} slots per group, "
             f"need {num_tokens} (bs={bs}, tokens_per_req={n})"
         )
-    if tables.is_cuda or getattr(tables, "is_npu", False):
+    if tables.is_cuda:
         block = 128
         grid = (tables.shape[0], triton.cdiv(num_tokens, block))
         _decode_locs_kernel[grid](
@@ -193,6 +193,8 @@ def decode_write_locations(
             BLOCK=block,
         )
         return
+    # CPU / NPU: the torch reference of _decode_locs_kernel (unit tests use
+    # the CPU path; NPU takes it as the equivalent torch implementation).
     pos = _decode_positions(seq_lens[:bs], n)
     req = torch.arange(bs, device=tables.device).repeat_interleave(n)
     for g in range(tables.shape[0]):
@@ -230,7 +232,7 @@ def extend_write_locations(
         return out
     cu_extend = torch.zeros(bs + 1, dtype=torch.int32, device=tables.device)
     torch.cumsum(extend_seq_lens, dim=0, out=cu_extend[1:])
-    if tables.is_cuda or getattr(tables, "is_npu", False):
+    if tables.is_cuda:
         _extend_locs_kernel[(tables.shape[0], bs)](
             tables,
             page_sizes,

@@ -142,15 +142,34 @@ def get_chunks_paged(prefix_lens, prefix_lens_cpu, page_table, page_size):
         chunk_kv_indices = torch.empty(
             num_tokens_per_forward[idx], dtype=torch.int32, device=device
         )
-        create_chunked_cache_kv_indices_paged[(batch_size,)](
-            page_table,
-            chunks.starts[idx],
-            chunks.len_in_chunk[idx],
-            chunks.cum_seq_lens[idx],
-            chunk_kv_indices,
-            page_table.shape[1],
-            page_size,
-        )
+        if device.type == "npu":
+            # NPU: torch reference of create_chunked_cache_kv_indices_paged —
+            # kv_slot = page_id * PAGE_SIZE + token_pos % PAGE_SIZE.
+            lens = chunks.len_in_chunk[idx].to(torch.int64)  # [bs]
+            starts = chunks.starts[idx].to(torch.int64)  # [bs]
+            cum = torch.cumsum(lens, dim=0)  # [bs]
+            out_offset = torch.cat(
+                [torch.zeros(1, dtype=torch.int64, device=device), cum[:-1]]
+            )
+            req = torch.arange(batch_size, device=device).repeat_interleave(lens)
+            token_pos = starts[req] + (
+                torch.arange(num_tokens_per_forward[idx], device=device)
+                - out_offset[req]
+            )
+            page_idx = token_pos // page_size
+            page_id = page_table[req, page_idx].to(torch.int64)
+            kv_slot = page_id * page_size + token_pos % page_size
+            chunk_kv_indices.copy_(kv_slot.to(torch.int32))
+        else:
+            create_chunked_cache_kv_indices_paged[(batch_size,)](
+                page_table,
+                chunks.starts[idx],
+                chunks.len_in_chunk[idx],
+                chunks.cum_seq_lens[idx],
+                chunk_kv_indices,
+                page_table.shape[1],
+                page_size,
+            )
         chunk_kv_indices_list.append(chunk_kv_indices)
 
     return chunks, chunk_kv_indices_list, chunks_cpu

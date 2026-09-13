@@ -107,6 +107,35 @@ def compute_position_triton(
         batch_size, dtype=torch.int32, device=extend_seq_lens.device
     )
     has_prefix = extend_prefix_lens.shape[0] == batch_size
+
+    if getattr(extend_seq_lens, "is_npu", False):
+        # NPU: torch reference of compute_position_kernel — per-request
+        # positions offset by the cached prefix, and the per-request output
+        # offset (cumsum of the extend seq lens). Same semantics, no Triton.
+        if batch_size > 0:
+            device = extend_seq_lens.device
+            seq_lens = extend_seq_lens.to(torch.int64)
+            prefix_lens = (
+                extend_prefix_lens.to(torch.int64)
+                if has_prefix
+                else torch.zeros(batch_size, dtype=torch.int64, device=device)
+            )
+            start_locs = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int64, device=device),
+                    torch.cumsum(seq_lens, dim=0)[:-1],
+                ]
+            )
+            req = torch.arange(batch_size, device=device).repeat_interleave(seq_lens)
+            pos_vals = (
+                prefix_lens[req]
+                + torch.arange(extend_seq_lens_sum, device=device)
+                - start_locs[req]
+            )
+            positions[:extend_seq_lens_sum].copy_(pos_vals)
+            extend_start_loc.copy_(start_locs.to(torch.int32))
+        return positions, extend_start_loc
+
     # Launch kernel
     compute_position_kernel[(batch_size,)](
         positions, extend_start_loc, extend_prefix_lens, extend_seq_lens, has_prefix

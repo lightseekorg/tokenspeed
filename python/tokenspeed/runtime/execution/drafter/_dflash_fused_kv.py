@@ -223,11 +223,58 @@ def _fused_norm_rope_stacked_scatter(
     kv_size = num_kv_heads * head_dim
     half_rotary_dim = rotary_dim // 2
     BLOCK_HD = triton.next_power_of_2(head_dim)
+    is_fp8 = k_buffers[0].dtype == torch.float8_e4m3fn
+    use_provided_scale = inv_k_scales is not None and inv_v_scales is not None
+
+    if getattr(kv, "is_npu", False):
+        # NPU: torch reference of _fused_norm_rope_scatter_kernel — compute
+        # the RMSNorm(K) + RoPE(K) materialization with torch ops, then
+        # scatter each layer's rows into the KV pool buffers at ``loc``.
+        device = kv.device
+        k = kv[..., :kv_size].view(n_layers, total_ctx, num_kv_heads, head_dim)
+        v = kv[..., kv_size:].view(n_layers, total_ctx, num_kv_heads, head_dim)
+        k_f = k.to(torch.float32)
+        inv_rms = torch.rsqrt(
+            k_f.pow(2).mean(dim=-1, keepdim=True)
+            + eps.view(n_layers, 1, 1, 1)
+        )
+        norm_w = k_norm_weight.view(n_layers, 1, 1, head_dim).to(torch.float32)
+        k_normed = k_f * inv_rms * norm_w
+        pos = positions.to(torch.int64)
+        cos = cos_sin_cache[pos, :half_rotary_dim].view(
+            total_ctx, 1, half_rotary_dim
+        )
+        sin = cos_sin_cache[pos, half_rotary_dim:rotary_dim].view(
+            total_ctx, 1, half_rotary_dim
+        )
+        k_first = k_normed[..., :half_rotary_dim]
+        k_second = k_normed[..., half_rotary_dim:rotary_dim]
+        k_rot_first = k_first * cos - k_second * sin
+        k_rot_second = k_second * cos + k_first * sin
+        k_mat = torch.cat(
+            [k_rot_first, k_rot_second, k_normed[..., rotary_dim:]], dim=-1
+        )  # [n_layers, total_ctx, num_kv_heads, head_dim]
+        if is_fp8:
+            if use_provided_scale:
+                inv_k = inv_k_scales.view(n_layers, 1, 1, 1).to(torch.float32)
+                inv_v = inv_v_scales.view(n_layers, 1, 1, 1).to(torch.float32)
+            else:
+                inv_k = torch.ones(n_layers, 1, 1, 1, device=device)
+                inv_v = inv_k
+            k_out_mat = (k_mat * inv_k).to(torch.float8_e4m3fn)
+            v_out_mat = (v.to(torch.float32) * inv_v).to(torch.float8_e4m3fn)
+        else:
+            k_out_mat = k_mat.to(kv.dtype)
+            v_out_mat = v
+        slots = loc.to(torch.int64)  # [total_ctx]
+        for layer in range(n_layers):
+            k_buffers[layer][slots] = k_out_mat[layer].reshape(total_ctx, kv_size)
+            v_buffers[layer][slots] = v_out_mat[layer].reshape(total_ctx, kv_size)
+        return
+
     k_ptrs, v_ptrs = _get_kv_buffer_ptrs(k_buffers, v_buffers)
     dst_row_stride = k_buffers[0].stride(0)
 
-    is_fp8 = k_buffers[0].dtype == torch.float8_e4m3fn
-    use_provided_scale = inv_k_scales is not None and inv_v_scales is not None
     if use_provided_scale:
         inv_k_arg = inv_k_scales
         inv_v_arg = inv_v_scales
@@ -398,6 +445,43 @@ def _fused_norm_rope_stacked(
     kv_size = num_kv_heads * head_dim
     half_rotary_dim = rotary_dim // 2
     BLOCK_HD = triton.next_power_of_2(head_dim)
+
+    if getattr(kv, "is_npu", False):
+        # NPU: torch reference of _fused_norm_rope_kernel_stacked —
+        # RMSNorm(K) + RoPE(K) per layer, V stored raw.
+        device = kv.device
+        expected_shape = (n_layers, total_ctx, num_kv_heads, head_dim)
+        k = kv[..., :kv_size].view(n_layers, total_ctx, num_kv_heads, head_dim)
+        v = kv[..., kv_size:].view(n_layers, total_ctx, num_kv_heads, head_dim)
+        k_f = k.to(torch.float32)
+        inv_rms = torch.rsqrt(
+            k_f.pow(2).mean(dim=-1, keepdim=True)
+            + eps.view(n_layers, 1, 1, 1)
+        )
+        norm_w = k_norm_weight.view(n_layers, 1, 1, head_dim).to(torch.float32)
+        k_normed = k_f * inv_rms * norm_w
+        pos = positions.to(torch.int64)
+        cos = cos_sin_cache[pos, :half_rotary_dim].view(
+            total_ctx, 1, half_rotary_dim
+        )
+        sin = cos_sin_cache[pos, half_rotary_dim:rotary_dim].view(
+            total_ctx, 1, half_rotary_dim
+        )
+        k_first = k_normed[..., :half_rotary_dim]
+        k_second = k_normed[..., half_rotary_dim:rotary_dim]
+        k_rot_first = k_first * cos - k_second * sin
+        k_rot_second = k_second * cos + k_first * sin
+        k_mat = torch.cat(
+            [k_rot_first, k_rot_second, k_normed[..., rotary_dim:]], dim=-1
+        ).to(kv.dtype)
+        if k_out is None:
+            k_out = torch.empty(expected_shape, dtype=kv.dtype, device=device)
+        if v_out is None:
+            v_out = torch.empty_like(k_out)
+        k_out.copy_(k_mat)
+        v_out.copy_(v)
+        return k_out, v_out
+
     expected_shape = (n_layers, total_ctx, num_kv_heads, head_dim)
     if k_out is None:
         k_out = torch.empty(expected_shape, dtype=kv.dtype, device=kv.device)

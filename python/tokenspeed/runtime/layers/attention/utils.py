@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import torch
 import triton
 import triton.language as tl
 
@@ -51,6 +52,37 @@ def create_flashinfer_kv_indices_triton(
             mask=mask,
         )
         tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
+
+
+def create_flashinfer_kv_indices(
+    page_table: torch.Tensor,
+    page_kernel_lens: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    page_table_stride: int,
+) -> None:
+    """Fill ``kv_indices`` with each request's page-table rows.
+
+    CUDA tensors run the Triton kernel; NPU tensors take the equivalent torch
+    implementation (per-request rows copied into ``[kv_indptr[pid], ...)``).
+    """
+    if getattr(page_table, "is_npu", False):
+        bs = page_kernel_lens.shape[0]
+        total = kv_indices.numel()
+        lens = page_kernel_lens.to(torch.int64)
+        req = torch.arange(bs, device=page_table.device).repeat_interleave(lens)
+        row_start = kv_indptr.to(torch.int64)[req]
+        within = torch.arange(total, device=page_table.device) - row_start
+        kv_indices.copy_(page_table[req, within])
+        return
+    bs = page_kernel_lens.shape[0]
+    create_flashinfer_kv_indices_triton[(bs,)](
+        page_table,
+        page_kernel_lens,
+        kv_indptr,
+        kv_indices,
+        page_table.shape[1],
+    )
 
 
 # --- Page-based memory profiling ---
