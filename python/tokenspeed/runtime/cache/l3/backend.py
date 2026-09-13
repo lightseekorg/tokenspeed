@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import ast
 import fnmatch
 import functools
 import glob
@@ -214,7 +215,10 @@ def l3_checkpoint_id(
     ``--trust-remote-code`` configuration/modeling helpers that derive
     architecture fields cannot share a namespace with identical
     JSON/weights. ``extensible`` also hashes ``--ext-yaml`` and the
-    ``ext_def_file`` that ``ExtensibleModelLoader`` imports, so a custom
+    ``ext_def_file`` that ``ExtensibleLM`` imports — resolved with
+    ``os.path.abspath`` relative to the process working directory, the
+    same way the loader does — plus that module's transitive local
+    helpers under the directory inserted into ``sys.path``, so a custom
     input processor cannot share a namespace with the same checkpoint.
     ``sharded_state`` fingerprints the files
     ``model_loader_extra_config["pattern"]`` selects
@@ -405,14 +409,164 @@ def _ext_def_file_from_yaml_text(yaml_text: str) -> str | None:
     return path
 
 
+def _contained_in_dir(path: str, root: str) -> bool:
+    path_abs = os.path.abspath(path)
+    root_abs = os.path.abspath(root)
+    if path_abs == root_abs:
+        return True
+    try:
+        return os.path.commonpath([path_abs, root_abs]) == root_abs
+    except ValueError:
+        return False
+
+
+def _extension_module_files(module_name: str, *, ext_def_dir: str) -> tuple[str, ...]:
+    """Return local files ExtensibleLM could load for ``module_name``.
+
+    Prefixes are included because ``import pkg.sub`` loads ``pkg`` then
+    ``pkg.sub``. Only paths that stay under the inserted ``sys.path``
+    directory are returned.
+    """
+
+    found: list[str] = []
+    parts = module_name.split(".")
+    for index in range(len(parts)):
+        prefix = parts[: index + 1]
+        base = os.path.join(ext_def_dir, *prefix)
+        for candidate in (f"{base}.py", os.path.join(base, "__init__.py")):
+            if not os.path.isfile(candidate):
+                continue
+            if not _contained_in_dir(candidate, ext_def_dir):
+                continue
+            found.append(candidate)
+    return tuple(found)
+
+
+def _ast_local_extension_imports(
+    source: str, *, current_file: str, ext_def_dir: str
+) -> tuple[str, ...]:
+    """Return local files imported by ``source`` under ``ext_def_dir``."""
+
+    try:
+        tree = ast.parse(source, filename=current_file)
+    except SyntaxError:
+        return ()
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                found.extend(
+                    _extension_module_files(alias.name, ext_def_dir=ext_def_dir)
+                )
+            continue
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        names = tuple(alias.name for alias in node.names)
+        if node.level:
+            package_dir = os.path.dirname(os.path.abspath(current_file))
+            for _ in range(node.level):
+                package_dir = os.path.dirname(package_dir)
+            if not _contained_in_dir(package_dir, ext_def_dir):
+                continue
+            module_parts = () if node.module is None else tuple(node.module.split("."))
+            search_root = (
+                os.path.join(package_dir, *module_parts)
+                if module_parts
+                else package_dir
+            )
+            if module_parts:
+                for index in range(len(module_parts)):
+                    prefix = module_parts[: index + 1]
+                    base = os.path.join(package_dir, *prefix)
+                    for candidate in (
+                        f"{base}.py",
+                        os.path.join(base, "__init__.py"),
+                    ):
+                        if os.path.isfile(candidate) and _contained_in_dir(
+                            candidate, ext_def_dir
+                        ):
+                            found.append(candidate)
+            for name in names:
+                if name == "*":
+                    continue
+                base = os.path.join(search_root, name)
+                for candidate in (f"{base}.py", os.path.join(base, "__init__.py")):
+                    if os.path.isfile(candidate) and _contained_in_dir(
+                        candidate, ext_def_dir
+                    ):
+                        found.append(candidate)
+            continue
+        if node.module is None:
+            continue
+        found.extend(_extension_module_files(node.module, ext_def_dir=ext_def_dir))
+        for name in names:
+            if name == "*":
+                continue
+            found.extend(
+                _extension_module_files(
+                    f"{node.module}.{name}", ext_def_dir=ext_def_dir
+                )
+            )
+    return tuple(found)
+
+
+def _extension_imported_code_files(entrypoint: str) -> tuple[tuple[str, str], ...]:
+    """Return ``(relative posix path, path)`` for the imported extension.
+
+    ``ExtensibleLM`` inserts ``dirname(abspath(ext_def_file))`` into
+    ``sys.path`` and imports the file's stem. Sibling modules and
+    packages loaded from that directory can change embeddings and KV, so
+    the L3 identity follows those local imports. Stdlib and site
+    packages are omitted because they do not live under that directory.
+    Directory and file symlinks are followed the same way Python imports
+    them; lexical containment keeps ``../`` relative imports from
+    escaping the extension directory.
+    """
+
+    entry = os.path.abspath(entrypoint)
+    ext_def_dir = os.path.dirname(entry)
+    pending = [entry]
+    seen_real: set[str] = set()
+    found: list[tuple[str, str]] = []
+    while pending:
+        path = pending.pop()
+        real = os.path.realpath(path)
+        if real in seen_real:
+            continue
+        if not os.path.isfile(path):
+            continue
+        if not _contained_in_dir(path, ext_def_dir):
+            continue
+        seen_real.add(real)
+        rel = os.path.relpath(path, ext_def_dir)
+        rel_posix = "/".join(rel.split(os.sep))
+        found.append((rel_posix, path))
+        try:
+            with open(path, encoding="utf-8") as handle:
+                source = handle.read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        pending.extend(
+            _ast_local_extension_imports(
+                source, current_file=path, ext_def_dir=ext_def_dir
+            )
+        )
+    found.sort(key=lambda item: item[0])
+    return tuple(found)
+
+
 def _extensible_fingerprint(ext_yaml: str, *, load_format: str) -> str:
     """Hash ``--ext-yaml`` and the extension module it loads, if any.
 
-    ``ExtensibleModelLoader`` reads both. A Hugging Face snapshot commit
-    does not cover those files, so they must enter the checkpoint id
-    before the snapshot shortcut returns. Non-extensible loaders must
-    pass an empty path. Parsing does not import PyYAML: two hosts that
-    share the yaml and ``ext_def_file`` must produce the same digest
+    ``ExtensibleLM`` reads both. A Hugging Face snapshot commit does not
+    cover those files, so they must enter the checkpoint id before the
+    snapshot shortcut returns. Relative ``ext_def_file`` values are
+    resolved with ``os.path.abspath`` against the process working
+    directory, matching the loader, not the YAML directory. The digest
+    includes that file and the local helpers it transitively imports
+    from the inserted ``sys.path`` directory. Non-extensible loaders
+    must pass an empty path. Parsing does not import PyYAML: two hosts
+    that share the yaml and extension code must produce the same digest
     even when only one has the yaml package.
     """
 
@@ -433,11 +587,14 @@ def _extensible_fingerprint(ext_yaml: str, *, load_format: str) -> str:
     ext_def = _ext_def_file_from_yaml_text(yaml_text)
     if ext_def is None:
         return hasher.hexdigest()
-    def_path = ext_def
-    if not os.path.isabs(def_path):
-        def_path = os.path.join(os.path.dirname(yaml_path), def_path)
+    def_path = os.path.abspath(ext_def)
     hasher.update(b"ext_def_file")
-    _update_file_digest(hasher, os.path.abspath(def_path))
+    hasher.update(os.path.basename(def_path).encode())
+    if not os.path.isfile(def_path):
+        raise FileNotFoundError(def_path)
+    for rel, path in _extension_imported_code_files(def_path):
+        hasher.update(rel.encode())
+        _update_file_digest(hasher, path)
     return hasher.hexdigest()
 
 

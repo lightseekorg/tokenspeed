@@ -346,8 +346,10 @@ more than one weight encoding cannot share objects across loaders
 (`sharded_state` combines every rank's local files matching the
 configured shard pattern, default `model-rank-*-part-*`, not only rank
 0's; `npcache` fingerprints the NumPy cache when present; `extensible`
-also hashes `--ext-yaml` and the imported `ext_def_file`, including on a
-Hugging Face hub snapshot whose commit does not cover those files), and
+also hashes `--ext-yaml` and the `ext_def_file` `ExtensibleLM` imports
+with the same cwd-relative `os.path.abspath` resolution as the loader,
+plus that module's transitive local helpers, including on a Hugging Face
+hub snapshot whose commit does not cover those files), and
 `--weight-version`), `--hf-overrides` (the effective
 HF text-config delta: `rope_theta`, `rope_scaling`, and other architecture
 fields), the packed Host layout (field payloads, not GPU-capacity

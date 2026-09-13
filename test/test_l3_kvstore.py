@@ -26,6 +26,7 @@ import sys
 import tempfile
 import types
 import unittest
+from contextlib import chdir
 from types import SimpleNamespace
 from unittest import mock
 
@@ -797,8 +798,9 @@ class StorageKeyTest(unittest.TestCase):
 
             def write_yaml(name: str, ext_def_name: str) -> str:
                 yaml_path = os.path.join(root, name)
+                ext_path = os.path.join(root, ext_def_name)
                 with open(yaml_path, "w", encoding="utf-8") as handle:
-                    handle.write(f"ext_def_file: {ext_def_name}\n")
+                    handle.write(f"ext_def_file: {ext_path}\n")
                 return yaml_path
 
             def write_ext_def(name: str, body: str) -> None:
@@ -829,7 +831,7 @@ class StorageKeyTest(unittest.TestCase):
             self.assertEqual(id_a, extensible_id(yaml_a_copy))
             quoted_yaml = os.path.join(root, "quoted.yaml")
             with open(quoted_yaml, "w", encoding="utf-8") as handle:
-                handle.write('ext_def_file: "a.py"\n')
+                handle.write(f'ext_def_file: "{os.path.join(root, "a.py")}"\n')
             quoted_id = extensible_id(quoted_yaml)
             self.assertNotEqual(quoted_id, id_a)
             write_ext_def("a.py", "PROCESSOR = 'a-changed'\n")
@@ -845,7 +847,7 @@ class StorageKeyTest(unittest.TestCase):
             with open(ext_def, "w", encoding="utf-8") as handle:
                 handle.write("PROCESSOR = 'shared'\n")
             with open(yaml_path, "w", encoding="utf-8") as handle:
-                handle.write("ext_def_file: ext.py\n")
+                handle.write(f"ext_def_file: {ext_def}\n")
             for directory, payload in ((first, b"weights-a"), (second, b"weights-b")):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write("{}")
@@ -871,9 +873,7 @@ class StorageKeyTest(unittest.TestCase):
             self.assertNotEqual(first_id, second_id)
             other_yaml = os.path.join(second, "other.yaml")
             with open(other_yaml, "w", encoding="utf-8") as handle:
-                handle.write("ext_def_file: ext.py\ncontext: {}\n")
-            with open(os.path.join(second, "ext.py"), "w", encoding="utf-8") as handle:
-                handle.write("PROCESSOR = 'shared'\n")
+                handle.write(f"ext_def_file: {ext_def}\ncontext: {{}}\n")
             other_id = l3_checkpoint_id(
                 first,
                 hf_config=SimpleNamespace(),
@@ -883,6 +883,108 @@ class StorageKeyTest(unittest.TestCase):
                 ext_yaml=other_yaml,
             )
             self.assertNotEqual(first_id, other_id)
+
+    def test_checkpoint_id_resolves_ext_def_file_from_cwd_like_loader(self):
+        commit = "e" * 40
+        with tempfile.TemporaryDirectory() as yaml_dir, tempfile.TemporaryDirectory() as cwd_dir:
+            repo = os.path.join(yaml_dir, "hub", "models--org--model")
+            snapshot = os.path.join(repo, "snapshots", commit)
+            os.makedirs(os.path.join(repo, "refs"))
+            os.makedirs(snapshot)
+            with open(os.path.join(snapshot, "config.json"), "w") as handle:
+                handle.write("{}")
+            with open(os.path.join(snapshot, "model.safetensors"), "wb") as handle:
+                handle.write(b"same-weights")
+            yaml_path = os.path.join(yaml_dir, "ext.yaml")
+            yaml_ext = os.path.join(yaml_dir, "ext.py")
+            cwd_ext = os.path.join(cwd_dir, "ext.py")
+            with open(yaml_path, "w", encoding="utf-8") as handle:
+                handle.write("ext_def_file: ext.py\n")
+            with open(yaml_ext, "w", encoding="utf-8") as handle:
+                handle.write("PROCESSOR = 'yaml-dir'\n")
+            with open(cwd_ext, "w", encoding="utf-8") as handle:
+                handle.write("PROCESSOR = 'cwd'\n")
+
+            def extensible_id() -> str:
+                return l3_checkpoint_id(
+                    snapshot,
+                    hf_config=SimpleNamespace(),
+                    revision="main",
+                    load_format="extensible",
+                    model_loader_extra_config={},
+                    ext_yaml=yaml_path,
+                )
+
+            with chdir(cwd_dir):
+                id_cwd = extensible_id()
+                with open(yaml_ext, "w", encoding="utf-8") as handle:
+                    handle.write("PROCESSOR = 'yaml-dir-changed'\n")
+                self.assertEqual(id_cwd, extensible_id())
+                with open(cwd_ext, "w", encoding="utf-8") as handle:
+                    handle.write("PROCESSOR = 'cwd-changed'\n")
+                self.assertNotEqual(id_cwd, extensible_id())
+
+    def test_checkpoint_id_hashes_imported_extension_helpers(self):
+        commit = "f" * 40
+        with tempfile.TemporaryDirectory() as cwd_dir:
+            repo = os.path.join(cwd_dir, "hub", "models--org--model")
+            snapshot = os.path.join(repo, "snapshots", commit)
+            os.makedirs(os.path.join(repo, "refs"))
+            os.makedirs(snapshot)
+            with open(os.path.join(snapshot, "config.json"), "w") as handle:
+                handle.write("{}")
+            with open(os.path.join(snapshot, "model.safetensors"), "wb") as handle:
+                handle.write(b"same-weights")
+            pkg = os.path.join(cwd_dir, "pkg")
+            os.makedirs(pkg)
+            with open(os.path.join(cwd_dir, "ext.py"), "w", encoding="utf-8") as handle:
+                handle.write("import helper\nfrom pkg import inner\n")
+            with open(
+                os.path.join(cwd_dir, "helper.py"), "w", encoding="utf-8"
+            ) as handle:
+                handle.write("VALUE = 1\n")
+            with open(
+                os.path.join(pkg, "__init__.py"), "w", encoding="utf-8"
+            ) as handle:
+                handle.write("")
+            with open(os.path.join(pkg, "inner.py"), "w", encoding="utf-8") as handle:
+                handle.write("VALUE = 1\n")
+            with open(
+                os.path.join(cwd_dir, "unused.py"), "w", encoding="utf-8"
+            ) as handle:
+                handle.write("VALUE = 1\n")
+            yaml_path = os.path.join(cwd_dir, "ext.yaml")
+            with open(yaml_path, "w", encoding="utf-8") as handle:
+                handle.write("ext_def_file: ext.py\n")
+
+            def extensible_id() -> str:
+                return l3_checkpoint_id(
+                    snapshot,
+                    hf_config=SimpleNamespace(),
+                    revision="main",
+                    load_format="extensible",
+                    model_loader_extra_config={},
+                    ext_yaml=yaml_path,
+                )
+
+            with chdir(cwd_dir):
+                id_base = extensible_id()
+                with open(
+                    os.path.join(cwd_dir, "unused.py"), "w", encoding="utf-8"
+                ) as handle:
+                    handle.write("VALUE = 2\n")
+                self.assertEqual(id_base, extensible_id())
+                with open(
+                    os.path.join(cwd_dir, "helper.py"), "w", encoding="utf-8"
+                ) as handle:
+                    handle.write("VALUE = 2\n")
+                id_helper = extensible_id()
+                self.assertNotEqual(id_base, id_helper)
+                with open(
+                    os.path.join(pkg, "inner.py"), "w", encoding="utf-8"
+                ) as handle:
+                    handle.write("VALUE = 2\n")
+                self.assertNotEqual(id_helper, extensible_id())
 
     def test_checkpoint_id_ignores_ext_yaml_unless_extensible(self):
         commit = "a" * 40

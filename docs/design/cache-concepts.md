@@ -625,9 +625,12 @@ Its responsibilities:
   `npcache` hashes `np/weight_names.json` and the listed NumPy files
   when that cache exists, because the loader then skips `*.bin`).
   `extensible` hashes `--ext-yaml` and the `ext_def_file` that
-  `ExtensibleModelLoader` imports — including on a Hugging Face hub
-  snapshot, whose commit does not cover those files — so a custom input
-  processor cannot share a namespace with the same checkpoint bytes.
+  `ExtensibleLM` imports (`os.path.abspath` relative to the process
+  working directory, matching the loader, not the YAML directory) plus
+  the local modules that file transitively imports from the directory
+  inserted into `sys.path` — including on a Hugging Face hub snapshot,
+  whose commit does not cover those files — so a custom input processor
+  cannot share a namespace with the same checkpoint bytes.
   Mistral
   fingerprints include `consolidated.safetensors.index.json` so two dumps
   with the same `consolidated*.safetensors` candidates but different shard
