@@ -729,7 +729,7 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
         if (victim == nullptr) {
             return;  // everything resident is exempt; only a completion can free capacity
         }
-        if (victim->ResultsInFlight() > 0 || pd_transfer_pins_.contains(victim->Id())) {
+        if (victim->ResultsInFlight() > 0 || pdTransferInFlight(*victim)) {
             // The victim is chosen but not quiescent: a forward's KV write or
             // a PD transfer is still landing on its pages. Wait for it
             // rather than sacrificing a worse-ranked request.
@@ -780,16 +780,16 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
             if (auto operation = schedulePrefillCandidate(build.plan, feedback, blocker, budget,
                                                           config_.decode_input_tokens, build.load_backs)) {
                 if (remote_grant) {
+                    // The blocker is now RemotePrefilling: the peer's prefill
+                    // is out against its pages (pdTransferInFlight). A D-role
+                    // LOCAL recovery grant enters Prefilling instead, which
+                    // pins nothing: no PD ACK ever arrives for it (its
+                    // lifetime is the L2 load ticket).
                     build.scheduled.insert(blocker);
                     build.remote_prefill.emplace_back(std::move(*operation));
                 } else {
                     pushOperation(build, *blocker, std::move(*operation));
                     blocker->TrackScheduledForward();
-                }
-                // A D-role LOCAL recovery grant must not pin: no PD ACK ever
-                // arrives to erase it (its lifetime is the L2 load ticket).
-                if (remote_grant) {
-                    pd_transfer_pins_.insert(blocker->Id());
                 }
                 return;
             }
@@ -864,10 +864,6 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
             if (auto operation = schedulePrefillCandidate(build.plan, feedback, request, build.token_budget,
                                                           decode_reserve, build.load_backs)) {
                 pushOperation(build, *request, std::move(*operation));
-                if (config_.role != Role::kFused) {
-                    // Pages stay pinned until the PD transfer completes.
-                    pd_transfer_pins_.insert(request->Id());
-                }
                 request->TrackScheduledForward();
                 if (holdsHeadOfLine(*request)) {
                     return;
@@ -909,8 +905,10 @@ void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& buil
 }
 
 // P role: prefill worker. Completed prompts leave on plan.remote_decode
-// first -- their KV pages stay pinned until the transfer finishes, so
-// releasing them outranks feeding more prompt work -- then the prefill
+// first -- their KV pages stay pinned until the transfer finishes
+// (pdTransferInFlight: on this role every page-holding state is pinned, from
+// the first scheduled chunk to the PD ACK), so releasing them outranks
+// feeding more prompt work -- then the prefill
 // phases run with no decode reserve (this role never decodes locally). No
 // retraction either: a P node's pressure valve is the transfer itself, so
 // this grammar never calls maybeRetractForCapacity and nothing here is ever
@@ -946,8 +944,9 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
     // Phase 1: local recovery, alone in its batch -- a resident chunk if one
     // is mid-prompt (always recovery here: a remote prompt is
     // RemotePrefilling, which schedules nothing until the peer is done),
-    // else the one readmission this round may start. No PD pin: local
-    // recovery has no PD ACK; its Host/Device lifetime is owned by the L2
+    // else the one readmission this round may start. Local recovery enters
+    // Prefilling, not RemotePrefilling, so no PD transfer is considered in
+    // flight: it has no PD ACK; its Host/Device lifetime is owned by the L2
     // load ticket. A readmission that fails admission simply waits -- it
     // never triggers retraction (swapping it with a victim is pure thrash)
     // and never stalls the decodes below.
@@ -975,7 +974,8 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
     // before any of their KV arrives. It rides plan.remote_prefill beside
     // the decode batch: no token budget, no batch slot. No
     // TrackScheduledForward: the peer runs this prefill, so no forward of
-    // this engine's is out against the pages; the PD pin holds them.
+    // this engine's is out against the pages; the RemotePrefilling state it
+    // enters is what holds them (pdTransferInFlight).
     for (Request* request : candidates) {
         if (!admitsLikeNewPrompt(*request)) {
             continue;
@@ -985,7 +985,6 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
                                                       config_.decode_input_tokens, build.load_backs)) {
             build.scheduled.insert(request);
             build.remote_prefill.emplace_back(std::move(*operation));
-            pd_transfer_pins_.insert(request->Id());
             break;
         }
         if (feedback.admission_failed && feedback.capacity_blocker == nullptr) {

@@ -71,10 +71,10 @@ def candidates(m: int, n: int, k: int):
     yield "cublas", [cublas(i) for i in range(NUM_COPIES)], o, ref
 
     if m == 1:
-        from tokenspeed_kernel.ops.gemm.triton_gemv import rowcta_gemv
+        from tokenspeed_kernel.ops.gemm.triton_gemv import triton_rowcta_gemv
 
         def rc(i):
-            return lambda: rowcta_gemv(xs[i], ws[i], o)
+            return lambda: triton_rowcta_gemv(xs[i], ws[i], o)
 
         yield "rowcta", [rc(i) for i in range(NUM_COPIES)], o, ref
 

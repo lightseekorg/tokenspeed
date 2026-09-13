@@ -135,7 +135,7 @@ def test_forward_batch_uses_per_group_block_tables_as_the_only_page_table():
 
 def test_k3_four_groups_share_one_global_id_namespace() -> None:
     scheduler = ts.Scheduler(_make_k3_config())
-    before = scheduler.available_kv_pages()
+    before = scheduler.available_lcm_blocks()
     assert before == 32
     scheduler.submit_requests([_make_spec("r1", num_pages=2)])
     plan = scheduler.next_execution_plan()
@@ -165,18 +165,26 @@ def test_k3_four_groups_share_one_global_id_namespace() -> None:
 
     _abort(scheduler, "r1")
     scheduler.next_execution_plan()
-    assert scheduler.available_kv_pages() == before
+    assert scheduler.available_lcm_blocks() == before
 
 
 def test_k3_finish_restores_all_usable_pages() -> None:
     scheduler = ts.Scheduler(_make_k3_config())
-    before = scheduler.available_kv_pages()
+    before = scheduler.available_lcm_blocks()
+    assert scheduler.empty_lcm_blocks() == before
+    assert scheduler.active_lcm_blocks() == 0
     scheduler.submit_requests([_make_spec("r1", num_pages=2)])
     assert _find_forward_op(scheduler.next_execution_plan()) is not None
+    assert scheduler.active_lcm_blocks() > 0
+    assert scheduler.empty_lcm_blocks() + scheduler.active_lcm_blocks() == before
     _advance_tokens(scheduler, "r1", [42])
     _finish(scheduler, "r1")
     scheduler.next_execution_plan()
-    assert scheduler.available_kv_pages() == before
+    assert scheduler.available_lcm_blocks() == before
+    # The finished request's pages stay resident as cache-only parents: they
+    # are evictable (available) but neither empty nor active.
+    assert scheduler.active_lcm_blocks() == 0
+    assert scheduler.empty_lcm_blocks() < before
 
 
 def _make_k3_128k_config(num_device_pages: int) -> ts.SchedulerConfig:
@@ -214,7 +222,7 @@ def test_k3_128k_requires_group_aware_shared_pool_geometry() -> None:
     assert undersized.max_single_request_tokens() < 131_072
 
     corrected = ts.Scheduler(_make_k3_128k_config(99))
-    before = corrected.available_kv_pages()
+    before = corrected.available_lcm_blocks()
     assert before == 98
     corrected.submit_requests([prompt])
     completed_tokens = 0
@@ -229,7 +237,7 @@ def test_k3_128k_requires_group_aware_shared_pool_geometry() -> None:
     assert _find_forward_op(corrected.next_execution_plan()) is not None
     _finish(corrected, "128k")
     corrected.next_execution_plan()
-    assert corrected.available_kv_pages() == before
+    assert corrected.available_lcm_blocks() == before
 
 
 @pytest.mark.parametrize("block_granularity", [1, 2, 4])
@@ -384,7 +392,7 @@ def _drive_k3_to_retract(scheduler) -> dict[str, dict[int, int]]:
             next_token += 1
 
     assert retracted
-    assert scheduler.available_kv_pages() == 11
+    assert scheduler.available_lcm_blocks() == 11
     assert scheduler.waiting_size() == 1
     assert scheduler.decoding_size() == 3
     assert scheduler.request_token_size("a") == 11
@@ -395,7 +403,7 @@ def test_k3_readmit_rebuilds_all_four_tables_and_restores_pages() -> None:
     """Readmission restores the prefix and prefills its full remaining extent."""
     cfg = _make_k3_config()
     scheduler = ts.Scheduler(cfg)
-    before = scheduler.available_kv_pages()
+    before = scheduler.available_lcm_blocks()
     pre_retract_pages = _drive_k3_to_retract(scheduler)
 
     for request_id in ("b", "c", "d"):
@@ -456,4 +464,4 @@ def test_k3_readmit_rebuilds_all_four_tables_and_restores_pages() -> None:
     _advance_tokens(scheduler, "a", [3001])
     _finish(scheduler, "a")
     scheduler.next_execution_plan()
-    assert scheduler.available_kv_pages() == before
+    assert scheduler.available_lcm_blocks() == before

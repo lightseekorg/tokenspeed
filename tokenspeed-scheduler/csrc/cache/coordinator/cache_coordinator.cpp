@@ -115,6 +115,28 @@ bool CacheCoordinator::ClearCache() {
     return true;
 }
 
+CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(const CacheKey& boundary) const {
+    std::int32_t cached = 0;
+    std::int32_t total = 0;
+    for (std::size_t group_index = 0; group_index < groups_.size(); ++group_index) {
+        const std::int32_t pages_per_prefix_hash = prefix_granularity_ / geometry_[group_index].BlockGranularity();
+        for (std::int32_t offset = 0; offset < pages_per_prefix_hash; ++offset) {
+            const CacheKey key{
+                .namespace_id = boundary.namespace_id,
+                .group_id = groups_[group_index].Id(),
+                .content_hash = boundary.content_hash,
+                .page_offset = offset,
+            };
+            cached += groups_[group_index].Index().Contains(pool_, key) ? 1 : 0;
+            ++total;
+        }
+    }
+    if (cached == 0) {
+        return BoundaryResidency::kNone;
+    }
+    return cached == total ? BoundaryResidency::kComplete : BoundaryResidency::kPartial;
+}
+
 std::vector<CacheKey> CacheCoordinator::keysForGroup(std::span<const std::string> content_hashes,
                                                      std::uint32_t group_id) const {
     _assert(group_id < groups_.size(), "cache key group id out of range");
@@ -360,18 +382,27 @@ std::int64_t CacheCoordinator::LcmBlocksNeededFor(std::span<const std::int64_t> 
     return prefix_blocks;
 }
 
-std::size_t CacheCoordinator::NumActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const {
-    std::unordered_set<std::int32_t> active;
+std::int32_t CacheCoordinator::NumActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const {
+    // Parent ids are dense in [1, NumLcmBlocks], so a bitmap dedupes shared
+    // prefixes without hashing every block reference of every live request.
+    std::vector<bool> seen(static_cast<std::size_t>(pool_.NumLcmBlocks()) + 1, false);
+    std::int32_t active = 0;
     for (std::span<const BlockTable> tables : request_tables) {
         for (const BlockTable& table : tables) {
             for (const CacheBlockRef& block_ref : table.Blocks()) {
-                if (block_ref) {
-                    active.insert(block_ref->Location().lcm_block_id);
+                if (!block_ref) {
+                    continue;
+                }
+                std::vector<bool>::reference parent_seen =
+                    seen[static_cast<std::size_t>(block_ref->Location().lcm_block_id)];
+                if (!parent_seen) {
+                    parent_seen = true;
+                    ++active;
                 }
             }
         }
     }
-    return active.size();
+    return active;
 }
 
 std::int32_t CacheCoordinator::GroupAvailablePages(std::int32_t group_index) const {
@@ -379,8 +410,7 @@ std::int32_t CacheCoordinator::GroupAvailablePages(std::int32_t group_index) con
             "cache group index out of range");
     const std::int32_t slots_per_parent =
         groups_[static_cast<std::size_t>(group_index)].Allocator().CacheBlocksPerLcmBlock();
-    return pool_.NumEmptyLcmBlocks() * slots_per_parent +
-           pool_.NumFreeSlotsInGroup(static_cast<std::uint32_t>(group_index));
+    return pool_.NumEmptyLcmBlocks() * slots_per_parent + pool_.NumFreeSlots(static_cast<std::uint32_t>(group_index));
 }
 
 std::int32_t CacheCoordinator::NumNewlyReleasableLcmBlocks(std::span<const BlockTable> tables) const {
@@ -520,8 +550,10 @@ void CacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTab
         }
         return nullptr;
     }();
-    groups_[group_index].Index().RegisterFullBlocks(tierPool<Tier>(), table, keys, access_epoch, first_cache_block,
-                                                    boundary_kind, inserted);
+    CacheGroup& group = groups_[group_index];
+    group.Index().RegisterFullBlocks(tierPool<Tier>(),
+                                     group.Allocator().BlocksToPublish(table, first_cache_block, keys.size()), keys,
+                                     access_epoch, first_cache_block, boundary_kind, inserted);
     if constexpr (Tier == CacheTier::kHost) {
         return;
     }
@@ -572,12 +604,7 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
         return indices.subspan(refs.size());
     };
 
-    std::vector<std::int32_t> cache_blocks_per_group;
-    cache_blocks_per_group.reserve(groups_.size());
-    for (const CacheGroup& group : groups_) {
-        cache_blocks_per_group.push_back(group.Allocator().CacheBlocksPerLcmBlock());
-    }
-    batch.blocks = host_pool_->AcquireAvailableBlocksInOrder(group_ids, cache_blocks_per_group);
+    batch.blocks = host_pool_->AcquireAvailableBlocksInOrder(group_ids);
     for (std::size_t i = 0; i < batch.blocks.size(); ++i) {
         if (!batch.blocks[i]) {
             unresolved_by_group[group_ids[i]].push_back(i);
@@ -619,9 +646,8 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
             _assert(groups_[group_id].Index().Evict(*host_pool_, local_victims[i].location).has_value(),
                     "selected Host child is not evictable");
         }
-        const std::int32_t packing = groups_[group_id].Allocator().CacheBlocksPerLcmBlock();
         std::vector<CacheBlockRef> refs =
-            host_pool_->AcquireUpToBlocks(group_id, packing, static_cast<std::int32_t>(unresolved.size()));
+            host_pool_->AcquireUpToBlocks(group_id, static_cast<std::int32_t>(unresolved.size()));
         const std::span<const std::size_t> remaining = assign(unresolved, std::move(refs));
         unresolved.erase(unresolved.begin(), unresolved.end() - static_cast<std::ptrdiff_t>(remaining.size()));
     }
@@ -677,9 +703,8 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
                     }
                 }
 
-                const std::int32_t target_packing = groups_[target_group].Allocator().CacheBlocksPerLcmBlock();
                 std::vector<CacheBlockRef> refs = host_pool_->AcquireUpToBlocksFromEmptyParent(
-                    target_group, target_packing, victim_parent, static_cast<std::int32_t>(unresolved.size()));
+                    target_group, victim_parent, static_cast<std::int32_t>(unresolved.size()));
                 _assert(!refs.empty(), "evicting a Host parent did not free a placement");
                 const std::span<const std::size_t> remaining = assign(unresolved, std::move(refs));
                 unresolved.erase(unresolved.begin(), unresolved.end() - static_cast<std::ptrdiff_t>(remaining.size()));

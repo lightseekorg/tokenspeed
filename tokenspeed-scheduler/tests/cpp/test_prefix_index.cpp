@@ -42,7 +42,7 @@ CacheKey KeyOf(const std::string& content_hash) {
 // the index as its only owner so the entry is evictable.
 CacheBlockLocation Cache(PrefixCacheIndex& index, BlockPool& pool, const std::string& content_hash,
                          std::uint64_t access_epoch) {
-    CacheBlockRef block = pool.AcquireBlock(kGroupId, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef block = pool.AcquireBlock(kGroupId);
     EXPECT_TRUE(block);
     const CacheBlockLocation location = block->Location();
     index.Register(pool, block, KeyOf(content_hash), access_epoch, /*logical_block_index=*/-1,
@@ -66,7 +66,7 @@ std::vector<CacheBlockLocation> DrainEvictionOrder(const PrefixCacheIndex& index
 }
 
 TEST(PrefixCacheIndexEvictionOrderTest, DeliversTheOldestAccessEpochFirst) {
-    BlockPool pool(3);
+    BlockPool pool(3, {1});
     PrefixCacheIndex index(kGroupId);
     const CacheBlockLocation newest = Cache(index, pool, "newest", /*access_epoch=*/30);
     const CacheBlockLocation oldest = Cache(index, pool, "oldest", /*access_epoch=*/10);
@@ -76,7 +76,7 @@ TEST(PrefixCacheIndexEvictionOrderTest, DeliversTheOldestAccessEpochFirst) {
 }
 
 TEST(PrefixCacheIndexEvictionOrderTest, DeliversOneEpochPerBatchSortedByLocation) {
-    BlockPool pool(4);
+    BlockPool pool(4, {1});
     PrefixCacheIndex index(kGroupId);
     Cache(index, pool, "later", /*access_epoch=*/9);
     const CacheBlockLocation first = Cache(index, pool, "same-a", /*access_epoch=*/7);
@@ -97,11 +97,11 @@ TEST(PrefixCacheIndexEvictionOrderTest, DeliversOneEpochPerBatchSortedByLocation
 }
 
 TEST(PrefixCacheIndexEvictionOrderTest, SkipsPinnedEntriesWithoutLosingTheRest) {
-    BlockPool pool(3);
+    BlockPool pool(3, {1});
     PrefixCacheIndex index(kGroupId);
     const CacheBlockLocation unpinned = Cache(index, pool, "unpinned", /*access_epoch=*/20);
 
-    CacheBlockRef pinned = pool.AcquireBlock(kGroupId, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef pinned = pool.AcquireBlock(kGroupId);
     ASSERT_TRUE(pinned);
     index.Register(pool, pinned, KeyOf("pinned"), /*access_epoch=*/10, /*logical_block_index=*/-1,
                    CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr);
@@ -113,11 +113,11 @@ TEST(PrefixCacheIndexEvictionOrderTest, SkipsPinnedEntriesWithoutLosingTheRest) 
 }
 
 TEST(PrefixCacheIndexEvictionOrderTest, SkipsPinnedEpochsAndReturnsTheWholeNextEpoch) {
-    BlockPool pool(5);
+    BlockPool pool(5, {1});
     PrefixCacheIndex index(kGroupId);
     std::vector<CacheBlockRef> pinned;
     for (std::uint64_t epoch : {1u, 2u, 3u}) {
-        CacheBlockRef block = pool.AcquireBlock(kGroupId, /*cache_blocks_per_lcm_block=*/1);
+        CacheBlockRef block = pool.AcquireBlock(kGroupId);
         index.Register(pool, block, KeyOf("pinned-" + std::to_string(epoch)), epoch,
                        /*logical_block_index=*/-1, CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr);
         pinned.push_back(std::move(block));
@@ -136,7 +136,7 @@ TEST(PrefixCacheIndexEvictionOrderTest, SkipsPinnedEpochsAndReturnsTheWholeNextE
 }
 
 TEST(PrefixCacheIndexEvictionOrderTest, ExhaustsTheMaximumEpochWithoutWrapping) {
-    BlockPool pool(1);
+    BlockPool pool(1, {1});
     PrefixCacheIndex index(kGroupId);
     Cache(index, pool, "last", std::numeric_limits<std::uint64_t>::max());
     PrefixCacheIndex::EvictionCursor cursor;
@@ -149,9 +149,9 @@ TEST(PrefixCacheIndexEvictionOrderTest, ExhaustsTheMaximumEpochWithoutWrapping) 
 }
 
 TEST(PrefixCacheIndexEvictionOrderTest, ReRegisteringAtAnOlderEpochMovesTheEntryEarlier) {
-    BlockPool pool(3);
+    BlockPool pool(3, {1});
     PrefixCacheIndex index(kGroupId);
-    CacheBlockRef refreshed = pool.AcquireBlock(kGroupId, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef refreshed = pool.AcquireBlock(kGroupId);
     ASSERT_TRUE(refreshed);
     const CacheBlockLocation moved = refreshed->Location();
     index.Register(pool, refreshed, KeyOf("moved"), /*access_epoch=*/30, /*logical_block_index=*/-1,
@@ -169,7 +169,7 @@ TEST(PrefixCacheIndexEvictionOrderTest, ReRegisteringAtAnOlderEpochMovesTheEntry
 }
 
 TEST(PrefixCacheIndexEvictionOrderTest, AcquiringAMatchMovesTheEntryToTheRequestEpoch) {
-    BlockPool pool(3);
+    BlockPool pool(3, {1});
     PrefixCacheIndex index(kGroupId);
     const CacheBlockLocation matched = Cache(index, pool, "matched", /*access_epoch=*/10);
     const CacheBlockLocation untouched = Cache(index, pool, "untouched", /*access_epoch=*/20);
@@ -184,7 +184,7 @@ TEST(PrefixCacheIndexEvictionOrderTest, AcquiringAMatchMovesTheEntryToTheRequest
 }
 
 TEST(PrefixCacheIndexEvictionOrderTest, EvictedEntriesLeaveTheOrder) {
-    BlockPool pool(3);
+    BlockPool pool(3, {1});
     PrefixCacheIndex index(kGroupId);
     const CacheBlockLocation evicted = Cache(index, pool, "evicted", /*access_epoch=*/10);
     const CacheBlockLocation kept = Cache(index, pool, "kept", /*access_epoch=*/20);
@@ -196,14 +196,14 @@ TEST(PrefixCacheIndexEvictionOrderTest, EvictedEntriesLeaveTheOrder) {
 }
 
 TEST(PrefixCacheIndexEvictionOrderTest, MatchesTheEvictableSetSeenByAFullScan) {
-    BlockPool pool(64);
+    BlockPool pool(64, {1});
     PrefixCacheIndex index(kGroupId);
     std::vector<CacheBlockRef> pinned;
     for (int i = 0; i < 40; ++i) {
         // Interleave epochs so registration order and eviction order differ.
         const std::uint64_t access_epoch = static_cast<std::uint64_t>((i * 17) % 23 + 1);
         if (i % 5 == 0) {
-            CacheBlockRef block = pool.AcquireBlock(kGroupId, /*cache_blocks_per_lcm_block=*/1);
+            CacheBlockRef block = pool.AcquireBlock(kGroupId);
             ASSERT_TRUE(block);
             index.Register(pool, block, KeyOf("pinned-" + std::to_string(i)), access_epoch,
                            /*logical_block_index=*/-1, CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr);

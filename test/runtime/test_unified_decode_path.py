@@ -91,7 +91,13 @@ class _RouterCase(_TorchCase):
         leaf.max_context_len = MAX_NUM_PAGES * 2
         leaf.kernel_page_size = 2
         leaf.device = "cpu"
-        router = CacheGroupRouter(None, is_draft=False, spec_num_tokens=1, device="cpu")
+        router = CacheGroupRouter(
+            None,
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=None,
+        )
         router.bind(
             CacheGroupGeometry(
                 granularities={FULL: 2},
@@ -475,7 +481,15 @@ class RunnerSignatureConformanceTest(_TorchCase):
         ),
         (
             "tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp",
-            "Qwen4ExpMambaAttnBackend",
+            "Qwen4ExpBackend",
+        ),
+        (
+            "tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple",
+            "Qwen4ExpPLEBackend",
+        ),
+        (
+            "tokenspeed.runtime.layers.attention.backends.specific.qsa_indexer",
+            "QSAIndexerBackend",
         ),
     )
 

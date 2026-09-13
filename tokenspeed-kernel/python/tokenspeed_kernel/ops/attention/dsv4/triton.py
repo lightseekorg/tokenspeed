@@ -56,21 +56,21 @@ __all__ = [
     "dsv4_combine_topk_swa_indices",
     "dsv4_compact_compressed_slot_mapping",
     "dsv4_compressed_slot_mapping",
-    "dsv4_group_slot_mapping",
     "dsv4_compute_global_topk_indices_and_lens",
     "dsv4_decode_dense_compressed_indices_and_lens",
     "dsv4_decode_swa_indices_and_lens",
     "dsv4_dequantize_and_gather_k_cache",
-    "dsv4_fused_csa_indexer_fp8_cache_insert",
     "dsv4_fused_csa_indexer_mxfp4_cache_insert",
     "dsv4_fused_indexer_q_rope_hadamard_mxfp4",
-    "dsv4_fused_qnorm_rope_kv_insert",
     "dsv4_fused_sparse_compress_cache_insert",
     "dsv4_gather_indexer_mxfp4_cache",
+    "dsv4_group_slot_mapping",
     "dsv4_indexer_decode_metadata_compute",
     "dsv4_save_compressor_state",
-    "dsv4_sparse_attention",
     "dsv4_validate_active_cache_pages",
+    "triton_dsv4_csa_indexer_fp8_cache_insert",
+    "triton_dsv4_prefill",
+    "triton_dsv4_swa_cache_insert",
     "write_dsv4_indexer_mxfp4_cache_cuda",
 ]
 
@@ -261,7 +261,7 @@ def _dsv4_qnorm_rope_kv_insert_kernel(
     priority=Priority.PORTABLE,
     tags={"portability", "cache_insert"},
 )
-def dsv4_fused_qnorm_rope_kv_insert(
+def triton_dsv4_swa_cache_insert(
     q: torch.Tensor,
     kv: torch.Tensor,
     swa_kv_cache: torch.Tensor,
@@ -415,7 +415,7 @@ def _dsv4_sparse_attention_kernel(
     priority=Priority.PORTABLE,
     tags={"portability"},
 )
-def dsv4_sparse_attention(
+def triton_dsv4_prefill(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
@@ -1524,7 +1524,7 @@ def _dsv4_fused_csa_indexer_fp8_cache_kernel(
     priority=Priority.PORTABLE,
     tags={"portability", "cache_insert"},
 )
-def dsv4_fused_csa_indexer_fp8_cache_insert(
+def triton_dsv4_csa_indexer_fp8_cache_insert(
     *,
     state_cache: torch.Tensor,
     token_to_req_indices: torch.Tensor,

@@ -146,13 +146,18 @@ public:
     // Number of LCM blocks that become reclaimable after dropping the exact
     // request-owned refs in tables. Used only to rank Retraction victims.
     std::int32_t NumNewlyReleasableLcmBlocks(std::span<const BlockTable> tables) const;
+    // Empty parents plus parents whose every child is an unpinned cache entry.
+    // Scans the pool and every group's index: a diagnostic, not a per-step
+    // gauge. Per-step accounting composes NumEmptyLcmBlocks and
+    // NumActiveLcmBlocks instead.
     std::int32_t NumAvailableLcmBlocks() const;
+    std::int32_t NumEmptyLcmBlocks() const { return pool_.NumEmptyLcmBlocks(); }
     std::int32_t TotalLcmBlocks() const { return pool_.NumLcmBlocks(); }
     std::int32_t NumFreeHostLcmBlocks() const { return host_pool_ == nullptr ? 0 : host_pool_->NumEmptyLcmBlocks(); }
     // LCM blocks required to place group_pages[g] pages for every group g.
     std::int64_t LcmBlocksNeededFor(std::span<const std::int64_t> group_pages) const;
     // Distinct LCM blocks referenced by the given per-request table sets.
-    std::size_t NumActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const;
+    std::int32_t NumActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const;
     // Free pages (group page units) this group could still place, counting its
     // partially filled parents and every empty parent.
     std::int32_t GroupAvailablePages(std::int32_t group_index) const;
@@ -212,6 +217,12 @@ public:
     // Reports real device-cache entry insertions and removals. The scheduler
     // folds the per-group mutations into one externally visible prefix event.
     void SetCacheMutationSink(CacheMutationSink sink) { cache_mutation_sink_ = std::move(sink); }
+    // Device residency of one scheduler-level prefix boundary: the child
+    // entries every group holds for that content hash (one per group page
+    // within the prefix granularity). The boundary key's group and offset are
+    // ignored; only its namespace and content hash identify the boundary.
+    enum class BoundaryResidency { kNone, kPartial, kComplete };
+    BoundaryResidency DeviceBoundaryResidency(const CacheKey& boundary) const;
 
 private:
     friend struct CacheCoordinatorTestAccess;

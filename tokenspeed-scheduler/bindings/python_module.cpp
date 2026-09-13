@@ -310,7 +310,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("pages_to_zero", &tokenspeed::ExecutionPlan::pages_to_zero);
 
     nb::class_<tokenspeed::Scheduler>(m, "Scheduler")
-        .def(nb::init<tokenspeed::SchedulerConfig>(), nb::arg("config") = tokenspeed::SchedulerConfig{})
+        .def(nb::init<tokenspeed::SchedulerConfig>(), nb::arg("config"))
         .def("submit_requests",
              nb::overload_cast<const std::vector<tokenspeed::RequestSpec>&>(&tokenspeed::Scheduler::SubmitRequests),
              nb::arg("request_specs"))
@@ -330,8 +330,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("decoding_size", &tokenspeed::Scheduler::DecodingSize)
         .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize)
         .def("pd_transfer_pinned", &tokenspeed::Scheduler::PdTransferPinned, nb::arg("request_id"))
-        .def("available_kv_pages", &tokenspeed::Scheduler::AvailableKvPages)
-        .def("active_kv_pages", &tokenspeed::Scheduler::ActiveKvPages)
+        .def("available_lcm_blocks", &tokenspeed::Scheduler::AvailableLcmBlocks)
+        .def("empty_lcm_blocks", &tokenspeed::Scheduler::EmptyLcmBlocks)
+        .def("active_lcm_blocks", &tokenspeed::Scheduler::ActiveLcmBlocks)
         .def("request_token_size", &tokenspeed::Scheduler::RequestTokenSize, nb::arg("id"))
         .def("max_single_request_tokens", &tokenspeed::Scheduler::MaxSingleRequestTokens)
         .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)

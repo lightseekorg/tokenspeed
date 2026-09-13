@@ -136,3 +136,7 @@ def test_v9_timed_partition_replays_changed_inputs() -> None:
         atol=2e-2,
         rtol=2e-2,
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

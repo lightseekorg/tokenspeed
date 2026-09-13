@@ -34,6 +34,8 @@ decode fused tail       ``1 <= M <= latent-tail capacity``
                         (multicast tail, tp_ep spanning WORLD) — see
                         ``select_k3_moe_tail_tier``
 multimem AR window      ``MULTIMEM_AR_MIN_TOKENS..MAX`` (prefill)
+attention reduce        ``1 <= M <= ATTN_AR_MAX_TOKENS`` (tokenspeed
+                        CuteDSL collective, attn TP group)
 fused-lane one-shot     everything else with a fused plan
 ======================  =========================================
 """
@@ -57,7 +59,10 @@ from tokenspeed_kernel.ops.communication.multimem import (
 )
 from tokenspeed_kernel.ops.moe.latent_tail import (
     KimiK3LatentTailOp,
+    attn_reduce_shape_supported,
+    build_attn_reduce_collective,
     latent_tail_supported,
+    multicast_backend_available,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -82,6 +87,21 @@ logger = logging.getLogger(__name__)
 
 _IRIS_MAX_TOKENS = 8192
 _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS = 48
+
+# Widest reduce this instance is built for; it becomes the collective's max_m.
+ATTN_AR_MAX_TOKENS = 8
+
+
+def attn_ar_eligible(
+    *, armed: bool, has_prefix: bool, num_tokens: int, fusion_max_tokens: int
+) -> bool:
+    """Whether the tokenspeed collective, not the vendor AR, serves this reduce.
+
+    ``fusion_max_tokens`` is the operator's window; it goes negative to forbid a
+    fused attention all-reduce outright, and this path is one.
+    """
+    window = min(ATTN_AR_MAX_TOKENS, fusion_max_tokens)
+    return armed and has_prefix and 0 < num_tokens <= window
 
 
 class K3MoETailTier(IntEnum):
@@ -310,6 +330,45 @@ class K3AttnCommState:
         )
         self.dummy_norm.weight.requires_grad_(False)
 
+        # A rank that skipped the build would strand its peers in the rendezvous.
+        self.cute_ar = None
+        if dist.is_initialized() and mapping.attn.tp_size > 1:
+            group = _get_process_group(mapping.attn.tp_group)
+            # Gate first: a forbidden window should not pay the rendezvous.
+            local_ok = (
+                attn_ar_eligible(
+                    armed=True,
+                    has_prefix=True,
+                    num_tokens=1,
+                    fusion_max_tokens=global_server_args_dict[
+                        "comm_fusion_max_num_tokens"
+                    ],
+                )
+                and self.attn_ar_fusion_ok
+                and multicast_backend_available(group)
+                and attn_reduce_shape_supported(
+                    tp_size=mapping.attn.tp_size, hidden_size=hidden
+                )
+            )
+            vote = torch.tensor([int(local_ok)], dtype=torch.int32, device="cuda")
+            dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=group)
+            if bool(vote.item()):
+                self.cute_ar = build_attn_reduce_collective(
+                    group=group,
+                    rank=mapping.attn.tp_rank,
+                    tp_size=mapping.attn.tp_size,
+                    hidden_size=hidden,
+                    max_tokens=ATTN_AR_MAX_TOKENS,
+                )
+        logger.info(
+            "Kimi K3 attention reduce: %s",
+            (
+                "tokenspeed CuteDSL collective at M<=%d" % ATTN_AR_MAX_TOKENS
+                if self.cute_ar is not None
+                else "not armed; the existing backends serve every M"
+            ),
+        )
+
 
 class K3MoeTailCommState:
     """Process-wide negotiated MoE-tail backends for Kimi-K3 (moe tp_ep group).
@@ -461,8 +520,7 @@ class K3AttnComm:
         self.mapping = state.mapping
 
     # ------------------------------------------------------------------
-    # Attention-side reduction (moved verbatim from
-    # KimiLinearDecoderLayer._reduce_attn_accumulate; behavior unchanged).
+    # Attention-side reduction, hoisted from KimiLinearDecoderLayer.
     # ------------------------------------------------------------------
     def attn_reduce(
         self,
@@ -480,11 +538,42 @@ class K3AttnComm:
         hidden comes back as the second return (else None -- block-write
         layers, large batches and the plain-reduce fallback).
 
+        The tokenspeed collective is the exception: it serves the narrow window
+        ahead of those branches and returns None for the mixed hidden even when
+        ``combine`` is set, so the caller runs the combine as its own kernel.
+        Measured net faster despite the extra launch at the width that
+        actually reaches it -- one token per step, where every layer but the
+        block-write ones arrives with a residual. Wider steps mostly take the
+        fused AttnRes graph instead, and the block-write layers that still
+        arrive pass no prefix: instrumented at eight tokens on a DSpark
+        deployment, this window was armed and served nothing. A layer that
+        declines the fused graph for some other reason does reach it with a
+        prefix, so that is a property of the configuration, not of the width.
+
+        Like the vendor branch below it, that window does not consult
+        ``force_deterministic_rsag``: the collective reduces in ascending rank
+        order with an fp32 accumulator, so it is already run-to-run stable.
+
         ``mlp_wp`` is the calling layer's precomputed ``rms_w * res_w``
         product (per-layer state, filled in post_load_weights); the B1
         combine kernels consume it in place of the separate weights.
         """
         num_tokens = attn_partial.shape[0]
+        if attn_ar_eligible(
+            armed=self.state.cute_ar is not None,
+            has_prefix=prefix_sum is not None,
+            num_tokens=num_tokens,
+            fusion_max_tokens=global_server_args_dict["comm_fusion_max_num_tokens"],
+        ):
+            # Any later reduce in this process overwrites it; this layer is done by then.
+            residual_out, _ = self.state.cute_ar(
+                attn_partial,
+                prefix_sum,
+                self.state.dummy_norm.weight,
+                include_reduce_scatter=False,
+                include_routed=True,
+            )
+            return residual_out, None
         if (
             prefix_sum is not None
             and self.state.attn_ar_fusion_ok

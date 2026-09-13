@@ -36,3 +36,7 @@ class TestSamplingBackendRegistryDefaults(unittest.TestCase):
 
         with mock.patch.object(registry, "current_platform", return_value=platform):
             self.assertEqual(registry._resolve_backend_name(server_args), "flashinfer")
+
+
+if __name__ == "__main__":
+    unittest.main()

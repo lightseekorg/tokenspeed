@@ -32,6 +32,7 @@
 #include "core/token_container.h"
 #include "resource/allocator/req_pool_allocator.h"
 #include "scheduler/request_spec.h"
+#include "utils.h"
 
 namespace tokenspeed::fsm {
 
@@ -117,7 +118,10 @@ struct ForwardState {
     // and the write lands on pages someone else now owns.
     std::int32_t ResultsInFlight() const { return results_in_flight_; }
     void TrackScheduledForward() { ++results_in_flight_; }
-    void ResultLanded() { results_in_flight_ = std::max(0, results_in_flight_ - 1); }
+    void ResultLanded() {
+        FatalCheck(results_in_flight_ > 0, "a forward result landed for a request with no forward in flight");
+        --results_in_flight_;
+    }
     // Carried across a state transition: a transition relabels the request,
     // and the forwards already out do not care what it is called.
     void CarryResultsInFlight(std::int32_t count) { results_in_flight_ = count; }

@@ -65,9 +65,16 @@ public:
 
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
-    std::size_t AvailableKvPages() const;
-    std::size_t ActiveKvPages() const;
     std::size_t PrefillSize() const;
+    // Device pool parents that are empty or hold only unpinned cache entries.
+    // Scans the pool and every prefix index: a leak check for tests and
+    // diagnostics, not a per-step gauge.
+    std::int32_t AvailableLcmBlocks() const { return coordinator_.NumAvailableLcmBlocks(); }
+    // Per-step gauges: empty parents are O(1), active parents walk the live
+    // requests' block tables. Parents resident only as cache are
+    // TotalLcmBlocks - EmptyLcmBlocks - ActiveLcmBlocks.
+    std::int32_t EmptyLcmBlocks() const { return coordinator_.NumEmptyLcmBlocks(); }
+    std::int32_t ActiveLcmBlocks() const;
     std::int32_t RequestTokenSize(const std::string& id) const;
     // Maximum logical request extent that one request can reserve in an
     // otherwise reclaimable device pool. The runtime must enforce this limit
@@ -77,8 +84,8 @@ public:
     std::int32_t CacheGroupTotalPages(const std::string& group_id) const;
     std::int32_t CacheGroupAvailablePages(const std::string& group_id) const;
 
-    bool PdTransferPinned(const std::string& request_id) const { return pd_transfer_pins_.contains(request_id); }
-    std::int32_t PoolFreeBlocks() const { return coordinator_.NumAvailableLcmBlocks(); }
+    // Test/diagnostic view of pdTransferInFlight by request id.
+    bool PdTransferPinned(const std::string& request_id) const;
     std::int32_t HostPoolCachedBlocks() const { return coordinator_.NumHostCachedBlocks(); }
     std::int32_t HostPoolFreeBlocks() const { return coordinator_.NumFreeHostLcmBlocks(); }
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
@@ -149,6 +156,13 @@ private:
 
     std::size_t groupIndex(const std::string& group_id) const;
     Request* findRequest(const std::string& request_id);
+    // A PD transfer is out against this request's pages, so nothing here may
+    // retract, finish or flush them. Derived from the FSM, never recorded: on
+    // the D role it is the peer's prefill writing the destination pages
+    // (RemotePrefilling); on the P role it is the peer's decode reading them,
+    // which begins with the first scheduled chunk and ends only with the PD
+    // ACK -- every page-holding state. A fused engine never transfers.
+    bool pdTransferInFlight(const Request& request) const;
 
     void handleEvent(const cache::WriteBackDone& event);
     void handleEvent(const cache::LoadBackDone& event);
@@ -278,7 +292,6 @@ private:
     std::vector<std::string> cache_group_ids_;
     std::int32_t max_single_request_tokens_{0};
 
-    std::unordered_set<std::string> pd_transfer_pins_;
     // Stamped onto each retraction; the readmission order lives on the
     // Retracted states themselves (nextReadmission).
     std::int64_t next_retraction_epoch_{1};
@@ -291,11 +304,16 @@ private:
     std::unordered_map<std::string, Request*> requests_by_id_;
     std::vector<KvCacheEvent> kv_events_;
     std::unordered_map<std::string, KvEventHashProgress> kv_event_hash_progress_;
-    std::unordered_map<CacheKey, KvBlockStoredEvent, CacheKeyHash> kv_event_pages_;
-    // Number of resident child cache entries behind each scheduler-level
-    // boundary. A group may contribute more than one child entry.
-    std::unordered_map<CacheKey, std::int32_t, CacheKeyHash> cached_event_child_counts_;
-    std::int32_t cache_entries_per_event_boundary_{0};
+    // What the prefix index cannot tell us about a boundary: the token
+    // descriptor the external event carries, and whether that event is
+    // currently out (a BlockStored not yet followed by its BlockRemoved).
+    // Residency itself is the coordinator's answer, never mirrored here. A
+    // descriptor lives exactly as long as the boundary has a cached child.
+    struct KvEventBoundary {
+        KvBlockStoredEvent stored;
+        bool published{false};
+    };
+    std::unordered_map<CacheKey, KvEventBoundary, CacheKeyHash> kv_event_boundaries_;
 };
 
 }  // namespace tokenspeed

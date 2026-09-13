@@ -21,6 +21,20 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=90, suite="runtime-1gpu")
 
 
+def test_state_helpers_use_shared_implementations():
+    """Backend-local definitions must not shadow the shared state helpers."""
+    from tokenspeed_kernel.ops.attention.gdn.triton import prepare_prefill_state_inputs
+
+    from tokenspeed.runtime.layers.attention.backends.state import checkpoint, mamba
+
+    assert mamba._prepare_cache_prefill_state_inputs is prepare_prefill_state_inputs
+    assert (
+        mamba._compute_state_block_index_plan
+        is checkpoint._compute_state_block_index_plan
+    )
+    assert mamba._gather_state_block_indices is checkpoint._gather_state_block_indices
+
+
 class _ContractPool:
     def __init__(self, page_size, components):
         # The arena publishes the contract; a view only names its arena.
@@ -121,7 +135,7 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
         try:
             import torch
 
-            from tokenspeed.runtime.layers.attention.backends.state.mamba import (  # noqa: E501
+            from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (  # noqa: E501
                 compute_state_block_indices,
             )
         except (ImportError, ModuleNotFoundError) as exc:
@@ -136,6 +150,8 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
             page_size,
             torch.tensor(before, dtype=torch.int32),
             torch.tensor(after, dtype=torch.int32),
+            validate=True,
+            group_id="linear_attention",
         )
 
     def test_across_boundary(self):
@@ -182,7 +198,7 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
 
     def test_index_plan_preserves_int32_inputs(self):
         torch = self.torch
-        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+        from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
             _compute_state_block_index_plan,
         )
 
@@ -241,9 +257,11 @@ class PrefillCheckpointPageTest(unittest.TestCase):
         try:
             import torch
 
+            from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
+                compute_state_block_indices,
+            )
             from tokenspeed.runtime.layers.attention.backends.state.mamba import (
                 MambaAttnBackend,
-                compute_state_block_indices,
             )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
@@ -335,6 +353,7 @@ class PrefillCheckpointPageTest(unittest.TestCase):
             torch.tensor([0], dtype=torch.int32),
             torch.tensor([1], dtype=torch.int32),
             validate=False,
+            group_id="linear_attention",
         )
         self.assertEqual(state_in.tolist(), [0])
         self.assertEqual(state_out.tolist(), [0])

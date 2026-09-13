@@ -136,7 +136,6 @@ private:
 
     void initializeCapacity() {
         _assert(demands_.size() == groups_.size(), "demands/groups size mismatch");
-        empty_parent_count_ = pool_.NumEmptyLcmBlocks();
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             const GroupDemand& demand = demands_[i];
             _assert(demand.table != nullptr, "group demand requires a block table");
@@ -146,20 +145,9 @@ private:
                     ? 0
                     : static_cast<std::int32_t>(std::ranges::count(prefix_.host.per_group[i].hits, std::uint8_t{1}));
             blocks_needed_[i] = static_cast<std::int64_t>(device_blocks) + host_blocks;
-            local_free_slots_[i] = pool_.NumFreeSlotsInGroup(static_cast<std::uint32_t>(i));
+            local_free_slots_[i] = pool_.NumFreeSlots(static_cast<std::uint32_t>(i));
         }
-    }
-
-    // Copy a parent's real occupancy only on first use. Subsequent reads must
-    // preserve the simulated releases and restores in this plan.
-    std::int32_t& remainingParentOccupancy(std::uint32_t group_id, std::int32_t parent_id) {
-        const auto [it, inserted] = remaining_occupied_.try_emplace(parent_id, 0);
-        if (inserted) {
-            it->second = pool_.OccupiedCount(parent_id);
-            _assert(0 < it->second && it->second <= groups_[group_id].Allocator().CacheBlocksPerLcmBlock(),
-                    "bound LCM parent has invalid occupancy");
-        }
-        return it->second;
+        empty_parent_count_ = pool_.NumEmptyLcmBlocks();
     }
 
     VictimCandidate makeVictimCandidate(std::uint32_t group_id, CacheBlockLocation location,
@@ -294,7 +282,9 @@ private:
     void removeOccupant(std::uint32_t group_id, CacheBlockLocation location) {
         _assert(pool_.BoundGroup(location.lcm_block_id) == group_id,
                 "released admission location belongs to another group");
-        std::int32_t& occupied = remainingParentOccupancy(group_id, location.lcm_block_id);
+        auto it =
+            remaining_occupied_.try_emplace(location.lcm_block_id, pool_.OccupiedCount(location.lcm_block_id)).first;
+        std::int32_t& occupied = it->second;
         _assert(occupied > 0, "admission released the same location twice");
         const std::int32_t slots = groups_[group_id].Allocator().CacheBlocksPerLcmBlock();
         if (occupied == 1) {
@@ -308,7 +298,9 @@ private:
     }
 
     void restoreOccupant(std::uint32_t group_id, CacheBlockLocation location) {
-        std::int32_t& occupied = remainingParentOccupancy(group_id, location.lcm_block_id);
+        auto it = remaining_occupied_.find(location.lcm_block_id);
+        _assert(it != remaining_occupied_.end(), "restored admission victim has no shadow occupancy");
+        std::int32_t& occupied = it->second;
         const std::int32_t slots = groups_[group_id].Allocator().CacheBlocksPerLcmBlock();
         if (occupied == 0) {
             _assert(empty_parent_count_ > 0, "restoring an admission victim underflowed empty parents");

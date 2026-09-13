@@ -33,7 +33,7 @@ if current_platform().is_npu:
     @register_kernel(
         "embedding",
         "rope",
-        name="ascend_embedding_rope",
+        name="torch_npu_embedding_rope",
         solution="torch_npu",
         capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
         signatures=format_signatures(
@@ -51,7 +51,7 @@ if current_platform().is_npu:
         },
         tags={"portability"},
     )
-    def ascend_embedding_rope(
+    def torch_npu_embedding_rope(
         *,
         positions: torch.Tensor,
         q: torch.Tensor,

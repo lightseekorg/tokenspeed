@@ -559,9 +559,9 @@ def test_msa_fp8_kv_descale_matches_dequant_reference(phase: str) -> None:
 
 
 def _msa_cute_registered() -> bool:
-    import tokenspeed_kernel.ops.attention.msa as msa_mod
+    import tokenspeed_kernel.ops.attention.msa.cute_dsl as msa_cute_dsl
 
-    return hasattr(msa_mod, "msa_minimax_extend_with_kvcache")
+    return hasattr(msa_cute_dsl, "cute_dsl_minimax_msa_extend_with_kvcache")
 
 
 requires_msa_cute = pytest.mark.skipif(
@@ -672,7 +672,7 @@ def test_msa_cute_extend_matches_triton(kv_cache_dtype: torch.dtype) -> None:
         kwargs = _two_request_extend_case(kv_cache_dtype)
         # Each solution's indexer pass rewrites the same index_k_cache slots
         # with identical values, so back-to-back calls stay comparable.
-        out_cute = msa_extend_with_kvcache(solution="msa", **kwargs)
+        out_cute = msa_extend_with_kvcache(solution="cute_dsl", **kwargs)
         import cutlass.cute as cute
 
         # Importing MSA must preserve option-bound compilation for other users.
@@ -710,7 +710,7 @@ def test_msa_cute_extend_wins_selection_and_decode_stays_triton() -> None:
         extend = select_kernel(
             "attention", "msa_extend_with_kvcache", signature, traits=traits
         )
-        assert extend.name == "msa_minimax_extend_with_kvcache"
+        assert extend.name == "cute_dsl_minimax_msa_extend_with_kvcache"
         decode = select_kernel(
             "attention", "msa_decode_with_kvcache", signature, traits=traits
         )

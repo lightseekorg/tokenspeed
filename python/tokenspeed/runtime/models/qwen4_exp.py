@@ -38,9 +38,6 @@ from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
-    bind_qwen4_exp_side_state,
-)
 from tokenspeed.runtime.layers.attention.linear.layernorm_gated import rmsnorm_fn
 from tokenspeed.runtime.layers.hyperconnection import (
     GatedResidualSimple,
@@ -449,30 +446,14 @@ class Qwen4ExpAttentionDecoderLayer(
         ctx: ForwardContext,
     ) -> torch.Tensor:
         q, k, v, gate = self._project_qkv_rope(positions, hidden_states)
-        if self.indexer is not None:
-            selected_slots = self.indexer(hidden_states, positions, ctx)
-            attention_output = self._qsa_attention(
-                q=q,
-                k=k,
-                v=v,
-                gate=gate,
-                attention_layer=self.attn,
-                ctx=ctx,
-                # QSA writes the paged KV itself; slots come from the backend.
-                out_cache_loc=ctx.attn_backend.write_locations(
-                    self.attn, ctx.forward_mode
-                ),
-                selected_slots=selected_slots,
-            )
-        else:
-            attention_output = self._attn(q, k, v, gate, ctx)
+        selected_slots = (
+            self.indexer(hidden_states, positions, ctx)
+            if self.indexer is not None
+            else None
+        )
+        attention_output = self._attn(q, k, v, gate, ctx, topk_indices=selected_slots)
         output, _ = self.o_proj(attention_output)
         return output
-
-    def _qsa_attention(self, **kwargs) -> torch.Tensor:
-        """Sparse-attention hook specialized by the MTP draft layer."""
-
-        return self.indexer.sparse_attention(**kwargs)
 
     def forward(
         self,
@@ -518,11 +499,6 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             hc_per_branch_norm=True,
         )
         self.hyper_connection_mixer = GatedResidualSimple(hc_config, use_combine=False)
-        self.ple_layers = tuple(
-            layer.ple
-            for layer in self.layers
-            if getattr(layer, "ple", None) is not None
-        )
         self.qsa_indexers = tuple(
             layer.indexer
             for layer in self.layers
@@ -559,11 +535,6 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         input_deepstack_embeds: torch.Tensor | None = None,
     ):
         del pp_proxy_tensors
-        bind_qwen4_exp_side_state(
-            ctx.attn_backend,
-            self.ple_layers,
-            self.qsa_indexers,
-        )
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )

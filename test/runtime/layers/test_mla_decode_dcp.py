@@ -331,3 +331,7 @@ def test_sliding_window_matches_a_per_row_masked_reference(
 
     expected = _windowed_reference(query, keys, n, window_left, causal_mask)
     assert (out - expected).abs().max() < tol * expected.abs().max()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

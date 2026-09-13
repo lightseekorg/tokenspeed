@@ -187,8 +187,8 @@ def _run_closed_loop(scheduler, rids: list[str]) -> dict:
         "generated": generated,
         "waiting": scheduler.waiting_size(),
         "decoding": scheduler.decoding_size(),
-        "available": scheduler.available_kv_pages(),
-        "active": scheduler.active_kv_pages(),
+        "available": scheduler.available_lcm_blocks(),
+        "active": scheduler.active_lcm_blocks(),
     }
 
 
@@ -247,5 +247,5 @@ class TestDRoleStateGroupReserve:
         dispatched = [rid for op in _dispatched(plan) for rid in op.request_ids]
         assert set(dispatched) == set(admitted), (
             f"first decode step blocked for {sorted(set(admitted) - set(dispatched))}: "
-            f"available={scheduler.available_kv_pages()} active={scheduler.active_kv_pages()}"
+            f"available={scheduler.available_lcm_blocks()} active={scheduler.active_lcm_blocks()}"
         )

@@ -855,12 +855,12 @@ class EventLoop:
         return len(self.output_processor.rid_to_state)
 
     def _get_scheduler_stats(self):
-        available = self.scheduler.available_kv_pages()
-        active = self.scheduler.active_kv_pages()
+        empty = self.scheduler.empty_lcm_blocks()
+        active = self.scheduler.active_lcm_blocks()
         return {
             "num_active_pages": active,
             "num_cached_pages": (
-                self._scheduler_cache_geometry.num_usable_pages - available
+                self._scheduler_cache_geometry.num_usable_pages - empty - active
             ),
             "num_queue_reqs": self.scheduler.waiting_size(),
         }

@@ -29,25 +29,21 @@ Skipped when the installed flash-attn lacks ``rel_bias`` (stock wheels).
 
 from __future__ import annotations
 
-import os
-import sys
-
 import pytest
 import torch
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_attention_rel_mha import (  # noqa: E402
+from rel_mha_reference import (
     DTYPE,
     HEAD_DIM,
     NUM_KV_HEADS,
     NUM_Q_HEADS,
-    _build_paged,
-    _cu,
-    _ref_rel_attn,
-    _require_fa4,
+    PAGE,
+    build_paged,
+    cu_seqlens,
+    ref_rel_attn,
+    require_fa4,
 )
-from tokenspeed_kernel.ops.attention.rmha import cuda as fa_mod  # noqa: E402
-from tokenspeed_kernel.ops.attention.rmha import (  # noqa: E402
+from tokenspeed_kernel.ops.attention.rmha import cuda as fa_mod
+from tokenspeed_kernel.ops.attention.rmha import (
     rel_mha_decode_with_kvcache,
     rel_mha_prefill,
 )
@@ -80,10 +76,10 @@ def _prefill_case(device, seq_lens, rel_extent):
 def test_rel_mha_prefill_fused_matches_reference_and_scoremod(
     device: str, require, rel_extent: int, window_left: int
 ) -> None:
-    _require_fa4(require)
+    require_fa4(require)
     seq_lens = [192, 384]
     q, k, v, rel = _prefill_case(device, seq_lens, rel_extent)
-    cu = _cu(seq_lens, device)
+    cu = cu_seqlens(seq_lens, device)
     scale = 1.0 / HEAD_DIM
 
     kwargs = dict(
@@ -108,7 +104,7 @@ def test_rel_mha_prefill_fused_matches_reference_and_scoremod(
 
     off = 0
     for length in seq_lens:
-        ref = _ref_rel_attn(
+        ref = ref_rel_attn(
             q[off : off + length],
             k[off : off + length],
             v[off : off + length],
@@ -132,10 +128,10 @@ def test_rel_mha_prefill_fused_matches_reference_and_scoremod(
 def test_rel_mha_decode_fused_matches_reference_and_scoremod(
     device: str, require, rel_extent: int, window_left: int
 ) -> None:
-    _require_fa4(require)
+    require_fa4(require)
     kv_lens = [200, 513, 64]
     batch = len(kv_lens)
-    k_cache, v_cache, page_table, ks, vs = _build_paged(kv_lens, device)
+    k_cache, v_cache, page_table, ks, vs = build_paged(kv_lens, device, PAGE)
     q = torch.randn(batch, NUM_Q_HEADS, HEAD_DIM, device=device, dtype=DTYPE) * 0.5
     rel = torch.randn(batch, NUM_Q_HEADS, rel_extent, device=device, dtype=DTYPE) * 0.1
     cache_seqlens = torch.tensor(kv_lens, device=device, dtype=torch.int32)
@@ -168,7 +164,7 @@ def test_rel_mha_decode_fused_matches_reference_and_scoremod(
     torch.testing.assert_close(out_fused, out_scoremod, atol=TOL, rtol=TOL)
 
     for i in range(batch):
-        ref = _ref_rel_attn(
+        ref = ref_rel_attn(
             q[i : i + 1],
             ks[i],
             vs[i],
@@ -183,7 +179,7 @@ def test_rel_mha_decode_fused_matches_reference_and_scoremod(
 @needs_fused
 def test_fused_falls_back_on_unaligned_extent(device: str, require) -> None:
     """Extents violating the fused-path constraints must route to score_mod."""
-    _require_fa4(require)
+    require_fa4(require)
     rel_96 = torch.zeros(4, NUM_Q_HEADS, 96, device=device, dtype=DTYPE)
     extra, _ = fa_mod._rel_attention_kwargs(rel_96, -1)
     assert "score_mod" in extra and "rel_bias" not in extra

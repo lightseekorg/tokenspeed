@@ -137,17 +137,22 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         return ratios.pop()
 
     @cached_property
+    def _qsa_target_layers(self) -> tuple[tuple[int, int], ...]:
+        """Target-side QSA layers (id, index width); verify staging is target-only."""
+        if getattr(self._text_config, "indexer_n_heads", None) is None:
+            return ()
+        index_dim = int(self._text_config.indexer_head_dim)
+        return tuple(
+            (layer_id, index_dim)
+            for layer_id, layer_type in enumerate(self.target_layer_types)
+            if layer_type == FULL_ATTENTION
+        )
+
+    @cached_property
     def _qsa_layers(self) -> tuple[tuple[int, int], ...]:
         """Return global layer ids and index widths for target and draft QSA."""
 
-        layers = []
-        if getattr(self._text_config, "indexer_n_heads", None) is not None:
-            index_dim = int(self._text_config.indexer_head_dim)
-            layers.extend(
-                (layer_id, index_dim)
-                for layer_id, layer_type in enumerate(self.target_layer_types)
-                if layer_type == FULL_ATTENTION
-            )
+        layers = list(self._qsa_target_layers)
         if (
             self._draft_text_config is not None
             and getattr(self._draft_text_config, "indexer_n_heads", None) is not None
@@ -167,10 +172,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         ratio = self._qsa_compress_ratio
         compressed_fields = []
         recent_fields = []
-        unit = 0
-
-        def add_layer(layer_id: int, index_dim: int) -> None:
-            nonlocal unit
+        for unit, (layer_id, index_dim) in enumerate(self._qsa_layers):
             recent_plane = f"qwen4_exp.qsa.unit.{unit}.recent"
             recent_fields.extend(
                 (
@@ -198,11 +200,43 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                     cache_dtype_name(torch.bfloat16),
                 )
             )
-            unit += 1
-
-        for layer_id, index_dim in self._qsa_layers:
-            add_layer(layer_id, index_dim)
         return tuple(compressed_fields), tuple(recent_fields)
+
+    @override
+    def workspace_bytes(self) -> int:
+        """GDN/PLE verify staging and commit rows, plus QSA verify staging."""
+        if (
+            not self.num_draft_layers
+            or self.attn_config.speculative_num_draft_tokens <= 1
+        ):
+            return 0
+        num_ple_layers = sum(
+            field.field_id.endswith(".conv") for field in self._ple_fields()
+        )
+        # Source and destination int64 row ids, shared by every batch size.
+        ple_commit_bytes = 2 * self.attn_config.max_bs * num_ple_layers * 8
+        return super().workspace_bytes() + ple_commit_bytes + self._qsa_staging_bytes()
+
+    def _qsa_staging_bytes(self) -> int:
+        """QSA target-verify staging, in closed form.
+
+        Mirrors ``QSAVerifyState.preallocate_verify_workspace``: one
+        layer-major key buffer (model dtype) plus the three shared tensors
+        (int64 positions, int64 logical positions, int32 recent locations),
+        sized once for the verify batch bound and the single verify width,
+        plus two uint64 cache addresses per layer for the batched commit.
+        """
+        layers = self._qsa_target_layers
+        width = int(self.attn_config.speculative_num_draft_tokens)
+        if not layers or not self.num_draft_layers or width <= 1:
+            return 0
+        capacity = int(self.attn_config.max_bs)
+        index_dim = layers[0][1]
+        dtype_bytes = torch.empty((), dtype=self.attn_config.dtype).element_size()
+        key_bytes = len(layers) * capacity * width * index_dim * dtype_bytes
+        shared_bytes = capacity * width * ((3 + 1) * 8 + 4)
+        address_bytes = len(layers) * 2 * 8
+        return key_bytes + shared_bytes + address_bytes
 
     @override
     def groups(self) -> tuple[CacheGroupDeclaration, ...]:
@@ -224,16 +258,28 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
             )
         qsa_compressed_fields, qsa_recent_fields = self._qsa_fields()
         if qsa_compressed_fields:
+            qsa_spec = CacheGroupSpec(
+                group_id=QWEN4_EXP_QSA_CACHE_GROUP,
+                retention="full_history",
+                rows_per_page=QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE,
+                entry_stride_tokens=self._qsa_compress_ratio,
+                sliding_window_tokens=None,
+                family="history",
+            )
+            # Raw block ids require exactly one model/kernel page per block.
+            for field in qsa_compressed_fields:
+                if not (
+                    field.shape[0] * self._qsa_compress_ratio
+                    == qsa_spec.block_granularity
+                    == QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE * self._qsa_compress_ratio
+                ):
+                    raise ValueError(
+                        f"Qwen4-Exp QSA compressed field {field.field_id!r}: "
+                        "field rows and block_granularity must match one model page"
+                    )
             extras += (
                 (
-                    CacheGroupSpec(
-                        group_id=QWEN4_EXP_QSA_CACHE_GROUP,
-                        retention="full_history",
-                        rows_per_page=QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE,
-                        entry_stride_tokens=self._qsa_compress_ratio,
-                        sliding_window_tokens=None,
-                        family="history",
-                    ),
+                    qsa_spec,
                     qsa_compressed_fields,
                 ),
                 (

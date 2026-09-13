@@ -83,7 +83,7 @@ std::int32_t CacheForGroup(CacheCoordinator& coordinator, BlockPool& pool, const
                            std::uint32_t group_id) {
     const CacheKey key = Key(content_hash, group_id);
     const std::int32_t group_index = static_cast<std::int32_t>(group_id);
-    CacheBlockRef got = pool.AcquireBlock(group_id, coordinator.Allocator(group_index).CacheBlocksPerLcmBlock());
+    CacheBlockRef got = pool.AcquireBlock(group_id);
     const std::int32_t id = got->Location().lcm_block_id;
     coordinator.GroupPrefixIndex(group_index).Register(pool, got, key, NextTestAccessEpoch());
     got.reset();
@@ -95,7 +95,7 @@ CacheBlockLocation CacheBoundaryForGroup(CacheCoordinator& coordinator, BlockPoo
                                          std::uint64_t access_epoch, std::int32_t logical_block_index,
                                          CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk) {
     const std::int32_t group_index = static_cast<std::int32_t>(group_id);
-    CacheBlockRef block_ref = pool.AcquireBlock(group_id, coordinator.Allocator(group_index).CacheBlocksPerLcmBlock());
+    CacheBlockRef block_ref = pool.AcquireBlock(group_id);
     _assert(static_cast<bool>(block_ref), "test cache block allocation failed");
     const CacheBlockLocation location = block_ref->Location();
     coordinator.GroupPrefixIndex(group_index)
@@ -116,7 +116,7 @@ void ExpectSwaWindowIntact(const PrefixMatch& m, std::int32_t window, std::int32
 }
 
 TEST(CacheGroupTest, HoldsSpecGroupIdManager) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     auto mgr = std::make_unique<GroupAllocator>(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/7);
     CacheGroup g(
         CacheGroupSpec{
@@ -127,7 +127,7 @@ TEST(CacheGroupTest, HoldsSpecGroupIdManager) {
 }
 
 TEST(MakeCoordinatorTest, BuildsOneGroupPerSpec) {
-    BlockPool pool(16);
+    BlockPool pool(16, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -140,7 +140,7 @@ TEST(MakeCoordinatorTest, BuildsOneGroupPerSpec) {
 }
 
 TEST(MakeCoordinatorTest, UsesOneCacheBlockPerLcmBlockByDefault) {
-    BlockPool pool(1);
+    BlockPool pool(1, {1});
     const std::array specs{CacheGroupSpec{.block_granularity = 4}};
 
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/4, pool);
@@ -149,7 +149,7 @@ TEST(MakeCoordinatorTest, UsesOneCacheBlockPerLcmBlockByDefault) {
 }
 
 TEST(MakeCoordinatorTest, Qwen35UsesUniformLogicalPWithDifferentPacking) {
-    BlockPool pool(32);
+    BlockPool pool(32, {8, 1, 1, 1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 8, .block_granularity = 128},
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 128},
@@ -182,7 +182,7 @@ TEST(MakeCoordinatorTest, Qwen35UsesUniformLogicalPWithDifferentPacking) {
 }
 
 TEST(MakeCoordinatorTest, ManagersMayUseSmallerPagesThanTheCoordinatorDomain) {
-    BlockPool pool(32);
+    BlockPool pool(32, {2, 3});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 8},
         {.kind = AttnKind::kSlidingWindow,
@@ -198,8 +198,53 @@ TEST(MakeCoordinatorTest, ManagersMayUseSmallerPagesThanTheCoordinatorDomain) {
     EXPECT_EQ(coordinator.GroupBlockGranularity(1), 2);
 }
 
+// A parent held only by an unpinned cache entry is available to eviction but
+// not empty: the per-step gauge counts it as cached, the leak check as free.
+TEST(CacheCoordinatorCapacityTest, EmptyParentsExcludeCacheOnlyParents) {
+    BlockPool pool(2, {2});
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 4}};
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/4, pool);
+    PrefixCacheIndex& index = coordinator.GroupPrefixIndex(0);
+    const CacheKey key = Key("cached", /*group_id=*/0);
+
+    CacheBlockRef request_ref = pool.AcquireBlock(/*group_id=*/0);
+    index.Register(pool, request_ref, key, /*access_epoch=*/1, /*logical_block_index=*/0, CacheBoundaryKind::kChunk,
+                   /*newly_cached=*/nullptr);
+    EXPECT_EQ(coordinator.NumEmptyLcmBlocks(), 1);
+    EXPECT_EQ(coordinator.NumAvailableLcmBlocks(), 1);
+
+    request_ref.reset();
+    EXPECT_EQ(coordinator.NumEmptyLcmBlocks(), 1);
+    EXPECT_EQ(coordinator.NumAvailableLcmBlocks(), 2);
+
+    EXPECT_TRUE(index.Evict(pool, CacheBlockLocation{.lcm_block_id = 1, .slot_index = 0}).has_value());
+    EXPECT_EQ(coordinator.NumEmptyLcmBlocks(), 2);
+    EXPECT_EQ(coordinator.NumAvailableLcmBlocks(), 2);
+}
+
+TEST(CacheCoordinatorCapacityTest, GroupAvailablePagesTracksLocalSlotsAndEmptyParents) {
+    BlockPool pool(3, {4, 2});
+    const std::array specs{
+        CacheGroupSpec{
+            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 4, .block_granularity = 4},
+        CacheGroupSpec{
+            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 4},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/4, pool);
+
+    EXPECT_EQ(coordinator.GroupAvailablePages(0), 12);
+    EXPECT_EQ(coordinator.GroupAvailablePages(1), 6);
+    CacheBlockRef group_zero = pool.AcquireBlock(/*group_id=*/0);
+    EXPECT_EQ(coordinator.GroupAvailablePages(0), 11);
+    EXPECT_EQ(coordinator.GroupAvailablePages(1), 4);
+    CacheBlockRef group_one = pool.AcquireBlock(/*group_id=*/1);
+    EXPECT_EQ(coordinator.GroupAvailablePages(0), 7);
+    EXPECT_EQ(coordinator.GroupAvailablePages(1), 3);
+}
+
 TEST(CacheCoordinatorTest, ExpandsOneLogicalHashIntoPerGroupCacheBlocks) {
-    BlockPool pool(32);
+    BlockPool pool(32, {2, 3});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 8},
         {.kind = AttnKind::kSlidingWindow,
@@ -232,7 +277,7 @@ TEST(CacheCoordinatorTest, ExpandsOneLogicalHashIntoPerGroupCacheBlocks) {
 }
 
 TEST(MakeCoordinatorTest, RejectsNonPositiveLogicalPOrPacking) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     const std::vector<CacheGroupSpec> valid = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 128},
     };
@@ -246,7 +291,7 @@ TEST(MakeCoordinatorTest, RejectsNonPositiveLogicalPOrPacking) {
 }
 
 TEST(CacheCoordinatorTest, RejectsManagerGeometryThatDiffersFromDomainOrSpec) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     std::vector<CacheGroup> wrong_p;
     wrong_p.emplace_back(
         CacheGroupSpec{
@@ -263,7 +308,7 @@ TEST(CacheCoordinatorTest, RejectsManagerGeometryThatDiffersFromDomainOrSpec) {
 }
 
 TEST(CacheCoordinatorTest, RejectsManagerGroupIdThatDiffersFromItsIndex) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     std::vector<CacheGroup> groups;
     groups.emplace_back(
         CacheGroupSpec{
@@ -331,7 +376,7 @@ TEST(CacheKeyTest, HashPreservesNamespaceGroupAndContentIdentity) {
 }
 
 TEST(MakeCoordinatorTest, UsesOneLogicalGranularityAcrossGroups) {
-    BlockPool pool(16);
+    BlockPool pool(16, {8, 1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 8, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -345,7 +390,7 @@ TEST(MakeCoordinatorTest, UsesOneLogicalGranularityAcrossGroups) {
 }
 
 TEST(CoordinatorMatchTest, BothGroupsAllMiss) {
-    BlockPool pool(16);
+    BlockPool pool(16, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -365,7 +410,7 @@ TEST(CoordinatorMatchTest, BothGroupsAllMiss) {
 TEST(CoordinatorMatchTest, CommonIsMinCoverageFullDeeperThanSwa) {
     // full caches 4 contiguous pages; swa (window 10 -> pages_needed 3)
     // caches only the last 3. Common = min(4, 3) = 3.
-    BlockPool pool(32);
+    BlockPool pool(32, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -391,7 +436,7 @@ TEST(CoordinatorMatchTest, CommonIsMinCoverageFullDeeperThanSwa) {
 }
 
 TEST(CoordinatorMatchTest, TrimmedFullHitsDoNotRefreshAccessEpoch) {
-    BlockPool pool(11);
+    BlockPool pool(11, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -422,7 +467,7 @@ TEST(CoordinatorMatchTest, TrimmedFullHitsDoNotRefreshAccessEpoch) {
 }
 
 TEST(CoordinatorMatchTest, ProbeDoesNotRefreshAccessEpoch) {
-    BlockPool pool(3);
+    BlockPool pool(3, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool);
@@ -444,8 +489,8 @@ TEST(CoordinatorMatchTest, ProbeDoesNotRefreshAccessEpoch) {
 }
 
 TEST(CacheCoordinatorTest, ClearDeviceCacheLeavesHostCacheUntouched) {
-    BlockPool device_pool(4);
-    BlockPool host_pool(4);
+    BlockPool device_pool(4, {1});
+    BlockPool host_pool(4, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/4, device_pool, &host_pool);
@@ -463,8 +508,8 @@ TEST(CacheCoordinatorTest, ClearDeviceCacheLeavesHostCacheUntouched) {
 }
 
 TEST(CacheCoordinatorTest, ClearCacheRemovesDeviceAndHostEntries) {
-    BlockPool device_pool(4);
-    BlockPool host_pool(4);
+    BlockPool device_pool(4, {1});
+    BlockPool host_pool(4, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/4, device_pool, &host_pool);
@@ -482,7 +527,7 @@ TEST(CacheCoordinatorTest, ClearCacheRemovesDeviceAndHostEntries) {
 }
 
 TEST(CacheCoordinatorTest, ClearDeviceCacheRejectsPinnedEntryWithoutPartialMutation) {
-    BlockPool pool(4);
+    BlockPool pool(4, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/4, pool);
@@ -510,7 +555,7 @@ std::vector<GroupDemand> FreshDemands(std::vector<BlockTable>& tables, std::span
 }
 
 TEST(CacheCoordinatorAdmissionTest, ReportsOnlyFreshlyAllocatedKernelPageIds) {
-    BlockPool pool(4);
+    BlockPool pool(4, {4, 1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 4, .block_granularity = 4},
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
@@ -540,7 +585,7 @@ TEST(CacheCoordinatorAdmissionTest, ReportsOnlyFreshlyAllocatedKernelPageIds) {
 }
 
 TEST(CacheCoordinatorAdmissionTest, AcquireMatchedFullPrefixUsesOneAccessEpoch) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
@@ -574,7 +619,7 @@ TEST(CacheCoordinatorAdmissionTest, AcquireMatchedFullPrefixUsesOneAccessEpoch) 
 }
 
 TEST(CacheCoordinatorAdmissionTest, LaterChunksReuseRequestAccessEpoch) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
@@ -622,7 +667,7 @@ TEST(CacheCoordinatorAdmissionTest, LaterChunksReuseRequestAccessEpoch) {
 }
 
 TEST(CacheCoordinatorAdmissionTest, ProbeAndRejectedAdmissionDoNotAdvanceAccessEpoch) {
-    BlockPool pool(1);
+    BlockPool pool(1, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
@@ -663,7 +708,7 @@ TEST(CacheCoordinatorAdmissionTest, ProbeAndRejectedAdmissionDoNotAdvanceAccessE
 }
 
 TEST(CacheCoordinatorAdmissionTest, FullEvictionPrefersOlderRequestBeforePosition) {
-    BlockPool pool(4);
+    BlockPool pool(4, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
@@ -694,7 +739,7 @@ TEST(CacheCoordinatorAdmissionTest, FullEvictionPrefersOlderRequestBeforePositio
 }
 
 TEST(CacheCoordinatorAdmissionTest, FullEvictionIsSuffixFirstWithinOneAccessEpoch) {
-    BlockPool pool(4);
+    BlockPool pool(4, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
@@ -717,13 +762,13 @@ TEST(CacheCoordinatorAdmissionTest, FullEvictionIsSuffixFirstWithinOneAccessEpoc
 }
 
 TEST(CacheCoordinatorAdmissionTest, RejectedCachedHitDoesNotRefreshAccessEpoch) {
-    BlockPool pool(2);
+    BlockPool pool(2, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
     CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
     const std::int32_t cached_hit = CacheForGroup(coordinator, pool, hashes[0], 0);
-    CacheBlockRef pinned = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef pinned = pool.AcquireBlock(/*group_id=*/0);
     ASSERT_TRUE(pinned);
     ASSERT_EQ(pool.NumEmptyLcmBlocks(), 0);
     const CacheBlockLocation cached_location{.lcm_block_id = cached_hit, .slot_index = 0};
@@ -748,8 +793,8 @@ TEST(CacheCoordinatorAdmissionTest, RejectedCachedHitDoesNotRefreshAccessEpoch) 
 }
 
 TEST(CacheCoordinatorAdmissionTest, UsesPoolAllocationOrderForEmptyParents) {
-    BlockPool pool(3);
-    std::vector<CacheBlockRef> held = pool.AcquireBlocks(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1, /*num=*/3);
+    BlockPool pool(3, {1});
+    std::vector<CacheBlockRef> held = pool.AcquireBlocks(/*group_id=*/0, /*num=*/3);
     ASSERT_EQ(held.size(), 3u);
     const CacheBlockLocation first_released = held[2]->Location();
     const CacheBlockLocation second_released = held[0]->Location();
@@ -769,8 +814,8 @@ TEST(CacheCoordinatorAdmissionTest, UsesPoolAllocationOrderForEmptyParents) {
 }
 
 TEST(CacheCoordinatorAdmissionTest, PacksSlotsFromOneNewParentTogether) {
-    BlockPool pool(2);
-    std::vector<CacheBlockRef> held = pool.AcquireBlocks(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1, /*num=*/2);
+    BlockPool pool(2, {2, 1});
+    std::vector<CacheBlockRef> held = pool.AcquireBlocks(/*group_id=*/1, /*num=*/2);
     ASSERT_EQ(held.size(), 2u);
     const CacheBlockLocation first_released = held[1]->Location();
     held[1].reset();
@@ -790,7 +835,7 @@ TEST(CacheCoordinatorAdmissionTest, PacksSlotsFromOneNewParentTogether) {
 }
 
 TEST(CacheCoordinatorAdmissionTest, FreeCachedHitCostsNoAdditionalPlacement) {
-    BlockPool pool(2);
+    BlockPool pool(2, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
     CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
@@ -810,7 +855,7 @@ TEST(CacheCoordinatorAdmissionTest, FreeCachedHitCostsNoAdditionalPlacement) {
 }
 
 TEST(CacheCoordinatorAdmissionTest, ReservedCapacityLivesInBlockTableUntilConsumed) {
-    BlockPool pool(3);
+    BlockPool pool(3, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/4, pool);
@@ -833,7 +878,7 @@ TEST(CacheCoordinatorAdmissionTest, ReservedCapacityLivesInBlockTableUntilConsum
 }
 
 TEST(CacheCoordinatorAdmissionTest, HeterogeneousGroupsSharePartialAndEmptyParents) {
-    BlockPool pool(2);
+    BlockPool pool(2, {2, 1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 4},
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
@@ -855,7 +900,7 @@ TEST(CacheCoordinatorAdmissionTest, HeterogeneousGroupsSharePartialAndEmptyParen
 }
 
 TEST(CacheCoordinatorAdmissionTest, PacksDemandBeforeConsumingAnotherGroupsOnlyParent) {
-    BlockPool pool(2);
+    BlockPool pool(2, {2, 1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 4},
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
@@ -877,7 +922,7 @@ TEST(CacheCoordinatorAdmissionTest, PacksDemandBeforeConsumingAnotherGroupsOnlyP
 }
 
 TEST(CacheCoordinatorAdmissionTest, RetriesWithCompactPackingWhenGreedyFreeSlotsWouldReject) {
-    BlockPool pool(3);
+    BlockPool pool(3, {2, 1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 4},
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
@@ -885,7 +930,7 @@ TEST(CacheCoordinatorAdmissionTest, RetriesWithCompactPackingWhenGreedyFreeSlots
     CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
     const std::int32_t first_partial_parent = CacheForGroup(coordinator, pool, hashes[0], 0);
-    CacheBlockRef fills_first_parent = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/2);
+    CacheBlockRef fills_first_parent = pool.AcquireBlock(/*group_id=*/0);
     const std::int32_t second_partial_parent = CacheForGroup(coordinator, pool, hashes[1], 0);
     fills_first_parent.reset();
     ASSERT_NE(first_partial_parent, second_partial_parent);
@@ -903,7 +948,7 @@ TEST(CacheCoordinatorAdmissionTest, RetriesWithCompactPackingWhenGreedyFreeSlots
 }
 
 TEST(CacheCoordinatorAdmissionTest, KeepsCachedChildrenWhenUnpackedPlacementFits) {
-    BlockPool pool(3);
+    BlockPool pool(3, {2, 1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 4},
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
@@ -911,7 +956,7 @@ TEST(CacheCoordinatorAdmissionTest, KeepsCachedChildrenWhenUnpackedPlacementFits
     CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
     CacheForGroup(coordinator, pool, hashes[0], 0);
-    CacheBlockRef fills_first_parent = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/2);
+    CacheBlockRef fills_first_parent = pool.AcquireBlock(/*group_id=*/0);
     CacheForGroup(coordinator, pool, hashes[1], 0);
     fills_first_parent.reset();
 
@@ -924,7 +969,7 @@ TEST(CacheCoordinatorAdmissionTest, KeepsCachedChildrenWhenUnpackedPlacementFits
 }
 
 TEST(CacheCoordinatorAdmissionTest, UsesEmptyParentBeforeEvictingCachedChild) {
-    BlockPool pool(2);
+    BlockPool pool(2, {2});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 4},
     };
@@ -941,13 +986,13 @@ TEST(CacheCoordinatorAdmissionTest, UsesEmptyParentBeforeEvictingCachedChild) {
 }
 
 TEST(CacheCoordinatorAdmissionTest, DoesNotShareFreeSlotsFromBoundForeignParent) {
-    BlockPool pool(1);
+    BlockPool pool(1, {4, 1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 4, .block_granularity = 4},
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
-    CacheBlockRef pinned = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/4);
+    CacheBlockRef pinned = pool.AcquireBlock(/*group_id=*/0);
     ASSERT_TRUE(pinned);
 
     std::vector<BlockTable> tables(coordinator.NumGroups());
@@ -961,7 +1006,7 @@ TEST(CacheCoordinatorAdmissionTest, DoesNotShareFreeSlotsFromBoundForeignParent)
 }
 
 TEST(CacheCoordinatorAdmissionTest, EvictsOldestCachedChildNeededForCapacity) {
-    BlockPool pool(1);
+    BlockPool pool(1, {2});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 4},
     };
@@ -978,7 +1023,7 @@ TEST(CacheCoordinatorAdmissionTest, EvictsOldestCachedChildNeededForCapacity) {
 }
 
 TEST(CacheCoordinatorAdmissionTest, FullEvictionUsesAccessEpochInsteadOfPermanentHitClass) {
-    BlockPool pool(2);
+    BlockPool pool(2, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
@@ -1014,7 +1059,7 @@ TEST(CacheCoordinatorAdmissionTest, FullEvictionUsesAccessEpochInsteadOfPermanen
 }
 
 TEST(CacheCoordinatorAdmissionTest, StateEvictionUsesAccessEpochBeforePosition) {
-    BlockPool pool(2);
+    BlockPool pool(2, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
@@ -1022,12 +1067,12 @@ TEST(CacheCoordinatorAdmissionTest, StateEvictionUsesAccessEpochBeforePosition) 
     GroupAllocator& manager = coordinator.Allocator(0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
 
-    CacheBlockRef late_checkpoint = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef late_checkpoint = pool.AcquireBlock(/*group_id=*/0);
     coordinator.GroupPrefixIndex(0).Register(pool, late_checkpoint, Key(hashes[0], 0), NextTestAccessEpoch(),
                                              /*logical_block_index=*/10);
     late_checkpoint.reset();
 
-    CacheBlockRef early_checkpoint = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef early_checkpoint = pool.AcquireBlock(/*group_id=*/0);
     coordinator.GroupPrefixIndex(0).Register(pool, early_checkpoint, Key(hashes[1], 0), NextTestAccessEpoch(),
                                              /*logical_block_index=*/0);
     early_checkpoint.reset();
@@ -1040,7 +1085,7 @@ TEST(CacheCoordinatorAdmissionTest, StateEvictionUsesAccessEpochBeforePosition) 
 }
 
 TEST(CacheCoordinatorAdmissionTest, OrdinaryStateKeepsLongerUnhitFrontier) {
-    BlockPool pool(2);
+    BlockPool pool(2, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
@@ -1062,7 +1107,7 @@ TEST(CacheCoordinatorAdmissionTest, OrdinaryStateKeepsLongerUnhitFrontier) {
 }
 
 TEST(CacheCoordinatorAdmissionTest, OrdinarySwaKeepsLongerUnhitFrontier) {
-    BlockPool pool(2);
+    BlockPool pool(2, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kSlidingWindow,
          .sliding_window = 8,
@@ -1087,7 +1132,7 @@ TEST(CacheCoordinatorAdmissionTest, OrdinarySwaKeepsLongerUnhitFrontier) {
 }
 
 TEST(CacheCoordinatorAdmissionTest, EndpointUsesNormalValueWithinSameEpoch) {
-    BlockPool pool(2);
+    BlockPool pool(2, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
@@ -1109,7 +1154,7 @@ TEST(CacheCoordinatorAdmissionTest, EndpointUsesNormalValueWithinSameEpoch) {
 }
 
 TEST(CacheCoordinatorAdmissionTest, PromotedBoundaryUsesNormalValueWithinSameEpoch) {
-    BlockPool pool(2);
+    BlockPool pool(2, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
@@ -1131,7 +1176,7 @@ TEST(CacheCoordinatorAdmissionTest, PromotedBoundaryUsesNormalValueWithinSameEpo
 }
 
 TEST(CacheCoordinatorAdmissionTest, ActualHitPromotesChunkBoundaryToNormalValue) {
-    BlockPool pool(2);
+    BlockPool pool(2, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
@@ -1157,7 +1202,7 @@ TEST(CacheCoordinatorAdmissionTest, ActualHitPromotesChunkBoundaryToNormalValue)
 }
 
 TEST(CacheCoordinatorAdmissionTest, EndpointIsNotBelowEveryPreviouslyHitBlock) {
-    BlockPool pool(2);
+    BlockPool pool(2, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
@@ -1183,7 +1228,7 @@ TEST(CacheCoordinatorAdmissionTest, EndpointIsNotBelowEveryPreviouslyHitBlock) {
 }
 
 TEST(CacheCoordinatorAdmissionTest, MixedGroupTieEvictsNonClosedBeforeFullHistory) {
-    BlockPool pool(3);
+    BlockPool pool(3, {1, 1, 1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
@@ -1214,7 +1259,7 @@ TEST(CacheCoordinatorAdmissionTest, MixedGroupTieEvictsNonClosedBeforeFullHistor
 }
 
 TEST(CacheCoordinatorAdmissionTest, RetriesWithFreshCursorsAfterPinnedAdmissionFails) {
-    BlockPool pool(3);
+    BlockPool pool(3, {1, 1, 1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
@@ -1259,7 +1304,7 @@ TEST(CacheCoordinatorAdmissionTest, RetriesWithFreshCursorsAfterPinnedAdmissionF
 }
 
 TEST(CacheCoordinatorAdmissionTest, SkipsProtectedOldestEpochAndEvictsLaterEpochs) {
-    BlockPool pool(3);
+    BlockPool pool(3, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
@@ -1290,7 +1335,7 @@ TEST(CacheCoordinatorAdmissionTest, SkipsProtectedOldestEpochAndEvictsLaterEpoch
 }
 
 TEST(CacheCoordinatorAdmissionTest, ProspectiveUncachedReclaimDoesNotEvictCachedBlock) {
-    BlockPool pool(3);
+    BlockPool pool(3, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
@@ -1316,7 +1361,7 @@ TEST(CacheCoordinatorAdmissionTest, QwenScaleChunkLifecyclePublishesOneStateSnap
     constexpr std::int32_t kPromptPages = 256;
     constexpr std::int32_t kChunkPages = 64;
     // Keep this publication-contract test out of eviction-policy territory.
-    BlockPool pool(/*num_lcm_blocks=*/512);
+    BlockPool pool(/*num_lcm_blocks=*/512, {1, 1, 1, 32});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kMambaState,
          .sliding_window = 0,
@@ -1390,7 +1435,7 @@ TEST(CacheCoordinatorAdmissionTest, QwenScaleChunkLifecyclePublishesOneStateSnap
 }
 
 TEST(CacheCoordinatorAdmissionTest, RebindsOnlyAfterEvictingWholeForeignParent) {
-    BlockPool pool(1);
+    BlockPool pool(1, {2, 1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 4},
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
@@ -1412,7 +1457,7 @@ TEST(CacheCoordinatorAdmissionTest, RebindsOnlyAfterEvictingWholeForeignParent) 
 }
 
 TEST(CacheCoordinatorAdmissionTest, UsesLocalSlotAfterEvictingAnotherWholeParent) {
-    BlockPool pool(2);
+    BlockPool pool(2, {2});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 4},
     };
@@ -1436,7 +1481,7 @@ TEST(CacheCoordinatorAdmissionTest, UsesLocalSlotAfterEvictingAnotherWholeParent
 }
 
 TEST(CacheCoordinatorAdmissionTest, RestoresOlderSiblingWhenMiddleCandidateFreesRequiredParent) {
-    BlockPool pool(2);
+    BlockPool pool(2, {2, 1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 4},
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
@@ -1444,7 +1489,7 @@ TEST(CacheCoordinatorAdmissionTest, RestoresOlderSiblingWhenMiddleCandidateFrees
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/4, pool);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}});
     GroupAllocator& manager = coordinator.Allocator(0);
-    std::vector<CacheBlockRef> cached = pool.AcquireBlocks(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/2, /*num=*/3);
+    std::vector<CacheBlockRef> cached = pool.AcquireBlocks(/*group_id=*/0, /*num=*/3);
     ASSERT_EQ(cached.size(), 3u);
     ASSERT_EQ(cached[0]->Location().lcm_block_id, cached[1]->Location().lcm_block_id);
     ASSERT_NE(cached[0]->Location().lcm_block_id, cached[2]->Location().lcm_block_id);
@@ -1468,7 +1513,7 @@ TEST(CacheCoordinatorAdmissionTest, RestoresOlderSiblingWhenMiddleCandidateFrees
 }
 
 TEST(CacheCoordinatorAdmissionTest, ProspectiveHitParentCannotBecomeVictim) {
-    BlockPool pool(2);
+    BlockPool pool(2, {2, 1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 4},
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
@@ -1492,7 +1537,7 @@ TEST(CacheCoordinatorAdmissionTest, ProspectiveHitParentCannotBecomeVictim) {
 }
 
 TEST(CacheCoordinatorAdmissionTest, ReclaimsTableOwnerBeforeEvictingProspectiveVictim) {
-    BlockPool pool(2);
+    BlockPool pool(2, {1});
     const std::vector<CacheGroupSpec> specs = {{.kind = AttnKind::kSlidingWindow,
                                                 .sliding_window = 5,
                                                 .cache_blocks_per_lcm_block = 1,
@@ -1517,7 +1562,7 @@ TEST(CacheCoordinatorAdmissionTest, ReclaimsTableOwnerBeforeEvictingProspectiveV
 }
 
 TEST(CacheCoordinatorAdmissionTest, EvictsProspectiveVictimCachedDuringCommit) {
-    BlockPool pool(2);
+    BlockPool pool(2, {1});
     const std::vector<CacheGroupSpec> specs = {{.kind = AttnKind::kSlidingWindow,
                                                 .sliding_window = 5,
                                                 .cache_blocks_per_lcm_block = 1,
@@ -1548,7 +1593,7 @@ TEST(CacheCoordinatorAdmissionTest, EvictsProspectiveVictimCachedDuringCommit) {
 }
 
 TEST(CacheCoordinatorAdmissionTest, RejectsProspectiveVictimWithAnExtraOwner) {
-    BlockPool pool(2);
+    BlockPool pool(2, {1});
     const std::vector<CacheGroupSpec> specs = {{.kind = AttnKind::kSlidingWindow,
                                                 .sliding_window = 5,
                                                 .cache_blocks_per_lcm_block = 1,
@@ -1579,7 +1624,7 @@ TEST(CacheCoordinatorAdmissionTest, RejectsProspectiveVictimWithAnExtraOwner) {
 
 TEST(CoordinatorMatchTest, SwaMissForcesZeroCommon) {
     // full caches 2 pages, swa caches nothing -> common = min(2, 0) = 0.
-    BlockPool pool(16);
+    BlockPool pool(16, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -1599,7 +1644,7 @@ TEST(CoordinatorMatchTest, SwaMissForcesZeroCommon) {
 }
 
 TEST(CoordinatorAllocTest, ColdStartAllocatesAlignedPages) {
-    BlockPool pool(32);
+    BlockPool pool(32, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -1620,7 +1665,7 @@ TEST(CoordinatorAllocTest, ColdStartAllocatesAlignedPages) {
 }
 
 TEST(CoordinatorAllocTest, ClaimsCommonPrefixThenAllocatesRemainder) {
-    BlockPool pool(64);
+    BlockPool pool(64, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -1645,7 +1690,7 @@ TEST(CoordinatorAllocTest, ClaimsCommonPrefixThenAllocatesRemainder) {
 }
 
 TEST(CoordinatorAllocTest, CrossGroupShortfallAllocatesNothing) {
-    BlockPool pool(5);
+    BlockPool pool(5, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -1668,7 +1713,7 @@ TEST(CoordinatorAllocTest, CrossGroupShortfallAllocatesNothing) {
 }
 
 TEST(CoordinatorStepTest, AcquireKeepsGroupsAligned) {
-    BlockPool pool(32);
+    BlockPool pool(32, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -1687,7 +1732,7 @@ TEST(CoordinatorStepTest, AcquireKeepsGroupsAligned) {
 }
 
 TEST(CoordinatorStepTest, AcquireShortfallAllocatesNothing) {
-    BlockPool pool(3);
+    BlockPool pool(3, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -1706,7 +1751,7 @@ TEST(CoordinatorStepTest, AcquireShortfallAllocatesNothing) {
 }
 
 TEST(CoordinatorStepTest, CacheFullBlocksThenMatchHits) {
-    BlockPool pool(32);
+    BlockPool pool(32, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -1725,7 +1770,7 @@ TEST(CoordinatorStepTest, CacheFullBlocksThenMatchHits) {
 }
 
 TEST(CoordinatorStepTest, FreeReturnsAllGroups) {
-    BlockPool pool(32);
+    BlockPool pool(32, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -1744,7 +1789,7 @@ TEST(CoordinatorStepTest, FreeReturnsAllGroups) {
 }
 
 TEST(CoordinatorStepTest, EndToEndTwoRequestsSharePrefix) {
-    BlockPool pool(64);
+    BlockPool pool(64, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -1777,7 +1822,7 @@ TEST(CoordinatorStepTest, EndToEndTwoRequestsSharePrefix) {
 }
 
 TEST(CoordinatorStepTest, CacheFullBlocksAtSlotOffsetExtendsPrefix) {
-    BlockPool pool(64);
+    BlockPool pool(64, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -1806,7 +1851,7 @@ TEST(CoordinatorStepTest, CacheFullBlocksAtSlotOffsetExtendsPrefix) {
 }
 
 TEST(CoordinatorStepTest, CacheFullBlocksAtOffsetSkipsSwaHoles) {
-    BlockPool pool(64);
+    BlockPool pool(64, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -1836,7 +1881,7 @@ TEST(CoordinatorStepTest, CacheFullBlocksAtOffsetSkipsSwaHoles) {
 }
 
 TEST(CoordinatorStepTest, CacheFullBlocksRejectsOutOfRangeFirstSlot) {
-    BlockPool pool(32);
+    BlockPool pool(32, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -1855,7 +1900,7 @@ TEST(CoordinatorStepTest, CacheFullBlocksRejectsOutOfRangeFirstSlot) {
 TEST(CoordinatorMatchTest, SwaRunCutByFullBoundDropsToNoValidMatch) {
     // full covers 4; swa's tail run {2,3,4} bounded to 4 leaves run {2,3} <
     // pages_needed 3 with holes at 0,1 -> no valid swa match, common = 0.
-    BlockPool pool(64);
+    BlockPool pool(64, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -1884,7 +1929,7 @@ TEST(CoordinatorMatchTest, SwaRunCutByFullBoundDropsToNoValidMatch) {
 TEST(CoordinatorMatchTest, FullShorterThanSwaBoundsSwaWithRunIntact) {
     // full covers 4; swa caches 1..4. Bounded to 4 the run {1,2,3} still reaches
     // pages_needed 3, so common stays 4 -- hole only OUTSIDE the last window.
-    BlockPool pool(64);
+    BlockPool pool(64, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -1919,7 +1964,7 @@ TEST(CoordinatorMatchTest, FullShorterThanSwaBoundsSwaWithRunIntact) {
 
 TEST(CoordinatorMatchTest, SwaShorterThanFullTruncatesFull) {
     // swa's best valid match is 4 blocks [null, b1, b2, b3]; full truncates 5 -> 4.
-    BlockPool pool(64);
+    BlockPool pool(64, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -1946,7 +1991,7 @@ TEST(CoordinatorMatchTest, SwaShorterThanFullTruncatesFull) {
 }
 
 TEST(CoordinatorPromotionTest, ProbePreservesClosedCoverageBeforeWindowConvergence) {
-    BlockPool pool(64);
+    BlockPool pool(64, {1, 1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
@@ -1977,7 +2022,7 @@ TEST(CoordinatorPromotionTest, ProbePreservesClosedCoverageBeforeWindowConvergen
 }
 
 TEST(CoordinatorPromotionTest, ClosedCoverageIsMinimumAcrossClosedGroups) {
-    BlockPool pool(64);
+    BlockPool pool(64, {1, 1, 1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
@@ -2007,7 +2052,7 @@ TEST(CoordinatorPromotionTest, ClosedCoverageIsMinimumAcrossClosedGroups) {
 }
 
 TEST(CoordinatorPromotionTest, LongerWindowHitDoesNotCreatePromotion) {
-    BlockPool pool(64);
+    BlockPool pool(64, {1, 1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -2042,7 +2087,7 @@ TEST(CoordinatorPromotionTest, LongerWindowHitDoesNotCreatePromotion) {
 }
 
 TEST(CoordinatorPromotionTest, PureWindowGroupsHaveNoClosedCoverage) {
-    BlockPool pool(32);
+    BlockPool pool(32, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kSlidingWindow,
          .sliding_window = 5,
@@ -2061,8 +2106,8 @@ TEST(CoordinatorPromotionTest, PureWindowGroupsHaveNoClosedCoverage) {
 }
 
 TEST(CoordinatorPromotionTest, HostTierPreservesDevicePromotion) {
-    BlockPool device_pool(64);
-    BlockPool host_pool(64);
+    BlockPool device_pool(64, {1, 1});
+    BlockPool host_pool(64, {1, 1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
@@ -2092,8 +2137,8 @@ TEST(CoordinatorPromotionTest, HostTierPreservesDevicePromotion) {
 }
 
 TEST(CoordinatorPromotionTest, HostClosedCoverageCreatesPromotion) {
-    BlockPool device_pool(64);
-    BlockPool host_pool(64);
+    BlockPool device_pool(64, {1, 1});
+    BlockPool host_pool(64, {1, 1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
@@ -2123,8 +2168,8 @@ TEST(CoordinatorPromotionTest, HostClosedCoverageCreatesPromotion) {
 }
 
 TEST(CoordinatorPromotionTest, HostHitCoveringClosedBoundaryDoesNotCreatePromotion) {
-    BlockPool device_pool(64);
-    BlockPool host_pool(64);
+    BlockPool device_pool(64, {1, 1});
+    BlockPool host_pool(64, {1, 1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
@@ -2160,7 +2205,7 @@ TEST(CoordinatorPromotionTest, HostHitCoveringClosedBoundaryDoesNotCreatePromoti
 TEST(CoordinatorMatchTest, TwoSwaGroupsSharedBoundaryMatches) {
     // pages_needed 3. full: 5; both SWA groups cache {1,2,3}, so each accepts
     // the SAME boundary 4 in the single sweep -- no cascade, full truncates 5 -> 4.
-    BlockPool pool(64);
+    BlockPool pool(64, {1, 1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -2199,7 +2244,7 @@ TEST(CoordinatorMatchTest, TwoSwaGroupsCascadingShrinkConverges) {
     // swaA first accepts boundary 5 (run {2,3,4}), then swaB shrinks the bound to 4 (run {1,2,3})
     // UNDER swaA's match; re-matching swaA at 4 fails its window ({1} missing) and cascades both
     // groups down to boundary 1 -- the greatest boundary ALL groups support (block 0 shared).
-    BlockPool pool(64);
+    BlockPool pool(64, {1, 1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -2238,7 +2283,7 @@ TEST(CoordinatorMatchTest, TwoSwaGroupsCascadingShrinkConverges) {
 TEST(CoordinatorMatchTest, SwaGroupOrderDoesNotChangeConvergedCommon) {
     // The cascade fixture above with the two window groups swapped: convergence must land on the
     // same greatest common boundary regardless of sweep order among non-closed groups.
-    BlockPool pool(64);
+    BlockPool pool(64, {1, 1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kSlidingWindow,
          .sliding_window = 10,
@@ -2271,7 +2316,7 @@ TEST(CoordinatorMatchTest, SwaGroupOrderDoesNotChangeConvergedCommon) {
 TEST(CoordinatorMatchTest, MultiWindowThreeGroupsSharedBoundary) {
     // Mixed window sizes on one pool (the W=128 / W=4 / full shape, scaled to P=2: W=6 needs a
     // 3-page tail, W=2 needs 1): all three groups support boundary 5 and the pool stays unified.
-    BlockPool pool(64);
+    BlockPool pool(64, {1, 1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
         {.kind = AttnKind::kSlidingWindow,
@@ -2307,7 +2352,7 @@ TEST(CoordinatorMatchTest, MultiWindowThreeGroupsSharedBoundary) {
 TEST(CoordinatorMatchTest, MultiWindowCascadeToZero) {
     // W=2's only cached page (3) forces boundary 4, where W=6 cannot cover {1,2,3} -> its
     // re-match collapses to 0 and drags the small window with it: no boundary works, common = 0.
-    BlockPool pool(64);
+    BlockPool pool(64, {1, 1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
         {.kind = AttnKind::kSlidingWindow,
@@ -2340,7 +2385,7 @@ TEST(CoordinatorMatchTest, DeepCascadeRequiresSecondConvergeSweep) {
     // then swaB's re-match lands at 2 UNDER swaA's already re-matched boundary, so swaA must
     // re-match again. Hand-computed greatest common boundary: 2 pages (A@3 valid but B@3 lacks
     // block 2; at 2 both windows clamp to begin over {0,1}).
-    BlockPool pool(64);
+    BlockPool pool(64, {1, 1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -2380,7 +2425,7 @@ TEST(CoordinatorMatchTest, DeepCascadeRequiresSecondConvergeSweep) {
 TEST(CoordinatorMatchTest, MultiWindowSlideCreditSumsPerWindow) {
     // Retention is per-window: at 10 computed tokens W=6 has slid past 2 pages, W=2 past 4,
     // full past none -- the gate credit is their sum over the shared pool.
-    BlockPool pool(64);
+    BlockPool pool(64, {1, 1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
         {.kind = AttnKind::kSlidingWindow,
@@ -2411,7 +2456,7 @@ TEST(CoordinatorMatchTest, MultiWindowSlideCreditSumsPerWindow) {
 }
 
 TEST(CoordinatorMatchTest, AllFullGroupsMinTruncationUnchanged) {
-    BlockPool pool(32);
+    BlockPool pool(32, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
@@ -2432,7 +2477,7 @@ TEST(CoordinatorMatchTest, AllFullGroupsMinTruncationUnchanged) {
 }
 
 TEST(CoordinatorMatchTest, SingleFullGroupUnchanged) {
-    BlockPool pool(16);
+    BlockPool pool(16, {1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool);
@@ -2450,7 +2495,7 @@ TEST(CoordinatorMatchTest, SingleFullGroupUnchanged) {
 
 TEST(CoordinatorMatchTest, SwaOnlyConfigKeepsTailRunWithLeadingHoles) {
     // No full bound: tail run {2,3,4} covers the window; leading holes null-pad to page 0.
-    BlockPool pool(32);
+    BlockPool pool(32, {1});
     std::vector<CacheGroupSpec> specs = {{.kind = AttnKind::kSlidingWindow,
                                           .sliding_window = 10,
                                           .cache_blocks_per_lcm_block = 1,
@@ -2473,7 +2518,7 @@ TEST(CoordinatorMatchTest, SwaOnlyConfigKeepsTailRunWithLeadingHoles) {
 }
 
 TEST(CoordinatorAllocTest, RejectedAdmissionLeavesCachedPrefixUnclaimed) {
-    BlockPool pool(5);
+    BlockPool pool(5, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -2499,7 +2544,7 @@ TEST(CoordinatorAllocTest, RejectedAdmissionLeavesCachedPrefixUnclaimed) {
 }
 
 TEST(CacheCoordinatorReclaimExpired, OnlySlidingWindowGroupEvicts) {
-    BlockPool pool(/*num_lcm_blocks=*/32);
+    BlockPool pool(/*num_lcm_blocks=*/32, {1, 1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -2535,7 +2580,7 @@ TEST(CacheCoordinatorReclaimExpired, OnlySlidingWindowGroupEvicts) {
 }
 
 TEST(CoordinatorMatchTest, ThreeGroupsCommonIsMinCoverageAcrossAll) {
-    BlockPool pool(64);
+    BlockPool pool(64, {1, 1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -2571,7 +2616,7 @@ TEST(CoordinatorMatchTest, ThreeGroupsCommonIsMinCoverageAcrossAll) {
 }
 
 TEST(CoordinatorMatchTest, ThreeGroupsOneAllMissForcesZeroCommon) {
-    BlockPool pool(64);
+    BlockPool pool(64, {1, 1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -2596,7 +2641,7 @@ TEST(CoordinatorMatchTest, ThreeGroupsOneAllMissForcesZeroCommon) {
 }
 
 TEST(CacheCoordinatorStoreCandidates, CollectsKeysWithoutPinningDeviceBlocks) {
-    BlockPool pool(/*num_lcm_blocks=*/16);
+    BlockPool pool(/*num_lcm_blocks=*/16, {1, 1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -2605,7 +2650,7 @@ TEST(CacheCoordinatorStoreCandidates, CollectsKeysWithoutPinningDeviceBlocks) {
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 2},
     };
-    BlockPool host_pool(4);
+    BlockPool host_pool(4, {1, 1});
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, &host_pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
@@ -2639,7 +2684,7 @@ TEST(CacheCoordinatorStoreCandidates, CollectsKeysWithoutPinningDeviceBlocks) {
 }
 
 TEST(CacheCoordinatorStoreCandidates, DisabledByDefaultCollectsNothing) {
-    BlockPool pool(16);
+    BlockPool pool(16, {1, 1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -2658,8 +2703,8 @@ TEST(CacheCoordinatorStoreCandidates, DisabledByDefaultCollectsNothing) {
 }
 
 TEST(CacheCoordinatorStoreCandidates, PrefillPublicationStreamsFullAndStateDecodePublicationDoesNot) {
-    BlockPool pool(24);
-    BlockPool host_pool(24);
+    BlockPool pool(24, {1, 1, 1});
+    BlockPool host_pool(24, {1, 1, 1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull,
@@ -2721,8 +2766,8 @@ TEST(CacheCoordinatorStoreCandidates, PrefillPublicationStreamsFullAndStateDecod
 }
 
 TEST(CacheCoordinatorStoreCandidates, PrefillStreamsThreeKdaGroupsDecodeFinishWritesLatestOnly) {
-    BlockPool pool(32);
-    BlockPool host_pool(32);
+    BlockPool pool(32, {1, 1, 1, 1});
+    BlockPool host_pool(32, {1, 1, 1, 1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull,
@@ -2800,7 +2845,7 @@ std::int32_t SlideCredit(const CacheCoordinator& coord, std::span<const BlockTab
 // The exact slide-credit rule: collection-on credits a slide-out block only when it is cached;
 // a pending store key does not pin the Device block before an operation is emitted.
 TEST(CacheCoordinatorStoreCandidates, SlideCreditExcludesUncachedOnlyWhenCollecting) {
-    BlockPool pool(16);
+    BlockPool pool(16, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{.kind = AttnKind::kSlidingWindow,
                        .sliding_window = 4,
@@ -2813,7 +2858,7 @@ TEST(CacheCoordinatorStoreCandidates, SlideCreditExcludesUncachedOnlyWhenCollect
     EXPECT_EQ(SlideCredit(off, tables, 8), 2) << "collection-off counts uncached ref-1 blocks";
     off.Free(tables);
 
-    BlockPool host_pool(4);
+    BlockPool host_pool(4, {1});
     CacheCoordinator on = MakeCoordinator(specs, 2, pool, &host_pool);
     std::vector<BlockTable> tables2(on.NumGroups());
     ASSERT_TRUE(AdmitForTest(on, tables2, 8));
@@ -2827,8 +2872,8 @@ TEST(CacheCoordinatorStoreCandidates, SlideCreditExcludesUncachedOnlyWhenCollect
 }
 
 TEST(CacheCoordinatorHostReplacement, ReusesOneColdChildBeforeRebindingAParent) {
-    BlockPool device_pool(2);
-    BlockPool host_pool(1);
+    BlockPool device_pool(2, {2, 1});
+    BlockPool host_pool(1, {2, 1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -2836,8 +2881,8 @@ TEST(CacheCoordinatorHostReplacement, ReusesOneColdChildBeforeRebindingAParent) 
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, &host_pool);
     const CacheKey first = Key("first", 0);
     const CacheKey second = Key("second", 0);
-    CacheBlockRef first_ref = host_pool.AcquireBlock(0, 2);
-    CacheBlockRef second_ref = host_pool.AcquireBlock(0, 2);
+    CacheBlockRef first_ref = host_pool.AcquireBlock(0);
+    CacheBlockRef second_ref = host_pool.AcquireBlock(0);
     coordinator.CacheHostBlock(first_ref, first);
     coordinator.CacheHostBlock(second_ref, second);
     first_ref.reset();
@@ -2853,15 +2898,15 @@ TEST(CacheCoordinatorHostReplacement, ReusesOneColdChildBeforeRebindingAParent) 
 }
 
 TEST(CacheCoordinatorHostReplacement, RebindsACompleteEvictableParentAcrossGroups) {
-    BlockPool device_pool(2);
-    BlockPool host_pool(1);
+    BlockPool device_pool(2, {2, 1});
+    BlockPool host_pool(1, {2, 1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, &host_pool);
-    CacheBlockRef first = host_pool.AcquireBlock(0, 2);
-    CacheBlockRef second = host_pool.AcquireBlock(0, 2);
+    CacheBlockRef first = host_pool.AcquireBlock(0);
+    CacheBlockRef second = host_pool.AcquireBlock(0);
     coordinator.CacheHostBlock(first, Key("first", 0));
     coordinator.CacheHostBlock(second, Key("second", 0));
     first.reset();
@@ -2880,7 +2925,7 @@ std::int32_t HostPut(CacheCoordinator& coordinator, BlockPool& host_pool, const 
                      std::uint32_t gid) {
     const CacheKey key = Key(content_hash, gid);
     GroupAllocator& manager = coordinator.Allocator(static_cast<std::int32_t>(gid));
-    CacheBlockRef block_ref = host_pool.AcquireBlock(gid, manager.CacheBlocksPerLcmBlock());
+    CacheBlockRef block_ref = host_pool.AcquireBlock(gid);
     const std::int32_t id = block_ref->Location().lcm_block_id;
     coordinator.GroupPrefixIndex(static_cast<std::int32_t>(gid))
         .Register(host_pool, block_ref, key, NextTestAccessEpoch());
@@ -2889,8 +2934,8 @@ std::int32_t HostPut(CacheCoordinator& coordinator, BlockPool& host_pool, const 
 }
 
 TEST(CacheCoordinatorHostReplacement, BatchReusesSameGroupVictimsWithOneScan) {
-    BlockPool device_pool(4);
-    BlockPool host_pool(2);
+    BlockPool device_pool(4, {2});
+    BlockPool host_pool(2, {2});
     const std::array specs{CacheGroupSpec{
         .kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 2,
@@ -2915,15 +2960,15 @@ TEST(CacheCoordinatorHostReplacement, BatchReusesSameGroupVictimsWithOneScan) {
 }
 
 TEST(CacheCoordinatorHostReplacement, BatchPreservesEmptyRefForPinnedShortfall) {
-    BlockPool device_pool(2);
-    BlockPool host_pool(2);
+    BlockPool device_pool(2, {1});
+    BlockPool host_pool(2, {1});
     const std::array specs{CacheGroupSpec{
         .kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, &host_pool);
-    CacheBlockRef pinned = host_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef pinned = host_pool.AcquireBlock(/*group_id=*/0);
     ASSERT_TRUE(pinned);
     coordinator.CacheHostBlock(pinned, Key("pinned", 0));
 
@@ -2941,8 +2986,8 @@ TEST(CacheCoordinatorHostReplacement, BatchPreservesEmptyRefForPinnedShortfall) 
 }
 
 TEST(CacheCoordinatorHostReplacement, BatchGivesScarceFreeCapacityToFirstCandidateGroup) {
-    BlockPool device_pool(2);
-    BlockPool host_pool(1);
+    BlockPool device_pool(2, {1, 1});
+    BlockPool host_pool(1, {1, 1});
     const std::array specs{
         CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
         CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -2961,8 +3006,8 @@ TEST(CacheCoordinatorHostReplacement, BatchGivesScarceFreeCapacityToFirstCandida
 }
 
 TEST(CacheCoordinatorHostReplacement, BatchGivesInterleavedGroupsFreeCapacityInCandidateOrder) {
-    BlockPool device_pool(3);
-    BlockPool host_pool(2);
+    BlockPool device_pool(3, {1, 1});
+    BlockPool host_pool(2, {1, 1});
     const std::array specs{
         CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
         CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -2983,8 +3028,8 @@ TEST(CacheCoordinatorHostReplacement, BatchGivesInterleavedGroupsFreeCapacityInC
 }
 
 TEST(CacheCoordinatorHostReplacement, BatchRebindsParentsOnceAcrossMixedGroups) {
-    BlockPool device_pool(4);
-    BlockPool host_pool(2);
+    BlockPool device_pool(4, {2, 2});
+    BlockPool host_pool(2, {2, 2});
     const std::array specs{
         CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
@@ -3014,8 +3059,8 @@ TEST(CacheCoordinatorHostReplacement, BatchRebindsParentsOnceAcrossMixedGroups) 
 }
 
 TEST(CacheCoordinatorHostReplacement, BatchCrossGroupRebindingDoesNotRescanPlacementPoolPerVictim) {
-    BlockPool device_pool(4);
-    BlockPool host_pool(2);
+    BlockPool device_pool(4, {2, 2});
+    BlockPool host_pool(2, {2, 2});
     const std::array specs{
         CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
@@ -3034,8 +3079,8 @@ TEST(CacheCoordinatorHostReplacement, BatchCrossGroupRebindingDoesNotRescanPlace
 }
 
 TEST(CacheCoordinatorHostReplacement, BatchCrossGroupRebindingChoosesLowestCacheValueParent) {
-    BlockPool device_pool(3);
-    BlockPool host_pool(2);
+    BlockPool device_pool(3, {1, 1, 1});
+    BlockPool host_pool(2, {1, 1, 1});
     const std::array specs{
         CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
         CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -3056,8 +3101,8 @@ TEST(CacheCoordinatorHostReplacement, BatchCrossGroupRebindingChoosesLowestCache
 }
 
 TEST(CacheCoordinatorHostReplacement, BatchDoesNotRebindPinnedParent) {
-    BlockPool device_pool(2);
-    BlockPool host_pool(1);
+    BlockPool device_pool(2, {2, 1});
+    BlockPool host_pool(1, {2, 1});
     const std::array specs{
         CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -3102,7 +3147,7 @@ std::vector<CacheGroupSpec> HostExtSpecs() {
 }
 
 TEST(CacheCoordinatorHostExtension, PreservesAllNullWindowExtensionSlots) {
-    BlockPool pool(3);
+    BlockPool pool(3, {1, 1});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
         {.kind = AttnKind::kSlidingWindow,
@@ -3110,7 +3155,7 @@ TEST(CacheCoordinatorHostExtension, PreservesAllNullWindowExtensionSlots) {
          .cache_blocks_per_lcm_block = 1,
          .block_granularity = 2},
     };
-    BlockPool host_pool(3);
+    BlockPool host_pool(3, {1, 1});
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, pool, &host_pool);
     const std::vector<std::string> hashes = ContentHashes({{0, 0}, {1, 1}, {2, 2}});
     for (const std::string& hash : hashes) {
@@ -3135,9 +3180,9 @@ TEST(CacheCoordinatorHostExtension, PreservesAllNullWindowExtensionSlots) {
 }
 
 TEST(CacheCoordinatorHostExtension, BothGroupsFullyPresent) {
-    BlockPool pool(16);
+    BlockPool pool(16, {1, 1});
     std::vector<CacheGroupSpec> specs = HostExtSpecs();
-    BlockPool host_pool(6);
+    BlockPool host_pool(6, {1, 1});
     CacheCoordinator coord = MakeCoordinator(specs, 2, pool, &host_pool);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}});
 
@@ -3159,9 +3204,9 @@ TEST(CacheCoordinatorHostExtension, BothGroupsFullyPresent) {
 TEST(CacheCoordinatorHostExtension, SwaTailMissShrinksBoundary) {
     // swa misses block 3 -> boundary shrinks to 3; tail at 3 = blocks [1, 3), which hits.
     // ext = 2, swa start = max(1, 3-2) = 1 = dev -> no holes; full's block-3 page stays unpinned.
-    BlockPool pool(16);
+    BlockPool pool(16, {1, 1});
     std::vector<CacheGroupSpec> specs = HostExtSpecs();
-    BlockPool host_pool(6);
+    BlockPool host_pool(6, {1, 1});
     CacheCoordinator coord = MakeCoordinator(specs, 2, pool, &host_pool);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}});
 
@@ -3181,9 +3226,9 @@ TEST(CacheCoordinatorHostExtension, SwaTailMissShrinksBoundary) {
 TEST(CacheCoordinatorHostExtension, FullGapCapsExtension) {
     // full misses block 2 -> boundary 2; swa tail at 2: start = max(1, 2-2) = 1 -> needs block 1 only.
     // ext = 1, both groups = {block-1 page}, 2 pins -- swa's deeper blocks 2..3 stay unused.
-    BlockPool pool(16);
+    BlockPool pool(16, {1, 1});
     std::vector<CacheGroupSpec> specs = HostExtSpecs();
-    BlockPool host_pool(6);
+    BlockPool host_pool(6, {1, 1});
     CacheCoordinator coord = MakeCoordinator(specs, 2, pool, &host_pool);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}});
 
@@ -3201,9 +3246,9 @@ TEST(CacheCoordinatorHostExtension, FullGapCapsExtension) {
 }
 
 TEST(CacheCoordinatorHostExtension, EmptyStoreZeroExtension) {
-    BlockPool pool(16);
+    BlockPool pool(16, {1, 1});
     std::vector<CacheGroupSpec> specs = HostExtSpecs();
-    BlockPool host_pool(5);
+    BlockPool host_pool(5, {1, 1});
     CacheCoordinator coord = MakeCoordinator(specs, 2, pool, &host_pool);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}});
 
@@ -3217,9 +3262,9 @@ TEST(CacheCoordinatorHostExtension, EmptyStoreZeroExtension) {
 
 TEST(CacheCoordinatorHostExtension, DeviceBoundaryRespected) {
     // Host holds only blocks 0..1 (below dev=2): zero extension, and those entries stay unpinned.
-    BlockPool pool(16);
+    BlockPool pool(16, {1, 1});
     std::vector<CacheGroupSpec> specs = HostExtSpecs();
-    BlockPool host_pool(5);
+    BlockPool host_pool(5, {1, 1});
     CacheCoordinator coord = MakeCoordinator(specs, 2, pool, &host_pool);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}});
 
@@ -3233,13 +3278,13 @@ TEST(CacheCoordinatorHostExtension, DeviceBoundaryRespected) {
     EXPECT_EQ(m.num_common_tokens, 4) << "below-floor host pages extend nothing";
     // The below-dev entries were never probed: all four stay evictable.
     EXPECT_EQ(coord.NumPinnedHostCachedBlocks(), 0);
-    EXPECT_TRUE(host_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1));
+    EXPECT_TRUE(host_pool.AcquireBlock(/*group_id=*/0));
 }
 
 TEST(CacheCoordinatorHostExtension, MatchPinsPagesUntilResultDies) {
-    BlockPool pool(16);
+    BlockPool pool(16, {1, 1});
     std::vector<CacheGroupSpec> specs = HostExtSpecs();
-    BlockPool host_pool(6);
+    BlockPool host_pool(6, {1, 1});
     CacheCoordinator coord = MakeCoordinator(specs, 2, pool, &host_pool);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}});
 
@@ -3251,10 +3296,9 @@ TEST(CacheCoordinatorHostExtension, MatchPinsPagesUntilResultDies) {
     EXPECT_EQ(m.num_common_tokens, 8);
     EXPECT_EQ(coord.NumPinnedHostCachedBlocks(), 5);
     EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 1);
-    CacheBlockRef last_free = host_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef last_free = host_pool.AcquireBlock(/*group_id=*/0);
     ASSERT_TRUE(last_free);
-    EXPECT_FALSE(host_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1))
-        << "pinned cache entries must not be selected as victims";
+    EXPECT_FALSE(host_pool.AcquireBlock(/*group_id=*/0)) << "pinned cache entries must not be selected as victims";
     last_free.reset();
     m = {};
     EXPECT_EQ(coord.NumPinnedHostCachedBlocks(), 0);
@@ -3264,7 +3308,7 @@ TEST(CacheCoordinatorHostExtension, MatchPinsPagesUntilResultDies) {
 TEST(CacheCoordinatorHostExtension, DeepCascadeConverges) {
     // Host twin of the deep cascade (dev = 0 so the block math mirrors the device test):
     // convergence must land on extension 2 and take no refs along the way.
-    BlockPool pool(64);
+    BlockPool pool(64, {1, 1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -3276,7 +3320,7 @@ TEST(CacheCoordinatorHostExtension, DeepCascadeConverges) {
          .cache_blocks_per_lcm_block = 1,
          .block_granularity = 4},
     };
-    BlockPool host_pool(32);
+    BlockPool host_pool(32, {1, 1, 1});
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, &host_pool);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0},
                                                  {1, 1, 1, 1},
@@ -3306,7 +3350,7 @@ TEST(CacheCoordinatorHostExtension, DeepCascadeConverges) {
 TEST(CacheCoordinatorHostExtension, MultiWindowGroupsExtendTogether) {
     // Host-tier twin of the multi-window device case (P=2, full + W=6 + W=2, dev=1): every
     // group supports host boundary 5, holes pad below each window's tail run.
-    BlockPool pool(16);
+    BlockPool pool(16, {1, 1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
         {.kind = AttnKind::kSlidingWindow,
@@ -3318,7 +3362,7 @@ TEST(CacheCoordinatorHostExtension, MultiWindowGroupsExtendTogether) {
          .cache_blocks_per_lcm_block = 1,
          .block_granularity = 2},
     };
-    BlockPool host_pool(16);
+    BlockPool host_pool(16, {1, 1, 1});
     CacheCoordinator coord = MakeCoordinator(specs, 2, pool, &host_pool);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}, {4, 4}, {5, 5}});
 
@@ -3343,7 +3387,7 @@ TEST(CacheCoordinatorHostExtension, MultiWindowCascadeConvergesToZeroExtension) 
     // W=2's only host page (block 3) caps the boundary at 4, where W=6 cannot cover {1,2,3};
     // its re-match collapses to the device boundary and the extension converges to zero with
     // nothing left pinned.
-    BlockPool pool(16);
+    BlockPool pool(16, {1, 1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
         {.kind = AttnKind::kSlidingWindow,
@@ -3355,7 +3399,7 @@ TEST(CacheCoordinatorHostExtension, MultiWindowCascadeConvergesToZeroExtension) 
          .cache_blocks_per_lcm_block = 1,
          .block_granularity = 2},
     };
-    BlockPool host_pool(16);
+    BlockPool host_pool(16, {1, 1, 1});
     CacheCoordinator coord = MakeCoordinator(specs, 2, pool, &host_pool);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}, {4, 4}, {5, 5}});
 
@@ -3385,11 +3429,11 @@ TEST(CacheCoordinatorHostExtension, MultiWindowCascadeConvergesToZeroExtension) 
 TEST(MambaAnalogTest, HitIsSingleSnapshotPlusLeadingHoles) {
     // needed = ceil((5-1)/4) = 1: the match is the RIGHTMOST cached block with
     // null holes below -- byte-identical to MambaManager.find_longest_cache_hit.
-    BlockPool pool(16);
+    BlockPool pool(16, {1});
     SwaManager mgr(/*block_granularity=*/4, /*sliding_window=*/5);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
     for (std::int32_t slot : {0, 1, 3}) {
-        CacheBlockRef block_ref = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+        CacheBlockRef block_ref = pool.AcquireBlock(/*group_id=*/0);
         mgr.RegisterCachedBlock(pool, block_ref, Key(ch[static_cast<std::size_t>(slot)], 0), NextTestAccessEpoch());
         block_ref.reset();
     }
@@ -3411,7 +3455,7 @@ TEST(MambaAnalogTest, RetentionKeepsOnlyTheLastStateBlock) {
     // vLLM: get_num_skipped_tokens = n-1 (only the last token's state matters).
     // Our slide rule skips n-W+1 tokens, so W=2 IS that policy: at 16 computed
     // tokens pages 0..2 free and only the tail state page survives.
-    BlockPool pool(16);
+    BlockPool pool(16, {1});
     SwaManager mgr(/*block_granularity=*/4, /*sliding_window=*/2);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, /*num_tokens=*/16));
@@ -3432,7 +3476,7 @@ TEST(MambaAnalogTest, RetentionKeepsOnlyTheLastStateBlock) {
 TEST(MambaAnalogTest, HybridFullSwaMambaComposesUnderOnePool) {
     // Task-4 shape: full + real window (W=8) + mamba-analog (W=5, needed=1),
     // three groups sharing ONE BlockPool; common = min over all three.
-    BlockPool pool(64);
+    BlockPool pool(64, {1, 1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -3467,7 +3511,7 @@ TEST(MambaAnalogTest, HybridFullSwaMambaComposesUnderOnePool) {
 TEST(MambaAnalogTest, HostTierStoresAndMatchesTheSnapshotOnly) {
     // vLLM offloading treats a mamba group as sliding_window_size_in_blocks=1:
     // the host index needs only the boundary snapshot; earlier keys stay holes.
-    BlockPool pool(16);
+    BlockPool pool(16, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow,
@@ -3475,7 +3519,7 @@ TEST(MambaAnalogTest, HostTierStoresAndMatchesTheSnapshotOnly) {
          .cache_blocks_per_lcm_block = 1,
          .block_granularity = 4},
     };
-    BlockPool host_pool(8);
+    BlockPool host_pool(8, {1, 1});
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, &host_pool);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
 
@@ -3494,7 +3538,7 @@ TEST(MambaAnalogTest, HostTierStoresAndMatchesTheSnapshotOnly) {
 // kMambaState is the named form of the analog pinned above: MakeCoordinator maps it to the
 // W=2 machinery, so a mixed full+state model converges with single-snapshot state semantics.
 TEST(MambaStateKindTest, FactoryMapsStateKindToAlignSemantics) {
-    BlockPool pool(32);
+    BlockPool pool(32, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
@@ -3515,7 +3559,7 @@ TEST(MambaStateKindTest, FactoryMapsStateKindToAlignSemantics) {
 }
 
 TEST(MambaStateKindTest, StateGroupRetentionKeepsOnlyLastPage) {
-    BlockPool pool(32);
+    BlockPool pool(32, {1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool);
@@ -3530,7 +3574,7 @@ TEST(MambaStateKindTest, StateGroupRetentionKeepsOnlyLastPage) {
 }
 
 TEST(CompletedBoundaryTest, HistoricalHashesWithoutBoundaryAreNotPublished) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/4, pool);
@@ -3551,7 +3595,7 @@ TEST(CompletedBoundaryTest, HistoricalHashesWithoutBoundaryAreNotPublished) {
 }
 
 TEST(CompletedBoundaryTest, RejectsNewHashesWithoutBoundaryKind) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/4, pool);
@@ -3571,7 +3615,7 @@ TEST(CompletedBoundaryTest, RejectsNewHashesWithoutBoundaryKind) {
 }
 
 TEST(MambaStateRegistrationTest, MambaPublishesOnlyChunkBoundary) {
-    BlockPool pool(32);
+    BlockPool pool(32, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
@@ -3600,7 +3644,7 @@ TEST(MambaStateRegistrationTest, MambaPublishesOnlyChunkBoundary) {
 }
 
 TEST(MambaStateRegistrationTest, MambaPublishesAlignedEndpoint) {
-    BlockPool pool(32);
+    BlockPool pool(32, {1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool);
@@ -3627,7 +3671,7 @@ TEST(MambaStateRegistrationTest, MambaPublishesAlignedEndpoint) {
 }
 
 TEST(MambaStateRegistrationTest, MambaPublishesAlignedCheckpointBeforeUnalignedEndpoint) {
-    BlockPool pool(32);
+    BlockPool pool(32, {1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool);
@@ -3652,7 +3696,7 @@ TEST(MambaStateRegistrationTest, UnalignedPublicationRequiresMatchingMaterialize
     for (const bool direct : {false, true}) {
         for (const std::int32_t materialized : {0, 4, 8}) {
             SCOPED_TRACE(::testing::Message() << "direct=" << direct << " materialized=" << materialized);
-            BlockPool pool(32);
+            BlockPool pool(32, {1});
             const std::vector<CacheGroupSpec> specs = {{.kind = AttnKind::kMambaState,
                                                         .sliding_window = 0,
                                                         .cache_blocks_per_lcm_block = 1,
@@ -3683,7 +3727,7 @@ TEST(MambaStateRegistrationTest, UnalignedPublicationRequiresMatchingMaterialize
 }
 
 TEST(DecodeDestinationTest, AdmitMaterializesOnlyRequestedStateSuffix) {
-    BlockPool pool(/*num_lcm_blocks=*/5);
+    BlockPool pool(/*num_lcm_blocks=*/5, {2, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -3721,7 +3765,7 @@ TEST(DecodeDestinationTest, AdmitMaterializesOnlyRequestedStateSuffix) {
 }
 
 TEST(SnapshotStateSparsePrefillTest, ReclaimsOldInputAcrossIntermediateHoles) {
-    BlockPool pool(/*num_lcm_blocks=*/4);
+    BlockPool pool(/*num_lcm_blocks=*/4, {1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
@@ -3759,7 +3803,7 @@ TEST(SnapshotStateSparsePrefillTest, ReclaimsOldInputAcrossIntermediateHoles) {
 }
 
 TEST(DecodeDestinationTest, HistoryGroupsDeterminePrefixAndStateGetsAlignedHoles) {
-    BlockPool pool(/*num_lcm_blocks=*/8);
+    BlockPool pool(/*num_lcm_blocks=*/8, {2, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -3810,7 +3854,7 @@ TEST(DecodeDestinationTest, HistoryGroupsDeterminePrefixAndStateGetsAlignedHoles
 }
 
 TEST(DecodeDestinationTest, SparseAdmissionFailureLeavesAllGroupsUnchanged) {
-    BlockPool pool(/*num_lcm_blocks=*/4);
+    BlockPool pool(/*num_lcm_blocks=*/4, {2, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -3838,7 +3882,7 @@ TEST(DecodeDestinationTest, SparseAdmissionFailureLeavesAllGroupsUnchanged) {
 }
 
 TEST(SwaRegistrationTest, SwaBoundaryRequiresTrailingWindow) {
-    BlockPool pool(32);
+    BlockPool pool(32, {1});
     std::vector<CacheGroupSpec> specs = {{.kind = AttnKind::kSlidingWindow,
                                           .sliding_window = 9,
                                           .cache_blocks_per_lcm_block = 1,
@@ -3864,7 +3908,7 @@ TEST(SwaRegistrationTest, SwaBoundaryRequiresTrailingWindow) {
 }
 
 TEST(SwaRegistrationTest, UnalignedEndpointPublishesTrailingFullPages) {
-    BlockPool pool(32);
+    BlockPool pool(32, {1});
     std::vector<CacheGroupSpec> specs = {{.kind = AttnKind::kSlidingWindow,
                                           .sliding_window = 9,
                                           .cache_blocks_per_lcm_block = 1,
@@ -3889,9 +3933,9 @@ TEST(SwaRegistrationTest, UnalignedEndpointPublishesTrailingFullPages) {
 }
 
 TEST(GroupAllocatorBoundaryTest, BoundaryPromotionIsMonotonic) {
-    BlockPool pool(1);
+    BlockPool pool(1, {1});
     FullAttnManager manager(/*block_granularity=*/4);
-    CacheBlockRef block_ref = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef block_ref = pool.AcquireBlock(/*group_id=*/0);
     const CacheKey key = Key(std::string(64, 'a'), 0);
 
     manager.RegisterCachedBlock(pool, block_ref, key, /*access_epoch=*/1, /*logical_block_index=*/0,

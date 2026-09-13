@@ -18,16 +18,17 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
-#include <algorithm>
 #include <string>
 #include <vector>
 
 #include "cache/core/block_pool.h"
+#include "cache/core/block_table.h"
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache/prefix/prefix_index.h"
 
@@ -84,9 +85,9 @@ std::int32_t IterationsFor(std::int32_t pool_size) {
 }
 
 void MeasureAcquireBlocksPackingOne(std::int32_t pool_size, std::int32_t iterations) {
-    BlockPool pool(pool_size);
+    BlockPool pool(pool_size, {1});
     Measure("acquire_blocks_packing_1", pool_size, kDemand, iterations, [&] {
-        std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(/*group_id=*/0, /*packing=*/1, /*num=*/kDemand);
+        std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(/*group_id=*/0, /*num=*/kDemand);
         const std::uint64_t checksum = ConsumeLocations(blocks);
         blocks.clear();
         return checksum;
@@ -94,8 +95,7 @@ void MeasureAcquireBlocksPackingOne(std::int32_t pool_size, std::int32_t iterati
 }
 
 std::vector<CacheBlockRef> MakeOneHolePerParent(BlockPool& pool, std::int32_t pool_size) {
-    std::vector<CacheBlockRef> retained =
-        pool.AcquireBlocks(/*group_id=*/0, /*packing=*/kPacking, /*num=*/pool_size * kPacking);
+    std::vector<CacheBlockRef> retained = pool.AcquireBlocks(/*group_id=*/0, /*num=*/pool_size * kPacking);
     if (static_cast<std::int32_t>(retained.size()) != pool_size * kPacking) {
         std::abort();
     }
@@ -106,10 +106,10 @@ std::vector<CacheBlockRef> MakeOneHolePerParent(BlockPool& pool, std::int32_t po
 }
 
 void MeasureFragmentedAllocations(std::int32_t pool_size, std::int32_t iterations) {
-    BlockPool pool(pool_size);
+    BlockPool pool(pool_size, {kPacking});
     std::vector<CacheBlockRef> retained = MakeOneHolePerParent(pool, pool_size);
     Measure("acquire_blocks_packing_4_one_hole_per_parent", pool_size, kDemand, iterations, [&] {
-        std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(/*group_id=*/0, /*packing=*/kPacking, /*num=*/kDemand);
+        std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(/*group_id=*/0, /*num=*/kDemand);
         const std::uint64_t checksum = ConsumeLocations(blocks);
         blocks.clear();
         return checksum;
@@ -117,11 +117,10 @@ void MeasureFragmentedAllocations(std::int32_t pool_size, std::int32_t iteration
 }
 
 void MeasureFullAllocations(std::int32_t pool_size, std::int32_t iterations) {
-    BlockPool pool(pool_size + kDemand);
-    std::vector<CacheBlockRef> retained =
-        pool.AcquireBlocks(/*group_id=*/0, /*packing=*/kPacking, /*num=*/pool_size * kPacking);
+    BlockPool pool(pool_size + kDemand, {kPacking});
+    std::vector<CacheBlockRef> retained = pool.AcquireBlocks(/*group_id=*/0, /*num=*/pool_size * kPacking);
     Measure("acquire_blocks_packing_4_full_parents", pool_size, kDemand, iterations, [&] {
-        std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(/*group_id=*/0, /*packing=*/kPacking, /*num=*/kDemand);
+        std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(/*group_id=*/0, /*num=*/kDemand);
         const std::uint64_t checksum = ConsumeLocations(blocks);
         blocks.clear();
         return checksum;
@@ -130,10 +129,10 @@ void MeasureFullAllocations(std::int32_t pool_size, std::int32_t iterations) {
 
 void MeasureLargeBatchControlMaintenance(std::int32_t pool_size, std::int32_t iterations) {
     const std::int32_t demand = std::min<std::int32_t>(512, pool_size);
-    BlockPool pool(pool_size);
+    BlockPool pool(pool_size, {kPacking});
     std::vector<CacheBlockRef> retained = MakeOneHolePerParent(pool, pool_size);
     Measure("acquire_blocks_packing_4_large_batch_one_hole_per_parent", pool_size, demand, iterations, [&] {
-        std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(/*group_id=*/0, /*packing=*/kPacking, /*num=*/demand);
+        std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(/*group_id=*/0, /*num=*/demand);
         const std::uint64_t checksum = ConsumeLocations(blocks);
         blocks.clear();
         return checksum;
@@ -141,12 +140,11 @@ void MeasureLargeBatchControlMaintenance(std::int32_t pool_size, std::int32_t it
 }
 
 void MeasureHostStyleAcquire(std::int32_t pool_size, std::int32_t iterations) {
-    BlockPool pool(pool_size);
+    BlockPool pool(pool_size, {kPacking});
     std::vector<CacheBlockRef> retained = MakeOneHolePerParent(pool, pool_size);
     const std::array<std::uint32_t, kDemand> group_ids{0, 0, 0, 0};
-    const std::array<std::int32_t, 1> packings{kPacking};
     Measure("acquire_available_in_order_one_hole_per_parent", pool_size, kDemand, iterations, [&] {
-        std::vector<CacheBlockRef> blocks = pool.AcquireAvailableBlocksInOrder(group_ids, packings);
+        std::vector<CacheBlockRef> blocks = pool.AcquireAvailableBlocksInOrder(group_ids);
         const std::uint64_t checksum = ConsumeLocations(blocks);
         blocks.clear();
         return checksum;
@@ -154,9 +152,9 @@ void MeasureHostStyleAcquire(std::int32_t pool_size, std::int32_t iterations) {
 }
 
 void MeasureEvictableCandidates(std::int32_t pool_size, std::int32_t iterations) {
-    BlockPool pool(pool_size);
+    BlockPool pool(pool_size, {1});
     PrefixCacheIndex index(/*group_id=*/0);
-    std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(/*group_id=*/0, /*packing=*/1, /*num=*/pool_size);
+    std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(/*group_id=*/0, /*num=*/pool_size);
     if (static_cast<std::int32_t>(blocks.size()) != pool_size) {
         std::abort();
     }
@@ -180,7 +178,7 @@ CacheCoordinator MakeAdmissionCoordinator(BlockPool& pool) {
 
 void FillAdmissionCache(CacheCoordinator& coordinator, BlockPool& pool, std::int32_t pool_size) {
     for (std::int32_t i = 0; i < pool_size; ++i) {
-        CacheBlockRef block = pool.AcquireBlock(/*group_id=*/0, /*packing=*/1);
+        CacheBlockRef block = pool.AcquireBlock(/*group_id=*/0);
         if (!block) {
             std::abort();
         }
@@ -192,7 +190,7 @@ void FillAdmissionCache(CacheCoordinator& coordinator, BlockPool& pool, std::int
 }
 
 void MeasureAdmission(std::int32_t pool_size, std::int32_t iterations) {
-    BlockPool pool(pool_size);
+    BlockPool pool(pool_size, {1});
     CacheCoordinator coordinator = MakeAdmissionCoordinator(pool);
     FillAdmissionCache(coordinator, pool, pool_size);
     BlockTable table;
@@ -221,7 +219,7 @@ void MeasureAdmission(std::int32_t pool_size, std::int32_t iterations) {
             }
         }
         coordinator.Free(std::span{&table, std::size_t{1}});
-        CacheBlockRef block = pool.AcquireBlock(/*group_id=*/0, /*packing=*/1);
+        CacheBlockRef block = pool.AcquireBlock(/*group_id=*/0);
         if (!block) {
             std::abort();
         }
@@ -237,10 +235,9 @@ void MeasureAdmission(std::int32_t pool_size, std::int32_t iterations) {
 // Distinct request epochs with pinned cache entries force admission to inspect
 // the entire index before rejecting. Setup and pins stay outside the timing.
 void MeasurePinnedAdmission(std::int32_t pool_size, std::int32_t iterations) {
-    BlockPool pool(pool_size);
+    BlockPool pool(pool_size, {1});
     CacheCoordinator coordinator = MakeAdmissionCoordinator(pool);
-    std::vector<CacheBlockRef> pins =
-        pool.AcquireBlocks(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1, /*num=*/pool_size);
+    std::vector<CacheBlockRef> pins = pool.AcquireBlocks(/*group_id=*/0, /*num=*/pool_size);
     for (std::int32_t i = 0; i < pool_size; ++i) {
         coordinator.GroupPrefixIndex(0).Register(
             pool, pins[static_cast<std::size_t>(i)],
@@ -260,7 +257,7 @@ void MeasurePinnedAdmission(std::int32_t pool_size, std::int32_t iterations) {
 }
 
 void MeasureAvailableLcmBlocks(std::int32_t pool_size, std::int32_t iterations) {
-    BlockPool pool(pool_size);
+    BlockPool pool(pool_size, {1});
     CacheCoordinator coordinator = MakeAdmissionCoordinator(pool);
     FillAdmissionCache(coordinator, pool, pool_size);
     Measure("num_available_lcm_blocks_cached_pool", pool_size, pool_size, iterations,
@@ -270,8 +267,8 @@ void MeasureAvailableLcmBlocks(std::int32_t pool_size, std::int32_t iterations) 
 // Every Host parent is cached, so the batch can only be served by evicting.
 // Each iteration drops one cache entry and restores it, keeping the tier full.
 void MeasureHostBlockAcquisition(std::int32_t pool_size, std::int32_t iterations) {
-    BlockPool pool(/*num_lcm_blocks=*/1);
-    BlockPool host_pool(pool_size);
+    BlockPool pool(/*num_lcm_blocks=*/1, {1});
+    BlockPool host_pool(pool_size, {1});
     const std::array specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
@@ -279,7 +276,7 @@ void MeasureHostBlockAcquisition(std::int32_t pool_size, std::int32_t iterations
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/4, pool, &host_pool,
                                                    /*stream_device_cache_to_host=*/true);
     for (std::int32_t i = 0; i < pool_size; ++i) {
-        CacheBlockRef block = host_pool.AcquireBlock(/*group_id=*/0, /*packing=*/1);
+        CacheBlockRef block = host_pool.AcquireBlock(/*group_id=*/0);
         if (!block) {
             std::abort();
         }

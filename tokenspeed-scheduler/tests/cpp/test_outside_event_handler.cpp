@@ -275,7 +275,7 @@ TEST_F(DisaggDecodeAdmissionTestSuite, ReservesWholeDestinationAndSurvivesRemote
     EXPECT_EQ(prefill->input_lengths, (std::vector<std::int32_t>{4}));
     ASSERT_EQ(prefill->block_tables.count("full"), 1u);
     EXPECT_EQ(prefill->block_tables.at("full").at(0).size(), 3u);
-    EXPECT_EQ(scheduler_->ActiveKvPages(), 3u);
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 3u);
 
     SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
     const ExecutionPlan decode_plan = PlanOnce();
@@ -738,12 +738,12 @@ TEST_F(DecodeRetractionL2TestSuite, WriteBackAckPublishesBestEffortHostEntries) 
     // The victim's pages were freed and immediately granted to the blocked
     // admission in the same round -- no D2H source pin holds them (the
     // execution stream orders the copy ahead of the granted request's use).
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 1);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 1);
     EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 0)
         << "the in-flight D2H operation must keep its Host destinations pinned";
 
     SendWriteBackDone(write_back.op_ids.front());
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 1);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 1);
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 3);
     EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 0);
 }
@@ -865,7 +865,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, MaterializesHistoryAndLatestStateSnapsh
     ASSERT_EQ(plan.pages_to_zero.size(), 2u);
     EXPECT_EQ(plan.pages_to_zero.at("full"), full);
     EXPECT_EQ(plan.pages_to_zero.at("state"), (std::vector<std::int32_t>{state[3], state[4]}));
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 1);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 1);
     EXPECT_TRUE(scheduler_->PdTransferPinned("r0"));
 
     SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
@@ -881,7 +881,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, MaterializesHistoryAndLatestStateSnapsh
     ExecutionEvent succeeded;
     succeeded.With(pd::SucceededEvent{"r0"});
     scheduler_->Advance(succeeded);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 6);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 6);
 }
 
 TEST_F(PdSmallStatePagesTestSuite, LatestSnapshotUsesTheStateGroupsBlockGranularity) {
