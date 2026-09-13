@@ -28,9 +28,11 @@ of queued hits) can be checked without a model or GPU.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -168,6 +170,22 @@ def test_loop_requires_exists_flags() -> None:
     assert param.default is inspect.Parameter.empty
 
 
+def test_l3_exists_reduce_doubles_require_op_and_group() -> None:
+    tree = ast.parse(Path(__file__).read_text())
+    found = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name != "fake_all_reduce":
+            continue
+        found = True
+        defaults = dict(
+            zip((arg.arg for arg in node.args.kwonlyargs), node.args.kw_defaults)
+        )
+        assert node.args.defaults == []
+        assert defaults["op"] is None
+        assert defaults["group"] is None
+    assert found
+
+
 def _spec(rid: str, tokens: list[int]):
     return SimpleNamespace(request_id=rid, tokens=tokens)
 
@@ -242,7 +260,7 @@ def test_can_clear_does_not_rotate_l3_namespace() -> None:
 def test_replica_min_reduces_tp_then_cp_then_pp(monkeypatch) -> None:
     groups_seen = []
 
-    def fake_all_reduce(flags, op=None, group=None):
+    def fake_all_reduce(flags, *, op, group):
         groups_seen.append(group)
         flags.fill_(0)
 
@@ -269,7 +287,7 @@ def test_replica_min_reduces_tp_then_cp_then_pp(monkeypatch) -> None:
 def test_enable_cp_min_uses_cp_group_when_tp_is_one(monkeypatch) -> None:
     groups_seen = []
 
-    def fake_all_reduce(flags, op=None, group=None):
+    def fake_all_reduce(flags, *, op, group):
         groups_seen.append(group)
 
     monkeypatch.setattr(
@@ -292,7 +310,7 @@ def test_enable_cp_min_uses_cp_group_when_tp_is_one(monkeypatch) -> None:
 def test_pp_min_runs_when_attn_tp_is_one(monkeypatch) -> None:
     groups_seen = []
 
-    def fake_all_reduce(flags, op=None, group=None):
+    def fake_all_reduce(flags, *, op, group):
         groups_seen.append(group)
 
     monkeypatch.setattr(

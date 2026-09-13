@@ -28,8 +28,10 @@ mirrored scheduler while a CP/PP peer still has the op pending.
 
 from __future__ import annotations
 
+import ast
 import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -123,6 +125,29 @@ def _install_collectives(
     monkeypatch.setattr(cache_hooks_module.dist, "all_gather_object", all_gather_object)
 
 
+def test_collective_doubles_require_op_and_group() -> None:
+    tree = ast.parse(Path(__file__).read_text())
+    found_reduce = False
+    found_gather = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        defaults = dict(
+            zip((arg.arg for arg in node.args.kwonlyargs), node.args.kw_defaults)
+        )
+        if node.name == "_all_reduce":
+            found_reduce = True
+            assert node.args.defaults == []
+            assert defaults["op"] is None
+            assert defaults["group"] is None
+        elif node.name == "_all_gather_object":
+            found_gather = True
+            assert node.args.defaults == []
+            assert defaults["group"] is None
+    assert found_reduce
+    assert found_gather
+
+
 @pytest.fixture()
 def fake_cache_ops(monkeypatch: pytest.MonkeyPatch):
     # The C++ op bindings (Cache.WriteBackOp) expose no Python constructor, so
@@ -192,10 +217,10 @@ def test_cp_peer_missing_writeback_keeps_payload_pending(
 
     gather_groups: list = []
 
-    def _all_reduce(tensor, op=None, group=None) -> None:
+    def _all_reduce(tensor, *, op, group) -> None:
         del tensor, op, group
 
-    def _all_gather_object(output, obj, group=None) -> None:
+    def _all_gather_object(output, obj, *, group) -> None:
         gather_groups.append(group)
         output[0] = list(obj)
         output[1] = []
@@ -229,10 +254,10 @@ def test_cp_agreed_writeback_emits_event(
 
     gather_groups: list = []
 
-    def _all_reduce(tensor, op=None, group=None) -> None:
+    def _all_reduce(tensor, *, op, group) -> None:
         del tensor, op, group
 
-    def _all_gather_object(output, obj, group=None) -> None:
+    def _all_gather_object(output, obj, *, group) -> None:
         gather_groups.append(group)
         output[0] = list(obj)
         output[1] = list(obj)
@@ -271,11 +296,11 @@ def test_gather_order_is_attention_tp_then_cp_then_pp(
     reduce_groups: list = []
     gather_groups: list = []
 
-    def _all_reduce(tensor, op=None, group=None) -> None:
+    def _all_reduce(tensor, *, op, group) -> None:
         del tensor, op
         reduce_groups.append(group)
 
-    def _all_gather_object(output, obj, group=None) -> None:
+    def _all_gather_object(output, obj, *, group) -> None:
         gather_groups.append(group)
         for i in range(len(output)):
             output[i] = list(obj)
@@ -315,10 +340,10 @@ def test_empty_tp_intersection_still_gathers_cp_and_pp(
     gather_objs: list = []
     peer_ready = [{"kind": "WriteBackDoneEvent", "op_id": 7}]
 
-    def _all_reduce(tensor, op=None, group=None) -> None:
+    def _all_reduce(tensor, *, op, group) -> None:
         del tensor, op, group
 
-    def _all_gather_object(output, obj, group=None) -> None:
+    def _all_gather_object(output, obj, *, group) -> None:
         gather_groups.append(group)
         gather_objs.append(list(obj))
         output[0] = list(obj)
@@ -357,12 +382,12 @@ def test_idle_replica_max_reduces_then_gathers_when_peer_has_work(
     reduce_groups: list = []
     gather_groups: list = []
 
-    def _all_reduce(tensor, op=None, group=None) -> None:
+    def _all_reduce(tensor, *, op, group) -> None:
         del op
         reduce_groups.append(group)
         tensor[0] = 1
 
-    def _all_gather_object(output, obj, group=None) -> None:
+    def _all_gather_object(output, obj, *, group) -> None:
         gather_groups.append(group)
         output[0] = list(obj)
         output[1] = [{"kind": "WriteBackDoneEvent", "op_id": 3}]
@@ -395,11 +420,11 @@ def test_idle_replica_skips_gather_only_after_unanimous_max_reduce(
 
     reduce_groups: list = []
 
-    def _all_reduce(tensor, op=None, group=None) -> None:
+    def _all_reduce(tensor, *, op, group) -> None:
         del tensor, op
         reduce_groups.append(group)
 
-    def _all_gather_object(output, obj, group=None) -> None:
+    def _all_gather_object(output, obj, *, group) -> None:
         del output, obj, group
         raise AssertionError("idle replica must not gather")
 
@@ -432,12 +457,12 @@ def test_replica_backup_failure_raises_after_poll_all_reduce(
     reduce_groups: list = []
     gather_groups: list = []
 
-    def _all_reduce(tensor, op=None, group=None) -> None:
+    def _all_reduce(tensor, *, op, group) -> None:
         del op
         reduce_groups.append(group)
         tensor[1] = max(int(tensor[1].item()), 1)
 
-    def _all_gather_object(output, obj, group=None) -> None:
+    def _all_gather_object(output, obj, *, group) -> None:
         gather_groups.append(group)
         del output, obj
 

@@ -1,5 +1,7 @@
+import ast
 import inspect
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import torch
@@ -38,6 +40,21 @@ class TestRequestHandlerFlushCache(unittest.TestCase):
         handler._device.delete_l3_namespace.return_value = True
         return handler
 
+    def test_flush_reduce_doubles_require_op_and_group(self):
+        tree = ast.parse(Path(__file__).read_text())
+        found = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef) or node.name != "fake_all_reduce":
+                continue
+            found = True
+            defaults = dict(
+                zip((arg.arg for arg in node.args.kwonlyargs), node.args.kw_defaults)
+            )
+            self.assertEqual(node.args.defaults, [])
+            self.assertIsNone(defaults["op"])
+            self.assertIsNone(defaults["group"])
+        self.assertTrue(found)
+
     def test_returns_scheduler_clear_result(self):
         for success in (True, False):
             with self.subTest(success=success):
@@ -55,7 +72,7 @@ class TestRequestHandlerFlushCache(unittest.TestCase):
     def test_failed_preflight_does_not_clear(self):
         groups_seen = []
 
-        def fake_all_reduce(buf, op=None, group=None):
+        def fake_all_reduce(buf, *, op, group):
             del buf, op
             groups_seen.append(group)
 
@@ -76,7 +93,7 @@ class TestRequestHandlerFlushCache(unittest.TestCase):
     def test_min_reduces_tp_then_cp_then_pp_before_clear(self):
         groups_seen = []
 
-        def fake_all_reduce(buf, op=None, group=None):
+        def fake_all_reduce(buf, *, op, group):
             del op
             groups_seen.append(group)
             buf.fill_(0)
@@ -102,7 +119,7 @@ class TestRequestHandlerFlushCache(unittest.TestCase):
     def test_agreed_preflight_clears(self):
         groups_seen = []
 
-        def fake_all_reduce(buf, op=None, group=None):
+        def fake_all_reduce(buf, *, op, group):
             del buf, op
             groups_seen.append(group)
 
@@ -122,7 +139,7 @@ class TestRequestHandlerFlushCache(unittest.TestCase):
     def test_min_reduces_tp_then_cp_then_pp_then_dp_before_clear(self):
         groups_seen = []
 
-        def fake_all_reduce(buf, op=None, group=None):
+        def fake_all_reduce(buf, *, op, group):
             del op
             groups_seen.append(group)
             buf.fill_(0)
@@ -150,7 +167,7 @@ class TestRequestHandlerFlushCache(unittest.TestCase):
     def test_dp_flush_min_prevents_l3_delete(self):
         groups_seen = []
 
-        def fake_all_reduce(buf, op=None, group=None):
+        def fake_all_reduce(buf, *, op, group):
             del op
             groups_seen.append(group)
             buf.fill_(0)
@@ -172,7 +189,7 @@ class TestRequestHandlerFlushCache(unittest.TestCase):
     def test_agreed_dp_preflight_clears(self):
         groups_seen = []
 
-        def fake_all_reduce(buf, op=None, group=None):
+        def fake_all_reduce(buf, *, op, group):
             del buf, op
             groups_seen.append(group)
 
@@ -204,7 +221,7 @@ class TestRequestHandlerFlushCache(unittest.TestCase):
         groups_seen = []
         phase = {"n": 0}
 
-        def fake_all_reduce(buf, op=None, group=None):
+        def fake_all_reduce(buf, *, op, group):
             del op
             groups_seen.append(group)
             phase["n"] += 1
@@ -445,7 +462,7 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
     def test_flush_min_reduces_tp_then_cp_then_pp(self):
         groups_seen = []
 
-        def fake_all_reduce(buf, op=None, group=None):
+        def fake_all_reduce(buf, *, op, group):
             del op
             groups_seen.append(group)
             buf.fill_(0)
@@ -484,7 +501,7 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
     def test_flush_min_reduces_tp_then_cp_then_pp_then_dp(self):
         groups_seen = []
 
-        def fake_all_reduce(buf, op=None, group=None):
+        def fake_all_reduce(buf, *, op, group):
             del op
             groups_seen.append(group)
             buf.fill_(0)
@@ -525,7 +542,7 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
     def test_enable_cp_flush_min_uses_cp_group_when_tp_is_one(self):
         groups_seen = []
 
-        def fake_all_reduce(buf, op=None, group=None):
+        def fake_all_reduce(buf, *, op, group):
             del buf, op
             groups_seen.append(group)
 
@@ -555,7 +572,7 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
     def test_failed_flush_still_min_reduces_before_skipping_nccl(self):
         groups_seen = []
 
-        def fake_all_reduce(buf, op=None, group=None):
+        def fake_all_reduce(buf, *, op, group):
             del buf, op
             groups_seen.append(group)
 
