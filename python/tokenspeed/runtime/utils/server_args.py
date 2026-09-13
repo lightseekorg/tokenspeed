@@ -1028,16 +1028,18 @@ class ServerArgs:
                 "auto",
                 "pt",
                 "safetensors",
-                "npcache",
-                "dummy",
-                "extensible",
-            ],
+            ]
+            + ([] if current_platform().is_npu else ["instanttensor"])
+            + ["npcache", "dummy", "extensible"],
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
             "and fall back to the pytorch bin format if safetensors format "
             "is not available. "
             '"pt" will load the weights in the pytorch bin format. '
             '"safetensors" will load the weights in the safetensors format. '
+            '"instanttensor" accelerates safetensors loading on NVIDIA GPUs '
+            "via distributed loading, pipelined prefetching, and direct I/O "
+            "(with optional GPUDirect Storage support). "
             '"npcache" will load the weights in pytorch format and store '
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values.',
