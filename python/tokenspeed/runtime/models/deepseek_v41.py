@@ -799,11 +799,11 @@ class DeepseekV41Attention(nn.Module):
         out, _ = self.wo_b(out, scale=None)
         if self.mapping.attn.has_tp:
             out = all_reduce(
-                out.float(),
+                out,
                 group=self.mapping.attn.tp_group,
                 backend=None,
                 op=torch.distributed.ReduceOp.SUM,
-            ).to(hidden_states.dtype)
+            )
         return out
 
 

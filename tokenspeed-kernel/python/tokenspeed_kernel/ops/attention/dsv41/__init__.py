@@ -42,6 +42,10 @@ from tokenspeed_kernel.selection import SelectionObjective, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
+    "decode_rows",
+    "decode_window",
+    "global_slots",
+    "selection_table",
     "cache_pack",
     "cache_unpack",
     "cache_scatter",
@@ -53,6 +57,7 @@ __all__ = [
     "index_topk",
     "compressor_tail_scatter",
     "compressor_pool",
+    "compressor_metadata",
     "swa_rope_scatter",
     "rope_inplace",
     "rope_pad_query",
@@ -550,6 +555,157 @@ def rope_pad_query(
         solution=solution,
     )
     return kernel(values, positions, cos_sin_cache)
+
+
+def decode_rows(
+    seq_lens,
+    request_pool_indices,
+    positions,
+    lengths,
+    pool_rows,
+    actual_bs,
+    num_extends,
+):
+    """Refresh persistent [bs] position/length/pool rows from live request inputs.
+
+    All outputs are overwritten; rows past actual_bs are padding, and leading
+    num_extends rows have no decode position. Input vectors are contiguous.
+    """
+    if not positions.is_cuda:
+        lengths.zero_()
+        lengths[:actual_bs].copy_(seq_lens[:actual_bs])
+        positions.copy_(lengths.to(torch.int64) - 1)
+        positions[:num_extends].fill_(-1)
+        pool_rows.fill_(-1)
+        pool_rows[:actual_bs].copy_(request_pool_indices[:actual_bs])
+        return
+    _kernel("decode_rows", positions)(
+        seq_lens,
+        request_pool_indices,
+        positions,
+        lengths,
+        pool_rows,
+        actual_bs,
+        num_extends,
+    )
+
+
+def decode_window(
+    positions,
+    requests,
+    write_slots,
+    read_slots,
+    read_lens,
+    status,
+    swa_table,
+    tail_table,
+    swa_pages,
+    tail_pages,
+):
+    """Fill SWA addresses and history errors for N logical query coordinates.
+
+    positions/requests are integer [N], tables are LCM group pages. Destinations
+    are write_slots[N], read_slots[N,128], read_lens[N], status[N]. Status bit 0
+    reports missing SWA history; bit 1 reports a required compressor tail. Page
+    zero and pages beyond the supplied capacities never address live cache.
+    """
+    if not positions.is_cuda:
+        from tokenspeed_kernel.ops.attention.mla._triton.page_table import (
+            bounded_group_slots,
+        )
+
+        wanted = (positions - 127).clamp_min(0)[:, None] + torch.arange(128)
+        wanted.masked_fill_(wanted > positions[:, None], -1)
+        slots = bounded_group_slots(
+            wanted, requests[:, None].expand_as(wanted), swa_table, 64, 1, 1, swa_pages
+        )
+        read_slots.copy_(slots)
+        read_lens.copy_((positions + 1).clamp(0, 128))
+        write_slots.copy_(
+            bounded_group_slots(positions, requests, swa_table, 64, 1, 1, swa_pages)
+        )
+        missing_swa = ((wanted >= 0) & (wanted < positions[:, None]) & (slots < 0)).any(
+            -1
+        )
+        previous = (positions - 1).masked_fill(
+            (positions < 0) | (positions % 2 != 1), -1
+        )
+        tail = bounded_group_slots(previous, requests, tail_table, 2, 1, 1, tail_pages)
+        status.copy_(
+            missing_swa.to(torch.int32)
+            | (((previous >= 0) & (tail < 0)).to(torch.int32) * 2)
+        )
+        return
+    _kernel("decode_window", positions)(
+        positions,
+        requests,
+        write_slots,
+        read_slots,
+        read_lens,
+        status,
+        swa_table,
+        tail_table,
+        swa_pages,
+        tail_pages,
+    )
+
+
+def global_slots(rows, positions, requests, table, ratio, pages):
+    """Map integer selected rows[N,K] into int32 physical slots[N,K].
+
+    Query coordinates [N] determine causality, ratio is raw tokens per global
+    row, and pages bounds the LCM field. Invalid/null addresses resolve to -1.
+    """
+    if not positions.is_cuda:
+        from tokenspeed_kernel.ops.attention.mla._triton.page_table import (
+            bounded_group_slots,
+        )
+
+        visible = (positions[:, None] + 1).clamp_min(0) // ratio
+        selected = (rows.to(torch.int64) * ratio).masked_fill(
+            (rows < 0) | (rows >= visible), -1
+        )
+        return bounded_group_slots(
+            selected, requests[:, None].expand_as(selected), table, 64, ratio, 1, pages
+        ).to(torch.int32)
+    return _kernel("global_slots", positions)(
+        rows, positions, requests, table, ratio, pages
+    )
+
+
+def selection_table(positions, requests, table, ratio):
+    """Gather indexer page rows and visible lengths for logical queries [N].
+
+    Returns int32 table[N,table_width] with null/invalid request entries -1,
+    and int32 visible lengths[N]. ratio is raw tokens per global cache row.
+    """
+    if not positions.is_cuda:
+        out = torch.full((positions.numel(), table.shape[1]), -1, dtype=torch.int32)
+        if table.numel():
+            values = table[requests.clamp(0, table.shape[0] - 1)]
+            out.copy_(
+                values.masked_fill(
+                    (values <= 0)
+                    | (requests[:, None] < 0)
+                    | (requests[:, None] >= table.shape[0]),
+                    -1,
+                )
+            )
+        return out, ((positions + 1).clamp_min(0) // ratio).to(torch.int32)
+    return _kernel("selection_table", positions)(positions, requests, table, ratio)
+
+
+def compressor_metadata(positions, requests, table, context_len, pages):
+    """Derive ratio-2 pair coordinates and retained tail addresses.
+
+    positions and requests are integer [N]; table is the LCM tail page table.
+    Returns active[N], pair positions[N], pair requests[N], predecessor indices[N],
+    read slots[N] and write slots[N]. Inactive coordinates and absent rows use -1.
+    context_len bounds logical keys, and pages bounds physical residency.
+    """
+    return _kernel("compressor_metadata", positions)(
+        positions, requests, table, context_len, pages
+    )
 
 
 # Backend registration (side-effect imports)
