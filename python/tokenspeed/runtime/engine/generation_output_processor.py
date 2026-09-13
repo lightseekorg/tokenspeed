@@ -234,11 +234,12 @@ class RequestState:
             self._surr_offset = max(
                 self._read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
             )
-        all_ids = self.prompt_input_ids_unpadded + self.output_ids
-        return (
-            all_ids[self._surr_offset :],
-            self._read_offset - self._surr_offset,
-        )
+        # Slice before concatenating: decode needs only the surrounding prompt
+        # suffix, not a copy of the entire cached prompt on every output token.
+        prompt = self.prompt_input_ids_unpadded
+        offset = self._surr_offset
+        decode_ids = prompt[offset:] + self.output_ids[max(offset - len(prompt), 0) :]
+        return decode_ids, self._read_offset - offset
 
     def check_finished(self, skip_grammar_termination: bool = False):
 
