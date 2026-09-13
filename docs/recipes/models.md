@@ -761,10 +761,14 @@ tokenspeed serve openai/gpt-oss-120b \
 
 ## DeepSeek V4-Flash / V4-Pro
 
-DeepSeek V4 needs FP8 KV cache, the DeepGEMM `mega_moe` experts, and the FP4
-indexer cache. `tokenspeed serve` auto-selects `--reasoning-parser deepseek_v31`
+DeepSeek V4 uses FP8 KV cache.
+`tokenspeed serve` auto-selects `--reasoning-parser deepseek_v31`
 and `--tool-call-parser deepseek_v4`, and auto-sets `block_size=256` (pass
-`--block-size N` with `N != 64` to override). Requires
+`--block-size N` with `N != 64` to override).
+
+### NVIDIA
+
+The NVIDIA recipes below require
 `tokenspeed-deepgemm>=2.5.0.post20260629` and `tokenspeed-flashmla`.
 
 **V4-Flash** — 4× B200 (SM100), data-parallel + expert-parallel:
@@ -810,6 +814,27 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Pro \
 For the expert-parallel topology, swap `--tensor-parallel-size 8` for
 `--tensor-parallel-size 8 --enable-expert-parallel --dense-tp-size 1` and
 `--moe-backend flashinfer_trtllm` for `--moe-backend mega_moe`.
+
+### AMD
+
+**V4-Flash** — 2× MI350-series (gfx950), tensor-parallel + MTP:
+
+```bash
+tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
+  --trust-remote-code \
+  --tensor-parallel-size 2 \
+  --kv-cache-dtype fp8_e4m3 \
+  --max-model-len 4096 \
+  --max-total-tokens 16384 \
+  --chunked-prefill-size 8192 \
+  --prefill-graph-max-tokens 8192 \
+  --gpu-memory-utilization 0.9 \
+  --disable-kvstore \
+  --speculative-algorithm MTP \
+  --speculative-num-steps 3 \
+  --host 127.0.0.1 \
+  --port 8000
+```
 
 ### MTP speculative decoding
 

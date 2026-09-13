@@ -814,7 +814,7 @@ def dsv4_prefill_topk(
             out=out,
         )
         spec = KernelRegistry.get().get_by_name(kernel.name)
-        if spec is not None and spec.solution == "gluon":
+        if spec is not None and spec.solution in {"gluon", "triton"}:
             kernel_kwargs["block_table_base_offsets"] = block_table_base_offsets
         return kernel(**kernel_kwargs)
 
@@ -937,7 +937,7 @@ def dsv4_decode_topk(
             persistent_topk_workspace=persistent_topk_workspace,
         )
         spec = KernelRegistry.get().get_by_name(kernel.name)
-        if spec is not None and spec.solution == "gluon":
+        if spec is not None and spec.solution in {"gluon", "triton"}:
             kernel_kwargs["block_table_base_offsets"] = block_table_base_offsets
         return kernel(**kernel_kwargs)
 
