@@ -24,6 +24,7 @@ import inspect
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
@@ -263,7 +264,12 @@ class ModelRunner:
             rank = int(obj.rank_offset) + self.global_rank
             world_size = int(obj.world_size)
             group_name = str(getattr(obj, "group_name", "weight_update_group"))
-            backend = Backend(str(getattr(obj, "backend", "nccl")))
+            backend_name = str(getattr(obj, "backend", "nccl"))
+            if backend_name == "nccl" and current_platform().is_npu:
+                # Ascend NPU has no NCCL backend; the trainer's default
+                # request maps to HCCL (adaptation rule R21).
+                backend_name = "hccl"
+            backend = Backend(backend_name)
             device = torch.device(f"{self.device}:{self.gpu_id}")
             get_device_module().set_device(device)
 

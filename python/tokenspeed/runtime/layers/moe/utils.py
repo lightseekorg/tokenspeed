@@ -24,6 +24,8 @@ import logging
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING
 
+from tokenspeed_kernel.platform import current_platform
+
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -48,6 +50,7 @@ class All2AllBackend(Enum):
     NONE = "none"
     DEEPEP = "deepep"
     FLASHINFER_NVLINK_ONE_SIDED = "flashinfer_nvlink_one_sided"
+    HCCL = "hccl"
 
     @classmethod
     def _missing_(cls, value):
@@ -66,6 +69,9 @@ class All2AllBackend(Enum):
 
     def is_flashinfer_nvlink_one_sided(self):
         return self == All2AllBackend.FLASHINFER_NVLINK_ONE_SIDED
+
+    def is_hccl(self):
+        return self == All2AllBackend.HCCL
 
 
 class MoeBackend(Enum):
@@ -186,7 +192,14 @@ def initialize_moe_config(server_args: ServerArgs):
     global DEEPEP_MODE
     global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
 
-    ALL2ALL_BACKEND = All2AllBackend(server_args.all2all_backend)
+    # On Ascend NPU there is no DeepEP / NVLink one-sided all-to-all; the
+    # default ("none") is replaced by the portable HCCL all-to-all so EP
+    # MoE keeps working (adaptation rule R38). Explicit GPU choices are
+    # left untouched.
+    all2all_value = server_args.all2all_backend
+    if all2all_value in (None, "none") and current_platform().is_npu:
+        all2all_value = "hccl"
+    ALL2ALL_BACKEND = All2AllBackend(all2all_value)
     MOE_BACKEND = MoeBackend(server_args.moe_backend)
     DEEPEP_MODE = DeepEPMode(server_args.deepep_mode)
     DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
@@ -198,7 +211,10 @@ def get_all2all_backend() -> All2AllBackend:
     global ALL2ALL_BACKEND
     if ALL2ALL_BACKEND is None:
         logger.warning("ALL2ALL_BACKEND is not initialized, using default backend")
-        ALL2ALL_BACKEND = All2AllBackend.NONE
+        # NPU default: portable HCCL all-to-all; GPU default stays "none".
+        ALL2ALL_BACKEND = (
+            All2AllBackend.HCCL if current_platform().is_npu else All2AllBackend.NONE
+        )
     return ALL2ALL_BACKEND
 
 

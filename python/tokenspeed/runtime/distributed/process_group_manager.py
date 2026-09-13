@@ -24,6 +24,7 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.mapping import Group, Mapping
 
@@ -47,7 +48,10 @@ class ProcessGroupManager:
     def __init__(self):
         self._process_groups: dict[str, dict[Group, dist.ProcessGroup]] = {}
         self._pg_timeout: timedelta | None = None
-        self._device_backend = "nccl"
+        # NCCL on NVIDIA/AMD, HCCL on Ascend NPU (adaptation rule R21). Kept
+        # platform-aware so the device-backend lookup (get_device_process_group)
+        # and the default init_process_group backend match the accelerator.
+        self._device_backend = "hccl" if current_platform().is_npu else "nccl"
 
     def init_distributed(
         self,

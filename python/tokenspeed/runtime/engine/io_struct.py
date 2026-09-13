@@ -46,10 +46,21 @@ from typing import Any, Literal, Union
 import msgspec
 import numpy as np
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.multimodal.inputs import MultimodalInputs
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.utils.env import envs
+
+
+def _device_collective_backend() -> str:
+    """Collective backend name for the accelerator in use.
+
+    NCCL on NVIDIA/AMD, HCCL on Ascend NPU (adaptation rule R21). Used as the
+    default backend for groups that cross into the runtime (e.g. the RL
+    weight-update group), where the GPU default "nccl" has no meaning on NPU.
+    """
+    return "hccl" if current_platform().is_npu else "nccl"
 
 
 def _require(condition: bool, message: str) -> None:
@@ -950,7 +961,7 @@ class InitWeightsUpdateGroupReqInput(BaseReq, kw_only=True):
     # The group name
     group_name: str = "weight_update_group"
     # The backend
-    backend: str = "nccl"
+    backend: str = msgspec.field(default_factory=_device_collective_backend)
 
 
 class InitWeightsUpdateGroupReqOutput(BaseReq, kw_only=True):

@@ -177,11 +177,18 @@ class DpSamplingComm:
         self._vocab_size = vocab_size
         self._logits_dtype = logits_dtype
         self._fallback_backend = fallback_comm_backend or get_global_backend()
-        self._device = (
-            torch.device(device)
-            if device is not None
-            else torch.device(f"cuda:{torch.cuda.current_device()}")
-        )
+        if device is not None:
+            self._device = torch.device(device)
+        elif (
+            current_platform is not None
+            and current_platform().is_npu
+            and getattr(torch, "npu", None) is not None
+        ):
+            # Ascend NPU: bind buffers to the current NPU device (adaptation
+            # rule R01), not torch.cuda which is meaningless here.
+            self._device = torch.device(f"npu:{torch.npu.current_device()}")
+        else:
+            self._device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
         self._backend: _ResolvedBackend = _resolve_backend(backend, group)
         self._state = None

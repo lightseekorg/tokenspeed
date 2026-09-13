@@ -104,6 +104,13 @@ def attn_ar_eligible(
     return armed and has_prefix and 0 < num_tokens <= window
 
 
+def _current_device() -> torch.device:
+    """Current accelerator device (CUDA on NVIDIA/AMD, NPU on Ascend)."""
+    if current_platform().is_npu:
+        return torch.device("npu", torch.npu.current_device())
+    return torch.device("cuda", torch.cuda.current_device())
+
+
 class K3MoETailTier(IntEnum):
     """How the K3 MoE tail combines routed/shared partials, best first.
 
@@ -326,7 +333,7 @@ class K3AttnCommState:
         self.dummy_norm.weight.data = torch.ones(
             hidden,
             dtype=torch.bfloat16,
-            device=torch.device("cuda", torch.cuda.current_device()),
+            device=_current_device(),
         )
         self.dummy_norm.weight.requires_grad_(False)
 
@@ -462,10 +469,15 @@ class K3MoeTailCommState:
             # Equal widths would alias the two per-width staging buffers.
             and latent != hidden
             and multimem_available()
-            # Cross-node symmetric-memory rendezvous requires fabric/IMEX.
+            # Cross-node symmetric-memory rendezvous requires fabric/IMEX
+            # (CUDA) or a node-local world (NPU); probe accordingly.
             and (
-                world <= torch.cuda.device_count()
-                or fabric_allocation_supported(torch.cuda.current_device())
+                (
+                    world <= torch.npu.device_count()
+                    if current_platform().is_npu
+                    else world <= torch.cuda.device_count()
+                    or fabric_allocation_supported(torch.cuda.current_device())
+                )
             )
         )
         tail_local = False
@@ -487,7 +499,7 @@ class K3MoeTailCommState:
         votes = torch.tensor(
             [int(multimem_local), int(tail_local)],
             dtype=torch.int32,
-            device="cuda",
+            device="npu" if current_platform().is_npu else "cuda",
         )
         dist.all_reduce(votes, op=dist.ReduceOp.MIN)
         multimem_ok, tail_ok = (bool(v) for v in votes.tolist())
@@ -789,7 +801,7 @@ class K3MoeTailComm:
             # Per-module mailbox. Constructor failures must propagate because
             # peers are already rendezvousing: a rank that failed mid-way has
             # stranded them, and killing the whole job is the good outcome.
-            _device = torch.device("cuda", torch.cuda.current_device())
+            _device = _current_device()
             self.latent_tail = KimiK3LatentTailOp.initialize(
                 group=dist.group.WORLD,
                 hidden_size=hidden_size,

@@ -56,6 +56,7 @@ setattr(threading, "_register_atexit", _ignore_threading_atexit)
 
 import torch
 import uvloop
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.engine.data_parallel_controller import (
     run_data_parallel_controller_process,
@@ -340,6 +341,11 @@ class Engine(EngineBase):
         backend: str = "nccl",
     ):
         """Initialize parameter update group."""
+        # Ascend NPU has no NCCL backend: map the default "nccl" request to
+        # HCCL so the RL weight-sync group forms on the accelerator's own
+        # collective backend (adaptation rule R21). GPU behavior unchanged.
+        if backend == "nccl" and current_platform().is_npu:
+            backend = "hccl"
         obj = InitWeightsUpdateGroupReqInput(
             master_address=master_address,
             master_port=master_port,
@@ -449,12 +455,28 @@ class Engine(EngineBase):
         self.collective_rpc("save_sharded_model", **kwargs)
 
 
+def _comm_socket_ifname_env() -> str:
+    """Collective socket-interface env var for the current platform.
+
+    NCCL on NVIDIA/AMD, HCCL on Ascend NPU (adaptation rule R23). Reading
+    the HCCL_* variable on NPU keeps cross-node collectives pinned to the
+    interface that reaches the head node, exactly as NCCL_SOCKET_IFNAME does
+    on GPU hosts.
+    """
+    if current_platform().is_npu:
+        return "HCCL_SOCKET_IFNAME"
+    return "NCCL_SOCKET_IFNAME"
+
+
 def _set_socket_interface(server_args: ServerArgs):
-    """Point gloo and NCCL at the interface that reaches the head node.
+    """Point gloo and the collective backend at the interface that reaches
+    the head node.
 
     Gloo has no peer-address heuristic: left alone it binds whatever the local
     hostname resolves to, which is a loopback entry on many hosts, and every
-    cross-node gloo collective then fails to connect.
+    cross-node gloo collective then fails to connect. The same holds for the
+    accelerator collective socket-interface variable (NCCL_* on GPU, HCCL_*
+    on NPU).
     """
     if server_args.mapping.nnodes <= 1 or not server_args.dist_init_addr:
         return
@@ -464,11 +486,12 @@ def _set_socket_interface(server_args: ServerArgs):
     if interface is None:
         logger.warning(
             f"cannot tell which interface reaches the head node {head}; set "
-            "GLOO_SOCKET_IFNAME and NCCL_SOCKET_IFNAME explicitly if cross-node setup fails"
+            f"GLOO_SOCKET_IFNAME and {_comm_socket_ifname_env()} explicitly "
+            "if cross-node setup fails"
         )
         return
 
-    for name in ("GLOO_SOCKET_IFNAME", "NCCL_SOCKET_IFNAME"):
+    for name in ("GLOO_SOCKET_IFNAME", _comm_socket_ifname_env()):
         os.environ.setdefault(name, interface)
     logger.info(f"socket interface reaching {head}: {interface}")
 
@@ -476,17 +499,21 @@ def _set_socket_interface(server_args: ServerArgs):
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    if server_args.disable_symm_mem:
-        os.environ["NCCL_CUMEM_ENABLE"] = "0"
-    if server_args.disable_nccl_nvls:
-        os.environ["NCCL_NVLS_ENABLE"] = "0"
-    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
-    os.environ["CUDA_MODULE_LOADING"] = "AUTO"
-    if not server_args.disable_tf32:
-        # Force TF32 on for cuBLAS/cuDNN matmuls. setdefault so a user's
-        # explicit env wins; --disable-tf32 is the documented opt-out.
-        os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "1")
-        os.environ.setdefault("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "1")
+    if not current_platform().is_npu:
+        # NVIDIA/AMD-only tuning: these NCCL_/CUDA_ variables are meaningless
+        # on Ascend NPU, whose collective stack reads HCCL_* instead (see
+        # _comm_socket_ifname_env / adaptation rule R23).
+        if server_args.disable_symm_mem:
+            os.environ["NCCL_CUMEM_ENABLE"] = "0"
+        if server_args.disable_nccl_nvls:
+            os.environ["NCCL_NVLS_ENABLE"] = "0"
+        os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
+        os.environ["CUDA_MODULE_LOADING"] = "AUTO"
+        if not server_args.disable_tf32:
+            # Force TF32 on for cuBLAS/cuDNN matmuls. setdefault so a user's
+            # explicit env wins; --disable-tf32 is the documented opt-out.
+            os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "1")
+            os.environ.setdefault("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "1")
 
     _set_socket_interface(server_args)
 

@@ -28,15 +28,29 @@ from contextlib import contextmanager
 # ===================== import region =====================
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.communication.nccl import (
-    NCCLLibrary,
-    buffer_type,
-    cudaStream_t,
-    ncclComm_t,
-    ncclDataTypeEnum,
-    ncclRedOpTypeEnum,
-    ncclUniqueId,
-)
+try:
+    from tokenspeed_kernel.ops.communication.nccl import (
+        NCCLLibrary,
+        buffer_type,
+        cudaStream_t,
+        ncclComm_t,
+        ncclDataTypeEnum,
+        ncclRedOpTypeEnum,
+        ncclUniqueId,
+    )
+except Exception:  # pragma: no cover - non-NVIDIA/AMD hosts
+    # The NCCL ctypes wrapper is only meaningful where NCCL exists (NVIDIA/
+    # AMD). On other platforms (e.g. Ascend NPU, where the HCCL counterpart
+    # PyHcclCommunicator lives below) the module must stay importable;
+    # PyNcclCommunicator then disables itself at construction because it
+    # cannot bind the library.
+    NCCLLibrary = None
+    buffer_type = None
+    cudaStream_t = None
+    ncclComm_t = None
+    ncclDataTypeEnum = None
+    ncclRedOpTypeEnum = None
+    ncclUniqueId = None
 from torch.distributed import ProcessGroup, ReduceOp
 
 from tokenspeed.runtime.distributed.utils import StatelessProcessGroup
@@ -285,6 +299,155 @@ class PyNcclCommunicator:
             # guess a default value when not specified
             enable = self.available
 
+        if stream is None:
+            stream = self.stream
+
+        old_disable = self.disabled
+        old_stream = self.stream
+
+        self.stream = stream
+        self.disabled = not enable
+        yield
+
+        self.disabled = old_disable
+        self.stream = old_stream
+
+
+class PyHcclCommunicator:
+    """HCCL communicator (Ascend NPU counterpart of ``PyNcclCommunicator``).
+
+    On Ascend NPU, HCCL is used through ``torch.distributed`` with the
+    ``hccl`` backend (adaptation rules R21/R22); there is no public ctypes
+    HCCL binding equivalent to the NVIDIA ``NCCLLibrary`` wrapper. This class
+    exposes the same method surface as ``PyNcclCommunicator``
+    (all_reduce/all_gather/reduce_scatter/send/recv/broadcast) and delegates
+    each collective to the HCCL ``ProcessGroup`` it was bound to, so callers
+    that switch between the two communicators keep the same call sites.
+
+    Args:
+        group: the process group to work on. A torch ``ProcessGroup`` created
+            with backend ``hccl``, or a ``StatelessProcessGroup`` for
+            metadata-only construction (collectives then require an explicit
+            ``process_group``).
+        device: the device to bind the communicator to.
+        process_group: explicit HCCL ``ProcessGroup`` to run collectives on.
+            When None and ``group`` is a real ``ProcessGroup``, ``group`` is
+            used directly.
+    """
+
+    def __init__(
+        self,
+        group: ProcessGroup | StatelessProcessGroup,
+        device: int | str | torch.device,
+        process_group: ProcessGroup | None = None,
+    ):
+        if not isinstance(group, StatelessProcessGroup):
+            if not dist.is_initialized():
+                raise RuntimeError("torch.distributed must be initialized")
+            self.rank = dist.get_rank(group)
+            self.world_size = dist.get_world_size(group)
+        else:
+            self.rank = group.rank
+            self.world_size = group.world_size
+
+        self.group = group
+        self._process_group = (
+            process_group if process_group is not None else group
+        )
+
+        # if world_size == 1, no need to create communicator
+        if self.world_size == 1:
+            self.available = False
+            self.disabled = True
+            self.stream = None
+            return
+
+        self.available = True
+        # by default it is disabled; use under `with obj.change_state(enable=True)`.
+        self.disabled = True
+
+        if isinstance(device, int):
+            device = torch.device(f"npu:{device}")
+        elif isinstance(device, str):
+            device = torch.device(device)
+        if not isinstance(device, torch.device):
+            raise TypeError(
+                f"device must be a torch.device, got {type(device).__name__}"
+            )
+        self.device = device
+
+    def _check_device(self, tensor: torch.Tensor) -> None:
+        if tensor.device.type != self.device.type:
+            raise ValueError(
+                f"this hccl communicator is created to work on {self.device}, "
+                f"but the input tensor is on {tensor.device}"
+            )
+
+    def _collective_group(self):
+        if isinstance(self.group, StatelessProcessGroup):
+            raise RuntimeError(
+                "PyHcclCommunicator collectives require a real hccl "
+                "ProcessGroup (a StatelessProcessGroup only carries metadata)"
+            )
+        return self._process_group
+
+    def all_reduce(
+        self, tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM, stream=None
+    ):
+        if self.disabled:
+            return
+        self._check_device(tensor)
+        dist.all_reduce(tensor, op=op, group=self._collective_group())
+
+    def all_gather(
+        self, output_tensor: torch.Tensor, input_tensor: torch.Tensor, stream=None
+    ):
+        if self.disabled:
+            return
+        self._check_device(input_tensor)
+        dist.all_gather_into_tensor(
+            output_tensor, input_tensor, group=self._collective_group()
+        )
+
+    def reduce_scatter(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+        op: ReduceOp = ReduceOp.SUM,
+        stream=None,
+    ):
+        if self.disabled:
+            return
+        self._check_device(input_tensor)
+        dist.reduce_scatter_tensor(
+            output_tensor, input_tensor, op=op, group=self._collective_group()
+        )
+
+    def send(self, tensor: torch.Tensor, dst: int, stream=None):
+        if self.disabled:
+            return
+        self._check_device(tensor)
+        dist.send(tensor, dst, group=self._collective_group())
+
+    def recv(self, tensor: torch.Tensor, src: int, stream=None):
+        if self.disabled:
+            return
+        self._check_device(tensor)
+        dist.recv(tensor, src, group=self._collective_group())
+
+    def broadcast(self, tensor: torch.Tensor, src: int, stream=None):
+        if self.disabled:
+            return
+        self._check_device(tensor)
+        dist.broadcast(tensor, src, group=self._collective_group())
+
+    @contextmanager
+    def change_state(
+        self, enable: bool | None = None, stream: torch.cuda.Stream | None = None
+    ):
+        """A context manager to change the state of the communicator."""
+        if enable is None:
+            enable = self.available
         if stream is None:
             stream = self.stream
 
