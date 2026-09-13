@@ -882,6 +882,14 @@ class DeepseekV41MoE(DeepseekV4MoE):
 
 
 class DeepseekV41DecoderLayer(nn.Module):
+    """Overlap HC coefficients with decode sublayer work on CUDA.
+
+    Sublayer inputs use the previous pre-mix, so the current coefficients need
+    only join before HC post. Eager and captured forwards use the same forks.
+    Prefill stays on the main stream: extra stream submissions can outweigh
+    overlap in small eager batches. Decode has no token-count threshold.
+    """
+
     def __init__(
         self,
         config,
@@ -890,6 +898,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         quant_config,
         prefix: str,
         aux_stream,
+        hc_stream: torch.cuda.Stream | None,
         host_table: bool,
         host_layout: str,
     ):
@@ -897,6 +906,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         self.layer_id = layer_id
         self.norm_eps, self.hc_eps = config.rms_norm_eps, config.hc_eps
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
+        self.hc_stream_fork = StreamFork(hc_stream)
         dense_quant = v41_mxfp8_config(quant_config)
         self.attn = DeepseekV41Attention(
             config,
@@ -959,43 +969,66 @@ class DeepseekV41DecoderLayer(nn.Module):
 
     def forward(self, hidden_states, pre_mix, positions, input_ids, ctx):
         residual = hidden_states
-        attn_pre, post, comb = v41_hc_mixes(
-            residual,
-            self.hc_attn_fn,
-            self.hc_attn_scale,
-            self.hc_attn_base,
-            self.norm_eps,
-            self.hc_eps,
-            self.hc_sinkhorn_iters,
+        overlap = (
+            residual.is_cuda
+            and ctx.forward_mode is not None
+            and ctx.forward_mode.is_decode()
+            and self.hc_stream_fork.aux_stream is not None
+            and self.hc_stream_fork.aux_stream.device == residual.device
         )
-        x = _v41_hc_input(residual, pre_mix, self.attn_norm)
-        hidden_states = v41_hc_post(self.attn(positions, x, ctx), residual, post, comb)
+        consumer = torch.cuda.current_stream() if overlap else None
+        if overlap:
+            residual.record_stream(self.hc_stream_fork.aux_stream)
+        with self.hc_stream_fork.scope(enable=overlap, overlap=True) as fork:
+            with fork.branch():
+                attn_pre, post, comb = v41_hc_mixes(
+                    residual,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.norm_eps,
+                    self.hc_eps,
+                    self.hc_sinkhorn_iters,
+                )
+            if overlap:
+                for tensor in (attn_pre, post, comb):
+                    tensor.record_stream(consumer)
+            x = _v41_hc_input(residual, pre_mix, self.attn_norm)
+            x = self.attn(positions, x, ctx)
+        hidden_states = v41_hc_post(x, residual, post, comb)
         residual = hidden_states
-        ffn_pre, post, comb = v41_hc_mixes(
-            residual,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-            self.norm_eps,
-            self.hc_eps,
-            self.hc_sinkhorn_iters,
-        )
-        x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
-        if self.ffn.use_mega_moe:
-            counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
-            x = self.ffn(
-                x,
-                input_ids,
-                sum(counts),
-                max(counts),
-                ctx=ctx,
-                comm_manager=self.comm_manager,
-            )
-        else:
-            x = self.comm_manager.pre_mlp_comm(x, ctx)
-            total, maximum = self.comm_manager.get_num_tokens(ctx)
-            x = self.ffn(x, input_ids, total, maximum, ctx=None, comm_manager=None)
-            x, _ = self.comm_manager.post_mlp_comm(x, None, ctx)
+        if overlap:
+            residual.record_stream(self.hc_stream_fork.aux_stream)
+        with self.hc_stream_fork.scope(enable=overlap, overlap=True) as fork:
+            with fork.branch():
+                ffn_pre, post, comb = v41_hc_mixes(
+                    residual,
+                    self.hc_ffn_fn,
+                    self.hc_ffn_scale,
+                    self.hc_ffn_base,
+                    self.norm_eps,
+                    self.hc_eps,
+                    self.hc_sinkhorn_iters,
+                )
+            if overlap:
+                for tensor in (ffn_pre, post, comb):
+                    tensor.record_stream(consumer)
+            x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
+            if self.ffn.use_mega_moe:
+                counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
+                x = self.ffn(
+                    x,
+                    input_ids,
+                    sum(counts),
+                    max(counts),
+                    ctx=ctx,
+                    comm_manager=self.comm_manager,
+                )
+            else:
+                x = self.comm_manager.pre_mlp_comm(x, ctx)
+                total, maximum = self.comm_manager.get_num_tokens(ctx)
+                x = self.ffn(x, input_ids, total, maximum, ctx=None, comm_manager=None)
+                x, _ = self.comm_manager.post_mlp_comm(x, None, ctx)
         return v41_hc_post(x, residual, post, comb), ffn_pre
 
 
@@ -1063,6 +1096,10 @@ class DeepseekV41Model(nn.Module):
         self.aux_stream = (
             torch.cuda.Stream(device=device) if device.type == "cuda" else None
         )
+        # HC must also overlap the attention/index and shared-expert branches.
+        self.hc_stream = (
+            torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        )
         self.layers = nn.ModuleList(
             [
                 DeepseekV41DecoderLayer(
@@ -1072,6 +1109,7 @@ class DeepseekV41Model(nn.Module):
                     quant_config,
                     add_prefix(f"layers.{layer_id}", prefix),
                     self.aux_stream,
+                    self.hc_stream,
                     host_table,
                     host_layout,
                 )

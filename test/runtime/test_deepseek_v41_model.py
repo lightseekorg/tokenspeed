@@ -449,7 +449,7 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
     torch.manual_seed(41)
     layers = [
         DeepseekV41DecoderLayer(
-            config, _mapping(0, 1, 1), i, None, f"layers.{i}", None, False, "gpu"
+            config, _mapping(0, 1, 1), i, None, f"layers.{i}", None, None, False, "gpu"
         )
         for i in (0, 1)
     ]
