@@ -27,6 +27,7 @@
 #include <optional>
 #include <span>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "utils.h"
@@ -51,7 +52,6 @@ public:
           demands_{demands},
           prefix_{prefix},
           victims_{victims},
-          remaining_occupied_(static_cast<std::size_t>(pool.NumLcmBlocks()) + 1),
           local_free_slots_(groups.size()),
           blocks_needed_(groups.size()) {}
 
@@ -137,22 +137,9 @@ private:
                     ? 0
                     : static_cast<std::int32_t>(std::ranges::count(prefix_.host.per_group[i].hits, std::uint8_t{1}));
             blocks_needed_[i] = static_cast<std::int64_t>(device_blocks) + host_blocks;
+            local_free_slots_[i] = pool_.NumFreeSlots(static_cast<std::uint32_t>(i));
         }
-
-        for (std::int32_t parent_id = 1; parent_id <= pool_.NumLcmBlocks(); ++parent_id) {
-            const std::optional<std::uint32_t> group_id = pool_.BoundGroup(parent_id);
-            if (!group_id) {
-                ++empty_parent_count_;
-                continue;
-            }
-
-            _assert(*group_id < groups_.size(), "LCM parent has invalid group binding");
-            const std::int32_t occupied = pool_.OccupiedCount(parent_id);
-            const std::int32_t slots = groups_[*group_id].Allocator().CacheBlocksPerLcmBlock();
-            _assert(0 < occupied && occupied <= slots, "bound LCM parent has invalid occupancy");
-            remaining_occupied_[static_cast<std::size_t>(parent_id)] = occupied;
-            local_free_slots_[*group_id] += slots - occupied;
-        }
+        empty_parent_count_ = pool_.NumEmptyLcmBlocks();
     }
 
     void collectCandidates() {
@@ -224,7 +211,9 @@ private:
     void removeOccupant(std::uint32_t group_id, CacheBlockLocation location) {
         _assert(pool_.BoundGroup(location.lcm_block_id) == group_id,
                 "released admission location belongs to another group");
-        std::int32_t& occupied = remaining_occupied_[static_cast<std::size_t>(location.lcm_block_id)];
+        auto it =
+            remaining_occupied_.try_emplace(location.lcm_block_id, pool_.OccupiedCount(location.lcm_block_id)).first;
+        std::int32_t& occupied = it->second;
         _assert(occupied > 0, "admission released the same location twice");
         const std::int32_t slots = groups_[group_id].Allocator().CacheBlocksPerLcmBlock();
         if (occupied == 1) {
@@ -238,7 +227,9 @@ private:
     }
 
     void restoreOccupant(std::uint32_t group_id, CacheBlockLocation location) {
-        std::int32_t& occupied = remaining_occupied_[static_cast<std::size_t>(location.lcm_block_id)];
+        auto it = remaining_occupied_.find(location.lcm_block_id);
+        _assert(it != remaining_occupied_.end(), "restored admission victim has no shadow occupancy");
+        std::int32_t& occupied = it->second;
         const std::int32_t slots = groups_[group_id].Allocator().CacheBlocksPerLcmBlock();
         if (occupied == 0) {
             _assert(empty_parent_count_ > 0, "restoring an admission victim underflowed empty parents");
@@ -268,7 +259,7 @@ private:
     std::span<const GroupDemand> demands_;
     const CacheCoordinator::PrefixProbe& prefix_;
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>>& victims_;
-    std::vector<std::int32_t> remaining_occupied_;
+    std::unordered_map<std::int32_t, std::int32_t> remaining_occupied_;
     std::vector<std::int64_t> local_free_slots_;
     std::vector<std::int64_t> blocks_needed_;
     std::int64_t empty_parent_count_{0};

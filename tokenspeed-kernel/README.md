@@ -123,6 +123,10 @@ iteration.
   kernel against the reference impl.
 - `python -m tokenspeed_kernel.benchmark` — unified timing, throughput
   (FLOPs / bytes) per op family, tabular reports, and Proton integration.
+- `KernelBenchmarkHarness` — registration-level device timing through warmed
+  graph replay, with raw samples, resolved registration metadata, and explicit
+  failure outcomes. The first operation-owned generator covers dense BF16
+  batched GEMM.
 - Runtime shape capture feeds replay and tuning workflows; `kernel_scope`
   scopes are visible in Proton/Chrome traces.
 - End-to-end serving: POST `/start_profile` with
@@ -137,6 +141,13 @@ iteration.
   (`TOKENSPEED_KERNEL_PROFILE_DATA=trace`,
   `TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT=chrome_trace`), then merge the
   traces with `tokenspeed merge-traces`.
+
+Registration-level benchmarks combine operation-owned input and correctness
+logic with graph-replay device timing. Pull request CI can compare compatible
+cases from the merge base and candidate revision. See the
+[benchmark documentation](benchmarks/README.md) for the harness and suite
+contract, and the [CI documentation](../test/ci/README.md#registration-level-kernel-benchmarks)
+for workflow behavior and runner requirements.
 
 ### Plugins
 

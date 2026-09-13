@@ -287,7 +287,7 @@ def test_waiting_prefix_hashes_skip_when_pool_cannot_admit() -> None:
     scheduler = ts.Scheduler(cfg)
     scheduler.submit_requests([_spec("r1", list(range(1, 9)))])
     scheduler.next_execution_plan()
-    assert scheduler.available_kv_pages() == 0
+    assert scheduler.available_lcm_blocks() == 0
     scheduler.submit_requests([_spec("r2", list(range(100, 108)))])
     assert scheduler.waiting_prefix_hashes() == []
 

@@ -231,3 +231,23 @@ def test_kvv_configs_use_pinned_upstream_and_local_api():
         assert flag_value(command, "--max-tokens") == max_tokens
         assert "--thinking" in command
         assert flag_value(command, "--thinking-effort") == "max"
+
+
+def test_kimi_k25_amd_accuracy_gate_preserves_question_outputs():
+    task = yaml.safe_load(
+        (
+            EVAL_CONFIG_DIR / "kimi-k2.5-mxfp4-eagle3-evalscope-aime25-amd.yaml"
+        ).read_text()
+    )
+    command = shlex.split(task["eval"]["command"])
+    generation = json.loads(flag_value(command, "--generation-config"))
+
+    assert (
+        flag_value(command, "--work-dir") == ".ci-artifacts/published/evalscope-results"
+    )
+    assert "--no-timestamp" not in command
+    assert flag_value(command, "--limit") == "4"
+    assert flag_value(command, "--eval-batch-size") == "4"
+    assert generation == {"do_sample": False, "temperature": 0.0, "max_tokens": 8192}
+    assert task["score_threshold"] == 0.75
+    assert "retries" not in task

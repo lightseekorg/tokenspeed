@@ -35,10 +35,11 @@ import functools
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["decode_gemv", "rowcta_gemv"]
+__all__ = ["decode_gemv", "triton_rowcta_gemv"]
 
 
 @triton.jit
@@ -103,7 +104,7 @@ _BF16_SIG = frozenset(
 @register_kernel(
     "gemm",
     "decode_gemv",
-    name="rowcta_gemv_triton",
+    name="triton_rowcta_gemv",
     solution="triton",
     signatures=_BF16_SIG,
     traits={
@@ -113,7 +114,7 @@ _BF16_SIG = frozenset(
     },
     priority=Priority.SPECIALIZED,
 )
-def rowcta_gemv(
+def triton_rowcta_gemv(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
 ) -> torch.Tensor:
     """``x @ weight.T`` for ``M == 1`` decode activations.
@@ -145,13 +146,51 @@ def rowcta_gemv(
 @register_kernel(
     "gemm",
     "decode_gemv",
-    name="decode_gemv_torch",
+    name="gluon_wmma_dense_gemv_gfx1250",
+    solution="gluon",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(12, 5),
+        max_arch_version=ArchVersion(12, 5),
+        vendors=frozenset({"amd"}),
+    ),
+    signatures=_BF16_SIG,
+    traits={
+        "m": frozenset(range(2, 33)),
+        "k_align_128": frozenset({True}),
+        "n_align_16": frozenset({True}),
+    },
+    priority=Priority.SPECIALIZED,
+)
+def gluon_wmma_dense_gemv_gfx1250(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    """``x @ weight.T`` for small-M decode activations on CDNA5.
+
+    Args:
+        x: ``[M, K]`` contiguous bf16 activation, K a multiple of 128.
+        weight: ``[N, K]`` contiguous bf16 weight, N a multiple of 16.
+        out: optional ``[M, N]`` destination.
+
+    Returns:
+        ``[M, N]`` output in ``x``'s dtype.
+    """
+    from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
+        gluon_wmma_tdm_dense_gfx1250,
+    )
+
+    return gluon_wmma_tdm_dense_gfx1250(x, weight, out=out)
+
+
+@register_kernel(
+    "gemm",
+    "decode_gemv",
+    name="torch_decode_gemv",
     solution="torch",
     signatures=_BF16_SIG,
     traits={},
     priority=Priority.PORTABLE,
 )
-def _torch_decode_gemv(
+def torch_decode_gemv(
     x: torch.Tensor,
     weight: torch.Tensor,
     out: torch.Tensor | None = None,
@@ -164,7 +203,7 @@ def _torch_decode_gemv(
 @functools.lru_cache(maxsize=64)
 def _select(m: int, n: int, k: int, on_cuda: bool):
     if not on_cuda:
-        return _torch_decode_gemv
+        return torch_decode_gemv
     from tokenspeed_kernel.platform import current_platform
     from tokenspeed_kernel.registry import KernelRegistry
     from tokenspeed_kernel.selection import (
@@ -182,7 +221,7 @@ def _select(m: int, n: int, k: int, on_cuda: bool):
             spec, {"N": n, "K": k}
         ):
             return reg.get_impl(spec.name)
-    return _torch_decode_gemv
+    return torch_decode_gemv
 
 
 def decode_gemv(
@@ -206,7 +245,7 @@ def decode_gemv(
         ):
             raise ValueError(f"out must match x and have shape {expected}")
         if not out.is_contiguous():
-            return _torch_decode_gemv(x, weight, out)
+            return torch_decode_gemv(x, weight, out)
     return _select(x.shape[0], weight.shape[0], weight.shape[1], x.is_cuda)(
         x, weight, out
     )

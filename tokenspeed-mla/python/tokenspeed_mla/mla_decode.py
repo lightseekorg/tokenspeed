@@ -40,6 +40,8 @@ from tokenspeed_mla.mla_decode_fp16 import (
     BlackwellMultiHeadLatentAttentionForwardFP16,
 )
 from tokenspeed_mla.mla_helpers import (
+    ceil_div,
+    compute_q_tile_layout,
     get_mla_decode_fold_sq_factor,
     select_mla_decode_tilers,
 )
@@ -48,6 +50,31 @@ from tokenspeed_mla.utils import (
     get_num_sm,
     torch_to_cutlass_dtype,
 )
+
+
+def _get_reducer_d_tiles(
+    batch_size: int,
+    seq_len_q: int,
+    num_heads: int,
+    num_sms: int,
+    split_kv: int,
+) -> int:
+    """Return 1/2/4 D512 bands for the real output rows and split count.
+
+    Adapted from FlashInfer PR #4178: minimize waves per output band, keeping
+    the smaller grid on ties. Full row grids avoid duplicating LSE reduction.
+    """
+    rows = batch_size * seq_len_q * num_heads
+    if rows <= 0 or num_sms <= 0 or rows >= num_sms or split_kv <= 1:
+        return 1
+    best = 1
+    best_waves = ceil_div(rows, num_sms)
+    for bands in (2, 4):
+        if bands <= split_kv:
+            waves = ceil_div(rows * bands, num_sms)
+            if waves * best < best_waves * bands:
+                best, best_waves = bands, waves
+    return best
 
 
 @functools.cache
@@ -61,7 +88,11 @@ def _get_split_kv_and_workspace_size(
     torch_dtype: torch.dtype,
     mma_qk_tiler_mn: tuple[int, int],
 ) -> Tuple[int, int]:
-    """Cache split_kv and workspace_size since they are deterministic for the same params."""
+    """Return cached split count and workspace bytes for the effective Q layout.
+
+    FP8 normalizes uniform K partitions before sizing the workspace so the
+    launch grid, scratch strides and reducer use the same nonempty split count.
+    """
     is_fp8 = torch_dtype == torch.float8_e4m3fn
     if is_fp8 and mma_qk_tiler_mn[0] == 64:
         # M64 launches one CTA per M tile. Reuse the FP8 kernel's wave-aware
@@ -75,18 +106,20 @@ def _get_split_kv_and_workspace_size(
             max_active_blocks,
             1,
         )
-        workspace_size = BlackwellMultiHeadLatentAttentionForwardFP8.get_workspace_size(
-            H, q_len, kv_lora_rank, B, split_kv, cutlass.Float32
-        )
     else:
         split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv_simplified(
             B, q_len, max_active_blocks
         )
-        workspace_size = (
-            BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
-                H, q_len, kv_lora_rank, B, split_kv, cutlass.Float32
-            )
-        )
+    if is_fp8:
+        # The occupancy candidate may contain empty final partitions (e.g.
+        # 32 splits for only 8 K tiles). Preserve the uniform chunk width while
+        # removing those partitions, as in FlashInfer PR #4178.
+        k_tiles = ceil_div(max_seq_len, mma_qk_tiler_mn[1])
+        tiles_per_split = ceil_div(k_tiles, split_kv)
+        split_kv = ceil_div(k_tiles, tiles_per_split)
+    workspace_size = BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
+        H, q_len, kv_lora_rank, B, split_kv, cutlass.Float32
+    )
     return split_kv, workspace_size
 
 
@@ -163,6 +196,9 @@ def _get_compiled_mla_kernel(
     use_pdl: bool = False,
     return_lse: bool = False,  # DCP: enable LSE output
     compute_capability: tuple[int, int] = (0, 0),
+    reducer_d_tiles: int = 1,
+    reducer_max_splits: int = 256,
+    pack_q: bool = False,
 ) -> Callable:
     """Compile and cache an MLA decode kernel.
 
@@ -209,9 +245,12 @@ def _get_compiled_mla_kernel(
     kernel_kwargs["num_heads"] = num_heads
     kernel_kwargs["seq_len_q"] = seq_len_q
     kernel_kwargs["window_left"] = window_left
+    kernel_kwargs["pack_q"] = pack_q
     if is_fp8:
         # DCP (cp_world) strided global-coordinate causal masking is fp8-only.
         kernel_kwargs["cp_world"] = cp_world
+        kernel_kwargs["reducer_d_tiles"] = reducer_d_tiles
+        kernel_kwargs["reducer_max_splits"] = reducer_max_splits
     kernel_obj = KernelClass(**kernel_kwargs)
 
     # All dimensions as sym_int — this matches the original kernel's use of
@@ -376,6 +415,7 @@ def tokenspeed_mla_decode(
     ] = None,  # per-request global causal bound; None = local (non-DCP)
     cp_world: int = 1,  # decode-context-parallel world size (1 = no DCP)
     cp_rank: int = 0,  # this rank's index in [0, cp_world); subtracted from causal_seqs
+    enable_packed_q: bool = False,
 ) -> torch.Tensor:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
 
@@ -415,7 +455,7 @@ def tokenspeed_mla_decode(
         Otherwise,the sequence length is fixed for all the requests in the batch.
     causal_mask : bool
         Whether to enable causal masking in the CuTe DSL kernel.
-        Currently this is effective for the FP8 kernel path.
+        Supported by both the FP8 and FP16/BF16 kernel paths.
     window_left : int
         Sliding-window span, or -1 (default) for full history. When
         non-negative, query row ``i`` of the ``q_len`` block attends to keys
@@ -457,6 +497,12 @@ def tokenspeed_mla_decode(
         bound is ``ceil((causal_seqs - cp_rank) / cp_world)``; the wrapper folds
         ``cp_rank`` in for you, so callers pass the same global ``causal_seqs`` on
         every rank. Must be 0 when ``cp_world == 1``.
+    enable_packed_q : bool
+        Opt into continuous query/head packing on FP8 and FP16/BF16 M128
+        kernels. Default False preserves the existing folded-query path.
+        M64 and token-gapped Q/output views retain that path even when True.
+        Packed split-KV workspace uses ``B * 128 * ceil(H*q_len/128) *
+        split_kv * (kv_lora_rank + 1) * 4`` bytes (zero for split_kv=1).
 
     Returns
     -------
@@ -526,14 +572,23 @@ def tokenspeed_mla_decode(
         is_fp8=is_fp8,
         compute_capability=compute_capability,
     )
-    # Fold only by a factor that exactly divides q_len; otherwise leave q_len
-    # on the scheduler dimension.
     mma_m_tile = mma_qk_tiler_mn[0]
-    fold_sq_factor = get_mla_decode_fold_sq_factor(H, q_len, mma_m_tile)
-
-    # Effective dimensions used by split_kv/workspace accounting.
-    H_eff = H * fold_sq_factor
-    q_len_eff = q_len // fold_sq_factor
+    # A flat view requires adjacent query tokens to continue the head rows.
+    # Keep the existing path for token-gapped views and M64 kernels.
+    pack_q = (
+        enable_packed_q
+        and mma_m_tile == 128
+        and query.stride(1) == H * query.stride(2)
+        and (out is None or out.stride(1) == H * out.stride(2))
+    )
+    if pack_q:
+        _, q_len_eff, _ = compute_q_tile_layout(H, q_len, mma_m_tile)
+        H_eff = mma_m_tile
+        fold_sq_factor = 1
+    else:
+        fold_sq_factor = get_mla_decode_fold_sq_factor(H, q_len, mma_m_tile)
+        H_eff = H * fold_sq_factor
+        q_len_eff = q_len // fold_sq_factor
 
     # Cached split_kv and workspace_size computation
     max_active_blocks = get_num_sm(query.device)
@@ -662,6 +717,15 @@ def tokenspeed_mla_decode(
         use_pdl=enable_pdl,
         return_lse=return_lse,
         compute_capability=compute_capability,
+        reducer_d_tiles=(
+            _get_reducer_d_tiles(B, q_len, H, max_active_blocks, split_kv)
+            if is_fp8
+            else 1
+        ),
+        # Public FP8 auto-splitting is bounded by 64 (M64) or 32 (M128).
+        # Both values are in the compile cache key, including across batches.
+        reducer_max_splits=(64 if mma_m_tile == 64 else 32) if is_fp8 else 256,
+        pack_q=pack_q,
     )
 
     # DCP: allocate real LSE tensor when return_lse=True (DCP path). torch.zeros

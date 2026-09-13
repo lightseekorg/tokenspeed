@@ -64,7 +64,6 @@ import torch.distributed
 import torch.distributed as dist
 import triton
 import zmq
-from fastapi.responses import ORJSONResponse
 from PIL import Image
 from pydantic import BaseModel
 from starlette.routing import Mount
@@ -428,20 +427,6 @@ def set_ulimit(target_soft_limit=65535):
             )
         except ValueError as e:
             logger.warning("Failed to set RLIMIT_STACK: %s", e)
-
-
-def add_api_key_middleware(app, api_key: str):
-    @app.middleware("http")
-    async def authentication(request, call_next):
-        if request.method == "OPTIONS":
-            return await call_next(request)
-        if request.url.path.startswith("/health"):
-            return await call_next(request)
-        if request.url.path.startswith("/metrics"):
-            return await call_next(request)
-        if request.headers.get("Authorization") != "Bearer " + api_key:
-            return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
-        return await call_next(request)
 
 
 def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):

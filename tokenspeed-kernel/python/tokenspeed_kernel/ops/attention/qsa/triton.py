@@ -50,9 +50,7 @@ def _qwen4_exp_qsa_prepare_metadata_kernel(
     complete_blocks,
     draft_logical_positions,
     uniform_len,
-    qsa_expansion,
     qsa_page_size,
-    recent_expansion,
     recent_page_size,
     stride_seq_b,
     stride_len_b,
@@ -109,11 +107,10 @@ def _qwen4_exp_qsa_prepare_metadata_kernel(
 
         qsa_columns = safe_logical // qsa_page_size
         qsa_pages = tl.load(
-            qsa_page_table + request * stride_qsa_pt_b + qsa_columns * qsa_expansion,
+            qsa_page_table + request * stride_qsa_pt_b + qsa_columns,
             mask=mask & valid,
             other=0,
         ).to(tl.int64)
-        qsa_pages = qsa_pages // qsa_expansion
         qsa_values = qsa_pages * qsa_page_size + safe_logical % qsa_page_size
         qsa_valid = valid & (qsa_pages > 0)
         tl.store(
@@ -124,13 +121,10 @@ def _qwen4_exp_qsa_prepare_metadata_kernel(
 
         recent_columns = safe_logical // recent_page_size
         recent_pages = tl.load(
-            recent_page_table
-            + request * stride_recent_pt_b
-            + recent_columns * recent_expansion,
+            recent_page_table + request * stride_recent_pt_b + recent_columns,
             mask=mask & valid,
             other=0,
         ).to(tl.int64)
-        recent_pages = recent_pages // recent_expansion
         recent_values = (
             recent_pages * recent_page_size + safe_logical % recent_page_size
         )
@@ -147,10 +141,8 @@ def qwen4_exp_qsa_prepare_metadata(
     query_lengths: torch.Tensor | int,
     total_tokens: int,
     qsa_page_table: torch.Tensor,
-    qsa_expansion: int,
     qsa_page_size: int,
     recent_page_table: torch.Tensor,
-    recent_expansion: int,
     recent_page_size: int,
     compress_ratio: int,
     *,
@@ -172,11 +164,10 @@ def qwen4_exp_qsa_prepare_metadata(
         seq_lens: Sequence length per request.
         query_lengths: Per-request row counts or one uniform Python integer.
         total_tokens: Total flattened query rows.
-        qsa_page_table: Compressed-cache page table at consumer granularity.
-        qsa_expansion: Consumer pages per compressed logical page.
+        qsa_page_table: Raw compressed-cache block ids, with holes and padding
+            normalized to zero; one entry per logical page.
         qsa_page_size: Logical tokens covered by a compressed page.
-        recent_page_table: Recent-cache page table at consumer granularity.
-        recent_expansion: Consumer pages per recent logical page.
+        recent_page_table: Raw recent-cache block ids in the same format.
         recent_page_size: Logical tokens covered by a recent page.
         compress_ratio: Raw tokens represented by one compressed key.
         draft_logical_positions: Optional request-local draft tags to reset.
@@ -229,9 +220,7 @@ def qwen4_exp_qsa_prepare_metadata(
         *outputs,
         draft_arg,
         uniform_len,
-        qsa_expansion,
         qsa_page_size,
-        recent_expansion,
         recent_page_size,
         seq_lens.stride(0),
         stride_len_b,
@@ -731,8 +720,8 @@ def qwen4_exp_qsa_compress_and_store(
     num_query_heads: int | None = None,
     stage_verify_buffers: (
         tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
-    ) = None,
-    stage_draft: bool = False,
+    ),
+    stage_draft: bool,
 ) -> torch.Tensor | None:
     """Pool, normalize, rotate, and scatter compressed QSA keys in one kernel.
 
@@ -781,10 +770,12 @@ def qwen4_exp_qsa_compress_and_store(
         query_norm_weight: Gemma RMSNorm weight for ``query``.
         query_norm_epsilon: RMSNorm epsilon for ``query``.
         num_query_heads: Query heads packed into each projected row.
-        stage_verify_buffers: Optional contiguous K, position, logical-position,
-            and recent-location destinations for target verification.
+        stage_verify_buffers: Contiguous K, position, logical-position,
+            and recent-location destinations for target verification. Pass
+            None explicitly when target verification staging is not needed.
         stage_draft: Store each row into the supplied request-local draft
             scratch after compression has consumed its previous contents.
+            Pass False explicitly when draft staging is not needed.
 
     Returns:
         Normalized and rotated query rows when ``query`` is provided;
@@ -1149,6 +1140,218 @@ def qwen4_exp_qsa_recent_write(
 
 
 @triton.jit
+def _qwen4_exp_qsa_verify_row_mask(
+    logical_positions,
+    accepted_lengths,
+    row,
+    verify_width,
+    compress_ratio,
+):
+    """Return whether one staged row belongs to the accepted trailing window."""
+
+    request = row // verify_width
+    step = row % verify_width
+    accepted = tl.load(accepted_lengths + request).to(tl.int64)
+    accepted = tl.minimum(tl.maximum(accepted, 0), verify_width)
+    write = step < accepted
+    if write:
+        last_index = request * verify_width + accepted - 1
+        last_position = tl.load(logical_positions + last_index).to(tl.int64)
+        position = tl.load(logical_positions + row).to(tl.int64)
+        write = position > last_position - compress_ratio
+    return write
+
+
+@triton.jit
+def _qwen4_exp_qsa_commit_verify_layers_kernel(
+    raw_addresses,
+    position_addresses,
+    staged_k,
+    logical_positions,
+    recent_locs,
+    position_values,
+    accepted_lengths,
+    head_dim,
+    recent_page_size,
+    verify_width,
+    stride_k_l,
+    stride_pv_n,
+    stride_pv_a,
+    stride_raw_p,
+    stride_raw_s,
+    stride_raw_d,
+    stride_pc_p,
+    COMPRESS_RATIO: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    row = tl.program_id(0)
+    layer = tl.program_id(1)
+    # The accepted trailing window has at most one writer per ring slot.
+    write = _qwen4_exp_qsa_verify_row_mask(
+        logical_positions, accepted_lengths, row, verify_width, COMPRESS_RATIO
+    )
+    loc = tl.load(recent_locs + row).to(tl.int64)
+    write &= loc > 0
+    if write:
+        position = tl.load(logical_positions + row).to(tl.int64)
+        slot = (position % COMPRESS_RATIO + COMPRESS_RATIO) % COMPRESS_RATIO
+        page = loc // recent_page_size
+        dim_offsets = tl.arange(0, BLOCK_D)
+        dim_mask = dim_offsets < head_dim
+        values = tl.load(
+            staged_k + layer.to(tl.int64) * stride_k_l + row * head_dim + dim_offsets,
+            mask=dim_mask,
+            other=0.0,
+        )
+        raw_ptr = tl.cast(tl.load(raw_addresses + layer), tl.pointer_type(tl.bfloat16))
+        tl.store(
+            raw_ptr
+            + page * stride_raw_p
+            + slot * stride_raw_s
+            + dim_offsets * stride_raw_d,
+            values.to(tl.bfloat16),
+            mask=dim_mask,
+        )
+        if slot == 0:
+            axes = tl.arange(0, 4)
+            axis_mask = axes < 3
+            rope_positions = tl.load(
+                position_values + row * stride_pv_n + axes * stride_pv_a,
+                mask=axis_mask,
+                other=0,
+            )
+            position_ptr = tl.cast(
+                tl.load(position_addresses + layer), tl.pointer_type(tl.int64)
+            )
+            tl.store(
+                position_ptr + page * stride_pc_p + axes,
+                rope_positions,
+                mask=axis_mask,
+            )
+
+
+def qwen4_exp_qsa_commit_verify_layers(
+    raw_addresses: torch.Tensor,
+    position_addresses: torch.Tensor,
+    staged_k: torch.Tensor,
+    logical_positions: torch.Tensor,
+    recent_locs: torch.Tensor,
+    position_values: torch.Tensor,
+    accepted_lengths: torch.Tensor,
+    raw_cache: torch.Tensor,
+    position_cache: torch.Tensor,
+    recent_page_size: int,
+    compress_ratio: int,
+    *,
+    verify_width: int,
+) -> None:
+    """Commit accepted target-verify raw keys into every QSA layer at once.
+
+    The layer-dependent keys arrive as one contiguous layer-major staging
+    tensor. Logical positions, recent-cache locations, and RoPE positions are
+    shared by every layer; destination fields are supplied as address tables.
+
+    Args:
+        raw_addresses: CUDA uint64 base address for each raw-key cache field.
+        position_addresses: CUDA uint64 base address for each position field.
+        staged_k: Keys shaped ``[layers, capacity, width, 1, head_dim]`` in
+            the model's floating-point dtype. Loads use that dtype and stores
+            convert to the raw-key cache's fixed bfloat16 format.
+        logical_positions: Consecutive logical positions within each request,
+            in request-major order.
+        recent_locs: Recent-cache locations for live rows.
+        position_values: RoPE positions shaped ``[rows, 3]``.
+        accepted_lengths: Accepted width for each request.
+        raw_cache: One raw-key field used as the stride and dtype donor.
+        position_cache: One position field used as the stride and dtype donor.
+        recent_page_size: Rows covered by one recent-cache page.
+        compress_ratio: Tokens grouped into one compressed entry.
+        verify_width: Candidate width per request.
+
+    Returns:
+        None.
+    """
+
+    num_layers = raw_addresses.numel()
+    rows = logical_positions.shape[0]
+    if num_layers == 0 or not rows:
+        return
+    if position_addresses.numel() != num_layers:
+        raise ValueError(
+            "Qwen4-Exp QSA batched verify commit needs one address per layer "
+            "in both destination tables"
+        )
+    if raw_addresses.dtype != torch.uint64 or position_addresses.dtype != torch.uint64:
+        raise ValueError("QSA cache field address tables must have dtype torch.uint64")
+    if staged_k.shape[0] != num_layers:
+        raise ValueError(
+            "QSA staged keys must hold exactly one layer block per address"
+        )
+    if verify_width < 1 or rows % verify_width:
+        raise ValueError("QSA verify rows must be a positive multiple of verify_width")
+    if accepted_lengths.shape[0] != rows // verify_width:
+        raise ValueError(
+            "QSA batched verify commits need one accepted length per request"
+        )
+    head_dim = staged_k.shape[-1]
+    if staged_k.ndim != 5 or tuple(staged_k.shape[2:]) != (
+        verify_width,
+        1,
+        head_dim,
+    ):
+        raise ValueError(
+            "QSA staged keys must be shaped "
+            "[num_layers, bucket_rows, verify_width, 1, head_dim]"
+        )
+    if not staged_k.is_contiguous():
+        raise ValueError(
+            "QSA staged keys must be contiguous so one layer stride addresses "
+            "every row"
+        )
+    if rows > staged_k.shape[1] * verify_width:
+        raise ValueError(
+            "QSA staged keys bucket covers fewer rows than this verify commit "
+            f"needs: {staged_k.shape[1]} x {verify_width} for {rows} rows"
+        )
+    if raw_cache.dtype != torch.bfloat16:
+        raise ValueError("QSA raw-key cache fields must be bfloat16")
+    if position_cache.dtype != torch.int64:
+        raise ValueError("QSA RoPE position cache fields must be int64")
+    if raw_cache.shape[-1] != head_dim or raw_cache.shape[1] != compress_ratio:
+        raise ValueError(
+            "QSA raw-key cache geometry disagrees with the staged keys or the "
+            "compression ratio"
+        )
+    if position_values.shape[0] != rows or recent_locs.shape[0] != rows:
+        raise ValueError(
+            "QSA batched verify commit needs one shared row per staged row"
+        )
+
+    _qwen4_exp_qsa_commit_verify_layers_kernel[(rows, num_layers)](
+        raw_addresses,
+        position_addresses,
+        staged_k,
+        logical_positions,
+        recent_locs,
+        position_values,
+        accepted_lengths,
+        head_dim,
+        recent_page_size,
+        verify_width,
+        staged_k.stride(0),
+        position_values.stride(0),
+        position_values.stride(1),
+        raw_cache.stride(0),
+        raw_cache.stride(1),
+        raw_cache.stride(-1),
+        position_cache.stride(0),
+        COMPRESS_RATIO=compress_ratio,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        num_warps=4,
+    )
+
+
+@triton.jit
 def _qwen4_exp_qsa_pad_keys_to_topk(
     keys, BLOCK_TOPK: tl.constexpr, BLOCK_N: tl.constexpr
 ):
@@ -1189,7 +1392,6 @@ def _qwen4_exp_qsa_stream_block_topk_kernel(
     head_dim,
     num_blocks,
     page_size,
-    page_expansion,
     blocks_per_split,
     stride_q_n,
     stride_q_h,
@@ -1234,14 +1436,11 @@ def _qwen4_exp_qsa_stream_block_topk_kernel(
         tile_mask = block_ids < block_end
         columns = block_ids // page_size
         offsets = block_ids % page_size
-        # Page tables live at consumer granularity; entry ``col * expansion``
-        # maps back to one logical compressed page.
         pages = tl.load(
-            page_table + request * stride_pt_b + columns * page_expansion,
+            page_table + request * stride_pt_b + columns,
             mask=tile_mask,
             other=0,
         ).to(tl.int64)
-        pages = pages // page_expansion
         slots = pages * page_size + offsets
         keys = tl.load(
             key_cache + slots[None, :] * stride_k_n + dim_offsets[:, None] * stride_k_d,
@@ -1401,7 +1600,6 @@ def _qwen4_exp_qsa_score_blocks_kernel(
     head_dim,
     num_blocks,
     page_size,
-    page_expansion,
     stride_q_n,
     stride_q_h,
     stride_q_d,
@@ -1434,14 +1632,11 @@ def _qwen4_exp_qsa_score_blocks_kernel(
     tile_mask = block_ids < num_blocks
     columns = block_ids // page_size
     offsets = block_ids % page_size
-    # Page tables live at consumer granularity; entry ``col * expansion``
-    # maps back to one logical compressed page.
     pages = tl.load(
-        page_table + request * stride_pt_b + columns * page_expansion,
+        page_table + request * stride_pt_b + columns,
         mask=tile_mask,
         other=0,
     ).to(tl.int64)
-    pages = pages // page_expansion
     slots = pages * page_size + offsets
     valid = tile_mask & (block_ids < complete)
     keys = tl.load(
@@ -1469,7 +1664,6 @@ def _qwen4_exp_qsa_block_topk_stream(
     *,
     page_size: int,
     block_topk: int,
-    page_expansion: int,
     max_partial_bytes: int,
     enable_pdl: bool = True,
 ) -> torch.Tensor:
@@ -1483,7 +1677,7 @@ def _qwen4_exp_qsa_block_topk_stream(
     """
 
     rows = query.shape[0]
-    num_blocks = triton.cdiv(page_table.shape[1], page_expansion) * page_size
+    num_blocks = page_table.shape[1] * page_size
     if rows == 0 or num_blocks == 0:
         return torch.full(
             (rows, block_topk), -1, dtype=torch.int32, device=query.device
@@ -1528,7 +1722,6 @@ def _qwen4_exp_qsa_block_topk_stream(
         query.shape[2],
         num_blocks,
         page_size,
-        page_expansion,
         blocks_per_split,
         query.stride(0),
         query.stride(1),
@@ -1612,7 +1805,6 @@ def _qwen4_exp_qsa_block_topk_logits(
     *,
     page_size: int,
     block_topk: int,
-    page_expansion: int,
     persistent_topk_workspace: torch.Tensor | None,
     enable_pdl: bool = True,
 ) -> torch.Tensor:
@@ -1628,7 +1820,7 @@ def _qwen4_exp_qsa_block_topk_logits(
     """
 
     rows = query.shape[0]
-    num_blocks = triton.cdiv(page_table.shape[1], page_expansion) * page_size
+    num_blocks = page_table.shape[1] * page_size
     logits = torch.empty((rows, num_blocks), dtype=torch.float32, device=query.device)
     use_pdl = _is_nvidia and enable_pdl
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
@@ -1643,7 +1835,6 @@ def _qwen4_exp_qsa_block_topk_logits(
         query.shape[2],
         num_blocks,
         page_size,
-        page_expansion,
         query.stride(0),
         query.stride(1),
         query.stride(2),
@@ -1693,7 +1884,6 @@ def qwen4_exp_qsa_block_topk(
     *,
     page_size: int,
     block_topk: int,
-    page_expansion: int = 1,
     max_partial_bytes: int = 32 * 1024 * 1024,
     solution: str = "stream",
     persistent_topk_workspace: torch.Tensor | None = None,
@@ -1704,15 +1894,13 @@ def qwen4_exp_qsa_block_topk(
     Args:
         query: Query tensor shaped ``[rows, heads, head_dim]``.
         key_cache: Flattened compressed keys shaped ``[slots, 1, head_dim]``.
-        page_table: Page table shaped ``[requests, max_pages]`` stored at
-            consumer granularity.
+        page_table: Raw compressed-cache block ids shaped ``[requests, max_pages]``,
+            with holes and padding normalized to zero; one entry per logical page.
         request_indices: Owning request id per query row.
         complete_blocks: Fully compressed block counts shaped ``[rows]``.
         page_size: Compressed-cache rows covered by one logical page.
         block_topk: Blocks selected per row; must be a power of two and at
             least 64.
-        page_expansion: Consumer page-table entries covered by one logical
-            page.
         max_partial_bytes: Memory budget for the partial top-k buffers
             (``stream`` solution only).
         solution: ``"stream"`` fuses scoring and selection without
@@ -1734,16 +1922,13 @@ def qwen4_exp_qsa_block_topk(
         raise ValueError("Qwen4-Exp QSA block top-k expects rank-three tensors")
     if block_topk < 64 or (block_topk & (block_topk - 1)):
         raise ValueError("Qwen4-Exp QSA block top-k needs a power-of-two topk >= 64")
-    page_expansion = int(page_expansion)
-    if page_expansion < 1:
-        raise ValueError("Qwen4-Exp QSA block top-k needs a positive expansion")
     if solution not in ("stream", "logits"):
         raise ValueError(
             "Qwen4-Exp QSA block top-k solution must be 'stream' or 'logits', "
             f"got {solution!r}"
         )
     rows = query.shape[0]
-    num_blocks = triton.cdiv(page_table.shape[1], page_expansion) * page_size
+    num_blocks = page_table.shape[1] * page_size
     if rows == 0 or num_blocks == 0:
         return torch.full(
             (rows, block_topk), -1, dtype=torch.int32, device=query.device
@@ -1757,7 +1942,6 @@ def qwen4_exp_qsa_block_topk(
             complete_blocks,
             page_size=page_size,
             block_topk=block_topk,
-            page_expansion=page_expansion,
             persistent_topk_workspace=persistent_topk_workspace,
             enable_pdl=enable_pdl,
         )
@@ -1769,7 +1953,6 @@ def qwen4_exp_qsa_block_topk(
         complete_blocks,
         page_size=page_size,
         block_topk=block_topk,
-        page_expansion=page_expansion,
         max_partial_bytes=max_partial_bytes,
         enable_pdl=enable_pdl,
     )

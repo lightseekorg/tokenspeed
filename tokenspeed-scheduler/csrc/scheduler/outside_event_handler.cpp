@@ -46,7 +46,6 @@ void Scheduler::handleEvent(const pd::FailedEvent& event) {
     if (request == nullptr || request->Is<fsm::Finished>()) {
         return;
     }
-    pd_transfer_pins_.erase(event.request_id);
     request->Apply(fsm::AbortEvent{&coordinator_});
 }
 
@@ -58,7 +57,6 @@ void Scheduler::handleEvent(const pd::SucceededEvent& event) {
     if (!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) {
         throw std::logic_error("PD SucceededEvent received in state " + request->StateName());
     }
-    pd_transfer_pins_.erase(event.request_id);
     request->Apply(fsm::FinishEvent{&coordinator_});
 }
 
@@ -71,7 +69,6 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
         if (event.bootstrap_token < 0) {
             throw std::invalid_argument("PD RemotePrefillDoneEvent requires a non-negative bootstrap token");
         }
-        pd_transfer_pins_.erase(event.request_id);
         request->Apply(fsm::RemotePrefillDoneEvent{event.bootstrap_token});
         return;
     }
@@ -83,10 +80,10 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
 }
 
 void Scheduler::handleEvent(const forward::Finish& event) {
-    if (pd_transfer_pins_.contains(event.request_id)) {
-        throw std::logic_error("PD Finish received while transfer pages are pinned");
-    }
     if (Request* request = findRequest(event.request_id)) {
+        if (pdTransferInFlight(*request)) {
+            throw std::logic_error("PD Finish received while transfer pages are pinned");
+        }
         if (request->Is<fsm::PrefillDone>() || request->Is<fsm::Decoding>()) {
             if (auto store = publishCompletedPages(*request)) {
                 pending_write_back_operations_.push_back(std::move(*store));
@@ -113,7 +110,9 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
         std::vector<CacheKey> event_keys =
             registerKvEventPrefixPages(request, progress.prefix_hashes, first_new_prefix_page);
         coordinator_.CacheCompletedBlocks(request.BlockTablesRef(), progress.prefix_hashes, progress.access_epoch,
-                                          first_new_prefix_page, request.TokenSize() - 1, CacheBoundaryKind::kEndpoint);
+                                          first_new_prefix_page, request.TokenSize() - 1, CacheBoundaryKind::kEndpoint,
+                                          /*stream_completed_to_host=*/false,
+                                          request.MaterializedStateBoundaryTokens());
         discardUncachedKvEventPages(event_keys);
     }
     if (!config_.StreamsDeviceCacheToHost()) {
@@ -143,7 +142,6 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
 }
 
 void Scheduler::handleEvent(const forward::Abort& event) {
-    pd_transfer_pins_.erase(event.request_id);
     if (Request* request = findRequest(event.request_id)) {
         request->Apply(fsm::AbortEvent{&coordinator_});
     }

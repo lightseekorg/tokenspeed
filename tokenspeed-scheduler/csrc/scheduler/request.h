@@ -116,6 +116,16 @@ public:
         return std::get_if<State>(&state_);
     }
 
+    // True in every state that owns block tables (the ForwardState family);
+    // Bootstrapping, Submitted, Retracted and Finished hold no pages.
+    bool HoldsPages() const {
+        return std::visit(Overloaded{
+                              [](const std::derived_from<fsm::ForwardState> auto&) { return true; },
+                              [](const auto&) { return false; },
+                          },
+                          state_);
+    }
+
     // Forwards scheduled for this request whose results have not come back.
     // Every state that holds pages answers this; the page-less ones
     // (Submitted, Retracted, Finished) owe nothing by construction.
@@ -174,6 +184,7 @@ public:
     std::vector<BlockTable>& BlockTablesRef() { return forwardState("BlockTablesRef").BlockTables(); }
 
     fsm::CacheProgress CacheProgress() const { return forwardState("CacheProgress").CacheProgressRef(); }
+    std::int32_t MaterializedStateBoundaryTokens() const;
 
     std::int32_t ReserveNumTokensInNextScheduleEvent() const {
         return std::visit(

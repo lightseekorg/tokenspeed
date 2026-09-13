@@ -27,7 +27,7 @@ TokenSpeed-specific behavior explicitly.
 | `--hf-overrides` | JSON model config overrides. |
 | `--host` | HTTP bind host. |
 | `--port` | HTTP bind port. |
-| `--api-key` | API key for the server. |
+| `--api-key` | SMG gateway API key for authorization with upstream workers. |
 | `--chat-template` | Chat template name or path. |
 | `--gpu-memory-utilization` | GPU memory fraction used for weights and KV cache. |
 | `--max-num-seqs` | Maximum concurrent sequences. |

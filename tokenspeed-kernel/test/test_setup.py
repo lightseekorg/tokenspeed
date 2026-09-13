@@ -148,7 +148,7 @@ def test_read_requirements_skips_installer_options_and_cycles(
     ]
 
 
-def test_sdist_includes_requirement_files(tmp_path, monkeypatch) -> None:
+def test_sdist_includes_requirements_and_python_sources(tmp_path, monkeypatch) -> None:
     source = tmp_path / "python"
     dist_dir = tmp_path / "dist"
     shutil.copytree(SETUP_PY.parent, source)
@@ -166,6 +166,10 @@ def test_sdist_includes_requirement_files(tmp_path, monkeypatch) -> None:
     expected_files = {
         f"requirements/{path.name}" for path in REQUIREMENTS_DIR.glob("*.txt")
     }
+    expected_files.update(
+        path.relative_to(source).as_posix()
+        for path in (source / "tokenspeed_kernel").rglob("*.py")
+    )
     assert expected_files <= archived_files
 
 

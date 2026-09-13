@@ -683,19 +683,19 @@ def test_nvidia_kda_verify_and_decode_registration_traits(
 
 
 @pytest.mark.parametrize(
-    "kernel_name",
+    ("kernel_name", "layout"),
     [
-        "triton_nvidia_kda_paged_prefill",
-        "flashkda_nvidia_kda_paged_prefill",
-        "cutedsl_kda_nvidia_paged_prefill",
+        ("triton_nvidia_kda_paged_prefill", "k_major"),
+        ("flashkda_nvidia_kda_paged_prefill", "k_major"),
+        ("cutedsl_kda_nvidia_paged_prefill", "v_major"),
     ],
 )
-def test_nvidia_kda_prefill_kernels_declare_k_major(kernel_name) -> None:
+def test_nvidia_kda_prefill_kernels_declare_native_layout(kernel_name, layout) -> None:
     """kda_paged_prefill relayouts only for kernels that declare a layout;
     a dropped declaration silently hands them the V-major state as-is."""
     spec = KernelRegistry.get().get_by_name(kernel_name)
     assert spec is not None, kernel_name
-    assert spec.traits.get("recurrent_layout") == frozenset({"k_major"}), kernel_name
+    assert spec.traits.get("recurrent_layout") == frozenset({layout}), kernel_name
 
 
 def test_kda_replay_supported_on_the_nvidia_serving_platform(b300_platform) -> None:

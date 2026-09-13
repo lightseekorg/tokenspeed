@@ -42,7 +42,7 @@ CacheKey RealKey(const std::vector<std::int32_t>& tokens, std::uint32_t group_id
 }
 
 TEST(FullAttnManagerTest, ConstructsWithBlockGranularity) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(/*block_granularity=*/4);
     BlockTable table;
     EXPECT_EQ(table.NumBlocks(), 0);
@@ -51,7 +51,7 @@ TEST(FullAttnManagerTest, ConstructsWithBlockGranularity) {
 }
 
 TEST(FullAttnManagerTest, MatchEmptyListReturnsNoHit) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     std::vector<CacheKey> empty_hashes;
     PrefixMatch m = mgr.Match(pool, empty_hashes, 0, static_cast<std::int32_t>(empty_hashes.size()));
@@ -60,7 +60,7 @@ TEST(FullAttnManagerTest, MatchEmptyListReturnsNoHit) {
 }
 
 TEST(FullAttnManagerTest, MatchAllMissReturnsNoHitAndDoesNotChangeRefs) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     std::vector<CacheKey> hashes = {RealKey({1, 2, 3, 4}, 0), RealKey({5, 6, 7, 8}, 0)};
     PrefixMatch m = mgr.Match(pool, hashes, 0, static_cast<std::int32_t>(hashes.size()));
@@ -69,7 +69,7 @@ TEST(FullAttnManagerTest, MatchAllMissReturnsNoHitAndDoesNotChangeRefs) {
 }
 
 TEST(FullAttnManagerTest, ProbeAcceptsTypedCacheKeys) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     const std::vector<CacheKey> keys{
         CacheKey{.group_id = 0, .content_hash = "hash"},
@@ -80,16 +80,16 @@ TEST(FullAttnManagerTest, ProbeAcceptsTypedCacheKeys) {
 }
 
 TEST(FullAttnManagerTest, MatchStopsAtFirstMiss) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     const CacheKey k0 = RealKey({1, 2, 3, 4}, 0);
     const CacheKey k1 = RealKey({5, 6, 7, 8}, 0);
     const CacheKey k2 = RealKey({9, 9, 9, 9}, 0);
 
-    CacheBlockRef a = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef a = pool.AcquireBlock(/*group_id=*/0);
     const std::int32_t a_id = a->Location().lcm_block_id;
     mgr.RegisterCachedBlock(pool, a, k0);
-    CacheBlockRef b = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef b = pool.AcquireBlock(/*group_id=*/0);
     const std::int32_t b_id = b->Location().lcm_block_id;
     mgr.RegisterCachedBlock(pool, b, k1);
     a.reset();
@@ -104,10 +104,10 @@ TEST(FullAttnManagerTest, MatchStopsAtFirstMiss) {
 }
 
 TEST(FullAttnManagerTest, MatchPinsUntilResultDies) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     const CacheKey k0 = RealKey({1, 2, 3, 4}, 0);
-    CacheBlockRef a = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef a = pool.AcquireBlock(/*group_id=*/0);
     mgr.RegisterCachedBlock(pool, a, k0);
     a.reset();
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 7);
@@ -122,10 +122,10 @@ TEST(FullAttnManagerTest, MatchPinsUntilResultDies) {
 }
 
 TEST(FullAttnManagerTest, ClaimHitBlocksClaimsAndAppends) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     const CacheKey k0 = RealKey({1, 2, 3, 4}, 0);
-    CacheBlockRef a = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef a = pool.AcquireBlock(/*group_id=*/0);
     const std::int32_t id = a->Location().lcm_block_id;
     mgr.RegisterCachedBlock(pool, a, k0);
     a.reset();
@@ -144,7 +144,7 @@ TEST(FullAttnManagerTest, ClaimHitBlocksClaimsAndAppends) {
 }
 
 TEST(FullAttnManagerTest, ClaimNoHitsIsNoOp) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     BlockTable table;
     PrefixMatch empty;
@@ -154,7 +154,7 @@ TEST(FullAttnManagerTest, ClaimNoHitsIsNoOp) {
 }
 
 TEST(FullAttnManagerTest, AcquireFillsTailBeforeAllocating) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     BlockTable table;
 
@@ -165,7 +165,7 @@ TEST(FullAttnManagerTest, AcquireFillsTailBeforeAllocating) {
 }
 
 TEST(FullAttnManagerTest, AcquirePartialPageLeavesTailRoom) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     BlockTable table;
 
@@ -175,7 +175,7 @@ TEST(FullAttnManagerTest, AcquirePartialPageLeavesTailRoom) {
 }
 
 TEST(FullAttnManagerTest, AcquireCanReserveFutureTokens) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     BlockTable table;
 
@@ -189,7 +189,7 @@ TEST(FullAttnManagerTest, AcquireCanReserveFutureTokens) {
 }
 
 TEST(FullAttnManagerTest, AcquireUsesTailRoomWithoutNewPage) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     BlockTable table;
 
@@ -201,7 +201,7 @@ TEST(FullAttnManagerTest, AcquireUsesTailRoomWithoutNewPage) {
 }
 
 TEST(FullAttnManagerTest, AcquireSpillsAcrossMultiplePages) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     BlockTable table;
 
@@ -214,7 +214,7 @@ TEST(FullAttnManagerTest, AcquireSpillsAcrossMultiplePages) {
 }
 
 TEST(FullAttnManagerTest, AcquireZeroTokensIsNoOp) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 0));
@@ -223,7 +223,7 @@ TEST(FullAttnManagerTest, AcquireZeroTokensIsNoOp) {
 }
 
 TEST(FullAttnManagerTest, AcquireAllOrNothingOnShortage) {
-    BlockPool pool(2);
+    BlockPool pool(2, {1});
     FullAttnManager mgr(4);
     BlockTable table;
 
@@ -235,7 +235,7 @@ TEST(FullAttnManagerTest, AcquireAllOrNothingOnShortage) {
 }
 
 TEST(FullAttnManagerTest, CacheFullBlocksMakesPagesPrefixHittable) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     const CacheKey k0 = RealKey({1, 2, 3, 4}, 0);
     const CacheKey k1 = RealKey({5, 6, 7, 8}, 0);
@@ -253,7 +253,7 @@ TEST(FullAttnManagerTest, CacheFullBlocksMakesPagesPrefixHittable) {
 }
 
 TEST(FullAttnManagerTest, CacheFullBlocksSkipsTailPage) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     const CacheKey k0 = RealKey({1, 2, 3, 4}, 0);
 
@@ -271,7 +271,7 @@ TEST(FullAttnManagerTest, CacheFullBlocksSkipsTailPage) {
 }
 
 TEST(FullAttnManagerTest, CacheFullBlocksIsIdempotentAcrossCalls) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     const CacheKey k0 = RealKey({1, 2, 3, 4}, 0);
     const CacheKey k1 = RealKey({5, 6, 7, 8}, 0);
@@ -290,7 +290,7 @@ TEST(FullAttnManagerTest, CacheFullBlocksIsIdempotentAcrossCalls) {
 }
 
 TEST(FullAttnManagerTest, FreeReturnsPagesAndClearsTable) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 8));  // 2 pages
@@ -304,7 +304,7 @@ TEST(FullAttnManagerTest, FreeReturnsPagesAndClearsTable) {
 }
 
 TEST(FullAttnManagerTest, FreedCachedPageStaysPrefixReusable) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     const CacheKey k0 = RealKey({1, 2, 3, 4}, 0);
 
@@ -319,7 +319,7 @@ TEST(FullAttnManagerTest, FreedCachedPageStaysPrefixReusable) {
 }
 
 TEST(FullAttnManagerTest, EndToEndTwoRequestsSharePrefix) {
-    BlockPool pool(16);
+    BlockPool pool(16, {1});
     FullAttnManager mgr(4);
     const CacheKey k0 = RealKey({1, 2, 3, 4}, 0);
     const CacheKey k1 = RealKey({5, 6, 7, 8}, 0);
@@ -352,7 +352,7 @@ TEST(FullAttnManagerTest, EndToEndTwoRequestsSharePrefix) {
 }
 
 TEST(FullAttnManagerTest, RejectsKeyForAnotherGroup) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     const CacheKey g0 = RealKey({1, 2, 3, 4}, 0);
     const CacheKey g1 = RealKey({1, 2, 3, 4}, 1);  // same tokens, group 1
@@ -371,10 +371,10 @@ TEST(FullAttnManagerTest, RejectsKeyForAnotherGroup) {
 // Claimed full pages carry no available capacity: the next Acquire must start a fresh
 // page, not consume phantom tail room.
 TEST(FullAttnManagerTest, ClaimThenAcquireStartsFreshPage) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     const CacheKey k0 = RealKey({1, 2, 3, 4}, 0);
-    CacheBlockRef a = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef a = pool.AcquireBlock(/*group_id=*/0);
     mgr.RegisterCachedBlock(pool, a, k0);
     a.reset();
 
@@ -391,7 +391,7 @@ TEST(FullAttnManagerTest, ClaimThenAcquireStartsFreshPage) {
 }
 
 TEST(FullAttnManagerTest, CacheFullBlocksZeroIsNoOp) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     BlockTable a;
     ASSERT_TRUE(mgr.Acquire(pool, a, 4));
@@ -401,7 +401,7 @@ TEST(FullAttnManagerTest, CacheFullBlocksZeroIsNoOp) {
 }
 
 TEST(FullAttnManagerTest, ClaimHitBlocksOnNonEmptyTableAsserts) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 4));  // table now non-empty
@@ -412,7 +412,7 @@ TEST(FullAttnManagerTest, ClaimHitBlocksOnNonEmptyTableAsserts) {
 // The chain links each page's key to the prior page's hash: an identical second
 // page after a different first page yields a different key.
 TEST(FullAttnManagerTest, ChainedPriorPreventsSecondPageCollision) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     FullAttnManager mgr(4);
 
     std::vector<std::int32_t> p_a = {1, 2, 3, 4};
@@ -445,14 +445,14 @@ TEST(FullAttnManagerTest, ChainedPriorPreventsSecondPageCollision) {
 }
 
 TEST(FullAttnManagerLcmTest, ManagerOnlyCacheOwnerRetainsChild) {
-    BlockPool pool(1);
+    BlockPool pool(1, {2});
     FullAttnManager mgr(/*block_granularity=*/4, /*cache_blocks_per_lcm_block=*/2, /*group_id=*/0);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 4));
     const CacheBlockLocation location = table.Blocks().front()->Location();
     const CacheKey key = RealKey({1, 2, 3, 4}, 0);
     const std::uint64_t access_epoch = 1;
-    mgr.Index().RegisterFullBlocks(pool, table, std::vector<CacheKey>{key}, access_epoch);
+    mgr.RegisterFullBlocks(pool, table, std::vector<CacheKey>{key}, access_epoch);
 
     mgr.Free(table);
 
@@ -462,7 +462,7 @@ TEST(FullAttnManagerLcmTest, ManagerOnlyCacheOwnerRetainsChild) {
 }
 
 TEST(FullAttnManagerLcmTest, RequestOnlyUniqueChildIsNotCacheEvictable) {
-    BlockPool pool(1);
+    BlockPool pool(1, {2});
     FullAttnManager mgr(4, 2, 0);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 4));
@@ -472,7 +472,7 @@ TEST(FullAttnManagerLcmTest, RequestOnlyUniqueChildIsNotCacheEvictable) {
 }
 
 TEST(FullAttnManagerLcmTest, ChildEvictionLeavesSiblingLocationValid) {
-    BlockPool pool(1);
+    BlockPool pool(1, {2});
     FullAttnManager mgr(4, 2, 0);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 8));
@@ -480,7 +480,7 @@ TEST(FullAttnManagerLcmTest, ChildEvictionLeavesSiblingLocationValid) {
     const CacheKey second_key = RealKey({5, 6, 7, 8}, 0);
     const CacheBlockLocation sibling = table.Blocks()[1]->Location();
     const std::uint64_t access_epoch = 1;
-    mgr.Index().RegisterFullBlocks(pool, table, std::vector<CacheKey>{first_key, second_key}, access_epoch);
+    mgr.RegisterFullBlocks(pool, table, std::vector<CacheKey>{first_key, second_key}, access_epoch);
     mgr.Free(table);
 
     EXPECT_TRUE(mgr.EvictCachedBlock(pool, CacheBlockLocation{.lcm_block_id = 1, .slot_index = 0}));
@@ -491,13 +491,13 @@ TEST(FullAttnManagerLcmTest, ChildEvictionLeavesSiblingLocationValid) {
 }
 
 TEST(FullAttnManagerLcmTest, PinnedChildBlocksWholeParentEviction) {
-    BlockPool pool(1);
+    BlockPool pool(1, {2});
     FullAttnManager mgr(4, 2, 0);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 8));
     const std::uint64_t access_epoch = 1;
-    mgr.Index().RegisterFullBlocks(
-        pool, table, std::vector<CacheKey>{RealKey({1, 2, 3, 4}, 0), RealKey({5, 6, 7, 8}, 0)}, access_epoch);
+    mgr.RegisterFullBlocks(pool, table, std::vector<CacheKey>{RealKey({1, 2, 3, 4}, 0), RealKey({5, 6, 7, 8}, 0)},
+                           access_epoch);
 
     EXPECT_FALSE(mgr.ParentIsFullyEvictable(pool, 1));
     mgr.Free(table);
@@ -505,12 +505,12 @@ TEST(FullAttnManagerLcmTest, PinnedChildBlocksWholeParentEviction) {
 }
 
 TEST(FullAttnManagerLcmTest, CrossGroupRebindRequiresErasingEveryChildEntry) {
-    BlockPool pool(1);
+    BlockPool pool(1, {2, 8});
     FullAttnManager first_group(4, 2, 0);
     BlockTable table;
     ASSERT_TRUE(first_group.Acquire(pool, table, 8));
     const std::uint64_t access_epoch = 1;
-    first_group.Index().RegisterFullBlocks(
+    first_group.RegisterFullBlocks(
         pool, table, std::vector<CacheKey>{RealKey({1, 2, 3, 4}, 0), RealKey({5, 6, 7, 8}, 0)}, access_epoch);
     first_group.Free(table);
 
@@ -519,13 +519,13 @@ TEST(FullAttnManagerLcmTest, CrossGroupRebindRequiresErasingEveryChildEntry) {
     ASSERT_TRUE(first_group.EvictCachedBlock(pool, CacheBlockLocation{.lcm_block_id = 1, .slot_index = 1}));
     ASSERT_EQ(pool.BoundGroup(1), std::nullopt);
 
-    CacheBlockRef rebound = pool.AcquireBlock(/*group_id=*/1, /*cache_blocks_per_lcm_block=*/8);
+    CacheBlockRef rebound = pool.AcquireBlock(/*group_id=*/1);
     ASSERT_TRUE(rebound);
     EXPECT_EQ(pool.BoundGroup(1), std::optional<std::uint32_t>{1});
 }
 
 TEST(FullAttnManagerLcmTest, DuplicateRegistrationUpdatesEpochWithoutReorderingEntries) {
-    BlockPool pool(2);
+    BlockPool pool(2, {2});
     FullAttnManager mgr(4, 2, 0);
     BlockTable first;
     BlockTable other;
@@ -536,12 +536,12 @@ TEST(FullAttnManagerLcmTest, DuplicateRegistrationUpdatesEpochWithoutReorderingE
     const CacheKey key = RealKey({1, 2, 3, 4}, 0);
     const CacheKey other_key = RealKey({5, 6, 7, 8}, 0);
     std::uint64_t next_access_epoch = 0;
-    mgr.Index().RegisterFullBlocks(pool, first, std::vector<CacheKey>{key}, ++next_access_epoch);
-    mgr.Index().RegisterFullBlocks(pool, other, std::vector<CacheKey>{other_key}, ++next_access_epoch);
+    mgr.RegisterFullBlocks(pool, first, std::vector<CacheKey>{key}, ++next_access_epoch);
+    mgr.RegisterFullBlocks(pool, other, std::vector<CacheKey>{other_key}, ++next_access_epoch);
     const CacheBlockLocation first_location = first.Blocks()[0]->Location();
     const CacheBlockLocation other_location = other.Blocks()[0]->Location();
 
-    mgr.Index().RegisterFullBlocks(pool, duplicate, std::vector<CacheKey>{key}, ++next_access_epoch);
+    mgr.RegisterFullBlocks(pool, duplicate, std::vector<CacheKey>{key}, ++next_access_epoch);
     mgr.Free(first);
     mgr.Free(other);
     mgr.Free(duplicate);
@@ -556,7 +556,7 @@ TEST(FullAttnManagerLcmTest, DuplicateRegistrationUpdatesEpochWithoutReorderingE
 }
 
 TEST(FullAttnManagerLcmTest, NamespaceIsPartOfPrefixIndex) {
-    BlockPool pool(2);
+    BlockPool pool(2, {1});
     FullAttnManager mgr(4, 1, 0);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 8));
@@ -564,7 +564,7 @@ TEST(FullAttnManagerLcmTest, NamespaceIsPartOfPrefixIndex) {
     const CacheKey second{.namespace_id = 2, .group_id = 0, .content_hash = "shared-content"};
     const std::uint64_t access_epoch = 1;
 
-    mgr.Index().RegisterFullBlocks(pool, table, std::vector<CacheKey>{first, second}, access_epoch);
+    mgr.RegisterFullBlocks(pool, table, std::vector<CacheKey>{first, second}, access_epoch);
 
     EXPECT_EQ(mgr.NumCachedBlocks(pool), 2);
     EXPECT_TRUE(mgr.ContainsCachedBlock(pool, first));
@@ -573,11 +573,11 @@ TEST(FullAttnManagerLcmTest, NamespaceIsPartOfPrefixIndex) {
 }
 
 TEST(FullAttnManagerLcmTest, LocationBasedEvictionIsScopedToItsPool) {
-    BlockPool device_pool(1);
-    BlockPool host_pool(1);
+    BlockPool device_pool(1, {1});
+    BlockPool host_pool(1, {1});
     FullAttnManager mgr(4, 1, 0);
-    CacheBlockRef device = device_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
-    CacheBlockRef host = host_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef device = device_pool.AcquireBlock(/*group_id=*/0);
+    CacheBlockRef host = host_pool.AcquireBlock(/*group_id=*/0);
     const CacheBlockLocation shared_location = device->Location();
     ASSERT_EQ(host->Location(), shared_location);
     const CacheKey device_key = RealKey({1, 2, 3, 4}, 0);

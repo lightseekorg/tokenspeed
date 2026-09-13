@@ -32,6 +32,7 @@
 #include "core/token_container.h"
 #include "resource/allocator/req_pool_allocator.h"
 #include "scheduler/request_spec.h"
+#include "utils.h"
 
 namespace tokenspeed::fsm {
 
@@ -44,8 +45,10 @@ struct CacheProgress {
     std::uint64_t access_epoch{0};
     // Pending closed-prefix boundary; zero once published or when absent.
     std::int32_t promotion_boundary_tokens{0};
-    // Whether cache storage for the final state-checkpoint tail was reserved.
-    bool state_checkpoint_tail_reserved{false};
+    // Last aligned state boundary produced by scheduled local prefill. The
+    // ordered forward stream materializes it before subsequent publication.
+    // Decode must not advance this: verify commits only its accepted endpoint.
+    std::int32_t materialized_state_boundary_tokens{0};
 };
 
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,
@@ -115,7 +118,10 @@ struct ForwardState {
     // and the write lands on pages someone else now owns.
     std::int32_t ResultsInFlight() const { return results_in_flight_; }
     void TrackScheduledForward() { ++results_in_flight_; }
-    void ResultLanded() { results_in_flight_ = std::max(0, results_in_flight_ - 1); }
+    void ResultLanded() {
+        FatalCheck(results_in_flight_ > 0, "a forward result landed for a request with no forward in flight");
+        --results_in_flight_;
+    }
     // Carried across a state transition: a transition relabels the request,
     // and the forwards already out do not care what it is called.
     void CarryResultsInFlight(std::int32_t count) { results_in_flight_ = count; }
@@ -153,10 +159,6 @@ struct Prefilling : public ForwardState {
     }
 
     std::int32_t ReserveNumTokensInNextScheduleEvent() const { return reserve_num_tokens_in_next_schedule_event_; }
-    // The final mamba state checkpoint's pages are already reserved, so this
-    // request's remaining prompt is capacity-safe.
-    bool TailCheckpointReserved() const { return CacheProgressRef().state_checkpoint_tail_reserved; }
-
     TokenContainer::Window window{};
 
 private:

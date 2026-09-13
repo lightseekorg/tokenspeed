@@ -45,7 +45,6 @@ def _stage1_warp_gemv_gluon(
     topk_ids_ptr,  # (num_tokens, topk) int32
     D,
     I_r,
-    num_tokens,
     top_k,
     stride_xm,
     stride_xk,
@@ -133,7 +132,6 @@ def invoke_stage1_warp_decode_gluon(
         topk_ids,
         D,
         I_r,
-        num_tokens,
         topk,
         hidden_states.stride(0),
         hidden_states.stride(1),
@@ -161,7 +159,6 @@ def _stage2_warp_gemv_gluon(
     topk_weights_ptr,  # (num_tokens, topk) float32
     D,
     I_r,
-    num_tokens,
     top_k,
     stride_im,
     stride_ik,
@@ -263,7 +260,6 @@ def invoke_stage2_warp_decode_gluon(
         topk_weights,
         D,
         I_r,
-        num_tokens,
         topk,
         inter_states.stride(0),
         inter_states.stride(1),

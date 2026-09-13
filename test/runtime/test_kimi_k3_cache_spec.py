@@ -214,15 +214,15 @@ def test_non_speculative_kimi_reserves_no_verify_workspace() -> None:
 def test_lcm_parent_demand_uses_per_group_packing() -> None:
     recipe, _, layout = kimi_tp8_layout(max_bs=1, max_scheduled_tokens=8_192)
 
-    # Non-overlap sparse state prefill needs one input and one output block per
-    # KDA group; the next decode allocates its destination after completion.
-    # The search inverts that demand -- what 92 parents admit needs no more,
+    # Non-overlap sparse state prefill needs one input, one cacheable aligned
+    # checkpoint, one final continuation block, and one banked growth block per
+    # KDA group. The search inverts that demand -- what 98 parents admit needs no more,
     # and one parent fewer admits strictly less.
-    assert recipe.parents_needed(layout, 131_072) == 92
-    admitted = recipe.token_capacity(layout, 92)
+    assert recipe.parents_needed(layout, 131_072) == 98
+    admitted = recipe.token_capacity(layout, 98)
     assert admitted >= 131_072
-    assert recipe.parents_needed(layout, admitted) <= 92
-    assert recipe.token_capacity(layout, 91) < admitted
+    assert recipe.parents_needed(layout, admitted) <= 98
+    assert recipe.token_capacity(layout, 97) < admitted
 
 
 def test_sparse_state_parent_demand_tracks_decode_and_overlap_width() -> None:
@@ -239,12 +239,13 @@ def test_sparse_state_parent_demand_tracks_decode_and_overlap_width() -> None:
         overlap_schedule_depth=1,
     )
 
-    # KDA state uses the same two rolling pages with or without overlap. The
-    # small full-attention protection term still fits in the same packed parent.
+    # A full-block decode width plus overlap needs one more growth block per
+    # request and state group (3 requests x 3 groups). The full-attention
+    # protection term still fits in the same packed parent.
     assert (
         overlapped.parents_needed(layout, 131_072)
         - baseline.parents_needed(layout, 131_072)
-        == 0
+        == 9
     )
 
 

@@ -352,14 +352,10 @@ protected:
 
 TEST_F(HybridPrefixPromotionTestSuite, ThirdRequestReusesPromotedStateBoundary) {
     Submit(MakeHybridRequest("seed", 100));
-    const ExecutionPlan seed_body_plan = PlanOnce();
-    const ForwardBatch* seed_body = FindForwardBatch(seed_body_plan);
-    ASSERT_NE(seed_body, nullptr);
-    EXPECT_EQ(seed_body->input_lengths, std::vector<std::int32_t>{10});
-    const ExecutionPlan seed_tail_plan = PlanOnce();
-    const ForwardBatch* seed_tail = FindForwardBatch(seed_tail_plan);
-    ASSERT_NE(seed_tail, nullptr);
-    EXPECT_EQ(seed_tail->input_lengths, std::vector<std::int32_t>{1});
+    const ExecutionPlan seed_plan = PlanOnce();
+    const ForwardBatch* seed = FindForwardBatch(seed_plan);
+    ASSERT_NE(seed, nullptr);
+    EXPECT_EQ(seed->input_lengths, std::vector<std::int32_t>{11});
     SendForwardDone("seed", {900});
     PlanOnce();
     SendFinish("seed");
@@ -371,14 +367,10 @@ TEST_F(HybridPrefixPromotionTestSuite, ThirdRequestReusesPromotedStateBoundary) 
     ASSERT_NE(promotion, nullptr);
     ASSERT_EQ(promotion->request_ids, std::vector<std::string>{"promote"});
     EXPECT_EQ(promotion->input_lengths, std::vector<std::int32_t>{8});
-    const ExecutionPlan promotion_body_plan = PlanOnce();
-    const ForwardBatch* promotion_body = FindForwardBatch(promotion_body_plan);
-    ASSERT_NE(promotion_body, nullptr);
-    EXPECT_EQ(promotion_body->input_lengths, std::vector<std::int32_t>{2});
-    const ExecutionPlan promotion_tail_plan = PlanOnce();
-    const ForwardBatch* promotion_tail = FindForwardBatch(promotion_tail_plan);
-    ASSERT_NE(promotion_tail, nullptr);
-    EXPECT_EQ(promotion_tail->input_lengths, std::vector<std::int32_t>{1});
+    const ExecutionPlan remainder_plan = PlanOnce();
+    const ForwardBatch* remainder = FindForwardBatch(remainder_plan);
+    ASSERT_NE(remainder, nullptr);
+    EXPECT_EQ(remainder->input_lengths, std::vector<std::int32_t>{3});
     SendForwardDone("promote", {901});
     PlanOnce();
     SendFinish("promote");

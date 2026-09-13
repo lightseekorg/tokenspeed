@@ -23,6 +23,5 @@ exec ts serve \
     --speculative-eagle-topk 1 \
     --enable-prefix-caching \
     --disable-kvstore \
-    --enable-cache-report \
     --host 127.0.0.1 \
     --port 8000

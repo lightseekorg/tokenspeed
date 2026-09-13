@@ -87,6 +87,7 @@ if platform.is_nvidia and platform.is_blackwell:
             "support_sinks": frozenset({False}),
             "return_lse": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),
+            "support_skip_softmax": frozenset({False}),
         },
     )
     def fa4_mha_prefill(
@@ -127,7 +128,7 @@ if platform.is_nvidia and platform.is_blackwell:
     @register_kernel(
         "attention",
         "mha_extend_with_kvcache",
-        name="fa4_mha_extend_with_kvcache_cached",
+        name="fa4_mha_extend_with_kvcache",
         solution="fa4",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
@@ -555,6 +556,7 @@ elif platform.is_nvidia and platform.is_hopper:
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
+            "support_skip_softmax": frozenset({False}),
         },
     )
     def fa3_mha_prefill(
@@ -593,7 +595,7 @@ elif platform.is_nvidia and platform.is_hopper:
     @register_kernel(
         "attention",
         "mha_extend_with_kvcache",
-        name="fa3_mha_extend_with_kvcache_cached",
+        name="fa3_mha_extend_with_kvcache",
         solution="fa3",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
@@ -656,7 +658,7 @@ elif platform.is_nvidia and platform.is_hopper:
     @register_kernel(
         "attention",
         "mha_decode_with_kvcache",
-        name="fa3_mha_decode_with_kvcache_cached",
+        name="fa3_mha_decode_with_kvcache",
         solution="fa3",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),

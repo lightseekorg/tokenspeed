@@ -6,9 +6,6 @@ TokenSpeed is a speed-of-light LLM inference engine designed for **agentic workl
 
 Core components:
 
-- **Modeling layer**: local-SPMD design with a static compiler that generates
-  collective communication from module-boundary placement annotations, so users
-  do not hand-write parallelism logic.
 - **Scheduler**: C++ control plane and Python execution plane. Request
   lifecycle, KV cache ownership, and overlap timing are encoded as a
   finite-state machine, with safe KV resource reuse enforced by the type system at compile time.
@@ -25,6 +22,8 @@ TokenSpeed takes a fundamentally different architectural approach from existing 
 > TokenSpeed is an open source LLM inference engine and the first to separate the control plane from the execution plane. The control plane is implemented in C++ as a finite-state machine, using the type system to enforce safe resource management, including request lifecycles and KV cache state, at compile time rather than runtime. The execution plane is implemented in Python, enabling fast iteration and lowering the cognitive load for researchers and engineers. This architecture combines strong correctness guarantees in the core scheduling system with the development velocity of a high-level execution layer.
 >
 > TokenSpeed also treats kernels as a first-class, modular subsystem, separating them from the core engine through a portable public API, centralized registry and selection model, and an extensible plugin mechanism for heterogeneous accelerators.
+
+More importantly, TokenSpeed is the **Switzerland** of open-source LLM inference engines: neutral because it's backed by the non-profit [LightSeek Foundation](https://lightseek.org/) rather than a commercial company, with **serious hardware and engineering support** from vendors like NVIDIA and AMD.
 
 ## News
 

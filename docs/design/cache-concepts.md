@@ -86,6 +86,34 @@ A fourth quantity lives outside the logical world entirely:
   KV-cache-based attention (as paged KV entries) and by state-based attention
   (as a state slot). The view is defined by the consumer, not by the block.
 
+`BlockPool` owns the physical placement indexes: the FIFO of empty LCM blocks,
+the free child-slot count for each cache group, and the ordered set of partially
+filled LCM blocks for that group. C++ group ids are dense scheduler indices, so
+the scheduler supplies the complete packing vector when it constructs each
+pool. The per-group placement records form a vector indexed by group id, and
+each `GroupPlacement` stores immutable slots-per-parent geometry. It updates its
+free-slot count, bound-parent count and partial-parent index together on every
+occupancy transition. A parent with zero occupants is unbound, so its capacity
+belongs to the global empty-parent FIFO rather than any group.
+
+The pool knows which child slots are occupied, never who holds them. Whether a
+child is pinned by a request table, published by a prefix-cache entry, or held
+by an in-flight transfer is a `CacheBlockRef` ownership fact that lives with
+the holders; the pool does not track it, and `CacheBlockRef` does not report
+it. Anything that needs "held only by the cache" asks `PrefixCacheIndex`
+(`ParentIsFullyEvictable`), which is a scan and is therefore reserved for
+eviction policy and leak checks, not for per-step accounting.
+
+Admission first checks the indexed free-slot and empty-parent counts. If the
+request fits, it does not enumerate eviction candidates. Under memory pressure,
+it enumerates candidates and keeps shadow occupancy only for the parents whose
+children it tentatively evicts. This makes the common zero-eviction path scale
+with cache groups and request demand rather than total cache capacity.
+
+The per-step page gauge composes two O(1)-or-cheaper quantities the same way:
+empty parents come from the pool, active parents from the live requests' block
+tables, and cache-only residency is the remainder `total - empty - active`.
+
 ## Who is allowed to see what
 
 ### C++ scheduler: schedules in logical units
@@ -151,18 +179,82 @@ entry *values*, however, are **`CacheBlock` ids** — handles to the physical
 storage the cache layer allocated. The scheduler owns allocation, so its output names that storage directly.
 Consumers outside the cache layer treat the ids as opaque.
 
+#### Snapshot-state prefill checkpoints
+
 Logical width does not imply dense physical residency. Full-history KV and
 retained sliding-window rows materialize every block their kernels read, but a
-full-history snapshot-state prefill normally needs only its input and final
-output checkpoints. With prefix caching and an off-page final tail, the aligned
-body materializes its endpoint and atomically reserves the tail storage; the
-tail consumes that reservation instead of materializing another sparse input
-checkpoint. The next decode admission allocates its destination after prefill
-scheduling and rolls the expired input page forward, including under overlap
+full-history snapshot-state prefill normally needs only its input, aligned
+prefix output, and final continuation checkpoints. When the extent contains an
+internal checkpoint, one forward materializes it and the final output, with
+capacity for both secured at admission. A completing forward on a decoding
+role also reserves growth storage, which is not an additional computed state
+([Scheduler §1.2](scheduler.md#12-state-checkpoints-one-forward)). The next
+decode admission rolls the expired input block forward, including under overlap
 scheduling. The table keeps absolute slot positions while representing other
-skipped intermediate checkpoints as null holes (`0`). State consumers may
-gather only the declared input/output slots; compacting the row or publishing an
-unwritten intermediate checkpoint would break position identity.
+skipped intermediate checkpoints as null holes (`0`). State consumers may gather only the declared
+input/output slots; compacting the row or publishing an unwritten intermediate
+checkpoint would break position identity.
+
+Publication requires provenance, not just an allocated block or completed hash.
+The request's cache progress records the last aligned boundary materialized by
+local prefill, carried through the same ordered-forward contract as its token
+progress. Decode does not advance that record: verification commits only the
+accepted endpoint and may skip an aligned boundary. Admission, finish and
+retraction pass this provenance to the coordinator. A snapshot is publishable
+only when the exact accepted endpoint equals the hashed boundary, or that exact
+boundary has prefill materialization provenance. The conservative admission
+frontier (which subtracts the verify width) is not an exact state endpoint.
+Remote endpoint-only landings
+do not claim an internal prefill checkpoint.
+
+Snapshot selection and slot addressing are distinct even within this mapping:
+the last internal reusable checkpoint is at
+`floor(after / prefix_granularity) * prefix_granularity`, strictly between
+`before` and `after`. Its slot is `(checkpoint - 1) / block_granularity`.
+The two granularities need not be equal. Selecting the snapshot by a smaller
+state-group span would leave the prefix-boundary state unwritten while the
+coordinator publishes it. With smaller state blocks, admission also accounts
+for the whole materialized suffix through the endpoint and its reserve.
+
+When an extend materializes internal state checkpoints, convolution windows
+are assembled directly into their destination blocks by the kernel package.
+The prefill path calls that batched write before causal convolution updates
+the final continuation state; no write is needed without an internal checkpoint.
+At most one internal checkpoint per eligible request is selected. Its token
+position and packed-prefix metadata are computed once on the host; the GPU
+views share one immutable, pinned asynchronous upload. The reusable
+`runtime.utils.tensor.upload_packed` helper aligns each typed view and owns a
+fresh staging buffer per call, so preparing the next forward cannot overwrite
+an upload still in flight. Checkpoint writers widen page IDs to int64 before
+multiplying by pool strides; an int32 page ID can address an element offset
+beyond the int32 range. Decode has no such batch
+and does not compute checkpoint indices. Recurrent execution partitions the
+batch into a body scan and a tail scan when an internal checkpoint is needed.
+Otherwise the ordinary prefill scan runs once. `_run_prefill_recurrent` owns
+both cases and always returns outputs and final states; its caller writes the
+final states to the continuation blocks. Target verification remains separate.
+Every request in a checkpoint
+batch participates in the body: rows crossing a checkpoint stop at that
+boundary, while other rows run to completion. Only crossing rows enter the
+packed tail scan, initialized directly
+from their body final states. Body and tail outputs are scattered back to
+original token order, so every token is evaluated exactly once while the aligned
+and final states are both retained. Batch size one uses zero-copy body/tail
+views; larger batches use the same batched pack/scatter contract. This split
+does not change cache ownership or scheduler metadata.
+
+The body/tail split uses the existing prefill-op state-layout contract. KDA
+solutions may retain their original K-major Python adapters; the kernel facade
+converts between that layout and the runtime's V-major state slab on both scans.
+Native-layout adapter entry points are not required for checkpoint continuation.
+KDA's int64 sequence boundaries are still prepared once in runtime metadata and
+reused by the original adapters. Preparation uses `Tensor.to(torch.int64)`;
+an already-int64 boundary is returned unchanged without allocating a copy.
+
+Scan results may be transposed views in that public state layout. The batched
+input packer addresses recurrent-state rows and features using their actual
+strides, including on CUDA graph replay; it does not require an extra
+contiguous copy or a different kernel adapter.
 
 Speculative KDA verification stores no per-position recurrent states: it
 captures each window's raw projections in a compact payload and commits by
@@ -189,9 +281,11 @@ Provenance discipline: each quantity is sourced from its own domain and never
 laundered through another's name. The contract's `prefix_granularity` comes
 from the memory plan, not read back out of pool state. The arena carries
 **two** scalars with distinct roles: `CacheArena.prefix_granularity` is the
-identity grain, used only for contract publication and plan-consistency
-checks — `prefix_granularity` exists to compute prefix hits, and runtime
-arithmetic must not reach for it; `CacheArena.kv_page_size` is the KV arena
+identity grain, used for contract publication and plan-consistency checks.
+The state-checkpoint mapping point additionally uses the contract's identity
+grain to select the snapshot required for prefix reuse; this is not kernel
+geometry. Other runtime arithmetic must not reach for it.
+`CacheArena.kv_page_size` is the KV arena
 page span that paged-KV geometry math (row views, slot↔page arithmetic,
 scale-tile branching) reads. Both derive from the one plan, which is the
 single point of the prefix-page ↔ KV-page convention.
@@ -210,6 +304,15 @@ later attention-buffer accessor is too late: the side-cache kernels would
 already be racing the asynchronous H2D restore. Place the fence immediately
 before the first cache-field access so independent projections can still
 overlap the load.
+
+A batched post-verification commit is the one side-cache writer that issues no
+fence of its own. It moves every bound layer's fields in a single launch, so it
+cannot fence per layer, and it relies on two invariants instead: it runs after
+the whole model forward, by which point every bound layer has already fenced
+this step in its own forward, and under pipeline parallelism only the layers
+this rank forwards are bound to it. Moving such a commit earlier than the end of
+the forward, or binding layers the rank does not forward, breaks the fence
+guarantee without any call site visibly dropping a wait.
 
 The Host-transfer workspace resolves transport capability for its buffer
 binding before publishing consumer waits. NVIDIA mapped-Host transfers can
@@ -342,7 +445,10 @@ Perception rules per directory:
   `CacheBlock` index, extracted from the old `GroupAllocator`. It owns
   register/lookup/evict/pin (`Register`, `RegisterFullBlocks`, `Contains`,
   `Find`, `Evict`, `AcquireMatched`, eviction metadata). Indices are
-  pool-scoped: one index serves both the Device and Host tiers of its group.
+  pool-scoped: one index serves both the Device and Host tiers of its group. A
+  cache entry is metadata plus an owning `CacheBlockRef` that publishes an
+  existing block for reuse; registration neither allocates nor copies physical
+  storage.
 * **`PrefixMatcher`** (`prefix_matcher.h`) — the per-attention-kind match
   policy, extracted from the old manager subclasses. `FullAttnMatcher` walks
   left-to-right until the first miss (prefix-closed); `SwaMatcher` scans
@@ -377,7 +483,12 @@ The conversion is `GroupGeometry` in the coordinator layer:
 
 Where reclaim needs to know whether a block is still cached, it takes the
 group's `PrefixCacheIndex` as an explicit read-only parameter — the
-dependency is visible in the signature, not hidden in shared state.
+dependency is visible in the signature, not hidden in shared state. The
+reverse direction is symmetric: publishing a table's completed blocks may
+replace one with the key's existing canonical block, and that write goes
+through a mutable window the allocator hands out
+(`GroupAllocator::BlocksToPublish`) to `PrefixCacheIndex::RegisterFullBlocks`.
+The index never sees a `BlockTable`; the allocator remains its only mutator.
 
 ## The coordinator layer (`csrc/cache/coordinator/`)
 
@@ -622,7 +733,11 @@ Its responsibilities:
   ranking retraction (preemption) victims.
 * **Mutation reporting.** `SetCacheMutationSink` reports per-group cache
   insertions/removals; the scheduler folds them into one externally visible
-  prefix event.
+  prefix event. Whether a scheduler-level boundary is fully, partially or not
+  resident is the coordinator's answer (`DeviceBoundaryResidency`, read off
+  the group indexes), so the scheduler keeps no residency counters of its own
+  — only the token descriptor the event carries and whether that event is
+  currently out.
 For L3 write-through, each lane carries only its own hashed Host destinations.
 Its CUDA completion starts those backups, and its scheduler ACK waits until
 those puts finish; a different lane completing cannot release its pages.
@@ -758,6 +873,39 @@ the escalating admission headroom each retraction adds to the victim's next
 admission. The protocol — victim choice, readmission order, why the release
 is safe before the L2 snapshot copies — is `scheduler.md` §2 and §4.
 
+## Sparse indexers: model weights, backend dispatch and verification
+
+* The **model** owns indexer weights and top-k selection, passing
+  `topk_indices` through `PagedAttention.forward` to the backend.
+* The **full-attention backend** owns attention dispatch and full-KV cache
+  addressing. `CacheGroupRouter` expands only the groups served by attention
+  leaves; QSA's compressed/recent history groups are separate consumers.
+* **`QSAIndexerBackend`** owns those two groups' raw block tables, query
+  lengths and transient verification workspace. It uses the shared table
+  fill at expansion ratio one, preserving block ids and clearing padding,
+  and borrows the full-KV address view from the router. Its private
+  `QSAVerifyState` exists only for a speculative target with local QSA fields.
+* **`Qwen4ExpBackend`** composes an attention backend with optional PLE and
+  indexer consumers. Its attention child uses the ordinary hybrid only for
+  views with GDN layers; draft views have neither GDN nor PLE.
+  The runner's existing post-verify calls dispatch once
+  to their respective children; the root neither allocates verify tensors
+  nor registers or looks up QSA state. PLE owns its checkpoint metadata
+  independently of Mamba and shares only the checkpoint arithmetic. See the
+  [execution lifecycle](unified_path.md#backend-package-layout).
+
+LCM owns persistent allocation, prefix matching, transfer and retention,
+including QSA's full-KV, compressed and recent cache groups. Verify-state layer
+ownership and cache addresses come from the bound plan's layer window,
+including under PP and target/draft sharing. Cache recipes reserve verify
+workspace before sizing the arena.
+
+Qwen4-Exp selects its cache recipe by model family, including targets with
+only full-attention layers. PLE and QSA fields and their verify budget do
+not require a GDN component. Recurrent shapes and replay settings are read
+only when that component exists; a recurrent layer label without matching
+linear-attention geometry still fails during recipe construction.
+
 ## Code placement
 
 * Prefix-matching code (prefix hashing, match/lookup, reuse boundaries) lives
@@ -824,7 +972,9 @@ Enforced:
   between them (P divisibility, PD transfer policy, one-cache-block chunks for
   a recurrent-state group). The `Scheduler` runs it before constructing any
   member, because the pools and the coordinator assert on the same fields and
-  would otherwise preempt the diagnostic. Consequently `MakeSpecsFromConfig`
+  would otherwise preempt the diagnostic. Python callers must also pass
+  `Scheduler(config)` explicitly; the binding retains no module-lifetime
+  default configuration. Consequently `MakeSpecsFromConfig`
   is pure translation — it validates nothing;
 * the scheduler layer **transports** `cache_blocks_per_lcm_block` rather than
   reasoning with it. It appears in `csrc/scheduler/` only as a config field
@@ -895,12 +1045,15 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   refuses a sliding `State` group at the bridge).
 * Group consumption is claimed positively, from one declaration: each
   consumer takes exactly the delivered `block_tables` entries for the
-  groups it serves — the router builds one leaf per paged (history-family)
-  group of its bound pool view and fails a live batch missing any of them;
-  state consumers (Mamba/KDA, Inkling conv) index the dict by their own
-  group ids, as does the V4 backend for the several history groups one V4
-  layer reads at once (its pool view reports no `PagedAttention` binding
-  and no router leaf). `cache_consumer_families` remains the boot-time coverage
+  groups it serves. The router builds a leaf for each claimed attention
+  group and fails a live batch missing any of them. QSA's indexer claims
+  its compressed/recent history groups separately; it does not instantiate
+  attention leaves for them. State consumers (Mamba/KDA, PLE, Inkling conv)
+  index the dict by their own group ids, as does the V4 backend for the
+  several history groups one V4 layer reads at once (its pool view reports
+  no `PagedAttention` binding and no router leaf). Mamba's group set comes from
+  its recurrent fields, so a PLE checkpoint group cannot arm its verify
+  state. `cache_consumer_families` remains the boot-time coverage
   declaration (`validate_scheduler_config`). Extra delivered groups ride
   through untouched; a table for a group the bound pool never published
   fails loudly.
@@ -916,6 +1069,10 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   kernel pages out, one expand launch per group. Models and the runner never
   compute locations — `write_locations(layer, mode)` is the single accessor
   (`unified_path.md`, "Write locations have one owner").
+  QSA's indexer reuses `GroupTableStacks` with `kernel_page_size` equal to
+  each group's `block_granularity`. This ratio-one fill copies stable raw
+  table views and clears holes/padding; it does not add another subdivision
+  convention or derive its addresses through a dummy attention leaf.
 * The slot *arithmetic* itself lives in the mapping layer in exactly two
   spellings of one invariant (`table[req, pos // P] * P + pos % P`, which
   is page-size invariant): the router's stacked window/span math
@@ -963,9 +1120,10 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   GSM8K 1319-question sweep: nospec 0.9651, DSpark 0.9629). ✓
 * Two arena scalars, two roles, both derived from the plan:
   `CacheArena.prefix_granularity` (identity grain; contract publication and
-  plan checks only) and `CacheArena.kv_page_size` (KV arena geometry, read by
-  row/slot/tile math in the paged pools and their consumers). Prefix-hit
-  computation is the only computational consumer of `prefix_granularity`. ✓
+  plan checks) and `CacheArena.kv_page_size` (KV arena geometry, read by
+  row/slot/tile math in the paged pools and their consumers). Prefix reuse
+  also requires the state-checkpoint mapping point to select the snapshot
+  at the contract's prefix boundary, independently of its state-block span. ✓
 * Cache geometry has one owner and no mirrors. `CacheArena` holds the
   allocation, the field views, the plan, the contract and the geometry
   scalars; `CachePool` is a typed layer window that forwards nothing, so

@@ -98,14 +98,6 @@ class TestAttentionBackendChoices(unittest.TestCase):
             ):
                 parser.parse_args(["--model", "x", flag, "bogus"])
 
-    def test_inline_detokenizer_flag_removed_from_cli(self):
-        parser = self._build_parser()
-        with (
-            contextlib.redirect_stderr(io.StringIO()),
-            self.assertRaises(SystemExit),
-        ):
-            parser.parse_args(["--model", "x", "--enable-inline-detokenizer"])
-
     def test_inline_detokenizer_is_forced_on(self):
         args = prepare_server_args(["--model", "x"])
         self.assertTrue(args.enable_inline_detokenizer)
@@ -293,6 +285,7 @@ class TestAttentionBackendChoices(unittest.TestCase):
             speculative_num_steps=3,
             speculative_num_draft_tokens=4,
             spec_context_pad=12,  # 3 overshoot spans * 4 draft tokens
+            skip_softmax_threshold=0.0,
         )
         model_config = SimpleNamespace(
             hf_config=SimpleNamespace(),
@@ -372,8 +365,6 @@ class TestDecodeHostL2(unittest.TestCase):
         args.disable_kvstore = False
         args.enable_kvstore = False
         args.enable_prefix_caching = False
-        args.kvstore_storage_backend = None
-        args.kvstore_mem_layout = "layer_first"
         args.kvstore_io_backend = "kernel"
 
         args._handle_kvstore()
@@ -394,20 +385,18 @@ class TestL3StorageBackend(unittest.TestCase):
         self.assertIsNotNone(action)
         self.assertEqual(set(action.choices), {"mooncake", "memory"})
 
-    def test_memory_backend_keeps_host_layout_and_io(self):
+    def test_memory_backend_keeps_host_io(self):
         args = object.__new__(ServerArgs)
         args.disaggregation_mode = "null"
         args.disable_kvstore = False
         args.enable_kvstore = False
         args.enable_prefix_caching = True
         args.kvstore_storage_backend = "memory"
-        args.kvstore_mem_layout = "layer_first"
         args.kvstore_io_backend = "direct"
 
         args._handle_kvstore()
 
         self.assertTrue(args.enable_kvstore)
-        self.assertEqual(args.kvstore_mem_layout, "layer_first")
         self.assertEqual(args.kvstore_io_backend, "direct")
 
     def test_l3_requires_host_l2(self):
@@ -417,27 +406,24 @@ class TestL3StorageBackend(unittest.TestCase):
         args.enable_kvstore = False
         args.enable_prefix_caching = True
         args.kvstore_storage_backend = "mooncake"
-        args.kvstore_mem_layout = "layer_first"
         args.kvstore_io_backend = "direct"
 
         with self.assertRaisesRegex(ValueError, "requires Host L2"):
             args._handle_kvstore()
 
-    def test_mooncake_backend_switches_layout(self):
+    def test_mooncake_backend_keeps_host_io(self):
         args = object.__new__(ServerArgs)
         args.disaggregation_mode = "null"
         args.disable_kvstore = False
         args.enable_kvstore = False
         args.enable_prefix_caching = True
         args.kvstore_storage_backend = "mooncake"
-        args.kvstore_mem_layout = "layer_first"
         args.kvstore_io_backend = "direct"
 
         args._handle_kvstore()
 
         self.assertTrue(args.enable_kvstore)
-        self.assertEqual(args.kvstore_mem_layout, "page_first")
-        self.assertEqual(args.kvstore_io_backend, "kernel")
+        self.assertEqual(args.kvstore_io_backend, "direct")
 
 
 if __name__ == "__main__":

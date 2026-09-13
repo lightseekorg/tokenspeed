@@ -39,8 +39,6 @@ server:
     --comm-fusion-max-num-tokens 4096
     --kvstore-ratio 0.5
     --enable-prefix-caching
-    --enable-cache-report
-    --skip-server-warmup
     --host 127.0.0.1
     --port 8000
   ready:

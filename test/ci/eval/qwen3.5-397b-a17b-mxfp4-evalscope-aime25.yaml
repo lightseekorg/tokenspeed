@@ -24,7 +24,6 @@ server:
     --sampling-backend greedy
     --disable-kvstore
     --kvstore-ratio 0.0
-    --enable-cache-report
     --host 127.0.0.1
     --port 8000
     --policy round_robin

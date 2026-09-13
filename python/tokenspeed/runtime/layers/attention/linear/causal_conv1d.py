@@ -24,10 +24,12 @@
 # SOFTWARE.
 
 
-import numpy as np
 import torch
 import triton
 import triton.language as tl
+from tokenspeed_kernel.ops.attention.gdn.triton import (
+    CausalConv1dPrefillMetadata,
+)
 from tokenspeed_kernel.platform import pdl_enabled
 
 PAD_SLOT_ID = -1
@@ -412,7 +414,8 @@ def causal_conv1d_fn(
     activation: str | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
     validate_data=False,
-    **kwargs,
+    *,
+    prefill_metadata: CausalConv1dPrefillMetadata,
 ):
     """support varlen + continuous batching when x is 2D tensor
 
@@ -453,6 +456,9 @@ def causal_conv1d_fn(
         for example: cache_indices = [pad_slot_id, 1, 20, pad_slot_id]
         in this case, the kernel will not process entries at
         indices 0 and 3
+    prefill_metadata: CausalConv1dPrefillMetadata
+        Read-only program mapping built once with this forward's sequence
+        boundaries and shared by all recurrent-attention layers.
 
     out: same shape as `x`
     """
@@ -461,19 +467,12 @@ def causal_conv1d_fn(
         activation = "silu"
 
     out = torch.empty_like(x)
-    seq_lens_cpu = kwargs.get("seq_lens_cpu")
-    if seq_lens_cpu is not None:
-        seqlens = np.asarray(seq_lens_cpu)
-    else:
-        seqlens = np.diff(query_start_loc.to("cpu"))
-    MAX_NUM_PROGRAMS = 1024
-
-    batch_ptr = torch.full(
-        (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=x.device
-    )  # tracking which seq-idx the Triton program is handling
-    token_chunk_offset_ptr = torch.full(
-        (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=x.device
-    )  # tracking BLOCK_M-based index in the sequence the Triton program is handling
+    batch_ptr = prefill_metadata.batch_indices
+    token_chunk_offset_ptr = prefill_metadata.chunk_offsets
+    if batch_ptr.device != x.device or token_chunk_offset_ptr.device != x.device:
+        raise ValueError("convolution metadata must be on the input device")
+    if batch_ptr.numel() == 0:
+        return out
 
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
     dim, cu_seqlen = x.shape
@@ -534,43 +533,7 @@ def causal_conv1d_fn(
         assert (dim, width) == weight.shape
         assert is_channel_last, "Need to run in channel-last layout"
 
-    def num_program(META, seqlens):
-        nums = -(-seqlens // META["BLOCK_M"])  # ceil-div, numpy array
-        tot = int(nums.sum())
-
-        mlist = np.repeat(np.arange(len(nums)), nums)
-        # offsetlist[i] = local chunk index within its sequence
-        offsetlist = np.arange(tot) - np.repeat(np.cumsum(nums) - nums, nums)
-        mlist_len = mlist.shape[0]
-
-        if META["batch_ptr"].nelement() < mlist_len:
-            newlen = mlist_len + 1
-            META["batch_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
-            META["token_chunk_offset_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
-
-        combined_np = np.stack([mlist, offsetlist]).astype(np.int32, copy=False)
-        combined_cpu = torch.from_numpy(combined_np).pin_memory()
-        META["batch_ptr"][:mlist_len].copy_(combined_cpu[0], non_blocking=True)
-        META["token_chunk_offset_ptr"][:mlist_len].copy_(
-            combined_cpu[1], non_blocking=True
-        )
-
-        META["batch_ptr"] = META["batch_ptr"].to(META["x_ptr"].device)
-        META["token_chunk_offset_ptr"] = META["token_chunk_offset_ptr"].to(
-            META["x_ptr"].device
-        )
-        return tot
-
-    def grid(META):
-        return (
-            num_program(META, seqlens),
-            triton.cdiv(dim, META["BLOCK_N"]),
-        )
-
-    if batch_ptr.device != x.device:
-        batch_ptr = batch_ptr.to(x.device)
-        token_chunk_offset_ptr = token_chunk_offset_ptr.to(x.device)
-
+    grid = (batch_ptr.numel(), triton.cdiv(dim, 256))
     _causal_conv1d_fwd_kernel[grid](
         # Pointers to matrices
         x,
@@ -610,7 +573,7 @@ def causal_conv1d_fn(
         IS_CONTINUOUS_BATCHING=cache_indices is not None,
         USE_PAD_SLOT=pad_slot_id is not None,
         NP2_STATELEN=np2_statelen,
-        BLOCK_M=8,
+        BLOCK_M=prefill_metadata.block_m,
         BLOCK_N=256,
         num_stages=2,
         ENABLE_PDL=enable_pdl,

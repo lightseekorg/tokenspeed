@@ -68,6 +68,7 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
             attn_tp_size=1,
             head_dim=16,
             backend_name="mha",
+            skip_softmax_threshold=0.0,
         )
         return self.MHAAttnBackend(config, spec, kernel_page_size=kernel_page_size)
 
@@ -81,7 +82,13 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
 
         page_sizes = {FULL: 4, SWA: 2}
         leaves = {gid: self._leaf(page_sizes[gid]) for gid in group_ids}
-        router = CacheGroupRouter(None, is_draft=False, spec_num_tokens=1, device="cpu")
+        router = CacheGroupRouter(
+            None,
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=None,
+        )
         router.bind(
             CacheGroupGeometry(
                 granularities={gid: 4 for gid in group_ids},

@@ -564,7 +564,7 @@ def test_replay_planning_matches_allocation_and_rejects_drift():
 
     with pytest.raises(
         RuntimeError,
-        match="planned paged-state verify workspace does not match allocated tensors",
+        match="planned verify workspace does not match allocated tensors",
     ):
         _prepare_verify_workspace(
             server_args=server_args,
@@ -580,10 +580,16 @@ def test_replay_planning_matches_allocation_and_rejects_drift():
 def test_descriptor_binding_rejects_nonuniform_conv_width():
     harness = _Harness(eager_replay=True)
     last = harness.layer_ids[-1]
-    harness.params[last]["conv_weights"] = harness.params[last]["conv_weights"][:, :3]
     harness.prepare_metadata([0], {group: [2] for group in _STATE_GROUPS}, [8 + T])
+    harness.forward(harness.inputs(1, 701), 1)
+    # Verify kernels reject invalid conv widths before descriptor binding.
+    # Rebind directly to exercise the batched descriptor's geometry check.
+    weights = harness.backend._replay_weights[last]
+    weights = (weights[0][:, :3], *weights[1:])
+    harness.backend._replay_weights[last] = weights
+    harness.backend._replay_descriptor_bound.remove(last)
     with pytest.raises(RuntimeError, match="uniform geometry"):
-        harness.forward(harness.inputs(1, 701), 1)
+        harness.backend._bind_replay_descriptor(last, weights)
 
 
 def test_equal_geometry_pool_replacement_rebinds_batched_replay():
@@ -761,7 +767,11 @@ def test_a_rejected_hybrid_rebind_moves_no_child():
         return leaf
 
     router = CacheGroupRouter(
-        leaf_factory, is_draft=False, spec_num_tokens=T, device=DEV
+        leaf_factory,
+        is_draft=False,
+        spec_num_tokens=T,
+        device=DEV,
+        consumed_group_ids=None,
     )
     hybrid = HybridLinearAttnBackend(router, harness.backend, [])
     hybrid.set_cache_pool(harness.pool)
@@ -871,11 +881,6 @@ def test_hybrid_rebinding_reaches_the_state_child():
     full.validate_cache_pool = lambda pool: None
     full.init_prefill_graph_state = lambda max_num_tokens, max_bs: None
     hybrid = HybridLinearAttnBackend(full, harness.backend, [])
-    side_state = SimpleNamespace(
-        dropped=False, commit_after_mtp_verify=lambda *a, **k: None
-    )
-    side_state.drop_verify_scratch = lambda: setattr(side_state, "dropped", True)
-    hybrid.register_speculative_state_backend(side_state)
     share = harness.backend.sparse_topk
     share.prefill = share.decode = object()
 
@@ -890,7 +895,6 @@ def test_hybrid_rebinding_reaches_the_state_child():
     hybrid.set_cache_pool(replacement)
     assert full.cache_pool is replacement
     assert harness.backend.kv_pool is replacement
-    assert side_state.dropped
     assert share.prefill is None and share.decode is None
     assert_no_alias(hybrid, old_slabs)
     assert_no_alias(harness.backend, old_slabs)

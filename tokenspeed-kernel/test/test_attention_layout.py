@@ -111,7 +111,9 @@ def test_attention_implementations_are_grouped_by_variant():
         if path.is_dir() and (path / "__init__.py").is_file()
     }
 
-    assert package_dirs == {
+    # Private checkpoint helpers are shared by the GDN/KDA state backends.
+    shared_helper_packages = {"_triton"}
+    assert package_dirs == shared_helper_packages | {
         "dsa",
         "dsv4",
         "gdn",
@@ -139,7 +141,7 @@ def test_attention_implementations_are_grouped_by_variant():
         "triton",
     }
 
-    for variant in package_dirs:
+    for variant in package_dirs - shared_helper_packages:
         variant_dir = attention_dir / variant
         implementation_modules = {
             path.stem for path in variant_dir.glob("*.py") if path.name != "__init__.py"

@@ -34,6 +34,7 @@ import os
 import socket
 import sys
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -68,11 +69,12 @@ def _inputs(device):
 def _quantized_head(shard, device, logits):
     """A head the production predicate accepts as genuinely quantized.
 
-    Only ``apply`` is stood in for -- with a real packed weight the collective
-    would still be exercised, but the reference would have to model NVFP4
-    rounding. The point here is that the quantized branch survives the real
-    all-gather, not that NVFP4 multiplies correctly.
+    Mock the NVFP4 capability probe during construction and stand in for
+    ``apply`` with precomputed logits. This checks quantized dispatch through
+    the real all-gather on every GPU vendor without requiring an NVFP4 GEMM
+    or modeling its rounding in the reference.
     """
+    import tokenspeed_kernel
     from torch import nn
 
     from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4W4A16LinearMethod
@@ -94,7 +96,10 @@ def _quantized_head(shard, device, logits):
     head.alpha = torch.ones((1,), dtype=torch.float32, device=device)
     head.input_size_per_partition = HIDDEN
     head.output_size_per_partition = shard
-    head.quant_method = Nvfp4W4A16LinearMethod(SimpleNamespace(group_size=16))
+    with mock.patch.object(
+        tokenspeed_kernel, "has_flashinfer_cute_dsl_nvfp4_a16", return_value=True
+    ):
+        head.quant_method = Nvfp4W4A16LinearMethod(SimpleNamespace(group_size=16))
     head.quant_method.apply = lambda layer, x, bias: logits
     return head
 
@@ -227,3 +232,7 @@ def test_a_quantized_head_survives_the_real_collective():
 
 def test_two_ranks_keep_their_candidates_through_a_cuda_graph():
     _run(2, _check_capture_and_replay)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

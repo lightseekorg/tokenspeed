@@ -133,3 +133,7 @@ def test_max_pages_is_not_constexpr(kernel) -> None:
     (the router owns all slot math)."""
     parameter = inspect.signature(kernel.fn).parameters["max_pages"]
     assert parameter.annotation is inspect.Parameter.empty
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

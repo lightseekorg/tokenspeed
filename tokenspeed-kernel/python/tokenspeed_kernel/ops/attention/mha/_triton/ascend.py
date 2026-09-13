@@ -40,13 +40,14 @@ if current_platform().is_npu:
         "sliding_window": frozenset({False}),
         "support_sinks": frozenset({False}),
         "support_logit_cap": frozenset({False}),
+        "support_skip_softmax": frozenset({False}),
         "return_lse": frozenset({False}),
     }
 
     @register_kernel(
         "attention",
         "mha_prefill",
-        name="ascend_mha_prefill",
+        name="torch_npu_mha_prefill",
         solution="torch_npu",
         capability=_CAPABILITY,
         signatures=format_signatures(("q", "k", "v"), "dense", _DTYPES),
@@ -54,13 +55,13 @@ if current_platform().is_npu:
         traits=_OPTIONS,
         tags={"portability"},
     )
-    def mha_prefill(**kwargs):
+    def torch_npu_mha_prefill(**kwargs):
         return _mha_prefill(**kwargs)
 
     @register_kernel(
         "attention",
         "mha_extend_with_kvcache",
-        name="ascend_mha_extend_with_kvcache",
+        name="torch_npu_mha_extend_with_kvcache",
         solution="torch_npu",
         capability=_CAPABILITY,
         signatures=format_signatures(("q", "k_cache", "v_cache"), "dense", _DTYPES),
@@ -72,13 +73,13 @@ if current_platform().is_npu:
         },
         tags={"portability"},
     )
-    def mha_extend_with_kvcache(**kwargs):
+    def torch_npu_mha_extend_with_kvcache(**kwargs):
         return _mha_extend_with_kvcache(**kwargs)
 
     @register_kernel(
         "attention",
         "mha_decode_with_kvcache",
-        name="ascend_mha_decode_with_kvcache",
+        name="torch_npu_mha_decode_with_kvcache",
         solution="torch_npu",
         capability=_CAPABILITY,
         signatures=format_signatures(("q", "k_cache", "v_cache"), "dense", _DTYPES),
@@ -90,12 +91,12 @@ if current_platform().is_npu:
         },
         tags={"portability"},
     )
-    def mha_decode_with_kvcache(**kwargs):
+    def torch_npu_mha_decode_with_kvcache(**kwargs):
         return _mha_decode_with_kvcache(**kwargs)
 
 
 __all__ = [
-    "mha_decode_with_kvcache",
-    "mha_extend_with_kvcache",
-    "mha_prefill",
+    "torch_npu_mha_decode_with_kvcache",
+    "torch_npu_mha_extend_with_kvcache",
+    "torch_npu_mha_prefill",
 ]

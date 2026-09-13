@@ -50,6 +50,7 @@ import sys
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -181,3 +182,7 @@ def test_eager_serving_leaves_the_fork_disabled():
     """Outside the graph phase behaviour is unchanged: no fork, no aux stream."""
     call = _run(graph_phase=False, capture_mode=False)
     assert call["enable"] is False
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

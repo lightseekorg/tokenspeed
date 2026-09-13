@@ -43,7 +43,6 @@ server:
     --sampling-backend greedy
     --disable-kvstore
     --kvstore-ratio 0.0
-    --enable-cache-report
     --reasoning-parser kimi_k3
     --host 127.0.0.1
     --port 8000

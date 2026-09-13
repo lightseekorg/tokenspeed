@@ -64,7 +64,6 @@ def gluon_bf16_moe_stage1_kernel(
     sorted_token_ids_ptr,
     sorted_expert_ids_ptr,
     num_valid_ids_ptr,
-    N,  # = 2 * I  (gate||up column count of w1)
     K,  # = D
     EM,
     num_tokens,
@@ -407,7 +406,6 @@ def invoke_stage1(
     assert Dw == D, f"w1 K dim {Dw} != hidden D {D}"
     assert two_I % 2 == 0
     I_r = two_I // 2
-    N = two_I
     EM = sorted_token_ids.shape[0]
     assert out.shape == (
         num_tokens * topk,
@@ -454,7 +452,6 @@ def invoke_stage1(
         sorted_token_ids,
         sorted_expert_ids,
         num_valid_ids,
-        N,
         D,
         EM,
         num_tokens,

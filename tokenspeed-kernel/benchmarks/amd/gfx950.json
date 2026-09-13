@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "suite_id": "amd-gfx950-registration-kernels",
+  "environment": {
+    "vendor": "amd",
+    "arch": "9.5"
+  },
+  "timer": {
+    "calls_per_graph": 100,
+    "eager_warmup_iterations": 5,
+    "replay_warmup_iterations": 3,
+    "measurement_blocks": 30
+  },
+  "cases": [
+    {
+      "id": "gemm.bmm/gluon_bmm_a16w16_gfx950/b12-m1-n512-k128-bfloat16/v1",
+      "definition": {
+        "family": "gemm",
+        "mode": "bmm",
+        "parameters": {
+          "batch": 12,
+          "M": 1,
+          "N": 512,
+          "K": 128,
+          "dtype": "bfloat16",
+          "validation": {
+            "runs": 5,
+            "atol": 0.015,
+            "rtol": 0.015
+          }
+        },
+        "registration": "gluon_bmm_a16w16_gfx950",
+        "seed": 42,
+        "definition_version": 1
+      },
+      "policy": {
+        "max_regression_relative": 0.1,
+        "max_regression_absolute_us": 0.5,
+        "max_relative_mad": 0.05
+      }
+    }
+  ]
+}

@@ -341,32 +341,6 @@ def test_proposals_are_valid_token_ids() -> None:
     assert int(out.min()) >= 0
 
 
-# --------------------------------------------------------------------------
-# Recurrent (KDA) state commit after verify
-# --------------------------------------------------------------------------
-
-
-def test_kda_commit_is_a_base_no_op_hook() -> None:
-    """K3's recurrent state must be committed after a DSpark verify too.
-
-    The runner calls update_mamba_state_after_mtp_verify unconditionally
-    after every drafted decode round (no hasattr probe, no algorithm check):
-    the hook keys on the backend override, stateless backends inherit the
-    base no-op. This keeps DSpark covered if the call site ever grows an
-    algorithm check, and keeps stateless backends safe without a guard.
-    """
-    from tokenspeed.runtime.layers.attention.backends.base import (
-        AttentionBackend,
-    )
-
-    class _StatelessBackend(AttentionBackend):
-        def init_forward_metadata(self, *args, **kwargs):
-            pass
-
-    backend = _StatelessBackend.__new__(_StatelessBackend)
-    assert backend.update_mamba_state_after_mtp_verify(None) is None
-
-
 class _ShardIndices:
     def __init__(self, num_org: int) -> None:
         self.num_org_elements = num_org

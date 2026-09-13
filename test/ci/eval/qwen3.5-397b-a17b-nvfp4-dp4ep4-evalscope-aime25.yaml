@@ -32,7 +32,6 @@ server:
     --speculative-algorithm MTP
     --speculative-num-steps 3
     --drafter-attention-backend trtllm
-    --enable-cache-report
     --host 127.0.0.1
     --port 8000
   ready:

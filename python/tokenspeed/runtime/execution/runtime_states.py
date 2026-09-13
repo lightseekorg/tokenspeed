@@ -57,7 +57,11 @@ class RuntimeStates:
         extend_prefix_lens: torch.Tensor,
     ) -> None:
         self.valid_cache_lengths[extend_request_pool_indices] = extend_prefix_lens
-        self.remote_spec_candidate_ready[extend_request_pool_indices] = False
+        # Scalar indexed assignment stages a CPU tensor and synchronizes CUDA.
+        # Keep the reset ordered on the execution stream without a host wait.
+        self.remote_spec_candidate_ready.index_fill_(
+            0, extend_request_pool_indices, False
+        )
 
     def write_remote_spec_candidate_ids(
         self, req_pool_idx: int, candidate_ids: list[int]

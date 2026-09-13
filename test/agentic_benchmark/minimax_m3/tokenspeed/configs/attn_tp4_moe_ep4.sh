@@ -23,6 +23,5 @@ exec ts serve \
     --speculative-num-draft-tokens 4 \
     --disable-kvstore \
     --block-size 128 \
-    --enable-cache-report \
     --host 127.0.0.1 \
     --port 8000

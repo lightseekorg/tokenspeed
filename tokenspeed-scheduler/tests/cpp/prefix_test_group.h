@@ -128,7 +128,12 @@ public:
     }
     void CacheFullBlocks(BlockPool& pool, BlockTable& table, std::span<const CacheKey> keys,
                          std::int32_t first_slot = 0) {
-        index_.RegisterFullBlocks(pool, table, keys, ++next_access_epoch_, first_slot);
+        RegisterFullBlocks(pool, table, keys, ++next_access_epoch_, first_slot);
+    }
+    void RegisterFullBlocks(BlockPool& pool, BlockTable& table, std::span<const CacheKey> keys,
+                            std::uint64_t access_epoch, std::int32_t first_slot = 0) {
+        index_.RegisterFullBlocks(pool, allocator_.BlocksToPublish(table, first_slot, keys.size()), keys, access_epoch,
+                                  first_slot, CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr);
     }
 
     bool ContainsCachedBlock(const BlockPool& pool, const CacheKey& key) const { return index_.Contains(pool, key); }

@@ -22,6 +22,5 @@ exec ts serve \
     --enable-prefix-caching \
     --disable-kvstore \
     --block-size 128 \
-    --enable-cache-report \
     --host 127.0.0.1 \
     --port 8000

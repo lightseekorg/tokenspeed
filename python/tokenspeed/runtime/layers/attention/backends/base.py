@@ -44,7 +44,7 @@ from abc import ABC
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -63,24 +63,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
-
-
-class SpeculativeStateBackend(Protocol):
-    """Model side-state that consumes speculative verification results."""
-
-    def commit_after_mtp_verify(
-        self,
-        accepted_lengths: torch.Tensor,
-        *,
-        num_extends: int,
-    ) -> None: ...
-
-    def drop_verify_scratch(self) -> None: ...
-
-
-_SpeculativeStateBackendT = TypeVar(
-    "_SpeculativeStateBackendT", bound=SpeculativeStateBackend
-)
 
 
 @dataclass
@@ -180,14 +162,11 @@ class AttentionBackend(CachePoolBinding, ABC):
     def _init_pool_binding(self) -> None:
         """The binding lifecycle fields; wrappers that skip __init__ call this."""
         super()._init_pool_binding()
-        self._speculative_state_backends: list[SpeculativeStateBackend] = []
         self._sparse_topk = SparseTopKShare()
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
-        """Record the pool and drop the verify caches built on the old one."""
+        """Record the pool and clear shared sparse-forward metadata."""
         super()._publish_cache_pool(cache_pool)
-        for backend in self._speculative_state_backends:
-            backend.drop_verify_scratch()
         self._sparse_topk.clear()
 
     def configure_runtime(self, **kwargs) -> None:
@@ -355,10 +334,6 @@ class AttentionBackend(CachePoolBinding, ABC):
         same object whichever level of the tree they hold."""
         return self._sparse_topk
 
-    def update_mamba_state_after_mtp_verify(self, accepted_lengths) -> None:
-        """Commit recurrent-state pages after MTP verification; only nodes
-        with Mamba/GDN state override."""
-
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
     ) -> bool:
@@ -420,32 +395,14 @@ class AttentionBackend(CachePoolBinding, ABC):
     def register_step_counter(self, step_counter: StepCounter) -> None:
         self.step_counter = step_counter
 
-    def register_speculative_state_backend(
-        self, backend: SpeculativeStateBackend
-    ) -> None:
-        """Register a model side-state consumer of MTP verification results."""
-        if backend not in self._speculative_state_backends:
-            self._speculative_state_backends.append(backend)
-
-    def find_speculative_state_backend(
-        self, backend_type: type[_SpeculativeStateBackendT]
-    ) -> _SpeculativeStateBackendT | None:
-        """The registered side backend of ``backend_type``, or None."""
-        return next(
-            (
-                backend
-                for backend in self._speculative_state_backends
-                if isinstance(backend, backend_type)
-            ),
-            None,
-        )
-
     def commit_speculative_state_after_verify(
         self, accepted_lengths: torch.Tensor, *, num_extends: int
     ) -> None:
-        """Publish MTP accept/reject results to registered model side-state."""
-        for backend in self._speculative_state_backends:
-            backend.commit_after_mtp_verify(accepted_lengths, num_extends=num_extends)
+        """Commit live acceptance after drafted decode/mixed execution or replay.
+
+        ``num_extends == 0`` identifies pure decode; otherwise extend requests
+        lead the mixed batch. Stateless backends inherit this no-op.
+        """
 
     @contextmanager
     def record_pd_cache_step(

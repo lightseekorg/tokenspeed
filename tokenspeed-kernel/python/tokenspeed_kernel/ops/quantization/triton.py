@@ -424,7 +424,7 @@ def _mxfp8_quantize_kernel(
     traits={},
     priority=Priority.PORTABLE,
 )
-def mxfp8_quantize(
+def triton_quantize_mxfp8(
     x: torch.Tensor,
     enable_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -437,10 +437,12 @@ def mxfp8_quantize(
     assert x.dtype in (
         torch.bfloat16,
         torch.float16,
-    ), f"mxfp8_quantize input must be bf16/fp16, got {x.dtype}"
+    ), f"triton_quantize_mxfp8 input must be bf16/fp16, got {x.dtype}"
     M, N, x_row_stride = _flatten_to_2d(x)
     if N % 32 != 0:
-        raise ValueError("mxfp8_quantize requires the last dimension divisible by 32")
+        raise ValueError(
+            "triton_quantize_mxfp8 requires the last dimension divisible by 32"
+        )
 
     out = torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device)
     scale_dtype = getattr(torch, "float8_e8m0fnu", torch.uint8)

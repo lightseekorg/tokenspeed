@@ -21,6 +21,5 @@ exec ts serve \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
     --speculative-draft-model-quantization unquant \
-    --enable-cache-report \
     --host 127.0.0.1 \
     --port 8000

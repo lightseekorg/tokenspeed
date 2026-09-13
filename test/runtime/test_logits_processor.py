@@ -126,6 +126,12 @@ def test_force_deterministic_rsag_disables_logits_symm_mem(
 def _set_fabric(monkeypatch, supported: bool) -> None:
     import tokenspeed_kernel.ops.communication.fabric as fabric
 
+    # These tests model NVIDIA multicast regardless of the runner's platform.
+    monkeypatch.setattr(
+        logits_processor_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_nvidia=True),
+    )
     # The topology is what makes these groups host-spread; without it the tests
     # would name a property their own setup never established.
     monkeypatch.setitem(
@@ -518,3 +524,7 @@ def test_get_logits_softcap_disables_fused_argmax(monkeypatch):
     out = proc._get_logits(hidden, lm_head, md)
     assert called.get("ag")  # gathered (softcap on full vocab), not early-returned
     assert out.shape == (4, 8)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

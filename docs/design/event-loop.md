@@ -98,6 +98,10 @@ Consequences:
   but each is a low-rate path whose caller cannot proceed without the result
   (the landing's failure must surface BEFORE the scheduler advances the
   request into decode). A new blocking method on the per-round path is a bug.
+* Keep per-forward state resets asynchronous on the execution stream too.
+  Use device-side scalar fills for indexed flags: assigning a Python scalar
+  through tensor indexing can stage a CPU tensor and introduce a hidden
+  synchronous H2D copy, blocking further forward launches.
 
 The rule is also mechanically enforced, on by default: a thread-local
 dispatch mode over the loop raises on any CUDA tensor op run from the
@@ -207,6 +211,15 @@ per-mutation publish calls; they only fragment batches.
 The same reasoning fixes the metrics call: scheduler iteration metrics are
 recorded once per round, from the same pre-dispatch snapshot as the
 scheduler stats.
+
+Page gauges count LCM parents, excluding the reserved null parent. The
+per-round sampler reads `empty_lcm_blocks()` and `active_lcm_blocks()`;
+cached-only parents are `num_usable_pages - empty - active`. Active and cached
+counts are disjoint, even when cache groups pack multiple blocks into a parent.
+`LoadSnapshot.num_used_pages` sums active and cached parents to report all
+resident occupancy, including evictable cache, rather than cache alone.
+`available_lcm_blocks()` scans the pool and prefix indexes for reclaimability
+and belongs in diagnostics and leak checks, never in the per-round sampler.
 
 ## The hooks pattern
 

@@ -51,6 +51,7 @@ on:
           - test/ci/eval/qwen3.5-397b-a17b-mxfp4-evalscope-aime25.yaml
           - test/ci/eval/qwen3.8-flash-next-fp8-evalscope-gsm8k.yaml
           - test/ci/perf/gpt-oss-120b-mxfp4-evalscope-mi355.yaml
+          - test/ci/perf/kernel-benchmark-amd-gfx950.yaml
           - test/ci/perf/kimi-k2.5-nvfp4-evalscope-agentic.yaml
           - test/ci/perf/kimi-k3-eagle3-mxfp4-tp8ep8-evalscope-random-4k-1k-mi35x.yaml
           - test/ci/perf/kimi-k3-mxfp4-tp8ep8-evalscope-random-4k-1k-mi35x.yaml
@@ -117,6 +118,8 @@ jobs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       has_tasks: ${{ steps.matrix.outputs.has_tasks }}
       source_sha: ${{ steps.source.outputs.sha }}
+      comparison_base_ref: ${{ steps.source.outputs.comparison_base_ref }}
+      comparison_candidate_ref: ${{ steps.source.outputs.comparison_candidate_ref }}
       install_tokenspeed_mla_from_source: ${{ steps.source.outputs.install_mla }}
     steps:
       - name: Resolve source
@@ -163,6 +166,8 @@ jobs:
             }
             link=$(jq -r .html_url <<< "$data")
             mode=commit
+            comparison_base_ref=$(gh api "repos/${{ github.repository }}/commits/main" --jq .sha)
+            comparison_candidate_ref=$sha
             # A manually selected commit may contain unmerged tokenspeed-mla
             # changes, so always use its in-tree package.
             install_mla=1
@@ -173,6 +178,8 @@ jobs:
             fi
             link="https://github.com/${{ github.repository }}/commit/$sha"
             mode=main
+            comparison_base_ref=$sha
+            comparison_candidate_ref=$sha
             install_mla=0
           else
             number=${PR##*/}
@@ -184,7 +191,9 @@ jobs:
               echo "Pull request not found: $PR" >&2
               exit 2
             fi
-            sha=$(jq -r .head.sha <<< "$data")
+            comparison_base_ref=$(jq -r .base.sha <<< "$data")
+            comparison_candidate_ref=$(jq -r .head.sha <<< "$data")
+            sha=$comparison_candidate_ref
             link=$(jq -r .html_url <<< "$data")
             mode=pr
             if gh api "repos/${{ github.repository }}/pulls/$number/files" \
@@ -195,6 +204,8 @@ jobs:
             fi
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "comparison_base_ref=$comparison_base_ref" >> "$GITHUB_OUTPUT"
+          echo "comparison_candidate_ref=$comparison_candidate_ref" >> "$GITHUB_OUTPUT"
           echo "install_mla=$install_mla" >> "$GITHUB_OUTPUT"
           {
             echo "### K8s Dispatch"
@@ -303,5 +314,7 @@ jobs:
       install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
       b200_runner_label: b200v2
       checkout_ref: ${{ needs.scan.outputs.source_sha }}
+      comparison_base_ref: ${{ needs.scan.outputs.comparison_base_ref }}
+      comparison_candidate_ref: ${{ needs.scan.outputs.comparison_candidate_ref }}
       timeout_minutes: 720
     secrets: inherit
