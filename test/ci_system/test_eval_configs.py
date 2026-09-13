@@ -241,6 +241,7 @@ def test_kimi_k25_amd_accuracy_gate_preserves_question_outputs():
     )
     command = shlex.split(task["eval"]["command"])
     generation = json.loads(flag_value(command, "--generation-config"))
+    server_tokens = shlex.split(task["server"]["command"])
 
     assert (
         flag_value(command, "--work-dir") == ".ci-artifacts/published/evalscope-results"
@@ -248,6 +249,13 @@ def test_kimi_k25_amd_accuracy_gate_preserves_question_outputs():
     assert "--no-timestamp" not in command
     assert flag_value(command, "--limit") == "4"
     assert flag_value(command, "--eval-batch-size") == "4"
-    assert generation == {"do_sample": False, "temperature": 0.0, "max_tokens": 65536}
+    assert generation == {
+        "do_sample": True,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "seed": 42,
+        "max_tokens": 65536,
+    }
+    assert flag_value(server_tokens, "--sampling-backend") == "triton"
     assert task["score_threshold"] == 0.75
     assert "retries" not in task

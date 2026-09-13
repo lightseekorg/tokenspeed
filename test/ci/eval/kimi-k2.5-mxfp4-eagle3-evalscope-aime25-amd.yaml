@@ -29,7 +29,7 @@ server:
     --speculative-eagle-topk 1
     --speculative-num-draft-tokens 2
     --speculative-draft-model-quantization unquant
-    --sampling-backend greedy
+    --sampling-backend triton
     --disable-kvstore
     --kvstore-ratio 0.0
   ready:
@@ -52,7 +52,7 @@ eval:
     --limit 4
     --eval-batch-size 4
     --stream
-    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":65536}'
+    --generation-config '{"do_sample":true,"temperature":1.0,"top_p":0.95,"seed":42,"max_tokens":65536}'
 report:
   github_step_summary: true
 score_threshold: 0.75

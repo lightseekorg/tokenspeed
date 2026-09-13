@@ -95,8 +95,14 @@ the NVIDIA Kimi-K2.5 EAGLE3 and DFlash AIME25 tasks. Both the
 and the [16K run](https://github.com/lightseekorg/tokenspeed/actions/runs/34764637152)
 truncated the same unanswered question. The 64K experiment tests whether more
 generation budget lets it finish; it does not establish an accuracy fix.
-The four questions, batch size four, greedy sampling, EAGLE3 configuration,
-score threshold of 0.75, and timeouts remain unchanged.
+The sampling comparison keeps the same 64K budget and replaces greedy decoding
+with the `triton` sampling backend, `do_sample=true`, `temperature=1.0`,
+`top_p=0.95`, and `seed=42`. Temperature and top-p follow the
+[official Kimi-K2.5 Thinking-mode recommendation](https://huggingface.co/moonshotai/Kimi-K2.5#6-model-usage).
+Compare per-question stop reasons and final answers against the greedy 64K run;
+the sampling comparison does not establish the cause of the earlier truncation.
+The four questions, batch size four, EAGLE3 configuration, score threshold of
+0.75, and timeouts remain unchanged.
 
 `optional` marks a task or per-label matrix entry as non-blocking.
 Optional entries are emitted with `matrix.optional: true`, and the PR workflows
