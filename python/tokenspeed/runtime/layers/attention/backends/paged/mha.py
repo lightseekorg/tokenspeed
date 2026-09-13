@@ -172,6 +172,13 @@ class MHAAttnBackend(PagedAttentionBackend):
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
     ) -> bool:
+        if current_platform().is_npu:
+            # Ascend RoPE (torch_npu npu_mrope) has no fused KV-write variant,
+            # so the fused rope+KV-prewrite path cannot run on NPU. Fall back
+            # to plain RoPE + the backend's normal save_kv_cache store, which
+            # the torch_npu attention kernels support. GPU platforms keep the
+            # fused prewrite path.
+            return False
         return forward_mode is not None and forward_mode.is_decode()
 
     # ------------------------------------------------------------------
