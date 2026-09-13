@@ -1518,7 +1518,7 @@ class ServerArgs:
             "flashmla",
             "tokenspeed_mla",
             "hybrid_linear_attn",
-        ]
+        ] + (["npu_flash_attention"] if current_platform().is_npu else [])
         parser.add_argument(
             "--attention-backend",
             type=str,
@@ -1999,7 +1999,7 @@ class ServerArgs:
             "fa4",
             "triton_attn",
             "flashinfer_cudnn",
-        ]
+        ] + (["npu_flash_attention"] if current_platform().is_npu else [])
         parser.add_argument(
             "--mm-attention-backend",
             type=str,

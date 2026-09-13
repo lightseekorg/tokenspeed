@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.attention.mha import (
 from tokenspeed_kernel.ops.kvcache.triton import (
     fused_fp8_set_kv_buffer,
 )
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.ops.quantization import quantize_mxfp8
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
@@ -58,6 +59,12 @@ _KERNEL_SOLUTION_BY_BACKEND = {
     "triton": "triton",
     "flashinfer": "flashinfer",
 }
+if current_platform().is_npu:
+    # Ascend: route the NPU flash-attention backend to the registered
+    # "torch_npu" kernel solution (npu_fusion_attention family) in
+    # tokenspeed-kernel ops/attention/ascend.py. GPU platforms keep the
+    # exact original mapping above.
+    _KERNEL_SOLUTION_BY_BACKEND["npu_flash_attention"] = "torch_npu"
 
 
 def _slice_extend_inputs(metadata, q, k, v):

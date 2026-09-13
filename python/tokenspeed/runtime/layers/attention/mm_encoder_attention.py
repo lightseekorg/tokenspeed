@@ -291,12 +291,57 @@ def vision_attn_flashinfer_cudnn(
     return output
 
 
+def vision_attn_npu(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor | None,
+    bsz: int,
+    seq_len: int,
+    softmax_scale: float | None = None,
+    max_seqlen: int | None = None,
+    **_: Any,
+) -> torch.Tensor:
+    """Ascend NPU non-causal varlen attention (npu_fusion_attention family).
+
+    Uses ``torch_npu.npu_fused_infer_attention_score`` in TND layout with no
+    attention mask (multimodal encoder attention is non-causal). The torch
+    reference path lives on the NPU device; GPU platforms keep their existing
+    backends below.
+    """
+    import torch_npu
+
+    cu_seqlens, seq_lens, max_seqlen = _varlen_metadata(
+        cu_seqlens, bsz, seq_len, device=q.device, max_seqlen=max_seqlen
+    )
+    scale = (
+        softmax_scale if softmax_scale is not None else (q.shape[-1] ** -0.5)
+    )
+    output, _ = torch_npu.npu_fused_infer_attention_score(
+        q,
+        k,
+        v,
+        atten_mask=None,
+        actual_seq_lengths=seq_lens,
+        actual_seq_lengths_kv=seq_lens,
+        num_heads=q.shape[1],
+        num_key_value_heads=k.shape[1],
+        scale=scale,
+        input_layout="TND",
+        sparse_mode=0,
+    )
+    return output
+
+
 _BACKENDS: dict[str, Callable[..., torch.Tensor]] = {
     "triton_attn": vision_attn_triton,
     "fa3": vision_attn_fa3,
     "fa4": vision_attn_fa4,
     "flashinfer_cudnn": vision_attn_flashinfer_cudnn,
 }
+if _platform.is_npu:
+    _BACKENDS["npu_flash_attention"] = vision_attn_npu
 
 
 def _default_multimodal_encoder_attn_backend() -> str:
@@ -309,6 +354,8 @@ def _default_multimodal_encoder_attn_backend() -> str:
         return "triton_attn"
     if _is_amd:
         return "triton_attn"
+    if _platform.is_npu:
+        return "npu_flash_attention"
     raise RuntimeError(
         f"No default multimodal encoder attention backend for platform {_platform}; "
         "set --mm-attention-backend explicitly."

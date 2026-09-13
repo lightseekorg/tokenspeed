@@ -392,6 +392,11 @@ def _resolve_cache_family(
 
 
 def _get_default_backend_name(arch: AttentionArch) -> str:
+    if current_platform().is_npu:
+        # Ascend dense attention defaults to the NPU flash-attention backend
+        # (kernel solution "torch_npu"). GPU platforms keep their defaults.
+        if arch == AttentionArch.MHA:
+            return "npu_flash_attention"
     if arch == AttentionArch.MLA:
         return "mla"
     if arch == AttentionArch.DSA:

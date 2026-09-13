@@ -37,6 +37,7 @@ from tokenspeed_kernel.ops.attention.mha.flashinfer import (
 from tokenspeed_kernel.ops.kvcache.triton import (
     fused_fp8_set_kv_buffer,
 )
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
@@ -494,4 +495,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
 
-register_backend("trtllm", {AttentionArch.MHA}, TRTLLMMHAAttnBackend)
+if not current_platform().is_npu:
+    # TRT-LLM MHA is a GPU (flashinfer) backend; keep it out of the NPU
+    # backend registry. GPU platforms register it exactly as before.
+    register_backend("trtllm", {AttentionArch.MHA}, TRTLLMMHAAttnBackend)

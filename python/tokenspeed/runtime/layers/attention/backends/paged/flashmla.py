@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.ops.attention.mha.cuda import flash_attn_varlen_func
 from tokenspeed_kernel.ops.attention.mha.flashinfer import (
     BatchMLAPagedAttentionWrapper,
@@ -819,4 +820,7 @@ class _PrefillIndicesUpdater:
             )
 
 
-register_backend("flashmla", {AttentionArch.MLA}, FlashMLABackend)
+if not current_platform().is_npu:
+    # FlashMLA is a GPU (flash_attn/flash_mla) backend; keep it out of the
+    # NPU backend registry. GPU platforms register it exactly as before.
+    register_backend("flashmla", {AttentionArch.MLA}, FlashMLABackend)
