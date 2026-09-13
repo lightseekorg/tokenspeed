@@ -248,6 +248,6 @@ def test_kimi_k25_amd_accuracy_gate_preserves_question_outputs():
     assert "--no-timestamp" not in command
     assert flag_value(command, "--limit") == "4"
     assert flag_value(command, "--eval-batch-size") == "4"
-    assert generation == {"do_sample": False, "temperature": 0.0, "max_tokens": 8192}
+    assert generation == {"do_sample": False, "temperature": 0.0, "max_tokens": 16384}
     assert task["score_threshold"] == 0.75
     assert "retries" not in task

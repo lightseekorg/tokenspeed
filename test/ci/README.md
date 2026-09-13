@@ -87,7 +87,12 @@ The AMD Kimi-K2.5 AIME25 gate writes EvalScope results under
 success and failure, including timestamped per-question predictions and scoring
 records. Compare the
 responses, stop reasons, and extracted answers when investigating an accuracy
-miss before changing the token limit or sampling configuration.
+miss before changing the token limit or sampling configuration. This gate allows
+16384 output tokens: [CI run 34763795877](https://github.com/lightseekorg/tokenspeed/actions/runs/34763795877/job/103741100888)
+recorded a wrong answer with `stop_reason=max_tokens` at the previous 8192-token
+limit. Its reasoning contained the correct value but ended before a final answer.
+The four-question limit, batch size of four, greedy sampling, and 0.75 score
+threshold remain unchanged.
 
 `optional` marks a task or per-label matrix entry as non-blocking.
 Optional entries are emitted with `matrix.optional: true`, and the PR workflows
