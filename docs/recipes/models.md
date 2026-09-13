@@ -836,6 +836,32 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
   --port 8000
 ```
 
+**V4-Flash** — 1× MI450-series (gfx1250), Triton + decode/prefill graphs, without MTP:
+
+```bash
+tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
+  --served-model-name deepseek-v4-flash \
+  --trust-remote-code \
+  --tensor-parallel-size 1 \
+  --kv-cache-dtype fp8_e4m3 \
+  --moe-backend triton \
+  --attention-use-fp4-indexer-cache \
+  --max-model-len 4096 \
+  --max-total-tokens 8192 \
+  --max-num-seqs 4 \
+  --chunked-prefill-size 256 \
+  --gpu-memory-utilization 0.8 \
+  --disable-kvstore \
+  --max-cudagraph-capture-size 4 \
+  --cudagraph-capture-sizes 1 2 3 4 \
+  --prefill-graph-max-tokens 256 \
+  --prefill-graph-capture-sizes 128 256 \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+MTP is not yet validated on MI450.
+
 ### MTP speculative decoding
 
 Both variants can drive the checkpoint's NextN/MTP draft layers. Keep the launch

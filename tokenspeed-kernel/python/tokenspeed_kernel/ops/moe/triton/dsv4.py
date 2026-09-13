@@ -52,6 +52,7 @@ def _select_experts_kernel(
     RENORMALIZE: tl.constexpr,
     NEED_SCORES: tl.constexpr,
 ):
+    """Write expert ids and sqrt-softplus weights using top-k or hash routing."""
     token = tl.program_id(0)
     expert = tl.arange(0, BLOCK_E)
     logits = tl.load(

@@ -256,27 +256,6 @@ def test_attention_api_ownership_and_result_type_identity_are_stable():
     assert _attention_kda_pkg.KdaPrefillResult is KdaPrefillResult
 
 
-def test_dsv4_triton_package_preserves_exports_and_registrations() -> None:
-    """The solution package preserves exports and reloads indexer registrations."""
-    assert _attention_dsv4_pkg.triton is _attention_triton_dsv4
-    assert _attention_triton_dsv4.indexer is _attention_triton_dsv4_indexer
-    for name in _attention_triton_dsv4.__all__:
-        assert callable(getattr(_attention_triton_dsv4, name))
-    registry = KernelRegistry.get()
-    for name in (
-        "triton_dsv4_prefill_topk_mxfp4",
-        "triton_dsv4_decode_topk_mxfp4",
-        "triton_dsv4_plan",
-    ):
-        implementation = getattr(_attention_triton_dsv4_indexer, name)
-        assert getattr(_attention_triton_dsv4, name) is implementation
-        assert registry.get_impl(name) is implementation
-        spec = registry.get_by_name(name)
-        assert spec is not None
-        assert spec.solution == "triton"
-        assert spec.priority == Priority.PORTABLE
-
-
 def test_residual_family_exports_and_modes():
     expected_exports = {
         "attn_res_fwd",

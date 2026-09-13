@@ -22,10 +22,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Triton DSV4 kernels and stable solution exports.
+"""Triton DSV4 kernel exports.
 
-Existing kernels remain here during the package transition; new implementations
-live in submodules imported here to load their registrations.
+TODO: Moe kernel implementations into their own dedicated files.
 """
 
 from __future__ import annotations
