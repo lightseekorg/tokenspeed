@@ -32,6 +32,10 @@ from tokenspeed_kernel._triton import tl, triton
 
 _TOP_K_TOP_P_BLOCK_SIZE = 2048
 _TOP_K_TOP_P_PAD = 128
+# NPU Graph capture forbids host sync (.item()); the NPU torch-composition
+# sampler uses a fixed candidate pool (like the CUDA Triton top_k_pad) instead
+# of deriving k from a device tensor at runtime.
+_NPU_SAMPLE_MAX_K = 2048
 _QRITA_BLOCK_SIZE = 8192
 _QRITA_BLOCK_SIZE_TRUNC = 4096
 _QRITA_NUM_WARPS = 16
@@ -501,6 +505,22 @@ def _check_top_k_top_p_gumbel_inputs(
     return rows, vocab_size, num_blocks
 
 
+def _npu_capturing() -> bool:
+    """Return True when the current NPU stream is inside a graph capture.
+
+    NPU Graph capture forbids host-synchronizing ops (``.item()`` / CPU
+    ``torch.Generator``), so the NPU torch-composition sampler must avoid them
+    while a capture is underway. torch_npu exposes the flag only from its
+    ``torch_npu.npu`` submodule; guard the import for non-NPU environments.
+    """
+    try:
+        from torch_npu.npu import is_current_stream_capturing
+
+        return bool(is_current_stream_capturing())
+    except Exception:
+        return False
+
+
 def _sample_top_k_top_p_npu(
     logits: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -556,7 +576,10 @@ def _sample_top_k_top_p_npu(
         min_p_log_threshold = torch.full((rows,), float("-inf"), device=device)
 
     scaled = logits.float() / temperature[:, None]  # [rows, vocab]
-    max_k = int(top_k.max().clamp(max=vocab_size).item())
+    # NPU Graph capture forbids host sync (.item()), so use a fixed candidate
+    # pool sized like the CUDA Triton kernel's top_k_pad; the top-p/min-p
+    # filters live in the keep mask below, so semantics are unchanged.
+    max_k = min(vocab_size, _NPU_SAMPLE_MAX_K)
     if max_k <= 0:
         max_k = 1
     topk_vals, topk_idx = torch.topk(scaled, k=max_k, dim=-1)  # descending
@@ -575,14 +598,19 @@ def _sample_top_k_top_p_npu(
     # Deterministic uniform noise per (seed, offset, row): one CPU Generator
     # per request row seeded from the pool values, so repeated calls with the
     # same pools reproduce the same sample (mirrors the Triton kernels' use of
-    # ``tl.randint(seed, offset)``).
-    uniform = torch.empty(rows, max_k, dtype=torch.float64)
-    for r in range(rows):
-        g = torch.Generator()
-        g.manual_seed(
-            (int(seed[r].item()) * 1000003 + int(offset[r].item())) & ((1 << 63) - 1)
-        )
-        uniform[r] = torch.rand(max_k, generator=g, dtype=torch.float64)
+    # ``tl.randint(seed, offset)``). During NPU Graph capture host sync is
+    # forbidden, so fall back to a device-side default-RNG draw there.
+    if _npu_capturing():
+        uniform = torch.rand(rows, max_k, device=device, dtype=torch.float64)
+    else:
+        uniform = torch.empty(rows, max_k, dtype=torch.float64)
+        for r in range(rows):
+            g = torch.Generator()
+            g.manual_seed(
+                (int(seed[r].item()) * 1000003 + int(offset[r].item()))
+                & ((1 << 63) - 1)
+            )
+            uniform[r] = torch.rand(max_k, generator=g, dtype=torch.float64)
     uniform = torch.clamp(
         uniform.to(dtype=scaled.dtype, device=device), min=1.0e-7
     )
