@@ -18,7 +18,7 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.configs.load_config import LoadConfig
+from tokenspeed.runtime.configs.load_config import LoadConfig, LoadFormat
 from tokenspeed.runtime.model_loader.loader import DefaultModelLoader
 from tokenspeed.runtime.model_loader.weight_utils import (
     _find_sub_byte_dtype,
@@ -36,19 +36,29 @@ IS_NVIDIA = current_platform().is_nvidia
 class TestInstantTensorConfig(unittest.TestCase):
     """Config/CLI wiring that needs neither a GPU nor instanttensor."""
 
-    def test_cli_rejects_removed_instanttensor(self):
-        # C11 removes the instanttensor load-format option; the CLI must
-        # reject the removed value instead of silently accepting it.
+    def test_cli_load_format_choices_platform_aware(self):
+        # instanttensor (NVIDIA weight-loading accelerator) stays available on
+        # GPU platforms but is filtered out of the choices on NPU.
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
-        with self.assertRaises(SystemExit):
-            parser.parse_args(
-                ["--model", "test/model", "--load-format", "instanttensor"]
-            )
+        choices = [
+            a.choices for a in parser._actions if a.dest == "load_format"
+        ][0]
+        self.assertIsNotNone(choices)
+        if current_platform().is_npu:
+            self.assertNotIn("instanttensor", choices)
+            with self.assertRaises(SystemExit):
+                parser.parse_args(
+                    ["--model", "test/model", "--load-format", "instanttensor"]
+                )
+        else:
+            self.assertIn("instanttensor", choices)
 
-    def test_load_config_rejects_removed_instanttensor(self):
-        with self.assertRaises(ValueError):
-            LoadConfig(load_format="instanttensor")
+    def test_load_config_accepts_instanttensor(self):
+        # The guard lives at the CLI layer (platform-filtered choices); the
+        # LoadFormat enum stays complete so the value round-trips.
+        cfg = LoadConfig(load_format="instanttensor")
+        self.assertEqual(cfg.load_format, LoadFormat.INSTANTTENSOR)
 
     def test_prepare_weights_treats_safetensors_as_safetensors(self):
         with tempfile.TemporaryDirectory() as tmpdir:
