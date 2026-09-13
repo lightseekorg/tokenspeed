@@ -89,6 +89,15 @@ records. Compare the
 responses, stop reasons, and extracted answers when investigating an accuracy
 miss before changing the token limit or sampling configuration.
 
+The AMD Kimi-K2.5 AIME25 length experiment uses `max_tokens=65536`, matching
+the NVIDIA Kimi-K2.5 EAGLE3 and DFlash AIME25 tasks. Both the
+[8K run](https://github.com/lightseekorg/tokenspeed/actions/runs/34763795877)
+and the [16K run](https://github.com/lightseekorg/tokenspeed/actions/runs/34764637152)
+truncated the same unanswered question. The 64K experiment tests whether more
+generation budget lets it finish; it does not establish an accuracy fix.
+The four questions, batch size four, greedy sampling, EAGLE3 configuration,
+score threshold of 0.75, and timeouts remain unchanged.
+
 `optional` marks a task or per-label matrix entry as non-blocking.
 Optional entries are emitted with `matrix.optional: true`, and the PR workflows
 map that to GitHub Actions `continue-on-error`.
