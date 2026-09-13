@@ -147,6 +147,36 @@ NVIDIA` uses the `nvidia-x86` runner group, while `PR Test NVIDIA ARM` uses
 the `nvidia-arm` runner group. GB300 is classified as NVIDIA ARM, but is not
 declared in task YAMLs and therefore does not enter default CI matrices.
 
+### Vendor path filtering
+
+Each vendor PR workflow starts with a `scan` job that classifies the changed
+files with `test/ci_system/ci_path_filter.py --runner-group <group>` and skips
+its GPU matrix jobs when nothing requires that vendor. The classification is
+directory based:
+
+* Shared paths (`python/`, `test/`, `tokenspeed-kernel/`,
+  `tokenspeed-scheduler/`, `run-pr-test-stage.yml`) require every runner group.
+* Vendor-owned paths require only that vendor's runner groups, even inside a
+  shared directory: `tokenspeed-kernel-amd/` and
+  `tokenspeed-kernel/test/amd/` are AMD; `tokenspeed-mla/` and
+  `tokenspeed-kernel/test/nvidia/` are NVIDIA.
+* Each workflow's own YAML requires only its runner group; `workflow_dispatch`
+  always runs.
+
+`tokenspeed-kernel/test/` is laid out to feed this filter. Tests whose
+module-level gate (`is_cdna4()`, `is_cdna5()`, `is_amd()`, or an import from
+`tokenspeed_kernel_amd`) skips them off AMD hardware live under
+`tokenspeed-kernel/test/amd/`; tests that require CUDA, CuTe DSL, FlashInfer,
+DeepEP, DeepGEMM, TRT-LLM, FlashAttention 3/4, FlashMLA, Marlin, MNNVL, or
+`tokenspeed-mla` live under `tokenspeed-kernel/test/nvidia/`. Everything else
+(portable Triton kernels, registry and selection logic, tests that
+parametrize over both vendors) stays at the top level. The vendor subtrees
+mirror the top-level `ops/` and `thirdparty/` layout, and every subtree shares
+the root `conftest.py`, `utils.py`, and `kimi3_reference.py`, so a test moves
+between them without changing its imports. Put a new test in the narrowest
+directory whose gate matches its module-level skip; a mixed test belongs at
+the top level rather than in either vendor subtree.
+
 ## Registration-Level Kernel Benchmarks
 
 The `kernel-benchmark-amd-gfx950` performance task compares exact kernel

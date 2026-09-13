@@ -46,7 +46,6 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.pipelined_program import (
     _preshuffled_w_read_layout,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.routing import (
-    _ROUTE_GL_DTYPE,
     _route_next_pow2,
     gluon_route_supported,
 )
@@ -200,11 +199,10 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         w13_scale.stride(0), w13_scale.stride(-2), w13_scale.stride(-1),
         inter.stride(0), inter.stride(1),
         w13_act_scale, w2_act_scale, b13,
-        D_PACKED=D // 2, TOPK=top_k,
+        TOPK=top_k,
         # EP/TKP: padded widths of the [tokens, experts] logits tile and the
         # top-k selection tile; >= 64*num_warps keeps the blocked layout valid.
         EP=max(_route_next_pow2(n_experts), 64 * COOP_NUM_WARPS), TKP=64 * COOP_NUM_WARPS,
-        X_DTYPE=_ROUTE_GL_DTYPE[router_logits.dtype],
         BLOCK_K=COOP_BLOCK_K, BLOCK_N=COOP_BLOCK_N, BLOCK_M=16,
         NUM_BUFFERS=COOP_NUM_BUFFERS, NUM_WARPS=COOP_NUM_WARPS,
         W_PRESHUFFLED=w13_preshuffled,
@@ -571,11 +569,9 @@ def _warp_decode_topk_stage1_coop_kernel(
     x_global_scale_ptr,
     out_quant_scale_ptr,
     w13_bias,
-    D_PACKED: gl.constexpr,
     TOPK: gl.constexpr,
     EP: gl.constexpr,
     TKP: gl.constexpr,
-    X_DTYPE: gl.constexpr,
     BLOCK_K: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_M: gl.constexpr,

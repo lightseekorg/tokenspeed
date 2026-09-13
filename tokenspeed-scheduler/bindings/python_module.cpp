@@ -310,7 +310,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("pages_to_zero", &tokenspeed::ExecutionPlan::pages_to_zero);
 
     nb::class_<tokenspeed::Scheduler>(m, "Scheduler")
-        .def(nb::init<tokenspeed::SchedulerConfig>(), nb::arg("config") = tokenspeed::SchedulerConfig{})
+        .def(nb::init<tokenspeed::SchedulerConfig>(), nb::arg("config"))
         .def("submit_requests",
              nb::overload_cast<const std::vector<tokenspeed::RequestSpec>&>(&tokenspeed::Scheduler::SubmitRequests),
              nb::arg("request_specs"))

@@ -18,155 +18,189 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Qwen4-Exp extensions for the hybrid GDN attention backend."""
+"""Qwen4-Exp composition of attention, PLE and QSA cache consumers."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import torch
-from typing_extensions import override
 
-from tokenspeed.runtime.layers.attention.backends.base import CudaGraphSupport
-from tokenspeed.runtime.layers.attention.backends.state.mamba import (
-    MambaAttnBackend,
+from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+    HybridLinearAttnBackend,
 )
-from tokenspeed.runtime.layers.attention.backends.state.qsa import bind_qsa_indexers
-from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
-    QWEN4_EXP_PLE_CACHE_GROUP,
-    qwen4_exp_ple_conv_field,
-)
+from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-    from tokenspeed.runtime.layers.attention.configs.base import (
-        AttnConfig,
-        SoftmaxAttnConfig,
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.layers.attention.backends.base import SparseTopKShare
+    from tokenspeed.runtime.layers.attention.backends.specific.qsa_indexer import (
+        QSAIndexerBackend,
     )
-    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-    from tokenspeed.runtime.layers.attention.qsa.indexer import QSAIndexer
-    from tokenspeed.runtime.layers.qwen4_exp_ple import Qwen4ExpPLELayer
+    from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple import (
+        Qwen4ExpPLEBackend,
+    )
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+    from tokenspeed.runtime.layers.paged_attention import PagedAttention
+    from tokenspeed.runtime.pd.utils import StepCounter
 
 
-def qwen4_exp_linear_backend(
-    attn_backend: AttentionBackend,
-) -> Qwen4ExpMambaAttnBackend:
-    """Resolve and validate the Qwen4-Exp linear-attention backend."""
-
-    backend = getattr(attn_backend, "linear_attn_backend", attn_backend)
-    if not isinstance(backend, Qwen4ExpMambaAttnBackend):
-        raise RuntimeError("Qwen4-Exp PLE requires its model-specific GDN backend")
-    return backend
+def qwen4_exp_backend(attn_backend: AttentionBackend) -> Qwen4ExpBackend:
+    """Resolve the model's composite without depending on an attention leaf."""
+    if not isinstance(attn_backend, Qwen4ExpBackend):
+        raise RuntimeError("Qwen4-Exp layers require their model's composite backend")
+    return attn_backend
 
 
-class Qwen4ExpMambaAttnBackend(MambaAttnBackend):
-    """GDN backend with Qwen4-Exp PLE verification state."""
+class Qwen4ExpBackend(AttentionBackend):
+    """Broadcast cache lifecycle calls; model layers retain their compute order."""
 
-    # Qwen4-Exp's PLE/QSA modules own token-indexed side-state writes; prefill
-    # graph replay pads token rows to a bucket while their cache metadata
-    # remains real-token shaped. Keep prefills eager so padding can never
-    # advance n-gram, short-conv, or compressed-key state.
-    cuda_graph_support = CudaGraphSupport(prefill_graph=False)
-
-    def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
-        super().__init__(config, spec)
-        self._ple_layers: tuple[Qwen4ExpPLELayer, ...] = ()
-        self._ple_verify_scratch: dict[str, torch.Tensor] = {}
-
-    def _preallocate_aux_verify_workspace(
-        self, max_bs: int, draft_token_num: int
-    ) -> int:
-        self._ensure_ple_verify_scratch(max_bs, draft_token_num)
-        return sum(tensor.nbytes for tensor in self._ple_verify_scratch.values())
-
-    @override
-    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
-        super()._publish_cache_pool(cache_pool)
-        self._ple_verify_scratch = {}
-        for layer in self._ple_layers:
-            layer.drop_verify_scratch()
-
-    def _ensure_ple_verify_scratch(self, max_bs: int, draft_token_num: int) -> None:
-        """Allocate graph-stable PLE context and convolution rollback rows."""
-        arena = getattr(self.kv_pool, "arena", None)
-        plan = getattr(arena, "plan", None)
-        if plan is None:
-            return
-        fields = [
-            field
-            for field in plan.fields
-            if field.group_id == QWEN4_EXP_PLE_CACHE_GROUP
-        ]
-        if not fields:
-            return
-        rows = max_bs * (draft_token_num + 1)
-        if self._ple_verify_scratch and all(
-            tensor.shape[0] >= rows for tensor in self._ple_verify_scratch.values()
-        ):
-            return
-        scratch: dict[str, torch.Tensor] = {}
-        for field in fields:
-            cache_field = arena.field(field.field_id)
-            scratch[field.field_id] = cache_field.new_zeros(
-                (rows, *cache_field.shape[1:])
-            )
-        self._ple_verify_scratch = scratch
-
-    def ple_verify_scratch(
-        self, context_field_id: str, layer_id: int
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Return shared context and per-layer PLE convolution verify rows."""
-        context = self._ple_verify_scratch.get(context_field_id)
-        conv = self._ple_verify_scratch.get(qwen4_exp_ple_conv_field(layer_id))
-        if context is None or conv is None:
-            return None
-        return context, conv
-
-    def bind_ple_layers(self, layers: Iterable[Qwen4ExpPLELayer]) -> None:
-        """Bind the stable model-owned PLE layers used by verify commits."""
-
-        bound = tuple(layers)
-        if self._ple_layers is bound:
-            return
-        if self._ple_layers:
-            same = len(self._ple_layers) == len(bound) and all(
-                previous is current
-                for previous, current in zip(self._ple_layers, bound, strict=True)
-            )
-            if not same:
-                raise RuntimeError("PLE backend cannot be rebound to another model")
-        self._ple_layers = bound
-
-    def _commit_aux_verified_state(
+    def __init__(
         self,
-        accepted_length: torch.Tensor,
-        pages_by_group: dict[str, torch.Tensor],
+        config: AttnConfig,
+        attention_backend: AttentionBackend,
+        ple_backend: Qwen4ExpPLEBackend | None,
+        indexer_backend: QSAIndexerBackend | None,
     ) -> None:
-        pages = pages_by_group.get(QWEN4_EXP_PLE_CACHE_GROUP)
-        if pages is None:
-            return
-        for layer in self._ple_layers:
-            layer.commit_verified(accepted_length, pages)
+        super().__init__(config, config.component(SoftmaxAttnConfig))
+        self.attention_backend = attention_backend
+        self.ple_backend = ple_backend
+        self.indexer_backend = indexer_backend
+
+    def child_backends(self) -> tuple[AttentionBackend, ...]:
+        return (self.attention_backend,) + tuple(
+            backend
+            for backend in (self.ple_backend, self.indexer_backend)
+            if backend is not None
+        )
+
+    @property
+    def cache_consumer_families(self) -> frozenset[str]:
+        return frozenset().union(
+            *(backend.cache_consumer_families for backend in self.child_backends())
+        )
+
+    def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
+        """Preallocate target verify consumers and return their total byte count."""
+        if self.is_draft or self.spec_num_tokens <= 1:
+            return 0
+        gdn = (
+            self.attention_backend.linear_attn_backend
+            if isinstance(self.attention_backend, HybridLinearAttnBackend)
+            else None
+        )
+        return sum(
+            consumer.preallocate_verify_workspace(max_bs, draft_token_num)
+            for consumer in (gdn, self.ple_backend, self.indexer_backend)
+            if consumer is not None
+        )
+
+    def init_cuda_graph_state(self, max_bs: int, **kwargs) -> None:
+        for backend in self.child_backends():
+            backend.init_cuda_graph_state(max_bs, **kwargs)
+
+    def init_forward_metadata(self, *args, **kwargs) -> None:
+        for backend in self.child_backends():
+            backend.init_forward_metadata(*args, **kwargs)
+
+    def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs) -> None:
+        for backend in self.child_backends():
+            backend.init_forward_metadata_capture_cuda_graph(*args, **kwargs)
+
+    def refresh_decode_metadata(self, *args, **kwargs) -> None:
+        for backend in self.child_backends():
+            backend.refresh_decode_metadata(*args, **kwargs)
+
+    def configure_runtime(self, **kwargs) -> None:
+        self._full_attn_backend.configure_runtime(**kwargs)
+
+    def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
+        self._full_attn_backend.init_prefill_graph_state(max_num_tokens, max_bs)
+
+    def register_step_counter(self, step_counter: StepCounter) -> None:
+        self.attention_backend.register_step_counter(step_counter)
+
+    def forward(self, *args, **kwargs):
+        # The attention child owns the break point and the single PD cache step.
+        return self.attention_backend.forward(*args, **kwargs)
+
+    @property
+    def sparse_topk(self) -> SparseTopKShare:
+        return self.attention_backend.sparse_topk
+
+    @property
+    def supports_layer_sliding_window(self) -> bool:
+        return self._full_attn_backend.supports_layer_sliding_window
+
+    def support_kv_cache_prewrite(self, forward_mode: ForwardMode | None) -> bool:
+        return self.attention_backend.support_kv_cache_prewrite(forward_mode)
+
+    def write_locations(
+        self, layer: PagedAttention, forward_mode: ForwardMode
+    ) -> torch.Tensor:
+        return self.attention_backend.write_locations(layer, forward_mode)
+
+    def publish_draft_step_locations(
+        self, cache_start: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
+        return self.attention_backend.publish_draft_step_locations(
+            cache_start, num_tokens
+        )
+
+    def draft_write_locations_uniform(
+        self, out: torch.Tensor, cache_start: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
+        return self.attention_backend.draft_write_locations_uniform(
+            out, cache_start, num_tokens
+        )
+
+    def draft_history_view(self):
+        return self.attention_backend.draft_history_view()
+
+    def decode_window_locations(self) -> torch.Tensor:
+        return self.attention_backend.decode_window_locations()
+
+    def extend_span_locations(self) -> torch.Tensor:
+        return self.attention_backend.extend_span_locations()
+
+    def override_num_extends(self, num_extends: int):
+        return self.attention_backend.override_num_extends(num_extends)
+
+    @property
+    def _full_attn_backend(self) -> AttentionBackend:
+        if isinstance(self.attention_backend, HybridLinearAttnBackend):
+            return self.attention_backend.full_attn_backend
+        return self.attention_backend
+
+    def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
+        self._full_attn_backend.advance_draft_forward_metadata(seq_lens)
+        if self.indexer_backend is not None:
+            self.indexer_backend.advance_draft_forward_metadata(seq_lens)
+
+    def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
+        # Hybrid's base implementation is a no-op; publish to the router itself.
+        self._full_attn_backend.update_draft_forward_metadata(frontier)
+        if self.indexer_backend is not None:
+            self.indexer_backend.update_draft_forward_metadata(frontier)
+
+    def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
+        self._full_attn_backend.fill_block_decode_seq_lens(bs, block_seq_lens)
+        if self.indexer_backend is not None:
+            self.indexer_backend.fill_block_decode_seq_lens(bs, block_seq_lens)
+
+    def commit_speculative_state_after_verify(
+        self, accepted_lengths: torch.Tensor, *, num_extends: int
+    ) -> None:
+        self.attention_backend.commit_speculative_state_after_verify(
+            accepted_lengths, num_extends=num_extends
+        )
+        if num_extends == 0 and self.ple_backend is not None:
+            self.ple_backend.commit_verified_state(accepted_lengths)
+        if self.indexer_backend is not None:
+            self.indexer_backend.commit_after_mtp_verify(
+                accepted_lengths, num_extends=num_extends
+            )
 
 
-def bind_qwen4_exp_side_state(
-    attn_backend: AttentionBackend,
-    ple_layers: Iterable[Qwen4ExpPLELayer],
-    qsa_indexers: Iterable[QSAIndexer],
-) -> None:
-    """Bind Qwen4-Exp PLE and QSA state to their owning backends."""
-
-    ple_layers = tuple(ple_layers)
-    qsa_indexers = tuple(qsa_indexers)
-    if ple_layers:
-        qwen4_exp_linear_backend(attn_backend).bind_ple_layers(ple_layers)
-    if qsa_indexers:
-        bind_qsa_indexers(attn_backend, qsa_indexers)
-
-
-__all__ = [
-    "Qwen4ExpMambaAttnBackend",
-    "bind_qwen4_exp_side_state",
-    "qwen4_exp_linear_backend",
-]
+__all__ = ["Qwen4ExpBackend", "qwen4_exp_backend"]

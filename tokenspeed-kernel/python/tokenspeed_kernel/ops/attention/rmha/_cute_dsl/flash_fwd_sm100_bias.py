@@ -23,7 +23,7 @@ import math
 import time
 from dataclasses import dataclass
 from functools import partial
-from typing import Callable, Literal, Optional, Tuple, Type
+from typing import Callable, Literal, Optional, Tuple
 
 import cuda.bindings.driver as cuda
 import cutlass

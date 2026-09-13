@@ -22,12 +22,19 @@
 
 from __future__ import annotations
 
+import os
+import sys
 import threading
 import time
 from types import SimpleNamespace
 
 import pytest
 import zmq
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed.runtime.engine import load_snapshot as load_snapshot_module
 from tokenspeed.runtime.engine.io_struct import LoadSnapshot, MsgpackDecoder
@@ -369,7 +376,7 @@ def _reporter(trace, scheduler_state, *, enabled=True):
         return {
             "num_queue_reqs": scheduler_state["waiting"],
             "num_active_pages": scheduler_state["active"],
-            "num_cached_pages": scheduler_state["used"],
+            "num_cached_pages": scheduler_state["cached"],
         }
 
     return load_snapshot_module.LoadReporter(
@@ -380,13 +387,14 @@ def _reporter(trace, scheduler_state, *, enabled=True):
     )
 
 
-def test_running_round_publishes_the_sample_the_loop_already_took():
+@pytest.mark.parametrize(("active", "cached"), [(4, 5), (16, 0), (0, 16)])
+def test_running_round_publishes_the_sample_the_loop_already_took(active, cached):
     """The active path never samples again: the loop passes its own stats."""
     trace = []
-    reporter = _reporter(trace, {"waiting": 3, "active": 4, "used": 5})
+    reporter = _reporter(trace, {"waiting": 3, "active": active, "cached": cached})
 
     reporter.observe(
-        {"num_queue_reqs": 3, "num_active_pages": 4, "num_cached_pages": 5},
+        {"num_queue_reqs": 3, "num_active_pages": active, "num_cached_pages": cached},
         num_running=2,
     )
 
@@ -396,8 +404,8 @@ def test_running_round_publishes_the_sample_the_loop_already_took():
             observed_tuple(
                 num_running_reqs=2,
                 num_waiting_reqs=3,
-                num_active_pages=4,
-                num_used_pages=5,
+                num_active_pages=active,
+                num_used_pages=active + cached,
                 max_total_pages=20,
             ),
         )
@@ -410,24 +418,24 @@ def test_frozen_rounds_sample_for_themselves():
     test_unchanged_values_only_emit_a_heartbeat), and the idle sleep bounds
     the rate to one sample per millisecond."""
     trace = []
-    scheduler_state = {"waiting": 0, "active": 0, "used": 0}
+    scheduler_state = {"waiting": 0, "active": 0, "cached": 0}
     reporter = _reporter(trace, scheduler_state)
 
     reporter.sample_and_observe(num_running=0)
-    scheduler_state.update(waiting=1, active=2, used=2)
+    scheduler_state.update(waiting=1, active=2, cached=2)
     reporter.sample_and_observe(num_running=0)
 
     assert trace == [
         "sample",
         ("observe", (0, 0, 0, 0, 20)),
         "sample",
-        ("observe", (0, 1, 2, 2, 20)),
+        ("observe", (0, 1, 2, 4, 20)),
     ]
 
 
 def test_non_reporting_rank_never_samples_the_scheduler():
     trace = []
-    reporter = _reporter(trace, {"waiting": 0, "active": 0, "used": 0}, enabled=False)
+    reporter = _reporter(trace, {"waiting": 0, "active": 0, "cached": 0}, enabled=False)
 
     reporter.sample_and_observe(num_running=0)
 
@@ -640,3 +648,7 @@ def test_store_rejects_non_positive_dp_size():
     """A store must have at least one rank to form a complete replica."""
     with pytest.raises(ValueError, match="dp_size"):
         LoadSnapshotStore(dp_size=0)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

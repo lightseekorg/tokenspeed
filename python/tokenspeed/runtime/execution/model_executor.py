@@ -343,7 +343,9 @@ class ModelExecutor:
         spec_num_tokens = config.spec_num_tokens if config.spec_algo is not None else 1
         self.input_buffers = InputBuffers(
             max_bs=max_bs,
-            max_num_tokens=config.chunked_prefill_size,
+            max_num_tokens=max(
+                config.chunked_prefill_size, max_bs * config.output_length
+            ),
             state_write_padding_pool_index=config.max_req_pool_size,
             device=self.device,
         )

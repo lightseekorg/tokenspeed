@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -45,7 +44,11 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 )
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
-    qwen4_exp_linear_backend,
+    qwen4_exp_backend,
+)
+from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple import (
+    PLEForwardMetadata,
+    Qwen4ExpPLEBackend,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_PLE_CACHE_GROUP,
@@ -60,9 +63,6 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     get_masked_input_and_mask,
 )
 from tokenspeed.runtime.utils import add_prefix
-
-if TYPE_CHECKING:
-    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
 _IndexBundle = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 # Uniform-batch index bundles captured into a CUDA graph. During capture the
@@ -452,11 +452,6 @@ class Qwen4ExpPLELayer(nn.Module):
             bias=False,
         )
         nn.init.zeros_(self.conv1d.weight)
-        self._verify_scratch: dict[
-            tuple[int, int], tuple[torch.Tensor, torch.Tensor]
-        ] = {}
-        self._active_verify_key: tuple[int, int] | None = None
-        self._last_pool: CachePool | None = None
 
     def _load_kv_proj_shard(
         self,
@@ -481,14 +476,17 @@ class Qwen4ExpPLELayer(nn.Module):
         )
 
     @staticmethod
-    def _linear_backend(ctx: ForwardContext):
-        return qwen4_exp_linear_backend(ctx.attn_backend)
+    def _ple_backend(ctx: ForwardContext) -> Qwen4ExpPLEBackend:
+        backend = qwen4_exp_backend(ctx.attn_backend).ple_backend
+        if backend is None:
+            raise RuntimeError("Qwen4-Exp PLE requires its PLE backend")
+        return backend
 
     @staticmethod
-    def _metadata(linear_backend):
-        metadata = getattr(linear_backend, "forward_metadata", None)
+    def _metadata(backend: Qwen4ExpPLEBackend) -> PLEForwardMetadata:
+        metadata = backend.forward_metadata
         if metadata is None:
-            raise RuntimeError("Qwen4-Exp PLE requires hybrid state metadata")
+            raise RuntimeError("Qwen4-Exp PLE metadata was not prepared")
         return metadata
 
     @staticmethod
@@ -562,19 +560,10 @@ class Qwen4ExpPLELayer(nn.Module):
         CPU lengths only have to fit inside them. They stay the single source
         of truth for what is real -- the caller slices to their sum.
         """
-        cpu_lengths = metadata.extend_seq_lens_cpu
-        if cpu_lengths is not None and cpu_lengths.numel() >= bs:
-            lengths = [int(value) for value in cpu_lengths[:bs].tolist()]
-            if sum(lengths) <= total_tokens:
-                return lengths
-        if bs == 0:
-            return []
-        if total_tokens % bs:
-            raise RuntimeError(
-                "Qwen4-Exp PLE cannot infer per-request token lengths from "
-                f"{total_tokens} tokens and batch size {bs}"
-            )
-        return [total_tokens // bs] * bs
+        lengths = metadata.query_lengths[:bs]
+        if len(lengths) != bs or sum(lengths) > total_tokens:
+            raise RuntimeError("Qwen4-Exp PLE query lengths exceed the supplied batch")
+        return lengths
 
     @staticmethod
     def _batch_indices(
@@ -834,66 +823,6 @@ class Qwen4ExpPLELayer(nn.Module):
             final_conv = values.new_empty((bs, channels, 0))
         return conv_output, final_conv, intermediate_conv
 
-    def _verify_scratch_for(
-        self,
-        bs: int,
-        width: int,
-        backend,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        key = (bs, width)
-        self._active_verify_key = key
-        rows = bs * (width + 1)
-        external = backend.ple_verify_scratch(self.context_field_id, self.layer_id)
-        if external is None:
-            raise RuntimeError("Qwen4-Exp PLE verify workspace was not preallocated")
-        if external[0].shape[0] < rows or external[1].shape[0] < rows:
-            raise RuntimeError(
-                "Qwen4-Exp PLE verify workspace is smaller than the "
-                f"captured batch: need {rows} rows"
-            )
-        scratch = (external[0][:rows], external[1][:rows])
-        self._verify_scratch[key] = scratch
-        return scratch
-
-    def drop_verify_scratch(self) -> None:
-        """Forget the workspace views; the backend reissues them for a rebound pool."""
-        self._verify_scratch.clear()
-        self._active_verify_key = None
-        self._last_pool = None
-
-    def commit_verified(
-        self,
-        accepted_lengths: torch.Tensor,
-        destination_pages: torch.Tensor,
-    ) -> None:
-        bs = accepted_lengths.shape[0]
-        active_width = self._active_verify_key[1] if self._active_verify_key else None
-        candidates = [
-            key
-            for key in self._verify_scratch
-            if key[0] >= bs and (active_width is None or key[1] == active_width)
-        ]
-        if not candidates:
-            return
-        # Graph capture owns one scratch tensor per padded batch bucket. Model
-        # Python does not run on replay, so `_active_verify_key` still names the
-        # last captured graph; the smallest bucket covering the live batch is
-        # the graph ForwardStepRunner selected for this step.
-        key = min(candidates, key=lambda value: value[0])
-        _, width = key
-        context_scratch, conv_scratch = self._verify_scratch[key]
-        accepted = accepted_lengths.to(torch.long).clamp(1, width)
-        source = torch.arange(bs, device=accepted.device) * (width + 1) + accepted
-        pool = self._last_pool
-        context_field = pool.arena.field(self.context_field_id)
-        conv_field = pool.arena.field(qwen4_exp_ple_conv_field(self.layer_id))
-        self._write_pages(
-            context_field, destination_pages, context_scratch.index_select(0, source)
-        )
-        self._write_pages(
-            conv_field, destination_pages, conv_scratch.index_select(0, source)
-        )
-
     def _final_context(
         self,
         flat_ids: torch.Tensor,
@@ -984,22 +913,17 @@ class Qwen4ExpPLELayer(nn.Module):
         """
         if ctx.forward_mode.is_idle() or hidden_states.shape[0] == 0:
             return hidden_states
-        linear_backend = self._linear_backend(ctx)
-        metadata = self._metadata(linear_backend)
-        in_blocks_by_group = metadata.state_in_blocks_by_group or {}
-        out_blocks_by_group = metadata.state_out_blocks_by_group or {}
-        if QWEN4_EXP_PLE_CACHE_GROUP not in in_blocks_by_group:
-            raise RuntimeError("Qwen4-Exp PLE cache group was not published")
+        backend = self._ple_backend(ctx)
+        metadata = self._metadata(backend)
         # A padded-bucket replay hands us bucket rows whose tail is filler, so
         # the lengths decide how many rows are real before anything reads them.
         lengths = self._lengths(metadata, input_ids.shape[0], ctx.bs)
         hidden_states, input_ids = slice_to_real_tokens(
             sum(lengths), hidden_states, input_ids
         )
-        input_pages = in_blocks_by_group[QWEN4_EXP_PLE_CACHE_GROUP][: ctx.bs]
-        output_pages = out_blocks_by_group[QWEN4_EXP_PLE_CACHE_GROUP][: ctx.bs]
+        input_pages = metadata.input_blocks[: ctx.bs]
+        output_pages = metadata.output_blocks[: ctx.bs]
         pool = ctx.token_to_kv_pool
-        self._last_pool = pool
         load_tracker = getattr(pool, "layerwise_load_tracker", None)
         if load_tracker is not None:
             load_tracker.wait_for_layer(self.layer_id)
@@ -1012,19 +936,16 @@ class Qwen4ExpPLELayer(nn.Module):
         index = self._batch_indices(lengths, input_ids.device)
         req, col, lengths_t, starts, _, total, _ = index
         flat_ids = input_ids.flatten()
-        verify = metadata.mamba_output_indices is not None
+        verify = metadata.verify_width is not None
         context_scratch = conv_scratch = None
         scratch_stride = 0
         if verify:
             # Both CUDA state producers write directly into this stable rollback
             # workspace, including each request's carried row.
-            width = max(lengths, default=0)
-            context_scratch, conv_scratch = self._verify_scratch_for(
-                ctx.bs,
-                width,
-                linear_backend,
+            context_scratch, conv_scratch = backend.ple_verify_scratch(
+                self.context_field_id, self.layer_id, ctx.bs
             )
-            scratch_stride = width + 1
+            scratch_stride = metadata.verify_width + 1
         if flat_ids.is_cuda:
             # The n-gram windows are gathered inside the hash kernel; verify
             # writes their state rows directly instead of returning a packed tail.

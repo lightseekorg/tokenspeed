@@ -325,7 +325,11 @@ class CacheGroupRouterTest(unittest.TestCase):
             SWA: _StubLeaf(2, is_draft=is_draft, spec=spec),
         }
         router = CacheGroupRouter(
-            None, is_draft=is_draft, spec_num_tokens=spec, device="cpu"
+            None,
+            is_draft=is_draft,
+            spec_num_tokens=spec,
+            device="cpu",
+            consumed_group_ids=None,
         )
         router.bind(_geometry(), leaves)
         router.init_cuda_graph_state(4)
@@ -351,9 +355,66 @@ class CacheGroupRouterTest(unittest.TestCase):
         self.assertFalse(router.supports_layer_sliding_window)
 
     def test_rejects_non_history_groups(self):
-        router = CacheGroupRouter(None, is_draft=False, spec_num_tokens=1, device="cpu")
+        router = CacheGroupRouter(
+            None,
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=None,
+        )
         with self.assertRaisesRegex(ValueError, "family 'state'"):
             router.bind(_geometry(), {"linear_attention_0": _StubLeaf(8)})
+
+    def test_explicit_groups_do_not_build_indexer_attention_leaves(self):
+        created = []
+
+        def create_leaf(group_id, block_granularity):
+            created.append(group_id)
+            return _StubLeaf(block_granularity)
+
+        groups = (FULL, "qwen4_exp_qsa", "qwen4_exp_qsa_recent")
+        pool = SimpleNamespace(
+            paged_group_ids=groups,
+            arena=SimpleNamespace(
+                cache_group_specs=tuple(
+                    SimpleNamespace(
+                        group_id=gid,
+                        family="history",
+                        retention="full_history",
+                        block_granularity=4,
+                        rows_per_page=4,
+                        entry_stride_tokens=1,
+                        sliding_window_tokens=None,
+                    )
+                    for gid in groups
+                )
+            ),
+        )
+        router = CacheGroupRouter(
+            create_leaf,
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=(FULL,),
+        )
+        router.set_cache_pool(pool)
+        router.init_cuda_graph_state(2)
+        # Rebinding must compare the same filtered group set as the first bind.
+        router.set_cache_pool(pool)
+        router.init_cuda_graph_state(2)
+        self.assertEqual(created, [FULL])
+        self.assertEqual(router.stacks.group_ids, (FULL,))
+        # Delivery belongs to the selected consumer; peer groups are not
+        # prerequisites for refreshing attention's own stable metadata.
+        router.refresh_decode_metadata(
+            2,
+            1,
+            torch.arange(2, dtype=torch.int32),
+            torch.tensor([1, 1], dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            block_tables={FULL: torch.tensor([[2]], dtype=torch.int32)},
+        )
+        self.assertEqual(router.stacks.table(FULL, 1)[0, 0].item(), 2)
 
     def test_refresh_hands_each_leaf_its_own_kernel_page_table(self):
         router, leaves = self._router()
@@ -759,7 +820,13 @@ class CacheGroupRouterTest(unittest.TestCase):
 
     def test_single_group_model_surface_proxies_to_the_sole_leaf(self):
         leaf = _StubLeaf(4)
-        router = CacheGroupRouter(None, is_draft=False, spec_num_tokens=1, device="cpu")
+        router = CacheGroupRouter(
+            None,
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=None,
+        )
         router.bind(_geometry(), {FULL: leaf})
         self.assertEqual(router.chunked_prefill_metadata, "chunk-meta")
         multi, _ = self._router()
@@ -916,7 +983,11 @@ class CacheGroupRouterRebindTest(unittest.TestCase):
             return leaf
 
         router = CacheGroupRouter(
-            factory, is_draft=False, spec_num_tokens=1, device="cpu"
+            factory,
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=None,
         )
         return router, built
 
@@ -1041,9 +1112,9 @@ class CacheGroupRouterRebindTest(unittest.TestCase):
                 super().__init__()
                 self._verify_scratch = slab[1:3]
 
-        node = SimpleNamespace(_speculative_state_backends=[_Side()])
+        node = SimpleNamespace(indexer_backend=_Side())
         self.assertEqual(len(reachable_tensors(node)), 1)
-        with self.assertRaisesRegex(AssertionError, "_speculative_state_backends"):
+        with self.assertRaisesRegex(AssertionError, "indexer_backend"):
             assert_no_alias(node, storages_of(slab))
 
     def test_a_rebound_router_matches_a_fresh_one_field_by_field(self):

@@ -55,7 +55,9 @@ class _Leaf:
 
 
 def _draft_router(rows: int = 8) -> CacheGroupRouter:
-    router = CacheGroupRouter(None, is_draft=True, spec_num_tokens=4, device="cpu")
+    router = CacheGroupRouter(
+        None, is_draft=True, spec_num_tokens=4, device="cpu", consumed_group_ids=None
+    )
     router.bind(
         CacheGroupGeometry(
             granularities={FULL: 128},
@@ -131,11 +133,12 @@ class IdleReplayScrubTest(unittest.TestCase):
                 # with placeholders before this call; snapshot what the
                 # drafter's recorded kernels would read.
                 captured["extend_kwargs"] = extend_kwargs
+                captured["attn_backend"] = ctx.attn_backend
                 _refresh(router, padded_bs, 0, None)
                 captured["rows"] = router.draft_history_view().table[:padded_bs].clone()
 
         ex = SimpleNamespace(
-            attn_backend=None,
+            attn_backend=object(),
             token_to_kv_pool=None,
             input_buffers=SimpleNamespace(
                 req_pool_indices_buf=torch.zeros(8, dtype=torch.int64),
@@ -166,6 +169,7 @@ class IdleReplayScrubTest(unittest.TestCase):
             ),
         )
         self.assertTrue((captured["rows"] == 0).all(), captured["rows"])
+        self.assertIs(captured["attn_backend"], ex.attn_backend)
         # The idle replay hands the runner empty extend slices, never None.
         extend_kwargs = captured["extend_kwargs"]
         self.assertIs(extend_kwargs["extend_with_prefix"], False)

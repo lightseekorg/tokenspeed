@@ -25,7 +25,7 @@ Correctness check: approximate match against torch reference (IPC-based reductio
 from NCCL reduction order, so bf16 results may differ slightly -- this is expected).
 
 Run with:
-    pytest tokenspeed-kernel/test/thirdparty/test_trtllm_comm.py -v
+    pytest tokenspeed-kernel/test/nvidia/thirdparty/test_trtllm_comm.py -v
 """
 
 import multiprocessing as mp
