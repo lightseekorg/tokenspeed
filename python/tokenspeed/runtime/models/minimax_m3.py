@@ -28,13 +28,24 @@ from collections.abc import Iterable, Sequence
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import swiglu_oai
-from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
-from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.thirdparty.cuda.minimax_m3_fused import (
-    fused_qknorm_rope_kv_insert,
-)
+
+if current_platform().is_npu:
+    # MiniMax-M3 is NVIDIA-only: its fused CUDA kernels (and the tvm_ffi FFI
+    # they depend on) are not part of the Ascend stack. Bind None so the
+    # module still imports for the model registry on NPU; any forward that
+    # actually reaches these kernels fails with a clear error instead of a
+    # NameError. GPU platforms keep the exact original imports below.
+    dsv3_router_gemm = None
+    moe_finalize_fuse_shared = None
+    fused_qknorm_rope_kv_insert = None
+else:
+    from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
+    from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
+    from tokenspeed_kernel.thirdparty.cuda.minimax_m3_fused import (
+        fused_qknorm_rope_kv_insert,
+    )
 from torch import nn
 from transformers import MiniMaxM3VLTextConfig
 
