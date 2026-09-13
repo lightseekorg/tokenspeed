@@ -28,10 +28,13 @@ the current forward's selection and immutable query-address plans. Memory-only w
 Request indices below are BATCH TABLE ROWS, not request-pool slots. Obtain the
 ordinary full-query inputs from query_metadata(mode); CED may explicitly subset
 those positions. A source must select every query needed by its Reuse consumers.
+Compressor projections cover the full canonical query window: request spans have
+consecutive positions, so pair metadata is prepared once by direct row lookup.
 """
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 
@@ -56,6 +59,33 @@ from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v41 import (
 from tokenspeed.runtime.layers.attention.registry import register_backend
 
 
+class V41CompressorPlan(NamedTuple):
+    """Current-forward pair indices and addresses shared by all ratio-2 owners.
+
+    Contains no projected inputs or request history. Decode storage is allocated
+    at max_decode_bs and refreshed in place before eager or graph execution.
+    """
+
+    active: torch.Tensor
+    pair_positions: torch.Tensor
+    pair_requests: torch.Tensor
+    previous: torch.Tensor
+    read_slots: torch.Tensor
+    write_slots: torch.Tensor
+
+    @classmethod
+    def allocate(cls, n: int, device: torch.device):
+        return cls(
+            torch.empty(n, dtype=torch.bool, device=device),
+            *(torch.empty(n, dtype=torch.int64, device=device) for _ in range(5)),
+        )
+
+    def window(self, start: int, stop: int):
+        # Only prefix views or the one-row-per-request mixed decode suffix are
+        # used: predecessor indices remain local without an offset adjustment.
+        return V41CompressorPlan(*(value[start:stop] for value in self))
+
+
 @dataclass
 class V41Metadata:
     block_tables: dict[str, torch.Tensor]
@@ -67,6 +97,7 @@ class V41Metadata:
     swa_write_slots: torch.Tensor
     swa_read_slots: torch.Tensor | None
     swa_read_lens: torch.Tensor | None
+    compressor: V41CompressorPlan
 
 
 @dataclass
@@ -194,6 +225,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 (max_bs, 128), -1, dtype=torch.int32, device=self.device
             ),
             swa_read_lens=torch.zeros(max_bs, dtype=torch.int32, device=self.device),
+            compressor=V41CompressorPlan.allocate(max_bs, self.device),
         )
 
     def _decode_view(self, bs: int) -> V41Metadata:
@@ -211,6 +243,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 b.swa_write_slots[:bs],
                 b.swa_read_slots[:bs],
                 b.swa_read_lens[:bs],
+                b.compressor.window(0, bs),
             )
         return self._decode_views_by_bs[bs]
 
@@ -269,12 +302,25 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             actual_bs,
             num_extends,
         )
+        self._prepare_compressor(meta)
         self._refresh_decode_window(meta, actual_bs)
         if num_extends:
             self.sparse_topk.decode = None
         else:
             self.forward_prefill_metadata = None
             self.sparse_topk.clear()
+
+    def _prepare_compressor(self, metadata: V41Metadata) -> None:
+        from tokenspeed_kernel.ops.attention.dsv41 import compressor_metadata
+
+        gid = V41_COMPRESSOR_TAIL_GROUP_ID
+        compressor_metadata(
+            metadata.positions,
+            metadata.request_indices,
+            metadata.block_tables[gid],
+            self.cache_pool.arena.cache_group_page_counts[gid],
+            *metadata.compressor,
+        )
 
     def _decode_window(self, positions, requests):
         wanted = (positions - 127).clamp_min(0)[:, None] + torch.arange(
@@ -389,7 +435,14 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             torch.empty(total, dtype=torch.int64, device=self.device),
             None,
             None,
+            V41CompressorPlan.allocate(total, self.device),
         )
+        self._prepare_compressor(meta)
+        plan = meta.compressor
+        if bool((plan.active & (plan.previous < 0) & (plan.read_slots < 0)).any()):
+            raise RuntimeError(
+                "V4.1 required compressor tail is absent; request needs recovery"
+            )
         self.forward_metadata = meta
         meta.swa_write_slots.copy_(
             self.cache_slots(V41_SWA_GROUP_ID, positions, requests, ForwardMode.MIXED)
@@ -405,6 +458,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             meta.swa_write_slots[:n],
             None,
             None,
+            meta.compressor.window(0, n),
         )
         self.forward_decode_metadata = V41Metadata(
             tables,
@@ -416,6 +470,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             meta.swa_write_slots[n:],
             torch.empty((total - n, 128), dtype=torch.int32, device=self.device),
             torch.empty(total - n, dtype=torch.int32, device=self.device),
+            meta.compressor.window(n, total),
         )
         self._refresh_decode_window(self.forward_decode_metadata, bs - num_extends)
         self.sparse_topk.clear()
@@ -568,22 +623,28 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         owner,
         content,
         scores,
-        positions,
-        request_indices,
         forward_mode,
         norm_weight,
         norm_eps,
     ):
-        """Pool a ratio-2 owner's projected inputs, without norm or RoPE.
+        """Pool projected inputs in query_metadata(forward_mode) row order.
 
-        Inputs: FP32 [T,512] content/scores and absolute token positions/table
-        rows. Returns (FP32 pooled rows, pair-start RoPE positions, requests).
-        Capacity is T on eager AND graph paths: row i is active only when input
-        position i is odd and nonnegative. Inactive pooled rows are zero, with
-        position/request -1; consumers must keep these masks (do not compact).
-        The caller casts to activation dtype BEFORE RMSNorm, then derives index
-        K before main RoPE. Decode history is validated by the common refresh.
+        Inputs: FP32 [T,512] content/scores for the complete canonical query
+        window, plus optional RMSNorm weight and epsilon. Reordered/subset rows
+        must not be passed to this entry point. Pairing and tail addresses come
+        from the current forward's shared compressor plan; all request history
+        stays in LCM. Metadata preparation validates dependencies before layers.
+
+        Returns pooled rows and pair-start positions/requests, all with capacity
+        T on eager and graph paths. Inactive outputs are zero with coordinates
+        -1. With norm_weight, output is BF16 and pooling is rounded to BF16 BEFORE
+        RMSNorm; otherwise output is FP32. RoPE remains model-owned.
         """
+        meta = self.query_metadata(forward_mode)
+        positions = meta.positions
+        active, pair_positions, pair_requests, previous, slots, write_slots = (
+            meta.compressor
+        )
         if content.dtype != torch.float32 or scores.dtype != torch.float32:
             raise ValueError("V4.1 ratio-2 projection/pooling requires FP32 inputs")
         if self.spec.compress_ratios[owner] != 2:
@@ -591,45 +652,6 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._owner_group(owner)
         if content.shape != (positions.numel(), 512) or scores.shape != content.shape:
             raise ValueError("compressor content/scores must be [tokens, 512]")
-        if content.is_cuda:
-            from tokenspeed_kernel.ops.attention import dsv41
-
-            gid = V41_COMPRESSOR_TAIL_GROUP_ID
-            active, pair_positions, pair_requests, previous, slots, write_slots = (
-                dsv41.compressor_metadata(
-                    positions,
-                    request_indices,
-                    self.query_metadata(forward_mode).block_tables[gid],
-                    self.context_len,
-                    self.cache_pool.arena.cache_group_page_counts[gid],
-                )
-            )
-        else:
-            active = (positions >= 0) & (positions % 2 == 1)
-            pair_positions = (positions - 1).masked_fill(~active, -1)
-            pair_requests = request_indices.masked_fill(~active, -1)
-            if not positions.numel():
-                return (
-                    content.to(
-                        torch.bfloat16 if norm_weight is not None else content.dtype
-                    ).clone(),
-                    pair_positions,
-                    pair_requests,
-                )
-            previous = self._lookup_rows(
-                positions, request_indices, pair_positions, pair_requests
-            )
-            slots = self.cache_slots(
-                V41_COMPRESSOR_TAIL_GROUP_ID,
-                pair_positions,
-                pair_requests,
-                forward_mode,
-            )
-        missing = active & (previous < 0)
-        if not forward_mode.is_decode() and bool((missing & (slots < 0)).any()):
-            raise RuntimeError(
-                "V4.1 required compressor tail is absent; request needs recovery"
-            )
         # Read before any writes: a scheduler-reused tail page must not destroy
         # the odd-prefix input needed by the first completed pair in this chunk.
         tail = self.cache_pool.compressor_tail(owner)
@@ -648,6 +670,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 norm_eps,
             )
         else:
+            missing = active & (previous < 0)
             pooled = torch.empty_like(content)
             for start in range(0, positions.numel(), 8):
                 stop = min(start + 8, positions.numel())
@@ -675,9 +698,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         if content.is_cuda:
             dsv41.compressor_tail_scatter(content, scores, tail, write_slots)
         else:
-            self.write_compressor_tail(
-                owner, content, scores, positions, request_indices, forward_mode
-            )
+            live = write_slots >= 0
+            tail[write_slots[live] // 2, write_slots[live] % 2, 0] = content[live]
+            tail[write_slots[live] // 2, write_slots[live] % 2, 1] = scores[live]
         return pooled, pair_positions, pair_requests
 
     def write_global(

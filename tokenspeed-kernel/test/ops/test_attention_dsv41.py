@@ -922,3 +922,97 @@ def test_native_prefill_workspace_matches_joint_softmax(query_chunk_size):
     ]
     expected = torch.bmm(probs, selected).bfloat16()
     torch.testing.assert_close(out, expected, rtol=0.02, atol=0.004)
+
+
+def _compressor_metadata_reference(positions, requests, table, pages):
+    positions, requests, table = positions.cpu(), requests.cpu(), table.cpu()
+    sources = {(int(r), int(p)): i for i, (p, r) in enumerate(zip(positions, requests))}
+
+    def slot(p, r):
+        if p < 0 or not 0 <= r < table.shape[0] or p // 2 >= table.shape[1]:
+            return -1
+        page = int(table[r, p // 2])
+        return page * 2 + p % 2 if 0 < page < pages else -1
+
+    rows = []
+    for p, r in zip(positions.tolist(), requests.tolist(), strict=True):
+        active = p >= 0 and p % 2 == 1
+        pair, request = (p - 1, r) if active else (-1, -1)
+        previous = sources.get((request, pair), -1) if active and r >= 0 else -1
+        rows.append((active, pair, request, previous, slot(pair, request), slot(p, r)))
+    return tuple(
+        torch.tensor([row[i] for row in rows], dtype=dtype)
+        for i, dtype in enumerate(
+            (
+                torch.bool,
+                positions.dtype,
+                requests.dtype,
+                torch.int64,
+                torch.int64,
+                torch.int64,
+            )
+        )
+    )
+
+
+@pytest.mark.parametrize("n", [0, 1, 16, 128, 129, 257, 8192, 32768])
+@pytest.mark.parametrize("target", ["cpu", "cuda"])
+def test_compressor_metadata_consecutive_requests_and_refresh(n, target):
+    if target == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA/ROCm")
+    indices = torch.arange(n)
+    requests = (indices // 257).to(torch.int32)
+    positions = indices % 257 + 3 + requests % 2
+    # Reorder whole request spans, retaining each request's internal order.
+    order = torch.argsort(-requests, stable=True)
+    positions, requests = positions[order], requests[order]
+    positions[11::31] = -1
+    requests[19::43] = -1
+    p = torch.empty(n * 2, dtype=torch.int64, device=target)[::2]
+    r = torch.empty(n * 3, dtype=torch.int32, device=target)[::3]
+    p.copy_(positions)
+    r.copy_(requests)
+    table = torch.ones(
+        (max(1, (n + 256) // 257), 264), dtype=torch.int32, device=target
+    )[:, ::2]
+    table[:, 13::17] = 0
+    table[:, 29::37] = 4  # Out-of-capacity pages must resolve to -1 too.
+    out = tuple(
+        torch.empty(n, dtype=dtype, device=target)
+        for dtype in (
+            torch.bool,
+            torch.int64,
+            torch.int32,
+            torch.int64,
+            torch.int64,
+            torch.int64,
+        )
+    )
+
+    def prepare():
+        dsv41.compressor_metadata(p, r, table, 4, *out)
+
+    prepare()
+    for got, want in zip(
+        out, _compressor_metadata_reference(p, r, table, 4), strict=True
+    ):
+        torch.testing.assert_close(got.cpu(), want, rtol=0, atol=0)
+    if target == "cuda":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            prepare()
+    for step in range(3):
+        p.add_(1)
+        table[:, :4] = 2 if step % 2 else 0
+        if step == 2:
+            p.fill_(-1)
+        for value in out:
+            value.fill_(1)
+        if target == "cuda":
+            graph.replay()
+        else:
+            prepare()
+        for got, want in zip(
+            out, _compressor_metadata_reference(p, r, table, 4), strict=True
+        ):
+            torch.testing.assert_close(got.cpu(), want, rtol=0, atol=0)

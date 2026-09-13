@@ -695,14 +695,66 @@ def selection_table(positions, requests, table, ratio):
     return _kernel("selection_table", positions)(positions, requests, table, ratio)
 
 
-def compressor_metadata(positions, requests, table, context_len, pages):
-    """Derive ratio-2 pair coordinates and retained tail addresses.
+def compressor_metadata(
+    positions,
+    requests,
+    table,
+    pages,
+    active,
+    pair_positions,
+    pair_requests,
+    previous,
+    read_slots,
+    write_slots,
+):
+    """Fill ratio-2 pair coordinates and LCM tail addresses in O(N).
 
-    positions and requests are integer [N]; table is the LCM tail page table.
-    Returns active[N], pair positions[N], pair requests[N], predecessor indices[N],
-    read slots[N] and write slots[N]. Inactive coordinates and absent rows use -1.
-    context_len bounds logical keys, and pages bounds physical residency.
+    positions/requests are integer [N] in request-major order, with consecutive
+    positions within each request. Whole request spans may be reordered; arbitrary
+    token permutations are unsupported. The metadata producer owns this layout.
+    table is the LCM tail page table; pages bounds physical residency.
+
+    Destinations are contiguous [N]: bool active and integer pair_positions,
+    pair_requests, previous, read_slots, write_slots. previous indexes the input
+    rows, or is -1 for a predecessor outside the current span. Inactive pair
+    coordinates and absent addresses use -1. Every destination is overwritten
+    in place, including padding, so callers can reuse storage under CUDA graphs.
+    Returns None. Inputs and destinations must not alias.
     """
-    return _kernel("compressor_metadata", positions)(
-        positions, requests, table, context_len, pages
+    if not positions.is_cuda:
+        from tokenspeed_kernel.ops.attention.triton.page_table import (
+            bounded_group_slots,
+        )
+
+        active.copy_((positions >= 0) & (positions % 2 == 1))
+        pair_positions.copy_((positions - 1).masked_fill(~active, -1))
+        pair_requests.copy_(requests.masked_fill(~active, -1))
+        previous.fill_(-1)
+        in_batch = (
+            active[1:]
+            & (requests[1:] >= 0)
+            & (requests[:-1] == requests[1:])
+            & (positions[:-1] == pair_positions[1:])
+        )
+        previous[1:].copy_(
+            torch.arange(max(positions.numel() - 1, 0)).masked_fill(~in_batch, -1)
+        )
+        read_slots.copy_(
+            bounded_group_slots(pair_positions, pair_requests, table, 2, 1, 1, pages)
+        )
+        write_slots.copy_(
+            bounded_group_slots(positions, requests, table, 2, 1, 1, pages)
+        )
+        return
+    _kernel("compressor_metadata", positions)(
+        positions,
+        requests,
+        table,
+        pages,
+        active,
+        pair_positions,
+        pair_requests,
+        previous,
+        read_slots,
+        write_slots,
     )

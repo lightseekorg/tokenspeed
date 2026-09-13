@@ -230,10 +230,9 @@ class _Backend:
     def query_metadata(self, mode):
         return self.meta
 
-    def compress(
-        self, owner, content, scores, positions, requests, mode, norm_weight, norm_eps
-    ):
+    def compress(self, owner, content, scores, mode, norm_weight, norm_eps):
         assert content.dtype == scores.dtype == torch.float32
+        positions, requests = self.meta.positions, self.meta.request_indices
         self.projections[owner] = (content.clone(), scores.clone())
         cutoff = content.shape[0] // 2 * 2
         pooled = (

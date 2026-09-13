@@ -521,8 +521,6 @@ class DeepseekV41Compressor(nn.Module):
                 owner,
                 content,
                 scores,
-                positions,
-                requests,
                 mode,
                 self.norm.weight,
                 self.norm.variance_epsilon,

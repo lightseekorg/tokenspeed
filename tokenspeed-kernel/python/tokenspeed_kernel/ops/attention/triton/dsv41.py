@@ -2311,20 +2311,18 @@ def selection_table(positions, requests, table, ratio):
     return out, lengths
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["N"])
 def _compressor_metadata(
     Positions,
     Requests,
     Table,
-    Keys,
-    Order,
     Active,
     PairPositions,
     PairRequests,
     Previous,
     ReadSlots,
     WriteSlots,
-    N: tl.constexpr,
+    N,
     P0: tl.constexpr,
     R0: tl.constexpr,
     TR: tl.constexpr,
@@ -2332,50 +2330,37 @@ def _compressor_metadata(
     TS0: tl.constexpr,
     TS1: tl.constexpr,
     PAGES: tl.constexpr,
-    GRAIN: tl.constexpr,
-    SCAN: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    position = tl.load(Positions + row * P0).to(tl.int64)
-    request = tl.load(Requests + row * R0).to(tl.int64)
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    position = tl.load(Positions + row * P0, row < N, -1).to(tl.int64)
+    request = tl.load(Requests + row * R0, row < N, -1).to(tl.int64)
     active = (position >= 0) & (position % 2 == 1)
     pair = tl.where(active, position - 1, -1)
     pair_request = tl.where(active, request, -1)
-    previous = tl.full((), -1, tl.int64)
-    if SCAN:
-        indices = tl.arange(0, SCAN)
-        source_position = tl.load(Positions + indices * P0, indices < N, -1)
-        source_request = tl.load(Requests + indices * R0, indices < N, -1)
-        match = (
-            (indices < N) & (source_position == pair) & (source_request == pair_request)
-        )
-        previous = tl.min(tl.where(match, indices, N), 0).to(tl.int64)
-        previous = tl.where(previous < N, previous, -1)
-    else:
-        wanted = pair_request * GRAIN + pair
-        left = tl.full((), 0, tl.int32)
-        right = tl.full((), N, tl.int32)
-        while left < right:
-            mid = (left + right) // 2
-            value = tl.load(Keys + mid)
-            lower = value < wanted
-            left = tl.where(lower, mid + 1, left)
-            right = tl.where(lower, right, mid)
-        key = tl.load(Keys + left, left < N, -1)
-        previous = tl.load(Order + left, (left < N) & (key == wanted), -1)
-    previous = tl.where(active & (request >= 0), previous, -1)
+    prior_position = tl.load(Positions + (row - 1) * P0, (row > 0) & (row < N), -1)
+    prior_request = tl.load(Requests + (row - 1) * R0, (row > 0) & (row < N), -1)
+    previous = tl.where(
+        active
+        & (request >= 0)
+        & (row > 0)
+        & (prior_position == pair)
+        & (prior_request == request),
+        row - 1,
+        -1,
+    )
     read_slot = resolve_group_slot(
         Table, pair, pair_request, TR, TC, TS0, TS1, 2, 1, 1, PAGES
     )
     write_slot = resolve_group_slot(
         Table, position, request, TR, TC, TS0, TS1, 2, 1, 1, PAGES
     )
-    tl.store(Active + row, active)
-    tl.store(PairPositions + row, pair)
-    tl.store(PairRequests + row, pair_request)
-    tl.store(Previous + row, previous)
-    tl.store(ReadSlots + row, read_slot)
-    tl.store(WriteSlots + row, write_slot)
+    tl.store(Active + row, active, row < N)
+    tl.store(PairPositions + row, pair, row < N)
+    tl.store(PairRequests + row, pair_request, row < N)
+    tl.store(Previous + row, previous, row < N)
+    tl.store(ReadSlots + row, read_slot, row < N)
+    tl.store(WriteSlots + row, write_slot, row < N)
 
 
 @register_kernel(
@@ -2387,37 +2372,42 @@ def _compressor_metadata(
     capability=_CAPABILITY,
     priority=Priority.PORTABLE,
 )
-def compressor_metadata(positions, requests, table, context_len, pages):
-    """Find each completed pair's predecessor and LCM tail addresses."""
+def compressor_metadata(
+    positions,
+    requests,
+    table,
+    pages,
+    active,
+    pair_positions,
+    pair_requests,
+    previous,
+    read_slots,
+    write_slots,
+):
+    """Fill a ratio-2 plan for consecutive rows within each request in O(N)."""
     n = positions.numel()
     _integers(positions, (n,), "positions")
     _integers(requests, (n,), "requests")
     if table.ndim != 2:
         raise ValueError("Compressor tail page table must be two-dimensional")
     _integers(table, table.shape, "table")
-    _same_device(positions, (requests, table))
-    active = torch.empty(n, dtype=torch.bool, device=positions.device)
-    pair_positions = torch.empty_like(positions)
-    pair_requests = torch.empty_like(requests)
-    previous, read_slots, write_slots = (
-        torch.empty(n, dtype=torch.int64, device=positions.device) for _ in range(3)
-    )
     out = active, pair_positions, pair_requests, previous, read_slots, write_slots
+    _same_device(positions, (requests, table, *out))
+    if active.shape != (n,) or active.dtype != torch.bool:
+        raise ValueError("active must be bool [N]")
+    for name, value in zip(
+        ("pair_positions", "pair_requests", "previous", "read_slots", "write_slots"),
+        out[1:],
+        strict=True,
+    ):
+        _integers(value, (n,), name)
+    if any(not value.is_contiguous() for value in out):
+        raise ValueError("Compressor metadata outputs must be contiguous")
     if n:
-        # Scan small query tiles directly; sorting bounds the larger prefill
-        # lookup to O(N log N). Neither algorithm assumes query ordering.
-        scan = triton.next_power_of_2(n) if n <= 128 else 0
-        keys, order = (
-            (None, None)
-            if scan
-            else (requests.to(torch.int64) * (context_len + 1) + positions).sort()
-        )
-        _compressor_metadata[(n,)](
+        _compressor_metadata[(triton.cdiv(n, 256),)](
             positions,
             requests,
             table,
-            keys,
-            order,
             *out,
             n,
             positions.stride(0),
@@ -2425,8 +2415,6 @@ def compressor_metadata(positions, requests, table, context_len, pages):
             *table.shape,
             *table.stride(),
             pages,
-            context_len + 1,
-            scan,
+            BLOCK=256,
             num_warps=4,
         )
-    return out
