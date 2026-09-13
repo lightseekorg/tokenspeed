@@ -1995,10 +1995,8 @@ class DeepseekV4MoE(nn.Module):
                 activation="swiglu",
                 swiglu_limit=getattr(config, "swiglu_limit", None),
                 with_bias=False,
-                # FlashInfer's standard MXFP4 kernel performs routing in-kernel.
-                # Keep precomputed top-k for backends that require it; for
-                # FlashInfer, MoELayer repacks the already-selected routes into
-                # router logits before invoking the kernel.
+                # Older FlashInfer kernels require logits; use precomputed
+                # routes when the selected kernel advertises that capability.
                 routing_mode=(
                     None
                     if get_moe_backend().is_flashinfer_trtllm()
@@ -2047,7 +2045,7 @@ class DeepseekV4MoE(nn.Module):
         topk_ids: torch.Tensor,
         router_scores: torch.Tensor,
     ):
-        if self.experts.topk_output_format.is_bypassed():
+        if not self.experts.supports_precomputed_topk:
             router_logits = pack_topk_as_router_logits(
                 topk_weights, topk_ids, self.config.n_routed_experts
             )
