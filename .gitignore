@@ -197,3 +197,6 @@ Testing/
 
 AGENTS.local.md
 outputs/
+# torch.compile debug artifacts (V3 verifier accidental commit; do not track)
+torch_compile_debug/
+
