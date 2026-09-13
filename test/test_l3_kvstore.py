@@ -1584,6 +1584,24 @@ class MooncakeKvStoreTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "batch_get_into returned 1"):
             adapter.batch_get_into(["k0", "k1"], host, [0, 8], [8, 8])
 
+    def test_short_get_into_is_a_failed_prefetch(self):
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = SimpleNamespace(
+            batch_get_into=lambda keys, ptrs, sizes: [int(sizes[0]) // 2, int(sizes[1])]
+        )
+        host = SimpleNamespace(data_ptr=lambda: 100)
+        self.assertEqual(
+            adapter.batch_get_into(["k0", "k1"], host, [0, 8], [8, 8]),
+            [False, True],
+        )
+        adapter.store = SimpleNamespace(
+            batch_get_into=lambda keys, ptrs, sizes: [0, -1]
+        )
+        self.assertEqual(
+            adapter.batch_get_into(["k0", "k1"], host, [0, 8], [8, 8]),
+            [False, False],
+        )
+
     def test_namespace_clear_uses_anchored_escaped_regex(self):
         adapter = object.__new__(MooncakeKvStore)
         store = mock.Mock()

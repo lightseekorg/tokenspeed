@@ -256,11 +256,10 @@ class MooncakeKvStore:
             raise ValueError("ragged L3 get")
         base = host_buffer_ptr(host_buffer)
         ptrs = [base + int(offset) for offset in offsets]
-        results = self.store.batch_get_into(
-            list(keys), ptrs, [int(size) for size in sizes]
-        )
+        requested = [int(size) for size in sizes]
+        results = self.store.batch_get_into(list(keys), ptrs, requested)
         _require_result_len(results, len(keys), op="batch_get_into")
-        return [int(result) > 0 for result in results]
+        return [int(result) == size for result, size in zip(results, requested)]
 
     def batch_put_from(
         self,

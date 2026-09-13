@@ -387,7 +387,8 @@ previous checkpoint or entering NCCL weight broadcasts alone. A
 `batch_exists` hit is not a lease: if
 `batch_get_into` misses after Admit, the runtime unregisters the key,
 skips publishing empty Host pages, and retracts the batch snapshot-less
-so the next admit recomputes those tokens. Failed `batch_get_into` pages
+so the next admit recomputes those tokens. A short Mooncake read (fewer
+bytes than the requested page) is a miss, not a success. Failed `batch_get_into` pages
 stay unread so a later `batch_exists` hit cannot re-register them and
 retry the same prefetch; only replica-converged misses are blacklisted.
 Replica admission MIN-reduces local readability (exists and not unread).

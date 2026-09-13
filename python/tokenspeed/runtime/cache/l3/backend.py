@@ -952,7 +952,7 @@ class KvStoreStorage(Protocol):
         offsets: Sequence[int],
         sizes: Sequence[int],
     ) -> list[bool]:
-        """Read objects into Host buffer slices. True means the copy succeeded."""
+        """Read objects into Host buffer slices. True means a full-size copy."""
 
     def batch_put_from(
         self,

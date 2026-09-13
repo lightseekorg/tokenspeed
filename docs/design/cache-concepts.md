@@ -707,7 +707,9 @@ Its responsibilities:
   while the live set stays below capacity. Admit-time registration
   restores keys that were dropped from the shadow.
   That probe is not a lease: after Admit
-  allocates Host pages, `batch_get_into` can still miss. Prefetch runs
+  allocates Host pages, `batch_get_into` can still miss. A positive but
+  short Mooncake byte count is a miss, not a success: the unread suffix
+  would keep stale Host bytes. Prefetch runs
   on the control plane (CPU, same as `batch_exists`), is MIN-reduced
   across the replica, and a miss unregisters the keys, skips H2D /
   skips publishing empty Host pages (`LoadBackDone.success=false`),
