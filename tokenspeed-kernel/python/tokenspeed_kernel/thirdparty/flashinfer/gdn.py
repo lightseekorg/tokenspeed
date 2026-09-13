@@ -25,32 +25,46 @@ from __future__ import annotations
 import functools
 
 import torch
-from flashinfer.gdn_kernels.gdn_decode_mtp import (
-    get_tile_v_mtp,
-    get_vec_size_mtp,
-)
+from tokenspeed_kernel.platform import current_platform
 
-# Preserve independent availability checks for optional FlashInfer entry points.
-try:
-    from flashinfer.gdn_prefill import chunk_gated_delta_rule as _original_prefill
-except ImportError:
+if current_platform().is_nvidia:
+    from flashinfer.gdn_kernels.gdn_decode_mtp import (
+        get_tile_v_mtp,
+        get_vec_size_mtp,
+    )
+
+    # Preserve independent availability checks for optional FlashInfer entry points.
+    try:
+        from flashinfer.gdn_prefill import chunk_gated_delta_rule as _original_prefill
+    except ImportError:
+        _original_prefill = None
+    try:
+        from flashinfer.gdn_decode import (
+            gated_delta_rule_decode_pretranspose as _original_decode,
+        )
+    except ImportError:
+        _original_decode = None
+    try:
+        from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+            gated_delta_rule_mtp as _original_bf16_mtp,
+        )
+    except ImportError:
+        _original_bf16_mtp = None
+
+    HAS_PREFILL = _original_prefill is not None
+    HAS_DECODE = _original_decode is not None
+    HAS_BF16_MTP = _original_bf16_mtp is not None
+else:
+    # Non-NVIDIA (e.g. Ascend NPU): flashinfer_python has no backend here, so
+    # keep the module importable and inert instead of raising ImportError.
+    get_tile_v_mtp = None
+    get_vec_size_mtp = None
     _original_prefill = None
-try:
-    from flashinfer.gdn_decode import (
-        gated_delta_rule_decode_pretranspose as _original_decode,
-    )
-except ImportError:
     _original_decode = None
-try:
-    from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
-        gated_delta_rule_mtp as _original_bf16_mtp,
-    )
-except ImportError:
     _original_bf16_mtp = None
-
-HAS_PREFILL = _original_prefill is not None
-HAS_DECODE = _original_decode is not None
-HAS_BF16_MTP = _original_bf16_mtp is not None
+    HAS_PREFILL = False
+    HAS_DECODE = False
+    HAS_BF16_MTP = False
 
 
 def gated_delta_rule_mtp(
