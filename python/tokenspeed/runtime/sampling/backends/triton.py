@@ -203,7 +203,12 @@ class TritonSamplingBackend(SamplingBackend):
             device=config.device,
         )
         max_verify_rows = max(config.max_bs * config.max_draft_tokens_per_req, 1)
-        if config.device.type == "npu":
+        # config.device is a plain str ("cuda"/"npu") from
+        # SamplingBackendConfig.from_server_args; accept a torch.device too.
+        device_type = (
+            config.device.type if isinstance(config.device, torch.device) else config.device
+        )
+        if device_type == "npu":
             try:
                 npu_props = torch.npu.get_device_properties(config.device)
                 num_sms = getattr(npu_props, "cube_core_num", 0) or 1
