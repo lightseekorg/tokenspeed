@@ -2108,3 +2108,85 @@ def fused_mhc_prefill_hc4(
         eps=norm_eps,
     )
     return layer_input, post_mix.unsqueeze(-1), comb_mix.view(num_tokens, 4, 4)
+
+
+def _mhc_mixes_impl(
+    residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_iters, prenorm_gemm
+):
+    tokens, _, hidden = residual.shape
+    splits = _compute_num_split(
+        residual.device, 64, 4 * hidden, max(1, triton.cdiv(tokens, 64))
+    )
+    projection = torch.empty(
+        (splits, tokens, 24), device=residual.device, dtype=torch.float32
+    )
+    square_sum = torch.empty(
+        (splits, tokens), device=residual.device, dtype=torch.float32
+    )
+    pre = torch.empty((tokens, 4), device=residual.device, dtype=torch.float32)
+    post = torch.empty_like(pre)
+    comb = torch.empty((tokens, 4, 4), device=residual.device, dtype=torch.float32)
+    if tokens:
+        prenorm_gemm(
+            residual.view(tokens, 4 * hidden), weight, projection, square_sum, splits
+        )
+        mhc_pre_mix_hc4(
+            projection,
+            square_sum,
+            scale,
+            base,
+            pre,
+            post,
+            comb,
+            hidden_size=hidden,
+            rms_eps=rms_eps,
+            hc_eps=hc_eps,
+            sinkhorn_iters=sinkhorn_iters,
+            n_splits=splits,
+            num_tokens=tokens,
+        )
+    return pre, post, comb
+
+
+@register_kernel(
+    "residual",
+    "mhc_mixes",
+    name="triton_mhc_mixes",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {format_signature(residual=dense_tensor_format(torch.bfloat16))}
+    ),
+    priority=Priority.PORTABLE,
+)
+def triton_mhc_mixes(residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_iters):
+    return _mhc_mixes_impl(
+        residual,
+        weight,
+        scale,
+        base,
+        rms_eps,
+        hc_eps,
+        sinkhorn_iters,
+        _mhc_prenorm_gemm_triton,
+    )
+
+
+def mhc_apply_pre(residual: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
+    """Collapse BF16 [...,HC,H] with FP32 [...,HC] weights, returning BF16 [...,H]."""
+    hidden = residual.shape[-1]
+    hc = residual.shape[-2]
+    tokens = residual.numel() // (hc * hidden)
+    out = residual.new_empty((*residual.shape[:-2], hidden))
+    if tokens:
+        _mhc_pre_layer_triton_kernel[(tokens, triton.cdiv(hidden, 1024))](
+            pre,
+            residual,
+            out,
+            hidden_size=hidden,
+            hc_mult=hc,
+            block_h=1024,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    return out
