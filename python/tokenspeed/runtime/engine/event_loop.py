@@ -854,10 +854,12 @@ class EventLoop:
         # Chunk-pipeline: request I/O is owned by GLOBAL rank 0 only —
         # every stage's tp_rank-0 would otherwise try to open the one
         # frontend socket pair. recv_reqs broadcasts over the world group.
+        # ENABLE_CP without PP: every worker is attn_tp_rank 0, so only
+        # cp_rank 0 owns the socket; RequestHandler fans recv_reqs across CP.
         owns_request_io = (
             self.server_args.mapping.rank == 0
             if self.server_args.mapping.has_pp
-            else self.attn_tp_rank == 0
+            else (self.attn_tp_rank == 0 and self.server_args.mapping.attn.cp_rank == 0)
         )
         if owns_request_io:
             if self.server_args.zmq_msgpack:

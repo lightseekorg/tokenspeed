@@ -146,6 +146,18 @@ class RequestHandler:
                 "gloo", mapping.world_group
             )
             self.attn_tp_src_rank = mapping.world_group[0]
+        elif mapping.has_attn_cp:
+            # ENABLE_CP folds requested TP into CP and leaves every worker
+            # at attn_tp_rank 0, so the TP broadcaster never runs and each
+            # CP rank would otherwise PULL a different ZMQ message. Fan
+            # recv_reqs across CP the same way PP fans them across WORLD
+            # so L3 exists MIN (and later CP collectives) see one stream.
+            self.attn_tp_size = mapping.attn.cp_size
+            self.attn_tp_rank = mapping.attn.cp_rank
+            self.attn_tp_cpu_group = pg_manager.get_process_group(
+                "gloo", mapping.attn.cp_group
+            )
+            self.attn_tp_src_rank = mapping.attn.cp_group[0]
         else:
             self.attn_tp_cpu_group = pg_manager.get_process_group(
                 "gloo", mapping.attn.tp_group

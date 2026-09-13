@@ -463,8 +463,11 @@ def _ast_local_extension_imports(
             continue
         names = tuple(alias.name for alias in node.names)
         if node.level:
+            # ``from . import helper`` is level 1: the current package is
+            # ``dirname(file)``. Ascend ``level - 1`` parents, matching
+            # ``__package__.rsplit(".", level - 1)``, not ``level``.
             package_dir = os.path.dirname(os.path.abspath(current_file))
-            for _ in range(node.level):
+            for _ in range(node.level - 1):
                 package_dir = os.path.dirname(package_dir)
             if not _contained_in_dir(package_dir, ext_def_dir):
                 continue
@@ -516,7 +519,9 @@ def _extension_imported_code_files(entrypoint: str) -> tuple[tuple[str, str], ..
     ``ExtensibleLM`` inserts ``dirname(abspath(ext_def_file))`` into
     ``sys.path`` and imports the file's stem. Sibling modules and
     packages loaded from that directory can change embeddings and KV, so
-    the L3 identity follows those local imports. Stdlib and site
+    the L3 identity follows those local imports, including package-relative
+    ``from . import helper`` (resolved in the current package, not its
+    parent). Stdlib and site
     packages are omitted because they do not live under that directory.
     Directory and file symlinks are followed the same way Python imports
     them; lexical containment keeps ``../`` relative imports from

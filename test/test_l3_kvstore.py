@@ -986,6 +986,58 @@ class StorageKeyTest(unittest.TestCase):
                     handle.write("VALUE = 2\n")
                 self.assertNotEqual(id_helper, extensible_id())
 
+    def test_checkpoint_id_hashes_package_relative_extension_imports(self):
+        commit = "1" * 40
+        with tempfile.TemporaryDirectory() as cwd_dir:
+            repo = os.path.join(cwd_dir, "hub", "models--org--model")
+            snapshot = os.path.join(repo, "snapshots", commit)
+            os.makedirs(os.path.join(repo, "refs"))
+            os.makedirs(snapshot)
+            with open(os.path.join(snapshot, "config.json"), "w") as handle:
+                handle.write("{}")
+            with open(os.path.join(snapshot, "model.safetensors"), "wb") as handle:
+                handle.write(b"same-weights")
+            pkg = os.path.join(cwd_dir, "pkg")
+            os.makedirs(pkg)
+            with open(os.path.join(cwd_dir, "ext.py"), "w", encoding="utf-8") as handle:
+                handle.write("import pkg\n")
+            with open(
+                os.path.join(pkg, "__init__.py"), "w", encoding="utf-8"
+            ) as handle:
+                handle.write("from . import helper\n")
+            with open(os.path.join(pkg, "helper.py"), "w", encoding="utf-8") as handle:
+                handle.write("VALUE = 1\n")
+            with open(
+                os.path.join(cwd_dir, "helper.py"), "w", encoding="utf-8"
+            ) as handle:
+                handle.write("VALUE = 'parent'\n")
+            yaml_path = os.path.join(cwd_dir, "ext.yaml")
+            with open(yaml_path, "w", encoding="utf-8") as handle:
+                handle.write("ext_def_file: ext.py\n")
+
+            def extensible_id() -> str:
+                return l3_checkpoint_id(
+                    snapshot,
+                    hf_config=SimpleNamespace(),
+                    revision="main",
+                    load_format="extensible",
+                    model_loader_extra_config={},
+                    ext_yaml=yaml_path,
+                )
+
+            with chdir(cwd_dir):
+                id_base = extensible_id()
+                with open(
+                    os.path.join(cwd_dir, "helper.py"), "w", encoding="utf-8"
+                ) as handle:
+                    handle.write("VALUE = 'parent-changed'\n")
+                self.assertEqual(id_base, extensible_id())
+                with open(
+                    os.path.join(pkg, "helper.py"), "w", encoding="utf-8"
+                ) as handle:
+                    handle.write("VALUE = 2\n")
+                self.assertNotEqual(id_base, extensible_id())
+
     def test_checkpoint_id_ignores_ext_yaml_unless_extensible(self):
         commit = "a" * 40
         with tempfile.TemporaryDirectory() as directory:

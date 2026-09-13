@@ -350,6 +350,9 @@ For orientation, one iteration of `event_loop`:
   full decode batch, a head-of-line incomplete prefill, or an exhausted
   Device pool skips the rest of the wait queue so a long prompt is not
   hashed and remotely probed on every token step.
+  `ENABLE_CP` without PP fans `recv_reqs` across the CP group (only
+  `cp_rank==0` owns the ZMQ PULL) so every cache-owning rank enters the
+  same exists MIN; PP already fans the stream across WORLD.
   After Admit, vanished L3 objects are recovered on the same path:
   control-plane `batch_get_into`, replica MIN, skip H2D / skip
   publishing empty Host pages and empty Device prefetch destinations,

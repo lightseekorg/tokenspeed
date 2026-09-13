@@ -681,7 +681,10 @@ Its responsibilities:
   server's objects in place. After a successful RPC the Engine facade
   stamps the supplied version into `server_args.weight_version`.
   `ENABLE_CP` workers share `attn_tp_rank==0`
-  and are distinguished by `c{cp_rank}` and `cp_size`. Mooncake
+  and are distinguished by `c{cp_rank}` and `cp_size`. Without PP they
+  would each PULL a different ZMQ message, so only `cp_rank==0` owns
+  request I/O and `recv_reqs` broadcasts across the CP group — the same
+  fan-out PP uses for WORLD — before L3 exists MIN. Mooncake
   `global_segment_size` is divided by attention TP × CP × PP; passing
   `server_args.attn_tp_size` when `ENABLE_CP` inferred `cp_size` would
   over-mount the store. Host eviction does
