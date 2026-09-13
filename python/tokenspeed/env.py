@@ -38,6 +38,15 @@ def is_rocm_build() -> bool:
     return getattr(torch.version, "hip", None) is not None
 
 
+def is_npu_available() -> bool:
+    """Return whether torch-npu is installed and an Ascend device is visible."""
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        return False
+    return bool(torch.npu.is_available())
+
+
 # List of packages to check versions
 PACKAGE_LIST = [
     "tokenspeed",
@@ -128,7 +137,7 @@ def get_package_versions(packages: list[str]) -> dict[str, str]:
 
 
 def get_cuda_info() -> dict[str, object]:
-    """Get CUDA-related information if available."""
+    """Get device-related information if available (CUDA / ROCm / NPU)."""
     if is_cuda_build():
         cuda_info = {"CUDA available": torch.cuda.is_available()}
 
@@ -143,6 +152,14 @@ def get_cuda_info() -> dict[str, object]:
         if cuda_info["ROCM available"]:
             cuda_info.update(_get_gpu_info())
             cuda_info.update(_get_cuda_version_info())
+
+        return cuda_info
+    elif is_npu_available():
+        cuda_info = {"NPU available": True}
+
+        if cuda_info["NPU available"]:
+            cuda_info.update(_get_npu_info())
+            cuda_info.update(_get_npu_version_info())
 
         return cuda_info
     return {}
@@ -171,6 +188,28 @@ def _get_gpu_info() -> dict[str, str]:
             gpu_info[f"GPU {','.join(gpu_ids)} Compute Capability"] = cap
 
     return gpu_info
+
+
+def _get_npu_info() -> dict[str, str]:
+    """Get information about available Ascend NPUs."""
+    devices = defaultdict(list)
+    for device_index in range(torch.npu.device_count()):
+        devices[torch.npu.get_device_name(device_index)].append(str(device_index))
+
+    npu_info = {}
+    for name, device_ids in devices.items():
+        npu_info[f"NPU {','.join(device_ids)}"] = name
+    return npu_info
+
+
+def _get_npu_version_info() -> dict[str, str]:
+    """Get torch_npu version information."""
+    try:
+        import torch_npu
+
+        return {"torch_npu": torch_npu.__version__, "CANN": "see torch_npu"}
+    except Exception:
+        return {"torch_npu": "unknown"}
 
 
 def _get_cuda_version_info() -> dict[str, str | None]:

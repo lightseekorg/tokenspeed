@@ -28,18 +28,44 @@ import importlib.abc
 import importlib.util
 import sys
 
-import tokenspeed_triton.experimental.gluon.language as gl
 import torch
-from tokenspeed_triton.experimental import gluon
-from tokenspeed_triton.language.core import _aggregate as aggregate
-from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
 
 _IS_NPU = hasattr(torch, "npu") and torch.npu.is_available()
 
 if _IS_NPU:
-    from tokenspeed_kernel_npu._triton import libdevice, proton, tl, triton
+    # Ascend NPU path: triton-ascend is installed under the top-level
+    # ``triton`` package name, so we bind directly to it. The GPU-only
+    # Triton vendor fork symbols (gl/gluon/aggregate) have no NPU
+    # equivalents and are exposed as ``None``; code that needs them is
+    # NVIDIA/AMD-only and never reached on NPU.
+    import triton
+
+    from triton import language as tl
+    from triton.language.extra import libdevice
+
+    try:
+        from triton import profiler as proton
+    except ImportError:
+        proton = None
+
+    gl = None
+    gluon = None
+    try:
+        from triton.language.core import _aggregate as aggregate
+    except ImportError:
+        aggregate = None
+    try:
+        from triton.tools.tensor_descriptor import TensorDescriptor
+    except ImportError:
+        TensorDescriptor = None
 else:
+    import tokenspeed_triton.experimental.gluon.language as gl
+
+    from tokenspeed_triton.experimental import gluon
+    from tokenspeed_triton.language.core import _aggregate as aggregate
+    from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
     import tokenspeed_triton as triton
+
     from tokenspeed_triton import language as tl
     from tokenspeed_triton.language.extra import libdevice
 

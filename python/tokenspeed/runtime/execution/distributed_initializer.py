@@ -132,7 +132,7 @@ class DistributedInitializer:
             "Init torch distributed begin. Avail mem=%.4f GB",
             get_available_gpu_memory(config.device, config.gpu_id),
         )
-        if config.device == "cuda":
+        if config.device in {"cuda", "npu"}:
             maybe_set_numa_aware_cpu_affinity(config.gpu_id)
 
         # Determine backend

@@ -21,6 +21,8 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed.runtime.utils.common import get_device_module
+from typing import Any
 from tokenspeed_kernel.ops.kvcache.triton import mla_latent_norm_rope_scatter
 from tokenspeed_kernel.ops.sampling.cute_dsl import distributed_argmax as _dist_argmax
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
@@ -330,7 +332,7 @@ class DFlash(BaseDrafter):
     def _ensure_dist_argmax_state(self, dtype: torch.dtype, device: torch.device):
         """Probe once, before capture, and reuse the verdict for the process."""
         if self._dist_argmax_state is _UNSET:
-            if torch.cuda.is_current_stream_capturing():
+            if get_device_module().is_current_stream_capturing():
                 return None  # rendezvous is collective; leave it to warmup
             self._dist_argmax_state = self._probe_dist_argmax_state(dtype, device)
         return self._dist_argmax_state
@@ -562,8 +564,8 @@ class DFlash(BaseDrafter):
         decode_only = base_ctx.num_extends == 0
         if (
             decode_only
-            and torch.cuda.is_available()
-            and torch.cuda.is_current_stream_capturing()
+            and get_device_module().is_available()
+            and get_device_module().is_current_stream_capturing()
         ):
             old_lens = self.runtime_states.valid_cache_lengths.index_select(
                 0, req_pool_indices
@@ -642,13 +644,13 @@ class DFlash(BaseDrafter):
         self._fused_kv_k_buffers = []
         self._fused_kv_v_buffers = []
         # Aux stream for overlapping KV cache write with draft block preparation
-        self._kv_aux_stream: torch.cuda.Stream | None = None
-        self._kv_fork_event: torch.cuda.Event | None = None
-        self._kv_join_event: torch.cuda.Event | None = None
-        if torch.cuda.is_available():
-            self._kv_aux_stream = torch.cuda.Stream(device=self.device)
-            self._kv_fork_event = torch.cuda.Event()
-            self._kv_join_event = torch.cuda.Event()
+        self._kv_aux_stream: Any | None = None
+        self._kv_fork_event: Any | None = None
+        self._kv_join_event: Any | None = None
+        if get_device_module().is_available():
+            self._kv_aux_stream = get_device_module().Stream(device=self.device)
+            self._kv_fork_event = get_device_module().Event()
+            self._kv_join_event = get_device_module().Event()
         try:
             layers = self.draft_model_runner.model.layers
             if not layers:
@@ -962,7 +964,7 @@ class DFlash(BaseDrafter):
                 )
                 for _ in range(n_captures)
             ]
-            self._incr_capture_events = [torch.cuda.Event() for _ in range(n_captures)]
+            self._incr_capture_events = [get_device_module().Event() for _ in range(n_captures)]
             self._incr_num_tokens = 0
             self._incremental_proj_enabled = True
             logger.info(
@@ -983,7 +985,7 @@ class DFlash(BaseDrafter):
         and not the graph warmup phase — capture-only auxiliary branches warm
         serially there and are recorded only under capture."""
         capturing = (
-            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            get_device_module().is_available() and get_device_module().is_current_stream_capturing()
         )
         return (
             ctx.num_extends == 0
@@ -1026,9 +1028,9 @@ class DFlash(BaseDrafter):
         slot = self._incr_slot_bufs[capture_idx][:num_tokens]
         slot.copy_(hidden)
         event = self._incr_capture_events[capture_idx]
-        event.record(torch.cuda.current_stream())
+        event.record(get_device_module().current_stream())
 
-        with torch.cuda.stream(self._kv_aux_stream):
+        with get_device_module().stream(self._kv_aux_stream):
             self._kv_aux_stream.wait_event(event)
             acc = self._incr_acc_buf[:num_tokens]
             torch.addmm(
@@ -1167,7 +1169,7 @@ class DFlash(BaseDrafter):
     def _draft_native(
         self,
         current_tokens: torch.Tensor,
-        kv_sync_event: torch.cuda.Event = None,
+        kv_sync_event: Any = None,  # torch.cuda.Event or torch.npu.Event
         prepared: bool = False,
     ) -> torch.Tensor:
         bs = current_tokens.shape[0]
@@ -1187,7 +1189,7 @@ class DFlash(BaseDrafter):
             )
 
         is_capturing = (
-            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            get_device_module().is_available() and get_device_module().is_current_stream_capturing()
         )
         # MLA block rows are all decode rows. Treating them as extends makes
         # MLA backends slice the entire block out of their decode metadata.
@@ -1355,11 +1357,11 @@ class DFlash(BaseDrafter):
             cache_locs = base_ctx.attn_backend.decode_window_locations()[
                 : base_ctx.input_num_tokens
             ]
-            main_stream = torch.cuda.current_stream()
+            main_stream = get_device_module().current_stream()
             self._kv_fork_event.record(main_stream)
 
             if not (
-                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+                get_device_module().is_available() and get_device_module().is_current_stream_capturing()
             ):
                 hidden.record_stream(self._kv_aux_stream)
                 positions.record_stream(self._kv_aux_stream)
@@ -1367,7 +1369,7 @@ class DFlash(BaseDrafter):
                 if self._fused_kv_proj_workspace is not None:
                     self._fused_kv_proj_workspace.record_stream(self._kv_aux_stream)
 
-            with torch.cuda.stream(self._kv_aux_stream):
+            with get_device_module().stream(self._kv_aux_stream):
                 self._kv_aux_stream.wait_event(self._kv_fork_event)
                 self._write_native_cache(
                     hidden, positions, cache_locs, decode_only=True

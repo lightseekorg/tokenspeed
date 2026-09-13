@@ -642,7 +642,7 @@ class CacheGroupRouter(AttentionBackend):
         """Scratch-buffer slot resolve over the full-history table (side
         writes that must not clobber the published step window)."""
         view = self.draft_history_view()
-        if view.table.is_cuda:
+        if view.table.is_cuda or getattr(view.table, "is_npu", False):
             from tokenspeed.runtime.execution.cache_loc_kernel import (
                 compute_out_cache_loc_uniform,
             )

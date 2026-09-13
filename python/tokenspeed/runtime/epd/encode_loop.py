@@ -139,7 +139,7 @@ def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
 
     mapping = server_args.mapping
     attn_tp_rank = mapping.attn.tp_rank
-    device = f"cuda:{gpu_id}"
+    device = f"npu:{gpu_id}" if hasattr(torch, "npu") and torch.npu.is_available() else f"cuda:{gpu_id}"
 
     model_config = ModelConfig(
         server_args.model,

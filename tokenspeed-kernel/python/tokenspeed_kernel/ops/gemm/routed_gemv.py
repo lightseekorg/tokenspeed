@@ -47,6 +47,22 @@ from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_e
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
+
+@functools.lru_cache(maxsize=1)
+def _dm():
+    """Return the active device module (torch.cuda or torch.npu)."""
+    return torch.get_device_module()
+
+
+def _tgv_bias_device_str(device_index: int) -> str:
+    """Return the device string for the given device index on the active platform."""
+    dm = _dm()
+    # torch.npu always uses device index; torch.cuda accepts the same format.
+    dev_type = getattr(dm, "__name__", "torch.cuda")
+    if "npu" in dev_type:
+        return f"npu:{device_index}"
+    return f"cuda:{device_index}"
+
 # (m, n, k) -> backend; immutable so the registry's import-time view and the
 # wrappers' per-call view cannot diverge. Measured; see module docstring.
 MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
@@ -643,14 +659,14 @@ _warmed_lock = threading.Lock()
 def _usable_in_capture(backend: str, dev: int, m: int, n: int, k: int) -> bool:
     # Device-keyed: warmth on one GPU says nothing about another's modules.
     return (
-        not torch.cuda.is_current_stream_capturing()
+        not _dm().is_current_stream_capturing()
         or (backend, dev, m, n, k) in _warmed
     )
 
 
 def _mark_warmed(backend: str, dev: int, m: int, n: int, k: int) -> None:
     # Only a successful eager call earns capture trust.
-    if not torch.cuda.is_current_stream_capturing():
+    if not _dm().is_current_stream_capturing():
         with _warmed_lock:
             _warmed.add((backend, dev, m, n, k))
 
@@ -780,7 +796,7 @@ def _tgv_bias(n: int, device_index: int) -> torch.Tensor:
             bias = _tgv_biases.get(key)
             if bias is None:
                 bias = torch.zeros(
-                    n, device=f"cuda:{device_index}", dtype=torch.bfloat16
+                    n, device=_tgv_bias_device_str(device_index), dtype=torch.bfloat16
                 )
                 _tgv_biases[key] = bias
     return bias

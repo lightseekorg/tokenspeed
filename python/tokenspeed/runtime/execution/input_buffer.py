@@ -104,7 +104,7 @@ class InputBuffers:
         six launches on every step's critical path. Non-CUDA callers keep the
         torch spelling.
         """
-        if torch.device(self.device).type != "cuda":
+        if torch.device(self.device).type not in {"cuda", "npu"}:
             return None
         tape = PrepTape(self.device)
         tape.filltail(self.input_ids_buf, Reg.TOKENS, self.max_num_tokens, 1)

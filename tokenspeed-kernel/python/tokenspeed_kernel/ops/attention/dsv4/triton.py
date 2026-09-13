@@ -2079,10 +2079,10 @@ def dsv4_gather_indexer_mxfp4_cache(
     rows = int(slot_mapping.numel())
     if rows == 0:
         return
-    if not cache_2d.is_cuda:
-        raise ValueError("dsv4_gather_indexer_mxfp4_cache requires CUDA cache")
-    if not slot_mapping.is_cuda:
-        raise ValueError("dsv4_gather_indexer_mxfp4_cache requires CUDA slots")
+    if not (cache_2d.is_cuda or getattr(cache_2d, "is_npu", False)):
+        raise ValueError("dsv4_gather_indexer_mxfp4_cache requires CUDA/NPU cache")
+    if not (slot_mapping.is_cuda or getattr(slot_mapping, "is_npu", False)):
+        raise ValueError("dsv4_gather_indexer_mxfp4_cache requires CUDA/NPU slots")
     if values_out.dtype != torch.uint8 or scales_out.dtype != torch.uint8:
         raise TypeError("MXFP4 gather workspaces must be uint8 tensors")
     if values_out.stride(1) != 1 or scales_out.stride(1) != 1:
@@ -2353,7 +2353,7 @@ def dsv4_compute_global_topk_indices_and_lens(
             device=topk_indices.device,
             dtype=torch.bool,
         )
-    if not topk_indices.is_cuda:
+    if not (topk_indices.is_cuda or getattr(topk_indices, "is_npu", False)):
         valid = topk_indices >= 0
         if is_valid_token is not None:
             valid = valid & is_valid_token[:, None]
@@ -2538,7 +2538,7 @@ def dsv4_decode_dense_compressed_indices_and_lens(
             device=positions.device,
             dtype=torch.bool,
         )
-    if positions.is_cuda:
+    if positions.is_cuda or getattr(positions, 'is_npu', False):
         if is_valid_token is None:
             is_valid_token = torch.empty(
                 0,
@@ -2850,7 +2850,7 @@ def dsv4_build_dense_prefill_local_compressed_indices(
     base_offsets_arg = (
         positions if block_table_base_offsets is None else block_table_base_offsets
     )
-    if positions.is_cuda:
+    if positions.is_cuda or getattr(positions, 'is_npu', False):
         _dsv4_build_dense_prefill_local_compressed_indices_kernel[(positions.numel(),)](
             result,
             result.stride(0),
@@ -3436,7 +3436,7 @@ def dsv4_compact_compressed_slot_mapping(
             else seq_lens.numel()
         ),
     )
-    if seq_lens.is_cuda:
+    if seq_lens.is_cuda or getattr(seq_lens, 'is_npu', False):
         req_indices_i32 = token_to_req_indices.to(torch.int32)
         query_start_i32 = query_start_loc.to(torch.int32)
         seq_lens_i32 = seq_lens.to(torch.int32)
@@ -3537,8 +3537,8 @@ def dsv4_group_slot_mapping(
     if block_table.dim() != 2:
         raise ValueError(f"block_table must be 2-D, got {tuple(block_table.shape)}")
     num_tokens = positions.numel()
-    if not positions.is_cuda:
-        raise ValueError("dsv4_group_slot_mapping requires CUDA tensors")
+    if not (positions.is_cuda or getattr(positions, "is_npu", False)):
+        raise ValueError("dsv4_group_slot_mapping requires CUDA/NPU tensors")
     out = torch.empty(num_tokens, dtype=torch.int64, device=positions.device)
     if num_tokens == 0:
         return out
@@ -3647,8 +3647,8 @@ def dsv4_validate_active_cache_pages(
         raise ValueError(f"seq_lens must be 1-D, got {tuple(seq_lens.shape)}")
     if block_table.dim() != 2:
         raise ValueError(f"block_table must be 2-D, got {tuple(block_table.shape)}")
-    if not seq_lens.is_cuda or not block_table.is_cuda:
-        raise ValueError("dsv4_validate_active_cache_pages requires CUDA tensors")
+    if not (seq_lens.is_cuda or getattr(seq_lens, "is_npu", False)) or not (block_table.is_cuda or getattr(block_table, "is_npu", False)):
+        raise ValueError("dsv4_validate_active_cache_pages requires CUDA/NPU tensors")
     if seq_lens.device != block_table.device:
         raise ValueError("seq_lens and block_table must use the same CUDA device")
     if actual_bs < 0 or actual_bs > min(seq_lens.numel(), block_table.shape[0]):
@@ -3668,11 +3668,11 @@ def dsv4_validate_active_cache_pages(
     if (
         out.shape != (1,)
         or out.dtype != torch.bool
-        or not out.is_cuda
+        or not (out.is_cuda or getattr(out, "is_npu", False))
         or out.device != seq_lens.device
     ):
         raise ValueError(
-            "out must be a one-element CUDA bool tensor on the input device"
+            "out must be a one-element CUDA/NPU bool tensor on the input device"
         )
     if actual_bs == 0:
         out.fill_(True)

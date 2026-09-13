@@ -185,7 +185,7 @@ def get_available_gpu_memory(
 
 
 def is_pin_memory_available() -> bool:
-    return torch.cuda.is_available()
+    return get_device_module().is_available()
 
 
 class LayerFn(Protocol):
@@ -241,8 +241,8 @@ def set_random_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    if get_device_module().is_available():
+        get_device_module().manual_seed_all(seed)
 
 
 @dataclass
@@ -565,7 +565,7 @@ def broadcast_pyobj(
     of dist_group argument).
     """
     device = torch.device(
-        "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
+        "cuda" if get_device_module().is_available() and not force_cpu_device else "cpu"
     )
 
     if rank == src:
@@ -760,6 +760,8 @@ def print_warning_once(msg: str) -> None:
 def get_device_name(device_id: int = 0) -> str:
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         return torch.cuda.get_device_name(device_id)
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return torch.npu.get_device_name(device_id)
 
     return ""
 
@@ -770,8 +772,12 @@ def get_device(device_id: int | None = None) -> str:
         if device_id is None:
             return "cuda"
         return f"cuda:{device_id}"
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        if device_id is None:
+            return "npu"
+        return f"npu:{device_id}"
 
-    raise RuntimeError("No accelerator (CUDA/ROCm) is available.")
+    raise RuntimeError("No accelerator (CUDA/ROCm/NPU) is available.")
 
 
 def dataclass_to_string_truncated(
@@ -879,8 +885,9 @@ class MultiprocessingSerializer:
 def debug_timing(func):
     def wrapper(*args, **kwargs):
         if logger.isEnabledFor(logging.DEBUG):
-            tic = torch.cuda.Event(enable_timing=True)
-            toc = torch.cuda.Event(enable_timing=True)
+            dm = get_device_module()
+            tic = dm.Event(enable_timing=True)
+            toc = dm.Event(enable_timing=True)
             tic.record()
             result = func(*args, **kwargs)
             toc.record()

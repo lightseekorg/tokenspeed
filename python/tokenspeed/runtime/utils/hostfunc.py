@@ -33,6 +33,7 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
+from tokenspeed.runtime.utils.common import get_device_module
 
 _ext = None
 _ext_lock = threading.Lock()
@@ -176,8 +177,8 @@ def launch_hostfunc(fn: Callable, *args: Any, **kwargs: Any) -> int | None:
     When capturing, returns a handle to the user-data the caller must keep
     alive; otherwise executes eagerly and returns None.
     """
-    stream = torch.cuda.current_stream()
-    is_capturing = torch.cuda.is_current_stream_capturing()
+    stream = get_device_module().current_stream()
+    is_capturing = get_device_module().is_current_stream_capturing()
     ext = _load_ext()
     handle = ext.launch_hostfunc(
         stream.cuda_stream, not is_capturing, fn, *args, **kwargs

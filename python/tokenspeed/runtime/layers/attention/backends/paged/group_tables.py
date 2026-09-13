@@ -256,7 +256,7 @@ class GroupTableStacks:
                     f"cache group {gid!r} table has {src.shape[0]} request rows for "
                     f"a live batch of {actual_bs}"
                 )
-        if self.tables.is_cuda:
+        if self.tables.is_cuda or getattr(self.tables, "is_npu", False):
             stack_max_num_pages = self.tables.shape[2]
             block_cols = 128 if stack_max_num_pages >= 128 else 64
             for i, src in enumerate(srcs):

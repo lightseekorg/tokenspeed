@@ -404,7 +404,7 @@ class ForwardStepRunner:
         graph_cls = (
             self.device_module.NPUGraph
             if self.device == "npu"
-            else self.device_module.CUDAGraph
+            else getattr(self.device_module, "CUDAGraph", None) or getattr(self.device_module, "NPUGraph", None)
         )
         graph = graph_cls()
 

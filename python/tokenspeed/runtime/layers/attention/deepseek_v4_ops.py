@@ -23,6 +23,7 @@ runtime requires TokenSpeed's own built DeepSeek V4 attention op.
 from __future__ import annotations
 
 import torch
+from tokenspeed.runtime.utils.common import get_device_module
 from tokenspeed_kernel.ops.attention.dsv4 import (
     dsv4_csa_indexer_fp8_cache_insert,
     dsv4_swa_cache_insert,
@@ -166,9 +167,9 @@ def deepseek_v4_prepare_indexer_q_mxfp4(
         weights = weights.squeeze(-1)
     if weights.shape != index_q.shape[:2]:
         raise ValueError(f"weights must be [tokens, heads], got {tuple(weights.shape)}")
-    if not index_q.is_cuda:
+    if not (index_q.is_cuda or getattr(index_q, "is_npu", False)):
         raise ValueError(
-            "deepseek_v4_prepare_indexer_q_mxfp4 only supports CUDA tensors."
+            "deepseek_v4_prepare_indexer_q_mxfp4 only supports CUDA/NPU tensors."
         )
     return dsv4_fused_indexer_q_rope_hadamard_mxfp4(
         index_q=index_q,
@@ -249,9 +250,9 @@ def deepseek_v4_prepare_indexer_q_fp8(
         weights = weights.squeeze(-1)
     if weights.shape != index_q.shape[:2]:
         raise ValueError(f"weights must be [tokens, heads], got {tuple(weights.shape)}")
-    if not index_q.is_cuda:
+    if not (index_q.is_cuda or getattr(index_q, "is_npu", False)):
         raise ValueError(
-            "deepseek_v4_prepare_indexer_q_fp8 only supports CUDA tensors."
+            "deepseek_v4_prepare_indexer_q_fp8 only supports CUDA/NPU tensors."
         )
 
     weights_out = (weights.float() * float(softmax_scale) * float(head_scale)).float()
@@ -388,9 +389,9 @@ def save_deepseek_v4_compressor_state(
     num_actual = min(slot_mapping.numel(), kv.shape[0])
     if num_actual == 0:
         return
-    if not state_cache.is_cuda:
+    if not (state_cache.is_cuda or getattr(state_cache, "is_npu", False)):
         raise ValueError(
-            "save_deepseek_v4_compressor_state only supports CUDA tensors."
+            "save_deepseek_v4_compressor_state only supports CUDA/NPU tensors."
         )
 
     dsv4_save_compressor_state(
@@ -433,7 +434,7 @@ def _write_deepseek_v4_indexer_fp8_cache_capturable(
 
     slots = slot_mapping[:num_rows].to(torch.int64)
     valid = valid[:num_rows] & (slots >= 0)
-    if not (slots.is_cuda and torch.cuda.is_current_stream_capturing()):
+    if not ((slots.is_cuda or getattr(slots, "is_npu", False)) and get_device_module().is_current_stream_capturing()):
         if not bool(valid.any()):
             return
         rows = rows[valid]
@@ -566,9 +567,9 @@ def deepseek_v4_hca_compress_kv_cache_insert(
     )
     if num_actual == 0:
         return
-    if not state_cache.is_cuda:
+    if not (state_cache.is_cuda or getattr(state_cache, "is_npu", False)):
         raise ValueError(
-            "deepseek_v4_hca_compress_kv_cache_insert only supports CUDA tensors."
+            "deepseek_v4_hca_compress_kv_cache_insert only supports CUDA/NPU tensors."
         )
 
     dsv4_fused_sparse_compress_cache_insert(
@@ -642,9 +643,9 @@ def deepseek_v4_csa_compress_kv_cache_insert(
     num_actual = min(compressor_slot_mapping.numel(), positions.numel())
     if num_actual == 0:
         return
-    if not state_cache.is_cuda:
+    if not (state_cache.is_cuda or getattr(state_cache, "is_npu", False)):
         raise ValueError(
-            "deepseek_v4_csa_compress_kv_cache_insert only supports CUDA tensors."
+            "deepseek_v4_csa_compress_kv_cache_insert only supports CUDA/NPU tensors."
         )
 
     dsv4_fused_sparse_compress_cache_insert(
@@ -700,9 +701,9 @@ def deepseek_v4_csa_indexer_cache_insert(
     num_actual = min(compressor_slot_mapping.numel(), positions.numel())
     if num_actual == 0:
         return
-    if not state_cache.is_cuda:
+    if not (state_cache.is_cuda or getattr(state_cache, "is_npu", False)):
         raise ValueError(
-            "deepseek_v4_csa_indexer_cache_insert only supports CUDA tensors."
+            "deepseek_v4_csa_indexer_cache_insert only supports CUDA/NPU tensors."
         )
     if use_fp4_cache:
         dsv4_fused_csa_indexer_mxfp4_cache_insert(

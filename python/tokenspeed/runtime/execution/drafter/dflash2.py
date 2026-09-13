@@ -61,7 +61,7 @@ def _walk_greedy_path(
     out: torch.Tensor,
 ) -> torch.Tensor:
     """Greedily walk a fixed DFlash2 lattice without host-side tensor reads."""
-    if scores.is_cuda:
+    if scores.is_cuda or getattr(scores, "is_npu", False):
         return dflash2_greedy_path(candidate_ids, scores, anchor_token_ids, out)
     return _greedy_path_torch(candidate_ids, scores, anchor_token_ids, out)
 

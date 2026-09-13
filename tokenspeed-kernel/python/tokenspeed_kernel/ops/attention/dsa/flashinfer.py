@@ -191,13 +191,14 @@ def _get_dsa_sparse_counter_buffer(
     num_heads: int,
 ) -> torch.Tensor:
     device = torch.device(device)
-    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    dm = torch.get_device_module()
+    sm_count = dm.get_device_properties(device).multi_processor_count
     required_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
         int(num_tokens), int(num_heads), int(sm_count)
     )
     counter = _dsa_sparse_counter_buffers.get(device)
     if counter is None or counter.numel() < required_bytes:
-        if torch.cuda.is_current_stream_capturing():
+        if dm.is_current_stream_capturing():
             raise RuntimeError(
                 "FlashInfer DSA counter workspace must be initialized before "
                 "CUDA Graph capture."

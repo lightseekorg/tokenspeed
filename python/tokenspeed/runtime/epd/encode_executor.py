@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 
 import torch
+from tokenspeed.runtime.utils.common import get_device_module
 
 from tokenspeed.runtime.epd.mooncake.sender import (
     MooncakeEmbeddingSender,
@@ -258,8 +259,8 @@ class DisaggEncodeExecutor:
         # _lease_slot keeps the slot until its room is terminal (Success only after
         # the RDMA completes).
         copy_event = None
-        if torch.cuda.is_available():
-            copy_event = torch.cuda.Event()
+        if get_device_module().is_available():
+            copy_event = get_device_module().Event()
             copy_event.record()
         for rid, send_args in staged:
             self.senders[rid].send(copy_event=copy_event, **send_args)

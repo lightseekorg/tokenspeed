@@ -30,6 +30,7 @@ from tokenspeed.runtime.execution.weight_loader import WeightLoader
 from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
 from tokenspeed.runtime.multimodal.embedder import warmup_multimodal_encoders
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.common import get_device_module
 from tokenspeed.runtime.utils.env import global_server_args_dict_update
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -164,8 +165,8 @@ class ModelRunner:
             )
 
         warmup_device = torch.device(self.device)
-        if warmup_device.type == "cuda" and warmup_device.index is None:
-            warmup_device = torch.device("cuda", self.gpu_id)
+        if warmup_device.type in {"cuda", "npu"} and warmup_device.index is None:
+            warmup_device = torch.device(warmup_device.type, self.gpu_id)
         warmup_multimodal_encoders(
             self.model,
             device=warmup_device,
@@ -263,8 +264,8 @@ class ModelRunner:
             world_size = int(obj.world_size)
             group_name = str(getattr(obj, "group_name", "weight_update_group"))
             backend = Backend(str(getattr(obj, "backend", "nccl")))
-            device = torch.device(f"cuda:{self.gpu_id}")
-            torch.cuda.set_device(device)
+            device = torch.device(f"{self.device}:{self.gpu_id}")
+            get_device_module().set_device(device)
 
             timeout = default_pg_timeout
             init_method = f"tcp://{obj.master_address}:{int(obj.master_port)}"
@@ -330,7 +331,7 @@ class ModelRunner:
                     yield name, buf
 
             self.model.load_weights(_recv())
-            torch.cuda.synchronize(device)
+            get_device_module().synchronize(device)
             return True, f"updated {len(names)} weights"
         except Exception as e:  # noqa: BLE001 - surface to the control plane
             logger.exception("update_weights_from_distributed failed")

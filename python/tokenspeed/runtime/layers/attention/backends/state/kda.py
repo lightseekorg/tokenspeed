@@ -28,6 +28,8 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed.runtime.utils.common import get_device_module
+from typing import Any
 from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.attention.kda import (
     kda_batched_replay_uses_raw_gate,
@@ -132,7 +134,7 @@ class KdaAttnBackend(MambaAttnBackend):
         )
 
     def _reset_replay_state(self) -> None:
-        self._verify_producer_stream: torch.cuda.Stream | None = None
+        self._verify_producer_stream: Any | None = None  # torch.cuda.Stream or torch.npu.Stream
         self._verify_producer_forks: dict[int, StreamFork] = {}
         self._replay_payloads: tuple[torch.Tensor, ...] | None = None
         self._replay_weights: dict[
@@ -235,8 +237,10 @@ class KdaAttnBackend(MambaAttnBackend):
                     device=self.device,
                 )
                 first_conv, first_ssm = self._state_components(layer_ids[0])
-                if self._verify_split_producers and first_conv.is_cuda:
-                    self._verify_producer_stream = torch.cuda.Stream(
+                if self._verify_split_producers and (
+                    first_conv.is_cuda or getattr(first_conv, "is_npu", False)
+                ):
+                    self._verify_producer_stream = get_device_module().Stream(
                         device=first_conv.device, priority=-1
                     )
                     self._verify_producer_forks = {
@@ -660,8 +664,8 @@ class KdaAttnBackend(MambaAttnBackend):
                 # mode the producer tensors outlive this Python scope while
                 # verify runs on the main stream, so register that use with
                 # the caching allocator before launching its consumer.
-                if not torch.cuda.is_current_stream_capturing():
-                    consumer_stream = torch.cuda.current_stream()
+                if not get_device_module().is_current_stream_capturing():
+                    consumer_stream = get_device_module().current_stream()
                     g_raw.record_stream(consumer_stream)
                     conv_qkv.record_stream(consumer_stream)
                 split_producers = {"g_raw": g_raw, "conv_qkv": conv_qkv}

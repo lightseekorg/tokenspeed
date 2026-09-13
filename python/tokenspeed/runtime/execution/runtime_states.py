@@ -30,7 +30,7 @@ class RuntimeStates:
         req_pool_size: int,
         vocab_size: int,
         output_length: int,
-        device: str = "cuda",
+        device: str = "cuda",  # npu: also accepts "npu"
     ):
         self.device = device
         self.vocab_size = vocab_size

@@ -55,7 +55,7 @@ class SiluAndMul(torch.nn.Module):
             raise ValueError(
                 f"SwiGLU expects an even [gate, up] width, got {x.shape[-1]}"
             )
-        if not x.is_cuda:
+        if not (x.is_cuda or getattr(x, "is_npu", False)):
             if fp8_out:
                 raise NotImplementedError("CPU fp8_out silu_and_mul is not implemented")
             return self.forward_native(x)
@@ -158,7 +158,7 @@ class SituAndMul(torch.nn.Module):
             raise ValueError(
                 f"SiTU expects an even [gate, up] width, got {x.shape[-1]}"
             )
-        if x.is_cuda:
+        if x.is_cuda or getattr(x, "is_npu", False):
             from tokenspeed_kernel import situ_and_mul
 
             return situ_and_mul(

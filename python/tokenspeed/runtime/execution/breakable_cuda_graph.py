@@ -61,6 +61,8 @@ from typing import Any
 import torch
 from tokenspeed_kernel.ops.transform.weak_ref import weak_ref_tensor as _kernel_weak_ref
 
+from tokenspeed.runtime.utils.common import get_device_module
+
 __all__ = [
     "BreakableCapture",
     "active_forward",
@@ -137,7 +139,7 @@ def weak_ref_tensor(t: Any) -> Any:
     pass through; if the kernel extension is unavailable this degrades to
     the identity (strong ref -- correct, more memory).
     """
-    if isinstance(t, torch.Tensor) and t.is_cuda:
+    if isinstance(t, torch.Tensor) and (t.is_cuda or getattr(t, "is_npu", False)):
         return _kernel_weak_ref(t)
     return t
 
@@ -171,18 +173,18 @@ class BreakableCapture:
     """
 
     _active: BreakableCapture | None = None
-    _default_capture_stream: torch.cuda.Stream | None = None
+    _default_capture_stream: Any | None = None
 
     def __init__(
-        self, pool: Any | None = None, stream: torch.cuda.Stream | None = None
+        self, pool: Any | None = None, stream: Any | None = None
     ) -> None:
         self.pool = pool
         self.segments: list[Callable[[], Any]] = []
-        self._current_graph: torch.cuda.CUDAGraph | None = None
+        self._current_graph: Any | None = None
         self._capturing = False
         if stream is None:
             if BreakableCapture._default_capture_stream is None:
-                BreakableCapture._default_capture_stream = torch.cuda.Stream()
+                BreakableCapture._default_capture_stream = get_device_module().Stream()
             stream = BreakableCapture._default_capture_stream
         self._stream = stream
         self._stream_ctx: Any | None = None
@@ -206,8 +208,8 @@ class BreakableCapture:
         self._gc_was_enabled = gc.isenabled()
         gc.disable()
         # The capture stream must observe prior entry-stream work (warmup, buffers).
-        self._stream.wait_stream(torch.cuda.current_stream())
-        self._stream_ctx = torch.cuda.stream(self._stream)
+        self._stream.wait_stream(get_device_module().current_stream())
+        self._stream_ctx = get_device_module().stream(self._stream)
         self._stream_ctx.__enter__()
         BreakableCapture._active = self
         self._begin_segment()
@@ -222,14 +224,18 @@ class BreakableCapture:
                 self._stream_ctx.__exit__(*exc)
                 self._stream_ctx = None
             # Eager breaks ran on the side stream; entry stream must observe them.
-            torch.cuda.current_stream().wait_stream(self._stream)
+            get_device_module().current_stream().wait_stream(self._stream)
             if self._gc_was_enabled:
                 gc.enable()
         return False
 
     def _begin_segment(self) -> None:
         assert not self._capturing
-        graph = torch.cuda.CUDAGraph()
+        dm = get_device_module()
+        graph_cls = getattr(dm, "CUDAGraph", None) or getattr(dm, "NPUGraph", None)
+        if graph_cls is None:
+            raise RuntimeError("No device graph class on this platform.")
+        graph = graph_cls()
         if self.pool is not None:
             graph.capture_begin(pool=self.pool)
         else:

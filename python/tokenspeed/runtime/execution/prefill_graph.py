@@ -50,6 +50,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
+from tokenspeed.runtime.utils.common import get_device_module
 import tqdm
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
@@ -351,7 +352,7 @@ class PrefillGraph:
         """Warm up and capture the breakable graph for ``bucket`` from the buffers."""
         for _ in range(self.num_warmup):
             self._run_inner(bucket)
-        torch.cuda.synchronize()
+        get_device_module().synchronize()
         stream = decode_wrapper.stream if decode_wrapper is not None else None
         cap = BreakableCapture(pool=self._pool, stream=stream)
         with cap:

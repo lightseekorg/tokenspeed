@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
+from typing import Any
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.grammar.capturable_grammar import (
@@ -97,7 +98,7 @@ class ModelExecutionResult:
     """
 
     output_tokens: torch.Tensor
-    copy_event: torch.cuda.Event | None = None
+    copy_event: Any | None = None  # torch.cuda.Event or torch.npu.Event
     output_lengths: torch.Tensor | None = None
     grammar_completion: GrammarStepCompletion | None = None
     # Per-position logprob of the sampled token, same layout as output_tokens.
