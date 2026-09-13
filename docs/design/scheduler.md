@@ -26,7 +26,9 @@ and reconverges the groups: truncating a sliding-window or Mamba hits
 mask (for example `[0, 1, 1]` to `[0, 1]`, with a five-token window and
 two-token blocks requiring two lookback pages) can leave the first live
 lookback page as a hole, and a full re-probe would see the same L3 keys
-as a complete hit again. `schedulePrefillFirstChunk` then frees that
+as a complete hit again. Retry count is the probed Host span in prefix
+pages, not a fixed cap, so a long window/Mamba hit can shrink to the
+Device floor instead of asserting. `schedulePrefillFirstChunk` then frees that
 attempt — including the discarded `AdmissionResult`, whose `load_pairs`
 pin Host sources and Device destinations independently of the tables —
 and retries from the shortened probe so `hit_tokens` / `tokens_this_round`

@@ -198,6 +198,7 @@ class RequestHandler:
         self._profile_sync_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
         # Same constraint as _profile_sync: gloo barrier would CUDA-allocate.
         self._replica_decision_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
+        self._replica_flush_want_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
 
         self.hf_eos_token_id = hf_eos_token_id
         self.max_req_len = max_req_len
@@ -260,6 +261,8 @@ class RequestHandler:
     def process_requests(self, recv_reqs: list):
         """Dispatch control requests and return new generate request specs and states."""
         new_req_specs, req_states, bootstrap_infos, abort_rids = [], [], [], []
+        pending_flush_outputs = 0
+        pending_weight_updates = []
         for recv_req in recv_reqs:
             if isinstance(recv_req, TokenizedGenerateReqInput):
                 req_spec, req_state, bootstrap_info = self.handle_generate_request(
@@ -277,8 +280,7 @@ class RequestHandler:
                 logger.debug("AbortReq for rid=%s", recv_req.rid)
                 abort_rids.append(recv_req.rid)
             elif isinstance(recv_req, FlushCacheReqInput):
-                success = self._try_clear_replica_cache()
-                self.send_func.send_pyobj(FlushCacheReqOutput(success=success))
+                pending_flush_outputs += 1
             elif isinstance(recv_req, PauseSchedulerReqInput):
                 # State change + reply (abort/wait replies are deferred by the
                 # controller until the event loop observes a drained scheduler).
@@ -307,19 +309,15 @@ class RequestHandler:
                     InitWeightsUpdateGroupReqOutput(success=ok, message=msg)
                 )
             elif isinstance(recv_req, UpdateWeightsFromDistributedReqInput):
-                # RL weight sync: receive broadcast weights + load into the model.
                 ok, msg = self._require_weight_version_for_l3_flush(recv_req)
                 if ok:
                     ok, msg = self._require_flush_for_l3_version_switch(recv_req)
-                if ok:
-                    ok, msg = self._flush_cache_before_weight_load(recv_req)
-                if ok:
-                    ok, msg = self._device.update_weights(recv_req)
-                    if ok:
-                        ok, msg = self._commit_l3_weight_version(recv_req, msg)
-                self.send_func.send_pyobj(
-                    UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)
-                )
+                if not ok:
+                    self.send_func.send_pyobj(
+                        UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)
+                    )
+                else:
+                    pending_weight_updates.append(recv_req)
             elif isinstance(recv_req, DestroyWeightsUpdateGroupReqInput):
                 # RL weight sync: tear down the trainer's NCCL group on this worker.
                 ok, msg = self._device.update_weights(recv_req)
@@ -328,6 +326,12 @@ class RequestHandler:
                 )
             else:
                 raise NotImplementedError(f"Unsupported request type: {type(recv_req)}")
+        flush_success = self._rendezvous_replica_flush(
+            pending_flush_outputs=pending_flush_outputs,
+            weight_updates=pending_weight_updates,
+        )
+        for recv_req in pending_weight_updates:
+            self._complete_weight_update(recv_req, flush_success=flush_success)
         return new_req_specs, req_states, bootstrap_infos, abort_rids
 
     def _require_weight_version_for_l3_flush(self, recv_req) -> tuple[bool, str]:
@@ -377,33 +381,52 @@ class RequestHandler:
             "and in-flight writebacks cannot land in the new namespace",
         )
 
-    def _flush_cache_before_weight_load(self, recv_req) -> tuple[bool, str]:
-        """Invalidate Device/Host (and L3 objects) before replacing GPU weights.
+    def _rendezvous_replica_flush(
+        self, *, pending_flush_outputs: int, weight_updates: list
+    ) -> bool:
+        """Enter flush collectives from every rank on every round.
 
-        ``ClearCache`` rejects in-flight Host writebacks. Doing this after
-        ``update_weights`` would leave new parameters on the old prefix
-        indexes with no rollback. A failed flush keeps the previous
-        checkpoint intact so the caller can retry.
-
-        Rank-local ``ClearCache`` is all-or-nothing, but a replica can still
-        split: one rank with no in-flight writebacks would clear Device/Host
-        while a peer rejects. ``_try_clear_replica_cache`` MIN-reduces the
-        probe, then MIN-reduces L3 deletion, then clears. An L3 writeback
-        can still be in flight on one TP/CP/PP/DP rank after it has completed
-        on the others; those successful ranks must not enter
-        ``update_weights_from_distributed`` (ordered NCCL broadcasts)
-        while a peer skips it.
+        ``FlushCacheReqInput`` is sent separately to each attention-DP
+        worker. If only the worker that dequeued it entered
+        ``_try_clear_replica_cache``, that rank would DP all-reduce while a
+        lagging peer continued to ``EventLoop._dp_sync_and_check`` and
+        world-gathered. MAX-reduce flush intent on the DP group first so
+        every DP rank takes the same MIN-reduce path, then reply.
         """
 
-        if not recv_req.flush_cache:
-            return True, ""
-        if not self._try_clear_replica_cache():
-            return (
-                False,
-                "cache flush failed; retry the update after in-flight "
-                "Host writebacks drain",
+        want_flush = pending_flush_outputs > 0 or any(
+            bool(recv_req.flush_cache) for recv_req in weight_updates
+        )
+        if self.attn_dp_size > 1 and self.attn_dp_cpu_group is not None:
+            buf = self._replica_flush_want_buf
+            buf[0] = 1 if want_flush else 0
+            torch.distributed.all_reduce(
+                buf, op=torch.distributed.ReduceOp.MAX, group=self.attn_dp_cpu_group
             )
-        return True, ""
+            want_flush = bool(buf.item())
+        flush_success = True
+        if want_flush:
+            flush_success = self._try_clear_replica_cache()
+        for _ in range(pending_flush_outputs):
+            self.send_func.send_pyobj(FlushCacheReqOutput(success=flush_success))
+        return flush_success
+
+    def _complete_weight_update(self, recv_req, *, flush_success: bool) -> None:
+        """Finish a validated weight update after the rank-identical flush."""
+
+        if recv_req.flush_cache and not flush_success:
+            ok = False
+            msg = (
+                "cache flush failed; retry the update after in-flight "
+                "Host writebacks drain"
+            )
+        else:
+            ok, msg = self._device.update_weights(recv_req)
+            if ok:
+                ok, msg = self._commit_l3_weight_version(recv_req, msg)
+        self.send_func.send_pyobj(
+            UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)
+        )
 
     def _try_clear_replica_cache(self) -> bool:
         """MIN-reduce clearability, delete L3, then mutate Device/Host.

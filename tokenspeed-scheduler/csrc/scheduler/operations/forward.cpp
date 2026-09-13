@@ -373,9 +373,14 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     // required so acquireHostWithKeys re-matches window/Mamba groups at the
     // shortened bound: a full re-probe would see the same L3 keys again,
     // and truncating a non-closed hits mask can leave required lookback
-    // pages as holes.
+    // pages as holes. Bound retries by the probed Host span, not a fixed
+    // cap: a sliding-window or Mamba hit can shrink by one prefix page per
+    // attempt while the Host pool stays pinned.
+    const std::int32_t initial_host_prefix = host_prefix_cap;
+    const int max_attempts =
+        1 + std::max(0, initial_host_prefix - match.probe.device.num_common_tokens) / prefix_granularity;
     for (int attempt = 0;; ++attempt) {
-        _assert(attempt < 64, "L3 host prefix clamp did not converge");
+        _assert(attempt < max_attempts, "L3 host prefix clamp did not converge");
         if (match.probe.host.num_common_tokens > host_prefix_cap) {
             match.probe.host.num_common_tokens = host_prefix_cap;
         }

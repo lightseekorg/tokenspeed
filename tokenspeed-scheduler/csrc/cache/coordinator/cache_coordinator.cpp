@@ -345,8 +345,10 @@ CoordinatorMatch CacheCoordinator::acquireHostWithKeys(std::span<const std::vect
                                                        std::int32_t floor_tokens, PrefixProbe::Tier&& probe,
                                                        std::uint64_t access_epoch) {
     PrefixProbe::Tier working = std::move(probe);
+    const std::int32_t start_tokens = std::max(working.num_common_tokens, floor_tokens);
+    const int max_attempts = 1 + std::max(0, start_tokens - floor_tokens) / prefix_granularity_;
     for (int attempt = 0;; ++attempt) {
-        _assert(attempt < 64, "L3 host prefix clamp did not converge");
+        _assert(attempt < max_attempts, "L3 host prefix clamp did not converge");
         // Re-run SweepThenConverge at the current bound. Truncating a window
         // or Mamba hits mask (for example [0, 1, 1] -> [0, 1]) can leave the
         // first live lookback page as a hole; the matcher must rebuild the

@@ -645,7 +645,9 @@ Its responsibilities:
   load flushes Device/Host first so new parameters cannot reuse the
   previous checkpoint.   `ClearCache` rejects in-flight Host writebacks
   (pause drain does not wait for those). Weight-update `flush_cache` and
-  standalone `/flush_cache` first MIN-reduce a non-mutating
+  standalone `/flush_cache` first MAX-reduce flush intent across
+  attention DP so every DP worker enters the same collectives, then
+  MIN-reduce a non-mutating
   `CanClearCache` / `CacheIsClearable` probe across cache-owning ranks
   (attention TP, then CP, then PP) and then across attention DP so no
   rank mutates Device/Host until every replica that shares the Mooncake

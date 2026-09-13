@@ -367,7 +367,9 @@ the same checkpoint and layout). Live weight updates flush Device/Host
 before the GPU load, then rebuild that prefix. A requested `flush_cache`
 must succeed first: in-flight Host writebacks cause `ClearCache` to
 reject. Weight-update `flush_cache` and standalone `/flush_cache`
-MIN-reduce a non-mutating `can_clear_cache` probe across cache-owning
+first MAX-reduce flush intent across attention DP so every DP worker
+enters the same collectives, then MIN-reduce a non-mutating
+`can_clear_cache` probe across cache-owning
 ranks (attention TP, then CP, then PP) and then across attention DP
 before any rank clears. Exists, prefetch, and `WriteBackDone` stay
 TP/CP/PP because DP ranks hold different sequences; flush includes DP
