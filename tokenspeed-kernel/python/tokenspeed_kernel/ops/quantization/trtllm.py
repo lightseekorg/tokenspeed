@@ -29,6 +29,7 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
+__all__ = []
 
 if platform.is_nvidia:
     # DeepEP must initialize before TRT-LLM's static CUDA runtime.
@@ -130,5 +131,3 @@ if platform.is_nvidia:
         "trtllm_fp8_token",
         "trtllm_fp8_tensor",
     ]
-else:
-    __all__ = []
