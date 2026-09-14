@@ -77,6 +77,7 @@ def _projection_epilogue_kernel(
     down_mask = offsets < LOWRANK
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     value = tl.load(
         projected_ptr + row * projected_row_stride + offsets,
         mask=down_mask,
@@ -101,8 +102,6 @@ def _projection_epilogue_kernel(
             inject * projection_scale,
             mask=inject_mask,
         )
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -123,6 +122,7 @@ def _mix_epilogue_kernel(
     mask = offsets < hidden_size
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     mixed = tl.zeros([BLOCK], dtype=tl.float32)
     for branch in tl.static_range(HC_COUNT):
         column = branch * hidden_size + offsets
@@ -136,8 +136,6 @@ def _mix_epilogue_kernel(
         ).to(tl.float32)
         mixed += tl.sigmoid(gate) * value
     tl.store(out_ptr + row * out_row_stride + offsets, mixed / HC_COUNT, mask=mask)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -264,6 +262,7 @@ def _persistent_mix_kernel(
     # Wait before accessing stream-private state, including the generation.
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
 
     generation = tl.load(counters_ptr + 1, volatile=True)
     # Keep every row's 32-column atomic tiles within aligned 128-byte segments,
@@ -305,10 +304,6 @@ def _persistent_mix_kernel(
             sem="relaxed",
             scope="gpu",
         )
-    # All projection work is issued. Let the consumer prepare while this grid
-    # finishes its reduction and up projection; it must still wait for results.
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
     _grid_barrier(counters_ptr, (generation + 1) * num_ctas)
     if pid == 0:
         # Every CTA has consumed this generation and cleared its next-buffer

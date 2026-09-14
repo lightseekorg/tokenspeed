@@ -77,6 +77,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 ):
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        # Release successor setup; its wait still guards all dependent reads.
+        tl.extra.cuda.gdc_launch_dependents()
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
     if IS_VARLEN:
@@ -295,8 +297,6 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 ht, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
             )
             tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def chunk_gated_delta_rule_fwd_h(

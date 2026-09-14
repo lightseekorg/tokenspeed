@@ -156,9 +156,19 @@ and leave output undefined. Consumers must ignore padded output; enabled
 intermediate caches always require real storage.
 
 GDN prefill, decode and verify follow `pdl_enabled()`. Kernels wait before
-reading inputs and signal after computation; FlashInfer adapters preserve the
-upstream CuTe body and isolate PDL compilation caches. Graphs retain their
-capture-time PDL setting and must be recaptured to change it.
+reading producer-owned inputs or state, then signal launch readiness before
+computation so successors can overlap setup and independent weight loading.
+A launch signal never publishes outputs: the successor must still wait before
+reading them. FlashInfer adapters preserve the upstream CuTe body and isolate
+PDL compilation caches. Gated RMSNorm may preload weights only with the explicit
+`weights_independent` contract; a required contiguous weight copy disables that
+preload. Collective kernels on the gated-residual chain must not trigger early:
+at an RSAG-to-AR switch, `post_attn_comm` all-gathers the residual immediately
+before the next combine-norm, which preloads that residual before its PDL wait.
+An early collective trigger would therefore allow the combine-norm to read stale
+residual data. Graphs retain their capture-time PDL setting and must be
+recaptured to change it. QSA and gated residual kernels follow the same
+wait-before-read and wait-before-trigger ordering.
 
 ### `for_graph_replay` is for graph-mechanics asymmetries only
 

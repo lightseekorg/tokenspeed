@@ -153,6 +153,7 @@ def _grouped_gemma_rmsnorm_kernel(
     positions = row * WIDTH + group * GROUP_SIZE + offsets
     if ENABLE_PDL and not PRELOAD_RESIDUAL:
         tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     x = tl.load(x_ptr + positions, mask=mask, other=0.0).to(tl.float32)
     weight = tl.load(
         weight_ptr + group * weight_group_stride + offsets, mask=mask, other=0.0
@@ -161,6 +162,7 @@ def _grouped_gemma_rmsnorm_kernel(
         # The caller guarantees residual and norm weights are already visible.
         # Block output and injection logits may still be produced upstream.
         tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     if HAS_COMBINE:
         value = tl.load(
             block_ptr + row * GROUP_SIZE + offsets, mask=mask, other=0.0
@@ -175,8 +177,6 @@ def _grouped_gemma_rmsnorm_kernel(
     variance = tl.sum(x * x, axis=0) / GROUP_SIZE
     normalized = x * tl.rsqrt(variance + eps) * (1.0 + weight)
     tl.store(out_ptr + positions, normalized, mask=mask)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def grouped_gemma_rmsnorm(

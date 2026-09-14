@@ -1812,6 +1812,8 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
 ):
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        # Release successor setup; its wait still guards all dependent reads.
+        tl.extra.cuda.gdc_launch_dependents()
     row, tile = tl.program_id(0), tl.program_id(1)
     TOTAL_V: tl.constexpr = NUM_HEADS_V * HEAD_V
     QKV_DIM: tl.constexpr = 2 * NUM_HEADS_QK * HEAD_QK + TOTAL_V
@@ -1845,8 +1847,6 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
         )
         tl.store(b + row * NUM_HEADS_V + heads, b_values, mask)
         tl.store(a + row * NUM_HEADS_V + heads, a_values, mask)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def fused_qkvzba_split_reshape_cat_contiguous(

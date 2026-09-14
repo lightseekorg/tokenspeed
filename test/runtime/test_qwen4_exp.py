@@ -535,6 +535,9 @@ def _qsa_root(
                     block_granularity=granularity,
                     family="history",
                     retention="full_history",
+                    rows_per_page=granularity,
+                    entry_stride_tokens=1,
+                    sliding_window_tokens=None,
                 )
                 for gid, granularity in _QSA_GROUP_GRANULARITIES.items()
             ),
