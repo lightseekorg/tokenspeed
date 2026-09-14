@@ -73,7 +73,7 @@ def test_arming_requires_fused_moe_ar():
 
 
 @needs_iris
-def test_iris_preparation_caps_producer_direct_for_equal_groups(monkeypatch):
+def test_iris_preparation_uses_full_window_for_equal_tp8_groups(monkeypatch):
     from tokenspeed.runtime.models import kimi_k3_comm
 
     group = tuple(range(8))
@@ -98,7 +98,7 @@ def test_iris_preparation_caps_producer_direct_for_equal_groups(monkeypatch):
     prepare.assert_called_once_with(
         group,
         staged_max_numel=8192 * 7168,
-        producer_direct_max_numel=512 * 1024,
+        producer_direct_max_numel=8192 * (7168 + 3584),
         attnres_max_numel=16 * 7168,
         attnres_max_rows=16,
         dtype=torch.bfloat16,
@@ -143,7 +143,7 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
         call(
             moe_group,
             staged_max_numel=8192 * 7168,
-            producer_direct_max_numel=512 * 1024,
+            producer_direct_max_numel=48 * (7168 + 3584),
             attnres_max_numel=0,
             attnres_max_rows=0,
             dtype=torch.bfloat16,
@@ -179,7 +179,7 @@ def test_iris_preparation_handles_moe_only_group(monkeypatch):
     prepare.assert_called_once_with(
         moe_group,
         staged_max_numel=8192 * 7168,
-        producer_direct_max_numel=512 * 1024,
+        producer_direct_max_numel=48 * (7168 + 3584),
         attnres_max_numel=0,
         attnres_max_rows=0,
         dtype=torch.bfloat16,
@@ -213,7 +213,7 @@ def test_iris_preparation_keeps_baseline_window_for_equal_tp4(monkeypatch):
     prepare.assert_called_once_with(
         group,
         staged_max_numel=8192 * 7168,
-        producer_direct_max_numel=512 * 1024,
+        producer_direct_max_numel=48 * (7168 + 3584),
         attnres_max_numel=0,
         attnres_max_rows=0,
         dtype=torch.bfloat16,

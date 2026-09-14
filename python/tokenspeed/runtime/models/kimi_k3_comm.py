@@ -86,7 +86,7 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 logger = logging.getLogger(__name__)
 
 _IRIS_MAX_TOKENS = 8192
-_IRIS_PRODUCER_DIRECT_MAX_BYTES = 1024 * 1024
+_IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS = 48
 
 # Widest reduce this instance is built for; it becomes the collective's max_m.
 ATTN_AR_MAX_TOKENS = 8
@@ -221,12 +221,16 @@ def prepare_k3_all_reduce_buffers(
         allreduce_residual_attnres_max_tokens(mapping.attn.tp_size),
     )
     groups_are_equal = mapping.attn.tp_group == mapping.moe.tp_ep_group
-    # Iris and RCCL sum in different orders. Using Iris for K3 prefill changed
-    # the greedy EAGLE3 trajectory enough to reduce acceptance and end-to-end
-    # output throughput, despite making this collective faster in isolation.
-    producer_direct_max_numel = min(
-        max_num_tokens * (hidden_size + routed_hidden_size),
-        _IRIS_PRODUCER_DIRECT_MAX_BYTES // torch.bfloat16.itemsize,
+    # Keep the full producer-direct window for equal TP8 groups. Its 50K/500
+    # C16 gain survives content-sensitive EAGLE3 trajectories; retain 48 tokens
+    # for other mappings.
+    expand_moe_window = (
+        groups_are_equal and mapping.attn.tp_size == 8 and mapping.moe.tp_ep_size == 8
+    )
+    producer_direct_max_tokens = (
+        max_num_tokens
+        if expand_moe_window
+        else min(max_num_tokens, _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS)
     )
     prepared = False
     if mapping.attn.tp_size > 1:
@@ -234,7 +238,7 @@ def prepare_k3_all_reduce_buffers(
             mapping.attn.tp_group,
             staged_max_numel=max_num_tokens * hidden_size,
             producer_direct_max_numel=(
-                producer_direct_max_numel
+                producer_direct_max_tokens * (hidden_size + routed_hidden_size)
                 if groups_are_equal and mapping.moe.tp_ep_size > 1
                 else 0
             ),
@@ -248,7 +252,8 @@ def prepare_k3_all_reduce_buffers(
             prepare_all_reduce_buffers(
                 mapping.moe.tp_ep_group,
                 staged_max_numel=max_num_tokens * hidden_size,
-                producer_direct_max_numel=producer_direct_max_numel,
+                producer_direct_max_numel=producer_direct_max_tokens
+                * (hidden_size + routed_hidden_size),
                 attnres_max_numel=0,
                 attnres_max_rows=0,
                 dtype=torch.bfloat16,
