@@ -26,7 +26,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.dsv4._triton import compress as ops
+from tokenspeed_kernel.ops.attention.dsv4 import triton as ops
 
 
 @pytest.fixture(autouse=True)
@@ -117,7 +117,7 @@ def test_wide_launch_supports_sm100_and_caches_per_device(caplog):
         patch.object(ops.torch.cuda, "is_available", return_value=True),
         patch.object(ops.torch.version, "hip", None),
         patch.object(ops.torch.cuda, "get_device_capability", get_capability),
-        caplog.at_level("INFO", logger=ops.logger.name),
+        caplog.at_level("INFO", logger=ops.__name__),
     ):
         assert ops._wide_compress_launch_supported(0)
         assert ops._wide_compress_launch_supported(0)

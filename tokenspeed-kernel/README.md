@@ -182,8 +182,9 @@ value out of TokenSpeed-kernel; but one can also directly call into a
 specific solution under `ops/<family>/`, or manually `select_kernel` with
 targeted filters.
 
-See the [DSV4 attention notes](python/tokenspeed_kernel/ops/attention/dsv4/README.md)
-for implementation details.
+DSV4 prefill and decode selection includes the query head count. FlashMLA's
+sparse attention kernels support 64 or 128 heads; other head counts select
+an eligible alternative, including the portable Triton implementation.
 
 The public W4A16 NVFP4 GEMM accepts BF16 activations shaped `[M, K]`, packed
 `uint8` weights shaped `[N, K / 2]`, and block-16 E4M3 scales in the runtime
