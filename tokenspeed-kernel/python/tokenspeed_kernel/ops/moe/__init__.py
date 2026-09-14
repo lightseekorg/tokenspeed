@@ -734,7 +734,7 @@ def moe_apply(
     x: torch.Tensor,
     w: torch.nn.Module,
     # top-k routing inputs
-    router_logits: torch.Tensor,
+    router_logits: torch.Tensor | None,
     # top-k routing results
     topk_weights: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
@@ -755,7 +755,8 @@ def moe_apply(
         plan: Execution plan returned by moe_plan.
         x: Hidden states with shape [tokens, hidden_size].
         w: Module containing processed MoE weights.
-        router_logits: Router logits with shape [tokens, num_experts].
+        router_logits: Router logits with shape [tokens, num_experts], or None
+            for a precomputed-TopK kernel that consumes only IDs and weights.
         topk_weights: Optional precomputed expert weights with shape
             [tokens, top_k]. Required when plan support_routing is false.
         topk_ids: Optional precomputed expert ids with shape [tokens, top_k].

@@ -85,6 +85,31 @@ packed weights and block scales in the padded tail are zero-filled, so the
 extra dimensions do not change the MoE result. For example, a 640-wide expert
 under MoE TP4 is padded from 160 to 192 values per rank.
 
+### Kimi-K3 attention DP with MoE EP
+
+When attention DP is greater than one, Kimi-K3 requires attention DP, MoE EP,
+and world size to be equal. Mixed attention TP/DP layouts are rejected. The
+shared expert and both latent projections are replicated and operate on each
+rank's local tokens.
+
+`KimiLinearMoE._forward_attn_dp` gathers only latent activations and precomputed
+TopK IDs/weights, executes each rank's routed experts, and reduce-scatters the
+weighted latent partials. Latent RMSNorm, the up-projection, shared output, and
+residual addition remain local. This reference path uses three separate
+all-gathers (latent activations, expert IDs, and routing weights) and one
+reduce-scatter per nonempty global MoE batch. It does not gather full-width
+hidden states or residuals, or initialize the TP-tail fusion machinery.
+
+Only ranks with fewer rows pad their tensors; ranks at the collective row count
+reuse their produced tensors directly. Padding has zero routing weights;
+reduce-scatter restores rank ownership before local padding is removed. Idle
+ranks participate when peers have tokens. The same collective-sizing metadata
+covers eager execution, graph capture, and speculative draft narrowing.
+
+This implementation requires a precomputed-TopK expert kernel and
+`--all2all-backend none`. Replication increases model-weight memory per rank,
+which is accounted for before KV-cache allocation.
+
 ### DeepEP all-to-all
 
 `--all2all-backend deepep` moves expert routing off all-gather and onto DeepEP

@@ -394,6 +394,8 @@ class MoELayer(torch.nn.Module):
             self.support_routing and not self.supports_precomputed_topk
         )
         if use_kernel_routing:
+            if topk_output.router_logits is None:
+                raise ValueError("in-kernel MoE routing requires router logits")
             if not self.support_routing:
                 raise ValueError(
                     "selected MoE kernel does not support in-kernel routing"
