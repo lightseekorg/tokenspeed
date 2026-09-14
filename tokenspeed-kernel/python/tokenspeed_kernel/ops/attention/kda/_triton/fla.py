@@ -127,7 +127,7 @@ def kda_recurrent_decode_pool(
     ``h_pool`` is ``[num_pages, HV, V, K]`` fp32 and is updated in place.
     Returns ``o [B, T, HV, V]``.
     """
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         fused_recurrent_kda_pool,
     )
 

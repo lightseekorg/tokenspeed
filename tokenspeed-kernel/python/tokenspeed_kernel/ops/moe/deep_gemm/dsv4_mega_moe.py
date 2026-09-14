@@ -32,6 +32,7 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 try:
+    from tokenspeed_kernel.ops.moe.triton.shared import stage_dsv4_mega_moe_inputs
     from tokenspeed_kernel.thirdparty.deep_gemm import (
         fp8_fp4_mega_moe,
         get_pdl,
@@ -41,7 +42,6 @@ try:
         transform_weights_for_mega_moe,
         warmup_mega_moe_jit,
     )
-    from tokenspeed_kernel.thirdparty.triton import stage_dsv4_mega_moe_inputs
 except ImportError:  # pragma: no cover - DeepGEMM and Triton are optional
     fp8_fp4_mega_moe = None
     get_pdl = None

@@ -111,7 +111,7 @@ def test_kda_prefill_relayouts_only_for_declaring_kernels(
     ],
 )
 def test_kda_verify_bv_routing(batch_size, value_dim, store_states, expected) -> None:
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import _kda_verify_bv
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import _kda_verify_bv
 
     assert _kda_verify_bv(batch_size, value_dim, store_states) == expected
 
@@ -122,7 +122,7 @@ def test_kda_verify_bv_routing(batch_size, value_dim, store_states, expected) ->
 )
 def test_kda_verify_split_launch_routing(batch_size, expected) -> None:
     """Both routed knobs, including where the wide-block window closes."""
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         _kda_verify_launch_config,
     )
 
@@ -141,7 +141,7 @@ def test_kda_verify_split_launch_routing(batch_size, expected) -> None:
 
 
 def test_kda_verify_split_launch_requires_both_hoists_and_honors_overrides() -> None:
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         _kda_verify_launch_config,
     )
 
@@ -178,7 +178,7 @@ def test_kda_verify_split_launch_requires_both_hoists_and_honors_overrides() -> 
 def test_glm53_flash_mtp_schedules_match_reference_and_replay() -> None:
     """The TP4 schedules match the recurrence and graph replay is stable."""
     from tokenspeed_kernel._triton import triton
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         fused_recurrent_kda_mtp,
         fused_recurrent_kda_mtp_fwd_kernel,
     )
@@ -342,7 +342,7 @@ def test_glm53_flash_mtp_schedules_match_reference_and_replay() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_mtp_direct_committed_read_matches_seeded_scratch_and_replays() -> None:
     """Separate read/write pools replace the recurrent-state seed exactly."""
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         fused_recurrent_kda_mtp,
     )
 
@@ -833,7 +833,7 @@ def test_kda_decode_and_replay_select_layout_trait(
 
 
 def test_nvidia_kda_pool_matches_the_reference_recurrence() -> None:
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         fused_recurrent_kda_pool,
     )
 
@@ -1448,7 +1448,7 @@ def _megafuse_inputs(batch: int, seed: int = 17):
 def _run_megafuse(inp, *, fused: bool):
     """One megafuse decode, with the norm epilogue fused in or applied after."""
     from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         fused_recurrent_kda_megafuse,
     )
 

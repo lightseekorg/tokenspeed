@@ -25,12 +25,12 @@ from __future__ import annotations
 import functools
 
 import torch
+from flashinfer.gdn_decode import (
+    gated_delta_rule_decode_pretranspose as _original_decode,
+)
 from flashinfer.gdn_kernels.gdn_decode_mtp import (
     get_tile_v_mtp,
     get_vec_size_mtp,
-)
-from flashinfer.gdn_decode import (
-    gated_delta_rule_decode_pretranspose as _original_decode,
 )
 from flashinfer.gdn_prefill import chunk_gated_delta_rule as _original_prefill
 

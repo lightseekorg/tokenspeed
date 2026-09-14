@@ -967,7 +967,7 @@ def test_kda_cache_pool_component_views_end_to_end(
             h.extend(layer_id, s["mixed"][:8], s["g_raw"][:8], s["beta_raw"][:8])
         )
 
-    from tokenspeed_kernel.thirdparty.triton import fla_kda_recurrent
+    from tokenspeed_kernel.ops.attention.kda._triton import recurrent
 
     def _unexpected_megafuse(*args, **kwargs):
         raise AssertionError("AMD cache-group decode must bypass the FLA KDA megafuse")
@@ -981,7 +981,7 @@ def test_kda_cache_pool_component_views_end_to_end(
         return indexed_decode(*args, **kwargs)
 
     monkeypatch.setattr(
-        fla_kda_recurrent,
+        recurrent,
         "fused_recurrent_kda_megafuse",
         _unexpected_megafuse,
     )

@@ -440,3 +440,37 @@ def test_solution_wrappers_forward_host_boundaries(monkeypatch):
     cutedsl_op.cutedsl_kda_nvidia_paged_prefill(**dict(kwargs))
     assert received[-1]["cu_seqlens_cpu"] is kwargs["cu_seqlens_cpu"]
     assert implementations[-1] == "cutedsl_kda_chunk_prefill"
+
+
+def test_mtp_wrapper_forwards_explicit_kernel_contract(monkeypatch):
+    import tokenspeed_kernel.ops.attention.kda._triton.recurrent as recurrent
+    import tokenspeed_kernel.ops.attention.kda.triton as kda_triton
+
+    positional = tuple(object() for _ in range(10))
+    output = object()
+    seen = {}
+
+    def fake_mtp(*args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return output
+
+    monkeypatch.setattr(recurrent, "fused_recurrent_kda_mtp", fake_mtp)
+    result = kda_triton.kda_recurrent_decode_mtp(
+        *positional,
+        h_pool_out="output_pool",
+        lower_bound=-5.0,
+        recurrent_layout="v_major",
+    )
+
+    assert result is output
+    assert seen["args"] == positional
+    assert seen["kwargs"] == {
+        "h_pool_out": "output_pool",
+        "scale": None,
+        "lower_bound": -5.0,
+        "recurrent_layout": "v_major",
+        "use_qk_l2norm_in_kernel": True,
+        "use_gate_in_kernel": True,
+        "use_beta_sigmoid_in_kernel": True,
+    }
