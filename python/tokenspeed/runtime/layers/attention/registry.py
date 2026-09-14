@@ -575,32 +575,27 @@ def _resolve_kda_backend(kda_backend: str) -> str:
     """Resolve the KDA prefill backend policy.
 
     On AMD, the backend policy is ignored and compatible kernels are selected
-    using registry priority. On NVIDIA, ``auto`` picks the fastest available
-    kernel — ``cutedsl_kda``, then ``flashkda``, falling back to the portable
-    FLA scan. Explicit NVIDIA choices are validated against availability and
-    fail fast with an install hint. Decode is unaffected.
+    using registry priority. On NVIDIA, ``auto`` picks ``cutedsl_kda`` when its
+    device-specific implementation is available, ``flashkda`` on SM90+, and
+    ``fla`` otherwise. Explicit CuteDSL selection is validated against device
+    support. Decode is unaffected.
     """
-    if current_platform().is_amd:
+    platform = current_platform()
+    if platform.is_amd:
         # Named backend policies are NVIDIA-specific; let the registry decide.
         return "auto"
 
-    from tokenspeed_kernel.ops.attention.kda.cuda import is_flash_kda_installed
     from tokenspeed_kernel.ops.attention.kda.cute_dsl import is_cutedsl_kda_installed
 
     if kda_backend == "auto":
         if is_cutedsl_kda_installed():
             resolved = "cutedsl_kda"
-        elif is_flash_kda_installed():
+        elif platform.is_hopper_plus:
             resolved = "flashkda"
         else:
             resolved = "fla"
         logger.info("KDA prefill backend auto-resolved to %s", resolved)
         return resolved
-    if kda_backend == "flashkda" and not is_flash_kda_installed():
-        raise ValueError(
-            "--kda-backend flashkda requires the tokenspeed-flashkda "
-            "package (SM90+, CUDA 12.9+): pip install tokenspeed-flashkda"
-        )
     if kda_backend == "cutedsl_kda" and not is_cutedsl_kda_installed():
         raise ValueError(
             "--kda-backend cutedsl_kda requires the tokenspeed-cutedsl-kda package with a "

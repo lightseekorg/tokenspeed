@@ -132,7 +132,7 @@ from tokenspeed_kernel.ops.moe.triton import (
 )
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
-from tokenspeed_kernel.registry import KernelRegistry, Priority, error_fn
+from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import (
     SelectedKernel,
     select_kernel,
@@ -398,17 +398,11 @@ def _is_hopper_plus(platform: PlatformInfo) -> bool:
 
 
 def _is_hopper_plus_with_flashmla(platform: PlatformInfo) -> bool:
-    return (
-        _is_hopper_plus(platform)
-        and _attention_flash_mla.flash_mla_with_kvcache is not error_fn
-    )
+    return _is_hopper_plus(platform)
 
 
 def _is_hopper_plus_with_flashmla_prefill(platform: PlatformInfo) -> bool:
-    return (
-        _is_hopper_plus(platform)
-        and _attention_cuda_dsv4.flash_mla_sparse_fwd is not error_fn
-    )
+    return _is_hopper_plus(platform)
 
 
 def _is_nvidia(platform: PlatformInfo) -> bool:

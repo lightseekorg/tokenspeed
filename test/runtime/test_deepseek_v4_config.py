@@ -28,6 +28,7 @@ from tokenspeed_kernel.ops.attention.dsv4.cuda import (
 from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_compute_global_topk_indices_and_lens,
 )
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda import (
     hash_softplus_sqrt_topk_flash,
     softplus_sqrt_topk_flash,
@@ -1582,21 +1583,14 @@ class TestDeepseekV4Config(unittest.TestCase):
             model_config._verify_quantization()
 
     def test_deepseek_v4_flashmla_wrapper_exposes_required_api(self):
-        try:
-            from tokenspeed_kernel.ops.attention.mla.cuda import (
-                flash_mla_sparse_fwd,
-                flash_mla_with_kvcache,
-                get_mla_metadata,
-            )
-            from tokenspeed_kernel.registry import error_fn
-        except Exception as exc:  # noqa: BLE001 - optional kernel import
-            self.skipTest(f"FlashMLA wrapper unavailable: {exc}")
-        if (
-            flash_mla_with_kvcache is error_fn
-            or flash_mla_sparse_fwd is error_fn
-            or get_mla_metadata is error_fn
-        ):
-            self.skipTest("FlashMLA wrapper unavailable on this platform")
+        if not current_platform().is_hopper_plus:
+            self.skipTest("FlashMLA requires NVIDIA Hopper or newer")
+
+        from tokenspeed_kernel.ops.attention.mla.cuda import (
+            flash_mla_sparse_fwd,
+            flash_mla_with_kvcache,
+            get_mla_metadata,
+        )
 
         self.assertTrue(callable(flash_mla_with_kvcache))
         self.assertTrue(callable(flash_mla_sparse_fwd))

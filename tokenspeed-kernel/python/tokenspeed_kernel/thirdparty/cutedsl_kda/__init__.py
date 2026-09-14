@@ -24,9 +24,8 @@ The kernel, its wrapper, and the AOT ``.so`` payload ship as the standalone
 ``tokenspeed-cutedsl-kda`` distribution (import package ``tokenspeed_cutedsl_kda``,
 a CUDA-only dependency declared in ``requirements/cuda-thirdparty.txt``).
 All ``tokenspeed_cutedsl_kda`` imports funnel through this module so the
-dependency remains optional, mirroring the sibling
-``thirdparty/flash_kda.py`` loader. Lazy imports keep the attention registry
-usable when the package is absent, notably on AMD/ROCm.
+dependency remains optional. Lazy imports keep the attention registry usable
+when the package is absent, notably on AMD/ROCm.
 ``is_cutedsl_kda_installed()`` returns False there, so explicit selection fails
 at startup with an actionable error rather than an import crash.
 

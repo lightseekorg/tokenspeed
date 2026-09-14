@@ -28,13 +28,15 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
-from tokenspeed_kernel.thirdparty.flash_mla import (
-    flash_mla_sparse_fwd,
-    flash_mla_with_kvcache,
-    get_mla_metadata,
-)
 
 platform = current_platform()
+
+if platform.is_hopper_plus:
+    from tokenspeed_kernel.ops.attention.mla.cuda import (
+        flash_mla_sparse_fwd,
+        flash_mla_with_kvcache,
+        get_mla_metadata,
+    )
 
 try:
     from tokenspeed_kernel.thirdparty.cuda.dsv4_attention import (
@@ -194,11 +196,7 @@ def _dsv4_fp8_row_bytes(head_dim: int, rope_dim: int = 64) -> int:
     return nope_dim + 2 * int(rope_dim) + nope_dim // 64 + 1
 
 
-if (
-    platform.is_nvidia
-    and platform.is_hopper_plus
-    and flash_mla_with_kvcache is not error_fn
-):
+if platform.is_nvidia and platform.is_hopper_plus:
 
     @register_kernel(
         "attention",
@@ -291,11 +289,7 @@ if (
         return result
 
 
-if (
-    platform.is_nvidia
-    and platform.is_hopper_plus
-    and flash_mla_sparse_fwd is not error_fn
-):
+if platform.is_nvidia and platform.is_hopper_plus:
 
     @register_kernel(
         "attention",
