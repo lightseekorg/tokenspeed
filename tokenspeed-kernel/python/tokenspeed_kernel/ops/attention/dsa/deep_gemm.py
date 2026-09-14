@@ -116,8 +116,9 @@ def _resolve_prefill_tile_max_seqlen_k(
 
 
 if platform.is_nvidia:
+    import deep_ep  # noqa: F401
+    import trtllm_kernel  # noqa: F401
     from tokenspeed_kernel.thirdparty import deep_gemm
-    from tokenspeed_kernel.thirdparty import trtllm as _trtllm  # noqa: F401
 
     def _deep_gemm_paged_mqa_plan(
         *,

@@ -33,6 +33,8 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 _IS_NVIDIA = current_platform().is_nvidia
 
 if _IS_NVIDIA:
+    import deep_ep  # noqa: F401
+    import trtllm_kernel  # noqa: F401
     from tokenspeed_kernel.ops.attention.dsv4.cuda import (
         has_indexer_mxfp4_paged_gather,
         has_indexer_topk_prefill,
@@ -41,7 +43,7 @@ if _IS_NVIDIA:
         indexer_topk_prefill,
         persistent_topk,
     )
-    from tokenspeed_kernel.thirdparty import deep_gemm, trtllm
+    from tokenspeed_kernel.thirdparty import deep_gemm
     from tokenspeed_kernel.thirdparty.deep_gemm.warmup import warmup_prefill_jit
 
 _MXFP4_BLOCK_SIZE = 32
@@ -244,6 +246,16 @@ def _prefill_topk(
     return out
 
 
+def _trtllm_decode_topk(
+    values: torch.Tensor,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
+    topk: int,
+) -> None:
+    seq_lens = seq_lens.to(torch.int32).reshape(-1).contiguous()
+    torch.ops.trtllm.indexer_topk_decode(values, seq_lens, indices, 1, topk)
+
+
 def _decode_topk(
     logits: torch.Tensor,
     lengths: torch.Tensor,
@@ -275,7 +287,7 @@ def _decode_topk(
             logits.contiguous(), lengths, out, workspace, topk, logits.shape[1]
         )
         return out
-    trtllm.fast_topk_v2(logits.contiguous(), lengths, out, topk, 1)
+    _trtllm_decode_topk(logits.contiguous(), lengths, out, topk)
     return out
 
 
