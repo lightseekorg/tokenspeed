@@ -24,13 +24,16 @@ import math
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.mla.cuda import (
-    flash_mla_with_kvcache,
-    get_mla_metadata,
-)
 from tokenspeed_kernel.platform import current_platform
 
 platform = current_platform()
+
+if platform.is_hopper_plus:
+    from tokenspeed_kernel.ops.attention.mla.cuda import (
+        flash_mla_with_kvcache,
+        get_mla_metadata,
+    )
+
 torch.manual_seed(42)
 
 

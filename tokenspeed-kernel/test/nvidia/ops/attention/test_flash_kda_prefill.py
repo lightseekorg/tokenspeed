@@ -32,10 +32,8 @@ from importlib.util import find_spec
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.kda.cuda import (
-    flash_kda_chunk_prefill,
-    is_flash_kda_installed,
-)
+from tokenspeed_kernel.ops.attention.kda.cuda import flash_kda_chunk_prefill
+from tokenspeed_kernel.platform import current_platform
 
 HEADS = 12
 DIM = 128
@@ -45,9 +43,9 @@ STATE_MAX_ERROR = 5e-3
 
 requires_flash_kda = pytest.mark.skipif(
     not (
-        torch.cuda.is_available()
+        current_platform().is_hopper_plus
+        and torch.cuda.is_available()
         and find_spec("fla") is not None
-        and is_flash_kda_installed()
     ),
     reason="requires CUDA, flash-linear-attention, and flash-kda",
 )

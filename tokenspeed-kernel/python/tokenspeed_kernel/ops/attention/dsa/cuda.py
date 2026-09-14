@@ -48,13 +48,8 @@ from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
 )
-from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
+from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
-from tokenspeed_kernel.thirdparty.flash_mla import (
-    flash_mla_sparse_fwd,
-    flash_mla_with_kvcache,
-    get_mla_metadata,
-)
 
 __all__ = [
     "has_ragged_decode_topk",
@@ -62,6 +57,14 @@ __all__ = [
 ]
 
 platform = current_platform()
+
+if platform.is_hopper_plus:
+    from tokenspeed_kernel.ops.attention.mla.cuda import (
+        flash_mla_sparse_fwd,
+        flash_mla_with_kvcache,
+        get_mla_metadata,
+    )
+
 _decode_sched_meta_cache: dict[tuple, object] = {}
 _query_workspace_cache: dict[tuple, torch.Tensor] = {}
 
@@ -236,11 +239,7 @@ def ragged_decode_topk(
     )
 
 
-if (
-    platform.is_nvidia
-    and platform.is_hopper_plus
-    and flash_mla_with_kvcache is not error_fn
-):
+if platform.is_nvidia and platform.is_hopper_plus:
 
     @register_kernel(
         "attention",
@@ -328,11 +327,7 @@ if (
         return result
 
 
-if (
-    platform.is_nvidia
-    and platform.is_hopper_plus
-    and flash_mla_sparse_fwd is not error_fn
-):
+if platform.is_nvidia and platform.is_hopper_plus:
 
     @register_kernel(
         "attention",

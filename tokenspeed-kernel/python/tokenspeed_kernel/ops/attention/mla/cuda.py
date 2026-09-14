@@ -18,14 +18,19 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed_kernel.thirdparty.flash_mla import (
-    flash_mla_sparse_fwd,
-    flash_mla_with_kvcache,
-    get_mla_metadata,
-)
+from tokenspeed_kernel.platform import current_platform
 
-__all__ = [
-    "flash_mla_sparse_fwd",
-    "flash_mla_with_kvcache",
-    "get_mla_metadata",
-]
+if current_platform().is_hopper_plus:
+    from flash_mla import (
+        flash_mla_sparse_fwd,
+        flash_mla_with_kvcache,
+        get_mla_metadata,
+    )
+
+    __all__ = [
+        "flash_mla_sparse_fwd",
+        "flash_mla_with_kvcache",
+        "get_mla_metadata",
+    ]
+else:
+    __all__ = []

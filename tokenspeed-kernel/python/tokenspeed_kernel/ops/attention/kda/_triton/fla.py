@@ -24,8 +24,7 @@ KDA's applied decay gate is **per-channel**: a per-head log-decay
 ``A_log[num_heads]`` modulates a per-(head, channel) gate ``g [B, T, HV, K]`` --
 unlike GDN's scalar-per-head decay. ``fla``'s ``chunk_kda`` /
 ``fused_recurrent_kda`` implement the gated-delta scan. The optional dependency
-is isolated in
-``tokenspeed_kernel.thirdparty.fla``.
+is imported only when this FLA implementation is selected.
 
 The gate is computed inside ``fla``'s kernel (``use_gate_in_kernel=True``): we
 pass the raw ``g`` plus ``A_log`` and per-(head, channel) ``dt_bias``, and ``fla``
@@ -37,7 +36,17 @@ checkpoint stores ``A_log`` in a ``[head_dim]``-sized buffer zero-padded past
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.thirdparty import fla as _fla
+from fla.ops.kda import chunk_kda
+from fla.ops.kda.fused_recurrent import fused_recurrent_kda
+from triton.runtime.jit import ConstexprFunction
+
+
+def _ensure_triton_constexpr() -> None:
+    """Restore stock Triton constexpr builtins changed by tokenspeed-triton."""
+    import triton
+
+    if not isinstance(triton.next_power_of_2, ConstexprFunction):
+        triton.next_power_of_2 = ConstexprFunction(triton.next_power_of_2)
 
 
 def kda_chunk_prefill(
@@ -75,7 +84,8 @@ def kda_chunk_prefill(
     # takes the chunk path's max state error from ~4e-1 down to ~8e-4.
     if beta_is_logit:
         beta = beta.float().sigmoid()
-    return _fla.chunk_kda(
+    _ensure_triton_constexpr()
+    return chunk_kda(
         q,
         k,
         v,
@@ -162,7 +172,8 @@ def kda_recurrent_decode(
     """
     # Unlike ``chunk_kda``, ``fused_recurrent_kda`` has no ``safe_gate`` flag: it
     # applies the safe gate whenever ``lower_bound`` is set.
-    return _fla.fused_recurrent_kda(
+    _ensure_triton_constexpr()
+    return fused_recurrent_kda(
         q,
         k,
         v,
