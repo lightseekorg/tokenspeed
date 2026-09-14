@@ -97,4 +97,4 @@ def prepare_mega_moe_bf16_jit() -> None:
     include = Path(deep_gemm.__file__).resolve().parent / "include"
     cache = Path(os.environ.get("DG_JIT_CACHE_DIR", str(Path.home() / ".deep_gemm")))
     root = _make_include_overlay(include, cache)
-    deep_gemm._C.init(str(root), deep_gemm._find_cuda_home())
+    deep_gemm._C.init(str(root))
