@@ -99,8 +99,8 @@ def test_iris_preparation_caps_producer_direct_for_equal_groups(monkeypatch):
         group,
         staged_max_numel=8192 * 7168,
         producer_direct_max_numel=512 * 1024,
-        attnres_max_numel=16 * 7168,
-        attnres_max_rows=16,
+        attnres_max_numel=32 * 7168,
+        attnres_max_rows=32,
         dtype=torch.bfloat16,
         backend=None,
     )

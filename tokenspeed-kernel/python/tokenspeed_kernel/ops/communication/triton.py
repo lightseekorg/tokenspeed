@@ -55,7 +55,7 @@ __all__ = [
 
 
 allreduce_residual_rmsnorm_states = {}
-_ALLREDUCE_RESIDUAL_ATTNRES_MAX_TOKENS = 16
+_ALLREDUCE_RESIDUAL_ATTNRES_MAX_TOKENS = 32
 
 
 @dataclass
