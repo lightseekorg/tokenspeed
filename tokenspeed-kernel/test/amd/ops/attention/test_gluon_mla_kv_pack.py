@@ -20,12 +20,22 @@
 
 import pytest
 import torch
-from tokenspeed_kernel.platform import current_platform
+from utils import is_cdna4, is_cdna5
 
-pytestmark = pytest.mark.skipif(
-    not current_platform().is_cdna4,
-    reason="gfx950 is required",
-)
+if not (is_cdna4() or is_cdna5()):
+    pytest.skip(
+        "AMD CDNA4 or CDNA5 is required for Gluon MLA K/V pack tests",
+        allow_module_level=True,
+    )
+
+if is_cdna4():
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.kv_pack import (  # noqa: E402
+        gluon_mla_kv_pack_quantize_fp8_gfx950 as gluon_mla_kv_pack_quantize_fp8,
+    )
+else:
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.kv_pack import (  # noqa: E402
+        gluon_mla_kv_pack_quantize_fp8_gfx1250 as gluon_mla_kv_pack_quantize_fp8,
+    )
 
 
 def _reference(k_nope, k_pe, v, k_scale_inv, v_scale_inv, fp8_dtype):
@@ -44,10 +54,6 @@ def _reference(k_nope, k_pe, v, k_scale_inv, v_scale_inv, fp8_dtype):
 def test_gluon_mla_kv_pack_quantize_fp8(
     seq_len: int, fp8_dtype: torch.dtype, k_pe_ndim: int
 ) -> None:
-    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.kv_pack import (
-        gluon_mla_kv_pack_quantize_fp8_gfx950,
-    )
-
     torch.manual_seed(0)
     heads, qk_nope, qk_rope, v_head = 4, 128, 64, 128
     packed = torch.randn(
@@ -69,7 +75,7 @@ def test_gluon_mla_kv_pack_quantize_fp8(
     k_out = torch.empty_like(expected_k)
     v_out = torch.empty_like(expected_v)
 
-    actual_k, actual_v = gluon_mla_kv_pack_quantize_fp8_gfx950(
+    actual_k, actual_v = gluon_mla_kv_pack_quantize_fp8(
         k_nope,
         k_pe,
         v,
@@ -88,10 +94,6 @@ def test_gluon_mla_kv_pack_quantize_fp8(
 
 
 def test_gluon_mla_kv_pack_production_heads() -> None:
-    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.kv_pack import (
-        gluon_mla_kv_pack_quantize_fp8_gfx950,
-    )
-
     torch.manual_seed(1)
     seq_len, heads, qk_nope, qk_rope, v_head = 4096, 16, 128, 64, 128
     packed = torch.randn(
@@ -106,7 +108,7 @@ def test_gluon_mla_kv_pack_production_heads() -> None:
     k_pe = torch.randn(seq_len, 1, qk_rope, device="cuda", dtype=torch.bfloat16)
     expected_k, expected_v = _reference(k_nope, k_pe, v, 1.0, 1.0, torch.float8_e4m3fn)
 
-    actual_k, actual_v = gluon_mla_kv_pack_quantize_fp8_gfx950(k_nope, k_pe, v)
+    actual_k, actual_v = gluon_mla_kv_pack_quantize_fp8(k_nope, k_pe, v)
     torch.cuda.synchronize()
 
     assert torch.equal(actual_k.view(torch.uint8), expected_k.view(torch.uint8))
