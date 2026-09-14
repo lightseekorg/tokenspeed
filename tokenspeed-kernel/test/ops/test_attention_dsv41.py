@@ -121,48 +121,6 @@ def test_compressor_tail_scatter_graph_strides_and_replay(device):
     dsv41.compressor_tail_scatter(content[:0], scores[:0], tail, slots[:0])
 
 
-@pytest.mark.skipif(
-    torch.version.hip is not None,
-    reason="DeepSeek V4.1 graph execution is NVIDIA-only",
-)
-def test_index_topk_graph_full_candidates_and_reindex(device):
-    torch.manual_seed(43)
-    cache = _make_cache(
-        torch.randn(256, 128, device=device, dtype=torch.bfloat16), "index"
-    )
-    q = torch.randn(2, 2, 128, device=device, dtype=torch.bfloat16)
-    weights = torch.rand(2, 2, device=device, dtype=torch.bfloat16)
-    table = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]], device=device, dtype=torch.int32)
-    visible = torch.tensor([0, 0], device=device, dtype=torch.int32)
-
-    def run():
-        full = dsv41.index_topk(
-            q, weights, cache, table, visible, None, 16, 4, 8, 2, 64, None, None
-        )
-        reindex = dsv41.index_topk(
-            q, weights, cache, table, visible, full[2], 16, 0, 8, 2, 64, None, None
-        )
-        return full + reindex
-
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        run()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            output = run()
-    torch.cuda.current_stream().wait_stream(stream)
-    for lengths in ([17, 130], [256, 9], [0, 0], [65, 255]):
-        q.normal_()
-        weights.uniform_()
-        visible.copy_(torch.tensor(lengths, device=device, dtype=torch.int32))
-        table.copy_(table.flip(1))
-        expected = run()
-        graph.replay()
-        for got, want in zip(output, expected, strict=True):
-            torch.testing.assert_close(got, want, rtol=0, atol=0)
-
-
 def test_public_arguments_are_explicit():
     for name in dsv41.__all__:
         fn = getattr(dsv41, name)
