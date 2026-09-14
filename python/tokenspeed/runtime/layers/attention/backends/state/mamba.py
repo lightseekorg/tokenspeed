@@ -24,7 +24,7 @@ GLM-5.3) and Qwen4-exp build on it."""
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -54,8 +54,14 @@ from tokenspeed_kernel.ops.attention.gdn.triton import (
     set_total_chunks_hint,
     set_total_chunks_hint_uniform,
 )
-from tokenspeed_kernel.ops.attention.kda.triton import verify_state_blocks
-from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
+from tokenspeed_kernel.ops.attention.kda.triton import (
+    commit_state_pages,
+    verify_state_blocks,
+)
+from tokenspeed_kernel.ops.kvcache.triton import (
+    copy_state_rows,
+    state_verify_commit_rows,
+)
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     scrub_padding_tail,
@@ -68,8 +74,6 @@ from tokenspeed.runtime.layers.attention.backends.base import (
 from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
     _compute_state_block_index_plan,
     _gather_state_block_indices,
-    gather_verified_state_blocks,
-    verified_state_block_slots,
 )
 from tokenspeed.runtime.layers.attention.backends.state.utils import row_stride_i32
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
@@ -852,31 +856,56 @@ class MambaAttnBackend(AttentionBackend):
             cache[key] = rows
         return rows
 
+    def _resolve_verify_commit_pages(
+        self, accepted_length: torch.Tensor, group_ids: Sequence[str]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resolve the pending verify's write pages in the supplied group order."""
+        committed, tables, draft_token_num, _ = self._verify_commit_ctx
+        bs = accepted_length.shape[0]
+        write_stack = torch.empty(
+            (len(group_ids), bs), dtype=torch.int32, device=accepted_length.device
+        )
+        steps = torch.empty(bs, dtype=torch.int32, device=accepted_length.device)
+        for out_row, group_id in enumerate(group_ids):
+            commit_state_pages(
+                accepted_length,
+                committed,
+                tables[group_id],
+                batch_size=bs,
+                draft_tokens=draft_token_num,
+                granularity=self._checkpoint_granularity,
+                pages_out=write_stack,
+                out_row=out_row,
+                steps_out=steps,
+            )
+        return write_stack, steps
+
     def commit_verified_state(self, accepted_length: torch.Tensor) -> None:
-        """Commit the accepted draft prefix into each group's state slab."""
+        """Commit the accepted draft prefix with fused per-group page resolves."""
         ctx = self._verify_commit_ctx
         if ctx is None:
             return
-        committed, tables, draft_token_num, read_pages_by_group = ctx
+        _, _, draft_token_num, read_pages_by_group = ctx
         bs = accepted_length.shape[0]
-        k = accepted_length.to(torch.int64).clamp(min=1, max=draft_token_num)
-        slots = verified_state_block_slots(committed, k, self._checkpoint_granularity)
-        stride = draft_token_num + 1
-        src_rows = (
-            torch.arange(bs, dtype=torch.int64, device=accepted_length.device) * stride
-            + k
+        group_ids = self._state_groups()
+        write_stack, steps = self._resolve_verify_commit_pages(
+            accepted_length, group_ids
         )
-        pages_by_group: dict[str, torch.Tensor] = {}
-        for group_id in self._state_groups():
-            pages_by_group[group_id] = gather_verified_state_blocks(
-                tables[group_id], slots
-            )
         copy_tables = self._verify_copy_tables_get()
-        pages_stack = torch.stack(
-            [pages_by_group[group_id] for group_id in self._state_groups()]
+        src_tiled, dst_rows = torch.empty(
+            (2, copy_tables["num_layers"] * bs),
+            dtype=torch.int32,
+            device=accepted_length.device,
+        ).unbind(0)
+        state_verify_commit_rows(
+            steps,
+            write_stack,
+            src_tiled,
+            dst_rows,
+            verify_width=draft_token_num,
+            num_layers=copy_tables["num_layers"],
+            group_indices=copy_tables["group_sel"],
         )
-        dst_rows = pages_stack.index_select(0, copy_tables["group_sel"]).reshape(-1)
-        src_tiled = src_rows.repeat(copy_tables["num_layers"])
         copy_state_rows(
             copy_tables["conv_scratch"],
             copy_tables["conv_comp"],
@@ -894,17 +923,12 @@ class MambaAttnBackend(AttentionBackend):
                 state_addresses=copy_tables["ssm_comp"],
                 state_row_strides=copy_tables["ssm_element_stride"],
                 read_indices=torch.stack(
-                    [
-                        read_pages_by_group[group_id][:bs]
-                        for group_id in self._state_groups()
-                    ]
+                    [read_pages_by_group[group_id][:bs] for group_id in group_ids]
                 )
                 .index_select(0, copy_tables["group_sel"])
                 .to(torch.int32),
-                write_indices=dst_rows.view(copy_tables["num_layers"], bs).to(
-                    torch.int32
-                ),
-                accepted_length=k.to(torch.int32),
+                write_indices=dst_rows.view(copy_tables["num_layers"], bs),
+                accepted_length=steps,
                 draft_token_num=draft_token_num,
                 geometry=replay.geometry,
                 state_dtype=replay.state_dtype,
