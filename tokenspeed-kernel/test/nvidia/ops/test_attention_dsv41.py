@@ -44,9 +44,7 @@ def test_index_topk_graph_full_candidates_and_reindex():
     )
     q = torch.randn(2, 2, 128, device=device, dtype=torch.bfloat16)
     weights = torch.rand(2, 2, device=device, dtype=torch.bfloat16)
-    table = torch.tensor(
-        [[0, 1, 2, 3], [3, 2, 1, 0]], device=device, dtype=torch.int32
-    )
+    table = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]], device=device, dtype=torch.int32)
     visible = torch.tensor([0, 0], device=device, dtype=torch.int32)
 
     def run():
