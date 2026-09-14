@@ -121,6 +121,10 @@ def test_compressor_tail_scatter_graph_strides_and_replay(device):
     dsv41.compressor_tail_scatter(content[:0], scores[:0], tail, slots[:0])
 
 
+@pytest.mark.skipif(
+    torch.version.hip is not None,
+    reason="DeepSeek V4.1 graph execution is NVIDIA-only",
+)
 def test_index_topk_graph_full_candidates_and_reindex(device):
     torch.manual_seed(43)
     cache = _make_cache(

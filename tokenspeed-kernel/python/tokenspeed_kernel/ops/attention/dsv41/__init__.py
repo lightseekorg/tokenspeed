@@ -38,6 +38,7 @@ RoPE, normalization, output buffers and cache lifetime.
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.attention.mla._triton.page_table import bounded_group_slots
 from tokenspeed_kernel.selection import SelectionObjective, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -766,10 +767,6 @@ def compressor_metadata(
     Returns None. Inputs and destinations must not alias.
     """
     if not positions.is_cuda:
-        from tokenspeed_kernel.ops.attention.triton.page_table import (
-            bounded_group_slots,
-        )
-
         active.copy_((positions >= 0) & (positions % 2 == 1))
         pair_positions.copy_((positions - 1).masked_fill(~active, -1))
         pair_requests.copy_(requests.masked_fill(~active, -1))

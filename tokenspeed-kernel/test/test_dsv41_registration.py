@@ -93,9 +93,6 @@ for name in (
         ],
         env={
             **os.environ,
-            "CUDA_VISIBLE_DEVICES": "",
-            "HIP_VISIBLE_DEVICES": "",
-            "ROCR_VISIBLE_DEVICES": "",
             "PYTHONDONTWRITEBYTECODE": "1",
         },
         capture_output=True,

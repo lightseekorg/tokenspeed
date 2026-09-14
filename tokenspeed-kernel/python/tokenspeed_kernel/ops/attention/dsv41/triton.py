@@ -1249,7 +1249,7 @@ def _swa_rope_insert(
     "dsv41_swa_rope_scatter",
     name="triton_dsv41_swa_rope_scatter",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    capability=_CAPABILITY,
     signatures=frozenset({format_signature(x=dense_tensor_format(torch.bfloat16))}),
     traits={},
     priority=Priority.PORTABLE,
