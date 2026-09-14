@@ -408,7 +408,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         }
     }
     std::vector<CacheKey> event_keys = registerKvEventPrefixPages(*request, match.candidate_prefix_hashes, 0);
-    std::optional<CacheCoordinator::AdmissionResult> admission = admit(plan, feedback, std::move(match.probe), demands);
+    std::optional<CacheCoordinator::AdmissionResult> admission =
+        admit(plan, feedback, std::move(match.probe), demands, /*request_access_epoch=*/std::nullopt);
     if (!admission) {
         discardUncachedKvEventPages(event_keys);
         return std::nullopt;
@@ -418,7 +419,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
 
     if (!match.extension_hashes.empty()) {
         coordinator_.CacheFullBlocks(tables, match.extension_hashes, admission->access_epoch,
-                                     admission->device_prefix_tokens / coordinator_.PrefixGranularity());
+                                     admission->device_prefix_tokens / coordinator_.PrefixGranularity(),
+                                     CacheBoundaryKind::kChunk);
     }
     discardUncachedKvEventPages(event_keys);
     return fsm::SchedulePrefillFirstChunkEvent{
@@ -494,12 +496,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
 
     cache_progress.materialized_state_boundary_tokens =
         after_tokens / coordinator_.PrefixGranularity() * coordinator_.PrefixGranularity();
-    return fsm::SchedulePrefillEvent{
-        prefill_tokens,
-        decode_reserve,
-        std::move(cache_progress),
-        config_.role == Role::kP,
-    };
+    request->CacheProgressRef() = std::move(cache_progress);
+    return fsm::SchedulePrefillEvent{prefill_tokens, decode_reserve, config_.role == Role::kP};
 }
 
 std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan& plan, AdmissionFeedback& feedback,
@@ -539,7 +537,8 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
         }
     }
 
-    return fsm::ScheduleDecodeEvent{config_.decode_input_tokens, std::move(cache_progress)};
+    request->CacheProgressRef() = std::move(cache_progress);
+    return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
 }
 
 PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,

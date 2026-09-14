@@ -65,14 +65,14 @@ std::int32_t Request::MaterializedStateBoundaryTokens() const {
     if (endpoint > 0 && endpoint % prefix_granularity_ == 0) {
         return endpoint;
     }
-    return forwardState("MaterializedStateBoundaryTokens").CacheProgressRef().materialized_state_boundary_tokens;
+    return forwardResources("MaterializedStateBoundaryTokens").cache_progress.materialized_state_boundary_tokens;
 }
 
-fsm::ForwardState& Request::forwardState(const char* operation) {
-    fsm::ForwardState* result = std::visit(
-        []<typename State>(State& state) -> fsm::ForwardState* {
-            if constexpr (std::derived_from<State, fsm::ForwardState>) {
-                return &state;
+fsm::ForwardResources& Request::forwardResources(const char* operation) {
+    fsm::ForwardResources* result = std::visit(
+        []<typename State>(State& state) -> fsm::ForwardResources* {
+            if constexpr (fsm::HoldsForwardResources<State>) {
+                return &state.resources;
             }
             return nullptr;
         },
@@ -83,11 +83,11 @@ fsm::ForwardState& Request::forwardState(const char* operation) {
     return *result;
 }
 
-const fsm::ForwardState& Request::forwardState(const char* operation) const {
-    const fsm::ForwardState* result = std::visit(
-        []<typename State>(const State& state) -> const fsm::ForwardState* {
-            if constexpr (std::derived_from<State, fsm::ForwardState>) {
-                return &state;
+const fsm::ForwardResources& Request::forwardResources(const char* operation) const {
+    const fsm::ForwardResources* result = std::visit(
+        []<typename State>(const State& state) -> const fsm::ForwardResources* {
+            if constexpr (fsm::HoldsForwardResources<State>) {
+                return &state.resources;
             }
             return nullptr;
         },

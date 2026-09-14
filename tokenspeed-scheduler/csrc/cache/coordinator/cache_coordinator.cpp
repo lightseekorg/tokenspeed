@@ -475,7 +475,7 @@ void CacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables, std::span<c
         std::vector<CacheKey> keys = keysForGroup(content_hashes, groups_[i].Id());
         const std::int32_t pages_per_prefix_hash = prefix_granularity_ / geometry_[i].BlockGranularity();
         cacheFullBlocksForGroup<CacheTier::kDevice>(i, tables[i], keys, first_slot * pages_per_prefix_hash,
-                                                    access_epoch, boundary_kind);
+                                                    access_epoch, boundary_kind, /*stream_completed_to_host=*/false);
     }
 }
 
@@ -843,7 +843,9 @@ std::int32_t CacheCoordinator::NumPinnedHostCachedBlocks() const {
 void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key) {
     _assert(host_pool_ != nullptr, "CacheHostBlock requires a host pool");
     _assert(key.group_id < groups_.size(), "CacheHostBlock group id out of range");
-    groups_[key.group_id].Index().Register(*host_pool_, block_ref, key, ++next_access_epoch_);
+    groups_[key.group_id].Index().Register(*host_pool_, block_ref, key, ++next_access_epoch_,
+                                           /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                                           /*newly_cached=*/nullptr);
 }
 
 CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
