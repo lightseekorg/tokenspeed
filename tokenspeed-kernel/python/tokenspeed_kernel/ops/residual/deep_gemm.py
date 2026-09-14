@@ -43,9 +43,6 @@ if platform.is_hopper_plus:
     )
     from tokenspeed_kernel.thirdparty.cuda.mhc import mhc_big_fuse
 
-
-if platform.is_hopper_plus:
-
     @register_kernel(
         "residual",
         "mhc_pre",
