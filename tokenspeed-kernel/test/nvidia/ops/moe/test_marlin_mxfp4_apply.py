@@ -184,3 +184,55 @@ def test_marlin_mxfp4_ep_masks_nonlocal_experts() -> None:
         ).float()
 
     torch.testing.assert_close(acc, expected.float(), atol=5e-2, rtol=5e-2)
+
+def test_marlin_mxfp4_silu_without_situ_beta() -> None:
+    """Non-SiTU models leave ``activation_situ_beta`` as None on the weight
+    module (the expert layer's default); the apply must not ``float()`` it.
+    SiTU with a huge beta is SiLU (``beta * tanh(gate / beta) -> gate``), so
+    the SiTU reference doubles as the SiLU reference."""
+    _requires_sm90()
+    generator = torch.Generator(device="cuda").manual_seed(11)
+    num_experts, top_k = 8, 2
+    hidden_size, intermediate_size = 256, 128
+    num_tokens = 8
+
+    x = (
+        torch.randn(num_tokens, hidden_size, generator=generator, device="cuda") * 0.2
+    ).to(torch.bfloat16)
+    raw = make_mxfp4_moe_weights(
+        num_experts, hidden_size, intermediate_size, generator, device="cuda"
+    )
+    topk_ids = (
+        torch.arange(num_tokens * top_k, device="cuda").reshape(num_tokens, top_k)
+        % num_experts
+    ).to(torch.int32)
+    topk_weights = torch.rand(
+        num_tokens, top_k, generator=generator, device="cuda", dtype=torch.float32
+    )
+    topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
+    expected = mxfp4_moe_reference(
+        x,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        raw["w2_weight"],
+        raw["w2_scale"],
+        topk_ids,
+        topk_weights,
+        activation_dtype=torch.bfloat16,
+        situ_beta=1e6,
+        situ_linear_beta=None,
+    )
+    w = _Weights(
+        {k: v.clone() for k, v in raw.items()},
+        num_local_experts=num_experts,
+        ep_size=1,
+        ep_rank=0,
+        beta=None,
+        linear_beta=None,
+    )
+    plan = {"activation": "silu"}
+    marlin_mxfp4_moe_weights(plan, w)
+    actual = marlin_mxfp4_precomputed_moe_apply(
+        plan, x, w, None, topk_weights=topk_weights, topk_ids=topk_ids
+    )
+    torch.testing.assert_close(actual.float(), expected.float(), atol=5e-2, rtol=5e-2)
