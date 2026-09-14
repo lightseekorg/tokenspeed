@@ -672,8 +672,8 @@ def test_msa_cute_extend_matches_triton(kv_cache_dtype: torch.dtype) -> None:
         kwargs = _two_request_extend_case(kv_cache_dtype)
         # Each solution's indexer pass rewrites the same index_k_cache slots
         # with identical values, so back-to-back calls stay comparable.
-        out_cute = msa_extend_with_kvcache(solution="cute_dsl", **kwargs)
-        import cutlass.cute as cute
+        out_cute = msa_extend_with_kvcache(solution="msa", **kwargs)
+        from cutlass import cute
 
         # Importing MSA must preserve option-bound compilation for other users.
         assert callable(cute.compile[()])
@@ -1006,3 +1006,56 @@ def test_fmha_prefill_score_gates() -> None:
     assert not prefill_score_supported(
         index_q, pages.to(torch.float8_e4m3fn), 16, 256, [8], [32000]
     )
+
+
+@requires_cuda
+def test_msa_prefill_skips_padded_selected_blocks() -> None:
+    """The indexer pads slots it cannot fill with -1 (e.g. a visible block whose
+    score is -inf). The sparse kernels must skip those slots, not index the page
+    table with -1: that read is what killed MiniMax-M3's prefill-graph capture."""
+    torch.manual_seed(20260913)
+    prefill_len = 300
+    num_blocks = math.ceil(prefill_len / _BLOCK_SIZE)
+    block_table = torch.arange(1, num_blocks + 1, dtype=torch.int32, device="cuda")[
+        None
+    ]
+    key_cache = torch.randn(
+        num_blocks + 1, 1, _BLOCK_SIZE, _HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    )
+    value_cache = torch.randn_like(key_cache)
+    query = torch.randn(prefill_len, 16, _HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    seq_lens = torch.tensor([prefill_len], dtype=torch.int32, device="cuda")
+    cu_seqlens = torch.tensor([0, prefill_len], dtype=torch.int32, device="cuda")
+    prefix_lens = torch.zeros(1, dtype=torch.int32, device="cuda")
+    selected = torch.full((prefill_len, 1, _TOPK), -1, dtype=torch.int32, device="cuda")
+    for position in range(prefill_len):
+        selected[position, 0, 0] = position // _BLOCK_SIZE  # own block only
+    selected[129:, 0, 1] = 0  # a second valid block for some rows
+    selected[200:, 0, 1] = -1  # ... and a padded slot inside the visible range
+    output = minimax_sparse_attention(
+        query,
+        key_cache,
+        value_cache,
+        selected,
+        block_table,
+        seq_lens,
+        scale=_HEAD_DIM**-0.5,
+        cu_seqlens_q=cu_seqlens,
+        prefix_lens=prefix_lens,
+        max_query_len=prefill_len,
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(output.float()).all()
+    for position in (0, 129, 200, prefill_len - 1):
+        blocks = selected[position, 0]
+        expected = _reference_sparse_attention(
+            query[position],
+            key_cache,
+            value_cache,
+            blocks[blocks >= 0],
+            block_table[0],
+            position,
+        )
+        torch.testing.assert_close(
+            output[position].float(), expected, atol=2e-2, rtol=2e-2
+        )
