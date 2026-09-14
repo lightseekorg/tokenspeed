@@ -1536,11 +1536,12 @@ class ServerArgs:
             default=ServerArgs.kda_backend,
             help="KDA (Kimi Delta Attention) prefill kernel policy. On AMD, "
             "this setting is ignored and compatible kernels are selected using "
-            "registry priority. On NVIDIA, 'auto' selects cutedsl_kda on supported "
-            "devices, flashkda on SM90+, and fla otherwise. Named backends are "
-            "NVIDIA-specific: 'fla' uses the portable FLA scan, 'flashkda' uses "
-            "the FlashKDA library (SM90+), and 'cutedsl_kda' uses the CuteDSL KDA "
-            "AOT kernel (prebuilt, sm_103a). Decode is unaffected.",
+            "registry priority. On NVIDIA, 'auto' selects the fastest available "
+            "backend "
+            "(cutedsl_kda > flashkda > fla). Named backends are NVIDIA-specific: "
+            "'fla' uses the portable FLA scan, 'flashkda' uses the optional "
+            "FlashKDA library (source build, SM90+), and 'cutedsl_kda' uses the "
+            "CuteDSL KDA AOT kernel (prebuilt, sm_103a). Decode is unaffected.",
         )
         parser.add_argument(
             "--drafter-attention-backend",
