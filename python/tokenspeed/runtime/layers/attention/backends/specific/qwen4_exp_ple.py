@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.attention.kda.triton import (
+    commit_state_pages,
     verify_state_blocks,
 )
 from tokenspeed_kernel.ops.kvcache.triton import (
@@ -43,8 +44,6 @@ from tokenspeed.runtime.layers.attention.backends.base import (
 )
 from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
     compute_state_block_indices,
-    gather_verified_state_blocks,
-    verified_state_block_slots,
 )
 from tokenspeed.runtime.layers.attention.backends.state.utils import row_stride_i32
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
@@ -406,7 +405,7 @@ class Qwen4ExpPLEBackend(AttentionBackend):
                     f"{self._conv_field_ids[0]} {conv_dst_stride}"
                 )
         device = context_field.device
-        tables = {
+        return {
             "context_src": self._u64([context_scratch.data_ptr()], device),
             "context_dst": self._u64([context_field.data_ptr()], device),
             "context_src_stride": self._i64([row_stride_i32(context_scratch)], device),
@@ -423,10 +422,9 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             "conv_dst_stride": self._i64([conv_dst_stride] * len(conv_fields), device),
             "conv_row_bytes": conv_fields[0][0].numel() * conv_fields[0].element_size(),
         }
-        return tables
 
     def commit_verified_state(self, accepted_lengths: torch.Tensor) -> None:
-        """Commit one completed decode verification's accepted PLE checkpoint."""
+        """Commit the accepted PLE checkpoint with a fused page resolve."""
         context = self._verify_commit_ctx
         if context is None:
             return
@@ -441,19 +439,29 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         row_count = bs * num_layers
         if rows is None or rows.shape[1] < row_count:
             raise RuntimeError("PLE commit rows exceed the preallocated capacity")
-        steps = accepted_lengths.to(torch.int64).clamp(min=1, max=width)
-        slots = verified_state_block_slots(
-            self._decode_committed, steps, self._checkpoint_granularity
+        pages, steps = torch.empty(
+            (2, bs), dtype=torch.int32, device=accepted_lengths.device
+        ).unbind(0)
+        commit_state_pages(
+            accepted_lengths,
+            self._decode_committed,
+            rows_table,
+            batch_size=bs,
+            draft_tokens=width,
+            granularity=self._checkpoint_granularity,
+            pages_out=pages.unsqueeze(0),
+            out_row=0,
+            steps_out=steps,
         )
-        pages = gather_verified_state_blocks(rows_table, slots)
         src_rows, dst_rows = rows[0, :row_count], rows[1, :row_count]
         state_verify_commit_rows(
-            accepted_lengths,
+            steps,
             pages,
             src_rows,
             dst_rows,
             verify_width=width,
             num_layers=num_layers,
+            group_indices=None,
         )
         tables = self._ple_verify_tables
         if tables["context_row_bytes"]:

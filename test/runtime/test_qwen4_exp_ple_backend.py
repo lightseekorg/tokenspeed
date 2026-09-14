@@ -128,12 +128,12 @@ def _verify(backend):
     backend.refresh_decode_metadata(
         4,
         2,
-        torch.arange(4),
-        torch.tensor([6, 7, 1, 1], dtype=torch.int32),
+        torch.arange(4, device=backend.device),
+        torch.tensor([6, 7, 1, 1], dtype=torch.int32, device=backend.device),
         forward_mode=ForwardMode.DECODE,
         block_tables={
             QWEN4_EXP_PLE_CACHE_GROUP: torch.tensor(
-                [[1, 2, 3], [4, 5, 6]], dtype=torch.int32
+                [[1, 2, 3], [4, 5, 6]], dtype=torch.int32, device=backend.device
             )
         },
     )
@@ -164,9 +164,18 @@ def test_ple_capture_and_verify_use_own_stable_metadata(backend, monkeypatch):
         lambda *a, **k: rows_calls.append((a, k)),
     )
     monkeypatch.setattr(ple_module, "copy_state_rows", lambda *a, **k: None)
-    backend.commit_verified_state(torch.tensor([2, 3], dtype=torch.int32))
-    backend.commit_verified_state(torch.tensor([2, 3], dtype=torch.int32))
+    accepted = torch.tensor([0, 9], dtype=torch.int32)
+    backend.commit_verified_state(accepted)
+    backend.commit_verified_state(accepted)
     assert len(rows_calls) == 1
+    steps, pages, _, _ = rows_calls[0][0]
+    assert steps.tolist() == [1, 3]
+    assert pages.tolist() == [1, 5]
+    assert rows_calls[0][1] == {
+        "verify_width": 3,
+        "num_layers": 2,
+        "group_indices": None,
+    }
     assert backend._verify_commit_ctx is None
 
 
@@ -312,34 +321,112 @@ def test_draft_view_cannot_claim_target_ple_fields():
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="PLE batched copy requires CUDA"
 )
-def test_ple_commit_copies_only_accepted_checkpoints():
+@pytest.mark.parametrize("accepted_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize(
+    "seq_lens, accepted_lengths, block_rows, copies",
+    [
+        ([6, 7], [2, 3], [[1, 2, 3], [4, 5, 6]], [(2, 2), (5, 7)]),
+        ([6, 7], [0, 9], [[1, 2, 3], [4, 5, 6]], [(1, 1), (5, 7)]),
+        ([3, 30], [-3, 9], [[1, 2, 3], [4, 5, 6]], [(1, 1), (6, 7)]),
+        ([6, 7], [0, 9], [[-1, 2, 3], [4, 0, 6]], []),
+    ],
+    ids=["checkpoint-crossing", "acceptance-clamp", "slot-clamp", "invalid-pages"],
+)
+def test_ple_commit_copies_only_accepted_checkpoints(
+    accepted_dtype, seq_lens, accepted_lengths, block_rows, copies
+):
     backend = _make_backend(3, False, "cuda")
     other_view = backend.cache_pool.arena.field(qwen4_exp_ple_conv_field(4))
     other_view.fill_(-77)
     for index, (field_id, scratch) in enumerate(backend._ple_verify_scratch.items()):
-        values = torch.arange(scratch.numel(), device="cuda").reshape(scratch.shape)
-        scratch.copy_(values + 100 * index)
+        scratch.copy_(
+            torch.arange(scratch.numel(), device="cuda").reshape(scratch.shape)
+            + 100 * index
+        )
         backend.cache_pool.arena.field(field_id).fill_(-77)
     backend.refresh_decode_metadata(
         4,
         2,
         torch.arange(4, device="cuda"),
-        torch.tensor([6, 7, 1, 1], dtype=torch.int32, device="cuda"),
+        torch.tensor([*seq_lens, 1, 1], dtype=torch.int32, device="cuda"),
         forward_mode=ForwardMode.DECODE,
         block_tables={
             QWEN4_EXP_PLE_CACHE_GROUP: torch.tensor(
-                [[1, 2, 3], [4, 5, 6]], dtype=torch.int32, device="cuda"
+                block_rows, dtype=torch.int32, device="cuda"
             )
         },
     )
     backend.commit_verified_state(
-        torch.tensor([2, 3], dtype=torch.int32, device="cuda")
+        torch.tensor(accepted_lengths, dtype=accepted_dtype, device="cuda")
     )
     for field_id, scratch in backend._ple_verify_scratch.items():
         field = backend.cache_pool.arena.field(field_id)
-        assert torch.equal(field[2], scratch[2])
-        assert torch.equal(field[5], scratch[7])
-        untouched = [row for row in range(field.shape[0]) if row not in (2, 5)]
-        assert torch.all(field[untouched] == -77)
+        expected = torch.full_like(field, -77)
+        for dst, src in copies:
+            expected[dst] = scratch[src]
+        torch.testing.assert_close(field, expected, rtol=0, atol=0)
     assert torch.all(other_view == -77)
+    assert backend._verify_commit_ctx is None
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="PLE batched copy requires CUDA"
+)
+def test_ple_commit_uses_fused_kernels_and_replays_live_inputs():
+    backend = _make_backend(3, False, "cuda")
+    for index, scratch in enumerate(backend._ple_verify_scratch.values()):
+        scratch.copy_(
+            torch.arange(scratch.numel(), device="cuda").reshape(scratch.shape)
+            + 100 * index
+        )
+    _verify(backend)
+    context = backend._verify_commit_ctx
+    block_rows, _, _ = context
+    accepted = torch.tensor([0, 9], dtype=torch.int32, device="cuda")
+    # Compile before profiling or capture, as a warmed serving loop does.
+    backend.commit_verified_state(accepted)
+    backend._verify_commit_ctx = context
+    backend._ple_commit_rows.fill_(-99)
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ) as profile:
+        backend.commit_verified_state(accepted)
+        torch.cuda.synchronize()
+    gpu_kernels = [
+        event.name
+        for event in profile.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    assert len(gpu_kernels) == 4
+    for kernel, count in (
+        ("_commit_state_pages_kernel", 1),
+        ("_state_verify_commit_rows_kernel", 1),
+        ("_copy_state_rows_kernel", 2),
+    ):
+        assert sum(kernel in name for name in gpu_kernels) == count
+    assert torch.all(backend._ple_commit_rows[:, 4:] == -99)
+
+    backend._verify_commit_ctx = context
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        backend.commit_verified_state(accepted)
+    for lengths, pages, sources in (
+        ([2, 1], [2, 5], [2, 5]),
+        ([3, 2], [7, 8], [3, 6]),
+    ):
+        accepted.copy_(torch.tensor(lengths, dtype=torch.int32, device="cuda"))
+        block_rows[:, 1].copy_(torch.tensor(pages, dtype=torch.int32, device="cuda"))
+        for field_id in backend._ple_verify_scratch:
+            backend.cache_pool.arena.field(field_id).fill_(-77)
+        graph.replay()
+        for field_id, scratch in backend._ple_verify_scratch.items():
+            field = backend.cache_pool.arena.field(field_id)
+            expected = torch.full_like(field, -77)
+            for dst, src in zip(pages, sources, strict=True):
+                expected[dst] = scratch[src]
+            torch.testing.assert_close(field, expected, rtol=0, atol=0)
+        assert torch.all(backend._ple_commit_rows[:, 4:] == -99)
     assert backend._verify_commit_ctx is None
