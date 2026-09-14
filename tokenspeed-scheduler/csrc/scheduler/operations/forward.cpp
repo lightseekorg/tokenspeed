@@ -494,12 +494,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
 
     cache_progress.materialized_state_boundary_tokens =
         after_tokens / coordinator_.PrefixGranularity() * coordinator_.PrefixGranularity();
-    return fsm::SchedulePrefillEvent{
-        prefill_tokens,
-        decode_reserve,
-        std::move(cache_progress),
-        config_.role == Role::kP,
-    };
+    request->CacheProgressRef() = std::move(cache_progress);
+    return fsm::SchedulePrefillEvent{prefill_tokens, decode_reserve, config_.role == Role::kP};
 }
 
 std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan& plan, AdmissionFeedback& feedback,
@@ -539,7 +535,8 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
         }
     }
 
-    return fsm::ScheduleDecodeEvent{config_.decode_input_tokens, std::move(cache_progress)};
+    request->CacheProgressRef() = std::move(cache_progress);
+    return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
 }
 
 PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,

@@ -64,27 +64,18 @@ struct RemotePrefilling : public Prefilling {
 // "schedulable" with no exceptions, and inheritance would make the answer
 // depend on how the caller dispatches (holds_alternative vs derived_from vs
 // an overload set).
-struct PrefillAwaitingResult : public ForwardState {
-    PrefillAwaitingResult(TokenContainer* token_container, std::int32_t prefix_granularity,
-                          std::unique_ptr<ReqPoolIndex> req_pool_index, TokenContainer::Window window,
-                          std::int32_t reserve_num_tokens_in_next_schedule_event, std::vector<BlockTable> block_tables,
-                          CacheProgress cache_progress)
-        : ForwardState(token_container, prefix_granularity, std::move(req_pool_index), std::move(block_tables),
-                       std::move(cache_progress)),
+struct PrefillAwaitingResult {
+    PrefillAwaitingResult(ForwardResources resources, TokenContainer::Window window,
+                          std::int32_t reserve_num_tokens_in_next_schedule_event)
+        : resources{std::move(resources)},
           window{window},
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event} {}
 
+    PrefillInfo CurrentPrefillInfo() const { return MakePrefillInfo(resources, window); }
     std::int32_t ReserveNumTokensInNextScheduleEvent() const { return reserve_num_tokens_in_next_schedule_event_; }
-    PrefillInfo CurrentPrefillInfo() const {
-        return PrefillInfo{
-            .input_ids = token_container_->TokenSlice(window),
-            .shifted_input_ids = ComputeShiftedInputIds(token_container_, window),
-            .already_scheduled_len = window.begin,
-            .extend_len = window.size,
-        };
-    }
-    void ExtendResultTokens(const std::vector<std::int32_t>& result_tokens) { token_container_->Extend(result_tokens); }
+    void ExtendResultTokens(const std::vector<std::int32_t>& result_tokens) { resources.ExtendTokens(result_tokens); }
 
+    ForwardResources resources;
     TokenContainer::Window window{};
 
 private:
