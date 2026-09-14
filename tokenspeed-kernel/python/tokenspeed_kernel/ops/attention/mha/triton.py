@@ -20,6 +20,7 @@
 
 
 import torch
+from tokenspeed_kernel.ops.attention.mha._triton.context import *  # noqa: F403
 from tokenspeed_kernel.ops.attention.mha._triton.decode import (
     _triton_mha_decode_with_kvcache_impl,
 )
@@ -27,15 +28,14 @@ from tokenspeed_kernel.ops.attention.mha._triton.prefill import (
     _triton_mha_extend_with_kvcache_impl,
     _triton_mha_prefill_impl,
 )
-from tokenspeed_kernel.ops.attention.mha._triton.context import *  # noqa: F403
 from tokenspeed_kernel.ops.attention.mha._triton.qkv_rotary import *  # noqa: F403
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
-
 _PORTABLE_CAPABILITY = CapabilityRequirement(vendors=frozenset({"nvidia", "amd"}))
 _PORTABLE_DTYPES = {torch.float16, torch.bfloat16}
+
 
 @register_kernel(
     "attention",

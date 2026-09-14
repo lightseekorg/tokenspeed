@@ -32,10 +32,10 @@ from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
-
 _FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz})
 _PORTABLE_DTYPES = frozenset({torch.float16, torch.bfloat16}) | _FP8_DTYPES
 _PORTABLE_CAPABILITY = CapabilityRequirement(vendors=frozenset({"nvidia", "amd"}))
+
 
 @register_kernel(
     "attention",
