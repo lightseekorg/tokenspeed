@@ -185,6 +185,7 @@ def test_marlin_mxfp4_ep_masks_nonlocal_experts() -> None:
 
     torch.testing.assert_close(acc, expected.float(), atol=5e-2, rtol=5e-2)
 
+
 def test_marlin_mxfp4_silu_without_situ_beta() -> None:
     """Non-SiTU models leave ``activation_situ_beta`` as None on the weight
     module (the expert layer's default); the apply must not ``float()`` it.

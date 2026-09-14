@@ -14,7 +14,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import torch
-
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.msa._triton.indexer import (
     SPARSE_BLOCK_SIZE,

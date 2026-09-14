@@ -1036,13 +1036,19 @@ def test_msa_sparse_kernels_skip_padded_selected_blocks(phase: str) -> None:
     if phase == "prefill":
         # Request 0: one token over its poisoned block. Request 1: the real one.
         positions = [0] + list(range(prefill_len))
-        cu_seqlens = torch.tensor([0, 1, 1 + prefill_len], dtype=torch.int32, device="cuda")
+        cu_seqlens = torch.tensor(
+            [0, 1, 1 + prefill_len], dtype=torch.int32, device="cuda"
+        )
         seq_lens = torch.tensor([1, prefill_len], dtype=torch.int32, device="cuda")
     else:
         positions = [0, prefill_len - 1]
         seq_lens = torch.tensor([1, prefill_len], dtype=torch.int32, device="cuda")
-    query = torch.randn(len(positions), 16, _HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    selected = torch.full((len(positions), 1, _TOPK), -1, dtype=torch.int32, device="cuda")
+    query = torch.randn(
+        len(positions), 16, _HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    )
+    selected = torch.full(
+        (len(positions), 1, _TOPK), -1, dtype=torch.int32, device="cuda"
+    )
     for row, position in enumerate(positions):
         selected[row, 0, 0] = position // _BLOCK_SIZE  # own block only
     if phase == "prefill":
