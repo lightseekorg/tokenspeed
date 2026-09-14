@@ -219,6 +219,7 @@ if (
         ),
         traits={
             "head_dim": frozenset({512}),
+            "num_heads": frozenset({64, 128}),
             "cache_layout": frozenset({"fp8_swa_page_planar"}),
             "topk_layout": frozenset({"global_slots"}),
             "support_sink": frozenset({True}),
@@ -315,6 +316,7 @@ if (
         ),
         traits={
             "head_dim": frozenset({512}),
+            "num_heads": frozenset({64, 128}),
             "cache_layout": frozenset({"dense_workspace"}),
             "support_sink": frozenset({True}),
             "metadata_dtypes": frozenset({torch.int32}),

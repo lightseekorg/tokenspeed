@@ -410,6 +410,13 @@ def _is_hopper_plus_with_flashmla(platform: PlatformInfo) -> bool:
     )
 
 
+def _is_hopper_plus_with_flashmla_prefill(platform: PlatformInfo) -> bool:
+    return (
+        _is_hopper_plus(platform)
+        and _attention_cuda_dsv4.flash_mla_sparse_fwd is not error_fn
+    )
+
+
 def _is_nvidia(platform: PlatformInfo) -> bool:
     return platform.is_nvidia
 
@@ -1394,12 +1401,12 @@ def _attention_dsa_decode() -> object:
     )
 
 
-def _attention_dsv4_selected(width: int = 640) -> object:
-    q = torch.empty((1, 16, 512), dtype=torch.bfloat16)
+def _attention_dsv4_selected(width: int, heads: int) -> object:
+    q = torch.empty((1, heads, 512), dtype=torch.bfloat16)
     kv = torch.empty((width, 512), dtype=torch.bfloat16)
     indices = torch.arange(width, dtype=torch.int32).unsqueeze(0)
     lens = torch.tensor([width], dtype=torch.int32)
-    attn_sink = torch.empty((16,), dtype=torch.float32)
+    attn_sink = torch.empty((heads,), dtype=torch.float32)
     return _attention_dsv4_pkg.dsv4_prefill(
         q,
         kv,
@@ -1411,23 +1418,11 @@ def _attention_dsv4_selected(width: int = 640) -> object:
 
 
 def _attention_dsv4_selected_short() -> object:
-    return _attention_dsv4_selected(128)
+    return _attention_dsv4_selected(128, 16)
 
 
 def _attention_dsv4_selected_h64() -> object:
-    q = torch.empty((1, 64, 512), dtype=torch.bfloat16)
-    kv = torch.empty((640, 512), dtype=torch.bfloat16)
-    indices = torch.arange(640, dtype=torch.int32).unsqueeze(0)
-    lens = torch.tensor([640], dtype=torch.int32)
-    attn_sink = torch.empty((64,), dtype=torch.float32)
-    return _attention_dsv4_pkg.dsv4_prefill(
-        q,
-        kv,
-        indices,
-        lens,
-        attn_sink,
-        512**-0.5,
-    )
+    return _attention_dsv4_selected(640, 64)
 
 
 def _attention_dsv4_selected_i64() -> object:
@@ -1443,12 +1438,12 @@ def _attention_dsv4_selected_i64() -> object:
     )
 
 
-def _attention_dsv4_paged_selected(with_extra: bool = True) -> object:
-    q = torch.empty((2, 16, 512), dtype=torch.bfloat16)
+def _attention_dsv4_paged_selected(with_extra: bool, heads: int) -> object:
+    q = torch.empty((2, heads, 512), dtype=torch.bfloat16)
     swa_cache = torch.empty((2, 64 * 584), dtype=torch.uint8)
     swa_slots = torch.empty((2, 256), dtype=torch.int32)
     swa_lens = torch.empty((2,), dtype=torch.int32)
-    attn_sink = torch.empty((16,), dtype=torch.float32)
+    attn_sink = torch.empty((heads,), dtype=torch.float32)
     kwargs = {}
     if with_extra:
         kwargs = {
@@ -1470,7 +1465,7 @@ def _attention_dsv4_paged_selected(with_extra: bool = True) -> object:
 
 
 def _attention_dsv4_paged_selected_swa_only() -> object:
-    return _attention_dsv4_paged_selected(with_extra=False)
+    return _attention_dsv4_paged_selected(with_extra=False, heads=16)
 
 
 def _attention_dsv4_paged_selected_pro_tp8() -> object:
@@ -3791,15 +3786,40 @@ _CASES = [
         _attention_dsv4_decode_topk_mxfp4,
         id_suffix="mxfp4",
     ),
-    _case(
-        _is_hopper_plus_with_flashmla,
-        "hopper-plus",
-        "attention",
-        "dsv4_decode",
-        "flashmla_dsv4_decode",
-        _attention_dsv4_paged_selected,
-        id_suffix="extra-segment",
-    ),
+    *[
+        _case(
+            _is_hopper_plus_with_flashmla_prefill,
+            "hopper-plus",
+            "attention",
+            "dsv4_prefill",
+            f"{solution}_dsv4_prefill",
+            partial(_attention_dsv4_selected, width=640, heads=heads),
+            id_suffix=f"heads{heads}",
+        )
+        for heads, solution in (
+            (16, "triton"),
+            (32, "triton"),
+            (64, "flashmla"),
+            (128, "flashmla"),
+        )
+    ],
+    *[
+        _case(
+            _is_hopper_plus_with_flashmla,
+            "hopper-plus",
+            "attention",
+            "dsv4_decode",
+            f"{solution}_dsv4_decode",
+            partial(_attention_dsv4_paged_selected, with_extra=True, heads=heads),
+            id_suffix=f"extra-segment-heads{heads}",
+        )
+        for heads, solution in (
+            (16, "triton"),
+            (32, "triton"),
+            (64, "flashmla"),
+            (128, "flashmla"),
+        )
+    ],
     _case(
         _is_hopper,
         "hopper",
@@ -3928,7 +3948,7 @@ _CASES = [
         "attention",
         "dsv4_decode",
         "triton_dsv4_decode",
-        _attention_dsv4_paged_selected,
+        partial(_attention_dsv4_paged_selected, with_extra=True, heads=16),
         id_suffix="extra-segment",
     ),
     _case(
@@ -3946,7 +3966,7 @@ _CASES = [
         "attention",
         "dsv4_prefill",
         "gluon_dsv4_prefill_gfx950",
-        _attention_dsv4_selected,
+        partial(_attention_dsv4_selected, width=640, heads=16),
         id_suffix="width640",
     ),
     _case(
