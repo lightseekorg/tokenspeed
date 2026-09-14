@@ -824,7 +824,16 @@ def _index_gather_heads(q, weights, process_group):
 
 
 def _index_finish_parts(scores, ids, k, output, lengths):
-    values, positions = scores.topk(k, dim=1, sorted=False)
+    bits = scores.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    ordered = bits ^ torch.where(
+        bits & 0x80000000 != 0,
+        0xFFFFFFFF,
+        0x80000000,
+    )
+    packed = ((ordered - 0x80000000) << 32) | (0xFFFFFFFF - ids)
+    packed.masked_fill_(scores == -torch.inf, torch.iinfo(torch.int64).min)
+    positions = packed.topk(k, dim=1, sorted=False).indices
+    values = scores.gather(1, positions)
     _finish_topk(values, ids.gather(1, positions), output, lengths)
 
 
