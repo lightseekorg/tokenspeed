@@ -851,13 +851,9 @@ class IrisAllReduce(object):
             if self._producer_direct_scratch_numel
             else None
         )
-        output_max_numel = max(
-            producer_direct_max_numel,
-            staged_max_numel if self._staged_two_stage_supported else 0,
-        )
         self._reduced_output_buf = (
-            torch.empty(output_max_numel, dtype=dtype, device=self.device)
-            if output_max_numel
+            torch.empty(producer_direct_max_numel, dtype=dtype, device=self.device)
+            if producer_direct_max_numel
             else None
         )
         self._ready_flags = (
@@ -1098,8 +1094,7 @@ class IrisAllReduce(object):
         )
         num_tiles = triton.cdiv(partition_words, block_words)
         num_programs = min(num_tiles, kernel_config.max_programs)
-        assert self._reduced_output_buf is not None
-        output = self._reduced_output_buf[:numel]
+        output = tensor.view(-1)
         iris_reduce_symmetric_two_stage_gluon_kernel[(num_programs,)](
             staged,
             self._staged_two_stage_scratch_buf,
@@ -1117,10 +1112,12 @@ class IrisAllReduce(object):
             WORDS_PER_LANE=kernel_config.words_per_lane,
             ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[self.dtype],
             ELEMENTS_PER_WORD=self._elements_per_word,
+            OUTPUT_PACKED=(
+                output.data_ptr() % self._kernel_config.packed_word_bytes == 0
+            ),
             EXIT_BARRIER=True,
             num_warps=kernel_config.num_subgroups,
         )
-        tensor.view(-1).copy_(output)
         return tensor.clone() if safe else tensor
 
     def all_reduce_symmetric(
@@ -1180,6 +1177,7 @@ class IrisAllReduce(object):
                 WORDS_PER_LANE=two_stage_config.words_per_lane,
                 ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[self.dtype],
                 ELEMENTS_PER_WORD=self._elements_per_word,
+                OUTPUT_PACKED=True,
                 EXIT_BARRIER=False,
                 num_warps=two_stage_config.num_subgroups,
             )
@@ -1678,6 +1676,7 @@ def iris_reduce_symmetric_two_stage_gluon_kernel(
     WORDS_PER_LANE: gl.constexpr,
     ELEMENT_DTYPE: gl.constexpr,
     ELEMENTS_PER_WORD: gl.constexpr,
+    OUTPUT_PACKED: gl.constexpr,
     EXIT_BARRIER: gl.constexpr,
 ):
     """Reduce-scatter producer outputs, then all-gather the rank partitions."""
@@ -1831,11 +1830,40 @@ def iris_reduce_symmetric_two_stage_gluon_kernel(
         output_offset = gl.expand_dims(peer_ids * PARTITION_WORDS, 1) + gl.expand_dims(
             partition_offset, 0
         )
-        gl.store(
-            tl.cast(output_ptr, gl.pointer_type(gl.uint64)) + output_offset,
-            values,
-            mask=gl.expand_dims(mask, 0),
-        )
+        output_mask = gl.expand_dims(mask, 0)
+        if OUTPUT_PACKED:
+            gl.store(
+                tl.cast(output_ptr, gl.pointer_type(gl.uint64)) + output_offset,
+                values,
+                mask=output_mask,
+            )
+        else:
+            value_0, value_1, value_2, value_3 = _unpack_word(
+                values, ELEMENT_DTYPE, ELEMENTS_PER_WORD
+            )
+            element_offset = output_offset * ELEMENTS_PER_WORD
+            output_dtype: gl.constexpr = output_ptr.type.element_ty
+            gl.store(
+                output_ptr + element_offset,
+                value_0.to(output_dtype),
+                mask=output_mask,
+            )
+            gl.store(
+                output_ptr + element_offset + 1,
+                value_1.to(output_dtype),
+                mask=output_mask,
+            )
+            if ELEMENTS_PER_WORD == 4:
+                gl.store(
+                    output_ptr + element_offset + 2,
+                    value_2.to(output_dtype),
+                    mask=output_mask,
+                )
+                gl.store(
+                    output_ptr + element_offset + 3,
+                    value_3.to(output_dtype),
+                    mask=output_mask,
+                )
         tile_id += NUM_PROGRAMS
 
     if EXIT_BARRIER:

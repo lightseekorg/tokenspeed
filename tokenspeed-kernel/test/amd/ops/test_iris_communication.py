@@ -544,11 +544,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             assert state._staged_two_stage_input_buf is None
             assert state._staged_two_stage_scratch_buf is None
             assert state._staged_two_stage_ready_flags is None
-        output_max_numel = max(
-            producer_direct_max_numel,
-            staged_max_numel if state._staged_two_stage_supported else 0,
-        )
-        assert state._reduced_output_buf.numel() == output_max_numel
+        assert state._reduced_output_buf.numel() == producer_direct_max_numel
         if attnres_max_numel:
             assert state._attnres_input_buf.shape == (
                 2,
@@ -560,6 +556,13 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             )
         for shape in _ar_shape_cases():
             _check_all_reduce(state, rank, world_size, shape, device)
+        if state._staged_two_stage_supported:
+            _check_all_reduce_unaligned_output(
+                state,
+                rank,
+                world_size,
+                device,
+            )
         if world_size == 4:
             for shape in _ar_graph_shape_cases():
                 _check_all_reduce_graph_replay(
@@ -660,6 +663,56 @@ def _check_all_reduce(state, rank: int, world_size: int, shape, device) -> None:
         result.shape == expected.shape
     ), f"shape mismatch: {result.shape} vs {expected.shape}"
     torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+
+def _check_all_reduce_unaligned_output(
+    state,
+    rank: int,
+    world_size: int,
+    device,
+) -> None:
+    from tokenspeed_kernel.ops.communication.iris import (
+        IRIS_ALL_REDUCE_KERNEL_CONFIG,
+        _select_staged_all_reduce_path,
+        iris_all_reduce,
+    )
+
+    numel = 16 * 64
+    tuning, use_two_stage = _select_staged_all_reduce_path(
+        numel=numel,
+        world_size=world_size,
+        dtype=torch.bfloat16,
+        two_stage_supported=True,
+    )
+    assert tuning is None and use_two_stage
+
+    if rank % 2:
+        storage = torch.empty(numel + 1, dtype=torch.bfloat16, device=device)
+        storage[0] = -1
+        local = storage[1:]
+        assert local.data_ptr() % IRIS_ALL_REDUCE_KERNEL_CONFIG.packed_word_bytes != 0
+    else:
+        storage = torch.empty(numel, dtype=torch.bfloat16, device=device)
+        local = storage
+        assert local.data_ptr() % IRIS_ALL_REDUCE_KERNEL_CONFIG.packed_word_bytes == 0
+    local.fill_(rank + 1)
+
+    result = iris_all_reduce(state, local)
+
+    expected_value = world_size * (world_size + 1) // 2
+    torch.testing.assert_close(
+        result,
+        torch.full_like(result, expected_value),
+        atol=0,
+        rtol=0,
+    )
+    if rank % 2:
+        torch.testing.assert_close(
+            storage[0],
+            torch.tensor(-1, dtype=torch.bfloat16, device=device),
+            atol=0,
+            rtol=0,
+        )
 
 
 def _check_all_reduce_graph_replay(
