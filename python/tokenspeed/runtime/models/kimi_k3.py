@@ -2393,6 +2393,29 @@ class KimiLinearDecoderLayer(nn.Module):
         if hidden_states.shape[0] == 1:
             return False
 
+        num_tokens = hidden_states.shape[0]
+        if (
+            not self.is_block_write_layer
+            and hidden_states.is_cuda
+            and self.prev_valid_blocks > 0
+            and self._mlp_wp is not None
+            and 0 < num_tokens <= ATTNRES_FAST_PATH_MAX_TOKENS
+        ):
+            combine = (
+                _sliced_scratch(hidden_states, self._mlp_slot, num_tokens),
+                self.mlp_res_proj.weight.reshape(-1),
+                self.mlp_res_norm.weight,
+                self.post_attention_layernorm.weight,
+                self.mlp_res_norm.variance_epsilon,
+            )
+            if self.k3_comm.fused_attnres_reduce_available(
+                hidden_states,
+                hidden_states,
+                combine,
+                self._mlp_wp,
+            ):
+                return False
+
         block_write_idx = self.block_write_idx if self.is_block_write_layer else -1
         pre_attn = attn_res_fwd_available(
             hidden_states,
@@ -2591,11 +2614,11 @@ class KimiLinearDecoderLayer(nn.Module):
                     and num_tokens
                     <= global_server_args_dict["comm_fusion_max_num_tokens"]
                 )
-                or (
-                    # The gfx950 fused reducer consumes the AttnRes scratch
-                    # through M=16, so its producer stream must join first.
-                    current_platform().is_cdna4
-                    and num_tokens <= ATTNRES_STREAM_FORK_THRESHOLD
+                or self.k3_comm.fused_attnres_reduce_available(
+                    h,
+                    prefix_sum,
+                    ar_combine,
+                    self._mlp_wp,
                 )
             )
         )

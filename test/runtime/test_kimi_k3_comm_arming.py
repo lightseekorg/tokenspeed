@@ -99,8 +99,8 @@ def test_iris_preparation_uses_full_window_for_equal_tp8_groups(monkeypatch):
         group,
         staged_max_numel=8192 * 7168,
         producer_direct_max_numel=8192 * (7168 + 3584),
-        attnres_max_numel=16 * 7168,
-        attnres_max_rows=16,
+        attnres_max_numel=32 * 7168,
+        attnres_max_rows=32,
         dtype=torch.bfloat16,
         backend=None,
     )
