@@ -4648,6 +4648,14 @@ _CASES = [
         "gluon_argmax_gfx950",
         _sampling_argmax,
     ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "sampling",
+        "argmax",
+        "gluon_argmax_gfx1250",
+        _sampling_argmax,
+    ),
     # MoE API x architecture golden cases.
     *[
         _case(

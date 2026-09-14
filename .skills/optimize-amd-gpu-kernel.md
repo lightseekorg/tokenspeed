@@ -11,8 +11,8 @@ description: Optimizing kernel performance on AMD Instinct MI GPUs.
   kernel count, tune tiling and configurations, etc.
 * Profile first, focus on the top bottleneck, change one thing, and rerun the
   same benchmark/profiling method.
-* Use Gluon for explicit low-level control: buffer load/store, async copy to
-  LDS, shared layouts, MFMA layout, wave count, and LLVM attributes.
+* Use Gluon for explicit low-level control: TDM (for gfx1250), buffer load/store,
+  async copy to LDS, shared layouts, MFMA layout, wave count, and LLVM attributes.
 * Pay attention to both `ttg` level and `llvm` level opportunities and balances.
 * Tune configuration parameters, but do not overfit with many one-off switch
   cases.
@@ -35,6 +35,7 @@ Applicable to various problems:
 * Ensure proper software pipelining to break dependencies in the same loop
   iteration.
 * Prefer coalesced and vectorized async global memory load/store.
+* Prefer to use TDM async load/store/gather/scatter on gfx1250 for bulk tensor.
 * If indexing range allows, prefer buffer load/store intrinsics in Gluon to
   avoid out-of-bound branches and overheads.
 * Avoid shared memory bank conflict if possible. Use padding instead of
@@ -60,13 +61,14 @@ inspiration.
 
 * If high VGPR pressure, consider slice along M/N in the hot loop and interleave
   to retire certain slices of loaded values earlier.
+* If long LDS load wait, consider prefetch LDS load in previous loop iteration.
 
 ### Memory bound problems
 
 The key is to saturate GPU memory bandwidth with enough inflight memory
 instructions, and avoid exposed compute instruction cycles.
 
-* Prefetch using async load with higher number of shared memory buffers.
+* Prefetch using TDM / async load with higher number of shared memory buffers.
 * Use double or triple buffering only when it hides real latency. Extra buffers
   increase LDS/register pressure and may reduce occupancy or compiler quality.
 * Use cache modifiers like `".cg"`, `".wt"`, etc. to control whether to cache at
