@@ -740,7 +740,7 @@ def _index_scan_kernel(
         page = tl.load(Table + query * TS0 + (logical // 64) * TS1, valid, other=-1).to(
             tl.int64
         )
-        valid = valid & (page > 0) & (page < PAGES)
+        valid = valid & (page >= 0) & (page < PAGES)
         base = Cache + page * CP
         data_byte = (logical[None, :] % 64) * 64 + d[:, None] // 2
         byte = tl.load(
@@ -1558,7 +1558,7 @@ def _clean_logits(
         page = tl.load(
             T + row * T0 + (column // P) * T1, valid & (column // P < TC), other=0
         ).to(tl.int64)
-        valid &= (page > 0) & (page < NP) & (column // P < TC)
+        valid &= (page >= 0) & (page < NP) & (column // P < TC)
     value = tl.load(X + row * X0 + column, valid, other=-float("inf"))
     tl.store(O + row * CAP + column, value, column < CAP)
 

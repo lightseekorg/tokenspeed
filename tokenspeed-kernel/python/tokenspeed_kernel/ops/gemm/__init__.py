@@ -71,7 +71,11 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import SelectedKernel, select_kernel
+from tokenspeed_kernel.selection import (
+    NoKernelFoundError,
+    SelectedKernel,
+    select_kernel,
+)
 from tokenspeed_kernel.signature import (
     ScaleFormat,
     dense_tensor_format,
@@ -819,15 +823,25 @@ def dsv4_linear_fp32(
         hidden_states=dense_tensor_format(hidden_states.dtype),
         weight=dense_tensor_format(weight.dtype),
     )
-    kernel = select_kernel(
-        "gemm",
-        "dsv4_linear_fp32",
-        signature,
-        traits=traits,
-        override=override,
-        solution=solution,
-    )
     k = int(weight.shape[1])
+    try:
+        kernel = select_kernel(
+            "gemm",
+            "dsv4_linear_fp32",
+            signature,
+            traits=traits,
+            override=override,
+            solution=solution,
+        )
+    except NoKernelFoundError:
+        if override is not None or solution is not None:
+            raise
+        flat = hidden_states.reshape(-1, k)
+        if flat.is_cuda and flat.dtype == weight.dtype:
+            output = torch.mm(flat, weight.t(), out_dtype=torch.float32)
+        else:
+            output = torch.mm(flat.float(), weight.float().t())
+        return output.reshape(*hidden_states.shape[:-1], weight.shape[0])
     shape_params = {
         "M": int(prod(hidden_states.shape[:-1])),
         "N": int(weight.shape[0]),

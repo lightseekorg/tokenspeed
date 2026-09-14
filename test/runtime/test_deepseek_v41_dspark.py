@@ -281,6 +281,7 @@ def test_window_attention_matches_dense_reference():
 def test_draft_forward_graph_and_context_seeding(monkeypatch):
     config = _draft_config()
     config.hidden_size = 256
+    config.moe_intermediate_size = 256
     config.head_dim = 512
     config.qk_rope_head_dim = 64
     config.q_lora_rank = 128

@@ -35,6 +35,7 @@ from types import SimpleNamespace
 
 import torch
 from torch import nn
+from tokenspeed_kernel.ops.attention.dsv41 import rope_inplace
 
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
@@ -95,11 +96,14 @@ class _WindowAttention:
         attn_sink,
         softmax_scale,
         index_process_group,
+        swa_rope_cache,
     ):
         if index_q is not None or index_weights is not None:
             raise ValueError("DSpark window attention has no indexer")
         batch, block = self.slots.numel(), self.block_size
         history = self.windows.index_select(0, self.slots)
+        if swa_rope_cache is not None:
+            swa = rope_inplace(swa.clone(), positions, swa_rope_cache, None)
         kv = torch.cat((history, _quantized_kv(swa).reshape(batch, block, -1)), dim=1)
         queries = q.reshape(batch, block, q.shape[-2], q.shape[-1])
         # ponytail: the draft attends only 128+5 rows; fuse after parity is pinned.
@@ -221,7 +225,8 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         return _norm(projected, self.main_norm)
 
     def _main_kv(self, attention, main_x, positions):
-        kv, _ = attention.wkv(main_x, block_scale=None, output_dtype=None)
+        qkv, _ = attention.wq_a_wkv(main_x, block_scale=None, output_dtype=None)
+        _, kv = qkv.split((attention.q_norm.weight.numel(), attention.head_dim), dim=-1)
         return _quantized_kv(
             attention.rotary_emb(_norm(kv, attention.kv_norm), positions, False)
         )

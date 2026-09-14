@@ -344,7 +344,7 @@ def test_config_selects_flash_recipe_and_checks_geometry(runtime_config, overlap
         8,
     )
     profile = _resolve_attn_side(model, requested_backend=args.attention_backend)
-    family = _resolve_cache_family(profile, model, attn)
+    family = _resolve_cache_family(profile, attn)
     assert family == "deepseek_v41"
     assert _RECIPES[family] is DeepseekV41Recipe
     recipe = _RECIPES[family](
@@ -396,7 +396,7 @@ def test_real_server_args_prepare_cache_pool_and_backend(runtime_config, overlap
     attn = _create_attn_config(args, model, is_draft=False)
     profile = _resolve_attn_side(model, requested_backend=args.attention_backend)
     setup = prepare_cache_setup(
-        family=_resolve_cache_family(profile, model, attn),
+        family=_resolve_cache_family(profile, attn),
         server_args=args,
         model_config=model,
         attn_config=attn,

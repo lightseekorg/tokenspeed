@@ -892,6 +892,7 @@ def test_recipe_exact_geometry_capacity_and_dispatch():
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import _RECIPES
     from tokenspeed.runtime.layers.attention.registry import (
         _create_attn_backend,
+        _resolve_attn_side,
         _resolve_cache_family,
     )
 
@@ -901,7 +902,8 @@ def test_recipe_exact_geometry_capacity_and_dispatch():
         DeepseekV41AttentionBackend,
     )
     model = SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41_text"))
-    assert _resolve_cache_family(None, model, recipe.attn_config) == "deepseek_v41"
+    profile = _resolve_attn_side(model, requested_backend=None)
+    assert _resolve_cache_family(profile, recipe.attn_config) == "deepseek_v41"
 
 
 def test_owner_topology_and_reject_invalid_recipes():
