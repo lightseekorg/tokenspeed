@@ -80,8 +80,7 @@ bool CacheCoordinator::HasMambaStateGroup() const {
 
 bool CacheCoordinator::deviceCacheIsClearable() const {
     for (const CacheGroup& group : groups_) {
-        const PrefixCacheIndex& index = group.Index();
-        if (static_cast<std::int32_t>(index.EvictableLocations(pool_).size()) != index.NumEntries(pool_)) {
+        if (group.Index().NumPinnedEntries(pool_) != 0) {
             return false;
         }
     }
@@ -93,8 +92,7 @@ bool CacheCoordinator::hostCacheIsClearable() const {
         return true;
     }
     for (const CacheGroup& group : groups_) {
-        const PrefixCacheIndex& index = group.Index();
-        if (static_cast<std::int32_t>(index.EvictableLocations(*host_pool_).size()) != index.NumEntries(*host_pool_)) {
+        if (group.Index().NumPinnedEntries(*host_pool_) != 0) {
             return false;
         }
     }
