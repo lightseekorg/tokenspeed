@@ -76,9 +76,16 @@ def stubbed_wrapper(monkeypatch):
         seen["state"] = state
         return v.clone(), state.clone()
 
-    monkeypatch.setattr(cutedsl_op, "cutedsl_kda_check_config", fake_check_config)
-    monkeypatch.setattr(cutedsl_op, "cutedsl_kda_workspace_size", fake_workspace_size)
-    monkeypatch.setattr(cutedsl_op, "cutedsl_kda_forward", fake_forward)
+    monkeypatch.setattr(
+        cutedsl_op, "cutedsl_kda_check_config", fake_check_config, raising=False
+    )
+    monkeypatch.setattr(
+        cutedsl_op,
+        "cutedsl_kda_workspace_size",
+        fake_workspace_size,
+        raising=False,
+    )
+    monkeypatch.setattr(cutedsl_op, "cutedsl_kda_forward", fake_forward, raising=False)
     return seen
 
 
@@ -249,7 +256,7 @@ def test_hint_length_mismatch_raises(stubbed_wrapper):
 def test_cutedsl_original_adapter_split_matches_full_scan():
     import tokenspeed_kernel.ops.attention.kda as attn
 
-    if not cutedsl_op.is_cutedsl_kda_installed():
+    if not cutedsl_op.cutedsl_kda_supported():
         pytest.skip("CuteDSL KDA is not available on this GPU")
     generator = torch.Generator(device="cuda").manual_seed(123)
     tensors = [

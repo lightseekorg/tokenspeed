@@ -1062,9 +1062,9 @@ def test_prefill_state_inputs_zero_fresh_rows_without_reading_null_page() -> Non
 @pytest.mark.parametrize("prefix", [0, 1024])
 def test_kda_prefill_fused_staging_matches_pytorch(prefix, monkeypatch):
     """Native KDA outputs and persistent state match the old staging ops."""
-    from tokenspeed_kernel.ops.attention.kda.cute_dsl import is_cutedsl_kda_installed
+    from tokenspeed_kernel.ops.attention.kda.cute_dsl import cutedsl_kda_supported
 
-    if not is_cutedsl_kda_installed():
+    if not cutedsl_kda_supported():
         pytest.skip("requires the native CuteDSL KDA prefill package")
 
     contract = _stub_contract(prefix_granularity=1024, usable_pages=8)

@@ -585,10 +585,10 @@ def _resolve_kda_backend(kda_backend: str) -> str:
         # Named backend policies are NVIDIA-specific; let the registry decide.
         return "auto"
 
-    from tokenspeed_kernel.ops.attention.kda.cute_dsl import is_cutedsl_kda_installed
+    from tokenspeed_kernel.ops.attention.kda.cute_dsl import cutedsl_kda_supported
 
     if kda_backend == "auto":
-        if is_cutedsl_kda_installed():
+        if cutedsl_kda_supported():
             resolved = "cutedsl_kda"
         elif platform.is_hopper_plus:
             resolved = "flashkda"
@@ -596,11 +596,9 @@ def _resolve_kda_backend(kda_backend: str) -> str:
             resolved = "fla"
         logger.info("KDA prefill backend auto-resolved to %s", resolved)
         return resolved
-    if kda_backend == "cutedsl_kda" and not is_cutedsl_kda_installed():
+    if kda_backend == "cutedsl_kda" and not cutedsl_kda_supported():
         raise ValueError(
-            "--kda-backend cutedsl_kda requires the tokenspeed-cutedsl-kda package with a "
-            "build matching this device (sm_100a / sm_103a) and the public "
-            "nvidia-cutlass-dsl, apache-tvm-ffi, cuda-python wheels"
+            "--kda-backend cutedsl_kda requires an NVIDIA sm_100 or sm_103 device"
         )
     return kda_backend
 

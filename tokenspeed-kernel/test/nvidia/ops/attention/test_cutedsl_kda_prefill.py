@@ -33,7 +33,7 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.attention.kda.cute_dsl import (
     cutedsl_kda_chunk_prefill,
-    is_cutedsl_kda_installed,
+    cutedsl_kda_supported,
 )
 
 HEADS = 12
@@ -46,7 +46,7 @@ requires_cutedsl_kda = pytest.mark.skipif(
     not (
         torch.cuda.is_available()
         and find_spec("fla") is not None
-        and is_cutedsl_kda_installed()
+        and cutedsl_kda_supported()
     ),
     reason="requires CUDA, flash-linear-attention, and a tokenspeed-cutedsl-kda build",
 )
