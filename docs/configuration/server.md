@@ -146,7 +146,7 @@ different process groups.
 | `--draft-moe-backend` | MoE backend for the speculative decoding draft model. |
 | `--all2all-backend` | MoE all-to-all backend. |
 | `--deepep-mode` | DeepEP mode: `auto`, `normal`, or `low_latency`. |
-| `--sampling-backend` | Sampling backend: `greedy`, `flashinfer`, `flashinfer_full`, `triton`, or `triton_full`. |
+| `--sampling-backend` | Sampling backend: `greedy`, `flashinfer`, `flashinfer_full`, `triton`, `triton_full`, or `sonic` (requires the optional [sonic-sampler](https://github.com/tachyontrails/sonic-sampler) package; one fused Triton pipeline per step; `top_k=-1` is realized as bounded top-128 truncation; bf16 logits only; see the `--sampling-backend` help for its memory cost). |
 
 Set backend choices explicitly in production. `auto` is useful for bring-up, but
 explicit values make benchmark comparisons and regressions easier to reason
