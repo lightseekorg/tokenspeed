@@ -73,14 +73,6 @@ for _ in range(2):
         implementation = registry.get_impl(name)
         assert callable(implementation), name
         assert implementation.__module__ == family + "." + module
-
-adapter = importlib.import_module("tokenspeed_kernel.thirdparty.flash_mla")
-for name in (
-    "flash_mla_sparse_fwd", "flash_mla_with_kvcache", "get_mla_metadata",
-    "flash_mla_api", "is_flash_mla_v41_available",
-):
-    assert name in adapter.__all__, name
-    assert callable(getattr(adapter, name)), name
 """
     result = subprocess.run(
         [

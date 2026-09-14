@@ -744,7 +744,9 @@ def test_compressor_fused_norm_preserves_pooled_bf16_boundary(device):
 
 
 def _native_available():
-    from tokenspeed_kernel.thirdparty.flash_mla import is_flash_mla_v41_available
+    from tokenspeed_kernel.ops.attention.dsv41.flash_mla import (
+        is_flash_mla_v41_available,
+    )
 
     return (
         torch.cuda.is_available()

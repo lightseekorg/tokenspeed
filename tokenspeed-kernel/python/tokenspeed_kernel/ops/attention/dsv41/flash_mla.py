@@ -22,12 +22,36 @@
 
 from __future__ import annotations
 
+from types import ModuleType
+
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
-from tokenspeed_kernel.thirdparty.flash_mla import flash_mla_api
+
+_FLASH_MLA_API: ModuleType | None = None
+if current_platform().is_hopper_plus:
+    import flash_mla.flash_mla_interface as _FLASH_MLA_API
+    from flash_mla import fused_norm_rope_attn_rope_cast as _fused_v41  # noqa: F401
+
+
+def flash_mla_api() -> ModuleType:
+    """Return the optional native V4.1 FlashMLA API."""
+    if _FLASH_MLA_API is None:
+        raise ImportError(
+            "FlashMLA V4.1 requires tokenspeed-flashmla with its native CUDA extension"
+        )
+    return _FLASH_MLA_API
+
+
+def is_flash_mla_v41_available() -> bool:
+    """Return whether the optional V4.1 API and native extension are available."""
+    return _FLASH_MLA_API is not None
 
 
 def new_flashmla_schedule() -> object:

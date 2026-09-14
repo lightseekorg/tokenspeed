@@ -31,6 +31,9 @@ wrapper call, entirely on CPU with the wrapper entry points stubbed out.
 
 from __future__ import annotations
 
+import sys
+from types import ModuleType
+
 import pytest
 import tokenspeed_kernel.ops.attention.kda.cuda as flash_op
 import tokenspeed_kernel.ops.attention.kda.cute_dsl as cutedsl_op
@@ -141,15 +144,12 @@ def test_cutedsl_wrapper_preserves_state_and_int64_boundaries(
 def test_flash_original_wrapper_preserves_state_and_int64_boundaries(monkeypatch):
     seen: dict = {}
 
-    def fake_flash_kda_fwd():
-        def fake_forward(*args, **kwargs):
-            seen["state"] = kwargs["initial_state"]
-            seen["boundaries"] = kwargs["cu_seqlens"]
-            kwargs["final_state"].copy_(kwargs["initial_state"])
+    def fake_flash_kda_fwd(*args, **kwargs):
+        seen["state"] = kwargs["initial_state"]
+        seen["boundaries"] = kwargs["cu_seqlens"]
+        kwargs["final_state"].copy_(kwargs["initial_state"])
 
-        return fake_forward
-
-    monkeypatch.setattr(flash_op, "flash_kda_fwd", fake_flash_kda_fwd)
+    monkeypatch.setattr(flash_op, "flash_kda_fwd", fake_flash_kda_fwd, raising=False)
     q, k, v, g, beta, a_log, dt_bias = _inputs()
     boundaries = torch.tensor([0, T], dtype=torch.int64)
     host_boundaries = torch.tensor([0, T], dtype=torch.int64)
@@ -186,14 +186,11 @@ def test_adapters_preserve_runtime_v_major_state(
     import tokenspeed_kernel.ops.attention.kda as attn
     from tokenspeed_kernel.registry import KernelRegistry
 
-    def fake_flash_kda_fwd():
-        def fake_forward(*args, **kwargs):
-            kwargs["final_state"].copy_(kwargs["initial_state"])
-            args[6].copy_(args[2])
+    def fake_flash_kda_fwd(*args, **kwargs):
+        kwargs["final_state"].copy_(kwargs["initial_state"])
+        args[6].copy_(args[2])
 
-        return fake_forward
-
-    monkeypatch.setattr(flash_op, "flash_kda_fwd", fake_flash_kda_fwd)
+    monkeypatch.setattr(flash_op, "flash_kda_fwd", fake_flash_kda_fwd, raising=False)
     name = (
         "cutedsl_kda_nvidia_paged_prefill"
         if solution == "cutedsl_kda"
@@ -402,6 +399,13 @@ def test_solution_wrappers_forward_host_boundaries(monkeypatch):
     monkeypatch.setattr(kd_triton, "_nvidia_kda_prefill", fake_prefill)
     monkeypatch.setattr(kd_cuda, "_nvidia_kda_prefill", fake_prefill)
     monkeypatch.setattr(cutedsl_op, "_nvidia_kda_prefill", fake_prefill)
+
+    def fake_kda_chunk_prefill():
+        pass
+
+    fla_module = ModuleType("tokenspeed_kernel.ops.attention.kda._triton.fla")
+    fla_module.kda_chunk_prefill = fake_kda_chunk_prefill
+    monkeypatch.setitem(sys.modules, fla_module.__name__, fla_module)
 
     q, k, v, g, beta, a_log, dt_bias = _inputs()
     cu = torch.tensor([0, T], dtype=torch.int32)

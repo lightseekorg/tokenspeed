@@ -41,14 +41,19 @@ from tokenspeed_kernel.ops.attention.kda.triton import (
     _DENSE_HALF_SIGNATURES,
     _nvidia_kda_prefill,
 )
-from tokenspeed_kernel.platform import CapabilityRequirement
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.thirdparty.flash_kda import (
-    flash_kda_fwd,
-    is_flash_kda_installed,
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
 )
+from tokenspeed_kernel.registry import Priority, register_kernel
 
-__all__ = ["flash_kda_chunk_prefill", "is_flash_kda_installed"]
+platform = current_platform()
+
+if platform.is_nvidia and platform.is_hopper_plus:
+    from flash_kda import fwd as flash_kda_fwd
+
+__all__ = ["flash_kda_chunk_prefill"]
 
 
 @register_kernel(
@@ -56,7 +61,10 @@ __all__ = ["flash_kda_chunk_prefill", "is_flash_kda_installed"]
     "kda_paged_prefill",
     name="flashkda_nvidia_kda_paged_prefill",
     solution="flashkda",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 0),
+        vendors=frozenset({"nvidia"}),
+    ),
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
     traits={"recurrent_layout": frozenset({"k_major"})},
@@ -137,7 +145,7 @@ def flash_kda_chunk_prefill(
         device=q.device,
     )
     out = torch.empty_like(v)
-    flash_kda_fwd()(
+    flash_kda_fwd(
         q.contiguous(),
         k.contiguous(),
         v.contiguous(),

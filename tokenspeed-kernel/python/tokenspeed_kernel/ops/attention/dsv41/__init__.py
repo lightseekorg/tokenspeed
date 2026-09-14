@@ -221,7 +221,9 @@ def new_attention_schedule() -> object | None:
     The caller retains it through capture/replay; no request state or global
     tensor cache is allocated here. Portable selected attention accepts None.
     """
-    from tokenspeed_kernel.thirdparty.flash_mla import is_flash_mla_v41_available
+    from tokenspeed_kernel.ops.attention.dsv41.flash_mla import (
+        is_flash_mla_v41_available,
+    )
 
     if not is_flash_mla_v41_available():
         return None
@@ -279,7 +281,9 @@ def selected_attention(
     decode, and tiles compact BF16 prefill workspaces. The portable implementation
     uses the same selections and bounded gather with FP32 online softmax.
     """
-    from tokenspeed_kernel.thirdparty.flash_mla import is_flash_mla_v41_available
+    from tokenspeed_kernel.ops.attention.dsv41.flash_mla import (
+        is_flash_mla_v41_available,
+    )
 
     native = (
         schedule is not None or prefill_kv is not None
