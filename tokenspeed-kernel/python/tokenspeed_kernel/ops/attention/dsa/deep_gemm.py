@@ -115,10 +115,13 @@ def _resolve_prefill_tile_max_seqlen_k(
     return int(candidate_lens[start:end].max().item())
 
 
-if platform.is_nvidia:
+if platform.is_hopper_plus:
+    from tokenspeed_kernel._cuda_toolkit import prepare_cuda_toolkit_env
+
+    prepare_cuda_toolkit_env()
     import deep_ep  # noqa: F401
+    import deep_gemm
     import trtllm_kernel  # noqa: F401
-    from tokenspeed_kernel.thirdparty import deep_gemm
 
     def _deep_gemm_paged_mqa_plan(
         *,

@@ -22,35 +22,37 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+    pdl_enabled,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-try:
-    from tokenspeed_kernel.ops.moe.triton.shared import stage_dsv4_mega_moe_inputs
-    from tokenspeed_kernel.thirdparty.deep_gemm import (
+platform = current_platform()
+logger = logging.getLogger(__name__)
+
+if platform.is_blackwell:
+    from tokenspeed_kernel._cuda_toolkit import prepare_cuda_toolkit_env
+
+    prepare_cuda_toolkit_env()
+    from deep_gemm import (
         fp8_fp4_mega_moe,
         get_pdl,
         get_symm_buffer_for_mega_moe,
         set_pdl,
         transform_sf_into_required_layout,
         transform_weights_for_mega_moe,
-        warmup_mega_moe_jit,
     )
-except ImportError:  # pragma: no cover - DeepGEMM and Triton are optional
-    fp8_fp4_mega_moe = None
-    get_pdl = None
-    get_symm_buffer_for_mega_moe = None
-    set_pdl = None
-    transform_sf_into_required_layout = None
-    transform_weights_for_mega_moe = None
-    warmup_mega_moe_jit = None
-    stage_dsv4_mega_moe_inputs = None
+    from tokenspeed_kernel.ops.moe.triton.shared import stage_dsv4_mega_moe_inputs
 
 
 _MXFP4_BLOCK_SIZE = 32
@@ -200,6 +202,72 @@ def _get_symm_buffer(
     return buffer
 
 
+def _warmup_m_values(max_tokens: int) -> list[int]:
+    """Return token counts covering every DeepGEMM tile reachable at runtime."""
+    dense = min(max_tokens, 2048)
+    values: set[int] = set(range(1, dense + 1))
+    values.update(range(dense, max_tokens + 1, 16))
+    values.add(max_tokens)
+    return sorted(values)
+
+
+def _warmup_mega_moe_jit(
+    *,
+    num_experts: int,
+    max_num_tokens: int,
+    top_k: int,
+    hidden_size: int,
+    device: torch.device,
+    transformed_l1_weights: tuple[torch.Tensor, torch.Tensor],
+    transformed_l2_weights: tuple[torch.Tensor, torch.Tensor],
+    symm_buffer: object,
+    activation_clamp: float | None,
+) -> None:
+    """Pre-compile MegaMoE kernel tiles using the initialized model state."""
+    token_counts = _warmup_m_values(max_num_tokens)
+    logger.info(
+        "Warming up mega_moe JIT: %d token counts up to %d",
+        len(token_counts),
+        max_num_tokens,
+    )
+
+    for num_tokens in token_counts:
+        hidden_states = torch.randn(
+            num_tokens,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        topk_ids = torch.randint(
+            0,
+            num_experts,
+            (num_tokens, top_k),
+            dtype=torch.int32,
+            device=device,
+        )
+        topk_weights = torch.full(
+            (num_tokens, top_k),
+            1.0 / top_k,
+            dtype=torch.float32,
+            device=device,
+        )
+
+        output = torch.empty_like(hidden_states)
+        symm_buffer.x[:num_tokens].copy_(hidden_states.to(torch.float8_e4m3fn))
+        symm_buffer.x_sf[:num_tokens].fill_(1.0)
+        symm_buffer.topk_idx[:num_tokens].copy_(topk_ids)
+        symm_buffer.topk_weights[:num_tokens].copy_(topk_weights)
+        fp8_fp4_mega_moe(
+            output,
+            transformed_l1_weights,
+            transformed_l2_weights,
+            symm_buffer,
+            activation_clamp=activation_clamp,
+        )
+
+    torch.cuda.synchronize()
+
+
 def _warmup_deep_gemm_dsv4_mega_moe(
     *,
     state: object,
@@ -241,7 +309,7 @@ def _warmup_deep_gemm_dsv4_mega_moe(
         intermediate_size=intermediate_size,
         max_num_tokens=max_num_tokens,
     )
-    warmup_mega_moe_jit(
+    _warmup_mega_moe_jit(
         num_experts=num_experts,
         max_num_tokens=max_num_tokens,
         top_k=top_k,
@@ -255,7 +323,7 @@ def _warmup_deep_gemm_dsv4_mega_moe(
     _warmed_configs.add(warmup_key)
 
 
-if fp8_fp4_mega_moe is not None and stage_dsv4_mega_moe_inputs is not None:
+if platform.is_blackwell:
 
     @register_kernel(
         "moe",

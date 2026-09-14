@@ -31,20 +31,17 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.platform import current_platform
 
-if not torch.cuda.is_available():
-    pytest.skip("CUDA required", allow_module_level=True)
+if not torch.cuda.is_available() or not current_platform().is_hopper_plus:
+    pytest.skip("NVIDIA Hopper or newer required", allow_module_level=True)
 
-deep_gemm = pytest.importorskip(
-    "tokenspeed_kernel.thirdparty.deep_gemm",
-    reason="DeepGEMM is an optional dependency",
+import deep_gemm  # noqa: E402
+from deep_gemm.utils import (  # noqa: E402
+    get_mn_major_tma_aligned_packed_ue8m0_tensor,
 )
-
 from tokenspeed_kernel.ops.activation.triton import (  # noqa: E402
     fused_swiglu_fp8_ue8m0_masked_packed,
-)
-from tokenspeed_kernel.thirdparty.deep_gemm.utils.layout import (  # noqa: E402
-    get_mn_major_tma_aligned_packed_ue8m0_tensor,
 )
 
 _BLOCK = 128

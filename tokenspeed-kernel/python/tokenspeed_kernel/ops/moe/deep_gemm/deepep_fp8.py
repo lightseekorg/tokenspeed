@@ -63,8 +63,11 @@ platform = current_platform()
 logger = logging.getLogger(__name__)
 _warned_about_requantization = False
 
-try:
-    from tokenspeed_kernel.thirdparty.deep_gemm import (
+if platform.is_hopper_plus:
+    from tokenspeed_kernel._cuda_toolkit import prepare_cuda_toolkit_env
+
+    prepare_cuda_toolkit_env()
+    from deep_gemm import (
         get_mn_major_tma_aligned_tensor,
         get_pdl,
         m_grouped_fp8_gemm_nt_contiguous,
@@ -72,16 +75,9 @@ try:
         set_pdl,
         transform_sf_into_required_layout,
     )
-except ImportError:  # pragma: no cover - DeepGEMM is an optional dependency
-    get_mn_major_tma_aligned_tensor = None
-    get_pdl = None
-    m_grouped_fp8_gemm_nt_contiguous = None
-    m_grouped_fp8_gemm_nt_masked = None
-    set_pdl = None
-    transform_sf_into_required_layout = None
 
 
-if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
+if platform.is_hopper_plus:
     from tokenspeed_kernel.ops.activation.triton import (
         fused_swiglu_fp8_ue8m0,
         fused_swiglu_fp8_ue8m0_masked_packed,

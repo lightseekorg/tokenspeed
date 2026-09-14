@@ -17,3 +17,12 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
+from tokenspeed_kernel.ops.gemm.deep_gemm import _warmup_m_values
+
+
+def test_warmup_m_values_covers_dense_and_tail_ranges() -> None:
+    assert _warmup_m_values(3) == [1, 2, 3]
+    values = _warmup_m_values(2050)
+    assert values[:3] == [1, 2, 3]
+    assert values[-2:] == [2048, 2050]

@@ -54,7 +54,7 @@ def _kpool_cache_views(
     return values.view(torch.float8_e4m3fn), scales.view(torch.float32)
 
 
-if current_platform().is_nvidia:
+if current_platform().is_hopper_plus:
     from tokenspeed_kernel.ops.attention.dsa.deep_gemm import (
         deep_gemm_dsa_prefill_topk,
     )

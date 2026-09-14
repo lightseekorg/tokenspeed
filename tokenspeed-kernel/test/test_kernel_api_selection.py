@@ -417,16 +417,6 @@ def _is_nvidia_with_cute_dsl(platform: PlatformInfo) -> bool:
     return platform.is_nvidia and _sampling_cute_dsl.is_available()
 
 
-def _is_hopper_plus_with_deep_gemm(platform: PlatformInfo) -> bool:
-    # The FP8 DeepEP apply kernel only registers when the optional DeepGEMM
-    # package exposes the masked grouped GEMM, so gate on that too.
-    return (
-        platform.is_nvidia
-        and platform.arch_version >= ArchVersion(9, 0)
-        and _moe_deep_gemm_deepep_fp8.m_grouped_fp8_gemm_nt_masked is not None
-    )
-
-
 def _is_cdna4(platform: PlatformInfo) -> bool:
     return platform.is_cdna4
 
@@ -4785,7 +4775,7 @@ _CASES = [
         _moe_apply_nvfp4_deepep_cutedsl,
     ),
     _case(
-        _is_hopper_plus_with_deep_gemm,
+        _is_hopper_plus,
         "hopper-plus",
         "moe",
         "apply",
