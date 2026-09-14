@@ -226,10 +226,8 @@ target's whatever the drafter proposed.
 
 Kimi-K3 combines a MoonViT vision encoder with a hybrid KDA
 (linear-attention) / NoPE-MLA (full-attention) decoder and a
-DeepSeek-V3-style latent MoE. NVIDIA uses the packaged CuteDSL or FlashKDA
-prefill implementation when supported. Install flash-linear-attention when
-explicitly selecting the portable FLA implementation or when using `auto` on
-pre-Hopper NVIDIA devices:
+DeepSeek-V3-style latent MoE. The KDA layers currently use
+flash-linear-attention kernels on NVIDIA, so install it first:
 
 ```bash
 pip install flash-linear-attention
@@ -239,9 +237,9 @@ Notes:
 
 - K3 uses the cache-group scheduler and KDA state groups.
 - KDA dispatch is vendor-neutral at the runtime boundary. The kernel registry
-  selects the NVIDIA or native AMD implementation, including each backend's
-  preferred recurrent-state layout. The runtime does not transpose or
-  reinterpret that state.
+  selects the existing FLA-derived NVIDIA implementation or the native AMD
+  implementation, including each backend's preferred recurrent-state layout.
+  The runtime does not transpose or reinterpret that state.
 - NVIDIA auto-selects `--attention-backend tokenspeed_mla` for K3
   (fp8 KV required). AMD uses the `mla` backend.
 - `tokenspeed serve` auto-selects the `kimi_k3` reasoning and tool-call
