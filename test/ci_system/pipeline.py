@@ -72,6 +72,7 @@ RUNNER_SM_PREFIXES = (
 )
 
 AMD_RUNNER_PREFIXES = (
+    "linux-mi355-",
     "amd-mi35x-",
     "amd-mi355-",
     "amd-mi350-",

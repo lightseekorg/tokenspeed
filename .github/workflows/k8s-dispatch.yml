@@ -279,7 +279,7 @@ jobs:
               pool = os.environ["RUNNER_POOL"]
               runner_families = {
                   "b200v2": runner.startswith("b200v2-"),
-                  "amd": runner.startswith("amd-"),
+                  "amd": runner.startswith(("amd-", "linux-mi355-")),
                   "gb200": runner.startswith("gb200-"),
                   "b300": runner.startswith("b300-"),
               }

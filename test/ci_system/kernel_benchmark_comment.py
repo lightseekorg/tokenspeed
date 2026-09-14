@@ -289,7 +289,7 @@ def extract_report(archive: bytes) -> dict[str, Any] | None:
 
 def _artifact_name(run_id: int, run_attempt: int) -> str:
     return (
-        "pr-test-kernel-benchmark-amd-gfx950-amd-mi355-1gpu-bench-"
+        "pr-test-kernel-benchmark-amd-gfx950-linux-mi355-1.lightseek.test-"
         f"{run_id}-{run_attempt}"
     )
 
