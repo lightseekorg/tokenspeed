@@ -27,6 +27,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 
 import torch
+from flashinfer.sparse import BlockSparseAttentionWrapper
 
 _DEFAULT_WORKSPACE_BYTES = 128 * 1024 * 1024
 _BITS_PER_BYTE = 8
@@ -75,8 +76,6 @@ class _FlashInferQSASparseRunner:
     ) -> None:
         if device.type != "cuda":
             raise ValueError("FlashInfer QSA sparse attention requires a CUDA device")
-        from flashinfer.sparse import BlockSparseAttentionWrapper
-
         self.device = device
         self._wrapper_type = BlockSparseAttentionWrapper
         self.workspace = torch.empty(

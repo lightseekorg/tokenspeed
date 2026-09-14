@@ -981,7 +981,9 @@ def test_flashinfer_mtp_uninitialized_buffers(
     """Live output/cache rows overwrite poison; skipped rows and slab gaps survive."""
     require("attention", "gdn_decode_mtp", "flashinfer", torch.bfloat16, "q")
     from flashinfer.gdn_decode import gated_delta_rule_mtp as reference_mtp
-    from tokenspeed_kernel.thirdparty.flashinfer.gdn import gated_delta_rule_mtp
+    from tokenspeed_kernel.ops.attention.gdn._flashinfer.adapter import (
+        gated_delta_rule_mtp,
+    )
 
     steps, heads, dim = 3, 32, 128
     pool_size = 1 + batch * (steps + 1)

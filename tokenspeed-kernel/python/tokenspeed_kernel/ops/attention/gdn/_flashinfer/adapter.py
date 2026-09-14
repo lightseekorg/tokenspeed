@@ -29,28 +29,10 @@ from flashinfer.gdn_kernels.gdn_decode_mtp import (
     get_tile_v_mtp,
     get_vec_size_mtp,
 )
-
-# Preserve independent availability checks for optional FlashInfer entry points.
-try:
-    from flashinfer.gdn_prefill import chunk_gated_delta_rule as _original_prefill
-except ImportError:
-    _original_prefill = None
-try:
-    from flashinfer.gdn_decode import (
-        gated_delta_rule_decode_pretranspose as _original_decode,
-    )
-except ImportError:
-    _original_decode = None
-try:
-    from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
-        gated_delta_rule_mtp as _original_bf16_mtp,
-    )
-except ImportError:
-    _original_bf16_mtp = None
-
-HAS_PREFILL = _original_prefill is not None
-HAS_DECODE = _original_decode is not None
-HAS_BF16_MTP = _original_bf16_mtp is not None
+from flashinfer.gdn_decode import (
+    gated_delta_rule_decode_pretranspose as _original_decode,
+)
+from flashinfer.gdn_prefill import chunk_gated_delta_rule as _original_prefill
 
 
 def gated_delta_rule_mtp(
@@ -190,7 +172,7 @@ def _mtp_runner(enable_pdl: bool):
     if not enable_pdl:
         return gdn_decode_mtp.run_mtp_decode
 
-    from tokenspeed_kernel.thirdparty.flashinfer._pdl import _adapt_module
+    from tokenspeed_kernel.ops.attention.gdn._flashinfer.pdl import _adapt_module
 
     return _adapt_module(
         gdn_decode_mtp,
@@ -209,7 +191,7 @@ def _bf16_runners(enable_pdl: bool):
     if not enable_pdl:
         return vars(gdn_decode_bf16_state)
 
-    from tokenspeed_kernel.thirdparty.flashinfer._pdl import _adapt_module
+    from tokenspeed_kernel.ops.attention.gdn._flashinfer.pdl import _adapt_module
 
     return _adapt_module(
         gdn_decode_bf16_state,
@@ -241,7 +223,7 @@ def _decode_runner(enable_pdl: bool):
 
     from flashinfer import gdn_decode
     from flashinfer.gdn_kernels import gdn_decode_pretranspose
-    from tokenspeed_kernel.thirdparty.flashinfer._pdl import (
+    from tokenspeed_kernel.ops.attention.gdn._flashinfer.pdl import (
         _adapt_module,
         _clone_function,
     )
@@ -277,7 +259,7 @@ def _prefill_runner(enable_pdl: bool):
 
     from flashinfer import gdn_prefill
     from flashinfer.gdn_kernels.blackwell import gdn_prefill as sm100
-    from tokenspeed_kernel.thirdparty.flashinfer._pdl import (
+    from tokenspeed_kernel.ops.attention.gdn._flashinfer.pdl import (
         _adapt_module,
         _clone_function,
         _PdlKernel,
