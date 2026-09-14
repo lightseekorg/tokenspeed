@@ -1189,7 +1189,7 @@ def dsa_prefill_topk_fp8(
     return out, lens_out
 
 
-def triton_dsa_plan(
+def _triton_dsa_plan_impl(
     *,
     page_size: int,
     seq_lens_2d: torch.Tensor,
@@ -1199,7 +1199,7 @@ def triton_dsa_plan(
     return object() if out is None else out
 
 
-def triton_dsa_decode_topk_fp8(
+def _triton_dsa_decode_topk_fp8_impl(
     q: torch.Tensor,
     weights: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -1238,7 +1238,7 @@ def triton_dsa_decode_topk_fp8(
     )
 
 
-def triton_dsa_prefill_topk_fp8(
+def _triton_dsa_prefill_topk_fp8_impl(
     q: torch.Tensor,
     weights: torch.Tensor,
     kv_workspace_slots: torch.Tensor,
@@ -1283,8 +1283,5 @@ __all__ = [
     "dsa_prefill_topk_fp8",
     "triton_topk_from_logits",
     "local_topk_to_global_slots",
-    "triton_dsa_plan",
-    "triton_dsa_decode_topk_fp8",
-    "triton_dsa_prefill_topk_fp8",
     "workspace_topk_to_global_slots",
 ]

@@ -452,7 +452,7 @@ def prefill_attention_fwd(
     )
 
 
-def triton_mha_prefill(
+def _triton_mha_prefill_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -503,7 +503,7 @@ def triton_mha_prefill(
     return out
 
 
-def triton_mha_extend_with_kvcache(
+def _triton_mha_extend_with_kvcache_impl(
     q: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_kv: torch.Tensor,

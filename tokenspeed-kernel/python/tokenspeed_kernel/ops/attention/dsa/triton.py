@@ -575,9 +575,9 @@ def triton_dsa_prefill(
 from tokenspeed_kernel.ops.attention.dsa._triton.topk import *  # noqa: E402,F403
 from tokenspeed_kernel.ops.attention.dsa._triton.topk import (  # noqa: E402
     _topk_with_padding,
-    triton_dsa_decode_topk_fp8 as _triton_dsa_decode_topk_fp8,
-    triton_dsa_plan as _triton_dsa_plan,
-    triton_dsa_prefill_topk_fp8 as _triton_dsa_prefill_topk_fp8,
+    _triton_dsa_decode_topk_fp8_impl,
+    _triton_dsa_plan_impl,
+    _triton_dsa_prefill_topk_fp8_impl,
 )
 
 
@@ -598,7 +598,7 @@ def triton_dsa_plan(
     seq_lens_2d: torch.Tensor,
     out: object | None = None,
 ) -> torch.Tensor:
-    return _triton_dsa_plan(
+    return _triton_dsa_plan_impl(
         page_size=page_size,
         seq_lens_2d=seq_lens_2d,
         out=out,
@@ -655,7 +655,7 @@ def triton_dsa_decode_topk_fp8(
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return _triton_dsa_decode_topk_fp8(
+    return _triton_dsa_decode_topk_fp8_impl(
         q=q,
         weights=weights,
         seq_lens=seq_lens,
@@ -707,7 +707,7 @@ def triton_dsa_prefill_topk_fp8(
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return _triton_dsa_prefill_topk_fp8(
+    return _triton_dsa_prefill_topk_fp8_impl(
         q=q,
         weights=weights,
         kv_workspace_slots=kv_workspace_slots,

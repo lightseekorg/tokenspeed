@@ -268,7 +268,7 @@ def mla_prefill_fwd(
     )
 
 
-def triton_mla_prefill(
+def _triton_mla_prefill_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,

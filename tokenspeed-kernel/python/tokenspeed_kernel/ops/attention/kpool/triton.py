@@ -27,13 +27,9 @@ import functools
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.kpool._triton.cache import (
-    triton_kpool_decode_append as _triton_kpool_decode_append,
-)
-from tokenspeed_kernel.ops.attention.kpool._triton.cache import (
-    triton_kpool_prefill_tail_write as _triton_kpool_prefill_tail_write,
-)
-from tokenspeed_kernel.ops.attention.kpool._triton.cache import (
-    triton_kpool_prefill_write as _triton_kpool_prefill_write,
+    _triton_kpool_decode_append_impl,
+    _triton_kpool_prefill_tail_write_impl,
+    _triton_kpool_prefill_write_impl,
 )
 from tokenspeed_kernel.ops.attention.kpool._triton.expand import (
     expand_kpool_to_flat_kv,
@@ -87,7 +83,7 @@ def triton_kpool_prefill_write(
     index_scales: torch.Tensor,
     ape: torch.Tensor,
 ) -> None:
-    return _triton_kpool_prefill_write(
+    return _triton_kpool_prefill_write_impl(
         slot_k=slot_k,
         slot_score=slot_score,
         write_slots=write_slots,
@@ -122,7 +118,7 @@ def triton_kpool_prefill_tail_write(
     *,
     pool_size: int,
 ) -> None:
-    return _triton_kpool_prefill_tail_write(
+    return _triton_kpool_prefill_tail_write_impl(
         k=k,
         gate=gate,
         tail_k=tail_k,
@@ -162,7 +158,7 @@ def triton_kpool_decode_append(
     index_scales: torch.Tensor,
     ape: torch.Tensor,
 ) -> None:
-    return _triton_kpool_decode_append(
+    return _triton_kpool_decode_append_impl(
         k=k,
         gate=gate,
         tail_k=tail_k,

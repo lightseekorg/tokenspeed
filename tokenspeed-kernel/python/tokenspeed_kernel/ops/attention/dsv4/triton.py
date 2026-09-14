@@ -35,9 +35,9 @@ import logging
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.dsv4._triton.indexer import (  # noqa: F401
-    triton_dsv4_decode_topk_mxfp4 as _triton_dsv4_decode_topk_mxfp4,
-    triton_dsv4_plan as _triton_dsv4_plan,
-    triton_dsv4_prefill_topk_mxfp4 as _triton_dsv4_prefill_topk_mxfp4,
+    _triton_dsv4_decode_topk_mxfp4_impl,
+    _triton_dsv4_plan_impl,
+    _triton_dsv4_prefill_topk_mxfp4_impl,
 )
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -104,7 +104,7 @@ def triton_dsv4_prefill_topk_mxfp4(
     gather_workspace: tuple[torch.Tensor, torch.Tensor] | None,
     out: torch.Tensor | None,
 ) -> tuple[torch.Tensor, None]:
-    return _triton_dsv4_prefill_topk_mxfp4(
+    return _triton_dsv4_prefill_topk_mxfp4_impl(
         index_q=index_q,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -151,7 +151,7 @@ def triton_dsv4_decode_topk_mxfp4(
     out: torch.Tensor | None,
     persistent_topk_workspace: torch.Tensor | None,
 ) -> torch.Tensor:
-    return _triton_dsv4_decode_topk_mxfp4(
+    return _triton_dsv4_decode_topk_mxfp4_impl(
         index_q=index_q,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -185,7 +185,7 @@ def triton_dsv4_plan(
     seq_lens_2d: torch.Tensor,
     out: object | None,
 ) -> torch.Tensor:
-    return _triton_dsv4_plan(
+    return _triton_dsv4_plan_impl(
         page_size=page_size,
         seq_lens_2d=seq_lens_2d,
         out=out,

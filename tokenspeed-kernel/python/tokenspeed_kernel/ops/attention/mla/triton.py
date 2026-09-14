@@ -21,11 +21,11 @@
 
 import torch
 from tokenspeed_kernel.ops.attention.mla._triton.decode import (
-    triton_mla_decode_with_kvcache as _triton_mla_decode_with_kvcache,
+    _triton_mla_decode_with_kvcache_impl,
 )
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import *  # noqa: F403
 from tokenspeed_kernel.ops.attention.mla._triton.prefill import (
-    triton_mla_prefill as _triton_mla_prefill,
+    _triton_mla_prefill_impl,
 )
 from tokenspeed_kernel.ops.attention.mla._triton.write_locations import *  # noqa: F403
 from tokenspeed_kernel.platform import CapabilityRequirement
@@ -68,7 +68,7 @@ def triton_mla_prefill(
     out: torch.Tensor | None = None,
     seq_lens_kv: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    return _triton_mla_prefill(
+    return _triton_mla_prefill_impl(
         q=q,
         k=k,
         v=v,
@@ -118,7 +118,7 @@ def triton_mla_decode_with_kvcache(
     window_left: int = -1,
     noncausal_block_size: int = 1,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    return _triton_mla_decode_with_kvcache(
+    return _triton_mla_decode_with_kvcache_impl(
         q=q,
         kv_cache=kv_cache,
         page_table=page_table,

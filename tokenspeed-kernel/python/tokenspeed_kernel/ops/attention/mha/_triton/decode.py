@@ -833,7 +833,7 @@ def decode_attention_fwd(
         )
 
 
-def triton_mha_decode_with_kvcache(
+def _triton_mha_decode_with_kvcache_impl(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,

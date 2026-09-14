@@ -284,7 +284,7 @@ def mla_decode_fwd(
     )
 
 
-def triton_mla_decode_with_kvcache(
+def _triton_mla_decode_with_kvcache_impl(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,

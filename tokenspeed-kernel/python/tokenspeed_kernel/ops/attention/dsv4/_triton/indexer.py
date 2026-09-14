@@ -272,7 +272,7 @@ def _check_base_offsets(
         )
 
 
-def triton_dsv4_prefill_topk_mxfp4(
+def _triton_dsv4_prefill_topk_mxfp4_impl(
     index_q: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
     index_k_cache: torch.Tensor,
@@ -350,7 +350,7 @@ def triton_dsv4_prefill_topk_mxfp4(
     return _select_topk(logits, topk, out, base_rows), None
 
 
-def triton_dsv4_decode_topk_mxfp4(
+def _triton_dsv4_decode_topk_mxfp4_impl(
     index_q: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
     index_k_cache: torch.Tensor,
@@ -409,7 +409,7 @@ def triton_dsv4_decode_topk_mxfp4(
     return _select_topk(logits, topk, out, base_rows)
 
 
-def triton_dsv4_plan(
+def _triton_dsv4_plan_impl(
     *, page_size: int, seq_lens_2d: torch.Tensor, out: object | None
 ) -> torch.Tensor:
     """Keep a stable plan tensor for the runtime's in-place metadata refresh.

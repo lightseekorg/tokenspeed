@@ -136,7 +136,7 @@ def _kpool_prefill_write_kernel(
     tl.store(index_scales_ptr + scale_base, scale, mask=valid)
 
 
-def triton_kpool_prefill_write(
+def _triton_kpool_prefill_write_impl(
     slot_k: torch.Tensor,
     slot_score: torch.Tensor,
     write_slots: torch.Tensor,
@@ -276,7 +276,7 @@ def _kpool_prefill_tail_write_kernel(
         )
 
 
-def triton_kpool_prefill_tail_write(
+def _triton_kpool_prefill_tail_write_impl(
     k: torch.Tensor,
     gate: torch.Tensor,
     tail_k: torch.Tensor,
@@ -532,7 +532,7 @@ def _kpool_decode_append_kernel(
             tl.store(index_scales_ptr + scale_base, scale, mask=index_page_valid)
 
 
-def triton_kpool_decode_append(
+def _triton_kpool_decode_append_impl(
     k: torch.Tensor,
     gate: torch.Tensor,
     tail_k: torch.Tensor,
@@ -631,10 +631,3 @@ def triton_kpool_decode_append(
         num_warps=4,
         num_stages=1,
     )
-
-
-__all__ = [
-    "triton_kpool_decode_append",
-    "triton_kpool_prefill_tail_write",
-    "triton_kpool_prefill_write",
-]

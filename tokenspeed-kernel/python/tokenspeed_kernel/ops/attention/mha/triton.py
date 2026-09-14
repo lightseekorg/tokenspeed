@@ -21,13 +21,11 @@
 
 import torch
 from tokenspeed_kernel.ops.attention.mha._triton.decode import (
-    triton_mha_decode_with_kvcache as _triton_mha_decode_with_kvcache,
+    _triton_mha_decode_with_kvcache_impl,
 )
 from tokenspeed_kernel.ops.attention.mha._triton.prefill import (
-    triton_mha_extend_with_kvcache as _triton_mha_extend_with_kvcache,
-)
-from tokenspeed_kernel.ops.attention.mha._triton.prefill import (
-    triton_mha_prefill as _triton_mha_prefill,
+    _triton_mha_extend_with_kvcache_impl,
+    _triton_mha_prefill_impl,
 )
 from tokenspeed_kernel.ops.attention.mha._triton.context import *  # noqa: F403
 from tokenspeed_kernel.ops.attention.mha._triton.qkv_rotary import *  # noqa: F403
@@ -72,7 +70,7 @@ def triton_mha_prefill(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    return _triton_mha_prefill(
+    return _triton_mha_prefill_impl(
         q=q,
         k=k,
         v=v,
@@ -130,7 +128,7 @@ def triton_mha_extend_with_kvcache(
     v_scale: torch.Tensor | None = None,
     enable_pdl: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    return _triton_mha_extend_with_kvcache(
+    return _triton_mha_extend_with_kvcache_impl(
         q=q,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_kv=cu_seqlens_kv,
@@ -189,7 +187,7 @@ def triton_mha_decode_with_kvcache(
     v_scale: torch.Tensor | None = None,
     enable_pdl: bool = False,
 ) -> torch.Tensor:
-    return _triton_mha_decode_with_kvcache(
+    return _triton_mha_decode_with_kvcache_impl(
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
