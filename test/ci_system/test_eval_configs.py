@@ -202,7 +202,8 @@ def test_kimi_k3_amd_gates_use_eagle3():
     generation_config = json.loads(flag_value(eval_tokens, "--generation-config"))
     assert generation_config["seed"] == 42
     assert tasks[0]["score_threshold"] == 0.90
-    assert tasks[1]["perf_reference"] == {1: [161, 18.8]}
+    assert "'evalscope[perf]==1.11.1'" in tasks[1]["perf"]["install"][0]
+    assert tasks[1]["perf_reference"] == {1: [153, 17.8]}
 
     control_filenames = (
         "kimi-k3-mxfp4-tp8ep8-evalscope-aime26-amd.yaml",
