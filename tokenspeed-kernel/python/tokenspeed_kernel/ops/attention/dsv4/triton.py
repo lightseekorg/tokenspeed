@@ -35,9 +35,9 @@ import logging
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.dsv4._triton.indexer import (  # noqa: F401
-    triton_dsv4_decode_topk_mxfp4,
-    triton_dsv4_plan,
-    triton_dsv4_prefill_topk_mxfp4,
+    triton_dsv4_decode_topk_mxfp4 as _triton_dsv4_decode_topk_mxfp4,
+    triton_dsv4_plan as _triton_dsv4_plan,
+    triton_dsv4_prefill_topk_mxfp4 as _triton_dsv4_prefill_topk_mxfp4,
 )
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -59,6 +59,137 @@ DEEPSEEK_V4_INDEXER_MXFP4_SCALE_DIM = (
     DEEPSEEK_V4_INDEXER_DIM // DEEPSEEK_V4_MXFP4_BLOCK_SIZE
 )
 DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT = 128
+
+_INDEXER_SIGNATURE = format_signature(
+    q=dense_tensor_format(torch.uint8),
+    weights=dense_tensor_format(torch.float32),
+    index_k_cache=dense_tensor_format(torch.uint8),
+)
+_INDEXER_TRAITS = {
+    "index_heads": frozenset({32, 64}),
+    "head_dim": frozenset({128}),
+    "topk": frozenset({512, 1024, 2048}),
+    "page_size": frozenset({64}),
+    "index_k_format": frozenset({"mxfp4"}),
+}
+
+
+@register_kernel(
+    "attention",
+    "dsv4_prefill_topk",
+    name="triton_dsv4_prefill_topk_mxfp4",
+    solution="triton",
+    signatures=frozenset({_INDEXER_SIGNATURE}),
+    traits=_INDEXER_TRAITS,
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    priority=Priority.PORTABLE,
+    tags={"portability", "mxfp4", "sparse"},
+)
+def triton_dsv4_prefill_topk_mxfp4(
+    index_q: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    cu_seqlen_k_start: torch.Tensor,
+    cu_seqlen_k_end: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    max_seqlen_k: int,
+    index_k_format: str,
+    block_table_base_offsets: torch.Tensor | None,
+    gathered_k: tuple[torch.Tensor, torch.Tensor] | None,
+    gather_workspace: tuple[torch.Tensor, torch.Tensor] | None,
+    out: torch.Tensor | None,
+) -> tuple[torch.Tensor, None]:
+    return _triton_dsv4_prefill_topk_mxfp4(
+        index_q=index_q,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        block_table=block_table,
+        cu_seq_lens=cu_seq_lens,
+        cu_seqlen_k_start=cu_seqlen_k_start,
+        cu_seqlen_k_end=cu_seqlen_k_end,
+        seq_lens=seq_lens,
+        page_size=page_size,
+        topk=topk,
+        max_seqlen_k=max_seqlen_k,
+        index_k_format=index_k_format,
+        block_table_base_offsets=block_table_base_offsets,
+        gathered_k=gathered_k,
+        gather_workspace=gather_workspace,
+        out=out,
+    )
+
+
+@register_kernel(
+    "attention",
+    "dsv4_decode_topk",
+    name="triton_dsv4_decode_topk_mxfp4",
+    solution="triton",
+    signatures=frozenset({_INDEXER_SIGNATURE}),
+    traits=_INDEXER_TRAITS,
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    priority=Priority.PORTABLE,
+    tags={"portability", "mxfp4", "sparse"},
+)
+def triton_dsv4_decode_topk_mxfp4(
+    index_q: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    max_context_len: int,
+    plan: object,
+    index_k_format: str,
+    block_table_base_offsets: torch.Tensor | None,
+    out: torch.Tensor | None,
+    persistent_topk_workspace: torch.Tensor | None,
+) -> torch.Tensor:
+    return _triton_dsv4_decode_topk_mxfp4(
+        index_q=index_q,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        context_lens=context_lens,
+        block_table=block_table,
+        page_size=page_size,
+        topk=topk,
+        max_context_len=max_context_len,
+        plan=plan,
+        index_k_format=index_k_format,
+        block_table_base_offsets=block_table_base_offsets,
+        out=out,
+        persistent_topk_workspace=persistent_topk_workspace,
+    )
+
+
+@register_kernel(
+    "attention",
+    "dsv4_plan",
+    name="triton_dsv4_plan",
+    solution="triton",
+    signatures=frozenset({format_signature()}),
+    traits={"page_size": frozenset({64})},
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    priority=Priority.PORTABLE,
+    tags={"portability", "cuda_graph"},
+)
+def triton_dsv4_plan(
+    *,
+    page_size: int,
+    seq_lens_2d: torch.Tensor,
+    out: object | None,
+) -> torch.Tensor:
+    return _triton_dsv4_plan(
+        page_size=page_size,
+        seq_lens_2d=seq_lens_2d,
+        out=out,
+    )
 
 __all__ = [
     "dsv4_build_dense_prefill_local_compressed_indices",

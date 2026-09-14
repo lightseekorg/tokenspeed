@@ -44,13 +44,11 @@ import tokenspeed_kernel.numerics.reference.gemm as _gemm_reference
 import tokenspeed_kernel.ops.attention as _attention_pkg
 import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
 import tokenspeed_kernel.ops.attention.dsa as _attention_dsa_pkg
-import tokenspeed_kernel.ops.attention.dsa._triton.topk as _attention_triton_dsa_topk
 import tokenspeed_kernel.ops.attention.dsa.cuda as _attention_cuda_dsa
 import tokenspeed_kernel.ops.attention.dsa.deep_gemm as _attention_deep_gemm_dsa
 import tokenspeed_kernel.ops.attention.dsa.flashinfer as _attention_flashinfer_dsa
 import tokenspeed_kernel.ops.attention.dsa.gluon as _attention_gluon_dsa
 import tokenspeed_kernel.ops.attention.dsv4 as _attention_dsv4_pkg
-import tokenspeed_kernel.ops.attention.dsv4._triton.indexer as _attention_triton_dsv4_indexer
 import tokenspeed_kernel.ops.attention.dsv4.cuda as _attention_cuda_dsv4
 import tokenspeed_kernel.ops.attention.dsv4.deep_gemm as _attention_deep_gemm_dsv4
 import tokenspeed_kernel.ops.attention.dsv4.gluon as _attention_gluon_dsv4
@@ -59,17 +57,16 @@ import tokenspeed_kernel.ops.attention.gdn.flashinfer as _attention_flashinfer_g
 import tokenspeed_kernel.ops.attention.kda as _attention_kda_pkg
 import tokenspeed_kernel.ops.attention.kda.gluon as _attention_gluon_kda
 import tokenspeed_kernel.ops.attention.kpool.deep_gemm as _attention_deep_gemm_kpool
+import tokenspeed_kernel.ops.attention.kpool.triton as _attention_triton_kpool
 import tokenspeed_kernel.ops.attention.mha as _attention_mha_pkg
-import tokenspeed_kernel.ops.attention.mha._triton.decode as _attention_triton_mha_decode
-import tokenspeed_kernel.ops.attention.mha._triton.prefill as _attention_triton_mha_prefill
 import tokenspeed_kernel.ops.attention.mha.cuda as _attention_flash_attn
 import tokenspeed_kernel.ops.attention.mha.flashinfer as _attention_flashinfer
 import tokenspeed_kernel.ops.attention.mha.gluon as _attention_gluon_mha
+import tokenspeed_kernel.ops.attention.mha.triton as _attention_triton_mha
 import tokenspeed_kernel.ops.attention.mla as _attention_mla_pkg
-import tokenspeed_kernel.ops.attention.mla._triton.decode as _attention_triton_mla_decode
-import tokenspeed_kernel.ops.attention.mla._triton.prefill as _attention_triton_mla_prefill
 import tokenspeed_kernel.ops.attention.mla.cuda as _attention_flash_mla
 import tokenspeed_kernel.ops.attention.mla.gluon as _attention_gluon_mla
+import tokenspeed_kernel.ops.attention.mla.triton as _attention_triton_mla
 import tokenspeed_kernel.ops.attention.rmha as _attention_rmha_pkg
 import tokenspeed_kernel.ops.attention.rmha.cuda as _attention_cuda_rmha
 import tokenspeed_kernel.ops.attention.rmha.gluon as _attention_gluon_rmha
@@ -170,16 +167,13 @@ _RELOAD_MODULES = [
     _attention_flashinfer_gdn,
     _attention_flashinfer,
     *_ATTENTION_GLUON_MODULES,
-    _attention_triton_mha_prefill,
-    _attention_triton_mha_decode,
-    _attention_triton_mla_prefill,
-    _attention_triton_mla_decode,
+    _attention_triton_mha,
+    _attention_triton_mla,
+    _attention_triton_kpool,
     _attention_triton_rel_mha,
     _attention_triton_merge_state,
-    _attention_triton_dsv4_indexer,
     _attention_triton_dsv4,
     _attention_triton_dsa,
-    _attention_triton_dsa_topk,
     _attention_triton_gdn,
     # Variant packages own public result classes imported by other test modules.
     # Reloading them would replace those class objects and break isinstance checks.

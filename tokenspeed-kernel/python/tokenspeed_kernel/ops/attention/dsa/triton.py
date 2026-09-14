@@ -575,4 +575,151 @@ def triton_dsa_prefill(
 from tokenspeed_kernel.ops.attention.dsa._triton.topk import *  # noqa: E402,F403
 from tokenspeed_kernel.ops.attention.dsa._triton.topk import (  # noqa: E402
     _topk_with_padding,
+    triton_dsa_decode_topk_fp8 as _triton_dsa_decode_topk_fp8,
+    triton_dsa_plan as _triton_dsa_plan,
+    triton_dsa_prefill_topk_fp8 as _triton_dsa_prefill_topk_fp8,
 )
+
+
+@register_kernel(
+    "attention",
+    "dsa_plan",
+    name="triton_dsa_plan",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset({format_signature()}),
+    traits={"page_size": frozenset({64})},
+    priority=Priority.PORTABLE,
+    tags={"portability"},
+)
+def triton_dsa_plan(
+    *,
+    page_size: int,
+    seq_lens_2d: torch.Tensor,
+    out: object | None = None,
+) -> torch.Tensor:
+    return _triton_dsa_plan(
+        page_size=page_size,
+        seq_lens_2d=seq_lens_2d,
+        out=out,
+    )
+
+
+_TOPK_SIGNATURES = frozenset(
+    {
+        format_signature(
+            q=dense_tensor_format(torch.bfloat16),
+            weights=dense_tensor_format(torch.float32),
+        ),
+        format_signature(
+            q=dense_tensor_format(torch.bfloat16),
+            weights=dense_tensor_format(torch.bfloat16),
+        ),
+    }
+)
+
+
+@register_kernel(
+    "attention",
+    "dsa_decode_topk",
+    name="triton_dsa_decode_topk_fp8",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=_TOPK_SIGNATURES,
+    traits={
+        "head_dim": frozenset({128}),
+        "topk": frozenset({512, 1024, 2048}),
+        "page_size": frozenset({64}),
+        "index_k_format": frozenset({"fp8_scaled"}),
+        "index_k_layout": frozenset({"packed", "page_planar"}),
+    },
+    features={"logical_offsets"},
+    priority=Priority.PORTABLE,
+    tags={"portability"},
+)
+def triton_dsa_decode_topk_fp8(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    q_len_per_req: int = 1,
+    topk_layout: str = "global_slots",
+    block_table_base_offsets: torch.Tensor | None = None,
+    index_k_cache: torch.Tensor | None = None,
+    seq_lens_2d: torch.Tensor | None = None,
+    plan: object | None = None,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _triton_dsa_decode_topk_fp8(
+        q=q,
+        weights=weights,
+        seq_lens=seq_lens,
+        block_table=block_table,
+        page_size=page_size,
+        topk=topk,
+        softmax_scale=softmax_scale,
+        q_len_per_req=q_len_per_req,
+        topk_layout=topk_layout,
+        block_table_base_offsets=block_table_base_offsets,
+        index_k_cache=index_k_cache,
+        seq_lens_2d=seq_lens_2d,
+        plan=plan,
+        out=out,
+        lens_out=lens_out,
+    )
+
+
+@register_kernel(
+    "attention",
+    "dsa_prefill_topk",
+    name="triton_dsa_prefill_topk_fp8",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=_TOPK_SIGNATURES,
+    traits={
+        "head_dim": frozenset({128}),
+        "topk": frozenset({512, 1024, 2048}),
+        "index_k_format": frozenset({"fp8_scaled"}),
+        "index_k_layout": frozenset({"packed", "page_planar"}),
+    },
+    priority=Priority.PORTABLE,
+    tags={"portability"},
+)
+def triton_dsa_prefill_topk_fp8(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    kv_workspace_slots: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    topk: int,
+    softmax_scale: float,
+    index_k_cache: torch.Tensor | None = None,
+    page_size: int | None = None,
+    index_k_fp8: torch.Tensor | None = None,
+    index_k_scale: torch.Tensor | None = None,
+    max_logits_bytes: int | None = None,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _triton_dsa_prefill_topk_fp8(
+        q=q,
+        weights=weights,
+        kv_workspace_slots=kv_workspace_slots,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        topk=topk,
+        softmax_scale=softmax_scale,
+        index_k_cache=index_k_cache,
+        page_size=page_size,
+        index_k_fp8=index_k_fp8,
+        index_k_scale=index_k_scale,
+        max_logits_bytes=max_logits_bytes,
+        out=out,
+        lens_out=lens_out,
+    )

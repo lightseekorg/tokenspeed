@@ -24,9 +24,17 @@ from __future__ import annotations
 
 import functools
 
-import tokenspeed_kernel.ops.attention.kpool._triton.cache  # noqa: F401
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.attention.kpool._triton.cache import (
+    triton_kpool_decode_append as _triton_kpool_decode_append,
+)
+from tokenspeed_kernel.ops.attention.kpool._triton.cache import (
+    triton_kpool_prefill_tail_write as _triton_kpool_prefill_tail_write,
+)
+from tokenspeed_kernel.ops.attention.kpool._triton.cache import (
+    triton_kpool_prefill_write as _triton_kpool_prefill_write,
+)
 from tokenspeed_kernel.ops.attention.kpool._triton.expand import (
     expand_kpool_to_flat_kv,
 )
@@ -52,6 +60,120 @@ _TRAITS = {
     "score_activation": frozenset({"relu", "none"}),
     "topk_layout": frozenset({"global_slots"}),
 }
+
+
+@register_kernel(
+    "attention",
+    "kpool_prefill_write",
+    name="triton_kpool_prefill_write",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {format_signature(slot_k=dense_tensor_format(torch.bfloat16))}
+    ),
+    traits={
+        "head_dim": frozenset({128}),
+        "pool_size": frozenset({2, 4, 8, 16}),
+        "index_k_format": frozenset({"fp8_scaled"}),
+        "rotate": frozenset({True}),
+    },
+    priority=Priority.PORTABLE,
+)
+def triton_kpool_prefill_write(
+    slot_k: torch.Tensor,
+    slot_score: torch.Tensor,
+    write_slots: torch.Tensor,
+    index_values: torch.Tensor,
+    index_scales: torch.Tensor,
+    ape: torch.Tensor,
+) -> None:
+    return _triton_kpool_prefill_write(
+        slot_k=slot_k,
+        slot_score=slot_score,
+        write_slots=write_slots,
+        index_values=index_values,
+        index_scales=index_scales,
+        ape=ape,
+    )
+
+
+@register_kernel(
+    "attention",
+    "kpool_prefill_tail_write",
+    name="triton_kpool_prefill_tail_write",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset({format_signature(k=dense_tensor_format(torch.bfloat16))}),
+    traits={
+        "head_dim": frozenset({128}),
+        "pool_size": frozenset({2, 4, 8, 16}),
+    },
+    priority=Priority.PORTABLE,
+)
+def triton_kpool_prefill_tail_write(
+    k: torch.Tensor,
+    gate: torch.Tensor,
+    tail_k: torch.Tensor,
+    tail_gate: torch.Tensor,
+    source_starts: torch.Tensor,
+    destination_slots: torch.Tensor,
+    destination_positions: torch.Tensor,
+    valid_counts: torch.Tensor,
+    *,
+    pool_size: int,
+) -> None:
+    return _triton_kpool_prefill_tail_write(
+        k=k,
+        gate=gate,
+        tail_k=tail_k,
+        tail_gate=tail_gate,
+        source_starts=source_starts,
+        destination_slots=destination_slots,
+        destination_positions=destination_positions,
+        valid_counts=valid_counts,
+        pool_size=pool_size,
+    )
+
+
+@register_kernel(
+    "attention",
+    "kpool_decode_append",
+    name="triton_kpool_decode_append",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset({format_signature(k=dense_tensor_format(torch.bfloat16))}),
+    traits={
+        "head_dim": frozenset({128}),
+        "pool_size": frozenset({2, 4, 8, 16}),
+        "index_k_format": frozenset({"fp8_scaled"}),
+        "rotate": frozenset({True}),
+    },
+    priority=Priority.PERFORMANT,
+)
+def triton_kpool_decode_append(
+    k: torch.Tensor,
+    gate: torch.Tensor,
+    tail_k: torch.Tensor,
+    tail_gate: torch.Tensor,
+    seq_lens: torch.Tensor,
+    request_slots: torch.Tensor,
+    index_block_table: torch.Tensor,
+    index_values: torch.Tensor,
+    index_scales: torch.Tensor,
+    ape: torch.Tensor,
+) -> None:
+    return _triton_kpool_decode_append(
+        k=k,
+        gate=gate,
+        tail_k=tail_k,
+        tail_gate=tail_gate,
+        seq_lens=seq_lens,
+        request_slots=request_slots,
+        index_block_table=index_block_table,
+        index_values=index_values,
+        index_scales=index_scales,
+        ape=ape,
+    )
 
 
 @functools.lru_cache(maxsize=1)

@@ -22,9 +22,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.platform import current_platform
 
 _is_nvidia = current_platform().is_nvidia
 
@@ -1191,19 +1189,6 @@ def dsa_prefill_topk_fp8(
     return out, lens_out
 
 
-@register_kernel(
-    "attention",
-    "dsa_plan",
-    name="triton_dsa_plan",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=frozenset({format_signature()}),
-    traits={
-        "page_size": frozenset({64}),
-    },
-    priority=Priority.PORTABLE,
-    tags={"portability"},
-)
 def triton_dsa_plan(
     *,
     page_size: int,
@@ -1214,36 +1199,6 @@ def triton_dsa_plan(
     return object() if out is None else out
 
 
-@register_kernel(
-    "attention",
-    "dsa_decode_topk",
-    name="triton_dsa_decode_topk_fp8",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=frozenset(
-        {
-            format_signature(
-                q=dense_tensor_format(torch.bfloat16),
-                weights=dense_tensor_format(torch.float32),
-            ),
-            # Raw indexer weights: the wrapper upcasts before scoring.
-            format_signature(
-                q=dense_tensor_format(torch.bfloat16),
-                weights=dense_tensor_format(torch.bfloat16),
-            ),
-        }
-    ),
-    traits={
-        "head_dim": frozenset({128}),
-        "topk": frozenset({512, 1024, 2048}),
-        "page_size": frozenset({64}),
-        "index_k_format": frozenset({"fp8_scaled"}),
-        "index_k_layout": frozenset({"packed", "page_planar"}),
-    },
-    features={"logical_offsets"},
-    priority=Priority.PORTABLE,
-    tags={"portability"},
-)
 def triton_dsa_decode_topk_fp8(
     q: torch.Tensor,
     weights: torch.Tensor,
@@ -1283,34 +1238,6 @@ def triton_dsa_decode_topk_fp8(
     )
 
 
-@register_kernel(
-    "attention",
-    "dsa_prefill_topk",
-    name="triton_dsa_prefill_topk_fp8",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=frozenset(
-        {
-            format_signature(
-                q=dense_tensor_format(torch.bfloat16),
-                weights=dense_tensor_format(torch.float32),
-            ),
-            # Raw indexer weights: the wrapper upcasts before scoring.
-            format_signature(
-                q=dense_tensor_format(torch.bfloat16),
-                weights=dense_tensor_format(torch.bfloat16),
-            ),
-        }
-    ),
-    traits={
-        "head_dim": frozenset({128}),
-        "topk": frozenset({512, 1024, 2048}),
-        "index_k_format": frozenset({"fp8_scaled"}),
-        "index_k_layout": frozenset({"packed", "page_planar"}),
-    },
-    priority=Priority.PORTABLE,
-    tags={"portability"},
-)
 def triton_dsa_prefill_topk_fp8(
     q: torch.Tensor,
     weights: torch.Tensor,

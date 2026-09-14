@@ -22,9 +22,7 @@ import math
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.platform import current_platform
 
 _MIN_BLOCK_KV = 32
 
@@ -835,24 +833,6 @@ def decode_attention_fwd(
         )
 
 
-@register_kernel(
-    "attention",
-    "mha_decode_with_kvcache",
-    name="triton_mha_decode_with_kvcache",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=format_signatures(
-        ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
-    ),
-    priority=Priority.PORTABLE,
-    traits={
-        "sliding_window": frozenset({False, True}),
-        "support_sinks": frozenset({False, True}),
-        "support_logit_cap": frozenset({False, True}),
-        "return_lse": frozenset({False}),
-    },
-    tags={"portability"},
-)
 def triton_mha_decode_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,

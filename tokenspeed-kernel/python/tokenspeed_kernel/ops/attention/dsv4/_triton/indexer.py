@@ -25,9 +25,6 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.dsa._triton.topk import triton_topk_from_logits
-from tokenspeed_kernel.platform import CapabilityRequirement
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 
 @triton.jit
@@ -275,31 +272,6 @@ def _check_base_offsets(
         )
 
 
-_SIGNATURE = format_signature(
-    q=dense_tensor_format(torch.uint8),
-    weights=dense_tensor_format(torch.float32),
-    index_k_cache=dense_tensor_format(torch.uint8),
-)
-_TRAITS = {
-    "index_heads": frozenset({32, 64}),
-    "head_dim": frozenset({128}),
-    "topk": frozenset({512, 1024, 2048}),
-    "page_size": frozenset({64}),
-    "index_k_format": frozenset({"mxfp4"}),
-}
-
-
-@register_kernel(
-    "attention",
-    "dsv4_prefill_topk",
-    name="triton_dsv4_prefill_topk_mxfp4",
-    solution="triton",
-    signatures=frozenset({_SIGNATURE}),
-    traits=_TRAITS,
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    priority=Priority.PORTABLE,
-    tags={"portability", "mxfp4", "sparse"},
-)
 def triton_dsv4_prefill_topk_mxfp4(
     index_q: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
@@ -378,17 +350,6 @@ def triton_dsv4_prefill_topk_mxfp4(
     return _select_topk(logits, topk, out, base_rows), None
 
 
-@register_kernel(
-    "attention",
-    "dsv4_decode_topk",
-    name="triton_dsv4_decode_topk_mxfp4",
-    solution="triton",
-    signatures=frozenset({_SIGNATURE}),
-    traits=_TRAITS,
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    priority=Priority.PORTABLE,
-    tags={"portability", "mxfp4", "sparse"},
-)
 def triton_dsv4_decode_topk_mxfp4(
     index_q: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
@@ -448,17 +409,6 @@ def triton_dsv4_decode_topk_mxfp4(
     return _select_topk(logits, topk, out, base_rows)
 
 
-@register_kernel(
-    "attention",
-    "dsv4_plan",
-    name="triton_dsv4_plan",
-    solution="triton",
-    signatures=frozenset({format_signature()}),
-    traits={"page_size": frozenset({64})},
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    priority=Priority.PORTABLE,
-    tags={"portability", "cuda_graph"},
-)
 def triton_dsv4_plan(
     *, page_size: int, seq_lens_2d: torch.Tensor, out: object | None
 ) -> torch.Tensor:
