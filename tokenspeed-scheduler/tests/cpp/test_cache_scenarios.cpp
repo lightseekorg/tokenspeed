@@ -2157,7 +2157,8 @@ TEST(ExtendResultEvent, AwaitingResultAbsorbsEmptyIntermediateResults) {
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
@@ -2192,7 +2193,8 @@ TEST(ExtendResultEvent, AwaitingResultCarriesForwardsInFlightIntoPrefillDone) {
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
@@ -2234,7 +2236,8 @@ TEST(RetractEvent, StampsResumePriorityFromGeneratedOutput) {
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
@@ -2245,7 +2248,7 @@ TEST(RetractEvent, StampsResumePriorityFromGeneratedOutput) {
                                                       /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
                                                       fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
-                                                      /*load_pairs=*/{}});
+                                                      /*load_pairs=*/{}, /*awaits_result=*/false});
     ASSERT_TRUE(request.Is<fsm::Prefilling>());
 
     request.Apply(
@@ -2288,7 +2291,8 @@ TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
@@ -2300,7 +2304,7 @@ TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
                                                       /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
                                                       fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
-                                                      /*load_pairs=*/{}});
+                                                      /*load_pairs=*/{}, /*awaits_result=*/false});
     request.Apply(fsm::ExtendResultEvent{{42}});
     request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1});
     request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(999, 7)});
@@ -2336,7 +2340,8 @@ TEST(RetractionHeadroom, SpendingTheWindowNeverMakesItCoverTheRemainder) {
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
@@ -2348,7 +2353,7 @@ TEST(RetractionHeadroom, SpendingTheWindowNeverMakesItCoverTheRemainder) {
                                                       /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
                                                       fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
-                                                      /*load_pairs=*/{}});
+                                                      /*load_pairs=*/{}, /*awaits_result=*/false});
     request.Apply(fsm::ExtendResultEvent{{42}});
     request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1});
     request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(4096, 7)});
@@ -2771,7 +2776,8 @@ TEST(CacheProgressTest, PromotionBoundarySurvivesPrefillRounds) {
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/6, /*granularity=*/2)};
@@ -2789,13 +2795,14 @@ TEST(CacheProgressTest, PromotionBoundarySurvivesPrefillRounds) {
                                                           .access_epoch = admission->access_epoch,
                                                           .promotion_boundary_tokens = 8,
                                                       },
-                                                      /*load_pairs=*/{}});
+                                                      /*load_pairs=*/{}, /*awaits_result=*/false});
     ASSERT_TRUE(request.Is<fsm::Prefilling>());
     EXPECT_EQ(request.CacheProgress().promotion_boundary_tokens, 8);
 
     request.Apply(fsm::SchedulePrefillEvent{
         /*tokens_this_round=*/4,
         /*reserve_num_tokens_in_next_schedule_event=*/1,
+        /*awaits_result=*/false,
     });
     ASSERT_TRUE(request.Is<fsm::Prefilling>());
     EXPECT_EQ(request.CacheProgress().promotion_boundary_tokens, 8);
@@ -2857,7 +2864,8 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
@@ -2873,7 +2881,7 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
                                                       fsm::PrefillSource::kRemote, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0,
                                                       fsm::CacheProgress{.access_epoch = admission->access_epoch},
-                                                      /*load_pairs=*/{}});
+                                                      /*load_pairs=*/{}, /*awaits_result=*/false});
     ASSERT_TRUE(request.Is<fsm::RemotePrefilling>());
 
     request.Apply(fsm::RemotePrefillDoneEvent{/*token=*/42});
@@ -2888,7 +2896,8 @@ TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) 
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, device_pool, /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
     Request request{spec, /*prefix_granularity=*/2, Role::kD};
@@ -2906,6 +2915,7 @@ TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) 
         /*hit_tokens=*/0,
         fsm::CacheProgress{.access_epoch = admission->access_epoch},
         /*load_pairs=*/{},
+        /*awaits_result=*/false,
     });
     request.Apply(fsm::RemotePrefillDoneEvent{/*token=*/42});
     request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1});
@@ -2932,6 +2942,7 @@ TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) 
         /*hit_tokens=*/0,
         fsm::CacheProgress{.access_epoch = recovery_admission->access_epoch},
         /*load_pairs=*/{},
+        /*awaits_result=*/false,
     });
     EXPECT_TRUE(request.Is<fsm::PrefillDone>());
 }
@@ -2947,7 +2958,8 @@ TEST(RetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
@@ -2963,7 +2975,7 @@ TEST(RetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
                                                       fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0,
                                                       fsm::CacheProgress{.access_epoch = admission->access_epoch},
-                                                      /*load_pairs=*/{}});
+                                                      /*load_pairs=*/{}, /*awaits_result=*/false});
     ASSERT_TRUE(request.Is<fsm::PrefillDone>());
     EXPECT_EQ(request.CacheProgress().access_epoch, admission->access_epoch);
     ASSERT_LT(pool.NumEmptyLcmBlocks(), 8);
@@ -3029,7 +3041,8 @@ TEST(EventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{1};
     ReqPoolIndex held = req_pool.Allocate();  // exhaust the single slot
     ASSERT_EQ(req_pool.AvailableSlots(), 0);
@@ -3046,7 +3059,7 @@ TEST(EventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
                                                           fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                           /*hit_tokens=*/0,
                                                           /*cache_progress=*/{},
-                                                          /*load_pairs=*/{}}),
+                                                          /*load_pairs=*/{}, /*awaits_result=*/false}),
         std::runtime_error);
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 31) << "a failed req-pool Allocate must not leak block-pool pages";
 
@@ -3069,7 +3082,8 @@ TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
     ASSERT_TRUE(AdmitForTest(coordinator, tables,

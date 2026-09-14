@@ -97,8 +97,8 @@ public:
     // Registers block_ref under key. If key already has a canonical block,
     // block_ref is replaced with a reference to that block.
     void Register(const BlockPool& pool, CacheBlockRef& block_ref, const CacheKey& key, std::uint64_t access_epoch,
-                  std::int32_t logical_block_index = -1, CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk,
-                  std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached = nullptr) {
+                  std::int32_t logical_block_index, CacheBoundaryKind boundary_kind,
+                  std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached) {
         _assert(block_ref && block_ref.IsOwnedBy(pool), "cache block must belong to the target pool");
         _assert(pool.BoundGroup(block_ref->Location().lcm_block_id) == group_id_,
                 "cache block must belong to the prefix index group");

@@ -73,7 +73,7 @@ public:
         };
     }
 
-    AcquirePlan PlanAcquire(const BlockTable& table, std::int32_t num_tokens, std::int32_t reserve_tokens = 0) const {
+    AcquirePlan PlanAcquire(const BlockTable& table, std::int32_t num_tokens, std::int32_t reserve_tokens) const {
         _assert(num_tokens >= 0 && reserve_tokens >= 0, "token demand and reserve must be non-negative");
         const std::int32_t num_blocks = BlocksNeededFor(table, num_tokens + reserve_tokens);
         return AcquirePlan{
