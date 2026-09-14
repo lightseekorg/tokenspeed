@@ -56,6 +56,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_SWA_GROUP_ID,
     v41_table_widths,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v41 import (
     DeepseekV41CachePool,
 )
@@ -181,13 +182,15 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self.forward_decode_metadata: V41Metadata | None = None
         self._decode_views_by_bs: dict[int, V41Metadata] = {}
         self._decode_buffers: V41Metadata | None = None
+        self._decode_history_status: torch.Tensor | None = None
         self._max_decode_bs = 0
         self._swa_plans: dict[ForwardMode, V41SWAQueryPlan] = {}
         self._prefill_spans: tuple[tuple[int, int, int, int], ...] = ()
         self._decode_schedule_keepalive: list[object] = []
         self._prepared_selections: dict[tuple, tuple] = {}
 
-    def set_cache_pool(self, cache_pool: DeepseekV41CachePool) -> None:
+    def validate_cache_pool(self, cache_pool: CachePool) -> None:
+        super().validate_cache_pool(cache_pool)
         if not isinstance(cache_pool, DeepseekV41CachePool):
             raise TypeError("V4.1 backend requires DeepseekV41CachePool")
         specs = {s.group_id: s for s in cache_pool.arena.cache_group_specs}
@@ -197,7 +200,20 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 specs[gid].entry_stride_tokens,
             ) != (rows, stride):
                 raise ValueError(f"V4.1 pool is missing the {gid} row geometry")
-        super().set_cache_pool(cache_pool)
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        super()._publish_cache_pool(cache_pool)
+        self.forward_metadata = None
+        self.forward_prefill_metadata = None
+        self.forward_decode_metadata = None
+        self._decode_views_by_bs.clear()
+        self._decode_buffers = None
+        self._decode_history_status = None
+        self._max_decode_bs = 0
+        self._swa_plans.clear()
+        self._prefill_spans = ()
+        self._decode_schedule_keepalive.clear()
+        self._prepared_selections.clear()
 
     def init_cuda_graph_state(
         self,
@@ -384,6 +400,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         n = metadata.positions.numel()
         if not n:
             return
+        assert self._decode_history_status is not None
         status = self._decode_history_status[:n]
         counts = self.cache_pool.arena.cache_group_page_counts
         decode_window(

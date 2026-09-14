@@ -150,6 +150,17 @@ def _backend(device, max_bs):
     return _verify_backend(device, max_bs, 1)
 
 
+def _pool(recipe, device):
+    arena = CacheArena(
+        _layout(recipe).bind(16),
+        device,
+        cache_group_specs=tuple(s for s, _ in recipe.groups()),
+        token_capacity=1024,
+        enable_memory_saver=False,
+    )
+    return DeepseekV41CachePool(arena, layer_num=40, rank=0, field_layer_offset=0)
+
+
 def _verify_backend(device, max_bs, verify_width):
     recipe = _recipe(device)
     recipe.decode_input_tokens = verify_width
@@ -166,14 +177,7 @@ def _verify_backend(device, max_bs, verify_width):
             ),
         ),
     )
-    arena = CacheArena(
-        _layout(recipe).bind(16),
-        device,
-        cache_group_specs=tuple(s for s, _ in recipe.groups()),
-        token_capacity=1024,
-        enable_memory_saver=False,
-    )
-    pool = DeepseekV41CachePool(arena, layer_num=40, rank=0, field_layer_offset=0)
+    pool = _pool(recipe, device)
     config = recipe.attn_config
     backend = DeepseekV41AttentionBackend(config, config.component(DeepseekV41Config))
     backend.set_cache_pool(pool)
@@ -181,6 +185,36 @@ def _verify_backend(device, max_bs, verify_width):
         max_bs, max_tokens_per_req=verify_width, overlap_schedule_depth=1
     )
     return backend
+
+
+def test_rebinding_cache_pool_drops_pool_derived_state():
+    backend = _backend("cpu", 2)
+    old_buffers = backend._decode_buffers
+    backend.forward_metadata = backend._decode_view(1)
+    backend.forward_prefill_metadata = backend.forward_metadata
+    backend.forward_decode_metadata = backend.forward_metadata
+    backend._swa_plans[ForwardMode.DECODE] = object()
+    backend._prefill_spans = ((0, 0, 0, 1),)
+    backend._decode_schedule_keepalive.append(torch.empty(1))
+    backend._prepared_selections[()] = ()
+
+    new_pool = _pool(_recipe("cpu"), "cpu")
+    backend.set_cache_pool(new_pool)
+
+    assert backend.cache_pool is new_pool
+    assert backend.forward_metadata is None
+    assert backend.forward_prefill_metadata is None
+    assert backend.forward_decode_metadata is None
+    assert not backend._decode_views_by_bs
+    assert backend._decode_buffers is None
+    assert backend._decode_history_status is None
+    assert backend._max_decode_bs == 0
+    assert not backend._swa_plans
+    assert not backend._prefill_spans
+    assert not backend._decode_schedule_keepalive
+    assert not backend._prepared_selections
+    backend.init_cuda_graph_state(2, max_tokens_per_req=1, overlap_schedule_depth=1)
+    assert backend._decode_buffers is not old_buffers
 
 
 def _tables(device):
