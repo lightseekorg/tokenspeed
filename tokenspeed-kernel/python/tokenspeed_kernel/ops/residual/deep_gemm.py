@@ -41,11 +41,7 @@ if platform.is_hopper_plus:
         set_pdl,
         tf32_hc_prenorm_gemm,
     )
-
-try:
     from tokenspeed_kernel.thirdparty.cuda.mhc import mhc_big_fuse
-except Exception:
-    mhc_big_fuse = None  # type: ignore[assignment]
 
 
 if platform.is_hopper_plus:
