@@ -143,7 +143,8 @@ def test_triton_ordinary_all_reduce_keeps_512_kib_limit(monkeypatch):
     assert backend.producer_direct_max_bytes == 1024 * 1024
 
 
-def test_triton_preparation_caps_only_ordinary_staging(monkeypatch):
+@pytest.mark.parametrize("enable_lamport", [False, True])
+def test_triton_preparation_caps_only_ordinary_staging(monkeypatch, enable_lamport):
     backend = TritonAllReduceBackend(Mock(), producer_direct_max_bytes=256)
     group = (0, 1)
     process_group = object()
@@ -152,6 +153,7 @@ def test_triton_preparation_caps_only_ordinary_staging(monkeypatch):
         max_bytes=1024,
         attnres_max_numel=32,
         max_token_num=4,
+        enable_lamport=enable_lamport,
     )
     create = Mock(return_value=state)
     initialize = Mock()
@@ -182,6 +184,7 @@ def test_triton_preparation_caps_only_ordinary_staging(monkeypatch):
         producer_direct_max_numel=512,
         attnres_max_numel=32,
         attnres_max_rows=4,
+        enable_lamport=enable_lamport,
         dtype=torch.bfloat16,
     )
     create.assert_called_once_with(
@@ -194,9 +197,56 @@ def test_triton_preparation_caps_only_ordinary_staging(monkeypatch):
         max_bytes=1024,
         attnres_max_numel=32,
         attnres_max_rows=4,
+        enable_lamport=enable_lamport,
     )
     initialize.assert_called_once_with(state, torch.bfloat16)
     assert backend._instances[group] is state
+
+    capacities = dict(
+        staged_max_numel=512,
+        producer_direct_max_numel=512,
+        attnres_max_numel=32,
+        attnres_max_rows=4,
+        dtype=torch.bfloat16,
+    )
+    assert backend.prepare_all_reduce_buffers(
+        group, **capacities, enable_lamport=enable_lamport
+    )
+    with pytest.raises(RuntimeError, match="different Lamport policy"):
+        backend.prepare_all_reduce_buffers(
+            group, **capacities, enable_lamport=not enable_lamport
+        )
+
+
+@pytest.mark.parametrize("enable_lamport", [False, True])
+def test_public_preparation_forwards_lamport_policy(
+    backend, monkeypatch, enable_lamport
+):
+    from tokenspeed.runtime.distributed.comm_ops import prepare_all_reduce_buffers
+
+    monkeypatch.setattr(
+        "tokenspeed.runtime.distributed.comm_backend.auto.current_platform",
+        lambda: SimpleNamespace(is_amd=True),
+    )
+    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
+    monkeypatch.setitem(global_server_args_dict, "mapping", None)
+    backend._trtllm_ar.has_trtllm_ar.return_value = False
+    backend._triton_ar.prepare_all_reduce_buffers.return_value = True
+    capacities = dict(
+        staged_max_numel=0,
+        producer_direct_max_numel=8 * 10752,
+        attnres_max_numel=0,
+        attnres_max_rows=0,
+        enable_lamport=enable_lamport,
+        dtype=torch.bfloat16,
+    )
+    group = tuple(range(8))
+
+    assert prepare_all_reduce_buffers(group, **capacities, backend=backend)
+
+    backend._triton_ar.prepare_all_reduce_buffers.assert_called_once_with(
+        group, **capacities
+    )
 
 
 def test_unprepared_group_keeps_default_producer_dispatch_limit(monkeypatch):

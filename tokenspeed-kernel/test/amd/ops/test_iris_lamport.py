@@ -21,6 +21,8 @@
 import re
 import socket
 from datetime import timedelta
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -72,6 +74,43 @@ def test_lamport_rejects_other_payloads(world, shapes, dtype):
     )
 
     assert _kimi_k3_moe_producer_direct_protocol(world, shapes, dtype) is None
+
+
+@pytest.mark.parametrize("enable_lamport", [False, True])
+@pytest.mark.parametrize("rows", [1, 6, 7])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_lamport_dispatch_requires_opt_in(monkeypatch, enable_lamport, rows, reverse):
+    from tokenspeed_kernel.ops.communication import iris as iris_ops
+
+    monkeypatch.setattr(iris_ops, "_platform", SimpleNamespace(is_cdna4=True))
+    state = iris_ops.IrisAllReduce.__new__(iris_ops.IrisAllReduce)
+    state.world_size = 8
+    state.dtype = torch.bfloat16
+    state.device = torch.device("cpu")
+    state.enable_lamport = enable_lamport
+    state._kernel_config = iris_ops.IRIS_ALL_REDUCE_KERNEL_CONFIG
+    state._elements_per_word = (
+        state._kernel_config.packed_word_bytes // state.dtype.itemsize
+    )
+    state.producer_direct_max_numel = rows * 10752
+    state._input_buf = torch.empty(rows * 10752, dtype=state.dtype)
+    state._reduced_output_buf = torch.empty_like(state._input_buf)
+    state._all_reduce_symmetric_lamport = Mock()
+    state._all_reduce_symmetric_pull = Mock()
+    shapes = ((rows, 3584), (rows, 7168))
+    if reverse:
+        shapes = shapes[::-1]
+    inputs = iris_ops.iris_acquire_outputs(state, shapes)
+
+    outputs = iris_ops.iris_all_reduce_symmetric(state, inputs)
+
+    assert tuple(tuple(tensor.shape) for tensor in outputs) == shapes
+    if enable_lamport and rows <= 6:
+        state._all_reduce_symmetric_lamport.assert_called_once_with(rows * 10752)
+        state._all_reduce_symmetric_pull.assert_not_called()
+    else:
+        state._all_reduce_symmetric_pull.assert_called_once_with(rows * 10752)
+        state._all_reduce_symmetric_lamport.assert_not_called()
 
 
 @pytest.mark.parametrize("rank", range(8))
@@ -140,6 +179,7 @@ def _new_state(rank, device, capacity, dtype):
     from tokenspeed_kernel.ops.communication.iris import create_iris_state
 
     return create_iris_state(
+        enable_lamport=True,
         group=dist.group.WORLD,
         rank_in_group=rank,
         staged_max_numel=0,
