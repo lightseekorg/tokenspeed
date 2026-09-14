@@ -2151,7 +2151,7 @@ TEST(RetractEvent, StampsResumePriorityFromGeneratedOutput) {
                                                       /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
                                                       fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
-                                                      /*load_pairs=*/{}});
+                                                      /*load_pairs=*/{}, /*awaits_result=*/false});
     ASSERT_TRUE(request.Is<fsm::Prefilling>());
 
     request.Apply(
@@ -2207,7 +2207,7 @@ TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
                                                       /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
                                                       fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
-                                                      /*load_pairs=*/{}});
+                                                      /*load_pairs=*/{}, /*awaits_result=*/false});
     request.Apply(fsm::ExtendResultEvent{{42}});
     request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, request.CacheProgress()});
     request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(999, 7)});
@@ -2256,7 +2256,7 @@ TEST(RetractionHeadroom, SpendingTheWindowNeverMakesItCoverTheRemainder) {
                                                       /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
                                                       fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
-                                                      /*load_pairs=*/{}});
+                                                      /*load_pairs=*/{}, /*awaits_result=*/false});
     request.Apply(fsm::ExtendResultEvent{{42}});
     request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, request.CacheProgress()});
     request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(4096, 7)});
@@ -2698,7 +2698,7 @@ TEST(CacheProgressTest, PromotionBoundarySurvivesPrefillRounds) {
                                                           .access_epoch = admission->access_epoch,
                                                           .promotion_boundary_tokens = 8,
                                                       },
-                                                      /*load_pairs=*/{}});
+                                                      /*load_pairs=*/{}, /*awaits_result=*/false});
     ASSERT_TRUE(request.Is<fsm::Prefilling>());
     EXPECT_EQ(request.CacheProgress().promotion_boundary_tokens, 8);
 
@@ -2706,6 +2706,7 @@ TEST(CacheProgressTest, PromotionBoundarySurvivesPrefillRounds) {
         /*tokens_this_round=*/4,
         /*reserve_num_tokens_in_next_schedule_event=*/1,
         request.CacheProgress(),
+        /*awaits_result=*/false,
     });
     ASSERT_TRUE(request.Is<fsm::Prefilling>());
     EXPECT_EQ(request.CacheProgress().promotion_boundary_tokens, 8);
@@ -2784,7 +2785,7 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
                                                       fsm::PrefillSource::kRemote, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0,
                                                       fsm::CacheProgress{.access_epoch = admission->access_epoch},
-                                                      /*load_pairs=*/{}});
+                                                      /*load_pairs=*/{}, /*awaits_result=*/false});
     ASSERT_TRUE(request.Is<fsm::RemotePrefilling>());
 
     request.Apply(fsm::RemotePrefillDoneEvent{/*token=*/42});
@@ -2818,6 +2819,7 @@ TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) 
         /*hit_tokens=*/0,
         fsm::CacheProgress{.access_epoch = admission->access_epoch},
         /*load_pairs=*/{},
+        /*awaits_result=*/false,
     });
     request.Apply(fsm::RemotePrefillDoneEvent{/*token=*/42});
     request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, request.CacheProgress()});
@@ -2844,6 +2846,7 @@ TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) 
         /*hit_tokens=*/0,
         fsm::CacheProgress{.access_epoch = recovery_admission->access_epoch},
         /*load_pairs=*/{},
+        /*awaits_result=*/false,
     });
     EXPECT_TRUE(request.Is<fsm::PrefillDone>());
 }
@@ -2876,7 +2879,7 @@ TEST(RetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
                                                       fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0,
                                                       fsm::CacheProgress{.access_epoch = admission->access_epoch},
-                                                      /*load_pairs=*/{}});
+                                                      /*load_pairs=*/{}, /*awaits_result=*/false});
     ASSERT_TRUE(request.Is<fsm::PrefillDone>());
     EXPECT_EQ(request.CacheProgress().access_epoch, admission->access_epoch);
     ASSERT_LT(pool.NumEmptyLcmBlocks(), 8);
@@ -2999,7 +3002,7 @@ TEST(EventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
                                                           fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                           /*hit_tokens=*/0,
                                                           /*cache_progress=*/{},
-                                                          /*load_pairs=*/{}}),
+                                                          /*load_pairs=*/{}, /*awaits_result=*/false}),
         std::runtime_error);
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 31) << "a failed req-pool Allocate must not leak block-pool pages";
 

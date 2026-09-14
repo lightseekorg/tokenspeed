@@ -119,12 +119,13 @@ public:
     }
 
     void RegisterCachedBlock(BlockPool& pool, CacheBlockRef& block, const CacheKey& key) {
-        index_.Register(pool, block, key, ++next_access_epoch_);
+        index_.Register(pool, block, key, ++next_access_epoch_, /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                        /*newly_cached=*/nullptr);
     }
     void RegisterCachedBlock(BlockPool& pool, CacheBlockRef& block, const CacheKey& key, std::uint64_t access_epoch,
                              std::int32_t logical_block_index = -1,
                              CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk) {
-        index_.Register(pool, block, key, access_epoch, logical_block_index, boundary_kind);
+        index_.Register(pool, block, key, access_epoch, logical_block_index, boundary_kind, /*newly_cached=*/nullptr);
     }
     void CacheFullBlocks(BlockPool& pool, BlockTable& table, std::span<const CacheKey> keys,
                          std::int32_t first_slot = 0) {
@@ -145,7 +146,11 @@ public:
     }
     std::int32_t NumCachedBlocks(const BlockPool& pool) const { return index_.NumEntries(pool); }
     std::vector<CacheBlockLocation> EvictableBlockLocations(const BlockPool& pool) const {
-        return index_.EvictableLocations(pool);
+        std::vector<CacheBlockLocation> locations;
+        for (const PrefixCacheIndex::EvictionCandidate& candidate : index_.EvictableCandidates(pool)) {
+            locations.push_back(candidate.location);
+        }
+        return locations;
     }
     std::optional<PrefixCacheIndex::CachedBlockMetadata> CachedBlockMetadataFor(const BlockPool& pool,
                                                                                 CacheBlockLocation location) const {

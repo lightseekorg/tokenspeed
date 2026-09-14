@@ -183,6 +183,10 @@ class Qwen3_5BaseTextConfig(PretrainedConfig):
 
     model_type = "qwen3_5_text_base"
     keys_to_ignore_at_inference = ["past_key_values"]
+    ignore_keys_at_rope_validation = {
+        "mrope_section",
+        "mrope_interleaved",
+    }
 
     def __init__(
         self,

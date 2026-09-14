@@ -36,6 +36,7 @@ import inspect
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 
 import pytest
 import tokenspeed_kernel
@@ -43,7 +44,6 @@ import tokenspeed_kernel.numerics.reference.gemm as _gemm_reference
 import tokenspeed_kernel.ops.attention as _attention_pkg
 import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
 import tokenspeed_kernel.ops.attention.dsa as _attention_dsa_pkg
-import tokenspeed_kernel.ops.attention.dsa._triton.topk as _attention_triton_dsa_topk
 import tokenspeed_kernel.ops.attention.dsa.cuda as _attention_cuda_dsa
 import tokenspeed_kernel.ops.attention.dsa.deep_gemm as _attention_deep_gemm_dsa
 import tokenspeed_kernel.ops.attention.dsa.flashinfer as _attention_flashinfer_dsa
@@ -57,17 +57,16 @@ import tokenspeed_kernel.ops.attention.gdn.flashinfer as _attention_flashinfer_g
 import tokenspeed_kernel.ops.attention.kda as _attention_kda_pkg
 import tokenspeed_kernel.ops.attention.kda.gluon as _attention_gluon_kda
 import tokenspeed_kernel.ops.attention.kpool.deep_gemm as _attention_deep_gemm_kpool
+import tokenspeed_kernel.ops.attention.kpool.triton as _attention_triton_kpool
 import tokenspeed_kernel.ops.attention.mha as _attention_mha_pkg
-import tokenspeed_kernel.ops.attention.mha._triton.decode as _attention_triton_mha_decode
-import tokenspeed_kernel.ops.attention.mha._triton.prefill as _attention_triton_mha_prefill
 import tokenspeed_kernel.ops.attention.mha.cuda as _attention_flash_attn
 import tokenspeed_kernel.ops.attention.mha.flashinfer as _attention_flashinfer
 import tokenspeed_kernel.ops.attention.mha.gluon as _attention_gluon_mha
+import tokenspeed_kernel.ops.attention.mha.triton as _attention_triton_mha
 import tokenspeed_kernel.ops.attention.mla as _attention_mla_pkg
-import tokenspeed_kernel.ops.attention.mla._triton.decode as _attention_triton_mla_decode
-import tokenspeed_kernel.ops.attention.mla._triton.prefill as _attention_triton_mla_prefill
 import tokenspeed_kernel.ops.attention.mla.cuda as _attention_flash_mla
 import tokenspeed_kernel.ops.attention.mla.gluon as _attention_gluon_mla
+import tokenspeed_kernel.ops.attention.mla.triton as _attention_triton_mla
 import tokenspeed_kernel.ops.attention.rmha as _attention_rmha_pkg
 import tokenspeed_kernel.ops.attention.rmha.cuda as _attention_cuda_rmha
 import tokenspeed_kernel.ops.attention.rmha.gluon as _attention_gluon_rmha
@@ -91,6 +90,7 @@ import tokenspeed_kernel.ops.moe.latent_decode as _moe_latent_decode
 import tokenspeed_kernel.ops.moe.sigmoid_topk as _moe_sigmoid_topk
 import tokenspeed_kernel.ops.moe.softmax_topk as _moe_softmax_topk
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
+import tokenspeed_kernel.ops.moe.triton.dsv4 as _moe_triton_dsv4
 import tokenspeed_kernel.ops.moe.triton.softmax_topk as _moe_triton_softmax_topk
 import tokenspeed_kernel.ops.quantization as _quantization_pkg
 import tokenspeed_kernel.ops.quantization.flashinfer as _quantization_flashinfer
@@ -167,15 +167,13 @@ _RELOAD_MODULES = [
     _attention_flashinfer_gdn,
     _attention_flashinfer,
     *_ATTENTION_GLUON_MODULES,
-    _attention_triton_mha_prefill,
-    _attention_triton_mha_decode,
-    _attention_triton_mla_prefill,
-    _attention_triton_mla_decode,
+    _attention_triton_mha,
+    _attention_triton_mla,
+    _attention_triton_kpool,
     _attention_triton_rel_mha,
     _attention_triton_merge_state,
     _attention_triton_dsv4,
     _attention_triton_dsa,
-    _attention_triton_dsa_topk,
     _attention_triton_gdn,
     # Variant packages own public result classes imported by other test modules.
     # Reloading them would replace those class objects and break isinstance checks.
@@ -219,6 +217,7 @@ _RELOAD_MODULES = [
     _moe_gluon,
     _moe_triton_bf16,
     _moe_triton_decode_sigmoid_topk,
+    _moe_triton_dsv4,
     _moe_triton_mxfp4,
     _moe_triton_softmax_topk,
     _moe_triton,
@@ -402,6 +401,13 @@ def _is_hopper_plus_with_flashmla(platform: PlatformInfo) -> bool:
     return (
         _is_hopper_plus(platform)
         and _attention_flash_mla.flash_mla_with_kvcache is not error_fn
+    )
+
+
+def _is_hopper_plus_with_flashmla_prefill(platform: PlatformInfo) -> bool:
+    return (
+        _is_hopper_plus(platform)
+        and _attention_cuda_dsv4.flash_mla_sparse_fwd is not error_fn
     )
 
 
@@ -1389,12 +1395,12 @@ def _attention_dsa_decode() -> object:
     )
 
 
-def _attention_dsv4_selected(width: int = 640) -> object:
-    q = torch.empty((1, 16, 512), dtype=torch.bfloat16)
+def _attention_dsv4_selected(width: int, heads: int) -> object:
+    q = torch.empty((1, heads, 512), dtype=torch.bfloat16)
     kv = torch.empty((width, 512), dtype=torch.bfloat16)
     indices = torch.arange(width, dtype=torch.int32).unsqueeze(0)
     lens = torch.tensor([width], dtype=torch.int32)
-    attn_sink = torch.empty((16,), dtype=torch.float32)
+    attn_sink = torch.empty((heads,), dtype=torch.float32)
     return _attention_dsv4_pkg.dsv4_prefill(
         q,
         kv,
@@ -1406,23 +1412,11 @@ def _attention_dsv4_selected(width: int = 640) -> object:
 
 
 def _attention_dsv4_selected_short() -> object:
-    return _attention_dsv4_selected(128)
+    return _attention_dsv4_selected(128, 16)
 
 
 def _attention_dsv4_selected_h64() -> object:
-    q = torch.empty((1, 64, 512), dtype=torch.bfloat16)
-    kv = torch.empty((640, 512), dtype=torch.bfloat16)
-    indices = torch.arange(640, dtype=torch.int32).unsqueeze(0)
-    lens = torch.tensor([640], dtype=torch.int32)
-    attn_sink = torch.empty((64,), dtype=torch.float32)
-    return _attention_dsv4_pkg.dsv4_prefill(
-        q,
-        kv,
-        indices,
-        lens,
-        attn_sink,
-        512**-0.5,
-    )
+    return _attention_dsv4_selected(640, 64)
 
 
 def _attention_dsv4_selected_i64() -> object:
@@ -1438,12 +1432,12 @@ def _attention_dsv4_selected_i64() -> object:
     )
 
 
-def _attention_dsv4_paged_selected(with_extra: bool = True) -> object:
-    q = torch.empty((2, 16, 512), dtype=torch.bfloat16)
+def _attention_dsv4_paged_selected(with_extra: bool, heads: int) -> object:
+    q = torch.empty((2, heads, 512), dtype=torch.bfloat16)
     swa_cache = torch.empty((2, 64 * 584), dtype=torch.uint8)
     swa_slots = torch.empty((2, 256), dtype=torch.int32)
     swa_lens = torch.empty((2,), dtype=torch.int32)
-    attn_sink = torch.empty((16,), dtype=torch.float32)
+    attn_sink = torch.empty((heads,), dtype=torch.float32)
     kwargs = {}
     if with_extra:
         kwargs = {
@@ -1465,7 +1459,7 @@ def _attention_dsv4_paged_selected(with_extra: bool = True) -> object:
 
 
 def _attention_dsv4_paged_selected_swa_only() -> object:
-    return _attention_dsv4_paged_selected(with_extra=False)
+    return _attention_dsv4_paged_selected(with_extra=False, heads=16)
 
 
 def _attention_dsv4_paged_selected_pro_tp8() -> object:
@@ -1832,6 +1826,59 @@ def _attention_dsa_prefill_fp8_packed_rank512() -> object:
         qk_rope_head_dim=64,
         softmax_scale=1.0,
         page_size=64,
+    )
+
+
+def _attention_dsv4_prefill_topk_mxfp4() -> object:
+    """Exercise public MXFP4 prefill selection with packed 128-wide queries."""
+    index_q = (
+        torch.empty((2, 64, 64), dtype=torch.uint8),
+        torch.empty((2, 64), dtype=torch.int32),
+    )
+    return _attention_dsv4_pkg.dsv4_prefill_topk(
+        index_q,
+        torch.empty((2, 64), dtype=torch.float32),
+        torch.empty((2, 64 * 68), dtype=torch.uint8),
+        torch.tensor([[0], [1]], dtype=torch.int32),
+        torch.tensor([0, 64, 128], dtype=torch.int32),
+        torch.tensor([0, 64], dtype=torch.int32),
+        torch.tensor([64, 128], dtype=torch.int32),
+        torch.tensor([64, 64], dtype=torch.int32),
+        page_size=64,
+        topk=512,
+        max_seqlen_k=64,
+        index_k_format="mxfp4",
+        block_table_base_offsets=None,
+        gathered_k=None,
+        gather_workspace=None,
+        out=None,
+        override=None,
+        solution=None,
+    )
+
+
+def _attention_dsv4_decode_topk_mxfp4() -> object:
+    """Exercise public MXFP4 decode selection without executing a kernel."""
+    index_q = (
+        torch.empty((2, 64, 64), dtype=torch.uint8),
+        torch.empty((2, 64), dtype=torch.int32),
+    )
+    return _attention_dsv4_pkg.dsv4_decode_topk(
+        index_q,
+        torch.empty((2, 64), dtype=torch.float32),
+        torch.empty((2, 64 * 68), dtype=torch.uint8),
+        torch.tensor([[64], [64]], dtype=torch.int32),
+        torch.tensor([[0], [1]], dtype=torch.int32),
+        page_size=64,
+        topk=512,
+        max_context_len=64,
+        plan=None,
+        index_k_format="mxfp4",
+        block_table_base_offsets=None,
+        out=None,
+        persistent_topk_workspace=None,
+        override=None,
+        solution=None,
     )
 
 
@@ -3251,15 +3298,20 @@ def _moe_apply_unquant_trtllm() -> object:
     )
 
 
-def _dsv4_select_experts_bias() -> object:
-    router_logits = torch.empty((2, 256), dtype=torch.float32)
+def _dsv4_select_experts_bias(tokens: int) -> object:
+    """Exercise bias-router selection across specialized and portable batches."""
+    router_logits = torch.empty((tokens, 256), dtype=torch.float32)
     correction_bias = torch.empty((256,), dtype=torch.float32)
     return tokenspeed_kernel.dsv4_select_experts(
         router_logits,
         6,
         True,
         correction_bias=correction_bias,
+        hash_indices_table=None,
+        input_ids=None,
         need_scores=False,
+        override=None,
+        solution=None,
     )
 
 
@@ -3693,14 +3745,75 @@ def _case(
 _CASES = [
     # Attention API x architecture golden cases.
     _case(
-        _is_hopper_plus_with_flashmla,
-        "hopper-plus",
+        _is_cdna4,
+        "cdna4",
         "attention",
-        "dsv4_decode",
-        "flashmla_dsv4_decode",
-        _attention_dsv4_paged_selected,
-        id_suffix="extra-segment",
+        "dsv4_prefill_topk",
+        "gluon_dsv4_prefill_topk_mxfp4_gfx950",
+        _attention_dsv4_prefill_topk_mxfp4,
+        id_suffix="mxfp4",
     ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsv4_decode_topk",
+        "gluon_dsv4_decode_topk_mxfp4_gfx950",
+        _attention_dsv4_decode_topk_mxfp4,
+        id_suffix="mxfp4",
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsv4_prefill_topk",
+        "triton_dsv4_prefill_topk_mxfp4",
+        _attention_dsv4_prefill_topk_mxfp4,
+        id_suffix="mxfp4",
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsv4_decode_topk",
+        "triton_dsv4_decode_topk_mxfp4",
+        _attention_dsv4_decode_topk_mxfp4,
+        id_suffix="mxfp4",
+    ),
+    *[
+        _case(
+            _is_hopper_plus_with_flashmla_prefill,
+            "hopper-plus",
+            "attention",
+            "dsv4_prefill",
+            f"{solution}_dsv4_prefill",
+            partial(_attention_dsv4_selected, width=640, heads=heads),
+            id_suffix=f"heads{heads}",
+        )
+        for heads, solution in (
+            (16, "triton"),
+            (32, "triton"),
+            (64, "flashmla"),
+            (128, "flashmla"),
+        )
+    ],
+    *[
+        _case(
+            _is_hopper_plus_with_flashmla,
+            "hopper-plus",
+            "attention",
+            "dsv4_decode",
+            f"{solution}_dsv4_decode",
+            partial(_attention_dsv4_paged_selected, with_extra=True, heads=heads),
+            id_suffix=f"extra-segment-heads{heads}",
+        )
+        for heads, solution in (
+            (16, "triton"),
+            (32, "triton"),
+            (64, "flashmla"),
+            (128, "flashmla"),
+        )
+    ],
     _case(
         _is_hopper,
         "hopper",
@@ -3829,7 +3942,7 @@ _CASES = [
         "attention",
         "dsv4_decode",
         "triton_dsv4_decode",
-        _attention_dsv4_paged_selected,
+        partial(_attention_dsv4_paged_selected, with_extra=True, heads=16),
         id_suffix="extra-segment",
     ),
     _case(
@@ -3847,7 +3960,7 @@ _CASES = [
         "attention",
         "dsv4_prefill",
         "gluon_dsv4_prefill_gfx950",
-        _attention_dsv4_selected,
+        partial(_attention_dsv4_selected, width=640, heads=16),
         id_suffix="width640",
     ),
     _case(
@@ -4542,13 +4655,34 @@ _CASES = [
         _sampling_argmax,
     ),
     # MoE API x architecture golden cases.
+    *[
+        _case(
+            _is_cdna5,
+            "cdna5",
+            "moe",
+            "dsv4_select_experts",
+            "triton_dsv4_select_experts",
+            partial(_dsv4_select_experts_bias, tokens=tokens),
+            id_suffix=f"bias-tokens{tokens}",
+        )
+        for tokens in (1, 2, 17)
+    ],
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "moe",
+        "dsv4_select_experts",
+        "triton_dsv4_select_experts",
+        _dsv4_select_experts_hash,
+        id_suffix="hash",
+    ),
     _case(
         _is_hopper_plus,
         "hopper-plus",
         "moe",
         "dsv4_select_experts",
         "cuda_dsv4_select_experts",
-        _dsv4_select_experts_bias,
+        partial(_dsv4_select_experts_bias, tokens=2),
         id_suffix="bias",
     ),
     _case(
@@ -4560,14 +4694,22 @@ _CASES = [
         _dsv4_select_experts_hash,
         id_suffix="hash",
     ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "moe",
-        "dsv4_select_experts",
-        "gluon_dsv4_select_experts_gfx950",
-        _dsv4_select_experts_bias,
-    ),
+    *[
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "moe",
+            "dsv4_select_experts",
+            expected,
+            partial(_dsv4_select_experts_bias, tokens=tokens),
+            id_suffix=f"bias-tokens{tokens}",
+        )
+        for tokens, expected in (
+            (1, "gluon_dsv4_select_experts_gfx950"),
+            (2, "gluon_dsv4_select_experts_gfx950"),
+            (17, "triton_dsv4_select_experts"),
+        )
+    ],
     _case(
         _is_hopper,
         "hopper",
@@ -4757,6 +4899,16 @@ def selected_kernel_spy(monkeypatch):
                 )
             if case.mode == "dsa_plan":
                 return torch.empty((1, 4), dtype=torch.int32)
+            if case.mode in {"dsv4_prefill_topk", "dsv4_decode_topk"}:
+                q_values, _ = kwargs["index_q"]
+                indices = torch.empty(
+                    (q_values.shape[0], kwargs["topk"]),
+                    dtype=torch.int32,
+                    device=q_values.device,
+                )
+                if case.mode == "dsv4_prefill_topk":
+                    return indices, None
+                return indices
             if case.mode in {
                 "mla_decode_projected_value",
                 "mla_normalize_project_query",

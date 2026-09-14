@@ -22,9 +22,6 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 
 @triton.jit
@@ -139,24 +136,7 @@ def _kpool_prefill_write_kernel(
     tl.store(index_scales_ptr + scale_base, scale, mask=valid)
 
 
-@register_kernel(
-    "attention",
-    "kpool_prefill_write",
-    name="triton_kpool_prefill_write",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=frozenset(
-        {format_signature(slot_k=dense_tensor_format(torch.bfloat16))}
-    ),
-    traits={
-        "head_dim": frozenset({128}),
-        "pool_size": frozenset({2, 4, 8, 16}),
-        "index_k_format": frozenset({"fp8_scaled"}),
-        "rotate": frozenset({True}),
-    },
-    priority=Priority.PORTABLE,
-)
-def triton_kpool_prefill_write(
+def _triton_kpool_prefill_write_impl(
     slot_k: torch.Tensor,
     slot_score: torch.Tensor,
     write_slots: torch.Tensor,
@@ -296,20 +276,7 @@ def _kpool_prefill_tail_write_kernel(
         )
 
 
-@register_kernel(
-    "attention",
-    "kpool_prefill_tail_write",
-    name="triton_kpool_prefill_tail_write",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=frozenset({format_signature(k=dense_tensor_format(torch.bfloat16))}),
-    traits={
-        "head_dim": frozenset({128}),
-        "pool_size": frozenset({2, 4, 8, 16}),
-    },
-    priority=Priority.PORTABLE,
-)
-def triton_kpool_prefill_tail_write(
+def _triton_kpool_prefill_tail_write_impl(
     k: torch.Tensor,
     gate: torch.Tensor,
     tail_k: torch.Tensor,
@@ -565,22 +532,7 @@ def _kpool_decode_append_kernel(
             tl.store(index_scales_ptr + scale_base, scale, mask=index_page_valid)
 
 
-@register_kernel(
-    "attention",
-    "kpool_decode_append",
-    name="triton_kpool_decode_append",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=frozenset({format_signature(k=dense_tensor_format(torch.bfloat16))}),
-    traits={
-        "head_dim": frozenset({128}),
-        "pool_size": frozenset({2, 4, 8, 16}),
-        "index_k_format": frozenset({"fp8_scaled"}),
-        "rotate": frozenset({True}),
-    },
-    priority=Priority.PERFORMANT,
-)
-def triton_kpool_decode_append(
+def _triton_kpool_decode_append_impl(
     k: torch.Tensor,
     gate: torch.Tensor,
     tail_k: torch.Tensor,
@@ -679,10 +631,3 @@ def triton_kpool_decode_append(
         num_warps=4,
         num_stages=1,
     )
-
-
-__all__ = [
-    "triton_kpool_decode_append",
-    "triton_kpool_prefill_tail_write",
-    "triton_kpool_prefill_write",
-]

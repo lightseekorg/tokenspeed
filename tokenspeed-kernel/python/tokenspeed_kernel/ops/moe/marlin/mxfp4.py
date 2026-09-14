@@ -264,7 +264,8 @@ def marlin_mxfp4_precomputed_moe_apply(
         size_k=hidden,
     ).view(-1, gemm1_n)
 
-    beta = float(getattr(w, "activation_situ_beta", 1.0))
+    beta_attr = getattr(w, "activation_situ_beta", None)
+    beta = 1.0 if beta_attr is None else float(beta_attr)
     linear_beta = getattr(w, "activation_situ_linear_beta", None)
     if activation == "situ":
         intermediate2 = situ_and_mul(

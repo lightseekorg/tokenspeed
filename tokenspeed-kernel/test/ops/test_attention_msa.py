@@ -1006,3 +1006,89 @@ def test_fmha_prefill_score_gates() -> None:
     assert not prefill_score_supported(
         index_q, pages.to(torch.float8_e4m3fn), 16, 256, [8], [32000]
     )
+
+
+@requires_cuda
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_msa_sparse_kernels_skip_padded_selected_blocks(phase: str) -> None:
+    """The indexer pads slots it cannot fill with -1. The sparse kernels must
+    skip those slots instead of indexing the page table with -1: that reads
+    the previous row's last entry (or before the table), then a wrong page.
+    Request 0 is a decoy whose row points at a poisoned page (values 100.0),
+    so an unmasked -1 in request 1 drags its output towards 100.
+    """
+    torch.manual_seed(20260913)
+    prefill_len = 300
+    num_blocks = math.ceil(prefill_len / _BLOCK_SIZE)
+    poison_page = num_blocks + 1
+    key_cache = torch.randn(
+        poison_page + 1, 1, _BLOCK_SIZE, _HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    )
+    value_cache = torch.randn_like(key_cache)
+    key_cache[poison_page] = 0.0
+    value_cache[poison_page] = 100.0
+    block_table = torch.stack(
+        [
+            torch.full((num_blocks,), poison_page, dtype=torch.int32, device="cuda"),
+            torch.arange(1, num_blocks + 1, dtype=torch.int32, device="cuda"),
+        ]
+    )
+    if phase == "prefill":
+        # Request 0: one token over its poisoned block. Request 1: the real one.
+        positions = [0] + list(range(prefill_len))
+        cu_seqlens = torch.tensor(
+            [0, 1, 1 + prefill_len], dtype=torch.int32, device="cuda"
+        )
+        seq_lens = torch.tensor([1, prefill_len], dtype=torch.int32, device="cuda")
+    else:
+        positions = [0, prefill_len - 1]
+        seq_lens = torch.tensor([1, prefill_len], dtype=torch.int32, device="cuda")
+    query = torch.randn(
+        len(positions), 16, _HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    )
+    selected = torch.full(
+        (len(positions), 1, _TOPK), -1, dtype=torch.int32, device="cuda"
+    )
+    for row, position in enumerate(positions):
+        selected[row, 0, 0] = position // _BLOCK_SIZE  # own block only
+    if phase == "prefill":
+        selected[1 + 129 :, 0, 1] = 0  # a second valid block for some rows ...
+        selected[1 + 200 :, 0, 1] = -1  # ... and a padded slot inside the visible range
+        checked = (1 + 129, 1 + 200, len(positions) - 1)
+        output = minimax_sparse_attention(
+            query,
+            key_cache,
+            value_cache,
+            selected,
+            block_table,
+            seq_lens,
+            scale=_HEAD_DIM**-0.5,
+            cu_seqlens_q=cu_seqlens,
+            prefix_lens=torch.zeros(2, dtype=torch.int32, device="cuda"),
+            max_query_len=prefill_len,
+        )
+    else:
+        checked = (1,)  # slot 1 of request 1 is -1 with 3 visible blocks
+        output = minimax_sparse_attention(
+            query,
+            key_cache,
+            value_cache,
+            selected,
+            block_table,
+            seq_lens,
+            scale=_HEAD_DIM**-0.5,
+            decode_query_len=1,
+        )
+    torch.cuda.synchronize()
+    assert torch.isfinite(output.float()).all()
+    for row in checked:
+        blocks = selected[row, 0]
+        expected = _reference_sparse_attention(
+            query[row],
+            key_cache,
+            value_cache,
+            blocks[blocks >= 0],
+            block_table[1],
+            positions[row],
+        )
+        torch.testing.assert_close(output[row].float(), expected, atol=2e-2, rtol=2e-2)

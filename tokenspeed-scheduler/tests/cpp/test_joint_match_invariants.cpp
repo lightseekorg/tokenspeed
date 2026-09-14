@@ -69,7 +69,10 @@ std::int32_t CacheBlockFor(CacheCoordinator& coordinator, BlockPool& pool, const
         return -1;
     }
     const std::int32_t id = block_ref->Location().lcm_block_id;
-    coordinator.GroupPrefixIndex(group_index).Register(pool, block_ref, KeyFor(content_hash, group_id), ++g_epoch);
+    coordinator.GroupPrefixIndex(group_index)
+        .Register(pool, block_ref, KeyFor(content_hash, group_id), ++g_epoch, /*logical_block_index=*/-1,
+                  CacheBoundaryKind::kChunk,
+                  /*newly_cached=*/nullptr);
     block_ref.reset();
     return id;
 }
@@ -116,7 +119,6 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
             CacheCoordinator coordinator =
                 MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                 /*stream_device_cache_to_host=*/false);
-
             // Random per-group caching: each group caches a random prefix
             // subset of the request's blocks (front-truncated to mimic the
             // sliding group's reclaim of slid-out blocks).

@@ -106,6 +106,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
 
     add_executable(tokenspeed_scheduler_tests
         tests/cpp/test_prefix_hasher.cpp
+        tests/cpp/test_prefix_index.cpp
         tests/cpp/test_block_pool.cpp
         tests/cpp/test_cache_block_ref.cpp
         tests/cpp/test_full_attn_group.cpp
@@ -138,4 +139,21 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
 
     include(GoogleTest)
     gtest_discover_tests(tokenspeed_scheduler_tests)
+
+    # Not registered with CTest: it reports timings on stdout rather than
+    # asserting, so it is built on demand and read by a human.
+    add_executable(tokenspeed_scheduler_cache_scan_benchmark
+        tests/cpp/benchmark_cache_scans.cpp
+    )
+
+    target_link_libraries(tokenspeed_scheduler_cache_scan_benchmark
+        PRIVATE
+            tokenspeed_scheduler_core
+    )
+
+    target_include_directories(tokenspeed_scheduler_cache_scan_benchmark
+        PRIVATE
+            csrc
+            tests/cpp
+    )
 endif()

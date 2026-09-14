@@ -69,7 +69,7 @@ class Qwen3_5ConfigTests(unittest.TestCase):
             config.text_config.num_attention_heads,
         )
 
-    def test_mrope_extensions_do_not_leak_to_transformers_rope_validation(
+    def test_mrope_extensions_survive_rope_validation_and_round_trip(
         self,
     ) -> None:
         rope_parameters = {
@@ -82,9 +82,13 @@ class Qwen3_5ConfigTests(unittest.TestCase):
             config = Qwen3_5MoeTextConfig(rope_parameters=rope_parameters)
 
         self.assertEqual(config.rope_parameters["rope_type"], "default")
-        self.assertNotIn("mrope_section", config.rope_parameters)
-        self.assertNotIn("mrope_interleaved", config.rope_parameters)
-        self.assertEqual(get_rope_parameters(config), rope_parameters)
+        self.assertIn("mrope_section", config.rope_parameters)
+        self.assertIn("mrope_interleaved", config.rope_parameters)
+        self.assertEqual(get_rope_parameters(config)["mrope_section"], [16, 24, 24])
+
+        round_tripped = Qwen3_5MoeTextConfig(**config.to_dict())
+        self.assertIn("mrope_section", round_tripped.rope_parameters)
+        self.assertIn("mrope_interleaved", round_tripped.rope_parameters)
 
 
 class ConfigDtypeTests(unittest.TestCase):

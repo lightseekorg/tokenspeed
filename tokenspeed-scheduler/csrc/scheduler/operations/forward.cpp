@@ -461,7 +461,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         // retries after Free(tables), and that helper would leave discarded
         // new_page_ids in plan.pages_to_zero.
         CacheCoordinator::PrefixProbe probe_for_admit = match.probe;
-        admission = coordinator_.Admit(std::move(probe_for_admit), demands);
+        admission = coordinator_.Admit(std::move(probe_for_admit), demands,
+                                       /*request_access_epoch=*/std::nullopt);
         if (!admission) {
             feedback.admission_failed = true;
             discardUncachedKvEventPages(event_keys);

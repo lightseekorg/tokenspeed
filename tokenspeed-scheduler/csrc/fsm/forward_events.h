@@ -50,7 +50,7 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
                                    ReqPoolAllocator* req_pool_allocator, PrefillSource source,
                                    CacheCoordinator* coordinator, std::vector<BlockTable> block_tables,
                                    std::int32_t hit_tokens, CacheProgress cache_progress,
-                                   std::vector<BlockTransfer> load_pairs, bool awaits_result = false)
+                                   std::vector<BlockTransfer> load_pairs, bool awaits_result)
         : tokens_this_round_{tokens_this_round},
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event},
           req_pool_allocator_{req_pool_allocator},
@@ -86,7 +86,7 @@ struct SchedulePrefillEvent : InvalidTransitionHandler<SchedulePrefillEvent> {
     using InvalidTransitionHandler<SchedulePrefillEvent>::operator();
 
     SchedulePrefillEvent(std::int32_t tokens_this_round, std::int32_t reserve_num_tokens_in_next_schedule_event,
-                         CacheProgress cache_progress, bool awaits_result = false)
+                         CacheProgress cache_progress, bool awaits_result)
         : tokens_this_round_{tokens_this_round},
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event},
           cache_progress_{std::move(cache_progress)},

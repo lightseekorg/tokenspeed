@@ -457,6 +457,7 @@ def dsv4_prefill(
     signature = _attention_format_signature(q=q, kv=kv)
     traits = {
         "head_dim": int(q.shape[-1]),
+        "num_heads": int(q.shape[1]),
         "cache_layout": "dense_workspace",
         "support_sink": True,
         "selected_width": int(indices.shape[-1]),
@@ -814,7 +815,7 @@ def dsv4_prefill_topk(
             out=out,
         )
         spec = KernelRegistry.get().get_by_name(kernel.name)
-        if spec is not None and spec.solution == "gluon":
+        if spec is not None and spec.solution in {"gluon", "triton"}:
             kernel_kwargs["block_table_base_offsets"] = block_table_base_offsets
         return kernel(**kernel_kwargs)
 
@@ -937,7 +938,7 @@ def dsv4_decode_topk(
             persistent_topk_workspace=persistent_topk_workspace,
         )
         spec = KernelRegistry.get().get_by_name(kernel.name)
-        if spec is not None and spec.solution == "gluon":
+        if spec is not None and spec.solution in {"gluon", "triton"}:
             kernel_kwargs["block_table_base_offsets"] = block_table_base_offsets
         return kernel(**kernel_kwargs)
 

@@ -161,9 +161,10 @@ private:
     DecodeOperation applyEventAndBuildOperation(Request* request, fsm::ScheduleDecodeEvent event);
 
     AdmissionMatch matchPrefixAtAdmission(Request* request);
-    std::optional<CacheCoordinator::AdmissionResult> admit(
-        ExecutionPlan& plan, AdmissionFeedback& feedback, CacheCoordinator::PrefixProbe&& prefix,
-        std::span<const GroupDemand> demands, std::optional<std::uint64_t> request_access_epoch = std::nullopt);
+    std::optional<CacheCoordinator::AdmissionResult> admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
+                                                           CacheCoordinator::PrefixProbe&& prefix,
+                                                           std::span<const GroupDemand> demands,
+                                                           std::optional<std::uint64_t> request_access_epoch);
     std::optional<CacheCoordinator::AdmissionResult> admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                            std::span<const GroupDemand> demands,
                                                            std::uint64_t request_access_epoch);
