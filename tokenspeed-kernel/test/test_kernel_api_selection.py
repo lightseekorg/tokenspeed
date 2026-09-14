@@ -50,6 +50,9 @@ import tokenspeed_kernel.ops.attention.dsa.deep_gemm as _attention_deep_gemm_dsa
 import tokenspeed_kernel.ops.attention.dsa.flashinfer as _attention_flashinfer_dsa
 import tokenspeed_kernel.ops.attention.dsa.gluon as _attention_gluon_dsa
 import tokenspeed_kernel.ops.attention.dsv4 as _attention_dsv4_pkg
+import tokenspeed_kernel.ops.attention.dsv4._triton.attention as _attention_triton_dsv4_attention
+import tokenspeed_kernel.ops.attention.dsv4._triton.cache as _attention_triton_dsv4_cache
+import tokenspeed_kernel.ops.attention.dsv4._triton.compress as _attention_triton_dsv4_compress
 import tokenspeed_kernel.ops.attention.dsv4._triton.indexer as _attention_triton_dsv4_indexer
 import tokenspeed_kernel.ops.attention.dsv4.cuda as _attention_cuda_dsv4
 import tokenspeed_kernel.ops.attention.dsv4.deep_gemm as _attention_deep_gemm_dsv4
@@ -176,6 +179,9 @@ _RELOAD_MODULES = [
     _attention_triton_mla_decode,
     _attention_triton_rel_mha,
     _attention_triton_merge_state,
+    _attention_triton_dsv4_attention,
+    _attention_triton_dsv4_cache,
+    _attention_triton_dsv4_compress,
     _attention_triton_dsv4_indexer,
     _attention_triton_dsv4,
     _attention_triton_dsa,
