@@ -55,6 +55,7 @@ from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
     current_platform,
+    prepare_cuda_toolkit_env,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -64,8 +65,6 @@ logger = logging.getLogger(__name__)
 _warned_about_requantization = False
 
 if platform.is_hopper_plus:
-    from tokenspeed_kernel._cuda_toolkit import prepare_cuda_toolkit_env
-
     prepare_cuda_toolkit_env()
     from deep_gemm import (
         get_mn_major_tma_aligned_tensor,

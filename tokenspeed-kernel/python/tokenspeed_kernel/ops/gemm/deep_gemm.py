@@ -28,6 +28,7 @@ from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
     pdl_enabled,
+    prepare_cuda_toolkit_env,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
@@ -51,8 +52,6 @@ platform = current_platform()
 
 
 if platform.is_hopper_plus:
-    from tokenspeed_kernel._cuda_toolkit import prepare_cuda_toolkit_env
-
     prepare_cuda_toolkit_env()
     from deep_gemm import (
         ceil_to_ue8m0,

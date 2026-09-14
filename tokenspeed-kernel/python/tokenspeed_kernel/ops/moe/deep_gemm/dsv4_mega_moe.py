@@ -33,6 +33,7 @@ from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
     pdl_enabled,
+    prepare_cuda_toolkit_env,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -41,8 +42,6 @@ platform = current_platform()
 logger = logging.getLogger(__name__)
 
 if platform.is_blackwell:
-    from tokenspeed_kernel._cuda_toolkit import prepare_cuda_toolkit_env
-
     prepare_cuda_toolkit_env()
     from deep_gemm import (
         fp8_fp4_mega_moe,
