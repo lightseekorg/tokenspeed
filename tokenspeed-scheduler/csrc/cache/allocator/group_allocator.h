@@ -45,7 +45,7 @@ namespace tokenspeed {
 // group's PrefixCacheIndex, match policy in its PrefixMatcher.
 class GroupAllocator {
 public:
-    explicit GroupAllocator(std::int32_t cache_blocks_per_lcm_block = 1, std::uint32_t group_id = 0)
+    explicit GroupAllocator(std::int32_t cache_blocks_per_lcm_block, std::uint32_t group_id)
         : cache_blocks_per_lcm_block_{cache_blocks_per_lcm_block}, group_id_{group_id} {
         _assert(cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
     }

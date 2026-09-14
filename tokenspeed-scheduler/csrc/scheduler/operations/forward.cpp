@@ -408,7 +408,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         }
     }
     std::vector<CacheKey> event_keys = registerKvEventPrefixPages(*request, match.candidate_prefix_hashes, 0);
-    std::optional<CacheCoordinator::AdmissionResult> admission = admit(plan, feedback, std::move(match.probe), demands);
+    std::optional<CacheCoordinator::AdmissionResult> admission =
+        admit(plan, feedback, std::move(match.probe), demands, /*request_access_epoch=*/std::nullopt);
     if (!admission) {
         discardUncachedKvEventPages(event_keys);
         return std::nullopt;
@@ -418,7 +419,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
 
     if (!match.extension_hashes.empty()) {
         coordinator_.CacheFullBlocks(tables, match.extension_hashes, admission->access_epoch,
-                                     admission->device_prefix_tokens / coordinator_.PrefixGranularity());
+                                     admission->device_prefix_tokens / coordinator_.PrefixGranularity(),
+                                     CacheBoundaryKind::kChunk);
     }
     discardUncachedKvEventPages(event_keys);
     return fsm::SchedulePrefillFirstChunkEvent{

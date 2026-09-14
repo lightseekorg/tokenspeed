@@ -57,7 +57,7 @@ public:
     // The Host pool is available to explicit tier operations. Streaming controls
     // whether ordinary Device prefix publication also feeds the Host tier.
     CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
-                     BlockPool* host_pool = nullptr, bool stream_device_cache_to_host = true);
+                     BlockPool* host_pool, bool stream_device_cache_to_host);
 
     std::int32_t NumGroups() const { return static_cast<std::int32_t>(groups_.size()); }
 
@@ -138,7 +138,7 @@ public:
     PrefixProbe ProbeDecodeDevicePrefix(std::span<const std::string> content_hashes) const;
     std::int32_t PromotionBoundaryTokens(const PrefixProbe& prefix) const;
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
-                                         std::optional<std::uint64_t> request_access_epoch = std::nullopt);
+                                         std::optional<std::uint64_t> request_access_epoch);
     // Capacity views for scheduling code, counted in LCM parent blocks. The
     // counts are opaque capacity units to the scheduler: all packing/geometry
     // arithmetic stays behind these methods.
@@ -165,8 +165,7 @@ public:
     // Registers an exact range, used for transferred prefix blocks and tests.
     // Runtime publication during Admit follows each group's boundary contract.
     void CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
-                         std::uint64_t access_epoch, std::int32_t first_slot = 0,
-                         CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk);
+                         std::uint64_t access_epoch, std::int32_t first_slot, CacheBoundaryKind boundary_kind);
     void CacheCompletedBlocks(std::span<BlockTable> tables, std::span<const std::string> prefix_hashes,
                               std::uint64_t access_epoch, std::int32_t first_new_prefix_page,
                               std::int32_t num_computed_tokens, CacheBoundaryKind boundary_kind,
@@ -249,7 +248,7 @@ private:
     template <CacheTier Tier>
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
                                  std::int32_t first_cache_block, std::uint64_t access_epoch,
-                                 CacheBoundaryKind boundary_kind, bool stream_completed_to_host = false);
+                                 CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
     template <CacheTier Tier>
     void cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand, std::uint64_t access_epoch);
     void cacheDeviceCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
@@ -276,7 +275,6 @@ private:
 // One CacheGroup per spec (group_id = index), sharing one scheduler prefix
 // domain P while each group may use a smaller cache-page token count.
 CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
-                                 BlockPool& pool, BlockPool* host_pool = nullptr,
-                                 bool stream_device_cache_to_host = true);
+                                 BlockPool& pool, BlockPool* host_pool, bool stream_device_cache_to_host);
 
 }  // namespace tokenspeed

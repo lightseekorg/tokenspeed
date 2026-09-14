@@ -46,7 +46,6 @@ struct KvBlockRemovedEvent {
 
 using KvCacheEvent = std::variant<KvBlockStoredEvent, KvBlockRemovedEvent>;
 
-std::uint64_t HashKvBlock(std::span<const std::int32_t> token_ids,
-                          std::optional<std::uint64_t> parent_hash = std::nullopt);
+std::uint64_t HashKvBlock(std::span<const std::int32_t> token_ids, std::optional<std::uint64_t> parent_hash);
 
 }  // namespace tokenspeed
