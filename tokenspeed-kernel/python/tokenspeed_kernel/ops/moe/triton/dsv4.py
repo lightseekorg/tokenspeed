@@ -67,27 +67,35 @@ def _select_experts_kernel(
     lanes = tl.arange(0, BLOCK_K)
     chosen_ids = tl.full((BLOCK_K,), -1, tl.int32)
     chosen_weights = tl.zeros((BLOCK_K,), tl.float32)
-    choice = scores
-    if BIAS:
-        choice += tl.load(
-            bias_ptr + expert * bias_stride, mask=expert < EXPERTS, other=0
-        )
-    choice = tl.where(expert < EXPERTS, choice, -float("inf"))
     if HASH:
         input_id = tl.load(ids_ptr + token).to(tl.int64)
+    else:
+        choice = scores
+        if BIAS:
+            choice += tl.load(
+                bias_ptr + expert * bias_stride, mask=expert < EXPERTS, other=0
+            )
+        choice = tl.where(choice == choice, choice, float("inf"))
+        remaining = expert < EXPERTS
     for rank in tl.static_range(TOPK):
         if HASH:
             selected = tl.load(
                 hash_ptr + input_id * hash_stride_m + rank * hash_stride_k
             ).to(tl.int32)
         else:
+            max_choice = tl.max(
+                tl.where(remaining, choice, -float("inf")),
+                0,
+            )
             selected = tl.min(
                 tl.where(
-                    (choice == tl.max(choice, 0)) & (expert < EXPERTS), expert, EXPERTS
+                    remaining & (choice == max_choice),
+                    expert,
+                    EXPERTS,
                 ),
                 0,
             )
-            choice = tl.where(expert == selected, -float("inf"), choice)
+            remaining = remaining & (expert != selected)
         weight = tl.sum(tl.where(expert == selected, scores, 0.0), 0)
         chosen_ids = tl.where(lanes == rank, selected, chosen_ids)
         chosen_weights = tl.where(lanes == rank, weight, chosen_weights)

@@ -75,8 +75,8 @@ def test_router_matches_reference(
         hash_indices_table=table,
         input_ids=input_ids,
         need_scores=need_scores,
-        override=None,
-        solution="triton",
+        override="triton_dsv4_select_experts",
+        solution=None,
     )
     expected_scores = F.softplus(logits.float()).sqrt()
     expected_ids = (
@@ -112,7 +112,7 @@ def test_router_ties_and_graph_replay() -> None:
             hash_indices_table=None,
             input_ids=None,
             need_scores=True,
-            override=None,
+            override="triton_dsv4_select_experts",
             solution=None,
         )
 
@@ -132,6 +132,48 @@ def test_router_ties_and_graph_replay() -> None:
     eager = run()
     for actual, expected in zip(captured, eager, strict=True):
         torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_router_nan_logits_keep_expert_ids_in_range(with_bias: bool) -> None:
+    logits = torch.full(
+        (80, 256),
+        float("nan"),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    bias = (
+        torch.zeros((256,), device="cuda", dtype=torch.float32) if with_bias else None
+    )
+
+    def run() -> torch.Tensor:
+        _, ids, _ = dsv4_select_experts(
+            logits,
+            top_k=6,
+            renormalize=True,
+            correction_bias=bias,
+            hash_indices_table=None,
+            input_ids=None,
+            need_scores=False,
+            override="triton_dsv4_select_experts",
+            solution=None,
+        )
+        return ids
+
+    expected = torch.arange(
+        6,
+        device="cuda",
+        dtype=torch.int32,
+    ).repeat(80, 1)
+    torch.testing.assert_close(run(), expected)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured, expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
@@ -210,8 +252,8 @@ def test_router_to_mxfp4_experts(tokens: int) -> None:
             hash_indices_table=None,
             input_ids=None,
             need_scores=False,
-            override=None,
-            solution="triton",
+            override="triton_dsv4_select_experts",
+            solution=None,
         )
         return moe_apply(
             plan,

@@ -48,6 +48,7 @@ env:
     tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[True-False-dtype1-bias]
     tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[True-False-dtype2-hash]
     tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_ties_and_graph_replay
+    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_nan_logits_keep_expert_ids_in_range[True]
     tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_to_mxfp4_experts[17]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/attention.dsv4_prefill_topk/triton_dsv4_prefill_topk_mxfp4/mxfp4@mi450]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/attention.dsv4_decode_topk/triton_dsv4_decode_topk_mxfp4/mxfp4@mi450]
