@@ -238,7 +238,9 @@ def _matmul_decode(
 
     descriptor_m = M
     if not cfg.USE_GATHER:
-        descriptor_m = eM - off_m
+        # Rows left in this expert fit i32 even when the weight slab needs the
+        # wide index type.
+        descriptor_m = (eM - off_m).to(gl.int32)
     x_desc, w_desc, x_scale_desc, w_scale_desc, gathered_m = create_descriptor(
         cfg,
         X_ptr,
@@ -326,12 +328,16 @@ def _matmul_decode(
     out = out.to(Y.dtype.element_ty)
     out = gl.convert_layout(out, BLOCKED_LAYOUT_Y)
 
+    OUTPUT_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=1, per_phase=1, max_phase=1, order=[1, 0]
+    )
+    out_smem = gl.allocate_shared_memory(
+        Y.dtype.element_ty, (BLOCK_M, OUT_BLOCK_N), OUTPUT_SHARED_LAYOUT
+    )
+    out_smem.store(out)
+
     if WriteBackIndx is not None:
         WriteBackIndx += start_m
-
-        SCATTER_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
-            vec=1, per_phase=1, max_phase=1, order=[1, 0]
-        )
 
         IDX_BASE_LAYOUT: gl.constexpr = get_tdm_gather_scatter_idx_layout(
             BLOCK_M, cfg.NUM_WARPS
@@ -347,40 +353,33 @@ def _matmul_decode(
         )
         dst_row_indices = dst_row_indices.to(cfg.index_type)
 
-        out_smem = gl.allocate_shared_memory(
-            Y.dtype.element_ty, (BLOCK_M, OUT_BLOCK_N), SCATTER_SHARED_LAYOUT
-        )
-        out_smem.store(out)
-
         y_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
             base=Y_ptr,
             shape=(writeback_size, yN),
             strides=(stride_y_m, stride_y_n),
             block_shape=(BLOCK_M, OUT_BLOCK_N),
-            layout=SCATTER_SHARED_LAYOUT,
+            layout=OUTPUT_SHARED_LAYOUT,
         )
 
-        col_offset = (OUT_BLOCK_N * _enforce_wave_uniform_i32(pid_n)).to(
-            address_index_type
-        )
-        y_desc = gl.amd.cdna5.tdm.update_tensor_descriptor(
+        # TDM descriptor offsets do not support i64
+        col_offset = OUT_BLOCK_N * _enforce_wave_uniform_i32(pid_n.to(gl.int32))
+        y_desc_s = gl.amd.cdna5.tdm.update_tensor_descriptor(
             y_desc, add_offsets=[0, col_offset], clamp_bounds=True
         )
-        gl.amd.cdna5.tdm.async_scatter(y_desc, dst_row_indices, out_smem)
+        gl.amd.cdna5.tdm.async_scatter(y_desc_s, dst_row_indices, out_smem)
         gl.amd.cdna5.tdm.async_wait(0)
     else:
-        offs_y_m = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, BLOCKED_LAYOUT_Y))
-        offs_y_n = OUT_BLOCK_N * pid_n + gl.arange(
-            0, OUT_BLOCK_N, gl.SliceLayout(0, BLOCKED_LAYOUT_Y)
+        y_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+            base=Y_ptr + start_m * stride_y_m,
+            shape=(eM, yN),
+            strides=(stride_y_m, stride_y_n),
+            block_shape=(BLOCK_M, OUT_BLOCK_N),
+            layout=OUTPUT_SHARED_LAYOUT,
         )
-        mask_m = offs_y_m < eM
-        mask_n = offs_y_n < yN
-
-        Y_ptr += start_m * stride_y_m
-
-        y_offs = (
-            offs_y_m.to(address_index_type)[:, None] * stride_y_m
-            + offs_y_n.to(address_index_type)[None, :] * stride_y_n
+        # TDM descriptor offsets do not support i64
+        gl.amd.cdna5.tdm.async_store(
+            y_desc,
+            [off_m.to(gl.int32), (OUT_BLOCK_N * pid_n).to(gl.int32)],
+            out_smem,
         )
-        y_mask = mask_m[:, None] & mask_n[None, :]
-        gl.amd.cdna5.buffer_store(out, Y_ptr, y_offs, mask=y_mask)
+        gl.amd.cdna5.tdm.async_wait(0)
