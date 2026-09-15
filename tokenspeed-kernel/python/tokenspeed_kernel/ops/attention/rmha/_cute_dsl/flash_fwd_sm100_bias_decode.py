@@ -4924,11 +4924,7 @@ def run(
             current_stream,
         )
         print("Verifying results...")
-        if qk_blockscaled or v_dequant:
-            # PyTorch Inductor cannot reliably lower FP8 source casts yet.
-            reference_fn = run_torch_fmha
-        else:
-            reference_fn = torch.compile(run_torch_fmha, mode="max-autotune")
+        reference_fn = run_torch_fmha
         o_ref = reference_fn(
             q_ref, k_ref[:, :seqlen], v_ref[:, :seqlen], bias_ref, scale_s
         )
