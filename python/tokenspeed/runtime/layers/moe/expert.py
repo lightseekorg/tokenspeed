@@ -25,6 +25,7 @@ from dataclasses import replace
 
 import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.moe.activation import Nvfp4Activation
 from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
     TRTLLM_NVFP4_ISPP_ALIGNMENT,
 )
@@ -343,7 +344,7 @@ class MoELayer(torch.nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | Nvfp4Activation,
         topk_output: TopKOutput,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
