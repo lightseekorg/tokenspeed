@@ -20,10 +20,22 @@
 
 """Tests for MultimodalRuntime (mrope overrides factored out of ModelExecutor)."""
 
+import sys
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
+
+import pytest
 import torch
 
+from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 
 
@@ -67,6 +79,55 @@ def _mm_input(
 def _runtime(mrope=True, capacity=64):
     ib = _FakeInputBuffers(capacity)
     return MultimodalRuntime(model_is_mrope=mrope, input_buffers=ib, device="cpu"), ib
+
+
+@pytest.mark.parametrize("mode", [ForwardMode.EXTEND, ForwardMode.MIXED])
+@pytest.mark.parametrize("has_multimodal", [False, True])
+def test_forward_argument_reaches_attention_metadata(mode, has_multimodal):
+    backend = Mock()
+    pool = SimpleNamespace(arena=SimpleNamespace(cache_group_specs=[]))
+    num_extends = 2 if mode.is_extend() else 1
+    ctx = ForwardContext(
+        attn_backend=backend,
+        token_to_kv_pool=pool,
+        bs=2,
+        num_extends=num_extends,
+        input_num_tokens=2,
+        forward_mode=mode,
+    )
+    runner = ForwardStepRunner.__new__(ForwardStepRunner)
+    runner.attn_backend = backend
+    runner.token_to_kv_pool = pool
+    runner.draft_attn_backend = None
+    runner.drafter = None
+    runner.input_buffers = SimpleNamespace(
+        req_pool_indices_buf=torch.arange(2, dtype=torch.int32),
+        seq_lens_buf=torch.ones(2, dtype=torch.int32),
+    )
+    runner._can_use_graph = Mock(return_value=False)
+    runner._forward_func = Mock()
+    multimodal = _FakeMmContext([_mm_input(), None]) if has_multimodal else None
+    prefix = torch.zeros(num_extends, dtype=torch.int32)
+    lengths = torch.ones(num_extends, dtype=torch.int32)
+
+    runner(
+        bs=2,
+        ctx=ctx,
+        sampling_info=None,
+        extend_with_prefix=False,
+        extend_prefix_lens=prefix,
+        extend_prefix_lens_cpu=prefix,
+        extend_seq_lens=lengths,
+        extend_seq_lens_cpu=lengths,
+        block_tables={},
+        multimodal_context=multimodal,
+    )
+    backend.init_forward_metadata.assert_called_once()
+    assert (
+        backend.init_forward_metadata.call_args.kwargs["multimodal_context"]
+        is multimodal
+    )
+    runner._forward_func.assert_called_once_with(bs=2, ctx=ctx, sampling_info=None)
 
 
 def test_non_mrope_model_returns_none():
@@ -176,3 +237,7 @@ def test_wire_drafter_sets_pad_ids_only_when_supported():
         ),
     )
     assert drafter.ids is None
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))

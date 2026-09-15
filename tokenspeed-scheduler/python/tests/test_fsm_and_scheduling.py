@@ -255,6 +255,61 @@ class TestChunkedPrefill:
         assert plan.forward[0].num_extends() > 0
         assert s.request_token_size("r0") == 20
 
+    def test_unsplittable_span_is_never_cut_by_chunking(self):
+        """A [start, end) span on RequestSpec stays inside one prefill chunk.
+
+        budget=16, grain=4, span=[10, 26): the first chunk stops at the span
+        start instead of page-aligning to 16, the second chunk takes the
+        whole span even though 26 is off-page, the third finishes the prompt.
+        """
+        tokens = list(range(32))
+        s = Scheduler(make_config(max_scheduled_tokens=16, prefix_granularity=4))
+        spec = make_spec("r0", tokens)
+        spec.unsplittable_spans = [(10, 26)]
+        assert spec.unsplittable_spans == [(10, 26)]
+        s.submit_requests([spec])
+
+        plan1 = s.next_execution_plan()
+        assert plan1.forward[0].input_lengths == [10]
+        assert plan1.forward[0].extend_prefix_lens == [0]
+        assert plan1.forward[0].input_ids == tokens[0:10]
+
+        plan2 = s.next_execution_plan()
+        assert plan2.forward[0].input_lengths == [16]
+        assert plan2.forward[0].extend_prefix_lens == [10]
+        assert plan2.forward[0].input_ids == tokens[10:26]
+
+        plan3 = s.next_execution_plan()
+        assert plan3.forward[0].input_lengths == [6]
+        assert plan3.forward[0].extend_prefix_lens == [26]
+        assert plan3.forward[0].input_ids == tokens[26:32]
+
+    @pytest.mark.parametrize(
+        "spans",
+        [[(-1, 2)], [(2, 2)], [(3, 2)], [(4, 9)], [(4, 7), (0, 5)]],
+    )
+    def test_invalid_unsplittable_spans_reject_the_whole_batch(self, spans):
+        s = Scheduler(make_config())
+        valid = make_spec("valid", list(range(8)))
+        spec = make_spec("invalid", list(range(8)))
+        spec.unsplittable_spans = spans
+        with pytest.raises(ValueError, match="unsplittable span"):
+            s.submit_requests([valid, spec])
+        assert s.waiting_size() == 0
+        s.submit_requests([valid])
+        assert s.waiting_size() == 1
+
+    def test_unsplittable_span_wider_than_the_budget_is_rejected(self):
+        """A span no round could prefill whole would park forever; submit refuses it."""
+        s = Scheduler(make_config(max_scheduled_tokens=8))
+        spec = make_spec("r0", list(range(12)))
+        spec.unsplittable_spans = [(0, 9)]
+        with pytest.raises(ValueError, match="max_scheduled_tokens"):
+            s.submit_requests([spec])
+        spec.unsplittable_spans = [(1, 9)]
+        s.submit_requests([spec])
+        assert s.waiting_size() == 1
+
 
 # ---------------------------------------------------------------------------
 # PrefillFirst: prefilling requests take priority

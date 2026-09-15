@@ -745,11 +745,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             name = name.removesuffix(".scale") + scale_suffix
         if ".shared_experts.w2" in name:
             name = name.replace(".shared_experts.w2", ".shared_experts.down_proj")
-        if ".ffn.gate.bias" in name:
-            name = name.replace(
-                ".ffn.gate.bias",
-                ".ffn.gate.e_score_correction_bias",
-            )
+        if name.endswith(".ffn.gate.bias"):
+            name = name[: -len("bias")] + "e_score_correction_bias"
         return name
 
     def get_stacked_params_mapping(self):

@@ -247,6 +247,8 @@ class InputProcessor:
                 )
             multimodal_inputs = obj.precomputed_multimodal_inputs
             multimodal_inputs.ensure_pad_values()
+            if multimodal_inputs.im_token_id is None:
+                multimodal_inputs.im_token_id = self.engine.image_token_id
             # MRoPE-aware models (Qwen2/3-VL, …) require 3-axis position_ids
             # derived from image_grid_thw + the image_token_id placeholders in
             # input_ids. SMG ships precomputed mm inputs with mrope_* unset; if

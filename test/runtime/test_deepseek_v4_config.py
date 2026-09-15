@@ -146,6 +146,9 @@ from tokenspeed.runtime.models.deepseek_v4 import (
 )
 from tokenspeed.runtime.models.deepseek_v4_dspark import (
     _ATTENTION_CHECKPOINT_TENSORS,
+    _LAST_STAGE_CORE,
+    _STAGE_COMMON_CORE,
+    _STAGE_ZERO_CORE,
     DeepseekV4DSparkModel,
     DeepseekV4ForCausalLMDSpark,
     _apply_dspark_hc_head,
@@ -1285,6 +1288,9 @@ class TestDeepseekV4Config(unittest.TestCase):
 
     def test_deepseek_v4_tokenizer_is_auto_selected_by_architecture(self):
         self.assertTrue(prefers_deepseek_v4_tokenizer(["DeepseekV4ForCausalLM"]))
+        self.assertTrue(
+            prefers_deepseek_v4_tokenizer(["DeepseekV4ForConditionalGeneration"])
+        )
         self.assertFalse(prefers_deepseek_v4_tokenizer(["KimiK2ForCausalLM"]))
         self.assertFalse(prefers_deepseek_v4_tokenizer(None))
 
@@ -1792,6 +1798,85 @@ class TestDeepseekV4Config(unittest.TestCase):
             "model.markov_embedding.weight",
         )
         self.assertIsNone(model._map_checkpoint_name("mtp.3.norm.weight"))
+
+    def test_dspark_checkpoint_name_mapping_preserves_visual_bias(self):
+        model = object.__new__(DeepseekV4ForCausalLMDSpark)
+        model.model = SimpleNamespace(num_stages=3)
+
+        for stage_id in range(3):
+            for source, destination in (
+                ("weight", "weight"),
+                ("bias", "e_score_correction_bias"),
+                ("bias_vl", "bias_vl"),
+            ):
+                with self.subTest(stage=stage_id, source=source):
+                    self.assertEqual(
+                        model._map_checkpoint_name(f"mtp.{stage_id}.ffn.gate.{source}"),
+                        f"model.stages.{stage_id}.block.ffn.gate.{destination}",
+                    )
+
+    def test_mtp_checkpoint_name_mapping_preserves_visual_bias(self):
+        model = object.__new__(DeepseekV4ForCausalLMNextN)
+        model.config = SimpleNamespace(
+            num_hidden_layers=43,
+            num_nextn_predict_layers=1,
+        )
+
+        for prefix in ("mtp.0", "model.layers.43"):
+            for source, destination in (
+                ("weight", "weight"),
+                ("bias", "e_score_correction_bias"),
+                ("bias_vl", "bias_vl"),
+            ):
+                with self.subTest(prefix=prefix, source=source):
+                    self.assertEqual(
+                        model._map_checkpoint_name(f"{prefix}.ffn.gate.{source}"),
+                        f"model.layers.43.mtp_block.ffn.gate.{destination}",
+                    )
+
+    def test_dspark_load_weights_initializes_visual_routing_bias(self):
+        model = object.__new__(DeepseekV4ForCausalLMDSpark)
+        torch.nn.Module.__init__(model)
+        model.config = SimpleNamespace(n_routed_experts=0)
+        model.mapping = Mapping(rank=0, world_size=1)
+        model.model = torch.nn.Module()
+        model.model.num_stages = 1
+        stage = torch.nn.Module()
+        stage.block = torch.nn.Module()
+        stage.block.attn_norm = torch.nn.Module()
+        stage.block.attn_norm.weight = torch.nn.Parameter(torch.empty(2))
+        stage.block.ffn = torch.nn.Module()
+        gate = torch.nn.Module()
+        gate.e_score_correction_bias = torch.nn.Parameter(torch.empty(2))
+        gate.bias_vl = torch.nn.Parameter(torch.empty(2))
+        stage.block.ffn.gate = gate
+        model.model.stages = torch.nn.ModuleList([stage])
+
+        required = (
+            _ATTENTION_CHECKPOINT_TENSORS
+            | _STAGE_COMMON_CORE
+            | _STAGE_ZERO_CORE
+            | _LAST_STAGE_CORE
+        )
+        checkpoint = {f"mtp.0.{name}": torch.ones(2) for name in required}
+        text_bias = torch.tensor([0.5, -0.25])
+        visual_bias = torch.tensor([-0.75, 0.125])
+        checkpoint["mtp.0.ffn.gate.bias"] = text_bias
+        checkpoint["mtp.0.ffn.gate.bias_vl"] = visual_bias
+
+        # Exercise a gate-only draft with the real stage/parameter validation.
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4_dspark.build_moe_checkpoint_loader"
+        ) as make_expert_loader:
+            make_expert_loader.return_value.matches.return_value = False
+            loaded = model.load_weights(checkpoint.items())
+
+            self.assertIn("model.stages.0.block.ffn.gate.bias_vl", loaded)
+            torch.testing.assert_close(gate.bias_vl, visual_bias)
+            torch.testing.assert_close(gate.e_score_correction_bias, text_bias)
+            del checkpoint["mtp.0.ffn.gate.bias_vl"]
+            with self.assertRaisesRegex(ValueError, "did not initialize.*bias_vl"):
+                model.load_weights(checkpoint.items())
 
     def test_target_expert_scale_mapping_follows_expert_format(self):
         model = object.__new__(DeepseekV4ForCausalLM)
@@ -3570,22 +3655,23 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
 
     def test_deepseek_v4_prefill_workspace_bounds_use_cpu_mirrors(self):
-        self.assertEqual(
-            DeepseekV4AttentionBackend._prefill_workspace_bounds(
-                torch.tensor([17, 65], dtype=torch.int32),
-                torch.tensor([5, 9], dtype=torch.int32),
-                num_reqs=2,
-                window_size=16,
-                compress_ratio=4,
-            ),
-            (24, 16),
-        )
+        for gather_window, max_gather_len in ((15, 24), (63, 65)):
+            self.assertEqual(
+                DeepseekV4AttentionBackend._prefill_workspace_bounds(
+                    torch.tensor([17, 65], dtype=torch.int32),
+                    torch.tensor([5, 9], dtype=torch.int32),
+                    num_reqs=2,
+                    gather_window=gather_window,
+                    compress_ratio=4,
+                ),
+                (max_gather_len, 16),
+            )
         self.assertEqual(
             DeepseekV4AttentionBackend._prefill_workspace_bounds(
                 torch.tensor([17], dtype=torch.int32),
                 torch.tensor([5], dtype=torch.int32),
                 num_reqs=1,
-                window_size=16,
+                gather_window=15,
                 compress_ratio=1,
             ),
             (17, 0),
@@ -3595,7 +3681,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 None,
                 None,
                 num_reqs=0,
-                window_size=16,
+                gather_window=15,
                 compress_ratio=4,
             ),
             (1, 0),
@@ -3624,7 +3710,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     seq_lens_cpu,
                     query_lens_cpu,
                     num_reqs=2 if seq_lens_cpu.numel() == 2 else 1,
-                    window_size=16,
+                    gather_window=15,
                     compress_ratio=4,
                 )
 
@@ -3650,7 +3736,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     seq_lens_cpu,
                     query_lens_cpu,
                     num_reqs=1,
-                    window_size=16,
+                    gather_window=15,
                     compress_ratio=4,
                 )
 
@@ -3659,7 +3745,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 None,
                 None,
                 num_reqs=-1,
-                window_size=16,
+                gather_window=15,
                 compress_ratio=4,
             )
 
@@ -3991,6 +4077,52 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(
             torch.equal(sliced.cache.indexer_state_block_table, indexer_state[1:3])
         )
+
+        # Reuse the batch as two prefills followed by one decode/verify request.
+        metadata.forward_mode = ForwardMode.MIXED
+        metadata.num_prefill_reqs = 2
+        metadata.num_prefill_tokens = 3
+        metadata.swa_left = swa_left = torch.tensor([0, 1, 0], dtype=torch.int32)
+        metadata.swa_right = swa_right = torch.tensor([1, 0, 0], dtype=torch.int32)
+        metadata.swa_max_image_tokens = 384
+
+        for req_start, req_end, token_start, token_end, mode in (
+            (0, 2, 0, 3, ForwardMode.EXTEND),
+            (1, 2, 2, 3, ForwardMode.EXTEND),
+            (2, 3, 3, 6, ForwardMode.DECODE),
+        ):
+            with self.subTest(mode=mode, req_start=req_start):
+                sliced = backend._metadata_slice(
+                    metadata,
+                    req_start=req_start,
+                    req_end=req_end,
+                    token_start=token_start,
+                    token_end=token_end,
+                    forward_mode=mode,
+                )
+                if mode == ForwardMode.DECODE:
+                    self.assertIsNone(sliced.swa_left)
+                    self.assertIsNone(sliced.swa_right)
+                else:
+                    self.assertEqual(
+                        sliced.swa_left.tolist(),
+                        swa_left[token_start:token_end].tolist(),
+                    )
+                    self.assertEqual(
+                        sliced.swa_right.tolist(),
+                        swa_right[token_start:token_end].tolist(),
+                    )
+                    self.assertEqual(sliced.swa_max_image_tokens, 384)
+
+        with self.assertRaisesRegex(RuntimeError, "visible-window metadata"):
+            backend._metadata_slice(
+                metadata,
+                req_start=0,
+                req_end=3,
+                token_start=0,
+                token_end=6,
+                forward_mode=ForwardMode.EXTEND,
+            )
 
     def test_deepseek_v4_kv_pool_requires_matching_layout_layers(self):
         config = SimpleNamespace(
@@ -6519,6 +6651,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             top_k=2,
             renormalize=True,
             correction_bias=bias,
+            bias_vl=None,
+            image_token_id=None,
         )
 
         expected_scores = F.softplus(logits).sqrt()
@@ -6555,6 +6689,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             renormalize=True,
             hash_indices_table=table,
             input_ids=input_ids,
+            bias_vl=None,
+            image_token_id=None,
         )
 
         expected_ids = torch.tensor([[3, 1], [2, 3]], dtype=torch.int32)
@@ -6646,6 +6782,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             top_k=6,
             renormalize=True,
             correction_bias=bias,
+            bias_vl=None,
+            image_token_id=None,
         )
 
         expected_scores = F.softplus(logits).sqrt()

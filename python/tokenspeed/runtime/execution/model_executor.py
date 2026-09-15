@@ -1088,6 +1088,7 @@ class ModelExecutor:
                     extend_prefix_lens_cpu=ib.extend_prefix_lens_cpu[:0],
                     extend_seq_lens=ib.extend_seq_lens_buf[:0],
                     extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:0],
+                    multimodal_context=None,
                 )
             return
 
@@ -1474,6 +1475,7 @@ class ModelExecutor:
                             :num_extends
                         ],
                         block_tables=block_tables,
+                        multimodal_context=multimodal_context,
                     )
                     if timing_enabled:
                         forward_step_ms = (

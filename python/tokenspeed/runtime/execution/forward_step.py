@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+    from tokenspeed.runtime.multimodal.inputs import MultimodalForwardContext
     from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 
 logger = get_colorful_logger(__name__)
@@ -881,6 +882,7 @@ class ForwardStepRunner:
         extend_seq_lens_cpu: torch.Tensor,
         positions: torch.Tensor | None = None,
         block_tables: dict | None = None,
+        multimodal_context: MultimodalForwardContext | None,
     ):
         """
         Unified forward entry point.
@@ -968,6 +970,7 @@ class ForwardStepRunner:
                 capture_hidden_mode=ctx.capture_hidden_mode,
                 num_tokens=ctx.input_num_tokens,
                 block_tables=block_tables,
+                multimodal_context=multimodal_context,
             )
 
         if use_graph:

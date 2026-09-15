@@ -287,8 +287,22 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         return match;
     }
     match.probe = probe(probe_hashes);
-    const std::int32_t hit_prefix_pages =
-        std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens) / prefix_granularity;
+    std::int32_t hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
+    if (!request->UnsplittableSpans().empty()) {
+        while (hit_tokens > 0) {
+            const std::int32_t end =
+                request->AdjustPrefillEnd(0, hit_tokens, hit_tokens) / prefix_granularity * prefix_granularity;
+            if (end == hit_tokens) {
+                break;
+            }
+            // Page rounding or a shorter re-probe can land inside an earlier span.
+            const auto clamped_hashes =
+                std::span<const std::string>(hashes).first(static_cast<std::size_t>(end / prefix_granularity));
+            match.probe = probe(clamped_hashes);
+            hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
+        }
+    }
+    const std::int32_t hit_prefix_pages = hit_tokens / prefix_granularity;
     match.prefix_hashes.assign(hashes.begin(), hashes.begin() + hit_prefix_pages);
 
     const std::int32_t extension_pages =
@@ -358,9 +372,12 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     if (coordinator_.HasMambaStateGroup() || promotion_boundary_tokens > 0) {
         prefill_tokens = AlignPrefillChunk(hit_tokens, unscheduled, remaining, coordinator_.PrefixGranularity(),
                                            promotion_boundary_tokens);
-        if (prefill_tokens == 0) {
-            return std::nullopt;
-        }
+    }
+    prefill_tokens = request->AdjustPrefillEnd(hit_tokens, hit_tokens + prefill_tokens,
+                                               hit_tokens + std::min(remaining, unscheduled)) -
+                     hit_tokens;
+    if (prefill_tokens == 0) {
+        return std::nullopt;
     }
 
     const std::int32_t after_tokens = hit_tokens + prefill_tokens;
@@ -457,9 +474,12 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     if (coordinator_.HasMambaStateGroup() || cache_progress.promotion_boundary_tokens > 0) {
         prefill_tokens = AlignPrefillChunk(first_pos, unscheduled, remaining, coordinator_.PrefixGranularity(),
                                            cache_progress.promotion_boundary_tokens);
-        if (prefill_tokens == 0) {
-            return std::nullopt;
-        }
+    }
+    prefill_tokens =
+        request->AdjustPrefillEnd(first_pos, first_pos + prefill_tokens, first_pos + std::min(remaining, unscheduled)) -
+        first_pos;
+    if (prefill_tokens == 0) {
+        return std::nullopt;
     }
 
     const std::int32_t after_tokens = first_pos + prefill_tokens;
