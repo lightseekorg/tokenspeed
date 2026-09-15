@@ -72,14 +72,14 @@ def validate_options(tokens, generations, rank_skew_cycles):
         raise ValueError("rank skew cycles must be a nonnegative integer")
 
 
-def make_operands(m, slot, device):
+def make_operands(m, slot, device, layers=2):
     replicated = torch.Generator(device=device).manual_seed(9231 + m + 101 * slot)
     local = torch.Generator(device=device).manual_seed(
         18001 + m + 103 * slot + 997 * dist.get_rank()
     )
     latent = [
         torch.randn(m, 3584, device=device, dtype=torch.bfloat16, generator=replicated)
-        for _ in range(2)
+        for _ in range(layers)
     ]
     residual = (
         torch.randn(m, 7168, device=device, dtype=torch.bfloat16, generator=replicated)
@@ -92,12 +92,12 @@ def make_operands(m, slot, device):
             torch.randn(7168, 768, device=device, dtype=torch.bfloat16, generator=local)
             * 0.03,
         )
-        for _ in range(2)
+        for _ in range(layers)
     ]
     return {"latent": latent, "residual": residual, "producers": producers}
 
 
-def run_layers(operands, adapters, weights):
+def run_layers(operands, adapters, weights, snapshot_outputs=False):
     prefix, results = operands["residual"], []
     m = prefix.shape[0]
     for layer, adapter in enumerate(adapters):
@@ -105,7 +105,9 @@ def run_layers(operands, adapters, weights):
             *operands["producers"][layer], out=adapter.input_view(m), solution="torch"
         )
         prefix = adapter(operands["latent"][layer], weights[layer], prefix, shared)
-        results.append(prefix)
+        # Correctness-only snapshots preserve intermediates across pool reuse.
+        # They are not part of the serving implementation or a performance run.
+        results.append(prefix.clone() if snapshot_outputs else prefix)
     return results
 
 
@@ -122,7 +124,7 @@ def old_reference(latent, weight, residual, producer):
 
 def numerical_checks(actual, operands, weights, label):
     records, prefix = [], operands["residual"]
-    for layer in range(2):
+    for layer in range(len(weights)):
         reference = old_reference(
             operands["latent"][layer],
             weights[layer],
@@ -152,8 +154,10 @@ def update_inputs(operands, saved, phase):
             producer[0].neg_()
 
 
-def make_case(m, slot, adapters, weights, warmup, stream, device):
-    operands = make_operands(m, slot, device)
+def make_case(
+    m, slot, adapters, weights, warmup, stream, device, snapshot_outputs=False
+):
+    operands = make_operands(m, slot, device, len(adapters))
     warm_latent = {tensor.data_ptr() for tensor in warmup["latent"]}
     warm_residual = {warmup["residual"].data_ptr()}
     check_all_ranks(
@@ -176,7 +180,9 @@ def make_case(m, slot, adapters, weights, warmup, stream, device):
     expected, errors = [], []
     for phase in (0, 1):
         update_inputs(operands, saved, phase)
-        observed = [x.clone() for x in run_layers(operands, adapters, weights)]
+        observed = [
+            x.clone() for x in run_layers(operands, adapters, weights, snapshot_outputs)
+        ]
         errors.append(
             numerical_checks(observed, operands, weights, "phase-" + str(phase))
         )
@@ -188,7 +194,7 @@ def make_case(m, slot, adapters, weights, warmup, stream, device):
     update_inputs(operands, saved, 0)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        outputs = run_layers(operands, adapters, weights)
+        outputs = run_layers(operands, adapters, weights, snapshot_outputs)
     graph.replay()
     check_all_ranks(
         equal_outputs(outputs, expected[0]), "capture used stale warmup pointers"
@@ -250,15 +256,22 @@ def guard_checks(workspace, guards, capacity):
     )
 
 
-def run(args, device, adapter_type, profile):
+def run(args, device, adapter_type, profile, output_pool_type=None):
     capacity = max(args.tokens)
     workspace = SharedRsWorkspace.allocate(dist.group.WORLD, capacity + 32, device)
     workspace.state.comm_buff[capacity:].fill_(53.0)
-    adapters = [adapter_type(workspace, capacity) for _ in range(2)]
+    pooled = output_pool_type is not None
+    layers = 4 if pooled else 2
+    pool = output_pool_type(workspace, capacity) if pooled else None
+    adapters = (
+        [pool.bind_layer(i) for i in range(layers)]
+        if pooled
+        else [adapter_type(workspace, capacity) for _ in range(layers)]
+    )
     owners, guards = [], []
     # Add a physical guard after the logical output without modifying adapter
     # code or its profile. All descriptors still address the exact logical view.
-    for adapter in adapters:
+    for adapter in adapters[:2]:
         owner = allocate_symmetric_up_projection_output(
             dist.group.WORLD, capacity + 32, device=device
         )
@@ -266,6 +279,16 @@ def run(args, device, adapter_type, profile):
         owner.tensor[capacity:].fill_(61.0)
         owners.append(owner)
         guards.append(owner.tensor[capacity:])
+    if pooled:
+        # Retain two guarded physical owners, and use the real pool selector
+        # to bind four independent launch caches to these alternating slots.
+        pool.outputs = tuple(adapter.output for adapter in adapters[:2])
+        adapters = [pool.bind_layer(i) for i in range(layers)]
+        check_all_ranks(
+            adapters[0].output is adapters[2].output
+            and adapters[1].output is adapters[3].output,
+            "parity output sharing missing",
+        )
     check_all_ranks(
         adapters[0].output.tensor.data_ptr() != adapters[1].output.tensor.data_ptr(),
         "layer outputs alias",
@@ -274,14 +297,14 @@ def run(args, device, adapter_type, profile):
     weights = [
         torch.randn(896, 3584, device=device, dtype=torch.bfloat16, generator=local)
         * 0.015
-        for _ in range(2)
+        for _ in range(layers)
     ]
     stream = torch.cuda.Stream(device=device)
     stream.wait_stream(torch.cuda.current_stream(device))
     warmups, cases = {}, []
     with torch.cuda.stream(stream):
         for m in args.tokens:
-            warmup = make_operands(m, 99, device)
+            warmup = make_operands(m, 99, device, layers)
             warmups[m] = warmup
             # Warm each layer using independent warmup residual, so even the
             # second layer's real chained residual has a different pointer.
@@ -296,7 +319,9 @@ def run(args, device, adapter_type, profile):
                 )
             for slot in (0, 1):
                 cases.append(
-                    make_case(m, slot, adapters, weights, warmup, stream, device)
+                    make_case(
+                        m, slot, adapters, weights, warmup, stream, device, pooled
+                    )
                 )
         rejections = rejection_checks(
             workspace,
@@ -342,7 +367,9 @@ def run(args, device, adapter_type, profile):
             "rank": dist.get_rank(),
             "passed": True,
             "tokens": args.tokens,
-            "layers": 2,
+            "layers": layers,
+            "pooled_outputs": pooled,
+            "correctness_only_intermediate_snapshots": pooled,
             "graph_slots_per_bucket": 2,
             "generations": args.generations,
             "checks_per_rank": len(flags),
@@ -350,7 +377,7 @@ def run(args, device, adapter_type, profile):
             "real_shared_producer_out": True,
             "warmup_and_graph_operand_pointers_distinct": True,
             "two_layers_share_raw_workspace": True,
-            "per_layer_outputs_survive_next_layer_workspace_reuse": True,
+            "per_layer_outputs_survive_next_layer_workspace_reuse": not pooled,
             "guards": True,
             "rank_skew": args.rank_skew_cycles > 0,
             "rejections": rejections,

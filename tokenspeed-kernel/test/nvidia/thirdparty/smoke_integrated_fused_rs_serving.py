@@ -31,6 +31,7 @@ import torch
 import torch.distributed as dist
 from smoke_medium_fused_rs_serving import run
 from tokenspeed_kernel.ops.communication.medium_fused_rs_up_projection_serving import (
+    IntegratedFusedRsOutputPool,
     IntegratedFusedRsUpProjectionServing,
 )
 from tokenspeed_kernel.ops.communication.medium_fused_rs_up_projection_serving_config import (
@@ -41,6 +42,11 @@ from tokenspeed_kernel.ops.communication.medium_fused_rs_up_projection_serving_c
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--pooled-outputs",
+        action="store_true",
+        help="Check four chained layers reusing two output slots",
+    )
     args = parser.parse_args()
     args.tokens = [128, 256, 512, 1024, 2048, 4096, 8192]
     args.generations = 3
@@ -63,6 +69,7 @@ def main():
             torch.device("cuda", torch.cuda.current_device()),
             IntegratedFusedRsUpProjectionServing,
             integrated_fused_rs_serving_config,
+            IntegratedFusedRsOutputPool if args.pooled_outputs else None,
         )
         ranks = [None] * 8
         dist.all_gather_object(ranks, local)

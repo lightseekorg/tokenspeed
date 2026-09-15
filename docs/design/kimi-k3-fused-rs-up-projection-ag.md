@@ -76,6 +76,12 @@ The 230400-byte occupancy-query bound is conservative, not measured usage.
 
 ## Synchronization and lifetime
 
+The per-layer-output rules below describe the historical endpoint adapter.
+The integrated adapter now uses the separately documented
+[two-slot ownership policy](kimi-k3-integrated-fused-tail.md#tuning-and-memory),
+with unchanged publication and completion barriers. Historical measurements
+must not be relabeled as results for that memory-reuse revision.
+
 Execution is sequential on one explicitly prepared stream:
 
 ```text

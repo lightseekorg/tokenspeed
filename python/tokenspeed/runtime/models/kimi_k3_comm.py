@@ -631,6 +631,7 @@ class K3MoeTailCommState:
         self.fused_rs_up_ag_finalize = None
         self.fused_rs_up_ag_workspace = None
         self.fused_rs_up_ag_capacity = 0
+        self.integrated_tail_output_pool = None
         self.medium_fused_rs_up_ag_workspace = None
         self.medium_fused_rs_up_ag_capacity = 0
         self.latent_tail_ok = False  # per-layer ops built by K3MoeTailComm
@@ -1296,22 +1297,31 @@ class K3MoeTailComm:
                 FusedRsUpProjectionServing,
             )
 
-            # Per-layer outputs survive later layers' raw-workspace reuse and
-            # AttnRes prefix references. Allocate before KV-cache sizing.
+            # Integrated sequential layers alternate two symmetric outputs.
+            # AttnRes snapshots and EAGLE3 taps copy before either slot is reused.
+            # Historical profiles retain their separate per-layer outputs.
             if self.state.integrated_tail:
                 from tokenspeed_kernel.ops.communication.medium_fused_rs_up_projection_serving import (
-                    IntegratedFusedRsUpProjectionServing,
+                    IntegratedFusedRsOutputPool,
                 )
 
-                serving_type = IntegratedFusedRsUpProjectionServing
+                if self.state.integrated_tail_output_pool is None:
+                    self.state.integrated_tail_output_pool = (
+                        IntegratedFusedRsOutputPool(
+                            self.state.fused_rs_up_ag_workspace,
+                            self.state.fused_rs_up_ag_capacity,
+                        )
+                    )
+                self.fused_rs_up_ag = self.state.integrated_tail_output_pool.bind_layer(
+                    layer_index
+                )
             else:
-                serving_type = FusedRsUpProjectionServing
-            self.fused_rs_up_ag = serving_type(
-                self.state.fused_rs_up_ag_workspace,
-                self.state.fused_rs_up_ag_capacity,
-            )
+                self.fused_rs_up_ag = FusedRsUpProjectionServing(
+                    self.state.fused_rs_up_ag_workspace,
+                    self.state.fused_rs_up_ag_capacity,
+                )
             if self.state.integrated_tail:
-                # Same raw storage and per-layer output; only first-stage and
+                # Same raw storage and parity output; only first-stage and
                 # fused GEMM geometry depend on M. No duplicate large buffers.
                 self.medium_fused_rs_up_ag = self.fused_rs_up_ag
         if self.state.latent_tail_ok:

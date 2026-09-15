@@ -109,6 +109,57 @@ def policy():
     )
 
 
+def test_integrated_output_pool_allocates_two_slots_with_independent_layer_plans():
+    allocations = []
+
+    def allocate(group, capacity, *, device):
+        output = SimpleNamespace(group=group, capacity=capacity, device=device)
+        allocations.append(output)
+        return output
+
+    def adapter(workspace, capacity, *, output):
+        return SimpleNamespace(
+            workspace=workspace, capacity=capacity, output=output, _plans={}
+        )
+
+    workspace = SimpleNamespace(
+        state=SimpleNamespace(group=object(), max_token_num=8192, device="cuda:0")
+    )
+    namespace = definitions(
+        OPS / "medium_fused_rs_up_projection_serving.py",
+        {"IntegratedFusedRsOutputPool"},
+        {
+            "torch": SimpleNamespace(
+                cuda=SimpleNamespace(is_current_stream_capturing=lambda: False)
+            ),
+            "integrated_fused_rs_serving_config": profile()[
+                "integrated_fused_rs_serving_config"
+            ],
+            "allocate_symmetric_up_projection_output": allocate,
+            "IntegratedFusedRsUpProjectionServing": adapter,
+        },
+    )
+    pool = namespace["IntegratedFusedRsOutputPool"](workspace, 8192)
+    layers = [pool.bind_layer(index) for index in range(2, 94)]
+    assert len(allocations) == 2
+    assert all(
+        layer.output is allocations[index % 2] for index, layer in enumerate(layers)
+    )
+    assert len({id(layer._plans) for layer in layers}) == 92
+    layers[0]._plans[8192] = "first layer weight binding"
+    assert not layers[2]._plans
+    for invalid in (-1, True, 1.5):
+        with pytest.raises(ValueError, match="layer index"):
+            pool.bind_layer(invalid)
+    second = namespace["IntegratedFusedRsOutputPool"](workspace, 8192)
+    assert all(left is not right for left in pool.outputs for right in second.outputs)
+    assert len(allocations) == 4
+    namespace["torch"].cuda.is_current_stream_capturing = lambda: True
+    with pytest.raises(ValueError, match="precede capture"):
+        namespace["IntegratedFusedRsOutputPool"](workspace, 8192)
+    assert len(allocations) == 4
+
+
 def test_integrated_policy_and_profile_cover_continuous_ranges():
     namespace = policy()
     select = namespace["select_integrated_k3_moe_tail_tier"]

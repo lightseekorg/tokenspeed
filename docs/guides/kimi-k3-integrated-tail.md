@@ -52,10 +52,19 @@ does not imply stall-free MMA or cross-stream overlap of the two tail stages.
 
 ## Memory and validation
 
-Sequential layers share raw workspace but retain separate output buffers for
-graph lifetime. Independent concurrent executions require independent storage.
-At92 layers,8192×7168 BF16 outputs alone consume10304MiB per rank. Record measured
-KV-cache capacity, not just latency, when comparing serving configurations.
+Sequential layers share raw workspace and alternate two persistent symmetric
+outputs by global layer-index parity. The previous residual occupies the other
+slot; AttnRes snapshots and speculative taps retain independent copies. Each
+layer keeps its own weight-dependent launch cache. Independent concurrent
+executions require independent storage.
+
+Two 8192×7168 BF16 outputs consume 224 MiB per rank instead of the original
+92-layer allocation's 10304 MiB. This saves 10080 MiB of output allocation;
+measured KV capacity and serving performance still need verification for this
+revision. Results from the original per-layer-output campaign do not validate
+the pooled version. The integrated distributed test's `--pooled-outputs` option
+checks four chained layers, two graph slots and changed-input replay; its
+intermediate snapshots are correctness instrumentation, not serving copies.
 
 First-start graph preparation compiles shape-specific launch bindings and can
 be substantially slower than main. Report startup and capture cost separately

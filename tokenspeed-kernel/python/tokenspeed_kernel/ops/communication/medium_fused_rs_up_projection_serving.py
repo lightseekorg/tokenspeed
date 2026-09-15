@@ -50,12 +50,20 @@ class MediumFusedRsUpProjectionServing(FusedRsUpProjectionServing):
 
     profile = staticmethod(medium_fused_rs_serving_config)
 
-    def __init__(self, workspace: SharedRsWorkspace, max_tokens: int):
+    def __init__(
+        self,
+        workspace: SharedRsWorkspace,
+        max_tokens: int,
+        *,
+        output: SymmetricUpProjectionOutput | None = None,
+    ):
         """Allocate one layer's output before KV sizing and graph capture.
 
         Args:
             workspace: Model-owned raw symmetric storage, used sequentially.
             max_tokens: Largest provisional bucket this output must cover.
+            output: Optional model-owned symmetric output. Its prior consumers
+                must finish before reuse; it must outlive every bound graph.
         """
         self.profile(max_tokens)
         if torch.cuda.is_current_stream_capturing():
@@ -63,9 +71,19 @@ class MediumFusedRsUpProjectionServing(FusedRsUpProjectionServing):
         if max_tokens > workspace.state.max_token_num:
             raise ValueError("medium output capacity exceeds raw workspace")
         self.workspace = workspace
-        self.output = allocate_symmetric_up_projection_output(
-            workspace.state.group, max_tokens, device=workspace.state.device
-        )
+        if output is None:
+            output = allocate_symmetric_up_projection_output(
+                workspace.state.group, max_tokens, device=workspace.state.device
+            )
+        if (
+            output.tensor.shape != (max_tokens, 7168)
+            or output.tensor.dtype != torch.bfloat16
+            or output.tensor.device != workspace.state.device
+            or output.group is not workspace.state.group
+            or not output.tensor.is_contiguous()
+        ):
+            raise ValueError("serving output must match workspace group and capacity")
+        self.output = output
         self._plans: dict[int, _PreparedLaunch] = {}
 
     def input_view(self, num_tokens: int) -> torch.Tensor:
@@ -118,3 +136,49 @@ class IntegratedFusedRsUpProjectionServing(MediumFusedRsUpProjectionServing):
     """
 
     profile = staticmethod(integrated_fused_rs_serving_config)
+
+
+class IntegratedFusedRsOutputPool:
+    """Two outputs for sequential K3 layers, never for concurrent executions.
+
+    AttnRes snapshots and speculative hidden-state taps must own copies. The
+    current layer's residual may reference the previous slot, not this slot.
+    The inherited publication barrier orders prior consumers across ranks
+    before multicast overwrites a slot; output completion precedes consumers.
+    """
+
+    def __init__(self, workspace: SharedRsWorkspace, max_tokens: int):
+        """Allocate both model-owned slots before KV sizing and graph capture.
+
+        Args:
+            workspace: Shared raw workspace for one sequential model instance.
+            max_tokens: Maximum output capacity, common to both slots.
+        """
+        integrated_fused_rs_serving_config(max_tokens)
+        if torch.cuda.is_current_stream_capturing():
+            raise ValueError("output pool allocation must precede capture")
+        if max_tokens > workspace.state.max_token_num:
+            raise ValueError("output pool capacity exceeds raw workspace")
+        self.workspace = workspace
+        self.max_tokens = max_tokens
+        self.outputs = tuple(
+            allocate_symmetric_up_projection_output(
+                workspace.state.group, max_tokens, device=workspace.state.device
+            )
+            for _ in range(2)
+        )
+
+    def bind_layer(self, layer_index: int) -> IntegratedFusedRsUpProjectionServing:
+        """Return a layer-specific launch cache using its fixed parity slot.
+
+        Args:
+            layer_index: Nonnegative global decoder-layer index.
+
+        Returns:
+            Adapter with independent weight/plan bindings and a shared output.
+        """
+        if type(layer_index) is not int or layer_index < 0:
+            raise ValueError("layer index must be a nonnegative integer")
+        return IntegratedFusedRsUpProjectionServing(
+            self.workspace, self.max_tokens, output=self.outputs[layer_index % 2]
+        )

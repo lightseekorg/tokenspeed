@@ -41,11 +41,28 @@ uses one CTA throughout M33..1024. This is a simplicity choice among close
 screened configurations, not proof of noise or a universal small-batch rule.
 Historical endpoint-only profiles and their measured results remain unchanged.
 
-One raw symmetric workspace is shared by sequential layers; each layer owns
-one 8192x7168 BF16 symmetric output, shared across M profiles. At 92 layers
-the outputs alone require 10304 MiB. Allocate before KV sizing, record actual
-KV capacity, and keep every allocation alive through all graph replays.
-Different model/graph instances running concurrently require separate storage.
+One raw symmetric workspace and two 8192x7168 BF16 symmetric outputs are
+shared by sequential layers. Global layer-index parity selects the output;
+each layer still owns its weight-dependent launch cache. Both outputs together
+require 224 MiB, versus 10304 MiB for the original 92 per-layer outputs.
+This is a 10080 MiB allocation reduction, not yet a measured KV-capacity or
+serving-throughput improvement. The original two-batch campaign uses the old
+per-layer allocation and must not qualify this revised ownership policy.
+
+The previous layer's output can remain the current residual, so one output
+would be unsafe. Two outputs keep it distinct from the current destination;
+the existing live-input alias checks remain enabled. AttnRes block writes copy
+into independent block storage, and EAGLE3/DFLASH taps clone or materialize their
+results before later layers overwrite a slot. The existing entry rank barrier
+orders all prior consumers before multicast reuse, and the exit barrier makes
+the result visible before its next consumers. Auxiliary consumer streams must
+join before reuse. No new copy or device barrier is introduced.
+
+Allocate before KV sizing and retain both handles through every graph replay.
+All graph buckets use fixed parity addresses and execute sequentially; outputs
+are transient until the same slot is next written, not per-layer archives.
+Different concurrent model/graph instances require separate storage. The
+historical endpoint-only and medium-only profiles retain per-layer outputs.
 
 Arithmetic, early accumulator release, direct TMA multicast, external
 publication/completion barriers, alias checks and live capture pointers retain
