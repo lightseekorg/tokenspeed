@@ -224,6 +224,9 @@ class ServerArgs:
     kvstore_ratio: float = 2.0
     kvstore_size: int = 0
     kvstore_io_backend: str = "kernel"
+    # Optional L3 storage beneath the compact Host cache.
+    kvstore_storage_backend: str | None = None
+    kvstore_storage_backend_extra_config: str | None = None
 
     # Multi-node distributed serving. ``None`` means "not given by the user",
     # which is what lets the launcher environment fill them in.
@@ -853,6 +856,12 @@ class ServerArgs:
         elif not self.disable_kvstore:
             self.enable_kvstore = True
 
+        if self.kvstore_storage_backend is not None and not self.enable_kvstore:
+            raise ValueError(
+                "L3 storage (--kvstore-storage-backend) requires Host L2; "
+                "unset --disable-kvstore"
+            )
+
     def validate_cache_options(self):
         speculative_algorithm = getattr(self, "speculative_algorithm", None)
         draft_model_path_use_base = getattr(self, "draft_model_path_use_base", False)
@@ -1209,6 +1218,24 @@ class ServerArgs:
             choices=["direct", "kernel"],
             default=ServerArgs.kvstore_io_backend,
             help="The IO backend for KVStore transfer between CPU and GPU.",
+        )
+        parser.add_argument(
+            "--kvstore-storage-backend",
+            type=str,
+            choices=["mooncake", "memory"],
+            default=ServerArgs.kvstore_storage_backend,
+            help="L3 store under compact Host (flat) KV. "
+            "'mooncake' is Mooncake Store (SGLang/vLLM HiCache equivalent). "
+            "'memory' is an in-process dict for tests. Requires Host L2 "
+            "(do not pass --disable-kvstore).",
+        )
+        parser.add_argument(
+            "--kvstore-storage-backend-extra-config",
+            type=str,
+            default=ServerArgs.kvstore_storage_backend_extra_config,
+            help="JSON object of extra L3 backend settings. For mooncake: "
+            "master_server_address, local_hostname, metadata_server, "
+            "global_segment_size, protocol, device_name, tenant_id.",
         )
         # Mamba Cache
         parser.add_argument(

@@ -1,0 +1,54 @@
+name: Mooncake L3 Master Test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "python/tokenspeed/runtime/cache/l3/**"
+      - "test/test_l3_mooncake_master.py"
+      - "test/test_l3_kvstore.py"
+      - ".github/workflows/mooncake-l3-test.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "python/tokenspeed/runtime/cache/l3/**"
+      - "test/test_l3_mooncake_master.py"
+      - "test/test_l3_kvstore.py"
+      - ".github/workflows/mooncake-l3-test.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: mooncake-l3-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install Mooncake master runtime
+        run: |
+          python -m pip install --retries 10 --timeout 60 \
+            'mooncake-transfer-engine-non-cuda==0.3.12.post1' \
+            'nvidia-cuda-runtime-cu12==12.9.79'
+          if ! sudo apt-get install -y \
+            libcurl4 libibverbs1 librdmacm1 libnuma1 rdma-core; then
+            sudo apt-get update -o Acquire::Retries=5
+            sudo apt-get install -y -o Acquire::Retries=5 \
+              libcurl4 libibverbs1 librdmacm1 libnuma1 rdma-core
+          fi
+
+      - name: Run L3 unit tests and live master roundtrip
+        env:
+          MOONCAKE_REQUIRE_MASTER: "1"
+          PYTHONPATH: python
+        run: |
+          python -m unittest test.test_l3_kvstore test.test_l3_mooncake_master -v

@@ -185,6 +185,14 @@ Retracted RetractEvent::operator()(PrefillDone&& state) {
     return retract(std::move(state));
 }
 
+Retracted RetractEvent::operator()(PrefillAwaitingResult&& state) {
+    return retract(std::move(state));
+}
+
+Retracted RetractEvent::operator()(RemotePrefilling&& state) {
+    return retract(std::move(state));
+}
+
 Retracted RetractEvent::operator()(Decoding&& state) {
     return retract(std::move(state));
 }

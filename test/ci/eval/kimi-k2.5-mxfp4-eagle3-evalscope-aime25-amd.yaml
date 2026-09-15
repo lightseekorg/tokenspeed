@@ -42,6 +42,7 @@ eval:
   command: >-
     HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
     /tmp/evalscope-perf/bin/evalscope eval
+    --work-dir .ci-artifacts/published/evalscope-results
     --model amd/Kimi-K2.5-MXFP4
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
@@ -51,7 +52,7 @@ eval:
     --limit 4
     --eval-batch-size 4
     --stream
-    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":8192}'
+    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":65536}'
 report:
   github_step_summary: true
 score_threshold: 0.75

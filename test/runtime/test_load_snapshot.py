@@ -503,7 +503,49 @@ def test_event_loop_binds_the_output_setter_only_where_it_exists():
     loop = event_loop_module.EventLoop.__new__(event_loop_module.EventLoop)
     loop.attn_tp_rank = 1
     loop.dp_rank = 4
-    loop.server_args = SimpleNamespace(zmq_msgpack=True, load_watch_interval=0.25)
+    loop.server_args = SimpleNamespace(
+        zmq_msgpack=True,
+        load_watch_interval=0.25,
+        mapping=SimpleNamespace(
+            has_pp=False,
+            rank=1,
+            attn=SimpleNamespace(cp_rank=0),
+        ),
+    )
+    loop.port_args = SimpleNamespace(metrics_ipc_name="tcp://metrics")
+    loop.send_to_tokenizer = TrapSender()
+    loop._scheduler_cache_geometry = SimpleNamespace(num_usable_pages=20)
+
+    loop._init_load_reporter()
+
+    assert isinstance(
+        loop.load_reporter._publisher, load_snapshot_module.NullLoadSnapshotPublisher
+    )
+
+
+def test_event_loop_skips_load_reporter_on_cp_nonowners():
+    """ENABLE_CP leaves every worker at attn_tp_rank 0; nonowners still get
+    a NullSender and must not touch set_load_snapshot during reporter init."""
+    pytest.importorskip("tokenspeed_scheduler")
+    from tokenspeed.runtime.engine import event_loop as event_loop_module
+    from tokenspeed.runtime.engine.io_struct import NullSender
+
+    class TrapSender(NullSender):
+        def __getattr__(self, name):
+            raise AssertionError(f"CP nonowner consulted the sender: {name}")
+
+    loop = event_loop_module.EventLoop.__new__(event_loop_module.EventLoop)
+    loop.attn_tp_rank = 0
+    loop.dp_rank = 0
+    loop.server_args = SimpleNamespace(
+        zmq_msgpack=True,
+        load_watch_interval=0.25,
+        mapping=SimpleNamespace(
+            has_pp=False,
+            rank=1,
+            attn=SimpleNamespace(cp_rank=1),
+        ),
+    )
     loop.port_args = SimpleNamespace(metrics_ipc_name="tcp://metrics")
     loop.send_to_tokenizer = TrapSender()
     loop._scheduler_cache_geometry = SimpleNamespace(num_usable_pages=20)

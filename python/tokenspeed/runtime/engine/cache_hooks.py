@@ -24,11 +24,21 @@ Owns everything between an execution plan's cache ops and the scheduler
 events their completions eventually produce: count what the plan puts in
 flight (``DeviceHandle.execute`` submits the transfers themselves, on the
 data plane, from the same plan), poll
-completions (control-side event queries), and agree across attn-tp ranks on
+completions (control-side event queries), and agree across every
+cache-owning rank in the replica (attention TP, then CP, then PP) on
 which completions EVERY rank has seen (the C++ scheduler is mirrored, so an
-event may only advance once all ranks hold it). ``poll_ready_events`` returns
-events for the event loop to apply — feedback into the scheduler stays an
-explicit ``advance_scheduler`` call in the loop body.
+event may only advance once all ranks hold it). L3 Host backups complete
+asynchronously, so a rank-local ``WriteBackDone`` would ``CacheHostBlock``
+on one mirrored scheduler while a CP/PP peer still has the op pending.
+Every rank enters every replica-group gather, including with an empty
+intermediate intersection; skipping a later CP/PP ``all_gather_object``
+hangs ranks whose first group already agreed. An L3 backup future that
+fails is converted into a rank-local flag and MAX-reduced on that same
+first replica all_reduce so every rank raises together instead of one
+rank raising out of ``poll_results`` while peers wait in the gather.
+``poll_ready_events`` returns events for the event loop to apply —
+feedback into the scheduler stays an explicit ``advance_scheduler`` call
+in the loop body.
 
 Depends only on the device handle and static parallel-layout config, not on
 live event-loop state. ``device=None`` (kvstore disabled) makes every method
@@ -66,9 +76,15 @@ class L2CacheHooks:
         attn_tp_rank: int,
         attn_tp_size: int,
         attn_tp_cpu_group,
+        attn_cp_size: int,
+        attn_cp_cpu_group,
+        pp_size: int,
+        pp_cpu_group,
         global_rank: int,
     ) -> None:
         self._device = device
+        # Replica-wide skip/intersect is the general path, not DFLASH-only.
+        # The argument stays required so EventLoop wiring remains explicit.
         self._speculative_algorithm = speculative_algorithm
         self._attn_tp_rank = attn_tp_rank
         self._attn_tp_size = attn_tp_size
@@ -77,9 +93,18 @@ class L2CacheHooks:
         self._pending_payloads: OrderedDict[tuple[str, int], dict] = OrderedDict()
         # All ranks submit identical cache plans (the C++ scheduler is
         # mirrored), so a local in-flight counter mirrors across ranks: if it's
-        # 0 here, no rank has anything pending. Lets us skip the TP collective
-        # in poll_ready_events entirely when nothing is in flight.
+        # 0 here, no rank has anything pending. Lets us skip the replica
+        # collectives in poll_ready_events entirely when nothing is in flight
+        # — but only after every cache-owning rank agrees the replica is idle.
         self._num_inflight = 0
+        replica_groups = []
+        if attn_tp_size > 1 and attn_tp_cpu_group is not None:
+            replica_groups.append((attn_tp_size, attn_tp_cpu_group))
+        if attn_cp_size > 1 and attn_cp_cpu_group is not None:
+            replica_groups.append((attn_cp_size, attn_cp_cpu_group))
+        if pp_size > 1 and pp_cpu_group is not None:
+            replica_groups.append((pp_size, pp_cpu_group))
+        self._replica_groups = replica_groups
 
     def count_plan_ops(self, execution_plan) -> None:
         """Count the cache ops this plan will put in flight.
@@ -109,20 +134,32 @@ class L2CacheHooks:
             payload = cache_event_to_payload(event)
             self._pending_payloads[cache_event_key(payload)] = payload
 
-        # The gather below is a collective, but cache-op completion is async and
-        # not lock-step across ranks, so local state (_num_inflight /
-        # _pending_payloads) diverges transiently. A rank-local skip would let
-        # some ranks gather while others return, deadlocking the group. Agree on
-        # the skip via a cheap single-int all_reduce.
-        # Outside DFLASH/DSPARK cache ops are rank-deterministic, so the local
-        # short-circuit is safe and avoids the collective.
+        # Completions are async (CUDA copies, L3 backups) and not lock-step
+        # across TP/CP/PP, so local state (_num_inflight / _pending_payloads)
+        # diverges transiently. A rank-local skip would let some ranks gather
+        # while others return, deadlocking the group. Agree on work and on
+        # backup failure via a two-int MAX all_reduce on each replica group.
         local_has_work = bool(self._num_inflight != 0 or self._pending_payloads)
-        if self._speculative_algorithm in ("DFLASH", "DSPARK"):
-            if not self._group_has_work(local_has_work):
+        local_backup_failed = self._device.consume_l3_backup_poll_failure()
+        if self._replica_groups:
+            has_work, backup_failed = self._converge_poll_state(
+                local_has_work, local_backup_failed
+            )
+            if backup_failed:
+                raise RuntimeError(
+                    "L3 backup failed on a replica rank; every cache-owning "
+                    "rank raises after the poll all_reduce so peers are not "
+                    "left in all_gather_object"
+                )
+            if not has_work:
                 return []
-        else:
-            if not local_has_work:
-                return []
+        elif local_backup_failed:
+            raise RuntimeError(
+                "L3 backup failed; refusing WriteBackDone until replica "
+                "ranks can converge on the failure"
+            )
+        elif not local_has_work:
+            return []
 
         ready_payloads = self._pop_ready_payloads()
         if not ready_payloads:
@@ -142,36 +179,49 @@ class L2CacheHooks:
             events.append(e)
         return events
 
-    def _group_has_work(self, local_has_work: bool) -> bool:
-        """Whether ANY attn-tp rank has cache work this step (unanimous via a
-        single-int MAX all_reduce, far cheaper than the payload gather it
-        guards). Deciding from rank-local state alone deadlocks the group; see
+    def _converge_poll_state(
+        self, local_has_work: bool, local_backup_failed: bool
+    ) -> tuple[bool, bool]:
+        """Replica MAX of in-flight work and L3 backup failure.
+
+        Single two-int MAX all_reduce on attention TP, then CP, then PP
+        (same order as L3 exists / flush). Deciding from rank-local state
+        alone deadlocks the group when a peer still has in-flight backups
+        or when one rank raised out of ``poll_results``; see
         poll_ready_events.
 
         Args:
             local_has_work: This rank's view of whether any cache op is in
                 flight or any polled payload awaits commit.
+            local_backup_failed: Whether this rank's L3 backup future failed
+                since the last poll.
 
         Returns:
-            ``True`` if any rank has work (all must gather); ``False`` only when
-            every rank is idle.
+            ``(has_work, backup_failed)`` after MAX-reducing both flags.
         """
-        if self._attn_tp_size == 1:
-            return local_has_work
-        flag = torch.tensor([1 if local_has_work else 0], dtype=torch.int32)
-        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=self._attn_tp_cpu_group)
-        return bool(flag.item())
+        flag = torch.tensor(
+            [1 if local_has_work else 0, 1 if local_backup_failed else 0],
+            dtype=torch.int32,
+        )
+        for _size, group in self._replica_groups:
+            dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
+        return bool(flag[0].item()), bool(flag[1].item())
 
     def _pop_ready_payloads(self) -> list[dict]:
-        local_payloads = list(self._pending_payloads.values())
-        if self._attn_tp_size == 1:
-            ready_payloads = local_payloads
-        else:
-            gathered_payloads = [None] * self._attn_tp_size
+        """Intersect pending completions across every replica group.
+
+        Attention TP, then CP, then PP, matching L3 exists / flush. Every
+        rank enters every ``all_gather_object``: an empty intermediate
+        intersection still gathers ``[]`` so a peer that is ready on a
+        later group is not left unmatched.
+        """
+        ready_payloads = list(self._pending_payloads.values())
+        for size, group in self._replica_groups:
+            gathered_payloads = [None] * size
             dist.all_gather_object(
                 gathered_payloads,
-                local_payloads,
-                group=self._attn_tp_cpu_group,
+                ready_payloads,
+                group=group,
             )
             ready_payloads = pop_common_cache_event_payloads(gathered_payloads)
             if self._attn_tp_rank == 0 and cache_sync_debug_enabled():

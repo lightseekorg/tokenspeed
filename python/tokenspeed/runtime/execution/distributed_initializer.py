@@ -167,6 +167,12 @@ class DistributedInitializer:
         pg_manager.init_process_group(config.mapping.world_group)
         pg_manager.init_process_group(config.mapping.attn.tp_group)
         pg_manager.init_process_group(config.mapping.attn.dp_group)
+        if config.mapping.has_attn_cp:
+            # Context-parallel ranks own different token blocks but must
+            # agree on L3 prefix hits before admit. ENABLE_CP folds attn TP
+            # into CP, so attn.tp_group is size 1 and this group is the
+            # replica's cache-owning set inside a stage.
+            pg_manager.init_process_group(config.mapping.attn.cp_group)
         # No-op at the default linear_attn.tp == attn.tp (same group,
         # idempotent).
         pg_manager.init_process_group(config.mapping.linear_attn.tp_group)

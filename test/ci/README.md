@@ -82,6 +82,22 @@ score miss. Use it for infrastructure flakes (CUDA launch failure, NVLink
 barrier timeout, GPU memory-access fault) where a clean second attempt is
 cheap relative to a red PR.
 
+The AMD Kimi-K2.5 AIME25 gate writes EvalScope results under
+`.ci-artifacts/published/evalscope-results`. Its CI artifact upload runs on both
+success and failure, including timestamped per-question predictions and scoring
+records. Compare the
+responses, stop reasons, and extracted answers when investigating an accuracy
+miss before changing the token limit or sampling configuration.
+
+The AMD Kimi-K2.5 AIME25 gate allows `max_tokens=65536`, matching the NVIDIA
+Kimi-K2.5 EAGLE3 and DFlash tasks. The same question was truncated in both the
+[8K run](https://github.com/lightseekorg/tokenspeed/actions/runs/34763795877) and
+[16K run](https://github.com/lightseekorg/tokenspeed/actions/runs/34764637152).
+With the larger budget, the [64K run](https://github.com/lightseekorg/tokenspeed/actions/runs/34765831078)
+completed all four answers correctly with natural stops; the longest used 41181
+output tokens. The four questions, batch size four, greedy sampling, EAGLE3
+configuration, score threshold of 0.75, and timeouts remain unchanged.
+
 `optional` marks a task or per-label matrix entry as non-blocking.
 Optional entries are emitted with `matrix.optional: true`, and the PR workflows
 map that to GitHub Actions `continue-on-error`.
