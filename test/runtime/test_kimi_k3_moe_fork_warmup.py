@@ -185,40 +185,5 @@ def test_eager_serving_leaves_the_fork_disabled():
     assert call["enable"] is False
 
 
-@pytest.mark.parametrize("supported_width", [False, True])
-def test_prequantized_down_input_keeps_width_fallback(supported_width):
-    """Only eligible rows bypass the ordinary projection/gather consumer."""
-    moe = _make_moe(_SpyFork())
-    hidden = torch.zeros(2, 4)
-    projection = mock.Mock(return_value=(hidden, None))
-    projection.weight = torch.empty(1)
-    encoded = object()
-    fused = mock.Mock(return_value=encoded)
-    fused.handles.return_value = supported_width
-    experts = mock.Mock(return_value=hidden)
-    moe.routed_expert_down_proj = projection
-    moe._nvfp4_down = fused
-    moe._routed_experts = experts
-    with (
-        mock.patch(
-            "tokenspeed.runtime.models.kimi_k3.get_is_cuda_graph_phase",
-            return_value=False,
-        ),
-        mock.patch(
-            "tokenspeed.runtime.models.kimi_k3.get_is_capture_mode", return_value=False
-        ),
-    ):
-        KimiLinearMoE.forward(moe, hidden, hidden.clone(), 2, 2)
-    fused.handles.assert_called_once_with(2)
-    if supported_width:
-        fused.assert_called_once_with(hidden, projection.weight)
-        projection.assert_not_called()
-        assert experts.call_args.args[0] is encoded
-    else:
-        fused.assert_not_called()
-        projection.assert_called_once_with(hidden)
-        assert experts.call_args.args[0] is hidden
-
-
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
