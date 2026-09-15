@@ -104,8 +104,8 @@ def dsv4_mega_moe_plan(
     """Create an opaque DeepSeek V4 MegaMoE execution plan.
 
     Kernel selection applies registry capability requirements. The currently
-    registered implementation requires NVIDIA SM100 and the pinned DeepGEMM
-    package supplied by the CUDA installation.
+    registered implementation requires NVIDIA SM100 and optional DeepGEMM
+    MegaMoE symbols, so planning fails cleanly when either is unavailable.
 
     Args:
         num_experts: Total number of routed experts across the EP group.
