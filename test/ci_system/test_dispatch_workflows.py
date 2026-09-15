@@ -7,7 +7,13 @@ import yaml
 from pipeline import build_matrix
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-K8S_RUNNER_PREFIXES = ("b200-", "amd-", "gb200-", "b300-")
+K8S_RUNNER_PREFIXES = (
+    "b200-",
+    "amd-",
+    "linux-mi355-",
+    "gb200-",
+    "b300-",
+)
 SLURM_RUNNER_PREFIXES = (
     "b200-",
     "gb200-",
@@ -296,7 +302,7 @@ def test_kernel_benchmark_task_uses_shared_ci_contract():
     assert task["type"] == "perf"
     assert task["workflow_stage"] == "kernel-benchmark"
     assert task["triggers"] == ["per-commit", "manual"]
-    assert task["runner"]["labels"] == ["amd-mi355-1gpu-bench"]
+    assert task["runner"]["labels"] == ["linux-mi355-1.lightseek.test"]
     assert ".ci-artifacts/published" in task["perf"]["command"]
     for variable in ("BASE_REF", "CANDIDATE_REF", "PR_NUMBER", "MERGE_SHA"):
         assert variable in task["perf"]["command"]

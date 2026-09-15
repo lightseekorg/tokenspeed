@@ -93,7 +93,7 @@ optional: true
 # only the MI355 bench entry is non-blocking; the MI350 entry of the same
 # task still blocks on failure
 optional:
-  amd-mi355-1gpu-bench: true
+  linux-mi355-1.lightseek.test: true
 ```
 
 The NVIDIA PR workflow routes `b200-<Ngpu>` task labels to
@@ -193,7 +193,7 @@ meaningful manual comparison, use `K8s Dispatch`: selecting a pull request uses
 its target and head revisions, while selecting a commit compares it with the
 latest `main`. Both revisions always execute serially in one task allocation.
 
-The task requests the `amd-mi355-1gpu-bench` runner pool and exposes logical
+The task requests the `linux-mi355-1.lightseek.test` runner pool and exposes logical
 device 0. Each allocation must provide one exclusive `gfx950` GPU, working ROCm
 device permissions, Git, Bash, Python virtual-environment support, sufficient
 temporary storage, and access to the configured package indexes. The normal AMD

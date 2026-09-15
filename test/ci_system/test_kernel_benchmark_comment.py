@@ -131,7 +131,7 @@ class FakeGitHub:
                         "id": 9001,
                         "name": (
                             "pr-test-kernel-benchmark-amd-gfx950-"
-                            f"amd-mi355-1gpu-bench-{RUN_ID}-{RUN_ATTEMPT}"
+                            f"linux-mi355-1.lightseek.test-{RUN_ID}-{RUN_ATTEMPT}"
                         ),
                         "expired": False,
                     }

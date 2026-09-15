@@ -124,7 +124,7 @@ def test_server_log_wrapper_preserves_server_exit_code(tmp_path):
 def test_amd_runner_prefixes_cover_legacy_and_arc_labels():
     assert is_amd_runner("amd-mi35x-1gpu-test")
     assert is_amd_runner("amd-mi35x-4gpu-test")
-    assert is_amd_runner("amd-mi355-1gpu-bench")
+    assert is_amd_runner("linux-mi355-1.lightseek.test")
     assert is_amd_runner("amd-mi350-1gpu-bench")
     assert is_amd_runner("amd-mi350-4gpu-bench")
     assert is_amd_runner("amd-mi450-sim")
@@ -138,7 +138,7 @@ def test_cpu_only_runners_are_told_apart_from_gpu_pools():
     # other AMD task has nothing to reclaim there.
     assert is_cpu_only_runner("amd-mi45x-cpu-test")
     assert not is_cpu_only_runner("amd-mi35x-1gpu-test")
-    assert not is_cpu_only_runner("amd-mi355-1gpu-bench")
+    assert not is_cpu_only_runner("linux-mi355-1.lightseek.test")
 
 
 def test_cpu_only_amd_runner_skips_the_gpu_reclaim(capsys, tmp_path):
@@ -242,7 +242,7 @@ def test_nvidia_gpu_cleanup_runner_prefixes_cover_gb200_and_b300():
     assert not should_run_nvidia_gpu_cleanup("b200-4gpu")
     assert not should_run_nvidia_gpu_cleanup("h100-1gpu")
     assert not should_run_nvidia_gpu_cleanup("amd-mi35x-2gpu-test")
-    assert not should_run_nvidia_gpu_cleanup("amd-mi355-1gpu-bench")
+    assert not should_run_nvidia_gpu_cleanup("linux-mi355-1.lightseek.test")
     assert not should_run_nvidia_gpu_cleanup("amd-mi350-1gpu-bench")
 
 
@@ -1247,7 +1247,7 @@ def test_build_matrix_selects_kernel_benchmark_stage(tmp_path):
         workflow_stage: kernel-benchmark
         triggers: [per-commit]
         runner:
-          labels: [amd-mi355-1gpu-bench]
+          labels: [linux-mi355-1.lightseek.test]
         perf:
           command: run benchmark
         """,
@@ -1262,7 +1262,7 @@ def test_build_matrix_selects_kernel_benchmark_stage(tmp_path):
         workflow_stage: model-test
         triggers: [per-commit]
         runner:
-          labels: [amd-mi355-1gpu-bench]
+          labels: [linux-mi355-1.lightseek.test]
         perf:
           command: run model
         """,
@@ -1359,7 +1359,7 @@ def test_build_matrix_excludes_runner_label_substrings_case_insensitively(
             [
                 "b300-1gpu",
                 "gb300-4gpu",
-                "amd-mi355-1gpu-bench",
+                "linux-mi355-1.lightseek.test",
                 "h100-1gpu",
             ],
         ),
@@ -1391,7 +1391,7 @@ def test_build_matrix_empty_exclusion_restores_all_runners(monkeypatch, tmp_path
         "mixed.yaml",
         _default_body(
             "mixed",
-            ["b300-1gpu", "amd-mi355-1gpu-bench"],
+            ["b300-1gpu", "linux-mi355-1.lightseek.test"],
         ),
     )
 
@@ -1399,18 +1399,18 @@ def test_build_matrix_empty_exclusion_restores_all_runners(monkeypatch, tmp_path
 
     assert [entry["runner"] for entry in matrix["include"]] == [
         "b300-1gpu",
-        "amd-mi355-1gpu-bench",
+        "linux-mi355-1.lightseek.test",
     ]
 
 
 def test_build_matrix_all_excluded_returns_empty_include(monkeypatch, tmp_path):
-    monkeypatch.setenv("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS", "gpu")
+    monkeypatch.setenv("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS", "gpu,mi355")
     _write_task_yaml(
         tmp_path,
         "mixed.yaml",
         _default_body(
             "mixed",
-            ["b300-1gpu", "amd-mi355-1gpu-bench"],
+            ["b300-1gpu", "linux-mi355-1.lightseek.test"],
         ),
     )
 
@@ -1518,14 +1518,14 @@ def test_build_matrix_per_label_optional_only_affects_listed_label(tmp_path):
         "ut-kernel.yaml",
         _default_body(
             "ut-kernel",
-            ["h100-1gpu", "amd-mi355-1gpu-bench"],
-            extra="optional:\n  amd-mi355-1gpu-bench: true\n",
+            ["h100-1gpu", "linux-mi355-1.lightseek.test"],
+            extra="optional:\n  linux-mi355-1.lightseek.test: true\n",
         ),
     )
     matrix = build_matrix(tmp_path, tmp_path, trigger="per-commit")
     assert [(e["runner"], e["optional"]) for e in matrix["include"]] == [
         ("h100-1gpu", False),
-        ("amd-mi355-1gpu-bench", True),
+        ("linux-mi355-1.lightseek.test", True),
     ]
 
 

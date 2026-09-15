@@ -7,7 +7,7 @@ triggers:
   - manual
 runner:
   labels:
-    - amd-mi355-1gpu-bench
+    - linux-mi355-1.lightseek.test
 env:
   CI: "true"
   CUDA_VISIBLE_DEVICES: "0"
