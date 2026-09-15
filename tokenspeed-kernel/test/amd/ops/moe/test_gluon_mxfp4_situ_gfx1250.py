@@ -32,6 +32,7 @@ if not is_cdna5():
     )
 
 import tokenspeed_kernel  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import fused  # noqa: E402
 
 _KERNEL_NAME = "gluon_mxfp4_a8w4_situ_gfx1250_precomputed_moe_apply"
 
@@ -123,7 +124,9 @@ def _make_plan() -> dict:
     return plan
 
 
-@pytest.mark.parametrize("num_tokens", [1, 4, 32])
+# 65 is the smallest size above the prefill BLOCK_M of 64, so off_m is nonzero
+# for the tail block.
+@pytest.mark.parametrize("num_tokens", [1, 4, 32, 65])
 def test_kimi_k3_tp_situ_matches_a8w4_reference_gfx1250(
     num_tokens: int,
 ) -> None:
@@ -157,6 +160,38 @@ def test_kimi_k3_tp_situ_matches_a8w4_reference_gfx1250(
     torch.cuda.synchronize()
     assert torch.count_nonzero(expected).item() > 0
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=5e-2)
+
+
+# A real 64-bit index type needs a multi-gigabyte weight slab, so force the
+# predicate instead
+@pytest.mark.parametrize("num_tokens", [1, 4, 32])
+def test_kimi_k3_tp_situ_compiles_and_matches_with_upcast_indices_gfx1250(
+    num_tokens: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, _, hidden_states, topk_weights, topk_ids, router_logits = _make_case(
+        num_tokens
+    )
+    plan = _make_plan()
+    tokenspeed_kernel.moe_process_weights(plan, module)
+
+    def apply() -> torch.Tensor:
+        return tokenspeed_kernel.moe_apply(
+            plan,
+            hidden_states,
+            module,
+            router_logits,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        ).clone()
+
+    narrow = apply()
+    monkeypatch.setattr(fused, "should_upcast_indices", lambda *args: True)
+    wide = apply()
+
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(narrow).item() > 0
+    torch.testing.assert_close(wide, narrow, atol=0.0, rtol=0.0)
 
 
 def test_kimi_k3_tp_situ_is_cuda_graph_capturable_gfx1250() -> None:
