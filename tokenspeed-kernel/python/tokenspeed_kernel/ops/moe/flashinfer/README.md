@@ -15,6 +15,8 @@ even when graphs reuse a memory pool. No host synchronization or extra routing
 buffer is needed.
 
 `thirdparty/flashinfer/trtllm_moe.py` builds a source-keyed private JIT module.
+The adapter ships as a Python package in both source distributions and wheels;
+it does not require a source checkout on `PYTHONPATH`.
 It adds a checked `cudaMemsetAsync` after the named map allocation and retains
 FlashInfer's routing, tuning, GEMM implementations and Python API signatures.
 The installed package and stock JIT modules are unchanged. The first warmup

@@ -552,8 +552,9 @@ class ModelExecutor:
         """Profile tunable kernels over one dummy prefill before graph capture.
 
         The dummy batch is capped by both the chunked-prefill token budget and
-        rank-local request capacity. ``make_dummy_batch`` splits tokens into
-        requests of at most ``context_len``, while request-indexed buffers
+        rank-local request capacity. The caller supplies the minimum request
+        count that fits the model context; ``make_dummy_batch`` balances tokens
+        across those requests, while request-indexed buffers
         contain only ``max_num_seqs // data_parallel_size`` rows. Keeping the
         token count within their product prevents autotuning from constructing
         a batch that cannot fit those buffers.
@@ -611,7 +612,8 @@ class ModelExecutor:
             ib.fill_dummy_decode_buffers(
                 batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
             )
-            ctx = self.prefill_graph.make_dummy_batch(num_tokens)
+            bs = -(-num_tokens // max(1, int(self.config.context_len)))
+            ctx = self.prefill_graph.make_dummy_batch(num_tokens, bs)
             positions = (
                 ib.mrope_positions_buf[:, :num_tokens]
                 if self.config.model_is_mrope

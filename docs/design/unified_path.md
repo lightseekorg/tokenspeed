@@ -721,6 +721,9 @@ The outer owner captures exact request counts from
 with one variant per token bucket and request count. Token buckets still follow the shared
 prefill token ladder. Capture requests have positive lengths and fit the
 model context and request buffers; zero-length request padding is not admitted.
+Startup autotuning uses the same dummy-batch builder with an explicit minimum
+request count, `ceil(num_tokens / context_len)`, independent of the configured
+capture request counts. Its token budget also respects rank-local request capacity.
 Uncaptured request counts retain the ordinary attention break, whose
 separate-subgraph cache still rejects internal checkpoints. Replay refresh includes
 `scan_query_start_loc`, which the recurrent dispatcher consumes, as well as
