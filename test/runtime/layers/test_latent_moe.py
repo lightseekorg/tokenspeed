@@ -835,7 +835,7 @@ def test_kimi3_latent_projection_shard_forward_add3_matches_replicated(
             for r in range(world):
                 output[r] = stripe(r)
 
-        monkeypatch.setattr(latent_module, "all_gather_into_tensor", gather_all)
+        monkeypatch.setattr(latent_module, "all_gather_single", gather_all)
         # The up projection must not follow the column band onto the backend's
         # own gather; that path is unmeasured for this width and rendezvouses
         # a second workspace.

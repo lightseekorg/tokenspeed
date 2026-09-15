@@ -28,7 +28,7 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
 )
 from typing_extensions import override
 
-from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
+from tokenspeed.runtime.distributed.comm_ops import all_gather_single
 from tokenspeed.runtime.execution.cache_loc_kernel import (
     dflash_prepare_decode,
 )
@@ -360,7 +360,7 @@ class DFlash(BaseDrafter):
         increasing batch sizes (``[1, 2, ..., max_bs]``); a buffer grown lazily
         would be freed and reallocated when a larger bs needs more room, leaving
         every smaller-bs graph captured earlier with an
-        ``all_gather_into_tensor`` recorded against freed memory. On replay
+        ``all_gather_single`` recorded against freed memory. On replay
         those small-bs decode steps read garbage (out-of-vocab) draft token ids,
         which flow into the next verify forward's embedding lookup and trigger a
         CUDA illegal memory access. A fixed max-capacity buffer is allocated
@@ -504,12 +504,12 @@ class DFlash(BaseDrafter):
         )
         gathered_max = gathered_max[:needed]
         gathered_ids = gathered_ids[:needed]
-        all_gather_into_tensor(
+        all_gather_single(
             gathered_max,
             local_max.contiguous(),
             self.logits_processor.tp_group,
         )
-        all_gather_into_tensor(
+        all_gather_single(
             gathered_ids,
             global_ids.contiguous(),
             self.logits_processor.tp_group,

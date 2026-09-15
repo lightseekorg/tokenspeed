@@ -199,10 +199,10 @@ class TrtllmAllReduceBackend(CommBackend):
     ) -> torch.Tensor:
         return self._fallback.all_gather(tensor, group, dim)
 
-    def all_gather_into_tensor(
+    def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None:
-        return self._fallback.all_gather_into_tensor(output, input, group)
+        return self._fallback.all_gather_single(output, input, group)
 
     def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor:
         return self._fallback.reduce_scatter(tensor, group)

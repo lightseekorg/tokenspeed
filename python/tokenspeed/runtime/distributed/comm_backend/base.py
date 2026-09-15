@@ -121,7 +121,7 @@ class CommBackend(ABC):
     ) -> torch.Tensor: ...
 
     @abstractmethod
-    def all_gather_into_tensor(
+    def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None: ...
 

@@ -523,7 +523,7 @@ class KimiK3LatentDownOp:
         if key in cls._ceilings:
             return
         gathered = torch.empty(tp_size, dtype=torch.int64, device=device)
-        dist.all_gather_into_tensor(
+        dist.all_gather_single(
             gathered,
             torch.tensor([max_m], dtype=torch.int64, device=device),
             group=group,

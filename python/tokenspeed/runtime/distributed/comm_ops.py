@@ -283,7 +283,7 @@ def all_gather(
     return backend.all_gather(tensor, group, dim)
 
 
-def all_gather_into_tensor(
+def all_gather_single(
     output: torch.Tensor,
     input: torch.Tensor,
     group: Group,
@@ -292,7 +292,7 @@ def all_gather_into_tensor(
     """All-gather input into a pre-allocated output buffer."""
     if backend is None:
         backend = get_global_backend()
-    backend.all_gather_into_tensor(output, input, group)
+    backend.all_gather_single(output, input, group)
 
 
 def reduce_scatter(

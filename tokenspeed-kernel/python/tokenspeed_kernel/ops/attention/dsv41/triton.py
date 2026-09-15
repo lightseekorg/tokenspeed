@@ -818,7 +818,7 @@ def _index_gather_heads(q, weights, process_group):
     gathered = torch.empty(
         (shards * q.shape[0], q.shape[1], 129), dtype=weights.dtype, device=q.device
     )
-    torch.distributed.all_gather_into_tensor(gathered, packed, group=process_group)
+    torch.distributed.all_gather_single(gathered, packed, group=process_group)
     gathered = gathered.view(shards, *packed.shape).permute(1, 0, 2, 3).flatten(1, 2)
     return gathered[..., :128].to(torch.bfloat16), gathered[..., 128], shards
 

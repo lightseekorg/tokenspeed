@@ -41,7 +41,7 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
-from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
+from tokenspeed.runtime.distributed.comm_ops import all_gather_single
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -782,7 +782,7 @@ class LogitsProcessor(nn.Module):
                     dtype=logits.dtype,
                     device=logits.device,
                 )
-                all_gather_into_tensor(gathered_logits, logits, self.tp_group)
+                all_gather_single(gathered_logits, logits, self.tp_group)
                 logits = (
                     gathered_logits.view(self.tp_size, num_rows, local_vocab_size)
                     .transpose(0, 1)

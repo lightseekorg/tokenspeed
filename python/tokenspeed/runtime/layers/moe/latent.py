@@ -44,7 +44,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     COMM_ONESHOT_MAX_BYTES,
     acquire_all_reduce_outputs,
     all_gather,
-    all_gather_into_tensor,
+    all_gather_single,
     all_reduce,
     all_reduce_latent_norm,
     prepare_all_reduce_fusion,
@@ -509,7 +509,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
                 dtype=local.dtype,
                 device=local.device,
             )
-            all_gather_into_tensor(stacked, local.contiguous(), self.shard_group)
+            all_gather_single(stacked, local.contiguous(), self.shard_group)
             return stacked.permute(1, 0, 2).reshape(num_tokens, self.output_size_full)
         if not self.narrowed or self.column_group is None:
             return local

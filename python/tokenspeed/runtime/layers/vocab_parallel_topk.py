@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import torch
 
-from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
+from tokenspeed.runtime.distributed.comm_ops import all_gather_single
 from tokenspeed.runtime.layers.logits_processor import (
     fused_softcap_generic,
     should_apply_lm_head_quant_method,
@@ -280,7 +280,7 @@ class VocabParallelTopK:
         staged[:, :top_k].copy_(values)
         staged[:, top_k:].copy_(ids)
         staged[:, top_k:].add_(float(shard.org_vocab_start_index))
-        all_gather_into_tensor(gathered, staged, self.tp_group)
+        all_gather_single(gathered, staged, self.tp_group)
 
         # Rank-major to row-major, so one row's candidates from every rank sit
         # side by side for the final selection, values and ids each on a plane.
