@@ -461,8 +461,13 @@ TEST_F(DecodeRetractionL2TestSuite, AnAbortedVictimStopsQualifyingForReadmission
         << "an aborted victim must not be readmitted";
 }
 
-TEST_F(DecodeRetractionL2TestSuite, RetractionLetsBlockedAdmissionRun) {
-    Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1)});
+TEST_F(DecodeRetractionL2TestSuite, AtomicSpanRetractionCapsRecoveryPrefix) {
+    RequestSpec running = MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1);
+    // A D-role admission represents a peer-side whole-prompt prefill.  On
+    // retraction, the same first-span cap must still prevent the request from
+    // claiming its L2 snapshot as a reusable prefix.
+    running.atomic_spans_flat = {0, 1};
+    Submit({running});
     SendBootstrapped("running");
     PlanOnce();
     SendRemotePrefillDone("running", /*bootstrap_token=*/42);
@@ -509,7 +514,9 @@ TEST_F(DecodeRetractionL2TestSuite, RetractionLetsBlockedAdmissionRun) {
     const ForwardBatch* recovered = FindForwardBatch(recovery.Operations());
     ASSERT_NE(recovered, nullptr);
     EXPECT_EQ(recovered->request_ids, (std::vector<std::string>{"running"}));
-    EXPECT_FALSE(ExtractCacheOpsOfKind<LoadBackBatch>(recovery).empty());
+    EXPECT_EQ(recovered->extend_prefix_lens, (std::vector<std::int32_t>{0}));
+    EXPECT_TRUE(ExtractCacheOpsOfKind<LoadBackBatch>(recovery).empty())
+        << "a retracted request must not load snapshot pages beyond its atomic prefix cap";
     EXPECT_EQ(scheduler_->DecodingSize(), 0u)
         << "a retracted request returns to Decode only after local prefill completes";
 }

@@ -71,6 +71,11 @@ class SamplingBatchInfo:
     # offset — a MIXED round's verify() sees only the decode suffix.
     batch_row_offset: int = 0
 
+    # Default-off DeepSeek V4 numerical-attribution metadata. The harness is
+    # eager-only, so these CPU values never enter a CUDA graph.
+    dsv4_numerical_attribution_rows: list[dict] | None = None
+    dsv4_forced_token_ids: list[int | None] | None = None
+
     # Device
     device: str = "cuda"
 
@@ -97,6 +102,10 @@ class SamplingBatchInfo:
             top_ks=_slice(self.top_ks),
             min_ps=_slice(self.min_ps),
             req_pool_indices=_slice(self.req_pool_indices),
+            dsv4_numerical_attribution_rows=_slice(
+                self.dsv4_numerical_attribution_rows
+            ),
+            dsv4_forced_token_ids=_slice(self.dsv4_forced_token_ids),
             vocab_mask=_slice(self.vocab_mask),
             grammars=_slice(self.grammars),
             batch_row_offset=self.batch_row_offset + (s.start or 0),

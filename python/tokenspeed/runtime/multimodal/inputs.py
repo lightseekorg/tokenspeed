@@ -296,6 +296,7 @@ class MultimodalForwardContext:
     mm_inputs: list[MultimodalInputs | None]
     extend_prefix_lens: list[int]
     extend_seq_lens: list[int]
+    request_ids: list[str] = dataclasses.field(default_factory=list)
 
     def has_inputs(self) -> bool:
         return bool(self.mm_inputs and any(x is not None for x in self.mm_inputs))
@@ -371,4 +372,5 @@ def multimodal_context_for_forward(forward_op, rid_to_state):
         mm_inputs=mm_inputs,
         extend_prefix_lens=list(forward_op.extend_prefix_lens),
         extend_seq_lens=list(forward_op.input_lengths[:num_extends]),
+        request_ids=[str(request_id) for request_id in forward_op.request_ids],
     )

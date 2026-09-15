@@ -65,8 +65,12 @@ import torch
 from torch import nn
 
 from tokenspeed.runtime.distributed.mapping import VisionTowerMapping
-from tokenspeed.runtime.distributed.process_group_manager import (
-    process_group_manager,
+from tokenspeed.runtime.distributed.process_group_manager import process_group_manager
+from tokenspeed.runtime.metrics.dsv4_vision_instrumentation import (
+    begin_current_stream_timing,
+    finish_current_stream_timing,
+    get_dsv4_vision_instrumentation,
+    record_encoder_call,
 )
 from tokenspeed.runtime.multimodal.encoder_feature_transport import (
     EncoderFeatureTransport,
@@ -505,6 +509,11 @@ class MultimodalEmbedder:
                     f"MultimodalEmbedder: no encoder registered for {modality}"
                 )
 
+            recorder = get_dsv4_vision_instrumentation()
+            encoder_timing = begin_current_stream_timing(
+                recorder.enabled, torch.get_device_module(device.type)
+            )
+
             if self.has_encoder_dp:
                 output_width = embedding_width
                 if spec.deepstack:
@@ -523,6 +532,8 @@ class MultimodalEmbedder:
                 per_item_embs = list(torch.split(output, per_item_lens, dim=0))
 
             self._store_encoder_outputs(items, per_item_embs, spec, multimodal_model)
+            encoder_wall_ns = finish_current_stream_timing(encoder_timing) or 0
+            record_encoder_call(modality, items, per_item_embs, wall_ns=encoder_wall_ns)
 
     def _run_encoder(
         self,

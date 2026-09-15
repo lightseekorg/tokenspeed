@@ -53,6 +53,13 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
+from tokenspeed.runtime.metrics.dsv4_numerical_attribution import (
+    numerical_attribution_enabled,
+    record_numerical_attribution_boundary,
+)
+from tokenspeed.runtime.metrics.dsv4_vision_instrumentation import (
+    record_logits_dtype,
+)
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeConfig,
 )
@@ -725,6 +732,7 @@ class LogitsProcessor(nn.Module):
         else:
             # GGUF models
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
+        record_logits_dtype(logits.dtype)
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
@@ -794,6 +802,9 @@ class LogitsProcessor(nn.Module):
 
         if self.final_logit_softcapping:
             fused_softcap_generic(logits, self.final_logit_softcapping)
+
+        if numerical_attribution_enabled():
+            record_numerical_attribution_boundary("logits", logits)
 
         return logits
 

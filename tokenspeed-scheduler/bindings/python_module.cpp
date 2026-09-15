@@ -157,7 +157,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::RequestSpec::request_id)
         .def_rw("tokens", &tokenspeed::RequestSpec::tokens)
-        .def_rw("max_new_tokens", &tokenspeed::RequestSpec::max_new_tokens);
+        .def_rw("max_new_tokens", &tokenspeed::RequestSpec::max_new_tokens)
+        .def_rw("atomic_spans_flat", &tokenspeed::RequestSpec::atomic_spans_flat);
 
     nb::module_ forward_event = m.def_submodule("ForwardEvent");
     nb::class_<tokenspeed::forward::ExtendResult>(forward_event, "ExtendResult")

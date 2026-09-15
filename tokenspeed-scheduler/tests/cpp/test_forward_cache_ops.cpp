@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -54,6 +55,44 @@ CacheCoordinator MakeTwoGroup(BlockPool& pool) {
                        .block_granularity = 2},
     };
     return MakeCoordinator(specs, 2, pool, /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
+}
+
+std::int32_t LegacyAlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,
+                                     std::int32_t prefix_granularity, std::int32_t promotion_boundary_tokens) {
+    std::int32_t chunk_size = std::min(unscheduled, token_budget);
+    if (promotion_boundary_tokens > first_pos) {
+        chunk_size = std::min(chunk_size, promotion_boundary_tokens - first_pos);
+    }
+    if (chunk_size == unscheduled) {
+        return chunk_size;
+    }
+    const std::int32_t prefix_page_offset = first_pos % prefix_granularity;
+    if (prefix_page_offset != 0) {
+        const std::int32_t tokens_to_boundary = prefix_granularity - prefix_page_offset;
+        return token_budget >= tokens_to_boundary ? tokens_to_boundary : 0;
+    }
+    return chunk_size - chunk_size % prefix_granularity;
+}
+
+std::int32_t ReferenceAtomicAlign(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,
+                                  std::int32_t prefix_granularity, std::int32_t promotion_boundary_tokens,
+                                  std::span<const std::pair<std::int32_t, std::int32_t>> atomic_spans) {
+    std::int32_t chunk =
+        LegacyAlignPrefillChunk(first_pos, unscheduled, token_budget, prefix_granularity, promotion_boundary_tokens);
+    for (const auto& [start, end] : atomic_spans) {
+        if (end < first_pos) continue;
+        if (start == first_pos) {
+            const std::int32_t length = end - start + 1;
+            if (token_budget < length) return 0;
+            chunk = std::max(chunk, length);
+            continue;
+        }
+        const std::int32_t chunk_end_exclusive = first_pos + chunk;
+        if (start > first_pos && start < chunk_end_exclusive && chunk_end_exclusive <= end) {
+            return start - first_pos;
+        }
+    }
+    return chunk;
 }
 
 TEST(ForwardCacheOpsFree, ReturnsAllPagesToPool) {
@@ -118,6 +157,85 @@ TEST(StateCheckpointMaterializationStartTest, SelectsLatestBoundaryOrEndpoint) {
 TEST(SnapshotStateReserveTokensTest, CoversGrowthAndDecodeWidth) {
     EXPECT_EQ(SnapshotStateReserveTokens(/*block_granularity=*/128, /*decode_tokens=*/1), 128);
     EXPECT_EQ(SnapshotStateReserveTokens(/*block_granularity=*/2, /*decode_tokens=*/3), 3);
+}
+
+TEST(AtomicSpanAlignPrefillChunkTest, PreservesNamedCounterexample) {
+    const std::array spans{std::pair<std::int32_t, std::int32_t>{8100, 8300}};
+    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/0, /*unscheduled=*/8301, /*token_budget=*/8192,
+                                /*prefix_granularity=*/256, /*promotion_boundary_tokens=*/0, spans),
+              8100);
+    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/8100, /*unscheduled=*/201, /*token_budget=*/8192,
+                                /*prefix_granularity=*/256, /*promotion_boundary_tokens=*/0, spans),
+              201);
+    EXPECT_THROW(AlignPrefillChunk(/*first_pos=*/8192, /*unscheduled=*/109, /*token_budget=*/8192,
+                                   /*prefix_granularity=*/256, /*promotion_boundary_tokens=*/0, spans),
+                 std::runtime_error);
+}
+
+TEST(AtomicSpanAlignPrefillChunkTest, KeepsFullyContainedSpansInOneChunk) {
+    const std::array spans{std::pair<std::int32_t, std::int32_t>{4, 7}, std::pair<std::int32_t, std::int32_t>{12, 18}};
+    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/0, /*unscheduled=*/32, /*token_budget=*/32,
+                                /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/0, spans),
+              32);
+}
+
+TEST(AtomicSpanAlignPrefillChunkTest, StopsOnlyBeforePartiallyCoveredLaterSpan) {
+    const std::array spans{std::pair<std::int32_t, std::int32_t>{4, 7}, std::pair<std::int32_t, std::int32_t>{12, 18}};
+    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/0, /*unscheduled=*/32, /*token_budget=*/16,
+                                /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/0, spans),
+              12);
+}
+
+TEST(AtomicSpanAlignPrefillChunkTest, FrozenOracleAndEmptySpanRegressionDomains) {
+    constexpr std::array<std::int32_t, 5> kGranularities{1, 2, 4, 8, 16};
+    std::uint64_t empty_evaluations = 0;
+    std::uint64_t atomic_evaluations = 0;
+    for (const std::int32_t granularity : kGranularities) {
+        for (std::int32_t first_pos = 0; first_pos < 128; ++first_pos) {
+            for (std::int32_t unscheduled = 0; unscheduled < 96; ++unscheduled) {
+                for (std::int32_t budget = 0; budget < 72; ++budget) {
+                    const std::int32_t promotion =
+                        ((first_pos / granularity) % 2 == 0) ? (first_pos / granularity + 1) * granularity : 0;
+                    const std::int32_t legacy =
+                        LegacyAlignPrefillChunk(first_pos, unscheduled, budget, granularity, promotion);
+                    const std::int32_t empty =
+                        AlignPrefillChunk(first_pos, unscheduled, budget, granularity, promotion, {});
+                    if (empty != legacy) {
+                        FAIL() << "empty-span regression at first=" << first_pos << " unscheduled=" << unscheduled
+                               << " budget=" << budget << " granularity=" << granularity;
+                    }
+                    ++empty_evaluations;
+
+                    std::array<std::pair<std::int32_t, std::int32_t>, 2> storage{};
+                    for (std::int32_t variant = 0; variant < 4; ++variant) {
+                        std::size_t span_count = 0;
+                        if (variant == 1 && first_pos > 0) {
+                            storage[span_count++] = {first_pos - 1, first_pos - 1};
+                        } else if (variant == 2 && unscheduled > 0) {
+                            const std::int32_t length = std::min<std::int32_t>(unscheduled, 1 + first_pos % 8);
+                            storage[span_count++] = {first_pos, first_pos + length - 1};
+                        } else if (variant == 3 && unscheduled > 1) {
+                            const std::int32_t offset = std::max<std::int32_t>(1, unscheduled / 2);
+                            storage[span_count++] = {first_pos + offset, first_pos + offset};
+                        }
+                        const std::span spans{storage.data(), span_count};
+                        const std::int32_t expected =
+                            ReferenceAtomicAlign(first_pos, unscheduled, budget, granularity, promotion, spans);
+                        const std::int32_t actual =
+                            AlignPrefillChunk(first_pos, unscheduled, budget, granularity, promotion, spans);
+                        if (actual != expected) {
+                            FAIL() << "atomic oracle mismatch at variant=" << variant << " first=" << first_pos
+                                   << " unscheduled=" << unscheduled << " budget=" << budget
+                                   << " granularity=" << granularity;
+                        }
+                        ++atomic_evaluations;
+                    }
+                }
+            }
+        }
+    }
+    EXPECT_EQ(empty_evaluations, 4'423'680u);
+    EXPECT_EQ(atomic_evaluations, 17'694'720u);
 }
 
 TEST(ForwardCacheOpsPrefill, FirstChunkAcquiresPagesForTokens) {

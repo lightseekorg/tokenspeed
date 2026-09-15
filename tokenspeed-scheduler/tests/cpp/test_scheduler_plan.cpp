@@ -326,6 +326,90 @@ TEST_F(SchedulerTestSuite, SubmitRequestsValidatesWholeBatchBeforeInsertion) {
     EXPECT_NO_THROW(Submit(valid));
 }
 
+TEST_F(SchedulerTestSuite, AtomicSpanAdmissionValidatesEveryWireConditionBeforeInsertion) {
+    struct Case {
+        std::vector<std::int32_t> flat;
+        std::string message;
+    };
+    const std::vector<Case> cases{
+        {{0}, "even number"},
+        {{-1, 0}, "0 <= start <= end"},
+        {{2, 1}, "0 <= start <= end"},
+        {{0, 4}, "token count"},
+        {{0, 1, 1, 2}, "strictly ascending and non-overlapping"},
+    };
+    for (const Case& test_case : cases) {
+        RequestSpec invalid = MakeRequestSpec("invalid", 2);
+        invalid.atomic_spans_flat = test_case.flat;
+        try {
+            Submit(invalid);
+            FAIL() << "accepted invalid atomic spans";
+        } catch (const std::invalid_argument& error) {
+            EXPECT_NE(std::string{error.what()}.find(test_case.message), std::string::npos);
+        }
+    }
+
+    RequestSpec oversized = MakeRequestSpec("oversized", 33);
+    oversized.atomic_spans_flat = {0, 64};
+    try {
+        Submit(oversized);
+        FAIL() << "accepted oversized atomic span";
+    } catch (const std::invalid_argument& error) {
+        const std::string message = error.what();
+        EXPECT_NE(message.find("length 65"), std::string::npos);
+        EXPECT_NE(message.find("--chunked-prefill-size 64"), std::string::npos);
+    }
+
+    const RequestSpec valid = MakeRequestSpec("valid", 2);
+    RequestSpec invalid = MakeRequestSpec("invalid-batch", 2);
+    invalid.atomic_spans_flat = {0, 4};
+    EXPECT_THROW(Submit(std::vector<RequestSpec>{valid, invalid}), std::invalid_argument);
+    EXPECT_NO_THROW(Submit(valid));
+}
+
+TEST_F(SchedulerTestSuite, AtomicSpanCapsPrefixProbeBeforeFirstImageBlock) {
+    Submit(MakeRequestSpec("seed", 4));
+    PlanOnce();
+    SendForwardDone("seed", {100});
+    PlanOnce();
+    SendFinish("seed");
+    PlanOnce();
+
+    RequestSpec image = MakeRequestSpec("image", 4);
+    image.atomic_spans_flat = {4, 7};
+    Submit(image);
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* forward = FindForwardBatch(plan);
+    ASSERT_NE(forward, nullptr);
+    EXPECT_EQ(forward->extend_prefix_lens, std::vector<std::int32_t>{4});
+    EXPECT_EQ(forward->input_lengths, std::vector<std::int32_t>{4});
+}
+
+class AtomicSpanChunkingTestSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.max_scheduled_tokens = 8;
+        return cfg;
+    }
+};
+
+TEST_F(AtomicSpanChunkingTestSuite, SchedulerGuardSnapsBeforeAtomicSpan) {
+    RequestSpec image = MakeRequestSpec("image", 6);
+    image.atomic_spans_flat = {6, 10};
+    Submit(image);
+
+    const ExecutionPlan first_plan = PlanOnce();
+    const ForwardBatch* first = FindForwardBatch(first_plan);
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(first->input_lengths, std::vector<std::int32_t>{6});
+    const ExecutionPlan second_plan = PlanOnce();
+    const ForwardBatch* second = FindForwardBatch(second_plan);
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(second->extend_prefix_lens, std::vector<std::int32_t>{6});
+    EXPECT_EQ(second->input_lengths, std::vector<std::int32_t>{6});
+}
+
 class HybridPrefixPromotionTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {

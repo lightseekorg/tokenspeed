@@ -29,6 +29,9 @@ from tokenspeed_kernel.ops.sampling.cuda import (
 )
 from tokenspeed_kernel.registry import error_fn
 
+from tokenspeed.runtime.metrics.dsv4_numerical_attribution import (
+    record_numerical_attribution_sampling,
+)
 from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackend,
     SamplingBackendConfig,
@@ -175,6 +178,8 @@ class GreedySamplingBackend(SamplingBackend):
             )
         bs = logits.shape[0]
         tokens = sampling_argmax(logits, out=self._sample_token_buf[:bs])
+        if sampling_info.dsv4_numerical_attribution_rows is not None:
+            self._record_and_force_attribution(logits, tokens, sampling_info)
 
         # TP-rank sync (rank 0 wins), mirrors FlashInferSamplingBackend.sample.
         # All-gathered logits are not bit-identical across ranks, so per-rank
@@ -188,6 +193,23 @@ class GreedySamplingBackend(SamplingBackend):
             )
 
         return tokens, self._ones_buf[:bs]
+
+    def _record_and_force_attribution(
+        self,
+        logits: torch.Tensor,
+        tokens: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+    ) -> None:
+        record_numerical_attribution_sampling(
+            logits, tokens, sampling_info.dsv4_numerical_attribution_rows
+        )
+        forced = sampling_info.dsv4_forced_token_ids
+        if forced is None or len(forced) != tokens.numel():
+            raise RuntimeError("attribution forced-token rows are not aligned")
+        if any(token_id is not None for token_id in forced):
+            if any(token_id is None for token_id in forced):
+                raise RuntimeError("attribution cannot mix forced and unforced rows")
+            tokens.copy_(torch.tensor(forced, dtype=tokens.dtype, device=tokens.device))
 
     @nvtx_range("sampling:verify", color="yellow")
     def verify(
@@ -218,6 +240,16 @@ class GreedySamplingBackend(SamplingBackend):
                 vocab_mask=sampling_info.vocab_mask,
             )
         target_predict = sampling_argmax(logits).reshape(bs, num_tokens_per_req)
+        # Plain decode now uses the unified N=1 verify path. Keep the
+        # eager-only attribution trajectory hook on that path as well.
+        if sampling_info.dsv4_numerical_attribution_rows is not None:
+            if num_tokens_per_req != 1:
+                raise RuntimeError(
+                    "numerical attribution does not support speculative verify"
+                )
+            self._record_and_force_attribution(
+                logits, target_predict[:, 0], sampling_info
+            )
 
         _verify_chain_greedy(
             predicts=predict,

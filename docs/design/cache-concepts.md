@@ -510,6 +510,13 @@ Its responsibilities:
   deliberately split so the probe can be taken once and the admission retried
   against it — the scheduler's same-round retract-and-grant re-runs a failed
   admission after freeing a victim (see `scheduler.md`) without re-probing.
+  A request carrying an atomic token span caps the hashes supplied to the
+  probe at the first span start, for both first admission and retraction
+  recovery. The cap is applied to the probe input, not to its returned scalar:
+  probing a longer input and truncating only `num_common_tokens` afterwards
+  would leave the probe's per-group hits and promotion metadata describing
+  pages the request is forbidden to claim, desynchronising the subsequent
+  admission.
   `ProbeDecodeDevicePrefix` is the PD-decode variant: local history
   pages are reused while final-state groups are restored from the remote
   endpoint snapshot.

@@ -30,22 +30,71 @@ whether its batch has tokens.
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 import torch.distributed
 
-from tokenspeed.runtime.engine.event_loop import EventLoop
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.types import DpForwardMetadata
+
+
+def _extract_event_loop_dp_metadata_seam():
+    source_path = (
+        Path(__file__).resolve().parents[3]
+        / "python/tokenspeed/runtime/engine/event_loop.py"
+    )
+    tree = ast.parse(source_path.read_text(), filename=str(source_path))
+    helper = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_dsv4_forward_intersects_image_span"
+    )
+    event_loop = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "EventLoop"
+    )
+    method = next(
+        node
+        for node in event_loop.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_dp_sync_and_check"
+    )
+    extracted = ast.Module(body=[helper, method], type_ignores=[])
+    ast.fix_missing_locations(extracted)
+    namespace = {
+        "dist": torch.distributed,
+        "ForwardMode": ForwardMode,
+        "DpForwardMetadata": DpForwardMetadata,
+    }
+    exec(compile(extracted, str(source_path), "exec"), namespace)
+    event_loop_type = type(
+        "EventLoop", (), {"_dp_sync_and_check": namespace["_dp_sync_and_check"]}
+    )
+    return event_loop_type, namespace["_dsv4_forward_intersects_image_span"]
+
+
+EventLoop, _dsv4_forward_intersects_image_span = _extract_event_loop_dp_metadata_seam()
 
 
 class FakeForwardOp:
-    def __init__(self, *, input_lengths, request_ids=None, num_extends=0):
+    def __init__(
+        self,
+        *,
+        input_lengths,
+        request_ids=None,
+        num_extends=0,
+        extend_prefix_lens=None,
+    ):
         self.input_lengths = input_lengths
         self.request_ids = request_ids or [
             f"req-{i}" for i in range(len(input_lengths))
         ]
         self._num_extends = num_extends
+        self.extend_prefix_lens = extend_prefix_lens or [0] * num_extends
 
     def num_extends(self):
         return self._num_extends
@@ -54,10 +103,12 @@ class FakeForwardOp:
 class _FakeLoop:
     """Only the state read by ``EventLoop._dp_sync_and_check``."""
 
-    def __init__(self, *, world_size=1):
-        self._dp_local_info = torch.zeros(1, 3, dtype=torch.int32)
-        self._dp_global_info = torch.zeros(world_size, 3, dtype=torch.int32)
+    def __init__(self, *, world_size=1, vision_active=False, states=None):
+        self._dp_local_info = torch.zeros(1, 4, dtype=torch.int32)
+        self._dp_global_info = torch.zeros(world_size, 4, dtype=torch.int32)
         self.world_cpu_group = None
+        self._dsv4_vision_active = vision_active
+        self.output_processor = SimpleNamespace(rid_to_state=states or {})
 
 
 def _sync(loop, forward_op, monkeypatch, other_rank_rows=()):
@@ -121,7 +172,7 @@ def test_zero_token_forward_op_is_not_model_work(monkeypatch):
 def test_idle_rank_joins_dummy_forward_only_when_a_peer_has_work(monkeypatch):
     # Two ranks: this one idle, the peer running a 4-token decode batch.
     loop = _FakeLoop(world_size=2)
-    busy_peer = (4, 4, int(ForwardMode.DECODE))
+    busy_peer = (4, 4, int(ForwardMode.DECODE), 0)
 
     meta = _sync(loop, None, monkeypatch, other_rank_rows=[busy_peer])
 
@@ -130,6 +181,73 @@ def test_idle_rank_joins_dummy_forward_only_when_a_peer_has_work(monkeypatch):
     assert meta.global_num_tokens == [0, 4]
 
     # Fully idle world: nothing to keep in lockstep with.
-    idle_peer = (0, 0, int(ForwardMode.IDLE))
+    idle_peer = (0, 0, int(ForwardMode.IDLE), 0)
     meta = _sync(loop, None, monkeypatch, other_rank_rows=[idle_peer])
     assert not meta.need_idle_forward
+
+
+def _image_state(*offsets):
+    item = SimpleNamespace(
+        modality=SimpleNamespace(name="IMAGE"), offsets=list(offsets)
+    )
+    return SimpleNamespace(multimodal_inputs=SimpleNamespace(mm_items=[item]))
+
+
+def test_dsv4_intersection_bit_is_exact_for_current_extend_query():
+    states = {"image": _image_state((5, 9))}
+
+    before = FakeForwardOp(
+        input_lengths=[5],
+        request_ids=["image"],
+        num_extends=1,
+        extend_prefix_lens=[0],
+    )
+    intersecting = FakeForwardOp(
+        input_lengths=[2],
+        request_ids=["image"],
+        num_extends=1,
+        extend_prefix_lens=[5],
+    )
+    after = FakeForwardOp(
+        input_lengths=[3],
+        request_ids=["image"],
+        num_extends=1,
+        extend_prefix_lens=[10],
+    )
+    decode = FakeForwardOp(input_lengths=[1], request_ids=["image"], num_extends=0)
+
+    assert not _dsv4_forward_intersects_image_span(before, states)
+    assert _dsv4_forward_intersects_image_span(intersecting, states)
+    assert not _dsv4_forward_intersects_image_span(after, states)
+    assert not _dsv4_forward_intersects_image_span(decode, states)
+    assert not _dsv4_forward_intersects_image_span(None, states)
+
+
+def test_dsv4_dp_metadata_carries_image_text_and_idle_rank_bits(monkeypatch):
+    states = {"image": _image_state((5, 9))}
+    loop = _FakeLoop(world_size=2, vision_active=True, states=states)
+    image_op = FakeForwardOp(
+        input_lengths=[3],
+        request_ids=["image"],
+        num_extends=1,
+        extend_prefix_lens=[6],
+    )
+    text_peer = (4, 1, int(ForwardMode.EXTEND), 0)
+
+    meta = _sync(loop, image_op, monkeypatch, other_rank_rows=[text_peer])
+    assert meta.global_dsv4_image_span_intersections == [True, False]
+
+    idle_loop = _FakeLoop(world_size=2, vision_active=True)
+    image_peer = (3, 1, int(ForwardMode.EXTEND), 1)
+    idle_meta = _sync(idle_loop, None, monkeypatch, other_rank_rows=[image_peer])
+    assert idle_meta.need_idle_forward
+    assert idle_meta.global_dsv4_image_span_intersections == [False, True]
+
+
+def test_non_dsv4_models_preserve_none_metadata_default(monkeypatch):
+    loop = _FakeLoop(vision_active=False)
+    op = FakeForwardOp(input_lengths=[2], num_extends=1)
+
+    meta = _sync(loop, op, monkeypatch)
+
+    assert meta.global_dsv4_image_span_intersections is None

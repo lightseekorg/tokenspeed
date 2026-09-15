@@ -73,6 +73,40 @@ class TestDeepseekV4MegaMoE(unittest.TestCase):
             )
         self.assertEqual(plan.call_args.kwargs["activation_clamp"], 10.0)
 
+    def test_forward_preserves_mega_moe_kernel_defaults(self):
+        plan = object()
+        with patch.object(deepseek_v4_model, "dsv4_mega_moe_plan", return_value=plan):
+            experts = DeepseekV4MegaMoEExperts(
+                num_experts=4,
+                num_local_experts=2,
+                top_k=2,
+                hidden_size=128,
+                intermediate_size=128,
+                mapping=None,
+                prefix="layers.0.ffn.experts",
+                swiglu_limit=None,
+            )
+        state = object()
+        experts._processed_state = state
+        hidden_states = torch.zeros((1, 128), dtype=torch.bfloat16)
+        topk_weights = torch.full((1, 2), 0.5, dtype=torch.float32)
+        topk_ids = torch.tensor([[0, 1]], dtype=torch.int64)
+        expected = torch.ones_like(hidden_states)
+
+        with patch.object(
+            deepseek_v4_model, "dsv4_mega_moe_apply", return_value=expected
+        ) as apply:
+            actual = experts(hidden_states, topk_weights, topk_ids)
+
+        self.assertIs(actual, expected)
+        apply.assert_called_once_with(
+            plan,
+            state,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

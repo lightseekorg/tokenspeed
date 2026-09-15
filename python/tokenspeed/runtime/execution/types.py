@@ -49,6 +49,7 @@ class DpForwardMetadata:
     all_decode_or_idle: bool
     all_extend: bool
     need_idle_forward: bool
+    global_dsv4_image_span_intersections: list[bool] | None = None
 
 
 @dataclass(frozen=True)

@@ -82,6 +82,26 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _deepseek_v4_atomic_spans(multimodal_inputs) -> list[tuple[int, int]]:
+    """Return authored whole-placeholder image spans without normalization."""
+    spans = []
+    if multimodal_inputs is None:
+        return spans
+    for item in multimodal_inputs.mm_items:
+        if getattr(item.modality, "name", None) != "IMAGE" or not item.offsets:
+            continue
+        spans.extend((int(start), int(end)) for start, end in item.offsets)
+    return spans
+
+
+def _request_atomic_spans(
+    multimodal_inputs, *, deepseek_v4_vision_enabled: bool
+) -> list[tuple[int, int]]:
+    if not deepseek_v4_vision_enabled:
+        return []
+    return _deepseek_v4_atomic_spans(multimodal_inputs)
+
+
 def _profile_rank_tag(attn_mapping) -> str:
     """File-name tag identifying this scheduler process's profile outputs."""
     parts = []
@@ -112,6 +132,7 @@ class RequestHandler:
         pause_controller=None,
         memory_controller=None,
         device=None,
+        deepseek_v4_vision_enabled: bool = False,
     ) -> None:
 
         self.forward_ct = 0
@@ -125,6 +146,7 @@ class RequestHandler:
         # data plane so it is ordered against forwards. The scheduler worker
         # passes the handle in; None elsewhere (e.g. unit tests).
         self._device = device
+        self._deepseek_v4_vision_enabled = deepseek_v4_vision_enabled
 
         mapping = server_args.mapping
         self.attn_tp_size = mapping.attn.tp_size
@@ -256,7 +278,15 @@ class RequestHandler:
             elif isinstance(recv_req, IsSleepingReqInput):
                 self.memory_controller.handle_is_sleeping(recv_req)
             elif isinstance(recv_req, GetInternalStateReq):
-                self.send_func.send_pyobj(GetInternalStateReqOutput(internal_state={}))
+                from tokenspeed.runtime.metrics.dsv4_vision_instrumentation import (
+                    get_dsv4_vision_instrumentation,
+                )
+
+                self.send_func.send_pyobj(
+                    GetInternalStateReqOutput(
+                        internal_state=get_dsv4_vision_instrumentation().internal_state()
+                    )
+                )
             elif isinstance(recv_req, SetInternalStateReq):
                 self.send_func.send_pyobj(
                     SetInternalStateReqOutput(updated=False, server_args={})
@@ -293,6 +323,10 @@ class RequestHandler:
         req_spec = make_spec(
             rid=recv_req.rid,
             tokens=recv_req.input_ids,
+            atomic_spans=_request_atomic_spans(
+                recv_req.multimodal_inputs,
+                deepseek_v4_vision_enabled=self._deepseek_v4_vision_enabled,
+            ),
         )
         req_state = RequestState.from_recv_req(
             recv_req,

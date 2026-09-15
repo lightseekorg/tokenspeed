@@ -223,6 +223,7 @@ class PrefillGraph:
         # Multimodal seam: models whose multimodal path is embeds-only expose
         # multimodal_input_embeds; others (e.g. deepstack) replay text only.
         self._multimodal_input_embeds = getattr(model, "multimodal_input_embeds", None)
+        self._multimodal_graph_safe = getattr(model, "multimodal_graph_safe", True)
         self.text_model = (
             model.language_model if hasattr(model, "language_model") else model
         )
@@ -571,8 +572,11 @@ class PrefillGraph:
         exposes the embeds-only ``multimodal_input_embeds`` seam; models with
         extra per-layer inputs (deepstack) run eager.
         """
-        if multimodal_context is not None and self._multimodal_input_embeds is None:
-            return False
+        if multimodal_context is not None:
+            if not self._multimodal_graph_safe:
+                return False
+            if self._multimodal_input_embeds is None:
+                return False
         return self._replay_bucket(ctx) is not None
 
     def replay(

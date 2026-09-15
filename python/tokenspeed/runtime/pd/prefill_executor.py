@@ -288,6 +288,18 @@ class DisaggPrefillExecutor:
             f"EPD: prefill aborted request {request_id} (embedding receive timed out)",
         )
 
+    def reject_at_admission(
+        self,
+        request_id: str,
+        bootstrap_info: BootstrapInfo,
+        reason: str,
+    ) -> None:
+        """Release a registered P-role request rejected by the scheduler."""
+        try:
+            self.kv_manager.abort_room(bootstrap_info.bootstrap_room, reason)
+        finally:
+            self._drop_request_state(request_id)
+
     def execute(self, op):
         """Send this completed prompt's KV to the node that will decode it.
 

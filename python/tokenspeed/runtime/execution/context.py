@@ -123,6 +123,18 @@ class ForwardContext:
     # the target; None means the taps are only collected in aux_hidden_states.
     target_capture_sink: TargetCaptureSink | None = None
 
+    # DeepSeek V4 image semantics for this forward. The payload is built by the
+    # vision-enabled model beside the DSA resets and remains None for all other
+    # architectures and text-only V4 forwards.
+    dsv4_vision: Any | None = None
+    # Rank-indexed CPU metadata used to make the normal MoE image-mask sidecar
+    # collective symmetric across attention-DP batches.
+    global_dsv4_image_span_intersections: list[bool] | None = None
+    # The normal RSAG mask is static across base FFNs. Cache its gathered form
+    # once per model forward; ``None`` is also a valid cached text rollback.
+    dsv4_moe_image_mask: torch.Tensor | None = None
+    dsv4_moe_image_mask_cached: bool = False
+
 
 @contextmanager
 def report_collective_sizing(

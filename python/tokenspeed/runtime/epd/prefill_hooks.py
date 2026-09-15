@@ -62,12 +62,15 @@ class EpdPrefillHooks:
     def __init__(self, loop, admission) -> None:
         self._loop = loop
         self._admission = admission
-        # Staged EPD request payloads (request_id -> (spec, state, bootstrap)),
-        # held here while the controller (rid-keyed, like kv_transfer) runs the
-        # async receive; popped in drain_ready_embeddings on admit/abort.
+        # Staged EPD admission entries
+        # (request_id -> (spec, state, previous_state, bootstrap)), held here
+        # while the controller (rid-keyed, like kv_transfer) runs the async
+        # receive; popped in drain_ready_embeddings on admit/abort. Keeping the
+        # full entry lets delayed admission use EventLoop's normal exception
+        # isolation and cleanup path.
         self._staged: dict = {}
 
-    def try_stage(self, spec, state, bootstrap) -> bool:
+    def try_stage(self, spec, state, bootstrap, previous_state=None) -> bool:
         """Stage an encode-routed request OUT of the scheduler until its
         per-image embeddings have been received; return False for everything
         else (the caller registers the P->D sender and admits immediately).
@@ -83,7 +86,12 @@ class EpdPrefillHooks:
         if self._admission is None or not _is_epd_request(state):
             return False
         self._admission.stage(spec.request_id, state.multimodal_inputs.mm_items)
-        self._staged[spec.request_id] = (spec, state, bootstrap)
+        self._staged[spec.request_id] = (
+            spec,
+            state,
+            previous_state,
+            bootstrap,
+        )
         return True
 
     def drain_ready_embeddings(self) -> None:
@@ -106,7 +114,7 @@ class EpdPrefillHooks:
             return
         admitted_ids, failed_ids = self._admission.drain()
         for rid in failed_ids:
-            spec, state, bootstrap = self._staged.pop(rid)
+            spec, state, _previous_state, bootstrap = self._staged.pop(rid)
             # Signal the dual-dispatched decode that this request failed so its KV
             # receiver fails (FailedEvent -> PdTransferHooks abort)
             # instead of waiting forever for KV the prefill will never send. The
@@ -128,9 +136,9 @@ class EpdPrefillHooks:
                     )
             state.set_finish_with_abort("EPD embedding receive failed or timed out")
             loop.output_processor.publish_finished_at_admission(rid, state)
-        admitted_specs = []
+        admitted_entries = []
         for rid in admitted_ids:
-            spec, state, bootstrap = self._staged.pop(rid)
+            spec, state, previous_state, bootstrap = self._staged.pop(rid)
             # Aborted mid-receive (no abort path, so drain still returns it admitted):
             # don't register the P->D sender or submit -- that runs a wasted forward
             # and leaks the sender. Stream its finish instead.
@@ -141,9 +149,9 @@ class EpdPrefillHooks:
             # is about to enter the scheduler.
             if loop.kv_transfer is not None:
                 loop.kv_transfer.register(rid, bootstrap)
-            admitted_specs.append(spec)
-        if admitted_specs:
-            loop.scheduler.submit_requests(admitted_specs)
+            admitted_entries.append((spec, state, previous_state, bootstrap))
+        if admitted_entries:
+            loop._submit_admitted_requests(admitted_entries)
         elif self._admission.has_pending():
             # Nothing advanced this cycle but requests are still receiving; yield the
             # GIL so the Python daemon transfer/recv threads run (rank-consistent:

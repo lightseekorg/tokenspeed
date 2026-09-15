@@ -553,6 +553,80 @@ class PipelinedPyobjBroadcaster:
         return data or []
 
 
+_UNSIGNED_REQUEST_DTYPES = {
+    torch.uint16: "uint16",
+    torch.uint32: "uint32",
+    torch.uint64: "uint64",
+}
+_UNSIGNED_REQUEST_DTYPES_BY_NAME = {
+    name: dtype for dtype, name in _UNSIGNED_REQUEST_DTYPES.items()
+}
+
+
+def _rebuild_unsigned_request_tensor(
+    payload: bytes,
+    dtype_name: str,
+    shape: tuple[int, ...],
+) -> torch.Tensor:
+    """Rebuild an unsigned CPU tensor without PyTorch's storage pickler."""
+    try:
+        dtype = _UNSIGNED_REQUEST_DTYPES_BY_NAME[dtype_name]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported unsigned request tensor dtype: {dtype_name!r}"
+        ) from exc
+    numel = 1
+    for dim in shape:
+        numel *= dim
+    expected_nbytes = numel * torch.empty((), dtype=dtype).element_size()
+    if len(payload) != expected_nbytes:
+        raise ValueError(
+            "Unsigned request tensor payload length differs from its dtype/shape: "
+            f"dtype={dtype_name} shape={shape} bytes={len(payload)} "
+            f"expected={expected_nbytes}"
+        )
+    # ``bytearray`` gives frombuffer an owned writable backing store. Clone so
+    # the returned tensor has ordinary PyTorch-owned storage after this helper
+    # returns and does not retain the serialized byte buffer.
+    return torch.frombuffer(bytearray(payload), dtype=dtype).clone().reshape(shape)
+
+
+class _RequestTransportPickler(pickle.Pickler):
+    """Pickle requests while bypassing broken unsigned-storage reducers.
+
+    PyTorch's regular reducers remain authoritative for every other object and
+    tensor dtype. Some PyTorch builds cannot unpickle uint16/uint32/uint64
+    tensors because their storage reducer reads ``UntypedStorage.dtype``.
+    Request metadata is CPU-resident, so encode only those unsigned tensors as
+    owned bytes plus dtype/shape and leave the model/wire contract unchanged.
+    """
+
+    def reducer_override(self, obj):
+        if isinstance(obj, torch.Tensor) and obj.dtype in _UNSIGNED_REQUEST_DTYPES:
+            if obj.layout != torch.strided:
+                raise TypeError(
+                    "Unsigned request tensors must use the strided layout, got "
+                    f"{obj.layout}"
+                )
+            tensor = obj.detach().to(device="cpu").contiguous()
+            payload = bytes(tensor.view(torch.uint8).numpy())
+            return (
+                _rebuild_unsigned_request_tensor,
+                (
+                    payload,
+                    _UNSIGNED_REQUEST_DTYPES[obj.dtype],
+                    tuple(int(dim) for dim in obj.shape),
+                ),
+            )
+        return NotImplemented
+
+
+def _serialize_request_pyobj(data: list[Any]) -> bytes:
+    stream = io.BytesIO()
+    _RequestTransportPickler(stream, protocol=pickle.HIGHEST_PROTOCOL).dump(data)
+    return stream.getvalue()
+
+
 def broadcast_pyobj(
     data: list[Any],
     rank: int,
@@ -573,7 +647,7 @@ def broadcast_pyobj(
             tensor_size = torch.tensor([0], dtype=torch.long, device=device)
             dist.broadcast(tensor_size, src=src, group=dist_group)
         else:
-            serialized_data = pickle.dumps(data)
+            serialized_data = _serialize_request_pyobj(data)
             size = len(serialized_data)
 
             tensor_data = torch.ByteTensor(

@@ -195,12 +195,55 @@ def aligned_max_scheduled_tokens(
     return max_scheduled_tokens - max_scheduled_tokens % grain
 
 
-def make_spec(rid: str, tokens: list[int], max_new_tokens: int = 0) -> RequestSpec:
+def make_spec(
+    rid: str,
+    tokens: list[int],
+    max_new_tokens: int = 0,
+    atomic_spans: Sequence[tuple[int, int]] = (),
+) -> RequestSpec:
     spec = RequestSpec()
     spec.request_id = rid
     spec.tokens = tokens
     spec.max_new_tokens = max_new_tokens
+    spec.atomic_spans_flat = [bound for span in atomic_spans for bound in span]
     return spec
+
+
+def validate_atomic_spans_flat(
+    atomic_spans_flat: Sequence[int],
+    *,
+    num_tokens: int,
+    max_scheduled_tokens: int,
+) -> None:
+    """Validate the scheduler's inclusive, flat atomic-span wire format."""
+    if len(atomic_spans_flat) % 2:
+        raise ValueError(
+            "atomic spans require an even number of inclusive bounds; "
+            f"got {len(atomic_spans_flat)}"
+        )
+    previous_end = -1
+    for index in range(0, len(atomic_spans_flat), 2):
+        start = int(atomic_spans_flat[index])
+        end = int(atomic_spans_flat[index + 1])
+        span = f"[{start},{end}]"
+        if start < 0 or end < start:
+            raise ValueError(f"atomic span {span} must satisfy 0 <= start <= end")
+        if end >= num_tokens:
+            raise ValueError(
+                f"atomic span {span} must end before the request token count "
+                f"{num_tokens}"
+            )
+        if index and start <= previous_end:
+            raise ValueError(
+                f"atomic span {span} must be strictly ascending and non-overlapping"
+            )
+        span_length = end - start + 1
+        if span_length > max_scheduled_tokens:
+            raise ValueError(
+                f"atomic span {span} has length {span_length} exceeding "
+                f"configured --chunked-prefill-size {max_scheduled_tokens}"
+            )
+        previous_end = end
 
 
 def make_config(

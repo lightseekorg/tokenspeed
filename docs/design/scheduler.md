@@ -26,6 +26,21 @@ caching — a chunk ending mid-page would leave a partial page that can never be
 matched. A chunk that *completes* the prompt is exempt: there is no next chunk
 to align for.
 
+**Atomic spans.** Some model inputs declare inclusive token spans that one
+prefill query must consume as a unit. These spans are admitted only when they
+are in bounds, strictly ascending, non-overlapping, and no longer than
+`max_scheduled_tokens`. Span correctness is applied after page/promotion
+alignment and therefore wins: a provisional chunk stops before a later span
+only when its boundary would split that span; fully contained spans stay in the
+same chunk. When a chunk begins at a span start, it covers the complete span. If
+the current round has too little remaining budget, alignment returns zero and
+defers the request. Starting strictly inside a span is an invariant failure.
+
+This is **Invariant A**: each atomic span belongs wholly to exactly one prefill
+query range. Prefix matching may stop only before the first span, and no chunk
+boundary may fall strictly inside one. Empty-span requests retain byte-for-byte
+the prior alignment result. Page alignment yields where it would otherwise split an atomic span.
+
 **Reserve.** What an admission holds beyond the chunk it computes is stated
 once per round (`PrefillReserve`: decode width, prompt headroom,
 whether the round finishes shaping the state groups) and turned into each
@@ -444,6 +459,12 @@ no victim and nothing could free that page.
 - An incomplete local prefill is not overtaken (1.1). Decodes are never hostage
   to it: they consume no fresh capacity within their reserve, so they keep
   running beside a stalled prefill.
+- Atomic spans use inclusive `[start, end]` coordinates and are validated at
+  admission for even wire arity, `0 <= start <= end`, `end < num_tokens`,
+  strict sorted non-overlap, and length no greater than
+  `--chunked-prefill-size`. An oversized span is a per-request rejection. A
+  zero chunk is a normal deferral when the remaining round budget cannot cover
+  a span, never permission to split it.
 - Retraction fires only when no prefill progressed and an admission failed
   (2). The chosen victim must be quiescent — no forward of its own in flight,
   no PD transfer against its pages (§3.1) — and an in-flight load-back or an in-flight pinned

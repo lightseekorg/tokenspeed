@@ -47,7 +47,10 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
+from tokenspeed.runtime.execution.forward_step import (
+    ForwardStepRunner,
+    get_is_cuda_graph_phase,
+)
 from tokenspeed.runtime.execution.forward_thread import ForwardThread
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.model_runner import ModelRunner
@@ -79,6 +82,17 @@ from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.paged_attention import (
     bind_cache_groups,
     check_block_drafter_storage,
+)
+from tokenspeed.runtime.metrics.dsv4_numerical_attribution import (
+    begin_numerical_attribution_forward,
+    build_sampling_directive,
+    configure_dsv4_numerical_attribution,
+)
+from tokenspeed.runtime.metrics.dsv4_vision_instrumentation import (
+    begin_current_stream_timing,
+    build_request_media_bindings,
+    finish_current_stream_timing,
+    get_dsv4_vision_instrumentation,
 )
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.dp_sampling_config import (
@@ -178,6 +192,9 @@ class ModelExecutorConfig:
     max_cudagraph_capture_size: int
     model_is_mrope: bool
     enable_nan_detection: bool = False
+    enable_dsv4_vision_instrumentation: bool = False
+    enable_dsv4_numerical_attribution: bool = False
+    sampling_backend: str = "greedy"
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
 
@@ -299,6 +316,13 @@ class ModelExecutorConfig:
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
             enable_nan_detection=server_args.enable_nan_detection,
+            enable_dsv4_vision_instrumentation=getattr(
+                server_args, "enable_dsv4_vision_instrumentation", False
+            ),
+            enable_dsv4_numerical_attribution=getattr(
+                server_args, "enable_dsv4_numerical_attribution", False
+            ),
+            sampling_backend=server_args.sampling_backend,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
         )
@@ -506,6 +530,12 @@ class ModelExecutor:
         # themselves.
         self.default_stream = self.device_module.default_stream(self.device)
         self.execution_stream = self.device_module.Stream()
+        if config.enable_dsv4_vision_instrumentation:
+            # Eager startup warmup above uses the untouched methods. Deferred
+            # graph capture uses the wrappers' shared capture-phase guard.
+            self._dsv4_instrumentation_forward = ((), 0, ())
+            self._run_target_forward = self._run_target_forward_instrumented
+            self.execute_forward_op = self._execute_forward_op_instrumented
         # The data plane: every CUDA-touching operation after startup is
         # submitted here and runs in FIFO order on one thread. The event loop
         # (control plane) never waits on the GPU along the per-round path —
@@ -526,6 +556,13 @@ class ModelExecutor:
             device=self.device,
         )
 
+        configure_dsv4_numerical_attribution(
+            enabled=config.enable_dsv4_numerical_attribution,
+            global_rank=config.global_rank,
+            expected_vocab_size=config.vocab_size,
+        )
+        self._dsv4_attribution_steps: dict[str, int] = {}
+        self._dsv4_attribution_completed_requests: set[str] = set()
         logger.info("ModelExecutor initialized")
 
     def capture_graphs(self) -> None:
@@ -757,6 +794,87 @@ class ModelExecutor:
             multimodal_context=self._active_multimodal_context,
             **self.input_buffers.ngram_model_kwargs(ctx.input_num_tokens),
         )
+
+    def _run_target_forward_instrumented(self, ctx: ForwardContext):
+        # Graph capture happens after executor construction. Use the shared
+        # phase signal to keep CUDA events out of startup capture and warmup.
+        record_instrumentation = not get_is_cuda_graph_phase()
+        instrumentation_timing = None
+        if record_instrumentation:
+            get_dsv4_vision_instrumentation().begin_dispatch()
+            instrumentation_timing = begin_current_stream_timing(
+                True, self.device_module
+            )
+        path = "eager"
+        positions = self._active_positions_override
+        if positions is None:
+            if self.config.model_is_mrope:
+                positions = self.input_buffers.mrope_positions_buf[
+                    :, : ctx.input_num_tokens
+                ]
+            else:
+                positions = self.input_buffers.positions_buf[: ctx.input_num_tokens]
+        # PP mid-pipeline: receive the upstream boundary state and thread it
+        # through the model's pp_inbound channel. The P role forces eager, so
+        # neither graph path below can be active alongside PP.
+        if self.config.pp_size > 1 and not self._pp_is_first_stage:
+            pp_inbound = self._pp_recv_stage_state(ctx.input_num_tokens)
+            output = self.model_runner.forward(
+                ctx,
+                self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
+                positions,
+                pp_inbound=pp_inbound,
+                **self.input_buffers.ngram_model_kwargs(ctx.input_num_tokens),
+            )
+        else:
+            # Prefill-graph replay when captured for this forward (the decode graph
+            # replays one level up: it captures the whole _forward_step).
+            mode = ctx.forward_mode
+            if (
+                mode is not None
+                and (mode.is_extend() or mode.is_mixed())
+                and self.prefill_graph.can_run(ctx, self._active_multimodal_context)
+            ):
+                path = "replay"
+                output = self.prefill_graph.replay(
+                    ctx,
+                    self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
+                    self._active_multimodal_context,
+                )
+            else:
+                output = self.model_runner.forward(
+                    ctx,
+                    self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
+                    positions,
+                    multimodal_context=self._active_multimodal_context,
+                    **self.input_buffers.ngram_model_kwargs(ctx.input_num_tokens),
+                )
+        if not record_instrumentation:
+            return output
+        wall_ns = finish_current_stream_timing(instrumentation_timing)
+        request_ids, num_extends, extend_prefix_lens = (
+            self._dsv4_instrumentation_forward
+        )
+        vision = getattr(ctx, "dsv4_vision", None)
+        intersects_span = bool(getattr(vision, "intersects_span", False))
+        if path == "replay" and intersects_span:
+            raise RuntimeError(
+                "DeepSeek V4 image-bearing forward cannot replay a prefill graph"
+            )
+        get_dsv4_vision_instrumentation().record_dispatch(
+            path=path,
+            num_tokens=ctx.input_num_tokens,
+            batch_size=ctx.bs,
+            request_ids=request_ids,
+            num_extends=num_extends,
+            extend_prefix_lens=extend_prefix_lens,
+            intersects_span=intersects_span,
+            media_bindings=build_request_media_bindings(
+                self._active_multimodal_context
+            ),
+            wall_ns=wall_ns,
+        )
+        return output
 
     def _apply_force_single_token_verify(
         self,
@@ -1027,12 +1145,79 @@ class ModelExecutor:
             )
         self.runtime_states.update_valid_cache_length(req_pool_indices, deltas)
 
-    def _build_sampling_info(self, bs: int) -> SamplingBatchInfo:
+    def _build_sampling_info(
+        self,
+        bs: int,
+        sampling_params_list: list[SamplingParams],
+        forward_op,
+    ) -> SamplingBatchInfo:
+        attribution_rows = None
+        forced_token_ids = None
+        if self.config.enable_dsv4_numerical_attribution or any(
+            isinstance(getattr(params, "custom_params", None), dict)
+            and "dsv4_numerical_attribution" in params.custom_params
+            for params in sampling_params_list
+        ):
+            if forward_op is None or bs != 1 or len(sampling_params_list) != 1:
+                raise RuntimeError(
+                    "numerical attribution requires one concrete forward operation"
+                )
+            is_prefill = forward_op.num_extends() == 1
+            params = sampling_params_list[0]
+            metadata = params.custom_params["dsv4_numerical_attribution"]
+            request_id = str(forward_op.request_ids[0])
+            if request_id not in self._dsv4_attribution_completed_requests:
+                profile = metadata["profile"]
+                if profile == "tokenspeed-incremental":
+                    trajectory_step = self._dsv4_attribution_steps.get(request_id, 0)
+                else:
+                    trajectory_step = int(metadata["requested_step"])
+                prompt_length = int(metadata["prompt_length"])
+                start_position = (
+                    int(forward_op.extend_prefix_lens[0])
+                    if is_prefill
+                    else prompt_length + trajectory_step - 1
+                )
+                directive = build_sampling_directive(
+                    params,
+                    enabled=self.config.enable_dsv4_numerical_attribution,
+                    batch_size=bs,
+                    enforce_eager=self.config.enforce_eager,
+                    speculative_algorithm=self.config.spec_algo,
+                    sampling_backend=self.config.sampling_backend,
+                    forward_mode="prefill" if is_prefill else "decode",
+                    start_position=start_position,
+                    call_input_length=int(forward_op.input_lengths[0]),
+                    accepted_prefix_tokens=(
+                        int(forward_op.extend_prefix_lens[0]) if is_prefill else 0
+                    ),
+                    request_id=request_id,
+                    trajectory_step=trajectory_step,
+                )
+                if directive is not None:
+                    if profile == "tokenspeed-incremental":
+                        next_step = trajectory_step + 1
+                        self._dsv4_attribution_steps[request_id] = next_step
+                        checkpoint_step = metadata["checkpoint_step"]
+                        limit = (
+                            int(checkpoint_step) + 1
+                            if checkpoint_step is not None
+                            else 32
+                        )
+                        if next_step == limit:
+                            self._dsv4_attribution_completed_requests.add(request_id)
+                    else:
+                        self._dsv4_attribution_completed_requests.add(request_id)
+                    attribution_rows = [directive]
+                    forced_token_ids = [directive["forced_id"]]
+                    begin_numerical_attribution_forward(directive)
         return SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
             vocab_size=self.runtime_states.vocab_size,
             device=self.device,
+            dsv4_numerical_attribution_rows=attribution_rows,
+            dsv4_forced_token_ids=forced_token_ids,
         )
 
     def execute_idle_forward(self, dp_metadata: DpForwardMetadata):
@@ -1053,6 +1238,9 @@ class ModelExecutor:
             global_num_tokens=dp_metadata.global_num_tokens,
             global_bs=dp_metadata.global_batch_size,
             all_decode_or_idle=dp_metadata.all_decode_or_idle,
+            global_dsv4_image_span_intersections=(
+                dp_metadata.global_dsv4_image_span_intersections
+            ),
         )
         sampling_info = SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:0],
@@ -1262,6 +1450,37 @@ class ModelExecutor:
             ).to(self.device, non_blocking=True)
             self.runtime_states.reset_states(rows, values)
 
+    def _execute_forward_op_instrumented(
+        self,
+        forward_op,
+        sampling_params_list: list[SamplingParams],
+        dp_metadata: DpForwardMetadata | None = None,
+        grammar_inputs=None,
+        multimodal_context=None,
+        capture_next_input_ids: bool = False,
+        *,
+        ngram_inputs: NGramInputs | None,
+    ) -> ModelExecutionResult:
+        num_extends = forward_op.num_extends()
+        self._dsv4_instrumentation_forward = (
+            tuple(str(request_id) for request_id in forward_op.request_ids),
+            num_extends,
+            tuple(
+                int(prefix_len)
+                for prefix_len in forward_op.extend_prefix_lens[:num_extends]
+            ),
+        )
+        return ModelExecutor.execute_forward_op(
+            self,
+            forward_op,
+            sampling_params_list,
+            dp_metadata=dp_metadata,
+            grammar_inputs=grammar_inputs,
+            multimodal_context=multimodal_context,
+            capture_next_input_ids=capture_next_input_ids,
+            ngram_inputs=ngram_inputs,
+        )
+
     def execute_forward_op(
         self,
         forward_op,
@@ -1410,9 +1629,14 @@ class ModelExecutor:
                     ctx.global_bs = dp_metadata.global_batch_size
                     ctx.all_decode_or_idle = dp_metadata.all_decode_or_idle
                     ctx.all_extend = dp_metadata.all_extend
+                    ctx.global_dsv4_image_span_intersections = (
+                        dp_metadata.global_dsv4_image_span_intersections
+                    )
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_start = time.perf_counter() if timing_enabled else 0.0
-                    sampling_info = self._build_sampling_info(bs)
+                    sampling_info = self._build_sampling_info(
+                        bs, sampling_params_list, forward_op
+                    )
                     grammar_completion = setup_grammar_step(
                         sampling_info=sampling_info,
                         bs=bs,

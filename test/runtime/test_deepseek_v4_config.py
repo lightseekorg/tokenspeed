@@ -196,6 +196,9 @@ def _v4_backend(flat: SimpleNamespace) -> DeepseekV4AttentionBackend:
     config_fields = {k: v for k, v in fields.items() if k not in _V4_SPEC_FIELDS}
     config_fields.setdefault("speculative_num_steps", 0)
     config_fields.setdefault("speculative_num_draft_tokens", 1)
+
+    config_fields.setdefault("vision_enabled", False)
+    config_fields.setdefault("vision_max_n_token", 0)
     return DeepseekV4AttentionBackend(
         SimpleNamespace(**config_fields), SimpleNamespace(**spec_fields)
     )
@@ -6570,6 +6573,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             n_routed_experts=4,
             hidden_size=8,
             num_hash_layers=0,
+            num_hidden_layers=43,
             topk_method=None,
         )
         gate = DeepseekV4MoEGate(config, layer_index=1)
@@ -6593,6 +6597,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             n_routed_experts=256,
             hidden_size=4096,
             num_hash_layers=0,
+            num_hidden_layers=43,
             topk_method=None,
         )
         gate = DeepseekV4MoEGate(config, layer_index=1).cuda().to(torch.bfloat16)

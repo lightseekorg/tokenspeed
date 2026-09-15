@@ -38,6 +38,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from tokenspeed.runtime.engine.event_loop import EventLoop  # noqa: E402
 from tokenspeed.runtime.epd.prefill_hooks import EpdPrefillHooks  # noqa: E402
 
 
@@ -79,13 +80,18 @@ class _Admission:
 class _OutputProcessor:
     def __init__(self) -> None:
         self.published: list[str] = []
+        self.rid_to_state: dict = {}
 
     def publish_finished_at_admission(self, request_id, _state) -> None:
         self.published.append(request_id)
+        self.rid_to_state.pop(request_id, None)
 
 
 class _FakeLoop:
     """Only the loop state EpdPrefillHooks reads."""
+
+    _reject_at_admission = EventLoop._reject_at_admission
+    _submit_admitted_requests = EventLoop._submit_admitted_requests
 
     def __init__(self) -> None:
         self._pause = SimpleNamespace(admit_blocked=False)
@@ -131,7 +137,7 @@ def test_try_stage_stages_encode_routed_requests() -> None:
     assert hooks.try_stage(spec, state, "bootstrap")
 
     assert admission.staged == ["r0"]
-    assert hooks._staged == {"r0": (spec, state, "bootstrap")}
+    assert hooks._staged == {"r0": (spec, state, None, "bootstrap")}
 
 
 # --- drain_ready_embeddings -----------------------------------------------------
@@ -154,6 +160,54 @@ def test_drain_submits_admitted_and_registers_deferred_sender() -> None:
     assert registered == [("r0", "bootstrap")]
     assert loop.submitted == [[spec]]
     assert hooks._staged == {}
+
+
+def test_drain_isolates_invalid_admission_and_cleans_deferred_sender() -> None:
+    admission = _Admission()
+    loop = _FakeLoop()
+
+    def submit(specs):
+        if any(getattr(spec, "invalid", False) for spec in specs):
+            raise ValueError("invalid staged request")
+        loop.submitted.append(list(specs))
+
+    loop.scheduler = SimpleNamespace(submit_requests=submit)
+    registered: list[tuple[str, object]] = []
+    rejected: list[tuple[str, object, str]] = []
+    loop.kv_transfer = SimpleNamespace(
+        register=lambda rid, bootstrap: registered.append((rid, bootstrap)),
+        reject_at_admission=lambda rid, bootstrap, reason: rejected.append(
+            (rid, bootstrap, reason)
+        ),
+    )
+    hooks = EpdPrefillHooks(loop, admission)
+    valid = SimpleNamespace(request_id="valid", invalid=False)
+    invalid = SimpleNamespace(request_id="invalid", invalid=True)
+    valid_state = _State(mm_items=[_handshaked_item()])
+    invalid_state = _State(mm_items=[_handshaked_item()])
+    loop.output_processor.rid_to_state.update(
+        {"valid": valid_state, "invalid": invalid_state}
+    )
+    hooks.try_stage(valid, valid_state, "bootstrap-valid")
+    hooks.try_stage(invalid, invalid_state, "bootstrap-invalid")
+    admission.drain_result = (["valid", "invalid"], [])
+
+    hooks.drain_ready_embeddings()
+
+    assert registered == [
+        ("valid", "bootstrap-valid"),
+        ("invalid", "bootstrap-invalid"),
+    ]
+    assert loop.submitted == [[valid]]
+    message = "Scheduler rejected request invalid: invalid staged request"
+    assert invalid_state.finish_calls == [message]
+    assert loop.output_processor.published == ["invalid"]
+    assert rejected == [("invalid", "bootstrap-invalid", message)]
+
+    following = SimpleNamespace(request_id="following", invalid=False)
+    following_state = _State()
+    loop._submit_admitted_requests([(following, following_state, None, None)])
+    assert loop.submitted[-1] == [following]
 
 
 def test_drain_finishes_failed_requests_without_submitting() -> None:

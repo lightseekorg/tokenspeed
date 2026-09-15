@@ -309,6 +309,8 @@ class ServerArgs:
     prefill_graph_capture_sizes: list[int] | None = None
     cudagraph_capture_sizes: list[int] | None = None
     enable_nan_detection: bool = False
+    enable_dsv4_vision_instrumentation: bool = False
+    enable_dsv4_numerical_attribution: bool = False
     enable_nvtx: bool = False
     weight_loader_prefetch_checkpoints: bool = True
     weight_loader_prefetch_num_threads: int = 4
@@ -1923,6 +1925,22 @@ class ServerArgs:
             "sampled token id escaped the vocab range), and terminate only "
             "those requests with a numerical error so corruption cannot "
             "spread to the rest of the batch.",
+        )
+        parser.add_argument(
+            "--enable-dsv4-vision-instrumentation",
+            action="store_true",
+            default=ServerArgs.enable_dsv4_vision_instrumentation,
+            help="Export default-off DeepSeek V4 vision integration metrics. "
+            "Timed forwards use events on the current execution stream and "
+            "are intended for validation, not production serving.",
+        )
+        parser.add_argument(
+            "--enable-dsv4-numerical-attribution",
+            action="store_true",
+            default=ServerArgs.enable_dsv4_numerical_attribution,
+            help="Enable the fail-closed DeepSeek V4 raw-logit attribution "
+            "harness. This diagnostic mode requires eager, greedy, "
+            "single-request, non-speculative execution.",
         )
         parser.add_argument(
             "--enable-nvtx",
