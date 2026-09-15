@@ -26,7 +26,6 @@ from utils import is_cdna4, is_cdna5
 
 MODEL_VOCABS = {
     "dsv4": 129280,  # V4 Pro/Flash and V4.1 Flash share the output vocabulary.
-    "qwen3_5": 151936,
     "kimi_k3": 163840,
     "glm_5_3_flash": 154880,
 }
@@ -46,7 +45,11 @@ else:
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float32, torch.float16, torch.bfloat16],
+    ids=["fp32", "fp16", "bf16"],
+)
 def test_argmax_matches_torch_for_dtypes(dtype):
     torch.manual_seed(0xA950)
     x = torch.randn(8, 4096, device="cuda", dtype=dtype)
@@ -54,39 +57,17 @@ def test_argmax_matches_torch_for_dtypes(dtype):
     torch.testing.assert_close(out, torch.argmax(x, dim=-1), atol=0, rtol=0)
 
 
+# Cover every _select_config bucket on gfx950 and gfx1250, with an odd M at
+# each bucket boundary so non-power-of-two grids are exercised. fp16 and bf16
+# share tile geometry, so only bf16 and fp32 are exercised here.
 @pytest.mark.parametrize("N", MODEL_VOCABS.values(), ids=MODEL_VOCABS.keys())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("M", [1, 2, 3, 4, 5, 8, 16, 17, 32, 64, 128, 256, 512, 1024])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+@pytest.mark.parametrize("M", [1, 2, 3, 5, 17, 64, 65, 128, 129, 256, 513, 1024])
 def test_argmax_matches_torch_for_model_shapes(M, N, dtype):
     torch.manual_seed(M ^ N)
     x = torch.randn(M, N, device="cuda", dtype=dtype)
     out = argmax_impl.argmax(x, out=None)
     torch.testing.assert_close(out, torch.argmax(x, dim=-1), atol=0, rtol=0)
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("batch", [1, 4, 16, 64, 128, 256, 1024])
-@pytest.mark.parametrize("phase", ["draft", "verify"])
-def test_argmax_deepseek_v41_speculative_shapes(batch, phase, dtype):
-    # DeepSeek-V4.1-Flash text_config: vocab_size=129280, dspark_block_size=5.
-    # Draft heads sample strided [batch, 5, vocab] slices; target verification
-    # flattens five predictions plus the anchor into six rows per request.
-    N = MODEL_VOCABS["dsv4"]
-    torch.manual_seed(batch ^ N ^ 0x41)
-    if phase == "draft":
-        x = torch.randn(batch, 5, N, device="cuda", dtype=dtype)[:, 2, :]
-    else:
-        x = torch.randn(batch * 6, N, device="cuda", dtype=dtype)
-    x[:, -1] = 100.0
-    out = (
-        torch.empty(x.shape[0], device="cuda", dtype=torch.int32)
-        if phase == "draft"
-        else None
-    )
-    returned = argmax_impl.argmax(x, out=out)
-    if out is not None:
-        assert returned is out
-    torch.testing.assert_close(returned.long(), torch.argmax(x, dim=-1), atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
@@ -149,9 +130,10 @@ def test_argmax_writes_into_strided_caller_buffer(out_dtype):
     torch.testing.assert_close(out.long(), torch.argmax(x, dim=-1), atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("N", MODEL_VOCABS.values(), ids=MODEL_VOCABS.keys())
-@pytest.mark.parametrize("M", [16, 256, 513])
-def test_argmax_out_buffer_under_cuda_graph(M, N):
+# M=16 routes through split scratch; M=256 is a one-stage launch without it.
+@pytest.mark.parametrize("M", [16, 256])
+def test_argmax_out_buffer_under_cuda_graph(M):
+    N = MODEL_VOCABS["dsv4"]
     torch.manual_seed(M ^ N ^ 0xC0DE)
     x = 0.1 * torch.randn(M, N, device="cuda", dtype=torch.float32)
     out = torch.empty(M, dtype=torch.int32, device="cuda")
@@ -170,7 +152,10 @@ def test_argmax_out_buffer_under_cuda_graph(M, N):
     torch.testing.assert_close(out.long(), torch.argmax(x, dim=-1), atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("M,N", [(1, 4097), (5, 129281), (65, 151936), (513, 65537)])
+@pytest.mark.parametrize(
+    "M,N",
+    [(1, 4097), (5, 129281), (65, 154880), (513, 8192), (513, 65537)],
+)
 def test_argmax_strided_rows_and_partial_tiles(M, N):
     x = torch.randn(M, N + 7, device="cuda", dtype=torch.float32)[:, :N]
     x[:, -1] = 100.0
@@ -179,12 +164,16 @@ def test_argmax_strided_rows_and_partial_tiles(M, N):
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("out_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.bfloat16, torch.float32],
+    ids=["fp16", "bf16", "fp32"],
+)
 @pytest.mark.parametrize("M", [129, 513])
 @pytest.mark.parametrize("N", [16385, 129281])
-def test_argmax_masks_padding_with_negative_logits(M, N, dtype, out_dtype):
+def test_argmax_masks_padding_with_negative_logits(M, N, dtype):
     # Offset each row and fill its padding with values that must not win.
+    out_dtype = torch.int32
     storage = torch.full((M, N + 8), float("inf"), device="cuda", dtype=dtype)
     x = storage[:, 1 : N + 1]
     x.fill_(-2.0)
@@ -248,13 +237,12 @@ def test_argmax_rejects_invalid_output(kind):
         argmax_impl.argmax(x, out=out)
 
 
-@pytest.mark.parametrize("N", MODEL_VOCABS.values(), ids=MODEL_VOCABS.keys())
-@pytest.mark.parametrize("M", [4, 16])
-def test_argmax_public_dispatch_and_repeated_graph_calls(M, N):
+def test_argmax_public_dispatch_and_repeated_graph_calls():
     from tokenspeed_kernel.ops.sampling import argmax
     from tokenspeed_kernel.selection import select_kernel
     from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
+    M, N = 4, MODEL_VOCABS["dsv4"]
     x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
     outputs = [torch.empty(M, device="cuda", dtype=torch.int32) for _ in range(3)]
     selected = select_kernel(

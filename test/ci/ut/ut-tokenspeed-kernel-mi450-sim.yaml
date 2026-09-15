@@ -36,6 +36,17 @@ env:
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-q_bf16-prefill]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_standard_cache.py::test_standard_cache_decode_cuda_graph_replays_changed_inputs[1]
     tokenspeed-kernel/test/amd/ops/test_kimi3_prefill_gluon_amd.py::test_attn_res_amd_entrypoint_accepts_legacy_keywords
+    # Gluon argmax on gfx1250: split reduction, non-power-of-two split count,
+    # pipelined TDM with zero-padding masking, single-tile rows, NaN handling,
+    # graph capture and scratch ownership.
+    tokenspeed-kernel/test/amd/ops/sampling/test_gluon_argmax_gfx950.py::test_argmax_matches_torch_for_model_shapes[1-bf16-dsv4]
+    tokenspeed-kernel/test/amd/ops/sampling/test_gluon_argmax_gfx950.py::test_argmax_matches_torch_for_model_shapes[17-fp32-glm_5_3_flash]
+    tokenspeed-kernel/test/amd/ops/sampling/test_gluon_argmax_gfx950.py::test_argmax_masks_padding_with_negative_logits[16385-129-fp16]
+    tokenspeed-kernel/test/amd/ops/sampling/test_gluon_argmax_gfx950.py::test_argmax_strided_rows_and_partial_tiles[513-8192]
+    tokenspeed-kernel/test/amd/ops/sampling/test_gluon_argmax_gfx950.py::test_argmax_ignores_nan_but_preserves_valid_negative_infinity[4]
+    tokenspeed-kernel/test/amd/ops/sampling/test_gluon_argmax_gfx950.py::test_argmax_out_buffer_under_cuda_graph[16]
+    tokenspeed-kernel/test/amd/ops/sampling/test_gluon_argmax_gfx950.py::test_argmax_first_capture_does_not_cache_graph_pool_scratch
+    tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/sampling.argmax/gluon_argmax_gfx1250@mi450]
     # DeepSeek V4 portable Triton path on gfx1250: one case per code path.
     # TODO: need_scores=True router cases stay out: the pinned rocJITsu mis-scales
     # float division for subnormal quotients, which corrupts their F.softplus
