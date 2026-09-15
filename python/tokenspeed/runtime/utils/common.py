@@ -59,7 +59,6 @@ import numpy as np
 import psutil
 import pybase64
 import requests
-import tokenspeed_triton as triton
 import torch
 import torch.distributed
 import torch.distributed as dist
@@ -967,15 +966,8 @@ def set_cuda_arch():
     os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
 
 
-def next_power_of_2(n: int):
-    return 1 << (n - 1).bit_length() if n > 0 else 1
-
-
 def round_up(x: int, y: int) -> int:
     return ((x - 1) // y + 1) * y
-
-
-setattr(triton, "next_power_of_2", next_power_of_2)
 
 
 def add_prefix(name: str, prefix: str) -> str:
