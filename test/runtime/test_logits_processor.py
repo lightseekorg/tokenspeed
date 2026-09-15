@@ -68,7 +68,7 @@ def test_tp_logits_all_gather_handles_zero_rows(monkeypatch):
     metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE)
     calls = {"all_gather": 0}
 
-    def fake_all_gather_into_tensor(output, input_, group):
+    def fake_all_gather_single(output, input_, group):
         calls["all_gather"] += 1
         assert group == (0, 1)
         assert tuple(output.shape) == (0, 3)
@@ -76,8 +76,8 @@ def test_tp_logits_all_gather_handles_zero_rows(monkeypatch):
 
     monkeypatch.setattr(
         logits_processor_module,
-        "all_gather_into_tensor",
-        fake_all_gather_into_tensor,
+        "all_gather_single",
+        fake_all_gather_single,
     )
 
     output = processor(
@@ -130,7 +130,7 @@ def test_tp_logits_gather_preserves_dtype(monkeypatch, dtype, cached):
     monkeypatch.setattr(processor, "_init_all_gather_state", initialize)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(logits_processor_module, "all_gather_inner", multicast)
-    monkeypatch.setattr(logits_processor_module, "all_gather_into_tensor", collective)
+    monkeypatch.setattr(logits_processor_module, "all_gather_single", collective)
     hidden = torch.tensor([[1.0, 1 / 512]], dtype=dtype)
     weight = torch.zeros((8, 2), dtype=dtype)
     weight[0, 0] = 1
@@ -542,7 +542,7 @@ def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(monkeypatc
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     monkeypatch.setattr(
         logits_processor_module,
-        "all_gather_into_tensor",
+        "all_gather_single",
         lambda out, inp, group: None,
     )
 

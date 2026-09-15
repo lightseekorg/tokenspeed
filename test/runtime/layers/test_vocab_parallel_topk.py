@@ -206,7 +206,7 @@ def test_a_quantized_head_picks_candidates_through_the_padding_slice(
         out[: src.shape[0]].copy_(src)
         out[src.shape[0] :].copy_(peer_packed)
 
-    monkeypatch.setattr(topk_module, "all_gather_into_tensor", fake_all_gather)
+    monkeypatch.setattr(topk_module, "all_gather_single", fake_all_gather)
     candidate_ids, _ = selector(hidden_states)
 
     # Every winner is a real token of this shard, never one of the pad columns
@@ -247,7 +247,7 @@ def test_shard_local_topk_picks_what_a_whole_vocabulary_topk_would(
         out[: src.shape[0]].copy_(src)
         out[src.shape[0] :].copy_(peer_packed)
 
-    monkeypatch.setattr(topk_module, "all_gather_into_tensor", fake_all_gather)
+    monkeypatch.setattr(topk_module, "all_gather_single", fake_all_gather)
     candidate_ids, values = selector(hidden_states)
 
     expected = torch.topk(torch.matmul(hidden_states, weight.T), top_k, dim=-1)

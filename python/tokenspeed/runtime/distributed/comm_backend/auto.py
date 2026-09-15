@@ -275,10 +275,10 @@ class AutoBackend(CommBackend):
 
         return self._nccl.all_gather(tensor, group, dim)
 
-    def all_gather_into_tensor(
+    def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None:
-        return self._nccl.all_gather_into_tensor(output, input, group)
+        return self._nccl.all_gather_single(output, input, group)
 
     def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor:
         return self._nccl.reduce_scatter(tensor, group)

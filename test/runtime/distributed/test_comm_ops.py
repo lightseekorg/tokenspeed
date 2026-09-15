@@ -475,24 +475,24 @@ def _test_all_gather(rank, world_size, device, group, ref_group):
         torch.testing.assert_close(result, expected)
 
 
-def _test_all_gather_into_tensor(rank, world_size, device, group, ref_group):
-    from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
+def _test_all_gather_single(rank, world_size, device, group, ref_group):
+    from tokenspeed.runtime.distributed.comm_ops import all_gather_single
 
     for sz in TEST_SIZES:
         for dtype in DTYPES:
             inp = torch.randint(1, 16, (sz,), dtype=dtype, device=device)
             output = torch.empty(sz * world_size, dtype=dtype, device=device)
             expected = torch.empty_like(output)
-            dist.all_gather_into_tensor(expected, inp, group=ref_group)
-            all_gather_into_tensor(output, inp, group)
+            dist.all_gather_single(expected, inp, group=ref_group)
+            all_gather_single(output, inp, group)
             torch.testing.assert_close(output, expected)
 
     # 2D
     inp = torch.randint(1, 16, (4, 128), dtype=torch.float32, device=device)
     output = torch.empty(4 * world_size, 128, dtype=torch.float32, device=device)
     expected = torch.empty_like(output)
-    dist.all_gather_into_tensor(expected, inp, group=ref_group)
-    all_gather_into_tensor(output, inp, group)
+    dist.all_gather_single(expected, inp, group=ref_group)
+    all_gather_single(output, inp, group)
     torch.testing.assert_close(output, expected)
 
 
@@ -526,7 +526,7 @@ def _test_reduce_scatter(rank, world_size, device, group, ref_group):
             total_sz = sz * world_size
             inp = torch.randint(1, 16, (total_sz,), dtype=dtype, device=device)
             expected = torch.empty(sz, dtype=dtype, device=device)
-            dist.reduce_scatter_tensor(expected, inp, group=ref_group)
+            dist.reduce_scatter_single(expected, inp, group=ref_group)
             result = reduce_scatter(inp.clone(), group)
             torch.testing.assert_close(result, expected)
 
@@ -535,7 +535,7 @@ def _test_reduce_scatter(rank, world_size, device, group, ref_group):
         total_rows = 16 * world_size
         inp = torch.randint(1, 16, (total_rows, 128), dtype=dtype, device=device)
         expected = torch.empty(16, 128, dtype=dtype, device=device)
-        dist.reduce_scatter_tensor(expected, inp, group=ref_group)
+        dist.reduce_scatter_single(expected, inp, group=ref_group)
         result = reduce_scatter(inp.clone(), group)
         torch.testing.assert_close(result, expected)
 
@@ -608,7 +608,7 @@ def _test_fused_ops(rank, world_size, device, group, ref_group):
     total_sz = 512 * world_size
     inp = torch.randint(1, 16, (total_sz,), dtype=torch.float32, device=device)
     expected = torch.empty(512, dtype=torch.float32, device=device)
-    dist.reduce_scatter_tensor(expected, inp, group=ref_group)
+    dist.reduce_scatter_single(expected, inp, group=ref_group)
     result = fused_reduce_scatter(inp.clone(), rank, group)
     torch.testing.assert_close(result, expected)
 
@@ -727,8 +727,8 @@ class TestCommOps:
         _run(world_size, _test_all_gather)
 
     @pytest.mark.parametrize("world_size", WORLD_SIZES)
-    def test_all_gather_into_tensor(self, world_size):
-        _run(world_size, _test_all_gather_into_tensor)
+    def test_all_gather_single(self, world_size):
+        _run(world_size, _test_all_gather_single)
 
     @pytest.mark.parametrize("world_size", WORLD_SIZES)
     def test_all_to_all_single(self, world_size):
