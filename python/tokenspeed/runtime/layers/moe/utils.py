@@ -47,6 +47,7 @@ class All2AllBackend(Enum):
 
     NONE = "none"
     DEEPEP = "deepep"
+    PETIT = "petit"
     FLASHINFER_NVLINK_ONE_SIDED = "flashinfer_nvlink_one_sided"
 
     @classmethod
@@ -64,6 +65,9 @@ class All2AllBackend(Enum):
     def is_deepep(self):
         return self == All2AllBackend.DEEPEP
 
+    def is_petit(self):
+        return self == All2AllBackend.PETIT
+
     def is_flashinfer_nvlink_one_sided(self):
         return self == All2AllBackend.FLASHINFER_NVLINK_ONE_SIDED
 
@@ -77,6 +81,7 @@ class MoeBackend(Enum):
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+    PETIT = "petit"
 
     DEEP_GEMM = "deep_gemm"
     DEEP_GEMM_MEGA_MOE = "deep_gemm_mega_moe"
@@ -93,6 +98,9 @@ class MoeBackend(Enum):
 
     def is_marlin(self):
         return self == MoeBackend.MARLIN
+
+    def is_petit(self):
+        return self == MoeBackend.PETIT
 
     def is_flashinfer_trtllm(self):
         return self == MoeBackend.FLASHINFER_TRTLLM

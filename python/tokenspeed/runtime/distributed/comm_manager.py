@@ -217,6 +217,11 @@ class CommManager:
         )
 
     def pre_moe_comm(self, hidden_states: torch.Tensor, ctx: ForwardContext):
+        from tokenspeed.runtime.layers.moe.utils import get_all2all_backend
+
+        if get_all2all_backend().is_petit():
+            return hidden_states
+
         if not self.mapping.moe.has_tp_ep:
             return hidden_states
 
@@ -256,6 +261,11 @@ class CommManager:
     def post_moe_comm(
         self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
     ):
+        from tokenspeed.runtime.layers.moe.utils import get_all2all_backend
+
+        if get_all2all_backend().is_petit():
+            return hidden_states, residual
+
         if not self.mapping.moe.has_tp_ep:
             return hidden_states, residual
 

@@ -759,6 +759,92 @@ tokenspeed serve openai/gpt-oss-120b \
   --port 8000
 ```
 
+### Petit MegaMoE on AMD CDNA4
+
+Petit provides a fused expert communication-and-compute path for serialized
+MXFP4 GPT-OSS 120B and DeepSeek V3 checkpoints. ROCm installations of
+`tokenspeed-kernel` include `petit-kernel==0.0.5` through the ROCm third-party
+requirements. Petit is imported only when its backend is used; CUDA installations
+do not require it. The backend requires `MegaMoeConfig` support and currently
+supports one 8-GPU AMD CDNA4 (`gfx950`) node only. Select Petit for both backend roles:
+
+```bash
+HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+tokenspeed serve <serialized-mxfp4-model-path> \
+  --dist-init-addr 127.0.0.1:4000 \
+  --world-size 8 \
+  --nprocs-per-node 8 \
+  --tensor-parallel-size 1 \
+  --data-parallel-size 8 \
+  --expert-parallel-size 8 \
+  --dense-tp-size 1 \
+  --moe-tp-size 1 \
+  --dtype bfloat16 \
+  --moe-backend petit \
+  --all2all-backend petit \
+  --chunked-prefill-size 1024 \
+  --max-prefill-tokens 1024 \
+  --disable-kvstore
+```
+
+The supported expert shapes are GPT-OSS 120B (128 experts, top-4, hidden size
+2880, biased OpenAI SwiGLU with alpha 1.702, clamp limit 7.0, and beta 1.0) and
+DeepSeek V3 (256 experts, top-8, hidden size 7168, intermediate size 2048,
+bias-free SiLU). Attention TP, MoE TP, context parallelism, and dense TP must
+all be 1; world size and expert parallel size must both be 8. Petit requires
+BF16 model activations (`--dtype bfloat16`). Use trivial
+expert placement without EPLB or redundant experts. Each rank is limited to
+1024 tokens in prefill and decode, and chunked prefill must remain enabled with
+a positive chunk size; speculative draft tokens count toward the decode limit.
+When speculative decoding is active, the target and draft MoE
+backends must both be Petit because they share one all-to-all backend. DeepSeek
+V3 activation clamps, nonstandard SiLU alpha, and expert biases are not
+supported.
+
+Kimi K2.5 MXFP4 also supports Petit with 384 experts, top-8 routing, hidden
+size 7168, and intermediate size 2048. DeepSeek V3 and Kimi shared experts
+execute on the main stream with Petit: auxiliary-stream execution has produced
+corrupted outputs during ROCm graph replay. Prefill/decode graphs and EAGLE3
+remain supported; shared-expert computation does not overlap the routed experts.
+
+### DeepSeek V4-Pro with Petit
+
+V4-Pro can use the Petit integration on one 8-GPU AMD CDNA4 node with
+serialized MXFP4 routed experts and BF16 activations. It requires a
+`petit_kernel` build exposing `MegaMoeActivationFunction.silu_clamp10` and its
+V4-Pro MegaMoE kernels. TokenSpeed requires the checkpoint's `swiglu_limit`
+to be 10. Routed experts compute `silu(min(gate, 10)) * clamp(up, -10, 10)`
+before intermediate MXFP4 quantization. There is no unclamped fallback.
+V4-Flash is not supported by this integration.
+
+```bash
+tokenspeed serve deepseek-ai/DeepSeek-V4-Pro \
+  --world-size 8 \
+  --nprocs-per-node 8 \
+  --tensor-parallel-size 1 \
+  --data-parallel-size 8 \
+  --expert-parallel-size 8 \
+  --dense-tp-size 1 \
+  --moe-tp-size 1 \
+  --dtype bfloat16 \
+  --moe-backend petit \
+  --all2all-backend petit \
+  --kv-cache-dtype fp8_e4m3 \
+  --attention-use-fp4-indexer-cache \
+  --chunked-prefill-size 1024 \
+  --max-prefill-tokens 1024 \
+  --disable-kvstore
+```
+
+The V4-Pro profile uses 384 routed experts, top-6 selection, hidden size 7168,
+and intermediate size 3072. Hash and learned routing retain local token order;
+shared experts execute locally with dense TP1 on the main stream. V4-Pro applies
+the same Petit shared-expert stream safeguard as V3 to avoid the overlap
+implicated in ROCm graph-replay corruption; graph capture remains enabled.
+The existing Petit placement,
+1024-token per-rank capacity, and speculative-backend restrictions above apply.
+Petit remains an optional dependency behind `tokenspeed-kernel`.
+
 ## DeepSeek V4-Flash / V4-Pro
 
 DeepSeek V4 uses FP8 KV cache.

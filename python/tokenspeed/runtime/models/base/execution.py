@@ -114,6 +114,9 @@ class CompiledDecoderLayer(nn.Module):
                 ):
                     has_rsag_comms = True
         self.has_rsag_comms = has_rsag_comms
+        self.runs_on_empty_input = any(
+            step.spec.runs_on_empty_input for step in self.steps
+        )
 
     def can_fuse_embed_reduce(self, num_tokens: int) -> bool:
         from tokenspeed.runtime.models.base.comm_ops import FusedReduceNormOp
@@ -143,7 +146,11 @@ class CompiledDecoderLayer(nn.Module):
 
         if num_global_tokens == 0:
             return hidden_states, residual
-        if hidden_states.shape[0] == 0 and not self.has_rsag_comms:
+        if (
+            hidden_states.shape[0] == 0
+            and not self.has_rsag_comms
+            and not self.runs_on_empty_input
+        ):
             return hidden_states, residual
 
         state = ExecutionState(hidden_states, residual, ctx)

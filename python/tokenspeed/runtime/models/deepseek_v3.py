@@ -56,6 +56,7 @@ from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
+from tokenspeed.runtime.layers.moe.utils import get_all2all_backend
 from tokenspeed.runtime.layers.utils import (
     CP_METADATA,
     ENABLE_CP,
@@ -288,7 +289,12 @@ class DeepseekV3MoE(nn.Module):
         self.layer_index = layer_index
         self.n_shared_experts = config.n_shared_experts
         self.routed_scaling_factor = config.routed_scaling_factor
-        self.stream_fork = StreamFork(alt_stream)
+        # Petit with auxiliary-stream shared experts can corrupt graph replay
+        # on ROCm. Keep both branches on the main stream until that interaction
+        # is resolved; prefill/decode graphs and speculation remain enabled.
+        self.stream_fork = StreamFork(
+            None if get_all2all_backend().is_petit() else alt_stream
+        )
 
         if self.mapping.moe.ep_size > config.n_routed_experts:
             raise ValueError(
@@ -310,7 +316,7 @@ class DeepseekV3MoE(nn.Module):
                 mapping=self.mapping,
                 quant_config=quant_config,
                 prefix=add_prefix("shared_experts", prefix),
-                is_shared_expert=True,
+                is_shared_expert=not get_all2all_backend().is_petit(),
             )
 
         self.experts = MoELayer(

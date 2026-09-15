@@ -63,6 +63,7 @@ from tokenspeed.runtime.models.base import (
     BaseTransformerModel,
     CompiledMoEDecoderLayer,
 )
+from tokenspeed.runtime.models.base.module_spec import ModuleKind, ModuleSpec
 from tokenspeed.runtime.models.utils import (
     create_fused_set_kv_buffer_arg,
     validate_attention_partition,
@@ -510,6 +511,11 @@ class GptOssDecoderLayer(CompiledMoEDecoderLayer):
             prefix=add_prefix("mlp", prefix),
         )
 
+    def mlp_spec(self) -> ModuleSpec:
+        if not get_all2all_backend().is_petit():
+            return super().mlp_spec()
+        return ModuleSpec.from_kind(kind=ModuleKind.MOE, runs_on_empty_input=True)
+
 
 class GptOssModel(BaseTransformerModel):
     layer_cls = GptOssDecoderLayer
@@ -575,6 +581,20 @@ class GptOssForCausalLM(BaseCausalLM):
             )
 
         return weight_mapping
+
+    def _cache_routed_expert_weights(self) -> None:
+        if get_all2all_backend().is_petit():
+            # Petit replaces the checkpoint parameters with its native packed
+            # tensors after loading.  Keeping the original ``.data`` objects
+            # here would pin both layouts for the lifetime of the server.
+            # Petit also rejects EPLB, the only consumer of this cache.
+            self.routed_experts_weights_of_layer = {}
+            return
+
+        self.routed_experts_weights_of_layer = {
+            layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+            for layer_id in range(len(self.model.layers))
+        }
 
     def load_weights(
         self,
@@ -707,10 +727,7 @@ class GptOssForCausalLM(BaseCausalLM):
             else:
                 logger.info("All parameters loaded successfully.")
 
-        self.routed_experts_weights_of_layer = {
-            layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-            for layer_id in range(len(self.model.layers))
-        }
+        self._cache_routed_expert_weights()
 
     def _load_mxfp4_weights(self, weights, weight_name_mapping: dict):
         # Stream experts; buffering them pins most of the checkpoint on the GPU.

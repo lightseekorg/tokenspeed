@@ -12,6 +12,7 @@ import os
 import sys
 import types
 import unittest
+from unittest import mock
 
 import torch
 
@@ -21,7 +22,40 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from tokenspeed.runtime.layers.moe.utils import All2AllBackend
 from tokenspeed.runtime.models.gpt_oss import GptOssForCausalLM
+
+
+class TestGptOssRoutedExpertWeightCache(unittest.TestCase):
+    def _model(self):
+        get_moe_weights = mock.Mock(return_value=[torch.ones(1)])
+        layer = types.SimpleNamespace(
+            mlp=types.SimpleNamespace(get_moe_weights=get_moe_weights)
+        )
+        model = types.SimpleNamespace(layers=[layer])
+        return types.SimpleNamespace(model=model), get_moe_weights
+
+    def test_petit_does_not_retain_source_expert_weights(self):
+        model, get_moe_weights = self._model()
+        with mock.patch(
+            "tokenspeed.runtime.models.gpt_oss.get_all2all_backend",
+            return_value=All2AllBackend.PETIT,
+        ):
+            GptOssForCausalLM._cache_routed_expert_weights(model)
+
+        self.assertEqual(model.routed_experts_weights_of_layer, {})
+        get_moe_weights.assert_not_called()
+
+    def test_other_backends_keep_expert_weights_for_eplb(self):
+        model, get_moe_weights = self._model()
+        with mock.patch(
+            "tokenspeed.runtime.models.gpt_oss.get_all2all_backend",
+            return_value=All2AllBackend.NONE,
+        ):
+            GptOssForCausalLM._cache_routed_expert_weights(model)
+
+        self.assertEqual(list(model.routed_experts_weights_of_layer), [0])
+        get_moe_weights.assert_called_once_with()
 
 
 class TestGptOssMxfp4Streaming(unittest.TestCase):

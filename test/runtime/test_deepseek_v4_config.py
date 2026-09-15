@@ -648,6 +648,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(calls, [seq_lens])
 
     def _bind_deepseek_v4_moe_methods(self, moe):
+        moe.use_petit = False
         for name in (
             "_forward_shared_experts",
             "forward_mega_moe",
@@ -781,6 +782,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         backend = SimpleNamespace(
             is_mega_moe=lambda: False,
+            is_petit=lambda: False,
             is_flashinfer_trtllm=lambda: True,
         )
         config = SimpleNamespace(
