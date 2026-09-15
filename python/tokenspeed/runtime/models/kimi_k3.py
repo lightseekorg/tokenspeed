@@ -87,6 +87,7 @@ from tokenspeed_kernel.ops.moe import (
     latent_moe_input_projections,
 )
 from tokenspeed_kernel.ops.moe.latent_down import KimiK3LatentDownOp
+from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.ops.residual import attn_res_fwd, attn_res_fwd_available
 from tokenspeed_kernel.ops.tuning import load_packaged_flashinfer_tuning_cache
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
@@ -1820,7 +1821,7 @@ class KimiLinearMoE(nn.Module):
 
     def _routed_experts(
         self,
-        routed_in: torch.Tensor,
+        routed_in: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         topk_output: TopKOutput,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
@@ -1961,6 +1962,24 @@ class KimiLinearMoE(nn.Module):
                 device=hidden_states.device,
             )
 
+        if self.experts.plan["weight_dtype"] == "nvfp4":
+            if num_tokens > 0:
+                routed_input = fp4_quantize(
+                    routed_input,
+                    self.experts.w13_input_scale_quant,
+                    is_sf_swizzled_layout=False,
+                    enable_pdl=pdl_enabled(),
+                )
+            else:
+                routed_input = (
+                    hidden_states.new_empty(
+                        (0, self.routed_hidden // 2), dtype=torch.uint8
+                    ),
+                    hidden_states.new_empty(
+                        (0, self.routed_hidden // 16), dtype=torch.uint8
+                    ),
+                )
+
         if self.moe_alltoall is not None:
             routed_input, topk_ids, topk_weights, combine_offset = (
                 self.moe_alltoall.dispatch(
@@ -1968,21 +1987,24 @@ class KimiLinearMoE(nn.Module):
                 )
             )
         else:
+            prequantized = isinstance(routed_input, tuple)
+            payloads = (
+                [*routed_input, topk_ids, topk_weights]
+                if prequantized
+                else [routed_input, topk_ids, topk_weights]
+            )
             if num_tokens < max_tokens:
                 padding = (0, 0, 0, max_tokens - num_tokens)
-                routed_input = F.pad(routed_input, padding, mode="constant", value=0)
-                topk_ids = F.pad(topk_ids, padding, mode="constant", value=0)
-                topk_weights = F.pad(topk_weights, padding, mode="constant", value=0)
-
-            routed_input = all_gather(
-                routed_input.contiguous(), self.mapping.moe.ep_group, dim=0
-            )
-            topk_ids = all_gather(
-                topk_ids.contiguous(), self.mapping.moe.ep_group, dim=0
-            )
-            topk_weights = all_gather(
-                topk_weights.contiguous(), self.mapping.moe.ep_group, dim=0
-            )
+                payloads = [
+                    F.pad(tensor, padding, mode="constant", value=0)
+                    for tensor in payloads
+                ]
+            payloads = [
+                all_gather(tensor.contiguous(), self.mapping.moe.ep_group, dim=0)
+                for tensor in payloads
+            ]
+            routed_input = (payloads[0], payloads[1]) if prequantized else payloads[0]
+            topk_ids, topk_weights = payloads[-2:]
 
         routing = StandardTopKOutput(
             topk_weights=topk_weights,

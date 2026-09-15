@@ -53,6 +53,7 @@ class FlashInferMoeAlltoAll:
             raise ValueError(
                 "MoE all-to-all requires an even contiguous expert partition"
             )
+        # The BF16 capacity also covers packed NVFP4 plus its block scales.
         payload_bytes = hidden_size * (torch.finfo(dtype).bits // 8)
         routing_bytes = top_k * (4 + torch.finfo(weights_dtype).bits // 8)
         size = moe_a2a_get_workspace_size_per_rank(
@@ -84,21 +85,32 @@ class FlashInferMoeAlltoAll:
 
     def dispatch(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         max_tokens: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """Dispatch local tokens and routing; return flattened receives and combine offset."""
+    ) -> tuple[
+        torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        int,
+    ]:
+        """Dispatch local tokens or an NVFP4 pair, routing, and return flattened receives."""
         from flashinfer.comm import moe_a2a_dispatch, moe_a2a_sanitize_expert_ids
 
         if not 0 < max_tokens <= self.max_tokens:
             raise ValueError(
                 "MoE all-to-all token count exceeds its workspace capacity"
             )
+        prequantized = isinstance(hidden_states, tuple)
+        input_payloads = [topk_ids, topk_weights]
+        if prequantized:
+            input_payloads.extend(hidden_states)
+        else:
+            input_payloads.append(hidden_states)
         payloads, offset, _ = moe_a2a_dispatch(
             token_selected_experts=topk_ids,
-            input_payloads=[topk_ids, topk_weights, hidden_states],
+            input_payloads=input_payloads,
             workspace=self.workspace,
             metainfo=self.metainfo,
             runtime_max_tokens_per_rank=max_tokens,
@@ -111,7 +123,7 @@ class FlashInferMoeAlltoAll:
             enable_rank_mask=False,
             active_rank_mask=None,
         )
-        ids, weights, hidden = payloads
+        ids, weights, hidden = payloads[:3]
         # A valid nonlocal ID makes every expert backend ignore unused receive slots.
         invalid_id = ((self.ep_rank + 1) % self.ep_size) * (
             self.num_experts // self.ep_size
@@ -124,8 +136,14 @@ class FlashInferMoeAlltoAll:
             invalid_expert_id=invalid_id,
             enable_pdl=pdl_enabled(),
         )
+        routed_input = hidden.view(-1, input_payloads[2].shape[1])
+        if prequantized:
+            routed_input = (
+                routed_input,
+                payloads[3].view(-1, input_payloads[3].shape[1]),
+            )
         return (
-            hidden.view(-1, self.hidden_size),
+            routed_input,
             ids.view(-1, self.top_k),
             weights.view(-1, self.top_k),
             offset,

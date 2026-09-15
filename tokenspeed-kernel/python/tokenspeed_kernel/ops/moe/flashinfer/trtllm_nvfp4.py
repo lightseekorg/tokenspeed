@@ -183,9 +183,8 @@ if platform.is_nvidia:
         else:
             gate_ws2 = ws2.reshape(ws2.shape[0])
             up_ws2 = gate_ws2
-        # Input scales (max across shards) for alpha computation
-        w13_input_scale = w.w13_input_scale.max().to(torch.float32)
-        w2_input_scale = w.w2_input_scale.max().to(torch.float32)
+        w13_input_scale = w.w13_input_scale.to(torch.float32)
+        w2_input_scale = w.w2_input_scale.to(torch.float32)
 
         # Store input_scale_quant for runtime fp4_quantize
         w13_input_scale_quant = (1.0 / w13_input_scale).to(torch.float32)
@@ -291,7 +290,7 @@ if platform.is_nvidia:
         return _flashinfer_trtllm_nvfp4_moe_weights(plan, w, situ=True)
 
     def _flashinfer_trtllm_nvfp4_moe_apply(
-        x: torch.Tensor,
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         w: torch.nn.Module,
         router_logits: torch.Tensor,
         topk_weights: torch.Tensor | None,
@@ -311,25 +310,34 @@ if platform.is_nvidia:
         """
         _spec = getattr(w, "_spec", None)
 
-        num_tokens = x.shape[0]
+        prequantized = isinstance(x, tuple)
+        data = x[0] if prequantized else x
+        num_tokens = data.shape[0]
         # Idle DP ranks pass 0 tokens and the fused kernel divides by token count on host; skip experts.
         if num_tokens == 0:
+            output = (
+                data.new_empty((0, data.shape[1] * 2), dtype=torch.bfloat16)
+                if prequantized
+                else data
+            )
             if do_finalize:
-                return x
+                return output
             return (
-                x,
-                x.new_empty((0, _spec.top_k), dtype=torch.bfloat16),
+                output,
+                data.new_empty((0, _spec.top_k), dtype=torch.bfloat16),
                 # moe_finalize_fuse_shared expects a 1-D [num_tokens * top_k] permute map.
-                x.new_empty((0,), dtype=torch.int32),
+                data.new_empty((0,), dtype=torch.int32),
             )
 
-        # Quantize input to FP4 using the fused-kernel scale layout.
-        hs_fp4, hs_scale = fp4_quantize(
-            x,
-            w.w13_input_scale_quant,
-            is_sf_swizzled_layout=False,
-            enable_pdl=enable_pdl,
-        )
+        if prequantized:
+            hs_fp4, hs_scale = x
+        else:
+            hs_fp4, hs_scale = fp4_quantize(
+                x,
+                w.w13_input_scale_quant,
+                is_sf_swizzled_layout=False,
+                enable_pdl=enable_pdl,
+            )
 
         # GEMM and scale arguments shared by both kernel entry points.
         common_kwargs = dict(
@@ -534,7 +542,7 @@ if platform.is_nvidia:
         signatures=format_signatures(
             "x",
             "dense",
-            {torch.bfloat16},
+            {torch.bfloat16, torch.uint8},
         ),
         traits={
             "weight_dtype": frozenset({"nvfp4"}),
@@ -544,9 +552,7 @@ if platform.is_nvidia:
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
             "ispp_alignment": frozenset({TRTLLM_NVFP4_ISPP_ALIGNMENT}),
-            # NVFP4 SiTU runs w4a4: the wrapper quantizes the bf16 input
-            # to NVFP4 itself, which the registry models as "input"
-            # (unlike the MXFP4 SiTU cubins, which are w4a8/MXFP8).
+            # NVFP4 SiTU runs w4a4, accepting BF16 or an already-quantized pair.
             "internal_activation_dtype": frozenset({"input"}),
             "supports_bias": frozenset({False}),
         },
@@ -554,7 +560,7 @@ if platform.is_nvidia:
     )
     def flashinfer_trtllm_nvfp4_situ_routed_moe_apply(
         plan: dict,
-        x: torch.Tensor,
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         w: torch.nn.Module,
         router_logits: torch.Tensor,
         topk_weights: torch.Tensor | None = None,
@@ -566,8 +572,30 @@ if platform.is_nvidia:
     ):
         if topk_weights is None or topk_ids is None:
             raise ValueError("precomputed_topk plan requires topk_weights and topk_ids")
-        if x.dtype != torch.bfloat16:
-            raise TypeError("FlashInfer NVFP4 SiTU requires bf16 input")
+        if isinstance(x, tuple):
+            data, scales = x
+            if data.dtype != torch.uint8 or scales.dtype not in (
+                torch.uint8,
+                torch.float8_e4m3fn,
+            ):
+                raise TypeError(
+                    "Prequantized NVFP4 requires uint8 data and byte-sized block scales"
+                )
+            if (
+                data.ndim != 2
+                or data.shape[1] % 8 != 0
+                or scales.shape != (data.shape[0], data.shape[1] // 8)
+            ):
+                raise ValueError(
+                    "Prequantized NVFP4 requires linear per-token block scales"
+                )
+            output_shape = (data.shape[0], data.shape[1] * 2)
+        else:
+            if x.dtype != torch.bfloat16:
+                raise TypeError(
+                    "FlashInfer NVFP4 SiTU requires bf16 input or an NVFP4 pair"
+                )
+            output_shape = x.shape
         # Caller-owned destination (e.g. K3's fused all-reduce lane slice):
         # writing the finalized rows in place keeps the join zero-copy, same
         # contract as the MXFP4 SiTU kernel. Only meaningful when finalizing;
@@ -577,7 +605,7 @@ if platform.is_nvidia:
         out_buf = getattr(w, "_situ_output_buffer", None) if do_finalize else None
         if not (
             out_buf is not None
-            and out_buf.shape == (x.shape[0], x.shape[-1])
+            and out_buf.shape == output_shape
             and out_buf.is_contiguous()
         ):
             out_buf = None

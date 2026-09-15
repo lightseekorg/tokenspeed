@@ -346,7 +346,7 @@ class MoELayer(torch.nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         topk_output: TopKOutput,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
@@ -360,7 +360,9 @@ class MoELayer(torch.nn.Module):
         """Run the planned MoE kernel over this layer's weights.
 
         Args:
-            hidden_states: ``[tokens, hidden]`` local hidden states.
+            hidden_states: ``[tokens, hidden]`` local hidden states, or a
+                ``(packed_nvfp4, block_scales)`` pair for kernels accepting
+                prequantized input. Block scales use linear per-token layout.
             topk_output: Routing result, or the raw logits when the kernel
                 routes itself.
             num_global_tokens: Token count summed over the attention DP ranks.

@@ -113,9 +113,24 @@ sequential layers within a model, and separate for target and draft models.
 Unused receive slots are assigned an expert ID outside the receiving rank's
 partition. Combine uses BF16 outputs without low-precision communication.
 
-The AG/RS reference transport uses three all-gathers
-(latent activations, expert IDs, and weights) and one reduce-scatter. Only
-shorter ranks pad their tensors; padding has zero routing weights. Idle ranks
+With NVFP4 experts, each rank quantizes its local routed latents before
+either FlashInfer dispatch or AG/RS. The payloads are packed FP4 activations, linear FP8 block
+scales, TopK IDs, and routing weights. The expert kernel consumes the received
+activation/scale pair directly. Idle ranks produce empty packed tensors before
+the selected transport pads or dispatches them. Other weight formats retain
+BF16 input dispatch.
+
+Activation-scale loading always accumulates the maximum from all checkpoint
+experts before EP filtering, separately for FC1 and FC2. NVFP4 stores these as
+replicated scalars. Every rank therefore uses the same scales when forming
+inverse scales and GEMM factors, without a scale-synchronization collective.
+Per-expert weight scales remain separate. The existing BF16-sized transport workspace is retained as a capacity
+bound; quantized dispatch reduces payload traffic, while combine remains BF16.
+
+The AG/RS reference transport uses four all-gathers for NVFP4 (packed
+activations, block scales, expert IDs, and weights), or three for BF16 inputs,
+followed by one BF16 reduce-scatter. Only shorter ranks pad their payloads;
+padding has zero routing weights. Idle ranks
 participate when peers have tokens. Both transports use the same token-count
 metadata for eager execution, graph capture, and speculative draft narrowing.
 

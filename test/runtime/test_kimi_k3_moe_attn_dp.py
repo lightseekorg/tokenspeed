@@ -202,6 +202,7 @@ def test_k3_rejects_unsupported_transport_layout(monkeypatch, backend, dp, match
 @pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("with_norm", [False, True])
 @pytest.mark.parametrize("use_alltoall", [False, True])
+@pytest.mark.parametrize("nvfp4", [False, True])
 def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
     monkeypatch,
     counts: tuple[int, int],
@@ -209,20 +210,42 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
     weights_dtype: torch.dtype,
     with_norm: bool,
     use_alltoall: bool,
+    nvfp4: bool,
 ) -> None:
     rows, capacity = counts[rank], max(counts)
     events = []
     group = (0, 1)
-    latent = torch.zeros(2, capacity, 2, dtype=torch.bfloat16)
+    width = 32 if nvfp4 else 2
+    latent = torch.zeros(2, capacity, width, dtype=torch.bfloat16)
     ids = torch.zeros(2, capacity, 2, dtype=torch.int32)
     weights = torch.zeros(2, capacity, 2, dtype=weights_dtype)
     for owner, count in enumerate(counts):
-        latent[owner, :count] = torch.tensor([owner + 1, owner + 2])
+        latent[owner, :count] = torch.tensor([owner + 1, owner + 2]).repeat(width // 2)
         ids[owner, :count] = torch.tensor([1, 0], dtype=torch.int32)
         weights[owner, :count] = torch.tensor([0.271828, 0.728172], dtype=weights_dtype)
     hidden = torch.cat((latent[rank, :rows], latent[rank, :rows]), dim=-1)
     prefix = hidden + 10
-    gathers = iter((("AG_latent", latent), ("AG_ids", ids), ("AG_weights", weights)))
+    packed = torch.zeros(2, capacity, width // 2, dtype=torch.uint8)
+    scales = torch.zeros(2, capacity, width // 16, dtype=torch.uint8)
+    for owner, count in enumerate(counts):
+        packed[owner, :count] = owner + 3
+        scales[owner, :count] = owner + 7
+    activation_payloads = (
+        [("AG_packed", packed), ("AG_scales", scales)]
+        if nvfp4
+        else [("AG_latent", latent)]
+    )
+    gathers = iter([*activation_payloads, ("AG_ids", ids), ("AG_weights", weights)])
+    quant_scale = torch.tensor(0.125)
+
+    def quantize(tensor, scale, *, is_sf_swizzled_layout, enable_pdl):
+        events.append("quantize")
+        assert scale is quant_scale and not is_sf_swizzled_layout
+        torch.testing.assert_close(tensor, latent[rank, :rows])
+        return packed[rank, :rows], scales[rank, :rows]
+
+    quantizer = mock.Mock(side_effect=quantize)
+    monkeypatch.setattr(kimi_k3, "fp4_quantize", quantizer)
 
     def gather(tensor, group, *, dim):
         name, expected = next(gathers)
@@ -232,7 +255,7 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
         torch.testing.assert_close(tensor, expected[rank])
         if rows == capacity:
             assert tensor.data_ptr() == expected[rank].data_ptr()
-        return expected.reshape(2 * capacity, 2)
+        return expected.reshape(2 * capacity, expected.shape[-1])
 
     def experts(
         routed, routing, *, num_global_tokens, max_num_tokens_per_gpu, do_finalize
@@ -241,7 +264,11 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
         assert num_global_tokens == max_num_tokens_per_gpu == 2 * capacity
         assert do_finalize
         assert routing.router_logits is None
-        torch.testing.assert_close(routed, latent.reshape(-1, 2))
+        if nvfp4:
+            torch.testing.assert_close(routed[0], packed.reshape(-1, width // 2))
+            torch.testing.assert_close(routed[1], scales.reshape(-1, width // 16))
+            routed = latent.reshape(-1, width)
+        torch.testing.assert_close(routed, latent.reshape(-1, width))
         torch.testing.assert_close(routing.topk_ids, ids.reshape(-1, 2))
         torch.testing.assert_close(routing.topk_weights, weights.reshape(-1, 2))
         return routed * (rank + 1)
@@ -249,28 +276,34 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
     def scatter(partial, *, group):
         events.append("RS")
         assert group == (0, 1)
-        torch.testing.assert_close(partial, latent.reshape(-1, 2) * (rank + 1))
+        torch.testing.assert_close(partial, latent.reshape(-1, width) * (rank + 1))
         return latent[rank] * 3
 
     def dispatch(local_hidden, local_ids, local_weights, max_tokens):
         events.append("dispatch")
         assert max_tokens == capacity
-        torch.testing.assert_close(local_hidden, latent[rank, :rows])
+        if nvfp4:
+            torch.testing.assert_close(local_hidden[0], packed[rank, :rows])
+            torch.testing.assert_close(local_hidden[1], scales[rank, :rows])
+            received = (packed.reshape(-1, width // 2), scales.reshape(-1, width // 16))
+        else:
+            torch.testing.assert_close(local_hidden, latent[rank, :rows])
+            received = latent.reshape(-1, width)
         torch.testing.assert_close(local_ids, ids[rank, :rows])
         torch.testing.assert_close(local_weights, weights[rank, :rows])
-        return latent.reshape(-1, 2), ids.reshape(-1, 2), weights.reshape(-1, 2), 1234
+        return received, ids.reshape(-1, 2), weights.reshape(-1, 2), 1234
 
     def combine(partial, local_tokens, max_tokens, combine_offset):
         events.append("combine")
         assert local_tokens == rows and max_tokens == capacity
         assert combine_offset == 1234
-        torch.testing.assert_close(partial, latent.reshape(-1, 2) * (rank + 1))
+        torch.testing.assert_close(partial, latent.reshape(-1, width) * (rank + 1))
         return latent[rank, :rows] * 3
 
     def norm(value):
         events.append("norm")
         torch.testing.assert_close(value, latent[rank, :rows] * 3)
-        return torch.nn.functional.rms_norm(value.float(), (2,), eps=1e-6).to(
+        return torch.nn.functional.rms_norm(value.float(), (width,), eps=1e-6).to(
             value.dtype
         )
 
@@ -297,9 +330,13 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
             if use_alltoall
             else None
         ),
-        routed_hidden=2,
+        routed_hidden=width,
         top_k=2,
         topk=topk,
+        experts=SimpleNamespace(
+            plan={"weight_dtype": "nvfp4" if nvfp4 else "unquant"},
+            w13_input_scale_quant=quant_scale,
+        ),
         gate=mock.Mock(return_value=torch.empty(rows, 2)),
         routed_expert_down_proj=mock.Mock(return_value=(latent[rank, :rows], None)),
         shared_experts=mock.Mock(return_value=hidden * 3),
@@ -320,7 +357,7 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
     expected_latent = latent[rank, :rows] * 3
     if with_norm:
         expected_latent = torch.nn.functional.rms_norm(
-            expected_latent.float(), (2,), eps=1e-6
+            expected_latent.float(), (width,), eps=1e-6
         ).to(hidden.dtype)
     expected = (
         prefix + torch.cat((expected_latent, expected_latent), dim=-1) + hidden * 3
@@ -329,8 +366,14 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
     expected_events = (
         ["dispatch", "experts", "combine"]
         if use_alltoall
-        else ["AG_latent", "AG_ids", "AG_weights", "experts", "RS"]
+        else [name for name, _ in activation_payloads]
+        + ["AG_ids", "AG_weights", "experts", "RS"]
     )
+    if nvfp4 and rows:
+        expected_events.insert(0, "quantize")
+        quantizer.assert_called_once()
+    else:
+        quantizer.assert_not_called()
     if rows:
         if with_norm:
             expected_events.append("norm")
