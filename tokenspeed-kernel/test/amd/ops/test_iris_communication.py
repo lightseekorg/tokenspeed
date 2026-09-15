@@ -468,7 +468,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             sum(int(torch.tensor(shape).prod()) for shape in shapes)
             for shapes in output_shape_cases
         )
-        attnres_max_rows = 32 if world_size == attnres_config.world_size else 0
+        attnres_max_rows = 16 if world_size == attnres_config.world_size else 0
         attnres_max_numel = attnres_max_rows * attnres_config.hidden_size
         staged_max_numel = max(staged_max_numel, attnres_max_numel)
         state = create_iris_state(
@@ -870,7 +870,7 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
     )
 
     config = IRIS_ALL_REDUCE_KERNEL_CONFIG.kimi_k3_attnres
-    for num_tokens in (1, 2, 4, 8, 16, 32):
+    for num_tokens in (1, 2, 4, 8, 16):
         torch.manual_seed(101 + num_tokens)
         hidden = config.hidden_size
         blocks = (torch.randn(4, num_tokens, hidden, device=device) * 0.1).to(

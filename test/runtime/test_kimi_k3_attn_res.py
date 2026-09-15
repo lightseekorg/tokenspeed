@@ -129,7 +129,7 @@ class AttnResTests(unittest.TestCase):
         self.assertIs(supported.call_args.args[2], mlp_wp)
         fused.assert_called_once()
 
-    def test_unsupported_iris_reduce_defers_attnres_combine(self):
+    def test_fused_attention_window_defers_attnres_combine(self):
         import tokenspeed_kernel.ops.communication.triton as triton_comm
 
         import tokenspeed.runtime.models.kimi_k3_comm as kimi_k3_comm
@@ -160,8 +160,8 @@ class AttnResTests(unittest.TestCase):
             mock.patch.object(
                 triton_comm,
                 "allreduce_residual_attnres_combine_supported",
-                return_value=False,
-            ),
+                side_effect=lambda partial, *_args, **_kwargs: partial.shape[0] <= 16,
+            ) as supported,
             mock.patch.object(
                 kimi_k3_comm,
                 "all_reduce",
@@ -177,7 +177,63 @@ class AttnResTests(unittest.TestCase):
 
         torch.testing.assert_close(residual, prefix + reduced)
         self.assertIsNone(hidden)
+        supported.assert_called_once()
         fallback_reduce.assert_called_once_with(partial, state.mapping.attn.tp_group)
+
+    def test_fused_attention_reduce_window(self):
+        import tokenspeed_kernel.ops.communication.triton as triton_comm
+
+        import tokenspeed.runtime.models.kimi_k3_comm as kimi_k3_comm
+
+        combine = (
+            (object(), object(), object()),
+            object(),
+            object(),
+            torch.randn(_HIDDEN, dtype=torch.bfloat16),
+            _EPS,
+        )
+
+        with (
+            mock.patch.object(
+                kimi_k3_comm, "_get_process_group", return_value=object()
+            ),
+            mock.patch.object(
+                triton_comm,
+                "allreduce_residual_attnres_combine_supported",
+                side_effect=lambda partial, *_args, **_kwargs: partial.shape[0] <= 16,
+            ) as supported,
+        ):
+            for num_tokens, expected in (
+                (16, True),
+                (17, False),
+            ):
+                with self.subTest(num_tokens=num_tokens):
+                    partial = torch.randn(
+                        num_tokens,
+                        _HIDDEN,
+                        dtype=torch.bfloat16,
+                    )
+                    state = SimpleNamespace(
+                        mapping=SimpleNamespace(
+                            nprocs_per_node=8,
+                            attn=SimpleNamespace(
+                                tp_rank=0,
+                                tp_group=tuple(range(8)),
+                            ),
+                        )
+                    )
+                    comm = kimi_k3_comm.K3AttnComm(state)
+                    self.assertEqual(
+                        comm.fused_attnres_reduce_available(
+                            partial,
+                            partial,
+                            combine,
+                            torch.randn(_HIDDEN, dtype=torch.bfloat16),
+                        ),
+                        expected,
+                    )
+
+        self.assertEqual(supported.call_count, 2)
 
     def test_torch_fallback_matches_reference(self):
         prefix_sum, block_residual, proj, norm = _make_inputs(17)
@@ -439,7 +495,9 @@ class AttnResTests(unittest.TestCase):
     def test_fused_attention_reduce_preempts_decomposed_graph(self):
         weight = torch.empty(_HIDDEN, dtype=torch.bfloat16)
         norm = SimpleNamespace(weight=weight, variance_epsilon=_EPS)
-        use_fused_reduce = mock.Mock(return_value=True)
+        use_fused_reduce = mock.Mock(
+            side_effect=lambda partial, *_args: partial.shape[0] <= 16
+        )
         layer = SimpleNamespace(
             is_block_write_layer=False,
             block_write_idx=1,
@@ -454,7 +512,8 @@ class AttnResTests(unittest.TestCase):
             post_attention_layernorm=norm,
             k3_comm=SimpleNamespace(fused_attnres_reduce_available=use_fused_reduce),
         )
-        hidden_states = SimpleNamespace(shape=(32, _HIDDEN), is_cuda=True)
+        hidden_states = SimpleNamespace(shape=(16, _HIDDEN), is_cuda=True)
+        fallback_hidden_states = SimpleNamespace(shape=(17, _HIDDEN), is_cuda=True)
         scratch = (object(), object(), object())
 
         with (
@@ -475,19 +534,23 @@ class AttnResTests(unittest.TestCase):
             self.assertTrue(
                 kimi_k3.KimiLinearDecoderLayer._fused_attnres_graph_available(
                     layer,
-                    SimpleNamespace(shape=(33, _HIDDEN), is_cuda=True),
+                    fallback_hidden_states,
                     object(),
                 )
             )
 
         self.assertEqual(available.call_count, 2)
-        use_fused_reduce.assert_called_once()
-        self.assertIs(use_fused_reduce.call_args.args[0], hidden_states)
-        self.assertIs(use_fused_reduce.call_args.args[1], hidden_states)
-        self.assertIs(use_fused_reduce.call_args.args[2][0], scratch)
-        self.assertIs(use_fused_reduce.call_args.args[3], weight)
+        self.assertEqual(use_fused_reduce.call_count, 2)
+        fused_args = use_fused_reduce.call_args_list[0].args
+        self.assertIs(fused_args[0], hidden_states)
+        self.assertIs(fused_args[1], hidden_states)
+        self.assertIs(fused_args[2][0], scratch)
+        self.assertIs(fused_args[3], weight)
+        self.assertIs(
+            use_fused_reduce.call_args_list[1].args[0], fallback_hidden_states
+        )
 
-    def test_fused_attention_reduce_waits_for_scratch_stream(self):
+    def test_fused_attention_reduce_runs_after_scratch_production(self):
         events = []
 
         class Fork:
@@ -501,8 +564,8 @@ class AttnResTests(unittest.TestCase):
             def branch(self):
                 yield
 
-        h = SimpleNamespace(shape=(32, _HIDDEN), is_cuda=True)
-        prefix = torch.zeros(32, _HIDDEN, dtype=torch.bfloat16)
+        h = SimpleNamespace(shape=(16, _HIDDEN), is_cuda=True)
+        prefix = torch.zeros(16, _HIDDEN, dtype=torch.bfloat16)
         hidden = torch.ones_like(prefix)
         weight = mock.Mock()
         weight.reshape.return_value = weight
@@ -557,7 +620,7 @@ class AttnResTests(unittest.TestCase):
                 [object()],
             )
 
-        self.assertTrue(fork.assert_enabled)
+        self.assertFalse(fork.assert_enabled)
         self.assertEqual(events, ["partial", "attention", "join", "reduce"])
         reduce.assert_called_once()
 

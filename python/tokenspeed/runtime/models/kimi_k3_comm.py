@@ -536,7 +536,6 @@ class K3AttnComm:
         scratch, _, _, output_weight, _ = combine
         if score_weight is None or output_weight is None:
             return False
-
         from tokenspeed_kernel.ops.communication.triton import (
             allreduce_residual_attnres_combine_supported,
         )
