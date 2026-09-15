@@ -598,7 +598,7 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool, verify_
     from tokenspeed_kernel.ops.attention import dsv41
 
     assert DeepseekV41AttentionBackend.cuda_graph_support.decode_graph
-    assert not DeepseekV41AttentionBackend.cuda_graph_support.prefill_graph
+    assert DeepseekV41AttentionBackend.cuda_graph_support.prefill_graph
     torch.manual_seed(42)
     backend = _verify_backend("cuda", 5, verify_width)
     backend.cache_pool.arena.buffer.zero_()

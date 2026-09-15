@@ -68,6 +68,11 @@ from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.pp_stage import PPStageState
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    break_point,
+    current_forward_ctx,
+    slice_to_real_tokens,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.layernorm import RMSNorm
@@ -707,6 +712,7 @@ class DeepseekV41Attention(nn.Module):
             )
         return self._padded_attn_sink
 
+    @break_point
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor, ctx: ForwardContext
     ) -> torch.Tensor:
@@ -714,6 +720,12 @@ class DeepseekV41Attention(nn.Module):
         if mode is None:
             raise ValueError("V4.1 attention requires an explicit forward mode")
         meta = backend.query_metadata(mode)
+        # Prefill buckets pad token-local compute; cache writes and selection
+        # must use only the live rows, including the decode suffix of a mixed batch.
+        if current_forward_ctx() is not None:
+            positions, hidden_states = slice_to_real_tokens(
+                meta.positions.numel(), positions, hidden_states
+            )
         if (
             positions.shape != meta.positions.shape
             or positions.numel() != hidden_states.shape[0]
