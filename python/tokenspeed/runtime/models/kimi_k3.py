@@ -470,9 +470,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             if self._fused_qkv_a_pad_rows:
                 # Drop the zero pad rows of the 128-aligned FP8 projection
                 # before anything consumes the output.
-                qkv_gate = qkv_gate[
-                    ..., : self._qkv_a_width + self._gate_width
-                ].contiguous()
+                qkv_gate = qkv_gate[..., : self._qkv_a_width + self._gate_width]
             qkv_gate = comm_manager.pre_attn_comm(qkv_gate, ctx)
             q_a, latent_cache, gate = self._split_fused_qkv_a(qkv_gate)
         elif self.fused_qkv_a_proj_with_mqa.weight.dtype in _FP8_WEIGHT_DTYPES:
@@ -488,9 +486,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             if self._fused_qkv_a_pad_rows:
                 # Drop the zero pad rows of the 128-aligned FP8 projection
                 # before anything consumes the output.
-                qkv_gate = qkv_gate[
-                    ..., : self._qkv_a_width + self._gate_width
-                ].contiguous()
+                qkv_gate = qkv_gate[..., : self._qkv_a_width + self._gate_width]
             qkv_gate = comm_manager.pre_attn_comm(qkv_gate, ctx)
             q_a, latent_cache, gate = self._split_fused_qkv_a(qkv_gate)
         elif attnres_partial_args is not None:
