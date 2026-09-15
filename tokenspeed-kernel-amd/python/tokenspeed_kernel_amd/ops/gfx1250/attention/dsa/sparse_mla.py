@@ -30,6 +30,8 @@ from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.indexing import (
     _dsa_prefill_logits_fp8_kernel,
 )
 from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.standard_cache_logits import (
+    _dsa_kpool_prefill_logits_kernel,
+    _dsa_kpool_prefill_plan_logits_kernel,
     _dsa_standard_decode_logits_kernel,
     _dsa_standard_prefill_logits_kernel,
 )
@@ -37,6 +39,9 @@ from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.standard_cache_logits impor
 __all__ = [
     "gluon_dsa_decode_topk_fp8_gfx1250",
     "gluon_dsa_decode_topk_standard_gfx1250",
+    "gluon_dsa_kpool_prefill_logits_gfx1250",
+    "gluon_dsa_kpool_prefill_plan_logits_gfx1250",
+    "gluon_dsa_logical_topk_gfx1250",
     "gluon_dsa_prefill_topk_fp8_gfx1250",
     "gluon_dsa_prefill_topk_standard_gfx1250",
 ]
@@ -59,6 +64,9 @@ _STANDARD_DECODE_WAVES_PER_EU = 2
 _STANDARD_PREFILL_BLOCK_N = 128
 _STANDARD_PREFILL_NUM_WARPS = 8
 _STANDARD_PREFILL_WAVES_PER_EU = 1
+_KPOOL_SCORE_BLOCK_N = 128
+_KPOOL_SCORE_NUM_WARPS = 4
+_KPOOL_SCORE_WAVES_PER_EU = 4
 
 
 @gluon.constexpr_function
@@ -539,6 +547,458 @@ def _dsa_topk_indices(
         waves_per_eu=waves_per_eu,
     )
     return out, lens_out
+
+
+def gluon_dsa_logical_topk_gfx1250(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    topk: int,
+    out: torch.Tensor | None,
+    lens_out: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select logical columns from bounded FP32 rows with Wave32 radix top-k.
+
+    Args:
+        logits: Contiguous FP32 scores shaped ``[rows, columns]``.
+        row_starts: Contiguous int32 inclusive bounds shaped ``[rows]``.
+        row_ends: Contiguous int32 exclusive bounds shaped ``[rows]``.
+        topk: Number of logical columns to select.
+        out: Optional contiguous int32 output shaped ``[rows, topk]``.
+        lens_out: Optional contiguous int32 valid-count output shaped ``[rows]``.
+
+    Returns:
+        Selected logical columns padded with ``-1`` and their valid counts.
+    """
+    topk = int(topk)
+    _check_topk_contract(topk)
+    if logits.dim() != 2:
+        raise ValueError(f"logits must be 2-D, got shape={tuple(logits.shape)}")
+    if logits.dtype != torch.float32:
+        raise TypeError(f"logits must be float32, got {logits.dtype}")
+    if not logits.is_cuda:
+        raise RuntimeError("Gluon logical top-k requires CUDA tensors")
+    if not logits.is_contiguous():
+        raise ValueError("logits must be contiguous")
+
+    rows = int(logits.shape[0])
+    for name, bounds in (("row_starts", row_starts), ("row_ends", row_ends)):
+        if bounds.shape != (rows,):
+            raise ValueError(
+                f"{name} must have shape {(rows,)}, got {tuple(bounds.shape)}"
+            )
+        if bounds.dtype != torch.int32:
+            raise TypeError(f"{name} must be int32, got {bounds.dtype}")
+        if bounds.device != logits.device:
+            raise ValueError(f"{name} must be on the same device as logits")
+        if not bounds.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+
+    expected_out_shape = (rows, topk)
+    if out is None:
+        out = torch.empty(expected_out_shape, dtype=torch.int32, device=logits.device)
+    elif (
+        out.shape != expected_out_shape
+        or out.dtype != torch.int32
+        or out.device != logits.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "out must be contiguous int32 on logits.device with shape "
+            f"{expected_out_shape}"
+        )
+
+    if lens_out is None:
+        lens_out = torch.empty((rows,), dtype=torch.int32, device=logits.device)
+    elif (
+        lens_out.shape != (rows,)
+        or lens_out.dtype != torch.int32
+        or lens_out.device != logits.device
+        or not lens_out.is_contiguous()
+    ):
+        raise ValueError(
+            "lens_out must be contiguous int32 on logits.device with shape "
+            f"{(rows,)}"
+        )
+
+    if rows == 0:
+        return out, lens_out
+    return _dsa_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+
+
+def _check_kpool_score_inputs(
+    q: torch.Tensor,
+    pooled_k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    pool_size: int,
+    page_size: int,
+    ordered_head_fold: bool,
+) -> int:
+    if not isinstance(ordered_head_fold, bool):
+        raise TypeError(
+            f"ordered_head_fold must be bool, got {type(ordered_head_fold).__name__}"
+        )
+    if q.dtype != torch.bfloat16:
+        raise TypeError(f"KPool Gluon scorer requires BF16 q, got {q.dtype}")
+    if q.dim() != 3 or tuple(q.shape[1:]) != (32, 128):
+        raise ValueError(
+            f"KPool Gluon scorer requires q=[tokens, 32, 128], got {tuple(q.shape)}"
+        )
+    if q.stride(-1) != 1:
+        raise ValueError("q must have a contiguous head-dimension axis")
+    if not q.is_cuda:
+        raise RuntimeError("KPool Gluon scorer requires CUDA tensors")
+    if weights.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(f"KPool weights must be BF16 or FP32, got {weights.dtype}")
+    if weights.shape != q.shape[:2] or weights.stride(-1) != 1:
+        raise ValueError("weights must match q and have a contiguous head axis")
+    if pool_size != 4 or page_size != 16:
+        raise ValueError(
+            "KPool Gluon scorer requires pool_size=4 and page_size=16, got "
+            f"pool_size={pool_size}, page_size={page_size}"
+        )
+
+    row_bytes = 128 + 4
+    compact_page_bytes = page_size * row_bytes
+    cache_shape_ok = (
+        pooled_k_cache.dim() == 2 and pooled_k_cache.shape[1] == compact_page_bytes
+    ) or (
+        pooled_k_cache.dim() == 3
+        and tuple(pooled_k_cache.shape[1:]) == (page_size, row_bytes)
+    )
+    cache_page_stride_bytes = int(pooled_k_cache.stride(0))
+    packed_within_page = (
+        pooled_k_cache.dim() == 2 or pooled_k_cache.stride(1) == row_bytes
+    )
+    if pooled_k_cache.dtype != torch.uint8:
+        raise TypeError(f"pooled_k_cache must be uint8, got {pooled_k_cache.dtype}")
+    if not cache_shape_ok or (
+        pooled_k_cache.stride(-1) != 1
+        or not packed_within_page
+        or cache_page_stride_bytes < compact_page_bytes
+        or cache_page_stride_bytes % 4
+        or pooled_k_cache.storage_offset() % 4
+    ):
+        raise ValueError(
+            "pooled_k_cache requires packed rows and a nonoverlapping, "
+            "4-byte-aligned page stride"
+        )
+    if weights.device != q.device or pooled_k_cache.device != q.device:
+        raise ValueError("weights and pooled_k_cache must be on the same device as q")
+    return cache_page_stride_bytes
+
+
+def _prepare_kpool_score_outputs(
+    q: torch.Tensor,
+    *,
+    window_cols: int,
+    out: torch.Tensor | None,
+    row_ends_out: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    expected_logits = (int(q.shape[0]), window_cols)
+    if out is None:
+        out = torch.empty(expected_logits, dtype=torch.float32, device=q.device)
+    elif (
+        out.shape != expected_logits
+        or out.dtype != torch.float32
+        or out.device != q.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "out must be contiguous FP32 on q.device with shape "
+            f"{expected_logits}, got shape={tuple(out.shape)}, dtype={out.dtype}, "
+            f"device={out.device}, contiguous={out.is_contiguous()}"
+        )
+
+    expected_ends = (int(q.shape[0]),)
+    if row_ends_out is None:
+        row_ends_out = torch.empty(expected_ends, dtype=torch.int32, device=q.device)
+    elif (
+        row_ends_out.shape != expected_ends
+        or row_ends_out.dtype != torch.int32
+        or row_ends_out.device != q.device
+        or not row_ends_out.is_contiguous()
+    ):
+        raise ValueError(
+            "row_ends_out must be contiguous int32 on q.device with shape "
+            f"{expected_ends}"
+        )
+    return out, row_ends_out
+
+
+def gluon_dsa_kpool_prefill_logits_gfx1250(
+    q: torch.Tensor,
+    pooled_k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    causal_lens: torch.Tensor,
+    req_ids: torch.Tensor,
+    index_block_table: torch.Tensor,
+    *,
+    pool_size: int,
+    page_size: int,
+    pool_offset: int,
+    window_cols: int,
+    softmax_scale: float,
+    ordered_head_fold: bool,
+    out: torch.Tensor | None,
+    row_ends_out: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score a request-table-addressed GLM KPool window with Wave32 WMMA.
+
+    Args:
+        q: BF16 queries shaped ``[tokens, 32, 128]``.
+        pooled_k_cache: Page-major uint8 FP8 keys and FP32 row scales.
+        weights: BF16 or FP32 signed head weights shaped ``[tokens, 32]``.
+        causal_lens: Visible raw-token counts shaped ``[tokens]``.
+        req_ids: Request-table row for each query token.
+        index_block_table: Logical-pool-page to physical-page mapping.
+        pool_size: Raw tokens represented by each pooled key.
+        page_size: Pooled keys per physical page.
+        pool_offset: First global pool represented by output column zero.
+        window_cols: Output columns in the local scoring window.
+        softmax_scale: Scale applied after weighted per-head ReLU reduction.
+        ordered_head_fold: Whether to fold heads in logical order.
+        out: Optional contiguous FP32 scoring workspace.
+        row_ends_out: Optional contiguous int32 local exclusive bounds.
+
+    Returns:
+        Local-window scores and exclusive valid bounds.
+    """
+    pool_size = int(pool_size)
+    page_size = int(page_size)
+    pool_offset = int(pool_offset)
+    window_cols = int(window_cols)
+    cache_page_stride_bytes = _check_kpool_score_inputs(
+        q,
+        pooled_k_cache,
+        weights,
+        pool_size=pool_size,
+        page_size=page_size,
+        ordered_head_fold=ordered_head_fold,
+    )
+    if pool_offset < 0:
+        raise ValueError(f"pool_offset must be nonnegative, got {pool_offset}")
+    if window_cols <= 0:
+        raise ValueError(f"window_cols must be positive, got {window_cols}")
+
+    tokens = int(q.shape[0])
+    for name, value in (("causal_lens", causal_lens), ("req_ids", req_ids)):
+        if value.shape != (tokens,):
+            raise ValueError(f"{name} must have shape {(tokens,)}, got {value.shape}")
+        if value.dtype != torch.int32:
+            raise TypeError(f"{name} must be int32, got {value.dtype}")
+        if value.device != q.device:
+            raise ValueError(f"{name} must be on the same device as q")
+        if not value.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    if index_block_table.dim() != 2:
+        raise ValueError(
+            "index_block_table must be 2-D, got "
+            f"shape={tuple(index_block_table.shape)}"
+        )
+    if index_block_table.dtype != torch.int32:
+        raise TypeError(
+            f"index_block_table must be int32, got {index_block_table.dtype}"
+        )
+    if index_block_table.device != q.device:
+        raise ValueError("index_block_table must be on the same device as q")
+    if index_block_table.stride(-1) != 1:
+        raise ValueError("index_block_table must have contiguous page columns")
+    if tokens and index_block_table.shape[0] == 0:
+        raise ValueError("index_block_table must have at least one request row")
+
+    out, row_ends_out = _prepare_kpool_score_outputs(
+        q,
+        window_cols=window_cols,
+        out=out,
+        row_ends_out=row_ends_out,
+    )
+    if tokens == 0:
+        return out, row_ends_out
+
+    max_candidates = int(index_block_table.shape[1]) * page_size
+    if max_candidates and pooled_k_cache.shape[0] == 0:
+        raise ValueError("a nonempty index_block_table requires pooled cache pages")
+    if max_candidates == 0 or pool_offset >= max_candidates:
+        row_ends_out.zero_()
+        return out, row_ends_out
+
+    num_warps = _KPOOL_SCORE_NUM_WARPS
+    _dsa_kpool_prefill_logits_kernel[(tokens, 1)](
+        q,
+        weights,
+        pooled_k_cache.view(torch.float8_e4m3fn),
+        pooled_k_cache.view(torch.float32),
+        weights,
+        causal_lens,
+        req_ids,
+        index_block_table,
+        out,
+        row_ends_out,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        weights.stride(0),
+        weights.stride(1),
+        weights.stride(0),
+        weights.stride(1),
+        index_block_table.stride(0),
+        out.stride(0),
+        float(softmax_scale),
+        max_candidates,
+        pool_offset,
+        PAGE_SIZE=page_size,
+        PAGE_STRIDE_BYTES=cache_page_stride_bytes,
+        POOL_SIZE=pool_size,
+        NUM_HEADS=q.shape[1],
+        HEAD_DIM=q.shape[2],
+        BLOCK_N=_KPOOL_SCORE_BLOCK_N,
+        WINDOW_COLS=window_cols,
+        NUM_WARPS=num_warps,
+        ORDERED_HEAD_FOLD=ordered_head_fold,
+        USE_BUFFER_LOAD=pooled_k_cache.untyped_storage().nbytes() < 2**31,
+        USE_BUFFER_STORE=out.nbytes < 2**31,
+        num_warps=num_warps,
+        waves_per_eu=_KPOOL_SCORE_WAVES_PER_EU,
+    )
+    return out, row_ends_out
+
+
+def gluon_dsa_kpool_prefill_plan_logits_gfx1250(
+    q: torch.Tensor,
+    pooled_k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    pool_workspace_slots: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    pool_size: int,
+    page_size: int,
+    pool_offset: int,
+    window_cols: int,
+    softmax_scale: float,
+    ordered_head_fold: bool,
+    out: torch.Tensor | None,
+    row_ends_out: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score a physical-slot GLM KPool prefill window with Wave32 WMMA.
+
+    Args:
+        q: BF16 queries shaped ``[tokens, 32, 128]``.
+        pooled_k_cache: Page-major uint8 FP8 keys and FP32 row scales.
+        weights: BF16 or FP32 signed head weights shaped ``[tokens, 32]``.
+        pool_workspace_slots: Physical pooled-cache slots in logical order.
+        row_starts: Inclusive workspace start for each query token.
+        row_ends: Exclusive workspace end for each query token.
+        pool_size: Raw tokens represented by each pooled key.
+        page_size: Pooled keys per physical page.
+        pool_offset: First request-local pool represented by output column zero.
+        window_cols: Output columns in the local scoring window.
+        softmax_scale: Scale applied after weighted per-head ReLU reduction.
+        ordered_head_fold: Whether to fold heads in logical order.
+        out: Optional contiguous FP32 scoring workspace.
+        row_ends_out: Optional contiguous int32 local exclusive bounds.
+
+    Returns:
+        Local-window scores and exclusive valid bounds.
+    """
+    pool_size = int(pool_size)
+    page_size = int(page_size)
+    pool_offset = int(pool_offset)
+    window_cols = int(window_cols)
+    cache_page_stride_bytes = _check_kpool_score_inputs(
+        q,
+        pooled_k_cache,
+        weights,
+        pool_size=pool_size,
+        page_size=page_size,
+        ordered_head_fold=ordered_head_fold,
+    )
+    if pool_offset < 0:
+        raise ValueError(f"pool_offset must be nonnegative, got {pool_offset}")
+    if window_cols <= 0:
+        raise ValueError(f"window_cols must be positive, got {window_cols}")
+
+    tokens = int(q.shape[0])
+    if pool_workspace_slots.dim() != 1:
+        raise ValueError("pool_workspace_slots must be one-dimensional")
+    if pool_workspace_slots.dtype != torch.int64:
+        raise TypeError(
+            f"pool_workspace_slots must be int64, got {pool_workspace_slots.dtype}"
+        )
+    for name, value in (("row_starts", row_starts), ("row_ends", row_ends)):
+        if value.shape != (tokens,):
+            raise ValueError(f"{name} must have shape {(tokens,)}, got {value.shape}")
+        if value.dtype != torch.int32:
+            raise TypeError(f"{name} must be int32, got {value.dtype}")
+    for name, value in (
+        ("pool_workspace_slots", pool_workspace_slots),
+        ("row_starts", row_starts),
+        ("row_ends", row_ends),
+    ):
+        if value.device != q.device:
+            raise ValueError(f"{name} must be on the same device as q")
+        if not value.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+
+    out, row_ends_out = _prepare_kpool_score_outputs(
+        q,
+        window_cols=window_cols,
+        out=out,
+        row_ends_out=row_ends_out,
+    )
+    if tokens == 0:
+        return out, row_ends_out
+    if pool_workspace_slots.numel() and pooled_k_cache.shape[0] == 0:
+        raise ValueError("a nonempty prefill plan requires pooled cache pages")
+
+    num_warps = _KPOOL_SCORE_NUM_WARPS
+    _dsa_kpool_prefill_plan_logits_kernel[(tokens, 1)](
+        q,
+        weights,
+        pooled_k_cache.view(torch.float8_e4m3fn),
+        pooled_k_cache.view(torch.float32),
+        weights,
+        pool_workspace_slots,
+        row_starts,
+        row_ends,
+        out,
+        row_ends_out,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        weights.stride(0),
+        weights.stride(1),
+        weights.stride(0),
+        weights.stride(1),
+        out.stride(0),
+        float(softmax_scale),
+        int(pool_workspace_slots.numel()),
+        pool_offset,
+        PAGE_SIZE=page_size,
+        PAGE_STRIDE_BYTES=cache_page_stride_bytes,
+        POOL_SIZE=pool_size,
+        NUM_HEADS=q.shape[1],
+        HEAD_DIM=q.shape[2],
+        BLOCK_N=_KPOOL_SCORE_BLOCK_N,
+        WINDOW_COLS=window_cols,
+        NUM_WARPS=num_warps,
+        ORDERED_HEAD_FOLD=ordered_head_fold,
+        USE_BUFFER_LOAD=pooled_k_cache.untyped_storage().nbytes() < 2**31,
+        USE_BUFFER_STORE=out.nbytes < 2**31,
+        num_warps=num_warps,
+        waves_per_eu=_KPOOL_SCORE_WAVES_PER_EU,
+    )
+    return out, row_ends_out
 
 
 def gluon_dsa_decode_topk_fp8_gfx1250(

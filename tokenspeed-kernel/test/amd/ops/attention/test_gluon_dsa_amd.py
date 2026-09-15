@@ -56,6 +56,9 @@ else:
         gluon_dsa_decode_topk_fp8_gfx1250 as gluon_dsa_decode_topk_fp8,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (
+        gluon_dsa_logical_topk_gfx1250 as gluon_logical_topk_indices,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (
         gluon_dsa_prefill_topk_fp8_gfx1250 as gluon_dsa_prefill_topk_fp8,
     )
 
@@ -992,7 +995,10 @@ def test_dsa_decode_topk_keeps_late_values_above_threshold() -> None:
     torch.testing.assert_close(lens_out.cpu(), torch.tensor([topk], dtype=torch.int32))
 
 
-@pytest.mark.skipif(not is_cdna4(), reason="requires the gfx950 logical top-k")
+@pytest.mark.skipif(
+    not (is_cdna4() or is_cdna5()),
+    reason="requires the AMD Gluon logical top-k",
+)
 def test_gluon_logical_topk_indices_respects_ragged_ranges_and_outputs() -> None:
     cols = 1024
     topk = 512

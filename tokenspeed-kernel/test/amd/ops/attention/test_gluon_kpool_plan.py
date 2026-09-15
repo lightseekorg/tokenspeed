@@ -18,17 +18,17 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""End-to-end GFX950 coverage for plan-aware Gluon KPool selection."""
+"""End-to-end AMD coverage for plan-aware Gluon KPool selection."""
 
 from __future__ import annotations
 
 import pytest
 import torch
-from utils import is_cdna4
+from utils import is_cdna4, is_cdna5
 
-if not is_cdna4():
+if not (is_cdna4() or is_cdna5()):
     pytest.skip(
-        "AMD CDNA4 (GFX950) is required for Gluon KPool plan tests",
+        "AMD CDNA4 or CDNA5 is required for Gluon KPool plan tests",
         allow_module_level=True,
     )
 
@@ -37,9 +37,6 @@ from tokenspeed_kernel.ops.attention.kpool import (
     gluon as gluon_kpool_select,  # isort: skip
 )
 
-from tokenspeed_kernel.ops.attention.kpool.gluon import (  # isort: skip
-    gluon_kpool_prefill_topk_fp8_gfx950,
-)
 from tokenspeed_kernel.ops.attention.kpool.triton import (  # isort: skip
     triton_kpool_prefill_topk,
 )
@@ -48,6 +45,19 @@ from tokenspeed_kernel.signature import (  # isort: skip
     dense_tensor_format,
     format_signature,
 )
+
+if is_cdna4():
+    _gluon_kpool_prefill_topk = gluon_kpool_select.gluon_kpool_prefill_topk_fp8_gfx950
+    _score_logits_name = "gluon_dsa_kpool_prefill_logits_gfx950"
+    _score_plan_logits_name = "gluon_dsa_kpool_prefill_plan_logits_gfx950"
+    _logical_topk_name = "gluon_dsa_logical_topk_gfx950"
+    _expected_kernel_name = "gluon_kpool_prefill_topk_fp8_gfx950"
+else:
+    _gluon_kpool_prefill_topk = gluon_kpool_select.gluon_kpool_prefill_topk_fp8_gfx1250
+    _score_logits_name = "gluon_dsa_kpool_prefill_logits_gfx1250"
+    _score_plan_logits_name = "gluon_dsa_kpool_prefill_plan_logits_gfx1250"
+    _logical_topk_name = "gluon_dsa_logical_topk_gfx1250"
+    _expected_kernel_name = "gluon_kpool_prefill_topk_fp8_gfx1250"
 
 _DEVICE = "cuda"
 _FP8_MAX = 448.0
@@ -318,7 +328,7 @@ def test_plan_matches_table_and_reference_for_ragged_padded_late_windows() -> No
         device=_DEVICE,
     )
     lens_out = torch.empty(q.shape[0], dtype=torch.int32, device=_DEVICE)
-    planned = gluon_kpool_prefill_topk_fp8_gfx950(
+    planned = _gluon_kpool_prefill_topk(
         q,
         cache,
         weights,
@@ -331,7 +341,7 @@ def test_plan_matches_table_and_reference_for_ragged_padded_late_windows() -> No
         out=out,
         lens_out=lens_out,
     )
-    table_addressed = gluon_kpool_prefill_topk_fp8_gfx950(
+    table_addressed = _gluon_kpool_prefill_topk(
         q,
         cache,
         weights,
@@ -412,7 +422,7 @@ def test_plan_masks_fixed_bucket_padding_for_gluon_and_portable() -> None:
     expected = _reference(q, pooled_k, weights, causal, req_ids, index_table, kv_table)
     kwargs = _common_kwargs() | _plan_kwargs(causal, req_ids, index_table)
 
-    gluon_result = gluon_kpool_prefill_topk_fp8_gfx950(
+    gluon_result = _gluon_kpool_prefill_topk(
         q,
         cache,
         weights,
@@ -468,7 +478,7 @@ def test_short_plan_has_stable_logical_order_and_flatkv_boundaries() -> None:
 
     first = None
     for _ in range(3):
-        actual = gluon_kpool_prefill_topk_fp8_gfx950(
+        actual = _gluon_kpool_prefill_topk(
             q,
             cache,
             weights,
@@ -486,6 +496,44 @@ def test_short_plan_has_stable_logical_order_and_flatkv_boundaries() -> None:
             first = actual[0].clone()
         else:
             assert torch.equal(actual[0], first)
+
+
+def test_plan_radix_path_matches_reference_after_deterministic_threshold() -> None:
+    causal_len = 2049 * _POOL + 3
+    (
+        q,
+        cache,
+        pooled_k,
+        weights,
+        positions,
+        query_start_loc,
+        req_ids,
+        causal,
+        index_table,
+        kv_table,
+    ) = _setup_rows(
+        (causal_len,),
+        seed=82,
+        page_padding_bytes=32,
+        permute_index_pages=True,
+    )
+    expected = _reference(q, pooled_k, weights, causal, req_ids, index_table, kv_table)
+
+    actual = _gluon_kpool_prefill_topk(
+        q,
+        cache,
+        weights,
+        positions,
+        query_start_loc,
+        index_table,
+        kv_table,
+        **_common_kwargs(),
+        **_plan_kwargs(causal, req_ids, index_table),
+        chunk_pools=8192,
+    )
+
+    assert torch.equal(actual[1], expected[1])
+    assert _row_sets(actual) == _row_sets(expected)
 
 
 def test_plan_workspace_cap_tiles_rows_while_running_real_scorer(
@@ -513,7 +561,7 @@ def test_plan_workspace_cap_tiles_rows_while_running_real_scorer(
         causal, req_ids, index_table
     )
     calls = []
-    plan_scorer = gluon_kpool_select.gluon_dsa_kpool_prefill_plan_logits_gfx950
+    plan_scorer = getattr(gluon_kpool_select, _score_plan_logits_name)
 
     def tracked_plan_scorer(q_tile, *args, **kwargs):
         calls.append(int(q_tile.shape[0]))
@@ -521,7 +569,7 @@ def test_plan_workspace_cap_tiles_rows_while_running_real_scorer(
 
     monkeypatch.setattr(
         gluon_kpool_select,
-        "gluon_dsa_kpool_prefill_plan_logits_gfx950",
+        _score_plan_logits_name,
         tracked_plan_scorer,
     )
     window_width = 1024
@@ -543,6 +591,9 @@ def test_plan_workspace_cap_tiles_rows_while_running_real_scorer(
         max_num_pools=max_num_pools,
         chunk_pools=8192,
         max_logits_bytes=one_row_bytes,
+        score_logits=getattr(gluon_kpool_select, _score_logits_name),
+        score_plan_logits=tracked_plan_scorer,
+        logical_topk=getattr(gluon_kpool_select, _logical_topk_name),
     )
 
     assert calls == [1, 1, 1]
@@ -586,7 +637,7 @@ def test_plan_filters_nonfinite_scores(nonfinite: float) -> None:
         .view(cache.shape[0], -1)
     )
 
-    actual = gluon_kpool_prefill_topk_fp8_gfx950(
+    actual = _gluon_kpool_prefill_topk(
         q,
         cache,
         weights,
@@ -623,7 +674,7 @@ def test_plan_short_sort_supports_cuda_graph_replay() -> None:
     kwargs = _common_kwargs() | _plan_kwargs(causal, req_ids, index_table)
 
     def run() -> tuple[torch.Tensor, torch.Tensor]:
-        return gluon_kpool_prefill_topk_fp8_gfx950(
+        return _gluon_kpool_prefill_topk(
             q,
             cache,
             weights,
@@ -674,8 +725,8 @@ def test_public_dispatch_supports_both_addressing_modes_and_geometry_fallbacks()
         "attention", "kpool_prefill_topk", signature, traits=traits
     )
 
-    assert planned.name == "gluon_kpool_prefill_topk_fp8_gfx950"
-    assert table_addressed.name == "gluon_kpool_prefill_topk_fp8_gfx950"
+    assert planned.name == _expected_kernel_name
+    assert table_addressed.name == _expected_kernel_name
     for trait, unsupported in (
         ("index_heads", 64),
         ("page_size", 64),
@@ -708,7 +759,7 @@ def test_public_no_plan_entry_uses_optimized_table_addressing() -> None:
     ) = _setup_rows((causal_len,), seed=81, page_padding_bytes=48)
     kwargs = _common_kwargs()
 
-    direct = gluon_kpool_prefill_topk_fp8_gfx950(
+    direct = _gluon_kpool_prefill_topk(
         q,
         cache,
         weights,
