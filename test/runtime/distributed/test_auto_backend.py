@@ -127,19 +127,28 @@ def test_triton_collection_fallback_reduces_each_tensor(monkeypatch):
 
 def test_triton_ordinary_all_reduce_keeps_512_kib_limit(monkeypatch):
     backend = TritonAllReduceBackend(Mock(), producer_direct_max_bytes=1024 * 1024)
+    group = tuple(range(8))
     tensor = Mock(
         is_cuda=True,
         is_contiguous=Mock(return_value=True),
         dtype=torch.bfloat16,
     )
-    tensor.numel.return_value = 300 * 1024
     monkeypatch.setattr(
         triton_allreduce_module,
         "current_platform",
         lambda: SimpleNamespace(is_amd=True),
     )
+    monkeypatch.setattr(backend, "_get_or_create", lambda _group: object())
+    monkeypatch.setattr(
+        triton_allreduce_module,
+        "all_reduce_can_run",
+        lambda _state, _tensor, op: True,
+    )
 
-    assert not backend.can_run(tensor, (0, 1))
+    tensor.numel.return_value = 36 * 7168
+    assert backend.can_run(tensor, group)
+    tensor.numel.return_value = 37 * 7168
+    assert not backend.can_run(tensor, group)
     assert backend.producer_direct_max_bytes == 1024 * 1024
 
 

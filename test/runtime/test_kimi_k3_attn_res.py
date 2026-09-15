@@ -29,6 +29,7 @@ kernel build is present) the CUDA kernel must match the torch fallback.
 import os
 import sys
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
@@ -400,12 +401,17 @@ class AttnResTests(unittest.TestCase):
             is_block_write_layer=False,
             block_write_idx=1,
             prev_valid_blocks=1,
+            _mlp_wp=weight,
+            _mlp_slot=3,
             self_attention_res_proj=SimpleNamespace(weight=weight.reshape(1, -1)),
             self_attention_res_norm=norm,
             input_layernorm=norm,
             mlp_res_proj=SimpleNamespace(weight=weight.reshape(1, -1)),
             mlp_res_norm=norm,
             post_attention_layernorm=norm,
+            k3_comm=SimpleNamespace(
+                fused_attnres_reduce_available=mock.Mock(return_value=False)
+            ),
         )
         block_residual = torch.empty(2, 2, _HIDDEN, dtype=torch.bfloat16)
 
@@ -429,6 +435,131 @@ class AttnResTests(unittest.TestCase):
                 )
             )
             self.assertEqual(available.call_count, 2)
+
+    def test_fused_attention_reduce_preempts_decomposed_graph(self):
+        weight = torch.empty(_HIDDEN, dtype=torch.bfloat16)
+        norm = SimpleNamespace(weight=weight, variance_epsilon=_EPS)
+        use_fused_reduce = mock.Mock(return_value=True)
+        layer = SimpleNamespace(
+            is_block_write_layer=False,
+            block_write_idx=1,
+            prev_valid_blocks=1,
+            _mlp_wp=weight,
+            _mlp_slot=3,
+            self_attention_res_proj=SimpleNamespace(weight=weight.reshape(1, -1)),
+            self_attention_res_norm=norm,
+            input_layernorm=norm,
+            mlp_res_proj=SimpleNamespace(weight=weight.reshape(1, -1)),
+            mlp_res_norm=norm,
+            post_attention_layernorm=norm,
+            k3_comm=SimpleNamespace(fused_attnres_reduce_available=use_fused_reduce),
+        )
+        hidden_states = SimpleNamespace(shape=(32, _HIDDEN), is_cuda=True)
+        scratch = (object(), object(), object())
+
+        with (
+            mock.patch.object(kimi_k3, "_sliced_scratch", return_value=scratch),
+            mock.patch.object(
+                kimi_k3,
+                "attn_res_fwd_available",
+                return_value=True,
+            ) as available,
+        ):
+            self.assertFalse(
+                kimi_k3.KimiLinearDecoderLayer._fused_attnres_graph_available(
+                    layer,
+                    hidden_states,
+                    object(),
+                )
+            )
+            self.assertTrue(
+                kimi_k3.KimiLinearDecoderLayer._fused_attnres_graph_available(
+                    layer,
+                    SimpleNamespace(shape=(33, _HIDDEN), is_cuda=True),
+                    object(),
+                )
+            )
+
+        self.assertEqual(available.call_count, 2)
+        use_fused_reduce.assert_called_once()
+        self.assertIs(use_fused_reduce.call_args.args[0], hidden_states)
+        self.assertIs(use_fused_reduce.call_args.args[1], hidden_states)
+        self.assertIs(use_fused_reduce.call_args.args[2][0], scratch)
+        self.assertIs(use_fused_reduce.call_args.args[3], weight)
+
+    def test_fused_attention_reduce_waits_for_scratch_stream(self):
+        events = []
+
+        class Fork:
+            @contextmanager
+            def scope(self, *, enable):
+                self.assert_enabled = enable
+                yield self
+                events.append("join")
+
+            @contextmanager
+            def branch(self):
+                yield
+
+        h = SimpleNamespace(shape=(32, _HIDDEN), is_cuda=True)
+        prefix = torch.zeros(32, _HIDDEN, dtype=torch.bfloat16)
+        hidden = torch.ones_like(prefix)
+        weight = mock.Mock()
+        weight.reshape.return_value = weight
+        fork = Fork()
+        reduce = mock.Mock(
+            side_effect=lambda *_args, **_kwargs: (
+                events.append("reduce"),
+                (prefix, hidden),
+            )[1]
+        )
+        attention = mock.Mock(side_effect=lambda **_kwargs: events.append("attention"))
+        attention.return_value = object()
+        layer = SimpleNamespace(
+            _fused_attnres_graph_available=mock.Mock(return_value=False),
+            _mix_into_attention=mock.Mock(return_value=(h, prefix)),
+            prev_valid_blocks=1,
+            is_block_write_layer=False,
+            _mlp_slot=3,
+            _mlp_split=False,
+            _next_attn_mix=None,
+            _hoist_next_mlp=False,
+            _mlp_wp=object(),
+            mlp_res_proj=SimpleNamespace(weight=weight),
+            mlp_res_norm=SimpleNamespace(weight=object(), variance_epsilon=_EPS),
+            post_attention_layernorm=SimpleNamespace(weight=object()),
+            self_attn=attention,
+            comm_manager=object(),
+            k3_comm=SimpleNamespace(
+                state=SimpleNamespace(attn_ar_fusion_ok=False),
+                fused_attnres_reduce_available=mock.Mock(return_value=True),
+            ),
+            attn_fork=fork,
+            _reduce_attn_accumulate=reduce,
+            is_moe_layer=False,
+            mlp=mock.Mock(return_value=torch.zeros_like(prefix)),
+        )
+
+        with (
+            mock.patch.object(kimi_k3, "get_is_capture_mode", return_value=True),
+            mock.patch.object(kimi_k3, "_sliced_scratch", return_value=object()),
+            mock.patch.object(
+                kimi_k3,
+                "attnres_partial",
+                side_effect=lambda *_args: events.append("partial"),
+            ),
+        ):
+            kimi_k3.KimiLinearDecoderLayer.forward(
+                layer,
+                object(),
+                object(),
+                object(),
+                [object()],
+            )
+
+        self.assertTrue(fork.assert_enabled)
+        self.assertEqual(events, ["partial", "attention", "join", "reduce"])
+        reduce.assert_called_once()
 
     def test_fused_to_fallback_populates_next_split_partial(self):
         hidden_states = SimpleNamespace(shape=(4, _HIDDEN), is_cuda=True)
