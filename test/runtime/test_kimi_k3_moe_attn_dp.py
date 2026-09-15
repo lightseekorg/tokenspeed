@@ -20,6 +20,7 @@
 
 """Attention-DP MoE ownership and collective ordering."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -29,6 +30,7 @@ from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput, TopKOutputFormat
+from tokenspeed.runtime.layers.moe.utils import All2AllBackend
 from tokenspeed.runtime.models import kimi_k3
 from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
 
@@ -57,7 +59,11 @@ def test_attn_dp_rejects_partial_world_layout_before_backend_setup(
     backend.assert_not_called()
 
 
-def test_attn_dp_replicates_dense_weights_and_skips_tp_tail_setup(monkeypatch) -> None:
+@pytest.mark.parametrize("backend", ["none", "agrs", "flashinfer"])
+@pytest.mark.parametrize("fabric_available", [False, True])
+def test_attn_dp_replicates_dense_weights_and_selects_transport(
+    monkeypatch, backend: str, fabric_available: bool
+) -> None:
     class Experts(nn.Module):
         def __init__(self, **kwargs):
             super().__init__()
@@ -86,11 +92,24 @@ def test_attn_dp_replicates_dense_weights_and_skips_tp_tail_setup(monkeypatch) -
     monkeypatch.setattr(kimi_k3, "K3MoeTailComm", forbidden)
     monkeypatch.setattr(kimi_k3, "LatentMoELayer", forbidden)
     monkeypatch.setattr(kimi_k3, "MoELayer", Experts)
+    transport = object() if fabric_available else None
+    factory = mock.Mock(return_value=transport)
+    monkeypatch.setattr(kimi_k3, "get_flashinfer_moe_alltoall", factory)
+    monkeypatch.setattr(kimi_k3, "get_all2all_backend", lambda: All2AllBackend(backend))
+    monkeypatch.setattr(
+        "tokenspeed.runtime.distributed.process_group_manager.process_group_manager.get_device_process_group",
+        mock.Mock(return_value=object()),
+    )
     monkeypatch.setattr(
         kimi_k3, "situ_moe_unavailable_reason", mock.Mock(return_value=None)
     )
     monkeypatch.setattr(kimi_k3, "load_packaged_flashinfer_tuning_cache", mock.Mock())
     monkeypatch.setitem(kimi_k3.global_server_args_dict, "enforce_eager", False)
+    monkeypatch.setitem(kimi_k3.global_server_args_dict, "max_prefill_tokens", 8192)
+    monkeypatch.setitem(kimi_k3.global_server_args_dict, "max_num_seqs", 128)
+    monkeypatch.setitem(
+        kimi_k3.global_server_args_dict, "speculative_num_draft_tokens", 4
+    )
     mapping = SimpleNamespace(
         world_size=2,
         rank=1,
@@ -108,23 +127,37 @@ def test_attn_dp_replicates_dense_weights_and_skips_tp_tail_setup(monkeypatch) -
             dp_size=1,
         ),
     )
-    layer = KimiLinearMoE(
-        config=KimiLinearConfig(
-            hidden_size=64,
-            routed_expert_hidden_size=32,
-            moe_intermediate_size=32,
-            num_experts=8,
-            num_experts_per_token=2,
-            num_shared_experts=1,
-        ),
-        mapping=mapping,
-        layer_index=1,
-        model_scope="test",
-        moe_block_count=1,
-        quant_config=None,
-        prefix="moe",
-        alt_stream=None,
-    )
+    expected_error = backend == "flashinfer" and not fabric_available
+    with (
+        pytest.raises(ValueError, match="sharing a CUDA fabric")
+        if expected_error
+        else nullcontext()
+    ):
+        layer = KimiLinearMoE(
+            config=KimiLinearConfig(
+                hidden_size=64,
+                routed_expert_hidden_size=32,
+                moe_intermediate_size=32,
+                num_experts=8,
+                num_experts_per_token=2,
+                num_shared_experts=1,
+            ),
+            mapping=mapping,
+            layer_index=1,
+            model_scope="test",
+            moe_block_count=1,
+            quant_config=None,
+            prefix="moe",
+            alt_stream=None,
+        )
+    if expected_error:
+        return
+    if backend == "agrs":
+        factory.assert_not_called()
+        assert layer.moe_alltoall is None
+    else:
+        factory.assert_called_once()
+        assert layer.moe_alltoall is transport
     forbidden.assert_not_called()
     assert not layer._shard_latent_projections
     assert not layer.routed_expert_down_proj.narrowed
@@ -140,16 +173,45 @@ def test_attn_dp_replicates_dense_weights_and_skips_tp_tail_setup(monkeypatch) -
     assert not hasattr(layer, "native_latent_moe")
 
 
+@pytest.mark.parametrize(
+    "backend,dp,match",
+    [
+        ("deepep", 2, "does not support DeepEP"),
+        ("agrs", 1, "requires attention DP"),
+        ("flashinfer", 1, "requires attention DP"),
+    ],
+)
+def test_k3_rejects_unsupported_transport_layout(monkeypatch, backend, dp, match):
+    monkeypatch.setattr(kimi_k3, "get_all2all_backend", lambda: All2AllBackend(backend))
+    with pytest.raises(ValueError, match=match):
+        KimiLinearMoE(
+            config=SimpleNamespace(),
+            mapping=SimpleNamespace(
+                world_size=2,
+                attn=SimpleNamespace(dp_size=dp, tp_size=2 // dp),
+                moe=SimpleNamespace(ep_size=2, tp_ep_size=2),
+            ),
+            layer_index=0,
+            model_scope="test",
+            moe_block_count=1,
+            quant_config=None,
+            prefix="moe",
+            alt_stream=None,
+        )
+
+
 @pytest.mark.parametrize("counts", [(1, 1), (0, 1), (1, 3)])
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("with_norm", [False, True])
+@pytest.mark.parametrize("use_alltoall", [False, True])
 def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
     monkeypatch,
     counts: tuple[int, int],
     rank: int,
     weights_dtype: torch.dtype,
     with_norm: bool,
+    use_alltoall: bool,
 ) -> None:
     rows, capacity = counts[rank], max(counts)
     events = []
@@ -193,6 +255,21 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
         torch.testing.assert_close(partial, latent.reshape(-1, 2) * (rank + 1))
         return latent[rank] * 3
 
+    def dispatch(local_hidden, local_ids, local_weights, max_tokens):
+        events.append("dispatch")
+        assert max_tokens == capacity
+        torch.testing.assert_close(local_hidden, latent[rank, :rows])
+        torch.testing.assert_close(local_ids, ids[rank, :rows])
+        torch.testing.assert_close(local_weights, weights[rank, :rows])
+        return latent.reshape(-1, 2), ids.reshape(-1, 2), weights.reshape(-1, 2), 1234
+
+    def combine(partial, local_tokens, max_tokens, combine_offset):
+        events.append("combine")
+        assert local_tokens == rows and max_tokens == capacity
+        assert combine_offset == 1234
+        torch.testing.assert_close(partial, latent.reshape(-1, 2) * (rank + 1))
+        return latent[rank, :rows] * 3
+
     def norm(value):
         events.append("norm")
         torch.testing.assert_close(value, latent[rank, :rows] * 3)
@@ -217,6 +294,11 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
             world_size=2,
             attn=SimpleNamespace(dp_rank=rank),
             moe=SimpleNamespace(ep_group=group),
+        ),
+        moe_alltoall=(
+            SimpleNamespace(dispatch=dispatch, combine=combine)
+            if use_alltoall
+            else None
         ),
         routed_hidden=2,
         top_k=2,
@@ -247,7 +329,11 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
         prefix + torch.cat((expected_latent, expected_latent), dim=-1) + hidden * 3
     )
     torch.testing.assert_close(result, expected)
-    expected_events = ["AG_latent", "AG_ids", "AG_weights", "experts", "RS"]
+    expected_events = (
+        ["dispatch", "experts", "combine"]
+        if use_alltoall
+        else ["AG_latent", "AG_ids", "AG_weights", "experts", "RS"]
+    )
     if rows:
         if with_norm:
             expected_events.append("norm")

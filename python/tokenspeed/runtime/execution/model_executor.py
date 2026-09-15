@@ -124,7 +124,7 @@ def _resolve_prefill_graph_max_tokens(server_args) -> int:
     extend-shaped forward takes DeepEP's normal dispatch, whose per-expert
     receive counts come back to the host, and a host sync cannot be captured.
     """
-    if server_args.all2all_backend not in (None, "none"):
+    if server_args.all2all_backend == "deepep":
         return 0
     if server_args.prefill_graph_max_tokens is not None:
         return int(server_args.prefill_graph_max_tokens)

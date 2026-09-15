@@ -1461,7 +1461,9 @@ class ServerArgs:
             metavar="ALL2ALL_BACKEND",
             type=str,
             default=ServerArgs.all2all_backend,
-            help="MoE all-to-all backend: none, deepep, etc.",
+            choices=["none", "agrs", "deepep", "flashinfer"],
+            help="MoE communication backend. agrs and flashinfer explicitly select "
+            "the Kimi-K3 attention-DP transport; none preserves existing behavior.",
         )
         parser.add_argument(
             "--deepep-mode",

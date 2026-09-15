@@ -18,10 +18,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import logging
+from functools import cache
 from typing import List, Tuple
 
 import torch
+from tokenspeed_kernel.ops.communication.fabric import group_has_fabric
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.thirdparty.flashinfer.moe_alltoall import FlashInferMoeAlltoAll
+
+logger = logging.getLogger(__name__)
 
 _custom_allreduce = None
 
@@ -115,3 +121,45 @@ def all_reduce_unreg(
     """All-reduce for non-registered tensors."""
     _check_available()
     _custom_allreduce.all_reduce_unreg(fa, inp, buffer, out)
+
+
+@cache
+def get_flashinfer_moe_alltoall(
+    group: torch.distributed.ProcessGroup,
+    model_scope: str,
+    max_tokens: int,
+    hidden_size: int,
+    top_k: int,
+    num_experts: int,
+    dtype: torch.dtype,
+    weights_dtype: torch.dtype,
+) -> FlashInferMoeAlltoAll | None:
+    """Create one workspace per model/group, or return None without a shared NVLink fabric.
+
+    Args:
+        group: Expert-parallel process group.
+        model_scope: Model identity; overlapping target/draft graphs require separate storage.
+        max_tokens: Maximum local token capacity, including prefill and verification.
+        hidden_size: Width of routed activations and outputs.
+        top_k: Number of selected experts per token.
+        num_experts: Global expert count.
+        dtype: Routed activation/output dtype.
+        weights_dtype: Precomputed routing-weight dtype.
+
+    Returns:
+        A shared transport for sequential layers of this model, or None for the AG/RS fallback.
+    """
+    ranks = tuple(torch.distributed.get_process_group_ranks(group))
+    if not current_platform().is_nvidia or not group_has_fabric(ranks):
+        return None
+    transport = FlashInferMoeAlltoAll(
+        group, max_tokens, hidden_size, top_k, num_experts, dtype, weights_dtype
+    )
+    logger.info(
+        "K3 MoE communication: FlashInfer MNNVL all-to-all scope=%s ep=%d capacity=%d width=%d",
+        model_scope,
+        group.size(),
+        max_tokens,
+        hidden_size,
+    )
+    return transport

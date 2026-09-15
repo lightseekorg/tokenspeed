@@ -574,7 +574,10 @@ class KimiK3RegistrationTests(unittest.TestCase):
         from tokenspeed.runtime.models import kimi_k3
 
         def mapping_for(tp_ep_size):
-            return SimpleNamespace(moe=SimpleNamespace(tp_ep_size=tp_ep_size))
+            return SimpleNamespace(
+                attn=SimpleNamespace(dp_size=1),
+                moe=SimpleNamespace(tp_ep_size=tp_ep_size),
+            )
 
         on_nvidia = torch.version.hip is None
         self.assertEqual(

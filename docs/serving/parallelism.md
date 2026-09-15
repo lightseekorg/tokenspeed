@@ -92,23 +92,38 @@ and world size to be equal. Mixed attention TP/DP layouts are rejected. The
 shared expert and both latent projections are replicated and operate on each
 rank's local tokens.
 
-`KimiLinearMoE._forward_attn_dp` gathers only latent activations and precomputed
-TopK IDs/weights, executes each rank's routed experts, and reduce-scatters the
-weighted latent partials. Latent RMSNorm, the up-projection, shared output, and
-residual addition remain local. This reference path uses three separate
-all-gathers (latent activations, expert IDs, and routing weights) and one
-reduce-scatter per nonempty global MoE batch. It does not gather full-width
-hidden states or residuals, or initialize the TP-tail fusion machinery.
+`KimiLinearMoE._forward_attn_dp` dispatches latent activations and precomputed
+TopK IDs/weights, executes each rank's routed experts, and combines the weighted
+latent outputs back to their original ranks. Latent RMSNorm, the up-projection,
+shared output, and residual addition remain local.
 
-Only ranks with fewer rows pad their tensors; ranks at the collective row count
-reuse their produced tensors directly. Padding has zero routing weights;
-reduce-scatter restores rank ownership before local padding is removed. Idle
-ranks participate when peers have tokens. The same collective-sizing metadata
-covers eager execution, graph capture, and speculative draft narrowing.
+`--all2all-backend` accepts `none`, `agrs`, `deepep`, and `flashinfer`.
+For this K3 attention-DP path:
 
-This implementation requires a precomputed-TopK expert kernel and
-`--all2all-backend none`. Replication increases model-weight memory per rank,
-which is accounted for before KV-cache allocation.
+- `none` (default) preserves automatic selection: FlashInfer on NVIDIA ranks
+  sharing a CUDA fabric, otherwise AG/RS.
+- `agrs` forces the reference all-gather/reduce-scatter transport.
+- `flashinfer` requires FlashInfer MNNVL all-to-all and errors without the
+  required CUDA fabric.
+- `deepep` is not supported by this K3 path.
+
+FlashInfer MNNVL all-to-all handles dispatch and combine. Workspaces are
+allocated before graph capture, shared by
+sequential layers within a model, and separate for target and draft models.
+Unused receive slots are assigned an expert ID outside the receiving rank's
+partition. Combine uses BF16 outputs without low-precision communication.
+
+The AG/RS reference transport uses three all-gathers
+(latent activations, expert IDs, and weights) and one reduce-scatter. Only
+shorter ranks pad their tensors; padding has zero routing weights. Idle ranks
+participate when peers have tokens. Both transports use the same token-count
+metadata for eager execution, graph capture, and speculative draft narrowing.
+
+This path requires precomputed-TopK expert kernels. Kimi owns dispatch/combine.
+`MoELayer` maps `agrs` and `flashinfer` to `a2a_backend="none"` in the inner
+expert plan, so the expert backend does not dispatch again.
+Replication and transport workspace memory are accounted for before KV-cache
+allocation. FlashInfer all-to-all requires its `moe_a2a_*` APIs.
 
 ### DeepEP all-to-all
 
@@ -142,7 +157,7 @@ The mode is chosen per forward from a value every rank agrees on, because the tw
 modes are different collectives. With DP attention that value is "every DP rank
 is decoding", so one extending rank moves the whole group to the normal legs.
 
-The prefill CUDA graph is disabled whenever an all-to-all backend is selected:
+The prefill CUDA graph is disabled when DeepEP is selected:
 normal-mode dispatch reports its per-expert receive counts to the host, and a
 host sync cannot be captured. Decode graphs are unaffected.
 

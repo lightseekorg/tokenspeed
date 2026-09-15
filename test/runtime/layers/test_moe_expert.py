@@ -12,6 +12,7 @@ from tokenspeed.runtime.layers.moe.topk import (
     StandardTopKOutput,
     TopKConfig,
 )
+from tokenspeed.runtime.layers.moe.utils import All2AllBackend
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 
 
@@ -86,8 +87,10 @@ def test_moe_layer_rejects_invalid_situ_parameters(
         )
 
 
+@pytest.mark.parametrize("backend", ["none", "agrs", "flashinfer"])
 def test_moe_layer_builds_ep8_local_expert_partition(
     monkeypatch: pytest.MonkeyPatch,
+    backend: str,
 ) -> None:
     captured: dict[str, object] = {}
 
@@ -109,6 +112,9 @@ def test_moe_layer_builds_ep8_local_expert_partition(
         expert_module, "create_layer_weights", fake_create_layer_weights
     )
 
+    monkeypatch.setattr(
+        expert_module, "get_all2all_backend", lambda: All2AllBackend(backend)
+    )
     layer = MoELayer(
         top_k=16,
         num_experts=896,
@@ -130,6 +136,8 @@ def test_moe_layer_builds_ep8_local_expert_partition(
     assert layer.activation_situ_beta == 4.0
     assert layer.activation_situ_linear_beta == 25.0
     assert captured["spec"].num_local_experts == 112
+    assert captured["plan"]["a2a_backend"] == "none"
+    assert captured["spec"].a2a_backend == "none"
     assert captured["plan"]["ep_size"] == 8
     assert captured["plan"]["activation"] == "situ"
     assert captured["plan"]["routing_mode"] == "precomputed_topk"
