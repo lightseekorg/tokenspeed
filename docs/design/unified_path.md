@@ -673,12 +673,150 @@ The NVIDIA CuteDSL prefill adapter declares its native `v_major`
 (`[N, H, V, K]`) state layout. The dispatch facade alone adapts a caller
 with another layout; the wrapper must not round-trip native state through
 FLA's `[N, H, K, V]` convention. Direct wrapper callers use the native
-layout for both initial and final state. Gate conversion to FP32 and beta
-packing retain their ordinary PyTorch operations. The native wrapper allocates
-the scan output; breakable graph replay copies it into the graph-owned stable
-handoff buffer. No output-buffer extension to the native wrapper is required.
+layout for both initial and final state. Exact-length gate conversion to FP32
+and beta packing retain their ordinary PyTorch operations. The native wrapper
+allocates the scan output. Ordinary attention breaks copy it into a stable
+graph-owned handoff buffer; inline KDA keeps output restoration and padding
+cleanup inside the graph, without that handoff copy. No output-buffer
+extension to the native wrapper is required.
 These preparation changes modify neither the native scan, its gate math, nor
 GEMM arithmetic.
+
+## Experimental KDA prefill subgraphs
+
+### Capturing KDA in the outer graph
+
+For pure extend with the captured request count, KDA stays inside the outer
+prefill graph. Before warmup, the backend creates a capacity metadata binding
+for the selected bucket. The hybrid wrapper bypasses its attention break
+while this binding is active, capturing neighboring projections, KDA kernels
+and post-attention compute together. Full-attention layers keep their breaks.
+
+Before replay, the binding validates live lengths and refreshes boundaries,
+convolution maps and state-page indices on the consumer stream. All KDA
+layers read this same stable storage. Token lengths may vary within the
+bucket; request counts must match capture. Native output padding is cleared
+inside the graph, replacing the KDA break's handoff copy and tail scrub.
+The outer graph owns these allocations and their pool.
+
+The ordinary outer capture is retained for mixed batches and other request
+counts. All variants share the outer pool and execute serially, as existing
+bucket captures do. Layerwise PD transfer and data parallelism retain the
+ordinary route: host cache-step callbacks must remain live, and DP admission
+must stay rank-uniform. A binding rejects a replacement cache pool; graph
+release and recapture remain the orchestrator's responsibility.
+
+Internal-checkpoint forwards have a merged capture with two scan capacities.
+Stable body/tail token maps use negative indices for inactive rows; packing
+zeros those rows, and inverse-map gathering restores live output order while
+zeroing output padding. Compact batches without an inverse map use scatter.
+Each scan consumes its
+own live GPU boundaries and CPU mirror. Checkpoint writes retain the eager
+ordering: convolution snapshots precede convolution updates, and recurrent
+snapshots precede the tail scan. The graph binds scheduler-owned checkpoint
+destinations, not backend-owned cache pages. Replay requires the captured
+request count, but checkpoint counts, row identities and lengths can change.
+The outer owner captures exact request counts from
+`prefill_graph_capture_batch_sizes` (unset: the minimum count per token bucket)
+with one variant per token bucket and request count. Token buckets still follow the shared
+prefill token ladder. Capture requests have positive lengths and fit the
+model context and request buffers; zero-length request padding is not admitted.
+Startup autotuning uses the same dummy-batch builder with an explicit minimum
+request count, `ceil(num_tokens / context_len)`, independent of the configured
+capture request counts. Its token budget also respects rank-local request capacity.
+Uncaptured request counts retain the ordinary attention break, whose
+separate-subgraph cache still rejects internal checkpoints. Replay refresh includes
+`scan_query_start_loc`, which the recurrent dispatcher consumes, as well as
+the convolution boundary and existing int64 mirror.
+
+The checkpoint metadata also owns an inverse output-token map, built with
+the existing packed host metadata and refreshed at the same stable addresses.
+Each layer gathers body and tail outputs in one kernel, writing zero for
+negative sources. This replaces two scatters plus output initialization;
+the inline path needs no additional output-padding scrub. Eager compact
+checkpoint batches retain their ordinary merge when no inverse map is supplied.
+Q/K/V may remain views of convolution output until the existing checkpoint
+packer materializes them. Saved verification payloads keep their split producer.
+
+Merged graphs reserve one tail slot per real request. An inactive slot has
+one zero-input dummy token, a negative output-token map, no checkpoint
+destination and a negative state-update row. Its scan result must never replace
+the body's final state. This padding is graph execution scratch, not a
+scheduler request or cache allocation. Native scans still see positive-length
+sequences; ordinary eager prefill retains compact tails and skips the second
+scan when there is no internal checkpoint. Both use the same checkpoint
+writers and recurrent-state scatter, which ignore negative destinations/rows.
+
+### Separate subgraphs in the ordinary outer capture
+
+`TOKENSPEED_KDA_PREFILL_GRAPH=1` opts into capacity-based subgraphs within
+the existing breakable-prefill attention break. The default remains off.
+The cache calls the same extend implementation for warmup and capture;
+capture failures propagate. Decode and ordinary eager
+forwards retain their existing behavior. PD cache-step recording and the
+break-output copy/padding stay outside the subgraph in their original order.
+
+Each backend lazily retains schedules for the outer prefill graph's selected
+token buckets, keyed by sequence count, padded token count, CUDA stream and
+PDL setting. There is no separate KDA bucket list or schedule-count limit.
+Layer entries also
+require identical input addresses, shapes, strides, dtypes and scalar
+arguments, and retain input references against allocator address recycling.
+Incompatible inputs run the same eager callable.
+The first execution warms native plans normally; the second records a graph
+and replays once, so in-place cache state is never advanced by extra warmups.
+
+Schedules own private metadata snapshots. Actual CPU/GPU boundaries and
+state-page indices are refreshed once per new forward, on the same stream
+that consumes them. All layers in that schedule share the snapshot. This
+does not mutate the original per-forward metadata or change scheduler page
+ownership. Publishing a replacement cache pool drops all subgraphs, under
+the existing orchestrator-owned graph-release/rebind lifecycle.
+
+Subgraphs on one replay stream share a private graph memory pool and one
+capture stream. Other replay streams use separate pools, so concurrent
+consumers cannot overwrite each other's scratch. The outer breakable graph
+pool remains separate: its intermediates are live across attention breaks.
+Every subgraph produces its output before the existing immediate handoff
+copy consumes it; no captured temporary is an eager-call cache. Output
+tensors remain strongly owned by their graph entries.
+
+The private KDA metadata overrides only the packed execution extent; real
+host lengths and GPU boundaries still agree. An explicit
+`KdaPrefillCapacity` passed to the kernel facade admits the live CPU lengths:
+each sequence may fill the bucket, but their combined tokens must also fit it.
+The CuTeDSL adapter alone converts this descriptor to native planning bounds.
+Convolution maps reserve `ceil(token_capacity / block_m) + sequences - 1`
+programs, bounding the sum of per-request rounded lengths without reserving
+the entire token bucket for every request. One GPU metadata refresh
+per forward marks inactive programs with PAD_SLOT_ID before all layers run:
+the convolution kernel otherwise performs unmasked prior-token loads even
+for an excess chunk. Scan inputs are cleared past the live device boundary
+inside the graph, since a capacity descriptor makes padding addressable to
+native full-tile loads. Both conv and scan read live GPU boundaries;
+total live tokens must fit the physical packed extent. Empty sequence slots
+are not admitted. Batch-count changes require another schedule.
+Other solutions retain exact live-length planning and reject capacity mode.
+
+For the pinned token-major CuTeDSL ABI, a fused preparation kernel scrubs
+padding, converts gates to FP32 and builds the device chunk plan. Its total
+chunk capacity is `ceil(token_capacity / 16) + sequences - 1`, while each
+sequence retains the full per-sequence walk bound. The third-party adapter
+passes this explicit plan to the existing native launch without replacing
+global functions or changing scan arithmetic. Routing and workspace partition
+rules remain owned by the native host. Unsupported layouts retain the public
+wrapper's capacity preparation.
+
+Only the checkpoint packer may assert `inputs_packed`: it owns contiguous
+Q/K/V/beta and initializes every padded token. That contract skips redundant
+copies, never inferred merely from being inside capture. Gate projection can
+still produce undefined padding, so gate scrub/cast always runs. Per-call
+plan and scratch tensors belong to the active graph pool or eager invocation;
+they are not a mutable process-global plan shared across replay streams.
+
+This is an experimental capacity contract.
+Full-model overlap, memory use and performance must be validated before
+enabling it by default.
 
 ## Non-goals
 

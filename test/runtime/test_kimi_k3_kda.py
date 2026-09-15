@@ -129,6 +129,7 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(
         num_real_tokens=num_tokens,
         lower_bound=-5.0,
         cu_seqlens_cpu=boundaries.to(torch.int64),
+        inputs_packed=False,
     )
     assert captured["initial_state"] is stored
     assert captured["cu_seqlens"] is scan_boundaries
@@ -588,6 +589,7 @@ class _KDAHarness:
             bs=bs,
             forward_mode=ForwardMode.EXTEND,
             mixed_qkv=mixed.clone(),
+            save_kv_cache=True,
             g_raw=g_raw,
             beta_raw=beta_raw,
             seq_len=seq_len,

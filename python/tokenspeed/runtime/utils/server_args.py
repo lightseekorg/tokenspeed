@@ -307,6 +307,8 @@ class ServerArgs:
     prefill_graph_max_tokens: int | None = None
     # Explicit prefill bucket list; unset = the relative-stride ladder (see get_prefill_token_buckets).
     prefill_graph_capture_sizes: list[int] | None = None
+    # Exact request counts for inline attention; unset keeps the minimum per bucket.
+    prefill_graph_capture_batch_sizes: list[int] | None = None
     cudagraph_capture_sizes: list[int] | None = None
     enable_nan_detection: bool = False
     enable_nvtx: bool = False
@@ -1905,15 +1907,41 @@ class ServerArgs:
             "graph. Default (unset) = min(2048, chunked-prefill size); "
             "0 disables.",
         )
-        parser.add_argument(
-            "--prefill-graph-capture-sizes",
-            metavar="PREFILL_GRAPH_CAPTURE_SIZE",
+        prefill_token_sizes = parser.add_mutually_exclusive_group()
+        prefill_token_sizes.add_argument(
+            "--prefill-graph-capture-token-sizes",
+            dest="prefill_graph_capture_sizes",
+            metavar="TOKENS",
             type=int,
             nargs="+",
-            help="Explicit list of token-bucket sizes to capture for the "
-            "breakable prefill graph (like --cudagraph-capture-sizes for "
-            "decode). Unset: a relative-stride ladder bounding padded compute "
-            "at ~12.5%% of any size.",
+            help="Total input-token capacities per forward, summed across the "
+            "batch; not per-request sequence lengths. Shorter inputs are padded. "
+            "For pure prefill, count newly computed tokens, excluding cached "
+            "prefixes. Unset: a relative-stride ladder with ~12.5%% spacing, "
+            "subject to a 16-token minimum step and a 512-token maximum step.",
+        )
+        prefill_token_sizes.add_argument(
+            "--prefill-graph-capture-sizes",
+            dest="prefill_graph_capture_sizes",
+            metavar="TOKENS",
+            type=int,
+            nargs="+",
+            help="Compatibility alias for --prefill-graph-capture-token-sizes. "
+            "Specify only one spelling.",
+        )
+        parser.add_argument(
+            "--prefill-graph-capture-batch-sizes",
+            metavar="BS",
+            type=int,
+            nargs="+",
+            help="Exact request counts for inline prefill attention capture; "
+            "these are batch sizes, not maximum request capacities. "
+            "Unset: the minimum request count that fits each token bucket within "
+            "the model context. KDA uses fixed checkpoint slots, so each token "
+            "bucket needs one inline variant per configured request count. "
+            "Adding request counts increases capture time and memory. "
+            "This does not replace the scheduler's --max-num-seqs limit. "
+            "Other batch sizes retain the ordinary attention breaks.",
         )
         parser.add_argument(
             "--enable-nan-detection",

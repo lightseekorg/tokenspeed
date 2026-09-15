@@ -235,13 +235,26 @@ both cases and always returns outputs and final states; its caller writes the
 final states to the continuation blocks. Target verification remains separate.
 Every request in a checkpoint
 batch participates in the body: rows crossing a checkpoint stop at that
-boundary, while other rows run to completion. Only crossing rows enter the
-packed tail scan, initialized directly
-from their body final states. Body and tail outputs are scattered back to
-original token order, so every token is evaluated exactly once while the aligned
-and final states are both retained. Batch size one uses zero-copy body/tail
-views; larger batches use the same batched pack/scatter contract. This split
+boundary, while other rows run to completion. In the ordinary compact path,
+only crossing rows enter the packed tail scan, initialized directly
+from their body final states. Body and tail outputs are restored to original
+token order, so every valid token is evaluated exactly once while the aligned
+and final states are both retained. Ordinary batch size one uses zero-copy
+body/tail views and concatenates the outputs; larger compact batches pack
+inputs and scatter outputs. Inline capacity graphs pack even one request
+because its live boundary cannot be encoded as a capture-time Python slice.
+They restore outputs with a shared inverse-map gather. Negative token indices
+make packing write zeros; negative inverse sources make gathering write zero
+output padding. GPU boundaries still determine the real tokens in each scan.
+This split
 does not change cache ownership or scheduler metadata.
+
+Merged capacity graphs may reserve a checkpoint/tail execution slot for every
+request, including requests with no internal checkpoint. Such an inactive
+slot has a negative checkpoint destination and output map; its dummy scan
+result cannot overwrite the body's final state. These slots are transient
+graph scratch, never new cache blocks or publishable checkpoints. The
+ordinary compact-tail path and the capacity path share masked state writers.
 
 The body/tail split uses the existing prefill-op state-layout contract. KDA
 solutions may retain their original K-major Python adapters; the kernel facade

@@ -45,9 +45,7 @@ if platform.is_nvidia:
     from flashinfer import (
         fp4_quantize,
         nvfp4_block_scale_interleave,
-        trtllm_fp4_block_scale_moe,
     )
-    from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices as maybe_get_cached_w3_w1_permute_indices,
     )
@@ -60,6 +58,10 @@ if platform.is_nvidia:
     from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
         _SITU_ACTIVATION_TYPE,
         _positive_situ_value,
+    )
+    from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
+        trtllm_fp4_block_scale_moe,
+        trtllm_fp4_block_scale_routed_moe,
     )
 
     def _flashinfer_trtllm_nvfp4_moe_weights(

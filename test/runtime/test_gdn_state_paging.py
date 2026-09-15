@@ -1516,6 +1516,7 @@ class TritonCheckpointContinuationTest(unittest.TestCase):
                     seq_len=n,
                     num_real_tokens=n,
                     cu_seqlens_cpu=bounds_cpu,
+                    inputs_packed=False,
                     **kwargs,
                 )
                 self.assertFalse(expected_state[0].is_contiguous())
@@ -1563,6 +1564,7 @@ class TritonCheckpointContinuationTest(unittest.TestCase):
                         seq_len=4,
                         num_real_tokens=4,
                         cu_seqlens_cpu=prefix_bounds,
+                        inputs_packed=False,
                         **body_kwargs,
                     )
                     torch.testing.assert_close(

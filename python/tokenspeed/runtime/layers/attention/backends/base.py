@@ -177,6 +177,22 @@ class AttentionBackend(CachePoolBinding, ABC):
         """Allocate static buffers the breakable prefill graphs bake.
         Default: no-op — attention stays eager at the break points."""
 
+    # Temporary execution state while a binding installs fixed metadata.
+    # bind() restores it on exit; this is neither a feature/capability flag
+    # nor a test of whether the current CUDA stream is capturing.
+    prefill_graph_inline: bool = False
+
+    def prepare_prefill_graph_bindings(self, bucket: int) -> list:
+        """Return stable metadata bindings for inline capture at `bucket`.
+
+        Each returned binding implements ``compatible(ctx)`` and the context
+        manager ``bind(refresh)``: False binds for warmup/capture, True refreshes
+        before live replay. The outer owner retains these bindings and buffers.
+        An empty list leaves attention at its ordinary break, including host
+        callbacks for layerwise transfer.
+        """
+        return []
+
     # ------------------------------------------------------------------
     # Metadata (docs/design/unified_path.md)
     # ------------------------------------------------------------------

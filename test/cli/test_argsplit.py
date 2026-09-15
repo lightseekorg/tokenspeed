@@ -118,7 +118,12 @@ def test_dp_sampling_routes_to_engine():
 
 def test_multi_value_capture_sizes_route_to_engine():
     """nargs='+' engine flags: every bare value belongs to the flag, not argv."""
-    for flag in ("--cudagraph-capture-sizes", "--prefill-graph-capture-sizes"):
+    for flag in (
+        "--cudagraph-capture-sizes",
+        "--prefill-graph-capture-sizes",
+        "--prefill-graph-capture-token-sizes",
+        "--prefill-graph-capture-batch-sizes",
+    ):
         r = _split([flag, "288", "320", "--dp-sampling"])
         assert r.engine == [flag, "288", "320", "--dp-sampling"]
         assert r.gateway == []

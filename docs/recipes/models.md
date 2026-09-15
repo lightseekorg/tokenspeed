@@ -855,7 +855,7 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
   --max-cudagraph-capture-size 4 \
   --cudagraph-capture-sizes 1 2 3 4 \
   --prefill-graph-max-tokens 256 \
-  --prefill-graph-capture-sizes 128 256 \
+  --prefill-graph-capture-token-sizes 128 256 \
   --host 127.0.0.1 \
   --port 8000
 ```
