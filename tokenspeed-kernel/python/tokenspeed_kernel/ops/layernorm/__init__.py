@@ -24,6 +24,9 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.layernorm.triton import (
+    gated_residual_combine_norm as _gated_residual_combine_norm,
+)
+from tokenspeed_kernel.ops.layernorm.triton import (
     grouped_gemma_rmsnorm as _grouped_gemma_rmsnorm,
 )
 from tokenspeed_kernel.ops.layernorm.triton import grouped_rmsnorm as _grouped_rmsnorm
@@ -156,4 +159,63 @@ def grouped_rmsnorm(
     return _grouped_rmsnorm(x, int(group_size), eps, out=out)
 
 
-__all__ = ["grouped_gemma_rmsnorm", "grouped_rmsnorm", "qk_rmsnorm", "rmsnorm"]
+def gated_residual_combine_norm(
+    block_output: torch.Tensor,
+    residual: torch.Tensor,
+    inject_logits: torch.Tensor,
+    weight: torch.Tensor,
+    hc_count: int,
+    hidden_size: int,
+    eps: float,
+    *,
+    preload_residual: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Inject a sublayer output and normalize each updated residual branch.
+
+    One CTA computes both outputs for one token and branch. The updated
+    residual is rounded to the input dtype before computing RMS statistics,
+    matching a standalone combine followed by grouped Gemma RMSNorm.
+
+    Args:
+        block_output: GPU sublayer output shaped ``[..., hidden_size]``.
+        residual: GPU residual streams shaped ``[..., hc_count * hidden_size]``.
+        inject_logits: Per-branch gate logits shaped ``[..., hc_count]``.
+            The injection multiplier is ``2 * sigmoid(inject_logits)``.
+        weight: Gemma weight offsets shaped ``[hc_count * hidden_size]`` or
+            ``[hidden_size]`` for weights shared across branches. The effective
+            norm multiplier is ``1 + weight``.
+        hc_count: Number of residual branches, greater than one.
+        hidden_size: Width of one branch and the RMS reduction size.
+        eps: Epsilon added to the per-branch mean square.
+        preload_residual: Whether residual and weight are already visible before
+            the current PDL producer starts. If true, load both before the PDL
+            wait; block output and injection logits are always read after it.
+
+    Returns:
+        Updated residual and normalized residual, both matching the residual
+        shape and dtype. Inputs are left unchanged.
+    """
+    if not residual.is_cuda:
+        raise ValueError("gated_residual_combine_norm requires GPU tensors")
+    if hc_count <= 1 or hidden_size <= 0:
+        raise ValueError("hc_count must exceed one and hidden_size must be positive")
+    if residual.ndim < 1 or residual.shape[-1] != hc_count * hidden_size:
+        raise ValueError("residual last dimension must equal hc_count * hidden_size")
+    return _gated_residual_combine_norm(
+        block_output,
+        residual,
+        inject_logits,
+        weight,
+        hidden_size,
+        eps,
+        preload_residual,
+    )
+
+
+__all__ = [
+    "gated_residual_combine_norm",
+    "grouped_gemma_rmsnorm",
+    "grouped_rmsnorm",
+    "qk_rmsnorm",
+    "rmsnorm",
+]
