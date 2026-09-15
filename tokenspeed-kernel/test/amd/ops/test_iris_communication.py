@@ -74,7 +74,8 @@ def _spawn_and_collect(worker_fn, args, world_size: int) -> None:
         raise RuntimeError("\n".join(f"Rank {r}: {e}" for r, e in error_dict.items()))
 
 
-def test_iris_state_uses_path_capacities(monkeypatch):
+@pytest.mark.parametrize("enable_lamport", [False, True])
+def test_iris_state_uses_path_capacities(monkeypatch, enable_lamport):
     from tokenspeed_kernel.ops.communication import triton as triton_ops
 
     created = []
@@ -94,6 +95,7 @@ def test_iris_state_uses_path_capacities(monkeypatch):
         max_bytes=64,
         attnres_max_numel=55,
         max_token_num=5,
+        enable_lamport=enable_lamport,
         device=torch.device("cpu"),
     )
 
@@ -103,11 +105,23 @@ def test_iris_state_uses_path_capacities(monkeypatch):
     assert iris_state.producer_direct_max_numel == 32
     assert iris_state.attnres_max_numel == 55
     assert iris_state.attnres_max_rows == 5
+    assert iris_state.enable_lamport is enable_lamport
     assert triton_ops._get_or_create_iris_state(state, torch.bfloat16) is iris_state
     assert len(created) == 1
 
+    state.enable_lamport = not enable_lamport
+    other = triton_ops._get_or_create_iris_state(state, torch.bfloat16)
+    assert other is not iris_state
+    assert other.enable_lamport is not enable_lamport
+    assert len(created) == 2
 
-def test_iris_state_reuses_prepared_capacity(monkeypatch):
+
+@pytest.mark.parametrize("prepared_lamport", [False, True])
+@pytest.mark.parametrize("requested_lamport", [False, True])
+@pytest.mark.parametrize("max_bytes", [0, 64])
+def test_iris_state_reuses_prepared_capacity(
+    monkeypatch, prepared_lamport, requested_lamport, max_bytes
+):
     from tokenspeed_kernel.ops.communication import triton as triton_ops
 
     group = object()
@@ -121,10 +135,11 @@ def test_iris_state_reuses_prepared_capacity(monkeypatch):
         producer_direct_max_numel=128,
         attnres_max_numel=32,
         attnres_max_rows=4,
+        enable_lamport=prepared_lamport,
     )
     iris_ops = SimpleNamespace(
         IRIS_AR_STATES={"prepared": prepared},
-        create_iris_state=lambda **_: pytest.fail("must reuse prepared state"),
+        create_iris_state=lambda **kwargs: SimpleNamespace(**kwargs),
     )
     monkeypatch.setitem(
         sys.modules, "tokenspeed_kernel.ops.communication.iris", iris_ops
@@ -133,13 +148,18 @@ def test_iris_state_reuses_prepared_capacity(monkeypatch):
         group=group,
         rank_in_group=0,
         max_numel=16,
-        max_bytes=64,
+        max_bytes=max_bytes,
         attnres_max_numel=8,
         max_token_num=1,
+        enable_lamport=requested_lamport,
         device=device,
     )
 
-    assert triton_ops._get_or_create_iris_state(state, torch.bfloat16) is prepared
+    actual = triton_ops._get_or_create_iris_state(state, torch.bfloat16)
+    can_reuse = max_bytes == 0 or prepared_lamport == requested_lamport
+    assert (actual is prepared) is can_reuse
+    if not can_reuse:
+        assert actual.enable_lamport is requested_lamport
 
 
 def test_iris_context_rejects_late_heap_growth(monkeypatch):
@@ -469,6 +489,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
         attnres_max_numel = attnres_max_rows * attnres_config.hidden_size
         staged_max_numel = max(staged_max_numel, attnres_max_numel)
         state = create_iris_state(
+            enable_lamport=False,
             group=dist.group.WORLD,
             rank_in_group=rank,
             staged_max_numel=staged_max_numel,
@@ -586,6 +607,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             )
 
         fp16_state = create_iris_state(
+            enable_lamport=False,
             group=dist.group.WORLD,
             rank_in_group=rank,
             staged_max_numel=0,
@@ -613,6 +635,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             )
 
         fp32_state = create_iris_state(
+            enable_lamport=False,
             group=dist.group.WORLD,
             rank_in_group=rank,
             staged_max_numel=0,
@@ -949,6 +972,7 @@ def _ar_subgroup_worker_fn(rank, world_size, port, error_dict):
         from tokenspeed_kernel.ops.communication.iris import create_iris_state
 
         state = create_iris_state(
+            enable_lamport=False,
             group=group,
             rank_in_group=group_rank,
             staged_max_numel=4 * 7,
