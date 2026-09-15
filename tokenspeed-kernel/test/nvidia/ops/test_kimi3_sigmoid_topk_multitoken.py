@@ -51,7 +51,7 @@ from tokenspeed_kernel.ops.moe import sigmoid_topk as sigmoid_topk_mod  # noqa: 
 from tokenspeed_kernel.ops.moe.triton.kimi3_sigmoid_topk import (  # noqa: E402
     kimi3_sigmoid_bias_topk,
 )
-from tokenspeed_kernel.ops.moe.triton.shared import (  # noqa: E402
+from tokenspeed_kernel.ops.moe.triton.minimax_topk import (  # noqa: E402
     minimax_biased_grouped_topk,
 )
 

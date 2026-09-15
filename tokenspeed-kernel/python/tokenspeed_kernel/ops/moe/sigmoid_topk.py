@@ -8,7 +8,7 @@ import torch
 from tokenspeed_kernel.ops.moe.triton.kimi3_sigmoid_topk import (
     kimi3_sigmoid_bias_topk,
 )
-from tokenspeed_kernel.ops.moe.triton.shared import minimax_biased_grouped_topk
+from tokenspeed_kernel.ops.moe.triton.minimax_topk import minimax_biased_grouped_topk
 from tokenspeed_kernel.platform import CapabilityRequirement, Platform, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel

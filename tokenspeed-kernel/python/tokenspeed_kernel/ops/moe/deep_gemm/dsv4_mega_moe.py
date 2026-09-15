@@ -51,7 +51,9 @@ if platform.is_blackwell:
         transform_sf_into_required_layout,
         transform_weights_for_mega_moe,
     )
-    from tokenspeed_kernel.ops.moe.triton.shared import stage_dsv4_mega_moe_inputs
+    from tokenspeed_kernel.ops.moe.deep_gemm._triton.stage import (
+        stage_dsv4_mega_moe_inputs,
+    )
 
 
 _MXFP4_BLOCK_SIZE = 32
