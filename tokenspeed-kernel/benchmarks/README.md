@@ -1,6 +1,6 @@
 # Registration-Level Kernel Benchmarks
 
-This directory contains versioned suites for measuring exact TokenSpeed kernel
+This directory contains suites for measuring exact TokenSpeed kernel
 registrations. The benchmark harness separates operation-specific input and
 correctness logic from shared device timing and result reporting.
 
@@ -51,8 +51,8 @@ result = harness.run(
         },
         solution=None,
         registration="gluon_bmm_a16w16_gfx950",
+        cold_cache=True,
         seed=42,
-        definition_version=1,
     )
 )
 ```
@@ -68,10 +68,14 @@ Input creation, selection, compilation, eager warmup, graph capture, replay
 warmup, correctness checks, and result serialization are outside the reported
 device time.
 
-Each measurement block times a captured graph containing `calls_per_graph`
-invocations, then reports time per invocation. Timing settings are part of the
-benchmark definition and must match across revisions before measurements can be
-compared.
+By default, each captured invocation clears the device caches immediately
+before the operation runs. Device events surround only the operation, so cache
+clearing is excluded from its reported time. A case can set `cold_cache` to
+`false` for hot-cache experiments.
+
+Each measurement block reports the mean device time across `calls_per_graph`
+invocations. Timing settings and cache mode are part of the benchmark definition
+and must match across revisions before measurements can be compared.
 
 The result contains the raw device-time samples, resolved registration, timing
 mode, and structured failure information. Suite-level comparison uses the
@@ -96,18 +100,28 @@ and tensor values are never serialized for cross-revision comparison.
 
 ## Suite Contract
 
-A versioned suite declares:
+A suite declares:
 
 - the required hardware vendor and architecture;
 - graph timing settings shared by its cases;
-- stable case IDs and definitions; and
+- stable case IDs, comparison epochs, and definitions; and
 - per-case relative regression, absolute regression, and noise limits.
 
-Compatible cases must have the same ID, definition, timing settings, resolved
-registration, and recorded hardware and runtime environment. Added and changed
-cases are reported but not compared. A baseline case missing from the candidate
-is also reported. If any otherwise-compatible run is too noisy, its result is
-inconclusive rather than a regression.
+`comparison_epoch` is an opaque equality token used only to decide whether
+baseline and candidate measurements are comparable. It has no ordering and
+creates no backward-compatibility requirement. Advance it when an operation's
+performance-relevant semantics change while retaining the same operation and
+case identity. For example, adding a consumer fusion without renaming the
+operation starts a new comparison epoch. Do not advance it for ordinary kernel
+implementation changes or benchmark harness and CI changes. Those kernel
+implementation changes are what the benchmark is intended to compare, while
+timing-infrastructure compatibility is represented and checked separately.
+
+Compatible cases must have the same ID, comparison epoch, definition, timing
+settings, resolved registration, and recorded hardware and runtime environment.
+Added and changed cases are reported but not compared. A baseline case missing
+from the candidate is also reported. If any otherwise-compatible run is too
+noisy, its result is inconclusive rather than a regression.
 
 Regression policy comes from the merge-base suite, so a candidate cannot weaken
 its own gate by changing a threshold. A benchmark is a regression only when its

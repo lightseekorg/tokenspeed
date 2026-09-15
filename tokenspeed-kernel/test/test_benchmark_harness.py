@@ -52,9 +52,16 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 class _FakeTimer:
     def __init__(self) -> None:
         self.calls = 0
+        self.cold_cache: list[bool] = []
 
-    def measure(self, prepared: PreparedInvocation) -> GraphMeasurement:
+    def measure(
+        self,
+        prepared: PreparedInvocation,
+        *,
+        cold_cache: bool,
+    ) -> GraphMeasurement:
         self.calls += 1
+        self.cold_cache.append(cold_cache)
         prepared.invoke()
         return GraphMeasurement(
             samples_us=(2.0, 3.0, 4.0),
@@ -77,8 +84,13 @@ class _FailingTimer:
     def __init__(self, phase: str) -> None:
         self.phase = phase
 
-    def measure(self, prepared: PreparedInvocation) -> GraphMeasurement:
-        _ = prepared
+    def measure(
+        self,
+        prepared: PreparedInvocation,
+        *,
+        cold_cache: bool,
+    ) -> GraphMeasurement:
+        _ = prepared, cold_cache
         cause = RuntimeError("timing failed")
         raise GraphBenchmarkError(self.phase, "timing failed", cause=cause)
 
@@ -104,8 +116,8 @@ def _request(family: str) -> BenchmarkRequest:
         parameters={"size": 8},
         solution="test_solution",
         registration=None,
+        cold_cache=True,
         seed=7,
-        definition_version=2,
     )
 
 
@@ -135,8 +147,8 @@ def test_request_selection_modes_and_parameter_copy():
         parameters=parameters,
         solution=None,
         registration=None,
+        cold_cache=True,
         seed=42,
-        definition_version=1,
     )
     solution = BenchmarkRequest(
         family="gemm",
@@ -144,8 +156,8 @@ def test_request_selection_modes_and_parameter_copy():
         parameters=parameters,
         solution="gluon",
         registration=None,
+        cold_cache=True,
         seed=42,
-        definition_version=1,
     )
     exact = BenchmarkRequest(
         family="gemm",
@@ -153,8 +165,8 @@ def test_request_selection_modes_and_parameter_copy():
         parameters=parameters,
         solution=None,
         registration="gluon_bmm",
+        cold_cache=False,
         seed=42,
-        definition_version=1,
     )
     parameters["size"] = 16
 
@@ -162,6 +174,8 @@ def test_request_selection_modes_and_parameter_copy():
     assert solution.selection_mode == "solution"
     assert exact.selection_mode == "registration"
     assert normal.parameters == {"size": 8}
+    assert normal.cold_cache is True
+    assert exact.cold_cache is False
 
 
 def test_request_rejects_ambiguous_selection() -> None:
@@ -172,8 +186,8 @@ def test_request_rejects_ambiguous_selection() -> None:
             {},
             solution="gluon",
             registration="exact",
+            cold_cache=True,
             seed=42,
-            definition_version=1,
         )
 
 
@@ -184,14 +198,16 @@ def test_request_requires_identity_and_selection_fields() -> None:
 
 def test_harness_returns_measurement_and_actual_registration():
     set_benchmark_generator("unit_success", "test", _prepared)
-    result = KernelBenchmarkHarness(
-        None, timer=_FakeTimer(), platform_provider=_platform
-    ).run(_request("unit_success"))
+    timer = _FakeTimer()
+    result = KernelBenchmarkHarness(None, timer=timer, platform_provider=_platform).run(
+        _request("unit_success")
+    )
 
     assert result.status is BenchmarkStatus.SUCCESS
     assert result.registration_name == "test_registration"
     assert result.solution == "test_solution"
     assert result.selection_mode == "solution"
+    assert result.cold_cache is True
     assert result.parameters == {"size": 8, "dtype": "test"}
     assert result.samples_us == (2.0, 3.0, 4.0)
     assert result.median_us == 3.0
@@ -202,6 +218,7 @@ def test_harness_returns_measurement_and_actual_registration():
     assert result.correctness is None
     assert result.to_dict()["status"] == "success"
     assert result.to_dict()["samples_us"] == [2.0, 3.0, 4.0]
+    assert timer.cold_cache == [True]
 
 
 def test_harness_routes_fresh_runs_to_each_output_validator() -> None:
@@ -444,8 +461,8 @@ def test_dense_bmm_rejects_invalid_generator_parameters(parameters, match):
         parameters=parameters,
         solution=None,
         registration=None,
+        cold_cache=True,
         seed=42,
-        definition_version=1,
     )
 
     with pytest.raises(BenchmarkCaseError, match=match) as raised:
@@ -574,8 +591,8 @@ def test_dense_bmm_uses_registered_reference_for_local_correctness(
             },
             solution=None,
             registration=candidate_spec.name,
+            cold_cache=True,
             seed=7,
-            definition_version=1,
         )
     )
 
@@ -665,8 +682,8 @@ def test_dense_bmm_validation_requires_a_compatible_registered_reference(
             },
             solution=None,
             registration=candidate_spec.name,
+            cold_cache=True,
             seed=42,
-            definition_version=1,
         )
     )
 
@@ -710,8 +727,8 @@ def test_exact_dense_bmm_rejects_incompatible_shape(
             parameters={"batch": 12, "M": 2, "N": 512, "K": 128},
             solution=None,
             registration="unit_exact_bmm",
+            cold_cache=True,
             seed=42,
-            definition_version=1,
         )
     )
 
@@ -749,8 +766,8 @@ def test_dense_bmm_solution_shape_miss_is_invalid_not_backend_unavailable(
             parameters={"batch": 12, "M": 2, "N": 512, "K": 128},
             solution="unit",
             registration=None,
+            cold_cache=True,
             seed=42,
-            definition_version=1,
         )
     )
 
@@ -774,8 +791,8 @@ def test_dense_bmm_missing_solution_reports_backend_unavailable(
             parameters={"batch": 12, "M": 1, "N": 512, "K": 128},
             solution="missing",
             registration=None,
+            cold_cache=True,
             seed=42,
-            definition_version=1,
         )
     )
 
@@ -821,8 +838,8 @@ def test_dense_bmm_gluon_registration_graph_replay(selection, selection_mode):
                 "dtype": "bfloat16",
                 "validation": {"runs": 3},
             },
+            cold_cache=True,
             seed=42,
-            definition_version=1,
             **selection,
         )
     )
