@@ -25,10 +25,10 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable
 
+import tokenspeed_triton as triton
+import tokenspeed_triton.language as tl
 import torch
 import torch.nn as nn
-import triton
-import triton.language as tl
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 from tokenspeed_kernel.ops.layernorm.triton import (
     fused_qk_rmsnorm_rope_gate,

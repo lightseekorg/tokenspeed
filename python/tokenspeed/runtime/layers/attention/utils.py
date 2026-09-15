@@ -18,8 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import triton
-import triton.language as tl
+import tokenspeed_triton as triton
+import tokenspeed_triton.language as tl
 
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,

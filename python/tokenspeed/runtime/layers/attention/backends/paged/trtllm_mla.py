@@ -28,8 +28,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import tokenspeed_triton as triton
 import torch
-import triton
 from tokenspeed_kernel.ops.attention.mha.flashinfer import (
     trtllm_batch_decode_with_kv_cache_mla,
     trtllm_ragged_attention_deepseek,

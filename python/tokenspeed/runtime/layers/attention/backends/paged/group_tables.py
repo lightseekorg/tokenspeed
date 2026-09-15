@@ -47,9 +47,9 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+import tokenspeed_triton as triton
+import tokenspeed_triton.language as tl
 import torch
-import triton
-import triton.language as tl
 
 from tokenspeed.runtime.layers.attention.backends.paged.write_locations import (
     decode_write_locations,

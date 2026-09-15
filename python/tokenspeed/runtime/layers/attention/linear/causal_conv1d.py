@@ -24,9 +24,9 @@
 # SOFTWARE.
 
 
+import tokenspeed_triton as triton
+import tokenspeed_triton.language as tl
 import torch
-import triton
-import triton.language as tl
 from tokenspeed_kernel.ops.attention.gdn.triton import (
     CausalConv1dPrefillMetadata,
 )

@@ -24,9 +24,9 @@ from __future__ import annotations
 
 from enum import IntEnum, auto
 
+import tokenspeed_triton as triton
+import tokenspeed_triton.language as tl
 import torch
-import triton
-import triton.language as tl
 
 
 class ForwardMode(IntEnum):

@@ -59,10 +59,10 @@ import numpy as np
 import psutil
 import pybase64
 import requests
+import tokenspeed_triton as triton
 import torch
 import torch.distributed
 import torch.distributed as dist
-import triton
 import zmq
 from PIL import Image
 from pydantic import BaseModel
