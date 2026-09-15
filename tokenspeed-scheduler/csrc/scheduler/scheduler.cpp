@@ -386,20 +386,19 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
 }
 
 std::size_t Scheduler::WaitingSize() const {
-    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const auto& request) {
-        return request->template Is<fsm::Submitted>() || request->template Is<fsm::Retracted>();
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->IsAnyOf<fsm::Submitted, fsm::Retracted>();
     }));
 }
 
 std::size_t Scheduler::DecodingSize() const {
-    return static_cast<std::size_t>(
-        std::ranges::count_if(requests_, [](const auto& request) { return request->template Is<fsm::Decoding>(); }));
+    return static_cast<std::size_t>(std::ranges::count_if(
+        requests_, [](const std::unique_ptr<Request>& request) { return request->Is<fsm::Decoding>(); }));
 }
 
 std::size_t Scheduler::PrefillSize() const {
-    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const auto& request) {
-        return request->template Is<fsm::Prefilling>() || request->template Is<fsm::RemotePrefilling>() ||
-               request->template Is<fsm::PrefillAwaitingResult>() || request->template Is<fsm::PrefillDone>();
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->IsAnyOf<fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillAwaitingResult, fsm::PrefillDone>();
     }));
 }
 
@@ -407,9 +406,7 @@ std::int32_t Scheduler::ActiveLcmBlocks() const {
     std::vector<std::span<const BlockTable>> request_tables;
     request_tables.reserve(requests_.size());
     for (const auto& request : requests_) {
-        if (!request->Is<fsm::Prefilling>() && !request->Is<fsm::RemotePrefilling>() &&
-            !request->Is<fsm::PrefillAwaitingResult>() && !request->Is<fsm::PrefillDone>() &&
-            !request->Is<fsm::Decoding>()) {
+        if (!request->HoldsPages()) {
             continue;
         }
         request_tables.emplace_back(request->BlockTablesRef());
@@ -444,8 +441,8 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     std::vector<Request*> candidates;
     candidates.reserve(requests_.size());
     for (const auto& request : requests_) {
-        if (request->Is<fsm::Submitted>() || request->Is<fsm::Prefilling>() || request->Is<fsm::RemotePrefilling>() ||
-            request->Is<fsm::PrefillDone>() || request->Is<fsm::Decoding>() || request->Is<fsm::Retracted>()) {
+        if (request->IsAnyOf<fsm::Submitted, fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillDone, fsm::Decoding,
+                             fsm::Retracted>()) {
             candidates.push_back(request.get());
         }
     }

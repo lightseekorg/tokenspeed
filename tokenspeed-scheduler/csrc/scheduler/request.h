@@ -111,6 +111,11 @@ public:
         return std::holds_alternative<State>(state_);
     }
 
+    template <typename... States>
+    bool IsAnyOf() const {
+        return (std::holds_alternative<States>(state_) || ...);
+    }
+
     template <typename State>
     const State* GetIf() const {
         return std::get_if<State>(&state_);
