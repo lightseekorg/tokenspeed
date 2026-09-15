@@ -1,6 +1,7 @@
 # Integrated K3 fused tail acceptance profile
 
-This default-off profile is **not yet qualified for serving performance**.
+This default-off profile has a completed single-pair serving measurement,
+not replicated performance or full-model numerical qualification.
 `TOKENSPEED_K3_INTEGRATED_FUSED_TAIL=1` enables both first-stage protocols and
 the same fused shared-RS/up-projection/residual/AG device pattern. It is mutually
 exclusive with the historical first-only, medium-only and endpoint-only flags.
@@ -45,9 +46,12 @@ One raw symmetric workspace and two 8192x7168 BF16 symmetric outputs are
 shared by sequential layers. Global layer-index parity selects the output;
 each layer still owns its weight-dependent launch cache. Both outputs together
 require 224 MiB, versus 10304 MiB for the original 92 per-layer outputs.
-This is a 10080 MiB allocation reduction, not yet a measured KV-capacity or
-serving-throughput improvement. The original two-batch campaign uses the old
-per-layer allocation and must not qualify this revised ownership policy.
+This is a 10080 MiB allocation reduction. The pooled serving measurement
+reports 51.00 GiB KV per GPU versus 51.58 GiB for same-run main, compared with
+40.97 GiB in the historical per-layer candidate. See the
+[serving results](../guides/kimi-k3-integrated-tail.md#serving-measurement).
+The original two-batch campaign uses the old per-layer allocation and does not
+qualify this revised ownership policy.
 
 The previous layer's output can remain the current residual, so one output
 would be unsafe. Two outputs keep it distinct from the current destination;
