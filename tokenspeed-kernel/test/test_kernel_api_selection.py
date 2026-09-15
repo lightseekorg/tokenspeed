@@ -1644,6 +1644,34 @@ def _attention_dsa_decode_fp8_e5m2_sparse_rank512() -> object:
     return _attention_dsa_decode_fp8_sparse_rank512(torch.float8_e5m2)
 
 
+def _attention_dsa_decode_glm53_flash_bf16_dense() -> object:
+    q = torch.empty((4, 16, 512), dtype=torch.bfloat16)
+    kv_cache = torch.empty((2051, 512), dtype=torch.bfloat16)
+    topk_slots = torch.empty((4, 2051), dtype=torch.int32)
+    topk_lens = torch.empty((4,), dtype=torch.int32)
+    return _attention_dsa_pkg.dsa_decode(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=None,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=2051,
+        qk_nope_head_dim=256,
+        kv_lora_rank=512,
+        qk_rope_head_dim=0,
+        softmax_scale=1.0,
+        page_size=64,
+        q_len_per_req=4,
+        logit_cap=0.0,
+        k_scale=1.0,
+        return_lse=False,
+        out=None,
+        override=None,
+        solution=None,
+        kv_seq_lens=None,
+    )
+
+
 def _attention_dsa_prefill() -> object:
     q = torch.empty((2, 8, 576), dtype=torch.bfloat16)
     sparse_kv_cache = torch.empty((64, 656), dtype=torch.uint8)
@@ -4353,9 +4381,41 @@ _CASES = [
         _is_cdna5,
         "cdna5",
         "attention",
+        "dsa_decode_glm53_flash_bf16_dense",
+        "gluon_dsa_decode_gfx1250",
+        _attention_dsa_decode_glm53_flash_bf16_dense,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
         "dsa_prefill",
         "gluon_dsa_prefill_gfx1250",
         _attention_dsa_prefill,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsa_prefill_glm53_flash_bf16_dense",
+        "gluon_dsa_prefill_gfx1250",
+        _attention_dsa_prefill_glm53_flash_bf16_dense,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsa_prefill_glm53_flash_fp8_dense",
+        "gluon_dsa_prefill_fp8_dense_gfx1250",
+        _attention_dsa_prefill_glm53_flash_fp8_dense,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsa_prefill_glm53_flash_fp8_e5m2_dense",
+        "gluon_dsa_prefill_fp8_dense_gfx1250",
+        _attention_dsa_prefill_glm53_flash_fp8_e5m2_dense,
     ),
     _case(
         _is_cdna5,
