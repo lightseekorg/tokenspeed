@@ -545,6 +545,8 @@ class ModelExecutor:
             self.forward_step.capture()
         if not self.prefill_graph.disable:
             self.prefill_graph.capture(self.forward_step)
+            if self.drafter is not None:
+                self.drafter.capture_prefill_graph(self.forward_step.stream)
 
     def _autotune(self) -> None:
         """Profile tunable kernels over one dummy prefill before graph capture.
