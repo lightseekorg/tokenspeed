@@ -46,7 +46,7 @@ public:
     PrefixTestGroup(std::int32_t block_granularity, std::int32_t cache_blocks_per_lcm_block, std::uint32_t group_id,
                     std::int32_t sliding_window)
         : geometry_{block_granularity},
-          allocator_{cache_blocks_per_lcm_block, group_id},
+          allocator_{cache_blocks_per_lcm_block, group_id, /*shard_count=*/1},
           index_{group_id},
           sliding_window_{sliding_window} {}
 

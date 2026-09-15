@@ -120,7 +120,7 @@ void ExpectSwaWindowIntact(const PrefixMatch& m, std::int32_t window, std::int32
 
 TEST(CacheGroupTest, HoldsSpecGroupIdManager) {
     BlockPool pool(8, {1});
-    auto mgr = std::make_unique<GroupAllocator>(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/7);
+    auto mgr = std::make_unique<GroupAllocator>(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/7, /*shard_count=*/1);
     CacheGroup g(
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
@@ -312,7 +312,7 @@ TEST(CacheCoordinatorTest, RejectsManagerGeometryThatDiffersFromDomainOrSpec) {
     wrong_p.emplace_back(
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 48},
-        std::make_unique<GroupAllocator>(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0),
+        std::make_unique<GroupAllocator>(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1),
         std::make_unique<FullAttnMatcher>());
     EXPECT_THROW(CacheCoordinator(std::move(wrong_p), /*prefix_granularity=*/128, pool, /*host_pool=*/nullptr,
                                   /*stream_device_cache_to_host=*/false),
@@ -322,10 +322,26 @@ TEST(CacheCoordinatorTest, RejectsManagerGeometryThatDiffersFromDomainOrSpec) {
     wrong_k.emplace_back(
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 8, .block_granularity = 128},
-        std::make_unique<GroupAllocator>(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0),
+        std::make_unique<GroupAllocator>(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1),
         std::make_unique<FullAttnMatcher>());
     EXPECT_THROW(CacheCoordinator(std::move(wrong_k), /*prefix_granularity=*/128, pool, /*host_pool=*/nullptr,
                                   /*stream_device_cache_to_host=*/false),
+                 std::runtime_error);
+
+    // A spec sharded across two owners while its allocator balances nothing
+    // would silently disable placement balancing; both must agree.
+    BlockPool sharded_pool(8, {2});
+    std::vector<CacheGroup> wrong_shards;
+    wrong_shards.emplace_back(
+        CacheGroupSpec{.kind = AttnKind::kFull,
+                       .sliding_window = 0,
+                       .cache_blocks_per_lcm_block = 2,
+                       .block_granularity = 128,
+                       .shard_count = 2},
+        std::make_unique<GroupAllocator>(/*cache_blocks_per_lcm_block=*/2, /*group_id=*/0, /*shard_count=*/1),
+        std::make_unique<FullAttnMatcher>());
+    EXPECT_THROW(CacheCoordinator(std::move(wrong_shards), /*prefix_granularity=*/128, sharded_pool,
+                                  /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false),
                  std::runtime_error);
 }
 
@@ -336,7 +352,7 @@ TEST(CacheCoordinatorTest, RejectsManagerGroupIdThatDiffersFromItsIndex) {
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 128},
         std::make_unique<GroupAllocator>(/*cache_blocks_per_lcm_block=*/1,
-                                         /*group_id=*/1),
+                                         /*group_id=*/1, /*shard_count=*/1),
         std::make_unique<FullAttnMatcher>());
 
     EXPECT_THROW(CacheCoordinator(std::move(groups), /*prefix_granularity=*/128, pool, /*host_pool=*/nullptr,

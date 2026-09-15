@@ -494,9 +494,9 @@ class RunnerSignatureConformanceTest(_TorchCase):
     )
 
     def test_init_forward_metadata_binds_the_runner_call_shape(self):
-        """The runner's extend call: five positionals, then block_tables and
-        the five extend fields as required keywords (no defaults anywhere),
-        plus the model-side extras a node may ignore."""
+        """The runner's extend call: five positionals, then block_tables with
+        its CPU mirror and the five extend fields as required keywords (no
+        defaults anywhere), plus the model-side extras a node may ignore."""
         import importlib
         import inspect
 
@@ -517,6 +517,7 @@ class RunnerSignatureConformanceTest(_TorchCase):
                         None,
                         None,
                         block_tables={},
+                        block_tables_cpu={},
                         extend_seq_lens=None,
                         extend_seq_lens_cpu=None,
                         extend_prefix_lens=None,

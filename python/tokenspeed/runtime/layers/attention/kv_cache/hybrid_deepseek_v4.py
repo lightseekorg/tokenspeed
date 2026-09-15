@@ -7,9 +7,16 @@
 # copies of the Software, and to permit persons to whom the Software is
 # furnished to do so, subject to the following conditions:
 #
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 from __future__ import annotations
 
@@ -21,19 +28,26 @@ from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_compact_compressed_slot_mapping,
     dsv4_compressed_slot_mapping,
 )
+from tokenspeed_kernel.ops.kvcache.triton_virtual_blocks import virtual_slots_to_local
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
+    V4_INDEXER_KV_GROUP_ID,
     V4_KERNEL_BLOCK_ROWS,
     V4_SWA_KV_GROUP_ID,
     DeepseekV4CacheLayout,
+    parse_v4_compressed_kv_group_id,
     parse_v4_compressor_state_group_id,
     v4_compressed_kv_group_id,
+    v4_compressed_rows_per_page,
     v4_compressor_state_group_id,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    CacheRuntimeContract,
+)
 from tokenspeed.runtime.layers.attention.page_table import (
     mask_invalid_graph_tokens as _mask_invalid_graph_tokens,
 )
@@ -56,15 +70,32 @@ def _compressed_boundary_mask(
 
 @dataclass
 class DeepseekV4CacheMetadata:
+    """Scheduler block tables of one batch plus their rank-local read views.
+
+    ``block_tables`` hold the scheduler's virtual block IDs. Writers translate
+    through :meth:`local_compressed_write_slots`; attention reads the tables
+    :meth:`refresh_page_tables` derives from them, in which the null
+    block and every page another DCP rank owns are ``-1``. A replicated group
+    (``shard_count == 1``) translates to itself, so the same path serves every
+    DCP size.
+    """
+
     page_size: int
     page_table: torch.Tensor
+    dcp_size: int
+    dcp_rank: int
+    runtime_contract: CacheRuntimeContract
     block_tables: dict[str, torch.Tensor] = field(default_factory=dict)
     swa_page_table: torch.Tensor | None = None
     compressor_state_block_tables: dict[int, torch.Tensor] = field(default_factory=dict)
     indexer_state_block_table: torch.Tensor | None = None
-    decode_compressed_slot_mappings: dict[tuple[int, int], torch.Tensor] = field(
+    # Keyed by (compress_ratio, indexer, kv_cache_block_size).
+    decode_compressed_slot_mappings: dict[tuple[int, bool, int], torch.Tensor] = field(
         default_factory=dict
     )
+    # Local read tables per compressed group; refreshed in place so CUDA
+    # graphs keep their captured pointers.
+    compressed_page_tables: dict[str, torch.Tensor] = field(default_factory=dict)
 
     @classmethod
     def from_group_tables(
@@ -73,6 +104,9 @@ class DeepseekV4CacheMetadata:
         page_size: int,
         page_table: torch.Tensor,
         block_tables: dict[str, torch.Tensor],
+        dcp_size: int,
+        dcp_rank: int,
+        runtime_contract: CacheRuntimeContract,
     ) -> "DeepseekV4CacheMetadata":
         """Bind the cache-group tables and name the V4-specific ones.
 
@@ -82,6 +116,10 @@ class DeepseekV4CacheMetadata:
             block_tables: Cache-group tables keyed by group id; the SWA,
                 per-ratio compressor-state and indexer-state groups are
                 also exposed under their V4 names. Unknown ids ride along.
+            dcp_size: Owners of each sharded group's virtual blocks.
+            dcp_rank: This process's position among those owners.
+            runtime_contract: The bound arena's contract; its virtual block
+                counts bound every translation.
 
         Returns:
             The metadata over exactly these tensors (no copies).
@@ -94,6 +132,9 @@ class DeepseekV4CacheMetadata:
         return cls(
             page_size=page_size,
             page_table=page_table,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            runtime_contract=runtime_contract,
             block_tables=block_tables,
             swa_page_table=block_tables.get(V4_SWA_KV_GROUP_ID),
             compressor_state_block_tables=compressor_state,
@@ -102,16 +143,108 @@ class DeepseekV4CacheMetadata:
             ),
         )
 
+    def slice_requests(self, start: int, end: int) -> "DeepseekV4CacheMetadata":
+        """Views over request rows ``[start, end)`` of every table, read views included."""
+        sliced = DeepseekV4CacheMetadata.from_group_tables(
+            page_size=self.page_size,
+            page_table=self.page_table[start:end],
+            block_tables={
+                key: table[start:end] for key, table in self.block_tables.items()
+            },
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
+            runtime_contract=self.runtime_contract,
+        )
+        sliced.compressed_page_tables = {
+            group_id: table[start:end]
+            for group_id, table in self.compressed_page_tables.items()
+        }
+        return sliced
+
+    def refresh_page_tables(self) -> None:
+        """Translate every compressed group's table to local pages, in place.
+
+        Pages this rank does not own and the virtual null block become ``-1``.
+        Output buffers are reused whenever their geometry matches, so a table
+        captured into a CUDA graph is refreshed rather than replaced.
+        """
+        for group_id, table in self.block_tables.items():
+            if parse_v4_compressed_kv_group_id(group_id) is None:
+                continue
+            out = self.compressed_page_tables.get(group_id)
+            if out is not None and (
+                out.shape != table.shape
+                or out.dtype != table.dtype
+                or out.device != table.device
+            ):
+                out = None
+            if out is None:
+                # Replay setup may run outside the warmup inference context.
+                with torch.inference_mode(False):
+                    out = torch.empty_like(table, memory_format=torch.contiguous_format)
+            local, owned = virtual_slots_to_local(
+                table,
+                rows_per_page=1,
+                virtual_block_count=self.runtime_contract.virtual_block_counts[
+                    group_id
+                ],
+                degree=self.dcp_size,
+                rank=self.dcp_rank,
+                out=out,
+            )
+            local.masked_fill_(~owned, -1)
+            self.compressed_page_tables[group_id] = local
+
     def compressed_page_table(self, compress_ratio: int) -> torch.Tensor:
+        """The local read table :meth:`refresh_page_tables` prepared."""
+        return self.compressed_page_tables[v4_compressed_kv_group_id(compress_ratio)]
+
+    def compressed_block_table(self, compress_ratio: int) -> torch.Tensor:
+        """The scheduler's virtual table for one compressed KV group."""
         if compress_ratio <= 1:
             return self.page_table
-        table = self.block_tables.get(v4_compressed_kv_group_id(compress_ratio))
+        return self._group_table(v4_compressed_kv_group_id(compress_ratio))
+
+    def indexer_block_table(self) -> torch.Tensor:
+        """The scheduler's table for the replicated indexer K group."""
+        return self._group_table(V4_INDEXER_KV_GROUP_ID)
+
+    def _group_table(self, group_id: str) -> torch.Tensor:
+        table = self.block_tables.get(group_id)
         if table is None:
             raise RuntimeError(
-                "DeepSeek V4 missing cache-group block table for compressed "
-                f"KV group {v4_compressed_kv_group_id(compress_ratio)!r}"
+                f"DeepSeek V4 missing cache-group block table for group {group_id!r}"
             )
         return table
+
+    def _slot_table(self, compress_ratio: int, *, indexer: bool) -> torch.Tensor:
+        """The virtual table slot mappings for ``compress_ratio`` derive from."""
+        if indexer:
+            return self.indexer_block_table()
+        return self.compressed_block_table(compress_ratio)
+
+    def local_compressed_write_slots(
+        self, slots: torch.Tensor, compress_ratio: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Translate virtual compressed-KV slots to local slots and a write mask.
+
+        Args:
+            slots: Virtual slots from :meth:`compressed_slot_mapping`; ``-1``
+                marks a token that writes nothing.
+            compress_ratio: The compressed KV group the slots address.
+
+        Returns:
+            Local slots, with unowned and masked tokens parked on slot 0, and
+            the mask that is True only where this rank owns the row.
+        """
+        group_id = v4_compressed_kv_group_id(compress_ratio)
+        return virtual_slots_to_local(
+            slots,
+            rows_per_page=v4_compressed_rows_per_page(compress_ratio),
+            virtual_block_count=self.runtime_contract.virtual_block_counts[group_id],
+            degree=self.dcp_size,
+            rank=self.dcp_rank,
+        )
 
     def _update_decode_compressed_slot_mapping(
         self,
@@ -120,11 +253,12 @@ class DeepseekV4CacheMetadata:
         query_start_loc: torch.Tensor,
         seq_lens: torch.Tensor,
         compress_ratio: int,
+        indexer: bool,
         kv_cache_block_size: int,
-        is_valid_token: torch.Tensor | None = None,
+        is_valid_token: torch.Tensor | None,
     ) -> torch.Tensor:
         num_tokens = token_to_req_indices.shape[0]
-        key = (compress_ratio, kv_cache_block_size)
+        key = (compress_ratio, indexer, kv_cache_block_size)
         out = self.decode_compressed_slot_mappings.get(key)
         if out is None or out.shape[0] < num_tokens or out.device != seq_lens.device:
             if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
@@ -136,9 +270,9 @@ class DeepseekV4CacheMetadata:
                 out = torch.empty(num_tokens, dtype=torch.int64, device=seq_lens.device)
             self.decode_compressed_slot_mappings[key] = out
 
-        page_table = self.compressed_page_table(compress_ratio)
+        page_table = self._slot_table(compress_ratio, indexer=indexer)
         if page_table is not self.page_table:
-            return dsv4_compact_compressed_slot_mapping(
+            mapping = dsv4_compact_compressed_slot_mapping(
                 num_tokens=num_tokens,
                 token_to_req_indices=token_to_req_indices,
                 query_start_loc=query_start_loc,
@@ -150,6 +284,10 @@ class DeepseekV4CacheMetadata:
                 is_valid_token=is_valid_token,
                 out=out,
             )
+            # The fused mapper permits page 0 during warmup; the virtual null
+            # block has no owner and must never be written.
+            mapping.masked_fill_(mapping < kv_cache_block_size, -1)
+            return mapping
 
         mapping = dsv4_compressed_slot_mapping(
             num_tokens=num_tokens,
@@ -172,7 +310,7 @@ class DeepseekV4CacheMetadata:
         seq_lens: torch.Tensor,
         is_valid_token: torch.Tensor | None = None,
     ) -> None:
-        for compress_ratio, kv_cache_block_size in list(
+        for compress_ratio, indexer, kv_cache_block_size in list(
             self.decode_compressed_slot_mappings
         ):
             self._update_decode_compressed_slot_mapping(
@@ -180,6 +318,7 @@ class DeepseekV4CacheMetadata:
                 query_start_loc=query_start_loc,
                 seq_lens=seq_lens,
                 compress_ratio=compress_ratio,
+                indexer=indexer,
                 kv_cache_block_size=kv_cache_block_size,
                 is_valid_token=is_valid_token,
             )
@@ -192,20 +331,40 @@ class DeepseekV4CacheMetadata:
         token_to_req_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         seq_lens: torch.Tensor,
+        indexer: bool,
         kv_cache_block_size: int | None = None,
         use_decode_cache: bool = False,
         is_valid_token: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Virtual slots each token writes in a compressed group, ``-1`` for none.
+
+        Args:
+            positions: Token positions in their requests.
+            compress_ratio: Compression ratio of the group being written.
+            token_to_req_indices: Request row of each token.
+            query_start_loc: Cumulative query lengths per request.
+            seq_lens: Sequence length per request.
+            indexer: Address the replicated indexer K group instead of the
+                compressed KV group of ``compress_ratio``.
+            kv_cache_block_size: Rows per page of the addressed group.
+            use_decode_cache: Serve decode batches from the persistent
+                per-group mapping buffers.
+            is_valid_token: Graph padding mask; padded tokens write nothing.
+
+        Returns:
+            Int64 virtual slots, one per token. Compressed KV callers pass them
+            through :meth:`local_compressed_write_slots` before writing.
+        """
         if kv_cache_block_size is None:
             kv_cache_block_size = self.page_size
-        page_table = self.compressed_page_table(compress_ratio)
+        page_table = self._slot_table(compress_ratio, indexer=indexer)
         if (
             use_decode_cache
             and positions.is_cuda
             and (page_table.is_cuda or self.page_table.is_cuda)
         ):
             cached = self.decode_compressed_slot_mappings.get(
-                (compress_ratio, kv_cache_block_size)
+                (compress_ratio, indexer, kv_cache_block_size)
             )
             if (
                 cached is not None
@@ -218,6 +377,7 @@ class DeepseekV4CacheMetadata:
                 query_start_loc=query_start_loc,
                 seq_lens=seq_lens,
                 compress_ratio=compress_ratio,
+                indexer=indexer,
                 kv_cache_block_size=kv_cache_block_size,
                 is_valid_token=is_valid_token,
             )
@@ -235,7 +395,8 @@ class DeepseekV4CacheMetadata:
         else:
             page_ids = _safe_page_ids(page_table, req_idx, page_indices.long())
         slots = page_ids.to(torch.int64) * kv_cache_block_size + offsets
-        valid_slots = (page_ids >= 0) & _compressed_boundary_mask(
+        # Page 0 is the null block: never a write target.
+        valid_slots = (page_ids >= 1) & _compressed_boundary_mask(
             positions,
             compress_ratio,
         )
@@ -250,12 +411,12 @@ class DeepseekV4CacheMetadata:
 class HybridDeepseekV4TokenToKVPool(CachePool):
     """DeepSeek V4 fp8_ds_mla cache pool: one layer window over the arena.
 
-    The SWA, compressed-KV, compressor-state and CSA indexer-state caches are
-    each a cache group of the one shared arena (the V4 recipe declares them;
-    the scheduler addresses them as ``CacheGroup``s), and this view binds
-    their planes per layer. The ``indexer_kv_buffer`` shares its page table
-    and page-count budget with the ``v4.c{ratio}a.compressed_kv`` group
-    rather than owning a separate group of its own.
+    The SWA, compressed-KV, compressor-state, CSA indexer K and indexer-state
+    caches are each a cache group of the one shared arena (the V4 recipe
+    declares them; the scheduler addresses them as ``CacheGroup``s), and this
+    view binds their planes per layer. Only the compressed-KV groups may be
+    sharded across DCP ranks; the indexer reads every rank's rows, so its K
+    stays a replicated group of its own.
     """
 
     def __init__(

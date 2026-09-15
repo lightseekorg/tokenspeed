@@ -156,4 +156,19 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
             csrc
             tests/cpp
     )
+
+    add_executable(tokenspeed_scheduler_block_pool_benchmark
+        tests/cpp/benchmark_block_pool.cpp
+    )
+
+    target_link_libraries(tokenspeed_scheduler_block_pool_benchmark
+        PRIVATE
+            tokenspeed_scheduler_core
+    )
+
+    target_include_directories(tokenspeed_scheduler_block_pool_benchmark
+        PRIVATE
+            csrc
+            tests/cpp
+    )
 endif()

@@ -545,6 +545,9 @@ class PrefillGraph:
                 cache_metadata.tables(active_forward_op=dummy_forward_op)
             )
             extra_metadata_kwargs["block_tables"] = group_tables
+            extra_metadata_kwargs["block_tables_cpu"] = dict(
+                cache_metadata.tables_cpu(active_forward_op=dummy_forward_op)
+            )
         self.attn_backend.init_forward_metadata(
             bs=bs,
             num_extends=bs,

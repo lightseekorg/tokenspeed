@@ -797,7 +797,11 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
         device="cpu",
         attn_tp_size=1,
         data_parallel_size=2,
-        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, dp_size=2)),
+        mapping=SimpleNamespace(
+            attn=SimpleNamespace(
+                tp_size=1, dp_size=2, dcp_size=1, dcp_rank=0, dcp_group=(0,)
+            )
+        ),
         prefix_granularity=128,
         spec_context_pad=2 * verify_width,
         max_num_seqs=4,

@@ -44,6 +44,9 @@ from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     DeepseekV4CacheMetadata,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    CacheRuntimeContract,
+)
 
 
 class DeepseekV4GraphBuffers:
@@ -64,6 +67,8 @@ class DeepseekV4GraphBuffers:
         block_tables: per-group persistent tables (allocated by the
             backend's contract configuration through
             :meth:`allocate_group_tables`).
+        dcp_size / dcp_rank / runtime_contract: the virtual-block placement
+            every cache view translates through.
     """
 
     def __init__(
@@ -73,8 +78,14 @@ class DeepseekV4GraphBuffers:
         max_tokens_per_req: int,
         max_num_pages: int,
         device: torch.device | str,
+        dcp_size: int,
+        dcp_rank: int,
+        runtime_contract: CacheRuntimeContract,
     ) -> None:
         self.max_bs = max_bs
+        self.dcp_size = dcp_size
+        self.dcp_rank = dcp_rank
+        self.runtime_contract = runtime_contract
         self.max_tokens_per_req = max(1, int(max_tokens_per_req))
         max_tokens = max_bs * self.max_tokens_per_req
         self.device = device
@@ -149,6 +160,9 @@ class DeepseekV4GraphBuffers:
                 page_size=kernel_page_size,
                 page_table=self.page_table[:bs, :max_num_pages],
                 block_tables={gid: buf[:bs] for gid, buf in self.block_tables.items()},
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
+                runtime_contract=self.runtime_contract,
             ),
             is_valid_token=self.is_valid_token[:total_tokens],
             seq_lens_cpu=None,

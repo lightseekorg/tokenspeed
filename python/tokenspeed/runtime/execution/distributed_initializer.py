@@ -166,6 +166,9 @@ class DistributedInitializer:
         )
         pg_manager.init_process_group(config.mapping.world_group)
         pg_manager.init_process_group(config.mapping.attn.tp_group)
+        # A DCP group of one is still the group the decode path collectives
+        # address; init_process_group is idempotent and handles size 1.
+        pg_manager.init_process_group(config.mapping.attn.dcp_group)
         pg_manager.init_process_group(config.mapping.attn.dp_group)
         # No-op at the default linear_attn.tp == attn.tp (same group,
         # idempotent).
