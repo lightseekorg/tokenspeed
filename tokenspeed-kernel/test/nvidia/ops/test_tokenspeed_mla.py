@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import math
 import os
-import platform
 import subprocess
 import sys
 import textwrap
@@ -49,12 +48,12 @@ QK_ROPE = 64
 V_HEAD = 128
 
 # (is_causal, return_lse) variants exposed by tokenspeed_mla_prefill.
-PREFILL_BINARY_VARIANT_FLAGS = [
+PREFILL_VARIANT_FLAGS = [
     (causal, lse) for causal in (False, True) for lse in (False, True)
 ]
 
 # (seq_lens_q, seq_lens_k, h_q, h_k) — varlen problem layouts.
-PREFILL_BINARY_SHAPE_CASES = [
+PREFILL_SHAPE_CASES = [
     ((64, 128, 32), (64, 128, 32), 8, 8),
     ((128, 256, 96), (128, 256, 96), 128, 128),
     ((990,), (990,), 128, 128),
@@ -77,14 +76,6 @@ def _make_kv_slice_inputs(device: str, dtype: torch.dtype = torch.bfloat16):
     return k_nope, k_pe, v
 
 
-def _host_arch() -> str:
-    return {
-        "amd64": "x86_64",
-        "arm64": "aarch64",
-        "x64": "x86_64",
-    }.get(platform.machine().lower(), platform.machine().lower())
-
-
 def _prefill_shape_id(case) -> str:
     seq_lens_q, seq_lens_k, h_q, h_k = case
     return f"sQ{sum(seq_lens_q)}_sK{sum(seq_lens_k)}_hq{h_q}_hk{h_k}"
@@ -93,21 +84,6 @@ def _prefill_shape_id(case) -> str:
 def _prefill_variant_id(flags: tuple[bool, bool]) -> str:
     causal, lse = flags
     return ("causal" if causal else "nocausal") + ("_lse" if lse else "")
-
-
-def _require_mla_binary_prefill():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA GPU is required for tokenspeed-mla binary prefill")
-
-    import tokenspeed_mla.fmha_binary as fmha_binary
-
-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    expected_suffix = f"sm_{props.major}{props.minor}a_{_host_arch()}.so"
-    so_path = fmha_binary._resolve_so_path()
-    if not so_path.exists():
-        pytest.skip(f"tokenspeed-mla binary prefill SO not found: {so_path}")
-    assert so_path.name.endswith(expected_suffix)
-    return fmha_binary, so_path
 
 
 def _reference(k_nope, k_pe, v, k_scale_inv, v_scale_inv, fp8_dtype):
@@ -155,36 +131,23 @@ def _prefill_reference(
     return torch.cat(outputs, dim=0).to(torch.bfloat16), torch.cat(lses, dim=0)
 
 
-def test_binary_prefill_so_loads() -> None:
-    fmha_binary, so_path = _require_mla_binary_prefill()
-
-    module = fmha_binary._load_module(str(so_path))
-
-    assert getattr(module, fmha_binary._FUNC_NAMES[(False, False)], None) is not None
-    assert fmha_binary.has_binary_prefill()
-
-
 @pytest.mark.parametrize(
     "shape_case",
-    PREFILL_BINARY_SHAPE_CASES,
-    ids=[_prefill_shape_id(case) for case in PREFILL_BINARY_SHAPE_CASES],
+    PREFILL_SHAPE_CASES,
+    ids=[_prefill_shape_id(case) for case in PREFILL_SHAPE_CASES],
 )
 @pytest.mark.parametrize(
     "variant_flags",
-    PREFILL_BINARY_VARIANT_FLAGS,
-    ids=[_prefill_variant_id(flags) for flags in PREFILL_BINARY_VARIANT_FLAGS],
+    PREFILL_VARIANT_FLAGS,
+    ids=[_prefill_variant_id(flags) for flags in PREFILL_VARIANT_FLAGS],
 )
-def test_kernel_tokenspeed_mla_prefill_binary_e2e(
-    device: str, monkeypatch, shape_case, variant_flags: tuple[bool, bool]
+def test_kernel_tokenspeed_mla_prefill_e2e(
+    device: str, shape_case, variant_flags: tuple[bool, bool]
 ) -> None:
     is_causal, return_lse = variant_flags
 
-    _require_mla_binary_prefill()
-
-    import tokenspeed_mla.mla_prefill as mla_prefill
-
-    monkeypatch.setattr(mla_prefill, "_PREFILL_BACKEND_ENV", "binary")
-    mla_prefill._resolve_backend.cache_clear()
+    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
+        pytest.skip("tokenspeed-mla prefill requires Blackwell SM100/SM103")
 
     seq_lens_q, seq_lens_k, h_q, h_k = shape_case
     total_q = sum(seq_lens_q)
@@ -223,23 +186,22 @@ def test_kernel_tokenspeed_mla_prefill_binary_e2e(
     ).to(torch.float8_e4m3fn)
     softmax_scale = 1.0 / math.sqrt(QK_NOPE + QK_ROPE)
 
-    try:
-        actual = kernel_mla.tokenspeed_mla_prefill(
-            query,
-            key,
-            value,
-            torch.tensor(seq_lens_k, device=device, dtype=torch.int32),
-            cum_seq_lens_k,
-            max(seq_lens_k),
-            batch_size=len(seq_lens_k),
-            softmax_scale=softmax_scale,
-            is_causal=is_causal,
-            return_lse=return_lse,
-            cum_seq_lens_q=cum_seq_lens_q,
-            max_seq_len_q=max(seq_lens_q),
-        )
-    finally:
-        mla_prefill._resolve_backend.cache_clear()
+    actual = kernel_mla.tokenspeed_mla_prefill(
+        query,
+        key,
+        value,
+        torch.tensor(seq_lens_k, device=device, dtype=torch.int32),
+        cum_seq_lens_k,
+        max(seq_lens_k),
+        batch_size=len(seq_lens_k),
+        softmax_scale=softmax_scale,
+        is_causal=is_causal,
+        return_lse=return_lse,
+        cum_seq_lens_q=cum_seq_lens_q,
+        max_seq_len_q=max(seq_lens_q),
+        enable_pdl=False,
+        out=None,
+    )
     torch.cuda.synchronize()
 
     expected, expected_lse = _prefill_reference(
