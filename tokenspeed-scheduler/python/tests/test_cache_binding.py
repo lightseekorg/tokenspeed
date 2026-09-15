@@ -62,6 +62,14 @@ def test_cache_event_fields_are_bound():
     assert load_back.op_id == 8
 
 
+def test_atomic_spans_flat_round_trip_without_visibility_binding():
+    request = ts.RequestSpec()
+    request.atomic_spans_flat = [3, 9, 20, 24]
+
+    assert request.atomic_spans_flat == [3, 9, 20, 24]
+    assert not hasattr(request, "visibility_spans_flat")
+
+
 def test_execution_event_accepts_cache_events():
     execution_event = ExecutionEvent()
 

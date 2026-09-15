@@ -92,6 +92,25 @@ class DisaggDecodeExecutor:
         self._local_states[request_id] = TransferPoll.Bootstrapping
         self._bootstrap(request_id, bootstrap_info)
 
+    def _drop_request_state(self, request_id: str) -> None:
+        """Release every decode-side object owned by one request id."""
+        receiver = self.receivers.pop(request_id, None)
+        if receiver is not None:
+            receiver.clear()
+        self._local_states.pop(request_id, None)
+        self._request_pool_indices.pop(request_id, None)
+        self._remote_cache_slots.pop(request_id, None)
+        self._remote_spec_candidate_ids.pop(request_id, None)
+
+    def reject_at_admission(
+        self,
+        request_id: str,
+        _bootstrap_info: BootstrapInfo,
+        _reason: str,
+    ) -> None:
+        """Release a registered D-role request rejected by the scheduler."""
+        self._drop_request_state(request_id)
+
     def execute(self, op):
         """Pull this admitted prompt's KV from the prefill node.
 

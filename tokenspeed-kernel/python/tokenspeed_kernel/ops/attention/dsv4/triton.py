@@ -2781,16 +2781,20 @@ def _dsv4_combine_topk_swa_indices_kernel(
     query_start_loc_ptr,
     seq_lens_ptr,
     gather_lens_ptr,
+    left_ptr,
+    right_ptr,
     block_table_base_offsets_ptr,
     workspace_width,
     compressed_base,
     compressed_block_size,
     compressed_table_capacity,
     has_block_table_base_offsets: tl.constexpr,
+    has_visibility: tl.constexpr,
     topk: tl.constexpr,
     compress_ratio: tl.constexpr,
     window_size: tl.constexpr,
     padded_topk: tl.constexpr,
+    padded_swa: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
@@ -2821,7 +2825,18 @@ def _dsv4_combine_topk_swa_indices_kernel(
             0,
         )
         topk_len = tl.minimum(live_compressed_len, topk)
-        swa_len = tl.minimum(pos + 1, window_size)
+        left = tl.zeros((), dtype=tl.int32)
+        right = tl.zeros((), dtype=tl.int32)
+        if has_visibility:
+            left = tl.maximum(tl.minimum(tl.load(left_ptr + token_idx), 383), 0)
+            right = tl.maximum(tl.minimum(tl.load(right_ptr + token_idx), 384), 0)
+        window_back = window_size - 1
+        swa_start = tl.maximum(
+            pos - window_back - tl.maximum(left - window_back, 0),
+            0,
+        )
+        swa_end = tl.minimum(pos + right, seq_len - 1)
+        swa_len = swa_end - swa_start + 1
 
         topk_offsets = tl.arange(0, padded_topk)
         topk_mask = topk_offsets < topk_len
@@ -2842,7 +2857,7 @@ def _dsv4_combine_topk_swa_indices_kernel(
             mask=valid_topk,
         )
 
-        swa_offsets = tl.arange(0, window_size)
+        swa_offsets = tl.arange(0, padded_swa)
         tl.store(
             combined_indices_ptr
             + token_idx * combined_indices_stride
@@ -2851,9 +2866,7 @@ def _dsv4_combine_topk_swa_indices_kernel(
             workspace_width * batch_idx
             + compressed_base
             + swa_offsets
-            + pos
-            - swa_len
-            + 1
+            + swa_start
             - gather_start,
             mask=swa_offsets < swa_len,
         )
@@ -2875,13 +2888,30 @@ def dsv4_combine_topk_swa_indices(
     block_table_base_offsets: torch.Tensor | None = None,
     compressed_block_size: int = 1,
     compressed_table_capacity: int | None = None,
+    left: torch.Tensor | None = None,
+    right: torch.Tensor | None = None,
+    vision_max_n_token: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build FlashMLA sparse prefill indices from compressed prefix and SWA."""
 
     num_tokens = topk_indices.shape[0]
     num_reqs = seq_lens.shape[0]
+    if (left is None) != (right is None):
+        raise ValueError("DeepSeek V4 visibility requires both left and right")
+    if vision_max_n_token < 0:
+        raise ValueError("vision_max_n_token must be non-negative")
+    if left is not None and (left.numel() != num_tokens or right.numel() != num_tokens):
+        raise ValueError(
+            "DeepSeek V4 visibility tensors must match the prefill token count"
+        )
     combined_topk = (
-        (topk + window_size + DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
+        (
+            topk
+            + window_size
+            + vision_max_n_token
+            + DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT
+            - 1
+        )
         // DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT
         * DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT
     )
@@ -2901,6 +2931,72 @@ def dsv4_combine_topk_swa_indices(
     if compressed_table_capacity is None:
         compressed_table_capacity = compressed_base
 
+    if topk_indices.device.type == "cpu":
+        query_lens = torch.diff(query_start_loc.to(torch.int64))
+        token_to_req = torch.repeat_interleave(
+            torch.arange(num_reqs, dtype=torch.int64), query_lens
+        )
+        normalized_starts = query_start_loc[:-1].to(torch.int64) - int(
+            query_start_loc[0]
+        )
+        token_offsets = torch.arange(
+            num_tokens, dtype=torch.int64
+        ) - torch.repeat_interleave(normalized_starts, query_lens)
+        token_seq_lens = seq_lens.to(torch.int64)[token_to_req]
+        positions = token_seq_lens - query_lens[token_to_req] + token_offsets
+        base_rows = (
+            block_table_base_offsets.to(torch.int64)[token_to_req]
+            * compressed_block_size
+            if block_table_base_offsets is not None
+            else torch.zeros_like(positions)
+        )
+        topk_lens = ((positions + 1) // compress_ratio - base_rows).clamp(
+            0, min(topk, compressed_table_capacity)
+        )
+        token_left = (
+            left.to(torch.int64).clamp(0, 383)
+            if left is not None
+            else torch.zeros_like(positions)
+        )
+        token_right = (
+            right.to(torch.int64).clamp(0, 384)
+            if right is not None
+            else torch.zeros_like(positions)
+        )
+        window_back = window_size - 1
+        swa_starts = (
+            positions - window_back - (token_left - window_back).clamp(min=0)
+        ).clamp(min=0)
+        swa_ends = torch.minimum(positions + token_right, token_seq_lens - 1)
+        swa_lens = swa_ends - swa_starts + 1
+        columns = torch.arange(combined_topk, dtype=torch.int64)[None, :]
+        request_bases = workspace_width * token_to_req
+        safe_topk_columns = columns.clamp(max=topk_indices.shape[1] - 1).expand(
+            num_tokens, -1
+        )
+        topk_values = topk_indices.to(torch.int64).gather(1, safe_topk_columns)
+        is_topk = columns < topk_lens[:, None]
+        values = torch.where(
+            is_topk & (topk_values >= 0),
+            request_bases[:, None] + topk_values,
+            torch.full_like(topk_values, -1),
+        )
+        swa_offsets = columns - topk_lens[:, None]
+        is_swa = (swa_offsets >= 0) & (swa_offsets < swa_lens[:, None])
+        gather_starts = token_seq_lens - gather_lens.to(torch.int64)[token_to_req]
+        values = torch.where(
+            is_swa,
+            request_bases[:, None]
+            + compressed_base
+            + swa_starts[:, None]
+            + swa_offsets
+            - gather_starts[:, None],
+            values,
+        )
+        combined_indices.copy_(values.to(torch.int32))
+        combined_lens.copy_((topk_lens + swa_lens).to(torch.int32))
+        return combined_indices, combined_lens
+
     _dsv4_combine_topk_swa_indices_kernel[(num_reqs, 128)](
         combined_indices,
         combined_indices.stride(0),
@@ -2910,6 +3006,8 @@ def dsv4_combine_topk_swa_indices(
         query_start_loc.to(torch.int32),
         seq_lens.to(torch.int32),
         gather_lens.to(torch.int32),
+        left if left is not None else seq_lens,
+        right if right is not None else seq_lens,
         (
             block_table_base_offsets.to(torch.int32)
             if block_table_base_offsets is not None
@@ -2920,10 +3018,12 @@ def dsv4_combine_topk_swa_indices(
         compressed_block_size,
         compressed_table_capacity,
         has_block_table_base_offsets=block_table_base_offsets is not None,
+        has_visibility=left is not None,
         topk=topk,
         compress_ratio=compress_ratio,
         window_size=window_size,
         padded_topk=triton.next_power_of_2(topk_indices.shape[-1]),
+        padded_swa=triton.next_power_of_2(window_size + vision_max_n_token),
     )
     return combined_indices, combined_lens
 
@@ -3039,8 +3139,11 @@ def _dsv4_combine_dense_swa_indices_kernel(
     seq_lens_ptr,
     compressed_lens_ptr,
     gather_lens_ptr,
+    left_ptr,
+    right_ptr,
     workspace_width,
     compressed_base,
+    has_visibility: tl.constexpr,
     combined_topk: tl.constexpr,
     compress_ratio: tl.constexpr,
     window_size: tl.constexpr,
@@ -3063,7 +3166,18 @@ def _dsv4_combine_dense_swa_indices_kernel(
         )
     else:
         compressed_len = tl.full((), 0, tl.int32)
-    swa_len = tl.minimum(pos + 1, window_size)
+    left = tl.zeros((), dtype=tl.int32)
+    right = tl.zeros((), dtype=tl.int32)
+    if has_visibility:
+        left = tl.maximum(tl.minimum(tl.load(left_ptr + token_idx), 383), 0)
+        right = tl.maximum(tl.minimum(tl.load(right_ptr + token_idx), 384), 0)
+    window_back = window_size - 1
+    swa_start = tl.maximum(
+        pos - window_back - tl.maximum(left - window_back, 0),
+        0,
+    )
+    swa_end = tl.minimum(pos + right, seq_len - 1)
+    swa_len = swa_end - swa_start + 1
     total_len = compressed_len + swa_len
 
     request_base = workspace_width * req_idx
@@ -3073,9 +3187,7 @@ def _dsv4_combine_dense_swa_indices_kernel(
 
     swa_offsets = offsets - compressed_len
     is_swa = (offsets >= compressed_len) & (offsets < total_len)
-    swa_values = (
-        request_base + compressed_base + swa_offsets + pos - swa_len + 1 - gather_start
-    )
+    swa_values = request_base + compressed_base + swa_offsets + swa_start - gather_start
     values = tl.where(is_swa, swa_values, values)
 
     tl.store(
@@ -3097,13 +3209,24 @@ def dsv4_combine_dense_swa_indices(
     compress_ratio: int,
     workspace_width: int,
     compressed_base: int,
+    left: torch.Tensor | None = None,
+    right: torch.Tensor | None = None,
+    vision_max_n_token: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build dense-compressed plus SWA sparse prefill indices."""
 
     num_tokens = positions.numel()
+    if (left is None) != (right is None):
+        raise ValueError("DeepSeek V4 visibility requires both left and right")
+    if vision_max_n_token < 0:
+        raise ValueError("vision_max_n_token must be non-negative")
+    if left is not None and (left.numel() != num_tokens or right.numel() != num_tokens):
+        raise ValueError(
+            "DeepSeek V4 visibility tensors must match the prefill token count"
+        )
     combined_topk = (
         (
-            max(compressed_base + window_size, 1)
+            max(compressed_base + window_size + vision_max_n_token, 1)
             + DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT
             - 1
         )
@@ -3120,6 +3243,55 @@ def dsv4_combine_dense_swa_indices(
     if num_tokens == 0:
         return combined_indices, combined_lens
 
+    if positions.device.type == "cpu":
+        token_to_req = token_to_req_indices.to(torch.int64)
+        positions_cpu = positions.to(torch.int64)
+        token_seq_lens = seq_lens.to(torch.int64)[token_to_req]
+        token_compressed_lens = compressed_lens.to(torch.int64)[token_to_req]
+        compressed_len = (
+            torch.minimum((positions_cpu + 1) // compress_ratio, token_compressed_lens)
+            if compress_ratio > 1
+            else torch.zeros_like(positions_cpu)
+        )
+        token_left = (
+            left.to(torch.int64).clamp(0, 383)
+            if left is not None
+            else torch.zeros_like(positions_cpu)
+        )
+        token_right = (
+            right.to(torch.int64).clamp(0, 384)
+            if right is not None
+            else torch.zeros_like(positions_cpu)
+        )
+        window_back = window_size - 1
+        swa_starts = (
+            positions_cpu - window_back - (token_left - window_back).clamp(min=0)
+        ).clamp(min=0)
+        swa_ends = torch.minimum(positions_cpu + token_right, token_seq_lens - 1)
+        swa_lens = swa_ends - swa_starts + 1
+        columns = torch.arange(combined_topk, dtype=torch.int64)[None, :]
+        request_bases = workspace_width * token_to_req
+        values = torch.where(
+            columns < compressed_len[:, None],
+            request_bases[:, None] + columns,
+            torch.full((num_tokens, combined_topk), -1, dtype=torch.int64),
+        )
+        swa_offsets = columns - compressed_len[:, None]
+        is_swa = (swa_offsets >= 0) & (swa_offsets < swa_lens[:, None])
+        gather_starts = token_seq_lens - gather_lens.to(torch.int64)[token_to_req]
+        values = torch.where(
+            is_swa,
+            request_bases[:, None]
+            + compressed_base
+            + swa_starts[:, None]
+            + swa_offsets
+            - gather_starts[:, None],
+            values,
+        )
+        combined_indices.copy_(values.to(torch.int32))
+        combined_lens.copy_((compressed_len + swa_lens).to(torch.int32))
+        return combined_indices, combined_lens
+
     candidate_block = 128
     _dsv4_combine_dense_swa_indices_kernel[
         (num_tokens, triton.cdiv(combined_topk, candidate_block))
@@ -3132,8 +3304,11 @@ def dsv4_combine_dense_swa_indices(
         seq_lens.to(torch.int32),
         compressed_lens.to(torch.int32),
         gather_lens.to(torch.int32),
+        left if left is not None else seq_lens,
+        right if right is not None else seq_lens,
         workspace_width,
         compressed_base,
+        has_visibility=left is not None,
         combined_topk=combined_topk,
         compress_ratio=compress_ratio,
         window_size=window_size,

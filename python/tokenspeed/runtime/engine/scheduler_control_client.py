@@ -377,6 +377,10 @@ class SchedulerControlClient:
         return result.is_sleeping
 
     async def get_internal_state(self: AsyncLLM) -> list[dict[Any, Any]]:
+        # Introspection may be the first frontend operation after Engine
+        # construction.  Start the result-dispatch loop before waiting for the
+        # scheduler reply, just like the other control-plane methods above.
+        self.auto_create_handle_loop()
         req = GetInternalStateReq()
         responses: list[GetInternalStateReqOutput] = (
             await self.get_internal_state_communicator(req)
@@ -387,6 +391,7 @@ class SchedulerControlClient:
     async def set_internal_state(
         self: AsyncLLM, obj: SetInternalStateReq
     ) -> list[bool]:
+        self.auto_create_handle_loop()
         responses: list[SetInternalStateReqOutput] = (
             await self.set_internal_state_communicator(obj)
         )

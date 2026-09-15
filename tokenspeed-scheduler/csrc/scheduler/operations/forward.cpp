@@ -270,7 +270,11 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     // will allocate private writable pages for the replayed suffix.
     const std::int32_t replay_tokens = std::max(config_.prefix_replay_tokens, 1);
     const std::int32_t max_cacheable_tokens = std::max(request->PrefillSize() - replay_tokens, 0);
-    const std::int32_t probe_prefix_pages = max_cacheable_tokens / prefix_granularity;
+    std::int32_t probe_prefix_pages = max_cacheable_tokens / prefix_granularity;
+    if (request->HasAtomicSpans()) {
+        const std::int32_t first_atomic_start = request->AtomicSpans().front().first;
+        probe_prefix_pages = std::min(probe_prefix_pages, first_atomic_start / prefix_granularity);
+    }
     const std::int32_t candidate_prefix_pages = std::max((request->PrefillSize() - 1) / prefix_granularity, 0);
     std::vector<std::span<const std::int32_t>> prefix_pages = request->FullPrefixPages(false);
     prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
@@ -355,9 +359,9 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
                                           : fsm::PrefillSource::kLocal;
     const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
     std::int32_t prefill_tokens = std::min(remaining, unscheduled);
-    if (coordinator_.HasMambaStateGroup() || promotion_boundary_tokens > 0) {
+    if (coordinator_.HasMambaStateGroup() || promotion_boundary_tokens > 0 || request->HasAtomicSpans()) {
         prefill_tokens = AlignPrefillChunk(hit_tokens, unscheduled, remaining, coordinator_.PrefixGranularity(),
-                                           promotion_boundary_tokens);
+                                           promotion_boundary_tokens, request->AtomicSpans());
         if (prefill_tokens == 0) {
             return std::nullopt;
         }
@@ -454,9 +458,10 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     fsm::CacheProgress cache_progress = request->CacheProgress();
     std::int32_t prefill_tokens = std::min(remaining, unscheduled);
-    if (coordinator_.HasMambaStateGroup() || cache_progress.promotion_boundary_tokens > 0) {
+    if (coordinator_.HasMambaStateGroup() || cache_progress.promotion_boundary_tokens > 0 ||
+        request->HasAtomicSpans()) {
         prefill_tokens = AlignPrefillChunk(first_pos, unscheduled, remaining, coordinator_.PrefixGranularity(),
-                                           cache_progress.promotion_boundary_tokens);
+                                           cache_progress.promotion_boundary_tokens, request->AtomicSpans());
         if (prefill_tokens == 0) {
             return std::nullopt;
         }

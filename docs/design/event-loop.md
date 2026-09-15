@@ -137,6 +137,24 @@ Consequences:
   class (see below) instead of weaving branches through the loop and its
   helpers.
 
+### Admission rejection is isolated per request
+
+Scheduler validation is a client-error boundary, not an event-loop failure
+boundary. Admission first submits the batch once. If the C++ scheduler rejects
+it with a validation error, the loop retries each request independently: valid
+peers are admitted, while each invalid request is finished at admission with an
+actionable abort reason and spends no scheduler slot or forward step. This is
+safe because the scheduler validates and constructs the entire batch before it
+publishes any request, so a failed batch leaves no partially admitted entries
+for the per-request retries to duplicate.
+
+An admission entry is the tuple `(spec, state, previous_state, bootstrap)`, not
+just a request spec. The additional context lets rejection clean up a registered
+PD transfer and restore the displaced state when a duplicate request id is the
+invalid entry. Pause withholding must buffer and later resubmit this full tuple
+through the same exception-isolating path; reducing it to a bare spec would
+make rejection leak state or transfer resources after resume.
+
 ## Principle 3: scheduler feedback is explicit and centralized
 
 `advance_scheduler` (`scheduler_utils.py`) is the **only** caller of
@@ -229,7 +247,7 @@ Current inventory:
 
 | Attribute      | Class / home                                  | Shape          | Loop entry points |
 | -------------- | --------------------------------------------- | -------------- | ----------------- |
-| `_pause_hooks` | `PauseHooks` — `engine/pause.py`              | glue (PauseController is the state machine) | `apply_transitions`, `withhold_admissions`, `paused_idle_step` |
+| `_pause_hooks` | `PauseHooks` — `engine/pause.py`              | glue (PauseController is the state machine) | `apply_transitions`, `withhold_admissions` (buffers full admission-entry tuples), `paused_idle_step` |
 | `_epd_hooks`   | `EpdPrefillHooks` — `epd/prefill_hooks.py`    | glue (EpdPrefillAdmission decides)          | `try_stage`, `drain_ready_embeddings`, `assert_embeddings_received` |
 | `_pd_hooks`    | `PdTransferHooks` — `pd/transfer_hooks.py`    | glue (transfer executors decide)            | `poll_transfer_events` |
 | `_cache_hooks` | `L2CacheHooks` — `engine/cache_hooks.py`      | glue-ish (handed the `DeviceHandle`: submission rides `execute`; polling stays control-side event queries) | `count_plan_ops`, `poll_ready_events` |

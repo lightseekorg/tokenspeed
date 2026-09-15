@@ -35,10 +35,22 @@ def get_model(
 ) -> nn.Module:
     """Load and return a model for the given runtime configuration."""
     loader = get_model_loader(load_config)
-    return loader.load_model(
+    model = loader.load_model(
         model_config=model_config,
         device_config=device_config,
     )
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    if global_server_args_dict.get("enable_dsv4_vision_instrumentation", False):
+        from tokenspeed.runtime.metrics.dsv4_vision_instrumentation import (
+            get_dsv4_vision_instrumentation,
+        )
+
+        instrumentation = get_dsv4_vision_instrumentation()
+        instrumentation.record_model_parameters(
+            name for name, _ in model.named_parameters()
+        )
+    return model
 
 
 __all__ = [

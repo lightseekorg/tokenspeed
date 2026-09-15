@@ -67,6 +67,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
+from tokenspeed.runtime.metrics.dsv4_vision_instrumentation import (
+    record_prefill_index_buffer,
+)
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
@@ -255,15 +258,17 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 f"({self.kernel_page_size}), got {config.prefix_granularity}"
             )
         self.context_len = config.context_len
-        self.prefill_chunk_size = max(
-            1,
-            int(
-                global_server_args_dict.get(
-                    "deepseek_v4_prefill_chunk_size",
-                    DEEPSEEK_V4_DEFAULT_PREFILL_CHUNK_SIZE,
-                )
-            ),
+        self.vision_enabled = bool(config.vision_enabled)
+        self.vision_max_n_token = (
+            int(config.vision_max_n_token) if self.vision_enabled else 0
         )
+        prefill_chunk_size = getattr(config, "deepseek_v4_prefill_chunk_size", None)
+        if prefill_chunk_size is None:
+            prefill_chunk_size = global_server_args_dict.get(
+                "deepseek_v4_prefill_chunk_size",
+                DEEPSEEK_V4_DEFAULT_PREFILL_CHUNK_SIZE,
+            )
+        self.prefill_chunk_size = max(1, int(prefill_chunk_size))
         self.max_num_pages = max(
             1,
             (self.context_len + self.kernel_page_size - 1) // self.kernel_page_size,
@@ -1336,6 +1341,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         softmax_scale: float,
         attn_sink: torch.Tensor,
         topk_indices: torch.Tensor | None,
+        vision=None,
     ) -> torch.Tensor:
         metadata = self.forward_metadata
         if (
@@ -1350,6 +1356,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             or not metadata.forward_mode.is_mixed()
         ):
             raise RuntimeError("DeepSeek V4 mixed attention requires forward metadata")
+        self._bind_vision_metadata(metadata, vision)
 
         num_prefill_reqs = metadata.num_prefill_reqs
         num_prefill_tokens = metadata.num_prefill_tokens
@@ -1385,6 +1392,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     else None
                 ),
                 metadata=prefill_metadata,
+                vision=None,
             )
             with nvtx_range(f"attn_{kind}_mixed_prefill_copy"):
                 out[:num_prefill_tokens].copy_(prefill_out)
@@ -1434,6 +1442,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         topk_indices: torch.Tensor | None,
         metadata: DeepseekV4ForwardMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        left, right = self._prepare_prefill_visibility(
+            metadata, device=positions.device
+        )
         cache_metadata = metadata.cache
         num_reqs = metadata.seq_lens.numel()
         prefix_lens = metadata.seq_lens - metadata.query_lens
@@ -1503,7 +1514,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 compressed_base=compressed_base,
                 compressed_block_size=compressed_block_size,
                 compressed_table_capacity=compressed_table_capacity,
+                left=left,
+                right=right,
+                vision_max_n_token=self.vision_max_n_token,
             )
+            record_prefill_index_buffer(indices)
             return kv_workspace, indices, lens
 
         if compress_ratio == 4:
@@ -1563,7 +1578,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 compressed_base=compressed_base,
                 compressed_block_size=compressed_block_size,
                 compressed_table_capacity=compressed_table_capacity,
+                left=left,
+                right=right,
+                vision_max_n_token=self.vision_max_n_token,
             )
+            record_prefill_index_buffer(indices)
             return kv_workspace, indices, lens
 
         indices, lens = dsv4_combine_dense_swa_indices(
@@ -1576,8 +1595,169 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             compress_ratio=compress_ratio,
             workspace_width=workspace_width,
             compressed_base=compressed_base,
+            left=left,
+            right=right,
+            vision_max_n_token=self.vision_max_n_token,
         )
+        record_prefill_index_buffer(indices)
         return kv_workspace, indices, lens
+
+    @staticmethod
+    def _bind_vision_metadata(metadata: DeepseekV4ForwardMetadata, vision) -> None:
+        """Attach the model payload once; request/token slicing happens later."""
+        if vision is None or metadata.vision_prefill_validated:
+            return
+        num_tokens = int(metadata.token_to_req_indices.numel())
+        if vision.left.numel() != num_tokens or vision.right.numel() != num_tokens:
+            raise RuntimeError(
+                "DeepSeek V4 vision payload token count does not match attention "
+                f"metadata: vision={vision.left.numel()}, attention={num_tokens}"
+            )
+        metadata.vision_left = vision.left
+        metadata.vision_right = vision.right
+        metadata.vision_atomic_spans = [list(spans) for spans in vision.atomic_spans]
+        metadata.vision_visibility_spans = [
+            list(spans) for spans in vision.visibility_spans
+        ]
+        metadata.vision_atomic_spans_in_chunk = [
+            list(spans) for spans in vision.atomic_spans_in_chunk
+        ]
+        metadata.vision_visibility_spans_in_chunk = [
+            list(spans) for spans in vision.visibility_spans_in_chunk
+        ]
+
+    def _prepare_prefill_visibility(
+        self,
+        metadata: DeepseekV4ForwardMetadata,
+        *,
+        device: torch.device,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Validate absolute spans and fill query-local visibility tensors."""
+        if metadata.vision_prefill_validated:
+            if not any(metadata.vision_atomic_spans_in_chunk):
+                return None, None
+            return metadata.vision_left, metadata.vision_right
+        if not metadata.vision_atomic_spans:
+            metadata.vision_prefill_validated = True
+            return None, None
+        if not self.vision_enabled:
+            raise RuntimeError(
+                "DeepSeek V4 image visibility reached a text-only attention backend"
+            )
+        seq_lens_cpu = metadata.seq_lens_cpu
+        query_lens_cpu = metadata.query_lens_cpu
+        num_reqs = int(metadata.seq_lens.numel())
+        if (
+            seq_lens_cpu is None
+            or query_lens_cpu is None
+            or seq_lens_cpu.device.type != "cpu"
+            or query_lens_cpu.device.type != "cpu"
+            or seq_lens_cpu.numel() != num_reqs
+            or query_lens_cpu.numel() != num_reqs
+        ):
+            raise RuntimeError(
+                "DeepSeek V4 image visibility requires matching CPU sequence "
+                "and query lengths"
+            )
+        span_fields = (
+            metadata.vision_atomic_spans,
+            metadata.vision_visibility_spans,
+            metadata.vision_atomic_spans_in_chunk,
+            metadata.vision_visibility_spans_in_chunk,
+        )
+        if any(len(field) != num_reqs for field in span_fields):
+            raise RuntimeError(
+                "DeepSeek V4 image span request count does not match attention metadata"
+            )
+        if metadata.vision_left is None or metadata.vision_right is None:
+            raise RuntimeError(
+                "DeepSeek V4 image spans are missing left/right payloads"
+            )
+
+        seq_lens = [int(value) for value in seq_lens_cpu.tolist()]
+        query_lens = [int(value) for value in query_lens_cpu.tolist()]
+        filtered_atomic: list[list[tuple[int, int]]] = []
+        filtered_visibility: list[list[tuple[int, int]]] = []
+        for req_idx, (seq_len, query_len) in enumerate(
+            zip(seq_lens, query_lens, strict=True)
+        ):
+            if query_len < 0 or seq_len < query_len:
+                raise RuntimeError(
+                    "DeepSeek V4 image visibility found an invalid sequence/query pair"
+                )
+            query_start = seq_len - query_len
+            query_end = seq_len - 1
+
+            def contained_spans(
+                spans: list[tuple[int, int]], *, kind: str
+            ) -> list[tuple[int, int]]:
+                contained = []
+                for start, end in spans:
+                    if end < query_start or start > query_end:
+                        continue
+                    if start < query_start or end > query_end:
+                        raise RuntimeError(
+                            f"DeepSeek V4 {kind} span {(start, end)} partially "
+                            "overlaps prefill query range "
+                            f"[{query_start}, {query_end}] for request {req_idx}"
+                        )
+                    contained.append((start, end))
+                return contained
+
+            filtered_atomic.append(
+                contained_spans(metadata.vision_atomic_spans[req_idx], kind="atomic")
+            )
+            filtered_visibility.append(
+                contained_spans(
+                    metadata.vision_visibility_spans[req_idx], kind="visibility"
+                )
+            )
+
+        if filtered_atomic != metadata.vision_atomic_spans_in_chunk:
+            raise RuntimeError(
+                "DeepSeek V4 independently filtered atomic spans disagree with "
+                "the model payload"
+            )
+        if filtered_visibility != metadata.vision_visibility_spans_in_chunk:
+            raise RuntimeError(
+                "DeepSeek V4 independently filtered visibility spans disagree "
+                "with the model payload"
+            )
+
+        num_tokens = sum(query_lens)
+        if (
+            metadata.vision_left.numel() != num_tokens
+            or metadata.vision_right.numel() != num_tokens
+        ):
+            raise RuntimeError(
+                "DeepSeek V4 image visibility tensor length does not match query rows"
+            )
+        left = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+        right = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+        flat_base = 0
+        left_limit = min(self.vision_max_n_token - 1, 383)
+        right_limit = min(self.vision_max_n_token, 384)
+        for query_len, seq_len, request_spans in zip(
+            query_lens, seq_lens, filtered_visibility, strict=True
+        ):
+            query_start = seq_len - query_len
+            for start, end in request_spans:
+                local_start = flat_base + start - query_start
+                local_end = flat_base + end - query_start
+                absolute_positions = torch.arange(
+                    start, end + 1, dtype=torch.int32, device=device
+                )
+                left[local_start : local_end + 1] = (absolute_positions - start).clamp(
+                    max=left_limit
+                )
+                right[local_start : local_end + 1] = (end - absolute_positions).clamp(
+                    max=right_limit
+                )
+            flat_base += query_len
+        metadata.vision_left = left
+        metadata.vision_right = right
+        metadata.vision_prefill_validated = True
+        return left, right
 
     @staticmethod
     def _prefill_workspace_bounds(
@@ -1682,6 +1862,25 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             num_prefill_reqs=num_prefill_reqs,
             num_prefill_tokens=num_prefill_tokens,
             forward_mode=forward_mode,
+            vision_left=(
+                metadata.vision_left[token_start:token_end]
+                if metadata.vision_left is not None
+                else None
+            ),
+            vision_right=(
+                metadata.vision_right[token_start:token_end]
+                if metadata.vision_right is not None
+                else None
+            ),
+            vision_atomic_spans=metadata.vision_atomic_spans[req_start:req_end],
+            vision_visibility_spans=metadata.vision_visibility_spans[req_start:req_end],
+            vision_atomic_spans_in_chunk=metadata.vision_atomic_spans_in_chunk[
+                req_start:req_end
+            ],
+            vision_visibility_spans_in_chunk=(
+                metadata.vision_visibility_spans_in_chunk[req_start:req_end]
+            ),
+            vision_prefill_validated=metadata.vision_prefill_validated,
         )
 
     def _forward_deepseek_v4_prefill_chunk(
@@ -1701,7 +1900,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         attn_sink: torch.Tensor,
         topk_indices: torch.Tensor | None,
         metadata: DeepseekV4ForwardMetadata,
+        vision,
     ) -> torch.Tensor:
+        self._bind_vision_metadata(metadata, vision)
         with nvtx_range(f"attn_{kind}_prefill_pad_q"):
             if q.shape[1] == padded_heads:
                 q_padded = q.contiguous()
@@ -1751,6 +1952,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         attn_sink: torch.Tensor,
         topk_indices: torch.Tensor | None,
         metadata: DeepseekV4ForwardMetadata | None = None,
+        vision=None,
     ) -> torch.Tensor:
         if metadata is None:
             metadata = self.forward_metadata
@@ -1762,6 +1964,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             metadata = self.forward_prefill_metadata or metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
+        self._bind_vision_metadata(metadata, vision)
         if (
             metadata.forward_mode is None
             or not metadata.forward_mode.is_extend_or_mixed()
@@ -1793,6 +1996,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 attn_sink=attn_sink,
                 topk_indices=topk_indices,
                 metadata=metadata,
+                vision=vision,
             )
 
         query_lens_cpu = metadata.query_lens_cpu
@@ -1846,6 +2050,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     else None
                 ),
                 metadata=chunk_metadata,
+                vision=None,
             )
             out[token_start:token_end].copy_(chunk_out)
         return out

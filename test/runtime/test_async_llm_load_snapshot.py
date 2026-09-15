@@ -230,3 +230,39 @@ async def test_get_load_starts_receivers_and_projects_only_fresh_complete_cache(
     now[0] = 0.002
     assert await SchedulerControlClient.get_load(llm) == []
     assert calls == ["started", "started", "started"]
+
+
+@pytest.mark.asyncio
+async def test_get_internal_state_starts_receivers_before_first_request():
+    calls = []
+
+    async def communicate(_request):
+        assert calls == ["started"]
+        return [SimpleNamespace(internal_state={"rank": 0})]
+
+    llm = SimpleNamespace(
+        auto_create_handle_loop=lambda: calls.append("started"),
+        get_internal_state_communicator=communicate,
+    )
+
+    assert await SchedulerControlClient.get_internal_state(llm) == [{"rank": 0}]
+    assert calls == ["started"]
+
+
+@pytest.mark.asyncio
+async def test_set_internal_state_starts_receivers_before_first_request():
+    calls = []
+    request = object()
+
+    async def communicate(actual_request):
+        assert calls == ["started"]
+        assert actual_request is request
+        return [SimpleNamespace(updated=False)]
+
+    llm = SimpleNamespace(
+        auto_create_handle_loop=lambda: calls.append("started"),
+        set_internal_state_communicator=communicate,
+    )
+
+    assert await SchedulerControlClient.set_internal_state(llm, request) == [False]
+    assert calls == ["started"]

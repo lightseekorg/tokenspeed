@@ -141,9 +141,32 @@ from tokenspeed.runtime.layers.quantization import Fp8Config, Mxfp4Config
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from tokenspeed.runtime.metrics.dsv4_numerical_attribution import (
+    numerical_attribution_checkpoint_active,
+    numerical_attribution_enabled,
+    record_numerical_attribution_boundary,
+)
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import BaseCausalLM
+from tokenspeed.runtime.models.deepseek_v4_vision import (
+    DeepseekV4VisionAligner,
+    DeepseekV4VisionMetadataError,
+    DeepseekV4VisionTransformer,
+    build_dsv4_vision_forward,
+    encode_image_items,
+)
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
+from tokenspeed.runtime.multimodal.embedder import (
+    EncoderSpec,
+    MultimodalEmbedder,
+    pad_input_tokens,
+)
+from tokenspeed.runtime.multimodal.inputs import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalForwardContext,
+    MultimodalInputs,
+)
 from tokenspeed.runtime.utils import (
     add_prefix,
     get_colorful_logger,
@@ -1588,20 +1611,31 @@ def dsv4_select_experts(
     hash_indices_table: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
     need_scores: bool = True,
+    image_mask: torch.Tensor | None = None,
+    bias_vl: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Use an accelerator router when available, otherwise run eager routing."""
-    try:
-        return _kernel_dsv4_select_experts(
-            router_logits,
-            top_k,
-            renormalize,
-            correction_bias,
-            hash_indices_table,
-            input_ids,
-            need_scores,
-        )
-    except (NoKernelFoundError, AttributeError, RuntimeError):
-        pass
+    if image_mask is None:
+        try:
+            return _kernel_dsv4_select_experts(
+                router_logits,
+                top_k,
+                renormalize,
+                correction_bias,
+                hash_indices_table,
+                input_ids,
+                need_scores,
+            )
+        except (NoKernelFoundError, AttributeError, RuntimeError):
+            pass
+
+    if image_mask is not None:
+        if image_mask.ndim != 1 or image_mask.dtype != torch.bool:
+            raise ValueError("image_mask must be a rank-1 bool tensor")
+        if image_mask.numel() != router_logits.shape[0]:
+            raise ValueError("image_mask must contain one entry per router-logit row")
+        if bias_vl is None or bias_vl.shape != (router_logits.shape[1],):
+            raise ValueError("bias_vl must be loaded with one entry per routed expert")
 
     scores = torch.sqrt(F.softplus(router_logits.float()))
     if hash_indices_table is not None:
@@ -1609,10 +1643,44 @@ def dsv4_select_experts(
             raise ValueError("hash-routed DeepSeek V4 MoE requires input_ids")
         table = hash_indices_table.to(device=scores.device, dtype=torch.int64)
         ids = input_ids.reshape(-1).to(device=scores.device, dtype=torch.int64)
-        topk_ids = table[ids]
+        if image_mask is None:
+            topk_ids = table[ids]
+        else:
+            mask = image_mask.to(device=scores.device)
+            text_ids = ids[~mask]
+            if text_ids.numel() and bool(
+                ((text_ids < 0) | (text_ids >= table.shape[0])).any().item()
+            ):
+                raise IndexError("unmasked input_ids are outside the hash table")
+            topk_ids = torch.empty(
+                (scores.shape[0], top_k),
+                device=scores.device,
+                dtype=table.dtype,
+            )
+            topk_ids[~mask] = table[text_ids]
+            topk_ids[mask] = torch.topk(
+                scores[mask]
+                + bias_vl.to(device=scores.device, dtype=scores.dtype).unsqueeze(0),
+                k=top_k,
+                dim=-1,
+                largest=True,
+                sorted=True,
+            ).indices
     else:
         scores_for_choice = scores
-        if correction_bias is not None:
+        if image_mask is not None:
+            mask = image_mask.to(device=scores.device)
+            text_bias = (
+                correction_bias.to(device=scores.device, dtype=scores.dtype)
+                if correction_bias is not None
+                else torch.zeros_like(bias_vl, device=scores.device)
+            )
+            scores_for_choice = scores_for_choice + torch.where(
+                mask.unsqueeze(-1),
+                bias_vl.to(device=scores.device, dtype=scores.dtype).unsqueeze(0),
+                text_bias.unsqueeze(0),
+            )
+        elif correction_bias is not None:
             scores_for_choice = scores_for_choice + correction_bias.to(
                 device=scores.device,
                 dtype=scores.dtype,
@@ -1678,6 +1746,20 @@ class DeepseekV4MoEGate(nn.Module):
         else:
             self.register_parameter("tid2eid", None)
             self.e_score_correction_bias = None
+        self.is_base_layer = 0 <= layer_index < int(config.num_hidden_layers)
+        if self.is_base_layer and bool(
+            getattr(
+                config,
+                "_tokenspeed_dsv4_vision_active",
+                int(getattr(config, "vision_n_layers", 0) or 0) > 0,
+            )
+        ):
+            self.bias_vl = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+        else:
+            self.register_parameter("bias_vl", None)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return dsv4_linear_fp32(
@@ -2023,11 +2105,12 @@ class DeepseekV4MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None,
+        image_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         router_logits = self.gate(hidden_states)
         fmt = getattr(self.experts, "topk_output_format", None)
         need_scores = fmt is not None and not fmt.is_bypassed()
-        return dsv4_select_experts(
+        topk_weights, topk_ids, router_scores = dsv4_select_experts(
             router_logits,
             self.config.num_experts_per_tok,
             self.config.norm_topk_prob,
@@ -2035,7 +2118,19 @@ class DeepseekV4MoE(nn.Module):
             hash_indices_table=self.gate.tid2eid,
             input_ids=input_ids,
             need_scores=need_scores,
+            image_mask=image_mask,
+            bias_vl=self.gate.bias_vl,
         )
+        if numerical_attribution_enabled():
+            record_numerical_attribution_boundary(
+                f"layer.{self.layer_index}.router_topk_ids",
+                topk_ids.to(torch.int64),
+            )
+            record_numerical_attribution_boundary(
+                f"layer.{self.layer_index}.router_weights",
+                topk_weights * self.routed_scaling_factor,
+            )
+        return topk_weights, topk_ids, router_scores
 
     def _make_topk_output(
         self,
@@ -2077,7 +2172,18 @@ class DeepseekV4MoE(nn.Module):
         input_ids: torch.Tensor,
         ctx: ForwardContext,
         comm_manager: CommManager,
+        image_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if image_mask is not None:
+            num_tokens = image_mask.numel()
+            hidden_states, input_ids = slice_to_real_tokens(
+                num_tokens, hidden_states, input_ids
+            )
+            if hidden_states.shape[0] != num_tokens or input_ids.shape[0] != num_tokens:
+                raise ValueError(
+                    "DeepSeek V4 MegaMoE image routing requires one local row "
+                    "per image-mask entry"
+                )
         if hidden_states.shape[0] == 0:
             topk_weights = hidden_states.new_empty(
                 (0, self.config.num_experts_per_tok), dtype=torch.float32
@@ -2089,9 +2195,14 @@ class DeepseekV4MoE(nn.Module):
             )
         else:
             with nvtx_range("moe_select_experts"):
-                topk_weights, topk_ids, _ = self._select_experts(
-                    hidden_states, input_ids
-                )
+                if image_mask is None:
+                    topk_weights, topk_ids, _ = self._select_experts(
+                        hidden_states, input_ids
+                    )
+                else:
+                    topk_weights, topk_ids, _ = self._select_experts(
+                        hidden_states, input_ids, image_mask
+                    )
 
         shared = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
@@ -2117,13 +2228,19 @@ class DeepseekV4MoE(nn.Module):
         input_ids: torch.Tensor,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
+        image_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
         with nvtx_range("moe_select_experts"):
-            topk_weights, topk_ids, router_scores = self._select_experts(
-                hidden_states, input_ids
-            )
+            if image_mask is None:
+                topk_weights, topk_ids, router_scores = self._select_experts(
+                    hidden_states, input_ids
+                )
+            else:
+                topk_weights, topk_ids, router_scores = self._select_experts(
+                    hidden_states, input_ids, image_mask
+                )
         with nvtx_range("moe_make_topk_output"):
             topk_output = self._make_topk_output(
                 hidden_states, topk_weights, topk_ids, router_scores
@@ -2153,6 +2270,7 @@ class DeepseekV4MoE(nn.Module):
         max_num_tokens_per_gpu: int,
         ctx: ForwardContext | None = None,
         comm_manager: CommManager | None = None,
+        image_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.use_mega_moe:
             return self.forward_mega_moe(
@@ -2160,9 +2278,14 @@ class DeepseekV4MoE(nn.Module):
                 input_ids,
                 ctx,
                 comm_manager,
+                image_mask,
             )
         return self.forward_normal(
-            hidden_states, input_ids, num_global_tokens, max_num_tokens_per_gpu
+            hidden_states,
+            input_ids,
+            num_global_tokens,
+            max_num_tokens_per_gpu,
+            image_mask,
         )
 
 
@@ -3271,6 +3394,7 @@ class DeepseekV4Attention(nn.Module):
                     softmax_scale=self.scale,
                     attn_sink=self.attn_sink,
                     topk_indices=topk_indices,
+                    vision=ctx.dsv4_vision,
                 )
         elif forward_mode.is_decode():
             with nvtx_range(f"{profile_prefix}_decode_backend"):
@@ -3305,6 +3429,7 @@ class DeepseekV4Attention(nn.Module):
                     softmax_scale=self.scale,
                     attn_sink=self.attn_sink,
                     topk_indices=topk_indices,
+                    vision=ctx.dsv4_vision,
                 )
         else:
             raise RuntimeError(f"Unsupported DeepSeek V4 forward mode: {forward_mode}")
@@ -3384,22 +3509,20 @@ class DeepseekV4DecoderLayer(nn.Module):
             torch.empty(3, dtype=torch.float32), requires_grad=False
         )
 
-    def _pre_mlp_input_ids_comm(
-        self, input_ids: torch.Tensor, ctx: ForwardContext
+    def _pre_mlp_sidecar_comm(
+        self, sidecar: torch.Tensor, ctx: ForwardContext
     ) -> torch.Tensor:
         if not self.mapping.moe.has_tp_ep:
-            return input_ids
+            return sidecar
         if self.comm_manager.use_all_reduce(is_moe=True):
-            return input_ids
+            return sidecar
 
         token_counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
         max_tokens = max(token_counts)
-        padded = torch.empty(
-            (max_tokens,), device=input_ids.device, dtype=input_ids.dtype
-        )
-        padded[: input_ids.shape[0]].copy_(input_ids)
-        if input_ids.shape[0] < max_tokens:
-            padded[input_ids.shape[0] :].zero_()
+        padded = torch.empty((max_tokens,), device=sidecar.device, dtype=sidecar.dtype)
+        padded[: sidecar.shape[0]].copy_(sidecar)
+        if sidecar.shape[0] < max_tokens:
+            padded[sidecar.shape[0] :].zero_()
 
         gathered = [torch.empty_like(padded) for _ in token_counts]
         group = pg_manager.get_device_process_group(self.mapping.moe.tp_ep_group)
@@ -3407,6 +3530,88 @@ class DeepseekV4DecoderLayer(nn.Module):
         return torch.cat(
             [tokens[:count] for tokens, count in zip(gathered, token_counts)], dim=0
         )
+
+    def _pre_mlp_input_ids_comm(
+        self, input_ids: torch.Tensor, ctx: ForwardContext
+    ) -> torch.Tensor:
+        return self._pre_mlp_sidecar_comm(input_ids, ctx)
+
+    def _pre_mlp_image_mask_comm(
+        self, image_mask: torch.Tensor, ctx: ForwardContext
+    ) -> torch.Tensor:
+        if image_mask.ndim != 1 or image_mask.dtype != torch.bool:
+            raise ValueError("image_mask must be a rank-1 bool tensor")
+        transported = self._pre_mlp_sidecar_comm(image_mask.to(torch.int32), ctx)
+        return transported.to(torch.bool)
+
+    def _dsv4_moe_group_has_image_span(self, ctx: ForwardContext) -> bool:
+        intersections = getattr(ctx, "global_dsv4_image_span_intersections", None)
+        attn_has_dp = bool(
+            getattr(getattr(self.mapping, "attn", None), "has_dp", False)
+        )
+        if intersections is None:
+            has_local_vision = getattr(ctx, "dsv4_vision", None) is not None
+            if not attn_has_dp or not has_local_vision:
+                return has_local_vision
+            raise RuntimeError(
+                "DeepSeek V4 DP MoE routing requires rank-symmetric image-span metadata"
+            )
+
+        group = self.mapping.moe.tp_ep_group
+        if any(rank < 0 or rank >= len(intersections) for rank in group):
+            raise RuntimeError(
+                "DeepSeek V4 image-span metadata does not cover the MoE TP/EP group"
+            )
+        return any(intersections[rank] for rank in group)
+
+    def _validate_dsv4_rsag_local_rows(
+        self,
+        *,
+        local_rows: int,
+        input_ids: torch.Tensor,
+        local_image_mask: torch.Tensor | None,
+        ctx: ForwardContext,
+    ) -> None:
+        token_counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
+        local_group_rank = self.mapping.moe.tp_ep_rank
+        if local_group_rank >= len(token_counts):
+            raise RuntimeError("DeepSeek V4 local MoE rank is outside its row table")
+        expected_rows = int(token_counts[local_group_rank])
+        if local_rows != expected_rows or input_ids.shape[0] != local_rows:
+            raise RuntimeError(
+                "DeepSeek V4 local image-mask rows must match the local MoE "
+                "scattered count and input-ID rows"
+            )
+        if local_image_mask is not None and (
+            local_image_mask.ndim != 1
+            or local_image_mask.dtype != torch.bool
+            or local_image_mask.shape[0] != local_rows
+        ):
+            raise RuntimeError(
+                "DeepSeek V4 local image-mask rows must match local hidden-state rows"
+            )
+
+    def _cached_dsv4_rsag_image_mask(
+        self,
+        local_image_mask: torch.Tensor | None,
+        local_rows: int,
+        input_ids: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> torch.Tensor | None:
+        if getattr(ctx, "dsv4_moe_image_mask_cached", False):
+            return getattr(ctx, "dsv4_moe_image_mask", None)
+
+        if local_image_mask is None:
+            local_image_mask = torch.zeros(
+                local_rows, dtype=torch.bool, device=input_ids.device
+            )
+        gathered = self._pre_mlp_image_mask_comm(local_image_mask, ctx)
+        # An all-false result is a safe text rollback if upstream metadata and
+        # the sidecar ever disagree; it must not enter the eager image router.
+        cached = gathered if bool(gathered.any().item()) else None
+        ctx.dsv4_moe_image_mask = cached
+        ctx.dsv4_moe_image_mask_cached = True
+        return cached
 
     def forward(
         self,
@@ -3448,9 +3653,17 @@ class DeepseekV4DecoderLayer(nn.Module):
                     norm_weight=self.attn_norm.weight,
                     norm_eps=self.attn_norm.variance_epsilon,
                 )
+        if numerical_attribution_enabled():
+            record_numerical_attribution_boundary(
+                f"layer.{self.layer_id}.attn_pre_norm", hidden_states
+            )
 
         with nvtx_range("attn_total"):
             hidden_states = self.attn(positions, hidden_states, ctx)
+        if numerical_attribution_enabled():
+            record_numerical_attribution_boundary(
+                f"layer.{self.layer_id}.attn_output", hidden_states
+            )
 
         with nvtx_range("hc_fused_ffn_pre"):
             residual, hidden_states, post, comb = mhc_fused_hc(
@@ -3467,8 +3680,22 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_weight=self.ffn_norm.weight,
                 norm_eps=self.ffn_norm.variance_epsilon,
             )
+        if numerical_attribution_enabled():
+            record_numerical_attribution_boundary(
+                f"layer.{self.layer_id}.attn_post_hc", residual
+            )
+        if numerical_attribution_enabled():
+            record_numerical_attribution_boundary(
+                f"layer.{self.layer_id}.ffn_pre_norm", hidden_states
+            )
+        local_moe_rows = hidden_states.shape[0]
 
         ffn_input_ids = input_ids
+        vision = getattr(ctx, "dsv4_vision", None)
+        local_image_mask = None
+        if self.ffn.gate.is_base_layer and vision is not None:
+            local_image_mask = vision.image_mask
+        ffn_image_mask = local_image_mask
         use_mega_moe = getattr(self.ffn, "use_mega_moe", False)
         if use_mega_moe:
             token_counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
@@ -3476,11 +3703,49 @@ class DeepseekV4DecoderLayer(nn.Module):
             max_num_tokens_per_gpu = max(token_counts) if token_counts else 0
         else:
             token_counts = None
+            uses_rsag = (
+                self.mapping.moe.has_tp_ep
+                and not self.comm_manager.use_all_reduce(is_moe=True)
+            )
+            vision_routing_enabled = (
+                self.ffn.gate.is_base_layer
+                and getattr(self.ffn.gate, "bias_vl", None) is not None
+            )
+            group_has_image_span = False
+            if vision_routing_enabled and uses_rsag:
+                group_has_image_span = self._dsv4_moe_group_has_image_span(ctx)
+                if local_image_mask is not None and not group_has_image_span:
+                    raise RuntimeError(
+                        "DeepSeek V4 local image payload is absent from its "
+                        "rank-symmetric MoE group metadata"
+                    )
+                if group_has_image_span:
+                    self._validate_dsv4_rsag_local_rows(
+                        local_rows=local_moe_rows,
+                        input_ids=input_ids,
+                        local_image_mask=local_image_mask,
+                        ctx=ctx,
+                    )
             with nvtx_range("pre_mlp_comm"):
                 hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
             if self.ffn.gate.is_hash_moe:
                 with nvtx_range("pre_mlp_input_ids_comm"):
                     ffn_input_ids = self._pre_mlp_input_ids_comm(input_ids, ctx)
+            if group_has_image_span:
+                with nvtx_range("pre_mlp_image_mask_comm"):
+                    ffn_image_mask = self._cached_dsv4_rsag_image_mask(
+                        local_image_mask, local_moe_rows, input_ids, ctx
+                    )
+                if (
+                    ffn_image_mask is not None
+                    and ffn_image_mask.shape[0] != hidden_states.shape[0]
+                ):
+                    raise RuntimeError(
+                        "DeepSeek V4 gathered image-mask rows must match "
+                        "post-communication hidden-state rows"
+                    )
+            elif uses_rsag:
+                ffn_image_mask = None
             with nvtx_range("moe_get_num_tokens"):
                 num_global_tokens, max_num_tokens_per_gpu = (
                     self.comm_manager.get_num_tokens(ctx)
@@ -3493,12 +3758,21 @@ class DeepseekV4DecoderLayer(nn.Module):
                 max_num_tokens_per_gpu,
                 ctx=ctx if use_mega_moe else None,
                 comm_manager=self.comm_manager if use_mega_moe else None,
+                image_mask=ffn_image_mask,
             )
         if not use_mega_moe:
             with nvtx_range("post_mlp_comm"):
                 hidden_states, _ = self.comm_manager.post_mlp_comm(
                     hidden_states, None, ctx
                 )
+        if numerical_attribution_checkpoint_active():
+            record_numerical_attribution_boundary(
+                f"layer.{self.layer_id}.ffn_output", hidden_states
+            )
+            diagnostic_post_hc = mhc_post(hidden_states, residual, post, comb)
+            record_numerical_attribution_boundary(
+                f"layer.{self.layer_id}.block_post_hc", diagnostic_post_hc
+            )
         # Defer ffn post_mapping to next layer's fused_hc
         return residual, hidden_states, post, comb
 
@@ -3643,7 +3917,18 @@ class DeepseekV4Model(nn.Module):
         ctx: ForwardContext,
         input_embeds: torch.Tensor | None = None,
         pp_inbound: PPStageState | None = None,
+        dsv4_multimodal_context: MultimodalForwardContext | None = None,
     ) -> tuple[torch.Tensor | PPStageState, list[torch.Tensor] | None]:
+        ctx.dsv4_vision = None
+        ctx.dsv4_moe_image_mask = None
+        ctx.dsv4_moe_image_mask_cached = False
+        if dsv4_multimodal_context is not None:
+            ctx.dsv4_vision = build_dsv4_vision_forward(
+                dsv4_multimodal_context,
+                num_tokens=input_ids.numel(),
+                device=input_ids.device,
+                max_image_tokens=int(self.config.vision_max_n_token),
+            )
         if pp_inbound is not None:
             # Mid-pipeline stage: resume the mHC thread state received from
             # the upstream stage instead of embedding.
@@ -3656,6 +3941,10 @@ class DeepseekV4Model(nn.Module):
             if hidden_states is None:
                 with nvtx_range("embed_tokens"):
                     hidden_states = self.embed_tokens(input_ids)
+            if numerical_attribution_enabled():
+                record_numerical_attribution_boundary(
+                    "embedding_pre_hc", hidden_states, preserve_all_rows=True
+                )
             with nvtx_range("hc_repeat"):
                 hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
             hc_x_prev = None
@@ -3723,8 +4012,12 @@ class DeepseekV4Model(nn.Module):
                 self.rms_norm_eps,
                 self.hc_eps,
             )
+        if numerical_attribution_enabled():
+            record_numerical_attribution_boundary("head_input", hidden_states)
         with nvtx_range("final_norm"):
             hidden_states = self.norm(hidden_states)
+        if numerical_attribution_enabled():
+            record_numerical_attribution_boundary("final_norm", hidden_states)
         return hidden_states, aux_hidden_states
 
 
@@ -3742,6 +4035,123 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         if self.mapping.attn.has_dp and isinstance(quant_config, Fp8Config):
             quant_config = None
         return super().resolve_lm_head(config, quant_config, prefix)
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        mapping: Mapping,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        encoder_only: bool = False,
+        is_multimodal_active: bool = True,
+        mm_attention_backend: str | None = None,
+    ) -> None:
+        del mm_attention_backend
+        configured_for_vision = int(getattr(config, "vision_n_layers", 0) or 0) > 0
+        self.is_multimodal_active = configured_for_vision and is_multimodal_active
+        config._tokenspeed_dsv4_vision_active = self.is_multimodal_active
+        super().__init__(
+            config=config,
+            mapping=mapping,
+            quant_config=quant_config,
+            prefix=prefix,
+            encoder_only=encoder_only,
+        )
+        self.multimodal_graph_safe = not self.is_multimodal_active
+        self.last_vision_load_report: dict[str, int] | None = None
+        if not self.is_multimodal_active:
+            self.vision = None
+            self.aligner = None
+            self.image_start = None
+            self.image_end = None
+            self.image_newline = None
+            self.image_pad = None
+            self.multimodal_embedder = None
+            self.image_encoder = None
+            return
+
+        self.vision = DeepseekV4VisionTransformer(config)
+        self.aligner = DeepseekV4VisionAligner(config)
+        self.image_start = nn.Parameter(
+            torch.empty(config.hidden_size), requires_grad=False
+        )
+        self.image_end = nn.Parameter(
+            torch.empty(config.hidden_size), requires_grad=False
+        )
+        self.image_newline = nn.Parameter(
+            torch.empty(config.hidden_size), requires_grad=False
+        )
+        self.image_pad = nn.Parameter(
+            torch.empty(config.hidden_size), requires_grad=False
+        )
+        self.multimodal_embedder = MultimodalEmbedder(encoder_mapping=mapping.vision)
+        self.image_encoder = self.encode_images
+
+    def encode_images(self, items: list[MultimodalDataItem]) -> torch.Tensor:
+        if (
+            self.vision is None
+            or self.aligner is None
+            or self.image_start is None
+            or self.image_end is None
+            or self.image_newline is None
+            or self.image_pad is None
+        ):
+            raise DeepseekV4VisionMetadataError(
+                "DeepSeek V4 vision encoder is disabled"
+            )
+        return encode_image_items(
+            items,
+            self.vision,
+            self.aligner,
+            (
+                self.image_start,
+                self.image_end,
+                self.image_newline,
+                self.image_pad,
+            ),
+        )
+
+    def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
+        if self.image_encoder is None:
+            return {}
+        return {Modality.IMAGE: EncoderSpec(self.image_encoder)}
+
+    def pad_input_ids(
+        self,
+        input_ids: list[int],
+        mm_inputs: MultimodalInputs,
+    ) -> list[int]:
+        return pad_input_tokens(input_ids, mm_inputs)
+
+    def prepare_model_kwargs(
+        self,
+        ctx: ForwardContext,
+        input_ids: torch.Tensor,
+        kwargs: dict,
+    ) -> dict:
+        model_kwargs = super().prepare_model_kwargs(ctx, input_ids, kwargs)
+        multimodal_context = kwargs.get("multimodal_context")
+        if not self.is_multimodal_active or multimodal_context is None:
+            return model_kwargs
+        if self.multimodal_embedder is None or self.model is None:
+            raise DeepseekV4VisionMetadataError(
+                "DeepSeek V4 multimodal input arrived while its vision path is disabled"
+            )
+        input_embeds, embedder_kwargs = self.multimodal_embedder.apply(
+            input_ids=input_ids,
+            text_embedding=self.model.embed_tokens,
+            ctx=multimodal_context,
+            encoders=self.get_multimodal_encoder_specs(),
+            multimodal_model=self,
+        )
+        if embedder_kwargs:
+            raise DeepseekV4VisionMetadataError(
+                "DeepSeek V4 vision bridge must remain embeds-only"
+            )
+        if input_embeds is not None:
+            model_kwargs["input_embeds"] = input_embeds
+        model_kwargs["dsv4_multimodal_context"] = multimodal_context
+        return model_kwargs
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         self.capture_aux_hidden_states = True
@@ -3770,8 +4180,10 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             name = "lm_head.weight"
         if ".shared_experts.w2" in name:
             name = name.replace(".shared_experts.w2", ".shared_experts.down_proj")
-        if ".ffn.gate.bias" in name:
-            name = name.replace(".ffn.gate.bias", ".ffn.gate.e_score_correction_bias")
+        if name.endswith(".ffn.gate.bias"):
+            name = name[: -len(".ffn.gate.bias")] + (
+                ".ffn.gate.e_score_correction_bias"
+            )
         if re.search(r"\.experts\.\d+\.w[123]\.scale$", name):
             scale_name = _deepseek_v4_expert_scale_parameter_name(
                 self.config,
@@ -3781,6 +4193,35 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         elif name.endswith(".scale"):
             name = name[:-6] + ".weight_scale_inv"
         return name
+
+    @staticmethod
+    def _is_vision_weight_name(name: str) -> bool:
+        return name.startswith(("vision.", "aligner.")) or name in {
+            "image_start",
+            "image_end",
+            "image_newline",
+            "image_pad",
+        }
+
+    @staticmethod
+    def _load_exact_parameter(
+        name: str,
+        parameter: nn.Parameter,
+        loaded_weight: torch.Tensor,
+    ) -> int:
+        if parameter.shape != loaded_weight.shape:
+            raise DeepseekV4VisionMetadataError(
+                f"DeepSeek V4 checkpoint tensor {name!r} has shape "
+                f"{tuple(loaded_weight.shape)}, expected {tuple(parameter.shape)}"
+            )
+        if parameter.dtype != loaded_weight.dtype:
+            raise DeepseekV4VisionMetadataError(
+                f"DeepSeek V4 checkpoint tensor {name!r} has dtype "
+                f"{loaded_weight.dtype}, expected {parameter.dtype}"
+            )
+        with torch.no_grad():
+            parameter.copy_(loaded_weight)
+        return loaded_weight.numel() * loaded_weight.element_size()
 
     @staticmethod
     def _block_quant_fp8_weight(
@@ -3805,6 +4246,16 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = self.get_stacked_params_mapping()
         params_dict = dict(self.named_parameters())
+        expected_vision = {
+            name for name in params_dict if self._is_vision_weight_name(name)
+        }
+        expected_bias_vl = {
+            name for name in params_dict if name.endswith(".ffn.gate.bias_vl")
+        }
+        loaded_vision: set[str] = set()
+        loaded_bias_vl: set[str] = set()
+        vision_assigned_bytes = 0
+        mtp_bias_vl_skipped = 0
         moe_loader = build_moe_checkpoint_loader(
             params_dict=params_dict,
             expert_schema=ExpertCheckpointSchema(
@@ -3832,10 +4283,50 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             return pp_start <= layer_id < pp_end
 
         for raw_name, loaded_weight in weights:
+            if self._is_vision_weight_name(raw_name):
+                if not self.is_multimodal_active:
+                    continue
+                if raw_name in loaded_vision:
+                    raise DeepseekV4VisionMetadataError(
+                        f"Duplicate DeepSeek V4 vision checkpoint tensor: {raw_name}"
+                    )
+                param = params_dict.get(raw_name)
+                if param is None or raw_name not in expected_vision:
+                    raise DeepseekV4VisionMetadataError(
+                        f"Unmatched DeepSeek V4 vision checkpoint tensor: {raw_name}"
+                    )
+                vision_assigned_bytes += self._load_exact_parameter(
+                    raw_name, param, loaded_weight
+                )
+                loaded_vision.add(raw_name)
+                # Vision w1 names are consumed here, before the text stacked
+                # w1/w3 mapper can interpret the already-fused official tensor.
+                continue
+
+            if raw_name.startswith("mtp.") and raw_name.endswith(".ffn.gate.bias_vl"):
+                if self.is_multimodal_active:
+                    mtp_bias_vl_skipped += 1
+                continue
+
             name = self._map_weight_name(raw_name)
             if name.startswith("mtp."):
                 continue
             if pp_windowed and not _pp_owns(name):
+                continue
+            if raw_name.endswith(".ffn.gate.bias_vl"):
+                if not self.is_multimodal_active:
+                    continue
+                if name in loaded_bias_vl:
+                    raise DeepseekV4VisionMetadataError(
+                        f"Duplicate DeepSeek V4 bias_vl checkpoint tensor: {raw_name}"
+                    )
+                param = params_dict.get(name)
+                if param is None or name not in expected_bias_vl:
+                    raise DeepseekV4VisionMetadataError(
+                        f"Unmatched DeepSeek V4 bias_vl checkpoint tensor: {raw_name}"
+                    )
+                self._load_exact_parameter(raw_name, param, loaded_weight)
+                loaded_bias_vl.add(name)
                 continue
             if (
                 name.endswith("attn.wo_a.weight")
@@ -3866,6 +4357,29 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                     continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+        if self.is_multimodal_active:
+            missing_vision = sorted(expected_vision - loaded_vision)
+            if missing_vision:
+                raise DeepseekV4VisionMetadataError(
+                    "DeepSeek V4 vision checkpoint is incomplete: "
+                    f"missing_count={len(missing_vision)}, first={missing_vision[:5]}"
+                )
+            missing_bias_vl = sorted(expected_bias_vl - loaded_bias_vl)
+            if missing_bias_vl:
+                raise DeepseekV4VisionMetadataError(
+                    "DeepSeek V4 bias_vl checkpoint is incomplete: "
+                    f"missing_count={len(missing_bias_vl)}, first={missing_bias_vl[:5]}"
+                )
+            self.last_vision_load_report = {
+                "vision_matched": len(loaded_vision),
+                "vision_assigned_bytes": vision_assigned_bytes,
+                "bias_vl_matched": len(loaded_bias_vl),
+                "unmatched": 0,
+                "mtp_skipped": mtp_bias_vl_skipped,
+            }
+            logger.info(
+                "DeepSeek V4 vision load report: %s", self.last_vision_load_report
+            )
         del params_dict, moe_loader
         self.post_load_weights()
         self.warmup_kernels()

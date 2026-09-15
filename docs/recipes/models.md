@@ -792,6 +792,92 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
   --port 8000
 ```
 
+### DeepSeek V4-Flash-Vision
+
+The validated delivery topology for `DeepSeek-V4-Flash-Vision-Exp` is one node
+with exactly four GB200 GPUs: attention and vision TP4, expert parallel size 4,
+and dense TP1. The checkpoint must be locally pinned and complete, with all 48
+weight shards available. Before launching, expose devices `0,1,2,3` in PCI bus
+order and independently verify that the allocation belongs to the current user
+and that no compute process is using those devices.
+
+```bash
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+
+tokenspeed serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
+  --served-model-name deepseek-v4-flash-vision \
+  --trust-remote-code \
+  --attn-tp-size 4 \
+  --enable-expert-parallel \
+  --dense-tp-size 1 \
+  --kv-cache-dtype fp8_e4m3 \
+  --moe-backend mega_moe \
+  --attention-use-fp4-indexer-cache \
+  --max-model-len 80000 \
+  --max-total-tokens 163840 \
+  --chunked-prefill-size 8192 \
+  --enable-mixed-batch \
+  --gpu-memory-utilization 0.9 \
+  --disable-kvstore \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+Multimodal prefill is eager for the entire request. Keep these operational
+constraints in mind:
+
+- The checkpoint supports at most 384 tokens per image.
+- Each atomic image span, including its leading compression padding, must fit
+  within one prefill chunk.
+- `--chunked-prefill-size` must be at least the longest admitted atomic image
+  span. The validated value is 8192; admission fails instead of splitting an
+  oversized span.
+- Prefix-cache reuse stops at the first image span in the prompt. Text before
+  that boundary can still be reused.
+- Captured prefill-graph replay is disabled for every prefill of a batch that
+  contains a multimodal request, including text-only requests in that batch.
+  This is a per-batch rule, not a per-chunk rule. If the measured mixed-batch
+  text cost in the delivery benchmark is dominant, the follow-up is a static,
+  graph-stable `image_mask_buf`; do not bypass the eager safety rule.
+- The vision tower intentionally uses the pinned reference's native rank-3
+  `F.scaled_dot_product_attention` path and therefore uses no fused attention
+  kernel. This parity choice materializes a full `[heads, tokens, tokens]` BF16
+  score matrix per image. Moving to a fused vision-attention kernel is a
+  declared follow-up that requires a recorded user decision and a recalibrated
+  Regime-A basis; numerical ceilings must not be widened.
+
+The delivery benchmark below was measured on one node with four GB200 GPUs,
+using the launch settings above, three discarded warmups, ten measured
+repetitions, `max_new_tokens=1`, and a cache flush before every repetition.
+Prefill time is aggregate device time across the dispatches for the batch;
+vision time is the corresponding encoder subset. Client elapsed time is
+recorded in the benchmark artifact but is not used for these device-time
+figures.
+
+| Shape | Requests | Prefill median / p90 | Vision median / p90 | Prompt tokens/s median / p90 | Requests/s median / p90 | Path |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Text only | 4 | 121.520 / 122.402 ms | 0 / 0 ms | 4419.03 / 4455.96 | 32.916 / 33.192 | replay |
+| Image only | 4 | 766.560 / 981.621 ms | 252.365 / 253.361 ms | 1846.01 / 1950.52 | 5.233 / 5.529 | eager |
+| One image + three text | 4 | 263.041 / 264.344 ms | 68.618 / 68.752 ms | 2991.93 / 3005.94 | 15.207 / 15.278 | eager, co-batched |
+
+Peak benchmark allocation was 62,035 MiB on each device; the live service
+gate peaked at 60,487 MiB on each device. Both are below the configured usable
+limit of 170,523 MiB per device (90% of 189,471 MiB), and neither run observed
+a host or device OOM. These measurements describe the pinned delivery
+checkpoint and topology; remeasure after changing the model, topology, token
+budgets, image grid, or kernel stack.
+
+For troubleshooting, first confirm the four-device topology and the explicit
+FP8 KV-cache setting. An atomic-span admission error means the rendered image
+block exceeds the configured prefill chunk; increase the chunk budget without
+exceeding the service token limits, or reduce the admitted image grid. If an
+image request unexpectedly reaches a captured prefill graph, treat it as a
+safety failure. For memory or latency investigation, collect each device's
+peak independently and separate vision-encoder time from whole-prefill time;
+the delivery benchmark uses three discarded warmups and ten measurements for
+text-only, image-only, and one-image-plus-three-text batches.
+
 **V4-Pro** — 8× B200, tensor-parallel:
 
 ```bash

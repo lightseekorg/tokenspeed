@@ -164,6 +164,8 @@ public:
     void StoreSpecCandidates(std::vector<std::int32_t> ids) { spec_candidate_ids_ = std::move(ids); }
     std::vector<std::int32_t> TakeSpecCandidates() { return std::exchange(spec_candidate_ids_, {}); }
     std::int32_t PrefillSize() const { return token_container_.PrefillSize(); }
+    bool HasAtomicSpans() const { return !atomic_spans_.empty(); }
+    std::span<const std::pair<std::int32_t, std::int32_t>> AtomicSpans() const { return atomic_spans_; }
     PrefillInfo CurrentPrefillInfo() const;
 
     std::int32_t UnscheduledPrefillSize() const {
@@ -229,6 +231,7 @@ private:
     std::int32_t submitted_prompt_size_{0};
     std::int32_t max_new_tokens_{0};
     std::int32_t retraction_count_{0};
+    std::vector<std::pair<std::int32_t, std::int32_t>> atomic_spans_;
     std::vector<std::int32_t> spec_candidate_ids_;
     std::int32_t prefix_granularity_{};
     fsm::State state_;

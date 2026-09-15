@@ -525,10 +525,14 @@ class ModelConfig:
 
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures)
-        self.is_multimodal = is_multimodal_model(self.hf_config.architectures)
+        self.is_multimodal = is_multimodal_model(
+            self.hf_config.architectures, self.hf_config
+        )
         self.is_multimodal_gen = is_multimodal_gen_model(self.hf_config.architectures)
         self.is_image_gen = is_image_gen_model(self.hf_config.architectures)
-        self.is_audio_model = is_audio_model(self.hf_config.architectures)
+        self.is_audio_model = is_audio_model(
+            self.hf_config.architectures, self.hf_config
+        )
 
         language_model_only = bool(getattr(server_args, "language_model_only", False))
         # Target-only flag; never apply to draft / auxiliary checkpoints.
@@ -906,7 +910,10 @@ def is_generation_model(model_architectures: list[str]):
     return True
 
 
-def is_multimodal_model(model_architectures: list[str] | None):
+def is_multimodal_model(
+    model_architectures: list[str] | None,
+    config: PretrainedConfig | None = None,
+):
     multimodal_architectures = {
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
@@ -919,7 +926,13 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "InklingForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
     }
-    return any(arch in multimodal_architectures for arch in model_architectures or [])
+    architectures = model_architectures or getattr(config, "architectures", None) or []
+    if any(arch in multimodal_architectures for arch in architectures):
+        return True
+    return (
+        "DeepseekV4ForCausalLM" in architectures
+        and int(getattr(config, "vision_n_layers", 0) or 0) > 0
+    )
 
 
 def is_multimodal_gen_model(model_architectures: list[str]):
@@ -930,13 +943,17 @@ def is_image_gen_model(model_architectures: list[str]):
     return False
 
 
-def is_audio_model(model_architectures: list[str] | None):
+def is_audio_model(
+    model_architectures: list[str] | None,
+    config: PretrainedConfig | None = None,
+):
     audio_architectures = {
         "InklingForConditionalGeneration",
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3ASRForConditionalGeneration",
     }
-    return any(arch in audio_architectures for arch in model_architectures or [])
+    architectures = model_architectures or getattr(config, "architectures", None) or []
+    return any(arch in audio_architectures for arch in architectures)
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:

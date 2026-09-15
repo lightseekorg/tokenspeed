@@ -365,6 +365,35 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
         if (spec.max_new_tokens < 0) {
             throw std::invalid_argument("Scheduler: max_new_tokens must be non-negative");
         }
+        if (spec.atomic_spans_flat.size() % 2 != 0) {
+            throw std::invalid_argument("Scheduler: atomic spans require an even number of inclusive bounds; got " +
+                                        std::to_string(spec.atomic_spans_flat.size()));
+        }
+        std::int32_t previous_end = -1;
+        for (std::size_t i = 0; i < spec.atomic_spans_flat.size(); i += 2) {
+            const std::int32_t start = spec.atomic_spans_flat[i];
+            const std::int32_t end = spec.atomic_spans_flat[i + 1];
+            const std::string span = "[" + std::to_string(start) + "," + std::to_string(end) + "]";
+            if (start < 0 || end < start) {
+                throw std::invalid_argument("Scheduler: atomic span " + span + " must satisfy 0 <= start <= end");
+            }
+            if (end >= static_cast<std::int64_t>(spec.tokens.size())) {
+                throw std::invalid_argument("Scheduler: atomic span " + span +
+                                            " must end before the request token count " +
+                                            std::to_string(spec.tokens.size()));
+            }
+            if (i != 0 && start <= previous_end) {
+                throw std::invalid_argument("Scheduler: atomic span " + span +
+                                            " must be strictly ascending and non-overlapping");
+            }
+            const std::int64_t span_length = static_cast<std::int64_t>(end) - start + 1;
+            if (span_length > config_.max_scheduled_tokens) {
+                throw std::invalid_argument(
+                    "Scheduler: atomic span " + span + " has length " + std::to_string(span_length) +
+                    " exceeding configured --chunked-prefill-size " + std::to_string(config_.max_scheduled_tokens));
+            }
+            previous_end = end;
+        }
         const std::int64_t generation_reserve =
             config_.role == Role::kP ? 0 : std::max<std::int64_t>(spec.max_new_tokens, config_.decode_input_tokens);
         const std::int64_t token_limit = static_cast<std::int64_t>(spec.tokens.size()) + generation_reserve;

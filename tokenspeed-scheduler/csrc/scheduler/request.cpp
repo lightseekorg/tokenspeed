@@ -31,9 +31,15 @@ Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role 
       token_container_{spec.tokens},
       submitted_prompt_size_{static_cast<std::int32_t>(spec.tokens.size())},
       max_new_tokens_{spec.max_new_tokens},
+      atomic_spans_{},
       prefix_granularity_{prefix_granularity},
       state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, prefix_granularity}}
-                                  : fsm::State{fsm::Bootstrapping{&token_container_, prefix_granularity}}} {}
+                                  : fsm::State{fsm::Bootstrapping{&token_container_, prefix_granularity}}} {
+    atomic_spans_.reserve(spec.atomic_spans_flat.size() / 2);
+    for (std::size_t i = 0; i < spec.atomic_spans_flat.size(); i += 2) {
+        atomic_spans_.emplace_back(spec.atomic_spans_flat[i], spec.atomic_spans_flat[i + 1]);
+    }
+}
 
 PrefillInfo Request::CurrentPrefillInfo() const {
     return std::visit(

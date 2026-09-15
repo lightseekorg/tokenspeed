@@ -25,23 +25,48 @@
 namespace tokenspeed {
 
 std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,
-                               std::int32_t prefix_granularity, std::int32_t promotion_boundary_tokens) {
+                               std::int32_t prefix_granularity, std::int32_t promotion_boundary_tokens,
+                               std::span<const std::pair<std::int32_t, std::int32_t>> atomic_spans) {
     _assert(first_pos >= 0 && unscheduled >= 0 && token_budget >= 0, "prefill positions must be non-negative");
     _assert(prefix_granularity > 0, "prefix_granularity must be > 0");
     std::int32_t chunk_size = std::min(unscheduled, token_budget);
     if (promotion_boundary_tokens > first_pos) {
         chunk_size = std::min(chunk_size, promotion_boundary_tokens - first_pos);
     }
-    if (chunk_size == unscheduled) {
-        return chunk_size;
+    if (chunk_size != unscheduled) {
+        const std::int32_t prefix_page_offset = first_pos % prefix_granularity;
+        if (prefix_page_offset != 0) {
+            const std::int32_t tokens_to_boundary = prefix_granularity - prefix_page_offset;
+            chunk_size = token_budget >= tokens_to_boundary ? tokens_to_boundary : 0;
+        } else {
+            chunk_size -= chunk_size % prefix_granularity;
+        }
     }
 
-    const std::int32_t prefix_page_offset = first_pos % prefix_granularity;
-    if (prefix_page_offset != 0) {
-        const std::int32_t tokens_to_boundary = prefix_granularity - prefix_page_offset;
-        return token_budget >= tokens_to_boundary ? tokens_to_boundary : 0;
+    for (const auto& [span_start, span_end] : atomic_spans) {
+        _assert(!(span_start < first_pos && first_pos <= span_end),
+                "AlignPrefillChunk: chunk starts strictly inside an atomic span");
+        if (span_end < first_pos) {
+            continue;
+        }
+        if (span_start == first_pos) {
+            const std::int32_t span_length = span_end - span_start + 1;
+            _assert(span_length <= unscheduled, "AlignPrefillChunk: atomic span exceeds remaining prefill");
+            if (token_budget < span_length) {
+                return 0;
+            }
+            chunk_size = std::max(chunk_size, span_length);
+            continue;
+        }
+        const std::int32_t chunk_end_exclusive = first_pos + chunk_size;
+        // Fully contained spans are safe and may share one encoder batch. Snap
+        // only when the provisional boundary would divide a later span.
+        if (span_start > first_pos && span_start < chunk_end_exclusive && chunk_end_exclusive <= span_end) {
+            chunk_size = span_start - first_pos;
+            break;
+        }
     }
-    return chunk_size - chunk_size % prefix_granularity;
+    return chunk_size;
 }
 
 std::int32_t StateCheckpointMaterializationStart(std::int32_t before_tokens, std::int32_t after_tokens,

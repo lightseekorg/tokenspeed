@@ -428,6 +428,7 @@ def test_gathered_context_does_not_see_later_control_plane_edits():
     # already dispatched with the previous context must not observe it.
     mm.mrope_positions = torch.zeros(3, 8, dtype=torch.int64)
     assert ctx.mm_inputs[0] is not mm
+    assert ctx.request_ids == ["r0"]
     assert torch.equal(ctx.mm_inputs[0].mrope_positions, positions)
 
 

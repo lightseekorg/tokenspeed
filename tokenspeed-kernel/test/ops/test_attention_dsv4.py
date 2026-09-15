@@ -570,6 +570,213 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
             with self.subTest(override=override):
                 self.assertFalse(_dsv4_use_serial_four_block_indexer_q(**case))
 
+    def test_visible_sparse_prefill_builders_match_frozen_oracle_90112_rows(self):
+        length = 2048
+        positions = torch.arange(length, dtype=torch.int64)
+        token_to_req = torch.zeros(length, dtype=torch.int32)
+        seq_lens = torch.tensor([length], dtype=torch.int32)
+        query_start_loc = torch.tensor([0, length], dtype=torch.int32)
+        gather_lens = seq_lens.clone()
+        topk_indices = torch.arange(4, dtype=torch.int32).expand(length, -1)
+        dense_columns = torch.arange(512, dtype=torch.int64)[None, :]
+        topk_columns = torch.arange(640, dtype=torch.int64)[None, :]
+        comparison_rows = 0
+
+        for fixture_length in (24, 48, 72, 96, 128, 160, 192, 224, 256, 320, 384):
+            for residue in range(4):
+                block_start = 512 + residue
+                visibility_start = block_start + 3 - block_start % 4
+                visibility_end = visibility_start + fixture_length - 1
+                left = torch.zeros(length, dtype=torch.int32)
+                right = torch.zeros(length, dtype=torch.int32)
+                visible_positions = torch.arange(fixture_length, dtype=torch.int32)
+                left[visibility_start : visibility_end + 1] = visible_positions
+                right[visibility_start : visibility_end + 1] = torch.flip(
+                    visible_positions, dims=(0,)
+                )
+
+                window_back = 127
+                starts = (
+                    positions
+                    - window_back
+                    - (left.to(torch.int64) - window_back).clamp(min=0)
+                ).clamp(min=0)
+                ends = torch.minimum(
+                    positions + right.to(torch.int64),
+                    torch.full_like(positions, length - 1),
+                )
+                swa_lens = ends - starts + 1
+
+                dense_actual, dense_lens = dsv4_combine_dense_swa_indices(
+                    positions=positions,
+                    token_to_req_indices=token_to_req,
+                    seq_lens=seq_lens,
+                    compressed_lens=torch.zeros(1, dtype=torch.int32),
+                    gather_lens=gather_lens,
+                    window_size=128,
+                    compress_ratio=1,
+                    workspace_width=length,
+                    compressed_base=0,
+                    left=left,
+                    right=right,
+                    vision_max_n_token=384,
+                )
+                dense_expected = torch.where(
+                    dense_columns < swa_lens[:, None],
+                    starts[:, None] + dense_columns,
+                    torch.full((length, 512), -1, dtype=torch.int64),
+                ).to(torch.int32)
+                torch.testing.assert_close(dense_actual, dense_expected, atol=0, rtol=0)
+                torch.testing.assert_close(
+                    dense_lens, swa_lens.to(torch.int32), atol=0, rtol=0
+                )
+
+                topk_actual, topk_lens_actual = dsv4_combine_topk_swa_indices(
+                    topk_indices=topk_indices,
+                    query_start_loc=query_start_loc,
+                    seq_lens=seq_lens,
+                    gather_lens=gather_lens,
+                    window_size=128,
+                    compress_ratio=4,
+                    topk=4,
+                    workspace_width=length + 512,
+                    compressed_base=512,
+                    left=left,
+                    right=right,
+                    vision_max_n_token=384,
+                )
+                topk_lens = torch.minimum(
+                    (positions + 1) // 4, torch.full_like(positions, 4)
+                )
+                topk_expected = torch.full((length, 640), -1, dtype=torch.int64)
+                is_topk = topk_columns < topk_lens[:, None]
+                topk_expected = torch.where(
+                    is_topk, topk_columns.expand(length, -1), topk_expected
+                )
+                swa_offsets = topk_columns - topk_lens[:, None]
+                topk_expected = torch.where(
+                    (swa_offsets >= 0) & (swa_offsets < swa_lens[:, None]),
+                    512 + starts[:, None] + swa_offsets,
+                    topk_expected,
+                ).to(torch.int32)
+                torch.testing.assert_close(topk_actual, topk_expected, atol=0, rtol=0)
+                torch.testing.assert_close(
+                    topk_lens_actual,
+                    (topk_lens + swa_lens).to(torch.int32),
+                    atol=0,
+                    rtol=0,
+                )
+
+                leading_pad = visibility_start - block_start
+                self.assertEqual(leading_pad, 3 - block_start % 4)
+                self.assertTrue(
+                    torch.equal(
+                        left[block_start:visibility_start],
+                        torch.zeros(leading_pad, dtype=torch.int32),
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(
+                        right[block_start:visibility_start],
+                        torch.zeros(leading_pad, dtype=torch.int32),
+                    )
+                )
+                comparison_rows += length
+
+        self.assertEqual(comparison_rows, 90_112)
+
+    def test_visible_three_span_isolation_and_text_width_regression(self):
+        length = 4096
+        positions = torch.arange(length, dtype=torch.int64)
+        token_to_req = torch.zeros(length, dtype=torch.int32)
+        seq_lens = torch.tensor([length], dtype=torch.int32)
+        gather_lens = seq_lens.clone()
+        left = torch.zeros(length, dtype=torch.int32)
+        right = torch.zeros(length, dtype=torch.int32)
+        for start, end in ((256, 319), (1024, 1151), (2048, 2303)):
+            left[start : end + 1] = torch.arange(end - start + 1, dtype=torch.int32)
+            right[start : end + 1] = torch.arange(
+                end - start, -1, -1, dtype=torch.int32
+            )
+
+        visible, visible_lens = dsv4_combine_dense_swa_indices(
+            positions=positions,
+            token_to_req_indices=token_to_req,
+            seq_lens=seq_lens,
+            compressed_lens=torch.zeros(1, dtype=torch.int32),
+            gather_lens=gather_lens,
+            window_size=128,
+            compress_ratio=1,
+            workspace_width=length,
+            compressed_base=0,
+            left=left,
+            right=right,
+            vision_max_n_token=384,
+        )
+        self.assertEqual(int(visible[1024, visible_lens[1024] - 1]), 1151)
+        self.assertLessEqual(int(visible[1500, visible_lens[1500] - 1]), 1500)
+        self.assertNotIn(2048, visible[1500, : visible_lens[1500]].tolist())
+
+        dense_old, dense_old_lens = dsv4_combine_dense_swa_indices(
+            positions=positions,
+            token_to_req_indices=token_to_req,
+            seq_lens=seq_lens,
+            compressed_lens=torch.zeros(1, dtype=torch.int32),
+            gather_lens=gather_lens,
+            window_size=128,
+            compress_ratio=1,
+            workspace_width=length,
+            compressed_base=0,
+        )
+        dense_static, dense_static_lens = dsv4_combine_dense_swa_indices(
+            positions=positions,
+            token_to_req_indices=token_to_req,
+            seq_lens=seq_lens,
+            compressed_lens=torch.zeros(1, dtype=torch.int32),
+            gather_lens=gather_lens,
+            window_size=128,
+            compress_ratio=1,
+            workspace_width=length,
+            compressed_base=0,
+            vision_max_n_token=384,
+        )
+        torch.testing.assert_close(dense_static_lens, dense_old_lens, atol=0, rtol=0)
+        torch.testing.assert_close(
+            dense_static[:, : dense_old.shape[1]], dense_old, atol=0, rtol=0
+        )
+        self.assertTrue(torch.all(dense_static[:, dense_old.shape[1] :] == -1))
+
+        topk = torch.arange(4, dtype=torch.int32).expand(length, -1)
+        query_start = torch.tensor([0, length], dtype=torch.int32)
+        topk_old, topk_old_lens = dsv4_combine_topk_swa_indices(
+            topk_indices=topk,
+            query_start_loc=query_start,
+            seq_lens=seq_lens,
+            gather_lens=gather_lens,
+            window_size=128,
+            compress_ratio=4,
+            topk=4,
+            workspace_width=length + 1024,
+            compressed_base=1024,
+        )
+        topk_static, topk_static_lens = dsv4_combine_topk_swa_indices(
+            topk_indices=topk,
+            query_start_loc=query_start,
+            seq_lens=seq_lens,
+            gather_lens=gather_lens,
+            window_size=128,
+            compress_ratio=4,
+            topk=4,
+            workspace_width=length + 1024,
+            compressed_base=1024,
+            vision_max_n_token=384,
+        )
+        torch.testing.assert_close(topk_static_lens, topk_old_lens, atol=0, rtol=0)
+        torch.testing.assert_close(
+            topk_static[:, : topk_old.shape[1]], topk_old, atol=0, rtol=0
+        )
+        self.assertTrue(torch.all(topk_static[:, topk_old.shape[1] :] == -1))
+
     def test_v4_table_kernels_do_not_specialize_runtime_geometry(self):
         cases = (
             (
@@ -784,6 +991,108 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class DeepseekV4AttentionOpsTest(unittest.TestCase):
+
+    def test_visible_sparse_prefill_builders_ratios_1_4_128(self):
+        device = torch.device("cuda")
+        length = 512
+        window_size = 128
+        positions_cpu = torch.arange(length, dtype=torch.int64)
+        token_to_req_cpu = torch.zeros(length, dtype=torch.int32)
+        seq_lens_cpu = torch.tensor([length], dtype=torch.int32)
+        gather_lens_cpu = seq_lens_cpu.clone()
+        query_start_cpu = torch.tensor([0, length], dtype=torch.int32)
+        left_cpu = torch.zeros(length, dtype=torch.int32)
+        right_cpu = torch.zeros(length, dtype=torch.int32)
+        left_cpu[128:] = torch.arange(384, dtype=torch.int32)
+        right_cpu[128:] = torch.arange(383, -1, -1, dtype=torch.int32)
+        topk_cpu = torch.arange(4, dtype=torch.int32).expand(length, -1)
+
+        for compress_ratio in (1, 4, 128):
+            compressed_base = length // compress_ratio
+            compressed_lens_cpu = torch.tensor([compressed_base], dtype=torch.int32)
+            workspace_width = compressed_base + length
+            dense_expected, dense_expected_lens = dsv4_combine_dense_swa_indices(
+                positions=positions_cpu,
+                token_to_req_indices=token_to_req_cpu,
+                seq_lens=seq_lens_cpu,
+                compressed_lens=compressed_lens_cpu,
+                gather_lens=gather_lens_cpu,
+                window_size=window_size,
+                compress_ratio=compress_ratio,
+                workspace_width=workspace_width,
+                compressed_base=compressed_base,
+                left=left_cpu,
+                right=right_cpu,
+                vision_max_n_token=384,
+            )
+            dense_actual, dense_actual_lens = dsv4_combine_dense_swa_indices(
+                positions=positions_cpu.to(device),
+                token_to_req_indices=token_to_req_cpu.to(device),
+                seq_lens=seq_lens_cpu.to(device),
+                compressed_lens=compressed_lens_cpu.to(device),
+                gather_lens=gather_lens_cpu.to(device),
+                window_size=window_size,
+                compress_ratio=compress_ratio,
+                workspace_width=workspace_width,
+                compressed_base=compressed_base,
+                left=left_cpu.to(device),
+                right=right_cpu.to(device),
+                vision_max_n_token=384,
+            )
+
+            topk_expected, topk_expected_lens = dsv4_combine_topk_swa_indices(
+                topk_indices=topk_cpu,
+                query_start_loc=query_start_cpu,
+                seq_lens=seq_lens_cpu,
+                gather_lens=gather_lens_cpu,
+                window_size=window_size,
+                compress_ratio=compress_ratio,
+                topk=4,
+                workspace_width=workspace_width,
+                compressed_base=compressed_base,
+                left=left_cpu,
+                right=right_cpu,
+                vision_max_n_token=384,
+            )
+            topk_actual, topk_actual_lens = dsv4_combine_topk_swa_indices(
+                topk_indices=topk_cpu.to(device),
+                query_start_loc=query_start_cpu.to(device),
+                seq_lens=seq_lens_cpu.to(device),
+                gather_lens=gather_lens_cpu.to(device),
+                window_size=window_size,
+                compress_ratio=compress_ratio,
+                topk=4,
+                workspace_width=workspace_width,
+                compressed_base=compressed_base,
+                left=left_cpu.to(device),
+                right=right_cpu.to(device),
+                vision_max_n_token=384,
+            )
+            torch.cuda.synchronize()
+
+            with self.subTest(compress_ratio=compress_ratio, builder="dense"):
+                self.assertEqual(
+                    dense_actual.shape[1],
+                    math.ceil((compressed_base + window_size + 384) / 128) * 128,
+                )
+                torch.testing.assert_close(
+                    dense_actual.cpu(), dense_expected, atol=0, rtol=0
+                )
+                torch.testing.assert_close(
+                    dense_actual_lens.cpu(), dense_expected_lens, atol=0, rtol=0
+                )
+                valid = dense_actual[dense_actual >= 0]
+                self.assertTrue(torch.all(valid < workspace_width))
+            with self.subTest(compress_ratio=compress_ratio, builder="topk"):
+                self.assertEqual(topk_actual.shape[1], 640)
+                torch.testing.assert_close(
+                    topk_actual.cpu(), topk_expected, atol=0, rtol=0
+                )
+                torch.testing.assert_close(
+                    topk_actual_lens.cpu(), topk_expected_lens, atol=0, rtol=0
+                )
+                valid = topk_actual[topk_actual >= 0]
+                self.assertTrue(torch.all(valid < workspace_width))
 
     def test_sanitized_insert_write_safety_under_graph_replay(self):
         # Full producer -> sanitize -> CUDA graph replay -> cache write path.

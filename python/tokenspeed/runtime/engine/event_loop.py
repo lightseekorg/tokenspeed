@@ -33,7 +33,7 @@ import torch.distributed as dist
 import zmq
 from tokenspeed_scheduler import Scheduler
 
-from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.configs.model_config import ModelConfig, is_deepseek_v4
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -53,6 +53,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     resolve_dspark_prefix_replay_tokens,
     scheduler_cache_group_pages,
     should_use_overlap_schedule,
+    validate_atomic_spans_flat,
 )
 from tokenspeed.runtime.epd.prefill_hooks import EpdPrefillHooks
 from tokenspeed.runtime.execution.device import (
@@ -95,6 +96,37 @@ from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
+
+
+def _dsv4_forward_intersects_image_span(forward_op, rid_to_state) -> bool:
+    """Whether this rank's current extend query overlaps an authored image span."""
+    if forward_op is None:
+        return False
+    num_extends = int(forward_op.num_extends())
+    if num_extends <= 0:
+        return False
+
+    for row in range(num_extends):
+        query_len = int(forward_op.input_lengths[row])
+        if query_len <= 0:
+            continue
+        query_start = int(forward_op.extend_prefix_lens[row])
+        query_end = query_start + query_len - 1
+        state = rid_to_state.get(forward_op.request_ids[row])
+        multimodal_inputs = getattr(state, "multimodal_inputs", None)
+        if multimodal_inputs is None:
+            continue
+        for item in multimodal_inputs.mm_items:
+            if (
+                item is None
+                or getattr(item.modality, "name", None) != "IMAGE"
+                or not item.offsets
+            ):
+                continue
+            for span_start, span_end in item.offsets:
+                if int(span_start) <= query_end and int(span_end) >= query_start:
+                    return True
+    return False
 
 
 def maybe_warm_cupti_for_graph_capture() -> None:
@@ -151,7 +183,24 @@ class EventLoop:
         self.global_rank = global_rank
         self.shutdown_event = shutdown_event or threading.Event()
 
+        self._dsv4_instrumentation = None
+        if server_args.enable_dsv4_vision_instrumentation:
+            # Configure observation state before model construction so the
+            # loader and startup allocation hooks are visible when requested.
+            from tokenspeed.runtime.metrics.dsv4_vision_instrumentation import (
+                configure_dsv4_vision_instrumentation,
+            )
+
+            self._dsv4_instrumentation = configure_dsv4_vision_instrumentation(
+                enabled=True,
+                global_rank=global_rank,
+            )
+
         self.model_config = self._load_model_config(server_args.model)
+        self._dsv4_vision_active = bool(
+            self.model_config.is_multimodal_active
+            and is_deepseek_v4(self.model_config.hf_config)
+        )
         if server_args.speculative_draft_model_path is not None:
             draft_model_config = self._load_model_config(
                 server_args.speculative_draft_model_path,
@@ -249,8 +298,8 @@ class EventLoop:
             self.world_cpu_group = pg_manager.get_process_group(
                 "gloo", mapping.world_group
             )
-            self._dp_local_info = torch.zeros(1, 3, dtype=torch.int32)
-            self._dp_global_info = torch.zeros(mapping.world_size, 3, dtype=torch.int32)
+            self._dp_local_info = torch.zeros(1, 4, dtype=torch.int32)
+            self._dp_global_info = torch.zeros(mapping.world_size, 4, dtype=torch.int32)
         num_host_pages = specs.num_host_pages
         # L2 cache-op accounting + rank-synced completion tracking (see
         # cache_hooks.py); a no-op shell when kvstore is disabled. The hooks
@@ -326,6 +375,12 @@ class EventLoop:
             cache_groups=cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
         )
+        if self._dsv4_instrumentation is not None:
+            self._dsv4_instrumentation.record_scheduler_config(
+                disable_prefix_cache=scheduler_cfg.disable_prefix_cache,
+                max_scheduled_tokens=scheduler_cfg.max_scheduled_tokens,
+                prefix_granularity=scheduler_cfg.prefix_granularity,
+            )
         logger.info(
             "Scheduler config: prefix_granularity=%s num_device_pages=%s "
             "max_scheduled_tokens=%s decode_input_tokens=%s "
@@ -347,6 +402,7 @@ class EventLoop:
             [group.group_id for group in cache_groups],
         )
         self.scheduler = Scheduler(scheduler_cfg)
+        self.max_scheduled_tokens = int(scheduler_cfg.max_scheduled_tokens)
         # Per-round batch logging lives on the control plane: it reports
         # scheduler quantities (queue depth, page usage) that the loop already
         # samples, and its counters stay on this thread.
@@ -449,6 +505,12 @@ class EventLoop:
             pause_controller=self._pause,
             memory_controller=self._memory,
             device=self._device,
+            deepseek_v4_vision_enabled=bool(
+                "DeepseekV4ForCausalLM"
+                in tuple(self.model_config.hf_config.architectures or ())
+                and int(getattr(self.model_config.hf_config, "vision_n_layers", 0) or 0)
+                > 0
+            ),
         )
 
         self.output_processor = OutputProcesser(
@@ -691,7 +753,7 @@ class EventLoop:
         if not ready:
             return
 
-        admitted_specs = []
+        admitted_entries = []
         for spec, state, bootstrap in ready:
             # Grammar-aborted (invalid grammar, timed-out compile, or missing
             # backend) requests must not enter the scheduler — they have no
@@ -711,22 +773,135 @@ class EventLoop:
             if self._device.role is DeviceRole.PD_DECODE:
                 # The prompt was computed on the prefill node.
                 state.computed_length = state.input_length
+            previous_state = self.output_processor.rid_to_state.get(spec.request_id)
             self.output_processor.register(spec.request_id, state)
+            if not self._validate_atomic_spans_at_admission(
+                spec,
+                state,
+                previous_state=previous_state,
+                bootstrap=bootstrap,
+            ):
+                continue
             # EPD prefill: an encode-routed request is staged OUT of the
             # scheduler until its embeddings arrive; its P->D sender
             # registration and submission are both deferred to the EPD
             # admission drain (see EpdPrefillHooks.try_stage for why).
-            if self._epd_hooks.try_stage(spec, state, bootstrap):
+            if self._epd_hooks.try_stage(
+                spec, state, bootstrap, previous_state=previous_state
+            ):
                 continue
             if self.kv_transfer is not None:
                 self.kv_transfer.register(spec.request_id, bootstrap)
-            admitted_specs.append(spec)
+            admitted_entries.append((spec, state, previous_state, bootstrap))
 
-        if self._pause_hooks.withhold_admissions(admitted_specs, pause_blocked_before):
+        # Preserve the state and transfer-cleanup context while paused.  On
+        # resume these entries must flow through the same exception-isolating
+        # submit path as immediate admissions; buffering bare specs would lose
+        # the information needed to reject one bad request without leaking its
+        # registered state.
+        if self._pause_hooks.withhold_admissions(
+            admitted_entries, pause_blocked_before
+        ):
             return
 
-        if admitted_specs:
-            self.scheduler.submit_requests(admitted_specs)
+        if admitted_entries:
+            self._submit_admitted_requests(admitted_entries)
+
+    def _validate_atomic_spans_at_admission(
+        self,
+        spec,
+        state,
+        *,
+        previous_state=None,
+        bootstrap=None,
+    ) -> bool:
+        """Reject malformed atomic spans before EPD staging or submission."""
+        try:
+            validate_atomic_spans_flat(
+                spec.atomic_spans_flat,
+                num_tokens=len(spec.tokens),
+                max_scheduled_tokens=self.max_scheduled_tokens,
+            )
+        except ValueError as error:
+            self._reject_at_admission(
+                spec,
+                state,
+                error,
+                previous_state=previous_state,
+                bootstrap=bootstrap,
+            )
+            return False
+        return True
+
+    def _reject_at_admission(
+        self,
+        spec,
+        state,
+        error: Exception | str,
+        previous_state=None,
+        bootstrap=None,
+    ) -> None:
+        """Finish one invalid request without spending a scheduler slot."""
+        message = f"Scheduler rejected request {spec.request_id}: {error}"
+        reject_registered = getattr(self.kv_transfer, "reject_at_admission", None)
+        if reject_registered is not None and bootstrap is not None:
+            try:
+                reject_registered(spec.request_id, bootstrap, message)
+            except Exception:
+                # Admission rejection must remain an isolated, client-visible
+                # finish even if distributed-transfer cleanup is best-effort.
+                logger.warning(
+                    "Failed to clean up cache-transfer state for rejected request %s",
+                    spec.request_id,
+                    exc_info=True,
+                )
+        state.set_finish_with_abort(message)
+        self.output_processor.publish_finished_at_admission(spec.request_id, state)
+        if previous_state is not None and previous_state is not state:
+            # A duplicate id temporarily displaced the already-live request at
+            # register time. Keep its state reachable after rejecting only the
+            # newcomer.
+            self.output_processor.rid_to_state[spec.request_id] = previous_state
+
+    def _submit_admitted_requests(self, admitted_entries: list[tuple]) -> None:
+        """Isolate scheduler validation failures to the offending request.
+
+        The C++ scheduler validates a submitted batch before publishing any of
+        it. If one spec is malformed, retry each entry independently so valid
+        peers still enter the scheduler and the bad entry receives the same
+        admission-finish treatment as a grammar rejection.
+        """
+        normalized = [
+            (
+                entry[0],
+                entry[1],
+                entry[2] if len(entry) > 2 else None,
+                entry[3] if len(entry) > 3 else None,
+            )
+            for entry in admitted_entries
+        ]
+        specs = [spec for spec, _, _, _ in normalized]
+        try:
+            self.scheduler.submit_requests(specs)
+            return
+        except ValueError as batch_error:
+            logger.warning(
+                "Scheduler rejected an admission batch; isolating %d request(s): %s",
+                len(specs),
+                batch_error,
+            )
+
+        for spec, state, previous_state, bootstrap in normalized:
+            try:
+                self.scheduler.submit_requests([spec])
+            except ValueError as error:
+                self._reject_at_admission(
+                    spec,
+                    state,
+                    error,
+                    previous_state=previous_state,
+                    bootstrap=bootstrap,
+                )
 
     @nvtx_range("loop:commit", color="rapids")
     def _pp_broadcast_output_tokens(self, forward_op, results) -> None:
@@ -832,6 +1007,13 @@ class EventLoop:
         self._dp_local_info[0, 0] = num_tokens
         self._dp_local_info[0, 1] = batch_size
         self._dp_local_info[0, 2] = int(forward_mode)
+        self._dp_local_info[0, 3] = int(
+            executes_model_forward
+            and getattr(self, "_dsv4_vision_active", False)
+            and _dsv4_forward_intersects_image_span(
+                forward_op, self.output_processor.rid_to_state
+            )
+        )
         dist.all_gather_into_tensor(
             self._dp_global_info,
             self._dp_local_info,
@@ -840,6 +1022,9 @@ class EventLoop:
         global_num_tokens = self._dp_global_info[:, 0].tolist()
         global_batch_size = self._dp_global_info[:, 1].tolist()
         global_forward_mode = self._dp_global_info[:, 2].tolist()
+        global_dsv4_image_span_intersections = [
+            bool(value) for value in self._dp_global_info[:, 3].tolist()
+        ]
         any_rank_has_work = max(global_num_tokens) > 0
         need_idle_forward = num_tokens == 0 and any_rank_has_work
         all_decode_or_idle = all(
@@ -861,6 +1046,11 @@ class EventLoop:
             all_decode_or_idle=all_decode_or_idle,
             all_extend=all_extend,
             need_idle_forward=need_idle_forward,
+            global_dsv4_image_span_intersections=(
+                global_dsv4_image_span_intersections
+                if getattr(self, "_dsv4_vision_active", False)
+                else None
+            ),
         )
 
     def _num_running(self) -> int:

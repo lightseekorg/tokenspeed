@@ -152,6 +152,19 @@ class DeepseekV4ForwardMetadata:
     # Cached split boundary derived from scheduler num_extends/query_lens.
     num_prefill_reqs: int = 0
     num_prefill_tokens: int = 0
+    # DeepSeek V4 image visibility stays in absolute request coordinates until
+    # the backend performs the single query-local buffer fill.
+    vision_left: torch.Tensor | None = None
+    vision_right: torch.Tensor | None = None
+    vision_atomic_spans: list[list[tuple[int, int]]] = field(default_factory=list)
+    vision_visibility_spans: list[list[tuple[int, int]]] = field(default_factory=list)
+    vision_atomic_spans_in_chunk: list[list[tuple[int, int]]] = field(
+        default_factory=list
+    )
+    vision_visibility_spans_in_chunk: list[list[tuple[int, int]]] = field(
+        default_factory=list
+    )
+    vision_prefill_validated: bool = False
 
     def decode_req_count(self) -> int:
         return max(0, int(self.seq_lens.shape[0]) - int(self.num_prefill_reqs))

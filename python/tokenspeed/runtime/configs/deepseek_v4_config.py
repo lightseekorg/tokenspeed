@@ -29,9 +29,29 @@ class DeepseekV4Config(PretrainedConfig):
         self,
         max_position_embeddings: int = 1048576,
         rope_scaling: dict | None = None,
+        vision_n_layers: int = 0,
+        vision_dim: int = 1024,
+        vision_n_heads: int = 16,
+        vision_inter_dim: int = 2816,
+        vision_patch_size: int = 14,
+        vision_rope_theta: float = 10000.0,
+        vision_downsample_ratio: int = 3,
+        vision_max_n_token: int = 384,
+        vision_min_pixels: int = 147456,
+        vision_max_wh_ratio: int = 8,
         **kwargs,
     ):
         self.max_position_embeddings = max_position_embeddings
         self.rope_scaling = rope_scaling
         self.rope_parameters = rope_scaling or {}
+        self.vision_n_layers = vision_n_layers
+        self.vision_dim = vision_dim
+        self.vision_n_heads = vision_n_heads
+        self.vision_inter_dim = vision_inter_dim
+        self.vision_patch_size = vision_patch_size
+        self.vision_rope_theta = vision_rope_theta
+        self.vision_downsample_ratio = vision_downsample_ratio
+        self.vision_max_n_token = vision_max_n_token
+        self.vision_min_pixels = vision_min_pixels
+        self.vision_max_wh_ratio = vision_max_wh_ratio
         super().__init__(rope_scaling=rope_scaling, **kwargs)

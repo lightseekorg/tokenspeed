@@ -104,6 +104,8 @@ class _FakeLoop:
 
     # The real abort marker so the notify_client contract stays honest.
     _request_abort_or_mark = EventLoop._request_abort_or_mark
+    _reject_at_admission = EventLoop._reject_at_admission
+    _submit_admitted_requests = EventLoop._submit_admitted_requests
 
     def __init__(self, rid_to_state: dict | None = None) -> None:
         self.output_processor = _OutputProcessor(rid_to_state or {})
@@ -201,6 +203,57 @@ def test_admission_gate_buffers_specs_while_paused() -> None:
 
     assert hooks.withhold_admissions(specs, True)
     assert hooks._pause.buffered_specs == specs
+
+
+def test_resume_isolates_invalid_buffered_admission_and_keeps_loop_usable() -> None:
+    class RejectingScheduler(_Scheduler):
+        def submit_requests(self, specs: list) -> None:
+            if any(spec.invalid for spec in specs):
+                raise ValueError("invalid buffered request")
+            super().submit_requests(specs)
+
+    class PublishingOutputProcessor(_OutputProcessor):
+        def __init__(self, rid_to_state: dict) -> None:
+            super().__init__(rid_to_state)
+            self.finished: list[tuple[str, str]] = []
+
+        def publish_finished_at_admission(self, request_id: str, state) -> None:
+            self.finished.append((request_id, state.finish_calls[-1][0]))
+            self.rid_to_state.pop(request_id, None)
+
+    valid_state = _State()
+    invalid_state = _State()
+    hooks, loop = _hooks(rid_to_state={"valid": valid_state, "invalid": invalid_state})
+    loop.scheduler = RejectingScheduler()
+    loop.output_processor = PublishingOutputProcessor(
+        {"valid": valid_state, "invalid": invalid_state}
+    )
+    loop.kv_transfer = None
+    hooks._pause.state = PauseState.PAUSED_NEW
+    valid = SimpleNamespace(request_id="valid", invalid=False)
+    invalid = SimpleNamespace(request_id="invalid", invalid=True)
+    entries = [
+        (valid, valid_state, None, None),
+        (invalid, invalid_state, None, None),
+    ]
+
+    assert hooks.withhold_admissions(entries, True)
+    hooks._pause.state = PauseState.UNPAUSED
+    hooks.apply_transitions(_GrammarManager())
+
+    assert loop.scheduler.submitted == [[valid]]
+    assert loop.output_processor.finished == [
+        (
+            "invalid",
+            "Scheduler rejected request invalid: invalid buffered request",
+        )
+    ]
+
+    following_state = _State()
+    loop.output_processor.rid_to_state["following"] = following_state
+    following = SimpleNamespace(request_id="following", invalid=False)
+    loop._submit_admitted_requests([(following, following_state, None, None)])
+    assert loop.scheduler.submitted[-1] == [following]
 
 
 def test_admission_gate_warns_when_pause_coalesced_with_requests(

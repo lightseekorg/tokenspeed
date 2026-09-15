@@ -129,7 +129,10 @@ class PauseController:
     def __init__(self, send_func) -> None:
         self._send = send_func
         self.state = PauseState.UNPAUSED
-        # RequestSpecs withheld from the scheduler while paused; flushed on resume.
+        # Admission entries withheld from the scheduler while paused; flushed
+        # on resume through EventLoop's exception-isolating submission helper.
+        # Older direct users may still buffer bare RequestSpecs, which
+        # PauseHooks normalizes for compatibility.
         self.buffered_specs: list = []
         # Deferred post-drain action for abort/wait pause OR memory release; held
         # until the scheduler drains. Single-consumer: only one may be armed.
@@ -391,13 +394,22 @@ class PauseHooks:
                 state.set_finish_with_abort("Aborted by pause", notify_client=True)
 
         if not self._pause.admit_blocked and self._pause.buffered_specs:
-            specs = [
-                spec
-                for spec in self._pause.take_buffered_specs()
-                if self._reap_or_keep_buffered_spec(spec)
-            ]
-            if specs:
-                loop.scheduler.submit_requests(specs)
+            entries = []
+            for buffered in self._pause.take_buffered_specs():
+                if isinstance(buffered, tuple):
+                    spec = buffered[0]
+                    entry = buffered
+                else:
+                    # Compatibility for callers/tests that predate admission
+                    # entries. A bare spec has no displaced state or transfer
+                    # bootstrap to restore/clean up.
+                    spec = buffered
+                    state = loop.output_processor.rid_to_state.get(spec.request_id)
+                    entry = (spec, state, None, None)
+                if self._reap_or_keep_buffered_spec(spec):
+                    entries.append(entry)
+            if entries:
+                loop._submit_admitted_requests(entries)
 
     def _reap_or_keep_buffered_spec(self, spec) -> bool:
         """Resolve a buffered spec on resume; return True if it should be admitted.
@@ -423,9 +435,9 @@ class PauseHooks:
         return True
 
     def withhold_admissions(
-        self, admitted_specs: list, pause_blocked_before: bool
+        self, admitted_entries: list, pause_blocked_before: bool
     ) -> bool:
-        """Pause admission gate: while paused, buffer ``admitted_specs`` instead
+        """Pause admission gate: while paused, buffer admission entries instead
         of submitting them (running requests keep stepping) and return True so
         the caller skips submission. Buffered specs are flushed on resume by
         ``apply_transitions``, ahead of any newly-admitted ones, preserving
@@ -442,17 +454,21 @@ class PauseHooks:
         """
         if not self._pause.admit_blocked:
             return False
-        if admitted_specs and not pause_blocked_before:
+        if admitted_entries and not pause_blocked_before:
+            specs = [
+                entry[0] if isinstance(entry, tuple) else entry
+                for entry in admitted_entries
+            ]
             logger.warning(
                 "Pause engaged in the same recv batch as %d generate "
                 "request(s) (rids=%s); their FIFO order relative to the "
                 "pause is not preserved, so a pre-pause request may be "
                 "buffered as post-pause work and run only after resume. "
                 "See TODO(pause-fifo).",
-                len(admitted_specs),
-                [spec.request_id for spec in admitted_specs],
+                len(specs),
+                [spec.request_id for spec in specs],
             )
-        self._pause.buffer_specs(admitted_specs)
+        self._pause.buffer_specs(admitted_entries)
         return True
 
     # -- freeze-loop hook (called from event_loop) -----------------------------

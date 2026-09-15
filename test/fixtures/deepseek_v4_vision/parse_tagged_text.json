@@ -1,0 +1,58 @@
+{
+  "cases": {
+    "empty-path": {
+      "error": "Image path must not be empty",
+      "input": "<image></image>"
+    },
+    "interleaved": {
+      "input": "before<image>first.png</image>after",
+      "output": [
+        {
+          "text": "before",
+          "type": "text"
+        },
+        {
+          "image_url": {
+            "url": "first.png"
+          },
+          "type": "image_url"
+        },
+        {
+          "text": "after",
+          "type": "text"
+        }
+      ]
+    },
+    "multiple": {
+      "input": "<image>first.png</image>middle<image>second.png</image>",
+      "output": [
+        {
+          "image_url": {
+            "url": "first.png"
+          },
+          "type": "image_url"
+        },
+        {
+          "text": "middle",
+          "type": "text"
+        },
+        {
+          "image_url": {
+            "url": "second.png"
+          },
+          "type": "image_url"
+        }
+      ]
+    },
+    "no-tags": {
+      "input": "ordinary text",
+      "output": "ordinary text"
+    },
+    "unterminated": {
+      "error": "Malformed <image>path</image> tag",
+      "input": "<image>missing end tag"
+    }
+  },
+  "revision": "e46e16bf6035c6f317eb2ac7458eb0362926d402",
+  "schema_version": 1
+}

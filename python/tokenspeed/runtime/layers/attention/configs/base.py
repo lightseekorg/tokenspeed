@@ -195,9 +195,19 @@ class AttnConfig:
     # per request) instead of Eagle/MTP's per-step single-token decode. Backends
     # use this to expand decode metadata to spec_num_tokens rows per request.
     draft_block_decode: bool = False
+    # Static multimodal allocation facts. Backends size workspaces from the
+    # model contract, never from whether one particular batch carries media.
+    vision_enabled: bool = False
+    vision_max_n_token: int = 0
     components: tuple[AttnComponentSpec, ...]
 
     def __post_init__(self):
+        if self.vision_max_n_token < 0:
+            raise ValueError("vision_max_n_token must be non-negative")
+        if self.vision_enabled and self.vision_max_n_token <= 0:
+            raise ValueError(
+                "vision-enabled attention requires a positive vision_max_n_token"
+            )
         softmax_components = [
             c for c in self.components if isinstance(c, SoftmaxAttnConfig)
         ]
@@ -238,6 +248,13 @@ def model_wide_kwargs(
     block-decode mode, and — for families that bypass the DSpark width
     convention — the raw speculative width).
     """
+    hf_config = getattr(model_config, "hf_config", None)
+    architectures = tuple(getattr(hf_config, "architectures", None) or ())
+    vision_enabled = bool(
+        not is_draft
+        and "DeepseekV4ForCausalLM" in architectures
+        and int(getattr(hf_config, "vision_n_layers", 0) or 0) > 0
+    )
     kwargs = dict(
         device=server_args.device,
         dtype=model_config.dtype,
@@ -251,6 +268,12 @@ def model_wide_kwargs(
         pd_disaggregation_enabled=server_args.disaggregation_mode != "null",
         is_draft=is_draft,
         draft_block_decode=draft_block_decode,
+        vision_enabled=vision_enabled,
+        vision_max_n_token=(
+            int(getattr(hf_config, "vision_max_n_token", 0) or 0)
+            if vision_enabled
+            else 0
+        ),
     )
     if server_args.speculative_algorithm is not None:
         kwargs.update(

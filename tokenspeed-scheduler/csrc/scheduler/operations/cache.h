@@ -23,6 +23,7 @@
 #include <map>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cache/core/cache_types.h"
@@ -43,7 +44,8 @@ std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config);
 // Incomplete chunks end on a prefix boundary; a final extent stays whole even
 // when it ends off-boundary. Returns 0 when no legal chunk fits the budget.
 std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,
-                               std::int32_t prefix_granularity, std::int32_t promotion_boundary_tokens);
+                               std::int32_t prefix_granularity, std::int32_t promotion_boundary_tokens,
+                               std::span<const std::pair<std::int32_t, std::int32_t>> atomic_spans = {});
 
 // Absolute token boundary of the first output state in (before_tokens,
 // after_tokens]: the latest prefix boundary crossed, or after_tokens if none.
