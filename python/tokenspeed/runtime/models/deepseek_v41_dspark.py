@@ -34,8 +34,8 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import torch
-from torch import nn
 from tokenspeed_kernel.ops.attention.dsv41 import rope_inplace
+from torch import nn
 
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (

@@ -353,8 +353,7 @@ def test_full_eval_writes_result_only_after_completion(
     )
     assert server_command[server_command.index("--moe-backend") + 1] == "mega_moe"
     assert (
-        server_command[server_command.index("--reasoning-parser") + 1]
-        == "deepseek_v31"
+        server_command[server_command.index("--reasoning-parser") + 1] == "deepseek_v31"
     )
     if execution_mode == "graph":
         assert server_command[
