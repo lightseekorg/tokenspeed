@@ -86,9 +86,6 @@ from tokenspeed_kernel.ops.moe import (
     latent_moe_decode_pipeline_available,
     latent_moe_input_projections,
 )
-from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
-    situ_moe_unavailable_reason,
-)
 from tokenspeed_kernel.ops.moe.latent_down import KimiK3LatentDownOp
 from tokenspeed_kernel.ops.residual import attn_res_fwd, attn_res_fwd_available
 from tokenspeed_kernel.ops.tuning import load_packaged_flashinfer_tuning_cache
@@ -1464,7 +1461,6 @@ class KimiLinearMoE(nn.Module):
             mapping,
             moe_backend,
             alt_stream,
-            enforce_eager=bool(global_server_args_dict["enforce_eager"]),
         )
         # AUTO intentionally requests the flashinfer-backed SiTU plan when it was
         # registered at import time; AUTO cannot override MoELayer per model.
@@ -1476,15 +1472,6 @@ class KimiLinearMoE(nn.Module):
                     "TRT-LLM, or Marlin (Hopper W4A16) backend; no portable SiTU "
                     f"Triton fallback exists (selected MoE backend: "
                     f"{moe_backend.value!r})."
-                )
-            # Fail here with the actual reason instead of letting MoELayer's
-            # kernel selection miss the (never-registered) SiTU kernel.
-            reason = situ_moe_unavailable_reason()
-            if reason is not None:
-                raise RuntimeError(
-                    "Kimi-K3's fused SiTU MoE requires flashinfer > 0.6.15 "
-                    f"with native SiTU, unavailable: {reason}. Upgrade "
-                    "flashinfer; no portable SiTU Triton fallback exists."
                 )
             # Out-of-box tactics: seed the autotuner from the in-tree
             # swept table for this GPU/flashinfer combo, if one ships

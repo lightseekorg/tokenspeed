@@ -20,12 +20,7 @@
 
 from __future__ import annotations
 
-import logging
-
 import torch
-from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
-    situ_moe_unavailable_reason,
-)
 from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -34,8 +29,6 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
-
-logger = logging.getLogger(__name__)
 
 platform = current_platform()
 TRTLLM_NVFP4_ISPP_ALIGNMENT = 64
@@ -54,19 +47,14 @@ if platform.is_nvidia:
     from flashinfer.fused_moe.core import (
         get_w2_permute_indices_with_cache,
     )
-
-    # SiTU availability (flashinfer > 0.6.15, PR #4180) and the per-expert
-    # SiTU constant lookup are shared with the MXFP4 TRT-LLM integration.
+    from flashinfer.tllm_enums import ActivationType
     from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
-        _SITU_ACTIVATION_TYPE,
         _positive_situ_value,
     )
 
     def _flashinfer_trtllm_nvfp4_moe_weights(
         plan: dict, w: torch.nn.Module, *, situ: bool
     ):
-        if situ and (reason := situ_moe_unavailable_reason()) is not None:
-            raise RuntimeError(reason)
         _group_size = 16
         _correction_bias = getattr(w, "_correction_bias", None)
         _routing_logits_dtype = getattr(w, "_routing_logits_dtype", torch.bfloat16)
@@ -532,49 +520,38 @@ if platform.is_nvidia:
             routed=True,
         )
 
-    def _register_nvfp4_situ_kernel(function):
-        reason = situ_moe_unavailable_reason()
-        if reason is not None:
-            # Skipping is normal for deployments that don't serve Kimi-K3, so
-            # log at INFO -- but keep the reason (e.g. a flashinfer build
-            # without SiTU), which otherwise vanishes and makes "kernel not
-            # found" failures hard to trace back here.
-            logger.info("Kimi-K3 NVFP4 SiTU MoE kernel not registered: %s", reason)
-            return function
-        return register_kernel(
-            "moe",
-            "apply",
-            name="flashinfer_trtllm_nvfp4_situ_routed_moe_apply",
-            solution="flashinfer_trtllm",
-            weight_preprocessor=flashinfer_trtllm_nvfp4_situ_moe_weights,
-            capability=CapabilityRequirement(
-                vendors=frozenset({"nvidia"}),
-                min_arch_version=ArchVersion(10, 0),
-                max_arch_version=ArchVersion(10, 3),
-            ),
-            signatures=format_signatures(
-                "x",
-                "dense",
-                {torch.bfloat16},
-            ),
-            traits={
-                "weight_dtype": frozenset({"nvfp4"}),
-                "activation": frozenset({"situ"}),
-                "routing_mode": frozenset({"precomputed_topk"}),
-                "supports_deferred_finalize": frozenset({True, False}),
-                "supports_ep": frozenset({True}),
-                "supports_all_to_all_ep": frozenset({False}),
-                "ispp_alignment": frozenset({TRTLLM_NVFP4_ISPP_ALIGNMENT}),
-                # NVFP4 SiTU runs w4a4: the wrapper quantizes the bf16 input
-                # to NVFP4 itself, which the registry models as "input"
-                # (unlike the MXFP4 SiTU cubins, which are w4a8/MXFP8).
-                "internal_activation_dtype": frozenset({"input"}),
-                "supports_bias": frozenset({False}),
-            },
-            priority=Priority.SPECIALIZED,
-        )(function)
-
-    @_register_nvfp4_situ_kernel
+    @register_kernel(
+        "moe",
+        "apply",
+        name="flashinfer_trtllm_nvfp4_situ_routed_moe_apply",
+        solution="flashinfer_trtllm",
+        weight_preprocessor=flashinfer_trtllm_nvfp4_situ_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+        ),
+        signatures=format_signatures(
+            "x",
+            "dense",
+            {torch.bfloat16},
+        ),
+        traits={
+            "weight_dtype": frozenset({"nvfp4"}),
+            "activation": frozenset({"situ"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({True, False}),
+            "supports_ep": frozenset({True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ispp_alignment": frozenset({TRTLLM_NVFP4_ISPP_ALIGNMENT}),
+            # NVFP4 SiTU runs w4a4: the wrapper quantizes the bf16 input
+            # to NVFP4 itself, which the registry models as "input"
+            # (unlike the MXFP4 SiTU cubins, which are w4a8/MXFP8).
+            "internal_activation_dtype": frozenset({"input"}),
+            "supports_bias": frozenset({False}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
     def flashinfer_trtllm_nvfp4_situ_routed_moe_apply(
         plan: dict,
         x: torch.Tensor,
@@ -613,6 +590,6 @@ if platform.is_nvidia:
             do_finalize,
             enable_pdl,
             routed=True,
-            activation_type=_SITU_ACTIVATION_TYPE,
+            activation_type=ActivationType.Situ,
             output=out_buf,
         )

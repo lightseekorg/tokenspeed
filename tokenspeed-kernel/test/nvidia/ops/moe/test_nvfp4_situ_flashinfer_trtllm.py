@@ -33,7 +33,6 @@ registry resolves the (nvfp4, situ, precomputed_topk) plan to this kernel.
 
 from __future__ import annotations
 
-from importlib.util import find_spec
 from types import SimpleNamespace
 
 import pytest
@@ -58,13 +57,7 @@ def _situ_runtime_reason() -> str | None:
         return "requires CUDA"
     if not (10, 0) <= torch.cuda.get_device_capability() <= (10, 3):
         return "flashinfer TRTLLM-Gen SiTU targets the sm_100 family"
-    if find_spec("flashinfer") is None:
-        return "requires flashinfer"
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
-        situ_moe_unavailable_reason,
-    )
-
-    return situ_moe_unavailable_reason()
+    return None
 
 
 _reason = _situ_runtime_reason()

@@ -100,9 +100,6 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
         "tokenspeed.runtime.distributed.process_group_manager.process_group_manager.get_device_process_group",
         mock.Mock(return_value=object()),
     )
-    monkeypatch.setattr(
-        kimi_k3, "situ_moe_unavailable_reason", mock.Mock(return_value=None)
-    )
     monkeypatch.setattr(kimi_k3, "load_packaged_flashinfer_tuning_cache", mock.Mock())
     monkeypatch.setitem(kimi_k3.global_server_args_dict, "enforce_eager", False)
     monkeypatch.setitem(kimi_k3.global_server_args_dict, "max_prefill_tokens", 8192)
