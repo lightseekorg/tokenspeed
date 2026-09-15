@@ -156,9 +156,9 @@ performance result.
    buffers, and delayed peers. Timing uses the slowest rank and alternating
    paired measurements. Never replace the baseline collective with NCCL for
    convenience.
-4. After numerical gates, validate a complete K3 block and a serving smoke. Use
-   an untouched main installation for baseline, not merely an assumed-disabled
-   historical patch stack.
+4. After local correctness and performance gates, proceed directly to the
+   agreed full-model gold-standard benchmark, without an additional serving
+   smoke test. Use an untouched main installation for the baseline.
 5. Freeze the dispatch policy, then run three independent paired clean boots of
    main and the final candidate with the main K3 agentic TP8 EAGLE3 benchmark.
    Preserve dataset, warmup, concurrency/number pairs, all request parameters,
@@ -171,10 +171,11 @@ performance result.
    Graph node tracing. Verify the intended producer/consumer replacement and
    inspect prefill and decode separately. Profiling runs are not timing samples.
 
-GPU tests live under `tokenspeed-kernel/test/nvidia/ops/moe/`:
-`test_latent_down_nvfp4_gpu.py`, the prequantized regression in
-`test_nvfp4_situ_flashinfer_trtllm.py`, and the eight-rank
-`bench_latent_down_nvfp4.py` driver.
+Only unit tests for the new scalar and cooperative quantization kernels are
+included under `tokenspeed-kernel/test/nvidia/ops/moe/`:
+`test_latent_down_nvfp4_gpu.py` and `test_latent_down_nvfp4_cooperative.py`.
+Historical distributed and end-to-end validation above is not an additional
+checked-in test suite.
 
 The pinned EvalScope client advances its dataset offset within a sweep. The
 five CC points therefore use zero-based conversation slices `[0:4]`, `[4:12]`,
@@ -193,97 +194,17 @@ Report fully occupied pure-decode steps separately from partial batches, and
 retain mixed-turn/mixed-prefill steps as separate categories. Do not interpret
 the entire short capture as a steady-state full-concurrency measurement.
 
-## Reproducing the numerical gate
+## Running the kernel unit tests
 
-The cooperative quantizer used by the auto policy lives in
-`nvfp4_input_cooperative.py`. The quantization group stays 16 values, while
-2/4/8 lanes share its scale computation (8/4/2 values per lane). Producer
-geometry, BF16 rounding, mailbox sentinels, readiness and reset remain
-unchanged. The same arithmetic also accepts a plain local tensor, allowing
-quantizer-only, separate gather/quantize and fused timings to be compared.
-The separate benchmark driver also compares it with the original scalar
-quantizer without changing the serving dispatch policy.
-Acceptance requires exact payload/scales, partial-warp masks,
-live-row-only reset, rotating mailboxes, delayed peers and graph replay with
-both PDL policies; performance is decided against main with its original PDL
-setting, not against an artificially disabled baseline.
+The scalar and cooperative quantizers are checked against FlashInfer's packed
+payload and linear scales. Tests cover numerical edge cases, partial rows,
+PDL off/on, CUDA Graph replay and mailbox reset. The cooperative cases exercise
+2/4/8 values per lane and multiple launch geometries. Fusion is in the mailbox
+consumer, not the GEMM.
 
-The experiment names distinguish quantizer organization from fusion:
-
-| Variant | Mailbox consumption | Quantization |
-| --- | --- | --- |
-| `main` | Original BF16 gather | Separate FlashInfer kernel |
-| `old-fused` | Fused with quantization | Original single-lane 16-value scale group |
-| `fused-v*-c*` | Fused with quantization | Cooperative scale group |
-| `separate-v*-c*` | Original BF16 gather | Separate cooperative kernel |
-
-The two cooperative variants use the same quantization primitive, with different
-source readiness/reset handling. Fusion happens in the mailbox consumer, not
-the GEMM. Their fastest launch configurations need not be identical. Pipeline
-time reductions use `main` as the denominator, not `old-fused`; quantizer-only
-reductions instead use `q-fi`. Above 1280, separate variants use the original
-`all_gather_inner` path as described below, with no mailbox-fusion variant.
-
-Run the single-GPU tests with the same installed runtime and FlashInfer version
-used for serving:
+Run with the same Blackwell runtime and FlashInfer version used for serving:
 
 ```bash
 python -m pytest tokenspeed-kernel/test/nvidia/ops/moe/test_latent_down_nvfp4_gpu.py -q
-python -m pytest tokenspeed-kernel/test/nvidia/ops/moe/test_nvfp4_situ_flashinfer_trtllm.py -q
-python -m pytest test/runtime/test_kimi_k3_moe_fork_warmup.py -q
-```
-
-On each of two four-GPU nodes in one verified multicast-capable allocation,
-launch the distributed driver with the same rendezvous address. Supply the
-actual master address, rank and unique output path through task-specific
-environment variables:
-
-```bash
-torchrun --nnodes=2 --nproc-per-node=4 \
-  --node-rank="$K3_NODE_RANK" --master-addr="$K3_MASTER_ADDR" --master-port=8573 \
-  tokenspeed-kernel/test/nvidia/ops/moe/bench_latent_down_nvfp4.py \
-  --mode all --pdl 1 --replays 1000 --output "$K3_GATE_OUTPUT"
-```
-
-Repeat with `--mode all --pdl 0` and `--mode auto --pdl 1`, each with its own
-output file. A graph replay spans both rotating workspaces. The reported
-microseconds are per projection, measured on the slowest rank, with six
-alternating paired timing rounds. Inputs and weights are reused: this is a
-hot-buffer microbenchmark, not a cold-weight or full-model performance claim.
-
-For the cooperative quantizer, run its separate gate:
-
-```bash
 python -m pytest tokenspeed-kernel/test/nvidia/ops/moe/test_latent_down_nvfp4_cooperative.py -q
-torchrun --nnodes=2 --nproc-per-node=4 \
-  --node-rank="$K3_NODE_RANK" --master-addr="$K3_MASTER_ADDR" --master-port=8573 \
-  tokenspeed-kernel/test/nvidia/ops/moe/bench_latent_down_nvfp4_cooperative.py \
-  --pdl 1 --rounds 6 --tokens 1,4,8,9,16,32 --ctas 4,16,64 --replays 1000 \
-  --output "$K3_COOPERATIVE_OUTPUT"
 ```
-
-Repeat with PDL disabled as a diagnostic, not a replacement baseline. The full
-pipeline graph still contains two alternating mailbox slots. Quantizer-only
-controls contain 16 operations per graph to amortize host launch gaps; their
-reported duration is divided by 16 and must not be presented as pipeline time.
-Both quantizer controls retain 16 distinct payload and scale buffers, matching
-FlashInfer's captured allocation pattern. Reusing only two custom outputs would
-give it a different cache working set and bias large-M comparisons. Full
-pipelines retain two distinct output buffers for their two mailbox slots.
-Select configurations on one sweep, then examine those same configurations on
-an independent sweep. Do not select a new minimum from the confirmation sweep.
-
-The cooperative driver accepts widths up to 8192 and an explicit CTA list.
-Expand the grid search for larger M instead of extrapolating from a 64-CTA
-ceiling. Above 1280, the baseline and separate candidate both use main's local
-shard GEMM plus `all_gather_inner`; there is no cooperative mailbox-fusion
-result at these widths. The original mailbox capacity and runtime dispatch
-remain unchanged. Record pure-quantizer and full-pipeline gains separately;
-neither sparse positive points nor a different best geometry at every width
-establish a deployable contiguous interval without boundary validation.
-
-Eager reference construction must complete on every peer before a correctness
-check reuses the same mailbox slot. A local clone or device synchronization is
-not a cross-rank lifetime fence. The cooperative driver therefore adds a barrier
-between reference generation and its first checked variant, outside all timed
-regions. Timed graphs keep the existing two-slot rotation without new barriers.
