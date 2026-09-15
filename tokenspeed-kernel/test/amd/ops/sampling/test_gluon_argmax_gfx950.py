@@ -283,13 +283,31 @@ def test_argmax_public_dispatch_and_repeated_graph_calls(M, N):
             torch.testing.assert_close(out.long(), expected, atol=0, rtol=0)
 
 
-@pytest.mark.skipif(_ARCH != "gfx1250", reason="GFX1250 scratch ownership contract")
+def _scratch_cache_keys_for(logits, stream):
+    prefix = (logits.device.index, stream.cuda_stream, logits.shape[0])
+    return [key for key in argmax_impl._scratch_cache if key[:3] == prefix]
+
+
 def test_argmax_concurrent_streams_use_independent_scratch():
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     xs = [torch.randn(4, MODEL_VOCABS["dsv4"], device="cuda") for _ in streams]
     outputs = [torch.empty(4, dtype=torch.int64, device="cuda") for _ in streams]
-    for stream in streams:
+    scratch_pointers = []
+    for stream, x, out in zip(streams, xs, outputs):
         stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            argmax_impl.argmax(x, out=out)
+        keys = _scratch_cache_keys_for(x, stream)
+        assert keys
+        scratch_pointers.append(
+            {
+                tensor.data_ptr()
+                for key in keys
+                for tensor in argmax_impl._scratch_cache[key]
+            }
+        )
+    # Check ownership directly even if short kernels happen to run serially.
+    assert scratch_pointers[0].isdisjoint(scratch_pointers[1])
     for _ in range(20):
         for stream, x, out in zip(streams, xs, outputs):
             with torch.cuda.stream(stream):
@@ -300,7 +318,6 @@ def test_argmax_concurrent_streams_use_independent_scratch():
         torch.testing.assert_close(out, torch.argmax(x, dim=-1), atol=0, rtol=0)
 
 
-@pytest.mark.skipif(_ARCH != "gfx1250", reason="GFX1250 scratch ownership contract")
 def test_argmax_first_capture_does_not_cache_graph_pool_scratch():
     x = torch.randn(7, MODEL_VOCABS["dsv4"], device="cuda")
     out = torch.empty(7, dtype=torch.int64, device="cuda")
@@ -308,13 +325,12 @@ def test_argmax_first_capture_does_not_cache_graph_pool_scratch():
     argmax_impl.argmax(x, out=out)
     torch.cuda.synchronize()
     stream = torch.cuda.Stream()
-    _, _, splits = argmax_impl._select_config(x.shape[0], x.shape[1], x.dtype)
-    key = (x.device.index, stream.cuda_stream, x.shape[0], splits)
-    argmax_impl._scratch_cache.pop(key, None)
+    for key in _scratch_cache_keys_for(x, stream):
+        argmax_impl._scratch_cache.pop(key)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         argmax_impl.argmax(x, out=out)
-    assert key not in argmax_impl._scratch_cache
+    assert not _scratch_cache_keys_for(x, stream)
     for _ in range(3):
         x.normal_()
         graph.replay()
@@ -323,5 +339,5 @@ def test_argmax_first_capture_does_not_cache_graph_pool_scratch():
         stream.wait_stream(torch.cuda.current_stream())
         argmax_impl.argmax(x, out=out)
     stream.synchronize()
-    assert key in argmax_impl._scratch_cache
+    assert _scratch_cache_keys_for(x, stream)
     torch.testing.assert_close(out, torch.argmax(x, dim=-1), atol=0, rtol=0)

@@ -18,7 +18,7 @@ is unavailable, the public API falls back to PyTorch.
   operator allocates an int64 result.
 - Ties choose the lowest index. NaNs are ignored; all-NaN rows return `-1`.
   Unsupported inputs fall back to `torch.argmax`, including its NaN semantics.
-- On gfx1250, scratch is isolated by device and stream and reused across
+- Scratch is isolated by device and stream and reused across
   serialized calls. Graphs sharing warmed scratch must also replay serially.
   Warm up on the capture stream to avoid scratch initialization during capture;
   cold captures keep their allocations out of the eager cache.
