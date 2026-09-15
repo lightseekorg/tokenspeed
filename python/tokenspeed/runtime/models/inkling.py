@@ -65,7 +65,7 @@ the text-token embedding for that path so tower outputs are never re-normed
 (reference parity).
 
 Prefix caching is supported under the paged-conv defaults; only the rolling
-conv-state fallback requires ``--no-enable-prefix-caching`` (asserted at
+conv-state fallback requires ``--disable-prefix-caching`` (asserted at
 init). Weight loading supports dummy, real BF16, Quark MXFP4, and ModelOpt
 NVFP4 checkpoints (routed experts quantized, quant-exclusion lists translated
 to this module tree). MTP speculative decoding is served by the NextN draft

@@ -1829,7 +1829,7 @@ class ServerArgs:
             help="Enable prefix caching.",
         )
         prefix_cache_group.add_argument(
-            "--no-enable-prefix-caching",
+            "--disable-prefix-caching",
             dest="enable_prefix_caching",
             action="store_false",
             help="Disable prefix caching.",

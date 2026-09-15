@@ -207,7 +207,7 @@ class InputProcessor:
             if self.engine.server_args.enable_prefix_caching:
                 raise ValueError(
                     "input_embeds is provided while prefix caching is enabled. "
-                    "Please add `--no-enable-prefix-caching` when you launch the server "
+                    "Please add `--disable-prefix-caching` when you launch the server "
                     "if you want to use input_embeds as inputs."
                 )
             input_embeds = obj.input_embeds
