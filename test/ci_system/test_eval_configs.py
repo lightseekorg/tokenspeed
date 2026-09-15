@@ -171,12 +171,12 @@ def test_qwen38_flash_next_runs_gsm8k_with_kvstore_enabled():
     assert task["score_threshold"] == 0.96
 
 
-def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b300_and_mi35x():
+def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
     filenames = (
         "deepseek-v4.1-flash-evalscope-gsm8k.yaml",
         "deepseek-v4.1-flash-evalscope-gsm8k-amd.yaml",
     )
-    labels = ("b300-4gpu", "amd-mi35x-4gpu-test")
+    labels = ("b200-4gpu", "amd-mi35x-4gpu-test")
 
     for filename, label in zip(filenames, labels, strict=True):
         task = yaml.safe_load((EVAL_CONFIG_DIR / filename).read_text(encoding="utf-8"))
@@ -203,7 +203,7 @@ def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b300_and_mi35x():
         assert flag_value(eval_tokens, "--eval-batch-size") == "32"
         assert task["score_threshold"] == 0.90
 
-        if label == "b300-4gpu":
+        if label == "b200-4gpu":
             assert "--enable-expert-parallel" in server_tokens
             assert flag_value(server_tokens, "--moe-backend") == "mega_moe"
         else:
