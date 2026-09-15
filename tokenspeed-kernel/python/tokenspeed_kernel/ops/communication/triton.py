@@ -33,6 +33,9 @@ logger = logging.getLogger(__file__)
 
 __all__ = [
     "create_state",
+    "create_hidden_rsag_state",
+    "reduce_scatter_inner",
+    "stage_inner",
     "get_token_dist",
     "reduce_scatter",
     "all_gather",
@@ -71,6 +74,9 @@ class TritonCommState:
     hidden_dim: int
     comm_buff: torch.Tensor | None
     symm_mem_hdl: object | None
+    local_buff: torch.Tensor | None
+    local_symm_mem_hdl: object | None
+    hidden_rsag_max_blocks: int
 
 
 @dataclass
@@ -1052,6 +1058,9 @@ def nvidia_create_rsag_state(
         hidden_dim=hidden_size,
         comm_buff=comm_buff,
         symm_mem_hdl=None,
+        local_buff=None,
+        local_symm_mem_hdl=None,
+        hidden_rsag_max_blocks=0,
     )
 
 
@@ -1520,6 +1529,9 @@ def amd_create_rsag_state(
         hidden_dim=hidden_size,
         comm_buff=comm_buff,
         symm_mem_hdl=symm_mem_hdl,
+        local_buff=None,
+        local_symm_mem_hdl=None,
+        hidden_rsag_max_blocks=0,
     )
 
 
@@ -1732,6 +1744,9 @@ def create_allreduce_residual_rmsnorm_state(
         hidden_dim=hidden_dim,
         comm_buff=comm_buff,
         symm_mem_hdl=symm_mem_hdl,
+        local_buff=None,
+        local_symm_mem_hdl=None,
+        hidden_rsag_max_blocks=0,
     )
 
 
@@ -1949,6 +1964,9 @@ def create_state(
             hidden_dim=0,
             comm_buff=comm_buff,
             symm_mem_hdl=symm_mem_hdl,
+            local_buff=None,
+            local_symm_mem_hdl=None,
+            hidden_rsag_max_blocks=0,
         )
 
     assert max_tokens > 0, "max_tokens must be specified for RS/AG state"
@@ -2303,6 +2321,9 @@ def _attnres_comm_state(
         hidden_dim=0,
         comm_buff=None,
         symm_mem_hdl=None,
+        local_buff=None,
+        local_symm_mem_hdl=None,
+        hidden_rsag_max_blocks=0,
     )
 
 
@@ -2644,3 +2665,350 @@ def all_gather_inner(
         skip_entry_sync=skip_entry_sync,
         safe=safe,
     )
+
+
+# Experimental hidden-axis RS: independent from token-axis RS/AG heuristics.
+_HIDDEN_RSAG_MAX_BLOCKS = 128
+
+
+@triton.jit
+def fence_proxy_alias():
+    """Order accesses through multicast and ordinary virtual aliases."""
+    tl.inline_asm_elementwise(
+        "fence.proxy.alias;", "=r", [], dtype=tl.int32, is_pure=False, pack=1
+    )
+
+
+# ------------------------------------------------------------------------------
+# Signal barriers
+# ------------------------------------------------------------------------------
+
+
+def _validate_hidden_rsag_num_blocks(state: TritonCommState, num_blocks: int) -> None:
+    """Validate a rank-identical, single-resident-wave hidden RS/AG grid."""
+    assert _RSAG_MIN_BLOCKS <= num_blocks <= _HIDDEN_RSAG_MAX_BLOCKS, (
+        f"num_blocks ({num_blocks}) must be in "
+        f"[{_RSAG_MIN_BLOCKS}, {_HIDDEN_RSAG_MAX_BLOCKS}]"
+    )
+    assert num_blocks & (num_blocks - 1) == 0, "num_blocks must be a power of two"
+    assert state.hidden_rsag_max_blocks >= _RSAG_MIN_BLOCKS, (
+        "hidden RS/AG requires create_hidden_rsag_state to establish a "
+        "rank-uniform resident-grid limit"
+    )
+    assert num_blocks <= state.hidden_rsag_max_blocks, (
+        f"num_blocks ({num_blocks}) exceeds the rank-uniform device-SM floor "
+        f"({state.hidden_rsag_max_blocks}); "
+        "hidden RS/AG uses a program-id-keyed cross-rank barrier and therefore "
+        "requires an explicit grid that fits in one physical-SM wave"
+    )
+
+
+def create_hidden_rsag_state(
+    group: dist.ProcessGroup,
+    rank_in_group: int,
+    max_tokens: int,
+    hidden_size: int,
+    device: torch.device | None,
+) -> TritonCommState:
+    """Create persistent buffers for hidden-dimension ReduceScatter/AllGather.
+
+    Args:
+        group: Process group spanning the hidden shards.
+        rank_in_group: This process's rank within ``group``.
+        max_tokens: Maximum captured token bucket.
+        hidden_size: Full hidden width before the even rank split.
+        device: Optional CUDA device; defaults to the current device.
+
+    Returns:
+        A symmetric full-width communication state with a second symmetric
+        local-shard output buffer. Both allocations and their rendezvous
+        handles are stable across CUDA Graph replays.
+    """
+    platform = current_platform()
+    assert (
+        platform.is_nvidia
+    ), f"create_hidden_rsag_state only supports NVIDIA, got {platform}"
+    assert hidden_size % group.size() == 0, (
+        f"hidden_size ({hidden_size}) must be divisible by world size "
+        f"({group.size()})"
+    )
+    device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
+    local_sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    rank_uniform_sm_count = torch.tensor(
+        [local_sm_count], dtype=torch.int32, device=device
+    )
+    dist.all_reduce(rank_uniform_sm_count, op=dist.ReduceOp.MIN, group=group)
+    hidden_rsag_max_blocks = min(
+        _HIDDEN_RSAG_MAX_BLOCKS, int(rank_uniform_sm_count.item())
+    )
+    assert hidden_rsag_max_blocks >= _RSAG_MIN_BLOCKS, (
+        "hidden RS/AG needs at least "
+        f"{_RSAG_MIN_BLOCKS} SMs on every rank, got rank-uniform floor "
+        f"{hidden_rsag_max_blocks}"
+    )
+    # Hidden grids may use more slots than the established token-axis path.
+    # Grow the process-global floor before either persistent hidden allocation;
+    # nvidia_create_rsag_state only applies max(), so it cannot shrink this.
+    hidden_pad_bytes = _HIDDEN_RSAG_MAX_BLOCKS * group.size() * 4
+    symm_mem.set_signal_pad_size(max(symm_mem.get_signal_pad_size(), hidden_pad_bytes))
+    state = nvidia_create_rsag_state(
+        group=group,
+        rank_in_group=rank_in_group,
+        max_tokens=max_tokens,
+        hidden_size=hidden_size,
+        device=device,
+    )
+    state.symm_mem_hdl = symm_mem.rendezvous(state.comm_buff, group=group)
+    state.hidden_rsag_max_blocks = hidden_rsag_max_blocks
+    local_hidden = hidden_size // group.size()
+    local_shape = (max_tokens, local_hidden)
+    state.local_buff, state.local_symm_mem_hdl = _alloc_symm(
+        local_shape, torch.bfloat16, state.device, group
+    )
+    assert state.local_symm_mem_hdl.rank == rank_in_group, "Mismatched local rank id"
+    assert (
+        state.local_symm_mem_hdl.world_size == group.size()
+    ), "Mismatched local world size"
+    # Fail at initialization rather than inside a captured direct-pull kernel if
+    # any peer mapping is absent. This is a host-only handle query and adds no
+    # collective or rank-dependent allocation.
+    for peer in range(group.size()):
+        peer_buffer = state.local_symm_mem_hdl.get_buffer(
+            peer,
+            local_shape,
+            torch.bfloat16,
+            storage_offset=0,
+        )
+        assert peer_buffer.data_ptr() != 0, f"Missing local-buffer mapping for {peer=}"
+        assert (
+            peer_buffer.data_ptr() % 16 == 0
+        ), f"Local-buffer mapping for {peer=} is not 16-byte aligned"
+        if peer == rank_in_group:
+            assert (
+                peer_buffer.data_ptr() == state.local_buff.data_ptr()
+            ), "The local symmetric-memory handle does not map state.local_buff"
+    return state
+
+
+@triton.jit
+def nvidia_rsag_reduce_scatter_kernel_inner(
+    output_ptr,
+    multicast_ptr,
+    signal_pad_ptr,
+    total_tokens,
+    hidden_offset,
+    LOCAL_HIDDEN: tl.constexpr,
+    TOTAL_HIDDEN: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    NUMEL_PER_THREAD: tl.constexpr,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+) -> None:
+    """Reduce one rank's column shard from row-major full-width inputs."""
+    # The entry barrier publishes the stage copy that ran immediately before
+    # this kernel.  Unlike the older token-dimension RS path, this API permits
+    # other work between stage and reduce, so the publication must carry
+    # system release/acquire semantics rather than relying on adjacency.
+    blockwise_barrier(signal_pad_ptr, None, RANK, WORLD_SIZE, sem="acq_rel")
+    sync_threads()
+    # stage_inner wrote through the ordinary VA while this kernel reduces
+    # through its multicast alias.  A fast rank may already be resident in the
+    # barrier while a slow rank is still staging, so the rank acquire alone
+    # does not establish proxy-alias coherence for the following multimem load.
+    fence_proxy_alias()
+
+    chunks_per_row: tl.constexpr = LOCAL_HIDDEN // NUMEL_PER_THREAD
+    total_hidden_chunks: tl.constexpr = TOTAL_HIDDEN // NUMEL_PER_THREAD
+    hidden_offset_chunks = hidden_offset // NUMEL_PER_THREAD
+    total_chunks = total_tokens * chunks_per_row
+
+    pid = tl.program_id(axis=0)
+    tid = get_flat_tid()
+    block_start = pid * BLOCK_SIZE
+
+    while block_start < total_chunks:
+        chunk = block_start + tid
+        mask = chunk < total_chunks
+        row = chunk // chunks_per_row
+        col_chunk = chunk % chunks_per_row
+
+        in_chunk = row * total_hidden_chunks + hidden_offset_chunks + col_chunk
+        in_ptr = (
+            multicast_ptr.to(tl.int64).to(tl.pointer_type(tl.uint64)) + in_chunk * 2
+        )
+        out_ptr = output_ptr.to(tl.pointer_type(tl.uint64)) + chunk * 2
+        x, y, z, w = multimem_ld_reduce_128(in_ptr, mask)
+        local_st_128(out_ptr, x, y, z, w, mask)
+        block_start += tl.num_programs(axis=0) * BLOCK_SIZE
+
+    sync_threads()
+    blockwise_barrier(signal_pad_ptr, None, RANK, WORLD_SIZE, sem="acq_rel")
+
+
+def nvidia_rsag_multimem_reduce_scatter_inner(
+    state: TritonCommState,
+    output: torch.Tensor,
+    total_tokens: int,
+    local_hidden: int,
+    hidden_offset: int,
+    num_blocks: int,
+) -> None:
+    num_elts = total_tokens * local_hidden
+    num_blocks, block_size, num_warps, numel_per_thread = nvidia_rsag_get_launch_config(
+        num_elts, num_blocks=num_blocks
+    )
+    symm_mem_hdl = state.symm_mem_hdl
+    assert symm_mem_hdl is not None, "RSAG state was not rendezvoused at init"
+    assert state.rank_in_group == symm_mem_hdl.rank, "Mismatched rank id"
+    grid = (num_blocks, 1, 1)
+    nvidia_rsag_reduce_scatter_kernel_inner[grid](
+        output_ptr=output,
+        multicast_ptr=symm_mem_hdl.multicast_ptr,
+        signal_pad_ptr=symm_mem_hdl.signal_pad_ptrs_dev,
+        total_tokens=total_tokens,
+        hidden_offset=hidden_offset,
+        LOCAL_HIDDEN=local_hidden,
+        TOTAL_HIDDEN=state.hidden_dim,
+        BLOCK_SIZE=block_size,
+        NUMEL_PER_THREAD=numel_per_thread,
+        RANK=symm_mem_hdl.rank,
+        WORLD_SIZE=symm_mem_hdl.world_size,
+        num_warps=num_warps,
+    )
+
+
+def nvidia_rsag_reduce_scatter_inner(
+    state: TritonCommState,
+    hidden_states: torch.Tensor,
+    tp_hidden_dim: int,
+    num_blocks: int | None,
+) -> torch.Tensor:
+    """Reduce-scatter a full row-major tensor along its hidden dimension.
+
+    Args:
+        state: Persistent symmetric-memory state sized for the full hidden width.
+        hidden_states: This rank's BF16 contribution shaped ``[M, total_hidden]``.
+        tp_hidden_dim: Full hidden width for a strict even rank split. It must
+            equal the width used to create ``state``.
+        num_blocks: Optional rank-identical CTA count. ``None`` selects a
+            payload-scaled power of two from rank-identical ``M``.
+
+    Returns:
+        This rank's reduced contiguous column shard shaped ``[M, local_hidden]``.
+        The result never aliases ``state.comm_buff`` so the kernel cannot overwrite
+        a peer input that another rank has not consumed yet. Stage, ReduceScatter,
+        the local consumer, AllGather, and final materialization must run on one
+        stream. Calls using the same state must not overlap across streams or graphs.
+    """
+    assert tp_hidden_dim == state.hidden_dim, (
+        f"tp_hidden_dim ({tp_hidden_dim}) must equal the state width "
+        f"({state.hidden_dim})"
+    )
+    assert tp_hidden_dim % state.world_size == 0, (
+        f"tp_hidden_dim ({tp_hidden_dim}) must be divisible by world_size "
+        f"({state.world_size})"
+    )
+    local_hidden = tp_hidden_dim // state.world_size
+    assert local_hidden % INNER_AG_NUMEL_PER_THREAD == 0, (
+        f"local hidden width ({local_hidden}) must be a multiple of "
+        f"{INNER_AG_NUMEL_PER_THREAD} bf16"
+    )
+    hidden_offset = state.rank_in_group * local_hidden
+
+    assert hidden_states.dtype == torch.bfloat16, "Only bfloat16 is supported"
+    assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
+    total_tokens, input_hidden = hidden_states.shape
+    assert (
+        input_hidden == tp_hidden_dim
+    ), f"input hidden ({input_hidden}) does not match total hidden ({tp_hidden_dim})"
+    assert (
+        total_tokens <= state.max_token_num
+    ), f"{total_tokens=} exceeds {state.max_token_num=}"
+
+    staged = state.comm_buff[:total_tokens, :]
+    assert hidden_states.data_ptr() == staged.data_ptr(), (
+        "reduce_scatter_inner requires the exact view returned by stage_inner; "
+        "this keeps the stage copy before the BT/HT producer without silently "
+        "inserting another copy"
+    )
+    assert (
+        state.local_buff is not None
+    ), "hidden-dimension reduce-scatter requires create_hidden_rsag_state"
+    output = state.local_buff[:total_tokens, :local_hidden]
+    assert output.shape == (total_tokens, local_hidden)
+    assert output.is_contiguous()
+    assert output.data_ptr() % 16 == 0
+    if num_blocks is None:
+        num_blocks = nvidia_rsag_reduce_scatter_num_blocks([total_tokens], local_hidden)
+    _validate_hidden_rsag_num_blocks(state, num_blocks)
+    nvidia_rsag_multimem_reduce_scatter_inner(
+        state,
+        output,
+        total_tokens,
+        local_hidden,
+        hidden_offset,
+        num_blocks,
+    )
+    return output
+
+
+def nvidia_rsag_stage_inner(
+    state: TritonCommState, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    """Stage a full-width hidden-dimension reduce-scatter contribution."""
+    assert hidden_states.ndim == 2
+    assert hidden_states.dtype == torch.bfloat16, "Only bfloat16 is supported"
+    assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
+    assert hidden_states.shape[1] == state.hidden_dim
+    assert hidden_states.shape[0] <= state.max_token_num
+    staged = state.comm_buff[: hidden_states.shape[0], :]
+    staged.copy_(hidden_states)
+    return staged
+
+
+def reduce_scatter_inner(
+    state: TritonCommState,
+    hidden_states: torch.Tensor,
+    tp_hidden_dim: int,
+    num_blocks: int | None,
+) -> torch.Tensor:
+    """Reduce-scatter along the hidden dimension on NVIDIA.
+
+    Args:
+        state: Persistent symmetric-memory state sized for the full hidden width.
+        hidden_states: This rank's BF16 contribution shaped ``[M, total_hidden]``.
+        tp_hidden_dim: Full hidden width for a strict even rank split.
+        num_blocks: Optional rank-identical power-of-two CTA count in ``[4, 128]``.
+
+    Returns:
+        This rank's reduced contiguous hidden shard. It does not alias the
+        symmetric communication buffer.
+    """
+    platform = current_platform()
+    assert (
+        platform.is_nvidia
+    ), f"reduce_scatter_inner only supports NVIDIA, got {platform}"
+    return nvidia_rsag_reduce_scatter_inner(
+        state,
+        hidden_states,
+        tp_hidden_dim=tp_hidden_dim,
+        num_blocks=num_blocks,
+    )
+
+
+def stage_inner(state: TritonCommState, hidden_states: torch.Tensor) -> torch.Tensor:
+    """Stage a full-width contribution for hidden-dimension ReduceScatter.
+
+    Args:
+        state: State returned by :func:`create_hidden_rsag_state`.
+        hidden_states: Contiguous BF16 contribution shaped ``[M, hidden_size]``.
+
+    Returns:
+        The exact symmetric-buffer view consumed by :func:`reduce_scatter_inner`.
+        It remains valid until the next stage or AllGather on the same state.
+        Stage and its matching ReduceScatter must run on the same stream, and
+        calls using one state must not overlap across streams or graph replays.
+    """
+    platform = current_platform()
+    assert platform.is_nvidia, f"stage_inner only supports NVIDIA, got {platform}"
+    return nvidia_rsag_stage_inner(state, hidden_states)

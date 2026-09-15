@@ -66,6 +66,7 @@ logger = get_colorful_logger(__name__)
 
 _is_capture_mode = False
 _is_cuda_graph_phase = False
+_is_prefill_graph_phase = False
 
 
 def get_is_capture_mode() -> bool:
@@ -74,6 +75,31 @@ def get_is_capture_mode() -> bool:
 
 def get_is_cuda_graph_phase() -> bool:
     return _is_cuda_graph_phase
+
+
+def get_is_prefill_graph_phase() -> bool:
+    return _is_prefill_graph_phase
+
+
+@contextmanager
+def prefill_graph_phase():
+    """Publish breakable-prefill graph state and restore the prior value.
+
+    This is intentionally separate from the full CUDA-graph phase and capture
+    flags.  A breakable prefill graph ends a captured segment around eager
+    attention, so model-wide auxiliary-stream branches that are valid inside a
+    full decode graph cannot be enabled across that break.  K3's qualified
+    prefill-only collective reads this flag directly; unrelated model paths
+    retain their established behavior.
+    """
+
+    global _is_prefill_graph_phase
+    previous = _is_prefill_graph_phase
+    _is_prefill_graph_phase = True
+    try:
+        yield
+    finally:
+        _is_prefill_graph_phase = previous
 
 
 @contextmanager

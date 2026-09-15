@@ -88,7 +88,12 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import maybe_inference_mode
-from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.env import (
+    envs,
+)
+from tokenspeed.runtime.utils.env import (
+    resolve_prefill_graph_max_tokens as _resolve_prefill_graph_max_tokens,
+)
 from tokenspeed.runtime.utils.hf_transformers_utils import get_context_length
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -112,28 +117,6 @@ def _draft_idle_global_num_tokens_for_step(
     if step_idx == 0 or global_bs is None:
         return global_num_tokens
     return global_bs
-
-
-PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 2048
-
-
-def _resolve_prefill_graph_max_tokens(server_args) -> int:
-    """Largest prefill-graph bucket: explicit value, or min(2048, chunk, kv budget).
-
-    Returns 0 (graph off) when the MoE all-to-all backend is DeepEP: an
-    extend-shaped forward takes DeepEP's normal dispatch, whose per-expert
-    receive counts come back to the host, and a host sync cannot be captured.
-    """
-    if server_args.all2all_backend not in (None, "none"):
-        return 0
-    if server_args.prefill_graph_max_tokens is not None:
-        return int(server_args.prefill_graph_max_tokens)
-    cap = PREFILL_GRAPH_DEFAULT_MAX_TOKENS
-    if server_args.chunked_prefill_size:
-        cap = min(cap, int(server_args.chunked_prefill_size))
-    if server_args.max_total_tokens:
-        cap = min(cap, int(server_args.max_total_tokens))
-    return cap
 
 
 def _cache_arena_attr(pool, name: str, default):

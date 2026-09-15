@@ -27,6 +27,29 @@ from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
+PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 2048
+
+
+def resolve_prefill_graph_max_tokens(server_args) -> int:
+    """Resolve the user-level prefill-graph capacity before model loading.
+
+    Returns zero when an all-to-all MoE backend makes the extend path
+    uncapturable. Otherwise an explicit bound wins; the default is capped by
+    both the scheduler's chunk and KV-token budgets.
+    """
+
+    if server_args.all2all_backend not in (None, "none"):
+        return 0
+    if server_args.prefill_graph_max_tokens is not None:
+        return int(server_args.prefill_graph_max_tokens)
+    cap = PREFILL_GRAPH_DEFAULT_MAX_TOKENS
+    if server_args.chunked_prefill_size:
+        cap = min(cap, int(server_args.chunked_prefill_size))
+    if server_args.max_total_tokens:
+        cap = min(cap, int(server_args.max_total_tokens))
+    return cap
+
+
 global_server_args_dict: dict = {
     "attention_backend": ServerArgs.attention_backend,
     "sampling_backend": ServerArgs.sampling_backend,
@@ -64,7 +87,8 @@ global_server_args_dict: dict = {
     "max_cudagraph_capture_size": ServerArgs.max_cudagraph_capture_size,
     "cudagraph_capture_sizes": ServerArgs.cudagraph_capture_sizes,
     "disable_prefill_graph": ServerArgs.disable_prefill_graph,
-    "prefill_graph_max_tokens": ServerArgs.prefill_graph_max_tokens,
+    "prefill_graph_max_tokens": resolve_prefill_graph_max_tokens(ServerArgs),
+    "prefill_graph_capture_sizes": ServerArgs.prefill_graph_capture_sizes,
     "all2all_backend": ServerArgs.all2all_backend,
     "deepep_mode": ServerArgs.deepep_mode,
 }
@@ -112,7 +136,8 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "max_cudagraph_capture_size": server_args.max_cudagraph_capture_size,
             "cudagraph_capture_sizes": server_args.cudagraph_capture_sizes,
             "disable_prefill_graph": server_args.disable_prefill_graph,
-            "prefill_graph_max_tokens": server_args.prefill_graph_max_tokens,
+            "prefill_graph_max_tokens": resolve_prefill_graph_max_tokens(server_args),
+            "prefill_graph_capture_sizes": server_args.prefill_graph_capture_sizes,
             "all2all_backend": server_args.all2all_backend,
             "deepep_mode": server_args.deepep_mode,
         }
