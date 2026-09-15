@@ -40,7 +40,7 @@ requires_registered_replay = pytest.mark.skipif(
     reason="KDA replay ops are not registered on this platform",
 )
 
-from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (  # noqa: E402
+from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (  # noqa: E402
     _gate_tiling,
     batched_kda_commit_conv_window_kernel,
     batched_recurrent_kda_replay_commit,
@@ -780,12 +780,12 @@ def test_fused_verify_no_store_matches_store_and_leaves_tape_untouched():
 @requires_registered_replay
 @pytest.mark.parametrize("n", [1, 4])
 def test_split_verify_wrapper_matches_fused_wrapper(n):
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
+        fused_kda_verify_conv_update,
+    )
     from tokenspeed_kernel.ops.attention.kda.triton import (
         triton_nvidia_kda_fused_paged_verify_no_store,
         triton_nvidia_kda_fused_paged_verify_split,
-    )
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
-        fused_kda_verify_conv_update,
     )
 
     t = 3

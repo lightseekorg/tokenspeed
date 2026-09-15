@@ -29,10 +29,12 @@ from tokenspeed_kernel.platform import ArchVersion, current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
-from tokenspeed_kernel.thirdparty.flashinfer.qsa_sparse import (
-    _FlashInferQSASparseRunner,
-    get_flashinfer_qsa_sparse_runner,
-)
+
+if current_platform().is_nvidia:
+    from tokenspeed_kernel.ops.attention.qsa._flashinfer.runner import (
+        _FlashInferQSASparseRunner,
+        get_flashinfer_qsa_sparse_runner,
+    )
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="QSA sparse attention requires CUDA or ROCm"
@@ -560,8 +562,6 @@ def test_qsa_sparse_attention_flashinfer_fa2_matches_reference_and_reuses_plan(
         pytest.skip("FlashInfer FA2 QSA requires NVIDIA Ampere or newer")
     if cache_dtype is torch.float8_e4m3fn and platform.arch_version < ArchVersion(9, 0):
         pytest.skip("FP8 FlashInfer FA2 QSA requires NVIDIA Hopper or newer")
-    pytest.importorskip("flashinfer.sparse")
-
     torch.manual_seed(37 + rows)
     cache_slots, q_heads, kv_heads, head_dim, width = 4096, 6, 1, 256, 2051
     q = torch.randn(rows, q_heads, head_dim, device=device, dtype=torch.bfloat16)
@@ -664,8 +664,6 @@ def test_flashinfer_qsa_runner_reuses_one_high_watermark_buffer(device: str) -> 
     platform = current_platform()
     if not platform.is_nvidia or platform.arch_version < ArchVersion(8, 0):
         pytest.skip("FlashInfer FA2 QSA requires NVIDIA Ampere or newer")
-    pytest.importorskip("flashinfer.sparse")
-
     rows, width, head_dim = 4, 33, 64
     q = torch.randn(rows, 4, head_dim, dtype=torch.bfloat16, device=device)
     cache = torch.randn(64, 1, head_dim, dtype=torch.bfloat16, device=device)
@@ -723,8 +721,6 @@ def test_qsa_sparse_attention_flashinfer_fa2_supports_graph_replay(
     platform = current_platform()
     if not platform.is_nvidia or platform.arch_version < ArchVersion(9, 0):
         pytest.skip("graph test requires FlashInfer FA2 on Hopper or newer")
-    pytest.importorskip("flashinfer.sparse")
-
     torch.manual_seed(97)
     cache_slots, width = 4096, 2051
     q = torch.randn(1, 6, 256, device=device, dtype=torch.bfloat16)

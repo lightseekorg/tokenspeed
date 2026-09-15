@@ -28,7 +28,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.communication.fabric import fabric_allocation_supported
-from tokenspeed_kernel.thirdparty.deep_ep import load_deep_ep
+from tokenspeed_kernel.platform import current_platform
 
 __all__ = [
     "Buffer",
@@ -90,9 +90,9 @@ class _MissingBuffer(metaclass=_MissingBufferMeta):
         _raise_deepep_unavailable()
 
 
-try:
-    Buffer = load_deep_ep().Buffer
-except ImportError:
+if current_platform().is_nvidia:
+    from deep_ep import Buffer
+else:
     Buffer = _MissingBuffer
 
 

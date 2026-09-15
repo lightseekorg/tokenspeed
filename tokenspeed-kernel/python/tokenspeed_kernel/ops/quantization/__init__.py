@@ -27,6 +27,7 @@ __all__ = [
     "fp8_quantize_dequantize",
     "quantize_fp8",
     "quantize_fp8_with_scale",
+    "quantize_fp8_group32_ue8m0_swizzled",
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_mxfp4",
@@ -441,6 +442,62 @@ def quantize_mxfp4(
             scale_layout=scale_layout,
             enable_pdl=enable_pdl,
         )
+
+
+def quantize_fp8_group32_ue8m0_swizzled(
+    x: torch.Tensor,
+    *,
+    override: str | None,
+    solution: str | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize exact group-32 E4M3 values directly into F8_128x4 scales.
+
+    Args:
+        x: CUDA BF16/FP16 ``[M,K]`` with unit column stride and K divisible by 32.
+            Row stride may include a gap. The scale rule retains the existing
+            ``amax >= 1e-4`` floor, IEEE upward power-of-two rounding and FP32
+            round-to-nearest division before E4M3 conversion.
+        override: Optional exact registered kernel name.
+        solution: Optional registered implementation restriction.
+
+    Returns:
+        Contiguous FP8 ``[M,K]`` and uint8 one-dimensional scales in the
+        F8_128x4 layout. Every scale byte is written, including zero padding to
+        ``round_up(M,128) * round_up(K/32,4)``. Storage belongs to this call;
+        no previous eager or captured output is cached or reused.
+    """
+    if (
+        not x.is_cuda
+        or x.ndim != 2
+        or x.dtype not in (torch.bfloat16, torch.float16)
+        or x.shape[1] <= 0
+        or x.shape[1] % 32
+        or x.stride(1) != 1
+    ):
+        raise ValueError(
+            "Exact swizzled FP8 quantization requires CUDA BF16/FP16 [M,K], "
+            "positive K divisible by 32 and contiguous columns"
+        )
+    kernel = select_kernel(
+        "quantization",
+        "fp8_group32_ue8m0_swizzled",
+        format_signature(x=dense_tensor_format(x.dtype)),
+        traits={},
+        solution=solution,
+        override=override,
+    )
+    shape_params = {"shape": tuple(x.shape), "scale_layout": "F8_128x4"}
+    ShapeCapture.get().record(
+        "quantization", "fp8_group32_ue8m0_swizzled", kernel.name, x.dtype, shape_params
+    )
+    with kernel_scope(
+        "quantization",
+        "fp8_group32_ue8m0_swizzled",
+        x.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(x)
 
 
 # Backend registration (side-effect imports).

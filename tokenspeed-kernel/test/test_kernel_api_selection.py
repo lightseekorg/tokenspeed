@@ -132,7 +132,7 @@ from tokenspeed_kernel.ops.moe.triton import (
 )
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
-from tokenspeed_kernel.registry import KernelRegistry, Priority, error_fn
+from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import (
     SelectedKernel,
     select_kernel,
@@ -257,6 +257,7 @@ def test_residual_family_exports_and_modes():
         "gated_residual_combine",
         "gated_residual_mix",
         "mhc_fused_hc",
+        "mhc_mixes",
         "mhc_post",
         "mhc_pre",
         "prepare_gated_residual_weight_cache",
@@ -276,8 +277,10 @@ def test_residual_family_exports_and_modes():
         "attn_res_fwd",
         "hyperconnection_combine",
         "hyperconnection_mix",
+        "mhc_mixes",
         "mhc_post",
         "mhc_pre",
+        "normalized_dot_gate",
     }
 
 
@@ -398,17 +401,11 @@ def _is_hopper_plus(platform: PlatformInfo) -> bool:
 
 
 def _is_hopper_plus_with_flashmla(platform: PlatformInfo) -> bool:
-    return (
-        _is_hopper_plus(platform)
-        and _attention_flash_mla.flash_mla_with_kvcache is not error_fn
-    )
+    return _is_hopper_plus(platform)
 
 
 def _is_hopper_plus_with_flashmla_prefill(platform: PlatformInfo) -> bool:
-    return (
-        _is_hopper_plus(platform)
-        and _attention_cuda_dsv4.flash_mla_sparse_fwd is not error_fn
-    )
+    return _is_hopper_plus(platform)
 
 
 def _is_nvidia(platform: PlatformInfo) -> bool:
@@ -421,16 +418,6 @@ def _is_nvidia_with_dsv4_cuda(platform: PlatformInfo) -> bool:
 
 def _is_nvidia_with_cute_dsl(platform: PlatformInfo) -> bool:
     return platform.is_nvidia and _sampling_cute_dsl.is_available()
-
-
-def _is_hopper_plus_with_deep_gemm(platform: PlatformInfo) -> bool:
-    # The FP8 DeepEP apply kernel only registers when the optional DeepGEMM
-    # package exposes the masked grouped GEMM, so gate on that too.
-    return (
-        platform.is_nvidia
-        and platform.arch_version >= ArchVersion(9, 0)
-        and _moe_deep_gemm_deepep_fp8.m_grouped_fp8_gemm_nt_masked is not None
-    )
 
 
 def _is_cdna4(platform: PlatformInfo) -> bool:
@@ -4791,7 +4778,7 @@ _CASES = [
         _moe_apply_nvfp4_deepep_cutedsl,
     ),
     _case(
-        _is_hopper_plus_with_deep_gemm,
+        _is_hopper_plus,
         "hopper-plus",
         "moe",
         "apply",

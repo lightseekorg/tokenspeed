@@ -30,7 +30,7 @@ def test_gb300_slurm_path_filter_ignores_other_vendor_workflows():
         "tokenspeed-kernel/test/conftest.py",
         "tokenspeed-kernel/test/utils.py",
         "tokenspeed-kernel/test/ops/test_attention.py",
-        "tokenspeed-kernel/test/thirdparty/test_kda_mtp_verify.py",
+        "tokenspeed-kernel/test/ops/attention/test_kda_mtp_verify.py",
         "tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/mha/gluon.py",
     ],
 )

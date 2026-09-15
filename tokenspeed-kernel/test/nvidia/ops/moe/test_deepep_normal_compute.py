@@ -36,14 +36,12 @@ from tokenspeed_kernel.ops.moe.triton.deepep_permute import (
     deepep_gather,
     deepep_scatter,
 )
+from tokenspeed_kernel.platform import current_platform
 
-if not torch.cuda.is_available():
-    pytest.skip("CUDA required", allow_module_level=True)
+if not torch.cuda.is_available() or not current_platform().is_hopper_plus:
+    pytest.skip("NVIDIA Hopper or newer required", allow_module_level=True)
 
-deep_gemm = pytest.importorskip(
-    "tokenspeed_kernel.thirdparty.deep_gemm",
-    reason="DeepGEMM is an optional dependency",
-)
+import deep_gemm  # noqa: E402
 
 _BLOCK = 128
 

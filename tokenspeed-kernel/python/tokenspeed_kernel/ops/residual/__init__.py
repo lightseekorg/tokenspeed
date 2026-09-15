@@ -521,6 +521,61 @@ def gated_residual_combine(
 # ===-----------------------------------------------------------------------===#
 
 
+def mhc_mixes(
+    residual: _torch.Tensor,
+    weight: _torch.Tensor,
+    scale: _torch.Tensor,
+    base: _torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+) -> tuple[_torch.Tensor, _torch.Tensor, _torch.Tensor]:
+    """Produce mHC coefficients separately from applying the pre-mix.
+
+    Args:
+        residual: Contiguous BF16 residual streams [T,4,H].
+        weight: Contiguous FP32 mixing projection [24,4*H].
+        scale: FP32 pre/post/combine scales [3].
+        base: FP32 mixing biases [24].
+        rms_eps: Epsilon for residual RMS normalization.
+        hc_eps: Epsilon for pre-mix and Sinkhorn normalization.
+        sinkhorn_iters: Positive number of Sinkhorn iterations.
+
+    Returns:
+        FP32 pre/post coefficients [T,4] and combine coefficients [T,4,4],
+        whose last two axes are input and output residual streams. The caller
+        chooses when to consume pre; no layer input or request state is retained.
+    """
+    if residual.ndim != 3 or residual.shape[1] != 4:
+        raise ValueError("mhc_mixes requires residual [T,4,H]")
+    if (
+        weight.shape != (24, 4 * residual.shape[-1])
+        or scale.shape != (3,)
+        or base.shape != (24,)
+    ):
+        raise ValueError("mhc_mixes projection/scale/base shapes disagree")
+    if residual.dtype != _torch.bfloat16 or any(
+        t.dtype != _torch.float32 for t in (weight, scale, base)
+    ):
+        raise ValueError("mhc_mixes requires BF16 residual and FP32 parameters")
+    if sinkhorn_iters < 1 or any(
+        not t.is_contiguous() or t.device != residual.device
+        for t in (residual, weight, scale, base)
+    ):
+        raise ValueError(
+            "mhc_mixes requires contiguous colocated tensors and positive iterations"
+        )
+    kernel = select_kernel(
+        "residual",
+        "mhc_mixes",
+        format_signature(residual=dense_tensor_format(residual.dtype)),
+        traits=None,
+        override=None,
+        solution=None,
+    )
+    return kernel(residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_iters)
+
+
 def mhc_pre(
     residual: _torch.Tensor,
     fn: _torch.Tensor,
@@ -736,6 +791,59 @@ __all__ = [
     "gated_residual_mix",
     "prepare_gated_residual_weight_cache",
     "mhc_fused_hc",
+    "mhc_mixes",
     "mhc_post",
     "mhc_pre",
 ]
+
+
+def normalized_dot_gate(residual, key_value, query_weight, key_weight, mask, eps):
+    """Add a shared value to residual streams using a normalized dot gate.
+
+    Args:
+        residual: Contiguous BF16 residual streams [...,C,H].
+        key_value: BF16 [...,(C+1)*H], holding C keys followed by a shared value.
+        query_weight: BF16 query normalization weights [C,H].
+        key_weight: BF16 key normalization weights [C,H].
+        mask: Boolean [...] participation mask; false rows pass through unchanged.
+        eps: Positive epsilon for both RMS normalizations.
+
+    Returns:
+        BF16 [...,C,H]. Each stream uses sigmoid(signed_sqrt(dot)) as its
+        value gate; dot is the weighted normalized dot divided by sqrt(H).
+        The square-root magnitude is floored at sqrt(1e-6), matching Engram.
+    """
+    if residual.ndim < 3 or min(residual.shape[-2:]) < 1:
+        raise ValueError("normalized_dot_gate requires residual [...,C,H]")
+    hc, dim = residual.shape[-2:]
+    shape = residual.shape[:-2]
+    if (
+        key_value.shape != (*shape, (hc + 1) * dim)
+        or query_weight.shape != (hc, dim)
+        or key_weight.shape != (hc, dim)
+        or mask.shape != shape
+        or mask.dtype != _torch.bool
+        or eps <= 0
+    ):
+        raise ValueError("normalized_dot_gate shapes, mask or epsilon are invalid")
+    values = (residual, key_value, query_weight, key_weight)
+    if (
+        not residual.is_cuda
+        or any(t.dtype != _torch.bfloat16 for t in values)
+        or any(
+            not t.is_contiguous() or t.device != residual.device
+            for t in (*values, mask)
+        )
+    ):
+        raise ValueError(
+            "normalized_dot_gate requires contiguous colocated GPU BF16 operands"
+        )
+    kernel = select_kernel(
+        "residual",
+        "normalized_dot_gate",
+        format_signature(residual=dense_tensor_format(residual.dtype)),
+        traits=None,
+        override=None,
+        solution=None,
+    )
+    return kernel(residual, key_value, query_weight, key_weight, mask, eps)

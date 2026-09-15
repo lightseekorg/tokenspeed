@@ -20,6 +20,8 @@
 
 """Native CuteDSL state ABI and parity with the former preparation sequence."""
 
+import math
+
 import pytest
 import tokenspeed_kernel.ops.attention.kda.cute_dsl as cutedsl_op
 import torch
@@ -89,9 +91,16 @@ def test_dispatch_native_state_and_shared_boundaries(
         seen.append(initial)
         return v, final
 
-    monkeypatch.setattr(cutedsl_op, "cutedsl_kda_check_config", lambda bound: None)
-    monkeypatch.setattr(cutedsl_op, "cutedsl_kda_workspace_size", lambda *a, **k: 0)
-    monkeypatch.setattr(cutedsl_op, "cutedsl_kda_forward", forward)
+    monkeypatch.setattr(
+        cutedsl_op, "cutedsl_kda_check_config", lambda bound: None, raising=False
+    )
+    monkeypatch.setattr(
+        cutedsl_op,
+        "cutedsl_kda_workspace_size",
+        lambda *a, **k: 0,
+        raising=False,
+    )
+    monkeypatch.setattr(cutedsl_op, "cutedsl_kda_forward", forward, raising=False)
     registry = KernelRegistry.get()
     real_platform = Platform.get()
     try:
@@ -111,7 +120,7 @@ def test_dispatch_native_state_and_shared_boundaries(
 
 @pytest.fixture
 def native_cuda():
-    if not torch.cuda.is_available() or not cutedsl_op.is_cutedsl_kda_installed():
+    if not torch.cuda.is_available() or not cutedsl_op.cutedsl_kda_supported():
         pytest.skip("requires CUDA and the native CuteDSL KDA payload")
 
 
@@ -143,7 +152,7 @@ def _former_preparation(inputs, state, bounds, cpu):
         beta,
         bounds,
         native_state,
-        scale=cutedsl_op.DEFAULT_SCALE,
+        scale=1.0 / math.sqrt(q.shape[-1]),
         workspace=workspace,
         cu_seqlens_cpu=cpu,
     )

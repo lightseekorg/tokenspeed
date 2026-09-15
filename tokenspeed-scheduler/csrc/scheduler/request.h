@@ -116,11 +116,11 @@ public:
         return std::get_if<State>(&state_);
     }
 
-    // True in every state that owns block tables (the ForwardState family);
-    // Bootstrapping, Submitted, Retracted and Finished hold no pages.
+    // True in every state that carries ForwardResources; Bootstrapping,
+    // Submitted, Retracted and Finished hold no pages.
     bool HoldsPages() const {
         return std::visit(Overloaded{
-                              [](const std::derived_from<fsm::ForwardState> auto&) { return true; },
+                              [](const fsm::HoldsForwardResources auto&) { return true; },
                               [](const auto&) { return false; },
                           },
                           state_);
@@ -131,7 +131,7 @@ public:
     // (Submitted, Retracted, Finished) owe nothing by construction.
     std::int32_t ResultsInFlight() const {
         return std::visit(Overloaded{
-                              [](const std::derived_from<fsm::ForwardState> auto& s) { return s.ResultsInFlight(); },
+                              [](const fsm::HoldsForwardResources auto& s) { return s.resources.results_in_flight; },
                               [](const auto&) { return 0; },
                           },
                           state_);
@@ -139,7 +139,7 @@ public:
 
     void TrackScheduledForward() {
         std::visit(Overloaded{
-                       [](std::derived_from<fsm::ForwardState> auto& s) { s.TrackScheduledForward(); },
+                       [](fsm::HoldsForwardResources auto& s) { s.resources.TrackScheduledForward(); },
                        [](auto&) {},
                    },
                    state_);
@@ -147,7 +147,7 @@ public:
 
     void NoteResultLanded() {
         std::visit(Overloaded{
-                       [](std::derived_from<fsm::ForwardState> auto& s) { s.ResultLanded(); },
+                       [](fsm::HoldsForwardResources auto& s) { s.resources.ResultLanded(); },
                        [](auto&) {},
                    },
                    state_);
@@ -177,13 +177,17 @@ public:
                           state_);
     }
 
-    std::int32_t RequestPoolIndex() const { return forwardState("RequestPoolIndex").RequestPoolIndex(); }
+    std::int32_t RequestPoolIndex() const { return forwardResources("RequestPoolIndex").RequestPoolIndex(); }
 
-    const std::vector<BlockTable>& BlockTablesRef() const { return forwardState("BlockTablesRef").BlockTables(); }
+    const std::vector<BlockTable>& BlockTablesRef() const { return forwardResources("BlockTablesRef").block_tables; }
 
-    std::vector<BlockTable>& BlockTablesRef() { return forwardState("BlockTablesRef").BlockTables(); }
+    std::vector<BlockTable>& BlockTablesRef() { return forwardResources("BlockTablesRef").block_tables; }
 
-    fsm::CacheProgress CacheProgress() const { return forwardState("CacheProgress").CacheProgressRef(); }
+    fsm::CacheProgress CacheProgress() const { return forwardResources("CacheProgress").cache_progress; }
+    // Written by the scheduler when an admission succeeds, like the block
+    // tables the same admission fills: resources and progress land at
+    // admission time, and a state transition only moves them on.
+    fsm::CacheProgress& CacheProgressRef() { return forwardResources("CacheProgressRef").cache_progress; }
     std::int32_t MaterializedStateBoundaryTokens() const;
 
     std::int32_t ReserveNumTokensInNextScheduleEvent() const {
@@ -217,8 +221,8 @@ public:
     }
 
 private:
-    fsm::ForwardState& forwardState(const char* operation);
-    const fsm::ForwardState& forwardState(const char* operation) const;
+    fsm::ForwardResources& forwardResources(const char* operation);
+    const fsm::ForwardResources& forwardResources(const char* operation) const;
 
     std::string id_;
     TokenContainer token_container_;

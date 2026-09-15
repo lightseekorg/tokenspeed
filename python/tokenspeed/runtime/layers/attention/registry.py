@@ -36,6 +36,10 @@ from tokenspeed.runtime.layers.attention.configs.base import (
     AttnConfig,
     SoftmaxAttnConfig,
 )
+from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import (
+    DeepseekV41Config,
+    is_deepseek_v41_config,
+)
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
@@ -216,7 +220,9 @@ _INKLING_ARCHITECTURES = {
     "InklingForConditionalGenerationNextN",
 }
 
-_DSPARK_DRAFT_ARCHITECTURE = "DeepseekV4ForCausalLMDSpark"
+_DSPARK_DRAFT_ARCHITECTURES = frozenset(
+    {"DeepseekV4ForCausalLMDSpark", "DeepseekV41ForCausalLMDSpark"}
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -257,7 +263,7 @@ def _resolve_attn_side(
     architectures = getattr(hf_config, "architectures", None) or []
     text_config = getattr(hf_config, "text_config", hf_config)
     qwen4_exp = is_qwen4_exp(hf_config)
-    is_dspark = _DSPARK_DRAFT_ARCHITECTURE in architectures
+    is_dspark = any(a in _DSPARK_DRAFT_ARCHITECTURES for a in architectures)
     is_dsa_kda = any(a in _HYBRID_DSA_KDA_ARCHITECTURES for a in architectures)
     return _AttnSideProfile(
         architectures=tuple(architectures),
@@ -314,7 +320,9 @@ def _apply_backend_overrides(
     any ``_create_attn_config`` call. The user's pre-override choice survives
     as ``profile.requested_backend``.
     """
-    if target.is_deepseek_v4:
+    if "DeepseekV41ForCausalLM" in target.architectures:
+        server_args.attention_backend = "deepseek_v41"
+    elif target.is_deepseek_v4:
         server_args.attention_backend = "deepseek_v4"
     if draft is not None and draft.is_deepseek_v4:
         server_args.drafter_attention_backend = "deepseek_v4"
@@ -369,6 +377,8 @@ def _resolve_cache_family(
     config: AttnConfig,
 ) -> CacheModelFamily:
     """The one dispatch from family facts (plus built config) to the recipe."""
+    if config.component(DeepseekV41Config) is not None:
+        return "deepseek_v41"
     if profile.is_deepseek_v4:
         return "deepseek_v4"
     # PLE and QSA are cache consumers even in a view without GDN layers.
@@ -524,7 +534,12 @@ def _create_attn_config(
     arch = model_config.attention_arch
     if arch not in _CONFIG_CLS:
         raise NotImplementedError(f"Not supported Attention Arch: {arch!r}")
-    config = _CONFIG_CLS[arch].generate(server_args, model_config, is_draft)
+    config_cls = (
+        DeepseekV41Config
+        if is_deepseek_v41_config(model_config.hf_config)
+        else _CONFIG_CLS[arch]
+    )
+    config = config_cls.generate(server_args, model_config, is_draft)
     # Extra components are built through the same generate() protocol and
     # composed into config.components (consumers look them up by class via
     # ``component()``).
@@ -575,37 +590,30 @@ def _resolve_kda_backend(kda_backend: str) -> str:
     """Resolve the KDA prefill backend policy.
 
     On AMD, the backend policy is ignored and compatible kernels are selected
-    using registry priority. On NVIDIA, ``auto`` picks the fastest available
-    kernel — ``cutedsl_kda``, then ``flashkda``, falling back to the portable
-    FLA scan. Explicit NVIDIA choices are validated against availability and
-    fail fast with an install hint. Decode is unaffected.
+    using registry priority. On NVIDIA, ``auto`` picks ``cutedsl_kda`` when its
+    device-specific implementation is available, ``flashkda`` on SM90+, and
+    ``fla`` otherwise. Explicit CuteDSL selection is validated against device
+    support. Decode is unaffected.
     """
-    if current_platform().is_amd:
+    platform = current_platform()
+    if platform.is_amd:
         # Named backend policies are NVIDIA-specific; let the registry decide.
         return "auto"
 
-    from tokenspeed_kernel.ops.attention.kda.cuda import is_flash_kda_installed
-    from tokenspeed_kernel.ops.attention.kda.cute_dsl import is_cutedsl_kda_installed
+    from tokenspeed_kernel.ops.attention.kda.cute_dsl import cutedsl_kda_supported
 
     if kda_backend == "auto":
-        if is_cutedsl_kda_installed():
+        if cutedsl_kda_supported():
             resolved = "cutedsl_kda"
-        elif is_flash_kda_installed():
+        elif platform.is_hopper_plus:
             resolved = "flashkda"
         else:
             resolved = "fla"
         logger.info("KDA prefill backend auto-resolved to %s", resolved)
         return resolved
-    if kda_backend == "flashkda" and not is_flash_kda_installed():
+    if kda_backend == "cutedsl_kda" and not cutedsl_kda_supported():
         raise ValueError(
-            "--kda-backend flashkda requires the tokenspeed-flashkda "
-            "package (SM90+, CUDA 12.9+): pip install tokenspeed-flashkda"
-        )
-    if kda_backend == "cutedsl_kda" and not is_cutedsl_kda_installed():
-        raise ValueError(
-            "--kda-backend cutedsl_kda requires the tokenspeed-cutedsl-kda package with a "
-            "build matching this device (sm_100a / sm_103a) and the public "
-            "nvidia-cutlass-dsl, apache-tvm-ffi, cuda-python wheels"
+            "--kda-backend cutedsl_kda requires an NVIDIA sm_100 or sm_103 device"
         )
     return kda_backend
 

@@ -495,6 +495,7 @@ import tokenspeed_kernel.ops.embedding.ascend  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.embedding.triton_host_gather  # noqa: E402,F401
 
 
 def apply_rope_mla_set_kv(
@@ -568,3 +569,51 @@ def apply_rope_mla_set_kv(
             q_rope_out=q_rope_out,
             enable_pdl=pdl_enabled(),
         )
+
+
+def mxfp8_embedding(weight, scales, indices, row_start, row_end):
+    """Gather BF16 embeddings from a row shard of an MXFP8 table.
+
+    Args:
+        weight: FP8 E4M3 codes [local_capacity,D], with contiguous columns.
+        scales: E8M0 exponent bytes [local_capacity,D/32].
+        indices: Contiguous integer IDs of any shape, on the table's GPU.
+        row_start: Global ID of the first locally owned row.
+        row_end: Exclusive end of locally owned rows, before capacity padding.
+
+    Returns:
+        BF16 embeddings [*indices.shape,D]; nonlocal IDs produce zero rows.
+        The caller owns any collective needed to combine shards.
+    """
+    if weight.ndim != 2 or weight.shape[1] % 32 or weight.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            "MXFP8 embedding weight must be E4M3 [rows,D] with D divisible by 32"
+        )
+    if (
+        scales.shape != (weight.shape[0], weight.shape[1] // 32)
+        or scales.dtype != torch.uint8
+    ):
+        raise ValueError("MXFP8 embedding scales must be E8M0 bytes [rows,D/32]")
+    if not 0 <= row_start <= row_end <= row_start + weight.shape[0]:
+        raise ValueError("MXFP8 embedding shard range exceeds table capacity")
+    if (
+        not indices.is_cuda
+        or indices.dtype not in (torch.int32, torch.int64)
+        or not indices.is_contiguous()
+        or weight.stride(1) != 1
+        or scales.stride(1) != 1
+        or weight.device != indices.device
+        or scales.device != indices.device
+    ):
+        raise ValueError(
+            "MXFP8 embedding requires colocated GPU tensors and contiguous IDs/columns"
+        )
+    kernel = select_kernel(
+        "embedding",
+        "mxfp8_embedding",
+        format_signature(weight=dense_tensor_format(weight.dtype)),
+        traits=None,
+        override=None,
+        solution=None,
+    )
+    return kernel(weight, scales, indices, row_start, row_end)

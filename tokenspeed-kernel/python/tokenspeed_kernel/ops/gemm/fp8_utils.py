@@ -38,11 +38,11 @@ if _is_nvidia:
     from tokenspeed_kernel.ops.quantization.flashinfer import (
         fp8_blockscale_quantize_runner_sm90 as _flashinfer_fp8_blockscale_quantize_runner_sm90,
     )
-    from tokenspeed_kernel.thirdparty.trtllm import (
-        per_token_group_quant_8bit as _trtllm_per_token_group_quant_fp8,
+    from tokenspeed_kernel.ops.quantization.trtllm import (
+        _per_token_group_quant_8bit as _trtllm_per_token_group_quant_fp8,
     )
-    from tokenspeed_kernel.thirdparty.trtllm import (
-        per_token_quant_fp8 as _trtllm_per_token_quant_fp8,
+    from tokenspeed_kernel.ops.quantization.trtllm import (
+        _per_token_quant_fp8 as _trtllm_per_token_quant_fp8,
     )
 
 
@@ -568,7 +568,7 @@ def per_token_group_quant_fp8(
         and not scale_tma_aligned
         and not scale_ue8m0
     ):
-        return _trtllm_per_token_group_quant_fp8(x, group_size)
+        return _trtllm_per_token_group_quant_fp8(x, group_size, False)
 
     return _per_token_group_quant_8bit_raw(
         x,

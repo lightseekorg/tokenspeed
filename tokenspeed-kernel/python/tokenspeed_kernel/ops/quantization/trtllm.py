@@ -25,42 +25,59 @@ from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
 )
-from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
+from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
-
-trtllm_fp8_token_group_128 = error_fn
-trtllm_fp8_token = error_fn
-trtllm_fp8_tensor = error_fn
+__all__ = []
 
 if platform.is_nvidia:
-    from tokenspeed_kernel.thirdparty.trtllm import (
-        per_tensor_quant_fp8 as _trtllm_per_tensor_quant_fp8,
-    )
-    from tokenspeed_kernel.thirdparty.trtllm import (
-        per_token_group_quant_8bit as _trtllm_per_token_group_quant_8bit,
-    )
-    from tokenspeed_kernel.thirdparty.trtllm import (
-        per_token_quant_fp8 as _trtllm_per_token_quant_fp8,
-    )
+    # DeepEP must initialize before TRT-LLM's static CUDA runtime.
+    import deep_ep  # noqa: F401
+    import trtllm_kernel  # noqa: F401
 
     _FP8_DTYPE = torch.float8_e4m3fn
 
+    def _per_token_group_quant_8bit(
+        x: torch.Tensor, group_size: int, use_ue8m0: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if group_size != 128:
+            raise ValueError(
+                "trtllm fp8_quantize_1x128 only supports group_size=128, "
+                f"got {group_size}"
+            )
+        return torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0)
+
+    def _per_tensor_quant_fp8(
+        input: torch.Tensor, output: torch.Tensor, scale: torch.Tensor
+    ) -> None:
+        q, s = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(input)
+        output.copy_(q)
+        scale.copy_(s.float().squeeze())
+
+    def _per_token_quant_fp8(
+        input: torch.Tensor, output: torch.Tensor, scale: torch.Tensor
+    ) -> None:
+        q, s = torch.ops.tensorrt_llm.quantize_e4m3_activation(input)
+        output.copy_(q)
+        scale.copy_(s.float().squeeze(-1))
+
     def trtllm_fp8_token_group_128(x: torch.Tensor) -> torch.Tensor:
-        qweight, _scale = _trtllm_per_token_group_quant_8bit(x, group_size=128)
+        qweight, _scale = _per_token_group_quant_8bit(
+            x, group_size=128, use_ue8m0=False
+        )
         return qweight.float()
 
     def trtllm_fp8_token(x: torch.Tensor) -> torch.Tensor:
         output = torch.empty_like(x, dtype=_FP8_DTYPE)
         scale = torch.empty(x.size(0), dtype=torch.float32, device=x.device)
-        _trtllm_per_token_quant_fp8(x, output, scale)
+        _per_token_quant_fp8(x, output, scale)
         return output.float()
 
     def trtllm_fp8_tensor(x: torch.Tensor) -> torch.Tensor:
         output = torch.empty_like(x, dtype=_FP8_DTYPE)
         scale = torch.zeros(1, dtype=torch.float32, device=x.device)
-        _trtllm_per_tensor_quant_fp8(x, output, scale)
+        _per_tensor_quant_fp8(x, output, scale)
         return output.float()
 
     @register_kernel(
@@ -93,15 +110,15 @@ if platform.is_nvidia:
             q = torch.empty_like(x, dtype=_FP8_DTYPE)
             if granularity == "tensor":
                 scale = torch.empty(1, dtype=torch.float32, device=x.device)
-                _trtllm_per_tensor_quant_fp8(x, q, scale)
+                _per_tensor_quant_fp8(x, q, scale)
             else:
                 scale = torch.empty(x.shape[:-1], dtype=torch.float32, device=x.device)
-                _trtllm_per_token_quant_fp8(x, q, scale)
+                _per_token_quant_fp8(x, q, scale)
                 scale = scale.unsqueeze(-1)
             return q, scale
 
         if granularity == "token_group":
-            return _trtllm_per_token_group_quant_8bit(
+            return _per_token_group_quant_8bit(
                 x,
                 group_size=group_size,
                 use_ue8m0=scale_encoding == "ue8m0",
@@ -109,9 +126,8 @@ if platform.is_nvidia:
 
         raise ValueError(f"unsupported TRT-LLM FP8 granularity: {granularity!r}")
 
-
-__all__ = [
-    "trtllm_fp8_token_group_128",
-    "trtllm_fp8_token",
-    "trtllm_fp8_tensor",
-]
+    __all__ = [
+        "trtllm_fp8_token_group_128",
+        "trtllm_fp8_token",
+        "trtllm_fp8_tensor",
+    ]

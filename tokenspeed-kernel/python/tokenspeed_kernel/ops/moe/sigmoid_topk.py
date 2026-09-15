@@ -8,6 +8,7 @@ import torch
 from tokenspeed_kernel.ops.moe.triton.kimi3_sigmoid_topk import (
     kimi3_sigmoid_bias_topk,
 )
+from tokenspeed_kernel.ops.moe.triton.minimax_topk import minimax_biased_grouped_topk
 from tokenspeed_kernel.platform import CapabilityRequirement, Platform, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
@@ -216,8 +217,6 @@ def triton_minimax_sigmoid_bias_topk(
     (40us vs 13us at [1, 896] topk=16). ``hidden_states`` is only shape-
     validated by the kernel wrapper, so the logits stand in for it.
     """
-    from tokenspeed_kernel.thirdparty.triton import minimax_biased_grouped_topk
-
     # The kernel scales only when it renormalizes, so keep fp32 through mul_.
     topk_weights, topk_ids = minimax_biased_grouped_topk(
         router_logits,
