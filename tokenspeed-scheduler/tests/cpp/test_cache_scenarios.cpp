@@ -2195,7 +2195,7 @@ TEST(ExtendResultEvent, AwaitingResultCarriesForwardsInFlightIntoPrefillDone) {
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
