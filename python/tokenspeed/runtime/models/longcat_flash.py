@@ -245,6 +245,9 @@ class _RuntimeLongcatMoE(nn.Module):
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
             zero_expert_type=config.zero_expert_type,
+            # LongCat applies its own zero-expert routing to gated SiLU experts.
+            activation="swiglu",
+            routing_mode="precomputed_topk",
             routing_config={
                 "routed_scaling_factor": self.routed_scaling_factor,
                 "normalize_topk_weights": config.norm_topk_prob,
