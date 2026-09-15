@@ -164,8 +164,8 @@ def _make_nvfp4_moe_weights(
         "w2_weight_scale": torch.stack(w2_scale),
         "w2_weight_scale_2": torch.stack(w2_s2).reshape(NUM_EXPERTS),
         # Kimi-K3-NVFP4 ships input_scale == 1.0 for every expert projection.
-        "w13_input_scale": torch.ones(NUM_EXPERTS),
-        "w2_input_scale": torch.ones(NUM_EXPERTS),
+        "w13_input_scale": torch.ones(1),
+        "w2_input_scale": torch.ones(1),
     }
 
 
@@ -517,13 +517,22 @@ def test_nvfp4_route_padding_is_initialized_on_every_replay(
     initialization occurs in the native launcher, without allocation interception.
     """
     from flashinfer.fused_moe import core
+    from flashinfer.tllm_enums import ActivationType
     from tokenspeed_kernel.ops.moe.flashinfer import trtllm_nvfp4 as impl
     from torch.utils._python_dispatch import TorchDispatchMode
 
     generator = torch.Generator().manual_seed(401)
     raw = _make_nvfp4_moe_weights(generator, logical_ispp=ISPP)
     local_offset = NUM_EXPERTS - local_count
-    w = _MoEWeights({k: v[local_offset:].clone() for k, v in raw.items()}).cuda()
+    # Activation input scales are global scalars, not expert-sharded weights.
+    w = _MoEWeights(
+        {
+            k: (
+                v if k in ("w13_input_scale", "w2_input_scale") else v[local_offset:]
+            ).clone()
+            for k, v in raw.items()
+        }
+    ).cuda()
     w._spec.top_k = top_k
     w._spec.num_local_experts = local_count
     w._spec.ep_rank = local_offset // local_count
@@ -544,7 +553,7 @@ def test_nvfp4_route_padding_is_initialized_on_every_replay(
             do_finalize=finalize,
             enable_pdl=enable_pdl,
             routed=routed,
-            activation_type=impl._SITU_ACTIVATION_TYPE,
+            activation_type=ActivationType.Situ,
             output=None,
         )
 

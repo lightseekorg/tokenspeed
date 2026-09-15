@@ -30,3 +30,5 @@ the same padding initialization before every routing invocation.
 Regression coverage includes live and padded mapping entries, local expert
 partitions, PDL on/off, changing routing within one captured shape, graph replay
 after workspace corruption, and output equality with the upstream operator.
+Expert-partition tests retain the loader's global activation input scales while
+sharding expert weights, and select SiTU through FlashInfer's activation enum.
