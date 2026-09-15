@@ -111,6 +111,7 @@ def _make_moe(fork: _SpyFork) -> SimpleNamespace:
     )
     return SimpleNamespace(
         _gather_dp_tokens_for_moe=False,
+        _nvfp4_down=None,
         native_latent_moe=None,
         stream_fork=fork,
         _topk_ready=None,

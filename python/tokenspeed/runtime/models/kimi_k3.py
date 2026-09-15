@@ -88,6 +88,12 @@ from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
     situ_moe_unavailable_reason,
 )
 from tokenspeed_kernel.ops.moe.latent_down import KimiK3LatentDownOp
+from tokenspeed_kernel.ops.moe.latent_down_nvfp4 import (
+    KimiK3Nvfp4DownOp,
+)
+from tokenspeed_kernel.ops.moe.latent_down_nvfp4 import (
+    fusion_mode as nvfp4_down_fusion_mode,
+)
 from tokenspeed_kernel.ops.residual import attn_res_fwd, attn_res_fwd_available
 from tokenspeed_kernel.ops.tuning import load_packaged_flashinfer_tuning_cache
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
@@ -1586,6 +1592,10 @@ class KimiLinearMoE(nn.Module):
             shard_rank=mapping.moe.tp_ep_rank,
             shard_size=mapping.moe.tp_ep_size,
         )
+        self._nvfp4_down = None
+        self._nvfp4_down_mode = nvfp4_down_fusion_mode()
+        self._nvfp4_down_group = mapping.moe.tp_ep_group
+        self._nvfp4_down_tp8 = mapping.moe.tp_size == 8 and mapping.moe.ep_size == 1
         self.routed_expert_up_proj = Kimi3LatentProjection(
             self.routed_hidden,
             config.hidden_size,
@@ -1764,6 +1774,34 @@ class KimiLinearMoE(nn.Module):
             out=shared_out,
         )
         return router_logits, routed_input, shared_output
+
+    def process_weights_after_loading(self, module) -> None:
+        """Prepare quantized latent input after expert scales, before capture."""
+        if (
+            self._nvfp4_down_mode == "off"
+            or not self._nvfp4_down_tp8
+            or not self.experts.plan.get("supports_nvfp4_input", False)
+            or self._nvfp4_down is not None
+        ):
+            return
+        self.experts.process_weights_after_loading(self.experts)
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager as pg_manager,
+        )
+
+        max_m = max(
+            int(global_server_args_dict.get("max_prefill_tokens") or 0),
+            int(global_server_args_dict.get("chunked_prefill_size") or 0),
+            int(global_server_args_dict.get("prefill_graph_max_tokens") or 0),
+            DOWN_MAILBOX_MAX_TOKENS,
+        )
+        self._nvfp4_down = KimiK3Nvfp4DownOp.initialize(
+            self.routed_expert_down_proj.multicast_down,
+            self.experts.w13_input_scale_quant,
+            group=pg_manager.get_device_process_group(self._nvfp4_down_group),
+            max_m=max_m,
+            mode=self._nvfp4_down_mode,
+        )
 
     def _routed_experts(
         self,
@@ -2026,7 +2064,14 @@ class KimiLinearMoE(nn.Module):
                         shared_partial
                     )
             if routed_in is None:
-                routed_in, _ = self.routed_expert_down_proj(hidden_states)
+                if self._nvfp4_down is not None and self._nvfp4_down.handles(
+                    hidden_states.shape[0]
+                ):
+                    routed_in = self._nvfp4_down(
+                        hidden_states, self.routed_expert_down_proj.weight
+                    )
+                else:
+                    routed_in, _ = self.routed_expert_down_proj(hidden_states)
             if self._topk_ready is not None and precompute_topk and fork._active:
                 self._topk_ready.wait(torch.cuda.current_stream())
             routed_partial = self._routed_experts(

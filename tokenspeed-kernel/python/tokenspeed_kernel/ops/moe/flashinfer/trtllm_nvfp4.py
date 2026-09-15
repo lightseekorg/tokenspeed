@@ -23,6 +23,10 @@ from __future__ import annotations
 import logging
 
 import torch
+from tokenspeed_kernel.ops.moe.activation import (
+    NVFP4_ACTIVATION_FORMAT,
+    Nvfp4Activation,
+)
 from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
     situ_moe_unavailable_reason,
 )
@@ -33,7 +37,7 @@ from tokenspeed_kernel.platform import (
     current_platform,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import format_signature, format_signatures
 
 logger = logging.getLogger(__name__)
 
@@ -303,7 +307,7 @@ if platform.is_nvidia:
         return _flashinfer_trtllm_nvfp4_moe_weights(plan, w, situ=True)
 
     def _flashinfer_trtllm_nvfp4_moe_apply(
-        x: torch.Tensor,
+        x: torch.Tensor | Nvfp4Activation,
         w: torch.nn.Module,
         router_logits: torch.Tensor,
         topk_weights: torch.Tensor | None,
@@ -326,6 +330,8 @@ if platform.is_nvidia:
         num_tokens = x.shape[0]
         # Idle DP ranks pass 0 tokens and the fused kernel divides by token count on host; skip experts.
         if num_tokens == 0:
+            if isinstance(x, Nvfp4Activation):
+                x = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
             if do_finalize:
                 return x
             return (
@@ -336,12 +342,16 @@ if platform.is_nvidia:
             )
 
         # Quantize input to FP4 using the fused-kernel scale layout.
-        hs_fp4, hs_scale = fp4_quantize(
-            x,
-            w.w13_input_scale_quant,
-            is_sf_swizzled_layout=False,
-            enable_pdl=enable_pdl,
-        )
+        if isinstance(x, Nvfp4Activation):
+            x.validate_receiver(w.w13_input_scale_quant)
+            hs_fp4, hs_scale = x.data, x.scales
+        else:
+            hs_fp4, hs_scale = fp4_quantize(
+                x,
+                w.w13_input_scale_quant,
+                is_sf_swizzled_layout=False,
+                enable_pdl=enable_pdl,
+            )
 
         # GEMM and scale arguments shared by both kernel entry points.
         common_kwargs = dict(
@@ -556,7 +566,8 @@ if platform.is_nvidia:
                 "x",
                 "dense",
                 {torch.bfloat16},
-            ),
+            )
+            | frozenset({format_signature(x=NVFP4_ACTIVATION_FORMAT)}),
             traits={
                 "weight_dtype": frozenset({"nvfp4"}),
                 "activation": frozenset({"situ"}),
@@ -577,7 +588,7 @@ if platform.is_nvidia:
     @_register_nvfp4_situ_kernel
     def flashinfer_trtllm_nvfp4_situ_routed_moe_apply(
         plan: dict,
-        x: torch.Tensor,
+        x: torch.Tensor | Nvfp4Activation,
         w: torch.nn.Module,
         router_logits: torch.Tensor,
         topk_weights: torch.Tensor | None = None,
@@ -589,7 +600,7 @@ if platform.is_nvidia:
     ):
         if topk_weights is None or topk_ids is None:
             raise ValueError("precomputed_topk plan requires topk_weights and topk_ids")
-        if x.dtype != torch.bfloat16:
+        if not isinstance(x, Nvfp4Activation) and x.dtype != torch.bfloat16:
             raise TypeError("FlashInfer NVFP4 SiTU requires bf16 input")
         # Caller-owned destination (e.g. K3's fused all-reduce lane slice):
         # writing the finalized rows in place keeps the join zero-copy, same
