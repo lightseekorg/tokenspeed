@@ -544,11 +544,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             assert state._staged_two_stage_input_buf is None
             assert state._staged_two_stage_scratch_buf is None
             assert state._staged_two_stage_ready_flags is None
-        output_max_numel = max(
-            producer_direct_max_numel,
-            staged_max_numel if state._staged_two_stage_supported else 0,
-        )
-        assert state._reduced_output_buf.numel() == output_max_numel
+        assert state._reduced_output_buf.numel() == producer_direct_max_numel
         if attnres_max_numel:
             assert state._attnres_input_buf.shape == (
                 2,
