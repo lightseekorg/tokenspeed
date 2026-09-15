@@ -174,6 +174,19 @@ def configure_deepseek_v4_attention(model_config) -> None:
         model_config.scaling = model_config.scaling * mscale * mscale
 
 
+def configure_deepseek_v41_attention(model_config) -> None:
+    """V4.1 latent dimensions; YaRN changes RoPE, not the attention scale."""
+    hf = model_config.hf_text_config
+    model_config.head_dim = hf.head_dim
+    model_config.attention_arch = AttentionArch.MLA
+    model_config.kv_lora_rank = hf.head_dim
+    model_config.qk_rope_head_dim = hf.qk_rope_head_dim
+    model_config.qk_nope_head_dim = hf.head_dim - hf.qk_rope_head_dim
+    model_config.v_head_dim = hf.head_dim
+    model_config.index_head_dim = hf.index_head_dim
+    model_config.scaling = hf.head_dim**-0.5
+
+
 def configure_glm_attention(model_config) -> None:
     mla_config = (
         model_config.hf_text_config
@@ -254,6 +267,15 @@ def configure_minimax_m3_attention(model_config) -> None:
 
 
 _ATTENTION_FAMILY_SPECS = (
+    _AttentionFamilySpec(
+        name="DeepSeek V4.1",
+        architectures=frozenset(
+            {"DeepseekV41ForCausalLM", "DeepseekV41ForCausalLMDSpark"}
+        ),
+        configure=configure_deepseek_v41_attention,
+        default_backend="deepseek_v41",
+        default_prefix_granularity=256,
+    ),
     _AttentionFamilySpec(
         name="DeepSeek V4",
         architectures=_DEEPSEEK_V4_ARCHITECTURES,
@@ -443,7 +465,8 @@ class ModelConfig:
         if (
             is_draft_worker
             and getattr(server_args, "speculative_algorithm", None) == "DSPARK"
-            and resolve_architecture(self.hf_config) == "DeepseekV4ForCausalLMDSpark"
+            and resolve_architecture(self.hf_config)
+            in ("DeepseekV4ForCausalLMDSpark", "DeepseekV41ForCausalLMDSpark")
         ):
             from tokenspeed.runtime.models.deepseek_v4_dspark import (
                 DEFAULT_DSPARK_WINDOW_SIZE,

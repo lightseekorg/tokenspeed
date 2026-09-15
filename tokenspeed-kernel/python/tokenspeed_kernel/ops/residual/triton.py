@@ -2108,3 +2108,151 @@ def fused_mhc_prefill_hc4(
         eps=norm_eps,
     )
     return layer_input, post_mix.unsqueeze(-1), comb_mix.view(num_tokens, 4, 4)
+
+
+def _mhc_mixes_impl(
+    residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_iters, prenorm_gemm
+):
+    tokens, _, hidden = residual.shape
+    splits = _compute_num_split(
+        residual.device, 64, 4 * hidden, max(1, triton.cdiv(tokens, 64))
+    )
+    projection = torch.empty(
+        (splits, tokens, 24), device=residual.device, dtype=torch.float32
+    )
+    square_sum = torch.empty(
+        (splits, tokens), device=residual.device, dtype=torch.float32
+    )
+    pre = torch.empty((tokens, 4), device=residual.device, dtype=torch.float32)
+    post = torch.empty_like(pre)
+    comb = torch.empty((tokens, 4, 4), device=residual.device, dtype=torch.float32)
+    if tokens:
+        prenorm_gemm(
+            residual.view(tokens, 4 * hidden), weight, projection, square_sum, splits
+        )
+        mhc_pre_mix_hc4(
+            projection,
+            square_sum,
+            scale,
+            base,
+            pre,
+            post,
+            comb,
+            hidden_size=hidden,
+            rms_eps=rms_eps,
+            hc_eps=hc_eps,
+            sinkhorn_iters=sinkhorn_iters,
+            n_splits=splits,
+            num_tokens=tokens,
+        )
+    return pre, post, comb
+
+
+@register_kernel(
+    "residual",
+    "mhc_mixes",
+    name="triton_mhc_mixes",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {format_signature(residual=dense_tensor_format(torch.bfloat16))}
+    ),
+    priority=Priority.PORTABLE,
+)
+def triton_mhc_mixes(residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_iters):
+    return _mhc_mixes_impl(
+        residual,
+        weight,
+        scale,
+        base,
+        rms_eps,
+        hc_eps,
+        sinkhorn_iters,
+        _mhc_prenorm_gemm_triton,
+    )
+
+
+def mhc_apply_pre(residual: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
+    """Collapse BF16 [...,HC,H] with FP32 [...,HC] weights, returning BF16 [...,H]."""
+    hidden = residual.shape[-1]
+    hc = residual.shape[-2]
+    tokens = residual.numel() // (hc * hidden)
+    out = residual.new_empty((*residual.shape[:-2], hidden))
+    if tokens:
+        _mhc_pre_layer_triton_kernel[(tokens, triton.cdiv(hidden, 1024))](
+            pre,
+            residual,
+            out,
+            hidden_size=hidden,
+            hc_mult=hc,
+            block_h=1024,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    return out
+
+
+@triton.jit
+def _normalized_dot_gate_kernel(
+    H,
+    KV,
+    QW,
+    KW,
+    Mask,
+    O,
+    D: tl.constexpr,
+    HC: tl.constexpr,
+    EPS: tl.constexpr,
+    B: tl.constexpr,
+):
+    row = tl.program_id(0)
+    hc = tl.program_id(1)
+    d = tl.arange(0, B)
+    h = tl.load(H + (row * HC + hc) * D + d, d < D, 0).to(tl.float32)
+    key = tl.load(KV + row * (HC + 1) * D + hc * D + d, d < D, 0).to(tl.float32)
+    qw = tl.load(QW + hc * D + d, d < D, 0).to(tl.float32)
+    kw = tl.load(KW + hc * D + d, d < D, 0).to(tl.float32)
+    weight = qw * kw
+    rstd = tl.rsqrt(tl.sum(h * h, 0) / D + EPS) * tl.rsqrt(
+        tl.sum(key * key, 0) / D + EPS
+    )
+    dot = tl.sum(h * weight * key, 0) * rstd * (D**-0.5)
+    magnitude = tl.sqrt(tl.maximum(tl.abs(dot), 1e-6))
+    signed = tl.where(dot.to(tl.int32, bitcast=True) < 0, -magnitude, magnitude)
+    gate = tl.sigmoid(signed)
+    gate = tl.where(tl.load(Mask + row), gate, 0.0)
+    value = tl.load(KV + row * (HC + 1) * D + HC * D + d, d < D, 0).to(tl.float32)
+    out = h + gate * value
+    tl.store(O + (row * HC + hc) * D + d, out, d < D)
+
+
+@register_kernel(
+    "residual",
+    "normalized_dot_gate",
+    name="triton_normalized_dot_gate",
+    solution="triton",
+    signatures=[format_signature(residual=dense_tensor_format(torch.bfloat16))],
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    priority=Priority.PORTABLE,
+)
+def normalized_dot_gate(residual, key_value, query_weight, key_weight, mask, eps):
+    """Apply a normalized, signed-square-root dot-product gate in one pass."""
+    hc, dim = residual.shape[-2:]
+    tokens = residual.numel() // (hc * dim)
+    out = torch.empty_like(residual)
+    if tokens:
+        _normalized_dot_gate_kernel[(tokens, hc)](
+            residual,
+            key_value,
+            query_weight,
+            key_weight,
+            mask,
+            out,
+            dim,
+            hc,
+            eps,
+            triton.next_power_of_2(dim),
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    return out

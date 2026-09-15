@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.residual.triton import _mhc_pre_impl
+from tokenspeed_kernel.ops.residual.triton import _mhc_mixes_impl, _mhc_pre_impl
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -41,7 +41,12 @@ if platform.is_hopper_plus:
         set_pdl,
         tf32_hc_prenorm_gemm,
     )
+    from tokenspeed_kernel.ops._deep_gemm.mega_moe_bf16 import (
+        prepare_mega_moe_bf16_jit,
+    )
     from tokenspeed_kernel.thirdparty.cuda.mhc import mhc_big_fuse
+
+    prepare_mega_moe_bf16_jit()
 
     @register_kernel(
         "residual",
@@ -91,4 +96,34 @@ if platform.is_hopper_plus:
             pre_reduce_apply_impl=mhc_big_fuse,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
+        )
+
+    @register_kernel(
+        "residual",
+        "mhc_mixes",
+        name="deep_gemm_mhc_mixes",
+        solution="deep_gemm",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset(
+            {format_signature(residual=dense_tensor_format(torch.bfloat16))}
+        ),
+        priority=Priority.PERFORMANT,
+    )
+    def deep_gemm_mhc_mixes(
+        residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_iters
+    ):
+        if get_pdl() != pdl_enabled():
+            set_pdl(pdl_enabled())
+        return _mhc_mixes_impl(
+            residual,
+            weight,
+            scale,
+            base,
+            rms_eps,
+            hc_eps,
+            sinkhorn_iters,
+            tf32_hc_prenorm_gemm,
         )

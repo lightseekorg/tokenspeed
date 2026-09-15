@@ -487,6 +487,7 @@ def load_builtin_kernels() -> None:
     import tokenspeed_kernel.ops.attention  # noqa: F401
     import tokenspeed_kernel.ops.attention.dsa  # noqa: F401
     import tokenspeed_kernel.ops.attention.dsv4  # noqa: F401
+    import tokenspeed_kernel.ops.attention.dsv41  # noqa: F401
     import tokenspeed_kernel.ops.attention.gdn  # noqa: F401
     import tokenspeed_kernel.ops.attention.kda  # noqa: F401
     import tokenspeed_kernel.ops.attention.kpool  # noqa: F401

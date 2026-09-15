@@ -42,6 +42,9 @@ if _IS_HOPPER_PLUS:
     import deep_ep  # noqa: F401
     import deep_gemm
     import trtllm_kernel  # noqa: F401
+    from tokenspeed_kernel.ops._deep_gemm.mega_moe_bf16 import (
+        prepare_mega_moe_bf16_jit,
+    )
     from tokenspeed_kernel.ops.attention.dsv4.cuda import (
         has_indexer_mxfp4_paged_gather,
         has_indexer_topk_prefill,
@@ -50,6 +53,8 @@ if _IS_HOPPER_PLUS:
         indexer_topk_prefill,
         persistent_topk,
     )
+
+    prepare_mega_moe_bf16_jit()
 
 _MXFP4_BLOCK_SIZE = 32
 _MXFP4_VALUE_BYTES_PER_BLOCK = _MXFP4_BLOCK_SIZE // 2
@@ -616,6 +621,30 @@ def _warmup_fp8_fp4_paged_mqa_logits(
             logits_dtype=torch.float32,
         )
     torch.cuda.synchronize()
+
+
+def warmup_mqa_logits(
+    *,
+    num_heads: int,
+    index_head_dim: int,
+    cache_block_size: int,
+    max_decode_tokens: int,
+    device: torch.device,
+) -> None:
+    """Compile packed MQA scoring and paged metadata kernels before capture."""
+    _warmup_fp8_fp4_mqa_logits(
+        num_heads=num_heads,
+        index_head_dim=index_head_dim,
+        device=device,
+        max_kv_len=4096,
+    )
+    _warmup_fp8_fp4_paged_mqa_logits(
+        num_heads=num_heads,
+        index_head_dim=index_head_dim,
+        cache_block_size=cache_block_size,
+        max_decode_tokens=max_decode_tokens,
+        device=device,
+    )
 
 
 def _warmup_prefill_jit(

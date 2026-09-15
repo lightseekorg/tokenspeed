@@ -18,7 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""DeepGEMM implementation of the DeepSeek V4 MegaMoE boundary."""
+"""DeepGEMM implementation of the DeepSeek V4/V4.1 MegaMoE boundary.
+
+The third-party adapter rounds FP32 weighted SwiGLU to BF16 before computing
+FP8 scales and payloads, matching both model references without unfusing MoE.
+"""
 
 from __future__ import annotations
 
@@ -51,9 +55,14 @@ if platform.is_blackwell:
         transform_sf_into_required_layout,
         transform_weights_for_mega_moe,
     )
+    from tokenspeed_kernel.ops._deep_gemm.mega_moe_bf16 import (
+        prepare_mega_moe_bf16_jit,
+    )
     from tokenspeed_kernel.ops.moe.deep_gemm._triton.stage import (
         stage_dsv4_mega_moe_inputs,
     )
+
+    prepare_mega_moe_bf16_jit()
 
 
 _MXFP4_BLOCK_SIZE = 32

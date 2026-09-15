@@ -35,6 +35,11 @@ DSA_SPARSE_PAGE_SIZE = 64
 # model's default prefix granularity both derive from it.
 DEEPSEEK_V4_PAGE_SIZE = 256
 
+# V4.1 FlatKV has 64-row global pages: raw spans are 128 (ratio 2) and
+# 64 (ratio 1). SWA remains a separate 64-token page address domain.
+DEEPSEEK_V41_SWA_PAGE_SIZE = 64
+DEEPSEEK_V41_GLOBAL_ROWS = 64
+
 # trtllm-gen paged MLA kernels support exactly these page sizes.
 TRTLLM_MLA_SUPPORTED_PAGE_SIZES = (32, 64)
 

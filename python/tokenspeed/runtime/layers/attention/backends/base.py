@@ -304,6 +304,7 @@ class AttentionBackend(CachePoolBinding, ABC):
             seq_lens,
             forward_mode=forward_mode,
             block_tables=block_tables,
+            num_extends=0,
             for_graph_replay=True,
             **kwargs,
         )

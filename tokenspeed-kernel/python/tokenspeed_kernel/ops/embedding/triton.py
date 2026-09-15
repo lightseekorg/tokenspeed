@@ -28,7 +28,11 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.embedding import (
@@ -1234,3 +1238,63 @@ def triton_embedding_rope_mla(
         quant_scale_kv=quant_scale_kv,
         enable_pdl=enable_pdl,
     )
+
+
+@triton.jit
+def _mxfp8_embedding_kernel(
+    W,
+    S,
+    I,
+    O,
+    D: tl.constexpr,
+    START: tl.constexpr,
+    END: tl.constexpr,
+    WS: tl.constexpr,
+    SS: tl.constexpr,
+    B: tl.constexpr,
+):
+    row = tl.program_id(0)
+    d = tl.arange(0, B)
+    index = tl.load(I + row)
+    local = (index >= START) & (index < END)
+    code = tl.load(W + (index - START) * WS + d, local & (d < D), 0.0).to(tl.float32)
+    exponent = tl.load(S + (index - START) * SS + d // 32, local & (d < D), 127).to(
+        tl.int32
+    )
+    scale = tl.where(
+        exponent == 0, 2.0**-127, (exponent << 23).to(tl.float32, bitcast=True)
+    )
+    scale = tl.where(exponent == 255, float("nan"), scale)
+    value = tl.where(local, code * scale, 0.0)
+    tl.store(O + row * D + d, value, d < D)
+
+
+@register_kernel(
+    "embedding",
+    "mxfp8_embedding",
+    name="triton_mxfp8_embedding",
+    solution="triton",
+    signatures=[format_signature(weight=dense_tensor_format(torch.float8_e4m3fn))],
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    priority=Priority.PORTABLE,
+)
+def mxfp8_embedding(weight, scales, indices, row_start, row_end):
+    """Gather local FP8/E8M0 rows, dequantize to BF16 and mask remote IDs."""
+    out = torch.empty(
+        (*indices.shape, weight.shape[1]), dtype=torch.bfloat16, device=indices.device
+    )
+    if indices.numel():
+        _mxfp8_embedding_kernel[(indices.numel(),)](
+            weight,
+            scales,
+            indices,
+            out,
+            weight.shape[1],
+            row_start,
+            row_end,
+            weight.stride(0),
+            scales.stride(0),
+            triton.next_power_of_2(weight.shape[1]),
+            num_warps=4,
+        )
+    return out

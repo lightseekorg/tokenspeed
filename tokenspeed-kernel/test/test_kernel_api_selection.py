@@ -257,6 +257,7 @@ def test_residual_family_exports_and_modes():
         "gated_residual_combine",
         "gated_residual_mix",
         "mhc_fused_hc",
+        "mhc_mixes",
         "mhc_post",
         "mhc_pre",
         "prepare_gated_residual_weight_cache",
@@ -276,8 +277,10 @@ def test_residual_family_exports_and_modes():
         "attn_res_fwd",
         "hyperconnection_combine",
         "hyperconnection_mix",
+        "mhc_mixes",
         "mhc_post",
         "mhc_pre",
+        "normalized_dot_gate",
     }
 
 

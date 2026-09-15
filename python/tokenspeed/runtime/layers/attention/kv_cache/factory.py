@@ -109,6 +109,17 @@ def create_cache_pool(
             layer_types=spec.layer_types,
             field_layer_offset=field_layer_offset,
         )
+    if spec.family == "deepseek_v41":
+        from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v41 import (
+            DeepseekV41CachePool,
+        )
+
+        return DeepseekV41CachePool(
+            arena=arena,
+            layer_num=num_layers,
+            rank=rank,
+            field_layer_offset=field_layer_offset,
+        )
     if spec.family == "deepseek_v4":
         from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
             HybridDeepseekV4TokenToKVPool,

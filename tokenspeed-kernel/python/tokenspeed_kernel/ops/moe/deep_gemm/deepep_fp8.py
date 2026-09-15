@@ -74,6 +74,11 @@ if platform.is_hopper_plus:
         set_pdl,
         transform_sf_into_required_layout,
     )
+    from tokenspeed_kernel.ops._deep_gemm.mega_moe_bf16 import (
+        prepare_mega_moe_bf16_jit,
+    )
+
+    prepare_mega_moe_bf16_jit()
 
 
 if platform.is_hopper_plus:
