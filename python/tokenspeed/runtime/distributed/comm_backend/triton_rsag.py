@@ -98,6 +98,9 @@ class TritonRSAGBackend:
         ):
             hidden_size = tensor.size(-1) * len(group)
             state = self._get_or_create(group, hidden_size)
+            if tensor.size(0) > state.max_token_num:
+                # Rows past the prefill-sized buffer would trip the kernel's capacity assert.
+                return self._fallback.all_gather(tensor, group=group, dim=dim)
             return all_gather_inner(
                 state,
                 tensor,
