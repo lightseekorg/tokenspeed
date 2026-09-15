@@ -28,6 +28,7 @@ on:
         type: choice
         options:
           - "off"
+          - test/ci/eval/deepseek-v4.1-flash-evalscope-gsm8k.yaml
           - test/ci/eval/deepseek-v4-flash-evalscope-gsm8k.yaml
           - test/ci/eval/deepseek-v4-flash-mtp-evalscope-gsm8k.yaml
           - test/ci/eval/glm-5.2-nvfp4-mtp-evalscope-aime26.yaml
