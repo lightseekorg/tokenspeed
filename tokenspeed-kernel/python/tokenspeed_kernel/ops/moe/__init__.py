@@ -30,6 +30,10 @@ import tokenspeed_kernel.ops.moe.marlin  # noqa: F401
 import tokenspeed_kernel.ops.moe.mega_moe  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
 import torch
+from tokenspeed_kernel.ops.moe.activation import (
+    NVFP4_ACTIVATION_FORMAT,
+    Nvfp4Activation,
+)
 from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
@@ -710,6 +714,8 @@ def moe_plan(
         "support_routing": support_routing,
         "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,
+        "supports_nvfp4_input": format_signature(x=NVFP4_ACTIVATION_FORMAT)
+        in apply_spec.format_signatures,
         "solution": apply_spec.solution,
         "internal_activation_dtype": internal_activation_dtype,
     }
@@ -733,7 +739,7 @@ def moe_process_weights(plan: dict, w: torch.nn.Module):
 
 def moe_apply(
     plan: dict,
-    x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    x: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | Nvfp4Activation,
     w: torch.nn.Module,
     # top-k routing inputs
     router_logits: torch.Tensor | None,
@@ -758,7 +764,8 @@ def moe_apply(
         x: Hidden states with shape [tokens, hidden_size], or a
             (packed_nvfp4, block_scales) pair for a kernel supporting prequantized
             input. Packed data is uint8 [tokens, hidden_size // 2]; scales are
-            linear uint8/float8 [tokens, hidden_size // 16].
+            linear uint8/float8 [tokens, hidden_size // 16]. Also accepts an
+            Nvfp4Activation if the plan advertises supports_nvfp4_input.
         w: Module containing processed MoE weights.
         router_logits: Router logits with shape [tokens, num_experts], or None
             for a precomputed-TopK kernel that consumes only IDs and weights.
@@ -792,11 +799,19 @@ def moe_apply(
 
     Solutions may use precomputed top-k tensors or route from logits directly.
     """
+    if isinstance(x, Nvfp4Activation) and not plan.get("supports_nvfp4_input", False):
+        raise ValueError("selected MoE does not support prequantized NVFP4 input")
     data = x[0] if isinstance(x, tuple) else x
     kernel = select_kernel(
         "moe",
         "apply",
-        format_signature(x=dense_tensor_format(data.dtype)),
+        format_signature(
+            x=(
+                NVFP4_ACTIVATION_FORMAT
+                if isinstance(x, Nvfp4Activation)
+                else dense_tensor_format(data.dtype)
+            )
+        ),
         override=plan["apply_kernel_name"],
     )
     # Only the all-to-all EP kernels own dispatch/combine legs, so the mode

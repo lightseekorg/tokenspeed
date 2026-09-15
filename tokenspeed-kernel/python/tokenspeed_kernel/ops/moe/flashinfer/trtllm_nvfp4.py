@@ -21,6 +21,10 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.moe.activation import (
+    NVFP4_ACTIVATION_FORMAT,
+    Nvfp4Activation,
+)
 from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -28,7 +32,7 @@ from tokenspeed_kernel.platform import (
     current_platform,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import format_signature, format_signatures
 
 platform = current_platform()
 TRTLLM_NVFP4_ISPP_ALIGNMENT = 64
@@ -292,7 +296,7 @@ if platform.is_nvidia:
         return _flashinfer_trtllm_nvfp4_moe_weights(plan, w, situ=True)
 
     def _flashinfer_trtllm_nvfp4_moe_apply(
-        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | Nvfp4Activation,
         w: torch.nn.Module,
         router_logits: torch.Tensor,
         topk_weights: torch.Tensor | None,
@@ -312,8 +316,11 @@ if platform.is_nvidia:
         """
         _spec = getattr(w, "_spec", None)
 
-        prequantized = isinstance(x, tuple)
-        data = x[0] if prequantized else x
+        prequantized = isinstance(x, (tuple, Nvfp4Activation))
+        if isinstance(x, Nvfp4Activation):
+            data = x.data
+        else:
+            data = x[0] if isinstance(x, tuple) else x
         num_tokens = data.shape[0]
         # Idle DP ranks pass 0 tokens and the fused kernel divides by token count on host; skip experts.
         if num_tokens == 0:
@@ -331,7 +338,11 @@ if platform.is_nvidia:
                 data.new_empty((0,), dtype=torch.int32),
             )
 
-        if prequantized:
+        # Quantize input to FP4 using the fused-kernel scale layout.
+        if isinstance(x, Nvfp4Activation):
+            x.validate_receiver(w.w13_input_scale_quant)
+            hs_fp4, hs_scale = x.data, x.scales
+        elif isinstance(x, tuple):
             hs_fp4, hs_scale = x
         else:
             hs_fp4, hs_scale = fp4_quantize(
@@ -545,7 +556,8 @@ if platform.is_nvidia:
             "x",
             "dense",
             {torch.bfloat16, torch.uint8},
-        ),
+        )
+        | frozenset({format_signature(x=NVFP4_ACTIVATION_FORMAT)}),
         traits={
             "weight_dtype": frozenset({"nvfp4"}),
             "activation": frozenset({"situ"}),
@@ -562,7 +574,7 @@ if platform.is_nvidia:
     )
     def flashinfer_trtllm_nvfp4_situ_routed_moe_apply(
         plan: dict,
-        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | Nvfp4Activation,
         w: torch.nn.Module,
         router_logits: torch.Tensor,
         topk_weights: torch.Tensor | None = None,
@@ -574,7 +586,9 @@ if platform.is_nvidia:
     ):
         if topk_weights is None or topk_ids is None:
             raise ValueError("precomputed_topk plan requires topk_weights and topk_ids")
-        if isinstance(x, tuple):
+        if isinstance(x, Nvfp4Activation):
+            output_shape = x.shape
+        elif isinstance(x, tuple):
             data, scales = x
             if data.dtype != torch.uint8 or scales.dtype not in (
                 torch.uint8,
