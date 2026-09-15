@@ -142,13 +142,16 @@ class MoELayer(torch.nn.Module):
                 f"num_experts ({num_experts}) must be divisible by ep_size "
                 f"({self.ep_size}) for contiguous expert ownership"
             )
-        num_local_experts = num_experts // self.ep_size
+        self.num_local_experts = num_experts // self.ep_size
 
-        self.num_local_experts = num_local_experts
+        # TODO: Unify alltoall backends at MoELayer level
+        a2a_backend = get_all2all_backend().value
+        if a2a_backend in ("agrs", "flashinfer"):
+            a2a_backend = "none"
         self._spec = MoELayerSpec(
             top_k=top_k,
             num_experts=num_experts,
-            num_local_experts=num_local_experts,
+            num_local_experts=self.num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             activation=activation,
@@ -157,7 +160,7 @@ class MoELayer(torch.nn.Module):
             ep_rank=self.ep_rank,
             ep_size=self.ep_size,
             prefix=prefix,
-            a2a_backend=get_all2all_backend().value,
+            a2a_backend=a2a_backend,
         )
 
         # Routing config
@@ -343,7 +346,7 @@ class MoELayer(torch.nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         topk_output: TopKOutput,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
@@ -357,7 +360,9 @@ class MoELayer(torch.nn.Module):
         """Run the planned MoE kernel over this layer's weights.
 
         Args:
-            hidden_states: ``[tokens, hidden]`` local hidden states.
+            hidden_states: ``[tokens, hidden]`` local hidden states, or a
+                ``(packed_nvfp4, block_scales)`` pair for kernels accepting
+                prequantized input. Block scales use linear per-token layout.
             topk_output: Routing result, or the raw logits when the kernel
                 routes itself.
             num_global_tokens: Token count summed over the attention DP ranks.
@@ -394,6 +399,8 @@ class MoELayer(torch.nn.Module):
             self.support_routing and not self.supports_precomputed_topk
         )
         if use_kernel_routing:
+            if topk_output.router_logits is None:
+                raise ValueError("in-kernel MoE routing requires router logits")
             if not self.support_routing:
                 raise ValueError(
                     "selected MoE kernel does not support in-kernel routing"

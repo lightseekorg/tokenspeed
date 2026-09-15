@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -75,6 +75,9 @@ from tokenspeed.runtime.layers.attention.configs.base import is_block_drafter
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     validate_scheduler_config,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
+    local_pages_by_group,
+)
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.paged_attention import (
     bind_cache_groups,
@@ -124,7 +127,7 @@ def _resolve_prefill_graph_max_tokens(server_args) -> int:
     extend-shaped forward takes DeepEP's normal dispatch, whose per-expert
     receive counts come back to the host, and a host sync cannot be captured.
     """
-    if server_args.all2all_backend not in (None, "none"):
+    if server_args.all2all_backend == "deepep":
         return 0
     if server_args.prefill_graph_max_tokens is not None:
         return int(server_args.prefill_graph_max_tokens)
@@ -351,6 +354,9 @@ class ModelExecutor:
             state_write_padding_pool_index=config.max_req_pool_size,
             device=self.device,
         )
+        # Group-keyed zeroing requests carry scheduler (virtual) block IDs; this
+        # rank's position in the DCP group selects the pages it owns.
+        self._cache_dcp_rank = model_runner.mapping.attn.dcp_rank
         ngram_context = engram_context_len(model_runner.model_config.hf_text_config)
         if ngram_context and (config.pp_size != 1 or config.overlap_schedule_depth > 1):
             raise NotImplementedError(
@@ -545,6 +551,8 @@ class ModelExecutor:
             self.forward_step.capture()
         if not self.prefill_graph.disable:
             self.prefill_graph.capture(self.forward_step)
+            if self.drafter is not None:
+                self.drafter.capture_prefill_graph(self.forward_step.stream)
 
     def _autotune(self) -> None:
         """Profile tunable kernels over one dummy prefill before graph capture.
@@ -1138,7 +1146,7 @@ class ModelExecutor:
                     spec_step_idx=step_idx,
                 )
 
-    def zero_cache_pages(self, pages):
+    def zero_cache_pages(self, pages: Mapping[str, Sequence[int]] | Sequence[int]):
         """Clear newly owned pages and return a CUDA completion event when needed.
 
         Runs on ``default_stream``, ordered behind the forwards in flight on
@@ -1151,6 +1159,15 @@ class ModelExecutor:
         if not pages:
             return None
         self.default_stream.wait_stream(self.execution_stream)
+
+        if isinstance(pages, Mapping):
+            # Group-keyed requests carry scheduler (virtual) IDs; pools and the
+            # arena only ever see this rank's local pages.
+            pages = local_pages_by_group(
+                pages,
+                contract=self._cache_runtime_contract,
+                rank=self._cache_dcp_rank,
+            )
 
         def sanitize(pool, pool_pages) -> bool:
             zero_new_blocks = getattr(pool, "zero_new_blocks", None)
@@ -1301,6 +1318,7 @@ class ModelExecutor:
             self.nan_guard.reset(bs)
             cache_metadata = None
             block_tables = {}
+            block_tables_cpu = {}
             if bs > 0:
                 # Validate and pack the per-group tables once for this batch.
                 cache_metadata = CacheBatchMetadata.from_forward_op(
@@ -1310,6 +1328,9 @@ class ModelExecutor:
                     num_requests=bs,
                 )
                 block_tables = dict(cache_metadata.tables(active_forward_op=forward_op))
+                block_tables_cpu = dict(
+                    cache_metadata.tables_cpu(active_forward_op=forward_op)
+                )
             decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
@@ -1474,6 +1495,7 @@ class ModelExecutor:
                             :num_extends
                         ],
                         block_tables=block_tables,
+                        block_tables_cpu=block_tables_cpu,
                     )
                     if timing_enabled:
                         forward_step_ms = (

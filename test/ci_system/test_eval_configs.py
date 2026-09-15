@@ -43,7 +43,7 @@ DATASETS = {
         "dataset_args": json.loads(GPQA_HUGGINGFACE_DATASET_ARGS)["gpqa_diamond"],
     },
     "gsm8k": {
-        "count": 7,
+        "count": 8,
         "dataset_args": {"dataset_id": "openai/gsm8k"},
     },
     "mmlu": {

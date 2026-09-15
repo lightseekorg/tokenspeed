@@ -118,6 +118,10 @@ class TritonRSAGBackend:
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
         state = self._get_or_create(group, tensor.size(-1))
+        # Cached history can exceed the scheduled-token budget used to size
+        # this workspace. Keep captured pointers stable and use NCCL instead.
+        if sum(scattered_num_tokens) > state.max_token_num:
+            return self._fallback.token_all_gather(tensor, group, scattered_num_tokens)
         return all_gather(state, tensor, token_list_in_group=scattered_num_tokens)
 
     def token_reduce_scatter(
@@ -127,10 +131,14 @@ class TritonRSAGBackend:
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
         state = self._get_or_create(group, tensor.size(-1))
+        if sum(scattered_num_tokens) > state.max_token_num:
+            return self._fallback.token_reduce_scatter(
+                tensor, group, scattered_num_tokens
+            )
         return reduce_scatter(state, tensor, token_list_in_group=scattered_num_tokens)
 
     def _get_max_num_gathered_tokens(self):
-        """Compute max buffer size for TritonRSAG.
+        """Cover prefill and rank-local decode/verify batches for TritonRSAG.
 
         global_server_args_dict read is intentional — this is one-time RSAG buffer
         init infrastructure. Passing mapping through all signatures would be too invasive.
@@ -143,6 +151,19 @@ class TritonRSAGBackend:
             max_attn_tp_num_tokens = chunked_prefill_size
         else:
             max_attn_tp_num_tokens = max_prefill_tokens + max_model_len
+        max_decode_bs = (
+            global_server_args_dict["max_num_seqs"] or 0
+        ) // mapping.attn.dp_size
+        decode_tokens_per_req = (
+            global_server_args_dict["speculative_num_draft_tokens"]
+            if global_server_args_dict.get("speculative_algorithm") is not None
+            else 1
+        )
+        # Graph buckets are capped by this same rank-local request limit.
+        # Verify expands each request even when the prefill chunk is smaller.
+        max_attn_tp_num_tokens = max(
+            max_attn_tp_num_tokens, max_decode_bs * decode_tokens_per_req
+        )
         max_scattered_num_tokens = ceil_div(
             max_attn_tp_num_tokens, mapping.attn.tp_size
         )

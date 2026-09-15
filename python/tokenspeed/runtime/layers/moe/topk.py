@@ -301,11 +301,11 @@ class TopKConfig:
 
 
 class StandardTopKOutput(NamedTuple):
-    """Standard top-k output format."""
+    """Precomputed routing; logits may be omitted once IDs and weights suffice."""
 
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
-    router_logits: torch.Tensor
+    router_logits: torch.Tensor | None
 
     @property
     def format(self) -> TopKOutputFormat:

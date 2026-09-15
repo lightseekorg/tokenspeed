@@ -23,10 +23,14 @@ from __future__ import annotations
 import math
 
 import torch
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import PlatformInfo, current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
+from tokenspeed_kernel.selection import (
+    NoKernelFoundError,
+    select_kernel,
+    spec_matches_traits,
+)
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
     dense_tensor_format,
@@ -503,13 +507,37 @@ def dsv4_prefill(
         )
 
 
+_DSV4_PARTIAL_DECODE_TRAITS = {"support_sink": False, "return_lse": True}
+
+
+def dsv4_decode_supports_partials(platform: PlatformInfo) -> bool:
+    """Whether ``platform`` has a decode kernel that can emit a no-sink LSE.
+
+    Decode context parallelism attends to each rank's cache shard separately
+    and merges the partials through their LSE, so it needs a ``dsv4_decode``
+    kernel registered with ``support_sink`` including False and ``return_lse``
+    including True.
+
+    Args:
+        platform: Hardware the kernel must be registered for.
+
+    Returns:
+        True when at least one registered ``dsv4_decode`` kernel satisfies the
+        platform and both traits.
+    """
+    specs = KernelRegistry.get().get_for_operator(
+        "attention", "dsv4_decode", platform=platform
+    )
+    return any(spec_matches_traits(spec, _DSV4_PARTIAL_DECODE_TRAITS) for spec in specs)
+
+
 def dsv4_decode(
     q: torch.Tensor,
     swa_kv_cache: torch.Tensor,
     swa_slots: torch.Tensor,
     swa_lens: torch.Tensor,
     swa_page_size: int,
-    attn_sink: torch.Tensor,
+    attn_sink: torch.Tensor | None,
     softmax_scale: float,
     extra_kv_cache: torch.Tensor | None = None,
     extra_slots: torch.Tensor | None = None,
@@ -518,7 +546,8 @@ def dsv4_decode(
     out: torch.Tensor | None = None,
     override: str | None = None,
     solution: str | None = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run DeepSeek V4 selected attention over page-planar FP8 caches.
 
     SWA and optional extra compressed rows form independent selected segments.
@@ -534,21 +563,31 @@ def dsv4_decode(
             prefix must be smaller than ``pages * swa_page_size``.
         swa_lens: Valid SWA selection length for each query token.
         swa_page_size: Number of SWA rows in each cache page.
-        attn_sink: One attention sink logit per query head.
+        attn_sink: One attention sink logit per query head, or None to omit
+            the sink when computing a DCP partial.
         softmax_scale: Scale applied to query-key dot products.
         extra_kv_cache: Optional uint8 page-planar compressed cache.
         extra_slots: Selected global slots in ``extra_kv_cache``. Nonnegative
             entries in each active prefix must be smaller than
             ``extra_pages * extra_page_size``.
-        extra_lens: Valid extra selection length for each query token.
+        extra_lens: Extra scan length for each query token, including any -1
+            holes inside that prefix. Owner filtering must not shorten it when
+            indices retain their original order.
         extra_page_size: Number of rows in each extra cache page.
-        out: Optional output shaped like ``q``.
+        out: Optional output buffer shaped like ``q``. When provided, the
+            returned output is this same tensor, including with return_lse=True.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
-
+        return_lse: Return a partial and its natural-log LSE. The LSE never
+            includes a sink, so ``attn_sink`` must be None; callers combining
+            partials apply the sink once after merging them.
     Returns:
-        BF16 attention output shaped like ``q``.
+        BF16 attention output shaped like ``q``. With return_lse=True, also
+        return natural-log FP32 LSE shaped [tokens, heads, 1], with one query
+        per token.
     """
+    if return_lse and attn_sink is not None:
+        raise ValueError("dsv4_decode returns a no-sink LSE; pass attn_sink=None")
     if q.dim() != 3 or q.shape[0] < 1 or q.shape[-1] != 512:
         raise ValueError(
             f"q must have shape [tokens, heads, 512], got {tuple(q.shape)}"
@@ -566,10 +605,10 @@ def dsv4_decode(
         raise TypeError("swa_slots must have dtype int32 or int64")
     if swa_lens.dtype not in (torch.int32, torch.int64):
         raise TypeError("swa_lens must have dtype int32 or int64")
-    if attn_sink.numel() < q.shape[1]:
+    if attn_sink is not None and attn_sink.numel() < q.shape[1]:
         raise ValueError("attn_sink must provide one value per query head")
     if any(
-        tensor.device != q.device
+        tensor is not None and tensor.device != q.device
         for tensor in (swa_kv_cache, swa_slots, swa_lens, attn_sink)
     ):
         raise ValueError("all paged selected-attention tensors must share a device")
@@ -618,7 +657,8 @@ def dsv4_decode(
         "num_heads": int(q.shape[1]),
         "cache_layout": "fp8_swa_page_planar",
         "topk_layout": "global_slots",
-        "support_sink": True,
+        "support_sink": attn_sink is not None,
+        "return_lse": return_lse,
         "has_extra": has_extra_segment,
         "has_extra_segment": has_extra_segment,
         "swa_selected_width": swa_width,
@@ -645,6 +685,12 @@ def dsv4_decode(
         solution=solution,
         override=override,
     )
+    if return_lse:
+        spec = KernelRegistry.get().get_by_name(kernel.name)
+        if spec is None or True not in spec.traits.get("return_lse", ()):
+            raise RuntimeError(
+                f"kernel {kernel.name!r} does not declare no-sink DSV4 LSE support"
+            )
     shape_params = {
         "tokens": tokens,
         "num_heads": int(q.shape[1]),
@@ -655,6 +701,8 @@ def dsv4_decode(
         "extra_page_size": int(extra_page_size or 0),
         "has_extra_segment": has_extra_segment,
     }
+    if return_lse:
+        shape_params["return_lse"] = True
     ShapeCapture.get().record(
         "attention",
         "dsv4_decode",
@@ -682,6 +730,7 @@ def dsv4_decode(
             extra_lens=extra_lens,
             extra_page_size=extra_page_size,
             out=out,
+            **({"return_lse": True} if return_lse else {}),
         )
 
 
@@ -1068,6 +1117,7 @@ __all__ = [
     "dsv4_csa_indexer_fp8_cache_insert",
     "dsv4_prefill",
     "dsv4_decode",
+    "dsv4_decode_supports_partials",
     "dsv4_prefill_topk",
     "dsv4_decode_topk",
     "dsv4_plan",

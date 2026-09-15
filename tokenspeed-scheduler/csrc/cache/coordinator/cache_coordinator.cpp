@@ -49,6 +49,13 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
                 "group block_granularity must be a positive divisor of the prefix granularity");
         _assert(groups_[i].Allocator().CacheBlocksPerLcmBlock() == groups_[i].Spec().cache_blocks_per_lcm_block,
                 "group allocator packing must match its group spec");
+        _assert(groups_[i].Allocator().ShardCount() == groups_[i].Spec().shard_count,
+                "group allocator shard count must match its group spec");
+        const auto& spec = groups_[i].Spec();
+        pool_.RegisterGroup(groups_[i].Id(), spec.cache_blocks_per_lcm_block, spec.shard_count);
+        if (host_pool_ != nullptr) {
+            host_pool_->RegisterGroup(groups_[i].Id(), spec.cache_blocks_per_lcm_block, spec.shard_count);
+        }
         geometry_.emplace_back(group_block_granularity);
         if (groups_[i].Matcher().IsPrefixClosed()) {
             match_order_.push_back(i);
@@ -863,7 +870,7 @@ CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int
         const std::int32_t group_block_granularity = spec.block_granularity;
         _assert(group_block_granularity > 0 && prefix_granularity % group_block_granularity == 0,
                 "group block_granularity must be a positive divisor of the prefix granularity");
-        auto allocator = std::make_unique<GroupAllocator>(spec.cache_blocks_per_lcm_block, group_id);
+        auto allocator = std::make_unique<GroupAllocator>(spec.cache_blocks_per_lcm_block, group_id, spec.shard_count);
         std::unique_ptr<PrefixMatcher> matcher;
         switch (spec.kind) {
             case AttnKind::kFull:

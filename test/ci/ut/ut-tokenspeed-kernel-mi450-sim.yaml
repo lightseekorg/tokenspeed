@@ -34,7 +34,19 @@ env:
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_short_512]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-q_bf16-decode]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-q_bf16-prefill]
+    # GLM-5.3-Flash full attention: native 256-wide NoPE score geometry,
+    # rank-512 values, and the 2051-slot KPool-plus-tail ABI in both stages.
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_glm53_flash_bf16_split_matrix[16]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_glm53_flash_zero_length_rows_are_zero
+    tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/attention.dsa_decode_glm53_flash_bf16_dense/gluon_dsa_decode_gfx1250@mi450]
+    tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/attention.dsa_prefill_glm53_flash_bf16_dense/gluon_dsa_prefill_gfx1250@mi450]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_standard_cache.py::test_standard_cache_decode_cuda_graph_replays_changed_inputs[1]
+    # GLM-5.3 KPool Wave32 scoring, logical radix top-k, and plan-aware expansion.
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_kpool_score.py::test_kpool_prefill_logits_match_weighted_relu_and_local_window[weight_dtype0-13-173-0-False]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_kpool_score.py::test_kpool_ordered_head_fold_matches_sequential_signed_reference
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_gluon_logical_topk_indices_respects_ragged_ranges_and_outputs
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_kpool_plan.py::test_short_plan_has_stable_logical_order_and_flatkv_boundaries
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_kpool_plan.py::test_plan_radix_path_matches_reference_after_deterministic_threshold
     tokenspeed-kernel/test/amd/ops/test_kimi3_prefill_gluon_amd.py::test_attn_res_amd_entrypoint_accepts_legacy_keywords
     # Gluon argmax on gfx1250: split reduction, non-power-of-two split count,
     # pipelined TDM with zero-padding masking, single-tile rows, NaN handling,

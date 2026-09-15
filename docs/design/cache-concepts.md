@@ -87,13 +87,16 @@ A fourth quantity lives outside the logical world entirely:
   (as a state slot). The view is defined by the consumer, not by the block.
 
 `BlockPool` owns the physical placement indexes: the FIFO of empty LCM blocks,
-the free child-slot count for each cache group, and the ordered set of partially
-filled LCM blocks for that group. C++ group ids are dense scheduler indices, so
+the free child-slot count for each cache group, and per-bucket ordered sets of
+partially filled LCM blocks. C++ group ids are dense scheduler indices, so
 the scheduler supplies the complete packing vector when it constructs each
 pool. The per-group placement records form a vector indexed by group id, and
-each `GroupPlacement` stores immutable slots-per-parent geometry. It updates its
-free-slot count, bound-parent count and partial-parent index together on every
-occupancy transition. A parent with zero occupants is unbound, so its capacity
+each `GroupAvailability` stores immutable slots-per-parent geometry. The
+coordinator registers each group's shard count before allocation; an ordinary
+standalone pool fixes a single bucket on first use. Registration cannot change
+the geometry after it is fixed, including after all blocks are freed. The pool
+updates its free-slot count and bucket indexes together on every occupancy
+transition. A parent with zero occupants is unbound, so its capacity
 belongs to the global empty-parent FIFO rather than any group.
 
 The pool knows which child slots are occupied, never who holds them. Whether a
@@ -178,6 +181,11 @@ request's table covers tokens
 entry *values*, however, are **`CacheBlock` ids** — handles to the physical
 storage the cache layer allocated. The scheduler owns allocation, so its output names that storage directly.
 Consumers outside the cache layer treat the ids as opaque.
+
+With DCP virtual-block placement, `CacheBatchMetadata` validates exported IDs
+against each group's **virtual** block count. The physical page count bounds
+local arena storage only; applying it to the scheduler table would reject valid
+remote-owner IDs before the runtime can translate them.
 
 #### Snapshot-state prefill checkpoints
 
@@ -616,9 +624,9 @@ whole). No family restates the order of the stages, and `_RECIPES`
 **No round-trip reconciliation.** The pipeline is arranged so that pairs which
 would otherwise need cross-checking cannot differ:
 
-* the group set in the plan equals the declared one because `pack` consumes
-  the `(spec, fields)` pairs and `setup()` publishes the specs from those
-  same pairs;
+* `setup()` obtains `(spec, fields)` pairs from `groups()` and uses the same
+  local tuple for `pack` and spec publication, so both name the same group
+  set without a separate cache of declarations;
 * a field cannot name a group the plan does not have, because it never names
   one — `pack` carries the declaring group id alongside each field;
 * per-group packing is read from the layout, not recomputed, everywhere
@@ -685,6 +693,98 @@ repeatedly rebuilding, briefly decoding and re-retracting the same prompt is
 the escalating admission headroom each retraction adds to the victim's next
 admission. The protocol — victim choice, readmission order, why the release
 is safe before the L2 snapshot copies — is `scheduler.md` §2 and §4.
+
+## Virtual block placement within a shared physical plan
+
+A recipe declares each group as a `(CacheGroupSpec, fields)` tuple.
+`CacheGroupSpec.shard_count` defaults to 1 (replicated); a larger value assigns
+virtual blocks cyclically across that many owners. The memory plan continues
+to own local shapes, strides, packing and byte counts. `CacheArena` is the sole
+publisher of `CacheRuntimeContract`, whose virtual counts and packing derive
+from these physical facts and each spec's `shard_count`. No separate placement
+or per-group address-space object is needed.
+
+A recipe's group set never depends on the DCP size. Only groups whose every
+reader can attend to a shard may be sharded; a group some consumer must read
+whole stays replicated and is declared as its own group at every DCP size, so
+prefix matching, transfer and zeroing -- all keyed by group -- see one
+topology. DeepSeek V4 shards its compressed-KV chains and keeps the SWA cache,
+the compressor states and the indexer's K replicated; the indexer K is its own
+full-history group rather than a tenant of the compressed chain it indexes.
+
+Splitting or regrouping fields can change physical packing and parent plane
+sizes. Capacity planning therefore uses the resulting physical parent byte
+size and each group's declared demand: a replicated full-history group holds
+one physical child per token span where a sharded one holds one per
+`shard_count` spans, so the replicated groups bound the token capacity.
+Virtual placement alone does not impose a fixed parent size across different
+group declarations; field alignment and bounds remain the physical planner's
+responsibility, and the padding bound applies unchanged.
+
+Translation from virtual to local IDs is one operation with `shard_count` as
+a parameter, never a mode: a replicated group translates to itself minus the
+null block, so batch metadata refreshes its local read tables, writers mask
+unowned rows, and zeroing filters foreign blocks through the same path at
+every DCP size. Virtual block 0 is the null block; no path writes to it, at
+any DCP size.
+
+Consumers bind a pool's compute view and read its arena's runtime contract.
+Views sharing an arena share that contract, rather than accepting separately
+injected copies of its geometry. Batch metadata retains the same contract for
+address translation.
+
+For physical packing K, N usable parents and D shards, a sharded
+group has `1 + N*K` local pages and `1 + N*D*K` virtual blocks. A replicated
+group uses one bucket. Existing `group_page_counts` and `group_packing` name
+physical quantities; the scheduler bridge explicitly consumes
+`virtual_block_counts` and `virtual_packing`. Virtual capacity must never be
+used to shape an arena field. Virtual null ID 0 has no owner and is filtered
+during translation.
+
+Before zeroing scheduler blocks, the runtime checks IDs against the virtual
+bound and translates each group's batch to owned local IDs through the shared
+translation API. Translation precedes dispatch to pool views; pools and the
+arena receive physical IDs and hold no context rank. The arena's
+`zero_blocks()` validates every ID against its group's local page count before
+clearing any bytes. Physical page 0 is within that range and is handled like
+any other page when explicitly requested.
+
+The allocator receives only an integer `shard_count`, fixed when the
+coordinator registers the group in its pools. It counts
+all nonnull refs in the request table, including shared prefixes and reserved
+headroom. Among available holes in already bound parents, it selects the
+least-loaded request bucket (ties by bucket ID), then the most occupied
+parent (ties by parent ID), then the lowest child ID. Allocation updates these
+occupancies before selecting the next child. Only when all bound-parent holes
+are exhausted may it open the next FIFO empty parent. Bucket balance cannot
+reserve an extra parent or cause admission failure while another bucket is
+available. A failed acquire leaves both placement and request tables unchanged.
+
+`BlockPool` maintains the free-slot count of each group and an ordered parent
+index per bucket. Each parent records only its lowest free slot per bucket;
+it does not materialize a list of every hole. Physical `occupy` and `Release`
+update these indices, including full-to-partial transitions and final-child
+release. Shared request/prefix references therefore keep both the parent
+binding and its index state alive until the last reference releases the block.
+These indices describe physical availability, not request-local owner loads.
+
+An exact acquire first checks `group holes + empty parents * group packing`.
+Capacity-first selection can consume all of these slots, so it then allocates
+directly without a second, pool-sized shadow planner. Insufficient capacity
+returns before changing the indices, occupancy, or FIFO. Ordinary, balanced,
+and Host allocation entry points use the same availability updates.
+
+Choosing a block examines the bucket-index heads, not every parent. Updating
+the chosen parent's ordering costs one logarithmic-time index update per
+bucket the parent has a hole in. Advancing its free-slot cursor only searches
+that bucket within that parent. Ordinary and balanced calls share the registered geometry;
+changing the shard count or packing is rejected even after every block is
+released. No allocation call rebuilds the group's indices for new geometry.
+The additional metadata is per-parent bucket minima and at most one tree
+entry per available bucket of a partial parent. Request loads remain derived
+from `BlockTable` on each actual acquire; this optimization introduces no
+request counter that retract, prefix replacement, or table clearing must reset.
+
 
 ## Sparse indexers: model weights, backend dispatch and verification
 

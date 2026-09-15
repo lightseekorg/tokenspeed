@@ -40,6 +40,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     V4_COMPRESSOR_STATE_ROWS_PER_PAGE,
     V4_COMPRESSOR_STATE_WINDOW_TOKENS,
     V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
+    V4_INDEXER_KV_GROUP_ID,
     V4_KERNEL_BLOCK_ROWS,
     V4_SWA_KV_GROUP_ID,
     DeepseekV4CacheLayout,
@@ -112,13 +113,25 @@ def v4_compressor_state_spec(ratio: int, *, c4_state_window: int) -> CacheGroupS
 
 
 def v4_compressed_kv_spec(ratio: int) -> CacheGroupSpec:
-    """Compressed kv for one ratio: full-history chain (indexer K shares it)."""
+    """Compressed kv for one ratio: the full-history chain."""
     _check_ratio(ratio)
     return CacheGroupSpec(
         group_id=v4_compressed_kv_group_id(ratio),
         retention="full_history",
         rows_per_page=v4_compressed_rows_per_page(ratio),
         entry_stride_tokens=ratio,
+        sliding_window_tokens=None,
+        family="history",
+    )
+
+
+def v4_indexer_kv_spec() -> CacheGroupSpec:
+    """Indexer K: a replicated full-history chain over the ratio-4 layers."""
+    return CacheGroupSpec(
+        group_id=V4_INDEXER_KV_GROUP_ID,
+        retention="full_history",
+        rows_per_page=v4_compressed_rows_per_page(4),
+        entry_stride_tokens=4,
         sliding_window_tokens=None,
         family="history",
     )
@@ -225,6 +238,11 @@ class DeepseekV4Recipe(CacheRecipe):
     # ---- geometry ----
 
     @property
+    def dcp_size(self) -> int:
+        """Owners of each compressed-KV virtual block; 1 keeps them replicated."""
+        return int(self.attn_config.dcp_size)
+
+    @property
     @override
     def max_padding_fraction(self) -> float:
         return _MAX_PADDING_FRACTION
@@ -256,8 +274,7 @@ class DeepseekV4Recipe(CacheRecipe):
         c4_window = v4_c4_state_window(self.decode_input_tokens)
         swa_bytes = layout.swa_block_bytes(V4_KERNEL_BLOCK_ROWS)
         stride_alignment = layout.swa_token_stride
-        ratio_counts = Counter(ratios)
-        declared: dict[str, tuple[CacheGroupSpec, tuple[CacheFieldSpec, ...]]] = {}
+        declared: dict[str, CacheGroupDeclaration] = {}
         # A group's plane numbering: one plane per layer that stores in it.
         occurrences: Counter[str] = Counter()
 
@@ -291,7 +308,10 @@ class DeepseekV4Recipe(CacheRecipe):
             if ratio == 1:
                 continue
 
-            compressed_spec = v4_compressed_kv_spec(ratio)
+            compressed_spec = replace(
+                v4_compressed_kv_spec(ratio),
+                shard_count=self.dcp_size,
+            )
             state_spec = v4_compressor_state_spec(ratio, c4_state_window=c4_window)
             compressed_slot = occurrences[compressed_spec.group_id]
             occurrences[compressed_spec.group_id] += 1
@@ -324,16 +344,20 @@ class DeepseekV4Recipe(CacheRecipe):
             if ratio != 4:
                 continue
 
-            # The indexer's K shares the compressed chain's group but sits on
-            # planes after every compressed tenant; its state is its own group.
+            # The indexer's K is its own replicated full-history group: the
+            # indexer reads every rank's rows, so it never follows the
+            # compressed chain's sharding. Its state is its own group too.
+            indexer_spec = v4_indexer_kv_spec()
+            indexer_slot = occurrences[indexer_spec.group_id]
+            occurrences[indexer_spec.group_id] += 1
             indexer_state_spec = v4_indexer_state_spec(c4_state_window=c4_window)
             indexer_state_slot = occurrences[indexer_state_spec.group_id]
             occurrences[indexer_state_spec.group_id] += 1
             declare(
-                compressed_spec,
+                indexer_spec,
                 CacheFieldSpec(
                     f"layer.{layer_id}.indexer_kv",
-                    f"unit.{ratio_counts[4] + compressed_slot}",
+                    f"unit.{indexer_slot}",
                     (V4_KERNEL_BLOCK_ROWS * layout.indexer_row_bytes,),
                     "uint8",
                     exact_page_stride=False,

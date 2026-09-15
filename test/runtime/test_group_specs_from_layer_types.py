@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 import os
 import pathlib
 import sys
 import unittest
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -560,21 +562,32 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
             )
 
 
-def _fake_pool(specs, *, packing=1) -> SimpleNamespace:
+def _fake_pool(specs, *, packing: int) -> SimpleNamespace:
     """A cache view whose arena publishes ``specs`` as its contract.
 
     Page counts and packing are the plan's facts, carried by the contract
     beside the specs -- the bridge reads them from there, never off a spec.
     """
-    return SimpleNamespace(
-        arena=SimpleNamespace(
-            runtime_contract=SimpleNamespace(
-                group_specs=tuple(specs),
-                group_page_counts={spec.group_id: 1024 for spec in specs},
-                group_packing={spec.group_id: packing for spec in specs},
-            )
-        )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+        CacheRuntimeContract,
     )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+        CacheGroupSpec as RuntimeCacheGroupSpec,
+    )
+
+    # The declaration tests use an isolated spec module. The actual contract
+    # validates the runtime class, so cross that boundary explicitly here.
+    runtime_specs = tuple(RuntimeCacheGroupSpec(**asdict(spec)) for spec in specs)
+    prefix_granularity = math.lcm(*(spec.block_granularity for spec in specs))
+    contract = CacheRuntimeContract(
+        prefix_granularity=prefix_granularity,
+        num_lcm_blocks=1023,
+        token_capacity=1023 * prefix_granularity,
+        group_specs=runtime_specs,
+        group_page_counts={spec.group_id: 1 + 1023 * packing for spec in specs},
+        group_packing={spec.group_id: packing for spec in specs},
+    )
+    return SimpleNamespace(arena=SimpleNamespace(runtime_contract=contract))
 
 
 class PoolToCacheGroupsIntegrationTest(unittest.TestCase):
@@ -605,7 +618,7 @@ class PoolToCacheGroupsIntegrationTest(unittest.TestCase):
         )
         # Duck-typed stand-in: a view naming an arena whose contract is
         # what the converter reads.
-        fake_pool = _fake_pool(specs)
+        fake_pool = _fake_pool(specs, packing=1)
 
         groups = pool_to_cache_groups(fake_pool)
 
@@ -623,7 +636,7 @@ class PoolToCacheGroupsIntegrationTest(unittest.TestCase):
             sliding_window_tokens=None,
             prefix_granularity=16,
         )
-        fake_pool = _fake_pool(specs)
+        fake_pool = _fake_pool(specs, packing=1)
 
         groups = {g.group_id: g for g in pool_to_cache_groups(fake_pool)}
 
@@ -634,6 +647,30 @@ class PoolToCacheGroupsIntegrationTest(unittest.TestCase):
         self.assertFalse(hasattr(state, "checkpoint_granularity"))
         full = groups["full_attention"]
         self.assertEqual(full.block_granularity, 16)
+
+    def test_sharded_group_exports_virtual_capacity_and_packing(self):
+        pool_to_cache_groups = self._import_converter()
+        specs = _specs(
+            layer_types=["full_attention", "sliding_attention"],
+            sliding_window_tokens=128,
+            prefix_granularity=16,
+        )
+        specs = tuple(
+            replace(spec, shard_count=4) if spec.group_id == "full_attention" else spec
+            for spec in specs
+        )
+        pool = _fake_pool(specs, packing=2)
+        groups = {group.group_id: group for group in pool_to_cache_groups(pool)}
+        full = groups["full_attention"]
+        self.assertEqual(full.total_pages, 1 + 1023 * 2 * 4)
+        self.assertEqual(full.cache_blocks_per_lcm_block, 8)
+        self.assertEqual(full.shard_count, 4)
+        sliding = groups["sliding_attention"]
+        self.assertEqual(sliding.total_pages, 1 + 1023 * 2)
+        self.assertEqual(sliding.cache_blocks_per_lcm_block, 2)
+        self.assertEqual(sliding.shard_count, 1)
+        self.assertEqual(full.block_granularity, 16)
+        self.assertEqual(sliding.block_granularity, 16)
 
 
 if __name__ == "__main__":

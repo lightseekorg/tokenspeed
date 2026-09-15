@@ -122,7 +122,16 @@ def raw_config():
             "engram_max_ngram_size": 4,
             "num_nextn_predict_layers": 3,
         },
-        "vision_config": {"model_type": "deepseek_v41_vision", "hidden_size": 1024},
+        "vision_config": {
+            "model_type": "deepseek_v41_vision",
+            "hidden_size": 1024,
+            "intermediate_size": 4096,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 16,
+            "patch_size": 14,
+            "downsample_ratio": 2,
+            "rope_theta": 10000,
+        },
     }
 
 
@@ -193,6 +202,9 @@ def runtime_config(config_dir):
 
 
 def test_registry_and_wrapper_roundtrip(config_dir, tmp_path):
+    from tokenspeed.runtime.models.deepseek_v41 import DeepseekV41ForCausalLM
+    from tokenspeed.runtime.models.registry import ModelRegistry
+
     assert _CONFIG_REGISTRY["deepseek_v41"] is DeepseekV41Config
     assert _CONFIG_REGISTRY["deepseek_v41_text"] is DeepseekV41TextConfig
     config = _load_config(config_dir)
@@ -203,14 +215,21 @@ def test_registry_and_wrapper_roundtrip(config_dir, tmp_path):
     config.save_pretrained(str(roundtrip), push_to_hub=False)
     restored = _load_config(roundtrip)
     raw = json.loads((config_dir / "config.json").read_text(encoding="utf-8"))
+    model_cls, architecture = ModelRegistry.resolve_model_cls(raw["architectures"])
+    assert model_cls is DeepseekV41ForCausalLM
+    assert architecture == "DeepseekV41ForCausalLM"
 
     for loaded in (config, auto_config, restored):
+        assert loaded.architectures == raw["architectures"]
         assert isinstance(loaded, DeepseekV41Config)
         assert isinstance(loaded.text_config, DeepseekV41TextConfig)
+        assert loaded.hidden_size == loaded.text_config.hidden_size
+        assert loaded.vocab_size == loaded.text_config.vocab_size
+        assert not hasattr(loaded, "num_hidden_layers")
         assert loaded.model_type == "deepseek_v41"
         assert loaded.text_config.model_type == "deepseek_v41_text"
-        assert loaded.architectures == ["DeepseekV41ForCausalLM"]
-        assert loaded.vision_config == raw["vision_config"]
+        for key, value in raw["vision_config"].items():
+            assert getattr(loaded.vision_config, key) == value
         assert loaded.image_token_id == 129264
         assert loaded.quantization_config == raw["quantization_config"]
         assert loaded.text_config.expert_dtype == "fp4"
@@ -230,7 +249,6 @@ def test_registry_and_wrapper_roundtrip(config_dir, tmp_path):
             ("max_position_embeddings", 1048576),
         ):
             assert getattr(loaded.text_config, key) == expected
-            assert getattr(loaded, key) == expected
         for key, expected in (
             ("bos_token_id", 0),
             ("eos_token_id", 1),
@@ -250,6 +268,32 @@ def test_registry_and_wrapper_roundtrip(config_dir, tmp_path):
         assert text.rope_scaling["factor"] == 16
         assert text.rope_scaling["original_max_position_embeddings"] == 65536
     assert restored.text_config.quantization_config == raw["quantization_config"]
+    overridden = AutoConfig.from_pretrained(
+        str(roundtrip),
+        local_files_only=True,
+        text_config={"hidden_size": 1024},
+        vision_config={"patch_size": 16},
+    )
+    assert overridden.text_config.hidden_size == overridden.hidden_size == 1024
+    assert overridden.vision_config.patch_size == 16
+
+
+@pytest.mark.parametrize(
+    "architectures",
+    [None, ["DeepseekV41ForCausalLM"], ["DeepseekV41ForCausalLMDSpark"]],
+)
+def test_top_level_config_preserves_checkpoint_architecture(raw_config, architectures):
+    raw_config["architectures"] = architectures
+    raw_config["vision_config"] = None
+    config = DeepseekV41Config(**raw_config)
+    assert config.architectures == architectures
+
+
+def test_vision_config_uses_checkpoint_overrides_and_defaults(raw_config):
+    del raw_config["vision_config"]["patch_size"]
+    config = DeepseekV41Config(**raw_config)
+    assert config.vision_config.patch_size == 14
+    assert config.vision_config.num_hidden_layers == 2
 
 
 def test_text_config_sets_dimensions_before_hf_rope_setup(raw_config, monkeypatch):
@@ -298,6 +342,7 @@ def test_model_config_uses_nested_mla_dims_without_yarn_scale(runtime_config):
     args, model = runtime_config
     assert isinstance(model.hf_config, DeepseekV41Config)
     assert model.hf_text_config is model.hf_config.text_config
+    assert model.is_multimodal and model.is_multimodal_active
     assert model.attention_arch is AttentionArch.MLA
     assert args.attention_backend == "deepseek_v41"
     assert args.prefix_granularity == 256
@@ -449,4 +494,4 @@ def test_real_server_args_prepare_cache_pool_and_backend(runtime_config, overlap
             == arena.buffer.untyped_storage().data_ptr()
         )
     assert backend.cuda_graph_support.decode_graph
-    assert not backend.cuda_graph_support.prefill_graph
+    assert backend.cuda_graph_support.prefill_graph

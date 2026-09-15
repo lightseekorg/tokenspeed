@@ -108,6 +108,11 @@ class BaseDrafter:
         derived target weights and therefore need no action.
         """
 
+    def capture_prefill_graph(self, stream: torch.cuda.Stream) -> None:
+        """Capture draft prefill work after target capture, when prefill graphs
+        are enabled. Drafters without a separate prefill graph need no action.
+        """
+
     @abstractmethod
     def run(
         self,

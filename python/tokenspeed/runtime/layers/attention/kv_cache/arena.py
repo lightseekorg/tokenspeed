@@ -225,7 +225,22 @@ class CacheArena:
         return self.plan.field_page_byte_offset(field_id, block_id)
 
     def zero_blocks(self, block_ids_by_group: dict[str, list[int]]) -> None:
-        """Clear selected CacheBlocks without interpreting their field types."""
+        """Clear local physical blocks after validating every group's IDs.
+
+        Args:
+            block_ids_by_group: Local block IDs, each in [0, group.page_count).
+
+        Raises:
+            IndexError: A block ID is outside its group's physical range.
+        """
+        for group_id, block_ids in block_ids_by_group.items():
+            page_count = self.plan.group(group_id).page_count
+            for block in block_ids:
+                if not 0 <= block < page_count:
+                    raise IndexError(
+                        f"local block ID {block} outside [0, {page_count}) "
+                        f"for group {group_id!r}"
+                    )
         segments = [
             segment
             for group_id, block_ids in block_ids_by_group.items()

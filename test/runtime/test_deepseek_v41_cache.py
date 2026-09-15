@@ -598,7 +598,7 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool, verify_
     from tokenspeed_kernel.ops.attention import dsv41
 
     assert DeepseekV41AttentionBackend.cuda_graph_support.decode_graph
-    assert not DeepseekV41AttentionBackend.cuda_graph_support.prefill_graph
+    assert DeepseekV41AttentionBackend.cuda_graph_support.prefill_graph
     torch.manual_seed(42)
     backend = _verify_backend("cuda", 5, verify_width)
     backend.cache_pool.arena.buffer.zero_()
@@ -797,7 +797,11 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
         device="cpu",
         attn_tp_size=1,
         data_parallel_size=2,
-        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, dp_size=2)),
+        mapping=SimpleNamespace(
+            attn=SimpleNamespace(
+                tp_size=1, dp_size=2, dcp_size=1, dcp_rank=0, dcp_group=(0,)
+            )
+        ),
         prefix_granularity=128,
         spec_context_pad=2 * verify_width,
         max_num_seqs=4,

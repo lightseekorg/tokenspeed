@@ -18,15 +18,18 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Hybrid gfx950 KPool prefill selection with fused Gluon scoring.
+"""Hybrid AMD KPool prefill selection with fused Gluon scoring.
 
 Short single-window rows use the portable deterministic sort so equal scores
-have stable pool-ID ordering. Long rows and their running merges use gfx950
-Gluon radix top-k. Pool-ID payload gathering and pool-to-FlatKV expansion
-remain portable Triton while those smaller stages are ported independently.
+have stable pool-ID ordering. Long rows and their running merges use
+architecture-native Gluon radix top-k. Pool-ID payload gathering and
+pool-to-FlatKV expansion remain portable Triton while those smaller stages are
+ported independently.
 """
 
 from __future__ import annotations
+
+from collections.abc import Callable
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
@@ -52,11 +55,18 @@ if _IS_AMD:
         gluon_dsa_kpool_prefill_plan_logits_gfx950,
         gluon_dsa_logical_topk_gfx950,
     )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (
+        gluon_dsa_kpool_prefill_logits_gfx1250,
+        gluon_dsa_kpool_prefill_plan_logits_gfx1250,
+        gluon_dsa_logical_topk_gfx1250,
+    )
 
 _HEAD_DIM = 128
 _POOL_SIZE = 4
 _PAGE_SIZE = 16
 _TOPK_POOLS = 512
+
+_SelectionStage = Callable[..., tuple[torch.Tensor, torch.Tensor]]
 
 
 def _validate_specialization(
@@ -83,7 +93,7 @@ def _validate_specialization(
     expected = (32, _HEAD_DIM, _POOL_SIZE, _PAGE_SIZE, _TOPK_POOLS, True)
     if specialization != expected:
         raise ValueError(
-            "gfx950 Gluon KPool prefill requires "
+            "Gluon KPool prefill requires "
             "index_heads=32, head_dim=128, pool_size=4, page_size=16, "
             "topk_pools=512, and apply_relu=True; "
             f"got {specialization}"
@@ -217,6 +227,9 @@ def _select_pools_chunked_gluon(
     max_num_pools: int,
     chunk_pools: int,
     max_logits_bytes: int | None,
+    score_logits: _SelectionStage,
+    score_plan_logits: _SelectionStage,
+    logical_topk: _SelectionStage,
 ) -> torch.Tensor:
     """Score bounded windows and select candidates with stable short rows.
 
@@ -307,7 +320,7 @@ def _select_pools_chunked_gluon(
                 assert pool_workspace_slots is not None
                 assert row_starts is not None
                 assert row_ends is not None
-                gluon_dsa_kpool_prefill_plan_logits_gfx950(
+                score_plan_logits(
                     q[row_start:row_end],
                     pooled_k_cache,
                     weights[row_start:row_end],
@@ -324,7 +337,7 @@ def _select_pools_chunked_gluon(
                     row_ends_out=tile_local_ends,
                 )
             else:
-                gluon_dsa_kpool_prefill_logits_gfx950(
+                score_logits(
                     q[row_start:row_end],
                     pooled_k_cache,
                     weights[row_start:row_end],
@@ -367,7 +380,7 @@ def _select_pools_chunked_gluon(
             tile_radix_starts = radix_row_starts_workspace[:tile_rows]
             tile_selected_positions = selected_positions_workspace[:tile_rows]
             tile_selected_lens = selected_lens_workspace[:tile_rows]
-            gluon_dsa_logical_topk_gfx950(
+            logical_topk(
                 tile_logits,
                 tile_radix_starts,
                 tile_local_ends,
@@ -389,7 +402,7 @@ def _select_pools_chunked_gluon(
             merged_vals = torch.cat((best_vals, vals), dim=1)
             merged_pools = torch.cat((best_pools, pools), dim=1)
             tile_local_ends.fill_(merged_vals.shape[1])
-            gluon_dsa_logical_topk_gfx950(
+            logical_topk(
                 merged_vals,
                 tile_radix_starts,
                 tile_local_ends,
@@ -422,7 +435,7 @@ def _select_pools_chunked_gluon(
     return result.contiguous()
 
 
-def _kpool_prefill_topk_fp8_gfx950(
+def _kpool_prefill_topk_fp8(
     q: torch.Tensor,
     pooled_k_cache: torch.Tensor,
     weights: torch.Tensor,
@@ -448,8 +461,11 @@ def _kpool_prefill_topk_fp8_gfx950(
     max_logits_bytes: int | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
+    score_logits: _SelectionStage,
+    score_plan_logits: _SelectionStage,
+    logical_topk: _SelectionStage,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select GLM KPool candidates through the fused GFX950 scorers.
+    """Select GLM KPool candidates through architecture-native Gluon stages.
 
     Complete runtime plans use physical-slot addressing. With no plan, request
     ids and causal lengths are reconstructed for the page-table scorer. Partial
@@ -484,7 +500,7 @@ def _kpool_prefill_topk_fp8_gfx950(
     has_prefill_plan = all(part is not None for part in plan_parts)
     if any(part is not None for part in plan_parts) and not has_prefill_plan:
         raise ValueError(
-            "gfx950 Gluon KPool prefill requires req_ids, causal_lens, "
+            "Gluon KPool prefill requires req_ids, causal_lens, "
             "pool_workspace_slots, row_starts, row_ends, and max_num_pools together"
         )
     if num_tokens == 0:
@@ -579,6 +595,9 @@ def _kpool_prefill_topk_fp8_gfx950(
             max_num_pools=max_num_pools,
             chunk_pools=chunk_pools,
             max_logits_bytes=max_logits_bytes,
+            score_logits=score_logits,
+            score_plan_logits=score_plan_logits,
+            logical_topk=logical_topk,
         )
     return expand_kpool_to_flat_kv(
         pool_indices,
@@ -619,6 +638,9 @@ def _kpool_prefill_topk_impl(
     max_logits_bytes: int | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
+    score_logits: _SelectionStage,
+    score_plan_logits: _SelectionStage,
+    logical_topk: _SelectionStage,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select KPool candidates with the production hybrid Gluon path.
 
@@ -626,7 +648,7 @@ def _kpool_prefill_topk_impl(
     they fit in one normalized scoring window. Longer or split selections keep
     the balanced reduction.
     """
-    return _kpool_prefill_topk_fp8_gfx950(
+    return _kpool_prefill_topk_fp8(
         q,
         pooled_k_cache,
         weights,
@@ -651,11 +673,30 @@ def _kpool_prefill_topk_impl(
         max_logits_bytes=max_logits_bytes,
         out=out,
         lens_out=lens_out,
+        score_logits=score_logits,
+        score_plan_logits=score_plan_logits,
+        logical_topk=logical_topk,
     )
 
 
 def gluon_kpool_prefill_topk_fp8_gfx950(*args, **kwargs):
-    return _kpool_prefill_topk_impl(*args, **kwargs)
+    return _kpool_prefill_topk_impl(
+        *args,
+        score_logits=gluon_dsa_kpool_prefill_logits_gfx950,
+        score_plan_logits=gluon_dsa_kpool_prefill_plan_logits_gfx950,
+        logical_topk=gluon_dsa_logical_topk_gfx950,
+        **kwargs,
+    )
+
+
+def gluon_kpool_prefill_topk_fp8_gfx1250(*args, **kwargs):
+    return _kpool_prefill_topk_impl(
+        *args,
+        score_logits=gluon_dsa_kpool_prefill_logits_gfx1250,
+        score_plan_logits=gluon_dsa_kpool_prefill_plan_logits_gfx1250,
+        logical_topk=gluon_dsa_logical_topk_gfx1250,
+        **kwargs,
+    )
 
 
 if _IS_AMD:
@@ -684,6 +725,41 @@ if _IS_AMD:
         },
         tags={"amd", "gfx950", "hybrid", "kpool", "mfma-score", "radix-topk"},
     )(gluon_kpool_prefill_topk_fp8_gfx950)
-    __all__ = ["gluon_kpool_prefill_topk_fp8_gfx950"]
+    register_kernel(
+        "attention",
+        "kpool_prefill_topk",
+        name="gluon_kpool_prefill_topk_fp8_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "index_heads": frozenset({32}),
+            "head_dim": frozenset({128}),
+            "pool_size": frozenset({4}),
+            "page_size": frozenset({16}),
+            "topk_pools": frozenset({512}),
+            "index_k_format": frozenset({"fp8_scaled"}),
+            "score_activation": frozenset({"relu"}),
+            "topk_layout": frozenset({"global_slots"}),
+            "prefill_plan": frozenset({False, True}),
+        },
+        tags={
+            "amd",
+            "gfx1250",
+            "hybrid",
+            "kpool",
+            "wave32-wmma-score",
+            "wave32-radix-topk",
+        },
+    )(gluon_kpool_prefill_topk_fp8_gfx1250)
+    __all__ = [
+        "gluon_kpool_prefill_topk_fp8_gfx950",
+        "gluon_kpool_prefill_topk_fp8_gfx1250",
+    ]
 else:
     __all__ = []

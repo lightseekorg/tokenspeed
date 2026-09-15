@@ -33,7 +33,6 @@ registry resolves the (nvfp4, situ, precomputed_topk) plan to this kernel.
 
 from __future__ import annotations
 
-from importlib.util import find_spec
 from types import SimpleNamespace
 
 import pytest
@@ -58,13 +57,7 @@ def _situ_runtime_reason() -> str | None:
         return "requires CUDA"
     if not (10, 0) <= torch.cuda.get_device_capability() <= (10, 3):
         return "flashinfer TRTLLM-Gen SiTU targets the sm_100 family"
-    if find_spec("flashinfer") is None:
-        return "requires flashinfer"
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
-        situ_moe_unavailable_reason,
-    )
-
-    return situ_moe_unavailable_reason()
+    return None
 
 
 _reason = _situ_runtime_reason()
@@ -164,8 +157,8 @@ def _make_nvfp4_moe_weights(
         "w2_weight_scale": torch.stack(w2_scale),
         "w2_weight_scale_2": torch.stack(w2_s2).reshape(NUM_EXPERTS),
         # Kimi-K3-NVFP4 ships input_scale == 1.0 for every expert projection.
-        "w13_input_scale": torch.ones(NUM_EXPERTS),
-        "w2_input_scale": torch.ones(NUM_EXPERTS),
+        "w13_input_scale": torch.ones(1),
+        "w2_input_scale": torch.ones(1),
     }
 
 
@@ -294,6 +287,28 @@ def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference(
     expected = _reference_moe(hidden_states, raw, topk_ids, topk_weights, situ=True)
     situ_err = _rel_l2(actual, expected)
 
+    import tokenspeed_kernel
+    from flashinfer import fp4_quantize
+
+    prequantized = fp4_quantize(
+        hidden_states,
+        w.w13_input_scale_quant,
+        is_sf_swizzled_layout=False,
+        enable_pdl=False,
+    )
+    quantized_result = tokenspeed_kernel.moe_apply(
+        {
+            "apply_kernel_name": "flashinfer_trtllm_nvfp4_situ_routed_moe_apply",
+            "a2a_backend": "none",
+        },
+        prequantized,
+        w,
+        router_logits=None,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+    torch.testing.assert_close(quantized_result, actual, atol=0, rtol=0)
+
     # Caller-owned output buffer (K3 fused-AR lane): the kernel must write
     # the identical result in place (zero-copy join).
     w._situ_output_buffer = torch.empty(
@@ -310,6 +325,16 @@ def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference(
     torch.cuda.synchronize()
     assert buffered.data_ptr() == w._situ_output_buffer.data_ptr()
     assert torch.equal(buffered, actual)
+    quantized_buffered = flashinfer_trtllm_nvfp4_situ_routed_moe_apply(
+        {},
+        prequantized,
+        w,
+        router_logits=None,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+    assert quantized_buffered.data_ptr() == w._situ_output_buffer.data_ptr()
+    torch.testing.assert_close(quantized_buffered, actual, atol=0, rtol=0)
     del w._situ_output_buffer
 
     # Anchor: the SwiGLU/silu variant of the same kernel on the same weights

@@ -18,10 +18,14 @@ import unittest
 from types import SimpleNamespace
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    CacheRuntimeContract,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
     v4_c4_state_window,
     v4_compressed_kv_spec,
     v4_compressor_state_spec,
+    v4_indexer_kv_spec,
     v4_indexer_state_spec,
     v4_swa_kv_spec,
 )
@@ -45,6 +49,7 @@ def build_v4_cache_specs(hf_config, *, layer_ratio, decode_input_tokens=1):
         specs.append(v4_compressor_state_spec(ratio, c4_state_window=window))
         specs.append(v4_compressed_kv_spec(ratio))
     if 4 in ratios:
+        specs.append(v4_indexer_kv_spec())
         specs.append(v4_indexer_state_spec(c4_state_window=window))
     return tuple(specs)
 
@@ -433,18 +438,20 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             spec.group_id: prefix_granularity // spec.block_granularity
             for spec in specs
         }
-        pool = SimpleNamespace(
-            arena=SimpleNamespace(
-                runtime_contract=SimpleNamespace(
-                    group_specs=specs,
-                    group_page_counts={
-                        gid: pack * (num_device_pages - 1) + 1
-                        for gid, pack in packing.items()
-                    },
-                    group_packing=packing,
-                )
-            )
+        # The bridge consumes the contract's scheduler-facing (virtual) counts;
+        # a real contract derives them from the physical ones and each spec's
+        # shard count, all 1 here.
+        contract = CacheRuntimeContract(
+            prefix_granularity=prefix_granularity,
+            num_lcm_blocks=num_device_pages - 1,
+            token_capacity=(num_device_pages - 1) * prefix_granularity,
+            group_specs=specs,
+            group_page_counts={
+                gid: pack * (num_device_pages - 1) + 1 for gid, pack in packing.items()
+            },
+            group_packing=packing,
         )
+        pool = SimpleNamespace(arena=SimpleNamespace(runtime_contract=contract))
         groups = pool_to_cache_groups(pool)
 
         self.assertEqual({g.family for g in groups}, {CacheGroupFamily.History})

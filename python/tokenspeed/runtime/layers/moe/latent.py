@@ -249,10 +249,8 @@ class Kimi3MoEExecutionPlan:
         mapping,
         moe_backend,
         alt_stream: torch.cuda.Stream | None,
-        *,
-        enforce_eager: bool,
     ) -> "Kimi3MoEExecutionPlan":
-        """Select orchestration without exposing platform policy to the model."""
+        """Select orchestration from the backend, streams, and parallel layout."""
 
         use_native = native_latent_moe_available()
         # Hopper (SM90) has no native FP4 tensor cores and no flashinfer SiTU
@@ -274,10 +272,7 @@ class Kimi3MoEExecutionPlan:
             use_trtllm=use_trtllm,
             use_marlin=use_marlin,
             overlap_shared_experts=(
-                use_native
-                and enforce_eager
-                and alt_stream is not None
-                and mapping.moe.tp_ep_size == 1
+                use_native and alt_stream is not None and mapping.moe.tp_ep_size == 1
             ),
             joint_moe_reduce=(
                 use_native

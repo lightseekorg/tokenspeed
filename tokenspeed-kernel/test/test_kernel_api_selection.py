@@ -56,6 +56,7 @@ import tokenspeed_kernel.ops.attention.gdn as _attention_gdn_pkg
 import tokenspeed_kernel.ops.attention.gdn.flashinfer as _attention_flashinfer_gdn
 import tokenspeed_kernel.ops.attention.kda as _attention_kda_pkg
 import tokenspeed_kernel.ops.attention.kda.gluon as _attention_gluon_kda
+import tokenspeed_kernel.ops.attention.kpool as _attention_kpool_pkg
 import tokenspeed_kernel.ops.attention.kpool.deep_gemm as _attention_deep_gemm_kpool
 import tokenspeed_kernel.ops.attention.kpool.triton as _attention_triton_kpool
 import tokenspeed_kernel.ops.attention.mha as _attention_mha_pkg
@@ -1644,6 +1645,34 @@ def _attention_dsa_decode_fp8_e5m2_sparse_rank512() -> object:
     return _attention_dsa_decode_fp8_sparse_rank512(torch.float8_e5m2)
 
 
+def _attention_dsa_decode_glm53_flash_bf16_dense() -> object:
+    q = torch.empty((4, 16, 512), dtype=torch.bfloat16)
+    kv_cache = torch.empty((2051, 512), dtype=torch.bfloat16)
+    topk_slots = torch.empty((4, 2051), dtype=torch.int32)
+    topk_lens = torch.empty((4,), dtype=torch.int32)
+    return _attention_dsa_pkg.dsa_decode(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=None,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=2051,
+        qk_nope_head_dim=256,
+        kv_lora_rank=512,
+        qk_rope_head_dim=0,
+        softmax_scale=1.0,
+        page_size=64,
+        q_len_per_req=4,
+        logit_cap=0.0,
+        k_scale=1.0,
+        return_lse=False,
+        out=None,
+        override=None,
+        solution=None,
+        kv_seq_lens=None,
+    )
+
+
 def _attention_dsa_prefill() -> object:
     q = torch.empty((2, 8, 576), dtype=torch.bfloat16)
     sparse_kv_cache = torch.empty((64, 656), dtype=torch.uint8)
@@ -1937,6 +1966,57 @@ def _attention_dsa_prefill_topk(
 
 def _attention_dsa_prefill_topk_bf16_weights() -> object:
     return _attention_dsa_prefill_topk(weights_dtype=torch.bfloat16)
+
+
+def _attention_kpool_prefill_topk(prefill_plan: bool) -> object:
+    tokens = 2
+    q = torch.empty((tokens, 32, 128), dtype=torch.bfloat16)
+    pooled_k_cache = torch.zeros((2, 16 * 132), dtype=torch.uint8)
+    weights = torch.empty((tokens, 32), dtype=torch.float32)
+    positions = torch.full((tokens,), 2047, dtype=torch.int32)
+    query_start_loc = torch.arange(tokens + 1, dtype=torch.int32)
+    index_block_table = torch.zeros((tokens, 32), dtype=torch.int32)
+    kv_block_table = torch.zeros((tokens, 32), dtype=torch.int32)
+    plan_kwargs: dict[str, torch.Tensor | int | None]
+    if prefill_plan:
+        plan_kwargs = {
+            "req_ids": torch.arange(tokens, dtype=torch.int32),
+            "causal_lens": positions + 1,
+            "pool_workspace_slots": torch.arange(1024, dtype=torch.int64),
+            "row_starts": torch.tensor((0, 512), dtype=torch.int32),
+            "row_ends": torch.tensor((512, 1024), dtype=torch.int32),
+            "max_num_pools": 512,
+        }
+    else:
+        plan_kwargs = {
+            "req_ids": None,
+            "causal_lens": None,
+            "pool_workspace_slots": None,
+            "row_starts": None,
+            "row_ends": None,
+            "max_num_pools": None,
+        }
+    return _attention_kpool_pkg.kpool_prefill_topk(
+        q,
+        pooled_k_cache,
+        weights,
+        positions,
+        query_start_loc,
+        index_block_table,
+        kv_block_table,
+        pool_size=4,
+        page_size=16,
+        kv_page_size=64,
+        topk_pools=512,
+        softmax_scale=128**-0.5,
+        apply_relu=True,
+        append_tail=True,
+        chunk_pools=8192,
+        max_logits_bytes=None,
+        out=None,
+        lens_out=None,
+        **plan_kwargs,
+    )
 
 
 def _attention_dsa_decode_topk_standard(
@@ -4353,9 +4433,41 @@ _CASES = [
         _is_cdna5,
         "cdna5",
         "attention",
+        "dsa_decode_glm53_flash_bf16_dense",
+        "gluon_dsa_decode_gfx1250",
+        _attention_dsa_decode_glm53_flash_bf16_dense,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
         "dsa_prefill",
         "gluon_dsa_prefill_gfx1250",
         _attention_dsa_prefill,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsa_prefill_glm53_flash_bf16_dense",
+        "gluon_dsa_prefill_gfx1250",
+        _attention_dsa_prefill_glm53_flash_bf16_dense,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsa_prefill_glm53_flash_fp8_dense",
+        "gluon_dsa_prefill_fp8_dense_gfx1250",
+        _attention_dsa_prefill_glm53_flash_fp8_dense,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsa_prefill_glm53_flash_fp8_e5m2_dense",
+        "gluon_dsa_prefill_fp8_dense_gfx1250",
+        _attention_dsa_prefill_glm53_flash_fp8_e5m2_dense,
     ),
     _case(
         _is_cdna5,
@@ -4506,6 +4618,24 @@ _CASES = [
         "gluon_dsa_prefill_topk_fp8_gfx1250",
         _attention_dsa_prefill_topk_bf16_weights,
         id_suffix="bf16-weights",
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "kpool_prefill_topk",
+        "gluon_kpool_prefill_topk_fp8_gfx1250",
+        lambda: _attention_kpool_prefill_topk(False),
+        id_suffix="table-addressed",
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "kpool_prefill_topk",
+        "gluon_kpool_prefill_topk_fp8_gfx1250",
+        lambda: _attention_kpool_prefill_topk(True),
+        id_suffix="prefill-plan",
     ),
     _case(
         _is_supported_gpu,

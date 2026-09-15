@@ -45,8 +45,8 @@ if platform.is_nvidia:
 
     def flashinfer_cutedsl_deepep_nvfp4_moe_weights(plan: dict, w: torch.nn.Module):
         w13_ws2 = w.w13_weight_scale_2[:, 0]
-        w13_input_scale = w.w13_input_scale.max().to(torch.float32)
-        w2_input_scale = w.w2_input_scale.max().to(torch.float32)
+        w13_input_scale = w.w13_input_scale.to(torch.float32)
+        w2_input_scale = w.w2_input_scale.to(torch.float32)
         w.w13_weight_scale_2 = torch.nn.Parameter(w13_ws2, requires_grad=False)
         w.w13_input_scale_quant = torch.nn.Parameter(
             (1.0 / w13_input_scale).to(torch.float32), requires_grad=False
