@@ -87,58 +87,21 @@ under MoE TP4 is padded from 160 to 192 values per rank.
 
 ### Kimi-K3 attention DP with MoE EP
 
-When attention DP is greater than one, Kimi-K3 requires attention DP, MoE EP,
-and world size to be equal. Mixed attention TP/DP layouts are rejected. The
-shared expert and both latent projections are replicated and operate on each
-rank's local tokens.
+When attention DP is greater than one, Kimi-K3 requires
+`attention DP == MoE EP == world size`. Shared experts and latent projections
+are replicated; only the routed experts require dispatch/combine communication.
 
-`KimiLinearMoE._forward_attn_dp` dispatches latent activations and precomputed
-TopK IDs/weights, executes each rank's routed experts, and combines the weighted
-latent outputs back to their original ranks. Latent RMSNorm, the up-projection,
-shared output, and residual addition remain local.
+Select the transport with `--all2all-backend`:
 
-`--all2all-backend` accepts `none`, `agrs`, `deepep`, and `flashinfer`.
-For this K3 attention-DP path:
+- `none` (default): automatically use FlashInfer on NVIDIA ranks sharing a CUDA
+  fabric, otherwise AG/RS.
+- `agrs`: use reference all-gather dispatch and reduce-scatter combine.
+- `flashinfer`: use FlashInfer MNNVL all-to-all; errors without the required
+  CUDA fabric.
+- `deepep`: unsupported for this K3 path.
 
-- `none` (default) preserves automatic selection: FlashInfer on NVIDIA ranks
-  sharing a CUDA fabric, otherwise AG/RS.
-- `agrs` forces the reference all-gather/reduce-scatter transport.
-- `flashinfer` requires FlashInfer MNNVL all-to-all and errors without the
-  required CUDA fabric.
-- `deepep` is not supported by this K3 path.
-
-FlashInfer MNNVL all-to-all handles dispatch and combine. Workspaces are
-allocated before graph capture, shared by
-sequential layers within a model, and separate for target and draft models.
-Unused receive slots are assigned an expert ID outside the receiving rank's
-partition. Combine uses BF16 outputs without low-precision communication.
-
-With NVFP4 experts, each rank quantizes its local routed latents before
-either FlashInfer dispatch or AG/RS. The payloads are packed FP4 activations, linear FP8 block
-scales, TopK IDs, and routing weights. The expert kernel consumes the received
-activation/scale pair directly. Idle ranks produce empty packed tensors before
-the selected transport pads or dispatches them. Other weight formats retain
-BF16 input dispatch.
-
-Activation-scale loading always accumulates the maximum from all checkpoint
-experts before EP filtering, separately for FC1 and FC2. NVFP4 stores these as
-replicated scalars. Every rank therefore uses the same scales when forming
-inverse scales and GEMM factors, without a scale-synchronization collective.
-Per-expert weight scales remain separate. The existing BF16-sized transport workspace is retained as a capacity
-bound; quantized dispatch reduces payload traffic, while combine remains BF16.
-
-The AG/RS reference transport uses four all-gathers for NVFP4 (packed
-activations, block scales, expert IDs, and weights), or three for BF16 inputs,
-followed by one BF16 reduce-scatter. Only shorter ranks pad their payloads;
-padding has zero routing weights. Idle ranks
-participate when peers have tokens. Both transports use the same token-count
-metadata for eager execution, graph capture, and speculative draft narrowing.
-
-This path requires precomputed-TopK expert kernels. Kimi owns dispatch/combine.
-`MoELayer` maps `agrs` and `flashinfer` to `a2a_backend="none"` in the inner
-expert plan, so the expert backend does not dispatch again.
-Replication and transport workspace memory are accounted for before KV-cache
-allocation. FlashInfer all-to-all requires its `moe_a2a_*` APIs.
+Both transports quantize NVFP4 activations before dispatch and transfer their
+block scales alongside the routing IDs and weights. Combine outputs remain BF16.
 
 ### DeepEP all-to-all
 

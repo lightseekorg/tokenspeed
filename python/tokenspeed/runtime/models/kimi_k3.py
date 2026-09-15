@@ -1935,104 +1935,113 @@ class KimiLinearMoE(nn.Module):
         if max_tokens == 0:
             return prefix_sum
 
-        shared_output = None
-        if num_tokens > 0:
-            router_logits = self.gate(hidden_states)
-            topk = self.topk(
-                hidden_states,
-                router_logits,
-                output_format=TopKOutputFormat.STANDARD,
-                num_token_non_padded=None,
-                expert_location_dispatch_info=None,
-            )
-            routed_input, _ = self.routed_expert_down_proj(hidden_states)
-            shared_output = self.shared_experts(hidden_states, down_out=None)
-            topk_ids = topk.topk_ids
-            topk_weights = topk.topk_weights
-        else:
-            routed_input = hidden_states.new_empty((0, self.routed_hidden))
-            topk_ids = torch.empty(
-                (0, self.top_k),
-                dtype=self.topk.topk_config.topk_indices_dtype,
-                device=hidden_states.device,
-            )
-            topk_weights = torch.empty(
-                (0, self.top_k),
-                dtype=self.topk.topk_config.topk_weights_dtype,
-                device=hidden_states.device,
-            )
-
-        if self.experts.plan["weight_dtype"] == "nvfp4":
+        with self.stream_fork.scope(
+            enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
+        ) as fork:
             if num_tokens > 0:
-                routed_input = fp4_quantize(
-                    routed_input,
-                    self.experts.w13_input_scale_quant,
-                    is_sf_swizzled_layout=False,
-                    enable_pdl=pdl_enabled(),
+                router_logits = self.gate(hidden_states)
+                topk = self.topk(
+                    hidden_states,
+                    router_logits,
+                    output_format=TopKOutputFormat.STANDARD,
+                    num_token_non_padded=None,
+                    expert_location_dispatch_info=None,
+                )
+                routed_input, _ = self.routed_expert_down_proj(hidden_states)
+                topk_ids = topk.topk_ids
+                topk_weights = topk.topk_weights
+            else:
+                routed_input = hidden_states.new_empty((0, self.routed_hidden))
+                topk_ids = torch.empty(
+                    (0, self.top_k),
+                    dtype=self.topk.topk_config.topk_indices_dtype,
+                    device=hidden_states.device,
+                )
+                topk_weights = torch.empty(
+                    (0, self.top_k),
+                    dtype=self.topk.topk_config.topk_weights_dtype,
+                    device=hidden_states.device,
+                )
+
+            if self.experts.plan["weight_dtype"] == "nvfp4":
+                if num_tokens > 0:
+                    routed_input = fp4_quantize(
+                        routed_input,
+                        self.experts.w13_input_scale_quant,
+                        is_sf_swizzled_layout=False,
+                        enable_pdl=pdl_enabled(),
+                    )
+                else:
+                    routed_input = (
+                        hidden_states.new_empty(
+                            (0, self.routed_hidden // 2), dtype=torch.uint8
+                        ),
+                        hidden_states.new_empty(
+                            (0, self.routed_hidden // 16), dtype=torch.uint8
+                        ),
+                    )
+
+            if self.moe_alltoall is not None:
+                routed_input, topk_ids, topk_weights, combine_offset = (
+                    self.moe_alltoall.dispatch(
+                        routed_input, topk_ids, topk_weights, max_tokens
+                    )
                 )
             else:
-                routed_input = (
-                    hidden_states.new_empty(
-                        (0, self.routed_hidden // 2), dtype=torch.uint8
-                    ),
-                    hidden_states.new_empty(
-                        (0, self.routed_hidden // 16), dtype=torch.uint8
-                    ),
+                prequantized = isinstance(routed_input, tuple)
+                payloads = (
+                    [*routed_input, topk_ids, topk_weights]
+                    if prequantized
+                    else [routed_input, topk_ids, topk_weights]
                 )
-
-        if self.moe_alltoall is not None:
-            routed_input, topk_ids, topk_weights, combine_offset = (
-                self.moe_alltoall.dispatch(
-                    routed_input, topk_ids, topk_weights, max_tokens
-                )
-            )
-        else:
-            prequantized = isinstance(routed_input, tuple)
-            payloads = (
-                [*routed_input, topk_ids, topk_weights]
-                if prequantized
-                else [routed_input, topk_ids, topk_weights]
-            )
-            if num_tokens < max_tokens:
-                padding = (0, 0, 0, max_tokens - num_tokens)
+                if num_tokens < max_tokens:
+                    padding = (0, 0, 0, max_tokens - num_tokens)
+                    payloads = [
+                        F.pad(tensor, padding, mode="constant", value=0)
+                        for tensor in payloads
+                    ]
                 payloads = [
-                    F.pad(tensor, padding, mode="constant", value=0)
+                    all_gather(tensor.contiguous(), self.mapping.moe.ep_group, dim=0)
                     for tensor in payloads
                 ]
-            payloads = [
-                all_gather(tensor.contiguous(), self.mapping.moe.ep_group, dim=0)
-                for tensor in payloads
-            ]
-            routed_input = (payloads[0], payloads[1]) if prequantized else payloads[0]
-            topk_ids, topk_weights = payloads[-2:]
+                routed_input = (
+                    (payloads[0], payloads[1]) if prequantized else payloads[0]
+                )
+                topk_ids, topk_weights = payloads[-2:]
 
-        routing = StandardTopKOutput(
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            router_logits=None,
-        )
-        total_tokens = self.mapping.world_size * max_tokens
-        routed_output = self._routed_experts(
-            routed_input,
-            routing,
-            num_global_tokens=total_tokens,
-            max_num_tokens_per_gpu=total_tokens,
-            do_finalize=True,
-        )
-
-        if self.moe_alltoall is not None:
-            routed_output = self.moe_alltoall.combine(
-                routed_output, num_tokens, max_tokens, combine_offset
+            routing = StandardTopKOutput(
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                router_logits=None,
             )
-        else:
-            routed_output = reduce_scatter(
-                routed_output.contiguous(), group=self.mapping.moe.ep_group
-            )[:num_tokens]
+            total_tokens = self.mapping.world_size * max_tokens
+            routed_output = self._routed_experts(
+                routed_input,
+                routing,
+                num_global_tokens=total_tokens,
+                max_num_tokens_per_gpu=total_tokens,
+                do_finalize=True,
+            )
+
+            if self.moe_alltoall is not None:
+                routed_output = self.moe_alltoall.combine(
+                    routed_output, num_tokens, max_tokens, combine_offset
+                )
+            else:
+                routed_output = reduce_scatter(
+                    routed_output.contiguous(), group=self.mapping.moe.ep_group
+                )[:num_tokens]
+
+            if num_tokens > 0 and self.routed_expert_norm is not None:
+                routed_output = self.routed_expert_norm(routed_output)
+
+            shared_output = None
+            with fork.branch():
+                if num_tokens > 0:
+                    shared_output = self.shared_experts(hidden_states, down_out=None)
 
         if num_tokens == 0:
             return prefix_sum
-        if self.routed_expert_norm is not None:
-            routed_output = self.routed_expert_norm(routed_output)
         return self.routed_expert_up_proj.forward_add3(
             routed_output,
             prefix_sum,
