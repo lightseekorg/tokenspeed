@@ -48,9 +48,6 @@ env:
     tokenspeed-kernel/test/amd/ops/sampling/test_gluon_argmax_gfx950.py::test_argmax_first_capture_does_not_cache_graph_pool_scratch
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/sampling.argmax/gluon_argmax_gfx1250@mi450]
     # DeepSeek V4 portable Triton path on gfx1250: one case per code path.
-    # TODO: need_scores=True router cases stay out: the pinned rocJITsu mis-scales
-    # float division for subnormal quotients, which corrupts their F.softplus
-    # reference on the simulator.
     tokenspeed-kernel/test/ops/attention/test_triton_dsv4_indexer.py::test_decode_logits_and_topk[64-2048]
     tokenspeed-kernel/test/ops/attention/test_triton_dsv4_indexer.py::test_prefill_ragged_candidates[True]
     tokenspeed-kernel/test/ops/attention/test_triton_dsv4_indexer.py::test_decode_graph_refresh_and_padding
@@ -58,6 +55,9 @@ env:
     tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[True-False-dtype0-plain]
     tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[True-False-dtype1-bias]
     tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[True-False-dtype2-hash]
+    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[False-True-dtype0-hash]
+    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[False-True-dtype1-plain]
+    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[False-True-dtype2-bias]
     tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_ties_and_graph_replay
     tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_nan_logits_keep_expert_ids_in_range[True]
     tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_to_mxfp4_experts[17]
