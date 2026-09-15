@@ -34,6 +34,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
+    pack,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     prepare_cache_setup,
@@ -901,6 +902,137 @@ def test_qwen_mtp_padding_allowance_tracks_draft_planes() -> None:
             )
             < 1e-9
         )
+
+
+@pytest.mark.parametrize(
+    ("full_layers", "sliding_layers", "expected_padding"),
+    (
+        (1, 4, 3.0),
+        (3, 8, 5.0 / 3.0),
+        (4, 4, 0.0),
+        (2, 0, 0.0),
+        (0, 3, 0.0),
+    ),
+)
+def test_ordinary_hybrid_padding_allowance_tracks_exact_group_ratio(
+    full_layers: int,
+    sliding_layers: int,
+    expected_padding: float,
+) -> None:
+    """Unequal ordinary groups admit only their required slab-tail padding."""
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
+        OrdinaryRecipe,
+    )
+
+    layer_types = (FULL_ATTENTION,) * full_layers + (
+        "sliding_attention",
+    ) * sliding_layers
+    base_config = _mha_config()
+    mha = replace(
+        base_config.component(MHAConfig),
+        cache_layer_types=layer_types,
+        sliding_window_tokens=512,
+    )
+    attn_config = replace(base_config, components=(mha,))
+    recipe = OrdinaryRecipe(
+        family="mha",
+        server_args=SimpleNamespace(max_total_tokens=None),
+        model_config=SimpleNamespace(num_attention_layers=len(layer_types)),
+        attn_config=attn_config,
+        draft_model_config=None,
+        draft_attn_config=None,
+        cache_budget_bytes=1_048_576,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    )
+
+    assert recipe.max_padding_fraction == pytest.approx(expected_padding)
+    setup = recipe.setup()
+    plan = setup.spec.memory_plan
+    raw_bytes = {
+        group.group_id: sum(
+            field.payload_bytes
+            for field in plan.fields
+            if field.group_id == group.group_id
+        )
+        for group in plan.groups
+    }
+    observed_padding = max(
+        (plan.lcm_block_bytes - size) / size for size in raw_bytes.values()
+    )
+    assert observed_padding == pytest.approx(expected_padding)
+
+    if expected_padding > 0.0:
+        with pytest.raises(ValueError, match="padding fraction"):
+            pack(
+                recipe.groups(),
+                prefix_granularity=recipe.prefix_granularity,
+                cache_blocks_per_lcm_block=recipe.packing(recipe.groups()),
+                alignment=recipe.alignment,
+                max_padding_fraction=expected_padding - 1e-9,
+            )
+
+
+def test_ordinary_padding_allowance_uses_mixed_target_draft_payloads() -> None:
+    """The bound includes dtype sidecars, not only cache-group layer counts."""
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
+        OrdinaryRecipe,
+    )
+
+    target_base = replace(
+        _mha_config(),
+        prefix_granularity=128,
+        kernel_page_size=128,
+    )
+    target_mha = replace(
+        target_base.component(MHAConfig),
+        head_dim=32,
+        cache_layer_types=("sliding_attention",),
+        sliding_window_tokens=512,
+    )
+    target_config = replace(target_base, components=(target_mha,))
+
+    draft_base = replace(
+        _mha_config(),
+        kv_cache_dtype=torch.float8_e4m3fn,
+        kv_cache_mxfp8=True,
+        prefix_granularity=128,
+        kernel_page_size=128,
+    )
+    draft_mha = replace(draft_base.component(MHAConfig), head_dim=64)
+    draft_config = replace(draft_base, components=(draft_mha,))
+    recipe = OrdinaryRecipe(
+        family="mha",
+        server_args=SimpleNamespace(max_total_tokens=None),
+        model_config=SimpleNamespace(num_attention_layers=1),
+        attn_config=target_config,
+        draft_model_config=SimpleNamespace(num_attention_layers=1),
+        draft_attn_config=draft_config,
+        cache_budget_bytes=1_048_576,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    )
+
+    groups = recipe.groups()
+    assert [len(fields) for _, fields in groups] == [2, 4]
+    assert recipe.max_padding_fraction == pytest.approx(1.0 / 64.0)
+    setup = recipe.setup()
+    plan = setup.spec.memory_plan
+    raw_bytes = {
+        group.group_id: sum(
+            field.payload_bytes
+            for field in plan.fields
+            if field.group_id == group.group_id
+        )
+        for group in plan.groups
+    }
+    observed_padding = max(
+        (plan.lcm_block_bytes - size) / size for size in raw_bytes.values()
+    )
+    assert observed_padding == pytest.approx(recipe.max_padding_fraction)
+    assert (plan.lcm_block_bytes - raw_bytes["sliding_attention"]) / raw_bytes[
+        "sliding_attention"
+    ] == pytest.approx(1.0 / 64.0)
 
 
 def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
