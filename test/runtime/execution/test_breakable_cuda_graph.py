@@ -759,32 +759,32 @@ class TestPrefillGraphMaxTokensResolution(unittest.TestCase):
         return SimpleNamespace(**base)
 
     def test_default_ceiling(self):
-        from tokenspeed.runtime.execution.model_executor import (
+        from tokenspeed.runtime.utils.env import (
             PREFILL_GRAPH_DEFAULT_MAX_TOKENS,
-            _resolve_prefill_graph_max_tokens,
+            resolve_prefill_graph_max_tokens,
         )
 
         self.assertEqual(
-            _resolve_prefill_graph_max_tokens(self._args()),
+            resolve_prefill_graph_max_tokens(self._args()),
             PREFILL_GRAPH_DEFAULT_MAX_TOKENS,
         )
 
     def test_k3_transports_keep_prefill_graphs(self):
-        from tokenspeed.runtime.execution.model_executor import (
+        from tokenspeed.runtime.utils.env import (
             PREFILL_GRAPH_DEFAULT_MAX_TOKENS,
-            _resolve_prefill_graph_max_tokens,
+            resolve_prefill_graph_max_tokens,
         )
 
         for backend in ("agrs", "flashinfer"):
             with self.subTest(backend=backend):
                 self.assertEqual(
-                    _resolve_prefill_graph_max_tokens(
+                    resolve_prefill_graph_max_tokens(
                         self._args(all2all_backend=backend)
                     ),
                     PREFILL_GRAPH_DEFAULT_MAX_TOKENS,
                 )
                 self.assertEqual(
-                    _resolve_prefill_graph_max_tokens(
+                    resolve_prefill_graph_max_tokens(
                         self._args(
                             all2all_backend=backend, prefill_graph_max_tokens=1024
                         )
@@ -793,17 +793,17 @@ class TestPrefillGraphMaxTokensResolution(unittest.TestCase):
                 )
 
     def test_deepep_disables_the_graph(self):
-        from tokenspeed.runtime.execution.model_executor import (
-            _resolve_prefill_graph_max_tokens,
+        from tokenspeed.runtime.utils.env import (
+            resolve_prefill_graph_max_tokens,
         )
 
         # DeepEP's normal dispatch reports per-expert receive counts to the host,
         # and a host sync cannot be captured -- even when asked for explicitly.
         self.assertEqual(
-            _resolve_prefill_graph_max_tokens(self._args(all2all_backend="deepep")), 0
+            resolve_prefill_graph_max_tokens(self._args(all2all_backend="deepep")), 0
         )
         self.assertEqual(
-            _resolve_prefill_graph_max_tokens(
+            resolve_prefill_graph_max_tokens(
                 self._args(all2all_backend="deepep", prefill_graph_max_tokens=2048)
             ),
             0,

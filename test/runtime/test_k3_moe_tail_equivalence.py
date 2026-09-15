@@ -60,7 +60,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-H, L, EPS = 7168, 3584, 1e-6
+H, L, EPS = 7168, 3584, 1e-5
 # Above the fused tail's capacity and below the multimem floor, so one token
 # count can drive every tier that does not gate on capacity.
 MID_TOKENS = 64
@@ -204,7 +204,7 @@ def _run_separate_reduce(comm, routed, shared, prefix, m):
     return comm._tail_separate_reduce(routed_proj, shared, prefix, m, H)
 
 
-TOP_K = 8  # K3's num_experts_per_token; any value in [1, 64] compiles.
+TOP_K = 16  # K3's num_experts_per_token; any value in [1, 64] compiles.
 
 
 def _deferred_triple(rank: int, device: torch.device, m: int, seed: int):
@@ -344,6 +344,12 @@ def test_selector_boundaries():
             tail_fusion_max_tokens=fused_max,
             fused_moe_ar=fused_ar,
             multimem_ok=mm,
+            is_decode=False,
+            join_moe_reduce=False,
+            mnnvl_bt_deferred_ok=False,
+            mnnvl_ht_deferred_ok=False,
+            fused_rs_up_ag_ok=False,
+            prefill_graph_phase=False,
         )
 
     assert pick(1) is K3MoETailTier.TAIL_FUSION

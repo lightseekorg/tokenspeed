@@ -46,7 +46,17 @@ minutes on one idle GPU. Re-run whenever the FlashInfer or cuDNN version, GPU
 model, or MoE shape changes (the metadata guard turns a stale table into a
 logged fallback, never silent misuse).
 
-Examples (Kimi-K3 on EP8, defaults):
+The default ``mxfp`` format preserves the original MXFP8-activation /
+MXFP4-weight sweep. ``--quant-format nvfp4`` instead models the W4A4 path:
+both activations and weights use block-16 NVFP4 (E2M1), and activation inputs
+are generated with ``flashinfer.fp4_quantize``. The format must match the
+served checkpoint because tensor shapes are part of the autotuner cache key.
+To add another format to an existing table, first copy that table to a new
+output path and sweep into the copy. FlashInfer merges same-environment keys
+when saving, so the disjoint MXFP and NVFP4 entries are both preserved; never
+use the packaged in-tree table itself as a sweep output.
+
+Examples (Kimi-K3 on EP8, MXFP defaults):
 
     # Generate the environment-specific filename in the current directory.
     python -m tokenspeed_kernel.ops.moe.flashinfer.moe_tactic_sweep
@@ -54,6 +64,12 @@ Examples (Kimi-K3 on EP8, defaults):
     # Or select the output path explicitly.
     python -m tokenspeed_kernel.ops.moe.flashinfer.moe_tactic_sweep \\
         --output moe-tactics-kimi-k3-ep8.json
+
+    # Kimi-K3 NVFP4, TP8 (896 local experts, 384 intermediate features/rank).
+    python -m tokenspeed_kernel.ops.moe.flashinfer.moe_tactic_sweep \\
+        --quant-format nvfp4 --ep-size 1 --tp-size 8 \\
+        --local-experts 896 --intermediate-size 384 \\
+        --finalize-modes both --output moe-tactics-kimi-k3-nvfp4-tp8.json
 """
 
 from __future__ import annotations
@@ -74,25 +90,69 @@ from tokenspeed_kernel.ops.tuning import (
 # Resweep with a matching value for larger prefill configurations.
 SITU_TUNE_MAX_NUM_TOKENS = get_autotune_max_num_tokens()
 
-SF_BLOCK = 32
+MXFP_SF_BLOCK = 32
+NVFP4_SF_BLOCK = 16
+QUANT_FORMATS = ("mxfp", "nvfp4")
 # With the heuristic floor every bucket is safe to sweep; kept for opt-outs.
 DEFAULT_SWEEP_MIN_BUCKET = 1
 STAGE1_CONFIGS_PER_FAMILY = 3
 STAGE2_MAX_CONFIGS = 64
 
 
-def _make_weights(local_experts: int, hidden: int, ispp: int, device, seed: int):
+def _scale_block_size(quant_format: str) -> int:
+    """Return the scale-group width encoded by ``quant_format``."""
+    if quant_format == "mxfp":
+        return MXFP_SF_BLOCK
+    if quant_format == "nvfp4":
+        return NVFP4_SF_BLOCK
+    raise ValueError(f"unsupported quant format: {quant_format}")
+
+
+def _candidate_dtype_pair(quant_format: str, dtype_enum):
+    """Return FlashInfer TRTLLM-Gen activation and weight dtype enums."""
+    if quant_format == "mxfp":
+        return dtype_enum.MxE4m3, dtype_enum.MxE2m1
+    if quant_format == "nvfp4":
+        return dtype_enum.E2m1, dtype_enum.E2m1
+    raise ValueError(f"unsupported quant format: {quant_format}")
+
+
+def _make_output_scales(
+    quant_format: str, local_experts: int, device
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    """Build the dequant/requant scalars required by an E2M1 MoE run."""
+    if quant_format == "mxfp":
+        return None, None, None
+    if quant_format == "nvfp4":
+        scales = tuple(
+            torch.ones(local_experts, dtype=torch.float32, device=device)
+            for _ in range(3)
+        )
+        return scales
+    raise ValueError(f"unsupported quant format: {quant_format}")
+
+
+def _make_weights(
+    local_experts: int,
+    hidden: int,
+    ispp: int,
+    device,
+    seed: int,
+    *,
+    quant_format: str,
+):
     """Random weights in the prepared TRTLLM layout (perf-representative).
 
     Scale bytes are pinned to 127 (2^0) so garbage exponents cannot produce
     inf/nan; tactic ranking depends on shapes and routing, not weight values.
     """
+    scale_block = _scale_block_size(quant_format)
     g = torch.Generator(device="cpu").manual_seed(seed)
     w13 = torch.randint(
         0, 256, (local_experts, 2 * ispp, hidden // 2), generator=g, dtype=torch.uint8
     ).to(device)
     w13_scale = torch.full(
-        (local_experts, 2 * ispp, hidden // SF_BLOCK),
+        (local_experts, 2 * ispp, hidden // scale_block),
         127,
         dtype=torch.uint8,
         device=device,
@@ -101,7 +161,7 @@ def _make_weights(local_experts: int, hidden: int, ispp: int, device, seed: int)
         0, 256, (local_experts, hidden, ispp // 2), generator=g, dtype=torch.uint8
     ).to(device)
     w2_scale = torch.full(
-        (local_experts, hidden, ispp // SF_BLOCK),
+        (local_experts, hidden, ispp // scale_block),
         127,
         dtype=torch.uint8,
         device=device,
@@ -110,10 +170,15 @@ def _make_weights(local_experts: int, hidden: int, ispp: int, device, seed: int)
 
 
 def _make_tokens(
-    num_tokens: int, hidden: int, num_experts: int, top_k: int, device, seed: int
+    num_tokens: int,
+    hidden: int,
+    num_experts: int,
+    top_k: int,
+    device,
+    seed: int,
+    *,
+    quant_format: str,
 ):
-    from flashinfer import mxfp8_quantize
-
     g = torch.Generator(device="cpu").manual_seed(seed)
     x = (torch.randn(num_tokens, hidden, generator=g) * 0.05).bfloat16().to(device)
     topk_ids = torch.stack(
@@ -122,7 +187,25 @@ def _make_tokens(
     topk_weights = (
         torch.rand(num_tokens, top_k, generator=g).softmax(-1).bfloat16().to(device)
     )
-    x_q, x_scale = mxfp8_quantize(x, False, alignment=hidden)
+    if quant_format == "mxfp":
+        from flashinfer import mxfp8_quantize
+
+        x_q, x_scale = mxfp8_quantize(x, False, alignment=hidden)
+    elif quant_format == "nvfp4":
+        from flashinfer import fp4_quantize
+
+        # Kimi-K3-NVFP4 ships input_scale == 1.0. Match production's block-16,
+        # non-swizzled activation scales exactly: these shapes are part of
+        # FlashInfer's tactic-cache key.
+        global_scale = torch.ones((), dtype=torch.float32, device=device)
+        x_q, x_scale = fp4_quantize(
+            x,
+            global_scale,
+            sf_vec_size=NVFP4_SF_BLOCK,
+            is_sf_swizzled_layout=False,
+        )
+    else:
+        raise ValueError(f"unsupported quant format: {quant_format}")
     x_scale = x_scale.view(torch.float8_e4m3fn).reshape(num_tokens, -1)
     return x_q, x_scale, topk_ids, topk_weights
 
@@ -174,11 +257,14 @@ def _candidate_tactics(args) -> list[tuple[int, int]]:
     )
 
     moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+    activation_dtype, weight_dtype = _candidate_dtype_pair(
+        args.quant_format, DtypeTrtllmGen
+    )
     seen: dict[tuple[int, int], None] = {}
     for probe_tokens in (64, 256, 512, SITU_TUNE_MAX_NUM_TOKENS):
         for tac in moe_op.trtllm_get_valid_moe_configs(
-            DtypeTrtllmGen.MxE4m3,
-            DtypeTrtllmGen.MxE2m1,
+            activation_dtype,
+            weight_dtype,
             Fp8QuantizationType.NoneFp8,
             args.top_k,
             args.hidden_size,
@@ -215,6 +301,9 @@ def _run(args, W, tokens, tactic_setter, tactic, iters, do_finalize=True):
     beta = torch.full(
         (args.local_experts,), args.situ_beta, dtype=torch.float32, device=x_q.device
     )
+    output1_scale, output1_gate_scale, output2_scale = _make_output_scales(
+        args.quant_format, args.local_experts, x_q.device
+    )
 
     def _mk(w13, w13_scale, w2, w2_scale):
         def call():
@@ -232,9 +321,9 @@ def _run(args, W, tokens, tactic_setter, tactic, iters, do_finalize=True):
                 gemm2_weights=w2,
                 gemm2_weights_scale=w2_scale,
                 gemm2_bias=None,
-                output1_scale_scalar=None,
-                output1_scale_gate_scalar=None,
-                output2_scale_scalar=None,
+                output1_scale_scalar=output1_scale,
+                output1_scale_gate_scalar=output1_gate_scale,
+                output2_scale_scalar=output2_scale,
                 num_experts=args.num_experts,
                 top_k=args.top_k,
                 n_group=None,
@@ -258,7 +347,7 @@ def _run(args, W, tokens, tactic_setter, tactic, iters, do_finalize=True):
     return _time_call([_mk(*w) for w in W_list], iters=iters)
 
 
-def main(argv: list[str] | None = None) -> int:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0],
     )
@@ -273,6 +362,15 @@ def main(argv: list[str] | None = None) -> int:
         "--model",
         default="kimi-k3",
         help="Model slug used in an automatically generated output filename",
+    )
+    parser.add_argument(
+        "--quant-format",
+        default="mxfp",
+        choices=QUANT_FORMATS,
+        help=(
+            "Quantized MoE format: mxfp keeps the original MXFP8-activation / "
+            "MXFP4-weight path; nvfp4 uses block-16 E2M1 activations and weights"
+        ),
     )
     parser.add_argument(
         "--ep-size",
@@ -324,6 +422,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--coarse-iters", type=int, default=8)
     parser.add_argument("--fine-iters", type=int, default=50)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
     args = parser.parse_args(argv)
 
     from flashinfer.autotuner import AutoTuner, autotune
@@ -350,6 +453,7 @@ def main(argv: list[str] | None = None) -> int:
             args.intermediate_size,
             device,
             seed=1 + c,
+            quant_format=args.quant_format,
         )
         for c in range(args.weight_copies)
     ]
@@ -377,6 +481,7 @@ def main(argv: list[str] | None = None) -> int:
             args.top_k,
             device,
             seed=2,
+            quant_format=args.quant_format,
         )
         with autotune():
             _run(
@@ -411,6 +516,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.top_k,
                 device,
                 seed=100 + bucket,
+                quant_format=args.quant_format,
             )
 
             def run(tac, iters):

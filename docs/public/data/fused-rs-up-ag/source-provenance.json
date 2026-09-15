@@ -1,0 +1,91 @@
+{
+  "schema": "fused-shared-rs-up-projection-ag-source-provenance",
+  "fresh_pr_gpu_rerun": false,
+  "source_archive_sha256": "1e712d65ef43fa5319cf826eeb79b5b7717055ee6c703c43fbbdd17abb641460",
+  "comparison": "Frozen device sources are retained. AST comparison canonicalizes module-level import order only. The Triton communication host-state adapter is rebased on current main; its separate ported digest and preserved-device digest are explicit below. New facade, serving adapter and reproduction harness require fresh GPU validation.",
+  "files": {
+    "tokenspeed-kernel/python/tokenspeed_kernel/ops/communication/mnnvl_cutedsl_fused_rs_up_projection.py": {
+      "frozen_bytes_sha256": "78e654d565ce9719bf2d9abdd823a994a28febd655d6b489606af966967193d0",
+      "python_ast_sha256": "41d0984073a162687f5ff39a9249cfb164245a2d98a5abdab6844cf5fce13372"
+    },
+    "tokenspeed-kernel/python/tokenspeed_kernel/ops/communication/mnnvl_fused_rs_cluster_cap.py": {
+      "frozen_bytes_sha256": "4999e5e88bce5f16d8ffa307beb8e0b800872145cb9b76fc9f7f1e5f66029b03",
+      "python_ast_sha256": "e4a85fbdca565a7bfc637e150410bc52d008707afa796d6de901bd8d1f327510"
+    },
+    "tokenspeed-kernel/python/tokenspeed_kernel/ops/communication/mnnvl_cutedsl_symmetric_up_projection.py": {
+      "frozen_bytes_sha256": "3f42d86009ef477e6c8e6d8a863c8143dcbd45800b333d9fe6234689c30c6cbe",
+      "python_ast_sha256": "9ad22047a4443beff576060b7458b0dfca9578cfbdda4e11a773b5a9781ff74b"
+    },
+    "tokenspeed-kernel/python/tokenspeed_kernel/ops/communication/mnnvl_cutedsl_shared_rs.py": {
+      "frozen_bytes_sha256": "e498f00cbeab0d371fb3ae6b8707e5bd0a164401b924177554321139e0bfb372",
+      "python_ast_sha256": "2f7283443df3ec46ad9b176e90918dc5e22304144e76b8d4a318aea0ab5d7e24"
+    },
+    "tokenspeed-kernel/python/tokenspeed_kernel/ops/communication/shared_rs_contract.py": {
+      "frozen_bytes_sha256": "841b281b0468f55cbf4748ba17948f03631414da75a431db2c0b322dad57d314",
+      "python_ast_sha256": "f40bad3d4ac41f7df6ca3741190292eafed2a5b54e0d38443775bff6b169c962"
+    },
+    "tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/shared_rs/kernel.py": {
+      "frozen_bytes_sha256": "9573cb97dce97aa6b419439903e0c00c7ffda71de6bf6de4f7099ef97157bdb1",
+      "python_ast_sha256": "5c714c6217d0d9509cebfd5466f2976bcee0bd90fa30ed99bc3f5f491ff52e24"
+    },
+    "tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/symmetric_up_projection/__init__.py": {
+      "frozen_bytes_sha256": "4b7e8e16d17eb0e5524dedbe620be02b331b5c1dbe385d1095c6ffc4a9f7c1c6",
+      "python_ast_sha256": "eb8063c8f64314212c716ba615efed502cbdf5a590d0ffe4786d716a6c49dbe0"
+    },
+    "tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/symmetric_up_projection/gemm.py": {
+      "frozen_bytes_sha256": "d0dc59d968b0c233d28f65df364bfdd1e3c13bb5b1f99ac81e650d85df2db37b",
+      "python_ast_sha256": "71ee61cbc179ce03e787ddaa9c80bcde5550ced8ecb5647bdc7c419a9b1ace5c"
+    },
+    "tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/symmetric_up_projection/fused_shared_rs.py": {
+      "frozen_bytes_sha256": "25d5b15c2440a1b23db6333498a247a0ac78723af92c1efd323dfdfa637b673e",
+      "python_ast_sha256": "4e5cc62a0149805761f6418994afdb4f400c9a2e96cf51c808d2cf855d3a27c8"
+    },
+    "tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/symmetric_up_projection/fused_shared_rs_groups.py": {
+      "frozen_bytes_sha256": "04972e00257756c4380d13c5777ad2cb5f0a9c8ddd63e00a0d4e7cf165db7c19",
+      "python_ast_sha256": "8d3c39ee5334e6504233e331a9ec15c85ce95227707ead252dc470b12c52b953"
+    },
+    "tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/symmetric_up_projection/fused_shared_rs_n64.py": {
+      "frozen_bytes_sha256": "400742d336fccafbd4b1eefc65cd1c434f597ede2c81b465b1f63da391ce696c",
+      "python_ast_sha256": "bee6a319df584ef1a9a897da3c0cae97d5c531cfb71cfb8af567a2072833bf55"
+    },
+    "tokenspeed-kernel/python/tokenspeed_kernel/ops/communication/triton.py": {
+      "frozen_bytes_sha256": "741c17a39437ff4027ce73b9beb3e22fde526e4715bdb889dbf225e65ba9f5ed",
+      "python_ast_sha256": "ae6ec81cc714a4fd07274d00a458fd2481ea2428bbe2c84850943608603207c9",
+      "ported_python_ast_sha256": "2dc37d2621e6be57eb8b8c3c0e5012b537000a705009eb13b76411bdd59aac66",
+      "main_base": "2e4b540743878959eb51793ce01d74b5898b0e38",
+      "port_reason": "Retain current-main AMD/AttnRes communication fields and constructors, adding explicit optional hidden-RS state. Not claimed byte-identical to the old host adapter.",
+      "unchanged_device_functions": [
+        "fence_proxy_alias",
+        "nvidia_rsag_all_gather_kernel_inner",
+        "nvidia_rsag_multimem_all_gather_inner",
+        "nvidia_rsag_reduce_scatter_kernel_inner",
+        "nvidia_rsag_multimem_reduce_scatter_inner"
+      ],
+      "device_ast_sha256": "1c4b5b4d005b860fb01a5a769cd44720652150f492a99504b8ac3c94830abe71"
+    },
+    "tokenspeed-kernel/python/tokenspeed_kernel/ops/communication/mnnvl_cutedsl_finalize.py": {
+      "frozen_bytes_sha256": "b9ed6f3a8644ea707a3180d9981a1cb7799412b78664fb3e6bb977de74f379a6",
+      "python_ast_sha256": "28132f8bfaed254841d6d7ce4bb559849fb0bc0a985a80200d5f8d2f10609517"
+    },
+    "tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/flashinfer/mnnvl_cutedsl_finalize.py": {
+      "frozen_bytes_sha256": "a2d5f01008124ba5f474c3e888c7e8b843313426f118fba0c31196c43d572197",
+      "python_ast_sha256": "c87ec7669bb76972aa8a1abbebc9672c6a70a562ad7d81c48ccd4e80e089b21f"
+    },
+    "tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/mnnvl_k3_ht/device_kernel.py": {
+      "frozen_bytes_sha256": "a2bc36152b60b654a9a9c6eb5b715a3e4d884d0cedc0fb0193f30f440598496a",
+      "python_ast_sha256": "2b9e9daef165a1e4f9d359727320c8b459099b4ed32bfd388e59b47e54503e99"
+    },
+    "tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/mnnvl_k3_ht/primitives.py": {
+      "frozen_bytes_sha256": "05584df5b16e557f914c61ebb92fcd02884908a51222fc4fa8e0f7df0d71e2cb",
+      "python_ast_sha256": "5c909870d44759d58d666d4e70935edb2b70cf931bbc557325d03d4340f79d6d"
+    },
+    "tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/mnnvl_k3_ht/protocol.py": {
+      "frozen_bytes_sha256": "f569127b33ec99cfd77ba9d5272c9ce1368db64b3a87cceadd50f99f6c09148d",
+      "python_ast_sha256": "5a5e7fff9bbd734725bd764a91f81a4c21daf36e3e751bb51ee42394e762a6a0"
+    },
+    "tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/latent_moe_tail/primitives.py": {
+      "frozen_bytes_sha256": "e034b743c38d488909f6f43cdfad15d5acfb5c537e5f3f942195e4c027babb80",
+      "python_ast_sha256": "4a750807a5fc77dc9f6e21a764db0e1aecc8c4fcfa57b8b1bde2bca581a39499"
+    }
+  }
+}

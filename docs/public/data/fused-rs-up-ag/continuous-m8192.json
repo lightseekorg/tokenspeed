@@ -1,0 +1,204 @@
+{
+  "schema": "fused-shared-rs-up-projection-ag-evidence",
+  "historical": true,
+  "fresh_pr_gpu_rerun": false,
+  "source_record_sha256": "b42b5b9787139076905137a997e2113ed66af3e322483e6afcca736765c0ef71",
+  "M": 8192,
+  "launch_policy": {
+    "kind": "hardware_capacity",
+    "requested_clusters": null
+  },
+  "candidate_ht": {
+    "max_tokens": 8192,
+    "persistent_ctas": null,
+    "consumer_threads": 448,
+    "vectors_per_thread": 1,
+    "stages": 10,
+    "reduction_warps": 2,
+    "reduction_cta_groups": null,
+    "rms_token_groups": 2,
+    "rms_pipeline_stages": 3,
+    "rms_shard_major": false,
+    "enable_pdl": true
+  },
+  "fixed_reference_bounds": {
+    "absolute": 0.046875,
+    "relative_to_reference_max": 0.01,
+    "relative_l2": 0.006
+  },
+  "generations": 128,
+  "layer_slots": 4,
+  "graph_layers": 4,
+  "changed_inputs": [
+    "gemm2_output",
+    "expert_weights",
+    "expanded_idx",
+    "shared_partial",
+    "prefix",
+    "gamma",
+    "up_weight"
+  ],
+  "checks": [
+    "bitwise_baseline",
+    "changed_from_previous",
+    "survives_baseline_replay"
+  ],
+  "host_sync_or_collective_inside_generation_loop": false,
+  "no_host_sync_loop": true,
+  "performance_measured": false,
+  "pass": true,
+  "ranks": [
+    {
+      "rank": 0,
+      "generations": 128,
+      "slots": 4,
+      "checks": [
+        "bitwise_baseline",
+        "changed_from_previous",
+        "survives_baseline_replay"
+      ],
+      "num_checks": 1536,
+      "num_failures": 0,
+      "encoding": "row-major nested flags flattened; [bit, run_length]",
+      "flag_runs": [
+        [
+          1,
+          1536
+        ]
+      ]
+    },
+    {
+      "rank": 1,
+      "generations": 128,
+      "slots": 4,
+      "checks": [
+        "bitwise_baseline",
+        "changed_from_previous",
+        "survives_baseline_replay"
+      ],
+      "num_checks": 1536,
+      "num_failures": 0,
+      "encoding": "row-major nested flags flattened; [bit, run_length]",
+      "flag_runs": [
+        [
+          1,
+          1536
+        ]
+      ]
+    },
+    {
+      "rank": 2,
+      "generations": 128,
+      "slots": 4,
+      "checks": [
+        "bitwise_baseline",
+        "changed_from_previous",
+        "survives_baseline_replay"
+      ],
+      "num_checks": 1536,
+      "num_failures": 0,
+      "encoding": "row-major nested flags flattened; [bit, run_length]",
+      "flag_runs": [
+        [
+          1,
+          1536
+        ]
+      ]
+    },
+    {
+      "rank": 3,
+      "generations": 128,
+      "slots": 4,
+      "checks": [
+        "bitwise_baseline",
+        "changed_from_previous",
+        "survives_baseline_replay"
+      ],
+      "num_checks": 1536,
+      "num_failures": 0,
+      "encoding": "row-major nested flags flattened; [bit, run_length]",
+      "flag_runs": [
+        [
+          1,
+          1536
+        ]
+      ]
+    },
+    {
+      "rank": 4,
+      "generations": 128,
+      "slots": 4,
+      "checks": [
+        "bitwise_baseline",
+        "changed_from_previous",
+        "survives_baseline_replay"
+      ],
+      "num_checks": 1536,
+      "num_failures": 0,
+      "encoding": "row-major nested flags flattened; [bit, run_length]",
+      "flag_runs": [
+        [
+          1,
+          1536
+        ]
+      ]
+    },
+    {
+      "rank": 5,
+      "generations": 128,
+      "slots": 4,
+      "checks": [
+        "bitwise_baseline",
+        "changed_from_previous",
+        "survives_baseline_replay"
+      ],
+      "num_checks": 1536,
+      "num_failures": 0,
+      "encoding": "row-major nested flags flattened; [bit, run_length]",
+      "flag_runs": [
+        [
+          1,
+          1536
+        ]
+      ]
+    },
+    {
+      "rank": 6,
+      "generations": 128,
+      "slots": 4,
+      "checks": [
+        "bitwise_baseline",
+        "changed_from_previous",
+        "survives_baseline_replay"
+      ],
+      "num_checks": 1536,
+      "num_failures": 0,
+      "encoding": "row-major nested flags flattened; [bit, run_length]",
+      "flag_runs": [
+        [
+          1,
+          1536
+        ]
+      ]
+    },
+    {
+      "rank": 7,
+      "generations": 128,
+      "slots": 4,
+      "checks": [
+        "bitwise_baseline",
+        "changed_from_previous",
+        "survives_baseline_replay"
+      ],
+      "num_checks": 1536,
+      "num_failures": 0,
+      "encoding": "row-major nested flags flattened; [bit, run_length]",
+      "flag_runs": [
+        [
+          1,
+          1536
+        ]
+      ]
+    }
+  ]
+}
