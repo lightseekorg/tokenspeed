@@ -24,11 +24,10 @@ Triton kernels for computing cache locations and updating page tables.
 
 from __future__ import annotations
 
-import tokenspeed_triton as triton
-import tokenspeed_triton.language as tl
 import torch
 
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.triton import tl, triton
 
 logger = get_colorful_logger(__name__)
 

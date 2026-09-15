@@ -25,8 +25,6 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable
 
-import tokenspeed_triton as triton
-import tokenspeed_triton.language as tl
 import torch
 import torch.nn as nn
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
@@ -113,6 +111,7 @@ from tokenspeed.runtime.utils import (
     set_weight_attrs,
 )
 from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.triton import tl, triton
 
 logger = logging.getLogger(__name__)
 

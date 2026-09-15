@@ -27,10 +27,10 @@
 ``norm(x * gate(z))`` in one Triton launch, with ``silu`` or ``sigmoid`` as
 the gate. Inference only (no backward)."""
 
-import tokenspeed_triton as triton
-import tokenspeed_triton.language as tl
 import torch
 from tokenspeed_kernel.platform import pdl_enabled
+
+from tokenspeed.runtime.utils.triton import tl, triton
 
 
 @triton.heuristics({"HAS_Z": lambda args: args["Z"] is not None})

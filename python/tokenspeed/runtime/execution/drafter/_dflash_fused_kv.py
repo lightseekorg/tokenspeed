@@ -33,9 +33,9 @@ Adapted from sglang's `fused_kv_materialize.py`. Provides two variants:
 
 from __future__ import annotations
 
-import tokenspeed_triton as triton
-import tokenspeed_triton.language as tl
 import torch
+
+from tokenspeed.runtime.utils.triton import tl, triton
 
 # ---------------------------------------------------------------------------
 # Module-level cache for per-layer buffer pointer tensors.
