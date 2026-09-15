@@ -38,19 +38,7 @@ export default defineConfig({
         items: [
           { text: "Getting Started", link: "/guides/getting-started" },
           { text: "Launching a Server", link: "/guides/launching" },
-          { text: "InstantTensor Loading", link: "/guides/instanttensor" },
-          {
-            text: "Kimi K3 integrated MoE tail",
-            link: "/guides/kimi-k3-integrated-tail"
-          },
-          {
-            text: "Kimi K3 MNNVL CuTe DSL",
-            link: "/guides/kimi-k3-mnnvl-cutedsl"
-          },
-          {
-            text: "Kimi K3 fused shared-RS / up-projection / AG",
-            link: "/guides/kimi-k3-fused-rs-up-projection-ag"
-          }
+          { text: "InstantTensor Loading", link: "/guides/instanttensor" }
         ]
       },
       {

@@ -1,4 +1,4 @@
-# Integrated K3 fused tail acceptance profile
+# Integrated K3 MoE tail design
 
 This default-off profile has a completed single-pair serving measurement,
 not replicated performance or full-model numerical qualification.
@@ -48,8 +48,7 @@ each layer still owns its weight-dependent launch cache. Both outputs together
 require 224 MiB, versus 10304 MiB for the original 92 per-layer outputs.
 This is a 10080 MiB allocation reduction. The pooled serving measurement
 reports 51.00 GiB KV per GPU versus 51.58 GiB for same-run main, compared with
-40.97 GiB in the historical per-layer candidate. See the
-[serving results](../guides/kimi-k3-integrated-tail.md#serving-measurement).
+40.97 GiB in the historical per-layer candidate.
 The original two-batch campaign uses the old per-layer allocation and does not
 qualify this revised ownership policy.
 
@@ -68,11 +67,47 @@ are transient until the same slot is next written, not per-layer archives.
 Different concurrent model/graph instances require separate storage. The
 historical endpoint-only and medium-only profiles retain per-layer outputs.
 
-Arithmetic, early accumulator release, direct TMA multicast, external
-publication/completion barriers, alias checks and live capture pointers retain
-[the established fused contract](kimi-k3-fused-rs-up-projection-ag.md).
-No standalone RS, staging copy or AG materializer is inserted. The real
-shared producer writes the exact symmetric `out=` view.
+## Dataflow and arithmetic
+
+```mermaid
+flowchart TD
+    E[Deferred expert output] --> B[BT or HT finalize / reduce / RMSNorm]
+    S[Shared down-projection: out= symmetric input] --> F
+    B --> F[Fused shared RS + up-projection + residual + AG]
+    R[Residual owner slice] --> F
+    F --> O[Direct multicast to final symmetric output]
+```
+
+The first half produces replicated normalized latent [M,3584]. The second
+half consumes rank-local up weight [896,3584], raw shared partial [M,7168]
+and replicated residual [M,7168]. Each rank produces its896-column owner
+slice and multicasts it into the replicated [M,7168] output.
+
+Grouped128-bit multimem reductions feed shared addend stages while persistent
+GEMM executes. The epilogue releases accumulators after their final read,
+before waiting for output-stage reuse, then uses TMA multicast directly into
+the final symmetric buffer. There is no shared staging copy, separate global
+RS result or mailbox/AG materializer. A legacy shard allocation remains layout
+metadata, not a produced intermediate. Overlap is inside the second stage;
+stall-free MMA and overlap between both tail stages are not claimed.
+
+Preserve these BF16 boundaries for each owned slice:
+
+```text
+shared = BF16(sum_ranks(raw_shared))
+acc    = FP32(latent @ weight.T)
+q      = BF16(acc + FP32(shared_owner))
+out    = BF16(FP32(q) + FP32(residual_owner))
+```
+
+Residual is included once after reduction. Main pre-adds residual to the shared
+owner before addmm and AllReduce #2, so bitwise equality to main is not promised.
+System-level publication/acquire/release, proxy-alias fences and cross-rank
+output completion remain. There is no rank barrier inside GEMM. Allocation,
+rank agreement, occupancy checks and compilation precede capture; replay uses
+live inputs without host collectives. The real shared producer writes the
+exact symmetric `out=` view. Target verification follows the same M dispatch:
+sixteen requests with four speculative tokens can use M64.
 
 ## Validation boundary
 
@@ -87,3 +122,29 @@ Preserve execution failures, source/container/config identities and numeric
 results. Report local tail, all-turn gold TTFT and first-turn TTFT separately,
 including speculative acceptance and KV-capacity differences. Performance
 results alone do not establish numerical equivalence or model task quality.
+
+Only kernel unit/correctness tests and their helpers are retained in this
+branch; experiment drivers and result datasets are excluded. Tests cover BT/HT
+references and graph replay, fused launch configuration, live input pointers,
+guarded outputs and changed-input replay. The integrated correctness harness
+supports `--pooled-outputs` for four layers sharing two physical outputs.
+Its intermediate snapshots are correctness instrumentation, not serving copies.
+Distributed tests require TP8 and are not substitutes for model-quality checks.
+
+## Source map and attribution
+
+Runtime integration is in `python/tokenspeed/runtime/models/kimi_k3_comm.py`.
+Bindings live under `tokenspeed-kernel/python/tokenspeed_kernel/ops/communication/`;
+fused device code is in `thirdparty/cute_dsl/symmetric_up_projection/` within
+that package. Runtime uses only the `tokenspeed-kernel` boundary.
+
+The native H3584 HT specialization vendors FlashInfer's
+`flashinfer/comm/mnnvl_cutedsl/kernel_ht/device_kernel.py` from v0.6.18,
+commit `69ff11fc4954396d98326656dc85debd2223f637`, under its original Apache-2.0
+license. Upstream file SHA256:
+`076c6621d5456affa6c7255c868260a90904a3e4c624d18779d15f35a54c44a6`.
+Original notices remain in source. The specialization uses ceiling-divided
+reduction vectors and predicated multimem loads/stores: H3584/TP8 has448 BF16x8
+packs and56 packs per shard. With two reduction warps, lanes56–63 issue no
+load/store. This avoids H4096 padding copies and RMSNorm rescaling while
+preserving the producer/consumer/RMSNorm geometry contract.

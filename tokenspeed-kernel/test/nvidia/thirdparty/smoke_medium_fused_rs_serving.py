@@ -37,7 +37,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from bench_medium_fused_tail import equal_outputs, reference_errors
+from fused_rs_up_ag_reference import equal_outputs, reference_errors
 from test_fused_rs_up_projection_serving import check_all_ranks
 from tokenspeed_kernel.ops.communication.medium_fused_rs_up_projection_serving import (
     MediumFusedRsUpProjectionServing,

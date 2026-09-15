@@ -20,23 +20,12 @@
 
 """Truth table for the K3 MoE tail tier selector."""
 
-from types import SimpleNamespace
-
 import pytest
 
-from tokenspeed.runtime.models import kimi_k3_comm
 from tokenspeed.runtime.models.kimi_k3_comm import (
-    MNNVL_BT_MAX_TOKENS,
-    MNNVL_BT_MIN_TOKENS,
-    MNNVL_BT_QUALIFIED_TOKENS,
-    MNNVL_HT_MAX_TOKENS,
-    MNNVL_HT_MIN_TOKENS,
-    MNNVL_HT_QUALIFIED_TOKENS,
     K3MoETailTier,
     select_k3_moe_tail_tier,
 )
-from tokenspeed.runtime.utils import env
-from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
 def _select(**overrides):
@@ -46,40 +35,9 @@ def _select(**overrides):
         tail_fusion_max_tokens=16,
         fused_moe_ar=True,
         multimem_ok=True,
-        is_decode=False,
-        join_moe_reduce=False,
-        mnnvl_bt_deferred_ok=False,
-        mnnvl_ht_deferred_ok=False,
-        fused_rs_up_ag_ok=False,
-        prefill_graph_phase=False,
     )
     base.update(overrides)
     return select_k3_moe_tail_tier(**base)
-
-
-class _AlwaysSupportedWorkspace:
-    def supports_num_tokens(self, _num_tokens):
-        return True
-
-
-def _plan_comm():
-    comm = kimi_k3_comm.K3MoeTailComm.__new__(kimi_k3_comm.K3MoeTailComm)
-    comm.state = SimpleNamespace(
-        mnnvl_bt_deferred=_AlwaysSupportedWorkspace(),
-        mnnvl_ht_deferred=_AlwaysSupportedWorkspace(),
-        multimem_ar_ok=True,
-    )
-    comm.execution_plan = SimpleNamespace(
-        fused_moe_ar=True,
-        join_moe_reduce=False,
-    )
-    comm.latent_tail = None
-    comm._experts_supports_deferred_finalize = True
-    comm._shard_up_projection = True
-    comm.mapping = SimpleNamespace(moe=SimpleNamespace(tp_ep_size=8))
-    comm.routed_hidden = 3584
-    comm.hidden_size = 7168
-    return comm
 
 
 @pytest.mark.parametrize("m", [1, 8, 16])
@@ -139,191 +97,6 @@ def test_fused_lane_fallback_without_multimem(m):
 
 def test_graph_phase_above_fused_capacity_still_tiers_by_tokens():
     assert _select(num_tokens=512, graph_phase=True) is K3MoETailTier.MULTIMEM_AR
-
-
-def test_deferred_mnnvl_protocols_only_preempt_prefill_graphs():
-    assert (
-        _select(
-            num_tokens=512,
-            prefill_graph_phase=True,
-            mnnvl_bt_deferred_ok=True,
-        )
-        is K3MoETailTier.MNNVL_BT_DEFERRED
-    )
-    assert (
-        _select(
-            num_tokens=4096,
-            prefill_graph_phase=True,
-            mnnvl_ht_deferred_ok=True,
-        )
-        is K3MoETailTier.MNNVL_HT_DEFERRED
-    )
-    assert (
-        _select(num_tokens=512, mnnvl_bt_deferred_ok=True) is K3MoETailTier.MULTIMEM_AR
-    )
-    assert (
-        _select(
-            num_tokens=4096,
-            graph_phase=True,
-            prefill_graph_phase=True,
-            is_decode=True,
-            mnnvl_ht_deferred_ok=True,
-        )
-        is K3MoETailTier.FUSED_LANE_AR
-    )
-
-
-def test_deferred_mnnvl_ranges_match_the_qualified_complete_tail_windows():
-    assert (MNNVL_BT_MIN_TOKENS, MNNVL_BT_MAX_TOKENS) == (256, 1024)
-    assert (MNNVL_HT_MIN_TOKENS, MNNVL_HT_MAX_TOKENS) == (1280, 8192)
-    assert MNNVL_BT_QUALIFIED_TOKENS == {256, 384, 512, 768, 1024}
-    assert MNNVL_HT_QUALIFIED_TOKENS == {1280, 2048, 4096, 6144, 8192}
-
-
-@pytest.mark.parametrize(
-    ("m", "expected"),
-    [
-        *(
-            (m, K3MoETailTier.MNNVL_BT_DEFERRED)
-            for m in sorted(MNNVL_BT_QUALIFIED_TOKENS)
-        ),
-        *(
-            (m, K3MoETailTier.MNNVL_HT_DEFERRED)
-            for m in sorted(MNNVL_HT_QUALIFIED_TOKENS)
-        ),
-    ],
-)
-def test_plan_enables_deferred_finalize_only_at_qualified_buckets(
-    monkeypatch, m, expected
-):
-    monkeypatch.setattr(kimi_k3_comm, "get_is_cuda_graph_phase", lambda: False)
-    monkeypatch.setattr(kimi_k3_comm, "get_is_prefill_graph_phase", lambda: True)
-
-    plan = _plan_comm().plan(m, hidden_states=None)
-
-    assert plan.tier is expected
-    assert plan.defer_finalize is True
-
-
-@pytest.mark.parametrize("m", [257, 1023, 1152, 1536])
-def test_plan_keeps_exact_bucket_gaps_on_the_established_tier(monkeypatch, m):
-    monkeypatch.setattr(kimi_k3_comm, "get_is_cuda_graph_phase", lambda: False)
-    monkeypatch.setattr(kimi_k3_comm, "get_is_prefill_graph_phase", lambda: True)
-
-    plan = _plan_comm().plan(m, hidden_states=None)
-
-    assert plan.tier is K3MoETailTier.MULTIMEM_AR
-    assert plan.defer_finalize is False
-
-
-@pytest.mark.parametrize(("m", "is_decode"), [(512, False), (2048, False)])
-def test_plan_keeps_eager_prefill_on_the_established_tier(monkeypatch, m, is_decode):
-    monkeypatch.setattr(kimi_k3_comm, "get_is_cuda_graph_phase", lambda: False)
-    monkeypatch.setattr(kimi_k3_comm, "get_is_prefill_graph_phase", lambda: False)
-
-    plan = _plan_comm().plan(m, hidden_states=None, is_decode=is_decode)
-
-    assert plan.tier is K3MoETailTier.MULTIMEM_AR
-    assert plan.defer_finalize is False
-
-
-@pytest.mark.parametrize("m", [512, 2048])
-def test_plan_keeps_decode_on_the_established_tier(monkeypatch, m):
-    monkeypatch.setattr(kimi_k3_comm, "get_is_cuda_graph_phase", lambda: True)
-    monkeypatch.setattr(kimi_k3_comm, "get_is_prefill_graph_phase", lambda: False)
-
-    plan = _plan_comm().plan(m, hidden_states=None, is_decode=True)
-
-    assert plan.tier is K3MoETailTier.FUSED_LANE_AR
-    assert plan.defer_finalize is False
-
-
-def test_mnnvl_capacity_tracks_the_largest_real_prefill_graph_bucket(monkeypatch):
-    monkeypatch.setitem(
-        kimi_k3_comm.global_server_args_dict,
-        "prefill_graph_max_tokens",
-        2048,
-    )
-    assert kimi_k3_comm._mnnvl_graph_max_tokens() == 2048
-    monkeypatch.setitem(
-        kimi_k3_comm.global_server_args_dict,
-        "prefill_graph_capture_sizes",
-        [256, 512],
-    )
-    assert kimi_k3_comm._mnnvl_graph_max_tokens() == 2048
-
-
-@pytest.mark.parametrize(
-    ("all2all_backend", "explicit_max", "capture_sizes", "expected_max"),
-    [
-        ("none", None, None, 2048),
-        ("none", 8192, [256, 512, 2048], 8192),
-        ("deepep", 8192, [256, 512, 2048], 0),
-    ],
-)
-def test_server_args_update_feeds_resolved_mnnvl_graph_capacity(
-    monkeypatch,
-    all2all_backend,
-    explicit_max,
-    capture_sizes,
-    expected_max,
-):
-    """The pre-model global update is the selector's source of truth."""
-
-    # This is a ServerArgs unit test, not a launcher-topology test.  Do not
-    # inherit the enclosing Slurm step's two-node topology when it runs in the
-    # distributed GB300 validation job.
-    for name in ("SLURM_STEP_NUM_NODES", "SLURM_NODEID", "SLURM_STEP_NODELIST"):
-        monkeypatch.delenv(name, raising=False)
-    # Keep the unit test independent of host-specific ephemeral-port policies.
-    args = ServerArgs(model="stub", dist_init_addr="127.0.0.1:7654")
-    args.all2all_backend = all2all_backend
-    args.prefill_graph_max_tokens = explicit_max
-    args.prefill_graph_capture_sizes = capture_sizes
-    args.chunked_prefill_size = 8192
-    args.max_total_tokens = None
-    snapshot = dict(env.global_server_args_dict)
-    monkeypatch.setattr(env, "pdl_enabled", lambda _: None)
-    try:
-        env.global_server_args_dict_update(args)
-        assert kimi_k3_comm._mnnvl_graph_max_tokens() == expected_max
-        assert (
-            env.global_server_args_dict["prefill_graph_capture_sizes"] == capture_sizes
-        )
-    finally:
-        env.global_server_args_dict.clear()
-        env.global_server_args_dict.update(snapshot)
-
-
-def test_mnnvl_candidate_is_qualified_only_for_moe_tp8_ep1():
-    def mapping(tp_size, ep_size):
-        return SimpleNamespace(moe=SimpleNamespace(tp_size=tp_size, ep_size=ep_size))
-
-    assert kimi_k3_comm._mnnvl_tp8_layout(mapping(8, 1))
-    assert not kimi_k3_comm._mnnvl_tp8_layout(mapping(1, 8))
-    assert not kimi_k3_comm._mnnvl_tp8_layout(mapping(2, 4))
-
-
-def test_fused_tail_and_bt_keep_priority_over_ht():
-    assert (
-        _select(
-            num_tokens=8,
-            graph_phase=True,
-            prefill_graph_phase=True,
-            mnnvl_bt_deferred_ok=True,
-            mnnvl_ht_deferred_ok=True,
-        )
-        is K3MoETailTier.TAIL_FUSION
-    )
-    assert (
-        _select(
-            num_tokens=512,
-            prefill_graph_phase=True,
-            mnnvl_bt_deferred_ok=True,
-            mnnvl_ht_deferred_ok=True,
-        )
-        is K3MoETailTier.MNNVL_BT_DEFERRED
-    )
 
 
 def test_join_without_a_lane_reaches_the_join_tier():
