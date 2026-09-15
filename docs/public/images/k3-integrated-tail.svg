@@ -1,0 +1,115 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="890" viewBox="0 0 1440 890" role="img" aria-labelledby="title desc">
+<!--
+Copyright (c) 2026 LightSeek Foundation
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+-->
+<title id="title">Integrated K3 TP8 MoE tail: unchanged main and fused serving path</title>
+<desc id="desc">For token counts above 32 through 8192, both BT or HT first-stage fusion and shared ReduceScatter, up-projection, residual and AllGather fusion are connected to serving. Shared down-projection writes directly to symmetric input. Independent MMA and grouped reduction feed an epilogue that releases accumulators before output-stage reuse and multicasts into the final output. Small and above-range paths are preserved. This is a structural diagram, not a latency chart.</desc>
+<defs>
+  <marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 Z" fill="#64748b"/></marker>
+  <style>
+    text { font-family: Arial, sans-serif; fill: #18324d; }
+    .title { font-size: 30px; font-weight: 700; }
+    .sub { font-size: 18px; fill: #60758d; }
+    .heading { font-size: 21px; font-weight: 700; }
+    .body { font-size: 18px; }
+    .small { font-size: 16px; fill: #526981; }
+    .label { font-size: 18px; font-weight: 700; }
+    .flow { fill: none; stroke: #64748b; stroke-width: 2.3; marker-end: url(#arrow); }
+  </style>
+</defs>
+<rect width="1440" height="890" fill="#ffffff"/>
+<text x="32" y="44" class="title">K3 TP8 MoE tail: both stages integrated into serving</text>
+<text x="32" y="77" class="sub">Optimized ranges: 32 &lt; M ≤ 8192 · latent width 3584 · hidden width 7168 · owner shard 896</text>
+
+<rect x="28" y="110" width="616" height="618" rx="16" fill="#f7f9fc" stroke="#d7e0ea"/>
+<text x="50" y="147" class="heading">UNCHANGED MAIN</text>
+<rect x="50" y="174" width="274" height="86" rx="12" fill="#eaf0f8" stroke="#c9d6e5"/>
+<text x="68" y="209" class="body">Routed expert output</text>
+<text x="68" y="236" class="small">Local contributions</text>
+<rect x="348" y="174" width="274" height="86" rx="12" fill="#eaf0f8" stroke="#c9d6e5"/>
+<text x="366" y="209" class="body">Shared down-projection</text>
+<text x="366" y="236" class="small">Rank-local shared partial</text>
+<path d="M187 260 V300" class="flow"/>
+<path d="M485 260 V300" class="flow"/>
+<rect x="50" y="302" width="274" height="106" rx="12" fill="#fff1dd" stroke="#dccbae"/>
+<text x="68" y="335" class="body">Finalize + AllReduce #1</text>
+<text x="68" y="363" class="body">+ RMSNorm</text>
+<text x="68" y="390" class="small">Normalized latent [M,3584]</text>
+<rect x="348" y="302" width="274" height="106" rx="12" fill="#fff1dd" stroke="#dccbae"/>
+<text x="366" y="335" class="body">Shared partial [M,7168]</text>
+<text x="366" y="363" class="body">Add residual owner slice</text>
+<text x="366" y="390" class="small">Existing BF16 addend order</text>
+<path d="M187 408 V453" class="flow"/>
+<path d="M485 408 V453" class="flow"/>
+<rect x="50" y="455" width="572" height="86" rx="12" fill="#eaf0f8" stroke="#c9d6e5"/>
+<text x="70" y="489" class="body">Owner-shard GEMM: cuBLAS addmm</text>
+<text x="70" y="517" class="small">Reads the pre-added shared / residual owner</text>
+<path d="M336 541 V578" class="flow"/>
+<rect x="50" y="580" width="572" height="91" rx="12" fill="#fff1dd" stroke="#dccbae"/>
+<text x="70" y="614" class="body">Full-width AllReduce #2</text>
+<text x="70" y="644" class="small">Replicated BF16 output [M,7168]</text>
+<text x="50" y="704" class="small">Original communication selection and arithmetic retained.</text>
+
+<rect x="674" y="110" width="738" height="618" rx="16" fill="#f3fbf9" stroke="#b6dcd3"/>
+<text x="696" y="147" class="heading" style="fill:#008675">INTEGRATED CANDIDATE</text>
+<rect x="696" y="174" width="324" height="86" rx="12" fill="#e6f4f0" stroke="#b6dcd3"/>
+<text x="714" y="209" class="body">Deferred routed expert output</text>
+<text x="714" y="236" class="small">Same model / original agentic workload</text>
+<rect x="1044" y="174" width="346" height="86" rx="12" fill="#e6f4f0" stroke="#b6dcd3"/>
+<text x="1062" y="209" class="body">Shared down-projection</text>
+<text x="1062" y="236" class="small">out= preallocated symmetric input</text>
+<path d="M858 260 V300" class="flow"/>
+<path d="M1217 260 V300" class="flow"/>
+<rect x="696" y="302" width="324" height="106" rx="12" fill="#dcece9" stroke="#9dc9bf"/>
+<text x="714" y="335" class="body">BT / HT finalize + reduce + norm</text>
+<text x="714" y="363" class="small">BT: 3 stages · HT: persistent pipeline</text>
+<text x="714" y="390" class="small">Normalized latent [M,3584]</text>
+<rect x="1044" y="302" width="346" height="106" rx="12" fill="#dcece9" stroke="#9dc9bf"/>
+<text x="1062" y="335" class="body">Symmetric shared input [M,7168]</text>
+<text x="1062" y="363" class="small">No shared staging copy</text>
+<text x="1062" y="390" class="small">Cross-rank publication retained</text>
+<path d="M858 408 V473" class="flow"/>
+<path d="M1217 408 V473" class="flow"/>
+<rect x="696" y="434" width="694" height="217" rx="13" fill="#ffffff" stroke="#008675" stroke-width="2"/>
+<text x="714" y="461" class="label" style="fill:#008675">Fused shared RS + up-projection + residual + AG</text>
+<rect x="714" y="479" width="306" height="64" rx="9" fill="#e6eefc"/>
+<text x="730" y="505" class="body">Persistent up-projection MMA</text>
+<text x="730" y="530" class="small">1 CTA medium / 2 CTAs large</text>
+<rect x="1044" y="479" width="328" height="64" rx="9" fill="#e2f2e8"/>
+<text x="1060" y="505" class="body">Grouped multimem load-reduce</text>
+<text x="1060" y="530" class="small">Shared owner: FP32 → BF16</text>
+<path d="M867 543 V566" class="flow"/>
+<path d="M1208 543 V566" class="flow"/>
+<rect x="714" y="568" width="658" height="65" rx="9" fill="#dcece9"/>
+<text x="730" y="594" class="body">Shared + residual epilogue → direct TMA multicast</text>
+<text x="730" y="619" class="small">Release accumulator before waiting for output-stage reuse</text>
+<path d="M1043 651 V673" class="flow"/>
+<text x="716" y="699" class="body">Final symmetric [M,7168] output · completion synchronization</text>
+
+<text x="32" y="768" class="label">Continuous dispatch · default-off integrated switch · both comparison arms use graph maximum 8192</text>
+<rect x="28" y="784" width="1384" height="56" rx="10" fill="#edf2f8"/>
+<text x="46" y="818" class="small">M ≤ 32: unchanged</text>
+<text x="292" y="818" class="small">33–512: BT + 64×64</text>
+<text x="548" y="818" class="small">513–1024: BT + 64×128</text>
+<text x="850" y="818" class="small">1025–8192: HT + 256×128</text>
+<text x="1185" y="818" class="small">&gt;8192: separate</text>
+<text x="32" y="870" class="small">Structural diagram, not latency data. Overlap is within the fused second stage; stall-free MMA and cross-stage overlap are not claimed.</text>
+</svg>

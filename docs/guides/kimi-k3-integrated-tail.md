@@ -4,6 +4,8 @@ This experimental, default-off serving path combines BT/HT first-stage fusion
 with fused shared ReduceScatter, up-projection, residual addition and AllGather.
 It is not yet qualified for stable serving gains or full-model numerical quality.
 
+![Unchanged main and the integrated two-stage serving path](/images/k3-integrated-tail.svg)
+
 ## Enable the complete path
 
 Set `TOKENSPEED_K3_INTEGRATED_FUSED_TAIL=1` in the server environment and pass
@@ -54,6 +56,10 @@ Sequential layers share raw workspace but retain separate output buffers for
 graph lifetime. Independent concurrent executions require independent storage.
 At92 layers,8192×7168 BF16 outputs alone consume10304MiB per rank. Record measured
 KV-cache capacity, not just latency, when comparing serving configurations.
+
+First-start graph preparation compiles shape-specific launch bindings and can
+be substantially slower than main. Report startup and capture cost separately
+from post-readiness TTFT; do not treat those as the same latency metric.
 
 The arithmetic is not bitwise equivalent to main's owner-shard addmm followed
 by AllReduce. The current performance campaign deliberately skips independent
