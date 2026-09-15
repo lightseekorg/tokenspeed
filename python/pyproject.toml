@@ -104,3 +104,7 @@ license-files = ["LICENSE", "THIRDPARTYNOTICES"]
 
 [tool.setuptools.packages.find]
 include = ["tokenspeed*"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"triton" = { msg = "Use tokenspeed_triton instead." }
+"torch.compile" = { msg = "Write the fused kernel directly in Triton instead." }
