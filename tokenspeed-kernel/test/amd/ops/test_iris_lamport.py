@@ -123,10 +123,10 @@ def test_lamport_buffer_polling_codegen(rank, tmp_path):
     """
     from tokenspeed_kernel._triton import gluon, triton
     from tokenspeed_kernel.ops.communication.iris import (
-        iris_lamport_bf16_gluon_kernel,
+        lamport_all_reduce_bf16,
     )
 
-    fn = iris_lamport_bf16_gluon_kernel
+    fn = lamport_all_reduce_bf16
     signature = {
         name: "*i32" if name == "epochs" else "*bf16" for name in fn.arg_names[:4]
     }

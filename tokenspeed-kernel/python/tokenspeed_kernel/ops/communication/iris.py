@@ -1320,7 +1320,7 @@ class IrisAllReduce(object):
         assert self._kimi_k3_moe_lamport_epochs is not None
         assert self._kimi_k3_moe_lamport_peer_addresses is not None
         num_programs = total_numel // config.lamport_block_elements
-        iris_lamport_bf16_gluon_kernel[(num_programs,)](
+        lamport_all_reduce_bf16[(num_programs,)](
             self._input_buf,
             self._kimi_k3_moe_lamport_region,
             self._reduced_output_buf,
@@ -1600,7 +1600,7 @@ def _iris_wait_lamport_peers(
 
 
 @gluon.jit
-def iris_lamport_bf16_gluon_kernel(
+def lamport_all_reduce_bf16(
     input_sym_ptr,
     region_sym_ptr,
     output_ptr,
