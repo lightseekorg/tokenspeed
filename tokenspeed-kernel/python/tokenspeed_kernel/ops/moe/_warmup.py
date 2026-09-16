@@ -679,13 +679,6 @@ class _SyntheticMoeWeights(torch.nn.Module):
             top_k=case.shape.top_k,
             ep_rank=case.placement.moe_ep_rank,
         )
-        if case.routing.with_bias and kind == "mxfp4":
-            self.w13_weight_bias = self._parameter(
-                torch.zeros((e, 2 * i), dtype=torch.bfloat16, device=device)
-            )
-            self.w2_weight_bias = self._parameter(
-                torch.zeros((e, h), dtype=torch.bfloat16, device=device)
-            )
 
     @staticmethod
     def _parameter(value: torch.Tensor) -> torch.nn.Parameter:
@@ -795,7 +788,7 @@ class MoeApplyWarmupConfig:
                     case.weights.block_size if case.weights.kind == "fp8" else None
                 ),
                 internal_activation_dtype=case.internal_activation_dtype,
-                with_bias=case.routing.with_bias,
+                with_bias=False,
                 deepep_group=None,
                 deepep_mode=None,
                 deepep_low_latency_max_num_tokens_per_gpu=None,
