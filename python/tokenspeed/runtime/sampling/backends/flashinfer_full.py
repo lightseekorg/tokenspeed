@@ -42,7 +42,6 @@ from tokenspeed_kernel.ops.sampling.triton import (
     gather_and_expand_scalars,
     min_p_renorm_prob,
 )
-from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 from tokenspeed.runtime.sampling.backends.base import (
     SPECULATIVE_ACCEPT_THRESHOLD_ACC,
@@ -172,16 +171,12 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
                 f"logit_bias contains out-of-vocab token id(s); "
                 f"vocab_size={vocab}, offending={[t for t in raw_ids if not 0 <= t < vocab]}"
             )
-            token_ids = torch.tensor(
-                raw_ids,
-                device=self._logit_bias.device,
-                dtype=torch.long,
+            token_ids = torch.tensor(raw_ids, dtype=torch.long, pin_memory=True).to(
+                self._logit_bias.device, non_blocking=True
             )
             bias_values = torch.tensor(
-                list(bias_map.values()),
-                device=self._logit_bias.device,
-                dtype=torch.bfloat16,
-            )
+                list(bias_map.values()), dtype=torch.bfloat16, pin_memory=True
+            ).to(self._logit_bias.device, non_blocking=True)
             self._logit_bias[pool_idx, token_ids] = bias_values
 
     def reset_capture_state(self) -> None:
@@ -197,7 +192,6 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
     # ------------------------------------------------------------------
 
     @nvtx_range("sampling:penalties", color="yellow")
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _apply_penalties_and_bias(
         self,
         logits: torch.Tensor,
@@ -248,7 +242,6 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         return logits
 
     @nvtx_range("sampling:accum_counts", color="yellow")
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _accumulate_counts(
         self,
         pool_idx: torch.Tensor,

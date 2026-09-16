@@ -24,7 +24,7 @@ import math
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -259,8 +259,8 @@ def pool_to_cache_groups(pool: Any) -> list:
     # no fallback to pool-side copies of the same specs.
     contract = pool.arena.runtime_contract
     specs = contract.group_specs
-    counts = contract.group_page_counts
-    packing = contract.group_packing
+    counts = contract.virtual_block_counts
+    packing = contract.virtual_packing
     out = []
     for spec in specs:
         retention = _RETENTION_MAP.get(spec.retention)
@@ -284,6 +284,7 @@ def pool_to_cache_groups(pool: Any) -> list:
             retention=retention,
             family=family,
             cache_blocks_per_lcm_block=int(packing[spec.group_id]),
+            shard_count=spec.shard_count,
         )
         transfer_policy = spec.transfer_policy
         if transfer_policy is not None:
@@ -495,6 +496,19 @@ def cache_sync_debug_enabled() -> bool:
     return value.strip().lower() in _TRUTHY_ENV_VALUES
 
 
+class PackedBlockTables(NamedTuple):
+    """One batch's per-group block tables, staged once and uploaded once.
+
+    Attributes:
+        tables: Per-group int32 views into the one device storage.
+        tables_cpu: The same tables as views into the pinned host stage they
+            were uploaded from, for planning that must not wait on the device.
+    """
+
+    tables: dict[str, torch.Tensor]
+    tables_cpu: dict[str, torch.Tensor]
+
+
 def block_tables_from_forward_op(
     forward_op: Any,
     device: "torch.device | str",
@@ -504,6 +518,26 @@ def block_tables_from_forward_op(
     max_page_id: int | None = None,
     max_page_ids: Mapping[str, int] | None = None,
 ) -> dict[str, torch.Tensor]:
+    """The device tables of :func:`packed_block_tables_from_forward_op`."""
+    return packed_block_tables_from_forward_op(
+        forward_op,
+        device,
+        num_reqs=num_reqs,
+        expected_group_ids=expected_group_ids,
+        max_page_id=max_page_id,
+        max_page_ids=max_page_ids,
+    ).tables
+
+
+def packed_block_tables_from_forward_op(
+    forward_op: Any,
+    device: "torch.device | str",
+    *,
+    num_reqs: int | None = None,
+    expected_group_ids: tuple[str, ...] | None = None,
+    max_page_id: int | None = None,
+    max_page_ids: Mapping[str, int] | None = None,
+) -> PackedBlockTables:
     """Bridge the per-group block tables to GPU int32 tensors: absolute
     page indices, null hole = 0 preserved, ragged-row padding -1. No
     base-offset companion -- the cache path never compacts.
@@ -513,7 +547,8 @@ def block_tables_from_forward_op(
     precondition of the backends' one-launch packed replay fill
     (``_try_packed_group_unpack``). Per-group uploads would fail its
     same-storage check and fall back to per-group copy/fill chains
-    (~40 tiny transfers per decode step).
+    (~40 tiny transfers per decode step). The host stage is returned too,
+    so a backend planning from the tables reads them without a D2H sync.
 
     Args:
         forward_op: Scheduler forward operation exporting CPU NumPy tables.
@@ -524,8 +559,8 @@ def block_tables_from_forward_op(
         max_page_ids: Optional per-group inclusive upper bounds.
 
     Returns:
-        Per-group tensor views in ``expected_group_ids`` order when supplied,
-        otherwise preserving producer order.
+        Device and host per-group tensor views in ``expected_group_ids``
+        order when supplied, otherwise preserving producer order.
 
     Raises:
         ValueError: If strict contract validation fails before device transfer.
@@ -606,6 +641,7 @@ def block_tables_from_forward_op(
                     )
     device = torch.device(device) if isinstance(device, str) else device
     out: dict[str, torch.Tensor] = {}
+    out_cpu: dict[str, torch.Tensor] = {}
     packable: list[tuple[str, Any, int]] = []
     total = 0
     for key, arr in ordered_items:
@@ -620,11 +656,12 @@ def block_tables_from_forward_op(
             # Kept out of the pack: a zero-width table must stay loud in the
             # replay fill's cols >= 1 assert, not be silently tail-padded.
             out[key] = torch.empty((arr.shape[0], 0), dtype=torch.int32, device=device)
+            out_cpu[key] = torch.empty((arr.shape[0], 0), dtype=torch.int32)
             continue
         packable.append((key, arr, total))
         total += arr.shape[0] * arr.shape[1]
     if not packable:
-        return out
+        return PackedBlockTables(out, out_cpu)
     # Fresh pinned stage per step (event-fenced; reuse races overlap).
     # arr is a read-only zero-copy view over the C++ buffer; np.copyto
     # reads it into our own writable pinned tensor (never writes back).
@@ -635,7 +672,10 @@ def block_tables_from_forward_op(
     packed = staged.to(device, non_blocking=True)
     for key, arr, offset in packable:
         out[key] = packed[offset : offset + arr.size].view(arr.shape[0], arr.shape[1])
-    return out
+        out_cpu[key] = staged[offset : offset + arr.size].view(
+            arr.shape[0], arr.shape[1]
+        )
+    return PackedBlockTables(out, out_cpu)
 
 
 def _classify_param(name: str) -> str:

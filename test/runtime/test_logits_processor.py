@@ -68,7 +68,7 @@ def test_tp_logits_all_gather_handles_zero_rows(monkeypatch):
     metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE)
     calls = {"all_gather": 0}
 
-    def fake_all_gather_into_tensor(output, input_, group):
+    def fake_all_gather_single(output, input_, group):
         calls["all_gather"] += 1
         assert group == (0, 1)
         assert tuple(output.shape) == (0, 3)
@@ -76,8 +76,8 @@ def test_tp_logits_all_gather_handles_zero_rows(monkeypatch):
 
     monkeypatch.setattr(
         logits_processor_module,
-        "all_gather_into_tensor",
-        fake_all_gather_into_tensor,
+        "all_gather_single",
+        fake_all_gather_single,
     )
 
     output = processor(
@@ -130,7 +130,7 @@ def test_tp_logits_gather_preserves_dtype(monkeypatch, dtype, cached):
     monkeypatch.setattr(processor, "_init_all_gather_state", initialize)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(logits_processor_module, "all_gather_inner", multicast)
-    monkeypatch.setattr(logits_processor_module, "all_gather_into_tensor", collective)
+    monkeypatch.setattr(logits_processor_module, "all_gather_single", collective)
     hidden = torch.tensor([[1.0, 1 / 512]], dtype=dtype)
     weight = torch.zeros((8, 2), dtype=dtype)
     weight[0, 0] = 1
@@ -542,7 +542,7 @@ def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(monkeypatc
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     monkeypatch.setattr(
         logits_processor_module,
-        "all_gather_into_tensor",
+        "all_gather_single",
         lambda out, inp, group: None,
     )
 
@@ -593,3 +593,82 @@ def test_get_logits_softcap_disables_fused_argmax(monkeypatch):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def _logprob_device() -> str:
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def test_get_token_ids_logprobs_gathers_every_position_in_one_index():
+    device = _logprob_device()
+    torch.manual_seed(0)
+    all_logprobs = torch.log_softmax(torch.randn(6, 8, device=device), dim=-1)
+    metadata = LogitsMetadata(
+        forward_mode=ForwardMode.EXTEND,
+        extend_logprob_pruned_lens_cpu=[3, 0, 2, 1],
+        token_ids_logprobs=[[1, 5], [2], [], [7, 0, 3]],
+    )
+
+    val, idx = LogitsProcessor.get_token_ids_logprobs(all_logprobs, metadata)
+
+    rows = all_logprobs.tolist()
+    expected_val, pt = [], 0
+    for token_ids, pruned_len in zip(
+        metadata.token_ids_logprobs, metadata.extend_logprob_pruned_lens_cpu
+    ):
+        expected_val.append(
+            [[rows[pt + j][t] for t in token_ids] for j in range(pruned_len)]
+        )
+        pt += pruned_len
+    assert val == expected_val
+    assert idx == [[[1, 5], [1, 5], [1, 5]], [], [[], []], [[7, 0, 3]]]
+
+
+def test_extend_return_logprob_indices_stage_through_pinned_host():
+    device = _logprob_device()
+    torch.manual_seed(0)
+    vocab = 6
+    hidden = torch.randn(5, 4, device=device)
+    weight = torch.randn(vocab, 4, device=device)
+    input_token_ids = torch.tensor([0, 5, 2, 3], device=device)
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=vocab)
+    )
+    # Two requests of 3 and 2 tokens; logprobs start at position 1 and 0.
+    metadata = LogitsMetadata(
+        forward_mode=ForwardMode.EXTEND,
+        extend_return_logprob=True,
+        extend_token_ids_logprob=True,
+        extend_seq_lens_cpu=[3, 2],
+        extend_logprob_start_lens_cpu=[1, 0],
+        extend_logprob_pruned_lens_cpu=[2, 2],
+        extend_input_logprob_token_ids_gpu=input_token_ids,
+        token_ids_logprobs=[[0, 2], [3]],
+        temp_scaled_logprobs=True,
+        temperature=torch.tensor([[0.5], [2.0]], device=device),
+    )
+
+    out = processor(
+        input_ids=None,
+        hidden_states=hidden,
+        lm_head=SimpleNamespace(weight=weight),
+        logits_metadata=metadata,
+    )
+
+    logits = hidden[1:] @ weight.T
+    torch.testing.assert_close(out.next_token_logits, logits[[1, 3]])
+    per_row_temperature = torch.tensor([0.5, 0.5, 2.0, 2.0], device=device)
+    scaled = torch.log_softmax(logits / per_row_temperature.view(-1, 1), dim=-1)
+    torch.testing.assert_close(
+        out.input_token_logprobs,
+        scaled[torch.arange(4, device=device), input_token_ids],
+    )
+    assert out.input_token_ids_logprobs_idx == [[[0, 2], [0, 2]], [[3], [3]]]
+    torch.testing.assert_close(
+        torch.tensor(out.input_token_ids_logprobs_val[0]),
+        scaled[0:2][:, [0, 2]].cpu(),
+    )
+    torch.testing.assert_close(
+        torch.tensor(out.input_token_ids_logprobs_val[1]),
+        scaled[2:4][:, [3]].cpu(),
+    )

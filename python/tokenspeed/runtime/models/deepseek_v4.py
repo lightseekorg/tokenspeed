@@ -1265,7 +1265,7 @@ def _deepseek_v4_sparse_attn_indexer(
     *,
     indexer_metadata: DeepseekV4SparseIndexerMetadata,
     indexer_cache: torch.Tensor,
-    indexer_page_table: torch.Tensor,
+    indexer_block_table: torch.Tensor,
     indexer_block_size: int,
     compress_ratio: int,
     packed_q_values: torch.Tensor,
@@ -1304,14 +1304,14 @@ def _deepseek_v4_sparse_attn_indexer(
     if decode_block_table is None:
         decode_block_table = torch.empty(
             (0, 1),
-            dtype=indexer_page_table.dtype,
-            device=indexer_page_table.device,
+            dtype=indexer_block_table.dtype,
+            device=indexer_block_table.device,
         )
     return torch.ops.tokenspeed.deepseek_v4_sparse_attn_indexer(
         indexer_cache,
         positions,
         batch_metadata.token_to_req_indices,
-        indexer_page_table,
+        indexer_block_table,
         batch_metadata.seq_lens_cpu,
         batch_metadata.query_lens_cpu,
         prefill_metadata.chunk_specs,
@@ -2321,9 +2321,9 @@ class DeepseekV4Compressor(nn.Module):
 
         kv_cache_block_size = pool.get_compressed_block_size(layer_index)
 
-        def resolve_compressed_slots() -> torch.Tensor:
+        def resolve_compressed_slots() -> tuple[torch.Tensor, torch.Tensor]:
             with nvtx_range(f"{profile_prefix}_compressed_slot_mapping"):
-                return cache_metadata.compressed_slot_mapping(
+                slots = cache_metadata.compressed_slot_mapping(
                     positions,
                     self.compress_ratio,
                     token_to_req_indices=metadata.token_to_req_indices[
@@ -2331,6 +2331,7 @@ class DeepseekV4Compressor(nn.Module):
                     ],
                     query_start_loc=metadata.query_start_loc,
                     seq_lens=metadata.seq_lens,
+                    indexer=False,
                     kv_cache_block_size=kv_cache_block_size,
                     use_decode_cache=(
                         ctx.forward_mode is not None and ctx.forward_mode.is_decode()
@@ -2338,12 +2339,16 @@ class DeepseekV4Compressor(nn.Module):
                     is_valid_token=valid_token,
                 )
 
+            return cache_metadata.local_compressed_write_slots(
+                slots, self.compress_ratio
+            )
+
         if memo is not None:
-            compressed_slots = memo.get_or_compute(
+            compressed_slots, compressed_write_mask = memo.get_or_compute(
                 ("compressed", self.compress_ratio), resolve_compressed_slots
             )
         else:
-            compressed_slots = resolve_compressed_slots()
+            compressed_slots, compressed_write_mask = resolve_compressed_slots()
         with nvtx_range(f"{profile_prefix}_cache_insert"):
             insert = (
                 deepseek_v4_csa_compress_kv_cache_insert
@@ -2362,6 +2367,7 @@ class DeepseekV4Compressor(nn.Module):
                 cos_sin_cache=cos_sin_cache,
                 kv_cache_2d=pool.get_compressed_kv_buffer_2d(layer_index),
                 kv_slot_mapping=compressed_slots,
+                kv_write_mask=compressed_write_mask,
                 kv_cache_block_size=kv_cache_block_size,
                 compress_ratio=self.compress_ratio,
             )
@@ -2487,11 +2493,11 @@ class DeepseekV4Indexer(nn.Module):
             if getattr(metadata, "is_valid_token", None) is not None
             else None
         )
-        indexer_page_table = metadata.cache.compressed_page_table(self.compress_ratio)
+        indexer_block_table = metadata.cache.indexer_block_table()
         decode_plan = _deepseek_v4_indexer_decode_plan(
             positions=decode_positions,
             token_to_req_indices=metadata.token_to_req_indices[decode_start:decode_end],
-            block_table=indexer_page_table,
+            block_table=indexer_block_table,
             cache_block_size=indexer_block_size,
             compress_ratio=self.compress_ratio,
             metadata=metadata,
@@ -2643,10 +2649,10 @@ class DeepseekV4Indexer(nn.Module):
             if metadata.query_lens_cpu is not None and num_prefill_tokens > 0
             else empty_cpu
         )
-        indexer_page_table = metadata.cache.compressed_page_table(self.compress_ratio)
+        indexer_block_table = metadata.cache.indexer_block_table()
         prefill_metadata = _deepseek_v4_indexer_prefill_metadata(
             metadata=metadata,
-            block_table=indexer_page_table,
+            block_table=indexer_block_table,
             cache_block_size=indexer_block_size,
             compress_ratio=self.compress_ratio,
             num_prefill_tokens=num_prefill_tokens,
@@ -2668,7 +2674,7 @@ class DeepseekV4Indexer(nn.Module):
                 token_to_req_indices=metadata.token_to_req_indices[
                     decode_start:decode_end
                 ],
-                block_table=indexer_page_table,
+                block_table=indexer_block_table,
                 cache_block_size=indexer_block_size,
                 compress_ratio=self.compress_ratio,
                 metadata=metadata,
@@ -2726,7 +2732,7 @@ class DeepseekV4Indexer(nn.Module):
         return _deepseek_v4_sparse_attn_indexer(
             indexer_metadata=indexer_metadata,
             indexer_cache=indexer_cache,
-            indexer_page_table=indexer_page_table,
+            indexer_block_table=indexer_block_table,
             indexer_block_size=indexer_block_size,
             compress_ratio=self.compress_ratio,
             packed_q_values=packed_index_q[0],
@@ -2828,6 +2834,7 @@ class DeepseekV4Indexer(nn.Module):
                     ctx.forward_mode is not None and ctx.forward_mode.is_decode()
                 ),
                 is_valid_token=valid_token,
+                indexer=True,
             )
         with nvtx_range("indexer_cache_insert"):
             deepseek_v4_csa_indexer_cache_insert(

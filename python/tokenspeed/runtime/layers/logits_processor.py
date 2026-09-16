@@ -23,8 +23,6 @@
 import dataclasses
 
 import torch
-import triton
-import triton.language as tl
 from tokenspeed_kernel.ops.communication.triton import all_gather_inner, create_state
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
@@ -41,7 +39,7 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
-from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
+from tokenspeed.runtime.distributed.comm_ops import all_gather_single
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -60,7 +58,8 @@ from tokenspeed.runtime.sampling.logits_layout import (
     LogitsLayoutExecutor,
     LogitsLayoutPlan,
 )
-from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils import get_colorful_logger, is_pin_memory_available
+from tokenspeed.runtime.utils.triton import tl, triton
 
 logger = get_colorful_logger(__name__)
 
@@ -529,6 +528,7 @@ class LogitsProcessor(nn.Module):
             # 1. pruned_states: hidden states that we want logprobs from.
             # 2. sample_indices: Indices that have sampled tokens.
             # 3. input_logprob_indices: Indices that have input logprob tokens.
+            pin_memory = is_pin_memory_available()
             sample_index_pt = -1
             sample_indices = []
             input_logprob_indices_pt = 0
@@ -563,11 +563,11 @@ class LogitsProcessor(nn.Module):
 
             pruned_states = torch.cat(pruned_states)
             sample_indices = torch.tensor(
-                sample_indices, device=pruned_states.device, dtype=torch.int64
-            )
+                sample_indices, dtype=torch.int64, pin_memory=pin_memory
+            ).to(pruned_states.device, non_blocking=True)
             input_logprob_indices = torch.tensor(
-                input_logprob_indices, device=pruned_states.device, dtype=torch.int64
-            )
+                input_logprob_indices, dtype=torch.int64, pin_memory=pin_memory
+            ).to(pruned_states.device, non_blocking=True)
 
         # Compute logits for both input and sampled tokens.
         logits_layout_plan = self._resolve_logits_layout_plan(
@@ -633,8 +633,8 @@ class LogitsProcessor(nn.Module):
             # Normalize the logprob w/o temperature, top-p
             pruned_lens = torch.tensor(
                 logits_metadata.extend_logprob_pruned_lens_cpu,
-                device=input_logprobs.device,
-            )
+                pin_memory=pin_memory,
+            ).to(input_logprobs.device, non_blocking=True)
             if logits_metadata.temp_scaled_logprobs:
                 logits_metadata.temperature = torch.repeat_interleave(
                     logits_metadata.temperature.view(-1),
@@ -782,7 +782,7 @@ class LogitsProcessor(nn.Module):
                     dtype=logits.dtype,
                     device=logits.device,
                 )
-                all_gather_into_tensor(gathered_logits, logits, self.tp_group)
+                all_gather_single(gathered_logits, logits, self.tp_group)
                 logits = (
                     gathered_logits.view(self.tp_size, num_rows, local_vocab_size)
                     .transpose(0, 1)
@@ -843,6 +843,7 @@ class LogitsProcessor(nn.Module):
         all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata
     ):
         input_token_ids_logprobs_val, input_token_ids_logprobs_idx = [], []
+        pin_memory = is_pin_memory_available()
         pt = 0
         for token_ids, pruned_len in zip(
             logits_metadata.token_ids_logprobs,
@@ -853,8 +854,11 @@ class LogitsProcessor(nn.Module):
                 input_token_ids_logprobs_idx.append([])
                 continue
 
+            token_ids_tensor = torch.tensor(
+                token_ids, dtype=torch.long, pin_memory=pin_memory
+            ).to(all_logprobs.device, non_blocking=True)
             input_token_ids_logprobs_val.append(
-                [all_logprobs[pt + j, token_ids].tolist() for j in range(pruned_len)]
+                all_logprobs[pt : pt + pruned_len, token_ids_tensor].tolist()
             )
             input_token_ids_logprobs_idx.append([token_ids for _ in range(pruned_len)])
             pt += pruned_len

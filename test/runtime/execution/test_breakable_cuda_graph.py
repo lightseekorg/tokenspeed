@@ -616,7 +616,30 @@ class TestPrefillGraphMaxTokensResolution(unittest.TestCase):
             PREFILL_GRAPH_DEFAULT_MAX_TOKENS,
         )
 
-    def test_all_to_all_backend_disables_the_graph(self):
+    def test_k3_transports_keep_prefill_graphs(self):
+        from tokenspeed.runtime.execution.model_executor import (
+            PREFILL_GRAPH_DEFAULT_MAX_TOKENS,
+            _resolve_prefill_graph_max_tokens,
+        )
+
+        for backend in ("agrs", "flashinfer"):
+            with self.subTest(backend=backend):
+                self.assertEqual(
+                    _resolve_prefill_graph_max_tokens(
+                        self._args(all2all_backend=backend)
+                    ),
+                    PREFILL_GRAPH_DEFAULT_MAX_TOKENS,
+                )
+                self.assertEqual(
+                    _resolve_prefill_graph_max_tokens(
+                        self._args(
+                            all2all_backend=backend, prefill_graph_max_tokens=1024
+                        )
+                    ),
+                    1024,
+                )
+
+    def test_deepep_disables_the_graph(self):
         from tokenspeed.runtime.execution.model_executor import (
             _resolve_prefill_graph_max_tokens,
         )

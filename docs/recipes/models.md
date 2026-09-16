@@ -702,6 +702,12 @@ with optional predictive latent embeddings (PLE), optional QSA sparse
 attention, and a one-layer MTP draft. Dense and MoE checkpoints share the same
 launch command.
 
+The decoder passes ordinary sublayer-output tensors and residual tuples between
+layers. At adjacent HC boundaries, it explicitly calls the consuming mixer's
+`combine_norm()` to fuse residual injection with that mixer's grouped RMSNorm.
+PLE, deepstack updates and row-gather boundaries combine the residual first;
+the updated, unnormalized HC state remains available for MTP.
+
 ```bash
 ts serve \
     --model Qwen/Qwen3.8-Flash-Next-FP8 \

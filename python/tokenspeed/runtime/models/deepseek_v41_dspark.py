@@ -278,8 +278,8 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
                 h,
                 pre_mix,
                 positions,
-                ids.reshape(-1),
-                replace(ctx, attn_backend=backend),
+                image_mask=None,
+                ctx=replace(ctx, attn_backend=backend),
             )
         return _norm(v41_hc_pre(h, pre_mix), self.norm).reshape(
             batch, self.block_size, -1
@@ -289,9 +289,18 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
 class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM):
     """Strict mtp-only adapter sharing embedding/head with its V4.1 target."""
 
+    def __init__(self, config, mapping, quant_config):
+        super().__init__(
+            config=config,
+            mapping=mapping,
+            quant_config=quant_config,
+            is_multimodal_active=False,
+            mm_attention_backend=None,
+        )
+
     def resolve_model(self, config, mapping, quant_config, prefix):
         return DeepseekV41DSparkModel(
-            getattr(config, "text_config", config),
+            config.text_config,
             mapping,
             quant_config,
             add_prefix("model", prefix),
@@ -299,10 +308,10 @@ class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM):
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
-        draft = copy(getattr(config, "text_config", config))
-        draft.num_hidden_layers = draft.dspark_num_stages
-        draft.n_routed_experts = draft.dspark_n_routed_experts
-        return DeepseekV41ForCausalLM.get_model_config_for_expert_location(draft)
+        location = super().get_model_config_for_expert_location(config)
+        location.num_layers = config.text_config.dspark_num_stages
+        location.num_logical_experts = config.text_config.dspark_n_routed_experts
+        return location
 
     def get_hot_token_id(self):
         return None

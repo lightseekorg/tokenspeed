@@ -730,6 +730,14 @@ def test_compressor_fused_norm_preserves_pooled_bf16_boundary(device):
     raw = dsv41.compressor_pool(
         content, scores, previous, tail, slots, active, None, None, 0.0
     )
+    maximum = torch.maximum(scores[previous], scores)
+    old_exp = torch.exp(scores[previous] - maximum)
+    new_exp = torch.exp(scores - maximum)
+    expected_raw = (content[previous] * old_exp + content * new_exp) / (
+        old_exp + new_exp
+    )
+    expected_raw[~active] = 0
+    torch.testing.assert_close(raw, expected_raw, rtol=1e-6, atol=1e-6)
     rounded = raw.bfloat16().float()
     expected = (
         rounded

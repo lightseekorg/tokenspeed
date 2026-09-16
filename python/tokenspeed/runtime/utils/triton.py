@@ -18,8 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from __future__ import annotations
+import tokenspeed_triton as triton
+import tokenspeed_triton.language as tl
 
-
-def get_compiler_backend() -> str:
-    return "inductor"
+__all__ = ["tl", "triton"]

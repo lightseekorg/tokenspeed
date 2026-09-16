@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Checkpoint configuration for DeepSeek V4.1's text backbone."""
+"""Checkpoint configuration for DeepSeek V4.1's text and vision backbones."""
 
 from transformers import PretrainedConfig
 
@@ -64,13 +64,55 @@ class DeepseekV41TextConfig(PretrainedConfig):
         return 3 if getattr(self, "engram_layer_ids", ()) else 0
 
 
-class DeepseekV41Config(PretrainedConfig):
-    model_type = "deepseek_v41"
-    sub_configs = {"text_config": DeepseekV41TextConfig}
+class DeepseekV41VisionConfig(PretrainedConfig):
+    """ViT and aligner dimensions with Flash checkpoint defaults."""
 
-    def __init__(self, **kwargs):
-        text = kwargs.pop("text_config", {})
-        self.text_config = text
+    model_type = "deepseek_v41_vision"
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int = 1024,
+        intermediate_size: int = 2816,
+        num_hidden_layers: int = 32,
+        num_attention_heads: int = 16,
+        patch_size: int = 14,
+        downsample_ratio: int = 3,
+        rope_theta: float = 10000.0,
+        **kwargs,
+    ) -> None:
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.patch_size = patch_size
+        self.downsample_ratio = downsample_ratio
+        self.rope_theta = rope_theta
+        super().__init__(**kwargs)
+
+
+class DeepseekV41Config(PretrainedConfig):
+    """DeepSeek V4.1 text and vision configuration."""
+
+    model_type = "deepseek_v41"
+
+    def __init__(
+        self,
+        *,
+        text_config: dict | DeepseekV41TextConfig | None = None,
+        vision_config: dict | DeepseekV41VisionConfig | None = None,
+        **kwargs,
+    ) -> None:
+        if text_config is None:
+            text_config = DeepseekV41TextConfig()
+        elif isinstance(text_config, dict):
+            text_config = DeepseekV41TextConfig(**text_config)
+        if vision_config is None:
+            vision_config = DeepseekV41VisionConfig()
+        elif isinstance(vision_config, dict):
+            vision_config = DeepseekV41VisionConfig(**vision_config)
+        self.text_config = text_config
+        self.vision_config = vision_config
         super().__init__(**kwargs)
         expert_dtype = kwargs.get("quantization_config", {}).get("expert_dtype")
         if expert_dtype is not None:
@@ -79,13 +121,10 @@ class DeepseekV41Config(PretrainedConfig):
             if name in kwargs:
                 setattr(self.text_config, name, getattr(self, name))
 
-    def __setattr__(self, name, value):
-        if name == "text_config" and isinstance(value, dict):
-            value = DeepseekV41TextConfig(**value)
-        super().__setattr__(name, value)
+    @property
+    def hidden_size(self) -> int:
+        return self.text_config.hidden_size
 
-    def __getattr__(self, name):
-        text = self.__dict__.get("text_config")
-        if name.startswith("_") or name == "text_config" or text is None:
-            raise AttributeError(name)
-        return getattr(text, name)
+    @property
+    def vocab_size(self) -> int:
+        return self.text_config.vocab_size

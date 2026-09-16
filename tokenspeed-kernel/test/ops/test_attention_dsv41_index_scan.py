@@ -107,7 +107,7 @@ def test_index_gather_heads_packed_once(dtype):
     with patch.object(
         torch.distributed, "get_world_size", return_value=4
     ), patch.object(
-        torch.distributed, "all_gather_into_tensor", side_effect=gather
+        torch.distributed, "all_gather_single", side_effect=gather
     ) as collective, patch.object(
         torch.distributed, "all_reduce", side_effect=AssertionError
     ):
@@ -286,8 +286,8 @@ def test_index_scan_graph_oracle(device, shards, dtype, tp_group):
             table.copy_(table.flip(1))
             with patch.object(
                 torch.distributed,
-                "all_gather_into_tensor",
-                wraps=torch.distributed.all_gather_into_tensor,
+                "all_gather_single",
+                wraps=torch.distributed.all_gather_single,
             ) as gather, patch.object(
                 torch.distributed, "all_reduce", side_effect=AssertionError
             ):

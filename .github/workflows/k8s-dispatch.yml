@@ -20,10 +20,11 @@ on:
         type: choice
         options:
           - all
+          - test/ci/eval/deepseek-v4.1-flash-evalscope-gsm8k-amd.yaml
+          - test/ci/eval/deepseek-v4.1-flash-evalscope-gsm8k.yaml
           - test/ci/eval/deepseek-v4-flash-evalscope-gsm8k.yaml
           - test/ci/eval/deepseek-v4-flash-mtp-evalscope-gsm8k-amd.yaml
           - test/ci/eval/deepseek-v4-flash-mtp-evalscope-gsm8k.yaml
-          - test/ci/eval/deepseek-v4-pro-evalscope-gsm8k-amd.yaml
           - test/ci/eval/glm-5.2-nvfp4-mtp-evalscope-aime26.yaml
           - test/ci/eval/glm-5.3-flash-fp8-mtp-evalscope-aime26.yaml
           - test/ci/eval/glm-5.3-flash-fp8-mtp-evalscope-aime26-amd.yaml

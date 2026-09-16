@@ -30,14 +30,27 @@ class _DefaultStream:
 
 
 class ZeroCachePagesContractTest(unittest.TestCase):
-    @staticmethod
-    def _fake(pool, draft_pool, trace):
+    # Group-keyed requests are translated from scheduler (virtual) IDs before
+    # any pool sees them; every group here is replicated, so the translation
+    # only drops the reserved null block 0.
+    _GROUPS = ("full", "state", "history", "target_only")
+
+    @classmethod
+    def _fake(cls, pool, draft_pool, trace):
         return types.SimpleNamespace(
             token_to_kv_pool=pool,
             draft_token_to_kv_pool=draft_pool,
             device="cpu",
             default_stream=_DefaultStream(trace),
             execution_stream="execution-stream",
+            _cache_runtime_contract=types.SimpleNamespace(
+                group_specs=tuple(
+                    types.SimpleNamespace(group_id=group_id, shard_count=1)
+                    for group_id in cls._GROUPS
+                ),
+                virtual_block_counts={group_id: 64 for group_id in cls._GROUPS},
+            ),
+            _cache_dcp_rank=0,
         )
 
     @classmethod
@@ -105,6 +118,23 @@ class ZeroCachePagesContractTest(unittest.TestCase):
         pages = {"full": [4, 5], "state": [9]}
         self.assertIsNone(self._call(pool, pages))
         self.assertEqual(seen, [pages])
+
+    def test_group_aware_pool_never_sees_the_null_block(self):
+        seen = []
+        pool = types.SimpleNamespace(
+            requires_page_zeroing=True,
+            zero_new_blocks=lambda pages: seen.append(dict(pages)),
+        )
+        self.assertIsNone(self._call(pool, {"full": [0, 4], "state": [0]}))
+        self.assertEqual(seen, [{"full": [4], "state": []}])
+
+    def test_group_aware_pool_rejects_out_of_range_virtual_blocks(self):
+        pool = types.SimpleNamespace(
+            requires_page_zeroing=True,
+            zero_new_blocks=lambda pages: None,
+        )
+        with self.assertRaises(IndexError):
+            self._call(pool, {"full": [64]})
 
     def test_stateful_draft_pool_zeros_its_group_subset(self):
         target_seen = []

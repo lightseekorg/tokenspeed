@@ -45,13 +45,21 @@ struct CacheGroupConfig {
     // (row geometry or state checkpoint) folds to this span before crossing
     // the bridge; the scheduler never sees rows, strides or checkpoints.
     std::int32_t block_granularity{};
+    // Scheduler-facing (virtual) block count including the null block: the
+    // physical page count of one rank times shard_count, as the Python
+    // contract's virtual_block_counts publishes it.
     std::int32_t total_pages{};
-    // Number of this group's CacheBlocks packed into one physical LCM block.
+    // Scheduler-facing children per LCM block: the physical packing times
+    // shard_count (the contract's virtual_packing). Each of the shard_count
+    // owners holds one physical child for every shard_count virtual ones.
     std::int32_t cache_blocks_per_lcm_block{1};
     Retention retention{Retention::FullHistory};
     std::optional<std::int32_t> sliding_window_tokens{};
     CacheGroupFamily family{CacheGroupFamily::History};
     CacheTransferPolicy transfer_policy{CacheTransferPolicy::Unspecified};
+    // Cyclic owners of this group's virtual blocks; the pool balances new
+    // children across them by request load. 1 keeps the group replicated.
+    std::int32_t shard_count{1};
 
     // A State group keeps one recurrent-state checkpoint per block instead of
     // a token history: the mamba-style group (GDN linear attention, conv

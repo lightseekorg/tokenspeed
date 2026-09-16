@@ -31,14 +31,15 @@ from tokenspeed.runtime.grammar.reasoning_structural_tag import (
 pytest.importorskip("xgrammar")
 
 
-def test_deepseek_v31_reasoning_parser_wraps_json_schema_after_thinking():
+@pytest.mark.parametrize("parser", ["deepseek_v31", "deepseek_v41"])
+def test_deepseek_reasoning_parser_wraps_json_schema_after_thinking(parser):
     schema = {
         "type": "object",
         "properties": {"answer": {"type": "string"}},
         "required": ["answer"],
     }
 
-    structural_tag = structural_tag_for_reasoning_json_schema("deepseek_v31", schema)
+    structural_tag = structural_tag_for_reasoning_json_schema(parser, schema)
 
     assert structural_tag is not None
     payload = json.loads(structural_tag)

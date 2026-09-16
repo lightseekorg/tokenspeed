@@ -11,6 +11,7 @@ recurrent KDA state still gets committed after a DSpark verify.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -58,6 +59,7 @@ class _RecordingV4DSparkModel:
 
 def _v4_dspark_window_shell(lengths: torch.Tensor) -> DeepseekV4DSpark:
     drafter = DeepseekV4DSpark.__new__(DeepseekV4DSpark)
+    drafter._prefill_graph = None
     drafter.input_buffers = SimpleNamespace(
         extend_seq_lens_cpu=lengths,
         input_lengths_buf=_DeviceLengthReadBomb(),
@@ -84,6 +86,30 @@ def _drafter(spec_num_tokens: int = 8, vocab: int = VOCAB) -> DSpark:
 # --------------------------------------------------------------------------
 # DeepSeek V4 prefill window seeding
 # --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("prefill_disabled", [False, True])
+@pytest.mark.parametrize("decode_disabled", [False, True])
+def test_draft_prefill_capture_uses_the_resolved_prefill_gate(
+    monkeypatch, prefill_disabled, decode_disabled
+):
+    from tokenspeed.runtime.execution import model_executor
+
+    monkeypatch.setattr(model_executor, "workspace_pool", Mock())
+    executor = SimpleNamespace(
+        _autotune=Mock(),
+        device="cuda",
+        forward_step=Mock(disable=decode_disabled),
+        prefill_graph=Mock(disable=prefill_disabled),
+        drafter=Mock(),
+    )
+    model_executor.ModelExecutor.capture_graphs(executor)
+    if prefill_disabled:
+        executor.drafter.capture_prefill_graph.assert_not_called()
+    else:
+        executor.drafter.capture_prefill_graph.assert_called_once_with(
+            executor.forward_step.stream
+        )
 
 
 def test_v4_prefill_window_seeding_uses_the_cpu_length_mirror() -> None:
@@ -356,7 +382,7 @@ class _ShardedHead:
 
 def test_the_walk_feeds_each_round_its_own_positions_hoisted_slice() -> None:
     """The whole proposal walk must hand round k the hoisted projection of
-    position k-1, bit-for-bit what projecting that position alone gives."""
+    position k-1, allowing float32 GEMM rounding across batch shapes."""
     torch.manual_seed(11)
     drafter = _drafter()
     weight = torch.randn(VOCAB, HIDDEN)
@@ -385,7 +411,7 @@ def test_the_walk_feeds_each_round_its_own_positions_hoisted_slice() -> None:
     assert len(received) == drafter.spec_num_tokens - 1
     for k, got in enumerate(received, start=1):
         want = hidden[:, k - 1, :].to(weight.dtype) @ weight.T
-        assert torch.equal(got, want)
+        torch.testing.assert_close(got, want)
 
 
 def test_the_block_projection_matches_projecting_each_position() -> None:

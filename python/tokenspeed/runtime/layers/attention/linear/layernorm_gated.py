@@ -28,9 +28,9 @@
 the gate. Inference only (no backward)."""
 
 import torch
-import triton
-import triton.language as tl
 from tokenspeed_kernel.platform import pdl_enabled
+
+from tokenspeed.runtime.utils.triton import tl, triton
 
 
 @triton.heuristics({"HAS_Z": lambda args: args["Z"] is not None})

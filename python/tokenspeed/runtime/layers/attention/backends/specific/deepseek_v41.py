@@ -149,8 +149,8 @@ class V41SWAQueryPlan:
 
 class DeepseekV41AttentionBackend(AttentionBackend):
     # Decode uses fixed-capacity rows and refresh-time history validation.
-    # Arbitrary-chunk/mixed prefill still needs host-side dependency checks.
-    cuda_graph_support = CudaGraphSupport(decode_graph=True, prefill_graph=False)
+    # Breakable prefill keeps attention and its host-side checks eager.
+    cuda_graph_support = CudaGraphSupport(decode_graph=True, prefill_graph=True)
     supports_layer_sliding_window = True
 
     def __init__(self, config: AttnConfig, spec: DeepseekV41Config) -> None:

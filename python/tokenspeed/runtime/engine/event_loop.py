@@ -832,7 +832,7 @@ class EventLoop:
         self._dp_local_info[0, 0] = num_tokens
         self._dp_local_info[0, 1] = batch_size
         self._dp_local_info[0, 2] = int(forward_mode)
-        dist.all_gather_into_tensor(
+        dist.all_gather_single(
             self._dp_global_info,
             self._dp_local_info,
             group=self.world_cpu_group,

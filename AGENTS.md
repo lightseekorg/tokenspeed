@@ -86,6 +86,9 @@ Inside the root `tokenspeed-kernel/` directory:
 
 * All direct tokenspeed-triton imports should happen in `_triton.py` and then
   re-import to other places.
+* Avoid using `triton` directly; use `tokenspeed_triton` instead.
+* Avoid using `torch.compile`; prefer writing the fused kernel directly in
+  Triton.
 * All direct third-party code should be placed in `thirdparty/` and imported
   into `ops/` then registered via `register_kernel`.
 * Prefer CuteDSL for NVIDIA GPU kernels and Triton Gluon for AMD GPU kernels.

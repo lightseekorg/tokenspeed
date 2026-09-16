@@ -44,7 +44,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     COMM_ONESHOT_MAX_BYTES,
     acquire_all_reduce_outputs,
     all_gather,
-    all_gather_into_tensor,
+    all_gather_single,
     all_reduce,
     all_reduce_latent_norm,
     prepare_all_reduce_fusion,
@@ -249,10 +249,8 @@ class Kimi3MoEExecutionPlan:
         mapping,
         moe_backend,
         alt_stream: torch.cuda.Stream | None,
-        *,
-        enforce_eager: bool,
     ) -> "Kimi3MoEExecutionPlan":
-        """Select orchestration without exposing platform policy to the model."""
+        """Select orchestration from the backend, streams, and parallel layout."""
 
         use_native = native_latent_moe_available()
         # Hopper (SM90) has no native FP4 tensor cores and no flashinfer SiTU
@@ -274,10 +272,7 @@ class Kimi3MoEExecutionPlan:
             use_trtllm=use_trtllm,
             use_marlin=use_marlin,
             overlap_shared_experts=(
-                use_native
-                and enforce_eager
-                and alt_stream is not None
-                and mapping.moe.tp_ep_size == 1
+                use_native and alt_stream is not None and mapping.moe.tp_ep_size == 1
             ),
             joint_moe_reduce=(
                 use_native
@@ -509,7 +504,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
                 dtype=local.dtype,
                 device=local.device,
             )
-            all_gather_into_tensor(stacked, local.contiguous(), self.shard_group)
+            all_gather_single(stacked, local.contiguous(), self.shard_group)
             return stacked.permute(1, 0, 2).reshape(num_tokens, self.output_size_full)
         if not self.narrowed or self.column_group is None:
             return local

@@ -119,6 +119,7 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
         pp_inbound=None,
         engram_previous_tokens=torch.full((2, 3), -1, dtype=torch.int64),
         engram_token_mask=torch.ones(2, dtype=torch.bool),
+        image_mask=None,
     )
     assert events == [("layer", i) for i in range(37)] + [
         ("engram", 37),
@@ -200,7 +201,7 @@ def test_draft_checkpoint_strict_shards(monkeypatch, rank):
     config = _draft_config()
     _loader_model(monkeypatch, config, rank, "cpu")
     model = DeepseekV41ForCausalLMDSpark(
-        SimpleNamespace(text_config=config), _mapping(rank, 4, 4), _quant(), "", False
+        SimpleNamespace(text_config=config), _mapping(rank, 4, 4), _quant()
     )
     weights = _draft_checkpoint(model.model)
     model.load_weights(reversed(list(weights.items())))
@@ -260,6 +261,7 @@ def test_window_attention_matches_dense_reference():
         attn_sink=sink,
         softmax_scale=dim**-0.5,
         index_process_group=None,
+        swa_rope_cache=None,
     )
     decoded = _quantized_kv(current).reshape(batch, block, dim)
     expected = torch.empty_like(q).reshape(batch, block, heads, dim)
@@ -289,7 +291,7 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch):
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
     with torch.device("cuda:0"):
         adapter = DeepseekV41ForCausalLMDSpark(
-            SimpleNamespace(text_config=config), _mapping(0, 1, 1), _quant(), "", False
+            SimpleNamespace(text_config=config), _mapping(0, 1, 1), _quant()
         )
     adapter.load_weights(_draft_checkpoint(adapter.model).items())
     with torch.no_grad():
@@ -304,6 +306,7 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch):
             module.quant_method.process_weights_after_loading(module)
         elif isinstance(module, MoELayer):
             module.process_weights_after_loading(module)
+    _assert_prefill_graph_matches_eager(adapter, monkeypatch)
     windows = torch.zeros(3, 3, 128, 512, dtype=torch.bfloat16, device="cuda:0")
     hidden = torch.randn(
         2, 4, 3 * config.hidden_size, dtype=torch.bfloat16, device="cuda:0"
@@ -344,6 +347,72 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch):
             torch.testing.assert_close(captured, expected, rtol=0, atol=0)
             assert torch.isfinite(captured).all()
         graph.reset()
+
+
+@torch.inference_mode()
+def _assert_prefill_graph_matches_eager(adapter, monkeypatch):
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
+
+    ib = InputBuffers(3, 1024, 8, device="cuda:0")
+    drafter = DeepseekV4DSpark(
+        spec_num_tokens=6,
+        spec_num_steps=5,
+        draft_model_runner=SimpleNamespace(
+            model=adapter, mapping=adapter.mapping, device="cuda:0"
+        ),
+        attn_backend=None,
+        token_to_kv_pool=None,
+        runtime_states=None,
+        input_buffers=ib,
+        vocab_size=adapter.model.config.vocab_size,
+    )
+    drafter.capture_prefill_graph(torch.cuda.Stream())
+    graph = drafter._prefill_graph
+    assert graph is not None
+    torch.manual_seed(41)
+    # Full-ring padding must preserve untouched columns, including near the
+    # RoPE limit. Reorder slots, continue chunks and reuse a slot for a new request.
+    cases = (
+        ([15, 1, 0], [0, 126, 0], [2, 5, 1], ["a", "b", "c"]),
+        ([130, 7], [15, 127], [2, 5], ["a", "b"]),
+        ([3, 129, 5], [134, 145, 0], [5, 2, 1], ["b", "a", "c"]),
+        ([1, 127], [131071, 0], [5, 2], ["b", "new"]),
+        ([128], [128], [1], ["c"]),
+    )
+    for lengths, prefixes, slots, request_ids in cases:
+        bs = len(lengths)
+        ib.extend_seq_lens_cpu[:bs] = torch.tensor(lengths, dtype=torch.int32)
+        ib.extend_prefix_lens_cpu[:bs] = torch.tensor(prefixes, dtype=torch.int32)
+        ib.req_pool_indices_buf[:bs] = torch.tensor(slots, device="cuda:0")
+        drafter.prepare_request_state(request_ids, slots, bs)
+        n = sum(lengths)
+        positions = torch.cat(
+            [torch.arange(p, p + length) for p, length in zip(prefixes, lengths)]
+        ).to("cuda:0")
+        ib.positions_buf[:n].copy_(positions)
+        # Trailing decode rows in a mixed batch must not enter prefill seeding.
+        hidden = torch.randn(
+            n + 6, drafter.hidden_width, device="cuda:0", dtype=torch.bfloat16
+        )
+        before = drafter.kv_windows.clone(), drafter.context_lengths.clone()
+        drafter._prefill_graph = None
+        assert drafter._seed_prefill_windows(hidden, bs) == n
+        expected = drafter.kv_windows.clone(), drafter.context_lengths.clone()
+        drafter.kv_windows.copy_(before[0])
+        drafter.context_lengths.copy_(before[1])
+        drafter._prefill_graph = graph
+        # Replay must execute the captured projection/write kernels without
+        # calling the eager model implementation again.
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                drafter.model,
+                "write_context_windows_batched",
+                Mock(side_effect=AssertionError("draft prefill ran eagerly")),
+            )
+            assert drafter._seed_prefill_windows(hidden, bs) == n
+        torch.testing.assert_close(drafter.kv_windows, expected[0], rtol=0, atol=0)
+        torch.testing.assert_close(drafter.context_lengths, expected[1], rtol=0, atol=0)
+        assert drafter._seed_prefill_windows(hidden, 0) == 0
 
 
 @pytest.mark.parametrize("checkpoint_source", ["temporary", "reference"])
@@ -412,6 +481,7 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
     ]
     target, draft = configs
     assert target.hf_config.architectures == ["DeepseekV41ForCausalLM"]
+    assert target.is_multimodal and not draft.is_multimodal
     assert draft.hf_config.architectures == ["DeepseekV41ForCausalLMDSpark"]
     assert draft.hf_text_config.dspark_target_layer_ids == [37, 38, 39]
     assert draft.num_attention_layers == draft.hf_text_config.dspark_num_stages == 3

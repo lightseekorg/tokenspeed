@@ -116,6 +116,9 @@ def test_short_plan_scoring_keeps_ordered_fold_and_honors_workspace_cap(
         max_num_pools=513,
         chunk_pools=8192,
         max_logits_bytes=one_row_cap,
+        score_logits=kpool_select.gluon_dsa_kpool_prefill_logits_gfx950,
+        score_plan_logits=(kpool_select.gluon_dsa_kpool_prefill_plan_logits_gfx950),
+        logical_topk=kpool_select.gluon_dsa_logical_topk_gfx950,
     )
 
     assert result.shape == (tokens, 512)
@@ -187,6 +190,9 @@ def test_no_plan_scoring_uses_table_addressing(monkeypatch: pytest.MonkeyPatch) 
         max_num_pools=513,
         chunk_pools=8192,
         max_logits_bytes=None,
+        score_logits=kpool_select.gluon_dsa_kpool_prefill_logits_gfx950,
+        score_plan_logits=(kpool_select.gluon_dsa_kpool_prefill_plan_logits_gfx950),
+        logical_topk=kpool_select.gluon_dsa_logical_topk_gfx950,
     )
 
     assert result.shape == (1, 512)

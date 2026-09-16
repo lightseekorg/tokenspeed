@@ -908,6 +908,7 @@ def is_generation_model(model_architectures: list[str]):
 
 def is_multimodal_model(model_architectures: list[str] | None):
     multimodal_architectures = {
+        "DeepseekV41ForCausalLM",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen4ExpForConditionalGeneration",

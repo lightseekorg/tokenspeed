@@ -85,6 +85,24 @@ packed weights and block scales in the padded tail are zero-filled, so the
 extra dimensions do not change the MoE result. For example, a 640-wide expert
 under MoE TP4 is padded from 160 to 192 values per rank.
 
+### Kimi-K3 attention DP with MoE EP
+
+When attention DP is greater than one, Kimi-K3 requires
+`attention DP == MoE EP == world size`. Shared experts and latent projections
+are replicated; only the routed experts require dispatch/combine communication.
+
+Select the transport with `--all2all-backend`:
+
+- `none` (default): automatically use FlashInfer on NVIDIA ranks sharing a CUDA
+  fabric, otherwise AG/RS.
+- `agrs`: use reference all-gather dispatch and reduce-scatter combine.
+- `flashinfer`: use FlashInfer MNNVL all-to-all; errors without the required
+  CUDA fabric.
+- `deepep`: unsupported for this K3 path.
+
+Both transports quantize NVFP4 activations before dispatch and transfer their
+block scales alongside the routing IDs and weights. Combine outputs remain BF16.
+
 ### DeepEP all-to-all
 
 `--all2all-backend deepep` moves expert routing off all-gather and onto DeepEP
@@ -117,7 +135,7 @@ The mode is chosen per forward from a value every rank agrees on, because the tw
 modes are different collectives. With DP attention that value is "every DP rank
 is decoding", so one extending rank moves the whole group to the normal legs.
 
-The prefill CUDA graph is disabled whenever an all-to-all backend is selected:
+The prefill CUDA graph is disabled when DeepEP is selected:
 normal-mode dispatch reports its per-expert receive counts to the host, and a
 host sync cannot be captured. Decode graphs are unaffected.
 

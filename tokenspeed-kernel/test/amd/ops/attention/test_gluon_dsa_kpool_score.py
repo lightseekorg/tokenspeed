@@ -18,23 +18,48 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""GFX950 Gluon scoring coverage for GLM pooled index keys."""
+"""AMD Gluon scoring coverage for GLM pooled index keys."""
 
 from __future__ import annotations
 
+from functools import partial
+
 import pytest
 import torch
-from utils import is_cdna4
+from utils import is_cdna4, is_cdna5
 
-if not is_cdna4():
+if not (is_cdna4() or is_cdna5()):
     pytest.skip(
-        "AMD CDNA4 (GFX950) is required for pooled Gluon DSA scorer tests",
+        "AMD CDNA4 or CDNA5 is required for pooled Gluon DSA scorer tests",
         allow_module_level=True,
     )
 
-from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (  # isort: skip
-    gluon_dsa_kpool_prefill_logits_gfx950,
-    gluon_dsa_kpool_prefill_plan_logits_gfx950,
+if is_cdna4():
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (  # isort: skip
+        gluon_dsa_kpool_prefill_logits_gfx950 as _kpool_prefill_logits_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
+        gluon_dsa_kpool_prefill_plan_logits_gfx950 as _kpool_prefill_plan_logits_impl,
+    )
+else:
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (  # isort: skip
+        gluon_dsa_kpool_prefill_logits_gfx1250 as _kpool_prefill_logits_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (
+        gluon_dsa_kpool_prefill_plan_logits_gfx1250 as _kpool_prefill_plan_logits_impl,
+    )
+
+_kpool_prefill_logits = partial(
+    _kpool_prefill_logits_impl,
+    ordered_head_fold=False,
+    out=None,
+    row_ends_out=None,
+)
+_kpool_prefill_plan_logits = partial(
+    _kpool_prefill_plan_logits_impl,
+    ordered_head_fold=False,
+    out=None,
+    row_ends_out=None,
 )
 
 _DEVICE = "cuda"
@@ -214,7 +239,7 @@ def test_kpool_prefill_logits_match_weighted_relu_and_local_window(
     )
     row_ends = torch.full((q.shape[0],), -1, device=_DEVICE, dtype=torch.int32)
 
-    actual, actual_ends = gluon_dsa_kpool_prefill_logits_gfx950(
+    actual, actual_ends = _kpool_prefill_logits(
         q,
         cache,
         weights,
@@ -302,7 +327,7 @@ def test_kpool_plan_logits_match_ragged_physical_slots_and_padded_stride(
     )
     local_ends = torch.full((q.shape[0],), -1, device=_DEVICE, dtype=torch.int32)
 
-    actual, actual_ends = gluon_dsa_kpool_prefill_plan_logits_gfx950(
+    actual, actual_ends = _kpool_prefill_plan_logits(
         q,
         cache,
         weights,
@@ -362,7 +387,7 @@ def test_kpool_ordered_head_fold_matches_sequential_signed_reference() -> None:
     req_ids = torch.zeros((1,), device=_DEVICE, dtype=torch.int32)
     block_table = torch.zeros((1, 1), device=_DEVICE, dtype=torch.int32)
 
-    actual, row_ends = gluon_dsa_kpool_prefill_logits_gfx950(
+    actual, row_ends = _kpool_prefill_logits(
         q,
         cache,
         weights,
@@ -394,7 +419,7 @@ def test_kpool_prefill_logits_empty_page_table_returns_zero_bounds() -> None:
     block_table = torch.empty((1, 0), device=_DEVICE, dtype=torch.int32)
     out = torch.full((3, 512), float("nan"), device=_DEVICE, dtype=torch.float32)
 
-    actual, row_ends = gluon_dsa_kpool_prefill_logits_gfx950(
+    actual, row_ends = _kpool_prefill_logits(
         q,
         cache,
         weights,
@@ -437,7 +462,7 @@ def test_kpool_prefill_logits_preserve_nonfinite_visible_scores(
     req_ids = torch.zeros((1,), device=_DEVICE, dtype=torch.int32)
     block_table = torch.zeros((1, 1), device=_DEVICE, dtype=torch.int32)
 
-    actual, row_ends = gluon_dsa_kpool_prefill_logits_gfx950(
+    actual, row_ends = _kpool_prefill_logits(
         q,
         cache,
         weights,
@@ -460,7 +485,7 @@ def test_kpool_prefill_logits_preserve_nonfinite_visible_scores(
 
 def test_kpool_ordered_head_fold_rejects_non_bool_flag() -> None:
     with pytest.raises(TypeError, match="ordered_head_fold must be bool"):
-        gluon_dsa_kpool_prefill_logits_gfx950(
+        _kpool_prefill_logits(
             None,
             None,
             None,
@@ -492,7 +517,7 @@ def test_kpool_prefill_logits_reject_unsupported_geometry(
     block_table = torch.zeros((1, 1), device=_DEVICE, dtype=torch.int32)
 
     with pytest.raises(ValueError, match=match):
-        gluon_dsa_kpool_prefill_logits_gfx950(
+        _kpool_prefill_logits(
             q,
             cache,
             weights,
