@@ -75,12 +75,12 @@ if _is_amd:
 
     _allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
 elif _platform.is_nvidia:
-    from tokenspeed_kernel.ops.layernorm.cuda import rmsnorm_fused_parallel
-    from tokenspeed_kernel.ops.layernorm.flashinfer import (
+    from tokenspeed_kernel.ops.layernorm import (
         gemma_fused_add_rmsnorm,
         gemma_rmsnorm,
         layernorm,
     )
+    from tokenspeed_kernel.ops.layernorm.cuda import rmsnorm_fused_parallel
 
     _allreduce_residual_rmsnorm = trtllm_allreduce_residual_rmsnorm
 else:

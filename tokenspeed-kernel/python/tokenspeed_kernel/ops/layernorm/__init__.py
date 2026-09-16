@@ -92,6 +92,95 @@ register_kernel_api(
 )
 
 
+def gemma_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    out: torch.Tensor | None = None,
+    enable_pdl: bool | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    kernel = select_kernel(
+        "layernorm",
+        "gemma_rmsnorm",
+        format_signature(x=dense_tensor_format(x.dtype)),
+        traits={},
+        solution=solution,
+    )
+    return kernel(
+        x=x,
+        weight=weight,
+        eps=eps,
+        out=out,
+        enable_pdl=enable_pdl,
+    )
+
+
+register_kernel_api(
+    family="layernorm",
+    mode="gemma_rmsnorm",
+    public_api=gemma_rmsnorm,
+    warmup_config_type=None,
+)
+
+
+def gemma_fused_add_rmsnorm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    enable_pdl: bool | None = None,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    kernel = select_kernel(
+        "layernorm",
+        "gemma_fused_add_rmsnorm",
+        format_signature(x=dense_tensor_format(x.dtype)),
+        traits={},
+        solution=solution,
+    )
+    return kernel(
+        x=x,
+        residual=residual,
+        weight=weight,
+        eps=eps,
+        enable_pdl=enable_pdl,
+    )
+
+
+register_kernel_api(
+    family="layernorm",
+    mode="gemma_fused_add_rmsnorm",
+    public_api=gemma_fused_add_rmsnorm,
+    warmup_config_type=None,
+)
+
+
+def layernorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+    solution: str | None = None,
+) -> torch.Tensor:
+    kernel = select_kernel(
+        "layernorm",
+        "layernorm",
+        format_signature(x=dense_tensor_format(x.dtype)),
+        traits={},
+        solution=solution,
+    )
+    return kernel(x=x, weight=weight, bias=bias, eps=eps)
+
+
+register_kernel_api(
+    family="layernorm",
+    mode="layernorm",
+    public_api=layernorm,
+    warmup_config_type=None,
+)
+
+
 def qk_rmsnorm(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -160,4 +249,12 @@ def grouped_rmsnorm(
     return _grouped_rmsnorm(x, int(group_size), eps, out=out)
 
 
-__all__ = ["grouped_gemma_rmsnorm", "grouped_rmsnorm", "qk_rmsnorm", "rmsnorm"]
+__all__ = [
+    "gemma_fused_add_rmsnorm",
+    "gemma_rmsnorm",
+    "grouped_gemma_rmsnorm",
+    "grouped_rmsnorm",
+    "layernorm",
+    "qk_rmsnorm",
+    "rmsnorm",
+]

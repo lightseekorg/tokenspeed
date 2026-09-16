@@ -74,8 +74,9 @@ if current_platform().is_nvidia:
         from flashinfer import rmsnorm as _rmsnorm
 
         _fused_add_rmsnorm = _with_pdl_default(_fused_add_rmsnorm)
-        gemma_fused_add_rmsnorm = _with_pdl_default(_gemma_fused_add_rmsnorm)
-        gemma_rmsnorm = _with_pdl_default(_gemma_rmsnorm)
+        _gemma_fused_add_rmsnorm = _with_pdl_default(_gemma_fused_add_rmsnorm)
+        _gemma_rmsnorm = _with_pdl_default(_gemma_rmsnorm)
+        _layernorm = layernorm
         _rmsnorm = _with_pdl_default(_rmsnorm)
 
         @register_kernel(
@@ -132,6 +133,78 @@ if current_platform().is_nvidia:
                 raise ValueError("FlashInfer fused_add_rmsnorm does not accept out")
             _fused_add_rmsnorm(x, residual, weight, eps, enable_pdl=enable_pdl)
             return x, residual
+
+        @register_kernel(
+            "layernorm",
+            "gemma_rmsnorm",
+            name="flashinfer_gemma_rmsnorm",
+            solution="flashinfer",
+            capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+            signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
+            traits={},
+            priority=Priority.PERFORMANT + 1,
+            warmup_behavior=WarmupBehavior.JIT_COMPILE,
+        )
+        def gemma_rmsnorm(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            eps: float,
+            out: torch.Tensor | None,
+            enable_pdl: bool | None,
+        ) -> torch.Tensor:
+            return _gemma_rmsnorm(
+                x,
+                weight,
+                eps,
+                out=out,
+                enable_pdl=enable_pdl,
+            )
+
+        @register_kernel(
+            "layernorm",
+            "gemma_fused_add_rmsnorm",
+            name="flashinfer_gemma_fused_add_rmsnorm",
+            solution="flashinfer",
+            capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+            signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
+            traits={},
+            priority=Priority.PERFORMANT + 1,
+            warmup_behavior=WarmupBehavior.JIT_COMPILE,
+        )
+        def gemma_fused_add_rmsnorm(
+            x: torch.Tensor,
+            residual: torch.Tensor,
+            weight: torch.Tensor,
+            eps: float,
+            enable_pdl: bool | None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            _gemma_fused_add_rmsnorm(
+                x,
+                residual,
+                weight,
+                eps,
+                enable_pdl=enable_pdl,
+            )
+            return x, residual
+
+        @register_kernel(
+            "layernorm",
+            "layernorm",
+            name="flashinfer_layernorm",
+            solution="flashinfer",
+            capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+            signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
+            traits={},
+            priority=Priority.PERFORMANT + 1,
+            warmup_behavior=WarmupBehavior.JIT_COMPILE,
+        )
+        def layernorm(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            bias: torch.Tensor,
+            eps: float,
+        ) -> torch.Tensor:
+            return _layernorm(x, weight, bias, eps)
 
     except ImportError:
         pass
