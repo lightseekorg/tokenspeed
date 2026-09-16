@@ -319,13 +319,13 @@ if platform.is_nvidia:
             max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
-        signatures={
+        signatures=frozenset(
             format_signature(
                 a=tensor_format(
                     "nvfp4",
                     torch.uint8,
                     scale=ScaleFormat(
-                        storage_dtype=torch.float8_e4m3fn,
+                        storage_dtype=a_scale_dtype,
                         granularity="block",
                         block_shape=(16,),
                     ),
@@ -334,13 +334,15 @@ if platform.is_nvidia:
                     "nvfp4",
                     torch.uint8,
                     scale=ScaleFormat(
-                        storage_dtype=torch.float8_e4m3fn,
+                        storage_dtype=b_scale_dtype,
                         granularity="block",
                         block_shape=(16,),
                     ),
                 ),
             )
-        },
+            for a_scale_dtype in (torch.float8_e4m3fn, torch.uint8)
+            for b_scale_dtype in (torch.float8_e4m3fn, torch.uint8)
+        ),
         traits={},
         priority=Priority.SPECIALIZED + 2,
         warmup_behavior=WarmupBehavior.FLASHINFER_AUTOTUNE,

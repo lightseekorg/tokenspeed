@@ -26,6 +26,9 @@ from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
 
 bootstrap_profiling_from_env()
 
+for _cached_export in globals().get("_exports", {}):
+    globals().pop(_cached_export, None)
+
 _exports = {
     "NoKernelFoundError": ("tokenspeed_kernel.selection", "NoKernelFoundError"),
     "add3": ("tokenspeed_kernel.ops.activation", "add3"),
