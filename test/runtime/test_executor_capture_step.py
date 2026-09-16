@@ -163,18 +163,31 @@ def test_the_step_names_every_operation_the_constructor_gave_up():
 
 
 def test_the_step_runs_its_operations_in_the_order_the_constructor_did():
-    """Tune, freeze, capture decode, capture prefill; the caller seeds after.
+    """Load or tune, freeze, capture decode, capture prefill; then seed.
 
     Tuning and capture draw from the generator, so the boot path seeds once
-    they are done, exactly where the constructor used to.
+    they are done, exactly where the constructor used to. An explicit warmup
+    bundle replaces live tuning at the same point before workspace freeze.
     """
     step = _function(_tree("model_executor.py"), "capture_graphs")
     sequence = [
         call.func.attr
-        for call in _attribute_calls(step)
+        for call in sorted(_attribute_calls(step), key=lambda call: call.lineno)
         if call.func.attr in _STEP_OPERATIONS
     ]
     assert sequence == ["_autotune", "freeze", "capture", "capture"]
+    bundle_loads = [
+        call.lineno
+        for call in ast.walk(step)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "load_warmup_bundle"
+    ]
+    freezes = [
+        call.lineno for call in _attribute_calls(step) if call.func.attr == "freeze"
+    ]
+    assert len(bundle_loads) == 1
+    assert bundle_loads[0] < min(freezes)
 
     builder = _function(_tree("device.py"), "build_device_side")
     seed = [

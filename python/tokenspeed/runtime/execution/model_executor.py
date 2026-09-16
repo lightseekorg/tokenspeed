@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.tuning import (
     set_autotune_process_group,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.warmup import load_warmup_bundle
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.configs.utils import get_rope_parameters
@@ -179,6 +180,7 @@ class ModelExecutorConfig:
     model_is_mrope: bool
     enable_nan_detection: bool = False
     disable_autotune: bool = False
+    kernel_warmup_bundle: str | None = None
     enable_cudagraph_gc: bool = False
 
     # ====== DP =========
@@ -278,6 +280,7 @@ class ModelExecutorConfig:
             cudagraph_capture_sizes=server_args.cudagraph_capture_sizes,
             disable_cuda_graph_padding=server_args.disable_cuda_graph_padding,
             disable_autotune=server_args.disable_autotune,
+            kernel_warmup_bundle=server_args.kernel_warmup_bundle,
             enable_cudagraph_gc=server_args.enable_cudagraph_gc,
             max_cudagraph_capture_size=server_args.max_cudagraph_capture_size,
             disable_prefill_graph=disable_prefill_graph,
@@ -537,7 +540,18 @@ class ModelExecutor:
         init_cuda_graph_state), so a caller that rebinds between the two
         re-runs those itself.
         """
-        self._autotune()
+        if self.config.kernel_warmup_bundle is None:
+            self._autotune()
+        else:
+            bundle = load_warmup_bundle(
+                self.config.kernel_warmup_bundle,
+                self._autotune_num_tokens(),
+            )
+            logger.info(
+                "Loaded kernel warmup bundle %s with %s FlashInfer profiles",
+                bundle.path,
+                bundle.profile_count,
+            )
 
         workspace_pool(self.device).freeze()
 
@@ -545,6 +559,17 @@ class ModelExecutor:
             self.forward_step.capture()
         if not self.prefill_graph.disable:
             self.prefill_graph.capture(self.forward_step)
+
+    def _autotune_num_tokens(self) -> int:
+        per_rank_max_batch = max(
+            1,
+            int(self.config.max_num_seqs)
+            // max(int(self.config.data_parallel_size), 1),
+        )
+        return min(
+            int(self.config.chunked_prefill_size),
+            int(self.config.context_len) * per_rank_max_batch,
+        )
 
     def _autotune(self) -> None:
         """Profile tunable kernels over one dummy prefill before graph capture.
@@ -562,15 +587,7 @@ class ModelExecutor:
         capture. On distributed boots, per-tactic timings are averaged across
         ranks so every rank selects the same tactic.
         """
-        per_rank_max_batch = max(
-            1,
-            int(self.config.max_num_seqs)
-            // max(int(self.config.data_parallel_size), 1),
-        )
-        num_tokens = min(
-            int(self.config.chunked_prefill_size),
-            int(self.config.context_len) * per_rank_max_batch,
-        )
+        num_tokens = self._autotune_num_tokens()
         if num_tokens <= 0 or self.model_runner is None:
             return
         if self.config.pp_size > 1:

@@ -293,6 +293,7 @@ class ServerArgs:
     enforce_eager: bool = False
     disable_cuda_graph_padding: bool = False
     disable_autotune: bool = False
+    kernel_warmup_bundle: str | None = None
     enable_cudagraph_gc: bool = False
     disable_nccl_nvls: bool = False
     disable_symm_mem: bool = False
@@ -1851,6 +1852,12 @@ class ServerArgs:
             help="Skip the startup kernel-tuning pass; tunable kernels use each "
             "library's heuristic tactics instead. Speeds up startup for "
             "debugging at the cost of serving performance.",
+        )
+        parser.add_argument(
+            "--kernel-warmup-bundle",
+            type=str,
+            default=ServerArgs.kernel_warmup_bundle,
+            help="Load a generated TokenSpeed kernel warmup bundle before CUDA graph capture.",
         )
         parser.add_argument(
             "--enable-cudagraph-gc",
