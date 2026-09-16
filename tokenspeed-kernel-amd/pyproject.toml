@@ -23,3 +23,6 @@ license-files = ["LICENSE", "THIRDPARTYNOTICES"]
 
 [tool.setuptools.packages.find]
 where = ["python"]
+
+[tool.setuptools.package-data]
+"tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4" = ["sched_barrier.ll"]
