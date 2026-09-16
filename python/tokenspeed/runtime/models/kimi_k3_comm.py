@@ -43,7 +43,6 @@ fused-lane one-shot     everything else with a fused plan
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 from enum import IntEnum
 
@@ -129,7 +128,7 @@ class K3MoETailTier(IntEnum):
 
     TAIL_FUSION = 0  # fused decode kernel (aka the multicast latent tail)
     FUSED_RS_UP_AG = 1  # integrated large M: HT + shared-RS/up-projection/AG
-    MEDIUM_FUSED_RS_UP_AG = 2  # opt-in provisional BT + medium fused back half
+    MEDIUM_FUSED_RS_UP_AG = 2  # integrated medium M: BT + fused back half
     MNNVL_BT_DEFERRED = 3  # graph: finalize + balanced-tree AR + RMSNorm
     MNNVL_HT_DEFERRED = 4  # graph: finalize + persistent HT AR + RMSNorm
     MULTIMEM_AR = 5  # in-switch (ld_reduce) reduces, then the replicated tail
@@ -150,27 +149,63 @@ MULTIMEM_AR_MIN_TOKENS = 256
 # Upper edge of the measured window; larger batches take the join's grouped path.
 MULTIMEM_AR_MAX_TOKENS = 8192
 
-# FlashInfer #4358 protocol specializations qualified on TP8 GB300.  These
-# paths are CUDA-Graph-only: eager CuTe DSL dispatch adds roughly 300 us of
-# host enqueue latency, while graph replay retains the kernel-side wins.
-# The complete sharded-tail benchmark qualifies only the explicit production
-# graph buckets below.  Every other M keeps the established tier; no result is
-# extrapolated across the gaps between measured capture sizes.
+# Historical first-stage-only graph policies, retained but not armed by serving.
+# The automatic integrated route uses continuous intervals and supports both
+# eager and graph execution; these old bucket lists do not select its kernels.
 MNNVL_BT_MIN_TOKENS = 256
 MNNVL_BT_MAX_TOKENS = 1024
 MNNVL_HT_MIN_TOKENS = 1280
 MNNVL_HT_MAX_TOKENS = 8192
 MNNVL_BT_QUALIFIED_TOKENS = frozenset((256, 384, 512, 768, 1024))
 MNNVL_HT_QUALIFIED_TOKENS = frozenset((1280, 2048, 4096, 6144, 8192))
-MNNVL_DEFERRED_ENABLE_ENV = "TOKENSPEED_K3_MNNVL_CUTEDSL"
-MNNVL_BT_ONLY_ENABLE_ENV = "TOKENSPEED_K3_MNNVL_BT_ONLY"
-MEDIUM_FUSED_RS_UP_AG_ENABLE_ENV = "TOKENSPEED_K3_MEDIUM_FUSED_RS_UP_AG"
-INTEGRATED_TAIL_ENABLE_ENV = "TOKENSPEED_K3_INTEGRATED_FUSED_TAIL"
 
 
-def _integrated_tail_enabled() -> bool:
-    """Enable both first stages and the continuous-range fused back half."""
-    return os.environ.get(INTEGRATED_TAIL_ENABLE_ENV) == "1"
+def _integrated_tail_applicable(
+    *,
+    mapping,
+    hidden_size: int,
+    latent_size: int,
+    top_k: int,
+    is_blackwell: bool,
+    fused_moe_ar: bool,
+    has_routed_norm: bool,
+    shard_up_projection: bool,
+    experts_supports_deferred_finalize: bool,
+) -> bool:
+    """Select the automatic integrated path from static model/backend traits.
+
+    Args:
+        mapping: MoE TP/EP and attention DP/CP topology.
+        hidden_size: Full shared/residual width.
+        latent_size: Routed latent width before up-projection.
+        top_k: Number of routed experts per token.
+        is_blackwell: Whether this rank uses NVIDIA SM100/SM103.
+        fused_moe_ar: Whether the execution plan supports the routed AR lane.
+        has_routed_norm: Whether routed RMSNorm is present.
+        shard_up_projection: Whether up-projection owns a rank-local weight shard.
+        experts_supports_deferred_finalize: Actual expert-backend output trait.
+
+    Returns:
+        True for the supported K3 TP8/EP1 layout. Rank agreement, communication
+        support and PDL are validated collectively before allocation; failure
+        must not silently select an old in-range tail. Graph capture settings
+        and experimental environment variables never select the implementation.
+    """
+    return (
+        is_blackwell
+        and mapping.moe.tp_size == 8
+        and mapping.moe.ep_size == 1
+        and mapping.moe.tp_ep_size == 8
+        and mapping.attn.dp_size == 1
+        and mapping.attn.cp_size == 1
+        and hidden_size == 7168
+        and latent_size == 3584
+        and top_k == 16
+        and fused_moe_ar
+        and has_routed_norm
+        and shard_up_projection
+        and experts_supports_deferred_finalize
+    )
 
 
 def select_integrated_k3_moe_tail_tier(num_tokens: int) -> K3MoETailTier | None:
@@ -192,29 +227,6 @@ def select_integrated_k3_moe_tail_tier(num_tokens: int) -> K3MoETailTier | None:
     if num_tokens <= 8192:
         return K3MoETailTier.FUSED_RS_UP_AG
     return K3MoETailTier.SEPARATE_REDUCE
-
-
-def _mnnvl_bt_only_enabled() -> bool:
-    """Opt in to the provisional medium bucket policy without enabling HT."""
-    return os.environ.get(MNNVL_BT_ONLY_ENABLE_ENV) == "1"
-
-
-def _medium_fused_rs_up_ag_enabled() -> bool:
-    """Opt in to the unqualified medium back half; BT-only is also required."""
-    return os.environ.get(MEDIUM_FUSED_RS_UP_AG_ENABLE_ENV) == "1"
-
-
-def _medium_flags_valid(bt_only: bool, medium_fused: bool, legacy: bool) -> bool:
-    """Return whether explicit experimental flags have unambiguous scope."""
-    return not (
-        (medium_fused and not bt_only) or ((bt_only or medium_fused) and legacy)
-    )
-
-
-def _mnnvl_deferred_enabled() -> bool:
-    """Whether the qualified experimental K3 CuTe DSL route is opted in."""
-
-    return os.environ.get(MNNVL_DEFERRED_ENABLE_ENV) == "1"
 
 
 def _mnnvl_graph_max_tokens() -> int:
@@ -591,7 +603,8 @@ class K3MoeTailCommState:
         self.allow_mnnvl_deferred = allow_mnnvl_deferred
         self.mnnvl_bt_only = mnnvl_bt_only
         self.allow_medium_fused_rs_up_ag = allow_medium_fused_rs_up_ag
-        self.integrated_tail = _integrated_tail_enabled()
+        # Derived from model/backend traits by K3MoeTailComm, never an opt-in.
+        self.integrated_tail = allow_mnnvl_deferred
         bt_min_tokens = 33 if self.integrated_tail else MNNVL_BT_MIN_TOKENS
         ht_min_tokens = 1025 if self.integrated_tail else MNNVL_HT_MIN_TOKENS
         self.bt_candidate_tokens = (
@@ -614,8 +627,17 @@ class K3MoeTailCommState:
 
         world = dist.get_world_size()
         hidden, latent = hidden_size, latent_size
-        bt_capacity = min(MNNVL_BT_MAX_TOKENS, mnnvl_graph_max_tokens)
-        ht_capacity = min(MNNVL_HT_MAX_TOKENS, mnnvl_graph_max_tokens)
+        # Graph capture is a subset of supported M, not an allocation limit.
+        bt_capacity = (
+            MNNVL_BT_MAX_TOKENS
+            if self.integrated_tail
+            else min(MNNVL_BT_MAX_TOKENS, mnnvl_graph_max_tokens)
+        )
+        ht_capacity = (
+            MNNVL_HT_MAX_TOKENS
+            if self.integrated_tail
+            else min(MNNVL_HT_MAX_TOKENS, mnnvl_graph_max_tokens)
+        )
         fused_capacity = 8192 if self.integrated_tail else 0
         medium_capacity = max(
             (m for m in self.bt_candidate_tokens if m <= mnnvl_graph_max_tokens),
@@ -688,27 +710,16 @@ class K3MoeTailCommState:
             and top_k == 16
             and _mnnvl_tp8_layout(mapping)
         )
-        flags_valid = (
-            _medium_flags_valid(
-                mnnvl_bt_only, allow_medium_fused_rs_up_ag, _mnnvl_deferred_enabled()
+        # Retain historical implementations, but never arm their serving modes.
+        # PDL is a requirement of the unchanged BT/HT kernels, not an opt-out.
+        configuration_valid = (
+            not mnnvl_bt_only
+            and not allow_medium_fused_rs_up_ag
+            and (
+                not self.integrated_tail
+                or not global_server_args_dict.get("disable_pdl", False)
             )
-            # Reject the removed endpoint flag collectively instead of silently
-            # running an unoptimized path with an obsolete launch configuration.
-            and os.environ.get("TOKENSPEED_K3_FUSED_RS_UP_AG") != "1"
         )
-        if self.integrated_tail:
-            flags_valid = (
-                flags_valid
-                and not any(
-                    os.environ.get(flag) == "1"
-                    for flag in (
-                        MNNVL_BT_ONLY_ENABLE_ENV,
-                        MEDIUM_FUSED_RS_UP_AG_ENABLE_ENV,
-                        MNNVL_DEFERRED_ENABLE_ENV,
-                    )
-                )
-                and mnnvl_graph_max_tokens == 8192
-            )
         if (
             allow_latent_tail
             # The fused tail requires tp_ep to span WORLD.
@@ -735,7 +746,7 @@ class K3MoeTailCommState:
                 -int(mnnvl_bt_only),
                 int(allow_medium_fused_rs_up_ag),
                 -int(allow_medium_fused_rs_up_ag),
-                int(flags_valid),
+                int(configuration_valid),
                 int(medium_local),
                 int(self.integrated_tail),
                 -int(self.integrated_tail),
@@ -750,21 +761,19 @@ class K3MoeTailCommState:
             bt_negative_min,
             medium_min,
             medium_negative_min,
-            flags_ok,
+            configuration_ok,
             medium_ok,
         ) = values[5:11]
         if (
-            not flags_ok
+            not configuration_ok
             or bt_min != -bt_negative_min
             or medium_min != -medium_negative_min
             or values[11] != -values[12]
         ):
             raise ValueError(
-                "medium flags must agree across ranks, require BT_ONLY=1 for medium "
-                "fusion, and cannot coexist with the first-stage MNNVL flag; "
-                "integrated mode requires graph max 8192 and no ablation flags. "
-                "TOKENSPEED_K3_FUSED_RS_UP_AG is removed; use "
-                "TOKENSPEED_K3_INTEGRATED_FUSED_TAIL for the integrated path."
+                "K3 tail capabilities must agree across ranks; legacy first-only/"
+                "medium-only serving modes are disabled, and the automatic "
+                "integrated BT/HT path requires PDL"
             )
         multimem_ok, tail_ok, mnnvl_bt_ok, mnnvl_ht_ok, fused_ok = (
             bool(v) for v in values[:5]
@@ -1210,30 +1219,20 @@ class K3MoeTailComm:
             allow_latent_tail=(
                 not execution_plan.use_native and routed_norm is not None
             ),
-            allow_mnnvl_deferred=(
-                (
-                    _mnnvl_deferred_enabled()
-                    or _mnnvl_bt_only_enabled()
-                    or _integrated_tail_enabled()
-                )
-                and execution_plan.fused_moe_ar
-                and _mnnvl_tp8_layout(mapping)
-                and routed_norm is not None
-                and experts_supports_deferred_finalize
-                and self._shard_up_projection
-                and (
-                    _integrated_tail_enabled()
-                    or not global_server_args_dict["enforce_eager"]
-                )
-                and (
-                    _integrated_tail_enabled()
-                    or not global_server_args_dict["disable_prefill_graph"]
-                )
-                and not global_server_args_dict["disable_pdl"]
-                and mnnvl_graph_max_tokens >= MNNVL_BT_MIN_TOKENS
+            allow_mnnvl_deferred=_integrated_tail_applicable(
+                mapping=mapping,
+                hidden_size=hidden_size,
+                latent_size=routed_hidden,
+                top_k=top_k,
+                is_blackwell=current_platform().is_blackwell,
+                fused_moe_ar=execution_plan.fused_moe_ar,
+                has_routed_norm=routed_norm is not None,
+                shard_up_projection=self._shard_up_projection,
+                experts_supports_deferred_finalize=experts_supports_deferred_finalize,
             ),
-            mnnvl_bt_only=_mnnvl_bt_only_enabled(),
-            allow_medium_fused_rs_up_ag=_medium_fused_rs_up_ag_enabled(),
+            # Old implementations stay in source, but are not serving choices.
+            mnnvl_bt_only=False,
+            allow_medium_fused_rs_up_ag=False,
             mnnvl_graph_max_tokens=mnnvl_graph_max_tokens,
         )
         self.mapping = mapping
@@ -1353,6 +1352,8 @@ class K3MoeTailComm:
                     defer_finalize=True,
                     symm_outputs=(None, self.fused_rs_up_ag.input_view(num_tokens)),
                 )
+        # Only small M or unsupported model/backend layouts reach legacy dispatch.
+        # Supported M33..8192 returned above; a missing fused route raises.
         # Graph warmup, capture, and replay must select the same tier.
         tier = select_k3_moe_tail_tier(
             num_tokens=num_tokens,

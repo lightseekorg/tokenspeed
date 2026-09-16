@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Default-off medium profile of the existing live-pointer serving adapter."""
+"""Integrated serving and a retained diagnostic medium-only adapter."""
 
 import torch
 from tokenspeed_kernel.ops.communication.cutedsl_fused_rs_up_projection import (
@@ -44,8 +44,8 @@ from tokenspeed_kernel.ops.communication.mnnvl_cutedsl_symmetric_up_projection i
 class MediumFusedRsUpProjectionServing(FusedRsUpProjectionServingBase):
     """Use the same validation, live operands and two barriers with medium binding.
 
-    This experimental profile is unqualified. The caller must opt in explicitly;
-    an enabled flag is not evidence of correctness or serving performance.
+    This legacy profile is retained for direct kernel tests, not selected by
+    normal serving. The integrated subclass supplies the medium/large policy.
     """
 
     profile = staticmethod(medium_fused_rs_serving_config)
@@ -132,7 +132,7 @@ class IntegratedFusedRsUpProjectionServing(MediumFusedRsUpProjectionServing):
     """One live-pointer execution path with continuous medium/large tuning.
 
     Allocation, publication, masking and completion are inherited unchanged.
-    This acceptance profile does not imply numerical or TTFT qualification.
+    Automatic dispatch does not imply new numerical or TTFT qualification.
     """
 
     profile = staticmethod(integrated_fused_rs_serving_config)

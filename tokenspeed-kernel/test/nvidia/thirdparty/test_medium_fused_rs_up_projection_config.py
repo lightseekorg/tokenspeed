@@ -391,3 +391,132 @@ def test_shared_serving_base_cannot_select_old_endpoint_policy():
         ]
     assert "prepare_fused_rs_up_projection" not in source
     assert "fused_rs_up_projection_config" not in source
+
+
+@pytest.fixture
+def runtime_policy():
+    from enum import IntEnum
+    from types import SimpleNamespace
+
+    path = ROOT.parent / "python/tokenspeed/runtime/models/kimi_k3_comm.py"
+    tree = ast.parse(path.read_text())
+    names = {
+        "K3MoETailTier",
+        "_integrated_tail_applicable",
+        "select_integrated_k3_moe_tail_tier",
+    }
+    nodes = [node for node in tree.body if getattr(node, "name", None) in names]
+    comm = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "K3MoeTailComm"
+    )
+    plan = next(
+        node
+        for node in comm.body
+        if isinstance(node, ast.FunctionDef) and node.name == "plan"
+    )
+
+    def reject_legacy_dispatch(**kwargs):
+        raise AssertionError("supported fused M reached legacy dispatch")
+
+    namespace = {
+        "IntEnum": IntEnum,
+        "torch": SimpleNamespace(Tensor=object),
+        "TailPlan": SimpleNamespace,
+        "select_k3_moe_tail_tier": reject_legacy_dispatch,
+    }
+    exec(
+        compile(ast.Module(body=[*nodes, plan], type_ignores=[]), str(path), "exec"),
+        namespace,
+    )
+    args = dict(
+        mapping=SimpleNamespace(
+            moe=SimpleNamespace(tp_size=8, ep_size=1, tp_ep_size=8),
+            attn=SimpleNamespace(dp_size=1, cp_size=1),
+        ),
+        hidden_size=7168,
+        latent_size=3584,
+        top_k=16,
+        is_blackwell=True,
+        fused_moe_ar=True,
+        has_routed_norm=True,
+        shard_up_projection=True,
+        experts_supports_deferred_finalize=True,
+    )
+    return namespace, args
+
+
+@pytest.mark.parametrize("old_value", ["0", "1"])
+def test_integrated_route_is_automatic_not_an_environment_opt_in(
+    runtime_policy, monkeypatch, old_value
+):
+    for flag in (
+        "TOKENSPEED_K3_INTEGRATED_FUSED_TAIL",
+        "TOKENSPEED_K3_FUSED_RS_UP_AG",
+        "TOKENSPEED_K3_MNNVL_CUTEDSL",
+        "TOKENSPEED_K3_MNNVL_BT_ONLY",
+        "TOKENSPEED_K3_MEDIUM_FUSED_RS_UP_AG",
+    ):
+        monkeypatch.setenv(flag, old_value)
+    namespace, args = runtime_policy
+    assert namespace["_integrated_tail_applicable"](**args)
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("is_blackwell", False),
+        ("hidden_size", 4096),
+        ("latent_size", 4096),
+        ("top_k", 8),
+        ("fused_moe_ar", False),
+        ("has_routed_norm", False),
+        ("shard_up_projection", False),
+        ("experts_supports_deferred_finalize", False),
+    ],
+)
+def test_automatic_route_requires_supported_model_backend(runtime_policy, key, value):
+    namespace, args = runtime_policy
+    args[key] = value
+    assert not namespace["_integrated_tail_applicable"](**args)
+
+
+@pytest.mark.parametrize(
+    "m,tier",
+    [
+        (256, "MEDIUM_FUSED_RS_UP_AG"),
+        (512, "MEDIUM_FUSED_RS_UP_AG"),
+        (1024, "MEDIUM_FUSED_RS_UP_AG"),
+        (1280, "FUSED_RS_UP_AG"),
+        (2048, "FUSED_RS_UP_AG"),
+        (4096, "FUSED_RS_UP_AG"),
+        (8192, "FUSED_RS_UP_AG"),
+        (16384, "SEPARATE_REDUCE"),
+    ],
+)
+def test_automatic_plan_bypasses_legacy_tail(runtime_policy, m, tier):
+    from types import SimpleNamespace
+
+    namespace, _ = runtime_policy
+    raw = object()
+    finalize = SimpleNamespace(supports_num_tokens=lambda tokens: True)
+    owner = SimpleNamespace(
+        state=SimpleNamespace(
+            integrated_tail=True,
+            mnnvl_bt_deferred=finalize,
+            mnnvl_ht_deferred=finalize,
+        ),
+        fused_rs_up_ag=SimpleNamespace(input_view=lambda tokens: raw),
+        _experts_supports_deferred_finalize=True,
+    )
+    result = namespace["plan"](owner, m, None, is_decode=False)
+    assert result.tier is getattr(namespace["K3MoETailTier"], tier)
+    if m <= 8192:
+        assert result.defer_finalize
+        assert result.symm_outputs == (None, raw)
+        owner.fused_rs_up_ag = None
+        with pytest.raises(RuntimeError, match="missing"):
+            namespace["plan"](owner, m, None, is_decode=False)
+    else:
+        assert result.routed_in_fork

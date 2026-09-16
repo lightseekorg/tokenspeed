@@ -126,7 +126,7 @@ class FusedRsUpProjectionServingBase(ABC):
         max_arch_version=ArchVersion(10, 3),
     ),
     priority=Priority.SPECIALIZED,
-    tags={"blackwell", "throughput", "opt_in"},
+    tags={"blackwell", "throughput", "integrated"},
 )
 def cutedsl_fused_rs_up_projection_ag(plan, latent, weight, residual, shared):
     """Execute the fused collective with the caller's live graph operands.

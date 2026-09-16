@@ -1,13 +1,16 @@
 # Integrated K3 MoE tail design
 
-This default-off profile has a completed single-pair serving measurement,
-not replicated performance or full-model numerical qualification.
-`TOKENSPEED_K3_INTEGRATED_FUSED_TAIL=1` enables both first-stage protocols and
-the same fused shared-RS/up-projection/residual/AG device pattern. It is mutually
-exclusive with the historical first-only and medium-only flags.
-The old M4096/M8192-only entry point is removed. Setting its obsolete
-`TOKENSPEED_K3_FUSED_RS_UP_AG` flag is rejected collectively; use
-`TOKENSPEED_K3_INTEGRATED_FUSED_TAIL` for the continuous-range path.
+The integrated path is selected automatically for NVIDIA SM100/SM103 with
+K3's TP8/EP1, attention DP1/CP1, H7168/latent3584/top16 layout, routed RMSNorm,
+sharded up-projection and a deferred-finalize-capable fused-AR expert backend.
+No environment switch enables or disables it. Historical first-only and
+medium-only implementations remain in source, but their serving modes are
+never armed. Old experimental environment variables are no longer read.
+
+The kernel configuration has a completed single-pair serving measurement,
+not replicated performance or full-model numerical qualification. Removing
+the opt-in does not constitute a new serving acceptance result. Comparisons
+use an unchanged main checkout, not a baseline mode inside this implementation.
 
 | Kernel M | First stage | Second stage |
 | --- | --- | --- |
@@ -21,12 +24,19 @@ on its padded M using the existing graph ladder. Eager and graph forwards use
 the same selector and live-pointer launcher, including speculative forwards.
 No optimized-range fallback is permitted after integrated initialization.
 Capability disagreement fails before collective allocation; missing in-range
-plans fail rather than switching to an AllReduce control.
+plans fail rather than switching to an AllReduce control. Required communication
+support, dependencies and PDL must be available once the layout is selected;
+failure is not an opt-out. Unsupported hardware/model/backend layouts retain
+the existing compatibility dispatch.
 
 Both comparison arms explicitly set `--prefill-graph-max-tokens 8192`. The
 original agentic benchmark does not mandate 2048: it omits the option and
 inherits a runtime default. This profile neither changes that default nor the
 benchmark client, workload, request counts, KVStore or speculative settings.
+The BT/HT and fused workspaces cover M through 8192 independently of the graph
+capture limit, including eager-only execution. A smaller or disabled capture
+ladder therefore does not disable the optimization; it only changes which
+forwards replay a graph. This does not enlarge the configured capture ladder.
 
 ## Tuning and memory
 
@@ -68,7 +78,8 @@ Allocate before KV sizing and retain both handles through every graph replay.
 All graph buckets use fixed parity addresses and execute sequentially; outputs
 are transient until the same slot is next written, not per-layer archives.
 Different concurrent model/graph instances require separate storage. The
-historical medium-only profile retains per-layer outputs.
+historical medium-only adapter retains per-layer outputs for direct kernel tests
+but is not constructed by normal serving.
 
 ## Dataflow and arithmetic
 
