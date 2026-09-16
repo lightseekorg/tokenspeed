@@ -51,8 +51,8 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_common import (
 )
 
 _LANES = gl.constexpr(64)
-# Kimi K3 W13 uses a deliberately masked wide-K tile. W2 and other supported
-# shapes retain exact tiles selected by ``_largest_exact_block_kb`` below.
+# Kimi K3 W13 uses a deliberately masked wide-K tile. W2 prefers exact tiles,
+# but retains the 256-byte minimum required by scaled upcast and masks its tail.
 WARP_DECODE_STAGE1_BLOCK_N = 8
 WARP_DECODE_STAGE1_BLOCK_KB = 1024
 WARP_DECODE_STAGE1_NUM_WARPS = 4
@@ -544,7 +544,6 @@ def _stage2_a16w4_warp_gemv_combine(
     shared_input_ptr,
     shared_weight_ptr,
     shared_out_ptr,
-    hidden_dim,
     intermediate_dim,
     stride_ipm,
     stride_ipk,
@@ -1283,9 +1282,12 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
     stage2_block_kb = (
         WARP_DECODE_TP_STAGE2_BLOCK_KB
         if tp_local
-        else _largest_exact_block_kb(
-            packed_intermediate,
-            WARP_DECODE_STAGE2_BLOCK_KB,
+        else max(
+            256,
+            _largest_exact_block_kb(
+                packed_intermediate,
+                WARP_DECODE_STAGE2_BLOCK_KB,
+            ),
         )
     )
     # The M=1 joint path remains faster with eight waves.
@@ -1340,7 +1342,6 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         out if shared_input is None else shared_input,
         out if shared_weight is None else shared_weight,
         shared_out,
-        hidden_dim,
         intermediate_dim,
         inter.stride(0),
         inter.stride(1),

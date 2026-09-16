@@ -258,9 +258,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 kimi_k3.Kimi3MoEExecutionPlan, "build", return_value=plan
             ),
             mock.patch.object(
-                kimi_k3, "situ_moe_unavailable_reason", return_value=None
-            ),
-            mock.patch.object(
                 kimi_k3, "load_packaged_flashinfer_tuning_cache", lambda *a, **kw: None
             ),
             mock.patch.object(
@@ -574,7 +571,10 @@ class KimiK3RegistrationTests(unittest.TestCase):
         from tokenspeed.runtime.models import kimi_k3
 
         def mapping_for(tp_ep_size):
-            return SimpleNamespace(moe=SimpleNamespace(tp_ep_size=tp_ep_size))
+            return SimpleNamespace(
+                attn=SimpleNamespace(dp_size=1),
+                moe=SimpleNamespace(tp_ep_size=tp_ep_size),
+            )
 
         on_nvidia = torch.version.hip is None
         self.assertEqual(
@@ -612,7 +612,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
         layer = KimiLinearMoE.__new__(KimiLinearMoE)
         torch.nn.Module.__init__(layer)
         layer.execution_plan = SimpleNamespace(use_trtllm=True)
-        layer._gather_dp_tokens_for_moe = False
         layer.experts = SimpleNamespace(
             support_routing=True,
             supports_precomputed_topk=True,
@@ -695,12 +694,13 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 self.tp_group = kwargs["tp_group"]
 
         mapping = SimpleNamespace(
+            attn=SimpleNamespace(dp_size=1),
             moe=SimpleNamespace(
                 tp_ep_rank=0,
                 tp_ep_size=8,
                 has_tp_ep=True,
                 tp_ep_group=tuple(range(8)),
-            )
+            ),
         )
         activated = torch.empty(2, 768, dtype=torch.bfloat16)
         down_out = torch.empty(2, 7168, dtype=torch.bfloat16)
@@ -1146,7 +1146,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             side_effect=AssertionError("zero tokens must bypass the fused pipeline")
         )
         layer = SimpleNamespace(
-            _gather_dp_tokens_for_moe=False,
+            mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=1)),
             native_latent_moe=native_latent_moe,
             _use_fused_decode_pipeline=True,
             _forward_fused_decode_pipeline=fused_pipeline,
@@ -1169,47 +1169,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
             max_num_tokens_per_gpu=0,
             prefix_sum=prefix_sum,
         )
-
-    def test_cross_dp_ep_gather_uses_dp_group_and_returns_local_offset(self):
-        from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
-
-        layer = KimiLinearMoE.__new__(KimiLinearMoE)
-        layer.mapping = SimpleNamespace(
-            attn=SimpleNamespace(
-                tp_size=8,
-                cp_size=1,
-                dp_size=4,
-                dp_rank=2,
-                dp_group=(2, 10, 18, 26),
-            )
-        )
-        ctx = SimpleNamespace(
-            collective_global_num_tokens=None,
-            global_num_tokens=[3] * 8 + [5] * 8 + [7] * 8 + [11] * 8,
-        )
-        hidden = torch.arange(14, dtype=torch.float32).reshape(7, 2)
-        prefix = hidden + 100
-        gathered = []
-
-        def gather(tensor, group, scattered_num_tokens):
-            gathered.append((tensor, group, scattered_num_tokens))
-            return torch.cat((tensor, tensor), dim=0)
-
-        with mock.patch(
-            "tokenspeed.runtime.models.kimi_k3.token_all_gather", side_effect=gather
-        ):
-            gathered_hidden, gathered_prefix, total, offset = layer._gather_dp_tokens(
-                hidden, prefix, ctx
-            )
-
-        self.assertEqual(total, 26)
-        self.assertEqual(offset, 8)
-        self.assertEqual(len(gathered), 2)
-        for _, group, counts in gathered:
-            self.assertEqual(group, (2, 10, 18, 26))
-            self.assertEqual(counts, [3, 5, 7, 11])
-        torch.testing.assert_close(gathered_hidden, torch.cat((hidden, hidden)))
-        torch.testing.assert_close(gathered_prefix, torch.cat((prefix, prefix)))
 
     def test_mla_gate_projection_uses_api_selected_layout(self):
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention

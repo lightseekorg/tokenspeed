@@ -46,8 +46,9 @@ class RoutingMethodType(IntEnum):
 class All2AllBackend(Enum):
 
     NONE = "none"
+    AGRS = "agrs"
     DEEPEP = "deepep"
-    FLASHINFER_NVLINK_ONE_SIDED = "flashinfer_nvlink_one_sided"
+    FLASHINFER = "flashinfer"
 
     @classmethod
     def _missing_(cls, value):
@@ -63,9 +64,6 @@ class All2AllBackend(Enum):
 
     def is_deepep(self):
         return self == All2AllBackend.DEEPEP
-
-    def is_flashinfer_nvlink_one_sided(self):
-        return self == All2AllBackend.FLASHINFER_NVLINK_ONE_SIDED
 
 
 class MoeBackend(Enum):

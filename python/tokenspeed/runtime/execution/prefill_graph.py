@@ -377,11 +377,19 @@ class PrefillGraph:
             positions = ib.mrope_positions_buf[:, :num_tokens]
         else:
             positions = ib.positions_buf[:num_tokens]
+        input_ids = ib.input_ids_buf[:num_tokens]
+        model_kwargs = {
+            "input_embeds": self._input_embeds_buf[:num_tokens],
+            **ib.ngram_model_kwargs(num_tokens),
+        }
+        prepare_kwargs = getattr(self.text_model, "prepare_model_kwargs", None)
+        if prepare_kwargs is not None:
+            model_kwargs = prepare_kwargs(self._ctx, input_ids, model_kwargs)
         return self.inner_model(
-            ib.input_ids_buf[:num_tokens],
+            input_ids,
             positions,
             self._ctx,
-            input_embeds=self._input_embeds_buf[:num_tokens],
+            **model_kwargs,
         )
 
     def _land_input_embeds(self, embeds: torch.Tensor, bucket: int) -> None:
@@ -544,6 +552,9 @@ class PrefillGraph:
                 cache_metadata.tables(active_forward_op=dummy_forward_op)
             )
             extra_metadata_kwargs["block_tables"] = group_tables
+            extra_metadata_kwargs["block_tables_cpu"] = dict(
+                cache_metadata.tables_cpu(active_forward_op=dummy_forward_op)
+            )
         self.attn_backend.init_forward_metadata(
             bs=bs,
             num_extends=bs,

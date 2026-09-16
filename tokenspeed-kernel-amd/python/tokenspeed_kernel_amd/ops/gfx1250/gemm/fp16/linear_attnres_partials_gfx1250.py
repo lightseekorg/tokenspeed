@@ -54,7 +54,6 @@ def _linear_attnres_partials_kernel(
     block_stride,
     eps,
     attnres_program_offset: gl.constexpr,
-    output_size: gl.constexpr,
 ):
     """Run shared-weight projection CTAs and one dual-AttnRes CTA per token."""
     pid = gl.program_id(0)
@@ -248,7 +247,6 @@ def gluon_linear_attnres_partials_gfx1250(
         blocks.stride(0),
         float(eps),
         projection_programs,
-        output_size,
         num_warps=_NUM_WARPS,
         num_stages=1,
         waves_per_eu=1,

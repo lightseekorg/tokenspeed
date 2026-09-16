@@ -26,9 +26,9 @@ from typing import Any, Literal, NamedTuple, Protocol, runtime_checkable
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk, moe_softmax_topk
+from tokenspeed_kernel.ops.moe.sigmoid_topk import minimax_biased_grouped_topk
 from tokenspeed_kernel.ops.moe.triton.inkling_topk import inkling_topk
 from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flash
-from tokenspeed_kernel.thirdparty.triton import minimax_biased_grouped_topk
 
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder,
@@ -301,11 +301,11 @@ class TopKConfig:
 
 
 class StandardTopKOutput(NamedTuple):
-    """Standard top-k output format."""
+    """Precomputed routing; logits may be omitted once IDs and weights suffice."""
 
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
-    router_logits: torch.Tensor
+    router_logits: torch.Tensor | None
 
     @property
     def format(self) -> TopKOutputFormat:

@@ -47,7 +47,7 @@ server:
     --sampling-backend greedy
     --disable-kvstore
     --kvstore-ratio 0.0
-    --no-enable-prefix-caching
+    --disable-prefix-caching
     --host 127.0.0.1
     --port 21000
     --policy round_robin
@@ -59,7 +59,7 @@ server:
     interval: 10
 perf:
   install:
-    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]==1.11.1'
   # EvalScope loads remote tokenizer paths through ModelScope even when the
   # dataset source is Hugging Face, so materialize the HF tokenizer locally.
   command: >-

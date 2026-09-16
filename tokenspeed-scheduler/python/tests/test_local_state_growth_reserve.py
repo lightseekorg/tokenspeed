@@ -142,8 +142,8 @@ def _run_closed_loop(scheduler, rids: list[str]) -> dict:
         "finished": finished,
         "waiting": scheduler.waiting_size(),
         "decoding": scheduler.decoding_size(),
-        "available": scheduler.available_kv_pages(),
-        "active": scheduler.active_kv_pages(),
+        "available": scheduler.available_lcm_blocks(),
+        "active": scheduler.active_lcm_blocks(),
     }
 
 

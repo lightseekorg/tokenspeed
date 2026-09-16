@@ -116,9 +116,11 @@ def _sparse_prefill_kernel(
 
     for selected_offset in tl.range(0, selected_count):
         block = tl.load(selected_ptr + selected_offset * stride_t_k).to(tl.int32)
-        page = tl.load(block_table_row + block).to(tl.int64)
+        # The indexer pads unselectable slots with -1; skip them instead of
+        # indexing the page table with a negative block.
+        page = tl.load(block_table_row + tl.maximum(block, 0)).to(tl.int64)
         key_positions = block * BLOCK_K + key_offsets
-        key_mask = key_positions <= query_position
+        key_mask = (key_positions <= query_position) & (block >= 0)
         key = tl.load(
             key_cache
             + page * stride_k_page
@@ -138,8 +140,10 @@ def _sparse_prefill_kernel(
         )
         block_max = tl.max(logits, axis=1)
         new_max = tl.maximum(max_score, block_max)
-        probabilities = tl.exp2(logits - new_max[:, None])
-        correction = tl.exp2(max_score - new_max)
+        # A fully masked block leaves new_max at -inf; exp2(-inf - -inf) is NaN.
+        safe_max = tl.where(new_max == -float("inf"), 0.0, new_max)
+        probabilities = tl.exp2(logits - safe_max[:, None])
+        correction = tl.exp2(max_score - safe_max)
         accumulator *= correction[:, None]
         normalizer = normalizer * correction + tl.sum(probabilities, axis=1)
         value = tl.load(
@@ -260,9 +264,11 @@ def _sparse_decode_kernel(
 
     for selected_offset in tl.range(selected_start, selected_end):
         block = tl.load(selected_ptr + selected_offset * stride_t_k).to(tl.int32)
-        page = tl.load(block_table_row + block).to(tl.int64)
+        # The indexer pads unselectable slots with -1; skip them instead of
+        # indexing the page table with a negative block.
+        page = tl.load(block_table_row + tl.maximum(block, 0)).to(tl.int64)
         key_positions = block * BLOCK_K + key_offsets
-        key_mask = key_positions <= query_position
+        key_mask = (key_positions <= query_position) & (block >= 0)
         key = tl.load(
             key_cache
             + page * stride_k_page
@@ -282,9 +288,11 @@ def _sparse_decode_kernel(
         )
         block_max = tl.max(logits, axis=1)
         new_max = tl.maximum(max_score, block_max)
-        probabilities = tl.exp2(logits - new_max[:, None])
+        # A fully masked block leaves new_max at -inf; exp2(-inf - -inf) is NaN.
+        safe_max = tl.where(new_max == -float("inf"), 0.0, new_max)
+        probabilities = tl.exp2(logits - safe_max[:, None])
         block_sum = tl.sum(probabilities, axis=1)
-        accumulator *= tl.exp2(max_score - new_max)[:, None]
+        accumulator *= tl.exp2(max_score - safe_max)[:, None]
         value = tl.load(
             value_cache
             + page * stride_v_page
@@ -297,7 +305,7 @@ def _sparse_decode_kernel(
         if USE_FP8:
             value = (value.to(tl.float32) * v_descale).to(q.dtype)
         accumulator += tl.dot(probabilities.to(value.dtype), value)
-        lse = new_max + tl.log2(tl.exp2(lse - new_max) + block_sum)
+        lse = safe_max + tl.log2(tl.exp2(lse - safe_max) + block_sum)
         max_score = new_max
 
     normalization = tl.where(

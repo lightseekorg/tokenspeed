@@ -309,7 +309,6 @@ def test_kimi3_moe_execution_policy_is_selected_outside_model() -> None:
             mapping,
             backend,
             alt_stream=None,
-            enforce_eager=False,
         )
 
     assert plan.use_native
@@ -352,7 +351,6 @@ def test_kimi3_moe_execution_policy_preserves_nvidia_trtllm() -> None:
             mapping,
             backend,
             alt_stream=None,
-            enforce_eager=False,
         )
 
     assert not plan.use_native
@@ -387,7 +385,7 @@ def test_kimi3_moe_execution_policy_honours_a_forced_marlin_backend() -> None:
         latent_module, "native_latent_moe_available", return_value=False
     ):
         plan = Kimi3MoEExecutionPlan.build(
-            _plan_mapping(), _backend(marlin=True), alt_stream=None, enforce_eager=False
+            _plan_mapping(), _backend(marlin=True), alt_stream=None
         )
 
     assert plan.use_marlin
@@ -404,7 +402,7 @@ def test_kimi3_moe_execution_policy_takes_marlin_when_its_probe_says_yes() -> No
         mock.patch.object(latent_module, "_marlin_moe_available", return_value=True),
     ):
         plan = Kimi3MoEExecutionPlan.build(
-            _plan_mapping(), _backend(auto=True), alt_stream=None, enforce_eager=False
+            _plan_mapping(), _backend(auto=True), alt_stream=None
         )
 
     assert plan.use_marlin
@@ -835,7 +833,7 @@ def test_kimi3_latent_projection_shard_forward_add3_matches_replicated(
             for r in range(world):
                 output[r] = stripe(r)
 
-        monkeypatch.setattr(latent_module, "all_gather_into_tensor", gather_all)
+        monkeypatch.setattr(latent_module, "all_gather_single", gather_all)
         # The up projection must not follow the column band onto the backend's
         # own gather; that path is unmeasured for this width and rendezvouses
         # a second workspace.

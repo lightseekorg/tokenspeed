@@ -242,7 +242,7 @@ if current_platform().is_amd:
     def gluon_mla_decode_fp8xfp8_gfx950_bh16bn128(*args, **kwargs):
         return _mla_decode_fp8xfp8_impl(*args, **kwargs)
 
-    register_kernel(
+    @register_kernel(
         "attention",
         "mla_decode_projected_value",
         name="gluon_mla_decode_projected_value_gfx950",
@@ -280,9 +280,11 @@ if current_platform().is_amd:
             "gate_kind": frozenset({"none", "sigmoid"}),
             "support_logit_cap": frozenset({False}),
         },
-    )(_mla_decode_projected_value_impl)
+    )
+    def gluon_mla_decode_projected_value_gfx950(*args, **kwargs):
+        return _mla_decode_projected_value_impl(*args, **kwargs)
 
-    register_kernel(
+    @register_kernel(
         "attention",
         "mla_project_value",
         name="gluon_mla_project_value_gfx950",
@@ -310,9 +312,11 @@ if current_platform().is_amd:
             "gate_kind": frozenset({"none", "sigmoid"}),
             "inputs_contiguous": frozenset({True}),
         },
-    )(_mla_project_value_impl)
+    )
+    def gluon_mla_project_value_gfx950(*args, **kwargs):
+        return _mla_project_value_impl(*args, **kwargs)
 
-    register_kernel(
+    @register_kernel(
         "attention",
         "mla_normalize_project_query",
         name="gluon_mla_normalize_project_query_gfx950",
@@ -351,9 +355,11 @@ if current_platform().is_amd:
             "inputs_contiguous": frozenset({True}),
             "outputs_inner_contiguous": frozenset({True}),
         },
-    )(_mla_normalize_project_query_impl)
+    )
+    def gluon_mla_normalize_project_query_gfx950(*args, **kwargs):
+        return _mla_normalize_project_query_impl(*args, **kwargs)
 
-    register_kernel(
+    @register_kernel(
         "attention",
         "mla_normalize_project_query",
         name="gluon_mla_normalize_project_query_gfx1250",
@@ -392,7 +398,9 @@ if current_platform().is_amd:
             "inputs_contiguous": frozenset({True}),
             "outputs_inner_contiguous": frozenset({True}),
         },
-    )(_mla_normalize_project_query_gfx1250_impl)
+    )
+    def gluon_mla_normalize_project_query_gfx1250(*args, **kwargs):
+        return _mla_normalize_project_query_gfx1250_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",
@@ -458,7 +466,7 @@ if current_platform().is_amd:
     def gluon_mla_decode_gfx1250(*args, **kwargs):
         return _mla_decode_gfx1250_impl(*args, **kwargs)
 
-    register_kernel(
+    @register_kernel(
         "attention",
         "mla_decode_projected_value",
         name="gluon_mla_decode_projected_value_gfx1250",
@@ -496,9 +504,11 @@ if current_platform().is_amd:
             "gate_kind": frozenset({"none", "sigmoid"}),
             "support_logit_cap": frozenset({False}),
         },
-    )(_mla_decode_projected_value_gfx1250_impl)
+    )
+    def gluon_mla_decode_projected_value_gfx1250(*args, **kwargs):
+        return _mla_decode_projected_value_gfx1250_impl(*args, **kwargs)
 
-    register_kernel(
+    @register_kernel(
         "attention",
         "mla_project_value",
         name="gluon_mla_project_value_gfx1250",
@@ -526,7 +536,9 @@ if current_platform().is_amd:
             "gate_kind": frozenset({"none", "sigmoid"}),
             "inputs_contiguous": frozenset({True}),
         },
-    )(_mla_project_value_gfx1250_impl)
+    )
+    def gluon_mla_project_value_gfx1250(*args, **kwargs):
+        return _mla_project_value_gfx1250_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",

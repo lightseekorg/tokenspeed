@@ -64,25 +64,18 @@ _chunk_gated_delta_rule = error_fn
 _gated_delta_rule_decode_pretranspose = error_fn
 _gated_delta_rule_mtp = error_fn
 _gated_delta_rule_bf16_mtp = None
-_has_gdn_decode = False
 
 if platform.is_hopper_plus:
-    try:
-        from tokenspeed_kernel.thirdparty.flashinfer import gdn as _flashinfer_gdn
-    except ImportError:
-        pass
-    else:
-        if _flashinfer_gdn.HAS_PREFILL:
-            _chunk_gated_delta_rule = _flashinfer_gdn.chunk_gated_delta_rule
-        _has_gdn_decode = _flashinfer_gdn.HAS_DECODE
-        _gated_delta_rule_decode_pretranspose = (
-            _flashinfer_gdn.gated_delta_rule_decode_pretranspose
-        )
-        _gated_delta_rule_mtp = _flashinfer_gdn.gated_delta_rule_mtp
-        # BF16 MTP exposes intermediate-state/scatter arguments absent from
-        # the single-token entry point, and remains independently optional.
-        if _flashinfer_gdn.HAS_BF16_MTP:
-            _gated_delta_rule_bf16_mtp = _flashinfer_gdn.gated_delta_rule_bf16_mtp
+    from tokenspeed_kernel.ops.attention.gdn._flashinfer import (
+        adapter as _flashinfer_gdn,
+    )
+
+    _chunk_gated_delta_rule = _flashinfer_gdn.chunk_gated_delta_rule
+    _gated_delta_rule_decode_pretranspose = (
+        _flashinfer_gdn.gated_delta_rule_decode_pretranspose
+    )
+    _gated_delta_rule_mtp = _flashinfer_gdn.gated_delta_rule_mtp
+    _gated_delta_rule_bf16_mtp = _flashinfer_gdn.gated_delta_rule_bf16_mtp
 
 
 def is_available() -> bool:
@@ -92,11 +85,7 @@ def is_available() -> bool:
     # Blackwell path (sm100 B200/GB200, sm103 B300), gated on CUDA>=13 and the
     # prefill kernel being present; it raises NotImplementedError otherwise.
     # Mirror that here so the caller does not commit to a crashing fast-path.
-    return (
-        _chunk_gated_delta_rule is not error_fn
-        and platform.is_hopper_plus
-        and cuda_major >= 13
-    )
+    return platform.is_blackwell and cuda_major >= 13
 
 
 def is_supported(
@@ -116,7 +105,7 @@ def is_supported(
 
 def is_decode_available() -> bool:
     """Whether the SM90+ GDN decode/MTP kernels can run on this platform."""
-    return _has_gdn_decode and platform.is_hopper_plus
+    return platform.is_hopper_plus
 
 
 def is_decode_supported(head_dim: int, dtype: torch.dtype) -> bool:
@@ -135,7 +124,7 @@ def is_decode_supported(head_dim: int, dtype: torch.dtype) -> bool:
 
 CHUNK_SIZE = 64
 
-gdn_chunk_prefill = error_fn
+flashinfer_gdn_chunk_prefill = error_fn
 
 if is_available():
 
@@ -145,7 +134,7 @@ if is_available():
         name="flashinfer_gdn_chunk_prefill",
         solution="flashinfer",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 0),
+            min_arch_version=ArchVersion(10, 0),
             max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
@@ -161,7 +150,7 @@ if is_available():
         },
         tags={"hopper", "blackwell", "latency"},
     )
-    def gdn_chunk_prefill(
+    def flashinfer_gdn_chunk_prefill(
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -287,8 +276,8 @@ if is_available():
 # GDN decode / MTP (K-last, SM90+)
 # ===-----------------------------------------------------------------------===#
 
-gdn_decode_step = error_fn
-gdn_decode_mtp = error_fn
+flashinfer_gdn_decode_step = error_fn
+flashinfer_gdn_decode_mtp = error_fn
 
 if is_decode_available():
 
@@ -310,7 +299,7 @@ if is_decode_available():
         },
         tags={"hopper", "latency"},
     )
-    def gdn_decode_step(
+    def flashinfer_gdn_decode_step(
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -379,7 +368,7 @@ if is_decode_available():
         },
         tags={"hopper", "latency", "speculative-decoding"},
     )
-    def gdn_decode_mtp(
+    def flashinfer_gdn_decode_mtp(
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -437,8 +426,7 @@ if is_decode_available():
         K_dim = q.shape[-1]
         V_dim = v.shape[-1]
         use_bf16_state = (
-            _gated_delta_rule_bf16_mtp is not None
-            and initial_state.dtype == torch.bfloat16
+            initial_state.dtype == torch.bfloat16
             and K_dim == SUPPORTED_HEAD_DIM
             and V_dim == SUPPORTED_HEAD_DIM
         )

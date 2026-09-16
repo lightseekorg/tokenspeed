@@ -36,7 +36,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 _IS_NVIDIA = current_platform().is_nvidia
 
 if _IS_NVIDIA:
-    from tokenspeed_kernel.thirdparty.flashinfer.qsa_sparse import (
+    from tokenspeed_kernel.ops.attention.qsa._flashinfer.runner import (
         get_flashinfer_qsa_sparse_runner,
     )
 

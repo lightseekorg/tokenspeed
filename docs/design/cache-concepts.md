@@ -86,6 +86,37 @@ A fourth quantity lives outside the logical world entirely:
   KV-cache-based attention (as paged KV entries) and by state-based attention
   (as a state slot). The view is defined by the consumer, not by the block.
 
+`BlockPool` owns the physical placement indexes: the FIFO of empty LCM blocks,
+the free child-slot count for each cache group, and per-bucket ordered sets of
+partially filled LCM blocks. C++ group ids are dense scheduler indices, so
+the scheduler supplies the complete packing vector when it constructs each
+pool. The per-group placement records form a vector indexed by group id, and
+each `GroupAvailability` stores immutable slots-per-parent geometry. The
+coordinator registers each group's shard count before allocation; an ordinary
+standalone pool fixes a single bucket on first use. Registration cannot change
+the geometry after it is fixed, including after all blocks are freed. The pool
+updates its free-slot count and bucket indexes together on every occupancy
+transition. A parent with zero occupants is unbound, so its capacity
+belongs to the global empty-parent FIFO rather than any group.
+
+The pool knows which child slots are occupied, never who holds them. Whether a
+child is pinned by a request table, published by a prefix-cache entry, or held
+by an in-flight transfer is a `CacheBlockRef` ownership fact that lives with
+the holders; the pool does not track it, and `CacheBlockRef` does not report
+it. Anything that needs "held only by the cache" asks `PrefixCacheIndex`
+(`ParentIsFullyEvictable`), which is a scan and is therefore reserved for
+eviction policy and leak checks, not for per-step accounting.
+
+Admission first checks the indexed free-slot and empty-parent counts. If the
+request fits, it does not enumerate eviction candidates. Under memory pressure,
+it enumerates candidates and keeps shadow occupancy only for the parents whose
+children it tentatively evicts. This makes the common zero-eviction path scale
+with cache groups and request demand rather than total cache capacity.
+
+The per-step page gauge composes two O(1)-or-cheaper quantities the same way:
+empty parents come from the pool, active parents from the live requests' block
+tables, and cache-only residency is the remainder `total - empty - active`.
+
 ## Who is allowed to see what
 
 ### C++ scheduler: schedules in logical units
@@ -150,6 +181,11 @@ request's table covers tokens
 entry *values*, however, are **`CacheBlock` ids** — handles to the physical
 storage the cache layer allocated. The scheduler owns allocation, so its output names that storage directly.
 Consumers outside the cache layer treat the ids as opaque.
+
+With DCP virtual-block placement, `CacheBatchMetadata` validates exported IDs
+against each group's **virtual** block count. The physical page count bounds
+local arena storage only; applying it to the scheduler table would reject valid
+remote-owner IDs before the runtime can translate them.
 
 #### Snapshot-state prefill checkpoints
 
@@ -276,6 +312,15 @@ later attention-buffer accessor is too late: the side-cache kernels would
 already be racing the asynchronous H2D restore. Place the fence immediately
 before the first cache-field access so independent projections can still
 overlap the load.
+
+A batched post-verification commit is the one side-cache writer that issues no
+fence of its own. It moves every bound layer's fields in a single launch, so it
+cannot fence per layer, and it relies on two invariants instead: it runs after
+the whole model forward, by which point every bound layer has already fenced
+this step in its own forward, and under pipeline parallelism only the layers
+this rank forwards are bound to it. Moving such a commit earlier than the end of
+the forward, or binding layers the rank does not forward, breaks the fence
+guarantee without any call site visibly dropping a wait.
 
 The Host-transfer workspace resolves transport capability for its buffer
 binding before publishing consumer waits. NVIDIA mapped-Host transfers can
@@ -405,7 +450,10 @@ Perception rules per directory:
   `CacheBlock` index, extracted from the old `GroupAllocator`. It owns
   register/lookup/evict/pin (`Register`, `RegisterFullBlocks`, `Contains`,
   `Find`, `Evict`, `AcquireMatched`, eviction metadata). Indices are
-  pool-scoped: one index serves both the Device and Host tiers of its group.
+  pool-scoped: one index serves both the Device and Host tiers of its group. A
+  cache entry is metadata plus an owning `CacheBlockRef` that publishes an
+  existing block for reuse; registration neither allocates nor copies physical
+  storage.
 * **`PrefixMatcher`** (`prefix_matcher.h`) — the per-attention-kind match
   policy, extracted from the old manager subclasses. `FullAttnMatcher` walks
   left-to-right until the first miss (prefix-closed); `SwaMatcher` scans
@@ -438,7 +486,12 @@ The conversion is `GroupGeometry` in the coordinator layer:
 
 Where reclaim needs to know whether a block is still cached, it takes the
 group's `PrefixCacheIndex` as an explicit read-only parameter — the
-dependency is visible in the signature, not hidden in shared state.
+dependency is visible in the signature, not hidden in shared state. The
+reverse direction is symmetric: publishing a table's completed blocks may
+replace one with the key's existing canonical block, and that write goes
+through a mutable window the allocator hands out
+(`GroupAllocator::BlocksToPublish`) to `PrefixCacheIndex::RegisterFullBlocks`.
+The index never sees a `BlockTable`; the allocator remains its only mutator.
 
 ## The coordinator layer (`csrc/cache/coordinator/`)
 
@@ -494,7 +547,11 @@ Its responsibilities:
   ranking retraction (preemption) victims.
 * **Mutation reporting.** `SetCacheMutationSink` reports per-group cache
   insertions/removals; the scheduler folds them into one externally visible
-  prefix event.
+  prefix event. Whether a scheduler-level boundary is fully, partially or not
+  resident is the coordinator's answer (`DeviceBoundaryResidency`, read off
+  the group indexes), so the scheduler keeps no residency counters of its own
+  — only the token descriptor the event carries and whether that event is
+  currently out.
 
 `MakeCoordinator` is the factory: one `CacheGroup` per `CacheGroupSpec`
 (group_id = index), all sharing one scheduler-level `prefix_granularity`
@@ -506,12 +563,24 @@ The internal capacity planner behind `Admit`. It runs entirely on shadow
 occupancy — never mutating the real pool — and answers: *which cached blocks
 must be evicted for this admission to fit, while protecting the current
 prefix hits?* The algorithm: first check whether existing local holes plus
-empty parents fit with zero eviction; otherwise pop victims from a heap
-ordered by eviction policy (LRU access epoch, then tier: uncached
-request-only block → probationary boundary → established boundary → suffix of
-a closed prefix) until the plan fits; finally walk the victim list in reverse
-and restore every victim that is not strictly required, yielding a minimal
-eviction set.
+empty parents fit with zero eviction; otherwise select eviction candidates
+until the plan fits. Request-reclaimable candidates are collected and sorted
+once; each cache group loads and sorts one epoch of eligible candidates at a
+time, skipping epochs whose entries are all protected or already listed for
+request reclaim. Selection compares the next candidate from each group with
+the next request-reclaimable candidate using one policy: LRU access epoch,
+then tier (uncached request-only block → probationary boundary → established
+boundary → suffix of a closed prefix). Finally, walk the selected blocks in
+reverse and restore every block that is not strictly required, yielding a
+minimal eviction set in `victims`.
+
+Each cache group uses a non-owning cursor over its tier's eviction index.
+It advances continuously, skips fully pinned epochs, and returns complete
+epochs for policy ordering. Cursors exist only during one read-only planning
+pass: their index and pool must remain alive, and entries must not be inserted,
+erased, or re-keyed during traversal. Commit-time index mutations happen after
+the planner is destroyed. A full traversal costs O(N), including pinned entries,
+without a separate tree lookup per epoch.
 
 ## The cache pipeline: layers → group → pack → bind
 
@@ -555,9 +624,9 @@ whole). No family restates the order of the stages, and `_RECIPES`
 **No round-trip reconciliation.** The pipeline is arranged so that pairs which
 would otherwise need cross-checking cannot differ:
 
-* the group set in the plan equals the declared one because `pack` consumes
-  the `(spec, fields)` pairs and `setup()` publishes the specs from those
-  same pairs;
+* `setup()` obtains `(spec, fields)` pairs from `groups()` and uses the same
+  local tuple for `pack` and spec publication, so both name the same group
+  set without a separate cache of declarations;
 * a field cannot name a group the plan does not have, because it never names
   one — `pack` carries the declaring group id alongside each field;
 * per-group packing is read from the layout, not recomputed, everywhere
@@ -625,6 +694,131 @@ the escalating admission headroom each retraction adds to the victim's next
 admission. The protocol — victim choice, readmission order, why the release
 is safe before the L2 snapshot copies — is `scheduler.md` §2 and §4.
 
+## Virtual block placement within a shared physical plan
+
+A recipe declares each group as a `(CacheGroupSpec, fields)` tuple.
+`CacheGroupSpec.shard_count` defaults to 1 (replicated); a larger value assigns
+virtual blocks cyclically across that many owners. The memory plan continues
+to own local shapes, strides, packing and byte counts. `CacheArena` is the sole
+publisher of `CacheRuntimeContract`, whose virtual counts and packing derive
+from these physical facts and each spec's `shard_count`. No separate placement
+or per-group address-space object is needed.
+
+A recipe's group set never depends on the DCP size. Only groups whose every
+reader can attend to a shard may be sharded; a group some consumer must read
+whole stays replicated and is declared as its own group at every DCP size, so
+prefix matching, transfer and zeroing -- all keyed by group -- see one
+topology. DeepSeek V4 shards its compressed-KV chains and keeps the SWA cache,
+the compressor states and the indexer's K replicated; the indexer K is its own
+full-history group rather than a tenant of the compressed chain it indexes.
+
+Splitting or regrouping fields can change physical packing and parent plane
+sizes. Capacity planning therefore uses the resulting physical parent byte
+size and each group's declared demand: a replicated full-history group holds
+one physical child per token span where a sharded one holds one per
+`shard_count` spans, so the replicated groups bound the token capacity.
+Virtual placement alone does not impose a fixed parent size across different
+group declarations; field alignment and bounds remain the physical planner's
+responsibility, and the padding bound applies unchanged.
+
+Translation from virtual to local IDs is one operation with `shard_count` as
+a parameter, never a mode: a replicated group translates to itself minus the
+null block, so batch metadata refreshes its local read tables, writers mask
+unowned rows, and zeroing filters foreign blocks through the same path at
+every DCP size. Virtual block 0 is the null block; no path writes to it, at
+any DCP size.
+
+Consumers bind a pool's compute view and read its arena's runtime contract.
+Views sharing an arena share that contract, rather than accepting separately
+injected copies of its geometry. Batch metadata retains the same contract for
+address translation.
+
+For physical packing K, N usable parents and D shards, a sharded
+group has `1 + N*K` local pages and `1 + N*D*K` virtual blocks. A replicated
+group uses one bucket. Existing `group_page_counts` and `group_packing` name
+physical quantities; the scheduler bridge explicitly consumes
+`virtual_block_counts` and `virtual_packing`. Virtual capacity must never be
+used to shape an arena field. Virtual null ID 0 has no owner and is filtered
+during translation.
+
+Before zeroing scheduler blocks, the runtime checks IDs against the virtual
+bound and translates each group's batch to owned local IDs through the shared
+translation API. Translation precedes dispatch to pool views; pools and the
+arena receive physical IDs and hold no context rank. The arena's
+`zero_blocks()` validates every ID against its group's local page count before
+clearing any bytes. Physical page 0 is within that range and is handled like
+any other page when explicitly requested.
+
+The allocator receives only an integer `shard_count`, fixed when the
+coordinator registers the group in its pools. It counts
+all nonnull refs in the request table, including shared prefixes and reserved
+headroom. Among available holes in already bound parents, it selects the
+least-loaded request bucket (ties by bucket ID), then the most occupied
+parent (ties by parent ID), then the lowest child ID. Allocation updates these
+occupancies before selecting the next child. Only when all bound-parent holes
+are exhausted may it open the next FIFO empty parent. Bucket balance cannot
+reserve an extra parent or cause admission failure while another bucket is
+available. A failed acquire leaves both placement and request tables unchanged.
+
+`BlockPool` maintains the free-slot count of each group and an ordered parent
+index per bucket. Each parent records only its lowest free slot per bucket;
+it does not materialize a list of every hole. Physical `occupy` and `Release`
+update these indices, including full-to-partial transitions and final-child
+release. Shared request/prefix references therefore keep both the parent
+binding and its index state alive until the last reference releases the block.
+These indices describe physical availability, not request-local owner loads.
+
+An exact acquire first checks `group holes + empty parents * group packing`.
+Capacity-first selection can consume all of these slots, so it then allocates
+directly without a second, pool-sized shadow planner. Insufficient capacity
+returns before changing the indices, occupancy, or FIFO. Ordinary, balanced,
+and Host allocation entry points use the same availability updates.
+
+Choosing a block examines the bucket-index heads, not every parent. Updating
+the chosen parent's ordering costs one logarithmic-time index update per
+bucket the parent has a hole in. Advancing its free-slot cursor only searches
+that bucket within that parent. Ordinary and balanced calls share the registered geometry;
+changing the shard count or packing is rejected even after every block is
+released. No allocation call rebuilds the group's indices for new geometry.
+The additional metadata is per-parent bucket minima and at most one tree
+entry per available bucket of a partial parent. Request loads remain derived
+from `BlockTable` on each actual acquire; this optimization introduces no
+request counter that retract, prefix replacement, or table clearing must reset.
+
+
+## Sparse indexers: model weights, backend dispatch and verification
+
+* The **model** owns indexer weights and top-k selection, passing
+  `topk_indices` through `PagedAttention.forward` to the backend.
+* The **full-attention backend** owns attention dispatch and full-KV cache
+  addressing. `CacheGroupRouter` expands only the groups served by attention
+  leaves; QSA's compressed/recent history groups are separate consumers.
+* **`QSAIndexerBackend`** owns those two groups' raw block tables, query
+  lengths and transient verification workspace. It uses the shared table
+  fill at expansion ratio one, preserving block ids and clearing padding,
+  and borrows the full-KV address view from the router. Its private
+  `QSAVerifyState` exists only for a speculative target with local QSA fields.
+* **`Qwen4ExpBackend`** composes an attention backend with optional PLE and
+  indexer consumers. Its attention child uses the ordinary hybrid only for
+  views with GDN layers; draft views have neither GDN nor PLE.
+  The runner's existing post-verify calls dispatch once
+  to their respective children; the root neither allocates verify tensors
+  nor registers or looks up QSA state. PLE owns its checkpoint metadata
+  independently of Mamba and shares only the checkpoint arithmetic. See the
+  [execution lifecycle](unified_path.md#backend-package-layout).
+
+LCM owns persistent allocation, prefix matching, transfer and retention,
+including QSA's full-KV, compressed and recent cache groups. Verify-state layer
+ownership and cache addresses come from the bound plan's layer window,
+including under PP and target/draft sharing. Cache recipes reserve verify
+workspace before sizing the arena.
+
+Qwen4-Exp selects its cache recipe by model family, including targets with
+only full-attention layers. PLE and QSA fields and their verify budget do
+not require a GDN component. Recurrent shapes and replay settings are read
+only when that component exists; a recurrent layer label without matching
+linear-attention geometry still fails during recipe construction.
+
 ## Code placement
 
 * Prefix-matching code (prefix hashing, match/lookup, reuse boundaries) lives
@@ -691,7 +885,9 @@ Enforced:
   between them (P divisibility, PD transfer policy, one-cache-block chunks for
   a recurrent-state group). The `Scheduler` runs it before constructing any
   member, because the pools and the coordinator assert on the same fields and
-  would otherwise preempt the diagnostic. Consequently `MakeSpecsFromConfig`
+  would otherwise preempt the diagnostic. Python callers must also pass
+  `Scheduler(config)` explicitly; the binding retains no module-lifetime
+  default configuration. Consequently `MakeSpecsFromConfig`
   is pure translation — it validates nothing;
 * the scheduler layer **transports** `cache_blocks_per_lcm_block` rather than
   reasoning with it. It appears in `csrc/scheduler/` only as a config field
@@ -762,12 +958,15 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   refuses a sliding `State` group at the bridge).
 * Group consumption is claimed positively, from one declaration: each
   consumer takes exactly the delivered `block_tables` entries for the
-  groups it serves — the router builds one leaf per paged (history-family)
-  group of its bound pool view and fails a live batch missing any of them;
-  state consumers (Mamba/KDA, Inkling conv) index the dict by their own
-  group ids, as does the V4 backend for the several history groups one V4
-  layer reads at once (its pool view reports no `PagedAttention` binding
-  and no router leaf). `cache_consumer_families` remains the boot-time coverage
+  groups it serves. The router builds a leaf for each claimed attention
+  group and fails a live batch missing any of them. QSA's indexer claims
+  its compressed/recent history groups separately; it does not instantiate
+  attention leaves for them. State consumers (Mamba/KDA, PLE, Inkling conv)
+  index the dict by their own group ids, as does the V4 backend for the
+  several history groups one V4 layer reads at once (its pool view reports
+  no `PagedAttention` binding and no router leaf). Mamba's group set comes from
+  its recurrent fields, so a PLE checkpoint group cannot arm its verify
+  state. `cache_consumer_families` remains the boot-time coverage
   declaration (`validate_scheduler_config`). Extra delivered groups ride
   through untouched; a table for a group the bound pool never published
   fails loudly.
@@ -783,6 +982,10 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   kernel pages out, one expand launch per group. Models and the runner never
   compute locations — `write_locations(layer, mode)` is the single accessor
   (`unified_path.md`, "Write locations have one owner").
+  QSA's indexer reuses `GroupTableStacks` with `kernel_page_size` equal to
+  each group's `block_granularity`. This ratio-one fill copies stable raw
+  table views and clears holes/padding; it does not add another subdivision
+  convention or derive its addresses through a dummy attention leaf.
 * The slot *arithmetic* itself lives in the mapping layer in exactly two
   spellings of one invariant (`table[req, pos // P] * P + pos % P`, which
   is page-size invariant): the router's stacked window/span math

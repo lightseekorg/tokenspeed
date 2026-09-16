@@ -180,8 +180,8 @@ class RequestStats:
         if spec_algorithm is not None and rs.spec_verify_ct > 0:
             acc_len = rs.accept_draft_tokens or 0.0
             acc_rate = (
-                round(max(0.0, acc_len - 1.0) / spec_num_tokens, 4)
-                if spec_num_tokens
+                round(max(0.0, acc_len - 1.0) / (spec_num_tokens - 1), 4)
+                if spec_num_tokens > 1
                 else 0.0
             )
             acc_len = round(acc_len, 2)

@@ -51,7 +51,7 @@ from tokenspeed_kernel.ops.moe import sigmoid_topk as sigmoid_topk_mod  # noqa: 
 from tokenspeed_kernel.ops.moe.triton.kimi3_sigmoid_topk import (  # noqa: E402
     kimi3_sigmoid_bias_topk,
 )
-from tokenspeed_kernel.thirdparty.triton import (  # noqa: E402
+from tokenspeed_kernel.ops.moe.triton.minimax_topk import (  # noqa: E402
     minimax_biased_grouped_topk,
 )
 
@@ -151,8 +151,6 @@ def test_dispatcher_hands_rows_past_the_cap_to_the_grouped_kernel(monkeypatch):
     """One row past the crossover the packed kernel must not run, and the
     grouped kernel must be asked for the output dtype rather than returning
     fp32 for the wrapper to cast."""
-    import tokenspeed_kernel.thirdparty.triton as thirdparty_triton
-
     cap = sigmoid_topk_mod._K3_PACKED_TOPK_MAX_ROWS_NVIDIA
     calls = []
     monkeypatch.setattr(
@@ -161,13 +159,13 @@ def test_dispatcher_hands_rows_past_the_cap_to_the_grouped_kernel(monkeypatch):
         lambda *a, **k: calls.append(k) or pytest.fail("packed ran past the cap"),
     )
     grouped_dtypes = []
-    real_grouped = thirdparty_triton.minimax_biased_grouped_topk
+    real_grouped = sigmoid_topk_mod.minimax_biased_grouped_topk
 
     def grouped_spy(*args, **kwargs):
         grouped_dtypes.append(kwargs["weights_dtype"])
         return real_grouped(*args, **kwargs)
 
-    monkeypatch.setattr(thirdparty_triton, "minimax_biased_grouped_topk", grouped_spy)
+    monkeypatch.setattr(sigmoid_topk_mod, "minimax_biased_grouped_topk", grouped_spy)
 
     torch.manual_seed(7)
     logits = (torch.randn(cap + 1, EXPERTS, device="cuda") * 0.2).float()

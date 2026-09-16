@@ -85,6 +85,18 @@ async def test_partial_last_line_without_newline_still_emitted():
 
 
 @pytest.mark.asyncio
+async def test_each_line_is_flushed_before_reading_more():
+    class Sink(io.StringIO):
+        def flush(self):
+            flushed.append(self.getvalue())
+
+    flushed = []
+    sink = Sink()
+    await tag_stream(_make_reader(b"first\nlast"), "ts", sink)
+    assert flushed == ["[ts] first\n", "[ts] first\n[ts] last\n"]
+
+
+@pytest.mark.asyncio
 async def test_eof_with_no_data_emits_nothing():
     reader = _make_reader(b"")
     sink = io.StringIO()

@@ -31,6 +31,8 @@ import os
 import pathlib
 import sys
 
+import pytest
+
 # Executed as a script by run_ci_suite: the test dir must be importable.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -188,3 +190,7 @@ def test_the_step_runs_its_operations_in_the_order_the_constructor_did():
         if call.func.attr == "capture_graphs"
     ]
     assert seed and capture and max(capture) < min(seed), (capture, seed)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

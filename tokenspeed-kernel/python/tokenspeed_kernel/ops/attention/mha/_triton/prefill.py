@@ -22,9 +22,7 @@ import math
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.platform import current_platform
 
 
 @triton.jit
@@ -454,26 +452,7 @@ def prefill_attention_fwd(
     )
 
 
-@register_kernel(
-    "attention",
-    "mha_prefill",
-    name="triton_mha_prefill",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=format_signatures(
-        ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
-    ),
-    priority=Priority.PORTABLE,
-    traits={
-        "sliding_window": frozenset({False, True}),
-        "support_sinks": frozenset({False, True}),
-        "support_logit_cap": frozenset({False, True}),
-        "return_lse": frozenset({False, True}),
-        "support_skip_softmax": frozenset({False}),
-    },
-    tags={"portability"},
-)
-def triton_mha_prefill(
+def _triton_mha_prefill_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -524,26 +503,7 @@ def triton_mha_prefill(
     return out
 
 
-@register_kernel(
-    "attention",
-    "mha_extend_with_kvcache",
-    name="triton_mha_extend_with_kvcache",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=format_signatures(
-        ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
-    ),
-    priority=Priority.PORTABLE,
-    traits={
-        "is_causal": frozenset({False, True}),
-        "sliding_window": frozenset({False, True}),
-        "support_sinks": frozenset({False, True}),
-        "support_logit_cap": frozenset({False, True}),
-        "return_lse": frozenset({False, True}),
-    },
-    tags={"portability"},
-)
-def triton_mha_extend_with_kvcache(
+def _triton_mha_extend_with_kvcache_impl(
     q: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_kv: torch.Tensor,

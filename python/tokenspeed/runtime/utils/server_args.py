@@ -249,9 +249,14 @@ class ServerArgs:
     use_trtllm_ragged_deepseek_prefill: bool | None = None
 
     # DeepSeek V4
+    decode_context_parallel_size: int = 1
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
     deepseek_v4_prefill_chunk_size: int = 4
+    # DeepSeek V4.1 Engram host tables. Off by default (GPU-sharded).
+    engram_host_table: bool = False
+    engram_host_table_dir: str | None = None
+    engram_host_table_layout: str = "auto"
 
     # Grammar backend
     grammar_backend: str = "none"
@@ -650,6 +655,7 @@ class ServerArgs:
             attn_tp_size=attn_tp_size,
             attn_cp_size=attn_cp_size,
             attn_dp_size=attn_dp_size,
+            attn_dcp_size=self.decode_context_parallel_size,
             dense_tp_size=dense_tp_size,
             dense_dp_size=dense_dp_size,
             moe_tp_size=moe_tp_size,
@@ -666,6 +672,8 @@ class ServerArgs:
         )
 
         # Impl constraints:
+        if self.mapping.attn.has_dcp and self.disaggregation_mode != "null":
+            raise ValueError("DCP cache transfer does not yet support PD")
         if self.mapping.moe.has_tp and self.mapping.moe.has_ep:
             raise ValueError("MoE TP and EP cannot be both > 1")
 
@@ -850,6 +858,13 @@ class ServerArgs:
             self.enable_kvstore = True
 
     def validate_cache_options(self):
+        # Runs after _handle_kvstore() has applied the KVStore default, so the
+        # check sees the effective setting rather than the pre-resolution flag.
+        if self.decode_context_parallel_size > 1 and self.enable_kvstore:
+            raise ValueError(
+                "DCP cache transfer does not yet support KVStore; "
+                "use --disable-kvstore."
+            )
         speculative_algorithm = getattr(self, "speculative_algorithm", None)
         draft_model_path_use_base = getattr(self, "draft_model_path_use_base", False)
         speculative_draft_model_path = getattr(
@@ -1457,7 +1472,9 @@ class ServerArgs:
             metavar="ALL2ALL_BACKEND",
             type=str,
             default=ServerArgs.all2all_backend,
-            help="MoE all-to-all backend: none, deepep, etc.",
+            choices=["none", "agrs", "deepep", "flashinfer"],
+            help="MoE communication backend. agrs and flashinfer explicitly select "
+            "the Kimi-K3 attention-DP transport; none preserves existing behavior.",
         )
         parser.add_argument(
             "--deepep-mode",
@@ -1659,6 +1676,40 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
+            "--engram-host-table",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.engram_host_table,
+            help=(
+                "DeepSeek V4.1 Engram: store the two FP8 n-gram tables in host "
+                "memory and gather rows through UVA. Frees HBM for KV cache. "
+                "See --engram-host-table-layout. Requires enough host RAM."
+            ),
+        )
+        parser.add_argument(
+            "--engram-host-table-dir",
+            type=str,
+            default=ServerArgs.engram_host_table_dir,
+            help=(
+                "Directory for shared Engram mmap files. Default: /dev/shm "
+                "when it has enough free space, otherwise /scratch or /tmp. "
+                "Used only with --engram-host-table-layout shared. Docker often "
+                "caps /dev/shm at 32-64 GiB, too small for a full V4.1 table."
+            ),
+        )
+        parser.add_argument(
+            "--engram-host-table-layout",
+            type=str,
+            choices=["auto", "shared", "sharded"],
+            default=ServerArgs.engram_host_table_layout,
+            help=(
+                "Host Engram layout when --engram-host-table is set. shared: one "
+                "full copy per node, skip the lookup all-reduce. sharded: each "
+                "attention-TP rank holds a host shard and keeps the all-reduce "
+                "(anonymous mapping, huge-page friendly). auto: sharded when "
+                "attention TP > 1, else shared."
+            ),
+        )
+        parser.add_argument(
             "--grammar-backend",
             type=str,
             choices=["xgrammar", "none"],
@@ -1791,7 +1842,7 @@ class ServerArgs:
             help="Enable prefix caching.",
         )
         prefix_cache_group.add_argument(
-            "--no-enable-prefix-caching",
+            "--disable-prefix-caching",
             dest="enable_prefix_caching",
             action="store_false",
             help="Disable prefix caching.",
@@ -1939,6 +1990,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.attn_tp_size,
             help="Specify tp size for attn part",
+        )
+        parser.add_argument(
+            "--decode-context-parallel-size",
+            type=int,
+            default=ServerArgs.decode_context_parallel_size,
+            help="Shard DeepSeek V4 compressed KV over a subgroup of attention TP.",
         )
         parser.add_argument(
             "--dense-tp-size",

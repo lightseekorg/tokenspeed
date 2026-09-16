@@ -34,7 +34,7 @@ server:
     --sampling-backend greedy
     --disable-kvstore
     --kvstore-ratio 0.0
-    --no-enable-prefix-caching
+    --disable-prefix-caching
     --host 127.0.0.1
     --port 21000
     --policy round_robin

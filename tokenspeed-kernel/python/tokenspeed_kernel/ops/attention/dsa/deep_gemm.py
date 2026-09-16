@@ -24,6 +24,7 @@ from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
     pdl_enabled,
+    prepare_cuda_toolkit_env,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -115,9 +116,16 @@ def _resolve_prefill_tile_max_seqlen_k(
     return int(candidate_lens[start:end].max().item())
 
 
-if platform.is_nvidia:
-    from tokenspeed_kernel.thirdparty import deep_gemm
-    from tokenspeed_kernel.thirdparty import trtllm as _trtllm  # noqa: F401
+if platform.is_hopper_plus:
+    prepare_cuda_toolkit_env()
+    import deep_ep  # noqa: F401
+    import deep_gemm
+    import trtllm_kernel  # noqa: F401
+    from tokenspeed_kernel.ops._deep_gemm.mega_moe_bf16 import (
+        prepare_mega_moe_bf16_jit,
+    )
+
+    prepare_mega_moe_bf16_jit()
 
     def _deep_gemm_paged_mqa_plan(
         *,

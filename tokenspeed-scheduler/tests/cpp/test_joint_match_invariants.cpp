@@ -64,12 +64,15 @@ std::uint64_t g_epoch = 0;
 std::int32_t CacheBlockFor(CacheCoordinator& coordinator, BlockPool& pool, const std::string& content_hash,
                            std::uint32_t group_id) {
     const std::int32_t group_index = static_cast<std::int32_t>(group_id);
-    CacheBlockRef block_ref = pool.AcquireBlock(group_id, coordinator.Allocator(group_index).CacheBlocksPerLcmBlock());
+    CacheBlockRef block_ref = pool.AcquireBlock(group_id);
     if (!block_ref) {
         return -1;
     }
     const std::int32_t id = block_ref->Location().lcm_block_id;
-    coordinator.GroupPrefixIndex(group_index).Register(pool, block_ref, KeyFor(content_hash, group_id), ++g_epoch);
+    coordinator.GroupPrefixIndex(group_index)
+        .Register(pool, block_ref, KeyFor(content_hash, group_id), ++g_epoch, /*logical_block_index=*/-1,
+                  CacheBoundaryKind::kChunk,
+                  /*newly_cached=*/nullptr);
     block_ref.reset();
     return id;
 }
@@ -110,9 +113,10 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
     const std::vector<std::string> hashes = MakeHashes(kBlocks);
 
     for (int round = 0; round < 200; ++round) {
-        BlockPool pool(64);
+        BlockPool pool(64, {1, 1});
         {
-            CacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool);
+            CacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool, /*host_pool=*/nullptr,
+                                                           /*stream_device_cache_to_host=*/false);
 
             // Random per-group caching: each group caches a random prefix
             // subset of the request's blocks (front-truncated to mimic the
@@ -185,8 +189,9 @@ TEST(JointMatchInvariantsTest, DraftOnlyGroupJoinsConvergenceAsOrdinaryGroup) {
          .cache_blocks_per_lcm_block = 1,
          .block_granularity = kBlockTokens},
     };
-    BlockPool pool(64);
-    CacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool);
+    BlockPool pool(64, {1, 2, 1});
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, kBlockTokens, pool, /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     const std::vector<std::string> hashes = MakeHashes(kBlocks);
 
     // Cache depth 6 for the full groups, but only blocks [2, 5) for the

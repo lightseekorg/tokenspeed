@@ -22,9 +22,6 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
 
 _FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz})
 _MLA_DECODE_DTYPES = frozenset({torch.float16, torch.bfloat16}) | _FP8_DTYPES
@@ -287,23 +284,7 @@ def mla_decode_fwd(
     )
 
 
-@register_kernel(
-    "attention",
-    "mla_decode_with_kvcache",
-    name="triton_mla_decode_with_kvcache",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=format_signatures(("q", "kv_cache"), "dense", _MLA_DECODE_DTYPES),
-    priority=Priority.PORTABLE,
-    traits={
-        "q_len": frozenset({1}),
-        "sliding_window": frozenset({False, True}),
-        "support_logit_cap": frozenset({False, True}),
-        "return_lse": frozenset({False, True}),
-    },
-    tags={"portability"},
-)
-def triton_mla_decode_with_kvcache(
+def _triton_mla_decode_with_kvcache_impl(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,

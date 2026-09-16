@@ -731,10 +731,10 @@ def moe_process_weights(plan: dict, w: torch.nn.Module):
 
 def moe_apply(
     plan: dict,
-    x: torch.Tensor,
+    x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     w: torch.nn.Module,
     # top-k routing inputs
-    router_logits: torch.Tensor,
+    router_logits: torch.Tensor | None,
     # top-k routing results
     topk_weights: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
@@ -753,9 +753,13 @@ def moe_apply(
 
     Args:
         plan: Execution plan returned by moe_plan.
-        x: Hidden states with shape [tokens, hidden_size].
+        x: Hidden states with shape [tokens, hidden_size], or a
+            (packed_nvfp4, block_scales) pair for a kernel supporting prequantized
+            input. Packed data is uint8 [tokens, hidden_size // 2]; scales are
+            linear uint8/float8 [tokens, hidden_size // 16].
         w: Module containing processed MoE weights.
-        router_logits: Router logits with shape [tokens, num_experts].
+        router_logits: Router logits with shape [tokens, num_experts], or None
+            for a precomputed-TopK kernel that consumes only IDs and weights.
         topk_weights: Optional precomputed expert weights with shape
             [tokens, top_k]. Required when plan support_routing is false.
         topk_ids: Optional precomputed expert ids with shape [tokens, top_k].
@@ -786,10 +790,11 @@ def moe_apply(
 
     Solutions may use precomputed top-k tensors or route from logits directly.
     """
+    data = x[0] if isinstance(x, tuple) else x
     kernel = select_kernel(
         "moe",
         "apply",
-        format_signature(x=dense_tensor_format(x.dtype)),
+        format_signature(x=dense_tensor_format(data.dtype)),
         override=plan["apply_kernel_name"],
     )
     # Only the all-to-all EP kernels own dispatch/combine legs, so the mode

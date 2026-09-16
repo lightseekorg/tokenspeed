@@ -26,14 +26,24 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import ScaleFormat, format_signature, tensor_format
 
-# Re-exported
-# dsv3_fused_a_gemm supports specific shapes only (see python/tokenspeed/runtime/models/deepseek_v3.py);
-# call such kernels manually rather than by register_kernel.
-from tokenspeed_kernel.thirdparty.trtllm import dsv3_fused_a_gemm  # noqa: F401
+if current_platform().is_nvidia:
+    # DeepEP must initialize before TRT-LLM's static CUDA runtime.
+    import deep_ep  # noqa: F401
+    import trtllm_kernel  # noqa: F401
+
+
+def dsv3_fused_a_gemm(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
+    """Run TRT-LLM's shape-specialized DeepSeek V3 fused-A projection."""
+    return torch.ops.trtllm.dsv3_fused_a_gemm_op(mat_a, mat_b, None, None)
+
 
 _fp4_dtypes: frozenset[torch.dtype] = frozenset({torch.uint8, torch.float4_e2m1fn_x2})
 _NVFP4_SCALE_DTYPES: frozenset[torch.dtype] = frozenset(
@@ -79,7 +89,7 @@ def _get_runner(out_dtype: torch.dtype):
     "gemm",
     "mm",
     name="cublaslt_mm_nvfp4",
-    solution="cublas",
+    solution="cublaslt",
     capability=CapabilityRequirement(
         min_arch_version=ArchVersion(10, 0),
         vendors=frozenset({"nvidia"}),

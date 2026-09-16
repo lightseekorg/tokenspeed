@@ -50,7 +50,7 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
                                    ReqPoolAllocator* req_pool_allocator, PrefillSource source,
                                    CacheCoordinator* coordinator, std::vector<BlockTable> block_tables,
                                    std::int32_t hit_tokens, CacheProgress cache_progress,
-                                   std::vector<BlockTransfer> load_pairs, bool awaits_result = false)
+                                   std::vector<BlockTransfer> load_pairs, bool awaits_result)
         : tokens_this_round_{tokens_this_round},
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event},
           req_pool_allocator_{req_pool_allocator},
@@ -86,10 +86,9 @@ struct SchedulePrefillEvent : InvalidTransitionHandler<SchedulePrefillEvent> {
     using InvalidTransitionHandler<SchedulePrefillEvent>::operator();
 
     SchedulePrefillEvent(std::int32_t tokens_this_round, std::int32_t reserve_num_tokens_in_next_schedule_event,
-                         CacheProgress cache_progress, bool awaits_result = false)
+                         bool awaits_result)
         : tokens_this_round_{tokens_this_round},
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event},
-          cache_progress_{std::move(cache_progress)},
           awaits_result_{awaits_result} {}
 
     std::variant<PrefillDone, PrefillAwaitingResult, Prefilling> operator()(Prefilling&& state);
@@ -97,15 +96,13 @@ struct SchedulePrefillEvent : InvalidTransitionHandler<SchedulePrefillEvent> {
 private:
     std::int32_t tokens_this_round_{};
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
-    CacheProgress cache_progress_;
     bool awaits_result_{false};
 };
 
 struct ScheduleDecodeEvent : InvalidTransitionHandler<ScheduleDecodeEvent> {
     using InvalidTransitionHandler<ScheduleDecodeEvent>::operator();
 
-    ScheduleDecodeEvent(std::int32_t decode_input_tokens, CacheProgress cache_progress)
-        : decode_input_tokens_{decode_input_tokens}, cache_progress_{std::move(cache_progress)} {}
+    explicit ScheduleDecodeEvent(std::int32_t decode_input_tokens) : decode_input_tokens_{decode_input_tokens} {}
 
     Decoding operator()(PrefillDone&& state);
     Decoding operator()(PrefillAwaitingResult&& state);
@@ -116,7 +113,6 @@ private:
     Decoding decode(State&& state);
 
     std::int32_t decode_input_tokens_{};
-    CacheProgress cache_progress_;
 };
 
 struct FinishEvent : InvalidTransitionHandler<FinishEvent> {
@@ -235,15 +231,9 @@ struct ExtendResultEvent : InvalidTransitionHandler<ExtendResultEvent> {
             return std::move(state);
         }
         state.ExtendResultTokens(result_tokens_);
-        TokenContainer* token_container = state.TokenContainerPtr();
-        const std::int32_t prefix_granularity = state.PrefixGranularity();
-        const TokenContainer::Window window = state.window;
-        const std::int32_t reserve = state.ReserveNumTokensInNextScheduleEvent();
-        auto req_pool_index = std::move(state).TakeRequestPoolIndex();
-        auto block_tables = std::move(state).TakeBlockTables();
-        auto cache_progress = std::move(state).TakeCacheProgress();
-        return PrefillDone{token_container, prefix_granularity,      std::move(req_pool_index), window,
-                           reserve,         std::move(block_tables), std::move(cache_progress)};
+        // Older intermediate chunk results may still be landing on these
+        // pages (see above): the bundle, in-flight count included, moves on.
+        return PrefillDone{std::move(state.resources), state.window, state.ReserveNumTokensInNextScheduleEvent()};
     }
 
     // An intermediate chunk produces no token -- its result is KV written

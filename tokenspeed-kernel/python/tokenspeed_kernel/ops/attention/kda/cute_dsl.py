@@ -32,23 +32,39 @@ and validated on every call.
 
 from __future__ import annotations
 
+import math
+
 import torch
 from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult
 from tokenspeed_kernel.ops.attention.kda.triton import (
     _DENSE_HALF_SIGNATURES,
     _nvidia_kda_prefill,
 )
-from tokenspeed_kernel.platform import CapabilityRequirement
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.thirdparty.cutedsl_kda import (
-    DEFAULT_SCALE,
-    cutedsl_kda_check_config,
-    cutedsl_kda_forward,
-    cutedsl_kda_workspace_size,
-    is_cutedsl_kda_installed,
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
 )
+from tokenspeed_kernel.registry import Priority, register_kernel
 
-__all__ = ["cutedsl_kda_chunk_prefill", "is_cutedsl_kda_installed"]
+_SUPPORTED_ARCHES = frozenset({ArchVersion(10, 0), ArchVersion(10, 3)})
+
+
+def cutedsl_kda_supported() -> bool:
+    """Whether the current platform supports the packaged CuteDSL KDA kernel."""
+    platform = current_platform()
+    return platform.is_nvidia and platform.arch_version in _SUPPORTED_ARCHES
+
+
+if cutedsl_kda_supported():
+    from tokenspeed_cutedsl_kda import (
+        cutedsl_kda_check_config,
+        cutedsl_kda_forward,
+        cutedsl_kda_workspace_size,
+    )
+
+
+__all__ = ["cutedsl_kda_chunk_prefill", "cutedsl_kda_supported"]
 
 
 @register_kernel(
@@ -56,7 +72,11 @@ __all__ = ["cutedsl_kda_chunk_prefill", "is_cutedsl_kda_installed"]
     "kda_paged_prefill",
     name="cutedsl_kda_nvidia_paged_prefill",
     solution="cutedsl_kda",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(10, 0),
+        max_arch_version=ArchVersion(10, 3),
+        vendors=frozenset({"nvidia"}),
+    ),
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
     traits={"recurrent_layout": frozenset({"v_major"})},
@@ -122,6 +142,8 @@ def cutedsl_kda_chunk_prefill(
     # loudly rather than silently mis-gate.
     cutedsl_kda_check_config(float(lower_bound))
     batch, tokens, num_heads, key_dim = q.shape
+    if key_dim != 128:
+        raise ValueError(f"CuteDSL KDA requires key_dim=128, got {key_dim}")
     num_value_heads, value_dim = v.shape[2], v.shape[-1]
     if cu_seqlens is not None:
         num_sequences = cu_seqlens.numel() - 1
@@ -192,7 +214,7 @@ def cutedsl_kda_chunk_prefill(
         beta,
         boundaries,
         state_in,
-        scale=DEFAULT_SCALE,
+        scale=1.0 / math.sqrt(key_dim),
         workspace=workspace,
         cu_seqlens_cpu=cu_seqlens_cpu,
     )

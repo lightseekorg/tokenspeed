@@ -25,12 +25,12 @@
 
 
 import torch
-import triton
-import triton.language as tl
 from tokenspeed_kernel.ops.attention.gdn.triton import (
     CausalConv1dPrefillMetadata,
 )
 from tokenspeed_kernel.platform import pdl_enabled
+
+from tokenspeed.runtime.utils.triton import tl, triton
 
 PAD_SLOT_ID = -1
 

@@ -56,6 +56,9 @@ else:
         gluon_dsa_decode_topk_fp8_gfx1250 as gluon_dsa_decode_topk_fp8,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (
+        gluon_dsa_logical_topk_gfx1250 as gluon_logical_topk_indices,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (
         gluon_dsa_prefill_topk_fp8_gfx1250 as gluon_dsa_prefill_topk_fp8,
     )
 
@@ -992,7 +995,10 @@ def test_dsa_decode_topk_keeps_late_values_above_threshold() -> None:
     torch.testing.assert_close(lens_out.cpu(), torch.tensor([topk], dtype=torch.int32))
 
 
-@pytest.mark.skipif(not is_cdna4(), reason="requires the gfx950 logical top-k")
+@pytest.mark.skipif(
+    not (is_cdna4() or is_cdna5()),
+    reason="requires the AMD Gluon logical top-k",
+)
 def test_gluon_logical_topk_indices_respects_ragged_ranges_and_outputs() -> None:
     cols = 1024
     topk = 512
@@ -1581,10 +1587,10 @@ def test_dsa_decode_sparse_kvcache_trims_large_topk_for_tiny_lens() -> None:
 
 
 @pytest.mark.skipif(
-    not is_cdna4(),
-    reason="GLM-5.3-Flash native FP8 MFMA decode is specific to gfx950",
+    not (is_cdna4() or is_cdna5()),
+    reason="GLM-5.3-Flash native FP8 decode requires AMD CDNA4 or CDNA5",
 )
-def test_dsa_decode_glm53_flash_native_fp8_mfma() -> None:
+def test_dsa_decode_glm53_flash_native_fp8_matrix() -> None:
     device = "cuda"
     num_heads = 16
     num_slots = 2051
@@ -1704,11 +1710,11 @@ def test_dsa_glm53_bf16_split_schedule(
 
 
 @pytest.mark.skipif(
-    not is_cdna4(),
-    reason="GLM-5.3-Flash BF16 decode is specific to gfx950",
+    not (is_cdna4() or is_cdna5()),
+    reason="GLM-5.3-Flash BF16 decode requires AMD CDNA4 or CDNA5",
 )
 @pytest.mark.parametrize("tokens", (16, 64))
-def test_dsa_decode_glm53_flash_bf16_split_mfma(tokens: int) -> None:
+def test_dsa_decode_glm53_flash_bf16_split_matrix(tokens: int) -> None:
     device = "cuda"
     num_heads = 16
     num_slots = 256
@@ -1765,8 +1771,8 @@ def test_dsa_decode_glm53_flash_bf16_split_mfma(tokens: int) -> None:
 
 
 @pytest.mark.skipif(
-    not is_cdna4(),
-    reason="the tested DSA kernel currently only supports gfx950",
+    not (is_cdna4() or is_cdna5()),
+    reason="GLM-5.3-Flash graph replay requires AMD CDNA4 or CDNA5",
 )
 @pytest.mark.parametrize("tokens", (16, 64))
 def test_dsa_decode_glm53_flash_bf16_split_graph_tracks_live_lengths(
@@ -1966,8 +1972,8 @@ def test_dsa_prefill_glm53_flash_dense_mfma(
 
 
 @pytest.mark.skipif(
-    not is_cdna4(),
-    reason="GLM-5.3-Flash padded prefill is specific to gfx950",
+    not (is_cdna4() or is_cdna5()),
+    reason="GLM-5.3-Flash padded prefill requires AMD CDNA4 or CDNA5",
 )
 def test_dsa_prefill_glm53_flash_zero_length_rows_are_zero() -> None:
     device = "cuda"

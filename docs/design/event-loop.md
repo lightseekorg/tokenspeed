@@ -202,6 +202,15 @@ The same reasoning fixes the metrics call: scheduler iteration metrics are
 recorded once per round, from the same pre-dispatch snapshot as the
 scheduler stats.
 
+Page gauges count LCM parents, excluding the reserved null parent. The
+per-round sampler reads `empty_lcm_blocks()` and `active_lcm_blocks()`;
+cached-only parents are `num_usable_pages - empty - active`. Active and cached
+counts are disjoint, even when cache groups pack multiple blocks into a parent.
+`LoadSnapshot.num_used_pages` sums active and cached parents to report all
+resident occupancy, including evictable cache, rather than cache alone.
+`available_lcm_blocks()` scans the pool and prefix indexes for reclaimability
+and belongs in diagnostics and leak checks, never in the per-round sampler.
+
 ## The hooks pattern
 
 Loop-side integration of a subsystem is a small class whose methods are the

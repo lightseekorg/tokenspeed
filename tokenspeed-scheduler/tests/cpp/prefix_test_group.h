@@ -46,7 +46,7 @@ public:
     PrefixTestGroup(std::int32_t block_granularity, std::int32_t cache_blocks_per_lcm_block, std::uint32_t group_id,
                     std::int32_t sliding_window)
         : geometry_{block_granularity},
-          allocator_{cache_blocks_per_lcm_block, group_id},
+          allocator_{cache_blocks_per_lcm_block, group_id, /*shard_count=*/1},
           index_{group_id},
           sliding_window_{sliding_window} {}
 
@@ -119,16 +119,22 @@ public:
     }
 
     void RegisterCachedBlock(BlockPool& pool, CacheBlockRef& block, const CacheKey& key) {
-        index_.Register(pool, block, key, ++next_access_epoch_);
+        index_.Register(pool, block, key, ++next_access_epoch_, /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                        /*newly_cached=*/nullptr);
     }
     void RegisterCachedBlock(BlockPool& pool, CacheBlockRef& block, const CacheKey& key, std::uint64_t access_epoch,
                              std::int32_t logical_block_index = -1,
                              CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk) {
-        index_.Register(pool, block, key, access_epoch, logical_block_index, boundary_kind);
+        index_.Register(pool, block, key, access_epoch, logical_block_index, boundary_kind, /*newly_cached=*/nullptr);
     }
     void CacheFullBlocks(BlockPool& pool, BlockTable& table, std::span<const CacheKey> keys,
                          std::int32_t first_slot = 0) {
-        index_.RegisterFullBlocks(pool, table, keys, ++next_access_epoch_, first_slot);
+        RegisterFullBlocks(pool, table, keys, ++next_access_epoch_, first_slot);
+    }
+    void RegisterFullBlocks(BlockPool& pool, BlockTable& table, std::span<const CacheKey> keys,
+                            std::uint64_t access_epoch, std::int32_t first_slot = 0) {
+        index_.RegisterFullBlocks(pool, allocator_.BlocksToPublish(table, first_slot, keys.size()), keys, access_epoch,
+                                  first_slot, CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr);
     }
 
     bool ContainsCachedBlock(const BlockPool& pool, const CacheKey& key) const { return index_.Contains(pool, key); }
@@ -140,7 +146,11 @@ public:
     }
     std::int32_t NumCachedBlocks(const BlockPool& pool) const { return index_.NumEntries(pool); }
     std::vector<CacheBlockLocation> EvictableBlockLocations(const BlockPool& pool) const {
-        return index_.EvictableLocations(pool);
+        std::vector<CacheBlockLocation> locations;
+        for (const PrefixCacheIndex::EvictionCandidate& candidate : index_.EvictableCandidates(pool)) {
+            locations.push_back(candidate.location);
+        }
+        return locations;
     }
     std::optional<PrefixCacheIndex::CachedBlockMetadata> CachedBlockMetadataFor(const BlockPool& pool,
                                                                                 CacheBlockLocation location) const {

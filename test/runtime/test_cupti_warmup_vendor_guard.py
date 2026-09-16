@@ -45,6 +45,8 @@ import sys
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -99,3 +101,7 @@ def test_nvidia_warms_cupti_when_asked():
 
 def test_no_cuda_is_a_noop():
     assert _run(is_amd=False, cuda_available=False) is False
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -9,7 +9,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
+from tokenspeed.runtime.distributed.comm_ops import all_gather_single
 
 
 def _local_vocab_argmax(
@@ -87,12 +87,12 @@ def _local_vocab_argmax(
 
     flat_values = gathered_values.reshape(-1)[: tp_size * rows]
     flat_ids = gathered_ids.reshape(-1)[: tp_size * rows]
-    all_gather_into_tensor(
+    all_gather_single(
         flat_values,
         local_max.contiguous(),
         tp_group,
     )
-    all_gather_into_tensor(
+    all_gather_single(
         flat_ids,
         global_ids.contiguous(),
         tp_group,

@@ -231,6 +231,10 @@ if current_platform().is_cdna4:
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.kv_pack import (
         gluon_mla_kv_pack_quantize_fp8_gfx950 as mla_kv_pack_quantize_fp8,
     )
+elif current_platform().is_cdna5:
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.kv_pack import (
+        gluon_mla_kv_pack_quantize_fp8_gfx1250 as mla_kv_pack_quantize_fp8,
+    )
 elif current_platform().is_nvidia:
     try:
         from tokenspeed_mla import (

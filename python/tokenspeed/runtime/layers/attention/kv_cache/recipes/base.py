@@ -346,6 +346,7 @@ class CacheRecipe(ABC):
         )
         parents = 0
         for group_id, packing in layout.group_packing:
+            packing *= self._shard_counts[group_id]
             child_pages = counts[group_id] - NULL_PAGES
             parents += (child_pages + packing - 1) // packing
         return parents
@@ -380,10 +381,16 @@ class CacheRecipe(ABC):
     def _group_specs(self) -> tuple[CacheGroupSpec, ...]:
         return tuple(spec for spec, _ in self.groups())
 
-    @staticmethod
-    def _max_packing(layout: CacheLayout) -> int:
-        """CacheBlocks per parent of the most finely packed group."""
-        return max(count for _, count in layout.group_packing)
+    @cached_property
+    def _shard_counts(self) -> dict[str, int]:
+        return {spec.group_id: spec.shard_count for spec in self._group_specs}
+
+    def _max_packing(self, layout: CacheLayout) -> int:
+        """Virtual CacheBlocks per parent of the most finely packed group."""
+        return max(
+            count * self._shard_counts[group_id]
+            for group_id, count in layout.group_packing
+        )
 
     # ------------------------------------------------------------------
     # Seams: extras

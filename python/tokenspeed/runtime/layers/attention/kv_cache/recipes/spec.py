@@ -65,7 +65,17 @@ class CacheGroupSpec:
     # Snapshot-state shape: raw-token span between two state checkpoints.
     checkpoint_granularity: int | None = None
 
+    # Number of cyclic owners of this group's virtual blocks. One keeps the
+    # same block IDs on every rank; local field geometry is independent of it.
+    shard_count: int = 1
+
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.shard_count, bool)
+            or not isinstance(self.shard_count, int)
+            or self.shard_count <= 0
+        ):
+            raise ValueError("shard_count must be a positive integer")
         has_rows = (
             self.rows_per_page is not None or self.entry_stride_tokens is not None
         )

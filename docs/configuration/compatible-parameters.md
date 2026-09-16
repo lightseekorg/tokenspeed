@@ -33,7 +33,7 @@ TokenSpeed-specific behavior explicitly.
 | `--max-num-seqs` | Maximum concurrent sequences. |
 | `--block-size` | KV cache block size. |
 | `--enable-prefix-caching` | Enable prefix cache reuse. |
-| `--no-enable-prefix-caching` | Disable prefix cache reuse. |
+| `--disable-prefix-caching` | Disable prefix cache reuse. |
 | `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |
 | `--max-cudagraph-capture-size` | Largest decode device-graph capture size. |
 | `--tensor-parallel-size`, `--tp` | Set attention tensor parallel size. |

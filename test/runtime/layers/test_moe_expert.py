@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest import mock
+
 import pytest
 import torch
 
@@ -10,6 +12,7 @@ from tokenspeed.runtime.layers.moe.topk import (
     StandardTopKOutput,
     TopKConfig,
 )
+from tokenspeed.runtime.layers.moe.utils import All2AllBackend
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 
 
@@ -26,11 +29,10 @@ def test_hybrid_moe_dispatches_from_actual_topk_format(
     calls: list[dict] = []
 
     def fake_moe_apply(*args, **kwargs):
-        calls.append(kwargs)
+        calls.append({"router_logits": args[3], **kwargs})
         return args[1]
 
     monkeypatch.setattr(expert_module.tokenspeed_kernel, "moe_apply", fake_moe_apply)
-    monkeypatch.setattr(expert_module, "pdl_enabled", lambda: False)
 
     hidden_states = torch.empty((2, 4))
     router_logits = torch.empty((2, 8))
@@ -45,12 +47,14 @@ def test_hybrid_moe_dispatches_from_actual_topk_format(
         StandardTopKOutput(
             torch.empty((2, 2)),
             torch.empty((2, 2), dtype=torch.int32),
-            router_logits,
+            None,
         ),
         num_global_tokens=2,
         max_num_tokens_per_gpu=2,
     )
 
+    assert calls[0]["router_logits"] is router_logits
+    assert calls[1]["router_logits"] is None
     assert "topk_weights" not in calls[0]
     assert "topk_ids" not in calls[0]
     assert calls[1]["topk_weights"].shape == (2, 2)
@@ -83,8 +87,10 @@ def test_moe_layer_rejects_invalid_situ_parameters(
         )
 
 
+@pytest.mark.parametrize("backend", ["none", "agrs", "flashinfer"])
 def test_moe_layer_builds_ep8_local_expert_partition(
     monkeypatch: pytest.MonkeyPatch,
+    backend: str,
 ) -> None:
     captured: dict[str, object] = {}
 
@@ -106,6 +112,9 @@ def test_moe_layer_builds_ep8_local_expert_partition(
         expert_module, "create_layer_weights", fake_create_layer_weights
     )
 
+    monkeypatch.setattr(
+        expert_module, "get_all2all_backend", lambda: All2AllBackend(backend)
+    )
     layer = MoELayer(
         top_k=16,
         num_experts=896,
@@ -127,6 +136,8 @@ def test_moe_layer_builds_ep8_local_expert_partition(
     assert layer.activation_situ_beta == 4.0
     assert layer.activation_situ_linear_beta == 25.0
     assert captured["spec"].num_local_experts == 112
+    assert captured["plan"]["a2a_backend"] == "none"
+    assert captured["spec"].a2a_backend == "none"
     assert captured["plan"]["ep_size"] == 8
     assert captured["plan"]["activation"] == "situ"
     assert captured["plan"]["routing_mode"] == "precomputed_topk"
@@ -274,3 +285,27 @@ def test_moe_layer_requests_dynamic_mxfp4_activations(
     )
 
     assert captured["internal_activation_dtype"] == "mxfp4"
+
+
+def test_kernel_routing_rejects_missing_logits(monkeypatch) -> None:
+    layer = MoELayer.__new__(MoELayer)
+    torch.nn.Module.__init__(layer)
+    layer.plan = {
+        "support_routing": True,
+        "supports_precomputed_topk": False,
+        "supports_deferred_finalize": False,
+    }
+    apply = mock.Mock(
+        side_effect=AssertionError("kernel launched without router logits")
+    )
+    monkeypatch.setattr(expert_module.tokenspeed_kernel, "moe_apply", apply)
+    with pytest.raises(ValueError, match="requires router logits"):
+        layer(
+            torch.ones(1, 4),
+            StandardTopKOutput(
+                torch.ones(1, 2), torch.zeros(1, 2, dtype=torch.int32), None
+            ),
+            num_global_tokens=1,
+            max_num_tokens_per_gpu=1,
+        )
+    apply.assert_not_called()

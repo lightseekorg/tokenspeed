@@ -91,7 +91,13 @@ class _RouterCase(_TorchCase):
         leaf.max_context_len = MAX_NUM_PAGES * 2
         leaf.kernel_page_size = 2
         leaf.device = "cpu"
-        router = CacheGroupRouter(None, is_draft=False, spec_num_tokens=1, device="cpu")
+        router = CacheGroupRouter(
+            None,
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=None,
+        )
         router.bind(
             CacheGroupGeometry(
                 granularities={FULL: 2},
@@ -475,14 +481,22 @@ class RunnerSignatureConformanceTest(_TorchCase):
         ),
         (
             "tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp",
-            "Qwen4ExpMambaAttnBackend",
+            "Qwen4ExpBackend",
+        ),
+        (
+            "tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple",
+            "Qwen4ExpPLEBackend",
+        ),
+        (
+            "tokenspeed.runtime.layers.attention.backends.specific.qsa_indexer",
+            "QSAIndexerBackend",
         ),
     )
 
     def test_init_forward_metadata_binds_the_runner_call_shape(self):
-        """The runner's extend call: five positionals, then block_tables and
-        the five extend fields as required keywords (no defaults anywhere),
-        plus the model-side extras a node may ignore."""
+        """The runner's extend call: five positionals, then block_tables with
+        its CPU mirror and the five extend fields as required keywords (no
+        defaults anywhere), plus the model-side extras a node may ignore."""
         import importlib
         import inspect
 
@@ -503,6 +517,7 @@ class RunnerSignatureConformanceTest(_TorchCase):
                         None,
                         None,
                         block_tables={},
+                        block_tables_cpu={},
                         extend_seq_lens=None,
                         extend_seq_lens_cpu=None,
                         extend_prefix_lens=None,

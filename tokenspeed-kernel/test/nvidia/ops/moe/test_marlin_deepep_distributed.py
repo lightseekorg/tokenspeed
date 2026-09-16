@@ -44,8 +44,6 @@ import torch.distributed as dist
 from kimi3_reference import mxfp4_moe_reference
 from utils import make_mxfp4_moe_weights
 
-deep_ep = pytest.importorskip("deep_ep", reason="deep_ep is an optional dependency")
-
 
 def _world_size() -> int:
     return int(os.environ.get("WORLD_SIZE", "1"))

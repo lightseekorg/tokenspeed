@@ -768,8 +768,8 @@ class KdaAttnBackend(MambaAttnBackend):
         lower_bound: float | None,
     ) -> torch.Tensor:
 
-        from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
-            fused_recurrent_kda_mtp,
+        from tokenspeed_kernel.ops.attention.kda.triton import (
+            kda_recurrent_decode_mtp,
         )
 
         num_heads = query.shape[2]
@@ -793,7 +793,7 @@ class KdaAttnBackend(MambaAttnBackend):
         write_rows = output_indices[:batch_size]
         state_out = ssm_scratch
 
-        return fused_recurrent_kda_mtp(
+        return kda_recurrent_decode_mtp(
             query_b,
             key_b,
             value_b,

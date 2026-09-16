@@ -55,6 +55,7 @@ from tokenspeed_kernel.ops.attention.gdn.triton import (
     set_total_chunks_hint_uniform,
 )
 from tokenspeed_kernel.ops.attention.kda.triton import verify_state_blocks
+from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     scrub_padding_tail,
@@ -63,12 +64,16 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
 )
+from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
+    _compute_state_block_index_plan,
+    _gather_state_block_indices,
+    gather_verified_state_blocks,
+    verified_state_block_slots,
+)
+from tokenspeed.runtime.layers.attention.backends.state.utils import row_stride_i32
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
-)
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    LINEAR_ATTENTION,
 )
 from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
     causal_conv1d_fn,
@@ -88,9 +93,6 @@ if TYPE_CHECKING:
     )
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
-
-# Default cache group id carrying GDN/Mamba state pages.
-_STATE_GROUP_ID = LINEAR_ATTENTION
 
 
 def _packed_qkv_views(
@@ -116,16 +118,6 @@ def _packed_qkv_views(
         key.view(1, seq_len, num_k_heads, head_k),
         value.view(1, seq_len, num_v_heads, head_v),
     )
-
-
-@dataclass(frozen=True)
-class _StateBlockIndexPlan:
-    checkpoint_granularity: int
-    before: torch.Tensor
-    after: torch.Tensor
-    has_history: torch.Tensor
-    in_slots: torch.Tensor
-    out_slots: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -173,125 +165,6 @@ def _slice_prefill_recurrent_inputs(
         f_a_out=None if f_a_out is None else f_a_out[token_start:token_end],
         beta_raw=None if beta_raw is None else beta_raw[token_start:token_end],
     )
-
-
-def _compute_state_block_index_plan(
-    checkpoint_granularity: int,
-    seq_lens_before: torch.Tensor,
-    seq_lens_after: torch.Tensor,
-) -> _StateBlockIndexPlan:
-    before = seq_lens_before
-    after = seq_lens_after
-    in_slots = torch.div(
-        before - 1, checkpoint_granularity, rounding_mode="floor"
-    ).clamp_(min=0)
-    out_slots = torch.div(after - 1, checkpoint_granularity, rounding_mode="floor")
-    return _StateBlockIndexPlan(
-        checkpoint_granularity=checkpoint_granularity,
-        before=before,
-        after=after,
-        has_history=before > 0,
-        in_slots=in_slots,
-        out_slots=out_slots,
-    )
-
-
-def _gather_state_block_indices(
-    rows: torch.Tensor,
-    plan: _StateBlockIndexPlan,
-    *,
-    out_slots_safe: torch.Tensor | None = None,
-    validate: bool = True,
-    group_id: str = _STATE_GROUP_ID,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    bs = plan.before.shape[0]
-    rows = rows[:bs]
-    max_slots = rows.shape[1]
-    if out_slots_safe is None:
-        out_slots_safe = plan.out_slots.clamp(min=0, max=max_slots - 1)
-
-    state_in = rows.gather(1, plan.in_slots.unsqueeze(1)).squeeze(1)
-    state_in = torch.where(plan.has_history, state_in, torch.zeros_like(state_in))
-    state_out = rows.gather(1, out_slots_safe.unsqueeze(1)).squeeze(1)
-
-    if validate:
-        if bool((plan.after <= 0).any()):
-            raise ValueError(
-                "state paging: seq_lens_after must be >= 1 for every request"
-            )
-        if bool((plan.out_slots >= max_slots).any()):
-            raise ValueError(
-                "state paging: out page slot exceeds table width "
-                f"{max_slots} (checkpoint_granularity="
-                f"{plan.checkpoint_granularity})"
-            )
-        if bool((state_in[plan.has_history] <= 0).any()):
-            raise ValueError(
-                "state paging: in page is a pad (-1) or hole (0) for a "
-                "request with history; reading it would silently resume "
-                f"from the zero state ({group_id!r} table)"
-            )
-        if bool((state_out <= 0).any()):
-            raise ValueError(
-                "state paging: out page is a pad (-1) or hole (0); the "
-                "request's working state page must be present in the "
-                f"{group_id!r} table"
-            )
-        # A step that crosses a page boundary or resumes from a prefix hit
-        # reads a page that is, or becomes, a read-only snapshot. It must write
-        # a different page.
-        # in == out is legal only for in-place evolution inside one page.
-        crossing = plan.has_history & (plan.in_slots != out_slots_safe)
-        if bool((state_in[crossing] == state_out[crossing]).any()):
-            raise ValueError(
-                "state paging: a boundary-crossing or prefix-resuming step "
-                "resolves the same page for input and output; the input "
-                "page is a read-only prefix snapshot and writing it would "
-                f"corrupt every branch sharing it ({group_id!r} table)"
-            )
-        # The <= 0 raise above guarantees every state_out entry is positive.
-        if torch.unique(state_out).numel() != state_out.numel():
-            raise ValueError(
-                f"state out pages must be unique per batch ({group_id!r} "
-                "table): two requests writing one working state page would "
-                "silently clobber each other"
-            )
-    return state_in.to(torch.int32), state_out.to(torch.int32)
-
-
-def compute_state_block_indices(
-    rows: torch.Tensor,
-    checkpoint_granularity: int,
-    seq_lens_before: torch.Tensor,
-    seq_lens_after: torch.Tensor,
-    *,
-    validate: bool = True,
-    group_id: str = _STATE_GROUP_ID,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dual-index state pages: in = slot of position n-1 (0/null when no
-    history), out = slot of the step's last position. rows: [bs, max_slots]
-    int32 page ids (-1 pad, 0 hole). Within a slot in == out (in-place
-    evolution); crossing a checkpoint boundary reads the old slot and writes
-    the new one; resuming from a prefix hit reads the claimed snapshot slot
-    and writes the fresh working slot.
-
-    Args:
-        rows: ``[bs, max_slots]`` int32 page-id table of one state group.
-        checkpoint_granularity: Token span of a state-block slot (``g``),
-            independent of the prefix identity granularity.
-        seq_lens_before: Per-request token count before this forward.
-        seq_lens_after: Per-request token count after this forward.
-        validate: Run the host-synchronizing write-side checks.
-        group_id: State group the table belongs to; only used to attribute
-            validation errors (multi-group KDA runs this once per group).
-
-    Returns:
-        ``(state_in, state_out)`` int32 page ids per request.
-    """
-    plan = _compute_state_block_index_plan(
-        checkpoint_granularity, seq_lens_before, seq_lens_after
-    )
-    return _gather_state_block_indices(rows, plan, validate=validate, group_id=group_id)
 
 
 def _prepare_gdn_decode_state_path(
@@ -571,24 +444,24 @@ class MambaAttnBackend(AttentionBackend):
             raise RuntimeError(
                 "MambaAttnBackend requires a KV pool with a runtime cache contract"
             )
-        state_group_ids = tuple(
-            spec.group_id for spec in contract.group_specs if spec.family == "state"
-        )
-        if not state_group_ids:
-            raise RuntimeError(
-                "MambaAttnBackend requires at least one state-family cache group"
-            )
         if getattr(kv_pool, "state_group_by_layer", None) is None or not callable(
             getattr(kv_pool, "get_component", None)
         ):
             raise RuntimeError(
                 "MambaAttnBackend requires state_group_by_layer and get_component()"
             )
-        checkpoint_granularities = {
-            spec.checkpoint_granularity
+        claimed_groups = set(kv_pool.state_group_by_layer.values())
+        state_specs = tuple(
+            spec
             for spec in contract.group_specs
-            if spec.family == "state"
-        }
+            if spec.group_id in claimed_groups and spec.family == "state"
+        )
+        state_group_ids = tuple(spec.group_id for spec in state_specs)
+        if not state_group_ids or set(state_group_ids) != claimed_groups:
+            raise RuntimeError(
+                "MambaAttnBackend requires a state-family group for every recurrent layer"
+            )
+        checkpoint_granularities = {spec.checkpoint_granularity for spec in state_specs}
         if len(checkpoint_granularities) != 1 or None in checkpoint_granularities:
             raise RuntimeError(
                 "MambaAttnBackend requires one shared state-group "
@@ -730,7 +603,7 @@ class MambaAttnBackend(AttentionBackend):
         Verify reads the state at the last COMMITTED position
         (``seq_lens - draft_token_num``); speculative outputs stay out of the
         state slab, and the accepted state is committed back by
-        ``update_mamba_state_after_mtp_verify``. Returns the per-group in
+        ``commit_speculative_state_after_verify``. Returns the per-group in
         pages, the committed lengths, and the per-group group tables (kept
         for the commit's dynamic page resolve).
         """
@@ -839,14 +712,7 @@ class MambaAttnBackend(AttentionBackend):
         if self._gdn_replay is not None:
             total += self._gdn_replay.payload.nbytes
             total += self._gdn_replay.parameters.nbytes
-        total += self._preallocate_aux_verify_workspace(max_bs, draft_token_num)
         return total
-
-    def _preallocate_aux_verify_workspace(
-        self, max_bs: int, draft_token_num: int
-    ) -> int:
-        """Allocate model-owned verify state and return its byte size."""
-        return 0
 
     def _verify_copy_tables_get(self) -> dict[str, torch.Tensor | int | None]:
         """Pointer tables for the batched verify state copies and replay:
@@ -865,18 +731,6 @@ class MambaAttnBackend(AttentionBackend):
         conv_bytes: int | None = None
         ssm_bytes: int | None = None
 
-        def _row_stride_i32(t: torch.Tensor) -> int:
-            # Slab components are page-interleaved as_strided views: row
-            # payload contiguous, row-to-row stride the physical page.
-            if t[0].numel() and not t[0].is_contiguous():
-                raise RuntimeError(
-                    "batched verify state copy requires contiguous row payloads"
-                )
-            stride_bytes = t.stride(0) * t.element_size()
-            if stride_bytes % 4:
-                raise RuntimeError("state row stride must be 4-byte aligned")
-            return stride_bytes // 4
-
         for layer_id in layer_ids:
             conv, ssm = self._state_components(layer_id)
             conv_scratch, ssm_scratch = self._verify_scratch[layer_id]
@@ -888,14 +742,14 @@ class MambaAttnBackend(AttentionBackend):
                 raise RuntimeError("verify state rows must be uniform per kind")
             conv_src.append(conv.data_ptr())
             conv_dst.append(conv_scratch.data_ptr())
-            conv_src_st.append(_row_stride_i32(conv))
-            conv_dst_st.append(_row_stride_i32(conv_scratch))
+            conv_src_st.append(row_stride_i32(conv))
+            conv_dst_st.append(row_stride_i32(conv_scratch))
             ssm_src.append(ssm.data_ptr())
-            ssm_src_st.append(_row_stride_i32(ssm))
+            ssm_src_st.append(row_stride_i32(ssm))
             ssm_element_st.append(ssm.stride(0))
             if not self.replay_ssm:
                 ssm_dst.append(ssm_scratch.data_ptr())
-                ssm_dst_st.append(_row_stride_i32(ssm_scratch))
+                ssm_dst_st.append(row_stride_i32(ssm_scratch))
             group_sel.append(group_index[self._state_group_for(layer_id)])
 
         def _u64(values: list[int]) -> torch.Tensor:
@@ -940,8 +794,6 @@ class MambaAttnBackend(AttentionBackend):
 
     def _seed_verify_scratch_batched(self, bs: int, draft_token_num: int) -> None:
         """Seed verify scratch from each layer's committed state page."""
-        from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
-
         tables = self._verify_copy_tables_get()
         state_in_by_group = self.forward_metadata.state_in_blocks_by_group
         sin_stack = torch.stack(
@@ -1007,8 +859,7 @@ class MambaAttnBackend(AttentionBackend):
         committed, tables, draft_token_num, read_pages_by_group = ctx
         bs = accepted_length.shape[0]
         k = accepted_length.to(torch.int64).clamp(min=1, max=draft_token_num)
-        new_last = committed[:bs] + k - 1
-        slot = torch.div(new_last, self._checkpoint_granularity, rounding_mode="floor")
+        slots = verified_state_block_slots(committed, k, self._checkpoint_granularity)
         stride = draft_token_num + 1
         src_rows = (
             torch.arange(bs, dtype=torch.int64, device=accepted_length.device) * stride
@@ -1016,23 +867,14 @@ class MambaAttnBackend(AttentionBackend):
         )
         pages_by_group: dict[str, torch.Tensor] = {}
         for group_id in self._state_groups():
-            rows_tbl = tables[group_id]
-            slot_safe = slot.clamp(min=0, max=rows_tbl.shape[1] - 1)
-            pages_by_group[group_id] = (
-                rows_tbl[:bs]
-                .gather(1, slot_safe.unsqueeze(1))
-                .squeeze(1)
-                .to(torch.int64)
-                .clamp_min(0)
+            pages_by_group[group_id] = gather_verified_state_blocks(
+                tables[group_id], slots
             )
-        self._commit_aux_verified_state(accepted_length, pages_by_group)
         copy_tables = self._verify_copy_tables_get()
         pages_stack = torch.stack(
             [pages_by_group[group_id] for group_id in self._state_groups()]
         )
         dst_rows = pages_stack.index_select(0, copy_tables["group_sel"]).reshape(-1)
-        from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
-
         src_tiled = src_rows.repeat(copy_tables["num_layers"])
         copy_state_rows(
             copy_tables["conv_scratch"],
@@ -1077,13 +919,6 @@ class MambaAttnBackend(AttentionBackend):
                 dst_row_strides=copy_tables["ssm_comp_stride"],
             )
         self._verify_commit_ctx = None
-
-    def _commit_aux_verified_state(
-        self,
-        accepted_length: torch.Tensor,
-        pages_by_group: dict[str, torch.Tensor],
-    ) -> None:
-        """Commit model-owned side state after speculative verification."""
 
     def _cache_contract_state_blocks(
         self,

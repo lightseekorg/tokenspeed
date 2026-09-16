@@ -27,8 +27,6 @@ from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
-import triton
-import triton.language as tl
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 from tokenspeed_kernel.ops.layernorm.triton import (
     fused_qk_rmsnorm_rope_gate,
@@ -113,6 +111,7 @@ from tokenspeed.runtime.utils import (
     set_weight_attrs,
 )
 from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.triton import tl, triton
 
 logger = logging.getLogger(__name__)
 
@@ -863,9 +862,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         v: torch.Tensor,
         gate: torch.Tensor | None,
         ctx: ForwardContext,
+        **kwargs,
     ) -> torch.Tensor:
         """Backend attention call + optional gate apply. Subclasses override."""
-        attn_output = self.attn(q, k, v, ctx)
+        attn_output = self.attn(q, k, v, ctx, **kwargs)
         if gate is not None:
             sigmoid_mul(attn_output, gate)
         return attn_output

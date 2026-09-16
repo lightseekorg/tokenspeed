@@ -28,7 +28,8 @@ nothing else is spawned here — an external frontend such as ``smg serve
 this engine dials in at ``tcp://{--data-parallel-address}:
 {--data-parallel-rpc-port}`` (default ``tcp://127.0.0.1:30500``). Headless
 mode implies ``--zmq-msgpack`` + ``--skip-tokenizer-init`` (see
-``launch_scheduler_headless``)."""
+``launch_scheduler_headless``).
+"""
 
 from __future__ import annotations
 
@@ -37,6 +38,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import sys
 from pathlib import Path
@@ -65,6 +67,7 @@ DEFAULT_GATEWAY_PORT = 8000
 DEFAULT_REASONING_PARSER = "passthrough"
 DEEPSEEK_V4_REASONING_PARSER = "deepseek_v31"
 DEEPSEEK_V4_TOOL_CALL_PARSER = "deepseek_v4"
+DEEPSEEK_V41_REASONING_PARSER = "deepseek_v41"
 GLM_REASONING_PARSER = "glm45"
 GLM_TOOL_CALL_PARSER = "glm47_moe"
 INKLING_REASONING_PARSER = "inkling"
@@ -343,8 +346,22 @@ def _load_model_config(model_id: str | None) -> dict:
     return config if isinstance(config, dict) else {}
 
 
-def _is_deepseek_v4_model(model_id: str | None) -> bool:
+def _is_deepseek_v41_model(model_id: str | None) -> bool:
     if not model_id:
+        return False
+    config = _load_model_config(model_id)
+    if config.get("model_type") in {"deepseek_v41", "deepseek_v41_text"} or (
+        "DeepseekV41ForCausalLM" in (config.get("architectures") or [])
+    ):
+        return True
+    return (
+        re.search(r"deepseek[-_]?v4[._-]?1(?:[-_/]|$)", model_id, re.IGNORECASE)
+        is not None
+    )
+
+
+def _is_deepseek_v4_model(model_id: str | None) -> bool:
+    if not model_id or _is_deepseek_v41_model(model_id):
         return False
     normalized = model_id.lower().replace("_", "-")
     if "deepseek-v4" in normalized or "deepseekv4" in normalized.replace("-", ""):
@@ -418,7 +435,17 @@ def _args_with_default_model_parsers(
     engine_result = list(engine_args)
     gateway_result = list(gateway_args)
 
-    if _is_deepseek_v4_model(model_id):
+    if _is_deepseek_v41_model(model_id):
+        if (
+            "--reasoning-parser" not in engine_result
+            and "--reasoning-parser" not in gateway_result
+        ):
+            engine_result.extend(["--reasoning-parser", DEEPSEEK_V41_REASONING_PARSER])
+            gateway_result.extend(["--reasoning-parser", DEEPSEEK_V41_REASONING_PARSER])
+        if "--tool-call-parser" not in gateway_result:
+            gateway_result.extend(["--tool-call-parser", "deepseek_v41"])
+
+    elif _is_deepseek_v4_model(model_id):
         if (
             "--reasoning-parser" not in engine_result
             and "--reasoning-parser" not in gateway_result

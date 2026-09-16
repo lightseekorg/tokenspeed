@@ -29,16 +29,20 @@ from tokenspeed_kernel.signature import format_signatures
 
 try:
     from tokenspeed_kernel_amd.ops.gfx950.sampling.argmax import (
-        gluon_argmax_gfx950 as _argmax_impl,
+        gluon_argmax_gfx950 as _argmax_gfx950_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.sampling.argmax import (
+        gluon_argmax_gfx1250 as _argmax_gfx1250_impl,
     )
 except ImportError as exc:
     _IMPORT_ERROR = exc
-    _argmax_impl = None
+    _argmax_gfx950_impl = None
+    _argmax_gfx1250_impl = None
 else:
     _IMPORT_ERROR = None
 
 
-if _argmax_impl is not None:
+if _IMPORT_ERROR is None:
 
     @register_kernel(
         "sampling",
@@ -61,7 +65,34 @@ if _argmax_impl is not None:
         *,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return _argmax_impl(logits, out=out)
+        return _argmax_gfx950_impl(logits, out=out)
+
+    @register_kernel(
+        "sampling",
+        "argmax",
+        name="gluon_argmax_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=format_signatures(
+            "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
+        ),
+        priority=Priority.SPECIALIZED,
+        tags={"latency", "throughput"},
+    )
+    def gluon_argmax_gfx1250(
+        logits: torch.Tensor,
+        *,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Reduce ``(M, N)`` logits into optional int32/int64 ``(M,)`` out.
+
+        Returns out when supplied, otherwise a newly allocated int64 tensor.
+        """
+        return _argmax_gfx1250_impl(logits, out=out)
 
 else:
 
@@ -74,5 +105,14 @@ else:
             "gluon_argmax_gfx950 requires tokenspeed-kernel-amd"
         ) from _IMPORT_ERROR
 
+    def gluon_argmax_gfx1250(
+        logits: torch.Tensor,
+        *,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        raise ImportError(
+            "gluon_argmax_gfx1250 requires tokenspeed-kernel-amd"
+        ) from _IMPORT_ERROR
 
-__all__ = ["gluon_argmax_gfx950"]
+
+__all__ = ["gluon_argmax_gfx950", "gluon_argmax_gfx1250"]

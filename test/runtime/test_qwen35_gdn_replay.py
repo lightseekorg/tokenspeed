@@ -528,36 +528,17 @@ def test_rebinding_a_pool_of_different_state_geometry_is_rejected():
     assert backend._checkpoint_granularity == 4
 
 
-def test_rebinding_a_state_backend_drops_registered_side_state_scratch():
+def test_rebinding_a_state_backend_clears_sparse_metadata():
     backend, _ = _make_backend(*_initial_pools(), replay=False)
-    side = SimpleNamespace(dropped=False, commit_after_mtp_verify=lambda *a, **k: None)
-    side.drop_verify_scratch = lambda: setattr(side, "dropped", True)
-    backend.register_speculative_state_backend(side)
+    share = backend.sparse_topk
+    share.prefill = share.decode = share.qsa_metadata = object()
 
     backend.set_cache_pool(
         _ContractPool(4, {0: ("linear_attention", *_initial_pools(seed=31))})
     )
-    assert side.dropped
-
-
-def test_rebinding_the_pool_drops_the_ple_verify_scratch():
-    """The PLE scratch is cut from the bound arena's fields, so a rebind must reissue it."""
-    from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
-        Qwen4ExpMambaAttnBackend,
-    )
-
-    backend = Qwen4ExpMambaAttnBackend.__new__(Qwen4ExpMambaAttnBackend)
-    backend._init_pool_binding()
-    layer = SimpleNamespace(dropped=False)
-    layer.drop_verify_scratch = lambda: setattr(layer, "dropped", True)
-    backend._ple_layers = (layer,)
-    backend._ple_verify_scratch = {"context": torch.zeros(2)}
-
-    pool = _ContractPool(4, {0: ("linear_attention", *_initial_pools())})
-    backend.set_kv_pool(pool)
-    assert backend.kv_pool is pool
-    assert backend._ple_verify_scratch == {}
-    assert layer.dropped
+    assert share.prefill is None
+    assert share.decode is None
+    assert share.qsa_metadata is None
 
 
 if __name__ == "__main__":

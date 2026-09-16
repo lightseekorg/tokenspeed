@@ -45,7 +45,7 @@ class TestCLIConfigCompat(unittest.TestCase):
     ) -> ServerArgs:
         argv = ["--model", model]
         if not enable_prefix_caching:
-            argv.append("--no-enable-prefix-caching")
+            argv.append("--disable-prefix-caching")
         argv.extend(["--speculative-config", config])
         args = self._parse_args(argv)
         server_args = self._from_cli_args_no_init(args)
@@ -348,23 +348,6 @@ class TestCLIConfigCompat(unittest.TestCase):
             )
             self.assertEqual(args.sampling_backend, backend)
 
-    def test_all2all_backend_arg(self):
-        args = self._parse_args(
-            ["--model", "test/model", "--all2all-backend", "deepep"]
-        )
-        self.assertEqual(args.all2all_backend, "deepep")
-
-    def test_recipe_all2all_backend_alias_arg(self):
-        args = self._parse_args(
-            [
-                "--model",
-                "test/model",
-                "--all2all-backend",
-                "flashinfer_nvlink_one_sided",
-            ]
-        )
-        self.assertEqual(args.all2all_backend, "flashinfer_nvlink_one_sided")
-
     def test_recipe_moe_backend_alias_arg(self):
         args = self._parse_args(
             ["--model", "test/model", "--moe-backend", "deep_gemm_mega_moe"]
@@ -393,7 +376,7 @@ class TestCLIConfigCompat(unittest.TestCase):
         args = self._parse_args(["--model", "test/model", "--enable-log-requests"])
         self.assertTrue(args.enable_log_requests)
 
-    def test_no_enable_log_requests_arg(self):
+    def test_disable_log_requests_arg(self):
         args = self._parse_args(["--model", "test/model", "--no-enable-log-requests"])
         self.assertFalse(args.enable_log_requests)
 
@@ -405,8 +388,8 @@ class TestCLIConfigCompat(unittest.TestCase):
         args = self._parse_args(["--model", "test/model", "--enable-prefix-caching"])
         self.assertTrue(args.enable_prefix_caching)
 
-    def test_no_enable_prefix_caching_arg(self):
-        args = self._parse_args(["--model", "test/model", "--no-enable-prefix-caching"])
+    def test_disable_prefix_caching_arg(self):
+        args = self._parse_args(["--model", "test/model", "--disable-prefix-caching"])
         self.assertFalse(args.enable_prefix_caching)
 
     def test_kv_events_config_arg(self):
@@ -440,7 +423,7 @@ class TestCLIConfigCompat(unittest.TestCase):
                         if disabled:
                             argv.append("--disable-kvstore")
                         if role == "decode":
-                            argv.append("--no-enable-prefix-caching")
+                            argv.append("--disable-prefix-caching")
                         sa = self._from_cli_args_no_init(self._parse_args(argv))
                         sa.resolve_cache()
 

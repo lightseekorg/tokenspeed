@@ -75,6 +75,8 @@ class CacheRuntimeContract:
         if any(not isinstance(spec, CacheGroupSpec) for spec in self.group_specs):
             raise ValueError("group_specs must contain CacheGroupSpec values")
         group_ids = tuple(spec.group_id for spec in self.group_specs)
+        if any(not isinstance(group_id, str) or not group_id for group_id in group_ids):
+            raise ValueError("group_specs must use nonempty string IDs")
         if len(group_ids) != len(set(group_ids)):
             raise ValueError("group_specs contain duplicate group IDs")
         counts = dict(self.group_page_counts)
@@ -117,10 +119,37 @@ class CacheRuntimeContract:
                 "cache_blocks_per_lcm_block + 1: "
                 f"expected={expected_counts}, got={counts}"
             )
-        max_child_pages = max(counts.values()) - 1
+        virtual_counts = self.virtual_block_counts
+        if max(virtual_counts.values()) - 1 > (1 << 31) - 1:
+            raise ValueError("virtual cache block ID exceeds int32 range")
+        for spec in self.group_specs:
+            if spec.rows_per_page is not None:
+                max_slots = counts[spec.group_id] * spec.rows_per_page
+                if max_slots - 1 > (1 << 31) - 1:
+                    raise ValueError(
+                        f"local cache slots for {spec.group_id!r} exceed int32 range"
+                    )
+        max_child_pages = max(virtual_counts.values()) - 1
         if token_capacity > max_child_pages * prefix_granularity:
             raise ValueError(
                 "token_capacity exceeds the largest group's child-page capacity"
             )
         object.__setattr__(self, "group_page_counts", MappingProxyType(counts))
         object.__setattr__(self, "group_packing", MappingProxyType(packing))
+
+    @property
+    def virtual_block_counts(self) -> Mapping[str, int]:
+        """Scheduler block counts, including the null block."""
+        return {
+            spec.group_id: 1
+            + (self.group_page_counts[spec.group_id] - 1) * spec.shard_count
+            for spec in self.group_specs
+        }
+
+    @property
+    def virtual_packing(self) -> Mapping[str, int]:
+        """Scheduler children per parent; physical binding uses group_packing."""
+        return {
+            spec.group_id: self.group_packing[spec.group_id] * spec.shard_count
+            for spec in self.group_specs
+        }

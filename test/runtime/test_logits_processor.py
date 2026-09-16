@@ -68,7 +68,7 @@ def test_tp_logits_all_gather_handles_zero_rows(monkeypatch):
     metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE)
     calls = {"all_gather": 0}
 
-    def fake_all_gather_into_tensor(output, input_, group):
+    def fake_all_gather_single(output, input_, group):
         calls["all_gather"] += 1
         assert group == (0, 1)
         assert tuple(output.shape) == (0, 3)
@@ -76,8 +76,8 @@ def test_tp_logits_all_gather_handles_zero_rows(monkeypatch):
 
     monkeypatch.setattr(
         logits_processor_module,
-        "all_gather_into_tensor",
-        fake_all_gather_into_tensor,
+        "all_gather_single",
+        fake_all_gather_single,
     )
 
     output = processor(
@@ -89,6 +89,69 @@ def test_tp_logits_all_gather_handles_zero_rows(monkeypatch):
 
     assert calls["all_gather"] == 1
     assert tuple(output.next_token_logits.shape) == (0, 6)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("cached", [False, True])
+def test_tp_logits_gather_preserves_dtype(monkeypatch, dtype, cached):
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=16),
+        skip_all_gather=False,
+        do_argmax=False,
+        logit_scale=None,
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+    )
+    state = object()
+    if cached:
+        processor._all_gather_state = state
+    calls = []
+
+    def initialize(lm_head):
+        assert dtype == torch.bfloat16
+        calls.append("init")
+        return state
+
+    def multicast(received_state, logits, *, tp_hidden_dim, skip_entry_sync, safe):
+        assert received_state is state
+        assert logits.dtype == torch.bfloat16
+        assert tp_hidden_dim == 16 and skip_entry_sync and not safe
+        calls.append("multicast")
+        return torch.cat((logits, logits), dim=-1)
+
+    def collective(output, logits, group):
+        assert dtype != torch.bfloat16
+        assert output.dtype == logits.dtype == dtype
+        assert group == (0, 1)
+        calls.append("collective")
+        output.copy_(torch.cat((logits, logits), dim=0))
+
+    monkeypatch.setattr(processor, "_init_all_gather_state", initialize)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(logits_processor_module, "all_gather_inner", multicast)
+    monkeypatch.setattr(logits_processor_module, "all_gather_single", collective)
+    hidden = torch.tensor([[1.0, 1 / 512]], dtype=dtype)
+    weight = torch.zeros((8, 2), dtype=dtype)
+    weight[0, 0] = 1
+    weight[1] = 1
+    local = hidden @ weight.T
+    output = processor._get_logits(
+        hidden,
+        SimpleNamespace(weight=weight),
+        logits_metadata=None,
+        embedding_bias=None,
+        plan=None,
+    )
+    assert output.dtype == dtype
+    torch.testing.assert_close(
+        output, torch.cat((local, local), dim=-1), rtol=0, atol=0
+    )
+    if dtype == torch.bfloat16:
+        assert calls == (["multicast"] if cached else ["init", "multicast"])
+    else:
+        assert calls == ["collective"]
+        assert output.argmax(-1).item() == 1
 
 
 @pytest.mark.parametrize(
@@ -126,6 +189,12 @@ def test_force_deterministic_rsag_disables_logits_symm_mem(
 def _set_fabric(monkeypatch, supported: bool) -> None:
     import tokenspeed_kernel.ops.communication.fabric as fabric
 
+    # These tests model NVIDIA multicast regardless of the runner's platform.
+    monkeypatch.setattr(
+        logits_processor_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_nvidia=True),
+    )
     # The topology is what makes these groups host-spread; without it the tests
     # would name a property their own setup never established.
     monkeypatch.setitem(
@@ -473,7 +542,7 @@ def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(monkeypatc
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     monkeypatch.setattr(
         logits_processor_module,
-        "all_gather_into_tensor",
+        "all_gather_single",
         lambda out, inp, group: None,
     )
 
@@ -512,9 +581,15 @@ def test_get_logits_softcap_disables_fused_argmax(monkeypatch):
         logits_processor_module, "fused_softcap_generic", lambda *a, **k: None
     )
 
-    hidden = torch.randn(4, 2, dtype=torch.float32)
-    lm_head = SimpleNamespace(weight=torch.randn(4, 2, dtype=torch.float32))  # 4*2 == 8
+    hidden = torch.randn(4, 2, dtype=torch.bfloat16)
+    lm_head = SimpleNamespace(
+        weight=torch.randn(4, 2, dtype=torch.bfloat16)
+    )  # 4*2 == 8
     md = LogitsMetadata(forward_mode=ForwardMode.DECODE)
     out = proc._get_logits(hidden, lm_head, md)
     assert called.get("ag")  # gathered (softcap on full vocab), not early-returned
     assert out.shape == (4, 8)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

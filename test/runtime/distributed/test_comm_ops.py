@@ -182,6 +182,29 @@ class TestAutoBackendTopology:
         assert result == "rsag-result"
         backend._nccl.all_gather.assert_not_called()
 
+    def test_last_dim_all_gather_wider_than_the_buffer_takes_nccl(self, monkeypatch):
+        """Rows past the prefill-sized RSAG buffer go to NCCL instead of asserting."""
+        from tokenspeed.runtime.distributed.comm_backend import triton_rsag
+
+        fallback = Mock()
+        fallback.all_gather.return_value = "nccl-result"
+        rsag = triton_rsag.TritonRSAGBackend(fallback=fallback)
+        state = Mock(max_token_num=8192)
+        monkeypatch.setattr(rsag, "_get_or_create", lambda group, hidden: state)
+        monkeypatch.setattr(
+            triton_rsag, "current_platform", lambda: Mock(is_nvidia=True)
+        )
+        inner = Mock(return_value="rsag-result")
+        monkeypatch.setattr(triton_rsag, "all_gather_inner", inner)
+        group = tuple(range(4))
+        wide = torch.empty(27648, 384, dtype=torch.bfloat16)
+        assert rsag.all_gather(wide, group, dim=-1) == "nccl-result"
+        fallback.all_gather.assert_called_once_with(wide, group=group, dim=-1)
+        inner.assert_not_called()
+        fits = torch.empty(8192, 384, dtype=torch.bfloat16)
+        assert rsag.all_gather(fits, group, dim=-1) == "rsag-result"
+        inner.assert_called_once()
+
     def test_host_spread_all_reduce_still_keys_on_topology(self, backend, monkeypatch):
         """Fabric governs the rsag paths only: triton_ar stays node-local."""
         self._set_fabric(monkeypatch, True)
@@ -452,24 +475,24 @@ def _test_all_gather(rank, world_size, device, group, ref_group):
         torch.testing.assert_close(result, expected)
 
 
-def _test_all_gather_into_tensor(rank, world_size, device, group, ref_group):
-    from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
+def _test_all_gather_single(rank, world_size, device, group, ref_group):
+    from tokenspeed.runtime.distributed.comm_ops import all_gather_single
 
     for sz in TEST_SIZES:
         for dtype in DTYPES:
             inp = torch.randint(1, 16, (sz,), dtype=dtype, device=device)
             output = torch.empty(sz * world_size, dtype=dtype, device=device)
             expected = torch.empty_like(output)
-            dist.all_gather_into_tensor(expected, inp, group=ref_group)
-            all_gather_into_tensor(output, inp, group)
+            dist.all_gather_single(expected, inp, group=ref_group)
+            all_gather_single(output, inp, group)
             torch.testing.assert_close(output, expected)
 
     # 2D
     inp = torch.randint(1, 16, (4, 128), dtype=torch.float32, device=device)
     output = torch.empty(4 * world_size, 128, dtype=torch.float32, device=device)
     expected = torch.empty_like(output)
-    dist.all_gather_into_tensor(expected, inp, group=ref_group)
-    all_gather_into_tensor(output, inp, group)
+    dist.all_gather_single(expected, inp, group=ref_group)
+    all_gather_single(output, inp, group)
     torch.testing.assert_close(output, expected)
 
 
@@ -503,7 +526,7 @@ def _test_reduce_scatter(rank, world_size, device, group, ref_group):
             total_sz = sz * world_size
             inp = torch.randint(1, 16, (total_sz,), dtype=dtype, device=device)
             expected = torch.empty(sz, dtype=dtype, device=device)
-            dist.reduce_scatter_tensor(expected, inp, group=ref_group)
+            dist.reduce_scatter_single(expected, inp, group=ref_group)
             result = reduce_scatter(inp.clone(), group)
             torch.testing.assert_close(result, expected)
 
@@ -512,7 +535,7 @@ def _test_reduce_scatter(rank, world_size, device, group, ref_group):
         total_rows = 16 * world_size
         inp = torch.randint(1, 16, (total_rows, 128), dtype=dtype, device=device)
         expected = torch.empty(16, 128, dtype=dtype, device=device)
-        dist.reduce_scatter_tensor(expected, inp, group=ref_group)
+        dist.reduce_scatter_single(expected, inp, group=ref_group)
         result = reduce_scatter(inp.clone(), group)
         torch.testing.assert_close(result, expected)
 
@@ -585,7 +608,7 @@ def _test_fused_ops(rank, world_size, device, group, ref_group):
     total_sz = 512 * world_size
     inp = torch.randint(1, 16, (total_sz,), dtype=torch.float32, device=device)
     expected = torch.empty(512, dtype=torch.float32, device=device)
-    dist.reduce_scatter_tensor(expected, inp, group=ref_group)
+    dist.reduce_scatter_single(expected, inp, group=ref_group)
     result = fused_reduce_scatter(inp.clone(), rank, group)
     torch.testing.assert_close(result, expected)
 
@@ -704,8 +727,8 @@ class TestCommOps:
         _run(world_size, _test_all_gather)
 
     @pytest.mark.parametrize("world_size", WORLD_SIZES)
-    def test_all_gather_into_tensor(self, world_size):
-        _run(world_size, _test_all_gather_into_tensor)
+    def test_all_gather_single(self, world_size):
+        _run(world_size, _test_all_gather_single)
 
     @pytest.mark.parametrize("world_size", WORLD_SIZES)
     def test_all_to_all_single(self, world_size):

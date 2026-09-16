@@ -31,6 +31,9 @@ wrapper call, entirely on CPU with the wrapper entry points stubbed out.
 
 from __future__ import annotations
 
+import sys
+from types import ModuleType
+
 import pytest
 import tokenspeed_kernel.ops.attention.kda.cuda as flash_op
 import tokenspeed_kernel.ops.attention.kda.cute_dsl as cutedsl_op
@@ -73,9 +76,16 @@ def stubbed_wrapper(monkeypatch):
         seen["state"] = state
         return v.clone(), state.clone()
 
-    monkeypatch.setattr(cutedsl_op, "cutedsl_kda_check_config", fake_check_config)
-    monkeypatch.setattr(cutedsl_op, "cutedsl_kda_workspace_size", fake_workspace_size)
-    monkeypatch.setattr(cutedsl_op, "cutedsl_kda_forward", fake_forward)
+    monkeypatch.setattr(
+        cutedsl_op, "cutedsl_kda_check_config", fake_check_config, raising=False
+    )
+    monkeypatch.setattr(
+        cutedsl_op,
+        "cutedsl_kda_workspace_size",
+        fake_workspace_size,
+        raising=False,
+    )
+    monkeypatch.setattr(cutedsl_op, "cutedsl_kda_forward", fake_forward, raising=False)
     return seen
 
 
@@ -141,15 +151,12 @@ def test_cutedsl_wrapper_preserves_state_and_int64_boundaries(
 def test_flash_original_wrapper_preserves_state_and_int64_boundaries(monkeypatch):
     seen: dict = {}
 
-    def fake_flash_kda_fwd():
-        def fake_forward(*args, **kwargs):
-            seen["state"] = kwargs["initial_state"]
-            seen["boundaries"] = kwargs["cu_seqlens"]
-            kwargs["final_state"].copy_(kwargs["initial_state"])
+    def fake_flash_kda_fwd(*args, **kwargs):
+        seen["state"] = kwargs["initial_state"]
+        seen["boundaries"] = kwargs["cu_seqlens"]
+        kwargs["final_state"].copy_(kwargs["initial_state"])
 
-        return fake_forward
-
-    monkeypatch.setattr(flash_op, "flash_kda_fwd", fake_flash_kda_fwd)
+    monkeypatch.setattr(flash_op, "flash_kda_fwd", fake_flash_kda_fwd, raising=False)
     q, k, v, g, beta, a_log, dt_bias = _inputs()
     boundaries = torch.tensor([0, T], dtype=torch.int64)
     host_boundaries = torch.tensor([0, T], dtype=torch.int64)
@@ -186,14 +193,11 @@ def test_adapters_preserve_runtime_v_major_state(
     import tokenspeed_kernel.ops.attention.kda as attn
     from tokenspeed_kernel.registry import KernelRegistry
 
-    def fake_flash_kda_fwd():
-        def fake_forward(*args, **kwargs):
-            kwargs["final_state"].copy_(kwargs["initial_state"])
-            args[6].copy_(args[2])
+    def fake_flash_kda_fwd(*args, **kwargs):
+        kwargs["final_state"].copy_(kwargs["initial_state"])
+        args[6].copy_(args[2])
 
-        return fake_forward
-
-    monkeypatch.setattr(flash_op, "flash_kda_fwd", fake_flash_kda_fwd)
+    monkeypatch.setattr(flash_op, "flash_kda_fwd", fake_flash_kda_fwd, raising=False)
     name = (
         "cutedsl_kda_nvidia_paged_prefill"
         if solution == "cutedsl_kda"
@@ -252,7 +256,7 @@ def test_hint_length_mismatch_raises(stubbed_wrapper):
 def test_cutedsl_original_adapter_split_matches_full_scan():
     import tokenspeed_kernel.ops.attention.kda as attn
 
-    if not cutedsl_op.is_cutedsl_kda_installed():
+    if not cutedsl_op.cutedsl_kda_supported():
         pytest.skip("CuteDSL KDA is not available on this GPU")
     generator = torch.Generator(device="cuda").manual_seed(123)
     tensors = [
@@ -403,6 +407,13 @@ def test_solution_wrappers_forward_host_boundaries(monkeypatch):
     monkeypatch.setattr(kd_cuda, "_nvidia_kda_prefill", fake_prefill)
     monkeypatch.setattr(cutedsl_op, "_nvidia_kda_prefill", fake_prefill)
 
+    def fake_kda_chunk_prefill():
+        pass
+
+    fla_module = ModuleType("tokenspeed_kernel.ops.attention.kda._triton.fla")
+    fla_module.kda_chunk_prefill = fake_kda_chunk_prefill
+    monkeypatch.setitem(sys.modules, fla_module.__name__, fla_module)
+
     q, k, v, g, beta, a_log, dt_bias = _inputs()
     cu = torch.tensor([0, T], dtype=torch.int32)
     kwargs = dict(
@@ -429,3 +440,37 @@ def test_solution_wrappers_forward_host_boundaries(monkeypatch):
     cutedsl_op.cutedsl_kda_nvidia_paged_prefill(**dict(kwargs))
     assert received[-1]["cu_seqlens_cpu"] is kwargs["cu_seqlens_cpu"]
     assert implementations[-1] == "cutedsl_kda_chunk_prefill"
+
+
+def test_mtp_wrapper_forwards_explicit_kernel_contract(monkeypatch):
+    import tokenspeed_kernel.ops.attention.kda._triton.recurrent as recurrent
+    import tokenspeed_kernel.ops.attention.kda.triton as kda_triton
+
+    positional = tuple(object() for _ in range(10))
+    output = object()
+    seen = {}
+
+    def fake_mtp(*args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return output
+
+    monkeypatch.setattr(recurrent, "fused_recurrent_kda_mtp", fake_mtp)
+    result = kda_triton.kda_recurrent_decode_mtp(
+        *positional,
+        h_pool_out="output_pool",
+        lower_bound=-5.0,
+        recurrent_layout="v_major",
+    )
+
+    assert result is output
+    assert seen["args"] == positional
+    assert seen["kwargs"] == {
+        "h_pool_out": "output_pool",
+        "scale": None,
+        "lower_bound": -5.0,
+        "recurrent_layout": "v_major",
+        "use_qk_l2norm_in_kernel": True,
+        "use_gate_in_kernel": True,
+        "use_beta_sigmoid_in_kernel": True,
+    }

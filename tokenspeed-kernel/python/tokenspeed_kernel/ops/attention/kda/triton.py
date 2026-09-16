@@ -26,6 +26,48 @@ _DENSE_HALF_SIGNATURES = format_signatures(
 _DENSE_BF16_SIGNATURES = format_signatures(("q", "k", "v"), "dense", {torch.bfloat16})
 
 
+def kda_recurrent_decode_mtp(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor | None,
+    h_pool: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    *,
+    h_pool_out: torch.Tensor,
+    lower_bound: float | None,
+    recurrent_layout: str,
+) -> torch.Tensor:
+    """Run multi-token KDA decode against explicit read and write state pools."""
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
+        fused_recurrent_kda_mtp,
+    )
+
+    return fused_recurrent_kda_mtp(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        A_log,
+        dt_bias,
+        h_pool,
+        read_indices,
+        write_indices,
+        h_pool_out=h_pool_out,
+        scale=None,
+        lower_bound=lower_bound,
+        recurrent_layout=recurrent_layout,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+    )
+
+
 @register_kernel(
     "attention",
     "kda_fused_paged_decode",
@@ -63,7 +105,7 @@ def triton_nvidia_kda_fused_paged_decode(
     norm_eps: float | None = None,
 ) -> torch.Tensor:
     """Adapt dev's NVIDIA conv/GEMV/recurrent megafusion."""
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         fused_recurrent_kda_megafuse,
     )
 
@@ -113,7 +155,7 @@ def _nvidia_fused_verify(
     g_raw: torch.Tensor | None = None,
     conv_qkv: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         fused_kda_verify_conv_update,
         fused_recurrent_kda_verify_megafuse,
     )
@@ -184,7 +226,7 @@ def triton_nvidia_kda_verify_conv_update(
     draft_token_num: int,
 ) -> torch.Tensor:
     """Materialize the NVIDIA split-verify convolution producer."""
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         fused_kda_verify_conv_update,
     )
 
@@ -504,7 +546,7 @@ def triton_nvidia_kda_replay_commit(
     gate_scratch: torch.Tensor | None = None,
 ) -> None:
     """Replay the accepted prefix of a verified window into the state pool."""
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         fused_recurrent_kda_replay_commit,
     )
 
@@ -590,7 +632,7 @@ def triton_nvidia_kda_batched_replay_commit(
     Returns:
         None.
     """
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         batched_recurrent_kda_replay_commit,
     )
 

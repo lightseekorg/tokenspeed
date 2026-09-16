@@ -79,7 +79,7 @@ def _eligible(
         ),
         mock.patch.object(latent_down.dist, "is_initialized", return_value=initialized),
         mock.patch.object(
-            latent_down.dist, "all_gather_into_tensor", side_effect=gather_ceilings
+            latent_down.dist, "all_gather_single", side_effect=gather_ceilings
         ),
         # Without this the vote reaches the real collective with a Mock group,
         # which no-ops: the tensor keeps its local value and the test passes
@@ -1207,7 +1207,7 @@ def test_an_agreed_ceiling_is_polled_once_not_once_per_layer() -> None:
 
     with _eligible(), _voting_ranks(built):
         with mock.patch.object(
-            latent_down.dist, "all_gather_into_tensor", side_effect=counted
+            latent_down.dist, "all_gather_single", side_effect=counted
         ):
             for block in range(4):
                 _initialize(block_index=block)

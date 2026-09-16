@@ -12,7 +12,7 @@ if not current_platform().is_cdna4:
 
 from tokenspeed_kernel.ops.moe import sigmoid_topk as packed_topk_module  # noqa: E402
 from tokenspeed_kernel.ops.moe.gluon import sigmoid_topk as routing_module  # noqa: E402
-from tokenspeed_kernel.thirdparty.triton import (  # noqa: E402
+from tokenspeed_kernel.ops.moe.triton.minimax_topk import (  # noqa: E402
     minimax_biased_grouped_topk,
 )
 

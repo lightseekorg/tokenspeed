@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
 import torch
 
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -216,3 +217,7 @@ def test_pd_contract_refused_when_disabled() -> None:
     assert pool.arena.supports_disaggregation is False
     with pytest.raises(RuntimeError, match="no transfer policy"):
         build_arena_cache_transfer_contract(pool.arena)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

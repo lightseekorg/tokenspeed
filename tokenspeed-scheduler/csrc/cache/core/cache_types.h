@@ -74,12 +74,15 @@ struct CacheGroupSpec {
     // Only kSlidingWindow uses this value. Mamba's one-checkpoint lookback is
     // an internal retention policy rather than a model window.
     std::int32_t sliding_window{0};
-    // Number of this group's CacheBlocks packed into one physical LCM block.
-    // It affects placement only, not the scheduler-wide prefix granularity.
+    // Number of this group's virtual CacheBlocks per LCM block (physical
+    // packing times shard_count). It affects placement only, not the
+    // scheduler-wide prefix granularity.
     std::int32_t cache_blocks_per_lcm_block{1};
     // Tokens represented by one CacheBlock in this group. Required: must be
     // a positive divisor of the coordinator-wide prefix granularity.
     std::int32_t block_granularity{0};
+    // Cyclic owners of the virtual blocks; must divide cache_blocks_per_lcm_block.
+    std::int32_t shard_count{1};
 };
 
 // Per-group input for one admission. prefix_hashes is the request's cumulative

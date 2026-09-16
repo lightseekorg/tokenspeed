@@ -29,6 +29,7 @@ from tokenspeed.runtime.utils import (
     get_colorful_logger,
     set_cuda_arch,
 )
+from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
 from tokenspeed.runtime.utils.server_args import ServerArgs
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -90,6 +91,18 @@ class WeightLoader:
                 load_config=load_config,
                 device_config=DeviceConfig(device),
             )
+            initialize_engram = getattr(model, "initialize_engram", None)
+            if callable(initialize_engram):
+                # Immutable tokenizer/hash tensors belong to the weight lifetime,
+                # before cache budgeting or the first warmup/captured forward.
+                tokenizer = get_tokenizer(
+                    server_args.tokenizer,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                    architectures=model_config.hf_config.architectures,
+                )
+                initialize_engram(tokenizer)
 
         # Load KV cache scaling factors if using FP8
         if server_args.kv_cache_dtype == "fp8_e4m3":

@@ -68,6 +68,13 @@ def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
 
+def _assert_fp8_rounding(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    # E4M3FN rounds by at most half its mantissa step (2**-3), or half
+    # its smallest subnormal (2**-9). Compare against FP32, since the
+    # portable split RoPE path rounds through BF16 before converting to FP8.
+    torch.testing.assert_close(actual.float(), expected, rtol=2**-4, atol=2**-10)
+
+
 def _make_inputs(n_loc: int, dtype: torch.dtype, pattern: str, seed: int = 0):
     torch.manual_seed(seed)
     device = "cuda"
@@ -421,7 +428,8 @@ def test_mla_rope_set_kv_buffer_matches_reference(is_neox, loc_dtype):
     torch.testing.assert_close(kv[loc.long()], kv_ref[loc.long()], atol=0.01, rtol=0.01)
 
 
-def test_mla_rope_set_kv_buffer_fp8_matches_two_kernel_path() -> None:
+def test_mla_rope_set_kv_buffer_fp8_matches_fp32_reference() -> None:
+    """Fused and split RoPE paths stay within the FP8 rounding bound."""
     torch.manual_seed(0)
     n_loc = 17
     num_heads = 3
@@ -464,8 +472,17 @@ def test_mla_rope_set_kv_buffer_fp8_matches_two_kernel_path() -> None:
     )
     torch.cuda.synchronize()
 
-    assert _bitwise_equal(query, query_ref)
-    assert _bitwise_equal(kv[loc], key_ref[:, 0])
+    assert _bitwise_equal(query[..., :NOPE_DIM], query_ref[..., :NOPE_DIM])
+    assert _bitwise_equal(kv[loc, :NOPE_DIM], key_ref[:, 0, :NOPE_DIM])
+    q_rope_ref = _rotate_rope_reference(q_rope.float(), cos_sin, positions, True)
+    k_rope_ref = _rotate_rope_reference(k_rope.float(), cos_sin, positions, True)
+    for actual, expected in (
+        (query[..., NOPE_DIM:], q_rope_ref),
+        (query_ref[..., NOPE_DIM:], q_rope_ref),
+        (kv[loc, NOPE_DIM:], k_rope_ref[:, 0]),
+        (key_ref[:, 0, NOPE_DIM:], k_rope_ref[:, 0]),
+    ):
+        _assert_fp8_rounding(actual, expected)
 
 
 @pytest.mark.parametrize("n_loc", [1, 17, 600])
@@ -520,10 +537,8 @@ def test_mla_set_kv_nope_matches_two_kernel_path(n_loc: int) -> None:
 
 @pytest.mark.parametrize("n_loc", [4, 600])
 @pytest.mark.parametrize("has_rope", [False, True])
-def test_fused_sanitize_matches_the_split_path_bytes(
-    n_loc: int, has_rope: bool
-) -> None:
-    """A sanitizing fused write lands the same latent bytes as the split path.
+def test_fused_sanitize_matches_the_split_path(n_loc: int, has_rope: bool) -> None:
+    """Fused writes preserve sanitization and FP8 accuracy of the split path.
 
     This is the property that lets Kimi-K3's pool declare
     ``latent_write_sanitizes`` instead of overriding the latent write: the
@@ -598,7 +613,29 @@ def test_fused_sanitize_matches_the_split_path_bytes(
 
     assert not torch.isnan(kv[loc.cpu()].float()).any()
     assert torch.isfinite(kv[loc.cpu()].float()).all()
-    assert _bitwise_equal(kv, kv_ref)
+    if not has_rope:
+        assert _bitwise_equal(kv, kv_ref)
+        return
+
+    # NoPE values and untouched slots still have an exact byte contract.
+    assert _bitwise_equal(kv[:, :NOPE_DIM], kv_ref[:, :NOPE_DIM])
+    untouched = torch.ones(NUM_PAGES, device="cuda", dtype=torch.bool)
+    untouched[loc] = False
+    assert _bitwise_equal(kv[untouched, NOPE_DIM:], kv_ref[untouched, NOPE_DIM:])
+
+    rope_ref = _rotate_rope_reference(k_rope.float(), cos_sin_cache, positions, False)[
+        :, 0
+    ]
+    finite = torch.isfinite(rope_ref)
+    actual_rope = kv[loc, NOPE_DIM:]
+    split_rope = kv_ref[loc, NOPE_DIM:]
+    # Non-finite inputs must produce exactly the split path's sanitized bytes.
+    assert torch.equal(
+        actual_rope.view(torch.uint8)[~finite],
+        split_rope.view(torch.uint8)[~finite],
+    )
+    for output in (actual_rope, split_rope):
+        _assert_fp8_rounding(output.float()[finite], rope_ref[finite])
 
 
 def _fake_mla_pool(dtype: torch.dtype = torch.float8_e4m3fn) -> MLATokenToKVPool:
@@ -857,3 +894,7 @@ def test_stacked_latent_write_matches_norm_rope_then_scatter(dtype, is_neox, san
         torch.testing.assert_close(
             buffers[layer].float(), expected, atol=tolerance, rtol=tolerance
         )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -22,6 +22,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+"""Triton DSV4 kernel exports.
+
+TODO: Moe kernel implementations into their own dedicated files.
+"""
+
 from __future__ import annotations
 
 import functools
@@ -29,6 +34,11 @@ import logging
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.attention.dsv4._triton.indexer import (  # noqa: F401
+    _triton_dsv4_decode_topk_mxfp4_impl,
+    _triton_dsv4_plan_impl,
+    _triton_dsv4_prefill_topk_mxfp4_impl,
+)
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -50,27 +60,159 @@ DEEPSEEK_V4_INDEXER_MXFP4_SCALE_DIM = (
 )
 DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT = 128
 
+_INDEXER_SIGNATURE = format_signature(
+    q=dense_tensor_format(torch.uint8),
+    weights=dense_tensor_format(torch.float32),
+    index_k_cache=dense_tensor_format(torch.uint8),
+)
+_INDEXER_TRAITS = {
+    "index_heads": frozenset({32, 64}),
+    "head_dim": frozenset({128}),
+    "topk": frozenset({512, 1024, 2048}),
+    "page_size": frozenset({64}),
+    "index_k_format": frozenset({"mxfp4"}),
+}
+
+
+@register_kernel(
+    "attention",
+    "dsv4_prefill_topk",
+    name="triton_dsv4_prefill_topk_mxfp4",
+    solution="triton",
+    signatures=frozenset({_INDEXER_SIGNATURE}),
+    traits=_INDEXER_TRAITS,
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    priority=Priority.PORTABLE,
+    tags={"portability", "mxfp4", "sparse"},
+)
+def triton_dsv4_prefill_topk_mxfp4(
+    index_q: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    cu_seqlen_k_start: torch.Tensor,
+    cu_seqlen_k_end: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    max_seqlen_k: int,
+    index_k_format: str,
+    block_table_base_offsets: torch.Tensor | None,
+    gathered_k: tuple[torch.Tensor, torch.Tensor] | None,
+    gather_workspace: tuple[torch.Tensor, torch.Tensor] | None,
+    out: torch.Tensor | None,
+) -> tuple[torch.Tensor, None]:
+    return _triton_dsv4_prefill_topk_mxfp4_impl(
+        index_q=index_q,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        block_table=block_table,
+        cu_seq_lens=cu_seq_lens,
+        cu_seqlen_k_start=cu_seqlen_k_start,
+        cu_seqlen_k_end=cu_seqlen_k_end,
+        seq_lens=seq_lens,
+        page_size=page_size,
+        topk=topk,
+        max_seqlen_k=max_seqlen_k,
+        index_k_format=index_k_format,
+        block_table_base_offsets=block_table_base_offsets,
+        gathered_k=gathered_k,
+        gather_workspace=gather_workspace,
+        out=out,
+    )
+
+
+@register_kernel(
+    "attention",
+    "dsv4_decode_topk",
+    name="triton_dsv4_decode_topk_mxfp4",
+    solution="triton",
+    signatures=frozenset({_INDEXER_SIGNATURE}),
+    traits=_INDEXER_TRAITS,
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    priority=Priority.PORTABLE,
+    tags={"portability", "mxfp4", "sparse"},
+)
+def triton_dsv4_decode_topk_mxfp4(
+    index_q: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    max_context_len: int,
+    plan: object,
+    index_k_format: str,
+    block_table_base_offsets: torch.Tensor | None,
+    out: torch.Tensor | None,
+    persistent_topk_workspace: torch.Tensor | None,
+) -> torch.Tensor:
+    return _triton_dsv4_decode_topk_mxfp4_impl(
+        index_q=index_q,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        context_lens=context_lens,
+        block_table=block_table,
+        page_size=page_size,
+        topk=topk,
+        max_context_len=max_context_len,
+        plan=plan,
+        index_k_format=index_k_format,
+        block_table_base_offsets=block_table_base_offsets,
+        out=out,
+        persistent_topk_workspace=persistent_topk_workspace,
+    )
+
+
+@register_kernel(
+    "attention",
+    "dsv4_plan",
+    name="triton_dsv4_plan",
+    solution="triton",
+    signatures=frozenset({format_signature()}),
+    traits={"page_size": frozenset({64})},
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    priority=Priority.PORTABLE,
+    tags={"portability", "cuda_graph"},
+)
+def triton_dsv4_plan(
+    *,
+    page_size: int,
+    seq_lens_2d: torch.Tensor,
+    out: object | None,
+) -> torch.Tensor:
+    return _triton_dsv4_plan_impl(
+        page_size=page_size,
+        seq_lens_2d=seq_lens_2d,
+        out=out,
+    )
+
+
 __all__ = [
     "dsv4_build_dense_prefill_local_compressed_indices",
     "dsv4_combine_dense_swa_indices",
     "dsv4_combine_topk_swa_indices",
     "dsv4_compact_compressed_slot_mapping",
     "dsv4_compressed_slot_mapping",
-    "dsv4_group_slot_mapping",
     "dsv4_compute_global_topk_indices_and_lens",
     "dsv4_decode_dense_compressed_indices_and_lens",
     "dsv4_decode_swa_indices_and_lens",
     "dsv4_dequantize_and_gather_k_cache",
-    "dsv4_fused_csa_indexer_fp8_cache_insert",
     "dsv4_fused_csa_indexer_mxfp4_cache_insert",
     "dsv4_fused_indexer_q_rope_hadamard_mxfp4",
-    "dsv4_fused_qnorm_rope_kv_insert",
     "dsv4_fused_sparse_compress_cache_insert",
     "dsv4_gather_indexer_mxfp4_cache",
+    "dsv4_group_slot_mapping",
     "dsv4_indexer_decode_metadata_compute",
     "dsv4_save_compressor_state",
-    "dsv4_sparse_attention",
     "dsv4_validate_active_cache_pages",
+    "triton_dsv4_csa_indexer_fp8_cache_insert",
+    "triton_dsv4_prefill",
+    "triton_dsv4_swa_cache_insert",
     "write_dsv4_indexer_mxfp4_cache_cuda",
 ]
 
@@ -261,7 +403,7 @@ def _dsv4_qnorm_rope_kv_insert_kernel(
     priority=Priority.PORTABLE,
     tags={"portability", "cache_insert"},
 )
-def dsv4_fused_qnorm_rope_kv_insert(
+def triton_dsv4_swa_cache_insert(
     q: torch.Tensor,
     kv: torch.Tensor,
     swa_kv_cache: torch.Tensor,
@@ -415,7 +557,7 @@ def _dsv4_sparse_attention_kernel(
     priority=Priority.PORTABLE,
     tags={"portability"},
 )
-def dsv4_sparse_attention(
+def triton_dsv4_prefill(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
@@ -1146,6 +1288,7 @@ def _dsv4_fused_sparse_compress_cache_kernel(
     TOKEN_STRIDE: tl.constexpr,
     SCALE_DIM: tl.constexpr,
     KV_BLOCK_STRIDE: tl.constexpr,
+    kv_write_mask_ptr=None,
 ):
     token_idx = tl.program_id(0)
 
@@ -1158,8 +1301,12 @@ def _dsv4_fused_sparse_compress_cache_kernel(
         return
 
     kv_slot = tl.load(kv_slot_mapping_ptr + token_idx)
-    if kv_slot < 0:
+    write_valid = kv_slot >= 0
+    if kv_write_mask_ptr is not None:
+        write_valid = write_valid & tl.load(kv_write_mask_ptr + token_idx)
+    if not write_valid:
         return
+    kv_slot = tl.maximum(kv_slot, 0)
 
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
     if block_table_base_offsets_ptr is not None:
@@ -1259,7 +1406,7 @@ def _dsv4_fused_sparse_compress_cache_kernel(
     tl.store(
         rope_ptr + rope_local,
         rotated.to(tl.bfloat16),
-        mask=(block >= NOPE_HEAD_DIM) & mask,
+        mask=(block >= NOPE_HEAD_DIM) & mask & write_valid,
     )
 
 
@@ -1298,8 +1445,22 @@ def dsv4_fused_sparse_compress_cache_insert(
     kv_cache_block_size: int,
     compress_ratio: int,
     overlap: bool,
-    block_table_base_offsets: torch.Tensor | None = None,
+    block_table_base_offsets: torch.Tensor | None,
+    kv_write_mask: torch.Tensor | None,
 ) -> None:
+    """Compress replicated state and store owned FP8 payload, scale and RoPE.
+
+    Args:
+        block_table_base_offsets: Optional per-request base offsets added to
+            the compressor block-table row before it is indexed.
+        kv_write_mask: Optional contiguous boolean vector covering the input
+            slots on the KV slot device. False entries suppress every store,
+            including scale padding, and may safely address reserved page 0.
+            None preserves the unmasked compression path.
+
+    Returns:
+        None. Selected cache rows are updated in place.
+    """
     num_actual = min(
         compressor_slot_mapping.numel(),
         positions.numel(),
@@ -1307,6 +1468,17 @@ def dsv4_fused_sparse_compress_cache_insert(
     )
     if num_actual == 0:
         return
+    if kv_write_mask is not None and (
+        kv_write_mask.ndim != 1
+        or kv_write_mask.dtype != torch.bool
+        or kv_write_mask.device != kv_slot_mapping.device
+        or kv_write_mask.numel() < num_actual
+        or not kv_write_mask.is_contiguous()
+    ):
+        raise ValueError(
+            "compressed cache write mask must be a contiguous bool vector "
+            "on the KV slot device and cover all slots"
+        )
     block_table_i32 = _as_int32_block_table(block_table)
     _dsv4_fused_sparse_compress_cache_kernel[(num_actual,)](
         state_cache,
@@ -1342,6 +1514,9 @@ def dsv4_fused_sparse_compress_cache_insert(
         TOKEN_STRIDE=DEEPSEEK_V4_SWA_TOKEN_STRIDE,
         SCALE_DIM=DEEPSEEK_V4_SWA_SCALE_DIM,
         KV_BLOCK_STRIDE=kv_cache_2d.stride(0),
+        kv_write_mask_ptr=(
+            kv_write_mask[:num_actual] if kv_write_mask is not None else None
+        ),
         num_warps=(
             16
             if compress_ratio >= 128
@@ -1524,7 +1699,7 @@ def _dsv4_fused_csa_indexer_fp8_cache_kernel(
     priority=Priority.PORTABLE,
     tags={"portability", "cache_insert"},
 )
-def dsv4_fused_csa_indexer_fp8_cache_insert(
+def triton_dsv4_csa_indexer_fp8_cache_insert(
     *,
     state_cache: torch.Tensor,
     token_to_req_indices: torch.Tensor,
@@ -2287,35 +2462,51 @@ def _dsv4_compute_global_topk_indices_and_lens_kernel(
     block_table_ptr,
     block_table_stride,
     is_valid_token_ptr,
-    has_valid_token: tl.constexpr,
+    base_offsets_ptr,
+    valid_lens_ptr,
+    num_requests,
+    table_width,
     block_size: tl.constexpr,
     topk: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
-    token_idx = tl.program_id(0)
-    if has_valid_token:
-        is_valid_token = tl.load(is_valid_token_ptr + token_idx)
-        if not is_valid_token:
-            tl.store(topk_lens_ptr + token_idx, 0)
-            return
-    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
-    count = tl.zeros((), dtype=tl.int32)
+    token_idx = tl.program_id(0).to(tl.int64)
+    req_idx = tl.load(token_to_req_indices_ptr + token_idx).to(tl.int64)
+    query_valid = (req_idx >= 0) & (req_idx < num_requests)
+    if is_valid_token_ptr is not None:
+        query_valid &= tl.load(is_valid_token_ptr + token_idx)
+    base = tl.full((), 0, tl.int64)
+    if base_offsets_ptr is not None:
+        base = tl.load(base_offsets_ptr + req_idx, mask=query_valid, other=0).to(
+            tl.int64
+        )
+    local_count = tl.zeros((), dtype=tl.int32)
+    scan_end = tl.zeros((), dtype=tl.int32)
 
     for i in range(0, topk, TRITON_BLOCK_SIZE):
-        offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+        offset = i + tl.arange(0, TRITON_BLOCK_SIZE).to(tl.int64)
         mask = offset < topk
-        local_idx = tl.load(
+        selected = tl.load(
             topk_indices_ptr + token_idx * topk_indices_stride + offset,
             mask=mask,
             other=-1,
         )
-        valid = local_idx >= 0
+        candidates_valid = mask & (selected >= 0) & query_valid
+        # Trim only upstream padding. Base/owner filtering may leave holes,
+        # and its per-layer readable count must not shorten the scan prefix.
+        scan_end = tl.maximum(
+            scan_end,
+            tl.max(tl.where(candidates_valid, offset + 1, 0).to(tl.int32), axis=0),
+        )
+        local_idx = selected.to(tl.int64) - base * block_size
         block_indices = local_idx // block_size
+        valid = candidates_valid & (local_idx >= 0) & (block_indices < table_width)
         block_numbers = tl.load(
             block_table_ptr + req_idx * block_table_stride + block_indices,
-            mask=mask & valid,
-            other=0,
-        )
+            mask=valid,
+            other=-1,
+        ).to(tl.int64)
+        valid &= block_numbers >= 0
         block_offsets = local_idx % block_size
         slot_ids = block_numbers * block_size + block_offsets
         slot_ids = tl.where(valid, slot_ids, -1)
@@ -2324,9 +2515,12 @@ def _dsv4_compute_global_topk_indices_and_lens_kernel(
             slot_ids,
             mask=mask,
         )
-        count += tl.sum(valid.to(tl.int32), axis=0)
+        if valid_lens_ptr is not None:
+            local_count += tl.sum(valid.to(tl.int32), axis=0)
 
-    tl.store(topk_lens_ptr + token_idx, count)
+    tl.store(topk_lens_ptr + token_idx, scan_end)
+    if valid_lens_ptr is not None:
+        tl.store(valid_lens_ptr + token_idx, local_count)
 
 
 def dsv4_compute_global_topk_indices_and_lens(
@@ -2336,54 +2530,109 @@ def dsv4_compute_global_topk_indices_and_lens(
     block_table: torch.Tensor,
     block_size: int,
     is_valid_token: torch.Tensor | None = None,
+    block_table_base_offsets: torch.Tensor | None = None,
+    out_valid_lens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Map local CSA top-k indices to global KV slots in one Triton kernel."""
+    """Map CSA top-k entries through a physical page table in one kernel.
+
+    Args:
+        topk_indices: Int32 compressed entry IDs [queries, width], padded by -1.
+            The upstream indexer must enforce each query's causal bound and
+            keep the candidate prefix length unchanged across layers within a
+            forward when the attention backend reuses its schedule.
+        token_to_req_indices: Int32/int64 vector covering every query's request
+            row. Noncontiguous metadata vectors are copied to contiguous storage.
+        block_table: Int32/int64 physical page IDs [requests, pages]; negative
+            pages are unreadable. DCP callers prepare local pages before this op.
+            Physical slots must fit int32. Both tables allow strided rows, with
+            unit column stride. All input tensors must share a device.
+        block_size: Positive number of compressed entries per physical page.
+        is_valid_token: Optional boolean vector covering every query; false
+            entries identify padded queries.
+        block_table_base_offsets: Optional int32/int64 vector of absolute first
+            logical pages [requests]. Top-k IDs stay absolute when supplied.
+        out_valid_lens: Optional contiguous int32 [queries] output receiving
+            the number of readable slots after all filtering, on the same device.
+
+    Returns:
+        Int32 physical slots [queries, width], with invalid entries set to -1,
+        and int32 scan lengths [queries]: one past the last nonnegative input
+        candidate, zero for empty, masked or out-of-range queries. For upstream
+        candidates with trailing padding this equals their valid count. Base
+        and page filtering preserve this prefix even when every output is -1.
+        Every slot is written, preserving candidate order, holes and duplicates.
+
+    Callers provide metadata with the documented shapes, dtypes and device.
+    Validation covers the top-k tensor, column strides and output count buffer.
+    """
 
     if topk_indices.dtype != torch.int32:
         raise TypeError(f"topk_indices must be int32, got {topk_indices.dtype}")
     if topk_indices.dim() != 2:
         raise ValueError(f"topk_indices must be 2-D, got {tuple(topk_indices.shape)}")
     num_tokens = topk_indices.shape[0]
-    global_topk_indices = torch.empty_like(topk_indices)
+    if topk_indices.stride(1) != 1 or block_table.stride(1) != 1:
+        raise ValueError("top-k mapping requires contiguous rows")
+    if out_valid_lens is not None and (
+        out_valid_lens.shape != (num_tokens,)
+        or out_valid_lens.dtype != torch.int32
+        or out_valid_lens.device != topk_indices.device
+        or not out_valid_lens.is_contiguous()
+    ):
+        raise ValueError("local counts must be contiguous int32 on the query device")
+    global_topk_indices = torch.empty_like(
+        topk_indices, memory_format=torch.contiguous_format
+    )
     topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
-    if num_tokens == 0:
+    rows, cols = block_table.shape
+    if num_tokens == 0 or topk_indices.shape[1] == 0 or rows == 0:
+        global_topk_indices.fill_(-1)
+        topk_lens.zero_()
+        if out_valid_lens is not None:
+            out_valid_lens.zero_()
         return global_topk_indices, topk_lens
     if is_valid_token is not None:
-        is_valid_token = is_valid_token[:num_tokens].to(
-            device=topk_indices.device,
-            dtype=torch.bool,
-        )
+        is_valid_token = is_valid_token[:num_tokens].contiguous()
+    token_to_req_indices = token_to_req_indices[:num_tokens].contiguous()
+    if block_table_base_offsets is not None:
+        block_table_base_offsets = block_table_base_offsets[:rows].contiguous()
     if not topk_indices.is_cuda:
-        valid = topk_indices >= 0
-        if is_valid_token is not None:
-            valid = valid & is_valid_token[:, None]
-        req_idx = token_to_req_indices[:num_tokens].to(torch.int64)
-        rows = int(block_table.shape[0]) if block_table.dim() >= 1 else 0
-        cols = int(block_table.shape[1]) if block_table.dim() >= 2 else 0
-        if rows <= 0 or cols <= 0:
-            global_topk_indices.fill_(-1)
-            topk_lens.zero_()
-            return global_topk_indices, topk_lens
-        safe_local = torch.where(valid, topk_indices, torch.zeros_like(topk_indices))
-        block_indices = torch.div(safe_local, block_size, rounding_mode="floor")
-        block_offsets = safe_local % block_size
+        req_idx = token_to_req_indices.to(torch.int64)
         req_valid = (req_idx >= 0) & (req_idx < rows)
-        block_valid = (block_indices >= 0) & (block_indices < cols)
-        valid = valid & req_valid[:, None] & block_valid
+        if is_valid_token is not None:
+            req_valid &= is_valid_token
+        candidates_valid = (topk_indices >= 0) & req_valid[:, None]
+        candidate_ends = torch.arange(
+            1, topk_indices.shape[1] + 1, dtype=torch.int32, device=topk_indices.device
+        )
+        topk_lens.copy_(torch.where(candidates_valid, candidate_ends, 0).amax(dim=1))
+        if cols == 0:
+            global_topk_indices.fill_(-1)
+            if out_valid_lens is not None:
+                out_valid_lens.zero_()
+            return global_topk_indices, topk_lens
         safe_req = req_idx.clamp(0, rows - 1)
+        local = topk_indices.to(torch.int64)
+        if block_table_base_offsets is not None:
+            local = (
+                local
+                - block_table_base_offsets.to(torch.int64)[safe_req, None] * block_size
+            )
+        block_indices = torch.div(local, block_size, rounding_mode="floor")
+        valid = candidates_valid & (block_indices >= 0) & (block_indices < cols)
         safe_block = block_indices.long().clamp(0, cols - 1)
         block_numbers = block_table[safe_req[:, None], safe_block]
+        valid &= block_numbers >= 0
         global_topk_indices.copy_(
             torch.where(
                 valid,
-                block_numbers.to(torch.int32) * block_size + block_offsets,
-                torch.full_like(topk_indices, -1),
+                block_numbers.to(torch.int64) * block_size + local % block_size,
+                -1,
             )
         )
-        topk_lens.copy_(valid.sum(dim=1, dtype=torch.int32))
+        if out_valid_lens is not None:
+            out_valid_lens.copy_(valid.sum(dim=1, dtype=torch.int32))
         return global_topk_indices, topk_lens
-    if is_valid_token is None:
-        is_valid_token = torch.empty(0, dtype=torch.bool, device=topk_indices.device)
 
     _dsv4_compute_global_topk_indices_and_lens_kernel[(num_tokens,)](
         global_topk_indices,
@@ -2391,11 +2640,14 @@ def dsv4_compute_global_topk_indices_and_lens(
         topk_lens,
         topk_indices,
         topk_indices.stride(0),
-        token_to_req_indices.to(torch.int32),
-        block_table.to(torch.int32),
+        token_to_req_indices,
+        block_table,
         block_table.stride(0),
         is_valid_token,
-        is_valid_token.numel() != 0,
+        block_table_base_offsets,
+        out_valid_lens,
+        rows,
+        cols,
         block_size=block_size,
         topk=topk_indices.shape[-1],
         TRITON_BLOCK_SIZE=1024,
