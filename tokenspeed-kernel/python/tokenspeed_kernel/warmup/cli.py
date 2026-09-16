@@ -24,6 +24,7 @@ import argparse
 
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry, load_builtin_kernels
+from tokenspeed_kernel.warmup.bundle import generate_bundle
 from tokenspeed_kernel.warmup.discovery import list_config_ids, load_config
 from tokenspeed_kernel.warmup.runner import validate_profile
 
@@ -70,7 +71,26 @@ def main(argv: list[str]) -> int:
         metavar="CONFIG",
         help="Validate one built-in warmup configuration",
     )
+    action.add_argument(
+        "--config",
+        metavar="CONFIG",
+        help="Generate a bundle from one built-in warmup configuration",
+    )
+    parser.add_argument(
+        "--output-dir",
+        metavar="PATH",
+        help="Output directory for a generated warmup bundle",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace an existing complete output bundle",
+    )
     args = parser.parse_args(argv)
+    if args.config is None and (args.output_dir is not None or args.force):
+        parser.error("--output-dir and --force require --config")
+    if args.config is not None and args.output_dir is None:
+        parser.error("--config requires --output-dir")
 
     if args.list_configs:
         for config_id in list_config_ids():
@@ -99,6 +119,21 @@ def main(argv: list[str]) -> int:
         except (TypeError, ValueError) as error:
             parser.error(str(error))
         print(f"{loaded.profile.id}: valid")
+        return 0
+
+    if args.config is not None:
+        try:
+            loaded = load_config(args.config)
+        except (TypeError, ValueError) as error:
+            parser.error(str(error))
+        output = generate_bundle(
+            loaded=loaded,
+            output_dir=args.output_dir,
+            force=args.force,
+            platform=current_platform(),
+            command=("python", "-m", "tokenspeed_kernel.warmup", *argv),
+        )
+        print(output)
         return 0
 
     try:

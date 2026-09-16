@@ -19,5 +19,11 @@
 # SOFTWARE.
 
 from tokenspeed_kernel.warmup.api import PreparedWarmup, WarmupConfig
+from tokenspeed_kernel.warmup.load import LoadedWarmupBundle, load_warmup_bundle
 
-__all__ = ["PreparedWarmup", "WarmupConfig"]
+__all__ = [
+    "LoadedWarmupBundle",
+    "PreparedWarmup",
+    "WarmupConfig",
+    "load_warmup_bundle",
+]

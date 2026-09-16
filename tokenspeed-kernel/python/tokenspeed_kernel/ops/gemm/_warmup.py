@@ -223,6 +223,10 @@ class Nvfp4SwigluQuantWarmupConfig:
     version: int
     cases: tuple[_Nvfp4SwigluQuantWarmupCase, ...]
 
+    @property
+    def maximum_num_tokens(self) -> int:
+        return max(case.maximum_num_tokens for case in self.cases)
+
     @classmethod
     def from_json(cls, raw: Mapping[str, object]) -> Nvfp4SwigluQuantWarmupConfig:
         _require_fields(raw, frozenset({"version", "cases"}), "warmup definition")

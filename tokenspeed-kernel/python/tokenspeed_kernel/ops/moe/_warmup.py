@@ -26,6 +26,7 @@ from types import SimpleNamespace
 
 import torch
 from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights
+from tokenspeed_kernel.ops.tuning import set_autotune_max_num_tokens
 from tokenspeed_kernel.platform import ArchVersion, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, WarmupBehavior
 
@@ -742,6 +743,10 @@ class MoeApplyWarmupConfig:
     tuning: _MoeTuning
     cases: tuple[_MoeCase, ...]
 
+    @property
+    def maximum_num_tokens(self) -> int:
+        return max(case.token_domain.maximum for case in self.cases)
+
     @classmethod
     def from_json(cls, raw: Mapping[str, object]) -> MoeApplyWarmupConfig:
         _fields(raw, {"version", "tuning", "cases"}, "moe.apply definition")
@@ -767,6 +772,11 @@ class MoeApplyWarmupConfig:
             raise ValueError("moe.apply FlashInfer warmup requires NVIDIA Blackwell")
         if not torch.cuda.is_available():
             raise RuntimeError("moe.apply warmup requires CUDA")
+        if self.tuning.strategy != "flashinfer_native":
+            raise NotImplementedError(
+                "two_stage_with_heuristic_floor warmup is not implemented yet"
+            )
+        set_autotune_max_num_tokens(self.maximum_num_tokens)
 
         planned = []
         registration = None
