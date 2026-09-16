@@ -28,6 +28,7 @@ import os
 from pathlib import Path
 from test.runtime.test_deepseek_v41_engram import _mapping
 from test.runtime.test_deepseek_v41_model import (
+    _Backend,
     _checkpoint,
     _config,
     _ctx,
@@ -91,8 +92,9 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
             self.layer_id = layer_id
             self.engram = Engram(layer_id) if layer_id >= 37 else None
 
-        def forward(self, hidden, pre_mix, positions, input_ids, ctx):
+        def forward(self, hidden, pre_mix, positions, input_ids, ctx, rows):
             events.append(("layer", self.layer_id))
+            assert rows.keep_rows is None and rows.source is rows.query
             # Distinct HC streams and a non-mean final mix catch weighted/output taps.
             return embeddings[:, None, :] + streams + 10 * self.layer_id, pre_mix
 
@@ -103,17 +105,20 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
     target.model.config = SimpleNamespace(
         num_hidden_layers=40, hidden_size=2, hc_mult=4, engram_layer_ids=[37, 38, 39]
     )
+    target.model.ced_decoder_start = 20
     target.model.layers = nn.ModuleList(Layer(i) for i in range(40))
     target.model.engram_hash = Mock(return_value=torch.tensor([[0, 1, 2], [0, 1, 2]]))
     target.model.norm = SimpleNamespace(weight=torch.ones(2), variance_epsilon=1e-6)
     target.set_dspark_layers_to_capture([37, 38, 39])
     assert target.model.dspark_capture_layers == (37, 38, 39)
     assert target.capture_aux_hidden_states
-    ctx = _ctx(None, 2, ForwardMode.EXTEND)
+    positions = torch.tensor([0, 1])
+    backend = _Backend(positions, torch.zeros(2, dtype=torch.int64))
+    ctx = _ctx(backend, 2, ForwardMode.EXTEND)
     ctx.capture_hidden_mode = capture_mode
     _, captures = target.model(
         torch.tensor([1, 2]),
-        torch.tensor([0, 1]),
+        positions,
         ctx,
         input_embeds=embeddings,
         pp_inbound=None,
@@ -396,7 +401,7 @@ def _assert_prefill_graph_matches_eager(adapter, monkeypatch):
         )
         before = drafter.kv_windows.clone(), drafter.context_lengths.clone()
         drafter._prefill_graph = None
-        assert drafter._seed_prefill_windows(hidden, bs) == n
+        assert drafter._seed_prefill_windows(hidden, bs, None) == n
         expected = drafter.kv_windows.clone(), drafter.context_lengths.clone()
         drafter.kv_windows.copy_(before[0])
         drafter.context_lengths.copy_(before[1])
@@ -409,10 +414,10 @@ def _assert_prefill_graph_matches_eager(adapter, monkeypatch):
                 "write_context_windows_batched",
                 Mock(side_effect=AssertionError("draft prefill ran eagerly")),
             )
-            assert drafter._seed_prefill_windows(hidden, bs) == n
+            assert drafter._seed_prefill_windows(hidden, bs, None) == n
         torch.testing.assert_close(drafter.kv_windows, expected[0], rtol=0, atol=0)
         torch.testing.assert_close(drafter.context_lengths, expected[1], rtol=0, atol=0)
-        assert drafter._seed_prefill_windows(hidden, 0) == 0
+        assert drafter._seed_prefill_windows(hidden, 0, None) == 0
 
 
 @pytest.mark.parametrize("checkpoint_source", ["temporary", "reference"])

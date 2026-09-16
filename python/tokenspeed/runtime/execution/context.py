@@ -73,6 +73,22 @@ class DraftNarrowing(Protocol):
         the following steps."""
 
 
+@dataclass(frozen=True)
+class CapturedRows:
+    """Row layout of a target forward's captured taps when the model narrowed.
+
+    A model whose later layers run on a subset of the input rows (DeepSeek
+    V4.1's CED decoder) captures its taps for that subset only. It reports
+    the subset here so a drafter can address the captures: ``positions`` is
+    every captured row's prompt position, extend requests first in
+    ``prefill_spans`` order ((row offset, row count) each), then the decode
+    rows in their verify layout.
+    """
+
+    positions: torch.Tensor
+    prefill_spans: tuple[tuple[int, int], ...]
+
+
 @dataclass
 class ForwardContext:
     """Do not contain Tensor.
@@ -113,6 +129,9 @@ class ForwardContext:
 
     # --- logits processor ---
     gather_ids: torch.Tensor | None = None
+    # Set by a target model that captures its taps on a narrowed row subset
+    # (see CapturedRows); None means one captured row per input row.
+    captured_rows: CapturedRows | None = None
 
     # --- spec-decode draft (drafter-attached collaborators, per forward) ---
     # Set on the draft forwards that narrow verify-shaped rows to the

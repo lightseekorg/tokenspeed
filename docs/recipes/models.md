@@ -949,6 +949,54 @@ production load, confirm that every rank reports a nonzero Prefix Replay window,
 then check completion, speculative acceptance, and cache-hit metrics with fixed
 prompts and package/model revisions.
 
+## DeepSeek V4.1-Flash
+
+DeepSeek V4.1 (`deepseek_v41`) is served by its own FlatKV attention backend
+with a four-group KV cache: the global KV chains, the SWA rows and the
+compressor tails. The recipe declares the last two **replayable**
+(`replay_window_tokens`): they never enter the prefix cache, and a prefix
+hit re-feeds the cached prefix's last 128 tokens so the model regenerates
+them into the request's own pages (SWA bounded replay,
+[`docs/design/scheduler.md` §1.3](../design/scheduler.md#13-bounded-replay)).
+The global KV and index rows those replayed tokens recompute are masked, so
+the shared rows stay exactly what the first computation produced. The CED
+decoder (layers 20–39) runs only on each prompt's last 128 positions
+(one row per chunk that does not complete its prompt), which is why the
+backend declares `prefill_graph=False`: the prefill row count changes at
+layer 20. Pass `--disable-prefill-graph` explicitly or let the backend
+resolution turn it off; decode CUDA graphs are unaffected.
+
+```bash
+tokenspeed serve deepseek-ai/DeepSeek-V4.1-Flash \
+  --served-model-name deepseek-v41-flash \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --enable-expert-parallel \
+  --moe-backend marlin \
+  --dtype bfloat16 \
+  --max-model-len 32768 \
+  --max-total-tokens 262144 \
+  --max-num-seqs 32 \
+  --chunked-prefill-size 8192 \
+  --max-cudagraph-capture-size 32 \
+  --disable-prefill-graph \
+  --disable-kvstore \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+Add `--speculative-algorithm DSPARK` for same-checkpoint DSpark decoding;
+the draft seeds its context windows from the decoder's kept rows. A hit
+re-feeds the groups' whole retention window (the 128-token attention window
+plus the admission protection, a few verify widths); the scheduler requires
+`--chunked-prefill-size` of at least that window plus one prefix page and
+never leaves a prompt's final chunk shorter than it. The replayed rows attend
+SWA keys from the replay start only, the truncation the model is trained
+for; the cached global KV is never recomputed from them.
+`usage.prompt_tokens_details.cached_tokens` reports the hit through the end
+of the replayed window, so it stays a multiple of the prefix granularity.
+Prefill/decode disaggregation is not implemented for V4.1.
+
 ## Tuning Order
 
 1. Set model ID, trust policy, tokenizer mode, and served model name.

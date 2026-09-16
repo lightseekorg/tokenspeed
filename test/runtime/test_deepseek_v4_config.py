@@ -246,6 +246,9 @@ def _extend_kwargs(
         extend_seq_lens_cpu=extend_seq_lens_cpu,
         extend_prefix_lens=extend_prefix_lens_cpu.clone(),
         extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+        extend_replay_lens_cpu=torch.zeros_like(extend_prefix_lens_cpu),
+        extend_prompt_lens_cpu=extend_prefix_lens_cpu
+        + extend_seq_lens_cpu[: extend_prefix_lens_cpu.numel()],
         extend_with_prefix=bool(extend_prefix_lens_cpu.any()),
     )
 

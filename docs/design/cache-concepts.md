@@ -684,6 +684,30 @@ off the diagonal is therefore legal by construction rather than by special
 case: a sliding-masked layer on a full-history group (a block drafter, DSA's
 sparse compute over a fully retained cache) simply retains more than it reads.
 
+A third contract appears when a group leaves prefix caching. DeepSeek V4.1
+declares its SWA rows and compressor tails **replayable**
+(`CacheGroupSpec.replay_window_tokens`, `recipes/deepseek_v41.py`): a prefix
+hit never shares them, so the scheduler re-feeds the cached prefix's last
+window and the backend regenerates them into the request's private pages.
+The rows it re-feeds carry `extend_replay_lens_cpu` down the extend bundle
+(`unified_path.md`), and the backend derives two things from it:
+
+* **Visibility for replayed rows** starts at the replay window's first
+  token (`V41PrefillSpan.swa_prefix_begin`): a re-fed row may not look back
+  into rows that were never regenerated, and the new rows after a full
+  window need nothing older than the window, so their view is unchanged.
+* **A write floor for the shared groups** (`V41Metadata.global_write_floor`
+  = prefix + replay per request): the replayed rows recompute the global KV
+  and index rows the hit already holds in shared pages, and `write_global`
+  masks every compression group whose last position lies below the floor
+  (ratio-aware: a ratio-2 pair straddling the floor is written). The
+  shared rows therefore stay exactly what the first computation produced;
+  only the private groups are rewritten.
+
+The same backend narrows the CED decoder to each request's prompt tail
+(`decoder_view()`); the decoder's SWA rows are decode-only state and, being
+in the replayable group, are never expected from a hit either.
+
 Block drafters (DFLASH / DSPARK) write their KV at the target's cache
 locations, so their storage *is* the target's full-history group whatever mask
 their layers apply. `resolve_cache_layer_types` labels every block-draft layer

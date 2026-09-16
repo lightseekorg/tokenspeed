@@ -31,6 +31,7 @@ from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     DeepseekV41AttentionBackend,
     V41CompressorPlan,
+    V41PrefillSpan,
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import DeepseekV41Config
@@ -235,7 +236,10 @@ def _tables(device):
     return tables
 
 
-def _extend(backend, tables, lengths, prefixes):
+def _extend(backend, tables, lengths, prefixes, replays, prompt_lens):
+    """One EXTEND batch; ``prefixes`` are the extend starts (replay rows
+    included), ``replays`` the leading rows re-fed inside a prefix hit and
+    ``prompt_lens`` the full prompt lengths deciding which spans complete."""
     device = backend.device
     counts = torch.tensor(lengths, dtype=torch.int32)
     prefix = torch.tensor(prefixes, dtype=torch.int32)
@@ -250,9 +254,16 @@ def _extend(backend, tables, lengths, prefixes):
         extend_seq_lens_cpu=counts,
         extend_prefix_lens=prefix.to(device),
         extend_prefix_lens_cpu=prefix,
+        extend_replay_lens_cpu=torch.tensor(replays, dtype=torch.int32),
+        extend_prompt_lens_cpu=torch.tensor(prompt_lens, dtype=torch.int32),
         extend_with_prefix=any(prefixes),
     )
     return backend.query_metadata(ForwardMode.EXTEND)
+
+
+def _final(lengths, prefixes):
+    """Prompt lengths for spans whose chunk completes the prompt."""
+    return [p + n for p, n in zip(prefixes, lengths)]
 
 
 @pytest.mark.parametrize("for_graph_replay", [False, True])
@@ -392,6 +403,8 @@ def test_packed_mixed_metadata_and_count_validation(verify_width):
         extend_seq_lens_cpu=torch.tensor([3]),
         extend_prefix_lens=torch.tensor([2]),
         extend_prefix_lens_cpu=torch.tensor([2]),
+        extend_replay_lens_cpu=torch.tensor([0]),
+        extend_prompt_lens_cpu=torch.tensor([5]),
         extend_with_prefix=True,
         num_tokens=3 + verify_width,
     )
@@ -527,6 +540,8 @@ def test_mixed_decode_rejects_missing_history():
             extend_seq_lens_cpu=torch.tensor([2]),
             extend_prefix_lens=torch.tensor([0]),
             extend_prefix_lens_cpu=torch.tensor([0]),
+            extend_replay_lens_cpu=torch.tensor([0]),
+            extend_prompt_lens_cpu=torch.tensor([2]),
             extend_with_prefix=False,
         )
 
@@ -536,7 +551,194 @@ def test_compressor_prefill_rejects_missing_history():
     tables = _tables("cpu")
     tables[TAIL].zero_()
     with pytest.raises(RuntimeError, match="compressor tail"):
-        _extend(backend, tables, [1], [3])
+        _extend(backend, tables, [1], [3], [0], _final([1], [3]))
+
+
+def test_replay_span_truncates_swa_prefix_and_validates_lengths():
+    """Rows re-fed inside a prefix hit start their SWA window at the replay
+    start: the plan carries no retained-prefix slots for them, while an
+    ordinary chunk at the same offset looks back into its own rows."""
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    meta = _extend(backend, tables, [131], [64], [0], [195])
+    plain = backend._swa_query_plan(
+        meta.positions, meta.request_indices, ForwardMode.EXTEND
+    )
+    assert plain.requests[0].prefix_slots.numel() == 64
+    meta = _extend(backend, tables, [131], [64], [128], [195])
+    replay = backend._swa_query_plan(
+        meta.positions, meta.request_indices, ForwardMode.EXTEND
+    )
+    assert replay.requests[0].prefix_slots.numel() == 0
+    assert meta.global_write_floor.tolist() == [192]
+    assert backend.query_metadata(ForwardMode.DECODE).global_write_floor is None
+    for lengths, prefixes, replays, prompts in (
+        ([3], [4], [5], [7]),  # replay longer than the chunk
+        ([3], [4], [-1], [7]),
+        ([3], [4], [0], [6]),  # chunk runs past its prompt
+    ):
+        with pytest.raises(ValueError, match="replay/prompt"):
+            _extend(backend, tables, lengths, prefixes, replays, prompts)
+
+
+def test_write_global_masks_rows_below_the_replay_floor(monkeypatch):
+    """A replayed row's global/index rows already sit in the pages the hit
+    claimed: the owner's scatter gets slot -1 for every compression group
+    whose last position lies below the request's floor, for both ratios."""
+    from tokenspeed_kernel.ops.attention import dsv41
+
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    # Request 0 replays [4, 8) of a hit at 8 and adds [8, 12); request 1 is a
+    # plain chunk with no floor above its own prefix.
+    meta = _extend(backend, tables, [8, 3], [4, 2], [4, 0], [12, 5])
+    assert meta.global_write_floor.tolist() == [8, 2]
+    seen = {}
+    monkeypatch.setattr(
+        dsv41,
+        "cache_scatter",
+        lambda rows, cache, slots, fmt: seen.__setitem__(fmt, slots.clone()),
+    )
+    rows = meta.positions.numel()
+    backend.write_global(
+        20,
+        torch.zeros(rows, 512),
+        torch.zeros(rows, 128),
+        meta.positions,
+        meta.request_indices,
+        ForwardMode.EXTEND,
+    )
+    unmasked = backend.cache_slots(
+        R1, meta.positions, meta.request_indices, ForwardMode.EXTEND
+    )
+    masked = (meta.positions < meta.global_write_floor[meta.request_indices]).tolist()
+    assert masked == [True] * 4 + [False] * 4 + [False] * 3
+    for fmt in ("global", "index"):
+        assert torch.equal(seen[fmt], unmasked.masked_fill(torch.tensor(masked), -1))
+    # Ratio 2: pair starts at 4 and 6 end below the floor of 8; the pair at 8
+    # is the first the request may write. Request 1's pair at 2 is its own.
+    pairs = torch.tensor([4, 6, 8, 10, 2])
+    requests = torch.tensor([0, 0, 0, 0, 1])
+    backend.write_global(
+        2, torch.zeros(5, 512), torch.zeros(5, 128), pairs, requests, ForwardMode.EXTEND
+    )
+    unmasked = backend.cache_slots(R2, pairs, requests, ForwardMode.EXTEND)
+    expected = unmasked.masked_fill(torch.tensor([True, True, False, False, False]), -1)
+    assert torch.equal(seen["global"], expected)
+    # Padding rows keep their negative slot and never index the floor.
+    backend.write_global(
+        20,
+        torch.zeros(1, 512),
+        torch.zeros(1, 128),
+        torch.tensor([-1]),
+        torch.tensor([-1]),
+        ForwardMode.EXTEND,
+    )
+    assert seen["global"].tolist() == [-1]
+
+
+def test_decoder_view_is_the_identity_for_decode_and_complete_short_chunks():
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    meta = _extend(backend, tables, [5, 3], [0, 2], [0, 0], [5, 5])
+    view = backend.decoder_view()
+    assert view.keep_rows is None and view.logits_rows is None
+    assert view.metadata is meta and view.prefill is meta
+    assert [(s.request, s.offset, s.prefix, s.count) for s in view.spans] == [
+        (0, 0, 0, 5),
+        (1, 5, 2, 3),
+    ]
+    backend.refresh_decode_metadata(
+        2,
+        2,
+        torch.tensor([0, 1]),
+        torch.tensor([23, 17]),
+        forward_mode=ForwardMode.DECODE,
+        block_tables=tables,
+        num_extends=0,
+        for_graph_replay=False,
+    )
+    view = backend.decoder_view()
+    assert view.keep_rows is None and view.logits_rows is None
+    assert view.metadata is backend.query_metadata(ForwardMode.DECODE)
+    assert view.prefill is None and view.spans == ()
+    # Graph replay at the same batch size refreshes the captured decode
+    # window in place: the view names that same metadata and no tensors.
+    backend.refresh_decode_metadata(
+        2,
+        1,
+        torch.tensor([0]),
+        torch.tensor([24]),
+        forward_mode=ForwardMode.DECODE,
+        block_tables=tables,
+        num_extends=0,
+        for_graph_replay=True,
+    )
+    assert backend.decoder_view().metadata is view.metadata
+    assert backend.decoder_view()[1:] == (None, (), None, None)
+
+
+def test_decoder_view_keeps_one_row_per_open_chunk_and_the_final_window():
+    """The CED decoder runs on each prompt-completing chunk's last window
+    (the whole chunk when shorter), on one row of every other chunk, and on
+    every decode row; sampled rows are the last kept row per request."""
+    backend = _verify_backend("cpu", 3, 2)
+    tables = _tables("cpu")
+    tables = {gid: torch.cat((t, t[:1])) for gid, t in tables.items()}
+    backend.init_forward_metadata(
+        3,
+        2,
+        torch.tensor([0, 1, 2]),
+        torch.tensor([9, 5, 9]),
+        ForwardMode.MIXED,
+        block_tables=tables,
+        extend_seq_lens=torch.tensor([5, 3]),
+        extend_seq_lens_cpu=torch.tensor([5, 3]),
+        extend_prefix_lens=torch.tensor([4, 2]),
+        extend_prefix_lens_cpu=torch.tensor([4, 2]),
+        extend_replay_lens_cpu=torch.tensor([4, 0]),
+        extend_prompt_lens_cpu=torch.tensor([12, 5]),
+        extend_with_prefix=True,
+    )
+    full = backend.query_metadata(ForwardMode.MIXED)
+    view = backend.decoder_view()
+    # Request 0 continues past this chunk: one row. Request 1 completes: all
+    # three rows. The verify-width-2 decode request keeps both rows.
+    assert view.keep_rows.tolist() == [4, 5, 6, 7, 8, 9]
+    assert view.metadata.positions.tolist() == [8, 2, 3, 4, 7, 8]
+    assert view.metadata.request_indices.tolist() == [0, 1, 1, 1, 2, 2]
+    assert view.logits_rows.tolist() == [0, 3, 4, 5]
+    assert view.spans == (
+        V41PrefillSpan(0, 0, 8, 1, 8),
+        V41PrefillSpan(1, 1, 2, 3, 2),
+    )
+    assert view.prefill.positions.tolist() == [8, 2, 3, 4]
+    assert torch.equal(
+        view.metadata.swa_write_slots, full.swa_write_slots[view.keep_rows]
+    )
+    assert view.metadata.global_write_floor is full.global_write_floor
+    # The view's prefill rows are a canonical window: planning them uses the
+    # host spans (no device snapshot) and each row's SWA starts at its span.
+    assert backend._window(
+        view.prefill.positions, view.prefill.request_indices, ForwardMode.EXTEND
+    ) == (view.prefill, view.spans)
+    plan = backend._swa_query_plan(
+        view.prefill.positions, view.prefill.request_indices, ForwardMode.EXTEND
+    )
+    assert [r.prefix_slots.numel() for r in plan.requests] == [0, 0]
+    # A completing chunk longer than the window keeps exactly the window.
+    # Without decode rows the view is its own prefill window, so the rows
+    # the decoder layers hand back are recognized as canonical.
+    meta = _extend(backend, tables, [140], [0], [0], [140])
+    view = backend.decoder_view()
+    assert view.keep_rows.tolist() == list(range(12, 140))
+    assert view.spans == (V41PrefillSpan(0, 0, 12, 128, 12),)
+    assert view.logits_rows.tolist() == [127]
+    assert view.prefill is view.metadata
+    assert view.metadata.positions.tolist() == meta.positions[12:].tolist()
+    assert backend._window(
+        view.metadata.positions, view.metadata.request_indices, ForwardMode.EXTEND
+    ) == (view.metadata, view.spans)
 
 
 def _decode_compute(backend, inputs, bs):
@@ -598,7 +800,9 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool, verify_
     from tokenspeed_kernel.ops.attention import dsv41
 
     assert DeepseekV41AttentionBackend.cuda_graph_support.decode_graph
-    assert DeepseekV41AttentionBackend.cuda_graph_support.prefill_graph
+    # Decoder narrowing makes the prefill row count depend on prompt
+    # completion, not on the token bucket, so prefill graphs stay off.
+    assert not DeepseekV41AttentionBackend.cuda_graph_support.prefill_graph
     torch.manual_seed(42)
     backend = _verify_backend("cuda", 5, verify_width)
     backend.cache_pool.arena.buffer.zero_()
@@ -613,7 +817,7 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool, verify_
         torch.rand(capacity, 2, device="cuda", dtype=torch.bfloat16),
         torch.zeros(2, device="cuda"),
     )
-    meta = _extend(backend, tables, [12, 12], [0, 0])
+    meta = _extend(backend, tables, [12, 12], [0, 0], [0, 0], _final([12, 12], [0, 0]))
     history = torch.randn(24, 512, device="cuda", dtype=torch.bfloat16)
     for layer in (2, 3, 20, 24, 25):
         dsv41.cache_scatter(
@@ -910,6 +1114,42 @@ def test_recipe_exact_geometry_capacity_and_dispatch():
     assert _resolve_cache_family(profile, recipe.attn_config) == "deepseek_v41"
 
 
+def test_recipe_declares_replay_windows_for_the_private_groups():
+    """The SWA and compressor-tail groups leave prefix caching: the recipe
+    marks them replayable, the scheduler bridge forwards the windows, and
+    the backend refuses a pool that would share them through a hit."""
+    from tokenspeed.runtime.engine.scheduler_utils import pool_to_cache_groups
+
+    recipe = _recipe("cpu")
+    specs = {s.group_id: s for s, _ in recipe.groups()}
+    # The whole retention window (attention window or pair, plus protection).
+    expected = {SWA: 130, R2: None, R1: None, TAIL: 4}
+    assert {gid: s.replay_window_tokens for gid, s in specs.items()} == expected
+    backend = _backend("cpu", 2)
+    groups = {g.group_id: g for g in pool_to_cache_groups(backend.cache_pool)}
+    assert {gid: g.replay_window_tokens for gid, g in groups.items()} == expected
+    with pytest.raises(ValueError, match="sliding-window"):
+        replace(specs[R1], replay_window_tokens=1)
+    with pytest.raises(ValueError, match="replay_window_tokens must be"):
+        replace(specs[SWA], replay_window_tokens=specs[SWA].sliding_window_tokens + 1)
+    with pytest.raises(ValueError, match="replay_window_tokens must be"):
+        replace(specs[TAIL], replay_window_tokens=0)
+    cached_swa = tuple(
+        replace(spec, replay_window_tokens=None) if spec.group_id == SWA else spec
+        for spec, _ in recipe.groups()
+    )
+    arena = CacheArena(
+        _layout(recipe).bind(16),
+        "cpu",
+        cache_group_specs=cached_swa,
+        token_capacity=1024,
+        enable_memory_saver=False,
+    )
+    pool = DeepseekV41CachePool(arena, layer_num=40, rank=0, field_layer_offset=0)
+    with pytest.raises(ValueError, match="replay_window_tokens equal"):
+        backend.set_cache_pool(pool)
+
+
 def test_owner_topology_and_reject_invalid_recipes():
     owners, sources = v41_layer_mapping(RATIOS, OWNERS, SOURCES, 20)
     assert owners == (-1, -1) + (2,) * 6 + (8,) * 6 + (14,) * 6 + (20,) * 20
@@ -1071,7 +1311,7 @@ def test_packed_compressor_rejected_suffix_every_acceptance(prefix, accepted):
     torch.manual_seed(41)
     content, scores = torch.randn(2, prefix + width, 512)
     new_content, new_scores = torch.randn(2, width, 512)
-    meta = _extend(backend, tables, [prefix], [0])
+    meta = _extend(backend, tables, [prefix], [0], [0], _final([prefix], [0]))
     backend.compress(
         2,
         content[:prefix],
@@ -1126,7 +1366,9 @@ def test_compressor_odd_chunks_arbitrary_requests_and_rejected_suffix():
     ).sum(1)
     parts = []
     for prefix, count in ((0, 3), (3, 2), (5, 2)):
-        meta = _extend(backend, tables, [count], [prefix])
+        meta = _extend(
+            backend, tables, [count], [prefix], [0], _final([count], [prefix])
+        )
         pooled, pos, req = backend.compress(
             2,
             content[prefix : prefix + count],
@@ -1144,7 +1386,7 @@ def test_compressor_odd_chunks_arbitrary_requests_and_rejected_suffix():
     torch.testing.assert_close(torch.cat(parts), expected)
     # Position-addressed history survives an uncommitted suffix; this is not
     # a claim that the gated speculative scheduler/commit path is supported.
-    meta = _extend(backend, tables, [2], [7])
+    meta = _extend(backend, tables, [2], [7], [0], _final([2], [7]))
     backend.compress(
         2,
         torch.randn(2, 512),
@@ -1154,7 +1396,7 @@ def test_compressor_odd_chunks_arbitrary_requests_and_rejected_suffix():
         norm_eps=0.0,
     )
     # Reject that suffix logically, then complete a different token7.
-    meta = _extend(backend, tables, [1], [7])
+    meta = _extend(backend, tables, [1], [7], [0], _final([1], [7]))
     new_content, new_scores = torch.randn(1, 512), torch.randn(1, 512)
     pooled, _, _ = backend.compress(
         2,
@@ -1184,7 +1426,7 @@ def test_gpu_quantized_joint_attention_and_reindex_reuse():
 
     backend = _backend("cuda", 2)
     tables = _tables("cuda")
-    meta = _extend(backend, tables, [17, 3], [0, 0])
+    meta = _extend(backend, tables, [17, 3], [0, 0], [0, 0], _final([17, 3], [0, 0]))
     torch.manual_seed(7)
     n = meta.positions.numel()
     main = torch.randn(n, 512, device="cuda", dtype=torch.bfloat16)
@@ -1272,6 +1514,8 @@ def test_mixed_metadata_query_windows_and_capacity():
         extend_seq_lens_cpu=torch.tensor([3]),
         extend_prefix_lens=torch.tensor([2]),
         extend_prefix_lens_cpu=torch.tensor([2]),
+        extend_replay_lens_cpu=torch.tensor([0]),
+        extend_prompt_lens_cpu=torch.tensor([5]),
         extend_with_prefix=True,
     )
     assert backend.query_metadata(ForwardMode.MIXED).positions.tolist() == [2, 3, 4, 8]
@@ -1326,7 +1570,9 @@ def test_gpu_ratio2_prefill_to_decode_including_empty_compressor_step():
             )
             meta = backend.query_metadata(mode)
         else:
-            meta = _extend(backend, tables, [count], [prefix])
+            meta = _extend(
+                backend, tables, [count], [prefix], [0], _final([count], [prefix])
+            )
         stop = prefix + count
         pooled, pos, req = backend.compress(
             2,
@@ -1371,7 +1617,7 @@ def test_gpu_swa_prefill_cross_chunk_matches_full_and_null_is_untouched():
     q = torch.randn(140, 2, 512, device="cuda", dtype=torch.bfloat16)
     swa = torch.randn(140, 512, device="cuda", dtype=torch.bfloat16)
     sink = torch.zeros(2, device="cuda", dtype=torch.float32)
-    meta = _extend(backend, tables, [140], [0])
+    meta = _extend(backend, tables, [140], [0], [0], _final([140], [0]))
     full = backend.forward_v41(
         q,
         swa,
@@ -1389,7 +1635,9 @@ def test_gpu_swa_prefill_cross_chunk_matches_full_and_null_is_untouched():
     backend.cache_pool.arena.buffer.zero_()
     chunks = []
     for prefix, count in ((0, 3), (3, 64), (67, 73)):
-        meta = _extend(backend, tables, [count], [prefix])
+        meta = _extend(
+            backend, tables, [count], [prefix], [0], _final([count], [prefix])
+        )
         chunks.append(
             backend.forward_v41(
                 q[prefix : prefix + count],
@@ -1411,11 +1659,50 @@ def test_gpu_swa_prefill_cross_chunk_matches_full_and_null_is_untouched():
     torch.cuda.synchronize()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_gpu_replayed_rows_attend_from_the_window_start_only():
+    """Bounded replay truncates SWA at the replay start: a chunk re-feeding
+    [64, 128) before 12 new rows attends exactly like a fresh 76-row prompt
+    (RoPE is applied by the model, so only the window shape matters here),
+    not like the same rows inside the full prompt."""
+    backend = _backend("cuda", 2)
+    tables = _tables("cuda")
+    torch.manual_seed(9)
+    q = torch.randn(140, 2, 512, device="cuda", dtype=torch.bfloat16)
+    swa = torch.randn(140, 512, device="cuda", dtype=torch.bfloat16)
+    sink = torch.zeros(2, device="cuda", dtype=torch.float32)
+
+    def attend(meta, rows):
+        return backend.forward_v41(
+            q[rows],
+            swa[rows],
+            layer_id=0,
+            positions=meta.positions,
+            request_indices=meta.request_indices,
+            forward_mode=ForwardMode.EXTEND,
+            index_q=None,
+            index_weights=None,
+            attn_sink=sink,
+            softmax_scale=512**-0.5,
+            index_process_group=None,
+            swa_rope_cache=None,
+        )
+
+    full = attend(_extend(backend, tables, [140], [0], [0], [140]), slice(0, 140))
+    backend.cache_pool.arena.buffer.zero_()
+    replayed = attend(_extend(backend, tables, [76], [64], [64], [140]), slice(64, 140))
+    backend.cache_pool.arena.buffer.zero_()
+    fresh = attend(_extend(backend, tables, [76], [0], [0], [76]), slice(64, 140))
+    torch.testing.assert_close(replayed, fresh, rtol=0, atol=0)
+    assert not torch.equal(replayed, full[64:])
+    torch.cuda.synchronize()
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_prefill_plan_reuses_addresses_and_refresh_rechecks_pages(device):
     backend = _backend(device, 2)
     tables = _tables(device)
-    meta = _extend(backend, tables, [3], [128])
+    meta = _extend(backend, tables, [3], [128], [0], _final([3], [128]))
     first = backend._swa_query_plan(
         meta.positions, meta.request_indices, ForwardMode.EXTEND
     )
@@ -1428,7 +1715,7 @@ def test_prefill_plan_reuses_addresses_and_refresh_rechecks_pages(device):
     assert first.requests[0].prefix_slots.numel() == 127
     old_slots = first.requests[0].prefix_slots.clone()
     tables[SWA][0, :2] = torch.tensor([3, 4], device=device)
-    meta = _extend(backend, tables, [3], [128])
+    meta = _extend(backend, tables, [3], [128], [0], _final([3], [128]))
     second = backend._swa_query_plan(
         meta.positions, meta.request_indices, ForwardMode.EXTEND
     )
@@ -1450,7 +1737,7 @@ def test_prefill_plan_reuses_addresses_and_refresh_rechecks_pages(device):
 def test_prefill_plan_distinguishes_reordered_subset_and_checks_dependencies(device):
     backend = _backend(device, 2)
     tables = _tables(device)
-    meta = _extend(backend, tables, [4], [128])
+    meta = _extend(backend, tables, [4], [128], [0], _final([4], [128]))
     full = backend._swa_query_plan(
         meta.positions, meta.request_indices, ForwardMode.EXTEND
     )
@@ -1612,7 +1899,7 @@ def test_compressor_plan_shared_owners_and_reused_tail_page(device, monkeypatch)
         return prepare(*args)
 
     monkeypatch.setattr(dsv41, "compressor_metadata", counted)
-    meta = _extend(backend, tables, [4, 3], [3, 0])
+    meta = _extend(backend, tables, [4, 3], [3, 0], [0, 0], _final([4, 3], [3, 0]))
     assert len(calls) == 1
     assert meta.compressor.previous.tolist() == [-1, -1, 1, -1, -1, 4, -1]
     before = tuple(t.clone() for t in meta.compressor)
@@ -1654,7 +1941,7 @@ def test_compressor_plan_shared_owners_and_reused_tail_page(device, monkeypatch)
     # Preparing a new forward must resolve the changed LCM assignment again.
     tables[TAIL][0, 1] = 0
     with pytest.raises(RuntimeError, match="compressor tail"):
-        _extend(backend, tables, [4, 3], [3, 0])
+        _extend(backend, tables, [4, 3], [3, 0], [0, 0], _final([4, 3], [3, 0]))
     assert len(calls) == 2
 
 
@@ -1678,6 +1965,8 @@ def test_mixed_compressor_plan_windows_match_combined_pooling(
         extend_seq_lens_cpu=torch.tensor([3]),
         extend_prefix_lens=torch.tensor([2], device=device),
         extend_prefix_lens_cpu=torch.tensor([2]),
+        extend_replay_lens_cpu=torch.tensor([0]),
+        extend_prompt_lens_cpu=torch.tensor([5]),
         extend_with_prefix=True,
     )
     full = backend.query_metadata(ForwardMode.MIXED).compressor

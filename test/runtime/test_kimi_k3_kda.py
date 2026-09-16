@@ -558,6 +558,8 @@ class _KDAHarness:
             extend_seq_lens_cpu=new_cpu,
             extend_prefix_lens=prefix_cpu.to(self.device),
             extend_prefix_lens_cpu=prefix_cpu,
+            extend_replay_lens_cpu=torch.zeros_like(prefix_cpu),
+            extend_prompt_lens_cpu=prefix_cpu + new_cpu,
             extend_with_prefix=bool(prefix_cpu.any()),
         )
 

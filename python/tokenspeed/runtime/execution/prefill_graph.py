@@ -507,6 +507,8 @@ class PrefillGraph:
         ib.extend_seq_lens_cpu[:bs].copy_(seq_lens_cpu)
         ib.extend_prefix_lens_buf[:bs].zero_()
         ib.extend_prefix_lens_cpu[:bs].zero_()
+        ib.extend_replay_lens_cpu[:bs].zero_()
+        ib.extend_prompt_lens_cpu[:bs].copy_(seq_lens_cpu)
 
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
@@ -565,6 +567,8 @@ class PrefillGraph:
             extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:bs],
             extend_prefix_lens=ib.extend_prefix_lens_buf[:bs],
             extend_prefix_lens_cpu=ib.extend_prefix_lens_cpu[:bs],
+            extend_replay_lens_cpu=ib.extend_replay_lens_cpu[:bs],
+            extend_prompt_lens_cpu=ib.extend_prompt_lens_cpu[:bs],
             extend_with_prefix=False,
             **extra_metadata_kwargs,
         )

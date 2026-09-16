@@ -564,6 +564,8 @@ def _qsa_extend_round(router: CacheGroupRouter, block_tables: dict, seq_lens) ->
         extend_seq_lens_cpu=ones,
         extend_prefix_lens=seq_lens - 1,
         extend_prefix_lens_cpu=seq_lens - 1,
+        extend_replay_lens_cpu=torch.zeros_like(seq_lens - 1),
+        extend_prompt_lens_cpu=seq_lens - 1 + ones,
         extend_with_prefix=True,
     )
 
