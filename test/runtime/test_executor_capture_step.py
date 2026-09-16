@@ -171,18 +171,24 @@ def test_the_step_runs_operations_in_capture_order():
         if call.func.attr in _STEP_OPERATIONS
     ]
     assert sequence == ["freeze", "capture", "capture"]
-    bundle_loads = [
-        call.lineno
+    named_calls = [
+        call
         for call in ast.walk(step)
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Name)
-        and call.func.id == "load_warmup_bundle"
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+    ]
+    bucket_setters = [
+        call.lineno
+        for call in named_calls
+        if call.func.id == "set_autotune_max_num_tokens"
+    ]
+    bundle_loads = [
+        call.lineno for call in named_calls if call.func.id == "load_warmup_bundle"
     ]
     freezes = [
         call.lineno for call in _attribute_calls(step) if call.func.attr == "freeze"
     ]
-    assert len(bundle_loads) == 1
-    assert bundle_loads[0] < min(freezes)
+    assert len(bucket_setters) == len(bundle_loads) == 1
+    assert bucket_setters[0] < bundle_loads[0] < min(freezes)
 
     executor = next(
         node

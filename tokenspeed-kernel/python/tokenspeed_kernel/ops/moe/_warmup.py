@@ -331,7 +331,6 @@ class _MoeRouting:
 
 @dataclass(frozen=True)
 class _MoeTuning:
-    strategy: str
     random_seed: int
 
     @classmethod
@@ -348,7 +347,7 @@ class _MoeTuning:
         random_seed = _integer(raw, "random_seed", context)
         if random_seed < 0:
             raise ValueError(f"{context}.random_seed cannot be negative")
-        return cls(strategy=strategy, random_seed=random_seed)
+        return cls(random_seed=random_seed)
 
 
 @dataclass(frozen=True)
