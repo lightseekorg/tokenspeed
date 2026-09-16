@@ -136,8 +136,9 @@ def test_gfx950_suite_selects_exact_registrations():
     assert suite.timer.eager_warmup_iterations == 5
     assert suite.timer.replay_warmup_iterations == 3
     assert suite.default_measurement_blocks == 30
-    assert len(suite.cases) == 7
-    case = suite.cases[0]
+    gemm_cases = [case for case in suite.cases if case.request.family == "gemm"]
+    assert len(gemm_cases) == 7
+    case = gemm_cases[0]
     assert case.id == ("gemm.bmm/gluon_bmm_a16w16_gfx950/b12-m1-n512-k128-bfloat16")
     assert case.comparison_epoch == 1
     assert case.request.parameters == {
@@ -167,7 +168,7 @@ def test_gfx950_suite_selects_exact_registrations():
         (4096, 4096, 1280),
         (4096, 5120, 1024),
     )
-    for mxfp8_case, (m, n, k) in zip(suite.cases[1:], mxfp8_shapes, strict=True):
+    for mxfp8_case, (m, n, k) in zip(gemm_cases[1:], mxfp8_shapes, strict=True):
         assert mxfp8_case.id == (
             "gemm.mm/gluon_mm_mxfp8_gfx950/" f"m{m}-n{n}-k{k}-mxfp8-bfloat16"
         )

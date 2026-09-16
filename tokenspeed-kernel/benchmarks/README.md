@@ -4,13 +4,15 @@ This directory contains suites for measuring TokenSpeed operations and their
 selected kernel registrations. The benchmark harness separates operation-specific
 input and correctness logic from shared device timing and result reporting.
 
-Suites are organized as `<vendor>/<arch>.json`, one per target platform. Each
-model and operation family keeps its cases in a separate file referenced by the
-hardware suite. Each operation family and mode owns one benchmark generator under
-`tokenspeed_kernel/benchmark/generators/`; built-in generators are loaded by
-the harness, and additional ones are registered with
-`set_benchmark_generator`. Suites reference generators by family, mode, and
-parameters, and every generator reuses the same harness, timer, and validators.
+Suites are organized as `<vendor>/<arch>.json`, one per target platform.
+Benchmark cases are grouped by model and operation family in files referenced by
+the hardware suite. They use representative model inputs and exercise normal
+operation dispatch, covering both kernel selection and execution.
+
+Each operation family and mode owns one generator under
+`tokenspeed_kernel/benchmark/generators/`. Built-in generators are loaded by the
+harness, and additional ones are registered with `set_benchmark_generator`.
+Every generator reuses the same harness, timer, and validators.
 
 ## Benchmark Requests
 

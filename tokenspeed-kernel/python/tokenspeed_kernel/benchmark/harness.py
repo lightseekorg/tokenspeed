@@ -176,7 +176,17 @@ def _load_builtin_generators() -> None:
         prepare_dense_bmm,
         prepare_mxfp8_mm,
     )
+    from tokenspeed_kernel.benchmark.generators.kda import (
+        prepare_kda_paged_decode,
+        prepare_kda_paged_prefill,
+    )
 
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "kda_paged_decode"), prepare_kda_paged_decode
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "kda_paged_prefill"), prepare_kda_paged_prefill
+    )
     _BENCHMARK_GENERATORS.setdefault(("gemm", "bmm"), prepare_dense_bmm)
     _BENCHMARK_GENERATORS.setdefault(("gemm", "mm"), prepare_mxfp8_mm)
 
