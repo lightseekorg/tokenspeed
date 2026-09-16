@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
+from tokenspeed_kernel.ops.tuning import set_autotune_max_num_tokens
 from tokenspeed_kernel.platform import PlatformInfo
 from tokenspeed_kernel.registry import WarmupBehavior
 from tokenspeed_kernel.warmup.discovery import LoadedWarmupProfile
@@ -89,6 +90,9 @@ def generate_bundle(
 
     autotuner = importlib.import_module("flashinfer.autotuner")
     validated = validate_profile(loaded.profile)
+    set_autotune_max_num_tokens(
+        max(target.config.maximum_num_tokens for target in validated)
+    )
     prepared = tuple(
         target.config.prepare(target.solution, platform) for target in validated
     )

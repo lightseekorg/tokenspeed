@@ -154,9 +154,7 @@ def test_nvfp4_gemm_swiglu_nvfp4_quant_matches_unfused_model_shapes(
     i: int,
 ) -> None:
     import tokenspeed_kernel
-    from tokenspeed_kernel.ops.gemm.cute_dsl import (
-        nvfp4_gemm_swiglu_nvfp4_quant,
-    )
+    from tokenspeed_kernel import nvfp4_gemm_swiglu_nvfp4_quant
     from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
     from tokenspeed_kernel.registry import load_builtin_kernels
     from tokenspeed_kernel.thirdparty.cuda import silu_and_mul_fuse_nvfp4_quant
@@ -224,15 +222,25 @@ def test_nvfp4_gemm_swiglu_nvfp4_quant_matches_unfused_model_shapes(
     linear_gate_scale = torch.cat((linear_scale, gate_scale), dim=0)
 
     fused_fp4, fused_scale = nvfp4_gemm_swiglu_nvfp4_quant(
-        x_fp4,
-        x_scale,
-        interleave_linear_and_gate(linear_gate_fp4, group_size=64, dim=0),
-        swizzle_blockscale_2d(
+        a=x_fp4,
+        a_scale=x_scale,
+        b=interleave_linear_and_gate(linear_gate_fp4, group_size=64, dim=0),
+        b_scale=swizzle_blockscale_2d(
             interleave_linear_and_gate(linear_gate_scale, group_size=64, dim=0)
         ),
-        fc1_alpha,
-        down_input_scale_inv,
+        alpha=fc1_alpha,
+        output_global_scale=down_input_scale_inv,
+        out=None,
+        out_scale=None,
+        ab_dtype="float4_e2m1fn",
+        sf_dtype="float8_e4m3fn",
+        c_dtype="float4_e2m1fn",
+        sf_vec_size=16,
+        use_prefetch=False,
+        prefetch_dist=3,
+        vectorized_f32=True,
         enable_pdl=True,
+        solution="cute_dsl",
     )
 
     fc2_alpha = (1.0 / down_input_scale_inv) * (1.0 / w2_scale_inv)
@@ -354,7 +362,7 @@ def test_nvfp4_gemm_swiglu_tactics_agree_with_heuristic(m: int, k: int, i: int) 
 def test_nvfp4_gemm_swiglu_autotune_populates_cache() -> None:
     """One call inside a tuning window fills every smaller shape bucket."""
     from flashinfer.autotuner import AutoTuner, autotune
-    from tokenspeed_kernel.ops.gemm.cute_dsl import nvfp4_gemm_swiglu_nvfp4_quant
+    from tokenspeed_kernel import nvfp4_gemm_swiglu_nvfp4_quant
 
     m, k, i = 256, 7168, 512
     a, a_scale, b, b_scale, alpha, global_scale, _, _ = _autotune_operands(m, k, i)
@@ -365,7 +373,23 @@ def test_nvfp4_gemm_swiglu_autotune_populates_cache() -> None:
     )
     with autotune():
         tuned, tuned_scale = nvfp4_gemm_swiglu_nvfp4_quant(
-            a, a_scale, b, b_scale, alpha, global_scale
+            a=a,
+            a_scale=a_scale,
+            b=b,
+            b_scale=b_scale,
+            alpha=alpha,
+            output_global_scale=global_scale,
+            out=None,
+            out_scale=None,
+            ab_dtype="float4_e2m1fn",
+            sf_dtype="float8_e4m3fn",
+            c_dtype="float4_e2m1fn",
+            sf_vec_size=16,
+            use_prefetch=False,
+            prefetch_dist=3,
+            vectorized_f32=True,
+            enable_pdl=True,
+            solution="cute_dsl",
         )
     torch.cuda.synchronize()
     after = sum(
@@ -374,7 +398,23 @@ def test_nvfp4_gemm_swiglu_autotune_populates_cache() -> None:
     assert after > before + 1, "a tuning window must fill more than the observed bucket"
 
     untuned, untuned_scale = nvfp4_gemm_swiglu_nvfp4_quant(
-        a, a_scale, b, b_scale, alpha, global_scale
+        a=a,
+        a_scale=a_scale,
+        b=b,
+        b_scale=b_scale,
+        alpha=alpha,
+        output_global_scale=global_scale,
+        out=None,
+        out_scale=None,
+        ab_dtype="float4_e2m1fn",
+        sf_dtype="float8_e4m3fn",
+        c_dtype="float4_e2m1fn",
+        sf_vec_size=16,
+        use_prefetch=False,
+        prefetch_dist=3,
+        vectorized_f32=True,
+        enable_pdl=True,
+        solution="cute_dsl",
     )
     torch.cuda.synchronize()
     assert torch.equal(tuned, untuned) and torch.equal(
