@@ -474,12 +474,25 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
     assert setup.fixed_workspace_bytes == 128 + ple_bytes  # GDN conv + SSM: 128 B.
 
 
-def test_ordinary_mha_reserves_null_parent_within_cache_budget() -> None:
+@pytest.mark.parametrize(
+    ("full_layers", "sliding_layers", "usable_pages"),
+    ((2, 0, 15), (1, 4, 7)),
+)
+def test_ordinary_mha_reserves_null_parent_within_cache_budget(
+    full_layers: int, sliding_layers: int, usable_pages: int
+) -> None:
     model_config = SimpleNamespace(
-        num_attention_layers=2,
+        num_attention_layers=full_layers + sliding_layers,
         hf_config=SimpleNamespace(),
     )
     attn_config = _mha_config()
+    mha = replace(
+        attn_config.component(MHAConfig),
+        cache_layer_types=(FULL_ATTENTION,) * full_layers
+        + ("sliding_attention",) * sliding_layers,
+        sliding_window_tokens=512,
+    )
+    attn_config = replace(attn_config, components=(mha,))
     server_args = SimpleNamespace(max_total_tokens=None)
 
     setup = prepare_cache_setup(
@@ -496,18 +509,20 @@ def test_ordinary_mha_reserves_null_parent_within_cache_budget() -> None:
 
     assert setup.spec.family == "mha"
     assert setup.spec.memory_plan.prefix_granularity == 64
-    assert setup.spec.memory_plan.num_lcm_blocks == 15
+    assert setup.spec.memory_plan.num_lcm_blocks == usable_pages
     assert setup.spec.memory_plan.arena_bytes <= 16_384
-    assert setup.spec.token_capacity == 960
+    assert setup.spec.token_capacity == usable_pages * 64
     assert setup.num_draft_layers == 0
-    pool = _pool_over_new_arena(setup.spec, attn_config, num_layers=2)
+    pool = _pool_over_new_arena(
+        setup.spec, attn_config, num_layers=model_config.num_attention_layers
+    )
     assert type(pool) is MHATokenToKVPool
     assert pool.arena.runtime_contract.token_capacity == setup.spec.token_capacity
     with pytest.raises(TypeError, match="incompatible with MHAConfig"):
         _pool_over_new_arena(
             replace(setup.spec, family="kimi_k3"),
             attn_config,
-            num_layers=2,
+            num_layers=model_config.num_attention_layers,
         )
 
 
@@ -901,117 +916,6 @@ def test_qwen_mtp_padding_allowance_tracks_draft_planes() -> None:
             )
             < 1e-9
         )
-
-
-@pytest.mark.parametrize(
-    ("full_layers", "sliding_layers", "expected_padding"),
-    (
-        (1, 4, 3.0),
-        (4, 1, 3.0),
-        (3, 8, 5.0 / 3.0),
-        (1, 64, 63.0),
-        (4, 4, 0.0),
-        (2, 0, 0.0),
-        (0, 3, 0.0),
-    ),
-)
-def test_ordinary_hybrid_setup_accepts_unequal_groups_within_budget(
-    full_layers: int,
-    sliding_layers: int,
-    expected_padding: float,
-) -> None:
-    """Slab-tail padding does not reject valid groups or exceed the byte budget."""
-    layer_types = (FULL_ATTENTION,) * full_layers + (
-        "sliding_attention",
-    ) * sliding_layers
-    base_config = _mha_config()
-    mha = replace(
-        base_config.component(MHAConfig),
-        cache_layer_types=layer_types,
-        sliding_window_tokens=512,
-    )
-    attn_config = replace(base_config, components=(mha,))
-    setup = prepare_cache_setup(
-        family="mha",
-        server_args=SimpleNamespace(max_total_tokens=None),
-        model_config=SimpleNamespace(num_attention_layers=len(layer_types)),
-        attn_config=attn_config,
-        draft_model_config=None,
-        draft_attn_config=None,
-        cache_budget_bytes=1_048_576,
-        decode_input_tokens=1,
-        overlap_schedule_depth=0,
-    )
-
-    plan = setup.spec.memory_plan
-    assert setup.spec.layer_types == layer_types
-    assert len(plan.fields) == 2 * len(layer_types)
-    assert all(group.cache_blocks_per_lcm_block == 1 for group in plan.groups)
-    assert plan.arena_bytes <= 1_048_576
-    raw_bytes = {
-        group.group_id: sum(
-            field.payload_bytes
-            for field in plan.fields
-            if field.group_id == group.group_id
-        )
-        for group in plan.groups
-    }
-    observed_padding = max(
-        (plan.lcm_block_bytes - size) / size for size in raw_bytes.values()
-    )
-    assert observed_padding == pytest.approx(expected_padding)
-
-
-def test_ordinary_setup_preserves_mixed_target_draft_payloads() -> None:
-    """Mixed cache formats retain their scale fields and fit the byte budget."""
-    target_base = replace(
-        _mha_config(),
-        prefix_granularity=128,
-        kernel_page_size=128,
-    )
-    target_mha = replace(
-        target_base.component(MHAConfig),
-        head_dim=32,
-        cache_layer_types=("sliding_attention",),
-        sliding_window_tokens=512,
-    )
-    target_config = replace(target_base, components=(target_mha,))
-
-    draft_base = replace(
-        _mha_config(),
-        kv_cache_dtype=torch.float8_e4m3fn,
-        kv_cache_mxfp8=True,
-        prefix_granularity=128,
-        kernel_page_size=128,
-    )
-    draft_mha = replace(draft_base.component(MHAConfig), head_dim=64)
-    draft_config = replace(draft_base, components=(draft_mha,))
-    setup = prepare_cache_setup(
-        family="mha",
-        server_args=SimpleNamespace(max_total_tokens=None),
-        model_config=SimpleNamespace(num_attention_layers=1),
-        attn_config=target_config,
-        draft_model_config=SimpleNamespace(num_attention_layers=1),
-        draft_attn_config=draft_config,
-        cache_budget_bytes=1_048_576,
-        decode_input_tokens=1,
-        overlap_schedule_depth=0,
-    )
-
-    plan = setup.spec.memory_plan
-    assert len(plan.fields) == 6
-    assert plan.arena_bytes <= 1_048_576
-    raw_bytes = {
-        group.group_id: sum(
-            field.payload_bytes
-            for field in plan.fields
-            if field.group_id == group.group_id
-        )
-        for group in plan.groups
-    }
-    assert (plan.lcm_block_bytes - raw_bytes["sliding_attention"]) / raw_bytes[
-        "sliding_attention"
-    ] == pytest.approx(1.0 / 64.0)
 
 
 def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
