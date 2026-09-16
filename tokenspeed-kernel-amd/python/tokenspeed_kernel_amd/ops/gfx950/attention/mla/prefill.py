@@ -653,16 +653,25 @@ def _fp8_pipeline_phase(
         offsets, rows = program.make_k_offsets((t + 1) * cfg.BLOCK_N)
         offsets_pe, rows_pe = program.make_k_pe_offsets((t + 1) * cfg.BLOCK_N)
         program.issue_load(
-            offsets, k_smem.index(1 - CUR), rows[:, None] < program.kv_len
+            offsets,
+            k_smem.index(1 - CUR),
+            mask=rows[:, None] < program.kv_len,
+            other=None,
         )
         program.issue_load(
-            offsets_pe, k_pe_smem.index(1 - CUR), rows_pe[:, None] < program.kv_len
+            offsets_pe,
+            k_pe_smem.index(1 - CUR),
+            mask=rows_pe[:, None] < program.kv_len,
+            other=None,
         )
         # The four-slot V ring reuses V(t-3), read in phase t-2. The entry
         # barrier therefore separates every prior read from this overwrite.
         offsets_v, rows_v = program.make_v_offsets((t + 1) * cfg.BLOCK_N)
         program.issue_load_v(
-            offsets_v, v_smem.index((t + 1) % 4), rows_v[:, None] < program.kv_len
+            offsets_v,
+            v_smem.index((t + 1) % 4),
+            mask=rows_v[:, None] < program.kv_len,
+            other=None,
         )
 
     previous0, previous1 = gl.split(
