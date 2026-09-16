@@ -22,7 +22,7 @@
 
 import torch
 from tokenspeed_kernel.ops.communication.cutedsl_fused_rs_up_projection import (
-    FusedRsUpProjectionServing,
+    FusedRsUpProjectionServingBase,
     _PreparedLaunch,
 )
 from tokenspeed_kernel.ops.communication.fused_rs_workspace import (
@@ -41,7 +41,7 @@ from tokenspeed_kernel.ops.communication.mnnvl_cutedsl_symmetric_up_projection i
 )
 
 
-class MediumFusedRsUpProjectionServing(FusedRsUpProjectionServing):
+class MediumFusedRsUpProjectionServing(FusedRsUpProjectionServingBase):
     """Use the same validation, live operands and two barriers with medium binding.
 
     This experimental profile is unqualified. The caller must opt in explicitly;

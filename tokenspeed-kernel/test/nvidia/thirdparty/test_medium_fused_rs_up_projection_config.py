@@ -318,3 +318,76 @@ def test_actual_host_grid_override_forwards_correct_worker_limit(
         else capacity
     )
     assert forwarded == (c, cta, cluster, expected)
+
+
+@pytest.fixture
+def integrated_profile():
+    # Execute the CPU-only selector without importing CUDA-dependent bindings.
+    path = OPS / "medium_fused_rs_up_projection_serving_config.py"
+    tree = ast.parse(path.read_text())
+    selector = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "integrated_fused_rs_serving_config"
+    )
+    namespace = {"MediumFusedRsUpProjectionTuning": Tuning}
+    exec(
+        compile(ast.Module(body=[selector], type_ignores=[]), str(path), "exec"),
+        namespace,
+    )
+    return namespace[selector.name]
+
+
+@pytest.mark.parametrize(
+    "m,tile_m,tile_n,cluster_m,cap",
+    [
+        (256, 64, 64, 1, None),
+        (512, 64, 64, 1, None),
+        (768, 64, 128, 1, None),
+        (1024, 64, 128, 1, None),
+        (1280, 256, 128, 2, 38),
+        (2048, 256, 128, 2, 38),
+        (3072, 256, 128, 2, 38),
+        (4096, 256, 128, 2, 38),
+        (6144, 256, 128, 2, None),
+        (8192, 256, 128, 2, None),
+    ],
+)
+def test_integrated_profile_replaces_large_endpoint_whitelist(
+    integrated_profile, m, tile_m, tile_n, cluster_m, cap
+):
+    config = integrated_profile(m)
+    assert (config.tile_m, config.tile_n, config.cluster_m) == (
+        tile_m,
+        tile_n,
+        cluster_m,
+    )
+    assert config.cluster_cap == cap
+    assert config.ab_stages == (6 if m > 1024 else 0)
+    assert config.c_stages == (3 if m > 1024 else 0)
+    assert config.addend_stages == 1
+    assert config.reduce_vectors == 4
+    assert config.scheduler_type == "static_persistent"
+
+
+def test_shared_serving_base_cannot_select_old_endpoint_policy():
+    source = (OPS / "cutedsl_fused_rs_up_projection.py").read_text()
+    tree = ast.parse(source)
+    base = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "FusedRsUpProjectionServingBase"
+    )
+    assert [ast.unparse(parent) for parent in base.bases] == ["ABC"]
+    methods = {
+        node.name: node for node in base.body if isinstance(node, ast.FunctionDef)
+    }
+    assert "__init__" not in methods
+    for name in ("input_view", "_prepare"):
+        assert "abstractmethod" in [
+            ast.unparse(decorator) for decorator in methods[name].decorator_list
+        ]
+    assert "prepare_fused_rs_up_projection" not in source
+    assert "fused_rs_up_projection_config" not in source

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Serving adapter for the qualified fused shared-RS/up-projection/AG kernel.
+"""Shared live-pointer launcher for fused shared-RS/up-projection/AG profiles.
 
 Allocations and compilation precede capture. Live operand descriptors are
 host-only, non-synchronizing DLPack views, so a graph records its own latent
@@ -26,25 +26,16 @@ and residual pointers without additional device copies. The device body and
 both publication/completion barriers are unchanged.
 """
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
 import torch
-from tokenspeed_kernel.ops.communication.fused_rs_up_projection import (
-    prepare_fused_rs_up_projection,
-)
-from tokenspeed_kernel.ops.communication.fused_rs_up_projection_config import (
-    fused_rs_up_projection_config,
-)
-from tokenspeed_kernel.ops.communication.fused_rs_workspace import (
-    SharedRsWorkspace,
-    _vote,
-)
+from tokenspeed_kernel.ops.communication.fused_rs_workspace import _vote
 from tokenspeed_kernel.ops.communication.mnnvl_cutedsl_symmetric_up_projection import (
     SymmetricUpProjectionOutput,
     _overlaps,
     _rank_barrier_kernel,
-    allocate_symmetric_up_projection_output,
 )
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -65,35 +56,22 @@ class _PreparedLaunch:
     max_active_clusters: int
 
 
-class FusedRsUpProjectionServing:
-    """Per-layer output owner using one sequential model's shared raw workspace.
+class FusedRsUpProjectionServingBase(ABC):
+    """Share validation and live launches without selecting a token policy.
 
-    Allocate during model initialization, before KV-cache sizing. Lazy compile
-    is allowed during prefill warmup only, never during CUDA graph capture.
-    Different buckets may reuse this layer's output because the serving engine
-    executes them sequentially on its execution stream. Concurrent graphs or
-    model instances must not share this object or its raw workspace.
+    Concrete profiles own output allocation, input views and compilation.
+    This base cannot be instantiated as a separate serving entry point.
     """
 
-    def __init__(self, workspace: SharedRsWorkspace, max_tokens: int):
-        """Allocate a layer output for workspace's TP8 group and explicit capacity.
-
-        Both allocations must outlive every graph using the layer. Call outside
-        capture, collectively in the same model-construction order on all ranks.
-        """
-        fused_rs_up_projection_config(max_tokens)
-        self.workspace = workspace
-        self.output = allocate_symmetric_up_projection_output(
-            workspace.state.group, max_tokens, device=workspace.state.device
-        )
-        self._plans: dict[int, _PreparedLaunch] = {}
-
+    @abstractmethod
     def input_view(self, num_tokens: int) -> torch.Tensor:
-        """Return the exact symmetric shared down-projection out= view."""
-        fused_rs_up_projection_config(num_tokens)
-        if num_tokens > self.output.tensor.shape[0]:
-            raise ValueError("fused serving token count exceeds allocated capacity")
-        return self.workspace.state.comm_buff[:num_tokens]
+        """Return the profile's symmetric shared-producer destination."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def _prepare(self, m, latent, weight, residual) -> _PreparedLaunch:
+        """Bind and compile the selected profile before graph capture."""
+        raise NotImplementedError
 
     def _validate(self, latent, weight, residual, shared):
         if latent.ndim != 2:
@@ -120,41 +98,6 @@ class FusedRsUpProjectionServing:
             if _overlaps(raw, protected) or _overlaps(self.output.tensor, protected):
                 raise ValueError("fused serving storage aliases a live input")
         return m
-
-    def _prepare(self, m, latent, weight, residual):
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("fused serving compilation must finish during warmup")
-        output = SymmetricUpProjectionOutput(
-            self.output.tensor[:m],
-            self.output.handle,
-            self.output.group,
-            self.output.rank,
-        )
-        facade = prepare_fused_rs_up_projection(
-            latent,
-            weight,
-            residual,
-            self.workspace,
-            output,
-            residual_is_replicated=True,
-        )
-        bound = facade.plan
-        # Retain only fixed weight/output/layout descriptors, not a warmup
-        # residual allocation or its pointer. Every launch supplies live inputs.
-        result = _PreparedLaunch(
-            compiled=bound.compiled,
-            cuda=bound._cuda,
-            cutlass=bound._cutlass,
-            fixed_args=bound._cute_args[1:4],
-            weight=weight,
-            output=output,
-            compile_dump=bound._compile_dump,
-            capacity_records=bound.qualified_capacity_records,
-            kernel=bound.kernel,
-            max_active_clusters=bound.max_active_clusters,
-        )
-        self._plans[m] = result
-        return result
 
     def __call__(self, latent, weight, residual, shared):
         """Run with live operands; return this layer's persistent output view."""
@@ -189,8 +132,8 @@ def cutedsl_fused_rs_up_projection_ag(plan, latent, weight, residual, shared):
     """Execute the fused collective with the caller's live graph operands.
 
     Args:
-        plan: Per-layer FusedRsUpProjectionServing with persistent output/raw owners.
-        latent: Replicated contiguous CUDA BF16 [M,3584], produced by routed HT.
+        plan: Concrete serving profile with persistent output/raw owners.
+        latent: Replicated contiguous CUDA BF16 [M,3584], produced by routed BT/HT.
         weight: This layer's fixed contiguous CUDA BF16 [896,3584] owner weight.
         residual: Replicated contiguous CUDA BF16 [M,7168], added once.
         shared: Exact raw input view returned by plan.input_view(M), already
@@ -198,7 +141,8 @@ def cutedsl_fused_rs_up_projection_ag(plan, latent, weight, residual, shared):
 
     Returns:
         Persistent symmetric BF16 [M,7168] output, valid until the next call
-        using this layer's output. Only M4096 and M8192 are supported.
+        using the same output slot. The concrete profile selects supported M;
+        the integrated profile covers the continuous interval (32,8192].
     """
     from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.primitives import to_cute
 

@@ -4,8 +4,10 @@ This default-off profile has a completed single-pair serving measurement,
 not replicated performance or full-model numerical qualification.
 `TOKENSPEED_K3_INTEGRATED_FUSED_TAIL=1` enables both first-stage protocols and
 the same fused shared-RS/up-projection/residual/AG device pattern. It is mutually
-exclusive with the historical first-only, medium-only and endpoint-only flags.
-Those old profiles remain unchanged for reproduction.
+exclusive with the historical first-only and medium-only flags.
+The old M4096/M8192-only entry point is removed. Setting its obsolete
+`TOKENSPEED_K3_FUSED_RS_UP_AG` flag is rejected collectively; use
+`TOKENSPEED_K3_INTEGRATED_FUSED_TAIL` for the continuous-range path.
 
 | Kernel M | First stage | Second stage |
 | --- | --- | --- |
@@ -40,7 +42,8 @@ one-CTA 64x64, without a repeated cluster-only comparison. That is insufficient
 evidence for a separate low-M two-CTA interval. The integrated profile therefore
 uses one CTA throughout M33..1024. This is a simplicity choice among close
 screened configurations, not proof of noise or a universal small-batch rule.
-Historical endpoint-only profiles and their measured results remain unchanged.
+Historical endpoint-only measurements refer to earlier revisions, not a retained
+serving entry point in this branch.
 
 One raw symmetric workspace and two 8192x7168 BF16 symmetric outputs are
 shared by sequential layers. Global layer-index parity selects the output;
@@ -65,7 +68,7 @@ Allocate before KV sizing and retain both handles through every graph replay.
 All graph buckets use fixed parity addresses and execute sequentially; outputs
 are transient until the same slot is next written, not per-layer archives.
 Different concurrent model/graph instances require separate storage. The
-historical endpoint-only and medium-only profiles retain per-layer outputs.
+historical medium-only profile retains per-layer outputs.
 
 ## Dataflow and arithmetic
 
@@ -145,6 +148,15 @@ RS and Triton hidden-dimension RS kernels, their launch/staging APIs and the
 standalone RS tuning sweep are removed. Shared reduction remains inside the
 fused GEMM; its entry/exit barriers, proxy-alias fences, allocation sizes and
 M dispatch are unchanged. Existing generic Triton collectives remain available.
+
+The endpoint-only facade, fixed-M configuration and separate cluster-cap binding
+are removed. The common serving base retains live-pointer validation and launch
+but cannot be instantiated; concrete profiles supply input views and compilation.
+Integrated medium/large configurations and cluster caps still use the existing
+continuous-range binder, with unchanged fused device code and output pooling.
+The large-M correctness harness now checks that integrated adapter against the
+same-profile fixed-input binding and the unchanged independent addmm/AllReduce
+reference; M4096/M8192 remain test cases, not a dispatch whitelist.
 
 The native H3584 HT specialization vendors FlashInfer's
 `flashinfer/comm/mnnvl_cutedsl/kernel_ht/device_kernel.py` from v0.6.18,

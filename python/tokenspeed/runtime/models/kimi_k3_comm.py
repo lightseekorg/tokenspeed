@@ -128,7 +128,7 @@ class K3MoETailTier(IntEnum):
     """
 
     TAIL_FUSION = 0  # fused decode kernel (aka the multicast latent tail)
-    FUSED_RS_UP_AG = 1  # prefill: HT finalize/norm + shared-RS/up-projection/AG
+    FUSED_RS_UP_AG = 1  # integrated large M: HT + shared-RS/up-projection/AG
     MEDIUM_FUSED_RS_UP_AG = 2  # opt-in provisional BT + medium fused back half
     MNNVL_BT_DEFERRED = 3  # graph: finalize + balanced-tree AR + RMSNorm
     MNNVL_HT_DEFERRED = 4  # graph: finalize + persistent HT AR + RMSNorm
@@ -163,8 +163,6 @@ MNNVL_HT_MAX_TOKENS = 8192
 MNNVL_BT_QUALIFIED_TOKENS = frozenset((256, 384, 512, 768, 1024))
 MNNVL_HT_QUALIFIED_TOKENS = frozenset((1280, 2048, 4096, 6144, 8192))
 MNNVL_DEFERRED_ENABLE_ENV = "TOKENSPEED_K3_MNNVL_CUTEDSL"
-FUSED_RS_UP_AG_ENABLE_ENV = "TOKENSPEED_K3_FUSED_RS_UP_AG"
-FUSED_RS_UP_AG_TOKENS = frozenset((4096, 8192))
 MNNVL_BT_ONLY_ENABLE_ENV = "TOKENSPEED_K3_MNNVL_BT_ONLY"
 MEDIUM_FUSED_RS_UP_AG_ENABLE_ENV = "TOKENSPEED_K3_MEDIUM_FUSED_RS_UP_AG"
 INTEGRATED_TAIL_ENABLE_ENV = "TOKENSPEED_K3_INTEGRATED_FUSED_TAIL"
@@ -213,16 +211,10 @@ def _medium_flags_valid(bt_only: bool, medium_fused: bool, legacy: bool) -> bool
     )
 
 
-def _fused_rs_up_ag_enabled() -> bool:
-    """Whether the experimental complete large-M tail is explicitly opted in."""
-
-    return os.environ.get(FUSED_RS_UP_AG_ENABLE_ENV) == "1"
-
-
 def _mnnvl_deferred_enabled() -> bool:
     """Whether the qualified experimental K3 CuTe DSL route is opted in."""
 
-    return os.environ.get(MNNVL_DEFERRED_ENABLE_ENV) == "1" or _fused_rs_up_ag_enabled()
+    return os.environ.get(MNNVL_DEFERRED_ENABLE_ENV) == "1"
 
 
 def _mnnvl_graph_max_tokens() -> int:
@@ -248,7 +240,6 @@ def select_k3_moe_tail_tier(
     join_moe_reduce: bool,
     mnnvl_bt_deferred_ok: bool,
     mnnvl_ht_deferred_ok: bool,
-    fused_rs_up_ag_ok: bool,
     prefill_graph_phase: bool,
 ) -> K3MoETailTier:
     """Pick the tail tier; every input must be rank-uniform.
@@ -271,8 +262,6 @@ def select_k3_moe_tail_tier(
             by the breakable prefill graph.  It is deliberately separate from
             ``graph_phase`` so prefill capture does not enable full-graph
             auxiliary-stream branches across an eager attention break.
-        fused_rs_up_ag_ok: Rank-negotiated complete-tail capability. The
-            selector additionally restricts it to the two qualified buckets.
 
     Returns:
         The best applicable ``K3MoETailTier``.
@@ -281,13 +270,6 @@ def select_k3_moe_tail_tier(
     # multimem window would still resolve here rather than overlap.
     if graph_phase and 1 <= num_tokens <= tail_fusion_max_tokens:
         return K3MoETailTier.TAIL_FUSION
-    if (
-        prefill_graph_phase
-        and not is_decode
-        and fused_rs_up_ag_ok
-        and num_tokens in FUSED_RS_UP_AG_TOKENS
-    ):
-        return K3MoETailTier.FUSED_RS_UP_AG
     # The MNNVL CuTe DSL protocols consume TRT-LLM's deferred-finalize triple.
     # They are only profitable under graph replay and are initially confined
     # to prefill; speculative-decode buckets retain their separately tuned
@@ -532,7 +514,6 @@ class K3MoeTailCommState:
         rms_eps: float,
         allow_latent_tail: bool,
         allow_mnnvl_deferred: bool,
-        allow_fused_rs_up_ag: bool,
         mnnvl_bt_only: bool,
         allow_medium_fused_rs_up_ag: bool,
         mnnvl_graph_max_tokens: int,
@@ -546,7 +527,6 @@ class K3MoeTailCommState:
                 rms_eps=rms_eps,
                 allow_latent_tail=allow_latent_tail,
                 allow_mnnvl_deferred=allow_mnnvl_deferred,
-                allow_fused_rs_up_ag=allow_fused_rs_up_ag,
                 mnnvl_bt_only=mnnvl_bt_only,
                 allow_medium_fused_rs_up_ag=allow_medium_fused_rs_up_ag,
                 mnnvl_graph_max_tokens=mnnvl_graph_max_tokens,
@@ -560,7 +540,6 @@ class K3MoeTailCommState:
                 or inst.rms_eps != float(rms_eps)
                 or inst.allow_latent_tail != allow_latent_tail
                 or inst.allow_mnnvl_deferred != allow_mnnvl_deferred
-                or inst.allow_fused_rs_up_ag != allow_fused_rs_up_ag
                 or inst.mnnvl_bt_only != mnnvl_bt_only
                 or inst.allow_medium_fused_rs_up_ag != allow_medium_fused_rs_up_ag
                 or inst.mnnvl_graph_max_tokens != mnnvl_graph_max_tokens
@@ -574,7 +553,6 @@ class K3MoeTailCommState:
                     f"top_k={inst.top_k} rms_eps={inst.rms_eps} "
                     f"allow_latent_tail={inst.allow_latent_tail} "
                     f"allow_mnnvl_deferred={inst.allow_mnnvl_deferred} "
-                    f"allow_fused_rs_up_ag={inst.allow_fused_rs_up_ag} "
                     f"mnnvl_bt_only={inst.mnnvl_bt_only} "
                     f"allow_medium_fused_rs_up_ag={inst.allow_medium_fused_rs_up_ag} "
                     f"mnnvl_graph_max_tokens={inst.mnnvl_graph_max_tokens}, but a later "
@@ -583,7 +561,6 @@ class K3MoeTailCommState:
                     f"rms_eps={float(rms_eps)} "
                     f"allow_latent_tail={allow_latent_tail} "
                     f"allow_mnnvl_deferred={allow_mnnvl_deferred} "
-                    f"allow_fused_rs_up_ag={allow_fused_rs_up_ag} "
                     f"mnnvl_bt_only={mnnvl_bt_only} "
                     f"allow_medium_fused_rs_up_ag={allow_medium_fused_rs_up_ag} "
                     f"mnnvl_graph_max_tokens={mnnvl_graph_max_tokens}; the current "
@@ -602,7 +579,6 @@ class K3MoeTailCommState:
         rms_eps,
         allow_latent_tail,
         allow_mnnvl_deferred,
-        allow_fused_rs_up_ag,
         mnnvl_bt_only,
         allow_medium_fused_rs_up_ag,
         mnnvl_graph_max_tokens,
@@ -613,7 +589,6 @@ class K3MoeTailCommState:
         self.rms_eps = float(rms_eps)
         self.allow_latent_tail = allow_latent_tail
         self.allow_mnnvl_deferred = allow_mnnvl_deferred
-        self.allow_fused_rs_up_ag = allow_fused_rs_up_ag
         self.mnnvl_bt_only = mnnvl_bt_only
         self.allow_medium_fused_rs_up_ag = allow_medium_fused_rs_up_ag
         self.integrated_tail = _integrated_tail_enabled()
@@ -628,7 +603,6 @@ class K3MoeTailCommState:
         self.multimem_ar_ok = False
         self.mnnvl_bt_deferred = None
         self.mnnvl_ht_deferred = None
-        self.fused_rs_up_ag_finalize = None
         self.fused_rs_up_ag_workspace = None
         self.fused_rs_up_ag_capacity = 0
         self.integrated_tail_output_pool = None
@@ -642,12 +616,7 @@ class K3MoeTailCommState:
         hidden, latent = hidden_size, latent_size
         bt_capacity = min(MNNVL_BT_MAX_TOKENS, mnnvl_graph_max_tokens)
         ht_capacity = min(MNNVL_HT_MAX_TOKENS, mnnvl_graph_max_tokens)
-        fused_capacity = max(
-            (m for m in FUSED_RS_UP_AG_TOKENS if m <= mnnvl_graph_max_tokens),
-            default=0,
-        )
-        if self.integrated_tail:
-            fused_capacity = 8192
+        fused_capacity = 8192 if self.integrated_tail else 0
         medium_capacity = max(
             (m for m in self.bt_candidate_tokens if m <= mnnvl_graph_max_tokens),
             default=0,
@@ -701,7 +670,7 @@ class K3MoeTailCommState:
         )
         tail_local = False
         fused_local = (
-            (allow_fused_rs_up_ag or self.integrated_tail)
+            self.integrated_tail
             and mnnvl_ht_local
             and fused_capacity > 0
             and hidden == 7168
@@ -719,8 +688,13 @@ class K3MoeTailCommState:
             and top_k == 16
             and _mnnvl_tp8_layout(mapping)
         )
-        flags_valid = _medium_flags_valid(
-            mnnvl_bt_only, allow_medium_fused_rs_up_ag, _mnnvl_deferred_enabled()
+        flags_valid = (
+            _medium_flags_valid(
+                mnnvl_bt_only, allow_medium_fused_rs_up_ag, _mnnvl_deferred_enabled()
+            )
+            # Reject the removed endpoint flag collectively instead of silently
+            # running an unoptimized path with an obsolete launch configuration.
+            and os.environ.get("TOKENSPEED_K3_FUSED_RS_UP_AG") != "1"
         )
         if self.integrated_tail:
             flags_valid = (
@@ -731,7 +705,6 @@ class K3MoeTailCommState:
                         MNNVL_BT_ONLY_ENABLE_ENV,
                         MEDIUM_FUSED_RS_UP_AG_ENABLE_ENV,
                         MNNVL_DEFERRED_ENABLE_ENV,
-                        FUSED_RS_UP_AG_ENABLE_ENV,
                     )
                 )
                 and mnnvl_graph_max_tokens == 8192
@@ -788,8 +761,10 @@ class K3MoeTailCommState:
         ):
             raise ValueError(
                 "medium flags must agree across ranks, require BT_ONLY=1 for medium "
-                "fusion, and cannot coexist with legacy MNNVL/full-fusion flags; "
-                "integrated mode requires graph max 8192 and no ablation flags"
+                "fusion, and cannot coexist with the first-stage MNNVL flag; "
+                "integrated mode requires graph max 8192 and no ablation flags. "
+                "TOKENSPEED_K3_FUSED_RS_UP_AG is removed; use "
+                "TOKENSPEED_K3_INTEGRATED_FUSED_TAIL for the integrated path."
             )
         multimem_ok, tail_ok, mnnvl_bt_ok, mnnvl_ht_ok, fused_ok = (
             bool(v) for v in values[:5]
@@ -858,34 +833,28 @@ class K3MoeTailCommState:
                 SharedRsWorkspace,
             )
 
-            self.fused_rs_up_ag_finalize = (
-                MNNVLCuteDSLHTFinalizeAllReduceRMSNorm.initialize(
-                    group=dist.group.WORLD,
-                    hidden_size=latent,
-                    top_k=top_k,
-                    rms_eps=self.rms_eps,
-                    candidate_min_tokens=(
-                        ht_min_tokens
-                        if self.integrated_tail
-                        else min(FUSED_RS_UP_AG_TOKENS)
+            self.mnnvl_ht_deferred = MNNVLCuteDSLHTFinalizeAllReduceRMSNorm.initialize(
+                group=dist.group.WORLD,
+                hidden_size=latent,
+                top_k=top_k,
+                rms_eps=self.rms_eps,
+                candidate_min_tokens=ht_min_tokens,
+                candidate_max_tokens=fused_capacity,
+                tuning_routes=(
+                    MNNVLCuteDSLHTFinalizeTuning(
+                        max_tokens=fused_capacity,
+                        persistent_ctas=None,
+                        consumer_threads=448,
+                        vectors_per_thread=1,
+                        stages=10,
+                        reduction_warps=2,
+                        reduction_cta_groups=None,
+                        rms_token_groups=2,
+                        rms_pipeline_stages=3,
+                        rms_shard_major=False,
+                        enable_pdl=True,
                     ),
-                    candidate_max_tokens=fused_capacity,
-                    tuning_routes=(
-                        MNNVLCuteDSLHTFinalizeTuning(
-                            max_tokens=fused_capacity,
-                            persistent_ctas=None,
-                            consumer_threads=448,
-                            vectors_per_thread=1,
-                            stages=10,
-                            reduction_warps=2,
-                            reduction_cta_groups=None,
-                            rms_token_groups=2,
-                            rms_pipeline_stages=3,
-                            rms_shard_major=False,
-                            enable_pdl=True,
-                        ),
-                    ),
-                )
+                ),
             )
             self.fused_rs_up_ag_workspace = SharedRsWorkspace.allocate(
                 dist.group.WORLD,
@@ -893,8 +862,6 @@ class K3MoeTailCommState:
                 torch.device("cuda", torch.cuda.current_device()),
             )
             self.fused_rs_up_ag_capacity = fused_capacity
-            if self.integrated_tail:
-                self.mnnvl_ht_deferred = self.fused_rs_up_ag_finalize
         if medium_ok and self.multimem_ar_ok:
             from tokenspeed_kernel.ops.communication.fused_rs_workspace import (
                 SharedRsWorkspace,
@@ -1265,7 +1232,6 @@ class K3MoeTailComm:
                 and not global_server_args_dict["disable_pdl"]
                 and mnnvl_graph_max_tokens >= MNNVL_BT_MIN_TOKENS
             ),
-            allow_fused_rs_up_ag=_fused_rs_up_ag_enabled(),
             mnnvl_bt_only=_mnnvl_bt_only_enabled(),
             allow_medium_fused_rs_up_ag=_medium_fused_rs_up_ag_enabled(),
             mnnvl_graph_max_tokens=mnnvl_graph_max_tokens,
@@ -1293,37 +1259,23 @@ class K3MoeTailComm:
                 self.state.medium_fused_rs_up_ag_capacity,
             )
         if self.state.fused_rs_up_ag_workspace is not None:
-            from tokenspeed_kernel.ops.communication.cutedsl_fused_rs_up_projection import (
-                FusedRsUpProjectionServing,
+            from tokenspeed_kernel.ops.communication.medium_fused_rs_up_projection_serving import (
+                IntegratedFusedRsOutputPool,
             )
 
             # Integrated sequential layers alternate two symmetric outputs.
             # AttnRes snapshots and EAGLE3 taps copy before either slot is reused.
-            # Historical profiles retain their separate per-layer outputs.
-            if self.state.integrated_tail:
-                from tokenspeed_kernel.ops.communication.medium_fused_rs_up_projection_serving import (
-                    IntegratedFusedRsOutputPool,
-                )
-
-                if self.state.integrated_tail_output_pool is None:
-                    self.state.integrated_tail_output_pool = (
-                        IntegratedFusedRsOutputPool(
-                            self.state.fused_rs_up_ag_workspace,
-                            self.state.fused_rs_up_ag_capacity,
-                        )
-                    )
-                self.fused_rs_up_ag = self.state.integrated_tail_output_pool.bind_layer(
-                    layer_index
-                )
-            else:
-                self.fused_rs_up_ag = FusedRsUpProjectionServing(
+            if self.state.integrated_tail_output_pool is None:
+                self.state.integrated_tail_output_pool = IntegratedFusedRsOutputPool(
                     self.state.fused_rs_up_ag_workspace,
                     self.state.fused_rs_up_ag_capacity,
                 )
-            if self.state.integrated_tail:
-                # Same raw storage and parity output; only first-stage and
-                # fused GEMM geometry depend on M. No duplicate large buffers.
-                self.medium_fused_rs_up_ag = self.fused_rs_up_ag
+            self.fused_rs_up_ag = self.state.integrated_tail_output_pool.bind_layer(
+                layer_index
+            )
+            # Same raw storage and parity output; only first-stage and fused
+            # GEMM geometry depend on M. No duplicate large buffers.
+            self.medium_fused_rs_up_ag = self.fused_rs_up_ag
         if self.state.latent_tail_ok:
             # Deferred-finalize arming (rank-uniform). The gate is the
             # experts kernel plan's own supports_deferred_finalize bit,
@@ -1427,10 +1379,6 @@ class K3MoeTailComm:
                 and num_tokens in MNNVL_HT_QUALIFIED_TOKENS
                 and ht_workspace.supports_num_tokens(num_tokens)
             ),
-            fused_rs_up_ag_ok=(
-                getattr(self, "fused_rs_up_ag", None) is not None
-                and num_tokens <= self.state.fused_rs_up_ag_capacity
-            ),
             prefill_graph_phase=get_is_prefill_graph_phase(),
         )
         # Upgrade only an already eligible BT prefill tier. Both new arms use
@@ -1443,12 +1391,6 @@ class K3MoeTailComm:
                 tier=K3MoETailTier.MEDIUM_FUSED_RS_UP_AG,
                 defer_finalize=True,
                 symm_outputs=(None, self.medium_fused_rs_up_ag.input_view(num_tokens)),
-            )
-        if tier is K3MoETailTier.FUSED_RS_UP_AG:
-            return TailPlan(
-                tier=tier,
-                defer_finalize=True,
-                symm_outputs=(None, self.fused_rs_up_ag.input_view(num_tokens)),
             )
         if tier is K3MoETailTier.TAIL_FUSION:
             # Full fusion: with the trtllm fused-AR plan armed and a
@@ -1584,7 +1526,7 @@ class K3MoeTailComm:
             )
         if tier is K3MoETailTier.FUSED_RS_UP_AG:
             gemm2_out, expert_weights, expanded_idx = routed_out
-            routed_norm = self.state.fused_rs_up_ag_finalize(
+            routed_norm = self.state.mnnvl_ht_deferred(
                 gemm2_out, expert_weights, expanded_idx, self.routed_norm.weight
             )
             return self.fused_rs_up_ag(

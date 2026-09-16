@@ -20,10 +20,11 @@
 
 """TP8 serving-adapter acceptance; execute directly under torchrun.
 
-Tests the actual dynamic-pointer adapter against the fixed qualified facade.
-The two layers share raw storage, own distinct outputs, and capture different
-latent/residual pointers for A/B graphs in both supported buckets. This is
-kernel/graph acceptance, not a full-model quality or TTFT certificate.
+Tests the integrated dynamic-pointer adapter against a fixed-input binding
+using the same continuous-range configuration. The two layers share raw storage,
+own distinct outputs, and capture different latent/residual pointers for A/B
+graphs at M4096 and M8192. These are test cases, not a dispatch whitelist.
+This is kernel/graph acceptance, not a full-model quality or TTFT certificate.
 """
 
 import argparse
@@ -36,14 +37,17 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from fused_rs_up_ag_admission import _query_cluster_admission, cap_smem_precheck
-from tokenspeed_kernel.ops.communication.cutedsl_fused_rs_up_projection import (
-    FusedRsUpProjectionServing,
-)
-from tokenspeed_kernel.ops.communication.fused_rs_up_projection import (
-    prepare_fused_rs_up_projection,
-)
 from tokenspeed_kernel.ops.communication.fused_rs_workspace import (
     SharedRsWorkspace,
+)
+from tokenspeed_kernel.ops.communication.medium_fused_rs_up_projection import (
+    prepare_medium_fused_rs_up_projection,
+)
+from tokenspeed_kernel.ops.communication.medium_fused_rs_up_projection_serving import (
+    IntegratedFusedRsUpProjectionServing,
+)
+from tokenspeed_kernel.ops.communication.medium_fused_rs_up_projection_serving_config import (
+    integrated_fused_rs_serving_config,
 )
 from tokenspeed_kernel.ops.communication.mnnvl_cutedsl_symmetric_up_projection import (
     allocate_symmetric_up_projection_output,
@@ -96,15 +100,16 @@ def make_case(m, slot, adapters, weights, workspace, device):
         output = allocate_symmetric_up_projection_output(
             dist.group.WORLD, m, device=device
         )
-        ref = prepare_fused_rs_up_projection(
+        ref = prepare_medium_fused_rs_up_projection(
             latent[layer],
             weights[layer],
             residual_ref,
             workspace,
             output,
             residual_is_replicated=True,
+            tuning=integrated_fused_rs_serving_config(m),
         )
-        admit(ref.plan)
+        admit(ref)
         references.append(ref)
         residual_ref = output.tensor
 
@@ -191,7 +196,10 @@ def main():
         raise ValueError("this acceptance requires TP8")
     torch.backends.cuda.matmul.allow_tf32 = False
     workspace = SharedRsWorkspace.allocate(dist.group.WORLD, 8192, device)
-    adapters = [FusedRsUpProjectionServing(workspace, 8192) for _ in range(2)]
+    adapters = [
+        IntegratedFusedRsUpProjectionServing(workspace, 8192, output=None)
+        for _ in range(2)
+    ]
     torch.manual_seed(5201 + dist.get_rank())
     weights = [
         torch.randn(896, 3584, device=device, dtype=torch.bfloat16) / math.sqrt(3584)
