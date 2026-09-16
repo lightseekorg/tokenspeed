@@ -162,6 +162,43 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     ]
 
 
+@pytest.mark.parametrize("capture_batch_sizes", [None, [1, 2, 4]])
+def test_prefill_capture_batch_sizes_must_be_explicit(capture_batch_sizes):
+    from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
+    from tokenspeed.runtime.execution.prefill_graph import (
+        resolve_prefill_capture_batch_sizes,
+    )
+
+    config_args = dict(
+        max_req_pool_size=5,
+        output_length=1,
+        enforce_eager=False,
+        prefix_granularity=128,
+        max_num_seqs=4,
+        chunked_prefill_size=4096,
+        vocab_size=32,
+        context_len=4096,
+        physical_context_len=4096,
+        device="cpu",
+        gpu_id=0,
+        global_rank=0,
+        cudagraph_capture_sizes=[1, 2, 4],
+        disable_cuda_graph_padding=False,
+        max_cudagraph_capture_size=4,
+        model_is_mrope=False,
+    )
+    with pytest.raises(TypeError, match="prefill_graph_capture_batch_sizes"):
+        ModelExecutorConfig(**config_args)
+
+    config = ModelExecutorConfig(
+        **config_args, prefill_graph_capture_batch_sizes=capture_batch_sizes
+    )
+    assert config.prefill_graph_capture_batch_sizes is capture_batch_sizes
+    assert resolve_prefill_capture_batch_sizes(config, 1024) == (
+        [1] if capture_batch_sizes is None else capture_batch_sizes
+    )
+
+
 def test_cudagraph_gc_flag_reaches_the_capture_context():
     """The operator flag must survive ServerArgs -> config -> capture.
 

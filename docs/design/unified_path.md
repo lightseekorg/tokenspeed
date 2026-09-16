@@ -718,8 +718,11 @@ destinations, not backend-owned cache pages. Replay requires the captured
 request count, but checkpoint counts, row identities and lengths can change.
 The outer owner captures exact request counts from
 `prefill_graph_capture_batch_sizes` (unset: the minimum count per token bucket)
-with one variant per token bucket and request count. Token buckets still follow the shared
-prefill token ladder. Capture requests have positive lengths and fit the
+with one variant per token bucket and request count. `ModelExecutorConfig`
+requires this field explicitly: factories forward the configured list or `None`
+for the minimum-count policy, so missing configuration wiring fails at
+construction. Token buckets still follow the shared prefill token ladder.
+Capture requests have positive lengths and fit the
 model context and request buffers; zero-length request padding is not admitted.
 Startup autotuning uses the same dummy-batch builder with an explicit minimum
 request count, `ceil(num_tokens / context_len)`, independent of the configured

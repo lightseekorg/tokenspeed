@@ -177,6 +177,8 @@ class ModelExecutorConfig:
     disable_cuda_graph_padding: bool
     max_cudagraph_capture_size: int
     model_is_mrope: bool
+    # Explicit None selects the minimum request count for each token bucket.
+    prefill_graph_capture_batch_sizes: list[int] | None
     enable_nan_detection: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
@@ -214,7 +216,6 @@ class ModelExecutorConfig:
     prefill_graph_max_tokens: int = 0
     # Explicit bucket list overriding the ladder (see get_prefill_token_buckets).
     prefill_graph_capture_sizes: list[int] | None = None
-    prefill_graph_capture_batch_sizes: list[int] | None = None
 
     @staticmethod
     def from_server_args(
