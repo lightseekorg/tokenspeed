@@ -124,6 +124,43 @@ class PrefillCaptureArgsTest(unittest.TestCase):
         self.assertIn("not maximum request capacities", help_text)
         self.assertIn("Compatibility alias", help_text)
 
+    def test_executor_requires_explicit_capture_batch_sizes(self):
+        from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
+        from tokenspeed.runtime.execution.prefill_graph import (
+            resolve_prefill_capture_batch_sizes,
+        )
+
+        config_args = dict(
+            max_req_pool_size=5,
+            output_length=1,
+            enforce_eager=False,
+            prefix_granularity=128,
+            max_num_seqs=4,
+            chunked_prefill_size=4096,
+            vocab_size=32,
+            context_len=4096,
+            physical_context_len=4096,
+            device="cpu",
+            gpu_id=0,
+            global_rank=0,
+            cudagraph_capture_sizes=[1, 2, 4],
+            disable_cuda_graph_padding=False,
+            max_cudagraph_capture_size=4,
+            model_is_mrope=False,
+        )
+        with self.assertRaisesRegex(TypeError, "prefill_graph_capture_batch_sizes"):
+            ModelExecutorConfig(**config_args)
+
+        for sizes, expected in ((None, [1]), ([1, 2, 4], [1, 2, 4])):
+            with self.subTest(capture_batch_sizes=sizes):
+                config = ModelExecutorConfig(
+                    **config_args, prefill_graph_capture_batch_sizes=sizes
+                )
+                self.assertIs(config.prefill_graph_capture_batch_sizes, sizes)
+                self.assertEqual(
+                    resolve_prefill_capture_batch_sizes(config, 1024), expected
+                )
+
 
 def _spec(
     group_id: str,
