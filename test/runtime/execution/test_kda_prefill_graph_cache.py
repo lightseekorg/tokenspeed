@@ -27,7 +27,6 @@ import torch
 
 from tokenspeed.runtime.layers.attention.backends.state.kda_prefill_graph import (
     KdaOuterGraphBinding,
-    KdaPrefillGraphCache,
     _checkpoint_slot_batch,
     _clone_metadata,
 )
@@ -103,120 +102,21 @@ def test_checkpoint_slots_keep_shape_and_mask_inactive_requests(count):
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_replay_refreshes_pages_and_writes_exactly_once():
-    cache = KdaPrefillGraphCache()
-    backend = SimpleNamespace(forward_metadata=metadata("cuda", 1))
-    value = torch.ones(1, device="cuda")
-    state = torch.zeros(4, device="cuda")
-
-    def forward():
-        pages = backend.forward_metadata.state_out_blocks_by_group["state"]
-        state[pages] += value
-        return state[pages].clone()
-
-    for page in (1, 2, 3, 1, 2):
-        live = metadata("cuda", page)
-        backend.forward_metadata = live
-        before = state.clone()
-        result = cache.run(backend, 0, 1, {"value": value}, forward)
-        torch.testing.assert_close(result, before[page : page + 1] + 1)
-        before[page] += 1
-        torch.testing.assert_close(state, before)
-        assert backend.forward_metadata is live
-    assert cache.captures == 1
-    assert cache.replays == 4
-
-    # Another input allocation must not replay the captured old address.
-    value = torch.full_like(value, 3)
-    before = state.clone()
-    cache.run(backend, 0, 1, {"value": value}, forward)
-    before[2] += 3
-    torch.testing.assert_close(state, before)
-    assert cache.replays == 4
-
-    # Every outer token bucket remains eligible, including the ninth and later.
-    for bucket in range(2, 11):
-        for _ in range(3):
-            backend.forward_metadata = metadata("cuda", 2)
-            before = state.clone()
-            result = cache.run(backend, 0, bucket, {"value": value}, forward)
-            before[2] += 3
-            torch.testing.assert_close(state, before)
-            torch.testing.assert_close(result, before[2:3])
-    assert len(cache.schedules) == 10
-    assert cache.captures == 10
-    assert cache.replays == 22
-
-
-def test_hybrid_reinitialization_clears_kda_graphs():
+def test_hybrid_initializes_prefill_graph_state_on_both_children():
     from unittest.mock import Mock
 
     from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
         HybridLinearAttnBackend,
     )
-    from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
 
-    child = object.__new__(KdaAttnBackend)
-    child._prefill_graph_cache = object()
     backend = object.__new__(HybridLinearAttnBackend)
     backend.full_attn_backend = Mock()
-    backend.linear_attn_backend = child
+    backend.linear_attn_backend = Mock()
     backend.init_prefill_graph_state(1024, 4)
-    assert child._prefill_graph_cache is None
     backend.full_attn_backend.init_prefill_graph_state.assert_called_once_with(1024, 4)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_failure_restores_live_metadata():
-    cache = KdaPrefillGraphCache()
-    live = metadata("cuda", 1)
-    backend = SimpleNamespace(forward_metadata=live)
-
-    def forward():
-        raise ValueError("test failure")
-
-    with pytest.raises(ValueError, match="test failure"):
-        cache.run(backend, 0, 1, {}, forward)
-    assert backend.forward_metadata is live
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_pool_sharing_is_scoped_to_replay_stream():
-    cache = KdaPrefillGraphCache()
-    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
-    cases = []
-
-    def bind_forward(value):
-        def forward():
-            return (value.square() + 3).clone()
-
-        return forward
-
-    for stream in streams:
-        with torch.cuda.stream(stream):
-            for layer in range(2):
-                backend = SimpleNamespace(forward_metadata=metadata("cuda", 1))
-                value = torch.full((257,), layer + 1.0, device="cuda")
-
-                forward = bind_forward(value)
-                for _ in range(2):
-                    cache.run(backend, layer, 257, {"value": value}, forward)
-                cases.append((stream, backend, layer, value, forward))
-    assert len(cache._capture_resources) == 2
-    pools = [resources[0] for resources in cache._capture_resources.values()]
-    assert pools[0] != pools[1]
-    outputs = []
-    # Queue both streams without a host synchronization between replays.
-    for stream, backend, layer, value, forward in reversed(cases):
-        with torch.cuda.stream(stream):
-            value.add_(2)
-            result = cache.run(backend, layer, 257, {"value": value}, forward)
-            outputs.append((result.clone(), value.square() + 3))
-    torch.cuda.synchronize()
-    for actual, expected in outputs:
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    assert cache.captures == 4
+    backend.linear_attn_backend.init_prefill_graph_state.assert_called_once_with(
+        1024, 4
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -333,22 +233,6 @@ def test_outer_binding_restores_metadata_after_failure():
             raise ValueError("test failure")
     assert backend.forward_metadata is original
     assert not backend.prefill_graph_inline
-
-
-def test_internal_checkpoint_batch_bypasses_capacity_graph():
-    live = metadata("cpu", 1)
-    live.prefill_checkpoint_batch = object()
-    backend = SimpleNamespace(forward_metadata=live)
-    cache = KdaPrefillGraphCache()
-    calls = []
-
-    def forward():
-        calls.append(backend.forward_metadata)
-        return "eager checkpoint result"
-
-    assert cache.run(backend, 0, 8, {}, forward) == "eager checkpoint result"
-    assert calls == [live]
-    assert cache.schedules == {}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -557,12 +441,17 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
 
 
 @pytest.mark.parametrize(
-    "compatible,transfer,expected",
-    [(True, False, 2), (False, False, 1), (True, True, 1)],
+    "captured,compatible,transfer,expected",
+    [
+        (True, True, False, 2),
+        (True, False, False, 1),
+        (True, True, True, 1),
+        (False, True, False, 1),
+    ],
 )
-@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
 def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
-    compatible, transfer, expected, batch_size
+    captured, compatible, transfer, expected, batch_size
 ):
     from contextlib import contextmanager, nullcontext
     from unittest.mock import patch
@@ -597,6 +486,8 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
             [Binding()],
         )
     }
+    if not captured:
+        owner._inline_captures.clear()
     owner.attn_backend = SimpleNamespace(step_counter=object() if transfer else None)
     owner._replay_bucket = lambda ctx: 8
     owner._log_engaged_once = lambda *args: None
@@ -616,6 +507,7 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     assert events == (
         ["refresh", "inline", "restore"] if expected == 2 else ["ordinary"]
     )
+    assert len(owner._inline_captures) == int(captured)
 
 
 @pytest.mark.parametrize(

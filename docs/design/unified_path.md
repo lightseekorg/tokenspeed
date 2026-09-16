@@ -727,8 +727,8 @@ model context and request buffers; zero-length request padding is not admitted.
 Startup autotuning uses the same dummy-batch builder with an explicit minimum
 request count, `ceil(num_tokens / context_len)`, independent of the configured
 capture request counts. Its token budget also respects rank-local request capacity.
-Uncaptured request counts retain the ordinary attention break, whose
-separate-subgraph cache still rejects internal checkpoints. Replay refresh includes
+Uncaptured request counts retain the ordinary attention break and eager KDA,
+including internal-checkpoint batches. Replay refresh includes
 `scan_query_start_loc`, which the recurrent dispatcher consumes, as well as
 the convolution boundary and existing int64 mirror.
 
@@ -750,39 +750,25 @@ sequences; ordinary eager prefill retains compact tails and skips the second
 scan when there is no internal checkpoint. Both use the same checkpoint
 writers and recurrent-state scatter, which ignore negative destinations/rows.
 
-### Separate subgraphs in the ordinary outer capture
+### Startup capture and eager fallback
 
-`TOKENSPEED_KDA_PREFILL_GRAPH=1` opts into capacity-based subgraphs within
-the existing breakable-prefill attention break. The default remains off.
-The cache calls the same extend implementation for warmup and capture;
-capture failures propagate. Decode and ordinary eager
-forwards retain their existing behavior. PD cache-step recording and the
-break-output copy/padding stay outside the subgraph in their original order.
+`TOKENSPEED_KDA_PREFILL_GRAPH=1` opts into the merged captures owned by
+`PrefillGraph`; the default remains off. Startup creates the configured token
+bucket and exact-request-count variants. Serving forwards only select and
+replay these captures, never warm up or capture a separate per-layer graph.
 
-Each backend lazily retains schedules for the outer prefill graph's selected
-token buckets, keyed by sequence count, padded token count, CUDA stream and
-PDL setting. There is no separate KDA bucket list or schedule-count limit.
-Layer entries also
-require identical input addresses, shapes, strides, dtypes and scalar
-arguments, and retain input references against allocator address recycling.
-Incompatible inputs run the same eager callable.
-The first execution warms native plans normally; the second records a graph
-and replays once, so in-place cache state is never advanced by extra warmups.
+If no compatible merged capture exists, the ordinary outer graph retains its
+attention break and calls the same eager KDA implementation. Checkpoint
+handling, PD cache-step recording and break-output copy/padding keep their
+existing order. Inputs outside the outer graph's admission rules run eager.
+New request shapes do not grow a backend-owned graph cache. Metadata refresh
+and eager execution may still allocate temporary buffers.
 
-Schedules own private metadata snapshots. Actual CPU/GPU boundaries and
-state-page indices are refreshed once per new forward, on the same stream
-that consumes them. All layers in that schedule share the snapshot. This
-does not mutate the original per-forward metadata or change scheduler page
-ownership. Publishing a replacement cache pool drops all subgraphs, under
-the existing orchestrator-owned graph-release/rebind lifecycle.
+The outer owner retains graph metadata and outputs. Its serial shared-pool
+discipline and orchestrator-owned graph-release/rebind lifecycle apply to all
+merged variants; there is no separate KDA graph pool.
 
-Subgraphs on one replay stream share a private graph memory pool and one
-capture stream. Other replay streams use separate pools, so concurrent
-consumers cannot overwrite each other's scratch. The outer breakable graph
-pool remains separate: its intermediates are live across attention breaks.
-Every subgraph produces its output before the existing immediate handoff
-copy consumes it; no captured temporary is an eager-call cache. Output
-tensors remain strongly owned by their graph entries.
+### Fixed-capacity execution metadata
 
 The private KDA metadata overrides only the packed execution extent; real
 host lengths and GPU boundaries still agree. An explicit

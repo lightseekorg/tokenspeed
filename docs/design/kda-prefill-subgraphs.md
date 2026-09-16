@@ -37,6 +37,10 @@ Main and tail are parts of the same outer capture, not separately selected
 graphs. This removes the per-layer KDA graph launch and the output handoff copy
 at the attention break.
 
+The server captures the configured variants at startup. Requests select an
+existing capture; encountering another batch size or token length does not
+create a new graph during serving.
+
 Before replay, the backend refreshes request boundaries, convolution maps,
 token maps and state-page indices once for all KDA layers. The buffers retain
 their addresses; the scheduler remains responsible for cache allocation and
@@ -148,13 +152,14 @@ within that configuration.
   prompts can still use graphs for individual scheduled chunks that fit.
 - Other KDA backends retain their existing execution behavior.
 
-Within an ordinary outer graph's pure-prefill attention break, the same switch
-can also enable a separate per-layer KDA subgraph. It uses the outer token
-bucket and captures lazily: the first eligible call warms the kernels, the
-second captures and replays, and later calls replay. It requires compatible
-tensor addresses, shapes, strides and scalar arguments, and does not support
-internal-checkpoint batches. Incompatible calls execute the existing eager
-attention callable; the surrounding outer segments remain graphed.
+When a batch cannot use a merged capture, KDA executes eagerly at the ordinary
+outer graph's attention break. The surrounding model segments remain graphed
+when an outer token bucket fits. This fallback does not capture or retain
+per-layer KDA graphs, even for shapes seen repeatedly.
+
+Graph storage is determined by startup capture rather than accumulated from
+serving traffic. Metadata refresh and eager execution still allocate temporary
+buffers; this is not a guarantee of constant total GPU memory usage.
 
 Ordinary outer capture and fully eager execution are different fallbacks:
 missing a merged KDA configuration does not by itself disable graphs for the

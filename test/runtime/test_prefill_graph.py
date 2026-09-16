@@ -162,6 +162,87 @@ class PrefillCaptureArgsTest(unittest.TestCase):
                 )
 
 
+class KdaPrefillFallbackTest(unittest.TestCase):
+    def test_outer_attention_break_does_not_capture_kda_graphs(self):
+        from unittest.mock import patch
+
+        import torch
+
+        from tokenspeed.runtime.execution.breakable_cuda_graph import BreakableCapture
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+        from tokenspeed.runtime.layers.attention.backends.state.kda import (
+            KdaAttnBackend,
+        )
+        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+            MambaAttnBackend,
+        )
+
+        backend = object.__new__(KdaAttnBackend)
+        backend._prefill_graph_enabled = True
+        backend.kda_backend = "cutedsl_kda"
+        capture = object.__new__(BreakableCapture)
+        output = torch.ones(1)
+        results = []
+
+        # Exercise the real replay boundary with CPU tensors and a mocked scan.
+        # Even repeated fallback shapes must not warm or capture a private graph.
+        with (
+            patch.object(MambaAttnBackend, "forward_extend", autospec=True) as scan,
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+            patch.object(torch.cuda, "CUDAGraph") as graph,
+            patch.object(
+                torch.cuda,
+                "current_stream",
+                side_effect=AssertionError("fallback attempted graph preparation"),
+            ),
+        ):
+            scan.return_value = output
+            for bs, bucket in ((1, 128), (2, 2048), (4, 4096), (1, 8192)):
+                for checkpoint in (None, object()):
+                    live = SimpleNamespace(prefill_checkpoint_batch=checkpoint)
+                    backend.forward_metadata = live
+
+                    def forward():
+                        results.append(
+                            backend.forward_extend(
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                bs,
+                                ForwardMode.EXTEND,
+                                save_kv_cache=True,
+                                layer_id=0,
+                                seq_len=bucket,
+                            )
+                        )
+
+                    capture.segments = [forward]
+                    for iteration in range(3):
+                        with self.subTest(bs=bs, bucket=bucket, iteration=iteration):
+                            scan.reset_mock()
+                            capture.replay(valid_rows=bucket - 1)
+                            scan.assert_called_once_with(
+                                backend,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                bs,
+                                ForwardMode.EXTEND,
+                                save_kv_cache=True,
+                                layer_id=0,
+                                seq_len=bucket,
+                            )
+                            self.assertIs(results[-1], output)
+                            self.assertIs(backend.forward_metadata, live)
+                            self.assertFalse(backend.prefill_graph_inline)
+            graph.assert_not_called()
+        self.assertEqual(len(results), 24)
+
+
 def _spec(
     group_id: str,
     *,

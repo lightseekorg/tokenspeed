@@ -260,9 +260,6 @@ class PrefillGraph:
         self._embed_tokens = getattr(self.inner_model, "embed_tokens", None)
         self._input_embeds_buf: torch.Tensor | None = None
         self.attn_backend = attn_backend
-        # (token capacity, exact BS) -> (capture, outputs, metadata bindings).
-        # Checkpoint request counts are refreshed metadata, not another key.
-        self._inline_captures = {}
         self.token_to_kv_pool = token_to_kv_pool
         self.input_buffers = input_buffers
         self.config = config
@@ -298,6 +295,12 @@ class PrefillGraph:
         # One captured graph + bucket-sized output per padded token bucket.
         self._captures: dict[int, BreakableCapture] = {}
         self._outputs: dict[int, CapturedForward] = {}
+        # Captures with supported prefill attention inlined in the prefill graph.
+        # (token capacity, exact BS) -> (capture, outputs, metadata bindings).
+        # Checkpoint request counts are refreshed metadata, not another key.
+        self._inline_captures: dict[
+            tuple[int, int], tuple[BreakableCapture, CapturedForward, list]
+        ] = {}
 
     # ------------------------------------------------------------------
     # Graph capture

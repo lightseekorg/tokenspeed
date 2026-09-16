@@ -54,13 +54,8 @@ from tokenspeed_kernel.ops.attention.kda.triton import (
 from tokenspeed_kernel.platform import pdl_enabled
 from typing_extensions import override
 
-from tokenspeed.runtime.execution.breakable_cuda_graph import (
-    BreakableCapture,
-    current_valid_rows,
-)
 from tokenspeed.runtime.layers.attention.backends.state.kda_prefill_graph import (
     KdaOuterGraphBinding,
-    KdaPrefillGraphCache,
     KdaPrefillGraphMetadata,
 )
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
@@ -122,7 +117,6 @@ class KdaAttnBackend(MambaAttnBackend):
         kda_backend: str = "auto",
     ) -> None:
         super().__init__(config, spec)
-        self._prefill_graph_cache = None
         self._prefill_graph_enabled = (
             os.environ.get("TOKENSPEED_KDA_PREFILL_GRAPH", "0") == "1"
         )
@@ -145,10 +139,6 @@ class KdaAttnBackend(MambaAttnBackend):
             "platform-selected kernels",
             self.kda_backend,
         )
-
-    def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
-        self._prefill_graph_cache = None
-        super().init_prefill_graph_state(max_num_tokens, max_bs)
 
     def prepare_prefill_graph_bindings(self, bucket: int) -> list:
         # The startup feature switch enables this optimization; bind() sets the
@@ -174,21 +164,18 @@ class KdaAttnBackend(MambaAttnBackend):
         save_kv_cache,
         **kwargs,
     ):
-        def forward():
-            return super(KdaAttnBackend, self).forward_extend(
-                q,
-                k,
-                v,
-                layer,
-                token_to_kv_pool,
-                bs,
-                forward_mode,
-                save_kv_cache=save_kv_cache,
-                **kwargs,
-            )
-
+        output = super().forward_extend(
+            q,
+            k,
+            v,
+            layer,
+            token_to_kv_pool,
+            bs,
+            forward_mode,
+            save_kv_cache=save_kv_cache,
+            **kwargs,
+        )
         if self.prefill_graph_inline:
-            output = forward()
             checkpoint = self.forward_metadata.prefill_checkpoint_batch
             if checkpoint is not None and checkpoint.output_sources is not None:
                 # The fused gather writes the complete output, including padding.
@@ -197,29 +184,9 @@ class KdaAttnBackend(MambaAttnBackend):
             rows = torch.arange(output.shape[0], device=output.device)
             padding = rows >= self.forward_metadata.query_start_loc[-1]
             return output.masked_fill_(padding.view(-1, *([1] * (output.ndim - 1))), 0)
-        # Only a pure EXTEND break during outer replay may try the separate
-        # CuTeDSL cache, never during capture. Otherwise use the same forward.
-        # Admission here still allows cache fallback for checkpoints, changed
-        # signatures or the first warmup call.
-        if not (
-            self._prefill_graph_enabled
-            and self.kda_backend == "cutedsl_kda"
-            and forward_mode.is_extend()
-            and current_valid_rows() is not None
-            and BreakableCapture.current() is None
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            return forward()
-        if self._prefill_graph_cache is None:
-            self._prefill_graph_cache = KdaPrefillGraphCache()
-        arguments = dict(kwargs, q=q, k=k, v=v, bs=bs, save_kv_cache=save_kv_cache)
-        return self._prefill_graph_cache.run(
-            self,
-            kwargs["layer_id"],
-            kwargs["seq_len"],
-            arguments,
-            forward,
-        )
+        # Uncaptured batches keep eager attention inside the ordinary outer
+        # graph. Serving forwards never allocate or capture a KDA subgraph.
+        return output
 
     def _reset_replay_state(self) -> None:
         self._verify_producer_stream: torch.cuda.Stream | None = None
@@ -279,7 +246,6 @@ class KdaAttnBackend(MambaAttnBackend):
     @override
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
-        self._prefill_graph_cache = None
         self._reset_replay_state()
         shape = self._replay_shape(cache_pool)
         self._replay_active = kda_replay_commit_supported(

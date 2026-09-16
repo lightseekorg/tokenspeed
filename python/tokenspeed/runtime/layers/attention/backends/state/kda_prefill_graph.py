@@ -18,9 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""KDA capacity metadata for inline outer capture and separate subgraphs."""
+"""KDA capacity metadata owned by startup-captured outer graphs."""
 
-import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass, replace
 
@@ -31,15 +30,12 @@ from tokenspeed_kernel.ops.attention.gdn.triton import (
     refresh_causal_conv1d_capacity_metadata,
 )
 from tokenspeed_kernel.ops.attention.kda import KdaPrefillCapacity
-from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaForwardMetadata,
     _PrefillCheckpointBatch,
 )
 from tokenspeed.runtime.utils.tensor import upload_packed
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass(kw_only=True)
@@ -202,8 +198,7 @@ def _refresh_checkpoint_destinations(target, source):
 def _capacity_metadata(source, bucket, tail_capacity):
     """Create an isolated execution snapshot without allocating request state.
 
-    ``tail_capacity=None`` prepares a separate full-batch scan. A non-None
-    capacity also reserves fixed checkpoint/tail slots for inline capture.
+    Reserve fixed checkpoint/tail slots for inline capture.
     The graph owner retains the snapshot and its stable device buffers.
     """
     capacity = KdaPrefillCapacity(bucket, source.extend_seq_lens_cpu.numel())
@@ -216,15 +211,14 @@ def _capacity_metadata(source, bucket, tail_capacity):
         },
         capacity=capacity,
     )
-    if tail_capacity is not None:
-        result.prefill_checkpoint_batch = _checkpoint_slot_batch(
-            source, bucket, tail_capacity
-        )
-        result.state_checkpoint_blocks_by_group = {
-            group: torch.full_like(indices, -1)
-            for group, indices in source.state_out_blocks_by_group.items()
-        }
-        _refresh_checkpoint_destinations(result, source)
+    result.prefill_checkpoint_batch = _checkpoint_slot_batch(
+        source, bucket, tail_capacity
+    )
+    result.state_checkpoint_blocks_by_group = {
+        group: torch.full_like(indices, -1)
+        for group, indices in source.state_out_blocks_by_group.items()
+    }
+    _refresh_checkpoint_destinations(result, source)
     # Bound total packed work plus one partial block per request. Stable maps
     # are shared across layers and refreshed before replay on its consumer stream.
     result.conv_prefill_metadata = build_causal_conv1d_capacity_metadata(
@@ -252,24 +246,6 @@ def _clone_metadata(value):
                 field.name: _clone_metadata(getattr(value, field.name))
                 for field in fields(value)
             },
-        )
-    return value
-
-
-def _argument_key(value):
-    """Match tensor address, shape, strides, dtype and device, or a scalar value.
-
-    Tensor contents may change at the same address. Live request boundaries
-    and page IDs belong in refreshed metadata, not untracked Python arguments.
-    Non-tensor arguments must equal their capture-time values.
-    """
-    if isinstance(value, torch.Tensor):
-        return (
-            value.data_ptr(),
-            tuple(value.shape),
-            value.stride(),
-            value.dtype,
-            value.device,
         )
     return value
 
@@ -382,118 +358,3 @@ def _refresh_capacity_metadata(target, source):
             if indices.shape != new[group].shape or indices.dtype != new[group].dtype:
                 raise RuntimeError("KDA graph state index geometry changed")
             indices.copy_(new[group])
-
-
-class KdaPrefillGraphCache:
-    """Capture extend using the outer prefill graph's selected token buckets.
-
-    Caller supplies only pure EXTEND work inside breakable graph replay.
-    Outputs have the usual break-output lifetime: consume before the next call.
-    The cache owns execution metadata, not scheduler state or cache pages.
-    """
-
-    def __init__(self):
-        self.schedules = {}
-        self.last_source = None
-        self.last_key = None
-        self.captures = 0
-        self.replays = 0
-        self._capture_resources = {}
-
-    def run(self, backend, layer_id, bucket, arguments, forward):
-        """Warm, capture or replay one layer under a capacity schedule.
-
-        Schedules match sequence count, token bucket, stream and PDL; each layer
-        also matches the argument signature described by ``_argument_key``.
-        A new forward must supply a new source metadata object: object identity,
-        not tensor contents, triggers the once-per-forward metadata refresh.
-        Consume the returned output before the next call reuses its graph pool.
-        """
-        source = backend.forward_metadata
-        # Body/tail scans have different packed extents and checkpoint indices.
-        # A full-batch capacity graph cannot replay that metadata contract.
-        if source.prefill_checkpoint_batch is not None:
-            return forward()
-        stream = torch.cuda.current_stream()
-        if source is not self.last_source:
-            self.last_key = (
-                source.extend_seq_lens_cpu.numel(),
-                bucket,
-                stream.cuda_stream,
-                pdl_enabled(),
-            )
-            self.last_source = source
-        # A single metadata object may also be used with another padded bucket.
-        key = (self.last_key[0], bucket, stream.cuda_stream, pdl_enabled())
-        schedule = self.schedules.get(key)
-        if schedule is None:
-            schedule = {
-                "metadata": _capacity_metadata(source, bucket, None),
-                "source": source,
-                "layers": {},
-            }
-            self.schedules[key] = schedule
-        elif schedule["source"] is not source:
-            # Refresh once on the consumer stream; all layers reuse the maps.
-            _refresh_capacity_metadata(schedule["metadata"], source)
-            schedule["source"] = source
-
-        signature = tuple(
-            (name, _argument_key(value)) for name, value in sorted(arguments.items())
-        )
-        entry = schedule["layers"].get(layer_id)
-        if entry is not None and entry["signature"] != signature:
-            # Keep the original tensor objects alive: an allocator-recycled
-            # pointer must never turn a different argument into a cache hit.
-            return forward()
-        original = backend.forward_metadata
-        backend.forward_metadata = schedule["metadata"]
-        try:
-            if entry is None:
-                result = forward()  # Ordinary first execution warms native plans.
-                schedule["layers"][layer_id] = {
-                    "signature": signature,
-                    "arguments": dict(arguments),
-                    "graph": None,
-                    "output": None,
-                }
-                return result
-            if entry["graph"] is None:
-                graph = torch.cuda.CUDAGraph()
-                # Only serial consumers share scratch. Keep separate pools for
-                # different replay streams, and never borrow the outer graph's
-                # pool: its live intermediates span this attention break.
-                resource_key = (stream.device, stream.cuda_stream)
-                resources = self._capture_resources.get(resource_key)
-                if resources is None:
-                    resources = (
-                        torch.cuda.graph_pool_handle(),
-                        torch.cuda.Stream(device=stream.device),
-                    )
-                    self._capture_resources[resource_key] = resources
-                pool, capture_stream = resources
-                capture_stream.wait_stream(stream)
-                # Capture records work but does not execute cache writes. Replay
-                # exactly once; never warm up again against an in-place state.
-                with torch.cuda.graph(
-                    graph,
-                    pool=pool,
-                    stream=capture_stream,
-                    capture_error_mode="thread_local",
-                ):
-                    output = forward()
-                stream.wait_stream(capture_stream)
-                entry["graph"], entry["output"] = graph, output
-                entry["capture_stream"] = capture_stream
-                self.captures += 1
-                logger.info(
-                    "KDA prefill subgraph captured: layer=%s bucket=%s sequences=%s",
-                    layer_id,
-                    bucket,
-                    key[0],
-                )
-            entry["graph"].replay()
-            self.replays += 1
-            return entry["output"]
-        finally:
-            backend.forward_metadata = original
