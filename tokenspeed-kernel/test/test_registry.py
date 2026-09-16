@@ -24,10 +24,13 @@ import pytest
 import torch
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import (
+    KernelApiSpec,
     KernelRegistry,
     KernelSpec,
+    WarmupBehavior,
     describe_kernel,
     register_kernel,
+    register_kernel_api,
 )
 from tokenspeed_kernel.signature import (
     ScaleFormat,
@@ -54,6 +57,7 @@ class TestKernelSpec:
         assert spec.priority == 10
         assert spec.tags == frozenset()
         assert spec.format_signatures == frozenset()
+        assert spec.warmup_behavior is WarmupBehavior.NONE
 
     def test_hashable_without_dict_traits(self):
         spec = KernelSpec(name="k1", family="attention", mode="decode", traits={})
@@ -230,6 +234,76 @@ class TestRegistryRegister:
         assert priorities == sorted(priorities, reverse=True)
 
 
+class TestKernelApiSpec:
+    def test_register_and_list_api(self):
+        def public_api():
+            return None
+
+        register_kernel_api(
+            family="gemm",
+            mode="mm",
+            public_api=public_api,
+            warmup_config_type=None,
+        )
+
+        registry = KernelRegistry.get()
+        spec = registry.get_api("gemm", "mm")
+        assert spec is not None
+        assert spec.api == "gemm.mm"
+        assert spec.public_api is public_api
+        assert registry.list_apis() == [spec]
+
+    def test_duplicate_api_is_rejected(self):
+        def public_api():
+            return None
+
+        spec = KernelApiSpec(
+            family="moe",
+            mode="apply",
+            public_api=public_api,
+            warmup_config_type=None,
+        )
+        registry = KernelRegistry.get()
+        registry.register_api(spec)
+
+        with pytest.raises(ValueError, match="already registered"):
+            registry.register_api(spec)
+
+    @pytest.mark.parametrize(
+        ("family", "mode"),
+        [("", "apply"), ("moe.apply", "apply"), ("moe", ""), ("moe", "apply.v2")],
+    )
+    def test_invalid_api_identifier_is_rejected(self, family, mode):
+        with pytest.raises(ValueError, match="Invalid kernel API"):
+            KernelApiSpec(
+                family=family,
+                mode=mode,
+                public_api=lambda: None,
+                warmup_config_type=None,
+            )
+
+    def test_non_callable_public_api_is_rejected(self):
+        with pytest.raises(TypeError, match="must be callable"):
+            KernelApiSpec(
+                family="moe",
+                mode="apply",
+                public_api=None,  # type: ignore[arg-type]
+                warmup_config_type=None,
+            )
+
+    def test_reset_clears_api_metadata(self):
+        register_kernel_api(
+            family="moe",
+            mode="apply",
+            public_api=lambda: None,
+            warmup_config_type=None,
+        )
+
+        KernelRegistry.reset()
+
+        assert KernelRegistry.get().list_apis() == []
+
+
 class TestRegistryQueries:
     def test_get_for_operator_basic(self, sample_specs):
         reg = KernelRegistry.get()
@@ -346,9 +420,7 @@ class TestRegistryQueries:
         register_all_samples(reg, sample_specs)
 
         solutions = reg.list_solutions("attention", "decode")
-        assert "flashinfer" in solutions
-        assert "triton" in solutions
-        assert "reference" in solutions
+        assert solutions == ["flashinfer", "reference", "triton"]
 
 
 class TestRegistryCache:
@@ -470,6 +542,21 @@ class TestRegisterKernelDecorator:
 
         assert original(5) == 10
 
+    def test_warmup_behavior(self):
+        @register_kernel(
+            "gemm",
+            "mm",
+            solution="flashinfer",
+            signatures=format_signatures(("a", "b"), "dense", {torch.bfloat16}),
+            warmup_behavior=WarmupBehavior.FLASHINFER_AUTOTUNE,
+        )
+        def tuned_gemm(a, b):
+            return a @ b
+
+        spec = KernelRegistry.get().get_by_name("flashinfer_gemm_mm")
+        assert spec is not None
+        assert spec.warmup_behavior is WarmupBehavior.FLASHINFER_AUTOTUNE
+
 
 class TestDescribeKernel:
     def test_describe_existing(self, sample_specs):
@@ -480,6 +567,7 @@ class TestDescribeKernel:
         assert "flashinfer_decode" in desc
         assert "attention" in desc
         assert "flashinfer" in desc
+        assert "Warmup: none" in desc
 
     def test_describe_includes_weight_preprocessor_link(self):
         def moe_weights(**_):

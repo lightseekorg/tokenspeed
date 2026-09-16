@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
-from enum import IntEnum
+from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 if TYPE_CHECKING:
@@ -42,6 +42,7 @@ __all__ = [
     "KernelApiSpec",
     "KernelRegistry",
     "Priority",
+    "WarmupBehavior",
     "load_builtin_kernels",
     "register_kernel",
     "register_kernel_api",
@@ -134,6 +135,15 @@ class Priority(IntEnum):
     PLUGIN = 16
 
 
+class WarmupBehavior(str, Enum):
+    """Ahead-of-time preparation required by a concrete kernel."""
+
+    NONE = "none"
+    FLASHINFER_AUTOTUNE = "flashinfer_autotune"
+    JIT_COMPILE = "jit_compile"
+    PREALLOCATE = "preallocate"
+
+
 def _band_for(value: int) -> Priority:
     """Return the band that contains ``value`` (the largest band start ≤ value)."""
     return max((b for b in Priority if int(b) <= value), key=int)
@@ -164,6 +174,14 @@ class KernelApiSpec:
     mode: str
     public_api: Callable[..., object]
     warmup_config_type: type[WarmupConfig] | None
+
+    def __post_init__(self) -> None:
+        if not self.family or "." in self.family:
+            raise ValueError(f"Invalid kernel API family {self.family!r}")
+        if not self.mode or "." in self.mode:
+            raise ValueError(f"Invalid kernel API mode {self.mode!r}")
+        if not callable(self.public_api):
+            raise TypeError("Kernel API public_api must be callable")
 
     @property
     def api(self) -> str:
@@ -198,6 +216,7 @@ class KernelSpec:
         frozenset()
     )  # Standard tags: "throughput", "latency", "determinism", "portability"
     weight_preprocessor: Callable | None = None
+    warmup_behavior: WarmupBehavior = WarmupBehavior.NONE
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -205,6 +224,8 @@ class KernelSpec:
             "weight_preprocessor",
             _validate_weight_preprocessor(self.weight_preprocessor),
         )
+        if not isinstance(self.warmup_behavior, WarmupBehavior):
+            raise TypeError("warmup behavior must be a WarmupBehavior")
 
     def supports_format_signature(self, format_signature: FormatSignature) -> bool:
         return format_signature in self.format_signatures
@@ -384,7 +405,7 @@ class KernelRegistry:
 
     def list_solutions(self, family: str, mode: str) -> list[str]:
         """List available solutions for an operator."""
-        return list({s.solution for s in self._by_operator.get((family, mode), [])})
+        return sorted({s.solution for s in self._by_operator.get((family, mode), [])})
 
     # ---- Cache management ----
 
@@ -418,6 +439,7 @@ def register_kernel(
     priority: Priority | int = Priority.PERFORMANT + 2,
     tags: set[str] | None = None,
     weight_preprocessor: Callable | None = None,
+    warmup_behavior: WarmupBehavior = WarmupBehavior.NONE,
 ) -> Callable:
     """Decorator to register a kernel function.
 
@@ -470,6 +492,7 @@ def register_kernel(
             priority=priority_int,
             tags=frozenset(tags or set()),
             weight_preprocessor=normalized_weight_preprocessor,
+            warmup_behavior=warmup_behavior,
         )
 
         KernelRegistry.get().register(spec, fn)
@@ -510,6 +533,7 @@ def describe_kernel(name: str) -> str:
         f"  Operator: {spec.family}.{spec.mode}",
         f"  Solution: {spec.solution}",
         f"  Priority: {spec.priority} ({band_str})",
+        f"  Warmup: {spec.warmup_behavior.value}",
         "  Format signatures: "
         + ("; ".join(str(p) for p in spec.format_signatures) or "none"),
         f"  Platform: {spec.capability}",

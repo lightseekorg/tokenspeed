@@ -40,7 +40,7 @@ from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
 )
-from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.registry import Priority, WarmupBehavior, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
@@ -232,6 +232,7 @@ if platform.is_nvidia:
             "internal_activation_dtype": frozenset({"input"}),
         },
         priority=Priority.SPECIALIZED,
+        warmup_behavior=WarmupBehavior.FLASHINFER_AUTOTUNE,
     )
     def flashinfer_trtllm_mxint4_moe_apply(
         plan: dict,

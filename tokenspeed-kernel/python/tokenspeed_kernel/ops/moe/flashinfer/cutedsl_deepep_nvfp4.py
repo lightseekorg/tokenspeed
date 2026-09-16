@@ -30,7 +30,7 @@ from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
 )
-from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.registry import Priority, WarmupBehavior, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
@@ -133,6 +133,7 @@ if platform.is_nvidia:
             "supports_bias": frozenset({False}),
         },
         priority=Priority.PERFORMANT,
+        warmup_behavior=WarmupBehavior.JIT_COMPILE,
     )
     def flashinfer_cutedsl_deepep_nvfp4_moe_apply(
         plan: dict,

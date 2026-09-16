@@ -31,7 +31,12 @@ from tokenspeed_kernel.platform import (
     current_platform,
     pdl_enabled,
 )
-from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
+from tokenspeed_kernel.registry import (
+    Priority,
+    WarmupBehavior,
+    error_fn,
+    register_kernel,
+)
 from tokenspeed_kernel.signature import ScaleFormat, format_signature, tensor_format
 
 platform = current_platform()
@@ -338,6 +343,7 @@ if platform.is_nvidia:
         },
         traits={},
         priority=Priority.SPECIALIZED + 2,
+        warmup_behavior=WarmupBehavior.FLASHINFER_AUTOTUNE,
     )
     def nvfp4_gemm_swiglu_nvfp4_quant(
         a: torch.Tensor,
