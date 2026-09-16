@@ -329,6 +329,9 @@ class TestKernelApiSpec:
             api_specs["gemm.nvfp4_swiglu_quant"].warmup_config_type.__name__
             == "Nvfp4SwigluQuantWarmupConfig"
         )
+        assert (
+            api_specs["moe.apply"].warmup_config_type.__name__ == "MoeApplyWarmupConfig"
+        )
 
 
 class TestRegistryQueries:

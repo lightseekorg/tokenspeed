@@ -60,7 +60,11 @@ def _config_parts(config_id: str) -> tuple[str, ...]:
         raise ValueError(f"invalid warmup configuration ID {config_id!r}")
     path = PurePosixPath(config_id)
     parts = path.parts
-    if path.is_absolute() or not parts or any(part in {"", ".", ".."} for part in parts):
+    if (
+        path.is_absolute()
+        or not parts
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
         raise ValueError(f"invalid warmup configuration ID {config_id!r}")
     if path.as_posix() != config_id:
         raise ValueError(f"invalid warmup configuration ID {config_id!r}")
@@ -85,7 +89,9 @@ def load_config(config_id: str) -> LoadedWarmupProfile:
     try:
         raw = json.loads(source, object_pairs_hook=_reject_duplicate_keys)
     except json.JSONDecodeError as error:
-        raise ValueError(f"invalid JSON in warmup configuration {config_id!r}") from error
+        raise ValueError(
+            f"invalid JSON in warmup configuration {config_id!r}"
+        ) from error
     if not isinstance(raw, dict):
         raise TypeError(f"warmup configuration {config_id!r} must contain an object")
     profile = WarmupProfile.from_json(raw)

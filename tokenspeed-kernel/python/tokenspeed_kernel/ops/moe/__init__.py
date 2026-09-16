@@ -748,6 +748,7 @@ def moe_apply(
     shared_input: torch.Tensor | None = None,
     shared_weight: torch.Tensor | None = None,
     shared_out: torch.Tensor | None = None,
+    enable_pdl: bool | None = None,
 ):
     """Apply a planned MoE kernel.
 
@@ -783,6 +784,8 @@ def moe_apply(
         shared_out: Optional destination for the shared-expert down projection
             with shape [tokens, output_size]. Must be provided together with
             ``shared_input`` and ``shared_weight``.
+        enable_pdl: Explicit Programmatic Dependent Launch setting. None uses
+            the platform setting.
 
     Solutions may use precomputed top-k tensors or route from logits directly.
     """
@@ -823,15 +826,17 @@ def moe_apply(
         num_tokens_global=num_tokens_global,
         max_num_tokens_per_gpu=max_num_tokens_per_gpu,
         do_finalize=do_finalize,
-        enable_pdl=pdl_enabled(),
+        enable_pdl=pdl_enabled() if enable_pdl is None else enable_pdl,
         **a2a_kwargs,
         **shared_kwargs,
     )
 
 
+from tokenspeed_kernel.ops.moe._warmup import MoeApplyWarmupConfig  # noqa: E402
+
 register_kernel_api(
     family="moe",
     mode="apply",
     public_api=moe_apply,
-    warmup_config_type=None,
+    warmup_config_type=MoeApplyWarmupConfig,
 )

@@ -175,7 +175,9 @@ class WarmupProfile:
             raise ValueError("warmup profile schema_version must be 1")
         provider = _require_str(raw, "provider", "warmup profile")
         if provider != "flashinfer":
-            raise ValueError("the first warmup schema supports provider 'flashinfer' only")
+            raise ValueError(
+                "the first warmup schema supports provider 'flashinfer' only"
+            )
         raw_targets = raw["targets"]
         if not isinstance(raw_targets, list) or not raw_targets:
             raise TypeError("warmup profile.targets must be a non-empty list")
@@ -192,9 +194,6 @@ class WarmupProfile:
             raise ValueError(
                 "warmup profile.id must begin with its platform vendor and provider"
             )
-        target_keys = [(target.api, target.solution) for target in targets]
-        if len(target_keys) != len(set(target_keys)):
-            raise ValueError("warmup profile has duplicate API and solution targets")
         return cls(
             schema_version=schema_version,
             id=profile_id,
