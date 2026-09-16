@@ -20,7 +20,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import tempfile
+from pathlib import Path
 
 import pytest
 import torch
@@ -360,63 +364,77 @@ def test_nvfp4_gemm_swiglu_tactics_agree_with_heuristic(m: int, k: int, i: int) 
 
 @pytest.mark.skipif(not _has_sm100(), reason="Blackwell SM100 CUDA GPU required")
 def test_nvfp4_gemm_swiglu_autotune_populates_cache() -> None:
-    """One call inside a tuning window fills every smaller shape bucket."""
-    from flashinfer.autotuner import AutoTuner, autotune
-    from tokenspeed_kernel import nvfp4_gemm_swiglu_nvfp4_quant
+    """A typed public-API workload generates and reloads a complete bundle."""
+    from flashinfer.autotuner import AutoTuner
+    from tokenspeed_kernel.platform import current_platform
+    from tokenspeed_kernel.registry import load_builtin_kernels
+    from tokenspeed_kernel.warmup import load_warmup_bundle
+    from tokenspeed_kernel.warmup.bundle import generate_bundle
+    from tokenspeed_kernel.warmup.config.schema import WarmupProfile
+    from tokenspeed_kernel.warmup.discovery import LoadedWarmupProfile
 
-    m, k, i = 256, 7168, 512
-    a, a_scale, b, b_scale, alpha, global_scale, _, _ = _autotune_operands(m, k, i)
-
-    tuner = AutoTuner.get()
-    before = sum(
-        1 for key in tuner.profiling_cache if "nvfp4_gemm_swiglu" in key.custom_op
+    raw = {
+        "schema_version": 1,
+        "id": "nvidia/flashinfer/test/fused-gemm-small",
+        "provider": "flashinfer",
+        "platform": {
+            "vendor": "nvidia",
+            "minimum_compute_capability": 100,
+            "maximum_compute_capability": 103,
+        },
+        "provenance": {
+            "model": "tokenspeed-kernel-test",
+            "model_revision": None,
+            "quantization": "nvfp4",
+        },
+        "targets": [
+            {
+                "api": "gemm.nvfp4_swiglu_quant",
+                "solution": "cute_dsl",
+                "definition": {
+                    "version": 1,
+                    "cases": [
+                        {
+                            "expected_registration": "cute_dsl_nvfp4_swiglu_quant",
+                            "maximum_num_tokens": 256,
+                            "n": 1024,
+                            "k": 7168,
+                            "ab_dtype": "float4_e2m1fn",
+                            "sf_dtype": "float8_e4m3fn",
+                            "c_dtype": "float4_e2m1fn",
+                            "sf_vec_size": 16,
+                            "use_prefetch": False,
+                            "prefetch_dist": 3,
+                            "vectorized_f32": True,
+                            "enable_pdl": True,
+                            "random_seed": 515,
+                        }
+                    ],
+                },
+            }
+        ],
+    }
+    load_builtin_kernels()
+    source = json.dumps(raw, sort_keys=True)
+    loaded = LoadedWarmupProfile(
+        profile=WarmupProfile.from_json(raw),
+        source=source,
+        sha256=hashlib.sha256(source.encode()).hexdigest(),
     )
-    with autotune():
-        tuned, tuned_scale = nvfp4_gemm_swiglu_nvfp4_quant(
-            a=a,
-            a_scale=a_scale,
-            b=b,
-            b_scale=b_scale,
-            alpha=alpha,
-            output_global_scale=global_scale,
-            out=None,
-            out_scale=None,
-            ab_dtype="float4_e2m1fn",
-            sf_dtype="float8_e4m3fn",
-            c_dtype="float4_e2m1fn",
-            sf_vec_size=16,
-            use_prefetch=False,
-            prefetch_dist=3,
-            vectorized_f32=True,
-            enable_pdl=True,
-            solution="cute_dsl",
+    with tempfile.TemporaryDirectory() as directory:
+        output = Path(directory) / "bundle"
+        generate_bundle(
+            loaded=loaded,
+            output_dir=str(output),
+            force=False,
+            platform=current_platform(),
+            command=("test",),
         )
-    torch.cuda.synchronize()
-    after = sum(
-        1 for key in tuner.profiling_cache if "nvfp4_gemm_swiglu" in key.custom_op
-    )
-    assert after > before + 1, "a tuning window must fill more than the observed bucket"
-
-    untuned, untuned_scale = nvfp4_gemm_swiglu_nvfp4_quant(
-        a=a,
-        a_scale=a_scale,
-        b=b,
-        b_scale=b_scale,
-        alpha=alpha,
-        output_global_scale=global_scale,
-        out=None,
-        out_scale=None,
-        ab_dtype="float4_e2m1fn",
-        sf_dtype="float8_e4m3fn",
-        c_dtype="float4_e2m1fn",
-        sf_vec_size=16,
-        use_prefetch=False,
-        prefetch_dist=3,
-        vectorized_f32=True,
-        enable_pdl=True,
-        solution="cute_dsl",
-    )
-    torch.cuda.synchronize()
-    assert torch.equal(tuned, untuned) and torch.equal(
-        tuned_scale.view(torch.uint8), untuned_scale.view(torch.uint8)
-    )
+        with (output / "flashinfer.json").open() as file:
+            cache = json.load(file)
+        profile_keys = [key for key in cache if not key.startswith("_")]
+        assert len(profile_keys) > 1
+        bundle = load_warmup_bundle(str(output), expected_max_num_tokens=256)
+        assert bundle.profile_count == len(profile_keys)
+        assert bundle.source_id == raw["id"]
+    AutoTuner.get().clear_cache()
