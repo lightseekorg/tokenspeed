@@ -469,6 +469,14 @@ and kernel page size from
 with the existing forward and MTP reuse boundaries. The router clears this
 share before the root prepares its indexer child; the indexer does not clear it again.
 
+QSA block selection carries the same uniform query width from
+`decode_query_lengths` into its kernel API, using `None` for ragged or mixed
+queries. Materialized scoring may group a divisor of that width to share K
+within a request; it must retain each query's complete-block frontier and
+selection. Group size one and larger groups use the same scoring kernel, in
+both eager and captured forwards. Grouping must not be inferred from the total
+row count or page-table batch size for a ragged layout.
+
 Qwen4-Exp attention callers pass `topk_indices` explicitly, using `None` for
 dense attention. Sparse QSA requires `save_kv_cache=True` because it always
 writes the full KV cache; the dense fallback honors the caller's flag.
