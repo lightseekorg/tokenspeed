@@ -42,9 +42,10 @@ async_copy = cdna4.async_copy
 
 @gluon_builtin
 def _mfma_unscaled_fp8(a, b, acc, *, _semantic):
-    # Absent scales emit the unscaled v_mfma_f32_32x32x64_f8f6f4 instruction.
-    # mfma_scaled materializes unit-scale tensors, retaining the scaled opcode;
-    # ordinary mfma does not expose this K64 instruction.
+    # dot_scaled with None scales emits the unscaled
+    # v_mfma_f32_32x32x64_f8f6f4 instruction, without scale operands.
+    # Use this compiler builtin because the public mfma_scaled wrapper inserts
+    # unit scales, while ordinary mfma selects K16 for this FP8 tile.
     fmt = "e4m3" if a.dtype == gl.float8e4nv else "e5m2"
     output = _semantic.dot_scaled(
         a,
