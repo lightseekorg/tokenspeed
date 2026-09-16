@@ -307,7 +307,7 @@ class TestKernelApiSpec:
     def test_builtin_flashinfer_api_contracts_reload_after_reset(self):
         load_builtin_kernels()
 
-        registered = {spec.api for spec in KernelRegistry.get().list_apis()}
+        api_specs = {spec.api: spec for spec in KernelRegistry.get().list_apis()}
         assert {
             "attention.dsa_decode",
             "attention.dsa_prefill",
@@ -324,7 +324,11 @@ class TestKernelApiSpec:
             "moe.apply",
             "quantization.mxfp8",
             "quantization.nvfp4",
-        }.issubset(registered)
+        }.issubset(api_specs)
+        assert (
+            api_specs["gemm.nvfp4_swiglu_quant"].warmup_config_type.__name__
+            == "Nvfp4SwigluQuantWarmupConfig"
+        )
 
 
 class TestRegistryQueries:

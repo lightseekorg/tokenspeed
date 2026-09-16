@@ -119,6 +119,42 @@ _platform = Platform.get()
 _fp8_dtype = torch.float8_e4m3fn
 
 
+def _select_nvfp4_swiglu_quant(
+    a_dtype: torch.dtype,
+    a_scale_dtype: torch.dtype,
+    b_dtype: torch.dtype,
+    b_scale_dtype: torch.dtype,
+    sf_vec_size: int,
+    solution: str | None,
+) -> SelectedKernel:
+    return select_kernel(
+        "gemm",
+        "nvfp4_swiglu_quant",
+        format_signature(
+            a=tensor_format(
+                "nvfp4",
+                a_dtype,
+                scale=ScaleFormat(
+                    storage_dtype=a_scale_dtype,
+                    granularity="block",
+                    block_shape=(sf_vec_size,),
+                ),
+            ),
+            b=tensor_format(
+                "nvfp4",
+                b_dtype,
+                scale=ScaleFormat(
+                    storage_dtype=b_scale_dtype,
+                    granularity="block",
+                    block_shape=(sf_vec_size,),
+                ),
+            ),
+        ),
+        traits={},
+        solution=solution,
+    )
+
+
 def nvfp4_gemm_swiglu_nvfp4_quant(
     a: torch.Tensor,
     a_scale: torch.Tensor,
@@ -139,27 +175,12 @@ def nvfp4_gemm_swiglu_nvfp4_quant(
     solution: str | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the registered fused NVFP4 GEMM, SwiGLU, and quantization API."""
-    scale_format = ScaleFormat(
-        storage_dtype=a_scale.dtype,
-        granularity="block",
-        block_shape=(sf_vec_size,),
-    )
-    kernel = select_kernel(
-        "gemm",
-        "nvfp4_swiglu_quant",
-        format_signature(
-            a=tensor_format("nvfp4", a.dtype, scale=scale_format),
-            b=tensor_format(
-                "nvfp4",
-                b.dtype,
-                scale=ScaleFormat(
-                    storage_dtype=b_scale.dtype,
-                    granularity="block",
-                    block_shape=(sf_vec_size,),
-                ),
-            ),
-        ),
-        traits={},
+    kernel = _select_nvfp4_swiglu_quant(
+        a_dtype=a.dtype,
+        a_scale_dtype=a_scale.dtype,
+        b_dtype=b.dtype,
+        b_scale_dtype=b_scale.dtype,
+        sf_vec_size=sf_vec_size,
         solution=solution,
     )
     shape_params = {
@@ -201,11 +222,15 @@ def nvfp4_gemm_swiglu_nvfp4_quant(
         )
 
 
+from tokenspeed_kernel.ops.gemm._warmup import (  # noqa: E402
+    Nvfp4SwigluQuantWarmupConfig,
+)
+
 register_kernel_api(
     family="gemm",
     mode="nvfp4_swiglu_quant",
     public_api=nvfp4_gemm_swiglu_nvfp4_quant,
-    warmup_config_type=None,
+    warmup_config_type=Nvfp4SwigluQuantWarmupConfig,
 )
 
 
