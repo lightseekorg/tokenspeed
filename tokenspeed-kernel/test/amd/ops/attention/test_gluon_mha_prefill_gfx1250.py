@@ -424,8 +424,10 @@ def test_mha_prefill_cross_attn_full_kv(head_dim):
 def test_mha_prefill_cross_attn_fp8():
     device = "cuda"
     n_q_heads, n_kv_heads, head_dim = 4, 1, 128
-    q_bf16, k_bf16, v_bf16, cu_q, cu_q_cpu, max_q, cu_k, cu_k_cpu, max_k = _cross_inputs(
-        [128], [80], n_q_heads, n_kv_heads, head_dim, device, torch.bfloat16
+    q_bf16, k_bf16, v_bf16, cu_q, cu_q_cpu, max_q, cu_k, cu_k_cpu, max_k = (
+        _cross_inputs(
+            [128], [80], n_q_heads, n_kv_heads, head_dim, device, torch.bfloat16
+        )
     )
     q = q_bf16.to(torch.float8_e4m3fn)
     k = k_bf16.to(torch.float8_e4m3fn)

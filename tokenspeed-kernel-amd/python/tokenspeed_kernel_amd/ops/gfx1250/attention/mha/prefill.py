@@ -955,8 +955,7 @@ def gluon_mha_prefill_gfx1250(
         raise ValueError("cu_seqlens_k must contain the same batch as cu_seqlens")
     if max_seqlen_k is None:
         max_seqlen_k = max(
-            end - start
-            for start, end in zip(cu_seqlens_k_cpu, cu_seqlens_k_cpu[1:])
+            end - start for start, end in zip(cu_seqlens_k_cpu, cu_seqlens_k_cpu[1:])
         )
     if max_seqlen_k < 1:
         raise ValueError("max_seqlen_k must be >= 1")
