@@ -44,7 +44,7 @@ from types import MappingProxyType
 import torch
 from tokenspeed_kernel.ops.gemm.triton_gemv import _select, torch_decode_gemv
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
-from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.registry import Priority, WarmupBehavior, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 # (m, n, k) -> backend; immutable so the registry's import-time view and the
@@ -1069,6 +1069,11 @@ def _register_route() -> None:
             },
             # Above the M == 1 rowcta spec so a measured win takes the shape.
             priority=Priority.SPECIALIZED + 2,
+            warmup_behavior=(
+                WarmupBehavior.FLASHINFER_AUTOTUNE
+                if backend == "tgv"
+                else WarmupBehavior.JIT_COMPILE
+            ),
         )(impl)
 
 

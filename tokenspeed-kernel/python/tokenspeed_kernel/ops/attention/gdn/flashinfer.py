@@ -54,7 +54,12 @@ from tokenspeed_kernel.platform import (
     current_platform,
     pdl_enabled,
 )
-from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
+from tokenspeed_kernel.registry import (
+    Priority,
+    WarmupBehavior,
+    error_fn,
+    register_kernel,
+)
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
@@ -149,6 +154,7 @@ if is_available():
             "output_h": frozenset({False, True}),
         },
         tags={"hopper", "blackwell", "latency"},
+        warmup_behavior=WarmupBehavior.JIT_COMPILE,
     )
     def flashinfer_gdn_chunk_prefill(
         q: torch.Tensor,
@@ -298,6 +304,7 @@ if is_decode_available():
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
         },
         tags={"hopper", "latency"},
+        warmup_behavior=WarmupBehavior.JIT_COMPILE,
     )
     def flashinfer_gdn_decode_step(
         q: torch.Tensor,
@@ -367,6 +374,7 @@ if is_decode_available():
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
         },
         tags={"hopper", "latency", "speculative-decoding"},
+        warmup_behavior=WarmupBehavior.JIT_COMPILE,
     )
     def flashinfer_gdn_decode_mtp(
         q: torch.Tensor,

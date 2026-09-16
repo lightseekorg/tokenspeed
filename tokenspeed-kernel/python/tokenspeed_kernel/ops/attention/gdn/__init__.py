@@ -26,6 +26,7 @@ from enum import Enum
 
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
+from tokenspeed_kernel.registry import register_kernel_api
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
@@ -610,6 +611,25 @@ import tokenspeed_kernel.ops.attention.gdn.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.gdn.triton  # noqa: E402,F401
 
 # isort: on
+
+register_kernel_api(
+    family="attention",
+    mode="gdn_chunk_prefill",
+    public_api=gdn_chunk_prefill,
+    warmup_config_type=None,
+)
+register_kernel_api(
+    family="attention",
+    mode="gdn_decode_step",
+    public_api=gdn_decode_step,
+    warmup_config_type=None,
+)
+register_kernel_api(
+    family="attention",
+    mode="gdn_decode_mtp",
+    public_api=gdn_decode_mtp,
+    warmup_config_type=None,
+)
 
 __all__ = [
     "GdnCheckpointLayout",

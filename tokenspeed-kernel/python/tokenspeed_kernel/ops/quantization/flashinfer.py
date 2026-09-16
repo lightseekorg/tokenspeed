@@ -26,7 +26,12 @@ from tokenspeed_kernel.platform import (
     current_platform,
     pdl_enabled,
 )
-from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
+from tokenspeed_kernel.registry import (
+    Priority,
+    WarmupBehavior,
+    error_fn,
+    register_kernel,
+)
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
@@ -86,6 +91,7 @@ if platform.is_nvidia:
         signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
         traits={},
         priority=Priority.PERFORMANT,
+        warmup_behavior=WarmupBehavior.JIT_COMPILE,
     )
     def flashinfer_quantize_mxfp8(
         x: torch.Tensor,
@@ -116,6 +122,7 @@ if platform.is_nvidia and platform.is_blackwell:
             "has_scale": frozenset({True}),
         },
         priority=Priority.PERFORMANT,
+        warmup_behavior=WarmupBehavior.JIT_COMPILE,
     )
     def flashinfer_quantize_nvfp4(
         x: torch.Tensor,

@@ -19,7 +19,7 @@
 
 import torch
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
-from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.registry import Priority, WarmupBehavior, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
@@ -47,6 +47,7 @@ if platform.is_nvidia:
             "has_scale_q_tensor": frozenset({False}),
             "has_scale_kv_tensor": frozenset({False}),
         },
+        warmup_behavior=WarmupBehavior.JIT_COMPILE,
     )
     def flashinfer_embedding_rope_mla(
         *,

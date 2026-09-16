@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 
 import torch
+from tokenspeed_kernel.registry import register_kernel_api
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
@@ -182,6 +183,13 @@ import tokenspeed_kernel.ops.attention.qsa.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.qsa.flashinfer  # noqa: E402,F401
 
 # isort: on
+
+register_kernel_api(
+    family="attention",
+    mode="qsa_sparse_attention",
+    public_api=qsa_sparse_attention,
+    warmup_config_type=None,
+)
 
 
 __all__ = [

@@ -31,7 +31,13 @@ from tokenspeed_kernel.platform import (
     current_platform,
     pdl_enabled,
 )
-from tokenspeed_kernel.registry import ErrorClass, Priority, error_fn, register_kernel
+from tokenspeed_kernel.registry import (
+    ErrorClass,
+    Priority,
+    WarmupBehavior,
+    error_fn,
+    register_kernel,
+)
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
@@ -140,6 +146,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             "support_logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
         },
+        warmup_behavior=WarmupBehavior.PREALLOCATE,
     )
     def flashinfer_trtllm_mha_extend_with_kvcache(
         q: torch.Tensor,
@@ -219,6 +226,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             "support_logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
         },
+        warmup_behavior=WarmupBehavior.PREALLOCATE,
     )
     def flashinfer_trtllm_mha_decode_with_kvcache(
         q: torch.Tensor,

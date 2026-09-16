@@ -32,7 +32,12 @@ from tokenspeed_kernel.platform import (
     current_platform,
     pdl_enabled,
 )
-from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
+from tokenspeed_kernel.registry import (
+    Priority,
+    WarmupBehavior,
+    error_fn,
+    register_kernel,
+)
 from tokenspeed_kernel.signature import (
     ScaleFormat,
     dense_tensor_format,
@@ -226,6 +231,7 @@ if gemm_fp8_nt_groupwise is not error_fn:
         },
         priority=Priority.SPECIALIZED + 3,
         tags={"throughput"},
+        warmup_behavior=WarmupBehavior.JIT_COMPILE,
     )
     def flashinfer_mm_fp8_blockscale(
         A: torch.Tensor,
@@ -366,6 +372,7 @@ if mm_mxfp8 is not error_fn:
             "pdl_enabled": frozenset({True}),
         },
         priority=Priority.SPECIALIZED + 2,
+        warmup_behavior=WarmupBehavior.FLASHINFER_AUTOTUNE,
     )
     def flashinfer_mm_mxfp8(
         A: torch.Tensor,
@@ -463,6 +470,7 @@ if mm_fp4 is not error_fn:
         signatures=_NVFP4_FORMAT_SIGNATURES,
         traits={},
         priority=Priority.SPECIALIZED + 2,
+        warmup_behavior=WarmupBehavior.FLASHINFER_AUTOTUNE,
     )
     def flashinfer_mm_nvfp4(
         A: torch.Tensor,
@@ -581,6 +589,7 @@ if has_flashinfer_cute_dsl_nvfp4_a16():
         signatures=_NVFP4_A16_FORMAT_SIGNATURES,
         traits={"k_align_16": frozenset({True})},
         priority=Priority.SPECIALIZED + 2,
+        warmup_behavior=WarmupBehavior.FLASHINFER_AUTOTUNE,
     )
     def flashinfer_cute_dsl_mm_nvfp4_a16(
         A: torch.Tensor,

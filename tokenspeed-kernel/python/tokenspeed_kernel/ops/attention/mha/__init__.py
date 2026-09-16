@@ -25,7 +25,7 @@ import math
 import torch
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.registry import KernelRegistry, Priority
+from tokenspeed_kernel.registry import KernelRegistry, Priority, register_kernel_api
 from tokenspeed_kernel.selection import select_kernel, spec_matches_traits
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
@@ -537,6 +537,19 @@ import tokenspeed_kernel.ops.attention.mha.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mha.gluon  # noqa: E402,F401
 
 # isort: on
+
+register_kernel_api(
+    family="attention",
+    mode="mha_extend_with_kvcache",
+    public_api=mha_extend_with_kvcache,
+    warmup_config_type=None,
+)
+register_kernel_api(
+    family="attention",
+    mode="mha_decode_with_kvcache",
+    public_api=mha_decode_with_kvcache,
+    warmup_config_type=None,
+)
 
 __all__ = [
     "mha_plan",

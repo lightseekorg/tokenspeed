@@ -20,6 +20,7 @@ from typing import Literal
 
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
+from tokenspeed_kernel.registry import register_kernel_api
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -504,3 +505,16 @@ def quantize_fp8_group32_ue8m0_swizzled(
 import tokenspeed_kernel.ops.quantization.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.quantization.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.quantization.trtllm  # noqa: E402,F401
+
+register_kernel_api(
+    family="quantization",
+    mode="mxfp8",
+    public_api=quantize_mxfp8,
+    warmup_config_type=None,
+)
+register_kernel_api(
+    family="quantization",
+    mode="nvfp4",
+    public_api=quantize_nvfp4,
+    warmup_config_type=None,
+)

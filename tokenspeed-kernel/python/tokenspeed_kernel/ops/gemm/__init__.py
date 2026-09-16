@@ -1563,3 +1563,11 @@ def bmm(
         else:
             output = output + bias_view
     return output
+
+
+register_kernel_api(
+    family="gemm",
+    mode="mm",
+    public_api=mm,
+    warmup_config_type=None,
+)

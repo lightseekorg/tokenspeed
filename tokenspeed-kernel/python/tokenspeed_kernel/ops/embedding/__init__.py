@@ -22,6 +22,7 @@ from dataclasses import dataclass
 import torch
 from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
+from tokenspeed_kernel.registry import register_kernel_api
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -617,3 +618,11 @@ def mxfp8_embedding(weight, scales, indices, row_start, row_end):
         solution=None,
     )
     return kernel(weight, scales, indices, row_start, row_end)
+
+
+register_kernel_api(
+    family="embedding",
+    mode="rope_mla",
+    public_api=apply_rope_mla,
+    warmup_config_type=None,
+)

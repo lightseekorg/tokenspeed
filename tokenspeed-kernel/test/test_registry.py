@@ -29,6 +29,7 @@ from tokenspeed_kernel.registry import (
     KernelSpec,
     WarmupBehavior,
     describe_kernel,
+    load_builtin_kernels,
     register_kernel,
     register_kernel_api,
 )
@@ -303,6 +304,28 @@ class TestKernelApiSpec:
 
         assert KernelRegistry.get().list_apis() == []
 
+    def test_builtin_flashinfer_api_contracts_reload_after_reset(self):
+        load_builtin_kernels()
+
+        registered = {spec.api for spec in KernelRegistry.get().list_apis()}
+        assert {
+            "attention.dsa_decode",
+            "attention.dsa_prefill",
+            "attention.gdn_chunk_prefill",
+            "attention.gdn_decode_mtp",
+            "attention.gdn_decode_step",
+            "attention.mha_decode_with_kvcache",
+            "attention.mha_extend_with_kvcache",
+            "attention.qsa_sparse_attention",
+            "embedding.rope_mla",
+            "gemm.decode_gemv",
+            "gemm.mm",
+            "gemm.nvfp4_swiglu_quant",
+            "moe.apply",
+            "quantization.mxfp8",
+            "quantization.nvfp4",
+        }.issubset(registered)
+
 
 class TestRegistryQueries:
     def test_get_for_operator_basic(self, sample_specs):
@@ -420,7 +443,7 @@ class TestRegistryQueries:
         register_all_samples(reg, sample_specs)
 
         solutions = reg.list_solutions("attention", "decode")
-        assert solutions == ["flashinfer", "reference", "triton"]
+        assert solutions == ["aiter", "flashinfer", "reference", "triton"]
 
 
 class TestRegistryCache:

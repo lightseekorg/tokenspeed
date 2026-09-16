@@ -43,7 +43,7 @@ from tokenspeed_kernel.platform import (
     current_platform,
     pdl_enabled,
 )
-from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.registry import Priority, WarmupBehavior, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
@@ -135,6 +135,7 @@ def _register_flashinfer_trtllm_dsa(
             "support_logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
         },
+        warmup_behavior=WarmupBehavior.PREALLOCATE,
     )
 
 

@@ -25,6 +25,7 @@ import math
 import torch
 from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
+from tokenspeed_kernel.registry import register_kernel_api
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
@@ -733,6 +734,19 @@ import tokenspeed_kernel.ops.attention.dsa.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsa.gluon  # noqa: E402,F401
 
 # isort: on
+
+register_kernel_api(
+    family="attention",
+    mode="dsa_decode",
+    public_api=dsa_decode,
+    warmup_config_type=None,
+)
+register_kernel_api(
+    family="attention",
+    mode="dsa_prefill",
+    public_api=dsa_prefill,
+    warmup_config_type=None,
+)
 
 __all__ = [
     "dsa_decode",

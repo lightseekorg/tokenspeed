@@ -30,7 +30,7 @@ from tokenspeed_kernel.platform import (
     current_platform,
     pdl_enabled,
 )
-from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.registry import Priority, WarmupBehavior, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 _IS_NVIDIA = current_platform().is_nvidia
@@ -200,6 +200,7 @@ if _IS_NVIDIA:
         },
         priority=Priority.PERFORMANT,
         tags={"fallback", "fa2", "fp8", "sparse"},
+        warmup_behavior=WarmupBehavior.PREALLOCATE,
     )(flashinfer_fa2_qsa_sparse_attention)
     register_kernel(
         "attention",
@@ -217,6 +218,7 @@ if _IS_NVIDIA:
         },
         priority=Priority.PERFORMANT,
         tags={"fallback", "fa2", "sparse"},
+        warmup_behavior=WarmupBehavior.PREALLOCATE,
     )(flashinfer_fa2_qsa_sparse_attention)
     __all__ = ["flashinfer_fa2_qsa_sparse_attention"]
 else:

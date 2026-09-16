@@ -36,7 +36,7 @@ import functools
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
-from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.registry import Priority, register_kernel, register_kernel_api
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = ["decode_gemv", "triton_rowcta_gemv"]
@@ -357,3 +357,11 @@ def grouped_bf16_projection_rowcta(
         enable_fp_fusion=False,
     )
     return out
+
+
+register_kernel_api(
+    family="gemm",
+    mode="decode_gemv",
+    public_api=decode_gemv,
+    warmup_config_type=None,
+)
