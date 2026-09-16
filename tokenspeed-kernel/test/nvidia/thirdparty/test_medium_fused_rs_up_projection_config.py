@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CPU-only configuration and boundary guards for the medium-M experiment."""
+"""CPU-only configuration and dispatch guards for the integrated fused tail."""
 
 import ast
 import importlib.util
@@ -411,11 +411,11 @@ def runtime_policy():
         for node in tree.body
         if isinstance(node, ast.ClassDef) and node.name == "K3MoeTailComm"
     )
-    plan = next(
+    methods = [
         node
         for node in comm.body
-        if isinstance(node, ast.FunctionDef) and node.name == "plan"
-    )
+        if isinstance(node, ast.FunctionDef) and node.name in {"plan", "run"}
+    ]
 
     def reject_legacy_dispatch(**kwargs):
         raise AssertionError("supported fused M reached legacy dispatch")
@@ -427,7 +427,9 @@ def runtime_policy():
         "select_k3_moe_tail_tier": reject_legacy_dispatch,
     }
     exec(
-        compile(ast.Module(body=[*nodes, plan], type_ignores=[]), str(path), "exec"),
+        compile(
+            ast.Module(body=[*nodes, *methods], type_ignores=[]), str(path), "exec"
+        ),
         namespace,
     )
     args = dict(
@@ -520,3 +522,93 @@ def test_automatic_plan_bypasses_legacy_tail(runtime_policy, m, tier):
             namespace["plan"](owner, m, None, is_decode=False)
     else:
         assert result.routed_in_fork
+
+
+def test_only_integrated_and_main_tiers_remain(runtime_policy):
+    namespace, _ = runtime_policy
+    assert set(namespace["K3MoETailTier"].__members__) == {
+        "TAIL_FUSION",
+        "MEDIUM_FUSED_RS_UP_AG",
+        "FUSED_RS_UP_AG",
+        "MULTIMEM_AR",
+        "FUSED_LANE_AR",
+        "SEPARATE_REDUCE",
+    }
+
+
+def test_integrated_adapter_has_no_intermediate_serving_profile():
+    tree = ast.parse((OPS / "medium_fused_rs_up_projection_serving.py").read_text())
+    classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
+    assert set(classes) == {
+        "IntegratedFusedRsUpProjectionServing",
+        "IntegratedFusedRsOutputPool",
+    }
+    assert [
+        ast.unparse(parent)
+        for parent in classes["IntegratedFusedRsUpProjectionServing"].bases
+    ] == ["FusedRsUpProjectionServingBase"]
+    config = ast.parse(
+        (OPS / "medium_fused_rs_up_projection_serving_config.py").read_text()
+    )
+    assert {node.name for node in config.body if isinstance(node, ast.FunctionDef)} == {
+        "integrated_fused_rs_serving_config"
+    }
+
+
+@pytest.mark.parametrize(
+    "m,tier,protocol",
+    [
+        (256, "MEDIUM_FUSED_RS_UP_AG", "bt"),
+        (1024, "MEDIUM_FUSED_RS_UP_AG", "bt"),
+        (2048, "FUSED_RS_UP_AG", "ht"),
+        (8192, "FUSED_RS_UP_AG", "ht"),
+    ],
+)
+def test_integrated_run_keeps_bt_ht_and_one_fused_back_half(
+    runtime_policy, m, tier, protocol
+):
+    from types import SimpleNamespace
+
+    namespace, _ = runtime_policy
+    calls = []
+    normalized, weight, norm_weight, residual, shared, output = (
+        object() for _ in range(6)
+    )
+    deferred = (object(), object(), object())
+
+    def finalize(name, *args):
+        calls.append((name, args))
+        return normalized
+
+    def fused(*args):
+        calls.append(("fused", args))
+        return output
+
+    def residual_view(rows, columns):
+        assert (rows, columns) == (m, 7168)
+        return residual
+
+    owner = SimpleNamespace(
+        state=SimpleNamespace(
+            mnnvl_bt_deferred=lambda *args: finalize("bt", *args),
+            mnnvl_ht_deferred=lambda *args: finalize("ht", *args),
+        ),
+        routed_norm=SimpleNamespace(weight=norm_weight),
+        up_proj=SimpleNamespace(weight=weight),
+        fused_rs_up_ag=fused,
+    )
+    result = namespace["run"](
+        owner,
+        SimpleNamespace(tier=getattr(namespace["K3MoETailTier"], tier)),
+        deferred,
+        shared,
+        SimpleNamespace(view=residual_view),
+        m,
+        7168,
+        prepared_shared_shard=None,
+    )
+    assert result is output
+    assert calls == [
+        (protocol, (*deferred, norm_weight)),
+        ("fused", (normalized, weight, residual, shared)),
+    ]

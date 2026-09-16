@@ -18,22 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Checkpoint-free TP8 live-pointer smoke for the medium serving adapter.
+"""TP8 correctness helpers for the integrated fused-tail serving adapter.
 
-Example arguments: --tokens 256 832 1024 --generations 3
---rank-skew-cycles 10000 --output result.json. A 128-generation run can name
-every serving-profile bucket. This tests two chained layers, two independent
-graphs per bucket, real producer out=, live pointer/content A/B/A, rank skew,
-guarded workspace/output reuse and pre-launch rejection. It neither measures
-tail latency nor qualifies model quality or serving TTFT.
+Check chained layers, independent graphs, producer out=, live pointer/content
+A/B/A, rank skew, guarded output reuse and pre-launch rejection. These checks
+neither measure tail latency nor qualify model quality or serving TTFT.
 """
 
-import argparse
-import json
-import os
 from dataclasses import asdict, replace
-from datetime import timedelta
-from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -41,35 +33,11 @@ from fused_rs_up_ag_reference import equal_outputs, reference_errors
 from test_fused_rs_up_projection_serving import check_all_ranks
 from tokenspeed_kernel.ops.communication.fused_rs_workspace import (
     SharedRsWorkspace,
-    _vote,
-)
-from tokenspeed_kernel.ops.communication.medium_fused_rs_up_projection_serving import (
-    MediumFusedRsUpProjectionServing,
-)
-from tokenspeed_kernel.ops.communication.medium_fused_rs_up_projection_serving_config import (
-    MEDIUM_FUSED_RS_SERVING_CANDIDATE_TOKENS,
-    medium_fused_rs_serving_config,
 )
 from tokenspeed_kernel.ops.communication.mnnvl_cutedsl_symmetric_up_projection import (
     allocate_symmetric_up_projection_output,
 )
 from tokenspeed_kernel.ops.gemm.kimi3 import kimi3_shared_down_projection
-
-
-def validate_options(tokens, generations, rank_skew_cycles):
-    if (
-        len(tokens) < 2
-        or len(set(tokens)) != len(tokens)
-        or any(
-            type(m) is not int or m not in MEDIUM_FUSED_RS_SERVING_CANDIDATE_TOKENS
-            for m in tokens
-        )
-    ):
-        raise ValueError("name at least two distinct supported medium serving buckets")
-    if type(generations) is not int or generations < 3:
-        raise ValueError("at least three generations are required for A/B/A")
-    if type(rank_skew_cycles) is not int or rank_skew_cycles < 0:
-        raise ValueError("rank skew cycles must be a nonnegative integer")
 
 
 def make_operands(m, slot, device, layers=2):
@@ -390,51 +358,3 @@ def run(args, device, adapter_type, profile, output_pool_type=None):
                 str(m): adapters[0]._plans[m].capacity_records for m in args.tokens
             },
         }
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tokens", type=int, nargs="+", required=True)
-    parser.add_argument("--generations", type=int, required=True)
-    parser.add_argument("--rank-skew-cycles", type=int, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args()
-    validate_options(args.tokens, args.generations, args.rank_skew_cycles)
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    dist.init_process_group("nccl", timeout=timedelta(minutes=10))
-    if dist.get_world_size() != 8:
-        raise ValueError("medium serving adapter acceptance requires TP8")
-    _vote(
-        dist.group.WORLD,
-        ("medium-serving-smoke", args.tokens, args.generations, args.rank_skew_cycles),
-        None,
-    )
-    torch.backends.cuda.matmul.allow_tf32 = False
-    record = {
-        "schema": "medium-fused-serving-adapter-v1",
-        "passed": False,
-        "full_model_or_ttft_qualified": False,
-        "performance_measured": False,
-    }
-    try:
-        local = run(
-            args,
-            torch.device("cuda", torch.cuda.current_device()),
-            MediumFusedRsUpProjectionServing,
-            medium_fused_rs_serving_config,
-        )
-        ranks = [None] * 8
-        dist.all_gather_object(ranks, local)
-        record.update(passed=True, ranks=ranks)
-    except Exception as exc:
-        record["failure_type"] = type(exc).__name__
-        raise
-    finally:
-        if dist.get_rank() == 0:
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            args.output.write_text(json.dumps(record, indent=2, allow_nan=False) + "\n")
-    dist.destroy_process_group()
-
-
-if __name__ == "__main__":
-    main()

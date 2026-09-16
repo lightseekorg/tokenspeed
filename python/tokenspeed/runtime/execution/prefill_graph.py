@@ -80,7 +80,6 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.execution.forward_step import prefill_graph_phase
 from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
@@ -553,9 +552,7 @@ class PrefillGraph:
             max_bs=int(self.config.max_num_seqs)
             // max(int(self.config.data_parallel_size), 1),
         )
-        # Full-graph auxiliary streams cannot span eager attention breaks;
-        # publish the prefill phase for both warmup and capture instead.
-        with maybe_inference_mode(), prefill_graph_phase():
+        with maybe_inference_mode():
             self._capture_all_buckets(decode_wrapper, entries, observer)
             if self._narrowing is not None:
                 self._capture_decoders(decode_wrapper, entries, observer)

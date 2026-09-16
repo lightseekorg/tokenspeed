@@ -29,7 +29,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from smoke_medium_fused_rs_serving import run
+from fused_rs_serving_checks import run
 from tokenspeed_kernel.ops.communication.medium_fused_rs_up_projection_serving import (
     IntegratedFusedRsOutputPool,
     IntegratedFusedRsUpProjectionServing,

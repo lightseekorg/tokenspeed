@@ -3,9 +3,10 @@
 The integrated path is selected automatically for NVIDIA SM100/SM103 with
 K3's TP8/EP1, attention DP1/CP1, H7168/latent3584/top16 layout, routed RMSNorm,
 sharded up-projection and a deferred-finalize-capable fused-AR expert backend.
-No environment switch enables or disables it. Historical first-only and
-medium-only implementations remain in source, but their serving modes are
-never armed. Old experimental environment variables are no longer read.
+No environment switch enables or disables it. Intermediate first-stage-only
+and medium-only routes, discrete bucket policies and their serving adapters
+are removed. Only the integrated path and main's original compatibility paths
+remain. Old experimental environment variables are no longer read.
 
 The kernel configuration has a completed single-pair serving measurement,
 not replicated performance or full-model numerical qualification. Removing
@@ -77,9 +78,9 @@ join before reuse. No new copy or device barrier is introduced.
 Allocate before KV sizing and retain both handles through every graph replay.
 All graph buckets use fixed parity addresses and execute sequentially; outputs
 are transient until the same slot is next written, not per-layer archives.
-Different concurrent model/graph instances require separate storage. The
-historical medium-only adapter retains per-layer outputs for direct kernel tests
-but is not constructed by normal serving.
+Different concurrent model/graph instances require separate storage. Direct
+kernel tests may give the integrated adapter an independent output to test its
+live-pointer contract; there is no separate medium-only serving profile.
 
 ## Dataflow and arithmetic
 
@@ -160,11 +161,16 @@ standalone RS tuning sweep are removed. Shared reduction remains inside the
 fused GEMM; its entry/exit barriers, proxy-alias fences, allocation sizes and
 M dispatch are unchanged. Existing generic Triton collectives remain available.
 
-The endpoint-only facade, fixed-M configuration and separate cluster-cap binding
-are removed. The common serving base retains live-pointer validation and launch
-but cannot be instantiated; concrete profiles supply input views and compilation.
+The endpoint-only facade, fixed-M configuration, medium-only serving profile and
+separate cluster-cap binding are removed. The common serving base retains
+live-pointer validation and launch but cannot be instantiated; the integrated
+adapter supplies input views and compilation directly, without a legacy adapter.
 Integrated medium/large configurations and cluster caps still use the existing
 continuous-range binder, with unchanged fused device code and output pooling.
+BT/HT first-stage kernels remain dependencies of this integrated route, but the
+first-stage-only routes and their old AllReduce back half are removed. Their
+prefill-only graph-phase marker is removed too; the execution framework matches
+main again. Main's small, multimem, fused-lane and separate paths are retained.
 The large-M correctness harness now checks that integrated adapter against the
 same-profile fixed-input binding and the unchanged independent addmm/AllReduce
 reference; M4096/M8192 remain test cases, not a dispatch whitelist.

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Integrated serving and a retained diagnostic medium-only adapter."""
+"""Continuous medium/large fused-tail serving with pooled symmetric outputs."""
 
 import torch
 from tokenspeed_kernel.ops.communication.cutedsl_fused_rs_up_projection import (
@@ -33,7 +33,6 @@ from tokenspeed_kernel.ops.communication.medium_fused_rs_up_projection import (
 )
 from tokenspeed_kernel.ops.communication.medium_fused_rs_up_projection_serving_config import (
     integrated_fused_rs_serving_config,
-    medium_fused_rs_serving_config,
 )
 from tokenspeed_kernel.ops.communication.mnnvl_cutedsl_symmetric_up_projection import (
     SymmetricUpProjectionOutput,
@@ -41,14 +40,13 @@ from tokenspeed_kernel.ops.communication.mnnvl_cutedsl_symmetric_up_projection i
 )
 
 
-class MediumFusedRsUpProjectionServing(FusedRsUpProjectionServingBase):
-    """Use the same validation, live operands and two barriers with medium binding.
+class IntegratedFusedRsUpProjectionServing(FusedRsUpProjectionServingBase):
+    """One live-pointer execution path with continuous medium/large tuning.
 
-    This legacy profile is retained for direct kernel tests, not selected by
-    normal serving. The integrated subclass supplies the medium/large policy.
+    Automatic dispatch does not imply new numerical or TTFT qualification.
     """
 
-    profile = staticmethod(medium_fused_rs_serving_config)
+    profile = staticmethod(integrated_fused_rs_serving_config)
 
     def __init__(
         self,
@@ -61,15 +59,15 @@ class MediumFusedRsUpProjectionServing(FusedRsUpProjectionServingBase):
 
         Args:
             workspace: Model-owned raw symmetric storage, used sequentially.
-            max_tokens: Largest provisional bucket this output must cover.
+            max_tokens: Largest M this output must cover, in (32,8192].
             output: Optional model-owned symmetric output. Its prior consumers
                 must finish before reuse; it must outlive every bound graph.
         """
         self.profile(max_tokens)
         if torch.cuda.is_current_stream_capturing():
-            raise ValueError("medium serving allocation must precede capture")
+            raise ValueError("fused serving allocation must precede capture")
         if max_tokens > workspace.state.max_token_num:
-            raise ValueError("medium output capacity exceeds raw workspace")
+            raise ValueError("fused output capacity exceeds raw workspace")
         self.workspace = workspace
         if output is None:
             output = allocate_symmetric_up_projection_output(
@@ -90,12 +88,12 @@ class MediumFusedRsUpProjectionServing(FusedRsUpProjectionServingBase):
         """Return the producer's exact symmetric BF16 [M,7168] destination."""
         self.profile(num_tokens)
         if num_tokens > self.output.tensor.shape[0]:
-            raise ValueError("medium serving bucket exceeds allocated capacity")
+            raise ValueError("fused serving M exceeds allocated capacity")
         return self.workspace.state.comm_buff[:num_tokens]
 
     def _prepare(self, m, latent, weight, residual):
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("medium serving compilation must finish during warmup")
+            raise RuntimeError("fused serving compilation must finish during warmup")
         output = SymmetricUpProjectionOutput(
             self.output.tensor[:m],
             self.output.handle,
@@ -126,16 +124,6 @@ class MediumFusedRsUpProjectionServing(FusedRsUpProjectionServingBase):
         )
         self._plans[m] = result
         return result
-
-
-class IntegratedFusedRsUpProjectionServing(MediumFusedRsUpProjectionServing):
-    """One live-pointer execution path with continuous medium/large tuning.
-
-    Allocation, publication, masking and completion are inherited unchanged.
-    Automatic dispatch does not imply new numerical or TTFT qualification.
-    """
-
-    profile = staticmethod(integrated_fused_rs_serving_config)
 
 
 class IntegratedFusedRsOutputPool:
