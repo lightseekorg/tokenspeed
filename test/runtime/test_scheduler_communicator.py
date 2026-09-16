@@ -29,6 +29,8 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
+from tokenspeed.runtime.engine.async_llm import AsyncLLM
+from tokenspeed.runtime.engine.io_struct import FlushCacheReqInput, FlushCacheReqOutput
 from tokenspeed.runtime.engine.scheduler_communicator import _Communicator
 
 
@@ -118,6 +120,27 @@ class TestWatchingCommunicator(unittest.IsolatedAsyncioTestCase):
             await fresh,
             [{"rank": 0, "flight": 2}, {"rank": 1, "flight": 2}],
         )
+
+
+class TestFlushCacheCommunicator(unittest.IsolatedAsyncioTestCase):
+    async def test_flush_requires_every_scheduler_to_succeed(self):
+        for successes in ((True,), (True, True), (True, False), (False, True)):
+            with self.subTest(successes=successes):
+                sender = _RecordingSender()
+                communicator = _Communicator(
+                    sender, fan_out=len(successes), mode="queueing"
+                )
+                llm = AsyncLLM.__new__(AsyncLLM)
+                llm.flush_cache_communicator = communicator
+                pending = asyncio.create_task(llm.flush_cache())
+                await asyncio.sleep(0)
+                self.assertEqual(len(sender.sent), 1)
+                self.assertIsInstance(sender.sent[0], FlushCacheReqInput)
+                for success in successes:
+                    self.assertFalse(pending.done())
+                    communicator.handle_recv(FlushCacheReqOutput(success=success))
+                    await asyncio.sleep(0)
+                self.assertEqual((await pending).success, all(successes))
 
 
 if __name__ == "__main__":
