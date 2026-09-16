@@ -23,7 +23,11 @@ from __future__ import annotations
 import argparse
 
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import KernelRegistry, load_builtin_kernels
+from tokenspeed_kernel.registry import (
+    KernelRegistry,
+    WarmupBehavior,
+    load_builtin_kernels,
+)
 from tokenspeed_kernel.warmup.bundle import generate_bundle
 from tokenspeed_kernel.warmup.discovery import list_config_ids, load_config
 from tokenspeed_kernel.warmup.runner import validate_profile
@@ -109,7 +113,8 @@ def main(argv: list[str]) -> int:
     registry = KernelRegistry.get()
     if args.list_apis:
         for spec in registry.list_apis():
-            print(spec.api)
+            if spec.warmup_config_type is not None:
+                print(spec.api)
         return 0
 
     if args.validate is not None:
@@ -144,6 +149,8 @@ def main(argv: list[str]) -> int:
     api_spec = registry.get_api(family, mode)
     if api_spec is None:
         parser.error(f"unknown kernel API {args.list_solutions!r}")
+    if api_spec.warmup_config_type is None:
+        parser.error(f"kernel API {args.list_solutions!r} has no warmup definition")
 
     platform = current_platform()
     solutions = sorted(
@@ -154,6 +161,7 @@ def main(argv: list[str]) -> int:
                 mode,
                 platform=platform,
             )
+            if spec.warmup_behavior is not WarmupBehavior.NONE
         }
     )
     for solution in solutions:

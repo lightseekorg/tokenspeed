@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from tokenspeed_kernel.registry import KernelApiSpec, KernelRegistry
+from tokenspeed_kernel.registry import KernelApiSpec, KernelRegistry, WarmupBehavior
 from tokenspeed_kernel.warmup.api import WarmupConfig
 from tokenspeed_kernel.warmup.config.schema import WarmupProfile
 
@@ -44,10 +44,19 @@ def validate_profile(profile: WarmupProfile) -> tuple[ValidatedWarmupTarget, ...
             raise ValueError(f"unknown kernel API {target.api!r}")
         if api_spec.warmup_config_type is None:
             raise ValueError(f"kernel API {target.api!r} has no warmup definition")
-        solutions = registry.list_solutions(family, mode)
-        if target.solution not in solutions:
+        solution_specs = registry.get_for_operator(
+            family,
+            mode,
+            solution=target.solution,
+        )
+        if not solution_specs:
             raise ValueError(
                 f"unknown solution {target.solution!r} for kernel API {target.api!r}"
+            )
+        if all(spec.warmup_behavior is WarmupBehavior.NONE for spec in solution_specs):
+            raise ValueError(
+                f"solution {target.solution!r} for kernel API {target.api!r} "
+                "has no warmup behavior"
             )
         config = api_spec.warmup_config_type.from_json(target.definition)
         validated.append(
