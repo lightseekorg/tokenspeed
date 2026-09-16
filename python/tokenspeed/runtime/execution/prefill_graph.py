@@ -465,10 +465,10 @@ class PrefillGraph:
         per-request structure (page-table rows, DSA indexer tables) is sized
         for ``physical_context_len``, and a longer fabricated request indexes
         past them. It does not bound the request-indexed buffers, which are
-        sized ``max_num_seqs // dp``: a bucket above ``context_len * max_bs``
-        overflows them and kills the boot (pre-existing; ``_autotune`` clamps
-        its token count for exactly that reason, the bucket ladder does not). A real forward carries more than ``context_len`` tokens only as
-        a multi-request batch, never as one sequence.
+        sized ``max_num_seqs // dp``: callers must keep a bucket at or below
+        ``context_len * max_bs``. A real forward carries more than
+        ``context_len`` tokens only as a multi-request batch, never as one
+        sequence.
 
         The prefill analogue of decode's ``_init_capture_metadata``. KV writes
         go to the reserved dummy slot; per-group table widths come from

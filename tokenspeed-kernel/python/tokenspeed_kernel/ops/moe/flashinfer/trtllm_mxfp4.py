@@ -374,7 +374,6 @@ if platform.is_nvidia:
         w.intermediate_size_per_partition = ispp_padded
         w.hidden_size_padded = hidden_padded
         w.hidden_size_original = getattr(w, "hidden_size", hidden_padded)
-        w._flashinfer_trtllm_autotuned = False
         return None
 
     def flashinfer_trtllm_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):

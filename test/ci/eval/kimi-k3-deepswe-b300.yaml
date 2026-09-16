@@ -40,7 +40,6 @@ server:
     --chunked-prefill-size 32768
     --gpu-memory-utilization 0.90
     --disable-kvstore
-    --disable-autotune
     --enable-allreduce-fusion
     --enable-log-request-stats
     --enable-metrics

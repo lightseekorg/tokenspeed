@@ -278,9 +278,8 @@ class DummyGroupTablesTest(unittest.TestCase):
         """A state group needs one working block per request: two rows sharing
         one silently clobber each other. The runtime check is gated on
         TOKENSPEED_CACHE_DEBUG, so a regression would be silent and this test
-        is the guard. Reachable at bs>1, which ``_autotune`` produces whenever
-        the chunk budget exceeds the model context -- and ``_autotune`` runs
-        even with the prefill graph disabled."""
+        is the guard. Prefill graph capture reaches this at every request-count
+        bucket above one."""
         import torch
 
         from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (

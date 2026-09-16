@@ -46,7 +46,7 @@ _RUNTIME = (
     / "runtime"
     / "execution"
 )
-_STEP_OPERATIONS = frozenset({"_autotune", "freeze", "capture", "capture_graphs"})
+_STEP_OPERATIONS = frozenset({"freeze", "capture", "capture_graphs"})
 
 
 def _tree(name: str) -> ast.Module:
@@ -72,9 +72,9 @@ def _attribute_calls(node: ast.AST) -> list[ast.Call]:
 def test_the_boot_path_runs_the_capture_step():
     """The one line that keeps boot behaviour unchanged has to be asserted.
 
-    Construction no longer tunes, freezes or captures, so ``build_device_side``
-    calling ``capture_graphs`` is the whole of the change's boot contract. With
-    that call gone the engine boots untuned, with an unfrozen workspace, no
+    Construction no longer loads tactics, freezes or captures, so
+    ``build_device_side`` calling ``capture_graphs`` is the whole of the boot
+    contract. With that call gone the engine boots with an unfrozen workspace, no
     graphs and no post-startup seed -- and the first decode dies inside
     ``ForwardStepRunner`` on a graph key that was never captured, because
     ``_can_use_graph`` answers from ``bs <= max_capture_bs``, not from
@@ -156,26 +156,21 @@ def test_nothing_the_constructor_reaches_tunes_freezes_or_captures():
 
 
 def test_the_step_names_every_operation_the_constructor_gave_up():
-    """The move must be complete, not partial: all four land in the step."""
+    """The move must be complete, not partial: all three land in the step."""
     step = _function(_tree("model_executor.py"), "capture_graphs")
     names = {call.func.attr for call in _attribute_calls(step)}
     assert _STEP_OPERATIONS - {"capture_graphs"} <= names, names
 
 
-def test_the_step_runs_its_operations_in_the_order_the_constructor_did():
-    """Load or tune, freeze, capture decode, capture prefill; then seed.
-
-    Tuning and capture draw from the generator, so the boot path seeds once
-    they are done, exactly where the constructor used to. An explicit warmup
-    bundle replaces live tuning at the same point before workspace freeze.
-    """
+def test_the_step_runs_operations_in_capture_order():
+    """Load tactics, freeze, capture decode, capture prefill; then seed."""
     step = _function(_tree("model_executor.py"), "capture_graphs")
     sequence = [
         call.func.attr
         for call in sorted(_attribute_calls(step), key=lambda call: call.lineno)
         if call.func.attr in _STEP_OPERATIONS
     ]
-    assert sequence == ["_autotune", "freeze", "capture", "capture"]
+    assert sequence == ["freeze", "capture", "capture"]
     bundle_loads = [
         call.lineno
         for call in ast.walk(step)
@@ -188,6 +183,16 @@ def test_the_step_runs_its_operations_in_the_order_the_constructor_did():
     ]
     assert len(bundle_loads) == 1
     assert bundle_loads[0] < min(freezes)
+
+    executor = next(
+        node
+        for node in _tree("model_executor.py").body
+        if isinstance(node, ast.ClassDef) and node.name == "ModelExecutor"
+    )
+    assert all(
+        not isinstance(node, ast.FunctionDef) or node.name != "_autotune"
+        for node in executor.body
+    )
 
     builder = _function(_tree("device.py"), "build_device_side")
     seed = [

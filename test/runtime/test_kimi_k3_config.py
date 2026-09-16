@@ -261,9 +261,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 kimi_k3, "situ_moe_unavailable_reason", return_value=None
             ),
             mock.patch.object(
-                kimi_k3, "load_packaged_flashinfer_tuning_cache", lambda *a, **kw: None
-            ),
-            mock.patch.object(
                 kimi_k3.KimiK3LatentDownOp,
                 "initialize",
                 staticmethod(lambda **kw: multicast_calls.append(kw) or "mc-op"),

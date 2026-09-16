@@ -116,8 +116,8 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             1 << 20
         )
         # Warm the shared block to this backend's peak now: graph capture runs
-        # the forward with the pool frozen, and under --disable-autotune no
-        # earlier forward will have grown the block by then.
+        # the forward with the pool frozen, and loading a tactic bundle does not
+        # execute an earlier model forward that could grow the block.
         self._workspace_pool.allocate(((self._workspace_nbytes,), torch.uint8))
 
         # DFLASH draft: the drafter predicts a whole block of spec_num_tokens

@@ -26,20 +26,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-import torch.distributed as dist
-from tokenspeed_kernel.ops.tuning import (
-    autotune,
-    set_autotune_max_num_tokens,
-    set_autotune_process_group,
-)
+from tokenspeed_kernel.ops.tuning import set_autotune_max_num_tokens
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.warmup import load_warmup_bundle
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.configs.utils import get_rope_parameters
-from tokenspeed.runtime.distributed.process_group_manager import (
-    process_group_manager as pg_manager,
-)
 from tokenspeed.runtime.engine.scheduler_utils import engram_context_len
 from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -179,14 +171,12 @@ class ModelExecutorConfig:
     max_cudagraph_capture_size: int
     model_is_mrope: bool
     enable_nan_detection: bool = False
-    disable_autotune: bool = False
     kernel_warmup_bundle: str | None = None
     enable_cudagraph_gc: bool = False
 
     # ====== DP =========
     data_parallel_size: int = 1
     world_size: int = 1
-    world_group: list[int] | None = None
 
     # ====== PP (prefill chunk pipeline) =========
     pp_size: int = 1
@@ -279,7 +269,6 @@ class ModelExecutorConfig:
             global_rank=global_rank,
             cudagraph_capture_sizes=server_args.cudagraph_capture_sizes,
             disable_cuda_graph_padding=server_args.disable_cuda_graph_padding,
-            disable_autotune=server_args.disable_autotune,
             kernel_warmup_bundle=server_args.kernel_warmup_bundle,
             enable_cudagraph_gc=server_args.enable_cudagraph_gc,
             max_cudagraph_capture_size=server_args.max_cudagraph_capture_size,
@@ -289,7 +278,6 @@ class ModelExecutorConfig:
             model_is_mrope=model_is_mrope,
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
-            world_group=server_args.mapping.world_group,
             pp_size=server_args.mapping.pp_size,
             pp_rank=(server_args.mapping.pp_rank if server_args.mapping.has_pp else 0),
             pp_group=(
@@ -532,7 +520,7 @@ class ModelExecutor:
         logger.info("ModelExecutor initialized")
 
     def capture_graphs(self) -> None:
-        """Tune the kernels, pin the workspace, then capture the graphs.
+        """Load kernel tactics, pin the workspace, then capture the graphs.
 
         A step of its own, so the caller decides when the graph owners start
         recording the pools' buffers. Construction has already read the pools
@@ -540,17 +528,21 @@ class ModelExecutor:
         init_cuda_graph_state), so a caller that rebinds between the two
         re-runs those itself.
         """
-        if self.config.kernel_warmup_bundle is None:
-            self._autotune()
-        else:
+        maximum_num_tokens = self._warmup_max_num_tokens()
+        set_autotune_max_num_tokens(maximum_num_tokens)
+        if self.config.kernel_warmup_bundle is not None:
             bundle = load_warmup_bundle(
                 self.config.kernel_warmup_bundle,
-                self._autotune_num_tokens(),
+                maximum_num_tokens,
             )
             logger.info(
                 "Loaded kernel warmup bundle %s with %s FlashInfer profiles",
                 bundle.path,
                 bundle.profile_count,
+            )
+        else:
+            logger.info(
+                "No kernel warmup bundle configured; using library-selected tactics"
             )
 
         workspace_pool(self.device).freeze()
@@ -560,7 +552,7 @@ class ModelExecutor:
         if not self.prefill_graph.disable:
             self.prefill_graph.capture(self.forward_step)
 
-    def _autotune_num_tokens(self) -> int:
+    def _warmup_max_num_tokens(self) -> int:
         per_rank_max_batch = max(
             1,
             int(self.config.max_num_seqs)
@@ -570,79 +562,6 @@ class ModelExecutor:
             int(self.config.chunked_prefill_size),
             int(self.config.context_len) * per_rank_max_batch,
         )
-
-    def _autotune(self) -> None:
-        """Profile tunable kernels over one dummy prefill before graph capture.
-
-        The dummy batch is capped by both the chunked-prefill token budget and
-        rank-local request capacity. ``make_dummy_batch`` splits tokens into
-        requests of at most ``context_len``, while request-indexed buffers
-        contain only ``max_num_seqs // data_parallel_size`` rows. Keeping the
-        token count within their product prevents autotuning from constructing
-        a batch that cannot fit those buffers.
-
-        The tuner enumerates every smaller shape bucket from this pass, so a
-        separate decode-sized pass is unnecessary. This must run before graph
-        capture because a captured graph retains the tactic selected during
-        capture. On distributed boots, per-tactic timings are averaged across
-        ranks so every rank selects the same tactic.
-        """
-        num_tokens = self._autotune_num_tokens()
-        if num_tokens <= 0 or self.model_runner is None:
-            return
-        if self.config.pp_size > 1:
-            # The tuning forward drives the model directly (no stage recv/send
-            # threading), which a mid-pipeline stage cannot run. Fall back to
-            # heuristic tactics on every rank so the world-averaged tactic
-            # collective is skipped consistently.
-            set_autotune_max_num_tokens(num_tokens)
-            logger.info(
-                "Kernel tuning skipped under pipeline parallelism; tunable "
-                "kernels use heuristic tactics"
-            )
-            return
-
-        # The bucket mapper keys serving-time tactic lookups, so it must match
-        # any pre-swept table loaded earlier even when tuning itself is off.
-        set_autotune_max_num_tokens(num_tokens)
-        if self.config.disable_autotune:
-            logger.info(
-                "Kernel tuning disabled (--disable-autotune); tunable kernels "
-                "use heuristic tactics"
-            )
-            return
-
-        cpu_group = None
-        if self.config.world_size > 1:
-            cpu_group = pg_manager.get_process_group("gloo", self.config.world_group)
-
-        logger.info(f"Kernel tuning with a dummy prefill of {num_tokens} tokens")
-        ib = self.input_buffers
-        tic = time.time()
-        set_autotune_process_group(cpu_group)
-        with autotune(), maybe_inference_mode():
-            # Reuse idle's dummy-input scrub before prefill writes its geometry;
-            # borrowed Engram views must not retain live history or masks.
-            ib.fill_dummy_decode_buffers(
-                batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
-            )
-            ctx = self.prefill_graph.make_dummy_batch(num_tokens)
-            positions = (
-                ib.mrope_positions_buf[:, :num_tokens]
-                if self.config.model_is_mrope
-                else ib.positions_buf[:num_tokens]
-            )
-            with active_forward(ctx):
-                self.model_runner.forward(
-                    ctx=ctx,
-                    input_ids=ib.input_ids_buf[:num_tokens],
-                    positions=positions,
-                    **ib.ngram_model_kwargs(num_tokens),
-                )
-        set_autotune_process_group(None)
-        torch.get_device_module(self.device).synchronize()
-        dist.barrier()
-        logger.info(f"Kernel tuning finished in {time.time() - tic:.1f}s")
 
     @property
     def capturable_grammar(self):

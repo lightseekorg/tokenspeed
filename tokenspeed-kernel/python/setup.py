@@ -941,8 +941,6 @@ setup(
     packages=find_packages(),
     package_data={
         "tokenspeed_kernel.warmup.config": ["nvidia/flashinfer/*/*.json"],
-        # Pre-swept flashinfer MoE tactic tables (see ops/tuning.py).
-        "tokenspeed_kernel.ops.moe.flashinfer": ["tactics/*.json"],
         "tokenspeed_kernel.thirdparty.cuda": ["objs/**/*.so"],
         # Vendored MiniMax MSA CuTe sources: cute/ has no __init__.py (it is
         # loaded via the upstream sys.path bootstrap), so ship it as data.

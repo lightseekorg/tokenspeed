@@ -89,7 +89,6 @@ from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
 )
 from tokenspeed_kernel.ops.moe.latent_down import KimiK3LatentDownOp
 from tokenspeed_kernel.ops.residual import attn_res_fwd, attn_res_fwd_available
-from tokenspeed_kernel.ops.tuning import load_packaged_flashinfer_tuning_cache
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn
 
@@ -1450,14 +1449,6 @@ class KimiLinearMoE(nn.Module):
                     f"with native SiTU, unavailable: {reason}. Upgrade "
                     "flashinfer; no portable SiTU Triton fallback exists."
                 )
-            # Out-of-box tactics: seed the autotuner from the in-tree
-            # swept table for this GPU/flashinfer combo, if one ships
-            # (flashinfer's own heuristic mispicks MoE tactics at prefill
-            # batch sizes). A lookup miss leaves the startup autotune
-            # window to tune these shapes.
-            load_packaged_flashinfer_tuning_cache(
-                "kimi-k3", mapping.moe.ep_size, mapping.moe.tp_size
-            )
         # Attention DP partitions the batch when its TP group is smaller than
         # the MoE TP×EP group. Gather those DP shards so every rank enters the
         # K3 MoE with the same complete token batch.

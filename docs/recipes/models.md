@@ -484,7 +484,6 @@ python -m tokenspeed.cli serve Qwen/Qwen3-0.6B \
   --prefix-granularity 128 \
   --max-cudagraph-capture-size 4 \
   --cudagraph-capture-sizes 1 2 4 \
-  --disable-autotune \
   --host 0.0.0.0 \
   --port 31889
 ```
@@ -503,8 +502,7 @@ graph flags retain their CUDA-oriented names for CLI compatibility, they control
 ACL Graph capture on an NPU. The command above captures decode batches 1, 2,
 and 4 and was validated with a 16,384-token KV pool. Increase
 `--max-model-len`, `--max-num-seqs`, `--max-total-tokens`, and the capture sizes
-together when scaling the deployment. `--disable-autotune` shortens bring-up;
-remove it after validation when startup tuning is desired.
+together when scaling the deployment.
 
 The current Ascend sampling path is validated with greedy decoding. Because
 `--sampling-backend greedy` always performs argmax, send `temperature=0` and do

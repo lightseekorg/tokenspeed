@@ -332,63 +332,23 @@ class _MoeRouting:
 @dataclass(frozen=True)
 class _MoeTuning:
     strategy: str
-    warmup_iterations: int
-    coarse_iterations: int
-    fine_iterations: int
-    use_cold_l2: bool
-    use_cuda_graph: bool
-    weight_copies: int
     random_seed: int
-    require_complete_coverage: bool
 
     @classmethod
     def parse(cls, raw: Mapping[str, object]) -> _MoeTuning:
         context = "moe.apply tuning"
-        names = {
-            "strategy",
-            "warmup_iterations",
-            "coarse_iterations",
-            "fine_iterations",
-            "use_cold_l2",
-            "use_cuda_graph",
-            "weight_copies",
-            "random_seed",
-            "require_complete_coverage",
-        }
-        _fields(raw, names, context)
-        strategy = _string(raw, "strategy", context)
-        if strategy not in {"flashinfer_native", "two_stage_with_heuristic_floor"}:
-            raise ValueError(f"{context}.strategy is unsupported: {strategy!r}")
-        integers = {
-            name: _integer(raw, name, context)
-            for name in (
-                "warmup_iterations",
-                "coarse_iterations",
-                "fine_iterations",
-                "weight_copies",
-                "random_seed",
-            )
-        }
-        if (
-            any(value < 0 for value in integers.values())
-            or integers["weight_copies"] == 0
-        ):
-            raise ValueError(
-                f"{context} iteration counts and weight copies are invalid"
-            )
-        return cls(
-            strategy=strategy,
-            warmup_iterations=integers["warmup_iterations"],
-            coarse_iterations=integers["coarse_iterations"],
-            fine_iterations=integers["fine_iterations"],
-            use_cold_l2=_boolean(raw, "use_cold_l2", context),
-            use_cuda_graph=_boolean(raw, "use_cuda_graph", context),
-            weight_copies=integers["weight_copies"],
-            random_seed=integers["random_seed"],
-            require_complete_coverage=_boolean(
-                raw, "require_complete_coverage", context
-            ),
+        _fields(
+            raw,
+            {"strategy", "random_seed"},
+            context,
         )
+        strategy = _string(raw, "strategy", context)
+        if strategy != "flashinfer_native":
+            raise ValueError(f"{context}.strategy must be 'flashinfer_native'")
+        random_seed = _integer(raw, "random_seed", context)
+        if random_seed < 0:
+            raise ValueError(f"{context}.random_seed cannot be negative")
+        return cls(strategy=strategy, random_seed=random_seed)
 
 
 @dataclass(frozen=True)
@@ -765,10 +725,6 @@ class MoeApplyWarmupConfig:
             raise ValueError("moe.apply FlashInfer warmup requires NVIDIA Blackwell")
         if not torch.cuda.is_available():
             raise RuntimeError("moe.apply warmup requires CUDA")
-        if self.tuning.strategy != "flashinfer_native":
-            raise NotImplementedError(
-                "two_stage_with_heuristic_floor warmup is not implemented yet"
-            )
         set_autotune_max_num_tokens(self.maximum_num_tokens)
 
         planned = []

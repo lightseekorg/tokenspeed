@@ -44,7 +44,6 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
 from tokenspeed.runtime.execution.model_runner import ModelRunner
-from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
@@ -687,125 +686,6 @@ def test_target_runner_passes_model_kwargs_not_context_tensors(buffers, mode):
             == ib.ngram_previous_tokens_buf.data_ptr()
         )
     assert vars(ctx) == original
-
-
-@pytest.mark.parametrize("context_len", [3, 4])
-def test_autotune_passes_engram_views_and_resets_dummy_inputs(
-    buffers, monkeypatch, context_len
-):
-    """Run the startup forward, not just its serving-path counterpart."""
-    ib, _ = buffers
-    num_tokens = min(7, context_len * 2)
-    lengths = [context_len, num_tokens - context_len]
-    events = []
-    metadata = []
-    tuning = False
-    views = ib.ngram_model_kwargs(num_tokens)
-    for value in ib.ngram_model_kwargs(ib.max_num_tokens).values():
-        value.fill_(1)
-
-    @contextmanager
-    def tuner():
-        nonlocal tuning
-        events.append("tuner-enter")
-        tuning = True
-        yield
-        tuning = False
-        events.append("tuner-exit")
-
-    def init_metadata(**kwargs):
-        assert tuning
-        assert kwargs["bs"] == kwargs["num_extends"] == 2
-        assert kwargs["forward_mode"] == ForwardMode.EXTEND
-        assert kwargs["seq_lens"].tolist() == lengths
-        assert kwargs["extend_prefix_lens"].tolist() == [0, 0]
-        assert not kwargs["extend_with_prefix"]
-        # An unbound fake pool exercises dummy setup without allocating KV.
-        assert "block_tables" not in kwargs
-        metadata.append(kwargs)
-        events.append("metadata")
-
-    def forward(ctx, input_ids, positions, **kwargs):
-        assert tuning
-        model_kwargs = DeepseekV41ForCausalLM.prepare_model_kwargs(
-            runner.model, ctx, input_ids, kwargs
-        )
-        for key, view in views.items():
-            actual = model_kwargs[key]
-            assert actual.shape == view.shape
-            assert actual.dtype == view.dtype
-            assert actual.data_ptr() == view.data_ptr()
-        assert (model_kwargs["engram_previous_tokens"] == -1).all()
-        assert not model_kwargs["engram_token_mask"].any()
-        assert input_ids.shape == (num_tokens,)
-        assert input_ids.data_ptr() == ib.input_ids_buf.data_ptr()
-        assert positions.data_ptr() == ib.positions_buf.data_ptr()
-        assert positions.tolist() == list(range(lengths[0])) + list(range(lengths[1]))
-        assert ctx.attn_backend is pg.attn_backend
-        assert ctx.input_num_tokens == num_tokens
-        assert ctx.bs == ctx.num_extends == 2
-        assert ctx.forward_mode == ForwardMode.EXTEND
-        assert "engram_previous_tokens" not in vars(ctx)
-        assert "engram_token_mask" not in vars(ctx)
-        events.append("forward")
-
-    runner = ModelRunner.__new__(ModelRunner)
-    runner.model = SimpleNamespace(forward=forward)
-    runner.is_generation = True
-    executor = ModelExecutor.__new__(ModelExecutor)
-    executor.device = ib.device
-    executor.config = SimpleNamespace(
-        max_num_seqs=2,
-        data_parallel_size=1,
-        chunked_prefill_size=7,
-        context_len=context_len,
-        physical_context_len=context_len,
-        pp_size=1,
-        world_size=1,
-        disable_autotune=False,
-        model_is_mrope=False,
-        device=ib.device,
-    )
-    executor.input_buffers = ib
-    executor.model_runner = runner
-    pg = PrefillGraph.__new__(PrefillGraph)
-    pg.config = executor.config
-    pg.input_buffers = ib
-    pg.attn_backend = SimpleNamespace(init_forward_metadata=init_metadata)
-    pg.token_to_kv_pool = SimpleNamespace(arena=SimpleNamespace(cache_group_specs=()))
-    pg.dp_size = 1
-    pg.drafter = None
-    executor.prefill_graph = pg
-    monkeypatch.setattr(model_executor, "autotune", tuner)
-    monkeypatch.setattr(
-        model_executor,
-        "set_autotune_max_num_tokens",
-        lambda count: events.append(("max_tokens", count)),
-    )
-    monkeypatch.setattr(
-        model_executor,
-        "set_autotune_process_group",
-        lambda group: events.append(("group", group)),
-    )
-    monkeypatch.setattr(
-        model_executor.dist, "barrier", lambda: events.append("barrier")
-    )
-
-    executor._autotune()
-
-    assert (ib.ngram_previous_tokens_buf == -1).all()
-    assert not ib.ngram_token_mask_buf.any()
-    assert len(metadata) == 1
-    assert events == [
-        ("max_tokens", num_tokens),
-        ("group", None),
-        "tuner-enter",
-        "metadata",
-        "forward",
-        "tuner-exit",
-        ("group", None),
-        "barrier",
-    ]
 
 
 def test_execute_idle_forward_passes_empty_engram_views(buffers):
