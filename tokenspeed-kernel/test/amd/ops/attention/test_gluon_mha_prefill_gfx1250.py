@@ -47,23 +47,58 @@ def _inputs(seqlens, n_q_heads, n_kv_heads, head_dim, device, dtype):
     return q, k, v, cu, cu_cpu, max(seqlens)
 
 
-def _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim, window_left=-1):
+def _reference(
+    q,
+    k,
+    v,
+    cu_cpu,
+    n_q_heads,
+    n_kv_heads,
+    head_dim,
+    window_left=-1,
+    causal=True,
+    cu_k_cpu=None,
+):
     sm_scale = 1.0 / math.sqrt(head_dim)
     group = n_q_heads // n_kv_heads
+    if cu_k_cpu is None:
+        cu_k_cpu = cu_cpu
     outs = []
-    for start, end in zip(cu_cpu[:-1], cu_cpu[1:]):
+    for (start, end), (k_start, k_end) in zip(
+        zip(cu_cpu[:-1], cu_cpu[1:]), zip(cu_k_cpu[:-1], cu_k_cpu[1:])
+    ):
         q_i = q[start:end].float()
-        k_exp = k[start:end].float().repeat_interleave(group, dim=1)
-        v_exp = v[start:end].float().repeat_interleave(group, dim=1)
-        n = end - start
+        k_exp = k[k_start:k_end].float().repeat_interleave(group, dim=1)
+        v_exp = v[k_start:k_end].float().repeat_interleave(group, dim=1)
+        n_q = end - start
+        n_k = k_end - k_start
         scores = torch.einsum("qhd,khd->hqk", q_i, k_exp) * sm_scale
-        pos = torch.arange(n, device=q.device)
-        mask = pos[:, None] >= pos[None, :]
+        pos_q = torch.arange(n_q, device=q.device)
+        pos_k = torch.arange(n_k, device=q.device)
+        mask = torch.ones((n_q, n_k), device=q.device, dtype=torch.bool)
+        if causal:
+            mask &= pos_q[:, None] >= pos_k[None, :]
         if window_left >= 0:
-            mask &= (pos[:, None] - pos[None, :]) <= window_left
+            mask &= (pos_q[:, None] - pos_k[None, :]) <= window_left
         scores = scores.masked_fill(~mask[None, :, :], float("-inf"))
         outs.append(torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), v_exp))
     return torch.cat(outs, dim=0)
+
+
+def _cross_inputs(seqlens_q, seqlens_k, n_q_heads, n_kv_heads, head_dim, device, dtype):
+    def _cu(seqlens):
+        cu_cpu = [0]
+        for s in seqlens:
+            cu_cpu.append(cu_cpu[-1] + s)
+        cu = torch.tensor(cu_cpu, device=device, dtype=torch.int32)
+        return cu, cu_cpu, max(seqlens)
+
+    cu_q, cu_q_cpu, max_q = _cu(seqlens_q)
+    cu_k, cu_k_cpu, max_k = _cu(seqlens_k)
+    q = torch.randn((cu_q_cpu[-1], n_q_heads, head_dim), device=device, dtype=dtype)
+    k = torch.randn((cu_k_cpu[-1], n_kv_heads, head_dim), device=device, dtype=dtype)
+    v = torch.randn((cu_k_cpu[-1], n_kv_heads, head_dim), device=device, dtype=dtype)
+    return q, k, v, cu_q, cu_q_cpu, max_q, cu_k, cu_k_cpu, max_k
 
 
 @pytest.mark.parametrize(
@@ -180,6 +215,7 @@ def test_select_reverse_q_blocks():
         {"max_seqlen": 256},
         {"window_left": 64},
         {"workgroups": 255},
+        {"causal": False},
     ):
         assert not prefill._select_reverse_q_blocks(**(kwargs | override))
 
@@ -303,3 +339,119 @@ def test_select_m_tile_gates():
 
     # Both satisfied.
     assert prefill._select_m_tile(batch_size=4, n_heads=32, max_seqlen=4096) == wide
+
+
+@pytest.mark.parametrize("head_dim", [64, 128], ids=["d64", "d128"])
+def test_mha_prefill_noncausal_full_kv(head_dim):
+    """Non-causal FA: every query sees the full K/V sequence."""
+    device, dtype = "cuda", torch.bfloat16
+    n_q_heads, n_kv_heads = 4, 1
+    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
+        [128, 192], n_q_heads, n_kv_heads, head_dim, device, dtype
+    )
+    out = prefill.gluon_mha_prefill_gfx1250(
+        q, k, v, cu, cu_cpu, max_seqlen, is_causal=False
+    )
+    expected = _reference(
+        q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim, causal=False
+    )
+    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+
+    causal_out = prefill.gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+    assert not torch.allclose(out.float(), causal_out.float(), rtol=1e-3, atol=1e-3)
+
+
+def test_mha_prefill_noncausal_fp8():
+    device = "cuda"
+    n_q_heads, n_kv_heads, head_dim = 4, 1, 128
+    q_bf16, k_bf16, v_bf16, cu, cu_cpu, max_seqlen = _inputs(
+        [128], n_q_heads, n_kv_heads, head_dim, device, torch.bfloat16
+    )
+    q = q_bf16.to(torch.float8_e4m3fn)
+    k = k_bf16.to(torch.float8_e4m3fn)
+    v = v_bf16.to(torch.float8_e4m3fn)
+    out = prefill.gluon_mha_prefill_gfx1250(
+        q, k, v, cu, cu_cpu, max_seqlen, is_causal=False
+    )
+    expected = _reference(
+        q.float(),
+        k.float(),
+        v.float(),
+        cu_cpu,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        causal=False,
+    )
+    assert out.dtype == torch.bfloat16
+    torch.testing.assert_close(out.float(), expected, rtol=2e-1, atol=2e-1)
+
+
+@pytest.mark.parametrize("head_dim", [64, 128], ids=["d64", "d128"])
+def test_mha_prefill_cross_attn_full_kv(head_dim):
+    """Cross-attn: Q and K/V may have different sequence lengths."""
+    device, dtype = "cuda", torch.bfloat16
+    n_q_heads, n_kv_heads = 4, 1
+    q, k, v, cu_q, cu_q_cpu, max_q, cu_k, cu_k_cpu, max_k = _cross_inputs(
+        [128, 192], [80, 96], n_q_heads, n_kv_heads, head_dim, device, dtype
+    )
+    out = prefill.gluon_mha_prefill_gfx1250(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_q_cpu,
+        max_q,
+        is_causal=False,
+        cu_seqlens_k=cu_k,
+        cu_seqlens_k_cpu=cu_k_cpu,
+        max_seqlen_k=max_k,
+    )
+    expected = _reference(
+        q,
+        k,
+        v,
+        cu_q_cpu,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        causal=False,
+        cu_k_cpu=cu_k_cpu,
+    )
+    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+
+
+def test_mha_prefill_cross_attn_fp8():
+    device = "cuda"
+    n_q_heads, n_kv_heads, head_dim = 4, 1, 128
+    q_bf16, k_bf16, v_bf16, cu_q, cu_q_cpu, max_q, cu_k, cu_k_cpu, max_k = _cross_inputs(
+        [128], [80], n_q_heads, n_kv_heads, head_dim, device, torch.bfloat16
+    )
+    q = q_bf16.to(torch.float8_e4m3fn)
+    k = k_bf16.to(torch.float8_e4m3fn)
+    v = v_bf16.to(torch.float8_e4m3fn)
+    out = prefill.gluon_mha_prefill_gfx1250(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_q_cpu,
+        max_q,
+        is_causal=False,
+        cu_seqlens_k=cu_k,
+        cu_seqlens_k_cpu=cu_k_cpu,
+        max_seqlen_k=max_k,
+    )
+    expected = _reference(
+        q.float(),
+        k.float(),
+        v.float(),
+        cu_q_cpu,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        causal=False,
+        cu_k_cpu=cu_k_cpu,
+    )
+    assert out.dtype == torch.bfloat16
+    torch.testing.assert_close(out.float(), expected, rtol=2e-1, atol=2e-1)

@@ -176,6 +176,7 @@ if current_platform().is_amd:
             "support_logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
             "support_skip_softmax": frozenset({False}),
+            "is_causal": frozenset({False, True}),
         },
     )
     def gluon_mha_prefill_gfx1250(*args, **kwargs):
