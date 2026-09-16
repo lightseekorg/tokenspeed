@@ -151,8 +151,9 @@ def copy_gmem_to_smem_u128(smem_ptr, gmem_ptr, *, loc=None, ip=None):
 
 
 class MixedInputFusedMultiHeadAttentionDecode:
-    def __init__(self, kv_splits):
+    def __init__(self, kv_splits, enable_pdl):
         self.kv_splits = kv_splits
+        self.enable_pdl = enable_pdl
 
         warpgroup_id = 0
 
@@ -484,6 +485,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
             cluster=[kv_splits, 1, 1],
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.enable_pdl,
         )
 
         ##############################
@@ -783,6 +785,13 @@ class MixedInputFusedMultiHeadAttentionDecode:
         tmem_offset += tcgen05.find_tmem_tensor_col_offset(tCtO)
 
         assert tmem_offset <= self.tmem_alloc_cols
+
+        # Descriptor prefetch, TMEM allocation and pipeline initialization can
+        # overlap the producer. Every warp waits before Q/K/V or slot reads,
+        # including the softmax tail; release downstream weight loading now.
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_wait()
+            cute.arch.griddepcontrol_launch_dependents()
 
         ##############################
         # Exit early
@@ -1558,6 +1567,7 @@ def _compile_kernel(
     selected_slots: torch.Tensor,
     output: torch.Tensor,
     kv_splits: int,
+    enable_pdl: bool,
 ):
     problem_shape = (
         query.shape[0],
@@ -1566,7 +1576,7 @@ def _compile_kernel(
         key_cache.shape[0],
         _HEAD_DIM,
     )
-    fmha = MixedInputFusedMultiHeadAttentionDecode(kv_splits)
+    fmha = MixedInputFusedMultiHeadAttentionDecode(kv_splits, enable_pdl)
     fmha.problem_shape = problem_shape
     return cute.compile(
         fmha,
@@ -1592,11 +1602,14 @@ def kernel(
     max_seqlen_q: int,
     k_scale: float | torch.Tensor | None,
     v_scale: float | torch.Tensor | None,
+    enable_pdl: bool,
 ) -> torch.Tensor:
     """Run direct-slot QSA GQA with adaptive SM100 CTA clusters.
 
     Query heads form contiguous groups for each KV head. Groups must contain
     at least two query heads so the swizzled Q TMA retains its head dimension.
+    ``enable_pdl`` selects dependent launch and input synchronization, retained
+    by CUDA graph capture. Returns BF16 output with the query's shape.
     """
 
     if query.ndim != 3 or query.shape[-1] != _HEAD_DIM:
@@ -1661,6 +1674,7 @@ def kernel(
         key_cache.dtype,
         kv_splits,
         tuple(selected_slots.stride()),
+        enable_pdl,
     )
     compiled = _COMPILED_KERNELS.get(cache_key)
     if compiled is None:
@@ -1671,6 +1685,7 @@ def kernel(
             selected_slots,
             output,
             kv_splits,
+            enable_pdl,
         )
         _COMPILED_KERNELS[cache_key] = compiled
     compiled(

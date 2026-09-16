@@ -163,10 +163,18 @@ live rows are fully written, while negative padding rows skip state access
 and leave output undefined. Consumers must ignore padded output; enabled
 intermediate caches always require real storage.
 
-GDN prefill, decode and verify follow `pdl_enabled()`. Kernels wait before
-reading inputs and signal after computation; FlashInfer adapters preserve the
-upstream CuTe body and isolate PDL compilation caches. Graphs retain their
-capture-time PDL setting and must be recaptured to change it.
+GDN, QSA and gated residual kernels follow `pdl_enabled()`, passed explicitly
+to QSA indexing kernels. Waits precede producer-owned reads and outgoing
+triggers. A trigger permits successor setup, never publishes results; each
+kernel may delay it for performance. Streaming top-k, for example, avoids
+delaying scoring waves with waiting merge CTAs. Graphs retain their captured
+PDL setting; recapture to change it.
+
+Gated RMSNorm preloads weights only with `weights_independent`; a contiguous
+copy disables this preload. At RSAG-to-AR boundaries the next combine-norm
+preloads the all-gathered residual before its wait, so that collective must
+not trigger early. FlashInfer adapters preserve the upstream CuTe body and
+keep PDL compilation caches separate.
 
 ### `for_graph_replay` is for graph-mechanics asymmetries only
 
@@ -454,6 +462,12 @@ writes the full KV cache; the dense fallback honors the caller's flag.
 Draft step zero still preserves the dense decode-context
 and KV-recording override, while QSA keeps its original context and narrows
 the selected top-k rows with the queries.
+
+The QSA API preserves `decode_query_lengths`: uniform decode/verification
+uses a positive width, while prefill and mixed/ragged queries use `None`.
+Only decode may select CuTe; NVIDIA prefill uses FlashInfer FA2, including
+single-token prefill. Adapting ragged rows to one-token queries must retain
+this distinction. Both use the same cache writer and sparse-attention call.
 
 `QSAIndexerBackend` privately owns `QSAVerifyState` only for a speculative
 target. Registry construction binds the cache plan and preallocates its
