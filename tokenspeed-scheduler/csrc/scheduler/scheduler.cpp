@@ -37,6 +37,7 @@
 #include "cache/tier/transfer.h"
 #include "fsm/forward_states.h"
 #include "scheduler/operations/forward.h"
+#include "scheduler/operations/group_demands.h"
 #include "cache/prefix/prefix_hasher.h"
 #include "utils.h"
 

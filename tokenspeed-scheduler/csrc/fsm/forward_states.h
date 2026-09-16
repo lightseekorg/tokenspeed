@@ -118,13 +118,17 @@ concept HoldsForwardResources = requires(State& state) {
 };
 
 // A prefill window's model inputs; shared by every state that still
-// describes its prompt chunk.
+// describes its prompt chunk. The model input starts `window.replay` tokens
+// before the window (bounded replay); progress still ends at begin + size.
 inline PrefillInfo MakePrefillInfo(const ForwardResources& resources, TokenContainer::Window window) {
+    _assert(window.replay >= 0 && window.replay <= window.begin, "replay must re-feed computed prompt tokens");
+    const TokenContainer::Window input{.begin = window.begin - window.replay, .size = window.size + window.replay};
     return PrefillInfo{
-        .input_ids = resources.token_container->TokenSlice(window),
-        .shifted_input_ids = ComputeShiftedInputIds(resources.token_container, window),
-        .already_scheduled_len = window.begin,
-        .extend_len = window.size,
+        .input_ids = resources.token_container->TokenSlice(input),
+        .shifted_input_ids = ComputeShiftedInputIds(resources.token_container, input),
+        .already_scheduled_len = input.begin,
+        .extend_len = input.size,
+        .replay_len = window.replay,
     };
 }
 

@@ -24,38 +24,6 @@
 
 namespace tokenspeed {
 
-std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,
-                               std::int32_t prefix_granularity, std::int32_t promotion_boundary_tokens) {
-    _assert(first_pos >= 0 && unscheduled >= 0 && token_budget >= 0, "prefill positions must be non-negative");
-    _assert(prefix_granularity > 0, "prefix_granularity must be > 0");
-    std::int32_t chunk_size = std::min(unscheduled, token_budget);
-    if (promotion_boundary_tokens > first_pos) {
-        chunk_size = std::min(chunk_size, promotion_boundary_tokens - first_pos);
-    }
-    if (chunk_size == unscheduled) {
-        return chunk_size;
-    }
-
-    const std::int32_t prefix_page_offset = first_pos % prefix_granularity;
-    if (prefix_page_offset != 0) {
-        const std::int32_t tokens_to_boundary = prefix_granularity - prefix_page_offset;
-        return token_budget >= tokens_to_boundary ? tokens_to_boundary : 0;
-    }
-    return chunk_size - chunk_size % prefix_granularity;
-}
-
-std::int32_t StateCheckpointMaterializationStart(std::int32_t before_tokens, std::int32_t after_tokens,
-                                                 std::int32_t prefix_granularity) {
-    _assert(before_tokens >= 0 && after_tokens > before_tokens, "state checkpoint extent must advance");
-    _assert(prefix_granularity > 0, "prefix_granularity must be > 0");
-    const std::int32_t completed_boundary = after_tokens - after_tokens % prefix_granularity;
-    return completed_boundary > before_tokens ? completed_boundary : after_tokens;
-}
-
-std::int64_t SnapshotStateReserveTokens(std::int64_t block_granularity, std::int64_t decode_tokens) {
-    return std::max(block_granularity, decode_tokens);
-}
-
 std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
     std::vector<CacheGroupSpec> specs;
     specs.reserve(config.cache_groups.size());
@@ -74,6 +42,7 @@ std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
         specs.push_back(CacheGroupSpec{
             .kind = is_swa ? AttnKind::kSlidingWindow : AttnKind::kFull,
             .sliding_window = is_swa ? *group.sliding_window_tokens : 0,
+            .replay_window = group.replay_window_tokens.value_or(0),
             .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
             .block_granularity = group.block_granularity,
             .shard_count = group.shard_count,

@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -33,6 +34,7 @@
 #include "cache/coordinator/group_geometry.h"
 #include "cache/cache_group.h"
 #include "cache/core/cache_types.h"
+#include "utils.h"
 
 namespace tokenspeed {
 
@@ -63,6 +65,22 @@ public:
 
     std::int32_t PrefixGranularity() const noexcept { return prefix_granularity_; }
     bool HasMambaStateGroup() const;
+    // A replayable group (CacheGroupSpec::replay_window > 0) is regenerated
+    // by the model from re-fed prompt tokens instead of being prefix-cached:
+    // it takes no part in matching or publication on either tier, and Admit
+    // materializes it from the replay window before a hit. Retention still
+    // slides its request-private pages out.
+    bool GroupIsReplayable(std::int32_t i) const {
+        return groups_[static_cast<std::size_t>(i)].Spec().replay_window > 0;
+    }
+    // Largest replay window over all groups; 0 when none is replayable.
+    std::int32_t ReplayWindowTokens() const noexcept { return replay_window_tokens_; }
+    // Tokens re-fed ahead of a prefix hit so every replayable group resumes
+    // there: the window before the hit, or the whole hit when shorter.
+    std::int32_t ReplayTokens(std::int32_t hit_tokens) const {
+        _assert(hit_tokens >= 0, "hit tokens must be non-negative");
+        return std::min(replay_window_tokens_, hit_tokens);
+    }
 
     GroupAllocator& Allocator(std::int32_t i) { return groups_[static_cast<std::size_t>(i)].Allocator(); }
     const GroupAllocator& Allocator(std::int32_t i) const { return groups_[static_cast<std::size_t>(i)].Allocator(); }
@@ -262,11 +280,13 @@ private:
     // Per-group token -> page arithmetic, aligned with groups_.
     std::vector<GroupGeometry> geometry_;
     // Closed groups first, so non-closed groups match against a settled bound.
+    // Replayable groups are absent: they neither constrain nor claim a hit.
     std::vector<std::size_t> match_order_;
     BlockPool& pool_;
     BlockPool* host_pool_{nullptr};
     bool stream_device_cache_to_host_{false};
     std::int32_t prefix_granularity_{0};
+    std::int32_t replay_window_tokens_{0};
     std::uint64_t next_access_epoch_{0};
     std::vector<StoreCandidate> pending_stores_;
     CacheMutationSink cache_mutation_sink_;
