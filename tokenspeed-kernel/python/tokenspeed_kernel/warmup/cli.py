@@ -24,11 +24,15 @@ import argparse
 
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry, load_builtin_kernels
+from tokenspeed_kernel.warmup.discovery import list_config_ids, load_config
+from tokenspeed_kernel.warmup.runner import validate_profile
 
 
 def _parse_api(value: str) -> tuple[str, str]:
-    family, separator, mode = value.partition(".")
-    if not separator or not family or not mode:
+    if value.count(".") != 1:
+        raise ValueError(f"API must be in family.mode form, got {value!r}")
+    family, mode = value.split(".")
+    if not family or not mode:
         raise ValueError(f"API must be in family.mode form, got {value!r}")
     return family, mode
 
@@ -41,6 +45,12 @@ def main(argv: list[str]) -> int:
     )
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument(
+        "--list",
+        dest="list_configs",
+        action="store_true",
+        help="List built-in warmup configurations",
+    )
+    action.add_argument(
         "--list-apis",
         action="store_true",
         help="List public APIs registered for warmup",
@@ -50,13 +60,45 @@ def main(argv: list[str]) -> int:
         metavar="API",
         help="List solutions available for one family.mode API",
     )
+    action.add_argument(
+        "--show",
+        metavar="CONFIG",
+        help="Show one built-in warmup configuration",
+    )
+    action.add_argument(
+        "--validate",
+        metavar="CONFIG",
+        help="Validate one built-in warmup configuration",
+    )
     args = parser.parse_args(argv)
+
+    if args.list_configs:
+        for config_id in list_config_ids():
+            print(config_id)
+        return 0
+
+    if args.show is not None:
+        try:
+            loaded = load_config(args.show)
+        except (TypeError, ValueError) as error:
+            parser.error(str(error))
+        print(loaded.source, end="" if loaded.source.endswith("\n") else "\n")
+        return 0
 
     load_builtin_kernels()
     registry = KernelRegistry.get()
     if args.list_apis:
         for spec in registry.list_apis():
             print(spec.api)
+        return 0
+
+    if args.validate is not None:
+        try:
+            loaded = load_config(args.validate)
+            validate_profile(loaded.profile)
+        except (TypeError, ValueError) as error:
+            parser.error(str(error))
+        print(f"{loaded.profile.id}: valid")
         return 0
 
     try:

@@ -940,6 +940,7 @@ setup(
     install_requires=_selected_install_requires(),
     packages=find_packages(),
     package_data={
+        "tokenspeed_kernel.warmup.config": ["nvidia/flashinfer/*/*.json"],
         # Pre-swept flashinfer MoE tactic tables (see ops/tuning.py).
         "tokenspeed_kernel.ops.moe.flashinfer": ["tactics/*.json"],
         "tokenspeed_kernel.thirdparty.cuda": ["objs/**/*.so"],
