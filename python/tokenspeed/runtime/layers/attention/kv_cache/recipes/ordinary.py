@@ -44,7 +44,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheLayout,
     cache_dtype_name,
     mxfp8_kv_scale_fields,
-    pack,
     scatter_stored_dtype_name,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
@@ -111,30 +110,10 @@ class OrdinaryRecipe(CacheRecipe):
     @property
     @override
     def max_padding_fraction(self) -> float:
-        """Allow exactly the padding implied by this ordinary layout.
-
-        Unequal hybrid groups leave unused occurrence planes, while mixed
-        target/draft cache dtypes can make even equal-count groups differ in
-        payload bytes.  A capacity-independent dry pack resolves both effects
-        using the real fields and pinned one-block packing.  Its largest
-        observed stride overhead is the bound for the budgeted pack, so no
-        unrelated padding headroom is granted.
-        """
-        groups = self.groups()
-        layout = pack(
-            groups,
-            prefix_granularity=self.prefix_granularity,
-            cache_blocks_per_lcm_block=self.packing(groups),
-            alignment=self.alignment,
-            max_padding_fraction=float("inf"),
-        )
-        packing = dict(layout.group_packing)
-        padding_fractions = []
-        for spec, fields in groups:
-            raw_bytes = sum(field.payload_bytes for field in fields)
-            stride_bytes = layout.lcm_block_bytes // packing[spec.group_id]
-            padding_fractions.append((stride_bytes - raw_bytes) / raw_bytes)
-        return max(padding_fractions)
+        # One-block packing fixes each group's stride regardless of its layer
+        # count or cache dtype. Small groups can therefore have arbitrary tail
+        # padding; the profiled byte budget still bounds the arena capacity.
+        return float("inf")
 
     @override
     def packing(self, groups: tuple[CacheGroupDeclaration, ...]) -> Mapping[str, int]:

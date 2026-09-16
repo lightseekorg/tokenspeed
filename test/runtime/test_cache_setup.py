@@ -34,7 +34,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
-    pack,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     prepare_cache_setup,
@@ -908,22 +907,20 @@ def test_qwen_mtp_padding_allowance_tracks_draft_planes() -> None:
     ("full_layers", "sliding_layers", "expected_padding"),
     (
         (1, 4, 3.0),
+        (4, 1, 3.0),
         (3, 8, 5.0 / 3.0),
+        (1, 64, 63.0),
         (4, 4, 0.0),
         (2, 0, 0.0),
         (0, 3, 0.0),
     ),
 )
-def test_ordinary_hybrid_padding_allowance_tracks_exact_group_ratio(
+def test_ordinary_hybrid_setup_accepts_unequal_groups_within_budget(
     full_layers: int,
     sliding_layers: int,
     expected_padding: float,
 ) -> None:
-    """Unequal ordinary groups admit only their required slab-tail padding."""
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
-        OrdinaryRecipe,
-    )
-
+    """Slab-tail padding does not reject valid groups or exceed the byte budget."""
     layer_types = (FULL_ATTENTION,) * full_layers + (
         "sliding_attention",
     ) * sliding_layers
@@ -934,7 +931,7 @@ def test_ordinary_hybrid_padding_allowance_tracks_exact_group_ratio(
         sliding_window_tokens=512,
     )
     attn_config = replace(base_config, components=(mha,))
-    recipe = OrdinaryRecipe(
+    setup = prepare_cache_setup(
         family="mha",
         server_args=SimpleNamespace(max_total_tokens=None),
         model_config=SimpleNamespace(num_attention_layers=len(layer_types)),
@@ -946,9 +943,11 @@ def test_ordinary_hybrid_padding_allowance_tracks_exact_group_ratio(
         overlap_schedule_depth=0,
     )
 
-    assert recipe.max_padding_fraction == pytest.approx(expected_padding)
-    setup = recipe.setup()
     plan = setup.spec.memory_plan
+    assert setup.spec.layer_types == layer_types
+    assert len(plan.fields) == 2 * len(layer_types)
+    assert all(group.cache_blocks_per_lcm_block == 1 for group in plan.groups)
+    assert plan.arena_bytes <= 1_048_576
     raw_bytes = {
         group.group_id: sum(
             field.payload_bytes
@@ -962,23 +961,9 @@ def test_ordinary_hybrid_padding_allowance_tracks_exact_group_ratio(
     )
     assert observed_padding == pytest.approx(expected_padding)
 
-    if expected_padding > 0.0:
-        with pytest.raises(ValueError, match="padding fraction"):
-            pack(
-                recipe.groups(),
-                prefix_granularity=recipe.prefix_granularity,
-                cache_blocks_per_lcm_block=recipe.packing(recipe.groups()),
-                alignment=recipe.alignment,
-                max_padding_fraction=expected_padding - 1e-9,
-            )
 
-
-def test_ordinary_padding_allowance_uses_mixed_target_draft_payloads() -> None:
-    """The bound includes dtype sidecars, not only cache-group layer counts."""
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
-        OrdinaryRecipe,
-    )
-
+def test_ordinary_setup_preserves_mixed_target_draft_payloads() -> None:
+    """Mixed cache formats retain their scale fields and fit the byte budget."""
     target_base = replace(
         _mha_config(),
         prefix_granularity=128,
@@ -1001,7 +986,7 @@ def test_ordinary_padding_allowance_uses_mixed_target_draft_payloads() -> None:
     )
     draft_mha = replace(draft_base.component(MHAConfig), head_dim=64)
     draft_config = replace(draft_base, components=(draft_mha,))
-    recipe = OrdinaryRecipe(
+    setup = prepare_cache_setup(
         family="mha",
         server_args=SimpleNamespace(max_total_tokens=None),
         model_config=SimpleNamespace(num_attention_layers=1),
@@ -1013,11 +998,9 @@ def test_ordinary_padding_allowance_uses_mixed_target_draft_payloads() -> None:
         overlap_schedule_depth=0,
     )
 
-    groups = recipe.groups()
-    assert [len(fields) for _, fields in groups] == [2, 4]
-    assert recipe.max_padding_fraction == pytest.approx(1.0 / 64.0)
-    setup = recipe.setup()
     plan = setup.spec.memory_plan
+    assert len(plan.fields) == 6
+    assert plan.arena_bytes <= 1_048_576
     raw_bytes = {
         group.group_id: sum(
             field.payload_bytes
@@ -1026,10 +1009,6 @@ def test_ordinary_padding_allowance_uses_mixed_target_draft_payloads() -> None:
         )
         for group in plan.groups
     }
-    observed_padding = max(
-        (plan.lcm_block_bytes - size) / size for size in raw_bytes.values()
-    )
-    assert observed_padding == pytest.approx(recipe.max_padding_fraction)
     assert (plan.lcm_block_bytes - raw_bytes["sliding_attention"]) / raw_bytes[
         "sliding_attention"
     ] == pytest.approx(1.0 / 64.0)

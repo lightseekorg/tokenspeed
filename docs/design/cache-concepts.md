@@ -613,15 +613,13 @@ are not per-layer (Inkling appends conv columns; V4 declares each group
 whole). No family restates the order of the stages, and `_RECIPES`
 (`recipes/setup.py`) is the single family → recipe map.
 
-Ordinary recipes pin one CacheBlock per group in each parent. Their padding
-allowance comes from a capacity-independent dry pack with those same fields,
-packing counts and alignment. For each group it measures
-`(stride_bytes - payload_bytes) / payload_bytes` and uses the largest value
-as the final pack's limit. This admits unequal full/sliding group sizes and
-mixed target/draft payloads, including scale fields, without a fixed padding
-cap. For example, equal-sized layers split into groups of one and four need
-a padding fraction of `3.0` for the smaller group; balanced groups need zero.
-The dry pack does not allocate storage or change the profiled cache budget.
+Ordinary recipes pin one CacheBlock per group in each parent, so a group's
+stride does not shrink with its layer count or cache dtype. For example,
+equal-sized layers split into groups of one and four need a padding fraction
+of `3.0` for the smaller group. The recipe therefore opts out of the padding
+ratio limit through `max_padding_fraction`; the common packer still validates
+field geometry, strides and block-size limits, and the profiled byte budget
+still bounds capacity. Grouping, packing and allocation are unchanged.
 
 **No round-trip reconciliation.** The pipeline is arranged so that pairs which
 would otherwise need cross-checking cannot differ:
