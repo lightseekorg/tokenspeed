@@ -298,13 +298,13 @@ def test_accepted_state_prompts_can_prefill_and_start_decode(
                 assert _find_forward_op(scheduler.next_execution_plan()) is not None
 
 
-@pytest.mark.parametrize("publish_on_finish", [False, True])
+@pytest.mark.parametrize("finish_after_first_decode", [False, True])
 @pytest.mark.parametrize("decode_width", [1, 3])
 @pytest.mark.parametrize("state_granularity", [1, 2, 4])
 @pytest.mark.parametrize("prompt_tokens", [3, 7, 8])
 @pytest.mark.parametrize("truncate_output", [False, True])
 def test_decode_reuses_only_prefill_state_boundary(
-    publish_on_finish: bool,
+    finish_after_first_decode: bool,
     decode_width: int,
     state_granularity: int,
     prompt_tokens: int,
@@ -341,7 +341,7 @@ def test_decode_reuses_only_prefill_state_boundary(
     _advance_tokens(
         scheduler, "r", list(range(next_token, next_token + visible_tokens))
     )
-    if not publish_on_finish:
+    if not finish_after_first_decode:
         assert _find_forward_op(scheduler.next_execution_plan()) is not None
         _advance_tokens(
             scheduler,

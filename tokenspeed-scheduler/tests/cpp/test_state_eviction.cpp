@@ -236,7 +236,7 @@ TEST_F(StatePublicationSuite, HostStoresOnlyFinalPrefillSnapshotIncludingShortTa
         for (const ExecutionPlan& plan : plans) {
             state_stores += StateStoreCount(plan);
         }
-        EXPECT_EQ(state_stores, 3) << "intermediate state must never be queued for L2";
+        EXPECT_EQ(state_stores, 3) << "ordinary computed Chunks must not be queued for L2";
         EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), length / 4 + 3);
         ASSERT_TRUE(scheduler_->ClearL1Cache());
         auto replay_tokens = request.tokens;
@@ -580,10 +580,9 @@ TEST_F(StatePublicationSuite, IncompletePrefillRetractionPublishesItsComputedSta
     SendForwardDone("partial", {});
     ASSERT_EQ(ResidentBlocks(), 8);
 
-    // The resident owns five blocks. The partial prompt owns two history
-    // pages and its token-8 state; its next chunk needs three more blocks,
-    // exceeding the ten-block pool. Admission fails before publishing that
-    // ordinary Chunk, so retraction must publish it as the recovery Endpoint.
+    // The resident uses five blocks; this prompt uses three and needs three
+    // more. The ten-block pool cannot admit its next chunk, so retraction
+    // publishes the completed token-8 state as a recovery Endpoint.
     const ExecutionPlan retract = PlanOnce();
     ASSERT_EQ(scheduler_->WaitingSize(), 1u);
     const ForwardBatch* resident_decode = FindForwardBatch(retract);

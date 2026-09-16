@@ -87,7 +87,7 @@ void classifyCompletedStateBoundaries(CompletedPages& completed, std::int32_t en
     const std::int32_t endpoint_boundary = endpoint_tokens / prefix_granularity * prefix_granularity;
     if (endpoint_boundary > 0 && std::ranges::find(completed.materialized_state_boundaries, endpoint_boundary) !=
                                      completed.materialized_state_boundaries.end()) {
-        // Preserve the final prefill or recovery checkpoint without upgrading history.
+        // Classify the last aligned prompt or recovery checkpoint without upgrading history.
         completed.state_boundary_kind = CacheBoundaryKind::kEndpoint;
     }
 }

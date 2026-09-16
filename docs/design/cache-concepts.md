@@ -213,34 +213,31 @@ skipped intermediate checkpoints as null holes (`0`). State consumers may gather
 input/output slots; compacting the row or publishing an unwritten intermediate
 checkpoint would break position identity.
 
-Publication requires provenance, not just an allocated block or completed hash.
-The request's cache progress records the aligned checkpoints produced by
-scheduled prefill. Admission, finish and retraction pass these boundaries to the
-coordinator, which publishes only those covered by the newly hashed range.
-A successful admission discards the covered boundaries; a failed admission
-leaves them for retry. Remote endpoint-only landings record only their endpoint
-when aligned, not an internal prefill checkpoint.
+Computed state publication requires an Endpoint or Promoted boundary and
+checkpoint provenance at that exact prefix boundary. Scheduled local prefill
+records its last aligned checkpoint; endpoint-only PD records only an aligned
+final state, not an earlier internal checkpoint. The coordinator publishes
+only recorded boundaries covered by the newly hashed range. A successful
+admission discards those records; a failed one leaves them for retry.
+Allocated slots and completed hashes alone are not proof.
 
-Computed state is published only at Endpoint or Promoted boundaries. Ordinary
-prefill Chunks remain in the request's block table without an index reference;
-normal reclamation frees them after their last working reference is released.
-Prefill's last reusable boundary is classified as Endpoint before publication,
-including when a short final tail follows it.
-
-Decode maintains working state but records and publishes no state checkpoints.
-The first decode admission still publishes the completed prefill boundary from
-`PrefillDone`. History-cache publication and working-state retention use the
-exact `Request::NumComputedTokens()` frontier under every verify width
+Ordinary computed Chunks have no prefix-index reference and do not stream to
+Host. Their working references follow normal block-table reclamation.
+Newly completed prefill boundaries at the prompt's last aligned checkpoint
+are classified as Endpoint, unless already Promoted, including before a short
+final tail. A step with no newly completed hash does not reclassify a boundary.
+`PrefillDone` can publish pending prefill state before decode or PD handoff;
+decode itself records and publishes no state checkpoints. History publication
+and working-state retention use the exact `Request::NumComputedTokens()`
+frontier under every verify width
 ([Scheduler §5](scheduler.md#5-invariants-a-change-must-preserve)).
 
-This is a computed-state publication rule, not an index-wide ban on `kChunk`.
-Host restores use the existing `CacheFullBlocks` registration path and retain
-its boundary kinds. Endpoint, Promoted and restored entries use the ordinary
-capacity eviction policy; there is no separate state cleanup pass or priority.
+Host restores still use `CacheFullBlocks` and may register `kChunk` entries.
+All cached checkpoints remain subject to ordinary capacity eviction; Endpoint
+does not pin storage. Allocation, reservations and transfer fences are unchanged.
 Finish queues existing prefill checkpoints for L2 without upgrading their kind.
-A prefill retraction with L2 may publish its completed boundary as Endpoint for
-recovery before releasing the request. Decode retraction publishes no new state
-and recovers from available prefill cache, recomputing the remaining suffix.
+With L2, prefill retraction may publish a computed recovery Endpoint; decode
+retraction uses available prefill cache and recomputes the suffix.
 
 Snapshot selection and slot addressing are distinct even within this mapping:
 the last internal reusable checkpoint is at

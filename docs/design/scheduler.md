@@ -130,14 +130,17 @@ an off-boundary endpoint is never keyed as a complete prefix.
 produced by admitted prefill windows: local prefill records its last aligned
 boundary, and a remote landing records only an aligned endpoint. Publication
 uses the preceding window's record before the next prefill advances it.
-Only State Endpoint and Promoted boundaries are published; ordinary chunks
-remain request-owned. Admission, finish and retraction publish only recorded
-boundaries covered by the newly hashed range. A successful admission discards the covered records;
-a failed one leaves them for retry.
+Only recorded boundaries within the newly hashed range are eligible. A
+successful admission discards the covered records; a failed one leaves them
+for retry.
 
-Decode records and publishes no state checkpoints. The first decode admission
-still publishes prefill's completed boundary from `PrefillDone`. History
-publication and working-state retention use the exact
+Only materialized State Endpoint/Promoted boundaries are published; ordinary
+Chunks remain request-owned. For newly completed prefix hashes, the last aligned
+prompt checkpoint is an Endpoint unless already Promoted, including before a
+short final tail. A step with no newly completed hashes does not publish or
+upgrade state. Admission from `PrefillDone` can publish pending prefill state
+before local decode or PD handoff; decode itself records and publishes no state
+checkpoints. History publication and working-state retention use the exact
 `Request::NumComputedTokens()` frontier (§5).
 
 One forward means one model dispatch, not one kernel launch. The state backend
@@ -172,14 +175,11 @@ The capacity guarantees are retention-specific:
   The P role and intermediate local chunks reserve no growth block (the next
   sparse re-shaping requires `AvailableTokens() == 0`).
 
-Finish publishes any remaining prefill result and queues existing prefill
-checkpoints for L2; it does not search for a checkpoint to upgrade. With L2,
-retracting a prefill publishes its actually computed boundary as Endpoint using
-the same publication path. Both `Prefilling` and `PrefillDone` take that position
-from their prefill window. Decode retraction creates no new checkpoint. The
-existing writeback queue and transfer guards handle recovery; without L2,
-retraction adds no new publication path. A missing checkpoint means recomputing
-the suffix or the entire request. Recovery itself follows ordinary prefill.
+Finish can publish a pending prefill checkpoint, then queues existing prefill
+cache for L2 without upgrading its kind. With L2, prefill retraction may publish
+a materialized recovery Endpoint at the completed window boundary; `Prefilling`
+and `PrefillDone` both use their actual prefill window. Decode retraction adds
+no state checkpoint. Missing cache is recomputed through ordinary prefill.
 
 ### 1.3 Bounded replay
 
@@ -449,6 +449,10 @@ candidate block there before the remote decode carries it to the peer. The
 growth reserves stay off: no admission headroom (nothing is ever retracted),
 no snapshot-state growth block (the peer banks its own), no overlap protection
 (no local decode is ever in flight).
+
+Preparing the handoff can publish a newly completed prefill boundary. The
+transfer ACK releases request ownership without further publication; cached
+entries remain subject to normal eviction.
 
 **Retraction: none.** A P node's pressure valve is the transfer itself — pages
 are pinned until the peer acknowledges, then released wholesale. Retracting a
