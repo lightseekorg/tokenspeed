@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 
+import math
 import socket
 import sys
 import traceback
@@ -451,6 +452,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
         # process (which has no distributed context).
         from tokenspeed_kernel.ops.communication.iris import (
             IRIS_ALL_REDUCE_KERNEL_CONFIG,
+            _select_staged_all_reduce_path,
             create_iris_state,
         )
 
@@ -556,6 +558,24 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             )
         for shape in _ar_shape_cases():
             _check_all_reduce(state, rank, world_size, shape, device)
+        if state._staged_two_stage_supported:
+            _, use_two_stage = _select_staged_all_reduce_path(
+                numel=1024,
+                world_size=world_size,
+                dtype=torch.bfloat16,
+                two_stage_supported=True,
+            )
+            assert use_two_stage
+            for safe in (False, True):
+                _check_all_reduce_graph_replay(
+                    state,
+                    rank,
+                    world_size,
+                    (1024,),
+                    device,
+                    storage_offset=rank % 2,
+                    safe=safe,
+                )
         if world_size == 4:
             for shape in _ar_graph_shape_cases():
                 _check_all_reduce_graph_replay(
@@ -564,6 +584,8 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
                     world_size,
                     shape,
                     device,
+                    storage_offset=0,
+                    safe=False,
                 )
             if current_platform().is_cdna4:
                 _check_mixed_geometry_graph_replay(
@@ -664,12 +686,25 @@ def _check_all_reduce_graph_replay(
     world_size: int,
     shape,
     device,
+    storage_offset: int,
+    safe: bool,
 ) -> None:
     from tokenspeed_kernel.ops.communication.iris import iris_all_reduce
 
-    local = torch.full(shape, rank + 1, dtype=torch.bfloat16, device=device)
-    result = iris_all_reduce(state, local, safe=False)
+    # Odd ranks can start one BF16 element into storage; retain guard elements.
+    numel = math.prod(shape)
+    storage = torch.full(
+        (numel + storage_offset + 1,), -1, dtype=torch.bfloat16, device=device
+    )
+    local = storage[storage_offset : storage_offset + numel].view(shape)
+    assert local.is_contiguous() and local.data_ptr() % 8 == 2 * storage_offset
+    local.fill_(rank + 1)
+    result = iris_all_reduce(
+        state, local, op=dist.ReduceOp.SUM, safe=safe, async_op=False
+    )
+    assert (result.data_ptr() == local.data_ptr()) == (not safe)
     expected_value = world_size * (world_size + 1) // 2
+    torch.testing.assert_close(local, result, atol=0, rtol=0)
     torch.testing.assert_close(
         result,
         torch.full_like(result, expected_value),
@@ -682,7 +717,10 @@ def _check_all_reduce_graph_replay(
     dist.barrier()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        graph_result = iris_all_reduce(state, local, safe=False)
+        graph_result = iris_all_reduce(
+            state, local, op=dist.ReduceOp.SUM, safe=safe, async_op=False
+        )
+    assert (graph_result.data_ptr() == local.data_ptr()) == (not safe)
 
     for replay_index in range(1, 5):
         scale = replay_index + 1
@@ -691,12 +729,16 @@ def _check_all_reduce_graph_replay(
         dist.barrier()
         graph.replay()
         torch.cuda.synchronize()
+        torch.testing.assert_close(local, graph_result, atol=0, rtol=0)
         torch.testing.assert_close(
             graph_result,
             torch.full_like(graph_result, scale * expected_value),
             atol=0,
             rtol=0,
         )
+    assert storage[-1].item() == -1
+    if storage_offset:
+        assert storage[0].item() == -1
 
 
 def _check_mixed_geometry_graph_replay(
