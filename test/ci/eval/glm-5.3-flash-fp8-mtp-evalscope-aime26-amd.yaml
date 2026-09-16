@@ -43,6 +43,7 @@ server:
     --speculative-num-steps 3
     --speculative-eagle-topk 1
     --speculative-num-draft-tokens 4
+    --grammar-backend xgrammar
   ready:
     url: http://127.0.0.1:8000/readiness
     timeout: 1200

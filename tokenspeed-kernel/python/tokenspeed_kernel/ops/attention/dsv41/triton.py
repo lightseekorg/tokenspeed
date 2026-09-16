@@ -1075,15 +1075,8 @@ def _compressor_pool(
     denominator = old_exp + new_exp
     old_weight = tl.div_rn(old_exp, denominator)
     new_weight = tl.div_rn(new_exp, denominator)
-    # Preserve separate FP32 products/addition before the caller's BF16 cast.
-    pooled = tl.inline_asm_elementwise(
-        "{ .reg .f32 a, b; mul.rn.f32 a, $1, $2; mul.rn.f32 b, $3, $4; add.rn.f32 $0, a, b; }",
-        constraints="=f,f,f,f,f",
-        args=[old_content, old_weight, current, new_weight],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
+    # The launch disables FP fusion so these remain separate FP32 operations.
+    pooled = old_content * old_weight + current * new_weight
     pooled = tl.where(live, pooled, 0.0)
     if HAS_NORM:
         # The released compressor rounds pooled inputs to BF16 before RMSNorm.
