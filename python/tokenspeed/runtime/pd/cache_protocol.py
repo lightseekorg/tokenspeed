@@ -407,6 +407,7 @@ def validate_cache_peer_layout(
             or local_spec.checkpoint_granularity != peer_spec.checkpoint_granularity
             or local_spec.retention != peer_spec.retention
             or local_spec.sliding_window_tokens != peer_spec.sliding_window_tokens
+            or local_spec.replay_window_tokens != peer_spec.replay_window_tokens
             or local_spec.transfer_policy != peer_spec.transfer_policy
         ):
             raise CacheContractError(

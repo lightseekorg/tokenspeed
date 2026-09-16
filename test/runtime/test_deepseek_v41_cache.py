@@ -1155,6 +1155,27 @@ def test_pd_contract_plan_and_manifest():
     assert base_addr == pool.arena.buffer.data_ptr()
     validate_cache_peer_layout(contract, contract)
     assert [spec.group_id for spec in contract.group_specs] == [SWA, R2, R1, TAIL]
+    # The replayable groups keep their replay declaration under PD (a peer
+    # that cached them would disagree on what a hit means) and travel as
+    # ordinary sliding windows: the whole retained tail ships, so the replay
+    # regenerates exactly that window and nothing is re-fed on the decode
+    # side.
+    specs_by_id = {spec.group_id: spec for spec in contract.group_specs}
+    for gid in (SWA, TAIL):
+        assert (
+            specs_by_id[gid].replay_window_tokens
+            == specs_by_id[gid].sliding_window_tokens
+        )
+    assert all(spec.transfer_policy == "full_suffix" for spec in contract.group_specs)
+    cached_peer = replace(
+        contract,
+        group_specs=tuple(
+            replace(spec, replay_window_tokens=None) if spec.group_id == SWA else spec
+            for spec in contract.group_specs
+        ),
+    )
+    with pytest.raises(Exception, match="semantics"):
+        validate_cache_peer_layout(contract, cached_peer)
     assert {f.field_id for f in contract.fields_for_group(SWA)} == {
         f"layer.{i}.swa" for i in range(40)
     }

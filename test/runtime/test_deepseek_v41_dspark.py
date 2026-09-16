@@ -52,6 +52,10 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.layers.attention import registry as attention_registry
+from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
+    V41DecoderView,
+    V41PrefillSpan,
+)
 from tokenspeed.runtime.layers.linear import LinearBase
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.models.deepseek_v41 import (
@@ -397,15 +401,17 @@ def _assert_drafter_run_writes_rows_and_drafts(adapter, windows, pool):
         logits_processor=SimpleNamespace(tp_group=adapter.mapping.attn.tp_group),
     )
     drafter.wire_target(target)
-    # One extend row of 3 tokens at positions 200..202 and one decode row whose
-    # verify window covers positions 300..305 with 4 accepted tokens.
+    # One extend request of 5 tokens at positions 198..202 whose CED decoder
+    # kept its last 3 rows (200..202), and one decode row whose verify window
+    # covers positions 300..305 with 4 accepted tokens. The taps -- and the
+    # rows the drafter writes -- follow the decoder view, not the raw extend.
     extend_positions = torch.arange(200, 203, device="cuda:0")
     decode_positions = torch.arange(300, 306, device="cuda:0")
     metas = {
         ForwardMode.EXTEND: SimpleNamespace(
-            positions=extend_positions,
-            swa_write_slots=_paged_slots(extend_positions, 64),
-            request_indices=torch.zeros(3, dtype=torch.int64, device="cuda:0"),
+            positions=torch.arange(198, 203, device="cuda:0"),
+            swa_write_slots=_paged_slots(torch.arange(198, 203, device="cuda:0"), 64),
+            request_indices=torch.zeros(5, dtype=torch.int64, device="cuda:0"),
         ),
         ForwardMode.DECODE: SimpleNamespace(
             positions=decode_positions,
@@ -413,6 +419,25 @@ def _assert_drafter_run_writes_rows_and_drafts(adapter, windows, pool):
             request_indices=torch.ones(6, dtype=torch.int64, device="cuda:0"),
         ),
     }
+    kept = SimpleNamespace(
+        positions=extend_positions,
+        swa_write_slots=_paged_slots(extend_positions, 64),
+        request_indices=torch.zeros(3, dtype=torch.int64, device="cuda:0"),
+    )
+    view_positions = torch.cat((extend_positions, decode_positions))
+    view = V41DecoderView(
+        SimpleNamespace(
+            positions=view_positions,
+            swa_write_slots=_paged_slots(view_positions, 64),
+            request_indices=torch.cat(
+                (kept.request_indices, metas[ForwardMode.DECODE].request_indices)
+            ),
+        ),
+        kept,
+        (V41PrefillSpan(0, 0, 200, 3, 200),),
+        torch.tensor([2, 3, 4, 5, 6, 7, 8, 9, 10], device="cuda:0"),
+        torch.tensor([2, 3, 4, 5, 6, 7, 8], device="cuda:0"),
+    )
     seen = {"groups": set()}
 
     def window_slots(group_id, start_pos, request_indices):
@@ -422,9 +447,11 @@ def _assert_drafter_run_writes_rows_and_drafts(adapter, windows, pool):
         return _history_slots(start_pos, 128, 64), None
 
     backend = SimpleNamespace(
-        query_metadata=lambda mode: metas[mode], window_slots=window_slots
+        query_metadata=lambda mode: metas[mode],
+        decoder_view=lambda: view,
+        window_slots=window_slots,
     )
-    ib.extend_seq_lens_cpu[:1] = 3
+    ib.extend_seq_lens_cpu[:1] = 5
     ctx = _ctx(None, 3 + width, ForwardMode.MIXED)
     ctx.bs, ctx.num_extends = 2, 1
     ctx.attn_backend, ctx.token_to_kv_pool = backend, pool
@@ -448,6 +475,8 @@ def _assert_drafter_run_writes_rows_and_drafts(adapter, windows, pool):
     assert seen["start_pos"].tolist() == [303]
     assert seen["requests"].tolist() == [1]
     assert seen["groups"] == {"v41.swa"}
+    # Exactly the kept extend rows and the verify rows were written; the two
+    # extend rows the decoder dropped (198, 199) were never captured.
     written = torch.cat((extend_positions, decode_positions))
     slots = _paged_slots(written, 64)
     assert windows[:, 0].count_nonzero() == 0
@@ -455,6 +484,8 @@ def _assert_drafter_run_writes_rows_and_drafts(adapter, windows, pool):
     assert (
         windows.count_nonzero() == windows[:, slots // 64, slots % 64].count_nonzero()
     )
+    dropped = _paged_slots(torch.arange(198, 200, device="cuda:0"), 64)
+    assert windows[:, dropped // 64, dropped % 64].count_nonzero() == 0
 
 
 @pytest.mark.parametrize("checkpoint_source", ["temporary", "reference"])

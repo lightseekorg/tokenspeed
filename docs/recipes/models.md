@@ -995,7 +995,10 @@ SWA keys from the replay start only, the truncation the model is trained
 for; the cached global KV is never recomputed from them.
 `usage.prompt_tokens_details.cached_tokens` reports the hit through the end
 of the replayed window, so it stays a multiple of the prefix granularity.
-Prefill/decode disaggregation is not implemented for V4.1.
+Under prefill/decode disaggregation the prefill node replays on its own
+prefix hits exactly as above and ships each group's retained tail; the
+decode node lands the tail and never re-feeds. Even on one machine, let
+Mooncake pick an RDMA transport rather than forcing the intra-node NVLink one.
 
 ## Tuning Order
 

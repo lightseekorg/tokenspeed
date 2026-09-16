@@ -717,9 +717,15 @@ group the draft bound is one the target's own layers share — a target without
 a full-history group has nothing for a block drafter to borrow. DeepSeek
 V4.1's same-checkpoint DSpark has no draft attention layers of its own; its
 per-stage context rows are extra fields of the target's SWA group on the last
-target layer, addressed by the target's SWA slots, so they are cached,
-transferred and evicted together with the SWA rows and the draft's 128-row
-window fits inside that group's retention.
+target layer, addressed by the target's SWA slots, so they are transferred
+and evicted together with the SWA rows and the draft's 128-row window fits
+inside that group's retention. The SWA group is replayable, so a prefix hit
+regenerates them with it: the drafter writes one row per row of the target's
+`decoder_view()` — each prompt's kept tail, then the decode rows — which is
+also the layout of the taps it reads, and the kept tail is exactly the
+window the first decode consumes. Under PD the retained tail of the SWA group
+ships to the decode node like any sliding window, draft rows included, and
+the decode node re-feeds nothing.
 
 Capacity has exactly two shapes, both on the base class. The default is the
 flat product (`parents × tightest packing × P`). Families whose per-group
