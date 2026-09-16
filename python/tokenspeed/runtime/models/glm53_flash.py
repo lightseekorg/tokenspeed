@@ -51,10 +51,12 @@ from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
+    current_forward_ctx,
     current_valid_rows,
 )
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
 from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
     HybridLinearAttnBackend,
 )
@@ -850,12 +852,13 @@ class Glm53FlashIndexer(GlmDsaIndexer):
             else None
         )
 
-    def forward(
+    def project(
         self,
         hidden_states: torch.Tensor,
         q_lora: torch.Tensor,
         positions: torch.Tensor,
-    ) -> Glm53FlashIndexerOutput:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project the unrotated indexer queries, normalized keys and head weights."""
         query = self.wq_b(q_lora)[0].view(-1, self.index_n_heads, self.index_head_dim)
         if self._wk_weights_proj_loaded:
             key_weights = self.wk_weights_proj(hidden_states)[0]
@@ -882,16 +885,17 @@ class Glm53FlashIndexer(GlmDsaIndexer):
             )
             query = torch.cat((query_pe, query_nope), dim=-1)
             key = torch.cat((key_pe.squeeze(1), key_nope), dim=-1)
-        query = hadamard_transform(
+        return query, key, weights
+
+    def compress_gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project the per-channel KPool compression scores."""
+        return F.linear(hidden_states, self.index_kpool_compress_gate)
+
+    def rotate_query(self, query: torch.Tensor) -> torch.Tensor:
+        """Apply the Hadamard rotation that matches the compressed index keys."""
+        return hadamard_transform(
             query.contiguous(),
             scale=self.index_head_dim**-0.5,
-        )
-        gate = F.linear(hidden_states, self.index_kpool_compress_gate)
-        return Glm53FlashIndexerOutput(
-            query=query,
-            key=key,
-            weights=weights,
-            gate=gate,
         )
 
 
@@ -947,6 +951,7 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
                 prefix=add_prefix("indexer", prefix),
             )
         )
+        self.stream_fork = StreamFork(alt_stream)
         self._decode_topk_indices_buffer: torch.Tensor | None = None
         self._decode_topk_lens_buffer: torch.Tensor | None = None
         self._absorbed_kv_b_version = -1
@@ -1063,32 +1068,59 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
         )
         if should_compute_indexer:
             hidden_states = comm_manager.pre_attn_comm(hidden_states, ctx)
-            indexer_output = self.indexer(hidden_states, q_norm, positions)
-            if num_prefill_tokens > 0:
-                kpool_runtime.write_prefill(
-                    key=indexer_output.key,
-                    gate=indexer_output.gate,
-                    compress_ape=self.indexer.index_kpool_compress_ape,
-                    ctx=ctx,
-                    backend=dsa_backend,
-                    layer_id=self.attn_mqa.layer_id,
-                )
-            if num_decode_tokens > 0:
-                kpool_runtime.write_decode(
-                    key=indexer_output.key[decode_start:decode_end],
-                    gate=indexer_output.gate[decode_start:decode_end],
-                    compress_ape=self.indexer.index_kpool_compress_ape,
-                    ctx=ctx,
-                    backend=dsa_backend,
-                    layer_id=self.attn_mqa.layer_id,
-                    num_reqs=decode_window.num_reqs,
-                    q_len_per_req=decode_window.q_len_per_req,
-                )
+            query, key, weights = self.indexer.project(hidden_states, q_norm, positions)
+            prepared_query = None
+            # The pooled-cache writes depend only on key and gate, the query
+            # side of the top-k only on query and weights: on an eager prefill
+            # the writes run on the auxiliary stream while the Hadamard rotation
+            # and the top-k's query preparation run on the current stream, and
+            # the join precedes the selection that reads the new pools.
+            with self.stream_fork.scope(
+                enable=self._can_overlap_prefill(num_prefill_tokens)
+            ):
+                with self.stream_fork.branch():
+                    gate = self.indexer.compress_gate(hidden_states)
+                    if num_prefill_tokens > 0:
+                        kpool_runtime.write_prefill(
+                            key=key,
+                            gate=gate,
+                            compress_ape=self.indexer.index_kpool_compress_ape,
+                            ctx=ctx,
+                            backend=dsa_backend,
+                            layer_id=self.attn_mqa.layer_id,
+                        )
+                    if num_decode_tokens > 0:
+                        kpool_runtime.write_decode(
+                            key=key[decode_start:decode_end],
+                            gate=gate[decode_start:decode_end],
+                            compress_ape=self.indexer.index_kpool_compress_ape,
+                            ctx=ctx,
+                            backend=dsa_backend,
+                            layer_id=self.attn_mqa.layer_id,
+                            num_reqs=decode_window.num_reqs,
+                            q_len_per_req=decode_window.q_len_per_req,
+                        )
+                query = self.indexer.rotate_query(query)
+                if num_prefill_tokens > 0:
+                    prepared_query = kpool_runtime.prepare_prefill_query(
+                        query=query,
+                        weights=weights,
+                        softmax_scale=self.indexer.weights_softmax_scale,
+                        ctx=ctx,
+                        layer_id=self.attn_mqa.layer_id,
+                    )
+            indexer_output = Glm53FlashIndexerOutput(
+                query=query,
+                key=key,
+                weights=weights,
+                gate=gate,
+            )
             if ctx.num_extends > 0:
                 shared_topk.prefill = self._compute_prefill_topk_indices(
                     indexer_output,
                     ctx,
                     num_prefill_tokens,
+                    prepared_query,
                 )
             if ctx.num_extends < ctx.bs:
                 shared_topk.decode = self._compute_decode_topk_indices(
@@ -1164,6 +1196,17 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def _can_overlap_prefill(self, num_prefill_tokens: int) -> bool:
+        """Overlap only on eager prefills: never inside a decode-graph capture
+        or a breakable prefill-graph capture/replay, whose segments own the
+        stream the break runs on."""
+        return (
+            self.alt_stream is not None
+            and num_prefill_tokens > 0
+            and not get_is_capture_mode()
+            and current_forward_ctx() is None
+        )
+
     def _compute_decode_topk_indices_portable(
         self,
         *,
@@ -1215,11 +1258,13 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
         indexer_output: Glm53FlashIndexerOutput,
         ctx: ForwardContext,
         num_prefill_tokens: int,
+        prepared_query: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> GlmDsaPrefillTopK | None:
         selected = ctx.attn_backend.require_kpool_runtime().select_prefill(
             query=indexer_output.query,
             weights=indexer_output.weights,
             softmax_scale=self.indexer.weights_softmax_scale,
+            prepared_query=prepared_query,
             ctx=ctx,
             backend=ctx.attn_backend,
             layer_id=self.attn_mqa.layer_id,
