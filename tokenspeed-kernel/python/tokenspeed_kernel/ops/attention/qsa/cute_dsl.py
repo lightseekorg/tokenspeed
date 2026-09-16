@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CuTe DSL registration for the B200 QSA sparse-attention specialization."""
+"""CuTe DSL registration for the B200/B300 QSA sparse-attention specialization."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
     current_platform,
+    pdl_enabled,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -55,7 +56,7 @@ def cute_dsl_blackwell_qsa_sparse_attention(
     k_scale: float | torch.Tensor | None,
     v_scale: float | torch.Tensor | None,
 ) -> torch.Tensor:
-    """Run the adaptive workspace-free B200 QSA specialization.
+    """Run the adaptive workspace-free B200/B300 QSA specialization.
 
     Args:
         q: BF16 query tensor shaped ``[tokens, query_heads, 256]``, with 6,
@@ -102,6 +103,7 @@ def cute_dsl_blackwell_qsa_sparse_attention(
         max_seqlen_q=max_seqlen_q,
         k_scale=k_scale,
         v_scale=v_scale,
+        enable_pdl=pdl_enabled(),
     )
 
 
@@ -113,7 +115,7 @@ if _IS_NVIDIA_BLACKWELL:
         solution="cute_dsl",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset(
@@ -131,6 +133,7 @@ if _IS_NVIDIA_BLACKWELL:
             }
         ),
         traits={
+            "is_decode": frozenset({True}),
             "head_dim": frozenset({_HEAD_DIM}),
             "value_head_dim": frozenset({_HEAD_DIM}),
             "num_q_heads": frozenset({6, 12, 24}),
