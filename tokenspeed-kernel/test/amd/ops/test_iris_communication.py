@@ -695,17 +695,39 @@ def _check_all_reduce_unaligned_output(
         storage = torch.empty(numel, dtype=torch.bfloat16, device=device)
         local = storage
         assert local.data_ptr() % IRIS_ALL_REDUCE_KERNEL_CONFIG.packed_word_bytes == 0
-    local.fill_(rank + 1)
-
-    result = iris_all_reduce(state, local)
-
     expected_value = world_size * (world_size + 1) // 2
-    torch.testing.assert_close(
-        result,
-        torch.full_like(result, expected_value),
-        atol=0,
-        rtol=0,
-    )
+    for safe in (False, True):
+        local.fill_(rank + 1)
+        result = iris_all_reduce(
+            state, local, op=dist.ReduceOp.SUM, safe=safe, async_op=False
+        )
+        assert (result.data_ptr() == local.data_ptr()) == (not safe)
+        for output in (local, result):
+            torch.testing.assert_close(
+                output,
+                torch.full_like(output, expected_value),
+                atol=0,
+                rtol=0,
+            )
+
+    local.fill_(rank + 1)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_result = iris_all_reduce(
+            state, local, op=dist.ReduceOp.SUM, safe=False, async_op=False
+        )
+    assert graph_result.data_ptr() == local.data_ptr()
+    for scale in range(2, 6):
+        local.fill_(scale * (rank + 1))
+        graph.replay()
+        torch.testing.assert_close(
+            local,
+            torch.full_like(local, scale * expected_value),
+            atol=0,
+            rtol=0,
+        )
     if rank % 2:
         torch.testing.assert_close(
             storage[0],
