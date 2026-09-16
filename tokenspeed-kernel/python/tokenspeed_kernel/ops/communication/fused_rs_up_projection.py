@@ -30,11 +30,11 @@ import torch.distributed as dist
 from tokenspeed_kernel.ops.communication.fused_rs_up_projection_config import (
     fused_rs_up_projection_config,
 )
+from tokenspeed_kernel.ops.communication.fused_rs_workspace import _vote
 from tokenspeed_kernel.ops.communication.mnnvl_cutedsl_fused_rs_up_projection import (
     BoundFusedRsUpProjection,
     FusedRsUpProjectionTuning,
 )
-from tokenspeed_kernel.ops.communication.mnnvl_cutedsl_shared_rs import _vote
 from tokenspeed_kernel.ops.communication.mnnvl_fused_rs_cluster_cap import (
     BoundFusedRsClusterCap,
     FusedRsClusterCapTuning,

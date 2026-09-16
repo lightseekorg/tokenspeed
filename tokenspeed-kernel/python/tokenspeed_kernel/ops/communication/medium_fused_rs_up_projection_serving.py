@@ -25,15 +25,15 @@ from tokenspeed_kernel.ops.communication.cutedsl_fused_rs_up_projection import (
     FusedRsUpProjectionServing,
     _PreparedLaunch,
 )
+from tokenspeed_kernel.ops.communication.fused_rs_workspace import (
+    SharedRsWorkspace,
+)
 from tokenspeed_kernel.ops.communication.medium_fused_rs_up_projection import (
     prepare_medium_fused_rs_up_projection,
 )
 from tokenspeed_kernel.ops.communication.medium_fused_rs_up_projection_serving_config import (
     integrated_fused_rs_serving_config,
     medium_fused_rs_serving_config,
-)
-from tokenspeed_kernel.ops.communication.mnnvl_cutedsl_shared_rs import (
-    SharedRsWorkspace,
 )
 from tokenspeed_kernel.ops.communication.mnnvl_cutedsl_symmetric_up_projection import (
     SymmetricUpProjectionOutput,

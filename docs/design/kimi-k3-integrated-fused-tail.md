@@ -138,6 +138,14 @@ Bindings live under `tokenspeed-kernel/python/tokenspeed_kernel/ops/communicatio
 fused device code is in `thirdparty/cute_dsl/symmetric_up_projection/` within
 that package. Runtime uses only the `tokenspeed-kernel` boundary.
 
+`ops/communication/fused_rs_workspace.py` owns the symmetric shared input,
+retained shard-layout metadata and allocation-time rank checks. Serving bindings
+and fused correctness tests share that workspace. The standalone CuTeDSL shared
+RS and Triton hidden-dimension RS kernels, their launch/staging APIs and the
+standalone RS tuning sweep are removed. Shared reduction remains inside the
+fused GEMM; its entry/exit barriers, proxy-alias fences, allocation sizes and
+M dispatch are unchanged. Existing generic Triton collectives remain available.
+
 The native H3584 HT specialization vendors FlashInfer's
 `flashinfer/comm/mnnvl_cutedsl/kernel_ht/device_kernel.py` from v0.6.18,
 commit `69ff11fc4954396d98326656dc85debd2223f637`, under its original Apache-2.0

@@ -24,7 +24,7 @@ from dataclasses import dataclass, replace
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.communication.mnnvl_cutedsl_shared_rs import (
+from tokenspeed_kernel.ops.communication.fused_rs_workspace import (
     SharedRsWorkspace,
 )
 from tokenspeed_kernel.ops.communication.mnnvl_cutedsl_symmetric_up_projection import (

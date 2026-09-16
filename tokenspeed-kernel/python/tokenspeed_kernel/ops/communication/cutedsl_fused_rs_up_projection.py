@@ -36,7 +36,7 @@ from tokenspeed_kernel.ops.communication.fused_rs_up_projection import (
 from tokenspeed_kernel.ops.communication.fused_rs_up_projection_config import (
     fused_rs_up_projection_config,
 )
-from tokenspeed_kernel.ops.communication.mnnvl_cutedsl_shared_rs import (
+from tokenspeed_kernel.ops.communication.fused_rs_workspace import (
     SharedRsWorkspace,
     _vote,
 )

@@ -39,16 +39,16 @@ import torch
 import torch.distributed as dist
 from fused_rs_up_ag_reference import equal_outputs, reference_errors
 from test_fused_rs_up_projection_serving import check_all_ranks
+from tokenspeed_kernel.ops.communication.fused_rs_workspace import (
+    SharedRsWorkspace,
+    _vote,
+)
 from tokenspeed_kernel.ops.communication.medium_fused_rs_up_projection_serving import (
     MediumFusedRsUpProjectionServing,
 )
 from tokenspeed_kernel.ops.communication.medium_fused_rs_up_projection_serving_config import (
     MEDIUM_FUSED_RS_SERVING_CANDIDATE_TOKENS,
     medium_fused_rs_serving_config,
-)
-from tokenspeed_kernel.ops.communication.mnnvl_cutedsl_shared_rs import (
-    SharedRsWorkspace,
-    _vote,
 )
 from tokenspeed_kernel.ops.communication.mnnvl_cutedsl_symmetric_up_projection import (
     allocate_symmetric_up_projection_output,
