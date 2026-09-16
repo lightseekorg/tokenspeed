@@ -21,7 +21,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 
+import torch
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import (
     KernelRegistry,
@@ -90,9 +92,16 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="Replace an existing complete output bundle",
     )
+    parser.add_argument(
+        "--device",
+        type=int,
+        help="CUDA device index used to generate a warmup bundle",
+    )
     args = parser.parse_args(argv)
-    if args.config is None and (args.output_dir is not None or args.force):
-        parser.error("--output-dir and --force require --config")
+    if args.config is None and (
+        args.output_dir is not None or args.force or args.device is not None
+    ):
+        parser.error("--output-dir, --force, and --device require --config")
     if args.config is not None and args.output_dir is None:
         parser.error("--config requires --output-dir")
 
@@ -108,6 +117,23 @@ def main(argv: list[str]) -> int:
             parser.error(str(error))
         print(loaded.source, end="" if loaded.source.endswith("\n") else "\n")
         return 0
+
+    generation_config = None
+    if args.config is not None:
+        try:
+            generation_config = load_config(args.config)
+        except (TypeError, ValueError) as error:
+            parser.error(str(error))
+        device = args.device
+        if device is None:
+            local_rank = os.environ.get("LOCAL_RANK")
+            if local_rank is None:
+                parser.error("--config requires --device or LOCAL_RANK")
+            try:
+                device = int(local_rank)
+            except ValueError:
+                parser.error(f"LOCAL_RANK must be an integer, got {local_rank!r}")
+        torch.cuda.set_device(device)
 
     load_builtin_kernels()
     registry = KernelRegistry.get()
@@ -126,13 +152,9 @@ def main(argv: list[str]) -> int:
         print(f"{loaded.profile.id}: valid")
         return 0
 
-    if args.config is not None:
-        try:
-            loaded = load_config(args.config)
-        except (TypeError, ValueError) as error:
-            parser.error(str(error))
+    if generation_config is not None:
         output = generate_bundle(
-            loaded=loaded,
+            loaded=generation_config,
             output_dir=args.output_dir,
             force=args.force,
             platform=current_platform(),
