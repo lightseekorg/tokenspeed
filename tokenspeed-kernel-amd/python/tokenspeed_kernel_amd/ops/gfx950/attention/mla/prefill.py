@@ -42,8 +42,9 @@ async_copy = cdna4.async_copy
 
 @gluon_builtin
 def _mfma_unscaled_fp8(a, b, acc, *, _semantic):
-    # Keep scales absent in IR. mfma_scaled materializes unit-scale tensors,
-    # preventing LLVM from selecting the unscaled K64 instruction.
+    # Absent scales emit the unscaled v_mfma_f32_32x32x64_f8f6f4 instruction.
+    # mfma_scaled materializes unit-scale tensors, retaining the scaled opcode;
+    # ordinary mfma does not expose this K64 instruction.
     fmt = "e4m3" if a.dtype == gl.float8e4nv else "e5m2"
     output = _semantic.dot_scaled(
         a,
@@ -626,7 +627,7 @@ def _fp8_rescale_output_pack(*args):
 
 
 @gluon.jit
-def _fp8_pipeline_phase(
+def _fp8_overlap_qk_and_previous_pv(
     program,
     q,
     q_pe,
@@ -645,6 +646,7 @@ def _fp8_pipeline_phase(
     CUR: gl.constexpr,
 ):
     cfg = program.cfg
+    # Overlap this tile's QK with the previous tile's softmax and PV.
     # V(t) is the most recent commit group; this phase consumes K(t) and V(t-1).
     # Leave V(t) in flight until the next phase, which waits for all older groups.
     async_copy.wait_group(1)
@@ -783,7 +785,7 @@ def process_query_block_fp8(program, k_smem, k_pe_smem, v_smem):
         # Static key-buffer indices remove their ping/pong address calculations.
         t = 1
         while t + 1 < count:
-            shifted, m, l, acc0, acc1 = _fp8_pipeline_phase(
+            shifted, m, l, acc0, acc1 = _fp8_overlap_qk_and_previous_pv(
                 program,
                 q,
                 q_pe,
@@ -801,7 +803,7 @@ def process_query_block_fp8(program, k_smem, k_pe_smem, v_smem):
                 causal_row,
                 1,
             )
-            shifted, m, l, acc0, acc1 = _fp8_pipeline_phase(
+            shifted, m, l, acc0, acc1 = _fp8_overlap_qk_and_previous_pv(
                 program,
                 q,
                 q_pe,
@@ -821,7 +823,7 @@ def process_query_block_fp8(program, k_smem, k_pe_smem, v_smem):
             )
             t += 2
         if t < count:
-            shifted, m, l, acc0, acc1 = _fp8_pipeline_phase(
+            shifted, m, l, acc0, acc1 = _fp8_overlap_qk_and_previous_pv(
                 program,
                 q,
                 q_pe,
