@@ -73,6 +73,9 @@ def get_drafter_impl(spec_algo: str, model: torch.nn.Module) -> type[BaseDrafter
         from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import (
             DeepseekV4DSpark,
         )
+        from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (
+            DeepseekV41DSpark,
+        )
         from tokenspeed.runtime.models.deepseek_v4_dspark import (
             DeepseekV4ForCausalLMDSpark,
         )
@@ -80,9 +83,9 @@ def get_drafter_impl(spec_algo: str, model: torch.nn.Module) -> type[BaseDrafter
             DeepseekV41ForCausalLMDSpark,
         )
 
-        if isinstance(
-            model, (DeepseekV4ForCausalLMDSpark, DeepseekV41ForCausalLMDSpark)
-        ):
+        if isinstance(model, DeepseekV41ForCausalLMDSpark):
+            return DeepseekV41DSpark
+        if isinstance(model, DeepseekV4ForCausalLMDSpark):
             return DeepseekV4DSpark
     if spec_algo == "MTP" and isinstance(model, InklingForConditionalGenerationNextN):
         from tokenspeed.runtime.execution.drafter.mtp import Mtp

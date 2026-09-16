@@ -335,39 +335,44 @@ def resolve_dspark_prefix_replay_tokens(
     """Resolve the prompt tail needed to rebuild DSpark runtime state.
 
     DeepSeek V4 DSpark advertises the requirement through its draft
-    ``ModelConfig``. Same-checkpoint DSpark configurations without that
-    capability remain fail-closed. External generic DSpark configurations keep
-    their existing scheduler behavior until they advertise an equivalent
-    contract.
+    ``ModelConfig``; V4.1 advertises zero because its windows are cache
+    resident. Same-checkpoint DSpark configurations without that capability
+    remain fail-closed. External generic DSpark configurations keep their
+    existing scheduler behavior until they advertise an equivalent contract.
     """
 
-    if not enable_prefix_caching or speculative_algorithm != "DSPARK":
+    if speculative_algorithm != "DSPARK":
         return 0
     if draft_model_config is None:
-        raise ValueError(
-            "DSPARK prefix caching requires a resolved draft model configuration."
-        )
+        raise ValueError("DSPARK requires a resolved draft model configuration.")
 
     replay_tokens = getattr(draft_model_config, "dspark_prefix_replay_tokens", None)
     if replay_tokens is None:
         if draft_model_path_use_base:
             raise ValueError(
-                "DSPARK same-checkpoint prefix caching requires a draft model "
-                "that advertises captured-context replay support."
+                "DSPARK same-checkpoint decoding requires a draft model that "
+                "advertises captured-context replay support."
             )
         return 0
 
     replay_tokens = int(replay_tokens)
-    if not 0 < replay_tokens <= (1 << 31) - 1:
+    if not 0 <= replay_tokens <= (1 << 31) - 1:
         raise ValueError(
-            "DSPARK captured-context replay requirement must fit a positive int32; "
-            f"got {replay_tokens}."
+            "DSPARK captured-context replay requirement must fit a non-negative "
+            f"int32; got {replay_tokens}."
         )
+    if replay_tokens == 0:
+        # The draft's context lives in the KV cache and follows the prefix.
+        return 0
+    # A drafter-private context cannot be restored from the host tier, with or
+    # without prefix reuse.
     if enable_kvstore:
         raise ValueError(
             "DSPARK captured-context replay does not support KVStore; "
             "use --disable-kvstore."
         )
+    if not enable_prefix_caching:
+        return 0
     if disaggregation_mode != "null":
         raise ValueError(
             "DSPARK captured-context replay does not support disaggregated "

@@ -2525,47 +2525,23 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(server_args.enable_prefix_caching)
         self.assertTrue(server_args.draft_model_path_use_base)
 
-    def test_dspark_same_checkpoint_rejects_kvstore(self):
-        with self.assertRaisesRegex(
-            ValueError,
-            "does not support KVStore",
-        ):
-            ServerArgs(
-                model="unused",
-                speculative_config=json.dumps(
-                    {"method": "dspark", "num_speculative_tokens": 5}
-                ),
-            )
-
-    def test_dspark_explicit_same_checkpoint_rejects_kvstore(self):
-        with self.assertRaisesRegex(ValueError, "does not support KVStore"):
-            ServerArgs(
-                model="same-checkpoint",
-                speculative_config=json.dumps(
-                    {
-                        "method": "dspark",
-                        "model": "same-checkpoint",
-                        "num_speculative_tokens": 5,
-                    }
-                ),
-            )
-
-    def test_dspark_explicit_redirected_same_checkpoint_rejects_kvstore(self):
-        with (
-            patch(
-                "tokenspeed.runtime.utils.server_args.maybe_model_redirect",
-                side_effect=lambda model: (
-                    "resolved-checkpoint" if model == "model-alias" else model
-                ),
+    def test_dspark_same_checkpoint_keeps_kvstore_default(self):
+        # Whether same-checkpoint DSpark can use KVStore depends on where the
+        # draft keeps its windows, which only the resolved draft config knows;
+        # argument parsing no longer pre-empts that decision.
+        server_args = ServerArgs(
+            model="same-checkpoint",
+            speculative_config=json.dumps(
+                {
+                    "method": "dspark",
+                    "model": "same-checkpoint",
+                    "num_speculative_tokens": 5,
+                }
             ),
-            self.assertRaisesRegex(ValueError, "does not support KVStore"),
-        ):
-            ServerArgs(
-                model="model-alias",
-                speculative_algorithm="DSPARK",
-                speculative_draft_model_path="model-alias",
-                speculative_num_steps=5,
-            )
+        )
+
+        self.assertTrue(server_args.enable_kvstore)
+        self.assertTrue(server_args.draft_model_path_use_base)
 
     def test_dspark_explicit_external_checkpoint_preserves_cache_behavior(self):
         server_args = ServerArgs(
@@ -2589,17 +2565,6 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertTrue(server_args.enable_kvstore)
         self.assertFalse(server_args.enable_prefix_caching)
-
-    def test_dspark_same_checkpoint_decode_still_rejects_kvstore(self):
-        with self.assertRaisesRegex(ValueError, "does not support KVStore"):
-            ServerArgs(
-                model="same-checkpoint",
-                enable_prefix_caching=False,
-                disaggregation_mode="decode",
-                speculative_algorithm="DSPARK",
-                speculative_draft_model_path="same-checkpoint",
-                speculative_num_steps=5,
-            )
 
     def test_dspark_external_decode_preserves_generic_cache_behavior(self):
         server_args = ServerArgs(

@@ -67,19 +67,45 @@ def _quantized_kv(x: torch.Tensor) -> torch.Tensor:
     return values.flatten(-2).reshape_as(x).to(x.dtype)
 
 
-class _WindowAttention:
-    """Borrow one stage's per-forward window; no state survives on the model."""
+def _window_rows(window: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+    """Gather ``[..., head_dim]`` rows of a paged window field by SWA slots.
 
-    def __init__(self, positions, windows, slots, start_positions, block_size):
+    Negative slots resolve to the null page's first row; callers mask them.
+    """
+    rows_per_page = window.shape[1]
+    slots = slots.clamp_min(0).long()
+    return window[slots // rows_per_page, slots % rows_per_page]
+
+
+def _write_window_rows(
+    window: torch.Tensor, slots: torch.Tensor, values: torch.Tensor
+) -> None:
+    """Scatter rows into a paged window field, leaving invalid slots untouched.
+
+    Negative slots (padding rows, nonresident positions) resolve to the null
+    page, which the cache contract keeps zero; those rows write back the bytes
+    already there, so the write stays graph-safe without a data-dependent
+    branch and the sentinel page keeps its contents.
+    """
+    rows_per_page = window.shape[1]
+    valid = (slots >= 0).unsqueeze(-1)
+    slots = slots.clamp_min(0).long()
+    page, row = slots // rows_per_page, slots % rows_per_page
+    window[page, row] = torch.where(valid, values.to(window.dtype), window[page, row])
+
+
+class _WindowAttention:
+    """Borrow one stage's LCM window pages for one forward; no state survives."""
+
+    def __init__(self, positions, window, history_slots, block_size):
         self.meta = SimpleNamespace(
             positions=positions,
             request_indices=torch.arange(
-                slots.numel(), device=slots.device
+                history_slots.shape[0], device=history_slots.device
             ).repeat_interleave(block_size),
         )
-        self.windows = windows
-        self.slots = slots
-        self.start_positions = start_positions
+        self.window = window
+        self.history_slots = history_slots
         self.block_size = block_size
 
     def query_metadata(self, mode):
@@ -103,8 +129,8 @@ class _WindowAttention:
     ):
         if index_q is not None or index_weights is not None:
             raise ValueError("DSpark window attention has no indexer")
-        batch, block = self.slots.numel(), self.block_size
-        history = self.windows.index_select(0, self.slots)
+        batch, block = self.history_slots.shape[0], self.block_size
+        history = _window_rows(self.window, self.history_slots)
         if swa_rope_cache is not None:
             swa = rope_inplace(swa.clone(), positions, swa_rope_cache, None)
         kv = torch.cat((history, _quantized_kv(swa).reshape(batch, block, -1)), dim=1)
@@ -112,10 +138,7 @@ class _WindowAttention:
         # ponytail: the draft attends only 128+5 rows; fuse after parity is pinned.
         scores = torch.einsum("bqhd,bkd->bhqk", queries.float(), kv.float())
         scores *= softmax_scale
-        window = history.shape[1]
-        visible = torch.arange(window, device=q.device)[None, :] < (
-            self.start_positions[:, None] + 1
-        )
+        visible = self.history_slots >= 0
         valid = torch.cat((visible, visible.new_ones((batch, block))), dim=1)
         scores.masked_fill_(~valid[:, None, None, :], -torch.inf)
         sink = attn_sink[None, :, None, None].expand(batch, -1, block, 1)
@@ -234,30 +257,34 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
             attention.rotary_emb(_norm(kv, attention.kv_norm), positions, False)
         )
 
-    def write_context_windows_batched(
-        self, captured_hidden_states, positions, slots, valid, kv_windows, dummy_slot
-    ) -> None:
-        """Seed accepted target captures at absolute positions in drafter-owned rings."""
-        del dummy_slot
+    def write_context_kv(self, captured_hidden_states, positions, slots, cache_pool):
+        """Write every stage's window row for the target rows at ``slots``.
+
+        Rows are position-pure functions of the captured hidden state, so the
+        same call seeds prefill chunks and refreshes verify rows; the target's
+        SWA slots address them.
+        """
         if captured_hidden_states.numel() == 0:
             return
         main_x = self._main_input(captured_hidden_states)
-        rows = slots[:, None].expand_as(positions)
-        columns = positions.remainder(self.window_size)
+        positions = positions.reshape(-1)
         for stage, layer in enumerate(self.layers):
-            values = self._main_kv(layer.attn, main_x, positions.reshape(-1))
-            values = values.reshape(*positions.shape, -1)
-            window = kv_windows[:, stage]
-            window[rows, columns] = torch.where(
-                valid[..., None], values, window[rows, columns]
+            _write_window_rows(
+                cache_pool.dspark_kv(stage),
+                slots.reshape(-1),
+                self._main_kv(layer.attn, main_x, positions),
             )
 
     def forward_backbone(
-        self, captured_hidden_states, bonus_token_ids, start_pos, kv_windows, slots, ctx
+        self, bonus_token_ids, start_pos, history_slots, cache_pool, ctx
     ):
-        """Return normalized [batch, proposals, hidden] for a fixed DSpark block."""
+        """Return normalized [batch, proposals, hidden] for a fixed DSpark block.
+
+        ``history_slots`` addresses positions ``start_pos-127..start_pos`` in
+        every stage's window; the anchor row at ``start_pos`` was written as a
+        verify row before this call.
+        """
         batch = bonus_token_ids.numel()
-        main_x = self._main_input(captured_hidden_states)
         ids = bonus_token_ids.new_full((batch, self.block_size), self.noise_token_id)
         ids[:, 0] = bonus_token_ids
         positions = (
@@ -270,12 +297,8 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         pre_mix = h.new_zeros(h.shape[:2], dtype=torch.float32)
         pre_mix[:, 0] = 1
         for stage, layer in enumerate(self.layers):
-            window = kv_windows[:, stage]
-            window[slots, start_pos.remainder(self.window_size)] = self._main_kv(
-                layer.attn, main_x, start_pos
-            )
             backend = _WindowAttention(
-                positions, window, slots, start_pos, self.block_size
+                positions, cache_pool.dspark_kv(stage), history_slots, self.block_size
             )
             h, pre_mix = layer(
                 h,

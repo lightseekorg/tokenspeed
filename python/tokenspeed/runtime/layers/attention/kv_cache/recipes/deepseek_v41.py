@@ -37,6 +37,8 @@ from typing_extensions import override
 from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import DeepseekV41Config
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_COMPRESSOR_TAIL_GROUP_ID,
+    V41_DSPARK_GROUP_PACKING,
+    V41_DSPARK_LCM_BLOCK_BYTES,
     V41_GLOBAL_R1_GROUP_ID,
     V41_GLOBAL_R2_GROUP_ID,
     V41_GLOBAL_ROW_BYTES,
@@ -45,10 +47,12 @@ from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_HEAD_DIM,
     V41_INDEX_HEAD_DIM,
     V41_INDEX_ROW_BYTES,
+    V41_LCM_BLOCK_BYTES,
     V41_PREFILL_QUERY_TILE,
     V41_SWA_GROUP_ID,
     V41_SWA_ROW_BYTES,
     V41_WINDOW_SIZE,
+    v41_dspark_field_name,
     v41_layer_mapping,
     v41_table_widths,
 )
@@ -60,14 +64,18 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupDeclaration,
     CacheGroupSpec,
+    apply_pd_transfer_policies,
 )
 
 
 class DeepseekV41Recipe(CacheRecipe):
-    """Target Flash FlatKV for decode/verify, without LCM-backed draft fields.
+    """Target Flash FlatKV for decode/verify, plus checkpoint-local DSpark windows.
 
     Verify width changes retention and workspace, never the target field layout.
-    Checkpoint-local DSpark windows remain owned by the drafter.
+    A same-checkpoint DSpark draft keeps its per-stage context window as extra
+    fields of the SWA group on the last target layer: one row per position,
+    addressed by the target's SWA slots, cached, transferred and evicted with
+    the SWA rows. The parent grows and the other groups repack accordingly.
     """
 
     family = "deepseek_v41"
@@ -82,18 +90,30 @@ class DeepseekV41Recipe(CacheRecipe):
     def max_padding_fraction(self) -> float:
         return 0.05
 
+    def dspark_stages(self) -> int:
+        """Number of same-checkpoint DSpark draft stages, 0 without DSpark."""
+        if (
+            getattr(self.server_args, "speculative_algorithm", None) != "DSPARK"
+            or self.draft_model_config is None
+            or self.draft_attn_config is not None
+        ):
+            return 0
+        hf = self.draft_model_config.hf_config
+        hf = getattr(hf, "text_config", hf)
+        stages = int(getattr(hf, "dspark_num_stages", 0))
+        if stages < 1:
+            raise ValueError("DeepSeek V4.1 DSpark requires a positive stage count")
+        return stages
+
     @override
     def groups(self) -> tuple[CacheGroupDeclaration, ...]:
         if self.num_draft_layers:
             raise NotImplementedError(
-                "DeepSeek V4.1 FlatKV stores target layers only; draft windows are external"
+                "DeepSeek V4.1 FlatKV stores target layers only; draft attention "
+                "layers are not supported"
             )
         if self.decode_input_tokens < 1:
             raise ValueError("DeepSeek V4.1 verify width must be positive")
-        if self.pd_disaggregation_enabled:
-            raise NotImplementedError(
-                "DeepSeek V4.1 PD cache transfer is not validated"
-            )
         if int(self.server_args.pipeline_parallel_size) != 1:
             raise NotImplementedError("DeepSeek V4.1 shared-owner FlatKV requires PP=1")
         hf = self.model_config.hf_config
@@ -147,6 +167,17 @@ class DeepseekV41Recipe(CacheRecipe):
 
         for layer in range(self.num_target_layers):
             add(V41_SWA_GROUP_ID, layer, "swa", (64, V41_SWA_ROW_BYTES), "uint8")
+        # The draft reads each stage's window with the target's SWA slots, so
+        # the rows live in the SWA group; the last target layer owns the field
+        # ids, so PD and L2 treat them as target state produced with that layer.
+        for stage in range(self.dspark_stages()):
+            add(
+                V41_SWA_GROUP_ID,
+                self.num_target_layers - 1,
+                v41_dspark_field_name(stage),
+                (64, V41_HEAD_DIM),
+                "bfloat16",
+            )
         for owner in owners:
             gid = (
                 V41_GLOBAL_R2_GROUP_ID if ratios[owner] == 2 else V41_GLOBAL_R1_GROUP_ID
@@ -165,7 +196,10 @@ class DeepseekV41Recipe(CacheRecipe):
         # Admission can be ahead of the completed forward. Retain its input
         # window as well as the unfinished pair; the allocator also reserves
         # in-flight pages through the shared scheduler_limits demand formula.
-        protection = (1 + self.overlap_schedule_depth) * self.decode_input_tokens
+        # The window is part of the PD peer contract, so size it for the
+        # deepest schedule (depth 1) on every role: a prefill node runs without
+        # overlap, and its pages must land in a decode node's retention.
+        protection = 2 * self.decode_input_tokens
         windows = {
             V41_SWA_GROUP_ID: V41_WINDOW_SIZE + protection,
             V41_GLOBAL_R2_GROUP_ID: None,
@@ -187,34 +221,46 @@ class DeepseekV41Recipe(CacheRecipe):
             V41_GLOBAL_R1_GROUP_ID: None,
             V41_COMPRESSOR_TAIL_GROUP_ID: windows[V41_COMPRESSOR_TAIL_GROUP_ID],
         }
-        return tuple(
-            (
-                CacheGroupSpec(
-                    group_id=gid,
-                    retention=(
-                        "full_history" if windows[gid] is None else "sliding_window"
-                    ),
-                    rows_per_page=rows,
-                    entry_stride_tokens=stride,
-                    sliding_window_tokens=windows[gid],
-                    replay_window_tokens=replays[gid],
-                    family="history",
-                    transfer_policy=None,
-                    checkpoint_granularity=None,
+        specs = [
+            CacheGroupSpec(
+                group_id=gid,
+                retention=(
+                    "full_history" if windows[gid] is None else "sliding_window"
                 ),
-                tuple(fields[gid]),
+                rows_per_page=rows,
+                entry_stride_tokens=stride,
+                sliding_window_tokens=windows[gid],
+                replay_window_tokens=replays[gid],
+                family="history",
+                transfer_policy=None,
+                checkpoint_granularity=None,
             )
             for gid, (rows, stride) in V41_GROUP_GEOMETRY.items()
+        ]
+        if self.pd_disaggregation_enabled:
+            specs = apply_pd_transfer_policies(specs)
+        return tuple((spec, tuple(fields[spec.group_id])) for spec in specs)
+
+    def _group_packing(self) -> Mapping[str, int]:
+        return V41_DSPARK_GROUP_PACKING if self.dspark_stages() else V41_GROUP_PACKING
+
+    def _lcm_block_bytes(self) -> int:
+        return (
+            V41_DSPARK_LCM_BLOCK_BYTES if self.dspark_stages() else V41_LCM_BLOCK_BYTES
         )
 
     @override
     def packing(self, groups: Sequence[CacheGroupDeclaration]) -> Mapping[str, int]:
-        return {spec.group_id: V41_GROUP_PACKING[spec.group_id] for spec, _ in groups}
+        packing = self._group_packing()
+        return {spec.group_id: packing[spec.group_id] for spec, _ in groups}
 
     @override
     def check_layout(self, layout: CacheLayout) -> None:
-        if layout.lcm_block_bytes != 1_382_400 or len(layout.plane_bytes) != 1:
-            raise ValueError("DeepSeek V4.1 Flash requires one 1,382,400-byte plane")
+        expected = self._lcm_block_bytes()
+        if layout.lcm_block_bytes != expected or len(layout.plane_bytes) != 1:
+            raise ValueError(
+                f"DeepSeek V4.1 Flash requires one {expected:,}-byte plane"
+            )
 
     @override
     def num_lcm_blocks(self, layout: CacheLayout) -> int:
@@ -231,7 +277,7 @@ class DeepseekV41Recipe(CacheRecipe):
             upper_bound=(
                 self.token_limit
                 if self.token_limit is not None
-                else num_lcm_blocks * V41_GROUP_PACKING[V41_GLOBAL_R1_GROUP_ID] * 64
+                else num_lcm_blocks * self._group_packing()[V41_GLOBAL_R1_GROUP_ID] * 64
             ),
         )
 

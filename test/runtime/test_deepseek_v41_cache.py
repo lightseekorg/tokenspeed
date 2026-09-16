@@ -1013,6 +1013,7 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
         max_total_tokens=1024,
         kv_cache_quant_method="none",
         disaggregation_mode="null",
+        disaggregation_layerwise_interval=1,
         pipeline_parallel_size=1,
         speculative_algorithm="DSPARK" if verify_width > 1 else None,
         speculative_num_draft_tokens=verify_width,
@@ -1040,8 +1041,10 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
     assert layout.lcm_block_bytes == 1_382_400 and len(layout.fields) == 51
     specs = {spec.group_id: spec for spec, _ in recipe.groups()}
     horizon = (1 + overlap_depth) * verify_width
-    assert specs[SWA].sliding_window_tokens == 128 + horizon
-    assert specs[TAIL].sliding_window_tokens == 2 + horizon
+    # Retention is sized for the deepest schedule on every role so that a
+    # prefill node (no overlap) and a decode node agree on the PD contract.
+    assert specs[SWA].sliding_window_tokens == 128 + 2 * verify_width
+    assert specs[TAIL].sliding_window_tokens == 2 + 2 * verify_width
     tables = (
         4 * config.max_bs * sum(v41_table_widths(config.context_len, horizon).values())
     )
@@ -1061,13 +1064,157 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
     )
     with pytest.raises(NotImplementedError, match="target attention"):
         DeepseekV41Config.generate(args, model, True)
+    # A PD role must transfer the cache once per prompt, not per layer.
+    args.disaggregation_mode = "prefill"
+    with pytest.raises(NotImplementedError, match="layerwise-interval 0"):
+        DeepseekV41Config.generate(args, model, False)
+    args.disaggregation_layerwise_interval = 0
+    assert DeepseekV41Config.generate(args, model, False).pd_disaggregation_enabled
+    args.disaggregation_mode = "null"
     args.pipeline_parallel_size = 2
     with pytest.raises(NotImplementedError, match="PP=1"):
         recipe.groups()
     args.pipeline_parallel_size = 1
     recipe.attn_config = replace(config, pd_disaggregation_enabled=True)
-    with pytest.raises(NotImplementedError, match="PD"):
+    pd_specs = {spec.group_id: spec for spec, _ in recipe.groups()}
+    assert set(pd_specs) == set(specs)
+    assert all(spec.transfer_policy == "full_suffix" for spec in pd_specs.values())
+    assert all(spec.transfer_policy is None for spec in specs.values())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_pool_zeroes_fresh_pages_per_group():
+    pool = _pool(_recipe("cuda"), "cuda")
+    assert pool.requires_page_zeroing
+    pool.arena.buffer.fill_(1)
+    # One parent belongs to one group: SWA page 1 is parent 1, R2 pages 41..60
+    # are parent 3. Zeroing must touch only those parents.
+    pool.zero_new_blocks({SWA: [1], R2: [41]})
+    assert pool.swa(3)[1].count_nonzero() == 0 and pool.swa(3)[2].count_nonzero() > 0
+    assert pool.global_kv(8)[41].count_nonzero() == 0
+    assert pool.global_kv(8)[21].count_nonzero() > 0
+
+
+def test_dspark_windows_join_the_swa_group():
+    recipe = _recipe("cpu")
+    recipe.server_args.speculative_algorithm = "DSPARK"
+    recipe.draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(dspark_num_stages=3)
+    )
+    assert recipe.dspark_stages() == 3
+    groups = dict(recipe.groups())
+    assert {s.group_id for s in groups} == set(V41_GROUP_GEOMETRY)
+    spec = next(s for s in groups if s.group_id == SWA)
+    fields = {f.field_id: f for f in groups[spec]}
+    assert len(fields) == 43
+    for stage in range(3):
+        field = fields[f"layer.39.dspark_kv{stage}"]
+        assert field.shape == (64, 512) and field.dtype == "bfloat16"
+    # The SWA page grows by the three stage rows; the other groups repack so
+    # every group stays inside the padding budget.
+    layout = _layout(recipe)
+    assert layout.lcm_block_bytes == 1_571_328
+    assert dict(layout.group_packing) == {SWA: 1, R2: 22, R1: 66, TAIL: 62}
+    recipe.check_layout(layout)
+    pool = _pool(recipe, "cpu")
+    assert pool.dspark_kv(2).shape[1:] == (64, 512)
+    assert pool.dspark_kv(2).dtype == torch.bfloat16
+    recipe.attn_config = replace(recipe.attn_config, pd_disaggregation_enabled=True)
+    from tokenspeed.runtime.pd.cache_protocol import (
+        build_arena_cache_transfer_contract,
+    )
+
+    contract, _ = build_arena_cache_transfer_contract(_pool(recipe, "cpu").arena)
+    assert {f.field_id for f in contract.fields_for_group(SWA)} >= {
+        f"layer.39.dspark_kv{stage}" for stage in range(3)
+    }
+    recipe.server_args.speculative_algorithm = None
+    assert recipe.dspark_stages() == 0
+    assert _layout(recipe).lcm_block_bytes == 1_382_400
+    recipe.server_args.speculative_algorithm = "DSPARK"
+    recipe.draft_model_config.hf_config.dspark_num_stages = 0
+    with pytest.raises(ValueError, match="positive stage count"):
         recipe.groups()
+
+
+def test_pd_contract_plan_and_manifest():
+    import numpy as np
+
+    from tokenspeed.runtime.pd.cache_protocol import (
+        build_arena_cache_transfer_contract,
+        build_cache_block_manifest,
+        validate_cache_peer_layout,
+    )
+    from tokenspeed.runtime.pd.transfer_plan import CacheTransferPlanner
+
+    recipe = _recipe("cpu")
+    recipe.attn_config = replace(recipe.attn_config, pd_disaggregation_enabled=True)
+    pool = _pool(recipe, "cpu")
+    assert pool.arena.supports_disaggregation is True
+    contract, base_addr = build_arena_cache_transfer_contract(pool.arena)
+    assert base_addr == pool.arena.buffer.data_ptr()
+    validate_cache_peer_layout(contract, contract)
+    assert [spec.group_id for spec in contract.group_specs] == [SWA, R2, R1, TAIL]
+    assert {f.field_id for f in contract.fields_for_group(SWA)} == {
+        f"layer.{i}.swa" for i in range(40)
+    }
+    assert {f.field_id for f in contract.fields_for_group(R2)} == {
+        f"layer.{o}.{name}" for o in (2, 8, 14) for name in ("global_kv", "index_k")
+    }
+    assert {f.field_id for f in contract.fields_for_group(TAIL)} == {
+        f"layer.{o}.compressor_tail" for o in (2, 8, 14)
+    }
+    # No V4.1 field is head-sharded, so unequal TP copies whole fields from
+    # one replicated source rank per decode rank.
+    planner = CacheTransferPlanner(
+        prefill_tp_size=4,
+        decode_tp_size=2,
+        prefill_layout=contract,
+        decode_layout=contract,
+    )
+    for decode_rank, source in ((0, 0), (1, 2)):
+        plan = planner.plan_for_decode_rank(decode_rank)
+        assert plan.target_prefill_ranks == (source,)
+        fragments = plan.fragments_by_prefill_rank[source]
+        assert len(fragments) == len(contract.plan.fields)
+        by_field = {f.field_id: f for f in contract.plan.fields}
+        assert all(
+            fragment.rows_per_page == 1
+            and fragment.bytes_per_row == by_field[fragment.field_id].payload_bytes
+            for fragment in fragments
+        )
+
+    # An odd prompt leaves an unfinished ratio-2 pair: its input lives in the
+    # compressor tail, so the tail and the last global_r2 page must both ship.
+    prompt_len, prefix_len = 4097, 3840
+    tables = {}
+    for spec in contract.group_specs:
+        columns = prompt_len // spec.block_granularity + 2
+        capacity = contract.plan.group(spec.group_id).page_count
+        # Any non-null page ID inside the group's capacity is a valid block.
+        tables[spec.group_id] = (
+            1 + np.arange(2 * columns).reshape(2, columns) % (capacity - 1)
+        ).astype(np.int32)
+    manifest = build_cache_block_manifest(
+        SimpleNamespace(block_tables_arrays=lambda: tables),
+        layout=contract,
+        request_row=1,
+        prefix_len=prefix_len,
+        prompt_len=prompt_len,
+    )
+    blocks = {group.group_id: group.block_ids for group in manifest.groups}
+    specs = {spec.group_id: spec for spec in contract.group_specs}
+
+    def logical(gid, begin, end):
+        return tuple(int(tables[gid][1, slot]) for slot in range(begin, end))
+
+    assert blocks[R2] == logical(R2, prefix_len // 128, (prompt_len + 127) // 128)
+    assert blocks[R1] == logical(R1, prefix_len // 64, (prompt_len + 63) // 64)
+    swa_begin = (prompt_len - specs[SWA].sliding_window_tokens + 1) // 64
+    assert blocks[SWA] == logical(SWA, swa_begin, (prompt_len + 63) // 64)
+    tail_begin = (prompt_len - specs[TAIL].sliding_window_tokens + 1) // 2
+    assert blocks[TAIL] == logical(TAIL, tail_begin, (prompt_len + 1) // 2)
+    assert (prompt_len - 1) // 2 in range(tail_begin, (prompt_len + 1) // 2)
 
 
 def test_recipe_exact_geometry_capacity_and_dispatch():

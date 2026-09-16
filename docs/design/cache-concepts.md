@@ -709,11 +709,17 @@ The same backend narrows the CED decoder to each request's prompt tail
 in the replayable group, are never expected from a hit either.
 
 Block drafters (DFLASH / DSPARK) write their KV at the target's cache
-locations, so their storage *is* the target's full-history group whatever mask
-their layers apply. `resolve_cache_layer_types` labels every block-draft layer
+locations, so their storage *is* a target-owned group whatever mask their
+layers apply. Drafts with their own attention layers ride the target's
+full-history group: `resolve_cache_layer_types` labels every block-draft layer
 full-history, and `check_block_drafter_storage` verifies at startup that the
 group the draft bound is one the target's own layers share — a target without
-a full-history group has nothing for a block drafter to borrow.
+a full-history group has nothing for a block drafter to borrow. DeepSeek
+V4.1's same-checkpoint DSpark has no draft attention layers of its own; its
+per-stage context rows are extra fields of the target's SWA group on the last
+target layer, addressed by the target's SWA slots, so they are cached,
+transferred and evicted together with the SWA rows and the draft's 128-row
+window fits inside that group's retention.
 
 Capacity has exactly two shapes, both on the base class. The default is the
 flat product (`parents × tightest packing × P`). Families whose per-group
@@ -1108,8 +1114,10 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   at startup, checking that the group's retention covers the mask (see
   *Storage vs. visibility*). Backends index their learned geometry by the
   bound id with no fallback (`CacheGroupGeometry.granularity_of` raises on
-  unknown ids). Block drafters ride the target's full-history group whatever
-  mask their layers apply (`check_block_drafter_storage`). ✓
+  unknown ids). Block drafters ride a target-owned group whatever mask their
+  layers apply: the full-history group for drafts with their own attention
+  layers (`check_block_drafter_storage`), the SWA group's extra fields for
+  V4.1's same-checkpoint DSpark. ✓
 * Capacity has two shapes and no more, and one place to read the scheduler's
   concurrency (see *The cache pipeline* above). ✓
 * Kernel geometry does not live under the recipes package. DeepSeek V4's byte

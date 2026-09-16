@@ -447,15 +447,28 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             *metadata.compressor,
         )
 
-    def _decode_window(self, positions, requests):
+    def window_slots(
+        self, group_id: str, positions: torch.Tensor, request_indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resolve each decode query's 128-row window in ``group_id`` to slots.
+
+        Args:
+            group_id: A group with the SWA row geometry.
+            positions: Absolute query positions, one per decode token row.
+            request_indices: Batch rows of the decode metadata, same shape.
+
+        Returns:
+            ``[n, 128]`` int32 slots of positions ``p-127..p`` (``-1`` before
+            the sequence start) and the ``[n]`` int32 count of live rows.
+        """
         wanted = (positions - 127).clamp_min(0)[:, None] + torch.arange(
             128, device=self.device
         )
         wanted = wanted.masked_fill(wanted > positions[:, None], -1)
         slots = self.cache_slots(
-            V41_SWA_GROUP_ID,
+            group_id,
             wanted,
-            requests[:, None].expand_as(wanted),
+            request_indices[:, None].expand_as(wanted),
             ForwardMode.DECODE,
         ).to(torch.int32)
         return slots, (positions + 1).clamp(0, 128).to(torch.int32)
@@ -1534,7 +1547,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             swa_slots, swa_lens = (
                 (metadata.swa_read_slots, metadata.swa_read_lens)
                 if canonical
-                else self._decode_window(positions, request_indices)
+                else self.window_slots(V41_SWA_GROUP_ID, positions, request_indices)
             )
             return dsv41.selected_attention(
                 q,
