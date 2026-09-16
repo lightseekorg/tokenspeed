@@ -25,6 +25,8 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.registry import Priority, WarmupBehavior, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 __all__ = [
     "add3",
@@ -261,6 +263,16 @@ def _silu_and_mul_kernel(
     tl.store(out_ptr + row * out_stride_row + col, out, mask=mask)
 
 
+@register_kernel(
+    "activation",
+    "silu_and_mul",
+    name="triton_silu_and_mul",
+    solution="triton",
+    signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
+    traits={"has_limit": frozenset({False, True})},
+    priority=Priority.PERFORMANT,
+    warmup_behavior=WarmupBehavior.JIT_COMPILE,
+)
 def silu_and_mul(
     x: torch.Tensor,
     out: torch.Tensor | None = None,

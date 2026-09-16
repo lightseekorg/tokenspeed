@@ -310,6 +310,7 @@ class TestKernelApiSpec:
 
         api_specs = {spec.api: spec for spec in KernelRegistry.get().list_apis()}
         assert {
+            "activation.silu_and_mul",
             "attention.dsa_decode",
             "attention.dsa_prefill",
             "attention.gdn_chunk_prefill",

@@ -19,37 +19,46 @@
 
 from __future__ import annotations
 
+import tokenspeed_kernel.ops.activation.flashinfer  # noqa: F401
+import tokenspeed_kernel.ops.activation.triton  # noqa: F401
 import torch
-from tokenspeed_kernel.ops.activation.flashinfer import (
-    silu_and_mul as flashinfer_silu_and_mul,
-)
-from tokenspeed_kernel.ops.activation.triton import (
-    add3,
-)
-from tokenspeed_kernel.ops.activation.triton import silu_and_mul as triton_silu_and_mul
+from tokenspeed_kernel.ops.activation.triton import add3
 from tokenspeed_kernel.ops.activation.triton import situ_and_mul as triton_situ_and_mul
 from tokenspeed_kernel.ops.gemm import _fp8_linear_activation
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
-from tokenspeed_kernel.registry import error_fn
+from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.registry import register_kernel_api
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 
 def silu_and_mul(
     x: torch.Tensor,
     out: torch.Tensor | None = None,
     limit: float | None = None,
+    solution: str | None = None,
 ) -> torch.Tensor:
-    """Apply SwiGLU through the platform implementation.
+    """Apply SwiGLU through a registered implementation."""
+    kernel = select_kernel(
+        "activation",
+        "silu_and_mul",
+        format_signature(x=dense_tensor_format(x.dtype)),
+        traits={"has_limit": limit is not None},
+        solution=solution,
+    )
+    return kernel(
+        x=x,
+        out=out,
+        enable_pdl=pdl_enabled(),
+        limit=limit,
+    )
 
-    Positive ``limit`` values use the portable Triton implementation because
-    the CUDA implementation does not expose the checkpoint's clamp semantics.
-    """
-    if (
-        limit is not None
-        or current_platform().is_amd
-        or flashinfer_silu_and_mul is error_fn
-    ):
-        return triton_silu_and_mul(x, out, enable_pdl=pdl_enabled(), limit=limit)
-    return flashinfer_silu_and_mul(x, out, enable_pdl=pdl_enabled())
+
+register_kernel_api(
+    family="activation",
+    mode="silu_and_mul",
+    public_api=silu_and_mul,
+    warmup_config_type=None,
+)
 
 
 def prepare_fp8_linear_activation(

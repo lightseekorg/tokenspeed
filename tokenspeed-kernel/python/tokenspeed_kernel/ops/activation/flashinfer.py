@@ -17,21 +17,44 @@
 
 """FlashInfer activation kernels."""
 
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import error_fn
+import torch
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.registry import (
+    Priority,
+    WarmupBehavior,
+    error_fn,
+    register_kernel,
+)
+from tokenspeed_kernel.signature import format_signatures
 
-gelu_and_mul = error_fn
-gelu_tanh_and_mul = error_fn
 silu_and_mul = error_fn
 
 if current_platform().is_nvidia:
     try:
-        from flashinfer import (
-            gelu_and_mul,
-            gelu_tanh_and_mul,
-            silu_and_mul,
+        from flashinfer import silu_and_mul as _silu_and_mul
+
+        @register_kernel(
+            "activation",
+            "silu_and_mul",
+            name="flashinfer_silu_and_mul",
+            solution="flashinfer",
+            capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+            signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
+            traits={"has_limit": frozenset({False})},
+            priority=Priority.PERFORMANT + 1,
+            warmup_behavior=WarmupBehavior.JIT_COMPILE,
         )
+        def silu_and_mul(
+            x: torch.Tensor,
+            out: torch.Tensor | None,
+            enable_pdl: bool,
+            limit: float | None,
+        ) -> torch.Tensor:
+            if limit is not None:
+                raise ValueError("FlashInfer silu_and_mul does not support a limit")
+            return _silu_and_mul(x, out, enable_pdl=enable_pdl)
+
     except ImportError:
         pass
 
-__all__ = ["gelu_and_mul", "gelu_tanh_and_mul", "silu_and_mul"]
+__all__ = ["silu_and_mul"]

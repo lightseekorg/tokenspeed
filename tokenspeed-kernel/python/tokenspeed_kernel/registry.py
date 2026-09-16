@@ -562,6 +562,7 @@ def load_builtin_kernels() -> None:
         if package is not None and isinstance(exports, dict):
             for name in exports:
                 package.__dict__.pop(name, None)
+    import tokenspeed_kernel.ops.activation  # noqa: F401
     import tokenspeed_kernel.ops.attention  # noqa: F401
     import tokenspeed_kernel.ops.attention.dsa  # noqa: F401
     import tokenspeed_kernel.ops.attention.dsv4  # noqa: F401
