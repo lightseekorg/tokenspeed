@@ -20,8 +20,19 @@
 from functools import wraps
 from inspect import signature
 
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
-from tokenspeed_kernel.registry import error_fn
+import torch
+from tokenspeed_kernel.platform import (
+    CapabilityRequirement,
+    current_platform,
+    pdl_enabled,
+)
+from tokenspeed_kernel.registry import (
+    Priority,
+    WarmupBehavior,
+    error_fn,
+    register_kernel,
+)
+from tokenspeed_kernel.signature import format_signatures
 
 fused_add_rmsnorm = error_fn
 gemma_fused_add_rmsnorm = error_fn
@@ -62,10 +73,66 @@ if current_platform().is_nvidia:
         )
         from flashinfer import rmsnorm as _rmsnorm
 
-        fused_add_rmsnorm = _with_pdl_default(_fused_add_rmsnorm)
+        _fused_add_rmsnorm = _with_pdl_default(_fused_add_rmsnorm)
         gemma_fused_add_rmsnorm = _with_pdl_default(_gemma_fused_add_rmsnorm)
         gemma_rmsnorm = _with_pdl_default(_gemma_rmsnorm)
-        rmsnorm = _with_pdl_default(_rmsnorm)
+        _rmsnorm = _with_pdl_default(_rmsnorm)
+
+        @register_kernel(
+            "layernorm",
+            "rmsnorm",
+            name="flashinfer_rmsnorm",
+            solution="flashinfer",
+            capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+            signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
+            traits={
+                "has_residual": frozenset({False}),
+                "has_out": frozenset({False, True}),
+            },
+            priority=Priority.PERFORMANT + 1,
+            warmup_behavior=WarmupBehavior.JIT_COMPILE,
+        )
+        def rmsnorm(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            eps: float,
+            residual: torch.Tensor | None,
+            out: torch.Tensor | None,
+            enable_pdl: bool | None,
+        ) -> torch.Tensor:
+            if residual is not None:
+                raise ValueError("FlashInfer rmsnorm does not accept a residual")
+            return _rmsnorm(x, weight, eps, out=out, enable_pdl=enable_pdl)
+
+        @register_kernel(
+            "layernorm",
+            "rmsnorm",
+            name="flashinfer_fused_add_rmsnorm",
+            solution="flashinfer",
+            capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+            signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
+            traits={
+                "has_residual": frozenset({True}),
+                "has_out": frozenset({False}),
+            },
+            priority=Priority.PERFORMANT + 1,
+            warmup_behavior=WarmupBehavior.JIT_COMPILE,
+        )
+        def fused_add_rmsnorm(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            eps: float,
+            residual: torch.Tensor | None,
+            out: torch.Tensor | None,
+            enable_pdl: bool | None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            if residual is None:
+                raise ValueError("FlashInfer fused_add_rmsnorm requires a residual")
+            if out is not None:
+                raise ValueError("FlashInfer fused_add_rmsnorm does not accept out")
+            _fused_add_rmsnorm(x, residual, weight, eps, enable_pdl=enable_pdl)
+            return x, residual
+
     except ImportError:
         pass
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.registry import Priority, WarmupBehavior, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 
 @triton.jit
@@ -77,12 +79,26 @@ def _rmsnorm_fused_parallel_kernel(
     tl.store(output2_ptr + output2_offsets, output2, mask=mask2)
 
 
+@register_kernel(
+    "layernorm",
+    "rmsnorm",
+    name="triton_rmsnorm",
+    solution="triton",
+    signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
+    traits={
+        "has_residual": frozenset({False, True}),
+        "has_out": frozenset({False, True}),
+    },
+    priority=Priority.PERFORMANT,
+    warmup_behavior=WarmupBehavior.JIT_COMPILE,
+)
 def rmsnorm(
     x: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
     residual: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    enable_pdl: bool | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if x.shape[0] == 0:
         if residual is None:

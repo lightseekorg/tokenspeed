@@ -22,6 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 import tokenspeed_kernel.ops.layernorm as layernorm
+import torch
 
 
 def _platform(vendor: str) -> SimpleNamespace:
@@ -51,52 +52,63 @@ def test_residual_and_out_are_mutually_exclusive(
 
 def test_nvidia_rmsnorm_preserves_fused_residual_contract(monkeypatch) -> None:
     calls = []
-    x, residual, weight = object(), object(), object()
+    result = object()
+    x = SimpleNamespace(dtype=torch.bfloat16)
+    residual, weight = object(), object()
 
-    def fused(x_arg, residual_arg, weight_arg, eps, **kwargs):
-        calls.append((x_arg, residual_arg, weight_arg, eps, kwargs))
+    def backend(**kwargs):
+        calls.append(kwargs)
+        return result
 
     monkeypatch.setattr(layernorm, "_platform", _platform("nvidia"))
-    monkeypatch.setattr(layernorm, "_fused_add_rmsnorm", fused, raising=False)
+    monkeypatch.setattr(layernorm, "select_kernel", lambda *args, **kwargs: backend)
 
-    result = layernorm.rmsnorm(x, weight, 1e-6, residual=residual)
-
-    assert result == (x, residual)
-    assert calls == [(x, residual, weight, 1e-6, {})]
+    assert layernorm.rmsnorm(x, weight, 1e-6, residual=residual) is result
+    assert calls == [
+        {
+            "x": x,
+            "weight": weight,
+            "eps": 1e-6,
+            "residual": residual,
+            "out": None,
+            "enable_pdl": None,
+        }
+    ]
 
 
 def test_nvidia_rmsnorm_defers_pdl_policy_to_backend(monkeypatch) -> None:
     calls = []
-    result, x, weight, out = object(), object(), object(), object()
+    result, weight, out = object(), object(), object()
+    x = SimpleNamespace(dtype=torch.bfloat16)
 
-    def backend(x_arg, weight_arg, eps, **kwargs):
-        calls.append((x_arg, weight_arg, eps, kwargs))
+    def backend(**kwargs):
+        calls.append(kwargs)
         return result
 
     monkeypatch.setattr(layernorm, "_platform", _platform("nvidia"))
-    monkeypatch.setattr(layernorm, "_rmsnorm", backend, raising=False)
+    monkeypatch.setattr(layernorm, "select_kernel", lambda *args, **kwargs: backend)
 
     assert layernorm.rmsnorm(x, weight, 1e-6, out=out) is result
-    assert calls == [(x, weight, 1e-6, {"out": out})]
+    assert calls[0]["out"] is out
+    assert calls[0]["enable_pdl"] is None
 
 
 def test_amd_rmsnorm_preserves_triton_call_contract(monkeypatch) -> None:
     calls = []
-    result, x, weight, residual, out = (object() for _ in range(5))
+    result, weight, residual, out = (object() for _ in range(4))
+    x = SimpleNamespace(dtype=torch.bfloat16)
 
-    def backend(x_arg, weight_arg, eps, **kwargs):
-        calls.append((x_arg, weight_arg, eps, kwargs))
+    def backend(**kwargs):
+        calls.append(kwargs)
         return result
 
     monkeypatch.setattr(layernorm, "_platform", _platform("amd"))
-    monkeypatch.setattr(layernorm, "triton_rmsnorm", backend, raising=False)
+    monkeypatch.setattr(layernorm, "select_kernel", lambda *args, **kwargs: backend)
 
     assert layernorm.rmsnorm(x, weight, 1e-6, residual=residual) is result
     assert layernorm.rmsnorm(x, weight, 1e-6, out=out) is result
-    assert calls == [
-        (x, weight, 1e-6, {"residual": residual}),
-        (x, weight, 1e-6, {"out": out}),
-    ]
+    assert calls[0]["residual"] is residual
+    assert calls[1]["out"] is out
 
 
 def test_ascend_rmsnorm_forwards_residual_or_out(monkeypatch) -> None:

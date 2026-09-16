@@ -323,6 +323,7 @@ class TestKernelApiSpec:
             "gemm.decode_gemv",
             "gemm.mm",
             "gemm.nvfp4_swiglu_quant",
+            "layernorm.rmsnorm",
             "moe.apply",
             "quantization.mxfp8",
             "quantization.nvfp4",
