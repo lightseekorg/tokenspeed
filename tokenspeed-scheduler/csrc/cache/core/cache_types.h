@@ -70,6 +70,20 @@ struct CacheKeyHash {
     }
 };
 
+// Non-owning identity: reusing a key or physical slot after eviction must not
+// make an old request's snapshot refer to the replacement entry.
+struct CachedStateBlock {
+    CacheKey key;
+    std::uint64_t generation{0};
+};
+
+// One complete aligned checkpoint across every snapshot-state group. Keeping
+// this handle does not pin Device memory or prevent capacity eviction.
+struct StateSnapshot {
+    std::int32_t boundary_tokens{0};
+    std::vector<CachedStateBlock> blocks;
+};
+
 struct CacheGroupSpec {
     AttnKind kind{AttnKind::kFull};
     // Only kSlidingWindow uses this value. Mamba's one-checkpoint lookback is
@@ -138,9 +152,12 @@ struct CompletedPages {
     std::int32_t first_new_prefix_page{0};
     // Which kind of resumable boundary the newly completed range ends on.
     CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
-    // Prefill publication streams newly completed history and snapshot-state
-    // blocks to Host. Decode publication leaves this false so only sliding
-    // windows keep streaming; finish/retract persist the remaining groups.
+    // State may retain an aligned checkpoint before an unaligned endpoint.
+    // Its classification must not promote the History or sliding groups.
+    std::optional<CacheBoundaryKind> state_boundary_kind{};
+    // Prefill publication streams newly completed history and retained state
+    // endpoints to Host. Ordinary state chunks never stream. Decode leaves
+    // this false; finish/retract explicitly persist retained endpoints.
     bool stream_completed_to_host{false};
     // Exact snapshot provenance: aligned boundaries a prefill materialized or
     // an accepted endpoint landed on, not yet hashed. Allocation and token

@@ -43,7 +43,8 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
         }
     }
     for (auto& candidate : coordinator_.TakePendingStores()) {
-        if (coordinator_.ContainsHostCachedBlock(candidate.key) || !storing_keys.insert(candidate.key).second) {
+        if (coordinator_.ContainsHostCachedBlock(candidate.key) ||
+            !coordinator_.CanStoreDeviceCachedBlock(candidate.key) || !storing_keys.insert(candidate.key).second) {
             continue;
         }
 
@@ -142,7 +143,17 @@ void TierTransferManager::CompleteWriteBack(std::uint32_t op_id) {
 }
 
 void TierTransferManager::CompleteLoadBack(std::uint32_t op_id) {
-    load_backs_.erase(op_id);
+    const auto it = load_backs_.find(op_id);
+    if (it == load_backs_.end()) {
+        return;
+    }
+    std::vector<CacheBlockRef*> destinations;
+    destinations.reserve(it->second.size());
+    for (BlockTransfer& transfer : it->second) {
+        destinations.push_back(&transfer.destination);
+    }
+    coordinator_.ReleaseDeviceBlockRefs(destinations);
+    load_backs_.erase(it);
 }
 
 std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const BlockTransfer> block_transfers) const {

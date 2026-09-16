@@ -159,6 +159,8 @@ private:
     void discardUncachedKvEventPages(std::span<const CacheKey> keys);
     void handleCacheMutation(const CacheKey& key, CacheCoordinator::CacheMutation mutation);
     std::optional<WriteBackOperation> publishCompletedPages(Request& request);
+    void updateDecodeStateSnapshot(Request& request, std::int32_t endpoint_tokens);
+    void clearLatestDecodeState(Request& request);
 
     std::size_t groupIndex(const std::string& group_id) const;
     Request* findRequest(const std::string& request_id);
@@ -176,7 +178,7 @@ private:
     void handleEvent(const pd::FailedEvent& event);
     void handleEvent(const pd::SucceededEvent& event);
     void handleEvent(const pd::RemotePrefillDoneEvent& event);
-    void handleEvent(const forward::ExtendResult& event);
+    void handleEvent(const forward::ExtendResult& event, bool publish_state);
     void handleEvent(const forward::Abort& event);
     void handleEvent(const forward::Finish& event);
     void handleEvent(const forward::UpdateReserveNumTokens& event);

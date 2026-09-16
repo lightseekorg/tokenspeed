@@ -230,6 +230,46 @@ so an aligned accepted endpoint is hashed by the very next admission rather
 than after a lag of up to the verify width. Remote endpoint-only landings do
 not claim an internal prefill checkpoint, only their endpoint when aligned.
 
+State-cache retention uses the existing boundary order
+`kChunk < kEndpoint < kPromoted`. Registering or retaining an existing entry
+can only upgrade its kind; a prefix hit does not change it. Once an ordinary
+state Chunk has no request or transfer owners, it is actively removed. Each
+request keeps its latest complete Decode snapshot in the original state-table
+slots, whose existing references prevent eviction. This cleanup leaves Endpoint,
+Promoted and non-state groups unchanged; previous reuse alone is no exemption.
+
+Each state table protects at most one slot for latest. Only an actual aligned
+accepted endpoint within the returned stable prefix can replace it, after the
+same boundary is validated in every state group. The snapshot identity remains
+non-owning; protection keeps the table's original reference rather than adding
+a separate holder. Request progress stores only the protected boundary token
+count, with zero meaning none; the coordinator uses full identities during
+validation. `num_accepted_tokens` is reported before host-side EOS,
+length or grammar truncation, so shortening the output cannot invent a state
+at an unwritten boundary. A missing or partial replacement leaves the old
+protected slots unchanged.
+
+Reclaim advances its scanned prefix past the protected slot and releases other
+expired slots normally. Replacing or clearing protection explicitly releases
+the old slot if it is already behind that frontier; an old slot still in the
+working window waits for normal reclaim. Shared snapshots remain pinned by
+each request's own table. No global latest collection is needed. Finish retains
+the newest complete resident boundary as Endpoint before clearing protection,
+even when no new prefix hash was added. `RetainLatestStateSnapshot` selects and
+upgrades that boundary in one call, without adding references or touching its
+access epoch. Clearing a request frees all its table references, including the
+protected slots.
+
+State Chunks do not start L2 stores, including protected latest snapshots.
+Prefill's final reusable boundary, and the complete boundary selected at Finish
+or recovery writeback, become Endpoint
+before their store is queued. Pending stores recheck eligibility; existing Host
+entries and already-started transfers are unchanged. Internal `forward::Abort`
+creates no endpoint. A result followed by that event in the same feedback packet
+still acknowledges its forward, but its new state is not published for reuse.
+Ordinary client cancellation during local generation can instead send
+`forward::Finish`, retaining valid endpoints.
+
 Snapshot selection and slot addressing are distinct even within this mapping:
 the last internal reusable checkpoint is at
 `floor(after / prefix_granularity) * prefix_granularity`, strictly between
@@ -497,8 +537,9 @@ Perception rules per directory:
 `GroupAllocator` is **physical placement only**, and there is exactly one of
 it — no subclasses. It moves `CacheBlock`s between the `BlockPool` and
 `BlockTable`s (`Acquire`, `AppendHostExtension`, `Free`), resolves kernel
-page ids, and executes retention (`ReclaimExpired` punches the first *N*
-slots to null holes). It is deliberately token-free: every token quantity is
+page ids, and executes retention (`ReclaimExpired` punches expired slots to
+null holes, except the table's protected slot). It is deliberately token-free:
+every token quantity is
 converted to block counts before it reaches the manager.
 
 The conversion is `GroupGeometry` in the coordinator layer:
@@ -601,13 +642,14 @@ Its responsibilities:
   stream to the Host tier (`stream_device_cache_to_host_`); a
   `pending_stores_` queue drives D2H transfers, alongside Host-side
   acquire/contains/pin queries. During prefill, each completed scheduling
-  boundary queues all newly published full-attention pages and one checkpoint
-  per snapshot-state group; the pending candidates are merged into a batched
-  writeback. The first decode admission from `PrefillDone` applies the same
+  boundary queues all newly published full-attention pages and eligible
+  Endpoint/Promoted state checkpoints; ordinary state Chunks stay on Device.
+  The pending candidates are merged into a batched writeback. The first
+  decode admission from `PrefillDone` applies the same
   policy to the final prompt boundary. Ordinary decode still publishes Device
   entries but does not stream full-attention or snapshot-state entries to
   Host. At finish or retraction, all eligible Device-resident non-state pages
-  and only the newest Device-resident checkpoint per state group are queued
+  and only the newest complete Device-resident state snapshot are queued
   before request ownership is released. Ordinary sliding-window entries
   always stream when published. The queue is drained by
   `TierTransferManager::StartPendingStores(guard)`: every store but a
@@ -616,7 +658,15 @@ Its responsibilities:
   same round (`scheduler.md` §2).
 * **Reclamation and lifecycle.** `ReclaimExpired`, `Free`,
   `ClearDeviceCache`/`ClearCache`, and `NumNewlyReleasableLcmBlocks` for
-  ranking retraction (preemption) victims.
+  ranking retraction (preemption) victims. Working-reference releases and
+  load-back ACKs collect affected state identities, drop their references,
+  and reconsider ordinary Chunks for active cleanup. Protecting a new complete
+  snapshot switches the retained table slots before releasing expired old
+  ones. Free clears both the table references and protection. The coordinator
+  stores no request pointers or extra Device references, and cleanup needs
+  no cache-wide scan, latest-record collection or persistent retirement set.
+  Active-page accounting and retract release estimates already visit all
+  non-empty table slots, including protected slots behind the reclaim frontier.
 * **Mutation reporting.** `SetCacheMutationSink` reports per-group cache
   insertions/removals; the scheduler folds them into one externally visible
   prefix event. Whether a scheduler-level boundary is fully, partially or not
@@ -631,20 +681,49 @@ while each manager may use a smaller cache-page token count.
 
 ### `AdmissionPlanner` (`cache_admission.cpp`, anonymous namespace)
 
-The internal capacity planner behind `Admit`. It runs entirely on shadow
-occupancy — never mutating the real pool — and answers: *which cached blocks
-must be evicted for this admission to fit, while protecting the current
-prefix hits?* The algorithm: first check whether existing local holes plus
-empty parents fit with zero eviction; otherwise select eviction candidates
-until the plan fits. Request-reclaimable candidates are collected and sorted
-once; each cache group loads and sorts one epoch of eligible candidates at a
-time, skipping epochs whose entries are all protected or already listed for
-request reclaim. Selection compares the next candidate from each group with
-the next request-reclaimable candidate using one policy: LRU access epoch,
-then tier (uncached request-only block → probationary boundary → established
-boundary → suffix of a closed prefix). Finally, walk the selected blocks in
-reverse and restore every block that is not strictly required, yielding a
-minimal eviction set in `victims`.
+The internal capacity planner behind `Admit` selects reclaimable blocks using
+shadow occupancy, without mutating the real pool. If existing local holes and
+empty parents already fit the demand, it returns without enumerating candidates.
+Current prefix hits and blocks that still need their owning references remain
+protected by the existing eligibility checks.
+
+Under pressure, selection merges candidates across cache groups by oldest
+access epoch, then the original same-epoch tier and logical position. There is
+no state-first pass. A previously acquired Chunk has preference over an
+unacquired one only at the same epoch; acquisition does not upgrade its kind
+or exempt it from active cleanup. Unacquired non-closed Chunks are reclaimed
+from shorter boundaries first; closed prefixes are reclaimed from their
+suffixes. Non-state ordering and the original zero-epoch tie-break are unchanged.
+
+Protected table slots are excluded from request-reclaim candidates by the
+same rule used for actual release. They cannot count as guaranteed cleanup
+capacity. Other requests' protected slots retain their own references, so the
+ordinary index eligibility check excludes them too. The planner previews the
+Endpoint/Promoted kinds that this admission will publish. Pending upgrades use
+the same publication
+enumeration as commit and apply to the canonical entry when one exists, not a
+second producer that registration will discard. The effective kind exists only
+in this plan; the stored `CacheBoundaryKind` and access epoch do not change.
+Unpinned Endpoint and Promoted entries remain capacity-evictable. Protecting a
+latest slot does not change its stored kind or the ordering of other entries.
+
+Request-reclaimable candidates are collected and sorted once. Each cache group
+loads and sorts one eligible epoch at a time, skipping protected entries and
+duplicates of request-reclaimable candidates. Selection stops when the demand
+fits, then restores selected blocks in reverse wherever they are not needed
+for capacity. All preference maps and cursors are local to the admission;
+there is no persistent priority index.
+
+Before selecting capacity victims, the shadow plan counts ordinary state
+Chunks that this admission is guaranteed to release: only the expiring table
+slot and index may own them, and they must not be prefix hits, protected table
+slots or canonical targets of pending publications. This credit uses actual
+packed-parent occupancy; freeing one child does not imply an empty parent.
+It prevents unnecessary eviction of other entries without changing their
+relative order. Reverse pruning restores only additional capacity victims.
+Commit publishes the determined boundaries before releasing references and
+actively cleaning these Chunks. A failed plan changes neither the pool nor
+the index.
 
 Each cache group uses a non-owning cursor over its tier's eviction index.
 It advances continuously, skips fully pinned epochs, and returns complete

@@ -52,6 +52,8 @@ struct CacheProgress {
     // overlap schedule lands two results back to back. Crossing a boundary
     // is not evidence of a written state; only an exact endpoint is.
     std::vector<std::int32_t> materialized_state_boundaries;
+    // Latest protected Decode checkpoint boundary; zero when absent.
+    std::int32_t latest_decode_state_boundary_tokens{0};
 
     void RecordMaterializedStateBoundary(std::int32_t boundary, std::int32_t prefix_granularity) {
         if (boundary <= 0 || boundary % prefix_granularity != 0 ||

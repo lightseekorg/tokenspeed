@@ -175,6 +175,13 @@ op kind) either returns events into one of these two points or adds a new
 explicit call site in the loop body with a comment stating why the existing
 points don't fit. It must not call `advance_scheduler` itself.
 
+Forward feedback keeps the accepted token count separate from the tokens
+returned to the client. `num_accepted_tokens` is read from the already-completed
+forward result before EOS, length or grammar handling truncates that output;
+intermediate Prefill acknowledgements pass zero. The scheduler uses this
+provenance to avoid publishing a state snapshot at an unwritten truncated
+boundary. This adds no GPU work or synchronization to the control plane.
+
 ## Principle 4: correctness never depends on the in-flight depth
 
 The loop is parameterized by `in_flight_depth`: 0 (classic synchronous

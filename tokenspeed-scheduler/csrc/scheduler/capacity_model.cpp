@@ -140,8 +140,7 @@ std::vector<std::int64_t> CapacityModel::SingleRequestGroupPages(std::int32_t to
                 // Remote landing: endpoint snapshot + banked growth block.
                 const std::int64_t snapshot_pages = token_limit == 0 ? 0 : 2;
                 // A retracted Decode request may recover by locally
-                // recomputing its suffix. Old State checkpoints are
-                // evictable, but one recovery chunk and its lookback must fit.
+                // recomputing its suffix, so its prefill peak must also fit.
                 child_pages = std::max(snapshot_pages, local_prefill_peak());
             } else if (group.retention == CacheGroupConfig::Retention::SlidingWindow) {
                 const std::int64_t dense_pages =
@@ -160,6 +159,20 @@ std::vector<std::int64_t> CapacityModel::SingleRequestGroupPages(std::int32_t to
             }
         } else {
             child_pages = local_prefill_peak();
+        }
+        if (group.IsSnapshotStateGroup() && decode_width > 0 && token_limit > 0) {
+            // With request TokenSize T, Decode reclaims below
+            // floor((T - decode_width - 1) / block_granularity), while its
+            // next verify reservation can reach T + decode_width - 1.
+            // Overlap retains one additional reservation. A latest checkpoint
+            // may remain as one older table slot outside this working window.
+            const std::int64_t decode_window_pages =
+                ceilDiv(2 * decode_width + protected_tokens + block_granularity - 1, block_granularity);
+            // A short request cannot occupy more slots than its absolute
+            // table extent, including the final verify window's overshoot.
+            const std::int64_t decode_dense_pages = ceilDiv(
+                static_cast<std::int64_t>(token_limit) + decode_width + protected_tokens - 1, block_granularity);
+            child_pages = std::max(child_pages, std::min(decode_dense_pages, decode_window_pages + 1));
         }
         group_pages[i] = child_pages;
     }

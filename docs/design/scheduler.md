@@ -179,6 +179,49 @@ The capacity guarantees are retention-specific:
   The P role and intermediate local chunks reserve no growth block (the next
   sparse re-shaping requires `AvailableTokens() == 0`).
 
+#### State-cache cleanup
+
+An ordinary state Chunk is removed once the cache index is its only owner.
+Each request holds its latest complete Decode snapshot in protected slots of
+its original block tables. Cleanup runs when working or load-back references
+are released, and when a request releases an expired protected slot. It checks
+registration generations and does not depend on capacity pressure. Prefix reuse does not permanently
+exempt a Chunk from cleanup. Endpoint and Promoted keep their existing kinds;
+MLA/full-history and sliding-window cleanup and ordering are unchanged.
+
+The last reusable Prefill boundary is Endpoint, including a boundary followed
+by a final tail shorter than the prefix granularity. Decode records its latest
+complete, actually written aligned endpoint without upgrading its kind or
+adding a separate reference holder. The coordinator validates every state
+group before changing any protected slot. It protects the new snapshot before
+releasing old slots that have already left the working window. Other expired
+slots continue to be reclaimed even if no new aligned snapshot appears.
+Each sharing request keeps its own table reference; only the last owner can
+make that ordinary Chunk eligible for cleanup. A protected latest cannot be
+capacity-evicted. Admission excludes its slot from both reclaim candidates and
+guaranteed-release credit, while retaining the original epoch, tier and position
+ordering without a separate state-first pass. Its shadow plan first credits ordinary
+Chunks that the same commit is guaranteed to release, so that cleanup does
+not cause unnecessary eviction of other entries.
+
+Finish upgrades the newest complete resident snapshot valid for the returned
+prefix to Endpoint even if the last round added no hash. Without such a
+snapshot it creates no Endpoint. Retraction's existing best-effort L2 writeback
+selects and upgrades a complete recovery point. Both retain the selected
+boundary before clearing latest and freeing request ownership. Retraction
+without L2 does not add a new Endpoint publication path. Ordinary state Chunks,
+including latest, do not start L2 stores. Existing Host copies and in-flight
+transfer protection remain intact. Selection and publication use the raw
+accepted endpoint, separately from host-truncated output and the conservative
+admission frontier. Feedback packets containing Abort acknowledge the forward
+without publishing its new Decode snapshot. Abort clears latest and frees its
+ordinary state; earlier Endpoint/Promoted entries remain reusable.
+
+KDA uses non-mixed batches. This policy does not change its kernel outputs or
+transfer fences. All request references remain in the original block tables,
+so active-page accounting and retract release estimates need no new holder
+accounting.
+
 ### 1.3 Bounded replay
 
 A sliding History group can be declared **replayable** (`CacheGroupConfig::
@@ -309,6 +352,15 @@ single-forward execution with prefix caching disabled. Narrower state blocks
 must count the entire materialized suffix, not assume that two outputs always
 occupy two adjacent slots. Tests cover small pools that must reject an oversized
 request instead of accepting a request that can never produce a forward.
+
+Decode has a separate state peak: for verification width `W`, state block
+granularity `G`, and overlap protection `O` tokens, its working window needs at
+most `ceil((2W + O + G - 1) / G)` blocks. One older protected checkpoint can sit
+outside that window. Their combined bound is capped by the absolute table
+extent, `ceil((token_limit + W + O - 1) / G)`, including verification beyond
+the final output limit. The state-group budget takes the maximum of this
+Decode peak and the existing Prefill/remote-landing peaks, then converts it to
+physical LCM blocks using the group's packing.
 
 ## 2. Retraction: when admission fails
 

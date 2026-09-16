@@ -189,6 +189,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::forward::ExtendResult::request_id)
         .def_rw("tokens", &tokenspeed::forward::ExtendResult::tokens)
+        .def_rw("num_accepted_tokens", &tokenspeed::forward::ExtendResult::num_accepted_tokens)
         .def_rw("spec_candidate_ids", &tokenspeed::forward::ExtendResult::spec_candidate_ids);
 
     nb::class_<tokenspeed::forward::Finish>(forward_event, "Finish")

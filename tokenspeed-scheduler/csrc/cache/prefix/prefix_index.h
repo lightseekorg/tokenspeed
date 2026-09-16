@@ -68,6 +68,7 @@ public:
         std::int32_t logical_block_index{-1};
         CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
         bool was_acquired{false};
+        std::uint64_t generation{0};
     };
 
     // Non-owning traversal state, bound on first use to one index/pool. The
@@ -129,6 +130,7 @@ public:
             .last_access_epoch = access_epoch,
             .logical_block_index = logical_block_index,
             .boundary_kind = boundary_kind,
+            .generation = ++next_generation_,
         });
         CacheEntryIterator entry_it = std::prev(cache_index.entries.end());
         cache_index.by_key.emplace(entry_it->key, entry_it);
@@ -197,6 +199,45 @@ public:
             return std::nullopt;
         }
         return metadataOf(*entry_it);
+    }
+
+    std::optional<CachedBlockMetadata> MetadataFor(const BlockPool& pool, const CacheKey& key) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return std::nullopt;
+        }
+        ConstCacheEntryIterator entry_it = findEntry(*cache_index, key);
+        return entry_it == cache_index->entries.end() ? std::nullopt : std::optional{metadataOf(*entry_it)};
+    }
+
+    std::optional<CachedStateBlock> IdentityFor(const BlockPool& pool, CacheBlockLocation location) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return std::nullopt;
+        }
+        ConstCacheEntryIterator entry_it = findEntry(*cache_index, location);
+        if (entry_it == cache_index->entries.end()) {
+            return std::nullopt;
+        }
+        return CachedStateBlock{.key = entry_it->key, .generation = entry_it->generation};
+    }
+
+    // Upgrade an existing identity without acquiring a block or changing its
+    // access epoch. A stale handle cannot upgrade a replacement entry.
+    bool Retain(const BlockPool& pool, const CachedStateBlock& block, CacheBoundaryKind boundary_kind) {
+        if (boundary_kind != CacheBoundaryKind::kEndpoint && boundary_kind != CacheBoundaryKind::kPromoted) {
+            return false;
+        }
+        CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return false;
+        }
+        CacheEntryIterator entry_it = findEntry(*cache_index, block.key);
+        if (entry_it == cache_index->entries.end() || entry_it->generation != block.generation) {
+            return false;
+        }
+        entry_it->boundary_kind = std::max(entry_it->boundary_kind, boundary_kind);
+        return true;
     }
 
     // Appends all unpinned entries of the next epoch containing candidates.
@@ -273,6 +314,24 @@ public:
         }
         CacheEntryIterator entry_it = findEntry(*cache_index, location);
         if (entry_it == cache_index->entries.end() || !entry_it->block_ref.unique()) {
+            return std::nullopt;
+        }
+        CacheKey key = entry_it->key;
+        eraseEntry(*cache_index, entry_it);
+        return key;
+    }
+
+    // Release only the recorded registration, if its kind still matches and
+    // no request or transfer holds a reference.
+    std::optional<CacheKey> Evict(const BlockPool& pool, const CachedStateBlock& block,
+                                  CacheBoundaryKind expected_kind) {
+        CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return std::nullopt;
+        }
+        CacheEntryIterator entry_it = findEntry(*cache_index, block.key);
+        if (entry_it == cache_index->entries.end() || entry_it->generation != block.generation ||
+            entry_it->boundary_kind != expected_kind || !entry_it->block_ref.unique()) {
             return std::nullopt;
         }
         CacheKey key = entry_it->key;
@@ -359,6 +418,7 @@ private:
         CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
         // Set only after a successful request admission acquires this entry.
         bool was_acquired{false};
+        std::uint64_t generation{0};
     };
 
     struct CacheEntries {
@@ -379,6 +439,7 @@ private:
             .logical_block_index = cache_entry.logical_block_index,
             .boundary_kind = cache_entry.boundary_kind,
             .was_acquired = cache_entry.was_acquired,
+            .generation = cache_entry.generation,
         };
     }
     static EvictionOrder evictionOrder(const CacheEntry& cache_entry) {
@@ -444,6 +505,7 @@ private:
     }
 
     std::uint32_t group_id_;
+    std::uint64_t next_generation_{0};
     std::unordered_map<const BlockPool*, CacheEntries> cache_entries_by_pool_;
 };
 

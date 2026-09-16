@@ -115,6 +115,71 @@ def test_mixed_forward_updates_reserve_for_decode_slots_only():
     assert len(reserve_events) == 1
     assert reserve_events[0].request_id == "decode"
     assert reserve_events[0].reserve_num_tokens_in_next_schedule_event == 1
+    extend_events = [
+        event for event in events if type(event).__name__ == "ExtendResult"
+    ]
+    assert {event.request_id: event.num_accepted_tokens for event in extend_events} == {
+        "prefill": 1,
+        "decode": 1,
+    }
+
+
+@pytest.mark.parametrize("stop_reason", ["eos", "length", "grammar"])
+def test_truncated_decode_feedback_preserves_gpu_accepted_count(stop_reason):
+    """Visible output may stop before the state committed by the GPU."""
+    processor = OutputProcesser(
+        _Sender(),
+        attn_tp_rank=0,
+        spec_algorithm="eagle",
+        spec_num_tokens=4,
+        metrics=_Metrics(),
+    )
+    state = _state([5, 6, 7], computed_length=3)
+    state.output_ids = [8]  # The first token was emitted by prefill.
+    if stop_reason == "eos":
+        state.sampling_params.ignore_eos = False
+        state.tokenizer.eos_token_id = 22
+    elif stop_reason == "length":
+        state.sampling_params.max_new_tokens = 3
+    else:
+
+        class _TerminatingMatcher(_Matcher):
+            def is_terminated(self) -> bool:
+                return self.accepted[-1:] == [22]
+
+        state.grammar = _TerminatingMatcher()
+    processor.rid_to_state["decode"] = state
+
+    class _SpecForwardOp:
+        request_ids = ["decode"]
+        request_pool_indices = [0]
+        input_lengths = [1]
+        prefill_lengths = []
+        extend_prefix_lens = []
+
+        def num_extends(self):
+            return 0
+
+    result = _ExecutionResult()
+    result.output_tokens = torch.tensor([11, 22, 33, 44], dtype=torch.int32)
+    result.output_lengths = torch.tensor([3], dtype=torch.int32)
+
+    events = processor.post_process_forward_op(
+        _SpecForwardOp(), result, is_prefill_instance=False
+    )
+
+    assert state.output_ids == [8, 11, 22]
+    assert state.finished_reason.to_json() == (
+        {"type": "length", "length": 3}
+        if stop_reason == "length"
+        else {"type": "stop", "matched": 22}
+    )
+    assert [type(event).__name__ for event in events] == ["ExtendResult", "Finish"]
+    assert list(events[0].tokens) == [11, 22]
+    assert events[0].num_accepted_tokens == 3
+    assert "decode" not in processor.rid_to_state
+    if stop_reason == "grammar":
+        assert state.grammar.accepted == [11, 22]
 
 
 def test_cached_tokens_count_the_replayed_window_as_a_hit():
@@ -239,6 +304,7 @@ def test_nan_flag_keeps_single_sanitized_token():
     extend_events = [e for e in events if type(e).__name__ == "ExtendResult"]
     assert len(extend_events) == 1
     assert list(extend_events[0].tokens) == [11]
+    assert extend_events[0].num_accepted_tokens == 3
     assert metrics.nan_aborts == 1
 
 
@@ -605,6 +671,31 @@ class _MismatchedPrefillExecutionResult(_PrefillExecutionResult):
     next_input_ids = torch.tensor([[201, 202, 203]], dtype=torch.int32)
 
 
+@pytest.mark.parametrize("is_prefill_instance", [False, True])
+def test_intermediate_prefill_feedback_has_no_accepted_tokens(is_prefill_instance):
+    processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
+    state = _state(list(range(8)))
+    processor.rid_to_state["prefill"] = state
+    forward_op = _PrefillForwardOp()
+    forward_op.prefill_lengths = [8]
+
+    events = processor.post_process_forward_op(
+        forward_op,
+        _PrefillExecutionResult(),
+        is_prefill_instance=is_prefill_instance,
+    )
+
+    # The model's sampled token is not an accepted generation token for a
+    # non-final prefill chunk; only the state-write ACK reaches the scheduler.
+    assert [type(event).__name__ for event in events] == ["ExtendResult"]
+    assert list(events[0].tokens) == []
+    assert events[0].num_accepted_tokens == 0
+    assert state.computed_length == 4
+    assert state.output_ids == []
+    assert not state.finished
+    assert processor.rid_to_state["prefill"] is state
+
+
 def test_prefill_final_chunk_folds_spec_candidates_into_the_extend_result():
     """The scheduler's remote decode is self-contained: the drafter candidates
     ride the final chunk's ExtendResult (the bootstrap token is tokens[0],
@@ -622,6 +713,7 @@ def test_prefill_final_chunk_folds_spec_candidates_into_the_extend_result():
     extend = next(e for e in events if type(e).__name__ == "ExtendResult")
     assert list(extend.tokens)[0] == 101
     assert list(extend.spec_candidate_ids) == [101, 102, 103]
+    assert extend.num_accepted_tokens == 1
 
 
 def test_prefill_extend_result_does_not_guess_from_next_input_ids():

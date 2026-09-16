@@ -22,6 +22,7 @@
 
 #include <concepts>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -199,7 +200,11 @@ public:
     // tables the same admission fills: resources and progress land at
     // admission time, and a state transition only moves them on.
     fsm::CacheProgress& CacheProgressRef() { return forwardResources("CacheProgressRef").cache_progress; }
-
+    void NoteAcceptedStateEndpoint(std::int32_t endpoint) { accepted_state_endpoint_tokens_ = endpoint; }
+    void SetLatestDecodeStateBoundary(std::int32_t boundary_tokens) {
+        forwardResources("SetLatestDecodeStateBoundary").cache_progress.latest_decode_state_boundary_tokens =
+            boundary_tokens;
+    }
     std::int32_t ReserveNumTokensInNextScheduleEvent() const {
         return std::visit(
             Overloaded{
@@ -239,6 +244,9 @@ private:
     std::int32_t submitted_prompt_size_{0};
     std::int32_t max_new_tokens_{0};
     std::int32_t retraction_count_{0};
+    // The actual state endpoint before host-side EOS/grammar truncation. A
+    // larger endpoint cannot be published as the shorter returned prefix.
+    std::optional<std::int32_t> accepted_state_endpoint_tokens_;
     std::vector<std::int32_t> spec_candidate_ids_;
     std::int32_t prefix_granularity_{};
     fsm::State state_;

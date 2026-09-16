@@ -45,6 +45,7 @@ public:
     std::int32_t NumBlocks() const { return static_cast<std::int32_t>(blocks_.size()); }
     std::int32_t AvailableTokens() const { return available_tokens_; }
     std::int32_t ReclaimedPrefixBlocks() const { return reclaimed_prefix_blocks_; }
+    std::int32_t ProtectedSlot() const { return protected_slot_; }
 
     CacheBlockRef EvictToNull(std::int32_t index) {
         _assert(0 <= index && index < static_cast<std::int32_t>(blocks_.size()), "EvictToNull index out of range");
@@ -61,10 +62,12 @@ private:
     // Unconsumed capacity at the logical tail. This may span multiple blocks
     // when admission preallocates a later decode/MTP step.
     std::int32_t available_tokens_{0};
-    // Slots below this monotonic frontier have already released their request
-    // ownership. Sparse state tables may contain holes between live islands,
-    // so reclaim cannot infer this frontier from the first null slot.
+    // Slots below this monotonic frontier have released their request ownership,
+    // except for protected_slot_. Sparse state tables may contain holes between
+    // live islands, so reclaim cannot infer this frontier from the first null slot.
     std::int32_t reclaimed_prefix_blocks_{0};
+    // Retain the original table reference for one complete state checkpoint.
+    std::int32_t protected_slot_{-1};
 };
 
 // LCM ownership ids for scheduler accounting/debugging. Kernel-facing page

@@ -9,6 +9,7 @@
 #include "cache/core/cache_types.h"
 #include "cache/tier/transfer.h"
 #include "cache/tier/transfer_manager.h"
+#include "cache_test_access.h"
 #include "scheduler/scheduler.h"
 #include "scheduler/types.h"
 
@@ -431,6 +432,59 @@ TEST(CacheOperationTest, DecodeRejectsRequestWhoseMaximumExtentCannotFitDevice) 
     EXPECT_THROW(scheduler.SubmitRequests({spec}), std::invalid_argument);
 }
 
+TEST(CacheOperationTest, RetractionReleaseEstimateIncludesProtectedSlotsBehindTheReclaimFrontier) {
+    BlockPool pool(3, {1});
+    const std::array specs{CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = 2}};
+    auto coordinator = MakeCoordinator(specs, 2, pool, nullptr, false);
+    std::vector<BlockTable> tables(1);
+    const std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{4}}};
+    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt));
+    const auto latest = CacheCoordinatorTestAccess::PublishStateSnapshot(
+        coordinator, tables, std::vector<std::string>{"latest"}, 2, 1, CacheBoundaryKind::kChunk);
+    ASSERT_TRUE(latest);
+    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(coordinator, tables, *latest));
+    coordinator.ReclaimExpired(tables, 4);
+    ASSERT_EQ(tables[0].ReclaimedPrefixBlocks(), 1);
+    ASSERT_TRUE(tables[0].Blocks()[0]);
+    EXPECT_EQ(tables[0].Blocks()[0].use_count(), 2u);
+    EXPECT_EQ(coordinator.NumNewlyReleasableLcmBlocks(tables), 2)
+        << "the old protected slot and current working page are both in this request's table";
+
+    std::vector<BlockTable> other(1);
+    other[0] = BlockTable::FromBlocks({coordinator.AcquireDeviceCachedBlock(latest->blocks[0].key)}, 0);
+    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(coordinator, other, *latest));
+    coordinator.ReclaimExpired(other, 4);
+    EXPECT_EQ(coordinator.NumNewlyReleasableLcmBlocks(tables), 1);
+    coordinator.Free(other);
+    EXPECT_EQ(coordinator.NumNewlyReleasableLcmBlocks(tables), 2);
+    coordinator.Free(tables);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), pool.NumLcmBlocks());
+}
+
+TEST(CacheOperationTest, RetractionReleaseEstimateDoesNotReleaseAProtectedSlotsSharedPackedParent) {
+    BlockPool pool(2, {2});
+    const std::array specs{
+        CacheGroupSpec{.kind = AttnKind::kMambaState, .cache_blocks_per_lcm_block = 2, .block_granularity = 2}};
+    auto coordinator = MakeCoordinator(specs, 2, pool, nullptr, false);
+    std::vector<BlockTable> tables(1);
+    const std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{6}}};
+    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt));
+    const auto latest = CacheCoordinatorTestAccess::PublishStateSnapshot(
+        coordinator, tables, std::vector<std::string>{"latest"}, 2, 1, CacheBoundaryKind::kChunk);
+    ASSERT_TRUE(latest);
+    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(coordinator, tables, *latest));
+    std::vector<BlockTable> other(1);
+    other[0] = BlockTable::FromBlocks({tables[0].EvictToNull(1)}, 0);
+    ASSERT_EQ(tables[0].Blocks()[0]->Location().lcm_block_id, other[0].Blocks()[0]->Location().lcm_block_id);
+    coordinator.ReclaimExpired(tables, 4);
+    EXPECT_EQ(coordinator.NumNewlyReleasableLcmBlocks(tables), 1)
+        << "only the separate working parent is released while the packed sibling has another owner";
+    coordinator.Free(other);
+    EXPECT_EQ(coordinator.NumNewlyReleasableLcmBlocks(tables), 2);
+    coordinator.Free(tables);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), pool.NumLcmBlocks());
+}
+
 TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeTokens) {
     SchedulerConfig config;
     config.prefix_granularity = 2;
@@ -456,6 +510,156 @@ TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeToken
     };
 
     EXPECT_NO_THROW(scheduler.SubmitRequests({spec}));
+}
+
+TEST(CacheOperationTest, StateEndpointStoreKeepsGuardContractAndExistingHostCopy) {
+    for (const auto guard : {StoreSourceGuard::kPinnedUntilAck, StoreSourceGuard::kStreamOrdered}) {
+        SCOPED_TRACE(static_cast<int>(guard));
+        BlockPool pool(2, {1});
+        BlockPool host_pool(2, {1});
+        const std::array specs{CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = 2}};
+        auto coordinator = MakeCoordinator(specs, 2, pool, &host_pool, true);
+        TierTransferManager transfers(coordinator);
+        const std::vector<std::string> hashes{"state2"};
+        const CacheKey key{.group_id = 0, .content_hash = hashes[0]};
+        std::vector<BlockTable> tables{BlockTable::FromBlocks({pool.AcquireBlock(0)}, 0)};
+        CacheCompletedBlocksForTest(coordinator, tables, hashes, 1, 0, 2, CacheBoundaryKind::kChunk, true,
+                                    std::array{2});
+        EXPECT_FALSE(transfers.StartPendingStores(guard)) << "Prefill Chunk must not auto-stream";
+        const auto snapshot = CacheCoordinatorTestAccess::CaptureStateSnapshot(coordinator, hashes, 2);
+        ASSERT_TRUE(snapshot);
+        coordinator.QueueStateSnapshotForStore(*snapshot);
+        EXPECT_FALSE(transfers.StartPendingStores(guard)) << "explicit queue still requires a retained endpoint";
+        const auto retained = coordinator.RetainLatestStateSnapshot(hashes, CacheBoundaryKind::kEndpoint);
+        ASSERT_TRUE(retained);
+        EXPECT_EQ(retained->boundary_tokens, 2);
+        coordinator.QueueStateSnapshotForStore(*retained);
+        const auto store = transfers.StartPendingStores(guard);
+        ASSERT_TRUE(store);
+        ASSERT_EQ(store->transfers.size(), 1u);
+        EXPECT_EQ(store->transfers[0].group_id, 0u);
+        EXPECT_EQ(store->source_pinned, guard == StoreSourceGuard::kPinnedUntilAck);
+        coordinator.QueueStateSnapshotForStore(*snapshot);
+        EXPECT_FALSE(transfers.StartPendingStores(guard)) << "do not duplicate an in-flight key";
+        coordinator.Free(tables);
+        EXPECT_EQ(coordinator.ClearDeviceCache(), guard == StoreSourceGuard::kStreamOrdered);
+        EXPECT_FALSE(coordinator.ContainsHostCachedBlock(key)) << "Host publication waits for the ACK";
+        transfers.CompleteWriteBack(store->op_id);
+        EXPECT_FALSE(transfers.HasAnyInFlight());
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key));
+        EXPECT_TRUE(coordinator.ClearDeviceCache());
+
+        // A new ordinary Device Chunk with the same key does not erase or
+        // replace an already valid Host checkpoint.
+        tables[0] = BlockTable::FromBlocks({pool.AcquireBlock(0)}, 0);
+        CacheCompletedBlocksForTest(coordinator, tables, hashes, 2, 0, 2, CacheBoundaryKind::kChunk, true,
+                                    std::array{2});
+        const auto replacement = CacheCoordinatorTestAccess::CaptureStateSnapshot(coordinator, hashes, 2);
+        ASSERT_TRUE(replacement);
+        EXPECT_FALSE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(coordinator, *snapshot));
+        EXPECT_FALSE(coordinator.CanStoreDeviceCachedBlock(key));
+        coordinator.QueueStateSnapshotForStore(*replacement);
+        EXPECT_FALSE(transfers.StartPendingStores(guard));
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key));
+        EXPECT_EQ(coordinator.NumHostCachedBlocks(), 1);
+        coordinator.Free(tables);
+    }
+}
+
+TEST(CacheOperationTest, PendingEndpointStoreRejectsReinsertedOrdinaryStateChunk) {
+    BlockPool pool(1, {1});
+    BlockPool host_pool(1, {1});
+    const std::array specs{CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = 2}};
+    auto coordinator = MakeCoordinator(specs, 2, pool, &host_pool, true);
+    TierTransferManager transfers(coordinator);
+    const std::vector<std::string> hashes{"same-key"};
+    const CacheKey key{.group_id = 0, .content_hash = hashes[0]};
+    std::vector<BlockTable> tables{BlockTable::FromBlocks({pool.AcquireBlock(0)}, 0)};
+    const auto snapshot = CacheCoordinatorTestAccess::PublishStateSnapshot(coordinator, tables, hashes, 2, 1,
+                                                                           CacheBoundaryKind::kEndpoint);
+    ASSERT_TRUE(snapshot);
+    const auto old_location = tables[0].Blocks()[0]->Location();
+    coordinator.QueueStateSnapshotForStore(*snapshot);
+    coordinator.Free(tables);
+    // ClearDeviceCache also clears pending_stores_, which would bypass the
+    // send-time metadata check. Evict only the old entry and retain its queue.
+    ASSERT_EQ(coordinator.GroupPrefixIndex(0).Evict(pool, old_location), key);
+    tables[0] = BlockTable::FromBlocks({pool.AcquireBlock(0)}, 0);
+    const auto replacement =
+        CacheCoordinatorTestAccess::PublishStateSnapshot(coordinator, tables, hashes, 2, 2, CacheBoundaryKind::kChunk);
+    ASSERT_TRUE(replacement);
+    EXPECT_EQ(tables[0].Blocks()[0]->Location(), old_location);
+    EXPECT_NE(replacement->blocks[0].generation, snapshot->blocks[0].generation);
+    const auto metadata = coordinator.GroupPrefixIndex(0).MetadataFor(pool, key);
+    ASSERT_TRUE(metadata);
+    EXPECT_EQ(metadata->boundary_kind, CacheBoundaryKind::kChunk);
+    EXPECT_EQ(metadata->generation, replacement->blocks[0].generation);
+    const auto pending = CacheCoordinatorTestAccess::PendingStores(coordinator);
+    ASSERT_EQ(pending.size(), 1u) << "the old Endpoint candidate must still reach StartPendingStores";
+    EXPECT_EQ(pending[0].key, key);
+    EXPECT_FALSE(transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck))
+        << "recheck current metadata, not the stale queue's former Endpoint kind";
+    EXPECT_TRUE(CacheCoordinatorTestAccess::PendingStores(coordinator).empty());
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(key));
+    EXPECT_EQ(coordinator.NumHostCachedBlocks(), 0);
+    coordinator.Free(tables);
+}
+
+TEST(CacheOperationTest, LoadAckReclaimsUnusedStateButPreservesLiveLatestAndExistingHost) {
+    for (const bool keep_latest : {false, true}) {
+        SCOPED_TRACE(keep_latest);
+        BlockPool pool(1, {1});
+        BlockPool host_pool(1, {1});
+        const std::array specs{CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = 2}};
+        auto coordinator = MakeCoordinator(specs, 2, pool, &host_pool, true);
+        TierTransferManager transfers(coordinator);
+        const std::vector<std::string> hashes{"loaded-state"};
+        const CacheKey key{.group_id = 0, .content_hash = hashes[0]};
+        std::vector<BlockTable> tables{BlockTable::FromBlocks({pool.AcquireBlock(0)}, 0)};
+        const auto location = tables[0].Blocks()[0]->Location();
+        const auto snapshot = CacheCoordinatorTestAccess::PublishStateSnapshot(coordinator, tables, hashes, 2, 1,
+                                                                               CacheBoundaryKind::kChunk);
+        ASSERT_TRUE(snapshot);
+        CacheBlockRef host_source = coordinator.AcquireHostBlock(0);
+        ASSERT_TRUE(host_source);
+        coordinator.CacheHostBlock(host_source, key);
+        std::vector<BlockTransfer> pairs;
+        pairs.push_back(
+            BlockTransfer{.source = std::move(host_source), .destination = coordinator.AcquireDeviceCachedBlock(key)});
+        const auto load = transfers.StartPrefixLoad(std::move(pairs));
+        ASSERT_EQ(load.transfers.size(), 1u);
+        std::vector<BlockTable> latest_tables(1);
+        if (keep_latest) {
+            latest_tables[0] = BlockTable::FromBlocks({coordinator.AcquireDeviceCachedBlock(key)}, 0);
+            ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(coordinator, latest_tables, *snapshot));
+            coordinator.ReclaimExpired(latest_tables, 4);
+        }
+
+        coordinator.Free(tables);
+        EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, key));
+        EXPECT_TRUE(transfers.HasAnyInFlight());
+        transfers.CompleteLoadBack(load.op_id);
+        EXPECT_FALSE(transfers.HasAnyInFlight());
+        EXPECT_EQ(coordinator.GroupPrefixIndex(0).Contains(pool, key), keep_latest);
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key));
+        EXPECT_EQ(coordinator.NumHostCachedBlocks(), 1);
+        EXPECT_TRUE(coordinator.TakePendingStores().empty()) << "ordinary Chunk starts no new L2 store";
+        coordinator.ClearProtectedStateSnapshot(latest_tables);
+        EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, key));
+
+        // A duplicate old ACK must not act on a new registration that reused
+        // both its key and its physical destination.
+        tables[0] = BlockTable::FromBlocks({pool.AcquireBlock(0)}, 0);
+        ASSERT_EQ(tables[0].Blocks()[0]->Location(), location);
+        const auto replacement = CacheCoordinatorTestAccess::PublishStateSnapshot(coordinator, tables, hashes, 2, 2,
+                                                                                  CacheBoundaryKind::kChunk);
+        ASSERT_TRUE(replacement);
+        ASSERT_NE(replacement->blocks[0].generation, snapshot->blocks[0].generation);
+        transfers.CompleteLoadBack(load.op_id);
+        EXPECT_TRUE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(coordinator, *replacement));
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key));
+        coordinator.Free(tables);
+    }
 }
 
 }  // namespace tokenspeed::test

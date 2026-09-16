@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "cache/coordinator/cache_coordinator.h"
+#include "utils.h"
 
 namespace tokenspeed {
 
@@ -37,6 +38,38 @@ struct CacheCoordinatorTestAccess {
     }
 
     static std::uint64_t NextAccessEpoch(CacheCoordinator& coordinator) { return ++coordinator.next_access_epoch_; }
+
+    static std::span<const CacheCoordinator::StoreCandidate> PendingStores(const CacheCoordinator& coordinator) {
+        return coordinator.pending_stores_;
+    }
+
+    static std::optional<StateSnapshot> CaptureStateSnapshot(const CacheCoordinator& coordinator,
+                                                             std::span<const std::string> prefix_hashes,
+                                                             std::int32_t boundary_tokens) {
+        return coordinator.CaptureStateSnapshot(prefix_hashes, boundary_tokens);
+    }
+
+    static bool StateSnapshotIsCurrent(const CacheCoordinator& coordinator, const StateSnapshot& snapshot) {
+        return coordinator.StateSnapshotIsCurrent(snapshot);
+    }
+
+    static bool RetainStateSnapshot(CacheCoordinator& coordinator, const StateSnapshot& snapshot,
+                                    CacheBoundaryKind boundary_kind) {
+        return coordinator.RetainStateSnapshot(snapshot, boundary_kind);
+    }
+
+    static std::optional<StateSnapshot> PublishStateSnapshot(CacheCoordinator& coordinator,
+                                                             std::span<BlockTable> tables,
+                                                             std::span<const std::string> prefix_hashes,
+                                                             std::int32_t boundary_tokens, std::uint64_t access_epoch,
+                                                             CacheBoundaryKind boundary_kind) {
+        return coordinator.PublishStateSnapshot(tables, prefix_hashes, boundary_tokens, access_epoch, boundary_kind);
+    }
+
+    static bool ProtectStateSnapshot(CacheCoordinator& coordinator, std::span<BlockTable> tables,
+                                     const StateSnapshot& snapshot) {
+        return coordinator.ProtectStateSnapshot(tables, snapshot);
+    }
 };
 
 inline auto MatchPrefixForTest(CacheCoordinator& coordinator, std::span<const std::string> content_hashes) {
@@ -47,6 +80,28 @@ inline void CacheFullBlocksForTest(CacheCoordinator& coordinator, std::span<Bloc
                                    std::span<const std::string> content_hashes, std::int32_t first_slot = 0) {
     coordinator.CacheFullBlocks(tables, content_hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
                                 first_slot, CacheBoundaryKind::kChunk);
+}
+
+inline void CacheCompletedBlocksForTest(CacheCoordinator& coordinator, std::span<BlockTable> tables,
+                                        std::span<const std::string> prefix_hashes, std::uint64_t access_epoch,
+                                        std::int32_t first_new_prefix_page, std::int32_t num_computed_tokens,
+                                        CacheBoundaryKind boundary_kind, bool stream_completed_to_host,
+                                        std::span<const std::int32_t> materialized_state_boundaries) {
+    _assert(tables.size() == static_cast<std::size_t>(coordinator.NumGroups()), "tables/groups size mismatch");
+    _assert(first_new_prefix_page >= 0 && static_cast<std::size_t>(first_new_prefix_page) < prefix_hashes.size(),
+            "completed page range must be non-empty");
+    const RequestProgress progress{
+        .completed_pages =
+            CompletedPages{
+                .prefix_hashes = prefix_hashes,
+                .first_new_prefix_page = first_new_prefix_page,
+                .boundary_kind = boundary_kind,
+                .stream_completed_to_host = stream_completed_to_host,
+                .materialized_state_boundaries = materialized_state_boundaries,
+            },
+        .num_computed_tokens = num_computed_tokens,
+    };
+    coordinator.CacheCompletedBlocks(tables, progress, access_epoch);
 }
 
 // Admits every group with the same demand prototype as a new request.

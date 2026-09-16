@@ -160,13 +160,15 @@ public:
         _assert(destination_it == destination_refs.end(), "unused host extension destination");
     }
 
-    // Retention execution: the first num_expired_blocks table slots become
-    // null holes, so the table never shrinks and slot alignment stays stable.
+    // Retention execution: expired slots become null holes except for the
+    // protected slot. The frontier still advances past that retained island.
     // How many blocks expired is retention policy (GroupGeometry).
     void ReclaimExpired(BlockPool& /*pool*/, BlockTable& table, std::int32_t num_expired_blocks) {
         const std::int32_t expired = std::min(num_expired_blocks, table.NumBlocks());
         for (std::int32_t i = table.reclaimed_prefix_blocks_; i < expired; ++i) {
-            table.EvictToNull(i).reset();
+            if (i != table.protected_slot_) {
+                table.EvictToNull(i).reset();
+            }
         }
         table.reclaimed_prefix_blocks_ = std::max(table.reclaimed_prefix_blocks_, expired);
     }
@@ -178,7 +180,7 @@ public:
         std::int32_t freed = 0;
         for (std::int32_t i = table.ReclaimedPrefixBlocks(); i < expired; ++i) {
             const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(i)];
-            if (!block) {
+            if (i == table.ProtectedSlot() || !block) {
                 continue;
             }
             const bool cached = index.Contains(block);
@@ -196,7 +198,7 @@ public:
         std::vector<CacheBlockLocation> locations;
         for (std::int32_t i = table.ReclaimedPrefixBlocks(); i < expired; ++i) {
             const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(i)];
-            if (!block) {
+            if (i == table.ProtectedSlot() || !block) {
                 continue;
             }
             const bool cached = index.Contains(block);
@@ -205,6 +207,20 @@ public:
             }
         }
         return locations;
+    }
+
+    // Switch protection without copying a block reference. An old protected
+    // slot behind the reclaim frontier will never be visited again, so return
+    // its ownership for the coordinator to release after every group switches.
+    // An old slot still in the working window follows ordinary reclamation.
+    CacheBlockRef SetProtectedSlot(BlockTable& table, std::int32_t slot) {
+        _assert(slot == -1 || (0 <= slot && slot < table.NumBlocks() && table.blocks_[static_cast<std::size_t>(slot)]),
+                "protected slot must hold a block");
+        const std::int32_t previous = std::exchange(table.protected_slot_, slot);
+        if (previous != slot && previous >= 0 && previous < table.reclaimed_prefix_blocks_) {
+            return table.EvictToNull(previous);
+        }
+        return {};
     }
 
     void ConsumeReservedTokens(BlockTable& table, std::int32_t num_tokens) {
@@ -222,6 +238,7 @@ public:
         table.blocks_.clear();
         table.available_tokens_ = 0;
         table.reclaimed_prefix_blocks_ = 0;
+        table.protected_slot_ = -1;
     }
 
 private:
