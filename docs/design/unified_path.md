@@ -640,14 +640,31 @@ buffer; `fill_input_buffers` takes no table.
   degraded mapping fails closed to `-1` (skipped write), never to a raw
   fallback vector.
 
-## K3 target capture is configured once
+## Target capture is configured once during model setup
 
-`create_model_runner` calls the draft model's optional `configure_target`
-hook after loading. K3's model hook validates and installs its trained tap
-indices, stream and projection contract on every stage. The ordinary DSpark
-drafter binds embeddings and heads without changing that contract. A last
-pipeline stage borrows its local draft embedding when the target embedding
-lives elsewhere; this is resource binding, not a different proposal algorithm.
+`create_model_runner` calls `execution.factory.configure_draft_target`
+after both models load and before cache construction. DFLASH/DSPARK models
+must implement the explicit `TargetCaptureConfigurator` interface; missing
+implementations fail at setup. A method with the same name on an unrelated
+object is not treated as an implementation or as evidence of prior setup.
+DFlash, DFlash2 and generic DSpark use their model's ordinary capture setup;
+K3 owns its trained stream/projection contract; DeepSeek V4/V4.1 DSpark owns
+its checkpoint tap selection. `models/target_capture.py` contains only the
+shared interface. DFlash checkpoint parsing and target configuration live in
+`DFlashDraftModel.configure_target`, inherited by DFlash2 and generic DSpark.
+Setup calls only the parent interface
+`configure_target`; each concrete draft directly adapts to its target family.
+There is no generic DSpark helper probing for a DeepSeek-specific setter, and
+K3 targets need not implement that setter. EAGLE3 selection remains in this same setup
+phase, including its explicit server-argument override.
+
+This runs on every PP stage even when that stage has no executing drafter.
+`wire_target` only binds embeddings, heads and other execution resources; it
+never selects capture layers, changes streams or replaces the output layout.
+There is no configured flag or optional-method probe in resource binding.
+A last pipeline stage borrows its local draft embedding when the target
+embedding lives elsewhere; this is resource binding, not a different proposal
+algorithm. Per-forward capture hooks consume the established configuration.
 
 Checkpoint tap labels remain zero-based completed-layer IDs. Prefix tap L is
 produced after L. AttnRes tap L is produced at L+1's entry by that layer's
@@ -657,7 +674,13 @@ use this same owner on both PP and non-PP. There is no boundary deferral or
 recovery operation. Capture's mixed stream must not be replaced by the fused
 attention input, which already includes input-layer normalization.
 
-Unquantized K3 drafts use `TargetContextProducer` on both topologies: normalize
+`execution/dspark_context.py` contains `DSparkContextProducer` and the model
+interface it consumes. K3 tap ownership and projection arithmetic live in
+`models/kimi_k3_dspark.py`; the producer does not interpret K3 layer IDs.
+This interface covers DSpark context production, not a requirement for all
+draft algorithms. K3 DSpark is currently the model using this production path.
+
+Unquantized K3 drafts use `DSparkContextProducer` on both topologies: normalize
 each tap if configured, apply its projection columns, sum in FP32, then apply
 context normalization once. The accumulator stays local or travels with the
 chunk's PP state. Only the final owner writes native context KV. Quantized
@@ -666,10 +689,13 @@ per-tap weight slicing is not a quantized linear operation. PP drafts require
 unquantized projection weights.
 
 The producer is stateless across forwards. Each chunk owns its accumulator;
-queued chunks cannot alias it. `ctx.target_context_ready` is published after
-native writes are enqueued on the forward stream. The common block drafter
-still updates accepted-prefix lengths, but does not project/write those rows
-again. Its optional auxiliary-stream writer is disabled for a forward with
+queued chunks cannot alias it. A configured `ctx.dspark_context_producer`
+owns native context writes during target forward; otherwise the drafter owns
+them. This responsibility is fixed at construction, not inferred from a
+per-round readiness flag. The producer enqueues writes before the drafter on
+the same stream; failures propagate instead of selecting a fallback writer.
+The common block drafter always updates accepted-prefix lengths, but only
+projects/writes context when no producer is configured. Its optional auxiliary-stream writer is disabled for a forward with
 this producer, avoiding a second writer or a missing stream dependency.
 The final PD readiness barrier remains after the whole proposal call, since
 proposal execution can write the same draft fields after context injection.

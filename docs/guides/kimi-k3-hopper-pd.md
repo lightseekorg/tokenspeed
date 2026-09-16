@@ -147,29 +147,35 @@ replica's latent batch before normalization and the shared/up-projection
 TP reduction. No full hidden-state or residual gather replicates the four
 attention-DP batches across EP32.
 
-Automatic low-latency capacity for token-sliced K3 in `auto` mode is:
+DeepEP low-latency send capacity defaults to 256 token rows per rank, as for
+other models. Use `--low-latency-max-num-tokens-per-gpu` to set it explicitly;
+the runtime does not automatically derive or validate a workload bound at startup.
+It rejects nonpositive values and rejects a low-latency dispatch whose actual
+source batch exceeds the configured capacity.
+
+For token-sliced K3 in `auto` mode, size the capacity to cover at least:
 
 ```text
 ceil((max_num_seqs // attention_DP) * verify_width / attention_TP)
 ```
 
-The D example allocates 32 source rows per EP rank. A smaller graph ladder
-does not reduce this capacity: eager batches above the ladder remain valid.
-An explicit `--low-latency-max-num-tokens-per-gpu` below the required bound
-fails at startup; a larger explicit value is respected. Other model paths
-retain their previous automatic value of 256. If `low_latency` is pinned,
-the capacity also covers the configured prefill/recovery chunk beside the
-decode batch before TP slicing, because no normal buffers exist. For the
-D example and an 8192-token chunk this requires 1056 rows per source rank
-and substantially more memory;
-an explicit decode-only capacity such as 32 is rejected. Prefer `auto` for
-the D engine.
+The D example needs at least 32 source rows per EP rank but retains the default
+256-row capacity unless explicitly changed. To reduce that allocation for this
+configuration, pass `--low-latency-max-num-tokens-per-gpu 32`. Size for the full
+admissible batch, not just the CUDA graph ladder: larger eager batches remain
+possible. The selected value must also satisfy DeepEP's alignment requirements.
+
+If `low_latency` is pinned, include the configured prefill/recovery chunk beside
+the decode batch before TP slicing, because no normal buffers exist. For the
+D example and an 8192-token chunk, this requires at least 1056 source rows per
+rank. The default 256 or a decode-only setting of 32 would be insufficient for
+that workload. Prefer `auto` to route extends through normal dispatch.
 
 DeepEP's own receive buffers still reserve expert capacity. The Marlin
 bridge uses device counts to construct aligned work and bound intermediate
 storage by source routes, avoiding SiTU work over the entire
 `experts * capacity` padding extent. Communication buffers are prepared
-with weights before KV memory profiling. Measure persistent memory and
+by the common DeepEP MoE weight-processing path before KV memory profiling. Measure persistent memory and
 capture/runtime peaks separately.
 
 Empty slices and idle DP ranks participate in both EP legs. The target's
@@ -191,11 +197,14 @@ attention mixing; the final layer uses the output mixing. A tap's owner is
 the stage with the weights needed to produce that stream.
 
 K3 capture selection is configured once after model loading through
-`K3DSparkModel.configure_target`, on every stage. The ordinary DSpark
-drafter binds execution resources without selecting taps again. K3 capture
-and projection semantics stay in the model.
+`K3DSparkModel.configure_target`, on every stage. All block-draft models
+implement the explicit `TargetCaptureConfigurator` setup interface. The
+ordinary DSpark drafter binds execution resources without selecting taps
+again; K3 capture and projection semantics stay in the model.
 
-PP and non-PP use the same per-tap projection. P stages pass one FP32
+`DSparkContextProducer` coordinates DSpark context accumulation and cache writes;
+the K3 draft model owns tap placement and projection arithmetic. PP and non-PP
+use the same per-tap projection. P stages pass one FP32
 `[tokens, draft_hidden]` accumulator alongside ordinary PP state. Per-tap
 `fc_norm` precedes projection; `context_norm` follows the complete sum.
 Every AttnRes tap L is captured at layer L+1's entry, before its input

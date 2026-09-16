@@ -50,6 +50,7 @@ from tokenspeed.runtime.layers.paged_attention import (
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -363,8 +364,41 @@ class DFlashDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class DFlashDraftModel(nn.Module):
+class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
     decoder_layer_cls = DFlashDecoderLayer
+
+    def configure_target(self, target_model, target_config) -> None:
+        """Install the capture inputs expected by this block-draft checkpoint."""
+        del target_config
+        nested = getattr(self.config, "dflash_config", {}) or {}
+        layer_ids = nested.get("target_layer_ids") or getattr(
+            self.config, "target_layer_ids", None
+        )
+        if not layer_ids:
+            raise ValueError(
+                "DFLASH draft config must define dflash_config.target_layer_ids."
+            )
+        stream = str(
+            nested.get("aux_hidden_stream")
+            or getattr(self.config, "aux_hidden_stream", None)
+            or "prefix"
+        ).lower()
+        if not hasattr(target_model, "set_dflash_layers_to_capture"):
+            raise ValueError(
+                "DFLASH requires the target model to support set_dflash_layers_to_capture."
+            )
+        stream_setter = getattr(target_model, "set_dflash_aux_hidden_stream", None)
+        if stream_setter is None and stream != "prefix":
+            raise ValueError(
+                f"The draft asks for the {stream!r} target hidden stream but "
+                f"{type(target_model).__name__} does not implement "
+                "set_dflash_aux_hidden_stream, so it can only supply 'prefix'."
+            )
+        target_model.set_dflash_layers_to_capture(
+            [int(layer_id) for layer_id in layer_ids]
+        )
+        if stream_setter is not None:
+            stream_setter(stream)
 
     def __init__(
         self,

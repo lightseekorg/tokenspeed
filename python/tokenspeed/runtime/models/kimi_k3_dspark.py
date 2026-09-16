@@ -61,19 +61,32 @@ from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfi
 from tokenspeed.runtime.layers.segmented_rmsnorm import segmented_rmsnorm
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
-from tokenspeed.runtime.models.context_projection import (
-    context_tap_owner_layer,
-    project_context_tap,
-)
 from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
     _prepare_mla_kv_b_proj_weights,
 )
 from tokenspeed.runtime.models.dflash import DFlashMLP
 from tokenspeed.runtime.models.dspark import VanillaMarkov
+from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
 
 logger = get_colorful_logger(__name__)
+
+
+def _context_tap_owner_layer(
+    layer_id: int, target_num_layers: int, aux_hidden_stream: str
+) -> int:
+    """Return the layer whose stage can produce a tap without extra weights.
+
+    Prefix taps belong to their completed layer. An AttnRes tap uses the next
+    layer's attention-mixing parameters, so it belongs to that consumer;
+    the final tap uses the last stage's output-mixing parameters.
+    """
+    if aux_hidden_stream == "prefix":
+        return layer_id
+    if aux_hidden_stream == "attn_res":
+        return min(layer_id + 1, target_num_layers - 1)
+    raise ValueError(f"Unknown target hidden stream {aux_hidden_stream!r}")
 
 
 class K3DSparkAttention(DeepseekV3AttentionMLA):
@@ -293,7 +306,7 @@ class K3DSparkDecoderLayer(nn.Module):
         return norm(hidden_states, residual)
 
 
-class K3DSparkModel(nn.Module):
+class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
     """The draft network. Interface-compatible with ``DFlashDraftModel``."""
 
     def __init__(
@@ -309,7 +322,7 @@ class K3DSparkModel(nn.Module):
             logger.warning("K3 DSpark: %s", note)
         self.config = config
         self.mapping = mapping
-        self.supports_target_context_projection = quant_config is None
+        self.supports_dspark_context_projection = quant_config is None
         self.attention_kind = "kimi_mla"
         hidden_size = int(config.hidden_size)
         eps = float(config.rms_norm_eps)
@@ -327,7 +340,7 @@ class K3DSparkModel(nn.Module):
             tap_index
             for tap_index, layer_id in enumerate(self.target_capture_layer_ids)
             if start
-            <= context_tap_owner_layer(
+            <= _context_tap_owner_layer(
                 int(layer_id),
                 num_target_execution_layers,
                 config.aux_hidden_stream,
@@ -405,7 +418,7 @@ class K3DSparkModel(nn.Module):
     def configure_target(self, target_model, target_config) -> None:
         """Bind trained tap indices and stream semantics on every owning stage."""
         validate_k3_dspark_config(self.config, target_config)
-        if self.supports_target_context_projection:
+        if self.supports_dspark_context_projection:
             target_model.set_target_context_capture(
                 list(self.target_capture_layer_ids),
                 self.config.aux_hidden_stream,
@@ -457,8 +470,9 @@ class K3DSparkModel(nn.Module):
         weight = self.context_proj.weight[
             :, local_idx * width : (local_idx + 1) * width
         ]
-        norm = self.fc_norm[local_idx] if self.fc_norm is not None else None
-        return project_context_tap(hidden, weight, norm)
+        if self.fc_norm is not None:
+            hidden = self.fc_norm[local_idx](hidden)
+        return torch.nn.functional.linear(hidden.to(weight.dtype), weight)
 
     def finalize_target_projection(self, projected: torch.Tensor) -> torch.Tensor:
         """Apply context RMSNorm once after all target taps have contributed."""

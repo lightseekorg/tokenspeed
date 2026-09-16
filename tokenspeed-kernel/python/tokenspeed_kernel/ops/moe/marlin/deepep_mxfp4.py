@@ -69,8 +69,8 @@ def _get_dispatcher(
 ) -> DeepEPDispatcher:
     """Build (once per plan) the dispatcher owning this layer's DeepEP legs.
 
-    Sizing comes from the plan rather than the live batch: the DeepEP buffer is
-    allocated on first use and reused for every later forward.
+    Sizing comes from the plan rather than the live batch. Common MoE weight
+    processing has already reserved the shared buffer; this dispatcher reuses it.
     """
     dispatcher = plan.get("_deepep_dispatcher")
     if dispatcher is not None:
@@ -106,23 +106,6 @@ def _get_dispatcher(
     )
     plan["_deepep_dispatcher"] = dispatcher
     return dispatcher
-
-
-def marlin_mxfp4_deepep_moe_weights(plan: dict, w: torch.nn.Module) -> None:
-    """Repack local weights and reserve DeepEP memory before cache sizing.
-
-    Args:
-        plan: DeepEP MoE plan including process group, mode, and capacity.
-        w: Local expert weights with num_experts/top_k and EP ownership.
-
-    Returns:
-        None; weights are repacked in place and the plan owns its dispatcher.
-    """
-    marlin_mxfp4_moe_weights(plan, w)
-    like = torch.empty(
-        (0, w._marlin_hidden_size), dtype=torch.bfloat16, device=w.w13_weight.device
-    )
-    _get_dispatcher(plan, w, like).prepare()
 
 
 def _apply_normal(
@@ -192,7 +175,7 @@ def _apply_low_latency(
     "apply",
     name="marlin_mxfp4_deepep_moe_apply",
     solution="marlin",
-    weight_preprocessor=marlin_mxfp4_deepep_moe_weights,
+    weight_preprocessor=marlin_mxfp4_moe_weights,
     capability=CapabilityRequirement(
         vendors=frozenset({"nvidia"}),
         min_arch_version=ArchVersion(9, 0),

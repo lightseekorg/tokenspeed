@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CPU coverage for shared local/pipeline context production."""
+"""CPU coverage for local and pipeline DSpark context production."""
 
 import os
 import sys
@@ -33,38 +33,34 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
-from tokenspeed.runtime.execution.context_producer import TargetContextProducer
-from tokenspeed.runtime.models.context_projection import (
-    context_tap_owner_layer,
-    project_context_tap,
+from tokenspeed.runtime.execution.dspark_context import DSparkContextProducer
+
+
+@pytest.mark.parametrize(
+    "stage_taps", [((0, 1, 2),), ((0,), (1,), (2,)), ((), (0, 1), (2,))]
 )
-
-
-@pytest.mark.parametrize("stream", ["prefix", "attn_res"])
-@pytest.mark.parametrize("windows", [((0, 8),), ((0, 3), (3, 5), (5, 8))])
-def test_pipeline_projection_matches_concatenated_reference(stream, windows):
+@pytest.mark.parametrize("with_tap_norm", [False, True])
+def test_pipeline_projection_matches_concatenated_reference(stage_taps, with_tap_norm):
     generator = torch.Generator().manual_seed(4)
     taps = (2, 4, 7)
     hidden = [torch.randn(5, 6, generator=generator) for _ in taps]
     weights = [torch.randn(4, 6, generator=generator) for _ in taps]
-    norms = [torch.nn.RMSNorm(6, eps=1e-5) for _ in taps]
+    norms = [
+        torch.nn.RMSNorm(6, eps=1e-5) if with_tap_norm else torch.nn.Identity()
+        for _ in taps
+    ]
     output_norm = torch.nn.RMSNorm(4, eps=1e-5)
     positions = torch.arange(11, 16)
     locations = torch.tensor([17, 18, 29, 30, 31])
     writes = []
     seen = []
     accumulator = None
-    for stage, (start, end) in enumerate(windows):
-        owned = [
-            i
-            for i, tap in enumerate(taps)
-            if start <= context_tap_owner_layer(tap, 8, stream) < end
-        ]
+    for stage, owned in enumerate(stage_taps):
 
         def project(index, rows):
             assert index in owned
             seen.append(index)
-            return project_context_tap(rows, weights[index], norms[index])
+            return F.linear(norms[index](rows), weights[index])
 
         def write(rows, pos, loc, pool):
             assert pool == "last-stage-cache"
@@ -73,13 +69,14 @@ def test_pipeline_projection_matches_concatenated_reference(stream, windows):
         model = SimpleNamespace(
             hidden_size=4,
             mapping=SimpleNamespace(
-                is_first_pp_rank=stage == 0, is_last_pp_rank=stage == len(windows) - 1
+                is_first_pp_rank=stage == 0,
+                is_last_pp_rank=stage == len(stage_taps) - 1,
             ),
             project_target_tap=project,
             finalize_target_projection=output_norm,
             write_context_kv=write,
         )
-        producer = TargetContextProducer(
+        producer = DSparkContextProducer(
             model, "last-stage-cache" if model.mapping.is_last_pp_rank else None
         )
         accumulator = producer.begin_stage(hidden[0], accumulator)
@@ -108,7 +105,7 @@ def test_context_accumulators_do_not_alias_between_inflight_chunks():
         hidden_size=4,
         mapping=SimpleNamespace(is_first_pp_rank=True, is_last_pp_rank=True),
     )
-    producer = TargetContextProducer(model, object())
+    producer = DSparkContextProducer(model, object())
     first = producer.begin_stage(torch.ones(3, 6), None)
     second = producer.begin_stage(torch.ones(3, 6), None)
     first.fill_(7)

@@ -34,6 +34,13 @@ arguments, and the engine's role is read off it once, at construction. An
 earlier shape had the loop assemble the peer and hand it back through a setter,
 which left the role mutable after startup for no reason.
 
+Persistent DeepEP communication storage is reserved during common MoE weight
+processing, before attention/cache construction profiles available memory.
+The kernel package owns allocation and compatible reuse; this rule is shared
+by every DeepEP backend. Runtime orchestration supplies configuration but does
+not infer token layouts or capacities from model names. Backend dispatchers
+reuse that storage when model execution begins.
+
 Attention construction returns a frozen, named `AttentionBuild` containing its
 backends, pools, cache storage, field placement/readiness and optional logical plan.
 `build_device_side` consumes this result locally and passes stage field

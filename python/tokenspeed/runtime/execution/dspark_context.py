@@ -18,26 +18,58 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Context production shared by local forwards and pipeline stages.
+"""Build DSpark context caches from captured target features.
 
-The producer owns only immutable projection weights and the destination cache
-view. Accumulated rows travel in the forward's PP state, so queued prefill
-chunks cannot overwrite a different chunk's projection buffer.
+The draft model owns projection weights and cache-layout arithmetic. This
+producer coordinates per-forward accumulation and cache writes; accumulated
+rows stay local or travel in PP state without aliasing another chunk's storage.
+K3 DSpark is currently the model using this production path.
 """
 
 from __future__ import annotations
 
+from typing import Protocol
+
 import torch
 
-from tokenspeed.runtime.models.context_projection import TargetContextProjector
+
+class _DSparkContextStage(Protocol):
+    """Pipeline ownership needed by context production."""
+
+    is_first_pp_rank: bool
+    is_last_pp_rank: bool
 
 
-class TargetContextProducer:
-    """Project owned target taps and write context before drafting."""
+class DSparkContextModel(Protocol):
+    """DSpark projection and cache writes for local and pipeline execution."""
+
+    hidden_size: int
+    mapping: _DSparkContextStage
+
+    def project_target_tap(
+        self, capture_idx: int, hidden: torch.Tensor
+    ) -> torch.Tensor:
+        """Return one positional tap's contribution before output normalization."""
+
+    def finalize_target_projection(self, projected: torch.Tensor) -> torch.Tensor:
+        """Normalize the complete sum in the draft's activation dtype."""
+
+    def write_context_kv(
+        self,
+        ctx_hidden: torch.Tensor,
+        positions: torch.Tensor,
+        cache_locs: torch.Tensor,
+        token_to_kv_pool,
+    ) -> None:
+        """Materialize normalized context rows in the draft's native cache layout."""
+
+
+class DSparkContextProducer:
+    """Project owned target taps and write DSpark context before drafting."""
 
     supports_pd_layerwise_finalization = True
 
-    def __init__(self, model: TargetContextProjector, token_to_kv_pool) -> None:
+    def __init__(self, model: DSparkContextModel, token_to_kv_pool) -> None:
         self.model = model
         self.token_to_kv_pool = token_to_kv_pool
         if bool(model.mapping.is_last_pp_rank) != (token_to_kv_pool is not None):

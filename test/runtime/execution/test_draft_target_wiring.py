@@ -1,10 +1,10 @@
 """Tests for draft-to-target wiring.
 
 Model-to-model wiring (shared embed/head, EAGLE3 capture ids) happens in
-``factory._wire_draft_to_target_model`` right after both models load, so
+``factory.configure_draft_target`` right after both models load, so
 shared weights are released before the KV-cache budget is profiled.
-Drafter-instance wiring (capture hooks on the target) happens in
-``BaseDrafter.wire_target`` implementations.
+Drafter-instance wiring binds execution resources only. Capture is configured
+by the loaded model during setup, before cache allocation.
 """
 
 from __future__ import annotations
@@ -101,7 +101,7 @@ def test_wire_eagle3_shares_embed_head_and_installs_capture_ids():
     }
 
     with mock.patch.object(factory, "get_drafter_impl", return_value=Eagle):
-        factory._wire_draft_to_target_model(_server_args("EAGLE3"), target, draft)
+        factory.configure_draft_target(_server_args("EAGLE3"), target, draft)
 
     draft.model.set_embed_and_head.assert_called_once_with("EMBED", "HEAD")
     target.model.set_eagle3_layers_to_capture.assert_called_once_with([1, 2, 3])
@@ -131,7 +131,7 @@ def test_wire_mtp_shares_complete_lm_head_for_opted_in_draft():
     draft = SimpleNamespace(model=draft_model)
 
     with mock.patch.object(factory, "get_drafter_impl", return_value=Mtp):
-        factory._wire_draft_to_target_model(_server_args("MTP"), target, draft)
+        factory.configure_draft_target(_server_args("MTP"), target, draft)
 
     assert draft_model.shared == ("EMBED", lm_head)
     assert draft_model.legacy is None
@@ -147,7 +147,7 @@ def test_wire_mtp_module_sharing_requires_target_lm_head():
         mock.patch.object(factory, "get_drafter_impl", return_value=Mtp),
         pytest.raises(ValueError, match="complete lm_head module"),
     ):
-        factory._wire_draft_to_target_model(_server_args("MTP"), target, draft)
+        factory.configure_draft_target(_server_args("MTP"), target, draft)
 
 
 def test_wire_eagle3_explicit_capture_ids_override_checkpoint():
@@ -158,7 +158,7 @@ def test_wire_eagle3_explicit_capture_ids_override_checkpoint():
     }
 
     with mock.patch.object(factory, "get_drafter_impl", return_value=Eagle):
-        factory._wire_draft_to_target_model(
+        factory.configure_draft_target(
             _server_args("EAGLE3", capture_ids=[7, 8]), target, draft
         )
 
@@ -166,13 +166,16 @@ def test_wire_eagle3_explicit_capture_ids_override_checkpoint():
 
 
 def test_wire_dflash_keeps_own_embed_head():
+    from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
+
     target, draft = mock.MagicMock(), mock.MagicMock()
-
+    draft.model = mock.MagicMock(spec=TargetCaptureConfigurator)
     with mock.patch.object(factory, "get_drafter_impl", return_value=DFlash):
-        factory._wire_draft_to_target_model(_server_args("DFLASH"), target, draft)
-
+        factory.configure_draft_target(_server_args("DFLASH"), target, draft)
+    draft.model.configure_target.assert_called_once_with(
+        target.model, target.model_config.hf_text_config
+    )
     target.model.get_embed_and_head.assert_not_called()
-    draft.model.set_embed_and_head.assert_not_called()
 
 
 def test_base_wire_target_is_a_noop():
@@ -182,47 +185,55 @@ def test_base_wire_target_is_a_noop():
     target_model.assert_not_called()
 
 
-def test_dflash_wire_target_requires_capture_support():
-    drafter = mock.MagicMock(spec=DFlash)
-    target_model = mock.MagicMock(
-        spec=["get_input_embeddings", "lm_head", "logits_processor"]
+@pytest.mark.parametrize("drafter_class", [DFlash, DSpark])
+def test_block_drafter_wire_target_only_binds_resources(drafter_class):
+    drafter = drafter_class.__new__(drafter_class)
+    drafter.model = SimpleNamespace()
+    embedding, head, processor = object(), object(), object()
+    target = SimpleNamespace(
+        get_input_embeddings=lambda: embedding,
+        lm_head=head,
+        logits_processor=processor,
+        set_dflash_layers_to_capture=mock.Mock(
+            side_effect=AssertionError("capture changed during binding")
+        ),
+        set_dflash_aux_hidden_stream=mock.Mock(
+            side_effect=AssertionError("stream changed during binding")
+        ),
     )
-    with pytest.raises(ValueError, match="set_dflash_layers_to_capture"):
-        DFlash.wire_target(drafter, target_model)
+    drafter.wire_target(target)
+    assert drafter.embed_tokens is embedding
+    assert drafter.lm_head is head
+    assert drafter.logits_processor is processor
+    target.set_dflash_layers_to_capture.assert_not_called()
+    target.set_dflash_aux_hidden_stream.assert_not_called()
 
 
-def test_dflash_wire_target_installs_capture_layers():
-    drafter = mock.MagicMock(spec=DFlash)
-    drafter.target_layer_ids = [4, 5]
-    target_model = mock.MagicMock(
-        spec=[
-            "get_input_embeddings",
-            "lm_head",
-            "logits_processor",
-            "set_dflash_layers_to_capture",
-        ]
+def test_block_drafter_binds_local_embedding_on_last_pipeline_stage():
+    drafter = DSpark.__new__(DSpark)
+    embedding = object()
+    drafter.model = SimpleNamespace(embed_tokens=embedding)
+    target = SimpleNamespace(
+        get_input_embeddings=lambda: None, lm_head=object(), logits_processor=object()
     )
-
-    DFlash.wire_target(drafter, target_model)
-
-    target_model.set_dflash_layers_to_capture.assert_called_once_with([4, 5])
-    assert drafter.embed_tokens is target_model.get_input_embeddings.return_value
-    assert drafter.lm_head is target_model.lm_head
+    drafter.wire_target(target)
+    assert drafter.embed_tokens is embedding
 
 
-def test_dspark_wire_target_installs_capture_layers():
-    drafter = mock.MagicMock(spec=DeepseekV4DSpark)
-    drafter.target_layer_ids = [10, 20]
-    draft_head = mock.MagicMock()
-    drafter.draft_model = mock.MagicMock(lm_head=draft_head)
-    target_model = mock.MagicMock(
-        spec=["lm_head", "logits_processor", "set_dspark_layers_to_capture"]
+def test_deepseek_dspark_wire_target_only_binds_resources():
+    drafter = DeepseekV4DSpark.__new__(DeepseekV4DSpark)
+    draft_head = object()
+    drafter.draft_model = SimpleNamespace(lm_head=draft_head)
+    target = SimpleNamespace(
+        logits_processor=SimpleNamespace(tp_group=(0, 1)),
+        set_dspark_layers_to_capture=mock.Mock(
+            side_effect=AssertionError("capture changed during binding")
+        ),
     )
-
-    DeepseekV4DSpark.wire_target(drafter, target_model)
-
-    target_model.set_dspark_layers_to_capture.assert_called_once_with([10, 20])
+    drafter.wire_target(target)
     assert drafter.lm_head is draft_head
+    assert drafter.tp_group == (0, 1)
+    target.set_dspark_layers_to_capture.assert_not_called()
 
 
 def test_dspark_weight_update_forces_cached_head_refresh():
@@ -406,12 +417,16 @@ def test_dflash_sink_folds_the_taps_and_writes_the_kv_once():
     assert torch.equal(locs, torch.arange(100, 100 + num_tokens, device=device))
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-q"]))
-
-
-@pytest.mark.parametrize("num_extends,accept", [(1, 1), (0, 2), (0, 0)])
-def test_prepared_context_updates_lengths_without_rewriting_cache(num_extends, accept):
+@pytest.mark.parametrize("producer_owned", [False, True])
+@pytest.mark.parametrize(
+    "num_extends,accept,capturing",
+    [(1, 1, False), (0, 2, False), (0, 0, False), (0, 2, True), (0, 0, True)],
+)
+def test_context_cache_ownership_preserves_prefix_lengths(
+    monkeypatch, producer_owned, num_extends, accept, capturing
+):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: capturing)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
     drafter = DFlash.__new__(DFlash)
     drafter.spec_num_tokens = 4
     drafter.input_buffers = SimpleNamespace(
@@ -421,25 +436,159 @@ def test_prepared_context_updates_lengths_without_rewriting_cache(num_extends, a
     )
     drafter.runtime_states = SimpleNamespace(valid_cache_lengths=torch.tensor([10]))
     drafter.draft_seq_lens_buf = torch.zeros(1, dtype=torch.int32)
-    drafter._write_native_cache = mock.Mock(
-        side_effect=AssertionError("context already written")
+    drafter._write_native_cache = mock.Mock()
+    locations = torch.arange(4)
+    backend = SimpleNamespace(
+        decode_window_locations=lambda: (
+            locations if not num_extends else torch.empty(0, dtype=torch.int64)
+        ),
+        extend_span_locations=lambda: locations,
     )
     ctx = SimpleNamespace(
-        target_context_ready=True,
+        dspark_context_producer=object() if producer_owned else None,
         bs=1,
         num_extends=num_extends,
         input_num_tokens=4,
-        attn_backend=SimpleNamespace(
-            decode_window_locations=lambda: (
-                torch.arange(4)
-                if not num_extends
-                else torch.empty(0, dtype=torch.int64)
-            ),
-            extend_span_locations=lambda: torch.arange(4),
-        ),
+        # A producer-owned update must not inspect write locations again.
+        attn_backend=object() if producer_owned else backend,
     )
-    drafter._update_native_cache_from_target(
-        ctx, SimpleNamespace(hidden_states=None), torch.tensor([accept])
-    )
+    hidden = torch.zeros(4, 8)
+    logits = object() if producer_owned else SimpleNamespace(hidden_states=hidden)
+    drafter._update_native_cache_from_target(ctx, logits, torch.tensor([accept]))
     assert drafter.draft_seq_lens_buf.item() == (14 if num_extends else 10 + accept)
+    if producer_owned:
+        drafter._write_native_cache.assert_not_called()
+    else:
+        args, kwargs = drafter._write_native_cache.call_args
+        assert drafter._write_native_cache.call_count == 1
+        assert args[0] is hidden
+        torch.testing.assert_close(args[1], torch.arange(10, 14))
+        torch.testing.assert_close(args[2], locations)
+        assert kwargs == {"decode_only": num_extends == 0}
+
+
+@pytest.mark.parametrize(
+    "hidden,error",
+    [(None, "requires target hidden"), (torch.zeros(3, 8), "token mismatch")],
+)
+def test_drafter_owned_context_requires_matching_target_hidden(hidden, error):
+    drafter = DFlash.__new__(DFlash)
+    drafter._update_draft_prefix_lengths = mock.Mock()
+    drafter._write_native_cache = mock.Mock()
+    ctx = SimpleNamespace(dspark_context_producer=None, input_num_tokens=4)
+    with pytest.raises(RuntimeError, match=error):
+        drafter._update_native_cache_from_target(
+            ctx, SimpleNamespace(hidden_states=hidden), torch.tensor([1])
+        )
+    drafter._update_draft_prefix_lengths.assert_called_once()
     drafter._write_native_cache.assert_not_called()
+
+
+@pytest.mark.parametrize("project_context", [False, True])
+def test_k3_setup_capture_survives_resource_binding(monkeypatch, project_context):
+    from tokenspeed.runtime.models import kimi_k3_dspark
+
+    draft = kimi_k3_dspark.K3DSparkModel.__new__(kimi_k3_dspark.K3DSparkModel)
+    torch.nn.Module.__init__(draft)
+    draft.config = SimpleNamespace(aux_hidden_stream="attn_res")
+    draft.target_capture_layer_ids = (2, 5)
+    draft.hidden_size = 8
+    draft.supports_dspark_context_projection = project_context
+    validation = mock.Mock()
+    monkeypatch.setattr(kimi_k3_dspark, "validate_k3_dspark_config", validation)
+    target = SimpleNamespace(
+        get_input_embeddings=lambda: "embedding",
+        lm_head="head",
+        logits_processor="processor",
+        set_target_context_capture=mock.Mock(),
+        set_dflash_layers_to_capture=mock.Mock(),
+        set_dflash_aux_hidden_stream=mock.Mock(),
+    )
+    target_config = object()
+    monkeypatch.setattr(factory, "get_drafter_impl", lambda algo, model: DSpark)
+    factory.configure_draft_target(
+        _server_args("DSPARK"),
+        SimpleNamespace(
+            model=target, model_config=SimpleNamespace(hf_text_config=target_config)
+        ),
+        SimpleNamespace(model=draft),
+    )
+    validation.assert_called_once_with(draft.config, target_config)
+    if project_context:
+        target.set_target_context_capture.assert_called_once_with([2, 5], "attn_res", 8)
+        target.set_dflash_layers_to_capture.assert_not_called()
+    else:
+        target.set_dflash_layers_to_capture.assert_called_once_with([2, 5])
+        target.set_dflash_aux_hidden_stream.assert_called_once_with("attn_res")
+        target.set_target_context_capture.assert_not_called()
+    for setter in (
+        target.set_target_context_capture,
+        target.set_dflash_layers_to_capture,
+        target.set_dflash_aux_hidden_stream,
+    ):
+        setter.side_effect = AssertionError(
+            "resource binding must not reconfigure capture"
+        )
+    drafter = DSpark.__new__(DSpark)
+    drafter.model = draft
+    drafter.wire_target(target)
+    assert drafter.embed_tokens == "embedding"
+    assert drafter.lm_head == "head"
+
+
+@pytest.mark.parametrize("family", ["dflash", "dflash2", "dspark"])
+def test_ordinary_block_models_declare_capture_setup(family):
+    from tokenspeed.runtime.models.dflash import DFlashDraftModel
+    from tokenspeed.runtime.models.dflash2 import DFlash2DraftModel
+    from tokenspeed.runtime.models.dspark import DSparkDraftModel
+    from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
+
+    model_class = {
+        "dflash": DFlashDraftModel,
+        "dflash2": DFlash2DraftModel,
+        "dspark": DSparkDraftModel,
+    }[family]
+    draft = model_class.__new__(model_class)
+    torch.nn.Module.__init__(draft)
+    draft.config = SimpleNamespace(dflash_config={"target_layer_ids": [2, 7]})
+    target = SimpleNamespace(set_dflash_layers_to_capture=mock.Mock())
+    assert isinstance(draft, TargetCaptureConfigurator)
+    draft.configure_target(target, None)
+    target.set_dflash_layers_to_capture.assert_called_once_with([2, 7])
+
+
+@pytest.mark.parametrize("family", ["v4", "v41"])
+def test_deepseek_block_models_configure_capture_through_common_setup(
+    monkeypatch, family
+):
+    from tokenspeed.runtime.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
+    from tokenspeed.runtime.models.deepseek_v41_dspark import (
+        DeepseekV41ForCausalLMDSpark,
+    )
+    from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
+
+    model_class = (
+        DeepseekV4ForCausalLMDSpark if family == "v4" else DeepseekV41ForCausalLMDSpark
+    )
+    draft = model_class.__new__(model_class)
+    torch.nn.Module.__init__(draft)
+    draft.model = SimpleNamespace(target_layer_ids=(10, 20))
+    target = SimpleNamespace(set_dspark_layers_to_capture=mock.Mock())
+    assert isinstance(draft, TargetCaptureConfigurator)
+    monkeypatch.setattr(
+        factory,
+        "get_drafter_impl",
+        lambda algorithm, model: SimpleNamespace(shares_target_embed_head=False),
+    )
+    factory.configure_draft_target(
+        _server_args("DSPARK"),
+        SimpleNamespace(
+            model=target, model_config=SimpleNamespace(hf_text_config=object())
+        ),
+        SimpleNamespace(model=draft),
+    )
+    target.set_dspark_layers_to_capture.assert_called_once_with([10, 20])
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))

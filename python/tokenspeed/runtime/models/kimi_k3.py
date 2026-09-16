@@ -2956,15 +2956,15 @@ class KimiLinearModel(nn.Module):
         capture_layers = self.layers_to_capture
         capture_dflash = bool(capture_layers)
         capture_eagle3 = bool(self.eagle3_layers_to_capture)
-        context_producer = ctx.target_context_producer
+        dspark_context = ctx.dspark_context_producer
         aux_hidden_states: list[torch.Tensor] | None = (
             []
-            if (capture_dflash and context_producer is None) or capture_eagle3
+            if (capture_dflash and dspark_context is None) or capture_eagle3
             else None
         )
         projected_context = None
-        if context_producer is not None:
-            projected_context = context_producer.begin_stage(
+        if dspark_context is not None:
+            projected_context = dspark_context.begin_stage(
                 hidden_states,
                 pp_inbound.projected_context if pp_inbound is not None else None,
             )
@@ -2976,8 +2976,8 @@ class KimiLinearModel(nn.Module):
                 layer_idx, prefix_sum, block_residual
             )
             capture_idx = self._dflash_capture_idx_map[layer_idx]
-            if context_producer is not None:
-                context_producer.add_capture(projected_context, capture_idx, captured)
+            if dspark_context is not None:
+                dspark_context.add_capture(projected_context, capture_idx, captured)
             else:
                 if ctx.target_capture_sink is not None:
                     ctx.target_capture_sink.on_target_capture(capture_idx, captured)
@@ -3021,18 +3021,17 @@ class KimiLinearModel(nn.Module):
         ):
             capture_tap(self.config.num_hidden_layers - 1)
 
-        if context_producer is not None:
+        if dspark_context is not None:
             cache_locs = ctx.attn_backend.decode_window_locations()
             if ctx.num_extends > 0:
                 cache_locs = torch.cat(
                     (ctx.attn_backend.extend_span_locations(), cache_locs)
                 )
-            context_producer.write_context(
+            dspark_context.write_context(
                 projected_context,
                 positions,
                 cache_locs[: ctx.input_num_tokens],
             )
-            ctx.target_context_ready = True
 
         hidden_states = _apply_attn_res(
             prefix_sum,

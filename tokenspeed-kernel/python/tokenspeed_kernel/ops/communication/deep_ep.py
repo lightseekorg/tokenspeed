@@ -36,6 +36,7 @@ __all__ = [
     "DeepEPDispatchMode",
     "DeepEPDispatcher",
     "DeepEPMode",
+    "prepare_deepep_buffer",
 ]
 
 logger = logging.getLogger(__file__)
@@ -43,6 +44,10 @@ logger = logging.getLogger(__file__)
 # FP8 block-scale granularity shared by the dispatch quantization and the
 # per-local-expert receive alignment DeepGEMM's contiguous layout requires.
 _FP8_BLOCK = 128
+
+# Reserve the BF16 input staging width even for dispatchers that quantize
+# payloads to FP8. Startup preparation and runtime acquisition must agree.
+_DEEPEP_BUFFER_ELEMENT_BYTES = 2
 
 # MNNVL/fabric buffers need the full IMEX stack, which only exists on multi-node
 # NVLink domains such as GB200 NVL72. TS_DEEPEP_ALLOW_MNNVL=0/1 forces the
@@ -298,6 +303,50 @@ class DeepEPBuffer:
         cls._dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
 
 
+def prepare_deepep_buffer(
+    *,
+    group: dist.ProcessGroup,
+    hidden_size: int,
+    num_experts: int,
+    deepep_mode: str,
+    max_dispatch_tokens_per_rank: int | None,
+) -> None:
+    """Reserve shared communication storage before the KV cache is sized.
+
+    All EP ranks call this during common MoE weight processing. It performs no
+    token dispatch and reuses a compatible buffer through the ordinary runtime
+    acquisition path. Kernel-specific dispatcher settings remain unchanged.
+
+    Args:
+        group: The process group used by the selected DeepEP MoE plan.
+        hidden_size: Width of unquantized dispatch inputs, not packed weights.
+        num_experts: Global expert count across the process group.
+        deepep_mode: Selected normal, low_latency or auto communication mode.
+        max_dispatch_tokens_per_rank: Configured source-row capacity; may be
+            None when only normal-mode buffers are required.
+
+    Returns:
+        None. Dispatchers later acquire the same persistent buffer.
+    """
+    if group is None:
+        raise ValueError("DeepEP MoE plan is missing deepep_group")
+    if hidden_size <= 0 or num_experts <= 0:
+        raise ValueError("DeepEP hidden size and expert count must be positive")
+    mode = DeepEPMode(deepep_mode)
+    if mode.enable_low_latency() and (
+        max_dispatch_tokens_per_rank is None or max_dispatch_tokens_per_rank <= 0
+    ):
+        raise ValueError("DeepEP low-latency mode requires a positive token capacity")
+    DeepEPBuffer.get_deepep_buffer(
+        group=group,
+        hidden_size=hidden_size,
+        param_bytes=_DEEPEP_BUFFER_ELEMENT_BYTES,
+        deepep_mode=mode,
+        num_max_dispatch_tokens_per_rank=max_dispatch_tokens_per_rank,
+        num_experts=num_experts,
+    )
+
+
 class _DeepEPDispatcherImplBase:
     def __init__(
         self,
@@ -320,7 +369,7 @@ class _DeepEPDispatcherImplBase:
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
 
-        self.params_bytes = 2
+        self.params_bytes = _DEEPEP_BUFFER_ELEMENT_BYTES
         self.num_max_dispatch_tokens_per_rank = low_latency_max_num_tokens_per_gpu
 
         self.handle = None
@@ -794,16 +843,6 @@ class DeepEPDispatcher:
                 ue8m0_scales=ue8m0_scales,
                 **common_kwargs,
             )
-
-    def prepare(self) -> None:
-        """Allocate persistent communication buffers before cache profiling.
-
-        Construction alone installs dispatch implementations but allocates no
-        wire storage. Model weight preprocessing calls this collective on all
-        EP ranks so available-memory profiling includes the eventual buffer.
-        No tokens are dispatched and no decode metadata is required.
-        """
-        self._get_impl(self.deepep_mode.enable_low_latency())._get_buffer()
 
     def dispatch(self, *args, **kwargs) -> tuple:
         self.dispatch_a(*args, **kwargs)

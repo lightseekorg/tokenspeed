@@ -122,6 +122,17 @@ output stay within each attention-TP group. See the
 [K3 Hopper PD guide](../guides/kimi-k3-hopper-pd.md) for PP4/TP8/EP8 prefill
 and DP4/TP8/EP32 decode.
 
+All DeepEP MoE plans reserve their persistent communication buffer during the
+common `moe_process_weights` call, after backend weight preprocessing and before
+KV cache memory profiling. This applies to Marlin, DeepGEMM and FlashInfer;
+non-DeepEP plans do not initialize DeepEP. The input hidden width and global
+expert count come from the MoE module's declared geometry, never inferred from
+packed weights. Dispatchers retain their backend-specific execution settings
+and reuse the prepared buffer. Compatible layers share the process-wide buffer;
+incompatible geometry, mode or capacity fails through the same reuse checks as
+runtime acquisition. The capacity remains the explicit server setting (256 by
+default), with no model-name-based sizing in `ModelRunner`.
+
 DeepEP has two sets of legs, and `--deepep-mode` picks between them:
 
 | Mode | Legs | Fits |

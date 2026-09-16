@@ -821,7 +821,7 @@ def build_device_side(
         supports_disaggregation=token_to_kv_pool.arena.supports_disaggregation,
         supports_pd_layerwise_finalization=bool(
             getattr(
-                executor.context_producer or executor.drafter,
+                executor.dspark_context_producer or executor.drafter,
                 "supports_pd_layerwise_finalization",
                 False,
             )

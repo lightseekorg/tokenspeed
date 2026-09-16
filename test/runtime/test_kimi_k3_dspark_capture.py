@@ -137,7 +137,7 @@ def test_attnres_capture_runs_at_owner_entry_across_pipeline_boundaries(
 ):
     from types import SimpleNamespace
 
-    from tokenspeed.runtime.execution.context_producer import TargetContextProducer
+    from tokenspeed.runtime.execution.dspark_context import DSparkContextProducer
     from tokenspeed.runtime.models import kimi_k3
 
     events = []
@@ -176,7 +176,7 @@ def test_attnres_capture_runs_at_owner_entry_across_pipeline_boundaries(
                 (rows.clone(), locations)
             ),
         )
-        producer = TargetContextProducer(
+        producer = DSparkContextProducer(
             projector, object() if mapping.is_last_pp_rank else None
         )
         model = SimpleNamespace(
@@ -198,9 +198,8 @@ def test_attnres_capture_runs_at_owner_entry_across_pipeline_boundaries(
         )
         locations = torch.tensor([9, 10])
         ctx = SimpleNamespace(
-            target_context_producer=producer,
+            dspark_context_producer=producer,
             target_capture_sink=None,
-            target_context_ready=False,
             num_extends=1,
             bs=1,
             input_num_tokens=2,
@@ -218,7 +217,7 @@ def test_attnres_capture_runs_at_owner_entry_across_pipeline_boundaries(
             pp_inbound=inbound,
         )
         assert aux is None
-        assert ctx.target_context_ready == mapping.is_last_pp_rank
+        assert len(writes) == int(mapping.is_last_pp_rank)
         if not mapping.is_last_pp_rank:
             inbound = output
     assert events == [

@@ -376,15 +376,15 @@ class ModelExecutor:
             max_bs,
             self.device,
         )
-        self.context_producer = None
+        self.dspark_context_producer = None
         if draft_model_runner is not None and getattr(
-            draft_model_runner.model, "supports_target_context_projection", False
+            draft_model_runner.model, "supports_dspark_context_projection", False
         ):
-            from tokenspeed.runtime.execution.context_producer import (
-                TargetContextProducer,
+            from tokenspeed.runtime.execution.dspark_context import (
+                DSparkContextProducer,
             )
 
-            self.context_producer = TargetContextProducer(
+            self.dspark_context_producer = DSparkContextProducer(
                 draft_model_runner.model, draft_token_to_kv_pool
             )
         if self.config.spec_algo is not None and self._pp_is_last_stage:
@@ -935,8 +935,7 @@ class ModelExecutor:
             )
             self.capturable_grammar.schedule_fill(input_ids_buf_slice=slice_)
 
-        ctx.target_context_producer = self.context_producer
-        ctx.target_context_ready = False
+        ctx.dspark_context_producer = self.dspark_context_producer
         if self.drafter is not None:
             self.drafter.prepare_target_forward(ctx)
 
@@ -1433,7 +1432,8 @@ class ModelExecutor:
                     forward_mode=forward_mode,
                     capture_hidden_mode=(
                         CaptureHiddenMode.FULL
-                        if self.drafter is not None and self.context_producer is None
+                        if self.drafter is not None
+                        and self.dspark_context_producer is None
                         else CaptureHiddenMode.NULL
                     ),
                     gather_ids=gather_ids,
@@ -1647,7 +1647,9 @@ class ModelExecutor:
     def register_draft_final_step_counter(self, step_counter) -> None:
         """Publish one CachePD step after a supported drafter's complete run."""
         producer = (
-            self.context_producer if self.context_producer is not None else self.drafter
+            self.dspark_context_producer
+            if self.dspark_context_producer is not None
+            else self.drafter
         )
         if producer is None or not getattr(
             producer, "supports_pd_layerwise_finalization", False

@@ -301,9 +301,7 @@ class ServerArgs:
     disable_tf32: bool = False
     force_deterministic_rsag: bool = False
     disable_sampling_tp_sync: bool = False
-    # Resolved with the model before loading: token-sliced K3 uses its actual
-    # decode capacity; other DeepEP plans retain the legacy 256-row allocation.
-    low_latency_max_num_tokens_per_gpu: int | None = None
+    low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
     # Breakable prefill graph bucket cap: None = auto min(2048, chunk); 0 disables.
@@ -882,10 +880,7 @@ class ServerArgs:
             )
 
     def validate(self):
-        if (
-            self.low_latency_max_num_tokens_per_gpu is not None
-            and self.low_latency_max_num_tokens_per_gpu <= 0
-        ):
+        if self.low_latency_max_num_tokens_per_gpu <= 0:
             raise ValueError("--low-latency-max-num-tokens-per-gpu must be positive")
         if self.device == "npu":
             if not self.disable_prefill_graph:
@@ -2032,10 +2027,8 @@ class ServerArgs:
             "--low-latency-max-num-tokens-per-gpu",
             type=int,
             default=ServerArgs.low_latency_max_num_tokens_per_gpu,
-            help="DeepEP low-latency send capacity per rank. When omitted, K3 "
-            "token dispatch derives it from the maximum per-DP verify batch "
-            "after TP slicing (plus recovery chunks when low latency is "
-            "pinned); other plans use 256.",
+            help="DeepEP low-latency send capacity per rank. Defaults to 256; "
+            "set explicitly to cover the largest batch sent through low latency.",
         )
 
         parser.add_argument(
