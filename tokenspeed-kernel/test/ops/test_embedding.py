@@ -24,6 +24,7 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.embedding import (
     FusedSetKVBufferArg,
+    apply_k_rope,
     apply_rope,
     apply_rope_mla,
 )
@@ -555,3 +556,50 @@ def test_fused_mla_entry_points_are_exported():
     for name in ("apply_rope_mla_set_kv", "supports_fused_mla_kv_write"):
         assert name in embedding.__all__, name
         assert hasattr(embedding, name)
+
+
+@pytest.mark.parametrize("solution", ["triton", "cuda"])
+@pytest.mark.parametrize("is_neox", [True, False])
+def test_k_only_rope_matches_a_paired_call(
+    device: str, solution: str, is_neox: bool, require
+) -> None:
+    """Dropping the scratch query must not change what the key becomes."""
+    torch.manual_seed(0)
+    num_tokens, head_size, max_position = 13, 64, 512
+    dtype = torch.bfloat16
+    require("embedding", "rope", solution, dtype, "q")
+
+    inv_freq = 1.0 / (
+        10000.0
+        ** (
+            torch.arange(0, head_size, 2, device=device, dtype=torch.float32)
+            / head_size
+        )
+    )
+    freqs = torch.outer(
+        torch.arange(max_position, device=device, dtype=torch.float32), inv_freq
+    )
+    cos_sin_cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1).contiguous()
+    positions = torch.randint(max_position, (num_tokens,), device=device)
+    key = torch.randn(num_tokens, head_size, device=device, dtype=dtype)
+
+    paired = key.clone()
+    apply_rope(
+        positions,
+        paired.new_empty(paired.shape),
+        paired,
+        head_size,
+        cos_sin_cache,
+        is_neox=is_neox,
+        solution=solution,
+    )
+    k_only = key.clone()
+    apply_k_rope(
+        positions,
+        k_only,
+        head_size,
+        cos_sin_cache,
+        is_neox=is_neox,
+        solution=solution,
+    )
+    torch.testing.assert_close(k_only, paired, rtol=0, atol=0)

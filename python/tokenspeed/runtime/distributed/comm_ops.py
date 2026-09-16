@@ -152,6 +152,43 @@ def prepare_all_reduce_lane(
     return backend.prepare_all_reduce_lane(group, hidden_dim)
 
 
+def prepare_all_reduce_buffers(
+    group: Group,
+    *,
+    staged_max_numel: int,
+    producer_direct_max_numel: int,
+    attnres_max_numel: int,
+    attnres_max_rows: int,
+    dtype: torch.dtype,
+    backend: CommBackend | None,
+) -> bool:
+    """Ask the active backend to allocate all-reduce buffers before cache planning.
+
+    Args:
+        group: Global ranks participating in the reductions.
+        staged_max_numel: Maximum ordinary all-reduce payload in elements.
+        producer_direct_max_numel: Maximum producer-direct payload in elements.
+        attnres_max_numel: Maximum fused AttnRes payload in elements.
+        attnres_max_rows: Maximum fused AttnRes payload in rows.
+        dtype: Element type shared by the prepared paths.
+        backend: Backend to prepare, or ``None`` to use the global backend.
+
+    Returns:
+        Whether the active backend prepared the requested buffers.
+    """
+
+    if backend is None:
+        backend = get_global_backend()
+    return backend.prepare_all_reduce_buffers(
+        group,
+        staged_max_numel=staged_max_numel,
+        producer_direct_max_numel=producer_direct_max_numel,
+        attnres_max_numel=attnres_max_numel,
+        attnres_max_rows=attnres_max_rows,
+        dtype=dtype,
+    )
+
+
 def prepare_all_reduce_fusion(
     group: Group,
     hidden_dim: int,
@@ -246,7 +283,7 @@ def all_gather(
     return backend.all_gather(tensor, group, dim)
 
 
-def all_gather_into_tensor(
+def all_gather_single(
     output: torch.Tensor,
     input: torch.Tensor,
     group: Group,
@@ -255,7 +292,7 @@ def all_gather_into_tensor(
     """All-gather input into a pre-allocated output buffer."""
     if backend is None:
         backend = get_global_backend()
-    backend.all_gather_into_tensor(output, input, group)
+    backend.all_gather_single(output, input, group)
 
 
 def reduce_scatter(

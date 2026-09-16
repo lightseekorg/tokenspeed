@@ -7,12 +7,16 @@
 # copies of the Software, and to permit persons to whom the Software is
 # furnished to do so, subject to the following conditions:
 #
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-#
-# DeepSeek V4 attention helpers keep runtime validation here; production Triton
-# kernels live under tokenspeed-kernel ops.
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 """DeepSeek V4 attention kernel boundaries.
 
@@ -23,11 +27,11 @@ runtime requires TokenSpeed's own built DeepSeek V4 attention op.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel import (
+from tokenspeed_kernel.ops.attention.dsv4 import (
     dsv4_csa_indexer_fp8_cache_insert,
     dsv4_swa_cache_insert,
 )
-from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_fused_csa_indexer_mxfp4_cache_insert,
     dsv4_fused_indexer_q_rope_hadamard_mxfp4,
     dsv4_fused_sparse_compress_cache_insert,
@@ -82,6 +86,8 @@ def fused_qnorm_rope_kv_insert(
     rms_norm_eps: float,
     block_size: int,
     q_out: torch.Tensor | None = None,
+    *,
+    validate_positions: bool,
 ) -> None:
     """Run the DeepSeek V4 fused SWA cache insert op.
 
@@ -104,6 +110,7 @@ def fused_qnorm_rope_kv_insert(
         rms_norm_eps=rms_norm_eps,
         page_size=block_size,
         q_out=q_out,
+        validate_positions=validate_positions,
     )
 
 
@@ -174,6 +181,7 @@ def deepseek_v4_prepare_indexer_q_mxfp4(
         weights=weights,
         softmax_scale=softmax_scale,
         head_scale=head_scale,
+        prefer_serial_four_block=True,
     )
 
 
@@ -520,6 +528,7 @@ def deepseek_v4_hca_compress_kv_cache_insert(
     kv_cache_2d: torch.Tensor,
     kv_slot_mapping: torch.Tensor,
     kv_cache_block_size: int,
+    kv_write_mask: torch.Tensor | None,
     compress_ratio: int = 128,
 ) -> None:
     """Compress HCA state, normalize/RoPE/FP8-quantize, and insert KV cache.
@@ -582,6 +591,8 @@ def deepseek_v4_hca_compress_kv_cache_insert(
         kv_cache_block_size=kv_cache_block_size,
         compress_ratio=compress_ratio,
         overlap=False,
+        block_table_base_offsets=None,
+        kv_write_mask=kv_write_mask,
     )
 
 
@@ -598,6 +609,7 @@ def deepseek_v4_csa_compress_kv_cache_insert(
     kv_cache_2d: torch.Tensor,
     kv_slot_mapping: torch.Tensor,
     kv_cache_block_size: int,
+    kv_write_mask: torch.Tensor | None,
     compress_ratio: int = 4,
 ) -> None:
     """Compress CSA state and insert one `fp8_ds_mla` row per 4 tokens.
@@ -658,6 +670,8 @@ def deepseek_v4_csa_compress_kv_cache_insert(
         kv_cache_block_size=kv_cache_block_size,
         compress_ratio=compress_ratio,
         overlap=True,
+        block_table_base_offsets=None,
+        kv_write_mask=kv_write_mask,
     )
 
 

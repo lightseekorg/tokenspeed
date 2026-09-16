@@ -27,14 +27,13 @@
 from dataclasses import dataclass
 
 import torch
-import triton
-import triton.language as tl
 from tokenspeed_kernel import prepare_fp8_linear_activation, silu_and_mul
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
+from tokenspeed.runtime.utils.triton import tl, triton
 
 _is_amd = current_platform().is_amd
 

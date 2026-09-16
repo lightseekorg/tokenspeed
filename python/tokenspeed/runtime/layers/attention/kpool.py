@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
-from tokenspeed_kernel.ops.attention import (
+from tokenspeed_kernel.ops.attention.kpool import (
     kpool_decode_append,
     kpool_decode_topk,
     kpool_prefill_tail_write,

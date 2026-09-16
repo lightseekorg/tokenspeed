@@ -51,11 +51,28 @@ PrefillInfo Request::CurrentPrefillInfo() const {
         state_);
 }
 
-fsm::ForwardState& Request::forwardState(const char* operation) {
-    fsm::ForwardState* result = std::visit(
-        []<typename State>(State& state) -> fsm::ForwardState* {
-            if constexpr (std::derived_from<State, fsm::ForwardState>) {
-                return &state;
+std::int32_t Request::MaterializedStateBoundaryTokens() const {
+    // Feedback contains accepted tokens plus one not-yet-computed token.
+    // Admission subtracts the whole verify width for conservative retention;
+    // that frontier is not an exact recurrent-state endpoint.
+    std::int32_t endpoint = 0;
+    if (Is<fsm::Decoding>()) {
+        endpoint = TokenSize() - 1;
+    } else if (Is<fsm::PrefillDone>()) {
+        const PrefillInfo info = CurrentPrefillInfo();
+        endpoint = info.already_scheduled_len + info.extend_len;
+    }
+    if (endpoint > 0 && endpoint % prefix_granularity_ == 0) {
+        return endpoint;
+    }
+    return forwardResources("MaterializedStateBoundaryTokens").cache_progress.materialized_state_boundary_tokens;
+}
+
+fsm::ForwardResources& Request::forwardResources(const char* operation) {
+    fsm::ForwardResources* result = std::visit(
+        []<typename State>(State& state) -> fsm::ForwardResources* {
+            if constexpr (fsm::HoldsForwardResources<State>) {
+                return &state.resources;
             }
             return nullptr;
         },
@@ -66,11 +83,11 @@ fsm::ForwardState& Request::forwardState(const char* operation) {
     return *result;
 }
 
-const fsm::ForwardState& Request::forwardState(const char* operation) const {
-    const fsm::ForwardState* result = std::visit(
-        []<typename State>(const State& state) -> const fsm::ForwardState* {
-            if constexpr (std::derived_from<State, fsm::ForwardState>) {
-                return &state;
+const fsm::ForwardResources& Request::forwardResources(const char* operation) const {
+    const fsm::ForwardResources* result = std::visit(
+        []<typename State>(const State& state) -> const fsm::ForwardResources* {
+            if constexpr (fsm::HoldsForwardResources<State>) {
+                return &state.resources;
             }
             return nullptr;
         },

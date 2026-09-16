@@ -51,8 +51,7 @@ protected:
         cfg.enable_l3_storage = false;
         cfg.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full_attention",
-            .rows_per_page = cfg.prefix_granularity,
-            .entry_stride_tokens = 1,
+            .block_granularity = cfg.prefix_granularity,
             .total_pages = cfg.device_allocator.total_pages,
             .retention = CacheGroupConfig::Retention::FullHistory,
             .family = CacheGroupFamily::History,
@@ -226,8 +225,7 @@ protected:
         for (std::size_t i = 0; i < GroupIds().size(); ++i) {
             CacheGroupConfig group;
             group.group_id = GroupIds()[i];
-            group.rows_per_page = cfg.prefix_granularity;
-            group.entry_stride_tokens = 1;
+            group.block_granularity = cfg.prefix_granularity;
             group.total_pages = cfg.device_allocator.total_pages;
             group.retention = CacheGroupConfig::Retention::FullHistory;
             group.family = i == 0 ? CacheGroupFamily::History : CacheGroupFamily::State;

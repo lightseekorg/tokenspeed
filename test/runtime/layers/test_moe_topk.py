@@ -31,20 +31,28 @@ def test_topk_call_can_override_configured_output_format() -> None:
 def test_plain_route_uses_kernel_package_softmax_topk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[int, bool, float]] = []
+    calls: list[tuple[int, torch.dtype, bool, float, str | None]] = []
 
     def fake_softmax_topk(
         router_logits: torch.Tensor,
         topk: int,
         *,
+        topk_indices_dtype: torch.dtype,
         renormalize: bool,
         routed_scaling_factor: float,
-        enable_pdl: bool,
+        solution: str | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        del enable_pdl
-        calls.append((topk, renormalize, routed_scaling_factor))
+        calls.append(
+            (
+                topk,
+                topk_indices_dtype,
+                renormalize,
+                routed_scaling_factor,
+                solution,
+            )
+        )
         shape = (router_logits.shape[0], topk)
-        return torch.ones(shape), torch.zeros(shape, dtype=torch.int64)
+        return torch.ones(shape), torch.zeros(shape, dtype=topk_indices_dtype)
 
     monkeypatch.setattr(topk_module, "moe_softmax_topk", fake_softmax_topk)
     output = select_experts(
@@ -54,11 +62,13 @@ def test_plain_route_uses_kernel_package_softmax_topk(
             top_k=2,
             renormalize=True,
             routed_scaling_factor=2.5,
+            topk_indices_dtype=torch.int32,
         ),
     )
 
-    assert calls == [(2, True, 2.5)]
+    assert calls == [(2, torch.int32, True, 2.5, None)]
     assert output.topk_weights.shape == output.topk_ids.shape == (2, 2)
+    assert output.topk_ids.dtype == torch.int32
 
 
 @pytest.mark.parametrize("renormalize", [False, True])

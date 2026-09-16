@@ -456,6 +456,165 @@ def test_linear_attnres_partials_gfx950_matches_composition(
         )
 
 
+def _kimi3_linear_attnres_inputs(
+    tokens: int,
+    output_size: int,
+    *,
+    seed: int = 29,
+) -> tuple:
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    hidden = (torch.randn(tokens, 7168, device="cuda", generator=generator) * 0.1).to(
+        torch.bfloat16
+    )
+    weight = (
+        torch.randn(output_size, 7168, device="cuda", generator=generator) * 0.01
+    ).to(torch.bfloat16)
+    blocks = (
+        torch.randn(4, tokens, 7168, device="cuda", generator=generator) * 0.1
+    ).to(torch.bfloat16)
+    scores = tuple(
+        (torch.randn(7168, device="cuda", generator=generator) * 0.02).to(
+            torch.bfloat16
+        )
+        for _ in range(2)
+    )
+    scratch = tuple(
+        (
+            torch.empty(tokens, device="cuda", dtype=torch.float32),
+            torch.empty(tokens, device="cuda", dtype=torch.float32),
+            torch.empty(tokens, 7168, device="cuda", dtype=torch.float32),
+        )
+        for _ in range(2)
+    )
+    return hidden, weight, blocks, scores, scratch
+
+
+def _assert_linear_attnres_matches_composition(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    blocks: torch.Tensor,
+    scores: tuple[torch.Tensor, torch.Tensor],
+    scratch: tuple,
+    actual: torch.Tensor,
+    *,
+    eps: float = 1e-6,
+) -> None:
+    torch.testing.assert_close(
+        actual,
+        torch.nn.functional.linear(hidden, weight),
+        atol=2e-2,
+        rtol=2e-2,
+    )
+    values = blocks.float()
+    inverse_rms = torch.rsqrt(values.square().mean(dim=-1) + eps)
+    for score, outputs in zip(scores, scratch, strict=True):
+        logits = torch.einsum("bth,h->bt", values, score.float()) * inverse_rms
+        maxima = logits.max(dim=0).values
+        unnormalized = torch.exp(logits - maxima)
+        torch.testing.assert_close(outputs[0], maxima, atol=2e-4, rtol=2e-4)
+        torch.testing.assert_close(
+            outputs[1], unnormalized.sum(dim=0), atol=2e-4, rtol=2e-4
+        )
+        torch.testing.assert_close(
+            outputs[2],
+            torch.einsum("bt,bth->th", unnormalized, values),
+            atol=2e-4,
+            rtol=2e-4,
+        )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or "gfx1250" not in getattr(torch.cuda.get_device_properties(0), "gcnArchName", ""),
+    reason="gfx1250 is required",
+)
+@pytest.mark.parametrize("output_size", [3648, 6288])
+def test_linear_attnres_partials_gfx1250_matches_composition(output_size: int) -> None:
+    hidden, weight, blocks, scores, scratch = _kimi3_linear_attnres_inputs(
+        1, output_size
+    )
+    assert linear_attnres_partials_available(
+        hidden,
+        weight,
+        blocks,
+        *scores,
+        *scratch,
+        eps=1e-6,
+    )
+    actual = linear_attnres_partials(
+        hidden,
+        weight,
+        blocks,
+        *scores,
+        *scratch,
+        eps=1e-6,
+        override="gluon_linear_attnres_partials_gfx1250",
+    )
+    _assert_linear_attnres_matches_composition(
+        hidden, weight, blocks, scores, scratch, actual
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or "gfx1250" not in getattr(torch.cuda.get_device_properties(0), "gcnArchName", ""),
+    reason="gfx1250 is required",
+)
+@pytest.mark.parametrize("output_size", [3648, 6288])
+def test_linear_attnres_partials_gfx1250_cuda_graph_replay(output_size: int) -> None:
+    hidden, weight, blocks, scores, scratch = _kimi3_linear_attnres_inputs(
+        1, output_size, seed=31
+    )
+    out = torch.empty(1, output_size, device="cuda", dtype=torch.bfloat16)
+
+    def run() -> torch.Tensor:
+        for outputs in scratch:
+            outputs[0].zero_()
+            outputs[1].zero_()
+            outputs[2].zero_()
+        return linear_attnres_partials(
+            hidden,
+            weight,
+            blocks,
+            *scores,
+            *scratch,
+            eps=1e-6,
+            out=out,
+            override="gluon_linear_attnres_partials_gfx1250",
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    hidden.copy_(torch.randn_like(hidden))
+    blocks.copy_(torch.randn_like(blocks))
+    graph.replay()
+    torch.cuda.synchronize()
+    replayed = out.clone()
+    expected = run()
+    torch.testing.assert_close(replayed, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or "gfx1250" not in getattr(torch.cuda.get_device_properties(0), "gcnArchName", ""),
+    reason="gfx1250 is required",
+)
+def test_linear_attnres_partials_gfx1250_rejects_unsupported_tokens() -> None:
+    hidden, weight, blocks, scores, scratch = _kimi3_linear_attnres_inputs(2, 6288)
+    with pytest.raises(ValueError, match="tokens must be 1"):
+        linear_attnres_partials(
+            hidden,
+            weight,
+            blocks,
+            *scores,
+            *scratch,
+            eps=1e-6,
+            override="gluon_linear_attnres_partials_gfx1250",
+        )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/ROCm is required")
 def test_linear_attnres_partials_cuda_portable_strided_inputs() -> None:
     generator = torch.Generator(device="cuda").manual_seed(37)

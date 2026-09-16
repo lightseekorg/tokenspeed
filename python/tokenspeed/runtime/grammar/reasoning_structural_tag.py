@@ -56,11 +56,13 @@ from typing import Any
 _REASONING_PARSER_TO_XGRAMMAR_MODEL: dict[str, str] = {
     "deepseek_r1": "deepseek_r1",
     "deepseek_v31": "deepseek_v3_2",
+    "deepseek_v41": "deepseek_v3_2",
     "kimi": "kimi",
     "kimi_k25": "kimi",
     "minimax": "minimax",
     "qwen3": "qwen_3",
     "qwen3_thinking": "qwen_3",
+    "glm45": "glm_4_7",
 }
 
 

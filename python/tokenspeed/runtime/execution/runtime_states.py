@@ -34,6 +34,9 @@ class RuntimeStates:
     ):
         self.device = device
         self.vocab_size = vocab_size
+        self.ngram_accepted_tokens: torch.Tensor | None = None
+        self.ngram_needs_seed: torch.Tensor | None = None
+        self.ngram_request_ids: list[str | None] = []
 
         self.valid_cache_lengths = torch.zeros(
             req_pool_size + 1, dtype=torch.int32, device=device
@@ -46,6 +49,25 @@ class RuntimeStates:
             req_pool_size + 1, dtype=torch.bool, device=device
         )
 
+    def init_ngram_state(self, context_len: int) -> None:
+        """Allocate a bounded, newest-first accepted input tail per pool slot.
+
+        ``context_len`` is zero without Engram, three for V4.1. This executor
+        state follows valid_cache_lengths, not sampled output or model KV. It
+        is reseeded from host snapshots on admission/recovery, never transferred
+        or prefix-matched as a backend cache. Returns None.
+        """
+        if context_len == 0:
+            return
+        pool_size = self.valid_cache_lengths.shape[0]
+        self.ngram_accepted_tokens = torch.full(
+            (pool_size, context_len), -1, dtype=torch.int64, device=self.device
+        )
+        self.ngram_needs_seed = torch.ones(
+            pool_size, dtype=torch.bool, device=self.device
+        )
+        self.ngram_request_ids = [None] * pool_size
+
     def update_valid_cache_length(
         self, req_pool_indices: torch.Tensor, increment_lengths: torch.Tensor
     ) -> None:
@@ -57,7 +79,15 @@ class RuntimeStates:
         extend_prefix_lens: torch.Tensor,
     ) -> None:
         self.valid_cache_lengths[extend_request_pool_indices] = extend_prefix_lens
-        self.remote_spec_candidate_ready[extend_request_pool_indices] = False
+        # Scalar indexed assignment stages a CPU tensor and synchronizes CUDA.
+        # Keep the reset ordered on the execution stream without a host wait.
+        self.remote_spec_candidate_ready.index_fill_(
+            0, extend_request_pool_indices, False
+        )
+        if self.ngram_accepted_tokens is not None:
+            assert self.ngram_needs_seed is not None
+            self.ngram_accepted_tokens.index_fill_(0, extend_request_pool_indices, -1)
+            self.ngram_needs_seed.index_fill_(0, extend_request_pool_indices, True)
 
     def write_remote_spec_candidate_ids(
         self, req_pool_idx: int, candidate_ids: list[int]

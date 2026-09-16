@@ -56,6 +56,20 @@ class CommBackend(ABC):
 
         return False
 
+    def prepare_all_reduce_buffers(
+        self,
+        group: Group,
+        *,
+        staged_max_numel: int,
+        producer_direct_max_numel: int,
+        attnres_max_numel: int,
+        attnres_max_rows: int,
+        dtype: torch.dtype,
+    ) -> bool:
+        """Return false when the backend has no persistent buffers to prepare."""
+
+        return False
+
     def can_acquire_all_reduce_outputs(
         self,
         shapes: tuple[tuple[int, ...], ...],
@@ -107,7 +121,7 @@ class CommBackend(ABC):
     ) -> torch.Tensor: ...
 
     @abstractmethod
-    def all_gather_into_tensor(
+    def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None: ...
 

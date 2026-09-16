@@ -242,8 +242,7 @@ protected:
 
         CacheGroupConfig full;
         full.group_id = "full";
-        full.rows_per_page = cfg.prefix_granularity;
-        full.entry_stride_tokens = 1;
+        full.block_granularity = cfg.prefix_granularity;
         full.total_pages = cfg.device_allocator.total_pages;
         full.retention = CacheGroupConfig::Retention::FullHistory;
         full.family = CacheGroupFamily::History;
@@ -276,7 +275,7 @@ TEST_F(DisaggDecodeAdmissionTestSuite, ReservesWholeDestinationAndSurvivesRemote
     EXPECT_EQ(prefill->input_lengths, (std::vector<std::int32_t>{4}));
     ASSERT_EQ(prefill->block_tables.count("full"), 1u);
     EXPECT_EQ(prefill->block_tables.at("full").at(0).size(), 3u);
-    EXPECT_EQ(scheduler_->ActiveKvPages(), 3u);
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 3u);
 
     SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
     const ExecutionPlan decode_plan = PlanOnce();
@@ -486,6 +485,8 @@ TEST_F(DecodeRetractionL2TestSuite, RetractionLetsBlockedAdmissionRun) {
     ASSERT_EQ(write_back_ops.size(), 1u);
     const auto& write_back = std::get<WriteBackBatch>(write_back_ops.front());
     ASSERT_EQ(write_back.op_ids.size(), 1u);
+    EXPECT_EQ(write_back.source_pinned, std::vector<bool>{false})
+        << "the victim's pages are granted away this round; the runtime must order the copy ahead of reuse";
 
     // The retraction round grants the freed capacity to the blocked request
     // in the same plan: its remote admission rides plan.remote_prefill.
@@ -737,12 +738,12 @@ TEST_F(DecodeRetractionL2TestSuite, WriteBackAckPublishesBestEffortHostEntries) 
     // The victim's pages were freed and immediately granted to the blocked
     // admission in the same round -- no D2H source pin holds them (the
     // execution stream orders the copy ahead of the granted request's use).
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 1);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 1);
     EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 0)
         << "the in-flight D2H operation must keep its Host destinations pinned";
 
     SendWriteBackDone(write_back.op_ids.front());
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 1);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 1);
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 3);
     EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 0);
 }
@@ -791,7 +792,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = PdSparseDecodeAdmissionTestSuite::MakeConfig();
         auto& state = cfg.cache_groups[1];
-        state.rows_per_page = 1;
+        state.block_granularity = 1;
         state.total_pages = 13;
         state.cache_blocks_per_lcm_block = 2;
         return cfg;
@@ -822,12 +823,11 @@ protected:
 
         CacheGroupConfig sliding;
         sliding.group_id = "sliding";
-        sliding.rows_per_page = 2;
-        sliding.entry_stride_tokens = 1;
+        sliding.block_granularity = 2;
         sliding.total_pages = cfg.device_allocator.total_pages;
         sliding.retention = CacheGroupConfig::Retention::SlidingWindow;
         sliding.sliding_window_tokens = 4;
-        sliding.family = CacheGroupFamily::State;
+        sliding.family = CacheGroupFamily::History;
         sliding.transfer_policy = CacheTransferPolicy::FullSuffix;
         cfg.cache_groups = {sliding};
         return cfg;
@@ -836,10 +836,10 @@ protected:
 
 TEST_F(PdLocalRecoveryCapacityTestSuite, SingleRequestCapacityIncludesLocalRecoveryWorkingSet) {
     // Full KV uses ceil(tokens / 4) parents. Non-overlap sparse local recovery
-    // of a chunked prompt needs three State parents: input checkpoint, final
-    // output and the banked growth block. Eight usable parents therefore admit
-    // at most 20 total tokens.
-    EXPECT_EQ(scheduler_->MaxSingleRequestTokens(), 20);
+    // of a chunked prompt needs four State parents: input checkpoint, aligned
+    // checkpoint, final output and the banked growth block. Eight usable parents
+    // therefore admit at most 16 total tokens.
+    EXPECT_EQ(scheduler_->MaxSingleRequestTokens(), 16);
 }
 
 TEST_F(PdSparseDecodeAdmissionTestSuite, MaterializesHistoryAndLatestStateSnapshotAtomically) {
@@ -865,7 +865,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, MaterializesHistoryAndLatestStateSnapsh
     ASSERT_EQ(plan.pages_to_zero.size(), 2u);
     EXPECT_EQ(plan.pages_to_zero.at("full"), full);
     EXPECT_EQ(plan.pages_to_zero.at("state"), (std::vector<std::int32_t>{state[3], state[4]}));
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 1);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 1);
     EXPECT_TRUE(scheduler_->PdTransferPinned("r0"));
 
     SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
@@ -881,7 +881,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, MaterializesHistoryAndLatestStateSnapsh
     ExecutionEvent succeeded;
     succeeded.With(pd::SucceededEvent{"r0"});
     scheduler_->Advance(succeeded);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 6);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 6);
 }
 
 TEST_F(PdSmallStatePagesTestSuite, LatestSnapshotUsesTheStateGroupsBlockGranularity) {

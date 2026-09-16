@@ -50,6 +50,7 @@ import sys
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -109,7 +110,7 @@ def _make_moe(fork: _SpyFork) -> SimpleNamespace:
         reduce_project_routed=lambda x: x,
     )
     return SimpleNamespace(
-        _gather_dp_tokens_for_moe=False,
+        mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=1)),
         native_latent_moe=None,
         stream_fork=fork,
         _topk_ready=None,
@@ -181,3 +182,7 @@ def test_eager_serving_leaves_the_fork_disabled():
     """Outside the graph phase behaviour is unchanged: no fork, no aux stream."""
     call = _run(graph_phase=False, capture_mode=False)
     assert call["enable"] is False
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

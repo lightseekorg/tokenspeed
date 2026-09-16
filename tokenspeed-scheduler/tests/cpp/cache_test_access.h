@@ -46,7 +46,7 @@ inline auto MatchPrefixForTest(CacheCoordinator& coordinator, std::span<const st
 inline void CacheFullBlocksForTest(CacheCoordinator& coordinator, std::span<BlockTable> tables,
                                    std::span<const std::string> content_hashes, std::int32_t first_slot = 0) {
     coordinator.CacheFullBlocks(tables, content_hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
-                                first_slot);
+                                first_slot, CacheBoundaryKind::kChunk);
 }
 
 inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
@@ -59,7 +59,7 @@ inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordi
         prototype.table = &table;
         demands.push_back(prototype);
     }
-    return coordinator.Admit(std::move(prefix), demands);
+    return coordinator.Admit(std::move(prefix), demands, std::nullopt);
 }
 
 inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,

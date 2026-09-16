@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.attention.flashinfer import (
+from tokenspeed_kernel.ops.attention.mha.flashinfer import (
     trtllm_batch_context_with_kv_cache,
     trtllm_batch_decode_with_kv_cache,
 )
@@ -58,6 +58,7 @@ from tokenspeed.runtime.layers.common import fp8_cast_contiguous
 from tokenspeed.runtime.utils.env import envs
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 
@@ -100,6 +101,8 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
     """The ``trtllm`` MHA leaf: TRT-LLM fused kernels for SM100 (Blackwell)."""
 
     default_kernel_page_size = TRTLLM_MHA_PAGE_SIZE
+    # Both kernel call sites forward layer.sliding_window_size.
+    supports_layer_sliding_window: bool = True
 
     def __init__(self, config: AttnConfig, spec: MHAConfig, *, kernel_page_size: int):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
@@ -135,8 +138,16 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         # Padded decode requests have seq_len=1; with q_len=spec_num_tokens
         # they'd hit an empty causal span and the kernel returns NaN.
         self.spec_cache_seqlens_buf: torch.Tensor | None = None
+        # Pure aranges per bs: pool-independent, so a rebind keeps them.
         self._cu_seqlens_by_bs: dict[int, torch.Tensor] = {}
         self._verify_views_by_bs: dict[int, TRTLLMMHAMetadata] = {}
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        super()._publish_cache_pool(cache_pool)
+        self.forward_prefill_metadata = None
+        self.forward_decode_metadata = None
+        self.spec_cache_seqlens_buf = None
+        self._verify_views_by_bs = {}
 
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None

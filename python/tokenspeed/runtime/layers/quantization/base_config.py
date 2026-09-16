@@ -81,6 +81,10 @@ class QuantizationConfig(ABC):
         """
         return self.get_name()
 
+    def get_moe_quant_config(self, prefix: str) -> "QuantizationConfig":
+        """Return the concrete quantization config for a routed MoE layer."""
+        return self
+
     def apply_checkpoint_name_replacements(
         self, replacements: tuple[tuple[str, str], ...]
     ) -> None:

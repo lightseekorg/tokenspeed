@@ -158,12 +158,19 @@ def test_msa_hybrid_fans_pool_binding_out_to_both_routers():
         def __init__(self):
             self.cache_pool = None
 
+        def validate_cache_pool(self, cache_pool):
+            del cache_pool
+
         def set_cache_pool(self, cache_pool):
             self.cache_pool = cache_pool
+
+        def _bind(self, cache_pool):
+            self.set_cache_pool(cache_pool)
 
     dense = ChildRouter()
     sparse = ChildRouter()
     backend = object.__new__(MSAHybridAttnBackend)
+    backend._init_pool_binding()
     backend.full_router = dense
     backend.sparse_router = sparse
     pool = object()
@@ -205,12 +212,16 @@ def test_router_fans_advance_out_to_every_leaf():
 
     leaf = _mha_backend()
     leaf.init_cuda_graph_state(8)
-    router = CacheGroupRouter(None, is_draft=True, spec_num_tokens=4, device="cpu")
+    router = CacheGroupRouter(
+        None, is_draft=True, spec_num_tokens=4, device="cpu", consumed_group_ids=None
+    )
     router.bind(
         CacheGroupGeometry(
             granularities={"full_attention": 64},
             families={"full_attention": "history"},
             full_history_group_id="full_attention",
+            row_geometry={"full_attention": (64, 1)},
+            retentions={"full_attention": ("full_history", None)},
         ),
         {"full_attention": leaf},
     )

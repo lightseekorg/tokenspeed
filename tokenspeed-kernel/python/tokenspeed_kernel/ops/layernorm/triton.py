@@ -232,6 +232,100 @@ def grouped_gemma_rmsnorm(
 
 
 @triton.jit
+def _grouped_rmsnorm_kernel(
+    x_ptr,
+    out_ptr,
+    row_stride,
+    out_row_stride,
+    eps: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < GROUP_SIZE
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    x = tl.load(
+        x_ptr + row * row_stride + offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    variance = tl.sum(x * x, axis=0) / GROUP_SIZE
+    normalized = x * tl.rsqrt(variance + eps)
+    tl.store(
+        out_ptr + row * out_row_stride + offsets,
+        normalized,
+        mask=mask,
+    )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def grouped_rmsnorm(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float,
+    *,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """Apply weight-free RMSNorm independently to last-dimension groups.
+
+    Args:
+        x: GPU input shaped ``[..., width]``.
+        group_size: Number of contiguous last-dimension values sharing one RMS
+            statistic. The last dimension must be divisible by this value.
+        eps: Epsilon added before reciprocal square root.
+        out: Optional contiguous output matching ``x``. ``out=x`` is supported
+            for graph-safe in-place normalization.
+
+    Returns:
+        Normalized tensor matching ``x`` shape and dtype.
+    """
+    if x.ndim < 1:
+        raise ValueError("x must have at least one dimension")
+    width = int(x.shape[-1])
+    if group_size <= 0 or width % group_size:
+        raise ValueError(
+            f"group_size must divide the last dimension ({width}), got {group_size}"
+        )
+    if out is None:
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    elif out.shape != x.shape or out.dtype != x.dtype or out.device != x.device:
+        raise ValueError("out must match x shape, dtype, and device")
+    elif not out.is_contiguous():
+        raise ValueError("out must be contiguous")
+    if x.numel() == 0:
+        return out
+    if not x.is_contiguous():
+        x = x.contiguous()
+
+    rows = x.numel() // group_size
+    x_2d = x.view(rows, group_size)
+    out_2d = out.view(rows, group_size)
+    block = triton.next_power_of_2(group_size)
+    if block > 65536:
+        raise ValueError("group_size is too large for the Triton reduction")
+    enable_pdl = pdl_enabled()
+    launch_kwargs = (
+        {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
+    )
+    _grouped_rmsnorm_kernel[(rows,)](
+        x_2d,
+        out_2d,
+        x_2d.stride(0),
+        out_2d.stride(0),
+        eps=eps,
+        GROUP_SIZE=group_size,
+        BLOCK=block,
+        ENABLE_PDL=enable_pdl,
+        **launch_kwargs,
+    )
+    return out
+
+
+@triton.jit
 def _fused_qk_rmsnorm_kernel(
     q_in_ptr,
     k_in_ptr,

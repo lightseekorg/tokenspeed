@@ -10,10 +10,6 @@ from importlib.util import find_spec
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.triton.linear.kda import (
-    kda_recurrent_decode,
-    kda_recurrent_decode_pool,
-)
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
@@ -22,6 +18,11 @@ if find_spec("fla") is None:
         "flash-linear-attention (fla) required for the KDA reference kernel",
         allow_module_level=True,
     )
+
+from tokenspeed_kernel.ops.attention.kda._triton.fla import (
+    kda_recurrent_decode,
+    kda_recurrent_decode_pool,
+)
 
 # K3 decode shapes (TP8 rank): 12 heads, K=V=128; lower_bound from config.
 HV, K, V = 12, 128, 128

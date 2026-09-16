@@ -18,10 +18,14 @@ import unittest
 from types import SimpleNamespace
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    CacheRuntimeContract,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
     v4_c4_state_window,
     v4_compressed_kv_spec,
     v4_compressor_state_spec,
+    v4_indexer_kv_spec,
     v4_indexer_state_spec,
     v4_swa_kv_spec,
 )
@@ -45,6 +49,7 @@ def build_v4_cache_specs(hf_config, *, layer_ratio, decode_input_tokens=1):
         specs.append(v4_compressor_state_spec(ratio, c4_state_window=window))
         specs.append(v4_compressed_kv_spec(ratio))
     if 4 in ratios:
+        specs.append(v4_indexer_kv_spec())
         specs.append(v4_indexer_state_spec(c4_state_window=window))
     return tuple(specs)
 
@@ -387,6 +392,81 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         self.assertEqual(rows["v4.swa_kv"], 64)
         self.assertEqual(rows["v4.c4a.compressor_state"], 4)
         self.assertEqual(rows["v4.c128a.compressor_state"], 8)
+
+    def test_every_v4_group_is_token_history(self):
+        # V4 stores rows of tokens everywhere -- the SWA window and the
+        # compressor tails are windows, not recurrent-state checkpoints -- so
+        # the whole pool is history family and the scheduler sees no snapshot
+        # group to place sparsely or align chunks for.
+        specs = build_v4_cache_specs(
+            SimpleNamespace(sliding_window=128),
+            layer_ratio=(1, 4, 128),
+        )
+        self.assertEqual({spec.family for spec in specs}, {"history"})
+        self.assertTrue(all(spec.checkpoint_granularity is None for spec in specs))
+        retentions = {spec.group_id: spec.retention for spec in specs}
+        self.assertEqual(retentions["v4.swa_kv"], "sliding_window")
+        self.assertEqual(retentions["v4.c4a.compressor_state"], "sliding_window")
+        self.assertEqual(
+            retentions["v4.c4a.indexer_compressor_state"], "sliding_window"
+        )
+        self.assertEqual(retentions["v4.c4a.compressed_kv"], "full_history")
+
+    def test_v4_groups_cross_the_bridge_into_a_live_scheduler(self):
+        # The whole V4 set arrives at the C++ scheduler as History groups,
+        # passes SchedulerConfig::Validate (which refuses a sliding State
+        # group) and builds a scheduler; with no snapshot group there is no
+        # state grain for the prefill chunk to align to.
+        try:
+            from tokenspeed_scheduler import CacheGroupFamily, Scheduler
+
+            from tokenspeed.runtime.engine.scheduler_utils import (
+                aligned_max_scheduled_tokens,
+                make_config,
+                pool_to_cache_groups,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + the tokenspeed_scheduler ext: {exc}")
+
+        prefix_granularity = 256
+        num_device_pages = 8
+        specs = build_v4_cache_specs(
+            SimpleNamespace(sliding_window=128),
+            layer_ratio=(1, 4, 128),
+        )
+        packing = {
+            spec.group_id: prefix_granularity // spec.block_granularity
+            for spec in specs
+        }
+        # The bridge consumes the contract's scheduler-facing (virtual) counts;
+        # a real contract derives them from the physical ones and each spec's
+        # shard count, all 1 here.
+        contract = CacheRuntimeContract(
+            prefix_granularity=prefix_granularity,
+            num_lcm_blocks=num_device_pages - 1,
+            token_capacity=(num_device_pages - 1) * prefix_granularity,
+            group_specs=specs,
+            group_page_counts={
+                gid: pack * (num_device_pages - 1) + 1 for gid, pack in packing.items()
+            },
+            group_packing=packing,
+        )
+        pool = SimpleNamespace(arena=SimpleNamespace(runtime_contract=contract))
+        groups = pool_to_cache_groups(pool)
+
+        self.assertEqual({g.family for g in groups}, {CacheGroupFamily.History})
+        config = make_config(
+            num_device_pages=num_device_pages,
+            max_scheduled_tokens=1024,
+            max_batch_size=4,
+            prefix_granularity=prefix_granularity,
+            num_host_pages=0,
+            disable_l2_cache=True,
+            role="fused",
+            cache_groups=groups,
+        )
+        Scheduler(config)
+        self.assertEqual(aligned_max_scheduled_tokens(8192, groups), 8192)
 
     def test_c4_state_window_covers_wide_verify_blocks(self):
         base = build_v4_cache_specs(

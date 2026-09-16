@@ -53,6 +53,15 @@ std::int32_t hostPoolBlocks(const SchedulerConfig& config) {
     return config.HasHostCache() ? config.host_allocator.NumUsableBlocks() : 0;
 }
 
+std::vector<std::int32_t> slotsPerParentByGroup(const SchedulerConfig& config) {
+    std::vector<std::int32_t> slots_per_group;
+    slots_per_group.reserve(config.cache_groups.size());
+    for (const CacheGroupConfig& group : config.cache_groups) {
+        slots_per_group.push_back(group.cache_blocks_per_lcm_block);
+    }
+    return slots_per_group;
+}
+
 // config_ is the first member, so routing it through this helper validates the
 // configuration before any pool or the coordinator is built off it.
 SchedulerConfig validated(SchedulerConfig config) {
@@ -75,8 +84,8 @@ CacheKey eventKey(const CacheKey& key) {
 Scheduler::Scheduler(SchedulerConfig config)
     : config_{validated(std::move(config))},
       req_pool_allocator_{config_.max_batch_size},
-      block_pool_{config_.device_allocator.NumUsableBlocks()},
-      host_pool_{hostPoolBlocks(config_)},
+      block_pool_{config_.device_allocator.NumUsableBlocks(), slotsPerParentByGroup(config_)},
+      host_pool_{hostPoolBlocks(config_), slotsPerParentByGroup(config_)},
       coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), config_.prefix_granularity, block_pool_,
                                    hostPoolBlocks(config_) > 0 ? &host_pool_ : nullptr,
                                    config_.StreamsDeviceCacheToHost())},
@@ -85,11 +94,6 @@ Scheduler::Scheduler(SchedulerConfig config)
     cache_group_ids_.reserve(config_.cache_groups.size());
     for (const CacheGroupConfig& group : config_.cache_groups) {
         cache_group_ids_.push_back(group.group_id);
-        const std::int32_t child_entries = config_.prefix_granularity / group.BlockGranularity();
-        if (cache_entries_per_event_boundary_ > std::numeric_limits<std::int32_t>::max() - child_entries) {
-            throw std::invalid_argument("Scheduler: cache entries per event boundary exceed int32 range");
-        }
-        cache_entries_per_event_boundary_ += child_entries;
     }
     max_single_request_tokens_ = calculateMaxSingleRequestTokens(coordinator_.TotalLcmBlocks());
 
@@ -118,15 +122,12 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
     const std::int64_t prefix_granularity = config_.prefix_granularity;
     // A final sub-page tail can follow the first aligned body, or a later body
     // that also retains an input checkpoint. Bound both cases independently.
-    const bool splits_final_state_checkpoint = config_.role != Role::kD && !config_.disable_prefix_cache;
-    const auto max_split_tail_after = [&](std::int64_t minimum_body_end) {
-        return splits_final_state_checkpoint
-                   ? std::max<std::int64_t>(0, std::min({prefix_granularity - 1, chunk_tokens - prefix_granularity,
-                                                         max_prompt_tokens - minimum_body_end}))
-                   : 0;
+    const auto max_tail_after = [&](std::int64_t minimum_body_end) {
+        return std::max<std::int64_t>(0, std::min({prefix_granularity - 1, chunk_tokens - prefix_granularity,
+                                                   max_prompt_tokens - minimum_body_end}));
     };
-    const std::int64_t max_first_chunk_tail_tokens = max_split_tail_after(prefix_granularity);
-    const std::int64_t max_later_chunk_tail_tokens = max_split_tail_after(2 * prefix_granularity);
+    const std::int64_t max_first_chunk_tail_tokens = max_tail_after(prefix_granularity);
+    const std::int64_t max_later_chunk_tail_tokens = max_tail_after(2 * prefix_granularity);
 
     std::vector<std::int64_t> group_pages(static_cast<std::size_t>(coordinator_.NumGroups()));
     for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
@@ -136,22 +137,22 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
             if (group.IsSnapshotStateGroup()) {
                 if (token_limit == 0) return std::int64_t{0};
                 // Peak = retained input checkpoint (a later chunk's, or a prefix-cache hit)
-                // + endpoint + max(growth, tail). P banks no growth; overlap keeps one more
-                // decode step live. A rebased recovery prompt may exceed max_prompt_tokens.
-                const std::int64_t growth_blocks =
-                    config_.role == Role::kP
-                        ? 0
-                        : ceilDiv(std::max<std::int64_t>(block_granularity, decode_width + protected_tokens),
-                                  block_granularity);
+                // + aligned checkpoint + its materialized suffix/reserve. The
+                // forward holds both the final continuation and growth storage.
+                // P banks no decode growth; overlap keeps one more decode step live.
+                // A rebased recovery prompt may exceed max_prompt_tokens.
+                const auto output_blocks = [&](std::int64_t tail_tokens) {
+                    const std::int64_t reserve_tokens =
+                        config_.role == Role::kP
+                            ? 0
+                            : SnapshotStateReserveTokens(block_granularity, decode_width + protected_tokens);
+                    return 1 + ceilDiv(tail_tokens + reserve_tokens, block_granularity);
+                };
                 const std::int64_t lookback = coordinator_.GroupBoundaryLookbackPages(i);
                 const std::int64_t first_chunk_peak =
-                    (config_.disable_prefix_cache ? 0 : lookback) + 1 +
-                    std::max(growth_blocks, ceilDiv(max_first_chunk_tail_tokens, block_granularity));
+                    (config_.disable_prefix_cache ? 0 : lookback) + output_blocks(max_first_chunk_tail_tokens);
                 const std::int64_t later_chunk_peak =
-                    max_prompt_tokens > chunk_tokens
-                        ? lookback + 1 +
-                              std::max(growth_blocks, ceilDiv(max_later_chunk_tail_tokens, block_granularity))
-                        : 0;
+                    max_prompt_tokens > chunk_tokens ? lookback + output_blocks(max_later_chunk_tail_tokens) : 0;
                 return std::max(first_chunk_peak, later_chunk_peak);
             }
             // Across every prompt up to max_prompt_tokens, retain the largest
@@ -221,6 +222,23 @@ Request* Scheduler::findRequest(const std::string& request_id) {
     return it == requests_by_id_.end() ? nullptr : it->second;
 }
 
+bool Scheduler::pdTransferInFlight(const Request& request) const {
+    switch (config_.role) {
+        case Role::kD:
+            return request.Is<fsm::RemotePrefilling>();
+        case Role::kP:
+            return request.HoldsPages();
+        case Role::kFused:
+            return false;
+    }
+    return false;
+}
+
+bool Scheduler::PdTransferPinned(const std::string& request_id) const {
+    const auto it = requests_by_id_.find(request_id);
+    return it != requests_by_id_.end() && pdTransferInFlight(*it->second);
+}
+
 std::size_t Scheduler::groupIndex(const std::string& group_id) const {
     const auto it = std::ranges::find(cache_group_ids_, group_id);
     if (it == cache_group_ids_.end()) {
@@ -247,7 +265,8 @@ bool Scheduler::clearCache(bool include_host) {
     // this function's business. What IS its business are the writers the pins
     // do not cover: an asynchronous transfer still landing into a cached
     // block would race a clear that succeeded on the pin check alone.
-    const bool has_pd_transfers = !pd_transfer_pins_.empty();
+    const bool has_pd_transfers = std::ranges::any_of(
+        requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
     const bool has_tier_transfers = tier_transfers_.HasAnyInFlight();
     if (has_pd_transfers || has_tier_transfers) {
         spdlog::info("[Scheduler] flush L1 cache rejected: pd_transfers={} tier_transfers={}", has_pd_transfers,
@@ -293,8 +312,8 @@ std::vector<CacheKey> Scheduler::registerKvEventPrefixPages(const Request& reque
             .token_ids = std::vector<std::int32_t>(token_pages[i].begin(), token_pages[i].end()),
             .block_size = config_.prefix_granularity,
         };
-        const auto [it, inserted] = kv_event_pages_.try_emplace(key, std::move(event));
-        FatalCheck(inserted || it->second.block_hashes.front() == progress.block_hashes[i],
+        const auto [it, inserted] = kv_event_boundaries_.try_emplace(key, KvEventBoundary{.stored = std::move(event)});
+        FatalCheck(inserted || it->second.stored.block_hashes.front() == progress.block_hashes[i],
                    "one cache content hash mapped to different KV event blocks");
         registered_keys.push_back(std::move(key));
     }
@@ -303,37 +322,31 @@ std::vector<CacheKey> Scheduler::registerKvEventPrefixPages(const Request& reque
 
 void Scheduler::discardUncachedKvEventPages(std::span<const CacheKey> keys) {
     for (const CacheKey& key : keys) {
-        if (!cached_event_child_counts_.contains(key)) {
-            kv_event_pages_.erase(key);
+        if (coordinator_.DeviceBoundaryResidency(key) == CacheCoordinator::BoundaryResidency::kNone) {
+            kv_event_boundaries_.erase(key);
         }
     }
 }
 
 void Scheduler::handleCacheMutation(const CacheKey& key, CacheCoordinator::CacheMutation mutation) {
-    const CacheKey prefix_key = eventKey(key);
+    const CacheKey boundary = eventKey(key);
+    const auto it = kv_event_boundaries_.find(boundary);
+    FatalCheck(it != kv_event_boundaries_.end(), "cache mutation on a KV event boundary with no token descriptor");
+    KvEventBoundary& event_boundary = it->second;
+    const CacheCoordinator::BoundaryResidency residency = coordinator_.DeviceBoundaryResidency(boundary);
     if (mutation == CacheCoordinator::CacheMutation::kStored) {
-        std::int32_t& child_count = cached_event_child_counts_[prefix_key];
-        FatalCheck(child_count < cache_entries_per_event_boundary_, "duplicate child entry for one KV event boundary");
-        ++child_count;
-        if (child_count == cache_entries_per_event_boundary_) {
-            const auto page_it = kv_event_pages_.find(prefix_key);
-            FatalCheck(page_it != kv_event_pages_.end(), "cached KV event boundary has no token descriptor");
-            kv_events_.emplace_back(page_it->second);
+        if (!event_boundary.published && residency == CacheCoordinator::BoundaryResidency::kComplete) {
+            kv_events_.emplace_back(event_boundary.stored);
+            event_boundary.published = true;
         }
         return;
     }
-
-    auto count_it = cached_event_child_counts_.find(prefix_key);
-    FatalCheck(count_it != cached_event_child_counts_.end() && count_it->second > 0,
-               "removed KV event boundary was not registered");
-    if (count_it->second == cache_entries_per_event_boundary_) {
-        const auto page_it = kv_event_pages_.find(prefix_key);
-        FatalCheck(page_it != kv_event_pages_.end(), "removed KV event boundary has no token descriptor");
-        kv_events_.emplace_back(KvBlockRemovedEvent{.block_hashes = page_it->second.block_hashes});
+    if (event_boundary.published) {
+        kv_events_.emplace_back(KvBlockRemovedEvent{.block_hashes = event_boundary.stored.block_hashes});
+        event_boundary.published = false;
     }
-    if (--count_it->second == 0) {
-        cached_event_child_counts_.erase(count_it);
-        kv_event_pages_.erase(prefix_key);
+    if (residency == CacheCoordinator::BoundaryResidency::kNone) {
+        kv_event_boundaries_.erase(it);
     }
 }
 
@@ -373,34 +386,27 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
 }
 
 std::size_t Scheduler::WaitingSize() const {
-    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const auto& request) {
-        return request->template Is<fsm::Submitted>() || request->template Is<fsm::Retracted>();
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->IsAnyOf<fsm::Submitted, fsm::Retracted>();
     }));
 }
 
 std::size_t Scheduler::DecodingSize() const {
-    return static_cast<std::size_t>(
-        std::ranges::count_if(requests_, [](const auto& request) { return request->template Is<fsm::Decoding>(); }));
+    return static_cast<std::size_t>(std::ranges::count_if(
+        requests_, [](const std::unique_ptr<Request>& request) { return request->Is<fsm::Decoding>(); }));
 }
 
 std::size_t Scheduler::PrefillSize() const {
-    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const auto& request) {
-        return request->template Is<fsm::Prefilling>() || request->template Is<fsm::RemotePrefilling>() ||
-               request->template Is<fsm::PrefillAwaitingResult>() || request->template Is<fsm::PrefillDone>();
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->IsAnyOf<fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillAwaitingResult, fsm::PrefillDone>();
     }));
 }
 
-std::size_t Scheduler::AvailableKvPages() const {
-    return static_cast<std::size_t>(coordinator_.NumAvailableLcmBlocks());
-}
-
-std::size_t Scheduler::ActiveKvPages() const {
+std::int32_t Scheduler::ActiveLcmBlocks() const {
     std::vector<std::span<const BlockTable>> request_tables;
     request_tables.reserve(requests_.size());
     for (const auto& request : requests_) {
-        if (!request->Is<fsm::Prefilling>() && !request->Is<fsm::RemotePrefilling>() &&
-            !request->Is<fsm::PrefillAwaitingResult>() && !request->Is<fsm::PrefillDone>() &&
-            !request->Is<fsm::Decoding>()) {
+        if (!request->HoldsPages()) {
             continue;
         }
         request_tables.emplace_back(request->BlockTablesRef());
@@ -435,8 +441,8 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     std::vector<Request*> candidates;
     candidates.reserve(requests_.size());
     for (const auto& request : requests_) {
-        if (request->Is<fsm::Submitted>() || request->Is<fsm::Prefilling>() || request->Is<fsm::RemotePrefilling>() ||
-            request->Is<fsm::PrefillDone>() || request->Is<fsm::Decoding>() || request->Is<fsm::Retracted>()) {
+        if (request->IsAnyOf<fsm::Submitted, fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillDone, fsm::Decoding,
+                             fsm::Retracted>()) {
             candidates.push_back(request.get());
         }
     }
@@ -447,7 +453,10 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     plan.With(ForwardBatch{std::move(forward_operations)});
 
     if (config_.StreamsDeviceCacheToHost()) {
-        if (auto store = tier_transfers_.StartPendingStores()) {
+        // Boundary publications of live requests: their owners hold the pages,
+        // and the ticket pins them until the ACK, so the copy stays off the
+        // forward's critical path.
+        if (auto store = tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck)) {
             write_back_operations.push_back(std::move(*store));
         }
     }

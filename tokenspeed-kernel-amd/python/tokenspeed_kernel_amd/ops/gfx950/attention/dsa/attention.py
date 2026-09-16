@@ -159,6 +159,7 @@ def _dsa_dense_mfma_kv_kernel(
     FP8_INPUTS: gl.constexpr,
     NATIVE_FP8: gl.constexpr,
     NATIVE_E5M2: gl.constexpr,
+    COLUMN_PARALLEL: gl.constexpr,
     TRIM_EMPTY_TILES: gl.constexpr,
     NUM_KV_SPLITS: gl.constexpr,
 ):
@@ -171,6 +172,14 @@ def _dsa_dense_mfma_kv_kernel(
     ROPE_LOAD_VEC: gl.constexpr = 4 if NATIVE_FP8 else 2
     SHARED_INTERVAL: gl.constexpr = 1024 if NATIVE_FP8 else 512
     SHARED_PADDING: gl.constexpr = 32 if NATIVE_FP8 else 16
+    # The BF16 no-RoPE tile owns one MFMA row. Split its columns across the
+    # four waves, then restore the original score layout before softmax.
+    mfma_qk: gl.constexpr = gl.amd.cdna4.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, instr_k],
+        transposed=True,
+        warps_per_cta=([1, 4] if COLUMN_PARALLEL else [4, 1]),
+    )
     mfma_s: gl.constexpr = gl.amd.cdna4.AMDMFMALayout(
         version=4,
         instr_shape=[16, 16, instr_k],
@@ -181,7 +190,7 @@ def _dsa_dense_mfma_kv_kernel(
         version=4,
         instr_shape=[16, 16, instr_k],
         transposed=True,
-        warps_per_cta=[4, 1],
+        warps_per_cta=([1, 4] if COLUMN_PARALLEL else [4, 1]),
     )
 
     _qlora_tpw_k: gl.constexpr = min(64, D_V // INPUT_VEC)
@@ -249,22 +258,22 @@ def _dsa_dense_mfma_kv_kernel(
 
     dot_qlora_a: gl.constexpr = gl.DotOperandLayout(
         operand_index=0,
-        parent=mfma_s,
+        parent=mfma_qk,
         k_width=QK_K_WIDTH,
     )
     dot_qrope_a: gl.constexpr = gl.DotOperandLayout(
         operand_index=0,
-        parent=mfma_s,
+        parent=mfma_qk,
         k_width=QK_K_WIDTH,
     )
     dot_klora_b: gl.constexpr = gl.DotOperandLayout(
         operand_index=1,
-        parent=mfma_s,
+        parent=mfma_qk,
         k_width=QK_K_WIDTH,
     )
     dot_krope_b: gl.constexpr = gl.DotOperandLayout(
         operand_index=1,
-        parent=mfma_s,
+        parent=mfma_qk,
         k_width=QK_K_WIDTH,
     )
     dot_p_a: gl.constexpr = gl.DotOperandLayout(
@@ -569,10 +578,11 @@ def _dsa_dense_mfma_kv_kernel(
         if HAS_ROPE:
             k_rope_t_dot = smem_krope.index(cur_buf).load(dot_krope_b)
 
-        scores = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=mfma_s)
+        scores = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=mfma_qk)
         scores = gl.amd.cdna4.mfma(q_lora_dot, k_lora_t_dot, scores)
         if HAS_ROPE:
             scores = gl.amd.cdna4.mfma(q_rope_dot, k_rope_t_dot, scores)
+        scores = gl.convert_layout(scores, mfma_s)
         scores = scores * scale
 
         offs_h_mma = hg_offset + gl.arange(
@@ -613,10 +623,11 @@ def _dsa_dense_mfma_kv_kernel(
     if HAS_ROPE:
         k_rope_t_dot = smem_krope.index(cur_buf).load(dot_krope_b)
 
-    scores = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=mfma_s)
+    scores = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=mfma_qk)
     scores = gl.amd.cdna4.mfma(q_lora_dot, k_lora_t_dot, scores)
     if HAS_ROPE:
         scores = gl.amd.cdna4.mfma(q_rope_dot, k_rope_t_dot, scores)
+    scores = gl.convert_layout(scores, mfma_s)
     scores = scores * scale
 
     offs_h_mma = hg_offset + gl.arange(
@@ -1018,18 +1029,22 @@ def _select_num_kv_splits(
     is_fp8: bool,
     native_fp8: bool = False,
     qk_rope_head_dim: int = 64,
+    is_prefill: bool = False,
 ) -> int:
     work_tiles = max(1, (min(int(topk_width), int(max_seqlen_k)) + 31) // 32)
     if work_tiles <= 8:
         return 1
     if not is_fp8:
         # This tuning comes from GLM-5.3-Flash. Split sufficiently large selected-KV
-        # rows across CTAs so the launch provides enough parallel work to fill the GPU.
+        # rows across CTAs so the launch provides enough parallel work to fill the
+        # GPU.
+        # Pooled selection can append up to three tail slots to the configured
+        # 2,048-token budget, so graph captures use widths from 2,048 through 2,051.
         if (
             int(qk_rope_head_dim) == 0
             and int(num_heads) == 16
-            and int(topk_width) == 2048
-            and work_tiles == 64
+            and 2048 <= int(topk_width) <= 2051
+            and work_tiles >= 64
         ):
             if int(num_tokens) == 16:
                 return 16
@@ -1043,7 +1058,12 @@ def _select_num_kv_splits(
         and work_tiles == 64
     ):
         return _GLM52_SINGLE_ROW_DECODE_SPLITS
+    base_ctas = max(1, int(num_tokens) * triton.cdiv(int(num_heads), 16))
     if native_fp8 and int(num_heads) == 16:
+        # Large prefill grids already fill the two-wave occupancy target. Splitting
+        # them would only multiply the full-rank reduction workspace.
+        if is_prefill and base_ctas >= _GFX950_COMPUTE_UNITS * 2:
+            return 1
         # Native FP8 DSA CTAs carry enough work that the generic two-wave
         # occupancy target oversplits medium/large graph batches. These
         # thresholds are expressed only in kernel shape terms and keep short
@@ -1055,7 +1075,6 @@ def _select_num_kv_splits(
                 return 8
         elif work_tiles >= 32 and (int(num_tokens) == 1 or int(num_tokens) >= 8):
             return 4
-    base_ctas = max(1, int(num_tokens) * triton.cdiv(int(num_heads), 16))
     return select_kv_splits(
         base_ctas=base_ctas,
         num_pages=work_tiles,
@@ -1089,6 +1108,7 @@ def _run_dense_kv(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     max_seqlen_k: int,
+    is_prefill: bool,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if out is None:
@@ -1105,6 +1125,7 @@ def _run_dense_kv(
         is_fp8=q.dtype in _FP8_DTYPES,
         native_fp8=q.dtype == kv_cache.dtype and q.dtype in _FP8_DTYPES,
         qk_rope_head_dim=qk_rope_head_dim,
+        is_prefill=is_prefill,
     )
     if num_kv_splits == 1:
         stage_out = out
@@ -1164,6 +1185,11 @@ def _run_dense_kv(
         NATIVE_FP8=(q.dtype == kv_cache.dtype and q.dtype in _FP8_DTYPES),
         NATIVE_E5M2=(
             q.dtype == torch.float8_e5m2 and kv_cache.dtype == torch.float8_e5m2
+        ),
+        COLUMN_PARALLEL=(
+            q.dtype == torch.bfloat16
+            and kv_cache.dtype == torch.bfloat16
+            and qk_rope_head_dim == 0
         ),
         TRIM_EMPTY_TILES=int(max_seqlen_k) < int(topk_slots.shape[1]),
         NUM_KV_SPLITS=num_kv_splits,
@@ -1280,6 +1306,7 @@ def _run_dsa(
     k_scale: float,
     out: torch.Tensor | None,
     max_seqlen_k: int,
+    is_prefill: bool,
 ) -> torch.Tensor:
     _check_inputs(
         q,
@@ -1343,6 +1370,7 @@ def _run_dsa(
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 max_seqlen_k=max_seqlen_k,
+                is_prefill=is_prefill,
                 out=out_view,
             )
         else:
@@ -1399,6 +1427,7 @@ def gluon_dsa_decode_gfx950(
         k_scale=k_scale,
         out=out,
         max_seqlen_k=max_seqlen_k,
+        is_prefill=False,
     )
 
 
@@ -1437,4 +1466,5 @@ def gluon_dsa_prefill_gfx950(
         k_scale=k_scale,
         out=out,
         max_seqlen_k=max_seqlen_k,
+        is_prefill=True,
     )

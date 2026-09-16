@@ -67,6 +67,17 @@ def test_clear_starts_a_fresh_forward():
     assert torch.equal(second, torch.ones(2, dtype=torch.int64))
 
 
+def test_first_use_is_once_per_key_and_resets_with_forward():
+    memo = DeepseekV4ForwardSlotMappings()
+
+    assert memo.first_use(("position_capacity", 4096))
+    assert not memo.first_use(("position_capacity", 4096))
+    assert memo.first_use(("position_capacity", 8192))
+
+    memo.clear()
+    assert memo.first_use(("position_capacity", 4096))
+
+
 def test_forward_context_carries_no_v4_memo_fields():
     names = {f.name for f in fields(ForwardContext)}
     assert not {"dsa_swa_slot_mapping", "dsa_compressor_slot_cache"} & names

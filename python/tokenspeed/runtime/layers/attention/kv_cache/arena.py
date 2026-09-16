@@ -68,6 +68,9 @@ class CacheArena:
                 "cache arena requires at least one cache group spec to publish"
             )
         self.plan = plan
+        # Materialize immutable byte geometry at setup, not on first hand-out.
+        for group in plan.groups:
+            plan.block_byte_segments(group.group_id, [])
         self.device = device
         self._cache_group_specs_by_id = {
             spec.group_id: spec for spec in cache_group_specs
@@ -91,13 +94,13 @@ class CacheArena:
         self._fields: dict[str, torch.Tensor] = {
             field.field_id: self._bind(field) for field in plan.fields
         }
+        plan_groups = {group.group_id: group for group in plan.groups}
         # The contract joins the recipe's logical specs with the plan's
         # physical facts for the same groups. The plan owns page counts and
         # packing; the contract carries them beside the specs rather than
         # copying them in, and the recipe packs the plan from the same
         # (spec, fields) pairs these specs come from, so both name one group
         # set by construction.
-        plan_groups = {group.group_id: group for group in plan.groups}
         self.runtime_contract = CacheRuntimeContract(
             # The identity axis comes from the plan, never read back out of
             # view state. Per-group CacheBlock spans live in the group specs
@@ -222,7 +225,22 @@ class CacheArena:
         return self.plan.field_page_byte_offset(field_id, block_id)
 
     def zero_blocks(self, block_ids_by_group: dict[str, list[int]]) -> None:
-        """Clear selected CacheBlocks without interpreting their field types."""
+        """Clear local physical blocks after validating every group's IDs.
+
+        Args:
+            block_ids_by_group: Local block IDs, each in [0, group.page_count).
+
+        Raises:
+            IndexError: A block ID is outside its group's physical range.
+        """
+        for group_id, block_ids in block_ids_by_group.items():
+            page_count = self.plan.group(group_id).page_count
+            for block in block_ids:
+                if not 0 <= block < page_count:
+                    raise IndexError(
+                        f"local block ID {block} outside [0, {page_count}) "
+                        f"for group {group_id!r}"
+                    )
         segments = [
             segment
             for group_id, block_ids in block_ids_by_group.items()
@@ -234,16 +252,7 @@ class CacheArena:
     def block_byte_segments(
         self, group_id: str, block_ids: list[int]
     ) -> list[tuple[int, int]]:
-        self.plan.group(group_id)
-        fields = [field for field in self.plan.fields if field.group_id == group_id]
-        return [
-            (
-                self.field_block_byte_offset(field.field_id, block_id),
-                field.payload_bytes,
-            )
-            for block_id in block_ids
-            for field in fields
-        ]
+        return self.plan.block_byte_segments(group_id, block_ids)
 
     @property
     def supports_disaggregation(self) -> bool:

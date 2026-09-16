@@ -18,39 +18,49 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""DeepGEMM implementation of the DeepSeek V4 MegaMoE boundary."""
+"""DeepGEMM implementation of the DeepSeek V4/V4.1 MegaMoE boundary.
+
+The third-party adapter rounds FP32 weighted SwiGLU to BF16 before computing
+FP8 scales and payloads, matching both model references without unfusing MoE.
+"""
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+    pdl_enabled,
+    prepare_cuda_toolkit_env,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-try:
-    from tokenspeed_kernel.thirdparty.deep_gemm import (
+platform = current_platform()
+logger = logging.getLogger(__name__)
+
+if platform.is_blackwell:
+    prepare_cuda_toolkit_env()
+    from deep_gemm import (
         fp8_fp4_mega_moe,
         get_pdl,
         get_symm_buffer_for_mega_moe,
         set_pdl,
-        transform_sf_into_required_layout,
-        transform_weights_for_mega_moe,
-        warmup_mega_moe_jit,
     )
-    from tokenspeed_kernel.thirdparty.triton import stage_dsv4_mega_moe_inputs
-except ImportError:  # pragma: no cover - DeepGEMM and Triton are optional
-    fp8_fp4_mega_moe = None
-    get_pdl = None
-    get_symm_buffer_for_mega_moe = None
-    set_pdl = None
-    transform_sf_into_required_layout = None
-    transform_weights_for_mega_moe = None
-    warmup_mega_moe_jit = None
-    stage_dsv4_mega_moe_inputs = None
+    from tokenspeed_kernel.ops._deep_gemm.mega_moe_bf16 import (
+        prepare_mega_moe_bf16_jit,
+    )
+    from tokenspeed_kernel.ops.moe.deep_gemm._triton.stage import (
+        stage_dsv4_mega_moe_inputs,
+    )
+
+    prepare_mega_moe_bf16_jit()
 
 
 _MXFP4_BLOCK_SIZE = 32
@@ -66,12 +76,6 @@ class _DeepGemmMegaMoEState:
     l1_weights: tuple[torch.Tensor, torch.Tensor]
     l2_weights: tuple[torch.Tensor, torch.Tensor]
     device: torch.device
-
-
-def _ue8m0_to_float(scale: torch.Tensor) -> torch.Tensor:
-    if scale.dtype == torch.uint8:
-        return (scale.to(torch.int32) << 23).view(torch.float32)
-    return scale.float()
 
 
 def _expected_shapes(
@@ -93,6 +97,62 @@ def _expected_shapes(
             intermediate_size // _MXFP4_BLOCK_SIZE,
         ),
     )
+
+
+def _interleave_gate_up_(weight: torch.Tensor, granularity: int) -> torch.Tensor:
+    """Interleave gate/up blocks in place with one-expert scratch space."""
+    squeeze_group_dim = weight.ndim == 2
+    if squeeze_group_dim:
+        weight = weight.unsqueeze(0)
+    groups, rows, *rest = weight.shape
+    half = rows // 2
+    blocks = half // granularity
+    for group in range(groups):
+        source = weight[group].clone().view(2, blocks, granularity, *rest)
+        weight[group].view(blocks, 2, granularity, *rest).copy_(source.transpose(0, 1))
+    return weight.squeeze(0) if squeeze_group_dim else weight
+
+
+def _pack_ue8m0_scale_(scale: torch.Tensor) -> torch.Tensor:
+    """Pack UE8M0 bytes into DeepGEMM's layout with one-expert scratch."""
+    squeeze_group_dim = scale.ndim == 2
+    if squeeze_group_dim:
+        scale = scale.unsqueeze(0)
+    groups, rows, columns = scale.shape
+    if columns % 4:
+        raise ValueError("MegaMoE UE8M0 scale columns must be divisible by four")
+    packed_columns = columns // 4
+    for group in range(groups):
+        source = scale[group].clone().view(rows, packed_columns, 4)
+        scale[group].view(packed_columns, rows, 4).copy_(source.permute(1, 0, 2))
+    packed = scale.view(torch.int32)
+    output = torch.as_strided(
+        packed,
+        size=(groups, rows, packed_columns),
+        stride=(rows * packed_columns, 1, rows),
+    )
+    return output.squeeze(0) if squeeze_group_dim else output
+
+
+def _reorder_scale_rows_(
+    scale: torch.Tensor, interleave_gate_up: bool, granularity: int
+) -> torch.Tensor:
+    """Apply MegaMoE gate/up and UTCCP row permutations in place."""
+    grouped = scale if scale.ndim == 3 else scale.unsqueeze(0)
+    groups, rows, packed_columns = grouped.shape
+    if rows % 128:
+        raise ValueError("MegaMoE scale rows must be divisible by 128")
+    for group in range(groups):
+        source = grouped[group].contiguous()
+        if interleave_gate_up:
+            half = rows // 2
+            blocks = half // granularity
+            source = source.view(2, blocks, granularity, packed_columns)
+            source = source.transpose(0, 1).reshape(rows, packed_columns)
+        source = source.view(-1, 4, 32, packed_columns)
+        source = source.transpose(1, 2).reshape(rows, packed_columns)
+        grouped[group].copy_(source)
+    return scale
 
 
 def _deep_gemm_dsv4_mega_moe_process_weights(
@@ -123,29 +183,17 @@ def _deep_gemm_dsv4_mega_moe_process_weights(
     if w13_weight.dtype != torch.uint8 or w2_weight.dtype != torch.uint8:
         raise ValueError("MegaMoE packed checkpoint weights must have dtype uint8")
 
-    w13_scale = transform_sf_into_required_layout(
-        sf=_ue8m0_to_float(w13_weight_scale).contiguous(),
-        mn=2 * intermediate_size,
-        k=hidden_size,
-        recipe=(1, _MXFP4_BLOCK_SIZE),
-        num_groups=num_local_experts,
-    )
-    w2_scale = transform_sf_into_required_layout(
-        sf=_ue8m0_to_float(w2_weight_scale).contiguous(),
-        mn=hidden_size,
-        k=intermediate_size,
-        recipe=(1, _MXFP4_BLOCK_SIZE),
-        num_groups=num_local_experts,
-    )
-    l1_weights, l2_weights = transform_weights_for_mega_moe(
-        (w13_weight.view(torch.int8).contiguous(), w13_scale),
-        (w2_weight.view(torch.int8).contiguous(), w2_scale),
-    )
-    # DeepGEMM may return the contiguous L2 input itself. Break that reference
-    # so callers can release all canonical checkpoint tensors after processing.
+    w13_weight = _interleave_gate_up_(w13_weight.view(torch.int8), 8)
+    w13_scale = _pack_ue8m0_scale_(w13_weight_scale)
+    w13_scale = _reorder_scale_rows_(w13_scale, True, 8)
+    w2_scale = _pack_ue8m0_scale_(w2_weight_scale)
+    w2_scale = _reorder_scale_rows_(w2_scale, False, 8)
+
+    # The opaque state takes ownership of the canonical tensor storage when the
+    # model drops its parameters after this callback returns.
     return _DeepGemmMegaMoEState(
-        l1_weights=l1_weights,
-        l2_weights=(l2_weights[0].clone(), l2_weights[1]),
+        l1_weights=(w13_weight, w13_scale),
+        l2_weights=(w2_weight.view(torch.int8), w2_scale),
         device=w13_weight.device,
     )
 
@@ -200,6 +248,72 @@ def _get_symm_buffer(
     return buffer
 
 
+def _warmup_m_values(max_tokens: int) -> list[int]:
+    """Return token counts covering every DeepGEMM tile reachable at runtime."""
+    dense = min(max_tokens, 2048)
+    values: set[int] = set(range(1, dense + 1))
+    values.update(range(dense, max_tokens + 1, 16))
+    values.add(max_tokens)
+    return sorted(values)
+
+
+def _warmup_mega_moe_jit(
+    *,
+    num_experts: int,
+    max_num_tokens: int,
+    top_k: int,
+    hidden_size: int,
+    device: torch.device,
+    transformed_l1_weights: tuple[torch.Tensor, torch.Tensor],
+    transformed_l2_weights: tuple[torch.Tensor, torch.Tensor],
+    symm_buffer: object,
+    activation_clamp: float | None,
+) -> None:
+    """Pre-compile MegaMoE kernel tiles using the initialized model state."""
+    token_counts = _warmup_m_values(max_num_tokens)
+    logger.info(
+        "Warming up mega_moe JIT: %d token counts up to %d",
+        len(token_counts),
+        max_num_tokens,
+    )
+
+    for num_tokens in token_counts:
+        hidden_states = torch.randn(
+            num_tokens,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        topk_ids = torch.randint(
+            0,
+            num_experts,
+            (num_tokens, top_k),
+            dtype=torch.int32,
+            device=device,
+        )
+        topk_weights = torch.full(
+            (num_tokens, top_k),
+            1.0 / top_k,
+            dtype=torch.float32,
+            device=device,
+        )
+
+        output = torch.empty_like(hidden_states)
+        symm_buffer.x[:num_tokens].copy_(hidden_states.to(torch.float8_e4m3fn))
+        symm_buffer.x_sf[:num_tokens].fill_(1.0)
+        symm_buffer.topk_idx[:num_tokens].copy_(topk_ids)
+        symm_buffer.topk_weights[:num_tokens].copy_(topk_weights)
+        fp8_fp4_mega_moe(
+            output,
+            transformed_l1_weights,
+            transformed_l2_weights,
+            symm_buffer,
+            activation_clamp=activation_clamp,
+        )
+
+    torch.cuda.synchronize()
+
+
 def _warmup_deep_gemm_dsv4_mega_moe(
     *,
     state: object,
@@ -241,7 +355,7 @@ def _warmup_deep_gemm_dsv4_mega_moe(
         intermediate_size=intermediate_size,
         max_num_tokens=max_num_tokens,
     )
-    warmup_mega_moe_jit(
+    _warmup_mega_moe_jit(
         num_experts=num_experts,
         max_num_tokens=max_num_tokens,
         top_k=top_k,
@@ -255,7 +369,7 @@ def _warmup_deep_gemm_dsv4_mega_moe(
     _warmed_configs.add(warmup_key)
 
 
-if fp8_fp4_mega_moe is not None and stage_dsv4_mega_moe_inputs is not None:
+if platform.is_blackwell:
 
     @register_kernel(
         "moe",
@@ -285,7 +399,7 @@ if fp8_fp4_mega_moe is not None and stage_dsv4_mega_moe_inputs is not None:
         tags={"throughput"},
         weight_preprocessor=_deep_gemm_dsv4_mega_moe_process_weights,
     )
-    def deep_gemm_dsv4_mega_moe(
+    def deep_gemm_dsv4_mega_moe_sm100(
         *,
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
@@ -337,6 +451,6 @@ if fp8_fp4_mega_moe is not None and stage_dsv4_mega_moe_inputs is not None:
         )
         return output
 
-    deep_gemm_dsv4_mega_moe._tokenspeed_warmup = (  # type: ignore[attr-defined]
+    deep_gemm_dsv4_mega_moe_sm100._tokenspeed_warmup = (  # type: ignore[attr-defined]
         _warmup_deep_gemm_dsv4_mega_moe
     )

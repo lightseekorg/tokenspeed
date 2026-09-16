@@ -1,5 +1,8 @@
 import argparse
 import json
+import os
+import re
+import shlex
 import subprocess
 import textwrap
 from pathlib import Path
@@ -9,6 +12,7 @@ from slurm_submit import (
     Submission,
     Task,
     gpu_count,
+    harden_bootstrap,
     load_task,
     main,
     parse_args,
@@ -523,6 +527,88 @@ def test_render_script_contains_cluster_requirements():
     assert unset in script
     assert script.index(unset) < script.index('srun "${srun_args[@]}"')
     subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+
+@pytest.mark.parametrize("nodes", [1, 2])
+@pytest.mark.parametrize(
+    "yaml_status,failures,attempts,status",
+    [(0, 0, 0, 0), (1, 2, 3, 0), (1, 3, 3, 1)],
+)
+def test_retained_bootstrap_retries_and_stops_before_evaluation(
+    tmp_path, monkeypatch, nodes, yaml_status, failures, attempts, status
+):
+    original = render_script(
+        Task("test/ci/eval/example.yaml", "example", "eval", "gb200-4gpu", 4, nodes),
+        Path("/shared/original.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/original@sha256:abc",
+    )
+    script = harden_bootstrap(original)
+    assert harden_bootstrap(script) == script
+    pattern = r"^(?:container|server|client)_command=\(\n(.*?)\n\)$"
+    old_commands = [shlex.split(s) for s in re.findall(pattern, original, re.M | re.S)]
+    commands = [shlex.split(s) for s in re.findall(pattern, script, re.M | re.S)]
+    assert len(commands) == (1 if nodes == 1 else 2)
+    for old, new in zip(old_commands, commands):
+        assert old[:2] + old[3:] == new[:2] + new[3:]
+        assert new[2] == commands[0][2]
+    for before, after in zip(original.splitlines(), script.splitlines()):
+        if "python3 -m pip install" not in before:
+            assert before == after
+    pip_log, sleep_log, pipeline_log = (
+        tmp_path / name for name in ("pip", "sleep-log", "pipeline")
+    )
+    (tmp_path / "python3").write_text(textwrap.dedent("""\
+        #!/bin/bash
+        if [ "$1" = -c ]; then exit "$YAML_STATUS"; fi
+        if [ "$1" = -m ] && [ "$2" = pip ]; then
+          printf '%s\\n' "$*" >> "$PIP_LOG"
+          [ "$(wc -l < "$PIP_LOG")" -le "$PIP_FAILURES" ] && exit 7
+          exit 0
+        fi
+        printf '%s\\n' "$*" >> "$PIPELINE_LOG"
+        exit 0
+        """))
+    (tmp_path / "sleep").write_text(
+        '#!/bin/bash\nprintf "%s\\n" "$1" >> "$SLEEP_LOG"\n'
+    )
+    for name in ("python3", "sleep"):
+        (tmp_path / name).chmod(0o755)
+    for name, value in {
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "YAML_STATUS": str(yaml_status),
+        "PIP_FAILURES": str(failures),
+        "PIP_LOG": str(pip_log),
+        "SLEEP_LOG": str(sleep_log),
+        "PIPELINE_LOG": str(pipeline_log),
+    }.items():
+        monkeypatch.setenv(name, value)
+    result = subprocess.run(commands[0], capture_output=True, text=True)
+    assert result.returncode == status
+    calls = pip_log.read_text().splitlines() if pip_log.exists() else []
+    assert len(calls) == attempts
+    for call in calls:
+        assert "--timeout 120" in call and "--progress-bar off" in call
+        assert "--target=/tmp/tokenspeed-ci-python PyYAML>=6,<7" in call
+        assert "--no-cache-dir" not in call
+    sleeps = sleep_log.read_text().splitlines() if sleep_log.exists() else []
+    assert sleeps == ["10"] * max(0, attempts - 1)
+    assert pipeline_log.exists() == (status == 0)
+
+
+def test_render_script_carries_the_tokenspeed_mla_override_into_the_container():
+    script = render_script(
+        Task("test/ci/eval/example.yaml", "example", "eval", "gb300-4gpu", 4, nodes=2),
+        Path("/shared/source.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/image@sha256:abc",
+    )
+
+    container_env = [line for line in script.splitlines() if "--container-env=" in line]
+    assert len(container_env) == 2
+    assert all("INSTALL_TOKENSPEED_MLA_FROM_SOURCE," in line for line in container_env)
 
 
 def test_render_script_mounts_only_allocated_gb300_devices():

@@ -949,9 +949,7 @@ def gluon_kda_paged_prefill_gfx950(
     if cu_seqlens.numel() - 1 != initial_state.shape[0]:
         raise ValueError("cu_seqlens and initial_state must describe the same batch")
 
-    from tokenspeed_kernel.ops.attention.triton.linear.index import (
-        prepare_chunk_indices,
-    )
+    from tokenspeed_kernel.ops.attention.gdn.triton import prepare_chunk_indices
 
     chunk_size = _CHUNK_SIZE
     subchunk_size = _SUBCHUNK_SIZE

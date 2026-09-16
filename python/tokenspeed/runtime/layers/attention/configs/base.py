@@ -38,8 +38,11 @@ from dataclasses import dataclass
 from typing import TypeVar
 
 import torch
+from tokenspeed_kernel.ops.attention.dsv4 import dsv4_decode_supports_partials
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 ComponentT = TypeVar("ComponentT", bound="AttnComponentSpec")
@@ -58,6 +61,42 @@ def resolve_speculative_num_tokens(
     if is_draft and server_args.speculative_algorithm == "DSPARK":
         return width - 1
     return width
+
+
+def is_block_drafter(speculative_algorithm: str | None, is_draft: bool) -> bool:
+    """A draft that proposes a whole block in one forward and writes its KV at
+    the target's cache locations (DFLASH / DSPARK)."""
+    return bool(is_draft and speculative_algorithm in ("DFLASH", "DSPARK"))
+
+
+def resolve_cache_layer_types(
+    hf_config,
+    *,
+    num_layers: int,
+    is_draft: bool,
+    draft_block_decode: bool,
+) -> tuple[str, ...]:
+    """Per-layer cache-group labels of one model side, read once for all
+    softmax families.
+
+    ``cache_layer_types`` wins over ``layer_types``: it can carry labels
+    outside transformers' ``ALLOWED_LAYER_TYPES`` (Inkling's sliding
+    sub-groups). Target-stack labels that do not fit a draft's depth are
+    dropped so the recipe resolves the draft to full history. A block drafter
+    writes at the target's cache locations, so its storage IS the target's
+    full-history group whatever compute mask its layers apply: the label
+    vector says so explicitly instead of losing the labels.
+    """
+    layer_types = tuple(
+        getattr(hf_config, "cache_layer_types", None)
+        or getattr(hf_config, "layer_types", None)
+        or ()
+    )
+    if draft_block_decode:
+        return (FULL_ATTENTION,) * num_layers
+    if is_draft and layer_types and len(layer_types) != num_layers:
+        return ()
+    return layer_types
 
 
 def resolve_dtype(kv_cache_dtype_str: str) -> torch.dtype:
@@ -95,9 +134,11 @@ class SoftmaxAttnConfig(AttnComponentSpec):
     num_kv_heads: int
     head_dim: int
     attn_tp_size: int
-    # Per-layer attention-type labels, forwarded to the KV pool for
-    # cache_group_specs publication (empty -> single full-history group).
-    layer_types: tuple[str, ...] = ()
+    # Per-layer cache-group labels (the storage vocabulary of
+    # recipes/spec.py, NOT the checkpoint's compute labels), consumed only by
+    # the cache recipes; empty -> single full-history group. A layer's
+    # compute mask lives on its PagedAttention (sliding_window_size).
+    cache_layer_types: tuple[str, ...] = ()
     # Retention window; families narrow the type (per-layer tuple on MHA,
     # DeepSeek V4's int on MLA, None on MSA).
     sliding_window_tokens: int | tuple[int | None, ...] | None = None
@@ -156,6 +197,10 @@ class AttnConfig:
     # per request) instead of Eagle/MTP's per-step single-token decode. Backends
     # use this to expand decode metadata to spec_num_tokens rows per request.
     draft_block_decode: bool = False
+    # One topology for target and continuation/MTP views; DCP does not add ranks.
+    dcp_size: int = 1
+    dcp_rank: int = 0
+    dcp_group: tuple[int, ...] = (0,)
     components: tuple[AttnComponentSpec, ...]
 
     def __post_init__(self):
@@ -167,6 +212,19 @@ class AttnConfig:
                 "AttnConfig requires exactly one softmax-family component, got "
                 f"{[type(c).__name__ for c in self.components] or 'none'}"
             )
+        if self.dcp_size > 1:
+            if softmax_components[0].backend_name != "deepseek_v4":
+                raise ValueError(
+                    "DCP currently requires the DeepSeek V4 attention backend"
+                )
+            # Partials merge through a no-sink LSE; fail here rather than at the
+            # first decode's kernel selection on platforms without that kernel.
+            platform = current_platform()
+            if not dsv4_decode_supports_partials(platform):
+                raise ValueError(
+                    "DCP requires a DeepSeek V4 decode kernel that returns a "
+                    f"no-sink LSE; none is registered for {platform.device_name}"
+                )
 
     def component(self, cls: type[ComponentT]) -> ComponentT | None:
         """The first component that is a ``cls``, or None.
@@ -212,6 +270,12 @@ def model_wide_kwargs(
         pd_disaggregation_enabled=server_args.disaggregation_mode != "null",
         is_draft=is_draft,
         draft_block_decode=draft_block_decode,
+    )
+    attn_mapping = server_args.mapping.attn
+    kwargs.update(
+        dcp_size=attn_mapping.dcp_size,
+        dcp_rank=attn_mapping.dcp_rank,
+        dcp_group=attn_mapping.dcp_group,
     )
     if server_args.speculative_algorithm is not None:
         kwargs.update(

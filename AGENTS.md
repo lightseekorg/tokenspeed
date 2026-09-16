@@ -5,7 +5,12 @@
 
 ## Collaboration principle
 
-Core features will be designed and implemented by the TokenSpeed core team. This isn't a matter of distrust in external contributions — writing code has gotten cheaper, but reviewing it, validating it, and deploying it safely at production scale hasn't. If anything, that cost has gone up. As Steve Jobs put it, A players want to work with A players. We believe the gap between the best people and average people is more than tenfold.
+Core features will be designed and implemented by the TokenSpeed core team.
+This isn't a matter of distrust in external contributions — writing code has
+gotten cheaper, but reviewing it, validating it, and deploying it safely at
+production scale hasn't. If anything, that cost has gone up. As Steve Jobs
+put it, A players want to work with A players. We believe the gap between the
+best people and average people is more than tenfold.
 
 ## Development environment
 
@@ -81,6 +86,9 @@ Inside the root `tokenspeed-kernel/` directory:
 
 * All direct tokenspeed-triton imports should happen in `_triton.py` and then
   re-import to other places.
+* Avoid using `triton` directly; use `tokenspeed_triton` instead.
+* Avoid using `torch.compile`; prefer writing the fused kernel directly in
+  Triton.
 * All direct third-party code should be placed in `thirdparty/` and imported
   into `ops/` then registered via `register_kernel`.
 * Prefer CuteDSL for NVIDIA GPU kernels and Triton Gluon for AMD GPU kernels.
@@ -88,13 +96,23 @@ Inside the root `tokenspeed-kernel/` directory:
   stay optional, and other solutions may be used as temporary transitions, but
   new work should consolidate toward these backend choices.
 * Files under `ops/` should follow `<family>/<solution>` structure, like
-  `gemm/trtllm.py` or `attention/triton/`.
+  `gemm/trtllm.py`. Attention adds its variant before the solution, for example
+  `attention/mha/triton.py`; multi-file implementations keep helpers under a
+  private directory such as `attention/mha/_triton/`.
+* Top-level `README.md` should only contain high-level kernel system designs
+  geared for human understanding. For per-op details, use `README.md` files
+  under corresponding `ops/` directory.
+* Prefer to `@register_kernel` with the name as the Python `def` function
+  attached to, prefixed with its solution (e.g, `triton_mha_prefill`).
 * When defining new public APIs, explain arguments and returns in docstring.
+* Vendor-specific tests should be placed under `test/<vendor>/` subdirectory.
+  Tests for common infra and covering multi-vendors reside under `test/`
+  directly.
 
 ## tokenspeed-kernel-amd
 
 Inside the root `tokenspeed-kernel-amd/` directory:
 
 * There should be no dependency on `tokenspeed-kernel`.
-* AMD Gluon Kernel tests should live in `tokenspeed-kernel/test/` to reuse
+* AMD Gluon Kernel tests should live in `tokenspeed-kernel/test/amd/` to reuse
   common platform utilities and reference computations.

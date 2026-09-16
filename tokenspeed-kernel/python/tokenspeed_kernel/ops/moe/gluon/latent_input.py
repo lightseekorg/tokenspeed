@@ -1,6 +1,6 @@
 # Copyright (c) 2026 LightSeek Foundation
 
-"""Gluon registrations for gfx950 latent-MoE input projections."""
+"""Gluon registrations for AMD latent-MoE input projections."""
 
 from __future__ import annotations
 
@@ -16,10 +16,13 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_decode import (
-        gluon_latent_input_decode_gfx950 as _decode_impl,
+        gluon_latent_input_decode_gfx950 as _decode_gfx950_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_small_batch import (
         gluon_latent_input_small_batch_gfx950 as _small_batch_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.moe.fp16.latent_input_decode import (
+        gluon_latent_input_decode_gfx1250 as _decode_gfx1250_impl,
     )
 
     _SIGNATURES = frozenset(
@@ -37,6 +40,38 @@ if current_platform().is_amd:
         max_arch_version=ArchVersion(9, 5),
         vendors=frozenset({"amd"}),
     )
+    _GFX1250 = CapabilityRequirement(
+        min_arch_version=ArchVersion(12, 5),
+        max_arch_version=ArchVersion(12, 5),
+        vendors=frozenset({"amd"}),
+    )
+
+    @register_kernel(
+        "moe",
+        "latent_input",
+        name="gluon_latent_input_decode_gfx1250",
+        solution="gluon",
+        capability=_GFX1250,
+        signatures=_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={
+            "tokens": frozenset({1}),
+            "hidden_size": frozenset({7168}),
+            "num_experts": frozenset({896}),
+            "latent_size": frozenset({3584}),
+            "shared_size": frozenset({768}),
+            "inputs_contiguous": frozenset({True}),
+        },
+    )
+    def gluon_latent_input_decode_gfx1250(**kwargs):
+        return _decode_gfx1250_impl(
+            kwargs["hidden_states"],
+            kwargs["router_weight"],
+            kwargs["routed_weight"],
+            kwargs["shared_gate_up_weight"],
+            beta=kwargs["gate_clamp"],
+            linear_beta=kwargs["up_clamp"],
+        )
 
     @register_kernel(
         "moe",
@@ -56,7 +91,7 @@ if current_platform().is_amd:
         },
     )
     def gluon_latent_input_decode_gfx950(**kwargs):
-        return _decode_impl(
+        return _decode_gfx950_impl(
             kwargs["hidden_states"],
             kwargs["router_weight"],
             kwargs["routed_weight"],

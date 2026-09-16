@@ -122,6 +122,7 @@ def test_mixed_batch_resets_only_prefill_lengths(monkeypatch):
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cpu"
     executor.device_module = torch.cuda
+    executor.default_stream = object()
     executor.execution_stream = _ExecutionStream()
     executor.runtime_states = _RuntimeStates()
 
@@ -138,7 +139,6 @@ def test_mixed_batch_resets_only_prefill_lengths(monkeypatch):
         return torch_tensor(*args, **kwargs)
 
     monkeypatch.setattr(torch, "tensor", tensor_without_pinning)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: object())
     monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
 
     executor._reset_valid_cache_length(forward_op)
@@ -155,6 +155,7 @@ def test_remote_prefill_seeds_the_complete_prompt_length(monkeypatch):
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cpu"
     executor.device_module = torch.cuda
+    executor.default_stream = object()
     executor.execution_stream = _ExecutionStream()
     executor.runtime_states = _RuntimeStates()
 
@@ -172,7 +173,6 @@ def test_remote_prefill_seeds_the_complete_prompt_length(monkeypatch):
         return torch_tensor(*args, **kwargs)
 
     monkeypatch.setattr(torch, "tensor", tensor_without_pinning)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: object())
     monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
 
     executor.reset_remote_prefill_cache_lengths(forward_op)
@@ -326,3 +326,52 @@ def test_non_spec_decode_routes_through_verify():
     assert executor._decode_candidates(ctx2) is None
     executor._run_sampling(object(), object(), ctx2, None)
     assert calls == ["sample"]
+
+
+@pytest.mark.parametrize(
+    ("prefill_tokens", "dp_size", "width", "capacity"),
+    [(64, 1, 1, 160), (64, 1, 4, 640), (64, 4, 4, 160), (8192, 1, 4, 8192)],
+)
+def test_input_allocation_covers_decode(
+    monkeypatch, prefill_tokens, dp_size, width, capacity
+):
+    import tokenspeed.runtime.execution.model_executor as module
+
+    class AllocationChecked(Exception):
+        pass
+
+    def check_allocation(
+        max_bs, max_num_tokens, state_write_padding_pool_index, device
+    ):
+        assert max_bs == 160 // dp_size
+        assert max_num_tokens == capacity
+        raise AllocationChecked
+
+    monkeypatch.setattr(
+        module, "validate_scheduler_config", lambda attn_backend, kv_pool: None
+    )
+    # Check the real constructor's allocation arguments without model/GPU setup.
+    monkeypatch.setattr(module, "InputBuffers", check_allocation)
+    config = SimpleNamespace(
+        device="cpu",
+        max_num_seqs=160,
+        data_parallel_size=dp_size,
+        chunked_prefill_size=prefill_tokens,
+        output_length=width,
+        max_req_pool_size=161,
+        spec_algo="EAGLE" if width > 1 else None,
+        spec_num_tokens=width,
+    )
+    with pytest.raises(AllocationChecked):
+        ModelExecutor(
+            config=config,
+            model_runner=None,
+            attn_backend=None,
+            token_to_kv_pool=SimpleNamespace(
+                arena=SimpleNamespace(runtime_contract=None)
+            ),
+            sampling_backend=None,
+            draft_model_runner=None,
+            draft_attn_backend=None,
+            draft_token_to_kv_pool=None,
+        )

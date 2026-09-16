@@ -10,7 +10,7 @@ def test_kernel_sources_use_tokenspeed_triton_adapter():
     # These helpers intentionally interact with framework-owned stock Triton;
     # neither defines TokenSpeed Triton kernels.
     stock_triton_interop = {
-        source_root / "thirdparty/fla.py",
+        source_root / "ops/attention/kda/_triton/fla.py",
         source_root / "thirdparty/msa/cute/src/common/cute_dsl_utils.py",
     }
     direct_imports = {}

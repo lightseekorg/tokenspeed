@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import inspect
+from collections.abc import Iterator
+
 import torch
 
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
@@ -279,3 +282,96 @@ def make_mla_memory_plan(
         max_padding_fraction=1.0,
     )
     return layout.bind(size // prefix_granularity)
+
+
+def binding_state(node: object) -> dict[str, object]:
+    """Every attribute of ``node``, reduced to what a fresh-vs-rebound comparison sees."""
+    return {name: _reduced(value, set()) for name, value in vars(node).items()}
+
+
+def _reduced(value: object, seen: set[int]) -> object:
+    if isinstance(value, torch.Tensor):
+        return (
+            "tensor",
+            tuple(value.shape),
+            value.stride(),
+            value.dtype,
+            str(value.device),
+        )
+    if isinstance(value, dict):
+        return (
+            "dict",
+            tuple(
+                (str(key), _reduced(item, seen))
+                for key, item in sorted(value.items(), key=lambda kv: str(kv[0]))
+            ),
+        )
+    if isinstance(value, (list, tuple)):
+        return (type(value).__name__, tuple(_reduced(item, seen) for item in value))
+    if isinstance(value, (set, frozenset)):
+        return (type(value).__name__, sorted(map(str, value)))
+    if isinstance(value, (bool, int, float, str, type(None))):
+        return value
+    if isinstance(value, (torch.dtype, torch.device)):
+        return str(value)
+    if (
+        hasattr(value, "__dict__")
+        and not isinstance(value, type)
+        and not callable(value)
+    ):
+        if id(value) in seen:
+            return type(value).__name__
+        seen.add(id(value))
+        return (
+            type(value).__name__,
+            tuple(
+                (name, _reduced(item, seen))
+                for name, item in sorted(vars(value).items())
+            ),
+        )
+    return type(value).__name__
+
+
+def storages_of(*tensors: torch.Tensor) -> set[int]:
+    """The untyped storages behind ``tensors``, so views at any offset are recognised."""
+    return {tensor.untyped_storage().data_ptr() for tensor in tensors}
+
+
+def reachable_tensors(node: object) -> list[torch.Tensor]:
+    """Every tensor reachable from ``node``'s attributes, for an alias set taken before a rebind."""
+    return [
+        tensor for value in vars(node).values() for tensor in _tensors(value, set())
+    ]
+
+
+def assert_no_alias(node: object, storages: set[int]) -> None:
+    """Fail if any tensor reachable from ``node``'s attributes lives in ``storages``."""
+    for name, value in vars(node).items():
+        for tensor in _tensors(value, set()):
+            assert (
+                tensor.untyped_storage().data_ptr() not in storages
+            ), f"{name} still aliases the old pool"
+
+
+def _tensors(value: object, seen: set[int]) -> Iterator[torch.Tensor]:
+    if isinstance(value, torch.Tensor):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _tensors(item, seen)
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            yield from _tensors(item, seen)
+    elif inspect.isfunction(value) and value.__closure__:
+        for cell in value.__closure__:
+            yield from _tensors(cell.cell_contents, seen)
+    elif isinstance(value, torch.nn.Module) or (
+        hasattr(value, "__dict__")
+        and not isinstance(value, type)
+        and not callable(value)
+    ):
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        for item in vars(value).values():
+            yield from _tensors(item, seen)

@@ -209,6 +209,4 @@ def test_dead_nope_query_branch_is_gone():
     ), "the unreachable NoPE query-assembly branch is back in the model"
 
     with pytest.raises(ModuleNotFoundError):
-        importlib.import_module(
-            "tokenspeed_kernel.ops.attention.triton.mla_query_assemble"
-        )
+        importlib.import_module("tokenspeed_kernel.ops.attention.mla.query_assemble")

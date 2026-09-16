@@ -1,0 +1,53 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-deepseek-v4.1-flash-gsm8k-amd
+type: eval
+workflow_stage: model-test
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - amd-mi35x-4gpu-test
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+server:
+  command: >-
+    ts serve
+    --model deepseek-ai/DeepSeek-V4.1-Flash
+    --tensor-parallel-size 4
+    --dtype bfloat16
+    --max-model-len 1048576
+    --max-total-tokens 1048576
+    --max-num-seqs 32
+    --chunked-prefill-size 8192
+    --gpu-memory-utilization 0.9
+    --disable-kvstore
+    --disable-prefill-graph
+    --trust-remote-code
+    --max-cudagraph-capture-size 32
+    --reasoning-parser deepseek_v31
+    --host 127.0.0.1
+    --port 8000
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 1800
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]==1.11.1'
+  command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model deepseek-ai/DeepSeek-V4.1-Flash
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets gsm8k
+    --dataset-hub huggingface
+    --dataset-args '{"gsm8k":{"dataset_id":"openai/gsm8k"}}'
+    --eval-batch-size 32
+    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":512}'
+report:
+  github_step_summary: true
+score_threshold: 0.90

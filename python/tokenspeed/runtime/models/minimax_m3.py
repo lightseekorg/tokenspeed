@@ -47,9 +47,6 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.utils import divide
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    FULL_ATTENTION,
-)
 from tokenspeed.runtime.layers.attention.mm_encoder_attention import VisionAttention
 from tokenspeed.runtime.layers.conv import Conv3dLayer
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
@@ -648,7 +645,6 @@ class MiniMaxM3Attention(nn.Module):
             self.head_dim**-0.5,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            group_id=FULL_ATTENTION,
         )
 
     def forward(

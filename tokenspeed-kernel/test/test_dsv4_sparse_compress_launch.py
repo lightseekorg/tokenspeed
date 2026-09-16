@@ -26,7 +26,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.triton import dsv4 as ops
+from tokenspeed_kernel.ops.attention.dsv4 import triton as ops
 
 
 @pytest.fixture(autouse=True)
@@ -69,6 +69,8 @@ def _launch(compress_ratio, overlap=False, wide_supported=True):
             kv_cache_block_size=64,
             compress_ratio=compress_ratio,
             overlap=overlap,
+            block_table_base_offsets=None,
+            kv_write_mask=None,
         )
     return recorded
 
@@ -107,6 +109,8 @@ def test_sparse_compress_skips_empty_batch():
             kv_cache_block_size=64,
             compress_ratio=128,
             overlap=True,
+            block_table_base_offsets=None,
+            kv_write_mask=None,
         )
     mock.__getitem__.assert_not_called()
 

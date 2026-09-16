@@ -1574,6 +1574,17 @@ def _select_num_kv_splits_bh16bn128_fp8(
     return max(1, min(occupancy_cap, work_cap))
 
 
+def _select_projected_value_num_kv_splits(
+    *, batch: int, max_seqlen_k: int, block_n: int
+) -> int:
+    if batch == 1:
+        return 16
+    blocks = (max_seqlen_k + block_n - 1) // block_n
+    work_cap = max(4, (blocks + 7) // 8)
+    occupancy_cap = max(1, (_WAVE_WORKGROUPS // 2) // batch)
+    return max(1, min(64, occupancy_cap, work_cap))
+
+
 def _select_num_kv_splits_bh64(
     *, batch: int, nhead: int, num_xcds: int, block_h: int
 ) -> int:
@@ -1768,9 +1779,11 @@ def _gluon_mla_decode_gfx950(
         )
     elif regime == "bh16bn128":
         if value_weight is not None:
-            # The projected-value reducer uses a fixed split count to retain
-            # lower reduction overhead for native E4M3 decode.
-            num_kv_splits = 16
+            num_kv_splits = _select_projected_value_num_kv_splits(
+                batch=batch_size,
+                max_seqlen_k=max_seqlen_k,
+                block_n=block_n,
+            )
         else:
             split_selector = (
                 _select_num_kv_splits_bh16bn128_fp8
@@ -2128,7 +2141,7 @@ def gluon_mla_decode_projected_value_gfx950(
     out: torch.Tensor,
     logit_cap: float = 0.0,
 ) -> torch.Tensor:
-    """Run native FP8 MLA with a projected-value epilogue."""
+    """Run batched native FP8 MLA with a projected-value epilogue."""
     fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
     if q.dtype not in fp8_dtypes or kv_cache.dtype != q.dtype:
         raise NotImplementedError("projected-value MLA requires matching fp8 q and kv")
@@ -2137,9 +2150,16 @@ def gluon_mla_decode_projected_value_gfx950(
             "projected-value MLA requires qk_nope/kv_lora/qk_rope dimensions "
             "(128, 512, 64)"
         )
-    expected_weight = (q.shape[2], kv_lora_rank, out.shape[-1] // q.shape[2])
+    if value_weight.ndim != 3:
+        raise ValueError("value_weight must be rank-3")
+    batch, heads = q.shape[0], q.shape[2]
+    value = value_weight.shape[2]
+    expected_weight = (heads, kv_lora_rank, value)
     if tuple(value_weight.shape) != expected_weight:
         raise ValueError(f"value_weight must have shape {expected_weight}")
+    expected_out = (batch, heads * value)
+    if tuple(out.shape) != expected_out:
+        raise ValueError(f"out must have shape {expected_out}")
     if gate is not None and gate.shape != out.shape:
         raise ValueError("gate and out must have matching shapes")
     if (

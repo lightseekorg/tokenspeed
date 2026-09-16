@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 import os
 import pathlib
 import sys
 import unittest
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -523,35 +525,69 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
                 checkpoint_granularity=0,
             )
 
-    def test_state_family_may_keep_row_geometry(self):
-        # V4-style row-buffer groups are state-family with real rows.
+    def test_state_family_requires_checkpoint_shape(self):
+        # Rows of token history -- V4's compressor tails included -- are a
+        # history group whatever their retention; the state family names the
+        # checkpoint shape and nothing else.
+        with self.assertRaisesRegex(ValueError, "checkpoint_granularity"):
+            CacheGroupSpec(
+                group_id="v4.compressor",
+                retention="sliding_window",
+                rows_per_page=16,
+                entry_stride_tokens=4,
+                sliding_window_tokens=256,
+                family="state",
+            )
         spec = CacheGroupSpec(
             group_id="v4.compressor",
             retention="sliding_window",
             rows_per_page=16,
             entry_stride_tokens=4,
             sliding_window_tokens=256,
-            family="state",
+            family="history",
         )
         self.assertEqual(spec.page_size, 64)
         self.assertEqual(spec.block_granularity, 64)
 
+    def test_state_family_rides_full_history(self):
+        # A checkpoint summarizes everything before it, so nothing in a state
+        # group ever slides out.
+        with self.assertRaisesRegex(ValueError, "full_history"):
+            CacheGroupSpec(
+                group_id="state",
+                retention="sliding_window",
+                sliding_window_tokens=256,
+                family="state",
+                checkpoint_granularity=64,
+            )
 
-def _fake_pool(specs, *, packing=1) -> SimpleNamespace:
+
+def _fake_pool(specs, *, packing: int) -> SimpleNamespace:
     """A cache view whose arena publishes ``specs`` as its contract.
 
     Page counts and packing are the plan's facts, carried by the contract
     beside the specs -- the bridge reads them from there, never off a spec.
     """
-    return SimpleNamespace(
-        arena=SimpleNamespace(
-            runtime_contract=SimpleNamespace(
-                group_specs=tuple(specs),
-                group_page_counts={spec.group_id: 1024 for spec in specs},
-                group_packing={spec.group_id: packing for spec in specs},
-            )
-        )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+        CacheRuntimeContract,
     )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+        CacheGroupSpec as RuntimeCacheGroupSpec,
+    )
+
+    # The declaration tests use an isolated spec module. The actual contract
+    # validates the runtime class, so cross that boundary explicitly here.
+    runtime_specs = tuple(RuntimeCacheGroupSpec(**asdict(spec)) for spec in specs)
+    prefix_granularity = math.lcm(*(spec.block_granularity for spec in specs))
+    contract = CacheRuntimeContract(
+        prefix_granularity=prefix_granularity,
+        num_lcm_blocks=1023,
+        token_capacity=1023 * prefix_granularity,
+        group_specs=runtime_specs,
+        group_page_counts={spec.group_id: 1 + 1023 * packing for spec in specs},
+        group_packing={spec.group_id: packing for spec in specs},
+    )
+    return SimpleNamespace(arena=SimpleNamespace(runtime_contract=contract))
 
 
 class PoolToCacheGroupsIntegrationTest(unittest.TestCase):
@@ -572,7 +608,6 @@ class PoolToCacheGroupsIntegrationTest(unittest.TestCase):
         return pool_to_cache_groups
 
     def test_two_group_specs_convert_to_two_scheduler_groups(self):
-        from types import SimpleNamespace
 
         pool_to_cache_groups = self._import_converter()
 
@@ -583,7 +618,7 @@ class PoolToCacheGroupsIntegrationTest(unittest.TestCase):
         )
         # Duck-typed stand-in: a view naming an arena whose contract is
         # what the converter reads.
-        fake_pool = _fake_pool(specs)
+        fake_pool = _fake_pool(specs, packing=1)
 
         groups = pool_to_cache_groups(fake_pool)
 
@@ -591,9 +626,9 @@ class PoolToCacheGroupsIntegrationTest(unittest.TestCase):
         group_ids = {g.group_id for g in groups}
         self.assertEqual(group_ids, {"full_attention", "sliding_attention"})
 
-    def test_checkpoint_spec_folds_to_row_geometry_at_the_bridge(self):
-        from types import SimpleNamespace
-
+    def test_both_declaration_shapes_cross_the_bridge_as_block_granularity(self):
+        """The scheduler config carries no declaration shape: a checkpoint
+        spec and a row-geometry spec both arrive as a bare slot span."""
         pool_to_cache_groups = self._import_converter()
 
         specs = _specs(
@@ -601,13 +636,41 @@ class PoolToCacheGroupsIntegrationTest(unittest.TestCase):
             sliding_window_tokens=None,
             prefix_granularity=16,
         )
-        fake_pool = _fake_pool(specs)
+        fake_pool = _fake_pool(specs, packing=1)
 
         groups = {g.group_id: g for g in pool_to_cache_groups(fake_pool)}
 
         state = groups["linear_attention"]
-        self.assertEqual(state.rows_per_page, 16)
-        self.assertEqual(state.entry_stride_tokens, 1)
+        self.assertEqual(state.block_granularity, 16)
+        self.assertFalse(hasattr(state, "rows_per_page"))
+        self.assertFalse(hasattr(state, "entry_stride_tokens"))
+        self.assertFalse(hasattr(state, "checkpoint_granularity"))
+        full = groups["full_attention"]
+        self.assertEqual(full.block_granularity, 16)
+
+    def test_sharded_group_exports_virtual_capacity_and_packing(self):
+        pool_to_cache_groups = self._import_converter()
+        specs = _specs(
+            layer_types=["full_attention", "sliding_attention"],
+            sliding_window_tokens=128,
+            prefix_granularity=16,
+        )
+        specs = tuple(
+            replace(spec, shard_count=4) if spec.group_id == "full_attention" else spec
+            for spec in specs
+        )
+        pool = _fake_pool(specs, packing=2)
+        groups = {group.group_id: group for group in pool_to_cache_groups(pool)}
+        full = groups["full_attention"]
+        self.assertEqual(full.total_pages, 1 + 1023 * 2 * 4)
+        self.assertEqual(full.cache_blocks_per_lcm_block, 8)
+        self.assertEqual(full.shard_count, 4)
+        sliding = groups["sliding_attention"]
+        self.assertEqual(sliding.total_pages, 1 + 1023 * 2)
+        self.assertEqual(sliding.cache_blocks_per_lcm_block, 2)
+        self.assertEqual(sliding.shard_count, 1)
+        self.assertEqual(full.block_granularity, 16)
+        self.assertEqual(sliding.block_granularity, 16)
 
 
 if __name__ == "__main__":

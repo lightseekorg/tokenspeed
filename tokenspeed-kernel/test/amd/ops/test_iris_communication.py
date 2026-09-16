@@ -1,0 +1,1261 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+
+import socket
+import sys
+import traceback
+from dataclasses import replace
+from types import SimpleNamespace
+from typing import List, Tuple
+
+import pytest
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from tokenspeed_kernel.platform import current_platform
+
+pytestmark = pytest.mark.skipif(
+    not current_platform().is_amd,
+    reason="Iris communication tests require AMD ROCm",
+)
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_open_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("", 0))
+        return sock.getsockname()[1]
+
+
+def _skip_if_unsupported(world_size: int, reason_prefix: str) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip(f"CUDA/ROCm is required for {reason_prefix}")
+    if world_size > torch.cuda.device_count():
+        pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
+    if not current_platform().is_amd:
+        pytest.skip(f"{reason_prefix} only targets AMD ROCm")
+    try:
+        import iris  # noqa: F401
+    except ImportError:
+        pytest.skip("iris is not installed")
+
+
+def _spawn_and_collect(worker_fn, args, world_size: int) -> None:
+    error_dict = mp.Manager().dict()
+    mp.spawn(
+        worker_fn,
+        args=args + (error_dict,),
+        nprocs=world_size,
+        join=True,
+    )
+
+    if error_dict:
+        raise RuntimeError("\n".join(f"Rank {r}: {e}" for r, e in error_dict.items()))
+
+
+def test_iris_state_uses_path_capacities(monkeypatch):
+    from tokenspeed_kernel.ops.communication import triton as triton_ops
+
+    created = []
+
+    def create_iris_state(**kwargs):
+        created.append(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    iris_ops = SimpleNamespace(IRIS_AR_STATES={}, create_iris_state=create_iris_state)
+    monkeypatch.setitem(
+        sys.modules, "tokenspeed_kernel.ops.communication.iris", iris_ops
+    )
+    state = SimpleNamespace(
+        group=object(),
+        rank_in_group=0,
+        max_numel=16,
+        max_bytes=64,
+        attnres_max_numel=55,
+        max_token_num=5,
+        device=torch.device("cpu"),
+    )
+
+    iris_state = triton_ops._get_or_create_iris_state(state, torch.bfloat16)
+
+    assert iris_state.staged_max_numel == 16
+    assert iris_state.producer_direct_max_numel == 32
+    assert iris_state.attnres_max_numel == 55
+    assert iris_state.attnres_max_rows == 5
+    assert triton_ops._get_or_create_iris_state(state, torch.bfloat16) is iris_state
+    assert len(created) == 1
+
+
+def test_iris_state_reuses_prepared_capacity(monkeypatch):
+    from tokenspeed_kernel.ops.communication import triton as triton_ops
+
+    group = object()
+    device = torch.device("cpu")
+    prepared = SimpleNamespace(
+        group=group,
+        rank_in_group=0,
+        device=device,
+        dtype=torch.bfloat16,
+        staged_max_numel=64,
+        producer_direct_max_numel=128,
+        attnres_max_numel=32,
+        attnres_max_rows=4,
+    )
+    iris_ops = SimpleNamespace(
+        IRIS_AR_STATES={"prepared": prepared},
+        create_iris_state=lambda **_: pytest.fail("must reuse prepared state"),
+    )
+    monkeypatch.setitem(
+        sys.modules, "tokenspeed_kernel.ops.communication.iris", iris_ops
+    )
+    state = SimpleNamespace(
+        group=group,
+        rank_in_group=0,
+        max_numel=16,
+        max_bytes=64,
+        attnres_max_numel=8,
+        max_token_num=1,
+        device=device,
+    )
+
+    assert triton_ops._get_or_create_iris_state(state, torch.bfloat16) is prepared
+
+
+def test_iris_context_rejects_late_heap_growth(monkeypatch):
+    from tokenspeed_kernel.ops.communication import iris as iris_ops
+
+    context = SimpleNamespace(heap_size=256)
+    monkeypatch.setattr(iris_ops, "_iris_ctx_singleton", context)
+
+    assert iris_ops._get_or_create_iris_context(128) is context
+    with pytest.raises(RuntimeError, match="prepare the largest state first"):
+        iris_ops._get_or_create_iris_context(512)
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_producer_direct_admission_supported_world_sizes(
+    monkeypatch,
+    world_size,
+    dtype,
+):
+    from tokenspeed_kernel.ops.communication import triton as triton_ops
+
+    monkeypatch.setattr(
+        triton_ops,
+        "current_platform",
+        lambda: SimpleNamespace(is_cdna4=True),
+    )
+    state = SimpleNamespace(world_size=world_size, max_bytes=64)
+
+    assert triton_ops.symm_outputs_can_run(
+        state,
+        ((3, 5), (1, 1)),
+        dtype,
+    )
+
+
+@pytest.mark.parametrize(
+    ("dtype", "shapes"),
+    [
+        (torch.bfloat16, ((32,),)),
+        (torch.float16, ((32,),)),
+        (torch.float32, ((16,),)),
+    ],
+)
+def test_producer_direct_admission_uses_byte_capacity(monkeypatch, dtype, shapes):
+    from tokenspeed_kernel.ops.communication import triton as triton_ops
+
+    monkeypatch.setattr(
+        triton_ops,
+        "current_platform",
+        lambda: SimpleNamespace(is_cdna4=True),
+    )
+    state = SimpleNamespace(world_size=8, max_bytes=64)
+
+    assert triton_ops.symm_outputs_can_run(state, shapes, dtype)
+
+
+@pytest.mark.parametrize(
+    ("world_size", "shapes", "dtype", "op"),
+    [
+        (1, ((4,),), torch.bfloat16, dist.ReduceOp.SUM),
+        (8, ((3,),), torch.bfloat16, dist.ReduceOp.SUM),
+        (8, ((3,),), torch.float32, dist.ReduceOp.SUM),
+        (8, ((36,),), torch.bfloat16, dist.ReduceOp.SUM),
+        (8, ((18,),), torch.float32, dist.ReduceOp.SUM),
+        (8, ((4,),), torch.float64, dist.ReduceOp.SUM),
+        (8, ((4,),), torch.bfloat16, dist.ReduceOp.PRODUCT),
+    ],
+)
+def test_producer_direct_admission_rejects_unsupported_requests(
+    monkeypatch,
+    world_size,
+    shapes,
+    dtype,
+    op,
+):
+    from tokenspeed_kernel.ops.communication import triton as triton_ops
+
+    monkeypatch.setattr(
+        triton_ops,
+        "current_platform",
+        lambda: SimpleNamespace(is_cdna4=True),
+    )
+    state = SimpleNamespace(world_size=world_size, max_bytes=64)
+
+    assert not triton_ops.symm_outputs_can_run(state, shapes, dtype, op)
+
+
+def test_producer_direct_admission_is_cdna4_only(monkeypatch):
+    from tokenspeed_kernel.ops.communication import triton as triton_ops
+
+    monkeypatch.setattr(
+        triton_ops,
+        "current_platform",
+        lambda: SimpleNamespace(is_cdna4=False),
+    )
+    state = SimpleNamespace(world_size=8, max_bytes=64)
+
+    assert not triton_ops.symm_outputs_can_run(
+        state,
+        ((4,),),
+        torch.bfloat16,
+    )
+
+
+@pytest.mark.parametrize(
+    ("world_size", "dtype", "min_bytes"),
+    [
+        (4, torch.bfloat16, 160 << 10),
+        (4, torch.float32, 160 << 10),
+        (8, torch.bfloat16, 96 << 10),
+        (8, torch.float32, 96 << 10),
+    ],
+)
+def test_producer_direct_two_stage_threshold(world_size, dtype, min_bytes):
+    try:
+        from tokenspeed_kernel.ops.communication.iris import (
+            IRIS_ALL_REDUCE_KERNEL_CONFIG,
+            _use_two_stage_producer_direct,
+        )
+    except ImportError:
+        pytest.skip("iris is not installed")
+
+    config = IRIS_ALL_REDUCE_KERNEL_CONFIG
+    alignment = world_size * (config.packed_word_bytes // dtype.itemsize)
+    min_numel = min_bytes // dtype.itemsize
+    assert _use_two_stage_producer_direct(world_size, min_numel, dtype)
+    assert not _use_two_stage_producer_direct(world_size, min_numel - alignment, dtype)
+    assert not _use_two_stage_producer_direct(world_size, min_numel + 1, dtype)
+    assert not _use_two_stage_producer_direct(2, min_numel, dtype)
+
+
+@pytest.mark.parametrize(
+    ("numel", "expected_path", "expected_schedule"),
+    [
+        (16 * 4096, "one_shot", (512, 1)),
+        (64 * 4096, "two_stage", None),
+    ],
+)
+def test_tp4_decode_staged_path_only_keeps_small_one_shot_shape(
+    monkeypatch,
+    numel,
+    expected_path,
+    expected_schedule,
+):
+    from tokenspeed_kernel.ops.communication import iris as iris_ops
+
+    monkeypatch.setattr(iris_ops, "_platform", SimpleNamespace(is_cdna4=True))
+
+    tuning, use_two_stage = iris_ops._select_staged_all_reduce_path(
+        numel,
+        4,
+        torch.bfloat16,
+        two_stage_supported=True,
+    )
+    assert ("two_stage" if use_two_stage else "one_shot") == expected_path
+    schedule = None if tuning is None else (tuning.block_size, tuning.num_subgroups)
+    assert schedule == expected_schedule
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_plain_two_stage_admits_partitionable_shapes(dtype):
+    try:
+        from tokenspeed_kernel.ops.communication.iris import _use_two_stage_plain
+    except ImportError:
+        pytest.skip("iris is not installed")
+
+    elements_per_word = 8 // dtype.itemsize
+    # The plain path carries no minimum size -- two-stage measured faster than
+    # one-shot at every shape down to 14 KB -- so the predicate is purely the
+    # kernel's partitioning requirement.
+    aligned = 8 * elements_per_word
+    assert _use_two_stage_plain(8, aligned, dtype)
+    assert _use_two_stage_plain(8, aligned * 4096, dtype)
+    # every K3 decode width partitions evenly across 8 ranks
+    for tokens in (1, 8, 16, 32, 64):
+        assert _use_two_stage_plain(8, tokens * 7168, dtype)
+    # a payload that does not split into whole words per rank stays on one-shot
+    assert not _use_two_stage_plain(8, aligned + 1, dtype)
+    # world sizes without a tuned partitioning fall back
+    assert not _use_two_stage_plain(2, aligned, dtype)
+
+
+def test_plain_two_stage_is_independent_of_producer_thresholds(monkeypatch):
+    try:
+        from tokenspeed_kernel.ops.communication import iris as iris_ops
+    except ImportError:
+        pytest.skip("iris is not installed")
+
+    config = iris_ops.IRIS_ALL_REDUCE_KERNEL_CONFIG
+    monkeypatch.setattr(
+        iris_ops,
+        "IRIS_ALL_REDUCE_KERNEL_CONFIG",
+        replace(
+            config,
+            producer_direct=replace(
+                config.producer_direct,
+                two_stage_min_bytes=(),
+            ),
+        ),
+    )
+    assert iris_ops._use_two_stage_plain(8, 8 * 7168, torch.bfloat16)
+    assert not iris_ops._use_two_stage_producer_direct(8, 8 * 7168, torch.bfloat16)
+
+
+@pytest.mark.parametrize("dtype", [torch.float64, torch.complex128, torch.int8])
+def test_plain_two_stage_rejects_unsupported_dtypes(dtype):
+    """Dtypes the packing kernel cannot express must stay on one-shot.
+
+    The kernel maps the element type through _PRODUCER_DIRECT_GL_DTYPES, so
+    admitting anything outside it would raise instead of reducing. Types wider
+    than a 64-bit word are the sharper case: they make elements-per-word zero,
+    which would divide by zero in the alignment check itself.
+    """
+    try:
+        from tokenspeed_kernel.ops.communication.iris import _use_two_stage_plain
+    except ImportError:
+        pytest.skip("iris is not installed")
+
+    for numel in (8, 64, 7168, 32 * 7168):
+        assert not _use_two_stage_plain(8, numel, dtype)
+
+
+@pytest.mark.parametrize(
+    ("world_size", "dtype", "supported"),
+    [
+        (8, torch.bfloat16, True),
+        (4, torch.float32, True),
+        (2, torch.bfloat16, False),
+        (8, torch.float64, False),
+    ],
+)
+def test_two_stage_state_gate_matches_dispatch(world_size, dtype, supported):
+    """The state-level gate must agree with the per-call predicate.
+
+    A state that reserves the staging buffer and the larger heap for a
+    combination the predicate then refuses is not merely wasteful: a caller
+    supplying an explicit heap sized for the one-shot allocations fails to
+    construct. Everything the predicate tests apart from payload size is fixed
+    for the life of the state, so the two have to be decided from the same
+    conditions.
+    """
+    try:
+        from tokenspeed_kernel.ops.communication.iris import _use_two_stage_plain
+    except ImportError:
+        pytest.skip("iris is not installed")
+
+    # a payload that satisfies the size condition, so only the state-level
+    # conditions can decide the outcome
+    numel = 8 * 7168
+    assert _use_two_stage_plain(world_size, numel, dtype) is supported
+
+
+# ---------------------------------------------------------------------------
+# Suite 1: iris_all_reduce
+# ---------------------------------------------------------------------------
+
+
+def _ar_shape_cases() -> List[Tuple[int, ...]]:
+    """Shapes covering small, vector, and 2-D cases."""
+    return [
+        (8,),
+        (16, 64),
+        (4, 7, 32),
+    ]
+
+
+def _ar_graph_shape_cases() -> List[Tuple[int, ...]]:
+    return [(16, 4096), (64, 4096)]
+
+
+def _ar_output_shape_cases() -> List[Tuple[Tuple[int, ...], ...]]:
+    """Producer-direct collections spanning one, two, and three outputs."""
+    return [
+        ((1, 7168), (1, 3584)),
+        ((2, 7168), (2, 3584)),
+        ((4, 7168), (4, 3584)),
+        ((8, 7168), (8, 3584)),
+        ((16, 7168), (16, 3584)),
+        ((3, 20), (2, 12)),
+        ((3, 5), (1, 1)),
+        ((2, 16),),
+        ((3, 20), (2, 12), (4, 4)),
+    ]
+
+
+def _ar_worker_fn(rank, world_size, port, error_dict):
+    try:
+        _ar_worker_main(rank, world_size, port)
+    except Exception:
+        error_dict[rank] = traceback.format_exc()
+
+
+def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    # Iris's example uses gloo because heap-base exchange is host-side; nccl
+    # also works, but gloo avoids contending with the iris-managed device
+    # memory and matches the upstream example.
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://localhost:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    try:
+        # Importing inside the worker avoids pulling iris into the parent
+        # process (which has no distributed context).
+        from tokenspeed_kernel.ops.communication.iris import (
+            IRIS_ALL_REDUCE_KERNEL_CONFIG,
+            create_iris_state,
+        )
+
+        kernel_config = IRIS_ALL_REDUCE_KERNEL_CONFIG
+        attnres_config = kernel_config.kimi_k3_attnres
+        output_shape_cases = _ar_output_shape_cases()
+        staged_max_numel = max(
+            max(int(torch.tensor(shape).prod()) for shape in _ar_shape_cases()),
+            max(int(torch.tensor(shape).prod()) for shape in _ar_graph_shape_cases()),
+        )
+        producer_direct_max_numel = max(
+            sum(int(torch.tensor(shape).prod()) for shape in shapes)
+            for shapes in output_shape_cases
+        )
+        attnres_max_rows = 16 if world_size == attnres_config.world_size else 0
+        attnres_max_numel = attnres_max_rows * attnres_config.hidden_size
+        staged_max_numel = max(staged_max_numel, attnres_max_numel)
+        state = create_iris_state(
+            group=dist.group.WORLD,
+            rank_in_group=rank,
+            staged_max_numel=staged_max_numel,
+            producer_direct_max_numel=producer_direct_max_numel,
+            attnres_max_numel=attnres_max_numel,
+            attnres_max_rows=attnres_max_rows,
+            dtype=torch.bfloat16,
+            heap_size=None,
+            device=device,
+        )
+        assert state._input_buf.numel() == producer_direct_max_numel
+        producer_direct_two_stage = kernel_config.producer_direct.two_stage_threshold(
+            world_size
+        ) is not None and kernel_config.two_stage.supports_world_size(world_size)
+        scratch_numel = (
+            kernel_config.two_stage.scratch_numel(
+                max_numel=producer_direct_max_numel,
+                world_size=world_size,
+            )
+            if producer_direct_two_stage
+            else 0
+        )
+        if scratch_numel:
+            assert state._producer_direct_scratch_buf.numel() == scratch_numel
+        else:
+            assert state._producer_direct_scratch_buf is None
+        assert state._producer_direct_ready_flags.shape == (
+            max(
+                kernel_config.producer_direct.one_stage_max_programs,
+                (
+                    kernel_config.two_stage.max_programs
+                    if producer_direct_two_stage
+                    else 0
+                ),
+            ),
+            world_size,
+        )
+        assert state._staged_input_buf.shape == (
+            kernel_config.staged.input_slots,
+            staged_max_numel,
+        )
+        assert state._ready_flags.shape == (
+            kernel_config.staged.max_programs(staged_max_numel),
+            world_size,
+        )
+        if world_size == 4 and current_platform().is_cdna4:
+            tuning = kernel_config.staged.tuning(
+                numel=16 * 4096,
+                world_size=world_size,
+                dtype=torch.bfloat16,
+                is_cdna4=True,
+            )
+            assert tuning is not None
+            tuned_input, tuned_ready = state._staged_tuning_workspaces[tuning]
+            assert tuned_input.shape == (
+                kernel_config.staged.input_slots,
+                tuning.numel,
+            )
+            assert tuned_ready.shape == (tuning.num_programs(), world_size)
+            assert tuned_input.data_ptr() != state._staged_input_buf.data_ptr()
+            assert tuned_ready.data_ptr() != state._ready_flags.data_ptr()
+        if state._staged_two_stage_supported:
+            assert state._staged_two_stage_input_buf.numel() == staged_max_numel
+            assert (
+                state._staged_two_stage_scratch_buf.numel()
+                == (staged_max_numel + world_size - 1) // world_size
+            )
+            assert state._staged_two_stage_ready_flags.shape == (
+                kernel_config.two_stage.max_programs,
+                world_size,
+            )
+        else:
+            assert state._staged_two_stage_input_buf is None
+            assert state._staged_two_stage_scratch_buf is None
+            assert state._staged_two_stage_ready_flags is None
+        output_max_numel = max(
+            producer_direct_max_numel,
+            staged_max_numel if state._staged_two_stage_supported else 0,
+        )
+        assert state._reduced_output_buf.numel() == output_max_numel
+        if attnres_max_numel:
+            assert state._attnres_input_buf.shape == (
+                2,
+                attnres_max_numel,
+            )
+            assert state._attnres_ready_flags.shape == (
+                attnres_max_rows,
+                world_size,
+            )
+        for shape in _ar_shape_cases():
+            _check_all_reduce(state, rank, world_size, shape, device)
+        if world_size == 4:
+            for shape in _ar_graph_shape_cases():
+                _check_all_reduce_graph_replay(
+                    state,
+                    rank,
+                    world_size,
+                    shape,
+                    device,
+                )
+            if current_platform().is_cdna4:
+                _check_mixed_geometry_graph_replay(
+                    state,
+                    rank,
+                    world_size,
+                    device,
+                )
+        for shapes in output_shape_cases:
+            _check_all_reduce_symmetric_outputs(
+                state,
+                rank,
+                world_size,
+                shapes,
+                device,
+            )
+
+        fp16_state = create_iris_state(
+            group=dist.group.WORLD,
+            rank_in_group=rank,
+            staged_max_numel=0,
+            producer_direct_max_numel=producer_direct_max_numel,
+            attnres_max_numel=0,
+            attnres_max_rows=0,
+            dtype=torch.float16,
+            heap_size=None,
+            device=device,
+        )
+        _check_all_reduce_symmetric_outputs(
+            fp16_state,
+            rank,
+            world_size,
+            ((3, 5), (1, 1)),
+            device,
+        )
+        if world_size > 2:
+            _check_all_reduce_symmetric_outputs(
+                fp16_state,
+                rank,
+                world_size,
+                ((16, 7168), (16, 3584)),
+                device,
+            )
+
+        fp32_state = create_iris_state(
+            group=dist.group.WORLD,
+            rank_in_group=rank,
+            staged_max_numel=0,
+            producer_direct_max_numel=producer_direct_max_numel,
+            attnres_max_numel=0,
+            attnres_max_rows=0,
+            dtype=torch.float32,
+            heap_size=None,
+            device=device,
+        )
+        _check_all_reduce_symmetric_outputs(
+            fp32_state,
+            rank,
+            world_size,
+            ((3, 5), (1, 1)),
+            device,
+        )
+        if world_size > 2:
+            _check_all_reduce_symmetric_outputs(
+                fp32_state,
+                rank,
+                world_size,
+                ((16, 7168), (16, 3584)),
+                device,
+            )
+        if world_size == attnres_config.world_size:
+            _check_all_reduce_residual_attnres(state, rank, device)
+    finally:
+        dist.destroy_process_group()
+
+
+def _check_all_reduce(state, rank: int, world_size: int, shape, device) -> None:
+    from tokenspeed_kernel.ops.communication.iris import iris_all_reduce
+
+    # Each rank contributes a tensor filled with ``rank + 1``; the reduction
+    # is therefore ``sum(1..world_size) = world_size*(world_size+1)/2``.
+    local = torch.full(shape, rank + 1, dtype=torch.bfloat16, device=device)
+
+    result = iris_all_reduce(state, local)
+
+    expected_value = world_size * (world_size + 1) // 2
+    expected = torch.full(shape, expected_value, dtype=torch.bfloat16, device=device)
+
+    assert (
+        result.shape == expected.shape
+    ), f"shape mismatch: {result.shape} vs {expected.shape}"
+    torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+
+def _check_all_reduce_graph_replay(
+    state,
+    rank: int,
+    world_size: int,
+    shape,
+    device,
+) -> None:
+    from tokenspeed_kernel.ops.communication.iris import iris_all_reduce
+
+    local = torch.full(shape, rank + 1, dtype=torch.bfloat16, device=device)
+    result = iris_all_reduce(state, local, safe=False)
+    expected_value = world_size * (world_size + 1) // 2
+    torch.testing.assert_close(
+        result,
+        torch.full_like(result, expected_value),
+        atol=0,
+        rtol=0,
+    )
+
+    local.fill_(rank + 1)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_result = iris_all_reduce(state, local, safe=False)
+
+    for replay_index in range(1, 5):
+        scale = replay_index + 1
+        local.fill_(scale * (rank + 1))
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            graph_result,
+            torch.full_like(graph_result, scale * expected_value),
+            atol=0,
+            rtol=0,
+        )
+
+
+def _check_mixed_geometry_graph_replay(
+    state,
+    rank: int,
+    world_size: int,
+    device,
+) -> None:
+    from tokenspeed_kernel.ops.communication.iris import iris_all_reduce
+
+    shapes = ((16, 4096), (65535,))
+    inputs = [
+        torch.empty(shape, dtype=torch.bfloat16, device=device) for shape in shapes
+    ]
+    graphs = []
+    for local in inputs:
+        local.fill_(rank + 1)
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            iris_all_reduce(state, local, safe=False)
+        graphs.append(graph)
+
+    expected_rank_sum = world_size * (world_size + 1) // 2
+    snapshots = [[torch.empty_like(local) for _ in range(8)] for local in inputs]
+    for replay_index in range(8):
+        scale = replay_index + 1
+        for local, graph, outputs in zip(inputs, graphs, snapshots, strict=True):
+            local.fill_(scale * (rank + 1))
+            if rank == 0:
+                torch.cuda._sleep(1_000_000)
+            graph.replay()
+            outputs[replay_index].copy_(local)
+
+    torch.cuda.synchronize()
+    for outputs in snapshots:
+        for replay_index, output in enumerate(outputs):
+            expected = (replay_index + 1) * expected_rank_sum
+            torch.testing.assert_close(
+                output,
+                torch.full_like(output, expected),
+                atol=0,
+                rtol=0,
+            )
+
+
+def _check_all_reduce_symmetric_outputs(
+    state,
+    rank: int,
+    world_size: int,
+    shapes,
+    device,
+) -> None:
+    if not current_platform().is_cdna4:
+        return
+
+    from tokenspeed_kernel.ops.communication.iris import (
+        iris_acquire_outputs,
+        iris_all_reduce_symmetric,
+    )
+
+    outputs = iris_acquire_outputs(state, shapes)
+    assert state.owns_outputs(outputs)
+    assert not state.owns_outputs(tuple(torch.empty_like(output) for output in outputs))
+    for index, output in enumerate(outputs, start=1):
+        output.fill_(index * (rank + 1))
+    results = iris_all_reduce_symmetric(state, outputs)
+    expected_value = world_size * (world_size + 1) // 2
+    for index, (output, result) in enumerate(zip(outputs, results), start=1):
+        torch.testing.assert_close(
+            result,
+            torch.full_like(output, index * expected_value),
+            atol=0,
+            rtol=0,
+        )
+
+    snapshots = []
+    for scale in range(1, 5):
+        for index, output in enumerate(outputs, start=1):
+            output.fill_(scale * index * (rank + 1))
+        results = iris_all_reduce_symmetric(state, outputs)
+        snapshots.append(tuple(result.clone() for result in results))
+    torch.cuda.synchronize()
+    for scale, results in enumerate(snapshots, start=1):
+        for index, (output, result) in enumerate(zip(outputs, results), start=1):
+            torch.testing.assert_close(
+                result,
+                torch.full_like(output, scale * index * expected_value),
+                atol=0,
+                rtol=0,
+            )
+
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for index, output in enumerate(outputs, start=1):
+            output.fill_(index * (rank + 1))
+        graph_results = iris_all_reduce_symmetric(state, outputs)
+    dist.barrier()
+    for _ in range(4):
+        graph.replay()
+    torch.cuda.synchronize()
+    for index, (output, result) in enumerate(zip(outputs, graph_results), start=1):
+        torch.testing.assert_close(
+            result,
+            torch.full_like(output, index * expected_value),
+            atol=0,
+            rtol=0,
+        )
+
+
+def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
+    from tokenspeed_kernel.ops.activation.triton import (
+        attnres_combine,
+        attnres_partial,
+    )
+    from tokenspeed_kernel.ops.communication.iris import (
+        IRIS_ALL_REDUCE_KERNEL_CONFIG,
+        iris_all_reduce,
+    )
+    from tokenspeed_kernel.ops.communication.triton import (
+        allreduce_residual_attnres_combine,
+        allreduce_residual_attnres_combine_supported,
+    )
+
+    config = IRIS_ALL_REDUCE_KERNEL_CONFIG.kimi_k3_attnres
+    for num_tokens in (1, 2, 4, 8, 16):
+        torch.manual_seed(101 + num_tokens)
+        hidden = config.hidden_size
+        blocks = (torch.randn(4, num_tokens, hidden, device=device) * 0.1).to(
+            torch.bfloat16
+        )
+        score_weight = (torch.randn(hidden, device=device) * 0.02).to(torch.bfloat16)
+        output_weight = (1.0 + torch.randn(hidden, device=device) * 0.02).to(
+            torch.bfloat16
+        )
+        residual = (torch.randn(num_tokens, hidden, device=device) * 0.1).to(
+            torch.bfloat16
+        )
+        local = (
+            torch.randn(num_tokens, hidden, device=device) * 0.01 + (rank + 1) * 0.002
+        ).to(torch.bfloat16)
+        scratch = (
+            torch.empty(num_tokens, device=device, dtype=torch.float32),
+            torch.empty(num_tokens, device=device, dtype=torch.float32),
+            torch.empty(num_tokens, hidden, device=device, dtype=torch.float32),
+        )
+        attnres_partial(blocks, score_weight, 1e-6, scratch)
+
+        reduced = iris_all_reduce(state, local.clone(), safe=False)
+        expected_residual = residual + reduced
+        expected_hidden = attnres_combine(
+            expected_residual,
+            score_weight,
+            output_weight,
+            1e-6,
+            scratch,
+            torch.empty_like(residual),
+        )
+        assert allreduce_residual_attnres_combine_supported(
+            local,
+            residual,
+            score_weight,
+            output_weight,
+            scratch,
+            rank=rank,
+            group=state.group,
+            local_world_size=8,
+        )
+        for _ in range(4):
+            actual_hidden, actual_residual = allreduce_residual_attnres_combine(
+                local,
+                residual,
+                score_weight,
+                output_weight,
+                scratch,
+                rank=rank,
+                group=state.group,
+                local_world_size=8,
+                eps=1e-6,
+            )
+            torch.testing.assert_close(
+                actual_residual, expected_residual, atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                actual_hidden, expected_hidden, atol=2e-2, rtol=2e-2
+            )
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_hidden, graph_residual = allreduce_residual_attnres_combine(
+                local,
+                residual,
+                score_weight,
+                output_weight,
+                scratch,
+                rank=rank,
+                group=state.group,
+                local_world_size=8,
+                eps=1e-6,
+            )
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(graph_residual, expected_residual, atol=0, rtol=0)
+        torch.testing.assert_close(graph_hidden, expected_hidden, atol=2e-2, rtol=2e-2)
+
+
+def _run_ar_test(world_size: int) -> None:
+    _skip_if_unsupported(world_size, "Iris all-reduce tests")
+    port = _get_open_port()
+    _spawn_and_collect(_ar_worker_fn, (world_size, port), world_size)
+
+
+def test_iris_all_reduce_correctness_world2():
+    _run_ar_test(world_size=2)
+
+
+def test_iris_all_reduce_correctness_world4():
+    _run_ar_test(world_size=4)
+
+
+def test_iris_all_reduce_correctness_world8():
+    _run_ar_test(world_size=8)
+
+
+def _ar_subgroup_worker_fn(rank, world_size, port, error_dict):
+    try:
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"tcp://localhost:{port}",
+            rank=rank,
+            world_size=world_size,
+        )
+        groups = (
+            tuple(range(0, world_size, 2)),
+            tuple(range(1, world_size, 2)),
+        )
+        process_groups = tuple(dist.new_group(ranks) for ranks in groups)
+        group_index = rank % 2
+        group = process_groups[group_index]
+        group_rank = groups[group_index].index(rank)
+
+        from tokenspeed_kernel.ops.communication.iris import create_iris_state
+
+        state = create_iris_state(
+            group=group,
+            rank_in_group=group_rank,
+            staged_max_numel=4 * 7,
+            producer_direct_max_numel=8 * (7168 + 3584),
+            attnres_max_numel=0,
+            attnres_max_rows=0,
+            dtype=torch.bfloat16,
+            heap_size=None,
+            device=device,
+        )
+        _check_all_reduce(
+            state,
+            group_rank,
+            len(groups[group_index]),
+            (4, 7),
+            device,
+        )
+        _check_all_reduce_symmetric_outputs(
+            state,
+            group_rank,
+            len(groups[group_index]),
+            ((3, 5), (1, 1)),
+            device,
+        )
+        _check_all_reduce_symmetric_outputs(
+            state,
+            group_rank,
+            len(groups[group_index]),
+            ((8, 7168), (8, 3584)),
+            device,
+        )
+    except Exception:
+        error_dict[rank] = traceback.format_exc()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def test_iris_all_reduce_noncontiguous_subgroups():
+    world_size = 8
+    _skip_if_unsupported(world_size, "Iris subgroup all-reduce tests")
+    port = _get_open_port()
+    _spawn_and_collect(_ar_subgroup_worker_fn, (world_size, port), world_size)
+
+
+# ---------------------------------------------------------------------------
+# Suite 2: IrisRSAG (reduce-scatter / all-gather)
+# ---------------------------------------------------------------------------
+
+
+def _rsag_uniform_token_cases(world_size: int) -> List[List[int]]:
+    return [
+        [8] * world_size,
+        [16] * world_size,
+        [64] * world_size,
+    ]
+
+
+def _rsag_worker_fn(rank, world_size, port, hidden_size, error_dict):
+    try:
+        _rsag_worker_main(rank, world_size, port, hidden_size)
+    except Exception:
+        error_dict[rank] = traceback.format_exc()
+
+
+def _rsag_worker_main(rank: int, world_size: int, port: int, hidden_size: int) -> None:
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    # Match the upstream iris example - gloo for the host-side rendezvous.
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://localhost:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    try:
+        from tokenspeed_kernel.ops.communication.iris import create_iris_rsag_state
+
+        cases = _rsag_uniform_token_cases(world_size)
+        max_tokens = max(sum(tokens) for tokens in cases)
+        rsag = create_iris_rsag_state(
+            group=dist.group.WORLD,
+            rank_in_group=rank,
+            max_tokens=max_tokens,
+            hidden_size=hidden_size,
+        )
+
+        # The generic ``all_gather`` / ``reduce_scatter`` dispatchers in
+        # ``communication.triton`` route AMD calls to ``amd_rsag_*`` (which
+        # require ``state.symm_mem_hdl``); we deliberately bypass that
+        # dispatcher and call the iris RSAG state directly. ``rsag`` IS the
+        # IrisRSAG instance now (no TritonCommState wrapper).
+        ag_fn = lambda state, t, **kw: rsag.all_gather(t, **kw)  # noqa: E731
+        rs_fn = lambda state, t, **kw: rsag.reduce_scatter(t, **kw)  # noqa: E731
+
+        for tokens in cases:
+            _check_all_gather(
+                rsag, rank, world_size, tokens, hidden_size, device, ag_fn
+            )
+            _check_reduce_scatter(
+                rsag, rank, world_size, tokens, hidden_size, device, rs_fn
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+def _check_all_gather(rsag, rank, world_size, tokens, hidden_size, device, all_gather):
+    local_tokens = tokens[rank]
+    local = torch.full(
+        (local_tokens, hidden_size),
+        rank + 1,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    result = all_gather(rsag, local, token_list_in_group=tokens)
+
+    expected = torch.empty(
+        (sum(tokens), hidden_size), dtype=torch.bfloat16, device=device
+    )
+    offset = 0
+    for peer, peer_tokens in enumerate(tokens):
+        expected[offset : offset + peer_tokens].fill_(peer + 1)
+        offset += peer_tokens
+
+    assert result.shape == expected.shape, f"{result.shape} vs {expected.shape}"
+    torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+
+def _check_reduce_scatter(
+    rsag, rank, world_size, tokens, hidden_size, device, reduce_scatter
+):
+    full = torch.full(
+        (sum(tokens), hidden_size),
+        rank + 1,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    result = reduce_scatter(rsag, full, token_list_in_group=tokens)
+
+    expected_value = world_size * (world_size + 1) // 2
+    expected = torch.full(
+        (tokens[rank], hidden_size),
+        expected_value,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    assert result.shape == expected.shape, f"{result.shape} vs {expected.shape}"
+    torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+
+def _run_rsag_test(world_size: int, hidden_size: int) -> None:
+    _skip_if_unsupported(world_size, "IrisRSAG tests")
+    port = _get_open_port()
+    _spawn_and_collect(_rsag_worker_fn, (world_size, port, hidden_size), world_size)
+
+
+def test_iris_rsag_correctness_world2():
+    _run_rsag_test(world_size=2, hidden_size=2880)
+
+
+def test_iris_rsag_correctness_world4():
+    _run_rsag_test(world_size=4, hidden_size=2880)
+
+
+def test_iris_rsag_correctness_world8():
+    _run_rsag_test(world_size=8, hidden_size=2880)
+
+
+# ---------------------------------------------------------------------------
+# Suite 3: fused allreduce + residual + RMSNorm
+# ---------------------------------------------------------------------------
+
+
+# Token shapes spanning decode (1), short/long prefill (256, 1024), and
+# the full ``max_token_num`` (8192) so we exercise both the small-M code
+# path and the path that walks the full symmetric heap buffer. Hidden=2880
+# is the gpt-oss-120b size we use elsewhere.
+_ARRMS_TOKEN_CASES: List[int] = [1, 64, 256, 1024, 8192]
+_ARRMS_HIDDEN_DIM = 2880
+_ARRMS_EPS = 1e-6
+
+
+def _arrms_worker_fn(rank, world_size, port, persistent, error_dict):
+    try:
+        _arrms_worker_main(rank, world_size, port, persistent)
+    except Exception:
+        error_dict[rank] = traceback.format_exc()
+
+
+def _arrms_worker_main(rank: int, world_size: int, port: int, persistent: bool) -> None:
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    # NCCL is fine here — iris's heap-base exchange is host-side and works
+    # the same over any default group.
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://localhost:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    try:
+        from tokenspeed_kernel.ops.communication.iris import (
+            create_iris_ar_rmsnorm_state,
+        )
+
+        max_token_num = max(_ARRMS_TOKEN_CASES)
+        state = create_iris_ar_rmsnorm_state(
+            group=dist.group.WORLD,
+            rank_in_group=rank,
+            max_token_num=max_token_num,
+            hidden_dim=_ARRMS_HIDDEN_DIM,
+            dtype=torch.bfloat16,
+            persistent=persistent,
+        )
+
+        # Use a fixed RMSNorm weight that is *not* identity, so a bug in
+        # the weight load path would fail the test.
+        weight = torch.linspace(
+            0.5, 1.5, _ARRMS_HIDDEN_DIM, dtype=torch.bfloat16, device=device
+        )
+
+        for tokens in _ARRMS_TOKEN_CASES:
+            _check_arrms_one(
+                state,
+                rank=rank,
+                world_size=world_size,
+                tokens=tokens,
+                weight=weight,
+                device=device,
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+def _check_arrms_one(state, rank, world_size, tokens, weight, device) -> None:
+    from tokenspeed_kernel.ops.communication.iris import (
+        iris_allreduce_residual_rmsnorm,
+    )
+
+    # Each rank contributes ``rank + 1``; sum across ranks is therefore
+    # ``world_size * (world_size + 1) / 2``. Residual is non-uniform
+    # (linspace) so the kernel can't accidentally short-circuit it.
+    x = torch.full(
+        (tokens, _ARRMS_HIDDEN_DIM), rank + 1, dtype=torch.bfloat16, device=device
+    )
+    residual = (
+        torch.arange(tokens * _ARRMS_HIDDEN_DIM, dtype=torch.float32, device=device)
+        .reshape(tokens, _ARRMS_HIDDEN_DIM)
+        .mul_(0.001)
+        .to(torch.bfloat16)
+    )
+
+    norm_out, residual_out = iris_allreduce_residual_rmsnorm(
+        state,
+        input_tensor=x,
+        residual=residual,
+        weight=weight,
+        eps=_ARRMS_EPS,
+    )
+
+    # Reference: do everything in fp32, mirroring the AMD test exactly so
+    # tolerance differences only reflect implementation noise, not
+    # reference noise.
+    reduced = torch.full(
+        (tokens, _ARRMS_HIDDEN_DIM),
+        world_size * (world_size + 1) // 2,
+        dtype=torch.float32,
+        device=device,
+    )
+    ref_residual = reduced + residual.float()
+    ref_norm = ref_residual * torch.rsqrt(
+        ref_residual.pow(2).mean(dim=-1, keepdim=True) + _ARRMS_EPS
+    )
+    ref_norm = ref_norm * weight.float()
+
+    torch.testing.assert_close(residual_out.float(), ref_residual, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(norm_out.float(), ref_norm, atol=2e-2, rtol=2e-2)
+
+
+def _run_arrms_test(world_size: int, persistent: bool) -> None:
+    _skip_if_unsupported(world_size, "Iris fused tests")
+    port = _get_open_port()
+    _spawn_and_collect(_arrms_worker_fn, (world_size, port, persistent), world_size)
+
+
+@pytest.mark.parametrize("persistent", [False, True], ids=["per_row", "persistent"])
+def test_iris_allreduce_residual_rmsnorm_world1(persistent: bool):
+    # Single-rank smoke test: exercises the inline-barrier self-signal/wait
+    # path (rank sends to itself) and the v1 device_barrier no-op case.
+    _run_arrms_test(world_size=1, persistent=persistent)
+
+
+@pytest.mark.parametrize("persistent", [False, True], ids=["per_row", "persistent"])
+def test_iris_allreduce_residual_rmsnorm_world2(persistent: bool):
+    _run_arrms_test(world_size=2, persistent=persistent)
+
+
+@pytest.mark.parametrize("persistent", [False, True], ids=["per_row", "persistent"])
+def test_iris_allreduce_residual_rmsnorm_world4(persistent: bool):
+    _run_arrms_test(world_size=4, persistent=persistent)
+
+
+@pytest.mark.parametrize("persistent", [False, True], ids=["per_row", "persistent"])
+def test_iris_allreduce_residual_rmsnorm_world8(persistent: bool):
+    _run_arrms_test(world_size=8, persistent=persistent)

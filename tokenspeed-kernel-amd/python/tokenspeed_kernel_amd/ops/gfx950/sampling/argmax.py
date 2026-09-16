@@ -38,7 +38,7 @@ _SUPPORTED_OUT_DTYPES = (torch.int32, torch.int64)
 _MIN_GLUON_VOCAB_SIZE = 4096
 _INT32_MAX = gl.constexpr(2**31 - 1)
 _scratch_cache: dict[
-    tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    tuple[int, int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 ] = {}
 
 
@@ -290,7 +290,8 @@ def _supports_gluon(logits: torch.Tensor) -> bool:
 def _get_atomic_scratch(
     M: int, num_splits: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    key = (device.index, M, num_splits)
+    stream = triton.runtime.driver.active.get_current_stream(device.index)
+    key = (device.index, stream, M, num_splits)
     scratch = _scratch_cache.get(key)
     if scratch is None:
         partial_values = torch.empty(
@@ -299,7 +300,9 @@ def _get_atomic_scratch(
         partial_indices = torch.empty((M, num_splits), dtype=torch.int32, device=device)
         counters = torch.zeros((M,), dtype=torch.int32, device=device)
         scratch = (partial_values, partial_indices, counters)
-        _scratch_cache[key] = scratch
+        # Never retain allocations from a graph-private pool for eager reuse.
+        if not torch.cuda.is_current_stream_capturing():
+            _scratch_cache[key] = scratch
     return scratch
 
 

@@ -51,7 +51,10 @@ from tokenspeed.runtime.layers.moe import (
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import get_all2all_backend
-from tokenspeed.runtime.layers.paged_attention import PagedAttention
+from tokenspeed.runtime.layers.paged_attention import (
+    PagedAttention,
+    hf_sliding_window_to_window_left,
+)
 from tokenspeed.runtime.layers.quantization import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
@@ -210,7 +213,6 @@ class GptOssAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             sliding_window_size=(sliding_window_size if use_sliding_window else -1),
-            group_id=layer_type,
         )
         self.layer_id = layer_id
 
@@ -289,16 +291,6 @@ class GptOssAttention(nn.Module):
         return self.forward_core(s)
 
 
-def routing_function(hidden_states, gating_output, topk, renormalize):
-
-    experts = torch.topk(gating_output, k=topk, dim=-1, sorted=True)
-    expert_weights = torch.nn.functional.softmax(
-        experts.values.to(torch.float32), dim=1
-    )
-    expert_indices = experts.indices.to(torch.int32)
-    return expert_weights, expert_indices
-
-
 class GptOssSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -364,9 +356,12 @@ class GptOssSparseMoeBlock(nn.Module):
             params_dtype=config.dtype,
         )
 
+        # Declare model semantics only; the kernel package selects the
+        # platform- and shape-specific softmax top-k implementation.
         self.topk = TopK(
             top_k=top_k,
-            custom_routing_function=routing_function,
+            renormalize=True,
+            custom_routing_function=None,
             output_format=self.experts.topk_output_format,
             topk_indices_dtype=(
                 torch.int64 if get_all2all_backend().is_deepep() else torch.int32
@@ -433,9 +428,7 @@ class GptOssConfig(PretrainedConfig):
 
 
 def get_attention_sliding_window_size(config):
-    # Aligned with HF's implementation, using sliding window inclusive with the last token
-    # TokenSpeed assumes exclusive
-    return config.sliding_window - 1
+    return hf_sliding_window_to_window_left(config.sliding_window)
 
 
 class GptOssDecoderLayer(CompiledMoEDecoderLayer):

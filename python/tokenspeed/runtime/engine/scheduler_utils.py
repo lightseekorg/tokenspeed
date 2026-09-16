@@ -24,7 +24,7 @@ import math
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -40,6 +40,7 @@ from tokenspeed_scheduler import (
     SchedulerConfig,
 )
 
+from tokenspeed.runtime.execution.types import NGramInputs
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
 )
@@ -66,6 +67,58 @@ _TRANSFER_POLICY_MAP = {
     "full_suffix": CacheTransferPolicy.FullSuffix,
     "latest_snapshot": CacheTransferPolicy.LatestSnapshot,
 }
+
+
+def engram_context_len(text_config) -> int:
+    """Select caller-owned Engram inputs, not Qwen4's LCM-owned PLE state."""
+    if not getattr(text_config, "engram_layer_ids", ()):
+        return 0
+    if getattr(text_config, "ngram_context_len", None) != 3:
+        raise ValueError("Engram requires hf_text_config.ngram_context_len = 3")
+    return text_config.ngram_context_len
+
+
+def ngram_inputs_for_forward(
+    forward_op, rid_to_state: Mapping, context_len: int
+) -> NGramInputs | None:
+    """Snapshot one bounded seed window per request, including empty prefills.
+
+    Each row is [current, prev1..3] at the extend prefix or the newest committed
+    decode token. Prompt/output lists contain physical IDs, unlike the unpadded
+    detokenizer prompt. The executor uses these immutable windows to seed/reset
+    its accepted input tail; ongoing decode and proposed predecessors stay on
+    the device, even when an entire verify result awaits its host commit.
+    """
+    if context_len == 0:
+        return None
+    tokens, positions = [], []
+    num_extends = forward_op.num_extends()
+    for i, rid in enumerate(forward_op.request_ids):
+        state = rid_to_state[rid]
+        prompt, output = state.prompt_input_ids, state.output_ids
+        prompt_len = len(prompt)
+        total = prompt_len + len(output)
+        length = forward_op.input_lengths[i]
+        if i < num_extends:
+            start = forward_op.extend_prefix_lens[i]
+            if start < 0 or start + length > total:
+                raise ValueError(f"N-gram prefill exceeds physical tokens for {rid}")
+        else:
+            start = total - 1
+            if start < 0:
+                raise ValueError(f"N-gram decode requires physical tokens for {rid}")
+        tokens.append(
+            tuple(
+                (
+                    -1
+                    if p < 0 or p >= total
+                    else prompt[p] if p < prompt_len else output[p - prompt_len]
+                )
+                for p in range(start, start - context_len - 1, -1)
+            )
+        )
+        positions.append(start)
+    return NGramInputs(tokens=tuple(tokens), positions=tuple(positions))
 
 
 @dataclass(frozen=True)
@@ -102,14 +155,14 @@ def aligned_max_scheduled_tokens(
 ) -> int:
     """Floor ``max_scheduled_tokens`` to the state-snapshot grain, if any.
 
-    Recurrent-state groups (family=State, retention=FullHistory — the C++
-    ``final_state_manager`` criterion) register their state snapshot only when
-    a prefill chunk ends exactly on a CacheBlock boundary
-    (``RegistersAlignedFinalPageOnly``); interior boundaries never received a
-    state write. A chunk size that is not a multiple of every such group's
-    CacheBlock token span therefore never registers a state block. Since the
-    admission probe takes the minimum hit across groups, prefix-cache reuse
-    silently degrades to zero for the whole model.
+    Recurrent-state groups (family=State, the C++ ``IsSnapshotStateGroup``
+    criterion) register their state snapshot only when a prefill chunk ends
+    exactly on a CacheBlock boundary (``RegistersAlignedFinalPageOnly``);
+    interior boundaries never received a state write. A chunk size that is
+    not a multiple of every such group's CacheBlock token span therefore
+    never registers a state block. Since the admission probe takes the
+    minimum hit across groups, prefix-cache reuse silently degrades to zero
+    for the whole model.
 
     Args:
         max_scheduled_tokens: Requested per-step token budget
@@ -131,12 +184,7 @@ def aligned_max_scheduled_tokens(
     for group in cache_groups or ():
         if group.family != CacheGroupFamily.State:
             continue
-        if group.retention == CacheRetention.SlidingWindow:
-            continue
-        grain = math.lcm(
-            grain,
-            int(group.rows_per_page) * int(group.entry_stride_tokens),
-        )
+        grain = math.lcm(grain, int(group.block_granularity))
     if grain == 1:
         return max_scheduled_tokens
     if max_scheduled_tokens < grain:
@@ -162,7 +210,6 @@ def make_config(
     prefix_granularity: int,
     num_host_pages: int,
     disable_l2_cache: bool,
-    enable_l3_storage: bool,
     role: str,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
@@ -184,7 +231,8 @@ def make_config(
     cfg.prefix_granularity = prefix_granularity
 
     cfg.num_host_pages = num_host_pages
-    cfg.enable_l3_storage = enable_l3_storage
+    # The runtime cache executor supports device and host tiers only.
+    cfg.enable_l3_storage = False
     cfg.enable_kv_cache_events = enable_kv_cache_events
 
     if role == "prefill":
@@ -211,8 +259,8 @@ def pool_to_cache_groups(pool: Any) -> list:
     # no fallback to pool-side copies of the same specs.
     contract = pool.arena.runtime_contract
     specs = contract.group_specs
-    counts = contract.group_page_counts
-    packing = contract.group_packing
+    counts = contract.virtual_block_counts
+    packing = contract.virtual_packing
     out = []
     for spec in specs:
         retention = _RETENTION_MAP.get(spec.retention)
@@ -227,23 +275,16 @@ def pool_to_cache_groups(pool: Any) -> list:
                 f"pool_to_cache_groups: unsupported family "
                 f"{spec.family!r} for group {spec.group_id!r}"
             )
-        # The C++ scheduler config only carries row geometry. A snapshot-state
-        # group folds to (rows=checkpoint_granularity, stride=1) at this single
-        # mapping point; both encode the same block_granularity.
-        if spec.checkpoint_granularity is not None:
-            rows_per_page = int(spec.checkpoint_granularity)
-            entry_stride_tokens = 1
-        else:
-            rows_per_page = int(spec.rows_per_page)
-            entry_stride_tokens = int(spec.entry_stride_tokens)
+        # The declaration shape (row geometry or state checkpoint) stops here:
+        # the scheduler only learns how many tokens one block-table slot spans.
         kwargs = dict(
             group_id=spec.group_id,
-            rows_per_page=rows_per_page,
-            entry_stride_tokens=entry_stride_tokens,
+            block_granularity=int(spec.block_granularity),
             total_pages=int(counts[spec.group_id]),
             retention=retention,
             family=family,
             cache_blocks_per_lcm_block=int(packing[spec.group_id]),
+            shard_count=spec.shard_count,
         )
         transfer_policy = spec.transfer_policy
         if transfer_policy is not None:
@@ -455,6 +496,19 @@ def cache_sync_debug_enabled() -> bool:
     return value.strip().lower() in _TRUTHY_ENV_VALUES
 
 
+class PackedBlockTables(NamedTuple):
+    """One batch's per-group block tables, staged once and uploaded once.
+
+    Attributes:
+        tables: Per-group int32 views into the one device storage.
+        tables_cpu: The same tables as views into the pinned host stage they
+            were uploaded from, for planning that must not wait on the device.
+    """
+
+    tables: dict[str, torch.Tensor]
+    tables_cpu: dict[str, torch.Tensor]
+
+
 def block_tables_from_forward_op(
     forward_op: Any,
     device: "torch.device | str",
@@ -464,6 +518,26 @@ def block_tables_from_forward_op(
     max_page_id: int | None = None,
     max_page_ids: Mapping[str, int] | None = None,
 ) -> dict[str, torch.Tensor]:
+    """The device tables of :func:`packed_block_tables_from_forward_op`."""
+    return packed_block_tables_from_forward_op(
+        forward_op,
+        device,
+        num_reqs=num_reqs,
+        expected_group_ids=expected_group_ids,
+        max_page_id=max_page_id,
+        max_page_ids=max_page_ids,
+    ).tables
+
+
+def packed_block_tables_from_forward_op(
+    forward_op: Any,
+    device: "torch.device | str",
+    *,
+    num_reqs: int | None = None,
+    expected_group_ids: tuple[str, ...] | None = None,
+    max_page_id: int | None = None,
+    max_page_ids: Mapping[str, int] | None = None,
+) -> PackedBlockTables:
     """Bridge the per-group block tables to GPU int32 tensors: absolute
     page indices, null hole = 0 preserved, ragged-row padding -1. No
     base-offset companion -- the cache path never compacts.
@@ -473,7 +547,8 @@ def block_tables_from_forward_op(
     precondition of the backends' one-launch packed replay fill
     (``_try_packed_group_unpack``). Per-group uploads would fail its
     same-storage check and fall back to per-group copy/fill chains
-    (~40 tiny transfers per decode step).
+    (~40 tiny transfers per decode step). The host stage is returned too,
+    so a backend planning from the tables reads them without a D2H sync.
 
     Args:
         forward_op: Scheduler forward operation exporting CPU NumPy tables.
@@ -484,8 +559,8 @@ def block_tables_from_forward_op(
         max_page_ids: Optional per-group inclusive upper bounds.
 
     Returns:
-        Per-group tensor views in ``expected_group_ids`` order when supplied,
-        otherwise preserving producer order.
+        Device and host per-group tensor views in ``expected_group_ids``
+        order when supplied, otherwise preserving producer order.
 
     Raises:
         ValueError: If strict contract validation fails before device transfer.
@@ -566,6 +641,7 @@ def block_tables_from_forward_op(
                     )
     device = torch.device(device) if isinstance(device, str) else device
     out: dict[str, torch.Tensor] = {}
+    out_cpu: dict[str, torch.Tensor] = {}
     packable: list[tuple[str, Any, int]] = []
     total = 0
     for key, arr in ordered_items:
@@ -580,11 +656,12 @@ def block_tables_from_forward_op(
             # Kept out of the pack: a zero-width table must stay loud in the
             # replay fill's cols >= 1 assert, not be silently tail-padded.
             out[key] = torch.empty((arr.shape[0], 0), dtype=torch.int32, device=device)
+            out_cpu[key] = torch.empty((arr.shape[0], 0), dtype=torch.int32)
             continue
         packable.append((key, arr, total))
         total += arr.shape[0] * arr.shape[1]
     if not packable:
-        return out
+        return PackedBlockTables(out, out_cpu)
     # Fresh pinned stage per step (event-fenced; reuse races overlap).
     # arr is a read-only zero-copy view over the C++ buffer; np.copyto
     # reads it into our own writable pinned tensor (never writes back).
@@ -595,7 +672,10 @@ def block_tables_from_forward_op(
     packed = staged.to(device, non_blocking=True)
     for key, arr, offset in packable:
         out[key] = packed[offset : offset + arr.size].view(arr.shape[0], arr.shape[1])
-    return out
+        out_cpu[key] = staged[offset : offset + arr.size].view(
+            arr.shape[0], arr.shape[1]
+        )
+    return PackedBlockTables(out, out_cpu)
 
 
 def _classify_param(name: str) -> str:

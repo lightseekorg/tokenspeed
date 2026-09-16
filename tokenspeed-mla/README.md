@@ -55,6 +55,7 @@ python ./tokenspeed-mla/python/tokenspeed_mla/fmha.py \
 ```
 
 ### Decode Performance
+
 ![Decode Latency Comparison for num_heads=16](https://raw.githubusercontent.com/lightseekorg/tokenspeed/main/tokenspeed-mla/assets/latency_comparison_numHead16.png)
 ![Decode Latency Comparison for num_heads=32](https://raw.githubusercontent.com/lightseekorg/tokenspeed/main/tokenspeed-mla/assets/latency_comparison_numHead32.png)
 
@@ -81,8 +82,52 @@ decode scenarios, especially token-by-token agent traffic. Example:
 `M` (`H_eff=128`) and the remaining two query groups are scheduled on the
 scheduler second dimension (`q_seqlen_eff=2`).
 
+The public `tokenspeed_mla_decode` also accepts `enable_packed_q=True` to
+opt into continuous query/head packing on the FP8 and FP16/BF16 M128 paths, adapted from
+FlashInfer PR #4178. The default is **False**, preserving the folded-query
+implementation. M64 and token-gapped Q/output views continue to
+use that implementation even when the option is enabled.
+
+Packed rows are ordered as `query_token * num_heads + head`. Each 2-CTA
+group owns 128 consecutive rows, including across query boundaries. Thus
+H96/Sq4 uses three query tiles instead of four, and H96/Sq8 uses six
+instead of eight. Only the final tile may contain padding. This is a tensor
+view transformation, with no additional packing kernel. The kernel uses
+per-row causal positions and predicates partial output/LSE rows.
+
+For packed queries, auto split-KV uses `ceil(H * q_len / 128)` query tiles,
+and workspace needs `B * 128 * ceil(H * q_len / 128) * split_kv * 513 * 4`
+bytes for D512/FP32 partials, or zero when split-KV is one. Callers enabling
+this option must provide sufficient workspace. Output shape, output dtype
+(BF16 for FP8; input dtype for FP16/BF16), and base-2 LSE semantics are unchanged.
+The FP16/BF16 implementation retains its existing split-KV heuristic, reducer
+capacity and PDL waits. The option is part of the
+compile cache key. Existing direct kernel callers retain the old layout;
+opting in through the public wrapper keeps tiling and workspace consistent.
+
+Sliding-window and DCP masking remain supported; window boundaries use the
+packed row's original query-token position.
+
+Regression coverage is in [tests/test_mla_decode.py](tests/test_mla_decode.py).
+It checks packed-query geometry, split-KV workspace sizing, FP8/FP16/BF16
+outputs and LSE, reducer variants, CUDA-graph replay, sliding windows and DCP.
+From the repository root, select this checkout's sources explicitly:
+
+```bash
+PYTHONPATH=tokenspeed-mla/python python -m pytest -q tokenspeed-mla/tests/test_mla_decode.py
+```
+
+GPU cases require Blackwell SM100/SM103 and are skipped on other devices.
+Add `-k 'not TestGPU'` to run only CPU checks, or `-k TestGPU` for GPU checks.
+
 Other optimizations include:
 
+- FP8 split-KV candidates are normalized to nonempty K partitions before
+  workspace allocation and kernel launch. The reducer uses a 32/64-split
+  capacity for the M128/M64 paths and selects 1/2/4 disjoint D512 output bands
+  when the real output rows do not fill the GPU. These changes adapt the
+  split-KV and reducer optimizations from FlashInfer PR #4178 to TokenSpeed's
+  folded-query layout; both reducer settings are included in the compile cache.
 - Using 2CTA UTCMMA instruction to reduce shared memory usage.
 - Try to use as less mbarrier as possible.
 - Split kv loading warp to get more latency hiding ability. After loading K, V is already in the L2 cache. Loading K of next tile will not have to wait for the completion of V loading.
@@ -158,6 +203,11 @@ What it supports:
 - `split_kv` and `workspace_size` are computed and cached from runtime shape/device info.
 - `is_var_seq`, `is_persistent`, and `enable_pdl` affect scheduling/compile variants.
 - `causal_mask` supports causal and non-causal execution on FP16/BF16/FP8 paths.
+- `window_left` bounds each block row's history: row `i` sees keys
+  `[max(0, K - q_len - window_left + i), k_bound)`, the whole `q_len` block plus
+  `window_left` tokens of context. The kernel starts its KV walk at the window
+  rather than at key 0, so cost tracks the window, not the cache. `-1` (the
+  default) is full history and compiles the same kernel it always did.
 - Optional `out` tensor reuse
 - `is_var_seq` and `enable_pdl` controls
 

@@ -32,7 +32,7 @@ import torch
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
-from tokenspeed_kernel.ops.attention.triton.mla_write_locations import (  # noqa: E402
+from tokenspeed_kernel.ops.attention.mla.triton import (  # noqa: E402
     mla_write_locations,
 )
 

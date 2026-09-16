@@ -48,6 +48,24 @@ def select_mla_decode_tilers(
     return default_qk, default_pv
 
 
+def compute_q_tile_layout(
+    num_heads: int, seq_len_q: int, m_tile: int
+) -> tuple[int, int, int]:
+    """Return total rows, tile count and valid rows in the final query tile.
+
+    ``num_heads`` is the positive head count per query, ``seq_len_q`` is the
+    positive query length, and ``m_tile`` is the positive MMA row capacity.
+    Heads must fit within one MMA tile. Following FlashInfer PR #4178,
+    consecutive rows represent ``query_token * num_heads + head`` and may
+    cross query boundaries. The returned tail is in ``[1, m_tile]``.
+    """
+    if min(num_heads, seq_len_q, m_tile) <= 0 or num_heads > m_tile:
+        raise ValueError("Require positive H, Sq and M, with H <= M")
+    total_rows = num_heads * seq_len_q
+    num_tiles = (total_rows + m_tile - 1) // m_tile
+    return total_rows, num_tiles, total_rows - (num_tiles - 1) * m_tile
+
+
 def get_mla_decode_fold_sq_factor(
     num_heads: int, seq_len_q: int, mma_m_tile: int = 128
 ) -> int:

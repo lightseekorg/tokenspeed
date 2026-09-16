@@ -66,6 +66,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         if bias is None and decode_gemv_routed(x, layer.weight):
             return decode_gemv(x, layer.weight)
+        if bias is None:
+            from tokenspeed_kernel.ops.gemm.kimi3 import _try_gluon_largem_gfx1250
+
+            largem = _try_gluon_largem_gfx1250(x, layer.weight)
+            if largem is not None:
+                return largem
         return tokenspeed_kernel.mm(
             x,
             layer.weight,

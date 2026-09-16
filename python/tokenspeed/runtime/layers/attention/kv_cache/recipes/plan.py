@@ -26,6 +26,7 @@ import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import cached_property
 from itertools import pairwise
 from typing import TYPE_CHECKING
 
@@ -299,6 +300,56 @@ class CacheMemoryPlan:
             + page_id * field.page_stride_bytes
             + field.field_offset_bytes
         )
+
+    @cached_property
+    def _block_byte_layouts(
+        self,
+    ) -> dict[str, tuple[int, tuple[tuple[int, int, int], ...]]]:
+        """Resolve immutable field geometry once, before repeated block hand-outs."""
+        return {
+            group.group_id: (
+                group.page_count,
+                tuple(
+                    (
+                        self.field_page_byte_offset(field.field_id, 0),
+                        field.page_stride_bytes,
+                        field.payload_bytes,
+                    )
+                    for field in self.fields
+                    if field.group_id == group.group_id
+                ),
+            )
+            for group in self.groups
+        }
+
+    def block_byte_segments(
+        self, group_id: str, block_ids: list[int]
+    ) -> list[tuple[int, int]]:
+        """Return field payload ranges for blocks, preserving caller/field order.
+
+        Args:
+            group_id: The planned cache group owning the blocks.
+            block_ids: Physical group block IDs, including zero when requested.
+
+        Returns:
+            Byte offset and byte count pairs, excluding field/stride padding.
+        """
+        page_count, fields = self._block_byte_layouts[group_id]
+        for block_id in block_ids:
+            if (
+                isinstance(block_id, bool)
+                or not isinstance(block_id, int)
+                or block_id < 0
+                or block_id >= page_count
+            ):
+                raise IndexError(
+                    f"page_id {block_id} outside [0, {page_count}) for group {group_id!r}"
+                )
+        return [
+            (base + block_id * stride, size)
+            for block_id in block_ids
+            for base, stride, size in fields
+        ]
 
     def capacity_report(
         self,

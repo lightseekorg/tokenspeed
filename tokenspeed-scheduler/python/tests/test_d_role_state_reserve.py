@@ -21,11 +21,9 @@
 """Regression test for the D-role KV-capacity deadlock (Kimi-K3 shaped config).
 
 Root cause: a D-role remote admission used to give each snapshot-state group (KDA)
-exactly one materialized block and ``reserve_tokens=0`` (the former
-``setSnapshotStatePrefillReserve`` helper only ever received the split tail, which
-is 0 on ``Role::kD`` because ``shouldSplitFinalStateCheckpoint`` is false there;
-``groupReserveTokens`` replaces it).  At its first block boundary every
-request therefore needed one
+exactly one materialized block and ``reserve_tokens=0``, without accounting for
+decode growth. ``groupReserveTokens`` now secures that growth at admission.
+At its first block boundary every request previously needed one
 fresh EMPTY parent per state group (packing 1).  When the prefill side is slow the
 pool fills with whole-prompt reservations before any KV lands; once fewer than
 (#state groups) empty parents remain, no landed request can take its first
@@ -189,8 +187,8 @@ def _run_closed_loop(scheduler, rids: list[str]) -> dict:
         "generated": generated,
         "waiting": scheduler.waiting_size(),
         "decoding": scheduler.decoding_size(),
-        "available": scheduler.available_kv_pages(),
-        "active": scheduler.active_kv_pages(),
+        "available": scheduler.available_lcm_blocks(),
+        "active": scheduler.active_lcm_blocks(),
     }
 
 
@@ -249,5 +247,5 @@ class TestDRoleStateGroupReserve:
         dispatched = [rid for op in _dispatched(plan) for rid in op.request_ids]
         assert set(dispatched) == set(admitted), (
             f"first decode step blocked for {sorted(set(admitted) - set(dispatched))}: "
-            f"available={scheduler.available_kv_pages()} active={scheduler.active_kv_pages()}"
+            f"available={scheduler.available_lcm_blocks()} active={scheduler.active_lcm_blocks()}"
         )

@@ -25,7 +25,7 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel import (
+from tokenspeed_kernel.ops.attention.mha import (
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
     mha_plan,
@@ -47,6 +47,7 @@ from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.registry import register_backend
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 
@@ -115,11 +116,16 @@ class MHADecodeMetadata:
 class MHAAttnBackend(PagedAttentionBackend):
     """Standard MHA leaf routed through tokenspeed_kernel attention APIs."""
 
+    # Every kernel call site forwards layer.sliding_window_size.
+    supports_layer_sliding_window: bool = True
+
     def __init__(self, config: AttnConfig, spec: MHAConfig, *, kernel_page_size: int):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
         # Map the selected backend to the corresponding kernel solution string.
         backend_name = spec.backend_name or "mha"
         self.kernel_solution = _KERNEL_SOLUTION_BY_BACKEND[backend_name]
+
+        self.skip_softmax_threshold = spec.skip_softmax_threshold
 
         self.tp_q_head_num = max(spec.num_attention_heads // spec.attn_tp_size, 1)
         self.tp_kv_head_num = max(spec.num_kv_heads // spec.attn_tp_size, 1)
@@ -150,6 +156,11 @@ class MHAAttnBackend(PagedAttentionBackend):
 
         self.forward_decode_metadata: MHADecodeMetadata | None = None
         self.forward_extend_metadata: MHAExtendMetadata | None = None
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        super()._publish_cache_pool(cache_pool)
+        self.forward_decode_metadata = None
+        self.forward_extend_metadata = None
 
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
@@ -390,6 +401,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             sinks=sinks,
+            skip_softmax_threshold=self.skip_softmax_threshold,
             solution=self.kernel_solution,
         )
         output = output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)

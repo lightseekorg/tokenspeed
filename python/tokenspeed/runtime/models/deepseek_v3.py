@@ -31,12 +31,12 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.attention import (
-    attn_merge_state,
+from tokenspeed_kernel.ops.attention import attn_merge_state
+from tokenspeed_kernel.ops.attention.mla import (
     mla_project_value,
     mla_project_value_prefers_contiguous_weight,
 )
-from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
+from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.embedding import apply_rope_mla, apply_rope_mla_set_kv
 from tokenspeed_kernel.ops.gemm import bmm
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
@@ -87,9 +87,6 @@ from tokenspeed.runtime.execution.forward_step import (
     get_is_cuda_graph_phase,
 )
 from tokenspeed.runtime.layers.activation import SiluAndMul
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    FULL_ATTENTION,
-)
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -632,7 +629,6 @@ class DeepseekV3AttentionMLA(nn.Module):
             num_kv_heads=1,
             layer_id=layer_id,
             v_head_dim=self.kv_lora_rank,
-            group_id=FULL_ATTENTION,
         )
 
         self.attn_mha = PagedAttention(
@@ -642,7 +638,6 @@ class DeepseekV3AttentionMLA(nn.Module):
             num_kv_heads=self.num_local_heads,
             layer_id=layer_id,
             v_head_dim=self.v_head_dim,
-            group_id=FULL_ATTENTION,
         )
 
         self.w_kc = None

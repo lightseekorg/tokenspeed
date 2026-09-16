@@ -894,6 +894,7 @@ class ForwardStepRunner:
         extend_seq_lens_cpu: torch.Tensor,
         positions: torch.Tensor | None = None,
         block_tables: dict | None = None,
+        block_tables_cpu: dict | None = None,
     ):
         """
         Unified forward entry point.
@@ -907,7 +908,9 @@ class ForwardStepRunner:
 
         The ``extend_*`` lengths are the ``[:num_extends]`` slices of the
         input buffers on every call — empty for a pure decode or the idle
-        replay, which never read them.
+        replay, which never read them. ``block_tables_cpu`` mirrors
+        ``block_tables`` on the host for backends that plan an extend from
+        the tables without waiting on the device.
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
@@ -981,6 +984,7 @@ class ForwardStepRunner:
                 capture_hidden_mode=ctx.capture_hidden_mode,
                 num_tokens=ctx.input_num_tokens,
                 block_tables=block_tables,
+                block_tables_cpu=block_tables_cpu,
             )
 
         if use_graph:
@@ -1023,9 +1027,6 @@ class ForwardStepRunner:
         if use_graph and padded_bs != bs:
             ctx.bs = bs
 
-        # Update mamba/GDN state after speculative verify (base default no-op).
-        if self.drafter is not None and ctx.forward_mode.is_decode():
-            self.attn_backend.update_mamba_state_after_mtp_verify(result[1])
         if self.drafter is not None and (
             ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed()
         ):

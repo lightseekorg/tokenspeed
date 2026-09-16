@@ -29,7 +29,6 @@ server:
     --comm-fusion-max-num-tokens 4096
     --speculative-algorithm MTP
     --speculative-num-steps 3
-    --enable-cache-report
     --host 127.0.0.1
     --port 8000
   ready:

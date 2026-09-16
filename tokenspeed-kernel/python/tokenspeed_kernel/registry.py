@@ -388,6 +388,9 @@ def register_kernel(
 ) -> Callable:
     """Decorator to register a kernel function.
 
+    ``name`` is the registry key that ``override=`` strings, ``describe_kernel``
+    and profiler scopes show.
+
     ``priority`` accepts a :class:`Priority` band (recommended) or a raw ``int``
     in ``[0, 20)``. Within a band, add a small offset for relative preference,
     e.g. ``Priority.SPECIALIZED + 2``. See :class:`Priority` for the meaning of
@@ -399,6 +402,7 @@ def register_kernel(
 
         @register_kernel(
             "attention", "decode",
+            name="triton_attention_decode",
             features={"paged"},
             solution="triton",
             capability=CapabilityRequirement(
@@ -412,7 +416,7 @@ def register_kernel(
             priority=Priority.SPECIALIZED + 1,
             tags={"latency", "determinism"},
         )
-        def triton_decode_attention(query, key_cache, value_cache, ...):
+        def triton_attention_decode(query, key_cache, value_cache, ...):
             ...
     """
     priority_int = _validate_priority(priority)
@@ -480,11 +484,23 @@ def load_builtin_kernels() -> None:
                 "tokenspeed_kernel.numerics.reference."
             ):
                 del sys.modules[key]
-    import tokenspeed_kernel.ops.attn_res  # noqa: F401
+    import tokenspeed_kernel.ops.attention  # noqa: F401
+    import tokenspeed_kernel.ops.attention.dsa  # noqa: F401
+    import tokenspeed_kernel.ops.attention.dsv4  # noqa: F401
+    import tokenspeed_kernel.ops.attention.dsv41  # noqa: F401
+    import tokenspeed_kernel.ops.attention.gdn  # noqa: F401
+    import tokenspeed_kernel.ops.attention.kda  # noqa: F401
+    import tokenspeed_kernel.ops.attention.kpool  # noqa: F401
+    import tokenspeed_kernel.ops.attention.mha  # noqa: F401
+    import tokenspeed_kernel.ops.attention.mla  # noqa: F401
+    import tokenspeed_kernel.ops.attention.msa  # noqa: F401
+    import tokenspeed_kernel.ops.attention.qsa  # noqa: F401
+    import tokenspeed_kernel.ops.attention.rmha  # noqa: F401
     import tokenspeed_kernel.ops.embedding  # noqa: F401
     import tokenspeed_kernel.ops.gemm  # noqa: F401
     import tokenspeed_kernel.ops.moe  # noqa: F401
     import tokenspeed_kernel.ops.quantization  # noqa: F401
+    import tokenspeed_kernel.ops.residual  # noqa: F401
     import tokenspeed_kernel.ops.sampling  # noqa: F401
     import tokenspeed_kernel.ops.transform  # noqa: F401
 

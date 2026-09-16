@@ -281,7 +281,7 @@ class LoadReporter:
                 num_running,
                 stats["num_queue_reqs"],
                 stats["num_active_pages"],
-                stats["num_cached_pages"],
+                stats["num_active_pages"] + stats["num_cached_pages"],
                 self._num_total_pages,
             )
         )

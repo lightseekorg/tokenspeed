@@ -20,8 +20,16 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+    pdl_enabled,
+    prepare_cuda_toolkit_env,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
     ScaleFormat,
@@ -39,34 +47,29 @@ _MXFP8_SCALE = ScaleFormat(
 _MXFP8_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_SCALE
 )
+logger = logging.getLogger(__name__)
+platform = current_platform()
 
 
-try:
-    from tokenspeed_kernel.thirdparty.deep_gemm import (
+if platform.is_hopper_plus:
+    prepare_cuda_toolkit_env()
+    from deep_gemm import (
         ceil_to_ue8m0,
         fp8_einsum,
         fp8_gemm_nt,
         get_mn_major_tma_aligned_tensor,
-        get_num_sms,
         get_pdl,
-        m_grouped_fp8_gemm_nt_contiguous,
-        m_grouped_fp8_gemm_nt_masked,
-        set_num_sms,
         set_pdl,
         transform_sf_into_required_layout,
     )
-except ImportError:
-    ceil_to_ue8m0 = None  # type: ignore[assignment]
-    fp8_einsum = None  # type: ignore[assignment]
-    fp8_gemm_nt = None  # type: ignore[assignment]
-    get_pdl = None  # type: ignore[assignment]
-    get_mn_major_tma_aligned_tensor = None  # type: ignore[assignment]
-    get_num_sms = None  # type: ignore[assignment]
-    m_grouped_fp8_gemm_nt_contiguous = None  # type: ignore[assignment]
-    m_grouped_fp8_gemm_nt_masked = None  # type: ignore[assignment]
-    set_num_sms = None  # type: ignore[assignment]
-    set_pdl = None  # type: ignore[assignment]
-    transform_sf_into_required_layout = None  # type: ignore[assignment]
+    from tokenspeed_kernel.ops._deep_gemm.mega_moe_bf16 import (
+        prepare_mega_moe_bf16_jit,
+    )
+
+    prepare_mega_moe_bf16_jit()
+else:
+    ceil_to_ue8m0 = None
+    transform_sf_into_required_layout = None
 
 
 _DEEPSEEK_V4_GROUPED_SIGNATURES = frozenset(
@@ -78,9 +81,53 @@ _DEEPSEEK_V4_GROUPED_SIGNATURES = frozenset(
 )
 
 
-def _warmup_deep_gemm_fp8_linears(plans: list[object], max_tokens: int) -> None:
-    from tokenspeed_kernel.thirdparty.deep_gemm.warmup import warmup_fp8_gemm_nt
+def _warmup_m_values(max_tokens: int) -> list[int]:
+    """Return token counts covering every DeepGEMM tile reachable at runtime."""
+    dense = min(max_tokens, 2048)
+    values: set[int] = set(range(1, dense + 1))
+    values.update(range(dense, max_tokens + 1, 16))
+    values.add(max_tokens)
+    return sorted(values)
 
+
+def _warmup_fp8_gemm_nt(
+    shapes: list[tuple[int, int]],
+    max_tokens: int,
+    device: torch.device,
+) -> None:
+    """Pre-compile dense block-scaled FP8 GEMMs for the supplied weight shapes."""
+    block_size = 128
+    seen: set[tuple[int, int]] = set()
+
+    for n, k in shapes:
+        if (n, k) in seen:
+            continue
+        seen.add((n, k))
+
+        a = torch.zeros(max_tokens, k, dtype=torch.float8_e4m3fn, device=device)
+        a_scales = torch.ones(
+            max_tokens, k // block_size, dtype=torch.float32, device=device
+        )
+        b = torch.zeros(n, k, dtype=torch.float8_e4m3fn, device=device)
+        b_scales = torch.ones(
+            n // block_size, k // block_size, dtype=torch.float32, device=device
+        )
+        out = torch.empty(max_tokens, n, dtype=torch.bfloat16, device=device)
+
+        for num_tokens in _warmup_m_values(max_tokens):
+            fp8_gemm_nt(
+                (a[:num_tokens], a_scales[:num_tokens]),
+                (b, b_scales),
+                out[:num_tokens],
+            )
+
+        del a, a_scales, b, b_scales, out
+
+    logger.info("Warmed up fp8_gemm_nt for %d weight shapes", len(seen))
+    torch.cuda.synchronize()
+
+
+def _warmup_deep_gemm_fp8_linears(plans: list[object], max_tokens: int) -> None:
     if get_pdl() != pdl_enabled():
         set_pdl(pdl_enabled())
     by_device: dict[torch.device, set[tuple[int, int]]] = {}
@@ -93,7 +140,7 @@ def _warmup_deep_gemm_fp8_linears(plans: list[object], max_tokens: int) -> None:
         device = prepared_weight_scales.device
         by_device.setdefault(device, set()).add((n, k))
     for device, shapes in by_device.items():
-        warmup_fp8_gemm_nt(list(shapes), max_tokens, device)
+        _warmup_fp8_gemm_nt(list(shapes), max_tokens, device)
 
 
 def _deep_gemm_dsv4_grouped_output_projection_weights(
@@ -145,8 +192,6 @@ def _warmup_deep_gemm_dsv4_grouped_output_projection(
     recipe: tuple[int, int, int],
     max_tokens: int,
 ) -> None:
-    from tokenspeed_kernel.thirdparty.deep_gemm.warmup import _warmup_m_values
-
     if get_pdl() != pdl_enabled():
         set_pdl(pdl_enabled())
     num_scale_blocks = input_dim // block_size[1]
@@ -189,7 +234,7 @@ def _warmup_deep_gemm_dsv4_grouped_output_projection(
     torch.cuda.synchronize()
 
 
-if fp8_einsum is not None:
+if platform.is_hopper_plus:
 
     @register_kernel(
         "gemm",
@@ -226,7 +271,7 @@ if fp8_einsum is not None:
         tma_aligned_scales: bool,
         recipe: tuple[int, int, int],
     ) -> torch.Tensor:
-        from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+        from tokenspeed_kernel.ops.attention.dsv4.triton import (
             dsv4_fused_inv_rope_fp8_quant,
         )
 
@@ -263,7 +308,7 @@ if fp8_einsum is not None:
         _warmup_deep_gemm_dsv4_grouped_output_projection
     )
 
-if fp8_gemm_nt is not None:
+if platform.is_hopper_plus:
 
     @register_kernel(
         "gemm",

@@ -62,7 +62,7 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
         num_kv_heads=text_config.num_key_value_heads,
         head_dim=text_config.qk_head_dim,
         attn_tp_size=4,
-        layer_types=tuple(text_config.paged_cache_layer_types),
+        cache_layer_types=tuple(text_config.paged_cache_layer_types),
         kv_lora_rank=text_config.kv_lora_rank,
         qk_nope_head_dim=text_config.qk_nope_head_dim,
         qk_rope_head_dim=text_config.qk_rope_head_dim,
@@ -96,7 +96,7 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
     draft_attn_config = replace(
         attn_config,
         is_draft=True,
-        components=(replace(dsa, layer_types=(FULL_ATTENTION,)),),
+        components=(replace(dsa, cache_layer_types=(FULL_ATTENTION,)),),
     )
     groups = declare_glm53_flash_groups(
         text_config.num_hidden_layers,

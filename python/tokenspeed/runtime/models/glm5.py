@@ -27,7 +27,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
-from tokenspeed_kernel.ops.attention import (
+from tokenspeed_kernel.ops.attention.dsa import (
     dsa_decode_topk,
     dsa_prefill_topk,
 )

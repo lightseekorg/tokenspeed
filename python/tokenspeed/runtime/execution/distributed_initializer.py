@@ -166,6 +166,9 @@ class DistributedInitializer:
         )
         pg_manager.init_process_group(config.mapping.world_group)
         pg_manager.init_process_group(config.mapping.attn.tp_group)
+        # A DCP group of one is still the group the decode path collectives
+        # address; init_process_group is idempotent and handles size 1.
+        pg_manager.init_process_group(config.mapping.attn.dcp_group)
         pg_manager.init_process_group(config.mapping.attn.dp_group)
         # No-op at the default linear_attn.tp == attn.tp (same group,
         # idempotent).
@@ -176,6 +179,10 @@ class DistributedInitializer:
             # Cross-stage group for hidden-state P2P (nccl) and small control
             # broadcasts like the sampled first token (gloo).
             pg_manager.init_process_group(config.mapping.pp_group)
+
+        from tokenspeed_kernel.ops.communication.fabric import gather_fabric_map
+
+        gather_fabric_map()
 
         # Arm the trtllm AR workspaces; --force-deterministic-rsag overrides at dispatch.
         if config.hidden_size > 0:

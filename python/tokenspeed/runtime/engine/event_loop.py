@@ -19,7 +19,9 @@
 # SOFTWARE.
 
 import faulthandler
+import os
 import signal
+import sys
 import threading
 import time
 from collections import deque
@@ -45,7 +47,9 @@ from tokenspeed.runtime.engine.pause import PauseController, PauseHooks
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
     advance_scheduler,
+    engram_context_len,
     make_config,
+    ngram_inputs_for_forward,
     resolve_dspark_prefix_replay_tokens,
     scheduler_cache_group_pages,
     should_use_overlap_schedule,
@@ -184,6 +188,14 @@ class EventLoop:
         else:
             self.in_flight_depth = int(self.use_overlap_schedule)
 
+        self._ngram_context_len = engram_context_len(self.model_config.hf_text_config)
+        if self._ngram_context_len and (
+            server_args.mapping.has_pp or self.in_flight_depth > 1
+        ):
+            raise NotImplementedError(
+                "Engram input history requires PP=1 and in-flight depth <= 1"
+            )
+
         decode_input_tokens = (
             server_args.speculative_num_draft_tokens
             if server_args.speculative_algorithm is not None
@@ -305,7 +317,6 @@ class EventLoop:
             prefix_granularity=geometry.prefix_granularity,
             num_host_pages=num_host_pages,
             disable_l2_cache=not server_args.enable_kvstore,
-            enable_l3_storage=server_args.kvstore_storage_backend is not None,
             role=server_args.disaggregation_mode,
             enable_kv_cache_events=self._kv_events_enabled,
             decode_input_tokens=decode_input_tokens,
@@ -821,7 +832,7 @@ class EventLoop:
         self._dp_local_info[0, 0] = num_tokens
         self._dp_local_info[0, 1] = batch_size
         self._dp_local_info[0, 2] = int(forward_mode)
-        dist.all_gather_into_tensor(
+        dist.all_gather_single(
             self._dp_global_info,
             self._dp_local_info,
             group=self.world_cpu_group,
@@ -856,12 +867,12 @@ class EventLoop:
         return len(self.output_processor.rid_to_state)
 
     def _get_scheduler_stats(self):
-        available = self.scheduler.available_kv_pages()
-        active = self.scheduler.active_kv_pages()
+        empty = self.scheduler.empty_lcm_blocks()
+        active = self.scheduler.active_lcm_blocks()
         return {
             "num_active_pages": active,
             "num_cached_pages": (
-                self._scheduler_cache_geometry.num_usable_pages - available
+                self._scheduler_cache_geometry.num_usable_pages - empty - active
             ),
             "num_queue_reqs": self.scheduler.waiting_size(),
         }
@@ -1008,6 +1019,11 @@ class EventLoop:
                         # KeyError on rids still present in the current forward_op.
                         sampling_params_list = self._gather_sampling_params(forward_op)
                         grammar_inputs = self._gather_grammar_state(forward_op)
+                        ngram_inputs = ngram_inputs_for_forward(
+                            forward_op,
+                            self.output_processor.rid_to_state,
+                            self._ngram_context_len,
+                        )
 
                         if in_flight and self._dispatch_depends_on_pending_commit(
                             forward_op, grammar_inputs
@@ -1021,6 +1037,7 @@ class EventLoop:
                             sampling_params_list=sampling_params_list,
                             dp_metadata=dp_metadata,
                             grammar_inputs=grammar_inputs,
+                            ngram_inputs=ngram_inputs,
                             multimodal_context=(
                                 multimodal_context_for_forward(
                                     forward_op, self.output_processor.rid_to_state
@@ -1170,7 +1187,15 @@ def run_event_loop(
 
     event_loop = None
     shutdown_event = threading.Event()
+    received_signal = None
     previous_sigterm_handler = None
+
+    def request_shutdown(signum, _frame):
+        nonlocal received_signal
+        # Defer logging until outside the signal handler (logging takes locks).
+        received_signal = signum
+        shutdown_event.set()
+
     try:
         if server_args.disaggregation_mode == "encode":
             # The encode role is LM-free; run the lightweight vision-tower loop
@@ -1186,10 +1211,7 @@ def run_event_loop(
         # scheduler iteration and ordinary runtime cleanup can finish.
         if threading.current_thread() is threading.main_thread():
             previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
-            signal.signal(
-                signal.SIGTERM,
-                lambda _signum, _frame: shutdown_event.set(),
-            )
+            signal.signal(signal.SIGTERM, request_shutdown)
 
         maybe_warm_cupti_for_graph_capture()
 
@@ -1228,6 +1250,17 @@ def run_event_loop(
         logger.error("Scheduler hit an exception: %s", traceback)
         parent_process.send_signal(signal.SIGUSR1)
     finally:
+        # SystemExit/KeyboardInterrupt bypass the Exception handler above;
+        # report their traceback without swallowing or changing the exit status.
+        exception_info = sys.exc_info()
+        logger.warning(
+            "Scheduler exiting: rank=%d pid=%d shutdown_requested=%s signal=%s",
+            global_rank,
+            os.getpid(),
+            shutdown_event.is_set(),
+            received_signal,
+            exc_info=exception_info if exception_info[0] is not None else None,
+        )
         if event_loop is not None:
             try:
                 event_loop.close()

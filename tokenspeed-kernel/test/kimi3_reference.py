@@ -58,10 +58,11 @@ def kda_recurrent(
     a_log: torch.Tensor,
     dt_bias: torch.Tensor,
     *,
-    lower_bound: float | None = -5.0,
-    eps: float = 1e-6,
+    output_dtype: torch.dtype,
+    lower_bound: float | None,
+    eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sequential KDA oracle for both prefill and decode."""
+    """Sequential KDA oracle with explicitly controlled output precision."""
 
     if q.shape != k.shape or q.shape != raw_g.shape:
         raise ValueError("q, k, and raw_g must have matching shapes")
@@ -90,7 +91,7 @@ def kda_recurrent(
         running = running + torch.einsum("hv,hk->hvk", delta, k_t)
         outputs.append(torch.einsum("hvk,hk->hv", running, q_t))
 
-    return torch.stack(outputs).to(q.dtype), running.to(state.dtype)
+    return torch.stack(outputs).to(output_dtype), running.to(state.dtype)
 
 
 _E2M1_VALUES = torch.tensor(

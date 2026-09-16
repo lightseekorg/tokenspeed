@@ -716,7 +716,7 @@ def test_inkling_preserves_enabled_prefix_caching(tmp_path):
     )
 
     assert "--enable-prefix-caching" in engine_args
-    assert "--no-enable-prefix-caching" not in engine_args
+    assert "--disable-prefix-caching" not in engine_args
 
 
 def test_prewarm_skips_local_path(tmp_path):

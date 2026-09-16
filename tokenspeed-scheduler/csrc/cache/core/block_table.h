@@ -52,9 +52,10 @@ public:
     }
 
 private:
+    // The allocator is the only component that changes a table; anything
+    // else that needs to write blocks (publishing them to a prefix index)
+    // receives a window from it.
     friend class GroupAllocator;
-    // Registering a block may replace it with the key's canonical block.
-    friend class PrefixCacheIndex;
 
     std::vector<CacheBlockRef> blocks_{};
     // Unconsumed capacity at the logical tail. This may span multiple blocks

@@ -67,12 +67,13 @@ from cutlass.cutlass_dsl import BaseDSL
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 try:
-    from .mla_helpers import (
+    from tokenspeed_mla.mla_helpers import (
         LOG2_E,
         MAX_SPLITS,
         MLAStaticTileScheduler,
         MLAStaticTileSchedulerParams,
         ceil_div,
+        compute_q_tile_layout,
         create_mla_static_tile_scheduler,
         create_mla_static_tile_scheduler_params,
         get_mla_decode_fold_sq_factor,
@@ -84,6 +85,7 @@ except ImportError:
         MLAStaticTileScheduler,
         MLAStaticTileSchedulerParams,
         ceil_div,
+        compute_q_tile_layout,
         create_mla_static_tile_scheduler,
         create_mla_static_tile_scheduler_params,
         get_mla_decode_fold_sq_factor,
@@ -219,7 +221,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         is_causal: bool = False,
         num_heads: int = 128,
         seq_len_q: int = 1,
+        window_left: int = -1,
         cp_world: int = 1,  # DCP world size; >1 enables strided global-coord causal masking
+        reducer_d_tiles: int = 1,
+        reducer_max_splits: int = MAX_SPLITS,
+        pack_q: bool = False,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -243,9 +249,30 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type is_var_seq: bool
         :param is_var_split_kv: Whether to use variable split KV
         :type is_var_split_kv: bool
+        :param window_left: Sliding-window span, or -1 for full history. When
+            non-negative, query row ``q_tok`` of the ``seq_len_q`` block sees
+            keys ``[max(0, K - seq_len_q - window_left + q_tok), k_bound)``:
+            the whole block plus ``window_left`` tokens of history, which is
+            the mask a block drafter's ``sliding_attention`` layers declare.
+        :type window_left: int
+        :param reducer_d_tiles: Number of disjoint D512 output bands (1, 2 or 4)
+        :type reducer_d_tiles: int
+        :param reducer_max_splits: Static reducer capacity; must cover every split
+        :type reducer_max_splits: int
+        :param pack_q: Pack consecutive query/head rows into M128 tiles. The
+            caller must size split-KV workspace for (128, ceil(H*Sq/128)).
+            False preserves the folded layout for existing direct callers.
+        :type pack_q: bool
         """
 
         self.latent_dim = 512
+        if reducer_d_tiles not in (1, 2, 4):
+            raise ValueError("reducer_d_tiles must be 1, 2 or 4")
+        if reducer_max_splits not in (32, 64, MAX_SPLITS):
+            raise ValueError("reducer_max_splits must be 32, 64 or MAX_SPLITS")
+        self.reducer_d_tiles = reducer_d_tiles
+        self.reducer_d_tile = self.latent_dim // reducer_d_tiles
+        self.reducer_max_splits = reducer_max_splits
         self.rope_dim = 64
         self.acc_dtype = acc_dtype
         self.lse_dtype = lse_dtype
@@ -258,6 +285,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.is_var_seq = is_var_seq
         self.is_var_split_kv = is_var_split_kv
         self.fold_sq_factor = fold_sq_factor
+        self.pack_q = pack_q
+        if pack_q and (mma_qk_tiler_mn[0] != 128 or fold_sq_factor != 1):
+            raise ValueError("Packed Q requires M128 and fold_sq_factor=1")
+        if pack_q:
+            self.total_q_rows, self.num_q_tiles, self.tail_q_rows = (
+                compute_q_tile_layout(num_heads, seq_len_q, mma_qk_tiler_mn[0])
+            )
         self.is_causal = is_causal
         # Original (pre-fold) num_heads and seq_len_q used for per-row causal
         # q_token_index computation. When fold_sq_factor > 1, each S_q group folds
@@ -265,6 +299,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # row r → (q_tok_in_group = r // num_heads, head = r % num_heads).
         self.num_heads = num_heads
         self.seq_len_q = seq_len_q
+        self.window_left = window_left
         self.cp_world = cp_world
         if mma_qk_tiler_mn[0] == 128:
             self.cluster_shape_mnk = (2, 1, 1)
@@ -524,11 +559,50 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             else None
         )
 
+        o_reduction = o
+        lse_reduction = lse
+        if cutlass.const_expr(self.pack_q):
+            # Bound Q's TMA row extent by the real rows; only the final tile
+            # can be partial. Keep a singleton S mode for the existing loader.
+            def _flatten_q(t):
+                return cute.make_tensor(
+                    t.iterator,
+                    cute.make_layout(
+                        (self.total_q_rows, t.shape[1], 1, t.shape[3]),
+                        stride=(t.stride[0], t.stride[1], t.stride[3], t.stride[3]),
+                    ),
+                )
+
+            q_latent = _flatten_q(q_latent)
+            q_rope = _flatten_q(q_rope)
+            m_tile = self.mma_qk_tiler_mn[0]
+            num_q_tiles = cute.ceil_div(o.shape[0] * o.shape[2], m_tile)
+            o = cute.make_tensor(
+                o.iterator,
+                cute.make_layout(
+                    (m_tile, o.shape[1], num_q_tiles, o.shape[3]),
+                    stride=(
+                        o.stride[0],
+                        o.stride[1],
+                        m_tile * o.stride[0],
+                        o.stride[3],
+                    ),
+                ),
+            )
+            if cutlass.const_expr(not self.skip_lse):
+                lse = cute.make_tensor(
+                    lse.iterator,
+                    cute.make_layout(
+                        (m_tile, num_q_tiles, lse.shape[2]),
+                        stride=(lse.stride[0], m_tile * lse.stride[0], lse.stride[2]),
+                    ),
+                )
+
         # When num_heads < M tile (128), fold fold_sq_factor query tokens into
         # the head dimension to better fill MMA M dimension per S_q group.
         # E.g., H=64, S_q=4, fold_sq_factor=2 → M_eff=128, S_q_eff=2.
         # This works because MLA shares KV across all heads/queries independently.
-        if cutlass.const_expr(self.fold_sq_factor > 1):
+        elif cutlass.const_expr(self.fold_sq_factor > 1):
 
             def _fold_sq_4d(t):
                 # [H, D, S_q, B] → [H*F, D, S_q/F, B], where F=fold_sq_factor.
@@ -570,11 +644,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     ),
                 )
 
+        if cutlass.const_expr(not self.pack_q):
+            o_reduction = o
+            lse_reduction = lse
+
         acc_o, acc_lse = self.initialize_workspace(
-            q_latent.shape[0],
-            q_latent.shape[1],
-            q_latent.shape[2],
-            q_latent.shape[3],
+            o.shape[0],
+            o.shape[1],
+            o.shape[2],
+            o.shape[3],
             split_kv,
             self.acc_dtype,
             workspace,
@@ -982,17 +1060,21 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         )
         if cutlass.const_expr(acc_o is not None):
             self.reduction_kernel(
-                o,
-                lse,
+                o_reduction,
+                lse_reduction,
                 acc_o,
                 acc_lse,
                 split_kv,
                 cache_seqs,
                 block_split_kvs,
             ).launch(
-                grid=(q_latent.shape[0], q_latent.shape[2], q_latent.shape[3]),
+                grid=(
+                    o_reduction.shape[0] * self.reducer_d_tiles,
+                    o_reduction.shape[2],
+                    o_reduction.shape[3],
+                ),
                 block=[self.threads_per_warp * self.num_compute_warps, 1, 1],
-                smem=MAX_SPLITS * self.acc_dtype.width // 8,
+                smem=self.reducer_max_splits * self.acc_dtype.width // 8,
                 stream=stream,
                 min_blocks_per_mp=1,
                 use_pdl=use_pdl,
@@ -1636,7 +1718,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         K=cache_seqs[blk_coord[2]],
                         K_causal=causal_seqs[blk_coord[2]],
                         L=mCL.shape[1],
-                        H=mQL.shape[0],
+                        H=(
+                            cutlass.min(
+                                self.mma_qk_tiler[0],
+                                self.total_q_rows - blk_coord[1] * self.mma_qk_tiler[0],
+                            )
+                            if cutlass.const_expr(self.pack_q)
+                            else mQL.shape[0]
+                        ),
                         tmem_ptr=tmem_ptr,
                         tidx=tidx,
                         tiled_mma_pv=tiled_mma_pv,
@@ -1694,27 +1783,52 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         """
         bidx, bidy, bidz = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
-        blk_coord = (bidx, bidy, bidz)
+        # Output coordinates retain the original query/head layout for packed Q.
+        # Each CTA writes a disjoint D band; only band zero writes the LSE.
+        d_tile_idx = bidx % self.reducer_d_tiles
+        blk_coord = (bidx // self.reducer_d_tiles, bidy, bidz)
+        acc_row = blk_coord[0]
+        acc_tile = blk_coord[1]
+        if cutlass.const_expr(self.pack_q):
+            flat_row = bidy * self.num_heads + blk_coord[0]
+            acc_row = flat_row % self.mma_qk_tiler[0]
+            acc_tile = flat_row // self.mma_qk_tiler[0]
         local_split_kv = (
             block_split_kvs[blk_coord[2]] if self.is_var_split_kv else split_kv
         )
         k_tile_total = cute.ceil_div(cache_seqs[blk_coord[2]], self.mma_qk_tiler[1])
-        k_tile_per_cta = cute.ceil_div(k_tile_total, local_split_kv)
-        local_split_kv = cute.ceil_div(k_tile_total, k_tile_per_cta)
+        # Mirror get_k_tile_count's window-aware split, or this reduction reads
+        # partials from CTAs that were given no tiles to write them.
+        if cutlass.const_expr(self.window_left >= 0):
+            k_tile_lo = (
+                max(
+                    0,
+                    cache_seqs[blk_coord[2]] - self.seq_len_q - self.window_left,
+                )
+                // self.mma_qk_tiler[1]
+            )
+        else:
+            k_tile_lo = 0
+        k_tile_per_cta = cute.ceil_div(k_tile_total - k_tile_lo, local_split_kv)
+        local_split_kv = cute.ceil_div(k_tile_total - k_tile_lo, k_tile_per_cta)
 
         # Alloc shared memory
         smem = utils.SmemAllocator()
-        storage = smem.allocate(MAX_SPLITS * self.acc_dtype.width // 8, 16)
+        storage = smem.allocate(self.reducer_max_splits * self.acc_dtype.width // 8, 16)
         lse_scale_ptr = cute.recast_ptr(storage, dtype=self.acc_dtype)
-        smem_lse_scale = cute.make_tensor(lse_scale_ptr, cute.make_layout(MAX_SPLITS))
+        smem_lse_scale = cute.make_tensor(
+            lse_scale_ptr, cute.make_layout(self.reducer_max_splits)
+        )
 
         cute.arch.griddepcontrol_wait()
 
-        gLSE = mAccLSE[blk_coord[0], None, blk_coord[1], blk_coord[2]]
+        gLSE = mAccLSE[acc_row, None, acc_tile, blk_coord[2]]
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp_idx == 0:
             # calculate the global lse and exp ^ (local_lse - global_lse)
-            lse_per_thread = cute.ceil_div(MAX_SPLITS, self.threads_per_warp)
+            lse_per_thread = cute.ceil_div(
+                self.reducer_max_splits, self.threads_per_warp
+            )
 
             local_lse = cute.make_rmem_tensor(
                 cute.make_layout(lse_per_thread), self.lse_dtype
@@ -1744,7 +1858,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 or sum_lse != sum_lse  # noqa: SIM201
                 else self.lse_dtype.inf
             )
-            if tidx == 0:
+            if tidx == 0 and d_tile_idx == 0:
                 if cutlass.const_expr(not self.skip_lse):
                     mLSE[blk_coord[0], blk_coord[1], blk_coord[2]] = global_lse
             # store the scale to shared memory
@@ -1758,9 +1872,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         pipeline.sync(barrier_id=4)
 
         elements_per_thread = cute.ceil_div(
-            self.latent_dim, self.threads_per_warp * self.num_compute_warps
+            self.reducer_d_tile, self.threads_per_warp * self.num_compute_warps
         )
-        gAccO = mAccO[blk_coord[0], None, None, blk_coord[1], blk_coord[2]]
+        gAccO = mAccO[acc_row, None, None, acc_tile, blk_coord[2]]
         rAccO = cute.make_rmem_tensor(
             cute.make_layout(elements_per_thread), self.acc_dtype
         )
@@ -1768,11 +1882,19 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         rAccO.fill(0.0)
         for i in range(local_split_kv):
             for j in cutlass.range_constexpr(elements_per_thread):
-                element_idx = tidx + j * self.threads_per_warp * self.num_compute_warps
+                element_idx = (
+                    d_tile_idx * self.reducer_d_tile
+                    + tidx
+                    + j * self.threads_per_warp * self.num_compute_warps
+                )
                 rAccO[j] += gAccO[i, element_idx] * smem_lse_scale[i]
         rO.store(rAccO.load().to(self.o_dtype))
         for j in cutlass.range_constexpr(elements_per_thread):
-            element_idx = tidx + j * self.threads_per_warp * self.num_compute_warps
+            element_idx = (
+                d_tile_idx * self.reducer_d_tile
+                + tidx
+                + j * self.threads_per_warp * self.num_compute_warps
+            )
             mO[blk_coord[0], element_idx, blk_coord[1], blk_coord[2]] = rO[j]
         cute.arch.griddepcontrol_launch_dependents()
         return
@@ -1843,8 +1965,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             split_kv = block_split_kvs[blk_coord[2]]
 
         k_tile_total = cute.ceil_div(K, self.mma_qk_tiler[1])
-        k_tile_per_cta = cute.ceil_div(k_tile_total, split_kv)
-        k_index = blk_coord[3] * k_tile_per_cta
+        # A sliding window makes every tile below the earliest visible key dead
+        # work, so the split starts there instead of at 0. window_left < 0 is a
+        # compile-time zero and leaves the full-history schedule untouched.
+        if cutlass.const_expr(self.window_left >= 0):
+            k_tile_lo = (
+                max(0, K - self.seq_len_q - self.window_left) // self.mma_qk_tiler[1]
+            )
+        else:
+            k_tile_lo = 0
+        k_tile_per_cta = cute.ceil_div(k_tile_total - k_tile_lo, split_kv)
+        k_index = k_tile_lo + blk_coord[3] * k_tile_per_cta
         k_tile_count = max(0, min(k_tile_total, k_index + k_tile_per_cta) - k_index)
         return k_index, k_tile_count, split_kv
 
@@ -1895,12 +2026,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             cute.group_modes(tSgQR, 0, 3),
         )
 
-        tQLgQL = tQLgQL_mkl[
-            None, None, None, common_params.blk_coord[1], common_params.blk_coord[2]
-        ]
-        tQRgQR = tQRgQR_mkl[
-            None, None, None, common_params.blk_coord[1], common_params.blk_coord[2]
-        ]
+        q_group = 0 if cutlass.const_expr(self.pack_q) else common_params.blk_coord[1]
+        q_m_tile = common_params.blk_coord[1] if cutlass.const_expr(self.pack_q) else 0
+        tQLgQL = tQLgQL_mkl[None, None, None, q_group, common_params.blk_coord[2]]
+        tQRgQR = tQRgQR_mkl[None, None, None, q_group, common_params.blk_coord[2]]
 
         # Issue Q TMA copies
         load_q_pipeline = common_params.load_q_pipeline
@@ -1909,14 +2038,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         for i in cutlass.range_constexpr(self.iterations_qk_latent):
             cute.copy(
                 q_params.tma_atom_q_latent,
-                tQLgQL[None, 0, i],
+                tQLgQL[None, q_m_tile, i],
                 tQsQ[None, (i, 0)],
                 tma_bar_ptr=tma_bar_ptr,
             )
         for i in cutlass.range_constexpr(self.iterations_qk_rope):
             cute.copy(
                 q_params.tma_atom_q_rope,
-                tQRgQR[None, 0, i],
+                tQRgQR[None, q_m_tile, i],
                 tQsQ_rope[None, i],
                 tma_bar_ptr=tma_bar_ptr,
             )
@@ -2806,6 +2935,39 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # var-seq / split-KV).
         first_mask_tile_idx = k_tile_total - mask_tile_count
 
+        # Phase 0: tiles straddling a sliding window's low edge. The edge moves
+        # by one key per query row, so it spans the same tile count the causal
+        # edge does, starting at the first tile the window reaches.
+        if cutlass.const_expr(self.window_left >= 0):
+            low_mask_end = (
+                max(0, common_params.K - self.seq_len_q - self.window_left) // tile_n
+                + (self.seq_len_q - 1 + tile_n - 1) // tile_n
+                + 1
+            )
+            while k_tile_count > 1 and k_index < low_mask_end:
+                (
+                    mma_s_consumer_state,
+                    p_mma_producer_state,
+                    p_cor_producer_state,
+                    row_max,
+                    row_sum,
+                    correction_factor,
+                ) = self.softmax(
+                    common_params,
+                    softmax_params,
+                    k_index,
+                    mma_s_consumer_state,
+                    p_mma_producer_state,
+                    p_cor_producer_state,
+                    row_max,
+                    row_sum,
+                    correction_factor,
+                    True,
+                    False,
+                )
+                k_index = k_index + 1
+                k_tile_count = k_tile_count - 1
+
         # Phase 1: pure unmasked bulk tiles (all columns strictly < min k_bound).
         while k_tile_count > 1 and k_index < first_mask_tile_idx:
             (
@@ -2857,7 +3019,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             k_index = k_index + 1
             k_tile_count = k_tile_count - 1
 
-        # Phase 3: this work-split's final tile.
+        # Phase 3: this work-split's final tile. A window's low edge can land
+        # on any tile, including a split's last one, so windowed splits always
+        # mask here rather than testing only the K-bound edge.
+        if cutlass.const_expr(self.window_left >= 0):
+            final_tile_apply_mask = True
+        else:
+            final_tile_apply_mask = k_index >= first_mask_tile_idx
         if cutlass.const_expr(common_params.mAccO is not None):
             # Split-KV: only apply mask when this final tile is globally in
             # the mask region (covers both last-split last-tile and straddling
@@ -2879,7 +3047,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 row_max,
                 row_sum,
                 correction_factor,
-                k_index >= first_mask_tile_idx,
+                final_tile_apply_mask,
                 True,
             )
         else:
@@ -3179,7 +3347,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 if apply_mask:
                     qk_col = tTR_tS[i][1]
                     if cutlass.const_expr(self.is_causal):
-                        if cutlass.const_expr(self.fold_sq_factor > 1):
+                        if cutlass.const_expr(self.pack_q):
+                            q_tok = (
+                                common_params.blk_coord[1] * self.mma_qk_tiler[0]
+                                + common_params.blk_coord[0] * cta_m_rows
+                                + tTR_tS[i][0]
+                            ) // self.num_heads
+                        elif cutlass.const_expr(self.fold_sq_factor > 1):
                             qk_row = tTR_tS[i][0]
                             q_tok = (
                                 common_params.blk_coord[1] * self.fold_sq_factor
@@ -3214,6 +3388,40 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         )
                         else self.acc_dtype(-1.0e6)
                     )
+                    if cutlass.const_expr(self.window_left >= 0):
+                        # Row q_tok's window opens at
+                        # K - seq_len_q - window_left + q_tok, so a key strictly
+                        # before that is out of view however the upper bound
+                        # was computed.
+                        if cutlass.const_expr(self.pack_q):
+                            win_row = (
+                                common_params.blk_coord[1] * self.mma_qk_tiler[0]
+                                + common_params.blk_coord[0] * cta_m_rows
+                                + tTR_tS[i][0]
+                            ) // self.num_heads
+                        elif cutlass.const_expr(self.fold_sq_factor > 1):
+                            win_row = (
+                                common_params.blk_coord[1] * self.fold_sq_factor
+                                + (
+                                    tTR_tS[i][0]
+                                    + common_params.blk_coord[0] * cta_m_rows
+                                )
+                                // self.num_heads
+                            )
+                        else:
+                            win_row = common_params.blk_coord[1]
+                        tTR_rAcc[i] = (
+                            tTR_rAcc[i]
+                            if cute.elem_less(
+                                common_params.K
+                                - self.seq_len_q
+                                - self.window_left
+                                + win_row
+                                - 1,
+                                qk_col + self.mma_qk_tiler[1] * k_index,
+                            )
+                            else self.acc_dtype(-1.0e6)
+                        )
             # reduction for row_max
             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
         elif cutlass.const_expr(arch >= Arch.sm_103 and arch <= Arch.sm_103f):
@@ -3245,7 +3453,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             if apply_mask:
                 for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                     if cutlass.const_expr(self.is_causal):
-                        if cutlass.const_expr(self.fold_sq_factor > 1):
+                        if cutlass.const_expr(self.pack_q):
+                            q_tok = (
+                                common_params.blk_coord[1] * self.mma_qk_tiler[0]
+                                + common_params.blk_coord[0] * cta_m_rows
+                                + tTR_tS[i][0]
+                            ) // self.num_heads
+                        elif cutlass.const_expr(self.fold_sq_factor > 1):
                             q_tok = (
                                 common_params.blk_coord[1] * self.fold_sq_factor
                                 + (
@@ -3285,6 +3499,40 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         )
                         else self.acc_dtype(-1.0e6)
                     )
+                    if cutlass.const_expr(self.window_left >= 0):
+                        # Row q_tok's window opens at
+                        # K - seq_len_q - window_left + q_tok, so a key strictly
+                        # before that is out of view however the upper bound
+                        # was computed.
+                        if cutlass.const_expr(self.pack_q):
+                            win_row = (
+                                common_params.blk_coord[1] * self.mma_qk_tiler[0]
+                                + common_params.blk_coord[0] * cta_m_rows
+                                + tTR_tS[i][0]
+                            ) // self.num_heads
+                        elif cutlass.const_expr(self.fold_sq_factor > 1):
+                            win_row = (
+                                common_params.blk_coord[1] * self.fold_sq_factor
+                                + (
+                                    tTR_tS[i][0]
+                                    + common_params.blk_coord[0] * cta_m_rows
+                                )
+                                // self.num_heads
+                            )
+                        else:
+                            win_row = common_params.blk_coord[1]
+                        tTR_rAcc[i] = (
+                            tTR_rAcc[i]
+                            if cute.elem_less(
+                                common_params.K
+                                - self.seq_len_q
+                                - self.window_left
+                                + win_row
+                                - 1,
+                                tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
+                            )
+                            else self.acc_dtype(-1.0e6)
+                        )
                 # reduction for row_max after manual masking
                 row_max_new = tTR_rAcc.load().reduce(
                     cute.ReductionOp.MAX, row_max_new, 0

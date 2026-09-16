@@ -98,14 +98,6 @@ class TestAttentionBackendChoices(unittest.TestCase):
             ):
                 parser.parse_args(["--model", "x", flag, "bogus"])
 
-    def test_inline_detokenizer_flag_removed_from_cli(self):
-        parser = self._build_parser()
-        with (
-            contextlib.redirect_stderr(io.StringIO()),
-            self.assertRaises(SystemExit),
-        ):
-            parser.parse_args(["--model", "x", "--enable-inline-detokenizer"])
-
     def test_inline_detokenizer_is_forced_on(self):
         args = prepare_server_args(["--model", "x"])
         self.assertTrue(args.enable_inline_detokenizer)
@@ -279,7 +271,11 @@ class TestAttentionBackendChoices(unittest.TestCase):
             attention_backend=None,
             drafter_attention_backend=None,
             attn_tp_size=None,
-            mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=2, dp_size=1)),
+            mapping=SimpleNamespace(
+                attn=SimpleNamespace(
+                    tp_size=2, dp_size=1, dcp_size=1, dcp_rank=0, dcp_group=(0,)
+                )
+            ),
             kv_cache_dtype="auto",
             max_num_seqs=8,
             data_parallel_size=None,
@@ -293,10 +289,12 @@ class TestAttentionBackendChoices(unittest.TestCase):
             speculative_num_steps=3,
             speculative_num_draft_tokens=4,
             spec_context_pad=12,  # 3 overshoot spans * 4 draft tokens
+            skip_softmax_threshold=0.0,
         )
         model_config = SimpleNamespace(
             hf_config=SimpleNamespace(),
             context_len=4096,
+            num_attention_layers=2,
             num_attention_heads=16,
             num_key_value_heads=8,
             head_dim=128,
@@ -368,11 +366,10 @@ class TestDecodeHostL2(unittest.TestCase):
     def test_decode_enables_host_l2_without_prefix_matching(self):
         args = object.__new__(ServerArgs)
         args.disaggregation_mode = "decode"
+        args.decode_context_parallel_size = 1
         args.disable_kvstore = False
         args.enable_kvstore = False
         args.enable_prefix_caching = False
-        args.kvstore_storage_backend = None
-        args.kvstore_mem_layout = "layer_first"
         args.kvstore_io_backend = "kernel"
 
         args._handle_kvstore()

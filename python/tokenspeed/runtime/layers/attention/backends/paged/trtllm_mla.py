@@ -29,8 +29,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-import triton
-from tokenspeed_kernel.ops.attention.flashinfer import (
+from tokenspeed_kernel.ops.attention.mha.flashinfer import (
     trtllm_batch_decode_with_kv_cache_mla,
     trtllm_ragged_attention_deepseek,
 )
@@ -51,8 +50,10 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.triton import triton
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 # Block constraint from flashinfer: block_num % (128 / page_size) == 0
@@ -172,6 +173,12 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         self.chunked_prefill_metadata: TRTLLMMLAChunkedPrefillMetadata | None = None
 
     # ---- Metadata initialization ----
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        super()._publish_cache_pool(cache_pool)
+        self.forward_decode_metadata = None
+        self.forward_prefill_metadata = None
+        self.chunked_prefill_metadata = None
 
     def init_forward_metadata(
         self,

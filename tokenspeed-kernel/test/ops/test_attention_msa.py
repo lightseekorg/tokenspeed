@@ -9,12 +9,12 @@ import math
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention import (
+from tokenspeed_kernel.ops.attention.msa import (
     msa_decode_with_kvcache,
     msa_extend_with_kvcache,
 )
-from tokenspeed_kernel.ops.attention.triton.minimax_indexer import minimax_indexer
-from tokenspeed_kernel.ops.attention.triton.minimax_sparse_attention import (
+from tokenspeed_kernel.ops.attention.msa._triton.indexer import minimax_indexer
+from tokenspeed_kernel.ops.attention.msa.triton import (
     minimax_sparse_attention,
 )
 
@@ -559,9 +559,9 @@ def test_msa_fp8_kv_descale_matches_dequant_reference(phase: str) -> None:
 
 
 def _msa_cute_registered() -> bool:
-    import tokenspeed_kernel.ops.attention.msa as msa_mod
+    import tokenspeed_kernel.ops.attention.msa.cute_dsl as msa_cute_dsl
 
-    return hasattr(msa_mod, "msa_minimax_extend_with_kvcache")
+    return hasattr(msa_cute_dsl, "cute_dsl_minimax_msa_extend_with_kvcache")
 
 
 requires_msa_cute = pytest.mark.skipif(
@@ -672,7 +672,7 @@ def test_msa_cute_extend_matches_triton(kv_cache_dtype: torch.dtype) -> None:
         kwargs = _two_request_extend_case(kv_cache_dtype)
         # Each solution's indexer pass rewrites the same index_k_cache slots
         # with identical values, so back-to-back calls stay comparable.
-        out_cute = msa_extend_with_kvcache(solution="msa", **kwargs)
+        out_cute = msa_extend_with_kvcache(solution="cute_dsl", **kwargs)
         import cutlass.cute as cute
 
         # Importing MSA must preserve option-bound compilation for other users.
@@ -710,7 +710,7 @@ def test_msa_cute_extend_wins_selection_and_decode_stays_triton() -> None:
         extend = select_kernel(
             "attention", "msa_extend_with_kvcache", signature, traits=traits
         )
-        assert extend.name == "msa_minimax_extend_with_kvcache"
+        assert extend.name == "cute_dsl_minimax_msa_extend_with_kvcache"
         decode = select_kernel(
             "attention", "msa_decode_with_kvcache", signature, traits=traits
         )
@@ -733,7 +733,7 @@ def _cutedsl_decode_score_available() -> bool:
     if not current_platform().is_blackwell:
         return False
     try:
-        from tokenspeed_kernel.ops.attention.cute_dsl import (  # noqa: F401
+        from tokenspeed_kernel.ops.attention.msa._cute_dsl.decode_score import (  # noqa: F401
             minimax_index_decode_score,
         )
     except ImportError:
@@ -756,9 +756,9 @@ def _cutedsl_decode_score_available() -> bool:
 def test_cutedsl_decode_score_matches_triton(
     decode_query_len: int, seq_list: list[int]
 ) -> None:
-    import tokenspeed_kernel.ops.attention.triton.minimax_indexer as mi
+    import tokenspeed_kernel.ops.attention.msa._triton.indexer as mi
     import triton
-    from tokenspeed_kernel.ops.attention.cute_dsl.minimax_index_decode_score import (
+    from tokenspeed_kernel.ops.attention.msa._cute_dsl.decode_score import (
         decode_score_supported,
         minimax_index_decode_score,
     )
@@ -849,7 +849,7 @@ def test_cutedsl_decode_score_matches_triton(
     reason="CuteDSL index decode score requires SM100 and cutlass-dsl",
 )
 def test_cutedsl_decode_score_gates() -> None:
-    from tokenspeed_kernel.ops.attention.cute_dsl.minimax_index_decode_score import (
+    from tokenspeed_kernel.ops.attention.msa._cute_dsl.decode_score import (
         decode_score_supported,
     )
 
@@ -968,7 +968,7 @@ def _prefill_indexer_case(
 def test_fmha_prefill_score_matches_triton(
     qo_lens: list[int], kv_lens: list[int]
 ) -> None:
-    from tokenspeed_kernel.ops.attention import msa_score
+    from tokenspeed_kernel.ops.attention.msa import cuda as msa_score
 
     if not msa_score.ensure_prefill_score_ready(None):
         pytest.skip("fmha OnlyScore JIT compilation failed (nvcc unavailable?)")
@@ -991,7 +991,7 @@ def test_fmha_prefill_score_matches_triton(
 
 @requires_fmha_prefill_score
 def test_fmha_prefill_score_gates() -> None:
-    from tokenspeed_kernel.ops.attention.msa_score import prefill_score_supported
+    from tokenspeed_kernel.ops.attention.msa.cuda import prefill_score_supported
 
     device = "cuda"
     index_q = torch.randn(8, 4, 128, device=device, dtype=torch.bfloat16)
@@ -1006,3 +1006,89 @@ def test_fmha_prefill_score_gates() -> None:
     assert not prefill_score_supported(
         index_q, pages.to(torch.float8_e4m3fn), 16, 256, [8], [32000]
     )
+
+
+@requires_cuda
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_msa_sparse_kernels_skip_padded_selected_blocks(phase: str) -> None:
+    """The indexer pads slots it cannot fill with -1. The sparse kernels must
+    skip those slots instead of indexing the page table with -1: that reads
+    the previous row's last entry (or before the table), then a wrong page.
+    Request 0 is a decoy whose row points at a poisoned page (values 100.0),
+    so an unmasked -1 in request 1 drags its output towards 100.
+    """
+    torch.manual_seed(20260913)
+    prefill_len = 300
+    num_blocks = math.ceil(prefill_len / _BLOCK_SIZE)
+    poison_page = num_blocks + 1
+    key_cache = torch.randn(
+        poison_page + 1, 1, _BLOCK_SIZE, _HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    )
+    value_cache = torch.randn_like(key_cache)
+    key_cache[poison_page] = 0.0
+    value_cache[poison_page] = 100.0
+    block_table = torch.stack(
+        [
+            torch.full((num_blocks,), poison_page, dtype=torch.int32, device="cuda"),
+            torch.arange(1, num_blocks + 1, dtype=torch.int32, device="cuda"),
+        ]
+    )
+    if phase == "prefill":
+        # Request 0: one token over its poisoned block. Request 1: the real one.
+        positions = [0] + list(range(prefill_len))
+        cu_seqlens = torch.tensor(
+            [0, 1, 1 + prefill_len], dtype=torch.int32, device="cuda"
+        )
+        seq_lens = torch.tensor([1, prefill_len], dtype=torch.int32, device="cuda")
+    else:
+        positions = [0, prefill_len - 1]
+        seq_lens = torch.tensor([1, prefill_len], dtype=torch.int32, device="cuda")
+    query = torch.randn(
+        len(positions), 16, _HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    )
+    selected = torch.full(
+        (len(positions), 1, _TOPK), -1, dtype=torch.int32, device="cuda"
+    )
+    for row, position in enumerate(positions):
+        selected[row, 0, 0] = position // _BLOCK_SIZE  # own block only
+    if phase == "prefill":
+        selected[1 + 129 :, 0, 1] = 0  # a second valid block for some rows ...
+        selected[1 + 200 :, 0, 1] = -1  # ... and a padded slot inside the visible range
+        checked = (1 + 129, 1 + 200, len(positions) - 1)
+        output = minimax_sparse_attention(
+            query,
+            key_cache,
+            value_cache,
+            selected,
+            block_table,
+            seq_lens,
+            scale=_HEAD_DIM**-0.5,
+            cu_seqlens_q=cu_seqlens,
+            prefix_lens=torch.zeros(2, dtype=torch.int32, device="cuda"),
+            max_query_len=prefill_len,
+        )
+    else:
+        checked = (1,)  # slot 1 of request 1 is -1 with 3 visible blocks
+        output = minimax_sparse_attention(
+            query,
+            key_cache,
+            value_cache,
+            selected,
+            block_table,
+            seq_lens,
+            scale=_HEAD_DIM**-0.5,
+            decode_query_len=1,
+        )
+    torch.cuda.synchronize()
+    assert torch.isfinite(output.float()).all()
+    for row in checked:
+        blocks = selected[row, 0]
+        expected = _reference_sparse_attention(
+            query[row],
+            key_cache,
+            value_cache,
+            blocks[blocks >= 0],
+            block_table[1],
+            positions[row],
+        )
+        torch.testing.assert_close(output[row].float(), expected, atol=2e-2, rtol=2e-2)

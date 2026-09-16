@@ -21,6 +21,7 @@
 #pragma once
 
 #include <algorithm>
+#include <concepts>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -32,6 +33,7 @@
 #include "core/token_container.h"
 #include "resource/allocator/req_pool_allocator.h"
 #include "scheduler/request_spec.h"
+#include "utils.h"
 
 namespace tokenspeed::fsm {
 
@@ -44,8 +46,10 @@ struct CacheProgress {
     std::uint64_t access_epoch{0};
     // Pending closed-prefix boundary; zero once published or when absent.
     std::int32_t promotion_boundary_tokens{0};
-    // Whether cache storage for the final state-checkpoint tail was reserved.
-    bool state_checkpoint_tail_reserved{false};
+    // Last aligned state boundary produced by scheduled local prefill. The
+    // ordered forward stream materializes it before subsequent publication.
+    // Decode must not advance this: verify commits only its accepted endpoint.
+    std::int32_t materialized_state_boundary_tokens{0};
 };
 
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,
@@ -76,129 +80,92 @@ private:
     std::int32_t prefix_granularity_{};
 };
 
-struct ForwardState {
-    ForwardState(TokenContainer* token_container, std::int32_t prefix_granularity,
-                 std::unique_ptr<ReqPoolIndex> req_pool_index, std::vector<BlockTable> block_tables,
-                 CacheProgress cache_progress)
-        : token_container_{token_container},
-          prefix_granularity_{prefix_granularity},
-          req_pool_index_{std::move(req_pool_index)},
-          block_tables_{std::move(block_tables)},
-          cache_progress_{std::move(cache_progress)} {}
-
-    ForwardState(const ForwardState&) = delete;
-    ForwardState& operator=(const ForwardState&) = delete;
-    ForwardState(ForwardState&&) noexcept = default;
-    ForwardState& operator=(ForwardState&&) noexcept = default;
-
-    TokenContainer* TokenContainerPtr() const { return token_container_; }
-    std::int32_t PrefixGranularity() const { return prefix_granularity_; }
-
-    std::unique_ptr<ReqPoolIndex> TakeRequestPoolIndex() && { return std::move(req_pool_index_); }
-    std::int32_t RequestPoolIndex() const { return req_pool_index_ ? req_pool_index_->slot_ : -1; }
-
-    std::vector<BlockTable>& BlockTables() { return block_tables_; }
-    const std::vector<BlockTable>& BlockTables() const { return block_tables_; }
-    std::vector<BlockTable> TakeBlockTables() && { return std::move(block_tables_); }
-
-    CacheProgress TakeCacheProgress() && { return std::move(cache_progress_); }
-    const CacheProgress& CacheProgressRef() const { return cache_progress_; }
-
+// Everything a page-holding state owns on the request's behalf: the KV
+// pages, the request-pool slot, the prefix-cache progress and the count of
+// forwards still out against those pages. Move-only, and moved as ONE
+// bundle: a transition hands it whole to exactly one successor state, or
+// returns the pages to the coordinator and lets the empty bundle die. There
+// is no third path, and no field that a transition could forget to carry.
+struct ForwardResources {
+    TokenContainer* token_container{};
+    std::int32_t prefix_granularity{};
+    std::unique_ptr<ReqPoolIndex> req_pool_index;
+    std::vector<BlockTable> block_tables;
+    CacheProgress cache_progress;
     // Forwards scheduled for this request whose results have not come back.
     // More than one is normal under the overlap schedule, which plans the
     // next step before committing the previous one.
     //
-    // It lives on the base, not on the states that happen to consume a
-    // result: a forward is out against the PAGES, and every forward state
-    // owns pages. A prefill chunk produces no ExtendResult, but its result
+    // It lives here, not on the states that happen to consume a result: a
+    // forward is out against the PAGES, and every page-holding state has
+    // this bundle. A prefill chunk produces no ExtendResult, but its result
     // still writes KV into this request's tables -- retract it mid-flight
     // and the write lands on pages someone else now owns.
-    std::int32_t ResultsInFlight() const { return results_in_flight_; }
-    void TrackScheduledForward() { ++results_in_flight_; }
-    void ResultLanded() { results_in_flight_ = std::max(0, results_in_flight_ - 1); }
-    // Carried across a state transition: a transition relabels the request,
-    // and the forwards already out do not care what it is called.
-    void CarryResultsInFlight(std::int32_t count) { results_in_flight_ = count; }
+    std::int32_t results_in_flight{0};
 
-protected:
-    TokenContainer* token_container_{};
-    std::int32_t prefix_granularity_{};
-
-private:
-    std::unique_ptr<ReqPoolIndex> req_pool_index_;
-    std::vector<BlockTable> block_tables_;
-    CacheProgress cache_progress_;
-    std::int32_t results_in_flight_{0};
+    std::int32_t RequestPoolIndex() const { return req_pool_index ? req_pool_index->slot_ : -1; }
+    void TrackScheduledForward() { ++results_in_flight; }
+    void ResultLanded() {
+        FatalCheck(results_in_flight > 0, "a forward result landed for a request with no forward in flight");
+        --results_in_flight;
+    }
+    void ExtendTokens(const std::vector<std::int32_t>& tokens) { token_container->Extend(tokens); }
 };
 
-struct Prefilling : public ForwardState {
-    Prefilling(TokenContainer* token_container, std::int32_t prefix_granularity,
-               std::unique_ptr<ReqPoolIndex> req_pool_index, TokenContainer::Window window,
-               std::int32_t reserve_num_tokens_in_next_schedule_event, std::vector<BlockTable> block_tables,
-               CacheProgress cache_progress)
-        : ForwardState(token_container, prefix_granularity, std::move(req_pool_index), std::move(block_tables),
-                       std::move(cache_progress)),
+template <typename State>
+concept HoldsForwardResources = requires(State& state) {
+    { state.resources } -> std::same_as<ForwardResources&>;
+};
+
+// A prefill window's model inputs; shared by every state that still
+// describes its prompt chunk.
+inline PrefillInfo MakePrefillInfo(const ForwardResources& resources, TokenContainer::Window window) {
+    return PrefillInfo{
+        .input_ids = resources.token_container->TokenSlice(window),
+        .shifted_input_ids = ComputeShiftedInputIds(resources.token_container, window),
+        .already_scheduled_len = window.begin,
+        .extend_len = window.size,
+    };
+}
+
+struct Prefilling {
+    Prefilling(ForwardResources resources, TokenContainer::Window window,
+               std::int32_t reserve_num_tokens_in_next_schedule_event)
+        : resources{std::move(resources)},
           window{window},
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event} {}
 
-    std::span<const std::int32_t> PrefillInputIds() const { return token_container_->TokenSlice(window); }
-    std::vector<std::int32_t> ShiftedInputIds() const { return ComputeShiftedInputIds(token_container_, window); }
-    PrefillInfo CurrentPrefillInfo() const {
-        return PrefillInfo{
-            .input_ids = PrefillInputIds(),
-            .shifted_input_ids = ShiftedInputIds(),
-            .already_scheduled_len = window.begin,
-            .extend_len = window.size,
-        };
-    }
-
+    PrefillInfo CurrentPrefillInfo() const { return MakePrefillInfo(resources, window); }
     std::int32_t ReserveNumTokensInNextScheduleEvent() const { return reserve_num_tokens_in_next_schedule_event_; }
-    // The final mamba state checkpoint's pages are already reserved, so this
-    // request's remaining prompt is capacity-safe.
-    bool TailCheckpointReserved() const { return CacheProgressRef().state_checkpoint_tail_reserved; }
 
+    ForwardResources resources;
     TokenContainer::Window window{};
 
 private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
 };
 
-struct PrefillDone : public ForwardState {
-    PrefillDone(TokenContainer* token_container, std::int32_t prefix_granularity,
-                std::unique_ptr<ReqPoolIndex> req_pool_index, TokenContainer::Window window,
-                std::int32_t reserve_num_tokens_in_next_schedule_event, std::vector<BlockTable> block_tables,
-                CacheProgress cache_progress)
-        : ForwardState(token_container, prefix_granularity, std::move(req_pool_index), std::move(block_tables),
-                       std::move(cache_progress)),
+struct PrefillDone {
+    PrefillDone(ForwardResources resources, TokenContainer::Window window,
+                std::int32_t reserve_num_tokens_in_next_schedule_event)
+        : resources{std::move(resources)},
           window{window},
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event} {}
 
+    PrefillInfo CurrentPrefillInfo() const { return MakePrefillInfo(resources, window); }
     std::int32_t ReserveNumTokensInNextScheduleEvent() const { return reserve_num_tokens_in_next_schedule_event_; }
+    void ExtendResultTokens(const std::vector<std::int32_t>& result_tokens) { resources.ExtendTokens(result_tokens); }
 
-    std::span<const std::int32_t> PrefillInputIds() const { return token_container_->TokenSlice(window); }
-    std::vector<std::int32_t> ShiftedInputIds() const { return ComputeShiftedInputIds(token_container_, window); }
-    PrefillInfo CurrentPrefillInfo() const {
-        return PrefillInfo{
-            .input_ids = PrefillInputIds(),
-            .shifted_input_ids = ShiftedInputIds(),
-            .already_scheduled_len = window.begin,
-            .extend_len = window.size,
-        };
-    }
-    void ExtendResultTokens(const std::vector<std::int32_t>& result_tokens) { token_container_->Extend(result_tokens); }
-
+    ForwardResources resources;
     TokenContainer::Window window{};
 
 private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
 };
 
-struct Decoding : public ForwardState {
-    Decoding(TokenContainer* token_container, std::int32_t prefix_granularity,
-             std::unique_ptr<ReqPoolIndex> req_pool_index, std::int32_t reserve_num_tokens_in_next_schedule_event,
-             std::vector<BlockTable> block_tables, CacheProgress cache_progress)
-        : ForwardState(token_container, prefix_granularity, std::move(req_pool_index), std::move(block_tables),
-                       std::move(cache_progress)),
+struct Decoding {
+    Decoding(ForwardResources resources, std::int32_t reserve_num_tokens_in_next_schedule_event)
+        : resources{std::move(resources)},
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event} {}
 
     std::int32_t ReserveNumTokensInNextScheduleEvent() const {
@@ -208,7 +175,9 @@ struct Decoding : public ForwardState {
     void SetReserveNumTokensInNextScheduleEvent(std::int32_t value) {
         reserve_num_tokens_in_next_schedule_event_ = value;
     }
-    void ExtendResultTokens(const std::vector<std::int32_t>& result_tokens) { token_container_->Extend(result_tokens); }
+    void ExtendResultTokens(const std::vector<std::int32_t>& result_tokens) { resources.ExtendTokens(result_tokens); }
+
+    ForwardResources resources;
 
 private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{-1};

@@ -25,12 +25,14 @@ Tile addressing, MXFP4 operand loads, and the scaled-MFMA op used by both
 production decode stages (``decode_stage1.py`` / ``decode_stage2.py``). They
 assume the intermediate rows are in (token, topk-slot) order, so no ragged
 metadata / scatter indices are consumed. ``situ_decode.py`` reuses the CDNA4
-scale-offset helper for its in-situ dequantization path.
+scale-offset helper and the compact scaled-upcast scale tile for its in-situ
+dequantization path.
 """
 
 from __future__ import annotations
 
 from tokenspeed_kernel_amd._triton import gl, gluon
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import MXFP4_BLOCK
 
 
 @gluon.jit
@@ -80,6 +82,63 @@ def _cdna4_swizzled_mxfp4_scale_offset(
         + n_mix.to(gl.int64)
     )
     return scale_expert_off + k_lin * stride_slin + n_block.to(gl.int64) * stride_snb
+
+
+# One v_cvt_scalef32_pk_bf16_fp4 converts eight packed FP4 values under a
+# single scale, so a lane must cover whole groups of that size.
+_SCALED_UPCAST_GROUP = 8
+
+
+@gluon.constexpr_function
+def _compact_mxfp4_scale_tile(expanded_layout, axis):
+    """Return the compact e8m0 scale tile for a CDNA4 scaled-upcast result.
+
+    ``gl.amd.cdna4.scaled_upcast`` takes a scale tensor whose extent along the
+    scaled axis merely has to divide the result's, so a lane can hold one scale
+    per ``v_cvt_scalef32_pk_bf16_fp4`` group instead of one per upcast element.
+    The op infers that operand's layout from the result's by folding away the
+    register bases the division makes redundant, which for a blocked result
+    layout is the same layout with a smaller ``size_per_thread`` on ``axis``.
+
+    A lane that already covers a whole 32-element MXFP4 block keeps one scale
+    per block, so the tile is exactly the block scales the tile needs. A lane
+    covering fewer elements keeps one scale per lane instead, and the lanes
+    within a block re-read its byte; that is still one load and one register
+    per lane rather than one per upcast element.
+
+    Args:
+        expanded_layout: ``gl.BlockedLayout`` of the scaled-upcast result tile.
+        axis: Scaled axis of the upcast, as passed to ``scaled_upcast``.
+
+    Returns:
+        A ``(layout, group)`` pair: the layout the compact scale tile must be
+        loaded in, and the number of result elements each of its entries
+        covers, so the caller can address one scale byte per ``group``
+        elements.
+
+    Raises:
+        ValueError: If a lane does not cover whole scaled-upcast groups along
+            ``axis``, which leaves a group without a single scale to apply.
+    """
+    per_lane = expanded_layout.size_per_thread[axis]
+    if per_lane % _SCALED_UPCAST_GROUP:
+        raise ValueError(
+            "scaled upcast needs every lane to cover whole "
+            f"{_SCALED_UPCAST_GROUP}-element groups along axis {axis}, but "
+            f"each lane covers {per_lane} elements"
+        )
+    group = min(per_lane, MXFP4_BLOCK)
+    size_per_thread = list(expanded_layout.size_per_thread)
+    size_per_thread[axis] = per_lane // group
+    return (
+        gl.BlockedLayout(
+            size_per_thread,
+            expanded_layout.threads_per_warp,
+            expanded_layout.warps_per_cta,
+            expanded_layout.order,
+        ),
+        group,
+    )
 
 
 @gluon.constexpr_function

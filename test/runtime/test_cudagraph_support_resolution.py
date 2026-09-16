@@ -110,13 +110,13 @@ class BackendDeclarationTest(_CudaGraphSupportCase):
 
     def test_qwen4_exp_declares_no_prefill_graph(self):
         try:
-            from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
-                Qwen4ExpMambaAttnBackend,
+            from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple import (
+                Qwen4ExpPLEBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs tokenspeed_kernel: {exc}")
-        self.assertFalse(Qwen4ExpMambaAttnBackend.cuda_graph_support.prefill_graph)
-        self.assertTrue(Qwen4ExpMambaAttnBackend.cuda_graph_support.decode_graph)
+        self.assertFalse(Qwen4ExpPLEBackend.cuda_graph_support.prefill_graph)
+        self.assertTrue(Qwen4ExpPLEBackend.cuda_graph_support.decode_graph)
 
     def test_declarations_are_class_attributes(self):
         # Rank-uniformity gate: support must not depend on per-rank instance
@@ -126,8 +126,12 @@ class BackendDeclarationTest(_CudaGraphSupportCase):
         for module_name, cls_name in (
             ("tokenspeed.runtime.layers.attention.backends.paged.dsa", "DSABackend"),
             (
-                "tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp",
-                "Qwen4ExpMambaAttnBackend",
+                "tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple",
+                "Qwen4ExpPLEBackend",
+            ),
+            (
+                "tokenspeed.runtime.layers.attention.backends.specific.qsa_indexer",
+                "QSAIndexerBackend",
             ),
         ):
             try:

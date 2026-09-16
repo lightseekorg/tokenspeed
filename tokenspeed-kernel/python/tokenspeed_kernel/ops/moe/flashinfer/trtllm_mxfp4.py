@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import logging
 import math
 
 import torch
@@ -32,8 +31,6 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
-
-logger = logging.getLogger(__name__)
 
 platform = current_platform()
 
@@ -84,57 +81,20 @@ def _reorder_w1w3_to_w3w1(x: torch.Tensor, dim: int = -2) -> torch.Tensor:
     return out.view(view_dtype) if view_dtype is not None else out
 
 
-def situ_moe_unavailable_reason() -> str | None:
-    """Report whether the flashinfer SiTU MoE runtime is usable in-process.
-
-    Importable on every platform so runtime callers need no vendor guards.
-
-    Returns:
-        None when the installed flashinfer exposes both SiTU routing entry
-        points used here; otherwise a human-readable reason, suitable for
-        surfacing in model-level configuration errors.
-    """
-    if not platform.is_nvidia:
-        return "flashinfer TRTLLM-Gen SiTU MoE requires an NVIDIA platform"
-    if _SITU_ACTIVATION_TYPE is None or _fi_fp4_routed_moe is None:
-        return (
-            "Kimi-K3 SiTU requires flashinfer with public and precomputed "
-            f"TRTLLM-Gen SiTU routing: {_situ_import_error}"
-        )
-    return None
-
-
 if platform.is_nvidia:
     from flashinfer import (
         mxfp8_quantize,
         nvfp4_block_scale_interleave,
         trtllm_fp4_block_scale_moe,
     )
+    from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices as maybe_get_cached_w3_w1_permute_indices,
     )
     from flashinfer.fused_moe.core import (
         get_w2_permute_indices_with_cache,
     )
-
-    # SiTU is native in flashinfer's TRTLLM-Gen MoE since PR #4180 (> 0.6.15);
-    # older builds lack the ActivationType.Situ member.
-    try:
-        from flashinfer.fused_moe import (
-            trtllm_fp4_block_scale_routed_moe as _fi_fp4_routed_moe,
-        )
-        from flashinfer.tllm_enums import ActivationType as _FiActivationType
-
-        _SITU_ACTIVATION_TYPE = getattr(_FiActivationType, "Situ", None)
-        _situ_import_error: ImportError | None = (
-            None
-            if _SITU_ACTIVATION_TYPE is not None
-            else ImportError("flashinfer build has no ActivationType.Situ")
-        )
-    except ImportError as exc:
-        _fi_fp4_routed_moe = None
-        _SITU_ACTIVATION_TYPE = None
-        _situ_import_error = exc
+    from flashinfer.tllm_enums import ActivationType
 
     def _get_device_permute_indices(
         x: torch.Tensor,
@@ -237,8 +197,6 @@ if platform.is_nvidia:
         *,
         situ: bool,
     ):
-        if situ and (reason := situ_moe_unavailable_reason()) is not None:
-            raise RuntimeError(reason)
         sf_block_size = 32
         num_experts = w.w13_weight.shape[0]
         ispp_padded = w.w13_weight.shape[1] // 2
@@ -449,15 +407,16 @@ if platform.is_nvidia:
             enable_pdl=enable_pdl,
         )[0]
 
-    def _call_mxfp4_situ_routed_moe(
+    def _call_mxfp4_routed_moe(
         w: torch.nn.Module,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         x: torch.Tensor,
         output: torch.Tensor | None,
         enable_pdl: bool,
-        hidden_states_scale: torch.Tensor | None = None,
-        do_finalize: bool = True,
+        hidden_states_scale: torch.Tensor | None,
+        do_finalize: bool,
+        activation_type: int,
     ):
         num_experts, local_experts, local_expert_offset = _local_expert_range(w)
         # FlashInfer's precomputed route is an unpacked (ids, weights) tuple.
@@ -466,20 +425,20 @@ if platform.is_nvidia:
             topk_ids.to(torch.int32).contiguous(),
             topk_weights.to(torch.bfloat16).contiguous(),
         )
-        result = _fi_fp4_routed_moe(
+        result = trtllm_fp4_block_scale_routed_moe(
             topk_ids=topk,
             routing_bias=None,
             hidden_states=x,
             hidden_states_scale=hidden_states_scale,
             gemm1_weights=w.w13_weight,
             gemm1_weights_scale=w.w13_weight_scale.view(torch.float8_e4m3fn),
-            gemm1_bias=None,
-            gemm1_alpha=w.gemm1_alpha,
-            gemm1_beta=w.gemm1_beta,
+            gemm1_bias=getattr(w, "w13_weight_bias", None),
+            gemm1_alpha=getattr(w, "gemm1_alpha", None),
+            gemm1_beta=getattr(w, "gemm1_beta", None),
             gemm1_clamp_limit=getattr(w, "gemm1_clamp_limit", None),
             gemm2_weights=w.w2_weight,
             gemm2_weights_scale=w.w2_weight_scale.view(torch.float8_e4m3fn),
-            gemm2_bias=None,
+            gemm2_bias=getattr(w, "w2_weight_bias", None),
             output1_scale_scalar=None,
             output1_scale_gate_scalar=None,
             output2_scale_scalar=None,
@@ -494,7 +453,7 @@ if platform.is_nvidia:
             routing_method_type=1,
             do_finalize=do_finalize,
             enable_pdl=enable_pdl,
-            activation_type=_SITU_ACTIVATION_TYPE,
+            activation_type=activation_type,
             tune_max_num_tokens=get_autotune_max_num_tokens(),
             output=output if do_finalize else None,
         )
@@ -519,7 +478,7 @@ if platform.is_nvidia:
         traits={
             "weight_dtype": frozenset({"mxfp4"}),
             "activation": frozenset({"silu", "swiglu"}),
-            "routing_mode": frozenset({"kernel_routing"}),
+            "routing_mode": frozenset({"kernel_routing", "precomputed_topk"}),
             "supports_deferred_finalize": frozenset({False}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
@@ -587,44 +546,27 @@ if platform.is_nvidia:
             x_quant.shape[0], h_dim, dtype=torch.bfloat16, device=x_quant.device
         )
 
-        result = _call_mxfp4_moe(w, router_logits, x_quant, x_scale, output, enable_pdl)
+        if (topk_weights is None) != (topk_ids is None):
+            raise ValueError("topk_weights and topk_ids must be supplied together")
+        if topk_ids is not None:
+            result = _call_mxfp4_routed_moe(
+                w,
+                topk_weights,
+                topk_ids,
+                x_quant,
+                output,
+                enable_pdl,
+                x_scale,
+                True,
+                ActivationType.Swiglu,
+            )
+        else:
+            result = _call_mxfp4_moe(
+                w, router_logits, x_quant, x_scale, output, enable_pdl
+            )
         if hidden_original != hidden_padded:
             result = result[:, :hidden_original].contiguous()
         return result
-
-    def _register_mxfp4_situ_kernel(function):
-        reason = situ_moe_unavailable_reason()
-        if reason is not None:
-            # Skipping is normal for deployments that do not serve Kimi-K3,
-            # but retain the reason for otherwise opaque selection failures.
-            logger.info("Kimi-K3 SiTU MoE kernel not registered: %s", reason)
-            return function
-        return register_kernel(
-            "moe",
-            "apply",
-            name="flashinfer_trtllm_mxfp4_situ_moe_apply",
-            solution="flashinfer_trtllm",
-            weight_preprocessor=flashinfer_trtllm_mxfp4_situ_moe_weights,
-            capability=CapabilityRequirement(
-                vendors=frozenset({"nvidia"}),
-                min_arch_version=ArchVersion(10, 0),
-                max_arch_version=ArchVersion(10, 3),
-            ),
-            signatures=format_signatures("x", "dense", {torch.bfloat16}),
-            traits={
-                "weight_dtype": frozenset({"mxfp4"}),
-                "activation": frozenset({"situ"}),
-                "routing_mode": frozenset({"kernel_routing", "precomputed_topk"}),
-                "supports_deferred_finalize": frozenset({True, False}),
-                "supports_ep": frozenset({True}),
-                "supports_all_to_all_ep": frozenset({False}),
-                "ispp_alignment": frozenset({1}),
-                # FlashInfer's SiTU cubins are MxFP4 x MxFP8 (w4a8) only.
-                "internal_activation_dtype": frozenset({"fp8"}),
-                "supports_bias": frozenset({False}),
-            },
-            priority=Priority.SPECIALIZED,
-        )(function)
 
     def _normalize_kernel_routing_deferred_result(result):
         gemm2_output, expert_weights, expanded_idx = result
@@ -638,7 +580,32 @@ if platform.is_nvidia:
             ]
         return gemm2_output, expert_weights, expanded_idx
 
-    @_register_mxfp4_situ_kernel
+    @register_kernel(
+        "moe",
+        "apply",
+        name="flashinfer_trtllm_mxfp4_situ_moe_apply",
+        solution="flashinfer_trtllm",
+        weight_preprocessor=flashinfer_trtllm_mxfp4_situ_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "weight_dtype": frozenset({"mxfp4"}),
+            "activation": frozenset({"situ"}),
+            "routing_mode": frozenset({"kernel_routing", "precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({True, False}),
+            "supports_ep": frozenset({True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ispp_alignment": frozenset({1}),
+            # FlashInfer's SiTU cubins are MxFP4 x MxFP8 (w4a8) only.
+            "internal_activation_dtype": frozenset({"fp8"}),
+            "supports_bias": frozenset({False}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
     def flashinfer_trtllm_mxfp4_situ_moe_apply(
         plan: dict,
         x: torch.Tensor,
@@ -711,7 +678,7 @@ if platform.is_nvidia:
                 )
 
         if use_precomputed_topk:
-            result = _call_mxfp4_situ_routed_moe(
+            result = _call_mxfp4_routed_moe(
                 w,
                 topk_weights,
                 topk_ids,
@@ -720,6 +687,7 @@ if platform.is_nvidia:
                 enable_pdl,
                 hidden_states_scale=hidden_states_scale,
                 do_finalize=do_finalize,
+                activation_type=ActivationType.Situ,
             )
             if not do_finalize:
                 return result
@@ -758,7 +726,7 @@ if platform.is_nvidia:
             routing_method_type=int(_routing_value(w, "routing_method_type", 2)),
             do_finalize=do_finalize,
             enable_pdl=enable_pdl,
-            activation_type=_SITU_ACTIVATION_TYPE,
+            activation_type=ActivationType.Situ,
             tune_max_num_tokens=get_autotune_max_num_tokens(),
             norm_topk_prob=_routing_value(w, "normalize_topk_weights", True),
             output=output if do_finalize else None,

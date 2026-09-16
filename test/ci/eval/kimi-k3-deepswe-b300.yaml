@@ -42,7 +42,6 @@ server:
     --disable-kvstore
     --disable-autotune
     --enable-allreduce-fusion
-    --enable-cache-report
     --enable-log-request-stats
     --enable-metrics
     --reasoning-parser kimi_k3

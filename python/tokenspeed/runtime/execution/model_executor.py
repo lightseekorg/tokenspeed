@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -41,6 +41,7 @@ from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
+from tokenspeed.runtime.engine.scheduler_utils import engram_context_len
 from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
@@ -59,6 +60,7 @@ from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     ModelExecutionResult,
+    NGramInputs,
 )
 from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.grammar.capturable_grammar import (
@@ -71,12 +73,17 @@ from tokenspeed.runtime.layers.attention.backends.base import (
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
 )
+from tokenspeed.runtime.layers.attention.configs.base import is_block_drafter
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     validate_scheduler_config,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
+    local_pages_by_group,
+)
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.paged_attention import (
-    validate_cache_group_ids,
+    bind_cache_groups,
+    check_block_drafter_storage,
 )
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.dp_sampling_config import (
@@ -84,7 +91,7 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
     setup_dp_sampling,
 )
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
-from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
+from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_context_length
@@ -122,7 +129,7 @@ def _resolve_prefill_graph_max_tokens(server_args) -> int:
     extend-shaped forward takes DeepEP's normal dispatch, whose per-expert
     receive counts come back to the host, and a host sync cannot be captured.
     """
-    if server_args.all2all_backend not in (None, "none"):
+    if server_args.all2all_backend == "deepep":
         return 0
     if server_args.prefill_graph_max_tokens is not None:
         return int(server_args.prefill_graph_max_tokens)
@@ -369,16 +376,28 @@ class ModelExecutor:
         spec_num_tokens = config.spec_num_tokens if config.spec_algo is not None else 1
         self.input_buffers = InputBuffers(
             max_bs=max_bs,
-            max_num_tokens=config.chunked_prefill_size,
+            max_num_tokens=max(
+                config.chunked_prefill_size, max_bs * config.output_length
+            ),
             state_write_padding_pool_index=config.max_req_pool_size,
             device=self.device,
         )
+        # Group-keyed zeroing requests carry scheduler (virtual) block IDs; this
+        # rank's position in the DCP group selects the pages it owns.
+        self._cache_dcp_rank = model_runner.mapping.attn.dcp_rank
+        ngram_context = engram_context_len(model_runner.model_config.hf_text_config)
+        if ngram_context and (config.pp_size != 1 or config.overlap_schedule_depth > 1):
+            raise NotImplementedError(
+                "Engram input history requires PP=1 and in-flight depth <= 1"
+            )
+        self.input_buffers.init_ngram_buffers(ngram_context)
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
             vocab_size=config.vocab_size,
             device=self.device,
             output_length=config.output_length,
         )
+        self.runtime_states.init_ngram_state(ngram_context)
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
             config.enable_nan_detection,
@@ -419,7 +438,6 @@ class ModelExecutor:
         )
 
         attn_backend.configure_runtime(
-            sliding_window_size=model_runner.sliding_window_size,
             cache_group_specs=tuple(token_to_kv_pool.arena.cache_group_specs),
             cache_group_page_counts=_cache_arena_attr(
                 token_to_kv_pool, "cache_group_page_counts", None
@@ -427,7 +445,6 @@ class ModelExecutor:
         )
         if draft_attn_backend is not None:
             draft_attn_backend.configure_runtime(
-                sliding_window_size=model_runner.sliding_window_size,
                 cache_group_specs=tuple(
                     _cache_arena_attr(draft_token_to_kv_pool, "cache_group_specs", ())
                 ),
@@ -436,15 +453,15 @@ class ModelExecutor:
                 ),
             )
 
-        validate_cache_group_ids(
-            model_runner.model,
-            token_to_kv_pool.arena.cache_group_specs,
-        )
+        # Storage is the plan's decision: stamp each attention layer's cache
+        # group from the pool and check the group retains what the layer's
+        # mask can see. A block drafter additionally borrows the target's
+        # full-history group -- it writes at the target's cache locations.
+        bind_cache_groups(model_runner.model, token_to_kv_pool)
         if draft_model_runner is not None and draft_token_to_kv_pool is not None:
-            validate_cache_group_ids(
-                draft_model_runner.model,
-                draft_token_to_kv_pool.arena.cache_group_specs,
-            )
+            bind_cache_groups(draft_model_runner.model, draft_token_to_kv_pool)
+            if is_block_drafter(config.spec_algo, is_draft=True):
+                check_block_drafter_storage(draft_model_runner.model, token_to_kv_pool)
 
         # Backend-declared CUDA-graph support, AND-composed over the target
         # and draft trees (the decode graph records the whole step, drafter
@@ -507,23 +524,6 @@ class ModelExecutor:
             graph_supported=graph_support.prefill_graph,
         )
 
-        self._autotune()
-
-        workspace_pool(self.device).freeze()
-
-        if not self.forward_step.disable:
-            # Capture must use the same bucket mapper as decode tuning.
-            with autotune(
-                tune_mode=False,
-                tuning_buckets=self._decode_autotune_buckets(
-                    tuple(self.forward_step.capture_bs)
-                ),
-                round_up=False,
-            ):
-                self.forward_step.capture()
-        if not self.prefill_graph.disable:
-            self.prefill_graph.capture(self.forward_step)
-
         # Encoder graphs are installed before KV-cache sizing and retained by
         # the model runner; preserve the executor-level handle for callers.
         self.encoder_graph_wrappers = getattr(
@@ -531,6 +531,14 @@ class ModelExecutor:
         )
 
         self.device_module = torch.get_device_module(self.device)
+        # Two streams, named once. `default_stream` is the forward thread's
+        # own: page zeroing runs here, and the cache ops take it by name for
+        # their fences and start events. `execution_stream` carries the model
+        # launches and the runtime-state writes. Dependencies between them are
+        # placed by the consumer: each forward waits on the default stream in
+        # its prologue; zeroing and write-back wait on the execution stream
+        # themselves.
+        self.default_stream = self.device_module.default_stream(self.device)
         self.execution_stream = self.device_module.Stream()
         # The data plane: every CUDA-touching operation after startup is
         # submitted here and runs in FIFO order on one thread. The event loop
@@ -552,9 +560,35 @@ class ModelExecutor:
             device=self.device,
         )
 
-        set_random_seed(48)
-
         logger.info("ModelExecutor initialized")
+
+    def capture_graphs(self) -> None:
+        """Tune the kernels, pin the workspace, then capture the graphs.
+
+        A step of its own, so the caller decides when the graph owners start
+        recording the pools' buffers. Construction has already read the pools
+        (validation, configure_runtime, bind_cache_groups and the runners'
+        init_cuda_graph_state), so a caller that rebinds between the two
+        re-runs those itself.
+        """
+        self._autotune()
+
+        workspace_pool(self.device).freeze()
+
+        if not self.forward_step.disable:
+            # Capture and replay share the exact decode bucket mapper.
+            with autotune(
+                tune_mode=False,
+                tuning_buckets=self._decode_autotune_buckets(
+                    tuple(self.forward_step.capture_bs)
+                ),
+                round_up=False,
+            ):
+                self.forward_step.capture()
+        if not self.prefill_graph.disable:
+            self.prefill_graph.capture(self.forward_step)
+            if self.drafter is not None:
+                self.drafter.capture_prefill_graph(self.forward_step.stream)
 
     def _decode_autotune_buckets(
         self,
@@ -634,6 +668,10 @@ class ModelExecutor:
             with torch.no_grad():
                 if num_tokens > 0:
                     with autotune(tune_mode=True, tuning_buckets=None, round_up=None):
+                        # Scrub borrowed Engram state before constructing warmup inputs.
+                        ib.fill_dummy_decode_buffers(
+                            batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
+                        )
                         ctx = self.prefill_graph.make_dummy_batch(num_tokens)
                         positions = (
                             ib.mrope_positions_buf[:, :num_tokens]
@@ -645,6 +683,7 @@ class ModelExecutor:
                                 ctx=ctx,
                                 input_ids=ib.input_ids_buf[:num_tokens],
                                 positions=positions,
+                                **ib.ngram_model_kwargs(num_tokens),
                             )
 
                 # Separate contexts avoid combining sizes with static
@@ -774,6 +813,7 @@ class ModelExecutor:
                 self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
                 positions,
                 pp_inbound=pp_inbound,
+                **self.input_buffers.ngram_model_kwargs(ctx.input_num_tokens),
             )
             return output
         # Prefill-graph replay when captured for this forward (the decode graph
@@ -794,6 +834,7 @@ class ModelExecutor:
             self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
             positions,
             multimodal_context=self._active_multimodal_context,
+            **self.input_buffers.ngram_model_kwargs(ctx.input_num_tokens),
         )
 
     def _apply_force_single_token_verify(
@@ -1013,11 +1054,11 @@ class ModelExecutor:
         input_lengths: torch.Tensor,
         num_extends: int,
     ):
-        """Write output tokens to future_input_map and update cache lengths.
+        """Advance accepted inputs and cache lengths together on execution_stream.
 
-        Must NOT be captured in CUDA graph — these writes are read by the
-        next iteration's batch prep on the default stream, so they need
-        explicit stream synchronization (see execute_forward_op).
+        Serving calls this after eager execution or graph replay. All writes
+        are tensor-only, including padding masks, so recording this update has
+        the same semantics. Callers must pass the state-write pool indices.
         """
         if self.drafter is None:
             # Without drafter, store output tokens for next round.
@@ -1039,6 +1080,29 @@ class ModelExecutor:
         else:
             deltas = torch.cat(
                 [input_lengths[:num_extends], accept_lengths[num_extends:]]
+            )
+        ib = self.input_buffers
+        live = req_pool_indices != ib.state_write_padding_pool_index
+        deltas = torch.where(live, deltas, 0)
+        tail = self.runtime_states.ngram_accepted_tokens
+        if tail is not None:
+            assert ib.ngram_previous_tokens_buf is not None
+            assert ib.ngram_token_mask_buf is not None
+            # A accepted inputs end at row A-1, NOT at the sampled bonus or
+            # the end of the proposed window. Masks retain raw OOV barriers
+            # after input_ids_buf has been clamped for the embedding lookup.
+            last_rows = (input_lengths.cumsum(0) - input_lengths + deltas - 1).clamp(
+                0, ib.max_num_tokens - 1
+            )
+            current = torch.where(
+                ib.ngram_token_mask_buf[last_rows], ib.input_ids_buf[last_rows], -1
+            )
+            accepted_tail = torch.cat(
+                [current[:, None], ib.ngram_previous_tokens_buf[last_rows, :-1]],
+                dim=1,
+            )
+            tail[req_pool_indices] = torch.where(
+                (deltas > 0)[:, None], accepted_tail, tail[req_pool_indices]
             )
         self.runtime_states.update_valid_cache_length(req_pool_indices, deltas)
 
@@ -1114,6 +1178,7 @@ class ModelExecutor:
             ctx,
             input_ids=empty,
             positions=empty,
+            **self.input_buffers.ngram_model_kwargs(0),
         )
 
         # If a drafter is active, its model also has MoE layers that issue
@@ -1152,10 +1217,28 @@ class ModelExecutor:
                     spec_step_idx=step_idx,
                 )
 
-    def zero_cache_pages(self, pages):
-        """Clear newly owned pages and return a CUDA completion event when needed."""
+    def zero_cache_pages(self, pages: Mapping[str, Sequence[int]] | Sequence[int]):
+        """Clear newly owned pages and return a CUDA completion event when needed.
+
+        Runs on ``default_stream``, ordered behind the forwards in flight on
+        ``execution_stream``: the pages' previous owner may still be writing
+        them. The plan's later work on the default stream (the load-backs'
+        start event, the remote prefill's fence) inherits the order; the next
+        forward's prologue waits on the default stream and so runs after the
+        zeroing.
+        """
         if not pages:
             return None
+        self.default_stream.wait_stream(self.execution_stream)
+
+        if isinstance(pages, Mapping):
+            # Group-keyed requests carry scheduler (virtual) IDs; pools and the
+            # arena only ever see this rank's local pages.
+            pages = local_pages_by_group(
+                pages,
+                contract=self._cache_runtime_contract,
+                rank=self._cache_dcp_rank,
+            )
 
         def sanitize(pool, pool_pages) -> bool:
             zero_new_blocks = getattr(pool, "zero_new_blocks", None)
@@ -1212,7 +1295,7 @@ class ModelExecutor:
         if torch.device(self.device).type not in {"cuda", "npu"}:
             return None
         done = self.device_module.Event()
-        done.record(self.device_module.current_stream(self.device))
+        done.record(self.default_stream)
         return done
 
     @nvtx_range("reset_valid_cache_length", color="orange")
@@ -1251,7 +1334,7 @@ class ModelExecutor:
 
     def _write_valid_cache_lengths(self, pool_indices, lengths) -> None:
         """Publish per-row valid cache lengths on the execution stream."""
-        self.execution_stream.wait_stream(self.device_module.current_stream())
+        self.execution_stream.wait_stream(self.default_stream)
         with self.device_module.stream(self.execution_stream):
             rows = torch.tensor(
                 pool_indices,
@@ -1275,6 +1358,8 @@ class ModelExecutor:
         grammar_inputs=None,
         multimodal_context=None,
         capture_next_input_ids: bool = False,
+        *,
+        ngram_inputs: NGramInputs | None,
     ) -> ModelExecutionResult:
         self._reset_valid_cache_length(forward_op)
         self.log_step += 1
@@ -1293,17 +1378,18 @@ class ModelExecutor:
         graph_padded_bs = 0
 
         with nvtx_range("pre_fill_setup", color="orange"):
-            # Wait for previous iteration's runtime state updates
-            # (future_input_map, valid_cache_lengths) on execution_stream to
-            # complete before reading them.
-            self.device_module.current_stream().wait_stream(self.execution_stream)
-            self.execution_stream.wait_stream(self.device_module.current_stream())
+            # Behind the default-stream work the plan enqueued ahead of this
+            # forward: the page zeroing, the retraction write-back's fence,
+            # the multimodal features. The runtime-state reads below need no
+            # cross-stream wait -- their writers ran on execution_stream too.
+            self.execution_stream.wait_stream(self.default_stream)
         with self.device_module.stream(self.execution_stream):
             bs = len(forward_op.request_ids)
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
             cache_metadata = None
             block_tables = {}
+            block_tables_cpu = {}
             if bs > 0:
                 # Validate and pack the per-group tables once for this batch.
                 cache_metadata = CacheBatchMetadata.from_forward_op(
@@ -1313,10 +1399,14 @@ class ModelExecutor:
                     num_requests=bs,
                 )
                 block_tables = dict(cache_metadata.tables(active_forward_op=forward_op))
+                block_tables_cpu = dict(
+                    cache_metadata.tables_cpu(active_forward_op=forward_op)
+                )
             decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
                 total_tokens=total_tokens,
+                ngram_inputs=ngram_inputs,
             )
             if self.drafter is not None and hasattr(
                 self.drafter, "prepare_request_state"
@@ -1476,6 +1566,7 @@ class ModelExecutor:
                             :num_extends
                         ],
                         block_tables=block_tables,
+                        block_tables_cpu=block_tables_cpu,
                     )
                     if timing_enabled:
                         forward_step_ms = (
@@ -1484,7 +1575,9 @@ class ModelExecutor:
 
                 # Update runtime state on execution_stream (NOT in the CUDA graph).
                 self._update_runtime_state(
-                    req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
+                    req_pool_indices=self.input_buffers.state_write_req_pool_indices_buf[
+                        :bs
+                    ],
                     output_tokens=output_tokens,
                     accept_lengths=output_lengths,
                     input_lengths=self.input_buffers.input_lengths_buf[:bs],

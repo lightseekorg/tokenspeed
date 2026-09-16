@@ -30,6 +30,7 @@ from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.configs.base import (
     AttnConfig,
     SoftmaxAttnConfig,
+    is_block_drafter,
     model_wide_kwargs,
     resolve_dtype,
 )
@@ -48,9 +49,9 @@ class MSAConfig(SoftmaxAttnConfig):
 
     full_attn_backend_name: str | None = None
 
-    # Compute-layer labels select dense versus sparse execution. Cache-layer
-    # labels (inherited layer_types) remain empty because every MiniMax layer
-    # retains full history.
+    # Compute-layer labels select dense versus sparse execution. The inherited
+    # cache_layer_types stay empty because every MiniMax layer retains full
+    # history.
     compute_layer_types: tuple[str, ...] = ()
     sparse_layer_ids: frozenset[int] = frozenset()
     sliding_window_tokens: None = None
@@ -79,8 +80,8 @@ class MSAConfig(SoftmaxAttnConfig):
         )
 
         kv_cache_dtype = server_args.kv_cache_dtype
-        draft_block_decode = bool(
-            is_draft and server_args.speculative_algorithm == "DFLASH"
+        draft_block_decode = is_block_drafter(
+            server_args.speculative_algorithm, is_draft
         )
         if draft_block_decode:
             kv_cache_dtype = "bfloat16"
@@ -106,7 +107,7 @@ class MSAConfig(SoftmaxAttnConfig):
             attn_tp_size=server_args.attn_tp_size or server_args.mapping.attn.tp_size,
             compute_layer_types=compute_layer_types,
             sparse_layer_ids=sparse_layer_ids,
-            layer_types=(),
+            cache_layer_types=(),
             sliding_window_tokens=None,
             index_head_dim=int(text_config.index_head_dim),
             index_n_heads=int(text_config.index_n_heads),

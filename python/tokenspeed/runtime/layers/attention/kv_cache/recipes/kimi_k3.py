@@ -301,7 +301,7 @@ class KimiK3Recipe(CacheRecipe):
         """Whether verify commits by replaying from one conv checkpoint row."""
         if self.server_args.speculative_algorithm is None:
             return False
-        from tokenspeed_kernel.ops.attention import (
+        from tokenspeed_kernel.ops.attention.kda import (
             kda_recurrent_layout,
             kda_replay_commit_supported,
         )
@@ -327,7 +327,7 @@ class KimiK3Recipe(CacheRecipe):
             heads, head_dim, _ = recurrent_shape
             # Replay starts from the committed convolution checkpoint and
             # reconstructs the accepted recurrent state.
-            from tokenspeed_kernel.ops.attention import (
+            from tokenspeed_kernel.ops.attention.kda import (
                 kda_batched_replay_uses_raw_gate,
             )
 
@@ -418,7 +418,15 @@ class KimiK3Recipe(CacheRecipe):
                     + protected_pages
                 )
             else:
-                # Snapshot state rolls between two pages per live request.
-                child_pages = 2 * max_live_requests
+                # A finishing off-page prefill holds its input snapshot and
+                # aligned checkpoint, plus the final tail AND banked decode
+                # growth. Overlap protects one more decode reservation. With
+                # ordinary decode this is four state blocks per live request.
+                growth_tokens = max(
+                    page_tokens, (1 + depth) * limits["decode_input_tokens"]
+                )
+                child_pages = max_live_requests * (
+                    2 + math.ceil((page_tokens - 1 + growth_tokens) / page_tokens)
+                )
             parents += math.ceil(child_pages / packing)
         return parents

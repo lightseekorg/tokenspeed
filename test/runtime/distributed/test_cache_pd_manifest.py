@@ -61,6 +61,16 @@ def _group_spec(
     retention: str = "full_history",
     sliding_window_tokens: int | None = None,
 ) -> CacheGroupSpec:
+    # A state group is one checkpoint per block; a history group is rows.
+    if family == "state":
+        return CacheGroupSpec(
+            group_id=group_id,
+            retention=retention,
+            sliding_window_tokens=sliding_window_tokens,
+            family=family,
+            transfer_policy=policy,
+            checkpoint_granularity=prefix_granularity,
+        )
     return CacheGroupSpec(
         group_id=group_id,
         retention=retention,
@@ -626,7 +636,7 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
     spec = classes[family](
         **common,
         **extras,
-        layer_types=(),
+        cache_layer_types=(),
     )
     config = AttnConfig(
         device="cpu",

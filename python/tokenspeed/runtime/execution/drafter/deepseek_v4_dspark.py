@@ -34,13 +34,18 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import (
     sample_dspark_block_greedy,
 )
+from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+from tokenspeed.runtime.utils.spec_block_geometry import validate_block_widths
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.model_runner import ModelRunner
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+
+
+logger = get_colorful_logger(__name__)
 
 
 def _dspark_decode_position_plan(
@@ -110,19 +115,13 @@ class DeepseekV4DSpark(BaseDrafter):
         self.draft_model = draft_model_runner.model
         self.model = self.draft_model.model
         self.block_size = int(self.model.block_size)
-        if int(spec_num_tokens) != self.block_size + 1:
-            raise ValueError(
-                "DSPARK verify width must equal checkpoint block_size + 1; "
-                f"got verify_width={spec_num_tokens}, block_size={self.block_size}."
-            )
-        if int(spec_num_steps) != self.block_size:
-            raise ValueError(
-                "DSPARK speculative steps must equal checkpoint block_size; "
-                f"got steps={spec_num_steps}, block_size={self.block_size}."
-            )
+        validate_block_widths(
+            "DSPARK", self.block_size, spec_num_steps, spec_num_tokens
+        )
         self.target_layer_ids = list(self.model.target_layer_ids)
         self.hidden_width = len(self.target_layer_ids) * int(self.model.hidden_size)
         self.idle_forward_steps = 1
+        self._prefill_graph: torch.cuda.CUDAGraph | None = None
         self._init_buffers()
 
     @staticmethod
@@ -190,7 +189,7 @@ class DeepseekV4DSpark(BaseDrafter):
 
     def wire_target(self, target_model) -> None:
         self.target_model = target_model
-        self.lm_head = target_model.lm_head
+        self.lm_head = self.draft_model.lm_head
         self.tp_group = target_model.logits_processor.tp_group
         if not hasattr(target_model, "set_dspark_layers_to_capture"):
             raise ValueError(
@@ -206,6 +205,12 @@ class DeepseekV4DSpark(BaseDrafter):
         num_extends: int,
     ) -> None:
         """Refresh request-to-window slots outside CUDA Graph replay."""
+
+        if hasattr(self, "lm_head"):
+            self.model.refresh_local_base_logits_head(
+                self.lm_head.weight,
+                force=False,
+            )
 
         if len(request_ids) != len(request_pool_indices):
             raise ValueError("DSPARK request IDs and pool indices must align.")
@@ -250,6 +255,13 @@ class DeepseekV4DSpark(BaseDrafter):
         if active_bs < self.input_buffers.max_bs:
             self.slot_indices_buf[active_bs:].copy_(self.padding_slots[active_bs:])
 
+    def on_target_weights_updated(self) -> None:
+        """Refresh target-derived weights after an in-place target reload."""
+        self.model.refresh_local_base_logits_head(
+            self.lm_head.weight,
+            force=True,
+        )
+
     @staticmethod
     def _bonus_tokens_from_output(
         output_tokens: torch.Tensor,
@@ -276,6 +288,57 @@ class DeepseekV4DSpark(BaseDrafter):
             )
             out[num_extends:].copy_(output_tokens[offsets + accepted - 1])
         return out
+
+    @torch.inference_mode()
+    def capture_prefill_graph(self, stream: torch.cuda.Stream) -> None:
+        """Capture one request's bounded context seeding in a private graph pool."""
+        window = int(self.model.window_size)
+        self._prefill_hidden = torch.zeros(
+            (1, window, self.hidden_width),
+            dtype=self.kv_windows.dtype,
+            device=self.device,
+        )
+        self._prefill_start = torch.zeros((1, 1), dtype=torch.int64, device=self.device)
+        self._prefill_length = torch.ones_like(self._prefill_start)
+        self._prefill_slot = torch.full(
+            (1,), self.first_padding_slot, dtype=torch.int64, device=self.device
+        )
+        self._prefill_offsets = torch.arange(window, device=self.device).unsqueeze(0)
+
+        def run_once():
+            valid = self._prefill_offsets < self._prefill_length
+            positions = self._prefill_start + self._prefill_offsets
+            # Padding keeps distinct ring columns and in-range RoPE positions.
+            # Repeating a valid column would race its masked write against a live one.
+            positions = torch.where(valid, positions, positions.remainder(window))
+            self.model.write_context_windows_batched(
+                self._prefill_hidden,
+                positions,
+                self._prefill_slot,
+                valid,
+                self.kv_windows,
+                self.first_padding_slot,
+            )
+            self.context_lengths[self._prefill_slot] = (
+                self._prefill_start + self._prefill_length
+            ).flatten()
+
+        stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                run_once()
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        # Own pool: target prefill and decode graphs must not recycle these
+        # intermediates, including any pointers memoized by quantized GEMMs.
+        with torch.cuda.graph(graph, stream=stream):
+            run_once()
+        graph.replay()
+        torch.cuda.synchronize(self.device)
+        self.kv_windows[self.first_padding_slot].zero_()
+        self.context_lengths[self.first_padding_slot].zero_()
+        self._prefill_graph = graph
+        logger.info("DSpark prefill CUDA graph captured (window=%d)", window)
 
     def _seed_prefill_windows(
         self,
@@ -319,22 +382,31 @@ class DeepseekV4DSpark(BaseDrafter):
             chunk_end = offset + chunk_len
             keep = min(int(self.model.window_size), chunk_len)
             kept_hidden = hidden_states[chunk_end - keep : chunk_end].unsqueeze(0)
-            positions, next_context_lengths = _dspark_prefill_position_plan(
-                self.input_buffers.positions_buf[
-                    chunk_end - keep : chunk_end
-                ].unsqueeze(0)
-            )
+            positions = self.input_buffers.positions_buf[
+                chunk_end - keep : chunk_end
+            ].unsqueeze(0)
             slot = self.slot_indices_buf[row : row + 1]
-            valid = torch.ones_like(positions, dtype=torch.bool)
-            self.model.write_context_windows_batched(
-                kept_hidden,
-                positions,
-                slot,
-                valid,
-                self.kv_windows,
-                self.first_padding_slot,
-            )
-            self.context_lengths[slot] = next_context_lengths
+            if self._prefill_graph is None:
+                positions, next_context_lengths = _dspark_prefill_position_plan(
+                    positions
+                )
+                valid = torch.ones_like(positions, dtype=torch.bool)
+                self.model.write_context_windows_batched(
+                    kept_hidden,
+                    positions,
+                    slot,
+                    valid,
+                    self.kv_windows,
+                    self.first_padding_slot,
+                )
+                self.context_lengths[slot] = next_context_lengths
+            else:
+                self._prefill_hidden.zero_()
+                self._prefill_hidden[:, :keep].copy_(kept_hidden)
+                self._prefill_start.copy_(positions[:, :1])
+                self._prefill_length.fill_(keep)
+                self._prefill_slot.copy_(slot)
+                self._prefill_graph.replay()
             offset = chunk_end
         return offset
 
@@ -405,7 +477,7 @@ class DeepseekV4DSpark(BaseDrafter):
             slots,
             draft_ctx,
         )
-        local_logits = self.model.local_base_logits(draft_hidden, self.lm_head)
+        local_logits = self.model.local_base_logits(draft_hidden, None)
         sample_dspark_block_greedy(
             local_logits,
             bonus,

@@ -53,7 +53,7 @@ def _recipe(
         num_kv_heads=64,
         head_dim=256,
         attn_tp_size=tp_size,
-        layer_types=_TARGET_LAYER_TYPES,
+        cache_layer_types=_TARGET_LAYER_TYPES,
         kv_lora_rank=512,
         qk_nope_head_dim=256,
         qk_rope_head_dim=0,
@@ -91,7 +91,7 @@ def _recipe(
         replace(
             attn_config,
             is_draft=True,
-            components=(replace(dsa, layer_types=(FULL_ATTENTION,)),),
+            components=(replace(dsa, cache_layer_types=(FULL_ATTENTION,)),),
         )
         if draft_layers
         else None

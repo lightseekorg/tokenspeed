@@ -150,7 +150,7 @@ if _ARCH_SUPPORTED and _has_cluster_launch_support():
         import cutlass.cute as cute
         from cutlass._mlir.dialects import llvm
         from cutlass.cute.runtime import from_dlpack
-        from cutlass.cute.typing import Float32, Int32
+        from cutlass.cute.typing import Int32
         from cutlass.cutlass_dsl import T, dsl_user_op
         from tokenspeed_kernel.thirdparty.cute_dsl.argmax import (
             ArgmaxKernel,
@@ -351,7 +351,7 @@ def _register_cute_argmax(fn):
 
 
 @_register_cute_argmax
-def _argmax_cute(
+def cute_dsl_argmax(
     logits: torch.Tensor,
     *,
     out: torch.Tensor | None = None,
@@ -422,12 +422,10 @@ def _argmax_pair_cute(
     return out
 
 
-cute_dsl_argmax = _argmax_cute
-
 # Direct CuTe DSL module API. The common runtime-facing API lives in
 # tokenspeed_kernel.ops.sampling and selects among registered solutions.
 if _CUTE_AVAILABLE:
-    argmax = _argmax_cute
+    argmax = cute_dsl_argmax
     argmax_pair = _argmax_pair_cute
     _argmax_kernel_impl = _invoke_kernel
 else:

@@ -53,8 +53,7 @@ def make_config(
     cfg.cache_groups = [
         CacheGroupConfig(
             group_id="full_attention",
-            rows_per_page=prefix_granularity,
-            entry_stride_tokens=1,
+            block_granularity=prefix_granularity,
             total_pages=num_device_pages,
             retention=CacheRetention.FullHistory,
             family=CacheGroupFamily.History,

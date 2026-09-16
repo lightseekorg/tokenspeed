@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cache/core/block_pool.h"
@@ -52,11 +53,11 @@ CacheCoordinator MakeTwoGroup(BlockPool& pool) {
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 2},
     };
-    return MakeCoordinator(specs, 2, pool);
+    return MakeCoordinator(specs, 2, pool, /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
 }
 
 TEST(ForwardCacheOpsFree, ReturnsAllPagesToPool) {
-    BlockPool pool(/*num_lcm_blocks=*/32);
+    BlockPool pool(/*num_lcm_blocks=*/32, {1, 1});
     CacheCoordinator coordinator = MakeTwoGroup(pool);
     const std::int32_t free_before = pool.NumEmptyLcmBlocks();
 
@@ -68,51 +69,59 @@ TEST(ForwardCacheOpsFree, ReturnsAllPagesToPool) {
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before);
 }
 
-TEST(AlignPrefillChunkTest, StopsAtPromotionBoundary) {
-    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/16, /*unscheduled=*/24, /*token_budget=*/24,
-                                /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/32),
-              16);
+TEST(AlignPrefillChunkTest, RespectsBudgetPromotionAndFinalExtent) {
+    const struct {
+        const char* name;
+        std::int32_t first_pos;
+        std::int32_t unscheduled;
+        std::int32_t token_budget;
+        std::int32_t prefix_granularity;
+        std::int32_t promotion_boundary;
+        std::int32_t expected_tokens;
+    } cases[] = {
+        {"first chunk reaches promotion", 16, 24, 24, 4, 32, 16},
+        {"budget precedes promotion", 16, 24, 8, 4, 32, 8},
+        {"later chunk reaches promotion", 24, 16, 16, 4, 32, 8},
+        {"prompt ends before promotion", 24, 4, 16, 4, 32, 4},
+        {"promotion already reached", 32, 16, 10, 4, 32, 8},
+        {"final extent crosses checkpoint", 50432, 868, 868, 128, 0, 868},
+        {"budget truncates final extent", 50432, 868, 800, 128, 0, 768},
+        {"aligned final extent", 51200, 768, 868, 128, 0, 768},
+        {"final extent has no internal checkpoint", 51200, 100, 868, 128, 0, 100},
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.name);
+        EXPECT_EQ(
+            AlignPrefillChunk(c.first_pos, c.unscheduled, c.token_budget, c.prefix_granularity, c.promotion_boundary),
+            c.expected_tokens);
+    }
 }
 
-TEST(AlignPrefillChunkTest, KeepsFuturePromotionWhenBudgetFallsShort) {
-    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/16, /*unscheduled=*/24, /*token_budget=*/8,
-                                /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/32),
-              8);
+TEST(StateCheckpointMaterializationStartTest, SelectsLatestBoundaryOrEndpoint) {
+    const struct {
+        const char* name;
+        std::int32_t before_tokens;
+        std::int32_t after_tokens;
+        std::int32_t expected_start;
+    } cases[] = {
+        {"internal checkpoint and continuation", 50432, 51300, 51200},
+        {"continuation without internal checkpoint", 51200, 51300, 51300},
+        {"checkpoint coincides with endpoint", 50432, 51200, 51200},
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.name);
+        EXPECT_EQ(StateCheckpointMaterializationStart(c.before_tokens, c.after_tokens, /*prefix_granularity=*/128),
+                  c.expected_start);
+    }
 }
 
-TEST(AlignPrefillChunkTest, LaterChunkStopsAtPromotionBoundary) {
-    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/24, /*unscheduled=*/16, /*token_budget=*/16,
-                                /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/32),
-              8);
-}
-
-TEST(AlignPrefillChunkTest, EndpointBeforePromotionWins) {
-    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/24, /*unscheduled=*/4, /*token_budget=*/16,
-                                /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/32),
-              4);
-}
-
-TEST(AlignPrefillChunkTest, ReachedPromotionUsesOrdinaryPageAlignment) {
-    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/32, /*unscheduled=*/16, /*token_budget=*/10,
-                                /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/32),
-              8);
-}
-
-TEST(FinalAlignedTailTokensTest, FindsSubPageTailAfterAlignedBody) {
-    const std::optional<std::int32_t> tail =
-        FinalAlignedTailTokens(/*first_pos=*/16, /*unscheduled=*/11, /*token_budget=*/16,
-                               /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/0);
-    EXPECT_EQ(tail, 3);
-}
-
-TEST(FinalAlignedTailTokensTest, LeavesAStandaloneSubPageWhole) {
-    EXPECT_EQ(FinalAlignedTailTokens(/*first_pos=*/24, /*unscheduled=*/3, /*token_budget=*/16,
-                                     /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/0),
-              std::nullopt);
+TEST(SnapshotStateReserveTokensTest, CoversGrowthAndDecodeWidth) {
+    EXPECT_EQ(SnapshotStateReserveTokens(/*block_granularity=*/128, /*decode_tokens=*/1), 128);
+    EXPECT_EQ(SnapshotStateReserveTokens(/*block_granularity=*/2, /*decode_tokens=*/3), 3);
 }
 
 TEST(ForwardCacheOpsPrefill, FirstChunkAcquiresPagesForTokens) {
-    BlockPool pool(/*num_lcm_blocks=*/32);
+    BlockPool pool(/*num_lcm_blocks=*/32, {1, 1});
     CacheCoordinator coordinator = MakeTwoGroup(pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
@@ -122,7 +131,7 @@ TEST(ForwardCacheOpsPrefill, FirstChunkAcquiresPagesForTokens) {
 }
 
 TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
-    BlockPool pool(/*num_lcm_blocks=*/32);
+    BlockPool pool(/*num_lcm_blocks=*/32, {1, 1});
     // W=16: the SWA bounded match needs ceil((16-1)/2) = 8 > 4 contiguous pages,
     // so all 4 prefix pages stay real hits and nothing slides out of window.
     std::vector<CacheGroupSpec> specs{
@@ -133,7 +142,8 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
 
     // r1: 8 tokens -> 4 pages/group; freed blocks keep their hashes (prefix-hittable).
     std::vector<std::string> hashes8(4);
@@ -186,7 +196,7 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
 }
 
 TEST(ForwardCacheOpsPrefill, ChunkAcquiresAndCachesFullBlocks) {
-    BlockPool pool(/*num_lcm_blocks=*/32);
+    BlockPool pool(/*num_lcm_blocks=*/32, {1, 1});
     CacheCoordinator coordinator = MakeTwoGroup(pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
@@ -212,7 +222,7 @@ TEST(ForwardCacheOpsPrefill, ChunkAcquiresAndCachesFullBlocks) {
 // Register-before-punch: CacheFullBlocks skips holes, so punched pages' hashes
 // must be registered before the slide.
 TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
-    BlockPool pool(/*num_lcm_blocks=*/32);
+    BlockPool pool(/*num_lcm_blocks=*/32, {1, 1});
     CacheCoordinator coordinator = MakeTwoGroup(pool);  // page=2, W=4
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
@@ -256,7 +266,7 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
 
 // The first decode step (query at position P) only reads keys back to P - W + 1.
 TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowBeforeAcquire) {
-    BlockPool pool(/*num_lcm_blocks=*/32);
+    BlockPool pool(/*num_lcm_blocks=*/32, {1, 1});
     CacheCoordinator coordinator = MakeTwoGroup(pool);  // page=2, W=4
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
@@ -292,7 +302,7 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowBeforeAcquire) {
 }
 
 TEST(ForwardCacheOpsDecode, StepAcquiresAndSlidesSwaWindow) {
-    BlockPool pool(/*num_lcm_blocks=*/64);
+    BlockPool pool(/*num_lcm_blocks=*/64, {1, 1});
     CacheCoordinator coordinator = MakeTwoGroup(pool);  // swa window=4, prefix_granularity=2
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
@@ -320,12 +330,13 @@ TEST(ForwardCacheOpsDecode, StepAcquiresAndSlidesSwaWindow) {
 }
 
 TEST(ForwardCacheOpsDecode, DecodeStepRegistersFilledPages) {
-    BlockPool pool(/*num_lcm_blocks=*/32);
+    BlockPool pool(/*num_lcm_blocks=*/32, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
     // 8 tokens -> 4 full pages; pages 0-1 registered at prefill time.
@@ -356,7 +367,7 @@ TEST(ForwardCacheOpsDecode, DecodeStepRegistersFilledPages) {
 }
 
 TEST(ForwardCacheOpsDecode, AdmissionWithEmptyHashesOnlySlidesAndAllocates) {
-    BlockPool pool(/*num_lcm_blocks=*/32);
+    BlockPool pool(/*num_lcm_blocks=*/32, {1, 1});
     CacheCoordinator coordinator = MakeTwoGroup(pool);  // page=2, W=4
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/8));  // 4 pages/group
@@ -384,13 +395,11 @@ TEST(MakeSpecsFromConfigTest, TranslatesCacheGroups) {
     config.prefix_granularity = 16;
     CacheGroupConfig full_grp;
     full_grp.group_id = "full";
-    full_grp.rows_per_page = 16;
-    full_grp.entry_stride_tokens = 1;
+    full_grp.block_granularity = 16;
     full_grp.retention = CacheGroupConfig::Retention::FullHistory;
     CacheGroupConfig swa_grp;
     swa_grp.group_id = "swa";
-    swa_grp.rows_per_page = 16;
-    swa_grp.entry_stride_tokens = 1;
+    swa_grp.block_granularity = 16;
     swa_grp.retention = CacheGroupConfig::Retention::SlidingWindow;
     swa_grp.sliding_window_tokens = 128;
     config.cache_groups = {full_grp, swa_grp};
@@ -410,13 +419,11 @@ TEST(MakeSpecsFromConfigTest, StateFamilyMapsToMambaStateKind) {
     config.prefix_granularity = 4;
     CacheGroupConfig full_grp;
     full_grp.group_id = "full_attention";
-    full_grp.rows_per_page = 4;
-    full_grp.entry_stride_tokens = 1;
+    full_grp.block_granularity = 4;
     full_grp.retention = CacheGroupConfig::Retention::FullHistory;
     CacheGroupConfig state_grp;
     state_grp.group_id = "linear_attention";
-    state_grp.rows_per_page = 4;
-    state_grp.entry_stride_tokens = 1;
+    state_grp.block_granularity = 4;
     state_grp.family = CacheGroupFamily::State;
     config.cache_groups = {full_grp, state_grp};
 
@@ -433,13 +440,11 @@ TEST(MakeSpecsFromConfigTest, Qwen35Fp8UsesOneLogicalPAndPerGroupPacking) {
     config.prefix_granularity = 128;
     CacheGroupConfig full;
     full.group_id = "full";
-    full.rows_per_page = 128;
-    full.entry_stride_tokens = 1;
+    full.block_granularity = 128;
     full.cache_blocks_per_lcm_block = 16;
     CacheGroupConfig state0;
     state0.group_id = "state0";
-    state0.rows_per_page = 128;
-    state0.entry_stride_tokens = 1;
+    state0.block_granularity = 128;
     state0.family = CacheGroupFamily::State;
     CacheGroupConfig state1 = state0;
     state1.group_id = "state1";
@@ -461,13 +466,11 @@ TEST(MakeSpecsFromConfigTest, PreservesPerGroupCachePageTokens) {
     config.prefix_granularity = 256;
     CacheGroupConfig history;
     history.group_id = "history";
-    history.rows_per_page = 64;
-    history.entry_stride_tokens = 4;
+    history.block_granularity = 256;
     CacheGroupConfig state;
     state.group_id = "compressor_state";
     state.family = CacheGroupFamily::State;
-    state.rows_per_page = 4;
-    state.entry_stride_tokens = 1;
+    state.block_granularity = 4;
     config.cache_groups = {history, state};
 
     const std::vector<CacheGroupSpec> specs = MakeSpecsFromConfig(config);
@@ -487,8 +490,7 @@ SchedulerConfig MakeValidConfig() {
     config.max_batch_size = 8;
     CacheGroupConfig group;
     group.group_id = "full";
-    group.rows_per_page = 128;
-    group.entry_stride_tokens = 1;
+    group.block_granularity = 128;
     group.total_pages = config.device_allocator.total_pages;
     config.cache_groups = {group};
     return config;
@@ -524,9 +526,17 @@ TEST(SchedulerConfigValidateTest, RejectsNonPositivePerGroupPacking) {
     }
 }
 
+TEST(SchedulerConfigValidateTest, RejectsNonPositiveBlockGranularity) {
+    SchedulerConfig config = MakeValidConfig();
+    for (const std::int32_t block_granularity : {0, -1}) {
+        config.cache_groups[0].block_granularity = block_granularity;
+        ExpectRejectedNamingGroup(config, config.cache_groups[0].group_id);
+    }
+}
+
 TEST(SchedulerConfigValidateTest, RejectsBlockGranularityThatDoesNotDivideP) {
     SchedulerConfig config = MakeValidConfig();
-    config.cache_groups[0].rows_per_page = 48;
+    config.cache_groups[0].block_granularity = 48;
     ExpectRejectedNamingGroup(config, config.cache_groups[0].group_id);
 }
 
@@ -545,6 +555,21 @@ TEST(SchedulerConfigValidateTest, RejectsNonPositiveSlidingWindowWithGroupId) {
         config.cache_groups[0].sliding_window_tokens = window;
         ExpectRejectedNamingGroup(config, "nonpositive_window");
     }
+}
+
+TEST(SchedulerConfigValidateTest, RejectsSlidingWindowStateGroupWithGroupId) {
+    // A State group holds checkpoints, never a token window that could slide
+    // out; the same window declared as History is an ordinary SWA group.
+    SchedulerConfig config = MakeValidConfig();
+    CacheGroupConfig& group = config.cache_groups[0];
+    group.group_id = "sliding_state";
+    group.retention = CacheGroupConfig::Retention::SlidingWindow;
+    group.sliding_window_tokens = 256;
+    group.family = CacheGroupFamily::State;
+    ExpectRejectedNamingGroup(config, "sliding_state");
+
+    group.family = CacheGroupFamily::History;
+    EXPECT_NO_THROW(config.Validate());
 }
 
 TEST(SchedulerConfigValidateTest, RejectsSnapshotStateGroupBelowOneCacheBlock) {
@@ -583,8 +608,7 @@ TEST(SchedulerConfigValidateTest, RejectsPdTransferPolicyMismatch) {
 TEST(SchedulerConfigValidateTest, CacheGroupConfigRejectsNonPositivePacking) {
     CacheGroupConfig group;
     group.group_id = "full";
-    group.rows_per_page = 1;
-    group.entry_stride_tokens = 1;
+    group.block_granularity = 1;
     group.total_pages = 2;
 
     group.cache_blocks_per_lcm_block = 0;
@@ -595,7 +619,7 @@ TEST(SchedulerConfigValidateTest, CacheGroupConfigRejectsNonPositivePacking) {
 }
 
 TEST(ForwardCacheOpsBuildBlockTables, TwoGroupsRowsAndIds) {
-    BlockPool pool(/*num_lcm_blocks=*/32);
+    BlockPool pool(/*num_lcm_blocks=*/32, {1, 1});
     CacheCoordinator coordinator = MakeTwoGroup(pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     // 6 tokens, prefix_granularity 2 -> 3 pages per group.
@@ -620,7 +644,7 @@ TEST(ForwardCacheOpsBuildBlockTables, TwoGroupsRowsAndIds) {
 }
 
 TEST(ForwardCacheOpsBuildBlockTables, SwaRowGetsNullHoleAfterAdvance) {
-    BlockPool pool(/*num_lcm_blocks=*/32);
+    BlockPool pool(/*num_lcm_blocks=*/32, {1, 1});
     CacheCoordinator coordinator = MakeTwoGroup(pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     // Window = 4 tokens = 2 pages, so 8 tokens leave earlier pages out of window.
@@ -639,7 +663,7 @@ TEST(ForwardCacheOpsBuildBlockTables, SwaRowGetsNullHoleAfterAdvance) {
 }
 
 TEST(ForwardCacheOpsBuildBlockTables, FreshTablesProduceEmptyRows) {
-    BlockPool pool(/*num_lcm_blocks=*/32);
+    BlockPool pool(/*num_lcm_blocks=*/32, {1, 1});
     CacheCoordinator coordinator = MakeTwoGroup(pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
@@ -652,12 +676,13 @@ TEST(ForwardCacheOpsBuildBlockTables, FreshTablesProduceEmptyRows) {
 }
 
 TEST(ForwardCacheOpsBuildBlockTables, SingleGroupRowMatchesSource) {
-    BlockPool pool(/*num_lcm_blocks=*/32);
+    BlockPool pool(/*num_lcm_blocks=*/32, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));  // 2 pages
 
@@ -672,7 +697,7 @@ TEST(ForwardCacheOpsBuildBlockTables, SingleGroupRowMatchesSource) {
 }
 
 TEST(ForwardCacheOpsBuildBlockTables, KeyMatchesSuppliedGroupIdStrings) {
-    BlockPool pool(/*num_lcm_blocks=*/32);
+    BlockPool pool(/*num_lcm_blocks=*/32, {1, 1});
     CacheCoordinator coordinator = MakeTwoGroup(pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
@@ -688,11 +713,12 @@ TEST(ForwardCacheOpsBuildBlockTables, KeyMatchesSuppliedGroupIdStrings) {
 }
 
 TEST(ForwardCacheOpsBuildBlockTables, ChildSlotsWithinOneParentHaveDistinctKernelPageIds) {
-    BlockPool pool(/*num_lcm_blocks=*/4);
+    BlockPool pool(/*num_lcm_blocks=*/4, {2});
     const std::vector<CacheGroupSpec> specs{
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, pool, /*host_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
 
@@ -707,12 +733,13 @@ TEST(ForwardCacheOpsBuildBlockTables, ChildSlotsWithinOneParentHaveDistinctKerne
 }
 
 TEST(ForwardCacheOpsBuildBlockTables, ResolvesEachGroupsPackingRecipe) {
-    BlockPool pool(/*num_lcm_blocks=*/16);
+    BlockPool pool(/*num_lcm_blocks=*/16, {2, 1});
     const std::vector<CacheGroupSpec> specs{
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, pool, /*host_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
 

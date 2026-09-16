@@ -70,8 +70,17 @@ public:
     // thrash -- its readmission must take back exactly what the retraction
     // freed -- so the victim policy skips it. (An undeclared budget is
     // never covered: nothing was reserved for it.)
+    //
+    // Judged against the budget that was open AT ADMISSION, never the
+    // current one. The windows were sized then, and decode spends them
+    // exactly as fast as it shrinks RemainingNewTokens(), so holding them
+    // against today's remainder would count spent headroom as still held:
+    // a request that outgrew a partial reserve would look covered the
+    // moment its remainder dipped under the window, and once every
+    // resident request looked covered nothing could be retracted to free
+    // the next page.
     bool ReserveCoversGeneration(std::int32_t safe_steps) const {
-        return max_new_tokens_ > 0 && AdmissionHeadroom(safe_steps) >= RemainingNewTokens();
+        return max_new_tokens_ > 0 && safe_steps * (1 + retraction_count_) >= RemainingNewTokensAtAdmission();
     }
 
     // Tokens generated so far / still permitted. Both survive retraction's
@@ -81,6 +90,14 @@ public:
     std::int32_t GeneratedTokens() const { return std::max(0, TokenSize() - submitted_prompt_size_); }
     std::int32_t RemainingNewTokens() const { return std::max(0, max_new_tokens_ - GeneratedTokens()); }
     bool HasGeneratedOutput() const { return GeneratedTokens() > 0; }
+    // The budget that was still open when the current admission was granted.
+    // Rebasing is the only thing that moves the prefill window and every
+    // retraction rebases, so PrefillSize() minus the submitted prompt is
+    // exactly what had been generated at that admission -- frozen for its
+    // whole life, where RemainingNewTokens() shrinks with every decode.
+    std::int32_t RemainingNewTokensAtAdmission() const {
+        return std::max(0, max_new_tokens_ - (PrefillSize() - submitted_prompt_size_));
+    }
 
     template <typename Event>
     void Apply(Event&& event) {
@@ -94,9 +111,24 @@ public:
         return std::holds_alternative<State>(state_);
     }
 
+    template <typename... States>
+    bool IsAnyOf() const {
+        return (std::holds_alternative<States>(state_) || ...);
+    }
+
     template <typename State>
     const State* GetIf() const {
         return std::get_if<State>(&state_);
+    }
+
+    // True in every state that carries ForwardResources; Bootstrapping,
+    // Submitted, Retracted and Finished hold no pages.
+    bool HoldsPages() const {
+        return std::visit(Overloaded{
+                              [](const fsm::HoldsForwardResources auto&) { return true; },
+                              [](const auto&) { return false; },
+                          },
+                          state_);
     }
 
     // Forwards scheduled for this request whose results have not come back.
@@ -104,7 +136,7 @@ public:
     // (Submitted, Retracted, Finished) owe nothing by construction.
     std::int32_t ResultsInFlight() const {
         return std::visit(Overloaded{
-                              [](const std::derived_from<fsm::ForwardState> auto& s) { return s.ResultsInFlight(); },
+                              [](const fsm::HoldsForwardResources auto& s) { return s.resources.results_in_flight; },
                               [](const auto&) { return 0; },
                           },
                           state_);
@@ -112,7 +144,7 @@ public:
 
     void TrackScheduledForward() {
         std::visit(Overloaded{
-                       [](std::derived_from<fsm::ForwardState> auto& s) { s.TrackScheduledForward(); },
+                       [](fsm::HoldsForwardResources auto& s) { s.resources.TrackScheduledForward(); },
                        [](auto&) {},
                    },
                    state_);
@@ -120,7 +152,7 @@ public:
 
     void NoteResultLanded() {
         std::visit(Overloaded{
-                       [](std::derived_from<fsm::ForwardState> auto& s) { s.ResultLanded(); },
+                       [](fsm::HoldsForwardResources auto& s) { s.resources.ResultLanded(); },
                        [](auto&) {},
                    },
                    state_);
@@ -150,13 +182,18 @@ public:
                           state_);
     }
 
-    std::int32_t RequestPoolIndex() const { return forwardState("RequestPoolIndex").RequestPoolIndex(); }
+    std::int32_t RequestPoolIndex() const { return forwardResources("RequestPoolIndex").RequestPoolIndex(); }
 
-    const std::vector<BlockTable>& BlockTablesRef() const { return forwardState("BlockTablesRef").BlockTables(); }
+    const std::vector<BlockTable>& BlockTablesRef() const { return forwardResources("BlockTablesRef").block_tables; }
 
-    std::vector<BlockTable>& BlockTablesRef() { return forwardState("BlockTablesRef").BlockTables(); }
+    std::vector<BlockTable>& BlockTablesRef() { return forwardResources("BlockTablesRef").block_tables; }
 
-    fsm::CacheProgress CacheProgress() const { return forwardState("CacheProgress").CacheProgressRef(); }
+    fsm::CacheProgress CacheProgress() const { return forwardResources("CacheProgress").cache_progress; }
+    // Written by the scheduler when an admission succeeds, like the block
+    // tables the same admission fills: resources and progress land at
+    // admission time, and a state transition only moves them on.
+    fsm::CacheProgress& CacheProgressRef() { return forwardResources("CacheProgressRef").cache_progress; }
+    std::int32_t MaterializedStateBoundaryTokens() const;
 
     std::int32_t ReserveNumTokensInNextScheduleEvent() const {
         return std::visit(
@@ -189,8 +226,8 @@ public:
     }
 
 private:
-    fsm::ForwardState& forwardState(const char* operation);
-    const fsm::ForwardState& forwardState(const char* operation) const;
+    fsm::ForwardResources& forwardResources(const char* operation);
+    const fsm::ForwardResources& forwardResources(const char* operation) const;
 
     std::string id_;
     TokenContainer token_container_;

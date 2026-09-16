@@ -31,10 +31,10 @@ server:
     --gpu-memory-utilization 0.90
     --trust-remote-code
     --sampling-backend flashinfer
+    --grammar-backend xgrammar
     --disable-kvstore
     --kvstore-ratio 0.0
-    --no-enable-prefix-caching
-    --enable-cache-report
+    --disable-prefix-caching
     --host 127.0.0.1
     --port 8000
     --policy round_robin

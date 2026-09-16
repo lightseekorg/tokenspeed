@@ -108,31 +108,27 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<>())
         .def(
             "__init__",
-            [](tokenspeed::CacheGroupConfig* self, std::string group_id, std::int32_t rows_per_page,
-               std::int32_t entry_stride_tokens, std::int32_t total_pages,
-               tokenspeed::CacheGroupConfig::Retention retention, std::optional<std::int32_t> sliding_window_tokens,
-               tokenspeed::CacheGroupFamily family, std::int32_t cache_blocks_per_lcm_block,
-               tokenspeed::CacheTransferPolicy transfer_policy) {
-                new (self) tokenspeed::CacheGroupConfig{std::move(group_id),
-                                                        rows_per_page,
-                                                        entry_stride_tokens,
-                                                        total_pages,
-                                                        cache_blocks_per_lcm_block,
-                                                        retention,
-                                                        sliding_window_tokens,
-                                                        family,
-                                                        transfer_policy};
+            [](tokenspeed::CacheGroupConfig* self, std::string group_id, std::int32_t block_granularity,
+               std::int32_t total_pages, tokenspeed::CacheGroupConfig::Retention retention,
+               std::optional<std::int32_t> sliding_window_tokens, tokenspeed::CacheGroupFamily family,
+               std::int32_t cache_blocks_per_lcm_block, tokenspeed::CacheTransferPolicy transfer_policy,
+               std::int32_t shard_count) {
+                new (self) tokenspeed::CacheGroupConfig{
+                    std::move(group_id), block_granularity,     total_pages, cache_blocks_per_lcm_block,
+                    retention,           sliding_window_tokens, family,      transfer_policy,
+                    shard_count,
+                };
             },
-            nb::arg("group_id"), nb::arg("rows_per_page"), nb::arg("entry_stride_tokens"), nb::arg("total_pages"),
+            nb::arg("group_id"), nb::arg("block_granularity"), nb::arg("total_pages"),
             nb::arg("retention") = tokenspeed::CacheGroupConfig::Retention::FullHistory,
             nb::arg("sliding_window_tokens") = std::nullopt, nb::arg("family") = tokenspeed::CacheGroupFamily::History,
             nb::arg("cache_blocks_per_lcm_block") = 1,
-            nb::arg("transfer_policy") = tokenspeed::CacheTransferPolicy::Unspecified)
+            nb::arg("transfer_policy") = tokenspeed::CacheTransferPolicy::Unspecified, nb::arg("shard_count") = 1)
         .def_rw("group_id", &tokenspeed::CacheGroupConfig::group_id)
-        .def_rw("rows_per_page", &tokenspeed::CacheGroupConfig::rows_per_page)
-        .def_rw("entry_stride_tokens", &tokenspeed::CacheGroupConfig::entry_stride_tokens)
+        .def_rw("block_granularity", &tokenspeed::CacheGroupConfig::block_granularity)
         .def_rw("total_pages", &tokenspeed::CacheGroupConfig::total_pages)
         .def_rw("cache_blocks_per_lcm_block", &tokenspeed::CacheGroupConfig::cache_blocks_per_lcm_block)
+        .def_rw("shard_count", &tokenspeed::CacheGroupConfig::shard_count)
         .def_rw("retention", &tokenspeed::CacheGroupConfig::retention)
         .def_rw("sliding_window_tokens", &tokenspeed::CacheGroupConfig::sliding_window_tokens)
         .def_rw("family", &tokenspeed::CacheGroupConfig::family)
@@ -273,7 +269,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("op_ids", &tokenspeed::WriteBackBatch::op_ids)
         .def_ro("group_ids", &tokenspeed::WriteBackBatch::group_ids)
         .def_ro("src_pages", &tokenspeed::WriteBackBatch::src_pages)
-        .def_ro("dst_pages", &tokenspeed::WriteBackBatch::dst_pages);
+        .def_ro("dst_pages", &tokenspeed::WriteBackBatch::dst_pages)
+        .def_ro("source_pinned", &tokenspeed::WriteBackBatch::source_pinned);
 
     auto collect_forward = [](const tokenspeed::ExecutionPlan& plan) -> nb::list {
         nb::list result;
@@ -316,7 +313,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("pages_to_zero", &tokenspeed::ExecutionPlan::pages_to_zero);
 
     nb::class_<tokenspeed::Scheduler>(m, "Scheduler")
-        .def(nb::init<tokenspeed::SchedulerConfig>(), nb::arg("config") = tokenspeed::SchedulerConfig{})
+        .def(nb::init<tokenspeed::SchedulerConfig>(), nb::arg("config"))
         .def("submit_requests",
              nb::overload_cast<const std::vector<tokenspeed::RequestSpec>&>(&tokenspeed::Scheduler::SubmitRequests),
              nb::arg("request_specs"))
@@ -336,8 +333,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("decoding_size", &tokenspeed::Scheduler::DecodingSize)
         .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize)
         .def("pd_transfer_pinned", &tokenspeed::Scheduler::PdTransferPinned, nb::arg("request_id"))
-        .def("available_kv_pages", &tokenspeed::Scheduler::AvailableKvPages)
-        .def("active_kv_pages", &tokenspeed::Scheduler::ActiveKvPages)
+        .def("available_lcm_blocks", &tokenspeed::Scheduler::AvailableLcmBlocks)
+        .def("empty_lcm_blocks", &tokenspeed::Scheduler::EmptyLcmBlocks)
+        .def("active_lcm_blocks", &tokenspeed::Scheduler::ActiveLcmBlocks)
         .def("request_token_size", &tokenspeed::Scheduler::RequestTokenSize, nb::arg("id"))
         .def("max_single_request_tokens", &tokenspeed::Scheduler::MaxSingleRequestTokens)
         .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)

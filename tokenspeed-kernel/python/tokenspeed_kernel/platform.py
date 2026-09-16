@@ -21,22 +21,16 @@
 from __future__ import annotations
 
 import ctypes
-import json
 import logging
 import math
 import os
-import pickle
-import subprocess
+import site
 import sys
-import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
-from itertools import product
 from pathlib import Path
 
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +41,45 @@ __all__ = [
     "CapabilityRequirement",
     "Platform",
     "current_platform",
+    "prepare_cuda_toolkit_env",
 ]
+
+
+def prepare_cuda_toolkit_env() -> None:
+    """Expose a wheel-provided CUDA toolkit to extensions that require nvcc."""
+    site_paths = []
+    try:
+        site_paths.extend(site.getsitepackages())
+    except Exception:
+        pass
+    site_paths.extend(sys.path)
+
+    candidates = []
+    requested_cuda_home = os.environ.get("CUDA_HOME")
+    if requested_cuda_home:
+        candidates.append(Path(requested_cuda_home))
+    for base in site_paths:
+        candidates.extend(sorted((Path(base) / "nvidia").glob("cu*"), reverse=True))
+
+    for candidate in candidates:
+        candidate = candidate.expanduser().resolve()
+        if not (
+            (candidate / "include" / "cuda_runtime.h").exists()
+            and (candidate / "bin" / "nvcc").exists()
+        ):
+            continue
+
+        os.environ["CUDA_HOME"] = str(candidate)
+        _prepend_env_path("CPATH", candidate / "include")
+        _prepend_env_path("PATH", candidate / "bin")
+        return
+
+
+def _prepend_env_path(name: str, path: Path) -> None:
+    value = str(path)
+    entries = [entry for entry in os.environ.get(name, "").split(os.pathsep) if entry]
+    if value not in entries:
+        os.environ[name] = os.pathsep.join([value, *entries])
 
 
 def _npu_is_available() -> bool:

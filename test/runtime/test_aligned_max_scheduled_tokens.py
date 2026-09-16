@@ -1,8 +1,8 @@
 """aligned_max_scheduled_tokens (engine/scheduler_utils, applied in
 engine/event_loop before make_config).
 
-Recurrent-state cache groups (family=State, retention=FullHistory; the
-C++ ``final_state_manager`` criterion) register their snapshot only when a
+Recurrent-state cache groups (family=State; the C++ ``IsSnapshotStateGroup``
+criterion) register their snapshot only when a
 prefill chunk ends page-aligned (RegistersAlignedFinalPageOnly). The helper
 floors the scheduler's max_scheduled_tokens to the LCM of those groups' page
 grains so state pages can register and prefix-cache reuse stays live; the
@@ -41,8 +41,7 @@ def _group(
 ) -> CacheGroupConfig:
     kwargs = dict(
         group_id=group_id,
-        rows_per_page=page_size,
-        entry_stride_tokens=1,
+        block_granularity=page_size,
         total_pages=8,
         retention=retention,
         family=family,
@@ -96,19 +95,32 @@ class AlignedMaxScheduledTokensTest(unittest.TestCase):
         self.assertEqual(aligned_max_scheduled_tokens(8192, []), 8192)
         self.assertEqual(aligned_max_scheduled_tokens(8192, None), 8192)
 
-    def test_sliding_window_state_group_is_swa_not_snapshot(self):
-        # V4-style SWA KV rides State family with SlidingWindow retention; it
-        # is a dense window, not an aligned-final-page snapshot group.
+    def test_sliding_window_history_group_sets_no_grain(self):
+        # V4-style SWA KV is a History group with SlidingWindow retention: a
+        # dense window, not an aligned-final-page snapshot group.
         groups = [
             _group(
                 "v4.swa_kv",
-                CacheGroupFamily.State,
+                CacheGroupFamily.History,
                 CacheRetention.SlidingWindow,
                 page_size=1536,
                 sliding_window_tokens=1536,
             )
         ]
         self.assertEqual(aligned_max_scheduled_tokens(8192, groups), 8192)
+
+    def test_sliding_window_state_group_is_not_a_valid_config(self):
+        # The scheduler refuses the fourth (family, retention) combination at
+        # the bridge, so the helper never has to tell it apart from a snapshot.
+        group = _group(
+            "sliding_state",
+            CacheGroupFamily.State,
+            CacheRetention.SlidingWindow,
+            page_size=1536,
+            sliding_window_tokens=1536,
+        )
+        with self.assertRaisesRegex(ValueError, "History group"):
+            group.validate()
 
     def test_chunk_below_one_page_is_rejected(self):
         # Increasing the scheduler limit after executor buffers were sized

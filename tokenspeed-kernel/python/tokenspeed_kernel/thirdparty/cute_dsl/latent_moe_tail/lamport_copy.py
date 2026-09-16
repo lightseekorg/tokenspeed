@@ -14,6 +14,7 @@ import torch
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
 from .primitives import (
+    NEG_ZERO_F32_BITS,
     VEC_BF16,
     bf16x8_to_packed_u32x4,
     fragment_is_dirty,
@@ -36,7 +37,13 @@ class LamportCopy:
     """
 
     def __init__(
-        self, hidden_dim: int, ctas: int, threads: int, has_residual: bool = False
+        self,
+        hidden_dim: int,
+        ctas: int,
+        threads: int,
+        has_residual: bool = False,
+        *,
+        sentinel: int,
     ):
         # Bind in host Python; the JIT resolves names from self, not module globals.
         self.use_pdl = pdl_enabled()
@@ -44,6 +51,7 @@ class LamportCopy:
         self.ctas = ctas
         self.threads = threads
         self.has_residual = has_residual
+        self.sentinel = sentinel
 
     @cute.jit
     def __call__(
@@ -88,7 +96,7 @@ class LamportCopy:
                 assumed_align=16,
             )
             packed = load_global_u32x4(source, volatile=True)
-            while fragment_is_dirty(packed):
+            while fragment_is_dirty(packed, self.sentinel):
                 packed = load_global_u32x4(source, volatile=True)
 
             if cutlass.const_expr(self.has_residual):
@@ -126,10 +134,11 @@ class LamportCopy:
                 cute.AddressSpace.gmem,
                 assumed_align=16,
             )
-            store_lamport_sentinel_128(source)
+            store_lamport_sentinel_128(source, sentinel=self.sentinel)
             fragment = fragment + stride
 
 
+# functools.cache keys on the call shape, so every caller must pass these alike.
 @functools.cache
 def compile_kernel(
     hidden_dim: int,
@@ -138,6 +147,8 @@ def compile_kernel(
     threads: int,
     device_index: int,
     has_residual: bool = False,
+    *,
+    sentinel: int,
 ):
     if hidden_dim <= 0 or hidden_dim % VEC_BF16:
         raise ValueError("hidden_dim must be a positive multiple of 8")
@@ -162,7 +173,7 @@ def compile_kernel(
             assumed_align=16,
         )
         return cute.compile(
-            LamportCopy(hidden_dim, ctas, threads, has_residual),
+            LamportCopy(hidden_dim, ctas, threads, has_residual, sentinel=sentinel),
             mailbox,
             output,
             residual,
@@ -181,6 +192,7 @@ def launch(
     ctas: int,
     threads: int,
     residual: torch.Tensor | None = None,
+    sentinel: int,
 ) -> None:
     if not 1 <= m <= max_m:
         raise ValueError(f"runtime M={m} must be in [1, {max_m}]")
@@ -219,7 +231,13 @@ def launch(
     )
     residual_flat = local_output.flatten() if residual is None else residual.flatten()
     compile_kernel(
-        hidden_dim, max_m, ctas, threads, device_index, residual is not None
+        hidden_dim,
+        max_m,
+        ctas,
+        threads,
+        device_index,
+        has_residual=residual is not None,
+        sentinel=sentinel,
     )(
         to_cute(symmetric_mailbox.flatten(), 16),
         to_cute_dynamic_m(
@@ -247,15 +265,42 @@ class LamportCopyKernel:
         max_m: int,
         ctas: int,
         threads: int,
+        sentinel: int,
     ) -> None:
+        """Bind a gather to one mailbox.
+
+        Args:
+            hidden_dim: Width of a mailbox row.
+            max_m: Rows the mailbox holds.
+            ctas: Grid width of the gather.
+            threads: Block width of the gather.
+            sentinel: The empty word this mailbox is armed with. The arming
+                host code and this kernel must name the same one; the caller
+                that owns the mailbox owns the value.
+        """
         self.hidden_dim = hidden_dim
         self.max_m = max_m
         self.ctas = ctas
         self.threads = threads
+        self.sentinel = sentinel
         device_index = torch.accelerator.current_device_index()
-        compile_kernel(hidden_dim, max_m, ctas, threads, device_index)
         compile_kernel(
-            hidden_dim, max_m, ctas, threads, device_index, has_residual=True
+            hidden_dim,
+            max_m,
+            ctas,
+            threads,
+            device_index,
+            has_residual=False,
+            sentinel=sentinel,
+        )
+        compile_kernel(
+            hidden_dim,
+            max_m,
+            ctas,
+            threads,
+            device_index,
+            has_residual=True,
+            sentinel=sentinel,
         )
 
     def __call__(
@@ -284,5 +329,6 @@ class LamportCopyKernel:
                 ctas=self.ctas,
                 threads=self.threads,
                 residual=residual,
+                sentinel=self.sentinel,
             )
         return output
