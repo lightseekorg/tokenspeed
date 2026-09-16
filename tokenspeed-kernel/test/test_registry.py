@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import pytest
+import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import (
@@ -332,6 +333,11 @@ class TestKernelApiSpec:
         assert (
             api_specs["moe.apply"].warmup_config_type.__name__ == "MoeApplyWarmupConfig"
         )
+        assert (
+            api_specs["gemm.nvfp4_swiglu_quant"].public_api
+            is tokenspeed_kernel.nvfp4_gemm_swiglu_nvfp4_quant
+        )
+        assert api_specs["moe.apply"].public_api is tokenspeed_kernel.moe_apply
 
 
 class TestRegistryQueries:

@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
@@ -549,15 +550,18 @@ def describe_kernel(name: str) -> str:
 
 
 def load_builtin_kernels() -> None:
-    import sys
-
     if not KernelRegistry.get().list_kernels():
         # Registry was reset; clear cached ops modules so decorators re-run.
         for key in list(sys.modules.keys()):
             if key.startswith("tokenspeed_kernel.ops.") or key.startswith(
                 "tokenspeed_kernel.numerics.reference."
             ):
-                del sys.modules[key]
+                sys.modules.pop(key, None)
+        package = sys.modules.get("tokenspeed_kernel")
+        exports = getattr(package, "_exports", {})
+        if package is not None and isinstance(exports, dict):
+            for name in exports:
+                package.__dict__.pop(name, None)
     import tokenspeed_kernel.ops.attention  # noqa: F401
     import tokenspeed_kernel.ops.attention.dsa  # noqa: F401
     import tokenspeed_kernel.ops.attention.dsv4  # noqa: F401
