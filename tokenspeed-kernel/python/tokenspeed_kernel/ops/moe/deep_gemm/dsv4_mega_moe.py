@@ -52,8 +52,6 @@ if platform.is_blackwell:
         get_pdl,
         get_symm_buffer_for_mega_moe,
         set_pdl,
-        transform_sf_into_required_layout,
-        transform_weights_for_mega_moe,
     )
     from tokenspeed_kernel.ops._deep_gemm.mega_moe_bf16 import (
         prepare_mega_moe_bf16_jit,
@@ -80,12 +78,6 @@ class _DeepGemmMegaMoEState:
     device: torch.device
 
 
-def _ue8m0_to_float(scale: torch.Tensor) -> torch.Tensor:
-    if scale.dtype == torch.uint8:
-        return (scale.to(torch.int32) << 23).view(torch.float32)
-    return scale.float()
-
-
 def _expected_shapes(
     num_local_experts: int,
     hidden_size: int,
@@ -105,6 +97,62 @@ def _expected_shapes(
             intermediate_size // _MXFP4_BLOCK_SIZE,
         ),
     )
+
+
+def _interleave_gate_up_(weight: torch.Tensor, granularity: int) -> torch.Tensor:
+    """Interleave gate/up blocks in place with one-expert scratch space."""
+    squeeze_group_dim = weight.ndim == 2
+    if squeeze_group_dim:
+        weight = weight.unsqueeze(0)
+    groups, rows, *rest = weight.shape
+    half = rows // 2
+    blocks = half // granularity
+    for group in range(groups):
+        source = weight[group].clone().view(2, blocks, granularity, *rest)
+        weight[group].view(blocks, 2, granularity, *rest).copy_(source.transpose(0, 1))
+    return weight.squeeze(0) if squeeze_group_dim else weight
+
+
+def _pack_ue8m0_scale_(scale: torch.Tensor) -> torch.Tensor:
+    """Pack UE8M0 bytes into DeepGEMM's layout with one-expert scratch."""
+    squeeze_group_dim = scale.ndim == 2
+    if squeeze_group_dim:
+        scale = scale.unsqueeze(0)
+    groups, rows, columns = scale.shape
+    if columns % 4:
+        raise ValueError("MegaMoE UE8M0 scale columns must be divisible by four")
+    packed_columns = columns // 4
+    for group in range(groups):
+        source = scale[group].clone().view(rows, packed_columns, 4)
+        scale[group].view(packed_columns, rows, 4).copy_(source.permute(1, 0, 2))
+    packed = scale.view(torch.int32)
+    output = torch.as_strided(
+        packed,
+        size=(groups, rows, packed_columns),
+        stride=(rows * packed_columns, 1, rows),
+    )
+    return output.squeeze(0) if squeeze_group_dim else output
+
+
+def _reorder_scale_rows_(
+    scale: torch.Tensor, interleave_gate_up: bool, granularity: int
+) -> torch.Tensor:
+    """Apply MegaMoE gate/up and UTCCP row permutations in place."""
+    grouped = scale if scale.ndim == 3 else scale.unsqueeze(0)
+    groups, rows, packed_columns = grouped.shape
+    if rows % 128:
+        raise ValueError("MegaMoE scale rows must be divisible by 128")
+    for group in range(groups):
+        source = grouped[group].contiguous()
+        if interleave_gate_up:
+            half = rows // 2
+            blocks = half // granularity
+            source = source.view(2, blocks, granularity, packed_columns)
+            source = source.transpose(0, 1).reshape(rows, packed_columns)
+        source = source.view(-1, 4, 32, packed_columns)
+        source = source.transpose(1, 2).reshape(rows, packed_columns)
+        grouped[group].copy_(source)
+    return scale
 
 
 def _deep_gemm_dsv4_mega_moe_process_weights(
@@ -135,29 +183,17 @@ def _deep_gemm_dsv4_mega_moe_process_weights(
     if w13_weight.dtype != torch.uint8 or w2_weight.dtype != torch.uint8:
         raise ValueError("MegaMoE packed checkpoint weights must have dtype uint8")
 
-    w13_scale = transform_sf_into_required_layout(
-        sf=_ue8m0_to_float(w13_weight_scale).contiguous(),
-        mn=2 * intermediate_size,
-        k=hidden_size,
-        recipe=(1, _MXFP4_BLOCK_SIZE),
-        num_groups=num_local_experts,
-    )
-    w2_scale = transform_sf_into_required_layout(
-        sf=_ue8m0_to_float(w2_weight_scale).contiguous(),
-        mn=hidden_size,
-        k=intermediate_size,
-        recipe=(1, _MXFP4_BLOCK_SIZE),
-        num_groups=num_local_experts,
-    )
-    l1_weights, l2_weights = transform_weights_for_mega_moe(
-        (w13_weight.view(torch.int8).contiguous(), w13_scale),
-        (w2_weight.view(torch.int8).contiguous(), w2_scale),
-    )
-    # DeepGEMM may return the contiguous L2 input itself. Break that reference
-    # so callers can release all canonical checkpoint tensors after processing.
+    w13_weight = _interleave_gate_up_(w13_weight.view(torch.int8), 8)
+    w13_scale = _pack_ue8m0_scale_(w13_weight_scale)
+    w13_scale = _reorder_scale_rows_(w13_scale, True, 8)
+    w2_scale = _pack_ue8m0_scale_(w2_weight_scale)
+    w2_scale = _reorder_scale_rows_(w2_scale, False, 8)
+
+    # The opaque state takes ownership of the canonical tensor storage when the
+    # model drops its parameters after this callback returns.
     return _DeepGemmMegaMoEState(
-        l1_weights=l1_weights,
-        l2_weights=(l2_weights[0].clone(), l2_weights[1]),
+        l1_weights=(w13_weight, w13_scale),
+        l2_weights=(w2_weight.view(torch.int8), w2_scale),
         device=w13_weight.device,
     )
 
