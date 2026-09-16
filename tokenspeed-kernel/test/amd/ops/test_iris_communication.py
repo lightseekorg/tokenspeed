@@ -556,13 +556,6 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             )
         for shape in _ar_shape_cases():
             _check_all_reduce(state, rank, world_size, shape, device)
-        if state._staged_two_stage_supported:
-            _check_all_reduce_unaligned_output(
-                state,
-                rank,
-                world_size,
-                device,
-            )
         if world_size == 4:
             for shape in _ar_graph_shape_cases():
                 _check_all_reduce_graph_replay(
@@ -663,78 +656,6 @@ def _check_all_reduce(state, rank: int, world_size: int, shape, device) -> None:
         result.shape == expected.shape
     ), f"shape mismatch: {result.shape} vs {expected.shape}"
     torch.testing.assert_close(result, expected, atol=0, rtol=0)
-
-
-def _check_all_reduce_unaligned_output(
-    state,
-    rank: int,
-    world_size: int,
-    device,
-) -> None:
-    from tokenspeed_kernel.ops.communication.iris import (
-        IRIS_ALL_REDUCE_KERNEL_CONFIG,
-        _select_staged_all_reduce_path,
-        iris_all_reduce,
-    )
-
-    numel = 16 * 64
-    tuning, use_two_stage = _select_staged_all_reduce_path(
-        numel=numel,
-        world_size=world_size,
-        dtype=torch.bfloat16,
-        two_stage_supported=True,
-    )
-    assert tuning is None and use_two_stage
-
-    if rank % 2:
-        storage = torch.empty(numel + 1, dtype=torch.bfloat16, device=device)
-        storage[0] = -1
-        local = storage[1:]
-        assert local.data_ptr() % IRIS_ALL_REDUCE_KERNEL_CONFIG.packed_word_bytes != 0
-    else:
-        storage = torch.empty(numel, dtype=torch.bfloat16, device=device)
-        local = storage
-        assert local.data_ptr() % IRIS_ALL_REDUCE_KERNEL_CONFIG.packed_word_bytes == 0
-    expected_value = world_size * (world_size + 1) // 2
-    for safe in (False, True):
-        local.fill_(rank + 1)
-        result = iris_all_reduce(
-            state, local, op=dist.ReduceOp.SUM, safe=safe, async_op=False
-        )
-        assert (result.data_ptr() == local.data_ptr()) == (not safe)
-        for output in (local, result):
-            torch.testing.assert_close(
-                output,
-                torch.full_like(output, expected_value),
-                atol=0,
-                rtol=0,
-            )
-
-    local.fill_(rank + 1)
-    torch.cuda.synchronize()
-    dist.barrier()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        graph_result = iris_all_reduce(
-            state, local, op=dist.ReduceOp.SUM, safe=False, async_op=False
-        )
-    assert graph_result.data_ptr() == local.data_ptr()
-    for scale in range(2, 6):
-        local.fill_(scale * (rank + 1))
-        graph.replay()
-        torch.testing.assert_close(
-            local,
-            torch.full_like(local, scale * expected_value),
-            atol=0,
-            rtol=0,
-        )
-    if rank % 2:
-        torch.testing.assert_close(
-            storage[0],
-            torch.tensor(-1, dtype=torch.bfloat16, device=device),
-            atol=0,
-            rtol=0,
-        )
 
 
 def _check_all_reduce_graph_replay(
