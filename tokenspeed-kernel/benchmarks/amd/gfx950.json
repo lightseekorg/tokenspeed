@@ -6,7 +6,6 @@
     "arch": "9.5"
   },
   "timer": {
-    "calls_per_graph": 100,
     "eager_warmup_iterations": 5,
     "replay_warmup_iterations": 3,
     "measurement_blocks": 30
@@ -51,10 +50,7 @@
           "N": 1792,
           "K": 5120,
           "quant": "mxfp8",
-          "block_size": [
-            1,
-            32
-          ],
+          "block_size": [[1, 32]],
           "out_dtype": "bfloat16",
           "validation": {
             "runs": 1,
@@ -83,10 +79,7 @@
           "N": 4096,
           "K": 1280,
           "quant": "mxfp8",
-          "block_size": [
-            1,
-            32
-          ],
+          "block_size": [[1, 32]],
           "out_dtype": "bfloat16",
           "validation": {
             "runs": 1,
@@ -115,10 +108,7 @@
           "N": 5120,
           "K": 1024,
           "quant": "mxfp8",
-          "block_size": [
-            1,
-            32
-          ],
+          "block_size": [[1, 32]],
           "out_dtype": "bfloat16",
           "validation": {
             "runs": 1,
@@ -147,10 +137,7 @@
           "N": 1792,
           "K": 5120,
           "quant": "mxfp8",
-          "block_size": [
-            1,
-            32
-          ],
+          "block_size": [[1, 32]],
           "out_dtype": "bfloat16",
           "validation": {
             "runs": 1,
@@ -179,10 +166,7 @@
           "N": 4096,
           "K": 1280,
           "quant": "mxfp8",
-          "block_size": [
-            1,
-            32
-          ],
+          "block_size": [[1, 32]],
           "out_dtype": "bfloat16",
           "validation": {
             "runs": 1,
@@ -211,10 +195,7 @@
           "N": 5120,
           "K": 1024,
           "quant": "mxfp8",
-          "block_size": [
-            1,
-            32
-          ],
+          "block_size": [[1, 32]],
           "out_dtype": "bfloat16",
           "validation": {
             "runs": 1,
