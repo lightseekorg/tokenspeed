@@ -32,13 +32,10 @@ def test_intermediate_state_eviction_has_no_config_switch():
     assert config.disable_l2_cache is False
 
 
-def test_extend_result_gpu_accepted_count_is_bound():
+def test_extend_result_tokens_are_bound():
     result = ts.ForwardEvent.ExtendResult()
-    assert result.num_accepted_tokens == -1
     result.tokens = [10]
-    result.num_accepted_tokens = 4
     assert list(result.tokens) == [10]
-    assert result.num_accepted_tokens == 4
 
 
 def test_removed_storage_cache_api_is_not_exported():

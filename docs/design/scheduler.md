@@ -126,26 +126,18 @@ An aligned endpoint is itself the checkpoint; an extent crossing no boundary
 needs only its final output. Only materialized aligned checkpoints are cached;
 an off-boundary endpoint is never keyed as a complete prefix.
 
-`CacheProgress::materialized_state_boundaries` holds the aligned boundaries
-whose state is written but not yet hashed. Two events add to it, each at the
-moment it becomes true: admitting a prefill window records the checkpoint that
-window materializes (local prefill its latest internal aligned boundary; a
-remote landing only its endpoint, when aligned), and a landed result records
-its accepted endpoint, `TokenSize() - 1`, when aligned. Recording at landing
-rather than at the next admission matters under the overlap schedule, which
-plans a step before the previous one commits: two results can land back to
-back, and the second must not erase the first. Merely crossing a boundary adds
-nothing — speculative decode commits only its accepted endpoint.
+`CacheProgress::materialized_state_boundaries` records the aligned checkpoints
+produced by admitted prefill windows: local prefill records its last aligned
+boundary, and a remote landing records only an aligned endpoint. Publication
+uses the preceding window's record before the next prefill advances it.
+Admission, finish and retraction publish only recorded boundaries covered by
+the newly hashed range. A successful admission discards the covered records;
+a failed one leaves them for retry.
 
-Admission, finish and retraction hand the list to the coordinator, which
-publishes every recorded boundary inside the newly hashed range — several at
-once when results landed back to back. A successful admission then drops the
-boundaries its hashes covered; a failed one leaves them for the retry. The
-hashed range comes from the same `Request::NumComputedTokens()` that drives
-retention (§5): the frontier is exact under any verify width, so the page
-holding an aligned accepted endpoint is hashed — and its checkpoint published —
-at the very next admission, and the list normally holds at most the last
-landing and the checkpoint of the chunk in flight.
+Decode records and publishes no state checkpoints. The first decode admission
+still publishes prefill's completed boundary from `PrefillDone`. History
+publication and working-state retention use the exact
+`Request::NumComputedTokens()` frontier (§5).
 
 One forward means one model dispatch, not one kernel launch. The state backend
 handles checkpoint outputs within it: the example's recurrent scan evaluates
@@ -182,40 +174,35 @@ The capacity guarantees are retention-specific:
 #### State-cache cleanup
 
 An ordinary state Chunk is removed once the cache index is its only owner.
-Each request holds its latest complete Decode snapshot in protected slots of
-its original block tables. Cleanup runs when working or load-back references
-are released, and when a request releases an expired protected slot. It checks
-registration generations and does not depend on capacity pressure. Prefix reuse does not permanently
-exempt a Chunk from cleanup. Endpoint and Promoted keep their existing kinds;
-MLA/full-history and sliding-window cleanup and ordering are unchanged.
+Cleanup runs when working or load-back references are released. It checks
+registration generations and does not depend on capacity pressure. Prefix reuse
+does not permanently exempt a Chunk from cleanup. Endpoint and Promoted keep
+their existing kinds; MLA/full-history and sliding-window cleanup and ordering
+are unchanged.
 
-The last reusable Prefill boundary is Endpoint, including a boundary followed
-by a final tail shorter than the prefix granularity. Decode records its latest
-complete, actually written aligned endpoint without upgrading its kind or
-adding a separate reference holder. The coordinator validates every state
-group before changing any protected slot. It protects the new snapshot before
-releasing old slots that have already left the working window. Other expired
-slots continue to be reclaimed even if no new aligned snapshot appears.
-Each sharing request keeps its own table reference; only the last owner can
-make that ordinary Chunk eligible for cleanup. A protected latest cannot be
-capacity-evicted. Admission excludes its slot from both reclaim candidates and
-guaranteed-release credit, while retaining the original epoch, tier and position
-ordering without a separate state-first pass. Its shadow plan first credits ordinary
-Chunks that the same commit is guaranteed to release, so that cleanup does
+When prefill publishes its last reusable boundary, it marks it Endpoint,
+including a boundary followed by a final tail shorter than the prefix
+granularity. Reusing an existing Chunk followed by a tail that adds no new hash
+does not itself upgrade that entry. Decode keeps only the working state
+required by its current execution window, with no extra latest
+snapshot. It neither publishes aligned decode checkpoints nor pins an older
+checkpoint beyond that window. Each sharing request keeps its own table
+reference; only the last owner can make an ordinary Chunk eligible for cleanup.
+Admission retains the original epoch, tier and position ordering without a
+separate state-first pass. Its shadow plan first credits ordinary Chunks that
+the same commit is guaranteed to release, so that cleanup does
 not cause unnecessary eviction of other entries.
 
-Finish upgrades the newest complete resident snapshot valid for the returned
-prefix to Endpoint even if the last round added no hash. Without such a
-snapshot it creates no Endpoint. Retraction's existing best-effort L2 writeback
-selects and upgrades a complete recovery point. Both retain the selected
-boundary before clearing latest and freeing request ownership. Retraction
-without L2 does not add a new Endpoint publication path. Ordinary state Chunks,
-including latest, do not start L2 stores. Existing Host copies and in-flight
-transfer protection remain intact. Selection and publication use the raw
-accepted endpoint, separately from host-truncated output and the conservative
-admission frontier. Feedback packets containing Abort acknowledge the forward
-without publishing its new Decode snapshot. Abort clears latest and frees its
-ordinary state; earlier Endpoint/Promoted entries remain reusable.
+Finish may retain the newest complete resident prefill checkpoint as Endpoint,
+even if the last round added no hash. It does not publish decode state or create
+a decode Endpoint. Retraction's best-effort L2 writeback uses the same
+prefill-bounded selection before releasing request ownership. Recovery reuses
+an available checkpoint and recomputes the suffix, or recomputes from scratch
+when none remains. Local recovery follows ordinary prefill publication rules.
+Retraction without L2 adds no new Endpoint publication path. Ordinary state
+Chunks do not start L2 stores. Existing Host copies and in-flight transfer
+protection remain intact. Abort releases request state without publishing an
+endpoint; earlier Endpoint/Promoted entries remain reusable.
 
 KDA uses non-mixed batches. This policy does not change its kernel outputs or
 transfer fences. All request references remain in the original block tables,
@@ -355,8 +342,7 @@ request instead of accepting a request that can never produce a forward.
 
 Decode has a separate state peak: for verification width `W`, state block
 granularity `G`, and overlap protection `O` tokens, its working window needs at
-most `ceil((2W + O + G - 1) / G)` blocks. One older protected checkpoint can sit
-outside that window. Their combined bound is capped by the absolute table
+most `ceil((2W + O + G - 1) / G)` blocks. This bound is capped by the absolute table
 extent, `ceil((token_limit + W + O - 1) / G)`, including verification beyond
 the final output limit. The state-group budget takes the maximum of this
 Decode peak and the existing Prefill/remote-landing peaks, then converts it to
@@ -442,9 +428,8 @@ admission — which publishes the newly completed pages — and written back to
 the request only after it succeeds. A failed admission therefore leaves both
 untouched, and the retry re-derives the same completed pages and asks for
 their publication again. Committing progress before admission would record
-the pages as hashed while never publishing them. A landed result is the one
-other writer: it appends its accepted endpoint to the pending state
-checkpoints as evidence (§1.2), but advances no hash and consumes nothing.
+the pages as hashed while never publishing them. Landed results advance token
+progress but add no reusable state checkpoints (§1.2).
 The scheduling events carry nothing but the shape of the next state (chunk
 size, decode reserve). An intermediate prefill chunk produces no token but
 does write KV, so it reports back with an empty `ExtendResult`: the arrival

@@ -37,10 +37,6 @@ struct ExtendResult {
     // bootstrap token == tokens.back()). Empty otherwise. Carried here so
     // the remote-decode operation is self-contained, like every decode op.
     std::vector<std::int32_t> spec_candidate_ids;
-    // GPU-accepted token count, before host-side stop conditions truncate
-    // tokens. Runtime callers provide it explicitly; -1 supports legacy
-    // callers whose tokens already contain the complete accepted output.
-    std::int32_t num_accepted_tokens{-1};
 };
 
 struct Finish {

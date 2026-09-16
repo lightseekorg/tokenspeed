@@ -164,15 +164,14 @@ std::vector<std::int64_t> CapacityModel::SingleRequestGroupPages(std::int32_t to
             // With request TokenSize T, Decode reclaims below
             // floor((T - decode_width - 1) / block_granularity), while its
             // next verify reservation can reach T + decode_width - 1.
-            // Overlap retains one additional reservation. A latest checkpoint
-            // may remain as one older table slot outside this working window.
+            // Overlap retains one additional reservation.
             const std::int64_t decode_window_pages =
                 ceilDiv(2 * decode_width + protected_tokens + block_granularity - 1, block_granularity);
             // A short request cannot occupy more slots than its absolute
             // table extent, including the final verify window's overshoot.
             const std::int64_t decode_dense_pages = ceilDiv(
                 static_cast<std::int64_t>(token_limit) + decode_width + protected_tokens - 1, block_granularity);
-            child_pages = std::max(child_pages, std::min(decode_dense_pages, decode_window_pages + 1));
+            child_pages = std::max(child_pages, std::min(decode_dense_pages, decode_window_pages));
         }
         group_pages[i] = child_pages;
     }

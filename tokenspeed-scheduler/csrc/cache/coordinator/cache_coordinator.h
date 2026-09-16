@@ -112,11 +112,6 @@ public:
                     .ReclaimableBlockLocationsAt(group.Index(), table, groupExpiredBlocksAt(i, num_computed_tokens))
                     .empty();
     }
-    bool GroupProtectedStateNeedsReclaimAt(std::int32_t i, const BlockTable& table,
-                                           std::int32_t num_computed_tokens) const {
-        return GroupKind(i) == AttnKind::kMambaState && table.ProtectedSlot() >= table.ReclaimedPrefixBlocks() &&
-               table.ProtectedSlot() < std::min(groupExpiredBlocksAt(i, num_computed_tokens), table.NumBlocks());
-    }
     std::int32_t GroupBlocksReclaimableAt(std::int32_t i, const BlockTable& table, std::int32_t num_computed_tokens,
                                           bool count_uncached) const {
         const CacheGroup& group = groups_[static_cast<std::size_t>(i)];
@@ -241,15 +236,6 @@ public:
     // Returns a non-owning identity; adds no Device refs or access-epoch touch.
     std::optional<StateSnapshot> RetainLatestStateSnapshot(std::span<const std::string> prefix_hashes,
                                                            CacheBoundaryKind boundary_kind);
-    // Register complete state, then protect its existing table references.
-    // A failed update leaves the previous protected slots unchanged.
-    std::optional<StateSnapshot> PublishAndProtectStateSnapshot(std::span<BlockTable> tables,
-                                                                std::span<const std::string> prefix_hashes,
-                                                                std::int32_t boundary_tokens,
-                                                                std::uint64_t access_epoch,
-                                                                CacheBoundaryKind boundary_kind);
-    // Release previously protected slots only if their working window expired.
-    void ClearProtectedStateSnapshot(std::span<BlockTable> tables);
     void QueueStateSnapshotForStore(const StateSnapshot& snapshot);
     std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
@@ -319,12 +305,6 @@ private:
                                                       std::int32_t boundary_tokens) const;
     bool StateSnapshotIsCurrent(const StateSnapshot& snapshot) const;
     bool RetainStateSnapshot(const StateSnapshot& snapshot, CacheBoundaryKind boundary_kind);
-    std::optional<StateSnapshot> PublishStateSnapshot(std::span<BlockTable> tables,
-                                                      std::span<const std::string> prefix_hashes,
-                                                      std::int32_t boundary_tokens, std::uint64_t access_epoch,
-                                                      CacheBoundaryKind boundary_kind);
-    bool ProtectStateSnapshot(std::span<BlockTable> tables, const StateSnapshot& snapshot);
-    void setProtectedStateBoundary(std::span<BlockTable> tables, std::int32_t boundary_tokens);
     std::int32_t groupExpiredBlocksAt(std::int32_t i, std::int32_t num_computed_tokens) const {
         return geometry_[static_cast<std::size_t>(i)].ExpiredBlocksAt(groups_[static_cast<std::size_t>(i)].Spec(),
                                                                       num_computed_tokens);

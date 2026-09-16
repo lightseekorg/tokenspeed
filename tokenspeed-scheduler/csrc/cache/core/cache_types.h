@@ -159,9 +159,8 @@ struct CompletedPages {
     // endpoints to Host. Ordinary state chunks never stream. Decode leaves
     // this false; finish/retract explicitly persist retained endpoints.
     bool stream_completed_to_host{false};
-    // Exact snapshot provenance: aligned boundaries a prefill materialized or
-    // an accepted endpoint landed on, not yet hashed. Allocation and token
-    // progress are not proof; a boundary absent here is not published.
+    // Exact prefill checkpoint provenance. Allocation and token progress are
+    // not proof. An empty span disables state publication for this demand.
     std::span<const std::int32_t> materialized_state_boundaries{};
 };
 

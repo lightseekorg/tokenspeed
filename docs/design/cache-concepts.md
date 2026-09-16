@@ -214,61 +214,42 @@ input/output slots; compacting the row or publishing an unwritten intermediate
 checkpoint would break position identity.
 
 Publication requires provenance, not just an allocated block or completed hash.
-The request's cache progress keeps every aligned boundary whose state is
-written but not yet hashed: the checkpoint a scheduled prefill materializes
-(carried through the same ordered-forward contract as its token progress) and
-each accepted endpoint a landed result stops on. Verification commits only its
-accepted endpoint; a boundary it crosses proves nothing and is never recorded.
-Admission, finish and retraction pass the list to the coordinator, which
-publishes each recorded boundary inside the newly hashed range and no other —
-several in one admission when the overlap schedule lands two results back to
-back — before retention can reclaim the slot. Entries leave the list only after
-the admission that hashed them succeeds, so a failed attempt retries. The
-hashed range comes from `Request::NumComputedTokens()`, which is exact under
-any verify width ([Scheduler §5](scheduler.md#5-invariants-a-change-must-preserve)),
-so an aligned accepted endpoint is hashed by the very next admission rather
-than after a lag of up to the verify width. Remote endpoint-only landings do
-not claim an internal prefill checkpoint, only their endpoint when aligned.
+The request's cache progress records the aligned checkpoints produced by
+scheduled prefill. Admission, finish and retraction pass these boundaries to the
+coordinator, which publishes only those covered by the newly hashed range.
+A successful admission discards the covered boundaries; a failed admission
+leaves them for retry. Remote endpoint-only landings record only their endpoint
+when aligned, not an internal prefill checkpoint.
+
+Decode maintains working state but records and publishes no state checkpoints.
+The first decode admission still publishes the completed prefill boundary from
+`PrefillDone`. History-cache publication and working-state retention use the
+exact `Request::NumComputedTokens()` frontier under every verify width
+([Scheduler §5](scheduler.md#5-invariants-a-change-must-preserve)).
 
 State-cache retention uses the existing boundary order
 `kChunk < kEndpoint < kPromoted`. Registering or retaining an existing entry
 can only upgrade its kind; a prefix hit does not change it. Once an ordinary
-state Chunk has no request or transfer owners, it is actively removed. Each
-request keeps its latest complete Decode snapshot in the original state-table
-slots, whose existing references prevent eviction. This cleanup leaves Endpoint,
-Promoted and non-state groups unchanged; previous reuse alone is no exemption.
+state Chunk has no request or transfer owners, it is actively removed. This
+cleanup leaves Endpoint, Promoted and non-state groups unchanged; previous reuse
+alone is no exemption. Decode keeps no extra latest snapshot or protected table
+slot. Its expired working references follow normal reclaim, and finish releases
+the remaining request references.
 
-Each state table protects at most one slot for latest. Only an actual aligned
-accepted endpoint within the returned stable prefix can replace it, after the
-same boundary is validated in every state group. The snapshot identity remains
-non-owning; protection keeps the table's original reference rather than adding
-a separate holder. Request progress stores only the protected boundary token
-count, with zero meaning none; the coordinator uses full identities during
-validation. `num_accepted_tokens` is reported before host-side EOS,
-length or grammar truncation, so shortening the output cannot invent a state
-at an unwritten boundary. A missing or partial replacement leaves the old
-protected slots unchanged.
+Finish and recovery writeback may retain the newest complete resident prefill
+checkpoint as Endpoint, even when no new prefix hash was added. Their lookup is
+bounded by the request's prefill length. `RetainLatestStateSnapshot` validates
+the common boundary across state groups and upgrades it without adding references
+or touching its access epoch. Retraction resumes from an available checkpoint
+and recomputes the suffix; without one it recomputes from scratch. Recovery runs
+through ordinary prefill and may publish its own checkpoints.
 
-Reclaim advances its scanned prefix past the protected slot and releases other
-expired slots normally. Replacing or clearing protection explicitly releases
-the old slot if it is already behind that frontier; an old slot still in the
-working window waits for normal reclaim. Shared snapshots remain pinned by
-each request's own table. No global latest collection is needed. Finish retains
-the newest complete resident boundary as Endpoint before clearing protection,
-even when no new prefix hash was added. `RetainLatestStateSnapshot` selects and
-upgrades that boundary in one call, without adding references or touching its
-access epoch. Clearing a request frees all its table references, including the
-protected slots.
-
-State Chunks do not start L2 stores, including protected latest snapshots.
-Prefill's final reusable boundary, and the complete boundary selected at Finish
-or recovery writeback, become Endpoint
-before their store is queued. Pending stores recheck eligibility; existing Host
-entries and already-started transfers are unchanged. Internal `forward::Abort`
-creates no endpoint. A result followed by that event in the same feedback packet
-still acknowledges its forward, but its new state is not published for reuse.
-Ordinary client cancellation during local generation can instead send
-`forward::Finish`, retaining valid endpoints.
+State Chunks do not start L2 stores. Prefill's final reusable boundary and the
+complete prefill checkpoint selected at finish or recovery writeback become
+Endpoint before their store is queued. Pending stores recheck eligibility;
+existing Host entries and already-started transfers are unchanged. Internal
+`forward::Abort` creates no endpoint. Neither Abort nor Finish publishes newly
+generated decode state.
 
 Snapshot selection and slot addressing are distinct even within this mapping:
 the last internal reusable checkpoint is at
@@ -538,7 +519,7 @@ Perception rules per directory:
 it — no subclasses. It moves `CacheBlock`s between the `BlockPool` and
 `BlockTable`s (`Acquire`, `AppendHostExtension`, `Free`), resolves kernel
 page ids, and executes retention (`ReclaimExpired` punches expired slots to
-null holes, except the table's protected slot). It is deliberately token-free:
+null holes). It is deliberately token-free:
 every token quantity is
 converted to block counts before it reaches the manager.
 
@@ -646,10 +627,11 @@ Its responsibilities:
   Endpoint/Promoted state checkpoints; ordinary state Chunks stay on Device.
   The pending candidates are merged into a batched writeback. The first
   decode admission from `PrefillDone` applies the same
-  policy to the final prompt boundary. Ordinary decode still publishes Device
-  entries but does not stream full-attention or snapshot-state entries to
-  Host. At finish or retraction, all eligible Device-resident non-state pages
-  and only the newest complete Device-resident state snapshot are queued
+  policy to the final prompt boundary. Ordinary decode publishes history-cache
+  Device entries but no snapshot-state entries; full-attention pages do not
+  stream to Host during decode. At finish or retraction, all eligible
+  Device-resident non-state pages and only the newest complete Device-resident
+  prefill state checkpoint are queued
   before request ownership is released. Ordinary sliding-window entries
   always stream when published. The queue is drained by
   `TierTransferManager::StartPendingStores(guard)`: every store but a
@@ -660,13 +642,11 @@ Its responsibilities:
   `ClearDeviceCache`/`ClearCache`, and `NumNewlyReleasableLcmBlocks` for
   ranking retraction (preemption) victims. Working-reference releases and
   load-back ACKs collect affected state identities, drop their references,
-  and reconsider ordinary Chunks for active cleanup. Protecting a new complete
-  snapshot switches the retained table slots before releasing expired old
-  ones. Free clears both the table references and protection. The coordinator
-  stores no request pointers or extra Device references, and cleanup needs
-  no cache-wide scan, latest-record collection or persistent retirement set.
+  and reconsider ordinary Chunks for active cleanup. Free clears the table
+  references. The coordinator stores no request pointers or extra Device
+  references; cleanup needs no cache-wide scan or persistent retirement set.
   Active-page accounting and retract release estimates already visit all
-  non-empty table slots, including protected slots behind the reclaim frontier.
+  non-empty table slots.
 * **Mutation reporting.** `SetCacheMutationSink` reports per-group cache
   insertions/removals; the scheduler folds them into one externally visible
   prefix event. Whether a scheduler-level boundary is fully, partially or not
@@ -695,17 +675,12 @@ or exempt it from active cleanup. Unacquired non-closed Chunks are reclaimed
 from shorter boundaries first; closed prefixes are reclaimed from their
 suffixes. Non-state ordering and the original zero-epoch tie-break are unchanged.
 
-Protected table slots are excluded from request-reclaim candidates by the
-same rule used for actual release. They cannot count as guaranteed cleanup
-capacity. Other requests' protected slots retain their own references, so the
-ordinary index eligibility check excludes them too. The planner previews the
-Endpoint/Promoted kinds that this admission will publish. Pending upgrades use
-the same publication
-enumeration as commit and apply to the canonical entry when one exists, not a
+The planner previews the Endpoint/Promoted kinds that this admission will
+publish. Pending upgrades use the same publication enumeration as commit and
+apply to the canonical entry when one exists, not a
 second producer that registration will discard. The effective kind exists only
 in this plan; the stored `CacheBoundaryKind` and access epoch do not change.
-Unpinned Endpoint and Promoted entries remain capacity-evictable. Protecting a
-latest slot does not change its stored kind or the ordering of other entries.
+Unpinned Endpoint and Promoted entries remain capacity-evictable.
 
 Request-reclaimable candidates are collected and sorted once. Each cache group
 loads and sorts one eligible epoch at a time, skipping protected entries and
@@ -716,9 +691,9 @@ there is no persistent priority index.
 
 Before selecting capacity victims, the shadow plan counts ordinary state
 Chunks that this admission is guaranteed to release: only the expiring table
-slot and index may own them, and they must not be prefix hits, protected table
-slots or canonical targets of pending publications. This credit uses actual
-packed-parent occupancy; freeing one child does not imply an empty parent.
+slot and index may own them, and they must not be prefix hits or canonical
+targets of pending publications. This credit uses actual packed-parent
+occupancy; freeing one child does not imply an empty parent.
 It prevents unnecessary eviction of other entries without changing their
 relative order. Reverse pruning restores only additional capacity victims.
 Commit publishes the determined boundaries before releasing references and

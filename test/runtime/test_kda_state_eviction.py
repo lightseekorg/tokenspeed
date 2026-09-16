@@ -290,7 +290,6 @@ class _ScheduledKDA:
             request_id,
             tokens,
             None,
-            num_accepted_tokens=len(tokens),
         )
         self.scheduler.advance(ts.ExecutionEvent().add_event(event))
         self.computed[request_id] = end
@@ -364,40 +363,42 @@ def test_scheduler_eviction_reuses_state_blocks_without_changing_kda_or_resume()
     # capacity; physical reuse does not depend on a pressure-triggered sweep.
     assert all(active.reused_outputs[group] for group in KIMI_STATE_GROUPS)
 
-    boundary = 16 * _P
-    snapshots = None
-    snapshot_tables = None
+    boundary = 15 * _P
+    snapshot_tables = actual.tables
+    snapshots = active.snapshot(snapshot_tables, boundary)
     for _ in range(4):
         actual = active.step("source", source_streams)
         _assert_steps_match(actual, reference.step(actual.begin, actual.end))
-        if actual.end == boundary:
-            snapshots = active.snapshot(actual.tables, boundary)
-            snapshot_tables = actual.tables
-    assert snapshots is not None and snapshot_tables is not None
     for key, state in active.snapshot(snapshot_tables, boundary).items():
         assert torch.equal(
             state, snapshots[key]
-        ), "decode modified its aligned snapshot"
+        ), "decode modified the prefill checkpoint"
     active.finish("source")
 
-    # A new request must really hit the aligned Decode snapshot, not recompute
-    # the old prompt. Its suffix is different, so this also checks isolation.
-    resume_tokens = source_tokens[:boundary] + list(range(30_000, 30_009))
+    # Decode crossed token 16P, but reuse still starts at the prefill checkpoint.
+    # Recompute the remaining prompt and decode history with a different suffix.
+    shared_tokens = 16 * _P
+    resume_tokens = source_tokens[:shared_tokens] + list(range(30_000, 30_009))
     resume_streams = {}
     for layer in _LAYERS:
         suffix = active.kernel.token_stream(9)
         resume_streams[layer] = {
-            name: torch.cat([source_streams[layer][name][:boundary], values], dim=0)
+            name: torch.cat(
+                [source_streams[layer][name][:shared_tokens], values], dim=0
+            )
             for name, values in suffix.items()
         }
     # Recompute the prefix independently from zero; never seed the oracle
     # from the very cache snapshot whose correctness it must establish.
     reference = _NumericalReference(active.kernel, resume_streams)
     reference.step(0, boundary)
-    active.submit("resume", resume_tokens, boundary + 7)
+    active.submit("resume", resume_tokens, shared_tokens + 7)
     actual = active.step("resume", resume_streams)
     assert actual.begin == boundary
     _assert_steps_match(actual, reference.step(actual.begin, actual.end))
+    while active.computed["resume"] < shared_tokens + 7:
+        actual = active.step("resume", resume_streams)
+        _assert_steps_match(actual, reference.step(actual.begin, actual.end))
     actual = active.step("resume", resume_streams)
     _assert_steps_match(actual, reference.step(actual.begin, actual.end))
     for key, state in active.snapshot(snapshot_tables, boundary).items():

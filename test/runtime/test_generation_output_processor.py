@@ -118,14 +118,14 @@ def test_mixed_forward_updates_reserve_for_decode_slots_only():
     extend_events = [
         event for event in events if type(event).__name__ == "ExtendResult"
     ]
-    assert {event.request_id: event.num_accepted_tokens for event in extend_events} == {
-        "prefill": 1,
-        "decode": 1,
+    assert {event.request_id: list(event.tokens) for event in extend_events} == {
+        "prefill": [11],
+        "decode": [22],
     }
 
 
 @pytest.mark.parametrize("stop_reason", ["eos", "length", "grammar"])
-def test_truncated_decode_feedback_preserves_gpu_accepted_count(stop_reason):
+def test_truncated_decode_feedback_contains_only_visible_tokens(stop_reason):
     """Visible output may stop before the state committed by the GPU."""
     processor = OutputProcesser(
         _Sender(),
@@ -176,7 +176,6 @@ def test_truncated_decode_feedback_preserves_gpu_accepted_count(stop_reason):
     )
     assert [type(event).__name__ for event in events] == ["ExtendResult", "Finish"]
     assert list(events[0].tokens) == [11, 22]
-    assert events[0].num_accepted_tokens == 3
     assert "decode" not in processor.rid_to_state
     if stop_reason == "grammar":
         assert state.grammar.accepted == [11, 22]
@@ -304,7 +303,6 @@ def test_nan_flag_keeps_single_sanitized_token():
     extend_events = [e for e in events if type(e).__name__ == "ExtendResult"]
     assert len(extend_events) == 1
     assert list(extend_events[0].tokens) == [11]
-    assert extend_events[0].num_accepted_tokens == 3
     assert metrics.nan_aborts == 1
 
 
@@ -689,7 +687,6 @@ def test_intermediate_prefill_feedback_has_no_accepted_tokens(is_prefill_instanc
     # non-final prefill chunk; only the state-write ACK reaches the scheduler.
     assert [type(event).__name__ for event in events] == ["ExtendResult"]
     assert list(events[0].tokens) == []
-    assert events[0].num_accepted_tokens == 0
     assert state.computed_length == 4
     assert state.output_ids == []
     assert not state.finished
@@ -713,7 +710,6 @@ def test_prefill_final_chunk_folds_spec_candidates_into_the_extend_result():
     extend = next(e for e in events if type(e).__name__ == "ExtendResult")
     assert list(extend.tokens)[0] == 101
     assert list(extend.spec_candidate_ids) == [101, 102, 103]
-    assert extend.num_accepted_tokens == 1
 
 
 def test_prefill_extend_result_does_not_guess_from_next_input_ids():

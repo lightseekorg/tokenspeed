@@ -28,8 +28,6 @@
 #include <span>
 #include <stdexcept>
 #include <string>
-#include <string_view>
-#include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -376,24 +374,8 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
 }
 
 void Scheduler::Advance(const ExecutionEvent& event) {
-    // NaN feedback acknowledges its forward before Abort in the same packet.
-    // Do not publish that forward's state, but preserve its result accounting.
-    std::unordered_set<std::string_view> aborted_requests;
     for (const auto& item : event.Events()) {
-        if (const auto* aborted = std::get_if<forward::Abort>(&item)) {
-            aborted_requests.insert(aborted->request_id);
-        }
-    }
-    for (const auto& item : event.Events()) {
-        std::visit(
-            [this, &aborted_requests](const auto& inner) {
-                if constexpr (std::is_same_v<std::decay_t<decltype(inner)>, forward::ExtendResult>) {
-                    handleEvent(inner, !aborted_requests.contains(inner.request_id));
-                } else {
-                    handleEvent(inner);
-                }
-            },
-            item);
+        std::visit([this](const auto& inner) { handleEvent(inner); }, item);
     }
 }
 

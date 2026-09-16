@@ -110,8 +110,7 @@ bool canConsumeReservedTokensInPlace(const CacheCoordinator& coordinator, std::s
     for (std::int32_t i = 0; i < coordinator.NumGroups(); ++i) {
         const BlockTable& table = tables[static_cast<std::size_t>(i)];
         if (coordinator.GroupBlocksNeededFor(i, table, num_tokens) != 0 ||
-            coordinator.GroupHasReclaimableBlocksAt(i, table, num_computed_tokens) ||
-            coordinator.GroupProtectedStateNeedsReclaimAt(i, table, num_computed_tokens)) {
+            coordinator.GroupHasReclaimableBlocksAt(i, table, num_computed_tokens)) {
             return false;
         }
     }
@@ -460,44 +459,6 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
 }
 
-void Scheduler::updateDecodeStateSnapshot(Request& request, std::int32_t endpoint_tokens) {
-    if (!coordinator_.HasMambaStateGroup() || endpoint_tokens <= request.PrefillSize() ||
-        endpoint_tokens > request.TokenSize() - 1 || endpoint_tokens % coordinator_.PrefixGranularity() != 0) {
-        return;
-    }
-
-    const fsm::CacheProgress progress = request.CacheProgress();
-    if (progress.latest_decode_state_boundary_tokens >= endpoint_tokens) {
-        return;
-    }
-    // State commits follow the exact accepted endpoint. The ordinary history
-    // publication frontier is deliberately conservative under speculation,
-    // so compute these keys without advancing that frontier or publishing MLA.
-    std::vector<std::string> state_hashes = progress.prefix_hashes;
-    const std::int32_t num_prefix_pages = endpoint_tokens / coordinator_.PrefixGranularity();
-    if (static_cast<std::int32_t>(state_hashes.size()) > num_prefix_pages) {
-        state_hashes.resize(static_cast<std::size_t>(num_prefix_pages));
-    }
-    const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(state_hashes.size());
-    appendCompletedPrefixHashes(state_hashes, request.FullPrefixPages(true), num_prefix_pages);
-    std::vector<CacheKey> event_keys = registerKvEventPrefixPages(request, state_hashes, first_new_prefix_page);
-    std::optional<StateSnapshot> snapshot = coordinator_.PublishAndProtectStateSnapshot(
-        request.BlockTablesRef(), state_hashes, endpoint_tokens, progress.access_epoch, CacheBoundaryKind::kChunk);
-    discardUncachedKvEventPages(event_keys);
-    if (!snapshot) {
-        return;
-    }
-    request.SetLatestDecodeStateBoundary(snapshot->boundary_tokens);
-}
-
-void Scheduler::clearLatestDecodeState(Request& request) {
-    if (!request.HoldsPages()) {
-        return;
-    }
-    request.SetLatestDecodeStateBoundary(0);
-    coordinator_.ClearProtectedStateSnapshot(request.BlockTablesRef());
-}
-
 PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
                                                         std::vector<LoadBackOperation>& load_back_operations) {
     PrefillOperation operation = applyPrefillEvent(*request, event, coordinator_, cache_group_ids_);
@@ -615,9 +576,11 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
             coordinator_.CacheCompletedBlocks(victim.BlockTablesRef(), progress, cache_progress.access_epoch);
         }
         coordinator_.QueueCachedBlocksForStore(cache_progress.prefix_hashes);
-        // Upgrade the complete recovery boundary before selecting L2 stores.
-        if (auto snapshot =
-                coordinator_.RetainLatestStateSnapshot(cache_progress.prefix_hashes, CacheBoundaryKind::kEndpoint)) {
+        // Recover from a prefill checkpoint and recompute the generated suffix.
+        const auto prefill_hashes = std::span<const std::string>{cache_progress.prefix_hashes}.first(
+            std::min(cache_progress.prefix_hashes.size(),
+                     static_cast<std::size_t>(victim.PrefillSize() / coordinator_.PrefixGranularity())));
+        if (auto snapshot = coordinator_.RetainLatestStateSnapshot(prefill_hashes, CacheBoundaryKind::kEndpoint)) {
             coordinator_.QueueStateSnapshotForStore(*snapshot);
         }
         // The victim's pages are granted away in this very round, so the
@@ -627,7 +590,6 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
             write_back_operations.push_back(std::move(*write_back));
         }
     }
-    clearLatestDecodeState(victim);
     victim.Apply(fsm::RetractEvent{&coordinator_, next_retraction_epoch_++, recovers_as_readmission,
                                    victim.HasGeneratedOutput()});
     spdlog::info("[Scheduler] retract: released request {} ({} tokens){}", victim.Id(), victim.TokenSize(),

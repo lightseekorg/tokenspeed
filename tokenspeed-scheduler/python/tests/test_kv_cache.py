@@ -301,8 +301,14 @@ def test_accepted_state_prompts_can_prefill_and_start_decode(
 @pytest.mark.parametrize("publish_on_finish", [False, True])
 @pytest.mark.parametrize("decode_width", [1, 3])
 @pytest.mark.parametrize("state_granularity", [1, 2, 4])
-def test_decode_reuses_only_materialized_state_boundary(
-    publish_on_finish: bool, decode_width: int, state_granularity: int
+@pytest.mark.parametrize("prompt_tokens", [3, 7, 8])
+@pytest.mark.parametrize("truncate_output", [False, True])
+def test_decode_reuses_only_prefill_state_boundary(
+    publish_on_finish: bool,
+    decode_width: int,
+    state_granularity: int,
+    prompt_tokens: int,
+    truncate_output: bool,
 ) -> None:
     cfg = ts.SchedulerConfig()
     cfg.prefix_granularity = 4
@@ -324,29 +330,35 @@ def test_decode_reuses_only_materialized_state_boundary(
         )
     ]
     scheduler = ts.Scheduler(cfg)
-    request = _spec("r", [1, 2, 3])
+    request = _spec("r", list(range(1, prompt_tokens + 1)))
     request.max_new_tokens = 30
     scheduler.submit_requests([request])
     assert _find_forward_op(scheduler.next_execution_plan()) is not None
-    _advance_tokens(scheduler, "r", [4])
+    _advance_tokens(scheduler, "r", [prompt_tokens + 1])
     assert _find_forward_op(scheduler.next_execution_plan()) is not None
-    _advance_tokens(scheduler, "r", list(range(5, 5 + decode_width)))
+    next_token = prompt_tokens + 2
+    visible_tokens = 1 if truncate_output else decode_width
+    _advance_tokens(
+        scheduler, "r", list(range(next_token, next_token + visible_tokens))
+    )
     if not publish_on_finish:
         assert _find_forward_op(scheduler.next_execution_plan()) is not None
         _advance_tokens(
-            scheduler, "r", list(range(5 + decode_width, 5 + 2 * decode_width))
+            scheduler,
+            "r",
+            list(range(next_token + visible_tokens, next_token + 2 * visible_tokens)),
         )
     _finish(scheduler, "r")
     scheduler.next_execution_plan()
 
-    # Width 1 actually writes checkpoint 4. Width 3 jumps from state 3 to
-    # state 6; its allocated first block still contains state 3, not state 4.
-    reuse = _spec("reuse", [1, 2, 3, 4, 90, 91])
+    # Decode cannot create a reusable checkpoint, even at an aligned accepted
+    # endpoint or when host-side stopping truncates the accepted output.
+    reuse = _spec("reuse", list(range(1, next_token + visible_tokens)) + [90, 91])
     reuse.max_new_tokens = 4
     scheduler.submit_requests([reuse])
     batch = _find_forward_op(scheduler.next_execution_plan())
     assert batch is not None
-    assert list(batch.extend_prefix_lens) == [4 if decode_width == 1 else 0]
+    assert list(batch.extend_prefix_lens) == [prompt_tokens // 4 * 4]
 
 
 @pytest.mark.parametrize("block_granularity", [1, 4])
@@ -354,7 +366,7 @@ def test_decode_reuses_only_materialized_state_boundary(
 @pytest.mark.parametrize("decode_width", [1, 3, 4])
 @pytest.mark.parametrize("overlap_depth", [0, 1])
 @pytest.mark.parametrize("prefix_cache_enabled", [False, True])
-def test_accepted_state_capacity_covers_decode_with_a_protected_latest(
+def test_accepted_state_capacity_covers_decode_working_window(
     block_granularity: int,
     chunk_tokens: int,
     decode_width: int,
@@ -405,14 +417,13 @@ def test_accepted_state_capacity_covers_decode_with_a_protected_latest(
                 generated,
                 scheduler.waiting_size(),
             )
-            # Width-one reaches every checkpoint. Wider verify steps reach 8,
-            # then stay odd with partial acceptance so its latest lives longer.
+            # Exercise aligned and unaligned accepted endpoints. Neither adds
+            # a retained snapshot outside the decode working window.
             accepted = 1 if generated <= 5 else min(2, decode_width)
             accepted = min(accepted, generation_budget - generated)
             result = ts.ForwardEvent.ExtendResult()
             result.request_id = "r"
             result.tokens = list(range(101 + generated, 101 + generated + accepted))
-            result.num_accepted_tokens = accepted
             reserve = ts.ForwardEvent.UpdateReserveNumTokens()
             reserve.request_id = "r"
             reserve.reserve_num_tokens_in_next_schedule_event = accepted
@@ -472,20 +483,19 @@ def _drive_k3_to_retract(scheduler) -> dict[str, dict[int, int]]:
             next_token += 1
 
     assert retracted
-    # Until its replacement is published, each latest stays table-owned and
-    # cannot fund another request in the same batch. The resulting decode
-    # lengths leave b/c/d holding 7/6/5 pages, respectively.
+    # Decode retains only its working state. After a retracts, b/c/d each
+    # hold four History blocks and one working block per State group.
     assert tuple(scheduler.request_token_size(r) for r in request_ids) == (
-        17,
+        11,
         9,
-        7,
-        5,
+        9,
+        9,
     )
-    assert scheduler.active_lcm_blocks() == 18
-    assert scheduler.available_lcm_blocks() == 14
-    # Retracting a drops eight History refs and three latest State refs.
-    # Seven published History pages remain cache-only; the unpublished final
-    # History page and latest State pages return to the pool (3 + 4 empty).
+    assert scheduler.active_lcm_blocks() == 21
+    assert scheduler.available_lcm_blocks() == 11
+    # Retracting a drops five History refs and three working State refs.
+    # Four published History blocks remain cache-only; the unpublished final
+    # History block and working State blocks return to the pool (3 + 4 empty).
     assert scheduler.empty_lcm_blocks() == 7
     assert scheduler.waiting_size() == 1
     assert scheduler.decoding_size() == 3
@@ -499,29 +509,28 @@ def test_k3_readmit_recomputes_missing_checkpoint_and_restores_pages() -> None:
     assert cfg.disable_l2_cache
     scheduler = ts.Scheduler(cfg)
     before = scheduler.available_lcm_blocks()
-    _drive_k3_to_retract(scheduler)
+    pre_retract_pages = _drive_k3_to_retract(scheduler)
 
     for request_id in ("b", "c", "d"):
         _finish(scheduler, request_id)
     assert scheduler.active_lcm_blocks() == 0
     assert scheduler.available_lcm_blocks() == before
 
-    # The token-14 state was replaced by token 16, which retraction also
-    # releases without a Host tier. History was only published through token
-    # 14. It cannot resume alone, but supplies the promotion boundary that
-    # ends the first recovery chunk.
+    # The original prefill checkpoint was evicted under pressure. Decode
+    # created no replacement. History published through token 8 cannot resume
+    # alone, but supplies the promotion boundary ending the recovery body.
     body_plan = scheduler.next_execution_plan()
     body = _find_forward_op(body_plan)
     assert body is not None
     assert tuple(body.request_ids) == ("a",)
-    assert tuple(body.prefill_lengths) == (17,)
+    assert tuple(body.prefill_lengths) == (11,)
     assert tuple(body.extend_prefix_lens) == (0,)
-    assert tuple(body.input_lengths) == (14,)
+    assert tuple(body.input_lengths) == (8,)
     body_tables = dict(body.block_tables)
     assert tuple(body_tables) == K3_GROUP_IDS
     prefix_granularity = cfg.prefix_granularity
     prefix_slots = body.input_lengths[0] // prefix_granularity
-    assert prefix_slots == 7
+    assert prefix_slots == 4
     rebuilt_rows = {}
     rebuilt_pages = []
     body_zero = dict(body_plan.pages_to_zero)
@@ -539,20 +548,20 @@ def test_k3_readmit_recomputes_missing_checkpoint_and_restores_pages() -> None:
         rebuilt_rows[group_id] = row
         rebuilt_pages.extend(positive)
     assert len(set(rebuilt_pages)) == len(rebuilt_pages)
-    assert len(rebuilt_pages) == 10
-    assert scheduler.active_lcm_blocks() == 10
-    assert scheduler.available_lcm_blocks() == before - 10
+    assert len(rebuilt_pages) == 7
+    assert scheduler.active_lcm_blocks() == 7
+    assert scheduler.available_lcm_blocks() == before - 7
 
     # An intermediate prefill acknowledges completion without producing a
     # token. The next forward continues from the checkpoint just rebuilt.
     _advance_tokens(scheduler, "a", [])
-    assert scheduler.request_token_size("a") == 17
+    assert scheduler.request_token_size("a") == 11
     tail_plan = scheduler.next_execution_plan()
     tail = _find_forward_op(tail_plan)
     assert tail is not None
     assert tuple(tail.request_ids) == ("a",)
-    assert tuple(tail.prefill_lengths) == (17,)
-    assert tuple(tail.extend_prefix_lens) == (14,)
+    assert tuple(tail.prefill_lengths) == (11,)
+    assert tuple(tail.extend_prefix_lens) == (8,)
     assert tuple(tail.input_lengths) == (3,)
     tables = dict(tail.block_tables)
     assert tuple(tables) == K3_GROUP_IDS
@@ -560,7 +569,7 @@ def test_k3_readmit_recomputes_missing_checkpoint_and_restores_pages() -> None:
     expected_slots = (
         tail.prefill_lengths[0] + prefix_granularity - 1
     ) // prefix_granularity
-    assert expected_slots == 9
+    assert expected_slots == 6
 
     all_positive_entries = []
     fresh_tail_entries = []
@@ -575,7 +584,16 @@ def test_k3_readmit_recomputes_missing_checkpoint_and_restores_pages() -> None:
         assert group_positive
         all_positive_entries.extend(group_positive)
 
-        assert row[:prefix_slots] == rebuilt_rows[group_id]
+        if group_id == K3_GROUP_IDS[0]:
+            # Publication may replace recomputed History blocks with the
+            # still-resident canonical blocks for those same logical slots.
+            for slot, page in enumerate(row[:prefix_slots]):
+                assert page in (
+                    rebuilt_rows[group_id][slot],
+                    pre_retract_pages[group_id][slot],
+                )
+        else:
+            assert row[:prefix_slots] == rebuilt_rows[group_id]
         suffix = row[prefix_slots:]
         assert len(suffix) == 2 + growth_slots
         group_tail = _positive_pages(suffix)
@@ -590,8 +608,8 @@ def test_k3_readmit_recomputes_missing_checkpoint_and_restores_pages() -> None:
     assert len(set(fresh_tail_entries)) == len(fresh_tail_entries)
     assert set(fresh_tail_entries).isdisjoint(rebuilt_pages)
     assert len(fresh_tail_entries) == 11
-    assert scheduler.active_lcm_blocks() == 21
-    assert scheduler.available_lcm_blocks() == before - 21
+    assert scheduler.active_lcm_blocks() == 18
+    assert scheduler.available_lcm_blocks() == before - 18
 
     _advance_tokens(scheduler, "a", [3000])
     scheduler.next_execution_plan()

@@ -175,7 +175,7 @@ TEST(StateEvictionPriorityTest, StateChunksUseEpochAcrossGroupsAndAcquisitionOnl
     }
 }
 
-TEST(StateEvictionPriorityTest, LatestKeepsItsOriginalTableReferenceWithoutChangingKind) {
+TEST(StateEvictionPriorityTest, WorkingReferenceKeepsTheOriginalKindAndSnapshotIdentityAddsNoPin) {
     PriorityCache cache(2, {GroupSpec(AttnKind::kMambaState, 1)});
     const auto endpoint_location = cache.Cache(0, "endpoint", 7, 100, Kind::kEndpoint);
     const auto latest_location = cache.Cache(0, "latest", 7, 0, Kind::kChunk);
@@ -184,10 +184,9 @@ TEST(StateEvictionPriorityTest, LatestKeepsItsOriginalTableReferenceWithoutChang
     const auto latest = CacheCoordinatorTestAccess::CaptureStateSnapshot(cache.coordinator, hashes, 4);
     ASSERT_TRUE(latest);
     auto source = cache.Hold(*latest);
-    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, source, *latest));
-    cache.coordinator.ReclaimExpired(source, 6);
+    cache.coordinator.ReclaimExpired(source, 4);
     ASSERT_TRUE(source[0].Blocks()[0]);
-    EXPECT_EQ(source[0].Blocks()[0].use_count(), 2u) << "protection reuses the table's existing reference";
+    EXPECT_EQ(source[0].Blocks()[0].use_count(), 2u) << "the working table and index each own one reference";
     const auto copied_identity = *latest;
     EXPECT_EQ(source[0].Blocks()[0].use_count(), 2u) << "copying snapshot metadata must not add a pin";
     EXPECT_TRUE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(cache.coordinator, copied_identity));
@@ -202,7 +201,7 @@ TEST(StateEvictionPriorityTest, LatestKeepsItsOriginalTableReferenceWithoutChang
     EXPECT_EQ(cache.coordinator.GroupPrefixIndex(0).NumPinnedEntries(cache.pool), 1);
 }
 
-TEST(StateEvictionPriorityTest, LatestRemainsPinnedWhenEveryOtherEpochIsNewer) {
+TEST(StateEvictionPriorityTest, WorkingInputRemainsPinnedWhenEveryOtherEpochIsNewer) {
     PriorityCache cache(3, {GroupSpec(AttnKind::kMambaState, 1)});
     cache.Cache(0, "latest", 1, 0, Kind::kChunk);
     cache.Cache(0, "endpoint", 2, 1, Kind::kEndpoint);
@@ -211,8 +210,7 @@ TEST(StateEvictionPriorityTest, LatestRemainsPinnedWhenEveryOtherEpochIsNewer) {
     const auto latest = CacheCoordinatorTestAccess::CaptureStateSnapshot(cache.coordinator, hashes, 4);
     ASSERT_TRUE(latest);
     auto source = cache.Hold(*latest);
-    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, source, *latest));
-    cache.coordinator.ReclaimExpired(source, 6);
+    cache.coordinator.ReclaimExpired(source, 4);
     std::vector<BlockTable> tables(1);
     ASSERT_TRUE(cache.Allocate(tables, 0, 8));
     EXPECT_FALSE(cache.Contains(0, "ordinary"));
@@ -220,7 +218,7 @@ TEST(StateEvictionPriorityTest, LatestRemainsPinnedWhenEveryOtherEpochIsNewer) {
     EXPECT_FALSE(cache.Contains(0, "endpoint"));
 }
 
-TEST(StateEvictionPriorityTest, ReplacingOneRequestsLatestKeepsAnotherRequestsSharedSnapshot) {
+TEST(StateEvictionPriorityTest, ReclaimingOneRequestsInputKeepsAnotherRequestsSharedSnapshot) {
     PriorityCache cache(3, {GroupSpec(AttnKind::kMambaState, 1)});
     cache.Cache(0, "shared", 1, 0, Kind::kChunk);
     cache.Cache(0, "replacement", 1, 1, Kind::kChunk);
@@ -236,11 +234,8 @@ TEST(StateEvictionPriorityTest, ReplacingOneRequestsLatestKeepsAnotherRequestsSh
                                        cache.coordinator.AcquireDeviceCachedBlock(Key(0, "replacement"))},
                                       0);
     auto second = cache.Hold(*shared);
-    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, first, *shared));
-    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, second, *shared));
     cache.coordinator.ReclaimExpired(first, 6);
-    cache.coordinator.ReclaimExpired(second, 6);
-    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, first, *replacement));
+    cache.coordinator.ReclaimExpired(second, 4);
     EXPECT_FALSE(first[0].Blocks()[0]);
     EXPECT_TRUE(second[0].Blocks()[0]);
     std::vector<BlockTable> tables(1);
@@ -248,58 +243,13 @@ TEST(StateEvictionPriorityTest, ReplacingOneRequestsLatestKeepsAnotherRequestsSh
     EXPECT_FALSE(cache.Contains(0, "ordinary"));
     EXPECT_TRUE(cache.Contains(0, "shared"));
     EXPECT_TRUE(cache.Contains(0, "replacement"));
-    cache.coordinator.ClearProtectedStateSnapshot(second);
+    cache.coordinator.Free(second);
     ASSERT_TRUE(cache.Allocate(tables, 0, 4));
     EXPECT_FALSE(cache.Contains(0, "shared"));
     EXPECT_TRUE(cache.Contains(0, "replacement"));
 }
 
-TEST(StateEvictionPriorityTest, StaleSameKeyGenerationCannotProtectANewRegistration) {
-    PriorityCache cache(2, {GroupSpec(AttnKind::kMambaState, 1)});
-    const auto original = cache.Cache(0, "latest", 10, 0, Kind::kChunk);
-    const std::vector<std::string> hashes{"latest"};
-    const auto stale = CacheCoordinatorTestAccess::CaptureStateSnapshot(cache.coordinator, hashes, 4);
-    ASSERT_TRUE(stale);
-    ASSERT_TRUE(cache.coordinator.GroupPrefixIndex(0).Evict(cache.pool, original));
-    cache.Cache(0, "endpoint", 100, 1, Kind::kEndpoint);
-    cache.Cache(0, "latest", 100, 0, Kind::kChunk);
-    const auto current = CacheCoordinatorTestAccess::CaptureStateSnapshot(cache.coordinator, hashes, 4);
-    ASSERT_TRUE(current);
-    ASSERT_NE(current->blocks[0].generation, stale->blocks[0].generation);
-    auto source = cache.Hold(*current);
-    EXPECT_FALSE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, source, *stale));
-    EXPECT_EQ(source[0].ProtectedSlot(), -1);
-    cache.coordinator.Free(source);
-    std::vector<BlockTable> tables(1);
-    ASSERT_TRUE(cache.Allocate(tables, 0, 4));
-    EXPECT_FALSE(cache.Contains(0, "latest"));
-    EXPECT_TRUE(cache.Contains(0, "endpoint"));
-}
-
-TEST(StateEvictionPriorityTest, PartialSnapshotDoesNotProtectItsRemainingGroupAsACompleteLatest) {
-    PriorityCache cache(3, {GroupSpec(AttnKind::kMambaState, 1), GroupSpec(AttnKind::kMambaState, 1)});
-    cache.Cache(0, "latest", 100, 0, Kind::kChunk);
-    const auto missing = cache.Cache(1, "latest", 100, 0, Kind::kChunk);
-    cache.Cache(0, "endpoint", 100, 1, Kind::kEndpoint);
-    const std::vector<std::string> hashes{"latest"};
-    const auto latest = CacheCoordinatorTestAccess::CaptureStateSnapshot(cache.coordinator, hashes, 4);
-    ASSERT_TRUE(latest);
-    ASSERT_EQ(latest->blocks.size(), 2u);
-    ASSERT_TRUE(cache.coordinator.GroupPrefixIndex(1).Evict(cache.pool, missing));
-    cache.Cache(1, "other-endpoint", 100, 1, Kind::kEndpoint);
-    auto source = cache.Hold(*latest);
-    EXPECT_FALSE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, source, *latest));
-    EXPECT_EQ(source[0].ProtectedSlot(), -1);
-    EXPECT_EQ(source[1].ProtectedSlot(), -1);
-    cache.coordinator.Free(source);
-    std::vector<BlockTable> tables(2);
-    ASSERT_TRUE(cache.Allocate(tables, 0, 4));
-    EXPECT_FALSE(cache.Contains(0, "latest"));
-    EXPECT_TRUE(cache.Contains(0, "endpoint"));
-    EXPECT_TRUE(cache.Contains(1, "other-endpoint"));
-}
-
-TEST(StateEvictionPriorityTest, CompleteLatestProtectsEveryStateGroup) {
+TEST(StateEvictionPriorityTest, WorkingInputsProtectEveryStateGroup) {
     PriorityCache cache(3, {GroupSpec(AttnKind::kMambaState, 1), GroupSpec(AttnKind::kMambaState, 1)});
     cache.Cache(0, "latest", 1, 0, Kind::kChunk);
     cache.Cache(1, "latest", 1, 0, Kind::kChunk);
@@ -309,8 +259,7 @@ TEST(StateEvictionPriorityTest, CompleteLatestProtectsEveryStateGroup) {
     ASSERT_TRUE(latest);
     ASSERT_EQ(latest->blocks.size(), 2u);
     auto source = cache.Hold(*latest);
-    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, source, *latest));
-    cache.coordinator.ReclaimExpired(source, 6);
+    cache.coordinator.ReclaimExpired(source, 4);
     std::vector<BlockTable> tables(2);
     ASSERT_TRUE(cache.Allocate(tables, 0, 4));
     EXPECT_FALSE(cache.Contains(1, "ordinary"));
@@ -400,8 +349,7 @@ TEST(StateEvictionPriorityTest, RegisteredZeroEpochEndpointUsesTheOriginalLocati
     const auto registered = tables[0].Blocks()[0]->Location();
     const auto unregistered = tables[0].Blocks()[1]->Location();
     const std::vector<std::string> hashes{"zero-epoch"};
-    ASSERT_TRUE(
-        CacheCoordinatorTestAccess::PublishStateSnapshot(cache.coordinator, tables, hashes, 4, 0, Kind::kEndpoint));
+    ASSERT_TRUE(CacheStateBoundaryForTest(cache.coordinator, tables, hashes, 4, 0, Kind::kEndpoint));
     ASSERT_TRUE(cache.coordinator.GroupPrefixIndex(0).MetadataFor(cache.pool, registered));
     ASSERT_FALSE(cache.coordinator.GroupPrefixIndex(0).MetadataFor(cache.pool, unregistered));
 
@@ -424,8 +372,7 @@ TEST(StateEvictionPriorityTest, GuaranteedChunkCleanupPreservesAnOtherwiseUnneed
     std::vector<BlockTable> tables(1);
     ASSERT_TRUE(cache.Allocate(tables, 0, 8));
     const std::vector<std::string> hashes{"reclaimable"};
-    auto snapshot =
-        CacheCoordinatorTestAccess::PublishStateSnapshot(cache.coordinator, tables, hashes, 4, 100, Kind::kChunk);
+    auto snapshot = CacheStateBoundaryForTest(cache.coordinator, tables, hashes, 4, 100, Kind::kChunk);
     ASSERT_TRUE(snapshot);
     cache.Cache(0, "endpoint", 1, 1, Kind::kEndpoint);
     ASSERT_EQ(cache.pool.NumEmptyLcmBlocks(), 0);
@@ -441,22 +388,21 @@ TEST(StateEvictionPriorityTest, GuaranteedChunkCleanupPreservesAnOtherwiseUnneed
     EXPECT_EQ(cache.pool.NumEmptyLcmBlocks(), 0);
 }
 
-TEST(StateEvictionPriorityTest, GuaranteedCleanupExcludesAnotherLiveRequestsLatest) {
+TEST(StateEvictionPriorityTest, GuaranteedCleanupExcludesAnotherRequestsWorkingInput) {
     PriorityCache cache(3, {GroupSpec(AttnKind::kMambaState, 1)});
     std::vector<BlockTable> tables(1);
     ASSERT_TRUE(cache.Allocate(tables, 0, 8));
-    const auto latest = CacheCoordinatorTestAccess::PublishStateSnapshot(
-        cache.coordinator, tables, std::vector<std::string>{"latest"}, 4, 100, Kind::kChunk);
+    const auto latest =
+        CacheStateBoundaryForTest(cache.coordinator, tables, std::vector<std::string>{"latest"}, 4, 100, Kind::kChunk);
     ASSERT_TRUE(latest);
     auto other_request = cache.Hold(*latest);
-    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, other_request, *latest));
-    cache.coordinator.ReclaimExpired(other_request, 6);
+    cache.coordinator.ReclaimExpired(other_request, 4);
     cache.Cache(0, "endpoint", 1, 1, Kind::kEndpoint);
     auto demands = cache.Demands(tables, 0, 4);
     const RequestProgress progress{.num_computed_tokens = 6};
     ASSERT_TRUE(cache.coordinator.Admit(cache.coordinator.ProbePrefix({}), demands, progress, std::nullopt));
     EXPECT_TRUE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(cache.coordinator, *latest));
-    EXPECT_FALSE(cache.Contains(0, "endpoint")) << "the live latest was not guaranteed free capacity";
+    EXPECT_FALSE(cache.Contains(0, "endpoint")) << "a shared working input is not guaranteed free capacity";
     EXPECT_FALSE(tables[0].Blocks()[0]);
     EXPECT_EQ(cache.pool.NumEmptyLcmBlocks(), 0);
 }
@@ -465,8 +411,8 @@ TEST(StateEvictionPriorityTest, SharedPinPreventsCleanupCreditAndFailedAdmission
     PriorityCache cache(2, {GroupSpec(AttnKind::kMambaState, 1)});
     std::vector<BlockTable> tables(1);
     ASSERT_TRUE(cache.Allocate(tables, 0, 8));
-    const auto snapshot = CacheCoordinatorTestAccess::PublishStateSnapshot(
-        cache.coordinator, tables, std::vector<std::string>{"shared"}, 4, 1, Kind::kChunk);
+    const auto snapshot =
+        CacheStateBoundaryForTest(cache.coordinator, tables, std::vector<std::string>{"shared"}, 4, 1, Kind::kChunk);
     ASSERT_TRUE(snapshot);
     const auto first = tables[0].Blocks()[0]->Location();
     const auto second = tables[0].Blocks()[1]->Location();
@@ -508,8 +454,11 @@ TEST(StateEvictionPriorityTest, CleanupCreditForOnePackedChildDoesNotInventAnEmp
     const auto first = tables[0].Blocks()[0]->Location();
     const auto working = tables[0].Blocks()[1]->Location();
     ASSERT_EQ(first.lcm_block_id, working.lcm_block_id);
-    ASSERT_TRUE(CacheCoordinatorTestAccess::PublishStateSnapshot(
-        cache.coordinator, tables, std::vector<std::string>{"expired"}, 4, 100, Kind::kChunk));
+    {
+        CacheBlockRef block = tables[0].Blocks()[0];
+        cache.coordinator.GroupPrefixIndex(0).Register(cache.pool, block, Key(0, "expired"), 100, 0, Kind::kChunk,
+                                                       nullptr);
+    }
     const auto history = cache.Cache(1, "history", 1, 0, Kind::kChunk);
     auto demands = cache.Demands(tables, 1, 4);
     const RequestProgress progress{.num_computed_tokens = 6};
@@ -527,8 +476,8 @@ TEST(StateEvictionPriorityTest, PendingChunkCanonicalThatGainsAWorkingReferenceI
     std::vector<BlockTable> tables(1);
     ASSERT_TRUE(cache.Allocate(tables, 0, 12));
     const auto canonical = tables[0].Blocks()[0]->Location();
-    const auto snapshot = CacheCoordinatorTestAccess::PublishStateSnapshot(
-        cache.coordinator, tables, std::vector<std::string>{"same"}, 4, 100, Kind::kChunk);
+    const auto snapshot =
+        CacheStateBoundaryForTest(cache.coordinator, tables, std::vector<std::string>{"same"}, 4, 100, Kind::kChunk);
     ASSERT_TRUE(snapshot);
     // Keep the duplicate source alive after Register replaces its table ref;
     // otherwise that incidental release could mask an invalid capacity credit.
@@ -619,8 +568,7 @@ TEST_P(PendingStateEvictionPriorityTest, ExistingReclaimableChunkUsesItsPendingU
     ASSERT_TRUE(cache.Allocate(tables, 0, 8));
     const auto future_endpoint = tables[0].Blocks()[0]->Location();
     const std::vector<std::string> hashes{"pending"};
-    ASSERT_TRUE(
-        CacheCoordinatorTestAccess::PublishStateSnapshot(cache.coordinator, tables, hashes, 4, 1, Kind::kChunk));
+    ASSERT_TRUE(CacheStateBoundaryForTest(cache.coordinator, tables, hashes, 4, 1, Kind::kChunk));
     cache.Cache(0, "ordinary", 1, 1, Kind::kChunk);
     auto demands = cache.Demands(tables, 0, 4);
     const std::array materialized{4};
@@ -672,7 +620,7 @@ TEST_P(PendingStateEvictionPriorityTest, CanonicalReceivesRetainedPriorityBefore
 INSTANTIATE_TEST_SUITE_P(RetainedKinds, PendingStateEvictionPriorityTest,
                          testing::Values(Kind::kEndpoint, Kind::kPromoted));
 
-TEST(StateEvictionPriorityTest, LatestAndPendingPromotedKeepPromotionWithoutChangingHistoryKind) {
+TEST(StateEvictionPriorityTest, SharedInputAndPendingPromotedKeepPromotionWithoutChangingHistoryKind) {
     PriorityCache cache(5, {GroupSpec(AttnKind::kFull, 1), GroupSpec(AttnKind::kMambaState, 1)});
     std::vector<BlockTable> tables(2);
     ASSERT_TRUE(cache.Allocate(tables, 1, 8));
@@ -688,7 +636,6 @@ TEST(StateEvictionPriorityTest, LatestAndPendingPromotedKeepPromotionWithoutChan
     const auto latest = CacheCoordinatorTestAccess::CaptureStateSnapshot(cache.coordinator, hashes, 4);
     ASSERT_TRUE(latest);
     auto other_request = cache.Hold(*latest);
-    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, other_request, *latest));
     auto demands = cache.Demands(tables, 1, 8);
     const std::array materialized{4};
     const RequestProgress progress{
@@ -705,7 +652,8 @@ TEST(StateEvictionPriorityTest, LatestAndPendingPromotedKeepPromotionWithoutChan
     EXPECT_FALSE(cache.Contains(1, "ordinary"));
     const auto state_after = cache.coordinator.GroupPrefixIndex(1).MetadataFor(cache.pool, canonical);
     ASSERT_TRUE(state_after);
-    EXPECT_EQ(state_after->boundary_kind, Kind::kPromoted) << "table protection must not downgrade publication";
+    EXPECT_EQ(state_after->boundary_kind, Kind::kPromoted)
+        << "a shared working reference must not downgrade publication";
     EXPECT_EQ(state_after->generation, latest->blocks[0].generation);
     EXPECT_TRUE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(cache.coordinator, *latest));
     const auto history_after = cache.coordinator.GroupPrefixIndex(0).MetadataFor(cache.pool, history);
@@ -780,7 +728,7 @@ TEST(StateEvictionPriorityTest, LastSharedPinReclaimsAcquiredChunkWithoutReleasi
     EXPECT_EQ(replacement->Location(), chunk);
 }
 
-TEST(StateEvictionPriorityTest, ReclaimKeepsLatestUntilFreeClearsAllStateOwnership) {
+TEST(StateEvictionPriorityTest, ReclaimDropsEveryExpiredChunkWithoutKeepingALatestSlot) {
     PriorityCache cache(12, {GroupSpec(AttnKind::kMambaState, 1), GroupSpec(AttnKind::kMambaState, 1)});
     std::vector<BlockTable> tables(2);
     std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{8}},
@@ -790,7 +738,6 @@ TEST(StateEvictionPriorityTest, ReclaimKeepsLatestUntilFreeClearsAllStateOwnersh
     cache.coordinator.CacheFullBlocks(tables, hashes, 1, 0, Kind::kChunk);
     const auto latest = CacheCoordinatorTestAccess::CaptureStateSnapshot(cache.coordinator, hashes, 8);
     ASSERT_TRUE(latest);
-    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, tables, *latest));
 
     cache.coordinator.ReclaimExpired(tables, 6);
     for (std::uint32_t group = 0; group < 2; ++group) {
@@ -799,23 +746,20 @@ TEST(StateEvictionPriorityTest, ReclaimKeepsLatestUntilFreeClearsAllStateOwnersh
         EXPECT_TRUE(tables[group].Blocks()[1]);
     }
     cache.coordinator.ReclaimExpired(tables, 10);
-    EXPECT_TRUE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(cache.coordinator, *latest));
+    EXPECT_FALSE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(cache.coordinator, *latest));
     for (std::uint32_t group = 0; group < 2; ++group) {
         EXPECT_EQ(tables[group].ReclaimedPrefixBlocks(), 2);
-        EXPECT_EQ(tables[group].ProtectedSlot(), 1);
-        EXPECT_TRUE(tables[group].Blocks()[1]);
-        EXPECT_EQ(cache.coordinator.GroupPrefixIndex(group).NumPinnedEntries(cache.pool), 1);
+        EXPECT_FALSE(tables[group].Blocks()[1]);
+        EXPECT_EQ(cache.coordinator.GroupPrefixIndex(group).NumPinnedEntries(cache.pool), 0);
     }
     cache.coordinator.Free(tables);
     EXPECT_FALSE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(cache.coordinator, *latest));
-    EXPECT_EQ(tables[0].ProtectedSlot(), -1);
-    EXPECT_EQ(tables[1].ProtectedSlot(), -1);
     EXPECT_FALSE(cache.Contains(0, "latest"));
     EXPECT_FALSE(cache.Contains(1, "latest"));
     EXPECT_EQ(cache.pool.NumEmptyLcmBlocks(), cache.pool.NumLcmBlocks());
 }
 
-TEST(StateEvictionPriorityTest, AnotherRequestsProtectedSlotPreventsCleanupUntilItsLastReferenceIsCleared) {
+TEST(StateEvictionPriorityTest, SharedWorkingInputPreventsCleanupUntilItsLastReferenceExpires) {
     PriorityCache cache(4, {GroupSpec(AttnKind::kMambaState, 1)});
     cache.Cache(0, "shared", 1, 0, Kind::kChunk);
     cache.Cache(0, "replacement", 1, 1, Kind::kChunk);
@@ -828,21 +772,16 @@ TEST(StateEvictionPriorityTest, AnotherRequestsProtectedSlotPreventsCleanupUntil
     auto first = cache.Hold(*shared);
     auto second = cache.Hold(*shared);
     auto next = cache.Hold(*replacement);
-    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, first, *shared));
-    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, second, *shared));
-    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, next, *replacement));
     cache.coordinator.ReclaimExpired(first, 6);
-    cache.coordinator.ReclaimExpired(second, 6);
-    cache.coordinator.ClearProtectedStateSnapshot(first);
     EXPECT_TRUE(cache.Contains(0, "shared"));
-    cache.coordinator.ClearProtectedStateSnapshot(second);
+    cache.coordinator.ReclaimExpired(second, 6);
     EXPECT_FALSE(cache.Contains(0, "shared"));
     ASSERT_TRUE(cache.Contains(0, "replacement"));
     EXPECT_EQ(cache.coordinator.GroupPrefixIndex(0).MetadataFor(cache.pool, Key(0, "replacement"))->boundary_kind,
               Kind::kChunk);
 }
 
-TEST(StateEvictionPriorityTest, ClearingProtectionPreservesRetainedKindsAndRejectsStaleIdentity) {
+TEST(StateEvictionPriorityTest, ReclaimPreservesRetainedKindsAndRejectsStaleIdentity) {
     PriorityCache cache(5, {GroupSpec(AttnKind::kMambaState, 1)});
     const auto original = cache.Cache(0, "reused", 1, 0, Kind::kChunk);
     const std::vector<std::string> hashes{"reused"};
@@ -854,20 +793,15 @@ TEST(StateEvictionPriorityTest, ClearingProtectionPreservesRetainedKindsAndRejec
     ASSERT_TRUE(replacement);
     ASSERT_NE(replacement->blocks[0].generation, stale->blocks[0].generation);
     auto tables = cache.Hold(*replacement);
-    EXPECT_FALSE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, tables, *stale));
-    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, tables, *replacement));
-    cache.coordinator.ReclaimExpired(tables, 6);
-    EXPECT_TRUE(cache.Contains(0, "reused"));
+    EXPECT_FALSE(CacheCoordinatorTestAccess::RetainStateSnapshot(cache.coordinator, *stale, Kind::kEndpoint));
     ASSERT_TRUE(cache.coordinator.RetainLatestStateSnapshot(hashes, Kind::kEndpoint));
-    cache.coordinator.ClearProtectedStateSnapshot(tables);
+    cache.coordinator.ReclaimExpired(tables, 6);
     EXPECT_FALSE(tables[0].Blocks()[0]);
     EXPECT_TRUE(cache.Contains(0, "reused"));
     tables = cache.Hold(*replacement);
-    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, tables, *replacement));
     ASSERT_TRUE(cache.coordinator.RetainLatestStateSnapshot(hashes, Kind::kPromoted));
     ASSERT_TRUE(cache.coordinator.RetainLatestStateSnapshot(hashes, Kind::kEndpoint));
     cache.coordinator.ReclaimExpired(tables, 6);
-    cache.coordinator.ClearProtectedStateSnapshot(tables);
     EXPECT_EQ(cache.coordinator.GroupPrefixIndex(0).MetadataFor(cache.pool, Key(0, "reused"))->boundary_kind,
               Kind::kPromoted);
 }
@@ -881,13 +815,12 @@ TEST(StateEvictionPriorityTest, PartialSnapshotCleanupRemovesItsRemainingOrdinar
     ASSERT_TRUE(snapshot);
     ASSERT_TRUE(cache.coordinator.GroupPrefixIndex(1).Evict(cache.pool, missing));
     auto tables = cache.Hold(*snapshot);
-    EXPECT_FALSE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, tables, *snapshot));
     cache.coordinator.Free(tables);
     EXPECT_FALSE(cache.Contains(0, "partial"));
     EXPECT_FALSE(cache.Contains(1, "partial"));
 }
 
-TEST(StateEvictionPriorityTest, ProtectedSlotDoesNotDelayTheReclaimFrontierOrKeepOtherExpiredSlots) {
+TEST(StateEvictionPriorityTest, ReclaimReleasesEveryExpiredSlotAndKeepsTheWorkingSuffix) {
     PriorityCache cache(6, {GroupSpec(AttnKind::kMambaState, 1)});
     std::vector<BlockTable> tables(1);
     ASSERT_TRUE(cache.Allocate(tables, 0, 16));
@@ -897,243 +830,37 @@ TEST(StateEvictionPriorityTest, ProtectedSlotDoesNotDelayTheReclaimFrontierOrKee
     const auto next = CacheCoordinatorTestAccess::CaptureStateSnapshot(cache.coordinator, hashes, 16);
     ASSERT_TRUE(latest);
     ASSERT_TRUE(next);
-    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, tables, *latest));
 
     cache.coordinator.ReclaimExpired(tables, 14);
     EXPECT_EQ(tables[0].ReclaimedPrefixBlocks(), 3);
-    EXPECT_EQ(tables[0].ProtectedSlot(), 0);
-    EXPECT_TRUE(tables[0].Blocks()[0]);
+    EXPECT_FALSE(tables[0].Blocks()[0]);
     EXPECT_FALSE(tables[0].Blocks()[1]);
     EXPECT_FALSE(tables[0].Blocks()[2]);
     EXPECT_TRUE(tables[0].Blocks()[3]);
     EXPECT_FALSE(cache.Contains(0, "expired1"));
     EXPECT_FALSE(cache.Contains(0, "expired2"));
-    EXPECT_EQ(cache.pool.NumEmptyLcmBlocks(), 4);
-
-    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, tables, *next));
-    EXPECT_EQ(tables[0].ReclaimedPrefixBlocks(), 3);
-    EXPECT_EQ(tables[0].ProtectedSlot(), 3);
-    EXPECT_FALSE(tables[0].Blocks()[0]) << "replacement must revisit the old slot behind the frontier";
-    EXPECT_FALSE(cache.Contains(0, "latest"));
-    EXPECT_TRUE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(cache.coordinator, *next));
     EXPECT_EQ(cache.pool.NumEmptyLcmBlocks(), 5);
 
-    cache.coordinator.ClearProtectedStateSnapshot(tables);
-    EXPECT_TRUE(tables[0].Blocks()[3]) << "clearing protection does not end the ordinary working lifetime";
+    EXPECT_FALSE(cache.Contains(0, "latest"));
+    EXPECT_TRUE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(cache.coordinator, *next));
+
+    EXPECT_TRUE(tables[0].Blocks()[3]) << "the current working input remains live";
     cache.coordinator.ReclaimExpired(tables, 18);
     EXPECT_FALSE(tables[0].Blocks()[3]);
     EXPECT_FALSE(cache.Contains(0, "next"));
     EXPECT_EQ(cache.pool.NumEmptyLcmBlocks(), 6);
 }
 
-TEST(StateEvictionPriorityTest, FailedReplacementLeavesEveryOldProtectedSlotIntact) {
-    PriorityCache cache(8, {GroupSpec(AttnKind::kMambaState, 1), GroupSpec(AttnKind::kMambaState, 1)});
-    std::vector<BlockTable> tables(2);
-    const std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{12}},
-                                           {.table = &tables[1], .extent = DenseGrowth{12}}};
-    ASSERT_TRUE(cache.coordinator.Admit(cache.coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt));
-    const std::vector<std::string> hashes{"old", "next"};
-    const auto old =
-        CacheCoordinatorTestAccess::PublishStateSnapshot(cache.coordinator, tables, hashes, 4, 1, Kind::kChunk);
-    const auto next =
-        CacheCoordinatorTestAccess::PublishStateSnapshot(cache.coordinator, tables, hashes, 8, 1, Kind::kChunk);
-    ASSERT_TRUE(old);
-    ASSERT_TRUE(next);
-    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, tables, *old));
-    cache.coordinator.ReclaimExpired(tables, 6);
-    CacheBlockRef missing = tables[1].EvictToNull(1);
-    ASSERT_TRUE(missing);
-    EXPECT_FALSE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, tables, *next));
-    for (std::uint32_t group = 0; group < 2; ++group) {
-        EXPECT_EQ(tables[group].ProtectedSlot(), 0);
-        ASSERT_TRUE(tables[group].Blocks()[0]);
-        EXPECT_EQ(tables[group].Blocks()[0].use_count(), 2u);
-    }
-    EXPECT_TRUE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(cache.coordinator, *old));
-    cache.coordinator.ReclaimExpired(tables, 10);
-    for (std::uint32_t group = 0; group < 2; ++group) {
-        EXPECT_EQ(tables[group].ReclaimedPrefixBlocks(), 2);
-        EXPECT_TRUE(tables[group].Blocks()[0]);
-    }
-    EXPECT_FALSE(cache.Contains(0, "next")) << "a failed update must not partially protect the first group";
-    const std::array refs{&missing};
-    cache.coordinator.ReleaseDeviceBlockRefs(refs);
-    cache.coordinator.ClearProtectedStateSnapshot(tables);
-    EXPECT_FALSE(cache.Contains(0, "old"));
-    EXPECT_FALSE(cache.Contains(1, "old"));
-}
-
-TEST(StateEvictionPriorityTest, PublishAndProtectSwitchesEveryGroupBeforeCleaningExpiredChunks) {
-    PriorityCache cache(8, {GroupSpec(AttnKind::kMambaState, 1), GroupSpec(AttnKind::kMambaState, 1)});
-    std::vector<BlockTable> tables(2);
-    const std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{12}},
-                                           {.table = &tables[1], .extent = DenseGrowth{12}}};
-    ASSERT_TRUE(cache.coordinator.Admit(cache.coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt));
-    const std::vector<std::string> hashes{"old", "next"};
-    const auto old = cache.coordinator.PublishAndProtectStateSnapshot(tables, hashes, 4, 1, Kind::kChunk);
-    ASSERT_TRUE(old);
-    cache.coordinator.ReclaimExpired(tables, 6);
-    for (const BlockTable& table : tables) {
-        ASSERT_EQ(table.ProtectedSlot(), 0);
-        ASSERT_EQ(table.ReclaimedPrefixBlocks(), 1);
-        ASSERT_TRUE(table.Blocks()[0]);
-        ASSERT_EQ(table.Blocks()[0].use_count(), 2u);
-    }
-
-    const auto redundant_source = tables[0].Blocks()[1]->Location();
-    const auto second_source = tables[1].Blocks()[1]->Location();
-    const auto canonical = cache.Cache(0, "next", 2, 1, Kind::kChunk);
-    ASSERT_NE(canonical, redundant_source);
-    const auto canonical_identity = cache.coordinator.GroupPrefixIndex(0).IdentityFor(cache.pool, canonical);
-    ASSERT_TRUE(canonical_identity);
-    ASSERT_EQ(cache.pool.NumEmptyLcmBlocks(), 1);
-    std::int32_t old_removals = 0;
-    cache.coordinator.SetCacheMutationSink([&](const CacheKey& key, CacheCoordinator::CacheMutation mutation) {
-        if (key.content_hash != "old" || mutation != CacheCoordinator::CacheMutation::kRemoved) {
-            return;
-        }
-        ++old_removals;
-        for (const BlockTable& table : tables) {
-            EXPECT_EQ(table.ProtectedSlot(), 1) << "all groups must switch before any old Chunk is cleaned";
-            EXPECT_FALSE(table.Blocks()[0]);
-            ASSERT_TRUE(table.Blocks()[1]);
-            EXPECT_EQ(table.Blocks()[1].use_count(), 2u);
-        }
-    });
-
-    const auto next = cache.coordinator.PublishAndProtectStateSnapshot(tables, hashes, 8, 3, Kind::kChunk);
-    ASSERT_TRUE(next);
-    ASSERT_EQ(next->blocks.size(), 2u);
-    EXPECT_EQ(next->boundary_tokens, 8);
-    EXPECT_EQ(next->blocks[0].generation, canonical_identity->generation);
-    EXPECT_EQ(tables[0].Blocks()[1]->Location(), canonical);
-    EXPECT_EQ(tables[1].Blocks()[1]->Location(), second_source);
-    EXPECT_FALSE(cache.pool.IsOccupied(redundant_source));
-    EXPECT_EQ(old_removals, 2);
-    EXPECT_FALSE(cache.Contains(0, "old"));
-    EXPECT_FALSE(cache.Contains(1, "old"));
-    EXPECT_FALSE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(cache.coordinator, *old));
-    EXPECT_TRUE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(cache.coordinator, *next));
-    EXPECT_EQ(cache.pool.NumEmptyLcmBlocks(), 4) << "two old Chunks and the redundant producer return to the pool";
-
-    const auto repeated = cache.coordinator.PublishAndProtectStateSnapshot(tables, hashes, 8, 4, Kind::kChunk);
-    ASSERT_TRUE(repeated);
-    ASSERT_EQ(repeated->blocks.size(), 2u);
-    for (std::uint32_t group = 0; group < 2; ++group) {
-        EXPECT_EQ(repeated->blocks[group].generation, next->blocks[group].generation);
-        EXPECT_EQ(tables[group].ProtectedSlot(), 1);
-        EXPECT_EQ(tables[group].ReclaimedPrefixBlocks(), 1);
-        EXPECT_EQ(tables[group].Blocks()[1].use_count(), 2u) << "returned identities must not add a pin";
-    }
-    EXPECT_EQ(old_removals, 2);
-    EXPECT_EQ(cache.pool.NumEmptyLcmBlocks(), 4);
-}
-
-TEST(StateEvictionPriorityTest, PublishAndProtectMissingGroupPreservesOldProtectionAndUnpublishedTables) {
-    PriorityCache cache(12, {GroupSpec(AttnKind::kMambaState, 1), GroupSpec(AttnKind::kMambaState, 1),
-                             GroupSpec(AttnKind::kMambaState, 1)});
-    std::vector<BlockTable> tables(3);
-    const std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{12}},
-                                           {.table = &tables[1], .extent = DenseGrowth{12}},
-                                           {.table = &tables[2], .extent = DenseGrowth{12}}};
-    ASSERT_TRUE(cache.coordinator.Admit(cache.coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt));
-    const std::vector<std::string> hashes{"old", "next"};
-    const auto old = cache.coordinator.PublishAndProtectStateSnapshot(tables, hashes, 4, 1, Kind::kChunk);
-    ASSERT_TRUE(old);
-    ASSERT_EQ(old->blocks.size(), 3u);
-    cache.coordinator.ReclaimExpired(tables, 6);
-    const auto canonical = cache.Cache(0, "next", 2, 1, Kind::kChunk);
-    const auto canonical_before = cache.coordinator.GroupPrefixIndex(0).MetadataFor(cache.pool, canonical);
-    ASSERT_TRUE(canonical_before);
-    CacheBlockRef missing = tables[2].EvictToNull(1);
-    ASSERT_TRUE(missing);
-    ASSERT_EQ(cache.pool.NumEmptyLcmBlocks(), 2);
-
-    std::array<std::array<CacheBlockLocation, 3>, 3> locations{};
-    std::array<std::array<std::uint32_t, 3>, 3> use_counts{};
-    for (std::size_t group = 0; group < tables.size(); ++group) {
-        for (std::size_t slot = 0; slot < tables[group].Blocks().size(); ++slot) {
-            const CacheBlockRef& ref = tables[group].Blocks()[slot];
-            locations[group][slot] = ref ? ref->Location() : CacheBlockLocation{};
-            use_counts[group][slot] = ref.use_count();
-        }
-    }
-
-    EXPECT_FALSE(cache.coordinator.PublishAndProtectStateSnapshot(tables, hashes, 8, 9, Kind::kPromoted));
-    for (std::size_t group = 0; group < tables.size(); ++group) {
-        EXPECT_EQ(tables[group].ProtectedSlot(), 0);
-        EXPECT_EQ(tables[group].ReclaimedPrefixBlocks(), 1);
-        ASSERT_EQ(tables[group].NumBlocks(), 3);
-        for (std::size_t slot = 0; slot < tables[group].Blocks().size(); ++slot) {
-            const CacheBlockRef& ref = tables[group].Blocks()[slot];
-            EXPECT_EQ(ref ? ref->Location() : CacheBlockLocation{}, locations[group][slot]);
-            EXPECT_EQ(ref.use_count(), use_counts[group][slot]);
-        }
-        const auto old_metadata = cache.coordinator.GroupPrefixIndex(group).MetadataFor(cache.pool, Key(group, "old"));
-        ASSERT_TRUE(old_metadata);
-        EXPECT_EQ(old_metadata->generation, old->blocks[group].generation);
-        EXPECT_EQ(old_metadata->boundary_kind, Kind::kChunk);
-        EXPECT_EQ(old_metadata->last_access_epoch, 1u);
-    }
-    const auto canonical_after = cache.coordinator.GroupPrefixIndex(0).MetadataFor(cache.pool, canonical);
-    ASSERT_TRUE(canonical_after);
-    EXPECT_EQ(canonical_after->generation, canonical_before->generation);
-    EXPECT_EQ(canonical_after->boundary_kind, canonical_before->boundary_kind);
-    EXPECT_EQ(canonical_after->last_access_epoch, canonical_before->last_access_epoch);
-    EXPECT_EQ(canonical_after->was_acquired, canonical_before->was_acquired);
-    EXPECT_FALSE(cache.Contains(1, "next")) << "validate the last group before publishing any preceding group";
-    EXPECT_FALSE(cache.Contains(2, "next"));
-    EXPECT_TRUE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(cache.coordinator, *old));
-    EXPECT_EQ(missing.use_count(), 1u);
-    EXPECT_EQ(cache.pool.NumEmptyLcmBlocks(), 2);
-}
-
-TEST(StateEvictionPriorityTest, OnlyLatestCapacityCannotFundAnAdmissionAndFailureIsAtomic) {
-    PriorityCache cache(2, {GroupSpec(AttnKind::kMambaState, 1)});
-    std::vector<BlockTable> tables(1);
-    ASSERT_TRUE(cache.Allocate(tables, 0, 8));
-    const auto latest = CacheCoordinatorTestAccess::PublishStateSnapshot(
-        cache.coordinator, tables, std::vector<std::string>{"latest"}, 4, 1, Kind::kChunk);
-    ASSERT_TRUE(latest);
-    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, tables, *latest));
-    const auto first = tables[0].Blocks()[0]->Location();
-    const auto second = tables[0].Blocks()[1]->Location();
-    auto demands = cache.Demands(tables, 0, 4);
-    const RequestProgress progress{.num_computed_tokens = 6};
-    EXPECT_FALSE(cache.coordinator.Admit(cache.coordinator.ProbePrefix({}), demands, progress, std::nullopt));
-    EXPECT_EQ(tables[0].NumBlocks(), 2);
-    EXPECT_EQ(tables[0].ReclaimedPrefixBlocks(), 0);
-    EXPECT_EQ(tables[0].ProtectedSlot(), 0);
-    EXPECT_EQ(tables[0].Blocks()[0]->Location(), first);
-    EXPECT_EQ(tables[0].Blocks()[1]->Location(), second);
-    EXPECT_TRUE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(cache.coordinator, *latest));
-    EXPECT_EQ(cache.pool.NumEmptyLcmBlocks(), 0);
-
-    cache.coordinator.ReclaimExpired(tables, 6);
-    EXPECT_FALSE(cache.coordinator.GroupHasReclaimableBlocksAt(0, tables[0], 6));
-    EXPECT_EQ(cache.coordinator.GroupBlocksReclaimableAt(0, tables[0], 6, true), 0);
-    cache.coordinator.ClearProtectedStateSnapshot(tables);
-    ASSERT_TRUE(cache.coordinator.Admit(cache.coordinator.ProbePrefix({}), demands, progress, std::nullopt));
-    EXPECT_FALSE(cache.Contains(0, "latest"));
-    EXPECT_FALSE(tables[0].Blocks()[0]);
-    EXPECT_EQ(tables[0].Blocks().back()->Location(), first);
-}
-
-TEST(StateEvictionPriorityTest, ReplacementKeepsThePreviousSnapshotUntilItsWorkingConsumerExpires) {
+TEST(StateEvictionPriorityTest, ReclaimKeepsThePreviousSnapshotUntilItsWorkingConsumerExpires) {
     PriorityCache cache(4, {GroupSpec(AttnKind::kMambaState, 1)});
     std::vector<BlockTable> tables(1);
     ASSERT_TRUE(cache.Allocate(tables, 0, 12));
     const std::vector<std::string> hashes{"old", "next"};
-    const auto old =
-        CacheCoordinatorTestAccess::PublishStateSnapshot(cache.coordinator, tables, hashes, 4, 1, Kind::kChunk);
-    const auto next =
-        CacheCoordinatorTestAccess::PublishStateSnapshot(cache.coordinator, tables, hashes, 8, 1, Kind::kChunk);
+    const auto old = CacheStateBoundaryForTest(cache.coordinator, tables, hashes, 4, 1, Kind::kChunk);
+    const auto next = CacheStateBoundaryForTest(cache.coordinator, tables, hashes, 8, 1, Kind::kChunk);
     ASSERT_TRUE(old);
     ASSERT_TRUE(next);
-    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, tables, *old));
     cache.coordinator.ReclaimExpired(tables, 4);
-    ASSERT_TRUE(CacheCoordinatorTestAccess::ProtectStateSnapshot(cache.coordinator, tables, *next));
-    EXPECT_EQ(tables[0].ProtectedSlot(), 1);
     EXPECT_TRUE(tables[0].Blocks()[0]);
     EXPECT_TRUE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(cache.coordinator, *old));
     EXPECT_TRUE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(cache.coordinator, *next));

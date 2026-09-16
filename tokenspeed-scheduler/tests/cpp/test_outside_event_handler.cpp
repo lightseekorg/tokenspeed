@@ -20,8 +20,6 @@
 
 #include "integration_test_helper.h"
 
-#include <limits>
-
 namespace tokenspeed::test {
 
 TEST(ExecutionEventTest, StoresConcreteEventsInInsertionOrder) {
@@ -34,30 +32,6 @@ TEST(ExecutionEventTest, StoresConcreteEventsInInsertionOrder) {
     EXPECT_TRUE(std::holds_alternative<cache::WriteBackDone>(event.Events()[0]));
     EXPECT_TRUE(std::holds_alternative<forward::Abort>(event.Events()[1]));
     EXPECT_TRUE(std::holds_alternative<pd::BootstrappedEvent>(event.Events()[2]));
-}
-
-TEST_F(SchedulerTestSuite, InvalidAcceptedCountDoesNotConsumeTheForwardResult) {
-    Submit(MakeRequestSpec("source", /*num_pages=*/2, /*start=*/1));
-    PlanOnce();
-    SendForwardDone("source", {41});
-    PlanOnce();
-    const std::int32_t previous_size = scheduler_->RequestTokenSize("source");
-
-    for (std::int32_t accepted : {-2, 0, std::numeric_limits<std::int32_t>::max()}) {
-        SCOPED_TRACE(accepted);
-        ExecutionEvent invalid;
-        invalid.With(forward::ExtendResult{
-            .request_id = "source",
-            .tokens = {42},
-            .num_accepted_tokens = accepted,
-        });
-        EXPECT_THROW(scheduler_->Advance(invalid), std::invalid_argument);
-        EXPECT_EQ(scheduler_->RequestTokenSize("source"), previous_size);
-    }
-
-    SendForwardDone("source", {42});
-    EXPECT_EQ(scheduler_->RequestTokenSize("source"), previous_size + 1);
-    SendAbortEvent("source");
 }
 
 inline const ForwardBatch* FindForwardBatch(const std::vector<Operation>& operations) {
@@ -161,7 +135,7 @@ protected:
     }
 };
 
-TEST_F(FinishOnlyHybridWriteBackTestSuite, FinishStoresAllMlaPagesAndLatestKdaSnapshot) {
+TEST_F(FinishOnlyHybridWriteBackTestSuite, FinishStoresDecodeMlaPagesWithoutNewKdaSnapshot) {
     Submit(MakeRequestSpec("r0", /*num_pages=*/2, /*start=*/1));
     const ExecutionPlan prefill = PlanOnce();
     EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(prefill).empty());
@@ -188,10 +162,10 @@ TEST_F(FinishOnlyHybridWriteBackTestSuite, FinishStoresAllMlaPagesAndLatestKdaSn
     ASSERT_EQ(finish_stores.size(), 1u);
     const auto& finish_write_back = std::get<WriteBackBatch>(finish_stores.front());
     ASSERT_EQ(finish_write_back.group_ids.size(), 1u);
-    EXPECT_EQ(finish_write_back.group_ids.front(), (std::vector<std::uint32_t>{0, 1, 2, 3}))
-        << "finish writes one decode MLA page and only the latest snapshot from each KDA group";
+    EXPECT_EQ(finish_write_back.group_ids.front(), (std::vector<std::uint32_t>{0}))
+        << "finish writes decode MLA pages but no decode KDA snapshot";
     SendWriteBackDone(finish_write_back.op_ids.front());
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 9);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
 }
 
 class LoadBackDoneTestSuite : public SchedulerTestSuite {

@@ -201,9 +201,7 @@ def _batch(scheduler, request_id: str):
 def _feedback(scheduler, *, request_id: str, tokens: list[int], decode: bool):
     # Accepted-state commit and completion precede this feedback in every caller.
     torch.cuda.synchronize()
-    result = make_extend_result_event(
-        request_id, tokens, None, num_accepted_tokens=len(tokens)
-    )
+    result = make_extend_result_event(request_id, tokens, None)
     event = ts.ExecutionEvent().add_event(result)
     if decode:
         reserve = ts.ForwardEvent.UpdateReserveNumTokens()
@@ -299,18 +297,23 @@ def test_speculative_active_eviction_reuses_only_written_state_blocks(
     _feedback(scheduler, request_id="source", tokens=[4], decode=False)
 
     computed = 4
-    old_snapshot = None
-    latest_snapshot = None
-    latest_boundary = None
-    directly_released = 0
-    reused_snapshot = {group: False for group in KIMI_STATE_GROUPS}
+    previous_tables = tables
+    released = {group: set() for group in KIMI_STATE_GROUPS}
+    reused_outputs = {group: set() for group in KIMI_STATE_GROUPS}
     # 7 -> 10 crosses 8 without committing there; 10 -> 12 writes an aligned
-    # partial acceptance. Replacing latest actively removes the old Chunk once
-    # its working reference is gone; later GPU outputs reuse those real blocks.
+    # partial acceptance. Both remain working state only; later GPU outputs
+    # reuse retired blocks without retaining a Decode snapshot.
     for accepted in [1, 2, 3, 2, 1, 3] + [3, 1] * 6:
         batch, tables = _batch(scheduler, "source")
         assert batch.num_extends() == 0
         assert list(batch.input_lengths) == [_WIDTH]
+        expired_slots = max(0, (computed - _WIDTH) // _P)
+        for group in KIMI_STATE_GROUPS:
+            row = tables[group][0]
+            assert all(block == 0 for block in row[:expired_slots])
+            for slot, block in enumerate(previous_tables[group][0]):
+                if block > 0 and row[slot] == 0:
+                    released[group].add(block)
         actual.metadata(
             tables,
             begin=computed,
@@ -336,56 +339,31 @@ def test_speculative_active_eviction_reuses_only_written_state_blocks(
             reference_states[end],
             f"accepted endpoint {end}",
         )
-        if end == 12:
-            old_snapshot = {group: tables[group][0][2] for group in KIMI_STATE_GROUPS}
-        elif old_snapshot is not None and end > 16:
-            for group in KIMI_STATE_GROUPS:
-                if tables[group][0][(end - 1) // _P] == old_snapshot[group]:
-                    reused_snapshot[group] = True
+        for group in KIMI_STATE_GROUPS:
+            output_block = tables[group][0][(end - 1) // _P]
+            if output_block in released[group]:
+                reused_outputs[group].add(output_block)
         empty_before_feedback = scheduler.empty_lcm_blocks()
         assert empty_before_feedback > 0
-        released_by_replacement = 0
-        if end % _P == 0:
-            if latest_snapshot is not None:
-                # The latest snapshot stays in its original table slot even
-                # after normal working retention expires. The scheduler plans
-                # decode from token_size - width; its two-token state window
-                # therefore expires slots below (computed - width) // P.
-                assert latest_boundary is not None
-                expired_slots = max(0, (computed - _WIDTH) // _P)
-                if latest_boundary // _P - 1 < expired_slots:
-                    released_by_replacement = len(KIMI_STATE_GROUPS)
-                assert all(
-                    tables[group][0][latest_boundary // _P - 1]
-                    == latest_snapshot[group]
-                    for group in KIMI_STATE_GROUPS
-                )
-            latest_snapshot = {
-                group: tables[group][0][(end - 1) // _P] for group in KIMI_STATE_GROUPS
-            }
-            latest_boundary = end
         _feedback(
             scheduler,
             request_id="source",
             tokens=list(range(computed + 1, end + 1)),
             decode=True,
         )
-        assert (
-            scheduler.empty_lcm_blocks()
-            == empty_before_feedback + released_by_replacement
-        ), "latest replacement must release exactly the unpinned old Chunk parents"
-        directly_released += released_by_replacement
+        assert scheduler.empty_lcm_blocks() == empty_before_feedback
+        previous_tables = tables
         computed = end
     assert computed == 40
-    assert directly_released > 0
+    assert all(released.values())
     assert all(
-        reused_snapshot.values()
-    ), "active cleanup must recycle every group's token-12 block into a later GPU output"
+        reused_outputs.values()
+    ), "retired working blocks must become GPU outputs again"
     finish = ts.ForwardEvent.Finish()
     finish.request_id = "source"
     scheduler.advance(ts.ExecutionEvent().add_event(finish))
 
-    for boundary, expected_hit in ((8, 4), (12, 4), (40, 40)):
+    for boundary in (8, 12, 40):
         request = ts.RequestSpec()
         request.request_id = f"resume_{boundary}"
         request.tokens = list(range(boundary)) + [999]
@@ -393,7 +371,7 @@ def test_speculative_active_eviction_reuses_only_written_state_blocks(
         scheduler.submit_requests([request])
         batch, tables = _batch(scheduler, request.request_id)
         begin = int(batch.extend_prefix_lens[0])
-        assert begin == expected_hit
+        assert begin == 4
         end = begin + int(batch.input_lengths[0])
         actual.metadata(
             tables,

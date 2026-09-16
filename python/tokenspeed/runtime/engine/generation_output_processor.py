@@ -723,9 +723,7 @@ class OutputProcesser:
                 # that much, so the scheduler stops counting a forward
                 # against these pages and may retract the request if the
                 # next round needs them.
-                request_changes.append(
-                    make_extend_result_event(rid, num_accepted_tokens=0)
-                )
+                request_changes.append(make_extend_result_event(rid))
                 continue
 
             # Do not output chunking result
@@ -846,12 +844,7 @@ class OutputProcesser:
             # instead of waiting for KV that never comes.
             if is_prefill_instance and nan_detected:
                 request_changes.append(
-                    make_extend_result_event(
-                        rid,
-                        new_ids,
-                        spec_candidate_ids,
-                        num_accepted_tokens=output_length,
-                    )
+                    make_extend_result_event(rid, new_ids, spec_candidate_ids)
                 )
                 request_changes.append(make_abort_event(rid))
                 self._log_request_stats(rid, request_state, stats_now)
@@ -865,12 +858,7 @@ class OutputProcesser:
             # passive client that still needs a terminating finish streamed.
             if request_state.to_abort and request_state.finished:
                 request_changes.append(
-                    make_extend_result_event(
-                        rid,
-                        new_ids,
-                        spec_candidate_ids,
-                        num_accepted_tokens=output_length,
-                    )
+                    make_extend_result_event(rid, new_ids, spec_candidate_ids)
                 )
                 if is_prefill_instance:
                     # PD owns these pages until SucceededEvent or FailedEvent
@@ -892,12 +880,7 @@ class OutputProcesser:
                 continue
 
             request_changes.append(
-                make_extend_result_event(
-                    rid,
-                    new_ids,
-                    spec_candidate_ids,
-                    num_accepted_tokens=output_length,
-                )
+                make_extend_result_event(rid, new_ids, spec_candidate_ids)
             )
             if is_prefill_instance:
                 # Prefill instances: never stream intermediate output to detokenizer.

@@ -20,7 +20,7 @@
 
 #include "scheduler/scheduler.h"
 
-#include <limits>
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -47,7 +47,6 @@ void Scheduler::handleEvent(const pd::FailedEvent& event) {
     if (request == nullptr || request->Is<fsm::Finished>()) {
         return;
     }
-    clearLatestDecodeState(*request);
     request->Apply(fsm::AbortEvent{&coordinator_});
 }
 
@@ -59,7 +58,6 @@ void Scheduler::handleEvent(const pd::SucceededEvent& event) {
     if (!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) {
         throw std::logic_error("PD SucceededEvent received in state " + request->StateName());
     }
-    clearLatestDecodeState(*request);
     request->Apply(fsm::FinishEvent{&coordinator_});
 }
 
@@ -92,7 +90,6 @@ void Scheduler::handleEvent(const forward::Finish& event) {
                 pending_write_back_operations_.push_back(std::move(*store));
             }
         }
-        clearLatestDecodeState(*request);
         request->Apply(fsm::FinishEvent{&coordinator_});
     }
 }
@@ -129,10 +126,12 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
             progress.access_epoch);
         discardUncachedKvEventPages(event_keys);
     }
-    // Finalization must retain the selected cache entry even if the last
-    // round added no hash. These identities hold no Device references.
+    // Finalization retains only prefill checkpoints, never generated state.
+    const auto prefill_hashes = std::span<const std::string>{progress.prefix_hashes}.first(
+        std::min(progress.prefix_hashes.size(),
+                 static_cast<std::size_t>(request.PrefillSize() / coordinator_.PrefixGranularity())));
     std::optional<StateSnapshot> retained_snapshot =
-        coordinator_.RetainLatestStateSnapshot(progress.prefix_hashes, CacheBoundaryKind::kEndpoint);
+        coordinator_.RetainLatestStateSnapshot(prefill_hashes, CacheBoundaryKind::kEndpoint);
     if (!config_.StreamsDeviceCacheToHost()) {
         return std::nullopt;
     }
@@ -151,31 +150,10 @@ void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
     }
 }
 
-void Scheduler::handleEvent(const forward::ExtendResult& event, bool publish_state) {
+void Scheduler::handleEvent(const forward::ExtendResult& event) {
     if (Request* request = findRequest(event.request_id)) {
-        const std::int32_t previous_size = request->TokenSize();
-        const bool is_decode_result = previous_size > request->PrefillSize();
-        if (event.num_accepted_tokens < -1) {
-            throw std::invalid_argument("accepted token count must be non-negative or unspecified");
-        }
-        const std::int32_t accepted =
-            event.num_accepted_tokens < 0 ? static_cast<std::int32_t>(event.tokens.size()) : event.num_accepted_tokens;
-        if (accepted < static_cast<std::int32_t>(event.tokens.size())) {
-            throw std::invalid_argument("accepted token count is smaller than returned tokens");
-        }
-        const std::int64_t endpoint =
-            is_decode_result ? static_cast<std::int64_t>(previous_size) - 1 + accepted : request->PrefillSize();
-        if (endpoint > std::numeric_limits<std::int32_t>::max()) {
-            throw std::invalid_argument("accepted state endpoint exceeds int32 range");
-        }
         request->NoteResultLanded();
         request->Apply(fsm::ExtendResultEvent{event.tokens});
-        if (!event.tokens.empty() && request->HoldsPages()) {
-            request->NoteAcceptedStateEndpoint(static_cast<std::int32_t>(endpoint));
-            if (is_decode_result && publish_state) {
-                updateDecodeStateSnapshot(*request, static_cast<std::int32_t>(endpoint));
-            }
-        }
         if (!event.spec_candidate_ids.empty()) {
             request->StoreSpecCandidates(event.spec_candidate_ids);
         }
@@ -184,7 +162,6 @@ void Scheduler::handleEvent(const forward::ExtendResult& event, bool publish_sta
 
 void Scheduler::handleEvent(const forward::Abort& event) {
     if (Request* request = findRequest(event.request_id)) {
-        clearLatestDecodeState(*request);
         request->Apply(fsm::AbortEvent{&coordinator_});
     }
 }

@@ -278,8 +278,7 @@ private:
                     !state_kind_overrides_[group_id].contains(metadata->generation)) {
                     // ReclaimableBlockLocationsAt already proves the only
                     // owners are this expiring table slot and the index.
-                    // Protected slots were skipped by the allocator. Prefix
-                    // hits were excluded above; pending canonical publications
+                    // Prefix hits were excluded above; pending canonical publications
                     // are excluded by generation.
                     // Commit therefore cleans this Chunk even without a
                     // capacity victim. Credit its real packing now, and do

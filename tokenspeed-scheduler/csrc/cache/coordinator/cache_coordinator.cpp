@@ -545,50 +545,6 @@ std::optional<StateSnapshot> CacheCoordinator::RetainLatestStateSnapshot(std::sp
     return std::nullopt;
 }
 
-std::optional<StateSnapshot> CacheCoordinator::PublishStateSnapshot(std::span<BlockTable> tables,
-                                                                    std::span<const std::string> prefix_hashes,
-                                                                    std::int32_t boundary_tokens,
-                                                                    std::uint64_t access_epoch,
-                                                                    CacheBoundaryKind boundary_kind) {
-    _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
-    if (boundary_tokens <= 0 || boundary_tokens % prefix_granularity_ != 0 ||
-        static_cast<std::size_t>(boundary_tokens / prefix_granularity_) > prefix_hashes.size()) {
-        return std::nullopt;
-    }
-    for (std::size_t i = 0; i < groups_.size(); ++i) {
-        if (groups_[i].Spec().kind != AttnKind::kMambaState) {
-            continue;
-        }
-        const std::int32_t slot = boundary_tokens / geometry_[i].BlockGranularity() - 1;
-        if (slot >= tables[i].NumBlocks() || !tables[i].Blocks()[static_cast<std::size_t>(slot)]) {
-            return std::nullopt;
-        }
-    }
-    const std::string& hash = prefix_hashes[static_cast<std::size_t>(boundary_tokens / prefix_granularity_ - 1)];
-    for (std::size_t i = 0; i < groups_.size(); ++i) {
-        if (groups_[i].Spec().kind != AttnKind::kMambaState) {
-            continue;
-        }
-        const std::int32_t blocks_per_prefix = prefix_granularity_ / geometry_[i].BlockGranularity();
-        const std::array keys{
-            CacheKey{.group_id = groups_[i].Id(), .content_hash = hash, .page_offset = blocks_per_prefix - 1}};
-        cacheFullBlocksForGroup<CacheTier::kDevice>(i, tables[i], keys,
-                                                    boundary_tokens / geometry_[i].BlockGranularity() - 1, access_epoch,
-                                                    boundary_kind, false);
-    }
-    return CaptureStateSnapshot(prefix_hashes, boundary_tokens);
-}
-
-std::optional<StateSnapshot> CacheCoordinator::PublishAndProtectStateSnapshot(
-    std::span<BlockTable> tables, std::span<const std::string> prefix_hashes, std::int32_t boundary_tokens,
-    std::uint64_t access_epoch, CacheBoundaryKind boundary_kind) {
-    auto snapshot = PublishStateSnapshot(tables, prefix_hashes, boundary_tokens, access_epoch, boundary_kind);
-    if (!snapshot || !ProtectStateSnapshot(tables, *snapshot)) {
-        return std::nullopt;
-    }
-    return snapshot;
-}
-
 bool CacheCoordinator::StateSnapshotIsCurrent(const StateSnapshot& snapshot) const {
     if (snapshot.boundary_tokens <= 0 || snapshot.boundary_tokens % prefix_granularity_ != 0 ||
         snapshot.blocks.empty()) {
@@ -629,53 +585,6 @@ bool CacheCoordinator::RetainStateSnapshot(const StateSnapshot& snapshot, CacheB
                 "validated state snapshot changed during retention");
     }
     return true;
-}
-
-bool CacheCoordinator::ProtectStateSnapshot(std::span<BlockTable> tables, const StateSnapshot& snapshot) {
-    _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
-    if (!StateSnapshotIsCurrent(snapshot)) {
-        return false;
-    }
-    for (const CachedStateBlock& block : snapshot.blocks) {
-        const std::size_t i = block.key.group_id;
-        const std::int32_t slot = snapshot.boundary_tokens / geometry_[i].BlockGranularity() - 1;
-        if (slot >= tables[i].NumBlocks() || !tables[i].Blocks()[static_cast<std::size_t>(slot)] ||
-            !tables[i].Blocks()[static_cast<std::size_t>(slot)].IsOwnedBy(pool_)) {
-            return false;
-        }
-        const auto identity =
-            groups_[i].Index().IdentityFor(pool_, tables[i].Blocks()[static_cast<std::size_t>(slot)]->Location());
-        if (!identity || identity->key != block.key || identity->generation != block.generation) {
-            return false;
-        }
-    }
-    setProtectedStateBoundary(tables, snapshot.boundary_tokens);
-    return true;
-}
-
-void CacheCoordinator::ClearProtectedStateSnapshot(std::span<BlockTable> tables) {
-    _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
-    setProtectedStateBoundary(tables, 0);
-}
-
-void CacheCoordinator::setProtectedStateBoundary(std::span<BlockTable> tables, std::int32_t boundary_tokens) {
-    std::vector<CacheBlockRef> expired_refs;
-    expired_refs.reserve(groups_.size());
-    for (std::size_t i = 0; i < groups_.size(); ++i) {
-        if (groups_[i].Spec().kind != AttnKind::kMambaState) {
-            continue;
-        }
-        const std::int32_t slot = boundary_tokens > 0 ? boundary_tokens / geometry_[i].BlockGranularity() - 1 : -1;
-        expired_refs.push_back(groups_[i].Allocator().SetProtectedSlot(tables[i], slot));
-    }
-    // Every group now protects the new boundary. Drop only the old references
-    // already behind their reclaim frontier, then clean the affected Chunks.
-    std::vector<CacheBlockRef*> refs;
-    refs.reserve(expired_refs.size());
-    for (CacheBlockRef& ref : expired_refs) {
-        refs.push_back(&ref);
-    }
-    ReleaseDeviceBlockRefs(refs);
 }
 
 void CacheCoordinator::QueueStateSnapshotForStore(const StateSnapshot& snapshot) {
@@ -1063,22 +972,9 @@ void CacheCoordinator::reclaimExpiredForGroup(std::size_t group_index, BlockTabl
     const std::int32_t expired =
         std::min(groupExpiredBlocksAt(static_cast<std::int32_t>(group_index), num_computed_tokens), table.NumBlocks());
     const std::int32_t begin = std::min(table.ReclaimedPrefixBlocks(), expired);
-    const std::int32_t protected_slot = table.ProtectedSlot();
-    if (begin <= protected_slot && protected_slot < expired) {
-        collectStateBlocks(
-            group_index,
-            table.Blocks().subspan(static_cast<std::size_t>(begin), static_cast<std::size_t>(protected_slot - begin)),
-            candidates);
-        collectStateBlocks(group_index,
-                           table.Blocks().subspan(static_cast<std::size_t>(protected_slot + 1),
-                                                  static_cast<std::size_t>(expired - protected_slot - 1)),
-                           candidates);
-    } else {
-        collectStateBlocks(
-            group_index,
-            table.Blocks().subspan(static_cast<std::size_t>(begin), static_cast<std::size_t>(expired - begin)),
-            candidates);
-    }
+    collectStateBlocks(
+        group_index, table.Blocks().subspan(static_cast<std::size_t>(begin), static_cast<std::size_t>(expired - begin)),
+        candidates);
     groups_[group_index].Allocator().ReclaimExpired(pool_, table, expired);
 }
 

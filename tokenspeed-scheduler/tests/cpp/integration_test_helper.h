@@ -138,7 +138,6 @@ protected:
         event.With(forward::ExtendResult{
             .request_id = request_id,
             .tokens = tokens,
-            .num_accepted_tokens = static_cast<std::int32_t>(tokens.size()),
         });
         scheduler_->Advance(std::move(event));
     }
