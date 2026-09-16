@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Real scheduler allocations drive GPU KDA across active state eviction.
+"""Real scheduler allocations drive GPU KDA as working state blocks are recycled.
 
 The small three-group pool and KDA kernels come from the existing numerical
 harness. Every working block id, prefix hit and sparse hole comes from the
@@ -326,7 +326,7 @@ def _assert_steps_match(actual: _Step, reference: _Step):
 
 @requires_cuda
 @requires_fla
-def test_scheduler_eviction_reuses_state_blocks_without_changing_kda_or_resume():
+def test_scheduler_recycles_unpublished_state_without_changing_kda_or_resume():
     """Recycled scheduler blocks cannot change continuation or cached-prefix state."""
     active = _ScheduledKDA(seed=91)
     source_tokens = list(range(_PROMPT_TOKENS + 5))
@@ -343,10 +343,9 @@ def test_scheduler_eviction_reuses_state_blocks_without_changing_kda_or_resume()
         steps += 1
         assert active.scheduler.empty_lcm_blocks() > 0
         if steps == 3:
-            # Packing is one block per parent. The first checkpoint has left
-            # the working tables and has been removed from every state group,
-            # even though there is still free capacity. No cache-only Chunk
-            # parent remains outside the materialized working tables.
+            # Packing is one block per parent. Ordinary prefill checkpoints
+            # are never published, so the first checkpoint returns to the
+            # pool when its last working reference leaves the table.
             materialized = sum(
                 block > 0
                 for rows in actual.tables.values()
@@ -359,8 +358,8 @@ def test_scheduler_eviction_reuses_state_blocks_without_changing_kda_or_resume()
             assert all(len(active.released[group]) == 1 for group in KIMI_STATE_GROUPS)
 
     # The released parents cycle through the allocator and become real GPU
-    # output destinations again. Active cleanup keeps the entire prefill below
-    # capacity; physical reuse does not depend on a pressure-triggered sweep.
+    # output destinations again. Unpublished working state returns directly
+    # to the pool, keeping the entire prefill below capacity.
     assert all(active.reused_outputs[group] for group in KIMI_STATE_GROUPS)
 
     boundary = 15 * _P

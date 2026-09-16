@@ -130,8 +130,9 @@ an off-boundary endpoint is never keyed as a complete prefix.
 produced by admitted prefill windows: local prefill records its last aligned
 boundary, and a remote landing records only an aligned endpoint. Publication
 uses the preceding window's record before the next prefill advances it.
-Admission, finish and retraction publish only recorded boundaries covered by
-the newly hashed range. A successful admission discards the covered records;
+Only State Endpoint and Promoted boundaries are published; ordinary chunks
+remain request-owned. Admission, finish and retraction publish only recorded
+boundaries covered by the newly hashed range. A successful admission discards the covered records;
 a failed one leaves them for retry.
 
 Decode records and publishes no state checkpoints. The first decode admission
@@ -171,43 +172,14 @@ The capacity guarantees are retention-specific:
   The P role and intermediate local chunks reserve no growth block (the next
   sparse re-shaping requires `AvailableTokens() == 0`).
 
-#### State-cache cleanup
-
-An ordinary state Chunk is removed once the cache index is its only owner.
-Cleanup runs when working or load-back references are released. It checks
-registration generations and does not depend on capacity pressure. Prefix reuse
-does not permanently exempt a Chunk from cleanup. Endpoint and Promoted keep
-their existing kinds; MLA/full-history and sliding-window cleanup and ordering
-are unchanged.
-
-When prefill publishes its last reusable boundary, it marks it Endpoint,
-including a boundary followed by a final tail shorter than the prefix
-granularity. Reusing an existing Chunk followed by a tail that adds no new hash
-does not itself upgrade that entry. Decode keeps only the working state
-required by its current execution window, with no extra latest
-snapshot. It neither publishes aligned decode checkpoints nor pins an older
-checkpoint beyond that window. Each sharing request keeps its own table
-reference; only the last owner can make an ordinary Chunk eligible for cleanup.
-Admission retains the original epoch, tier and position ordering without a
-separate state-first pass. Its shadow plan first credits ordinary Chunks that
-the same commit is guaranteed to release, so that cleanup does
-not cause unnecessary eviction of other entries.
-
-Finish may retain the newest complete resident prefill checkpoint as Endpoint,
-even if the last round added no hash. It does not publish decode state or create
-a decode Endpoint. Retraction's best-effort L2 writeback uses the same
-prefill-bounded selection before releasing request ownership. Recovery reuses
-an available checkpoint and recomputes the suffix, or recomputes from scratch
-when none remains. Local recovery follows ordinary prefill publication rules.
-Retraction without L2 adds no new Endpoint publication path. Ordinary state
-Chunks do not start L2 stores. Existing Host copies and in-flight transfer
-protection remain intact. Abort releases request state without publishing an
-endpoint; earlier Endpoint/Promoted entries remain reusable.
-
-KDA uses non-mixed batches. This policy does not change its kernel outputs or
-transfer fences. All request references remain in the original block tables,
-so active-page accounting and retract release estimates need no new holder
-accounting.
+Finish publishes any remaining prefill result and queues existing prefill
+checkpoints for L2; it does not search for a checkpoint to upgrade. With L2,
+retracting a prefill publishes its actually computed boundary as Endpoint using
+the same publication path. Both `Prefilling` and `PrefillDone` take that position
+from their prefill window. Decode retraction creates no new checkpoint. The
+existing writeback queue and transfer guards handle recovery; without L2,
+retraction adds no new publication path. A missing checkpoint means recomputing
+the suffix or the entire request. Recovery itself follows ordinary prefill.
 
 ### 1.3 Bounded replay
 
@@ -340,14 +312,6 @@ must count the entire materialized suffix, not assume that two outputs always
 occupy two adjacent slots. Tests cover small pools that must reject an oversized
 request instead of accepting a request that can never produce a forward.
 
-Decode has a separate state peak: for verification width `W`, state block
-granularity `G`, and overlap protection `O` tokens, its working window needs at
-most `ceil((2W + O + G - 1) / G)` blocks. This bound is capped by the absolute table
-extent, `ceil((token_limit + W + O - 1) / G)`, including verification beyond
-the final output limit. The state-group budget takes the maximum of this
-Decode peak and the existing Prefill/remote-landing peaks, then converts it to
-physical LCM blocks using the group's packing.
-
 ## 2. Retraction: when admission fails
 
 `maybeRetractForCapacity` fires when **no prefill made progress** this round
@@ -438,8 +402,8 @@ engine does not perform — the peer's decode on a P node, the peer's prefill on
 a D node — is not counted here; those are fenced by the PD transfer ack.
 
 **Victim choice** (`chooseVictim`, shared by D and fused): an incomplete
-prefill first — it has produced no output a client is reading, and its
-computed chunks survive as a prefix for the retry — largest first, freeing the
+prefill first — it has produced no output a client is reading, and L2 writeback
+may preserve a computed checkpoint for the retry — largest first, freeing the
 most at once; then decode work by most newly releasable LCM blocks and fewest
 tokens — the most capacity for the least lost work. Exempt in both tiers: a
 request whose reserve already covers its whole generation

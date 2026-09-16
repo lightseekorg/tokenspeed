@@ -178,7 +178,7 @@ TEST(MakeCoordinatorTest, Qwen35UsesUniformLogicalPWithDifferentPacking) {
     }
 
     const std::vector<std::string> hashes = ContentHashes({std::vector<std::int32_t>(128, 7)});
-    coord.CacheFullBlocks(tables, hashes, NextTestAccessEpoch(), 0, CacheBoundaryKind::kEndpoint);
+    CacheFullBlocksForTest(coord, tables, hashes);
     coord.Free(tables);
     CoordinatorMatch match = MatchPrefixForTest(coord, hashes).device;
     EXPECT_EQ(match.num_common_tokens, 128);
@@ -1257,45 +1257,31 @@ TEST(CacheCoordinatorAdmissionTest, PromotedBoundaryUsesNormalValueWithinSameEpo
     EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[1], 0)));
 }
 
-TEST(CacheCoordinatorAdmissionTest, ActualHitIsSameEpochPreferenceNotPermanentStateRetention) {
-    for (const AttnKind kind : {AttnKind::kMambaState, AttnKind::kSlidingWindow}) {
-        SCOPED_TRACE(static_cast<int>(kind));
-        BlockPool pool(2, {1});
-        const std::vector<CacheGroupSpec> specs = {
-            {.kind = kind,
-             .sliding_window = kind == AttnKind::kSlidingWindow ? 8 : 0,
-             .cache_blocks_per_lcm_block = 1,
-             .block_granularity = 4},
-        };
-        CacheCoordinator coordinator =
-            MakeCoordinator(specs, 4, pool, /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
-        GroupAllocator& manager = coordinator.Allocator(0);
-        const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+TEST(CacheCoordinatorAdmissionTest, ActualHitPromotesChunkBoundaryToNormalValue) {
+    BlockPool pool(2, {1});
+    const std::vector<CacheGroupSpec> specs = {
+        {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+    };
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 4, pool, /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
+    GroupAllocator& manager = coordinator.Allocator(0);
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
 
-        CacheBoundaryForGroup(coordinator, pool, hashes[0], /*group_id=*/0, /*access_epoch=*/1,
-                              /*logical_block_index=*/2);
-        std::vector<BlockTable> hit_tables(coordinator.NumGroups());
-        const std::optional<CacheCoordinator::AdmissionResult> hit =
-            AdmitForTest(coordinator, hit_tables, coordinator.ProbePrefix(std::span{hashes}.first(1)), GroupDemand{});
-        ASSERT_TRUE(hit);
-        const auto acquired_metadata = coordinator.GroupPrefixIndex(0).MetadataFor(pool, Key(hashes[0], 0));
-        ASSERT_TRUE(acquired_metadata);
-        EXPECT_TRUE(acquired_metadata->was_acquired);
-        EXPECT_EQ(acquired_metadata->boundary_kind, CacheBoundaryKind::kChunk);
-        coordinator.Free(hit_tables);
-        const bool is_state = kind == AttnKind::kMambaState;
-        EXPECT_EQ(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0)), !is_state);
+    CacheBoundaryForGroup(coordinator, pool, hashes[0], /*group_id=*/0, /*access_epoch=*/1,
+                          /*logical_block_index=*/2);
+    std::vector<BlockTable> hit_tables(coordinator.NumGroups());
+    const std::optional<CacheCoordinator::AdmissionResult> hit =
+        AdmitForTest(coordinator, hit_tables, coordinator.ProbePrefix(std::span{hashes}.first(1)), GroupDemand{});
+    ASSERT_TRUE(hit);
+    coordinator.Free(hit_tables);
 
-        CacheBoundaryForGroup(coordinator, pool, hashes[1], /*group_id=*/0, hit->access_epoch,
-                              /*logical_block_index=*/6);
-        std::vector<BlockTable> tables(coordinator.NumGroups());
-        ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
+    CacheBoundaryForGroup(coordinator, pool, hashes[1], /*group_id=*/0, hit->access_epoch,
+                          /*logical_block_index=*/6);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
 
-        // State was already cleaned; SWA retains the original same-epoch
-        // preference for a successful hit over an unacquired Chunk.
-        EXPECT_EQ(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0)), !is_state);
-        EXPECT_EQ(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[1], 0)), is_state);
-    }
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0)));
+    EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[1], 0)));
 }
 
 TEST(CacheCoordinatorAdmissionTest, EndpointIsNotBelowEveryPreviouslyHitBlock) {
@@ -1456,12 +1442,11 @@ TEST(CacheCoordinatorAdmissionTest, ProspectiveUncachedReclaimDoesNotEvictCached
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(cached_hash, 0)));
 }
 
-TEST(CacheCoordinatorAdmissionTest, QwenScaleChunkLifecyclePublishesOneStateSnapshotPerChunk) {
+TEST(CacheCoordinatorAdmissionTest, QwenScaleChunkLifecyclePublishesOnlyTheFinalStateBoundary) {
     constexpr std::int32_t kBlockTokens = 128;
     constexpr std::int32_t kPromptPages = 256;
     constexpr std::int32_t kChunkPages = 64;
-    // Plenty of capacity: intermediate state disappears because its final
-    // request reference was released, not because admission needed memory.
+    // Plenty of capacity: ordinary working chunks never enter the state index.
     BlockPool pool(/*num_lcm_blocks=*/512, {1, 1, 1, 32});
     const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kMambaState,
@@ -1549,8 +1534,8 @@ TEST(CacheCoordinatorAdmissionTest, QwenScaleChunkLifecyclePublishesOneStateSnap
     coordinator.Free(tables);
 
     for (std::int32_t group = 0; group < 3; ++group) {
-        EXPECT_EQ(stored_states[group], 4) << "every materialized chunk boundary was published";
-        EXPECT_EQ(removed_states[group], 3) << "only the final retained boundary survives";
+        EXPECT_EQ(stored_states[group], 1) << "only the final boundary is published";
+        EXPECT_EQ(removed_states[group], 0) << "ordinary chunks create no cache mutations";
         EXPECT_EQ(coordinator.GroupPrefixIndex(group).NumEntries(pool), 1);
     }
     EXPECT_EQ(coordinator.GroupPrefixIndex(3).NumEntries(pool), kPromptPages);
@@ -2915,8 +2900,8 @@ TEST(CacheCoordinatorStoreCandidates, PrefillChunkStreamsHistoryButNotState) {
     EXPECT_EQ(prefill[1].key, Key(hashes[1], /*group_id=*/0));
     EXPECT_EQ(prefill[2].key, Key(hashes[0], /*group_id=*/1));
     EXPECT_EQ(prefill[3].key, Key(hashes[1], /*group_id=*/1));
-    EXPECT_TRUE(coordinator.GroupPrefixIndex(2).Contains(pool, Key(hashes[1], 2)))
-        << "the intermediate state remains reusable on Device";
+    EXPECT_FALSE(coordinator.GroupPrefixIndex(2).Contains(pool, Key(hashes[1], 2)))
+        << "an ordinary state chunk remains request-local";
 
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/2));
     std::vector<std::string> decode_hashes = hashes;
@@ -2929,26 +2914,17 @@ TEST(CacheCoordinatorStoreCandidates, PrefillChunkStreamsHistoryButNotState) {
     ASSERT_EQ(decode.size(), 1u);
     EXPECT_EQ(decode[0].key, Key(decode_hashes[2], /*group_id=*/1));
 
-    EXPECT_FALSE(CacheCoordinatorTestAccess::CaptureStateSnapshot(coordinator, decode_hashes, 6));
-    const auto snapshot = CacheCoordinatorTestAccess::CaptureStateSnapshot(coordinator, hashes, 4);
-    ASSERT_TRUE(snapshot);
-    EXPECT_EQ(snapshot->boundary_tokens, 4);
-    coordinator.QueueStateSnapshotForStore(*snapshot);
-    EXPECT_TRUE(coordinator.TakePendingStores().empty()) << "unretained state must not be stored";
+    EXPECT_FALSE(coordinator.GroupPrefixIndex(2).Contains(pool, Key(decode_hashes[2], 2)));
     coordinator.QueueCachedBlocksForStore(decode_hashes);
-    const auto retained = coordinator.RetainLatestStateSnapshot(hashes, CacheBoundaryKind::kEndpoint);
-    ASSERT_TRUE(retained);
-    EXPECT_EQ(retained->boundary_tokens, 4);
-    coordinator.QueueStateSnapshotForStore(*retained);
+    coordinator.QueueLatestSnapshotBlocksForStore(decode_hashes);
     std::vector<CacheCoordinator::StoreCandidate> finish = coordinator.TakePendingStores();
-    ASSERT_EQ(finish.size(), 7u);
+    ASSERT_EQ(finish.size(), 6u);
     EXPECT_EQ(finish[0].key, Key(decode_hashes[0], /*group_id=*/0));
     EXPECT_EQ(finish[1].key, Key(decode_hashes[1], /*group_id=*/0));
     EXPECT_EQ(finish[2].key, Key(decode_hashes[2], /*group_id=*/0));
     EXPECT_EQ(finish[3].key, Key(decode_hashes[0], /*group_id=*/1));
     EXPECT_EQ(finish[4].key, Key(decode_hashes[1], /*group_id=*/1));
     EXPECT_EQ(finish[5].key, Key(decode_hashes[2], /*group_id=*/1));
-    EXPECT_EQ(finish[6].key, Key(hashes[1], /*group_id=*/2));
     coordinator.Free(tables);
 }
 
@@ -3006,12 +2982,11 @@ TEST(CacheCoordinatorStoreCandidates, PrefillEndpointStreamsThreeKdaGroupsDecode
                                 /*stream_completed_to_host=*/false, /*materialized_state_boundaries=*/{});
     EXPECT_TRUE(coordinator.TakePendingStores().empty()) << "decode publication must not auto-stream MLA or KDA";
 
-    EXPECT_FALSE(CacheCoordinatorTestAccess::CaptureStateSnapshot(coordinator, decode_hashes, 6));
+    for (std::uint32_t group = 1; group < 4; ++group) {
+        EXPECT_FALSE(coordinator.GroupPrefixIndex(group).Contains(pool, Key(decode_hashes[2], group)));
+    }
     coordinator.QueueCachedBlocksForStore(decode_hashes);
-    const auto snapshot = coordinator.RetainLatestStateSnapshot(hashes, CacheBoundaryKind::kEndpoint);
-    ASSERT_TRUE(snapshot);
-    EXPECT_EQ(snapshot->boundary_tokens, 4);
-    coordinator.QueueStateSnapshotForStore(*snapshot);
+    coordinator.QueueLatestSnapshotBlocksForStore(decode_hashes);
     std::vector<CacheCoordinator::StoreCandidate> finish = coordinator.TakePendingStores();
     ASSERT_EQ(finish.size(), 6u) << "all MLA pages plus only the prefill checkpoint per KDA group";
     EXPECT_EQ(finish[0].key, Key(decode_hashes[0], /*group_id=*/0));
@@ -3864,7 +3839,7 @@ TEST(CompletedBoundaryTest, PublicationWithoutCompletedPagesIsRejected) {
     coordinator.Free(tables);
 }
 
-TEST(MambaStateRegistrationTest, MambaPublishesOnlyChunkBoundary) {
+TEST(MambaStateRegistrationTest, OrdinaryStateChunkRemainsUnindexedWhileHistoryIsPublished) {
     BlockPool pool(32, {1, 1});
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
@@ -3894,8 +3869,12 @@ TEST(MambaStateRegistrationTest, MambaPublishesOnlyChunkBoundary) {
     EXPECT_TRUE(coord.GroupPrefixIndex(0).Contains(pool, Key(ch[2], 0)));
     EXPECT_FALSE(coord.GroupPrefixIndex(1).Contains(pool, Key(ch[0], 1)));
     EXPECT_FALSE(coord.GroupPrefixIndex(1).Contains(pool, Key(ch[1], 1)));
-    EXPECT_TRUE(coord.GroupPrefixIndex(1).Contains(pool, Key(ch[2], 1)));
+    EXPECT_FALSE(coord.GroupPrefixIndex(1).Contains(pool, Key(ch[2], 1)));
+    ASSERT_TRUE(tables[1].Blocks()[2]);
+    EXPECT_TRUE(tables[1].Blocks()[2].unique()) << "only the working table owns the computed Chunk";
+    const auto working = tables[1].Blocks()[2]->Location();
     coord.Free(tables);
+    EXPECT_FALSE(pool.IsOccupied(working));
 }
 
 TEST(MambaStateRegistrationTest, MambaPublishesAlignedEndpoint) {
@@ -3983,7 +3962,7 @@ TEST(MambaStateRegistrationTest, PublishesOnlyProvenBoundariesCoveredByHashes) {
                     CompletedPages{
                         .prefix_hashes = hashes,
                         .first_new_prefix_page = 0,
-                        .boundary_kind = direct ? CacheBoundaryKind::kEndpoint : CacheBoundaryKind::kChunk,
+                        .boundary_kind = CacheBoundaryKind::kEndpoint,
                         .materialized_state_boundaries = pending,
                     },
                 .num_computed_tokens = 10,
@@ -3998,7 +3977,7 @@ TEST(MambaStateRegistrationTest, PublishesOnlyProvenBoundariesCoveredByHashes) {
             EXPECT_EQ(boundary_was_published, std::ranges::find(pending, 8) != pending.end());
             for (std::int32_t page = 0; page < 2; ++page) {
                 EXPECT_EQ(coord.GroupPrefixIndex(0).Contains(pool, Key(hashes[page], 0)),
-                          direct && std::ranges::find(pending, (page + 1) * 4) != pending.end());
+                          std::ranges::find(pending, (page + 1) * 4) != pending.end());
             }
             coord.Free(tables);
         }
@@ -4238,6 +4217,97 @@ TEST(GroupAllocatorBoundaryTest, BoundaryPromotionIsMonotonic) {
     ASSERT_TRUE(metadata);
     EXPECT_EQ(metadata->boundary_kind, CacheBoundaryKind::kPromoted);
 }
+TEST(MambaStateRegistrationTest, ComputedChunksStayRequestLocalAndRetainedBoundariesRemainReusable) {
+    for (const auto kind : {CacheBoundaryKind::kChunk, CacheBoundaryKind::kEndpoint, CacheBoundaryKind::kPromoted}) {
+        for (const std::int32_t granularity : {1, 2, 4}) {
+            for (const bool direct : {false, true}) {
+                SCOPED_TRACE(::testing::Message() << static_cast<int>(kind) << "/" << granularity << "/" << direct);
+                BlockPool pool(16, {1});
+                const std::array specs{CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = granularity}};
+                auto coordinator = MakeCoordinator(specs, 4, pool, nullptr, false);
+                std::vector<BlockTable> tables(1);
+                ASSERT_TRUE(AdmitForTest(coordinator, tables, 8));
+                const std::vector<std::string> hashes{"computed-boundary"};
+                const std::int32_t boundary_slot = 4 / granularity - 1;
+                const auto location = tables[0].Blocks()[boundary_slot]->Location();
+                const std::array materialized{4};
+                const std::array demands{GroupDemand{.table = &tables[0]}};
+                const RequestProgress progress{
+                    .completed_pages =
+                        CompletedPages{
+                            .prefix_hashes = hashes,
+                            .boundary_kind = kind,
+                            .materialized_state_boundaries = materialized,
+                        },
+                    .num_computed_tokens = 4,
+                };
+                if (direct) {
+                    coordinator.CacheCompletedBlocks(tables, progress, 7);
+                } else {
+                    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt));
+                }
+                const bool cached = kind != CacheBoundaryKind::kChunk;
+                EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), cached ? 1 : 0);
+                EXPECT_EQ(coordinator.ProbePrefix(hashes).device.num_common_tokens, cached ? 4 : 0);
+                ASSERT_TRUE(tables[0].Blocks()[boundary_slot]);
+                EXPECT_EQ(tables[0].Blocks()[boundary_slot].use_count(), cached ? 2u : 1u);
+
+                // A later round with no new hash must not supplement or
+                // upgrade the previous boundary from the working table.
+                const RequestProgress unchanged{.num_computed_tokens = 4};
+                ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, unchanged, std::nullopt));
+                EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), cached ? 1 : 0);
+
+                CacheBlockRef reader = tables[0].Blocks()[boundary_slot];
+                coordinator.ReclaimExpired(tables, 6);
+                EXPECT_FALSE(tables[0].Blocks()[boundary_slot]);
+                EXPECT_TRUE(pool.IsOccupied(location)) << "a working consumer still owns its input";
+                reader.reset();
+                EXPECT_EQ(pool.IsOccupied(location), cached);
+                coordinator.Free(tables);
+                EXPECT_EQ(coordinator.ProbePrefix(hashes).device.num_common_tokens, cached ? 4 : 0);
+                if (cached) {
+                    const auto metadata = coordinator.GroupPrefixIndex(0).MetadataFor(pool, location);
+                    ASSERT_TRUE(metadata);
+                    EXPECT_EQ(metadata->boundary_kind, kind);
+                }
+            }
+        }
+    }
+}
+
+TEST(CacheCoordinatorAdmissionTest, UnpublishedWorkingChunkSurvivesRejectedAdmissionAndFundsRetry) {
+    BlockPool pool(2, {1});
+    const std::array specs{CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = 4}};
+    auto coordinator = MakeCoordinator(specs, 4, pool, nullptr, false);
+    std::vector<BlockTable> tables(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, 8));
+    const auto expired = tables[0].Blocks()[0]->Location();
+    const auto working = tables[0].Blocks()[1]->Location();
+    const std::vector<std::string> hashes{"ordinary"};
+    const std::array materialized{4};
+    std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{8}}};
+    const RequestProgress progress{
+        .completed_pages =
+            CompletedPages{
+                .prefix_hashes = hashes,
+                .boundary_kind = CacheBoundaryKind::kChunk,
+                .materialized_state_boundaries = materialized,
+            },
+        .num_computed_tokens = 6,
+    };
+    EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt));
+    EXPECT_EQ(tables[0].ReclaimedPrefixBlocks(), 0);
+    EXPECT_EQ(tables[0].Blocks()[0]->Location(), expired);
+    EXPECT_EQ(tables[0].Blocks()[1]->Location(), working);
+    EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 0);
+    demands[0].extent = DenseGrowth{4};
+    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt));
+    EXPECT_FALSE(tables[0].Blocks()[0]);
+    EXPECT_EQ(tables[0].Blocks()[1]->Location(), working);
+    EXPECT_EQ(tables[0].Blocks()[2]->Location(), expired);
+    EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 0);
+}
 
 // ---- Bounded replay --------------------------------------------------------
 //
@@ -4404,269 +4474,6 @@ TEST(BoundedReplayCoordinator, RetentionStillReclaimsReplayablePages) {
     for (const CacheBlockRef& block : tables[0].Blocks()) {
         EXPECT_TRUE(block);
     }
-}
-
-TEST(CacheCoordinatorStateSnapshot, CapturesCompleteStateOnlyAndOwnsNoDeviceReference) {
-    BlockPool pool(12, {1, 1, 1});
-    const std::vector<CacheGroupSpec> specs{
-        {.kind = AttnKind::kFull, .block_granularity = 2},
-        {.kind = AttnKind::kMambaState, .block_granularity = 2},
-        {.kind = AttnKind::kMambaState, .block_granularity = 4},
-    };
-    auto coordinator = MakeCoordinator(specs, 4, pool, nullptr, false);
-    std::vector<BlockTable> tables(specs.size());
-    ASSERT_TRUE(AdmitForTest(coordinator, tables, 4));
-    const std::vector<std::string> hashes{"boundary4"};
-    CacheCompletedBlocksForTest(coordinator, tables, hashes, 7, 0, 4, CacheBoundaryKind::kEndpoint, false,
-                                std::array{4});
-    const auto snapshot = CacheCoordinatorTestAccess::CaptureStateSnapshot(coordinator, hashes, 4);
-    ASSERT_TRUE(snapshot);
-    ASSERT_EQ(snapshot->blocks.size(), 2u);
-    EXPECT_EQ(snapshot->blocks[0].key, Key(hashes[0], 1, 1));
-    EXPECT_EQ(snapshot->blocks[1].key, Key(hashes[0], 2, 0));
-    EXPECT_TRUE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(coordinator, *snapshot));
-    EXPECT_FALSE(CacheCoordinatorTestAccess::CaptureStateSnapshot(coordinator, hashes, 2));
-    EXPECT_FALSE(CacheCoordinatorTestAccess::CaptureStateSnapshot(coordinator, hashes, 8));
-    auto malformed = *snapshot;
-    malformed.blocks.pop_back();
-    EXPECT_FALSE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(coordinator, malformed));
-    malformed = *snapshot;
-    malformed.blocks[1].key.content_hash = "different-boundary";
-    EXPECT_FALSE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(coordinator, malformed));
-    coordinator.Free(tables);
-    const auto missing = coordinator.AcquireDeviceCachedBlock(snapshot->blocks[1].key)->Location();
-    ASSERT_TRUE(coordinator.GroupPrefixIndex(2).Evict(pool, missing));
-    EXPECT_FALSE(CacheCoordinatorTestAccess::CaptureStateSnapshot(coordinator, hashes, 4));
-    EXPECT_TRUE(coordinator.ClearDeviceCache()) << "a snapshot is a handle, not a pin";
-    EXPECT_FALSE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(coordinator, *snapshot));
-}
-
-TEST(CacheCoordinatorStateSnapshot, MonotonicRetentionAndGenerationRejectReplacedEntries) {
-    BlockPool pool(4, {1, 1});
-    const std::vector<CacheGroupSpec> specs{
-        {.kind = AttnKind::kMambaState, .block_granularity = 2},
-        {.kind = AttnKind::kMambaState, .block_granularity = 2},
-    };
-    auto coordinator = MakeCoordinator(specs, 2, pool, nullptr, false);
-    const std::vector<std::string> hashes{"boundary2"};
-    const auto first = CacheBoundaryForGroup(coordinator, pool, hashes[0], 0, 7, 0, CacheBoundaryKind::kChunk);
-    CacheBoundaryForGroup(coordinator, pool, hashes[0], 1, 7, 0, CacheBoundaryKind::kChunk);
-    const auto snapshot = CacheCoordinatorTestAccess::CaptureStateSnapshot(coordinator, hashes, 2);
-    ASSERT_TRUE(snapshot);
-    ASSERT_TRUE(CacheCoordinatorTestAccess::RetainStateSnapshot(coordinator, *snapshot, CacheBoundaryKind::kPromoted));
-    ASSERT_TRUE(CacheCoordinatorTestAccess::RetainStateSnapshot(coordinator, *snapshot, CacheBoundaryKind::kEndpoint));
-    for (const auto& block : snapshot->blocks) {
-        const auto metadata = coordinator.GroupPrefixIndex(block.key.group_id).MetadataFor(pool, block.key);
-        ASSERT_TRUE(metadata);
-        EXPECT_EQ(metadata->boundary_kind, CacheBoundaryKind::kPromoted);
-        EXPECT_EQ(metadata->generation, block.generation);
-        EXPECT_EQ(metadata->last_access_epoch, 7u) << "retention is not a new access";
-        EXPECT_FALSE(metadata->was_acquired);
-    }
-    ASSERT_TRUE(coordinator.GroupPrefixIndex(0).Evict(pool, first));
-    CacheBoundaryForGroup(coordinator, pool, hashes[0], 0, 9, 0, CacheBoundaryKind::kChunk);
-    const auto replacement = coordinator.GroupPrefixIndex(0).MetadataFor(pool, Key(hashes[0], 0));
-    ASSERT_TRUE(replacement);
-    EXPECT_NE(replacement->generation, snapshot->blocks[0].generation);
-    EXPECT_FALSE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(coordinator, *snapshot));
-    EXPECT_FALSE(CacheCoordinatorTestAccess::RetainStateSnapshot(coordinator, *snapshot, CacheBoundaryKind::kPromoted));
-    EXPECT_EQ(coordinator.GroupPrefixIndex(0).MetadataFor(pool, Key(hashes[0], 0))->boundary_kind,
-              CacheBoundaryKind::kChunk);
-    const auto current = CacheCoordinatorTestAccess::CaptureStateSnapshot(coordinator, hashes, 2);
-    ASSERT_TRUE(current);
-    EXPECT_TRUE(CacheCoordinatorTestAccess::StateSnapshotIsCurrent(coordinator, *current));
-}
-
-TEST(CacheCoordinatorStateSnapshot, RetainsLatestCompleteBoundaryWithoutPinningOrTouchingEpoch) {
-    BlockPool pool(8, {1, 1});
-    const std::vector<CacheGroupSpec> specs{
-        {.kind = AttnKind::kMambaState, .block_granularity = 2},
-        {.kind = AttnKind::kMambaState, .block_granularity = 2},
-    };
-    auto coordinator = MakeCoordinator(specs, 2, pool, nullptr, false);
-    const std::vector<std::string> hashes{"boundary2", "boundary4", "boundary6"};
-    CacheBoundaryForGroup(coordinator, pool, hashes[0], 0, 1, 0, CacheBoundaryKind::kChunk);
-    CacheBoundaryForGroup(coordinator, pool, hashes[0], 1, 1, 0, CacheBoundaryKind::kChunk);
-    CacheBoundaryForGroup(coordinator, pool, hashes[1], 0, 2, 1, CacheBoundaryKind::kChunk);
-    CacheBoundaryForGroup(coordinator, pool, hashes[2], 1, 3, 2, CacheBoundaryKind::kChunk);
-    const auto snapshot = coordinator.RetainLatestStateSnapshot(hashes, CacheBoundaryKind::kEndpoint);
-    ASSERT_TRUE(snapshot);
-    EXPECT_EQ(snapshot->boundary_tokens, 2) << "different groups' latest entries are not one resumable checkpoint";
-    for (const auto& block : snapshot->blocks) {
-        const auto metadata = coordinator.GroupPrefixIndex(block.key.group_id).MetadataFor(pool, block.key);
-        ASSERT_TRUE(metadata);
-        EXPECT_EQ(metadata->boundary_kind, CacheBoundaryKind::kEndpoint);
-        EXPECT_EQ(metadata->generation, block.generation);
-        EXPECT_EQ(metadata->last_access_epoch, 1u);
-        EXPECT_FALSE(metadata->was_acquired);
-        EXPECT_EQ(coordinator.GroupPrefixIndex(block.key.group_id).NumPinnedEntries(pool), 0);
-    }
-    EXPECT_EQ(coordinator.GroupPrefixIndex(0).MetadataFor(pool, Key(hashes[1], 0))->boundary_kind,
-              CacheBoundaryKind::kChunk);
-    EXPECT_EQ(coordinator.GroupPrefixIndex(1).MetadataFor(pool, Key(hashes[2], 1))->boundary_kind,
-              CacheBoundaryKind::kChunk);
-
-    CacheBoundaryForGroup(coordinator, pool, hashes[2], 0, 4, 2, CacheBoundaryKind::kChunk);
-    const auto promoted = coordinator.RetainLatestStateSnapshot(hashes, CacheBoundaryKind::kPromoted);
-    ASSERT_TRUE(promoted);
-    EXPECT_EQ(promoted->boundary_tokens, 6);
-    const auto repeated = coordinator.RetainLatestStateSnapshot(hashes, CacheBoundaryKind::kEndpoint);
-    ASSERT_TRUE(repeated);
-    EXPECT_EQ(repeated->boundary_tokens, 6);
-    for (const auto& block : promoted->blocks) {
-        const auto metadata = coordinator.GroupPrefixIndex(block.key.group_id).MetadataFor(pool, block.key);
-        ASSERT_TRUE(metadata);
-        EXPECT_EQ(metadata->boundary_kind, CacheBoundaryKind::kPromoted);
-        EXPECT_EQ(metadata->generation, block.generation);
-        EXPECT_EQ(metadata->last_access_epoch, block.key.group_id == 0 ? 4u : 3u);
-        EXPECT_FALSE(metadata->was_acquired);
-        EXPECT_EQ(coordinator.GroupPrefixIndex(block.key.group_id).NumPinnedEntries(pool), 0);
-    }
-    EXPECT_TRUE(coordinator.TakePendingStores().empty()) << "retention does not queue a store";
-    EXPECT_TRUE(coordinator.ClearDeviceCache()) << "returned snapshots do not own block references";
-}
-
-TEST(CacheCoordinatorStateSnapshot, RetainLatestRejectsIncompleteBoundaryAndInvalidKindWithoutMutation) {
-    BlockPool pool(4, {1, 1});
-    const std::array specs{
-        CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = 2},
-        CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = 2},
-    };
-    auto coordinator = MakeCoordinator(specs, 2, pool, nullptr, false);
-    const std::vector<std::string> hashes{"boundary2", "boundary4"};
-    CacheBoundaryForGroup(coordinator, pool, hashes[0], 0, 7, 0, CacheBoundaryKind::kChunk);
-    CacheBoundaryForGroup(coordinator, pool, hashes[1], 1, 9, 1, CacheBoundaryKind::kChunk);
-    EXPECT_FALSE(coordinator.RetainLatestStateSnapshot(hashes, CacheBoundaryKind::kEndpoint));
-    for (std::uint32_t group_id = 0; group_id < 2; ++group_id) {
-        const auto metadata = coordinator.GroupPrefixIndex(group_id).MetadataFor(pool, Key(hashes[group_id], group_id));
-        ASSERT_TRUE(metadata);
-        EXPECT_EQ(metadata->boundary_kind, CacheBoundaryKind::kChunk);
-        EXPECT_EQ(metadata->last_access_epoch, group_id == 0 ? 7u : 9u);
-        EXPECT_FALSE(metadata->was_acquired);
-    }
-
-    CacheBoundaryForGroup(coordinator, pool, hashes[0], 1, 11, 0, CacheBoundaryKind::kChunk);
-    const auto complete = CacheCoordinatorTestAccess::CaptureStateSnapshot(coordinator, hashes, 2);
-    ASSERT_TRUE(complete);
-    EXPECT_FALSE(coordinator.RetainLatestStateSnapshot(hashes, CacheBoundaryKind::kChunk));
-    EXPECT_FALSE(coordinator.RetainLatestStateSnapshot(hashes, static_cast<CacheBoundaryKind>(255)));
-    EXPECT_FALSE(coordinator.RetainLatestStateSnapshot(std::span<const std::string>{}, CacheBoundaryKind::kEndpoint));
-    for (const auto& block : complete->blocks) {
-        const auto metadata = coordinator.GroupPrefixIndex(block.key.group_id).MetadataFor(pool, block.key);
-        ASSERT_TRUE(metadata);
-        EXPECT_EQ(metadata->boundary_kind, CacheBoundaryKind::kChunk);
-        EXPECT_EQ(metadata->generation, block.generation);
-        EXPECT_EQ(metadata->last_access_epoch, block.key.group_id == 0 ? 7u : 11u);
-        EXPECT_FALSE(metadata->was_acquired);
-        EXPECT_EQ(coordinator.GroupPrefixIndex(block.key.group_id).NumPinnedEntries(pool), 0);
-    }
-    EXPECT_TRUE(coordinator.TakePendingStores().empty());
-    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
-}
-
-TEST(CacheCoordinatorStateSnapshot, RetainLatestWithoutStateGroupsLeavesHistoryUnchanged) {
-    BlockPool pool(2, {1});
-    const std::array specs{CacheGroupSpec{.kind = AttnKind::kFull, .block_granularity = 2}};
-    auto coordinator = MakeCoordinator(specs, 2, pool, nullptr, false);
-    const std::vector<std::string> hashes{"history2"};
-    CacheBoundaryForGroup(coordinator, pool, hashes[0], 0, 7, 0, CacheBoundaryKind::kChunk);
-    const auto before = coordinator.GroupPrefixIndex(0).MetadataFor(pool, Key(hashes[0], 0));
-    ASSERT_TRUE(before);
-    EXPECT_FALSE(coordinator.RetainLatestStateSnapshot(hashes, CacheBoundaryKind::kEndpoint));
-    const auto after = coordinator.GroupPrefixIndex(0).MetadataFor(pool, Key(hashes[0], 0));
-    ASSERT_TRUE(after);
-    EXPECT_EQ(after->boundary_kind, before->boundary_kind);
-    EXPECT_EQ(after->generation, before->generation);
-    EXPECT_EQ(after->last_access_epoch, before->last_access_epoch);
-    EXPECT_EQ(after->was_acquired, before->was_acquired);
-    EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumPinnedEntries(pool), 0);
-    EXPECT_TRUE(coordinator.TakePendingStores().empty());
-    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
-}
-
-TEST(CacheCoordinatorStateSnapshot, RepeatedAndCanonicalRegistrationPreserveIdentityAndMonotonicKind) {
-    constexpr std::array kinds{CacheBoundaryKind::kChunk, CacheBoundaryKind::kEndpoint, CacheBoundaryKind::kPromoted};
-    constexpr std::array expected{
-        std::array{CacheBoundaryKind::kChunk, CacheBoundaryKind::kEndpoint, CacheBoundaryKind::kPromoted},
-        std::array{CacheBoundaryKind::kEndpoint, CacheBoundaryKind::kEndpoint, CacheBoundaryKind::kPromoted},
-        std::array{CacheBoundaryKind::kPromoted, CacheBoundaryKind::kPromoted, CacheBoundaryKind::kPromoted},
-    };
-    for (std::size_t initial = 0; initial < kinds.size(); ++initial) {
-        for (std::size_t incoming = 0; incoming < kinds.size(); ++incoming) {
-            for (const bool second_producer : {false, true}) {
-                SCOPED_TRACE(::testing::Message() << initial << "/" << incoming << "/" << second_producer);
-                BlockPool pool(2, {1});
-                const std::array specs{CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = 2}};
-                auto coordinator = MakeCoordinator(specs, 2, pool, nullptr, false);
-                auto& index = coordinator.GroupPrefixIndex(0);
-                const CacheKey key = Key("boundary2", 0);
-                CacheBlockRef canonical = pool.AcquireBlock(0);
-                index.Register(pool, canonical, key, 7, 0, kinds[initial], nullptr);
-                const auto before = index.MetadataFor(pool, key);
-                ASSERT_TRUE(before);
-                CacheBlockRef producer = second_producer ? pool.AcquireBlock(0) : canonical;
-                ASSERT_TRUE(producer);
-                index.Register(pool, producer, key, 9, 0, kinds[incoming], nullptr);
-                const auto after = index.MetadataFor(pool, key);
-                ASSERT_TRUE(after);
-                EXPECT_EQ(producer, canonical);
-                EXPECT_EQ(index.NumEntries(pool), 1);
-                EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1) << "a deduplicated producer does not retain another block";
-                EXPECT_EQ(after->generation, before->generation);
-                EXPECT_EQ(after->boundary_kind, expected[initial][incoming]);
-                EXPECT_EQ(after->last_access_epoch, 9u);
-                EXPECT_FALSE(after->was_acquired) << "registration does not invent a successful prefix acquisition";
-            }
-        }
-    }
-}
-
-TEST(CacheCoordinatorStateSnapshot, PublicationPreviewUsesProvenanceGeometryAndHoles) {
-    BlockPool pool(8, {1, 1});
-    const std::vector<CacheGroupSpec> specs{
-        {.kind = AttnKind::kFull, .block_granularity = 2},
-        {.kind = AttnKind::kMambaState, .block_granularity = 2},
-    };
-    auto coordinator = MakeCoordinator(specs, 4, pool, nullptr, false);
-    std::vector<BlockTable> tables(specs.size());
-    ASSERT_TRUE(AdmitForTest(coordinator, tables, 4));
-    const std::vector<std::string> hashes{"boundary4"};
-    std::vector<GroupDemand> demands;
-    for (auto& table : tables) {
-        demands.push_back(GroupDemand{.table = &table});
-    }
-    RequestProgress progress{
-        .completed_pages =
-            CompletedPages{
-                .prefix_hashes = hashes,
-                .first_new_prefix_page = 0,
-                .boundary_kind = CacheBoundaryKind::kEndpoint,
-                .materialized_state_boundaries = {},
-            },
-        .num_computed_tokens = 4,
-    };
-    EXPECT_TRUE(coordinator.CompletedStatePublications(demands, progress).empty());
-    const std::array materialized{4};
-    progress.completed_pages->materialized_state_boundaries = materialized;
-    const auto preview = coordinator.CompletedStatePublications(demands, progress);
-    ASSERT_EQ(preview.size(), 1u);
-    EXPECT_EQ(preview[0].key, Key(hashes[0], 1, 1));
-    EXPECT_EQ(preview[0].logical_block_index, 1);
-    EXPECT_EQ(preview[0].location, tables[1].Blocks()[1]->Location());
-    EXPECT_EQ(preview[0].boundary_kind, CacheBoundaryKind::kEndpoint);
-    EXPECT_EQ(coordinator.GroupPrefixIndex(1).NumEntries(pool), 0) << "preview must not publish or acquire";
-    auto hole = tables[1].EvictToNull(1);
-    EXPECT_TRUE(coordinator.CompletedStatePublications(demands, progress).empty());
-    coordinator.CacheCompletedBlocks(tables, progress, 7);
-    EXPECT_EQ(coordinator.GroupPrefixIndex(1).NumEntries(pool), 0);
-    tables[1] = BlockTable::FromBlocks({tables[1].Blocks()[0], std::move(hole)}, 0);
-    coordinator.CacheCompletedBlocks(tables, progress, 7);
-    const auto actual = coordinator.GroupPrefixIndex(1).MetadataFor(pool, preview[0].location);
-    ASSERT_TRUE(actual);
-    EXPECT_EQ(actual->logical_block_index, preview[0].logical_block_index);
-    EXPECT_EQ(actual->boundary_kind, preview[0].boundary_kind);
-    EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(pool, preview[0].key));
-    coordinator.Free(tables);
 }
 
 }  // namespace

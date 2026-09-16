@@ -160,7 +160,8 @@ public:
         _assert(destination_it == destination_refs.end(), "unused host extension destination");
     }
 
-    // Retention execution: expired slots become null holes.
+    // Retention execution: the first num_expired_blocks table slots become
+    // null holes, so the table never shrinks and slot alignment stays stable.
     // How many blocks expired is retention policy (GroupGeometry).
     void ReclaimExpired(BlockPool& /*pool*/, BlockTable& table, std::int32_t num_expired_blocks) {
         const std::int32_t expired = std::min(num_expired_blocks, table.NumBlocks());

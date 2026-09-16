@@ -126,19 +126,14 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
             progress.access_epoch);
         discardUncachedKvEventPages(event_keys);
     }
-    // Finalization retains only prefill checkpoints, never generated state.
-    const auto prefill_hashes = std::span<const std::string>{progress.prefix_hashes}.first(
-        std::min(progress.prefix_hashes.size(),
-                 static_cast<std::size_t>(request.PrefillSize() / coordinator_.PrefixGranularity())));
-    std::optional<StateSnapshot> retained_snapshot =
-        coordinator_.RetainLatestStateSnapshot(prefill_hashes, CacheBoundaryKind::kEndpoint);
     if (!config_.StreamsDeviceCacheToHost()) {
         return std::nullopt;
     }
     coordinator_.QueueCachedBlocksForStore(progress.prefix_hashes);
-    if (retained_snapshot) {
-        coordinator_.QueueStateSnapshotForStore(*retained_snapshot);
-    }
+    const auto prefill_hashes = std::span<const std::string>{progress.prefix_hashes}.first(
+        std::min(progress.prefix_hashes.size(),
+                 static_cast<std::size_t>(request.PrefillSize() / coordinator_.PrefixGranularity())));
+    coordinator_.QueueLatestSnapshotBlocksForStore(prefill_hashes);
     // The request's pages are released right after this (FinishEvent); the
     // pinned ticket keeps them cached and unevictable until the copy ACKs.
     return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);

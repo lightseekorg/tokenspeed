@@ -38,25 +38,6 @@ struct CacheCoordinatorTestAccess {
     }
 
     static std::uint64_t NextAccessEpoch(CacheCoordinator& coordinator) { return ++coordinator.next_access_epoch_; }
-
-    static std::span<const CacheCoordinator::StoreCandidate> PendingStores(const CacheCoordinator& coordinator) {
-        return coordinator.pending_stores_;
-    }
-
-    static std::optional<StateSnapshot> CaptureStateSnapshot(const CacheCoordinator& coordinator,
-                                                             std::span<const std::string> prefix_hashes,
-                                                             std::int32_t boundary_tokens) {
-        return coordinator.CaptureStateSnapshot(prefix_hashes, boundary_tokens);
-    }
-
-    static bool StateSnapshotIsCurrent(const CacheCoordinator& coordinator, const StateSnapshot& snapshot) {
-        return coordinator.StateSnapshotIsCurrent(snapshot);
-    }
-
-    static bool RetainStateSnapshot(CacheCoordinator& coordinator, const StateSnapshot& snapshot,
-                                    CacheBoundaryKind boundary_kind) {
-        return coordinator.RetainStateSnapshot(snapshot, boundary_kind);
-    }
 };
 
 inline auto MatchPrefixForTest(CacheCoordinator& coordinator, std::span<const std::string> content_hashes) {
@@ -89,18 +70,6 @@ inline void CacheCompletedBlocksForTest(CacheCoordinator& coordinator, std::span
         .num_computed_tokens = num_computed_tokens,
     };
     coordinator.CacheCompletedBlocks(tables, progress, access_epoch);
-}
-
-inline std::optional<StateSnapshot> CacheStateBoundaryForTest(CacheCoordinator& coordinator,
-                                                              std::span<BlockTable> tables,
-                                                              std::span<const std::string> prefix_hashes,
-                                                              std::int32_t boundary_tokens, std::uint64_t access_epoch,
-                                                              CacheBoundaryKind boundary_kind) {
-    const std::int32_t prefix_pages = boundary_tokens / coordinator.PrefixGranularity();
-    const auto completed_hashes = prefix_hashes.first(static_cast<std::size_t>(prefix_pages));
-    CacheCompletedBlocksForTest(coordinator, tables, completed_hashes, access_epoch, prefix_pages - 1, boundary_tokens,
-                                boundary_kind, false, std::span{&boundary_tokens, 1});
-    return CacheCoordinatorTestAccess::CaptureStateSnapshot(coordinator, prefix_hashes, boundary_tokens);
 }
 
 // Admits every group with the same demand prototype as a new request.

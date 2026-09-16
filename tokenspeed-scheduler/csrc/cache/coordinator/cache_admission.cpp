@@ -43,19 +43,16 @@ struct AdmissionPlan {
 
 class AdmissionPlanner {
 public:
-    AdmissionPlanner(const CacheCoordinator& coordinator, const std::vector<CacheGroup>& groups,
-                     std::span<const GroupGeometry> geometry, const BlockPool& pool,
-                     std::span<const GroupDemand> demands, const RequestProgress& progress,
-                     const CacheCoordinator::PrefixProbe& prefix, std::uint64_t publication_access_epoch,
+    AdmissionPlanner(const std::vector<CacheGroup>& groups, std::span<const GroupGeometry> geometry,
+                     const BlockPool& pool, std::span<const GroupDemand> demands,
+                     std::optional<std::int32_t> num_computed_tokens, const CacheCoordinator::PrefixProbe& prefix,
                      std::vector<std::pair<std::uint32_t, CacheBlockLocation>>& victims)
-        : coordinator_{coordinator},
-          groups_{groups},
+        : groups_{groups},
           geometry_{geometry},
           pool_{pool},
           demands_{demands},
-          progress_{progress},
+          num_computed_tokens_{num_computed_tokens},
           prefix_{prefix},
-          publication_access_epoch_{publication_access_epoch},
           victims_{victims},
           local_free_slots_(groups.size()),
           blocks_needed_(groups.size()) {}
@@ -70,7 +67,6 @@ public:
             return true;
         }
 
-        collectStatePriorities();
         collectCandidates();
         while (!fits()) {
             const std::optional<VictimCandidate> candidate = nextVictimCandidate();
@@ -81,8 +77,8 @@ public:
             victims_.emplace_back(candidate->group_id, candidate->location);
         }
 
-        // Restore later-selected blocks first, keeping each one unless its
-        // capacity is still needed. All changes affect only shadow occupancy.
+        // Restore newer blocks first, keeping each one unless its capacity is
+        // still needed. All releases and restores affect only shadow occupancy.
         std::vector<std::pair<std::uint32_t, CacheBlockLocation>> required_victims;
         required_victims.reserve(victims_.size());
         for (std::size_t i = victims_.size(); i > 0; --i) {
@@ -99,10 +95,13 @@ public:
     }
 
 private:
-    // This is the original tie-break within one access epoch, not another
-    // cache classification. An indexed entry may also have access epoch zero.
+    // Current prefix hits are protected before candidates reach this policy.
+    // A request-only block with no CacheEntry is reclaimed first. Cached
+    // entries then compare request access epoch, followed within one epoch by
+    // the tier order below. Position keeps the deeper unproven non-closed
+    // boundary, while a closed prefix is reclaimed from its suffix.
     enum class EvictionTier {
-        kUncached,
+        kUncached,  // physically allocated, but owned only by the request table
         kProbationaryBoundary,
         kEstablishedBoundary,
         kClosedPrefix,
@@ -153,63 +152,11 @@ private:
         empty_parent_count_ = pool_.NumEmptyLcmBlocks();
     }
 
-    struct PendingStatePriority {
-        CacheBoundaryKind boundary_kind;
-        std::int32_t logical_block_index;
-    };
-
-    void collectStatePriorities() {
-        if (!coordinator_.HasMambaStateGroup()) {
-            return;
-        }
-        state_kind_overrides_.resize(groups_.size());
-        // Register happens after planning. Classify real pending endpoints as
-        // retained now, without changing the index if admission later fails.
-        // Record ordinary canonical targets too: republication can give them
-        // another table reference, so their release is not guaranteed.
-        for (const auto& publication : coordinator_.CompletedStatePublications(demands_, progress_)) {
-            const auto canonical = groups_[publication.key.group_id].Index().MetadataFor(pool_, publication.key);
-            if (canonical) {
-                auto& kinds = state_kind_overrides_[publication.key.group_id];
-                auto [it, inserted] = kinds.try_emplace(canonical->generation, publication.boundary_kind);
-                if (!inserted) {
-                    it->second = std::max(it->second, publication.boundary_kind);
-                }
-                // The second producer will be replaced by the canonical ref;
-                // its discarded source must not receive endpoint preference.
-                continue;
-            }
-            if (publication.boundary_kind == CacheBoundaryKind::kChunk) {
-                continue;
-            }
-            pending_locations_.insert_or_assign(
-                publication.location, PendingStatePriority{publication.boundary_kind, publication.logical_block_index});
-        }
-    }
-
     VictimCandidate makeVictimCandidate(std::uint32_t group_id, CacheBlockLocation location,
                                         const std::optional<PrefixCacheIndex::CachedBlockMetadata>& metadata) const {
-        std::uint64_t last_access_epoch = metadata ? metadata->last_access_epoch : 0;
-        std::int32_t logical_block_index = metadata ? metadata->logical_block_index : -1;
-        CacheBoundaryKind boundary_kind = metadata ? metadata->boundary_kind : CacheBoundaryKind::kChunk;
-        const bool is_state = groups_[group_id].Spec().kind == AttnKind::kMambaState;
-        // Resolve this plan's preference without changing stored kind or refs.
-        if (is_state && metadata) {
-            const auto retained = state_kind_overrides_[group_id].find(metadata->generation);
-            if (retained != state_kind_overrides_[group_id].end()) {
-                boundary_kind = std::max(boundary_kind, retained->second);
-            }
-        } else if (is_state) {
-            const auto pending = pending_locations_.find(location);
-            if (pending != pending_locations_.end()) {
-                // This exact location will become a retained cache entry.
-                last_access_epoch = publication_access_epoch_;
-                logical_block_index = pending->second.logical_block_index;
-                boundary_kind = pending->second.boundary_kind;
-            }
-        }
-        // Keep the old same-epoch rules for state, SWA and full-history alike.
-        // Acquired Chunks get only this tie-break preference.
+        const std::uint64_t last_access_epoch = metadata ? metadata->last_access_epoch : 0;
+        const std::int32_t logical_block_index = metadata ? metadata->logical_block_index : -1;
+        const CacheBoundaryKind boundary_kind = metadata ? metadata->boundary_kind : CacheBoundaryKind::kChunk;
         const bool is_prefix_closed = groups_[group_id].Matcher().IsPrefixClosed();
         const bool is_probationary_boundary = !is_prefix_closed && boundary_kind == CacheBoundaryKind::kChunk &&
                                               !(metadata && metadata->was_acquired) && logical_block_index >= 0;
@@ -233,6 +180,8 @@ private:
         return VictimCandidate{
             .group_id = group_id,
             .location = location,
+            // Access epochs start at one. Zero puts an uncached block ahead of
+            // every reusable cache entry.
             .last_access_epoch = last_access_epoch,
             .eviction_tier = eviction_tier,
             .position_rank = position_rank,
@@ -246,8 +195,8 @@ private:
             protected_locations_.insert(hits.begin(), hits.end());
         }
 
-        if (progress_.num_computed_tokens) {
-            collectRequestReclaimCandidates(*progress_.num_computed_tokens);
+        if (num_computed_tokens_) {
+            collectRequestReclaimCandidates(*num_computed_tokens_);
         }
 
         cache_group_candidates_.reserve(groups_.size());
@@ -272,21 +221,8 @@ private:
                 if (!first_occurrence) {
                     continue;
                 }
-                const auto metadata = groups_[i].Index().MetadataFor(pool_, location);
-                if (groups_[i].Spec().kind == AttnKind::kMambaState && metadata &&
-                    metadata->boundary_kind == CacheBoundaryKind::kChunk &&
-                    !state_kind_overrides_[group_id].contains(metadata->generation)) {
-                    // ReclaimableBlockLocationsAt already proves the only
-                    // owners are this expiring table slot and the index.
-                    // Prefix hits were excluded above; pending canonical publications
-                    // are excluded by generation.
-                    // Commit therefore cleans this Chunk even without a
-                    // capacity victim. Credit its real packing now, and do
-                    // not restore it during reverse pruning of chosen victims.
-                    removeOccupant(group_id, location);
-                    continue;
-                }
-                request_reclaim_candidates_.push_back(makeVictimCandidate(group_id, location, metadata));
+                request_reclaim_candidates_.push_back(
+                    makeVictimCandidate(group_id, location, groups_[i].Index().MetadataFor(pool_, location)));
             }
         }
         std::ranges::sort(request_reclaim_candidates_, shouldEvictFirst);
@@ -313,8 +249,8 @@ private:
                 }
                 group.candidates.push_back(makeVictimCandidate(group.group_id, entry.location, entry.metadata));
             }
-            // Index order breaks epoch ties by location; the policy also uses
-            // the same-epoch tie-break and logical position, so sort the whole epoch.
+            // Index order breaks epoch ties by location; eviction policy also
+            // considers boundary tier and logical position, so sort the whole epoch.
             if (!group.candidates.empty()) {
                 std::ranges::sort(group.candidates, shouldEvictFirst);
                 return true;
@@ -395,21 +331,17 @@ private:
         return parents_needed <= empty_parent_count_;
     }
 
-    const CacheCoordinator& coordinator_;
     const std::vector<CacheGroup>& groups_;
     std::span<const GroupGeometry> geometry_;
     const BlockPool& pool_;
     std::span<const GroupDemand> demands_;
-    const RequestProgress& progress_;
+    std::optional<std::int32_t> num_computed_tokens_;
     const CacheCoordinator::PrefixProbe& prefix_;
-    std::uint64_t publication_access_epoch_;
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>>& victims_;
     std::unordered_map<std::int32_t, std::int32_t> remaining_occupied_;
     std::vector<std::int64_t> local_free_slots_;
     std::vector<std::int64_t> blocks_needed_;
     std::int64_t empty_parent_count_{0};
-    std::vector<std::unordered_map<std::uint64_t, CacheBoundaryKind>> state_kind_overrides_;
-    std::unordered_map<CacheBlockLocation, PendingStatePriority, CacheBlockLocationHash> pending_locations_;
     std::vector<VictimCandidate> request_reclaim_candidates_;
     std::size_t next_request_candidate_index_{0};
     std::vector<CacheGroupVictimCandidates> cache_group_candidates_;
@@ -418,15 +350,14 @@ private:
     std::vector<PrefixCacheIndex::EvictionCandidate> epoch_scratch_;
 };
 
-std::optional<AdmissionPlan> planAdmission(const CacheCoordinator& coordinator, const std::vector<CacheGroup>& groups,
+std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups,
                                            std::span<const GroupGeometry> geometry, const BlockPool& pool,
                                            CacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands,
-                                           const RequestProgress& progress, std::uint64_t publication_access_epoch) {
+                                           std::optional<std::int32_t> num_computed_tokens) {
     _assert(demands.size() == groups.size(), "demands/groups size mismatch");
 
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
-    AdmissionPlanner planner{coordinator, groups, geometry, pool, demands, progress, prefix, publication_access_epoch,
-                             victims};
+    AdmissionPlanner planner{groups, geometry, pool, demands, num_computed_tokens, prefix, victims};
     if (!planner.Plan()) {
         return std::nullopt;
     }
@@ -479,9 +410,8 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         demands = replayed;
     }
 
-    const std::uint64_t publication_access_epoch = request_access_epoch.value_or(next_access_epoch_ + 1);
     std::optional<AdmissionPlan> candidate =
-        planAdmission(*this, groups_, geometry_, pool_, std::move(prefix), demands, progress, publication_access_epoch);
+        planAdmission(groups_, geometry_, pool_, std::move(prefix), demands, progress.num_computed_tokens);
     if (!candidate) {
         return std::nullopt;
     }
@@ -517,17 +447,16 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
             prospective_victims.push_back(victim);
         }
     }
-    std::vector<CachedStateBlock> released_state_chunks;
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         BlockTable& table = *demands[i].table;
         if (progress.completed_pages) {
             cacheDeviceCompletedBlocksForGroup(i, table, *progress.completed_pages, access_epoch);
         }
         if (progress.num_computed_tokens) {
-            reclaimExpiredForGroup(i, table, *progress.num_computed_tokens, released_state_chunks);
+            groups_[i].Allocator().ReclaimExpired(
+                pool_, table, geometry_[i].ExpiredBlocksAt(groups_[i].Spec(), *progress.num_computed_tokens));
         }
     }
-    cleanupStateChunks(released_state_chunks);
     for (const auto& [group_id, location] : prospective_victims) {
         if (!evictCachedBlock(group_id, location)) {
             FatalCheck(!pool_.IsOccupied(location), "admission victim changed before acquisition");

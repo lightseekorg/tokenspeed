@@ -29,7 +29,7 @@
 
 namespace tokenspeed::test {
 
-class IntermediateStateEvictionSuite : public SchedulerTestSuite {
+class StatePublicationSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
@@ -138,7 +138,7 @@ protected:
     }
 };
 
-TEST_F(IntermediateStateEvictionSuite, ReclaimDropsOldPrefillStateWithoutCapacityPressure) {
+TEST_F(StatePublicationSuite, ReclaimDropsOldPrefillStateWithoutCapacityPressure) {
     Submit(RequestWithTokens("source", MakeTokens(40, 1)));
     const ExecutionPlan first = PlanOnce();
     ASSERT_NE(FindForwardBatch(first), nullptr);
@@ -161,7 +161,7 @@ TEST_F(IntermediateStateEvictionSuite, ReclaimDropsOldPrefillStateWithoutCapacit
     }
 }
 
-TEST_F(IntermediateStateEvictionSuite, CapacityPressureReusesOldPrefillBlocksAndKeepsTheFinalResumeBoundary) {
+TEST_F(StatePublicationSuite, CapacityPressureReusesOldPrefillBlocksAndKeepsTheFinalResumeBoundary) {
     config_.device_allocator.total_pages = 33;
     config_.max_scheduled_tokens = 4;
     for (CacheGroupConfig& group : config_.cache_groups) {
@@ -181,7 +181,7 @@ TEST_F(IntermediateStateEvictionSuite, CapacityPressureReusesOldPrefillBlocksAnd
     for (const std::string& group : {"state0", "state1", "state2"}) {
         const std::int32_t original = first->block_tables.at(group).at(0).at(0);
         ASSERT_GT(original, 0);
-        EXPECT_EQ(third->block_tables.at(group).at(0).at(0), 0) << "working ownership ends before cache eviction";
+        EXPECT_EQ(third->block_tables.at(group).at(0).at(0), 0) << "the expired request-local chunk has been released";
         bool reused = false;
         for (const ExecutionPlan& plan : plans) {
             const ForwardBatch* batch = FindForwardBatch(plan);
@@ -191,7 +191,7 @@ TEST_F(IntermediateStateEvictionSuite, CapacityPressureReusesOldPrefillBlocksAnd
                 reused |= batch->block_tables.at(group).at(0).at((end - 1) / 4) == original;
             }
         }
-        EXPECT_TRUE(reused) << group << " must recycle its first cached checkpoint under real pool pressure";
+        EXPECT_TRUE(reused) << group << " must recycle its first request-local chunk under real pool pressure";
     }
 
     SendFinish("source");
@@ -204,7 +204,7 @@ TEST_F(IntermediateStateEvictionSuite, CapacityPressureReusesOldPrefillBlocksAnd
     ExpectReplay("final_boundary", std::move(resume), 60, 4);
 }
 
-TEST_F(IntermediateStateEvictionSuite, FinalPrefillBoundarySurvivesAlignedAndUnalignedEndings) {
+TEST_F(StatePublicationSuite, FinalPrefillBoundarySurvivesAlignedAndUnalignedEndings) {
     for (std::int32_t length : {24, 26, 30}) {
         SCOPED_TRACE(length);
         Reset(false, 1, 0);
@@ -222,7 +222,7 @@ TEST_F(IntermediateStateEvictionSuite, FinalPrefillBoundarySurvivesAlignedAndUna
     }
 }
 
-TEST_F(IntermediateStateEvictionSuite, HostStoresOnlyFinalPrefillSnapshotIncludingShortTail) {
+TEST_F(StatePublicationSuite, HostStoresOnlyFinalPrefillSnapshotIncludingShortTail) {
     for (std::int32_t length : {26, 30}) {
         SCOPED_TRACE(length);
         Reset(true, 1, 0);
@@ -245,7 +245,7 @@ TEST_F(IntermediateStateEvictionSuite, HostStoresOnlyFinalPrefillSnapshotIncludi
     }
 }
 
-TEST_F(IntermediateStateEvictionSuite, DecodeAndFinishKeepOnlyThePrefillStateBoundary) {
+TEST_F(StatePublicationSuite, DecodeAndFinishKeepOnlyThePrefillStateBoundary) {
     Reset(false, 1, 0);
     std::vector<ExecutionPlan> plans;
     Prefill(RequestWithTokens("source", MakeTokens(4, 1)), plans);
@@ -254,6 +254,8 @@ TEST_F(IntermediateStateEvictionSuite, DecodeAndFinishKeepOnlyThePrefillStateBou
         SendForwardDone("source", {token});
         PlanOnce();
     }
+    // The last schedule has already hashed the completed prefix pages;
+    // Finish adds no hash and must not supplement a state snapshot.
     SendFinish("source");
     PlanOnce();
     EXPECT_EQ(ResidentBlocks(), 3 + 3);
@@ -261,7 +263,7 @@ TEST_F(IntermediateStateEvictionSuite, DecodeAndFinishKeepOnlyThePrefillStateBou
     ExpectReplay("generated_boundary", ConversationPrefix(12), 4);
 }
 
-TEST_F(IntermediateStateEvictionSuite, FinishAddsHistoryButNoDecodeStateToHost) {
+TEST_F(StatePublicationSuite, FinishAddsHistoryButNoDecodeStateToHost) {
     Reset(true, 1, 0);
     std::vector<ExecutionPlan> plans;
     Prefill(RequestWithTokens("source", MakeTokens(4, 1)), plans);
@@ -284,7 +286,7 @@ TEST_F(IntermediateStateEvictionSuite, FinishAddsHistoryButNoDecodeStateToHost) 
     ExpectReplay("generated_host_boundary", ConversationPrefix(12), 4);
 }
 
-TEST_F(IntermediateStateEvictionSuite, DecodeReclaimsExpiredWorkingSlotsWithoutKeepingALatestSnapshot) {
+TEST_F(StatePublicationSuite, DecodeReclaimsExpiredWorkingSlotsWithoutKeepingALatestSnapshot) {
     Reset(false, 1, 0);
     std::vector<ExecutionPlan> plans;
     Prefill(RequestWithTokens("source", MakeTokens(4, 1)), plans);
@@ -304,7 +306,7 @@ TEST_F(IntermediateStateEvictionSuite, DecodeReclaimsExpiredWorkingSlotsWithoutK
     ExpectReplay("decode_is_not_reusable", ConversationPrefix(12), 4);
 }
 
-TEST_F(IntermediateStateEvictionSuite, AbortReleasesConsumedPrefillStateWithoutPublishingItsOutput) {
+TEST_F(StatePublicationSuite, AbortReleasesConsumedPrefillStateWithoutPublishingItsOutput) {
     Submit(RequestWithTokens("source", MakeTokens(40, 1)));
     PlanOnce();
     SendForwardDone("source", {});
@@ -318,7 +320,7 @@ TEST_F(IntermediateStateEvictionSuite, AbortReleasesConsumedPrefillStateWithoutP
     ExpectReplay("completed_chunk", MakeTokens(17, 1), 0);
 }
 
-TEST_F(IntermediateStateEvictionSuite, AlignedDecodeFeedbackThenAbortDoesNotPublishItsNewSnapshot) {
+TEST_F(StatePublicationSuite, AlignedDecodeFeedbackThenAbortDoesNotPublishItsNewSnapshot) {
     Reset(true, 1, 0);
     std::vector<ExecutionPlan> plans;
     Prefill(RequestWithTokens("source", MakeTokens(4, 1)), plans);
@@ -355,7 +357,7 @@ TEST_F(IntermediateStateEvictionSuite, AlignedDecodeFeedbackThenAbortDoesNotPubl
     ExpectReplay("valid_prompt_is_reusable", ConversationPrefix(4), 4);
 }
 
-TEST_F(IntermediateStateEvictionSuite, OverlapKeepsInputUntilItsLastScheduledConsumer) {
+TEST_F(StatePublicationSuite, OverlapKeepsInputUntilItsLastScheduledConsumer) {
     Reset(false, 1, 1);
     Submit(RequestWithTokens("source", MakeTokens(40, 1)));
     const ExecutionPlan first = PlanOnce();
@@ -378,7 +380,7 @@ TEST_F(IntermediateStateEvictionSuite, OverlapKeepsInputUntilItsLastScheduledCon
     }
 }
 
-TEST_F(IntermediateStateEvictionSuite, SpeculationPublishesNeitherCrossedNorAlignedDecodeBoundaries) {
+TEST_F(StatePublicationSuite, SpeculationPublishesNeitherCrossedNorAlignedDecodeBoundaries) {
     Reset(false, 3, 0);
     std::vector<ExecutionPlan> plans;
     const RequestSpec request = RequestWithTokens("source", MakeTokens(6, 1));
@@ -398,7 +400,7 @@ TEST_F(IntermediateStateEvictionSuite, SpeculationPublishesNeitherCrossedNorAlig
     ExpectReplay("actual_boundary", std::move(aligned_decode), 4);
 }
 
-TEST_F(IntermediateStateEvictionSuite, TruncatedSpeculativeOutputDoesNotInventAnAlignedState) {
+TEST_F(StatePublicationSuite, TruncatedSpeculativeOutputDoesNotInventAnAlignedState) {
     Reset(false, 3, 0);
     std::vector<ExecutionPlan> plans;
     Prefill(RequestWithTokens("source", MakeTokens(4, 1)), plans);
@@ -416,7 +418,7 @@ TEST_F(IntermediateStateEvictionSuite, TruncatedSpeculativeOutputDoesNotInventAn
     ExpectReplay("no_token8_state", ConversationPrefix(8), 4);
 }
 
-TEST_F(IntermediateStateEvictionSuite, OverlappedSpeculativeDecodeKeepsOnlyThePrefillCacheBoundary) {
+TEST_F(StatePublicationSuite, OverlappedSpeculativeDecodeKeepsOnlyThePrefillCacheBoundary) {
     Reset(true, 3, 1);
     Submit(RequestWithTokens("source", MakeTokens(4, 1)));
     ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
@@ -443,7 +445,7 @@ TEST_F(IntermediateStateEvictionSuite, OverlappedSpeculativeDecodeKeepsOnlyThePr
     ExpectReplay("new_host_boundary", ConversationPrefix(12), 4);
 }
 
-TEST_F(IntermediateStateEvictionSuite, LiveDecodeDoesNotExposeGeneratedStateToAnotherRequest) {
+TEST_F(StatePublicationSuite, LiveDecodeDoesNotExposeGeneratedStateToAnotherRequest) {
     config_.max_batch_size = 2;
     scheduler_ = std::make_unique<Scheduler>(config_);
     std::vector<ExecutionPlan> plans;
@@ -463,7 +465,7 @@ TEST_F(IntermediateStateEvictionSuite, LiveDecodeDoesNotExposeGeneratedStateToAn
     ExpectReplay("reader_after_finish", ConversationPrefix(12), 4);
 }
 
-TEST_F(IntermediateStateEvictionSuite, AbortingOneProducerPreservesAnotherRequestsWorkingState) {
+TEST_F(StatePublicationSuite, AbortingOneProducerPreservesAnotherRequestsWorkingState) {
     Reset(false, 3, 1);
     config_.max_batch_size = 3;
     scheduler_ = std::make_unique<Scheduler>(config_);
@@ -497,7 +499,7 @@ TEST_F(IntermediateStateEvictionSuite, AbortingOneProducerPreservesAnotherReques
     ExpectReplay("prefill_remains_reusable", ConversationPrefix(8), 4);
 }
 
-TEST_F(IntermediateStateEvictionSuite, LongUnalignedDecodeKeepsOnlyItsBoundedWorkingState) {
+TEST_F(StatePublicationSuite, LongUnalignedDecodeKeepsOnlyItsBoundedWorkingState) {
     Reset(false, 3, 0);
     config_.max_scheduled_tokens = 4;
     scheduler_ = std::make_unique<Scheduler>(config_);
@@ -546,7 +548,143 @@ TEST_F(IntermediateStateEvictionSuite, LongUnalignedDecodeKeepsOnlyItsBoundedWor
     ExpectReplay("decode_boundary_not_cached", ConversationPrefix(8), 4);
 }
 
-TEST_F(IntermediateStateEvictionSuite, RetractionRecomputesDecodeFromPrefillOrFromScratch) {
+TEST_F(StatePublicationSuite, IncompletePrefillRetractionPublishesItsComputedStateForHostReplay) {
+    Reset(true, 1, 0);
+    config_.device_allocator.total_pages = 11;
+    config_.max_batch_size = 2;
+    config_.cache_groups.resize(2);
+    for (CacheGroupConfig& group : config_.cache_groups) {
+        group.total_pages = config_.device_allocator.total_pages;
+    }
+    scheduler_ = std::make_unique<Scheduler>(config_);
+
+    Submit(RequestSpec{.request_id = "resident", .tokens = MakeTokens(8, 1)});
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    SendForwardDone("resident", {41});
+    const ExecutionPlan first_decode = PlanOnce();
+    ASSERT_EQ(StateStoreCount(first_decode), 1);
+    AckWriteBacks(first_decode);
+    SendForwardDone("resident", {42});
+    ASSERT_EQ(ResidentBlocks(), 5);
+    ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 3);
+
+    Submit(RequestSpec{.request_id = "partial", .tokens = MakeTokens(20, 101)});
+    const ExecutionPlan first_chunk = PlanOnce();
+    const ForwardBatch* chunk = FindForwardBatch(first_chunk);
+    ASSERT_NE(chunk, nullptr);
+    ASSERT_EQ(chunk->request_ids, std::vector<std::string>{"partial"});
+    ASSERT_EQ(chunk->extend_prefix_lens, std::vector<std::int32_t>{0});
+    ASSERT_EQ(chunk->input_lengths, std::vector<std::int32_t>{8});
+    ASSERT_EQ(chunk->prefill_lengths, std::vector<std::int32_t>{20});
+    EXPECT_EQ(StateStoreCount(first_chunk), 0);
+    SendForwardDone("partial", {});
+    ASSERT_EQ(ResidentBlocks(), 8);
+
+    // The resident owns five blocks. The partial prompt owns two history
+    // pages and its token-8 state; its next chunk needs three more blocks,
+    // exceeding the ten-block pool. Admission fails before publishing that
+    // ordinary Chunk, so retraction must publish it as the recovery Endpoint.
+    const ExecutionPlan retract = PlanOnce();
+    ASSERT_EQ(scheduler_->WaitingSize(), 1u);
+    const ForwardBatch* resident_decode = FindForwardBatch(retract);
+    ASSERT_NE(resident_decode, nullptr);
+    ASSERT_EQ(resident_decode->request_ids, std::vector<std::string>{"resident"});
+    EXPECT_EQ(StateStoreCount(retract), 1);
+    std::int32_t history_stores = 0;
+    for (const CacheOperation& operation : ExtractCacheOpsOfKind<WriteBackBatch>(retract)) {
+        const auto& stores = std::get<WriteBackBatch>(operation);
+        for (std::size_t i = 0; i < stores.op_ids.size(); ++i) {
+            EXPECT_FALSE(stores.source_pinned.at(i));
+            history_stores +=
+                static_cast<std::int32_t>(std::count(stores.group_ids.at(i).begin(), stores.group_ids.at(i).end(), 0u));
+        }
+    }
+    EXPECT_EQ(history_stores, 2);
+    AckWriteBacks(retract);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
+    SendForwardDone("resident", {43});
+    SendAbortEvent("resident");
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+
+    const ExecutionPlan recovery = PlanOnce();
+    const ForwardBatch* recovered = FindForwardBatch(recovery);
+    ASSERT_NE(recovered, nullptr);
+    ASSERT_EQ(recovered->request_ids, std::vector<std::string>{"partial"});
+    EXPECT_EQ(recovered->extend_prefix_lens, std::vector<std::int32_t>{8});
+    EXPECT_EQ(recovered->input_lengths, std::vector<std::int32_t>{8});
+    EXPECT_EQ(recovered->prefill_lengths, std::vector<std::int32_t>{20});
+    bool loaded_state = false;
+    for (const CacheOperation& operation : ExtractCacheOpsOfKind<LoadBackBatch>(recovery)) {
+        const auto& loads = std::get<LoadBackBatch>(operation);
+        for (const auto& group_ids : loads.group_ids) {
+            loaded_state |= std::ranges::find(group_ids, 1u) != group_ids.end();
+        }
+        for (std::uint32_t op_id : loads.op_ids) {
+            SendLoadBackDone(op_id);
+        }
+    }
+    EXPECT_TRUE(loaded_state);
+    AckWriteBacks(recovery);
+    SendForwardDone("partial", {});
+    SendAbortEvent("partial");
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+}
+
+TEST_F(StatePublicationSuite, PrefillDoneRetractionUsesActualPrefillEndWithSpeculativeDecodeWidth) {
+    Reset(true, 5, 0);
+    config_.device_allocator.total_pages = 15;
+    config_.max_scheduled_tokens = 8;
+    config_.max_batch_size = 3;
+    config_.enable_mixed_prefill_decode = true;
+    config_.cache_groups.resize(2);
+    for (CacheGroupConfig& group : config_.cache_groups) {
+        group.total_pages = config_.device_allocator.total_pages;
+    }
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    Submit({RequestSpec{.request_id = "a", .tokens = MakeTokens(8, 1)},
+            RequestSpec{.request_id = "b", .tokens = MakeTokens(8, 101)},
+            RequestSpec{.request_id = "c", .tokens = MakeTokens(8, 201)}});
+    for (const std::string& id : {"a", "b"}) {
+        const ExecutionPlan prefill = PlanOnce();
+        const ForwardBatch* initial_batch = FindForwardBatch(prefill);
+        ASSERT_NE(initial_batch, nullptr);
+        ASSERT_EQ(initial_batch->request_ids, std::vector<std::string>{id});
+        SendForwardDone(id, {id == "a" ? 41 : 141});
+    }
+
+    // The mixed-mode prefill reserve leaves too little token budget for a
+    // decode, so the third request forces a retraction while both residents
+    // are still PrefillDone. All 8 prompt tokens are computed, even though
+    // TokenSize() - decode_input_tokens is only 9 - 5 = 4.
+    const ExecutionPlan retract = PlanOnce();
+    const ForwardBatch* replacement = FindForwardBatch(retract);
+    ASSERT_NE(replacement, nullptr);
+    ASSERT_EQ(replacement->request_ids, std::vector<std::string>{"c"});
+    ASSERT_EQ(scheduler_->WaitingSize(), 1u);
+    EXPECT_EQ(StateStoreCount(retract), 1);
+    std::int32_t history_stores = 0;
+    for (const CacheOperation& operation : ExtractCacheOpsOfKind<WriteBackBatch>(retract)) {
+        const auto& stores = std::get<WriteBackBatch>(operation);
+        for (std::size_t i = 0; i < stores.op_ids.size(); ++i) {
+            EXPECT_FALSE(stores.source_pinned.at(i));
+            history_stores +=
+                static_cast<std::int32_t>(std::count(stores.group_ids.at(i).begin(), stores.group_ids.at(i).end(), 0u));
+        }
+    }
+    EXPECT_EQ(history_stores, 2);
+    AckWriteBacks(retract);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 3);
+    SendForwardDone("c", {241});
+    for (const std::string& id : {"a", "b", "c"}) {
+        SendAbortEvent(id);
+    }
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+    auto replay_tokens = MakeTokens(8, 1);
+    replay_tokens.push_back(999);
+    ExpectReplay("recovered_prefill", std::move(replay_tokens), 8, 0);
+}
+
+TEST_F(StatePublicationSuite, RetractionRecomputesDecodeFromPrefillOrFromScratch) {
     for (const bool host_cache : {false, true}) {
         SCOPED_TRACE(host_cache);
         Reset(host_cache, 1, 0);

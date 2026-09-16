@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Scheduler-owned speculative KDA snapshots versus independent tokenwise decode.
+"""Scheduler-owned speculative KDA state versus independent tokenwise decode.
 
 The scheduler supplies all tested cache locations. Only the numerical oracle
 uses a fixed private working block: it runs each accepted token independently,
@@ -226,7 +226,7 @@ def _assert_states(actual, expected, label: str):
 @requires_cuda
 @requires_fla
 @pytest.mark.parametrize("replay", [False, True], ids=["scratch", "replay"])
-def test_speculative_active_eviction_reuses_only_written_state_blocks(
+def test_speculative_decode_recycles_working_state_and_preserves_prefill_checkpoint(
     replay,
 ):
     actual = _KDA(width=_WIDTH, replay=replay)

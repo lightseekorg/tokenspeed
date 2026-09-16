@@ -192,22 +192,9 @@ public:
     // completion. progress.completed_pages must be present.
     void CacheCompletedBlocks(std::span<BlockTable> tables, const RequestProgress& progress,
                               std::uint64_t access_epoch);
-    struct CompletedStatePublication {
-        CacheKey key;
-        CacheBlockLocation location;
-        std::int32_t logical_block_index;
-        CacheBoundaryKind boundary_kind;
-    };
-    // Read-only publication targets, using exactly the same provenance and
-    // non-hole selection as commit. Admission may preview kind upgrades.
-    std::vector<CompletedStatePublication> CompletedStatePublications(std::span<const GroupDemand> demands,
-                                                                      const RequestProgress& progress) const;
     void ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
     void ConsumeReservedTokens(std::span<BlockTable> tables, std::int32_t num_tokens);
     void Free(std::span<BlockTable> tables);
-    // Release a transfer batch, then reconsider only the affected state
-    // entries. The pointers are borrowed; no additional Device refs are held.
-    void ReleaseDeviceBlockRefs(std::span<CacheBlockRef* const> block_refs);
     // Clears only the Device prefix index. Returns false without mutation when
     // any cached block still has an owner outside its prefix index.
     bool ClearDeviceCache();
@@ -232,14 +219,10 @@ public:
     // Queue every already-published non-state Device cache entry for D2H Store.
     // Missing keys and an absent Host tier are silently skipped.
     void QueueCachedBlocksForStore(std::span<const std::string> prefix_hashes);
-    // Find the newest complete state in this prefix and upgrade its kind.
-    // Returns a non-owning identity; adds no Device refs or access-epoch touch.
-    std::optional<StateSnapshot> RetainLatestStateSnapshot(std::span<const std::string> prefix_hashes,
-                                                           CacheBoundaryKind boundary_kind);
-    void QueueStateSnapshotForStore(const StateSnapshot& snapshot);
+    // Queue the newest already-published Device checkpoint from each state group.
+    void QueueLatestSnapshotBlocksForStore(std::span<const std::string> prefix_hashes);
     std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
-    bool CanStoreDeviceCachedBlock(const CacheKey& key) const;
     HostAllocationBatch AcquireHostBlocks(std::span<const std::uint32_t> group_ids);
     CacheBlockRef AcquireHostBlock(std::uint32_t group_id);
     // Collection/pinning follows host-tier presence, so the slide credit flips count_uncached on this.
@@ -291,20 +274,8 @@ private:
                                       std::uint64_t access_epoch);
     void cacheDeviceCompletedBlocksForGroup(std::size_t group_index, BlockTable& table, const CompletedPages& completed,
                                             std::uint64_t access_epoch);
-    std::vector<CompletedStatePublication> completedStatePublicationsForGroup(std::size_t group_index,
-                                                                              const BlockTable& table,
-                                                                              const CompletedPages& completed) const;
     bool evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location);
     static void validateProgress(const RequestProgress& progress);
-    void collectStateBlocks(std::size_t group_index, std::span<const CacheBlockRef> blocks,
-                            std::vector<CachedStateBlock>& candidates) const;
-    void reclaimExpiredForGroup(std::size_t group_index, BlockTable& table, std::int32_t num_computed_tokens,
-                                std::vector<CachedStateBlock>& candidates);
-    void cleanupStateChunks(std::span<const CachedStateBlock> candidates);
-    std::optional<StateSnapshot> CaptureStateSnapshot(std::span<const std::string> prefix_hashes,
-                                                      std::int32_t boundary_tokens) const;
-    bool StateSnapshotIsCurrent(const StateSnapshot& snapshot) const;
-    bool RetainStateSnapshot(const StateSnapshot& snapshot, CacheBoundaryKind boundary_kind);
     std::int32_t groupExpiredBlocksAt(std::int32_t i, std::int32_t num_computed_tokens) const {
         return geometry_[static_cast<std::size_t>(i)].ExpiredBlocksAt(groups_[static_cast<std::size_t>(i)].Spec(),
                                                                       num_computed_tokens);

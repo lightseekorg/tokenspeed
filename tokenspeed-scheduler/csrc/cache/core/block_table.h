@@ -61,9 +61,9 @@ private:
     // Unconsumed capacity at the logical tail. This may span multiple blocks
     // when admission preallocates a later decode/MTP step.
     std::int32_t available_tokens_{0};
-    // Slots below this monotonic frontier have released their request ownership.
-    // Sparse state tables may contain holes between live islands, so reclaim
-    // cannot infer this frontier from the first null slot.
+    // Slots below this monotonic frontier have already released their request
+    // ownership. Sparse state tables may contain holes between live islands,
+    // so reclaim cannot infer this frontier from the first null slot.
     std::int32_t reclaimed_prefix_blocks_{0};
 };
 
