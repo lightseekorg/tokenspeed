@@ -143,7 +143,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("max_scheduled_tokens", &tokenspeed::SchedulerConfig::max_scheduled_tokens)
         .def_rw("max_batch_size", &tokenspeed::SchedulerConfig::max_batch_size)
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
-        .def_rw("prefill_workspace_tokens", &tokenspeed::SchedulerConfig::prefill_workspace_tokens)
         .def_rw("overlap_schedule_depth", &tokenspeed::SchedulerConfig::overlap_schedule_depth)
         .def_rw("role", &tokenspeed::SchedulerConfig::role)
         .def_prop_rw(

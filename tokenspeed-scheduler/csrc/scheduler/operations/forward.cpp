@@ -302,7 +302,6 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     const std::int32_t headroom = config_.role == Role::kP ? 0 : request->AdmissionHeadroom(kRetractionSafeSteps);
     const PrefillReserve reserve{
         .decode_input_tokens = decode_input_tokens,
-        .workspace_tokens = config_.prefill_workspace_tokens,
         .completes_prefill = completes_prefill,
         .prompt_headroom_tokens = headroom > 0 ? unscheduled - prefill_tokens + headroom : 0,
         // A remote landing always finishes shaping; the P role needs no
@@ -390,7 +389,6 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     // The prompt headroom was prepaid at first-chunk admission.
     const PrefillReserve reserve{
         .decode_input_tokens = reserve_num_tokens_in_next_schedule_event,
-        .workspace_tokens = config_.prefill_workspace_tokens,
         .completes_prefill = completes_prefill,
         .prompt_headroom_tokens = 0,
         .reserve_snapshot_state_growth = config_.role != Role::kP && completes_prefill,
@@ -819,8 +817,10 @@ void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& buil
 // first -- their KV pages stay pinned until the transfer finishes
 // (pdTransferInFlight: on this role every page-holding state is pinned, from
 // the first scheduled chunk to the PD ACK), so releasing them outranks
-// feeding more prompt work -- then the prefill
-// phases run with no decode reserve (this role never decodes locally). No
+// feeding more prompt work -- then the prefill phases run with the same
+// completing-chunk decode reserve as every other role: this node never
+// decodes locally, but the forward that completes a prompt drafts the first
+// candidate window into that reserve before the remote decode ships it. No
 // retraction either: a P node's pressure valve is the transfer itself, so
 // this grammar never calls maybeRetractForCapacity and nothing here is ever
 // readmitted.
@@ -842,7 +842,7 @@ void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& b
         }
     }
 
-    scheduleLocalPrefillWork(feedback, build, candidates, /*readmission=*/nullptr, /*decode_reserve=*/0);
+    scheduleLocalPrefillWork(feedback, build, candidates, /*readmission=*/nullptr, config_.decode_input_tokens);
 }
 
 // D role: decode worker. Local recovery work runs alone in its batch;

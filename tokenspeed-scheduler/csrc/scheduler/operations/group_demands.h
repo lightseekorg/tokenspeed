@@ -45,11 +45,10 @@ std::vector<GroupDemand> MakeGroupDemands(std::vector<BlockTable>& tables, Group
 // per round in tokens. Every cache group derives its own reserve from it in
 // ReservePrefillDemands -- the only writer of GroupDemand::reserve_tokens.
 struct PrefillReserve {
-    // Width of the decode step that follows the completed prompt; 0 on the P
-    // role, which never decodes locally.
+    // Width of the decode step that follows the completed prompt. The P role
+    // never decodes locally, but the forward that completes a prompt drafts
+    // the first candidate window into this slot before the remote decode.
     std::int32_t decode_input_tokens{};
-    // Transient history writes after every chunk, including on prefill-only roles.
-    std::int32_t workspace_tokens{};
     bool completes_prefill{false};
     // Rest of the prompt plus escalating decode room, prepaid by a decoding
     // role at first-chunk admission (Request::AdmissionHeadroom); 0 on later
@@ -72,8 +71,7 @@ std::int64_t SnapshotStateReserveTokens(std::int64_t block_granularity, std::int
 // Sets every group's reserve_tokens from the round's PrefillReserve, by
 // retention: full-history groups hold every token the round is accountable
 // for, including the prepaid prompt headroom; sliding-window groups recycle
-// slid-out pages and hold the decode slot. Both cover transient workspace.
-// Snapshot-state groups bank
+// slid-out pages and hold only the decode slot; snapshot-state groups bank
 // one growth block (SnapshotStateReserveTokens) on the admission that
 // finishes shaping them and 0 otherwise.
 void ReservePrefillDemands(std::span<GroupDemand> demands, std::span<const CacheGroupConfig> cache_groups,

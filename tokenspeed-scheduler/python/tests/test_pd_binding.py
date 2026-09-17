@@ -120,7 +120,10 @@ def test_pd_counters_follow_request_state():
     assert scheduler.active_lcm_blocks() == 0
 
 
-def test_prefill_workspace_is_reserved_before_prompt_completion():
+def test_prefill_role_reserves_the_decode_window_on_the_completing_chunk():
+    """The P role never decodes, but the chunk that completes a prompt drafts
+    the first candidate window, so it reserves ``decode_input_tokens`` exactly
+    like a decoding role; intermediate chunks hold only their own tokens."""
     cfg = SchedulerConfig()
     cfg.role = SchedulerConfig.Role.P
     cfg.prefix_granularity = 2
@@ -128,8 +131,7 @@ def test_prefill_workspace_is_reserved_before_prompt_completion():
     cfg.max_batch_size = 1
     cfg.num_device_pages = 17
     cfg.disable_l2_cache = True
-    cfg.decode_input_tokens = 0
-    cfg.prefill_workspace_tokens = 3
+    cfg.decode_input_tokens = 3
     cfg.cache_groups = [
         CacheGroupConfig(
             group_id="history",
@@ -143,8 +145,16 @@ def test_prefill_workspace_is_reserved_before_prompt_completion():
     scheduler = Scheduler(cfg)
     scheduler.submit_requests([make_spec("chunked", list(range(8)))])
     scheduler.advance(ExecutionEvent().add_event(PD.BootstrappedEvent("chunked")))
-    batch = scheduler.next_execution_plan().forward[0]
-    assert list(batch.input_lengths) == [4]
-    assert (
-        len([page for page in dict(batch.block_tables)["history"][0] if page > 0]) == 4
-    )
+
+    def held_pages(batch) -> int:
+        return len(
+            [page for page in dict(batch.block_tables)["history"][0] if page > 0]
+        )
+
+    first_chunk = scheduler.next_execution_plan().forward[0]
+    assert list(first_chunk.input_lengths) == [4]
+    assert held_pages(first_chunk) == 2, "tokens 0..3 only, no reserve yet"
+
+    completing_chunk = scheduler.next_execution_plan().forward[0]
+    assert list(completing_chunk.input_lengths) == [4]
+    assert held_pages(completing_chunk) == 6, "tokens 0..7 plus a 3-token window"

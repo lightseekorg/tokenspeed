@@ -31,7 +31,7 @@ matched. A chunk that *completes* the prompt is exempt: there is no next chunk
 to align for.
 
 **Reserve.** What an admission holds beyond the chunk it computes is stated
-once per round (`PrefillReserve`: decode width, workspace, prompt headroom,
+once per round (`PrefillReserve`: decode width, prompt headroom,
 whether the round finishes shaping the state groups) and turned into each
 group's page demand by `ReservePrefillDemands` — the only writer of
 `GroupDemand::reserve_tokens`. It picks the rule by the group's retention,
@@ -50,15 +50,15 @@ never by call site:
 - *Snapshot-state* groups reserve at least one growth block on a decoding
   role's completing chunk or remote landing, and nothing on other rounds (§1.2).
 
-`prefill_workspace_tokens` declares transient history writes after each prefill
-chunk. It defaults to zero, independently of `decode_input_tokens`. The runtime
-sets it to the verify width only for K3 DSpark on a pipeline prefill worker,
-whose final stage writes proposal KV after every chunk. Other models and roles
-retain their existing admission policy. History groups take the maximum of this
-workspace and their other reserves; snapshot-state shaping is unchanged. These
-pages use the request's existing cache groups and retire with its other blocks.
-The single-request capacity bound includes the same explicit workspace so a
-maximum-length K3 pipeline prefill prompt remains admissible.
+The decode slot is reserved on **every** role, the P role included. A P node
+never decodes locally, but with speculation configured the forward that
+completes a prompt runs the drafter once and writes its candidate block into
+the `decode_input_tokens` slots behind the prompt — the same window a decoding
+role verifies into — before `plan.remote_decode` ships the candidates. Without
+that reserve those rows have no page and fall to the dummy slot, and the block
+attention that reads them back proposes garbage. What P does *not* reserve is
+decode growth: no admission headroom, no snapshot-state growth block, no
+overlap protection (§3.1). The capacity model (§1.4) states the same split.
 
 ### 1.1 Head-of-line: an incomplete prefill holds the queue
 
@@ -435,6 +435,13 @@ it can report outcomes but never compose the batch.
 pinned until the transfer finishes, so releasing them outranks feeding more
 prompt work), then the shared local-prefill phases
 (`scheduleLocalPrefillWork`): resident chunks, then new prompts.
+
+**Reserve: the decode slot, nothing else.** The completing chunk reserves
+`decode_input_tokens` like every role, because the drafter writes the first
+candidate block there before the remote decode carries it to the peer. The
+growth reserves stay off: no admission headroom (nothing is ever retracted),
+no snapshot-state growth block (the peer banks its own), no overlap protection
+(no local decode is ever in flight).
 
 **Retraction: none.** A P node's pressure valve is the transfer itself — pages
 are pinned until the peer acknowledges, then released wholesale. Retracting a

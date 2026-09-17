@@ -34,9 +34,9 @@ The [Hopper/cu129 installation guide](hopper-cu129.md) describes the host
 prerequisites and dependency sources. The command rebuilds the checkout's
 kernel and scheduler packages; it does not start the P, D, or SMG services.
 
-This runtime requires `tokenspeed-scheduler>=0.1.17` for prefill workspace
-reservation and PD lifecycle counters. Rebuild the scheduler from this checkout
-when testing before the matching wheel is published.
+This runtime requires `tokenspeed-scheduler>=0.1.18` for the prefill role's
+decode-slot reserve and the PD lifecycle counters. Rebuild the scheduler from
+this checkout when testing before the matching wheel is published.
 
 DeepEP must provide the legacy `Buffer` API with BF16 low-latency support
 for the checkpoint's latent width and top-k. The standard K3 geometry is

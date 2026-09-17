@@ -51,7 +51,6 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     make_config,
     ngram_inputs_for_forward,
     resolve_dspark_prefix_replay_tokens,
-    resolve_prefill_workspace_tokens,
     scheduler_cache_group_pages,
     should_use_overlap_schedule,
 )
@@ -326,17 +325,6 @@ class EventLoop:
             cache_groups=cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
         )
-        scheduler_cfg.prefill_workspace_tokens = resolve_prefill_workspace_tokens(
-            disaggregation_mode=server_args.disaggregation_mode,
-            pp_size=mapping.pp_size,
-            speculative_algorithm=server_args.speculative_algorithm,
-            draft_model_type=(
-                draft_model_config.hf_config.model_type
-                if draft_model_config is not None
-                else None
-            ),
-            decode_input_tokens=decode_input_tokens,
-        )
         logger.info(
             "Scheduler config: prefix_granularity=%s num_device_pages=%s "
             "max_scheduled_tokens=%s decode_input_tokens=%s "
@@ -380,11 +368,9 @@ class EventLoop:
         self.max_model_len = min(
             self.model_config.context_len, self.max_single_request_tokens
         )
-        input_reserve = (
-            1
-            if server_args.disaggregation_mode == "prefill"
-            else max(decode_input_tokens, 1)
-        )
+        # Every role reserves the first decode/verify window behind the prompt:
+        # a decoding role to verify into it, the prefill role to draft into it.
+        input_reserve = max(decode_input_tokens, 1)
         self.max_req_input_len = self.max_model_len - input_reserve
         if self.max_req_input_len < 1:
             raise RuntimeError(
