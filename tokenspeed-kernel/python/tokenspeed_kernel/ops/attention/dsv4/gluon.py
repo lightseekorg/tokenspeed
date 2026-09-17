@@ -47,6 +47,9 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
         gluon_dsv4_prefill_topk_mxfp4_gfx950 as _dsv4_prefill_topk_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4 import (
+        gluon_dsv4_prefill_gfx1250 as _dsv4_prefill_gfx1250_impl,
+    )
 
     _DSV4_MXFP4_SIGNATURE = format_signature(
         q=dense_tensor_format(torch.uint8),
@@ -177,10 +180,41 @@ if current_platform().is_amd:
             "head_dim": frozenset({512}),
             "cache_layout": frozenset({"dense_workspace"}),
             "support_sink": frozenset({True}),
-            "selected_width": frozenset({384, 512, 640, 768, 1024, 1152}),
+            "selected_width": frozenset({128, 384, 512, 640, 768, 1024, 1152}),
             "metadata_dtypes": frozenset({torch.int32}),
         },
         tags={"amd", "gfx950", "selected_attention"},
     )
     def gluon_dsv4_prefill_gfx950(*args, **kwargs):
         return _dsv4_prefill_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "dsv4_prefill",
+        name="gluon_dsv4_prefill_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    kv=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim": frozenset({512}),
+            "cache_layout": frozenset({"dense_workspace"}),
+            "support_sink": frozenset({True}),
+            "selected_width": frozenset({128, 384, 512, 640, 768, 1024, 1152}),
+            "metadata_dtypes": frozenset({torch.int32}),
+        },
+        tags={"amd", "gfx1250", "selected_attention"},
+    )
+    def gluon_dsv4_prefill_gfx1250(*args, **kwargs):
+        return _dsv4_prefill_gfx1250_impl(*args, **kwargs)
