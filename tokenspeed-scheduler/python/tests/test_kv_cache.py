@@ -490,27 +490,27 @@ def _make_replay_config() -> ts.SchedulerConfig:
         block_granularity=4,
         total_pages=cfg.num_device_pages,
         retention=ts.CacheRetention.SlidingWindow,
-        sliding_window_tokens=24,
+        sliding_window_tokens=16,
         family=ts.CacheGroupFamily.History,
-        replay_window_tokens=16,
+        replayable=True,
     )
     cfg.cache_groups = [full, swa]
     return cfg
 
 
-def test_cache_group_config_replay_window_tokens_round_trips() -> None:
+def test_cache_group_config_replayable_round_trips() -> None:
     swa = _make_replay_config().cache_groups[1]
-    assert swa.replay_window_tokens == 16
-    swa.replay_window_tokens = None
-    assert swa.replay_window_tokens is None
-    swa.replay_window_tokens = 8
-    assert swa.replay_window_tokens == 8
+    assert swa.replayable is True
+    swa.replayable = False
+    assert swa.replayable is False
     swa.validate()
-    swa.replay_window_tokens = 25
-    with pytest.raises(ValueError, match="replay_window_tokens"):
-        swa.validate()
+    swa.replayable = True
+    swa.validate()
     full = _make_replay_config().cache_groups[0]
-    assert full.replay_window_tokens is None
+    assert full.replayable is False
+    full.replayable = True
+    with pytest.raises(ValueError, match="sliding History group"):
+        full.validate()
 
 
 def test_prefix_hit_replays_window_and_exposes_extend_replay_lens() -> None:

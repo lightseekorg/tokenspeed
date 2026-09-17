@@ -166,16 +166,20 @@ The capacity guarantees are retention-specific:
 ### 1.3 Bounded replay
 
 A sliding History group can be declared **replayable** (`CacheGroupConfig::
-replay_window_tokens`, see [Cache concepts](cache-concepts.md)): it leaves
+replayable`, see [Cache concepts](cache-concepts.md)): it leaves
 prefix caching entirely — never matched, published or streamed — and the
 model regenerates its rows from **re-fed prompt tokens**. DeepSeek V4.1's SWA
 rows and compressor tails are the motivating case: caching them persistently
 costs more than recomputing a bounded window, and the prefix hit should
-depend on the global KV alone.
+depend on the global KV alone. What a hit re-feeds is the group's whole
+retention window: retention keeps exactly what the queries after the hit
+read, and every page the group retains must be regenerated, so there is no
+second number to declare.
 
 The cache facts live on the `CacheCoordinator`, next to the specs they
-derive from: `ReplayWindowTokens()` (`W`, the largest declared window) and
-`ReplayTokens(P)` (`min(W, P)`, what a hit at `P` must re-feed). The
+derive from: `ReplayWindowTokens()` (`W`, the largest `sliding_window_tokens`
+over the replayable groups) and `ReplayTokens(P)` (`min(W, P)`, what a hit at
+`P` must re-feed). The
 scheduling rules live with the other chunk-cutting rules in
 `scheduler/operations/prefill_chunk.h`; the forward planner never branches on
 replay — the two decisions below reach the common path only through
@@ -233,10 +237,8 @@ PD: a replayable group travels like any sliding-window group. The prefill
 role replays on its own local hits exactly as the fused role does and, at
 completion, transfers the group's retained tail (`full_suffix` selects the
 pages intersecting the last `sliding_window_tokens − 1` positions). Every
-page of that tail must exist, so on the P and D roles `Validate` requires
-`replay_window_tokens == sliding_window_tokens`: the regenerated suffix then
-starts at or before the tail (a hit re-feeds the whole retention window, not
-just the attention window). The decode role computes no prompt rows, so
+page of that tail exists because a hit re-feeds the whole retention window:
+the regenerated suffix starts at or before the tail. The decode role computes no prompt rows, so
 `SchedulePrefillFirstChunkEvent` gives a remote prefill `replay = 0` and
 `Admit` leaves a demand that already names the landing's sparse suffix
 alone; the landed tail is what the first decode steps read, with no
