@@ -54,12 +54,14 @@ def get_scaled_dot_format_string(dtype: gl.dtype):
 
 @gluon.constexpr_function
 def partial_tdm_warp_hint(num_warps: int) -> int:
-    # Alternating bits so the mask and its reversal stay disjoint, which is what
-    # lets two loads merge into one `async_load_fused` operation.
+    # A contiguous half, so the mask and its reversal stay disjoint -- what lets
+    # two loads merge into one `async_load_fused` operation. Alternating bits
+    # satisfy that too, but measure worse: a contiguous half spreads the warps
+    # that carry a descriptor evenly over the SIMDs.
     if num_warps == 8:
-        return 0b01010101
+        return 0b11110000
     if num_warps == 4:
-        return 0b0101
+        return 0b1100
     raise ValueError(f"partial TDM requires 4 or 8 warps, got {num_warps}")
 
 
