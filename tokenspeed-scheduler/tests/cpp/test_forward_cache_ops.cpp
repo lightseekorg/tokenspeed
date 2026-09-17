@@ -157,8 +157,14 @@ TEST(ForwardCacheOpsPrefill, ChunkAcquiresAndCachesFullBlocks) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 4,
-                                 .prefix_hashes = hashes2,
-                                 .completed_boundary_kind = CacheBoundaryKind::kChunk,
+                             },
+                             RequestProgress{
+                                 .completed_pages =
+                                     CompletedPages{
+                                         .prefix_hashes = hashes2,
+                                         .first_new_prefix_page = 0,
+                                         .boundary_kind = CacheBoundaryKind::kChunk,
+                                     },
                                  .num_computed_tokens = 4,
                              }));
     EXPECT_EQ(tables[0].NumBlocks(), 4);
@@ -187,8 +193,14 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 4,
-                                 .prefix_hashes = hashes,
-                                 .completed_boundary_kind = CacheBoundaryKind::kChunk,
+                             },
+                             RequestProgress{
+                                 .completed_pages =
+                                     CompletedPages{
+                                         .prefix_hashes = hashes,
+                                         .first_new_prefix_page = 0,
+                                         .boundary_kind = CacheBoundaryKind::kChunk,
+                                     },
                                  .num_computed_tokens = 8,
                              }));
 
@@ -232,8 +244,14 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowBeforeAcquire) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 1,
-                                 .prefix_hashes = hashes,
-                                 .completed_boundary_kind = CacheBoundaryKind::kChunk,
+                             },
+                             RequestProgress{
+                                 .completed_pages =
+                                     CompletedPages{
+                                         .prefix_hashes = hashes,
+                                         .first_new_prefix_page = 0,
+                                         .boundary_kind = CacheBoundaryKind::kChunk,
+                                     },
                                  .num_computed_tokens = 12,
                              }));
 
@@ -261,6 +279,8 @@ TEST(ForwardCacheOpsDecode, StepAcquiresAndSlidesSwaWindow) {
         ASSERT_TRUE(AdmitForTest(coordinator, tables,
                                  GroupDemand{
                                      .num_tokens = 1,
+                                 },
+                                 RequestProgress{
                                      .num_computed_tokens = computed,
                                  }));
     }
@@ -300,9 +320,14 @@ TEST(ForwardCacheOpsDecode, DecodeStepRegistersFilledPages) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 1,
-                                 .prefix_hashes = hashes,
-                                 .new_prefix_hash_begin = 2,
-                                 .completed_boundary_kind = CacheBoundaryKind::kChunk,
+                             },
+                             RequestProgress{
+                                 .completed_pages =
+                                     CompletedPages{
+                                         .prefix_hashes = hashes,
+                                         .first_new_prefix_page = 2,
+                                         .boundary_kind = CacheBoundaryKind::kChunk,
+                                     },
                                  .num_computed_tokens = 8,
                              }));
 
@@ -325,6 +350,8 @@ TEST(ForwardCacheOpsDecode, AdmissionWithEmptyHashesOnlySlidesAndAllocates) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 1,
+                             },
+                             RequestProgress{
                                  .num_computed_tokens = 8,
                              }));
 

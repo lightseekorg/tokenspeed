@@ -190,7 +190,7 @@ TEST(CacheOperationTest, StreamOrderedStorePinsNoDeviceSource) {
 
     std::vector<BlockTable> tables(1);
     std::vector<GroupDemand> demands{{.table = &tables[0], .num_tokens = 2}};
-    auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands, std::nullopt);
+    auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt);
     ASSERT_TRUE(admission);
     const std::array<std::string, 1> hashes{"h0"};
     coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
@@ -223,7 +223,7 @@ TEST(CacheOperationTest, PinnedStoreHoldsDeviceSourceUntilAck) {
 
     std::vector<BlockTable> tables(1);
     std::vector<GroupDemand> demands{{.table = &tables[0], .num_tokens = 2}};
-    auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands, std::nullopt);
+    auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt);
     ASSERT_TRUE(admission);
     const std::array<std::string, 1> hashes{"h0"};
     coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
@@ -239,13 +239,13 @@ TEST(CacheOperationTest, PinnedStoreHoldsDeviceSourceUntilAck) {
     EXPECT_FALSE(coordinator.ClearDeviceCache());
     std::vector<BlockTable> newcomer(1);
     std::vector<GroupDemand> newcomer_demands{{.table = &newcomer[0], .num_tokens = 2}};
-    EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), newcomer_demands, std::nullopt))
+    EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), newcomer_demands, RequestProgress{}, std::nullopt))
         << "the only Device block is pinned by the in-flight store";
 
     transfers.CompleteWriteBack(write_back->op_id);
     EXPECT_FALSE(transfers.HasPinnedStoresInFlight());
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(CacheKey{.group_id = 0, .content_hash = "h0"}));
-    EXPECT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), newcomer_demands, std::nullopt))
+    EXPECT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), newcomer_demands, RequestProgress{}, std::nullopt))
         << "the ACK released the pin; the block is evictable again";
 }
 
@@ -309,7 +309,7 @@ TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
     ASSERT_TRUE(host_pin);
     std::vector<BlockTable> tables(1);
     std::vector<GroupDemand> demands{{.table = &tables[0], .num_tokens = 2}};
-    auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands, std::nullopt);
+    auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt);
     ASSERT_TRUE(admission);
     const std::array<std::string, 1> hashes{"h0"};
     coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
@@ -393,7 +393,7 @@ TEST(CacheOperationTest, RetractionReleaseEstimateExcludesBlocksOwnedByAnotherRe
 
     std::vector<BlockTable> tables(1);
     std::vector<GroupDemand> demands{{.table = &tables[0], .num_tokens = 4}};
-    auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands, std::nullopt);
+    auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt);
     ASSERT_TRUE(admission);
     const std::array<std::string, 2> hashes{"h0", "h1"};
     coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);

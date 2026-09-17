@@ -142,13 +142,11 @@ private:
     std::optional<CacheCoordinator::AdmissionResult> admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                            CacheCoordinator::PrefixProbe&& prefix,
                                                            std::span<const GroupDemand> demands,
+                                                           const RequestProgress& progress,
                                                            std::optional<std::uint64_t> request_access_epoch);
-    std::optional<CacheCoordinator::AdmissionResult> admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
-                                                           std::span<const GroupDemand> demands,
-                                                           std::uint64_t request_access_epoch);
     bool admitWithKvEventTracking(ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request,
-                                  const fsm::CacheProgress& cache_progress, std::int32_t new_prefix_hash_begin,
-                                  std::span<const GroupDemand> demands);
+                                  const fsm::CacheProgress& cache_progress, std::span<const GroupDemand> demands,
+                                  const RequestProgress& progress);
     std::vector<CacheKey> registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
                                                      std::int32_t first_page);
     void discardUncachedKvEventPages(std::span<const CacheKey> keys);

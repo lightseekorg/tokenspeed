@@ -156,7 +156,12 @@ public:
     // not count as cache hits.
     PrefixProbe ProbeDecodeDevicePrefix(std::span<const std::string> content_hashes) const;
     std::int32_t PromotionBoundaryTokens(const PrefixProbe& prefix) const;
+    // demands say what each group needs for the round ahead; progress says
+    // what the request completed since its previous admission. Completed
+    // pages are published and expired slots reclaimed inside this
+    // transaction, before the new pages are acquired.
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
+                                         const RequestProgress& progress,
                                          std::optional<std::uint64_t> request_access_epoch);
     // Capacity views for scheduling code, counted in LCM parent blocks. The
     // counts are opaque capacity units to the scheduler: all packing/geometry
@@ -183,11 +188,10 @@ public:
     // Runtime publication during Admit follows each group's boundary contract.
     void CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
                          std::uint64_t access_epoch, std::int32_t first_slot, CacheBoundaryKind boundary_kind);
-    void CacheCompletedBlocks(std::span<BlockTable> tables, std::span<const std::string> prefix_hashes,
-                              std::uint64_t access_epoch, std::int32_t first_new_prefix_page,
-                              std::int32_t num_computed_tokens, CacheBoundaryKind boundary_kind,
-                              bool stream_completed_to_host,
-                              std::span<const std::int32_t> materialized_state_boundaries);
+    // Publication without admission, for finish, retraction and remote
+    // completion. progress.completed_pages must be present.
+    void CacheCompletedBlocks(std::span<BlockTable> tables, const RequestProgress& progress,
+                              std::uint64_t access_epoch);
     void ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
     void ConsumeReservedTokens(std::span<BlockTable> tables, std::int32_t num_tokens);
     void Free(std::span<BlockTable> tables);
@@ -268,10 +272,12 @@ private:
                                  std::int32_t first_cache_block, std::uint64_t access_epoch,
                                  CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
     template <CacheTier Tier>
-    void cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand, std::uint64_t access_epoch);
-    void cacheDeviceCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
+    void cacheCompletedBlocksForGroup(std::size_t group_index, BlockTable& table, const CompletedPages& completed,
+                                      std::uint64_t access_epoch);
+    void cacheDeviceCompletedBlocksForGroup(std::size_t group_index, BlockTable& table, const CompletedPages& completed,
                                             std::uint64_t access_epoch);
     bool evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location);
+    static void validateProgress(const RequestProgress& progress);
     std::int32_t groupExpiredBlocksAt(std::int32_t i, std::int32_t num_computed_tokens) const {
         return geometry_[static_cast<std::size_t>(i)].ExpiredBlocksAt(groups_[static_cast<std::size_t>(i)].Spec(),
                                                                       num_computed_tokens);

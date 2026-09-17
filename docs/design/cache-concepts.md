@@ -541,6 +541,29 @@ Its responsibilities:
   `ProbeDecodeDevicePrefix` is the PD-decode variant: local history
   pages are reused while final-state groups are restored from the remote
   endpoint snapshot.
+
+  `Admit` takes two inputs of different scope and tense. One `GroupDemand`
+  per group says what that group needs for the round ahead: tokens, reserve,
+  and whether to materialize a sparse suffix. One `RequestProgress` per
+  request says what the request has done since the coordinator's previous
+  transaction for it: the prefix pages it completed (`CompletedPages`, present
+  only when the newly hashed range is non-empty, so "new hashes without a
+  boundary kind" cannot be expressed) and its computed-token count for
+  retention. Publication fields are request-scoped and therefore live on the
+  progress, not replicated onto every group's demand.
+
+  Publication rides inside `Admit` on purpose. "Completed" means scheduled
+  stream order for prefill (`NumComputedTokens` is the scheduled window end;
+  the FIFO data plane orders any hitter's forward after the writer) and
+  landed order for decode (token ids, hence hashes, exist only after
+  landing); the next admission is the first point after both, and one rule
+  covers both. Inside the transaction it is side-effect free when the
+  admission fails and is retried in the same round, it is ordered before
+  retention reclaims the slots it publishes, and victim planning sees the
+  pre-publication state so a request's own expired, still-unpublished tail
+  can fund the same admission. `CacheCompletedBlocks` takes the same
+  `RequestProgress` for finish, retraction and remote completion, which
+  publish without admitting.
 * **Prefix publication.** `CacheFullBlocks` / `CacheCompletedBlocks` register
   computed blocks into the prefix indexes for later requests. Prefix-closed
   groups match first; non-closed groups (SWA, Mamba) match only within the

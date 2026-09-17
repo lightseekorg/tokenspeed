@@ -2977,19 +2977,26 @@ TEST(CacheProgressTest, StateBoundariesRecordAtLandingAndSurviveFailedAdmission)
     GroupDemand demand{
         .table = &tables[0],
         .num_tokens = 128,  // fails before either publication or reclamation
-        .prefix_hashes = staged.prefix_hashes,
-        .new_prefix_hash_begin = 0,
-        .completed_boundary_kind = CacheBoundaryKind::kChunk,
-        .num_computed_tokens = 13,
-        .materialized_state_boundaries = staged.materialized_state_boundaries,
     };
-    EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), std::span{&demand, 1}, admission->access_epoch));
+    const RequestProgress progress{
+        .completed_pages =
+            CompletedPages{
+                .prefix_hashes = staged.prefix_hashes,
+                .first_new_prefix_page = 0,
+                .boundary_kind = CacheBoundaryKind::kChunk,
+                .materialized_state_boundaries = staged.materialized_state_boundaries,
+            },
+        .num_computed_tokens = 13,
+    };
+    EXPECT_FALSE(
+        coordinator.Admit(coordinator.ProbePrefix({}), std::span{&demand, 1}, progress, admission->access_epoch));
     EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 0);
     EXPECT_TRUE(resources.cache_progress.prefix_hashes.empty());
     EXPECT_EQ(resources.cache_progress.materialized_state_boundaries, (std::vector<std::int32_t>{4, 8, 16}));
 
     demand.num_tokens = 0;
-    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), std::span{&demand, 1}, admission->access_epoch));
+    ASSERT_TRUE(
+        coordinator.Admit(coordinator.ProbePrefix({}), std::span{&demand, 1}, progress, admission->access_epoch));
     staged.DiscardHashedStateBoundaries(4);
     resources.cache_progress = std::move(staged);
     EXPECT_EQ(resources.cache_progress.materialized_state_boundaries, (std::vector<std::int32_t>{16}));
@@ -3327,6 +3334,8 @@ TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 1,
+                             },
+                             RequestProgress{
                                  .num_computed_tokens = 4,
                              }));
 
@@ -3338,6 +3347,8 @@ TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 1,
+                             },
+                             RequestProgress{
                                  .num_computed_tokens = 5,
                              }));
     EXPECT_TRUE(swa_slot_null(0));
@@ -3348,6 +3359,8 @@ TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 1,
+                             },
+                             RequestProgress{
                                  .num_computed_tokens = 6,
                              }));
     EXPECT_FALSE(swa_slot_null(1)) << "key 3 of the pending query lives in page 1; freeing it is the off-by-one";
@@ -3358,6 +3371,8 @@ TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 1,
+                             },
+                             RequestProgress{
                                  .num_computed_tokens = 7,
                              }));
     EXPECT_TRUE(swa_slot_null(1));
