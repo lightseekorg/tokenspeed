@@ -9,10 +9,10 @@ configurations and widths retain the BF16 mailbox/gather followed by FlashInfer
 input quantization. `TOKENSPEED_K3_DOWN_NVFP4_FUSION=off` explicitly restores
 that original path for every width.
 
-This branch changes the default. Fresh full-model acceptance and node-level
-profiling remain required before merging; the historical results below do not
-certify the current default policy. This document describes the implementation
-contract, not a measured performance claim.
+This branch changes the default. The rebased numerical/module gates, three
+paired full-model sweeps and CC1/8/16 node-level profiling below are complete.
+The module improves, but the serving measurements do not establish an overall
+end-to-end throughput improvement.
 
 The validated serving target is one eight-GPU Blackwell TP8 attention / TP8 MoE
 replica with the NVFP4 SiTU FlashInfer TRT-LLM backend. Runtime eligibility
@@ -23,7 +23,135 @@ path. Additional data-parallel replicas or hybrid attention mappings are not
 validated by this experiment. This work does not change routed up-projection,
 shared experts, routing, sampling or EAGLE3 settings.
 
-## Ready-group module validation
+## Rebased default-policy validation
+
+The frozen comparison uses unmodified main
+`78c6518720e41b7a4a82697e593bda7a5ab05dc3` and candidate
+`519e904266874e0887df93d1b5b7d1253f6024f1`, on 8xGB300 with FlashInfer 0.6.18
+and PyTorch 2.13.0+cu130. The rebase preserves main's tuple-based prequantized
+input and attention-DP/all-to-all support; the typed activation is an additional
+registered input, not a replacement for that interface.
+
+All 761 numerical/integration cases passed without skips: 94 scalar, 204
+cooperative, 111 ready-group/default-policy, 42 expert compatibility and 310
+runtime cases. Distributed PDL off/on validation covered 18 widths and 1000
+graph replays, checking each of eight individually delayed peers. Additional
+changing-input stress covered 16 widths, four inputs and two mailbox slots,
+with 64 projections per graph and 64 replays for every delayed peer.
+
+The table measures the complete projection-through-quantization module, not
+the quantizer alone. Each timing sample takes the slowest TP rank; reported
+times are medians of six alternating rounds, with two projections per graph
+and 1000 graph replays per round. PDL is enabled. Positive values mean reduced
+time against the exact main path, including its existing collective and
+FlashInfer quantizer.
+
+| M | Main (us) | Default auto (us) | Time reduction |
+| --- | ---: | ---: | ---: |
+| 1 | 6.804 | 6.018 | +11.56% |
+| 2 | 7.483 | 6.566 | +12.26% |
+| 4 | 8.197 | 7.107 | +13.29% |
+| 8 | 9.722 | 8.761 | +9.88% |
+| 9 | 10.248 | 8.853 | +13.62% |
+| 32 | 10.509 | 9.444 | +10.14% |
+| 33 | 11.826 | 10.623 | +10.17% |
+| 64 | 10.764 | 10.050 | +6.63% |
+| 65 | 12.844 | 12.298 | +4.25% |
+| 95 | 12.343 | 11.718 | +5.06% |
+| 96 | 12.319 | 11.125 | +9.69% |
+| 97 | 11.995 | 10.948 | +8.73% |
+| 128 | 12.059 | 11.275 | +6.50% |
+| 129 | 13.349 | 12.254 | +8.20% |
+| 1279 | 32.775 | 26.112 | +20.33% |
+| 1280 | 32.794 | 26.112 | +20.38% |
+| 1281 (unchanged fallback) | 41.638 | 41.627 | +0.03% |
+| 8192 (unchanged fallback) | 146.622 | 146.786 | -0.11% |
+
+The fallback differences are measurement noise; neither width executes the
+new kernel.
+
+## Rebased full-model results
+
+Three paired clean boots compared the frozen main and candidate above on the
+same eight GPUs within each pair, in AB/BA/AB order. Both arms used the same
+runtime, checkpoints and main K3 agentic TP8 EAGLE3 configuration, FP8 KV cache,
+and an 8192-token prefill budget/chunk/graph maximum. The optimization variable
+was unset on both arms; every candidate rank prepared all 92 layers in `auto`.
+CUDA Graph and PDL remained enabled. There was no additional serving smoke test.
+
+All 4716 timed turns completed successfully with exactly 500 output tokens.
+The effective configurations, user histories, warmup, conversation slices,
+library versions and paired GPU identities passed comparison. The dataset
+SHA256 was `2405552a4f320bbaaf084a0f25f57dc1c9af44e69612d0c9d098a137db3463f2`,
+using EvalScope `acd09b44384d53174768bb1063f675420f76fae9`.
+
+Changes are geometric means of candidate/main ratios from all three pairs.
+Intervals are descriptive paired 95% t intervals on log ratios (df=2), not
+multiple-comparison-adjusted. No run was selected or dropped.
+
+| CC | Raw TPS/User | 95% interval | Raw TPS/GPU | 95% interval | Tok/Iter change | Normalized TPS/User |
+| --- | ---: | --- | ---: | --- | ---: | ---: |
+| 1 | +0.78% | [-0.94%, +2.53%] | +0.42% | [-0.90%, +1.74%] | +0.71% | +0.07% |
+| 2 | -1.62% | [-2.53%, -0.71%] | -1.38% | [-3.90%, +1.21%] | -1.84% | +0.22% |
+| 4 | -0.40% | [-2.45%, +1.69%] | -0.92% | [-3.07%, +1.27%] | -0.55% | +0.14% |
+| 8 | -0.60% | [-3.43%, +2.32%] | -1.04% | [-5.10%, +3.19%] | -0.04% | -0.55% |
+| 16 | +0.87% | [-2.08%, +3.91%] | -0.30% | [-3.41%, +2.92%] | +0.28% | +0.59% |
+| Across-CC geomean | -0.20% | [-1.50%, +1.12%] | -0.65% | [-2.61%, +1.36%] | -0.29% | +0.09% |
+
+`TPS/User = 1000 / TPOT(ms)` and `TPS/GPU = total throughput / 8`.
+Tok/Iter uses the main collector's iteration-weighted statistic within each
+run. Normalization applies `TPS/User * 3.5 / Tok/Iter` before paired aggregation;
+its across-CC interval is [-0.23%, +0.42%]. It is a first-order sensitivity
+estimate, not measured performance with acceptance held fixed: iteration cost
+need not remain constant, and normalization does not erase the raw results.
+
+The CC2 raw TPS/User decrease accompanies a 1.84% lower Tok/Iter (descriptive
+interval [-2.54%, -1.13%]); these measurements alone do not establish its cause.
+CC16 mean TTFT increases 4.42% (interval [+0.54%, +8.44%]). Neither observation
+is omitted from acceptance. Mean cache-hit changes are within 0.013 percentage
+points at every CC. Local module gains must not be reported as serving gains.
+
+## Node-level validation
+
+Independent main/candidate captures covered the first two turns at CC1, CC8
+and CC16, using Nsight Systems 2026.4.1 with CUDA Graph node tracing
+(`cuda-sw,nvtx`, `node:host-only`). The normal warmup and all earlier sweep
+points ran outside capture to preserve cache conditioning. Serving parameters
+matched the timed comparison, apart from NVTX and deployment-specific fields.
+CUDA Graph and PDL stayed enabled; no eager path was substituted.
+
+All 100 captured benchmark turns succeeded with 500 output tokens. The two
+nodes in each arm have identical ordered forward-step sequences across all
+eight ranks. All 12 reports passed analysis, with 99.03–99.65% of GPU kernel
+time attributed to forward steps. Every actual-request pure-decode step
+contains CUDA Graph node events.
+Attribution follows CUDA API/NVTX ownership; zero-correlation graph nodes are
+recovered only by unique containment in API-proven GPU-step bounds in the same
+process/device/context. Turn labels use rank-zero monotonic time and the
+validated TP-step ordinal, not a union of unsynchronized host clocks.
+
+| CC | Main captured TP steps | Auto captured TP steps | Main full-CC decode steps | Auto full-CC decode steps |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 466 | 477 | 298 | 309 |
+| 8 | 617 | 608 | 277 | 277 |
+| 16 | 641 | 636 | 282 | 263 |
+
+Captured counts include connection-check/setup work; full-CC decode counts
+exclude it and exclude draining batches. There are 2497 actual-request TP
+steps across the six arms. Eight ranks are not counted as eight independent
+measurements. First-turn, second-turn and overlapping-turn windows are retained
+separately, as are prefill and pure decode.
+
+Every actual-request target forward step has exactly 92 input encodings. Main
+decode uses 92 mailbox materializers plus 92 standalone quantizers. Default
+auto replaces them with 92 ready-group consumers at CC1 (M4) and 92 cooperative
+consumers at CC8/16 (M32/M64). Draining to one or two requests correctly selects
+ready-group; no forced large-width quantized-multicast kernel was observed.
+These traces verify the intended replacement and graph coverage, not a serving
+speedup. Kernel-duration sums can overlap and are not critical-path latency;
+none of the instrumented timings enters the paired performance results above.
+
+## Earlier ready-group module validation
 
 The integrated ready-group policy passed 108 GPU unit cases, including PDL
 off/on, partial warps, scale bytes, live-row reset and 1000 graph replays.
@@ -39,42 +167,9 @@ quantization time fell 2.8–7.3%. Timing used six alternating rounds, taking
 the slowest rank per round and then the median. These are module results,
 not new full-model TPS/User or TPS/GPU measurements.
 
-## Previous-policy validation summary
-
-The serving results below validate the previous auto policy: cooperative
-separate at M=1–8, cooperative fused at M=9–128, and scalar separate at
-M=129–1280. They do not establish end-to-end gains for the ready-group policy
-described below. Fresh full-model acceptance of that default policy is pending.
-
-The implementation was compared with unmodified main
-`eaf66b5be72ca1e9aed8b0a4c23165f4be072a2d` on 8xGB300, using the main K3
-agentic TP8 EAGLE3 configuration, FP8 KV cache, and an 8192-token prefill
-budget/chunk/graph maximum. Both arms used the same runtime, dataset and
-deployment overrides. The runtime included FlashInfer 0.6.18 and
-PyTorch 2.13.0+cu130. Numerical gates covered PDL off/on, dispatch boundaries,
-delayed peers and 1000 graph replays. Loaded-block checks included the
-8192-row fallback. All 4716 timed turns across three paired clean boots
-completed successfully with 500 output tokens each.
-
-Changes below are geometric means of paired candidate/main ratios:
-
-| CC | Raw TPS/User | Raw TPS/GPU | Acceptance-normalized TPS/User |
-| --- | ---: | ---: | ---: |
-| 1 | -0.94% | -0.74% | -0.20% |
-| 2 | +0.67% | -0.89% | +1.01% |
-| 4 | +2.66% | +1.40% | +1.79% |
-| 8 | +0.16% | -0.23% | +1.16% |
-| 16 | -0.91% | -1.09% | -0.17% |
-
-Normalization applies `TPS/User * 3.5 / Tok/Iter` to each run before paired
-aggregation. It is a first-order sensitivity analysis, not a measurement with
-acceptance held fixed: iteration cost need not remain constant. Across CCs,
-raw TPS/User changes by +0.32%, raw TPS/GPU by -0.31%, and normalized TPS/User
-by +0.72% (descriptive 95% paired interval: -0.64% to +2.09%). These results
-do not establish an overall serving throughput improvement. The small
-normalized CC1/CC16 regressions were accepted without per-shape exceptions
-for that previous opt-in policy. First/second-turn node-level profiling and
-fresh full-model acceptance of the current default policy remain merge gates.
+The current serving results above supersede the previous opt-in policy's
+comparison against `eaf66b5be72ca1e9aed8b0a4c23165f4be072a2d`. Those historical
+boots are not pooled with this rebased default-policy campaign.
 
 ## Dataflow
 
@@ -209,7 +304,7 @@ Only unit tests for the new scalar, cooperative and ready-group kernels are
 included under `tokenspeed-kernel/test/nvidia/ops/moe/`:
 `test_latent_down_nvfp4_gpu.py`, `test_latent_down_nvfp4_cooperative.py` and
 `test_latent_down_nvfp4_grouped.py`.
-Historical distributed and end-to-end validation above is not an additional
+Distributed and end-to-end validation above is not an additional
 checked-in test suite.
 
 The pinned EvalScope client advances its dataset offset within a sweep. The
