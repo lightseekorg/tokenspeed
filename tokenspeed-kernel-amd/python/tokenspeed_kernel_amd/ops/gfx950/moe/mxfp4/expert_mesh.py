@@ -31,18 +31,6 @@ def _add(a, b):
     return a + b
 
 
-@gluon.jit
-def _popcount(bits):
-    return gl.inline_asm_elementwise(
-        "v_bcnt_u32_b32 $0, $1, 0",
-        constraints="=v,v",
-        args=[bits],
-        dtype=gl.int32,
-        is_pure=True,
-        pack=1,
-    )
-
-
 @gluon.jit(do_not_specialize=("SIZE",))
 def _clear_mesh(mesh, SIZE):
     x = gl.arange(0, 4096, layout=gl.BlockedLayout([4], [64], [16], [0]))
@@ -135,7 +123,7 @@ def _count_mesh(
                 mask=start + x < M * WORDS,
                 other=0,
             )
-            count += gl.sum(_popcount(bits), 0)
+            count += gl.sum(gl.extra.libdevice.popc(bits.to(gl.int32)), 0)
         gl.store(counts + expert, count)
     else:
         gl.store(counts + expert, 0)
@@ -202,7 +190,7 @@ def _scatter_mesh(
                     mask=word < M * WORDS,
                     other=0,
                 )
-                routes = _popcount(bits)
+                routes = gl.extra.libdevice.popc(bits.to(gl.int32))
                 ranks = gl.associative_scan(routes, 0, _add) - routes
                 for repeat in range(gl.max(routes, 0)):
                     bit = gl.inline_asm_elementwise(

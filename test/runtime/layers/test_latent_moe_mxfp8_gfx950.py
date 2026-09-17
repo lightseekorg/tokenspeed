@@ -26,16 +26,16 @@ from unittest import mock
 
 import pytest
 import torch
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
+
+if not current_platform().is_cdna4:
+    pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
 
 @pytest.fixture(scope="module")
 def prepared_latent_experts():
     from tokenspeed_kernel.ops.moe import latent_moe_decode_pipeline_available
-    from tokenspeed_kernel.platform import current_platform
-
-    if not current_platform().is_cdna4:
-        pytest.skip("AMD CDNA4 is required")
 
     from tokenspeed.runtime.layers.layernorm import RMSNorm
     from tokenspeed.runtime.layers.moe import utils as moe_utils
@@ -225,10 +225,6 @@ def test_n16_preprocess_standard_finalize_and_joint_decode(
 @pytest.mark.parametrize("layout", ["concatenated", "interleaved"])
 @pytest.mark.parametrize("tp_rank", [0, 1])
 def test_n16_checkpoint_updates_preserve_loader_and_storage(device, layout, tp_rank):
-    from tokenspeed_kernel.platform import current_platform
-
-    if not current_platform().is_cdna4:
-        pytest.skip("AMD CDNA4 is required")
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.n16_weights import (
         preprocess_n16_mxfp4_weights,
     )

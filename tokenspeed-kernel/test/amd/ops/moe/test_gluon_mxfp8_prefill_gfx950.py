@@ -66,12 +66,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.mxfp8_gemm import (  # noqa: E40
     _load_a,
     _mxfp8_stage1,
     _mxfp8_stage2,
-    _phase_boundary,
     _publish_a,
+    _sched_barrier0,
     _situ,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.mxfp8_prefill import (  # noqa: E402
-    mxfp8_situ_prefill,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.mxfp8_quantize import (  # noqa: E402
     _quantize_mxfp8_kernel,
@@ -82,6 +79,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.mxfp8_quantize import (  # noqa:
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.n16_weights import (  # noqa: E402
     n16_mxfp4_shape,
     preprocess_n16_mxfp4_weights,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_mxfp8 import (  # noqa: E402
+    mxfp8_situ_prefill,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (  # noqa: E402
     _stage2_a16w4_warp_gemv_combine,
@@ -651,7 +651,7 @@ def _check_stage2_basis(k, m, *, pitch, buffer_safe, block_m):
         num_warps=4,
         num_stages=1,
         enable_fp_fusion=False,
-        **_mxfp8_compile_options(enable_asan=triton.knobs.compilation.enable_asan),
+        **_mxfp8_compile_options(),
     )
     scale_w = torch.exp2(raw["w2_scale"][0, n, group].float() - 127)
     expected = (
@@ -740,7 +740,7 @@ def _check_stage1_basis(d, varying_scales, block_m):
         num_warps=4,
         num_stages=1,
         enable_fp_fusion=False,
-        **_mxfp8_compile_options(enable_asan=triton.knobs.compilation.enable_asan),
+        **_mxfp8_compile_options(),
     )
     code = torch.tensor([1.0, 1.5, 2.0, 3.0], device="cuda")[n % 4]
     scale_w = torch.exp2(raw["w13_scale"][0, n, group].float() - 127)
@@ -850,12 +850,12 @@ def _phase_boundary_probe(x, y, out_x, out_y, SCHED_LIBRARY_HASH: gl.constexpr):
     c0 = gl.load(x + offset).to(gl.float32, bitcast=True)
     c1 = gl.load(y + offset).to(gl.float32, bitcast=True)
     for _ in gl.static_range(4):
-        _phase_boundary(SCHED_LIBRARY_HASH)
+        _sched_barrier0()
     gl.store(out_x + offset, c0.to(gl.int32, bitcast=True))
     gl.store(out_y + offset, c1.to(gl.int32, bitcast=True))
 
 
-def _check_phase_boundary_bits(enable_asan: bool):
+def _check_phase_boundary_bits():
     bits = torch.arange(1024, device="cuda", dtype=torch.int64)
     bits = ((bits * 0x9E3779B9 + 0x12345678) & 0xFFFFFFFF).to(torch.int32)
     boundaries = torch.tensor(
@@ -874,7 +874,7 @@ def _check_phase_boundary_bits(enable_asan: bool):
         out_y,
         num_warps=4,
         num_stages=1,
-        **_mxfp8_compile_options(enable_asan=enable_asan),
+        **_mxfp8_compile_options(),
     )
     # The hint performs no arithmetic; this is not a NaN-payload math contract.
     torch.testing.assert_close(out_x, bits, atol=0, rtol=0)
@@ -885,36 +885,29 @@ def _check_phase_boundary_bits(enable_asan: bool):
 
 
 def test_phase_fence_preserves_accumulator_bits():
-    _check_phase_boundary_bits(enable_asan=triton.knobs.compilation.enable_asan)
-
-
-def test_phase_boundary_without_external_library():
-    # Exercise the sanitizer-compatible hint omission without enabling ASAN.
-    _check_phase_boundary_bits(enable_asan=True)
+    _check_phase_boundary_bits()
 
 
 def test_scheduler_content_changes_compiled_kernel_key(monkeypatch, tmp_path):
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import _schedule
 
-    if triton.knobs.compilation.enable_asan:
-        pytest.skip("ASAN compilation omits the custom scheduling library")
     path = tmp_path / "sched_barrier.ll"
     original = Path(_schedule._SCHED_LIBRARY_PATH).read_text()
     path.write_text(original)
     monkeypatch.setattr(_schedule, "_SCHED_LIBRARY_PATH", str(path))
     _schedule._scheduler_library_hash.cache_clear()
     try:
-        first = _check_phase_boundary_bits(enable_asan=False)
+        first = _check_phase_boundary_bits()
         assert "@llvm.amdgcn.sched.barrier(i32 0)" in first.asm["llir"]
         # Keep the path fixed, but change the intrinsic's scheduling mask.
         path.write_text(
             original.replace("sched.barrier(i32 0)", "sched.barrier(i32 1)")
         )
         _schedule._scheduler_library_hash.cache_clear()
-        second = _check_phase_boundary_bits(enable_asan=False)
+        second = _check_phase_boundary_bits()
         assert first.hash != second.hash
         assert "@llvm.amdgcn.sched.barrier(i32 1)" in second.asm["llir"]
-        assert _check_phase_boundary_bits(enable_asan=False) is second
+        assert _check_phase_boundary_bits() is second
     finally:
         _schedule._scheduler_library_hash.cache_clear()
 
@@ -985,7 +978,7 @@ def test_situ_nonfinite_and_signed_zero_classification(record_property):
 def test_public_prefill_strides_duplicates_empty_and_input_preservation(
     m, policy, monkeypatch
 ):
-    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import mxfp8_prefill
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import prefill_mxfp8
 
     module, raw = _module(2, 3584, 3072, 16)
     plan = _plan(policy)
@@ -1012,8 +1005,8 @@ def test_public_prefill_strides_duplicates_empty_and_input_preservation(
         def fail(*args, **kwargs):
             pytest.fail("empty MoE must not sort or quantize")
 
-        monkeypatch.setattr(mxfp8_prefill, "sort_expert_slots", fail)
-        monkeypatch.setattr(mxfp8_prefill, "quantize_mxfp8", fail)
+        monkeypatch.setattr(prefill_mxfp8, "sort_expert_slots", fail)
+        monkeypatch.setattr(prefill_mxfp8, "quantize_mxfp8", fail)
     result = tokenspeed_kernel.moe_apply(
         plan,
         x,

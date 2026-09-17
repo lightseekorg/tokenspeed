@@ -25,7 +25,6 @@ from __future__ import annotations
 import math
 
 import torch
-from tokenspeed_kernel_amd._triton import triton
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4._schedule import (
     _mxfp8_compile_options,
 )
@@ -108,9 +107,7 @@ def mxfp8_situ_prefill(
         )
     if m == 0:
         return out
-    compile_options = _mxfp8_compile_options(
-        enable_asan=triton.knobs.compilation.enable_asan
-    )
+    compile_options = _mxfp8_compile_options()
     block_m = 32 if m <= 1024 else 128
     ids, route_weights, experts, valid = sort_expert_slots(
         topk_ids,

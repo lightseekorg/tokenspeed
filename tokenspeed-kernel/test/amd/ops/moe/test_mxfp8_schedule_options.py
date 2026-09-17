@@ -60,7 +60,7 @@ def test_scheduler_library_is_package_data(schedule):
 
 
 def test_normal_compile_options_pin_library_path(schedule):
-    assert schedule._mxfp8_compile_options(enable_asan=False) == {
+    assert schedule._mxfp8_compile_options() == {
         "SCHED_LIBRARY_HASH": hashlib.sha256(
             Path(schedule._SCHED_LIBRARY_PATH).read_bytes()
         ).hexdigest(),
@@ -68,36 +68,25 @@ def test_normal_compile_options_pin_library_path(schedule):
     }
 
 
-def test_asan_needs_no_custom_library(schedule, monkeypatch):
-    def fail():
-        raise AssertionError("ASAN must not request the custom library")
-
-    monkeypatch.setattr(schedule, "_scheduler_library_hash", fail)
-    assert schedule._mxfp8_compile_options(enable_asan=True) == {
-        "SCHED_LIBRARY_HASH": None,
-        "extern_libs": {},
-    }
-
-
 def test_changed_library_cannot_reuse_old_content_key(schedule, monkeypatch, tmp_path):
     path = tmp_path / Path(schedule._SCHED_LIBRARY_PATH).name
     path.write_bytes(Path(schedule._SCHED_LIBRARY_PATH).read_bytes())
     monkeypatch.setattr(schedule, "_SCHED_LIBRARY_PATH", str(path))
-    before = schedule._mxfp8_compile_options(enable_asan=False)
+    before = schedule._mxfp8_compile_options()
     path.write_bytes(path.read_bytes() + b"; changed contents, same path\n")
     # Simulate the fresh process required after editing JIT/library source.
     schedule._scheduler_library_hash.cache_clear()
-    after = schedule._mxfp8_compile_options(enable_asan=False)
+    after = schedule._mxfp8_compile_options()
     assert before["extern_libs"] == after["extern_libs"]
     assert before["SCHED_LIBRARY_HASH"] != after["SCHED_LIBRARY_HASH"]
     assert after["SCHED_LIBRARY_HASH"] == hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def test_compile_options_are_not_shared_mutable_state(schedule):
-    options = schedule._mxfp8_compile_options(enable_asan=False)
+    options = schedule._mxfp8_compile_options()
     options["extern_libs"].clear()
     options["SCHED_LIBRARY_HASH"] = None
-    again = schedule._mxfp8_compile_options(enable_asan=False)
+    again = schedule._mxfp8_compile_options()
     assert again["SCHED_LIBRARY_HASH"] == schedule._scheduler_library_hash()
     assert again["extern_libs"] == {
         schedule._SCHED_LIBRARY_NAME: schedule._SCHED_LIBRARY_PATH
@@ -263,7 +252,7 @@ def test_fused_quantizer_uniform_scale_exit_preserves_partial_groups(k):
 
 
 def test_bm32_bucket_and_runtime_shape_contract():
-    function = _source_function("mxfp8_prefill.py", "mxfp8_situ_prefill")
+    function = _source_function("prefill_mxfp8.py", "mxfp8_situ_prefill")
     assignment = next(
         node
         for node in function.body

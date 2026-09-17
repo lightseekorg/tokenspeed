@@ -74,12 +74,12 @@ if platform.is_amd:
         gluon_mxfp_fused_moe,
         gluon_mxfp_precomputed_mxfp4_fused_moe,
     )
-    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.mxfp8_prefill import (
-        mxfp8_situ_prefill,
-    )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.n16_weights import (
         n16_mxfp4_shape,
         preprocess_n16_mxfp4_weights,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_mxfp8 import (
+        mxfp8_situ_prefill,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (
         _supports_a16w4_warp_decode_ep_gfx950,

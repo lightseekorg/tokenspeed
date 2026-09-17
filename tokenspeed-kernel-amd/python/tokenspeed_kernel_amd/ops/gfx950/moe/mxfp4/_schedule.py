@@ -38,12 +38,8 @@ def _scheduler_library_hash() -> str:
     return hashlib.sha256(Path(_SCHED_LIBRARY_PATH).read_bytes()).hexdigest()
 
 
-def _mxfp8_compile_options(*, enable_asan: bool) -> dict:
-    # The AMD ASAN linker supplies its own libraries and ignores extern_libs.
-    # Omit only the scheduling hint, never the LDS ownership barriers or math.
+def _mxfp8_compile_options() -> dict:
     return {
-        "SCHED_LIBRARY_HASH": None if enable_asan else _scheduler_library_hash(),
-        "extern_libs": (
-            {} if enable_asan else {_SCHED_LIBRARY_NAME: _SCHED_LIBRARY_PATH}
-        ),
+        "SCHED_LIBRARY_HASH": _scheduler_library_hash(),
+        "extern_libs": {_SCHED_LIBRARY_NAME: _SCHED_LIBRARY_PATH},
     }

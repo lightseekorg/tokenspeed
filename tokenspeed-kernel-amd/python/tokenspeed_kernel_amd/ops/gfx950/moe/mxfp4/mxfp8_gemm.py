@@ -226,12 +226,6 @@ def _sched_barrier0(_semantic):
 
 
 @gluon.jit
-def _phase_boundary(SCHED_LIBRARY_HASH: gl.constexpr):
-    if SCHED_LIBRARY_HASH is not None:
-        _sched_barrier0()
-
-
-@gluon.jit
 def _bmajor_phase(acc, a, b, a_words, b_word, KH: gl.constexpr, NI: gl.constexpr):
     updated = ()
     bs = (b_word >> (8 * (2 * KH + NI))).to(gl.uint8)
@@ -266,7 +260,6 @@ def _stage1_interleaved(
     sb,
     K: gl.constexpr,
     NEXT: gl.constexpr,
-    SCHED_LIBRARY_HASH: gl.constexpr,
     BM: gl.constexpr,
 ):
     # Four B-major phases. Distribute the next tile's M16 reads before
@@ -285,15 +278,15 @@ def _stage1_interleaved(
             new_b += (_load_b(w, K, NEXT, 1, 0),)
         elif phase == 3:
             new_b += (_load_b(w, K, NEXT, 1, 1),)
-        _phase_boundary(SCHED_LIBRARY_HASH)
+        _sched_barrier0()
         for mi in gl.static_range(phase * READS, min((phase + 1) * READS, BM // 16)):
             for kh in gl.static_range(2):
                 new_a += (_fragment(smem, mi, kh),)
-        _phase_boundary(SCHED_LIBRARY_HASH)
+        _sched_barrier0()
         acc = _bmajor_phase(
             acc, old_a, old_b[phase], old_as, old_bs, phase // 2, phase % 2
         )
-        _phase_boundary(SCHED_LIBRARY_HASH)
+        _sched_barrier0()
     # The phase read order is M-major; the consumer tuple is K-half-major.
     a = ()
     for kh in gl.static_range(2):
@@ -444,27 +437,17 @@ def _stage2_tail(acc, a, b, a_words, b_word):
 
 
 @gluon.jit
-def _rcp(x):
-    return gl.inline_asm_elementwise(
-        "v_rcp_f32 $0, $1",
-        constraints="=v,v",
-        args=[x],
-        dtype=gl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@gluon.jit
 def _tanh(x):
     e = gl.exp2(-2.8853900817779268 * gl.abs(x))
-    t = (1.0 - e) * _rcp(1.0 + e)
+    t = gl.extra.libdevice.fast_dividef(1.0 - e, 1.0 + e)
     return gl.where(x > 0.0, t, -t)
 
 
 @gluon.jit
 def _situ(gate, up, BETA: gl.constexpr, LINEAR_BETA: gl.constexpr):
-    sigmoid = _rcp(1.0 + gl.exp2(-1.4426950408889634 * gate))
+    sigmoid = gl.extra.libdevice.fast_dividef(
+        1.0, 1.0 + gl.exp2(-1.4426950408889634 * gate)
+    )
     gate = BETA * _tanh(gate * (1.0 / BETA)) * sigmoid
     up = LINEAR_BETA * _tanh(up * (1.0 / LINEAR_BETA))
     return (gate * up).to(gl.bfloat16)
@@ -488,7 +471,7 @@ def _mxfp8_stage1(
     BETA: gl.constexpr,
     LINEAR_BETA: gl.constexpr,
     BUFFER_SAFE: gl.constexpr,
-    SCHED_LIBRARY_HASH: gl.constexpr,
+    SCHED_LIBRARY_HASH: gl.constexpr,  # Cache dependency; not a device operand.
     BM: gl.constexpr,
 ):
     gl.static_assert(BM == 32 or BM == 128)
@@ -515,11 +498,11 @@ def _mxfp8_stage1(
     )
     offsets = _a_offsets(ids, m_base, M, TOPK, K, False, BM, True)
     acc = _zeros(BM)
-    _phase_boundary(SCHED_LIBRARY_HASH)
+    _sched_barrier0()
     _copy_a(a0, x, offsets, 0, BUFFER_SAFE)
-    _phase_boundary(SCHED_LIBRARY_HASH)
+    _sched_barrier0()
     scales_a, scales_b = _load_scales(sa, sb, K, 0, BM)
-    _phase_boundary(SCHED_LIBRARY_HASH)
+    _sched_barrier0()
     if K > 256:
         _copy_a(a1, x, offsets, 1, BUFFER_SAFE)
     b = ()
@@ -528,18 +511,18 @@ def _mxfp8_stage1(
             b += (_load_b(w, K, 0, kh, ni),)
     cdna4_async_copy.wait_group(0)
     gl.barrier()
-    _phase_boundary(SCHED_LIBRARY_HASH)
+    _sched_barrier0()
     a = _full_fragments(a0, BM)
-    _phase_boundary(SCHED_LIBRARY_HASH)
+    _sched_barrier0()
 
     TAIL: gl.constexpr = 1 if K // 256 % 2 else 2
     for kt in gl.static_range(0, K // 256 - TAIL):
         read_slot = a1 if kt % 2 == 0 else a0
         write_slot = a0 if kt % 2 == 0 else a1
-        _phase_boundary(SCHED_LIBRARY_HASH)
+        _sched_barrier0()
         cdna4_async_copy.wait_group(0)
         gl.barrier()
-        _phase_boundary(SCHED_LIBRARY_HASH)
+        _sched_barrier0()
         if kt + 2 < K // 256:
             _copy_a(write_slot, x, offsets, kt + 2, BUFFER_SAFE)
         acc, a, b, scales_a, scales_b = _stage1_interleaved(
@@ -554,7 +537,6 @@ def _mxfp8_stage1(
             sb,
             K,
             kt + 1,
-            SCHED_LIBRARY_HASH,
             BM,
         )
     if TAIL == 2:
@@ -617,7 +599,7 @@ def _mxfp8_stage2(
     OUT_STRIDE: gl.constexpr,
     BUFFER_A_SAFE: gl.constexpr,
     BUFFER_OUT_SAFE: gl.constexpr,
-    SCHED_LIBRARY_HASH: gl.constexpr,
+    SCHED_LIBRARY_HASH: gl.constexpr,  # Cache dependency; not a device operand.
     BM: gl.constexpr,
 ):
     gl.static_assert(BM == 32 or BM == 128)
@@ -653,10 +635,10 @@ def _mxfp8_stage2(
     )
     offsets = _a_offsets(ids, m_base, M, TOPK, K, True, BM, False)
     acc = _zeros(BM)
-    _phase_boundary(SCHED_LIBRARY_HASH)
+    _sched_barrier0()
     b_lo = (_load_b(w, K, 0, 0, 0), _load_b(w, K, 0, 0, 1))
     scales_a, scales_b = _load_scales(sa, sb, K, 0, BM)
-    _phase_boundary(SCHED_LIBRARY_HASH)
+    _sched_barrier0()
     _publish_a(a0, _load_a(x, offsets, 0, BUFFER_A_SAFE, 0, BM // 16), 0, BM // 16)
     gl.barrier()
     first_lo, first_hi = _fragment_k64(a0, 0, 0, 0), _fragment_k64(a0, 0, 1, 0)
