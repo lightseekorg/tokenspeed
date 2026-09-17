@@ -533,7 +533,7 @@ void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, std::s
                                             std::uint64_t access_epoch, std::int32_t first_new_prefix_page,
                                             std::int32_t num_computed_tokens, CacheBoundaryKind boundary_kind,
                                             bool stream_completed_to_host,
-                                            std::int32_t materialized_state_boundary_tokens) {
+                                            std::span<const std::int32_t> materialized_state_boundaries) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     _assert(first_new_prefix_page >= 0 && static_cast<std::size_t>(first_new_prefix_page) < prefix_hashes.size(),
             "completed page range must be non-empty");
@@ -545,7 +545,7 @@ void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, std::s
             .completed_boundary_kind = boundary_kind,
             .num_computed_tokens = num_computed_tokens,
             .stream_completed_to_host = stream_completed_to_host,
-            .materialized_state_boundary_tokens = materialized_state_boundary_tokens,
+            .materialized_state_boundaries = materialized_state_boundaries,
         };
         cacheDeviceCompletedBlocksForGroup(i, demand, access_epoch);
     }
@@ -773,28 +773,47 @@ void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, con
     if (demand.num_computed_tokens < 0) {
         return;
     }
-    // Prefill can produce an internal snapshot, but speculative decode commits
-    // only the accepted endpoint. Never infer a written snapshot from an
-    // allocated slot or a completed token hash (including finish/retraction).
-    const std::int32_t boundary_tokens = static_cast<std::int32_t>(demand.prefix_hashes.size()) * prefix_granularity_;
-    if (groups_[group_index].Spec().kind == AttnKind::kMambaState &&
-        demand.materialized_state_boundary_tokens != boundary_tokens) {
+    // A non-closed group publishes, per resumable boundary, the pages needed
+    // to resume from it: the trailing window, or one snapshot slot for state.
+    // A sliding window resumes from the newest hashed boundary. A state
+    // snapshot exists only where a forward stopped -- prefill writes its
+    // latest internal aligned checkpoint, decode commits its accepted
+    // endpoint -- so never infer one from an allocated slot or a completed
+    // hash (including finish/retraction): only proven boundaries inside the
+    // newly hashed range publish, several at once when results landed back
+    // to back, and before retention can reclaim their table slots.
+    const std::int32_t hashed_prefix_pages = static_cast<std::int32_t>(demand.prefix_hashes.size());
+    std::vector<std::int32_t> boundaries_in_prefix_pages;
+    if (groups_[group_index].Spec().kind != AttnKind::kMambaState) {
+        boundaries_in_prefix_pages.push_back(hashed_prefix_pages);
+    } else {
+        for (const std::int32_t boundary : demand.materialized_state_boundaries) {
+            _assert(boundary > 0 && boundary % prefix_granularity_ == 0,
+                    "materialized state boundary must be positive and prefix-aligned");
+            const std::int32_t boundary_prefix_pages = boundary / prefix_granularity_;
+            if (boundary_prefix_pages > demand.new_prefix_hash_begin && boundary_prefix_pages <= hashed_prefix_pages) {
+                boundaries_in_prefix_pages.push_back(boundary_prefix_pages);
+            }
+        }
+    }
+    if (boundaries_in_prefix_pages.empty()) {
         return;
     }
-
-    const std::int32_t boundary_cache_block =
-        static_cast<std::int32_t>(demand.prefix_hashes.size()) * pages_per_prefix_hash;
-    const std::int32_t lookback =
-        std::min(groups_[group_index].Matcher().BoundaryLookbackPages(), boundary_cache_block);
-    if (lookback == 0) {
-        return;
+    const std::vector<CacheKey> keys = keysForGroup(demand.prefix_hashes, groups_[group_index].Id());
+    for (const std::int32_t boundary_prefix_pages : boundaries_in_prefix_pages) {
+        const std::int32_t boundary_cache_block = boundary_prefix_pages * pages_per_prefix_hash;
+        const std::int32_t lookback =
+            std::min(groups_[group_index].Matcher().BoundaryLookbackPages(), boundary_cache_block);
+        if (lookback == 0) {
+            continue;
+        }
+        const std::int32_t first_cache_block = boundary_cache_block - lookback;
+        cacheFullBlocksForGroup<Tier>(
+            group_index, *demand.table,
+            std::span<const CacheKey>{keys}.subspan(static_cast<std::size_t>(first_cache_block),
+                                                    static_cast<std::size_t>(lookback)),
+            first_cache_block, access_epoch, *demand.completed_boundary_kind, demand.stream_completed_to_host);
     }
-    const std::int32_t first_cache_block = boundary_cache_block - lookback;
-    std::vector<CacheKey> keys = keysForGroup(demand.prefix_hashes, groups_[group_index].Id());
-    cacheFullBlocksForGroup<Tier>(group_index, *demand.table,
-                                  std::span<const CacheKey>{keys}.subspan(static_cast<std::size_t>(first_cache_block)),
-                                  first_cache_block, access_epoch, *demand.completed_boundary_kind,
-                                  demand.stream_completed_to_host);
 }
 
 void CacheCoordinator::cacheDeviceCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,

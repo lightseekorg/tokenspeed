@@ -272,7 +272,7 @@ TEST(CacheCoordinatorTest, ExpandsOneLogicalHashIntoPerGroupCacheBlocks) {
     const std::vector<std::string> hashes = ContentHashes({std::vector<std::int32_t>(8, 7)});
     coordinator.CacheCompletedBlocks(tables, hashes, NextTestAccessEpoch(), /*first_new_prefix_page=*/0,
                                      /*num_computed_tokens=*/8, CacheBoundaryKind::kChunk,
-                                     /*stream_completed_to_host=*/false, /*materialized_state_boundary_tokens=*/0);
+                                     /*stream_completed_to_host=*/false, /*materialized_state_boundaries=*/{});
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0)));
     EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[0], 1, 0)));
     EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[0], 1, 1)));
@@ -1476,6 +1476,7 @@ TEST(CacheCoordinatorAdmissionTest, QwenScaleChunkLifecyclePublishesOneStateSnap
     std::optional<std::uint64_t> access_epoch;
     for (std::int32_t chunk = 0; chunk < kPromptPages / kChunkPages; ++chunk) {
         const std::int32_t first_page = chunk * kChunkPages;
+        const std::array materialized{first_page * kBlockTokens};
         std::vector<GroupDemand> demands;
         demands.reserve(specs.size());
         for (std::size_t group = 0; group < specs.size(); ++group) {
@@ -1487,7 +1488,7 @@ TEST(CacheCoordinatorAdmissionTest, QwenScaleChunkLifecyclePublishesOneStateSnap
                 .completed_boundary_kind = first_page == 0 ? std::nullopt : std::optional{CacheBoundaryKind::kChunk},
                 .num_computed_tokens = first_page * kBlockTokens,
                 .reserve_tokens = chunk == kPromptPages / kChunkPages - 1 ? 1 : 0,
-                .materialized_state_boundary_tokens = first_page * kBlockTokens,
+                .materialized_state_boundaries = first_page == 0 ? std::span<const std::int32_t>{} : materialized,
             });
         }
         const std::optional<CacheCoordinator::AdmissionResult> admission =
@@ -1496,6 +1497,7 @@ TEST(CacheCoordinatorAdmissionTest, QwenScaleChunkLifecyclePublishesOneStateSnap
         access_epoch = admission->access_epoch;
     }
 
+    const std::array materialized{kPromptPages * kBlockTokens};
     std::vector<GroupDemand> decode_demands;
     decode_demands.reserve(specs.size());
     for (std::size_t group = 0; group < specs.size(); ++group) {
@@ -1506,7 +1508,7 @@ TEST(CacheCoordinatorAdmissionTest, QwenScaleChunkLifecyclePublishesOneStateSnap
             .new_prefix_hash_begin = kPromptPages - kChunkPages,
             .completed_boundary_kind = CacheBoundaryKind::kEndpoint,
             .num_computed_tokens = kPromptPages * kBlockTokens,
-            .materialized_state_boundary_tokens = kPromptPages * kBlockTokens,
+            .materialized_state_boundaries = materialized,
         });
     }
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), decode_demands, access_epoch));
@@ -2871,7 +2873,8 @@ TEST(CacheCoordinatorStoreCandidates, PrefillPublicationStreamsFullAndStateDecod
 
     coordinator.CacheCompletedBlocks(tables, hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
                                      /*first_new_prefix_page=*/0, /*num_computed_tokens=*/4, CacheBoundaryKind::kChunk,
-                                     /*stream_completed_to_host=*/true, /*materialized_state_boundary_tokens=*/4);
+                                     /*stream_completed_to_host=*/true,
+                                     /*materialized_state_boundaries=*/std::array{4});
     std::vector<CacheCoordinator::StoreCandidate> prefill = coordinator.TakePendingStores();
     ASSERT_EQ(prefill.size(), 5u);
     EXPECT_EQ(prefill[0].key, Key(hashes[0], /*group_id=*/0));
@@ -2885,7 +2888,8 @@ TEST(CacheCoordinatorStoreCandidates, PrefillPublicationStreamsFullAndStateDecod
     decode_hashes.push_back(ContentHashes({{5, 6}})[0]);
     coordinator.CacheCompletedBlocks(tables, decode_hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
                                      /*first_new_prefix_page=*/2, /*num_computed_tokens=*/6, CacheBoundaryKind::kChunk,
-                                     /*stream_completed_to_host=*/false, /*materialized_state_boundary_tokens=*/6);
+                                     /*stream_completed_to_host=*/false,
+                                     /*materialized_state_boundaries=*/std::array{6});
     std::vector<CacheCoordinator::StoreCandidate> decode = coordinator.TakePendingStores();
     ASSERT_EQ(decode.size(), 1u);
     EXPECT_EQ(decode[0].key, Key(decode_hashes[2], /*group_id=*/1));
@@ -2940,7 +2944,8 @@ TEST(CacheCoordinatorStoreCandidates, PrefillStreamsThreeKdaGroupsDecodeFinishWr
 
     coordinator.CacheCompletedBlocks(tables, hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
                                      /*first_new_prefix_page=*/0, /*num_computed_tokens=*/4, CacheBoundaryKind::kChunk,
-                                     /*stream_completed_to_host=*/true, /*materialized_state_boundary_tokens=*/4);
+                                     /*stream_completed_to_host=*/true,
+                                     /*materialized_state_boundaries=*/std::array{4});
     std::vector<CacheCoordinator::StoreCandidate> prefill = coordinator.TakePendingStores();
     ASSERT_EQ(prefill.size(), 5u) << "2 MLA pages plus one snapshot from each of 3 KDA groups";
     EXPECT_EQ(prefill[0].key, Key(hashes[0], /*group_id=*/0));
@@ -2954,7 +2959,8 @@ TEST(CacheCoordinatorStoreCandidates, PrefillStreamsThreeKdaGroupsDecodeFinishWr
     decode_hashes.push_back(ContentHashes({{5, 6}})[0]);
     coordinator.CacheCompletedBlocks(tables, decode_hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
                                      /*first_new_prefix_page=*/2, /*num_computed_tokens=*/6, CacheBoundaryKind::kChunk,
-                                     /*stream_completed_to_host=*/false, /*materialized_state_boundary_tokens=*/6);
+                                     /*stream_completed_to_host=*/false,
+                                     /*materialized_state_boundaries=*/std::array{6});
     EXPECT_TRUE(coordinator.TakePendingStores().empty()) << "decode publication must not auto-stream MLA or KDA";
 
     coordinator.QueueCachedBlocksForStore(decode_hashes);
@@ -3782,6 +3788,7 @@ TEST(MambaStateRegistrationTest, MambaPublishesOnlyChunkBoundary) {
     std::vector<BlockTable> tables(coord.NumGroups());
     ASSERT_TRUE(AdmitForTest(coord, tables, /*num_tokens=*/12));  // 3 pages
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}});
+    const std::array materialized{12};
     std::vector<GroupDemand> demands;
     for (BlockTable& table : tables) {
         demands.push_back(GroupDemand{
@@ -3790,7 +3797,7 @@ TEST(MambaStateRegistrationTest, MambaPublishesOnlyChunkBoundary) {
             .new_prefix_hash_begin = 0,
             .completed_boundary_kind = CacheBoundaryKind::kChunk,
             .num_computed_tokens = 12,
-            .materialized_state_boundary_tokens = 12,
+            .materialized_state_boundaries = materialized,
         });
     }
     ASSERT_TRUE(coord.Admit(coord.ProbePrefix({}), demands, std::nullopt));
@@ -3811,13 +3818,14 @@ TEST(MambaStateRegistrationTest, MambaPublishesAlignedEndpoint) {
     std::vector<BlockTable> tables(coord.NumGroups());
     ASSERT_TRUE(AdmitForTest(coord, tables, /*num_tokens=*/12));
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}});
+    const std::array materialized{12};
     std::vector<GroupDemand> demands{{
         .table = &tables[0],
         .prefix_hashes = ch,
         .new_prefix_hash_begin = 0,
         .completed_boundary_kind = CacheBoundaryKind::kEndpoint,
         .num_computed_tokens = 12,
-        .materialized_state_boundary_tokens = 12,
+        .materialized_state_boundaries = materialized,
     }};
     ASSERT_TRUE(coord.Admit(coord.ProbePrefix({}), demands, std::nullopt));
     EXPECT_FALSE(coord.GroupPrefixIndex(0).Contains(pool, Key(ch[0], 0)));
@@ -3839,13 +3847,14 @@ TEST(MambaStateRegistrationTest, MambaPublishesAlignedCheckpointBeforeUnalignedE
     std::vector<BlockTable> tables(coord.NumGroups());
     ASSERT_TRUE(AdmitForTest(coord, tables, /*num_tokens=*/12));
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}});
+    const std::array materialized{8};
     std::vector<GroupDemand> demands{{
         .table = &tables[0],
         .prefix_hashes = ch,
         .new_prefix_hash_begin = 0,
         .completed_boundary_kind = CacheBoundaryKind::kEndpoint,
         .num_computed_tokens = 10,
-        .materialized_state_boundary_tokens = 8,
+        .materialized_state_boundaries = materialized,
     }};
     ASSERT_TRUE(coord.Admit(coord.ProbePrefix({}), demands, std::nullopt));
     EXPECT_EQ(coord.GroupPrefixIndex(0).NumEntries(pool), 1);
@@ -3853,10 +3862,11 @@ TEST(MambaStateRegistrationTest, MambaPublishesAlignedCheckpointBeforeUnalignedE
     coord.Free(tables);
 }
 
-TEST(MambaStateRegistrationTest, UnalignedPublicationRequiresMatchingMaterializedBoundary) {
+TEST(MambaStateRegistrationTest, PublishesOnlyProvenBoundariesCoveredByHashes) {
     for (const bool direct : {false, true}) {
-        for (const std::int32_t materialized : {0, 4, 8}) {
-            SCOPED_TRACE(::testing::Message() << "direct=" << direct << " materialized=" << materialized);
+        for (const auto& pending : std::vector<std::vector<std::int32_t>>{{}, {4}, {8}, {4, 8}, {4, 12}}) {
+            SCOPED_TRACE(::testing::Message()
+                         << "direct=" << direct << " pending=" << ::testing::PrintToString(pending));
             BlockPool pool(32, {1});
             const std::vector<CacheGroupSpec> specs = {{.kind = AttnKind::kMambaState,
                                                         .sliding_window = 0,
@@ -3870,7 +3880,7 @@ TEST(MambaStateRegistrationTest, UnalignedPublicationRequiresMatchingMaterialize
             if (direct) {
                 // Finish and retraction share this publication entry point.
                 coord.CacheCompletedBlocks(tables, hashes, NextTestAccessEpoch(), 0, 10, CacheBoundaryKind::kEndpoint,
-                                           false, materialized);
+                                           false, pending);
             } else {
                 const std::vector<GroupDemand> demands{{
                     .table = &tables[0],
@@ -3878,11 +3888,14 @@ TEST(MambaStateRegistrationTest, UnalignedPublicationRequiresMatchingMaterialize
                     .new_prefix_hash_begin = 0,
                     .completed_boundary_kind = CacheBoundaryKind::kChunk,
                     .num_computed_tokens = 10,
-                    .materialized_state_boundary_tokens = materialized,
+                    .materialized_state_boundaries = pending,
                 }};
                 ASSERT_TRUE(coord.Admit(coord.ProbePrefix({}), demands, std::nullopt));
             }
-            EXPECT_EQ(coord.GroupPrefixIndex(0).Contains(pool, Key(hashes[1], 0)), materialized == 8);
+            for (std::int32_t page = 0; page < 2; ++page) {
+                EXPECT_EQ(coord.GroupPrefixIndex(0).Contains(pool, Key(hashes[page], 0)),
+                          std::ranges::find(pending, (page + 1) * 4) != pending.end());
+            }
             coord.Free(tables);
         }
     }
@@ -4246,7 +4259,7 @@ TEST(BoundedReplayCoordinator, ReplayableGroupNeverPublishesOrStreams) {
          {CacheBoundaryKind::kChunk, CacheBoundaryKind::kEndpoint, CacheBoundaryKind::kPromoted}) {
         coord.CacheCompletedBlocks(tables, hashes, NextTestAccessEpoch(), /*first_new_prefix_page=*/0,
                                    /*num_computed_tokens=*/16, kind, /*stream_completed_to_host=*/true,
-                                   /*materialized_state_boundary_tokens=*/0);
+                                   /*materialized_state_boundaries=*/{});
     }
     EXPECT_EQ(coord.GroupPrefixIndex(0).NumEntries(pool), 4);
     EXPECT_EQ(coord.GroupPrefixIndex(1).NumEntries(pool), 0);

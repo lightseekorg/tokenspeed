@@ -110,15 +110,26 @@ An aligned endpoint is itself the checkpoint; an extent crossing no boundary
 needs only its final output. Only materialized aligned checkpoints are cached;
 an off-boundary endpoint is never keyed as a complete prefix.
 
-`CacheProgress::materialized_state_boundary_tokens` records the aligned
-boundary produced by the admitted local prefill. Publication of the preceding
-forward uses the old record before the next prefill advances it. Speculative
-decode preserves the record rather than claiming every crossed token boundary.
-The coordinator checks this exact boundary on admission, finish and retraction;
-an aligned accepted endpoint remains publishable without an internal snapshot.
-`Request::MaterializedStateBoundaryTokens()` resolves that endpoint from
-accepted feedback, not the conservative admission frontier. Capacity and
-retention continue to use their existing conservative token progress.
+`CacheProgress::materialized_state_boundaries` holds the aligned boundaries
+whose state is written but not yet hashed. Two events add to it, each at the
+moment it becomes true: admitting a prefill window records the checkpoint that
+window materializes (local prefill its latest internal aligned boundary; a
+remote landing only its endpoint, when aligned), and a landed result records
+its accepted endpoint, `TokenSize() - 1`, when aligned. Recording at landing
+rather than at the next admission matters under the overlap schedule, which
+plans a step before the previous one commits: two results can land back to
+back, and the second must not erase the first. Merely crossing a boundary adds
+nothing — speculative decode commits only its accepted endpoint.
+
+Admission, finish and retraction hand the list to the coordinator, which
+publishes every recorded boundary inside the newly hashed range — several at
+once when results landed back to back. A successful admission then drops the
+boundaries its hashes covered; a failed one leaves them for the retry. The
+hashed range comes from the same `Request::NumComputedTokens()` that drives
+retention (§5): the frontier is exact under any verify width, so the page
+holding an aligned accepted endpoint is hashed — and its checkpoint published —
+at the very next admission, and the list normally holds at most the last
+landing and the checkpoint of the chunk in flight.
 
 One forward means one model dispatch, not one kernel launch. The state backend
 handles checkpoint outputs within it: the example's recurrent scan evaluates
@@ -325,19 +336,22 @@ Every page-holding state carries one bundle, and a transition moves it whole
 to the successor state — so the count, like the pages, cannot be dropped on
 the way from one state to the next.
 
-The bundle follows one rule: **resources and progress land when an admission
-succeeds; a state transition only moves them, never modifies them.** The
-block tables are filled by the coordinator inside `Admit`; the cache progress
-(prefix-hash chain, promotion boundary, materialized state boundary) is
-advanced by the scheduler on a copy, handed to that same admission — which
-publishes the newly completed pages — and written back to the request only
-after it succeeds. A failed admission therefore leaves both untouched, and the
-retry re-derives the same completed pages and asks for their publication
-again. Committing progress before admission would record the pages as hashed
-while never publishing them. The scheduling events carry nothing but the
-shape of the next state (chunk size, decode reserve). An intermediate
-prefill chunk produces no token but does write KV, so it reports back with an
-empty `ExtendResult`: the arrival is the point, not the payload. Work this
+The bundle follows one rule: **resources and publication progress land when
+an admission succeeds; a state transition only moves them, never modifies
+them.** The block tables are filled by the coordinator inside `Admit`; the
+cache progress (prefix-hash chain, promotion boundary, pending state
+checkpoints) is advanced by the scheduler on a copy, handed to that same
+admission — which publishes the newly completed pages — and written back to
+the request only after it succeeds. A failed admission therefore leaves both
+untouched, and the retry re-derives the same completed pages and asks for
+their publication again. Committing progress before admission would record
+the pages as hashed while never publishing them. A landed result is the one
+other writer: it appends its accepted endpoint to the pending state
+checkpoints as evidence (§1.2), but advances no hash and consumes nothing.
+The scheduling events carry nothing but the shape of the next state (chunk
+size, decode reserve). An intermediate prefill chunk produces no token but
+does write KV, so it reports back with an empty `ExtendResult`: the arrival
+is the point, not the payload. Work this
 engine does not perform — the peer's decode on a P node, the peer's prefill on
 a D node — is not counted here; those are fenced by the PD transfer ack.
 
@@ -549,8 +563,15 @@ no victim and nothing could free that page.
   sources are granted away in the same round — and only such an op may be
   fenced ahead of the plan's page reuse by the runtime. A new store site
   chooses its guard explicitly (`StartPendingStores` has no default).
-- Only computed tokens are published as a prefix — `retractVictim` reads the
-  window of an incomplete prefill rather than its whole token count.
+- Only computed tokens are published as a prefix, and exactly those.
+  `Request::NumComputedTokens()` is the one frontier for prefix hashing and
+  retention on admission and retraction: the scheduled window end while
+  prefilling (an incomplete prefill's whole token count would publish pages
+  never computed), and every token but the last while decoding — feedback
+  ends with the sampled token the next forward computes. It does not subtract
+  the verify width: a decode result lands its accepted tokens, not a fixed
+  number, so any margin is an estimate that lags the real endpoint and
+  delays publication and reclaim behind it.
 - At most one readmission is in progress per role, by phase construction; a
   readmission that fails admission waits and never triggers retraction (4).
 - A request whose admission prepaid the generation budget open at that

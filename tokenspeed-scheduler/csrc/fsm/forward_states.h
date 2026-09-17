@@ -46,10 +46,30 @@ struct CacheProgress {
     std::uint64_t access_epoch{0};
     // Pending closed-prefix boundary; zero once published or when absent.
     std::int32_t promotion_boundary_tokens{0};
-    // Last aligned state boundary produced by scheduled local prefill. The
-    // ordered forward stream materializes it before subsequent publication.
-    // Decode must not advance this: verify commits only its accepted endpoint.
-    std::int32_t materialized_state_boundary_tokens{0};
+    // Aligned state boundaries written but not yet hashed, in token order:
+    // the checkpoint a scheduled prefill materializes, and every accepted
+    // endpoint landed since the last admission -- more than one when the
+    // overlap schedule lands two results back to back. Crossing a boundary
+    // is not evidence of a written state; only an exact endpoint is.
+    std::vector<std::int32_t> materialized_state_boundaries;
+
+    void RecordMaterializedStateBoundary(std::int32_t boundary, std::int32_t prefix_granularity) {
+        if (boundary <= 0 || boundary % prefix_granularity != 0 ||
+            boundary / prefix_granularity <= static_cast<std::int32_t>(prefix_hashes.size())) {
+            return;
+        }
+        if (materialized_state_boundaries.empty() || materialized_state_boundaries.back() < boundary) {
+            materialized_state_boundaries.push_back(boundary);
+        }
+    }
+
+    // Only after the admission that hashed them succeeded: a failed attempt
+    // retries their publication with the same hashes.
+    void DiscardHashedStateBoundaries(std::int32_t prefix_granularity) {
+        std::erase_if(materialized_state_boundaries, [&](std::int32_t boundary) {
+            return boundary / prefix_granularity <= static_cast<std::int32_t>(prefix_hashes.size());
+        });
+    }
 };
 
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,
@@ -109,7 +129,16 @@ struct ForwardResources {
         FatalCheck(results_in_flight > 0, "a forward result landed for a request with no forward in flight");
         --results_in_flight;
     }
-    void ExtendTokens(const std::vector<std::int32_t>& tokens) { token_container->Extend(tokens); }
+    void ExtendTokens(const std::vector<std::int32_t>& tokens) {
+        token_container->Extend(tokens);
+        // Feedback ends with the sampled token the next forward computes, so
+        // the accepted endpoint is one short of the container. An aligned
+        // endpoint is a written state: record it here, at landing, because
+        // the next admission may see more than one result.
+        if (!tokens.empty()) {
+            cache_progress.RecordMaterializedStateBoundary(token_container->Size() - 1, prefix_granularity);
+        }
+    }
 };
 
 template <typename State>
