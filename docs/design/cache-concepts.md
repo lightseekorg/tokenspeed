@@ -214,16 +214,21 @@ input/output slots; compacting the row or publishing an unwritten intermediate
 checkpoint would break position identity.
 
 Publication requires provenance, not just an allocated block or completed hash.
-The request's cache progress records the last aligned boundary materialized by
-local prefill, carried through the same ordered-forward contract as its token
-progress. Decode does not advance that record: verification commits only the
-accepted endpoint and may skip an aligned boundary. Admission, finish and
-retraction pass this provenance to the coordinator. A snapshot is publishable
-only when the exact accepted endpoint equals the hashed boundary, or that exact
-boundary has prefill materialization provenance. The conservative admission
-frontier (which subtracts the verify width) is not an exact state endpoint.
-Remote endpoint-only landings
-do not claim an internal prefill checkpoint.
+The request's cache progress keeps every aligned boundary whose state is
+written but not yet hashed: the checkpoint a scheduled prefill materializes
+(carried through the same ordered-forward contract as its token progress) and
+each accepted endpoint a landed result stops on. Verification commits only its
+accepted endpoint; a boundary it crosses proves nothing and is never recorded.
+Admission, finish and retraction pass the list to the coordinator, which
+publishes each recorded boundary inside the newly hashed range and no other —
+several in one admission when the overlap schedule lands two results back to
+back — before retention can reclaim the slot. Entries leave the list only after
+the admission that hashed them succeeds, so a failed attempt retries. The
+hashed range comes from `Request::NumComputedTokens()`, which is exact under
+any verify width ([Scheduler §5](scheduler.md#5-invariants-a-change-must-preserve)),
+so an aligned accepted endpoint is hashed by the very next admission rather
+than after a lag of up to the verify width. Remote endpoint-only landings do
+not claim an internal prefill checkpoint, only their endpoint when aligned.
 
 Snapshot selection and slot addressing are distinct even within this mapping:
 the last internal reusable checkpoint is at
@@ -540,6 +545,10 @@ Its responsibilities:
   computed blocks into the prefix indexes for later requests. Prefix-closed
   groups match first; non-closed groups (SWA, Mamba) match only within the
   boundary the closed groups settled (`match_order_` enforces this).
+  For Mamba-state groups, `CacheCompletedBlocks` publishes only explicitly
+  listed materialized boundaries inside the newly hashed range; an empty list
+  publishes no state snapshots (see
+  [Scheduler §1.2](scheduler.md#12-state-checkpoints-one-forward)).
   Replayable groups are outside `match_order_` and skip publication on both
   tiers — never registered, never streamed to Host, never counted by
   `DeviceBoundaryResidency` — because their rows are approximations the

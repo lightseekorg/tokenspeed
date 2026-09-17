@@ -79,7 +79,7 @@ def test_iris_preparation_uses_full_window_for_equal_tp8_groups(monkeypatch):
     group = tuple(range(8))
     mapping = SimpleNamespace(
         attn=SimpleNamespace(tp_size=8, tp_group=group),
-        moe=SimpleNamespace(tp_ep_size=8, tp_ep_group=group),
+        moe=SimpleNamespace(tp_size=8, ep_size=1, tp_ep_size=8, tp_ep_group=group),
     )
     prepare = Mock(return_value=True)
     monkeypatch.setattr(
@@ -101,6 +101,7 @@ def test_iris_preparation_uses_full_window_for_equal_tp8_groups(monkeypatch):
         producer_direct_max_numel=8192 * (7168 + 3584),
         attnres_max_numel=16 * 7168,
         attnres_max_rows=16,
+        enable_lamport=True,
         dtype=torch.bfloat16,
         backend=None,
     )
@@ -137,6 +138,7 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
             producer_direct_max_numel=0,
             attnres_max_numel=0,
             attnres_max_rows=0,
+            enable_lamport=False,
             dtype=torch.bfloat16,
             backend=None,
         ),
@@ -146,6 +148,7 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
             producer_direct_max_numel=48 * (7168 + 3584),
             attnres_max_numel=0,
             attnres_max_rows=0,
+            enable_lamport=False,
             dtype=torch.bfloat16,
             backend=None,
         ),
@@ -182,6 +185,7 @@ def test_iris_preparation_handles_moe_only_group(monkeypatch):
         producer_direct_max_numel=48 * (7168 + 3584),
         attnres_max_numel=0,
         attnres_max_rows=0,
+        enable_lamport=False,
         dtype=torch.bfloat16,
         backend=None,
     )
@@ -216,9 +220,63 @@ def test_iris_preparation_keeps_baseline_window_for_equal_tp4(monkeypatch):
         producer_direct_max_numel=48 * (7168 + 3584),
         attnres_max_numel=0,
         attnres_max_rows=0,
+        enable_lamport=False,
         dtype=torch.bfloat16,
         backend=None,
     )
+
+
+@needs_iris
+@pytest.mark.parametrize(
+    "world,attn_tp,moe_tp,moe_ep,expected",
+    [
+        (8, 8, 8, 1, True),
+        (16, 8, 8, 1, True),
+        (8, 8, 1, 8, False),
+        (8, 8, 4, 2, False),
+        (8, 4, 8, 1, False),
+        (8, 1, 8, 1, False),
+        (16, 8, 8, 2, False),
+        (4, 4, 4, 1, False),
+    ],
+)
+def test_iris_lamport_requires_attention_and_moe_tp8(
+    monkeypatch, world, attn_tp, moe_tp, moe_ep, expected
+):
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models import kimi_k3_comm
+
+    monkeypatch.setattr(
+        kimi_k3_comm, "current_platform", lambda: SimpleNamespace(is_cdna4=True)
+    )
+    for rank in range(world):
+        mapping = Mapping(
+            rank=rank,
+            world_size=world,
+            attn_tp_size=attn_tp,
+            moe_tp_size=moe_tp,
+            moe_ep_size=moe_ep,
+        )
+        prepare = Mock(return_value=True)
+        monkeypatch.setattr(kimi_k3_comm, "prepare_all_reduce_buffers", prepare)
+
+        assert kimi_k3_comm.prepare_k3_all_reduce_buffers(
+            mapping=mapping,
+            hidden_size=7168,
+            routed_hidden_size=3584,
+            max_num_tokens=8,
+        )
+
+        assert prepare.called
+        for request in prepare.call_args_list:
+            assert request.kwargs["enable_lamport"] is expected
+        # Disabling Lamport must preserve the producer-direct pull path.
+        moe_request = next(
+            request
+            for request in prepare.call_args_list
+            if request.args[0] == mapping.moe.tp_ep_group
+        )
+        assert moe_request.kwargs["producer_direct_max_numel"] == 8 * 10752
 
 
 def test_attention_collective_gate():
