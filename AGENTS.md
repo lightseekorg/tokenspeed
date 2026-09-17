@@ -124,3 +124,5 @@ Inside the root `tokenspeed-kernel-amd/` directory:
 * There should be no dependency on `tokenspeed-kernel`.
 * AMD Gluon Kernel tests should live in `tokenspeed-kernel/test/amd/` to reuse
   common platform utilities and reference computations.
+* For per kernel contract and algorithm details, put in
+  `python/tokenspeed_kernel_amd/ops/README.md`.
