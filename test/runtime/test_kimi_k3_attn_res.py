@@ -558,7 +558,8 @@ class AttnResTests(unittest.TestCase):
             def scope(self, *, enable):
                 self.assert_enabled = enable
                 yield self
-                events.append("join")
+                # An enabled StreamFork joins before leaving the scope.
+                events.append("scope_exit")
 
             @contextmanager
             def branch(self):
@@ -603,26 +604,46 @@ class AttnResTests(unittest.TestCase):
             mlp=mock.Mock(return_value=torch.zeros_like(prefix)),
         )
 
-        with (
-            mock.patch.object(kimi_k3, "get_is_capture_mode", return_value=True),
-            mock.patch.object(kimi_k3, "_sliced_scratch", return_value=object()),
-            mock.patch.object(
-                kimi_k3,
-                "attnres_partial",
-                side_effect=lambda *_args: events.append("partial"),
-            ),
+        # Exercise NVIDIA (0) and AMD (16) thresholds on either host. Scratch
+        # consumers must follow scope exit even when the producer overlaps.
+        for fork_threshold, is_capture, fork_enabled in (
+            (0, False, False),
+            (0, True, True),
+            (16, False, False),
+            (16, True, False),
         ):
-            kimi_k3.KimiLinearDecoderLayer.forward(
-                layer,
-                object(),
-                object(),
-                object(),
-                [object()],
-            )
+            with self.subTest(fork_threshold=fork_threshold, is_capture=is_capture):
+                events.clear()
+                reduce.reset_mock()
+                with (
+                    mock.patch.object(
+                        kimi_k3, "ATTNRES_STREAM_FORK_THRESHOLD", fork_threshold
+                    ),
+                    mock.patch.object(
+                        kimi_k3, "get_is_capture_mode", return_value=is_capture
+                    ),
+                    mock.patch.object(
+                        kimi_k3, "_sliced_scratch", return_value=object()
+                    ),
+                    mock.patch.object(
+                        kimi_k3,
+                        "attnres_partial",
+                        side_effect=lambda *_args: events.append("partial"),
+                    ),
+                ):
+                    kimi_k3.KimiLinearDecoderLayer.forward(
+                        layer,
+                        object(),
+                        object(),
+                        object(),
+                        [object()],
+                    )
 
-        self.assertFalse(fork.assert_enabled)
-        self.assertEqual(events, ["partial", "attention", "join", "reduce"])
-        reduce.assert_called_once()
+                self.assertEqual(fork.assert_enabled, fork_enabled)
+                self.assertEqual(
+                    events, ["partial", "attention", "scope_exit", "reduce"]
+                )
+                reduce.assert_called_once()
 
     def test_fused_to_fallback_populates_next_split_partial(self):
         hidden_states = SimpleNamespace(shape=(4, _HIDDEN), is_cuda=True)
