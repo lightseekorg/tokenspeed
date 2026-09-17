@@ -265,9 +265,9 @@ class Nvfp4SwigluQuantWarmupConfig:
         for index, case in enumerate(self.cases):
             kernel = _select_nvfp4_swiglu_quant(
                 a_dtype=torch.uint8,
-                a_scale_dtype=torch.float8_e4m3fn,
+                a_scale_dtype=torch.uint8,
                 b_dtype=torch.uint8,
-                b_scale_dtype=torch.float8_e4m3fn,
+                b_scale_dtype=torch.uint8,
                 sf_vec_size=case.sf_vec_size,
                 solution=solution,
             )
@@ -307,7 +307,7 @@ class Nvfp4SwigluQuantWarmupConfig:
                 dtype=torch.uint8,
                 device=device,
                 generator=generator,
-            ).view(torch.float8_e4m3fn)
+            )
             b = torch.randint(
                 0,
                 256,
@@ -326,7 +326,7 @@ class Nvfp4SwigluQuantWarmupConfig:
                 dtype=torch.uint8,
                 device=device,
                 generator=generator,
-            ).view(torch.float8_e4m3fn)
+            )
             invocations.append(
                 _Nvfp4SwigluQuantInvocation(
                     a=a,

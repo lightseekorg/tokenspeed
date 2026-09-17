@@ -587,6 +587,31 @@ def test_skipping_top_level_install_keeps_eval_install():
     assert [name for name, _ in stages] == ["server", "eval.install", "eval"]
 
 
+def test_server_warmup_precedes_server_and_injects_bundle():
+    task = {
+        "type": "eval",
+        "server": {
+            "warmup_config": "nvidia/flashinfer/model/profile",
+            "command": "ts serve --model example/model",
+            "ready": {"url": "http://127.0.0.1:8000/readiness"},
+        },
+        "eval": {"command": "run eval"},
+    }
+
+    stages = get_stage_commands(task)
+
+    assert [name for name, _ in stages] == ["server.warmup", "server", "eval"]
+    assert stages[0][1] == [
+        "rm -rf .ci-artifacts/kernel-warmup && "
+        "python3 -m tokenspeed_kernel.warmup "
+        "--config nvidia/flashinfer/model/profile "
+        "--output-dir .ci-artifacts/kernel-warmup --device 0"
+    ]
+    assert stages[1][1]["command"].endswith(
+        "--kernel-warmup-bundle .ci-artifacts/kernel-warmup"
+    )
+
+
 def test_slurm_execution_only_cleans_its_process_group(monkeypatch, tmp_path):
     task = {
         "name": "slurm-unit-test",

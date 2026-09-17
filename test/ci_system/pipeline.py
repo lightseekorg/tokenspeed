@@ -264,6 +264,23 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
             raise ValueError(
                 f"{path}: retries is only supported for eval and perf tasks"
             )
+    server = data.get("server", {})
+    if server and not isinstance(server, dict):
+        raise ValueError(f"{path}: server must be a mapping")
+    warmup_config = server.get("warmup_config") if server else None
+    if warmup_config is not None:
+        if not isinstance(warmup_config, str) or not warmup_config.strip():
+            raise ValueError(f"{path}: server.warmup_config must be a non-empty string")
+        if data["type"] not in {"eval", "perf"} or not server.get("command"):
+            raise ValueError(
+                f"{path}: server.warmup_config requires an eval/perf server command"
+            )
+        if "--kernel-warmup-bundle" in str(server["command"]):
+            raise ValueError(
+                f"{path}: server.command must not set --kernel-warmup-bundle "
+                "when server.warmup_config is configured"
+            )
+
     if "slurm" in data:
         slurm = data["slurm"]
         if not isinstance(slurm, dict):
@@ -279,6 +296,10 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{path}: slurm.{key} must be a positive integer")
         if slurm["nodes"] > 1:
+            if warmup_config is not None:
+                raise ValueError(
+                    f"{path}: server.warmup_config does not yet support multi-node Slurm"
+                )
             if data["type"] not in {"eval", "perf"}:
                 raise ValueError(
                     f"{path}: multi-node Slurm tasks must have type 'eval' or 'perf'"
@@ -311,6 +332,15 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
 def normalize_task(path: Path, repo_root: Path) -> Dict[str, Any]:
     data = load_yaml(path)
     validate_task(data, path)
+    warmup_config = (data.get("server") or {}).get("warmup_config")
+    if warmup_config is not None:
+        warmup_path = (
+            repo_root
+            / "tokenspeed-kernel/python/tokenspeed_kernel/warmup/config"
+            / f"{warmup_config}.json"
+        )
+        if not warmup_path.is_file():
+            raise ValueError(f"{path}: unknown server.warmup_config {warmup_config!r}")
     data["_source_path"] = path.relative_to(repo_root).as_posix()
     return data
 
@@ -1704,7 +1734,21 @@ def get_stage_commands(task: Dict[str, Any]) -> List[tuple[str, Any]]:
         return stages
 
     if task_type in {"eval", "perf"}:
-        server = task.get("server", {})
+        server = dict(task.get("server", {}))
+        warmup_config = server.pop("warmup_config", None)
+        if warmup_config is not None:
+            bundle_dir = ".ci-artifacts/kernel-warmup"
+            warmup_command = (
+                f"rm -rf {shlex.quote(bundle_dir)} && "
+                "python3 -m tokenspeed_kernel.warmup "
+                f"--config {shlex.quote(warmup_config)} "
+                f"--output-dir {shlex.quote(bundle_dir)} --device 0"
+            )
+            stages.append(("server.warmup", [warmup_command]))
+            server["command"] = (
+                f"{server['command']} "
+                f"--kernel-warmup-bundle {shlex.quote(bundle_dir)}"
+            )
         if server.get("command"):
             stages.append(("server", server))
         section = task.get(task_type, {})
@@ -1818,7 +1862,11 @@ def execute_task(
         task_stages = [
             (name, payload)
             for name, payload in task_stages
-            if name in {"install", "server"}
+            if name in {"install", "server.warmup", "server"}
+        ]
+    elif external_server:
+        task_stages = [
+            (name, payload) for name, payload in task_stages if name != "server.warmup"
         ]
     stages = filter_stage_commands(
         task_stages,

@@ -170,6 +170,10 @@ def test_sdist_includes_requirements_and_python_sources(tmp_path, monkeypatch) -
         path.relative_to(source).as_posix()
         for path in (source / "tokenspeed_kernel").rglob("*.py")
     )
+    expected_files.update(
+        path.relative_to(source).as_posix()
+        for path in (source / "tokenspeed_kernel" / "warmup" / "config").rglob("*.json")
+    )
     assert expected_files <= archived_files
 
 

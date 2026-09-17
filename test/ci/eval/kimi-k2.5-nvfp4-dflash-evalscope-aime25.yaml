@@ -13,6 +13,7 @@ env:
 install:
   - bash test/ci_system/install_deps.sh
 server:
+  warmup_config: nvidia/flashinfer/kimi-k2.5/nvfp4-tp4-ep1-t8192
   # Temporary NFS cold-load headroom; revert after the startup bottleneck is fixed.
   command: >-
     ts serve

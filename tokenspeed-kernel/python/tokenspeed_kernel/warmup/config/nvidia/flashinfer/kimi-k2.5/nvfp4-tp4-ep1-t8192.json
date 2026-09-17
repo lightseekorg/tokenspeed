@@ -1,0 +1,179 @@
+{
+  "schema_version": 1,
+  "id": "nvidia/flashinfer/kimi-k2.5/nvfp4-tp4-ep1-t8192",
+  "provider": "flashinfer",
+  "platform": {
+    "vendor": "nvidia",
+    "minimum_compute_capability": 100,
+    "maximum_compute_capability": 103
+  },
+  "provenance": {
+    "model": "nvidia/Kimi-K2.5-NVFP4",
+    "model_revision": null,
+    "quantization": "nvfp4"
+  },
+  "targets": [
+    {
+      "api": "moe.apply",
+      "solution": "flashinfer_trtllm",
+      "definition": {
+        "version": 1,
+        "tuning": {
+          "strategy": "flashinfer_native",
+          "random_seed": 1
+        },
+        "cases": [
+          {
+            "expected_registration": "flashinfer_trtllm_nvfp4_moe_apply",
+            "shape": {
+              "hidden_size": 7168,
+              "global_num_experts": 384,
+              "local_num_experts": 384,
+              "top_k": 8,
+              "global_intermediate_size": 2048,
+              "intermediate_size_per_partition": 512
+            },
+            "placement": {
+              "moe_tp_size": 4,
+              "moe_tp_rank": 0,
+              "moe_ep_size": 1,
+              "moe_ep_rank": 0,
+              "local_expert_offset": 0
+            },
+            "token_domain": {
+              "policy": "flashinfer_hybrid",
+              "maximum": 8192,
+              "round_up": false
+            },
+            "weights": {
+              "kind": "nvfp4",
+              "scale_format": "ue4m3",
+              "block_size": 16,
+              "layout": "backend_required",
+              "shuffle": true
+            },
+            "input_dtype": "bfloat16",
+            "output_dtype": "bfloat16",
+            "activation": {
+              "kind": "silu",
+              "alpha": null,
+              "beta": null,
+              "clamp": null
+            },
+            "routing": {
+              "kind": "kernel_routing",
+              "with_bias": true,
+              "method": "deepseek_v3",
+              "n_group": 1,
+              "topk_group": 1,
+              "routed_scaling_factor": 2.827,
+              "renormalize": true,
+              "generator": "balanced_distinct_topk.v1"
+            },
+            "finalization": {
+              "kind": "finalized"
+            },
+            "enable_pdl": true,
+            "per_token_scale": false,
+            "gemm1_lora_delta": false,
+            "fused_shared_experts": 0
+          },
+          {
+            "expected_registration": "flashinfer_trtllm_nvfp4_moe_apply",
+            "shape": {
+              "hidden_size": 7168,
+              "global_num_experts": 384,
+              "local_num_experts": 384,
+              "top_k": 8,
+              "global_intermediate_size": 2048,
+              "intermediate_size_per_partition": 512
+            },
+            "placement": {
+              "moe_tp_size": 4,
+              "moe_tp_rank": 0,
+              "moe_ep_size": 1,
+              "moe_ep_rank": 0,
+              "local_expert_offset": 0
+            },
+            "token_domain": {
+              "policy": "flashinfer_hybrid",
+              "maximum": 8192,
+              "round_up": false
+            },
+            "weights": {
+              "kind": "nvfp4",
+              "scale_format": "ue4m3",
+              "block_size": 16,
+              "layout": "backend_required",
+              "shuffle": true
+            },
+            "input_dtype": "bfloat16",
+            "output_dtype": "bfloat16",
+            "activation": {
+              "kind": "silu",
+              "alpha": null,
+              "beta": null,
+              "clamp": null
+            },
+            "routing": {
+              "kind": "kernel_routing",
+              "with_bias": true,
+              "method": "deepseek_v3",
+              "n_group": 1,
+              "topk_group": 1,
+              "routed_scaling_factor": 2.827,
+              "renormalize": true,
+              "generator": "balanced_distinct_topk.v1"
+            },
+            "finalization": {
+              "kind": "deferred"
+            },
+            "enable_pdl": true,
+            "per_token_scale": false,
+            "gemm1_lora_delta": false,
+            "fused_shared_experts": 0
+          }
+        ]
+      }
+    },
+    {
+      "api": "gemm.nvfp4_swiglu_quant",
+      "solution": "cute_dsl",
+      "definition": {
+        "version": 1,
+        "cases": [
+          {
+            "expected_registration": "cute_dsl_nvfp4_swiglu_quant",
+            "maximum_num_tokens": 8192,
+            "n": 9216,
+            "k": 7168,
+            "ab_dtype": "float4_e2m1fn",
+            "sf_dtype": "float8_e4m3fn",
+            "c_dtype": "float4_e2m1fn",
+            "sf_vec_size": 16,
+            "use_prefetch": false,
+            "prefetch_dist": 3,
+            "vectorized_f32": true,
+            "enable_pdl": true,
+            "random_seed": 2
+          },
+          {
+            "expected_registration": "cute_dsl_nvfp4_swiglu_quant",
+            "maximum_num_tokens": 8192,
+            "n": 1024,
+            "k": 7168,
+            "ab_dtype": "float4_e2m1fn",
+            "sf_dtype": "float8_e4m3fn",
+            "c_dtype": "float4_e2m1fn",
+            "sf_vec_size": 16,
+            "use_prefetch": false,
+            "prefetch_dist": 3,
+            "vectorized_f32": true,
+            "enable_pdl": true,
+            "random_seed": 3
+          }
+        ]
+      }
+    }
+  ]
+}
