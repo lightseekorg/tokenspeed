@@ -81,19 +81,19 @@ TEST(ChunkKeepingFinalWindowTest, NeverLeavesAShortFinalChunk) {
     EXPECT_EQ(ChunkKeepingFinalWindow(64, 70, 0), 64);
 }
 
-// full (closed, g=4) + swa (retention 12, replay 8) + tail (retention 4,
-// replay 2): the coordinator's replay window is the largest declared, 8.
+// full (closed, g=4) + replayable swa (window 8) + replayable tail (window 2):
+// the coordinator's replay window is the largest replayable window, 8.
 std::vector<CacheGroupSpec> ReplayableSpecs() {
     return {CacheGroupSpec{
                 .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
             CacheGroupSpec{.kind = AttnKind::kSlidingWindow,
-                           .sliding_window = 12,
-                           .replay_window = 8,
+                           .sliding_window = 8,
+                           .replayable = true,
                            .cache_blocks_per_lcm_block = 1,
                            .block_granularity = 4},
             CacheGroupSpec{.kind = AttnKind::kSlidingWindow,
-                           .sliding_window = 4,
-                           .replay_window = 2,
+                           .sliding_window = 2,
+                           .replayable = true,
                            .cache_blocks_per_lcm_block = 1,
                            .block_granularity = 2}};
 }

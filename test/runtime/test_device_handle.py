@@ -119,6 +119,9 @@ class _DecodeExecutor(DisaggDecodeExecutor):
     def generate_events(self):
         return self._events
 
+    def pop_remote_cached_tokens(self, request_id):
+        return 0
+
     def pop_remote_cache_slot(self, req_id):
         return self._slot
 
@@ -173,7 +176,9 @@ def _planned(*, num_extends, label=None):
 def _loop(trace, kv_transfer, state):
     output_processor = SimpleNamespace(
         rid_to_state={"r0": state} if state is not None else {},
-        on_remote_prefill_done=lambda rid, tok: trace.append(("bootstrap", tok)),
+        on_remote_prefill_done=lambda rid, tok, cached_tokens: trace.append(
+            ("bootstrap", tok)
+        ),
         finish_remote_prefill_only_request=lambda rid: [],
     )
     return SimpleNamespace(
@@ -194,7 +199,7 @@ def _decoding_state():
 def test_remote_prefill_completion_lands_both_writes_on_the_device():
     trace: list = []
     event = PD.RemotePrefillDoneEvent("r0", 42)
-    kv_transfer = _DecodeExecutor([event], slot=7, candidates=(3, [11, 12]))
+    kv_transfer = _DecodeExecutor([event], slot=7, candidates=(7, [11, 12]))
     state = _decoding_state()
 
     hooks = PdTransferHooks(_loop(trace, kv_transfer, state), _handle(trace))
@@ -205,7 +210,7 @@ def test_remote_prefill_completion_lands_both_writes_on_the_device():
     assert trace == [
         ("bootstrap", 42),
         "run",
-        ("candidates", 3, [11, 12]),
+        ("candidates", 7, [11, 12]),
         ("ready", 7),
     ]
 
@@ -225,13 +230,13 @@ def test_completion_without_device_work_submits_nothing():
 def test_an_aborted_request_still_lands_its_candidates_but_is_not_armed():
     trace: list = []
     event = PD.RemotePrefillDoneEvent("r0", 42)
-    kv_transfer = _DecodeExecutor([event], slot=7, candidates=(3, [11, 12]))
+    kv_transfer = _DecodeExecutor([event], slot=7, candidates=(7, [11, 12]))
     aborted = SimpleNamespace(to_abort=True, finished=False)
 
     hooks = PdTransferHooks(_loop(trace, kv_transfer, aborted), _handle(trace))
     hooks.poll_transfer_events()
 
-    assert trace == ["run", ("candidates", 3, [11, 12])]
+    assert trace == ["run", ("candidates", 7, [11, 12])]
 
 
 # ----------------------------------------------------------------------
@@ -768,3 +773,28 @@ def test_collaborators_hold_the_handle_instead_of_walking_to_it():
         source = inspect.getsource(module)
         assert "loop.device" not in source
         assert "loop._device" not in source
+
+
+def test_prefill_usage_hook_records_committed_totals_and_skips_retired_requests():
+    from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
+
+    recorded = []
+    transfer = object.__new__(DisaggPrefillExecutor)
+    transfer.senders = {"hit": SimpleNamespace(bootstrap_room=9)}
+    transfer.kv_manager = SimpleNamespace(
+        record_cached_tokens=lambda room, count: recorded.append((room, count))
+    )
+    loop = SimpleNamespace(
+        kv_transfer=transfer,
+        output_processor=SimpleNamespace(
+            rid_to_state={"hit": SimpleNamespace(cached_tokens=1280)}
+        ),
+    )
+    hooks = PdTransferHooks(loop, None)
+    hooks.record_prefill_usage(["hit", "retired"])
+    loop.output_processor.rid_to_state["hit"].cached_tokens = 1536
+    hooks.record_prefill_usage(["hit"])
+    assert recorded == [(9, 1280), (9, 1536)]
+    loop.kv_transfer = None
+    hooks.record_prefill_usage(["hit"])
+    assert recorded == [(9, 1280), (9, 1536)]

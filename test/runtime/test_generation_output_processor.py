@@ -683,7 +683,7 @@ def test_pd_one_token_request_finishes_at_remote_prefill_done():
     state.sampling_params.max_new_tokens = 1
     processor.rid_to_state["decode"] = state
 
-    processor.on_remote_prefill_done("decode", 101)
+    processor.on_remote_prefill_done("decode", 101, 2)
     events = processor.finish_remote_prefill_only_request("decode")
 
     assert state.output_ids == [101]
@@ -696,6 +696,7 @@ def test_pd_one_token_request_finishes_at_remote_prefill_done():
     assert output.rids == ["decode"]
     assert output.output_ids == [[101]]
     assert output.completion_tokens == [1]
+    assert output.cached_tokens == [2]
     assert output.finished_reasons[0] == {"type": "length", "length": 1}
 
 
@@ -721,7 +722,7 @@ def test_pd_decode_matcher_accepts_the_prefill_nodes_token():
     state.grammar = _Matcher()
     processor.rid_to_state["decode"] = state
 
-    processor.on_remote_prefill_done("decode", 101)
+    processor.on_remote_prefill_done("decode", 101, 2)
 
     assert state.output_ids == [101]
     assert state.grammar.accepted == [101]
@@ -735,7 +736,7 @@ def test_pd_decode_drops_the_grammar_when_the_bootstrap_token_is_lost():
     state.grammar = _Matcher()
     processor.rid_to_state["decode"] = state
 
-    processor.on_remote_prefill_done("decode", -1)
+    processor.on_remote_prefill_done("decode", -1, 2)
 
     assert state.output_ids == []
     assert state.grammar is None
@@ -748,7 +749,7 @@ def test_pd_multi_token_request_continues_after_remote_prefill_done():
     state.sampling_params.max_new_tokens = 2
     processor.rid_to_state["decode"] = state
 
-    processor.on_remote_prefill_done("decode", 101)
+    processor.on_remote_prefill_done("decode", 101, 2)
     events = processor.finish_remote_prefill_only_request("decode")
 
     assert state.output_ids == [101]
@@ -791,3 +792,32 @@ def test_spec_decode_metrics_count_mixed_rounds_and_proposed_drafts():
         forward_op=_ForwardOp(), model_execution_results=_SpecResult()
     )
     assert metrics.steps == [(1, 2, 3)]
+
+
+@pytest.mark.parametrize(
+    "local_hits,remote_hits,expected",
+    [(0, 1280, 1280), (256, 1280, 1280), (1280, 256, 1280)],
+)
+def test_remote_prefill_usage_merges_overlapping_prefixes(
+    local_hits, remote_hits, expected
+):
+    processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
+    state = _state(list(range(2048)), computed_length=2048)
+    state.cached_tokens = local_hits
+    processor.rid_to_state["decode"] = state
+    processor.on_remote_prefill_done("decode", 101, remote_hits)
+    assert state.cached_tokens == expected
+
+
+def test_non_pd_cached_tokens_reach_output():
+    from tokenspeed.runtime.engine.request_types import FINISH_LENGTH
+
+    sender = _Sender()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
+    state = _state(list(range(2048)))
+    processor.rid_to_state["local"] = state
+    processor.add_cached_tokens(["local"], [1024], [256])
+    state.output_ids = [101]
+    state.finished_reason = FINISH_LENGTH(length=1)
+    processor.stream_output(["local"], [state])
+    assert sender.items[0].cached_tokens == [1280]

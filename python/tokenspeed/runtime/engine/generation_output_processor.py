@@ -912,7 +912,9 @@ class OutputProcesser:
         self.stream_output(stream_out_rids, stream_out_states)
         return request_changes
 
-    def on_remote_prefill_done(self, req_id: str, bootstrap_token: int) -> None:
+    def on_remote_prefill_done(
+        self, req_id: str, bootstrap_token: int, cached_tokens: int
+    ) -> None:
         """Record the bootstrap token on a decode-node request (RemotePrefillDoneEvent).
 
         The bootstrap_token is the first real output token produced by the prefill node.
@@ -932,6 +934,8 @@ class OutputProcesser:
         if req_id not in self.rid_to_state:
             return
         state = self.rid_to_state[req_id]
+        # P and D reuse overlapping leading prefixes; never sum their hits.
+        state.cached_tokens = max(state.cached_tokens, cached_tokens)
         if bootstrap_token == -1:
             logger.warning(
                 "[on_remote_prefill_done] rid=%s received bootstrap_token=-1, skipping append to output_ids",

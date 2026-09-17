@@ -789,6 +789,8 @@ class EventLoop:
             is_prefill_instance=is_prefill_instance,
         )
 
+        self._pd_hooks.record_prefill_usage(forward_op.request_ids)
+
         # Fold committed tokens into the decode throughput window (host-side
         # reads of the already-synced result; no GPU sync).
         if forward_op.num_extends() <= 0:

@@ -47,14 +47,6 @@ void validateGroup(const SchedulerConfig& config, const CacheGroupConfig& group)
     if (group.transfer_policy != expected) {
         throw std::invalid_argument(where + "transfer_policy does not match its scheduler destination layout");
     }
-    // The transfer ships a sliding group's whole retained tail, so every page
-    // of it must exist on the prefill role: a replayable group there
-    // regenerates its full retention window, not just the attention window.
-    if (group.replay_window_tokens && *group.replay_window_tokens != *group.sliding_window_tokens) {
-        throw std::invalid_argument(where +
-                                    "PD cache requires replay_window_tokens == sliding_window_tokens: the "
-                                    "transferred tail must be fully regenerated");
-    }
 }
 
 }  // namespace
@@ -87,7 +79,7 @@ void SchedulerConfig::Validate() const {
     if (enable_l3_storage) {
         throw std::invalid_argument("Scheduler: L3 storage is not supported by the cache coordinator");
     }
-    std::int32_t max_replay_window_tokens = 0;
+    std::int32_t replay_window_tokens = 0;
     for (const CacheGroupConfig& group : cache_groups) {
         validateGroup(*this, group);
         // A recurrent state advances one whole checkpoint at a time, so a chunk
@@ -95,16 +87,18 @@ void SchedulerConfig::Validate() const {
         if (group.IsSnapshotStateGroup() && max_scheduled_tokens < prefix_granularity) {
             throw std::invalid_argument("Scheduler: Mamba max_scheduled_tokens must cover one cache block");
         }
-        max_replay_window_tokens = std::max(max_replay_window_tokens, group.replay_window_tokens.value_or(0));
+        if (group.replayable) {
+            replay_window_tokens = std::max(replay_window_tokens, *group.sliding_window_tokens);
+        }
     }
-    if (max_replay_window_tokens > 0) {
+    if (replay_window_tokens > 0) {
         // A prefix hit re-feeds up to one replay window and must still advance:
         // by every new token when fewer than a window remain, or by one prefix
         // page when a promotion boundary aligns the chunk.
-        if (max_scheduled_tokens < max_replay_window_tokens + std::max(max_replay_window_tokens, prefix_granularity)) {
+        if (max_scheduled_tokens < replay_window_tokens + std::max(replay_window_tokens, prefix_granularity)) {
             throw std::invalid_argument(
-                "Scheduler: max_scheduled_tokens must cover the largest replay_window_tokens plus max(replay "
-                "window, prefix_granularity)");
+                "Scheduler: max_scheduled_tokens must cover the replayable groups' largest sliding_window_tokens "
+                "plus max(that window, prefix_granularity)");
         }
         // The final-chunk window rule and the state-checkpoint chunk alignment
         // would each reshape the other's chunk; no model needs both.
