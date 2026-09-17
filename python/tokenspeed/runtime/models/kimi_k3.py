@@ -227,6 +227,7 @@ class KimiLinearMLP(nn.Module):
     place because Kimi-K3 runs the AttnRes residual path outside
     ``CommManager`` (see decision D4). EP Kimi can defer the shared-expert
     reduction so one Iris launch reduces it together with the routed latent.
+    Unsharded callers use tp_size=1 and tp_group=None.
     """
 
     def __init__(
@@ -235,7 +236,7 @@ class KimiLinearMLP(nn.Module):
         intermediate_size: int,
         tp_rank: int,
         tp_size: int,
-        tp_group: tuple[int, ...],
+        tp_group: tuple[int, ...] | None,
         quant_config: QuantizationConfig | None,
         prefix: str,
         reduce_results: bool,
@@ -1630,9 +1631,7 @@ class KimiLinearMoE(nn.Module):
             intermediate_size=config.moe_intermediate_size * config.num_shared_experts,
             tp_rank=0 if mapping.attn.dp_size > 1 else mapping.moe.tp_ep_rank,
             tp_size=1 if mapping.attn.dp_size > 1 else mapping.moe.tp_ep_size,
-            tp_group=(
-                (mapping.rank,) if mapping.attn.dp_size > 1 else mapping.moe.tp_ep_group
-            ),
+            tp_group=None if mapping.attn.dp_size > 1 else mapping.moe.tp_ep_group,
             quant_config=quant_config,
             prefix=add_prefix("shared_experts", prefix),
             # TP combines shared partials in the tail; DP keeps complete local outputs.
