@@ -29,11 +29,17 @@ while the GPU computations exercise convolution and recurrent state.
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass
-from test.ci_system.ci_register import register_cuda_ci
 
+# The CI runner executes each registered test file as a standalone script.
+_TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _TEST_DIR)
+sys.path.insert(0, os.path.dirname(_TEST_DIR))
 import pytest
 import torch
+from ci_system.ci_register import register_cuda_ci
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 
@@ -226,6 +232,12 @@ class _ScheduledKDA:
                 extend_seq_lens_cpu=lengths_cpu,
                 extend_prefix_lens=prefixes_cpu.to("cuda"),
                 extend_prefix_lens_cpu=prefixes_cpu,
+                extend_replay_lens_cpu=torch.as_tensor(
+                    batch.extend_replay_lens, dtype=torch.int32
+                ),
+                extend_prompt_lens_cpu=torch.as_tensor(
+                    batch.prefill_lengths, dtype=torch.int32
+                ),
                 extend_with_prefix=begin > 0,
             )
         else:
@@ -410,3 +422,7 @@ def test_scheduler_recycles_unpublished_state_without_changing_kda_or_resume():
             assert (
                 torch.count_nonzero(active.pool.get_component(layer, component)[0]) == 0
             )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

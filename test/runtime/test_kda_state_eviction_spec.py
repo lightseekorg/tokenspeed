@@ -27,7 +27,13 @@ without verification, snapshots, publication or cache eviction.
 
 from __future__ import annotations
 
-from test.ci_system.ci_register import register_cuda_ci
+import os
+import sys
+
+# The CI runner executes each registered test file as a standalone script.
+_TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _TEST_DIR)
+sys.path.insert(0, os.path.dirname(_TEST_DIR))
 from test.runtime.conftest import KIMI_STATE_GROUPS, requires_cuda
 from test.runtime.test_kimi_k3_kda import (
     _assert_close,
@@ -40,6 +46,7 @@ from test.runtime.test_kimi_k3_kda import (
 
 import pytest
 import torch
+from ci_system.ci_register import register_cuda_ci
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 
@@ -104,7 +111,14 @@ class _KDA:
         }
 
     def metadata(
-        self, tables, *, begin: int, end: int, prefill: bool, request_slot: int
+        self,
+        tables,
+        *,
+        begin: int,
+        end: int,
+        prefill: bool,
+        request_slot: int,
+        prompt_tokens: int,
     ):
         # Use the same contract-to-runtime table bridge as the numerical KDA
         # harness, with the complete unmodified scheduler tables supplied here.
@@ -125,6 +139,8 @@ class _KDA:
                 extend_seq_lens_cpu=lengths,
                 extend_prefix_lens=prefixes.to("cuda"),
                 extend_prefix_lens_cpu=prefixes,
+                extend_replay_lens_cpu=torch.zeros_like(prefixes),
+                extend_prompt_lens_cpu=torch.tensor([prompt_tokens], dtype=torch.int32),
                 extend_with_prefix=begin > 0,
             )
         else:
@@ -169,7 +185,12 @@ class _KDA:
             )
             if prefill:
                 output = self.backend.forward_extend(
-                    None, None, None, forward_mode=ForwardMode.EXTEND, **kwargs
+                    None,
+                    None,
+                    None,
+                    forward_mode=ForwardMode.EXTEND,
+                    save_kv_cache=True,
+                    **kwargs,
                 )
             else:
                 output = self.backend.forward_decode(None, None, None, **kwargs)
@@ -267,6 +288,7 @@ def test_speculative_decode_recycles_working_state_and_preserves_prefill_checkpo
             end=position + 1,
             prefill=False,
             request_slot=0,
+            prompt_tokens=0,
         )
         outputs = reference.forward(
             inputs, begin=position, end=position + 1, prefill=False
@@ -288,7 +310,12 @@ def test_speculative_decode_recycles_working_state_and_preserves_prefill_checkpo
     batch, tables = _batch(scheduler, "source")
     assert list(batch.input_lengths) == [4]
     actual.metadata(
-        tables, begin=0, end=4, prefill=True, request_slot=batch.request_pool_indices[0]
+        tables,
+        begin=0,
+        end=4,
+        prefill=True,
+        request_slot=batch.request_pool_indices[0],
+        prompt_tokens=batch.prefill_lengths[0],
     )
     outputs = actual.forward(inputs, begin=0, end=4, prefill=True)
     for layer in _LAYERS:
@@ -320,6 +347,7 @@ def test_speculative_decode_recycles_working_state_and_preserves_prefill_checkpo
             end=computed + _WIDTH,
             prefill=False,
             request_slot=batch.request_pool_indices[0],
+            prompt_tokens=0,
         )
         outputs = actual.forward(
             inputs, begin=computed, end=computed + _WIDTH, prefill=False
@@ -379,6 +407,7 @@ def test_speculative_decode_recycles_working_state_and_preserves_prefill_checkpo
             end=end,
             prefill=True,
             request_slot=batch.request_pool_indices[0],
+            prompt_tokens=batch.prefill_lengths[0],
         )
         outputs = actual.forward(inputs, begin=begin, end=end, prefill=True)
         for layer in _LAYERS:
@@ -406,3 +435,7 @@ def test_speculative_decode_recycles_working_state_and_preserves_prefill_checkpo
             assert (
                 torch.count_nonzero(actual.pool.get_component(layer, component)[0]) == 0
             )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
