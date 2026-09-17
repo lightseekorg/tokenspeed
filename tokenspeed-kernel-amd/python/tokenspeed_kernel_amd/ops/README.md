@@ -110,14 +110,14 @@ and batch size to limit shared-memory usage.
 
 ### MXFP8 SiTU Experts
 
-This gfx950 pipeline uses MXFP8 activations and MXFP4 weights through the
-existing MoE API. It is selected for EP8 SiTU experts with a 3072-wide
-intermediate and supported clamp settings. The `input` activation policy keeps
+On gfx950, the MoE API selects Gluon kernels with MXFP8 activations and MXFP4
+weights for EP8 SiTU experts with a 3072-wide intermediate and supported clamp
+settings. The `input` activation policy selects
 BF16-activation decode for eligible batches of up to four tokens; explicit
-`fp8` uses MXFP8 throughout. Other configurations retain their existing paths.
+`fp8` uses MXFP8 throughout.
 
 Weight preparation interleaves gate/up weights and arranges weights and scales
-for tiled loads. MXFP8 and BF16-activation kernels share this single prepared
+for tiled loads. MXFP8 and BF16-activation kernels share one prepared
 weight bank.
 
 #### Algorithm
@@ -131,15 +131,15 @@ Starting from BF16 activations and precomputed top-k expert IDs and weights:
    order.
 3. **Gate/up GEMM + SiTU** uses scaled matrix instructions and FP32
    accumulation, fusing the activation into a BF16 token-slot intermediate.
-4. **Quantize intermediates** to MXFP8, again keeping values in token-slot
+4. **Quantize intermediates** to MXFP8, keeping values in token-slot
    order and scales in sorted-route order.
 5. **Down GEMM + weighted combine** accumulates in FP32, applies route
    weights, and atomically adds BF16 results into each token's output row.
 
 Batches of up to 1024 tokens use 32-row expert tiles to reduce padding;
 larger batches use 128-row tiles. With 32-row tiles, quantization and sorted-scale
-production share a launch. Small route sets also use a two-launch sorter rather
-than the four-phase sorter. Blocks beyond the valid routed prefix skip work.
+production share a launch. Small route sets use a two-launch sorter; larger
+route sets use four phases. Blocks beyond the valid routed prefix skip work.
 
 Both GEMMs overlap loads with matrix computation using double-buffered shared
 memory. Phased operand loading and scheduling barriers limit live registers;
