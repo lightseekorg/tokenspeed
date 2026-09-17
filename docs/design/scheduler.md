@@ -247,13 +247,40 @@ regeneration anywhere.
 ### 1.4 What bounds a single request
 
 `MaxSingleRequestTokens` is a **startup** bound computed by binary search over
-`singleRequestLcmBlocksRequired`: the largest prompt whose worst-case working
-set — aligned checkpoint + final continuation state, decode reserve,
-overlap-depth protection, the state growth block, and for chunked sparse local
-recovery the retained input checkpoint (and, with the prefix cache on, a first
-chunk's cached one) — fits the pool. It is not a live
-check against currently free capacity; a prompt within the bound can still fail
-admission right now and simply waits.
+`CapacityModel::SingleRequestGroupPages` (`csrc/scheduler/capacity_model.h`):
+the largest prompt whose worst-case working set — aligned checkpoint + final
+continuation state, decode reserve, overlap-depth protection, the state growth
+block, and for chunked sparse local recovery the retained input checkpoint
+(and, with the prefix cache on, a first chunk's cached one) — fits the pool.
+It is not a live check against currently free capacity; a prompt within the
+bound can still fail admission right now and simply waits.
+
+The `CapacityModel` is deliberately **config-only**: it reads every
+`SchedulerConfig` field that is known before a pool exists and no
+`total_pages`, validating that subset through
+`SchedulerConfig::ValidateCapacityInputs()`. That is what lets the Python
+recipes size a pool from the same model before the arena is allocated
+(`recipes/scheduler_bridge.py` builds an unsized config and asks
+`ConcurrentGroupPages(max_total_tokens, max_context_len)` for each group's
+demand at `max_batch_size` live requests), and then lets the `Scheduler`
+bound requests against the pool they sized. The per-request working set —
+`decode_width + overlap_schedule_depth * decode_width` protected tokens,
+`SnapshotStateReserveTokens`, a group's prefix-match lookback (the same
+`PrefixMatcher` the coordinator builds, via `MakePrefixMatcher`) — exists in
+that one file; neither side restates it. The two answers are tied by an
+invariant the model's tests sweep: for one live request of `L` tokens,
+`ConcurrentGroupPages(L, L)` is never below `SingleRequestGroupPages(L)` in
+any group, so a pool sized for the configured concurrency admits every
+request the bound accepts.
+
+Per group, `ConcurrentGroupPages` charges: a snapshot-state group its
+single-request peak once per live request (the working set does not grow
+with history); a prefix-closed history group `ceil(T / g)` dense pages plus,
+per request, `ceil((g - 1 + protected) / g)` for the unaligned tail and the
+protected tokens that may spill past it; a sliding group, per request,
+`ceil((min(W - 1, ctx) + decode_width + protected + g - 1) / g)` resident
+pages, plus one in-flight prefill chunk behind its lookback (or, on the
+decode role, the landing bound `min(dense, lookback + window)` per request).
 
 For an internal checkpoint followed by `tail` tokens, the forward holds
 both the tail and the ordinary growth reserve: the output working set is

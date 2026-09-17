@@ -738,11 +738,22 @@ the decode node re-feeds nothing.
 
 Capacity has exactly two shapes, both on the base class. The default is the
 flat product (`parents × tightest packing × P`). Families whose per-group
-demand differs — K3's state groups riding inside MLA planes, V4's SWA and
-compressed chains — override `parents_needed` and get the inverse for free
-from `_capacity_from_parents`, one monotonic binary search shared by all.
+demand decides the pool — K3's state groups riding inside MLA planes, V4's
+SWA and compressed chains, GLM-5.3-Flash — size from `parents_needed` and get
+the inverse for free from `_capacity_from_parents`, one monotonic binary
+search shared by all. `parents_needed` itself is not a Python formula: it
+hands the group specs, the layout's virtual packing and `scheduler_limits`
+to the scheduler's own `CapacityModel` (`recipes/scheduler_bridge.py` →
+`csrc/scheduler/capacity_model.h`), whose `ConcurrentGroupPages` reports each
+group's demand at the configured concurrency and whose `LcmBlocksNeededFor`
+folds it by packing. The per-request working set — decode reservation,
+overlap-protected step, a state group's checkpoints and banked growth, a
+sliding group's lookback and resident window — is therefore defined once, in
+C++, and the `Scheduler` bounds single requests against the pool with the
+same model (`docs/design/scheduler.md` §1.4). No recipe restates any of it.
 `scheduler_limits` is the single place a recipe reads the scheduler's
-concurrency, so demand and capacity cannot size against different numbers.
+concurrency, role and reserve widths, so demand and capacity cannot size
+against different numbers.
 
 The runtime's global `max_num_seqs` is divided across attention DP ranks to
 produce each scheduler's rank-local `max_batch_size`. These values limit
@@ -929,12 +940,13 @@ events (wire-format constrained; unify deliberately if ever).
 ### Principle 2 — scheduler perceives only logical quantities: fixed, now with hard vocabulary rules
 
 Scheduling and FSM code do no geometry arithmetic. The coordinator exposes
-capacity views — `LcmBlocksNeededFor(group_pages)`,
-`NumActiveLcmBlocks(request_tables)`, `NumAvailableLcmBlocks`,
-`TotalLcmBlocks`, `GroupAvailablePages(group)` — and the scheduler treats the
-counts as opaque capacity units. The null-page reservation lives in
-`SchedulerConfig::AllocatorConfig::NumUsableBlocks()`, and nothing outside the
-cache layer enumerates LCM block ids.
+capacity views — `NumActiveLcmBlocks(request_tables)`,
+`NumAvailableLcmBlocks`, `TotalLcmBlocks`, `GroupAvailablePages(group)` — and
+the config-only `CapacityModel` (`csrc/scheduler/capacity_model.h`) folds
+page demand into LCM blocks (`LcmBlocksNeededFor(group_pages)`); the
+scheduler treats the counts as opaque capacity units. The null-page
+reservation lives in `SchedulerConfig::AllocatorConfig::NumUsableBlocks()`,
+and nothing outside the cache layer enumerates LCM block ids.
 
 Enforced:
 
@@ -949,16 +961,19 @@ Enforced:
 * `SchedulerConfig::Validate()` is the **single** configuration gate: every
   scheduler scalar, every `CacheGroupConfig::Validate()`, and the cross-checks
   between them (P divisibility, PD transfer policy, one-cache-block chunks for
-  a recurrent-state group). The `Scheduler` runs it before constructing any
-  member, because the pools and the coordinator assert on the same fields and
-  would otherwise preempt the diagnostic. Python callers must also pass
-  `Scheduler(config)` explicitly; the binding retains no module-lifetime
-  default configuration. Consequently `MakeSpecsFromConfig`
-  is pure translation — it validates nothing;
+  a recurrent-state group). Its sizing half, `ValidateCapacityInputs()`, is
+  the same checks minus the page counts that describe a sized pool; the
+  `CapacityModel` runs that half so a pool can be sized before it exists, and
+  `Validate()` runs it too, so no rule is stated twice. The `Scheduler` runs
+  `Validate()` before constructing any member, because the pools and the
+  coordinator assert on the same fields and would otherwise preempt the
+  diagnostic. Python callers must also pass `Scheduler(config)` explicitly;
+  the binding retains no module-lifetime default configuration. Consequently
+  `MakeSpecsFromConfig` is pure translation — it validates nothing;
 * the scheduler layer **transports** `cache_blocks_per_lcm_block` rather than
   reasoning with it. It appears in `csrc/scheduler/` only as a config field
   copied into the spec; capacity math stays in tokens and pages and folds to
-  LCM blocks inside `LcmBlocksNeededFor`.
+  LCM blocks inside `CapacityModel::LcmBlocksNeededFor`.
 
 Note on naming: the capacity counts intentionally keep *LCM block* names. An
 LCM parent is a byte-uniform storage unit whose token span differs per group

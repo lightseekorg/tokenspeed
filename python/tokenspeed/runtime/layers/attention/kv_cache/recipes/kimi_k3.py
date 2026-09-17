@@ -28,7 +28,6 @@ byte width so no parent is wasted.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from functools import cached_property
 
@@ -388,45 +387,3 @@ class KimiK3Recipe(CacheRecipe):
             full_packing = dict(layout.group_packing)[FULL_ATTENTION]
             upper = num_lcm_blocks * full_packing * layout.prefix_granularity
         return self._capacity_from_parents(layout, num_lcm_blocks, upper_bound=upper)
-
-    @override
-    def parents_needed(self, layout: CacheLayout, token_capacity: int) -> int:
-        """Physical parents this capacity needs at the configured concurrency.
-
-        K3's KDA state rides inside the MLA planes, so its demand is a pair of
-        closed forms (history pages for MLA, a fixed working set for the state
-        groups) rather than the contract's per-retention page-count formula.
-        """
-        page_tokens = layout.prefix_granularity
-        limits = self.scheduler_limits
-        max_live_requests = limits["max_live_requests"]
-        depth = limits["overlap_schedule_depth"]
-        if depth not in (0, 1):
-            raise ValueError(f"overlap_schedule_depth must be 0 or 1, got {depth}")
-        if depth and limits["decode_input_tokens"] == 0:
-            raise ValueError("overlapped cache sizing requires decode_input_tokens > 0")
-        protected_pages = max_live_requests * math.ceil(
-            depth * limits["decode_input_tokens"] / page_tokens
-        )
-        parents = 0
-        for group_id, packing in layout.group_packing:
-            if group_id == FULL_ATTENTION:
-                child_pages = (
-                    math.ceil(token_capacity / page_tokens)
-                    + max_live_requests
-                    - 1
-                    + protected_pages
-                )
-            else:
-                # A finishing off-page prefill holds its input snapshot and
-                # aligned checkpoint, plus the final tail AND banked decode
-                # growth. Overlap protects one more decode reservation. With
-                # ordinary decode this is four state blocks per live request.
-                growth_tokens = max(
-                    page_tokens, (1 + depth) * limits["decode_input_tokens"]
-                )
-                child_pages = max_live_requests * (
-                    2 + math.ceil((page_tokens - 1 + growth_tokens) / page_tokens)
-                )
-            parents += math.ceil(child_pages / packing)
-        return parents

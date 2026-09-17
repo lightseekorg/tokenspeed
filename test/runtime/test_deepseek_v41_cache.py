@@ -114,6 +114,8 @@ def _recipe(device):
             chunked_prefill_size=512,
             max_num_seqs=2,
             max_total_tokens=1024,
+            disaggregation_mode="null",
+            enable_prefix_caching=True,
         ),
         model_config=SimpleNamespace(
             num_attention_layers=40,

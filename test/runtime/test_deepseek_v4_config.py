@@ -280,6 +280,8 @@ def _v4_recipe(
             chunked_prefill_size=prefix_granularity,
             attention_use_fp4_indexer_cache=True,
             speculative_algorithm=None,
+            disaggregation_mode="null",
+            enable_prefix_caching=True,
         ),
         model_config=SimpleNamespace(
             hf_config=hf_config, num_attention_layers=num_layers
@@ -6849,6 +6851,8 @@ def test_v4_pd_recipe_and_readiness_follow_cache_producers():
             attention_use_fp4_indexer_cache=False,
             max_total_tokens=64 * 1024,
             chunked_prefill_size=256,
+            disaggregation_mode="prefill",
+            enable_prefix_caching=True,
         ),
         model_config=SimpleNamespace(
             num_attention_layers=3,

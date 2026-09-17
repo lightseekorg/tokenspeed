@@ -32,8 +32,6 @@ from tokenspeed_scheduler import (
     Cache,
     CacheGroupConfig,
     CacheGroupFamily,
-    CacheRetention,
-    CacheTransferPolicy,
     ExecutionEvent,
     ForwardEvent,
     RequestSpec,
@@ -44,6 +42,10 @@ from tokenspeed.runtime.execution.types import NGramInputs
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
+    cache_group_config,
+    scheduler_role,
+)
 
 _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
@@ -53,20 +55,6 @@ _CACHE_EVENT_TYPES = {
 if hasattr(Cache, "LoadBackDoneEvent"):
     _CACHE_EVENT_TYPES["LoadBackDoneEvent"] = Cache.LoadBackDoneEvent
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
-
-# Pool-spec string -> scheduler enum (pool_to_cache_groups).
-_RETENTION_MAP = {
-    "full_history": CacheRetention.FullHistory,
-    "sliding_window": CacheRetention.SlidingWindow,
-}
-_FAMILY_MAP = {
-    "history": CacheGroupFamily.History,
-    "state": CacheGroupFamily.State,
-}
-_TRANSFER_POLICY_MAP = {
-    "full_suffix": CacheTransferPolicy.FullSuffix,
-    "latest_snapshot": CacheTransferPolicy.LatestSnapshot,
-}
 
 
 def engram_context_len(text_config) -> int:
@@ -215,7 +203,7 @@ def make_config(
     decode_input_tokens: int = 1,
     overlap_schedule_depth: int = 0,
     disable_prefix_cache: bool = False,
-    cache_groups: Sequence["CacheGroupConfig"] | None = None,
+    cache_groups: Sequence[CacheGroupConfig] | None = None,
     enable_mixed_prefill_decode: bool = False,
     prefix_replay_tokens: int = 0,
 ) -> SchedulerConfig:
@@ -235,12 +223,7 @@ def make_config(
     cfg.enable_l3_storage = False
     cfg.enable_kv_cache_events = enable_kv_cache_events
 
-    if role == "prefill":
-        cfg.role = SchedulerConfig.Role.P
-    elif role == "decode":
-        cfg.role = SchedulerConfig.Role.D
-    else:
-        cfg.role = SchedulerConfig.Role.Fused
+    cfg.role = scheduler_role(role)
     cfg.decode_input_tokens = decode_input_tokens
     cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_prefix_cache = disable_prefix_cache
@@ -258,50 +241,16 @@ def pool_to_cache_groups(pool: Any) -> list:
     # The arena is the sole publisher, so there is exactly one source here --
     # no fallback to pool-side copies of the same specs.
     contract = pool.arena.runtime_contract
-    specs = contract.group_specs
     counts = contract.virtual_block_counts
     packing = contract.virtual_packing
-    out = []
-    for spec in specs:
-        retention = _RETENTION_MAP.get(spec.retention)
-        if retention is None:
-            raise ValueError(
-                f"pool_to_cache_groups: unsupported retention "
-                f"{spec.retention!r} for group {spec.group_id!r}"
-            )
-        family = _FAMILY_MAP.get(spec.family)
-        if family is None:
-            raise ValueError(
-                f"pool_to_cache_groups: unsupported family "
-                f"{spec.family!r} for group {spec.group_id!r}"
-            )
-        # The declaration shape (row geometry or state checkpoint) stops here:
-        # the scheduler only learns how many tokens one block-table slot spans.
-        kwargs = dict(
-            group_id=spec.group_id,
-            block_granularity=int(spec.block_granularity),
-            total_pages=int(counts[spec.group_id]),
-            retention=retention,
-            family=family,
-            cache_blocks_per_lcm_block=int(packing[spec.group_id]),
-            shard_count=spec.shard_count,
+    return [
+        cache_group_config(
+            spec,
+            total_pages=counts[spec.group_id],
+            cache_blocks_per_lcm_block=packing[spec.group_id],
         )
-        transfer_policy = spec.transfer_policy
-        if transfer_policy is not None:
-            mapped_policy = _TRANSFER_POLICY_MAP.get(transfer_policy)
-            if mapped_policy is None:
-                raise ValueError(
-                    "pool_to_cache_groups: unsupported transfer policy "
-                    f"{transfer_policy!r} for group {spec.group_id!r}"
-                )
-            kwargs["transfer_policy"] = mapped_policy
-        if spec.retention == "sliding_window":
-            kwargs["sliding_window_tokens"] = int(spec.sliding_window_tokens)
-        # Always stated, False included: a group silently left cached when its
-        # recipe declared it replayable would change what the prefix hit means.
-        kwargs["replayable"] = bool(spec.replayable)
-        out.append(CacheGroupConfig(**kwargs))
-    return out
+        for spec in contract.group_specs
+    ]
 
 
 def should_use_overlap_schedule(
