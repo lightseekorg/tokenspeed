@@ -23,7 +23,7 @@ server:
     --moe-backend flashinfer_trtllm
     --max-model-len 65536
     --max-num-seqs 16
-    --max-total-tokens 131072
+    --max-total-tokens 524288
     --max-prefill-tokens 8192
     --chunked-prefill-size 4096
     --max-cudagraph-capture-size 16
