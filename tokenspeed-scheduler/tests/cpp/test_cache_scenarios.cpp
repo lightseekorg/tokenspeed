@@ -4710,4 +4710,386 @@ TEST_F(ChunkedHostHitSuite, ChunkedPrefillAfterHostHit) {
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "pool balances after the chunked host hit";
 }
 
+// ---------------------------------------------------------------------------
+// Bounded replay: the sliding groups leave prefix caching; a prefix hit
+// re-feeds the replay window before it, and no prompt's final chunk is left
+// shorter than the window. P=8 tokens; full g=8 (closed), swa g=4 window 24
+// replay 16, tail g=2 window 4 replay 2; budget 64.
+// ---------------------------------------------------------------------------
+class BoundedReplaySuite : public SchedulerTestSuite {
+protected:
+    static constexpr std::int32_t kReplayWindow = 16;
+
+    virtual std::int32_t MaxScheduledTokens() const { return 64; }
+    virtual std::int32_t MaxBatchSize() const { return 8; }
+    virtual bool MixedPrefillDecode() const { return false; }
+    virtual std::int32_t PrefixReplayTokens() const { return 0; }
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = 8;
+        cfg.device_allocator.total_pages = 256;
+        cfg.host_allocator.total_pages = 256;
+        cfg.max_scheduled_tokens = MaxScheduledTokens();
+        cfg.max_batch_size = MaxBatchSize();
+        cfg.enable_l3_storage = false;
+        cfg.disable_l2_cache = true;
+        cfg.enable_mixed_prefill_decode = MixedPrefillDecode();
+        cfg.prefix_replay_tokens = PrefixReplayTokens();
+
+        CacheGroupConfig swa = MakeGroup("swa", /*block_granularity=*/4, cfg.device_allocator.total_pages,
+                                         CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
+                                         /*sliding_window_tokens=*/24);
+        swa.replay_window_tokens = kReplayWindow;
+        CacheGroupConfig tail = MakeGroup("tail", /*block_granularity=*/2, cfg.device_allocator.total_pages,
+                                          CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
+                                          /*sliding_window_tokens=*/4);
+        tail.replay_window_tokens = 2;
+        cfg.cache_groups = {
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+            swa,
+            tail,
+        };
+        return cfg;
+    }
+
+    RequestSpec MakeSpecWithTokens(const std::string& id, std::vector<std::int32_t> tokens) {
+        return RequestSpec{.request_id = id, .tokens = std::move(tokens)};
+    }
+
+    // Prefill (one chunk) -> one decode round -> finish; returns the prefill
+    // op's per-group rows. The decode round publishes the page hashes.
+    std::map<std::string, std::vector<std::int32_t>> RunLifecycle(const RequestSpec& spec) {
+        Submit(spec);
+        const ExecutionPlan prefill = PlanOnce();
+        const ForwardBatch* op = FindForwardBatch(prefill);
+        EXPECT_NE(op, nullptr);
+        std::map<std::string, std::vector<std::int32_t>> rows;
+        if (op != nullptr) {
+            EXPECT_EQ(op->extend_replay_lens.at(0), 0) << "a cold prompt re-feeds nothing";
+            for (const auto& [gid, table] : op->block_tables) {
+                rows[gid] = table.at(0);
+            }
+        }
+        SendForwardDone(spec.request_id, {9001});
+        PlanOnce();
+        SendForwardDone(spec.request_id, {9002});
+        SendFinish(spec.request_id);
+        PlanOnce();
+        return rows;
+    }
+
+    static std::vector<std::int32_t> Slice(const std::vector<std::int32_t>& tokens, std::int32_t begin,
+                                           std::int32_t end) {
+        return {tokens.begin() + begin, tokens.begin() + end};
+    }
+
+    static void ExpectHolesThenPages(const std::vector<std::int32_t>& row, std::int32_t first_page,
+                                     std::int32_t min_pages, const char* what) {
+        ASSERT_GE(static_cast<std::int32_t>(row.size()), min_pages) << what;
+        for (std::int32_t slot = 0; slot < first_page; ++slot) {
+            EXPECT_EQ(row[static_cast<std::size_t>(slot)], 0) << what << " slot " << slot << " must be a hole";
+        }
+        for (std::int32_t slot = first_page; slot < min_pages; ++slot) {
+            EXPECT_GT(row[static_cast<std::size_t>(slot)], 0) << what << " slot " << slot << " must be a page";
+        }
+    }
+};
+
+TEST_F(BoundedReplaySuite, FirstChunkAfterHitReplaysWindow) {
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
+    const RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/4);  // 32 tokens
+    const auto r1_rows = RunLifecycle(r1);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
+
+    // r2 = r1's 32 tokens + 8 new: the closed group hits P=32 on its own; the
+    // replayable groups claim nothing and the window [16, 32) is re-fed.
+    std::vector<std::int32_t> tokens = r1.tokens;
+    const std::vector<std::int32_t> tail = MakeTokens(/*count=*/8, /*start=*/901);
+    tokens.insert(tokens.end(), tail.begin(), tail.end());
+    Submit(MakeSpecWithTokens("r2", tokens));
+
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 16);
+    EXPECT_EQ(op->extend_replay_lens.at(0), kReplayWindow);
+    EXPECT_EQ(op->input_lengths.at(0), kReplayWindow + 8);
+    EXPECT_EQ(op->prefill_lengths.at(0), 40);
+    EXPECT_EQ(op->input_ids, Slice(tokens, 16, 40));
+
+    // Closed group: r1's four pages are shared, then fresh pages follow.
+    const auto& full_row = op->block_tables.at("full").at(0);
+    ASSERT_GE(full_row.size(), 5u);
+    for (std::size_t slot = 0; slot < 4; ++slot) {
+        EXPECT_EQ(full_row[slot], r1_rows.at("full").at(slot)) << "full slot " << slot;
+    }
+    EXPECT_GT(full_row[4], 0);
+    // Replayable groups: holes below s=16, private pages from there through
+    // the 40 computed tokens plus the decode slot.
+    ExpectHolesThenPages(op->block_tables.at("swa").at(0), /*first_page=*/16 / 4, /*min_pages=*/41 / 4 + 1, "swa");
+    ExpectHolesThenPages(op->block_tables.at("tail").at(0), /*first_page=*/16 / 2, /*min_pages=*/41 / 2 + 1, "tail");
+
+    // Progress is the chunk, not the replay: r2 decodes from position 40 and
+    // frees everything on finish.
+    SendForwardDone("r2", {199});
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+    SendForwardDone("r2", {200});
+    SendFinish("r2");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
+}
+
+TEST_F(BoundedReplaySuite, HitShorterThanWindowReplaysWholePrefix) {
+    const RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/1);  // 8 tokens
+    RunLifecycle(r1);
+
+    std::vector<std::int32_t> tokens = r1.tokens;
+    const std::vector<std::int32_t> tail = MakeTokens(/*count=*/8, /*start=*/901);
+    tokens.insert(tokens.end(), tail.begin(), tail.end());
+    Submit(MakeSpecWithTokens("r2", tokens));
+
+    const ExecutionPlan op_plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(op_plan);
+    ASSERT_NE(op, nullptr);
+    // P=8 < W=16: the whole hit prefix is re-fed and the forward starts at 0.
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 0);
+    EXPECT_EQ(op->extend_replay_lens.at(0), 8);
+    EXPECT_EQ(op->input_lengths.at(0), 16);
+    EXPECT_EQ(op->input_ids, tokens);
+    EXPECT_GT(op->block_tables.at("swa").at(0).at(0), 0) << "no hole: the private suffix starts at 0";
+}
+
+TEST_F(BoundedReplaySuite, NoHitNoReplay) {
+    Submit(MakeSpecWithTokens("r1", MakeTokens(/*count=*/12)));
+    const ExecutionPlan op_plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(op_plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 0);
+    EXPECT_EQ(op->extend_replay_lens.at(0), 0);
+    EXPECT_EQ(op->input_lengths.at(0), 12);
+}
+
+TEST_F(BoundedReplaySuite, FinalChunkKeepsAtLeastTheWindow) {
+    // 70 tokens with a 64-token budget would leave a 6-token final chunk; the
+    // first chunk is shortened so the final chunk holds exactly the window.
+    const std::vector<std::int32_t> tokens = MakeTokens(/*count=*/70);
+    Submit(MakeSpecWithTokens("r1", tokens));
+
+    const ExecutionPlan chunk1_plan = PlanOnce();
+    const ForwardBatch* chunk1 = FindForwardBatch(chunk1_plan);
+    ASSERT_NE(chunk1, nullptr);
+    EXPECT_EQ(chunk1->extend_prefix_lens.at(0), 0);
+    EXPECT_EQ(chunk1->extend_replay_lens.at(0), 0);
+    EXPECT_EQ(chunk1->input_lengths.at(0), 70 - kReplayWindow);
+
+    const ExecutionPlan chunk2_plan = PlanOnce();
+    const ForwardBatch* chunk2 = FindForwardBatch(chunk2_plan);
+    ASSERT_NE(chunk2, nullptr);
+    EXPECT_EQ(chunk2->extend_prefix_lens.at(0), 70 - kReplayWindow);
+    EXPECT_EQ(chunk2->extend_replay_lens.at(0), 0);
+    EXPECT_EQ(chunk2->input_lengths.at(0), kReplayWindow);
+    EXPECT_EQ(chunk2->input_ids, Slice(tokens, 54, 70));
+
+    SendForwardDone("r1", {});
+    SendForwardDone("r1", {9001});
+    const ExecutionPlan decode_plan = PlanOnce();
+    ASSERT_NE(FindForwardBatch(decode_plan), nullptr);
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u) << "decode resumes at position 70";
+}
+
+TEST_F(BoundedReplaySuite, FinalChunkAlreadyAtLeastTheWindowIsUnchanged) {
+    Submit(MakeSpecWithTokens("r1", MakeTokens(/*count=*/84)));
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    const ExecutionPlan chunk2_plan = PlanOnce();
+    const ForwardBatch* chunk2 = FindForwardBatch(chunk2_plan);
+    ASSERT_NE(chunk2, nullptr);
+    EXPECT_EQ(chunk2->extend_prefix_lens.at(0), 64);
+    EXPECT_EQ(chunk2->extend_replay_lens.at(0), 0);
+    EXPECT_EQ(chunk2->input_lengths.at(0), 20);
+}
+
+TEST_F(BoundedReplaySuite, ReplayRowsDebitTokenBudget) {
+    const RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/4);
+    RunLifecycle(r1);
+
+    std::vector<std::int32_t> tokens = r1.tokens;
+    const std::vector<std::int32_t> tail = MakeTokens(/*count=*/8, /*start=*/901);
+    tokens.insert(tokens.end(), tail.begin(), tail.end());
+    // r2 costs 16 replay + 8 new rows; r3's first chunk gets the remaining 40.
+    Submit({MakeSpecWithTokens("r2", tokens), MakeSpecWithTokens("r3", MakeTokens(/*count=*/60, /*start=*/5001))});
+
+    const ExecutionPlan op_plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(op_plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids, (std::vector<std::string>{"r2", "r3"}));
+    EXPECT_EQ(op->extend_replay_lens, (std::vector<std::int32_t>{kReplayWindow, 0}));
+    EXPECT_EQ(op->input_lengths, (std::vector<std::int32_t>{kReplayWindow + 8, 64 - kReplayWindow - 8}));
+}
+
+// The DSpark cap (prefix_replay_tokens) shortens the probe first; bounded
+// replay then re-feeds its window before whatever hit remains.
+class BoundedReplayWithDSparkCapSuite : public BoundedReplaySuite {
+protected:
+    std::int32_t PrefixReplayTokens() const override { return 8; }
+};
+
+TEST_F(BoundedReplayWithDSparkCapSuite, DSparkCapComposesWithBoundedReplay) {
+    const RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/4);  // 32 tokens
+    RunLifecycle(r1);
+
+    std::vector<std::int32_t> tokens = r1.tokens;
+    const std::vector<std::int32_t> tail = MakeTokens(/*count=*/4, /*start=*/901);
+    tokens.insert(tokens.end(), tail.begin(), tail.end());  // 36 tokens
+    Submit(MakeSpecWithTokens("r2", tokens));
+
+    const ExecutionPlan op_plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(op_plan);
+    ASSERT_NE(op, nullptr);
+    // Cap: (36 - 8) / 8 = 3 pages -> P = 24; window 16 -> s = 8.
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 8);
+    EXPECT_EQ(op->extend_replay_lens.at(0), kReplayWindow);
+    EXPECT_EQ(op->input_lengths.at(0), 36 - 8);
+    EXPECT_EQ(op->input_ids, Slice(tokens, 8, 36));
+}
+
+// Mixed mode: the decode batch leaves two replay windows for a pending local
+// prefill, so a hit chunk always fits in one forward.
+class BoundedReplayMixedSuite : public BoundedReplaySuite {
+protected:
+    std::int32_t MaxScheduledTokens() const override { return 2 * kReplayWindow + 6; }
+    std::int32_t MaxBatchSize() const override { return 16; }
+    bool MixedPrefillDecode() const override { return true; }
+};
+
+TEST_F(BoundedReplayMixedSuite, DecodeBatchLeavesRoomForTheReplayWindow) {
+    // Seed the cache with a 24-token prompt (one chunk under the 38 budget).
+    const RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/3);
+    RunLifecycle(r1);
+
+    // Eight decoding requests, each a 4-token prompt.
+    std::vector<std::string> decoders;
+    for (int i = 0; i < 8; ++i) {
+        const std::string id = "d" + std::to_string(i);
+        Submit(MakeSpecWithTokens(id, MakeTokens(/*count=*/4, /*start=*/2000 + 10 * i)));
+        ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+        SendForwardDone(id, {7000 + i});
+        decoders.push_back(id);
+    }
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    for (const std::string& id : decoders) {
+        SendForwardDone(id, {8000});
+    }
+    EXPECT_EQ(scheduler_->DecodingSize(), 8u);
+
+    // r2 hits P=24 (> W) and adds 15 new tokens: fewer than a window, so the
+    // whole W + 15 = 31 rows must go in one chunk. With a 38-token budget the
+    // decode batch must stop once 2W = 32 tokens remain, i.e. after 6 rows.
+    std::vector<std::int32_t> tokens = r1.tokens;
+    const std::vector<std::int32_t> tail = MakeTokens(/*count=*/15, /*start=*/901);
+    tokens.insert(tokens.end(), tail.begin(), tail.end());
+    Submit(MakeSpecWithTokens("r2", tokens));
+    const ExecutionPlan op_plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(op_plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->NumExtends(), 1);
+    EXPECT_EQ(op->request_ids.at(0), "r2");
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 24 - kReplayWindow);
+    EXPECT_EQ(op->extend_replay_lens.at(0), kReplayWindow);
+    EXPECT_EQ(op->input_lengths.at(0), kReplayWindow + 15);
+    EXPECT_EQ(op->request_ids.size(), 1u + 6u);
+}
+
+// PD: a replayable group travels like any sliding window -- the prefill role
+// replays locally on its own hits and transfers the retained tail; the decode
+// role lands that tail and never re-feeds anything.
+class BoundedReplayPrefillRoleSuite : public BoundedReplaySuite {
+protected:
+    virtual Role RoleUnderTest() const { return Role::kP; }
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = BoundedReplaySuite::MakeConfig();
+        cfg.role = RoleUnderTest();
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.transfer_policy = CacheTransferPolicy::FullSuffix;
+            // The shipped tail is the whole retention window, so the prefill
+            // role regenerates all of it: swa replays 24, tail 4.
+            if (group.replay_window_tokens) {
+                group.replay_window_tokens = group.sliding_window_tokens;
+            }
+        }
+        return cfg;
+    }
+
+    void SendBootstrapped(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(pd::BootstrappedEvent{request_id});
+        scheduler_->Advance(std::move(event));
+    }
+};
+
+TEST_F(BoundedReplayPrefillRoleSuite, LocalHitReplaysAndTheTailIsWhatTransfers) {
+    // r1: a 32-token prompt prefilled in one chunk; its ExtendResult lands
+    // the bootstrap token and the closed group's four pages are published.
+    const RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/4);
+    Submit(r1);
+    SendBootstrapped("r1");
+    const ExecutionPlan first_plan = PlanOnce();
+    const ForwardBatch* first = FindForwardBatch(first_plan);
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(first->extend_replay_lens, std::vector<std::int32_t>{0});
+    SendForwardDone("r1", {42});
+    ASSERT_TRUE(PlanOnce().remote_decode.has_value());
+
+    // r2 = r1's 32 tokens + 8 new: the closed group hits P=32 and the whole
+    // swa retention window [8, 32) is re-fed, so the tail a decode peer lands
+    // (`full_suffix`: from token 40 - 24 + 1 = 17, page 4) is materialized.
+    std::vector<std::int32_t> tokens = r1.tokens;
+    const std::vector<std::int32_t> tail = MakeTokens(/*count=*/8, /*start=*/901);
+    tokens.insert(tokens.end(), tail.begin(), tail.end());
+    Submit(MakeSpecWithTokens("r2", tokens));
+    SendBootstrapped("r2");
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids, std::vector<std::string>{"r2"});
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 8);
+    EXPECT_EQ(op->extend_replay_lens.at(0), 24);
+    EXPECT_EQ(op->input_lengths.at(0), 24 + 8);
+    EXPECT_EQ(op->input_ids, Slice(tokens, 8, 40));
+    ExpectHolesThenPages(op->block_tables.at("swa").at(0), /*first_page=*/8 / 4, /*min_pages=*/40 / 4, "swa");
+    ExpectHolesThenPages(op->block_tables.at("tail").at(0), /*first_page=*/8 / 2, /*min_pages=*/40 / 2, "tail");
+}
+
+class BoundedReplayDecodeRoleSuite : public BoundedReplayPrefillRoleSuite {
+protected:
+    Role RoleUnderTest() const override { return Role::kD; }
+};
+
+TEST_F(BoundedReplayDecodeRoleSuite, RemoteAdmissionLandsTheRetainedTailAndReplaysNothing) {
+    const RequestSpec spec = MakeRequestSpec("r1", /*num_pages=*/5);  // 40 tokens
+    Submit(spec);
+    SendBootstrapped("r1");
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* admission = FindRemoteAdmission(plan);
+    ASSERT_NE(admission, nullptr);
+    EXPECT_EQ(admission->extend_prefix_lens, std::vector<std::int32_t>{0});
+    EXPECT_EQ(admission->extend_replay_lens, std::vector<std::int32_t>{0});
+    EXPECT_EQ(admission->input_lengths, std::vector<std::int32_t>{40});
+    // The closed group lands the whole prompt; the replayable groups land
+    // exactly the tail their retention keeps (swa window 24 -> from token 17,
+    // page 4; tail window 4 -> from token 37, page 18), as any sliding group.
+    const auto& full_row = admission->block_tables.at("full").at(0);
+    ASSERT_GE(full_row.size(), 5u);
+    for (std::size_t slot = 0; slot < 5; ++slot) {
+        EXPECT_GT(full_row[slot], 0) << "full slot " << slot;
+    }
+    ExpectHolesThenPages(admission->block_tables.at("swa").at(0), /*first_page=*/17 / 4, /*min_pages=*/40 / 4, "swa");
+    ExpectHolesThenPages(admission->block_tables.at("tail").at(0), /*first_page=*/37 / 2, /*min_pages=*/40 / 2, "tail");
+    EXPECT_EQ(FindForwardBatch(plan)->request_ids.size(), 0u) << "the peer prefills; nothing runs locally";
+}
+
 }  // namespace tokenspeed::test

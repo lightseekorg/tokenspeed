@@ -33,6 +33,11 @@ public:
     struct Window {
         std::int32_t begin{0};
         std::int32_t size{0};
+        // Tokens before `begin` re-fed as model input on top of the window
+        // (bounded replay of replayable cache groups). They are not part of
+        // the window's progress: `begin` and `size` alone say which tokens
+        // this chunk computes, and TokenSlice ignores the field.
+        std::int32_t replay{0};
     };
 
     explicit TokenContainer(const std::vector<std::int32_t>& new_tokens)

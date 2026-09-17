@@ -210,6 +210,8 @@ class AttentionBackend(CachePoolBinding, ABC):
         extend_seq_lens_cpu: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
+        extend_replay_lens_cpu: torch.Tensor,
+        extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
         **kwargs,
     ) -> None:
@@ -229,6 +231,14 @@ class AttentionBackend(CachePoolBinding, ABC):
                 tables for every published group (placeholders on warmup).
             extend_*: ``[>= num_extends]`` per-request new-token / prefix
                 lengths and their pinned host mirrors (empty on idle warmup).
+            extend_replay_lens_cpu: ``[>= num_extends]`` host-only leading
+                input rows per request that re-feed cached prompt positions
+                (bounded replay). Positions ``[prefix, prefix + replay)``
+                regenerate replayable cache groups only; a node that cannot
+                honour that calls :func:`reject_bounded_replay`.
+            extend_prompt_lens_cpu: ``[>= num_extends]`` host-only whole
+                prompt lengths, so a node can tell the chunk that ends a
+                prompt from an intermediate one.
             extend_with_prefix: Whether any extend row continues a cached or
                 chunked prefix (some ``extend_prefix_lens`` entry is non-zero).
             **kwargs: Model-side extras (positions, capture mode, ...) a
@@ -503,3 +513,21 @@ class AttentionBackend(CachePoolBinding, ABC):
         **kwargs,
     ):
         raise NotImplementedError()
+
+
+def reject_bounded_replay(extend_replay_lens_cpu: torch.Tensor, node: str) -> None:
+    """Fail loud when a forward re-feeds cached positions a node cannot mask.
+
+    Replayed rows must not rewrite the groups whose rows the prefix hit
+    already holds; only a backend that plans its writes around
+    ``extend_replay_lens_cpu`` may accept them.
+
+    Args:
+        extend_replay_lens_cpu: ``[num_extends]`` host replay lengths.
+        node: Backend name for the diagnostic.
+    """
+    if extend_replay_lens_cpu.numel() and bool((extend_replay_lens_cpu != 0).any()):
+        raise RuntimeError(
+            f"{node} cannot mask bounded-replay rows; its cache groups must not "
+            "declare replay_window_tokens"
+        )

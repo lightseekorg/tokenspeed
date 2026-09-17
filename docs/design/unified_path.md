@@ -41,17 +41,25 @@ DECODE call raises. There is deliberately no fresh-allocation decode arm
 anywhere. `init_forward_metadata_replay_cuda_graph` no longer exists.
 
 Its extend inputs are one required, keyword-only bundle on every node —
-runner-facing (`backends/base.py`: router, V4, Mamba/KDA, composites) and
-leaf (`backends/paged/base.py`) alike: `extend_seq_lens`, `extend_seq_lens_cpu`,
-`extend_prefix_lens`, `extend_prefix_lens_cpu` are plain `torch.Tensor`
-(`[>= num_extends]` entries; empty, never `None`, when there are no
-extend requests) and `extend_with_prefix` is a plain `bool`. No default
-values: the runner passes the `[:num_extends]` slices of its input buffers
-on every call (the idle replay passes the empty `[:0]` slices), so a node
-that reads a field can never see a silently-defaulted one. This is
-deliberate — a `= False` default once hid `extend_with_prefix` being
-swallowed by a composite's `**kwargs`, and FlashMLA planned a ragged prefill
-for a prefix-cached batch.
+runner-facing (`backends/base.py`: router, V4, V4.1, Mamba/KDA, composites)
+and leaf (`backends/paged/base.py`) alike: `extend_seq_lens`,
+`extend_seq_lens_cpu`, `extend_prefix_lens`, `extend_prefix_lens_cpu` are
+plain `torch.Tensor` (`[>= num_extends]` entries; empty, never `None`, when
+there are no extend requests) and `extend_with_prefix` is a plain `bool`.
+Runner-facing nodes additionally take two host-only facts the scheduler
+knows and only V4.1 plans from: `extend_replay_lens_cpu` (how many leading
+rows of each extend re-feed already-cached positions — bounded replay,
+`docs/design/scheduler.md`) and `extend_prompt_lens_cpu` (the whole prompt
+length, so the backend can tell a prompt-completing chunk from an open one).
+Leaves never see them: a paged leaf writes every input row unconditionally,
+so the router and every other runner-facing node call
+`reject_bounded_replay` and fail loud on a non-zero replay instead of
+rewriting rows the prefix hit already shares. No default values: the runner
+passes the `[:num_extends]` slices of its input buffers on every call (the
+idle replay passes the empty `[:0]` slices), so a node that reads a field
+can never see a silently-defaulted one. This is deliberate — a `= False`
+default once hid `extend_with_prefix` being swallowed by a composite's
+`**kwargs`, and FlashMLA planned a ragged prefill for a prefix-cached batch.
 
 ### Buffer sizing: the ladder is a performance subset, never a capacity limit
 
@@ -223,6 +231,10 @@ two graph subsystems (`ForwardStepRunner.disable`, `PrefillGraph.disable`).
 `DSABackend` and Qwen4-Exp's PLE/indexer consumers disable the prefill graph
 (rationale comments live on those classes). Qwen4-Exp's root composes its
 actual children, so these restrictions also apply when there is no GDN leaf.
+`DeepseekV41AttentionBackend` disables it too: the CED decoder runs on a
+per-request tail of the prefill rows (`decoder_view()`), so a prefill
+forward changes its row count at layer 20 by an amount that depends on
+which requests complete their prompt — not a token bucket.
 
 Rules: declarations are static "never works" facts — a runtime prefill
 capture failure is FATAL (no silent eager degrade: a family that cannot
@@ -638,6 +650,15 @@ round can never be armed on one side and drained on the other. Model-side
 capture wiring (`set_dflash_layers_to_capture`) is static — which layers,
 in which tap order — and carries no per-round state.
 
+The reverse direction rides on the context as well: a target that captures
+its taps on a row subset reports it as `ctx.captured_rows`
+(`CapturedRows(positions, prefill_spans)`). V4.1's CED narrowing is the one
+producer — its taps sit in layers 37–39 and hold one row per open chunk and
+the last window of every completing one, so DSpark's prefill seeding
+(`_seed_prefill_windows`) reads the spans and positions from there instead
+of the input-length mirror. A target with one captured row per input row
+leaves it `None`, and the drafter keeps its buffer-based layout.
+
 ## Shared prefill convolution preparation
 
 Mamba/KDA extend metadata owns one immutable `CausalConv1dPrefillMetadata`
@@ -737,7 +758,7 @@ mapping remains a separate consumer of the shared mapping helpers
   mappings are backend scratch (`sparse_topk`, `slot_mappings`), cleared by
   every metadata build (`test_cache_group_router.py`,
   `test_deepseek_v4_slot_mappings.py`, `test_deepseek_v4_config.py`).
-* `grep -rnE '^\s+extend_(seq|prefix)_lens(_cpu)?: torch\.Tensor \| None,|
+* `grep -rnE '^\s+extend_(seq|prefix|replay|prompt)_lens(_cpu)?: torch\.Tensor \| None,|
   extend_with_prefix: bool = False' python/tokenspeed/runtime/layers/attention/backends/`
   must stay empty — no `init_forward_metadata` parameter in the extend
   bundle is optional or defaulted (`test/runtime/test_unified_decode_path.py`

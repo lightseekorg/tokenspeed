@@ -590,6 +590,9 @@ def test_qsa_draft_narrowing_preserves_layout_and_updates_the_frontier(
         extend_seq_lens_cpu=torch.tensor([3], dtype=torch.int32),
         extend_prefix_lens=torch.tensor([5], dtype=torch.int32),
         extend_prefix_lens_cpu=torch.tensor([5], dtype=torch.int32),
+        extend_replay_lens_cpu=torch.zeros_like(torch.tensor([5], dtype=torch.int32)),
+        extend_prompt_lens_cpu=torch.tensor([5], dtype=torch.int32)
+        + torch.tensor([3], dtype=torch.int32),
         extend_with_prefix=True,
     )
     extend = indexer.forward_extend_metadata

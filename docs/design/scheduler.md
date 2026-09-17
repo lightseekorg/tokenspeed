@@ -18,7 +18,11 @@ scheduled, never for the whole prompt**: `schedulePrefill` /
 this chunk's tokens, and the coordinator either grants the pages or the
 request stays put.
 
-Two adjustments ride on top of the raw chunk size:
+Two adjustments ride on top of the raw chunk size. Both are pure token
+arithmetic kept out of the planner: how a chunk is cut lives in
+`scheduler/operations/prefill_chunk.h` (`PrefillChunkTokens` is the one
+entry both prefill paths call), what each group demands for it in
+`scheduler/operations/group_demands.h`.
 
 **Alignment.** `AlignPrefillChunk` shortens a chunk so it ends on a prefix-page
 boundary (or on a promotion boundary), because a page is the unit of prefix
@@ -29,9 +33,9 @@ to align for.
 **Reserve.** What an admission holds beyond the chunk it computes is stated
 once per round (`PrefillReserve`: decode width, prompt headroom,
 whether the round finishes shaping the state groups) and turned into each
-group's page demand by `reservePrefillDemands` — the only writer of
-`GroupDemand::reserve_tokens`. `groupReserveTokens` picks the rule by the
-group's retention, never by call site:
+group's page demand by `ReservePrefillDemands` — the only writer of
+`GroupDemand::reserve_tokens`. It picks the rule by the group's retention,
+never by call site:
 
 - *Full-history* groups hold the decode slot — the chunk that
   completes the prompt reserves `decode_input_tokens`, so the first decode step
@@ -136,19 +140,98 @@ The capacity guarantees are retention-specific:
   prompt plus admission headroom; sliding-window groups do not hold headroom.
 - **Snapshot-state groups on decoding roles reserve growth at the admission
   that finishes shaping them** (completing chunk or remote landing):
-  `groupReserveTokens` reserves `max(block_granularity, decode_input_tokens)`,
+  `ReservePrefillDemands` reserves `max(block_granularity, decode_input_tokens)`,
   at least one block beyond the endpoint for every prompt length.
   Without it an endpoint with no spare block needs a fresh **empty** parent
   per state group at its first boundary crossing. A full pool can deadlock
   when residents are retraction-exempt because their generation is covered by
   admission headroom (§4). Invariant: *no request needs an empty parent
   for its first crossing* — it already owns the block. Later crossings
-  re-acquire from the shared pool and depend on the capacity bound (§1.3) and
+  re-acquire from the shared pool and depend on the capacity bound (§1.4) and
   admission back-pressure.
   The P role and intermediate local chunks reserve no growth block (the next
   sparse re-shaping requires `AvailableTokens() == 0`).
 
-### 1.3 What bounds a single request
+### 1.3 Bounded replay
+
+A sliding History group can be declared **replayable** (`CacheGroupConfig::
+replay_window_tokens`, see [Cache concepts](cache-concepts.md)): it leaves
+prefix caching entirely — never matched, published or streamed — and the
+model regenerates its rows from **re-fed prompt tokens**. DeepSeek V4.1's SWA
+rows and compressor tails are the motivating case: caching them persistently
+costs more than recomputing a bounded window, and the prefix hit should
+depend on the global KV alone.
+
+The cache facts live on the `CacheCoordinator`, next to the specs they
+derive from: `ReplayWindowTokens()` (`W`, the largest declared window) and
+`ReplayTokens(P)` (`min(W, P)`, what a hit at `P` must re-feed). The
+scheduling rules live with the other chunk-cutting rules in
+`scheduler/operations/prefill_chunk.h`; the forward planner never branches on
+replay — the two decisions below reach the common path only through
+`PrefillChunkTokens`, the one chunk-sizing helper both prefill paths call,
+which also carries the snapshot-state and promotion alignment every chunk
+already went through:
+
+- **After a prefix hit at `P`**, the first chunk re-feeds `[P − min(W, P), P)`
+  ahead of its new tokens, so the queries at and after `P` find the whole
+  window regenerated. This is the only place tokens are re-fed.
+- **No prompt's final chunk is shorter than `W`** (`ChunkKeepingFinalWindow`):
+  a chunk that would leave `0 < remainder < W` is shortened so exactly `W`
+  remain. A promotion boundary (the alignment rule above) that falls inside that final window
+  yields: no chunk end satisfies both rules, so the chunk passes the boundary
+  and the closed group recomputes the promoted pages rather than the request
+  waiting forever. The model narrows its decoder to the prompt's last window, which
+  must therefore arrive in one forward — as new tokens, never by re-feeding
+  what an earlier chunk of the same request already computed.
+
+The re-fed rows are ordinary forward input — they consume the round's token
+budget like any other row and `input_length` counts them — but they are not
+progress: `TokenContainer::Window{begin, size, replay}` keeps `begin`/`size`
+as the tokens this chunk computes (`replay` is non-zero only on a hit's first
+chunk), and `MakePrefillInfo` derives the model input
+`[begin − replay, begin + size)`. The runtime sees the pair
+`extend_prefix_len = begin − replay` and `extend_replay_len = replay` on the
+`ForwardBatch`; positions `[extend_prefix_len, extend_prefix_len +
+extend_replay_len)` regenerate the replayable groups only and must not be
+written into any other group, whose rows already sit in the shared cached
+pages the hit claimed.
+
+Capacity: a replayable group claims no hit pages, so at first admission its
+table is empty and `CacheCoordinator::Admit` itself materializes it as a
+sparse private suffix from the replay window's first token — slots below stay
+null holes, exactly as absolute-slot tables require — while closed groups keep
+the dense demand beyond `P` the caller stated. The FSM derives the window's
+`replay` from the same coordinator (`SchedulePrefillFirstChunkEvent`), so no
+event or scheduler operation carries a replay parameter. Later chunks change
+nothing.
+
+Budget: `SchedulerConfig::Validate` requires `max_scheduled_tokens ≥ W +
+max(W, P)` — a hit chunk re-feeds up to `W` and must still advance: by every
+new token when fewer than `W` remain, or by one prefix page when a promotion
+boundary aligns it — the first chunk spends the hit window before sizing its
+new tokens (and waits for a fresher budget when none is left), and in fused
+mixed mode the decode batch leaves that same amount for a pending local
+prefill (`MinPrefillChunkTokens`, the same reserve the mamba checkpoint page
+uses). Replay is re-derived at every
+admission, so a retracted request carries nothing: its readmission re-probes
+and replays from the new `P`. Replayable groups cannot be combined with
+snapshot-state groups, whose chunk alignment would fight the final-window
+rule.
+
+PD: a replayable group travels like any sliding-window group. The prefill
+role replays on its own local hits exactly as the fused role does and, at
+completion, transfers the group's retained tail (`full_suffix` selects the
+pages intersecting the last `sliding_window_tokens − 1` positions). Every
+page of that tail must exist, so on the P and D roles `Validate` requires
+`replay_window_tokens == sliding_window_tokens`: the regenerated suffix then
+starts at or before the tail (a hit re-feeds the whole retention window, not
+just the attention window). The decode role computes no prompt rows, so
+`SchedulePrefillFirstChunkEvent` gives a remote prefill `replay = 0` and
+`Admit` leaves a demand that already names the landing's sparse suffix
+alone; the landed tail is what the first decode steps read, with no
+regeneration anywhere.
+
+### 1.4 What bounds a single request
 
 `MaxSingleRequestTokens` is a **startup** bound computed by binary search over
 `singleRequestLcmBlocksRequired`: the largest prompt whose worst-case working
@@ -389,7 +472,9 @@ A store-less fused retraction is not in this ordering at all — it has no L2
 pages to load back, so it re-prefills through the ordinary admission path
 (`admitsLikeNewPrompt`). There is no queue to keep in step with the FSM: a
 request that finishes or aborts while retracted simply stops qualifying,
-with no bookkeeping to prune.
+with no bookkeeping to prune. Nor is bounded replay (§1.3) carried across a
+retraction: the readmission re-probes and derives its replay window from the
+new hit, and the L2 snapshot never holds a replayable group's pages.
 
 **A readmission that does not fit, waits.** Its failed admission never
 triggers retraction (it is never recorded as the capacity blocker): when the
@@ -438,8 +523,14 @@ no victim and nothing could free that page.
   except the decode reserve on the completing chunk (1), the snapshot-state
   growth block banked by the admission that finishes shaping a state group
   (1.2), and the admission headroom (4) — which only full-history groups hold.
+  A replayable group's private suffix starts at the replay window, which is
+  inside the forward's input, not beyond it (1.3).
+- A replayable group is never matched, published or streamed (1.3); its
+  re-fed rows are forward input that debits the token budget but never
+  advances `num_computed_tokens`; only a hit's first chunk re-feeds, and no
+  final chunk is shorter than the replay window (`ChunkKeepingFinalWindow`).
 - A prefill demand's reserve is decided once per group, by retention, in
-  `reservePrefillDemands` (1); no later step rewrites `reserve_tokens`, and the
+  `ReservePrefillDemands` (1); no later step rewrites `reserve_tokens`, and the
   helper asserts it found none set.
 - An incomplete local prefill is not overtaken (1.1). Decodes are never hostage
   to it: they consume no fresh capacity within their reserve, so they keep

@@ -164,6 +164,8 @@ def _run(wrapper, mode):
         extend_with_prefix=False,
         extend_prefix_lens=empty,
         extend_prefix_lens_cpu=empty,
+        extend_replay_lens_cpu=torch.zeros_like(empty),
+        extend_prompt_lens_cpu=empty + empty,
         extend_seq_lens=empty,
         extend_seq_lens_cpu=empty,
         positions=None,

@@ -63,6 +63,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
+    reject_bounded_replay,
 )
 from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
     _compute_state_block_index_plan,
@@ -1013,10 +1014,13 @@ class MambaAttnBackend(AttentionBackend):
         extend_seq_lens_cpu: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
+        extend_replay_lens_cpu: torch.Tensor,
+        extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
         **kwargs,
     ) -> None:
-        del req_pool_indices, extend_with_prefix, kwargs
+        del req_pool_indices, extend_with_prefix, extend_prompt_lens_cpu, kwargs
+        reject_bounded_replay(extend_replay_lens_cpu, "MambaStateBackend")
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
             raise RuntimeError(
                 "Mamba decode metadata goes through refresh_decode_metadata; "

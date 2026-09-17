@@ -59,6 +59,24 @@ V41_GROUP_PACKING = {
     V41_GLOBAL_R1_GROUP_ID: 60,
     V41_COMPRESSOR_TAIL_GROUP_ID: 54,
 }
+V41_LCM_BLOCK_BYTES = 1_382_400
+# With same-checkpoint DSpark the SWA page also carries the draft's context
+# rows, so the parent grows and the other groups repack to keep every group
+# within the recipe's padding budget (1.5% / 4.5% / 4.5% / 3.1%).
+V41_DSPARK_GROUP_PACKING = {
+    V41_SWA_GROUP_ID: 1,
+    V41_GLOBAL_R2_GROUP_ID: 22,
+    V41_GLOBAL_R1_GROUP_ID: 66,
+    V41_COMPRESSOR_TAIL_GROUP_ID: 62,
+}
+V41_DSPARK_LCM_BLOCK_BYTES = 1_571_328
+
+
+def v41_dspark_field_name(stage: int) -> str:
+    """Return the SWA-group field name holding one DSpark stage's window rows."""
+    if stage < 0:
+        raise ValueError("DSpark stage must be non-negative")
+    return f"dspark_kv{stage}"
 
 
 def v41_layer_mapping(

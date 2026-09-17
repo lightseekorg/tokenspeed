@@ -23,6 +23,9 @@
 import torch
 from typing_extensions import override
 
+from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
+    v41_dspark_field_name,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -94,6 +97,18 @@ class DeepseekV41CachePool(CachePool):
         Ratio-1 owners have no tail; requesting one fails instead of allocating.
         """
         return self._field(owner, "compressor_tail")
+
+    def zero_new_blocks(self, new_page_ids: dict[str, list[int]]) -> None:
+        """Clear freshly admitted local pages of every group before reuse."""
+        self.arena.zero_blocks(new_page_ids)
+
+    def dspark_kv(self, stage: int) -> torch.Tensor:
+        """Return one DSpark stage's BF16 [pages, 64, 512] context-window rows.
+
+        Rows share the SWA group's page ids and slots: slot // 64 is the page
+        and slot % 64 the row, exactly as the target's SWA slots resolve.
+        """
+        return self._field(self.layer_num - 1, v41_dspark_field_name(stage))
 
     @override
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:

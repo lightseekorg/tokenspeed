@@ -575,6 +575,8 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_seq_lens_cpu=new.clone(),
             extend_prefix_lens=prefix,
             extend_prefix_lens_cpu=prefix.clone(),
+            extend_replay_lens_cpu=torch.zeros_like(prefix),
+            extend_prompt_lens_cpu=prefix + new,
             extend_with_prefix=True,
         )
         kind, bs, num_extends, page_table, mode = leaves[FULL].calls[-2]
@@ -615,7 +617,34 @@ class CacheGroupRouterTest(unittest.TestCase):
                 extend_seq_lens_cpu=no_extends,
                 extend_prefix_lens=no_extends,
                 extend_prefix_lens_cpu=no_extends,
+                extend_replay_lens_cpu=torch.zeros_like(no_extends),
+                extend_prompt_lens_cpu=no_extends + no_extends,
                 extend_with_prefix=False,
+            )
+
+    def test_extend_init_rejects_bounded_replay_rows(self):
+        """Paged leaves write every input row unconditionally, so a replayed
+        prefix (rows the hit already holds) must fail loud instead of being
+        rewritten into shared pages."""
+        router, _ = self._router()
+        seq_lens = torch.tensor([9, 4], dtype=torch.int32)
+        prefix = torch.tensor([4, 0], dtype=torch.int32)
+        new = torch.tensor([5, 4], dtype=torch.int32)
+        with self.assertRaisesRegex(RuntimeError, "cannot mask bounded-replay"):
+            router.init_forward_metadata(
+                2,
+                2,
+                torch.arange(2, dtype=torch.int32),
+                seq_lens,
+                ForwardMode.EXTEND,
+                block_tables=self._tables(),
+                extend_seq_lens=new,
+                extend_seq_lens_cpu=new.clone(),
+                extend_prefix_lens=prefix,
+                extend_prefix_lens_cpu=prefix.clone(),
+                extend_replay_lens_cpu=torch.tensor([2, 0], dtype=torch.int32),
+                extend_prompt_lens_cpu=prefix + new,
+                extend_with_prefix=True,
             )
 
     def test_mixed_round_slices_decode_requests_after_the_extend_requests(self):
@@ -634,6 +663,11 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_seq_lens_cpu=torch.tensor([5], dtype=torch.int32),
             extend_prefix_lens=torch.tensor([4], dtype=torch.int32),
             extend_prefix_lens_cpu=torch.tensor([4], dtype=torch.int32),
+            extend_replay_lens_cpu=torch.zeros_like(
+                torch.tensor([4], dtype=torch.int32)
+            ),
+            extend_prompt_lens_cpu=torch.tensor([4], dtype=torch.int32)
+            + torch.tensor([5], dtype=torch.int32),
             extend_with_prefix=True,
         )
         self.assertEqual(
@@ -671,6 +705,8 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_seq_lens_cpu=extend_seq_lens.clone(),
             extend_prefix_lens=extend_prefix_lens,
             extend_prefix_lens_cpu=extend_prefix_lens.clone(),
+            extend_replay_lens_cpu=torch.zeros_like(extend_prefix_lens),
+            extend_prompt_lens_cpu=extend_prefix_lens + extend_seq_lens,
             extend_with_prefix=True,
         )
         router.refresh_decode_metadata(
@@ -709,6 +745,8 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_seq_lens_cpu=one.clone(),
             extend_prefix_lens=prefix,
             extend_prefix_lens_cpu=prefix.clone(),
+            extend_replay_lens_cpu=torch.zeros_like(prefix),
+            extend_prompt_lens_cpu=prefix + one,
             extend_with_prefix=True,
         )
         router.refresh_decode_metadata(
@@ -740,6 +778,8 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_seq_lens_cpu=extend_seq_lens.clone(),
             extend_prefix_lens=extend_prefix_lens,
             extend_prefix_lens_cpu=extend_prefix_lens.clone(),
+            extend_replay_lens_cpu=torch.zeros_like(extend_prefix_lens),
+            extend_prompt_lens_cpu=extend_prefix_lens + extend_seq_lens,
             extend_with_prefix=True,
         )
         router.refresh_decode_metadata(
@@ -911,6 +951,8 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_seq_lens_cpu=new.clone(),
             extend_prefix_lens=prefix,
             extend_prefix_lens_cpu=prefix.clone(),
+            extend_replay_lens_cpu=torch.zeros_like(prefix),
+            extend_prompt_lens_cpu=prefix + new,
             extend_with_prefix=False,
         )
         self.assertEqual((share.prefill, share.decode), (None, None))

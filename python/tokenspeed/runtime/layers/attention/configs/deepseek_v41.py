@@ -64,6 +64,16 @@ class DeepseekV41Config(SoftmaxAttnConfig):
         )
         if verify_width < 1:
             raise ValueError("V4.1 verify width must be positive")
+        if (
+            server_args.disaggregation_mode != "null"
+            and int(server_args.disaggregation_layerwise_interval) != 0
+        ):
+            # forward_v41 writes its cache outside AttentionBackend.forward, so
+            # no per-layer cache step is recorded for the layerwise sender.
+            raise NotImplementedError(
+                "DeepSeek V4.1 PD transfers the cache after the prompt completes; "
+                "pass --disaggregation-layerwise-interval 0"
+            )
         kwargs = model_wide_kwargs(
             server_args,
             model_config,
