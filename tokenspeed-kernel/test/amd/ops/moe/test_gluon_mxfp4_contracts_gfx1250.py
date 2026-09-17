@@ -18,7 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Off-device contract for gfx1250 MXFP4 index ownership, width and narrowing."""
+"""Off-device contracts for the gfx1250 Gluon MXFP4 MoE kernels: index
+ownership, index width and narrowing, and partial-TDM warp distribution."""
 
 from __future__ import annotations
 
@@ -175,3 +176,91 @@ def test_either_direction_alone_can_force_the_wide_index(
         scatter_writeback_rows=scatter_writeback_rows,
     )
     assert bits == expected_bits
+
+
+# ---------------------------------------------------------------------------
+# Partial TDM: which warps carry a descriptor, and which pair fuses
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("num_warps", [4, 8])
+def test_partial_tdm_warp_masks_partition_the_warps(num_warps: int) -> None:
+    hint = _common.partial_tdm_warp_hint(num_warps)
+    mirrored = _common.reverse_tdm_warp_used_hint(hint, num_warps)
+
+    # async_load_fused rejects overlapping masks, and a warp left out of both
+    # would drop its share of the block.
+    assert hint & mirrored == 0
+    assert hint | mirrored == (1 << num_warps) - 1
+
+    # async_load additionally requires an axis-aligned mask, whose active warp
+    # count is therefore always a power of two.
+    for mask in (hint, mirrored):
+        active = bin(mask).count("1")
+        assert active > 0 and active & (active - 1) == 0
+
+
+@pytest.mark.parametrize("num_warps", [2, 16])
+def test_partial_tdm_warp_hint_rejects_unsupported_warp_counts(num_warps: int) -> None:
+    with pytest.raises(ValueError, match="4 or 8 warps"):
+        _common.partial_tdm_warp_hint(num_warps)
+
+
+def _moe_config(*, use_gather: bool, partial_tdm: bool) -> _common.MoEConfig:
+    """One SiTU projection: stage 1 gathers its rows, stage 2 scatters them."""
+    return _common.MoEConfig(
+        64,
+        256,
+        256,
+        "e4m3",
+        "e2m1",
+        SCALE_BLOCK=32,
+        NUM_BUFFERS=3,
+        W_TRANSPOSE=True,
+        WITH_X_MX_SCALE=False,
+        WITH_W_MX_SCALE=True,
+        SCALE_PRESHUFFLE=True,
+        index_type=gl.int32,
+        PARTIAL_TDM=partial_tdm,
+        NUM_SUBTILES=(1, 1, 1),
+        EVEN_K=True,
+        USE_GATHER=use_gather,
+        NUM_WARPS=4,
+    )
+
+
+# async_gather takes no warp hint, so the gather path cannot put x in a fusion
+# and pairs w with its scale instead.
+@pytest.mark.parametrize(
+    ("use_gather", "partial_tdm", "fused_pair"),
+    [
+        (False, False, ()),
+        (True, False, ()),
+        (False, True, ("X", "W")),
+        (True, True, ("W", "W_SCALE")),
+    ],
+)
+def test_partial_tdm_hints_exactly_the_operands_it_fuses(
+    use_gather: bool, partial_tdm: bool, fused_pair: tuple[str, ...]
+) -> None:
+    cfg = _moe_config(use_gather=use_gather, partial_tdm=partial_tdm)
+    hints = {
+        operand: getattr(cfg, f"TDM_WARP_USED_HINT_{operand}").value
+        for operand in ("X", "W", "W_SCALE")
+    }
+
+    # A hint on an operand outside the fused pair would split its warps without
+    # buying back an issue slot, which is strictly slower than not hinting.
+    hinted = tuple(operand for operand, hint in hints.items() if hint is not None)
+    assert hinted == fused_pair
+    assert cfg.FUSE_X_W.value == (fused_pair == ("X", "W"))
+    assert cfg.FUSE_W_W_SCALE.value == (fused_pair == ("W", "W_SCALE"))
+    if fused_pair:
+        assert hints[fused_pair[0]] & hints[fused_pair[1]] == 0
+
+    # NUM_LOADS_IN_BATCH scales the async_wait count, so a fused pair still
+    # counted as two loads would desynchronize the pipeline.
+    whole_warp = _moe_config(use_gather=use_gather, partial_tdm=False)
+    assert cfg.NUM_LOADS_IN_BATCH.value == whole_warp.NUM_LOADS_IN_BATCH.value - bool(
+        fused_pair
+    )

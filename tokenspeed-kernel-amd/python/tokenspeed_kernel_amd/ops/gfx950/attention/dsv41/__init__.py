@@ -18,13 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""DeepSeek V4 attention kernels for AMD GFX1250."""
+"""DeepSeek V4.1 attention kernels for AMD GFX950."""
 
-from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4.decode import (
-    gluon_dsv4_decode_gfx1250,
-)
-from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4.prefill import (
-    gluon_dsv4_prefill_gfx1250,
+from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41.selected import (
+    gluon_dsv41_selected_attention_gfx950,
 )
 
-__all__ = ["gluon_dsv4_decode_gfx1250", "gluon_dsv4_prefill_gfx1250"]
+__all__ = ["gluon_dsv41_selected_attention_gfx950"]

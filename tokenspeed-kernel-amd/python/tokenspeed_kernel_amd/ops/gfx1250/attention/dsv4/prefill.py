@@ -18,24 +18,22 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""DeepSeek V4 prefill selected-attention kernel for AMD GFX950."""
+"""Dense-workspace DeepSeek V4 selected-attention prefill for GFX1250.
+
+Wave32 WMMA-v3 port of the generic H=16 GFX950 ``dsv4_prefill`` path.
+Prefill gathers SWA/global rows into a BF16 workspace first; this kernel
+only runs selected attention over that dense buffer.
+"""
 
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
-from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4.sparse_prefill import (
-    gluon_dsv4_sparse_prefill_gfx950,
-)
 
-__all__ = ["gluon_dsv4_prefill_gfx950"]
-
-
-def _use_sparse_prefill(q: torch.Tensor, indices: torch.Tensor) -> bool:
-    # Compact H=64/128 helper does not skip -1 pads; width 128 uses the generic kernel.
-    return q.shape[1] in (64, 128) and indices.shape[1] > 128
+__all__ = ["gluon_dsv4_prefill_gfx1250"]
 
 
 @gluon.jit
@@ -60,74 +58,49 @@ def _dsv4_prefill_kernel(
     TILE_K: gl.constexpr,
     HEAD_DIM: gl.constexpr,
 ):
-    mfma_score: gl.constexpr = gl.amd.cdna4.AMDMFMALayout(
-        version=4,
-        instr_shape=[16, 16, 16],
+    WARP_SIZE: gl.constexpr = 32
+    NUM_WARPS: gl.constexpr = gl.num_warps()
+    K_WIDTH: gl.constexpr = 8
+    qk_layout: gl.constexpr = gl.amd.AMDWMMALayout(
+        version=3,
         transposed=True,
-        warps_per_cta=[4, 1],
+        warp_bases=[[1, 0], [2, 0]],
+        reg_bases=[],
+        instr_shape=[16, 16, 32],
     )
-    mfma_value: gl.constexpr = gl.amd.cdna4.AMDMFMALayout(
-        version=4,
-        instr_shape=[16, 16, 16],
+    pv_layout: gl.constexpr = gl.amd.AMDWMMALayout(
+        version=3,
         transposed=True,
-        warps_per_cta=[4, 1],
+        warp_bases=[[0, 1], [0, 2]],
+        reg_bases=[],
+        instr_shape=[16, 16, 32],
     )
-
-    q_threads_d: gl.constexpr = min(64, HEAD_DIM // 8)
-    q_threads_h: gl.constexpr = 64 // q_threads_d
     q_load_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[q_threads_h, q_threads_d],
-        warps_per_cta=[4, 1],
-        order=[1, 0],
+        [1, 16],
+        [1, WARP_SIZE],
+        [NUM_WARPS, 1],
+        [1, 0],
     )
-    kv_threads_d: gl.constexpr = min(64, HEAD_DIM // 8)
-    kv_threads_k: gl.constexpr = 64 // kv_threads_d
     kv_load_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[8, 1],
-        threads_per_warp=[kv_threads_d, kv_threads_k],
-        warps_per_cta=[1, 4],
-        order=[0, 1],
+        [16, 1],
+        [WARP_SIZE, 1],
+        [1, NUM_WARPS],
+        [0, 1],
     )
-    out_threads_d: gl.constexpr = min(64, HEAD_DIM // 8)
-    out_threads_h: gl.constexpr = 64 // out_threads_d
-    out_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[out_threads_h, out_threads_d],
-        warps_per_cta=[4, 1],
-        order=[1, 0],
-    )
-
     q_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[512, 16]],
+        [[HEAD_DIM, K_WIDTH]],
         [BLOCK_H, HEAD_DIM],
         [1, 0],
     )
     kv_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[512, 16]],
+        [[HEAD_DIM, K_WIDTH]],
         [HEAD_DIM, TILE_K],
         [0, 1],
     )
-    q_dot_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0,
-        parent=mfma_score,
-        k_width=8,
-    )
-    k_dot_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1,
-        parent=mfma_score,
-        k_width=8,
-    )
-    p_dot_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0,
-        parent=mfma_value,
-        k_width=4,
-    )
-    v_dot_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1,
-        parent=mfma_value,
-        k_width=4,
-    )
+    q_dot_layout: gl.constexpr = gl.DotOperandLayout(0, qk_layout, K_WIDTH)
+    k_dot_layout: gl.constexpr = gl.DotOperandLayout(1, qk_layout, K_WIDTH)
+    p_dot_layout: gl.constexpr = gl.DotOperandLayout(0, pv_layout, K_WIDTH)
+    v_dot_layout: gl.constexpr = gl.DotOperandLayout(1, pv_layout, K_WIDTH)
 
     token_idx = gl.program_id(axis=0)
     head_group_idx = gl.program_id(axis=1)
@@ -137,9 +110,7 @@ def _dsv4_prefill_kernel(
     num_tiles = gl.maximum(gl.cdiv(effective_len, TILE_K), 1)
 
     q_heads = head_offset + gl.arange(
-        0,
-        BLOCK_H,
-        layout=gl.SliceLayout(1, q_load_layout),
+        0, BLOCK_H, layout=gl.SliceLayout(1, q_load_layout)
     )
     q_dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, q_load_layout))
     q_offsets = (
@@ -152,145 +123,70 @@ def _dsv4_prefill_kernel(
         [BLOCK_H, HEAD_DIM],
         layout=q_shared_layout,
     )
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        dest=q_shared,
-        ptr=q,
-        offsets=q_offsets.to(tl.int32),
-        mask=(q_heads < num_heads)[:, None],
+    q_shared.store(
+        gl.load(q + q_offsets, mask=(q_heads < num_heads)[:, None], other=0.0)
     )
-    gl.amd.cdna4.async_copy.commit_group()
-
-    local_k_load = gl.arange(
-        0,
-        TILE_K,
-        layout=gl.SliceLayout(0, kv_load_layout),
-    )
-    local_k_mfma = gl.arange(
-        0,
-        TILE_K,
-        layout=gl.SliceLayout(0, mfma_score),
-    )
-    kv_dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(1, kv_load_layout))
-    indices_base = token_idx.to(tl.int64) * stride_indices_t
-
-    rows_load = gl.amd.cdna4.buffer_load(
-        ptr=indices,
-        offsets=indices_base.to(tl.int32) + local_k_load,
-        mask=local_k_load < SELECTED_WIDTH,
-        other=-1,
-    )
-    rows_mfma = gl.amd.cdna4.buffer_load(
-        ptr=indices,
-        offsets=indices_base.to(tl.int32) + local_k_mfma,
-        mask=local_k_mfma < SELECTED_WIDTH,
-        other=-1,
-    )
-    valid_load = (
-        (local_k_load < effective_len)
-        & (rows_load >= 0)
-        & (rows_load.to(tl.int64) < num_kv_rows)
-    )
-    valid_mfma = (
-        (local_k_mfma < effective_len)
-        & (rows_mfma >= 0)
-        & (rows_mfma.to(tl.int64) < num_kv_rows)
-    )
-    safe_rows = gl.where(valid_load, rows_load, 0)
-
     kv_shared = gl.allocate_shared_memory(
-        kv.dtype.element_ty,
-        [2, HEAD_DIM, TILE_K],
+        q.dtype.element_ty,
+        [HEAD_DIM, TILE_K],
         layout=kv_shared_layout,
     )
-    kv_offsets = safe_rows[None, :].to(tl.int64) * stride_kv_row + kv_dims[:, None].to(
-        tl.int64
-    )
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        dest=kv_shared.index(0),
-        ptr=kv,
-        offsets=kv_offsets.to(tl.int32),
-        mask=valid_load[None, :],
-    )
-    gl.amd.cdna4.async_copy.commit_group()
-
-    gl.amd.cdna4.async_copy.wait_group(1)
+    gl.barrier()
     q_dot = q_shared.load(q_dot_layout)
 
     score_heads = head_offset + gl.arange(
-        0,
-        BLOCK_H,
-        layout=gl.SliceLayout(1, mfma_score),
+        0, BLOCK_H, layout=gl.SliceLayout(1, qk_layout)
     )
     valid_heads = score_heads < num_heads
-    max_value = gl.load(
-        attn_sink + score_heads,
-        mask=valid_heads,
-        other=0.0,
-    ).to(gl.float32)
+    max_value = gl.load(attn_sink + score_heads, mask=valid_heads, other=0.0).to(
+        gl.float32
+    )
     denominator = gl.full(
         [BLOCK_H],
         1.0,
         dtype=gl.float32,
-        layout=gl.SliceLayout(1, mfma_score),
+        layout=gl.SliceLayout(1, qk_layout),
     )
-    accumulator = gl.zeros(
-        [BLOCK_H, HEAD_DIM],
-        dtype=gl.float32,
-        layout=mfma_value,
-    )
+    accumulator = gl.zeros([BLOCK_H, HEAD_DIM], dtype=gl.float32, layout=pv_layout)
 
-    current_buffer = 0
-    for tile_idx in range(num_tiles - 1):
-        next_start = (tile_idx + 1) * TILE_K
-        next_k_load = next_start + local_k_load
-        next_k_mfma = next_start + local_k_mfma
-        next_rows_load = gl.amd.cdna4.buffer_load(
-            ptr=indices,
-            offsets=indices_base.to(tl.int32) + next_k_load,
-            mask=next_k_load < SELECTED_WIDTH,
+    local_k_load = gl.arange(0, TILE_K, layout=gl.SliceLayout(0, kv_load_layout))
+    kv_dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(1, kv_load_layout))
+    indices_base = token_idx.to(tl.int64) * stride_indices_t
+
+    for tile_idx in range(num_tiles):
+        positions = tile_idx * TILE_K + local_k_load
+        rows_load = gl.load(
+            indices + indices_base + positions.to(tl.int64),
+            mask=positions < SELECTED_WIDTH,
             other=-1,
         )
-        next_rows_mfma = gl.amd.cdna4.buffer_load(
-            ptr=indices,
-            offsets=indices_base.to(tl.int32) + next_k_mfma,
-            mask=next_k_mfma < SELECTED_WIDTH,
-            other=-1,
+        valid_load = (
+            (positions < effective_len)
+            & (rows_load >= 0)
+            & (rows_load.to(tl.int64) < num_kv_rows)
         )
-        next_valid_load = (
-            (next_k_load < effective_len)
-            & (next_rows_load >= 0)
-            & (next_rows_load.to(tl.int64) < num_kv_rows)
+        safe_rows = gl.where(valid_load, rows_load, 0).to(tl.int64)
+        kv_values = gl.load(
+            kv + safe_rows[None, :] * stride_kv_row + kv_dims[:, None].to(tl.int64),
+            mask=valid_load[None, :],
+            other=0.0,
         )
-        next_valid_mfma = (
-            (next_k_mfma < effective_len)
-            & (next_rows_mfma >= 0)
-            & (next_rows_mfma.to(tl.int64) < num_kv_rows)
-        )
-        next_safe_rows = gl.where(next_valid_load, next_rows_load, 0)
-        next_buffer = 1 - current_buffer
-        next_kv_offsets = next_safe_rows[None, :].to(
-            tl.int64
-        ) * stride_kv_row + kv_dims[:, None].to(tl.int64)
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(
-            dest=kv_shared.index(next_buffer),
-            ptr=kv,
-            offsets=next_kv_offsets.to(tl.int32),
-            mask=next_valid_load[None, :],
-        )
-        gl.amd.cdna4.async_copy.commit_group()
-        gl.amd.cdna4.async_copy.wait_group(1)
+        valid_col = gl.convert_layout(valid_load, gl.SliceLayout(0, qk_layout))
+        kv_shared.store(kv_values)
+        gl.barrier()
 
-        current_kv = kv_shared.index(current_buffer)
-        k_dot = current_kv.load(k_dot_layout)
-        v_dot = current_kv.permute([1, 0]).load(v_dot_layout)
-        scores = gl.zeros(
-            [BLOCK_H, TILE_K],
-            dtype=gl.float32,
-            layout=mfma_score,
+        k_dot = kv_shared.load(k_dot_layout)
+        v_dot = kv_shared.permute([1, 0]).load(v_dot_layout)
+        scores = (
+            gl.amd.cdna5.wmma(
+                q_dot,
+                k_dot,
+                gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=qk_layout),
+            )
+            * softmax_scale
         )
-        scores = gl.amd.cdna4.mfma(q_dot, k_dot, scores) * softmax_scale
         scores = gl.where(
-            valid_heads[:, None] & valid_mfma[None, :],
+            valid_heads[:, None] & valid_col[None, :],
             scores,
             -float("inf"),
         )
@@ -301,78 +197,35 @@ def _dsv4_prefill_kernel(
         previous_scale = gl.exp(max_value - safe_next_max)
         probabilities = gl.exp(scores - safe_next_max[:, None])
         denominator = previous_scale * denominator + gl.sum(probabilities, axis=1)
-        accumulator_scale = gl.convert_layout(
-            previous_scale,
-            gl.SliceLayout(1, mfma_value),
-        )
-        accumulator *= accumulator_scale[:, None]
+        accumulator *= gl.convert_layout(previous_scale[:, None], pv_layout)
         p_dot = gl.convert_layout(probabilities.to(q.dtype.element_ty), p_dot_layout)
-        accumulator = gl.amd.cdna4.mfma(p_dot, v_dot, accumulator)
-
+        accumulator = gl.amd.cdna5.wmma(p_dot, v_dot, accumulator)
         max_value = next_max
-        current_buffer = next_buffer
-        valid_mfma = next_valid_mfma
+        gl.barrier()
 
-    gl.amd.cdna4.async_copy.wait_group(0)
-    current_kv = kv_shared.index(current_buffer)
-    k_dot = current_kv.load(k_dot_layout)
-    v_dot = current_kv.permute([1, 0]).load(v_dot_layout)
-    scores = gl.zeros(
-        [BLOCK_H, TILE_K],
-        dtype=gl.float32,
-        layout=mfma_score,
-    )
-    scores = gl.amd.cdna4.mfma(q_dot, k_dot, scores) * softmax_scale
-    scores = gl.where(
-        valid_heads[:, None] & valid_mfma[None, :],
-        scores,
-        -float("inf"),
-    )
-
-    tile_max = gl.max(scores, axis=1)
-    next_max = gl.maximum(max_value, tile_max)
-    safe_next_max = gl.where(next_max > -float("inf"), next_max, 0.0)
-    previous_scale = gl.exp(max_value - safe_next_max)
-    probabilities = gl.exp(scores - safe_next_max[:, None])
-    denominator = previous_scale * denominator + gl.sum(probabilities, axis=1)
-    accumulator_scale = gl.convert_layout(
-        previous_scale,
-        gl.SliceLayout(1, mfma_value),
-    )
-    accumulator *= accumulator_scale[:, None]
-    p_dot = gl.convert_layout(probabilities.to(q.dtype.element_ty), p_dot_layout)
-    accumulator = gl.amd.cdna4.mfma(p_dot, v_dot, accumulator)
-
-    denominator_value = gl.convert_layout(
-        denominator,
-        gl.SliceLayout(1, mfma_value),
-    )
+    denominator_value = gl.convert_layout(denominator, gl.SliceLayout(1, pv_layout))
     safe_denominator = gl.where(denominator_value > 0.0, denominator_value, 1.0)
     accumulator /= safe_denominator[:, None]
-    accumulator = gl.where(
-        denominator_value[:, None] > 0.0,
-        accumulator,
-        0.0,
-    )
+    accumulator = gl.where(denominator_value[:, None] > 0.0, accumulator, 0.0)
 
     out_heads = head_offset + gl.arange(
-        0,
-        BLOCK_H,
-        layout=gl.SliceLayout(1, out_layout),
+        0, BLOCK_H, layout=gl.SliceLayout(1, q_load_layout)
     )
-    out_dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, out_layout))
+    out_dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, q_load_layout))
     out_offsets = (
         token_idx.to(tl.int64) * stride_o_t
         + out_heads[:, None].to(tl.int64) * stride_o_h
         + out_dims[None, :].to(tl.int64)
     )
-    output = gl.convert_layout(accumulator.to(out.dtype.element_ty), out_layout)
-    gl.amd.cdna4.buffer_store(
-        stored_value=output,
-        ptr=out,
-        offsets=out_offsets.to(tl.int32),
-        mask=(out_heads < num_heads)[:, None],
-    )
+    output = gl.convert_layout(accumulator.to(out.dtype.element_ty), q_load_layout)
+    gl.store(out + out_offsets, output, mask=(out_heads < num_heads)[:, None])
+
+
+def _tile_k() -> int:
+    value = int(os.environ.get("TOKENSPEED_DSV4_PREFILL_TILE_K", "32"))
+    if value not in (32, 64):
+        raise ValueError("TOKENSPEED_DSV4_PREFILL_TILE_K must be 32 or 64 on gfx1250")
+    return value
 
 
 def _check_tensor(name: str, tensor: object) -> torch.Tensor:
@@ -458,7 +311,7 @@ def _validate_inputs(
             raise ValueError(f"out must not alias {name}")
 
 
-def gluon_dsv4_prefill_gfx950(
+def gluon_dsv4_prefill_gfx1250(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
@@ -467,7 +320,7 @@ def gluon_dsv4_prefill_gfx950(
     softmax_scale: float,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run dense-workspace selected attention for DeepSeek V4 on GFX950.
+    """Run dense-workspace selected attention for DeepSeek V4 on GFX1250.
 
     Args:
         q: Contiguous BF16 queries shaped `[tokens, heads, 512]`.
@@ -505,17 +358,6 @@ def gluon_dsv4_prefill_gfx950(
         output.zero_()
         return output
 
-    if _use_sparse_prefill(q, indices):
-        return gluon_dsv4_sparse_prefill_gfx950(
-            q=q,
-            kv=kv,
-            indices=indices,
-            lens=lens,
-            attn_sink=attn_sink,
-            softmax_scale=scale,
-            out=output,
-        )
-
     kv_rows = kv.reshape(-1, 512)
     sink_values = attn_sink.reshape(-1)
     grid = (q.shape[0], triton.cdiv(q.shape[1], 16))
@@ -537,7 +379,7 @@ def gluon_dsv4_prefill_gfx950(
         kv_rows.shape[0],
         SELECTED_WIDTH=indices.shape[1],
         BLOCK_H=16,
-        TILE_K=32,
+        TILE_K=_tile_k(),
         HEAD_DIM=512,
         num_warps=4,
     )

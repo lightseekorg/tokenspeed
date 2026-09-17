@@ -814,6 +814,7 @@ def _matmul(
     SCHEDULE: gl.constexpr = "baseline",
     PINGPONG: gl.constexpr = False,
     NUM_WARPS: gl.constexpr = 4,
+    PARTIAL_TDM: gl.constexpr = False,
 ):
     gl.static_assert(RAGGED_DIMENSION is None or RAGGED_DIMENSION == "M")
     SPLIT_K: gl.constexpr = 1
@@ -853,6 +854,7 @@ def _matmul(
         WITH_W_MX_SCALE=WITH_W_MX_SCALE,
         SCALE_PRESHUFFLE=SCALE_PRESHUFFLE,
         index_type=INDEX_TYPE,
+        PARTIAL_TDM=PARTIAL_TDM,
         NUM_SUBTILES=NUM_SUBTILES,
         EVEN_K=EVEN_K,
         USE_GATHER=USE_GATHER,
@@ -1314,6 +1316,7 @@ def matmul(
     pingpong: bool = False,
     num_warps: int = 4,
     decode: bool = False,
+    partial_tdm: bool,
 ):
     """Run the gfx1250 Gluon MoE matmul kernel.
 
@@ -1332,6 +1335,9 @@ def matmul(
         fused_activation: Optional SwiGLU or SiTU activation descriptor.
         block_m: Concrete row tile resolved by the caller.
         decode: Select the small-M, M-ragged decode kernel.
+        partial_tdm: Split each TDM descriptor load across half the warps so a
+            pair of operand loads issues as one fused TDM operation. Requires
+            4 or 8 warps.
 
     Returns:
         ``(output, kernel)`` where ``kernel`` is the Triton/Gluon launch object.
@@ -1351,6 +1357,8 @@ def matmul(
         block_k=block_k,
         num_warps=num_warps,
     )
+    if partial_tdm and num_warps not in (4, 8):
+        raise ValueError(f"partial_tdm requires 4 or 8 warps, got {num_warps}")
 
     if precision_config is None:
         precision_config = PrecisionConfig()
@@ -1531,6 +1539,7 @@ def matmul(
         SCHEDULE=schedule,
         PINGPONG=pingpong,
         NUM_WARPS=num_warps,
+        PARTIAL_TDM=partial_tdm,
         num_warps=num_warps,
     )
     out_final = c_storage.data
@@ -1583,6 +1592,7 @@ def gluon_mxfp_combine(
     w_preshuffle: bool = False,
     x_scale_ragged_padded: bool = False,
     decode: bool = False,
+    partial_tdm: bool,
 ) -> torch.Tensor:
     """Combine GEMM using the gfx1250 Gluon MoE kernel."""
     del use_warp_pipeline, use_slice_mn, use_slice_n
@@ -1620,6 +1630,7 @@ def gluon_mxfp_combine(
         num_buffers=num_buffers,
         w_transpose=w_transpose,
         decode=decode,
+        partial_tdm=partial_tdm,
     )
     if n_expts_act is not None and int(n_expts_act) > 1:
         if n_tokens is None:
@@ -2714,6 +2725,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     decode: bool = False,
     block_m: int | None = None,
     out: torch.Tensor | None = None,
+    partial_tdm: bool = False,
 ) -> torch.Tensor:
     """Dispatch + combine for gfx1250 MXFP4-weight MoE with precomputed top-k.
 
@@ -2739,6 +2751,8 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         decode: Select the small-M decode kernel for both MoE projections.
         block_m: Optional row-tile override; unset values resolve per projection.
         out: Optional destination tensor for the finalized expert output.
+        partial_tdm: Fuse each projection's operand loads into one TDM
+            operation issued by half the warps.
 
     Returns:
         Tensor shaped ``(n_tokens, hidden_size)``.
@@ -2811,6 +2825,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         num_warps=4,
         num_buffers=3,
         decode=decode,
+        partial_tdm=partial_tdm,
     )
     intermediate_fp8 = _quantize_fp8_activation(
         intermediate,
@@ -2833,6 +2848,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         num_buffers=3,
         scale_load_mode="swizzle",
         decode=decode,
+        partial_tdm=partial_tdm,
     )
     return _weighted_topk_reduce_gfx1250(
         flat,
@@ -2887,12 +2903,23 @@ def gluon_mxfp_ragged_matmul(
         "pingpong",
         "num_warps",
         "decode",
+        "partial_tdm",
     }
     launch_kwargs = {k: extra_kwargs.pop(k) for k in list(extra_kwargs) if k in allowed}
+    launch_kwargs.setdefault("partial_tdm", False)
     combine_launch_kwargs = {
         k: v
         for k, v in launch_kwargs.items()
-        if k in {"block_m", "block_n", "block_k", "num_buffers", "num_warps", "decode"}
+        if k
+        in {
+            "block_m",
+            "block_n",
+            "block_k",
+            "num_buffers",
+            "num_warps",
+            "decode",
+            "partial_tdm",
+        }
     }
     unsupported = sorted(extra_kwargs)
     if unsupported:
@@ -2933,6 +2960,7 @@ def gluon_mxfp_ragged_matmul(
     )
     gather_tensor = _index_tensor(gather_indx, "src_indx")
     decode = bool(launch_kwargs.pop("decode", False))
+    partial_tdm = bool(launch_kwargs.pop("partial_tdm", False))
     m = int(x.shape[-2] if gather_tensor is None else gather_tensor.shape[0])
     num_experts = None if a_ragged_metadata is None else a_ragged_metadata.n_slices
     block_m = launch_kwargs.pop("block_m", None)
@@ -2952,6 +2980,7 @@ def gluon_mxfp_ragged_matmul(
         scale_preshuffle=scale_preshuffle,
         w_transpose=w_transpose,
         decode=decode,
+        partial_tdm=partial_tdm,
         **launch_kwargs,
     )
     return out
