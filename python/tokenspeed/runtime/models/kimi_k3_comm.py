@@ -33,10 +33,11 @@ All M thresholds for the K3 tail live here (single source of truth):
 decode fused tail       ``1 <= M <= latent-tail capacity``
                         (multicast tail, tp_ep spanning WORLD) — see
                         ``select_k3_moe_tail_tier``
-multimem AR window      ``MULTIMEM_AR_MIN_TOKENS..MAX`` (prefill)
+integrated medium      ``33 <= M <= 1024``: BT + fused RS/up/residual/AG
+integrated large       ``1025 <= M <= 8192``: HT + fused RS/up/residual/AG
 attention reduce        ``1 <= M <= ATTN_AR_MAX_TOKENS`` (tokenspeed
                         CuteDSL collective, attn TP group)
-fused-lane one-shot     everything else with a fused plan
+separate reduction     every forward not covered by the fused routes
 ======================  =========================================
 """
 
@@ -49,7 +50,6 @@ from enum import IntEnum
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.activation.triton import add3
-from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
 from tokenspeed_kernel.ops.communication.fabric import fabric_allocation_supported
 from tokenspeed_kernel.ops.communication.mnnvl_cutedsl_finalize import (
     MNNVLCuteDSLBTFinalizeTuning,
@@ -60,10 +60,7 @@ from tokenspeed_kernel.ops.communication.mnnvl_cutedsl_finalize import (
     mnnvl_cutedsl_ht_finalize_allreduce_rmsnorm_supported,
 )
 from tokenspeed_kernel.ops.communication.multimem import (
-    multimem_all_reduce_staged,
     multimem_available,
-    multimem_prealloc,
-    multimem_stage,
 )
 from tokenspeed_kernel.ops.moe.latent_tail import (
     KimiK3LatentTailOp,
@@ -75,10 +72,7 @@ from tokenspeed_kernel.ops.moe.latent_tail import (
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_ops import (
-    COMM_ONESHOT_MAX_BYTES,
-    acquire_all_reduce_outputs,
     all_reduce,
-    can_acquire_all_reduce_outputs,
     prepare_all_reduce_buffers,
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
@@ -89,7 +83,6 @@ from tokenspeed.runtime.execution.forward_step import (
 )
 from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.layers.layernorm import RMSNorm, _get_process_group
-from tokenspeed.runtime.layers.moe.latent import kimi3_join_reduce_moe
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
@@ -125,23 +118,11 @@ class K3MoETailTier(IntEnum):
     TAIL_FUSION = 0  # fused decode kernel (aka the multicast latent tail)
     FUSED_RS_UP_AG = 1  # integrated large M: HT + shared-RS/up-projection/AG
     MEDIUM_FUSED_RS_UP_AG = 2  # integrated medium M: BT + fused back half
-    MULTIMEM_AR = 3  # in-switch (ld_reduce) reduces, then the replicated tail
-    FUSED_LANE_AR = 4  # join tier: lane one-shot / cat+one-shot / grouped NCCL
-    SEPARATE_REDUCE = 5  # portable: reduce each partial on its own
+    SEPARATE_REDUCE = 3  # portable: reduce each partial on its own
 
 
-# Above plain decode-graph buckets: at decode sizes the two staged reduces
-# lose ~4% TPOT to the single fused-lane AR; the ld_reduce win is prefill's.
-# Caveat: spec-decode buckets reach bs*q tokens and can re-enter this window
-# in-graph (correct, but decode-suboptimal) — a follow-up should add an
-# is_decode axis rather than gate on the graph phase, which prefill graphs
-# legitimately share.
 # Measured profit edge of the fused tail; the kernel's own capacity is larger.
 TAIL_FUSION_MAX_TOKENS = 32
-
-MULTIMEM_AR_MIN_TOKENS = 256
-# Upper edge of the measured window; larger batches take the join's grouped path.
-MULTIMEM_AR_MAX_TOKENS = 8192
 
 # Continuous integrated intervals, shared by eager and graph execution.
 MNNVL_BT_MIN_TOKENS = 33
@@ -224,63 +205,23 @@ def select_k3_moe_tail_tier(
     num_tokens: int,
     graph_phase: bool,
     tail_fusion_max_tokens: int,
-    fused_moe_ar: bool,
-    multimem_ok: bool,
-    is_decode: bool,
-    join_moe_reduce: bool,
 ) -> K3MoETailTier:
-    """Pick the tail tier; every input must be rank-uniform.
+    """Select the small graph tail or the portable separate-reduce path.
 
     Args:
-        num_tokens: Tokens in this forward (identical on every rank).
+        num_tokens: Rank-uniform token count for this forward.
         graph_phase: Whether the forward runs under the CUDA-graph phase.
-        tail_fusion_max_tokens: Largest token count the fused tail is both
-            able and worth running at, 0 when absent.
-        fused_moe_ar: Whether the fused-AR execution plan is armed (implies a
-            backend-owned lane, so TRT-LLM only).
-        join_moe_reduce: Whether the routed and shared partials can be reduced
-            together without a lane, via a concatenated one-shot or a grouped
-            all-reduce. Portable, so this is what lets non-TRT-LLM backends
-            reach the join tier.
-        multimem_ok: Collectively-agreed multimem availability.
-        is_decode: Whether this forward is a decode (spec-verify included);
-            rank-uniform and stable between graph capture and replay.
+        tail_fusion_max_tokens: Available small-tail capacity, already capped
+            at the profitable token range; zero when unavailable.
 
     Returns:
-        The best applicable ``K3MoETailTier``.
+        TAIL_FUSION for a supported small graph forward, otherwise
+        SEPARATE_REDUCE. The integrated medium/large route is selected first
+        by K3MoeTailComm.plan.
     """
-    # Tested first, so a fused-tail capacity that ever reached into the
-    # multimem window would still resolve here rather than overlap.
     if graph_phase and 1 <= num_tokens <= tail_fusion_max_tokens:
         return K3MoETailTier.TAIL_FUSION
-    if not fused_moe_ar:
-        # No lane, but the join only needs a concatenated or grouped
-        # all-reduce. Taking it halves the tail's collectives -- SEPARATE_REDUCE
-        # reduces the routed and shared partials over the same group one after
-        # the other -- and each collective is a rendezvous whose cost does not
-        # amortize with batch, so the saving is largest at low concurrency.
-        #
-        # SEPARATE_REDUCE stays the fallback for layouts that cannot join,
-        # which includes a sharded up projection: its tail folds the projection
-        # between two sequential all-reduces instead of calling
-        # kimi3_join_reduce_moe, so it would save no collective while still
-        # giving up the routed_in_fork overlap.
-        #
-        # MULTIMEM_AR is deliberately still not reachable here. It already
-        # required fused_moe_ar before this join existed, so promoting
-        # lane-less backends into the multimem window would be a separate
-        # behavioural change rather than part of this one.
-        if join_moe_reduce:
-            return K3MoETailTier.FUSED_LANE_AR
-        return K3MoETailTier.SEPARATE_REDUCE
-    if (
-        multimem_ok
-        # Decode buckets skip multimem: same bytes, but it leaves the GPU idle there.
-        and not is_decode
-        and MULTIMEM_AR_MIN_TOKENS <= num_tokens <= MULTIMEM_AR_MAX_TOKENS
-    ):
-        return K3MoETailTier.MULTIMEM_AR
-    return K3MoETailTier.FUSED_LANE_AR
+    return K3MoETailTier.SEPARATE_REDUCE
 
 
 def prepare_k3_all_reduce_buffers(
@@ -547,7 +488,6 @@ class K3MoeTailCommState:
         self.allow_latent_tail = allow_latent_tail
         # Derived from model/backend traits by K3MoeTailComm, never an opt-in.
         self.integrated_tail = integrated_tail
-        self.multimem_ar_ok = False
         self.mnnvl_bt_deferred = None
         self.mnnvl_ht_deferred = None
         self.fused_rs_up_ag_workspace = None
@@ -566,13 +506,12 @@ class K3MoeTailCommState:
         # --- local probes (pure local; failures just vote False) ---
         # All ranks must agree on eligibility before any collective
         # allocator runs.
-        multimem_local = (
-            mapping.moe.tp_ep_size > 1
+        integrated_comm_local = (
+            self.integrated_tail
+            and mapping.moe.tp_ep_size > 1
             and mapping.moe.tp_ep_size == world
             and mapping.attn.dp_size == 1
             and mapping.attn.cp_size == 1
-            # Equal widths would alias the two per-width staging buffers.
-            and latent != hidden
             and multimem_available()
             # Cross-node symmetric-memory rendezvous requires fabric/IMEX.
             and (
@@ -582,7 +521,7 @@ class K3MoeTailCommState:
         )
         mnnvl_bt_local = (
             self.integrated_tail
-            and multimem_local
+            and integrated_comm_local
             and mnnvl_cutedsl_finalize_allreduce_rmsnorm_supported(
                 group=dist.group.WORLD,
                 tp_size=mapping.moe.tp_ep_size,
@@ -595,7 +534,7 @@ class K3MoeTailCommState:
         )
         mnnvl_ht_local = (
             self.integrated_tail
-            and multimem_local
+            and integrated_comm_local
             and mnnvl_cutedsl_ht_finalize_allreduce_rmsnorm_supported(
                 group=dist.group.WORLD,
                 tp_size=mapping.moe.tp_ep_size,
@@ -639,7 +578,7 @@ class K3MoeTailCommState:
         # --- the single agreement point: every rank executes unconditionally ---
         votes = torch.tensor(
             [
-                int(multimem_local),
+                int(integrated_comm_local),
                 int(tail_local),
                 int(mnnvl_bt_local),
                 int(mnnvl_ht_local),
@@ -659,25 +598,20 @@ class K3MoeTailCommState:
                 "K3 tail capabilities must agree across ranks; the automatic "
                 "integrated BT/HT path requires PDL"
             )
-        multimem_ok, tail_ok, mnnvl_bt_ok, mnnvl_ht_ok, fused_ok = (
+        integrated_comm_ok, tail_ok, mnnvl_bt_ok, mnnvl_ht_ok, fused_ok = (
             bool(v) for v in values[:5]
         )
         if self.integrated_tail and not all(
-            (multimem_ok, tail_ok, mnnvl_bt_ok, mnnvl_ht_ok, fused_ok)
+            (integrated_comm_ok, tail_ok, mnnvl_bt_ok, mnnvl_ht_ok, fused_ok)
         ):
             raise RuntimeError(
                 "integrated K3 tail requires every TP8 capability; no fallback"
             )
 
         # --- collective builds, fixed order, unguarded ---
-        if multimem_ok:
-            # Collective buffers must reach peak size before serving.
-            self.multimem_ar_ok = multimem_prealloc(
-                MULTIMEM_AR_MAX_TOKENS,
-                (latent, hidden),
-                dist.group.WORLD.group_name,
-            )
-        if mnnvl_bt_ok and self.multimem_ar_ok:
+        # BT/HT and the fused tail own their buffers. No staged AR buffers
+        # are needed; only the multicast/fabric capability probe is shared.
+        if mnnvl_bt_ok and integrated_comm_ok:
             self.mnnvl_bt_deferred = MNNVLCuteDSLFinalizeAllReduceRMSNorm.initialize(
                 group=dist.group.WORLD,
                 hidden_size=latent,
@@ -697,7 +631,7 @@ class K3MoeTailCommState:
                     ),
                 ),
             )
-        if fused_ok and self.multimem_ar_ok:
+        if fused_ok and integrated_comm_ok:
             from tokenspeed_kernel.ops.communication.fused_rs_workspace import (
                 SharedRsWorkspace,
             )
@@ -733,7 +667,7 @@ class K3MoeTailCommState:
             self.fused_rs_up_ag_capacity = fused_capacity
         self.latent_tail_ok = tail_ok
         logger.info(
-            f"K3 comm negotiated: multimem={self.multimem_ar_ok!s} "
+            f"K3 comm negotiated: integrated_comm={integrated_comm_ok!s} "
             f"mnnvl_bt_deferred={self.mnnvl_bt_deferred is not None!s} "
             f"mnnvl_ht_deferred={self.mnnvl_ht_deferred is not None!s} "
             f"fused_rs_up_ag_capacity={self.fused_rs_up_ag_capacity:d} "
@@ -907,14 +841,9 @@ class TailPlan:
             ``do_finalize=False`` (the tail owns finalize). Set for
             TAIL_FUSION when the multicast tail was armed to inline
             finalize (trtllm fused-AR deployments).
-        lane: Pre-materialized fused-lane buffer, or None; when set the
-            experts kernel writes its routed partial into
-            ``lane[:, :routed_hidden]`` and the shared experts into the rest.
-        symm_outputs: Producer-direct (routed, shared) views of symmetric
-            memory, or None. When set the producers write into these and the
-            tail consumes them in place; ``lane`` is None in that case.
-            The routed view is None for deferred-finalize complete fusion:
-            only the shared producer writes a materialized partial.
+        symm_outputs: Producer-direct destinations for integrated fusion,
+            or None. The pair is (None, shared): only the shared producer
+            writes a materialized partial; routed experts defer finalize.
         routed_in_fork: Whether the routed partial must be reduced and
             projected inside the fork (SEPARATE_REDUCE overlap).
         split_shared_rs: Start the shared ReduceScatter on the auxiliary
@@ -923,7 +852,6 @@ class TailPlan:
 
     tier: "K3MoETailTier"
     defer_finalize: bool = False
-    lane: torch.Tensor | None = None
     symm_outputs: tuple[torch.Tensor | None, torch.Tensor] | None = None
     routed_in_fork: bool = False
     split_shared_rs: bool = False
@@ -946,83 +874,6 @@ def _tail_finalize_top_k(
     if execution_plan.fused_moe_ar and experts_supports_deferred_finalize:
         return top_k
     return None
-
-
-# One buffer per (rows, width, dtype, device). A captured graph holds the
-# pointer, so a later token count must not replace an earlier buffer.
-_PACKED_MOE_JOIN_LANES: dict[tuple, torch.Tensor] = {}
-# Matches the CDNA5 dense WMMA row ceiling. Past this the shared down
-# projection cannot store a row-strided destination.
-_PACKED_MOE_JOIN_MAX_ROWS = 32
-
-
-def _packed_moe_join_lane(
-    like: torch.Tensor,
-    width: int,
-    *,
-    enabled: bool,
-) -> torch.Tensor | None:
-    """Persistent packed join buffer for CDNA5 decode with more than one token.
-
-    Batch 1 stays on ``allreduce_fusion_lane``. Both partials then land in one
-    ``[rows, routed + hidden]`` tensor and the join does not launch a copy.
-    gfx950's shared down projection cannot store a row-strided destination,
-    so this lane stays off there and the cat remains.
-    """
-
-    rows = int(like.shape[0]) if like.ndim == 2 else 0
-    if (
-        not enabled
-        or rows <= 1
-        or rows > _PACKED_MOE_JOIN_MAX_ROWS
-        or width <= 0
-        or not current_platform().is_cdna5
-    ):
-        return None
-    if rows * width * like.element_size() > COMM_ONESHOT_MAX_BYTES:
-        return None
-    key = (rows, width, like.dtype, like.device)
-    lane = _PACKED_MOE_JOIN_LANES.get(key)
-    if lane is not None:
-        return lane
-    if torch.cuda.is_current_stream_capturing():
-        return None
-    lane = like.new_zeros((rows, width))
-    _PACKED_MOE_JOIN_LANES[key] = lane
-    return lane
-
-
-def _acquire_symm_join_outputs(
-    *, mapping, routed_hidden: int, hidden_size: int, like, enabled: bool
-):
-    """Acquire the routed/shared pair from symmetric memory, or None.
-
-    Returns two consecutive views of the Iris input buffer -- not fresh
-    allocations -- so the producers write where the reduction already reads and
-    the pointers stay put across graph capture.
-
-    The pair matters, not just the memory: ``AutoBackend.all_reduce`` only
-    consults ``can_reduce_outputs`` on its tuple branch, so a single
-    concatenated operand can never reach the symmetric kernel however it was
-    allocated. ``latent_moe_expert_shared_all_reduce`` uses this pair on AMD
-    for both TP/TP and TP/EP mappings; the collective group is MoE TP x EP.
-
-    Collective in the same sense the acquire is: every rank of the MoE TP x EP
-    group reaches this with rank-uniform shapes, so none can disagree about
-    whether the pair exists.
-    """
-    if not enabled or mapping.moe.tp_ep_size <= 1 or like is None:
-        return None
-    if like.ndim != 2:
-        return None
-    num_tokens = like.shape[0]
-    if num_tokens <= 0:
-        return None
-    shapes = ((num_tokens, routed_hidden), (num_tokens, hidden_size))
-    group = mapping.moe.tp_ep_group
-    if not can_acquire_all_reduce_outputs(shapes, like, group):
-        return None
-    return acquire_all_reduce_outputs(shapes, like, group)
 
 
 class K3MoeTailComm:
@@ -1145,9 +996,6 @@ class K3MoeTailComm:
     def plan(
         self,
         num_tokens: int,
-        hidden_states: torch.Tensor,
-        *,
-        is_decode: bool = False,
     ) -> TailPlan:
         """Pick the tail tier and its forward-side obligations.
 
@@ -1176,7 +1024,7 @@ class K3MoeTailComm:
                     defer_finalize=True,
                     symm_outputs=(None, self.fused_rs_up_ag.input_view(num_tokens)),
                 )
-        # Only small M or unsupported model/backend layouts reach legacy dispatch.
+        # Only small M or unsupported model/backend layouts reach compatibility dispatch.
         # Supported M33..8192 returned above; a missing fused route raises.
         # Graph warmup, capture, and replay must select the same tier.
         tier = select_k3_moe_tail_tier(
@@ -1187,10 +1035,6 @@ class K3MoeTailComm:
                 if self.latent_tail is not None
                 else 0
             ),
-            fused_moe_ar=self.execution_plan.fused_moe_ar,
-            join_moe_reduce=self.execution_plan.join_moe_reduce,
-            multimem_ok=self.state.multimem_ar_ok,
-            is_decode=is_decode,
         )
         if tier is K3MoETailTier.TAIL_FUSION:
             # Full fusion: with the trtllm fused-AR plan armed and a
@@ -1212,42 +1056,8 @@ class K3MoeTailComm:
                     and get_is_capture_mode()
                 ),
             )
-        # Shard mode splits the joined reduction, so it cannot use the packed lane.
-        lane_enabled = (
-            tier is K3MoETailTier.FUSED_LANE_AR and not self._shard_up_projection
-        )
-        # Preferred: the producers write straight into symmetric memory and the
-        # join reduces them there. Falls back to the packed lane, which holds
-        # ordinary memory the collective has to stage first.
-        symm_outputs = _acquire_symm_join_outputs(
-            mapping=self.mapping,
-            routed_hidden=self.routed_hidden,
-            hidden_size=self.hidden_size,
-            like=hidden_states,
-            enabled=lane_enabled,
-        )
-        lane = (
-            None
-            if symm_outputs is not None
-            else allreduce_fusion_lane(
-                hidden_states,
-                self.routed_hidden + self.hidden_size,
-                enabled=lane_enabled,
-            )
-        )
-        # Batch 1 already has the one-row fusion lane. CDNA5 decode past that
-        # still cats the two partials on every MoE layer; both producers can
-        # store into one row-strided buffer, so keep a lane per token count.
-        if lane is None and symm_outputs is None:
-            lane = _packed_moe_join_lane(
-                hidden_states,
-                self.routed_hidden + self.hidden_size,
-                enabled=lane_enabled,
-            )
         return TailPlan(
             tier=tier,
-            lane=lane,
-            symm_outputs=symm_outputs,
             routed_in_fork=tier is K3MoETailTier.SEPARATE_REDUCE,
         )
 
@@ -1345,20 +1155,6 @@ class K3MoeTailComm:
                 prefix_sum,
                 prepared_shared_shard,
             )
-        if tier is K3MoETailTier.MULTIMEM_AR:
-            return self._tail_multimem_ar(
-                routed_out, shared_partial, prefix_sum, num_tokens, hidden_size
-            )
-        if tier is K3MoETailTier.FUSED_LANE_AR:
-            return self._tail_fused_lane_ar(
-                routed_out,
-                shared_partial,
-                prefix_sum,
-                plan.lane,
-                plan.symm_outputs,
-                num_tokens,
-                hidden_size,
-            )
         return self._tail_separate_reduce(
             routed_out, shared_partial, prefix_sum, num_tokens, hidden_size
         )
@@ -1402,118 +1198,6 @@ class K3MoeTailComm:
             prepared_shared_shard=prepared_shared_shard,
         )
 
-    def _tail_multimem_ar(
-        self,
-        routed_out: torch.Tensor,
-        shared_partial: torch.Tensor,
-        prefix_sum: torch.Tensor,
-        num_tokens: int,
-        hidden_size: int,
-    ) -> torch.Tensor:
-        if self._shard_up_projection:
-            return self._tail_multimem_ar_sharded(
-                routed_out, shared_partial, prefix_sum, num_tokens, hidden_size
-            )
-        return self._tail_multimem_ar_replicated(
-            routed_out, shared_partial, prefix_sum, num_tokens, hidden_size
-        )
-
-    def _tail_multimem_ar_sharded(
-        self,
-        routed_out: torch.Tensor,
-        shared_partial: torch.Tensor,
-        prefix_sum: torch.Tensor,
-        num_tokens: int,
-        hidden_size: int,
-    ) -> torch.Tensor:
-        # Eligibility guarantees tp_ep spans WORLD for these symmetric reductions.
-        group_name = dist.group.WORLD.group_name
-        routed_stage = multimem_stage(routed_out, group_name, MULTIMEM_AR_MAX_TOKENS)
-        shared_stage = (
-            multimem_stage(shared_partial, group_name, MULTIMEM_AR_MAX_TOKENS)
-            if routed_stage is not None
-            else None
-        )
-        # Eligibility guarantees both stages exist; a miss is a contract violation.
-        if routed_stage is None or shared_stage is None:
-            raise RuntimeError(
-                "multimem staging failed after the tier was selected; the "
-                "init-time capability vote and the runtime shapes disagree"
-            )
-        routed_reduced = multimem_all_reduce_staged(routed_stage, group_name)
-        # Disjoint projection shards concatenate when injected into the shared sum.
-        routed_reduced = (
-            self.routed_norm(routed_reduced)
-            if self.routed_norm is not None
-            else routed_reduced
-        )
-        start, width = self.up_proj.shard_slice
-        target = shared_stage[:, start : start + width]
-        target += prefix_sum.view(num_tokens, hidden_size).narrow(-1, start, width)
-        target.addmm_(routed_reduced, self.up_proj.weight.t())
-        shared_reduced = multimem_all_reduce_staged(shared_stage, group_name)
-        # Clone: the staging buffer is recycled by the next layer's stage copy.
-        return shared_reduced.view(num_tokens, hidden_size).clone()
-
-    def _tail_multimem_ar_replicated(
-        self,
-        routed_out: torch.Tensor,
-        shared_partial: torch.Tensor,
-        prefix_sum: torch.Tensor,
-        num_tokens: int,
-        hidden_size: int,
-    ) -> torch.Tensor:
-        # Eligibility guarantees tp_ep spans WORLD for these symmetric reductions.
-        group_name = dist.group.WORLD.group_name
-        routed_stage = multimem_stage(routed_out, group_name, MULTIMEM_AR_MAX_TOKENS)
-        shared_stage = (
-            multimem_stage(shared_partial, group_name, MULTIMEM_AR_MAX_TOKENS)
-            if routed_stage is not None
-            else None
-        )
-        # Eligibility guarantees both stages exist; a miss is a contract violation.
-        if routed_stage is None or shared_stage is None:
-            raise RuntimeError(
-                "multimem staging failed after the tier was selected; the "
-                "init-time capability vote and the runtime shapes disagree"
-            )
-        routed_reduced = multimem_all_reduce_staged(routed_stage, group_name)
-        shared_reduced = multimem_all_reduce_staged(shared_stage, group_name)
-        if self.routed_norm is not None:
-            routed_reduced = self.routed_norm(routed_reduced)
-        return self._projection_tail(
-            routed_reduced, shared_reduced, prefix_sum, num_tokens, hidden_size
-        )
-
-    def _projection_tail(
-        self,
-        routed_reduced: torch.Tensor,
-        shared_reduced: torch.Tensor,
-        prefix_sum: torch.Tensor,
-        num_tokens: int,
-        hidden_size: int,
-    ) -> torch.Tensor:
-        return self.up_proj.forward_add3(
-            routed_reduced,
-            prefix_sum,
-            shared_reduced,
-        ).view(num_tokens, hidden_size)
-
-    def _project_and_inject_local_block(
-        self,
-        routed_reduced: torch.Tensor,
-        shared_partial: torch.Tensor,
-        prefix_sum: torch.Tensor,
-        num_tokens: int,
-        hidden_size: int,
-    ) -> torch.Tensor:
-        start, width = self.up_proj.shard_slice
-        shared_partial = shared_partial.view(num_tokens, hidden_size)
-        target = shared_partial[:, start : start + width]
-        target += prefix_sum.view(num_tokens, hidden_size)[:, start : start + width]
-        target.addmm_(routed_reduced, self.up_proj.weight.t())
-        return shared_partial
-
     def _inject_local_block(
         self,
         routed_projected_shard: torch.Tensor,
@@ -1538,72 +1222,6 @@ class K3MoeTailComm:
             -1, start, width
         )
         return shared_partial
-
-    def _tail_fused_lane_ar(
-        self,
-        routed_out: torch.Tensor,
-        shared_partial: torch.Tensor,
-        prefix_sum: torch.Tensor,
-        lane: torch.Tensor | None,
-        symm_outputs: tuple[torch.Tensor, torch.Tensor] | None,
-        num_tokens: int,
-        hidden_size: int,
-    ) -> torch.Tensor:
-        if self._shard_up_projection:
-            return self._tail_fused_lane_ar_sharded(
-                routed_out, shared_partial, prefix_sum, num_tokens, hidden_size
-            )
-        return self._tail_fused_lane_ar_replicated(
-            routed_out,
-            shared_partial,
-            prefix_sum,
-            lane,
-            symm_outputs,
-            num_tokens,
-            hidden_size,
-        )
-
-    def _tail_fused_lane_ar_sharded(
-        self,
-        routed_out: torch.Tensor,
-        shared_partial: torch.Tensor,
-        prefix_sum: torch.Tensor,
-        num_tokens: int,
-        hidden_size: int,
-    ) -> torch.Tensor:
-        # Sharded projection folds into the shared reduction; the packed lane is disabled here.
-        routed_reduced = all_reduce(routed_out, self.mapping.moe.tp_ep_group)
-        if self.routed_norm is not None:
-            routed_reduced = self.routed_norm(routed_reduced)
-        shared_partial = self._project_and_inject_local_block(
-            routed_reduced, shared_partial, prefix_sum, num_tokens, hidden_size
-        )
-        return all_reduce(shared_partial, self.mapping.moe.tp_ep_group)
-
-    def _tail_fused_lane_ar_replicated(
-        self,
-        routed_out: torch.Tensor,
-        shared_partial: torch.Tensor,
-        prefix_sum: torch.Tensor,
-        lane: torch.Tensor | None,
-        symm_outputs: tuple[torch.Tensor, torch.Tensor] | None,
-        num_tokens: int,
-        hidden_size: int,
-    ) -> torch.Tensor:
-        routed_reduced, shared_reduced = kimi3_join_reduce_moe(
-            routed_out,
-            shared_partial,
-            lane=lane,
-            symm_outputs=symm_outputs,
-            routed_hidden=self.routed_hidden,
-            routed_norm=self.routed_norm,
-            group=self.mapping.moe.tp_ep_group,
-            enable_lane_norm=self.execution_plan.lane_latent_norm_ar,
-            max_token_num=self.execution_plan.comm_fusion_max_num_tokens,
-        )
-        return self._projection_tail(
-            routed_reduced, shared_reduced, prefix_sum, num_tokens, hidden_size
-        )
 
     def _tail_separate_reduce(
         self,
@@ -1664,8 +1282,6 @@ __all__ = [
     "K3MoETailTier",
     "K3MoeTailComm",
     "K3MoeTailCommState",
-    "MULTIMEM_AR_MAX_TOKENS",
-    "MULTIMEM_AR_MIN_TOKENS",
     "TailPlan",
     "select_k3_moe_tail_tier",
 ]

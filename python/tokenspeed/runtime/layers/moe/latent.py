@@ -340,11 +340,10 @@ class Kimi3MoEExecutionPlan:
         # tail can issue one collective per MoE layer instead of two wherever a
         # TP x EP group exists -- not only where TRT-LLM can arm a lane.
         #
-        # Excluded when the up projection is sharded: that tail folds the
-        # projection between two sequential all-reduces
-        # (_tail_fused_lane_ar_sharded) rather than calling the join, so the
-        # collective count is unchanged, while leaving SEPARATE_REDUCE would
-        # also give up the routed_in_fork overlap with the shared branch.
+        # A sharded up projection separates the two reductions, so it cannot
+        # use the joined-partial operation. K3 serving now selects fused tails
+        # or SEPARATE_REDUCE; these generic join capabilities do not select a
+        # serving route.
         join_moe_reduce = mapping.moe.has_tp_ep and not shard_up_projection
         return replace(
             self,

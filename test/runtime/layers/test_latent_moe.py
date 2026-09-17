@@ -947,10 +947,9 @@ def test_join_is_available_without_a_trtllm_lane() -> None:
 def test_sharded_up_projection_does_not_advertise_the_join() -> None:
     """A sharded up projection cannot use the join, so it must not claim it.
 
-    _tail_fused_lane_ar_sharded folds the projection between two sequential
-    all-reduces rather than calling kimi3_join_reduce_moe: selecting the join
-    tier there would save no collective while also dropping routed_in_fork,
-    which overlaps the routed reduction with the shared branch.
+    Sharded projection belongs between the two sequential reductions, so its
+    generic execution plan must not advertise a joined-partial operation.
+    K3 serving dispatch is covered separately by the tail-selector tests.
     """
     prepared = _plan_for_join(shard_up_projection=True)
     assert not prepared.join_moe_reduce

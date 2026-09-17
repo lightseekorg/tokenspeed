@@ -2226,19 +2226,11 @@ class KimiLinearMoE(nn.Module):
 
         routing_output_format = self._routing_output_format(ctx)
         precompute_topk = routing_output_format.is_standard()
-        plan = self.comm.plan(
-            num_tokens,
-            hidden_states,
-            is_decode=ctx is not None and ctx.forward_mode.is_decode(),
-        )
-        # Producer-direct destinations for the routed and shared partials. The
-        # symmetric pair is preferred (the tail reduces it in place); the packed
-        # lane is the fallback, and its two halves are slices of one buffer.
+        plan = self.comm.plan(num_tokens)
+        # Integrated fusion consumes shared output directly from symmetric
+        # storage; all other routes use ordinary producer outputs.
         if plan.symm_outputs is not None:
             routed_out_buf, shared_out_buf = plan.symm_outputs
-        elif plan.lane is not None:
-            routed_out_buf = plan.lane[:, : self.routed_hidden]
-            shared_out_buf = plan.lane[:, self.routed_hidden :]
         else:
             routed_out_buf = shared_out_buf = None
         self.experts._situ_output_buffer = routed_out_buf

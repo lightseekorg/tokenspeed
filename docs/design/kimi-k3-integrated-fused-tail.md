@@ -5,8 +5,10 @@ K3's TP8/EP1, attention DP1/CP1, H7168/latent3584/top16 layout, routed RMSNorm,
 sharded up-projection and a deferred-finalize-capable fused-AR expert backend.
 No environment switch enables or disables it. Intermediate first-stage-only
 and medium-only routes, discrete bucket policies and their serving adapters
-are removed. Only the integrated path and main's original compatibility paths
-remain. Old experimental environment variables are no longer read.
+are removed. Only four routes remain: the small fused tail, integrated medium
+and large tails, and separate reduction. The former staged multimem-AR and
+fused-lane/join tail routes are removed. Old experimental environment variables
+are no longer read.
 
 The kernel configuration has a completed single-pair serving measurement,
 not replicated performance or full-model numerical qualification. Removing
@@ -15,7 +17,8 @@ use an unchanged main checkout, not a baseline mode inside this implementation.
 
 | Kernel M | First stage | Second stage |
 | --- | --- | --- |
-| 0..32 | Existing empty/small route | Existing empty/small route |
+| 0 | Existing empty forward | Existing empty forward |
+| 1..32 | Small fused tail in graph phase; separate otherwise | Same small/separate route |
 | 33..1024 | Deferred BT finalize/AR/RMSNorm | Fused RS/up/residual/AG |
 | 1025..8192 | Deferred HT finalize/AR/RMSNorm, ten stages | Fused RS/up/residual/AG |
 | Above 8192 | Existing separate path | Existing separate path |
@@ -27,8 +30,14 @@ No optimized-range fallback is permitted after integrated initialization.
 Capability disagreement fails before collective allocation; missing in-range
 plans fail rather than switching to an AllReduce control. Required communication
 support, dependencies and PDL must be available once the layout is selected;
-failure is not an opt-out. Unsupported hardware/model/backend layouts retain
-the existing compatibility dispatch.
+failure is not an opt-out. Unsupported hardware/model/backend layouts use the
+small graph tail where available, otherwise separate reduction. Small eager
+forwards also use separate reduction. Its plan reduces, normalizes and projects
+the routed branch inside the existing stream-fork scope before completing the
+shared branch and residual. It does not consume unreduced routed partials as
+though they were already projected. Removing the old fast paths changes these
+fallbacks' performance and BF16 rounding; this cleanup has no new performance
+or numerical qualification for those configurations.
 
 Both comparison arms explicitly set `--prefill-graph-max-tokens 8192`. The
 original agentic benchmark does not mandate 2048: it omits the option and
@@ -65,6 +74,13 @@ reports 51.00 GiB KV per GPU versus 51.58 GiB for same-run main, compared with
 40.97 GiB in the historical per-layer candidate.
 The original two-batch campaign uses the old per-layer allocation and does not
 qualify this revised ownership policy.
+
+The removed staged AllReduce route no longer reserves its [8192,3584] and
+[8192,7168] BF16 buffers (168 MiB of tensor payload per rank). BT/HT and fused
+shared-RS retain their own allocations and multicast/fabric capability checks;
+they do not depend on those staging buffers. This is an allocation change, not
+a remeasured KV-capacity or serving-performance result. Generic communication
+primitives and the small-tail capability setup remain available.
 
 The previous layer's output can remain the current residual, so one output
 would be unsafe. Two outputs keep it distinct from the current destination;
@@ -170,7 +186,10 @@ continuous-range binder, with unchanged fused device code and output pooling.
 BT/HT first-stage kernels remain dependencies of this integrated route, but the
 first-stage-only routes and their old AllReduce back half are removed. Their
 prefill-only graph-phase marker is removed too; the execution framework matches
-main again. Main's small, multimem, fused-lane and separate paths are retained.
+main again. Main's small and separate paths are retained; its multimem-AR and
+fused-lane/join tail methods, producer-lane field and staging allocations are
+removed. The fused kernels' multimem instructions, barriers and launch tuning
+are unchanged.
 The large-M correctness harness now checks that integrated adapter against the
 same-profile fixed-input binding and the unchanged independent addmm/AllReduce
 reference; M4096/M8192 remain test cases, not a dispatch whitelist.

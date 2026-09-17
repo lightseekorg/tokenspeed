@@ -512,26 +512,24 @@ def test_automatic_plan_bypasses_legacy_tail(runtime_policy, m, tier):
         fused_rs_up_ag=SimpleNamespace(input_view=lambda tokens: raw),
         _experts_supports_deferred_finalize=True,
     )
-    result = namespace["plan"](owner, m, None, is_decode=False)
+    result = namespace["plan"](owner, m)
     assert result.tier is getattr(namespace["K3MoETailTier"], tier)
     if m <= 8192:
         assert result.defer_finalize
         assert result.symm_outputs == (None, raw)
         owner.fused_rs_up_ag = None
         with pytest.raises(RuntimeError, match="missing"):
-            namespace["plan"](owner, m, None, is_decode=False)
+            namespace["plan"](owner, m)
     else:
         assert result.routed_in_fork
 
 
-def test_only_integrated_and_main_tiers_remain(runtime_policy):
+def test_only_small_integrated_and_separate_tiers_remain(runtime_policy):
     namespace, _ = runtime_policy
     assert set(namespace["K3MoETailTier"].__members__) == {
         "TAIL_FUSION",
         "MEDIUM_FUSED_RS_UP_AG",
         "FUSED_RS_UP_AG",
-        "MULTIMEM_AR",
-        "FUSED_LANE_AR",
         "SEPARATE_REDUCE",
     }
 

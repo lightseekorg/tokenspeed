@@ -96,15 +96,13 @@ def _make_moe(fork: _SpyFork) -> SimpleNamespace:
     hidden = torch.zeros(2, 4)
 
     plan = SimpleNamespace(
-        lane=None,
         symm_outputs=None,
         split_shared_rs=False,
         routed_in_fork=False,
         defer_finalize=False,
     )
     comm = SimpleNamespace(
-        # Absorb keyword axes so the stub does not pin plan's signature.
-        plan=lambda num_tokens, hs, **_: plan,
+        plan=lambda num_tokens: plan,
         run=lambda *a, **k: hidden,
         reduce_scatter_shared=lambda x: x,
         reduce_project_routed=lambda x: x,

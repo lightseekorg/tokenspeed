@@ -18,119 +18,75 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Truth table for the K3 MoE tail tier selector."""
+"""Truth table for the K3 small-tail and separate-reduce selector."""
+
+from types import SimpleNamespace
 
 import pytest
 
 from tokenspeed.runtime.models.kimi_k3_comm import (
+    K3MoeTailComm,
     K3MoETailTier,
     select_k3_moe_tail_tier,
 )
 
 
 def _select(**overrides):
-    base = dict(
+    args = dict(
         num_tokens=1024,
         graph_phase=False,
-        tail_fusion_max_tokens=16,
-        fused_moe_ar=True,
-        multimem_ok=True,
+        tail_fusion_max_tokens=32,
     )
-    base.update(overrides)
-    return select_k3_moe_tail_tier(**base)
+    args.update(overrides)
+    return select_k3_moe_tail_tier(**args)
 
 
-@pytest.mark.parametrize("m", [1, 8, 16])
-def test_decode_graph_range_uses_fused_tail(m):
+@pytest.mark.parametrize("m", [1, 8, 16, 32])
+def test_small_graph_range_uses_fused_tail(m):
     assert _select(num_tokens=m, graph_phase=True) is K3MoETailTier.TAIL_FUSION
 
 
-def test_fused_tail_needs_graph_phase_and_capacity():
-    assert _select(num_tokens=8, graph_phase=False) is K3MoETailTier.FUSED_LANE_AR
+@pytest.mark.parametrize("m", [1, 8, 16, 32, 64, 256, 1024, 8192, 16384])
+def test_eager_compatibility_path_uses_separate_reduce(m):
+    assert _select(num_tokens=m) is K3MoETailTier.SEPARATE_REDUCE
+
+
+@pytest.mark.parametrize("m", [0, 64, 256, 1024, 8192, 16384])
+def test_outside_small_graph_capacity_uses_separate_reduce(m):
+    assert _select(num_tokens=m, graph_phase=True) is K3MoETailTier.SEPARATE_REDUCE
+
+
+def test_missing_small_tail_uses_separate_reduce():
     assert (
         _select(num_tokens=8, graph_phase=True, tail_fusion_max_tokens=0)
-        is K3MoETailTier.FUSED_LANE_AR
-    )
-
-
-def test_no_fused_ar_selects_separate_reduce_outside_the_fused_tail():
-    for m in (1, 17, 2048, 8192):
-        assert (
-            _select(num_tokens=m, fused_moe_ar=False) is K3MoETailTier.SEPARATE_REDUCE
-        )
-
-
-@pytest.mark.parametrize("m", [256, 1024, 2047, 2048, 8192])
-def test_multimem_ar_covers_the_measured_window(m):
-    assert _select(num_tokens=m) is K3MoETailTier.MULTIMEM_AR
-
-
-def test_multimem_ar_upper_bound_hands_off_to_the_join():
-    assert _select(num_tokens=8192) is K3MoETailTier.MULTIMEM_AR
-    assert _select(num_tokens=8193) is K3MoETailTier.FUSED_LANE_AR
-
-
-def test_fused_tail_wins_even_without_fused_ar():
-    assert (
-        _select(num_tokens=8, graph_phase=True, fused_moe_ar=False)
-        is K3MoETailTier.TAIL_FUSION
-    )
-
-
-def test_graph_phase_without_multimem_lands_on_fused_lane():
-    assert (
-        _select(num_tokens=512, graph_phase=True, multimem_ok=False)
-        is K3MoETailTier.FUSED_LANE_AR
-    )
-
-
-def test_multimem_lower_bound_excludes_decode_bucket_sizes():
-    for m in (16, 17, 32, 160, 255):
-        assert _select(num_tokens=m) is K3MoETailTier.FUSED_LANE_AR
-    assert _select(num_tokens=256) is K3MoETailTier.MULTIMEM_AR
-
-
-@pytest.mark.parametrize("m", [256, 2047, 2048, 8192])
-def test_fused_lane_fallback_without_multimem(m):
-    assert _select(num_tokens=m, multimem_ok=False) is K3MoETailTier.FUSED_LANE_AR
-
-
-def test_graph_phase_above_fused_capacity_still_tiers_by_tokens():
-    assert _select(num_tokens=512, graph_phase=True) is K3MoETailTier.MULTIMEM_AR
-
-
-def test_join_without_a_lane_reaches_the_join_tier():
-    """No TRT-LLM lane, but the join itself needs no lane.
-
-    ``fused_moe_ar`` implies a backend-owned lane and is TRT-LLM only, so on
-    every other backend it is False and the tail used to fall all the way to
-    SEPARATE_REDUCE -- two collectives per MoE layer over the same group.
-    ``kimi3_join_reduce_moe`` handles ``lane=None`` with a concatenated
-    one-shot or a grouped all-reduce, so the join tier is reachable without
-    one.
-    """
-    assert (
-        _select(fused_moe_ar=False, join_moe_reduce=True) is K3MoETailTier.FUSED_LANE_AR
-    )
-
-
-def test_without_join_capability_the_fallback_is_unchanged():
-    assert (
-        _select(fused_moe_ar=False, join_moe_reduce=False)
         is K3MoETailTier.SEPARATE_REDUCE
     )
 
 
-def test_join_does_not_preempt_the_fused_tail_or_multimem():
-    # The fused decode tail still wins inside its graph-phase window ...
-    assert (
-        _select(
-            num_tokens=8, graph_phase=True, fused_moe_ar=False, join_moe_reduce=True
-        )
-        is K3MoETailTier.TAIL_FUSION
-    )
-    # ... and an armed lane still routes through the multimem window.
-    assert (
-        _select(fused_moe_ar=True, join_moe_reduce=True, multimem_ok=True)
-        is K3MoETailTier.MULTIMEM_AR
-    )
+@pytest.mark.parametrize(
+    "integrated,m",
+    [(False, 8), (False, 256), (False, 8192), (True, 8), (True, 16384)],
+)
+def test_fallback_plan_reduces_and_projects_routed_in_fork(monkeypatch, integrated, m):
+    from tokenspeed.runtime.models import kimi_k3_comm
+
+    monkeypatch.setattr(kimi_k3_comm, "get_is_cuda_graph_phase", lambda: False)
+    comm = object.__new__(K3MoeTailComm)
+    comm.state = SimpleNamespace(integrated_tail=integrated)
+    comm.latent_tail = None
+
+    plan = comm.plan(m)
+    assert plan.tier is K3MoETailTier.SEPARATE_REDUCE
+    assert plan.routed_in_fork
+    assert not plan.defer_finalize
+    assert not plan.split_shared_rs
+    assert plan.symm_outputs is None
+
+
+def test_only_four_tail_routes_remain():
+    assert set(K3MoETailTier.__members__) == {
+        "TAIL_FUSION",
+        "MEDIUM_FUSED_RS_UP_AG",
+        "FUSED_RS_UP_AG",
+        "SEPARATE_REDUCE",
+    }

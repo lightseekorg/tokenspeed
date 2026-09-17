@@ -18,22 +18,19 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Every K3 MoE tail tier must produce the same answer.
+"""Compare the retained small fused tail and separate-reduce path.
 
-The selector routes a forward to one of the tail tiers by token count and
-graph phase, so which arithmetic runs depends on batch size and whether a CUDA
-graph is replaying. An end-to-end eval only ever exercises the tiers its own shapes
-happen to select — GPQA at ebs8 never reaches SEPARATE_REDUCE, and nothing in
-the decode path reaches MULTIMEM_AR. This file compares the tiers against each
-other directly on identical inputs, which is what makes a tier-specific
-numerical defect visible at all.
+The selector routes small graph forwards to the fused tail and other
+non-integrated forwards to separate reduction. These tests compare both paths
+on identical inputs; integrated medium/large kernels have their own tests under
+tokenspeed-kernel/test/nvidia/thirdparty/.
 
 The tiers are driven through ``K3MoeTailComm``'s own ``_tail_*`` methods, on an
 instance built by ``__new__`` with only the attributes those methods read
 (the collective negotiation in ``K3MoeTailCommState`` is deliberately
 bypassed). That matters: a test that re-derived norm+projection in torch
 would agree with itself no matter what ``routed_norm``,
-``kimi3_latent_projection_add3``, ``kimi3_join_reduce_moe`` or the fused
+``kimi3_latent_projection_add3`` or the fused
 kernel's epilogue actually computed. Only ``mapping``, ``execution_plan`` and
 ``state`` are stand-ins — they carry group and policy configuration, no
 arithmetic.
@@ -61,8 +58,7 @@ import torch
 import torch.distributed as dist
 
 H, L, EPS = 7168, 3584, 1e-6
-# Above the fused tail's capacity and below the multimem floor, so one token
-# count can drive every tier that does not gate on capacity.
+# Above the runtime small-tail cap; used by separate-reduce tests.
 MID_TOKENS = 64
 
 
@@ -150,16 +146,11 @@ def _build_comm(device: torch.device, *, latent_tail=None):
     comm._shard_up_projection = up_proj.shard_group is not None
 
     comm.mapping = _mapping_stub(world)
-    comm.execution_plan = SimpleNamespace(
-        fused_moe_ar=True,
-        join_moe_reduce=True,
-        lane_latent_norm_ar=False,
-        comm_fusion_max_num_tokens=8192,
-    )
+    comm.execution_plan = SimpleNamespace(fused_moe_ar=True)
     # Negotiated state stand-in.
     comm.state = SimpleNamespace(
         rms_eps=EPS,
-        multimem_ar_ok=True,
+        integrated_tail=False,
         latent_tail_ok=latent_tail is not None,
     )
     comm.latent_tail = latent_tail
@@ -331,39 +322,25 @@ def test_call_deferred_shape_hardening():
 
 
 def test_selector_boundaries():
-    """The tier map itself, with no GPU or collective involved."""
+    """The compatibility tier map, with no GPU or collective involved."""
     from tokenspeed.runtime.models.kimi_k3_comm import (
         K3MoETailTier,
         select_k3_moe_tail_tier,
     )
 
-    def pick(num_tokens, *, graph_phase=True, fused_max=64, fused_ar=True, mm=True):
+    def pick(num_tokens, *, graph_phase, fused_max):
         return select_k3_moe_tail_tier(
             num_tokens=num_tokens,
             graph_phase=graph_phase,
             tail_fusion_max_tokens=fused_max,
-            fused_moe_ar=fused_ar,
-            multimem_ok=mm,
         )
 
-    assert pick(1) is K3MoETailTier.TAIL_FUSION
-    assert pick(64) is K3MoETailTier.TAIL_FUSION
-    # One past capacity must leave the fused tail rather than truncate.
-    assert pick(65) is not K3MoETailTier.TAIL_FUSION
-    # Outside the graph phase the fused tail is unreachable at any size.
-    assert pick(1, graph_phase=False) is not K3MoETailTier.TAIL_FUSION
-    # No fused tail compiled: capacity is 0 and the join tier takes decode.
-    assert pick(1, fused_max=0) is K3MoETailTier.FUSED_LANE_AR
-    assert pick(256) is K3MoETailTier.MULTIMEM_AR
-    assert pick(8192) is K3MoETailTier.MULTIMEM_AR
-    assert pick(8193) is not K3MoETailTier.MULTIMEM_AR
-    assert pick(256, mm=False) is K3MoETailTier.FUSED_LANE_AR
-    # fused_moe_ar reports the trtllm AR lane, which only the join tier uses.
-    # The fused tail owns its own multicast collective, so it outranks the
-    # flag rather than being gated by it; every other size falls to portable.
-    assert pick(1, fused_ar=False) is K3MoETailTier.TAIL_FUSION
-    for n in (65, 256, 100_000):
-        assert pick(n, fused_ar=False) is K3MoETailTier.SEPARATE_REDUCE
+    assert pick(1, graph_phase=True, fused_max=32) is K3MoETailTier.TAIL_FUSION
+    assert pick(32, graph_phase=True, fused_max=32) is K3MoETailTier.TAIL_FUSION
+    for m in (64, 256, 8192, 16384):
+        assert pick(m, graph_phase=True, fused_max=32) is K3MoETailTier.SEPARATE_REDUCE
+    assert pick(1, graph_phase=False, fused_max=32) is K3MoETailTier.SEPARATE_REDUCE
+    assert pick(1, graph_phase=True, fused_max=0) is K3MoETailTier.SEPARATE_REDUCE
 
 
 def test_profit_cap_stops_the_fused_tail_below_its_capacity(monkeypatch):
@@ -385,8 +362,8 @@ def test_profit_cap_stops_the_fused_tail_below_its_capacity(monkeypatch):
         supports_split_collective=True,
         split_collective_min_tokens=9,
     )
-    comm.execution_plan = SimpleNamespace(fused_moe_ar=True, join_moe_reduce=True)
-    comm.state = SimpleNamespace(multimem_ar_ok=False)
+    comm.execution_plan = SimpleNamespace(fused_moe_ar=True)
+    comm.state = SimpleNamespace(integrated_tail=False)
     comm._shard_up_projection = False
     # __init__ is bypassed here; the probe declines on CPU, so no symmetric
     # heap is reached.
@@ -394,18 +371,18 @@ def test_profit_cap_stops_the_fused_tail_below_its_capacity(monkeypatch):
     comm.routed_hidden, comm.hidden_size = L, H
 
     cap = mod.TAIL_FUSION_MAX_TOKENS
-    assert comm.plan(cap, None).tier is mod.K3MoETailTier.TAIL_FUSION
-    # Past the cap the plan leaves the fused tail's early return, so it needs
-    # real hidden states to reach the lane decision.
-    above = comm.plan(cap + 1, torch.zeros(cap + 1, H))
-    assert above.tier is not mod.K3MoETailTier.TAIL_FUSION
+    assert comm.plan(cap).tier is mod.K3MoETailTier.TAIL_FUSION
+    # Past the cap, the compatibility plan uses separate reduction.
+    above = comm.plan(cap + 1)
+    assert above.tier is mod.K3MoETailTier.SEPARATE_REDUCE
+    assert above.routed_in_fork
 
 
 def test_tail_fusion_plan_defer_decision(monkeypatch):
     """TAIL_FUSION defers finalize iff the tail op and the fused-AR plan agree.
 
-    Pure Python: the plan() early return for TAIL_FUSION never touches the
-    lane machinery or hidden_states, so stubs carry the whole decision.
+    Pure Python: the plan() early return for TAIL_FUSION touches no
+    collective or input tensor, so stubs carry the whole decision.
     """
     from tokenspeed.runtime.models import kimi_k3_comm as mod
 
@@ -420,10 +397,8 @@ def test_tail_fusion_plan_defer_decision(monkeypatch):
             supports_split_collective=True,
             split_collective_min_tokens=9,
         )
-        comm.execution_plan = SimpleNamespace(
-            fused_moe_ar=fused_ar, join_moe_reduce=fused_ar
-        )
-        comm.state = SimpleNamespace(multimem_ar_ok=False)
+        comm.execution_plan = SimpleNamespace(fused_moe_ar=fused_ar)
+        comm.state = SimpleNamespace(integrated_tail=False)
         comm._shard_up_projection = False
         # __init__ is bypassed here; the probe declines on CPU, so no
         # symmetric heap is reached.
@@ -431,34 +406,34 @@ def test_tail_fusion_plan_defer_decision(monkeypatch):
         comm.routed_hidden, comm.hidden_size = L, H
         return comm
 
-    plan = build(supports_deferred=True, fused_ar=True).plan(1, None)
+    plan = build(supports_deferred=True, fused_ar=True).plan(1)
     assert plan.tier is mod.K3MoETailTier.TAIL_FUSION
     assert plan.defer_finalize
     assert not plan.split_shared_rs
-    assert plan.lane is None and not plan.routed_in_fork
+    assert plan.symm_outputs is None and not plan.routed_in_fork
 
     # A tail op without the deferred variant must keep the materialized mode.
-    plan = build(supports_deferred=False, fused_ar=True).plan(32, None)
+    plan = build(supports_deferred=False, fused_ar=True).plan(32)
     assert plan.tier is mod.K3MoETailTier.TAIL_FUSION
     assert not plan.defer_finalize
     assert plan.split_shared_rs
 
     # Split once token work enters a second collective-CTA wave.
     comm = build(supports_deferred=True, fused_ar=True)
-    assert not comm.plan(8, None).split_shared_rs
-    assert comm.plan(9, None).split_shared_rs
+    assert not comm.plan(8).split_shared_rs
+    assert comm.plan(9).split_shared_rs
 
     # Without the fused-AR (trtllm) plan the experts kernel cannot defer.
-    plan = build(supports_deferred=True, fused_ar=False).plan(1, None)
+    plan = build(supports_deferred=True, fused_ar=False).plan(1)
     assert plan.tier is mod.K3MoETailTier.TAIL_FUSION
     assert not plan.defer_finalize
 
     # No tail op at all: the tier is unreachable, nothing defers.
     comm = build(supports_deferred=True, fused_ar=True)
     comm.latent_tail = None
-    hidden = torch.zeros(17, H)
-    plan = comm.plan(17, hidden)
-    assert plan.tier is not mod.K3MoETailTier.TAIL_FUSION
+    plan = comm.plan(17)
+    assert plan.tier is mod.K3MoETailTier.SEPARATE_REDUCE
+    assert plan.routed_in_fork
     assert not plan.defer_finalize
 
 
@@ -583,88 +558,9 @@ def test_fused_tail_deferred_finalize_matches_reference(m):
 
 
 @collective
-@pytest.mark.parametrize("m", [256, 1024])
-def test_multimem_ar_matches_reference(m):
-    """MULTIMEM_AR: in-switch staged reduces, then the replicated projection."""
-    from tokenspeed_kernel.ops.communication.multimem import multimem_available
-
-    rank, dev = _setup()
-    if not _agreed(multimem_available()):
-        pytest.skip("multimem unavailable here")
-
-    comm = _build_comm(dev)
-    routed, shared, prefix = _inputs(rank, dev, m, seed=22)
-    ref = _reference(comm, routed, shared, prefix)
-    out = comm._tail_multimem_ar(routed, shared, prefix, m, H)
-    torch.cuda.synchronize()
-    assert _rel_err(out, ref) < 0.05
-
-
-@collective
-@pytest.mark.parametrize("m", [1, MID_TOKENS, 1024])
-def test_fused_lane_ar_matches_reference(m):
-    """FUSED_LANE_AR: the join tier, reached by eager serving at every size.
-
-    Driven without a lane buffer — the lane only materializes at bs==1 inside
-    a captured graph, and the join's no-lane path is what eager traffic takes.
-    """
-    rank, dev = _setup()
-    comm = _build_comm(dev)
-    routed, shared, prefix = _inputs(rank, dev, m, seed=55)
-    ref = _reference(comm, routed, shared, prefix)
-    out = comm._tail_fused_lane_ar(routed, shared, prefix, None, None, m, H)
-    torch.cuda.synchronize()
-    assert _rel_err(out, ref) < 0.05
-
-
-@collective
-@pytest.mark.parametrize("m", [1, MID_TOKENS, 1024])
-def test_fused_lane_ar_symmetric_matches_reference(m):
-    """The join tier reduces producer-direct partials to the same answer.
-
-    This regime swaps both the operand shape (a pair, not one concatenation)
-    and the kernel that sums it (an in-place symmetric reduce rather than a
-    staged one-shot), so it is the tier variant most able to disagree while
-    every other test still passes. Driving it here is also the only check that
-    the tail consumes the pair in the order it acquired them -- transposing
-    routed and shared would still produce plausibly-shaped output.
-
-    Skipped where the backend declines producer-direct memory; the vote keeps
-    the ranks from splitting over it, since one rank taking the symmetric
-    kernel while another stages would hang rather than fail.
-    """
-    from tokenspeed.runtime.distributed.comm_ops import (
-        acquire_all_reduce_outputs,
-        can_acquire_all_reduce_outputs,
-    )
-
-    rank, dev = _setup()
-    comm = _build_comm(dev)
-    routed, shared, prefix = _inputs(rank, dev, m, seed=55)
-    ref = _reference(comm, routed, shared, prefix)
-
-    group = comm.mapping.moe.tp_ep_group
-    shapes = ((m, L), (m, H))
-    if not _agreed(can_acquire_all_reduce_outputs(shapes, routed, group)):
-        pytest.skip("backend has no producer-direct all-reduce outputs here")
-
-    symm = acquire_all_reduce_outputs(shapes, routed, group)
-    # Stand in for the producers, which write their partials into these
-    # buffers rather than returning fresh ones.
-    symm[0].copy_(routed)
-    symm[1].copy_(shared)
-    out = comm._tail_fused_lane_ar(symm[0], symm[1], prefix, None, symm, m, H)
-    torch.cuda.synchronize()
-    assert _rel_err(out, ref) < 0.05
-
-
-@collective
 @pytest.mark.parametrize("m", [1, MID_TOKENS, 1024])
 def test_separate_reduce_matches_reference(m):
-    """SEPARATE_REDUCE: the portable tier, reached whenever fused AR is off.
-
-    No end-to-end eval in this repo selects it, so this is its only coverage.
-    """
+    """The portable fallback, including small eager and unsupported layouts."""
     rank, dev = _setup()
     comm = _build_comm(dev)
     routed, shared, prefix = _inputs(rank, dev, m, seed=33)
@@ -683,7 +579,6 @@ def test_tiers_agree_with_each_other():
     on batch size — so agreement between tiers is checked directly, at one
     token count, with the selector's capacity rules bypassed.
     """
-    from tokenspeed_kernel.ops.communication.multimem import multimem_available
     from tokenspeed_kernel.ops.moe.latent_tail import (
         KimiK3LatentTailOp,
         latent_tail_supported,
@@ -721,10 +616,6 @@ def test_tiers_agree_with_each_other():
         return routed.clone(), shared.clone(), prefix.clone()
 
     outs = {"separate_reduce": _run_separate_reduce(comm, *fresh(), m)}
-    r, s, p = fresh()
-    outs["fused_lane_ar"] = comm._tail_fused_lane_ar(r, s, p, None, None, m, H)
-    if _agreed(multimem_available()):
-        outs["multimem_ar"] = comm._tail_multimem_ar(*fresh(), m, H)
     if tail is not None:
         outs["tail_fusion"] = comm._tail_fusion(*fresh())
     torch.cuda.synchronize()
