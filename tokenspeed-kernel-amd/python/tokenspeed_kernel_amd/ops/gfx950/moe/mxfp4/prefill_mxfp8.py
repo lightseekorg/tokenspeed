@@ -25,9 +25,7 @@ from __future__ import annotations
 import math
 
 import torch
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4._schedule import (
-    _mxfp8_compile_options,
-)
+from tokenspeed_kernel_amd._scheduling import sched_barrier_compile_options
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.expert_mesh import sort_expert_slots
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.mxfp8_gemm import (
     _mxfp8_stage1,
@@ -107,7 +105,7 @@ def mxfp8_situ_prefill(
         )
     if m == 0:
         return out
-    compile_options = _mxfp8_compile_options()
+    compile_options = sched_barrier_compile_options()
     block_m = 32 if m <= 1024 else 128
     ids, route_weights, experts, valid = sort_expert_slots(
         topk_ids,

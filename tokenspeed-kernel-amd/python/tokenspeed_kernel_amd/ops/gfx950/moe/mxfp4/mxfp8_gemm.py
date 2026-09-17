@@ -26,12 +26,8 @@ uses async activation loads at both row counts; stage2 retains register loads
 and phased LDS publication. Output exchange happens after FP32 arithmetic.
 """
 
-from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, tl
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4._schedule import (
-    _SCHED_LIBRARY_NAME,
-    _SCHED_LIBRARY_PATH,
-    _SCHED_SYMBOL,
-)
+from tokenspeed_kernel_amd._scheduling import sched_barrier
+from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.n16_weights import (
     _n16_weight_offset,
 )
@@ -213,18 +209,6 @@ def _zeros(BM: gl.constexpr):
     return acc
 
 
-@tl.core.extern
-def _sched_barrier0(_semantic):
-    return tl.core.extern_elementwise(
-        _SCHED_LIBRARY_NAME,
-        _SCHED_LIBRARY_PATH,
-        [],
-        {(): (_SCHED_SYMBOL, tl.int32)},
-        is_pure=False,
-        _semantic=_semantic,
-    )
-
-
 @gluon.jit
 def _bmajor_phase(acc, a, b, a_words, b_word, KH: gl.constexpr, NI: gl.constexpr):
     updated = ()
@@ -278,15 +262,15 @@ def _stage1_interleaved(
             new_b += (_load_b(w, K, NEXT, 1, 0),)
         elif phase == 3:
             new_b += (_load_b(w, K, NEXT, 1, 1),)
-        _sched_barrier0()
+        sched_barrier()
         for mi in gl.static_range(phase * READS, min((phase + 1) * READS, BM // 16)):
             for kh in gl.static_range(2):
                 new_a += (_fragment(smem, mi, kh),)
-        _sched_barrier0()
+        sched_barrier()
         acc = _bmajor_phase(
             acc, old_a, old_b[phase], old_as, old_bs, phase // 2, phase % 2
         )
-        _sched_barrier0()
+        sched_barrier()
     # The phase read order is M-major; the consumer tuple is K-half-major.
     a = ()
     for kh in gl.static_range(2):
@@ -403,7 +387,6 @@ def _stage2_prefix(
         tail_a += (_fragment(smem, mi, 1),)
     if PUBLISH_NEXT:
         _publish_a(next_slot, next_a_tail, 2, 8)
-        gl.barrier()
     return acc, tail_a
 
 
@@ -498,11 +481,11 @@ def _mxfp8_stage1(
     )
     offsets = _a_offsets(ids, m_base, M, TOPK, K, False, BM, True)
     acc = _zeros(BM)
-    _sched_barrier0()
+    sched_barrier()
     _copy_a(a0, x, offsets, 0, BUFFER_SAFE)
-    _sched_barrier0()
+    sched_barrier()
     scales_a, scales_b = _load_scales(sa, sb, K, 0, BM)
-    _sched_barrier0()
+    sched_barrier()
     if K > 256:
         _copy_a(a1, x, offsets, 1, BUFFER_SAFE)
     b = ()
@@ -510,19 +493,17 @@ def _mxfp8_stage1(
         for ni in gl.static_range(2):
             b += (_load_b(w, K, 0, kh, ni),)
     cdna4_async_copy.wait_group(0)
-    gl.barrier()
-    _sched_barrier0()
+    sched_barrier()
     a = _full_fragments(a0, BM)
-    _sched_barrier0()
+    sched_barrier()
 
     TAIL: gl.constexpr = 1 if K // 256 % 2 else 2
     for kt in gl.static_range(0, K // 256 - TAIL):
         read_slot = a1 if kt % 2 == 0 else a0
         write_slot = a0 if kt % 2 == 0 else a1
-        _sched_barrier0()
+        sched_barrier()
         cdna4_async_copy.wait_group(0)
-        gl.barrier()
-        _sched_barrier0()
+        sched_barrier()
         if kt + 2 < K // 256:
             _copy_a(write_slot, x, offsets, kt + 2, BUFFER_SAFE)
         acc, a, b, scales_a, scales_b = _stage1_interleaved(
@@ -550,7 +531,6 @@ def _mxfp8_stage1(
         acc = _bmajor_phase(acc, a, b[phase], scales_a, scales_b, phase // 2, phase % 2)
     if TAIL == 2:
         cdna4_async_copy.wait_group(0)
-        gl.barrier()
         tail_a = _full_fragments(a1, BM)
         for phase in gl.static_range(4):
             acc = _bmajor_phase(
@@ -558,7 +538,6 @@ def _mxfp8_stage1(
             )
 
     cdna4_async_copy.wait_group(0)
-    gl.barrier()
     # Alias retired A storage: gate/up interleaving emits only N64 BF16.
     c_shared = a0.reinterpret(
         gl.bfloat16, [2 * BM, 64], gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
@@ -567,7 +546,6 @@ def _mxfp8_stage1(
         c_shared.slice(mi * 16, 16, 0).store(
             _situ(acc[mi][0], acc[mi][1], BETA, LINEAR_BETA)
         )
-    gl.barrier()
     store_layout: gl.constexpr = gl.BlockedLayout([1, 2], [2, 32], [2, 2], [1, 0])
     c = c_shared.slice(0, BM, 0).load(store_layout)
     route = tid.load(gl.SliceLayout(1, store_layout)).to(gl.uint32)
@@ -635,12 +613,11 @@ def _mxfp8_stage2(
     )
     offsets = _a_offsets(ids, m_base, M, TOPK, K, True, BM, False)
     acc = _zeros(BM)
-    _sched_barrier0()
+    sched_barrier()
     b_lo = (_load_b(w, K, 0, 0, 0), _load_b(w, K, 0, 0, 1))
     scales_a, scales_b = _load_scales(sa, sb, K, 0, BM)
-    _sched_barrier0()
+    sched_barrier()
     _publish_a(a0, _load_a(x, offsets, 0, BUFFER_A_SAFE, 0, BM // 16), 0, BM // 16)
-    gl.barrier()
     first_lo, first_hi = _fragment_k64(a0, 0, 0, 0), _fragment_k64(a0, 0, 1, 0)
     tail_a, tail_b, tail_as, tail_bs = None, None, None, None
     for kt in gl.static_range(0, K // 256):
@@ -669,7 +646,6 @@ def _mxfp8_stage2(
             )
             if kt + 1 < K // 256:
                 _publish_a(next_slot, next_a, 0, 2)
-                gl.barrier()
         else:
             acc, tail_a = _stage2_prefix(
                 acc,
@@ -696,7 +672,6 @@ def _mxfp8_stage2(
 
     if BM == 128:
         acc = _stage2_tail(acc, tail_a, tail_b, tail_as, tail_bs)
-    gl.barrier()
     c_shared = a0.reinterpret(
         gl.bfloat16, [BM, 128], gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
     )
@@ -710,7 +685,6 @@ def _mxfp8_stage2(
             .reshape(16, 128)
         )
         c_shared.slice(mi * 16, 16, 0).store(c)
-    gl.barrier()
     store_layout: gl.constexpr = gl.BlockedLayout([1, 2], [2, 32], [4, 1], [1, 0])
     c = c_shared.load(store_layout)
     row_bytes = tid.load(gl.SliceLayout(1, store_layout))

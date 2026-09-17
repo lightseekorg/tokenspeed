@@ -20,11 +20,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Private compilation policy for the MXFP8 expert scheduling hints."""
+"""AMD instruction-scheduling barrier and its external-library dependency."""
 
 import hashlib
 from functools import lru_cache
 from pathlib import Path
+
+from tokenspeed_kernel_amd._triton import tl
 
 _SCHED_LIBRARY_NAME = "tokenspeed_sched"
 _SCHED_SYMBOL = "__tokenspeed_sched_barrier0"
@@ -38,8 +40,32 @@ def _scheduler_library_hash() -> str:
     return hashlib.sha256(Path(_SCHED_LIBRARY_PATH).read_bytes()).hexdigest()
 
 
-def _mxfp8_compile_options() -> dict:
+def sched_barrier_compile_options() -> dict:
+    """Return launch options for kernels using :func:`sched_barrier`.
+
+    The kernel must accept an otherwise unused ``SCHED_LIBRARY_HASH`` constexpr
+    so edits to the library invalidate its compiled binary. Merge ``extern_libs``
+    with any other device libraries required by the caller.
+    """
     return {
         "SCHED_LIBRARY_HASH": _scheduler_library_hash(),
         "extern_libs": {_SCHED_LIBRARY_NAME: _SCHED_LIBRARY_PATH},
     }
+
+
+@tl.core.extern
+def sched_barrier(_semantic):
+    """Prevent instruction scheduling across this point; no workgroup sync.
+
+    Emits ``llvm.amdgcn.sched.barrier(0)``. Returns an unused int32 value required
+    by the elementwise extern interface. Launch with
+    :func:`sched_barrier_compile_options` to link the library and key its content.
+    """
+    return tl.core.extern_elementwise(
+        _SCHED_LIBRARY_NAME,
+        _SCHED_LIBRARY_PATH,
+        [],
+        {(): (_SCHED_SYMBOL, tl.int32)},
+        is_pure=False,
+        _semantic=_semantic,
+    )

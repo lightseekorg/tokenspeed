@@ -26,6 +26,16 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
 
+@gluon.jit
+def _downcast_mxfp8(values, exponent):
+    # E8M0 255 means NaN to scaled_downcast, whereas this quantizer's infinite
+    # scale maps finite inputs to signed zero and infinite inputs to NaN.
+    infinite_scale = exponent == 255
+    values = gl.where(infinite_scale[:, None], values * 0.0, values)
+    scale = gl.where(infinite_scale, 127, exponent).to(gl.uint8)
+    return gl.amd.cdna4.scaled_downcast(values, scale[:, None], "e4m3", axis=1)
+
+
 @gluon.jit(do_not_specialize=("ROWS",))
 def _quantize_mxfp8_kernel(
     x,
@@ -54,9 +64,7 @@ def _quantize_mxfp8_kernel(
     bits = (amax * (1.0 / 448.0)).to(gl.uint32, bitcast=True)
     exponent = (bits >> 23) & 255
     exponent += ((exponent < 255) & ((bits & 0x7FFFFF) != 0)).to(gl.uint32)
-    scale = (exponent << 23).to(gl.float32, bitcast=True)
-    values = values * (1.0 / scale[:, None])
-    packed = values.to(gl.float8e4nv, fp_downcast_rounding="rtne")
+    packed = _downcast_mxfp8(values, exponent)
     gl.store(
         q + group[:, None].to(gl.int64) * 32 + column[None, :],
         packed,
@@ -163,10 +171,7 @@ def _quantize_sorted_mxfp8(
     exponent = (bits >> 23) & 255
     exponent += ((exponent < 255) & ((bits & 0x7FFFFF) != 0)).to(gl.uint32)
     if values_role:
-        scale = (exponent << 23).to(gl.float32, bitcast=True)
-        packed = (values * (1.0 / scale[:, None])).to(
-            gl.float8e4nv, fp_downcast_rounding="rtne"
-        )
+        packed = _downcast_mxfp8(values, exponent)
         gl.store(
             q + group[:, None].to(gl.int64) * 32 + column[None, :],
             packed,

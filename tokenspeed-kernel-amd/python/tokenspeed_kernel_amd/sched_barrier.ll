@@ -20,7 +20,7 @@
 ; OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 ; SOFTWARE.
 
-; Triton does not hash external-library contents. _schedule.py supplies this
+; Triton's HIP backend does not hash library contents. _scheduling.py supplies this
 ; file's SHA256 as the SCHED_LIBRARY_HASH constexpr to invalidate compiled
 ; kernels automatically after edits. Keep that dependency; the filename and
 ; symbol need no version bumps. Restart the process after editing this file,

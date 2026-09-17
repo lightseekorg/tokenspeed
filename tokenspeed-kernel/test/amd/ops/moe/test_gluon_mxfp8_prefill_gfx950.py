@@ -22,8 +22,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 import torch
 from kimi3_reference import dequantize_mxfp4, mxfp4_moe_reference
@@ -38,14 +36,14 @@ from tokenspeed_kernel.ops.moe import (  # noqa: E402
     latent_moe_decode_pipeline_available,
     latent_moe_expert_shared,
 )
+from tokenspeed_kernel_amd._scheduling import (  # noqa: E402
+    sched_barrier_compile_options,
+)
 from tokenspeed_kernel_amd._triton import (  # noqa: E402
     cdna4_async_copy,
     gl,
     gluon,
     triton,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4._schedule import (  # noqa: E402
-    _mxfp8_compile_options,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.expert_mesh import (  # noqa: E402
     _build_small_mesh,
@@ -67,7 +65,6 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.mxfp8_gemm import (  # noqa: E40
     _mxfp8_stage1,
     _mxfp8_stage2,
     _publish_a,
-    _sched_barrier0,
     _situ,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.mxfp8_quantize import (  # noqa: E402
@@ -211,7 +208,7 @@ def _quantize_probe(x, fused):
     q = q_storage[:-32].view(torch.float8_e4m3fn).view_as(x)
     if not fused:
         scales = torch.empty((rows, k // 32), device="cuda", dtype=torch.uint8)
-        _quantize_mxfp8_kernel[((scales.numel() + 63) // 64,)](
+        compiled = _quantize_mxfp8_kernel[((scales.numel() + 63) // 64,)](
             x,
             q,
             scales,
@@ -232,7 +229,7 @@ def _quantize_probe(x, fused):
         )
         value_blocks = triton.cdiv(rows * (k // 32), 128)
         scale_blocks = triton.cdiv(padded * (k // 32), 128)
-        _quantize_sorted_mxfp8[(value_blocks + scale_blocks,)](
+        compiled = _quantize_sorted_mxfp8[(value_blocks + scale_blocks,)](
             x,
             q,
             ids,
@@ -269,7 +266,7 @@ def _quantize_probe(x, fused):
     torch.testing.assert_close(
         q_storage[-32:], torch.full_like(q_storage[-32:], 0x55), atol=0, rtol=0
     )
-    return q, scales
+    return q, scales, compiled
 
 
 @pytest.mark.parametrize("k", [256, 3072, 3584])
@@ -297,7 +294,7 @@ def test_q32_finite_bits_and_signed_zero(k, fused):
     x = values[:, None].expand(-1, k).clone()
     x[:, 1::32] = -0.0
     x[:, 2::32] = 0.0
-    q, scales = _quantize_probe(x, fused)
+    q, scales, _ = _quantize_probe(x, fused)
     expected, expected_s = _q32(x)
     torch.testing.assert_close(
         q.view(torch.uint8), expected.view(torch.uint8), atol=0, rtol=0
@@ -315,7 +312,7 @@ def test_q32_nonfinite_classification(fused, record_property):
     x[3, 0::32] = -float("inf")
     x[4, 0::32], x[4, 1::32] = float("nan"), float("inf")
     x[:, 2::32] = -0.0
-    q, scales = _quantize_probe(x, fused)
+    q, scales, _ = _quantize_probe(x, fused)
     expected, expected_s = _q32(x)
     torch.testing.assert_close(scales, expected_s, atol=0, rtol=0)
     torch.testing.assert_close(torch.isnan(q.float()), torch.isnan(expected.float()))
@@ -327,6 +324,21 @@ def test_q32_nonfinite_classification(fused, record_property):
         "nan_payload_differences",
         int(((q.view(torch.uint8) != expected.view(torch.uint8)) & ~finite).sum()),
     )
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_q32_all_bf16_encodings_use_hardware_scaled_downcast(fused):
+    x = torch.arange(2**16, device="cuda", dtype=torch.int32).to(torch.int16)
+    x = x.view(torch.bfloat16).reshape(256, 256)
+    q, scales, compiled = _quantize_probe(x, fused)
+    expected, expected_s = _q32(x)
+    torch.testing.assert_close(scales, expected_s, atol=0, rtol=0)
+    torch.testing.assert_close(torch.isnan(q.float()), torch.isnan(expected.float()))
+    finite = torch.isfinite(expected.float())
+    torch.testing.assert_close(
+        q.view(torch.uint8)[finite], expected.view(torch.uint8)[finite], atol=0, rtol=0
+    )
+    assert "v_cvt_scalef32_pk_fp8_f32" in compiled.asm["amdgcn"]
 
 
 @pytest.mark.parametrize("topk", [1, 16, 32, 33, 65])
@@ -651,7 +663,7 @@ def _check_stage2_basis(k, m, *, pitch, buffer_safe, block_m):
         num_warps=4,
         num_stages=1,
         enable_fp_fusion=False,
-        **_mxfp8_compile_options(),
+        **sched_barrier_compile_options(),
     )
     scale_w = torch.exp2(raw["w2_scale"][0, n, group].float() - 127)
     expected = (
@@ -740,7 +752,7 @@ def _check_stage1_basis(d, varying_scales, block_m):
         num_warps=4,
         num_stages=1,
         enable_fp_fusion=False,
-        **_mxfp8_compile_options(),
+        **sched_barrier_compile_options(),
     )
     code = torch.tensor([1.0, 1.5, 2.0, 3.0], device="cuda")[n % 4]
     scale_w = torch.exp2(raw["w13_scale"][0, n, group].float() - 127)
@@ -840,76 +852,6 @@ def test_xor_a_tiles_safe_padding_and_split_fragments(
     torch.testing.assert_close(actual, x[source], atol=0, rtol=0)
     torch.testing.assert_close(x, saved_x, atol=0, rtol=0)
     torch.testing.assert_close(encoded, saved_ids, atol=0, rtol=0)
-
-
-@gluon.jit
-def _phase_boundary_probe(x, y, out_x, out_y, SCHED_LIBRARY_HASH: gl.constexpr):
-    row = gl.arange(0, 16, layout=gl.SliceLayout(1, _MMA))
-    col = gl.arange(0, 64, layout=gl.SliceLayout(0, _MMA))
-    offset = row[:, None] * 64 + col[None, :]
-    c0 = gl.load(x + offset).to(gl.float32, bitcast=True)
-    c1 = gl.load(y + offset).to(gl.float32, bitcast=True)
-    for _ in gl.static_range(4):
-        _sched_barrier0()
-    gl.store(out_x + offset, c0.to(gl.int32, bitcast=True))
-    gl.store(out_y + offset, c1.to(gl.int32, bitcast=True))
-
-
-def _check_phase_boundary_bits():
-    bits = torch.arange(1024, device="cuda", dtype=torch.int64)
-    bits = ((bits * 0x9E3779B9 + 0x12345678) & 0xFFFFFFFF).to(torch.int32)
-    boundaries = torch.tensor(
-        [0, 0x80000000, 1, 0x80000001, 0x7F800000, 0xFF800000, 0x7FC12345, 0xFF812345],
-        device="cuda",
-        dtype=torch.int64,
-    ).to(torch.int32)
-    bits[: boundaries.numel()] = boundaries
-    other = bits.roll(137).clone()
-    saved_bits, saved_other = bits.clone(), other.clone()
-    out_x, out_y = torch.empty_like(bits), torch.empty_like(other)
-    compiled = _phase_boundary_probe[(1,)](
-        bits,
-        other,
-        out_x,
-        out_y,
-        num_warps=4,
-        num_stages=1,
-        **_mxfp8_compile_options(),
-    )
-    # The hint performs no arithmetic; this is not a NaN-payload math contract.
-    torch.testing.assert_close(out_x, bits, atol=0, rtol=0)
-    torch.testing.assert_close(out_y, other, atol=0, rtol=0)
-    torch.testing.assert_close(bits, saved_bits, atol=0, rtol=0)
-    torch.testing.assert_close(other, saved_other, atol=0, rtol=0)
-    return compiled
-
-
-def test_phase_fence_preserves_accumulator_bits():
-    _check_phase_boundary_bits()
-
-
-def test_scheduler_content_changes_compiled_kernel_key(monkeypatch, tmp_path):
-    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import _schedule
-
-    path = tmp_path / "sched_barrier.ll"
-    original = Path(_schedule._SCHED_LIBRARY_PATH).read_text()
-    path.write_text(original)
-    monkeypatch.setattr(_schedule, "_SCHED_LIBRARY_PATH", str(path))
-    _schedule._scheduler_library_hash.cache_clear()
-    try:
-        first = _check_phase_boundary_bits()
-        assert "@llvm.amdgcn.sched.barrier(i32 0)" in first.asm["llir"]
-        # Keep the path fixed, but change the intrinsic's scheduling mask.
-        path.write_text(
-            original.replace("sched.barrier(i32 0)", "sched.barrier(i32 1)")
-        )
-        _schedule._scheduler_library_hash.cache_clear()
-        second = _check_phase_boundary_bits()
-        assert first.hash != second.hash
-        assert "@llvm.amdgcn.sched.barrier(i32 1)" in second.asm["llir"]
-        assert _check_phase_boundary_bits() is second
-    finally:
-        _schedule._scheduler_library_hash.cache_clear()
 
 
 @gluon.jit

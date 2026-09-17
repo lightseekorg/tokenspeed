@@ -110,6 +110,10 @@ and batch size to limit shared-memory usage.
 
 ### MXFP8 SiTU Experts
 
+Quantizers select the group32 E8M0 exponent in software and use CDNA4
+`scaled_downcast` for rescaling and E4M3 conversion. They retain the existing
+zero-group floor and infinite-scale behavior, including signed zeros.
+
 The gfx950 EP8 SiTU registration with a 3072-wide intermediate selects a
 coupled MXFP8 prefill pipeline through the existing `moe_plan`,
 `moe_process_weights`, and `moe_apply` API. Both the normal `input`
@@ -221,8 +225,8 @@ data movement is needed; both separate K64 acquisitions remain in place.
 Compiler-only boundaries separate stage1 DMA/wait, global-load, two-M16-read
 and B-major MFMA phases, and stage2's initial operand and publication prologues.
 A packaged, always-inline LLVM wrapper emits `llvm.amdgcn.sched.barrier(0)`
-without accumulator operands or hardware synchronization. Existing LDS
-ownership barriers remain responsible for inter-wave safety. Stage2 has no
+without accumulator operands or hardware synchronization. Compiler-inserted LDS
+dependency barriers provide inter-wave safety. Stage2 has no
 artificial per-accumulator fences; its split publication chain is unchanged.
 The last eight current-tile MFMAs consume those registers after the next
 global-load prologue, before the following tile's dependent MFMAs; the final tile
@@ -235,7 +239,9 @@ the latter adds 512 bytes of shared metadata, not an additional activation tile.
 The BF16 CShuffle view reinterprets a retired A slot in place, without an
 additional shared-memory tile.
 
-The textual library is package data in `sched_barrier.ll`. Its SHA256 digest
+The shared `tokenspeed_kernel_amd._scheduling` utility exposes `sched_barrier`
+and `sched_barrier_compile_options` for AMD kernels. The textual library is
+package data in `tokenspeed_kernel_amd/sched_barrier.ll`. Its SHA256 digest
 is passed as the `SCHED_LIBRARY_HASH` constexpr, so content changes invalidate
 the compiled-kernel cache without renaming the file or symbol. The digest is
 computed once per process; restart after editing the library. No dependency
