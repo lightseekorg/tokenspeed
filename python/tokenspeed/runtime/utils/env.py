@@ -280,6 +280,7 @@ class Envs:
 
     # Quantization
     TOKENSPEED_NVFP4_GEMM_SWIGLU_NVFP4_QUANT = EnvBool(True)
+    TOKENSPEED_KERNEL_WARMUP_BUNDLE = EnvStr(None)
 
     # EPLB
     TOKENSPEED_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")

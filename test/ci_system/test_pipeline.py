@@ -25,6 +25,7 @@ from pipeline import (
     get_excluded_runner_labels,
     get_jit_cache_env,
     get_runner_specific_env,
+    get_server_warmup_env,
     get_stage_commands,
     is_amd_runner,
     is_cpu_only_runner,
@@ -607,9 +608,10 @@ def test_server_warmup_precedes_server_and_injects_bundle():
         "--config nvidia/flashinfer/model/profile "
         "--output-dir .ci-artifacts/kernel-warmup --device 0"
     ]
-    assert stages[1][1]["command"].endswith(
-        "--kernel-warmup-bundle .ci-artifacts/kernel-warmup"
-    )
+    assert stages[1][1]["command"] == "ts serve --model example/model"
+    assert get_server_warmup_env(task) == {
+        "TOKENSPEED_KERNEL_WARMUP_BUNDLE": ".ci-artifacts/kernel-warmup"
+    }
 
 
 def test_slurm_execution_only_cleans_its_process_group(monkeypatch, tmp_path):

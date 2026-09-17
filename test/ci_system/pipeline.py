@@ -95,6 +95,8 @@ ISOLATED_JIT_CACHE_RUNNER_PREFIXES = (
 )
 NVIDIA_GPU_CLEANUP_RUNNER_PREFIXES = ("gb200", "b300")
 PERF_DIAGNOSTIC_RUNNERS = ("b300-4gpu",)
+KERNEL_WARMUP_BUNDLE_DIR = ".ci-artifacts/kernel-warmup"
+KERNEL_WARMUP_BUNDLE_ENV = "TOKENSPEED_KERNEL_WARMUP_BUNDLE"
 
 
 def is_amd_runner(runner: str) -> bool:
@@ -275,12 +277,6 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
             raise ValueError(
                 f"{path}: server.warmup_config requires an eval/perf server command"
             )
-        if "--kernel-warmup-bundle" in str(server["command"]):
-            raise ValueError(
-                f"{path}: server.command must not set --kernel-warmup-bundle "
-                "when server.warmup_config is configured"
-            )
-
     if "slurm" in data:
         slurm = data["slurm"]
         if not isinstance(slurm, dict):
@@ -1707,6 +1703,12 @@ def stop_server(process: subprocess.Popen[str] | None) -> None:
     process.wait(timeout=5)
 
 
+def get_server_warmup_env(task: Dict[str, Any]) -> Dict[str, str]:
+    if (task.get("server") or {}).get("warmup_config") is None:
+        return {}
+    return {KERNEL_WARMUP_BUNDLE_ENV: KERNEL_WARMUP_BUNDLE_DIR}
+
+
 def get_stage_commands(task: Dict[str, Any]) -> List[tuple[str, Any]]:
     stages: List[tuple[str, Any]] = []
     install = task.get("install", [])
@@ -1737,18 +1739,13 @@ def get_stage_commands(task: Dict[str, Any]) -> List[tuple[str, Any]]:
         server = dict(task.get("server", {}))
         warmup_config = server.pop("warmup_config", None)
         if warmup_config is not None:
-            bundle_dir = ".ci-artifacts/kernel-warmup"
             warmup_command = (
-                f"rm -rf {shlex.quote(bundle_dir)} && "
+                f"rm -rf {shlex.quote(KERNEL_WARMUP_BUNDLE_DIR)} && "
                 "python3 -m tokenspeed_kernel.warmup "
                 f"--config {shlex.quote(warmup_config)} "
-                f"--output-dir {shlex.quote(bundle_dir)} --device 0"
+                f"--output-dir {shlex.quote(KERNEL_WARMUP_BUNDLE_DIR)} --device 0"
             )
             stages.append(("server.warmup", [warmup_command]))
-            server["command"] = (
-                f"{server['command']} "
-                f"--kernel-warmup-bundle {shlex.quote(bundle_dir)}"
-            )
         if server.get("command"):
             stages.append(("server", server))
         section = task.get(task_type, {})
@@ -1840,6 +1837,7 @@ def execute_task(
     env["CI_TASK_NAME"] = str(task["name"])
     env["CI_TASK_TYPE"] = str(task["type"])
     env["CI_RUNNER_LABEL"] = runner
+    env.update(get_server_warmup_env(task))
     env.update(get_default_runner_env(runner))
     env.update(get_runner_specific_env(task, declared_runner))
 

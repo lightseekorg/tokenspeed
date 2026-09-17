@@ -292,7 +292,6 @@ class ServerArgs:
     disable_kvstore: bool = False
     enforce_eager: bool = False
     disable_cuda_graph_padding: bool = False
-    kernel_warmup_bundle: str | None = None
     enable_cudagraph_gc: bool = False
     disable_nccl_nvls: bool = False
     disable_symm_mem: bool = False
@@ -1843,12 +1842,6 @@ class ServerArgs:
             "--disable-cuda-graph-padding",
             action="store_true",
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
-        )
-        parser.add_argument(
-            "--kernel-warmup-bundle",
-            type=str,
-            default=ServerArgs.kernel_warmup_bundle,
-            help="Load a generated TokenSpeed kernel warmup bundle before CUDA graph capture.",
         )
         parser.add_argument(
             "--enable-cudagraph-gc",

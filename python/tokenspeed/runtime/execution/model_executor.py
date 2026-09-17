@@ -269,7 +269,7 @@ class ModelExecutorConfig:
             global_rank=global_rank,
             cudagraph_capture_sizes=server_args.cudagraph_capture_sizes,
             disable_cuda_graph_padding=server_args.disable_cuda_graph_padding,
-            kernel_warmup_bundle=server_args.kernel_warmup_bundle,
+            kernel_warmup_bundle=envs.TOKENSPEED_KERNEL_WARMUP_BUNDLE.get(),
             enable_cudagraph_gc=server_args.enable_cudagraph_gc,
             max_cudagraph_capture_size=server_args.max_cudagraph_capture_size,
             disable_prefill_graph=disable_prefill_graph,
