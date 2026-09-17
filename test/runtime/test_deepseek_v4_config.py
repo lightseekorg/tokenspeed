@@ -2180,7 +2180,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         target_head = SimpleNamespace(weight=torch.ones(4, 3), tp_size=2)
         drafter = object.__new__(DeepseekV4DSpark)
         drafter.draft_model = SimpleNamespace(lm_head=draft_head)
-        drafter.target_layer_ids = [1, 3]
         target_model = SimpleNamespace(
             lm_head=target_head,
             logits_processor=SimpleNamespace(tp_group=(0, 1)),
@@ -2189,9 +2188,12 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         drafter.wire_target(target_model)
 
+        self.assertIs(drafter.target_model, target_model)
         self.assertIs(drafter.lm_head, draft_head)
         self.assertEqual(drafter.tp_group, (0, 1))
-        target_model.set_dspark_layers_to_capture.assert_called_once_with([1, 3])
+        # The draft model's configure_target installs the capture layers
+        # before any drafter exists; wiring only binds execution resources.
+        target_model.set_dspark_layers_to_capture.assert_not_called()
 
     def test_dspark_tp_only_contract_uses_resolved_mapping(self):
         mapping = SimpleNamespace(attn=SimpleNamespace(dp_size=1, cp_size=1))
