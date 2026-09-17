@@ -230,12 +230,15 @@ class MoELayer(torch.nn.Module):
         if input_dtype not in {torch.float16, torch.bfloat16}:
             input_dtype = torch.float16
 
-        deepep_group = None
+        # Moe Backend plan
+        moe_backend = get_moe_backend().value
+        moe_backend = None if moe_backend == "auto" else moe_backend
+        process_group = None
         deepep_mode = None
         deepep_low_latency_max_num_tokens_per_gpu = None
         if self._spec.use_deepep:
             mapping = global_server_args_dict["mapping"]
-            deepep_group = pg_manager.get_process_group(
+            process_group = pg_manager.get_process_group(
                 "nccl",
                 mapping.moe.tp_ep_group,
             )
@@ -247,10 +250,9 @@ class MoELayer(torch.nn.Module):
             deepep_low_latency_max_num_tokens_per_gpu = global_server_args_dict[
                 "low_latency_max_num_tokens_per_gpu"
             ]
-
-        # Moe Backend plan
-        moe_backend = get_moe_backend().value
-        moe_backend = None if moe_backend == "auto" else moe_backend
+        elif moe_backend == "mega_moe":
+            mapping = global_server_args_dict["mapping"]
+            process_group = pg_manager.get_device_process_group(mapping.moe.ep_group)
         self.plan = tokenspeed_kernel.moe_plan(
             self._quant_kind,
             input_dtype=input_dtype,
@@ -263,7 +265,7 @@ class MoELayer(torch.nn.Module):
             fp8_scale_block_shape=fp8_scale_block_shape,
             internal_activation_dtype=internal_activation_dtype,
             with_bias=with_bias,
-            deepep_group=deepep_group,
+            process_group=process_group,
             deepep_mode=deepep_mode,
             deepep_low_latency_max_num_tokens_per_gpu=(
                 deepep_low_latency_max_num_tokens_per_gpu

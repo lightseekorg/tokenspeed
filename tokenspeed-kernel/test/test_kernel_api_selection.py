@@ -2508,7 +2508,7 @@ def test_deepep_selects_apply_kernel_by_weight_dtype_without_pinned_solution(
             ispp=256,
             fp8_scale_block_shape=(128, 128) if weight_dtype == "fp8" else None,
             internal_activation_dtype="input",
-            deepep_group=object(),
+            process_group=object(),
             deepep_mode=deepep_mode,
         )
     finally:
@@ -2544,7 +2544,7 @@ def test_nvfp4_deepep_rejects_modes_without_normal_legs(
                 ep_size=2,
                 ispp=256,
                 internal_activation_dtype="input",
-                deepep_group=object(),
+                process_group=object(),
                 deepep_mode=deepep_mode,
             )
     finally:
@@ -2579,6 +2579,7 @@ def test_deepep_plan_carries_mode_and_low_latency_capacity(b200_platform) -> Non
     if registry.get_by_name(kernel_name) is None:
         pytest.skip(f"{kernel_name!r} is unavailable (optional backend missing)")
 
+    process_group = object()
     real_platform = Platform.get()
     try:
         Platform.override(b200_platform)
@@ -2591,7 +2592,7 @@ def test_deepep_plan_carries_mode_and_low_latency_capacity(b200_platform) -> Non
             ep_size=2,
             ispp=256,
             fp8_scale_block_shape=(128, 128),
-            deepep_group=object(),
+            process_group=process_group,
             deepep_mode="auto",
             deepep_low_latency_max_num_tokens_per_gpu=256,
         )
@@ -2599,6 +2600,7 @@ def test_deepep_plan_carries_mode_and_low_latency_capacity(b200_platform) -> Non
         Platform.override(real_platform)
         registry.clear_cache()
 
+    assert plan["process_group"] is process_group
     assert plan["deepep_mode"] == "auto"
     assert plan["deepep_low_latency_max_num_tokens_per_gpu"] == 256
 
@@ -3597,7 +3599,7 @@ def _moe_apply_nvfp4_deepep_cutedsl() -> object:
         ep_size=2,
         ispp=128,
         internal_activation_dtype="input",
-        deepep_group=object(),
+        process_group=object(),
         deepep_mode="low_latency",
         solution="flashinfer_cutedsl",
     )
@@ -3622,7 +3624,7 @@ def _moe_apply_fp8_deepep_deep_gemm() -> object:
         ispp=256,
         fp8_scale_block_shape=(128, 128),
         internal_activation_dtype="input",
-        deepep_group=object(),
+        process_group=object(),
         solution="deep_gemm",
     )
     _assert_moe_plan(
