@@ -38,10 +38,15 @@ from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["prepare_moe_apply", "prepare_sigmoid_bias_topk"]
+__all__ = [
+    "prepare_latent_expert_shared",
+    "prepare_latent_input",
+    "prepare_moe_apply",
+    "prepare_sigmoid_bias_topk",
+]
 
 
-_IMPLEMENTED_MODEL_PROFILES = frozenset({"glm53_flash_tp4"})
+_IMPLEMENTED_MODEL_PROFILES = frozenset({"glm53_flash_tp4", "kimi_k3_tp8"})
 _IMPLEMENTED_INPUT_DTYPES = {
     "bfloat16": torch.bfloat16,
 }
@@ -54,14 +59,17 @@ _IMPLEMENTED_ROUTING_WEIGHT_DTYPES = {
 }
 _IMPLEMENTED_WEIGHT_FORMATS = {
     "fp8": torch.float8_e4m3fn,
+    "mxfp4": torch.uint8,
 }
-_IMPLEMENTED_ACTIVATIONS = frozenset({"silu", "swiglu"})
+_IMPLEMENTED_ACTIVATIONS = frozenset({"silu", "situ", "swiglu"})
 _IMPLEMENTED_ROUTING_MODES = frozenset({"precomputed_topk"})
 _IMPLEMENTED_ROUTE_SCOPES = frozenset({"global", "local"})
-_IMPLEMENTED_ROUTE_DISTRIBUTIONS = frozenset({"router"})
-_IMPLEMENTED_TOKEN_COUNT_SCOPES = frozenset({"local"})
+_IMPLEMENTED_ROUTE_DISTRIBUTIONS = frozenset({"balanced_global", "router"})
+_IMPLEMENTED_TOKEN_COUNT_SCOPES = frozenset({"global", "local"})
 _IMPLEMENTED_INTERNAL_ACTIVATION_DTYPES = frozenset({"input"})
 _IMPLEMENTED_FP8_BLOCK_SHAPES = frozenset({(128, 128)})
+_IMPLEMENTED_MXFP4_GROUP_SIZES = frozenset({32})
+_KIMI_DIRECT_ROUTER = "kimi3_sigmoid_bias_topk"
 
 
 def _implemented_value(
@@ -160,6 +168,28 @@ def _select_sigmoid_bias_topk(
     return spec
 
 
+def _uses_kimi_direct_router(
+    platform: PlatformInfo,
+    *,
+    router_logits_dtype: torch.dtype,
+    tokens: int,
+    experts: int,
+    topk: int,
+) -> bool:
+    if platform.is_nvidia:
+        max_rows = 256
+    elif platform.is_cdna4:
+        max_rows = 1
+    else:
+        max_rows = 0
+    return (
+        router_logits_dtype is torch.float32
+        and 0 < tokens <= max_rows
+        and experts == 896
+        and topk == 16
+    )
+
+
 def _correction_bias(
     experts: int,
     *,
@@ -203,6 +233,68 @@ def _routing_tensors(
     )
     if expert_start:
         topk_ids = topk_ids + expert_start
+    return router_logits, topk_weights.contiguous(), topk_ids.contiguous()
+
+
+def _balanced_global_routing_tensors(
+    *,
+    tokens: int,
+    experts: int,
+    topk: int,
+    ep_size: int,
+    seed: int,
+    routed_scaling_factor: float,
+    normalize_topk_weights: bool,
+    router_logits_dtype: torch.dtype,
+    weights_dtype: torch.dtype,
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if experts % ep_size or topk % ep_size:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "Balanced global routing requires experts and topk divisible by ep_size",
+        )
+    local_experts = experts // ep_size
+    routes_per_rank = topk // ep_size
+    if routes_per_rank > local_experts:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "Balanced global routing selects too many experts per EP rank",
+        )
+
+    router_logits = 0.01 * _randn(
+        (tokens, experts),
+        generator=generator,
+        dtype=router_logits_dtype,
+    )
+    token_offsets = (
+        torch.arange(tokens, dtype=torch.int64)[:, None, None] * routes_per_rank
+    )
+    rank_offsets = (
+        torch.arange(ep_size, dtype=torch.int64)[None, :, None] * local_experts
+    )
+    route_offsets = torch.arange(routes_per_rank, dtype=torch.int64)[None, None, :] * 17
+    ids = rank_offsets + (seed + token_offsets + route_offsets) % local_experts
+    ids = ids.reshape(tokens, topk).to(device=router_logits.device)
+    selected_logits = torch.linspace(
+        8.0,
+        9.0,
+        topk,
+        device=router_logits.device,
+        dtype=router_logits_dtype,
+    ).expand(tokens, -1)
+    router_logits.scatter_(1, ids, selected_logits)
+
+    from tokenspeed_kernel.ops import moe as moe_ops
+
+    topk_weights, topk_ids = moe_ops.moe_sigmoid_bias_topk(
+        router_logits,
+        _correction_bias(experts, device=router_logits.device),
+        topk,
+        routed_scaling_factor=routed_scaling_factor,
+        normalize_topk_weights=normalize_topk_weights,
+        weights_dtype=weights_dtype,
+    )
     return router_logits, topk_weights.contiguous(), topk_ids.contiguous()
 
 
@@ -264,6 +356,22 @@ def _ones(shape: tuple[int, ...]) -> torch.Tensor:
     return torch.ones(shape, dtype=torch.float32, device="cuda")
 
 
+def _device_zeros(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    return torch.zeros(shape, dtype=dtype, device="cuda")
+
+
+def _device_empty(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    return torch.empty(shape, dtype=dtype, device="cuda")
+
+
+def _device_full(
+    shape: tuple[int, ...],
+    value: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    return torch.full(shape, value, dtype=dtype, device="cuda")
+
+
 def _make_fp8_weights(
     *,
     num_local_experts: int,
@@ -304,6 +412,91 @@ def _make_fp8_weights(
     )
 
 
+def _mxfp4_weight_shapes(
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size_per_partition: int,
+    group_size: int,
+) -> dict[str, tuple[int, ...]]:
+    if hidden_size % 2 or intermediate_size_per_partition % 2:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "MoE MXFP4 packed dimensions must be even",
+        )
+    if hidden_size % group_size or intermediate_size_per_partition % group_size:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            f"MoE MXFP4 dimensions must be divisible by group size {group_size}",
+        )
+    return {
+        "w13": (
+            num_local_experts,
+            2 * intermediate_size_per_partition,
+            hidden_size // 2,
+        ),
+        "w13_scale": (
+            num_local_experts,
+            2 * intermediate_size_per_partition,
+            hidden_size // group_size,
+        ),
+        "w2": (
+            num_local_experts,
+            hidden_size,
+            intermediate_size_per_partition // 2,
+        ),
+        "w2_scale": (
+            num_local_experts,
+            hidden_size,
+            intermediate_size_per_partition // group_size,
+        ),
+    }
+
+
+def _make_mxfp4_weights(
+    *,
+    num_experts: int,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size_per_partition: int,
+    group_size: int,
+    activation: str,
+    swiglu_limit: float | None,
+    situ_beta: float | None,
+    situ_linear_beta: float | None,
+    ep_rank: int,
+    ep_size: int,
+) -> SimpleNamespace:
+    shapes = _mxfp4_weight_shapes(
+        num_local_experts=num_local_experts,
+        hidden_size=hidden_size,
+        intermediate_size_per_partition=intermediate_size_per_partition,
+        group_size=group_size,
+    )
+    swiglu_arg = (
+        SimpleNamespace(alpha=1.0, limit=swiglu_limit)
+        if activation == "swiglu"
+        else None
+    )
+    return SimpleNamespace(
+        w13_weight=_device_zeros(shapes["w13"], torch.uint8),
+        w13_weight_scale=_device_full(shapes["w13_scale"], 127, torch.uint8),
+        w2_weight=_device_zeros(shapes["w2"], torch.uint8),
+        w2_weight_scale=_device_full(shapes["w2_scale"], 127, torch.uint8),
+        activation=activation,
+        activation_situ_beta=situ_beta,
+        activation_situ_linear_beta=situ_linear_beta,
+        swiglu_arg=swiglu_arg,
+        swiglu_beta=None,
+        w13_input_layout="concatenated",
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+        num_experts=num_experts,
+        num_local_experts=num_local_experts,
+        quant_config=None,
+    )
+
+
 def prepare_sigmoid_bias_topk(
     request: BenchmarkRequest,
     platform: PlatformInfo,
@@ -334,13 +527,24 @@ def prepare_sigmoid_bias_topk(
     normalize_topk_weights = parameters["normalize_topk_weights"]
 
     load_builtin_kernels()
-    spec = _select_sigmoid_bias_topk(
-        request,
+    direct_router = _uses_kimi_direct_router(
         platform,
         router_logits_dtype=router_logits_dtype,
         tokens=tokens,
         experts=experts,
         topk=topk,
+    )
+    spec = (
+        None
+        if direct_router
+        else _select_sigmoid_bias_topk(
+            request,
+            platform,
+            router_logits_dtype=router_logits_dtype,
+            tokens=tokens,
+            experts=experts,
+            topk=topk,
+        )
     )
     generator = _generator(request.seed)
     router_logits = _randn(
@@ -376,6 +580,7 @@ def prepare_sigmoid_bias_topk(
             "normalize_topk_weights": normalize_topk_weights,
         },
         validation=None,
+        implementation_name=_KIMI_DIRECT_ROUTER if direct_router else None,
     )
 
 
@@ -411,7 +616,20 @@ def prepare_moe_apply(
         _IMPLEMENTED_ROUTER_DTYPES,
     )
     weight_dtype_name, weight_dtype = _parse_weight_dtype(parameters["weight_dtype"])
-    block_shape = _parse_block_shape(parameters["fp8_scale_block_shape"])
+    block_shape = (
+        _parse_block_shape(parameters["fp8_scale_block_shape"])
+        if weight_dtype_name == "fp8"
+        else None
+    )
+    mxfp4_group_size = (
+        _implemented_value(
+            "mxfp4_group_size",
+            parameters["mxfp4_group_size"],
+            _IMPLEMENTED_MXFP4_GROUP_SIZES,
+        )
+        if weight_dtype_name == "mxfp4"
+        else None
+    )
     activation = _implemented_value(
         "activation",
         parameters["activation"],
@@ -420,6 +638,17 @@ def prepare_moe_apply(
     swiglu_limit = None
     if activation == "swiglu":
         swiglu_limit = float(parameters["swiglu_limit"])
+    situ_beta = None
+    situ_linear_beta = None
+    if activation == "situ":
+        if weight_dtype_name != "mxfp4":
+            raise BenchmarkCaseError(
+                BenchmarkStatus.INVALID_CASE,
+                "MoE SiTU apply benchmarks require MXFP4 weights",
+            )
+        situ_beta = float(parameters["activation_situ_beta"])
+        linear_beta = parameters["activation_situ_linear_beta"]
+        situ_linear_beta = None if linear_beta is None else float(linear_beta)
     routing_mode = _implemented_value(
         "routing_mode",
         parameters["routing_mode"],
@@ -435,11 +664,17 @@ def prepare_moe_apply(
         parameters["route_distribution"],
         _IMPLEMENTED_ROUTE_DISTRIBUTIONS,
     )
+    if route_distribution == "balanced_global" and route_scope != "global":
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "Balanced global routing requires route_scope='global'",
+        )
     token_count_scope = _implemented_value(
         "token_count_scope",
         parameters["token_count_scope"],
         _IMPLEMENTED_TOKEN_COUNT_SCOPES,
     )
+    token_partition_count = tp_size * ep_size
     routed_scaling_factor = float(parameters["routed_scaling_factor"])
     normalize_topk_weights = parameters["normalize_topk_weights"]
     internal_activation_dtype = _implemented_value(
@@ -499,28 +734,58 @@ def prepare_moe_apply(
     )
     route_experts = num_local_experts if route_scope == "local" else num_experts
     expert_start = ep_rank * num_local_experts if route_scope == "local" else 0
-    router_logits, topk_weights, topk_ids = _routing_tensors(
-        tokens=tokens,
-        experts=route_experts,
-        topk=topk,
-        routed_scaling_factor=routed_scaling_factor,
-        normalize_topk_weights=normalize_topk_weights,
-        router_logits_dtype=router_logits_dtype,
-        weights_dtype=torch.float32,
-        generator=generator,
-        expert_start=expert_start,
-    )
-    weights = _make_fp8_weights(
-        num_local_experts=num_local_experts,
-        hidden_size=hidden_size,
-        intermediate_size_per_partition=intermediate_size_per_partition,
-        block_shape=block_shape,
-        weight_dtype=weight_dtype,
-        activation=activation,
-        swiglu_limit=swiglu_limit,
-        ep_rank=ep_rank,
-        ep_size=ep_size,
-    )
+    if route_distribution == "balanced_global":
+        router_logits, topk_weights, topk_ids = _balanced_global_routing_tensors(
+            tokens=tokens,
+            experts=num_experts,
+            topk=topk,
+            ep_size=ep_size,
+            seed=request.seed,
+            routed_scaling_factor=routed_scaling_factor,
+            normalize_topk_weights=normalize_topk_weights,
+            router_logits_dtype=router_logits_dtype,
+            weights_dtype=torch.float32,
+            generator=generator,
+        )
+    else:
+        router_logits, topk_weights, topk_ids = _routing_tensors(
+            tokens=tokens,
+            experts=route_experts,
+            topk=topk,
+            routed_scaling_factor=routed_scaling_factor,
+            normalize_topk_weights=normalize_topk_weights,
+            router_logits_dtype=router_logits_dtype,
+            weights_dtype=torch.float32,
+            generator=generator,
+            expert_start=expert_start,
+        )
+    if weight_dtype_name == "fp8":
+        assert block_shape is not None
+        weights = _make_fp8_weights(
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            block_shape=block_shape,
+            weight_dtype=weight_dtype,
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+            ep_rank=ep_rank,
+            ep_size=ep_size,
+        )
+    else:
+        weights = _make_mxfp4_weights(
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            group_size=mxfp4_group_size,
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            ep_rank=ep_rank,
+            ep_size=ep_size,
+        )
     moe_ops.moe_process_weights(plan, weights)
 
     def invoke() -> object:
@@ -531,8 +796,14 @@ def prepare_moe_apply(
             router_logits,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            num_tokens_global=tokens * ep_size,
-            max_num_tokens_per_gpu=tokens,
+            num_tokens_global=(
+                tokens * ep_size if token_count_scope == "local" else tokens
+            ),
+            max_num_tokens_per_gpu=(
+                tokens
+                if token_count_scope == "local"
+                else math.ceil(tokens / token_partition_count)
+            ),
             do_finalize=True,
         )
 
@@ -556,6 +827,8 @@ def prepare_moe_apply(
             "weight_dtype": weight_dtype_name,
             "activation": activation,
             "swiglu_limit": swiglu_limit,
+            "activation_situ_beta": situ_beta,
+            "activation_situ_linear_beta": situ_linear_beta,
             "routing_mode": routing_mode,
             "route_scope": route_scope,
             "route_distribution": route_distribution,
@@ -563,6 +836,331 @@ def prepare_moe_apply(
             "routed_scaling_factor": routed_scaling_factor,
             "normalize_topk_weights": normalize_topk_weights,
             "fp8_scale_block_shape": block_shape,
+            "mxfp4_group_size": (
+                mxfp4_group_size if weight_dtype_name == "mxfp4" else None
+            ),
+            "topk_generation": "sigmoid_bias_topk",
+        },
+        validation=None,
+    )
+
+
+def _selected_spec(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+    signature: str,
+    traits: dict[str, object],
+) -> KernelSpec:
+    try:
+        selected = select_kernel(
+            request.family,
+            request.mode,
+            signature,
+            platform=platform,
+            traits=traits,
+        )
+    except NoKernelFoundError as error:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.NOT_APPLICABLE,
+            str(error),
+        ) from error
+    spec = KernelRegistry.get().get_by_name(selected.name)
+    if spec is None:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.REGISTRATION_MISSING,
+            f"Selected registration {selected.name!r} is not available",
+        )
+    return spec
+
+
+def _packed_projection_weights(
+    *,
+    hidden_size: int,
+    num_experts: int,
+    latent_size: int,
+    shared_size: int,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    rows = num_experts + latent_size + 2 * shared_size
+    packed = _device_zeros((rows, hidden_size), dtype)
+    router_weight = packed.narrow(0, 0, num_experts)
+    routed_weight = packed.narrow(0, num_experts, latent_size)
+    shared_gate_up_weight = packed.narrow(
+        0,
+        num_experts + latent_size,
+        2 * shared_size,
+    )
+    return router_weight, routed_weight, shared_gate_up_weight
+
+
+def prepare_latent_input(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare one packed latent-MoE input-projection benchmark."""
+
+    _validate_request_options(request)
+    parameters = request.parameters
+    model_profile = _implemented_value(
+        "model_profile",
+        parameters["model_profile"],
+        _IMPLEMENTED_MODEL_PROFILES,
+    )
+    tokens = parameters["tokens"]
+    hidden_size = parameters["hidden_size"]
+    num_experts = parameters["num_experts"]
+    latent_size = parameters["latent_size"]
+    shared_size = parameters["shared_size"]
+    input_dtype = _parse_dtype(
+        "input_dtype",
+        parameters["input_dtype"],
+        _IMPLEMENTED_INPUT_DTYPES,
+    )
+    situ_beta = float(parameters["activation_situ_beta"])
+    linear_beta = parameters["activation_situ_linear_beta"]
+    situ_linear_beta = None if linear_beta is None else float(linear_beta)
+
+    generator = _generator(request.seed)
+    hidden_states = _randn(
+        (tokens, hidden_size),
+        generator=generator,
+        dtype=input_dtype,
+    )
+    router_weight, routed_weight, shared_gate_up_weight = _packed_projection_weights(
+        hidden_size=hidden_size,
+        num_experts=num_experts,
+        latent_size=latent_size,
+        shared_size=shared_size,
+        dtype=input_dtype,
+    )
+
+    load_builtin_kernels()
+    from tokenspeed_kernel.ops.moe.latent_input import (
+        REGION_ALIGNMENT,
+        latent_moe_input_projections,
+        packed_projection_weight_view,
+    )
+
+    signature = format_signature(
+        hidden_states=dense_tensor_format(hidden_states.dtype),
+        router_weight=dense_tensor_format(router_weight.dtype),
+        routed_weight=dense_tensor_format(routed_weight.dtype),
+        shared_gate_up_weight=dense_tensor_format(shared_gate_up_weight.dtype),
+    )
+    weights = (router_weight, routed_weight, shared_gate_up_weight)
+    weights_packed = packed_projection_weight_view(*weights) is not None and all(
+        weight.shape[0] % REGION_ALIGNMENT == 0 for weight in weights
+    )
+    traits = {
+        "tokens": tokens,
+        "hidden_size": hidden_size,
+        "num_experts": num_experts,
+        "latent_size": latent_size,
+        "shared_size": shared_size,
+        "inputs_contiguous": all(tensor.is_contiguous() for tensor in weights),
+        "weights_packed": weights_packed,
+        "hidden_size_multiple_64": hidden_size % 64 == 0,
+    }
+    spec = _selected_spec(request, platform, signature, traits)
+
+    def invoke() -> object:
+        return latent_moe_input_projections(
+            hidden_states,
+            router_weight,
+            routed_weight,
+            shared_gate_up_weight,
+            gate_clamp=situ_beta,
+            up_clamp=situ_linear_beta,
+        )
+
+    return PreparedBenchmark(
+        registration=spec,
+        invocation=PreparedInvocation(invoke=invoke),
+        parameters={
+            "model_profile": model_profile,
+            "tokens": tokens,
+            "hidden_size": hidden_size,
+            "num_experts": num_experts,
+            "latent_size": latent_size,
+            "shared_size": shared_size,
+            "input_dtype": str(input_dtype).removeprefix("torch."),
+            "activation_situ_beta": situ_beta,
+            "activation_situ_linear_beta": situ_linear_beta,
+            "weights_packed": weights_packed,
+        },
+        validation=None,
+    )
+
+
+def prepare_latent_expert_shared(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare one joint latent routed-expert and shared-projection benchmark."""
+
+    _validate_request_options(request)
+    parameters = request.parameters
+    model_profile = _implemented_value(
+        "model_profile",
+        parameters["model_profile"],
+        _IMPLEMENTED_MODEL_PROFILES,
+    )
+    tokens = parameters["tokens"]
+    latent_size = parameters["latent_size"]
+    intermediate_size = parameters["intermediate_size"]
+    num_experts = parameters["num_experts"]
+    num_local_experts = parameters["num_local_experts"]
+    topk = parameters["topk"]
+    ep_size = parameters["ep_size"]
+    ep_rank = parameters["ep_rank"]
+    shared_size = parameters["shared_size"]
+    output_size = parameters["output_size"]
+    if ep_rank >= ep_size or num_local_experts * ep_size != num_experts:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "Latent MoE EP placement must evenly cover the global experts",
+        )
+    input_dtype = _parse_dtype(
+        "input_dtype",
+        parameters["input_dtype"],
+        _IMPLEMENTED_INPUT_DTYPES,
+    )
+    router_logits_dtype = _parse_dtype(
+        "router_logits_dtype",
+        parameters["router_logits_dtype"],
+        _IMPLEMENTED_ROUTER_DTYPES,
+    )
+    group_size = _implemented_value(
+        "mxfp4_group_size",
+        parameters["mxfp4_group_size"],
+        _IMPLEMENTED_MXFP4_GROUP_SIZES,
+    )
+    situ_beta = float(parameters["activation_situ_beta"])
+    linear_beta = parameters["activation_situ_linear_beta"]
+    situ_linear_beta = None if linear_beta is None else float(linear_beta)
+    routed_scaling_factor = float(parameters["routed_scaling_factor"])
+    normalize_topk_weights = parameters["normalize_topk_weights"]
+
+    generator = _generator(request.seed)
+    hidden_states = _randn(
+        (tokens, latent_size),
+        generator=generator,
+        dtype=input_dtype,
+    )
+    router_logits, topk_weights, topk_ids = _balanced_global_routing_tensors(
+        tokens=tokens,
+        experts=num_experts,
+        topk=topk,
+        ep_size=ep_size,
+        seed=request.seed,
+        routed_scaling_factor=routed_scaling_factor,
+        normalize_topk_weights=normalize_topk_weights,
+        router_logits_dtype=router_logits_dtype,
+        weights_dtype=torch.float32,
+        generator=generator,
+    )
+    weights = _make_mxfp4_weights(
+        num_experts=num_experts,
+        num_local_experts=num_local_experts,
+        hidden_size=latent_size,
+        intermediate_size_per_partition=intermediate_size,
+        group_size=group_size,
+        activation="situ",
+        swiglu_limit=None,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+    )
+    shared_input = _randn(
+        (tokens, shared_size),
+        generator=generator,
+        dtype=input_dtype,
+    )
+    shared_weight = _device_zeros((output_size, shared_size), input_dtype)
+    routed_out = torch.empty_like(hidden_states)
+    shared_out = _device_empty((tokens, output_size), input_dtype)
+    expert_start = ep_rank * num_local_experts
+
+    load_builtin_kernels()
+    signature = format_signature(
+        hidden_states=dense_tensor_format(hidden_states.dtype),
+        w13_weight=dense_tensor_format(weights.w13_weight.dtype),
+        w13_scale=dense_tensor_format(weights.w13_weight_scale.dtype),
+        w2_weight=dense_tensor_format(weights.w2_weight.dtype),
+        w2_scale=dense_tensor_format(weights.w2_weight_scale.dtype),
+        topk_weights=dense_tensor_format(topk_weights.dtype),
+        topk_ids=dense_tensor_format(topk_ids.dtype),
+        shared_input=dense_tensor_format(shared_input.dtype),
+        shared_weight=dense_tensor_format(shared_weight.dtype),
+        routed_out=dense_tensor_format(routed_out.dtype),
+        shared_out=dense_tensor_format(shared_out.dtype),
+    )
+    traits = {
+        "tokens": tokens,
+        "latent_size": latent_size,
+        "topk": topk,
+        "num_local_experts": num_local_experts,
+        "intermediate_size": intermediate_size,
+        "shared_size": shared_size,
+        "output_size": output_size,
+        "linear_weights": True,
+        "inputs_contiguous": True,
+    }
+    spec = _selected_spec(request, platform, signature, traits)
+
+    from tokenspeed_kernel.ops.moe.latent_decode import latent_moe_expert_shared
+
+    def reset() -> None:
+        routed_out.zero_()
+        shared_out.zero_()
+
+    def invoke() -> object:
+        return latent_moe_expert_shared(
+            hidden_states,
+            weights.w13_weight,
+            weights.w13_weight_scale,
+            weights.w2_weight,
+            weights.w2_weight_scale,
+            topk_weights,
+            topk_ids,
+            shared_input,
+            shared_weight,
+            activation_clamp=situ_beta,
+            linear_clamp=situ_linear_beta,
+            expert_start=expert_start,
+            w13_interleaved=False,
+            routed_out=routed_out,
+            shared_out=shared_out,
+        )
+
+    return PreparedBenchmark(
+        registration=spec,
+        invocation=PreparedInvocation(invoke=invoke, reset=reset),
+        parameters={
+            "model_profile": model_profile,
+            "tokens": tokens,
+            "latent_size": latent_size,
+            "intermediate_size": intermediate_size,
+            "num_experts": num_experts,
+            "num_local_experts": num_local_experts,
+            "topk": topk,
+            "ep_size": ep_size,
+            "ep_rank": ep_rank,
+            "expert_start": expert_start,
+            "shared_size": shared_size,
+            "output_size": output_size,
+            "input_dtype": str(input_dtype).removeprefix("torch."),
+            "router_logits_dtype": str(router_logits_dtype).removeprefix("torch."),
+            "weight_dtype": "mxfp4",
+            "mxfp4_group_size": group_size,
+            "activation": "situ",
+            "activation_situ_beta": situ_beta,
+            "activation_situ_linear_beta": situ_linear_beta,
+            "route_scope": "global",
+            "route_distribution": "balanced_global",
+            "routed_scaling_factor": routed_scaling_factor,
+            "normalize_topk_weights": normalize_topk_weights,
             "topk_generation": "sigmoid_bias_topk",
         },
         validation=None,

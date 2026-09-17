@@ -137,13 +137,20 @@ class PreparedValidation:
 class PreparedBenchmark:
     """Operation-owned state handed to the shared graph timer."""
 
-    registration: KernelSpec
+    registration: KernelSpec | None
     invocation: PreparedInvocation
     parameters: dict[str, Any]
     validation: PreparedValidation | None = None
+    implementation_name: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "parameters", dict(self.parameters))
+
+    @property
+    def selected_implementation_name(self) -> str | None:
+        if self.implementation_name is not None:
+            return self.implementation_name
+        return self.registration.name if self.registration is not None else None
 
 
 BenchmarkGenerator = Callable[[BenchmarkRequest, PlatformInfo], PreparedBenchmark]
@@ -189,6 +196,8 @@ def _load_builtin_generators() -> None:
         prepare_kda_paged_prefill,
     )
     from tokenspeed_kernel.benchmark.generators.moe import (
+        prepare_latent_expert_shared,
+        prepare_latent_input,
         prepare_moe_apply,
         prepare_sigmoid_bias_topk,
     )
@@ -219,6 +228,10 @@ def _load_builtin_generators() -> None:
         ("moe", "sigmoid_bias_topk"), prepare_sigmoid_bias_topk
     )
     _BENCHMARK_GENERATORS.setdefault(("moe", "apply"), prepare_moe_apply)
+    _BENCHMARK_GENERATORS.setdefault(("moe", "latent_input"), prepare_latent_input)
+    _BENCHMARK_GENERATORS.setdefault(
+        ("moe", "latent_expert_shared"), prepare_latent_expert_shared
+    )
 
 
 @dataclass(frozen=True)
@@ -238,6 +251,7 @@ class KernelBenchmarkResult:
     platform_arch: str
     device_name: str
     registration_name: str | None = None
+    implementation_name: str | None = None
     solution: str | None = None
     timing_mode: str = "graph_replay"
     metric: str = "device_time_per_invocation"
@@ -290,7 +304,7 @@ _GRAPH_STATUS_BY_PHASE = {
 
 
 class KernelBenchmarkHarness:
-    """Prepare and measure one registered operation with graph replay."""
+    """Prepare and measure one operation implementation with graph replay."""
 
     def __init__(
         self,
@@ -544,8 +558,17 @@ class KernelBenchmarkHarness:
         return KernelBenchmarkResult(
             status=BenchmarkStatus.SUCCESS,
             **self._base_fields(request, platform, prepared.parameters),
-            registration_name=prepared.registration.name,
-            solution=prepared.registration.solution,
+            registration_name=(
+                prepared.registration.name
+                if prepared.registration is not None
+                else None
+            ),
+            implementation_name=prepared.selected_implementation_name,
+            solution=(
+                prepared.registration.solution
+                if prepared.registration is not None
+                else None
+            ),
             samples_us=measurement.samples_us,
             median_us=measurement.median_us,
             p90_us=measurement.p90_us,
@@ -587,9 +610,18 @@ class KernelBenchmarkHarness:
                 prepared.parameters if prepared is not None else None,
             ),
             registration_name=(
-                prepared.registration.name if prepared is not None else None
+                prepared.registration.name
+                if prepared is not None and prepared.registration is not None
+                else None
             ),
-            solution=prepared.registration.solution if prepared is not None else None,
+            implementation_name=(
+                prepared.selected_implementation_name if prepared is not None else None
+            ),
+            solution=(
+                prepared.registration.solution
+                if prepared is not None and prepared.registration is not None
+                else None
+            ),
             setup_time_ms=setup_time_ms,
             correctness=correctness,
             correctness_time_ms=correctness_time_ms,

@@ -206,6 +206,7 @@ def test_harness_returns_measurement_and_actual_registration():
 
     assert result.status is BenchmarkStatus.SUCCESS
     assert result.registration_name == "test_registration"
+    assert result.implementation_name == "test_registration"
     assert result.solution == "test_solution"
     assert result.selection_mode == "solution"
     assert result.cold_cache is True
@@ -220,6 +221,52 @@ def test_harness_returns_measurement_and_actual_registration():
     assert result.to_dict()["samples_us"] == [2.0, 3.0, 4.0]
     assert timer.cold_cache == [True]
     assert timer.measurement_blocks == [3]
+
+
+def test_harness_reports_direct_implementation_without_registration() -> None:
+    def prepare_direct(
+        request: BenchmarkRequest,
+        platform: PlatformInfo,
+    ) -> PreparedBenchmark:
+        _ = request, platform
+        return PreparedBenchmark(
+            registration=None,
+            implementation_name="unit_direct_implementation",
+            invocation=PreparedInvocation(invoke=lambda: None),
+            parameters={"size": 8},
+        )
+
+    set_benchmark_generator("unit_direct", "test", prepare_direct)
+    result = KernelBenchmarkHarness(
+        _FakeTimer(),
+        platform_provider=_platform,
+    ).run(
+        BenchmarkRequest(
+            family="unit_direct",
+            mode="test",
+            parameters={"size": 8},
+            solution=None,
+            registration=None,
+            cold_cache=True,
+            seed=7,
+        ),
+        measurement_blocks=3,
+    )
+
+    assert result.status is BenchmarkStatus.SUCCESS
+    assert result.registration_name is None
+    assert result.implementation_name == "unit_direct_implementation"
+    assert result.solution is None
+
+
+def test_harness_requires_explicit_measurement_blocks() -> None:
+    harness = KernelBenchmarkHarness(
+        _FakeTimer(),
+        platform_provider=_platform,
+    )
+
+    with pytest.raises(TypeError):
+        harness.run(_request("unit_success"))
 
 
 def test_harness_routes_fresh_runs_to_each_output_validator() -> None:

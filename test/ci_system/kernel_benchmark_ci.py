@@ -244,11 +244,16 @@ def _measurement_comparison(
         classification = "within_budget"
         detail = "change does not exceed both regression budgets"
 
-    if base_result["registration_name"] != candidate_result["registration_name"]:
+    base_implementation = base_result.get("implementation_name") or base_result.get(
+        "registration_name"
+    )
+    candidate_implementation = candidate_result.get(
+        "implementation_name"
+    ) or candidate_result.get("registration_name")
+    if base_implementation != candidate_implementation:
         detail += (
-            "; selected registration changed from "
-            f"{base_result['registration_name']} to "
-            f"{candidate_result['registration_name']}"
+            "; selected implementation changed from "
+            f"{base_implementation} to {candidate_implementation}"
         )
     if policy != candidate_policy:
         detail += "; candidate policy changed, so the baseline policy was used"
