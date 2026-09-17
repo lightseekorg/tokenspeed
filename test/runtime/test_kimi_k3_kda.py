@@ -184,6 +184,7 @@ def _stub_contract(*, prefix_granularity: int, usable_pages: int):
                 rows_per_page=prefix_granularity,
                 entry_stride_tokens=1,
                 sliding_window_tokens=None,
+                replayable=False,
             )
             if group_id == "full_attention"
             else CacheGroupSpec(
@@ -192,6 +193,7 @@ def _stub_contract(*, prefix_granularity: int, usable_pages: int):
                 sliding_window_tokens=None,
                 family="state",
                 checkpoint_granularity=prefix_granularity,
+                replayable=False,
             )
         )
         for group_id in group_ids

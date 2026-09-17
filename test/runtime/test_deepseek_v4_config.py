@@ -3073,6 +3073,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 rows_per_page=4,
                 entry_stride_tokens=1,
                 sliding_window_tokens=None,
+                replayable=False,
             ),
             CacheGroupSpec(
                 group_id="coarse",
@@ -3080,6 +3081,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 rows_per_page=256,
                 entry_stride_tokens=1,
                 sliding_window_tokens=None,
+                replayable=False,
             ),
         )
         counts = {"fine": 20001, "coarse": 1025}
@@ -3906,6 +3908,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     rows_per_page=64,
                     entry_stride_tokens=1,
                     sliding_window_tokens=128,
+                    replayable=False,
                 ),
             ),
             {"v4.swa_kv": 1024},
@@ -4249,6 +4252,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     entry_stride_tokens=1,
                     family="history",
                     sliding_window_tokens=128,
+                    replayable=False,
                 ),
             ),
             {V4_SWA_KV_GROUP_ID: 128},
@@ -5272,6 +5276,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     rows_per_page=64,
                     entry_stride_tokens=4,
                     sliding_window_tokens=None,
+                    replayable=False,
                 ),
             ),
             {group_id: 128},

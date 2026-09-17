@@ -77,6 +77,7 @@ def v4_swa_kv_spec(hf_config) -> CacheGroupSpec:
         entry_stride_tokens=1,
         sliding_window_tokens=_resolve_sliding_window(hf_config),
         family="history",
+        replayable=False,
     )
 
 
@@ -97,6 +98,7 @@ def v4_compressor_state_spec(ratio: int) -> CacheGroupSpec:
         entry_stride_tokens=1,
         sliding_window_tokens=V4_COMPRESSOR_STATE_WINDOW_TOKENS[ratio],
         family="history",
+        replayable=False,
     )
 
 
@@ -110,6 +112,7 @@ def v4_compressed_kv_spec(ratio: int) -> CacheGroupSpec:
         entry_stride_tokens=ratio,
         sliding_window_tokens=None,
         family="history",
+        replayable=False,
     )
 
 
@@ -122,6 +125,7 @@ def v4_indexer_kv_spec() -> CacheGroupSpec:
         entry_stride_tokens=4,
         sliding_window_tokens=None,
         family="history",
+        replayable=False,
     )
 
 
@@ -134,6 +138,7 @@ def v4_indexer_state_spec() -> CacheGroupSpec:
         entry_stride_tokens=1,
         sliding_window_tokens=V4_COMPRESSOR_STATE_WINDOW_TOKENS[4],
         family="history",
+        replayable=False,
     )
 
 

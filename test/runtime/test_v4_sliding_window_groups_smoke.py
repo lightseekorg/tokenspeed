@@ -92,6 +92,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                     rows_per_page=rows_per_page,
                     entry_stride_tokens=entry_stride_tokens,
                     sliding_window_tokens=None,
+                    replayable=False,
                 ),
                 CacheGroupSpec(
                     group_id="sliding",
@@ -99,6 +100,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                     rows_per_page=rows_per_page,
                     entry_stride_tokens=entry_stride_tokens,
                     sliding_window_tokens=3 * raw_per_page + 1,
+                    replayable=False,
                 ),
             ]
             common = {
@@ -144,6 +146,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                 rows_per_page=rows_per_page,
                 entry_stride_tokens=entry_stride_tokens,
                 sliding_window_tokens=None,
+                replayable=False,
             )
             window = 3 * raw_per_page + 1
             sliding = CacheGroupSpec(
@@ -152,6 +155,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                 rows_per_page=rows_per_page,
                 entry_stride_tokens=entry_stride_tokens,
                 sliding_window_tokens=window,
+                replayable=False,
             )
             context_len = 5 * raw_per_page + 1
             for verify_width in (1, 2, 4, 8):
@@ -203,6 +207,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                     rows_per_page=rows_per_page,
                     entry_stride_tokens=entry_stride_tokens,
                     sliding_window_tokens=window,
+                    replayable=False,
                 )
                 for context_len in (2 * raw_per_page + 1, 5 * raw_per_page + 1):
                     for verify_width in (1, 2, 4, 8):
@@ -240,6 +245,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             rows_per_page=4,
             entry_stride_tokens=1,
             sliding_window_tokens=None,
+            replayable=False,
         )
         count_args = {
             "max_live_requests": 1,
@@ -284,15 +290,19 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             self.subTest(group="bad-rows"),
             self.assertRaisesRegex(ValueError, "rows_per_page"),
         ):
-            CacheGroupSpec("bad-rows", "full_history", 0, 1, None)
+            CacheGroupSpec("bad-rows", "full_history", 0, 1, None, replayable=False)
 
         invalid_specs = (
             (
-                CacheGroupSpec("bad-window", "sliding_window", 4, 1, 0),
+                CacheGroupSpec(
+                    "bad-window", "sliding_window", 4, 1, 0, replayable=False
+                ),
                 "sliding_window_tokens",
             ),
             (
-                CacheGroupSpec("bad-retention", "unknown", 4, 1, None),
+                CacheGroupSpec(
+                    "bad-retention", "unknown", 4, 1, None, replayable=False
+                ),
                 "unsupported retention",
             ),
         )
@@ -336,6 +346,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                 rows_per_page=4,
                 entry_stride_tokens=1,
                 sliding_window_tokens=8,
+                replayable=False,
             )
         ]
 
