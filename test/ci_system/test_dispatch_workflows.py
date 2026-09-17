@@ -649,6 +649,7 @@ def test_only_dedicated_tasks_declare_gb300():
             configs.append(path.name)
 
     assert sorted(configs) == [
+        "deepseek-v4.1-flash-pd-1p1d-dspark-evalscope-gsm8k-gb300-slurm.yaml",
         "kimi-k3-mxfp4-dspark-tp8-two-node-kvv-mmmu-pro-vision-gb300-slurm.yaml",
         "kimi-k3-mxfp4-dspark-tp8-two-node-kvv-ocr-bench-gb300-slurm.yaml",
         "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
@@ -866,7 +867,7 @@ def test_gb300_slurm_per_commit_workflow_is_isolated_and_automatic():
     assert "gb300-slurm-per-commit" in cancel_groups
 
 
-def test_gb300_slurm_per_commit_matrix_selects_kimi_k3_tasks(monkeypatch):
+def test_gb300_slurm_per_commit_matrix_selects_model_tasks(monkeypatch):
     monkeypatch.delenv("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS", raising=False)
 
     matrix = build_matrix(
@@ -879,6 +880,18 @@ def test_gb300_slurm_per_commit_matrix_selects_kimi_k3_tasks(monkeypatch):
     )
 
     assert matrix["include"] == [
+        {
+            "name": "eval-deepseek-v4.1-flash-pd-1p1d-dspark-gsm8k-gb300-slurm",
+            "type": "eval",
+            "config": (
+                "test/ci/eval/"
+                "deepseek-v4.1-flash-pd-1p1d-dspark-evalscope-gsm8k-gb300-slurm.yaml"
+            ),
+            "runner": "slurm-gb300-4gpu",
+            "priority": "normal",
+            "optional": False,
+            "workflow_stage": "model-test",
+        },
         {
             "name": "eval-kimi-k3-mxfp4-tp8-two-node-aime26-gb300-slurm",
             "type": "eval",

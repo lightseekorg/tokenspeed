@@ -1000,6 +1000,33 @@ prefix hits exactly as above and ships each group's retained tail; the
 decode node lands the tail and never re-feeds. Even on one machine, let
 Mooncake pick an RDMA transport rather than forcing the intra-node NVLink one.
 
+### GB300 Slurm 1P1D CI
+
+[`deepseek-v4.1-flash-pd-1p1d-dspark-evalscope-gsm8k-gb300-slurm.yaml`](../../test/ci/eval/deepseek-v4.1-flash-pd-1p1d-dspark-evalscope-gsm8k-gb300-slurm.yaml)
+runs one TP4 prefill engine and one TP4 decode engine on two four-GPU nodes.
+Node 0 also hosts the SMG gateway and the Slurm evaluation client, which
+connects to `127.0.0.1:8000`. Both engines use same-checkpoint DSpark,
+`mega_moe` with expert parallelism on Blackwell, host-resident Engram tables,
+and Mooncake transfer after the completed prompt (`layerwise-interval=0`).
+Decode prefix caching is disabled; the gateway uses `deepseek_v31` reasoning
+parsing. The 262144-token cache budget limits admission independently of the
+32768-token per-request context and 16-sequence cap.
+
+The gate checks GSM8K accuracy of at least 0.90 on 100 samples with EvalScope
+1.11.1, greedy decoding, concurrency 8, and up to 30000 generated tokens.
+It participates in the GB300 Slurm per-commit workflow. To run only this case,
+select its YAML in **Slurm Dispatch**, choose cluster `gb300`, and optionally
+provide a pull request number.
+
+The launcher uses `PD_SLURM=1` to assign one role per node and clears Slurm
+topology discovery only inside each worker process. Its job-and-step-scoped
+artifact directory must be shared between nodes. It publishes role readiness
+atomically and verifies cross-node gRPC health before starting the gateway.
+Worker logs remain separate as `prefill.log`, `decode.log`, and `lb.log`.
+Set `DISAGGREGATION_IB_DEVICE` when an explicit RDMA device selection is needed;
+otherwise Mooncake selects its transport automatically.
+Without `PD_SLURM=1`, the same launcher retains the single-node smoke topology.
+
 ## Tuning Order
 
 1. Set model ID, trust policy, tokenizer mode, and served model name.
