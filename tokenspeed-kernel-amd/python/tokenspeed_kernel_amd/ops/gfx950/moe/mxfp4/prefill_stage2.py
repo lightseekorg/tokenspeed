@@ -128,11 +128,9 @@ def _load_a_to_shared(
         )
     else:
         values = gl.load(base + offsets, mask=mask, other=0)
-        # E4M3 MFMAs share each A row across N-partitioned waves. Finish
-        # reading the old tile before any wave reuses this LDS slot.
-        gl.barrier()
+        # The compiler's LDS dependence analysis orders this store against
+        # the previous tile's cross-wave reads and the reads that follow.
         destination.store(values)
-        gl.barrier()
 
 
 # ---------------------------------------------------------------------------
@@ -913,11 +911,8 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                     b_scale1_c3 = gl.convert_layout(b_scale1_c3, b_scale_layout_chunk)
 
                 cdna4_async_copy.wait_group(1)
-                if USE_ASYNC_A:
-                    # The async copy and MFMA layouts distribute rows across
-                    # waves differently. Publish the completed LDS writes
-                    # before every wave reads its dot operand.
-                    gl.barrier()
+                # The copy wait is wave-local; the compiler emits the CTA
+                # barrier that publishes the LDS writes right after the wait.
                 a0 = cdna4_async_copy.load_shared_relaxed(smem_a.index(0), dot_a_layout)
                 acc0 = gl.amd.cdna4.mfma_scaled(
                     a=a0,
@@ -1056,8 +1051,6 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                 m3 = tok_ok
 
                 cdna4_async_copy.wait_group(0)
-                if USE_ASYNC_A:
-                    gl.barrier()
                 a1 = cdna4_async_copy.load_shared_relaxed(smem_a.index(1), dot_a_layout)
 
                 if DEFER_EPILOGUE:
@@ -1110,6 +1103,8 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                             # Every MFMA wave reads all M rows. Finish those
                             # cross-wave reads before any wave reuses either
                             # shared slot as the next async-copy destination.
+                            # load_shared_relaxed opts out of the compiler's
+                            # async-copy hazard tracking, so this stays explicit.
                             gl.barrier()
                         _load_a_to_shared(
                             smem_a.index(0),
@@ -1255,8 +1250,6 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                         )
 
                         cdna4_async_copy.wait_group(1)
-                        if USE_ASYNC_A:
-                            gl.barrier()
                         a_even = cdna4_async_copy.load_shared_relaxed(
                             smem_a.index(0), dot_a_layout
                         )
@@ -1297,8 +1290,6 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                             acc=acc3,
                         )
                         cdna4_async_copy.wait_group(0)
-                        if USE_ASYNC_A:
-                            gl.barrier()
                         a_odd = cdna4_async_copy.load_shared_relaxed(
                             smem_a.index(1), dot_a_layout
                         )

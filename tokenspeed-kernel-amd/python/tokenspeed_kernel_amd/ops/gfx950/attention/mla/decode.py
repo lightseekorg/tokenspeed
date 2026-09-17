@@ -1181,7 +1181,6 @@ def _mla_decode_gluon(
         page_zeros = gl.zeros([cfg.BLOCK_N], dtype=gl.int32, layout=cfg.blocked_page)
         bufs_page.index(0).store(page_zeros)
         bufs_page.index(1).store(page_zeros)
-        gl.barrier()
 
     # prologue: global load page numbers for the first two tiles
     program.issue_page_load(bufs_page.index(0), start_n)

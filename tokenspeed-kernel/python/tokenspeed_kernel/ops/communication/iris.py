@@ -1827,7 +1827,6 @@ def _iris_sync_rank_token(
         scope="sys",
     )
     _iris_drain_subgroup_vmem()
-    gl.barrier()
 
 
 @gluon.jit
@@ -2216,7 +2215,6 @@ def iris_reduce_symmetric_two_stage_gluon_kernel(
             cache_modifier=".cg",
         )
         peer_values.store(values)
-        gl.barrier()
 
         packed = peer_values.load(reduce_layout)
         value_0, value_1, value_2, value_3 = _unpack_word(
@@ -2237,7 +2235,6 @@ def iris_reduce_symmetric_two_stage_gluon_kernel(
             mask=tile_id * BLOCK_WORDS + reduce_words < PARTITION_WORDS,
             cache=".wt",
         )
-        gl.barrier()
         tile_id += NUM_PROGRAMS
 
     partitions_ready = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
@@ -2477,7 +2474,6 @@ def iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel(
         mask=mask,
         cache=".wt",
     )
-    gl.barrier()
 
     gl.atomic_xchg(local_ready, epoch, sem="release", scope="sys")
     _iris_sync_rank_epoch(
@@ -2529,7 +2525,6 @@ def iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel(
 
     # Publish consumption without serializing this epilogue. Reuse waits only
     # when a later invocation wraps back to the same staging slot.
-    gl.barrier()
     consumed = consumed_flags + row * WORLD_SIZE + RANK
     gl.atomic_xchg(consumed, epoch, sem="release", scope="sys")
 
@@ -2649,7 +2644,6 @@ def iris_push_one_shot_allreduce_residual_attnres_gluon_kernel(
             cache=".wt",
         )
     _iris_drain_subgroup_vmem()
-    gl.barrier()
 
     _iris_sync_rank_token(
         sync_ready_flags,
