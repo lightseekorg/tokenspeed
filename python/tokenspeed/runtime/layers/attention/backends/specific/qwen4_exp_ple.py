@@ -39,6 +39,7 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
     CudaGraphSupport,
+    reject_bounded_replay,
 )
 from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
     compute_state_block_indices,
@@ -217,13 +218,17 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         extend_seq_lens_cpu: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
+        extend_replay_lens_cpu: torch.Tensor,
+        extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
         **kwargs,
     ) -> None:
+        reject_bounded_replay(extend_replay_lens_cpu, "Qwen4ExpPLEBackend")
         del (
             req_pool_indices,
             extend_seq_lens,
             extend_prefix_lens_cpu,
+            extend_prompt_lens_cpu,
             extend_with_prefix,
             kwargs,
         )

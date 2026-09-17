@@ -1221,7 +1221,10 @@ def test_package_prefill_supports_192_column_intermediate_padding_gfx950(
     )
 
     generator = torch.Generator(device="cuda").manual_seed(20260830)
-    num_tokens, num_experts, top_k = 17, 2, 2
+    # One row past the warp-decode bound, so this keeps exercising package
+    # prefill wherever that bound is set.
+    num_tokens = fused_moe._SITU_WARP_DECODE_MAX_M + 1
+    num_experts, top_k = 2, 2
     latent_size, intermediate_size = 256, 2880
     module, raw = _make_mxfp4_module(
         num_experts=num_experts,
@@ -1381,7 +1384,8 @@ def test_ep_situ_package_prefill_matches_reference_gfx950(
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import moe as fused_moe
 
     generator = torch.Generator(device="cuda").manual_seed(20260830)
-    num_tokens, top_k = 33, 16
+    # One row past the warp-decode bound, for the same reason.
+    num_tokens, top_k = fused_moe._SITU_WARP_DECODE_MAX_M + 1, 16
     num_local_experts, num_experts = 2, 16
     ep_size, ep_rank = 8, 3
     latent_size, intermediate_size = 3584, 3072
@@ -1573,3 +1577,122 @@ def test_tp_situ_joint_shared_projection_gfx950(num_tokens: int) -> None:
     torch.cuda.synchronize()
     torch.testing.assert_close(captured_routed, routed_reference, atol=0, rtol=0)
     torch.testing.assert_close(captured_shared, shared_reference, atol=0.125, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "num_tokens",
+    # Widths the warp-decode bound now covers that it did not at 16. 32 and 64
+    # are Kimi-K3 decode at concurrency 8 and 16 with EAGLE3; 17 is the first
+    # row past the old bound.
+    [17, 32, 64],
+)
+def test_situ_warp_decode_matches_reference_above_old_bound_gfx950(
+    num_tokens: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The warp-decode path must be correct at the widths the bound admits.
+
+    Raising the bound moves these widths off package prefill, so the numerics
+    that used to be supplied by the tiled kernels are now supplied by the
+    warp-decode ones. Nothing else covered them: the existing decode tests stop
+    at 16, which is exactly where the bound used to be.
+    """
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import moe as fused_moe
+
+    assert num_tokens <= fused_moe._SITU_WARP_DECODE_MAX_M
+
+    generator = torch.Generator(device="cuda").manual_seed(20260916 + num_tokens)
+    top_k = 16
+    num_local_experts, num_experts = 2, 16
+    ep_size, ep_rank = 8, 3
+    latent_size, intermediate_size = 3584, 3072
+    module, raw = _make_mxfp4_module(
+        num_experts=num_local_experts,
+        latent_size=latent_size,
+        intermediate_size=intermediate_size,
+        top_k=top_k,
+        generator=generator,
+    )
+    module.num_experts = num_experts
+    module.num_local_experts = num_local_experts
+    module.ep_size = ep_size
+    module.ep_rank = ep_rank
+    hidden_states = 0.1 * torch.randn(
+        num_tokens,
+        latent_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    global_ids = torch.arange(num_experts, dtype=torch.int32, device="cuda")
+    topk_ids = torch.stack(
+        [torch.roll(global_ids, token) for token in range(num_tokens)]
+    )
+    topk_weights = torch.softmax(
+        torch.randn(
+            num_tokens,
+            top_k,
+            dtype=torch.float32,
+            device="cuda",
+            generator=generator,
+        ),
+        dim=-1,
+    )
+    router_logits = torch.empty((num_tokens, 0), dtype=torch.float32, device="cuda")
+    plan = _a8w4_ep_plan(intermediate_size)
+    tokenspeed_kernel.moe_process_weights(plan, module)
+    output_storage = torch.empty(
+        (num_tokens, latent_size + 7168),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+    module._situ_output_buffer = output_storage[:, :latent_size]
+
+    # Assert the routing, not just the numbers: a silent fall back to package
+    # prefill would still produce a correct result and hide the regression.
+    package_prefill_calls = []
+    package_prefill = fused_moe._maybe_gluon_package_mxfp4_prefill
+
+    def record_package_prefill(*args, **kwargs):
+        package_prefill_calls.append(num_tokens)
+        return package_prefill(*args, **kwargs)
+
+    monkeypatch.setattr(
+        fused_moe,
+        "_maybe_gluon_package_mxfp4_prefill",
+        record_package_prefill,
+    )
+
+    actual = tokenspeed_kernel.moe_apply(
+        plan,
+        hidden_states,
+        module,
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+
+    assert package_prefill_calls == []
+
+    expert_start = ep_rank * num_local_experts
+    local_ids = topk_ids - expert_start
+    local_mask = (local_ids >= 0) & (local_ids < num_local_experts)
+    local_ids = torch.where(local_mask, local_ids, torch.full_like(local_ids, -1))
+    local_weights = torch.where(
+        local_mask,
+        topk_weights,
+        torch.zeros_like(topk_weights),
+    )
+    expected = mxfp4_moe_reference(
+        hidden_states,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        raw["w2_weight"],
+        raw["w2_scale"],
+        local_ids,
+        local_weights,
+        activation_dtype=torch.bfloat16,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=8e-2)

@@ -99,7 +99,7 @@ import tokenspeed_kernel.ops.quantization.triton as _quantization_triton
 import tokenspeed_kernel.ops.quantization.trtllm as _quantization_trtllm
 import tokenspeed_kernel.ops.residual as _residual_pkg
 import tokenspeed_kernel.ops.residual.cuda as _residual_cuda
-import tokenspeed_kernel.ops.residual.cute_dsl as _residual_cute_dsl
+import tokenspeed_kernel.ops.residual.cute_fused as _residual_cute_fused
 import tokenspeed_kernel.ops.residual.deep_gemm as _residual_deep_gemm
 import tokenspeed_kernel.ops.residual.gluon as _residual_gluon
 import tokenspeed_kernel.ops.residual.torch as _residual_torch
@@ -189,7 +189,7 @@ _RELOAD_MODULES = [
     _gemm_pkg,
     # Residual registration modules.
     _residual_cuda,
-    _residual_cute_dsl,
+    _residual_cute_fused,
     _residual_deep_gemm,
     _residual_gluon,
     _residual_torch,
@@ -261,7 +261,6 @@ def test_residual_family_exports_and_modes():
         "mhc_mixes",
         "mhc_post",
         "mhc_pre",
-        "prepare_gated_residual_weight_cache",
     }
     assert set(_residual_pkg.__all__) == expected_exports
     assert all(

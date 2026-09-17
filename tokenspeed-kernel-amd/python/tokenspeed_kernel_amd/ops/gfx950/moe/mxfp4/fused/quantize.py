@@ -513,28 +513,174 @@ def _fp8_quantize_kernel(
     tl.store(out_ptr + out_off, x_fp8, mask=load_mask)
 
 
+# Per-program element counts for the dynamic FP8 quantizer. The amax pass and
+# the apply pass are separate launches because the scale is a property of the
+# whole tensor, so every element must be seen before any element is scaled.
+_DYNAMIC_FP8_BLOCK = 8192
+# Upper bound on the partial-amax count, so the combine stays a single small
+# workgroup. When a tensor would exceed it the amax block grows instead.
+_DYNAMIC_FP8_MAX_PARTIALS = 4096
+_DYNAMIC_FP8_E4M3_MAX = 448.0
+_DYNAMIC_FP8_MIN_AMAX = 1.0e-12
+# Largest padded element count still handled by one workgroup in one launch.
+#
+# Below this the single launch is the cheapest option: the two-pass reduction
+# needs a second launch, and at these sizes the launch -- not the arithmetic --
+# is the whole cost (~10 us single-pass against ~26 us two-pass at 65,536
+# padded elements).
+#
+# The bound is a tier lower than the point where the one-workgroup form breaks,
+# because it stops paying off well before then. Measured, one workgroup at
+# 131,072 padded elements costs ~33 us -- already worse than the two-pass -- and
+# from there it degrades to 903 us at 262,144 and fails to dispatch past roughly
+# 344k with HSA_STATUS_ERROR_OUT_OF_RESOURCES. Keeping the bound on the
+# unambiguous side also keeps it clear of that failure, whose own threshold
+# moves with how loaded the device is.
+#
+# Beware when re-tuning: a tensor whose length is well under its power of two
+# looks artificially good, because the compiler can drop the masked tail. At
+# 114,688 elements the one-workgroup form measures 16 us, but 129,024 elements
+# -- the same padded size -- costs 33 us. Tune against padded size, not numel.
+_DYNAMIC_FP8_SINGLE_PASS_MAX_ELEMENTS = 1 << 16
+
+
+def _dynamic_fp8_use_single_pass(numel: int) -> bool:
+    """Whether ``numel`` elements still fit the one-launch quantizer."""
+    return triton.next_power_of_2(numel) <= _DYNAMIC_FP8_SINGLE_PASS_MAX_ELEMENTS
+
+
 @triton.jit
-def _dynamic_fp8_quantize_kernel(x_ptr, out_ptr, scale_ptr, N: tl.constexpr):
-    block: tl.constexpr = triton.next_power_of_2(N)
-    offsets = tl.arange(0, block)
+def _dynamic_fp8_single_pass_kernel(
+    x_ptr, out_ptr, scale_ptr, N, min_amax, fp8_max, BLOCK: tl.constexpr
+):
+    """Reduce and quantize in one launch, for tensors one workgroup can hold."""
+    offsets = tl.arange(0, BLOCK)
     mask = offsets < N
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    amax = tl.maximum(tl.max(tl.abs(x)), 1.0e-12)
-    scale = amax / 448.0
+    scale = tl.maximum(tl.max(tl.abs(x)), min_amax) / fp8_max
     tl.store(scale_ptr, scale)
     tl.store(out_ptr + offsets, (x / scale).to(tl.float8e4nv), mask=mask)
 
 
+@triton.jit
+def _dynamic_fp8_amax_partial_kernel(x_ptr, partial_ptr, N, BLOCK: tl.constexpr):
+    """Reduce |x| to one partial amax per program."""
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offsets, mask=offsets < N, other=0.0).to(tl.float32)
+    tl.store(partial_ptr + pid, tl.max(tl.abs(x)))
+
+
+@triton.jit
+def _dynamic_fp8_apply_scale_kernel(
+    x_ptr,
+    out_ptr,
+    partial_ptr,
+    scale_ptr,
+    N,
+    num_partials,
+    min_amax,
+    fp8_max,
+    BLOCK: tl.constexpr,
+    PARTIAL_BLOCK: tl.constexpr,
+):
+    """Combine the partial amaxes, then scale and downcast this program's block.
+
+    Every program repeats the combine rather than reading a scale a third
+    kernel wrote. The partial count is bounded by
+    ``_DYNAMIC_FP8_MAX_PARTIALS``, so the repeated reduction is a few thousand
+    floats at worst, which is far cheaper than the extra launch it replaces --
+    at Kimi-K3 decode widths the launches, not the arithmetic, are the cost.
+    """
+    partial_offsets = tl.arange(0, PARTIAL_BLOCK)
+    partials = tl.load(
+        partial_ptr + partial_offsets, mask=partial_offsets < num_partials, other=0.0
+    )
+    scale = tl.maximum(tl.max(partials), min_amax) / fp8_max
+
+    pid = tl.program_id(0)
+    if pid == 0:
+        tl.store(scale_ptr, scale)
+
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < N
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    tl.store(out_ptr + offsets, (x / scale).to(tl.float8e4nv), mask=mask)
+
+
+def _dynamic_fp8_amax_block(numel: int) -> int:
+    """Smallest block that keeps the partial count inside one combine workgroup."""
+    block = _DYNAMIC_FP8_BLOCK
+    while triton.cdiv(numel, block) > _DYNAMIC_FP8_MAX_PARTIALS:
+        block *= 2
+    return block
+
+
 def _dynamic_fp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``x`` to FP8 E4M3 with a dynamic per-tensor scale.
+
+    Args:
+        x: BF16/FP16 activation tensor of any shape.
+
+    Returns:
+        ``(out, scale)`` -- the FP8 tensor and its scalar FP32 scale, such that
+        ``out * scale`` recovers ``x``.
+
+    Small tensors reduce and quantize in a single launch; larger ones reduce
+    over a grid first. The split is on padded element count rather than on any
+    caller-visible notion of batch size, because what bounds the one-launch form
+    is how much a single workgroup can hold -- see
+    ``_DYNAMIC_FP8_SINGLE_PASS_MAX_ELEMENTS``.
+
+    The grid form exists because the one-launch form used to be applied at every
+    size: it spilled hard as the tensor grew (18.4 us at 131,072 padded elements
+    against 903 us at 262,144) and then failed to dispatch past roughly 344k
+    with ``HSA_STATUS_ERROR_OUT_OF_RESOURCES``, which capped the Kimi-K3 decode
+    MoE gate below the widths speculative decoding produces. Taking ``N`` as a
+    runtime argument rather than a ``constexpr`` also stops the JIT recompiling
+    per distinct token count.
+    """
     if not x.is_contiguous():
         x = x.contiguous()
+    numel = x.numel()
     out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     scale = torch.empty(1, dtype=torch.float32, device=x.device)
-    _dynamic_fp8_quantize_kernel[(1,)](
+
+    if _dynamic_fp8_use_single_pass(numel):
+        _dynamic_fp8_single_pass_kernel[(1,)](
+            x,
+            out,
+            scale,
+            numel,
+            _DYNAMIC_FP8_MIN_AMAX,
+            _DYNAMIC_FP8_E4M3_MAX,
+            BLOCK=triton.next_power_of_2(numel),
+            num_warps=8,
+        )
+        return out, scale
+
+    amax_block = _dynamic_fp8_amax_block(numel)
+    num_partials = triton.cdiv(numel, amax_block)
+    partials = torch.empty(num_partials, dtype=torch.float32, device=x.device)
+
+    _dynamic_fp8_amax_partial_kernel[(num_partials,)](
+        x,
+        partials,
+        numel,
+        BLOCK=amax_block,
+        num_warps=8,
+    )
+    _dynamic_fp8_apply_scale_kernel[(triton.cdiv(numel, _DYNAMIC_FP8_BLOCK),)](
         x,
         out,
+        partials,
         scale,
-        N=x.numel(),
+        numel,
+        num_partials,
+        _DYNAMIC_FP8_MIN_AMAX,
+        _DYNAMIC_FP8_E4M3_MAX,
+        BLOCK=_DYNAMIC_FP8_BLOCK,
+        PARTIAL_BLOCK=triton.next_power_of_2(num_partials),
         num_warps=8,
     )
     return out, scale

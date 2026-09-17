@@ -172,7 +172,7 @@ def grouped_gemma_rmsnorm(
     weight: torch.Tensor,
     group_size: int,
     eps: float,
-    out: torch.Tensor | None = None,
+    out: torch.Tensor | None,
 ) -> torch.Tensor:
     """Grouped Gemma RMSNorm without the unused inverse-RMS output.
 
@@ -229,6 +229,133 @@ def grouped_gemma_rmsnorm(
         **launch_kwargs,
     )
     return out
+
+
+@triton.jit
+def _gated_residual_combine_norm_kernel(
+    residual_ptr,
+    block_ptr,
+    inject_ptr,
+    weight_ptr,
+    residual_out_ptr,
+    norm_out_ptr,
+    weight_group_stride,
+    eps: tl.constexpr,
+    WIDTH: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+    PRELOAD_RESIDUAL: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    row = tl.program_id(0)
+    group = tl.program_id(1)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < GROUP_SIZE
+    positions = row * WIDTH + group * GROUP_SIZE + offsets
+
+    if ENABLE_PDL and not PRELOAD_RESIDUAL:
+        tl.extra.cuda.gdc_wait()
+    residual = tl.load(residual_ptr + positions, mask=mask, other=0.0).to(tl.float32)
+    weight = tl.load(
+        weight_ptr + group * weight_group_stride + offsets, mask=mask, other=0.0
+    ).to(tl.float32)
+    if ENABLE_PDL and PRELOAD_RESIDUAL:
+        tl.extra.cuda.gdc_wait()
+
+    block_output = tl.load(
+        block_ptr + row * GROUP_SIZE + offsets, mask=mask, other=0.0
+    ).to(tl.float32)
+    logit = tl.load(inject_ptr + row * (WIDTH // GROUP_SIZE) + group).to(tl.float32)
+    combined = residual + block_output * 2.0 * tl.sigmoid(logit)
+    # Match a standalone combine store before the following norm reads it.
+    combined = combined.to(residual_ptr.dtype.element_ty).to(tl.float32)
+    tl.store(residual_out_ptr + positions, combined, mask=mask)
+    combined = tl.where(mask, combined, 0.0)
+
+    variance = tl.sum(combined * combined, axis=0) / GROUP_SIZE
+    normalized = combined * tl.rsqrt(variance + eps) * (1.0 + weight)
+    tl.store(norm_out_ptr + positions, normalized, mask=mask)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def gated_residual_combine_norm(
+    block_output: torch.Tensor,
+    residual: torch.Tensor,
+    inject_logits: torch.Tensor,
+    weight: torch.Tensor,
+    group_size: int,
+    eps: float,
+    preload_residual: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Combine gated residual branches and apply grouped Gemma RMSNorm."""
+    if residual.ndim < 1:
+        raise ValueError("residual must have at least one dimension")
+    width = int(residual.shape[-1])
+    if group_size <= 0 or width % group_size:
+        raise ValueError(
+            f"group_size must divide the last dimension ({width}), got {group_size}"
+        )
+    groups = width // group_size
+    for name, value, shape in (
+        ("block_output", block_output, (*residual.shape[:-1], group_size)),
+        ("inject_logits", inject_logits, (*residual.shape[:-1], groups)),
+    ):
+        if (
+            value.shape != shape
+            or value.dtype != residual.dtype
+            or value.device != residual.device
+        ):
+            raise ValueError(
+                f"{name} must have shape {tuple(shape)} and match residual "
+                "dtype and device"
+            )
+    if weight.shape not in ((width,), (group_size,)):
+        raise ValueError(
+            f"weight must have shape {(width,)} or {(group_size,)}, "
+            f"got {tuple(weight.shape)}"
+        )
+    if weight.dtype != residual.dtype or weight.device != residual.device:
+        raise ValueError("weight must match residual dtype and device")
+
+    combined = torch.empty_like(residual, memory_format=torch.contiguous_format)
+    normalized = torch.empty_like(residual, memory_format=torch.contiguous_format)
+    if residual.numel() == 0:
+        return combined, normalized
+    if not residual.is_contiguous():
+        residual = residual.contiguous()
+        preload_residual = False
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+        preload_residual = False
+    block_output = block_output.contiguous()
+    inject_logits = inject_logits.contiguous()
+
+    block = triton.next_power_of_2(group_size)
+    if block > 65536:
+        raise ValueError("group_size is too large for the Triton reduction")
+    rows = residual.numel() // width
+    enable_pdl = pdl_enabled()
+    launch_kwargs = (
+        {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
+    )
+    _gated_residual_combine_norm_kernel[(rows, groups)](
+        residual,
+        block_output,
+        inject_logits,
+        weight,
+        combined,
+        normalized,
+        group_size if weight.numel() == width else 0,
+        eps=eps,
+        WIDTH=width,
+        GROUP_SIZE=group_size,
+        BLOCK=block,
+        PRELOAD_RESIDUAL=preload_residual,
+        ENABLE_PDL=enable_pdl,
+        **launch_kwargs,
+    )
+    return combined, normalized
 
 
 @triton.jit

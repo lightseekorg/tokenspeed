@@ -194,6 +194,7 @@ class AutoBackend(CommBackend):
         producer_direct_max_numel: int,
         attnres_max_numel: int,
         attnres_max_rows: int,
+        enable_lamport: bool,
         dtype: torch.dtype,
     ) -> bool:
         if (
@@ -209,6 +210,7 @@ class AutoBackend(CommBackend):
             producer_direct_max_numel=producer_direct_max_numel,
             attnres_max_numel=attnres_max_numel,
             attnres_max_rows=attnres_max_rows,
+            enable_lamport=enable_lamport,
             dtype=dtype,
         )
 

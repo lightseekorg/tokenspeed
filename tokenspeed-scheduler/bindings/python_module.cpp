@@ -112,18 +112,19 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                std::int32_t total_pages, tokenspeed::CacheGroupConfig::Retention retention,
                std::optional<std::int32_t> sliding_window_tokens, tokenspeed::CacheGroupFamily family,
                std::int32_t cache_blocks_per_lcm_block, tokenspeed::CacheTransferPolicy transfer_policy,
-               std::int32_t shard_count) {
+               std::int32_t shard_count, std::optional<std::int32_t> replay_window_tokens) {
                 new (self) tokenspeed::CacheGroupConfig{
-                    std::move(group_id), block_granularity,     total_pages, cache_blocks_per_lcm_block,
-                    retention,           sliding_window_tokens, family,      transfer_policy,
-                    shard_count,
+                    std::move(group_id), block_granularity,     total_pages,          cache_blocks_per_lcm_block,
+                    retention,           sliding_window_tokens, replay_window_tokens, family,
+                    transfer_policy,     shard_count,
                 };
             },
             nb::arg("group_id"), nb::arg("block_granularity"), nb::arg("total_pages"),
             nb::arg("retention") = tokenspeed::CacheGroupConfig::Retention::FullHistory,
             nb::arg("sliding_window_tokens") = std::nullopt, nb::arg("family") = tokenspeed::CacheGroupFamily::History,
             nb::arg("cache_blocks_per_lcm_block") = 1,
-            nb::arg("transfer_policy") = tokenspeed::CacheTransferPolicy::Unspecified, nb::arg("shard_count") = 1)
+            nb::arg("transfer_policy") = tokenspeed::CacheTransferPolicy::Unspecified, nb::arg("shard_count") = 1,
+            nb::arg("replay_window_tokens") = std::nullopt)
         .def_rw("group_id", &tokenspeed::CacheGroupConfig::group_id)
         .def_rw("block_granularity", &tokenspeed::CacheGroupConfig::block_granularity)
         .def_rw("total_pages", &tokenspeed::CacheGroupConfig::total_pages)
@@ -131,6 +132,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("shard_count", &tokenspeed::CacheGroupConfig::shard_count)
         .def_rw("retention", &tokenspeed::CacheGroupConfig::retention)
         .def_rw("sliding_window_tokens", &tokenspeed::CacheGroupConfig::sliding_window_tokens)
+        .def_rw("replay_window_tokens", &tokenspeed::CacheGroupConfig::replay_window_tokens)
         .def_rw("family", &tokenspeed::CacheGroupConfig::family)
         .def_rw("transfer_policy", &tokenspeed::CacheGroupConfig::transfer_policy)
         .def("validate", &tokenspeed::CacheGroupConfig::Validate);
@@ -229,6 +231,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     forward_batch.def_ro("input_ids", &tokenspeed::ForwardBatch::input_ids)
         .def_ro("shifted_input_ids", &tokenspeed::ForwardBatch::shifted_input_ids)
         .def_ro("extend_prefix_lens", &tokenspeed::ForwardBatch::extend_prefix_lens)
+        .def_ro("extend_replay_lens", &tokenspeed::ForwardBatch::extend_replay_lens)
         .def_prop_ro(
             "prefill_lengths",
             [](const tokenspeed::ForwardBatch& op) -> const std::vector<std::int32_t>& { return op.prefill_lengths; },

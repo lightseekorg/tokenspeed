@@ -43,6 +43,8 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/fsm/pd_events.cpp
 
     csrc/scheduler/operations/forward.cpp
+    csrc/scheduler/operations/group_demands.cpp
+    csrc/scheduler/operations/prefill_chunk.cpp
 
     csrc/scheduler/kv_cache_events.cpp
     csrc/scheduler/request.cpp
@@ -115,6 +117,8 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_cache_coordinator.cpp
         tests/cpp/test_joint_match_invariants.cpp
         tests/cpp/test_forward_cache_ops.cpp
+        tests/cpp/test_prefill_chunk.cpp
+        tests/cpp/test_group_demands.cpp
         tests/cpp/test_forward_batch.cpp
         tests/cpp/test_kv_cache_lifecycle.cpp
         tests/cpp/test_cache_scenarios.cpp

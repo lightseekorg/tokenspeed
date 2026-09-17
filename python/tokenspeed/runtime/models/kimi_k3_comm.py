@@ -221,6 +221,13 @@ def prepare_k3_all_reduce_buffers(
         allreduce_residual_attnres_max_tokens(mapping.attn.tp_size),
     )
     groups_are_equal = mapping.attn.tp_group == mapping.moe.tp_ep_group
+    # The Lamport crossover was measured with attention TP8 and MoE TP8.
+    enable_lamport = (
+        groups_are_equal
+        and mapping.attn.tp_size == 8
+        and mapping.moe.tp_size == 8
+        and mapping.moe.ep_size == 1
+    )
     # Keep the full producer-direct window for equal TP8 groups. Its 50K/500
     # C16 gain survives content-sensitive EAGLE3 trajectories; retain 48 tokens
     # for other mappings.
@@ -244,6 +251,7 @@ def prepare_k3_all_reduce_buffers(
             ),
             attnres_max_numel=attnres_max_rows * hidden_size,
             attnres_max_rows=attnres_max_rows,
+            enable_lamport=enable_lamport,
             dtype=torch.bfloat16,
             backend=None,
         )
@@ -256,6 +264,7 @@ def prepare_k3_all_reduce_buffers(
                 * (hidden_size + routed_hidden_size),
                 attnres_max_numel=0,
                 attnres_max_rows=0,
+                enable_lamport=False,
                 dtype=torch.bfloat16,
                 backend=None,
             )

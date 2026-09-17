@@ -33,11 +33,17 @@ struct RequestSpec {
     std::int32_t max_new_tokens{0};
 };
 
+// One prefill chunk's model inputs. The input covers `extend_len` tokens
+// starting at prompt position `already_scheduled_len`; the first `replay_len`
+// of them sit inside a prefix hit and are re-fed only to regenerate the
+// replayable cache groups (bounded replay). Progress is
+// `already_scheduled_len + extend_len` regardless of replay_len.
 struct PrefillInfo {
     std::span<const std::int32_t> input_ids;
     std::vector<std::int32_t> shifted_input_ids;
     std::int32_t already_scheduled_len{0};
     std::int32_t extend_len{0};
+    std::int32_t replay_len{0};
 };
 
 }  // namespace tokenspeed

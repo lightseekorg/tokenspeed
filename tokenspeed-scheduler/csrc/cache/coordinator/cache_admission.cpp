@@ -29,6 +29,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "utils.h"
 
@@ -377,6 +378,29 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
             static_cast<std::size_t>(demand.new_prefix_hash_begin) < demand.prefix_hashes.size();
         _assert(demand.completed_boundary_kind.has_value() == has_new_prefix_hashes,
                 "completed boundary kind must match newly completed page hashes");
+    }
+
+    // A replayable group claims no hit pages, so before a hit its table is
+    // empty: materialize it as a sparse private suffix from the replay
+    // window's first token -- the slots below stay null holes, as
+    // absolute-slot tables require -- and the model regenerates the rows.
+    // Closed groups keep their dense demand beyond the hit. A demand that
+    // already names a sparse suffix is a remote landing (the peer's retained
+    // tail) and is left alone: nothing is regenerated here.
+    std::vector<GroupDemand> replayed;
+    const std::int32_t hit_tokens = std::max(prefix.device.num_common_tokens, prefix.host.num_common_tokens);
+    if (replay_window_tokens_ > 0 && hit_tokens > 0) {
+        const std::int32_t replay_begin = hit_tokens - ReplayTokens(hit_tokens);
+        replayed.assign(demands.begin(), demands.end());
+        for (std::size_t i = 0; i < replayed.size(); ++i) {
+            if (!GroupIsReplayable(static_cast<std::int32_t>(i)) || replayed[i].materialized_suffix_start >= 0) {
+                continue;
+            }
+            _assert(replayed[i].table->NumBlocks() == 0, "a replayable group holds no hit pages at admission");
+            replayed[i].num_tokens += hit_tokens;
+            replayed[i].materialized_suffix_start = replay_begin / geometry_[i].BlockGranularity();
+        }
+        demands = replayed;
     }
 
     std::optional<AdmissionPlan> candidate = planAdmission(groups_, geometry_, pool_, std::move(prefix), demands);

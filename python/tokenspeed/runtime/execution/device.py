@@ -830,11 +830,22 @@ def build_device_side(
 
     def encoder_model_facts() -> EncoderModelFacts:
         model = target.model
+        vision = next(
+            module
+            for module in (
+                getattr(model, name, None)
+                for name in ("visual", "vision_tower", "vision")
+            )
+            if module is not None
+        )
+        dtype = getattr(vision, "dtype", None)
+        if dtype is None:
+            dtype = next(vision.parameters()).dtype
         return EncoderModelFacts(
             device=executor.device,
             hidden=model.config.hidden_size,
             num_deepstack=getattr(model, "num_deepstack_embeddings", 0),
-            dtype=(getattr(model, "visual", None) or model.vision_tower).dtype,
+            dtype=dtype,
         )
 
     return DeviceBuild(

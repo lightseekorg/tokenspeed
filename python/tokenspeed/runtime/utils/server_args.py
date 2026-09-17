@@ -865,24 +865,9 @@ class ServerArgs:
                 "DCP cache transfer does not yet support KVStore; "
                 "use --disable-kvstore."
             )
-        speculative_algorithm = getattr(self, "speculative_algorithm", None)
-        draft_model_path_use_base = getattr(self, "draft_model_path_use_base", False)
-        speculative_draft_model_path = getattr(
-            self, "speculative_draft_model_path", None
-        )
-        if (
-            self.enable_kvstore
-            and speculative_algorithm == "DSPARK"
-            and (
-                draft_model_path_use_base
-                or speculative_draft_model_path is None
-                or speculative_draft_model_path == self.model
-            )
-        ):
-            raise ValueError(
-                "DSPARK same-checkpoint decoding does not support KVStore; "
-                "use --disable-kvstore."
-            )
+        # Same-checkpoint DSpark's KVStore support depends on where the draft
+        # keeps its context; the engine decides once the draft config resolves
+        # (resolve_dspark_prefix_replay_tokens).
         if (
             self.enable_kvstore
             and not self.enable_prefix_caching

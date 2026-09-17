@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.context import CapturedRows, ForwardContext
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
@@ -344,47 +344,65 @@ class DeepseekV4DSpark(BaseDrafter):
         self,
         hidden_states: torch.Tensor,
         num_extends: int,
+        captured: CapturedRows | None,
     ) -> int:
+        """Write each prefill request's last window of captured taps into its
+        draft context window and return the number of hidden rows consumed.
+
+        ``captured`` is the target's report of which rows it captured (CED
+        narrowing); None means one captured row per input row.
+        """
         if num_extends < 0:
             raise ValueError(f"DSPARK num_extends must be non-negative: {num_extends}.")
         if num_extends == 0:
             return 0
 
-        # fill_input_buffers derives this host mirror from the same scheduler
-        # lengths as input_lengths_buf. Reading the CUDA buffer row-by-row here
-        # serialized every chunk behind the target stream.
-        lengths_cpu = self.input_buffers.extend_seq_lens_cpu
-        if (
-            not isinstance(lengths_cpu, torch.Tensor)
-            or lengths_cpu.device.type != "cpu"
-            or lengths_cpu.dtype != torch.int32
-            or lengths_cpu.ndim != 1
-            or lengths_cpu.numel() < num_extends
-        ):
-            raise RuntimeError(
-                "DSPARK prefill window seeding requires a complete int32 CPU "
-                "extend-length mirror."
-            )
-        chunk_lengths = [int(length) for length in lengths_cpu[:num_extends].tolist()]
-        if any(length < 0 for length in chunk_lengths):
+        if captured is None:
+            # One captured row per input row. fill_input_buffers derives this
+            # host mirror from the same scheduler lengths as input_lengths_buf;
+            # reading the CUDA buffer row-by-row here serialized every chunk
+            # behind the target stream.
+            lengths_cpu = self.input_buffers.extend_seq_lens_cpu
+            if (
+                not isinstance(lengths_cpu, torch.Tensor)
+                or lengths_cpu.device.type != "cpu"
+                or lengths_cpu.dtype != torch.int32
+                or lengths_cpu.ndim != 1
+                or lengths_cpu.numel() < num_extends
+            ):
+                raise RuntimeError(
+                    "DSPARK prefill window seeding requires a complete int32 CPU "
+                    "extend-length mirror."
+                )
+            chunk_lengths = [int(n) for n in lengths_cpu[:num_extends].tolist()]
+            spans = []
+            offset = 0
+            for length in chunk_lengths:
+                spans.append((offset, length))
+                offset += length
+            positions_buf = self.input_buffers.positions_buf
+        else:
+            # The target captured a per-request tail only (CED narrowing).
+            spans = list(captured.prefill_spans)
+            positions_buf = captured.positions
+        if len(spans) != num_extends:
+            raise RuntimeError("DSPARK prefill chunk layout disagrees with the batch.")
+        if any(count < 0 for _, count in spans):
             raise RuntimeError("DSPARK prefill chunk lengths must be non-negative.")
-        total_prefill_tokens = sum(chunk_lengths)
+        total_prefill_tokens = sum(count for _, count in spans)
         if total_prefill_tokens > hidden_states.shape[0]:
             raise RuntimeError(
                 "DSPARK prefill chunk lengths exceed captured hidden-state rows: "
                 f"{total_prefill_tokens} > {hidden_states.shape[0]}."
             )
 
-        offset = 0
-        for row, chunk_len in enumerate(chunk_lengths):
+        for row, (offset, chunk_len) in enumerate(spans):
             if chunk_len <= 0:
                 continue
             chunk_end = offset + chunk_len
             keep = min(int(self.model.window_size), chunk_len)
             kept_hidden = hidden_states[chunk_end - keep : chunk_end].unsqueeze(0)
-            positions = self.input_buffers.positions_buf[
-                chunk_end - keep : chunk_end
-            ].unsqueeze(0)
+            positions = positions_buf[chunk_end - keep : chunk_end].unsqueeze(0)
             slot = self.slot_indices_buf[row : row + 1]
             if self._prefill_graph is None:
                 positions, next_context_lengths = _dspark_prefill_position_plan(
@@ -407,8 +425,7 @@ class DeepseekV4DSpark(BaseDrafter):
                 self._prefill_length.fill_(keep)
                 self._prefill_slot.copy_(slot)
                 self._prefill_graph.replay()
-            offset = chunk_end
-        return offset
+        return total_prefill_tokens
 
     def _draft_decode_rows(
         self,
@@ -520,8 +537,7 @@ class DeepseekV4DSpark(BaseDrafter):
         )
         next_tokens[:, 1:].copy_(next_tokens[:, :1])
         prefill_tokens = self._seed_prefill_windows(
-            hidden_states,
-            base_ctx.num_extends,
+            hidden_states, base_ctx.num_extends, base_ctx.captured_rows
         )
         self._draft_decode_rows(
             base_ctx,

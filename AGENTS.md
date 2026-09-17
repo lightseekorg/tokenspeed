@@ -80,6 +80,14 @@ change.
 * If a dependency repeatedly breaks during version upgrades or slows project
   progress, consider removing it entirely or at least making it optional.
 
+## Hardware and model support scope
+
+* NVIDIA GPU support is currently limited to `sm90`, `sm100`, `sm103`, and
+  `sm107`.
+* AMD GPU support is currently limited to `gfx950` and `gfx1250`.
+* NPU support targets only one or two specific models. There are currently no
+  plans to expand NPU model coverage.
+
 ## tokenspeed-kernel
 
 Inside the root `tokenspeed-kernel/` directory:

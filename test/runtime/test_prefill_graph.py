@@ -454,6 +454,8 @@ class DummyGroupTablesTest(unittest.TestCase):
             extend_seq_lens_cpu=buf(16, torch.int32),
             extend_prefix_lens_buf=buf(16, torch.int32),
             extend_prefix_lens_cpu=buf(16, torch.int32),
+            extend_replay_lens_cpu=buf(16, torch.int32),
+            extend_prompt_lens_cpu=buf(16, torch.int32),
         )
         pg.block_table = torch.zeros(16, 64, dtype=torch.int32)
 
