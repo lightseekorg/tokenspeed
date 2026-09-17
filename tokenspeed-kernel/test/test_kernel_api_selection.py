@@ -3846,6 +3846,33 @@ _CASES = [
         _attention_dsv4_decode_topk_mxfp4,
         id_suffix="mxfp4",
     ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsv4_decode",
+        "gluon_dsv4_decode_gfx1250",
+        _attention_dsv4_paged_selected_pro_tp8,
+        id_suffix="pro-tp8",
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsv4_decode",
+        "triton_dsv4_decode",
+        _attention_dsv4_paged_selected_pro_tp8_i64,
+        id_suffix="pro-tp8-int64-metadata",
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsv4_decode",
+        "gluon_dsv4_decode_gfx1250",
+        _attention_dsv4_paged_selected_swa_only,
+        id_suffix="swa-only",
+    ),
     *[
         _case(
             _is_hopper_plus_with_flashmla_prefill,

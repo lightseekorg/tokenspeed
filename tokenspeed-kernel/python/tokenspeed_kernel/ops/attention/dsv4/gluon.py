@@ -47,6 +47,9 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
         gluon_dsv4_prefill_topk_mxfp4_gfx950 as _dsv4_prefill_topk_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4 import (
+        gluon_dsv4_decode_gfx1250 as _dsv4_decode_gfx1250_impl,
+    )
 
     _DSV4_MXFP4_SIGNATURE = format_signature(
         q=dense_tensor_format(torch.uint8),
@@ -184,3 +187,61 @@ if current_platform().is_amd:
     )
     def gluon_dsv4_prefill_gfx950(*args, **kwargs):
         return _dsv4_prefill_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "dsv4_decode",
+        name="gluon_dsv4_decode_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    swa_kv_cache=dense_tensor_format(torch.uint8),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim": frozenset({512}),
+            "cache_layout": frozenset({"fp8_swa_page_planar"}),
+            "topk_layout": frozenset({"global_slots"}),
+            "support_sink": frozenset({True}),
+            "return_lse": frozenset({False}),
+            "metadata_dtypes": frozenset({torch.int32}),
+        },
+        tags={"amd", "gfx1250", "paged_cache", "selected_attention"},
+    )
+    def gluon_dsv4_decode_gfx1250(
+        q,
+        swa_kv_cache,
+        swa_slots,
+        swa_lens,
+        swa_page_size,
+        attn_sink,
+        softmax_scale,
+        extra_kv_cache,
+        extra_slots,
+        extra_lens,
+        extra_page_size,
+        out,
+    ):
+        return _dsv4_decode_gfx1250_impl(
+            q,
+            swa_kv_cache,
+            swa_slots,
+            swa_lens,
+            swa_page_size,
+            attn_sink,
+            softmax_scale,
+            extra_kv_cache,
+            extra_slots,
+            extra_lens,
+            extra_page_size,
+            out,
+        )

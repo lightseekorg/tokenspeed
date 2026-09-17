@@ -122,6 +122,7 @@ Inside the root `tokenspeed-kernel/` directory:
 Inside the root `tokenspeed-kernel-amd/` directory:
 
 * There should be no dependency on `tokenspeed-kernel`.
+* Add jit `launch_metadata` for Proton use along the Triton/Gluon kernels.
 * AMD Gluon Kernel tests should live in `tokenspeed-kernel/test/amd/` to reuse
   common platform utilities and reference computations.
 * For per kernel contract and algorithm details, put in
