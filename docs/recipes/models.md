@@ -1024,7 +1024,9 @@ artifact directory must be shared between nodes. It publishes role readiness
 atomically and verifies cross-node gRPC health before starting the gateway.
 Worker logs remain separate as `prefill.log`, `decode.log`, and `lb.log`.
 Set `DISAGGREGATION_IB_DEVICE` when an explicit RDMA device selection is needed;
-otherwise Mooncake selects its transport automatically.
+the GB300 task selects `mlx5_0,mlx5_1,mlx5_2,mlx5_3` to keep transfers on the
+InfiniBand fabric. Automatic discovery also includes Ethernet RNICs, which can
+cause incompatible RoCE/InfiniBand endpoint pairings during the RDMA handshake.
 Without `PD_SLURM=1`, the same launcher retains the single-node smoke topology.
 
 ## Tuning Order

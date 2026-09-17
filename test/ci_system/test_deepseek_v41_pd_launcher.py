@@ -162,6 +162,9 @@ def test_two_node_roles_keep_engines_independent(launcher):
         assert value(args, "--speculative-algorithm") == "DSPARK"
         assert value(args, "--max-cudagraph-capture-size") == "8"
         assert value(args, "--disaggregation-layerwise-interval") == "0"
+        assert (
+            value(args, "--disaggregation-ib-device") == "mlx5_0,mlx5_1,mlx5_2,mlx5_3"
+        )
         assert "--enable-expert-parallel" in args
         assert ("--disable-prefix-caching" in args) == (role == "decode")
         assert (tmp_path / "logs/123-1" / f"{role}.log").is_file()
