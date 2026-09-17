@@ -124,6 +124,12 @@ releasing a resource the closure captured. Capture plain values or a snapshot,
 and bind at capture time rather than closing over a variable the caller will
 rebind. Results cross back **only** through `PendingExecution.result()`.
 
+L3 Host prefetch results follow the same capture rule. The control plane
+prefetches and converges each plan's outcome, then `DeviceHandle.execute`
+detaches that result into the queued load-back submission. The forward thread
+never reads the executor's current-round prefetch dictionary: another round
+may already have replaced or invalidated it while the submission was queued.
+
 `execution/forward_thread.py` states this in full, including the single
 registered exception — grammar matchers, whose ownership is split by path and
 whose overlap is instead broken by the drain registry in Principle 4.

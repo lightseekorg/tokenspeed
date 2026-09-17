@@ -280,35 +280,6 @@ def _same_tensor_contract(
         )
 
 
-def prepare_gated_residual_weight_cache(up_weight: _torch.Tensor, lowrank: int) -> bool:
-    """Prepare derived mix-up weights after an initial or online weight load.
-
-    CUDA graphs retain the address of backend-specific derived weights. The
-    first call creates that fixed-address allocation outside forward; later
-    calls update it in place after online weight synchronization. It is a no-op
-    when the selected platform does not need a derived weight.
-
-    Args:
-        up_weight: Source mix-up weight shaped ``[wide, lowrank]``.
-        lowrank: Rank of the mix gate bottleneck.
-
-    Returns:
-        Whether a backend-specific derived allocation was prepared.
-    """
-    if lowrank <= 0:
-        raise ValueError("lowrank must be positive")
-    if up_weight.ndim != 2 or int(up_weight.shape[1]) != lowrank:
-        raise ValueError(
-            f"up_weight must have shape [wide, {lowrank}], got "
-            f"{tuple(up_weight.shape)}"
-        )
-    from tokenspeed_kernel.ops.residual.cute_dsl import (
-        _prepare_padded_up_weight,
-    )
-
-    return _prepare_padded_up_weight(up_weight, lowrank)
-
-
 def gated_residual_mix(
     normalized: _torch.Tensor,
     projection_weight: _torch.Tensor,
@@ -317,6 +288,7 @@ def gated_residual_mix(
     hidden_size: int,
     lowrank: int,
     *,
+    weights_independent: bool,
     projection_scale: float = 1.0,
     override: str | None = None,
     solution: str | None = None,
@@ -338,6 +310,10 @@ def gated_residual_mix(
         hc_count: Number of residual branches.
         hidden_size: Width of one branch.
         lowrank: Rank of the mix gate bottleneck.
+        weights_independent: Whether both weights are already ready and remain
+            unchanged within forward, permitting weight TMA before the activation
+            producer completes. Pass False when a preceding PDL kernel may write
+            either weight.
         projection_scale: Scale applied to down and inject projection results.
             It is ``1`` when an exact power-of-two scale was folded into the
             checkpoint weight and ``1 / hc_count`` otherwise.
@@ -386,20 +362,25 @@ def gated_residual_mix(
         )
         return mixed, inject
 
+    from tokenspeed_kernel.ops.residual.cute_fused import supports_fused_hc
+
     traits = {
+        "weights_independent": weights_independent,
+        "fused_grid_supported": supports_fused_hc(flat.device),
+        "fused_tma_aligned": all(
+            tensor.data_ptr() % 16 == 0
+            for tensor in (flat, projection_weight, up_weight)
+        ),
         "num_tokens": rows,
         "hc_count": hc_count,
         "hidden_size": hidden_size,
         "lowrank": lowrank,
-        "has_inject": has_inject,
         "contiguous": bool(
             flat.is_contiguous()
             and projection_weight.is_contiguous()
             and up_weight.is_contiguous()
         ),
-        "folded_scale": projection_scale == 1.0,
         "deterministic": _torch.are_deterministic_algorithms_enabled(),
-        "capturing": bool(flat.is_cuda and _torch.cuda.is_current_stream_capturing()),
     }
     signature = format_signature(
         normalized=dense_tensor_format(flat.dtype),
@@ -432,6 +413,7 @@ def gated_residual_mix(
             hidden_size,
             lowrank,
             projection_scale,
+            weights_independent,
         )
     mixed = mixed.reshape(*leading_shape, hidden_size)
     if inject is not None:
@@ -775,7 +757,7 @@ def mhc_fused_hc(
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.residual.cuda  # noqa: E402,F401
-import tokenspeed_kernel.ops.residual.cute_dsl  # noqa: E402,F401
+import tokenspeed_kernel.ops.residual.cute_fused  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.torch  # noqa: E402,F401
@@ -789,7 +771,6 @@ __all__ = [
     "attn_res_fwd_available",
     "gated_residual_combine",
     "gated_residual_mix",
-    "prepare_gated_residual_weight_cache",
     "mhc_fused_hc",
     "mhc_mixes",
     "mhc_post",

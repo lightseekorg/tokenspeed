@@ -321,8 +321,7 @@ features directly:
 
 Host KVStore (`--kvstore-ratio` / `--kvstore-size`) is a compact pinned
 buffer under GPU cache (flat KV). `--kvstore-storage-backend mooncake`
-adds Mooncake Store as L3 under that buffer, following SGLang HiCache /
-vLLM `MooncakeStoreConnector`:
+adds Mooncake Store as L3 under that buffer:
 
 ```
 GPU Device KV (L1)

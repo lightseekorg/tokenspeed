@@ -184,6 +184,7 @@ def _stub_contract(*, prefix_granularity: int, usable_pages: int):
                 rows_per_page=prefix_granularity,
                 entry_stride_tokens=1,
                 sliding_window_tokens=None,
+                replayable=False,
             )
             if group_id == "full_attention"
             else CacheGroupSpec(
@@ -192,6 +193,7 @@ def _stub_contract(*, prefix_granularity: int, usable_pages: int):
                 sliding_window_tokens=None,
                 family="state",
                 checkpoint_granularity=prefix_granularity,
+                replayable=False,
             )
         )
         for group_id in group_ids
@@ -558,6 +560,8 @@ class _KDAHarness:
             extend_seq_lens_cpu=new_cpu,
             extend_prefix_lens=prefix_cpu.to(self.device),
             extend_prefix_lens_cpu=prefix_cpu,
+            extend_replay_lens_cpu=torch.zeros_like(prefix_cpu),
+            extend_prompt_lens_cpu=prefix_cpu + new_cpu,
             extend_with_prefix=bool(prefix_cpu.any()),
         )
 

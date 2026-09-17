@@ -33,7 +33,7 @@ import math
 import os
 import re
 from pathlib import Path
-from test.runtime.test_deepseek_v41_cache import _backend, _extend, _tables
+from test.runtime.test_deepseek_v41_cache import R1, R2, _backend, _extend, _tables
 from test.runtime.test_deepseek_v41_engram import _mapping, _Tokenizer
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -48,8 +48,16 @@ from torch import nn
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.context import CapturedRows, ForwardContext
+from tokenspeed.runtime.execution.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardMode,
+)
+from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
+    V41DecoderView,
+    V41PrefillSpan,
+    V41RowPlan,
+)
 from tokenspeed.runtime.layers.linear import LinearBase, MergedColumnParallelLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.layers.moe.expert import MoELayer
@@ -221,14 +229,23 @@ class _DenseFFN(nn.Module):
 
 
 class _Backend:
-    def __init__(self, positions, requests):
+    def __init__(self, positions, requests, view=None):
         self.meta = SimpleNamespace(positions=positions, request_indices=requests)
+        self.view = (
+            V41DecoderView(self.meta, None, (), None, None) if view is None else view
+        )
         self.calls = []
         self.global_writes = {}
         self.projections = {}
 
     def query_metadata(self, mode):
         return self.meta
+
+    def decoder_view(self):
+        return self.view
+
+    def rows(self):
+        return V41RowPlan(self.meta, self.meta, None)
 
     def compress(self, owner, content, scores, mode, norm_weight, norm_eps):
         assert content.dtype == scores.dtype == torch.float32
@@ -285,7 +302,11 @@ class _Backend:
             )
         )
         assert softmax_scale == q.shape[-1] ** -0.5
-        assert torch.equal(request_indices, self.meta.request_indices)
+        assert any(
+            positions is meta.positions and requests is meta.request_indices
+            for meta in (self.meta, self.view.metadata)
+            for requests in (request_indices,)
+        )
         return (q * 0.25).to(q.dtype)
 
 
@@ -468,7 +489,9 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
     actual, expected = initial.clone(), initial.clone()
     actual_pre, expected_pre = pre.clone(), pre.clone()
     for layer in layers:
-        actual, actual_pre = layer(actual, actual_pre, positions, torch.arange(3), ctx)
+        actual, actual_pre = layer(
+            actual, actual_pre, positions, torch.arange(3), ctx, backend.rows()
+        )
         for sublayer, norm, name in (
             (layer.attn, layer.attn_norm, "attn"),
             (layer.ffn, layer.ffn_norm, "ffn"),
@@ -489,7 +512,7 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
             )
             x = _norm(collapsed, norm.weight, 1e-20)
             x = (
-                sublayer(positions, x, ctx)
+                sublayer(positions, x, ctx, backend.rows())
                 if name == "attn"
                 else sublayer(x, None, 3, 3, None, None)
             )
@@ -536,7 +559,7 @@ def test_attention_owner_cast_index_and_grouped_output(layer_id):
     backend = _Backend(positions, requests)
     ctx = _ctx(backend, 6, ForwardMode.EXTEND)
     x = torch.randn(6, 128, dtype=torch.bfloat16)
-    actual = attn(positions, x, ctx)
+    actual = attn(positions, x, ctx, backend.rows())
     qr = _norm(
         F.linear(x, attn.wq_a_wkv.weight[: config.q_lora_rank]),
         attn.q_norm.weight,
@@ -681,6 +704,90 @@ def test_full_40_layer_backbone_engram_and_final_mix(monkeypatch):
     assert forwarded["input_embeds"] is forwarded["pp_inbound"] is None
 
 
+def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
+    monkeypatch,
+):
+    """Layers below the candidate source see every row; the candidate source
+    writes its global KV for every row and then narrows to the decoder view;
+    every later layer, its collectives and the DSpark taps run on the view;
+    the sampled rows are the view's logits rows."""
+    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    torch.manual_seed(7)
+    config = _config()
+    model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", False, "gpu")
+    _initialize(model)
+    model.initialize_engram(_Tokenizer())
+    # Taps at, before and after the narrowing layer all reach the drafter in
+    # the narrowed layout ctx.captured_rows reports.
+    model.dspark_capture_layers = (19, 20, 39)
+    # Request 0 continues past this chunk (one decoder row); request 1
+    # completes its prompt (both rows).
+    ids = torch.tensor([0, 3, 4, 6, 3, 4])
+    positions = torch.tensor([0, 1, 2, 3, 0, 1])
+    requests = torch.tensor([0, 0, 0, 0, 1, 1])
+    keep_rows = torch.tensor([3, 4, 5])
+    tail = SimpleNamespace(
+        positions=positions[keep_rows], request_indices=requests[keep_rows]
+    )
+    view = V41DecoderView(
+        tail,
+        tail,
+        (V41PrefillSpan(0, 0, 3, 1, 3), V41PrefillSpan(1, 1, 0, 2, 0)),
+        keep_rows,
+        torch.tensor([0, 2]),
+    )
+    backend = _Backend(positions, requests, view)
+    ctx = _ctx(backend, 6, ForwardMode.EXTEND)
+    ctx.capture_hidden_mode = CaptureHiddenMode.FULL
+    seen = {}
+
+    def observe(layer_id):
+        def hook(module, args):
+            hidden, _, layer_positions, image_mask, layer_ctx, rows = args
+            seen[layer_id] = (
+                hidden.shape[0],
+                layer_positions.tolist(),
+                layer_ctx.collective_num_tokens,
+                rows.keep_rows is not None,
+            )
+
+        return hook
+
+    handles = [
+        model.layers[i].register_forward_pre_hook(observe(i)) for i in (19, 20, 21, 39)
+    ]
+    previous = torch.tensor([[-1, -1, -1], [0, -1, -1], [3, 0, -1], [4, 3, 0]])
+    previous = torch.cat((previous, previous[:2]))
+    actual, aux = model(
+        ids,
+        positions,
+        ctx,
+        None,
+        None,
+        engram_previous_tokens=previous,
+        engram_token_mask=torch.ones(6, dtype=torch.bool),
+        image_mask=None,
+    )
+    for handle in handles:
+        handle.remove()
+    assert seen[19] == (6, [0, 1, 2, 3, 0, 1], None, False)
+    assert seen[20] == (6, [0, 1, 2, 3, 0, 1], 3, True)
+    assert seen[21] == (3, [3, 0, 1], 3, False)
+    assert seen[39] == (3, [3, 0, 1], 3, False)
+    rows_attended = {layer: q.shape[0] for layer, q, *_ in backend.calls}
+    assert all(rows_attended[layer] == 6 for layer in range(20))
+    assert all(rows_attended[layer] == 3 for layer in range(20, 40))
+    # Every owner wrote from all six rows: the ratio-2 owners their pair
+    # rows, the candidate source (which then narrows) every token row.
+    assert sorted(backend.global_writes) == [2, 8, 14, 20]
+    assert all(w[2].numel() == 6 for w in backend.global_writes.values())
+    assert backend.global_writes[20][2].tolist() == positions.tolist()
+    assert actual.shape == (2, config.hidden_size)
+    assert [h.shape for h in aux] == [(3, config.hidden_size)] * 3
+    assert ctx.captured_rows == CapturedRows(tail.positions, ((0, 1), (1, 2)))
+    assert torch.isfinite(actual).all()
+
+
 def test_upstream_rope_and_hc_methods():
     root = os.environ.get("DEEPSEEK_V41_REFERENCE_DIR")
     if root is None:
@@ -809,7 +916,7 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
     backend = _backend("cuda:0", 2)
     backend.cache_pool.arena.buffer.zero_()
     tables = _tables("cuda:0")
-    meta = _extend(backend, tables, [4], [0])
+    meta = _extend(backend, tables, [4], [0], [0], [4])
     ctx = _ctx(backend, 4, ForwardMode.EXTEND)
     ids = torch.tensor([0, 3, 4, 6], device="cuda:0")
     previous = torch.tensor(
@@ -853,7 +960,7 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
     if execution_mode == "eager":
         return
     if execution_mode == "prefill":
-        _assert_prefill_graph_matches_eager(adapter, backend, tables)
+        _assert_chunked_prefill_replays_and_narrows(adapter, backend, tables)
         return
 
     _assert_decode_graph_matches_eager(
@@ -862,116 +969,110 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
 
 
 @torch.inference_mode()
-def _assert_prefill_graph_matches_eager(adapter, backend, tables):
-    """Capture the real runner, then change buckets, histories and request splits."""
-    from tokenspeed.runtime.execution.forward_batch_info import CaptureHiddenMode
-    from tokenspeed.runtime.execution.input_buffer import InputBuffers
-    from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
-
+def _assert_chunked_prefill_replays_and_narrows(adapter, backend, tables):
+    """A prompt prefilled in two chunks and the same prompt admitted on a
+    prefix hit (replaying the cached window) sample the same next token; the
+    decoder runs on one row per non-final chunk and on the last window of a
+    final one."""
     device = backend.device
-    ib = InputBuffers(2, 192, 2, device=device)
-    ib.init_ngram_buffers(3)
-    config = SimpleNamespace(
-        enforce_eager=False,
-        disable_prefill_graph=False,
-        prefill_graph_max_tokens=192,
-        prefill_graph_capture_sizes=[16, 192],
-        chunked_prefill_size=192,
-        max_num_seqs=2,
-        data_parallel_size=1,
-        world_size=1,
-        global_rank=0,
-        gpu_id=0,
-        device="cuda",
-        model_is_mrope=False,
-        context_len=512,
-        physical_context_len=512,
+    length, hit, window = 200, 128, 128
+    torch.manual_seed(3)
+    prompt = torch.randint(0, 7, (length,), device=device)
+    history = torch.stack(
+        [
+            torch.cat((torch.full((d,), -1, device=device), prompt[:-d]))
+            for d in (1, 2, 3)
+        ],
+        dim=1,
     )
-    graph = PrefillGraph(
-        model_runner=SimpleNamespace(model=adapter, is_generation=True),
-        attn_backend=backend,
-        token_to_kv_pool=backend.cache_pool,
-        input_buffers=ib,
-        config=config,
-        drafter=object(),
-        num_warmup=2,
-        graph_supported=backend.cuda_graph_support.prefill_graph,
-    )
-    assert not graph.disable
-    adapter.set_dspark_layers_to_capture([37, 38, 39])
     arena = backend.cache_pool.arena.buffer
     arena.zero_()
-    graph.capture(None)
-    assert all(cap.num_segments > 1 for cap in graph._captures.values())
-    arena.zero_()
-    # Odd compressor pairs, SWA page/window crossing, two requests, and mixed
-    # extend/decode all replay the same attention break with fresh metadata.
-    for step, (lengths, prefixes, num_extends) in enumerate(
-        (
-            ([15], [0], 1),
-            ([130], [15], 1),
-            ([3], [145], 1),
-            ([5, 7], [148, 0], 2),
-            ([3, 1], [153, 7], 1),
+    # Every window the model hands the backend -- full rows and the decoder
+    # view alike -- must plan from host spans; a device snapshot would also
+    # look back past the replay start.
+    canonical_window = backend._window
+
+    def checked_window(positions, requests, mode):
+        found = canonical_window(positions, requests, mode)
+        assert found is not None, "decoder rows fell back to a device snapshot"
+        return found
+
+    backend._window = checked_window
+
+    def run(request, tables, start, count, replay, prompt_len):
+        counts = torch.tensor([count], dtype=torch.int32)
+        prefix = torch.tensor([start], dtype=torch.int32)
+        backend.init_forward_metadata(
+            1,
+            1,
+            torch.tensor([request], device=device),
+            (counts + prefix).to(device),
+            ForwardMode.EXTEND,
+            block_tables=tables,
+            extend_seq_lens=counts.to(device),
+            extend_seq_lens_cpu=counts,
+            extend_prefix_lens=prefix.to(device),
+            extend_prefix_lens_cpu=prefix,
+            extend_replay_lens_cpu=torch.tensor([replay], dtype=torch.int32),
+            extend_prompt_lens_cpu=torch.tensor([prompt_len], dtype=torch.int32),
+            extend_with_prefix=start > 0,
         )
-    ):
-        n = sum(lengths)
-        bs = len(lengths)
-        mode = ForwardMode.EXTEND if num_extends == bs else ForwardMode.MIXED
-        ids = ib.input_ids_buf[:n]
-        ids.copy_((torch.arange(n, device=device) + step) % 7)
-        ib.ngram_previous_tokens_buf.fill_(-1)
-        ib.ngram_previous_tokens_buf[:n, 0] = (ids + 2) % 7
-        ib.ngram_token_mask_buf.zero_()
-        ib.ngram_token_mask_buf[:n] = True
-        counts = torch.tensor(lengths, dtype=torch.int32)
-        prefix = torch.tensor(prefixes, dtype=torch.int32)
+        rows = slice(start, start + count)
         ctx = ForwardContext(
             attn_backend=backend,
             token_to_kv_pool=backend.cache_pool,
-            bs=bs,
-            num_extends=num_extends,
-            input_num_tokens=n,
-            forward_mode=mode,
+            bs=1,
+            num_extends=1,
+            input_num_tokens=count,
+            forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=CaptureHiddenMode.FULL,
-            gather_ids=(counts.cumsum(0) - 1).to(device),
+            gather_ids=torch.tensor([count - 1], device=device),
         )
-        before = arena.clone()
-        for replay in (False, True):
-            backend.init_forward_metadata(
-                bs,
-                num_extends,
-                torch.arange(bs, device=device),
-                (counts + prefix).to(device),
-                mode,
-                block_tables=tables,
-                extend_seq_lens=counts[:num_extends].to(device),
-                extend_seq_lens_cpu=counts[:num_extends],
-                extend_prefix_lens=prefix[:num_extends].to(device),
-                extend_prefix_lens_cpu=prefix[:num_extends],
-                extend_with_prefix=any(prefixes),
-            )
-            ib.positions_buf[:n].copy_(backend.query_metadata(mode).positions)
-            if not replay:
-                expected = adapter(
-                    ctx=ctx,
-                    input_ids=ids,
-                    positions=ib.positions_buf[:n],
-                    **ib.ngram_model_kwargs(n),
-                )
-                logits = expected.next_token_logits.clone()
-                hidden = expected.hidden_states.clone()
-                expected_cache = arena.clone()
-                arena.copy_(before)
-            else:
-                assert graph.can_run(ctx)
-                actual = graph.replay(ctx, ids)
-                torch.testing.assert_close(
-                    actual.next_token_logits, logits, rtol=0, atol=0
-                )
-                torch.testing.assert_close(actual.hidden_states, hidden, rtol=0, atol=0)
-                torch.testing.assert_close(arena, expected_cache, rtol=0, atol=0)
-                assert torch.isfinite(actual.next_token_logits).all()
+        output = adapter(
+            ctx=ctx,
+            input_ids=prompt[rows],
+            positions=backend.query_metadata(ForwardMode.EXTEND).positions,
+            engram_previous_tokens=history[rows],
+            engram_token_mask=torch.ones(count, dtype=torch.bool, device=device),
+            image_mask=None,
+        )
+        assert output.next_token_logits.shape[0] == 1
+        assert torch.isfinite(output.next_token_logits).all()
+        return output.next_token_logits.clone(), backend.decoder_view()
+
+    # Request 0: a non-final chunk keeps one decoder row, the final chunk the
+    # prompt's last window.
+    _, view = run(0, tables, 0, 72, 0, length)
+    assert view.metadata.positions.tolist() == [71]
+    assert view.logits_rows.tolist() == [0]
+    chunked, view = run(0, tables, 72, length - 72, 0, length)
+    assert view.keep_rows is None and view.logits_rows is None
+    assert view.metadata.positions.tolist() == list(range(72, length))
+    # Request 1 hits request 0's global rows [0, hit) and replays the window
+    # before the hit into its own SWA/tail pages; the rows above the hit get
+    # private global pages.
+    hit_pages = {2: tables[R2][0, : hit // 128], 8: tables[R2][0, : hit // 128]}
+    hit_pages[14] = hit_pages[2]
+    hit_pages[20] = tables[R1][0, : hit // 64]
+    hit_tables = {gid: table.clone() for gid, table in tables.items()}
+    hit_tables[R2][1, : hit // 128] = hit_pages[2]
+    hit_tables[R1][1, : hit // 64] = hit_pages[20]
+    pool = backend.cache_pool
+    aliased = {
+        (owner, name): getattr(pool, name)(owner)[pages].clone()
+        for owner, pages in hit_pages.items()
+        for name in ("global_kv", "index_k")
+    }
+    replayed, view = run(
+        1, hit_tables, hit - window, length - (hit - window), window, length
+    )
+    assert view.metadata.positions.tolist() == list(range(length - window, length))
+    torch.testing.assert_close(replayed, chunked, rtol=0, atol=0)
+    # The replayed rows never rewrote the hit's global rows.
+    for (owner, name), before in aliased.items():
+        torch.testing.assert_close(
+            getattr(pool, name)(owner)[hit_pages[owner]], before, rtol=0, atol=0
+        )
 
 
 def _assert_decode_graph_matches_eager(adapter, backend, tables, device, steps):
@@ -1124,7 +1225,7 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
         )
         backend = _backend(str(device), 2)
         tables = _tables(str(device))
-        meta = _extend(backend, tables, [4], [0])
+        meta = _extend(backend, tables, [4], [0], [0], [4])
         ids = torch.tensor([0, 3, 4, 6], device=device)
         previous = torch.tensor(
             [[-1, -1, -1], [0, -1, -1], [3, 0, -1], [4, 3, 0]], device=device
@@ -1157,6 +1258,7 @@ def _loader_config():
     config.engram_layer_ids = [1]
     config.engram_num_embeddings = [72]
     config.kv_source_layer_ids = config.index_source_layer_ids = [2]
+    config.candidate_source_layer_id = 2
     return config
 
 

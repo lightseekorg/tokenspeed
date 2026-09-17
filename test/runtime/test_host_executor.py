@@ -314,10 +314,72 @@ class GroupAwareWireTest(unittest.TestCase):
         executor._load_poisoned = False
 
         executor.submit_load_backs(
-            SimpleNamespace(cache=[]), prerequisite_stream=object()
+            SimpleNamespace(cache=[]), prerequisite_stream=object(), l3_prefetch_ok={}
         )
 
         tracker.set_consumers.assert_called_once_with(-1)
+
+    def test_queued_l3_load_uses_its_captured_prefetch_results(self):
+        module = _load_executor_module_without_triton(force_isolated=True)
+        for second_outcome in ("success", "replica_miss", "exception", "empty"):
+            with self.subTest(second_outcome=second_outcome):
+                executor = module.L2CacheExecutor.__new__(module.L2CacheExecutor)
+                executor._l3_prefetch_ok = {}
+                executor._load_trackers = []
+                executor._start_loading = Mock(return_value=0)
+                executor._prefetch_from_storage = Mock(return_value=[True])
+
+                def plan_for(op_id, host_page):
+                    op = module.Cache.LoadBackOp()
+                    op.op_ids = [op_id]
+                    op.group_ids = [[0]]
+                    op.src_pages = [[host_page]]
+                    op.dst_pages = [[host_page + 10]]
+                    op.content_hashes = [[f"h{host_page}"]]
+                    op.page_offsets = [[0]]
+                    op.prefetch_from_storage = [[1]]
+                    return SimpleNamespace(cache=[op])
+
+                first = plan_for(1, 1)
+                second = plan_for(2, 2)
+                self.assertEqual(executor.prefetch_l3_load_backs(first), [True])
+                captured = executor.take_l3_prefetch_results()
+                if second_outcome == "exception":
+                    executor._prefetch_from_storage.side_effect = RuntimeError("RPC")
+                    with self.assertRaisesRegex(RuntimeError, "RPC"):
+                        executor.prefetch_l3_load_backs(second)
+                else:
+                    executor.prefetch_l3_load_backs(
+                        SimpleNamespace(cache=[])
+                        if second_outcome == "empty"
+                        else second
+                    )
+                if second_outcome in ("replica_miss", "exception"):
+                    executor.invalidate_l3_prefetch()
+                second_captured = executor.take_l3_prefetch_results()
+
+                stream = object()
+                executor.submit_load_backs(
+                    first, prerequisite_stream=stream, l3_prefetch_ok=captured
+                )
+                executor._start_loading.assert_called_once_with(
+                    [1], [(0, 11, 1)], success=True, prerequisite_stream=stream
+                )
+                if second_outcome != "empty":
+                    executor._start_loading.reset_mock()
+                    executor.submit_load_backs(
+                        second,
+                        prerequisite_stream=stream,
+                        l3_prefetch_ok=second_captured,
+                    )
+                    success = second_outcome == "success"
+                    executor._start_loading.assert_called_once_with(
+                        [2],
+                        [(0, 12, 2)] if success else [],
+                        success=success,
+                        prerequisite_stream=stream,
+                    )
+                self.assertEqual(executor.take_l3_prefetch_results(), {})
 
     def test_submit_preserves_group_identity(self):
         L2CacheExecutor = self._executor_module().L2CacheExecutor

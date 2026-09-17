@@ -208,16 +208,12 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
                 f"vocab_size={vocab}, offending="
                 f"{[t for t in raw_ids if not 0 <= t < vocab]}"
             )
-            token_ids = torch.tensor(
-                raw_ids,
-                device=self._logit_bias.device,
-                dtype=torch.long,
+            token_ids = torch.tensor(raw_ids, dtype=torch.long, pin_memory=True).to(
+                self._logit_bias.device, non_blocking=True
             )
             bias_values = torch.tensor(
-                list(bias_map.values()),
-                device=self._logit_bias.device,
-                dtype=torch.bfloat16,
-            )
+                list(bias_map.values()), dtype=torch.bfloat16, pin_memory=True
+            ).to(self._logit_bias.device, non_blocking=True)
             self._logit_bias[pool_idx, token_ids] = bias_values
 
     def reset_capture_state(self) -> None:

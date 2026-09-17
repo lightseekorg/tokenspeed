@@ -490,7 +490,14 @@ class ModelConfig:
                     "DSPARK captured-context window size must be positive; "
                     f"got {dspark_window_size}."
                 )
-            self.dspark_prefix_replay_tokens = dspark_window_size
+            # V4.1 keeps its windows in the SWA cache group, so a prefix hit
+            # already carries them; V4 rebuilds a drafter-private ring instead.
+            self.dspark_prefix_replay_tokens = (
+                0
+                if resolve_architecture(self.hf_config)
+                == "DeepseekV41ForCausalLMDSpark"
+                else dspark_window_size
+            )
             dspark_num_stages = count_dspark_stages(
                 model_path,
                 revision=revision,

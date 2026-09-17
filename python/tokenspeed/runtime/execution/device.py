@@ -342,10 +342,15 @@ class DeviceHandle:
         if l2 is not None:
             # Behind the zeroing: the loads' destinations were zeroed on the
             # default stream, so that is the prerequisite they order after.
+            # Capture on the control plane, before the next round can prefetch
+            # or invalidate its own L3 pages while this submission is queued.
+            l3_prefetch_ok = l2.take_l3_prefetch_results()
             self._l2_submissions.append(
                 self._thread.submit(
                     lambda: l2.submit_load_backs(
-                        execution_plan, prerequisite_stream=executor.default_stream
+                        execution_plan,
+                        prerequisite_stream=executor.default_stream,
+                        l3_prefetch_ok=l3_prefetch_ok,
                     )
                 )
             )
@@ -1105,11 +1110,22 @@ def build_device_side(
 
     def encoder_model_facts() -> EncoderModelFacts:
         model = target.model
+        vision = next(
+            module
+            for module in (
+                getattr(model, name, None)
+                for name in ("visual", "vision_tower", "vision")
+            )
+            if module is not None
+        )
+        dtype = getattr(vision, "dtype", None)
+        if dtype is None:
+            dtype = next(vision.parameters()).dtype
         return EncoderModelFacts(
             device=executor.device,
             hidden=model.config.hidden_size,
             num_deepstack=getattr(model, "num_deepstack_embeddings", 0),
-            dtype=(getattr(model, "visual", None) or model.vision_tower).dtype,
+            dtype=dtype,
         )
 
     return DeviceBuild(

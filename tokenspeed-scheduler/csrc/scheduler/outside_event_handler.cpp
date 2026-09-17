@@ -111,8 +111,7 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
             registerKvEventPrefixPages(request, progress.prefix_hashes, first_new_prefix_page);
         coordinator_.CacheCompletedBlocks(request.BlockTablesRef(), progress.prefix_hashes, progress.access_epoch,
                                           first_new_prefix_page, request.TokenSize() - 1, CacheBoundaryKind::kEndpoint,
-                                          /*stream_completed_to_host=*/false,
-                                          request.MaterializedStateBoundaryTokens());
+                                          /*stream_completed_to_host=*/false, progress.materialized_state_boundaries);
         discardUncachedKvEventPages(event_keys);
     }
     if (!config_.StreamsDeviceCacheToHost()) {

@@ -426,7 +426,9 @@ class L2CacheExecutor:
             prerequisite_stream=prerequisite_stream,
         )
 
-    def submit_load_backs(self, plan, *, prerequisite_stream) -> None:
+    def submit_load_backs(
+        self, plan, *, prerequisite_stream, l3_prefetch_ok: dict[StoragePage, bool]
+    ) -> None:
         """Launch the plan's H2D loads; runs after the plan's page zeroing.
 
         L3 prefetch runs before this submission. Failed prefetch skips H2D
@@ -438,6 +440,8 @@ class L2CacheExecutor:
             prerequisite_stream: The stream whose completed work every copy
                 must observe -- the one the plan's page zeroing ran on, so the
                 loads land on zeroed destination pages.
+            l3_prefetch_ok: This submission's captured prefetch results. Later
+                control-plane rounds must not change the queued H2D decision.
         """
         op_ids: list[int] = []
         transfers: list[tuple[int, int, int]] = []
@@ -460,7 +464,7 @@ class L2CacheExecutor:
                     operation_indices=range(len(operation.group_ids)),
                 )
                 if prefetch_pages and not all(
-                    self._l3_prefetch_ok.get(page, False) for page in prefetch_pages
+                    l3_prefetch_ok.get(page, False) for page in prefetch_pages
                 ):
                     prefetch_ok = False
         if not prefetch_ok:
@@ -596,9 +600,9 @@ class L2CacheExecutor:
         Callers MIN-reduce the vector across the replica before H2D or
         forward.
         """
+        self._l3_prefetch_ok = {}
         pages = self._plan_prefetch_pages(plan)
         if not pages:
-            self._l3_prefetch_ok = {}
             return []
         results = self._prefetch_from_storage(pages)
         if len(results) != len(pages):
@@ -608,6 +612,16 @@ class L2CacheExecutor:
             )
         self._l3_prefetch_ok = dict(zip(pages, results))
         return [bool(flag) for flag in results]
+
+    def take_l3_prefetch_results(self) -> dict[StoragePage, bool]:
+        """Move this round's results into its queued submission on the control plane.
+
+        Returns the per-page outcomes, detached from subsequent prefetches or
+        replica-wide invalidations. The forward thread only reads this snapshot.
+        """
+        results = self._l3_prefetch_ok
+        self._l3_prefetch_ok = {}
+        return results
 
     def invalidate_l3_prefetch(self) -> None:
         """Force later H2D to skip every L3 source in this plan."""

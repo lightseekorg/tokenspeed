@@ -192,6 +192,8 @@ def test_ple_non_verify_metadata_disarms_previous_round(backend, mode, monkeypat
         extend_seq_lens_cpu=lengths,
         extend_prefix_lens=prefix,
         extend_prefix_lens_cpu=prefix,
+        extend_replay_lens_cpu=torch.zeros_like(prefix),
+        extend_prompt_lens_cpu=prefix + lengths,
         extend_with_prefix=True,
     )
     if mode != ForwardMode.IDLE:

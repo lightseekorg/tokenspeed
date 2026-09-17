@@ -450,6 +450,51 @@ class LeafSignatureConformanceTest(_TorchCase):
                     self.fail(f"{cls.__name__}.init_forward_metadata: {exc}")
 
 
+class WrapperForwardsTheExtendBundleTest(_TorchCase):
+    """A wrapper that re-states the extend bundle for an inner runner-facing
+    node must forward every field: a field it accepts but drops would reach
+    the inner node's required-keyword check only on hardware that runs it."""
+
+    def test_inkling_wrapper_forwards_every_extend_field(self):
+        from unittest.mock import Mock
+
+        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
+            InklingAttnBackend,
+        )
+
+        torch = self.torch
+        wrapper = InklingAttnBackend.__new__(InklingAttnBackend)
+        wrapper.inner = Mock()
+        wrapper._pfg_seq_idx = None
+        wrapper.conv_columns = {"group_block_tokens": {"conv": 4}}
+        counts = torch.tensor([3], dtype=torch.int32)
+        prefix = torch.tensor([0], dtype=torch.int32)
+        bundle = dict(
+            extend_seq_lens=counts,
+            extend_seq_lens_cpu=counts,
+            extend_prefix_lens=prefix,
+            extend_prefix_lens_cpu=prefix,
+            extend_replay_lens_cpu=torch.zeros_like(prefix),
+            extend_prompt_lens_cpu=counts.clone(),
+            extend_with_prefix=False,
+        )
+        wrapper.init_forward_metadata(
+            1,
+            1,
+            torch.tensor([0], dtype=torch.int32),
+            counts,
+            ForwardMode.EXTEND,
+            block_tables={
+                "conv": torch.zeros((1, 2), dtype=torch.int32),
+                "full": torch.zeros((1, 2), dtype=torch.int32),
+            },
+            **bundle,
+        )
+        forwarded = wrapper.inner.init_forward_metadata.call_args.kwargs
+        for name, value in bundle.items():
+            self.assertIs(forwarded[name], value, f"{name} was not forwarded")
+
+
 class RunnerSignatureConformanceTest(_TorchCase):
     """Every runner-facing node accepts the runner's kwarg set."""
 
@@ -465,6 +510,10 @@ class RunnerSignatureConformanceTest(_TorchCase):
         (
             "tokenspeed.runtime.layers.attention.backends.specific.deepseek_v4",
             "DeepseekV4AttentionBackend",
+        ),
+        (
+            "tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41",
+            "DeepseekV41AttentionBackend",
         ),
         (
             "tokenspeed.runtime.layers.attention.backends.state.mamba",
@@ -495,7 +544,7 @@ class RunnerSignatureConformanceTest(_TorchCase):
 
     def test_init_forward_metadata_binds_the_runner_call_shape(self):
         """The runner's extend call: five positionals, then block_tables with
-        its CPU mirror and the five extend fields as required keywords (no
+        its CPU mirror and the seven extend fields as required keywords (no
         defaults anywhere), plus the model-side extras a node may ignore."""
         import importlib
         import inspect
@@ -522,6 +571,8 @@ class RunnerSignatureConformanceTest(_TorchCase):
                         extend_seq_lens_cpu=None,
                         extend_prefix_lens=None,
                         extend_prefix_lens_cpu=None,
+                        extend_replay_lens_cpu=None,
+                        extend_prompt_lens_cpu=None,
                         extend_with_prefix=False,
                         positions=None,
                         global_num_tokens=None,
@@ -536,6 +587,8 @@ class RunnerSignatureConformanceTest(_TorchCase):
                     "extend_seq_lens_cpu",
                     "extend_prefix_lens",
                     "extend_prefix_lens_cpu",
+                    "extend_replay_lens_cpu",
+                    "extend_prompt_lens_cpu",
                     "extend_with_prefix",
                 ):
                     param = sig.parameters.get(name)

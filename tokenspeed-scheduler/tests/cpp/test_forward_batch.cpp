@@ -171,5 +171,32 @@ TEST(ForwardBatch, EqualLengthRowsUnchanged) {
     EXPECT_EQ(full.at(1), (std::vector<std::int32_t>{20, 21}));
 }
 
+TEST(ForwardBatch, CarriesExtendReplayLensParallelToPrefixLens) {
+    std::vector<ForwardOperation> ops;
+    PrefillOperation replayed;
+    replayed.request_id = "r0";
+    replayed.input_ids = {1, 2, 3, 4, 5};
+    replayed.input_length = 5;
+    replayed.extend_prefix_len = 16;
+    replayed.extend_replay_len = 3;
+    PrefillOperation plain;
+    plain.request_id = "r1";
+    plain.input_ids = {6, 7};
+    plain.input_length = 2;
+    plain.extend_prefix_len = 0;
+    DecodeOperation decode;
+    decode.request_id = "d0";
+    decode.input_length = 1;
+    ops.emplace_back(std::move(decode));
+    ops.emplace_back(std::move(replayed));
+    ops.emplace_back(std::move(plain));
+
+    const ForwardBatch batch{std::move(ops)};
+    EXPECT_EQ(batch.request_ids, (std::vector<std::string>{"r0", "r1", "d0"}));
+    EXPECT_EQ(batch.extend_prefix_lens, (std::vector<std::int32_t>{16, 0}));
+    EXPECT_EQ(batch.extend_replay_lens, (std::vector<std::int32_t>{3, 0}));
+    EXPECT_EQ(batch.NumExtends(), 2);
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

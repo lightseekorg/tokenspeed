@@ -51,7 +51,10 @@ from tokenspeed_kernel.ops.gemm import (
     prepare_nvfp4_a16_weights,
     warmup_prepared_fp8_linears,
 )
-from tokenspeed_kernel.ops.layernorm import grouped_gemma_rmsnorm
+from tokenspeed_kernel.ops.layernorm import (
+    gated_residual_combine_norm,
+    grouped_gemma_rmsnorm,
+)
 from tokenspeed_kernel.ops.moe import (
     dsv4_mega_moe_apply,
     dsv4_mega_moe_plan,
@@ -83,7 +86,6 @@ from tokenspeed_kernel.ops.residual import (
     mhc_mixes,
     mhc_post,
     mhc_pre,
-    prepare_gated_residual_weight_cache,
 )
 from tokenspeed_kernel.ops.sampling import argmax
 from tokenspeed_kernel.ops.transform import hadamard_transform
@@ -117,12 +119,12 @@ __all__ = [
     "attn_res_fwd",
     "attn_res_fwd_available",
     "gated_residual_combine",
+    "gated_residual_combine_norm",
     "gated_residual_mix",
     "mhc_fused_hc",
     "mhc_mixes",
     "mhc_post",
     "mhc_pre",
-    "prepare_gated_residual_weight_cache",
     # layernorm
     "grouped_gemma_rmsnorm",
     # attention

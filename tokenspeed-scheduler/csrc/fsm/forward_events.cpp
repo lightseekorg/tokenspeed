@@ -45,7 +45,14 @@ SchedulePrefillFirstChunkEvent::scheduleFirstChunk(TokenContainer* token_contain
         .cache_progress = std::move(cache_progress_),
         .results_in_flight = 0,
     };
-    const TokenContainer::Window window{.begin = hit_tokens_, .size = tokens_this_round_};
+    // A local hit re-feeds the replay window before it (bounded replay). A
+    // remote prefill computes nothing here: the peer's replayable pages land
+    // as its retained tail, like any sliding group's.
+    const TokenContainer::Window window{
+        .begin = hit_tokens_,
+        .size = tokens_this_round_,
+        .replay = source_ == PrefillSource::kLocal ? coordinator_->ReplayTokens(hit_tokens_) : 0,
+    };
     if (source_ == PrefillSource::kRemote) {
         // The peer prefills the whole prompt; this engine only holds the
         // destination pages until RemotePrefillDone.

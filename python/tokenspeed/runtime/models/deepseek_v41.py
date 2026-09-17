@@ -37,9 +37,14 @@ kwargs. These are borrowed forward inputs, never request state or ForwardContext
 fields. The runner owns refresh/overlap/rollback and can use stable input views.
 No setter retains a mutable per-forward tensor; no hashes survive a forward.
 
-This baseline executes every scheduled token through every backbone layer. CED
-shortening, PP and CP are not implemented. DSpark captures layer inputs. Attention
-and MoE TPxEP widths must match to keep the HC stream replicated on attention TP.
+Every scheduled token runs through the encoder layers; the CED decoder (from
+the candidate source on) runs on the rows the backend's ``decoder_view()``
+keeps -- each prompt's last window (one row for a chunk that leaves its prompt
+open) plus every decode row -- after the candidate source has written the
+decoder's global KV for all rows. DSpark captures the kept rows and the model
+reports them as ``ctx.captured_rows``. PP, CP and narrowing under attention DP
+are not implemented. Attention and MoE TPxEP widths must match to keep the HC
+stream replicated on attention TP.
 """
 
 from __future__ import annotations
@@ -51,6 +56,7 @@ import os
 import re
 from collections import Counter
 from collections.abc import Iterable
+from contextlib import ExitStack
 from copy import copy
 from weakref import WeakValueDictionary
 
@@ -74,7 +80,14 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     current_forward_ctx,
     slice_to_real_tokens,
 )
-from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.context import (
+    CapturedRows,
+    ForwardContext,
+    report_collective_sizing,
+)
+from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
+    V41RowPlan,
+)
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -728,12 +741,16 @@ class DeepseekV41Attention(nn.Module):
 
     @break_point
     def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor, ctx: ForwardContext
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        rows: V41RowPlan,
     ) -> torch.Tensor:
         backend, mode = ctx.attn_backend, ctx.forward_mode
         if mode is None:
             raise ValueError("V4.1 attention requires an explicit forward mode")
-        meta = backend.query_metadata(mode)
+        meta = rows.source
         # Prefill buckets pad token-local compute; cache writes and selection
         # must use only the live rows, including the decode suffix of a mixed batch.
         if current_forward_ctx() is not None:
@@ -784,6 +801,18 @@ class DeepseekV41Attention(nn.Module):
                         row_positions,
                         row_requests,
                         mode,
+                    )
+                if rows.keep_rows is not None:
+                    # CED: the decoder's global KV above came from every
+                    # encoder row; from here on only the per-request tail
+                    # is attended and carried forward.
+                    hidden_states, qr, swa = (
+                        t.index_select(0, rows.keep_rows)
+                        for t in (hidden_states, qr, swa)
+                    )
+                    positions, requests = (
+                        rows.query.positions,
+                        rows.query.request_indices,
                     )
                 if self.indexer is not None:
                     index_q, index_weights = self.indexer(
@@ -993,7 +1022,7 @@ class DeepseekV41DecoderLayer(nn.Module):
                 param.weight_loader = default_weight_loader
                 self.register_parameter(f"hc_{name}_{suffix}", param)
 
-    def forward(self, hidden_states, pre_mix, positions, image_mask, ctx):
+    def forward(self, hidden_states, pre_mix, positions, image_mask, ctx, rows):
         residual = hidden_states
         overlap = (
             residual.is_cuda
@@ -1020,7 +1049,14 @@ class DeepseekV41DecoderLayer(nn.Module):
                 for tensor in (attn_pre, post, comb):
                     tensor.record_stream(consumer)
             x = _v41_hc_input(residual, pre_mix, self.attn_norm)
-            x = self.attn(positions, x, ctx)
+            x = self.attn(positions, x, ctx, rows)
+        if rows.keep_rows is not None:
+            residual, post, comb, attn_pre = (
+                t.index_select(0, rows.keep_rows)
+                for t in (residual, post, comb, attn_pre)
+            )
+            if image_mask is not None:
+                image_mask = image_mask.index_select(0, rows.keep_rows)
         hidden_states = v41_hc_post(x, residual, post, comb)
         residual = hidden_states
         if overlap:
@@ -1056,6 +1092,29 @@ class DeepseekV41DecoderLayer(nn.Module):
                 x = self.ffn(x, image_mask, total, maximum, ctx=None, comm_manager=None)
                 x, _ = self.comm_manager.post_mlp_comm(x, None, ctx)
         return v41_hc_post(x, residual, post, comb), ffn_pre
+
+
+def _ced_decoder_start(config) -> int:
+    """First decoder layer of the causal encoder-decoder split.
+
+    The decoder's global KV is projected by its first layer from the encoder
+    output and reused by every later layer, so that layer is the candidate
+    source and the last KV owner: layers after it never run a compressor, so
+    they can run on the narrowed decoder rows. Anything else is not the CED
+    layout this model shortens.
+    """
+    layers = int(config.num_hidden_layers)
+    owners = [int(layer) for layer in config.kv_source_layer_ids]
+    if not owners:
+        # A window-only stack (the DSpark draft) has no global KV and hence no
+        # decoder to shorten; every layer runs on the full rows.
+        return layers
+    start = int(config.candidate_source_layer_id)
+    if not 0 < start < layers or owners[-1] != start:
+        raise ValueError(
+            "V4.1 CED requires the candidate source to be the last KV owner"
+        )
+    return start
 
 
 class DeepseekV41Model(nn.Module):
@@ -1106,6 +1165,7 @@ class DeepseekV41Model(nn.Module):
         self.pp_start_layer, self.pp_end_layer = 0, config.num_hidden_layers
         self.engram_hash = None
         self.dspark_capture_layers = ()
+        self.ced_decoder_start = _ced_decoder_start(config)
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -1204,21 +1264,67 @@ class DeepseekV41Model(nn.Module):
         pre_mix = torch.zeros(h.shape[:2], dtype=torch.float32, device=h.device)
         pre_mix[:, 0] = 1
         captured = []
-        for layer in self.layers:
-            if layer.engram is not None:
-                h = layer.engram(
-                    h, hashes[:, layer.engram.layer_hash_index], engram_token_mask
-                )
-            if layer.layer_id in self.dspark_capture_layers:
-                # The draft was trained on unweighted HC means at layer inputs.
-                captured.append(h.mean(dim=1))
-            h, pre_mix = layer(h, pre_mix, positions, image_mask, ctx)
-        h = v41_hc_pre(h, pre_mix)
+        backend = ctx.attn_backend
+        full = backend.query_metadata(ctx.forward_mode)
+        view = backend.decoder_view()
+        if view.keep_rows is not None and ctx.global_num_tokens is not None:
+            raise NotImplementedError(
+                "V4.1 CED narrowing under attention data parallelism needs the "
+                "narrowed row counts exchanged across ranks"
+            )
+        # Encoder layers see every row. The first decoder layer projects the
+        # decoder's global KV from all rows, then narrows to the decoder view;
+        # the remaining decoder layers, and their collectives, run on that view.
+        row_plans = {
+            "encoder": V41RowPlan(full, full, None),
+            "narrowing": V41RowPlan(full, view.metadata, view.keep_rows),
+            "decoder": V41RowPlan(view.metadata, view.metadata, None),
+        }
+        with ExitStack() as decoder_scope:
+            for layer in self.layers:
+                if layer.layer_id < self.ced_decoder_start:
+                    rows = row_plans["encoder"]
+                elif layer.layer_id == self.ced_decoder_start:
+                    rows = row_plans["narrowing"]
+                    decoder_scope.enter_context(
+                        report_collective_sizing(
+                            ctx, view.metadata.positions.numel(), None
+                        )
+                    )
+                else:
+                    rows = row_plans["decoder"]
+                if layer.engram is not None:
+                    h = layer.engram(
+                        h, hashes[:, layer.engram.layer_hash_index], engram_token_mask
+                    )
+                if layer.layer_id in self.dspark_capture_layers:
+                    # The draft was trained on unweighted HC means at layer inputs.
+                    captured.append(h.mean(dim=1))
+                h, pre_mix = layer(h, pre_mix, positions, image_mask, ctx, rows)
+                if rows.keep_rows is not None:
+                    keep = rows.keep_rows
+                    positions = positions.index_select(0, keep)
+                    if image_mask is not None:
+                        image_mask = image_mask.index_select(0, keep)
+                    if hashes is not None:
+                        hashes = hashes.index_select(0, keep)
+                        engram_token_mask = engram_token_mask.index_select(0, keep)
+                    # Taps before this layer captured every row; the drafter
+                    # reads all taps in the layout ctx.captured_rows reports.
+                    captured = [tap.index_select(0, keep) for tap in captured]
+        h = _norm(v41_hc_pre(h, pre_mix), self.norm)
+        if view.logits_rows is not None:
+            h = h.index_select(0, view.logits_rows)
         capture = (
             ctx.capture_hidden_mode is not None
             and ctx.capture_hidden_mode.need_capture()
         )
-        return _norm(h, self.norm), (captured or [h]) if capture else None
+        if capture and view.keep_rows is not None:
+            ctx.captured_rows = CapturedRows(
+                view.metadata.positions,
+                tuple((span.offset, span.count) for span in view.spans),
+            )
+        return h, (captured or [h]) if capture else None
 
 
 class DeepseekV41ForCausalLM(BaseCausalLM):

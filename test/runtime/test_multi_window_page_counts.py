@@ -109,6 +109,7 @@ def _spec(group_id, retention, window=None, rows_per_page=64):
         rows_per_page=rows_per_page,
         entry_stride_tokens=1,
         sliding_window_tokens=window,
+        replayable=False,
     )
 
 

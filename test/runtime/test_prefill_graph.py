@@ -50,6 +50,7 @@ def _spec(
             family="state",
             checkpoint_granularity=block_granularity,
             sliding_window_tokens=sliding_window_tokens,
+            replayable=False,
         )
     return CacheGroupSpec(
         group_id=group_id,
@@ -58,6 +59,7 @@ def _spec(
         rows_per_page=block_granularity,
         entry_stride_tokens=1,
         sliding_window_tokens=sliding_window_tokens,
+        replayable=False,
     )
 
 
@@ -454,6 +456,8 @@ class DummyGroupTablesTest(unittest.TestCase):
             extend_seq_lens_cpu=buf(16, torch.int32),
             extend_prefix_lens_buf=buf(16, torch.int32),
             extend_prefix_lens_cpu=buf(16, torch.int32),
+            extend_replay_lens_cpu=buf(16, torch.int32),
+            extend_prompt_lens_cpu=buf(16, torch.int32),
         )
         pg.block_table = torch.zeros(16, 64, dtype=torch.int32)
 

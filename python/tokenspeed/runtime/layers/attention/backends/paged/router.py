@@ -52,7 +52,10 @@ from typing import TYPE_CHECKING
 import torch
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
-from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.backends.base import (
+    AttentionBackend,
+    reject_bounded_replay,
+)
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
@@ -470,6 +473,8 @@ class CacheGroupRouter(AttentionBackend):
         extend_seq_lens_cpu: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
+        extend_replay_lens_cpu: torch.Tensor,
+        extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
         **kwargs,
     ) -> None:
@@ -482,6 +487,8 @@ class CacheGroupRouter(AttentionBackend):
         or chunked prefix) travels with the extend lengths: leaves size their
         paged-prefix metadata by it, so it must reach them unchanged.
         """
+        del extend_prompt_lens_cpu
+        reject_bounded_replay(extend_replay_lens_cpu, "CacheGroupRouter")
         del kwargs
         # A new forward: the sparse layers' shared top-k is per forward.
         self.sparse_topk.clear()

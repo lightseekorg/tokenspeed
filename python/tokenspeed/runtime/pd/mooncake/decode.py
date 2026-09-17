@@ -62,7 +62,7 @@ class PrefillParallelInfo:
 
 def parse_prefill_status_message(
     parts: list[bytes],
-) -> tuple[int, int, int, int, list[int] | None]:
+) -> tuple[int, int, int, int, list[int] | None, int]:
     bootstrap_room = int(parts[0].decode("ascii"))
     status = int(parts[1].decode("ascii"))
     prefill_rank = int(parts[2].decode("ascii"))
@@ -76,6 +76,7 @@ def parse_prefill_status_message(
         prefill_rank,
         bootstrap_token,
         spec_candidate_ids,
+        int(parts[5].decode("ascii")) if len(parts) > 5 else 0,
     )
 
 
@@ -123,6 +124,7 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         # consumed by DisaggDecodeExecutor.generate_events() via pop_bootstrap_token().
         self.bootstrap_token_table: dict[int, int] = {}
         self.spec_candidate_ids_table: dict[int, list[int]] = {}
+        self.cached_tokens_table: dict[int, int] = {}
         self._pending_bootstrap_token_table: dict[int, int] = {}
         self._pending_spec_candidate_ids_table: dict[int, list[int]] = {}
 
@@ -199,6 +201,7 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         prefill_rank: int,
         bootstrap_token: int,
         spec_candidate_ids: list[int] | None,
+        cached_tokens: int,
     ) -> None:
         if bootstrap_room not in self.request_status:
             return
@@ -221,6 +224,10 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
                 self.update_status(bootstrap_room, TransferPoll.Failed)
                 return
             self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
+            # TP ranks describe overlapping prefixes, not disjoint ranges.
+            self.cached_tokens_table[bootstrap_room] = max(
+                self.cached_tokens_table.get(bootstrap_room, 0), cached_tokens
+            )
             if bootstrap_token != -1:
                 self._pending_bootstrap_token_table.setdefault(
                     bootstrap_room, bootstrap_token
@@ -271,10 +278,13 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         """Pop and return the bootstrap_token for the given room, or -1 if absent."""
         return self.bootstrap_token_table.pop(bootstrap_room, -1)
 
-    def pop_prefill_metadata(self, bootstrap_room: int) -> tuple[int, list[int] | None]:
+    def pop_prefill_metadata(
+        self, bootstrap_room: int
+    ) -> tuple[int, list[int] | None, int]:
         return (
             self.bootstrap_token_table.pop(bootstrap_room, -1),
             self.spec_candidate_ids_table.pop(bootstrap_room, None),
+            self.cached_tokens_table.pop(bootstrap_room, 0),
         )
 
     def get_session_id(self):

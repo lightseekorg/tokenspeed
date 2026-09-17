@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from itertools import accumulate
 from types import SimpleNamespace
 
 import pytest
@@ -20,17 +21,29 @@ torch.manual_seed(42)
 _FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz})
 
 
+@pytest.mark.parametrize("num_heads", [12, 128])
 @pytest.mark.parametrize(
-    "dtype,num_heads,qk_head_dim,v_head_dim",
+    "dtype,qk_head_dim,v_head_dim",
     [
-        pytest.param(torch.float16, 128, 192, 128, id="fp16"),
-        pytest.param(torch.bfloat16, 128, 192, 128, id="bf16"),
-        pytest.param(torch.float8_e4m3fn, 128, 192, 128, id="fp8-e4m3"),
-        pytest.param(torch.float8_e5m2, 128, 192, 128, id="fp8-e5m2"),
+        pytest.param(torch.float16, 192, 128, id="fp16"),
+        pytest.param(torch.bfloat16, 192, 128, id="bf16"),
+        pytest.param(torch.float8_e4m3fn, 192, 128, id="fp8-e4m3"),
+        pytest.param(torch.float8_e5m2, 192, 128, id="fp8-e5m2"),
     ],
 )
 @pytest.mark.parametrize("solution", ["triton", "gluon"])
 @pytest.mark.parametrize("is_causal", [False, True], ids=["noncausal", "causal"])
+@pytest.mark.parametrize(
+    "q_lens,kv_lens",
+    [
+        pytest.param((853, 1045), (853, 1045), id="ragged-self"),
+        pytest.param(
+            (1, 127, 128, 129, 255, 256, 257),
+            (65, 191, 256, 385, 511, 640, 769),
+            id="query-tile-tails-with-prefix",
+        ),
+    ],
+)
 def test_mla_prefill(
     device: str,
     solution: str,
@@ -39,14 +52,18 @@ def test_mla_prefill(
     num_heads: int,
     qk_head_dim: int,
     v_head_dim: int,
+    q_lens: tuple[int, ...],
+    kv_lens: tuple[int, ...],
     require,
 ) -> None:
     require("attention", "mla_prefill", solution, dtype, "q")
 
-    q_lens = [853, 1045]
-    kv_lens = q_lens
-    cu_seqlens_q = torch.tensor([0, 853, 1898], device=device, dtype=torch.int32)
-    cu_seqlens_kv = cu_seqlens_q
+    cu_seqlens_q = torch.tensor(
+        [0, *accumulate(q_lens)], device=device, dtype=torch.int32
+    )
+    cu_seqlens_kv = torch.tensor(
+        [0, *accumulate(kv_lens)], device=device, dtype=torch.int32
+    )
     init_dtype = torch.bfloat16 if dtype in _FP8_DTYPES else dtype
     q = torch.randn(
         sum(q_lens), num_heads, qk_head_dim, device=device, dtype=init_dtype
@@ -63,7 +80,7 @@ def test_mla_prefill(
         v = v.to(dtype)
     softmax_scale = 1.0 / math.sqrt(qk_head_dim)
 
-    out, lse = mla_prefill(
+    kwargs = dict(
         q=q,
         k=k,
         v=v,
@@ -76,6 +93,7 @@ def test_mla_prefill(
         return_lse=True,
         solution=solution,
     )
+    out, lse = mla_prefill(**kwargs)
 
     refs = []
     ref_lses = []

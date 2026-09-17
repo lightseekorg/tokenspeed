@@ -97,6 +97,11 @@ class InputBuffers:
         # NOT pinned: python readers only; the H2D uses the per-step bulk pinned staging (_bulk_pinned).
         self.extend_prefix_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         self.extend_seq_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
+        # Host-only extend facts the attention backend plans from: how many
+        # leading input rows re-feed cached prompt positions (bounded replay)
+        # and each request's whole prompt length (whether this chunk ends it).
+        self.extend_replay_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
+        self.extend_prompt_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         self._pad_tape = self._record_pad_tape()
 
     def init_ngram_buffers(self, context_len: int) -> None:
@@ -340,6 +345,12 @@ class InputBuffers:
             )
             self.extend_seq_lens_cpu[:num_extends] = torch.as_tensor(
                 forward_op.input_lengths[:num_extends], dtype=torch.int32
+            )
+            self.extend_replay_lens_cpu[:num_extends] = torch.as_tensor(
+                forward_op.extend_replay_lens, dtype=torch.int32
+            )
+            self.extend_prompt_lens_cpu[:num_extends] = torch.as_tensor(
+                forward_op.prefill_lengths[:num_extends], dtype=torch.int32
             )
             ext_prefix_cpu, ext_seq_cpu = self._bulk_pinned(
                 (num_extends, torch.int32), (num_extends, torch.int32)
