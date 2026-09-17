@@ -52,6 +52,7 @@ import tokenspeed_kernel.ops.attention.dsv4 as _attention_dsv4_pkg
 import tokenspeed_kernel.ops.attention.dsv4.cuda as _attention_cuda_dsv4
 import tokenspeed_kernel.ops.attention.dsv4.deep_gemm as _attention_deep_gemm_dsv4
 import tokenspeed_kernel.ops.attention.dsv4.gluon as _attention_gluon_dsv4
+import tokenspeed_kernel.ops.attention.dsv41 as _attention_dsv41_pkg
 import tokenspeed_kernel.ops.attention.gdn as _attention_gdn_pkg
 import tokenspeed_kernel.ops.attention.gdn.flashinfer as _attention_flashinfer_gdn
 import tokenspeed_kernel.ops.attention.kda as _attention_kda_pkg
@@ -1841,6 +1842,25 @@ def _attention_dsa_prefill_fp8_packed_rank512() -> object:
         qk_rope_head_dim=64,
         softmax_scale=1.0,
         page_size=64,
+    )
+
+
+def _attention_dsv41_index_topk() -> object:
+    q = torch.empty((2, 32, 128), dtype=torch.bfloat16)
+    return _attention_dsv41_pkg.index_topk(
+        q,
+        torch.empty((2, 32), dtype=torch.bfloat16),
+        torch.empty((4, 64, 68), dtype=torch.uint8),
+        torch.zeros((2, 4), dtype=torch.int32),
+        torch.tensor([64, 32], dtype=torch.int32),
+        None,
+        512,
+        0,
+        8,
+        2,
+        64,
+        None,
+        None,
     )
 
 
@@ -3814,6 +3834,22 @@ _CASES = [
         _is_cdna4,
         "cdna4",
         "attention",
+        "dsv41_index_topk",
+        "gluon_dsv41_index_topk_gfx950",
+        _attention_dsv41_index_topk,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsv41_index_topk",
+        "gluon_dsv41_index_topk_gfx1250",
+        _attention_dsv41_index_topk,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
         "dsv4_prefill_topk",
         "gluon_dsv4_prefill_topk_mxfp4_gfx950",
         _attention_dsv4_prefill_topk_mxfp4,
@@ -5068,6 +5104,23 @@ def selected_kernel_spy(monkeypatch):
                 )
             if case.mode == "dsa_plan":
                 return torch.empty((1, 4), dtype=torch.int32)
+            if case.mode == "dsv41_index_topk":
+                index_q = args[0]
+                topk = args[6]
+                candidate_topk = args[7]
+                tokens = index_q.shape[0]
+                return (
+                    torch.empty(
+                        (tokens, topk), dtype=torch.int32, device=index_q.device
+                    ),
+                    torch.empty((tokens,), dtype=torch.int32, device=index_q.device),
+                    torch.empty(
+                        (tokens, candidate_topk),
+                        dtype=torch.int32,
+                        device=index_q.device,
+                    ),
+                    torch.empty((tokens,), dtype=torch.int32, device=index_q.device),
+                )
             if case.mode in {"dsv4_prefill_topk", "dsv4_decode_topk"}:
                 q_values, _ = kwargs["index_q"]
                 indices = torch.empty(
