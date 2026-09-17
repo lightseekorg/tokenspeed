@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Experimental lane-cooperative NVFP4 preparation; not enabled by runtime.
+"""Lane-cooperative NVFP4 preparation for optional latent input quantization.
 
 Communication ownership and quantization ownership are independent: each lane
 polls its BF16 fragment, while 2/4/8 lanes cooperate on one 16-value scale.
