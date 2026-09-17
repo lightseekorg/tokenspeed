@@ -2253,8 +2253,19 @@ class MambaAttnBackend(AttentionBackend):
                 lower_bound=gate_lower_bound,
             )
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
-            # Extend indices never carry pad(-1), so this write is unguarded.
-            ssm_states[state_out_blocks] = last_recurrent_state
+            if checkpoint_batch is not None:
+                # Capacity metadata may carry padded request destinations (-1).
+                # Reuse the shared body rows and masked writer; PyTorch indexing
+                # would interpret -1 as the last real cache block.
+                write_prefill_recurrent_checkpoints(
+                    last_recurrent_state,
+                    ssm_states,
+                    state_out_blocks,
+                    checkpoint_batch.body_rows,
+                )
+            else:
+                # Ordinary unpadded extend metadata contains only live outputs.
+                ssm_states[state_out_blocks] = last_recurrent_state
 
         return core_attn_out
 

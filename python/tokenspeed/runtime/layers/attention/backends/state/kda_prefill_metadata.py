@@ -81,8 +81,8 @@ class _CheckpointCapacityBatch(_PrefillCheckpointBatch):
         return self.packed_capacity
 
 
-def _checkpoint_slot_batch(source, bucket, tail_capacity):
-    """Pad checkpoint execution to one tail slot per real request.
+def _checkpoint_slot_batch(source, bucket, tail_capacity, num_sequences):
+    """Pad checkpoint execution to the captured request capacity.
 
     Inactive slots get one zero-input token, never a zero-length native scan.
     Their token map and state destination are negative, so dummy results cannot
@@ -90,18 +90,25 @@ def _checkpoint_slot_batch(source, bucket, tail_capacity):
     checkpoint selection continue to come exclusively from source metadata.
     """
     lengths = source.extend_seq_lens_cpu
+    padding = num_sequences - lengths.numel()
+    if padding < 0:
+        raise ValueError("KDA live request count exceeds capture capacity")
     live = source.prefill_checkpoint_batch
     body_lengths = lengths if live is None else live.body_seq_lens_cpu
     tail_lengths = lengths - body_lengths
     active = tail_lengths > 0
     slot_lengths = tail_lengths.clamp_min(1)
-    rows = torch.arange(lengths.numel(), dtype=torch.int64)
+    rows = torch.arange(num_sequences, dtype=torch.int64)
     starts = source.cu_extend_seq_lens_cpu[:-1]
 
     def bounds(values):
         return torch.cat((values.new_zeros(1), values.cumsum(0))).to(torch.int64)
 
-    body_bounds, tail_bounds = bounds(body_lengths), bounds(slot_lengths)
+    # Native scans require positive lengths even for unused request slots.
+    # These slots have no source tokens, output rows or cache destinations.
+    body_slots = torch.cat((body_lengths, body_lengths.new_ones(padding)))
+    tail_slots = torch.cat((slot_lengths, slot_lengths.new_ones(padding)))
+    body_bounds, tail_bounds = bounds(body_slots), bounds(tail_slots)
     KdaPrefillCapacity(bucket, rows.numel()).validate(body_bounds, bucket)
     KdaPrefillCapacity(tail_capacity, rows.numel()).validate(tail_bounds, tail_capacity)
 
@@ -120,6 +127,10 @@ def _checkpoint_slot_batch(source, bucket, tail_capacity):
     tail_indices[: int(slot_lengths.sum())].masked_fill_(
         ~torch.repeat_interleave(active, slot_lengths), -1
     )
+    active = torch.cat((active, active.new_zeros(padding)))
+    starts = torch.cat(
+        (starts, starts.new_full((padding,), int(source.cu_extend_seq_lens_cpu[-1])))
+    )
     # Build the inverse once with the other host metadata, not once per layer.
     # Negative sources also make the gather write zero to all bucket padding.
     output_sources = torch.full((bucket,), -1, dtype=torch.int64)
@@ -129,7 +140,7 @@ def _checkpoint_slot_batch(source, bucket, tail_capacity):
     parts = (
         rows,
         starts,
-        body_lengths,
+        body_slots,
         torch.zeros_like(rows),
         body_indices,
         body_bounds,
@@ -160,11 +171,11 @@ def _checkpoint_slot_batch(source, bucket, tail_capacity):
         body_rows=device_rows,
         body_token_indices=body_indices,
         body_query_start_loc=body_boundaries,
-        body_seq_lens_cpu=body_lengths.clone(),
+        body_seq_lens_cpu=body_slots,
         body_cu_seqlens_cpu=body_bounds,
         tail_token_indices=tail_indices,
         tail_query_start_loc=tail_boundaries,
-        tail_seq_lens_cpu=slot_lengths,
+        tail_seq_lens_cpu=tail_slots,
         tail_cu_seqlens_cpu=tail_bounds,
         packed_capacity=bucket,
         tail_state_rows=state_rows,
@@ -188,9 +199,13 @@ def _refresh_checkpoint_destinations(target, source):
         if new is None:
             indices.fill_(-1)
         else:
-            if indices.shape != new[group].shape or indices.dtype != new[group].dtype:
+            if (
+                indices.numel() < new[group].numel()
+                or indices.dtype != new[group].dtype
+            ):
                 raise RuntimeError("KDA graph state index geometry changed")
-            indices.copy_(new[group])
+            indices[: new[group].numel()].copy_(new[group])
+            indices[new[group].numel() :].fill_(-1)
             indices.masked_fill_(inactive, -1)
 
 
@@ -211,7 +226,7 @@ def _capacity_metadata(source, bucket, tail_capacity):
         capacity=capacity,
     )
     result.prefill_checkpoint_batch = _checkpoint_slot_batch(
-        source, bucket, tail_capacity
+        source, bucket, tail_capacity, capacity.num_sequences
     )
     result.state_checkpoint_blocks_by_group = {
         group: torch.full_like(indices, -1)
@@ -252,10 +267,11 @@ def _clone_metadata(value):
 def prepare_kda_prefill_metadata(source, token_capacity, prefix_granularity, target):
     """Prepare one execution shape, optionally refreshing retained storage.
 
-    ``source`` is the scheduler-derived metadata for this forward. Eager and
-    captured execution both reserve exactly its positive-length request count;
-    token capacity may exceed their combined live length. ``target`` is either
-    a startup-retained view for that shape or None for fresh per-forward storage.
+    ``source`` is the scheduler-derived metadata for this forward. Fresh
+    execution metadata reserves its positive-length request count. A retained
+    target may have extra request slots: convolution gives them zero length,
+    while each native scan packs one masked dummy token per slot. ``target`` is
+    either a startup-retained view for that shape or None for fresh per-forward storage.
     No request state is allocated here. Returns the metadata consumed by every
     KDA layer, without a temporary backend binding or an execution-mode flag.
     """
@@ -280,9 +296,17 @@ def _refresh_capacity_metadata(target, source):
     copied into the target. In-place refresh is not allocation-free or H2D-free.
     State-group geometry changes raise instead of replacing bound storage.
     """
-    target.capacity.validate(
-        source.cu_extend_seq_lens_cpu, target.capacity.token_capacity
+    actual_bs = source.extend_seq_lens_cpu.numel()
+    capacity = target.capacity
+    KdaPrefillCapacity(capacity.token_capacity, actual_bs).validate(
+        source.cu_extend_seq_lens_cpu, capacity.token_capacity
     )
+    padding = capacity.num_sequences - actual_bs
+    if (
+        padding < 0
+        or int(source.cu_extend_seq_lens_cpu[-1]) + padding > capacity.token_capacity
+    ):
+        raise ValueError("KDA padded requests exceed capture capacity")
     for name in (
         "query_start_loc",
         "scan_query_start_loc",
@@ -290,7 +314,16 @@ def _refresh_capacity_metadata(target, source):
         "extend_seq_lens_cpu",
         "cu_extend_seq_lens_cpu",
     ):
-        getattr(target, name).copy_(getattr(source, name))
+        old, new = getattr(target, name), getattr(source, name)
+        old[: new.numel()].copy_(new)
+        # Repeated boundaries give convolution no work for unused requests.
+        # Body/tail scans use their separate positive-length packed boundaries.
+        pad_value = (
+            0
+            if name == "extend_seq_lens_cpu"
+            else int(source.cu_extend_seq_lens_cpu[-1])
+        )
+        old[new.numel() :].fill_(pad_value)
     refresh_causal_conv1d_capacity_metadata(
         target.query_start_loc,
         target.conv_prefill_metadata,
@@ -302,6 +335,7 @@ def _refresh_capacity_metadata(target, source):
             source,
             target.capacity.token_capacity,
             checkpoint.tail_token_indices.numel(),
+            capacity.num_sequences,
         )
         for field in fields(_CheckpointCapacityBatch):
             old, new = getattr(checkpoint, field.name), getattr(live, field.name)
@@ -318,6 +352,10 @@ def _refresh_capacity_metadata(target, source):
         if old.keys() != new.keys():
             raise RuntimeError("KDA graph state groups changed without pool rebind")
         for group, indices in old.items():
-            if indices.shape != new[group].shape or indices.dtype != new[group].dtype:
+            if (
+                indices.numel() < new[group].numel()
+                or indices.dtype != new[group].dtype
+            ):
                 raise RuntimeError("KDA graph state index geometry changed")
-            indices.copy_(new[group])
+            indices[: new[group].numel()].copy_(new[group])
+            indices[new[group].numel() :].fill_(-1)

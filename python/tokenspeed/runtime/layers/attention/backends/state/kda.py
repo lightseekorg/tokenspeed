@@ -176,9 +176,14 @@ class KdaAttnBackend(MambaAttnBackend):
         ):
             raise RuntimeError("KDA cache pool changed without graph release/recapture")
         source = self.forward_metadata
-        if source.extend_seq_lens_cpu.numel() != bs:
-            raise ValueError("KDA prefill metadata requires the exact request count")
         key = (token_capacity, bs)
+        actual_bs = source.extend_seq_lens_cpu.numel()
+        if actual_bs > bs or (
+            actual_bs != bs and (capture or key not in self._prefill_metadata)
+        ):
+            raise ValueError(
+                "KDA request padding requires an existing captured capacity"
+            )
         target = prepare_kda_prefill_metadata(
             source,
             token_capacity,

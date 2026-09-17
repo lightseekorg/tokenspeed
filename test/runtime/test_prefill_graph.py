@@ -121,7 +121,10 @@ class PrefillCaptureArgsTest(unittest.TestCase):
         help_text = " ".join(self.parser.format_help().split())
         self.assertIn("Total input-token capacities per forward", help_text)
         self.assertIn("not per-request sequence lengths", help_text)
-        self.assertIn("not maximum request capacities", help_text)
+        self.assertIn(
+            "Request capacities for inline prefill attention capture", help_text
+        )
+        self.assertIn("smallest fitting captured batch size", help_text)
         self.assertIn("Compatibility alias", help_text)
 
     def test_executor_requires_explicit_capture_batch_sizes(self):

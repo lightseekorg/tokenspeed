@@ -57,13 +57,22 @@ A merged capture is selected by two values:
 - **Token capacity:** the total input tokens for one forward, summed across
   requests. For pure prefill, this counts newly computed tokens and excludes
   cached prefixes. The smallest configured bucket that fits is selected.
-- **Request count:** the exact batch size. A capture for two requests does not
-  pad a one-request batch into its second slot.
+- **Request capacity:** the smallest captured batch size that fits the live
+  requests. With `[1, 2, 4]`, BS 1 and 2 use their own captures; BS 3 and 4 use
+  BS 4. Padding adds execution slots, not scheduler requests.
+
+Each unused request slot needs one masked dummy token in the native main scan.
+Selection reserves room for those tokens in addition to the live input length.
+If the smallest token bucket is full, the next configured token bucket can be
+used. If no token/request-capacity pair fits, execution takes the ordinary
+fallback. A larger token bucket also pads outer projections and MoE work, so
+crossing that boundary can cost more than padding only the request dimension.
 
 Each capture reserves one checkpoint/tail slot per request, so the number and
 identity of requests with checkpoints can change without another capture.
 The main scan reserves the outer token capacity. Tail storage is sized as
 `min(token_capacity, BS * max(1, prefix_granularity - 1))`.
+Here BS is the captured request capacity, including unused slots.
 
 For example, consider two requests with aligned cached prefixes that add
 868 and 869 tokens at checkpoint granularity 128:
@@ -84,6 +93,13 @@ the scan topology fixed and preserves main's final state. The tradeoff is that
 the fixed-slot tail scan still runs when no request needs a checkpoint, including
 eligible eager forwards while the feature is enabled. Padding never becomes a
 scheduler request or a persistent cache entry.
+
+An unused request slot has zero convolution length and negative input/output
+state-block indices. Its main and tail scans each receive one zero-input dummy
+token; their output maps and checkpoint destinations are negative. No dummy
+result reaches a real request or cache block. The live batch size is unchanged
+for MLA, output sampling and scheduling. Retained metadata is refreshed in place
+when a capture alternates between partially and fully occupied batches.
 
 ## Enable the feature
 
@@ -110,7 +126,7 @@ graph settings.
 |---|---|
 | `--prefill-graph-max-tokens` | Largest captured token capacity. Defaults to `min(2048, chunked-prefill size)`; `0` disables prefill graphs. |
 | `--prefill-graph-capture-token-sizes` | Shared token buckets for outer and KDA captures. There is no separate KDA bucket list. |
-| `--prefill-graph-capture-batch-sizes` | Exact request counts captured with inline KDA. Independent of the decode graph's batch-size list. |
+| `--prefill-graph-capture-batch-sizes` | Request capacities captured with inline KDA; replay rounds up to a fitting capacity. Independent of the decode graph's batch-size list. |
 
 The token limit is capped by the chunked-prefill size. An explicit bucket list
 is sorted and deduplicated; entries outside the positive range up to that limit
@@ -144,11 +160,11 @@ objects, outputs and stable metadata remain resident per configuration.
 
 ## Coverage and fallback
 
-Merged KDA capture applies to pure prefill batches with a captured request count
-and a matching token bucket. Live lengths and checkpoint patterns can vary
+Merged KDA capture applies to pure prefill batches with a fitting request capacity
+and token bucket. Live counts, lengths and checkpoint patterns can vary
 within that configuration.
 
-- Mixed prefill/decode batches and uncaptured request counts retain the
+- Mixed prefill/decode batches and request counts above captured capacity retain the
   ordinary outer graph, with attention breaks.
 - Data parallelism and layerwise prefill/decode cache transfer retain the
   ordinary outer route.

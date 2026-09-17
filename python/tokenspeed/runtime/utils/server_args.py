@@ -307,7 +307,7 @@ class ServerArgs:
     prefill_graph_max_tokens: int | None = None
     # Explicit prefill bucket list; unset = the relative-stride ladder (see get_prefill_token_buckets).
     prefill_graph_capture_sizes: list[int] | None = None
-    # Exact request counts for inline attention; unset keeps the minimum per bucket.
+    # Request capacities for inline attention; unset keeps the minimum per bucket.
     prefill_graph_capture_batch_sizes: list[int] | None = None
     cudagraph_capture_sizes: list[int] | None = None
     enable_nan_detection: bool = False
@@ -1934,14 +1934,14 @@ class ServerArgs:
             metavar="BS",
             type=int,
             nargs="+",
-            help="Exact request counts for inline prefill attention capture; "
-            "these are batch sizes, not maximum request capacities. "
+            help="Request capacities for inline prefill attention capture; "
+            "replay rounds up to the smallest fitting captured batch size. "
             "Unset: the minimum request count that fits each token bucket within "
             "the model context. KDA uses fixed checkpoint slots, so each token "
             "bucket needs one inline variant per configured request count. "
             "Adding request counts increases capture time and memory. "
             "This does not replace the scheduler's --max-num-seqs limit. "
-            "Other batch sizes retain the ordinary attention breaks.",
+            "Batches without a fitting capacity retain the ordinary attention breaks.",
         )
         parser.add_argument(
             "--enable-nan-detection",

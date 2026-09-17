@@ -80,7 +80,7 @@ def test_checkpoint_slots_keep_shape_and_mask_inactive_requests(count):
     source.prefill_checkpoint_batch = _build_prefill_checkpoint_batch(
         lengths, prefixes, count, 128, "cpu"
     )
-    fixed = _checkpoint_slot_batch(source, 2048, 254)
+    fixed = _checkpoint_slot_batch(source, 2048, 254, 2)
     assert fixed.rows.tolist() == [0, 1]
     assert fixed.tail_seq_lens_cpu.tolist() == [
         [100, 101][row] if row < count else 1 for row in range(2)
@@ -107,6 +107,35 @@ def test_checkpoint_slots_keep_shape_and_mask_inactive_requests(count):
         if count == 0
         else source.prefill_checkpoint_batch.rows.numel() == count
     )
+
+
+@pytest.mark.parametrize("count", [0, 1, 3])
+def test_checkpoint_slots_pad_requests_without_source_tokens_or_state_updates(count):
+    from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+        _build_prefill_checkpoint_batch,
+    )
+
+    source = metadata("cpu", 1)
+    lengths = torch.tensor([129, 130, 131])
+    source.extend_seq_lens_cpu = lengths
+    source.cu_extend_seq_lens_cpu = torch.cat((lengths.new_zeros(1), lengths.cumsum(0)))
+    source.prefill_checkpoint_batch = _build_prefill_checkpoint_batch(
+        lengths, lengths.new_zeros(3), count, 128, "cpu"
+    )
+    fixed = _checkpoint_slot_batch(source, 512, 508, 4)
+    assert fixed.body_seq_lens_cpu[-1] == fixed.tail_seq_lens_cpu[-1] == 1
+    assert fixed.state_update_rows.tolist() == [
+        row if row < count else -1 for row in range(4)
+    ]
+    for mapping, bounds in [
+        (fixed.body_token_indices, fixed.body_cu_seqlens_cpu),
+        (fixed.tail_token_indices, fixed.tail_cu_seqlens_cpu),
+    ]:
+        assert mapping[bounds[-2] : bounds[-1]].tolist() == [-1]
+    packed = torch.cat((fixed.body_token_indices, fixed.tail_token_indices))
+    assert packed[fixed.output_sources[:390]].tolist() == list(range(390))
+    assert torch.all(fixed.output_sources[390:] == -1)
+    assert source.extend_seq_lens_cpu.tolist() == [129, 130, 131]
 
 
 def test_hybrid_initializes_prefill_graph_state_on_both_children():
@@ -210,7 +239,7 @@ def test_outer_graph_inlines_state_layers_and_retains_full_attention_break():
         assert leaf.forward_metadata is retained
         assert leaf.prefill_metadata_is_capture_ready
 
-    with pytest.raises(ValueError, match="exact request count"):
+    with pytest.raises(ValueError, match="existing captured capacity"):
         leaf.prepare_prefill_metadata(8, 2, ForwardMode.EXTEND, capture=False)
     assert not leaf.prepare_prefill_metadata(8, 1, ForwardMode.MIXED, capture=False)
     leaf.cache_pool = object()
@@ -404,6 +433,18 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
         cases.extend([([837], [50304]), ([769], [0]), ([1023], [128])])
     if batch_size == 2:
         cases.extend([([868, 869], [50304, 50304]), ([869, 868], [50304, 50304])])
+    if batch_size == 4:
+        # Reuse BS4 storage across full -> padded -> full transitions. Compare
+        # every state block, including the null page and the previous fourth row.
+        for actual_bs in (3, 1, 2, 3):
+            cases.extend(
+                [
+                    ([64 + i for i in range(actual_bs)], [50304] * actual_bs),
+                    ([128] * actual_bs, [0] * actual_bs),
+                    ([837] + [128] * (actual_bs - 1), [50304] * actual_bs),
+                ]
+            )
+        cases.append(([2045, 1, 1], [0, 0, 0]))
     cases.append(([1] * batch_size, [0] * batch_size))
     # Exercise the real outer startup loop and shared-pool ownership.
     owner = object.__new__(PrefillGraph)
@@ -491,7 +532,7 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
         (False, True, False, 1),
     ],
 )
-@pytest.mark.parametrize("batch_size", [1, 2, 4])
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 4])
 def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     captured, compatible, transfer, expected, batch_size
 ):
@@ -502,9 +543,16 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     from tokenspeed.runtime.execution.prefill_graph import CapturedForward, PrefillGraph
 
     events = []
+    capture_bs = 4 if batch_size == 3 else batch_size
+    num_tokens = 7 if batch_size == 3 else 8
 
     def prepare(bucket, bs, mode, *, capture):
-        assert (bucket, bs, mode, capture) == (8, batch_size, ForwardMode.EXTEND, False)
+        assert (bucket, bs, mode, capture) == (
+            8,
+            capture_bs if captured else batch_size,
+            ForwardMode.EXTEND,
+            False,
+        )
         events.append("refresh")
         return compatible
 
@@ -514,13 +562,13 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     owner = object.__new__(PrefillGraph)
     owner._captures = {
         (8, None): (capture("ordinary"), CapturedForward(torch.ones(8, 4), None)),
-        (8, batch_size): (
+        (8, capture_bs): (
             capture("inline"),
             CapturedForward(torch.full((8, 4), 2.0), None),
         ),
     }
     if not captured:
-        del owner._captures[8, batch_size]
+        del owner._captures[8, capture_bs]
     owner.dp_size = 1
     owner.attn_backend = SimpleNamespace(
         step_counter=object() if transfer else None, prepare_prefill_metadata=prepare
@@ -530,22 +578,65 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     owner._embed_tokens = lambda ids: torch.zeros(8, 4)
     owner._land_input_embeds = lambda *args: None
     owner._padded_to = lambda *args: nullcontext()
+    owner.config = SimpleNamespace(model_is_mrope=False)
+    owner.input_buffers = SimpleNamespace(
+        input_ids_buf=torch.ones(8, dtype=torch.int64),
+        positions_buf=torch.ones(8, dtype=torch.int64),
+    )
     owner.text_model = SimpleNamespace(
         lm_head=None, logits_processor=lambda ids, hidden, *args: hidden
     )
     ctx = SimpleNamespace(
-        input_num_tokens=8, bs=batch_size, forward_mode=ForwardMode.EXTEND
+        input_num_tokens=num_tokens, bs=batch_size, forward_mode=ForwardMode.EXTEND
     )
     with patch(
         "tokenspeed.runtime.execution.prefill_graph.LogitsMetadata.from_forward_context",
         return_value=None,
     ):
-        result = owner.replay(ctx, torch.zeros(8, dtype=torch.int64), None)
-    torch.testing.assert_close(result, torch.full((8, 4), float(expected)))
+        result = owner.replay(ctx, torch.zeros(num_tokens, dtype=torch.int64), None)
+    torch.testing.assert_close(result, torch.full((num_tokens, 4), float(expected)))
+    assert ctx.bs == batch_size
     assert events == ([] if transfer else ["refresh"]) + [
         "inline" if expected == 2 else "ordinary"
     ]
     assert len(owner._captures) == 1 + int(captured)
+
+
+@pytest.mark.parametrize(
+    "bs,tokens,expected",
+    [
+        (1, 8, (8, 1)),
+        (2, 8, (8, 2)),
+        (3, 7, (8, 4)),
+        (3, 8, (16, 4)),
+        (3, 16, (16, None)),
+        (4, 8, (8, 4)),
+        (5, 8, (8, None)),
+    ],
+)
+def test_request_bucket_selection_reserves_dummy_scan_tokens(bs, tokens, expected):
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+
+    owner = object.__new__(PrefillGraph)
+    owner.disable = False
+    owner.dp_size = 1
+    owner.attn_backend = SimpleNamespace(step_counter=None)
+    owner._captures = {
+        (bucket, count): None for bucket in (8, 16) for count in (None, 1, 2, 4)
+    }
+    owner._captured_hidden_mode = None
+    owner._select_bucket = lambda ctx: 8 if ctx.input_num_tokens <= 8 else 16
+    ctx = SimpleNamespace(
+        bs=bs,
+        input_num_tokens=tokens,
+        num_extends=bs,
+        forward_mode=ForwardMode.EXTEND,
+        draft_narrowing=None,
+        capture_hidden_mode=None,
+    )
+    bucket = owner._replay_bucket(ctx)
+    assert (bucket, owner._merged_capture_bs(bucket, ctx)) == expected
 
 
 @pytest.mark.parametrize(

@@ -688,8 +688,9 @@ GEMM arithmetic.
 
 Supported pure-extend forwards use `prepare_prefill_metadata` before eager
 execution, startup capture and replay. This consumer-stream seam builds or
-refreshes `KdaPrefillMetadata` with the selected token capacity and exact request
-count. The same metadata contract controls scan capacity, checkpoint packing and
+refreshes `KdaPrefillMetadata` with the selected token and request capacities.
+Eager execution uses the live count; replay may round up to a captured count.
+The same metadata contract controls scan capacity, checkpoint packing and
 output restoration in every case; there is no temporary metadata binding or
 mutable inline flag. Only startup capture retains the metadata's addresses.
 Uncaptured shapes use temporary storage through the same builder.
@@ -699,12 +700,12 @@ capture neighboring projections, KDA kernels and post-attention compute together
 Full-attention layers keep their breaks. Before execution, the common preparation
 step validates live lengths and refreshes boundaries, convolution maps and
 state-page indices. All KDA layers read this same storage. Token lengths may
-vary within the bucket; request counts must match capture. Native output padding
+vary within the bucket; live request counts may fill part of a capture. Native output padding
 is cleared by the KDA forward, replacing the attention break's handoff copy and
 tail scrub when KDA is captured.
 
 The ordinary outer capture is retained for mixed batches and other request
-counts. All variants share the outer pool and execute serially, as existing
+counts beyond captured capacity. All variants share the outer pool and execute serially, as existing
 bucket captures do. Layerwise PD transfer and data parallelism retain the
 ordinary route: host cache-step callbacks must remain live, and DP admission
 must stay rank-uniform. Retained metadata rejects a replacement cache pool; graph
@@ -718,20 +719,26 @@ Each scan consumes its
 own live GPU boundaries and CPU mirror. Checkpoint writes retain the eager
 ordering: convolution snapshots precede convolution updates, and recurrent
 snapshots precede the tail scan. The graph binds scheduler-owned checkpoint
-destinations, not backend-owned cache pages. Replay requires the captured
-request count, but checkpoint counts, row identities and lengths can change.
-The outer owner captures exact request counts from
+destinations, not backend-owned cache pages. Replay uses a captured request
+capacity; live counts, checkpoint counts, row identities and lengths can change.
+The outer owner captures request capacities from
 `prefill_graph_capture_batch_sizes` (unset: the minimum count per token bucket)
 with one variant per token bucket and request count. `ModelExecutorConfig`
 requires this field explicitly: factories forward the configured list or `None`
 for the minimum-count policy, so missing configuration wiring fails at
 construction. Token buckets still follow the shared prefill token ladder.
-Capture requests have positive lengths and fit the
-model context and request buffers; zero-length request padding is not admitted.
+Capture requests have positive lengths and fit the model context and request
+buffers. At replay, unused execution slots have zero convolution length, negative
+state-block indices and one masked dummy token in each packed native scan.
+Their checkpoint/output maps and state-update rows are negative. Native scans
+still receive only positive-length sequences; padding owns no cache blocks.
+The live context and scheduler/MLA request counts remain unchanged. Selection
+reserves `live_tokens + padded_requests` in the token bucket; a full bucket can
+use the next existing token bucket, otherwise the ordinary fallback remains.
 Startup autotuning uses the same dummy-batch builder with an explicit minimum
 request count, `ceil(num_tokens / context_len)`, independent of the configured
 capture request counts. Its token budget also respects rank-local request capacity.
-Uncaptured request counts retain the ordinary attention break and eager KDA,
+Request counts exceeding captured capacity retain the ordinary attention break and eager KDA,
 including internal-checkpoint batches. Replay refresh includes
 `scan_query_start_loc`, which the recurrent dispatcher consumes, as well as
 the convolution boundary and existing int64 mirror.
@@ -745,7 +752,7 @@ checkpoint batches retain their ordinary merge when no inverse map is supplied.
 Q/K/V may remain views of convolution output until the existing checkpoint
 packer materializes them. Saved verification payloads keep their split producer.
 
-Merged graphs reserve one tail slot per real request. An inactive slot has
+Merged graphs reserve one tail slot per captured request slot. An inactive slot has
 one zero-input dummy token, a negative output-token map, no checkpoint
 destination and a negative state-update row. Its scan result must never replace
 the body's final state. This padding is execution scratch, not a scheduler
@@ -760,7 +767,7 @@ destinations/rows. Unifying metadata does not imply zero padding cost.
 
 `TOKENSPEED_KDA_PREFILL_GRAPH=1` opts into the merged captures owned by
 `PrefillGraph`; the default remains off. Startup creates the configured token
-bucket and exact-request-count variants. Serving forwards only select and
+bucket and request-capacity variants. Serving forwards only select and
 replay these captures, never warm up or capture a separate per-layer graph.
 
 If no compatible merged capture exists, the ordinary outer graph retains its
@@ -771,7 +778,7 @@ New request shapes do not grow a backend-owned graph cache. Metadata refresh
 and eager execution may still allocate temporary buffers.
 
 The outer owner holds all captures and outputs in one table keyed by token
-capacity and exact request count; `None` in the request-count position selects
+capacity and request capacity; `None` in the request-count position selects
 the ordinary attention-break capture. The backend retains startup metadata for
 the exact shapes that need stable addresses, not graphs or request state. Serving
 forwards never grow this retained table. The outer owner's serial shared-pool
@@ -796,8 +803,10 @@ the convolution kernel otherwise performs unmasked prior-token loads even
 for an excess chunk. Scan inputs are cleared past the live device boundary
 inside the graph, since a capacity descriptor makes padding addressable to
 native full-tile loads. Both conv and scan read live GPU boundaries;
-total live tokens must fit the physical packed extent. Empty sequence slots
-are not admitted. Batch-count changes require another schedule.
+total packed tokens, including dummy slots, must fit the physical extent.
+Native sequence slots are never empty: request padding uses masked one-token
+sequences in the scan maps. Convolution skips their zero-length spans. A capture
+can serve smaller live batch counts without another schedule.
 Other solutions retain exact live-length planning and reject capacity mode.
 
 For the pinned token-major CuTeDSL ABI, a fused preparation kernel scrubs

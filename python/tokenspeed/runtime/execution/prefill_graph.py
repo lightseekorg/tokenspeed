@@ -39,8 +39,8 @@ it captures the whole step), prefill & captured replays here (:meth:`can_run`
 Ordinary captures keep attention at eager breaks (see
 :mod:`tokenspeed.runtime.execution.breakable_cuda_graph`) and reuse the
 token-shaped segments across batch sizes. Inline captures include compatible
-KDA at an exact request count; full attention keeps its breaks. Mixed batches,
-uncaptured or incompatible request counts, layerwise transfer and DP retain
+KDA at a fitting request capacity; full attention keeps its breaks. Mixed batches,
+request counts beyond captured capacity, layerwise transfer and DP retain
 the ordinary route, subject to its admission rules. Both routes finish with
 the model's eager logits tail.
 """
@@ -97,9 +97,9 @@ def get_prefill_token_buckets(config: ModelExecutorConfig) -> list[int]:
     """Padded token-count buckets to capture for the breakable prefill graph.
 
     Both ordinary and inline captures use this total-token capacity ladder;
-    inline captures additionally match an exact request count. A live extend
-    forward is padded up to the smallest bucket >= its token count; forwards above
-    the largest bucket run eager.
+    inline captures additionally select a fitting request capacity. A live extend
+    forward is padded up to a bucket fitting its tokens and any dummy scan slots.
+    Forwards above the largest bucket run eager.
 
     Returns an empty list (graph disabled) when ``disable_prefill_graph`` is set or
     ``prefill_graph_max_tokens <= 0``. The largest bucket is clamped to the
@@ -692,11 +692,15 @@ class PrefillGraph:
                 ib.positions_buf[num_tokens:bucket].zero_()
         cap, output = self._captures[bucket, None]
         if self.dp_size == 1 and self.attn_backend.step_counter is None:
+            capture_bs = self._merged_capture_bs(bucket, ctx)
             ready = self.attn_backend.prepare_prefill_metadata(
-                bucket, ctx.bs, ctx.forward_mode, capture=False
+                bucket,
+                capture_bs if capture_bs is not None else ctx.bs,
+                ctx.forward_mode,
+                capture=False,
             )
-            if ready:
-                cap, output = self._captures.get((bucket, ctx.bs), (cap, output))
+            if ready and capture_bs is not None:
+                cap, output = self._captures[bucket, capture_bs]
         with self._padded_to(ctx, bucket):
             cap.replay(valid_rows=num_tokens)
         hidden_states, aux_hidden_states = output.sliced(num_tokens)
@@ -708,6 +712,30 @@ class PrefillGraph:
             self.text_model.lm_head,
             logits_metadata,
             aux_hidden_states,
+        )
+
+    def _merged_capture_bs(self, bucket: int, ctx: ForwardContext) -> int | None:
+        """Smallest captured request capacity, including native dummy-token room.
+
+        Padding belongs only to KDA execution metadata. The live context, MLA
+        breaks, logits and scheduler continue to see the real request count.
+        """
+        if (
+            self.dp_size != 1
+            or self.attn_backend.step_counter is not None
+            or not ctx.forward_mode.is_extend()
+        ):
+            return None
+        return min(
+            (
+                bs
+                for tokens, bs in self._captures
+                if tokens == bucket
+                and bs is not None
+                and bs >= ctx.bs
+                and ctx.input_num_tokens + bs - ctx.bs <= bucket
+            ),
+            default=None,
         )
 
     def _replay_bucket(self, ctx: ForwardContext) -> int | None:
@@ -741,6 +769,17 @@ class PrefillGraph:
         bucket = self._select_bucket(ctx)
         if bucket is None or (bucket, None) not in self._captures:
             return None
+        # A full token bucket may have no room for padded native scan slots.
+        # Reuse the next existing token bucket; never capture while serving.
+        for candidate in sorted(
+            {
+                tokens
+                for tokens, bs in self._captures
+                if bs is not None and tokens >= bucket
+            }
+        ):
+            if self._merged_capture_bs(candidate, ctx) is not None:
+                return candidate
         return bucket
 
     def _select_bucket(self, ctx: ForwardContext) -> int | None:
