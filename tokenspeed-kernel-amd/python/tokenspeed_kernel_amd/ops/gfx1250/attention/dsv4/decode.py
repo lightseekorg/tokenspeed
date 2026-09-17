@@ -996,8 +996,6 @@ def gluon_dsv4_decode_gfx1250(
     tokens = q.shape[0]
     swa_width = swa_slots.numel() // tokens
     extra_width = extra_slots.numel() // tokens if extra_slots is not None else 0
-    if q.shape[1] < 1:
-        raise ValueError("q must have at least one head")
     if not has_extra:
         extra_kv_cache = swa_kv_cache
         extra_slots = swa_slots
@@ -1101,7 +1099,6 @@ def gluon_dsv4_decode_gfx1250(
         USE_TDM_Q=use_tdm_q,
         num_warps=num_warps,
         num_stages=1,
-        waves_per_eu=1,
     )
     if num_splits > 1:
         _dsv4_paged_split_reduce_kernel[(tokens, num_heads)](
@@ -1120,6 +1117,5 @@ def gluon_dsv4_decode_gfx1250(
             NUM_KV_SPLITS=num_splits,
             HEAD_DIM=512,
             num_warps=1,
-            waves_per_eu=1,
         )
     return output
