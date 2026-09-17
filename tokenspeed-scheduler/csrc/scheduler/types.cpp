@@ -28,8 +28,8 @@ namespace tokenspeed {
 
 namespace {
 
-void validateGroup(const SchedulerConfig& config, const CacheGroupConfig& group) {
-    group.Validate();
+void validateGroupCapacityInputs(const SchedulerConfig& config, const CacheGroupConfig& group) {
+    group.ValidateCapacityInputs();
     const std::string where = "Cache group '" + group.group_id + "': ";
     if (config.prefix_granularity % group.block_granularity != 0) {
         throw std::invalid_argument(where + "block_granularity must divide the scheduler prefix_granularity");
@@ -52,14 +52,30 @@ void validateGroup(const SchedulerConfig& config, const CacheGroupConfig& group)
 }  // namespace
 
 void SchedulerConfig::Validate() const {
-    if (prefix_granularity <= 0) {
-        throw std::invalid_argument("Scheduler: prefix_granularity must be > 0");
-    }
+    ValidateCapacityInputs();
     if (device_allocator.total_pages <= 1) {
         throw std::invalid_argument("Scheduler: device cache must contain a null page and usable capacity");
     }
+    for (const CacheGroupConfig& group : cache_groups) {
+        group.Validate();
+    }
+    if (prefix_replay_tokens < 0) {
+        throw std::invalid_argument("Scheduler: prefix_replay_tokens must be >= 0");
+    }
+    if (enable_l3_storage) {
+        throw std::invalid_argument("Scheduler: L3 storage is not supported by the cache coordinator");
+    }
+}
+
+void SchedulerConfig::ValidateCapacityInputs() const {
+    if (prefix_granularity <= 0) {
+        throw std::invalid_argument("Scheduler: prefix_granularity must be > 0");
+    }
     if (cache_groups.empty()) {
         throw std::invalid_argument("Scheduler: at least one cache group is required");
+    }
+    if (max_batch_size < 0) {
+        throw std::invalid_argument("Scheduler: max_batch_size must be >= 0");
     }
     if (decode_input_tokens < 0) {
         throw std::invalid_argument("Scheduler: decode_input_tokens must be >= 0");
@@ -73,15 +89,9 @@ void SchedulerConfig::Validate() const {
     if (overlap_schedule_depth > 0 && decode_input_tokens == 0) {
         throw std::invalid_argument("Scheduler: overlapped decode requires decode_input_tokens > 0");
     }
-    if (prefix_replay_tokens < 0) {
-        throw std::invalid_argument("Scheduler: prefix_replay_tokens must be >= 0");
-    }
-    if (enable_l3_storage) {
-        throw std::invalid_argument("Scheduler: L3 storage is not supported by the cache coordinator");
-    }
     std::int32_t replay_window_tokens = 0;
     for (const CacheGroupConfig& group : cache_groups) {
-        validateGroup(*this, group);
+        validateGroupCapacityInputs(*this, group);
         // A recurrent state advances one whole checkpoint at a time, so a chunk
         // must be able to cover one cache block.
         if (group.IsSnapshotStateGroup() && max_scheduled_tokens < prefix_granularity) {

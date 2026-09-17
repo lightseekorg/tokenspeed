@@ -26,6 +26,7 @@ from tokenspeed_scheduler.tokenspeed_scheduler_ext import (  # Core; Execution p
     CacheGroupFamily,
     CacheRetention,
     CacheTransferPolicy,
+    CapacityModel,
     ExecutionEvent,
     ExecutionPlan,
     RequestSpec,
@@ -66,6 +67,7 @@ __all__ = [
     "CacheGroupConfig",
     "CacheGroupFamily",
     "CacheTransferPolicy",
+    "CapacityModel",
     # Execution plan & operations
     "ExecutionPlan",
     "Forward",

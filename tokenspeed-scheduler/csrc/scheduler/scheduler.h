@@ -278,9 +278,6 @@ private:
                                   Request* readmission, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
 
-    std::int32_t calculateMaxSingleRequestTokens(std::int64_t usable_lcm_blocks) const;
-    std::int64_t singleRequestLcmBlocksRequired(std::int32_t token_limit) const;
-
     SchedulerConfig config_;
     ReqPoolAllocator req_pool_allocator_;
 

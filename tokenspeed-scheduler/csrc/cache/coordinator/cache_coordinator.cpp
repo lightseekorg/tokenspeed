@@ -387,17 +387,6 @@ std::int32_t CacheCoordinator::NumAvailableLcmBlocks() const {
     return available;
 }
 
-std::int64_t CacheCoordinator::LcmBlocksNeededFor(std::span<const std::int64_t> group_pages) const {
-    _assert(group_pages.size() == groups_.size(), "page demand requires one entry per cache group");
-    std::int64_t prefix_blocks = 0;
-    for (std::size_t i = 0; i < groups_.size(); ++i) {
-        _assert(group_pages[i] >= 0, "group page demand must be non-negative");
-        const std::int64_t packing = groups_[i].Allocator().CacheBlocksPerLcmBlock();
-        prefix_blocks += (group_pages[i] + packing - 1) / packing;
-    }
-    return prefix_blocks;
-}
-
 std::int32_t CacheCoordinator::NumActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const {
     // Parent ids are dense in [1, NumLcmBlocks], so a bitmap dedupes shared
     // prefixes without hashing every block reference of every live request.
@@ -889,6 +878,22 @@ void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& 
                                            /*newly_cached=*/nullptr);
 }
 
+std::unique_ptr<PrefixMatcher> MakePrefixMatcher(const CacheGroupSpec& spec) {
+    _assert(spec.block_granularity > 0, "group block_granularity must be > 0");
+    switch (spec.kind) {
+        case AttnKind::kFull:
+            return std::make_unique<FullAttnMatcher>();
+        case AttnKind::kMambaState:
+            return std::make_unique<SwaMatcher>(spec.block_granularity, GroupGeometry::kMambaStateWindow);
+        case AttnKind::kSlidingWindow:
+            _assert(spec.sliding_window > 0, "sliding window group requires a positive window");
+            return std::make_unique<SwaMatcher>(spec.block_granularity, spec.sliding_window);
+        default:
+            FatalCheck(false, "unknown AttnKind in coordinator group spec");
+            return nullptr;
+    }
+}
+
 CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
                                  BlockPool& pool, BlockPool* host_pool, bool stream_device_cache_to_host) {
     _assert(!specs.empty(), "MakeCoordinator requires at least one spec");
@@ -901,27 +906,10 @@ CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int
         const CacheGroupSpec& spec = specs[i];
         const std::uint32_t group_id = static_cast<std::uint32_t>(i);
         _assert(spec.cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
-        const std::int32_t group_block_granularity = spec.block_granularity;
-        _assert(group_block_granularity > 0 && prefix_granularity % group_block_granularity == 0,
+        _assert(spec.block_granularity > 0 && prefix_granularity % spec.block_granularity == 0,
                 "group block_granularity must be a positive divisor of the prefix granularity");
         auto allocator = std::make_unique<GroupAllocator>(spec.cache_blocks_per_lcm_block, group_id, spec.shard_count);
-        std::unique_ptr<PrefixMatcher> matcher;
-        switch (spec.kind) {
-            case AttnKind::kFull:
-                matcher = std::make_unique<FullAttnMatcher>();
-                break;
-            case AttnKind::kMambaState:
-                matcher = std::make_unique<SwaMatcher>(group_block_granularity, GroupGeometry::kMambaStateWindow);
-                break;
-            case AttnKind::kSlidingWindow:
-                _assert(spec.sliding_window > 0, "sliding window group requires a positive window");
-                matcher = std::make_unique<SwaMatcher>(group_block_granularity, spec.sliding_window);
-                break;
-            default:
-                FatalCheck(false, "unknown AttnKind in coordinator group spec");
-                break;
-        }
-        groups.emplace_back(spec, std::move(allocator), std::move(matcher));
+        groups.emplace_back(spec, std::move(allocator), MakePrefixMatcher(spec));
     }
     return CacheCoordinator{std::move(groups), prefix_granularity, pool, host_pool, stream_device_cache_to_host};
 }

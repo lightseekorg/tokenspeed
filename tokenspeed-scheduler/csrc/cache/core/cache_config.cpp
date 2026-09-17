@@ -26,6 +26,13 @@
 namespace tokenspeed {
 
 void CacheGroupConfig::Validate() const {
+    ValidateCapacityInputs();
+    if (total_pages < 1) {
+        throw std::invalid_argument("Cache group '" + group_id + "': total_pages must include the null page");
+    }
+}
+
+void CacheGroupConfig::ValidateCapacityInputs() const {
     if (group_id.empty()) {
         throw std::invalid_argument("CacheGroupConfig: group_id must be non-empty");
     }
@@ -34,9 +41,6 @@ void CacheGroupConfig::Validate() const {
     const std::string where = "Cache group '" + group_id + "': ";
     if (block_granularity <= 0) {
         throw std::invalid_argument(where + "block_granularity must be > 0");
-    }
-    if (total_pages < 1) {
-        throw std::invalid_argument(where + "total_pages must include the null page");
     }
     if (cache_blocks_per_lcm_block <= 0) {
         throw std::invalid_argument(where + "cache_blocks_per_lcm_block must be > 0");
