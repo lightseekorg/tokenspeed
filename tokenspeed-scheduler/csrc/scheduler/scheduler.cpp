@@ -36,6 +36,7 @@
 
 #include "cache/tier/transfer.h"
 #include "fsm/forward_states.h"
+#include "scheduler/capacity_model.h"
 #include "scheduler/operations/forward.h"
 #include "scheduler/operations/group_demands.h"
 #include "cache/prefix/prefix_hasher.h"
@@ -44,11 +45,6 @@
 namespace tokenspeed {
 
 namespace {
-
-std::int64_t ceilDiv(std::int64_t value, std::int64_t divisor) {
-    _assert(value >= 0 && divisor > 0, "ceilDiv requires non-negative value and positive divisor");
-    return (value + divisor - 1) / divisor;
-}
 
 std::int32_t hostPoolBlocks(const SchedulerConfig& config) {
     return config.HasHostCache() ? config.host_allocator.NumUsableBlocks() : 0;
@@ -96,7 +92,7 @@ Scheduler::Scheduler(SchedulerConfig config)
     for (const CacheGroupConfig& group : config_.cache_groups) {
         cache_group_ids_.push_back(group.group_id);
     }
-    max_single_request_tokens_ = calculateMaxSingleRequestTokens(coordinator_.TotalLcmBlocks());
+    max_single_request_tokens_ = CapacityModel{config_}.MaxSingleRequestTokens(coordinator_.TotalLcmBlocks());
 
     if (config_.enable_kv_cache_events) {
         coordinator_.SetCacheMutationSink([this](const CacheKey& key, CacheCoordinator::CacheMutation mutation) {
@@ -107,121 +103,6 @@ Scheduler::Scheduler(SchedulerConfig config)
     if (const char* level = std::getenv("SPDLOG_LEVEL")) {
         spdlog::set_level(spdlog::level::from_str(level));
     }
-}
-
-std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit) const {
-    _assert(token_limit >= 0, "single-request token limit must be non-negative");
-    const std::int64_t decode_width = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
-    const std::int64_t workspace_tokens = config_.prefill_workspace_tokens;
-    // An overlapped forward protects one additional decode reservation that
-    // cannot yet be reclaimed from the request table.
-    const std::int64_t protected_tokens = static_cast<std::int64_t>(config_.overlap_schedule_depth) * decode_width;
-    const std::int64_t prefill_tail_tokens = std::max(decode_width + protected_tokens, workspace_tokens);
-    // The largest accepted prompt must still leave the first decode/MTP
-    // reservation inside token_limit.
-    const std::int64_t max_prompt_tokens =
-        std::max<std::int64_t>(static_cast<std::int64_t>(token_limit) - decode_width, 0);
-    const std::int64_t chunk_tokens = config_.max_scheduled_tokens;
-    const std::int64_t prefix_granularity = config_.prefix_granularity;
-    // A final sub-page tail can follow the first aligned body, or a later body
-    // that also retains an input checkpoint. Bound both cases independently.
-    const auto max_tail_after = [&](std::int64_t minimum_body_end) {
-        return std::max<std::int64_t>(0, std::min({prefix_granularity - 1, chunk_tokens - prefix_granularity,
-                                                   max_prompt_tokens - minimum_body_end}));
-    };
-    const std::int64_t max_first_chunk_tail_tokens = max_tail_after(prefix_granularity);
-    const std::int64_t max_later_chunk_tail_tokens = max_tail_after(2 * prefix_granularity);
-
-    std::vector<std::int64_t> group_pages(static_cast<std::size_t>(coordinator_.NumGroups()));
-    for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
-        const std::int64_t block_granularity = coordinator_.GroupBlockGranularity(i);
-        const CacheGroupConfig& group = config_.cache_groups[static_cast<std::size_t>(i)];
-        const auto local_prefill_peak = [&] {
-            if (group.IsSnapshotStateGroup()) {
-                if (token_limit == 0) return std::int64_t{0};
-                // Peak = retained input checkpoint (a later chunk's, or a prefix-cache hit)
-                // + aligned checkpoint + its materialized suffix/reserve. The
-                // forward holds both the final continuation and growth storage.
-                // P banks no decode growth; overlap keeps one more decode step live.
-                // A rebased recovery prompt may exceed max_prompt_tokens.
-                const auto output_blocks = [&](std::int64_t tail_tokens) {
-                    const std::int64_t reserve_tokens =
-                        config_.role == Role::kP
-                            ? 0
-                            : SnapshotStateReserveTokens(block_granularity, decode_width + protected_tokens);
-                    return 1 + ceilDiv(tail_tokens + reserve_tokens, block_granularity);
-                };
-                const std::int64_t lookback = coordinator_.GroupBoundaryLookbackPages(i);
-                const std::int64_t first_chunk_peak =
-                    (config_.disable_prefix_cache ? 0 : lookback) + output_blocks(max_first_chunk_tail_tokens);
-                const std::int64_t later_chunk_peak =
-                    max_prompt_tokens > chunk_tokens ? lookback + output_blocks(max_later_chunk_tail_tokens) : 0;
-                return std::max(first_chunk_peak, later_chunk_peak);
-            }
-            // Across every prompt up to max_prompt_tokens, retain the largest
-            // resident window seen by either the first chunk or a later chunk.
-            const std::int64_t first_prompt = std::min(max_prompt_tokens, chunk_tokens);
-            std::int64_t pages = ceilDiv(first_prompt + prefill_tail_tokens, block_granularity);
-            if (max_prompt_tokens > chunk_tokens) {
-                const std::int64_t later_prompt = std::min(max_prompt_tokens - chunk_tokens, chunk_tokens);
-                const std::int64_t lookback_pages = coordinator_.GroupBoundaryLookbackPages(i);
-                pages = std::max(pages, lookback_pages + ceilDiv(chunk_tokens + workspace_tokens, block_granularity));
-                pages =
-                    std::max(pages, lookback_pages + ceilDiv(later_prompt + prefill_tail_tokens, block_granularity));
-            }
-            return pages;
-        };
-        std::int64_t child_pages = 0;
-        if (coordinator_.GroupIsPrefixClosed(i)) {
-            // token_limit already includes the next decode reservation on
-            // decoding roles; a P prompt must additionally fit its workspace.
-            const std::int64_t extra_workspace = std::max(workspace_tokens - decode_width, std::int64_t{0});
-            child_pages =
-                ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens + extra_workspace, block_granularity);
-        } else if (config_.role == Role::kD) {
-            if (group.transfer_policy == CacheTransferPolicy::LatestSnapshot) {
-                // Remote landing: endpoint snapshot + banked growth block.
-                const std::int64_t snapshot_pages = token_limit == 0 ? 0 : 2;
-                // A retracted Decode request may recover by locally
-                // recomputing its suffix. Old State checkpoints are
-                // evictable, but one recovery chunk and its lookback must fit.
-                child_pages = std::max(snapshot_pages, local_prefill_peak());
-            } else if (group.retention == CacheGroupConfig::Retention::SlidingWindow) {
-                const std::int64_t dense_pages =
-                    ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
-                const std::int64_t window_pages = ceilDiv(static_cast<std::int64_t>(*group.sliding_window_tokens - 1) +
-                                                              decode_width + protected_tokens + block_granularity - 1,
-                                                          block_granularity);
-                // A sliding prefix probe can retain one older lookback island
-                // across null holes while the remote prompt tail is restored at
-                // absolute slots. Bound both intervals, capped by a dense table.
-                child_pages =
-                    std::min<std::int64_t>(dense_pages, coordinator_.GroupBoundaryLookbackPages(i) + window_pages);
-            } else {
-                // Decode-only restores its destination in one admission, so a
-                // non-sparse group cannot slide old prompt pages first.
-                child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
-            }
-        } else {
-            child_pages = local_prefill_peak();
-        }
-        group_pages[static_cast<std::size_t>(i)] = child_pages;
-    }
-    return coordinator_.LcmBlocksNeededFor(group_pages);
-}
-
-std::int32_t Scheduler::calculateMaxSingleRequestTokens(std::int64_t usable_lcm_blocks) const {
-    std::int64_t low = 0;
-    std::int64_t high = std::numeric_limits<std::int32_t>::max();
-    while (low < high) {
-        const std::int64_t candidate = low + (high - low + 1) / 2;
-        if (singleRequestLcmBlocksRequired(static_cast<std::int32_t>(candidate)) <= usable_lcm_blocks) {
-            low = candidate;
-        } else {
-            high = candidate - 1;
-        }
-    }
-    return static_cast<std::int32_t>(low);
 }
 
 Request* Scheduler::findRequest(const std::string& request_id) {
@@ -394,7 +275,7 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
 
 std::size_t Scheduler::BootstrappingSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(
-        requests_, [](const auto& request) { return request->template Is<fsm::Bootstrapping>(); }));
+        requests_, [](const std::unique_ptr<Request>& request) { return request->Is<fsm::Bootstrapping>(); }));
 }
 
 std::size_t Scheduler::WaitingSize() const {
@@ -416,7 +297,7 @@ std::size_t Scheduler::PrefillSize() const {
 
 std::size_t Scheduler::RemotePrefillSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(
-        requests_, [](const auto& request) { return request->template Is<fsm::RemotePrefilling>(); }));
+        requests_, [](const std::unique_ptr<Request>& request) { return request->Is<fsm::RemotePrefilling>(); }));
 }
 
 std::size_t Scheduler::PdTransferSize() const {

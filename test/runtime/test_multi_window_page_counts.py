@@ -20,17 +20,17 @@
 
 """Per-window page budgets for multi-window models (full + W=128 + W=4 style):
 each sliding group's device budget must follow ITS OWN window, keyed by the
-suffixed group ids the spec grouping emits."""
+suffixed group ids the spec grouping emits. The budget is the scheduler's
+capacity model, reached through the recipes' bridge."""
 
 from __future__ import annotations
 
-import importlib.util
 import math
 import os
-import pathlib
 import sys
-import types
 import unittest
+
+import pytest
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -38,45 +38,25 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-_RUNTIME_DIR = (
-    pathlib.Path(__file__).resolve().parents[2] / "python" / "tokenspeed" / "runtime"
+ts = pytest.importorskip("tokenspeed_scheduler")
+
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (  # noqa: E402
+    CacheFieldSpec,
 )
-_KV_CACHE_DIR = _RUNTIME_DIR / "layers" / "attention" / "kv_cache"
-_RECIPES_DIR = _KV_CACHE_DIR / "recipes"
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (  # noqa: E402
+    SchedulerLimits,
+    capacity_model,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa: E402
+    CacheGroupSpec,
+    group,
+    layer_group_ids,
+)
 
-# compute_cache_group_page_counts lazily imports ceil_div from
-# tokenspeed.runtime.utils.common, whose package pulls torch/psutil. Prefer the
-# real module (container runs); register a minimal equivalent only where the
-# runtime deps are absent, so the pure math stays testable everywhere.
-try:
-    from tokenspeed.runtime.utils.common import ceil_div as _real_ceil_div  # noqa: F401
-except Exception:
-    if "tokenspeed.runtime.utils.common" not in sys.modules:
-        _common = types.ModuleType("tokenspeed.runtime.utils.common")
-        _common.ceil_div = lambda a, b: -(-a // b)
-        sys.modules["tokenspeed.runtime.utils.common"] = _common
+PAGE = 64
 
 
-def _load(mod_name: str, file_path: pathlib.Path):
-    spec = importlib.util.spec_from_file_location(mod_name, file_path)
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-# spec.py is self-contained: load it from the repo file under a private
-# name (no real package import, no sys.modules shadowing needed).
-_pcs = _load("kv_cache_spec_for_page_counts", _RECIPES_DIR / "spec.py")
-compute_cache_group_page_counts = _pcs.compute_cache_group_page_counts
-CacheGroupSpec = _pcs.CacheGroupSpec
-_pcs.CacheFieldSpec = _load(
-    "kv_cache_plan_for_page_counts", _RECIPES_DIR / "plan.py"
-).CacheFieldSpec
-
-
-def _group_specs(module, **kwargs):
+def group_specs_from_layer_types(**kwargs):
     """The specs a layer vocabulary produces, via the one-walk ``group``.
 
     A group must declare fields, so a one-byte placeholder stands in: these
@@ -84,9 +64,9 @@ def _group_specs(module, **kwargs):
     """
     return tuple(
         group_spec
-        for group_spec, _ in module.group(
+        for group_spec, _ in group(
             fields_for_layer=lambda layer_id, group_id, occurrence: (
-                module.CacheFieldSpec(
+                CacheFieldSpec(
                     f"layer.{layer_id}.probe", f"unit.{occurrence}", (1,), "uint8"
                 ),
             ),
@@ -95,14 +75,7 @@ def _group_specs(module, **kwargs):
     )
 
 
-def group_specs_from_layer_types(**kwargs):
-    return _group_specs(_pcs, **kwargs)
-
-
-NULL_PAGE = _pcs.NULL_PAGES
-
-
-def _spec(group_id, retention, window=None, rows_per_page=64):
+def _spec(group_id, retention, window=None, rows_per_page=PAGE):
     return CacheGroupSpec(
         group_id=group_id,
         retention=retention,
@@ -113,65 +86,91 @@ def _spec(group_id, retention, window=None, rows_per_page=64):
     )
 
 
-class MultiWindowPageCountsTest(unittest.TestCase):
-    """full + W=128 + W=4 on page 64: three different budgets from one call."""
+def _pages(specs, **kw):
+    """Child pages per group (null page excluded), keyed by group id."""
+    defaults = dict(
+        max_live_requests=4,
+        max_scheduled_tokens=512,
+        max_total_tokens=4096,
+        max_context_len=4096,
+    )
+    defaults.update(kw)
+    model = capacity_model(
+        specs,
+        prefix_granularity=PAGE,
+        virtual_packing={spec.group_id: 1 for spec in specs},
+        limits=SchedulerLimits(
+            role=ts.SchedulerConfig.Role.Fused,
+            max_live_requests=defaults["max_live_requests"],
+            max_scheduled_tokens=defaults["max_scheduled_tokens"],
+            max_context_len=defaults["max_context_len"],
+            decode_input_tokens=1,
+            overlap_schedule_depth=0,
+            disable_prefix_cache=False,
+        ),
+    )
+    pages = model.concurrent_group_pages(
+        max_total_tokens=defaults["max_total_tokens"],
+        max_context_len=defaults["max_context_len"],
+    )
+    return dict(zip((spec.group_id for spec in specs), pages))
 
-    def counts(self, specs, **kw):
-        defaults = dict(
-            max_live_requests=4,
-            max_scheduled_tokens=512,
-            max_total_tokens=4096,
-            max_context_len=4096,
-        )
-        defaults.update(kw)
-        return compute_cache_group_page_counts(specs, **defaults)
+
+class MultiWindowPageCountsTest(unittest.TestCase):
+    """full + W=128 + W=4 on page 64: three different budgets from one call.
+
+    Per live request a sliding group retains ceil((W - 1 + decode + page - 1)
+    / page) pages -- its window, the next decode token, at any alignment --
+    and one in-flight prefill chunk adds its lookback plus ceil(chunk / page)
+    rows before they slide out.
+    """
 
     def test_each_window_budgets_independently(self):
-        counts = self.counts(
+        pages = _pages(
             [
                 _spec("full_attention", "full_history"),
                 _spec("sliding_attention_128", "sliding_window", window=128),
                 _spec("sliding_attention_4", "sliding_window", window=4),
             ]
         )
-        # full: ceil(4096/64) + live + dummy
-        self.assertEqual(counts["full_attention"], 64 + 4 + NULL_PAGE)
-        # W=128: resident ceil(127/64)=2 per request; scheduled ceil(512/64)=8
-        self.assertEqual(counts["sliding_attention_128"], 4 * 2 + 8 + 4 + NULL_PAGE)
-        # W=4: resident ceil(3/64)=1 per request -- a sub-page window still
-        # holds one page while its partial tail is live
-        self.assertEqual(counts["sliding_attention_4"], 4 * 1 + 8 + 4 + NULL_PAGE)
-        self.assertGreater(
-            counts["sliding_attention_128"], counts["sliding_attention_4"]
-        )
+        # full: ceil(4096/64) dense + one unaligned tail page per request
+        self.assertEqual(pages["full_attention"], 64 + 4)
+        # W=128: ceil((127 + 1 + 63)/64) = 3 per request; lookback ceil(127/64)
+        # = 2 and ceil(512/64) = 8 rows for the chunk in flight
+        self.assertEqual(pages["sliding_attention_128"], 4 * 3 + 2 + 8)
+        # W=4: ceil((3 + 1 + 63)/64) = 2 per request -- a sub-page window can
+        # still straddle two pages while its partial tail is live; lookback 1
+        self.assertEqual(pages["sliding_attention_4"], 4 * 2 + 1 + 8)
+        self.assertGreater(pages["sliding_attention_128"], pages["sliding_attention_4"])
 
-    def test_window_one_holds_no_resident_pages(self):
-        counts = self.counts([_spec("s", "sliding_window", window=1)])
-        self.assertEqual(counts["s"], 0 + 8 + 4 + NULL_PAGE)
+    def test_window_one_holds_only_the_token_being_written(self):
+        pages = _pages([_spec("s", "sliding_window", window=1)])
+        # No resident history and no lookback: one page per request for the
+        # decode token, plus the chunk in flight.
+        self.assertEqual(pages["s"], 4 * 1 + 0 + 8)
 
     def test_resident_window_clamped_by_context_len(self):
-        wide = self.counts(
-            [_spec("s", "sliding_window", window=128)], max_context_len=32
-        )
-        # min(127, 32) = 32 -> 1 resident page per request instead of 2
-        self.assertEqual(wide["s"], 4 * 1 + 8 + 4 + NULL_PAGE)
+        wide = _pages([_spec("s", "sliding_window", window=128)], max_context_len=32)
+        # min(127, 32) = 32 -> ceil((32 + 1 + 63)/64) = 2 pages per request
+        # instead of 3; the resumable-boundary lookback still follows the window.
+        self.assertEqual(wide["s"], 4 * 2 + 2 + 8)
 
     def test_scheduled_tokens_capped_by_total(self):
-        counts = self.counts(
+        pages = _pages(
             [_spec("s", "sliding_window", window=128)],
             max_scheduled_tokens=10_000,
             max_total_tokens=4096,
         )
-        self.assertEqual(counts["s"], 4 * 2 + math.ceil(4096 / 64) + 4 + NULL_PAGE)
+        self.assertEqual(pages["s"], 4 * 3 + 2 + math.ceil(4096 / PAGE))
 
     def test_sliding_without_window_raises(self):
         with self.assertRaises(ValueError):
-            self.counts([_spec("s", "sliding_window", window=None)])
+            _pages([_spec("s", "sliding_window", window=None)])
 
 
 class SuffixedGroupIdFlowTest(unittest.TestCase):
     """Spec grouping and budget computation agree on the suffixed group ids --
-    the exact dict the C++ scheduler receives as per-group total_pages."""
+    the groups the C++ scheduler sizes and later reads."""
 
     def test_grouping_feeds_counts_end_to_end(self):
         layer_types = [
@@ -183,31 +182,23 @@ class SuffixedGroupIdFlowTest(unittest.TestCase):
         windows = [None, 128, None, 4]
         specs = group_specs_from_layer_types(
             layer_types=layer_types,
-            group_ids=_pcs.layer_group_ids(
+            group_ids=layer_group_ids(
                 layer_types=layer_types, sliding_window_tokens=windows
             ),
-            prefix_granularity=64,
+            prefix_granularity=PAGE,
             sliding_window_tokens=windows,
         )
         self.assertEqual(
             [s.group_id for s in specs],
             ["full_attention", "sliding_attention_128", "sliding_attention_4"],
         )
-        counts = compute_cache_group_page_counts(
-            specs,
-            max_live_requests=4,
-            max_scheduled_tokens=512,
-            max_total_tokens=4096,
-            max_context_len=4096,
-        )
+        pages = _pages(specs)
         self.assertEqual(
-            set(counts),
+            set(pages),
             {"full_attention", "sliding_attention_128", "sliding_attention_4"},
         )
-        self.assertGreater(counts["full_attention"], counts["sliding_attention_128"])
-        self.assertGreater(
-            counts["sliding_attention_128"], counts["sliding_attention_4"]
-        )
+        self.assertGreater(pages["full_attention"], pages["sliding_attention_128"])
+        self.assertGreater(pages["sliding_attention_128"], pages["sliding_attention_4"])
 
 
 if __name__ == "__main__":

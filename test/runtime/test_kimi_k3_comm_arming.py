@@ -73,7 +73,7 @@ def test_arming_requires_fused_moe_ar():
 
 
 @needs_iris
-def test_iris_preparation_uses_full_window_for_equal_tp8_groups(monkeypatch):
+def test_iris_preparation_caps_attnres_for_equal_tp8_groups(monkeypatch):
     from tokenspeed.runtime.models import kimi_k3_comm
 
     group = tuple(range(8))

@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -172,8 +173,6 @@ public:
     std::int32_t NumEmptyLcmBlocks() const { return pool_.NumEmptyLcmBlocks(); }
     std::int32_t TotalLcmBlocks() const { return pool_.NumLcmBlocks(); }
     std::int32_t NumFreeHostLcmBlocks() const { return host_pool_ == nullptr ? 0 : host_pool_->NumEmptyLcmBlocks(); }
-    // LCM blocks required to place group_pages[g] pages for every group g.
-    std::int64_t LcmBlocksNeededFor(std::span<const std::int64_t> group_pages) const;
     // Distinct LCM blocks referenced by the given per-request table sets.
     std::int32_t NumActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const;
     // Free pages (group page units) this group could still place, counting its
@@ -292,6 +291,12 @@ private:
     std::vector<StoreCandidate> pending_stores_;
     CacheMutationSink cache_mutation_sink_;
 };
+
+// The prefix-match policy of one spec: full attention is prefix-closed with
+// no lookback; a sliding window (or a snapshot-state group, whose checkpoints
+// slide with a window of two) resumes only behind enough cached pages. The
+// coordinator's groups and the capacity model ask the same matcher.
+std::unique_ptr<PrefixMatcher> MakePrefixMatcher(const CacheGroupSpec& spec);
 
 // One CacheGroup per spec (group_id = index), sharing one scheduler prefix
 // domain P while each group may use a smaller cache-page token count.
