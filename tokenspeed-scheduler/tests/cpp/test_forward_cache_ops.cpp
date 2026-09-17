@@ -554,25 +554,19 @@ TEST(SchedulerConfigValidateTest, RejectsPdTransferPolicyMismatch) {
     EXPECT_NO_THROW(config.Validate());
 }
 
-TEST(SchedulerConfigValidateTest, ReplayWindowMustBePositiveAndFitASlidingHistoryGroup) {
+TEST(SchedulerConfigValidateTest, ReplayableRequiresASlidingHistoryGroup) {
     SchedulerConfig config = MakeValidConfig();
     CacheGroupConfig& group = config.cache_groups[0];
     group.group_id = "swa";
     group.retention = CacheGroupConfig::Retention::SlidingWindow;
     group.sliding_window_tokens = 256;
-    for (const std::int32_t replay : {0, -3, 257}) {
-        group.replay_window_tokens = replay;
-        ExpectRejectedNamingGroup(config, "swa");
-    }
-    group.replay_window_tokens = 256;
-    EXPECT_NO_THROW(config.Validate());
-    group.replay_window_tokens = 128;
+    group.replayable = true;
     EXPECT_NO_THROW(config.Validate());
 
     // Only a sliding History group can be regenerated: a full-history group is
     // prefix-closed and shared, and a State group cannot slide at all.
     SchedulerConfig full = MakeValidConfig();
-    full.cache_groups[0].replay_window_tokens = 8;
+    full.cache_groups[0].replayable = true;
     ExpectRejectedNamingGroup(full, full.cache_groups[0].group_id);
     group.family = CacheGroupFamily::State;
     ExpectRejectedNamingGroup(config, "swa");
@@ -585,8 +579,8 @@ TEST(SchedulerConfigValidateTest, ReplayNeedsBudgetForAWindowAndNoSnapshotStateO
     swa.block_granularity = 64;
     swa.total_pages = config.device_allocator.total_pages;
     swa.retention = CacheGroupConfig::Retention::SlidingWindow;
-    swa.sliding_window_tokens = 130;
-    swa.replay_window_tokens = 128;
+    swa.sliding_window_tokens = 128;
+    swa.replayable = true;
     config.cache_groups.push_back(swa);
     // P = 128 = W: the hit chunk needs W plus max(W, P) = 256 tokens of budget.
     config.max_scheduled_tokens = 255;
@@ -596,8 +590,7 @@ TEST(SchedulerConfigValidateTest, ReplayNeedsBudgetForAWindowAndNoSnapshotStateO
     // A window smaller than the prefix page still needs replay plus a page:
     // W = 2 leaves 6 of an 8-token budget, which no page-aligned chunk fits.
     SchedulerConfig small = config;
-    small.cache_groups[1].sliding_window_tokens = 4;
-    small.cache_groups[1].replay_window_tokens = 2;
+    small.cache_groups[1].sliding_window_tokens = 2;
     small.max_scheduled_tokens = 129;
     EXPECT_THROW(small.Validate(), std::invalid_argument);
     small.max_scheduled_tokens = 130;
@@ -613,18 +606,13 @@ TEST(SchedulerConfigValidateTest, ReplayNeedsBudgetForAWindowAndNoSnapshotStateO
     EXPECT_THROW(with_state.Validate(), std::invalid_argument) << "replay and snapshot-state groups do not mix";
 
     // PD roles transfer a replayable group as any sliding window's retained
-    // tail; the prefill role replays locally, the decode role never does. The
-    // shipped tail must be fully regenerated, so the replay window has to be
-    // the whole retention window there.
+    // tail; the prefill role replays locally, the decode role never does.
     for (const Role role : {Role::kP, Role::kD}) {
         SchedulerConfig pd = config;
         pd.role = role;
         for (CacheGroupConfig& group : pd.cache_groups) {
             group.transfer_policy = CacheTransferPolicy::FullSuffix;
         }
-        ExpectRejectedNamingGroup(pd, "swa");
-        pd.cache_groups[1].replay_window_tokens = pd.cache_groups[1].sliding_window_tokens;
-        pd.max_scheduled_tokens = 130 + 130;  // the larger window sets the budget floor
         EXPECT_NO_THROW(pd.Validate());
     }
 }

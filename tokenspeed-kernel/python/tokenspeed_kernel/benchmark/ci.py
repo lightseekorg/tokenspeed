@@ -65,6 +65,7 @@ class SuiteCase:
     """One stable benchmark identity and its revision-local request."""
 
     id: str
+    comparison_epoch: int
     definition: dict[str, Any]
     policy: dict[str, float]
     request: BenchmarkRequest
@@ -151,14 +152,17 @@ def _parse_definition(
     raw: object, location: str
 ) -> tuple[dict[str, Any], BenchmarkRequest]:
     definition = _object(raw, location)
+    cold_cache = definition.get("cold_cache", True)
+    if not isinstance(cold_cache, bool):
+        raise SuiteConfigError(f"{location}.cold_cache must be a boolean")
     request = BenchmarkRequest(
         family=definition["family"],
         mode=definition["mode"],
         parameters=definition["parameters"],
         solution=definition.get("solution"),
         registration=definition.get("registration"),
+        cold_cache=cold_cache,
         seed=definition["seed"],
-        definition_version=definition["definition_version"],
     )
 
     normalized = {
@@ -167,8 +171,8 @@ def _parse_definition(
         "parameters": request.parameters,
         "solution": request.solution,
         "registration": request.registration,
+        "cold_cache": request.cold_cache,
         "seed": request.seed,
-        "definition_version": request.definition_version,
     }
     return normalized, request
 
@@ -177,15 +181,30 @@ def _parse_case(raw: object, index: int) -> SuiteCase:
     location = f"cases[{index}]"
     case = _object(raw, location)
     case_id = _nonempty_string(case["id"], f"{location}.id")
+    comparison_epoch = case["comparison_epoch"]
+    if (
+        isinstance(comparison_epoch, bool)
+        or not isinstance(comparison_epoch, int)
+        or comparison_epoch <= 0
+    ):
+        raise SuiteConfigError(
+            f"{location}.comparison_epoch must be a positive integer"
+        )
     definition, request = _parse_definition(
         case["definition"], f"{location}.definition"
     )
     policy = _parse_policy(case["policy"], f"{location}.policy")
-    return SuiteCase(case_id, definition, policy, request)
+    return SuiteCase(
+        id=case_id,
+        comparison_epoch=comparison_epoch,
+        definition=definition,
+        policy=policy,
+        request=request,
+    )
 
 
 def load_suite(path: str | Path) -> BenchmarkSuite:
-    """Load the fields needed to execute a versioned benchmark suite."""
+    """Load the fields needed to execute a benchmark suite."""
 
     suite_path = Path(path)
     try:
@@ -277,10 +296,13 @@ def _failure_payload(
     status: BenchmarkStatus,
     phase: str,
     error: BaseException,
+    *,
+    cold_cache: bool,
 ) -> dict[str, Any]:
     return {
         "status": status.value,
         "registration_name": None,
+        "cold_cache": cold_cache,
         "timing_mode": "graph_replay",
         "metric": "device_time_per_invocation",
         "unit": "us",
@@ -298,6 +320,7 @@ def _result_payload(result: KernelBenchmarkResult) -> dict[str, Any]:
     return {
         "status": result.status.value,
         "registration_name": result.registration_name,
+        "cold_cache": result.cold_cache,
         "timing_mode": result.timing_mode,
         "metric": result.metric,
         "unit": result.unit,
@@ -366,11 +389,17 @@ def run_suite(
     for case in suite.cases:
         if mismatch is not None:
             result_payload = _failure_payload(
-                BenchmarkStatus.ENVIRONMENT_INVALID, "environment", mismatch
+                BenchmarkStatus.ENVIRONMENT_INVALID,
+                "environment",
+                mismatch,
+                cold_cache=case.request.cold_cache,
             )
         elif harness_error is not None:
             result_payload = _failure_payload(
-                BenchmarkStatus.SETUP_FAILURE, "runner_setup", harness_error
+                BenchmarkStatus.SETUP_FAILURE,
+                "runner_setup",
+                harness_error,
+                cold_cache=case.request.cold_cache,
             )
         else:
             assert harness is not None
@@ -381,6 +410,7 @@ def run_suite(
                     suite.timer.eager_warmup_iterations,
                     suite.timer.replay_warmup_iterations,
                     suite.timer.measurement_blocks,
+                    case.request.cold_cache,
                     environment.get("vendor"),
                     environment.get("arch"),
                     environment.get("device_name"),
@@ -390,6 +420,7 @@ def run_suite(
                     result.eager_warmup_iterations,
                     result.replay_warmup_iterations,
                     result.measurement_blocks,
+                    result.cold_cache,
                     result.platform_vendor,
                     result.platform_arch,
                     result.device_name,
@@ -401,12 +432,16 @@ def run_suite(
                 result_payload = _result_payload(result)
             except Exception as error:  # noqa: BLE001 - benchmark failures are data
                 result_payload = _failure_payload(
-                    BenchmarkStatus.EXECUTION_FAILURE, "runner", error
+                    BenchmarkStatus.EXECUTION_FAILURE,
+                    "runner",
+                    error,
+                    cold_cache=case.request.cold_cache,
                 )
 
         case_payloads.append(
             {
                 "id": case.id,
+                "comparison_epoch": case.comparison_epoch,
                 "definition": case.definition,
                 "policy": case.policy,
                 "result": result_payload,
@@ -453,7 +488,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run a revision-local kernel benchmark suite for CI"
     )
-    parser.add_argument("--suite", required=True, help="Versioned suite JSON path")
+    parser.add_argument("--suite", required=True, help="Benchmark suite JSON path")
     parser.add_argument(
         "--revision",
         required=True,

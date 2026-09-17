@@ -57,10 +57,10 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
             host_pool_->RegisterGroup(groups_[i].Id(), spec.cache_blocks_per_lcm_block, spec.shard_count);
         }
         geometry_.emplace_back(group_block_granularity);
-        _assert(spec.replay_window == 0 ||
-                    (spec.kind == AttnKind::kSlidingWindow && spec.replay_window <= spec.sliding_window),
-                "a replayable group must be a sliding window that retains its replay window");
-        replay_window_tokens_ = std::max(replay_window_tokens_, spec.replay_window);
+        if (spec.replayable) {
+            _assert(spec.kind == AttnKind::kSlidingWindow, "a replayable group must be a sliding window");
+            replay_window_tokens_ = std::max(replay_window_tokens_, spec.sliding_window);
+        }
         if (groups_[i].Matcher().IsPrefixClosed()) {
             match_order_.push_back(i);
         }

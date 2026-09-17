@@ -86,6 +86,7 @@ def _full_history_spec(group_id: str, *, shard_count: int) -> CacheGroupSpec:
         sliding_window_tokens=None,
         family="history",
         shard_count=shard_count,
+        replayable=False,
     )
 
 

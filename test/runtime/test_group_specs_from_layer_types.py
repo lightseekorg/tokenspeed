@@ -451,6 +451,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
             rows_per_page=16,
             entry_stride_tokens=4,
             sliding_window_tokens=None,
+            replayable=False,
         )
         self.assertEqual(spec.page_size, 64)
         self.assertEqual(spec.block_granularity, 64)
@@ -463,6 +464,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
             sliding_window_tokens=None,
             family="state",
             checkpoint_granularity=64,
+            replayable=False,
         )
         self.assertEqual(spec.block_granularity, 64)
         with self.assertRaises(TypeError):
@@ -478,6 +480,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
                 sliding_window_tokens=None,
                 family="state",
                 checkpoint_granularity=16,
+                replayable=False,
             )
 
     def test_missing_shape_raises(self):
@@ -486,6 +489,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
                 group_id="kv",
                 retention="full_history",
                 sliding_window_tokens=None,
+                replayable=False,
             )
 
     def test_partial_row_geometry_raises(self):
@@ -495,6 +499,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
                 retention="full_history",
                 rows_per_page=16,
                 sliding_window_tokens=None,
+                replayable=False,
             )
 
     def test_checkpoint_requires_state_family(self):
@@ -505,6 +510,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
                 sliding_window_tokens=None,
                 family="history",
                 checkpoint_granularity=16,
+                replayable=False,
             )
 
     def test_nonpositive_geometry_raises(self):
@@ -515,6 +521,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
                 rows_per_page=0,
                 entry_stride_tokens=1,
                 sliding_window_tokens=None,
+                replayable=False,
             )
         with self.assertRaises(ValueError):
             CacheGroupSpec(
@@ -523,6 +530,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
                 sliding_window_tokens=None,
                 family="state",
                 checkpoint_granularity=0,
+                replayable=False,
             )
 
     def test_state_family_requires_checkpoint_shape(self):
@@ -537,6 +545,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
                 entry_stride_tokens=4,
                 sliding_window_tokens=256,
                 family="state",
+                replayable=False,
             )
         spec = CacheGroupSpec(
             group_id="v4.compressor",
@@ -545,6 +554,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
             entry_stride_tokens=4,
             sliding_window_tokens=256,
             family="history",
+            replayable=False,
         )
         self.assertEqual(spec.page_size, 64)
         self.assertEqual(spec.block_granularity, 64)
@@ -559,6 +569,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
                 sliding_window_tokens=256,
                 family="state",
                 checkpoint_granularity=64,
+                replayable=False,
             )
 
 

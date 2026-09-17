@@ -150,6 +150,10 @@ class _GraphBackend(Protocol):
 
     def elapsed_time_ms(self, start: object, end: object) -> float: ...
 
+    def new_cache_clear_buffer(self) -> object: ...
+
+    def clear_cache(self, buffer: object) -> None: ...
+
 
 class _TorchCudaBackend:
     def ensure_available(self) -> None:
@@ -205,6 +209,16 @@ class _TorchCudaBackend:
     def elapsed_time_ms(self, start: object, end: object) -> float:
         return float(start.elapsed_time(end))
 
+    def new_cache_clear_buffer(self) -> object:
+        from tokenspeed_kernel._triton import triton
+
+        return triton.runtime.driver.active.get_empty_cache_for_benchmark()
+
+    def clear_cache(self, buffer: object) -> None:
+        from tokenspeed_kernel._triton import triton
+
+        triton.runtime.driver.active.clear_cache(buffer)
+
 
 class GraphTimer:
     """Measure an opaque device invocation through graph replay."""
@@ -218,9 +232,19 @@ class GraphTimer:
         self.config = config
         self._backend = backend or _TorchCudaBackend()
         self._stream: object | None = None
+        self._cache_clear_buffer: object | None = None
 
-    def measure(self, prepared: PreparedInvocation) -> GraphMeasurement:
-        """Capture and measure one prepared invocation."""
+    def measure(
+        self,
+        prepared: PreparedInvocation,
+        *,
+        cold_cache: bool,
+    ) -> GraphMeasurement:
+        """Capture and measure one prepared invocation.
+
+        Cold-cache timing clears the backend cache before every invocation and
+        excludes that clear from each reported device interval.
+        """
         if self.config.calls_per_graph > 1 and prepared.repeat_safe is not True:
             cause = ValueError(
                 "calls_per_graph > 1 requires an invocation with repeat_safe=True"
@@ -247,11 +271,19 @@ class GraphTimer:
         try:
             with torch.no_grad():
                 warmup_started = backend.monotonic()
-                stream, event_pairs = self._warm_up(prepared)
+                stream, event_pairs = self._warm_up(
+                    prepared,
+                    cold_cache=cold_cache,
+                )
                 warmup_time_ms = _elapsed_wall_ms(backend, warmup_started)
 
                 capture_started = backend.monotonic()
-                graph = self._capture(prepared, stream)
+                graph = self._capture(
+                    prepared,
+                    stream,
+                    event_pairs,
+                    cold_cache=cold_cache,
+                )
                 capture_time_ms = _elapsed_wall_ms(backend, capture_started)
 
                 first_replay_started = backend.monotonic()
@@ -264,6 +296,7 @@ class GraphTimer:
                     graph,
                     stream,
                     event_pairs,
+                    cold_cache=cold_cache,
                 )
                 measurement_time_ms = _elapsed_wall_ms(backend, measurement_started)
 
@@ -312,6 +345,8 @@ class GraphTimer:
     def _warm_up(
         self,
         prepared: PreparedInvocation,
+        *,
+        cold_cache: bool,
     ) -> tuple[object, list[tuple[object, object]]]:
         backend = self._backend
         try:
@@ -320,14 +355,20 @@ class GraphTimer:
                 self._stream = backend.new_stream()
             stream = self._stream
             backend.wait_stream(stream, source_stream)
+            event_count = (
+                self.config.calls_per_graph
+                if cold_cache
+                else self.config.measurement_blocks
+            )
             event_pairs = [
-                (backend.new_event(), backend.new_event())
-                for _ in range(self.config.measurement_blocks)
+                (backend.new_event(), backend.new_event()) for _ in range(event_count)
             ]
 
             with backend.use_stream(stream):
                 for _ in range(self.config.eager_warmup_iterations):
                     _reset(prepared)
+                    if cold_cache:
+                        self._clear_cache()
                     prepared.invoke()
             backend.synchronize_stream(stream)
 
@@ -350,6 +391,9 @@ class GraphTimer:
         self,
         prepared: PreparedInvocation,
         stream: object,
+        event_pairs: list[tuple[object, object]],
+        *,
+        cold_cache: bool,
     ) -> object:
         backend = self._backend
         graph: object | None = None
@@ -364,8 +408,15 @@ class GraphTimer:
                 stream,
                 capture_error_mode="global",
             ):
-                for _ in range(self.config.calls_per_graph):
-                    prepared.invoke()
+                if cold_cache:
+                    for start, end in event_pairs:
+                        self._clear_cache()
+                        backend.record_event(start, stream)
+                        prepared.invoke()
+                        backend.record_event(end, stream)
+                else:
+                    for _ in range(self.config.calls_per_graph):
+                        prepared.invoke()
             backend.synchronize_stream(stream)
             return graph
         except Exception as error:
@@ -412,6 +463,8 @@ class GraphTimer:
         graph: object,
         stream: object,
         event_pairs: list[tuple[object, object]],
+        *,
+        cold_cache: bool,
     ) -> tuple[float, ...]:
         backend = self._backend
         try:
@@ -420,6 +473,14 @@ class GraphTimer:
                     _reset(prepared)
                     backend.replay(graph)
             backend.synchronize_stream(stream)
+
+            if cold_cache:
+                return self._measure_cold_replays(
+                    prepared,
+                    graph,
+                    stream,
+                    event_pairs,
+                )
 
             with backend.use_stream(stream):
                 for start, end in event_pairs:
@@ -447,6 +508,38 @@ class GraphTimer:
                 "graph replay measurement failed",
                 cause=error,
             ) from error
+
+    def _measure_cold_replays(
+        self,
+        prepared: PreparedInvocation,
+        graph: object,
+        stream: object,
+        event_pairs: list[tuple[object, object]],
+    ) -> tuple[float, ...]:
+        backend = self._backend
+        samples: list[float] = []
+        for _ in range(self.config.measurement_blocks):
+            with backend.use_stream(stream):
+                _reset(prepared)
+                backend.replay(graph)
+            backend.synchronize_stream(stream)
+
+            call_samples: list[float] = []
+            for start, end in event_pairs:
+                sample_us = backend.elapsed_time_ms(start, end) * 1000.0
+                if not math.isfinite(sample_us) or sample_us <= 0.0:
+                    raise ValueError(
+                        "device event produced an invalid per-invocation sample "
+                        f"({sample_us!r} us)"
+                    )
+                call_samples.append(sample_us)
+            samples.append(statistics.fmean(call_samples))
+        return tuple(samples)
+
+    def _clear_cache(self) -> None:
+        if self._cache_clear_buffer is None:
+            self._cache_clear_buffer = self._backend.new_cache_clear_buffer()
+        self._backend.clear_cache(self._cache_clear_buffer)
 
 
 def _reset(prepared: PreparedInvocation) -> None:

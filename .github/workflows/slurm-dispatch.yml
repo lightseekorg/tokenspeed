@@ -29,7 +29,9 @@ on:
         options:
           - "off"
           - test/ci/eval/deepseek-v4.1-flash-evalscope-gsm8k.yaml
+          - test/ci/eval/deepseek-v4.1-flash-pd-1p1d-dspark-evalscope-gsm8k-gb300-slurm.yaml
           - test/ci/eval/deepseek-v4-flash-evalscope-gsm8k.yaml
+          - test/ci/eval/deepseek-v4-flash-dcp4-mtp-evalscope-gsm8k.yaml
           - test/ci/eval/deepseek-v4-flash-mtp-evalscope-gsm8k.yaml
           - test/ci/eval/glm-5.2-nvfp4-mtp-evalscope-aime26.yaml
           - test/ci/eval/glm-5.3-flash-fp8-mtp-evalscope-aime26.yaml

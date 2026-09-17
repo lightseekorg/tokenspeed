@@ -94,6 +94,15 @@ _PRODUCER_DIRECT_GL_DTYPES = {
 }
 
 
+def _peer_addresses(
+    tensor: torch.Tensor,
+    heap_bases: tuple[int, ...],
+    rank: int,
+) -> tuple[int, ...]:
+    heap_offset = tensor.data_ptr() - heap_bases[rank]
+    return tuple(heap_base + heap_offset for heap_base in heap_bases)
+
+
 @dataclass(frozen=True)
 class _StagedAllReduceKernelTuning:
     world_size: int
@@ -412,8 +421,8 @@ IRIS_ALL_REDUCE_KERNEL_CONFIG = IrisAllReduceKernelConfig(
     kimi_k3_attnres=KimiK3AttnResKernelConfig(
         world_size=8,
         hidden_size=7168,
-        num_subgroups=4,
-        elements_per_thread=1,
+        num_subgroups=16,
+        elements_per_thread=8,
     ),
 )
 
@@ -905,7 +914,7 @@ class IrisAllReduce(object):
                 + staged_config.input_slots * staged_max_numel
                 + staged_config.input_slots
                 * sum(tuning.numel for tuning in self._staged_tunings)
-                + 2 * attnres_max_numel
+                + 2 * self.world_size * attnres_max_numel
                 + (staged_max_numel if self._staged_two_stage_supported else 0)
                 + self._staged_two_stage_scratch_numel
                 + moe_config.lamport_stages
@@ -944,18 +953,18 @@ class IrisAllReduce(object):
             if producer_direct_max_numel
             else None
         )
-        self._attnres_input_buf = (
-            self._ctx.zeros((2, attnres_max_numel), dtype=dtype)
+        self._attnres_push_inbox = (
+            self._ctx.zeros((2, self.world_size, attnres_max_numel), dtype=dtype)
             if attnres_max_numel
             else None
         )
-        self._attnres_ready_flags = (
-            self._ctx.zeros((attnres_max_rows, self.world_size), dtype=torch.int32)
+        self._attnres_push_epochs = (
+            torch.zeros((attnres_max_rows,), dtype=torch.int32, device=self.device)
             if attnres_max_numel
             else None
         )
-        self._attnres_consumed_flags = (
-            self._ctx.zeros((attnres_max_rows, self.world_size), dtype=torch.int32)
+        self._attnres_push_ready_flags = (
+            self._ctx.zeros((2, attnres_max_rows, self.world_size), dtype=torch.int32)
             if attnres_max_numel
             else None
         )
@@ -1072,6 +1081,9 @@ class IrisAllReduce(object):
             if self._staged_two_stage_supported
             else None
         )
+        if self._attnres_push_inbox is not None:
+            torch.cuda.synchronize(self.device)
+            dist.barrier(group=self.group)
         heap_bases = self._ctx.get_heap_bases()
         self._group_heap_bases = heap_bases[group_ranks].contiguous()
         group_heap_bases = [int(address) for address in self._group_heap_bases.tolist()]
@@ -1091,6 +1103,15 @@ class IrisAllReduce(object):
                 address % moe_config.lamport_transaction_bytes == 0
                 for address in self._kimi_k3_moe_lamport_peer_addresses
             )
+        self._attnres_push_peer_inboxes = (
+            _peer_addresses(
+                self._attnres_push_inbox,
+                self._heap_base_addresses,
+                rank_in_group,
+            )
+            if self._attnres_push_inbox is not None
+            else None
+        )
         free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
         logger.info(
             "Iris all-reduce symmetric-heap buffers allocated: %s GB",
@@ -1425,7 +1446,10 @@ class IrisAllReduce(object):
             f"tensor numel ({partial.numel()}) exceeds iris buffer capacity "
             f"({self.attnres_max_numel})"
         )
-        assert self._attnres_input_buf is not None
+        assert self._attnres_push_inbox is not None
+        assert self._attnres_push_epochs is not None
+        assert self._attnres_push_ready_flags is not None
+        assert self._attnres_push_peer_inboxes is not None
         assert score_weight.shape == output_weight.shape == (kernel_config.hidden_size,)
         assert score_weight.dtype == output_weight.dtype == torch.bfloat16
         assert score_weight.device == output_weight.device == self.device
@@ -1440,10 +1464,10 @@ class IrisAllReduce(object):
 
         hidden = torch.empty_like(partial)
         residual_out = torch.empty_like(residual)
-        iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel[(num_tokens,)](
+        iris_push_one_shot_allreduce_residual_attnres_gluon_kernel[(num_tokens,)](
             partial,
             residual,
-            self._attnres_input_buf,
+            self._attnres_push_inbox,
             score_weight,
             output_weight,
             m,
@@ -1451,15 +1475,16 @@ class IrisAllReduce(object):
             acc,
             hidden,
             residual_out,
-            self._attnres_ready_flags,
-            self._attnres_consumed_flags,
+            self._attnres_push_epochs,
+            self._attnres_push_ready_flags,
+            *self._attnres_push_peer_inboxes,
             *self._heap_base_addresses,
             RANK=self._iris_rank,
             WORLD_SIZE=self.world_size,
-            M=num_tokens,
             HIDDEN=kernel_config.hidden_size,
             BLOCK=triton.next_power_of_2(kernel_config.hidden_size),
-            INPUT_SLOT_STRIDE=self.attnres_max_numel,
+            MAX_ELEMENTS=self.attnres_max_numel,
+            READY_SLOT_STRIDE=self.attnres_max_rows * self.world_size,
             EPS=eps,
             ELEMENTS_PER_THREAD=kernel_config.elements_per_thread,
             NUM_WARPS=kernel_config.num_subgroups,
@@ -1723,6 +1748,86 @@ def _iris_heap_base(
     if rank == 6:
         return heap_base_6
     return heap_base_7
+
+
+@gluon.jit
+def _iris_drain_subgroup_vmem():
+    gl.inline_asm_elementwise(
+        "s_waitcnt vmcnt(0)",
+        "=r,~{memory}",
+        [],
+        dtype=gl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@gluon.jit
+def _iris_sync_rank_token(
+    flags,
+    row,
+    token,
+    local_heap,
+    heap_base_0,
+    heap_base_1,
+    heap_base_2,
+    heap_base_3,
+    heap_base_4,
+    heap_base_5,
+    heap_base_6,
+    heap_base_7,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    SUBGROUP_SIZE: gl.constexpr,
+):
+    layout: gl.constexpr = gl.BlockedLayout([1], [SUBGROUP_SIZE], [NUM_WARPS], [0])
+    peers = gl.arange(0, WORLD_SIZE, layout=layout)
+    peer_mask = peers != RANK
+    peer_heaps = gl.where(peers == 0, heap_base_0, heap_base_7)
+    peer_heaps = gl.where(peers == 1, heap_base_1, peer_heaps)
+    peer_heaps = gl.where(peers == 2, heap_base_2, peer_heaps)
+    peer_heaps = gl.where(peers == 3, heap_base_3, peer_heaps)
+    peer_heaps = gl.where(peers == 4, heap_base_4, peer_heaps)
+    peer_heaps = gl.where(peers == 5, heap_base_5, peer_heaps)
+    peer_heaps = gl.where(peers == 6, heap_base_6, peer_heaps)
+    flags_heap_offset = tl.cast(flags, gl.uint64) - local_heap
+    peer_flags = tl.cast(
+        peer_heaps + flags_heap_offset,
+        gl.pointer_type(gl.int32),
+    )
+    gl.atomic_xchg(
+        peer_flags + row * WORLD_SIZE + RANK,
+        token,
+        mask=peer_mask,
+        sem="release",
+        scope="sys",
+    )
+    local_flags = flags + row * WORLD_SIZE + peers
+    seen = gl.load(
+        local_flags,
+        mask=peer_mask,
+        other=token,
+        cache_modifier=".cv",
+        volatile=True,
+    )
+    while gl.max(gl.where(peer_mask & (seen != token), 1, 0), axis=0) != 0:
+        seen = gl.load(
+            local_flags,
+            mask=peer_mask,
+            other=token,
+            cache_modifier=".cv",
+            volatile=True,
+        )
+    gl.atomic_add(
+        local_flags,
+        0,
+        mask=peer_mask,
+        sem="acquire",
+        scope="sys",
+    )
+    _iris_drain_subgroup_vmem()
+    gl.barrier()
 
 
 @gluon.jit
@@ -2208,6 +2313,80 @@ def iris_reduce_symmetric_two_stage_gluon_kernel(
 
 
 @gluon.jit
+def _iris_attnres_epilogue(
+    reduced,
+    residual_ptr,
+    score_weight_ptr,
+    output_weight_ptr,
+    scratch_m_ptr,
+    scratch_s_ptr,
+    scratch_acc_ptr,
+    hidden_ptr,
+    residual_out_ptr,
+    row_offsets,
+    weight_offsets,
+    mask,
+    row,
+    HIDDEN: gl.constexpr,
+    EPS: gl.constexpr,
+):
+    reduced = reduced.to(gl.bfloat16).to(gl.float32)
+    residual = gl.amd.cdna4.buffer_load(
+        residual_ptr,
+        row_offsets,
+        mask=mask,
+        other=0.0,
+    ).to(gl.float32)
+    prefix = (reduced + residual).to(gl.bfloat16).to(gl.float32)
+    gl.amd.cdna4.buffer_store(
+        prefix.to(residual_out_ptr.dtype.element_ty),
+        residual_out_ptr,
+        row_offsets,
+        mask=mask,
+    )
+    score_weight = gl.amd.cdna4.buffer_load(
+        score_weight_ptr,
+        weight_offsets,
+        mask=mask,
+        other=0.0,
+    ).to(gl.float32)
+    square_sum = gl.sum(gl.where(mask, prefix * prefix, 0.0), axis=0)
+    dot = gl.sum(gl.where(mask, prefix * score_weight, 0.0), axis=0)
+    prefix_logit = dot * gl.rsqrt(square_sum / HIDDEN + EPS)
+    block_m = gl.load(scratch_m_ptr + row)
+    block_s = gl.load(scratch_s_ptr + row)
+    maximum = gl.maximum(block_m, prefix_logit)
+    block_correction = gl.exp(block_m - maximum)
+    prefix_weight = gl.exp(prefix_logit - maximum)
+    inverse_sum = 1.0 / (block_s * block_correction + prefix_weight)
+    block_acc = gl.amd.cdna4.buffer_load(
+        scratch_acc_ptr,
+        row_offsets,
+        mask=mask,
+        other=0.0,
+    ).to(gl.float32)
+    mixed = (
+        ((block_acc * block_correction + prefix_weight * prefix) * inverse_sum)
+        .to(gl.bfloat16)
+        .to(gl.float32)
+    )
+    output_square_sum = gl.sum(gl.where(mask, mixed * mixed, 0.0), axis=0)
+    inverse_rms = gl.rsqrt(output_square_sum / HIDDEN + EPS)
+    output_weight = gl.amd.cdna4.buffer_load(
+        output_weight_ptr,
+        weight_offsets,
+        mask=mask,
+        other=0.0,
+    ).to(gl.float32)
+    gl.amd.cdna4.buffer_store(
+        (mixed * inverse_rms * output_weight).to(hidden_ptr.dtype.element_ty),
+        hidden_ptr,
+        row_offsets,
+        mask=mask,
+    )
+
+
+@gluon.jit
 def iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel(
     partial_ptr,
     residual_ptr,
@@ -2354,62 +2533,183 @@ def iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel(
     consumed = consumed_flags + row * WORLD_SIZE + RANK
     gl.atomic_xchg(consumed, epoch, sem="release", scope="sys")
 
-    reduced = reduced.to(gl.bfloat16).to(gl.float32)
-    residual = gl.amd.cdna4.buffer_load(
+    _iris_attnres_epilogue(
+        reduced,
         residual_ptr,
-        offset_i32,
-        mask=mask,
-        other=0.0,
-    ).to(gl.float32)
-    prefix = (reduced + residual).to(gl.bfloat16).to(gl.float32)
-    gl.amd.cdna4.buffer_store(
-        prefix.to(residual_out_ptr.dtype.element_ty),
+        score_weight_ptr,
+        output_weight_ptr,
+        scratch_m_ptr,
+        scratch_s_ptr,
+        scratch_acc_ptr,
+        hidden_ptr,
         residual_out_ptr,
         offset_i32,
-        mask=mask,
+        weight_offset_i32,
+        mask,
+        row,
+        HIDDEN,
+        EPS,
     )
 
-    score_weight = gl.amd.cdna4.buffer_load(
+
+@gluon.jit
+def iris_push_one_shot_allreduce_residual_attnres_gluon_kernel(
+    partial_ptr,
+    residual_ptr,
+    inbox_sym_ptr,
+    score_weight_ptr,
+    output_weight_ptr,
+    scratch_m_ptr,
+    scratch_s_ptr,
+    scratch_acc_ptr,
+    hidden_ptr,
+    residual_out_ptr,
+    generations,
+    ready_flags,
+    inbox_0: gl.pointer_type(gl.bfloat16),
+    inbox_1: gl.pointer_type(gl.bfloat16),
+    inbox_2: gl.pointer_type(gl.bfloat16),
+    inbox_3: gl.pointer_type(gl.bfloat16),
+    inbox_4: gl.pointer_type(gl.bfloat16),
+    inbox_5: gl.pointer_type(gl.bfloat16),
+    inbox_6: gl.pointer_type(gl.bfloat16),
+    inbox_7: gl.pointer_type(gl.bfloat16),
+    heap_base_0,
+    heap_base_1,
+    heap_base_2,
+    heap_base_3,
+    heap_base_4,
+    heap_base_5,
+    heap_base_6,
+    heap_base_7,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    HIDDEN: gl.constexpr,
+    BLOCK: gl.constexpr,
+    MAX_ELEMENTS: gl.constexpr,
+    READY_SLOT_STRIDE: gl.constexpr,
+    EPS: gl.constexpr,
+    ELEMENTS_PER_THREAD: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    SUBGROUP_SIZE: gl.constexpr,
+):
+    """Push Kimi-K3 attention rows into two-slot rank-ordered inboxes.
+
+    Peer inboxes are host-computed byte addresses. Explicit BF16 pointer
+    annotations preserve their pointer ABI and element-wise device offsets
+    without a Python pointer wrapper. The Iris context owns the mappings.
+    """
+    row = gl.program_id(0)
+    layout: gl.constexpr = gl.BlockedLayout(
+        [ELEMENTS_PER_THREAD], [SUBGROUP_SIZE], [NUM_WARPS], [0]
+    )
+    element = gl.arange(0, BLOCK, layout=layout)
+    mask = element < HIDDEN
+    row_offsets = (row * HIDDEN + element).to(gl.int32)
+    weight_offsets = element.to(gl.int32)
+    local = gl.amd.cdna4.buffer_load(
+        partial_ptr,
+        row_offsets,
+        mask=mask,
+        other=0.0,
+    )
+    generation = gl.load(generations + row).to(gl.int32) + 1
+    slot = generation & 1
+    inbox_slot_offset = slot * WORLD_SIZE * MAX_ELEMENTS
+    sync_ready_flags = ready_flags + slot * READY_SLOT_STRIDE
+    local_heap = _iris_heap_base(
+        RANK,
+        heap_base_0,
+        heap_base_1,
+        heap_base_2,
+        heap_base_3,
+        heap_base_4,
+        heap_base_5,
+        heap_base_6,
+        heap_base_7,
+    )
+    for peer_delta in gl.static_range(1, WORLD_SIZE):
+        destination = (RANK + peer_delta) % WORLD_SIZE
+        destination_inbox = _iris_heap_base(
+            destination,
+            inbox_0,
+            inbox_1,
+            inbox_2,
+            inbox_3,
+            inbox_4,
+            inbox_5,
+            inbox_6,
+            inbox_7,
+        )
+        gl.amd.cdna4.buffer_store(
+            local,
+            destination_inbox + inbox_slot_offset + RANK * MAX_ELEMENTS,
+            row_offsets,
+            mask=mask,
+            cache=".wt",
+        )
+    _iris_drain_subgroup_vmem()
+    gl.barrier()
+
+    _iris_sync_rank_token(
+        sync_ready_flags,
+        row,
+        generation,
+        local_heap,
+        heap_base_0,
+        heap_base_1,
+        heap_base_2,
+        heap_base_3,
+        heap_base_4,
+        heap_base_5,
+        heap_base_6,
+        heap_base_7,
+        RANK,
+        WORLD_SIZE,
+        NUM_WARPS,
+        SUBGROUP_SIZE,
+    )
+    local_inbox = inbox_sym_ptr + inbox_slot_offset
+
+    if RANK == 0:
+        reduced = local.to(gl.float32)
+    else:
+        reduced = gl.amd.cdna4.buffer_load(
+            local_inbox,
+            row_offsets,
+            mask=mask,
+            other=0.0,
+            cache=".cg",
+        ).to(gl.float32)
+    for source in gl.static_range(1, WORLD_SIZE):
+        if source == RANK:
+            reduced += local.to(gl.float32)
+        else:
+            reduced += gl.amd.cdna4.buffer_load(
+                local_inbox + source * MAX_ELEMENTS,
+                row_offsets,
+                mask=mask,
+                other=0.0,
+                cache=".cg",
+            ).to(gl.float32)
+
+    gl.store(generations + row, generation)
+    _iris_attnres_epilogue(
+        reduced,
+        residual_ptr,
         score_weight_ptr,
-        weight_offset_i32,
-        mask=mask,
-        other=0.0,
-    ).to(gl.float32)
-    square_sum = gl.sum(gl.where(mask, prefix * prefix, 0.0), axis=0)
-    dot = gl.sum(gl.where(mask, prefix * score_weight, 0.0), axis=0)
-    prefix_logit = dot * gl.rsqrt(square_sum / HIDDEN + EPS)
-
-    block_m = gl.load(scratch_m_ptr + row)
-    block_s = gl.load(scratch_s_ptr + row)
-    maximum = gl.maximum(block_m, prefix_logit)
-    block_correction = gl.exp(block_m - maximum)
-    prefix_weight = gl.exp(prefix_logit - maximum)
-    inverse_sum = 1.0 / (block_s * block_correction + prefix_weight)
-    block_acc = gl.amd.cdna4.buffer_load(
-        scratch_acc_ptr,
-        offset_i32,
-        mask=mask,
-        other=0.0,
-    ).to(gl.float32)
-    mixed = (
-        ((block_acc * block_correction + prefix_weight * prefix) * inverse_sum)
-        .to(gl.bfloat16)
-        .to(gl.float32)
-    )
-
-    output_square_sum = gl.sum(gl.where(mask, mixed * mixed, 0.0), axis=0)
-    inverse_rms = gl.rsqrt(output_square_sum / HIDDEN + EPS)
-    output_weight = gl.amd.cdna4.buffer_load(
         output_weight_ptr,
-        weight_offset_i32,
-        mask=mask,
-        other=0.0,
-    ).to(gl.float32)
-    gl.amd.cdna4.buffer_store(
-        (mixed * inverse_rms * output_weight).to(hidden_ptr.dtype.element_ty),
+        scratch_m_ptr,
+        scratch_s_ptr,
+        scratch_acc_ptr,
         hidden_ptr,
-        offset_i32,
-        mask=mask,
+        residual_out_ptr,
+        row_offsets,
+        weight_offsets,
+        mask,
+        row,
+        HIDDEN,
+        EPS,
     )
 
 
