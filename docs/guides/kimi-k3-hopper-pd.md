@@ -292,12 +292,14 @@ invocations to avoid their conflicting `conftest` module names.
 
 The configuration regressions below check that the MTP layer passes a single
 MoE block through `create_kimi_linear_moe` and that DSpark rejects a tap count
-that disagrees with `num_target_layers`:
+that disagrees with `num_target_layers`. The EAGLE3 capture test also checks
+completed-layer outputs with DFLASH capture disabled:
 
 ```bash
 PYTHONPATH=python:tokenspeed-kernel/python:tokenspeed-scheduler/python:test \
 python -m pytest -q \
   test/runtime/test_kimi_k3_config.py \
+  test/runtime/test_kimi_k3_eagle3.py \
   test/runtime/test_kimi_k3_dspark_model.py
 ```
 
