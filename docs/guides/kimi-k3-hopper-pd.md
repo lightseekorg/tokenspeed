@@ -290,6 +290,17 @@ Also run the existing K3 DSpark/capture tests. Keep runtime and kernel test
 roots in separate pytest
 invocations to avoid their conflicting `conftest` module names.
 
+The configuration regressions below check that the MTP layer passes a single
+MoE block through `create_kimi_linear_moe` and that DSpark rejects a tap count
+that disagrees with `num_target_layers`:
+
+```bash
+PYTHONPATH=python:tokenspeed-kernel/python:tokenspeed-scheduler/python:test \
+python -m pytest -q \
+  test/runtime/test_kimi_k3_config.py \
+  test/runtime/test_kimi_k3_dspark_model.py
+```
+
 For the existing one-node EP8 normal-dispatch smoke test:
 
 ```bash

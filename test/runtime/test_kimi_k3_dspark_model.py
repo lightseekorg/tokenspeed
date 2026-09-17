@@ -150,8 +150,12 @@ def test_non_yarn_rope_yields_no_scaling() -> None:
 
 
 def test_tap_count_must_match_num_target_layers() -> None:
-    with pytest.raises(ValueError, match="context_proj expects"):
-        validate_k3_dspark_config(make_config(target_layer_ids=[2, 23, 47]))
+    with pytest.raises(
+        ValueError, match="target_layer_ids has 3 entries but num_target_layers=5"
+    ):
+        validate_k3_dspark_config(
+            make_config(target_layer_ids=[2, 23, 47]), target_config=None
+        )
 
 
 def test_taps_must_be_ascending() -> None:
