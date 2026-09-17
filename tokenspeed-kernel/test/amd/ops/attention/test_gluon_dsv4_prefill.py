@@ -87,8 +87,18 @@ def _reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
-@pytest.mark.parametrize("heads", [1, 7, 16])
-@pytest.mark.parametrize("width", [128, 640])
+@pytest.mark.parametrize(
+    "heads, width",
+    [
+        (1, 128),
+        (7, 128),
+        (16, 128),
+        (64, 128),
+        (1, 640),
+        (7, 640),
+        (16, 640),
+    ],
+)
 def test_gluon_dsv4_prefill_matches_reference(heads: int, width: int) -> None:
     platform = current_platform()
     if not (platform.is_cdna4 or platform.is_cdna5):
