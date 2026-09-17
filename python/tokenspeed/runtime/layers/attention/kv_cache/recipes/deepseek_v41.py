@@ -193,28 +193,26 @@ class DeepseekV41Recipe(CacheRecipe):
                     "float32",
                 )
 
-        # Admission can be ahead of the completed forward. Retain its input
-        # window as well as the unfinished pair; the allocator also reserves
-        # in-flight pages through the shared scheduler_limits demand formula.
-        # The window is part of the PD peer contract, so size it for the
-        # deepest schedule (depth 1) on every role: a prefill node runs without
-        # overlap, and its pages must land in a decode node's retention.
-        protection = 2 * self.decode_input_tokens
+        # Retention keeps the `window - 1` positions before the next computed
+        # token: exactly what a query at that token reads (its 128-key SWA
+        # window, or the odd half of an unfinished compressor pair). The
+        # scheduler's frontier never runs ahead of the landed results, and the
+        # rows a scheduled step writes are reserved separately, so the window
+        # needs no verify-width or overlap margin.
         windows = {
-            V41_SWA_GROUP_ID: V41_WINDOW_SIZE + protection,
+            V41_SWA_GROUP_ID: V41_WINDOW_SIZE,
             V41_GLOBAL_R2_GROUP_ID: None,
             V41_GLOBAL_R1_GROUP_ID: None,
-            V41_COMPRESSOR_TAIL_GROUP_ID: 2 + protection,
+            V41_COMPRESSOR_TAIL_GROUP_ID: 2,
         }
         # SWA rows and compressor tails are never prefix-cached: a hit on the
-        # global groups re-feeds the cached prefix's last retention window --
-        # the attention window (or unfinished pair) plus the protection, so
-        # every page the group retains, and a PD peer receives, is
-        # regenerated -- and the model rebuilds them (bounded replay). The
-        # regenerated rows see SWA keys from the replay start only, not the
-        # stacked receptive field the original prefill had: the truncation the
-        # model is trained for (tech report 2.2). The shared global KV is never
-        # recomputed from them.
+        # global groups re-feeds the cached prefix's last retention window, so
+        # every page the group retains, and a PD peer receives, is regenerated
+        # -- and the model rebuilds them (bounded replay). The regenerated rows
+        # see SWA keys from the replay start only, not the stacked receptive
+        # field the original prefill had: the truncation the model is trained
+        # for (tech report 2.2). The shared global KV is never recomputed from
+        # them.
         replays = {
             V41_SWA_GROUP_ID: windows[V41_SWA_GROUP_ID],
             V41_GLOBAL_R2_GROUP_ID: None,

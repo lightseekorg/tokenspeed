@@ -987,8 +987,9 @@ tokenspeed serve deepseek-ai/DeepSeek-V4.1-Flash \
 
 Add `--speculative-algorithm DSPARK` for same-checkpoint DSpark decoding;
 the draft seeds its context windows from the decoder's kept rows. A hit
-re-feeds the groups' whole retention window (the 128-token attention window
-plus the admission protection, a few verify widths); the scheduler requires
+re-feeds the groups' whole retention window, which is exactly the 128-token
+attention window (the compressor-tail group retains its unfinished pair the
+same way); the scheduler requires
 `--chunked-prefill-size` of at least that window plus one prefix page and
 never leaves a prompt's final chunk shorter than it. The replayed rows attend
 SWA keys from the replay start only, the truncation the model is trained

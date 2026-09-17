@@ -1041,10 +1041,10 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
     assert layout.lcm_block_bytes == 1_382_400 and len(layout.fields) == 51
     specs = {spec.group_id: spec for spec, _ in recipe.groups()}
     horizon = (1 + overlap_depth) * verify_width
-    # Retention is sized for the deepest schedule on every role so that a
-    # prefill node (no overlap) and a decode node agree on the PD contract.
-    assert specs[SWA].sliding_window_tokens == 128 + 2 * verify_width
-    assert specs[TAIL].sliding_window_tokens == 2 + 2 * verify_width
+    # Retention is the attention window (or the pair) whatever the verify
+    # width or schedule depth: the scheduled rows are reserved, not retained.
+    assert specs[SWA].sliding_window_tokens == 128
+    assert specs[TAIL].sliding_window_tokens == 2
     tables = (
         4 * config.max_bs * sum(v41_table_widths(config.context_len, horizon).values())
     )
@@ -1248,8 +1248,8 @@ def test_recipe_exact_geometry_capacity_and_dispatch():
     specs = {s.group_id: s for s, _ in recipe.groups()}
     assert [specs[g].block_granularity for g in V41_GROUP_GEOMETRY] == [64, 128, 64, 2]
     assert all(s.family == "history" for s in specs.values())
-    assert specs[SWA].sliding_window_tokens == 130
-    assert specs[TAIL].sliding_window_tokens == 4
+    assert specs[SWA].sliding_window_tokens == 128
+    assert specs[TAIL].sliding_window_tokens == 2
     payload = {
         gid: sum(f.payload_bytes for f in fields)
         for (spec, fields) in recipe.groups()
@@ -1290,8 +1290,8 @@ def test_recipe_declares_replay_windows_for_the_private_groups():
 
     recipe = _recipe("cpu")
     specs = {s.group_id: s for s, _ in recipe.groups()}
-    # The whole retention window (attention window or pair, plus protection).
-    expected = {SWA: 130, R2: None, R1: None, TAIL: 4}
+    # The whole retention window: the attention window or the pair.
+    expected = {SWA: 128, R2: None, R1: None, TAIL: 2}
     assert {gid: s.replay_window_tokens for gid, s in specs.items()} == expected
     backend = _backend("cpu", 2)
     groups = {g.group_id: g for g in pool_to_cache_groups(backend.cache_pool)}
