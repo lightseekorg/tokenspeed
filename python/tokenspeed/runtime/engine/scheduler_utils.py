@@ -297,13 +297,9 @@ def pool_to_cache_groups(pool: Any) -> list:
             kwargs["transfer_policy"] = mapped_policy
         if spec.retention == "sliding_window":
             kwargs["sliding_window_tokens"] = int(spec.sliding_window_tokens)
-        # Always stated, None included: a group silently left cached when its
-        # recipe declared replay would change what the prefix hit means.
-        kwargs["replay_window_tokens"] = (
-            None
-            if spec.replay_window_tokens is None
-            else int(spec.replay_window_tokens)
-        )
+        # Always stated, False included: a group silently left cached when its
+        # recipe declared it replayable would change what the prefix hit means.
+        kwargs["replayable"] = bool(spec.replayable)
         out.append(CacheGroupConfig(**kwargs))
     return out
 

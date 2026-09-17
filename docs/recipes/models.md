@@ -953,8 +953,8 @@ prompts and package/model revisions.
 
 DeepSeek V4.1 (`deepseek_v41`) is served by its own FlatKV attention backend
 with a four-group KV cache: the global KV chains, the SWA rows and the
-compressor tails. The recipe declares the last two **replayable**
-(`replay_window_tokens`): they never enter the prefix cache, and a prefix
+compressor tails. The recipe declares the last two **replayable**: they
+never enter the prefix cache, and a prefix
 hit re-feeds the cached prefix's last 128 tokens so the model regenerates
 them into the request's own pages (SWA bounded replay,
 [`docs/design/scheduler.md` §1.3](../design/scheduler.md#13-bounded-replay)).
