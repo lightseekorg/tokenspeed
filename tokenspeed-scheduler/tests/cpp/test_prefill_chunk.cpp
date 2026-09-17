@@ -105,7 +105,8 @@ std::vector<CacheGroupSpec> FullOnlySpecs() {
 
 TEST(CoordinatorReplayTest, WindowIsTheLargestDeclaredAndAHitReplaysAtMostAWindow) {
     BlockPool pool(16, {1, 1, 1});
-    const CacheCoordinator coord = MakeCoordinator(ReplayableSpecs(), 4, pool, nullptr, false);
+    const CacheCoordinator coord =
+        MakeCoordinator(ReplayableSpecs(), 4, pool, /*enable_l3_storage=*/false, nullptr, false);
     EXPECT_EQ(coord.ReplayWindowTokens(), 8);
     EXPECT_EQ(coord.ReplayTokens(0), 0);
     EXPECT_EQ(coord.ReplayTokens(5), 5);
@@ -113,14 +114,16 @@ TEST(CoordinatorReplayTest, WindowIsTheLargestDeclaredAndAHitReplaysAtMostAWindo
     EXPECT_EQ(coord.ReplayTokens(64), 8);
 
     BlockPool plain_pool(16, {1});
-    const CacheCoordinator plain = MakeCoordinator(FullOnlySpecs(), 4, plain_pool, nullptr, false);
+    const CacheCoordinator plain =
+        MakeCoordinator(FullOnlySpecs(), 4, plain_pool, /*enable_l3_storage=*/false, nullptr, false);
     EXPECT_EQ(plain.ReplayWindowTokens(), 0);
     EXPECT_EQ(plain.ReplayTokens(64), 0);
 }
 
 TEST(PrefillChunkTokensTest, DebitsTheHitReplayAndKeepsTheFinalWindow) {
     BlockPool pool(64, {1, 1, 1});
-    const CacheCoordinator coord = MakeCoordinator(ReplayableSpecs(), 4, pool, nullptr, false);
+    const CacheCoordinator coord =
+        MakeCoordinator(ReplayableSpecs(), 4, pool, /*enable_l3_storage=*/false, nullptr, false);
     // A hit at 16 re-feeds 8 tokens first: 40 of budget leave 32 for new
     // tokens; a hit shorter than the window re-feeds only itself.
     EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/16, /*resumes_hit=*/true, 100, 40, 0), 32);
@@ -150,7 +153,8 @@ TEST(PrefillChunkTokensTest, DebitsTheHitReplayAndKeepsTheFinalWindow) {
     // Without replayable groups the helper is min(budget, unscheduled) plus
     // the alignment the state/promotion cases already had.
     BlockPool plain_pool(16, {1});
-    const CacheCoordinator plain = MakeCoordinator(FullOnlySpecs(), 4, plain_pool, nullptr, false);
+    const CacheCoordinator plain =
+        MakeCoordinator(FullOnlySpecs(), 4, plain_pool, /*enable_l3_storage=*/false, nullptr, false);
     EXPECT_EQ(PrefillChunkTokens(plain, 16, true, 100, 40, 0), 40);
     EXPECT_EQ(PrefillChunkTokens(plain, 16, true, 30, 40, 0), 30);
     EXPECT_EQ(PrefillChunkTokens(plain, 16, false, 100, 40, /*promotion=*/24), 8);
@@ -159,12 +163,18 @@ TEST(PrefillChunkTokensTest, DebitsTheHitReplayAndKeepsTheFinalWindow) {
 TEST(MinPrefillChunkTokensTest, ReservesACheckpointPageOrReplayPlusAWindowOrPage) {
     BlockPool pool(16, {1, 1, 1});
     // W = 8 > P = 4: replay plus another window.
-    EXPECT_EQ(MinPrefillChunkTokens(MakeCoordinator(ReplayableSpecs(), 4, pool, nullptr, false)), 16);
+    EXPECT_EQ(
+        MinPrefillChunkTokens(MakeCoordinator(ReplayableSpecs(), 4, pool, /*enable_l3_storage=*/false, nullptr, false)),
+        16);
     // W = 8 < P = 16: replay plus one prefix page, so an aligned chunk fits.
     BlockPool wide_pool(16, {1, 1, 1});
-    EXPECT_EQ(MinPrefillChunkTokens(MakeCoordinator(ReplayableSpecs(), 16, wide_pool, nullptr, false)), 24);
+    EXPECT_EQ(MinPrefillChunkTokens(
+                  MakeCoordinator(ReplayableSpecs(), 16, wide_pool, /*enable_l3_storage=*/false, nullptr, false)),
+              24);
     BlockPool plain_pool(16, {1});
-    EXPECT_EQ(MinPrefillChunkTokens(MakeCoordinator(FullOnlySpecs(), 4, plain_pool, nullptr, false)), 0);
+    EXPECT_EQ(MinPrefillChunkTokens(
+                  MakeCoordinator(FullOnlySpecs(), 4, plain_pool, /*enable_l3_storage=*/false, nullptr, false)),
+              0);
     BlockPool state_pool(16, {1, 1});
     const std::vector<CacheGroupSpec> with_state = {
         FullOnlySpecs()[0],
@@ -173,7 +183,9 @@ TEST(MinPrefillChunkTokensTest, ReservesACheckpointPageOrReplayPlusAWindowOrPage
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 4},
     };
-    EXPECT_EQ(MinPrefillChunkTokens(MakeCoordinator(with_state, 4, state_pool, nullptr, false)), 4);
+    EXPECT_EQ(
+        MinPrefillChunkTokens(MakeCoordinator(with_state, 4, state_pool, /*enable_l3_storage=*/false, nullptr, false)),
+        4);
 }
 
 }  // namespace

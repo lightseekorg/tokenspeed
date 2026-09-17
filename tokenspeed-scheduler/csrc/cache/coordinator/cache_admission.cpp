@@ -474,7 +474,10 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
                     if (!host_match.blocks[hit_index]) {
                         continue;
                     }
-                    const CacheKey& key = group_keys[i][static_cast<std::size_t>(floor_pages) + hit_index];
+                    const std::size_t key_index = static_cast<std::size_t>(floor_pages) + hit_index;
+                    FatalCheck(key_index < group_keys[i].size(),
+                               "host prefix hit is outside the planned prefix key range");
+                    const CacheKey& key = group_keys[i][key_index];
                     host_keys[hit_index] = key;
                     prefetch_flags[hit_index] =
                         groups_[i].Index().Contains(*host_pool_, host_match.blocks[hit_index]->Location()) ? 0 : 1;

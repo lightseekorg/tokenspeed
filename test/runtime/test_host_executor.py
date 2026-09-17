@@ -45,6 +45,10 @@ class _SyntheticPool:
 def _load_executor_module_without_triton(*, force_isolated=False):
     """Load executor orchestration when optional Triton is not installed."""
 
+    # Keep real dependencies outside the temporary sys.modules snapshot.
+    # Otherwise the first isolated load removes psutil again on exit.
+    import_module("psutil")
+
     if not force_isolated:
         executor_name = "tokenspeed.runtime.cache.l2.executor"
         if executor_name in sys.modules or util.find_spec("tokenspeed_triton"):

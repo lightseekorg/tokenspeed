@@ -26,7 +26,7 @@ import sys
 import tempfile
 import types
 import unittest
-from contextlib import chdir
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
@@ -53,6 +53,16 @@ from tokenspeed.runtime.cache.l3.mooncake import (
     MooncakeStoreConfig,
     parse_extra_config,
 )
+
+
+@contextmanager
+def _chdir(path):
+    previous = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
 
 
 class _FakeHost:
@@ -998,7 +1008,7 @@ class StorageKeyTest(unittest.TestCase):
                     ext_yaml=yaml_path,
                 )
 
-            with chdir(cwd_dir):
+            with _chdir(cwd_dir):
                 id_cwd = extensible_id()
                 with open(yaml_ext, "w", encoding="utf-8") as handle:
                     handle.write("PROCESSOR = 'yaml-dir-changed'\n")
@@ -1050,7 +1060,7 @@ class StorageKeyTest(unittest.TestCase):
                     ext_yaml=yaml_path,
                 )
 
-            with chdir(cwd_dir):
+            with _chdir(cwd_dir):
                 id_base = extensible_id()
                 with open(
                     os.path.join(cwd_dir, "unused.py"), "w", encoding="utf-8"
@@ -1108,7 +1118,7 @@ class StorageKeyTest(unittest.TestCase):
                     ext_yaml=yaml_path,
                 )
 
-            with chdir(cwd_dir):
+            with _chdir(cwd_dir):
                 id_base = extensible_id()
                 with open(
                     os.path.join(cwd_dir, "helper.py"), "w", encoding="utf-8"

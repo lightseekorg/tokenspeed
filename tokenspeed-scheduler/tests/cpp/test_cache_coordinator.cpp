@@ -4163,18 +4163,20 @@ TEST(BoundedReplayCoordinator, MakeCoordinatorRejectsReplayOnFullOrStateGroups) 
                                                                     .replayable = true,
                                                                     .cache_blocks_per_lcm_block = 1,
                                                                     .block_granularity = 4}};
-    EXPECT_THROW(MakeCoordinator(full_replay, 4, pool, nullptr, false), std::runtime_error);
+    EXPECT_THROW(MakeCoordinator(full_replay, 4, pool, /*enable_l3_storage=*/false, nullptr, false),
+                 std::runtime_error);
     const std::vector<CacheGroupSpec> state_replay = {CacheGroupSpec{.kind = AttnKind::kMambaState,
                                                                      .sliding_window = 0,
                                                                      .replayable = true,
                                                                      .cache_blocks_per_lcm_block = 1,
                                                                      .block_granularity = 4}};
-    EXPECT_THROW(MakeCoordinator(state_replay, 4, pool, nullptr, false), std::runtime_error);
+    EXPECT_THROW(MakeCoordinator(state_replay, 4, pool, /*enable_l3_storage=*/false, nullptr, false),
+                 std::runtime_error);
 }
 
 TEST(BoundedReplayCoordinator, ReplayableGroupNeverConstrainsTheCommonBoundary) {
     BlockPool pool(16, {1, 1});
-    CacheCoordinator coord = MakeCoordinator(ReplaySpecs(), 4, pool, nullptr, false);
+    CacheCoordinator coord = MakeCoordinator(ReplaySpecs(), 4, pool, /*enable_l3_storage=*/false, nullptr, false);
     EXPECT_EQ(coord.ReplayWindowTokens(), 8);
     EXPECT_FALSE(coord.GroupIsReplayable(0));
     EXPECT_TRUE(coord.GroupIsReplayable(1));
@@ -4201,7 +4203,7 @@ TEST(BoundedReplayCoordinator, ReplayableGroupNeverConstrainsTheCommonBoundary) 
 
 TEST(BoundedReplayCoordinator, AdmitMaterializesReplayableSuffixFromWindowBegin) {
     BlockPool pool(32, {1, 1});
-    CacheCoordinator coord = MakeCoordinator(ReplaySpecs(), 4, pool, nullptr, false);
+    CacheCoordinator coord = MakeCoordinator(ReplaySpecs(), 4, pool, /*enable_l3_storage=*/false, nullptr, false);
     const std::vector<std::string> hashes = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
     for (const std::string& hash : hashes) {
         CacheForGroup(coord, pool, hash, 0);
@@ -4245,7 +4247,8 @@ TEST(BoundedReplayCoordinator, AdmitMaterializesReplayableSuffixFromWindowBegin)
 TEST(BoundedReplayCoordinator, ReplayableGroupNeverPublishesOrStreams) {
     BlockPool pool(32, {1, 1});
     BlockPool host_pool(16, {1, 1});
-    CacheCoordinator coord = MakeCoordinator(ReplaySpecs(), 4, pool, &host_pool, /*stream_device_cache_to_host=*/true);
+    CacheCoordinator coord = MakeCoordinator(ReplaySpecs(), 4, pool, /*enable_l3_storage=*/false, &host_pool,
+                                             /*stream_device_cache_to_host=*/true);
     const std::vector<std::string> hashes = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
 
     std::vector<BlockTable> tables(2);
@@ -4280,7 +4283,7 @@ TEST(BoundedReplayCoordinator, ReplayableGroupNeverPublishesOrStreams) {
 
 TEST(BoundedReplayCoordinator, RetentionStillReclaimsReplayablePages) {
     BlockPool pool(32, {1, 1});
-    CacheCoordinator coord = MakeCoordinator(ReplaySpecs(), 4, pool, nullptr, false);
+    CacheCoordinator coord = MakeCoordinator(ReplaySpecs(), 4, pool, /*enable_l3_storage=*/false, nullptr, false);
     std::vector<BlockTable> tables(2);
     ASSERT_TRUE(AdmitForTest(coord, tables, /*num_tokens=*/24));
     ASSERT_EQ(tables[1].NumBlocks(), 6);

@@ -53,11 +53,11 @@ def _require_or_skip(reason: str) -> None:
 
 def _libcudart_dir() -> str | None:
     try:
-        import nvidia.cuda_runtime as cuda_runtime
+        import nvidia.cu13 as cuda_runtime
     except ImportError:
         return None
     for location in getattr(cuda_runtime, "__path__", []):
-        candidate = os.path.join(location, "lib", "libcudart.so.12")
+        candidate = os.path.join(location, "lib", "libcudart.so.13")
         if os.path.isfile(candidate):
             return os.path.dirname(candidate)
     return None
@@ -66,8 +66,8 @@ def _libcudart_dir() -> str | None:
 def _ensure_libcudart() -> str | None:
     """Load ``libcudart`` into this process and export it for child binaries.
 
-    ``mooncake_master`` and ``MooncakeDistributedStore`` are linked against
-    CUDA 12 even in the non-CUDA transfer-engine wheel. Changing
+    ``tokenspeed-mooncake`` links against CUDA 13 even for Host-only TCP
+    transfers. Changing
     ``LD_LIBRARY_PATH`` after Python starts does not affect this process's
     ``dlopen``, so preload via ``ctypes`` as well.
     """
@@ -76,7 +76,7 @@ def _ensure_libcudart() -> str | None:
     if lib_dir is None:
         return None
     ctypes.CDLL(
-        os.path.join(lib_dir, "libcudart.so.12"),
+        os.path.join(lib_dir, "libcudart.so.13"),
         mode=ctypes.RTLD_GLOBAL,
     )
     current = os.environ.get("LD_LIBRARY_PATH", "")

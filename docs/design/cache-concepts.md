@@ -593,7 +593,6 @@ Its responsibilities:
   retraction's snapshot pins its Device sources until the ACK; the snapshot
   store is stream-ordered instead, because its sources are re-granted in the
   same round (`scheduler.md` §2).
-  always stream when published.
 * **L3 under flat KV.** Host L2 is one compact pinned byte buffer indexed by
   CacheBlock IDs. Optional L3 (Mooncake Store) sits *below* that buffer, not
   beside GPU pages: after D2H, the runtime `batch_put_from`s each packed

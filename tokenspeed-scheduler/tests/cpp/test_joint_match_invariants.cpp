@@ -195,8 +195,9 @@ TEST(JointMatchInvariantsTest, ReplayableGroupIsNotPartOfTheJointInvariant) {
     const std::vector<std::string> hashes = MakeHashes(kBlocks);
     for (int round = 0; round < 200; ++round) {
         BlockPool pool(64, {1, 1});
-        CacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool, /*host_pool=*/nullptr,
-                                                       /*stream_device_cache_to_host=*/false);
+        CacheCoordinator coordinator =
+            MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                            /*stream_device_cache_to_host=*/false);
         std::uniform_int_distribution<std::int32_t> depth_dist(0, kBlocks);
         const std::int32_t full_depth = depth_dist(rng);
         for (std::int32_t i = 0; i < full_depth; ++i) {

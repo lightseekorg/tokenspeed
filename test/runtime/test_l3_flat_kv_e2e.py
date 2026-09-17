@@ -134,7 +134,9 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
                 raise TimeoutError("test did not release the L3 backup")
             return original_put(keys, host_buffer, offsets, sizes)
 
-        self.enterContext(patch.object(backend, "batch_put_from", gated_put))
+        put_patch = patch.object(backend, "batch_put_from", gated_put)
+        put_patch.start()
+        self.addCleanup(put_patch.stop)
 
         first[16:20].fill_(0x11)
         second[28:34].fill_(0x12)

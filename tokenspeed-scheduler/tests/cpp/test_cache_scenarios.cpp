@@ -2968,8 +2968,8 @@ TEST(CacheProgressTest, StateBoundariesRecordAtLandingAndSurviveFailedAdmission)
     BlockPool pool(8, {1});
     const std::vector<CacheGroupSpec> specs{
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2}};
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 4, pool, /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     const auto admission = AdmitForTest(coordinator, tables, /*num_tokens=*/16);
     ASSERT_TRUE(admission);

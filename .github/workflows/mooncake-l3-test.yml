@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout code
@@ -38,12 +38,16 @@ jobs:
         run: |
           python -m pip install --retries 10 --timeout 60 \
             'tokenspeed-mooncake==0.3.13.post20260825' \
-            'nvidia-cuda-runtime-cu12==12.9.79'
-          if ! sudo apt-get install -y \
-            libcurl4 libibverbs1 librdmacm1 libnuma1 rdma-core; then
+            'nvidia-cuda-runtime==13.0.96'
+          # The wheel links CUDA 13 and libcuda even for Host-only TCP tests.
+          # Install user-space driver libraries; no GPU or kernel driver is used.
+          if ! sudo apt-get install -y --no-install-recommends \
+            libcurl4 libibverbs1 librdmacm1 libnuma1 liburing2 rdma-core \
+            libnvidia-compute-580-server; then
             sudo apt-get update -o Acquire::Retries=5
-            sudo apt-get install -y -o Acquire::Retries=5 \
-              libcurl4 libibverbs1 librdmacm1 libnuma1 rdma-core
+            sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 \
+              libcurl4 libibverbs1 librdmacm1 libnuma1 liburing2 rdma-core \
+              libnvidia-compute-580-server
           fi
 
       - name: Run L3 unit tests and live master roundtrip
