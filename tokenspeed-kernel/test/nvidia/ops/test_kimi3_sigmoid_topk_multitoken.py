@@ -68,15 +68,6 @@ def _by_expert(weights, ids):
     return weights.gather(1, ids.to(torch.int64).argsort(dim=-1))
 
 
-def _reference(logits, bias, *, normalize, scale):
-    scores = logits.sigmoid()
-    ids = torch.topk(scores + bias.unsqueeze(0), TOPK, dim=-1, sorted=False).indices
-    weights = scores.gather(1, ids)
-    if normalize:
-        weights = weights / weights.sum(dim=-1, keepdim=True)
-    return weights * scale, ids
-
-
 # 128 rows is where the packed path peaks, so pin correctness there too.
 @pytest.mark.parametrize("tokens", [1, 2, 4, 8, 128])
 @pytest.mark.parametrize("normalize", [False, True])
@@ -96,7 +87,14 @@ def test_packed_topk_matches_reference_for_a_verify_window(tokens, normalize):
     assert weights.shape == (tokens, TOPK)
     assert ids.shape == (tokens, TOPK)
 
-    ref_w, ref_ids = _reference(logits, bias, normalize=normalize, scale=2.5)
+    ref_w, ref_ids = moe_sigmoid_bias_topk(
+        logits,
+        bias,
+        TOPK,
+        routed_scaling_factor=2.5,
+        normalize_topk_weights=normalize,
+        solution="reference",
+    )
     assert torch.equal(_experts(ids), _experts(ref_ids)), (tokens, normalize)
     torch.testing.assert_close(
         _by_expert(weights, ids),
@@ -137,7 +135,14 @@ def test_dispatcher_sends_a_verify_window_to_the_packed_kernel(tokens, monkeypat
     assert weights.dtype is torch.bfloat16 and ids.dtype is torch.int32
     assert weights.shape == (tokens, TOPK)
 
-    ref_w, ref_ids = _reference(logits, bias, normalize=True, scale=2.5)
+    ref_w, ref_ids = moe_sigmoid_bias_topk(
+        logits,
+        bias,
+        TOPK,
+        routed_scaling_factor=2.5,
+        normalize_topk_weights=True,
+        solution="reference",
+    )
     assert torch.equal(_experts(ids), _experts(ref_ids))
     torch.testing.assert_close(
         _by_expert(weights, ids).float(),
@@ -190,7 +195,14 @@ def test_dispatcher_keeps_a_strided_window_on_the_grouped_kernel():
     weights, ids = moe_sigmoid_bias_topk(
         logits, bias, TOPK, routed_scaling_factor=2.5, weights_dtype=torch.bfloat16
     )
-    ref_w, ref_ids = _reference(logits.contiguous(), bias, normalize=True, scale=2.5)
+    ref_w, ref_ids = moe_sigmoid_bias_topk(
+        logits.contiguous(),
+        bias,
+        TOPK,
+        routed_scaling_factor=2.5,
+        normalize_topk_weights=True,
+        solution="reference",
+    )
     assert torch.equal(_experts(ids), _experts(ref_ids))
     torch.testing.assert_close(
         _by_expert(weights, ids).float(),

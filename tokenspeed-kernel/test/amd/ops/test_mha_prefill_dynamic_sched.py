@@ -44,7 +44,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn.functional as F
 from utils import is_cdna4
 
 if not is_cdna4():
@@ -53,6 +52,7 @@ if not is_cdna4():
         allow_module_level=True,
     )
 
+from tokenspeed_kernel.ops.attention.mha import mha_prefill  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.attention.mha.prefill import (  # noqa: E402
     gluon_mha_prefill_gfx950,
 )
@@ -78,15 +78,17 @@ def _qkv(n_heads: int, n_kv_heads: int, total_tokens: int, seed: int = 0):
 
 
 def _dense_ref(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Per-sequence causal dense reference in fp32. [S,H,D] layout, one sequence."""
-    n_heads, n_kv_heads = q.shape[1], k.shape[1]
-    qt, kt, vt = (x.transpose(0, 1).float().unsqueeze(0) for x in (q, k, v))
-    if n_kv_heads != n_heads:
-        repeat = n_heads // n_kv_heads
-        kt = kt.repeat_interleave(repeat, dim=1)
-        vt = vt.repeat_interleave(repeat, dim=1)
-    out = F.scaled_dot_product_attention(qt, kt, vt, is_causal=True)
-    return out.squeeze(0).transpose(0, 1).to(q.dtype)
+    """Single-sequence causal dense reference; [S,H,D] layout, one sequence."""
+    seqlen = q.shape[0]
+    return mha_prefill(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens=torch.tensor([0, seqlen], device=q.device, dtype=torch.int32),
+        cu_seqlens_cpu=[0, seqlen],
+        max_seqlen=seqlen,
+        solution="reference",
+    )
 
 
 def _rel_err(a: torch.Tensor, b: torch.Tensor) -> float:

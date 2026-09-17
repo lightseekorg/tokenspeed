@@ -83,7 +83,7 @@ def test_decode_sigmoid_bias_topk_k3_numerics(
         16,
         routed_scaling_factor=scale,
         normalize_topk_weights=normalize,
-        solution="torch",
+        solution="reference",
     )
     weights, ids = tokenspeed_kernel.moe_sigmoid_bias_topk(
         logits,

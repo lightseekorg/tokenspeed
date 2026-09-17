@@ -87,20 +87,21 @@ class Priority(IntEnum):
         priority=Priority.PERFORMANT       # band start (8)
         priority=Priority.PERFORMANT + 2   # +2 within the band (10)
 
-    Band layout (each occupies a contiguous range of ints in [0, 20).
-    ints in 1..3 are unused — that range previously held a separate FALLBACK
-    band that was folded into PORTABLE):
+    Band layout (each occupies a contiguous range of ints in [0, 20)):
 
     +--------------+--------+----------------------------------------------------+
     | Band         | Range  | When to use                                        |
     +==============+========+====================================================+
-    | REFERENCE    |    0   | Correctness reference. Never auto-selected when a  |
-    |              |        | real implementation is available; useful as a      |
-    |              |        | numeric ground truth in tests.                     |
+    | REFERENCE    |  0..3  | Ground truth only. Never auto-selected, even when   |
+    |              |        | nothing else matches: selection skips this band    |
+    |              |        | unless the caller asks for ``solution="reference"`` |
+    |              |        | or names the kernel through ``override=``. Use it  |
+    |              |        | for PyTorch references whose cost or memory shape  |
+    |              |        | must never reach a serving path.                   |
     +--------------+--------+----------------------------------------------------+
     | PORTABLE     |  4..7  | In-tree generic implementation with no arch or     |
     |              |        | shape gating beyond the family contract — e.g.     |
-    |              |        | default Triton, or PyTorch reference patsh used as |
+    |              |        | default Triton, or PyTorch reference paths used as |
     |              |        | last-resort coverage.                              |
     +--------------+--------+----------------------------------------------------+
     | PERFORMANT   | 8..11  | In-tree generally optimized kernel, covering a     |

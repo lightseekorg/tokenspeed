@@ -64,7 +64,7 @@ def test_kimi3_sigmoid_bias_topk_is_exact_and_captures(
 @pytest.mark.skipif(not is_cdna5(), reason="gfx1250 prefill routing is CDNA5")
 @pytest.mark.parametrize("normalize", [False, True])
 @pytest.mark.parametrize("scale", [1.0, 2.5])
-def test_prefill_sigmoid_bias_topk_matches_torch_and_captures(
+def test_prefill_sigmoid_bias_topk_matches_reference_and_captures(
     normalize: bool,
     scale: float,
 ) -> None:
@@ -77,7 +77,7 @@ def test_prefill_sigmoid_bias_topk_matches_torch_and_captures(
         16,
         routed_scaling_factor=scale,
         normalize_topk_weights=normalize,
-        solution="torch",
+        solution="reference",
     )
 
     graph = torch.cuda.CUDAGraph()
@@ -110,7 +110,7 @@ def test_prefill_sigmoid_bias_topk_matches_torch_and_captures(
         16,
         routed_scaling_factor=scale,
         normalize_topk_weights=normalize,
-        solution="torch",
+        solution="reference",
     )
     graph.replay()
     torch.cuda.synchronize()
