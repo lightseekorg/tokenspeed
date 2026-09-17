@@ -27,6 +27,7 @@
 #include <span>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "cache/core/block_table.h"
@@ -90,17 +91,41 @@ struct CacheGroupSpec {
     std::int32_t shard_count{1};
 };
 
+// How a group's table grows in one admission. The two shapes use different
+// reference frames, which is why they are two types rather than one count.
+//
+// DenseGrowth appends to the table's current fill: num_tokens more tokens
+// beyond what the table already holds, relative to its available capacity.
+struct DenseGrowth {
+    std::int32_t num_tokens{0};
+
+    bool operator==(const DenseGrowth&) const noexcept = default;
+};
+
+// SparseSuffix is absolute in token space: the table's logical length becomes
+// the blocks covering extent_tokens, but only slots from first_block on are
+// materialized; the slots below stay null holes, preserving absolute slot
+// positions. Snapshot-state local prefill materializes its last checkpoint
+// and endpoint this way; decode-side PD lands the peer's endpoint snapshot
+// or retained sliding tail; a replayable group is regenerated from the
+// replay window's first token.
+struct SparseSuffix {
+    std::int32_t extent_tokens{0};
+    std::int32_t first_block{0};
+
+    bool operator==(const SparseSuffix&) const noexcept = default;
+};
+
+using GroupExtent = std::variant<DenseGrowth, SparseSuffix>;
+
 // Per-group capacity a request asks for in one admission: what this group
-// needs beyond what its table already holds. The request owns table.
+// needs beyond what its table already holds. reserve_tokens is room beyond
+// the extent, held for the round after, under either growth shape. The
+// request owns table.
 struct GroupDemand {
     BlockTable* table{nullptr};
-    std::int32_t num_tokens{0};
+    GroupExtent extent{DenseGrowth{}};
     std::int32_t reserve_tokens{0};
-    // -1 materializes the ordinary dense suffix. A non-negative value keeps
-    // earlier logical slots as null holes and materializes only this suffix.
-    // Snapshot-state local prefill uses an absolute endpoint here; Decode-side
-    // PD also uses it for latest snapshots and retained sliding tails.
-    std::int32_t materialized_suffix_start{-1};
 };
 
 // Prefix pages a request completed since the coordinator last saw it, ready to

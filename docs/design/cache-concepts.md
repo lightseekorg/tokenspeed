@@ -543,8 +543,14 @@ Its responsibilities:
   endpoint snapshot.
 
   `Admit` takes two inputs of different scope and tense. One `GroupDemand`
-  per group says what that group needs for the round ahead: tokens, reserve,
-  and whether to materialize a sparse suffix. One `RequestProgress` per
+  per group says what that group needs for the round ahead: an extent and a
+  reserve beyond it. The extent is one of two shapes in different reference
+  frames — `DenseGrowth` appends tokens relative to the table's current fill,
+  `SparseSuffix` names an absolute token extent and the first slot to
+  materialize, leaving the slots below as null holes — so the bounded-replay
+  rewrite in `Admit` is a visible conversion from one to the other (hit plus
+  growth becomes the absolute extent), not an arithmetic side effect. One
+  `RequestProgress` per
   request says what the request has done since the coordinator's previous
   transaction for it: the prefix pages it completed (`CompletedPages`, present
   only when the newly hashed range is non-empty, so "new hashes without a

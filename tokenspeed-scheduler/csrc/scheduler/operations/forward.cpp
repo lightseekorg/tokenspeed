@@ -312,7 +312,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
             config_.role != Role::kP && (source == fsm::PrefillSource::kRemote || completes_prefill),
     };
     std::vector<BlockTable> tables(static_cast<std::size_t>(coordinator_.NumGroups()));
-    std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.num_tokens = prefill_tokens});
+    std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.extent = DenseGrowth{prefill_tokens}});
     ReservePrefillDemands(demands, config_.cache_groups, reserve);
     if (source == fsm::PrefillSource::kLocal) {
         MakeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, hit_tokens, after_tokens);
@@ -324,14 +324,17 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
             const std::int32_t block_granularity = coordinator_.GroupBlockGranularity(i);
             if (group.transfer_policy == CacheTransferPolicy::LatestSnapshot) {
                 // The peer lands only the endpoint snapshot, in slot (PrefillSize-1)/g.
-                demands[i].num_tokens = request->PrefillSize();
-                demands[i].materialized_suffix_start = (request->PrefillSize() - 1) / block_granularity;
+                demands[i].extent = SparseSuffix{
+                    .extent_tokens = request->PrefillSize(),
+                    .first_block = (request->PrefillSize() - 1) / block_granularity,
+                };
             } else if (group.retention == CacheGroupConfig::Retention::SlidingWindow) {
                 const std::int32_t retained_begin =
                     std::max(0, request->PrefillSize() - *group.sliding_window_tokens + 1);
-                demands[i].num_tokens = request->PrefillSize();
-                demands[i].materialized_suffix_start =
-                    std::max(hit_tokens / block_granularity, retained_begin / block_granularity);
+                demands[i].extent = SparseSuffix{
+                    .extent_tokens = request->PrefillSize(),
+                    .first_block = std::max(hit_tokens / block_granularity, retained_begin / block_granularity),
+                };
             }
         }
     }
@@ -402,7 +405,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
                                config_.StreamsDeviceCacheToHost());
 
     std::vector<BlockTable>& tables = request->BlockTablesRef();
-    std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.num_tokens = prefill_tokens});
+    std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.extent = DenseGrowth{prefill_tokens}});
     ReservePrefillDemands(demands, config_.cache_groups, reserve);
     MakeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, first_pos, after_tokens);
     if (!admitWithKvEventTracking(plan, feedback, *request, cache_progress, demands, progress)) {
@@ -430,7 +433,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
         canConsumeReservedTokensInPlace(coordinator_, tables, reserve_tokens, num_computed_tokens)) {
         coordinator_.ConsumeReservedTokens(tables, reserve_tokens);
     } else {
-        std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.num_tokens = reserve_tokens});
+        std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.extent = DenseGrowth{reserve_tokens}});
         if (!admitWithKvEventTracking(plan, feedback, *request, cache_progress, demands, progress)) {
             return std::nullopt;
         }

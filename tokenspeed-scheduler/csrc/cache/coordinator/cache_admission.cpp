@@ -395,12 +395,17 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         const std::int32_t replay_begin = hit_tokens - ReplayTokens(hit_tokens);
         replayed.assign(demands.begin(), demands.end());
         for (std::size_t i = 0; i < replayed.size(); ++i) {
-            if (!GroupIsReplayable(static_cast<std::int32_t>(i)) || replayed[i].materialized_suffix_start >= 0) {
+            const auto* dense = std::get_if<DenseGrowth>(&replayed[i].extent);
+            if (!GroupIsReplayable(static_cast<std::int32_t>(i)) || dense == nullptr) {
                 continue;
             }
             _assert(replayed[i].table->NumBlocks() == 0, "a replayable group holds no hit pages at admission");
-            replayed[i].num_tokens += hit_tokens;
-            replayed[i].materialized_suffix_start = replay_begin / geometry_[i].BlockGranularity();
+            // The dense growth was relative to an empty table, so the hit plus
+            // the growth is the absolute extent.
+            replayed[i].extent = SparseSuffix{
+                .extent_tokens = hit_tokens + dense->num_tokens,
+                .first_block = replay_begin / geometry_[i].BlockGranularity(),
+            };
         }
         demands = replayed;
     }

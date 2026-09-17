@@ -89,7 +89,7 @@ inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordi
 inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
                                                                      std::vector<BlockTable>& tables,
                                                                      std::int32_t num_tokens) {
-    return AdmitForTest(coordinator, tables, GroupDemand{.num_tokens = num_tokens});
+    return AdmitForTest(coordinator, tables, GroupDemand{.extent = DenseGrowth{num_tokens}});
 }
 
 }  // namespace tokenspeed
