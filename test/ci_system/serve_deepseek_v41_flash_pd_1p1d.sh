@@ -127,6 +127,7 @@ echo "[pd-1p1d] world_size=$WORLD_SIZE moe_backend=$MOE_BACKEND enable_dspark=$E
 pids=()
 cleanup() {
   local code=$?
+  local log
   trap - EXIT INT TERM
   if [[ -n "$READY_FILE" ]]; then
     rm -f "$READY_FILE" "$READY_FILE.tmp"
@@ -181,17 +182,15 @@ wait_http() {
 wait_serving() {
   local role=$1
   local pid=$2
-  local timeout=$3
+  local deadline=$3
   local log="$LOG_DIR/${role}.log"
-  local start
-  start=$(date +%s)
   until grep -q "health status -> SERVING" "$log" 2>/dev/null; do
     if ! kill -0 "$pid" 2>/dev/null; then
       echo "[pd-1p1d] $role exited before reaching SERVING (log=$log)" >&2
       tail -n 200 "$log" >&2 || true
       return 1
     fi
-    if (( $(date +%s) - start > timeout )); then
+    if ((SECONDS >= deadline)); then
       echo "[pd-1p1d] timed out waiting for $role to reach SERVING (log=$log)" >&2
       tail -n 200 "$log" >&2 || true
       return 1
@@ -206,6 +205,7 @@ COMMON_ARGS=(
   --served-model-name "$SERVED_MODEL_NAME"
   --host "$WORKER_HOST"
   --world-size "$WORLD_SIZE"
+  # Keep attention TP equal to this role's world size even with expert parallelism.
   --tensor-parallel-size "$WORLD_SIZE"
   --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
   --trust-remote-code
@@ -280,6 +280,7 @@ start_worker() {
 
 # Each engine reserves a small control-plane port cluster around its
 # rendezvous address. Keep the P/D clusters disjoint while loading in parallel.
+startup_deadline=$((SECONDS + STARTUP_TIMEOUT))
 if [[ "$ROLE" != decode ]]; then
   start_worker prefill "$PREFILL_GPUS" "$PREFILL_PORT" "$PREFILL_BOOTSTRAP_PORT" "$PREFILL_DIST_INIT_ADDR"
 fi
@@ -288,10 +289,10 @@ if [[ "$ROLE" != prefill ]]; then
 fi
 
 if [[ "$ROLE" == both ]]; then
-  wait_serving prefill "${pids[0]}" "$STARTUP_TIMEOUT"
-  wait_serving decode "${pids[1]}" "$STARTUP_TIMEOUT"
+  wait_serving prefill "${pids[0]}" "$startup_deadline"
+  wait_serving decode "${pids[1]}" "$startup_deadline"
 else
-  wait_serving "$ROLE" "${pids[0]}" "$STARTUP_TIMEOUT"
+  wait_serving "$ROLE" "${pids[0]}" "$startup_deadline"
   printf '%s\n' "$WORKER_HOST" > "$READY_FILE.tmp"
   mv "$READY_FILE.tmp" "$READY_FILE"
   if [[ "$ROLE" == decode ]]; then
@@ -299,10 +300,9 @@ else
     # A worker exiting successfully is still a failed serving job.
     exit 1
   fi
-  start=$SECONDS
   until [[ -s "$LOG_DIR/decode.ready" ]]; do
     check_workers
-    if ((SECONDS - start >= STARTUP_TIMEOUT)); then
+    if ((SECONDS >= startup_deadline)); then
       echo "[pd-1p1d] timed out waiting for decode node" >&2
       exit 1
     fi

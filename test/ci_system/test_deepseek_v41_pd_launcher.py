@@ -64,7 +64,7 @@ pending.write_text(json.dumps(record))
 pending.replace(target)
 if kind == 'health':
     sys.exit(int(os.environ.get('HEALTH_EXIT', '0')))
-print('health status -> SERVING', flush=True)
+print(f'{kind}: health status -> SERVING', flush=True)
 if kind == os.environ.get('EXIT_ROLE'):
     time.sleep(0.1)
     sys.exit(0)
@@ -174,6 +174,14 @@ def test_two_node_roles_keep_engines_independent(launcher):
     decode.terminate()
     assert decode.wait(timeout=5) == 143
     assert not (tmp_path / "logs/123-1/decode.ready").exists()
+    prefill.terminate()
+    assert prefill.wait(timeout=5) == 143
+    decode_output = (tmp_path / "launcher-0.log").read_text()
+    prefill_output = (tmp_path / "launcher-1.log").read_text()
+    assert "decode: health status" in decode_output
+    assert "prefill: health status" not in decode_output
+    assert "prefill: health status" in prefill_output
+    assert "decode: health status" not in prefill_output
 
 
 def test_single_node_defaults_still_launch_both_roles(launcher):
