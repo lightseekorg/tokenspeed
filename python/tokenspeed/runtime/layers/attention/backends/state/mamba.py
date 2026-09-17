@@ -156,7 +156,7 @@ class _PrefillCheckpointBatch:
 
     @property
     def state_update_rows(self) -> torch.Tensor:
-        """Tail destinations; negative rows denote graph-only inactive slots."""
+        """Tail destinations; negative rows denote inactive capacity slots."""
         return self.rows
 
     @property

@@ -41,11 +41,14 @@ The server captures the configured variants at startup. Requests select an
 existing capture; encountering another batch size or token length does not
 create a new graph during serving.
 
-Before replay, the backend refreshes request boundaries, convolution maps,
-token maps and state-page indices once for all KDA layers. The buffers retain
-their addresses; the scheduler remains responsible for cache allocation and
-checkpoint ownership. This refresh happens outside the graph and still includes
-CPU work and host-to-device copies.
+With the feature enabled, supported pure-prefill forwards use the same
+capacity-shaped metadata for eager execution, capture and replay. Before the
+forward, the backend prepares request boundaries, convolution maps, token maps
+and state-page indices once for all KDA layers. Captured shapes refresh retained
+buffers at their original addresses; uncaptured shapes use temporary storage.
+The scheduler remains responsible for cache allocation and checkpoint ownership.
+This preparation happens outside the graph and still includes CPU work and
+host-to-device copies.
 
 ### Reuse captures across lengths and checkpoint patterns
 
@@ -78,8 +81,9 @@ fit the bucket.
 A request without an internal checkpoint runs entirely in main. Its tail slot
 contains a dummy token whose output and state writes are suppressed. This keeps
 the scan topology fixed and preserves main's final state. The tradeoff is that
-the captured tail scan still runs when no request needs a checkpoint. Padding
-never becomes a scheduler request or a persistent cache entry.
+the fixed-slot tail scan still runs when no request needs a checkpoint, including
+eligible eager forwards while the feature is enabled. Padding never becomes a
+scheduler request or a persistent cache entry.
 
 ## Enable the feature
 

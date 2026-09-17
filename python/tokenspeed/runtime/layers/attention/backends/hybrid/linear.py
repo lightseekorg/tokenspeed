@@ -179,10 +179,14 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     # ---- Forward dispatch ----
 
-    def prepare_prefill_graph_bindings(self, bucket: int) -> list:
+    def prepare_prefill_metadata(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode, *, capture: bool
+    ) -> bool:
         if self.step_counter is not None:
-            return []
-        return self.linear_attn_backend.prepare_prefill_graph_bindings(bucket)
+            return False
+        return self.linear_attn_backend.prepare_prefill_metadata(
+            token_capacity, bs, forward_mode, capture=capture
+        )
 
     def forward(
         self,
@@ -201,7 +205,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         backend = self._backend_for_layer(layer_id)
         forward = (
             self._forward
-            if backend.prefill_graph_inline and self.step_counter is None
+            if backend.prefill_metadata_is_capture_ready and self.step_counter is None
             else self._forward_break
         )
         return forward(

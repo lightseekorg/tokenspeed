@@ -238,7 +238,7 @@ class KdaPrefillFallbackTest(unittest.TestCase):
                             )
                             self.assertIs(results[-1], output)
                             self.assertIs(backend.forward_metadata, live)
-                            self.assertFalse(backend.prefill_graph_inline)
+                            self.assertFalse(backend.prefill_metadata_is_capture_ready)
             graph.assert_not_called()
         self.assertEqual(len(results), 24)
 
@@ -895,7 +895,7 @@ class CaptureFailureIsLoudTest(unittest.TestCase):
         pg = self.PrefillGraph.__new__(self.PrefillGraph)
         pg.disable = False
         pg.capture_buckets = [4]
-        pg._inline_captures = {}
+        pg._captures = {}
         pg.attn_backend = SimpleNamespace(
             init_prefill_graph_state=lambda **kwargs: None
         )

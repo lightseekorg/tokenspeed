@@ -686,24 +686,28 @@ GEMM arithmetic.
 
 ### Capturing KDA in the outer graph
 
-For pure extend with the captured request count, KDA stays inside the outer
-prefill graph. Before warmup, the backend creates a capacity metadata binding
-for the selected bucket. The hybrid wrapper bypasses its attention break
-while this binding is active, capturing neighboring projections, KDA kernels
-and post-attention compute together. Full-attention layers keep their breaks.
+Supported pure-extend forwards use `prepare_prefill_metadata` before eager
+execution, startup capture and replay. This consumer-stream seam builds or
+refreshes `KdaPrefillMetadata` with the selected token capacity and exact request
+count. The same metadata contract controls scan capacity, checkpoint packing and
+output restoration in every case; there is no temporary metadata binding or
+mutable inline flag. Only startup capture retains the metadata's addresses.
+Uncaptured shapes use temporary storage through the same builder.
 
-Before replay, the binding validates live lengths and refreshes boundaries,
-convolution maps and state-page indices on the consumer stream. All KDA
-layers read this same stable storage. Token lengths may vary within the
-bucket; request counts must match capture. Native output padding is cleared
-inside the graph, replacing the KDA break's handoff copy and tail scrub.
-The outer graph owns these allocations and their pool.
+For retained shapes, the hybrid wrapper can omit the KDA attention break and
+capture neighboring projections, KDA kernels and post-attention compute together.
+Full-attention layers keep their breaks. Before execution, the common preparation
+step validates live lengths and refreshes boundaries, convolution maps and
+state-page indices. All KDA layers read this same storage. Token lengths may
+vary within the bucket; request counts must match capture. Native output padding
+is cleared by the KDA forward, replacing the attention break's handoff copy and
+tail scrub when KDA is captured.
 
 The ordinary outer capture is retained for mixed batches and other request
 counts. All variants share the outer pool and execute serially, as existing
 bucket captures do. Layerwise PD transfer and data parallelism retain the
 ordinary route: host cache-step callbacks must remain live, and DP admission
-must stay rank-uniform. A binding rejects a replacement cache pool; graph
+must stay rank-uniform. Retained metadata rejects a replacement cache pool; graph
 release and recapture remain the orchestrator's responsibility.
 
 Internal-checkpoint forwards have a merged capture with two scan capacities.
@@ -736,7 +740,7 @@ The checkpoint metadata also owns an inverse output-token map, built with
 the existing packed host metadata and refreshed at the same stable addresses.
 Each layer gathers body and tail outputs in one kernel, writing zero for
 negative sources. This replaces two scatters plus output initialization;
-the inline path needs no additional output-padding scrub. Eager compact
+the capacity-shaped forward needs no additional output-padding scrub. Other
 checkpoint batches retain their ordinary merge when no inverse map is supplied.
 Q/K/V may remain views of convolution output until the existing checkpoint
 packer materializes them. Saved verification payloads keep their split producer.
@@ -744,11 +748,13 @@ packer materializes them. Saved verification payloads keep their split producer.
 Merged graphs reserve one tail slot per real request. An inactive slot has
 one zero-input dummy token, a negative output-token map, no checkpoint
 destination and a negative state-update row. Its scan result must never replace
-the body's final state. This padding is graph execution scratch, not a
-scheduler request or cache allocation. Native scans still see positive-length
-sequences; ordinary eager prefill retains compact tails and skips the second
-scan when there is no internal checkpoint. Both use the same checkpoint
-writers and recurrent-state scatter, which ignore negative destinations/rows.
+the body's final state. This padding is execution scratch, not a scheduler
+request or cache allocation. Native scans still see positive-length sequences.
+With the feature enabled, supported eager forwards use these same fixed slots,
+including the dummy tail scan when no request needs a checkpoint. With the
+feature disabled, compact tails still skip that scan. Both use the same
+checkpoint writers and recurrent-state scatter, which ignore negative
+destinations/rows. Unifying metadata does not imply zero padding cost.
 
 ### Startup capture and eager fallback
 
@@ -764,9 +770,16 @@ existing order. Inputs outside the outer graph's admission rules run eager.
 New request shapes do not grow a backend-owned graph cache. Metadata refresh
 and eager execution may still allocate temporary buffers.
 
-The outer owner retains graph metadata and outputs. Its serial shared-pool
-discipline and orchestrator-owned graph-release/rebind lifecycle apply to all
-merged variants; there is no separate KDA graph pool.
+The outer owner holds all captures and outputs in one table keyed by token
+capacity and exact request count; `None` in the request-count position selects
+the ordinary attention-break capture. The backend retains startup metadata for
+the exact shapes that need stable addresses, not graphs or request state. Serving
+forwards never grow this retained table. The outer owner's serial shared-pool
+discipline applies to all variants; there is no separate KDA graph pool. Before
+recapture, it releases the old captures and resets retained prefill metadata via
+`init_prefill_graph_state`. Publishing a cache pool also drops retained prefill
+metadata. Graph release and cache-pool rebind remain coordinated by the
+orchestrator.
 
 ### Fixed-capacity execution metadata
 

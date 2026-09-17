@@ -755,6 +755,16 @@ class ModelExecutor:
                 self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
                 self._active_multimodal_context,
             )
+        if (
+            mode is not None
+            and mode.is_extend()
+            and self.config.data_parallel_size == 1
+        ):
+            # The same execution metadata as replay, sized to eager's physical
+            # input extent. This neither pads requests nor captures new graphs.
+            self.attn_backend.prepare_prefill_metadata(
+                ctx.input_num_tokens, ctx.bs, mode, capture=False
+            )
         return self.model_runner.forward(
             ctx,
             self.input_buffers.input_ids_buf[: ctx.input_num_tokens],

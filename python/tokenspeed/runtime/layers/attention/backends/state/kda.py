@@ -54,9 +54,10 @@ from tokenspeed_kernel.ops.attention.kda.triton import (
 from tokenspeed_kernel.platform import pdl_enabled
 from typing_extensions import override
 
-from tokenspeed.runtime.layers.attention.backends.state.kda_prefill_graph import (
-    KdaOuterGraphBinding,
-    KdaPrefillGraphMetadata,
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.backends.state.kda_prefill_metadata import (
+    KdaPrefillMetadata,
+    prepare_kda_prefill_metadata,
 )
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaAttnBackend,
@@ -120,6 +121,8 @@ class KdaAttnBackend(MambaAttnBackend):
         self._prefill_graph_enabled = (
             os.environ.get("TOKENSPEED_KDA_PREFILL_GRAPH", "0") == "1"
         )
+        self._prefill_metadata: dict[tuple[int, int], KdaPrefillMetadata] = {}
+        self._prefill_metadata_pool = None
         self.max_bs = config.max_bs
         # The platform layout; the workspace planner probes the same one.
         self.kda_recurrent_layout = kda_recurrent_layout_default()
@@ -140,16 +143,55 @@ class KdaAttnBackend(MambaAttnBackend):
             self.kda_backend,
         )
 
-    def prepare_prefill_graph_bindings(self, bucket: int) -> list:
-        # The startup feature switch enables this optimization; bind() sets the
-        # temporary inline execution state only while stable metadata is active.
-        if (
+    def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
+        # The orchestrator releases old graphs before recapture or pool rebind.
+        # These are execution buffers, never backend-owned request state pages.
+        self._prefill_metadata.clear()
+        self._prefill_metadata_pool = None
+
+    @property
+    def prefill_metadata_is_capture_ready(self) -> bool:
+        metadata = self.forward_metadata
+        return (
+            isinstance(metadata, KdaPrefillMetadata)
+            and self._prefill_metadata.get(
+                (metadata.capacity.token_capacity, metadata.capacity.num_sequences)
+            )
+            is metadata
+        )
+
+    def prepare_prefill_metadata(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode, *, capture: bool
+    ) -> bool:
+        if not (
             self._prefill_graph_enabled
             and self.kda_backend == "cutedsl_kda"
             and self.step_counter is None
+            and forward_mode.is_extend()
         ):
-            return [KdaOuterGraphBinding(self, bucket, self.forward_metadata)]
-        return []
+            return False
+        if (
+            self._prefill_metadata_pool is not None
+            and self._prefill_metadata_pool is not self.cache_pool
+        ):
+            raise RuntimeError("KDA cache pool changed without graph release/recapture")
+        source = self.forward_metadata
+        if source.extend_seq_lens_cpu.numel() != bs:
+            raise ValueError("KDA prefill metadata requires the exact request count")
+        key = (token_capacity, bs)
+        target = prepare_kda_prefill_metadata(
+            source,
+            token_capacity,
+            self._prefix_granularity,
+            self._prefill_metadata.get(key),
+        )
+        if capture:
+            # Only startup grows retained storage. Uncaptured shapes use fresh
+            # metadata through this same builder and never capture during serving.
+            self._prefill_metadata[key] = target
+            self._prefill_metadata_pool = self.cache_pool
+        self.forward_metadata = target
+        return True
 
     def forward_extend(
         self,
@@ -175,7 +217,7 @@ class KdaAttnBackend(MambaAttnBackend):
             save_kv_cache=save_kv_cache,
             **kwargs,
         )
-        if self.prefill_graph_inline:
+        if isinstance(self.forward_metadata, KdaPrefillMetadata):
             checkpoint = self.forward_metadata.prefill_checkpoint_batch
             if checkpoint is not None and checkpoint.output_sources is not None:
                 # The fused gather writes the complete output, including padding.
@@ -246,6 +288,8 @@ class KdaAttnBackend(MambaAttnBackend):
     @override
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
+        self._prefill_metadata.clear()
+        self._prefill_metadata_pool = None
         self._reset_replay_state()
         shape = self._replay_shape(cache_pool)
         self._replay_active = kda_replay_commit_supported(
@@ -1022,7 +1066,7 @@ class KdaAttnBackend(MambaAttnBackend):
             inputs_packed=inputs_packed,
             capacity=(
                 KdaPrefillCapacity(seq_len, query_start_loc.numel() - 1)
-                if isinstance(self.forward_metadata, KdaPrefillGraphMetadata)
+                if isinstance(self.forward_metadata, KdaPrefillMetadata)
                 else None
             ),
             lower_bound=lower_bound,

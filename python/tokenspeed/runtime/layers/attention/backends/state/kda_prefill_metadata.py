@@ -18,9 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""KDA capacity metadata owned by startup-captured outer graphs."""
+"""Capacity-shaped KDA execution metadata shared by eager and CUDA graphs."""
 
-from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass, replace
 
 import torch
@@ -39,7 +38,7 @@ from tokenspeed.runtime.utils.tensor import upload_packed
 
 
 @dataclass(kw_only=True)
-class KdaPrefillGraphMetadata(MambaForwardMetadata):
+class KdaPrefillMetadata(MambaForwardMetadata):
     capacity: KdaPrefillCapacity
 
     @property
@@ -198,13 +197,13 @@ def _refresh_checkpoint_destinations(target, source):
 def _capacity_metadata(source, bucket, tail_capacity):
     """Create an isolated execution snapshot without allocating request state.
 
-    Reserve fixed checkpoint/tail slots for inline capture.
-    The graph owner retains the snapshot and its stable device buffers.
+    Eager and captured forwards reserve the same checkpoint/tail slots.
+    Startup capture retains the snapshot; uncaptured shapes do not retain it.
     """
     capacity = KdaPrefillCapacity(bucket, source.extend_seq_lens_cpu.numel())
     capacity.validate(source.cu_extend_seq_lens_cpu, bucket)
     cloned = _clone_metadata(source)
-    result = KdaPrefillGraphMetadata(
+    result = KdaPrefillMetadata(
         **{
             field.name: getattr(cloned, field.name)
             for field in fields(MambaForwardMetadata)
@@ -250,62 +249,26 @@ def _clone_metadata(value):
     return value
 
 
-class KdaOuterGraphBinding:
-    """Own a bucket's stable KDA metadata for capture in the outer graph.
+def prepare_kda_prefill_metadata(source, token_capacity, prefix_granularity, target):
+    """Prepare one execution shape, optionally refreshing retained storage.
 
-    Args:
-        backend: KDA leaf whose metadata is temporarily bound.
-        bucket: Packed token capacity selected by the outer graph.
-        source: Live or startup placeholder metadata defining the scan topology.
+    ``source`` is the scheduler-derived metadata for this forward. Eager and
+    captured execution both reserve exactly its positive-length request count;
+    token capacity may exceed their combined live length. ``target`` is either
+    a startup-retained view for that shape or None for fresh per-forward storage.
+    No request state is allocated here. Returns the metadata consumed by every
+    KDA layer, without a temporary backend binding or an execution-mode flag.
     """
-
-    def __init__(self, backend, bucket, source):
-        self.backend = backend
-        self.pool = backend.cache_pool
+    if target is None:
         tail_capacity = min(
-            bucket,
-            source.extend_seq_lens_cpu.numel()
-            * max(1, backend._prefix_granularity - 1),
+            token_capacity,
+            source.extend_seq_lens_cpu.numel() * max(1, prefix_granularity - 1),
         )
-        self.metadata = _capacity_metadata(source, bucket, tail_capacity)
-
-    def compatible(self, ctx):
-        """Check pool, transfer, forward mode and exact request-count matching.
-
-        Length, tail-capacity and state-group checks still run during refresh
-        and may raise. Passing this predicate is not full geometry validation.
-        """
-        source = self.backend.forward_metadata
-        return (
-            self.backend.cache_pool is self.pool
-            and self.backend.step_counter is None
-            and ctx.forward_mode.is_extend()
-            and ctx.num_extends == ctx.bs == self.metadata.capacity.num_sequences
-            and source.extend_seq_lens_cpu is not None
-            and source.extend_seq_lens_cpu.numel()
-            == self.metadata.capacity.num_sequences
-        )
-
-    @contextmanager
-    def bind(self, refresh: bool):
-        """Temporarily bind the outer owner's stable metadata and inline flag.
-
-        Use ``refresh=False`` for warmup/capture and ``True`` for live replay.
-        Variants sharing the outer pool run serially. Exiting restores backend
-        references, but does not undo GPU work already queued on the stream.
-        """
-        backend = self.backend
-        source = backend.forward_metadata
-        previous_inline = backend.prefill_graph_inline
-        if refresh:
-            _refresh_capacity_metadata(self.metadata, source)
-        backend.forward_metadata = self.metadata
-        backend.prefill_graph_inline = True
-        try:
-            yield
-        finally:
-            backend.forward_metadata = source
-            backend.prefill_graph_inline = previous_inline
+        return _capacity_metadata(source, token_capacity, tail_capacity)
+    if target.capacity.token_capacity != token_capacity:
+        raise ValueError("KDA metadata token capacity changed")
+    _refresh_capacity_metadata(target, source)
+    return target
 
 
 def _refresh_capacity_metadata(target, source):

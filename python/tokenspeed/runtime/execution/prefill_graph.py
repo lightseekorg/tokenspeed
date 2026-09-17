@@ -20,8 +20,8 @@
 
 """Breakable CUDA graphs for prefill (extend) forwards.
 
-:class:`PrefillGraph` owns ordinary captures in ``_captures[token_bucket]``
-and optional inline captures in ``_inline_captures[(token_bucket, exact_bs)]``.
+:class:`PrefillGraph` owns captures keyed by ``(token_bucket, exact_bs)``.
+``exact_bs=None`` denotes ordinary segments with eager attention breaks.
 Dummy batches balance tokens across the selected nonempty request count.
 The embedding lookup stays OUTSIDE
 the captured region: graphs start from a static input-embeds buffer, filled at
@@ -48,7 +48,7 @@ the model's eager logits tail.
 from __future__ import annotations
 
 import bisect
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -292,14 +292,11 @@ class PrefillGraph:
         self._engaged_logged: set[str] = set()
         # Aux-capture mode baked into the graphs; mismatched live forwards run eager.
         self._captured_hidden_mode = None
-        # One captured graph + bucket-sized output per padded token bucket.
-        self._captures: dict[int, BreakableCapture] = {}
-        self._outputs: dict[int, CapturedForward] = {}
-        # Captures with supported prefill attention inlined in the prefill graph.
-        # (token capacity, exact BS) -> (capture, outputs, metadata bindings).
-        # Checkpoint request counts are refreshed metadata, not another key.
-        self._inline_captures: dict[
-            tuple[int, int], tuple[BreakableCapture, CapturedForward, list]
+        # One owner for ordinary and attention-containing captures. None is the
+        # batch-independent attention-break variant; integers require exact BS.
+        # Checkpoint counts are refreshed metadata, never another capture key.
+        self._captures: dict[
+            tuple[int, int | None], tuple[BreakableCapture, CapturedForward]
         ] = {}
 
     # ------------------------------------------------------------------
@@ -342,12 +339,12 @@ class PrefillGraph:
         )
         # Seam: backends alloc static buffers or refuse capture; kept
         # outside inference mode (in-place refresh). Base default: no-op.
+        self._captures.clear()
         self.attn_backend.init_prefill_graph_state(
             max_num_tokens=max(self.capture_buckets),
             max_bs=int(self.config.max_num_seqs)
             // max(int(self.config.data_parallel_size), 1),
         )
-        self._inline_captures.clear()
         with maybe_inference_mode():
             self._capture_all_buckets(decode_wrapper)
 
@@ -373,50 +370,58 @@ class PrefillGraph:
             # Breaks record the ambient dummy ctx; it is rebound live at replay.
             try:
                 with active_forward(self._ctx):
-                    self._capture_bucket(bucket, decode_wrapper)
+                    if self.dp_size == 1:
+                        self.attn_backend.prepare_prefill_metadata(
+                            bucket, minimum_bs, self._ctx.forward_mode, capture=False
+                        )
+                    self._captures[bucket, None] = self._capture_bucket(
+                        bucket, decode_wrapper
+                    )
                 # Retain the ordinary graph for mixed/different-count batches.
                 # DP admission must be rank-uniform; keep its existing route.
-                ordinary = self._captures[bucket], self._outputs[bucket]
                 for bs in batch_sizes if self.dp_size == 1 else []:
                     self._ctx = self.make_dummy_batch(bucket, bs)
                     with active_forward(self._ctx):
-                        bindings = self.attn_backend.prepare_prefill_graph_bindings(
-                            bucket
+                        ready = self.attn_backend.prepare_prefill_metadata(
+                            bucket, bs, self._ctx.forward_mode, capture=True
                         )
-                        if not bindings:
+                        if not ready:
                             continue
-                        with ExitStack() as stack:
-                            for binding in bindings:
-                                stack.enter_context(binding.bind(refresh=False))
-                            self._capture_bucket(bucket, decode_wrapper)
-                        self._inline_captures[bucket, bs] = (
-                            self._captures[bucket],
-                            self._outputs[bucket],
-                            bindings,
+                        self._captures[bucket, bs] = self._capture_bucket(
+                            bucket, decode_wrapper
                         )
-                        self._captures[bucket], self._outputs[bucket] = ordinary
             finally:
                 self._ctx = None
         if self.config.global_rank == 0:
-            sample = next(iter(self._captures.values()), None)
+            ordinary = {
+                bucket: value
+                for (bucket, bs), value in self._captures.items()
+                if bs is None
+            }
+            sample = next(iter(ordinary.values()), None)
             logger.info(
                 "prefill breakable graph: captured buckets %s (segments=%d, eager "
                 "attention breaks)",
-                sorted(self._captures),
-                sample.num_segments if sample is not None else 0,
+                sorted(ordinary),
+                sample[0].num_segments if sample is not None else 0,
             )
-            if self._inline_captures:
+            variants = {
+                key: value
+                for key, value in self._captures.items()
+                if key[1] is not None
+            }
+            if variants:
                 logger.info(
                     "prefill inline attention: captured (tokens, requests) %s "
                     "with fixed checkpoint slots "
                     "(segments=%d, ordinary captures retained for fallback)",
-                    sorted(self._inline_captures),
-                    next(iter(self._inline_captures.values()))[0].num_segments,
+                    sorted(variants),
+                    next(iter(variants.values()))[0].num_segments,
                 )
 
     def _capture_bucket(
         self, bucket: int, decode_wrapper: ForwardStepRunner | None
-    ) -> None:
+    ) -> tuple[BreakableCapture, CapturedForward]:
         """Warm up and capture the breakable graph for ``bucket`` from the buffers."""
         for _ in range(self.num_warmup):
             self._run_inner(bucket)
@@ -424,11 +429,11 @@ class PrefillGraph:
         stream = decode_wrapper.stream if decode_wrapper is not None else None
         cap = BreakableCapture(pool=self._pool, stream=stream)
         with cap:
-            self._outputs[bucket] = CapturedForward(*self._run_inner(bucket))
+            output = CapturedForward(*self._run_inner(bucket))
         if self._pool is None:
             self._pool = cap.pool  # share the pool across all subsequent buckets
         cap.replay()  # capture records kernels without executing; smoke-test replay
-        self._captures[bucket] = cap
+        return cap, output
 
     def _run_inner(self, num_tokens: int):
         """Run the inner model over the leading ``num_tokens`` of the static buffers.
@@ -685,18 +690,15 @@ class PrefillGraph:
                 ib.mrope_positions_buf[:, num_tokens:bucket].zero_()
             else:
                 ib.positions_buf[num_tokens:bucket].zero_()
-        cap, output = self._captures[bucket], self._outputs[bucket]
-        with ExitStack() as stack:
-            if self.attn_backend.step_counter is None:
-                inline = self._inline_captures.get((bucket, ctx.bs))
-                if inline is not None and all(
-                    binding.compatible(ctx) for binding in inline[2]
-                ):
-                    cap, output, bindings = inline
-                    for binding in bindings:
-                        stack.enter_context(binding.bind(refresh=True))
-            with self._padded_to(ctx, bucket):
-                cap.replay(valid_rows=num_tokens)
+        cap, output = self._captures[bucket, None]
+        if self.dp_size == 1 and self.attn_backend.step_counter is None:
+            ready = self.attn_backend.prepare_prefill_metadata(
+                bucket, ctx.bs, ctx.forward_mode, capture=False
+            )
+            if ready:
+                cap, output = self._captures.get((bucket, ctx.bs), (cap, output))
+        with self._padded_to(ctx, bucket):
+            cap.replay(valid_rows=num_tokens)
         hidden_states, aux_hidden_states = output.sliced(num_tokens)
         # The eager logits tail of BaseCausalLM.forward, on the replayed hidden states.
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
@@ -737,7 +739,7 @@ class PrefillGraph:
         if ctx.capture_hidden_mode != self._captured_hidden_mode:
             return None
         bucket = self._select_bucket(ctx)
-        if bucket is None or bucket not in self._captures:
+        if bucket is None or (bucket, None) not in self._captures:
             return None
         return bucket
 
