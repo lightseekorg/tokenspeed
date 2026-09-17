@@ -22,7 +22,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     CacheRuntimeContract,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
-    v4_c4_state_window,
     v4_compressed_kv_spec,
     v4_compressor_state_spec,
     v4_indexer_kv_spec,
@@ -36,21 +35,20 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 )
 
 
-def build_v4_cache_specs(hf_config, *, layer_ratio, decode_input_tokens=1):
+def build_v4_cache_specs(hf_config, *, layer_ratio):
     """The spec set a ratio vector declares, in the recipe's own order.
 
     The recipe reaches for these constructors one group at a time as it walks
     layers; here the whole set is what is under test.
     """
     ratios = {int(ratio) for ratio in layer_ratio}
-    window = v4_c4_state_window(decode_input_tokens)
     specs = [v4_swa_kv_spec(hf_config)]
     for ratio in sorted(r for r in ratios if r > 1):
-        specs.append(v4_compressor_state_spec(ratio, c4_state_window=window))
+        specs.append(v4_compressor_state_spec(ratio))
         specs.append(v4_compressed_kv_spec(ratio))
     if 4 in ratios:
         specs.append(v4_indexer_kv_spec())
-        specs.append(v4_indexer_state_spec(c4_state_window=window))
+        specs.append(v4_indexer_state_spec())
     return tuple(specs)
 
 
@@ -468,25 +466,18 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         Scheduler(config)
         self.assertEqual(aligned_max_scheduled_tokens(8192, groups), 8192)
 
-    def test_c4_state_window_covers_wide_verify_blocks(self):
-        base = build_v4_cache_specs(
+    def test_c4_state_window_is_the_kernel_read_window(self):
+        """The ratio-4 compress kernel reads eight positions (two groups) when a
+        position completes a group; the verify rows of that step are written in
+        the same forward, so no verify width widens the retained window."""
+        specs = build_v4_cache_specs(
             SimpleNamespace(sliding_window=128),
-            layer_ratio=(4,),
+            layer_ratio=(4, 128),
         )
-        wide = build_v4_cache_specs(
-            SimpleNamespace(sliding_window=128),
-            layer_ratio=(4,),
-            decode_input_tokens=6,
-        )
-
-        base_windows = {spec.group_id: spec.sliding_window_tokens for spec in base}
-        wide_windows = {spec.group_id: spec.sliding_window_tokens for spec in wide}
-        for group_id in (
-            "v4.c4a.compressor_state",
-            "v4.c4a.indexer_compressor_state",
-        ):
-            self.assertEqual(base_windows[group_id], 8)
-            self.assertEqual(wide_windows[group_id], 10)
+        windows = {spec.group_id: spec.sliding_window_tokens for spec in specs}
+        self.assertEqual(windows["v4.c4a.compressor_state"], 8)
+        self.assertEqual(windows["v4.c4a.indexer_compressor_state"], 8)
+        self.assertEqual(windows["v4.c128a.compressor_state"], 128)
 
     def test_lcm_capacity_is_the_inverse_of_parent_demand(self):
         layout = SimpleNamespace(
