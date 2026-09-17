@@ -545,6 +545,10 @@ Its responsibilities:
   computed blocks into the prefix indexes for later requests. Prefix-closed
   groups match first; non-closed groups (SWA, Mamba) match only within the
   boundary the closed groups settled (`match_order_` enforces this).
+  For Mamba-state groups, `CacheCompletedBlocks` publishes only explicitly
+  listed materialized boundaries inside the newly hashed range; an empty list
+  publishes no state snapshots (see
+  [Scheduler §1.2](scheduler.md#12-state-checkpoints-one-forward)).
   Replayable groups are outside `match_order_` and skip publication on both
   tiers — never registered, never streamed to Host, never counted by
   `DeviceBoundaryResidency` — because their rows are approximations the
