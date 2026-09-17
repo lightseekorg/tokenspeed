@@ -661,6 +661,7 @@ phase, including its explicit server-argument override.
 This runs on every PP stage even when that stage has no executing drafter.
 `wire_target` only binds embeddings, heads and other execution resources; it
 never selects capture layers, changes streams or replaces the output layout.
+This also applies to V4.1's dedicated drafter with scheduler-owned context windows.
 There is no configured flag or optional-method probe in resource binding.
 A last pipeline stage borrows its local draft embedding when the target
 embedding lives elsewhere; this is resource binding, not a different proposal

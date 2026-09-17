@@ -4259,7 +4259,7 @@ TEST(BoundedReplayCoordinator, ReplayableGroupNeverPublishesOrStreams) {
          {CacheBoundaryKind::kChunk, CacheBoundaryKind::kEndpoint, CacheBoundaryKind::kPromoted}) {
         coord.CacheCompletedBlocks(tables, hashes, NextTestAccessEpoch(), /*first_new_prefix_page=*/0,
                                    /*num_computed_tokens=*/16, kind, /*stream_completed_to_host=*/true,
-                                   /*materialized_state_boundary_tokens=*/0);
+                                   /*materialized_state_boundaries=*/{});
     }
     EXPECT_EQ(coord.GroupPrefixIndex(0).NumEntries(pool), 4);
     EXPECT_EQ(coord.GroupPrefixIndex(1).NumEntries(pool), 0);

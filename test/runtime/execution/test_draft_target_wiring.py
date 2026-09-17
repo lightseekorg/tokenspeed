@@ -35,6 +35,9 @@ from tokenspeed.runtime.execution.drafter.base import BaseDrafter  # noqa: E402
 from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import (  # noqa: E402
     DeepseekV4DSpark,
 )
+from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (  # noqa: E402
+    DeepseekV41DSpark,
+)
 from tokenspeed.runtime.execution.drafter.dflash import DFlash  # noqa: E402
 from tokenspeed.runtime.execution.drafter.dspark import DSpark  # noqa: E402
 from tokenspeed.runtime.execution.drafter.eagle import Eagle  # noqa: E402
@@ -53,6 +56,9 @@ def test_get_drafter_impl_routing():
     from tokenspeed.runtime.models.deepseek_v4_dspark import (
         DeepseekV4ForCausalLMDSpark,
     )
+    from tokenspeed.runtime.models.deepseek_v41_dspark import (
+        DeepseekV41ForCausalLMDSpark,
+    )
     from tokenspeed.runtime.models.inkling_nextn import (
         InklingForConditionalGenerationNextN,
     )
@@ -70,6 +76,10 @@ def test_get_drafter_impl_routing():
     assert (
         get_drafter_impl("DSPARK", mock.MagicMock(spec=DeepseekV4ForCausalLMDSpark))
         is DeepseekV4DSpark
+    )
+    assert (
+        get_drafter_impl("DSPARK", mock.MagicMock(spec=DeepseekV41ForCausalLMDSpark))
+        is DeepseekV41DSpark
     )
 
 
@@ -587,6 +597,19 @@ def test_deepseek_block_models_configure_capture_through_common_setup(
         ),
         SimpleNamespace(model=draft),
     )
+    target.set_dspark_layers_to_capture.assert_called_once_with([10, 20])
+    target.set_dspark_layers_to_capture.side_effect = AssertionError(
+        "resource binding must not reconfigure capture"
+    )
+    draft.lm_head = object()
+    target.logits_processor = SimpleNamespace(tp_group=(0, 1))
+    drafter_class = DeepseekV4DSpark if family == "v4" else DeepseekV41DSpark
+    drafter = drafter_class.__new__(drafter_class)
+    drafter.draft_model = draft
+    drafter.wire_target(target)
+    assert drafter.target_model is target
+    assert drafter.lm_head is draft.lm_head
+    assert drafter.tp_group == (0, 1)
     target.set_dspark_layers_to_capture.assert_called_once_with([10, 20])
 
 
