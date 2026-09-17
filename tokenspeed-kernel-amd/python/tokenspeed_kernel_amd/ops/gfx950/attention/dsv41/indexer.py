@@ -427,6 +427,8 @@ def run_dsv41_csa2_index_topk(
     from tokenspeed_kernel.ops.attention.dsv41.triton import (
         _index_gather_heads,
         _index_topk_outputs,
+    )
+    from tokenspeed_kernel.ops.attention.dsv41.triton import (
         index_topk as portable_index_topk,
     )
 

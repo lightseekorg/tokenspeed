@@ -34,10 +34,14 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import (
         gluon_dsv41_index_topk_gfx950 as _dsv41_index_topk_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import (
         gluon_dsv41_selected_attention_gfx950 as _dsv41_selected_gfx950,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41 import (
         gluon_dsv41_index_topk_gfx1250 as _dsv41_index_topk_gfx1250,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41 import (
         gluon_dsv41_selected_attention_gfx1250 as _dsv41_selected_gfx1250,
     )
 
