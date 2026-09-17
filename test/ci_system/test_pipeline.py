@@ -603,15 +603,11 @@ def test_server_warmup_precedes_server_and_injects_bundle():
 
     assert [name for name, _ in stages] == ["server.warmup", "server", "eval"]
     assert stages[0][1] == [
-        "rm -rf .ci-artifacts/kernel-warmup && "
         "python3 -m tokenspeed_kernel.warmup "
-        "--config nvidia/flashinfer/model/profile "
-        "--output-dir .ci-artifacts/kernel-warmup --device 0"
+        "--config nvidia/flashinfer/model/profile --device 0 --force"
     ]
     assert stages[1][1]["command"] == "ts serve --model example/model"
-    assert get_server_warmup_env(task) == {
-        "TOKENSPEED_KERNEL_WARMUP_BUNDLE": ".ci-artifacts/kernel-warmup"
-    }
+    assert get_server_warmup_env(task) == {"TOKENSPEED_USE_KERNEL_WARMUP_CACHE": "1"}
 
 
 def test_slurm_execution_only_cleans_its_process_group(monkeypatch, tmp_path):

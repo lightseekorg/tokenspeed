@@ -32,6 +32,7 @@ from tokenspeed_kernel.registry import (
 )
 from tokenspeed_kernel.warmup.bundle import generate_bundle
 from tokenspeed_kernel.warmup.discovery import list_config_ids, load_config
+from tokenspeed_kernel.warmup.load import default_warmup_bundle_path
 from tokenspeed_kernel.warmup.runner import validate_profile
 
 
@@ -85,7 +86,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--output-dir",
         metavar="PATH",
-        help="Output directory for a generated warmup bundle",
+        help="Override the default bundle location under FlashInfer's cache",
     )
     parser.add_argument(
         "--force",
@@ -102,9 +103,6 @@ def main(argv: list[str]) -> int:
         args.output_dir is not None or args.force or args.device is not None
     ):
         parser.error("--output-dir, --force, and --device require --config")
-    if args.config is not None and args.output_dir is None:
-        parser.error("--config requires --output-dir")
-
     if args.list_configs:
         for config_id in list_config_ids():
             print(config_id)
@@ -153,9 +151,14 @@ def main(argv: list[str]) -> int:
         return 0
 
     if generation_config is not None:
+        output_dir = (
+            args.output_dir
+            if args.output_dir is not None
+            else str(default_warmup_bundle_path())
+        )
         output = generate_bundle(
             loaded=generation_config,
-            output_dir=args.output_dir,
+            output_dir=output_dir,
             force=args.force,
             platform=current_platform(),
             command=("python", "-m", "tokenspeed_kernel.warmup", *argv),

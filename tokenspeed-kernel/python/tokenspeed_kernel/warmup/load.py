@@ -27,7 +27,11 @@ from pathlib import Path
 
 from tokenspeed_kernel.ops.tuning import set_autotune_max_num_tokens
 
-__all__ = ["LoadedWarmupBundle", "load_warmup_bundle"]
+__all__ = [
+    "LoadedWarmupBundle",
+    "default_warmup_bundle_path",
+    "load_warmup_bundle",
+]
 
 
 @dataclass(frozen=True)
@@ -37,6 +41,11 @@ class LoadedWarmupBundle:
     source_sha256: str
     maximum_num_tokens: int
     profile_count: int
+
+
+def default_warmup_bundle_path() -> Path:
+    flashinfer_env = importlib.import_module("flashinfer.jit.env")
+    return Path(flashinfer_env.FLASHINFER_CACHE_DIR) / "tokenspeed" / "warmup"
 
 
 def _object(value: object, context: str) -> dict[str, object]:

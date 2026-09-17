@@ -95,8 +95,7 @@ ISOLATED_JIT_CACHE_RUNNER_PREFIXES = (
 )
 NVIDIA_GPU_CLEANUP_RUNNER_PREFIXES = ("gb200", "b300")
 PERF_DIAGNOSTIC_RUNNERS = ("b300-4gpu",)
-KERNEL_WARMUP_BUNDLE_DIR = ".ci-artifacts/kernel-warmup"
-KERNEL_WARMUP_BUNDLE_ENV = "TOKENSPEED_KERNEL_WARMUP_BUNDLE"
+KERNEL_WARMUP_CACHE_ENV = "TOKENSPEED_USE_KERNEL_WARMUP_CACHE"
 
 
 def is_amd_runner(runner: str) -> bool:
@@ -1706,7 +1705,7 @@ def stop_server(process: subprocess.Popen[str] | None) -> None:
 def get_server_warmup_env(task: Dict[str, Any]) -> Dict[str, str]:
     if (task.get("server") or {}).get("warmup_config") is None:
         return {}
-    return {KERNEL_WARMUP_BUNDLE_ENV: KERNEL_WARMUP_BUNDLE_DIR}
+    return {KERNEL_WARMUP_CACHE_ENV: "1"}
 
 
 def get_stage_commands(task: Dict[str, Any]) -> List[tuple[str, Any]]:
@@ -1740,10 +1739,8 @@ def get_stage_commands(task: Dict[str, Any]) -> List[tuple[str, Any]]:
         warmup_config = server.pop("warmup_config", None)
         if warmup_config is not None:
             warmup_command = (
-                f"rm -rf {shlex.quote(KERNEL_WARMUP_BUNDLE_DIR)} && "
                 "python3 -m tokenspeed_kernel.warmup "
-                f"--config {shlex.quote(warmup_config)} "
-                f"--output-dir {shlex.quote(KERNEL_WARMUP_BUNDLE_DIR)} --device 0"
+                f"--config {shlex.quote(warmup_config)} --device 0 --force"
             )
             stages.append(("server.warmup", [warmup_command]))
         if server.get("command"):

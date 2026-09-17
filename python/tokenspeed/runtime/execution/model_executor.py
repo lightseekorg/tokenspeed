@@ -28,7 +28,10 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.tuning import set_autotune_max_num_tokens
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.warmup import load_warmup_bundle
+from tokenspeed_kernel.warmup import (
+    default_warmup_bundle_path,
+    load_warmup_bundle,
+)
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.configs.utils import get_rope_parameters
@@ -269,7 +272,11 @@ class ModelExecutorConfig:
             global_rank=global_rank,
             cudagraph_capture_sizes=server_args.cudagraph_capture_sizes,
             disable_cuda_graph_padding=server_args.disable_cuda_graph_padding,
-            kernel_warmup_bundle=envs.TOKENSPEED_KERNEL_WARMUP_BUNDLE.get(),
+            kernel_warmup_bundle=(
+                str(default_warmup_bundle_path())
+                if envs.TOKENSPEED_USE_KERNEL_WARMUP_CACHE.get()
+                else None
+            ),
             enable_cudagraph_gc=server_args.enable_cudagraph_gc,
             max_cudagraph_capture_size=server_args.max_cudagraph_capture_size,
             disable_prefill_graph=disable_prefill_graph,
