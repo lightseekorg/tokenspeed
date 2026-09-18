@@ -16,7 +16,13 @@ A prompt is prefilled in chunks bounded by `max_scheduled_tokens`
 scheduled, never for the whole prompt**: `schedulePrefill` /
 `schedulePrefillFirstChunk` build one `GroupDemand` per cache group sized by
 this chunk's tokens, and the coordinator either grants the pages or the
-request stays put.
+request stays put. Alongside the demands, one `RequestProgress` per request
+carries what it computed since its previous admission — the prefix pages
+just completed and its computed-token count — which the coordinator publishes
+and reclaims inside the same `Admit` (`advanceRequestProgress` in
+`scheduler/operations/forward.cpp` is the one place that hashes those pages
+and builds it; see [cache-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)
+for why publication rides with admission).
 
 Two adjustments ride on top of the raw chunk size. Both are pure token
 arithmetic kept out of the planner: how a chunk is cut lives in
@@ -166,16 +172,20 @@ The capacity guarantees are retention-specific:
 ### 1.3 Bounded replay
 
 A sliding History group can be declared **replayable** (`CacheGroupConfig::
-replay_window_tokens`, see [Cache concepts](cache-concepts.md)): it leaves
+replayable`, see [Cache concepts](cache-concepts.md)): it leaves
 prefix caching entirely — never matched, published or streamed — and the
 model regenerates its rows from **re-fed prompt tokens**. DeepSeek V4.1's SWA
 rows and compressor tails are the motivating case: caching them persistently
 costs more than recomputing a bounded window, and the prefix hit should
-depend on the global KV alone.
+depend on the global KV alone. What a hit re-feeds is the group's whole
+retention window: retention keeps exactly what the queries after the hit
+read, and every page the group retains must be regenerated, so there is no
+second number to declare.
 
 The cache facts live on the `CacheCoordinator`, next to the specs they
-derive from: `ReplayWindowTokens()` (`W`, the largest declared window) and
-`ReplayTokens(P)` (`min(W, P)`, what a hit at `P` must re-feed). The
+derive from: `ReplayWindowTokens()` (`W`, the largest `sliding_window_tokens`
+over the replayable groups) and `ReplayTokens(P)` (`min(W, P)`, what a hit at
+`P` must re-feed). The
 scheduling rules live with the other chunk-cutting rules in
 `scheduler/operations/prefill_chunk.h`; the forward planner never branches on
 replay — the two decisions below reach the common path only through
@@ -233,10 +243,8 @@ PD: a replayable group travels like any sliding-window group. The prefill
 role replays on its own local hits exactly as the fused role does and, at
 completion, transfers the group's retained tail (`full_suffix` selects the
 pages intersecting the last `sliding_window_tokens − 1` positions). Every
-page of that tail must exist, so on the P and D roles `Validate` requires
-`replay_window_tokens == sliding_window_tokens`: the regenerated suffix then
-starts at or before the tail (a hit re-feeds the whole retention window, not
-just the attention window). The decode role computes no prompt rows, so
+page of that tail exists because a hit re-feeds the whole retention window:
+the regenerated suffix starts at or before the tail. The decode role computes no prompt rows, so
 `SchedulePrefillFirstChunkEvent` gives a remote prefill `replay = 0` and
 `Admit` leaves a demand that already names the landing's sparse suffix
 alone; the landed tail is what the first decode steps read, with no
@@ -245,13 +253,40 @@ regeneration anywhere.
 ### 1.4 What bounds a single request
 
 `MaxSingleRequestTokens` is a **startup** bound computed by binary search over
-`singleRequestLcmBlocksRequired`: the largest prompt whose worst-case working
-set — aligned checkpoint + final continuation state, decode reserve,
-overlap-depth protection, the state growth block, and for chunked sparse local
-recovery the retained input checkpoint (and, with the prefix cache on, a first
-chunk's cached one) — fits the pool. It is not a live
-check against currently free capacity; a prompt within the bound can still fail
-admission right now and simply waits.
+`CapacityModel::SingleRequestGroupPages` (`csrc/scheduler/capacity_model.h`):
+the largest prompt whose worst-case working set — aligned checkpoint + final
+continuation state, decode reserve, overlap-depth protection, the state growth
+block, and for chunked sparse local recovery the retained input checkpoint
+(and, with the prefix cache on, a first chunk's cached one) — fits the pool.
+It is not a live check against currently free capacity; a prompt within the
+bound can still fail admission right now and simply waits.
+
+The `CapacityModel` is deliberately **config-only**: it reads every
+`SchedulerConfig` field that is known before a pool exists and no
+`total_pages`, validating that subset through
+`SchedulerConfig::ValidateCapacityInputs()`. That is what lets the Python
+recipes size a pool from the same model before the arena is allocated
+(`recipes/scheduler_bridge.py` builds an unsized config and asks
+`ConcurrentGroupPages(max_total_tokens, max_context_len)` for each group's
+demand at `max_batch_size` live requests), and then lets the `Scheduler`
+bound requests against the pool they sized. The per-request working set —
+`decode_width + overlap_schedule_depth * decode_width` protected tokens,
+`SnapshotStateReserveTokens`, a group's prefix-match lookback (the same
+`PrefixMatcher` the coordinator builds, via `MakePrefixMatcher`) — exists in
+that one file; neither side restates it. The two answers are tied by an
+invariant the model's tests sweep: for one live request of `L` tokens,
+`ConcurrentGroupPages(L, L)` is never below `SingleRequestGroupPages(L)` in
+any group, so a pool sized for the configured concurrency admits every
+request the bound accepts.
+
+Per group, `ConcurrentGroupPages` charges: a snapshot-state group its
+single-request peak once per live request (the working set does not grow
+with history); a prefix-closed history group `ceil(T / g)` dense pages plus,
+per request, `ceil((g - 1 + protected) / g)` for the unaligned tail and the
+protected tokens that may spill past it; a sliding group, per request,
+`ceil((min(W - 1, ctx) + decode_width + protected + g - 1) / g)` resident
+pages, plus one in-flight prefill chunk behind its lookback (or, on the
+decode role, the landing bound `min(dense, lookback + window)` per request).
 
 For an internal checkpoint followed by `tail` tokens, the forward holds
 both the tail and the ordinary growth reserve: the output working set is

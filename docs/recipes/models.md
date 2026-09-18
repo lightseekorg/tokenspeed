@@ -960,8 +960,8 @@ prompts and package/model revisions.
 
 DeepSeek V4.1 (`deepseek_v41`) is served by its own FlatKV attention backend
 with a four-group KV cache: the global KV chains, the SWA rows and the
-compressor tails. The recipe declares the last two **replayable**
-(`replay_window_tokens`): they never enter the prefix cache, and a prefix
+compressor tails. The recipe declares the last two **replayable**: they
+never enter the prefix cache, and a prefix
 hit re-feeds the cached prefix's last 128 tokens so the model regenerates
 them into the request's own pages (SWA bounded replay,
 [`docs/design/scheduler.md` §1.3](../design/scheduler.md#13-bounded-replay)).
@@ -994,8 +994,9 @@ tokenspeed serve deepseek-ai/DeepSeek-V4.1-Flash \
 
 Add `--speculative-algorithm DSPARK` for same-checkpoint DSpark decoding;
 the draft seeds its context windows from the decoder's kept rows. A hit
-re-feeds the groups' whole retention window (the 128-token attention window
-plus the admission protection, a few verify widths); the scheduler requires
+re-feeds the groups' whole retention window, which is exactly the 128-token
+attention window (the compressor-tail group retains its unfinished pair the
+same way); the scheduler requires
 `--chunked-prefill-size` of at least that window plus one prefix page and
 never leaves a prompt's final chunk shorter than it. The replayed rows attend
 SWA keys from the replay start only, the truncation the model is trained
@@ -1006,6 +1007,35 @@ Under prefill/decode disaggregation the prefill node replays on its own
 prefix hits exactly as above and ships each group's retained tail; the
 decode node lands the tail and never re-feeds. Even on one machine, let
 Mooncake pick an RDMA transport rather than forcing the intra-node NVLink one.
+
+### GB300 Slurm 1P1D CI
+
+[`deepseek-v4.1-flash-pd-1p1d-dspark-evalscope-gsm8k-gb300-slurm.yaml`](../../test/ci/eval/deepseek-v4.1-flash-pd-1p1d-dspark-evalscope-gsm8k-gb300-slurm.yaml)
+runs one TP4 prefill engine and one TP4 decode engine on two four-GPU nodes.
+Node 0 also hosts the SMG gateway and the Slurm evaluation client, which
+connects to `127.0.0.1:8000`. Both engines use same-checkpoint DSpark,
+`mega_moe` with expert parallelism on Blackwell, host-resident Engram tables,
+and Mooncake transfer after the completed prompt (`layerwise-interval=0`).
+Decode prefix caching is disabled; the gateway uses `deepseek_v31` reasoning
+parsing. The 262144-token cache budget limits admission independently of the
+32768-token per-request context and 16-sequence cap.
+
+The gate checks GSM8K accuracy of at least 0.90 on 100 samples with EvalScope
+1.11.1, greedy decoding, concurrency 8, and up to 30000 generated tokens.
+It participates in the GB300 Slurm per-commit workflow. To run only this case,
+select its YAML in **Slurm Dispatch**, choose cluster `gb300`, and optionally
+provide a pull request number.
+
+The launcher uses `PD_SLURM=1` to assign one role per node and clears Slurm
+topology discovery only inside each worker process. Its job-and-step-scoped
+artifact directory must be shared between nodes. It publishes role readiness
+atomically and verifies cross-node gRPC health before starting the gateway.
+Worker logs remain separate as `prefill.log`, `decode.log`, and `lb.log`.
+Set `DISAGGREGATION_IB_DEVICE` when an explicit RDMA device selection is needed;
+the GB300 task selects `mlx5_0,mlx5_1,mlx5_2,mlx5_3` to keep transfers on the
+InfiniBand fabric. Automatic discovery also includes Ethernet RNICs, which can
+cause incompatible RoCE/InfiniBand endpoint pairings during the RDMA handshake.
+Without `PD_SLURM=1`, the same launcher retains the single-node smoke topology.
 
 ## Tuning Order
 

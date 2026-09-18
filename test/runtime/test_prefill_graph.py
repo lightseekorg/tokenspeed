@@ -50,6 +50,7 @@ def _spec(
             family="state",
             checkpoint_granularity=block_granularity,
             sliding_window_tokens=sliding_window_tokens,
+            replayable=False,
         )
     return CacheGroupSpec(
         group_id=group_id,
@@ -58,6 +59,7 @@ def _spec(
         rows_per_page=block_granularity,
         entry_stride_tokens=1,
         sliding_window_tokens=sliding_window_tokens,
+        replayable=False,
     )
 
 

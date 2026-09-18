@@ -18,9 +18,11 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.glm53_flash import (
     GLM53_FLASH_LOGICAL_BLOCK_TOKENS,
     Glm53FlashPoolOptions,
     Glm53FlashRecipe,
-    glm53_flash_parents_needed,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheLayout, pack
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
+    capacity_model,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
@@ -100,6 +102,8 @@ def _recipe(
         server_args=SimpleNamespace(
             max_total_tokens=None,
             chunked_prefill_size=8192,
+            disaggregation_mode="null",
+            enable_prefix_caching=True,
             speculative_algorithm="MTP" if draft_layers else None,
             speculative_num_draft_tokens=3,
         ),
@@ -239,18 +243,44 @@ def test_disaggregated_serving_requires_private_tail_transfer_bridge() -> None:
 
 
 def test_lcm_parent_demand_uses_per_group_packing() -> None:
-    layout = _layout(
-        tp_size=8,
-        mla_cache_dtype=torch.float8_e4m3fn,
+    recipe = _recipe(tp_size=8, mla_cache_dtype=torch.float8_e4m3fn)
+    groups = recipe.groups()
+    layout = pack(
+        groups,
+        prefix_granularity=recipe.prefix_granularity,
+        cache_blocks_per_lcm_block=recipe.packing(groups),
+        alignment=recipe.alignment,
+        max_padding_fraction=recipe.max_padding_fraction,
     )
-    sizing = dict(
-        max_scheduled_tokens=8_192,
-        max_live_requests=1,
-        decode_input_tokens=1,
-        overlap_schedule_depth=0,
-    )
+    packing = dict(layout.group_packing)
+    token_capacity = 131_072
 
-    assert glm53_flash_parents_needed(layout, token_capacity=131_072, **sizing) == 501
+    # The scheduler's model sizes every group; the recipe folds each group's
+    # pages into parents by its own packing rather than a flat product.
+    model = capacity_model(
+        recipe._group_specs,
+        prefix_granularity=layout.prefix_granularity,
+        virtual_packing=packing,
+        limits=recipe.scheduler_limits,
+    )
+    pages = dict(
+        zip(
+            (spec.group_id for spec in recipe._group_specs),
+            model.concurrent_group_pages(
+                max_total_tokens=token_capacity, max_context_len=4096
+            ),
+        )
+    )
+    # Dense MLA history plus one unaligned tail page per live request; each
+    # linear-attention state group holds its fixed per-request working set.
+    assert pages[FULL_ATTENTION] == 131_072 // 64 + 16
+    state_ids = [
+        spec.group_id for spec in recipe._group_specs if spec.family == "state"
+    ]
+    assert state_ids and all(pages[gid] == 16 * 4 for gid in state_ids)
+    expected = sum(-(-pages[gid] // packing[gid]) for gid in pages)
+    assert expected == recipe.parents_needed(layout, token_capacity)
+    assert expected != sum(pages.values()) // max(packing.values())
 
 
 @pytest.mark.parametrize("budget_slack", [0, 100])
@@ -263,13 +293,10 @@ def test_lcm_parent_budget_preserves_heterogeneous_group_demand(
         draft_layers=1,
     )
     token_limit = 131_072
-    expected = glm53_flash_parents_needed(
+    expected = CacheRecipe.parents_needed(
+        _recipe(tp_size=4, mla_cache_dtype=torch.bfloat16, draft_layers=1),
         layout,
-        token_capacity=token_limit,
-        max_scheduled_tokens=8_192,
-        max_live_requests=16,
-        decode_input_tokens=2,
-        overlap_schedule_depth=1,
+        token_limit,
     )
     budgeted = expected + budget_slack
 

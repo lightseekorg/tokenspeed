@@ -53,7 +53,7 @@ if current_platform().is_amd:
             "intermediate_size": frozenset({3072}),
             "shared_size": frozenset({768}),
             "output_size": frozenset({7168}),
-            "linear_weights": frozenset({True}),
+            "linear_weights": frozenset({True, False}),
             "inputs_contiguous": frozenset({True}),
         },
     )

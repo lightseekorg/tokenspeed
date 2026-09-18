@@ -444,6 +444,7 @@ class MooncakeKVReceiver:
         self.kv_mgr.expected_prefill_ranks_table.pop(self.bootstrap_room, None)
         self.kv_mgr.bootstrap_token_table.pop(self.bootstrap_room, None)
         self.kv_mgr.spec_candidate_ids_table.pop(self.bootstrap_room, None)
+        self.kv_mgr.cached_tokens_table.pop(self.bootstrap_room, None)
         self.kv_mgr._pending_bootstrap_token_table.pop(self.bootstrap_room, None)
         self.kv_mgr._pending_spec_candidate_ids_table.pop(self.bootstrap_room, None)
         with self.kv_mgr.failure_lock:

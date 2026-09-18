@@ -2975,21 +2975,27 @@ TEST(CacheProgressTest, StateBoundariesRecordAtLandingAndSurviveFailedAdmission)
     fsm::CacheProgress staged = resources.cache_progress;
     staged.prefix_hashes = {"h4", "h8", "h12"};
     GroupDemand demand{
-        .table = &tables[0],
-        .num_tokens = 128,  // fails before either publication or reclamation
-        .prefix_hashes = staged.prefix_hashes,
-        .new_prefix_hash_begin = 0,
-        .completed_boundary_kind = CacheBoundaryKind::kChunk,
-        .num_computed_tokens = 13,
-        .materialized_state_boundaries = staged.materialized_state_boundaries,
+        .table = &tables[0], .extent = DenseGrowth{128},  // fails before either publication or reclamation
     };
-    EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), std::span{&demand, 1}, admission->access_epoch));
+    const RequestProgress progress{
+        .completed_pages =
+            CompletedPages{
+                .prefix_hashes = staged.prefix_hashes,
+                .first_new_prefix_page = 0,
+                .boundary_kind = CacheBoundaryKind::kChunk,
+                .materialized_state_boundaries = staged.materialized_state_boundaries,
+            },
+        .num_computed_tokens = 13,
+    };
+    EXPECT_FALSE(
+        coordinator.Admit(coordinator.ProbePrefix({}), std::span{&demand, 1}, progress, admission->access_epoch));
     EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 0);
     EXPECT_TRUE(resources.cache_progress.prefix_hashes.empty());
     EXPECT_EQ(resources.cache_progress.materialized_state_boundaries, (std::vector<std::int32_t>{4, 8, 16}));
 
-    demand.num_tokens = 0;
-    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), std::span{&demand, 1}, admission->access_epoch));
+    demand.extent = DenseGrowth{0};
+    ASSERT_TRUE(
+        coordinator.Admit(coordinator.ProbePrefix({}), std::span{&demand, 1}, progress, admission->access_epoch));
     staged.DiscardHashedStateBoundaries(4);
     resources.cache_progress = std::move(staged);
     EXPECT_EQ(resources.cache_progress.materialized_state_boundaries, (std::vector<std::int32_t>{16}));
@@ -3111,7 +3117,7 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
     request.Apply(fsm::BootstrappedEvent{});
     std::vector<BlockTable> tables(coordinator.NumGroups());
     const std::optional<CacheCoordinator::AdmissionResult> admission =
-        AdmitForTest(coordinator, tables, GroupDemand{.num_tokens = 4, .reserve_tokens = 3});
+        AdmitForTest(coordinator, tables, GroupDemand{.extent = DenseGrowth{4}, .reserve_tokens = 3});
     ASSERT_TRUE(admission);
 
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{/*tokens_this_round=*/4,
@@ -3141,7 +3147,7 @@ TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) 
     Request request{spec, /*prefix_granularity=*/2, Role::kD};
     request.Apply(fsm::BootstrappedEvent{});
     std::vector<BlockTable> tables(coordinator.NumGroups());
-    auto admission = AdmitForTest(coordinator, tables, GroupDemand{.num_tokens = 4, .reserve_tokens = 1});
+    auto admission = AdmitForTest(coordinator, tables, GroupDemand{.extent = DenseGrowth{4}, .reserve_tokens = 1});
     ASSERT_TRUE(admission);
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{
         /*tokens_this_round=*/4,
@@ -3167,8 +3173,8 @@ TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) 
     EXPECT_EQ(device_pool.NumEmptyLcmBlocks(), device_pool.NumLcmBlocks());
 
     std::vector<BlockTable> recovery_tables(coordinator.NumGroups());
-    auto recovery_admission = AdmitForTest(coordinator, recovery_tables,
-                                           GroupDemand{.num_tokens = request.PrefillSize(), .reserve_tokens = 1});
+    auto recovery_admission = AdmitForTest(
+        coordinator, recovery_tables, GroupDemand{.extent = DenseGrowth{request.PrefillSize()}, .reserve_tokens = 1});
     ASSERT_TRUE(recovery_admission);
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{
         request.PrefillSize(),
@@ -3326,7 +3332,9 @@ TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
-                                 .num_tokens = 1,
+                                 .extent = DenseGrowth{1},
+                             },
+                             RequestProgress{
                                  .num_computed_tokens = 4,
                              }));
 
@@ -3337,7 +3345,9 @@ TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     // N=5; keys [2,5] -> page 0 out: slot 0 punched, slot 1 kept.
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
-                                 .num_tokens = 1,
+                                 .extent = DenseGrowth{1},
+                             },
+                             RequestProgress{
                                  .num_computed_tokens = 5,
                              }));
     EXPECT_TRUE(swa_slot_null(0));
@@ -3347,7 +3357,9 @@ TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     const std::int32_t free_before = pool.NumEmptyLcmBlocks();
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
-                                 .num_tokens = 1,
+                                 .extent = DenseGrowth{1},
+                             },
+                             RequestProgress{
                                  .num_computed_tokens = 6,
                              }));
     EXPECT_FALSE(swa_slot_null(1)) << "key 3 of the pending query lives in page 1; freeing it is the off-by-one";
@@ -3357,7 +3369,9 @@ TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     // N=7; keys [4,7] -> page 1 fully out, punched exactly now.
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
-                                 .num_tokens = 1,
+                                 .extent = DenseGrowth{1},
+                             },
+                             RequestProgress{
                                  .num_computed_tokens = 7,
                              }));
     EXPECT_TRUE(swa_slot_null(1));
@@ -4951,8 +4965,8 @@ TEST_F(ChunkedHostHitSuite, ChunkedPrefillAfterHostHit) {
 // ---------------------------------------------------------------------------
 // Bounded replay: the sliding groups leave prefix caching; a prefix hit
 // re-feeds the replay window before it, and no prompt's final chunk is left
-// shorter than the window. P=8 tokens; full g=8 (closed), swa g=4 window 24
-// replay 16, tail g=2 window 4 replay 2; budget 64.
+// shorter than the window. P=8 tokens; full g=8 (closed), replayable swa g=4
+// window 16 and tail g=2 window 2; budget 64.
 // ---------------------------------------------------------------------------
 class BoundedReplaySuite : public SchedulerTestSuite {
 protected:
@@ -4977,12 +4991,12 @@ protected:
 
         CacheGroupConfig swa = MakeGroup("swa", /*block_granularity=*/4, cfg.device_allocator.total_pages,
                                          CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
-                                         /*sliding_window_tokens=*/24);
-        swa.replay_window_tokens = kReplayWindow;
+                                         /*sliding_window_tokens=*/kReplayWindow);
+        swa.replayable = true;
         CacheGroupConfig tail = MakeGroup("tail", /*block_granularity=*/2, cfg.device_allocator.total_pages,
                                           CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
-                                          /*sliding_window_tokens=*/4);
-        tail.replay_window_tokens = 2;
+                                          /*sliding_window_tokens=*/2);
+        tail.replayable = true;
         cfg.cache_groups = {
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
@@ -5253,11 +5267,6 @@ protected:
         cfg.role = RoleUnderTest();
         for (CacheGroupConfig& group : cfg.cache_groups) {
             group.transfer_policy = CacheTransferPolicy::FullSuffix;
-            // The shipped tail is the whole retention window, so the prefill
-            // role regenerates all of it: swa replays 24, tail 4.
-            if (group.replay_window_tokens) {
-                group.replay_window_tokens = group.sliding_window_tokens;
-            }
         }
         return cfg;
     }
@@ -5283,8 +5292,8 @@ TEST_F(BoundedReplayPrefillRoleSuite, LocalHitReplaysAndTheTailIsWhatTransfers) 
     ASSERT_TRUE(PlanOnce().remote_decode.has_value());
 
     // r2 = r1's 32 tokens + 8 new: the closed group hits P=32 and the whole
-    // swa retention window [8, 32) is re-fed, so the tail a decode peer lands
-    // (`full_suffix`: from token 40 - 24 + 1 = 17, page 4) is materialized.
+    // swa retention window [16, 32) is re-fed, so the tail a decode peer lands
+    // (`full_suffix`: from token 40 - 16 + 1 = 25, page 6) is materialized.
     std::vector<std::int32_t> tokens = r1.tokens;
     const std::vector<std::int32_t> tail = MakeTokens(/*count=*/8, /*start=*/901);
     tokens.insert(tokens.end(), tail.begin(), tail.end());
@@ -5294,12 +5303,12 @@ TEST_F(BoundedReplayPrefillRoleSuite, LocalHitReplaysAndTheTailIsWhatTransfers) 
     const ForwardBatch* op = FindForwardBatch(plan);
     ASSERT_NE(op, nullptr);
     ASSERT_EQ(op->request_ids, std::vector<std::string>{"r2"});
-    EXPECT_EQ(op->extend_prefix_lens.at(0), 8);
-    EXPECT_EQ(op->extend_replay_lens.at(0), 24);
-    EXPECT_EQ(op->input_lengths.at(0), 24 + 8);
-    EXPECT_EQ(op->input_ids, Slice(tokens, 8, 40));
-    ExpectHolesThenPages(op->block_tables.at("swa").at(0), /*first_page=*/8 / 4, /*min_pages=*/40 / 4, "swa");
-    ExpectHolesThenPages(op->block_tables.at("tail").at(0), /*first_page=*/8 / 2, /*min_pages=*/40 / 2, "tail");
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 16);
+    EXPECT_EQ(op->extend_replay_lens.at(0), kReplayWindow);
+    EXPECT_EQ(op->input_lengths.at(0), kReplayWindow + 8);
+    EXPECT_EQ(op->input_ids, Slice(tokens, 16, 40));
+    ExpectHolesThenPages(op->block_tables.at("swa").at(0), /*first_page=*/16 / 4, /*min_pages=*/40 / 4, "swa");
+    ExpectHolesThenPages(op->block_tables.at("tail").at(0), /*first_page=*/16 / 2, /*min_pages=*/40 / 2, "tail");
 }
 
 class BoundedReplayDecodeRoleSuite : public BoundedReplayPrefillRoleSuite {
@@ -5318,15 +5327,15 @@ TEST_F(BoundedReplayDecodeRoleSuite, RemoteAdmissionLandsTheRetainedTailAndRepla
     EXPECT_EQ(admission->extend_replay_lens, std::vector<std::int32_t>{0});
     EXPECT_EQ(admission->input_lengths, std::vector<std::int32_t>{40});
     // The closed group lands the whole prompt; the replayable groups land
-    // exactly the tail their retention keeps (swa window 24 -> from token 17,
-    // page 4; tail window 4 -> from token 37, page 18), as any sliding group.
+    // exactly the tail their retention keeps (swa window 16 -> from token 25,
+    // page 6; tail window 2 -> from token 39, page 19), as any sliding group.
     const auto& full_row = admission->block_tables.at("full").at(0);
     ASSERT_GE(full_row.size(), 5u);
     for (std::size_t slot = 0; slot < 5; ++slot) {
         EXPECT_GT(full_row[slot], 0) << "full slot " << slot;
     }
-    ExpectHolesThenPages(admission->block_tables.at("swa").at(0), /*first_page=*/17 / 4, /*min_pages=*/40 / 4, "swa");
-    ExpectHolesThenPages(admission->block_tables.at("tail").at(0), /*first_page=*/37 / 2, /*min_pages=*/40 / 2, "tail");
+    ExpectHolesThenPages(admission->block_tables.at("swa").at(0), /*first_page=*/25 / 4, /*min_pages=*/40 / 4, "swa");
+    ExpectHolesThenPages(admission->block_tables.at("tail").at(0), /*first_page=*/39 / 2, /*min_pages=*/40 / 2, "tail");
     EXPECT_EQ(FindForwardBatch(plan)->request_ids.size(), 0u) << "the peer prefills; nothing runs locally";
 }
 

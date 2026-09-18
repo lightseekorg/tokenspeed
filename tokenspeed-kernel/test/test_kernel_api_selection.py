@@ -303,6 +303,8 @@ def test_builtin_moe_specialized_offsets_are_intentional() -> None:
     registry = KernelRegistry.get()
     expected_offsets = {
         "gluon_mxfp4_dynamic_moe_apply": Priority.SPECIALIZED + 1,
+        # Prefer the coupled MXFP8 bank over the overlapping A16 EP8 plan.
+        "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply": Priority.SPECIALIZED + 1,
         "triton_decode_sigmoid_bias_topk": Priority.SPECIALIZED + 1,
     }
     actual_offsets = {
@@ -2944,15 +2946,15 @@ def test_triton_mxfp4_supports_input_activation_dtype(
             8,
             3072,
             None,
-            "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply",
-            "validate_linear_mxfp4_moe_weights",
+            "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply",
+            "gluon_mxfp4_gfx950_a8w4_situ_ep_weights",
         ),
         (
             8,
             3072,
             "gluon",
-            "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply",
-            "validate_linear_mxfp4_moe_weights",
+            "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply",
+            "gluon_mxfp4_gfx950_a8w4_situ_ep_weights",
         ),
     ],
 )
@@ -3095,7 +3097,7 @@ def test_kimi3_a8_plan_preserves_unclipped_a16_decode(
         topk=16,
         linear_clamp=None,
     )
-    assert not _moe_latent_decode.latent_moe_decode_pipeline_available(
+    assert _moe_latent_decode.latent_moe_decode_pipeline_available(
         *tensors,
         plan,
         topk=16,
@@ -3846,6 +3848,33 @@ _CASES = [
         _attention_dsv4_decode_topk_mxfp4,
         id_suffix="mxfp4",
     ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsv4_decode",
+        "gluon_dsv4_decode_gfx1250",
+        _attention_dsv4_paged_selected_pro_tp8,
+        id_suffix="pro-tp8",
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsv4_decode",
+        "triton_dsv4_decode",
+        _attention_dsv4_paged_selected_pro_tp8_i64,
+        id_suffix="pro-tp8-int64-metadata",
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsv4_decode",
+        "gluon_dsv4_decode_gfx1250",
+        _attention_dsv4_paged_selected_swa_only,
+        id_suffix="swa-only",
+    ),
     *[
         _case(
             _is_hopper_plus_with_flashmla_prefill,
@@ -4052,7 +4081,25 @@ _CASES = [
         "cdna4",
         "attention",
         "dsv4_prefill",
-        "triton_dsv4_prefill",
+        "gluon_dsv4_prefill_gfx950",
+        _attention_dsv4_selected_short,
+        id_suffix="width128",
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsv4_prefill",
+        "gluon_dsv4_prefill_gfx1250",
+        partial(_attention_dsv4_selected, width=640, heads=16),
+        id_suffix="width640",
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsv4_prefill",
+        "gluon_dsv4_prefill_gfx1250",
         _attention_dsv4_selected_short,
         id_suffix="width128",
     ),

@@ -529,5 +529,5 @@ def reject_bounded_replay(extend_replay_lens_cpu: torch.Tensor, node: str) -> No
     if extend_replay_lens_cpu.numel() and bool((extend_replay_lens_cpu != 0).any()):
         raise RuntimeError(
             f"{node} cannot mask bounded-replay rows; its cache groups must not "
-            "declare replay_window_tokens"
+            "be replayable"
         )

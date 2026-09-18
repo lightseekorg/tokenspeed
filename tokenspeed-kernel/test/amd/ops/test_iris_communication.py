@@ -22,6 +22,7 @@
 import math
 import socket
 import sys
+import time
 import traceback
 from dataclasses import replace
 from types import SimpleNamespace
@@ -569,11 +570,14 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             assert state._staged_two_stage_ready_flags is None
         assert state._reduced_output_buf.numel() == producer_direct_max_numel
         if attnres_max_numel:
-            assert state._attnres_input_buf.shape == (
+            assert state._attnres_push_inbox.shape == (
                 2,
+                world_size,
                 attnres_max_numel,
             )
-            assert state._attnres_ready_flags.shape == (
+            assert state._attnres_push_epochs.shape == (attnres_max_rows,)
+            assert state._attnres_push_ready_flags.shape == (
+                2,
                 attnres_max_rows,
                 world_size,
             )
@@ -952,6 +956,7 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
             )
 
         graph = torch.cuda.CUDAGraph()
+        dist.barrier()
         with torch.cuda.graph(graph):
             graph_hidden, graph_residual = allreduce_residual_attnres_combine(
                 local,
@@ -964,10 +969,42 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
                 local_world_size=8,
                 eps=1e-6,
             )
-        graph.replay()
-        torch.cuda.synchronize()
-        torch.testing.assert_close(graph_residual, expected_residual, atol=0, rtol=0)
-        torch.testing.assert_close(graph_hidden, expected_hidden, atol=2e-2, rtol=2e-2)
+        dist.barrier()
+        expected_rank_sum = sum(range(1, 9))
+        for replay, scale in enumerate((2, -3, 5)):
+            local.fill_(scale * (rank + 1) / 128.0)
+            expected_reduced = torch.full_like(
+                local,
+                scale * expected_rank_sum / 128.0,
+            )
+            expected_residual = (residual.float() + expected_reduced.float()).to(
+                torch.bfloat16
+            )
+            expected_hidden = attnres_combine(
+                expected_residual,
+                score_weight,
+                output_weight,
+                1e-6,
+                scratch,
+                torch.empty_like(residual),
+            )
+            dist.barrier()
+            if rank == replay:
+                time.sleep(0.005)
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                graph_residual,
+                expected_residual,
+                atol=0,
+                rtol=0,
+            )
+            torch.testing.assert_close(
+                graph_hidden,
+                expected_hidden,
+                atol=2e-2,
+                rtol=2e-2,
+            )
 
 
 def _run_ar_test(world_size: int) -> None:
