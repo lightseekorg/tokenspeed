@@ -367,7 +367,7 @@ def index_topk(
     score_chunk_size: int,
     process_group: torch.distributed.ProcessGroup | None,
     out: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None,
-    solution: str | None = None,
+    solution: str | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bounded Full/Reindex scoring, Top-K rows, and optional source candidates.
 
@@ -393,7 +393,8 @@ def index_topk(
             collectives. All head contributions are combined before selection.
         out: Four contiguous int32 destinations ([T, topk], [T],
             [T, candidate_topk], [T]), or None to allocate them.
-        solution: Optional kernel solution to force through normal selection.
+        solution: Optional registered implementation restriction. Pass None for
+            automatic kernel selection.
 
     Returns:
         (logical_row_ids, row_lengths, candidate_block_ids, candidate_lengths).
