@@ -83,19 +83,11 @@ def test_common_weight_processing_prepares_every_deepep_solution(
 
 @pytest.mark.parametrize("backend", [None, "none"])
 @pytest.mark.parametrize("with_preprocessor", [False, True])
-def test_non_deepep_plans_do_not_acquire_or_import_deepep(
+def test_non_deepep_plans_do_not_prepare_a_buffer(
     monkeypatch, backend, with_preprocessor
 ):
-    import builtins
-
-    original_import = builtins.__import__
-
-    def guarded_import(name, *args, **kwargs):
-        if name == "tokenspeed_kernel.ops.communication.deep_ep":
-            raise AssertionError("non-DeepEP weight processing imported DeepEP")
-        return original_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    prepare = mock.Mock()
+    monkeypatch.setattr(deep_ep, "prepare_deepep_buffer", prepare)
     result = object()
     preprocessor = mock.Mock(return_value=result) if with_preprocessor else None
     plan = dict(a2a_backend=backend, weight_preprocessor=preprocessor)
@@ -104,6 +96,7 @@ def test_non_deepep_plans_do_not_acquire_or_import_deepep(
     assert moe.moe_process_weights(plan, weights) is (
         result if with_preprocessor else None
     )
+    prepare.assert_not_called()
     if preprocessor is not None:
         preprocessor.assert_called_once_with(plan=plan, w=weights)
 

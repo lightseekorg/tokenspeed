@@ -1416,13 +1416,10 @@ class KimiLinearMoE(nn.Module):
         elif mapping.attn.tp_size != mapping.moe.tp_ep_size:
             raise ValueError("Kimi-K3 attention TP must match the MoE TP x EP group.")
         all2all_backend = get_all2all_backend()
-        if mapping.attn.dp_size > 1:
-            if all2all_backend is All2AllBackend.DEEPEP:
-                raise ValueError(
-                    "Kimi-K3 attention DP does not support DeepEP; "
-                    "use --all2all-backend agrs or flashinfer."
-                )
-        elif all2all_backend in (All2AllBackend.AGRS, All2AllBackend.FLASHINFER):
+        if mapping.attn.dp_size == 1 and all2all_backend in (
+            All2AllBackend.AGRS,
+            All2AllBackend.FLASHINFER,
+        ):
             raise ValueError(
                 "Kimi-K3 agrs/flashinfer transport requires attention DP > 1."
             )
