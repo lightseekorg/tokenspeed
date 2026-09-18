@@ -32,7 +32,6 @@ from tokenspeed.runtime.configs.model_config import (
     is_deepseek_v4,
     is_qwen4_exp,
 )
-from tokenspeed.runtime.distributed.partition import target_execution_stage_windows
 from tokenspeed.runtime.layers.attention.configs.base import (
     AttnConfig,
     SoftmaxAttnConfig,
@@ -1125,10 +1124,12 @@ def create_attn_components(
     num_target_cache_layers = cache_setup.num_target_layers
     num_draft_cache_layers = cache_setup.num_draft_layers
     if server_args.mapping.has_pp:
+        from tokenspeed.runtime.distributed.pp_stage import pp_stage_windows
+
         # K3 and V4, the supported PP targets, have one cache layer per
         # execution block. Map their execution windows to the identical cache
         # IDs here; cache ownership itself does not partition execution blocks.
-        target_cache_windows = target_execution_stage_windows(
+        target_cache_windows = pp_stage_windows(
             model_config.num_hidden_layers,
             server_args.mapping.pp_size,
             server_args.mapping.pp_layer_partition,

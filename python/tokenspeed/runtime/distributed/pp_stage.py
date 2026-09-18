@@ -35,9 +35,6 @@ from dataclasses import dataclass, fields
 import torch
 
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.distributed.partition import (
-    target_execution_stage_windows,
-)
 
 
 def pp_stage_windows(
@@ -45,13 +42,13 @@ def pp_stage_windows(
     pp_size: int,
     partition: tuple[int, ...] | None = None,
 ) -> list[tuple[int, int]]:
-    """All stages' [start, end) target execution-block windows.
+    """All stages' [start, end) layer windows.
 
-    Models partition execution blocks here. Cache consumers explicitly map
-    those windows into their own layer-ID namespace.
+    The single source of the stage-split arithmetic: the model build, the KV
+    transfer route, and the Decode-side peer planner must all agree on it.
 
     Args:
-        num_layers: Target execution-block count, excluding draft layers and taps.
+        num_layers: Total model layer count.
         pp_size: Number of pipeline stages.
         partition: Optional explicit per-stage layer counts (front to back),
             e.g. ``(8, 11, 11, 8)``. When omitted, layers split as evenly as
@@ -63,7 +60,35 @@ def pp_stage_windows(
     Raises:
         ValueError: the partition length or sum does not match.
     """
-    return list(target_execution_stage_windows(num_layers, pp_size, partition))
+    if partition is not None:
+        if len(partition) != pp_size:
+            raise ValueError(
+                f"pp layer partition {partition} has {len(partition)} entries "
+                f"for {pp_size} pipeline stages"
+            )
+        if any(count <= 0 for count in partition):
+            raise ValueError(
+                f"pp layer partition {partition} must give every stage at "
+                "least one layer"
+            )
+        if sum(partition) != num_layers:
+            raise ValueError(
+                f"pp layer partition {partition} sums to {sum(partition)} "
+                f"but the model has {num_layers} layers"
+            )
+        counts = partition
+    else:
+        base = num_layers // pp_size
+        remainder = num_layers % pp_size
+        counts = tuple(
+            base + (1 if stage < remainder else 0) for stage in range(pp_size)
+        )
+    windows = []
+    start = 0
+    for length in counts:
+        windows.append((start, start + length))
+        start += length
+    return windows
 
 
 def pp_layer_window(num_hidden_layers: int, mapping: Mapping) -> tuple[int, int]:
