@@ -114,7 +114,7 @@ def run_dsv41_csa2_index_topk(
     out,
     launch_logits,
 ):
-    """Shared CSA2 host: gather, score into logits, ATen TopK. Wide histories use Triton."""
+    """Gather, score, and select CSA2 rows with shape-bounded, graph-safe scratch."""
     out = _index_topk_outputs(
         index_q,
         weights,
@@ -137,6 +137,8 @@ def run_dsv41_csa2_index_topk(
         else int(page_table.shape[1]) * _PAGE_SIZE
     )
     if need > _MAX_LOGITS:
+        # Full dispatch uses configured capacity, not device-visible lengths:
+        # reading those on the host would synchronize and break graph replay.
         return portable_index_topk(
             index_q,
             weights,
@@ -162,8 +164,9 @@ def run_dsv41_csa2_index_topk(
     if not tokens or not page_table.shape[1] or need < 1:
         return out
 
-    cache = index_cache.contiguous()
-    cache_2d = cache.view(cache.shape[0], cache.shape[1] * cache.shape[2])
+    # Arena pages have gaps between them but contiguous bytes within each page.
+    # Flatten only the inner dimensions to preserve their storage and page stride.
+    cache_2d = index_cache.flatten(1)
     query_chunk_size = min(int(query_chunk_size), 256)
     make_blocks = bool(candidate_topk)
 
@@ -173,7 +176,7 @@ def run_dsv41_csa2_index_topk(
             index_q[start:end], weights[start:end], process_group
         )
         table = page_table[start:end].contiguous()
-        visible = visible_lens[start:end].contiguous()
+        visible = visible_lens[start:end].clamp(0, int(table.shape[1]) * _PAGE_SIZE)
         candidates = (
             None
             if candidate_blocks is None

@@ -29,6 +29,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention import dsv41
+from tokenspeed_kernel.ops.attention.dsv41 import gluon as gluon_backend
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -202,7 +203,7 @@ def test_index_topk_missing_latest_page(device, require, solution, missing_page)
 
 
 @pytest.mark.parametrize("solution", ["triton", "gluon"])
-@pytest.mark.parametrize(("length", "expected_block"), [(256, 31), (320, 0)])
+@pytest.mark.parametrize(("length", "expected_block"), [(256, 31), (320, 31)])
 def test_index_topk_latest_block_outside_table(
     device, require, solution, length, expected_block
 ):
@@ -223,3 +224,69 @@ def test_index_topk_latest_block_outside_table(
     )
     assert output[2].item() == expected_block
     assert output[3].item() == 1
+    # Visibility is capped to table capacity without modifying the caller's input.
+    assert visible.item() == length
+
+
+@pytest.mark.parametrize("reindex", [False, True])
+def test_index_topk_preserves_arena_page_stride(device, require, monkeypatch, reindex):
+    require("attention", "dsv41_index_topk", "gluon", torch.bfloat16, "x")
+    q = torch.ones((1, 32, 128), dtype=torch.bfloat16, device=device)
+    weights = torch.ones((1, 32), dtype=torch.bfloat16, device=device)
+    arena = torch.zeros((4, 2, 64, 68), dtype=torch.uint8, device=device)
+    cache = arena[:, 0]
+    assert not cache.is_contiguous()
+    dsv41.cache_scatter(
+        torch.ones((256, 128), dtype=torch.bfloat16, device=device),
+        cache,
+        torch.arange(256, device=device),
+        "index",
+    )
+    table = torch.arange(4, dtype=torch.int32, device=device).unsqueeze(0)
+    visible = torch.tensor([320], dtype=torch.int32, device=device)
+    candidates = (
+        torch.tensor([[0, 16, 32, -1]], dtype=torch.int32, device=device)
+        if reindex
+        else None
+    )
+    candidate_topk = 0 if reindex else 32
+
+    def run(pages):
+        return dsv41.index_topk(
+            q,
+            weights,
+            pages,
+            table,
+            visible,
+            candidates,
+            512,
+            candidate_topk,
+            8,
+            1,
+            64,
+            None,
+            None,
+            "gluon",
+        )
+
+    expected = run(cache.contiguous())
+    name = (
+        "launch_gfx950_logits"
+        if current_platform().is_cdna4
+        else "launch_gfx1250_logits"
+    )
+    launch = getattr(gluon_backend, name)
+    calls = []
+
+    def check_page_view(q, w, cache_2d, table, visible, candidates, logits):
+        assert cache_2d.data_ptr() == cache.data_ptr()
+        assert cache_2d.stride(0) == cache.stride(0)
+        calls.append(cache_2d.shape)
+        return launch(q, w, cache_2d, table, visible, candidates, logits)
+
+    monkeypatch.setattr(gluon_backend, name, check_page_view)
+    actual = run(cache)
+    assert calls == [(4, 64 * 68)]
+    for got, want in zip(actual, expected, strict=True):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+    assert actual[1].item() == (16 if reindex else 256)

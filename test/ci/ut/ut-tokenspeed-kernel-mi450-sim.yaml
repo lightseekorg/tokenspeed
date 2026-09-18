@@ -27,7 +27,8 @@ env:
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_full_and_reindex_gluon[65-17-32]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_missing_latest_page[-1-gluon]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_missing_latest_page[3-gluon]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_latest_block_outside_table[320-0-gluon]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_latest_block_outside_table[320-31-gluon]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_preserves_arena_page_stride[True]
     tokenspeed-kernel/test/ops/test_attention.py::test_mha_decode_with_kvcache_gluon_peeled_split
     tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache[gluon-bh16bn64]
     tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_extend_with_kvcache[bf16]
