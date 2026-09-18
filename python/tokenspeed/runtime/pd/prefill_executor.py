@@ -39,21 +39,8 @@ logger = get_colorful_logger(__name__)
 
 from tokenspeed_scheduler import PD, Forward
 
-_BOOTSTRAP_DIAGNOSTIC_MIN_AGE_SECONDS = 1.0
-_BOOTSTRAP_DIAGNOSTIC_LOG_INTERVAL_SECONDS = 10.0
-_BOOTSTRAP_DIAGNOSTIC_SAMPLE_LIMIT = 8
-
-
-def _poll_name(status: int | None) -> str:
-    names = {
-        TransferPoll.Failed: "Failed",
-        TransferPoll.Bootstrapping: "Bootstrapping",
-        TransferPoll.Bootstrapped: "Bootstrapped",
-        TransferPoll.WaitingForInput: "WaitingForInput",
-        TransferPoll.Transferring: "Transferring",
-        TransferPoll.Success: "Success",
-    }
-    return names.get(status, f"Unknown({status})")
+# A request still bootstrapping this long after registration is reported.
+_BOOTSTRAP_STALL_SECONDS = 10.0
 
 
 class DisaggPrefillExecutor:
@@ -65,8 +52,7 @@ class DisaggPrefillExecutor:
         self._local_states = {}
         self._layerwise_enabled = False
         self._layerwise_interval = 1
-        self._bootstrap_diagnostic_last_log: float | None = None
-        self._prealloc_without_sender_since: dict[int, float] = {}
+        self._bootstrap_stall_logged_at: float | None = None
 
     def register_layerwise_step_counter(self, step_counter, interval: int) -> None:
         self._layerwise_enabled = True
@@ -324,121 +310,41 @@ class DisaggPrefillExecutor:
             raise TypeError(f"Expected Batch, got {type(op).__name__}.")
         self._cache_decode(op)
 
-    def _log_bootstrap_diagnostics(
-        self, request_ids: list[str], polls: list[int]
-    ) -> None:
-        """Periodically expose requests blocked before Prefill scheduling.
+    def _log_bootstrap_stalls(self, request_ids: list[str], polls: list[int]) -> None:
+        """Name requests that have waited on the PD handshake for too long.
 
-        A local ``Bootstrapped`` plus global ``Bootstrapping`` status means a
-        different PP/TP rank has not received its pre-allocation. A room in
-        ``transfer_infos`` without a live sender means pre-allocation arrived
-        before request registration, or arrived late after the request was
-        already failed and reaped.
+        A request bootstrapped locally whose global status is still
+        Bootstrapping is waiting for another rank's pre-allocation; that rank
+        never receives it when the decode side lost the room.
         """
-        now = time.monotonic()
-        wall_now = time.time()
-        pending = []
-        has_local_gap = False
-        for req_id, poll in zip(request_ids, polls, strict=True):
-            if (
-                self._local_states.get(req_id) != TransferPoll.Bootstrapping
-                or poll != TransferPoll.Bootstrapping
-            ):
-                continue
-            sender = self.senders.get(req_id)
-            if sender is None:
-                continue
-            age = max(wall_now - sender.init_time, 0.0)
-            if age < _BOOTSTRAP_DIAGNOSTIC_MIN_AGE_SECONDS:
-                continue
-            local = self.kv_manager.room_status(sender.bootstrap_room)
-            has_local_gap = has_local_gap or local == TransferPoll.Bootstrapping
-            pending.append(
-                (
-                    req_id,
-                    sender.bootstrap_room,
-                    age,
-                    local,
-                    poll,
-                )
-            )
-
-        active_rooms = {sender.bootstrap_room for sender in self.senders.values()}
-        try:
-            # The bootstrap worker mutates this dict concurrently. Diagnostics
-            # are best-effort and must never perturb request processing.
-            prealloc_rooms = set(tuple(self.kv_manager.transfer_infos))
-        except RuntimeError:
-            return
-        rooms_without_sender = prealloc_rooms - active_rooms
-        for room in rooms_without_sender:
-            self._prealloc_without_sender_since.setdefault(room, now)
-        for room in tuple(self._prealloc_without_sender_since):
-            if room not in rooms_without_sender:
-                self._prealloc_without_sender_since.pop(room, None)
-        aged_rooms_without_sender = [
-            room
-            for room in sorted(rooms_without_sender)
-            if now - self._prealloc_without_sender_since[room]
-            >= _BOOTSTRAP_DIAGNOSTIC_MIN_AGE_SECONDS
+        now = time.time()
+        stalled = [
+            f"{req_id}(room={sender.bootstrap_room}, age={now - sender.init_time:.0f}s)"
+            for req_id, poll in zip(request_ids, polls, strict=True)
+            if poll == TransferPoll.Bootstrapping
+            and (sender := self.senders.get(req_id)) is not None
+            and now - sender.init_time >= _BOOTSTRAP_STALL_SECONDS
         ]
-
-        if not pending and not aged_rooms_without_sender:
-            return
-        topology = self.kv_manager.topology
-        global_rank = topology.global_rank
-        # Each Attention-DP scheduler/PP stage has its own TP0 summary. A
-        # nonrepresentative rank only adds a pending line for a local gap.
-        emit_pending = bool(pending) and (topology.tp_rank == 0 or has_local_gap)
-        # An aged room with no sender is itself a local registration gap. It
-        # may exist on just one nonzero rank; do not hide it behind the TP0 gate.
-        emit_orphans = bool(aged_rooms_without_sender)
-        if not emit_pending and not emit_orphans:
-            return
-        if (
-            self._bootstrap_diagnostic_last_log is not None
-            and now - self._bootstrap_diagnostic_last_log
-            < _BOOTSTRAP_DIAGNOSTIC_LOG_INTERVAL_SECONDS
+        if not stalled or (
+            self._bootstrap_stall_logged_at is not None
+            and now - self._bootstrap_stall_logged_at < _BOOTSTRAP_STALL_SECONDS
         ):
             return
-        self._bootstrap_diagnostic_last_log = now
-
-        sample = [
-            "rid=%s room=%s age=%.1fs local=%s global=%s"
-            % (req_id, room, age, _poll_name(local), _poll_name(global_poll))
-            for req_id, room, age, local, global_poll in pending[
-                :_BOOTSTRAP_DIAGNOSTIC_SAMPLE_LIMIT
-            ]
-        ]
-        if emit_pending:
-            logger.warning(
-                "[prefill][bootstrap_pending] global_rank=%s pp_rank=%s "
-                "tp_rank=%s count=%s sample=%s",
-                global_rank,
-                topology.pp_rank,
-                topology.tp_rank,
-                len(pending),
-                sample,
-            )
-        if emit_orphans:
-            logger.warning(
-                "[prefill][prealloc_without_sender] global_rank=%s pp_rank=%s "
-                "tp_rank=%s count=%s rooms=%s; pre-allocation arrived before "
-                "request registration or after its sender was reaped",
-                global_rank,
-                topology.pp_rank,
-                topology.tp_rank,
-                len(aged_rooms_without_sender),
-                aged_rooms_without_sender[:_BOOTSTRAP_DIAGNOSTIC_SAMPLE_LIMIT],
-            )
+        self._bootstrap_stall_logged_at = now
+        topology = self.kv_manager.topology
+        logger.warning(
+            "[prefill] %s request(s) still bootstrapping on global_rank=%s: %s",
+            len(stalled),
+            topology.global_rank,
+            stalled[:8],
+        )
 
     def generate_events(self):
         if not self.senders:
-            self._log_bootstrap_diagnostics([], [])
             return []
         request_ids = list(self.senders)
         polls = poll_and_all_reduce(self.senders.values(), self.gloo_group)
-        self._log_bootstrap_diagnostics(request_ids, polls)
+        self._log_bootstrap_stalls(request_ids, polls)
 
         events = []
         to_remove = []
