@@ -79,7 +79,7 @@ def _eligible(
         ),
         mock.patch.object(latent_down.dist, "is_initialized", return_value=initialized),
         mock.patch.object(
-            latent_down.dist, "all_gather_into_tensor", side_effect=gather_ceilings
+            latent_down.dist, "all_gather_single", side_effect=gather_ceilings
         ),
         # Without this the vote reaches the real collective with a Mock group,
         # which no-ops: the tensor keeps its local value and the test passes
@@ -330,7 +330,9 @@ def test_call_publishes_the_block_it_was_handed(rank: int) -> None:
     seen: dict = {}
     op = _stub_op(rank, shard_dim, latent, seen)
     block_in = torch.zeros(shard_dim, hidden_size, dtype=torch.bfloat16)
-    out = op(torch.zeros(4, hidden_size, dtype=torch.bfloat16), block_in)
+    out = op(
+        torch.zeros(4, hidden_size, dtype=torch.bfloat16), block_in, output_scale=None
+    )
     assert out.shape == (4, latent)
     assert (
         out.untyped_storage().data_ptr() != seen["mailbox"].untyped_storage().data_ptr()
@@ -557,6 +559,7 @@ def test_call_selects_the_kernel_compiled_for_this_width(tokens: int) -> None:
     out = op(
         torch.zeros(tokens, hidden_size, dtype=torch.bfloat16),
         torch.zeros(latent, hidden_size, dtype=torch.bfloat16),
+        output_scale=None,
     )
     assert out.shape == (tokens, latent)
     assert seen["tokens"] == tokens
@@ -1207,7 +1210,7 @@ def test_an_agreed_ceiling_is_polled_once_not_once_per_layer() -> None:
 
     with _eligible(), _voting_ranks(built):
         with mock.patch.object(
-            latent_down.dist, "all_gather_into_tensor", side_effect=counted
+            latent_down.dist, "all_gather_single", side_effect=counted
         ):
             for block in range(4):
                 _initialize(block_index=block)

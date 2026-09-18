@@ -66,7 +66,9 @@ class _Harness:
             component=lambda cls: None,
         )
         self.config = config
-        self.backend = KdaAttnBackend(config, spec)
+        self.backend = KdaAttnBackend(
+            config, spec, enable_prefill_graph=False, kda_backend="auto"
+        )
         self.backend.set_kv_pool(self.pool)
         # The persistent decode buffers exist from construction, as at the
         # wrapper (the verify refresh below writes into them).
@@ -600,7 +602,13 @@ def test_equal_geometry_pool_replacement_rebinds_batched_replay():
     assert harness.backend._batched_replay_ready
 
     replacement = _make_kimi_pool(DEV, usable_pages=24)
+    # Prefill snapshots also refer to the old pool; publishing a replacement
+    # must drop them before eager preparation or startup recapture rebuilds them.
+    harness.backend._prefill_metadata[8, 1] = object()
+    harness.backend._prefill_metadata_pool = harness.pool
     harness.backend.set_kv_pool(replacement)
+    assert not harness.backend._prefill_metadata
+    assert harness.backend._prefill_metadata_pool is None
     harness.pool = replacement
     harness.contract = replacement.arena.runtime_contract
     harness.prepare_metadata([0], pages, [8 + T])

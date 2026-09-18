@@ -76,6 +76,7 @@ def test_qwen4_exp_qsa_prepare_metadata_matches_torch(
         recent_table,
         recent_page_size,
         ratio,
+        enable_pdl=False,
         draft_logical_positions=draft_tags,
     )
     lengths = (
@@ -1118,6 +1119,7 @@ def test_qwen4_exp_qsa_selected_slots_matches_torch(device: str) -> None:
         page_size,
         ratio,
         token_topk,
+        enable_pdl=False,
     )
 
     blocks = torch.where(

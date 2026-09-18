@@ -69,7 +69,7 @@ def _sync(loop, forward_op, monkeypatch, other_rank_rows=()):
         for i, row in enumerate(other_rank_rows, start=1):
             global_info[i] = torch.tensor(row, dtype=torch.int32)
 
-    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_gather)
+    monkeypatch.setattr(torch.distributed, "all_gather_single", fake_gather)
     return EventLoop._dp_sync_and_check(loop, forward_op)
 
 

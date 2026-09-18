@@ -35,7 +35,7 @@ DATASETS = {
         "dataset_args": {"dataset_id": "math-ai/aime25"},
     },
     "aime26": {
-        "count": 12,
+        "count": 13,
         "dataset_args": {"dataset_id": "math-ai/aime26"},
     },
     "gpqa_diamond": {
@@ -43,7 +43,7 @@ DATASETS = {
         "dataset_args": json.loads(GPQA_HUGGINGFACE_DATASET_ARGS)["gpqa_diamond"],
     },
     "gsm8k": {
-        "count": 7,
+        "count": 10,
         "dataset_args": {"dataset_id": "openai/gsm8k"},
     },
     "mmlu": {
@@ -169,6 +169,46 @@ def test_qwen38_flash_next_runs_gsm8k_with_kvstore_enabled():
     assert flag_value(eval_tokens, "--model") == "Qwen/Qwen3.8-Flash-Next-FP8"
     assert flag_value(eval_tokens, "--datasets") == "gsm8k"
     assert task["score_threshold"] == 0.96
+
+
+def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
+    filenames = (
+        "deepseek-v4.1-flash-evalscope-gsm8k.yaml",
+        "deepseek-v4.1-flash-evalscope-gsm8k-amd.yaml",
+    )
+    labels = ("b200-4gpu", "amd-mi35x-4gpu-test")
+
+    for filename, label in zip(filenames, labels, strict=True):
+        task = yaml.safe_load((EVAL_CONFIG_DIR / filename).read_text(encoding="utf-8"))
+        server_tokens = shlex.split(task["server"]["command"])
+        eval_tokens = shlex.split(task["eval"]["command"])
+
+        assert task["triggers"] == ["per-commit", "manual"]
+        assert task["runner"]["labels"] == [label]
+        assert flag_value(server_tokens, "--model") == "deepseek-ai/DeepSeek-V4.1-Flash"
+        assert flag_value(server_tokens, "--tensor-parallel-size") == "4"
+        assert flag_value(server_tokens, "--dtype") == "bfloat16"
+        assert flag_value(server_tokens, "--max-model-len") == "1048576"
+        assert flag_value(server_tokens, "--max-total-tokens") == "1048576"
+        assert flag_value(server_tokens, "--max-num-seqs") == "32"
+        assert flag_value(server_tokens, "--chunked-prefill-size") == "8192"
+        assert flag_value(server_tokens, "--gpu-memory-utilization") == "0.9"
+        assert flag_value(server_tokens, "--max-cudagraph-capture-size") == "32"
+        assert flag_value(server_tokens, "--reasoning-parser") == "deepseek_v31"
+        assert "--disable-kvstore" in server_tokens
+        assert "--disable-prefill-graph" in server_tokens
+        assert "--trust-remote-code" in server_tokens
+        assert flag_value(eval_tokens, "--model") == "deepseek-ai/DeepSeek-V4.1-Flash"
+        assert flag_value(eval_tokens, "--datasets") == "gsm8k"
+        assert flag_value(eval_tokens, "--eval-batch-size") == "32"
+        assert task["score_threshold"] == 0.90
+
+        if label == "b200-4gpu":
+            assert "--enable-expert-parallel" in server_tokens
+            assert flag_value(server_tokens, "--moe-backend") == "mega_moe"
+        else:
+            assert "--enable-expert-parallel" not in server_tokens
+            assert "--moe-backend" not in server_tokens
 
 
 def test_kimi_k3_amd_gates_use_eagle3():

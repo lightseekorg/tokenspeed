@@ -13,7 +13,8 @@
   },
   "cases": [
     {
-      "id": "gemm.bmm/gluon_bmm_a16w16_gfx950/b12-m1-n512-k128-bfloat16/v1",
+      "id": "gemm.bmm/gluon_bmm_a16w16_gfx950/b12-m1-n512-k128-bfloat16",
+      "comparison_epoch": 1,
       "definition": {
         "family": "gemm",
         "mode": "bmm",
@@ -30,8 +31,8 @@
           }
         },
         "registration": "gluon_bmm_a16w16_gfx950",
-        "seed": 42,
-        "definition_version": 1
+        "cold_cache": true,
+        "seed": 42
       },
       "policy": {
         "max_regression_relative": 0.1,

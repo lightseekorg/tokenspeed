@@ -32,6 +32,9 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 )
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.execution.dspark_context import (
+        DSparkContextProducer,
+    )
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
@@ -71,6 +74,22 @@ class DraftNarrowing(Protocol):
         layout) calls it after them; a draft whose step 0 attends the whole
         verify window never calls it — the drafter's step loop publishes for
         the following steps."""
+
+
+@dataclass(frozen=True)
+class CapturedRows:
+    """Row layout of a target forward's captured taps when the model narrowed.
+
+    A model whose later layers run on a subset of the input rows (DeepSeek
+    V4.1's CED decoder) captures its taps for that subset only. It reports
+    the subset here so a drafter can address the captures: ``positions`` is
+    every captured row's prompt position, extend requests first in
+    ``prefill_spans`` order ((row offset, row count) each), then the decode
+    rows in their verify layout.
+    """
+
+    positions: torch.Tensor
+    prefill_spans: tuple[tuple[int, int], ...]
 
 
 @dataclass
@@ -113,6 +132,9 @@ class ForwardContext:
 
     # --- logits processor ---
     gather_ids: torch.Tensor | None = None
+    # Set by a target model that captures its taps on a narrowed row subset
+    # (see CapturedRows); None means one captured row per input row.
+    captured_rows: CapturedRows | None = None
 
     # --- spec-decode draft (drafter-attached collaborators, per forward) ---
     # Set on the draft forwards that narrow verify-shaped rows to the
@@ -122,6 +144,10 @@ class ForwardContext:
     # by the drafter (prepare_target_forward) for the rounds it overlaps with
     # the target; None means the taps are only collected in aux_hidden_states.
     target_capture_sink: TargetCaptureSink | None = None
+    # Context production carries behavior. Its accumulator stays in the model
+    # forward or travels in PPStageState, never on ctx. A configured producer
+    # owns context cache writes; otherwise the drafter owns them.
+    dspark_context_producer: DSparkContextProducer | None = None
 
 
 @contextmanager

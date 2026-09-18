@@ -609,10 +609,19 @@ class OutputProcesser:
                 draft_width=self.spec_num_tokens - 1,
             )
 
-    def add_cached_tokens(self, rids: list[str], extend_prefix_lens: list[int]) -> None:
-        for rid, prefix_len in zip(rids, extend_prefix_lens):
+    def add_cached_tokens(
+        self,
+        rids: list[str],
+        extend_prefix_lens: list[int],
+        extend_replay_lens: list[int],
+    ) -> None:
+        # Replayed rows re-feed cached positions: the hit reaches to the end of
+        # the replay window, not to where the model input starts.
+        for rid, prefix_len, replay_len in zip(
+            rids, extend_prefix_lens, extend_replay_lens
+        ):
             if rs := self.rid_to_state.get(rid):
-                rs.cached_tokens += max(0, prefix_len - rs.computed_length)
+                rs.cached_tokens += max(0, prefix_len + replay_len - rs.computed_length)
 
     def post_process_forward_op(
         self,
@@ -623,6 +632,7 @@ class OutputProcesser:
         self.add_cached_tokens(
             forward_op.request_ids,
             forward_op.extend_prefix_lens,
+            forward_op.extend_replay_lens,
         )
         self._emit_spec_decode_metrics(forward_op, model_execution_results)
 
@@ -902,7 +912,9 @@ class OutputProcesser:
         self.stream_output(stream_out_rids, stream_out_states)
         return request_changes
 
-    def on_remote_prefill_done(self, req_id: str, bootstrap_token: int) -> None:
+    def on_remote_prefill_done(
+        self, req_id: str, bootstrap_token: int, cached_tokens: int
+    ) -> None:
         """Record the bootstrap token on a decode-node request (RemotePrefillDoneEvent).
 
         The bootstrap_token is the first real output token produced by the prefill node.
@@ -922,6 +934,8 @@ class OutputProcesser:
         if req_id not in self.rid_to_state:
             return
         state = self.rid_to_state[req_id]
+        # P and D reuse overlapping leading prefixes; never sum their hits.
+        state.cached_tokens = max(state.cached_tokens, cached_tokens)
         if bootstrap_token == -1:
             logger.warning(
                 "[on_remote_prefill_done] rid=%s received bootstrap_token=-1, skipping append to output_ids",

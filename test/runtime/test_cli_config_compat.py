@@ -348,23 +348,6 @@ class TestCLIConfigCompat(unittest.TestCase):
             )
             self.assertEqual(args.sampling_backend, backend)
 
-    def test_all2all_backend_arg(self):
-        args = self._parse_args(
-            ["--model", "test/model", "--all2all-backend", "deepep"]
-        )
-        self.assertEqual(args.all2all_backend, "deepep")
-
-    def test_recipe_all2all_backend_alias_arg(self):
-        args = self._parse_args(
-            [
-                "--model",
-                "test/model",
-                "--all2all-backend",
-                "flashinfer_nvlink_one_sided",
-            ]
-        )
-        self.assertEqual(args.all2all_backend, "flashinfer_nvlink_one_sided")
-
     def test_recipe_moe_backend_alias_arg(self):
         args = self._parse_args(
             ["--model", "test/model", "--moe-backend", "deep_gemm_mega_moe"]

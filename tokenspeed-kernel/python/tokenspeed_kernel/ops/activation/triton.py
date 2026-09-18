@@ -386,6 +386,15 @@ def swiglu_oai(
 
 
 @triton.jit
+def _situ_and_mul_values(gate, up, beta, linear_beta, HAS_LINEAR_BETA: tl.constexpr):
+    """Shared FP32 SiTU math for dense and device-counted row layouts."""
+    gate = beta * libdevice.tanh(gate / beta) * tl.sigmoid(gate)
+    if HAS_LINEAR_BETA:
+        up = linear_beta * libdevice.tanh(up / linear_beta)
+    return gate * up
+
+
+@triton.jit
 def _situ_and_mul_kernel(
     x_ptr,
     out_ptr,
@@ -409,10 +418,10 @@ def _situ_and_mul_kernel(
 
     gate = tl.load(gate_addrs, mask=mask).to(tl.float32)
     up = tl.load(up_addrs, mask=mask).to(tl.float32)
-    gate = beta * libdevice.tanh(gate / beta) * tl.sigmoid(gate)
-    if HAS_LINEAR_BETA:
-        up = linear_beta * libdevice.tanh(up / linear_beta)
-    tl.store(out_ptr + row * out_stride_row + col, gate * up, mask=mask)
+    out = _situ_and_mul_values(
+        gate, up, beta, linear_beta, HAS_LINEAR_BETA=HAS_LINEAR_BETA
+    )
+    tl.store(out_ptr + row * out_stride_row + col, out, mask=mask)
 
 
 def situ_and_mul(

@@ -49,13 +49,24 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
                 "group block_granularity must be a positive divisor of the prefix granularity");
         _assert(groups_[i].Allocator().CacheBlocksPerLcmBlock() == groups_[i].Spec().cache_blocks_per_lcm_block,
                 "group allocator packing must match its group spec");
+        _assert(groups_[i].Allocator().ShardCount() == groups_[i].Spec().shard_count,
+                "group allocator shard count must match its group spec");
+        const auto& spec = groups_[i].Spec();
+        pool_.RegisterGroup(groups_[i].Id(), spec.cache_blocks_per_lcm_block, spec.shard_count);
+        if (host_pool_ != nullptr) {
+            host_pool_->RegisterGroup(groups_[i].Id(), spec.cache_blocks_per_lcm_block, spec.shard_count);
+        }
         geometry_.emplace_back(group_block_granularity);
+        if (spec.replayable) {
+            _assert(spec.kind == AttnKind::kSlidingWindow, "a replayable group must be a sliding window");
+            replay_window_tokens_ = std::max(replay_window_tokens_, spec.sliding_window);
+        }
         if (groups_[i].Matcher().IsPrefixClosed()) {
             match_order_.push_back(i);
         }
     }
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        if (!groups_[i].Matcher().IsPrefixClosed()) {
+        if (!groups_[i].Matcher().IsPrefixClosed() && !GroupIsReplayable(static_cast<std::int32_t>(i))) {
             match_order_.push_back(i);
         }
     }
@@ -119,6 +130,11 @@ CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(co
     std::int32_t cached = 0;
     std::int32_t total = 0;
     for (std::size_t group_index = 0; group_index < groups_.size(); ++group_index) {
+        // A replayable group never holds an entry, so it would keep every
+        // boundary permanently partial.
+        if (GroupIsReplayable(static_cast<std::int32_t>(group_index))) {
+            continue;
+        }
         const std::int32_t pages_per_prefix_hash = prefix_granularity_ / geometry_[group_index].BlockGranularity();
         for (std::int32_t offset = 0; offset < pages_per_prefix_hash; ++offset) {
             const CacheKey key{
@@ -371,17 +387,6 @@ std::int32_t CacheCoordinator::NumAvailableLcmBlocks() const {
     return available;
 }
 
-std::int64_t CacheCoordinator::LcmBlocksNeededFor(std::span<const std::int64_t> group_pages) const {
-    _assert(group_pages.size() == groups_.size(), "page demand requires one entry per cache group");
-    std::int64_t prefix_blocks = 0;
-    for (std::size_t i = 0; i < groups_.size(); ++i) {
-        _assert(group_pages[i] >= 0, "group page demand must be non-negative");
-        const std::int64_t packing = groups_[i].Allocator().CacheBlocksPerLcmBlock();
-        prefix_blocks += (group_pages[i] + packing - 1) / packing;
-    }
-    return prefix_blocks;
-}
-
 std::int32_t CacheCoordinator::NumActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const {
     // Parent ids are dense in [1, NumLcmBlocks], so a bitmap dedupes shared
     // prefixes without hashing every block reference of every live request.
@@ -513,25 +518,24 @@ void CacheCoordinator::QueueLatestSnapshotBlocksForStore(std::span<const std::st
     }
 }
 
-void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, std::span<const std::string> prefix_hashes,
-                                            std::uint64_t access_epoch, std::int32_t first_new_prefix_page,
-                                            std::int32_t num_computed_tokens, CacheBoundaryKind boundary_kind,
-                                            bool stream_completed_to_host,
-                                            std::int32_t materialized_state_boundary_tokens) {
-    _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
-    _assert(first_new_prefix_page >= 0 && static_cast<std::size_t>(first_new_prefix_page) < prefix_hashes.size(),
+void CacheCoordinator::validateProgress(const RequestProgress& progress) {
+    if (!progress.completed_pages) {
+        return;
+    }
+    const CompletedPages& completed = *progress.completed_pages;
+    _assert(completed.first_new_prefix_page >= 0 &&
+                static_cast<std::size_t>(completed.first_new_prefix_page) < completed.prefix_hashes.size(),
             "completed page range must be non-empty");
+    _assert(progress.num_computed_tokens.has_value(), "completed pages require the request's computed progress");
+}
+
+void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, const RequestProgress& progress,
+                                            std::uint64_t access_epoch) {
+    _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
+    _assert(progress.completed_pages.has_value(), "publication requires completed pages");
+    validateProgress(progress);
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        const GroupDemand demand{
-            .table = &tables[i],
-            .prefix_hashes = prefix_hashes,
-            .new_prefix_hash_begin = first_new_prefix_page,
-            .completed_boundary_kind = boundary_kind,
-            .num_computed_tokens = num_computed_tokens,
-            .stream_completed_to_host = stream_completed_to_host,
-            .materialized_state_boundary_tokens = materialized_state_boundary_tokens,
-        };
-        cacheDeviceCompletedBlocksForGroup(i, demand, access_epoch);
+        cacheDeviceCompletedBlocksForGroup(i, tables[i], *progress.completed_pages, access_epoch);
     }
 }
 
@@ -540,6 +544,9 @@ void CacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTab
                                                std::span<const CacheKey> keys, std::int32_t first_cache_block,
                                                std::uint64_t access_epoch, CacheBoundaryKind boundary_kind,
                                                bool stream_completed_to_host) {
+    if (GroupIsReplayable(static_cast<std::int32_t>(group_index))) {
+        return;  // regenerated by the model, never published
+    }
     std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
     const bool automatically_streams_to_host =
         stream_device_cache_to_host_ &&
@@ -736,48 +743,67 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
 }
 
 template <CacheTier Tier>
-void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
-                                                    std::uint64_t access_epoch) {
+void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, BlockTable& table,
+                                                    const CompletedPages& completed, std::uint64_t access_epoch) {
+    if (GroupIsReplayable(static_cast<std::int32_t>(group_index))) {
+        return;
+    }
     const std::int32_t pages_per_prefix_hash = prefix_granularity_ / geometry_[group_index].BlockGranularity();
     if (groups_[group_index].Matcher().IsPrefixClosed()) {
         std::vector<CacheKey> keys =
-            keysForGroup(demand.prefix_hashes.subspan(static_cast<std::size_t>(demand.new_prefix_hash_begin)),
+            keysForGroup(completed.prefix_hashes.subspan(static_cast<std::size_t>(completed.first_new_prefix_page)),
                          groups_[group_index].Id());
-        cacheFullBlocksForGroup<Tier>(group_index, *demand.table, keys,
-                                      demand.new_prefix_hash_begin * pages_per_prefix_hash, access_epoch,
-                                      *demand.completed_boundary_kind, demand.stream_completed_to_host);
+        cacheFullBlocksForGroup<Tier>(group_index, table, keys, completed.first_new_prefix_page * pages_per_prefix_hash,
+                                      access_epoch, completed.boundary_kind, completed.stream_completed_to_host);
         return;
     }
-    if (demand.num_computed_tokens < 0) {
+    // A non-closed group publishes, per resumable boundary, the pages needed
+    // to resume from it: the trailing window, or one snapshot slot for state.
+    // A sliding window resumes from the newest hashed boundary. A state
+    // snapshot exists only where a forward stopped -- prefill writes its
+    // latest internal aligned checkpoint, decode commits its accepted
+    // endpoint -- so never infer one from an allocated slot or a completed
+    // hash (including finish/retraction): only proven boundaries inside the
+    // newly hashed range publish, several at once when results landed back
+    // to back, and before retention can reclaim their table slots.
+    const std::int32_t hashed_prefix_pages = static_cast<std::int32_t>(completed.prefix_hashes.size());
+    std::vector<std::int32_t> boundaries_in_prefix_pages;
+    if (groups_[group_index].Spec().kind != AttnKind::kMambaState) {
+        boundaries_in_prefix_pages.push_back(hashed_prefix_pages);
+    } else {
+        for (const std::int32_t boundary : completed.materialized_state_boundaries) {
+            _assert(boundary > 0 && boundary % prefix_granularity_ == 0,
+                    "materialized state boundary must be positive and prefix-aligned");
+            const std::int32_t boundary_prefix_pages = boundary / prefix_granularity_;
+            if (boundary_prefix_pages > completed.first_new_prefix_page &&
+                boundary_prefix_pages <= hashed_prefix_pages) {
+                boundaries_in_prefix_pages.push_back(boundary_prefix_pages);
+            }
+        }
+    }
+    if (boundaries_in_prefix_pages.empty()) {
         return;
     }
-    // Prefill can produce an internal snapshot, but speculative decode commits
-    // only the accepted endpoint. Never infer a written snapshot from an
-    // allocated slot or a completed token hash (including finish/retraction).
-    const std::int32_t boundary_tokens = static_cast<std::int32_t>(demand.prefix_hashes.size()) * prefix_granularity_;
-    if (groups_[group_index].Spec().kind == AttnKind::kMambaState &&
-        demand.materialized_state_boundary_tokens != boundary_tokens) {
-        return;
+    const std::vector<CacheKey> keys = keysForGroup(completed.prefix_hashes, groups_[group_index].Id());
+    for (const std::int32_t boundary_prefix_pages : boundaries_in_prefix_pages) {
+        const std::int32_t boundary_cache_block = boundary_prefix_pages * pages_per_prefix_hash;
+        const std::int32_t lookback =
+            std::min(groups_[group_index].Matcher().BoundaryLookbackPages(), boundary_cache_block);
+        if (lookback == 0) {
+            continue;
+        }
+        const std::int32_t first_cache_block = boundary_cache_block - lookback;
+        cacheFullBlocksForGroup<Tier>(
+            group_index, table,
+            std::span<const CacheKey>{keys}.subspan(static_cast<std::size_t>(first_cache_block),
+                                                    static_cast<std::size_t>(lookback)),
+            first_cache_block, access_epoch, completed.boundary_kind, completed.stream_completed_to_host);
     }
-
-    const std::int32_t boundary_cache_block =
-        static_cast<std::int32_t>(demand.prefix_hashes.size()) * pages_per_prefix_hash;
-    const std::int32_t lookback =
-        std::min(groups_[group_index].Matcher().BoundaryLookbackPages(), boundary_cache_block);
-    if (lookback == 0) {
-        return;
-    }
-    const std::int32_t first_cache_block = boundary_cache_block - lookback;
-    std::vector<CacheKey> keys = keysForGroup(demand.prefix_hashes, groups_[group_index].Id());
-    cacheFullBlocksForGroup<Tier>(group_index, *demand.table,
-                                  std::span<const CacheKey>{keys}.subspan(static_cast<std::size_t>(first_cache_block)),
-                                  first_cache_block, access_epoch, *demand.completed_boundary_kind,
-                                  demand.stream_completed_to_host);
 }
 
-void CacheCoordinator::cacheDeviceCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
-                                                          std::uint64_t access_epoch) {
-    cacheCompletedBlocksForGroup<CacheTier::kDevice>(group_index, demand, access_epoch);
+void CacheCoordinator::cacheDeviceCompletedBlocksForGroup(std::size_t group_index, BlockTable& table,
+                                                          const CompletedPages& completed, std::uint64_t access_epoch) {
+    cacheCompletedBlocksForGroup<CacheTier::kDevice>(group_index, table, completed, access_epoch);
 }
 
 void CacheCoordinator::ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens) {
@@ -848,6 +874,22 @@ void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& 
                                            /*newly_cached=*/nullptr);
 }
 
+std::unique_ptr<PrefixMatcher> MakePrefixMatcher(const CacheGroupSpec& spec) {
+    _assert(spec.block_granularity > 0, "group block_granularity must be > 0");
+    switch (spec.kind) {
+        case AttnKind::kFull:
+            return std::make_unique<FullAttnMatcher>();
+        case AttnKind::kMambaState:
+            return std::make_unique<SwaMatcher>(spec.block_granularity, GroupGeometry::kMambaStateWindow);
+        case AttnKind::kSlidingWindow:
+            _assert(spec.sliding_window > 0, "sliding window group requires a positive window");
+            return std::make_unique<SwaMatcher>(spec.block_granularity, spec.sliding_window);
+        default:
+            FatalCheck(false, "unknown AttnKind in coordinator group spec");
+            return nullptr;
+    }
+}
+
 CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
                                  BlockPool& pool, BlockPool* host_pool, bool stream_device_cache_to_host) {
     _assert(!specs.empty(), "MakeCoordinator requires at least one spec");
@@ -860,27 +902,10 @@ CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int
         const CacheGroupSpec& spec = specs[i];
         const std::uint32_t group_id = static_cast<std::uint32_t>(i);
         _assert(spec.cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
-        const std::int32_t group_block_granularity = spec.block_granularity;
-        _assert(group_block_granularity > 0 && prefix_granularity % group_block_granularity == 0,
+        _assert(spec.block_granularity > 0 && prefix_granularity % spec.block_granularity == 0,
                 "group block_granularity must be a positive divisor of the prefix granularity");
-        auto allocator = std::make_unique<GroupAllocator>(spec.cache_blocks_per_lcm_block, group_id);
-        std::unique_ptr<PrefixMatcher> matcher;
-        switch (spec.kind) {
-            case AttnKind::kFull:
-                matcher = std::make_unique<FullAttnMatcher>();
-                break;
-            case AttnKind::kMambaState:
-                matcher = std::make_unique<SwaMatcher>(group_block_granularity, GroupGeometry::kMambaStateWindow);
-                break;
-            case AttnKind::kSlidingWindow:
-                _assert(spec.sliding_window > 0, "sliding window group requires a positive window");
-                matcher = std::make_unique<SwaMatcher>(group_block_granularity, spec.sliding_window);
-                break;
-            default:
-                FatalCheck(false, "unknown AttnKind in coordinator group spec");
-                break;
-        }
-        groups.emplace_back(spec, std::move(allocator), std::move(matcher));
+        auto allocator = std::make_unique<GroupAllocator>(spec.cache_blocks_per_lcm_block, group_id, spec.shard_count);
+        groups.emplace_back(spec, std::move(allocator), MakePrefixMatcher(spec));
     }
     return CacheCoordinator{std::move(groups), prefix_granularity, pool, host_pool, stream_device_cache_to_host};
 }

@@ -249,6 +249,7 @@ class ServerArgs:
     use_trtllm_ragged_deepseek_prefill: bool | None = None
 
     # DeepSeek V4
+    decode_context_parallel_size: int = 1
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
     deepseek_v4_prefill_chunk_size: int = 4
@@ -303,10 +304,13 @@ class ServerArgs:
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
+    disable_kda_prefill_graph: bool = False
     # Breakable prefill graph bucket cap: None = auto min(2048, chunk); 0 disables.
     prefill_graph_max_tokens: int | None = None
     # Explicit prefill bucket list; unset = the relative-stride ladder (see get_prefill_token_buckets).
     prefill_graph_capture_sizes: list[int] | None = None
+    # Request capacities for inline attention; unset keeps the minimum per bucket.
+    prefill_graph_capture_batch_sizes: list[int] | None = None
     cudagraph_capture_sizes: list[int] | None = None
     enable_nan_detection: bool = False
     enable_nvtx: bool = False
@@ -654,6 +658,7 @@ class ServerArgs:
             attn_tp_size=attn_tp_size,
             attn_cp_size=attn_cp_size,
             attn_dp_size=attn_dp_size,
+            attn_dcp_size=self.decode_context_parallel_size,
             dense_tp_size=dense_tp_size,
             dense_dp_size=dense_dp_size,
             moe_tp_size=moe_tp_size,
@@ -670,6 +675,8 @@ class ServerArgs:
         )
 
         # Impl constraints:
+        if self.mapping.attn.has_dcp and self.disaggregation_mode != "null":
+            raise ValueError("DCP cache transfer does not yet support PD")
         if self.mapping.moe.has_tp and self.mapping.moe.has_ep:
             raise ValueError("MoE TP and EP cannot be both > 1")
 
@@ -794,10 +801,25 @@ class ServerArgs:
                     "supported yet"
                 )
             if self.speculative_algorithm is not None:
-                raise ValueError(
-                    "--pipeline-parallel-size > 1 does not support "
-                    "speculative decoding"
-                )
+                if (
+                    self.speculative_algorithm != "DSPARK"
+                    or self.disaggregation_mode != "prefill"
+                ):
+                    raise ValueError(
+                        "--pipeline-parallel-size > 1 supports speculation only "
+                        "as DSPARK context production on a prefill server"
+                    )
+                # Current CachePD / draft layout limits rather than PP limits:
+                # CachePD has no CP partition contract, and the draft reduces
+                # its attention-TP embedding partials over the dense TP group.
+                if (
+                    self.mapping.attn.cp_size != 1
+                    or self.mapping.dense.tp_group != self.mapping.attn.tp_group
+                ):
+                    raise ValueError(
+                        "Pipeline DSPARK requires attention CP=1 and matching "
+                        "dense/attention TP groups"
+                    )
             if (
                 self.pp_layer_partition is not None
                 and len(self.pp_layer_partition) != self.pipeline_parallel_size
@@ -854,24 +876,16 @@ class ServerArgs:
             self.enable_kvstore = True
 
     def validate_cache_options(self):
-        speculative_algorithm = getattr(self, "speculative_algorithm", None)
-        draft_model_path_use_base = getattr(self, "draft_model_path_use_base", False)
-        speculative_draft_model_path = getattr(
-            self, "speculative_draft_model_path", None
-        )
-        if (
-            self.enable_kvstore
-            and speculative_algorithm == "DSPARK"
-            and (
-                draft_model_path_use_base
-                or speculative_draft_model_path is None
-                or speculative_draft_model_path == self.model
-            )
-        ):
+        # Runs after _handle_kvstore() has applied the KVStore default, so the
+        # check sees the effective setting rather than the pre-resolution flag.
+        if self.decode_context_parallel_size > 1 and self.enable_kvstore:
             raise ValueError(
-                "DSPARK same-checkpoint decoding does not support KVStore; "
+                "DCP cache transfer does not yet support KVStore; "
                 "use --disable-kvstore."
             )
+        # Same-checkpoint DSpark's KVStore support depends on where the draft
+        # keeps its context; the engine decides once the draft config resolves
+        # (resolve_dspark_prefix_replay_tokens).
         if (
             self.enable_kvstore
             and not self.enable_prefix_caching
@@ -883,6 +897,8 @@ class ServerArgs:
             )
 
     def validate(self):
+        if self.low_latency_max_num_tokens_per_gpu <= 0:
+            raise ValueError("--low-latency-max-num-tokens-per-gpu must be positive")
         if self.device == "npu":
             if not self.disable_prefill_graph:
                 raise ValueError("NPU execution requires --disable-prefill-graph")
@@ -1461,7 +1477,9 @@ class ServerArgs:
             metavar="ALL2ALL_BACKEND",
             type=str,
             default=ServerArgs.all2all_backend,
-            help="MoE all-to-all backend: none, deepep, etc.",
+            choices=["none", "agrs", "deepep", "flashinfer"],
+            help="MoE communication backend. agrs and flashinfer explicitly select "
+            "the Kimi-K3 attention-DP transport; none preserves existing behavior.",
         )
         parser.add_argument(
             "--deepep-mode",
@@ -1898,6 +1916,13 @@ class ServerArgs:
             help="Disable cuda graph for prefill.",
         )
         parser.add_argument(
+            "--disable-kda-prefill-graph",
+            action="store_true",
+            help="Disable KDA prefill CUDA graphs while retaining ordinary "
+            "prefill and decode graph settings. Supported cutedsl_kda prefill "
+            "attention is included in prefill graphs by default.",
+        )
+        parser.add_argument(
             "--prefill-graph-max-tokens",
             type=int,
             default=ServerArgs.prefill_graph_max_tokens,
@@ -1905,15 +1930,41 @@ class ServerArgs:
             "graph. Default (unset) = min(2048, chunked-prefill size); "
             "0 disables.",
         )
-        parser.add_argument(
-            "--prefill-graph-capture-sizes",
-            metavar="PREFILL_GRAPH_CAPTURE_SIZE",
+        prefill_token_sizes = parser.add_mutually_exclusive_group()
+        prefill_token_sizes.add_argument(
+            "--prefill-graph-capture-token-sizes",
+            dest="prefill_graph_capture_sizes",
+            metavar="TOKENS",
             type=int,
             nargs="+",
-            help="Explicit list of token-bucket sizes to capture for the "
-            "breakable prefill graph (like --cudagraph-capture-sizes for "
-            "decode). Unset: a relative-stride ladder bounding padded compute "
-            "at ~12.5%% of any size.",
+            help="Total input-token capacities per forward, summed across the "
+            "batch; not per-request sequence lengths. Shorter inputs are padded. "
+            "For pure prefill, count newly computed tokens, excluding cached "
+            "prefixes. Unset: a relative-stride ladder with ~12.5%% spacing, "
+            "subject to a 16-token minimum step and a 512-token maximum step.",
+        )
+        prefill_token_sizes.add_argument(
+            "--prefill-graph-capture-sizes",
+            dest="prefill_graph_capture_sizes",
+            metavar="TOKENS",
+            type=int,
+            nargs="+",
+            help="Compatibility alias for --prefill-graph-capture-token-sizes. "
+            "Specify only one spelling.",
+        )
+        parser.add_argument(
+            "--prefill-graph-capture-batch-sizes",
+            metavar="BS",
+            type=int,
+            nargs="+",
+            help="Request capacities for inline prefill attention capture; "
+            "replay rounds up to the smallest fitting captured batch size. "
+            "Unset: the minimum request count that fits each token bucket within "
+            "the model context. KDA uses fixed checkpoint slots, so each token "
+            "bucket needs one inline variant per configured request count. "
+            "Adding request counts increases capture time and memory. "
+            "This does not replace the scheduler's --max-num-seqs limit. "
+            "Batches without a fitting capacity retain the ordinary attention breaks.",
         )
         parser.add_argument(
             "--enable-nan-detection",
@@ -1979,6 +2030,12 @@ class ServerArgs:
             help="Specify tp size for attn part",
         )
         parser.add_argument(
+            "--decode-context-parallel-size",
+            type=int,
+            default=ServerArgs.decode_context_parallel_size,
+            help="Shard DeepSeek V4 compressed KV over a subgroup of attention TP.",
+        )
+        parser.add_argument(
             "--dense-tp-size",
             type=int,
             default=ServerArgs.dense_tp_size,
@@ -2020,7 +2077,8 @@ class ServerArgs:
             "--low-latency-max-num-tokens-per-gpu",
             type=int,
             default=ServerArgs.low_latency_max_num_tokens_per_gpu,
-            help="Low latency max num tokens per gpu",
+            help="DeepEP low-latency send capacity per rank. Defaults to 256; "
+            "set explicitly to cover the largest batch sent through low latency.",
         )
 
         parser.add_argument(

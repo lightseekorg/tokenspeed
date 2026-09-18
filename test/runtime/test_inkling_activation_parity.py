@@ -374,6 +374,8 @@ class _Harness:
             extend_seq_lens_cpu=torch.tensor([T]),
             extend_prefix_lens=torch.zeros(1, dtype=torch.int32, device=dev),
             extend_prefix_lens_cpu=torch.zeros(1, dtype=torch.int32),
+            extend_replay_lens_cpu=torch.zeros(1, dtype=torch.int32),
+            extend_prompt_lens_cpu=torch.tensor([T], dtype=torch.int32),
             extend_with_prefix=False,
             block_tables=self.block_tables,
         )

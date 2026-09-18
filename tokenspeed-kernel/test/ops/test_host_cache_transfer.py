@@ -1118,6 +1118,7 @@ def test_cache_ranges_dma_round_trip_across_multiple_device_buffers():
     host = torch.zeros(96, dtype=torch.uint8, pin_memory=True)
     ranges = ((0, 8, 0, 24), (1, 16, 48, 32))
     stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
 
     transfer_cache_ranges("d2h", (first, second), host, ranges, stream)
     stream.synchronize()

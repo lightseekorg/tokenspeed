@@ -78,9 +78,10 @@ class BaseDrafter:
         """Wire this drafter to the loaded target model.
 
         Called once by ``ModelExecutor`` right after the drafter is
-        constructed. Subclasses that read target weights or install capture
-        hooks on the target override this; the default drafter needs nothing
-        from the target.
+        constructed. Subclasses bind execution resources such as target weights
+        and output heads here. Capture configuration belongs to model setup
+        before drafter construction; this method must not change it. The
+        default drafter needs nothing from the target.
 
         Args:
             target_model: The target ``torch.nn.Module`` the drafter
@@ -106,6 +107,11 @@ class BaseDrafter:
         Called after an in-place target weight update completes and before the
         device thread accepts another forward. Most drafters do not cache
         derived target weights and therefore need no action.
+        """
+
+    def capture_prefill_graph(self, stream: torch.cuda.Stream) -> None:
+        """Capture draft prefill work after target capture, when prefill graphs
+        are enabled. Drafters without a separate prefill graph need no action.
         """
 
     @abstractmethod

@@ -35,7 +35,6 @@ import pytest
 from tokenspeed_kernel.ops.tuning import (
     flashinfer_tuning_cache_filename,
     load_flashinfer_tuning_cache,
-    set_autotune_process_group,
 )
 
 requires_flashinfer = pytest.mark.skipif(
@@ -82,24 +81,6 @@ def test_packaged_lookup_miss_returns_false() -> None:
         load_packaged_flashinfer_tuning_cache("no-such-model-unit-test", 999, 1)
         is False
     )
-
-
-@requires_flashinfer
-def test_set_autotune_process_group_sets_and_clears() -> None:
-    import flashinfer.autotuner as fi
-
-    sentinel = object()
-    set_autotune_process_group(sentinel)
-    try:
-        assert fi.get_autotune_process_group() is sentinel
-    finally:
-        set_autotune_process_group(None)
-    assert fi.get_autotune_process_group() is None
-
-
-def test_set_autotune_process_group_tolerates_missing_backend() -> None:
-    # Like autotune(), a no-op without flashinfer installed.
-    set_autotune_process_group(None)
 
 
 @requires_flashinfer

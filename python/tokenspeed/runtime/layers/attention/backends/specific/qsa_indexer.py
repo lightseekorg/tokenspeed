@@ -28,7 +28,10 @@ from typing import TYPE_CHECKING
 import torch
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.backends.base import (
+    AttentionBackend,
+    reject_bounded_replay,
+)
 from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
     GroupTableSpec,
     GroupTableStacks,
@@ -212,11 +215,14 @@ class QSAIndexerBackend(AttentionBackend):
         extend_seq_lens_cpu: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
+        extend_replay_lens_cpu: torch.Tensor,
+        extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
         **kwargs,
     ) -> None:
         del req_pool_indices, extend_seq_lens_cpu, extend_prefix_lens
-        del extend_prefix_lens_cpu, extend_with_prefix, kwargs
+        del extend_prefix_lens_cpu, extend_prompt_lens_cpu, extend_with_prefix, kwargs
+        reject_bounded_replay(extend_replay_lens_cpu, "QSAIndexerBackend")
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
             raise RuntimeError("QSA decode metadata uses refresh_decode_metadata")
         self._fill_tables(bs, 0 if forward_mode.is_idle() else bs, block_tables)

@@ -23,6 +23,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention._triton.prefill_state_checkpoints import (
+    merge_prefill_checkpoint_outputs,
     pack_prefill_recurrent_checkpoint_inputs,
     write_prefill_conv_checkpoints,
     write_prefill_recurrent_checkpoints,
@@ -33,6 +34,146 @@ def _device() -> torch.device:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for Triton checkpoint kernels")
     return torch.device("cuda")
+
+
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+def test_inactive_conv_checkpoint_destinations_do_not_access_state(device_name):
+    device = _device() if device_name == "cuda" else torch.device("cpu")
+    raw = torch.arange(24, dtype=torch.float32, device=device).reshape(8, 3)
+    pool = torch.randn(5, 3, 3, device=device)
+    before = pool.clone()
+    rows = torch.tensor([0, 1], device=device)
+    blocks = torch.tensor([-1, 3], device=device)
+    write_prefill_conv_checkpoints(
+        raw,
+        pool,
+        torch.tensor([1, 2], device=device),
+        torch.tensor([2, 4], device=device),
+        blocks,
+        rows,
+        torch.tensor([1000000, 4], device=device),
+        torch.tensor([1000000, 4], device=device),
+    )
+    before[3] = raw[5:8].T
+    torch.testing.assert_close(pool, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+def test_inactive_recurrent_checkpoint_rows_preserve_destination(device_name):
+    device = _device() if device_name == "cuda" else torch.device("cpu")
+    state = torch.randn(3, 2, 4, 4, device=device).transpose(-1, -2)
+    state[0].fill_(float("nan"))
+    state[2].fill_(float("nan"))
+    pool = torch.randn(4, 2, 4, 4, device=device).transpose(-1, -2)
+    before = pool.clone()
+    # Slot 0 has no destination row; slot 2 has a row but no checkpoint page.
+    # Destination zero remains valid for merging tail results into body states.
+    write_prefill_recurrent_checkpoints(
+        state,
+        pool,
+        torch.tensor([0, 2, -1], device=device),
+        torch.tensor([-1, 0, 2], device=device),
+    )
+    before[0] = state[1]
+    torch.testing.assert_close(pool, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+@pytest.mark.parametrize("token_dim", [0, 1])
+def test_padded_checkpoint_pack_and_output_merge(device_name, token_dim):
+    device = _device() if device_name == "cuda" else torch.device("cpu")
+    # Noncontiguous token rows and state features match projection/scan views.
+    q = torch.arange(7 * 3 * 2 * 4, dtype=torch.float32, device=device).view(
+        1, 7, 3, 2, 4
+    )[:, :, 1]
+    state = (
+        torch.arange(3 * 2 * 4 * 4, dtype=torch.float32, device=device)
+        .view(3, 2, 4, 4)
+        .transpose(-1, -2)
+    )
+    rows = torch.tensor([2, 0], device=device)
+    body_indices = torch.tensor([0, 1, 4, -1, -1, -1, -1, -1], device=device)
+    tail_indices = torch.tensor([2, 3, 5, 6, -1], device=device)
+    gate = q.squeeze(0)
+
+    def pack(indices):
+        return pack_prefill_recurrent_checkpoint_inputs(
+            q, q, q, state, rows, indices, gate, gate, gate, gate, gate
+        )
+
+    body, tail = pack(body_indices), pack(tail_indices)
+    for name in ("query", "key", "value", "a", "b", "g_raw", "f_a_out", "beta_raw"):
+        actual = getattr(body, name)
+        if actual.ndim == q.ndim:
+            actual = actual.squeeze(0)
+        torch.testing.assert_close(actual[:3], gate[[0, 1, 4]], rtol=0, atol=0)
+        assert torch.count_nonzero(actual[3:]) == 0
+    torch.testing.assert_close(body.recurrent_state, state[rows], rtol=0, atol=0)
+    # Exercise feature strides in scan outputs as well as token-axis conventions.
+    body_out, tail_out = body.value.transpose(-1, -2), tail.value.transpose(-1, -2)
+    expected = q.transpose(-1, -2)
+    if token_dim == 0:
+        body_out, tail_out, expected = (
+            x.squeeze(0) for x in (body_out, tail_out, expected)
+        )
+    merged = merge_prefill_checkpoint_outputs(
+        body_out, tail_out, body_indices, tail_indices, token_dim, 9, None
+    )
+    torch.testing.assert_close(merged.narrow(token_dim, 0, 7), expected, rtol=0, atol=0)
+    assert torch.count_nonzero(merged.narrow(token_dim, 7, 2)) == 0
+
+
+@pytest.mark.parametrize("token_dim", [0, 1])
+@pytest.mark.parametrize("strided", [False, True])
+def test_shared_inverse_gather_replay(token_dim, strided):
+    device = _device()
+    body = torch.randn(8, 3, 4, device=device)
+    tail = torch.randn(5, 3, 4, device=device)
+    if strided:
+        body, tail = body.transpose(-1, -2), tail.transpose(-1, -2)
+    if token_dim == 1:
+        body, tail = body.unsqueeze(0), tail.unsqueeze(0)
+    body_map = torch.empty(8, dtype=torch.int64, device=device)
+    tail_map = torch.empty(5, dtype=torch.int64, device=device)
+    inverse = torch.full((10,), -1, dtype=torch.int64, device=device)
+
+    def run():
+        return merge_prefill_checkpoint_outputs(
+            body, tail, body_map, tail_map, token_dim, 10, inverse
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run()
+    for live_body, live_tail in [
+        ([0, 1, 4], [2, 3, 5, 6]),
+        ([5], [0, 2]),
+        ([], []),
+        ([1, 3, 5, 7, 9], [0, 2, 4, 6, 8]),
+    ] * 3:
+        body_map.fill_(-1)
+        tail_map.fill_(-1)
+        inverse.fill_(-1)
+        for source, mapping, destinations, start in (
+            (body, body_map, live_body, 0),
+            (tail, tail_map, live_tail, 8),
+        ):
+            source.copy_(torch.randn_like(source))
+            source.narrow(
+                token_dim,
+                len(destinations),
+                source.shape[token_dim] - len(destinations),
+            ).fill_(float("nan"))
+            if destinations:
+                dest = torch.tensor(destinations, device=device)
+                mapping[: len(destinations)].copy_(dest)
+                inverse[dest] = torch.arange(len(destinations), device=device) + start
+        expected = merge_prefill_checkpoint_outputs(
+            body, tail, body_map, tail_map, token_dim, 10, None
+        )
+        graph.replay()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.fixture

@@ -60,6 +60,7 @@ def test_capture_tensor_matches_post_layer_attnres_reference():
         output_attn_res_norm=None,
         norm=None,
         layers_to_capture=[],
+        dflash_aux_stream="prefix",
         eagle3_layers_to_capture=(2, 3),
     )
 
@@ -70,7 +71,7 @@ def test_capture_tensor_matches_post_layer_attnres_reference():
             model,
             torch.tensor([0, 1]),
             positions=None,
-            ctx=None,
+            ctx=SimpleNamespace(dspark_context_producer=None),
         )
 
     # IDs are one-based completed-layer IDs.  IDs 2 and 3 select the

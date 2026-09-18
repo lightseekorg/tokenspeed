@@ -27,6 +27,7 @@ import tokenspeed_kernel.ops.moe.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
 import tokenspeed_kernel.ops.moe.marlin  # noqa: F401
+import tokenspeed_kernel.ops.moe.mega_moe  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
 import torch
 from tokenspeed_kernel.platform import pdl_enabled
@@ -601,7 +602,7 @@ def moe_plan(
     fp8_scale_block_shape: tuple[int, int] | None = None,
     internal_activation_dtype: str | None = None,
     with_bias: bool = False,
-    deepep_group: object | None = None,
+    process_group: object | None = None,
     deepep_mode: str | None = None,
     deepep_low_latency_max_num_tokens_per_gpu: int | None = None,
     solution: str | None = None,
@@ -631,7 +632,8 @@ def moe_plan(
             activations have. "mxfp4" requests dynamic MXFP4 activation
             quantization. Defaults to "input" if not set.
         with_bias: Whether the selected kernel must support expert bias tensors.
-        deepep_group: Runtime-created process group used by DeepEP plans.
+        process_group: Runtime-created process group for DeepEP or MegaMoE
+            communication. Defaults to None for backends that do not use it.
         deepep_mode: Optional DeepEP mode for all-to-all plans: "low_latency"
             (decode-shaped batches only), "normal" (extend-shaped batches only),
             or "auto" to let each ``moe_apply`` pick through its ``low_latency``
@@ -700,7 +702,7 @@ def moe_plan(
         "apply_kernel_name": apply_spec.name,
         "weight_preprocessor": apply_spec.weight_preprocessor,
         "a2a_backend": a2a_backend,
-        "deepep_group": deepep_group,
+        "process_group": process_group,
         "deepep_mode": deepep_mode or "auto",
         "deepep_low_latency_max_num_tokens_per_gpu": (
             deepep_low_latency_max_num_tokens_per_gpu
@@ -714,27 +716,52 @@ def moe_plan(
 
 
 def moe_process_weights(plan: dict, w: torch.nn.Module):
-    """Process loaded MoE weights according to a plan.
+    """Process loaded MoE weights and prepare persistent communication storage.
 
     Args:
         plan: Execution plan returned by moe_plan.
         w: Module containing loaded MoE weights. This module is mutated in
-            place to prepare solution-specific layouts and scales.
+            place to prepare solution-specific layouts and scales. DeepEP
+            modules must declare hidden_size (the unquantized input width)
+            and num_experts (the global expert count).
+
+    Returns:
+        The selected weight preprocessor's result, or None without one.
     """
+    # Preserve input geometry before a kernel transforms its weight storage.
+    # Every DeepEP backend reserves through this one lifecycle entry point.
+    deepep_geometry = (
+        (w.hidden_size, w.num_experts) if plan.get("a2a_backend") == "deepep" else None
+    )
     preprocessor = plan.get("weight_preprocessor")
-    if preprocessor is None:
-        return None
-    if not callable(preprocessor):
-        raise RuntimeError(f"Weight preprocessor is not callable: {preprocessor!r}")
-    return preprocessor(plan=plan, w=w)
+    result = None
+    if preprocessor is not None:
+        if not callable(preprocessor):
+            raise RuntimeError(f"Weight preprocessor is not callable: {preprocessor!r}")
+        result = preprocessor(plan=plan, w=w)
+    if deepep_geometry is not None:
+        # Keep the optional communication dependency out of non-DeepEP plans.
+        from tokenspeed_kernel.ops.communication.deep_ep import prepare_deepep_buffer
+
+        hidden_size, num_experts = deepep_geometry
+        prepare_deepep_buffer(
+            group=plan["process_group"],
+            hidden_size=hidden_size,
+            num_experts=num_experts,
+            deepep_mode=plan["deepep_mode"],
+            max_dispatch_tokens_per_rank=plan[
+                "deepep_low_latency_max_num_tokens_per_gpu"
+            ],
+        )
+    return result
 
 
 def moe_apply(
     plan: dict,
-    x: torch.Tensor,
+    x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     w: torch.nn.Module,
     # top-k routing inputs
-    router_logits: torch.Tensor,
+    router_logits: torch.Tensor | None,
     # top-k routing results
     topk_weights: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
@@ -753,9 +780,13 @@ def moe_apply(
 
     Args:
         plan: Execution plan returned by moe_plan.
-        x: Hidden states with shape [tokens, hidden_size].
+        x: Hidden states with shape [tokens, hidden_size], or a
+            (packed_nvfp4, block_scales) pair for a kernel supporting prequantized
+            input. Packed data is uint8 [tokens, hidden_size // 2]; scales are
+            linear uint8/float8 [tokens, hidden_size // 16].
         w: Module containing processed MoE weights.
-        router_logits: Router logits with shape [tokens, num_experts].
+        router_logits: Router logits with shape [tokens, num_experts], or None
+            for a precomputed-TopK kernel that consumes only IDs and weights.
         topk_weights: Optional precomputed expert weights with shape
             [tokens, top_k]. Required when plan support_routing is false.
         topk_ids: Optional precomputed expert ids with shape [tokens, top_k].
@@ -786,10 +817,11 @@ def moe_apply(
 
     Solutions may use precomputed top-k tensors or route from logits directly.
     """
+    data = x[0] if isinstance(x, tuple) else x
     kernel = select_kernel(
         "moe",
         "apply",
-        format_signature(x=dense_tensor_format(x.dtype)),
+        format_signature(x=dense_tensor_format(data.dtype)),
         override=plan["apply_kernel_name"],
     )
     # Only the all-to-all EP kernels own dispatch/combine legs, so the mode

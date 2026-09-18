@@ -41,7 +41,6 @@ from tokenspeed_kernel.ops.sampling.flashinfer import (
 )
 from tokenspeed_kernel.ops.sampling.triton import gather_and_expand_scalars
 from tokenspeed_kernel.platform import pdl_enabled
-from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
 from tokenspeed.runtime.sampling.backends.base import (
@@ -260,7 +259,6 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._accept_index_local_buf: torch.Tensor | None = None
         self._accept_length_local_buf: torch.Tensor | None = None
 
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _prepare_step_hook(
         self,
         num_tokens_per_req: int,

@@ -33,7 +33,7 @@ import math
 import os
 import re
 from pathlib import Path
-from test.runtime.test_deepseek_v41_cache import _backend, _extend, _tables
+from test.runtime.test_deepseek_v41_cache import R1, R2, _backend, _extend, _tables
 from test.runtime.test_deepseek_v41_engram import _mapping, _Tokenizer
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -43,13 +43,22 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import save_file
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.context import CapturedRows, ForwardContext
+from tokenspeed.runtime.execution.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardMode,
+)
+from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
+    V41DecoderView,
+    V41PrefillSpan,
+    V41RowPlan,
+)
 from tokenspeed.runtime.layers.linear import LinearBase, MergedColumnParallelLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.layers.moe.expert import MoELayer
@@ -221,14 +230,23 @@ class _DenseFFN(nn.Module):
 
 
 class _Backend:
-    def __init__(self, positions, requests):
+    def __init__(self, positions, requests, view=None):
         self.meta = SimpleNamespace(positions=positions, request_indices=requests)
+        self.view = (
+            V41DecoderView(self.meta, None, (), None, None) if view is None else view
+        )
         self.calls = []
         self.global_writes = {}
         self.projections = {}
 
     def query_metadata(self, mode):
         return self.meta
+
+    def decoder_view(self):
+        return self.view
+
+    def rows(self):
+        return V41RowPlan(self.meta, self.meta, None)
 
     def compress(self, owner, content, scores, mode, norm_weight, norm_eps):
         assert content.dtype == scores.dtype == torch.float32
@@ -285,7 +303,11 @@ class _Backend:
             )
         )
         assert softmax_scale == q.shape[-1] ** -0.5
-        assert torch.equal(request_indices, self.meta.request_indices)
+        assert any(
+            positions is meta.positions and requests is meta.request_indices
+            for meta in (self.meta, self.view.metadata)
+            for requests in (request_indices,)
+        )
         return (q * 0.25).to(q.dtype)
 
 
@@ -305,6 +327,8 @@ def test_lm_head_checkpoint_and_logits_follow_model_dtype(
     adapter = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
     nn.Module.__init__(adapter)
     adapter.mapping = _mapping(rank, tp_size, world_size)
+    adapter.encoder_only = False
+    adapter.vision = None
     adapter.model = nn.Module()
     adapter.model.config = config
     with set_default_torch_dtype(dtype), torch.device(device):
@@ -466,7 +490,9 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
     actual, expected = initial.clone(), initial.clone()
     actual_pre, expected_pre = pre.clone(), pre.clone()
     for layer in layers:
-        actual, actual_pre = layer(actual, actual_pre, positions, torch.arange(3), ctx)
+        actual, actual_pre = layer(
+            actual, actual_pre, positions, torch.arange(3), ctx, backend.rows()
+        )
         for sublayer, norm, name in (
             (layer.attn, layer.attn_norm, "attn"),
             (layer.ffn, layer.ffn_norm, "ffn"),
@@ -487,7 +513,7 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
             )
             x = _norm(collapsed, norm.weight, 1e-20)
             x = (
-                sublayer(positions, x, ctx)
+                sublayer(positions, x, ctx, backend.rows())
                 if name == "attn"
                 else sublayer(x, None, 3, 3, None, None)
             )
@@ -534,7 +560,7 @@ def test_attention_owner_cast_index_and_grouped_output(layer_id):
     backend = _Backend(positions, requests)
     ctx = _ctx(backend, 6, ForwardMode.EXTEND)
     x = torch.randn(6, 128, dtype=torch.bfloat16)
-    actual = attn(positions, x, ctx)
+    actual = attn(positions, x, ctx, backend.rows())
     qr = _norm(
         F.linear(x, attn.wq_a_wkv.weight[: config.q_lora_rank]),
         attn.q_norm.weight,
@@ -645,6 +671,7 @@ def test_full_40_layer_backbone_engram_and_final_mix(monkeypatch):
         None,
         engram_previous_tokens=previous,
         engram_token_mask=mask,
+        image_mask=None,
     )
     handle.remove()
     assert [call[0] for call in backend.calls] == list(range(40))
@@ -665,6 +692,7 @@ def test_full_40_layer_backbone_engram_and_final_mix(monkeypatch):
             None,
             engram_previous_tokens=None,
             engram_token_mask=mask,
+            image_mask=None,
         )
     with pytest.raises(RuntimeError, match="already initialized"):
         model.initialize_engram(_Tokenizer())
@@ -675,6 +703,90 @@ def test_full_40_layer_backbone_engram_and_final_mix(monkeypatch):
     )
     assert forwarded["engram_previous_tokens"] is previous
     assert forwarded["input_embeds"] is forwarded["pp_inbound"] is None
+
+
+def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
+    monkeypatch,
+):
+    """Layers below the candidate source see every row; the candidate source
+    writes its global KV for every row and then narrows to the decoder view;
+    every later layer, its collectives and the DSpark taps run on the view;
+    the sampled rows are the view's logits rows."""
+    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    torch.manual_seed(7)
+    config = _config()
+    model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", False, "gpu")
+    _initialize(model)
+    model.initialize_engram(_Tokenizer())
+    # Taps at, before and after the narrowing layer all reach the drafter in
+    # the narrowed layout ctx.captured_rows reports.
+    model.dspark_capture_layers = (19, 20, 39)
+    # Request 0 continues past this chunk (one decoder row); request 1
+    # completes its prompt (both rows).
+    ids = torch.tensor([0, 3, 4, 6, 3, 4])
+    positions = torch.tensor([0, 1, 2, 3, 0, 1])
+    requests = torch.tensor([0, 0, 0, 0, 1, 1])
+    keep_rows = torch.tensor([3, 4, 5])
+    tail = SimpleNamespace(
+        positions=positions[keep_rows], request_indices=requests[keep_rows]
+    )
+    view = V41DecoderView(
+        tail,
+        tail,
+        (V41PrefillSpan(0, 0, 3, 1, 3), V41PrefillSpan(1, 1, 0, 2, 0)),
+        keep_rows,
+        torch.tensor([0, 2]),
+    )
+    backend = _Backend(positions, requests, view)
+    ctx = _ctx(backend, 6, ForwardMode.EXTEND)
+    ctx.capture_hidden_mode = CaptureHiddenMode.FULL
+    seen = {}
+
+    def observe(layer_id):
+        def hook(module, args):
+            hidden, _, layer_positions, image_mask, layer_ctx, rows = args
+            seen[layer_id] = (
+                hidden.shape[0],
+                layer_positions.tolist(),
+                layer_ctx.collective_num_tokens,
+                rows.keep_rows is not None,
+            )
+
+        return hook
+
+    handles = [
+        model.layers[i].register_forward_pre_hook(observe(i)) for i in (19, 20, 21, 39)
+    ]
+    previous = torch.tensor([[-1, -1, -1], [0, -1, -1], [3, 0, -1], [4, 3, 0]])
+    previous = torch.cat((previous, previous[:2]))
+    actual, aux = model(
+        ids,
+        positions,
+        ctx,
+        None,
+        None,
+        engram_previous_tokens=previous,
+        engram_token_mask=torch.ones(6, dtype=torch.bool),
+        image_mask=None,
+    )
+    for handle in handles:
+        handle.remove()
+    assert seen[19] == (6, [0, 1, 2, 3, 0, 1], None, False)
+    assert seen[20] == (6, [0, 1, 2, 3, 0, 1], 3, True)
+    assert seen[21] == (3, [3, 0, 1], 3, False)
+    assert seen[39] == (3, [3, 0, 1], 3, False)
+    rows_attended = {layer: q.shape[0] for layer, q, *_ in backend.calls}
+    assert all(rows_attended[layer] == 6 for layer in range(20))
+    assert all(rows_attended[layer] == 3 for layer in range(20, 40))
+    # Every owner wrote from all six rows: the ratio-2 owners their pair
+    # rows, the candidate source (which then narrows) every token row.
+    assert sorted(backend.global_writes) == [2, 8, 14, 20]
+    assert all(w[2].numel() == 6 for w in backend.global_writes.values())
+    assert backend.global_writes[20][2].tolist() == positions.tolist()
+    assert actual.shape == (2, config.hidden_size)
+    assert [h.shape for h in aux] == [(3, config.hidden_size)] * 3
+    assert ctx.captured_rows == CapturedRows(tail.positions, ((0, 1), (1, 2)))
+    assert torch.isfinite(actual).all()
 
 
 def test_upstream_rope_and_hc_methods():
@@ -754,15 +866,22 @@ def test_cuda_exact_fp8_linear_and_engram_method(monkeypatch):
     x = torch.randn(5, 128, dtype=torch.bfloat16, device="cuda:0")
     x[0] = 0
     x[1] *= 1e-6
-    codes, sf = v41_quantize_fp8(x)
-    dequant = (
-        codes.float().unflatten(-1, (-1, 32))
-        * sf.view(torch.float8_e8m0fnu).float().unsqueeze(-1)
-    ).flatten(-2)
     actual, _ = linear(x, block_scale=None, output_dtype=None)
-    expected = F.linear(dequant, weight.float() / 64).to(torch.bfloat16)
-    torch.testing.assert_close(actual, expected, rtol=0.015, atol=0.002)
-    assert linear.weight.dtype == torch.float8_e4m3fn
+    if current_platform().is_hopper:
+        # Hopper expands the weights to BF16 and leaves the activations alone.
+        assert linear.weight.dtype == torch.bfloat16
+        assert linear.weight_scale_inv is None
+        expected = F.linear(x.float(), weight.float() / 64).to(torch.bfloat16)
+        torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.002)
+    else:
+        codes, sf = v41_quantize_fp8(x)
+        dequant = (
+            codes.float().unflatten(-1, (-1, 32))
+            * sf.view(torch.float8_e8m0fnu).float().unsqueeze(-1)
+        ).flatten(-2)
+        expected = F.linear(dequant, weight.float() / 64).to(torch.bfloat16)
+        torch.testing.assert_close(actual, expected, rtol=0.015, atol=0.002)
+        assert linear.weight.dtype == torch.float8_e4m3fn
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured, _ = linear(x, block_scale=None, output_dtype=None)
@@ -774,8 +893,8 @@ def test_cuda_exact_fp8_linear_and_engram_method(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("capture_decode", [False, True])
-def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, capture_decode):
+@pytest.mark.parametrize("execution_mode", ["eager", "decode", "prefill"])
+def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode):
     config = _config()
     config.hidden_size = 256
     config.moe_intermediate_size = 256
@@ -786,7 +905,11 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, capture_decode
     torch.manual_seed(41)
     with torch.device("cuda:0"):
         adapter = DeepseekV41ForCausalLM(
-            SimpleNamespace(text_config=config), _mapping(0, 1, 1), _quant(), "", False
+            SimpleNamespace(text_config=config),
+            _mapping(0, 1, 1),
+            _quant(),
+            is_multimodal_active=False,
+            mm_attention_backend=None,
         )
     adapter.load_weights(
         _bind_engram_tables(adapter, _checkpoint(config), tmp_path).items()
@@ -801,7 +924,7 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, capture_decode
     backend = _backend("cuda:0", 2)
     backend.cache_pool.arena.buffer.zero_()
     tables = _tables("cuda:0")
-    meta = _extend(backend, tables, [4], [0])
+    meta = _extend(backend, tables, [4], [0], [0], [4])
     ctx = _ctx(backend, 4, ForwardMode.EXTEND)
     ids = torch.tensor([0, 3, 4, 6], device="cuda:0")
     previous = torch.tensor(
@@ -816,6 +939,7 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, capture_decode
         None,
         engram_previous_tokens=previous,
         engram_token_mask=mask,
+        image_mask=None,
     )
     assert actual.shape == (4, 256) and torch.isfinite(actual).all()
     # All 40 layers use the same decode path; the first decode has no ratio-2 row.
@@ -838,14 +962,131 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, capture_decode
         None,
         engram_previous_tokens=torch.tensor([[6, 4, 3]], device="cuda:0"),
         engram_token_mask=mask[:1],
+        image_mask=None,
     )
     assert decoded.shape == (1, 256) and torch.isfinite(decoded).all()
-    if not capture_decode:
+    if execution_mode == "eager":
+        return
+    if execution_mode == "prefill":
+        _assert_chunked_prefill_replays_and_narrows(adapter, backend, tables)
         return
 
     _assert_decode_graph_matches_eager(
         adapter, backend, tables, "cuda:0", ((6, 1), (7, 1), (8, 1), (1, 0), (9, 1))
     )
+
+
+@torch.inference_mode()
+def _assert_chunked_prefill_replays_and_narrows(adapter, backend, tables):
+    """A prompt prefilled in two chunks and the same prompt admitted on a
+    prefix hit (replaying the cached window) sample the same next token; the
+    decoder runs on one row per non-final chunk and on the last window of a
+    final one."""
+    device = backend.device
+    length, hit, window = 200, 128, 128
+    torch.manual_seed(3)
+    prompt = torch.randint(0, 7, (length,), device=device)
+    history = torch.stack(
+        [
+            torch.cat((torch.full((d,), -1, device=device), prompt[:-d]))
+            for d in (1, 2, 3)
+        ],
+        dim=1,
+    )
+    arena = backend.cache_pool.arena.buffer
+    arena.zero_()
+    # Every window the model hands the backend -- full rows and the decoder
+    # view alike -- must plan from host spans; a device snapshot would also
+    # look back past the replay start.
+    canonical_window = backend._window
+
+    def checked_window(positions, requests, mode):
+        found = canonical_window(positions, requests, mode)
+        assert found is not None, "decoder rows fell back to a device snapshot"
+        return found
+
+    backend._window = checked_window
+
+    def run(request, tables, start, count, replay, prompt_len):
+        counts = torch.tensor([count], dtype=torch.int32)
+        prefix = torch.tensor([start], dtype=torch.int32)
+        backend.init_forward_metadata(
+            1,
+            1,
+            torch.tensor([request], device=device),
+            (counts + prefix).to(device),
+            ForwardMode.EXTEND,
+            block_tables=tables,
+            extend_seq_lens=counts.to(device),
+            extend_seq_lens_cpu=counts,
+            extend_prefix_lens=prefix.to(device),
+            extend_prefix_lens_cpu=prefix,
+            extend_replay_lens_cpu=torch.tensor([replay], dtype=torch.int32),
+            extend_prompt_lens_cpu=torch.tensor([prompt_len], dtype=torch.int32),
+            extend_with_prefix=start > 0,
+        )
+        rows = slice(start, start + count)
+        ctx = ForwardContext(
+            attn_backend=backend,
+            token_to_kv_pool=backend.cache_pool,
+            bs=1,
+            num_extends=1,
+            input_num_tokens=count,
+            forward_mode=ForwardMode.EXTEND,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            gather_ids=torch.tensor([count - 1], device=device),
+        )
+        output = adapter(
+            ctx=ctx,
+            input_ids=prompt[rows],
+            positions=backend.query_metadata(ForwardMode.EXTEND).positions,
+            engram_previous_tokens=history[rows],
+            engram_token_mask=torch.ones(count, dtype=torch.bool, device=device),
+            image_mask=None,
+        )
+        assert output.next_token_logits.shape[0] == 1
+        assert torch.isfinite(output.next_token_logits).all()
+        return output.next_token_logits.clone(), backend.decoder_view()
+
+    # Request 0: a non-final chunk keeps one decoder row, the final chunk the
+    # prompt's last window.
+    _, view = run(0, tables, 0, 72, 0, length)
+    assert view.metadata.positions.tolist() == [71]
+    assert view.logits_rows.tolist() == [0]
+    chunked, view = run(0, tables, 72, length - 72, 0, length)
+    assert view.keep_rows is None and view.logits_rows is None
+    assert view.metadata.positions.tolist() == list(range(72, length))
+    # Request 1 hits request 0's global rows [0, hit) and replays the window
+    # before the hit into its own SWA/tail pages; the rows above the hit get
+    # private global pages.
+    hit_pages = {2: tables[R2][0, : hit // 128], 8: tables[R2][0, : hit // 128]}
+    hit_pages[14] = hit_pages[2]
+    hit_pages[20] = tables[R1][0, : hit // 64]
+    hit_tables = {gid: table.clone() for gid, table in tables.items()}
+    hit_tables[R2][1, : hit // 128] = hit_pages[2]
+    hit_tables[R1][1, : hit // 64] = hit_pages[20]
+    pool = backend.cache_pool
+    aliased = {
+        (owner, name): getattr(pool, name)(owner)[pages].clone()
+        for owner, pages in hit_pages.items()
+        for name in ("global_kv", "index_k")
+    }
+    replayed, view = run(
+        1, hit_tables, hit - window, length - (hit - window), window, length
+    )
+    assert view.metadata.positions.tolist() == list(range(length - window, length))
+    # The FP8 projections quantize each activation row alone, so a row's result
+    # never depends on its batch; Hopper's BF16 GEMM picks its tiling by M and
+    # differs between the replay and the chunk by BF16 rounding.
+    if current_platform().is_hopper:
+        torch.testing.assert_close(replayed, chunked, rtol=2**-6, atol=2**-7)
+    else:
+        torch.testing.assert_close(replayed, chunked, rtol=0, atol=0)
+    # The replayed rows never rewrote the hit's global rows.
+    for (owner, name), before in aliased.items():
+        torch.testing.assert_close(
+            getattr(pool, name)(owner)[hit_pages[owner]], before, rtol=0, atol=0
+        )
 
 
 def _assert_decode_graph_matches_eager(adapter, backend, tables, device, steps):
@@ -863,6 +1104,7 @@ def _assert_decode_graph_matches_eager(adapter, backend, tables, device, steps):
             positions=backend.query_metadata(ForwardMode.DECODE).positions,
             engram_previous_tokens=previous,
             engram_token_mask=mask,
+            image_mask=None,
         ).next_token_logits
 
     stream = torch.cuda.Stream()
@@ -978,7 +1220,11 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
         config.qk_rope_head_dim, config.q_lora_rank = 64, 128
         with torch.device(device):
             adapter = DeepseekV41ForCausalLM(
-                SimpleNamespace(text_config=config), mapping, _quant(), "", False
+                SimpleNamespace(text_config=config),
+                mapping,
+                _quant(),
+                is_multimodal_active=False,
+                mm_attention_backend=None,
             )
         adapter.load_weights(
             _bind_engram_tables(adapter, _checkpoint(config), tmp_path).items()
@@ -993,7 +1239,7 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
         )
         backend = _backend(str(device), 2)
         tables = _tables(str(device))
-        meta = _extend(backend, tables, [4], [0])
+        meta = _extend(backend, tables, [4], [0], [0], [4])
         ids = torch.tensor([0, 3, 4, 6], device=device)
         previous = torch.tensor(
             [[-1, -1, -1], [0, -1, -1], [3, 0, -1], [4, 3, 0]], device=device
@@ -1006,6 +1252,7 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
             None,
             engram_previous_tokens=previous,
             engram_token_mask=torch.ones(4, dtype=torch.bool, device=device),
+            image_mask=None,
         )
         assert result.shape == (4, 512) and torch.isfinite(result).all()
         gathered = [torch.empty_like(result) for _ in range(4)]
@@ -1025,10 +1272,11 @@ def _loader_config():
     config.engram_layer_ids = [1]
     config.engram_num_embeddings = [72]
     config.kv_source_layer_ids = config.index_source_layer_ids = [2]
+    config.candidate_source_layer_id = 2
     return config
 
 
-def _loader_model(monkeypatch, config, rank, device):
+def _mock_loader_hardware(monkeypatch):
     # Keep real V4 MegaMoE allocation and per-expert loading; only hardware
     # plan/finalization are mocked in CPU/meta checkpoint tests.
     monkeypatch.setattr(v4, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
@@ -1037,10 +1285,18 @@ def _loader_model(monkeypatch, config, rank, device):
     monkeypatch.setattr(pg_manager, "get_device_process_group", lambda group: None)
     monkeypatch.setattr(v4.DeepseekV4MegaMoEExperts, "finalize_weights", Mock())
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
+
+
+def _loader_model(monkeypatch, config, rank, device):
+    _mock_loader_hardware(monkeypatch)
     wrapper = SimpleNamespace(text_config=config)
     with torch.device(device):
         return DeepseekV41ForCausalLM(
-            wrapper, _mapping(rank, 4, 4), _quant(), "", False
+            wrapper,
+            _mapping(rank, 4, 4),
+            _quant(),
+            is_multimodal_active=False,
+            mm_attention_backend=None,
         )
 
 
@@ -1154,6 +1410,78 @@ def _checkpoint(config):
 
 
 @pytest.mark.parametrize(
+    "active,encoder_only", [(True, False), (False, False), (True, True)]
+)
+def test_multimodal_checkpoint_load(monkeypatch, tmp_path, active, encoder_only):
+    _mock_loader_hardware(monkeypatch)
+    text_config = _loader_config()
+    config = SimpleNamespace(
+        text_config=text_config,
+        vision_config=SimpleNamespace(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            patch_size=2,
+            downsample_ratio=2,
+            rope_theta=10000,
+        ),
+        encoder_only=encoder_only,
+    )
+    with set_default_torch_dtype(torch.bfloat16):
+        model = v41.DeepseekV41ForCausalLM(
+            config=config,
+            mapping=_mapping(0, 4, 4),
+            quant_config=_quant(),
+            is_multimodal_active=active,
+            mm_attention_backend="triton_attn",
+        )
+    weights = {} if encoder_only else _checkpoint(text_config)
+    if active:
+        for name, param in model.vision.named_parameters():
+            raw = name.replace(".attn.qkv_proj.", ".attn.wqkv.").replace(
+                ".attn.proj.", ".attn.wo."
+            )
+            module = model.vision.get_submodule(name.rpartition(".")[0])
+            shape = tuple(param.shape)
+            if isinstance(module, LinearBase):
+                shape = (
+                    (module.output_size, module.input_size)
+                    if param.ndim == 2
+                    else (module.output_size,)
+                )
+            weights[raw] = torch.full(shape, 0.25, dtype=param.dtype)
+    if not encoder_only:
+        for i in range(text_config.num_hidden_layers):
+            weights[f"layers.{i}.ffn.gate.bias_vl"] = torch.full(
+                (text_config.n_routed_experts,), 0.5, dtype=torch.float32
+            )
+    rest = _bind_engram_tables(model, weights, tmp_path)
+    model.load_weights(("model." + name, tensor) for name, tensor in rest.items())
+    if active:
+        for param in model.vision.parameters():
+            torch.testing.assert_close(param, torch.full_like(param, 0.25))
+    if encoder_only:
+        assert model.model is model.lm_head is model.logits_processor is None
+    else:
+        model.set_dspark_layers_to_capture([0, 2])
+        assert model.model.dspark_capture_layers == (0, 2)
+        embed, head = model.get_embed_and_head()
+        assert embed is model.get_input_embeddings().weight
+        assert head is model.lm_head.weight
+        if active:
+            assert "bias_vl" not in model.checkpoint_load_report["skipped"]
+            for layer in model.model.layers:
+                torch.testing.assert_close(
+                    layer.ffn.gate.bias_vl,
+                    torch.full_like(layer.ffn.gate.bias_vl, 0.5),
+                )
+        else:
+            assert model.vision is None
+            assert model.checkpoint_load_report["skipped"]["bias_vl"] == 3
+
+
+@pytest.mark.parametrize(
     "rank,prefixed,reverse",
     [(0, False, False), (1, True, True), (2, False, True), (3, True, False)],
 )
@@ -1206,13 +1534,21 @@ def test_strict_checkpoint_load_tp4_ep4(monkeypatch, rank, prefixed, reverse, tm
         )
         expected = (raw * scales).bfloat16().chunk(4, 0)[rank]
         torch.testing.assert_close(layer.attn.wo_a.weight, expected, rtol=0, atol=0)
-        assert layer.attn.wq_b.weight.dtype == torch.float8_e4m3fn
-        torch.testing.assert_close(
-            layer.attn.wq_b.weight.view(torch.uint8),
-            weights[a + ".wq_b.weight"].view(torch.uint8).chunk(4, 0)[rank],
-            rtol=0,
-            atol=0,
-        )
+        codes = weights[a + ".wq_b.weight"].chunk(4, 0)[rank]
+        if current_platform().is_hopper:
+            # Loaded straight into BF16; scales fold in after loading.
+            assert layer.attn.wq_b.weight.dtype == torch.bfloat16
+            torch.testing.assert_close(
+                layer.attn.wq_b.weight, codes.to(torch.bfloat16), rtol=0, atol=0
+            )
+        else:
+            assert layer.attn.wq_b.weight.dtype == torch.float8_e4m3fn
+            torch.testing.assert_close(
+                layer.attn.wq_b.weight.view(torch.uint8),
+                codes.view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
         shared = layer.ffn.shared_experts.gate_up_proj
         for slot, shard in enumerate(("w1", "w3")):
             source = (
@@ -1448,17 +1784,25 @@ def test_generic_safetensors_engram_load_is_bounded(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("topk", [1, 2])
-def test_routing_matches_reference_bias_and_normalization(topk):
+@pytest.mark.parametrize(
+    "vision,with_images", [(False, False), (True, False), (True, True)]
+)
+def test_routing_matches_reference_bias_and_normalization(topk, vision, with_images):
     logits = torch.tensor([[-100.0, -99.0, -98.0, -97.0], [0.0, 1.0, 2.0, 3.0]])
     bias = torch.tensor([4.0, 3.0, 0.0, 0.0])
+    bias_vl = torch.tensor([0.0, 0.0, 5.0, 0.0]) if vision else None
+    image_mask = torch.tensor([False, True]) if with_images else None
     moe = v41.DeepseekV41MoE.__new__(v41.DeepseekV41MoE)
     nn.Module.__init__(moe)
     moe.config = SimpleNamespace(num_experts_per_tok=topk, norm_topk_prob=True)
-    moe.gate = SimpleNamespace(weight=torch.eye(4), e_score_correction_bias=bias)
+    moe.gate = SimpleNamespace(
+        weight=torch.eye(4), e_score_correction_bias=bias, bias_vl=bias_vl
+    )
     moe.hash_indices_dtype = torch.int64
-    weights, ids, scores = moe._select_experts(logits, None)
+    weights, ids, scores = moe._select_experts(logits, image_mask)
     expected_scores = F.softplus(logits).sqrt()
-    expected_ids = (expected_scores + bias).topk(topk, dim=-1).indices
+    expected_bias = torch.stack([bias, bias_vl]) if with_images else bias
+    expected_ids = (expected_scores + expected_bias).topk(topk, dim=-1).indices
     expected_weights = expected_scores.gather(1, expected_ids)
     if topk > 1:
         expected_weights /= expected_weights.sum(-1, keepdim=True) + 1e-20

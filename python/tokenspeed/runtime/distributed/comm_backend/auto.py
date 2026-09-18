@@ -194,6 +194,7 @@ class AutoBackend(CommBackend):
         producer_direct_max_numel: int,
         attnres_max_numel: int,
         attnres_max_rows: int,
+        enable_lamport: bool,
         dtype: torch.dtype,
     ) -> bool:
         if (
@@ -209,6 +210,7 @@ class AutoBackend(CommBackend):
             producer_direct_max_numel=producer_direct_max_numel,
             attnres_max_numel=attnres_max_numel,
             attnres_max_rows=attnres_max_rows,
+            enable_lamport=enable_lamport,
             dtype=dtype,
         )
 
@@ -275,10 +277,10 @@ class AutoBackend(CommBackend):
 
         return self._nccl.all_gather(tensor, group, dim)
 
-    def all_gather_into_tensor(
+    def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None:
-        return self._nccl.all_gather_into_tensor(output, input, group)
+        return self._nccl.all_gather_single(output, input, group)
 
     def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor:
         return self._nccl.reduce_scatter(tensor, group)

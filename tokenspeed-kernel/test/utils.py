@@ -53,6 +53,11 @@ def is_amd() -> bool:
     return platform is not None and platform.is_amd
 
 
+def is_nvidia() -> bool:
+    platform = detected_platform()
+    return platform is not None and platform.is_nvidia
+
+
 def is_cdna4() -> bool:
     platform = detected_platform()
     return platform is not None and platform.is_cdna4

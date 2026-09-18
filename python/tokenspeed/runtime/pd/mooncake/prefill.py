@@ -100,9 +100,9 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         self.layerwise_interval = 1
         self.layerwise_debug = envs.TOKENSPEED_PD_LAYERWISE_DEBUG.get()
         self.step_counter = None
-        # room -> (bootstrap_token, spec_candidate_ids). Published after the prefill
-        # forward; the transfer thread reads it on the wait_for_bootstrap_token path.
+        # Bootstrap metadata is published after the final forward commits.
         self.prefill_metadata: dict[int, tuple[int, list[int] | None]] = {}
+        self.cached_tokens: dict[int, int] = {}
         self.bootstrap_token_cond = threading.Condition()
         # Determine the number of threads to use for kv sender
         cpu_count = os.cpu_count()
@@ -159,16 +159,20 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     room,
                 )
                 return
-            self.prefill_metadata[room] = (
-                token,
-                spec_candidate_ids,
-            )
+            self.prefill_metadata[room] = (token, spec_candidate_ids)
             self.bootstrap_token_cond.notify_all()
+
+    def record_cached_tokens(self, room: int, cached_tokens: int) -> None:
+        """Publish committed prefix-hit usage before the final transfer is submitted."""
+        with self.bootstrap_token_cond:
+            if self.request_status.get(room) not in (None, TransferPoll.Failed):
+                self.cached_tokens[room] = cached_tokens
 
     def begin_room(self, room: int) -> None:
         """Reset request metadata before publishing a room."""
         with self.bootstrap_token_cond:
             self.prefill_metadata.pop(room, None)
+            self.cached_tokens.pop(room, None)
         self.update_status(room, TransferPoll.Bootstrapping)
 
     def discard_room(self, room: int) -> None:
@@ -177,6 +181,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         self.request_status.pop(room, None)
         with self.bootstrap_token_cond:
             self.prefill_metadata.pop(room, None)
+            self.cached_tokens.pop(room, None)
             self.bootstrap_token_cond.notify_all()
 
     def _wait_prefill_metadata(
@@ -293,7 +298,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         """Validate and cache the route owned by this Prefill rank once."""
         # Plan against the LOGICAL layout (full model): peer validation and
         # fragment geometry must match what Decode sees on the wire. The
-        # window filter below keeps only fields this stage's physical arena
+        # field filter below keeps only fields this stage's physical arena
         # actually holds, so local addressing never touches a dropped plane.
         layout = getattr(self.kv_args, "wire_layout", None) or self.kv_args.cache_layout
         peer_layout = registration.peer_cache_layout
@@ -304,10 +309,10 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             decode_tp_size=registration.decode_tp_size,
             prefill_layout=layout,
             decode_layout=peer_layout,
-            # PP: this stage transfers only its own layers' fields; the other
-            # stages run their own planners over their windows, and the union
-            # covers the whole plan on the Decode side.
-            prefill_layer_window=getattr(self.kv_args, "pp_layer_window", None),
+            # Construction declares residency; transfer never infers model layers.
+            prefill_field_ids=frozenset(
+                self.kv_args.cache_fields_by_stage[self.topology.pp_rank]
+            ),
         )
         route = planner.plan_for_decode_rank(registration.decode_tp_rank)
         expected_decode_ranks = planner.decode_ranks_by_prefill_rank[local_tp_rank]
@@ -674,7 +679,6 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         )
         if self.check_status(kv_chunk.room) == TransferPoll.Failed:
             return False
-        self.update_status(kv_chunk.room, TransferPoll.Success)
         for req, registration in registered_reqs:
             self.sync_status_to_decode_endpoint(
                 registration.endpoint,
@@ -685,6 +689,9 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 bootstrap_token=bootstrap_token,
                 spec_candidate_ids=spec_candidate_ids,
             )
+        # Publish terminal state only after all notifications have read usage;
+        # the control plane may discard room metadata as soon as Success is visible.
+        self.update_status(kv_chunk.room, TransferPoll.Success)
         return True
 
     @property
@@ -719,6 +726,8 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             if spec_candidate_ids is not None
             else b""
         )
+        with self.bootstrap_token_cond:
+            cached_tokens = self.cached_tokens.get(room, 0)
         socket, lock = self._connect("tcp://" + remote + ":" + str(dst_port))
         with lock:
             socket.send_multipart(
@@ -728,6 +737,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     str(prefill_rank).encode("ascii"),
                     str(bootstrap_token).encode("ascii"),
                     spec_candidate_payload,
+                    str(cached_tokens).encode("ascii"),
                 ]
             )
 
@@ -871,7 +881,6 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     spec_candidate_ids = kv_chunk.spec_candidate_ids
                 if self.check_status(kv_chunk.room) == TransferPoll.Failed:
                     continue
-                self.update_status(kv_chunk.room, TransferPoll.Success)
                 for req in reqs:
                     registration = self.get_decode_registration(req)
                     self.sync_status_to_decode_endpoint(
@@ -883,6 +892,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                         bootstrap_token=bootstrap_token,
                         spec_candidate_ids=spec_candidate_ids,
                     )
+                self.update_status(kv_chunk.room, TransferPoll.Success)
                 self.transfer_infos.pop(kv_chunk.room, None)
             except Exception as exc:
                 logger.exception("CachePD transfer failed for room=%s", kv_chunk.room)
@@ -1138,15 +1148,12 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
 
         bootstrap_server_url = f"{ip_address}:{self.bootstrap_port}"
         url = f"http://{bootstrap_server_url}/route"
-        pp_layer_partition = getattr(self.topology, "pp_layer_partition", None)
         payload = {
             "role": "Prefill",
             "world_size": self.topology.world_size,
             "dp_size": self.topology.dp_size,
             "pp_size": self.topology.pp_size,
-            "pp_layer_partition": (
-                list(pp_layer_partition) if pp_layer_partition else None
-            ),
+            "cache_fields_by_stage": self.kv_args.cache_fields_by_stage,
             "rank_ip": get_local_ip_by_remote(),
             "rank_port": self.rank_port,
             "engine_rank": self.topology.global_rank,

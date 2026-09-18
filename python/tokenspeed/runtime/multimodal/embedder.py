@@ -622,7 +622,7 @@ class MultimodalEmbedder:
         if all(rows == first_rank_rows for rows in token_counts_by_rank):
             # The flat API writes NCCL's equal-size all-gather directly into
             # the final contiguous rank-major output buffer.
-            torch.distributed.all_gather_into_tensor(
+            torch.distributed.all_gather_single(
                 gathered,
                 local_output,
                 group=process_group,

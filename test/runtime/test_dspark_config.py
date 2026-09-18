@@ -425,7 +425,11 @@ def _draft_attn_config(algorithm: str, layer_types: tuple[str, ...]):
         chunked_prefill_size=8192,
         disaggregation_mode="null",
         attn_tp_size=4,
-        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=4, dp_size=1)),
+        mapping=SimpleNamespace(
+            attn=SimpleNamespace(
+                tp_size=4, dp_size=1, dcp_size=1, dcp_rank=0, dcp_group=(0,)
+            )
+        ),
     )
     model_config = SimpleNamespace(
         hf_config=SimpleNamespace(layer_types=layer_types, sliding_window=1024),

@@ -142,13 +142,16 @@ class MoELayer(torch.nn.Module):
                 f"num_experts ({num_experts}) must be divisible by ep_size "
                 f"({self.ep_size}) for contiguous expert ownership"
             )
-        num_local_experts = num_experts // self.ep_size
+        self.num_local_experts = num_experts // self.ep_size
 
-        self.num_local_experts = num_local_experts
+        # TODO: Unify alltoall backends at MoELayer level
+        a2a_backend = get_all2all_backend().value
+        if a2a_backend in ("agrs", "flashinfer"):
+            a2a_backend = "none"
         self._spec = MoELayerSpec(
             top_k=top_k,
             num_experts=num_experts,
-            num_local_experts=num_local_experts,
+            num_local_experts=self.num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             activation=activation,
@@ -157,7 +160,7 @@ class MoELayer(torch.nn.Module):
             ep_rank=self.ep_rank,
             ep_size=self.ep_size,
             prefix=prefix,
-            a2a_backend=get_all2all_backend().value,
+            a2a_backend=a2a_backend,
         )
 
         # Routing config
@@ -227,27 +230,28 @@ class MoELayer(torch.nn.Module):
         if input_dtype not in {torch.float16, torch.bfloat16}:
             input_dtype = torch.float16
 
-        deepep_group = None
+        # Moe Backend plan
+        moe_backend = get_moe_backend().value
+        moe_backend = None if moe_backend == "auto" else moe_backend
+        process_group = None
         deepep_mode = None
         deepep_low_latency_max_num_tokens_per_gpu = None
         if self._spec.use_deepep:
             mapping = global_server_args_dict["mapping"]
-            deepep_group = pg_manager.get_process_group(
+            process_group = pg_manager.get_process_group(
                 "nccl",
                 mapping.moe.tp_ep_group,
             )
             deepep_mode = get_deepep_mode().value
-            # Pin the low-latency capacity from the server arg: the DeepEP
-            # buffer is allocated once, on the first forward that dispatches,
-            # so sizing it from that batch would make decode depend on
-            # whichever batch happened to arrive first.
+            # Pin capacity before common weight processing reserves the DeepEP
+            # buffer. The first dispatch must not choose persistent capacity
+            # from whichever batch happens to arrive first.
             deepep_low_latency_max_num_tokens_per_gpu = global_server_args_dict[
                 "low_latency_max_num_tokens_per_gpu"
             ]
-
-        # Moe Backend plan
-        moe_backend = get_moe_backend().value
-        moe_backend = None if moe_backend == "auto" else moe_backend
+        elif moe_backend == "mega_moe":
+            mapping = global_server_args_dict["mapping"]
+            process_group = pg_manager.get_device_process_group(mapping.moe.ep_group)
         self.plan = tokenspeed_kernel.moe_plan(
             self._quant_kind,
             input_dtype=input_dtype,
@@ -260,7 +264,7 @@ class MoELayer(torch.nn.Module):
             fp8_scale_block_shape=fp8_scale_block_shape,
             internal_activation_dtype=internal_activation_dtype,
             with_bias=with_bias,
-            deepep_group=deepep_group,
+            process_group=process_group,
             deepep_mode=deepep_mode,
             deepep_low_latency_max_num_tokens_per_gpu=(
                 deepep_low_latency_max_num_tokens_per_gpu
@@ -343,7 +347,7 @@ class MoELayer(torch.nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         topk_output: TopKOutput,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
@@ -357,7 +361,9 @@ class MoELayer(torch.nn.Module):
         """Run the planned MoE kernel over this layer's weights.
 
         Args:
-            hidden_states: ``[tokens, hidden]`` local hidden states.
+            hidden_states: ``[tokens, hidden]`` local hidden states, or a
+                ``(packed_nvfp4, block_scales)`` pair for kernels accepting
+                prequantized input. Block scales use linear per-token layout.
             topk_output: Routing result, or the raw logits when the kernel
                 routes itself.
             num_global_tokens: Token count summed over the attention DP ranks.
@@ -394,6 +400,8 @@ class MoELayer(torch.nn.Module):
             self.support_routing and not self.supports_precomputed_topk
         )
         if use_kernel_routing:
+            if topk_output.router_logits is None:
+                raise ValueError("in-kernel MoE routing requires router logits")
             if not self.support_routing:
                 raise ValueError(
                     "selected MoE kernel does not support in-kernel routing"

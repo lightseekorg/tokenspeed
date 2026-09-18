@@ -63,6 +63,9 @@ public:
     // Host L2 prefix indexes were removed.
     bool ClearCache();
 
+    // Lifecycle counters read the current FSM state; they do not schedule work.
+    std::size_t BootstrappingSize() const;
+    // Submitted plus Retracted requests waiting for admission/readmission.
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
     std::size_t PrefillSize() const;
@@ -75,6 +78,10 @@ public:
     // TotalLcmBlocks - EmptyLcmBlocks - ActiveLcmBlocks.
     std::int32_t EmptyLcmBlocks() const { return coordinator_.NumEmptyLcmBlocks(); }
     std::int32_t ActiveLcmBlocks() const;
+    // RemotePrefilling only: a subset of PrefillSize(), never an extra total.
+    std::size_t RemotePrefillSize() const;
+    // Requests whose pages PD still pins. This resource count overlaps FSM states.
+    std::size_t PdTransferSize() const;
     std::int32_t RequestTokenSize(const std::string& id) const;
     // Maximum logical request extent that one request can reserve in an
     // otherwise reclaimable device pool. The runtime must enforce this limit
@@ -142,13 +149,11 @@ private:
     std::optional<CacheCoordinator::AdmissionResult> admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                            CacheCoordinator::PrefixProbe&& prefix,
                                                            std::span<const GroupDemand> demands,
+                                                           const RequestProgress& progress,
                                                            std::optional<std::uint64_t> request_access_epoch);
-    std::optional<CacheCoordinator::AdmissionResult> admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
-                                                           std::span<const GroupDemand> demands,
-                                                           std::uint64_t request_access_epoch);
     bool admitWithKvEventTracking(ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request,
-                                  const fsm::CacheProgress& cache_progress, std::int32_t new_prefix_hash_begin,
-                                  std::span<const GroupDemand> demands);
+                                  const fsm::CacheProgress& cache_progress, std::span<const GroupDemand> demands,
+                                  const RequestProgress& progress);
     std::vector<CacheKey> registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
                                                      std::int32_t first_page);
     void discardUncachedKvEventPages(std::span<const CacheKey> keys);
@@ -196,9 +201,9 @@ private:
         // the same candidates -- its first decode is next round's work).
         std::unordered_set<const Request*> scheduled;
         std::int32_t token_budget{0};
-        // Budget the decode batch must leave untouched: one state-checkpoint
-        // page for a pending local mamba prefill, which cannot advance in
-        // sub-page chunks (fused mixed mode only).
+        // Budget the decode batch must leave untouched for a pending local
+        // prefill that cannot advance in smaller chunks (MinPrefillChunkTokens;
+        // fused mixed mode only).
         std::int32_t state_prefill_reserve{0};
         bool pushed_prefill{false};
         bool pushed_decode{false};
@@ -277,9 +282,6 @@ private:
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                   Request* readmission, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
-
-    std::int32_t calculateMaxSingleRequestTokens(std::int64_t usable_lcm_blocks) const;
-    std::int64_t singleRequestLcmBlocksRequired(std::int32_t token_limit) const;
 
     SchedulerConfig config_;
     ReqPoolAllocator req_pool_allocator_;

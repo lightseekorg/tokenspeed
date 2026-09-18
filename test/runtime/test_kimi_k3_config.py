@@ -199,7 +199,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 self.w13_weight_scale = torch.empty(0)
                 self.w2_weight = torch.empty(0)
                 self.w2_weight_scale = torch.empty(0)
-                self.plan = {}
+                self.plan = {"weight_dtype": "unquant"}
                 self.supports_deferred_finalize = False
 
         class FakeSharedExperts(torch.nn.Module):
@@ -258,9 +258,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 kimi_k3.Kimi3MoEExecutionPlan, "build", return_value=plan
             ),
             mock.patch.object(
-                kimi_k3, "situ_moe_unavailable_reason", return_value=None
-            ),
-            mock.patch.object(
                 kimi_k3, "load_packaged_flashinfer_tuning_cache", lambda *a, **kw: None
             ),
             mock.patch.object(
@@ -308,6 +305,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
         built = self._build_moe_block(
             kimi_k3.Kimi3MoEExecutionPlan(
+                use_mega_moe=False,
                 use_native=False,
                 use_trtllm=True,
                 overlap_shared_experts=False,
@@ -331,6 +329,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
         built = self._build_moe_block(
             kimi_k3.Kimi3MoEExecutionPlan(
+                use_mega_moe=False,
                 use_native=False,
                 use_trtllm=True,
                 overlap_shared_experts=False,
@@ -374,6 +373,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
         built = self._build_moe_block(
             kimi_k3.Kimi3MoEExecutionPlan(
+                use_mega_moe=False,
                 use_native=False,
                 use_trtllm=True,
                 overlap_shared_experts=False,
@@ -391,6 +391,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
         built = self._build_moe_block(
             kimi_k3.Kimi3MoEExecutionPlan(
+                use_mega_moe=False,
                 use_native=False,
                 use_trtllm=False,
                 use_marlin=True,
@@ -413,6 +414,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
         built = self._build_moe_block(
             kimi_k3.Kimi3MoEExecutionPlan(
+                use_mega_moe=False,
                 use_native=False,
                 use_trtllm=True,
                 overlap_shared_experts=False,
@@ -523,9 +525,8 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
     def test_the_draft_states_a_rotation_of_one(self):
         """The draft runs its one block every step, so nothing rotates."""
-        from tokenspeed.runtime.models import kimi_k3, kimi_k3_nextn
+        from tokenspeed.runtime.models import kimi_k3_nextn
 
-        recorded: list[dict] = []
         config = KimiLinearConfig(
             hidden_size=64,
             routed_expert_hidden_size=32,
@@ -547,9 +548,10 @@ class KimiK3RegistrationTests(unittest.TestCase):
             ),
             mock.patch.object(
                 kimi_k3_nextn,
-                "KimiLinearMoE",
-                lambda **kw: recorded.append(kw) or torch.nn.Module(),
-            ),
+                "create_kimi_linear_moe",
+                autospec=True,
+                return_value=torch.nn.Module(),
+            ) as create_moe,
             mock.patch.object(
                 kimi_k3_nextn, "CommManager", lambda *a, **kw: SimpleNamespace()
             ),
@@ -559,13 +561,26 @@ class KimiK3RegistrationTests(unittest.TestCase):
             ),
         ):
             kimi_k3_nextn.KimiK3DraftDecoderLayer(
-                config=config, mapping=mapping, model_scope="draft"
+                config=config,
+                mapping=mapping,
+                model_scope="draft",
+                quant_config=None,
+                prefix="",
+                alt_stream=None,
             )
 
-        self.assertEqual(len(recorded), 1)
         # One block is a count the pool refuses; that refusal is pinned on the
         # op itself, in test_availability_needs_a_whole_number_of_rotations.
-        self.assertEqual(recorded[0]["moe_block_count"], 1)
+        create_moe.assert_called_once_with(
+            config=config,
+            mapping=mapping,
+            layer_index=0,
+            model_scope="draft",
+            moe_block_count=1,
+            quant_config=None,
+            prefix="block_sparse_moe",
+            alt_stream=None,
+        )
 
     def test_shard_predicate_requires_a_divisible_multi_rank_nvidia_group(self):
         """Each term of the shard predicate has to be visible on its own."""
@@ -574,7 +589,10 @@ class KimiK3RegistrationTests(unittest.TestCase):
         from tokenspeed.runtime.models import kimi_k3
 
         def mapping_for(tp_ep_size):
-            return SimpleNamespace(moe=SimpleNamespace(tp_ep_size=tp_ep_size))
+            return SimpleNamespace(
+                attn=SimpleNamespace(dp_size=1),
+                moe=SimpleNamespace(tp_ep_size=tp_ep_size),
+            )
 
         on_nvidia = torch.version.hip is None
         self.assertEqual(
@@ -612,7 +630,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
         layer = KimiLinearMoE.__new__(KimiLinearMoE)
         torch.nn.Module.__init__(layer)
         layer.execution_plan = SimpleNamespace(use_trtllm=True)
-        layer._gather_dp_tokens_for_moe = False
         layer.experts = SimpleNamespace(
             support_routing=True,
             supports_precomputed_topk=True,
@@ -695,12 +712,13 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 self.tp_group = kwargs["tp_group"]
 
         mapping = SimpleNamespace(
+            attn=SimpleNamespace(dp_size=1),
             moe=SimpleNamespace(
                 tp_ep_rank=0,
                 tp_ep_size=8,
                 has_tp_ep=True,
                 tp_ep_group=tuple(range(8)),
-            )
+            ),
         )
         activated = torch.empty(2, 768, dtype=torch.bfloat16)
         down_out = torch.empty(2, 7168, dtype=torch.bfloat16)
@@ -721,11 +739,15 @@ class KimiK3RegistrationTests(unittest.TestCase):
             layer = kimi_k3.KimiLinearMLP(
                 hidden_size=7168,
                 intermediate_size=6144,
-                mapping=mapping,
+                tp_rank=mapping.moe.tp_ep_rank,
+                tp_size=mapping.moe.tp_ep_size,
+                tp_group=mapping.moe.tp_ep_group,
                 quant_config=None,
                 prefix="shared_experts",
                 reduce_results=False,
                 is_shared_expert=True,
+                activation_situ_beta=1.0,
+                activation_situ_linear_beta=None,
             )
             actual = layer(
                 torch.empty(2, 7168, dtype=torch.bfloat16),
@@ -903,7 +925,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 self.w13_weight_scale = torch.empty(0)
                 self.w2_weight = torch.empty(0)
                 self.w2_weight_scale = torch.empty(0)
-                self.plan = {}
+                self.plan = {"weight_dtype": "unquant"}
                 self.activation_situ_linear_beta = kwargs["activation_situ_linear_beta"]
                 # Consumed by K3MoeTailComm arming (real MoELayer exposes it
                 # from the selected kernel's plan trait).
@@ -967,6 +989,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 kimi_k3.Kimi3MoEExecutionPlan,
                 "build",
                 return_value=kimi_k3.Kimi3MoEExecutionPlan(
+                    use_mega_moe=False,
                     use_native=True,
                     use_trtllm=False,
                     overlap_shared_experts=False,
@@ -1056,6 +1079,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 kimi_k3.Kimi3MoEExecutionPlan,
                 "build",
                 return_value=kimi_k3.Kimi3MoEExecutionPlan(
+                    use_mega_moe=False,
                     use_native=True,
                     use_trtllm=False,
                     overlap_shared_experts=False,
@@ -1096,6 +1120,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 kimi_k3.Kimi3MoEExecutionPlan,
                 "build",
                 return_value=kimi_k3.Kimi3MoEExecutionPlan(
+                    use_mega_moe=False,
                     use_native=True,
                     use_trtllm=False,
                     overlap_shared_experts=False,
@@ -1132,6 +1157,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 mock.Mock(),
                 num_global_tokens=1,
                 max_num_tokens_per_gpu=1,
+                do_finalize=True,
             ),
             routed_input + 1,
         )
@@ -1146,7 +1172,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             side_effect=AssertionError("zero tokens must bypass the fused pipeline")
         )
         layer = SimpleNamespace(
-            _gather_dp_tokens_for_moe=False,
+            mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=1)),
             native_latent_moe=native_latent_moe,
             _use_fused_decode_pipeline=True,
             _forward_fused_decode_pipeline=fused_pipeline,
@@ -1169,47 +1195,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
             max_num_tokens_per_gpu=0,
             prefix_sum=prefix_sum,
         )
-
-    def test_cross_dp_ep_gather_uses_dp_group_and_returns_local_offset(self):
-        from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
-
-        layer = KimiLinearMoE.__new__(KimiLinearMoE)
-        layer.mapping = SimpleNamespace(
-            attn=SimpleNamespace(
-                tp_size=8,
-                cp_size=1,
-                dp_size=4,
-                dp_rank=2,
-                dp_group=(2, 10, 18, 26),
-            )
-        )
-        ctx = SimpleNamespace(
-            collective_global_num_tokens=None,
-            global_num_tokens=[3] * 8 + [5] * 8 + [7] * 8 + [11] * 8,
-        )
-        hidden = torch.arange(14, dtype=torch.float32).reshape(7, 2)
-        prefix = hidden + 100
-        gathered = []
-
-        def gather(tensor, group, scattered_num_tokens):
-            gathered.append((tensor, group, scattered_num_tokens))
-            return torch.cat((tensor, tensor), dim=0)
-
-        with mock.patch(
-            "tokenspeed.runtime.models.kimi_k3.token_all_gather", side_effect=gather
-        ):
-            gathered_hidden, gathered_prefix, total, offset = layer._gather_dp_tokens(
-                hidden, prefix, ctx
-            )
-
-        self.assertEqual(total, 26)
-        self.assertEqual(offset, 8)
-        self.assertEqual(len(gathered), 2)
-        for _, group, counts in gathered:
-            self.assertEqual(group, (2, 10, 18, 26))
-            self.assertEqual(counts, [3, 5, 7, 11])
-        torch.testing.assert_close(gathered_hidden, torch.cat((hidden, hidden)))
-        torch.testing.assert_close(gathered_prefix, torch.cat((prefix, prefix)))
 
     def test_mla_gate_projection_uses_api_selected_layout(self):
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention

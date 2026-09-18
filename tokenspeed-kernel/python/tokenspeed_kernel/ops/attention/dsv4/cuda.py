@@ -220,7 +220,8 @@ if platform.is_nvidia and platform.is_hopper_plus:
             "num_heads": frozenset({64, 128}),
             "cache_layout": frozenset({"fp8_swa_page_planar"}),
             "topk_layout": frozenset({"global_slots"}),
-            "support_sink": frozenset({True}),
+            "support_sink": frozenset({True, False}),
+            "return_lse": frozenset({False, True}),
             "has_extra_segment": frozenset({False, True}),
             "metadata_dtypes": frozenset({torch.int32}),
         },
@@ -233,14 +234,15 @@ if platform.is_nvidia and platform.is_hopper_plus:
         swa_slots: torch.Tensor,
         swa_lens: torch.Tensor,
         swa_page_size: int,
-        attn_sink: torch.Tensor,
+        attn_sink: torch.Tensor | None,
         softmax_scale: float,
         extra_kv_cache: torch.Tensor | None = None,
         extra_slots: torch.Tensor | None = None,
         extra_lens: torch.Tensor | None = None,
         extra_page_size: int | None = None,
         out: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         q_kernel = q.unsqueeze(1)
         swa_indices = swa_slots.reshape(q.shape[0], 1, -1)
         row_bytes = _dsv4_fp8_row_bytes(q.shape[-1])
@@ -255,7 +257,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
                 row_bytes,
             )
             extra_indices = extra_slots.reshape(q.shape[0], 1, -1)
-        result, _ = flash_mla_with_kvcache(
+        result, lse = flash_mla_with_kvcache(
             q=q_kernel,
             k_cache=_fp8_page_planar_cache_view(
                 swa_kv_cache,
@@ -285,8 +287,8 @@ if platform.is_nvidia and platform.is_hopper_plus:
             result = result.squeeze(1)
         if out is not None:
             out.copy_(result)
-            return out
-        return result
+            result = out
+        return (result, lse) if return_lse else result
 
 
 if platform.is_nvidia and platform.is_hopper_plus:

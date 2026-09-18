@@ -364,15 +364,19 @@ def compare_runs(
                 comparison["base_median_us"] = _result_median(base_case)
                 comparisons.append(comparison)
                 continue
+            # The epoch separates performance-relevant operation semantics
+            # that intentionally retain the same stable case identity.
             if (
-                base_case["definition"] != candidate_case["definition"]
+                base_case["comparison_epoch"] != candidate_case["comparison_epoch"]
+                or base_case["definition"] != candidate_case["definition"]
                 or not timers_match
             ):
                 classification = (
                     "changed" if _case_succeeded(candidate_case) else "invalid"
                 )
                 detail = (
-                    "benchmark definition or timing configuration changed; "
+                    "comparison epoch, benchmark definition, or timing "
+                    "configuration changed; "
                     "measurements were not compared"
                     if classification == "changed"
                     else "changed candidate benchmark did not complete successfully"
@@ -521,9 +525,9 @@ def render_summary(report: Mapping[str, Any]) -> str:
         [
             "",
             (
-                "Comparisons require matching benchmark definitions, timing settings, "
-                "registrations, and hardware. The merge-base policy supplies the "
-                "regression and noise budgets."
+                "Comparisons require matching comparison epochs, benchmark "
+                "definitions, timing settings, registrations, and hardware. The "
+                "merge-base policy supplies the regression and noise budgets."
             ),
         ]
     )
