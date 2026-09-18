@@ -125,18 +125,20 @@ class TestAttentionBackendChoices(unittest.TestCase):
             hf_config=SimpleNamespace(full_attention_layer_ids=[1]),
             attention_arch=AttentionArch.MLA,
         )
-        for enabled in (False, True):
+        for disabled in (False, True):
             argv = ["--model", "x"]
-            if enabled:
-                argv.append("--enable-kda-prefill-graph")
+            if disabled:
+                argv.append("--disable-kda-prefill-graph")
             shared_args = prepare_server_args(argv)
-            self.assertIs(shared_args.enable_kda_prefill_graph, enabled)
+            self.assertIs(shared_args.disable_kda_prefill_graph, disabled)
+            self.assertFalse(shared_args.disable_prefill_graph)
+            self.assertFalse(shared_args.enforce_eager)
             # Simulate workers receiving the same serialized server arguments
             # despite conflicting legacy environment settings. Keep the real
             # KDA constructor so reintroducing a local env read fails this test.
             for worker_env in ("0", "1"):
                 with (
-                    self.subTest(enabled=enabled, worker_env=worker_env),
+                    self.subTest(disabled=disabled, worker_env=worker_env),
                     mock.patch.dict(
                         os.environ, {"TOKENSPEED_KDA_PREFILL_GRAPH": worker_env}
                     ),
@@ -159,7 +161,7 @@ class TestAttentionBackendChoices(unittest.TestCase):
                         is_kda=True,
                     )
                     self.assertIs(
-                        backend.linear_attn_backend._prefill_graph_enabled, enabled
+                        backend.linear_attn_backend._prefill_graph_enabled, not disabled
                     )
 
     def test_model_path_alias_sets_model(self):

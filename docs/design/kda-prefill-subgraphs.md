@@ -10,8 +10,9 @@ with the surrounding model operations. Fixed-capacity buffers let a capture
 handle different input lengths: the graph keeps the same addresses and launch
 shapes, while metadata supplies the live request boundaries and state pages.
 
-The feature is opt-in and currently requires the `cutedsl_kda` backend. It uses
-the existing prefill computation and scheduler-owned checkpoints.
+The feature is enabled by default for supported prefill batches on the
+`cutedsl_kda` backend when prefill graphs are enabled. It uses the existing
+prefill computation and scheduler-owned checkpoints.
 
 ## How it works
 
@@ -101,14 +102,13 @@ result reaches a real request or cache block. The live batch size is unchanged
 for MLA, output sampling and scheduling. Retained metadata is refreshed in place
 when a capture alternates between partially and fully occupied batches.
 
-## Enable the feature
+## Configure the feature
 
 For a supported KDA model, add these settings to your serving command. Keep the
 model's other options, such as tensor parallelism and quantization, as usual:
 
 ```bash
 tokenspeed serve /path/to/model \
-  --enable-kda-prefill-graph \
   --kda-backend cutedsl_kda \
   --chunked-prefill-size 4096 \
   --prefill-graph-max-tokens 4096 \
@@ -117,12 +117,10 @@ tokenspeed serve /path/to/model \
 ```
 
 Prefill graphs must remain enabled: omit `--disable-prefill-graph` and
-`--enforce-eager`. Omit `--enable-kda-prefill-graph` to turn off KDA graph capture
+`--enforce-eager`. Add `--disable-kda-prefill-graph` to turn off KDA graph capture
 while retaining the ordinary prefill and decode graph settings.
 
-This server argument replaces `TOKENSPEED_KDA_PREFILL_GRAPH`, which is no longer
-read. The shared server configuration supplies the setting to every TP worker,
-so worker-local environment variables cannot change capture behavior.
+The shared server configuration supplies this setting to every TP worker.
 
 ### Choose token buckets and batch sizes
 

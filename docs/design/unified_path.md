@@ -765,11 +765,12 @@ destinations/rows. Unifying metadata does not imply zero padding cost.
 
 ### Startup capture and eager fallback
 
-`--enable-kda-prefill-graph` opts into the merged captures owned by
-`PrefillGraph`; the default remains off. The shared `ServerArgs` configuration
-passes the setting explicitly to each KDA backend; workers do not read a local
-environment variable to decide whether to capture. Startup creates the configured
-token-bucket and request-capacity variants. Serving forwards only select and
+Supported KDA prefill uses the merged captures owned by `PrefillGraph` by
+default when prefill graphs are enabled. `--disable-kda-prefill-graph` disables
+KDA capture without changing ordinary prefill or decode graph settings. The
+shared `ServerArgs` configuration passes the setting explicitly to each KDA
+backend. Startup creates the configured token-bucket and request-capacity
+variants. Serving forwards only select and
 replay these captures, never warm up or capture a separate per-layer graph.
 
 If no compatible merged capture exists, the ordinary outer graph retains its
@@ -827,9 +828,8 @@ still produce undefined padding, so gate scrub/cast always runs. Per-call
 plan and scratch tensors belong to the active graph pool or eager invocation;
 they are not a mutable process-global plan shared across replay streams.
 
-This is an experimental capacity contract.
-Full-model overlap, memory use and performance must be validated before
-enabling it by default.
+Changes to this capacity contract require validation of full-model overlap,
+memory use and performance in addition to kernel correctness.
 
 ## Non-goals
 

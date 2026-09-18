@@ -711,7 +711,7 @@ def _create_hybrid_linear_attn_backend(
             linear_attn_backend = KdaAttnBackend(
                 config,
                 config.component(SoftmaxAttnConfig),
-                enable_prefill_graph=server_args.enable_kda_prefill_graph,
+                enable_prefill_graph=not server_args.disable_kda_prefill_graph,
                 kda_backend=kda_backend,
             )
         else:

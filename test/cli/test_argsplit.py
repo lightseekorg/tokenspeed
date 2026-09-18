@@ -117,8 +117,8 @@ def test_dp_sampling_routes_to_engine():
 
 
 def test_kda_prefill_graph_routes_to_engine():
-    r = _split(["--enable-kda-prefill-graph"])
-    assert r.engine == ["--enable-kda-prefill-graph"]
+    r = _split(["--disable-kda-prefill-graph"])
+    assert r.engine == ["--disable-kda-prefill-graph"]
     assert r.gateway == []
 
 
