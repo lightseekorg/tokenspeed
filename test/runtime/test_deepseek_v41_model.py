@@ -43,6 +43,7 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import save_file
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -865,15 +866,22 @@ def test_cuda_exact_fp8_linear_and_engram_method(monkeypatch):
     x = torch.randn(5, 128, dtype=torch.bfloat16, device="cuda:0")
     x[0] = 0
     x[1] *= 1e-6
-    codes, sf = v41_quantize_fp8(x)
-    dequant = (
-        codes.float().unflatten(-1, (-1, 32))
-        * sf.view(torch.float8_e8m0fnu).float().unsqueeze(-1)
-    ).flatten(-2)
     actual, _ = linear(x, block_scale=None, output_dtype=None)
-    expected = F.linear(dequant, weight.float() / 64).to(torch.bfloat16)
-    torch.testing.assert_close(actual, expected, rtol=0.015, atol=0.002)
-    assert linear.weight.dtype == torch.float8_e4m3fn
+    if current_platform().is_hopper:
+        # Hopper expands the weights to BF16 and leaves the activations alone.
+        assert linear.weight.dtype == torch.bfloat16
+        assert linear.weight_scale_inv is None
+        expected = F.linear(x.float(), weight.float() / 64).to(torch.bfloat16)
+        torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.002)
+    else:
+        codes, sf = v41_quantize_fp8(x)
+        dequant = (
+            codes.float().unflatten(-1, (-1, 32))
+            * sf.view(torch.float8_e8m0fnu).float().unsqueeze(-1)
+        ).flatten(-2)
+        expected = F.linear(dequant, weight.float() / 64).to(torch.bfloat16)
+        torch.testing.assert_close(actual, expected, rtol=0.015, atol=0.002)
+        assert linear.weight.dtype == torch.float8_e4m3fn
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured, _ = linear(x, block_scale=None, output_dtype=None)
@@ -1067,7 +1075,13 @@ def _assert_chunked_prefill_replays_and_narrows(adapter, backend, tables):
         1, hit_tables, hit - window, length - (hit - window), window, length
     )
     assert view.metadata.positions.tolist() == list(range(length - window, length))
-    torch.testing.assert_close(replayed, chunked, rtol=0, atol=0)
+    # The FP8 projections quantize each activation row alone, so a row's result
+    # never depends on its batch; Hopper's BF16 GEMM picks its tiling by M and
+    # differs between the replay and the chunk by BF16 rounding.
+    if current_platform().is_hopper:
+        torch.testing.assert_close(replayed, chunked, rtol=2**-6, atol=2**-7)
+    else:
+        torch.testing.assert_close(replayed, chunked, rtol=0, atol=0)
     # The replayed rows never rewrote the hit's global rows.
     for (owner, name), before in aliased.items():
         torch.testing.assert_close(
@@ -1520,13 +1534,21 @@ def test_strict_checkpoint_load_tp4_ep4(monkeypatch, rank, prefixed, reverse, tm
         )
         expected = (raw * scales).bfloat16().chunk(4, 0)[rank]
         torch.testing.assert_close(layer.attn.wo_a.weight, expected, rtol=0, atol=0)
-        assert layer.attn.wq_b.weight.dtype == torch.float8_e4m3fn
-        torch.testing.assert_close(
-            layer.attn.wq_b.weight.view(torch.uint8),
-            weights[a + ".wq_b.weight"].view(torch.uint8).chunk(4, 0)[rank],
-            rtol=0,
-            atol=0,
-        )
+        codes = weights[a + ".wq_b.weight"].chunk(4, 0)[rank]
+        if current_platform().is_hopper:
+            # Loaded straight into BF16; scales fold in after loading.
+            assert layer.attn.wq_b.weight.dtype == torch.bfloat16
+            torch.testing.assert_close(
+                layer.attn.wq_b.weight, codes.to(torch.bfloat16), rtol=0, atol=0
+            )
+        else:
+            assert layer.attn.wq_b.weight.dtype == torch.float8_e4m3fn
+            torch.testing.assert_close(
+                layer.attn.wq_b.weight.view(torch.uint8),
+                codes.view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
         shared = layer.ffn.shared_experts.gate_up_proj
         for slot, shard in enumerate(("w1", "w3")):
             source = (

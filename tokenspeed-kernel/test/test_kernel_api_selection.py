@@ -37,6 +37,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
 import tokenspeed_kernel
@@ -2532,7 +2533,7 @@ def test_deepep_selects_apply_kernel_by_weight_dtype_without_pinned_solution(
             ispp=256,
             fp8_scale_block_shape=(128, 128) if weight_dtype == "fp8" else None,
             internal_activation_dtype="input",
-            deepep_group=object(),
+            process_group=object(),
             deepep_mode=deepep_mode,
         )
     finally:
@@ -2568,7 +2569,7 @@ def test_nvfp4_deepep_rejects_modes_without_normal_legs(
                 ep_size=2,
                 ispp=256,
                 internal_activation_dtype="input",
-                deepep_group=object(),
+                process_group=object(),
                 deepep_mode=deepep_mode,
             )
     finally:
@@ -2603,6 +2604,7 @@ def test_deepep_plan_carries_mode_and_low_latency_capacity(b200_platform) -> Non
     if registry.get_by_name(kernel_name) is None:
         pytest.skip(f"{kernel_name!r} is unavailable (optional backend missing)")
 
+    process_group = object()
     real_platform = Platform.get()
     try:
         Platform.override(b200_platform)
@@ -2615,7 +2617,7 @@ def test_deepep_plan_carries_mode_and_low_latency_capacity(b200_platform) -> Non
             ep_size=2,
             ispp=256,
             fp8_scale_block_shape=(128, 128),
-            deepep_group=object(),
+            process_group=process_group,
             deepep_mode="auto",
             deepep_low_latency_max_num_tokens_per_gpu=256,
         )
@@ -2623,6 +2625,7 @@ def test_deepep_plan_carries_mode_and_low_latency_capacity(b200_platform) -> Non
         Platform.override(real_platform)
         registry.clear_cache()
 
+    assert plan["process_group"] is process_group
     assert plan["deepep_mode"] == "auto"
     assert plan["deepep_low_latency_max_num_tokens_per_gpu"] == 256
 
@@ -3621,7 +3624,7 @@ def _moe_apply_nvfp4_deepep_cutedsl() -> object:
         ep_size=2,
         ispp=128,
         internal_activation_dtype="input",
-        deepep_group=object(),
+        process_group=object(),
         deepep_mode="low_latency",
         solution="flashinfer_cutedsl",
     )
@@ -3646,7 +3649,7 @@ def _moe_apply_fp8_deepep_deep_gemm() -> object:
         ispp=256,
         fp8_scale_block_shape=(128, 128),
         internal_activation_dtype="input",
-        deepep_group=object(),
+        process_group=object(),
         solution="deep_gemm",
     )
     _assert_moe_plan(
@@ -5283,6 +5286,73 @@ def test_b200_fp8_swiglu_selects_trtllm_routed_moe(
     finally:
         Platform.override(real_platform)
         KernelRegistry._instance = real_registry
+
+
+def test_cutlass_fp8_weights_attach_swiglu_tensors() -> None:
+    if not Platform.get().is_nvidia:
+        pytest.skip("FlashInfer cutlass MoE is registered only on NVIDIA")
+    from tokenspeed_kernel.ops.moe.flashinfer.cutlass_fp8 import (
+        flashinfer_cutlass_fp8_moe_weights,
+    )
+
+    def _fp8_arange(shape: tuple[int, ...]) -> torch.Tensor:
+        size = 1
+        for dim in shape:
+            size *= dim
+        return (
+            torch.arange(size, dtype=torch.int64)
+            .remainder(120)
+            .to(torch.uint8)
+            .reshape(shape)
+            .view(torch.float8_e4m3fn)
+        )
+
+    def _weights(
+        w13: torch.Tensor, w2: torch.Tensor, s13: torch.Tensor, s2: torch.Tensor
+    ) -> torch.nn.Module:
+        weights = torch.nn.Module()
+        weights.w13_weight = torch.nn.Parameter(w13.clone(), requires_grad=False)
+        weights.w2_weight = torch.nn.Parameter(w2.clone(), requires_grad=False)
+        weights.w13_weight_scale_inv = torch.nn.Parameter(
+            s13.clone(), requires_grad=False
+        )
+        weights.w2_weight_scale_inv = torch.nn.Parameter(
+            s2.clone(), requires_grad=False
+        )
+        return weights
+
+    num_experts, hidden, ispp = 2, 128, 128
+    w13 = _fp8_arange((num_experts, 2 * ispp, hidden))
+    w2 = _fp8_arange((num_experts, hidden, ispp))
+    s13 = torch.rand((num_experts, 2 * ispp // 128, hidden // 128), dtype=torch.float32)
+    s2 = torch.rand((num_experts, hidden // 128, ispp // 128), dtype=torch.float32)
+
+    weights = _weights(w13, w2, s13, s2)
+    weights.swiglu_arg = SimpleNamespace(alpha=None, limit=7.0)
+    weights.swiglu_beta = 0.5
+    flashinfer_cutlass_fp8_moe_weights({}, weights)
+
+    expected_w13 = torch.cat((w13[:, ispp:], w13[:, :ispp]), dim=1)
+    expected_s13 = torch.cat((s13[:, 1:], s13[:, :1]), dim=1).clamp(min=1e-10)
+    assert torch.equal(
+        weights.w13_weight.view(torch.uint8), expected_w13.view(torch.uint8)
+    )
+    torch.testing.assert_close(weights.w13_weight_scale_inv, expected_s13)
+    torch.testing.assert_close(weights.w2_weight_scale_inv, s2.clamp(min=1e-10))
+    assert weights.swiglu_alpha_t is None
+    torch.testing.assert_close(
+        weights.swiglu_beta_t, torch.full((num_experts,), 0.5, dtype=torch.float32)
+    )
+    torch.testing.assert_close(
+        weights.swiglu_limit_t, torch.full((num_experts,), 7.0, dtype=torch.float32)
+    )
+
+    weights = _weights(w13, w2, s13, s2)
+    weights.swiglu_arg = SimpleNamespace(alpha=None, limit=None)
+    flashinfer_cutlass_fp8_moe_weights({}, weights)
+    assert weights.swiglu_alpha_t is None
+    assert weights.swiglu_beta_t is None
+    assert weights.swiglu_limit_t is None
 
 
 def test_b300_rel_decode_registration_and_selection(

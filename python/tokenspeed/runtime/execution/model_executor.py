@@ -180,6 +180,8 @@ class ModelExecutorConfig:
     disable_cuda_graph_padding: bool
     max_cudagraph_capture_size: int
     model_is_mrope: bool
+    # Explicit None selects the minimum request count for each token bucket.
+    prefill_graph_capture_batch_sizes: list[int] | None
     enable_nan_detection: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
@@ -286,6 +288,7 @@ class ModelExecutorConfig:
             disable_prefill_graph=disable_prefill_graph,
             prefill_graph_max_tokens=_resolve_prefill_graph_max_tokens(server_args),
             prefill_graph_capture_sizes=server_args.prefill_graph_capture_sizes,
+            prefill_graph_capture_batch_sizes=server_args.prefill_graph_capture_batch_sizes,
             model_is_mrope=model_is_mrope,
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
@@ -558,8 +561,9 @@ class ModelExecutor:
         """Profile tunable kernels over one dummy prefill before graph capture.
 
         The dummy batch is capped by both the chunked-prefill token budget and
-        rank-local request capacity. ``make_dummy_batch`` splits tokens into
-        requests of at most ``context_len``, while request-indexed buffers
+        rank-local request capacity. The caller supplies the minimum request
+        count that fits the model context; ``make_dummy_batch`` balances tokens
+        across those requests, while request-indexed buffers
         contain only ``max_num_seqs // data_parallel_size`` rows. Keeping the
         token count within their product prevents autotuning from constructing
         a batch that cannot fit those buffers.
@@ -617,7 +621,8 @@ class ModelExecutor:
             ib.fill_dummy_decode_buffers(
                 batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
             )
-            ctx = self.prefill_graph.make_dummy_batch(num_tokens)
+            bs = -(-num_tokens // max(1, int(self.config.context_len)))
+            ctx = self.prefill_graph.make_dummy_batch(num_tokens, bs)
             positions = (
                 ib.mrope_positions_buf[:, :num_tokens]
                 if self.config.model_is_mrope
@@ -757,6 +762,16 @@ class ModelExecutor:
                 ctx,
                 self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
                 self._active_multimodal_context,
+            )
+        if (
+            mode is not None
+            and mode.is_extend()
+            and self.config.data_parallel_size == 1
+        ):
+            # The same execution metadata as replay, sized to eager's physical
+            # input extent. This neither pads requests nor captures new graphs.
+            self.attn_backend.prepare_prefill_metadata(
+                ctx.input_num_tokens, ctx.bs, mode, capture=False
             )
         return self.model_runner.forward(
             ctx,

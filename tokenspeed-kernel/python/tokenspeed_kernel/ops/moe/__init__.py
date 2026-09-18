@@ -27,6 +27,7 @@ import tokenspeed_kernel.ops.moe.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
 import tokenspeed_kernel.ops.moe.marlin  # noqa: F401
+import tokenspeed_kernel.ops.moe.mega_moe  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
 import torch
 from tokenspeed_kernel.platform import pdl_enabled
@@ -601,7 +602,7 @@ def moe_plan(
     fp8_scale_block_shape: tuple[int, int] | None = None,
     internal_activation_dtype: str | None = None,
     with_bias: bool = False,
-    deepep_group: object | None = None,
+    process_group: object | None = None,
     deepep_mode: str | None = None,
     deepep_low_latency_max_num_tokens_per_gpu: int | None = None,
     solution: str | None = None,
@@ -631,7 +632,8 @@ def moe_plan(
             activations have. "mxfp4" requests dynamic MXFP4 activation
             quantization. Defaults to "input" if not set.
         with_bias: Whether the selected kernel must support expert bias tensors.
-        deepep_group: Runtime-created process group used by DeepEP plans.
+        process_group: Runtime-created process group for DeepEP or MegaMoE
+            communication. Defaults to None for backends that do not use it.
         deepep_mode: Optional DeepEP mode for all-to-all plans: "low_latency"
             (decode-shaped batches only), "normal" (extend-shaped batches only),
             or "auto" to let each ``moe_apply`` pick through its ``low_latency``
@@ -700,7 +702,7 @@ def moe_plan(
         "apply_kernel_name": apply_spec.name,
         "weight_preprocessor": apply_spec.weight_preprocessor,
         "a2a_backend": a2a_backend,
-        "deepep_group": deepep_group,
+        "process_group": process_group,
         "deepep_mode": deepep_mode or "auto",
         "deepep_low_latency_max_num_tokens_per_gpu": (
             deepep_low_latency_max_num_tokens_per_gpu

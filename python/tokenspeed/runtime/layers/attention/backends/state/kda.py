@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.attention.kda import (
+    KdaPrefillCapacity,
     kda_batched_replay_uses_raw_gate,
     kda_fused_paged_verify_uses_split_producers,
     kda_paged_decode,
@@ -49,6 +50,11 @@ from tokenspeed_kernel.ops.attention.kda.triton import capture_replay_payload
 from tokenspeed_kernel.platform import pdl_enabled
 from typing_extensions import override
 
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.backends.state.kda_prefill_metadata import (
+    KdaPrefillMetadata,
+    prepare_kda_prefill_metadata,
+)
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaAttnBackend,
     logger,
@@ -105,9 +111,13 @@ class KdaAttnBackend(MambaAttnBackend):
         config: AttnConfig,
         spec: SoftmaxAttnConfig,
         *,
+        enable_prefill_graph: bool,
         kda_backend: str = "auto",
     ) -> None:
         super().__init__(config, spec)
+        self._prefill_graph_enabled = enable_prefill_graph
+        self._prefill_metadata: dict[tuple[int, int], KdaPrefillMetadata] = {}
+        self._prefill_metadata_pool = None
         self.max_bs = config.max_bs
         # The platform layout; the workspace planner probes the same one.
         self.kda_recurrent_layout = kda_recurrent_layout_default()
@@ -127,6 +137,98 @@ class KdaAttnBackend(MambaAttnBackend):
             "platform-selected kernels",
             self.kda_backend,
         )
+
+    def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
+        # The orchestrator releases old graphs before recapture or pool rebind.
+        # These are execution buffers, never backend-owned request state pages.
+        self._prefill_metadata.clear()
+        self._prefill_metadata_pool = None
+
+    @property
+    def prefill_metadata_is_capture_ready(self) -> bool:
+        metadata = self.forward_metadata
+        return (
+            isinstance(metadata, KdaPrefillMetadata)
+            and self._prefill_metadata.get(
+                (metadata.capacity.token_capacity, metadata.capacity.num_sequences)
+            )
+            is metadata
+        )
+
+    def prepare_prefill_metadata(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode, *, capture: bool
+    ) -> bool:
+        if not (
+            self._prefill_graph_enabled
+            and self.kda_backend == "cutedsl_kda"
+            and self.step_counter is None
+            and forward_mode.is_extend()
+        ):
+            return False
+        if (
+            self._prefill_metadata_pool is not None
+            and self._prefill_metadata_pool is not self.cache_pool
+        ):
+            raise RuntimeError("KDA cache pool changed without graph release/recapture")
+        source = self.forward_metadata
+        key = (token_capacity, bs)
+        actual_bs = source.extend_seq_lens_cpu.numel()
+        if actual_bs > bs or (
+            actual_bs != bs and (capture or key not in self._prefill_metadata)
+        ):
+            raise ValueError(
+                "KDA request padding requires an existing captured capacity"
+            )
+        target = prepare_kda_prefill_metadata(
+            source,
+            token_capacity,
+            self._prefix_granularity,
+            self._prefill_metadata.get(key),
+        )
+        if capture:
+            # Only startup grows retained storage. Uncaptured shapes use fresh
+            # metadata through this same builder and never capture during serving.
+            self._prefill_metadata[key] = target
+            self._prefill_metadata_pool = self.cache_pool
+        self.forward_metadata = target
+        return True
+
+    def forward_extend(
+        self,
+        q,
+        k,
+        v,
+        layer,
+        token_to_kv_pool,
+        bs,
+        forward_mode,
+        *,
+        save_kv_cache,
+        **kwargs,
+    ):
+        output = super().forward_extend(
+            q,
+            k,
+            v,
+            layer,
+            token_to_kv_pool,
+            bs,
+            forward_mode,
+            save_kv_cache=save_kv_cache,
+            **kwargs,
+        )
+        if isinstance(self.forward_metadata, KdaPrefillMetadata):
+            checkpoint = self.forward_metadata.prefill_checkpoint_batch
+            if checkpoint is not None and checkpoint.output_sources is not None:
+                # The fused gather writes the complete output, including padding.
+                return output
+            # No eager handoff remains to scrub undefined native output padding.
+            rows = torch.arange(output.shape[0], device=output.device)
+            padding = rows >= self.forward_metadata.query_start_loc[-1]
+            return output.masked_fill_(padding.view(-1, *([1] * (output.ndim - 1))), 0)
+        # Uncaptured batches keep eager attention inside the ordinary outer
+        # graph. Serving forwards never allocate or capture a KDA subgraph.
+        return output
 
     def _reset_replay_state(self) -> None:
         self._verify_producer_stream: torch.cuda.Stream | None = None
@@ -186,6 +288,8 @@ class KdaAttnBackend(MambaAttnBackend):
     @override
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
+        self._prefill_metadata.clear()
+        self._prefill_metadata_pool = None
         self._reset_replay_state()
         shape = self._replay_shape(cache_pool)
         self._replay_active = kda_replay_commit_supported(
@@ -896,24 +1000,23 @@ class KdaAttnBackend(MambaAttnBackend):
         seq_len: int,
         num_real_tokens: int,
         lower_bound: float | None,
+        inputs_packed: bool,
         cu_seqlens_cpu: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run only the real-token prefix through the KDA prefill kernel.
+        """Run an exact-length or fixed-capacity KDA scan with live boundaries.
 
-        FlashKDA sizes its output from the input shape but tiles from
-        ``cu_seqlens``: bucket-padded inputs would leave the output tail
-        unwritten and feed padding into its final full-tile loads. The graph
-        handoff clears and restores the bucket tail afterward.
+        Ordinary metadata slices inputs to the real-token prefix. Capacity
+        metadata retains the physical packed extent; GPU boundaries determine
+        live work, so that extent is not a live-token count. The adapter clears
+        inputs before full-tile loads; inline output padding is cleared by the
+        in-graph gather or scrub. Only an ordinary break uses the handoff copy.
 
-        ``cu_seqlens_cpu`` is the metadata-built host int64 copy of
-        ``query_start_loc``'s contents (``init_forward_metadata`` constructs
-        and validates it once per extend batch, mirroring MHA's
-        ``cu_extend_seq_lens_cpu``). It is REQUIRED by the kda_paged_prefill
-        op: every solution plans its chunk indices from it on the host —
-        otherwise the boundary read recurs as a stream-synchronizing D2H on
-        every KDA layer of every prefill chunk, stalling the launch thread
-        behind all queued GPU work (which serializes the chunk pipeline's
-        stages).
+        ``cu_seqlens_cpu`` is the required metadata-built int64 mirror of
+        ``query_start_loc``. It supplies exact-length host planning and
+        capacity admission without a per-layer synchronizing D2H. The prepared
+        capacity path builds its chunk plan on device instead of on the host.
+        ``inputs_packed`` carries the producer promise defined by the kernel
+        facade; being inside a graph alone does not establish that promise.
         """
         head_k_dim = query.shape[3]
         num_value_heads = value.shape[2]
@@ -948,6 +1051,12 @@ class KdaAttnBackend(MambaAttnBackend):
             initial_state=recurrent_state,
             cu_seqlens=query_start_loc,
             cu_seqlens_cpu=cu_seqlens_cpu,
+            inputs_packed=inputs_packed,
+            capacity=(
+                KdaPrefillCapacity(seq_len, query_start_loc.numel() - 1)
+                if isinstance(self.forward_metadata, KdaPrefillMetadata)
+                else None
+            ),
             lower_bound=lower_bound,
             solution=None if self.kda_backend == "auto" else self.kda_backend,
             recurrent_layout=self.kda_recurrent_layout,

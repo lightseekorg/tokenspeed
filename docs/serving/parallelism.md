@@ -100,6 +100,10 @@ Select the transport with `--all2all-backend`:
   CUDA fabric.
 - `deepep`: unsupported for this K3 path.
 
+For NVIDIA NVFP4 checkpoints, `--moe-backend mega_moe` replaces routed
+dispatch, SiTU expert computation, and combine with MegaMoE. It requires
+`--all2all-backend none`, keeps routing weights after FC2, and returns BF16 outputs.
+
 Both transports quantize NVFP4 activations before dispatch and transfer their
 block scales alongside the routing IDs and weights. Combine outputs remain BF16.
 
