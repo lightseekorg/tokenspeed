@@ -414,6 +414,10 @@ def test_amd_collection_past_iris_capacity_uses_grouped_rccl(
 
 
 def test_acquire_all_reduce_outputs_uses_triton(backend, monkeypatch):
+    monkeypatch.setattr(
+        "tokenspeed.runtime.distributed.comm_backend.auto.current_platform",
+        lambda: SimpleNamespace(is_amd=True),
+    )
     monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
     monkeypatch.setitem(global_server_args_dict, "mapping", None)
     backend._trtllm_ar.has_trtllm_ar.return_value = False
@@ -437,6 +441,10 @@ def test_acquire_all_reduce_outputs_amd_uses_base_when_iris_is_ineligible(
     backend,
     monkeypatch,
 ):
+    monkeypatch.setattr(
+        "tokenspeed.runtime.distributed.comm_backend.auto.current_platform",
+        lambda: SimpleNamespace(is_amd=True),
+    )
     monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
     monkeypatch.setitem(global_server_args_dict, "mapping", None)
     backend._trtllm_ar.has_trtllm_ar.return_value = False
@@ -486,6 +494,10 @@ def test_acquire_all_reduce_outputs_preserves_trtllm(backend, monkeypatch):
 
 
 def test_symmetric_outputs_route_back_to_triton(backend, monkeypatch):
+    monkeypatch.setattr(
+        "tokenspeed.runtime.distributed.comm_backend.auto.current_platform",
+        lambda: SimpleNamespace(is_amd=True),
+    )
     monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
     backend._triton_ar.can_reduce_outputs.return_value = True
     outputs = (torch.empty(1, 4), torch.empty(1, 8))

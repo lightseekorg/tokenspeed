@@ -26,6 +26,7 @@ from tokenspeed.runtime.configs.kimi_k3_config import (  # noqa: E402
     KimiK3VisionConfig,
     KimiLinearConfig,
 )
+from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa: E402
     FULL_ATTENTION,
     LINEAR_ATTENTION,
@@ -434,12 +435,12 @@ class KimiK3RegistrationTests(unittest.TestCase):
         config = SimpleNamespace(
             num_hidden_layers=93, first_k_dense_replace=1, moe_layer_freq=1
         )
-        one = SimpleNamespace(pp_size=1, pp_rank=0)
+        one = Mapping(rank=0, world_size=1, pp_size=1)
         self.assertEqual(kimi_k3._k3_local_moe_blocks(config, one), 92)
         # 93 over three stages is 31 apiece; the first loses its dense layer.
         counts = [
             kimi_k3._k3_local_moe_blocks(
-                config, SimpleNamespace(pp_size=3, pp_rank=rank)
+                config, Mapping(rank=rank, world_size=3, pp_size=3)
             )
             for rank in range(3)
         ]
@@ -458,13 +459,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             num_experts_per_token=2,
             num_shared_experts=1,
         )
-        mapping = SimpleNamespace(
-            pp_size=1,
-            pp_rank=0,
-            moe=SimpleNamespace(
-                tp_ep_size=8, tp_ep_rank=0, tp_ep_group=tuple(range(8))
-            ),
-        )
+        mapping = Mapping(rank=0, world_size=8, pp_size=1, moe_tp_size=8)
         with (
             mock.patch.object(
                 kimi_k3, "KimiLinearKDA", lambda *a, **kw: torch.nn.Module()
@@ -497,7 +492,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         # At PP1 the stage's blocks and the model's happen to be the same number,
         # so the handoff has to be pinned where they differ.
         recorded.clear()
-        staged = SimpleNamespace(pp_size=3, pp_rank=1, moe=mapping.moe)
+        staged = Mapping(rank=8, world_size=24, pp_size=3, moe_tp_size=8)
         with (
             mock.patch.object(
                 kimi_k3, "KimiLinearKDA", lambda *a, **kw: torch.nn.Module()

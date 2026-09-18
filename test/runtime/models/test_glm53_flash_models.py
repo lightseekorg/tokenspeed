@@ -54,7 +54,7 @@ class _FakeLanguageModel(nn.Module):
         self.forward_kwargs = None
         self.loaded_weights = None
 
-    def forward(self, _ctx, _input_ids, _positions, _out_cache_loc, **kwargs):
+    def forward(self, _ctx, _input_ids, _positions, **kwargs):
         self.forward_kwargs = kwargs
         return kwargs.get("input_embeds")
 
@@ -302,7 +302,6 @@ def test_glm53_flash_forward_splices_prefill_and_skips_decode(monkeypatch) -> No
     )
     args = (
         torch.tensor([1, 2, 3]),
-        torch.arange(3),
         torch.arange(3),
     )
 

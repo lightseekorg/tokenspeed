@@ -178,7 +178,7 @@ def runtime_config(config_dir):
         data_parallel_size=None,
         pipeline_parallel_size=1,
         max_num_seqs=2,
-        chunked_prefill_size=256,
+        chunked_prefill_size=384,
         max_total_tokens=512,
         kv_cache_quant_method="none",
         disaggregation_mode="null",
@@ -186,6 +186,7 @@ def runtime_config(config_dir):
         disable_prefill_graph=True,
         seed=0,
     )
+    args.mapping.rank = 0
     model = ModelConfig(
         model_path=args.model,
         trust_remote_code=args.trust_remote_code,
@@ -420,10 +421,10 @@ def test_config_selects_flash_recipe_and_checks_geometry(runtime_config, overlap
     assert [group.block_granularity for group, _ in groups] == [64, 128, 64, 2]
     assert [len(fields) for _, fields in groups] == [40, 6, 2, 3]
     assert [group.sliding_window_tokens for group, _ in groups] == [
-        129 + overlap_depth,
+        128,
         None,
         None,
-        3 + overlap_depth,
+        2,
     ]
     assert all(group.family == "history" for group, _ in groups)
     assert all(field.page_stride_bytes % 256 == 0 for field in layout.fields)
@@ -445,7 +446,7 @@ def test_real_server_args_prepare_cache_pool_and_backend(runtime_config, overlap
         attn_config=attn,
         draft_model_config=None,
         draft_attn_config=None,
-        cache_budget_bytes=128 << 20,
+        cache_budget_bytes=256 << 20,
         decode_input_tokens=1,
         overlap_schedule_depth=overlap_depth,
     )
@@ -493,4 +494,4 @@ def test_real_server_args_prepare_cache_pool_and_backend(runtime_config, overlap
             == arena.buffer.untyped_storage().data_ptr()
         )
     assert backend.cuda_graph_support.decode_graph
-    assert backend.cuda_graph_support.prefill_graph
+    assert not backend.cuda_graph_support.prefill_graph
