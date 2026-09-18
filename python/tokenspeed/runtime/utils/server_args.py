@@ -797,12 +797,26 @@ class ServerArgs:
                     "--pipeline-parallel-size > 1 with attention DP is not "
                     "supported yet"
                 )
-            if self.speculative_algorithm not in (None, "DSPARK"):
-                raise ValueError(
-                    "--pipeline-parallel-size > 1 supports only DSPARK "
-                    "context production on a prefill server; other "
-                    "speculative algorithms are not supported"
-                )
+            if self.speculative_algorithm is not None:
+                if (
+                    self.speculative_algorithm != "DSPARK"
+                    or self.disaggregation_mode != "prefill"
+                ):
+                    raise ValueError(
+                        "--pipeline-parallel-size > 1 supports speculation only "
+                        "as DSPARK context production on a prefill server"
+                    )
+                # Current CachePD / draft layout limits rather than PP limits:
+                # CachePD has no CP partition contract, and the draft reduces
+                # its attention-TP embedding partials over the dense TP group.
+                if (
+                    self.mapping.attn.cp_size != 1
+                    or self.mapping.dense.tp_group != self.mapping.attn.tp_group
+                ):
+                    raise ValueError(
+                        "Pipeline DSPARK requires attention CP=1 and matching "
+                        "dense/attention TP groups"
+                    )
             if (
                 self.pp_layer_partition is not None
                 and len(self.pp_layer_partition) != self.pipeline_parallel_size

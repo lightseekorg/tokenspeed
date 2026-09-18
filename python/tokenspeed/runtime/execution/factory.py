@@ -138,27 +138,6 @@ def create_model_runner(
 
     draft_model_runner = None
     if draft_model_config is not None:
-        if server_args.mapping.has_pp and server_args.speculative_algorithm is not None:
-            if (
-                server_args.disaggregation_mode != "prefill"
-                or server_args.speculative_algorithm != "DSPARK"
-                or getattr(draft_model_config.hf_config, "model_type", None)
-                != "k3_dspark"
-            ):
-                raise ValueError(
-                    "Pipeline speculation requires Kimi-K3 DSpark on a prefill node"
-                )
-            # These are current CachePD/K3 draft layout limits, not PP limits:
-            # CachePD has no CP partition contract, and the draft reduces its
-            # attention-TP embedding partials over the dense TP group.
-            if (
-                server_args.mapping.attn.cp_size != 1
-                or server_args.mapping.dense.tp_group
-                != server_args.mapping.attn.tp_group
-            ):
-                raise ValueError(
-                    "Pipeline DSpark requires attention CP=1 and matching dense/attention TP groups"
-                )
         draft_model_runner = ModelRunner(
             model_config=draft_model_config,
             gpu_id=gpu_id,
