@@ -1,4 +1,22 @@
 # Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 """Dense BF16 projection kernels for Kimi K3.
 
@@ -16,6 +34,7 @@ from functools import lru_cache
 
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
+from tokenspeed_kernel.ops.gemm.flashinfer import autotune_bf16_gemm
 from tokenspeed_kernel.ops.gemm.routed_gemv import decode_gemv_routed
 from tokenspeed_kernel.platform import Platform, pdl_enabled
 
@@ -371,6 +390,7 @@ def kimi3_latent_projection(
     )
     routed = solution == "auto"
     if solution == "auto":
+        autotune_bf16_gemm(hidden_states, weight)
         if Platform.get().is_cdna4 and specialized and m == 1:
             solution = "triton_gemv"
         elif Platform.get().is_cdna4 and specialized and _use_gluon_smallm(m, k, n):
@@ -499,6 +519,7 @@ def kimi3_mla_qkv_gate_projection(
     }:
         raise ValueError(f"unknown Kimi K3 MLA projection solution {solution!r}")
     if solution == "auto":
+        autotune_bf16_gemm(hidden_states, weight)
         gfx1250_tdm = (
             Platform.get().is_cdna5
             and hidden_states.is_cuda
@@ -738,6 +759,7 @@ def kimi3_latent_projection_add3(
         raise ValueError("Kimi K3 RMSNorm epsilon requires a norm weight")
 
     if solution == "auto":
+        autotune_bf16_gemm(hidden_states, weight)
         from tokenspeed_kernel.ops.gemm.routed_gemv import (
             skinny_add3_supported,
         )
@@ -918,6 +940,7 @@ def kimi3_shared_situ_projection(
         and gate_up_width == KIMI3_SHARED_GATE_UP_LOCAL_SIZE
     )
     if solution == "auto":
+        autotune_bf16_gemm(hidden_states, gate_up_weight)
         solution = "triton_gemv" if Platform.get().is_cdna4 and specialized else "torch"
     if solution == "triton_gemv":
         if not specialized:
@@ -1015,6 +1038,7 @@ def kimi3_shared_down_projection(
     )
     routed = solution == "auto"
     if solution == "auto":
+        autotune_bf16_gemm(hidden_states, weight)
         if Platform.get().is_cdna4 and specialized:
             solution = "triton_gemv"
         elif (
@@ -1174,6 +1198,7 @@ def kimi3_qkvfab_projection(
         and output_width == KIMI3_QKVFAB_SIZE
     )
     if solution == "auto":
+        autotune_bf16_gemm(hidden_states, weight)
         if (
             Platform.get().is_cdna5
             and hidden_states.is_cuda

@@ -18,26 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The measured decode-GEMV route: dispatch reaches it, and it computes right.
-
-The routed backends are registered from sm100 up (GB200/B200 and GB300); below
-that the whole module must be a no-op and the generic selection must be
-untouched -- both directions are asserted here. The table is keyed per shape,
-so an arch that never runs a listed shape simply never matches.
-"""
+"""GPU contracts for joint FI GEMV dispatch and fused add3."""
 
 from __future__ import annotations
-
-import subprocess
-import sys
 
 import pytest
 import tokenspeed_kernel.ops.gemm  # noqa: F401  (registration side effects)
 import torch
-from tokenspeed_kernel.ops.gemm.routed_gemv import (
-    MEASURED_ROUTE,
-    decode_gemv_routed,
-)
+from tokenspeed_kernel.ops.gemm.routed_gemv import decode_gemv_routed
 from tokenspeed_kernel.ops.gemm.triton_gemv import _select, decode_gemv
 from tokenspeed_kernel.platform import current_platform
 
@@ -60,129 +48,6 @@ def _is_add3_arch() -> bool:
         current_platform().vendor == "nvidia"
         and torch.cuda.get_device_capability() >= (10, 3)
     )
-
-
-def _routed_cases():
-    return sorted(MEASURED_ROUTE.items())
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or not _is_routed_arch(),
-    reason="route is registered for sm100 and up",
-)
-@pytest.mark.parametrize("shape,backend", _routed_cases())
-def test_dispatch_picks_the_measured_backend(shape, backend):
-    m, n, k = shape
-    _select.cache_clear()
-    impl = _select(m, n, k, True)
-    assert backend in getattr(
-        impl, "__name__", ""
-    ), f"M={m} N={n} K={k} resolved {impl} instead of the measured {backend}"
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or not _is_routed_arch(),
-    reason="route is registered for sm100 and up",
-)
-@pytest.mark.parametrize("shape,backend", _routed_cases())
-def test_routed_backend_matches_torch(shape, backend):
-    m, n, k = shape
-    torch.manual_seed(0)
-    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
-    got = decode_gemv(x, w).float()
-    ref = (x @ w.t()).float()
-    # Accumulation order differs per kernel; a couple of ulp at ~sqrt(K).
-    assert torch.allclose(got, ref, atol=0.5, rtol=2e-2), (
-        f"M={m} N={n} K={k} via {backend}: "
-        f"max abs err {(got - ref).abs().max().item():.4f}"
-    )
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or not _is_routed_arch(),
-    reason="route is registered for sm100 and up",
-)
-def test_non_bf16_inputs_fall_back_to_torch():
-    from tokenspeed_kernel.ops.gemm.routed_gemv import (
-        cute_dsl_ll_bf16_gemv,
-        cute_dsl_skinny_gemv,
-        flashinfer_tgv_gemv,
-    )
-
-    x = torch.randn(1, 7168, device="cuda", dtype=torch.float16)
-    w = torch.randn(768, 7168, device="cuda", dtype=torch.float16)
-    got = cute_dsl_skinny_gemv(x, w)
-    assert torch.allclose(got.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
-
-    x = torch.randn(1, 1536, device="cuda", dtype=torch.float16)
-    w = torch.randn(7168, 1536, device="cuda", dtype=torch.float16)
-    got = flashinfer_tgv_gemv(x, w)
-    assert torch.allclose(got.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
-
-    x = torch.randn(1, 1536, device="cuda", dtype=torch.float16)
-    w = torch.randn(2560, 1536, device="cuda", dtype=torch.float16)
-    got = cute_dsl_ll_bf16_gemv(x, w)
-    assert torch.allclose(got.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or not _is_routed_arch(),
-    reason="route is registered for sm100 and up",
-)
-def test_capture_of_a_warmed_shape_replays_correctly():
-    """Warm eagerly, then capture: the routed kernel must be capturable and the
-    replay must actually compute -- inputs change and outputs are poisoned
-    between capture and replay, so a graph that recorded nothing (or a replay
-    that writes nothing) fails the comparison. An unwarmed shape inside the
-    same capture must fall back rather than JIT."""
-    from tokenspeed_kernel.ops.gemm import routed_gemv as route
-
-    m, n, k = 1, 3648, 7168
-    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
-    out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
-    decode_gemv(x, w)  # warm
-
-    dev = x.device.index
-    assert dev is not None
-    cold = ("skinny", dev, 1, 3584, 7168)
-    with route._warmed_lock:
-        route._warmed.discard(cold)
-    xc = torch.randn(1, 7168, device="cuda", dtype=torch.bfloat16)
-    wc = torch.randn(3584, 7168, device="cuda", dtype=torch.bfloat16)
-
-    g = torch.cuda.CUDAGraph()
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
-        decode_gemv(x, w, out=out)
-    torch.cuda.current_stream().wait_stream(s)
-    from tokenspeed_kernel.thirdparty.cute_dsl.skinny_gemm import (
-        shape_dynamic_skinny_gemm,
-    )
-
-    compiles: list[tuple] = []
-    real_compile = shape_dynamic_skinny_gemm._compile
-    shape_dynamic_skinny_gemm._compile = lambda *a, **kw: compiles.append(a)
-    try:
-        with torch.cuda.graph(g):
-            decode_gemv(x, w, out=out)
-            cold_out = route.cute_dsl_skinny_gemv(xc, wc)  # unwarmed: falls back
-    finally:
-        shape_dynamic_skinny_gemm._compile = real_compile
-    assert not compiles  # nothing may JIT inside the capture
-
-    # Poisoned outputs: only a replay that really runs the kernels can pass.
-    x.copy_(torch.randn_like(x))
-    xc.copy_(torch.randn_like(xc))
-    out.fill_(float("nan"))
-    cold_out.fill_(float("nan"))
-    g.replay()
-    torch.cuda.synchronize()
-    assert torch.allclose(out.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
-    assert torch.allclose(cold_out.float(), (xc @ wc.t()).float(), atol=0.5, rtol=2e-2)
-    assert cold not in route._warmed  # capture must not mark anything warmed
 
 
 @pytest.mark.skipif(
@@ -275,12 +140,12 @@ def test_unlisted_shapes_keep_the_generic_selection():
 
 
 @pytest.mark.parametrize("projection,n", [("kda", 3216), ("mla", 3648)])
-def test_large_m_projections_honor_measured_routes(monkeypatch, projection, n):
+def test_kimi_projections_honor_small_m_joint_route(monkeypatch, projection, n):
     from tokenspeed_kernel.ops.gemm import kimi3, triton_gemv
 
-    x = torch.empty(64, 7168, device="meta", dtype=torch.bfloat16)
+    x = torch.empty(32, 7168, device="meta", dtype=torch.bfloat16)
     weight = torch.empty(n, 7168, device="meta", dtype=torch.bfloat16)
-    output = torch.empty(64, n, device="meta", dtype=torch.bfloat16)
+    output = torch.empty(32, n, device="meta", dtype=torch.bfloat16)
     monkeypatch.setattr(kimi3, "decode_gemv_routed", lambda *_: True)
     monkeypatch.setattr(triton_gemv, "decode_gemv", lambda *_: output)
     if projection == "kda":
@@ -288,22 +153,8 @@ def test_large_m_projections_honor_measured_routes(monkeypatch, projection, n):
     else:
         result = kimi3.kimi3_mla_qkv_gate_projection(x, weight, 2112)
         assert result.packed is output
-        assert result.qkv.shape == (64, 2112)
-        assert result.gate.shape == (64, 1536)
-
-
-def test_qwen38_route_keeps_unstable_shapes_on_fallback():
-    assert MEASURED_ROUTE[(2, 12800, 2560)] == "skinny"
-    assert {m for m, n, k in MEASURED_ROUTE if (n, k) == (12800, 2560)} == {2, 4}
-    for shape in (
-        (2, 512, 2560),
-        (4, 640, 2560),
-        (17, 2560, 320),
-        (21, 2560, 320),
-        (23, 2560, 320),
-        (1, 6656, 2560),
-    ):
-        assert shape not in MEASURED_ROUTE
+        assert result.qkv.shape == (32, 2112)
+        assert result.gate.shape == (32, 1536)
 
 
 @pytest.mark.parametrize("m", [1, 2, 4])
@@ -352,316 +203,6 @@ def test_forced_torch_solution_is_not_routed():
     # Drain the queued vendor-BLAS work here: under emulation it otherwise keeps
     # executing into the next test and charges its runtime against that test.
     torch.cuda.synchronize()
-
-
-def test_route_predicate_admits_the_registered_arch_floor():
-    """MEASURED_ROUTE registers at sm100 and documents a GB200 re-sweep, so the
-    predicate must not gate on ADD3_ROUTE's stricter sm103 floor."""
-    from unittest.mock import patch
-
-    from tokenspeed_kernel.ops.gemm import routed_gemv
-
-    x = torch.randn(1, 7168, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(3584, 7168, device="cuda", dtype=torch.bfloat16)
-    # The predicate also consults the CDNA arm once the route misses.
-    nvidia = type("P", (), {"vendor": "nvidia", "is_cdna5": False})()
-    for capability, expected in (((10, 0), True), ((9, 0), False)):
-        routed_gemv._is_routed_arch.cache_clear()
-        with (
-            patch("torch.cuda.get_device_capability", return_value=capability),
-            patch("tokenspeed_kernel.platform.current_platform", return_value=nvidia),
-        ):
-            assert routed_gemv.decode_gemv_routed(x, w) is expected
-    routed_gemv._is_routed_arch.cache_clear()
-    torch.cuda.synchronize()
-
-
-def test_measured_route_source_has_no_duplicate_keys():
-    """A dict literal silently resolves duplicate keys last-wins, so a re-added
-    entry would shadow an existing one with no error anywhere. Count key
-    occurrences in the SOURCE text, where duplicates are still visible."""
-    import collections
-    import inspect
-    import re
-
-    from tokenspeed_kernel.ops.gemm import routed_gemv
-
-    src = inspect.getsource(routed_gemv)
-    keys = re.findall(r'\((\d+), (\d+), (\d+)\): "\w+"', src)
-    dupes = [k for k, n in collections.Counter(keys).items() if n > 1]
-    assert not dupes, f"duplicate MEASURED_ROUTE keys in source: {dupes}"
-    # Parsed size must match source count, else a duplicate collapsed.
-    assert len(routed_gemv.MEASURED_ROUTE) == len(keys)
-    # Tuple-valued tables need their own pattern, scanned per table: the two
-    # config tables are independent key spaces, so a shared key is legal.
-    for name, table in (
-        ("SKINNY_CONFIG_ROUTE", routed_gemv.SKINNY_CONFIG_ROUTE),
-        ("ADD3_ROUTE", routed_gemv.ADD3_ROUTE),
-    ):
-        start = src.index(f"{name}: MappingProxyType")
-        span = src[start : src.index(")", src.index("}", start))]
-        cfg_keys = re.findall(r"\((\d+), (\d+), (\d+)\): \(", span)
-        cfg_dupes = [k for k, n in collections.Counter(cfg_keys).items() if n > 1]
-        assert not cfg_dupes, f"duplicate {name} keys in source: {cfg_dupes}"
-        assert len(table) == len(cfg_keys), name
-    # Exact-M keying: entries may only exist in the gap-free swept range. The
-    # bound is the widest M any routed backend serves, which the split-K
-    # tactics carry to 64; nothing above that has been swept.
-    assert all(m <= 64 for m, _, _ in routed_gemv.MEASURED_ROUTE)
-    for name, table in (
-        ("SKINNY_CONFIG_ROUTE", routed_gemv.SKINNY_CONFIG_ROUTE),
-        ("SPLITK_TACTIC_ROUTE", routed_gemv.SPLITK_TACTIC_ROUTE),
-    ):
-        start = src.index(f"{name}: MappingProxyType")
-        span = src[start : src.index(")", src.index("}", start))]
-        cfg_keys = re.findall(r"\((\d+), (\d+), (\d+)\): \(", span)
-        assert len(table) == len(cfg_keys), name
-
-
-def test_skinny_config_route_entries_are_valid():
-    """Stored skinny configurations must satisfy the kernel geometry contract."""
-    from tokenspeed_kernel.ops.gemm.routed_gemv import SKINNY_CONFIG_ROUTE
-    from tokenspeed_kernel.thirdparty.cute_dsl.skinny_gemm import (
-        SkinnyGemmConfig,
-        shape_dynamic_skinny_gemm,
-    )
-
-    for (m, n, k), tuned in SKINNY_CONFIG_ROUTE.items():
-        # A later backend sweep can supersede a reusable skinny configuration.
-        # supports() does not know the kernel's warp-multiple block rule.
-        assert tuned[0] % 32 == 0, (m, n, k)
-        config = SkinnyGemmConfig(m, *tuned)
-        assert shape_dynamic_skinny_gemm.supports(config, m, n, k), (m, n, k)
-
-
-# What each FlashInfer BF16 backend does here, per PDL setting: None when it
-# runs, else the substring its refusal must carry. The route's candidate set
-# rests on this. A sweep that catches every exception and scores it as "no
-# result" cannot tell "this backend lost" from "this backend was never asked
-# properly" -- which is how three of these were missed: they reject pdl=True
-# outright rather than ignoring it.
-_BF16_BACKEND_SUPPORT = {
-    "cudnn": {True: None, False: None},
-    "tgv": {True: None, False: None},
-    "tinygemm": {True: None, False: None},
-    "cute-dsl": {True: None, False: None},
-    "cutlass": {True: "does not support PDL", False: None},
-    "cublaslt": {True: "does not support PDL", False: None},
-    "cutile": {True: "ignores `pdl`", False: "No valid config found"},
-}
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or not _is_routed_arch(),
-    reason="route is registered for sm100 and up",
-)
-@pytest.mark.parametrize("backend", sorted(_BF16_BACKEND_SUPPORT))
-def test_bf16_backend_support_is_what_the_route_was_tuned_against(backend):
-    """Pin the candidate set the measured tables were chosen from.
-
-    A wheel that makes a refused backend work, or breaks one that worked, moves
-    the set the tuner should have searched -- and neither shows up as a wrong
-    answer anywhere, only as a table that is quietly no longer the best pick.
-    """
-    from flashinfer import mm_bf16
-
-    m, n, k = 8, 1792, 7168  # a real draft projection
-    torch.manual_seed(0)
-    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
-    ref = x.float() @ w.float().t()
-    for pdl, refusal in _BF16_BACKEND_SUPPORT[backend].items():
-        try:
-            got = mm_bf16(x, w.t(), pdl=pdl, backend=backend)
-        except Exception as exc:  # noqa: BLE001  (any refusal is the signal)
-            assert refusal is not None, (
-                f"{backend} pdl={pdl} was usable when the tables were tuned and "
-                f"now raises {exc!r}; re-run test/gemm_tuning/tune_route.py"
-            )
-            assert refusal in str(
-                exc
-            ), f"{backend} pdl={pdl} refuses for a new reason: {exc!r}"
-            continue
-        assert refusal is None, (
-            f"{backend} pdl={pdl} now runs but was excluded from the sweep; "
-            f"re-run test/gemm_tuning/tune_route.py -- it may win a shape"
-        )
-        rel = (got.float() - ref).abs().max().item() / ref.abs().max().item()
-        assert rel < 0.02, f"{backend} pdl={pdl} rel err {rel:.4f}"
-
-
-def test_the_shared_vendor_module_is_never_touched():
-    """The adapter owns its instance; mm_bf16's own path never sees the change."""
-    # A subprocess that has NOT imported the vendor module: importing it first
-    # puts its name in sys.modules, which is exactly what the private instance
-    # needs for @dataclass to resolve while the vendor source runs. An
-    # in-process check would therefore pass even when the production path --
-    # nothing has imported it yet -- cannot build one at all.
-    script = """
-import importlib.util, sys
-V = "flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk"
-try:
-    # find_spec imports the parents, so a missing flashinfer raises here
-    # rather than answering None.
-    found = importlib.util.find_spec(V) is not None
-except ModuleNotFoundError:
-    found = False
-if not found:
-    print("skip"); raise SystemExit(0)
-assert V not in sys.modules, "vendor already imported; the check would be void"
-from tokenspeed_kernel.ops.gemm.routed_gemv import SPLITK_TACTIC_ROUTE
-from tokenspeed_kernel.thirdparty.cute_dsl import flashinfer_splitk as fs
-assert fs.is_available(), "adapter disabled itself"
-refused = [key for key, t in SPLITK_TACTIC_ROUTE.items() if not fs.supports(*key, t)]
-assert not refused, f"refused {refused}"
-assert V not in sys.modules, "building the private instance imported the vendor"
-import flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk as vendor
-assert fs._module() is not vendor, "not a private instance"
-assert vendor._MAX_M == 32, f"vendor cutover moved to {vendor._MAX_M}"
-print("ok")
-"""
-    proc = subprocess.run(
-        [sys.executable, "-c", script], capture_output=True, text=True
-    )
-    assert proc.returncode == 0, proc.stderr
-    tail = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
-    if tail == "skip":
-        pytest.skip("flashinfer split-K BF16 GEMM is not installed here")
-    assert tail == "ok", proc.stdout
-
-
-def test_splitk_tactic_route_entries_are_valid():
-    """Every measured tactic must target a shape the route sends to splitk and
-    be one the vendor kernel accepts; a typo would silently fall back."""
-    from tokenspeed_kernel.ops.gemm.routed_gemv import SPLITK_TACTIC_ROUTE
-    from tokenspeed_kernel.thirdparty.cute_dsl import flashinfer_splitk
-
-    if not flashinfer_splitk.is_available():
-        pytest.skip("flashinfer split-K BF16 GEMM is not the measured build")
-    for (m, n, k), tactic in SPLITK_TACTIC_ROUTE.items():
-        assert MEASURED_ROUTE.get((m, n, k)) == "splitk", (m, n, k)
-        assert flashinfer_splitk.supports(m, n, k, tactic), (m, n, k)
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or not _is_routed_arch(),
-    reason="route is registered for sm100 and up",
-)
-@pytest.mark.parametrize("m", [33, 47, 64])
-def test_splitk_serves_m_past_the_vendor_cutover(m):
-    """What the table above M == 32 rests on.
-
-    Public M rides the kernel's MMA-N axis, so the vendor's cutover is a
-    heuristic rather than a contract and M is tiled, not truncated. A kernel
-    that computed only the first tile would leave whole rows zero.
-    """
-    from tokenspeed_kernel.thirdparty.cute_dsl import flashinfer_splitk
-
-    if not flashinfer_splitk.is_available():
-        pytest.skip("flashinfer split-K BF16 GEMM is not the measured build")
-    torch.manual_seed(0)
-    n, k, tactic = 1792, 7168, (64, 32, 2, 9)
-    assert flashinfer_splitk.supports(m, n, k, tactic)
-    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
-    out = torch.zeros(m, n, device="cuda", dtype=torch.bfloat16)
-    flashinfer_splitk.splitk_mm(x, w, tactic, out)
-    ref = x.float() @ w.float().t()
-    assert int((out.abs().sum(dim=1) == 0).sum()) == 0
-    assert (out.float() - ref).abs().max() / ref.abs().max() < 0.02
-
-
-def _splitk_cases():
-    from tokenspeed_kernel.ops.gemm.routed_gemv import SPLITK_TACTIC_ROUTE
-
-    return sorted(SPLITK_TACTIC_ROUTE)
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or not _is_routed_arch(),
-    reason="route is registered for sm100 and up",
-)
-@pytest.mark.parametrize("shape", _splitk_cases())
-def test_splitk_captures_and_replays(shape):
-    """The drafter runs entirely inside a CUDA graph, so a routed backend that
-    cannot be captured would silently fall back there and nowhere else -- and
-    the fallback is correct, so nothing else in the suite would notice."""
-    m, n, k = shape
-    torch.manual_seed(0)
-    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
-    out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
-    decode_gemv(x, w, out=out)  # warm
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
-        decode_gemv(x, w, out=out)
-    torch.cuda.current_stream().wait_stream(s)
-    from tokenspeed_kernel.ops.gemm import routed_gemv as route
-
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        decode_gemv(x, w, out=out)
-    # Warming happens eagerly only, so the capture must have found it already
-    # warm rather than marking it warm from inside.
-    assert ("splitk", x.device.index or 0, m, n, k) in route._warmed
-    # Poisoned output and fresh input: only a replay that really runs passes.
-    x.copy_(torch.randn_like(x))
-    out.fill_(float("nan"))
-    g.replay()
-    torch.cuda.synchronize()
-    assert torch.allclose(out.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
-
-
-def test_skinny_config_prefers_the_measured_table_over_the_heuristic():
-    """Measured entries serve; unmeasured shapes fall through to the heuristic."""
-    from tokenspeed_kernel.ops.gemm import routed_gemv
-    from tokenspeed_kernel.thirdparty.cute_dsl.skinny_gemm import (
-        shape_dynamic_skinny_gemm,
-    )
-
-    routed_gemv._skinny_config.cache_clear()
-    m, n, k = 2, 320, 2560
-    config = routed_gemv._skinny_config(m, n, k)
-    assert (
-        config.block_size,
-        config.outputs_per_block,
-        config.k_unroll,
-        config.vector_width,
-    ) == routed_gemv.SKINNY_CONFIG_ROUTE[(m, n, k)]
-
-    unmeasured = (7, 320, 2560)
-    assert unmeasured not in routed_gemv.SKINNY_CONFIG_ROUTE
-    assert routed_gemv._skinny_config(*unmeasured) == (
-        shape_dynamic_skinny_gemm.default_config(*unmeasured)
-    )
-    routed_gemv._skinny_config.cache_clear()
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or not _is_routed_arch(),
-    reason="route is registered for sm100 and up",
-)
-@pytest.mark.parametrize("misalign,offset", [("x", 4), ("weight", 4), ("x", 8)])
-def test_under_aligned_operands_fall_back_to_torch(monkeypatch, misalign, offset):
-    """vw-16 needs 32-byte pointers and supports() cannot see alignment, so the
-    guard falls back; offset 8 is the 16B case a vw-8 config would accept."""
-    from tokenspeed_kernel.ops.gemm import routed_gemv
-    from tokenspeed_kernel.thirdparty.cute_dsl import skinny_gemm
-
-    m, n, k = 2, 320, 2560  # tuned entry (160, 2, 1, 16)
-    xbuf = torch.randn(m * k + offset, device="cuda", dtype=torch.bfloat16)
-    wbuf = torch.randn(n * k + offset, device="cuda", dtype=torch.bfloat16)
-    x = (xbuf[offset:] if misalign == "x" else xbuf[:-offset]).view(m, k)
-    w = (wbuf[offset:] if misalign == "weight" else wbuf[:-offset]).view(n, k)
-    assert (x if misalign == "x" else w).data_ptr() % 32
-    monkeypatch.setattr(
-        skinny_gemm.ShapeDynamicSkinnyGemm,
-        "__call__",
-        lambda *a, **kw: pytest.fail("under-aligned input must not launch vw-16"),
-    )
-    got = routed_gemv.cute_dsl_skinny_gemv(x, w)
-    assert torch.allclose(got.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
 
 
 @pytest.mark.skipif(
@@ -723,4 +264,165 @@ def test_cdna5_route_declines_unregistered_calls():
     unaligned_n = torch.randn(16, 1536, device="cuda", dtype=torch.bfloat16)
     assert not decode_gemv_routed(
         unaligned_n, torch.randn(7000, 1536, device="cuda", dtype=torch.bfloat16)
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _is_routed_arch(), reason="Blackwell required"
+)
+@pytest.mark.parametrize(
+    "n,k,expected_runners",
+    [
+        (
+            512,
+            2560,
+            {
+                "TGVRunner",
+                "CuteDSLDirectBf16Runner",
+                "CuteDSLSplitKBf16Runner",
+                "CuteDSLWarpSplitKBf16Runner",
+            },
+        ),
+        (2560, 160, {"TGVRunner"}),
+        (2560, 320, {"TGVRunner"}),
+        (7168, 2112, {"TGVRunner"}),
+        (
+            4120,
+            2560,
+            {"TGVRunner", "CuteDSLDirectBf16Runner", "CuteDSLSplitKBf16Runner"},
+        ),
+    ],
+    ids=["aligned", "tgv-k160", "tgv-k320", "tgv-k2112", "ragged-n4120"],
+)
+def test_joint_fi_tuning_roundtrip_and_changed_input_replay(
+    monkeypatch, tmp_path, n, k, expected_runners
+):
+    """Native candidates form a union, including non-128 K and non-16 N."""
+    from flashinfer.autotuner import AutoTuner
+    from tokenspeed_kernel.ops.gemm import flashinfer as fi_adapter
+    from tokenspeed_kernel.ops.gemm import mm
+    from tokenspeed_kernel.ops.tuning import (
+        autotune,
+        load_autotune_cache,
+        save_autotune_cache,
+    )
+
+    x = torch.randn(128, k, device="cuda", dtype=torch.bfloat16)
+    weight = (
+        torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / k**0.5
+    ).contiguous()
+    if not fi_adapter.flashinfer_joint_bf16_supported(x, weight, None):
+        pytest.skip("FI joint adapter unavailable")
+    if not hasattr(fi_adapter._fi_gemm, "_cute_dsl_bf16_runners"):
+        expected_runners = expected_runners - {"CuteDSLWarpSplitKBf16Runner"}
+    assert fi_adapter.BF16_GEMM_MAX_M == 32
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    native_key = AutoTuner.__dict__["_get_cache_key"]
+    profiles = set()
+    original = tuner._profile_single_kernel
+
+    def record(runner, tensors, *args, **kwargs):
+        profiles.add((type(runner).__name__, tensors[0].shape[0], tensors[4].dtype))
+        return original(runner, tensors, *args, **kwargs)
+
+    monkeypatch.setattr(tuner, "_profile_single_kernel", record)
+    # Empty-cache defaults must be legal too, without profiling or fallback to Torch.
+    with torch.no_grad(), autotune(tune_mode=False, tuning_buckets=None, round_up=None):
+        for m in (1, 3, 31, 32):
+            got = fi_adapter.flashinfer_bf16_gemm(x[:m], weight, None)
+            ref = x[:m].float() @ weight.float().T
+            assert torch.isfinite(got).all()
+            assert (
+                torch.linalg.vector_norm(got.float() - ref)
+                / torch.linalg.vector_norm(ref)
+                < 0.01
+            )
+    assert not profiles
+
+    with torch.no_grad(), autotune(tune_mode=True, tuning_buckets=None, round_up=None):
+        fi_adapter.autotune_bf16_gemm(x, weight)
+    assert {name for name, _, _ in profiles} == expected_runners
+    assert {m for _, m, _ in profiles} == {1, 2, 4, 8, 16, 32}
+    assert {dtype for _, _, dtype in profiles} == {torch.bfloat16}
+    assert AutoTuner.__dict__["_get_cache_key"] is native_key
+    print(
+        "PROFILE UNION", n, k, sorted((name, m) for name, m, _ in profiles), flush=True
+    )
+
+    path = str(tmp_path / "configs.json")
+    assert save_autotune_cache(path, None, 0)
+    tuner.clear_cache()
+    assert load_autotune_cache(path, None, 0)
+    attempts = []
+
+    def unexpected_profile(*args, **kwargs):
+        # FI can catch profiling failures, so also verify the attempt counter.
+        attempts.append(1)
+        raise AssertionError("cache hit profiled")
+
+    monkeypatch.setattr(tuner, "_profile_single_kernel", unexpected_profile)
+    with torch.no_grad(), autotune(tune_mode=True, tuning_buckets=None, round_up=None):
+        fi_adapter.autotune_bf16_gemm(x, weight)
+        for m in (1, 3, 31, 32):
+            fi_adapter.flashinfer_bf16_gemm(x[:m], weight, None)
+    assert not attempts
+
+    with torch.no_grad(), autotune(tune_mode=False, tuning_buckets=None, round_up=None):
+        for m in range(1, 33):
+            assert decode_gemv_routed(x[:m], weight)
+            buffer = torch.full((m * n + 32,), 42, dtype=torch.bfloat16, device="cuda")
+            out = buffer[: m * n].view(m, n)
+            out.fill_(float("nan"))
+            assert mm(x[:m], weight, out=out).data_ptr() == out.data_ptr()
+            ref = x[:m].float() @ weight.float().T
+            assert torch.isfinite(out).all()
+            assert (
+                torch.linalg.vector_norm(out.float() - ref)
+                / torch.linalg.vector_norm(ref)
+                < 0.01
+            )
+            assert torch.all(buffer[m * n :] == 42)
+            if m in (1, 3, 8, 17, 31, 32):
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    fi_adapter.flashinfer_bf16_gemm(x[:m], weight, out)
+                stream.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    fi_adapter.flashinfer_bf16_gemm(x[:m], weight, out)
+                x[:m].mul_(0.875)
+                out.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                ref = x[:m].float() @ weight.float().T
+                assert torch.isfinite(out).all()
+                assert (
+                    torch.linalg.vector_norm(out.float() - ref)
+                    / torch.linalg.vector_norm(ref)
+                    < 0.01
+                )
+                assert torch.all(buffer[m * n :] == 42)
+
+        def reject_fi(**kwargs):
+            raise AssertionError("M > 32 reached FI joint dispatch")
+
+        monkeypatch.setattr(fi_adapter._fi_gemm, "bf16_gemm_sm100", reject_fi)
+        for m in (33, 48, 64, 128):
+            assert not decode_gemv_routed(x[:m], weight)
+            out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+            assert mm(x[:m], weight, out=out).data_ptr() == out.data_ptr()
+            torch.testing.assert_close(out, x[:m] @ weight.T, rtol=0, atol=0)
+            torch.testing.assert_close(
+                decode_gemv(x[:m], weight), x[:m] @ weight.T, rtol=0, atol=0
+            )
+    assert not attempts
+    assert AutoTuner.__dict__["_get_cache_key"] is native_key
+    print(
+        "PASSED UNION",
+        n,
+        k,
+        "32 sizes; 6 changed-input graphs; 4 large-M fallbacks; 0 reprofile",
+        flush=True,
     )

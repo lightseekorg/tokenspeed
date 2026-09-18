@@ -20,7 +20,7 @@
 
 """Shared cold-L2 benchmark harness for the GEMM tuning scripts.
 
-``tune_route.py`` picks a backend per shape and ``tune_splitk_tactic.py`` picks
+Backend selection runs during startup; ``tune_splitk_tactic.py`` picks
 a split-K tactic for one of them. They have to agree on the shapes, on how a
 call is timed and on what counts as a wrong answer, so all three live here.
 """

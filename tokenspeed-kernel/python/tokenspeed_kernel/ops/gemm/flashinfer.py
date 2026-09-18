@@ -26,6 +26,7 @@ from collections.abc import Callable
 from typing import get_args
 
 import torch
+from tokenspeed_kernel.ops.tuning import is_autotuning
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -664,10 +665,14 @@ if has_flashinfer_cute_dsl_nvfp4_a16():
 # ---- FlashInfer BF16 low-latency GEMM, cute-dsl backend ------------------
 
 _mm_bf16 = error_fn
+_fi_gemm = None
+# Automatic dispatch scope, not a TGV capability limit.
+BF16_GEMM_MAX_M = 32
 
 if platform.is_nvidia and platform.arch_version in _CUTE_DSL_SM100_ARCHS:
     try:
         from flashinfer import mm_bf16 as _mm_bf16
+        from flashinfer.gemm import gemm_base as _fi_gemm
     except ImportError:
         pass
 
@@ -728,3 +733,98 @@ def flashinfer_cute_dsl_mm_bf16(
         out=out,
         backend=_CUTE_DSL_BACKEND,
     )
+
+
+def _bf16_gemm_runner_names(k: int) -> list[str]:
+    """Admit each backend by its own K contract, not their intersection."""
+    if k <= 0:
+        return []
+    # TGV handles partial K tiles; its TMA rows need 16-byte (8 BF16) strides.
+    runners = ["tgv"] if k % 8 == 0 else []
+    # Only cute-dsl requires whole 128-element K tiles. Its native runners
+    # filter N/tactic constraints independently (e.g. warp Split-K's N % 16).
+    if k % 128 == 0:
+        runners.append("cute-dsl")
+    return runners
+
+
+def flashinfer_joint_bf16_supported(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
+) -> bool:
+    """Check the common contract and whether at least one backend is eligible.
+
+    Discovery may use large M; execution enforces the separate M <= 32 scope.
+    """
+    return (
+        _fi_gemm is not None
+        and has_flashinfer_cute_dsl_bf16()
+        and x.is_cuda
+        and x.device == weight.device
+        and x.ndim == weight.ndim == 2
+        and x.dtype == weight.dtype == torch.bfloat16
+        and x.shape[0] > 0
+        and weight.shape[0] > 0
+        and x.shape[1] == weight.shape[1]
+        and weight.shape[1] > 0
+        and bool(_bf16_gemm_runner_names(weight.shape[1]))
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and x.data_ptr() % 32 == weight.data_ptr() % 32 == 0
+        and (
+            out is None
+            or (
+                out.shape == (x.shape[0], weight.shape[0])
+                and out.dtype == x.dtype
+                and out.device == x.device
+                and out.is_contiguous()
+                and out.data_ptr() % 32 == 0
+            )
+        )
+    )
+
+
+def flashinfer_bf16_gemm(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
+) -> torch.Tensor:
+    """Compute BF16 x[M,K] @ weight[N,K].T using FI's joint runner/tactic search.
+
+    The caller checks the contract and warms the actual shape before capture.
+    Only M <= 32 enters this search. Larger calls keep the original GEMM.
+    No TokenSpeed backend choice or second cache is maintained.
+    """
+    if (
+        not flashinfer_joint_bf16_supported(x, weight, out)
+        or x.shape[0] > BF16_GEMM_MAX_M
+    ):
+        raise ValueError("Unsupported input to joint FlashInfer BF16 GEMM")
+    if out is None:
+        out = torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
+    workspace = _fi_gemm._get_cache_buf(
+        "mm_bf16_workspace", _fi_gemm.DEFAULT_WORKSPACE_SIZE, x.device
+    )
+    # WAR: the public auto heuristic excludes cute-dsl. Reuse the existing FI
+    # dispatcher so eligible families enter one choose_one, including cache
+    # lookup. A backend that cannot handle K must not exclude the other one.
+    _fi_gemm.bf16_gemm_sm100(
+        a=x.detach(),
+        b=weight.detach().t(),
+        bias=None,
+        pdl=pdl_enabled(),
+        out=out,
+        workspace_buffer=workspace,
+        runner_names=_bf16_gemm_runner_names(weight.shape[1]),
+    )
+    return out
+
+
+def autotune_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
+    """Expose native small-M profiles from any encountered projection's N/K.
+
+    FI skips cached profiles. Scratch inputs/output never alias the model output;
+    this function does nothing outside the startup autotune window. M=32
+    exposes FI native profiles 1/2/4/8/16/32 without a large-M fallback profile.
+    """
+    if is_autotuning() and flashinfer_joint_bf16_supported(x, weight, None):
+        with torch.no_grad():
+            sample = x.new_zeros((BF16_GEMM_MAX_M, weight.shape[1]))
+            flashinfer_bf16_gemm(sample, weight, None)

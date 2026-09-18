@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""FlashInfer startup tuning policies and shared cache persistence."""
+"""Kernel startup tuning and FlashInfer-native cache persistence."""
 
 from __future__ import annotations
 
@@ -33,12 +33,18 @@ from pathlib import Path
 
 import torch.distributed as dist
 
+try:
+    import flashinfer.autotuner as _autotuner
+except ImportError:
+    _autotuner = None
+
 __all__ = [
     "autotune",
-    "flashinfer_autotune_cache_path",
+    "autotune_cache_path",
     "get_autotune_max_num_tokens",
-    "load_flashinfer_autotune_cache",
-    "save_flashinfer_autotune_cache",
+    "is_autotuning",
+    "load_autotune_cache",
+    "save_autotune_cache",
     "set_autotune_max_num_tokens",
     "set_autotune_process_group",
 ]
@@ -53,7 +59,7 @@ _autotune_max_num_tokens = _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS
 
 @contextlib.contextmanager
 def _ep_moe_candidates():
-    from flashinfer.autotuner import AutoTuner
+    AutoTuner = _autotuner.AutoTuner
 
     original_choose = AutoTuner.choose_one
 
@@ -107,7 +113,7 @@ def _ep_moe_candidates():
         AutoTuner.choose_one = original_choose
 
 
-def flashinfer_autotune_cache_path(cache_key: dict[str, object]) -> str | None:
+def autotune_cache_path(cache_key: dict[str, object]) -> str | None:
     """Build a cache path from model/layout facts and FlashInfer metadata.
 
     Args:
@@ -116,15 +122,12 @@ def flashinfer_autotune_cache_path(cache_key: dict[str, object]) -> str | None:
     Returns:
         Cache filename, or None when FlashInfer is unavailable.
     """
-    try:
-        from flashinfer.autotuner import _collect_metadata
-    except ImportError as exc:
-        logger.info("persistent FlashInfer autotune cache unavailable: %s", exc)
+    if _autotuner is None:
         return None
 
     payload = {
         "config": cache_key,
-        "environment": _collect_metadata(),
+        "environment": _autotuner._collect_metadata(),
     }
     digest = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -185,19 +188,17 @@ def autotune(
         ``None``; tuning is disabled again when the block exits, including on
         error.
     """
-    try:
-        import flashinfer.autotuner
-    except ImportError:
+    if _autotuner is None:
         yield
         return
     if tune_mode:
         # TGV's 2-CTA tactics can fail during sustained graph execution.
-        tuner = flashinfer.autotuner.AutoTuner.get()
+        tuner = _autotuner.AutoTuner.get()
         tuner._blocklist._invalid.setdefault("bf16_gemm::TGVRunner", set()).update(
             range(16, 29)
         )
     candidates = _ep_moe_candidates() if tune_mode else contextlib.nullcontext()
-    with candidates, flashinfer.autotuner.autotune(
+    with candidates, _autotuner.autotune(
         tune_mode, tuning_buckets=tuning_buckets, round_up=round_up
     ):
         yield
@@ -214,11 +215,8 @@ def set_autotune_process_group(process_group) -> None:
             ranks that tune together (prefer a CPU/gloo group), or ``None``
             to restore independent per-rank tuning.
     """
-    try:
-        import flashinfer.autotuner
-    except ImportError:
-        return
-    flashinfer.autotuner.set_autotune_process_group(process_group)
+    if _autotuner is not None:
+        _autotuner.set_autotune_process_group(process_group)
 
 
 def _install_autotune_cache_bytes(path: str, payload: bytes) -> None:
@@ -254,7 +252,7 @@ def _mirror_autotune_cache(
     return True
 
 
-def load_flashinfer_autotune_cache(
+def load_autotune_cache(
     path: str | None,
     process_group: dist.ProcessGroup | None,
     owner_rank: int,
@@ -269,12 +267,10 @@ def load_flashinfer_autotune_cache(
     Returns:
         Whether every rank loaded the cache. Otherwise all ranks tune cold.
     """
-    try:
-        from flashinfer.autotuner import AutoTuner
-    except ImportError:
+    if _autotuner is None:
         return False
     try:
-        tuner = AutoTuner.get()
+        tuner = _autotuner.AutoTuner.get()
         tuner.clear_cache()
     except Exception:
         if process_group is not None:
@@ -312,7 +308,7 @@ def load_flashinfer_autotune_cache(
     return loaded
 
 
-def save_flashinfer_autotune_cache(
+def save_autotune_cache(
     path: str | None,
     process_group: dist.ProcessGroup | None,
     owner_rank: int,
@@ -329,17 +325,20 @@ def save_flashinfer_autotune_cache(
     """
     if path is None:
         return False
-    try:
-        from flashinfer.autotuner import AutoTuner
-    except ImportError:
+    if _autotuner is None:
         return False
     if process_group is not None:
         dist.barrier(group=process_group)
     payload = None
     if process_group is None or dist.get_rank() == owner_rank:
         try:
-            AutoTuner.get().save_configs(path)
+            _autotuner.AutoTuner.get().save_configs(path)
             payload = Path(path).read_bytes()
         except Exception:
             logger.warning("Could not save FlashInfer cache %s", path, exc_info=True)
     return _mirror_autotune_cache(path, payload, process_group, owner_rank)
+
+
+def is_autotuning() -> bool:
+    """Whether FlashInfer may profile missing choices in the current context."""
+    return _autotuner is not None and _autotuner.AutoTuner.get().is_tuning_mode

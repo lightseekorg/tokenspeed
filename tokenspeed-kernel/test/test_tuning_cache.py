@@ -32,15 +32,16 @@ import torch
 from tokenspeed_kernel.ops import tuning
 from tokenspeed_kernel.ops.tuning import (
     autotune,
-    flashinfer_autotune_cache_path,
-    load_flashinfer_autotune_cache,
-    save_flashinfer_autotune_cache,
+    autotune_cache_path,
+    load_autotune_cache,
+    save_autotune_cache,
 )
 
 
 class _FakeTuner:
     def __init__(self) -> None:
         self.active = False
+        self.is_tuning_mode = False
         self._blocklist = types.SimpleNamespace(_invalid={})
 
     def load_configs(self, path: str) -> bool:
@@ -73,7 +74,11 @@ def _install_fake_flashinfer(monkeypatch, *, metadata):
     @contextlib.contextmanager
     def fake_autotune(tune_mode, **kwargs):
         calls.append((tune_mode, kwargs))
-        yield
+        previous, tuner.is_tuning_mode = tuner.is_tuning_mode, tune_mode
+        try:
+            yield
+        finally:
+            tuner.is_tuning_mode = previous
 
     autotuner_module.AutoTuner = AutoTuner
     autotuner_module.autotune = fake_autotune
@@ -84,6 +89,7 @@ def _install_fake_flashinfer(monkeypatch, *, metadata):
     flashinfer_module.autotuner = autotuner_module
     monkeypatch.setitem(sys.modules, "flashinfer", flashinfer_module)
     monkeypatch.setitem(sys.modules, "flashinfer.autotuner", autotuner_module)
+    monkeypatch.setattr(tuning, "_autotuner", autotuner_module)
     return tuner, calls
 
 
@@ -93,9 +99,9 @@ def test_cache_path_is_environment_and_config_scoped(monkeypatch, tmp_path) -> N
     monkeypatch.setenv("TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR", str(tmp_path))
 
     config = {"model": "model-a", "tp": 8, "ep": 1}
-    first = flashinfer_autotune_cache_path(config)
-    same = flashinfer_autotune_cache_path({"ep": 1, "tp": 8, "model": "model-a"})
-    other = flashinfer_autotune_cache_path({**config, "tp": 1, "ep": 8})
+    first = autotune_cache_path(config)
+    same = autotune_cache_path({"ep": 1, "tp": 8, "model": "model-a"})
+    other = autotune_cache_path({**config, "tp": 1, "ep": 8})
 
     assert first == same
     assert first != other
@@ -103,7 +109,7 @@ def test_cache_path_is_environment_and_config_scoped(monkeypatch, tmp_path) -> N
     assert Path(first).parent.parent == tmp_path
     assert Path(first).name == "autotune_configs.json"
     metadata["gpu"] = "B300"
-    assert flashinfer_autotune_cache_path(config) != first
+    assert autotune_cache_path(config) != first
 
 
 def test_autotune_forwards_decode_bucket_override(monkeypatch) -> None:
@@ -134,13 +140,13 @@ def test_autotune_forwards_decode_bucket_override(monkeypatch) -> None:
 def test_cache_roundtrip_and_failures(monkeypatch, tmp_path) -> None:
     tuner, _ = _install_fake_flashinfer(monkeypatch, metadata={})
     monkeypatch.setenv("TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR", str(tmp_path))
-    path = flashinfer_autotune_cache_path({"model": "model-a"})
-    assert save_flashinfer_autotune_cache(path, None, 0)
+    path = autotune_cache_path({"model": "model-a"})
+    assert save_autotune_cache(path, None, 0)
     assert Path(path).read_bytes() == b"tactics"
-    assert load_flashinfer_autotune_cache(path, None, 0)
+    assert load_autotune_cache(path, None, 0)
     assert tuner.active
 
-    assert not load_flashinfer_autotune_cache(str(tmp_path / "missing.json"), None, 0)
+    assert not load_autotune_cache(str(tmp_path / "missing.json"), None, 0)
     assert not tuner.active
 
     def failed_load(path):
@@ -148,13 +154,13 @@ def test_cache_roundtrip_and_failures(monkeypatch, tmp_path) -> None:
         raise KeyError("malformed tactic")
 
     monkeypatch.setattr(tuner, "load_configs", failed_load)
-    assert not load_flashinfer_autotune_cache(path, None, 0)
+    assert not load_autotune_cache(path, None, 0)
     assert not tuner.active
 
     monkeypatch.setattr(
         tuner, "save_configs", Mock(side_effect=TypeError("invalid tactic"))
     )
-    assert not save_flashinfer_autotune_cache(path, None, 0)
+    assert not save_autotune_cache(path, None, 0)
 
 
 @pytest.mark.parametrize(
@@ -194,6 +200,9 @@ def test_ep_candidates_keep_full_profile_inputs(monkeypatch, tokens, local, quer
             MoeRunnerInputs=types.SimpleNamespace(idx=lambda name: 1)
         ),
     )
+    monkeypatch.setattr(
+        tuning, "_autotuner", types.SimpleNamespace(AutoTuner=AutoTuner)
+    )
     original_choose, original_valid = AutoTuner.choose_one, MoERunner.get_valid_tactics
     with tuning._ep_moe_candidates():
         args = ("flashinfer::trtllm_fp4_block_scale_moe", [MoERunner()], None, inputs)
@@ -204,3 +213,54 @@ def test_ep_candidates_keep_full_profile_inputs(monkeypatch, tokens, local, quer
             AutoTuner().choose_one(*args, fail=True)
         assert MoERunner.get_valid_tactics is original_valid
     assert AutoTuner.choose_one is original_choose
+
+
+def test_tuning_mode_is_owned_by_flashinfer(monkeypatch):
+    _install_fake_flashinfer(monkeypatch, metadata={})
+    assert not tuning.is_autotuning()
+    with autotune(tune_mode=True, tuning_buckets=None, round_up=None):
+        assert tuning.is_autotuning()
+        with pytest.raises(RuntimeError), autotune(
+            tune_mode=False, tuning_buckets=None, round_up=None
+        ):
+            assert not tuning.is_autotuning()
+            raise RuntimeError("body failed")
+        assert tuning.is_autotuning()
+    assert not tuning.is_autotuning()
+
+
+def test_missing_flashinfer_is_a_noop(monkeypatch, tmp_path):
+    monkeypatch.setattr(tuning, "_autotuner", None)
+    assert tuning.autotune_cache_path({}) is None
+    assert not tuning.load_autotune_cache(str(tmp_path / "cache.json"), None, 0)
+    assert not tuning.save_autotune_cache(str(tmp_path / "cache.json"), None, 0)
+    tuning.set_autotune_process_group(None)
+    with autotune(tune_mode=True, tuning_buckets=None, round_up=None):
+        assert not tuning.is_autotuning()
+
+
+def test_peer_cache_failure_discards_local_results(monkeypatch, tmp_path):
+    tuner, _ = _install_fake_flashinfer(monkeypatch, metadata={})
+    path = str(tmp_path / "configs.json")
+    assert save_autotune_cache(path, None, 0)
+    monkeypatch.setattr(tuning.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(tuning.dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(
+        tuning.dist, "broadcast_object_list", lambda *args, **kwargs: None
+    )
+
+    def disagree(states, loaded, *, group):
+        states[:] = [loaded, False]
+
+    monkeypatch.setattr(tuning.dist, "all_gather_object", disagree)
+    assert not load_autotune_cache(path, object(), 0)
+    assert not tuner.active
+
+
+def test_default_cache_directory_is_flashinfer_autotune(monkeypatch, tmp_path):
+    _install_fake_flashinfer(monkeypatch, metadata={"gpu": "B300"})
+    monkeypatch.delenv("TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR", raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    path = autotune_cache_path({"model": "model-a"})
+    assert Path(path).parent.parent == tmp_path / "tokenspeed" / "flashinfer-autotune"
+    assert Path(path).name == "autotune_configs.json"

@@ -28,9 +28,9 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.tuning import (
     autotune,
-    flashinfer_autotune_cache_path,
-    load_flashinfer_autotune_cache,
-    save_flashinfer_autotune_cache,
+    autotune_cache_path,
+    load_autotune_cache,
+    save_autotune_cache,
     set_autotune_max_num_tokens,
     set_autotune_process_group,
 )
@@ -579,43 +579,11 @@ class ModelExecutor:
         workspace_pool(self.device).freeze()
 
         if not self.forward_step.disable:
-            # Capture and replay share the exact decode bucket mapper.
-            with autotune(
-                tune_mode=False,
-                tuning_buckets=self._decode_autotune_buckets(
-                    tuple(self.forward_step.capture_bs)
-                ),
-                round_up=False,
-            ):
-                self.forward_step.capture()
+            self.forward_step.capture()
         if not self.prefill_graph.disable:
             self.prefill_graph.capture(self.forward_step)
             if self.drafter is not None:
                 self.drafter.capture_prefill_graph(self.forward_step.stream)
-
-    def _decode_autotune_buckets(
-        self,
-        request_buckets: tuple[int, ...],
-    ) -> tuple[int, ...]:
-        """FI dynamic buckets covering the requested decode token counts."""
-        # Most decode kernels see one token per request. Speculative target
-        # verification and cross-attention-DP MoE gathers can see fixed
-        # multiples of that count, so include those exact cases too.
-        tokens_per_req = self.forward_step.max_tokens_per_req
-        factors = {
-            1,
-            tokens_per_req,
-            tokens_per_req * self.config.data_parallel_size,
-        }
-        return tuple(
-            sorted(
-                {
-                    request_bs * factor
-                    for request_bs in request_buckets
-                    for factor in factors
-                }
-            )
-        )
 
     def _autotune(self) -> None:
         """Tune missing prefill/decode configs and persist the shared cache."""
@@ -624,13 +592,15 @@ class ModelExecutor:
             int(self.config.max_num_seqs)
             // max(int(self.config.data_parallel_size), 1),
         )
-        num_tokens = min(
-            int(self.config.chunked_prefill_size),
-            int(self.config.context_len) * per_rank_max_batch,
-        )
         if self.model_runner is None:
             return
-
+        ib = self.input_buffers
+        num_tokens = min(
+            ib.input_ids_buf.numel(),
+            int(self.config.context_len) * per_rank_max_batch,
+        )
+        if self.config.chunked_prefill_size > 0:
+            num_tokens = min(num_tokens, int(self.config.chunked_prefill_size))
         set_autotune_max_num_tokens(num_tokens)
         cpu_group = None
         if self.config.world_size > 1:
@@ -642,11 +612,11 @@ class ModelExecutor:
         )
 
         cache_path = (
-            flashinfer_autotune_cache_path(self.config.autotune_cache_key)
+            autotune_cache_path(self.config.autotune_cache_key)
             if self.config.autotune_cache_key is not None
             else None
         )
-        load_flashinfer_autotune_cache(cache_path, cpu_group, owner_rank)
+        load_autotune_cache(cache_path, cpu_group, owner_rank)
 
         if self.config.pp_size > 1:
             # These dummy forwards do not perform pipeline stage transfers.
@@ -656,59 +626,48 @@ class ModelExecutor:
             logger.info("Kernel tuning disabled (--disable-autotune)")
             return
 
-        decode_cases = tuple(sorted(self.forward_step.capture_bs))
-        logger.info(
-            f"FlashInfer startup tuning: prefill={num_tokens} tokens, "
-            f"decode cases={decode_cases}"
-        )
+        # One traversal discovers each operator. Its dispatch exposes the
+        # tunable branches; FI enumerates native buckets independently of the
+        # graph ladder. Prefill stays inside the actual buffer/request limits.
+        logger.info(f"Kernel startup tuning with {num_tokens} prefill tokens")
 
-        ib = self.input_buffers
         tic = time.time()
         set_autotune_process_group(cpu_group)
-        try:
-            # Warmup metadata must remain mutable outside inference mode
-            # when capture refreshes it later.
-            with torch.no_grad():
-                if num_tokens > 0:
-                    with autotune(tune_mode=True, tuning_buckets=None, round_up=None):
-                        # Scrub borrowed Engram state before constructing warmup inputs.
-                        ib.fill_dummy_decode_buffers(
-                            batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
-                        )
-                        bs = -(-num_tokens // max(1, int(self.config.context_len)))
-                        ctx = self.prefill_graph.make_dummy_batch(num_tokens, bs)
-                        positions = (
-                            ib.mrope_positions_buf[:, :num_tokens]
-                            if self.config.model_is_mrope
-                            else ib.positions_buf[:num_tokens]
-                        )
-                        with active_forward(ctx):
-                            self.model_runner.forward(
-                                ctx=ctx,
-                                input_ids=ib.input_ids_buf[:num_tokens],
-                                positions=positions,
-                                **ib.ngram_model_kwargs(num_tokens),
-                            )
-
-                # Separate contexts avoid combining sizes with static
-                # branches that never occur together.
-                for bs in decode_cases:
-                    case_buckets = self._decode_autotune_buckets((bs,))
-                    with autotune(
-                        tune_mode=True,
-                        tuning_buckets=case_buckets,
-                        round_up=False,
-                    ):
-                        self.forward_step.warmup_decode_path(
-                            batch_sizes=(bs,), graph_phase=not self.forward_step.disable
-                        )
-        finally:
-            set_autotune_process_group(None)
+        # Capture later refreshes the metadata created here in place.
+        with torch.no_grad(), autotune(
+            tune_mode=True, tuning_buckets=None, round_up=None
+        ):
+            # Dummy forwards must not borrow live Engram history or masks.
+            ib.fill_dummy_decode_buffers(
+                batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
+            )
+            bs = -(-num_tokens // max(1, int(self.config.context_len)))
+            ctx = self.prefill_graph.make_dummy_batch(num_tokens, bs)
+            positions = (
+                ib.mrope_positions_buf[:, :num_tokens]
+                if self.config.model_is_mrope
+                else ib.positions_buf[:num_tokens]
+            )
+            with active_forward(ctx):
+                self.model_runner.forward(
+                    ctx=ctx,
+                    input_ids=ib.input_ids_buf[:num_tokens],
+                    positions=positions,
+                    **ib.ngram_model_kwargs(num_tokens),
+                )
+            if self.drafter is not None:
+                # The draft model is reached through the shared speculative
+                # forward, not model_runner.forward above. One request exposes
+                # its operators; FI still owns their bucket enumeration.
+                self.forward_step.warmup_decode_path(
+                    batch_sizes=(1,), graph_phase=False
+                )
+        set_autotune_process_group(None)
 
         torch.get_device_module(self.device).synchronize()
-        save_flashinfer_autotune_cache(cache_path, cpu_group, owner_rank)
+        save_autotune_cache(cache_path, cpu_group, owner_rank)
 
-        logger.info(f"FlashInfer startup tuning finished in {time.time() - tic:.1f}s")
+        logger.info(f"Kernel startup tuning finished in {time.time() - tic:.1f}s")
 
     @property
     def capturable_grammar(self):

@@ -27,7 +27,6 @@ from unittest import mock
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.gemm.routed_gemv import MEASURED_ROUTE
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -46,6 +45,7 @@ from tokenspeed.runtime.execution.drafter.dflash2 import (
 # Imported for its register_backend() side effects on _BACKEND_REGISTRY.
 from tokenspeed.runtime.layers.attention import backends  # noqa: F401
 from tokenspeed.runtime.layers.attention.registry import _BACKEND_REGISTRY
+from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.models import dflash as dflash_model
 from tokenspeed.runtime.models.dflash import DFlashDraftModel
@@ -64,15 +64,27 @@ _CUDA_ONLY = pytest.mark.skipif(
 )
 
 
-def test_draft_projections_reach_the_measured_gemv_route() -> None:
+@pytest.mark.parametrize("m", [8, 16, 24, 32])
+def test_draft_projections_use_common_gemm_dispatch(m: int) -> None:
     conv = DFlashGroupedConv(16, taps=2, group_size=4, block_size=8)
     selector = CandidateSelector(16, vocab_size=32, rank=4, top_k=4)
-    assert isinstance(conv.kernel_projection, ReplicatedLinear)
-    assert isinstance(selector.hidden_projection, ReplicatedLinear)
-    # The TP8 widths at the M a block drafter serves: batch * block width for
-    # the conv, batch * (block width - 1) for the selector.
-    for n, k in ((1792, 7168), (256, 7168)):
-        assert all((m, n, k) in MEASURED_ROUTE for m in (8, 16, 24, 32))
+    for layer in (conv.kernel_projection, selector.hidden_projection):
+        assert isinstance(layer, ReplicatedLinear)
+        assert isinstance(layer.quant_method, UnquantizedLinearMethod)
+        x = torch.randn(m, layer.weight.shape[1], dtype=layer.weight.dtype)
+        # New N/K signatures reach the shared tuning entry without a winner table.
+        with (
+            mock.patch(
+                "tokenspeed.runtime.layers.dense.unquant.decode_gemv_routed",
+                return_value=False,
+            ),
+            mock.patch(
+                "tokenspeed_kernel.mm", side_effect=torch.nn.functional.linear
+            ) as gemm,
+        ):
+            layer(x)
+        assert gemm.call_args.args[0] is x
+        assert gemm.call_args.args[1] is layer.weight
 
 
 def test_the_conv_commutes_with_a_shard_reduction() -> None:
