@@ -70,11 +70,6 @@ def test_scheduler_stats_partition_lcm_blocks(packing, active_parents, cached_pa
         "num_active_pages": 0,
         "num_cached_pages": 0,
         "num_queue_reqs": 0,
-        "num_bootstrapping_reqs": 0,
-        "num_prefilling_reqs": 0,
-        "num_remote_prefilling_reqs": 0,
-        "num_decoding_reqs": 0,
-        "num_pd_transfer_reqs": 0,
     }
 
     request = ts.RequestSpec()
@@ -85,11 +80,6 @@ def test_scheduler_stats_partition_lcm_blocks(packing, active_parents, cached_pa
         "num_active_pages": 0,
         "num_cached_pages": 0,
         "num_queue_reqs": 1,
-        "num_bootstrapping_reqs": 0,
-        "num_prefilling_reqs": 0,
-        "num_remote_prefilling_reqs": 0,
-        "num_decoding_reqs": 0,
-        "num_pd_transfer_reqs": 0,
     }
 
     scheduler.next_execution_plan()
@@ -97,11 +87,6 @@ def test_scheduler_stats_partition_lcm_blocks(packing, active_parents, cached_pa
         "num_active_pages": active_parents,
         "num_cached_pages": 0,
         "num_queue_reqs": 0,
-        "num_bootstrapping_reqs": 0,
-        "num_prefilling_reqs": 1,
-        "num_remote_prefilling_reqs": 0,
-        "num_decoding_reqs": 0,
-        "num_pd_transfer_reqs": 0,
     }
 
     result = ts.ForwardEvent.ExtendResult()
@@ -116,11 +101,6 @@ def test_scheduler_stats_partition_lcm_blocks(packing, active_parents, cached_pa
         "num_active_pages": 0,
         "num_cached_pages": cached_parents,
         "num_queue_reqs": 0,
-        "num_bootstrapping_reqs": 0,
-        "num_prefilling_reqs": 0,
-        "num_remote_prefilling_reqs": 0,
-        "num_decoding_reqs": 0,
-        "num_pd_transfer_reqs": 0,
     }
 
     assert scheduler.clear_cache()
@@ -128,11 +108,6 @@ def test_scheduler_stats_partition_lcm_blocks(packing, active_parents, cached_pa
         "num_active_pages": 0,
         "num_cached_pages": 0,
         "num_queue_reqs": 0,
-        "num_bootstrapping_reqs": 0,
-        "num_prefilling_reqs": 0,
-        "num_remote_prefilling_reqs": 0,
-        "num_decoding_reqs": 0,
-        "num_pd_transfer_reqs": 0,
     }
 
 
