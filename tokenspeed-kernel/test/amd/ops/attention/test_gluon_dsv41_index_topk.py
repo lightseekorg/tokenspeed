@@ -23,9 +23,7 @@
 from __future__ import annotations
 
 import importlib
-import os
 import sys
-from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -56,7 +54,12 @@ def _index_name() -> str:
         "attention",
         "dsv41_index_topk",
         format_signature(x=dense_tensor_format(torch.bfloat16)),
-        traits={"native_indexer": False, "index_heads": 32},
+        traits={
+            "native_indexer": False,
+            "index_heads": 32,
+            "index_k_format": "mxfp4",
+            "index_shards": 1,
+        },
         solution="gluon",
     )
     return kernel.name
@@ -88,34 +91,12 @@ def device():
     return torch.device("cuda:0")
 
 
-@pytest.fixture(scope="module")
-def tp_group():
-    if (
-        os.environ.get("TOKENSPEED_TEST_TP4") != "1"
-        or os.environ.get("WORLD_SIZE") != "4"
-    ):
-        yield None
-        return
-    device = torch.device(f"cuda:{os.environ['LOCAL_RANK']}")
-    torch.cuda.set_device(device)
-    torch.distributed.init_process_group(
-        "nccl", timeout=timedelta(seconds=120), device_id=device
-    )
-    try:
-        yield torch.distributed.group.WORLD
-    finally:
-        torch.distributed.destroy_process_group()
-
-
-@pytest.mark.parametrize("shards", [1, 4], ids=["local", "tp4"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_index_scan_graph_oracle_gluon(
-    device, shards, dtype, tp_group, require, monkeypatch
-):
+def test_index_scan_graph_oracle_gluon(device, dtype, require, monkeypatch):
     # Force multiple score-query tiles so graph replay covers the bounded path.
     monkeypatch.setattr(gluon_indexer, "_LOGITS_BUDGET_BYTES", 256)
     run_index_scan_graph_oracle(
-        device, shards, dtype, tp_group, require, "gluon", rtol=0.1, atol=0.1
+        device, 1, dtype, None, require, "gluon", rtol=0.1, atol=0.1
     )
 
 

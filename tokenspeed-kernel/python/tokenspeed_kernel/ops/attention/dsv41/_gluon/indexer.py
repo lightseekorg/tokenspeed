@@ -138,6 +138,10 @@ def run_dsv41_csa2_index_topk(
         process_group,
         out,
     )
+    if index_cache.shape[2] != 68:
+        raise ValueError("AMD Gluon CSA2 requires 68-byte MXFP4 index rows")
+    if process_group is not None:
+        raise ValueError("AMD Gluon CSA2 requires local or replicated index heads")
     # The shared contract requires eight-row candidate blocks.
     need = (
         int(candidate_blocks.shape[1]) * 8

@@ -428,9 +428,10 @@ def index_topk(
     reference's intermediate BF16 rounding. Native query tiles cap logits at
     32MiB for paged queries and 128MiB for a zero-row-stride request table.
     That broadcast layout gathers packed history once per call and packs Q
-    once before the score tiles; no payload survives the call. AMD Gluon Full
-    similarly caps each FP32 logits query tile at 32MiB instead of limiting
-    history width; Reindex scores only the candidate rows.
+    once before the score tiles; no payload survives the call. For unsharded
+    68-byte MXFP4 caches, AMD Gluon Full similarly caps each FP32 logits query
+    tile at 32MiB instead of limiting history width; Reindex scores only the
+    candidate rows.
     """
     from tokenspeed_kernel.ops.attention.dsv41.deep_gemm import (
         is_hopper_indexer_available,
@@ -461,9 +462,15 @@ def index_topk(
         )
         or (row_bytes == 132 and is_hopper_indexer_available())
     )
+    index_k_format = {
+        68: "mxfp4",
+        132: "fp8_scaled",
+    }.get(row_bytes, "unknown")
+    index_shards = 1
     index_heads = index_q.shape[1]
     if process_group is not None:
-        index_heads *= torch.distributed.get_world_size(process_group)
+        index_shards = torch.distributed.get_world_size(process_group)
+        index_heads *= index_shards
     kernel = select_kernel(
         "attention",
         "dsv41_index_topk",
@@ -471,7 +478,12 @@ def index_topk(
         features=None,
         platform=None,
         objective=SelectionObjective.DEFAULT,
-        traits={"native_indexer": native, "index_heads": index_heads},
+        traits={
+            "native_indexer": native,
+            "index_heads": index_heads,
+            "index_k_format": index_k_format,
+            "index_shards": index_shards,
+        },
         solution=solution,
         override=None,
     )

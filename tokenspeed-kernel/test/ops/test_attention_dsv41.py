@@ -539,7 +539,7 @@ def test_index_topk_batch_without_any_visible_context(device):
     table = torch.full((96, 1025), -1, dtype=torch.int32, device=device)
     visible = torch.zeros(96, dtype=torch.int32, device=device)
     top, lengths, blocks, block_lens = dsv41.index_topk(
-        q, weights, cache, table, visible, None, 512, 64, 8, 64, 4096, None, None
+        q, weights, cache, table, visible, None, 512, 64, 8, 64, 4096, None, None, None
     )
     torch.cuda.synchronize()
     assert not lengths.any() and not block_lens.any()
@@ -580,7 +580,7 @@ def test_index_topk_selects_top_scores_on_every_index_format(device, fmt, shared
     scores = dsv41.index_score(q, weights, cache, slots, None, None).float()
 
     top, lengths, blocks, block_lens = dsv41.index_topk(
-        q, weights, cache, table, visible, None, 512, 64, 8, 64, 4096, None, None
+        q, weights, cache, table, visible, None, 512, 64, 8, 64, 4096, None, None, None
     )
     torch.cuda.synchronize()
     assert lengths.tolist() == [512, 512, 512, 0]
@@ -604,7 +604,20 @@ def test_index_topk_selects_top_scores_on_every_index_format(device, fmt, shared
     assert (top[3] == -1).all() and (blocks[3] == -1).all()
 
     rerows, relengths, _, _ = dsv41.index_topk(
-        q, weights, cache, table, visible, blocks, 512, 0, 8, 64, 4096, None, None
+        q,
+        weights,
+        cache,
+        table,
+        visible,
+        blocks,
+        512,
+        0,
+        8,
+        64,
+        4096,
+        None,
+        None,
+        None,
     )
     for r in range(3):
         allowed = (

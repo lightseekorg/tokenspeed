@@ -1852,12 +1852,14 @@ def _attention_dsa_prefill_fp8_packed_rank512() -> object:
     )
 
 
-def _attention_dsv41_index_topk(heads: int, process_group: object) -> object:
+def _attention_dsv41_index_topk(
+    heads: int, process_group: object, row_bytes: int
+) -> object:
     q = torch.empty((2, heads, 128), dtype=torch.bfloat16)
     return _attention_dsv41_pkg.index_topk(
         q,
         torch.empty((2, heads), dtype=torch.bfloat16),
-        torch.empty((4, 64, 68), dtype=torch.uint8),
+        torch.empty((4, 64, row_bytes), dtype=torch.uint8),
         torch.zeros((2, 4), dtype=torch.int32),
         torch.tensor([64, 32], dtype=torch.int32),
         None,
@@ -3846,7 +3848,7 @@ _CASES = [
         "attention",
         "dsv41_index_topk",
         "gluon_dsv41_index_topk_gfx950",
-        partial(_attention_dsv41_index_topk, 32, None),
+        partial(_attention_dsv41_index_topk, 32, None, 68),
     ),
     _case(
         _is_cdna5,
@@ -3854,7 +3856,7 @@ _CASES = [
         "attention",
         "dsv41_index_topk",
         "gluon_dsv41_index_topk_gfx1250",
-        partial(_attention_dsv41_index_topk, 32, None),
+        partial(_attention_dsv41_index_topk, 32, None, 68),
     ),
     _case(
         _is_cdna4,
@@ -5674,8 +5676,8 @@ def test_gluon_mla_fixed_regime_auto_selection(
 
 
 @pytest.mark.parametrize("platform_fixture", ["mi350_platform", "mi450_platform"])
-@pytest.mark.parametrize(("heads", "shards"), [(64, 1), (16, 4)])
-def test_dsv41_index_topk_large_gathered_head_count_selects_triton(
+@pytest.mark.parametrize(("heads", "shards"), [(64, 1), (16, 4), (8, 4)])
+def test_dsv41_index_topk_unsupported_gluon_geometry_selects_triton(
     platform_fixture, heads, shards, request, monkeypatch, selected_kernel_spy
 ):
     platform = request.getfixturevalue(platform_fixture)
@@ -5687,7 +5689,34 @@ def test_dsv41_index_topk_large_gathered_head_count_selects_triton(
         "attention",
         "dsv41_index_topk",
         "triton_dsv41_index_topk",
-        partial(_attention_dsv41_index_topk, heads, group),
+        partial(_attention_dsv41_index_topk, heads, group, 68),
+    )
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = case
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    try:
+        Platform.override(platform)
+        registry.clear_cache()
+        case.invoke()
+        assert calls == [case.expected]
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+
+
+@pytest.mark.parametrize("platform_fixture", ["mi350_platform", "mi450_platform"])
+def test_dsv41_index_topk_fp8_rows_select_triton(
+    platform_fixture, request, selected_kernel_spy
+):
+    platform = request.getfixturevalue(platform_fixture)
+    case = _case(
+        lambda platform: platform.is_amd,
+        "cdna4",
+        "attention",
+        "dsv41_index_topk",
+        "triton_dsv41_index_topk",
+        partial(_attention_dsv41_index_topk, 32, None, 132),
     )
     active_case, calls = selected_kernel_spy
     active_case["case"] = case

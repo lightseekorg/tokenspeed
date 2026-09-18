@@ -48,6 +48,8 @@ if current_platform().is_amd:
     _INDEX_TRAITS = {
         "native_indexer": frozenset({False}),
         "index_heads": frozenset(range(1, 33)),
+        "index_k_format": frozenset({"mxfp4"}),
+        "index_shards": frozenset({1}),
     }
 
     @register_kernel(
