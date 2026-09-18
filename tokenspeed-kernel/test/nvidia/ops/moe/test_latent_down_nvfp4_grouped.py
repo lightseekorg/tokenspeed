@@ -148,7 +148,7 @@ def test_grouped_bytes_and_live_row_reset(pdl, hidden, m):
 
 
 @pytest.mark.parametrize("pdl", [False, True])
-@pytest.mark.parametrize("m", [8, 95, 96, 97, 1280])
+@pytest.mark.parametrize("m", [8, 9, 32, 64, 95, 96, 1280])
 def test_grouped_graph_replay(pdl, m):
     pdl_enabled(pdl)
     source = _fixture(m, 3584)
@@ -180,6 +180,42 @@ def test_grouped_graph_replay(pdl, m):
             graph.replay()
         torch.cuda.synchronize()
         _check(mailbox, source, data, scales, multiplier, m, pdl)
+
+
+@pytest.mark.parametrize("pdl", [False, True])
+def test_grouped_scale_rounding_boundaries(pdl):
+    pdl_enabled(pdl)
+    m, hidden = 17, 64
+    source = _fixture(m, hidden)
+    source[1].zero_()
+    source[2] = source[0].abs().clamp(max=1e-30)
+    source[3] = torch.nextafter(source[0], torch.full_like(source[0], float("inf")))
+    source[4] = torch.nextafter(source[0], torch.full_like(source[0], -float("inf")))
+    source[5:13] = (
+        torch.linspace(-1.375, 1.375, 16, device="cuda").to(torch.bfloat16).repeat(4)
+    )
+    mailbox = source.clone()
+    data = torch.full((m + 1, hidden // 2), 193, device="cuda", dtype=torch.uint8)
+    scales = torch.full((m + 1, hidden // 16), 193, device="cuda", dtype=torch.uint8)
+    for midpoint in (1.0625, 2.125, 4.25, 8.5, 17.0, 34.0, 68.0, 136.0):
+        center = torch.tensor(midpoint * 6 / 1.375, dtype=torch.float32)
+        for value in (
+            torch.nextafter(center, torch.tensor(-float("inf"))).item(),
+            center.item(),
+            torch.nextafter(center, torch.tensor(float("inf"))).item(),
+        ):
+            multiplier = torch.tensor(value, device="cuda", dtype=torch.float32)
+            mailbox.copy_(source)
+            launch(
+                mailbox,
+                data[:m],
+                scales[:m],
+                multiplier,
+                hidden=hidden,
+                m=m,
+                use_pdl=pdl,
+            )
+            _check(mailbox, source, data, scales, multiplier, m, pdl)
 
 
 @pytest.mark.parametrize("m", [0, 1281])

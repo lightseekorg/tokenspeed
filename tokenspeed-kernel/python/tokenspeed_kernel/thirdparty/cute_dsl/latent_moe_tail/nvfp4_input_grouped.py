@@ -30,10 +30,6 @@ import torch
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cutlass_dsl import T, dsl_user_op
-from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.nvfp4_input_cooperative import (
-    pack_scales,
-    quantize_fragment,
-)
 from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.primitives import (
     fragment_is_dirty,
     load_global_u32x4,
@@ -41,6 +37,107 @@ from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.primitives import (
     to_cute,
     to_cute_dynamic_m,
 )
+
+
+def _quantize_asm():
+    lines = [
+        "{",
+        ".reg .f32 v<8>, a, t, s, r, ginv, sixinv;",
+        ".reg .b32 u, halves, peer, bits, mask, base;",
+        ".reg .b16 sf, half0, half1;",
+        ".reg .b8 b<4>;",
+        ".reg .pred zero;",
+        "mov.f32 a, 0f00000000;",
+        "mov.b32 {b0, b1, b2, b3}, 0;",
+    ]
+    for i in range(8):
+        arg = 2 + i // 2
+        lines += [
+            (
+                f"shl.b32 u, ${arg}, 16;"
+                if i % 2 == 0
+                else f"and.b32 u, ${arg}, 0xffff0000;"
+            ),
+            f"mov.b32 v{i}, u;",
+            f"abs.f32 t, v{i};",
+            "max.f32 a, a, t;",
+        ]
+    lines += [
+        "and.b32 base, $7, 30;",
+        "mov.b32 mask, 3;",
+        "shl.b32 mask, mask, base;",
+        "mov.b32 bits, a;",
+        "shfl.sync.bfly.b32 peer, bits, 1, 31, mask;",
+        "mov.b32 t, peer;",
+        "max.f32 a, a, t;",
+        "rcp.approx.ftz.f32 sixinv, 0f40c00000;",
+        "mul.rn.f32 s, a, sixinv;",
+        "mul.rn.f32 s, s, $6;",
+        "cvt.rn.satfinite.e4m3x2.f32 sf, 0f00000000, s;",
+        "cvt.u32.u16 $1, sf;",
+        "cvt.rn.f16x2.e4m3x2 halves, sf;",
+        "mov.b32 {half0, half1}, halves;",
+        "cvt.f32.f16 s, half0;",
+        "rcp.approx.ftz.f32 ginv, $6;",
+        "mul.rn.f32 r, s, ginv;",
+        "rcp.approx.ftz.f32 r, r;",
+        "setp.eq.f32 zero, a, 0f00000000;",
+        "selp.f32 r, 0f00000000, r, zero;",
+    ]
+    for i in range(8):
+        lines.append(f"mul.rn.f32 v{i}, v{i}, r;")
+    for i in range(4):
+        lines.append(f"cvt.rn.satfinite.e2m1x2.f32 b{i}, v{2*i+1}, v{2*i};")
+    lines += ["mov.b32 $0, {b0, b1, b2, b3};", "}"]
+    return "\n".join(lines)
+
+
+@dsl_user_op
+def quantize_fragment(fragment, scale, lane, *, loc, ip):
+    args = [value.ir_value(loc=loc, ip=ip) for value in fragment]
+    args += [scale.ir_value(loc=loc, ip=ip), lane.ir_value(loc=loc, ip=ip)]
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        args,
+        _quantize_asm(),
+        "=r,=r,r,r,r,r,f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        cutlass.Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip))
+        for i in range(2)
+    )
+
+
+@dsl_user_op
+def pack_scales(scale, lane, *, loc, ip):
+    result = llvm.inline_asm(
+        T.i32(),
+        [scale.ir_value(loc=loc, ip=ip), lane.ir_value(loc=loc, ip=ip)],
+        "{ .reg .b32 v, t, shift, mask, base;\n"
+        "shr.u32 shift, $2, 1;\n"
+        "and.b32 shift, shift, 3;\n"
+        "shl.b32 shift, shift, 3;\n"
+        "shl.b32 v, $1, shift;\n"
+        "and.b32 base, $2, 24;\n"
+        "mov.b32 mask, 255;\n"
+        "shl.b32 mask, mask, base;\n"
+        "shfl.sync.bfly.b32 t, v, 2, 31, mask;\n"
+        "or.b32 v, v, t;\n"
+        "shfl.sync.bfly.b32 t, v, 4, 31, mask;\n"
+        "or.b32 $0, v, t; }",
+        "=r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Uint32(result)
 
 
 @dsl_user_op
@@ -108,7 +205,6 @@ class GroupedNvfp4Input:
                     (fragment[0], fragment[1], fragment[2], fragment[3]),
                     cutlass.Float32(scale[0]),
                     cutlass.Int32(tid % 32),
-                    values=8,
                     loc=None,
                     ip=None,
                 )
@@ -119,9 +215,7 @@ class GroupedNvfp4Input:
                     assumed_align=4,
                 )
                 cute.make_tensor(output, cute.make_layout((1,)))[0] = packed
-                packed_sf = pack_scales(
-                    sf, cutlass.Int32(tid % 32), values=8, loc=None, ip=None
-                )
+                packed_sf = pack_scales(sf, cutlass.Int32(tid % 32), loc=None, ip=None)
                 if tid % 8 == 0:
                     scales[element // 64] = packed_sf
                 store_lamport_sentinel_128(pointer, sentinel=0x80008000)

@@ -83,27 +83,6 @@ def _quantize_latent_input(source, data, scales, scale, signals, **kwargs):
 
 @register_kernel(
     "moe",
-    "quantize_latent_input_cooperative",
-    name="cute_dsl_nvfp4_latent_input_cooperative",
-    solution="cute_dsl",
-    capability=CapabilityRequirement(
-        vendors=frozenset({"nvidia"}),
-        min_arch_version=ArchVersion(10, 0),
-        max_arch_version=ArchVersion(10, 3),
-    ),
-    signatures=format_signatures("x", "dense", {torch.bfloat16}),
-    priority=Priority.SPECIALIZED,
-)
-def _quantize_latent_input_cooperative(source, data, scales, scale, **kwargs):
-    from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.nvfp4_input_cooperative import (
-        launch,
-    )
-
-    launch(source, data, scales, scale, **kwargs)
-
-
-@register_kernel(
-    "moe",
     "quantize_latent_input_grouped",
     name="cute_dsl_nvfp4_latent_input_grouped",
     solution="cute_dsl",
@@ -121,19 +100,6 @@ def _quantize_latent_input_grouped(source, data, scales, scale, **kwargs):
     )
 
     launch(source, data, scales, scale, **kwargs)
-
-
-def _auto_quantizer(m):
-    """Return (ready-group consumer, values/lane) for fixed launch bands."""
-    if not 1 <= m <= 1280:
-        raise ValueError("automatic NVFP4 preparation supports M=1..1280")
-    if m <= 8 or m >= 96:
-        return True, 8
-    if m <= 32:
-        return False, 2
-    if m <= 64:
-        return False, 4
-    return False, 8
 
 
 def fusion_mode() -> str:
@@ -175,12 +141,6 @@ class KimiK3Nvfp4DownOp:
             format_signature(x=dense_tensor_format(torch.bfloat16)),
             solution="cute_dsl",
         )
-        self.cooperative_kernel = select_kernel(
-            "moe",
-            "quantize_latent_input_cooperative",
-            format_signature(x=dense_tensor_format(torch.bfloat16)),
-            solution="cute_dsl",
-        )
         self.grouped_kernel = select_kernel(
             "moe",
             "quantize_latent_input_grouped",
@@ -206,9 +166,9 @@ class KimiK3Nvfp4DownOp:
             scale: Receiver's scalar FP32 encoding multiplier (already processed).
             group: The TP group whose eight ranks own the latent columns.
             max_m: Largest live row count supported by the experiment.
-            mode: Frozen startup setting, off/mailbox/all/auto. Auto uses ready
-                groups at M<=8 and M=96..1280, and the original cooperative
-                fused consumer at M=9..95. Larger widths retain the original path.
+            mode: Frozen startup setting, off/mailbox/all/auto. Auto uses the
+                ready-group fused consumer for M=1..1280. Larger row counts
+                retain the original path.
 
         Returns:
             Prepared op, or None when the group cannot safely use the fusion.
@@ -282,24 +242,10 @@ class KimiK3Nvfp4DownOp:
         )
 
         if auto_dispatch:
-            from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.nvfp4_input_cooperative import (
-                compile_kernel as compile_cooperative,
-            )
             from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.nvfp4_input_grouped import (
                 compile_kernel as compile_grouped,
             )
 
-            for rows in (9, 33, 65):
-                _, values = _auto_quantizer(rows)
-                compile_cooperative(
-                    hidden,
-                    values,
-                    608,
-                    128,
-                    True,
-                    scale.device.index,
-                    op.use_pdl,
-                )
             compile_grouped(hidden, scale.device.index, op.use_pdl)
         for rows in (() if auto_dispatch else (1, 5, 9, 33, 65)):
             mailbox_ctas, mailbox_threads = _mailbox_geometry(rows)
@@ -388,36 +334,20 @@ class KimiK3Nvfp4DownOp:
 
     def _prepare_auto(self, hidden_states, weight):
         m = hidden_states.shape[0]
-        grouped, values = _auto_quantizer(m)
         slot = self.mailbox._slot
         slot.gemm_by_m[m](hidden_states, weight, slot.mailbox, slot.multicast_ptr)
         source = slot.mailbox
         data = self.workspace.data[:m]
         scales = self.workspace.scales[:m]
-        if grouped:
-            self.grouped_kernel(
-                source,
-                data,
-                scales,
-                self.scale,
-                hidden=self.hidden,
-                m=m,
-                use_pdl=self.use_pdl,
-            )
-        else:
-            self.cooperative_kernel(
-                source,
-                data,
-                scales,
-                self.scale,
-                hidden=self.hidden,
-                m=m,
-                values=values,
-                ctas=608,
-                threads=128,
-                mailbox=True,
-                use_pdl=self.use_pdl,
-            )
+        self.grouped_kernel(
+            source,
+            data,
+            scales,
+            self.scale,
+            hidden=self.hidden,
+            m=m,
+            use_pdl=self.use_pdl,
+        )
         return data, scales.view(torch.float8_e4m3fn)
 
     def __call__(
