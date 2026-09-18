@@ -240,9 +240,12 @@ def _route_manager():
     from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
 
     manager = object.__new__(MooncakeKVManagerPrefill)
+    layout = _typed_layout(local_heads=4, global_heads=4)
     manager.kv_args = SimpleNamespace(
-        cache_layout=_typed_layout(local_heads=4, global_heads=4),
+        cache_layout=layout,
         kv_data_ptr=0x1000,
+        # A single stage owns every field, as a non-PP prefill declares.
+        cache_fields_by_stage=(tuple(field.field_id for field in layout.plan.fields),),
     )
     manager.topology = _topology()
     return manager
