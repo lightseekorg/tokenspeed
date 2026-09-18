@@ -19,14 +19,14 @@
 # SOFTWARE.
 
 
-"""Ready-group NVFP4 bytes, graph replay, and live mailbox-row ownership."""
+"""Lamport copy/NVFP4 bytes, graph replay, and live mailbox-row ownership."""
 
 import pytest
 import torch
 from flashinfer import fp4_quantize
-from tokenspeed_kernel.ops.moe.latent_down_nvfp4 import fusion_mode
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
-from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.nvfp4_input_grouped import (
+from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.lamport_copy_nvfp4_quant import (
+    LamportCopyNvfp4QuantKernel,
     compile_kernel,
     launch,
 )
@@ -35,17 +35,6 @@ pytestmark = pytest.mark.skipif(
     not current_platform().is_nvidia or current_platform().arch_version.major != 10,
     reason="requires Blackwell",
 )
-
-
-@pytest.mark.parametrize(
-    "configured,expected", [(None, "auto"), ("auto", "auto"), ("off", "off")]
-)
-def test_fusion_mode_default_and_override(monkeypatch, configured, expected):
-    if configured is None:
-        monkeypatch.delenv("TOKENSPEED_K3_DOWN_NVFP4_FUSION", raising=False)
-    else:
-        monkeypatch.setenv("TOKENSPEED_K3_DOWN_NVFP4_FUSION", configured)
-    assert fusion_mode() == expected
 
 
 def _fixture(m, hidden):
@@ -126,7 +115,7 @@ def _check(mailbox, source, data, scales, multiplier, m, pdl):
         1280,
     ],
 )
-def test_grouped_bytes_and_live_row_reset(pdl, hidden, m):
+def test_copy_bytes_and_live_row_reset(pdl, hidden, m):
     pdl_enabled(pdl)
     source = _fixture(m, hidden)
     mailbox = source.clone()
@@ -149,7 +138,7 @@ def test_grouped_bytes_and_live_row_reset(pdl, hidden, m):
 
 @pytest.mark.parametrize("pdl", [False, True])
 @pytest.mark.parametrize("m", [8, 9, 32, 64, 95, 96, 1280])
-def test_grouped_graph_replay(pdl, m):
+def test_copy_graph_replay(pdl, m):
     pdl_enabled(pdl)
     source = _fixture(m, 3584)
     mailbox = source.clone()
@@ -183,7 +172,7 @@ def test_grouped_graph_replay(pdl, m):
 
 
 @pytest.mark.parametrize("pdl", [False, True])
-def test_grouped_scale_rounding_boundaries(pdl):
+def test_copy_scale_rounding_boundaries(pdl):
     pdl_enabled(pdl)
     m, hidden = 17, 64
     source = _fixture(m, hidden)
@@ -218,11 +207,60 @@ def test_grouped_scale_rounding_boundaries(pdl):
             _check(mailbox, source, data, scales, multiplier, m, pdl)
 
 
+@pytest.mark.parametrize("pdl", [False, True])
+@pytest.mark.parametrize("m", [9, 95, 1280])
+def test_gather_allocated_outputs_and_graph_replay(pdl, m):
+    pdl_enabled(pdl)
+    source = _fixture(m, 3584)
+    mailbox = source.clone()
+    multiplier = torch.tensor(128.0, device="cuda", dtype=torch.float32)
+    gather = LamportCopyNvfp4QuantKernel(hidden_dim=3584, device=source.device)
+
+    def gather_pair():
+        outputs = []
+        for scale in (multiplier, multiplier * 2):
+            mailbox.copy_(source)
+            outputs.append(gather(mailbox, scale, m=m))
+        return outputs
+
+    def check(outputs):
+        assert outputs[0][0].data_ptr() != outputs[1][0].data_ptr()
+        assert outputs[0][1].data_ptr() != outputs[1][1].data_ptr()
+        for (data, scales), scale in zip(outputs, (multiplier, multiplier * 2)):
+            expected, expected_scales = fp4_quantize(
+                source[:m], scale, is_sf_swizzled_layout=False, enable_pdl=pdl
+            )
+            assert data.dtype == torch.uint8
+            assert scales.dtype == torch.float8_e4m3fn
+            torch.testing.assert_close(data, expected, rtol=0, atol=0)
+            torch.testing.assert_close(
+                scales.view(torch.uint8).flatten(),
+                expected_scales.view(torch.uint8).flatten(),
+                rtol=0,
+                atol=0,
+            )
+        assert bool((mailbox[:m].view(torch.int32) == -2147450880).all())
+        torch.testing.assert_close(mailbox[m], source[m], rtol=0, atol=0)
+
+    check(gather_pair())
+    before = compile_kernel.cache_info().misses
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = gather_pair()
+    assert compile_kernel.cache_info().misses == before
+    for _ in range(2):
+        source.copy_(_fixture(m, 3584).roll(64, dims=1))
+        for _ in range(10):
+            graph.replay()
+        torch.cuda.synchronize()
+        check(outputs)
+
+
 @pytest.mark.parametrize("m", [0, 1281])
-def test_grouped_rejects_unsupported_width(m):
+def test_copy_rejects_unsupported_width(m):
     source = torch.empty((1, 3584), device="cuda", dtype=torch.bfloat16)
     data = torch.empty((1, 1792), device="cuda", dtype=torch.uint8)
     scales = torch.empty((1, 224), device="cuda", dtype=torch.uint8)
     multiplier = torch.ones((), device="cuda", dtype=torch.float32)
-    with pytest.raises(ValueError, match="unsupported grouped NVFP4 geometry"):
+    with pytest.raises(ValueError, match="unsupported Lamport NVFP4 geometry"):
         launch(source, data, scales, multiplier, hidden=3584, m=m, use_pdl=True)

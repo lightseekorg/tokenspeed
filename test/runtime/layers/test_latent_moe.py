@@ -995,7 +995,8 @@ class _FakeMulticastDown:
     def handles(self, num_tokens: int) -> bool:
         return 1 <= num_tokens <= self.max_m
 
-    def __call__(self, hidden_states, block):
+    def __call__(self, hidden_states, block, *, output_scale):
+        assert output_scale is None
         # The caller hands over this rank's rows; the op does not carve them.
         self._calls.append((hidden_states.shape[0], tuple(block.shape)))
         return hidden_states @ block.T

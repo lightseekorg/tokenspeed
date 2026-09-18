@@ -19,7 +19,7 @@
 # SOFTWARE.
 
 
-"""Fused Lamport receive and NVFP4 quantization with independent ready groups."""
+"""Lamport copy fused with NVFP4 quantization using independent ready groups."""
 
 import functools
 
@@ -30,6 +30,7 @@ import torch
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cutlass_dsl import T, dsl_user_op
+from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.primitives import (
     fragment_is_dirty,
     load_global_u32x4,
@@ -157,7 +158,7 @@ def _ballot(value, *, loc, ip):
     return cutlass.Uint32(result)
 
 
-class GroupedNvfp4Input:
+class LamportCopyNvfp4Quant:
     def __init__(self, hidden, use_pdl):
         self.hidden = hidden
         self.use_pdl = use_pdl
@@ -239,7 +240,7 @@ def compile_kernel(hidden, device, use_pdl):
         )
         scale = make_fake_compact_tensor(cutlass.Float32, (1,), assumed_align=4)
         return cute.compile(
-            GroupedNvfp4Input(hidden, use_pdl),
+            LamportCopyNvfp4Quant(hidden, use_pdl),
             source,
             data,
             scales,
@@ -268,7 +269,7 @@ def launch(source, data, scales, global_scale, *, hidden, m, use_pdl):
         Buffers and the two-slot symmetric-mailbox rotation remain caller-owned.
     """
     if hidden <= 0 or hidden % 64 or not 1 <= m <= 1280:
-        raise ValueError("unsupported grouped NVFP4 geometry")
+        raise ValueError("unsupported Lamport NVFP4 geometry")
     if (
         not source.is_cuda
         or source.dtype != torch.bfloat16
@@ -303,3 +304,53 @@ def launch(source, data, scales, global_scale, *, hidden, m, use_pdl):
         cutlass.Int32(ctas),
         cuda.CUstream(torch.cuda.current_stream(source.device).cuda_stream),
     )
+
+
+class LamportCopyNvfp4QuantKernel:
+    """Copy a borrowed BF16 mailbox into fresh NVFP4 values and scales."""
+
+    def __init__(self, *, hidden_dim: int, device: torch.device) -> None:
+        """Compile for the mailbox's row width and device before graph capture."""
+        self.hidden_dim = hidden_dim
+        self.use_pdl = pdl_enabled()
+        compile_kernel(hidden_dim, device.index, self.use_pdl)
+
+    def __call__(
+        self,
+        symmetric_mailbox: torch.Tensor,
+        scale: torch.Tensor,
+        *,
+        m: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize live mailbox rows and restore their empty sentinels.
+
+        Args:
+            symmetric_mailbox: Contiguous CUDA BF16 storage covering M rows of
+                hidden_dim values, using the 0x80008000 sentinel contract.
+            scale: This receiver's positive scalar FP32 encoding multiplier.
+            m: Live rows, between 1 and 1280; only these rows are consumed.
+
+        Returns:
+            Newly allocated uint8 packed values [M, H/2] and linear E4M3
+            scales [M, H/16], with scale storage padded to 16 rows.
+        """
+        data = torch.empty(
+            (m, self.hidden_dim // 2),
+            dtype=torch.uint8,
+            device=symmetric_mailbox.device,
+        )
+        scales = torch.empty(
+            ((m + 15) // 16 * 16, self.hidden_dim // 16),
+            dtype=torch.uint8,
+            device=symmetric_mailbox.device,
+        )[:m]
+        launch(
+            symmetric_mailbox,
+            data,
+            scales,
+            scale,
+            hidden=self.hidden_dim,
+            m=m,
+            use_pdl=self.use_pdl,
+        )
+        return data, scales.view(torch.float8_e4m3fn)

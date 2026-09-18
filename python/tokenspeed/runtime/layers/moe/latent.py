@@ -563,7 +563,12 @@ class Kimi3LatentProjection(ReplicatedLinear):
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, None]:
         num_tokens = hidden_states.shape[0]
         if self.multicast_down is not None and self.multicast_down.handles(num_tokens):
-            return self.multicast_down(hidden_states, self._multicast_block()), None
+            return (
+                self.multicast_down(
+                    hidden_states, self._multicast_block(), output_scale=None
+                ),
+                None,
+            )
         if self.narrowed and self.column_group is not None:
             return self._gather_shards(self.project_shard(hidden_states)), None
         return self._gather_shards(self._project_replicated(hidden_states)), None
