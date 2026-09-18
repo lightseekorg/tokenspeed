@@ -168,6 +168,7 @@ def _backend(device: str, *, contract_pool, spec_tokens: int = 1) -> KdaAttnBack
     kda_backend = "auto" if current_platform().is_amd else "fla"
     backend = KdaAttnBackend(
         *_backend_config(device, spec_tokens=spec_tokens),
+        enable_prefill_graph=False,
         kda_backend=kda_backend,
     )
     backend.set_kv_pool(contract_pool)

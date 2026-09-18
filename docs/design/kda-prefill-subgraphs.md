@@ -107,7 +107,8 @@ For a supported KDA model, add these settings to your serving command. Keep the
 model's other options, such as tensor parallelism and quantization, as usual:
 
 ```bash
-TOKENSPEED_KDA_PREFILL_GRAPH=1 tokenspeed serve /path/to/model \
+tokenspeed serve /path/to/model \
+  --enable-kda-prefill-graph \
   --kda-backend cutedsl_kda \
   --chunked-prefill-size 4096 \
   --prefill-graph-max-tokens 4096 \
@@ -116,9 +117,12 @@ TOKENSPEED_KDA_PREFILL_GRAPH=1 tokenspeed serve /path/to/model \
 ```
 
 Prefill graphs must remain enabled: omit `--disable-prefill-graph` and
-`--enforce-eager`. Set `TOKENSPEED_KDA_PREFILL_GRAPH=0`, or leave it unset, to
-turn off KDA graph capture while retaining the ordinary prefill and decode
-graph settings.
+`--enforce-eager`. Omit `--enable-kda-prefill-graph` to turn off KDA graph capture
+while retaining the ordinary prefill and decode graph settings.
+
+This server argument replaces `TOKENSPEED_KDA_PREFILL_GRAPH`, which is no longer
+read. The shared server configuration supplies the setting to every TP worker,
+so worker-local environment variables cannot change capture behavior.
 
 ### Choose token buckets and batch sizes
 

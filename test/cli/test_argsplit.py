@@ -116,6 +116,12 @@ def test_dp_sampling_routes_to_engine():
     assert r.gateway == []
 
 
+def test_kda_prefill_graph_routes_to_engine():
+    r = _split(["--enable-kda-prefill-graph"])
+    assert r.engine == ["--enable-kda-prefill-graph"]
+    assert r.gateway == []
+
+
 def test_multi_value_capture_sizes_route_to_engine():
     """nargs='+' engine flags: every bare value belongs to the flag, not argv."""
     for flag in (

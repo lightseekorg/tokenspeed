@@ -24,7 +24,6 @@ See ``KdaAttnBackend`` for what separates the family from GDN."""
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -115,12 +114,11 @@ class KdaAttnBackend(MambaAttnBackend):
         config: AttnConfig,
         spec: SoftmaxAttnConfig,
         *,
+        enable_prefill_graph: bool,
         kda_backend: str = "auto",
     ) -> None:
         super().__init__(config, spec)
-        self._prefill_graph_enabled = (
-            os.environ.get("TOKENSPEED_KDA_PREFILL_GRAPH", "0") == "1"
-        )
+        self._prefill_graph_enabled = enable_prefill_graph
         self._prefill_metadata: dict[tuple[int, int], KdaPrefillMetadata] = {}
         self._prefill_metadata_pool = None
         self.max_bs = config.max_bs

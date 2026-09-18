@@ -66,7 +66,9 @@ class _Harness:
             component=lambda cls: None,
         )
         self.config = config
-        self.backend = KdaAttnBackend(config, spec)
+        self.backend = KdaAttnBackend(
+            config, spec, enable_prefill_graph=False, kda_backend="auto"
+        )
         self.backend.set_kv_pool(self.pool)
         # The persistent decode buffers exist from construction, as at the
         # wrapper (the verify refresh below writes into them).

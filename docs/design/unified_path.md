@@ -765,9 +765,11 @@ destinations/rows. Unifying metadata does not imply zero padding cost.
 
 ### Startup capture and eager fallback
 
-`TOKENSPEED_KDA_PREFILL_GRAPH=1` opts into the merged captures owned by
-`PrefillGraph`; the default remains off. Startup creates the configured token
-bucket and request-capacity variants. Serving forwards only select and
+`--enable-kda-prefill-graph` opts into the merged captures owned by
+`PrefillGraph`; the default remains off. The shared `ServerArgs` configuration
+passes the setting explicitly to each KDA backend; workers do not read a local
+environment variable to decide whether to capture. Startup creates the configured
+token-bucket and request-capacity variants. Serving forwards only select and
 replay these captures, never warm up or capture a separate per-layer graph.
 
 If no compatible merged capture exists, the ordinary outer graph retains its

@@ -303,6 +303,7 @@ class ServerArgs:
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
+    enable_kda_prefill_graph: bool = False
     # Breakable prefill graph bucket cap: None = auto min(2048, chunk); 0 disables.
     prefill_graph_max_tokens: int | None = None
     # Explicit prefill bucket list; unset = the relative-stride ladder (see get_prefill_token_buckets).
@@ -1898,6 +1899,12 @@ class ServerArgs:
             "--disable-prefill-graph",
             action="store_true",
             help="Disable cuda graph for prefill.",
+        )
+        parser.add_argument(
+            "--enable-kda-prefill-graph",
+            action="store_true",
+            help="Include supported cutedsl_kda prefill attention in the existing "
+            "prefill CUDA graphs. Requires prefill graphs to remain enabled.",
         )
         parser.add_argument(
             "--prefill-graph-max-tokens",
