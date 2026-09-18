@@ -163,12 +163,25 @@ live rows are fully written, while negative padding rows skip state access
 and leave output undefined. Consumers must ignore padded output; enabled
 intermediate caches always require real storage.
 
-GDN, QSA and gated residual kernels follow `pdl_enabled()`, passed explicitly
-to QSA indexing kernels. Waits precede producer-owned reads and outgoing
-triggers. A trigger permits successor setup, never publishes results; each
-kernel may delay it for performance. Streaming top-k, for example, avoids
-delaying scoring waves with waiting merge CTAs. Graphs retain their captured
-PDL setting; recapture to change it.
+After verification, GDN, KDA and PLE resolve the accepted checkpoint with
+`commit_state_pages`, once per state group and only for live requests. It
+clamps acceptance, computes checkpoint slots and gathers destination pages in
+one launch. `state_verify_commit_rows` maps those pages to layers and computes
+`request * (verify_width + 1) + accepted` for batched copies and ReplaySSM.
+Its inputs and outputs are contiguous: pages are `[groups, batch_size]` for
+grouped state or `[batch_size]` for PLE, so no explicit strides are needed.
+Non-positive pages resolve to row -1 so copies skip the null page. Keep this
+arithmetic in the kernels, without eager casts, gathers, `index_select` or
+`repeat`. GDN and KDA share their backend page resolver; PLE uses its own
+group's page vector and copies the shared context once and local convolution
+states in one batched launch.
+
+GDN (prefill, decode and verify), QSA and gated residual kernels follow
+`pdl_enabled()`, passed explicitly to QSA indexing kernels. Waits precede
+producer-owned reads and outgoing triggers. A trigger permits successor
+setup, never publishes results; each kernel may delay it for performance.
+Streaming top-k, for example, avoids delaying scoring waves with waiting
+merge CTAs. Graphs retain their captured PDL setting; recapture to change it.
 
 Gated RMSNorm preloads weights only with `weights_independent`; a contiguous
 copy disables this preload. At RSAG-to-AR boundaries the next combine-norm
