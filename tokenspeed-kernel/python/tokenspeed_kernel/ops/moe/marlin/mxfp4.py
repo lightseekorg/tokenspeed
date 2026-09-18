@@ -361,6 +361,9 @@ def marlin_mxfp4_masked_moe_apply(
     """
     if recv_x.dtype != torch.bfloat16:
         raise TypeError("Marlin DeepEP receive activations must be BF16")
+    # The valid row counts live on the device (masked_m) and the compact row
+    # capacity is fixed at CUDA-graph capture, so the block size cannot follow
+    # the batch the way the local path's _block_size_m does.
     block_m = 16
     packed, sorted_ids, expert_ids, total, offsets = pack_recv_rows(
         recv_x, masked_m, num_global_tokens, top_k, block_m
@@ -368,7 +371,7 @@ def marlin_mxfp4_masked_moe_apply(
     hidden = recv_x.shape[2]
     ispp = int(w._marlin_ispp)
     rows = packed.shape[0]
-    workspace = marlin_make_workspace(recv_x.device, max_blocks_per_sm=4)
+    workspace = marlin_make_workspace(recv_x.device)
     # All scheduled expert IDs are local and valid, so Marlin needs no EP
     # invalid-block scan. Communication already established expert ownership.
     # Neither GEMM multiplies route weights: LL combine owns that operation.
