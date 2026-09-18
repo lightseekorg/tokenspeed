@@ -24,6 +24,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
@@ -36,6 +37,9 @@ from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import DeepseekV41Config
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
+    V41_CACHE_FORMATS,
+)
+from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_COMPRESSOR_TAIL_GROUP_ID as TAIL,
 )
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
@@ -46,7 +50,6 @@ from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
 )
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_GROUP_GEOMETRY,
-    V41_GROUP_PACKING,
 )
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_SWA_GROUP_ID as SWA,
@@ -87,6 +90,12 @@ def _config(device):
         candidate_topk=2,
         candidate_block_size=8,
         max_query_tokens=514,
+        # The geometry assertions in this file pin the checkpoint's own rows,
+        # so CPU fixtures stay on them; a test that runs real kernels has to
+        # store the rows this GPU's FlashMLA can actually read.
+        cache_format=(
+            "v4" if device != "cpu" and current_platform().is_hopper else "v41"
+        ),
     )
     return AttnConfig(
         device=device,
@@ -221,20 +230,31 @@ def test_rebinding_cache_pool_drops_pool_derived_state():
 
 
 def _tables(device):
+    widths = v41_table_widths(512, 0)
     tables = {
         gid: torch.zeros((2, width), dtype=torch.int32, device=device)
-        for gid, width in v41_table_widths(512, 0).items()
+        for gid, width in widths.items()
     }
-    # Different parent assignments: SWA 1..8, r2 parent9, r1 parent10,
-    # tails parents11..16. Groups are mutually exclusive tenants, not slices
-    # that can all bind the same parent at the same time.
+    # Different parent assignments: SWA parents 1..8, r2 parent 8, r1 parent 9,
+    # tails parent 10. Groups are mutually exclusive tenants, not slices that
+    # can all bind the same parent at the same time. Each group numbers its
+    # pages in its own domain, so a parent's first page is packing * parent;
+    # the tables start one page in, as they always have. Spelling the ids as
+    # literals silently pins them to one packing table.
+    packing = _config(device).component(DeepseekV41Config).row_layout().group_packing
+    used = {SWA: 4, R2: widths[R2], R1: widths[R1], TAIL: 100}
+    for gid, parent in ((R2, 8), (R1, 9), (TAIL, 10)):
+        first = packing[gid] * parent + 1
+        assert (
+            first + 2 * used[gid] <= packing[gid] * 16
+        ), f"{gid} needs {2 * used[gid]} pages from parent {parent}"
     for req in range(2):
         tables[SWA][req, :4] = torch.arange(1 + req * 4, 5 + req * 4, device=device)
-        tables[R2][req] = torch.arange(161 + req * 4, 165 + req * 4, device=device)
-        tables[R1][req] = torch.arange(541 + req * 8, 549 + req * 8, device=device)
-        tables[TAIL][req, :100] = torch.arange(
-            541 + req * 100, 641 + req * 100, device=device
-        )
+        for gid, parent in ((R2, 8), (R1, 9), (TAIL, 10)):
+            start = packing[gid] * parent + 1 + req * used[gid]
+            tables[gid][req, : used[gid]] = torch.arange(
+                start, start + used[gid], device=device
+            )
     return tables
 
 
@@ -823,7 +843,10 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool, verify_
     history = torch.randn(24, 512, device="cuda", dtype=torch.bfloat16)
     for layer in (2, 3, 20, 24, 25):
         dsv41.cache_scatter(
-            history, backend.cache_pool.swa(layer), meta.swa_write_slots, "swa"
+            history,
+            backend.cache_pool.swa(layer),
+            meta.swa_write_slots,
+            backend.swa_format,
         )
     backend.write_global(
         20,
@@ -1029,6 +1052,9 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
         context_len=512,
     )
     config = DeepseekV41Config.generate(args, model, False)
+    spec = config.component(DeepseekV41Config)
+    assert spec.cache_format in V41_CACHE_FORMATS
+    config = replace(config, components=(replace(spec, cache_format="v41"),))
     assert config.speculative_num_draft_tokens == verify_width
     assert config.max_bs == 2
     assert config.context_len == 512 + args.spec_context_pad
@@ -1236,13 +1262,41 @@ def test_pd_contract_plan_and_manifest():
     assert (prompt_len - 1) // 2 in range(tail_begin, (prompt_len + 1) // 2)
 
 
+@pytest.mark.parametrize("cache_format", ["v41", "v4"])
+@pytest.mark.parametrize("dspark", [False, True])
+def test_every_cache_format_packs_to_the_plane_it_declares(cache_format, dspark):
+    """Each format's frozen packing must be what the planner derives from it."""
+    rows = V41_CACHE_FORMATS[cache_format]
+    recipe = _recipe("cpu")
+    spec = recipe.attn_config.component(DeepseekV41Config)
+    recipe.attn_config = replace(
+        recipe.attn_config, components=(replace(spec, cache_format=cache_format),)
+    )
+    if dspark:
+        recipe.server_args.speculative_algorithm = "DSPARK"
+        recipe.draft_model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(dspark_num_stages=3)
+        )
+    expected_packing = rows.dspark_group_packing if dspark else rows.group_packing
+    expected_plane = rows.dspark_lcm_block_bytes if dspark else rows.lcm_block_bytes
+    layout = _layout(recipe)
+    recipe.check_layout(layout)
+    assert layout.lcm_block_bytes == expected_plane
+    assert layout.plane_bytes == (("flatkv", expected_plane),)
+    assert dict(layout.group_packing) == dict(expected_packing)
+    widths = {f.field_id.split(".")[-1]: f.shape[-1] for f in layout.fields}
+    assert widths["swa"] == rows.swa_row_bytes
+    assert widths["global_kv"] == rows.global_row_bytes
+    assert widths["index_k"] == rows.index_row_bytes
+
+
 def test_recipe_exact_geometry_capacity_and_dispatch():
     recipe = _recipe("cpu")
     layout = _layout(recipe)
     recipe.check_layout(layout)
     assert layout.lcm_block_bytes == 1_382_400
     assert layout.plane_bytes == (("flatkv", 1_382_400),)
-    assert dict(layout.group_packing) == V41_GROUP_PACKING
+    assert dict(layout.group_packing) == dict(V41_CACHE_FORMATS["v41"].group_packing)
     specs = {s.group_id: s for s, _ in recipe.groups()}
     assert [specs[g].block_granularity for g in V41_GROUP_GEOMETRY] == [64, 128, 64, 2]
     assert all(s.family == "history" for s in specs.values())
@@ -1623,8 +1677,11 @@ def test_gpu_quantized_joint_attention_and_reindex_reuse():
         swa_rope_cache=None,
     )
     record = backend.sparse_topk.prefill
-    dq_swa = dsv41.cache_unpack(dsv41.cache_pack(swa, "swa", None), "swa", None)
-    dq_main = dsv41.cache_unpack(dsv41.cache_pack(main, "global", None), "global", None)
+    swa_fmt, global_fmt = backend.swa_format, backend.global_format
+    dq_swa = dsv41.cache_unpack(dsv41.cache_pack(swa, swa_fmt, None), swa_fmt, None)
+    dq_main = dsv41.cache_unpack(
+        dsv41.cache_pack(main, global_fmt, None), global_fmt, None
+    )
     expected = []
     for i in range(n):
         p, r = int(meta.positions[i]), int(meta.request_indices[i])
@@ -1774,7 +1831,10 @@ def test_gpu_ratio2_prefill_to_decode_including_empty_compressor_step():
     backend.cache_pool.arena.buffer.zero_()
     parts = [run(0, 3, ForwardMode.EXTEND), run(3, 4, ForwardMode.EXTEND)]
     parts.extend(run(p, 1, ForwardMode.DECODE) for p in (7, 8, 9))
-    torch.testing.assert_close(torch.cat(parts), full, rtol=0, atol=0)
+    # Prefill and decode may run different attention kernels over the same
+    # dequantized rows, so their reductions agree only to one BF16 ulp of the
+    # row's largest entries, which near-zero entries see as an absolute error.
+    torch.testing.assert_close(torch.cat(parts), full, rtol=2**-7, atol=2**-8)
     torch.cuda.synchronize()
 
 

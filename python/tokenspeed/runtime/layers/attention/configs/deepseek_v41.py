@@ -21,6 +21,7 @@
 from dataclasses import dataclass
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.layers.attention.configs.base import (
     AttnConfig,
@@ -28,7 +29,10 @@ from tokenspeed.runtime.layers.attention.configs.base import (
     model_wide_kwargs,
     resolve_speculative_num_tokens,
 )
-from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import v41_layer_mapping
+from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
+    V41_CACHE_FORMATS,
+    v41_layer_mapping,
+)
 
 
 def is_deepseek_v41_config(hf_config) -> bool:
@@ -50,6 +54,7 @@ class DeepseekV41Config(SoftmaxAttnConfig):
     candidate_topk: int
     candidate_block_size: int
     max_query_tokens: int
+    cache_format: str
 
     @classmethod
     def generate(cls, server_args, model_config, is_draft: bool) -> AttnConfig:
@@ -113,6 +118,11 @@ class DeepseekV41Config(SoftmaxAttnConfig):
             max_query_tokens=max(
                 int(server_args.chunked_prefill_size), kwargs["max_bs"] * verify_width
             ),
+            # The cache rows are the checkpoint's own V4.1 encoding wherever a
+            # reader exists for them. Hopper's FlashMLA reads the V4 layout but
+            # not V4.1, and the portable kernels read either, so sm90 stores the
+            # wider V4 rows and trades token capacity for the native reader.
+            cache_format="v4" if current_platform().is_hopper else "v41",
         )
         return AttnConfig(
             components=(spec,),
@@ -120,5 +130,15 @@ class DeepseekV41Config(SoftmaxAttnConfig):
             **kwargs,
         )
 
+    def row_layout(self):
+        """Return the row widths and packing tables this cache format uses."""
+        layout = V41_CACHE_FORMATS.get(self.cache_format)
+        if layout is None:
+            raise ValueError(
+                f"unsupported V4.1 cache format: {self.cache_format!r}; "
+                f"expected one of {sorted(V41_CACHE_FORMATS)}"
+            )
+        return layout
+
     def cache_cell_size(self, config: AttnConfig) -> int:
-        return 528
+        return self.row_layout().swa_row_bytes

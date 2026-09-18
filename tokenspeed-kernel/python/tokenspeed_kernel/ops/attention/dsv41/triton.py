@@ -27,13 +27,43 @@ from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-# (decoded dimensions, quantization group, value bytes, total row bytes)
+# (decoded dimensions, quantization group, value bytes, total row bytes,
+#  quantized dimensions). QUANTIZED == D means the whole row is quantized. The
+# V4 rows quantize only their leading dims: the data row carries the trailing
+# RoPE dims as unquantized BF16 right after its values, and the scale row ends
+# in a pad byte. Those rows exist because sm90 FlashMLA reads V4 (584 B/token)
+# but neither V4.1 (528 B) nor V4.1 FP4 (288 B); the default V4.1 rows stay the
+# model's own format on every other target.
 _LAYOUTS = {
-    "swa": (512, 32, 512, 528),
-    "global": (512, 16, 256, 288),
-    "index": (128, 32, 64, 68),
+    "swa": (512, 32, 512, 528, 512),
+    "global": (512, 16, 256, 288, 512),
+    "index": (128, 32, 64, 68, 128),
+    "swa_v4": (512, 64, 448, 584, 448),
+    "global_v4": (512, 64, 448, 584, 448),
+    "index_v4": (128, 128, 128, 132, 128),
+}
+# The op signature carries paged fields, not a format name, so both solutions
+# read the encoding off the row width. Each role has one width per format.
+_PAGED_FORMATS = {
+    "swa": {528: "swa", 584: "swa_v4"},
+    "global": {288: "global", 584: "global_v4"},
+    "index": {68: "index", 132: "index_v4"},
 }
 _CAPABILITY = CapabilityRequirement(vendors=frozenset({"nvidia", "amd"}))
+
+
+def _paged_format(cache, role):
+    if cache is None or cache.ndim != 3:
+        raise ValueError(f"{role} cache must be uint8 [pages, rows, row_bytes]")
+    cache_format = _PAGED_FORMATS[role].get(cache.shape[2])
+    if cache_format is None:
+        raise ValueError(
+            f"{role} cache row must be one of "
+            f"{sorted(_PAGED_FORMATS[role])} bytes, got {cache.shape[2]}"
+        )
+    return cache_format
+
+
 _FLOAT_SIGNATURES = frozenset(
     format_signature(x=dense_tensor_format(dtype))
     for dtype in (torch.bfloat16, torch.float32)
@@ -98,16 +128,25 @@ def _pack_kernel(
     D: tl.constexpr,
     GROUP: tl.constexpr,
     VALUES: tl.constexpr,
+    QUANTIZED: tl.constexpr,
+    SCALE_BYTES: tl.constexpr,
     FORMAT: tl.constexpr,
     SCATTER: tl.constexpr,
 ):
     row = tl.program_id(0)
     slot = tl.load(Slots + row * SS).to(tl.int64) if SCATTER else row.to(tl.int64)
     if slot >= 0 and slot < CAPACITY:
+        # V4 rows keep their trailing RoPE dims unquantized, so the scale groups
+        # past QUANTIZED cover BF16 data. Their scale bytes are never read back;
+        # scaling the whole row keeps one reduction and one divide for both
+        # layouts, and the pad byte below overwrites the unused tail.
         d = tl.arange(0, D)
         x = tl.load(X + row * XS0 + d * XS1).to(tl.float32).reshape(D // GROUP, GROUP)
         amax = tl.max(tl.abs(x), axis=1)
-        if FORMAT == "global":
+        if FORMAT == "index_v4":
+            # One plain FP32 scale for the whole row; no exponent rounding.
+            scale = tl.maximum(amax, 1.0e-6) * (1.0 / 448.0)
+        elif FORMAT == "global":
             scale = (
                 tl.div_rn(tl.maximum(amax, 6 * 2.0**-9), 6.0)
                 .to(tl.float8e4nv)
@@ -115,10 +154,10 @@ def _pack_kernel(
             )
             scale_byte = scale.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
         else:
-            if FORMAT == "swa":
-                scaled_max = tl.maximum(amax, 1.0e-4) * (1.0 / 448.0)
-            else:
+            if FORMAT == "index":
                 scaled_max = tl.maximum(amax, 6 * 2.0**-126) * (1.0 / 6.0)
+            else:
+                scaled_max = tl.maximum(amax, 1.0e-4) * (1.0 / 448.0)
             # Match reference IEEE-754 ceil(log2), not an approximate log2.
             bits = scaled_max.to(tl.int32, bitcast=True)
             exponent = (
@@ -128,15 +167,16 @@ def _pack_kernel(
             scale_byte = (exponent + 127).to(tl.uint8)
         y = tl.div_rn(x, scale[:, None]).reshape(D)
         base = C + (slot // PAGE_ROWS) * CP
-        data_byte = (slot % PAGE_ROWS) * VALUES
-        scale_byte_offset = PAGE_ROWS * VALUES + (slot % PAGE_ROWS) * (D // GROUP)
-        ROW_BYTES: tl.constexpr = VALUES + D // GROUP
-        if FORMAT == "swa":
-            encoded = (
-                tl.clamp(y, -448.0, 448.0).to(tl.float8e4nv).to(tl.uint8, bitcast=True)
-            )
-            tl.store(base + _planar_offset(data_byte + d, CR, CB, ROW_BYTES), encoded)
-        else:
+        page_row = slot % PAGE_ROWS
+        # A page holds PAGE_ROWS data rows and then PAGE_ROWS scale rows. The
+        # unquantized RoPE bytes sit inside the data row, after its values.
+        ROPE: tl.constexpr = D - QUANTIZED
+        DATA_BYTES: tl.constexpr = VALUES + ROPE * 2
+        ROW_BYTES: tl.constexpr = DATA_BYTES + SCALE_BYTES
+        data_byte = page_row * DATA_BYTES
+        rope_byte = data_byte + VALUES
+        scale_byte_offset = PAGE_ROWS * DATA_BYTES + page_row * SCALE_BYTES
+        if FORMAT == "global" or FORMAT == "index":
             codes = _e2m1_encode(y).reshape(D // 2, 2)
             lo, hi = tl.split(codes)
             tl.store(
@@ -144,13 +184,51 @@ def _pack_kernel(
                 + _planar_offset(data_byte + tl.arange(0, D // 2), CR, CB, ROW_BYTES),
                 lo | (hi << 4),
             )
-        tl.store(
-            base
-            + _planar_offset(
-                scale_byte_offset + tl.arange(0, D // GROUP), CR, CB, ROW_BYTES
-            ),
-            scale_byte,
-        )
+        else:
+            # QUANTIZED is not a power of two, so the store spans the whole row
+            # and masks the RoPE tail off rather than shortening the range.
+            encoded = (
+                tl.clamp(y, -448.0, 448.0).to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+            )
+            tl.store(
+                base + _planar_offset(data_byte + d, CR, CB, ROW_BYTES),
+                encoded,
+                mask=d < QUANTIZED,
+            )
+            if ROPE > 0:
+                # RoPE dims travel as raw BF16 halves, little-endian in the row.
+                r = tl.arange(0, ROPE)
+                word = (
+                    tl.load(X + row * XS0 + (QUANTIZED + r) * XS1)
+                    .to(tl.bfloat16)
+                    .to(tl.uint16, bitcast=True)
+                )
+                tl.store(
+                    base + _planar_offset(rope_byte + r * 2, CR, CB, ROW_BYTES),
+                    (word & 0xFF).to(tl.uint8),
+                )
+                tl.store(
+                    base + _planar_offset(rope_byte + r * 2 + 1, CR, CB, ROW_BYTES),
+                    (word >> 8).to(tl.uint8),
+                )
+        if FORMAT == "index_v4":
+            # GROUP == D, so the reduction left one scale; spill its four
+            # little-endian FP32 bytes.
+            word = tl.sum(scale.to(tl.int32, bitcast=True))
+            b = tl.arange(0, 4)
+            tl.store(
+                base + _planar_offset(scale_byte_offset + b, CR, CB, ROW_BYTES),
+                ((word >> (b * 8)) & 0xFF).to(tl.uint8),
+            )
+        else:
+            # D // GROUP equals SCALE_BYTES for these layouts, so the scale
+            # vector lands one-to-one; V4's trailing group covers RoPE and
+            # stores as pad.
+            s = tl.arange(0, SCALE_BYTES)
+            tl.store(
+                base + _planar_offset(scale_byte_offset + s, CR, CB, ROW_BYTES),
+                tl.where(s < QUANTIZED // GROUP, scale_byte, 0),
+            )
 
 
 @triton.jit
@@ -168,6 +246,8 @@ def _gather_kernel(
     D: tl.constexpr,
     GROUP: tl.constexpr,
     VALUES: tl.constexpr,
+    QUANTIZED: tl.constexpr,
+    SCALE_BYTES: tl.constexpr,
     FORMAT: tl.constexpr,
     GATHER: tl.constexpr,
 ):
@@ -177,35 +257,103 @@ def _gather_kernel(
     slot = tl.where(valid, slot, 0)
     d = tl.arange(0, D)
     base = C + (slot // PAGE_ROWS) * CP
-    data_byte = (slot % PAGE_ROWS) * VALUES + tl.where(VALUES == D, d, d // 2)
-    scale_byte_offset = (
-        PAGE_ROWS * VALUES + (slot % PAGE_ROWS) * (D // GROUP) + d // GROUP
-    )
-    ROW_BYTES: tl.constexpr = VALUES + D // GROUP
-    byte = tl.load(base + _planar_offset(data_byte, CR, CB, ROW_BYTES), valid, other=0)
-    if FORMAT == "swa":
-        value = byte.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    page_row = slot % PAGE_ROWS
+    ROPE: tl.constexpr = D - QUANTIZED
+    DATA_BYTES: tl.constexpr = VALUES + ROPE * 2
+    ROW_BYTES: tl.constexpr = DATA_BYTES + SCALE_BYTES
+    data_byte = page_row * DATA_BYTES + tl.where(VALUES == D, d, d // 2)
+    scale_byte_offset = PAGE_ROWS * DATA_BYTES + page_row * SCALE_BYTES + d // GROUP
+    if FORMAT == "global" or FORMAT == "index":
+        byte = tl.load(
+            base + _planar_offset(data_byte, CR, CB, ROW_BYTES), valid, other=0
+        )
+        scale_byte = tl.load(
+            base + _planar_offset(scale_byte_offset, CR, CB, ROW_BYTES), valid, other=0
+        )
+        if FORMAT == "global":
+            scale = scale_byte.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        else:
+            # E8M0 byte 0 represents 2**-127 (a float32 subnormal).
+            scale = tl.where(
+                scale_byte == 0,
+                2.0**-127,
+                (scale_byte.to(tl.int32) << 23).to(tl.float32, bitcast=True),
+            )
+        value = _e2m1_decode((byte >> ((d % 2) * 4)) & 15) * scale
+    elif FORMAT == "index_v4":
+        byte = tl.load(
+            base + _planar_offset(page_row * DATA_BYTES + d, CR, CB, ROW_BYTES),
+            valid,
+            other=0,
+        )
+        # Reassemble the row's single little-endian FP32 scale.
+        b = tl.arange(0, 4)
+        raw = tl.load(
+            base
+            + _planar_offset(
+                PAGE_ROWS * DATA_BYTES + page_row * SCALE_BYTES + b,
+                CR,
+                CB,
+                ROW_BYTES,
+            ),
+            valid,
+            other=0,
+        ).to(tl.int32)
+        scale = tl.sum(raw << (b * 8)).to(tl.float32, bitcast=True)
+        value = byte.to(tl.float8e4nv, bitcast=True).to(tl.float32) * scale
     else:
-        value = _e2m1_decode((byte >> ((d % 2) * 4)) & 15)
-    scale_byte = tl.load(
-        base + _planar_offset(scale_byte_offset, CR, CB, ROW_BYTES), valid, other=0
-    )
-    if FORMAT == "global":
-        scale = scale_byte.to(tl.float8e4nv, bitcast=True).to(tl.float32)
-    else:
-        # E8M0 byte 0 represents 2**-127 (a float32 subnormal).
+        quantized = valid & (d < QUANTIZED)
+        byte = tl.load(
+            base + _planar_offset(page_row * DATA_BYTES + d, CR, CB, ROW_BYTES),
+            quantized,
+            other=0,
+        )
+        scale_byte = tl.load(
+            base + _planar_offset(scale_byte_offset, CR, CB, ROW_BYTES),
+            quantized,
+            other=0,
+        )
         scale = tl.where(
             scale_byte == 0,
             2.0**-127,
             (scale_byte.to(tl.int32) << 23).to(tl.float32, bitcast=True),
         )
-    tl.store(O + row * OS0 + d * OS1, tl.where(valid, value * scale, 0.0))
+        value = byte.to(tl.float8e4nv, bitcast=True).to(tl.float32) * scale
+        if ROPE > 0:
+            # Halves were stored little-endian; rebuild the BF16 word in place.
+            rope = valid & (d >= QUANTIZED)
+            rope_byte = (
+                page_row * DATA_BYTES + VALUES + tl.maximum(d - QUANTIZED, 0) * 2
+            )
+            lo = tl.load(
+                base + _planar_offset(rope_byte, CR, CB, ROW_BYTES),
+                rope,
+                other=0,
+            )
+            hi = tl.load(
+                base + _planar_offset(rope_byte + 1, CR, CB, ROW_BYTES),
+                rope,
+                other=0,
+            )
+            word = (hi.to(tl.uint16) << 8) | lo.to(tl.uint16)
+            value = tl.where(
+                d < QUANTIZED,
+                value,
+                word.to(tl.bfloat16, bitcast=True).to(tl.float32),
+            )
+    tl.store(O + row * OS0 + d * OS1, tl.where(valid, value, 0.0))
 
 
 def _layout(cache_format):
     if cache_format not in _LAYOUTS:
-        raise ValueError("cache_format must be 'swa', 'global', or 'index'")
+        raise ValueError(f"cache_format must be one of {sorted(_LAYOUTS)}")
     return _LAYOUTS[cache_format]
+
+
+def _scale_bytes(cache_format):
+    """Bytes the row reserves for scales, including V4's trailing pad byte."""
+    dim, _, values, row_bytes, quantized = _layout(cache_format)
+    return row_bytes - values - (dim - quantized) * 2
 
 
 def _same_device(x, tensors):
@@ -245,7 +393,7 @@ def _output(out, shape, dtype, device):
 
 
 def _pack(rows, cache, slots, cache_format):
-    dim, group, values, _ = _layout(cache_format)
+    dim, group, values, _, quantized = _layout(cache_format)
     if (
         rows.ndim != 2
         or rows.shape[1] != dim
@@ -268,6 +416,8 @@ def _pack(rows, cache, slots, cache_format):
             D=dim,
             GROUP=group,
             VALUES=values,
+            QUANTIZED=quantized,
+            SCALE_BYTES=_scale_bytes(cache_format),
             FORMAT=cache_format,
             SCATTER=slots is not None,
             num_warps=4,
@@ -276,7 +426,7 @@ def _pack(rows, cache, slots, cache_format):
 
 
 def _gather(cache, slots, cache_format, out):
-    dim, group, values, _ = _layout(cache_format)
+    dim, group, values, _, quantized = _layout(cache_format)
     _same_device(cache, (slots, out))
     shape = (*slots.shape, dim) if slots is not None else (cache.shape[0], dim)
     dtype = torch.bfloat16 if out is None else out.dtype
@@ -300,6 +450,8 @@ def _gather(cache, slots, cache_format, out):
             D=dim,
             GROUP=group,
             VALUES=values,
+            QUANTIZED=quantized,
+            SCALE_BYTES=_scale_bytes(cache_format),
             FORMAT=cache_format,
             GATHER=slots is not None,
             num_warps=4,
@@ -445,12 +597,14 @@ def compressor_tail_scatter(content, scores, tail, slots):
     signatures=_QUERY_SIGNATURES,
     priority=Priority.PORTABLE,
 )
-def index_q_quantize(q, out):
+def index_q_quantize(q, cache_format, out):
     if q.ndim != 3 or q.shape[-1] != 128 or q.dtype != torch.bfloat16:
         raise ValueError("index q must be BF16 [tokens, heads, 128]")
     out = _output(out, q.shape, q.dtype, q.device)
-    packed = cache_pack(q.reshape(-1, 128), "index", None)
-    cache_unpack(packed, "index", out.view(-1, 128))
+    # Queries are quantized exactly like the keys they will meet, so the
+    # simulation matches whichever index rows this target stores.
+    packed = cache_pack(q.reshape(-1, 128), cache_format, None)
+    cache_unpack(packed, cache_format, out.view(-1, 128))
     return out
 
 
@@ -580,7 +734,7 @@ def selected_attention(
 
 def _score(q, weights, cache, slots, process_group):
     q, weights, shards = _index_gather_heads(q, weights, process_group)
-    keys = cache_gather(cache, slots, "index", None)
+    keys = cache_gather(cache, slots, _paged_format(cache, "index"), None)
     # Reference einsum materializes BF16 dots; weighting and each shard's head
     # sum round to weights' dtype, as in the fused scan below.
     dots = torch.bmm(q, keys.transpose(1, 2))
@@ -600,7 +754,7 @@ def _index_inputs(q, weights, cache):
         torch.float32,
     ):
         raise ValueError("weights must be BF16/FP32 [tokens, heads], already scaled")
-    _cache(cache, "index")
+    _cache(cache, _paged_format(cache, "index"))
     _same_device(q, (weights, cache))
 
 
@@ -622,7 +776,7 @@ def index_score(index_q, weights, index_cache, physical_slots, process_group, ou
     out = _output(out, physical_slots.shape, weights.dtype, index_q.device)
     out.copy_(
         _score(
-            index_q_quantize(index_q, None),
+            index_q_quantize(index_q, _paged_format(index_cache, "index"), None),
             weights,
             index_cache,
             physical_slots,
@@ -700,6 +854,7 @@ def _index_scan_kernel(
     ROW_K: tl.constexpr,
     BLOCK_K: tl.constexpr,
     MAKE_BLOCKS: tl.constexpr,
+    INDEX_FP8: tl.constexpr,
 ):
     query, part = tl.program_id(0), tl.program_id(1)
     visible = tl.minimum(tl.maximum(tl.load(Visible + query * VS), 0), TABLE_WIDTH * 64)
@@ -742,26 +897,53 @@ def _index_scan_kernel(
         )
         valid = valid & (page >= 0) & (page < PAGES)
         base = Cache + page * CP
-        data_byte = (logical[None, :] % 64) * 64 + d[:, None] // 2
-        byte = tl.load(
-            base[None, :] + _planar_offset(data_byte, CR, CB, 68),
-            valid[None, :],
-            other=0,
-        )
-        value = _e2m1_decode((byte >> ((d[:, None] % 2) * 4)) & 15)
-        scale_byte = tl.load(
-            base[None, :]
-            + _planar_offset(
-                64 * 64 + (logical[None, :] % 64) * 4 + d[:, None] // 32, CR, CB, 68
-            ),
-            valid[None, :],
-            other=0,
-        )
-        scale = tl.where(
-            scale_byte == 0,
-            2.0**-127,
-            (scale_byte.to(tl.int32) << 23).to(tl.float32, bitcast=True),
-        )
+        row = logical % 64
+        if INDEX_FP8:
+            # 128 E4M3 bytes per data row, then one little-endian FP32 scale
+            # per row -- DeepGEMM's index-K layout, read here byte by byte so
+            # the portable path sees exactly what its kernels do.
+            ROW_BYTES: tl.constexpr = 132
+            byte = tl.load(
+                base[None, :]
+                + _planar_offset(row[None, :] * 128 + d[:, None], CR, CB, ROW_BYTES),
+                valid[None, :],
+                other=0,
+            )
+            value = byte.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+            scale_base = 64 * 128 + row * 4
+            word = tl.full(row.shape, 0, tl.int32)
+            for shift in tl.static_range(4):
+                part_byte = tl.load(
+                    base + _planar_offset(scale_base + shift, CR, CB, ROW_BYTES),
+                    valid,
+                    other=0,
+                ).to(tl.int32)
+                word = word | (part_byte << (shift * 8))
+            scale = word.to(tl.float32, bitcast=True)[None, :]
+        else:
+            ROW_BYTES: tl.constexpr = 68
+            byte = tl.load(
+                base[None, :]
+                + _planar_offset(
+                    row[None, :] * 64 + d[:, None] // 2, CR, CB, ROW_BYTES
+                ),
+                valid[None, :],
+                other=0,
+            )
+            value = _e2m1_decode((byte >> ((d[:, None] % 2) * 4)) & 15)
+            scale_byte = tl.load(
+                base[None, :]
+                + _planar_offset(
+                    64 * 64 + row[None, :] * 4 + d[:, None] // 32, CR, CB, ROW_BYTES
+                ),
+                valid[None, :],
+                other=0,
+            )
+            scale = tl.where(
+                scale_byte == 0,
+                2.0**-127,
+                (scale_byte.to(tl.int32) << 23).to(tl.float32, bitcast=True),
+            )
         key = (value * scale).to(tl.bfloat16)
         dots = tl.dot(q, key).to(tl.bfloat16).to(tl.float32)
         products = (
@@ -960,6 +1142,7 @@ def index_topk(
         return out
     # ponytail: exact bitonic TopK is deliberately portable. At long *visible*
     # histories a radix selector can replace it without changing this API.
+    index_format = _paged_format(index_cache, "index")
     parts = 16
     tile = max(16, min(256, 1 << (score_chunk_size.bit_length() - 1)))
     row_k = max(tile, triton.next_power_of_2(topk))
@@ -970,7 +1153,7 @@ def index_topk(
         q, w, shards = _index_gather_heads(
             index_q[start:end], weights[start:end], process_group
         )
-        q = index_q_quantize(q, None)
+        q = index_q_quantize(q, index_format, None)
         table, visible = page_table[start:end], visible_lens[start:end]
         candidates = None if candidate_blocks is None else candidate_blocks[start:end]
         shape = (end - start, parts * row_k)
@@ -1009,6 +1192,7 @@ def index_topk(
             row_k,
             block_k,
             bool(candidate_topk),
+            index_format == "index_v4",
             enable_fp_fusion=False,
         )
         _index_finish_parts(
@@ -1195,6 +1379,9 @@ def _swa_rope_insert(
     P: tl.constexpr,
     NP: tl.constexpr,
     MAX_POS: tl.constexpr,
+    GROUP: tl.constexpr,
+    VALUES: tl.constexpr,
+    SCALE_BYTES: tl.constexpr,
     HAS_OUT: tl.constexpr,
 ):
     token = tl.program_id(0).to(tl.int64)
@@ -1221,9 +1408,16 @@ def _swa_rope_insert(
         ),
         normalized.to(tl.bfloat16),
     )
-    values = tl.reshape(rotated.to(tl.float32), (16, 32))
+    # The V4 row stores only the 448 NoPE dims as E4M3; its RoPE tail -- exactly
+    # the dims rotated above -- travels as raw BF16 in a plane of its own. The
+    # reduction still covers all 512 so one divide serves both layouts; the
+    # trailing group's scale is overwritten as pad and never read back.
+    GROUPS: tl.constexpr = 512 // GROUP
+    ROPE_BYTES: tl.constexpr = (512 - VALUES) * 2
+    DATA_BYTES: tl.constexpr = VALUES + ROPE_BYTES
+    values = tl.reshape(rotated.to(tl.float32), (GROUPS, GROUP))
     amax = tl.maximum(tl.max(tl.abs(values), 1), 1.0e-4)
-    # Use the same group32 IEEE exponent rule as the portable cache codec.
+    # Use the same IEEE exponent rule as the portable cache codec.
     raw_scale = amax * (1.0 / 448.0)
     bits = raw_scale.to(tl.int32, bitcast=True)
     exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
@@ -1231,17 +1425,27 @@ def _swa_rope_insert(
     quantized = tl.reshape(tl.div_rn(values, scale[:, None]), (512,)).to(tl.float8e4nv)
     if HAS_OUT:
         restored = quantized.to(tl.float32) * tl.reshape(
-            tl.broadcast_to(scale[:, None], (16, 32)), (512,)
+            tl.broadcast_to(scale[:, None], (GROUPS, GROUP)), (512,)
         )
+        if ROPE_BYTES > 0:
+            restored = tl.where(d < VALUES, restored, rotated.to(tl.float32))
         tl.store(OUT + token * O0 + d * O1, restored.to(tl.bfloat16))
     page = tl.maximum(slot, 0) // P
     row = tl.maximum(slot, 0) % P
     tl.store(
-        CACHE + page * C0 + row * 512 + d, quantized.to(tl.uint8, bitcast=True), live
+        CACHE + page * C0 + row * DATA_BYTES + d,
+        quantized.to(tl.uint8, bitcast=True),
+        live & (d < VALUES),
     )
+    if ROPE_BYTES > 0:
+        word = rotated.to(tl.bfloat16).to(tl.uint16, bitcast=True)
+        rope_byte = CACHE + page * C0 + row * DATA_BYTES + VALUES + (d - VALUES) * 2
+        tl.store(rope_byte, (word & 0xFF).to(tl.uint8), live & (d >= VALUES))
+        tl.store(rope_byte + 1, (word >> 8).to(tl.uint8), live & (d >= VALUES))
+    s = tl.arange(0, SCALE_BYTES)
     tl.store(
-        CACHE + page * C0 + P * 512 + row * 16 + tl.arange(0, 16),
-        exponent.to(tl.uint8),
+        CACHE + page * C0 + P * DATA_BYTES + row * SCALE_BYTES + s,
+        tl.where(s < VALUES // GROUP, exponent, 0).to(tl.uint8),
         live,
     )
 
@@ -1256,8 +1460,13 @@ def _swa_rope_insert(
     traits={},
     priority=Priority.PORTABLE,
 )
-def triton_dsv41_swa_rope_scatter(values, positions, cos_sin_cache, cache, slots, out):
-    _cache(cache, "swa")
+def triton_dsv41_swa_rope_scatter(
+    values, positions, cos_sin_cache, cache, slots, cache_format, out
+):
+    if cache_format not in _PAGED_FORMATS["swa"].values():
+        raise ValueError(f"{cache_format!r} is not a SWA row format")
+    dim, group, value_bytes, row_bytes, quantized = _layout(cache_format)
+    _cache(cache, cache_format)
     _same_device(values, (positions, cos_sin_cache, cache, slots, out))
     if values.dtype != torch.bfloat16 or values.ndim != 2 or values.shape[1] != 512:
         raise ValueError("SWA values must be BF16 [tokens,512]")
@@ -1270,12 +1479,14 @@ def triton_dsv41_swa_rope_scatter(values, positions, cos_sin_cache, cache, slots
         or cos_sin_cache.stride(1) != 1
     ):
         raise ValueError("SWA RoPE table must be FP32 [positions,64]")
-    if cache.stride(1) != 528 or cache.stride(2) != 1:
+    if cache.stride(1) != row_bytes or cache.stride(2) != 1:
         raise ValueError("Fused SWA requires contiguous page bytes")
     if out is not None:
         _output(out, values.shape, torch.bfloat16, values.device)
     page_size = 64
-    cache = cache.as_strided((cache.shape[0], page_size * 528), (cache.stride(0), 1))
+    cache = cache.as_strided(
+        (cache.shape[0], page_size * row_bytes), (cache.stride(0), 1)
+    )
     if values.shape[0] == 0:
         return
     _swa_rope_insert[(values.shape[0],)](
@@ -1296,6 +1507,9 @@ def triton_dsv41_swa_rope_scatter(values, positions, cos_sin_cache, cache, slots
         page_size,
         cache.shape[0],
         cos_sin_cache.shape[0],
+        group,
+        value_bytes,
+        _scale_bytes(cache_format),
         out is not None,
         num_warps=4,
         enable_fp_fusion=False,

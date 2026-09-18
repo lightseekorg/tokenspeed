@@ -26,7 +26,11 @@ solutions.
 Standalone packed rows place value bytes before scales (even FP4 element in
 low nibble). Formats: global = 512D E2M1/E4M3 groups of16, 288 bytes;
 index = 128D E2M1/E8M0 groups of32, 68 bytes; SWA = 512D E4M3/E8M0
- groups of32, 528 bytes. The entire post-RoPE vector is quantized.
+ groups of32, 528 bytes -- the entire post-RoPE vector is quantized. The
+swa_v4/global_v4 rows are the same 512D content in FlashMLA's V4 layout: a
+576-byte data row of 448 E4M3 NoPE bytes then the 64 RoPE dims left as BF16,
+and an 8-byte scale row of E8M0 per64 with a pad byte. They exist for targets
+whose FlashMLA reads V4 only.
 
 Paged fields use page-planar storage: all64 value rows, then all64 scale rows.
 Their uint8 [pages,64,row_bytes] shape describes storage, not decoded row axes.
@@ -143,18 +147,20 @@ def swa_rope_scatter(
     cos_sin_cache: torch.Tensor,
     cache: torch.Tensor,
     slots: torch.Tensor,
+    cache_format: str,
     out: torch.Tensor | None,
 ) -> torch.Tensor | None:
     """Rotate normalized BF16 SWA rows and quantize directly into planar pages.
 
     values is [T,512], positions and physical slots are integer [T], and the
-    FP32 RoPE table is [max_position,64]. cache is the LCM uint8 [pages,64,528]
-    field with contiguous page bytes. Invalid/null slots skip writes. If out
-    is supplied, write all quantized/dequantized BF16 [T,512] rows there, including
-    rows outside persistent retention. Read old prefixes before this operation.
+    FP32 RoPE table is [max_position,64]. cache is the LCM uint8 [pages,64,R]
+    field with contiguous page bytes, where R is the row width ``cache_format``
+    declares. Invalid/null slots skip writes. If out is supplied, write all
+    quantized/dequantized BF16 [T,512] rows there, including rows outside
+    persistent retention. Read old prefixes before this operation.
     """
     _kernel("swa_rope_scatter", values)(
-        values, positions, cos_sin_cache, cache, slots, out
+        values, positions, cos_sin_cache, cache, slots, cache_format, out
     )
     return out
 
@@ -205,15 +211,19 @@ def compressor_tail_scatter(
     return _kernel("compressor_tail_scatter", content)(content, scores, tail, slots)
 
 
-def index_q_quantize(q: torch.Tensor, out: torch.Tensor | None) -> torch.Tensor:
-    """FP4/E8M0-32 quantize/dequantize BF16 index ``q[T, H, 128]``.
+def index_q_quantize(
+    q: torch.Tensor, cache_format: str, out: torch.Tensor | None
+) -> torch.Tensor:
+    """Quantize/dequantize BF16 index ``q[T, H, 128]`` as ``cache_format`` does.
 
+    ``cache_format`` is 'index' (FP4 with E8M0-32 scales) or 'index_v4' (E4M3
+    with one FP32 scale), matching the keys the queries will be scored against.
     ``out`` is a contiguous BF16 destination shaped like q, or None to allocate.
     Returns the dequantized destination, matching the reference's inplace
     simulation. No RoPE, RMSNorm or Hadamard is applied. Main attention queries
     must NOT pass through this helper.
     """
-    return _kernel("index_q_quantize", q)(q, out)
+    return _kernel("index_q_quantize", q)(q, cache_format, out)
 
 
 def new_attention_schedule() -> object | None:
@@ -253,11 +263,11 @@ def selected_attention(
 
     Args:
         q: Post-RoPE BF16 [T, H, 512]; used unchanged, without an added Q norm.
-        swa_cache: This layer's strided uint8 [pages, 64, 528] SWA field.
+        swa_cache: This layer's strided uint8 [pages, 64, R] SWA field.
         swa_slots: Int32/int64 [T, W_swa] physical slots, normally W_swa=128.
         swa_lens: Int32/int64 [T] active prefix lengths; negative slots within
             each prefix are also ignored. Caller supplies causal selections.
-        global_cache: Owner's uint8 [pages, 64, 288] field, or None for SWA-only.
+        global_cache: Owner's uint8 [pages, 64, R] field, or None for SWA-only.
         global_slots: Int32/int64 [T, W_global], normally W_global=512; None
             iff global_cache is None. This is a separate physical address domain.
         global_lens: Int32/int64 [T] active prefix lengths, or None with no global.
@@ -417,23 +427,33 @@ def index_topk(
     once before the score tiles; no payload survives the call.
     """
     from tokenspeed_kernel.ops.attention.dsv41.deep_gemm import (
+        is_hopper_indexer_available,
         is_native_indexer_available,
     )
     from tokenspeed_kernel.thirdparty.deep_select import is_deep_select_available
 
-    native = (
+    # Each target scores the index rows its own cache format stores: FP4 with
+    # DeepSelect on Blackwell, FP8 with FlashInfer's selection on Hopper.
+    row_bytes = index_cache.shape[2] if index_cache.ndim == 3 else 0
+    shaped = (
         index_q.is_cuda
         and process_group is None
         and index_q.shape[1] == 32
         and index_cache.ndim == 3
-        and index_cache.shape[1:] == (64, 68)
-        and index_cache.stride(1) == 68
+        and index_cache.shape[1] == 64
+        and index_cache.stride(1) == row_bytes
         and index_cache.stride(2) == 1
         and index_cache.stride(0) < 2**31
         and index_cache.stride(0) % 16 == 0
         and index_cache.data_ptr() % 16 == 0
-        and is_native_indexer_available()
-        and is_deep_select_available()
+    )
+    native = shaped and (
+        (
+            row_bytes == 68
+            and is_native_indexer_available()
+            and is_deep_select_available()
+        )
+        or (row_bytes == 132 and is_hopper_indexer_available())
     )
     kernel = select_kernel(
         "attention",

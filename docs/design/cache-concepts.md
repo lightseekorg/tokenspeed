@@ -707,6 +707,19 @@ would otherwise need cross-checking cannot differ:
 If you find yourself writing a check that two derived views agree, the
 design is wrong: make one of them the source.
 
+**Recipes do not inspect the hardware.** A row encoding can be a property of
+the target — DeepSeek V4.1's packed rows are read natively by FlashMLA above
+sm100, while sm90 reads only the wider V4 layout — but the recipe never asks
+which machine it is on. The choice is made once where the model's attention
+config is generated (`configs/deepseek_v41.py`), recorded on the spec, and
+read back by everyone who needs it: the recipe sizes fields and looks up the
+packing from it, the backend names its kernel cache formats from it. Row
+width forces the packing and the plane, so each format owns its own frozen
+`group_packing` / `lcm_block_bytes` tables (`deepseek_v41_geometry.py`); the
+geometry module is a table keyed by format name and knows nothing about
+architectures. Adding a platform probe below the config layer would give one
+parent two possible sizes with no single place that decided which.
+
 ### Storage vs. visibility
 
 An attention layer has two contracts that a single `layer_types` string used
