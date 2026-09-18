@@ -150,6 +150,7 @@ class PrefillCaptureArgsTest(unittest.TestCase):
             disable_cuda_graph_padding=False,
             max_cudagraph_capture_size=4,
             model_is_mrope=False,
+            prefill_only=False,
         )
         with self.assertRaisesRegex(TypeError, "prefill_graph_capture_batch_sizes"):
             ModelExecutorConfig(**config_args)

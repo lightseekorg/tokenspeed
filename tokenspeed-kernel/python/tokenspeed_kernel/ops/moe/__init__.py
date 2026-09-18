@@ -745,7 +745,7 @@ def moe_process_weights(plan: dict, w: torch.nn.Module):
 
         hidden_size, num_experts = deepep_geometry
         prepare_deepep_buffer(
-            group=plan["deepep_group"],
+            group=plan["process_group"],
             hidden_size=hidden_size,
             num_experts=num_experts,
             deepep_mode=plan["deepep_mode"],

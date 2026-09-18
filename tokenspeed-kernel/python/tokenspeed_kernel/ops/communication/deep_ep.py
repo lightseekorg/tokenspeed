@@ -329,7 +329,7 @@ def prepare_deepep_buffer(
         None. Dispatchers later acquire the same persistent buffer.
     """
     if group is None:
-        raise ValueError("DeepEP MoE plan is missing deepep_group")
+        raise ValueError("DeepEP MoE plan is missing its process_group")
     if hidden_size <= 0 or num_experts <= 0:
         raise ValueError("DeepEP hidden size and expert count must be positive")
     mode = DeepEPMode(deepep_mode)

@@ -72,7 +72,7 @@ def test_common_weight_processing_prepares_every_deepep_solution(
         a2a_backend="deepep",
         solution=solution,
         weight_preprocessor=preprocess,
-        deepep_group=group,
+        process_group=group,
         deepep_mode=mode,
         deepep_low_latency_max_num_tokens_per_gpu=capacity,
     )
@@ -108,7 +108,7 @@ def test_deepep_prepares_even_without_a_weight_preprocessor(monkeypatch):
     plan = dict(
         a2a_backend="deepep",
         weight_preprocessor=None,
-        deepep_group=group,
+        process_group=group,
         deepep_mode="auto",
         deepep_low_latency_max_num_tokens_per_gpu=32,
     )
@@ -278,7 +278,7 @@ def test_prepare_rejects_invalid_low_latency_capacity(monkeypatch, mode, capacit
 @pytest.mark.parametrize(
     "override,message",
     [
-        ({"group": None}, "missing deepep_group"),
+        ({"group": None}, "missing its process_group"),
         ({"hidden_size": 0}, "must be positive"),
         ({"num_experts": 0}, "must be positive"),
     ],
