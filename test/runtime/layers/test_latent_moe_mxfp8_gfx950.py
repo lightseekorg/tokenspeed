@@ -22,21 +22,14 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from unittest import mock
 
 import pytest
 import torch
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
-# Reuse kernel test helpers when collecting this runtime test on its own.
-sys.path.insert(
-    0, str(Path(__file__).resolve().parents[3] / "tokenspeed-kernel" / "test")
-)
-from utils import is_cdna4  # noqa: E402
-
-if not is_cdna4():
+if not current_platform().is_cdna4:
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
 
