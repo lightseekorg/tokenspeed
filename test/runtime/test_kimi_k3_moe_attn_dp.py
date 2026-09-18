@@ -164,7 +164,7 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
     assert layer.shared_experts.gate_up_proj.weight.shape == (64, 64)
     assert layer.shared_experts.down_proj.weight.shape == (64, 32)
     assert layer.shared_experts.down_proj.tp_size == 1
-    assert layer.shared_experts.down_proj.tp_group == (1,)
+    assert layer.shared_experts.down_proj.tp_group is None
     assert layer.experts.kwargs["routing_mode"] == "precomputed_topk"
     assert not hasattr(layer, "comm")
     assert not hasattr(layer, "native_latent_moe")
