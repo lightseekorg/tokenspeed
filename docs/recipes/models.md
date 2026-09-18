@@ -707,6 +707,13 @@ with optional predictive latent embeddings (PLE), optional QSA sparse
 attention, and a one-layer MTP draft. Dense and MoE checkpoints share the same
 launch command.
 
+QSA selects CuTe DSL sparse attention on B200 (SM100) and B300 (SM103) for
+BF16 queries with BF16 or FP8 E4M3 KV caches, 256-dimensional heads, 6/12/24
+query heads, 1/2/4 KV heads, and a selected-slot width of 2051. This applies to
+ordinary decode and MTP verification under CUDA Graph. Prefill and mixed queries,
+including one-token prefill, and other supported NVIDIA shapes and architectures
+use the FlashInfer FA2 fallback.
+
 The decoder passes ordinary sublayer-output tensors and residual tuples between
 layers. At adjacent HC boundaries, it explicitly calls the consuming mixer's
 `combine_norm()` to fuse residual injection with that mixer's grouped RMSNorm.
@@ -866,7 +873,7 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
   --max-cudagraph-capture-size 4 \
   --cudagraph-capture-sizes 1 2 3 4 \
   --prefill-graph-max-tokens 256 \
-  --prefill-graph-capture-sizes 128 256 \
+  --prefill-graph-capture-token-sizes 128 256 \
   --host 127.0.0.1 \
   --port 8000
 ```

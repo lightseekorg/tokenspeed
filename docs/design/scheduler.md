@@ -16,7 +16,13 @@ A prompt is prefilled in chunks bounded by `max_scheduled_tokens`
 scheduled, never for the whole prompt**: `schedulePrefill` /
 `schedulePrefillFirstChunk` build one `GroupDemand` per cache group sized by
 this chunk's tokens, and the coordinator either grants the pages or the
-request stays put.
+request stays put. Alongside the demands, one `RequestProgress` per request
+carries what it computed since its previous admission — the prefix pages
+just completed and its computed-token count — which the coordinator publishes
+and reclaims inside the same `Admit` (`advanceRequestProgress` in
+`scheduler/operations/forward.cpp` is the one place that hashes those pages
+and builds it; see [cache-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)
+for why publication rides with admission).
 
 Two adjustments ride on top of the raw chunk size. Both are pure token
 arithmetic kept out of the planner: how a chunk is cut lives in

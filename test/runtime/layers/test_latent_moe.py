@@ -13,6 +13,7 @@ from tokenspeed.runtime.layers.moe.latent import (
     LatentMoELayer,
 )
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
+from tokenspeed.runtime.layers.moe.utils import MoeBackend
 
 
 def _up(x: torch.Tensor) -> tuple[torch.Tensor, None]:
@@ -295,10 +296,7 @@ def test_kimi3_moe_execution_policy_is_selected_outside_model() -> None:
             tp_ep_group=ep_group,
         )
     )
-    backend = SimpleNamespace(
-        is_auto=lambda: True,
-        is_flashinfer_trtllm=lambda: False,
-    )
+    backend = MoeBackend.AUTO
 
     with mock.patch.object(
         latent_module,
@@ -326,11 +324,7 @@ def test_kimi3_moe_execution_policy_preserves_nvidia_trtllm() -> None:
             tp_ep_group=object(),
         )
     )
-    backend = SimpleNamespace(
-        is_auto=lambda: True,
-        is_flashinfer_trtllm=lambda: False,
-        is_marlin=lambda: False,
-    )
+    backend = MoeBackend.AUTO
 
     with (
         mock.patch.object(
@@ -371,21 +365,13 @@ def _plan_mapping():
     )
 
 
-def _backend(*, auto=False, trtllm=False, marlin=False):
-    return SimpleNamespace(
-        is_auto=lambda: auto,
-        is_flashinfer_trtllm=lambda: trtllm,
-        is_marlin=lambda: marlin,
-    )
-
-
 def test_kimi3_moe_execution_policy_honours_a_forced_marlin_backend() -> None:
     """Asked for Marlin, the plan must say Marlin rather than nothing at all."""
     with mock.patch.object(
         latent_module, "native_latent_moe_available", return_value=False
     ):
         plan = Kimi3MoEExecutionPlan.build(
-            _plan_mapping(), _backend(marlin=True), alt_stream=None
+            _plan_mapping(), MoeBackend.MARLIN, alt_stream=None
         )
 
     assert plan.use_marlin
@@ -402,11 +388,29 @@ def test_kimi3_moe_execution_policy_takes_marlin_when_its_probe_says_yes() -> No
         mock.patch.object(latent_module, "_marlin_moe_available", return_value=True),
     ):
         plan = Kimi3MoEExecutionPlan.build(
-            _plan_mapping(), _backend(auto=True), alt_stream=None
+            _plan_mapping(), MoeBackend.AUTO, alt_stream=None
         )
 
     assert plan.use_marlin
     assert not plan.use_trtllm
+
+
+def test_kimi3_moe_execution_policy_selects_mega_moe() -> None:
+    with (
+        mock.patch.object(latent_module, "native_latent_moe_available") as native_probe,
+        mock.patch.object(latent_module, "_marlin_moe_available") as marlin_probe,
+    ):
+        plan = Kimi3MoEExecutionPlan.build(
+            _plan_mapping(), MoeBackend.MEGA_MOE, alt_stream=None
+        )
+    assert plan.use_mega_moe
+    assert not plan.use_native
+    assert not plan.use_trtllm
+    assert not plan.use_marlin
+    assert not plan.overlap_shared_experts
+    assert not plan.joint_moe_reduce
+    native_probe.assert_not_called()
+    marlin_probe.assert_not_called()
 
 
 def test_the_marlin_probe_needs_both_an_arch_and_a_built_library() -> None:
@@ -442,6 +446,7 @@ def test_kimi3_moe_execution_plan_prepares_latent_fusions(
         )
     )
     plan = Kimi3MoEExecutionPlan(
+        use_mega_moe=False,
         use_native=False,
         use_trtllm=True,
         overlap_shared_experts=False,
@@ -854,6 +859,7 @@ def _plan_for_join(shard_up_projection: bool) -> Kimi3MoEExecutionPlan:
         moe=SimpleNamespace(has_tp_ep=True, tp_ep_group=(0, 1)),
     )
     plan = Kimi3MoEExecutionPlan(
+        use_mega_moe=False,
         use_native=True,
         use_trtllm=False,
         overlap_shared_experts=False,

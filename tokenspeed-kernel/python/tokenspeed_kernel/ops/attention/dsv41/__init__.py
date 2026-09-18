@@ -20,7 +20,8 @@
 
 """DeepSeek V4.1 cache codecs, sparse attention and hierarchical selection.
 
-Importing this family registers its Triton and optional native solutions.
+Importing this family registers its Triton, AMD Gluon, and optional native
+solutions.
 
 Standalone packed rows place value bytes before scales (even FP4 element in
 low nibble). Formats: global = 512D E2M1/E4M3 groups of16, 288 bytes;
@@ -808,6 +809,7 @@ def compressor_metadata(
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.dsv41.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.dsv41.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.deep_select  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.flash_mla  # noqa: E402,F401

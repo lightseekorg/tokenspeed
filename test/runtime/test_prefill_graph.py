@@ -10,6 +10,9 @@ so capture and replay take the same code path.
 
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
 import os
 import sys
 import unittest
@@ -20,6 +23,227 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
+
+
+class PrefillCaptureArgsTest(unittest.TestCase):
+    def setUp(self):
+        from tokenspeed.runtime.utils.server_args import ServerArgs
+
+        self.parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(self.parser)
+
+    def test_token_aliases_share_config_and_capture_selection(self):
+        from tokenspeed.cli._argsplit import split_argv
+        from tokenspeed.runtime.execution.prefill_graph import (
+            PrefillGraph,
+            get_prefill_token_buckets,
+            resolve_prefill_capture_batch_sizes,
+        )
+
+        configurations = []
+        for flag in (
+            "--prefill-graph-capture-token-sizes",
+            "--prefill-graph-capture-sizes",
+        ):
+            argv = [
+                "--model",
+                "test",
+                flag,
+                "1024",
+                "2048",
+                "4096",
+                "--prefill-graph-capture-batch-sizes",
+                "2",
+                "1",
+                "2",
+            ]
+            direct = self.parser.parse_args(argv)
+            routed = self.parser.parse_args(split_argv(argv).engine)
+            self.assertEqual(vars(direct), vars(routed))
+            self.assertFalse(hasattr(direct, "prefill_graph_capture_token_sizes"))
+            self.assertEqual(direct.prefill_graph_capture_sizes, [1024, 2048, 4096])
+            config = SimpleNamespace(**vars(direct))
+            config.prefill_graph_max_tokens = config.chunked_prefill_size = 4096
+            config.context_len = 4096
+            config.max_num_seqs = 8
+            config.data_parallel_size = 1
+            buckets = get_prefill_token_buckets(config)
+            combinations = [
+                (bucket, bs)
+                for bucket in buckets
+                for bs in resolve_prefill_capture_batch_sizes(config, bucket)
+            ]
+            self.assertEqual(
+                combinations,
+                [
+                    (1024, 1),
+                    (1024, 2),
+                    (2048, 1),
+                    (2048, 2),
+                    (4096, 1),
+                    (4096, 2),
+                ],
+            )
+            owner = PrefillGraph.__new__(PrefillGraph)
+            owner.capture_buckets = buckets
+            self.assertEqual((owner._padded_bucket(868 + 869), 2), (2048, 2))
+            self.assertIsNone(owner._padded_bucket(4097))
+            configurations.append((vars(direct), combinations))
+        self.assertEqual(*configurations)
+
+    def test_token_aliases_are_mutually_exclusive(self):
+        from tokenspeed.cli._argsplit import split_argv
+
+        flags = ("--prefill-graph-capture-token-sizes", "--prefill-graph-capture-sizes")
+        for first, second in (flags, flags[::-1]):
+            for value in ("1024", "2048"):
+                for inline_value in (False, True):
+                    args = (
+                        [first + "=1024", second + "=" + value]
+                        if inline_value
+                        else [first, "1024", second, value]
+                    )
+                    argv = ["--model", "test", *args]
+                    for routed in (argv, split_argv(argv).engine):
+                        with self.subTest(argv=routed):
+                            with contextlib.redirect_stderr(io.StringIO()) as error:
+                                with self.assertRaises(SystemExit) as raised:
+                                    self.parser.parse_args(routed)
+                            self.assertEqual(raised.exception.code, 2)
+                            self.assertIn("not allowed with argument", error.getvalue())
+                            self.assertIn(first, error.getvalue())
+                            self.assertIn(second, error.getvalue())
+
+    def test_defaults_and_help_keep_token_and_request_units_separate(self):
+        args = self.parser.parse_args(["--model", "test"])
+        self.assertIsNone(args.prefill_graph_capture_sizes)
+        self.assertIsNone(args.prefill_graph_capture_batch_sizes)
+        help_text = " ".join(self.parser.format_help().split())
+        self.assertIn("Total input-token capacities per forward", help_text)
+        self.assertIn("not per-request sequence lengths", help_text)
+        self.assertIn(
+            "Request capacities for inline prefill attention capture", help_text
+        )
+        self.assertIn("smallest fitting captured batch size", help_text)
+        self.assertIn("Compatibility alias", help_text)
+
+    def test_executor_requires_explicit_capture_batch_sizes(self):
+        from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
+        from tokenspeed.runtime.execution.prefill_graph import (
+            resolve_prefill_capture_batch_sizes,
+        )
+
+        config_args = dict(
+            max_req_pool_size=5,
+            output_length=1,
+            enforce_eager=False,
+            prefix_granularity=128,
+            max_num_seqs=4,
+            chunked_prefill_size=4096,
+            vocab_size=32,
+            context_len=4096,
+            physical_context_len=4096,
+            device="cpu",
+            gpu_id=0,
+            global_rank=0,
+            cudagraph_capture_sizes=[1, 2, 4],
+            disable_cuda_graph_padding=False,
+            max_cudagraph_capture_size=4,
+            model_is_mrope=False,
+        )
+        with self.assertRaisesRegex(TypeError, "prefill_graph_capture_batch_sizes"):
+            ModelExecutorConfig(**config_args)
+
+        for sizes, expected in ((None, [1]), ([1, 2, 4], [1, 2, 4])):
+            with self.subTest(capture_batch_sizes=sizes):
+                config = ModelExecutorConfig(
+                    **config_args, prefill_graph_capture_batch_sizes=sizes
+                )
+                self.assertIs(config.prefill_graph_capture_batch_sizes, sizes)
+                self.assertEqual(
+                    resolve_prefill_capture_batch_sizes(config, 1024), expected
+                )
+
+
+class KdaPrefillFallbackTest(unittest.TestCase):
+    def test_outer_attention_break_does_not_capture_kda_graphs(self):
+        from unittest.mock import patch
+
+        import torch
+
+        from tokenspeed.runtime.execution.breakable_cuda_graph import BreakableCapture
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+        from tokenspeed.runtime.layers.attention.backends.state.kda import (
+            KdaAttnBackend,
+        )
+        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+            MambaAttnBackend,
+        )
+
+        backend = object.__new__(KdaAttnBackend)
+        backend._prefill_graph_enabled = True
+        backend.kda_backend = "cutedsl_kda"
+        capture = object.__new__(BreakableCapture)
+        output = torch.ones(1)
+        results = []
+
+        # Exercise the real replay boundary with CPU tensors and a mocked scan.
+        # Even repeated fallback shapes must not warm or capture a private graph.
+        with (
+            patch.object(MambaAttnBackend, "forward_extend", autospec=True) as scan,
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+            patch.object(torch.cuda, "CUDAGraph") as graph,
+            patch.object(
+                torch.cuda,
+                "current_stream",
+                side_effect=AssertionError("fallback attempted graph preparation"),
+            ),
+        ):
+            scan.return_value = output
+            for bs, bucket in ((1, 128), (2, 2048), (4, 4096), (1, 8192)):
+                for checkpoint in (None, object()):
+                    live = SimpleNamespace(prefill_checkpoint_batch=checkpoint)
+                    backend.forward_metadata = live
+
+                    def forward():
+                        results.append(
+                            backend.forward_extend(
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                bs,
+                                ForwardMode.EXTEND,
+                                save_kv_cache=True,
+                                layer_id=0,
+                                seq_len=bucket,
+                            )
+                        )
+
+                    capture.segments = [forward]
+                    for iteration in range(3):
+                        with self.subTest(bs=bs, bucket=bucket, iteration=iteration):
+                            scan.reset_mock()
+                            capture.replay(valid_rows=bucket - 1)
+                            scan.assert_called_once_with(
+                                backend,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                bs,
+                                ForwardMode.EXTEND,
+                                save_kv_cache=True,
+                                layer_id=0,
+                                seq_len=bucket,
+                            )
+                            self.assertIs(results[-1], output)
+                            self.assertIs(backend.forward_metadata, live)
+                            self.assertFalse(backend.prefill_metadata_is_capture_ready)
+            graph.assert_not_called()
+        self.assertEqual(len(results), 24)
 
 
 def _spec(
@@ -403,6 +627,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         context_len,
         physical,
         specs,
+        capture_bs,
         arena_blocks=64,
     ):
         """Drive make_dummy_batch to the backend hand-off and record it.
@@ -470,7 +695,10 @@ class DummyGroupTablesTest(unittest.TestCase):
             seen["max_prefix"] = int(pg.input_buffers.extend_prefix_lens_cpu.max())
 
         pg.attn_backend.init_forward_metadata = _record
-        ctx = pg.make_dummy_batch(num_tokens)
+        ctx = pg.make_dummy_batch(
+            num_tokens,
+            -(-num_tokens // context_len) if capture_bs is None else capture_bs,
+        )
         self.assertIs(ctx.attn_backend, pg.attn_backend)
         self.assertIs(ctx.token_to_kv_pool, pg.token_to_kv_pool)
         return seen
@@ -481,7 +709,11 @@ class DummyGroupTablesTest(unittest.TestCase):
         # 2048 tokens over a 960 context is three fabricated requests, so a
         # rule that collapsed rows to one would be visible here.
         seen = self._dummy_batch_probe(
-            num_tokens=2048, context_len=960, physical=1024, specs=(spec,)
+            num_tokens=2048,
+            context_len=960,
+            physical=1024,
+            specs=(spec,),
+            capture_bs=None,
         )
         tables = seen["block_tables"]
         table = tables["full_attention"]
@@ -498,6 +730,28 @@ class DummyGroupTablesTest(unittest.TestCase):
         self.assertEqual(table.device.type, "cpu")
         self.assertEqual(seen["max_prefix"], 0, "capture fabricates no prefix")
 
+    def test_explicit_request_count_uses_balanced_nonempty_placeholder_rows(self):
+        spec = _spec("full_attention", block_granularity=64)
+        seen = self._dummy_batch_probe(
+            num_tokens=1737,
+            context_len=2048,
+            physical=2048,
+            specs=(spec,),
+            capture_bs=2,
+        )
+        self.assertEqual(seen["extend_seq_lens_cpu"].tolist(), [869, 868])
+        self.assertEqual(seen["block_tables"]["full_attention"].shape[0], 2)
+        for tokens, bs in [(1, 2), (1737, 0), (1737, 17), (4096, 1)]:
+            with self.subTest(tokens=tokens, bs=bs):
+                with self.assertRaisesRegex(ValueError, "token/context capacity"):
+                    self._dummy_batch_probe(
+                        num_tokens=tokens,
+                        context_len=2048,
+                        physical=2048,
+                        specs=(spec,),
+                        capture_bs=bs,
+                    )
+
     def test_real_active_page_backend_gets_positions_alongside_its_tables(self):
         """A backend that validates live-page geometry (V4) is told how many
         tokens the batch carries and handed the live positions slice, and it
@@ -509,6 +763,7 @@ class DummyGroupTablesTest(unittest.TestCase):
             context_len=960,
             physical=1024,
             specs=(spec,),
+            capture_bs=None,
         )
         self.assertEqual(seen["num_tokens"], 128)
         self.assertEqual(seen["positions"].shape[0], 128)
@@ -525,6 +780,7 @@ class DummyGroupTablesTest(unittest.TestCase):
             context_len=960,
             physical=1024,
             specs=(spec,),
+            capture_bs=None,
             arena_blocks=2,
         )
         with self.assertRaises(ValueError) as caught:
@@ -533,6 +789,7 @@ class DummyGroupTablesTest(unittest.TestCase):
                 context_len=960,
                 physical=1024,
                 specs=(spec,),
+                capture_bs=None,
                 arena_blocks=2,
             )
         self.assertIn("page ID outside", str(caught.exception))
@@ -645,6 +902,7 @@ class CaptureFailureIsLoudTest(unittest.TestCase):
         pg = self.PrefillGraph.__new__(self.PrefillGraph)
         pg.disable = False
         pg.capture_buckets = [4]
+        pg._captures = {}
         pg.attn_backend = SimpleNamespace(
             init_prefill_graph_state=lambda **kwargs: None
         )

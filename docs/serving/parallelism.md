@@ -107,6 +107,10 @@ Select the transport with `--all2all-backend`:
   and its projection/shared-expert weight placement in one module.
   See [Kimi-K3 Hopper PD](../guides/kimi-k3-hopper-pd.md) for deployment layouts.
 
+For NVIDIA NVFP4 checkpoints, `--moe-backend mega_moe` replaces routed
+dispatch, SiTU expert computation, and combine with MegaMoE. It requires
+`--all2all-backend none`, keeps routing weights after FC2, and returns BF16 outputs.
+
 The AG/RS and FlashInfer transports quantize NVFP4 activations before dispatch and transfer their
 block scales alongside the routing IDs and weights. Combine outputs remain BF16.
 

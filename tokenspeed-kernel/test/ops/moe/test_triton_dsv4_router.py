@@ -233,7 +233,6 @@ def test_router_to_mxfp4_experts(tokens: int) -> None:
         fp8_scale_block_shape=None,
         internal_activation_dtype="input",
         with_bias=False,
-        deepep_group=None,
         deepep_mode=None,
         deepep_low_latency_max_num_tokens_per_gpu=None,
         solution="triton",

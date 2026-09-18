@@ -49,29 +49,47 @@ inline void CacheFullBlocksForTest(CacheCoordinator& coordinator, std::span<Bloc
                                 first_slot, CacheBoundaryKind::kChunk);
 }
 
+// Admits every group with the same demand prototype as a new request.
 inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
                                                                      std::vector<BlockTable>& tables,
                                                                      CacheCoordinator::PrefixProbe&& prefix,
-                                                                     GroupDemand prototype) {
+                                                                     GroupDemand prototype,
+                                                                     const RequestProgress& progress) {
     std::vector<GroupDemand> demands;
     demands.reserve(tables.size());
     for (BlockTable& table : tables) {
         prototype.table = &table;
         demands.push_back(prototype);
     }
-    return coordinator.Admit(std::move(prefix), demands, std::nullopt);
+    return coordinator.Admit(std::move(prefix), demands, progress, std::nullopt);
+}
+
+// The overloads without progress admit a request that has computed nothing
+// yet: nothing to publish, nothing for retention to reclaim.
+inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
+                                                                     std::vector<BlockTable>& tables,
+                                                                     CacheCoordinator::PrefixProbe&& prefix,
+                                                                     GroupDemand prototype) {
+    return AdmitForTest(coordinator, tables, std::move(prefix), prototype, RequestProgress{});
+}
+
+inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
+                                                                     std::vector<BlockTable>& tables,
+                                                                     GroupDemand prototype,
+                                                                     const RequestProgress& progress) {
+    return AdmitForTest(coordinator, tables, coordinator.ProbePrefix({}), prototype, progress);
 }
 
 inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
                                                                      std::vector<BlockTable>& tables,
                                                                      GroupDemand prototype) {
-    return AdmitForTest(coordinator, tables, coordinator.ProbePrefix({}), prototype);
+    return AdmitForTest(coordinator, tables, prototype, RequestProgress{});
 }
 
 inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
                                                                      std::vector<BlockTable>& tables,
                                                                      std::int32_t num_tokens) {
-    return AdmitForTest(coordinator, tables, GroupDemand{.num_tokens = num_tokens});
+    return AdmitForTest(coordinator, tables, GroupDemand{.extent = DenseGrowth{num_tokens}});
 }
 
 }  // namespace tokenspeed

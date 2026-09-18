@@ -719,14 +719,16 @@ def test_target_runner_passes_model_kwargs_not_context_tensors(buffers, mode):
     assert vars(ctx) == original
 
 
-@pytest.mark.parametrize("context_len", [3, 4])
+@pytest.mark.parametrize(
+    ("context_len", "lengths"), [(3, [3, 3]), (4, [4, 3]), (5, [4, 3]), (8, [7])]
+)
 def test_autotune_passes_engram_views_and_resets_dummy_inputs(
-    buffers, monkeypatch, context_len
+    buffers, monkeypatch, context_len, lengths
 ):
     """Run the startup forward, not just its serving-path counterpart."""
     ib, _ = buffers
     num_tokens = min(7, context_len * 2)
-    lengths = [context_len, num_tokens - context_len]
+    bs = len(lengths)
     events = []
     metadata = []
     tuning = False
@@ -745,10 +747,10 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
 
     def init_metadata(**kwargs):
         assert tuning
-        assert kwargs["bs"] == kwargs["num_extends"] == 2
+        assert kwargs["bs"] == kwargs["num_extends"] == bs
         assert kwargs["forward_mode"] == ForwardMode.EXTEND
         assert kwargs["seq_lens"].tolist() == lengths
-        assert kwargs["extend_prefix_lens"].tolist() == [0, 0]
+        assert kwargs["extend_prefix_lens"].tolist() == [0] * bs
         assert not kwargs["extend_with_prefix"]
         # An unbound fake pool exercises dummy setup without allocating KV.
         assert "block_tables" not in kwargs
@@ -770,10 +772,10 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         assert input_ids.shape == (num_tokens,)
         assert input_ids.data_ptr() == ib.input_ids_buf.data_ptr()
         assert positions.data_ptr() == ib.positions_buf.data_ptr()
-        assert positions.tolist() == list(range(lengths[0])) + list(range(lengths[1]))
+        assert positions.tolist() == [pos for size in lengths for pos in range(size)]
         assert ctx.attn_backend is pg.attn_backend
         assert ctx.input_num_tokens == num_tokens
-        assert ctx.bs == ctx.num_extends == 2
+        assert ctx.bs == ctx.num_extends == bs
         assert ctx.forward_mode == ForwardMode.EXTEND
         assert "engram_previous_tokens" not in vars(ctx)
         assert "engram_token_mask" not in vars(ctx)

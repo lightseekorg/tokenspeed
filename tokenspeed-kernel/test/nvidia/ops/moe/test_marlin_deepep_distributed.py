@@ -141,7 +141,7 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
         ep_size=world_size,
         ispp=intermediate_size,
         internal_activation_dtype="input",
-        deepep_group=dist.group.WORLD,
+        process_group=dist.group.WORLD,
         deepep_mode=mode,
         deepep_low_latency_max_num_tokens_per_gpu=(
             num_tokens if mode == "low_latency" else None
