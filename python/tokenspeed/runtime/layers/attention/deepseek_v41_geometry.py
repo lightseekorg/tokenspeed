@@ -18,13 +18,20 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""DeepSeek V4.1 FlatKV geometry; independent of V4's FP8/RoPE layout.
+"""DeepSeek V4.1 FlatKV geometry.
 
 A slot is page * rows_per_page + row, relative to one owner's field view.
 All readers must use tensor strides: fields share one physical LCM plane,
 not one contiguous allocation per owner. Packed rows contain values followed
-by scales (SWA: E4M3/E8M0, global: E2M1/E4M3, index: E2M1/E8M0).
+by scales.
+
+Every row width is a property of the cache format the caller selects through
+``V41_CACHE_FORMATS``; this module knows nothing about which hardware wants
+which.
 """
+
+from collections.abc import Mapping
+from dataclasses import dataclass
 
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DEEPSEEK_V41_GLOBAL_ROWS,
@@ -37,9 +44,6 @@ V41_GLOBAL_R1_GROUP_ID = "v41.global_r1"
 V41_COMPRESSOR_TAIL_GROUP_ID = "v41.compressor_tail_r2"
 V41_HEAD_DIM = 512
 V41_INDEX_HEAD_DIM = 128
-V41_SWA_ROW_BYTES = 528
-V41_GLOBAL_ROW_BYTES = 288
-V41_INDEX_ROW_BYTES = 68
 V41_WINDOW_SIZE = 128
 # Shared caller/recipe bound for native prefill query and output scratch.
 V41_PREFILL_QUERY_TILE = 2048
@@ -53,23 +57,95 @@ V41_GROUP_GEOMETRY = {
     V41_GLOBAL_R1_GROUP_ID: (DEEPSEEK_V41_GLOBAL_ROWS, 1),
     V41_COMPRESSOR_TAIL_GROUP_ID: (V41_TAIL_ROWS, 1),
 }
-V41_GROUP_PACKING = {
-    V41_SWA_GROUP_ID: 1,
-    V41_GLOBAL_R2_GROUP_ID: 20,
-    V41_GLOBAL_R1_GROUP_ID: 60,
-    V41_COMPRESSOR_TAIL_GROUP_ID: 54,
+
+
+@dataclass(frozen=True, kw_only=True)
+class V41CacheFormat:
+    """One row encoding for the cache fields, and what it packs to.
+
+    The row width decides how many of each group's blocks fit a parent, so a
+    format owns its packing tables and the plane they produce: these mirror
+    ``recipes.plan.pack()``, which only re-derives and checks them. With
+    same-checkpoint DSpark the SWA page also carries the draft's context rows,
+    so the parent grows and the other groups repack.
+
+    Attributes:
+        swa_kernel_format: ``dsv41`` kernel format name for the SWA rows.
+        global_kernel_format: ``dsv41`` kernel format name for the global rows.
+        index_kernel_format: ``dsv41`` kernel format name for the index rows.
+        swa_row_bytes: Packed bytes of one SWA row.
+        global_row_bytes: Packed bytes of one global KV row.
+        index_row_bytes: Packed bytes of one index-K row.
+        group_packing: Blocks per LCM block per group, without DSpark.
+        lcm_block_bytes: Parent size ``group_packing`` produces.
+        dspark_group_packing: Blocks per LCM block per group, with DSpark.
+        dspark_lcm_block_bytes: Parent size ``dspark_group_packing`` produces.
+    """
+
+    swa_kernel_format: str
+    global_kernel_format: str
+    index_kernel_format: str
+    swa_row_bytes: int
+    global_row_bytes: int
+    index_row_bytes: int
+    group_packing: Mapping[str, int]
+    lcm_block_bytes: int
+    dspark_group_packing: Mapping[str, int]
+    dspark_lcm_block_bytes: int
+
+
+# "v41" is the checkpoint's own encoding. "v4" re-encodes the fields in the
+# layouts Hopper's kernels can read: the KV rows become the wider V4 rows --
+# E4M3 values with E8M0 scales per 64, RoPE left in BF16 -- the only quantized
+# layout FlashMLA reads below sm100, and the index rows become DeepGEMM's FP8
+# index-K rows so its MQA logits kernels score on tensor cores. It costs
+# roughly half the token capacity for the same budget.
+V41_CACHE_FORMATS: Mapping[str, V41CacheFormat] = {
+    "v41": V41CacheFormat(
+        swa_kernel_format="swa",
+        global_kernel_format="global",
+        index_kernel_format="index",
+        swa_row_bytes=528,
+        global_row_bytes=288,
+        index_row_bytes=68,
+        group_packing={
+            V41_SWA_GROUP_ID: 1,
+            V41_GLOBAL_R2_GROUP_ID: 20,
+            V41_GLOBAL_R1_GROUP_ID: 60,
+            V41_COMPRESSOR_TAIL_GROUP_ID: 54,
+        },
+        lcm_block_bytes=1_382_400,
+        dspark_group_packing={
+            V41_SWA_GROUP_ID: 1,
+            V41_GLOBAL_R2_GROUP_ID: 22,
+            V41_GLOBAL_R1_GROUP_ID: 66,
+            V41_COMPRESSOR_TAIL_GROUP_ID: 62,
+        },
+        dspark_lcm_block_bytes=1_571_328,
+    ),
+    "v4": V41CacheFormat(
+        swa_kernel_format="swa_v4",
+        global_kernel_format="global_v4",
+        index_kernel_format="index_v4",
+        swa_row_bytes=584,
+        global_row_bytes=584,
+        index_row_bytes=132,
+        group_packing={
+            V41_SWA_GROUP_ID: 1,
+            V41_GLOBAL_R2_GROUP_ID: 11,
+            V41_GLOBAL_R1_GROUP_ID: 33,
+            V41_COMPRESSOR_TAIL_GROUP_ID: 60,
+        },
+        lcm_block_bytes=1_520_640,
+        dspark_group_packing={
+            V41_SWA_GROUP_ID: 1,
+            V41_GLOBAL_R2_GROUP_ID: 12,
+            V41_GLOBAL_R1_GROUP_ID: 36,
+            V41_COMPRESSOR_TAIL_GROUP_ID: 69,
+        },
+        dspark_lcm_block_bytes=1_695_744,
+    ),
 }
-V41_LCM_BLOCK_BYTES = 1_382_400
-# With same-checkpoint DSpark the SWA page also carries the draft's context
-# rows, so the parent grows and the other groups repack to keep every group
-# within the recipe's padding budget (1.5% / 4.5% / 4.5% / 3.1%).
-V41_DSPARK_GROUP_PACKING = {
-    V41_SWA_GROUP_ID: 1,
-    V41_GLOBAL_R2_GROUP_ID: 22,
-    V41_GLOBAL_R1_GROUP_ID: 66,
-    V41_COMPRESSOR_TAIL_GROUP_ID: 62,
-}
-V41_DSPARK_LCM_BLOCK_BYTES = 1_571_328
 
 
 def v41_dspark_field_name(stage: int) -> str:

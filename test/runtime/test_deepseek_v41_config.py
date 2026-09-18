@@ -411,14 +411,12 @@ def test_config_selects_flash_recipe_and_checks_geometry(runtime_config, overlap
         max_padding_fraction=recipe.max_padding_fraction,
     )
     recipe.check_layout(layout)
-    assert layout.lcm_block_bytes == 1_382_400
-    assert layout.plane_bytes == (("flatkv", 1_382_400),)
-    assert dict(layout.group_packing) == {
-        "v41.swa": 1,
-        "v41.global_r2": 20,
-        "v41.global_r1": 60,
-        "v41.compressor_tail_r2": 54,
-    }
+    # Row width decides the packing, so the plane follows the format this
+    # target chose; test_deepseek_v41_cache pins what each format produces.
+    rows = spec.row_layout()
+    assert layout.lcm_block_bytes == rows.lcm_block_bytes
+    assert layout.plane_bytes == (("flatkv", rows.lcm_block_bytes),)
+    assert dict(layout.group_packing) == dict(rows.group_packing)
     assert [group.block_granularity for group, _ in groups] == [64, 128, 64, 2]
     assert [len(fields) for _, fields in groups] == [40, 6, 2, 3]
     assert [group.sliding_window_tokens for group, _ in groups] == [
@@ -429,8 +427,8 @@ def test_config_selects_flash_recipe_and_checks_geometry(runtime_config, overlap
     ]
     assert all(group.family == "history" for group, _ in groups)
     assert all(field.page_stride_bytes % 256 == 0 for field in layout.fields)
-    with pytest.raises(ValueError, match="one 1,382,400-byte plane"):
-        recipe.check_layout(replace(layout, lcm_block_bytes=1_382_400 + 256))
+    with pytest.raises(ValueError, match="-byte plane"):
+        recipe.check_layout(replace(layout, lcm_block_bytes=rows.lcm_block_bytes + 256))
 
 
 @pytest.mark.parametrize("overlap_depth", [0, 1])
@@ -482,10 +480,11 @@ def test_real_server_args_prepare_cache_pool_and_backend(runtime_config, overlap
     assert arena.buffer.numel() == plan.arena_bytes
     assert arena.runtime_contract.token_capacity == args.max_total_tokens
     assert arena.runtime_contract.group_specs == setup.spec.cache_group_specs
+    rows = attn.component(DeepseekV41AttnConfig).row_layout()
     for view, shape in (
-        (pool.swa(39), (64, 528)),
-        (pool.global_kv(2), (64, 288)),
-        (pool.index_k(20), (64, 68)),
+        (pool.swa(39), (64, rows.swa_row_bytes)),
+        (pool.global_kv(2), (64, rows.global_row_bytes)),
+        (pool.index_k(20), (64, rows.index_row_bytes)),
         (pool.compressor_tail(14), (2, 2, 512)),
     ):
         assert tuple(view.shape[1:]) == shape
