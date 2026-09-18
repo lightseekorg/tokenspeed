@@ -53,6 +53,8 @@ import tokenspeed_kernel.ops.attention.dsv4.cuda as _attention_cuda_dsv4
 import tokenspeed_kernel.ops.attention.dsv4.deep_gemm as _attention_deep_gemm_dsv4
 import tokenspeed_kernel.ops.attention.dsv4.gluon as _attention_gluon_dsv4
 import tokenspeed_kernel.ops.attention.dsv41 as _attention_dsv41_pkg
+import tokenspeed_kernel.ops.attention.dsv41.gluon as _attention_gluon_dsv41
+import tokenspeed_kernel.ops.attention.dsv41.triton as _attention_triton_dsv41
 import tokenspeed_kernel.ops.attention.gdn as _attention_gdn_pkg
 import tokenspeed_kernel.ops.attention.gdn.flashinfer as _attention_flashinfer_gdn
 import tokenspeed_kernel.ops.attention.kda as _attention_kda_pkg
@@ -145,6 +147,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 _ATTENTION_GLUON_MODULES = [
     _attention_gluon_dsa,
     _attention_gluon_dsv4,
+    _attention_gluon_dsv41,
     _attention_gluon_kda,
     _attention_gluon_mha,
     _attention_gluon_mla,
@@ -175,6 +178,7 @@ _RELOAD_MODULES = [
     _attention_triton_rel_mha,
     _attention_triton_merge_state,
     _attention_triton_dsv4,
+    _attention_triton_dsv41,
     _attention_triton_dsa,
     _attention_triton_gdn,
     # Variant packages own public result classes imported by other test modules.
@@ -304,6 +308,8 @@ def test_builtin_moe_specialized_offsets_are_intentional() -> None:
     registry = KernelRegistry.get()
     expected_offsets = {
         "gluon_mxfp4_dynamic_moe_apply": Priority.SPECIALIZED + 1,
+        # Prefer the coupled MXFP8 bank over the overlapping A16 EP8 plan.
+        "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply": Priority.SPECIALIZED + 1,
         "triton_decode_sigmoid_bias_topk": Priority.SPECIALIZED + 1,
     }
     actual_offsets = {
@@ -1845,11 +1851,11 @@ def _attention_dsa_prefill_fp8_packed_rank512() -> object:
     )
 
 
-def _attention_dsv41_index_topk() -> object:
-    q = torch.empty((2, 32, 128), dtype=torch.bfloat16)
+def _attention_dsv41_index_topk(heads: int, process_group: object) -> object:
+    q = torch.empty((2, heads, 128), dtype=torch.bfloat16)
     return _attention_dsv41_pkg.index_topk(
         q,
-        torch.empty((2, 32), dtype=torch.bfloat16),
+        torch.empty((2, heads), dtype=torch.bfloat16),
         torch.empty((4, 64, 68), dtype=torch.uint8),
         torch.zeros((2, 4), dtype=torch.int32),
         torch.tensor([64, 32], dtype=torch.int32),
@@ -1859,7 +1865,7 @@ def _attention_dsv41_index_topk() -> object:
         8,
         2,
         64,
-        None,
+        process_group,
         None,
         None,
     )
@@ -2965,15 +2971,15 @@ def test_triton_mxfp4_supports_input_activation_dtype(
             8,
             3072,
             None,
-            "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply",
-            "validate_linear_mxfp4_moe_weights",
+            "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply",
+            "gluon_mxfp4_gfx950_a8w4_situ_ep_weights",
         ),
         (
             8,
             3072,
             "gluon",
-            "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply",
-            "validate_linear_mxfp4_moe_weights",
+            "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply",
+            "gluon_mxfp4_gfx950_a8w4_situ_ep_weights",
         ),
     ],
 )
@@ -3116,7 +3122,7 @@ def test_kimi3_a8_plan_preserves_unclipped_a16_decode(
         topk=16,
         linear_clamp=None,
     )
-    assert not _moe_latent_decode.latent_moe_decode_pipeline_available(
+    assert _moe_latent_decode.latent_moe_decode_pipeline_available(
         *tensors,
         plan,
         topk=16,
@@ -3837,7 +3843,7 @@ _CASES = [
         "attention",
         "dsv41_index_topk",
         "gluon_dsv41_index_topk_gfx950",
-        _attention_dsv41_index_topk,
+        partial(_attention_dsv41_index_topk, 32, None),
     ),
     _case(
         _is_cdna5,
@@ -3845,7 +3851,7 @@ _CASES = [
         "attention",
         "dsv41_index_topk",
         "gluon_dsv41_index_topk_gfx1250",
-        _attention_dsv41_index_topk,
+        partial(_attention_dsv41_index_topk, 32, None),
     ),
     _case(
         _is_cdna4,
@@ -5595,6 +5601,59 @@ def test_gluon_mla_fixed_regime_auto_selection(
         registry.clear_cache()
 
     assert calls == [expected]
+
+
+@pytest.mark.parametrize("platform_fixture", ["mi350_platform", "mi450_platform"])
+@pytest.mark.parametrize(("heads", "shards"), [(64, 1), (16, 4)])
+def test_dsv41_index_topk_large_gathered_head_count_selects_triton(
+    platform_fixture, heads, shards, request, monkeypatch, selected_kernel_spy
+):
+    platform = request.getfixturevalue(platform_fixture)
+    group = object() if shards > 1 else None
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: shards)
+    case = _case(
+        lambda platform: platform.is_amd,
+        "cdna4",
+        "attention",
+        "dsv41_index_topk",
+        "triton_dsv41_index_topk",
+        partial(_attention_dsv41_index_topk, heads, group),
+    )
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = case
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    try:
+        Platform.override(platform)
+        registry.clear_cache()
+        case.invoke()
+        assert calls == [case.expected]
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+
+
+# Capture host-available registrations before the fixture clears them. CI runs
+# this guard on each vendor; explicit DSV4.1 module checks also run across vendors.
+_CASE_REGISTRATION_MODULES = {
+    case.expected: impl.__module__
+    for case in _CASES
+    if (impl := KernelRegistry.get().get_impl(case.expected)) is not None
+}
+
+
+def test_selection_fixture_reloads_available_case_registrations():
+    assert _attention_gluon_dsv41 in _RELOAD_MODULES
+    assert _attention_triton_dsv41 in _RELOAD_MODULES
+    registry = KernelRegistry.get()
+    missing = {
+        name: module
+        for name, module in _CASE_REGISTRATION_MODULES.items()
+        if registry.get_impl(name) is None
+    }
+    assert (
+        not missing
+    ), f"Add registration modules to _RELOAD_MODULES for missing cases: {missing}"
 
 
 _CASE_PLATFORM_PARAMS = [

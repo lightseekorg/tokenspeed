@@ -18,16 +18,4 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""DeepSeek V4.1 attention kernels for AMD GFX950."""
-
-from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41.indexer import (
-    dsv41_index_logits_gfx950,
-)
-from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41.selected import (
-    gluon_dsv41_selected_attention_gfx950,
-)
-
-__all__ = [
-    "dsv41_index_logits_gfx950",
-    "gluon_dsv41_selected_attention_gfx950",
-]
+"""Host adapters for AMD Gluon DSV4.1 kernels."""

@@ -20,10 +20,8 @@
 
 """GFX950 DeepSeek V4.1 CSA2 indexer.
 
-Scores page-planar MXFP4 index-K with the V4 ``mfma_scaled`` e2m1 tile, then
-selects Top512 (and CSA2 blocks) on ATen. Histories wider than 32K fall back
-to the portable Triton scan so serving at 1M does not materialize a dense
-score matrix.
+Scores page-planar MXFP4 index-K with the V4 ``mfma_scaled`` e2m1 tile.
+The tokenspeed-kernel adapter owns query packing, selection, and fallbacks.
 """
 
 from __future__ import annotations
@@ -41,13 +39,9 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4.indexer import (
     _load_query_group,
 )
 
-__all__ = [
-    "gluon_dsv41_index_topk_gfx950",
-    "run_dsv41_csa2_index_topk",
-]
+__all__ = ["dsv41_index_logits_gfx950"]
 
 _MFMA_HEADS = 32
-_MAX_LOGITS = 32768
 
 
 @gluon.jit
@@ -190,7 +184,21 @@ def _score_csa2_group(
     return gl.sum(head_scores * head_weights[:, None], axis=0)
 
 
+def _index_launch_metadata(grid, kernel, args):
+    """Describe the score capacity without reading device-resident lengths."""
+    queries, width = args["logits"].shape
+    heads = args["NUM_HEADS"]
+    return {
+        "name": kernel.name,
+        "flops4": 2 * queries * heads * width * 128,
+        "bytes": queries * width * 68
+        + args["q"].numel() * args["q"].element_size() * grid[1]
+        + args["logits"].numel() * args["logits"].element_size(),
+    }
+
+
 @gluon.jit(
+    launch_metadata=_index_launch_metadata,
     do_not_specialize=(
         "stride_q_token",
         "stride_q_head",
@@ -203,7 +211,7 @@ def _score_csa2_group(
         "logits_stride",
         "page_stride_bytes",
         "num_pages",
-    )
+    ),
 )
 def _dsv41_mxfp4_logits_kernel(
     q,
@@ -359,193 +367,10 @@ def _dsv41_mxfp4_logits_kernel(
         )
 
 
-def _pack_index_q(q: torch.Tensor, weights: torch.Tensor):
-    from tokenspeed_kernel.ops.attention.dsv41.triton import cache_pack
-
-    tokens, heads, _ = q.shape
-    packed = cache_pack(q.contiguous().reshape(tokens * heads, 128), "index", None)
-    values = packed[:, :64].reshape(tokens, heads, 64)
-    scales = packed[:, 64:68].contiguous().view(torch.int32).reshape(tokens, heads)
-    pad = _MFMA_HEADS - heads
-    if pad < 0:
-        raise ValueError(
-            f"GFX950 CSA2 MFMA indexer supports at most {_MFMA_HEADS} heads"
-        )
-    if pad:
-        values = torch.nn.functional.pad(values, (0, 0, 0, pad))
-        scales = torch.nn.functional.pad(scales, (0, pad))
-        weights = torch.nn.functional.pad(weights.float(), (0, pad))
-    else:
-        weights = weights.float()
-    return values.contiguous(), scales.contiguous(), weights.contiguous()
-
-
-def _select_sorted(scores: torch.Tensor, k: int, out: torch.Tensor, lens: torch.Tensor):
-    out.fill_(-1)
-    lens.zero_()
-    width = scores.shape[1]
-    take = min(int(k), width)
-    if not scores.shape[0] or take < 1:
-        return
-    values, indices = scores.topk(take, dim=1, sorted=False)
-    valid = values > -torch.inf
-    ordered = (
-        indices.masked_fill(~valid, torch.iinfo(torch.int64).max).sort(dim=1).values
-    )
-    ordered = ordered.masked_fill(ordered == torch.iinfo(torch.int64).max, -1)
-    out[:, :take].copy_(ordered.to(out.dtype))
-    lens.copy_(valid.sum(dim=1).to(lens.dtype))
-
-
-def _logical_from_scan(columns: torch.Tensor, candidate_blocks: torch.Tensor | None):
-    if candidate_blocks is None:
-        return columns
-    block = candidate_blocks.gather(
-        1, (columns // 8).clamp(max=candidate_blocks.shape[1] - 1)
-    )
-    logical = block.to(torch.int64) * 8 + columns % 8
-    return torch.where(block >= 0, logical, torch.iinfo(torch.int64).max)
-
-
-def run_dsv41_csa2_index_topk(
-    index_q,
-    weights,
-    index_cache,
-    page_table,
-    visible_lens,
-    candidate_blocks,
-    topk,
-    candidate_topk,
-    candidate_block_size,
-    query_chunk_size,
-    score_chunk_size,
-    process_group,
-    out,
-    launch_logits,
+def dsv41_index_logits_gfx950(
+    values, scales, w, cache_2d, table, visible, candidates, logits
 ):
-    """Shared CSA2 host: gather, score into logits, ATen TopK. Wide histories use Triton."""
-    from tokenspeed_kernel.ops.attention.dsv41.triton import (
-        _index_gather_heads,
-        _index_topk_outputs,
-    )
-    from tokenspeed_kernel.ops.attention.dsv41.triton import (
-        index_topk as portable_index_topk,
-    )
-
-    need = (
-        int(candidate_blocks.shape[1]) * 8
-        if candidate_blocks is not None
-        else int(page_table.shape[1]) * _PAGE_SIZE
-    )
-    if need > _MAX_LOGITS:
-        return portable_index_topk(
-            index_q,
-            weights,
-            index_cache,
-            page_table,
-            visible_lens,
-            candidate_blocks,
-            topk,
-            candidate_topk,
-            candidate_block_size,
-            query_chunk_size,
-            score_chunk_size,
-            process_group,
-            out,
-        )
-
-    out = _index_topk_outputs(
-        index_q,
-        weights,
-        index_cache,
-        page_table,
-        visible_lens,
-        candidate_blocks,
-        topk,
-        candidate_topk,
-        candidate_block_size,
-        query_chunk_size,
-        score_chunk_size,
-        process_group,
-        out,
-    )
-    tokens = index_q.shape[0]
-    row_out, row_lens, block_out, block_lens = out
-    row_out.fill_(-1)
-    row_lens.zero_()
-    block_out.fill_(-1)
-    block_lens.zero_()
-    if not tokens or not page_table.shape[1] or need < 1:
-        return out
-
-    cache = index_cache.contiguous()
-    cache_2d = cache.view(cache.shape[0], cache.shape[1] * cache.shape[2])
-    query_chunk_size = min(int(query_chunk_size), 256)
-    make_blocks = bool(candidate_topk)
-
-    for start in range(0, tokens, query_chunk_size):
-        end = min(start + query_chunk_size, tokens)
-        q, w, _shards = _index_gather_heads(
-            index_q[start:end], weights[start:end], process_group
-        )
-        table = page_table[start:end].contiguous()
-        visible = visible_lens[start:end].contiguous()
-        candidates = (
-            None
-            if candidate_blocks is None
-            else candidate_blocks[start:end].contiguous()
-        )
-        queries = end - start
-        width = (
-            int(candidates.shape[1]) * 8
-            if candidates is not None
-            else int(table.shape[1]) * _PAGE_SIZE
-        )
-        width = min(width, need, _MAX_LOGITS)
-        if width < 1:
-            continue
-        logits = torch.full(
-            (queries, width),
-            -float("inf"),
-            dtype=torch.float32,
-            device=q.device,
-        )
-        launch_logits(q, w, cache_2d, table, visible, candidates, logits)
-        values_topk, columns = logits.topk(min(int(topk), width), dim=1, sorted=False)
-        logical = _logical_from_scan(columns, candidates)
-        packed = torch.where(
-            values_topk > -torch.inf, logical, torch.iinfo(torch.int64).max
-        )
-        ordered = packed.sort(dim=1).values
-        ordered = ordered.masked_fill(ordered == torch.iinfo(torch.int64).max, -1)
-        take = ordered.shape[1]
-        row_out[start:end, :take].copy_(ordered.to(row_out.dtype))
-        row_lens[start:end].copy_(
-            (values_topk > -torch.inf).sum(dim=1).to(row_lens.dtype)
-        )
-        if make_blocks:
-            n_blocks = width // 8
-            block_scores = (
-                logits[:, : n_blocks * 8].reshape(queries, n_blocks, 8).amax(-1)
-            )
-            latest = ((visible.to(torch.int64) - 1) // 8).clamp(0, n_blocks - 1)
-            live = (visible > 0) & (latest < n_blocks)
-            rows = torch.arange(queries, device=q.device)
-            current = block_scores[rows, latest]
-            block_scores[rows, latest] = torch.where(
-                live, torch.full_like(current, float("inf")), current
-            )
-            _select_sorted(
-                block_scores,
-                int(candidate_topk),
-                block_out[start:end],
-                block_lens[start:end],
-            )
-    return out
-
-
-def _launch_gfx950_logits(q, w, cache_2d, table, visible, candidates, logits):
-    values, scales, w = _pack_index_q(q, w)
+    """Score prepared 32-head MXFP4 queries into caller-owned CSA2 logits."""
     queries, width = logits.shape
     cand = table if candidates is None else candidates
     scale_dim = 4
@@ -579,38 +404,4 @@ def _launch_gfx950_logits(q, w, cache_2d, table, visible, candidates, logits):
         NUM_WARPS=2,
         num_warps=2,
         waves_per_eu=2,
-    )
-
-
-def gluon_dsv41_index_topk_gfx950(
-    index_q,
-    weights,
-    index_cache,
-    page_table,
-    visible_lens,
-    candidate_blocks,
-    topk,
-    candidate_topk,
-    candidate_block_size,
-    query_chunk_size,
-    score_chunk_size,
-    process_group,
-    out,
-):
-    """GFX950 CSA2 indexer: MXFP4 MFMA score plus ATen TopK."""
-    return run_dsv41_csa2_index_topk(
-        index_q,
-        weights,
-        index_cache,
-        page_table,
-        visible_lens,
-        candidate_blocks,
-        topk,
-        candidate_topk,
-        candidate_block_size,
-        query_chunk_size,
-        score_chunk_size,
-        process_group,
-        out,
-        _launch_gfx950_logits,
     )

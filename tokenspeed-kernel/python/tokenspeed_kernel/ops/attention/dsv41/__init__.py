@@ -399,7 +399,8 @@ def index_topk(
     Returns:
         (logical_row_ids, row_lengths, candidate_block_ids, candidate_lengths).
         IDs are position-sorted, packed into valid prefixes, then padded -1.
-        Blocks include the latest visible block even if its score is low.
+        Blocks include the latest visible block with valid cache rows even if
+        its score is low. Missing or out-of-range pages never become candidates.
         Empty history has zero lengths. Equal-score boundary ties may select
         any equivalent subset; no cross-chunk/TP bitwise tie guarantee.
 
@@ -438,6 +439,9 @@ def index_topk(
         and is_native_indexer_available()
         and is_deep_select_available()
     )
+    index_heads = index_q.shape[1]
+    if process_group is not None:
+        index_heads *= torch.distributed.get_world_size(process_group)
     kernel = select_kernel(
         "attention",
         "dsv41_index_topk",
@@ -445,7 +449,7 @@ def index_topk(
         features=None,
         platform=None,
         objective=SelectionObjective.DEFAULT,
-        traits={"native_indexer": native},
+        traits={"native_indexer": native, "index_heads": index_heads},
         solution=solution,
         override=None,
     )

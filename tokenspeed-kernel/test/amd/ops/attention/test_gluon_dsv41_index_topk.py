@@ -19,13 +19,16 @@
 
 from __future__ import annotations
 
+import importlib
 import os
 import sys
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -48,7 +51,7 @@ def _index_name() -> str:
         "attention",
         "dsv41_index_topk",
         format_signature(x=dense_tensor_format(torch.bfloat16)),
-        traits={"native_indexer": False},
+        traits={"native_indexer": False, "index_heads": 32},
         solution="gluon",
     )
     return kernel.name
@@ -107,3 +110,116 @@ def test_index_topk_full_and_reindex_gluon(
     run_index_topk_full_and_reindex(
         device, "gluon", heads, candidate_topk, topk, require, match_triton=False
     )
+
+
+def test_index_topk_large_head_count_auto_fallback(device, require):
+    run_index_topk_full_and_reindex(
+        device, None, 64, 17, 65, require, match_triton=True
+    )
+
+
+@pytest.mark.parametrize("solution", ["triton", "gluon"])
+def test_index_topk_rejects_invalid_page_table_shape(device, require, solution):
+    require("attention", "dsv41_index_topk", solution, torch.bfloat16, "x")
+    with pytest.raises(ValueError, match="page_table must be"):
+        dsv41.index_topk(
+            torch.ones((1, 32, 128), dtype=torch.bfloat16, device=device),
+            torch.ones((1, 32), dtype=torch.bfloat16, device=device),
+            torch.zeros((1, 64, 68), dtype=torch.uint8, device=device),
+            torch.zeros((1,), dtype=torch.int32, device=device),
+            torch.zeros((1,), dtype=torch.int32, device=device),
+            None,
+            16,
+            0,
+            8,
+            1,
+            64,
+            None,
+            None,
+            solution,
+        )
+
+
+@pytest.mark.parametrize(
+    ("arch", "dtype", "width", "metric", "kernel_name"),
+    [
+        ("gfx950", torch.uint8, 64, "flops4", "_dsv41_mxfp4_logits_kernel"),
+        ("gfx1250", torch.bfloat16, 128, "flops16", "_dsv41_wmma_logits_kernel"),
+    ],
+)
+def test_indexer_launch_metadata(arch, dtype, width, metric, kernel_name):
+    module = importlib.import_module(
+        f"tokenspeed_kernel_amd.ops.{arch}.attention.dsv41.indexer"
+    )
+    args = {
+        "q": torch.empty((2, 32, width), dtype=dtype),
+        "logits": torch.empty((2, 512), dtype=torch.float32),
+        "NUM_HEADS": 32,
+    }
+    metadata = module._index_launch_metadata(
+        (2, 2, 1), SimpleNamespace(name="index_score"), args
+    )
+    assert metadata["name"] == "index_score"
+    assert metadata[metric] == 2 * 2 * 32 * 512 * 128
+    assert metadata["bytes"] > args["logits"].numel() * 4
+    assert getattr(module, kernel_name).launch_metadata is module._index_launch_metadata
+
+
+@pytest.mark.parametrize("solution", ["triton", "gluon"])
+@pytest.mark.parametrize("missing_page", [-1, 3])
+def test_index_topk_missing_latest_page(device, require, solution, missing_page):
+    require("attention", "dsv41_index_topk", solution, torch.bfloat16, "x")
+    q = torch.ones((3, 32, 128), dtype=torch.bfloat16, device=device)
+    weights = -torch.ones((3, 32), dtype=torch.bfloat16, device=device)
+    cache = torch.zeros((3, 64, 68), dtype=torch.uint8, device=device)
+    dsv41.cache_scatter(
+        torch.ones((192, 128), dtype=torch.bfloat16, device=device),
+        cache,
+        torch.arange(192, device=device),
+        "index",
+    )
+    table = torch.tensor(
+        [[0, missing_page, 2, missing_page], [missing_page] * 4, [0, 1, 2, 0]],
+        dtype=torch.int32,
+        device=device,
+    )
+    visible = torch.tensor([256, 256, 0], dtype=torch.int32, device=device)
+    rows, row_lens, blocks, block_lens = dsv41.index_topk(
+        q, weights, cache, table, visible, None, 512, 32, 8, 2, 64, None, None, solution
+    )
+    expected_rows = torch.cat(
+        [torch.arange(64, device=device), torch.arange(128, 192, device=device)]
+    ).to(torch.int32)
+    expected_blocks = torch.cat(
+        [torch.arange(8, device=device), torch.arange(16, 24, device=device)]
+    ).to(torch.int32)
+    torch.testing.assert_close(rows[0, :128], expected_rows)
+    torch.testing.assert_close(blocks[0, :16], expected_blocks)
+    assert row_lens.tolist() == [128, 0, 0]
+    assert block_lens.tolist() == [16, 0, 0]
+    assert (rows[0, 128:] == -1).all() and (rows[1:] == -1).all()
+    assert (blocks[0, 16:] == -1).all() and (blocks[1:] == -1).all()
+
+
+@pytest.mark.parametrize("solution", ["triton", "gluon"])
+@pytest.mark.parametrize(("length", "expected_block"), [(256, 31), (320, 0)])
+def test_index_topk_latest_block_outside_table(
+    device, require, solution, length, expected_block
+):
+    require("attention", "dsv41_index_topk", solution, torch.bfloat16, "x")
+    q = torch.ones((1, 32, 128), dtype=torch.bfloat16, device=device)
+    weights = -torch.ones((1, 32), dtype=torch.bfloat16, device=device)
+    cache = torch.zeros((3, 64, 68), dtype=torch.uint8, device=device)
+    keys = (
+        torch.arange(1, 193, dtype=torch.bfloat16, device=device)[:, None]
+        .expand(-1, 128)
+        .contiguous()
+    )
+    dsv41.cache_scatter(keys, cache, torch.arange(192, device=device), "index")
+    table = torch.tensor([[0, 1, 2, 2]], dtype=torch.int32, device=device)
+    visible = torch.tensor([length], dtype=torch.int32, device=device)
+    output = dsv41.index_topk(
+        q, weights, cache, table, visible, None, 16, 1, 8, 1, 64, None, None, solution
+    )
+    assert output[2].item() == expected_block
+    assert output[3].item() == 1

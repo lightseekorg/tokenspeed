@@ -21,21 +21,16 @@
 """GFX1250 DeepSeek V4.1 CSA2 indexer.
 
 Wave32 WMMA port of the GFX950 CSA2 scorer. MXFP4 index-K is dequantized to
-BF16; 32 padded heads score a 32-wide history tile. ATen still selects
-Top512 and CSA2 blocks. Histories wider than 32K use the portable Triton
-scan through the shared host.
+BF16; 32 padded heads score a 32-wide history tile. The tokenspeed-kernel
+adapter owns query preparation, selection, and fallbacks.
 """
 
 from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
-from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41.indexer import (
-    _MFMA_HEADS,
-    run_dsv41_csa2_index_topk,
-)
 
-__all__ = ["gluon_dsv41_index_topk_gfx1250"]
+__all__ = ["dsv41_index_logits_gfx1250"]
 
 _HEAD_DIM = 128
 _PACKED_DIM = gl.constexpr(_HEAD_DIM // 2)
@@ -134,7 +129,21 @@ def _load_query(
     return gl.convert_layout(query, q_dot_layout), head_weights
 
 
+def _index_launch_metadata(grid, kernel, args):
+    """Describe the score capacity without reading device-resident lengths."""
+    queries, width = args["logits"].shape
+    heads = args["q"].shape[1]
+    return {
+        "name": kernel.name,
+        "flops16": 2 * queries * heads * width * 128,
+        "bytes": queries * width * 68
+        + args["q"].numel() * args["q"].element_size() * grid[1]
+        + args["logits"].numel() * args["logits"].element_size(),
+    }
+
+
 @gluon.jit(
+    launch_metadata=_index_launch_metadata,
     do_not_specialize=(
         "stride_q_token",
         "stride_q_head",
@@ -145,7 +154,7 @@ def _load_query(
         "logits_stride",
         "page_stride_bytes",
         "num_pages",
-    )
+    ),
 )
 def _dsv41_wmma_logits_kernel(
     q,
@@ -286,24 +295,8 @@ def _dsv41_wmma_logits_kernel(
         )
 
 
-def _pad_query(q: torch.Tensor, weights: torch.Tensor):
-    from tokenspeed_kernel.ops.attention.dsv41.triton import index_q_quantize
-
-    q = index_q_quantize(q.contiguous(), None)
-    tokens, heads, _ = q.shape
-    pad = _MFMA_HEADS - heads
-    if pad < 0:
-        raise ValueError(f"GFX1250 CSA2 indexer supports at most {_MFMA_HEADS} heads")
-    if pad:
-        q = torch.nn.functional.pad(q, (0, 0, 0, pad))
-        weights = torch.nn.functional.pad(weights.float(), (0, pad))
-    else:
-        weights = weights.float()
-    return q.contiguous(), weights.contiguous()
-
-
-def _launch_gfx1250_logits(q, w, cache_2d, table, visible, candidates, logits):
-    q, w = _pad_query(q, w)
+def dsv41_index_logits_gfx1250(q, w, cache_2d, table, visible, candidates, logits):
+    """Score prepared 32-head BF16 queries into caller-owned CSA2 logits."""
     queries, width = logits.shape
     cand = table if candidates is None else candidates
     _dsv41_wmma_logits_kernel[(queries, triton.cdiv(width, _CHUNK_N))](
@@ -332,38 +325,4 @@ def _launch_gfx1250_logits(q, w, cache_2d, table, visible, candidates, logits):
         CHUNK_N=_CHUNK_N,
         NUM_WARPS=_NUM_WARPS,
         num_warps=_NUM_WARPS,
-    )
-
-
-def gluon_dsv41_index_topk_gfx1250(
-    index_q,
-    weights,
-    index_cache,
-    page_table,
-    visible_lens,
-    candidate_blocks,
-    topk,
-    candidate_topk,
-    candidate_block_size,
-    query_chunk_size,
-    score_chunk_size,
-    process_group,
-    out,
-):
-    """GFX1250 CSA2 indexer: WMMA score plus ATen TopK."""
-    return run_dsv41_csa2_index_topk(
-        index_q,
-        weights,
-        index_cache,
-        page_table,
-        visible_lens,
-        candidate_blocks,
-        topk,
-        candidate_topk,
-        candidate_block_size,
-        query_chunk_size,
-        score_chunk_size,
-        process_group,
-        out,
-        _launch_gfx1250_logits,
     )
