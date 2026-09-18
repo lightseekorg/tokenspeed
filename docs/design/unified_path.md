@@ -840,6 +840,11 @@ mapping remains a separate consumer of the shared mapping helpers
 
 ## Regression gates
 
+* `test/runtime/execution/test_kda_prefill_graph_cache.py` is registered in
+  `runtime-1gpu`; its direct-script entry point runs pytest. It covers request
+  padding, capacity selection, metadata refresh and checkpoint/state isolation.
+  Native CuTeDSL replay tests run on NVIDIA SM100/SM103 and skip other devices;
+  missing native dependencies on a supported device are errors, not skips.
 * `test/runtime/test_unified_decode_path.py` — eager refresh and padded
   replay refresh produce identical live-request contents over the same
   buffers; lazy above-ladder views are pointer-stable; the graph_ptr_guard

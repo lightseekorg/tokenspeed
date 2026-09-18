@@ -20,17 +20,26 @@
 
 """Regression coverage for the capacity-based prefill graph owner."""
 
+import os
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from tokenspeed.runtime.layers.attention.backends.state.kda_prefill_metadata import (
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=60, suite="runtime-1gpu")
+
+from tokenspeed.runtime.layers.attention.backends.state.kda_prefill_metadata import (  # noqa: E402
     _checkpoint_slot_batch,
     _clone_metadata,
     prepare_kda_prefill_metadata,
 )
-from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+from tokenspeed.runtime.layers.attention.backends.state.mamba import (  # noqa: E402
     MambaForwardMetadata,
 )
 
@@ -295,6 +304,7 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
         CAUSAL_CONV1D_BLOCK_M,
         build_causal_conv1d_prefill_metadata,
     )
+    from tokenspeed_kernel.ops.attention.kda.cute_dsl import cutedsl_kda_supported
 
     from tokenspeed.runtime.execution.forward_batch_info import (
         CaptureHiddenMode,
@@ -306,7 +316,8 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
         _build_prefill_checkpoint_batch,
     )
 
-    pytest.importorskip("tokenspeed_cutedsl_kda")
+    if not cutedsl_kda_supported():
+        pytest.skip("native CuteDSL KDA requires NVIDIA SM100 or SM103")
     torch.manual_seed(42)
     # Eight BF16 beta heads keep eager tail views 16-byte aligned even when
     # the body has one token, as required by the native scan ABI.
@@ -762,3 +773,7 @@ def test_executor_prepares_eager_prefill_metadata_before_any_layer(
     assert events == (["prepare"] if prepared else []) + [
         "graph" if use_graph else "eager"
     ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q", "-rs"]))
