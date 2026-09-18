@@ -428,7 +428,9 @@ def index_topk(
     reference's intermediate BF16 rounding. Native query tiles cap logits at
     32MiB for paged queries and 128MiB for a zero-row-stride request table.
     That broadcast layout gathers packed history once per call and packs Q
-    once before the score tiles; no payload survives the call.
+    once before the score tiles; no payload survives the call. AMD Gluon Full
+    similarly caps each FP32 logits query tile at 32MiB instead of limiting
+    history width; Reindex scores only the candidate rows.
     """
     from tokenspeed_kernel.ops.attention.dsv41.deep_gemm import (
         is_hopper_indexer_available,

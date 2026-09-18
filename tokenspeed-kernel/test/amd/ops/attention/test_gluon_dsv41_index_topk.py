@@ -33,6 +33,7 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import gluon as gluon_backend
+from tokenspeed_kernel.ops.attention.dsv41._gluon import indexer as gluon_indexer
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -71,6 +72,15 @@ def test_gluon_index_topk_is_selected_on_supported_amd():
         pytest.skip("AMD gluon DSV4.1 indexer")
 
 
+@pytest.mark.parametrize(
+    ("width", "expected"),
+    [(32768, 256), (131072, 64), (1048576, 8)],
+)
+def test_gluon_index_topk_query_tile_bounds_logits(width, expected):
+    assert gluon_indexer._score_query_tile(256, width) == expected
+    assert expected * width * torch.float32.itemsize <= 32 << 20
+
+
 @pytest.fixture
 def device():
     if not torch.cuda.is_available():
@@ -99,7 +109,11 @@ def tp_group():
 
 @pytest.mark.parametrize("shards", [1, 4], ids=["local", "tp4"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_index_scan_graph_oracle_gluon(device, shards, dtype, tp_group, require):
+def test_index_scan_graph_oracle_gluon(
+    device, shards, dtype, tp_group, require, monkeypatch
+):
+    # Force multiple score-query tiles so graph replay covers the bounded path.
+    monkeypatch.setattr(gluon_indexer, "_LOGITS_BUDGET_BYTES", 256)
     run_index_scan_graph_oracle(
         device, shards, dtype, tp_group, require, "gluon", rtol=0.1, atol=0.1
     )
@@ -114,6 +128,53 @@ def test_index_topk_full_and_reindex_gluon(
     run_index_topk_full_and_reindex(
         device, "gluon", heads, candidate_topk, topk, require, match_triton=False
     )
+
+
+def test_index_topk_gluon_full_above_32k(device, require, monkeypatch):
+    from tokenspeed_kernel.ops.attention.dsv41 import triton as implementation
+
+    require("attention", "dsv41_index_topk", "gluon", torch.bfloat16, "x")
+    pages = 513
+    rows = pages * 64
+    q = torch.ones((1, 1, 128), dtype=torch.bfloat16, device=device)
+    weights = torch.ones((1, 1), dtype=torch.bfloat16, device=device)
+    keys = torch.zeros((rows, 128), dtype=torch.bfloat16, device=device)
+    keys[-8:] = 1
+    cache = torch.zeros((pages, 64, 68), dtype=torch.uint8, device=device)
+    dsv41.cache_scatter(keys, cache, torch.arange(rows, device=device), "index")
+    table = torch.arange(pages, dtype=torch.int32, device=device)[None]
+    visible = torch.tensor([rows], dtype=torch.int32, device=device)
+
+    def unexpected_fallback(*args, **kwargs):
+        raise AssertionError("long Full unexpectedly used portable Triton")
+
+    monkeypatch.setattr(implementation, "index_topk", unexpected_fallback)
+    selected, lengths, blocks, block_lengths = dsv41.index_topk(
+        q,
+        weights,
+        cache,
+        table,
+        visible,
+        None,
+        8,
+        0,
+        8,
+        256,
+        256,
+        None,
+        None,
+        solution="gluon",
+    )
+
+    torch.testing.assert_close(
+        selected.cpu(),
+        torch.arange(rows - 8, rows, dtype=torch.int32)[None],
+        rtol=0,
+        atol=0,
+    )
+    assert lengths.item() == 8
+    assert blocks.shape == (1, 0)
+    assert block_lengths.item() == 0
 
 
 def test_index_topk_large_head_count_auto_fallback(device, require):

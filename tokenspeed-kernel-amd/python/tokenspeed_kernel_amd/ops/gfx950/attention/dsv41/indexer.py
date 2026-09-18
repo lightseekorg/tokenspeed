@@ -21,7 +21,8 @@
 """GFX950 DeepSeek V4.1 CSA2 indexer.
 
 Scores page-planar MXFP4 index-K with the V4 ``mfma_scaled`` e2m1 tile.
-The tokenspeed-kernel adapter owns query packing, selection, and fallbacks.
+The tokenspeed-kernel adapter owns query packing, bounded query tiling, and
+selection.
 """
 
 from __future__ import annotations

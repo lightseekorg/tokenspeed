@@ -22,7 +22,7 @@
 
 Wave32 WMMA port of the GFX950 CSA2 scorer. MXFP4 index-K is dequantized to
 BF16; 32 padded heads score a 32-wide history tile. The tokenspeed-kernel
-adapter owns query preparation, selection, and fallbacks.
+adapter owns query preparation, bounded query tiling, and selection.
 """
 
 from __future__ import annotations
