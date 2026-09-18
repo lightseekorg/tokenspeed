@@ -180,6 +180,9 @@ class ModelExecutorConfig:
     disable_cuda_graph_padding: bool
     max_cudagraph_capture_size: int
     model_is_mrope: bool
+    # The prefill role of a disaggregated deployment computes prompts only:
+    # it never runs a decode/verify step of its own.
+    prefill_only: bool
     enable_nan_detection: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
@@ -287,6 +290,7 @@ class ModelExecutorConfig:
             prefill_graph_max_tokens=_resolve_prefill_graph_max_tokens(server_args),
             prefill_graph_capture_sizes=server_args.prefill_graph_capture_sizes,
             model_is_mrope=model_is_mrope,
+            prefill_only=server_args.disaggregation_mode == "prefill",
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
             world_group=server_args.mapping.world_group,
@@ -497,10 +501,10 @@ class ModelExecutor:
             decode_graph_supported=graph_support.decode_graph,
         )
         # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
-        # PP forbids attention DP and executes prefill only. Its stage peers
-        # initialize lazy collectives together on their first real prefill;
-        # a DECODE dummy would require state-verify scratch P never allocates.
-        if config.enforce_eager and config.pp_size == 1:
+        # The prefill role never decodes: a DECODE-shaped dummy would need the
+        # verify scratch it does not allocate, and its ranks initialize lazy
+        # collectives together on their first prefill round instead.
+        if config.enforce_eager and not config.prefill_only:
             logger.info("Prewarming Triton RSAG communication states")
             self.forward_step.prewarm_comm_states(batch_sizes=(1,))
             logger.info("Finished prewarming Triton RSAG communication states")

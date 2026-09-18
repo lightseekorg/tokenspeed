@@ -717,12 +717,12 @@ def _create_hybrid_linear_attn_backend(
     # non-spec hybrid decode doesn't get misclassified as target verify /
     # draft extend by `self.spec_num_tokens > 1`.
     if server_args.speculative_algorithm is not None:
-        if server_args.mapping.has_pp:
-            # PP only executes committed prefill state. A KDA backend starts
-            # allocating replay payloads in set_kv_pool, before explicit
-            # workspace preparation, so its verify width must already be one.
-            # Keep the original target/draft configs intact for logical cache
-            # geometry and other backend views.
+        if server_args.disaggregation_mode == "prefill":
+            # The prefill role only executes committed prefill state. A KDA
+            # backend starts allocating replay payloads in set_kv_pool, before
+            # explicit workspace preparation, so its verify width must already
+            # be one. Keep the original target/draft configs intact for
+            # logical cache geometry and other backend views.
             config = dataclasses.replace(config, speculative_num_draft_tokens=1)
         else:
             config.speculative_num_draft_tokens = (
