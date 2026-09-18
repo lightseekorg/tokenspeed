@@ -110,7 +110,7 @@ class MooncakeKVBootstrapServer(DisaggBootstrapServerBase):
             raise ValueError("CachePD requires explicit stage field placement")
         stages = tuple(tuple(stage) for stage in raw_stages)
         validate_cache_stage_fields(cache_layout, stages)
-        if len(stages) != int(data.get("pp_size", 1)):
+        if len(stages) != int(data["pp_size"]):
             raise ValueError("CachePD placement does not match pipeline stage count")
         if self.prefill_cache_fields_by_stage not in (None, stages):
             raise ValueError(

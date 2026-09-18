@@ -130,11 +130,8 @@ def _calc(kv_mgr, prefill_parallel_info: PrefillParallelInfo) -> ReceiverRoutePl
         raise RuntimeError(
             "Cache-transfer decode connected to a non-cache-transfer prefill"
         )
-    if (
-        len(prefill_parallel_info.cache_fields_by_stage)
-        != prefill_parallel_info.pp_size
-    ):
-        raise ValueError("CachePD placement does not match the prefill stage count")
+    # The bootstrap server validated the placement against the stage count
+    # when the prefill registered it; this side only consumes it.
     transfer_plan, dummy_ranks = build_pipeline_transfer_plan(
         prefill_tp_size=prefill_parallel_info.prefill_tp_size_per_dp_rank,
         decode_tp_size=kv_mgr.topology.tp_size,
