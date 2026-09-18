@@ -116,15 +116,12 @@ class CacheTransferPlanner:
         self.prefill_tp_size = prefill_tp_size
         self.decode_tp_size = decode_tp_size
         all_fields = frozenset(field.field_id for field in prefill_layout.plan.fields)
-        self._field_ids = None if prefill_field_ids == all_fields else prefill_field_ids
-        validate_cache_peer_layout(prefill_layout, decode_layout)
-
-        if prefill_field_ids is not None and not prefill_field_ids.issubset(
-            {field.field_id for field in prefill_layout.plan.fields}
-        ):
+        if prefill_field_ids is not None and not prefill_field_ids <= all_fields:
             raise UnsupportedPDLayoutError(
                 "stage placement contains unknown cache fields"
             )
+        self._field_ids = None if prefill_field_ids == all_fields else prefill_field_ids
+        validate_cache_peer_layout(prefill_layout, decode_layout)
 
         self._partitions = {
             field.field_id: prefill_layout.transfer_schema.partition_for(field.field_id)
