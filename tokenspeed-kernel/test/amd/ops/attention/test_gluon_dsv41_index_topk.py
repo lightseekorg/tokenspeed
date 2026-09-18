@@ -211,6 +211,74 @@ def test_indexer_launch_metadata(arch, dtype, width, metric, kernel_name):
     assert getattr(module, kernel_name).launch_metadata is module._index_launch_metadata
 
 
+@pytest.mark.parametrize(
+    ("arch", "entry_name", "kernel_name"),
+    [
+        ("gfx950", "dsv41_index_logits_gfx950", "_dsv41_mxfp4_logits_kernel"),
+        ("gfx1250", "dsv41_index_logits_gfx1250", "_dsv41_wmma_logits_kernel"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("requested_chunk", "score_chunk", "hardware_chunk"),
+    [(8, 8, 32), (64, 64, 64), (512, 256, 256)],
+)
+def test_indexer_score_chunk_bound(
+    monkeypatch,
+    arch,
+    entry_name,
+    kernel_name,
+    requested_chunk,
+    score_chunk,
+    hardware_chunk,
+):
+    module = importlib.import_module(
+        f"tokenspeed_kernel_amd.ops.{arch}.attention.dsv41.indexer"
+    )
+    launches = []
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append((grid, kwargs["SCORE_CHUNK"], kwargs["CHUNK_N"]))
+
+            return launch
+
+    monkeypatch.setattr(module, kernel_name, FakeKernel())
+    tokens, width = 2, 257
+    weights = torch.empty((tokens, 32), dtype=torch.float32)
+    cache = torch.empty((5, 64 * 68), dtype=torch.uint8)
+    table = torch.empty((tokens, 5), dtype=torch.int32)
+    visible = torch.empty((tokens,), dtype=torch.int32)
+    logits = torch.empty((tokens, width), dtype=torch.float32)
+    args = (
+        (
+            torch.empty((tokens, 32, 64), dtype=torch.uint8),
+            torch.empty((tokens, 32), dtype=torch.int32),
+            weights,
+        )
+        if arch == "gfx950"
+        else (torch.empty((tokens, 32, 128), dtype=torch.bfloat16), weights)
+    )
+
+    getattr(module, entry_name)(
+        *args,
+        cache,
+        table,
+        visible,
+        None,
+        logits,
+        requested_chunk,
+    )
+
+    assert launches == [
+        (
+            (tokens, (width + score_chunk - 1) // score_chunk),
+            score_chunk,
+            hardware_chunk,
+        )
+    ]
+
+
 @pytest.mark.parametrize("solution", ["triton", "gluon"])
 @pytest.mark.parametrize("missing_page", [-1, 3])
 def test_index_topk_missing_latest_page(device, require, solution, missing_page):
@@ -326,7 +394,9 @@ def test_index_topk_preserves_arena_page_stride(
     launch = getattr(gluon_backend, name)
     calls = []
 
-    def check_page_view(q, w, cache_2d, table, visible, candidates, logits):
+    def check_page_view(
+        q, w, cache_2d, table, visible, candidates, logits, score_chunk_size
+    ):
         assert cache_2d.stride(1) == 1
         if byte_stride == 1:
             assert cache_2d.data_ptr() == cache.data_ptr()
@@ -334,12 +404,21 @@ def test_index_topk_preserves_arena_page_stride(
         else:
             assert cache_2d.is_contiguous()
             assert cache_2d.data_ptr() != cache.data_ptr()
-        calls.append(cache_2d.shape)
-        return launch(q, w, cache_2d, table, visible, candidates, logits)
+        calls.append((cache_2d.shape, score_chunk_size))
+        return launch(
+            q,
+            w,
+            cache_2d,
+            table,
+            visible,
+            candidates,
+            logits,
+            score_chunk_size,
+        )
 
     monkeypatch.setattr(gluon_backend, name, check_page_view)
     actual = run(cache)
-    assert calls == [(4, 64 * 68)]
+    assert calls == [((4, 64 * 68), 64)]
     for got, want in zip(actual, expected, strict=True):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
     assert actual[1].item() == (16 if reindex else 256)

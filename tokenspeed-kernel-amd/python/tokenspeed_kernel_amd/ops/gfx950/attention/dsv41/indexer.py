@@ -239,6 +239,7 @@ def _dsv41_mxfp4_logits_kernel(
     PAGE_SIZE: gl.constexpr,
     TABLE_WIDTH: gl.constexpr,
     CANDIDATES: gl.constexpr,
+    SCORE_CHUNK: gl.constexpr,
     BLOCK_N: gl.constexpr,
     CHUNK_N: gl.constexpr,
     NUM_WARPS: gl.constexpr,
@@ -253,8 +254,8 @@ def _dsv41_mxfp4_logits_kernel(
         width = gl.where(vis > 0, CANDIDATES * 8, 0)
     else:
         width = vis
-    candidate_start = split * CHUNK_N
-    candidate_end = gl.minimum(width, candidate_start + CHUNK_N)
+    candidate_start = split * SCORE_CHUNK
+    candidate_end = gl.minimum(width, candidate_start + SCORE_CHUNK)
     candidate_end = gl.minimum(candidate_end, max_candidates)
     if candidate_start >= candidate_end:
         return
@@ -363,19 +364,47 @@ def _dsv41_mxfp4_logits_kernel(
         )
         gl.store(
             logits + token * logits_stride + positions,
-            gl.where(live, scores, -float("inf")),
-            mask=positions < max_candidates,
+            scores,
+            mask=(positions < max_candidates) & live,
         )
 
 
 def dsv41_index_logits_gfx950(
-    values, scales, w, cache_2d, table, visible, candidates, logits
+    values,
+    scales,
+    w,
+    cache_2d,
+    table,
+    visible,
+    candidates,
+    logits,
+    score_chunk_size,
 ):
-    """Score prepared 32-head MXFP4 queries into caller-owned CSA2 logits."""
+    """Score prepared 32-head MXFP4 queries into caller-owned CSA2 logits.
+
+    Args:
+        values: Packed E2M1 query values shaped [T, 32, 64].
+        scales: E8M0 query scales as int32 words shaped [T, 32].
+        w: FP32 head weights shaped [T, 32].
+        cache_2d: Page-planar MXFP4 bytes shaped [pages, 64 * 68].
+        table: Physical page IDs shaped [T, logical_pages].
+        visible: Visible logical row counts shaped [T].
+        candidates: Optional candidate block IDs shaped [T, blocks].
+        logits: FP32 destination shaped [T, scored_rows], initialized to -inf.
+        score_chunk_size: Positive multiple-of-eight upper bound on rows per CTA.
+
+    Returns:
+        None. ``logits`` is mutated in place.
+    """
+    score_chunk_size = int(score_chunk_size)
+    if score_chunk_size < 8 or score_chunk_size % 8:
+        raise ValueError("score_chunk_size must be a positive multiple of 8")
+    score_chunk_size = min(score_chunk_size, _CHUNK_N)
+    chunk_n = triton.cdiv(score_chunk_size, _BLOCK_N) * _BLOCK_N
     queries, width = logits.shape
     cand = table if candidates is None else candidates
     scale_dim = 4
-    _dsv41_mxfp4_logits_kernel[(queries, triton.cdiv(width, _CHUNK_N))](
+    _dsv41_mxfp4_logits_kernel[(queries, triton.cdiv(width, score_chunk_size))](
         values,
         scales.view(torch.uint8).reshape(queries, _MFMA_HEADS, scale_dim),
         w,
@@ -400,8 +429,9 @@ def dsv41_index_logits_gfx950(
         PAGE_SIZE=_PAGE_SIZE,
         TABLE_WIDTH=int(table.shape[1]),
         CANDIDATES=-1 if candidates is None else int(candidates.shape[1]),
+        SCORE_CHUNK=score_chunk_size,
         BLOCK_N=32,
-        CHUNK_N=_CHUNK_N,
+        CHUNK_N=chunk_n,
         NUM_WARPS=2,
         num_warps=2,
         waves_per_eu=2,

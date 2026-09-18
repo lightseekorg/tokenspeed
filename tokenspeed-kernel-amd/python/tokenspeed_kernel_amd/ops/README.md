@@ -77,11 +77,13 @@ heads and the 68-byte MXFP4 index format; sharded heads, wider head counts, and
 page-table capacity without reading device lengths on the host. Its query tile
 shrinks with history width to keep FP32 logits within 32 MiB (at most 256
 queries at 32K rows, 64 at 128K, and 8 at 1M). Reindex scores at most the
-candidate-list capacity. Arena page strides are preserved without copying the
-full cache; a non-unit stride between page bytes is normalized to contiguous
-storage before scoring. Missing or out-of-range cache pages never contribute
-rows or blocks, including the newest visible block. A valid newest block remains
-eligible regardless of its score.
+candidate-list capacity. Score CTAs honor the caller's row-chunk bound up to the
+256-row tuned maximum; masked 32-row hardware tiles cover smaller bounds. Arena
+page strides are preserved without copying the full cache; a non-unit stride
+between page bytes is normalized to contiguous storage before scoring. Missing
+or out-of-range cache pages never contribute rows or blocks, including the
+newest visible block. A valid newest block remains eligible regardless of its
+score.
 
 ## Sampling
 

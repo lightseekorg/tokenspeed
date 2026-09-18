@@ -178,6 +178,7 @@ def _dsv41_wmma_logits_kernel(
     TABLE_WIDTH: gl.constexpr,
     CANDIDATES: gl.constexpr,
     HEAD_DIM: gl.constexpr,
+    SCORE_CHUNK: gl.constexpr,
     BLOCK_N: gl.constexpr,
     CHUNK_N: gl.constexpr,
     NUM_WARPS: gl.constexpr,
@@ -192,8 +193,8 @@ def _dsv41_wmma_logits_kernel(
         width = gl.where(vis > 0, CANDIDATES * 8, 0)
     else:
         width = vis
-    candidate_start = split * CHUNK_N
-    candidate_end = gl.minimum(width, candidate_start + CHUNK_N)
+    candidate_start = split * SCORE_CHUNK
+    candidate_end = gl.minimum(width, candidate_start + SCORE_CHUNK)
     candidate_end = gl.minimum(candidate_end, max_candidates)
     if candidate_start >= candidate_end:
         return
@@ -290,16 +291,44 @@ def _dsv41_wmma_logits_kernel(
         )
         gl.store(
             logits + token * logits_stride + store_pos,
-            gl.where(live, scores, -float("inf")),
-            mask=store_pos < max_candidates,
+            scores,
+            mask=(store_pos < max_candidates) & live,
         )
 
 
-def dsv41_index_logits_gfx1250(q, w, cache_2d, table, visible, candidates, logits):
-    """Score prepared 32-head BF16 queries into caller-owned CSA2 logits."""
+def dsv41_index_logits_gfx1250(
+    q,
+    w,
+    cache_2d,
+    table,
+    visible,
+    candidates,
+    logits,
+    score_chunk_size,
+):
+    """Score prepared 32-head BF16 queries into caller-owned CSA2 logits.
+
+    Args:
+        q: Quantized/dequantized BF16 queries shaped [T, 32, 128].
+        w: FP32 head weights shaped [T, 32].
+        cache_2d: Page-planar MXFP4 bytes shaped [pages, 64 * 68].
+        table: Physical page IDs shaped [T, logical_pages].
+        visible: Visible logical row counts shaped [T].
+        candidates: Optional candidate block IDs shaped [T, blocks].
+        logits: FP32 destination shaped [T, scored_rows], initialized to -inf.
+        score_chunk_size: Positive multiple-of-eight upper bound on rows per CTA.
+
+    Returns:
+        None. ``logits`` is mutated in place.
+    """
+    score_chunk_size = int(score_chunk_size)
+    if score_chunk_size < 8 or score_chunk_size % 8:
+        raise ValueError("score_chunk_size must be a positive multiple of 8")
+    score_chunk_size = min(score_chunk_size, _CHUNK_N)
+    chunk_n = triton.cdiv(score_chunk_size, _BLOCK_N) * _BLOCK_N
     queries, width = logits.shape
     cand = table if candidates is None else candidates
-    _dsv41_wmma_logits_kernel[(queries, triton.cdiv(width, _CHUNK_N))](
+    _dsv41_wmma_logits_kernel[(queries, triton.cdiv(width, score_chunk_size))](
         q,
         w,
         cache_2d,
@@ -321,8 +350,9 @@ def dsv41_index_logits_gfx1250(q, w, cache_2d, table, visible, candidates, logit
         TABLE_WIDTH=int(table.shape[1]),
         CANDIDATES=-1 if candidates is None else int(candidates.shape[1]),
         HEAD_DIM=_HEAD_DIM,
+        SCORE_CHUNK=score_chunk_size,
         BLOCK_N=_BLOCK_N,
-        CHUNK_N=_CHUNK_N,
+        CHUNK_N=chunk_n,
         NUM_WARPS=_NUM_WARPS,
         num_warps=_NUM_WARPS,
     )

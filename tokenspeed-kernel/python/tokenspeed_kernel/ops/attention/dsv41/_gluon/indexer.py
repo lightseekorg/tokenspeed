@@ -206,6 +206,7 @@ def run_dsv41_csa2_index_topk(
                 tile_visible,
                 tile_candidates,
                 logits,
+                score_chunk_size,
             )
             values_topk, columns = logits.topk(
                 min(int(topk), width), dim=1, sorted=False
@@ -249,21 +250,42 @@ def run_dsv41_csa2_index_topk(
     return out
 
 
-def launch_gfx950_logits(q, w, cache_2d, table, visible, candidates, logits):
+def launch_gfx950_logits(
+    q, w, cache_2d, table, visible, candidates, logits, score_chunk_size
+):
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import (
         dsv41_index_logits_gfx950,
     )
 
     values, scales, w = _pack_index_q(q, w)
     dsv41_index_logits_gfx950(
-        values, scales, w, cache_2d, table, visible, candidates, logits
+        values,
+        scales,
+        w,
+        cache_2d,
+        table,
+        visible,
+        candidates,
+        logits,
+        score_chunk_size,
     )
 
 
-def launch_gfx1250_logits(q, w, cache_2d, table, visible, candidates, logits):
+def launch_gfx1250_logits(
+    q, w, cache_2d, table, visible, candidates, logits, score_chunk_size
+):
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41 import (
         dsv41_index_logits_gfx1250,
     )
 
     q, w = _pad_query(q, w)
-    dsv41_index_logits_gfx1250(q, w, cache_2d, table, visible, candidates, logits)
+    dsv41_index_logits_gfx1250(
+        q,
+        w,
+        cache_2d,
+        table,
+        visible,
+        candidates,
+        logits,
+        score_chunk_size,
+    )

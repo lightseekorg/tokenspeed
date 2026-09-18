@@ -72,7 +72,7 @@ def _oracle(q, weights, keys, shards):
     return scores.to(weights.dtype).float()
 
 
-def _check(ids, lengths, scores, rtol=0, atol=0):
+def _check(ids, lengths, scores, rtol, atol):
     assert ids.dtype == lengths.dtype == torch.int32
     for selected, length, score in zip(ids.cpu(), lengths.cpu(), scores, strict=True):
         n = min(selected.numel(), int((score > -torch.inf).sum()))
