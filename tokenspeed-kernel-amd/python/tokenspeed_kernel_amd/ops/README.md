@@ -72,16 +72,15 @@ and estimated tensor traffic without reading device-resident sequence lengths.
 
 The `tokenspeed-kernel` adapter owns query preparation, tensor-parallel head
 gathering, validation, and sorted row/block selection. Automatic dispatch uses
-the portable implementation above 32 gathered heads. Full selection also uses
-the portable implementation whenever the configured page-table capacity exceeds
-32768 rows, even if the visible history is shorter. This keeps scratch bounded
-without synchronizing device lengths to the host during graph capture or replay.
-Reindex uses candidate-list capacity, so it can use Gluon with a wide page table.
-Query tiles cap at 256 rows to bound the score workspace. Arena page strides are
-preserved without copying the full cache; a non-unit stride between page bytes
-is normalized to contiguous storage before scoring. Missing or out-of-range
-cache pages never contribute rows or blocks, including the newest visible
-block. A valid newest block remains eligible regardless of its score.
+the portable implementation above 32 gathered heads. Full selection scores the
+configured page-table capacity without reading device lengths on the host. Its
+query tile shrinks with history width to keep FP32 logits within 32 MiB (at most
+256 queries at 32K rows, 64 at 128K, and 8 at 1M). Reindex scores at most the
+candidate-list capacity. Arena page strides are preserved without copying the
+full cache; a non-unit stride between page bytes is normalized to contiguous
+storage before scoring. Missing or out-of-range cache pages never contribute
+rows or blocks, including the newest visible block. A valid newest block remains
+eligible regardless of its score.
 
 ## Sampling
 
