@@ -21,6 +21,7 @@
 """NVFP4 MegaMoE SiTU correctness at K3 geometry, including EP and graph replay.
 
 Run directly with torchrun; WORLD_SIZE=16 uses all 896 K3 experts.
+Pass --autotune to sweep all tactics before checking eager and graph results.
 """
 
 from __future__ import annotations
@@ -28,13 +29,22 @@ from __future__ import annotations
 import argparse
 import os
 import tempfile
+from contextlib import nullcontext
 from datetime import timedelta
+from unittest.mock import patch
 
 import pytest
 import torch
 import torch.distributed as dist
+from flashinfer.autotuner import AutoTuner
 from tokenspeed_kernel import moe_apply, moe_plan, moe_process_weights
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
+from tokenspeed_kernel.ops.tuning import (
+    autotune,
+    get_autotune_max_num_tokens,
+    set_autotune_max_num_tokens,
+    set_autotune_process_group,
+)
 
 HIDDEN = 3584
 INTERMEDIATE = 192
@@ -199,7 +209,7 @@ def _check(output, expected, label):
     assert error < 0.005, (label, error.item())
 
 
-def run_correctness(capacity: int, live_tokens: int):
+def run_correctness(capacity: int, live_tokens: int, tune: bool):
     torch.manual_seed(713 + dist.get_rank())
     plan = moe_plan(
         "nvfp4",
@@ -242,10 +252,33 @@ def run_correctness(capacity: int, live_tokens: int):
 
     expected = _reference(x, ids, weights, ref, capacity)
     print(f"rank={dist.get_rank()} launching eager", flush=True)
-    with torch.inference_mode():
+    guard = (
+        nullcontext()
+        if tune
+        else patch.object(
+            AutoTuner.get(),
+            "choose_one",
+            side_effect=AssertionError("MegaMoE tuning requires explicit opt-in"),
+        )
+    )
+    with guard, autotune(), torch.inference_mode():
         output = run()
     torch.cuda.synchronize()
     _check(output, expected, "eager")
+    if tune:
+        tuner = AutoTuner.get()
+        tactics = {
+            key.nearest_profile: value[0]
+            for key, value in tuner.profiling_cache.items()
+            if key.custom_op == "trtllm_nvfp4_mega_moe"
+        }
+        assert len(tactics) == (capacity - 1).bit_length() + 1
+        assert not tuner.stats.failed_tactics.get(
+            "trtllm_nvfp4_mega_moe::MegaMoERunner"
+        )
+        all_tactics = [None] * dist.get_world_size()
+        dist.all_gather_object(all_tactics, tactics)
+        assert all(t == tactics for t in all_tactics)
     run()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -260,22 +293,73 @@ def run_correctness(capacity: int, live_tokens: int):
         graph.replay()
     torch.cuda.synchronize()
     _check(captured, expected, "graph replay")
+    first_graph = (graph, captured, expected, x, ids, weights)
     tokens = 0 if dist.get_rank() == 0 and dist.get_world_size() > 1 else 1
     x, ids, weights = _inputs(tokens, w.num_experts)
     expected = _reference(x, ids, weights, ref, capacity)
-    output = run()
+    if tune:
+        with patch.object(
+            tuner, "_profile_single_kernel", wraps=tuner._profile_single_kernel
+        ) as profile:
+            with autotune():
+                output = run()
+            profile.assert_not_called()
+    else:
+        output = run()
     torch.cuda.synchronize()
     _check(output, expected, "uneven/idle rank")
+
+    from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.runner import get_runner
+
+    runner = get_runner(
+        dist.group.WORLD, w.num_experts, HIDDEN, INTERMEDIATE, TOP_K, 4.0, 25.0
+    )
+    arena = runner.workspace
+    pointers = (
+        arena.storage.data_ptr(),
+        arena.local.data_ptr(),
+        arena.output.data_ptr(),
+    )
+    maximum = get_autotune_max_num_tokens()
+    capacity = capacity // 2 if capacity == maximum else min(maximum, capacity * 2)
+    tokens = min(capacity, live_tokens + 1)
+    tokens = tokens if dist.get_rank() == 0 else max(1, tokens - 2)
+    x, ids, weights = _inputs(tokens, w.num_experts)
+    expected = _reference(x, ids, weights, ref, capacity)
+    _check(run(), expected, "alternate capacity eager")
+    other_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(other_graph):
+        other_output = run()
+    second_graph = (other_graph, other_output, expected, x, ids, weights)
+    outputs = []
+    # Replay different capacities back-to-back on the same arena, without host resets.
+    for saved in (first_graph, second_graph, first_graph, second_graph):
+        saved[0].replay()
+        outputs.append((saved[1].clone(), saved[2]))
+    torch.cuda.synchronize()
+    for actual, expected in outputs:
+        _check(actual, expected, "alternating captured capacities")
+    assert arena is runner.workspace
+    assert pointers == (
+        arena.storage.data_ptr(),
+        arena.local.data_ptr(),
+        arena.output.data_ptr(),
+    )
     dist.barrier()
     if dist.get_rank() == 0:
         print(
-            "PASS NVFP4 SiTU MegaMoE eager, graph replay, and uneven/idle ranks",
+            "PASS NVFP4 SiTU MegaMoE eager, graph replay, idle ranks, and shared-arena capacity switching",
             flush=True,
         )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_nvfp4_situ_megamoe():
+@pytest.mark.parametrize("tune", [False, True])
+def test_nvfp4_situ_megamoe(tune, monkeypatch):
+    if tune:
+        monkeypatch.setenv("MEGAMOE_TACTIC_AUTOTUNE", "1")
+    else:
+        monkeypatch.delenv("MEGAMOE_TACTIC_AUTOTUNE", raising=False)
     if not (10, 0) <= torch.cuda.get_device_capability() <= (10, 3):
         pytest.skip("requires SM100/SM103")
     with tempfile.TemporaryDirectory() as tmp:
@@ -288,8 +372,23 @@ def test_nvfp4_situ_megamoe():
             device_id=torch.cuda.current_device(),
         )
         try:
-            run_correctness(4, 4)
+            from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.runner import (
+                MegaMoERunner,
+            )
+
+            # Cover both layouts and schedulers; torchrun --autotune uses the full sweep.
+            with patch.object(
+                MegaMoERunner,
+                "TACTICS",
+                (
+                    (128, 512, "static", "epi_warps", 1),
+                    (256, 1024, "atomic_counter", "reuse_dispatch_warps", 8),
+                ),
+            ):
+                set_autotune_process_group(dist.group.WORLD)
+                run_correctness(4, 4, tune)
         finally:
+            set_autotune_process_group(None)
             dist.destroy_process_group()
 
 
@@ -302,7 +401,12 @@ if __name__ == "__main__":
         parser = argparse.ArgumentParser()
         parser.add_argument("--capacity", type=int, default=4)
         parser.add_argument("--tokens", type=int, default=4)
+        parser.add_argument("--autotune", action="store_true")
         args = parser.parse_args()
-        run_correctness(args.capacity, args.tokens)
+        os.environ["MEGAMOE_TACTIC_AUTOTUNE"] = "1" if args.autotune else "0"
+        set_autotune_max_num_tokens(args.capacity)
+        set_autotune_process_group(dist.new_group(backend="gloo"))
+        run_correctness(args.capacity, args.tokens, args.autotune)
     finally:
+        set_autotune_process_group(None)
         dist.destroy_process_group()

@@ -113,6 +113,15 @@ def trtllm_nvfp4_mega_moe_apply(
 ) -> torch.Tensor:
     """Dispatch NVFP4 tokens, run SiTU experts, and combine on the source ranks.
 
+    Uses the upstream heuristic by default. Set MEGAMOE_TACTIC_AUTOTUNE=1
+    identically on every EP rank before startup to participate in FlashInfer's
+    autotuning context and reuse tuned tactics across compatible layers.
+    Graph timing includes input staging. One buffer set sized by the configured
+    autotuning maximum backs all token views and tactics, with fixed scratch
+    offsets so captured calls can alternate sizes without host-side resets.
+    Outside tuning, cache misses use the heuristic tactic. Tune and warm up
+    before CUDA graph capture; all EP ranks must enter with identical caches.
+
     Args:
         plan: Selected NVFP4 MoE plan containing the EP process group.
         x: Packed E2M1 activations and linear E4M3 block scales.
@@ -121,27 +130,26 @@ def trtllm_nvfp4_mega_moe_apply(
         topk_weights: Final routing weights, including the model routing scale.
         topk_ids: Global expert indices for local tokens.
         num_tokens_global: Global token capacity for this collective step.
-        max_num_tokens_per_gpu: Rank-identical per-rank workspace capacity.
+        max_num_tokens_per_gpu: Rank-identical local token bound for this call.
         do_finalize: Must be true; this operation owns the complete routed result.
         enable_pdl: Reserved; the vendored kernel controls its own launch ordering.
 
     Returns:
         Local BF16 routed output, valid until the next use of the shared workspace.
     """
-    from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.runner import get_workspace
+    from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.runner import get_runner
 
     del router_logits, num_tokens_global, enable_pdl
     if not do_finalize or not isinstance(x, tuple):
         raise ValueError(
             "MegaMoE requires prequantized inputs and complete finalization"
         )
-    workspace = get_workspace(
+    runner = get_runner(
         plan["process_group"],
         w.num_experts,
         w.hidden_size,
         w.intermediate_size,
         w.top_k,
-        max_num_tokens_per_gpu,
         w.activation_situ_beta,
         w.activation_situ_linear_beta,
     )
@@ -154,4 +162,4 @@ def trtllm_nvfp4_mega_moe_apply(
         w.mega_fc2_alpha,
         w.mega_fc1_norm,
     )
-    return workspace.run(x, topk_ids, topk_weights, weights)
+    return runner.run(x, topk_ids, topk_weights, weights, max_num_tokens_per_gpu)
