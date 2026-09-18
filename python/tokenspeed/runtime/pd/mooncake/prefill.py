@@ -1148,16 +1148,12 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
 
         bootstrap_server_url = f"{ip_address}:{self.bootstrap_port}"
         url = f"http://{bootstrap_server_url}/route"
-        pp_layer_partition = getattr(self.topology, "pp_layer_partition", None)
         payload = {
             "role": "Prefill",
             "world_size": self.topology.world_size,
             "dp_size": self.topology.dp_size,
             "pp_size": self.topology.pp_size,
             "cache_fields_by_stage": self.kv_args.cache_fields_by_stage,
-            "pp_layer_partition": (
-                list(pp_layer_partition) if pp_layer_partition else None
-            ),
             "rank_ip": get_local_ip_by_remote(),
             "rank_port": self.rank_port,
             "engine_rank": self.topology.global_rank,
