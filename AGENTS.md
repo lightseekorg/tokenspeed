@@ -29,6 +29,9 @@ best people and average people is more than tenfold.
 * Wrappers must preserve explicitly supplied arguments and must not silently
   discard unsupported arguments.
 * Use absolute imports instead of relative imports.
+* Use f-strings for Python string interpolation, including logging messages.
+  Keep format templates required by APIs such as `strftime` and logging
+  formatters in their required syntax.
 * Use the repository's full MIT license header for copyright notices; do not use
   an abbreviated copyright-only header.
 * Before creating commits, run `pre-commit run --all-files` to format.

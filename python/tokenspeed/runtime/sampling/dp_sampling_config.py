@@ -220,17 +220,11 @@ def setup_dp_sampling(
         sampling_backend.configure_dp_sampling(runtime)
         processor.configure_dp_logits_layout(runtime)
     logger.info(
-        "Batch-DP spec-verify: requested=%s, infra_supports=%s, enabled=%s "
-        "min_bs=%s (drafter=%s, backend_supports_dp=%s, "
-        "tp_size=%s, tp_group=%s)",
-        support.requested,
-        support.infra_supports,
-        support.enabled,
-        runtime.min_bs,
-        support.drafter_available,
-        support.backend_supports_verify,
-        support.tp_size,
-        support.tp_group_set,
+        f"Batch-DP spec-verify: requested={support.requested!s}, infra_supports="
+        f"{support.infra_supports!s}, enabled={support.enabled!s} "
+        f"min_bs={runtime.min_bs!s} (drafter={support.drafter_available!s}, "
+        f"backend_supports_dp={support.backend_supports_verify!s}, "
+        f"tp_size={support.tp_size!s}, tp_group={support.tp_group_set!s})",
     )
     return runtime
 

@@ -166,7 +166,7 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
                                     )
                         else:
                             logger.info(
-                                "Attempting to reconnect to %s...", bootstrap_addr
+                                f"Attempting to reconnect to {bootstrap_addr!s}...",
                             )
                             self.heartbeat_failures[bootstrap_addr] = (
                                 self.heartbeat_failures.get(bootstrap_addr, 0) + 1
@@ -175,7 +175,7 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
                                 if bootstrap_addr in self.session_pool:
                                     del self.session_pool[bootstrap_addr]
                     except Exception:
-                        logger.info("Attempting to reconnect to %s...", bootstrap_addr)
+                        logger.info(f"Attempting to reconnect to {bootstrap_addr!s}...")
                         self.heartbeat_failures[bootstrap_addr] = (
                             self.heartbeat_failures.get(bootstrap_addr, 0) + 1
                         )
@@ -318,7 +318,6 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
                 self.update_status(room, TransferPoll.Failed)
                 affected_rooms.append(room)
         logger.error(
-            "Losing connection with prefill instance (bootstrap_addr: %s), affected %s requests",
-            failed_bootstrap_addr,
-            len(affected_rooms),
+            "Losing connection with prefill instance (bootstrap_addr: "
+            f"{failed_bootstrap_addr!s}), affected {len(affected_rooms)!s} requests",
         )

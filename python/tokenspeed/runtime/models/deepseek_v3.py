@@ -1725,7 +1725,7 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
         if name.endswith(_OPTIONAL_MISSING_WEIGHT_SUFFIXES):
             return None
 
-        logger.warning("The %s is not in the model.", name)
+        logger.warning(f"The {name!s} is not in the model.")
         return None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
@@ -1955,7 +1955,7 @@ def _draft_rope_scaling(rope_scaling: dict | None) -> dict | None:
         return rope_scaling
     if "factor" in rope_scaling:
         logger.warning(
-            "EAGLE3 MLA draft ignores unsupported rope_scaling %s", rope_scaling
+            f"EAGLE3 MLA draft ignores unsupported rope_scaling {rope_scaling!s}",
         )
     return None
 
@@ -2411,8 +2411,8 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
             )
         else:
             logger.info(
-                "EAGLE3 draft keeps its own embedding; target shape %s differs",
-                tuple(embed.shape),
+                "EAGLE3 draft keeps its own embedding; target shape "
+                f"{tuple(embed.shape)!s} differs",
             )
         if head is not None and self.load_lm_head_from_target:
             del self.lm_head.weight

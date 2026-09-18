@@ -113,8 +113,7 @@ class ModelRunner:
                     server_args.kv_cache_dtype = "fp8_e4m3"
                     logger.info(
                         "Auto-detected kv_cache_dtype=fp8_e4m3 from checkpoint "
-                        "quant config (kv_cache_quant_algo=%s)",
-                        kv_algo,
+                        f"quant config (kv_cache_quant_algo={kv_algo!s})",
                     )
 
         global_server_args_dict_update(server_args)
@@ -159,8 +158,8 @@ class ModelRunner:
         )
         if self.encoder_graph_wrappers:
             logger.info(
-                "Multimodal encoder CUDA graphs installed for %s",
-                sorted(self.encoder_graph_wrappers),
+                "Multimodal encoder CUDA graphs installed for "
+                f"{sorted(self.encoder_graph_wrappers)!s}",
             )
 
         warmup_device = torch.device(self.device)
@@ -293,11 +292,8 @@ class ModelRunner:
             self._weight_update_pg = pg
             self._weight_update_device = device
             logger.info(
-                "weight-update group joined: rank=%d world_size=%d device=%s group=%s",
-                rank,
-                world_size,
-                device,
-                group_name,
+                f"weight-update group joined: rank={rank:d} world_size={world_size:d} "
+                f"device={device!s} group={group_name!s}",
             )
             return True, "weight update group initialized"
         except Exception as e:  # noqa: BLE001 - surface to the control plane

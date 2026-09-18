@@ -743,11 +743,11 @@ def build_device_side(
         )
         if aligned != server_args.chunked_prefill_size:
             logger.warning(
-                "chunked_prefill_size=%s is not a multiple of the "
-                "state-snapshot checkpoint grain; using %s so recurrent-state "
+                f"chunked_prefill_size={server_args.chunked_prefill_size!s} is not a "
+                "multiple of the "
+                f"state-snapshot checkpoint grain; using {aligned!s} so recurrent-state"
+                " "
                 "pages can register for prefix-cache reuse.",
-                server_args.chunked_prefill_size,
-                aligned,
             )
             server_args.chunked_prefill_size = aligned
 

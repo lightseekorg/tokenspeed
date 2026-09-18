@@ -327,24 +327,17 @@ class EventLoop:
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
         )
         logger.info(
-            "Scheduler config: prefix_granularity=%s num_device_pages=%s "
-            "max_scheduled_tokens=%s decode_input_tokens=%s "
-            "overlap_schedule_depth=%s disable_l2_cache=%s "
-            "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
-            "disable_prefix_cache=%s prefix_replay_tokens=%s "
-            "cache_groups=%s",
-            scheduler_cfg.prefix_granularity,
-            scheduler_cfg.num_device_pages,
-            scheduler_cfg.max_scheduled_tokens,
-            scheduler_cfg.decode_input_tokens,
-            scheduler_cfg.overlap_schedule_depth,
-            scheduler_cfg.disable_l2_cache,
-            scheduler_cfg.max_batch_size,
-            server_args.max_num_seqs,
-            self.dp_size,
-            scheduler_cfg.disable_prefix_cache,
-            scheduler_cfg.prefix_replay_tokens,
-            [group.group_id for group in cache_groups],
+            f"Scheduler config: prefix_granularity={scheduler_cfg.prefix_granularity!s}"
+            f" num_device_pages={scheduler_cfg.num_device_pages!s} "
+            f"max_scheduled_tokens={scheduler_cfg.max_scheduled_tokens!s} "
+            f"decode_input_tokens={scheduler_cfg.decode_input_tokens!s} "
+            f"overlap_schedule_depth={scheduler_cfg.overlap_schedule_depth!s} "
+            f"disable_l2_cache={scheduler_cfg.disable_l2_cache!s} "
+            f"max_batch_size={scheduler_cfg.max_batch_size!s} (global max_num_seqs="
+            f"{server_args.max_num_seqs!s}, dp_size={self.dp_size!s}) "
+            f"disable_prefix_cache={scheduler_cfg.disable_prefix_cache!s} "
+            f"prefix_replay_tokens={scheduler_cfg.prefix_replay_tokens!s} "
+            f"cache_groups={[group.group_id for group in cache_groups]!s}",
         )
         self.scheduler = Scheduler(scheduler_cfg)
         # Per-round batch logging lives on the control plane: it reports
@@ -385,11 +378,9 @@ class EventLoop:
                 f"{self.max_single_request_tokens}, reserve={input_reserve}"
             )
         logger.info(
-            "Single-request token limit: cache=%s model=%s effective=%s max_input=%s",
-            self.max_single_request_tokens,
-            self.model_config.context_len,
-            self.max_model_len,
-            self.max_req_input_len,
+            f"Single-request token limit: cache={self.max_single_request_tokens!s} "
+            f"model={self.model_config.context_len!s} effective={self.max_model_len!s} "
+            f"max_input={self.max_req_input_len!s}",
         )
         if attn_tp_rank == 0:
             self.kv_event_publisher = EventPublisherFactory.create(
@@ -1186,7 +1177,7 @@ def run_event_loop(
     # processes may be spawned without inheriting the launcher's setting.
     if envs.NVSHMEM_IB_TRAFFIC_CLASS.is_set():
         envs.NVSHMEM_IB_TRAFFIC_CLASS.set(envs.NVSHMEM_IB_TRAFFIC_CLASS.get())
-        logger.info("NVSHMEM_IB_TRAFFIC_CLASS=%d", envs.NVSHMEM_IB_TRAFFIC_CLASS.get())
+        logger.info(f"NVSHMEM_IB_TRAFFIC_CLASS={envs.NVSHMEM_IB_TRAFFIC_CLASS.get():d}")
     faulthandler.enable()
     parent_process = psutil.Process().parent()
     register_usr_signal()
@@ -1256,18 +1247,15 @@ def run_event_loop(
 
     except Exception:  # noqa: BLE001 - process boundary; report and signal parent
         traceback = get_exception_traceback()
-        logger.error("Scheduler hit an exception: %s", traceback)
+        logger.error(f"Scheduler hit an exception: {traceback!s}")
         parent_process.send_signal(signal.SIGUSR1)
     finally:
         # SystemExit/KeyboardInterrupt bypass the Exception handler above;
         # report their traceback without swallowing or changing the exit status.
         exception_info = sys.exc_info()
         logger.warning(
-            "Scheduler exiting: rank=%d pid=%d shutdown_requested=%s signal=%s",
-            global_rank,
-            os.getpid(),
-            shutdown_event.is_set(),
-            received_signal,
+            f"Scheduler exiting: rank={global_rank:d} pid={os.getpid():d} "
+            f"shutdown_requested={shutdown_event.is_set()!s} signal={received_signal!s}",
             exc_info=exception_info if exception_info[0] is not None else None,
         )
         if event_loop is not None:
@@ -1275,8 +1263,8 @@ def run_event_loop(
                 event_loop.close()
             except Exception:  # noqa: BLE001 - best-effort teardown; signal parent
                 logger.error(
-                    "Scheduler transport shutdown failed: %s",
-                    get_exception_traceback(),
+                    "Scheduler transport shutdown failed: "
+                    f"{get_exception_traceback()!s}",
                 )
                 parent_process.send_signal(signal.SIGUSR1)
         if (

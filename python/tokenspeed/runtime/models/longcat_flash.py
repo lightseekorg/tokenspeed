@@ -717,7 +717,7 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
             return None
         if name.endswith(_LONGCAT_OPTIONAL_MISSING_WEIGHT_SUFFIXES):
             return None
-        _longcat_logger.warning("The %s is not in the model.", name)
+        _longcat_logger.warning(f"The {name!s} is not in the model.")
         return None
 
     def load_weights(self, weights: _Iterable[tuple[str, torch.Tensor]]):

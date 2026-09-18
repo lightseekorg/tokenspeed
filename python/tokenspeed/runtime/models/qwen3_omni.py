@@ -432,7 +432,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
                     continue
                 name = self._map_visual_weight(name)
                 if name not in params:
-                    logger.warning("Parameter %s not found in Qwen3-Omni", name)
+                    logger.warning(f"Parameter {name!s} not found in Qwen3-Omni")
                     continue
                 param = params[name]
                 loader = getattr(param, "weight_loader", default_weight_loader)
@@ -445,7 +445,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
                     continue
                 loaded_name = self.audio_tower.load_weight(name, loaded_weight)
                 if loaded_name is None:
-                    logger.warning("Parameter %s not found in Qwen3-Omni", name)
+                    logger.warning(f"Parameter {name!s} not found in Qwen3-Omni")
                 else:
                     loaded.add(f"audio_tower.{loaded_name}")
                 continue
@@ -485,7 +485,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
                 if name.endswith(ignore_suffixes) and name not in params:
                     continue
                 if name not in params:
-                    logger.warning("Parameter %s not found in Qwen3-Omni", name)
+                    logger.warning(f"Parameter {name!s} not found in Qwen3-Omni")
                     continue
                 param = params[name]
                 loader = getattr(param, "weight_loader", default_weight_loader)

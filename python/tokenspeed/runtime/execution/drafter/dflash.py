@@ -752,15 +752,13 @@ class DFlash(BaseDrafter):
 
             logger.info(
                 "DFLASH fused KV materialization enabled. "
-                "n_layers=%d, num_kv_heads=%d, head_dim=%d",
-                n_layers,
-                num_kv_heads,
-                head_dim,
+                f"n_layers={n_layers:d}, num_kv_heads={num_kv_heads:d}, head_dim="
+                f"{head_dim:d}",
             )
         except Exception as e:
             logger.warning(
-                "DFLASH fused KV initialization failed, falling back to sequential: %s",
-                e,
+                "DFLASH fused KV initialization failed, falling back to sequential: "
+                f"{e!s}",
             )
             self._fused_kv_enabled = False
             self._fused_kv_is_mla = False
@@ -777,7 +775,7 @@ class DFlash(BaseDrafter):
         from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 
         def decline(reason: str) -> None:
-            logger.info("DFLASH fused MLA KV write disabled: %s", reason)
+            logger.info(f"DFLASH fused MLA KV write disabled: {reason!s}")
 
         pool = self.token_to_kv_pool
         if not isinstance(pool, MLATokenToKVPool):
@@ -860,11 +858,8 @@ class DFlash(BaseDrafter):
         self._fused_kv_enabled = True
         logger.info(
             "DFLASH fused MLA KV write enabled. "
-            "n_layers=%d, kv_lora_rank=%d, rope_dim=%d, cache_dtype=%s",
-            n_layers,
-            kv_lora_rank,
-            rope_dim,
-            plane.dtype,
+            f"n_layers={n_layers:d}, kv_lora_rank={kv_lora_rank:d}, rope_dim="
+            f"{rope_dim:d}, cache_dtype={plane.dtype!s}",
         )
 
     def _write_native_cache_fused_mla(
@@ -916,10 +911,8 @@ class DFlash(BaseDrafter):
             in_features = fc_weight.shape[1]
             if in_features != n_captures * hidden_size:
                 logger.warning(
-                    "Incremental proj disabled: fc.in_features=%d != n_captures(%d) * hidden(%d)",
-                    in_features,
-                    n_captures,
-                    hidden_size,
+                    f"Incremental proj disabled: fc.in_features={in_features:d} != "
+                    f"n_captures({n_captures:d}) * hidden({hidden_size:d})",
                 )
                 return
 
@@ -946,13 +939,11 @@ class DFlash(BaseDrafter):
             self._incremental_proj_enabled = True
             logger.info(
                 "DFLASH incremental projection enabled. "
-                "n_captures=%d, hidden_size=%d, max_tokens=%d",
-                n_captures,
-                hidden_size,
-                max_tokens,
+                f"n_captures={n_captures:d}, hidden_size={hidden_size:d}, max_tokens="
+                f"{max_tokens:d}",
             )
         except Exception as e:
-            logger.warning("DFLASH incremental projection init failed: %s", e)
+            logger.warning(f"DFLASH incremental projection init failed: {e!s}")
             self._incremental_proj_enabled = False
 
     def _overlap_allowed(self, ctx: ForwardContext) -> bool:

@@ -96,8 +96,8 @@ class DisaggPrefillExecutor:
             sender = self.senders.get(request_id)
             if sender is None:
                 logger.debug(
-                    "[prefill][prepare_prefill] skipping request_id=%s without sender",
-                    request_id,
+                    f"[prefill][prepare_prefill] skipping request_id={request_id!s} "
+                    "without sender",
                 )
                 self._drop_request_state(request_id)
                 continue
@@ -354,13 +354,13 @@ class DisaggPrefillExecutor:
                 and poll == TransferPoll.Bootstrapped
             ):
                 logger.debug(
-                    "[prefill][generate_events] rid=%s -> BootstrappedEvent", req_id
+                    f"[prefill][generate_events] rid={req_id!s} -> BootstrappedEvent",
                 )
                 events.append(PD.BootstrappedEvent(req_id))
                 self._local_states[req_id] = TransferPoll.Bootstrapped
             elif poll == TransferPoll.Failed:
                 logger.warning(
-                    "[prefill][generate_events] rid=%s -> FailedEvent", req_id
+                    f"[prefill][generate_events] rid={req_id!s} -> FailedEvent",
                 )
                 events.append(PD.FailedEvent(req_id))
                 to_remove.append(req_id)
@@ -370,7 +370,7 @@ class DisaggPrefillExecutor:
             ):
                 self._local_states[req_id] = TransferPoll.Success
                 logger.debug(
-                    "[prefill][generate_events] rid=%s -> SucceededEvent", req_id
+                    f"[prefill][generate_events] rid={req_id!s} -> SucceededEvent",
                 )
                 events.append(PD.SucceededEvent(req_id))
                 to_remove.append(req_id)

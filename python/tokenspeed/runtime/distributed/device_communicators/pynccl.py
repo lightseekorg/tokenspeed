@@ -99,7 +99,7 @@ class PyNcclCommunicator:
         self.available = True
         self.disabled = False
 
-        logger.info("Epsilon is using nccl==%s", self.nccl.ncclGetVersion())
+        logger.info(f"Epsilon is using nccl=={self.nccl.ncclGetVersion()!s}")
 
         if self.rank == 0:
             # get the unique id from NCCL

@@ -123,7 +123,7 @@ def _warmup_fp8_gemm_nt(
 
         del a, a_scales, b, b_scales, out
 
-    logger.info("Warmed up fp8_gemm_nt for %d weight shapes", len(seen))
+    logger.info(f"Warmed up fp8_gemm_nt for {len(seen):d} weight shapes")
     torch.cuda.synchronize()
 
 

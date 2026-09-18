@@ -619,8 +619,8 @@ class IrisRSAG(object):
         self._out_buff = self._ctx.empty((max_tokens, hidden_size), dtype=self.dtype)
         free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
         logger.info(
-            "Iris RSAG symmetric-heap buffers allocated: %s GB",
-            free_gpu_memory_begin - free_gpu_memory_after,
+            "Iris RSAG symmetric-heap buffers allocated: "
+            f"{free_gpu_memory_begin - free_gpu_memory_after!s} GB",
         )
 
         assert self._ctx.get_num_ranks() == dist.get_world_size(), (
@@ -1114,8 +1114,8 @@ class IrisAllReduce(object):
         )
         free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
         logger.info(
-            "Iris all-reduce symmetric-heap buffers allocated: %s GB",
-            free_gpu_memory_begin - free_gpu_memory_after,
+            "Iris all-reduce symmetric-heap buffers allocated: "
+            f"{free_gpu_memory_begin - free_gpu_memory_after!s} GB",
         )
 
         self._rank_start = 0
@@ -2912,8 +2912,8 @@ class IrisAllReduceResidualRMSNorm(object):
         self._input_buf = self._ctx.zeros((max_token_num, hidden_dim), dtype=dtype)
         free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
         logger.info(
-            "Iris AR+RMSNorm symmetric-heap buffer allocated: %s GB",
-            free_gpu_memory_begin - free_gpu_memory_after,
+            "Iris AR+RMSNorm symmetric-heap buffer allocated: "
+            f"{free_gpu_memory_begin - free_gpu_memory_after!s} GB",
         )
 
         self._rank_start = 0
