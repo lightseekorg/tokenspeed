@@ -1216,12 +1216,18 @@ def mm(
         and quant in (None, "none")
         and A_scales is None
         and B_scales is None
-        and bias is None
         and out_dtype == torch.bfloat16
         and B.shape[-1] == K
     ):
+        # Row-parallel layers add bias only on rank 0. All ranks must expose
+        # the same bias-free tuning branch for FI's timing collectives, even
+        # when this rank's actual GEMM retains the generic biased path.
         autotune_bf16_gemm(A, B)
-        if M <= BF16_GEMM_MAX_M and flashinfer_joint_bf16_supported(A, B, out):
+        if (
+            bias is None
+            and M <= BF16_GEMM_MAX_M
+            and flashinfer_joint_bf16_supported(A, B, out)
+        ):
             return flashinfer_bf16_gemm(A, B, out)
 
     block_scale_layout = (

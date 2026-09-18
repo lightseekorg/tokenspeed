@@ -781,9 +781,8 @@ def test_mm_joint_dispatch_respects_overrides_and_contract(
     torch.testing.assert_close(
         got, (x @ w.T).to(out_dtype) + (b if b is not None else 0)
     )
-    assert probe.call_count == int(
-        override is None and not bias and out_dtype == torch.bfloat16
-    )
+    # Rank-local bias must not make ranks skip collective tactic profiling.
+    assert probe.call_count == int(override is None and out_dtype == torch.bfloat16)
     assert joint.call_count == int(
         override is None and not bias and out_dtype == torch.bfloat16 and rows <= 32
     )
