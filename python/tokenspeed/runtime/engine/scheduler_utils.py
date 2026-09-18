@@ -365,6 +365,29 @@ def make_update_reserve_tokens_event(request_id: str, new_reserve_num_tokens: in
     return fe
 
 
+def scheduler_pd_lifecycle(scheduler):
+    """Return a query for the PD request lifecycle counts.
+
+    ``(bootstrapping, prefilling, remote_prefilling, decoding, pd_pinned)``
+    -- five state counts over the request table, bound to the scheduler once
+    so the batch logger reads them only when it emits a line.
+
+    Args:
+        scheduler: The engine's C++ scheduler.
+    """
+
+    def lifecycle() -> tuple[int, int, int, int, int]:
+        return (
+            scheduler.bootstrapping_size(),
+            scheduler.prefilling_size(),
+            scheduler.remote_prefilling_size(),
+            scheduler.decoding_size(),
+            scheduler.pd_transfer_size(),
+        )
+
+    return lifecycle
+
+
 def scheduler_cache_group_pages(scheduler):
     """Return a ``group_id -> (total, available)`` page-count query.
 

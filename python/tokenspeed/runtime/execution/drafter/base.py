@@ -78,9 +78,10 @@ class BaseDrafter:
         """Wire this drafter to the loaded target model.
 
         Called once by ``ModelExecutor`` right after the drafter is
-        constructed. Subclasses that read target weights or install capture
-        hooks on the target override this; the default drafter needs nothing
-        from the target.
+        constructed. Subclasses bind execution resources such as target weights
+        and output heads here. Capture configuration belongs to model setup
+        before drafter construction; this method must not change it. The
+        default drafter needs nothing from the target.
 
         Args:
             target_model: The target ``torch.nn.Module`` the drafter

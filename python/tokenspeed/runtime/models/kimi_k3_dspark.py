@@ -30,8 +30,9 @@ concatenated, projected by ``context_proj``, and written into the draft's own
 latent KV cache; the block's queries are one anchor token plus mask tokens, and
 the intra-block token dependence comes entirely from the rank-256 Markov head.
 
-The draft borrows the target's embedding and lm_head, so the checkpoint's
-``embed_tokens`` copy is skipped and no ``lm_head`` is shipped at all.
+The draft shares the target's lm_head. Non-PP serving also borrows its
+embedding; PP's final stage loads the checkpoint's frozen ``embed_tokens``
+copy because the target embedding belongs to the first stage.
 """
 
 from __future__ import annotations
@@ -50,6 +51,7 @@ from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.distributed.pp_stage import pp_layer_window
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.layernorm import RMSNorm
@@ -57,6 +59,7 @@ from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.segmented_rmsnorm import segmented_rmsnorm
+from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
@@ -64,9 +67,26 @@ from tokenspeed.runtime.models.deepseek_v3 import (
 )
 from tokenspeed.runtime.models.dflash import DFlashMLP
 from tokenspeed.runtime.models.dspark import VanillaMarkov
+from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
 
 logger = get_colorful_logger(__name__)
+
+
+def _context_tap_owner_layer(
+    layer_id: int, target_num_layers: int, aux_hidden_stream: str
+) -> int:
+    """Return the layer whose stage can produce a tap without extra weights.
+
+    Prefix taps belong to their completed layer. An AttnRes tap uses the next
+    layer's attention-mixing parameters, so it belongs to that consumer;
+    the final tap uses the last stage's output-mixing parameters.
+    """
+    if aux_hidden_stream == "prefix":
+        return layer_id
+    if aux_hidden_stream == "attn_res":
+        return min(layer_id + 1, target_num_layers - 1)
+    raise ValueError(f"Unknown target hidden stream {aux_hidden_stream!r}")
 
 
 class K3DSparkAttention(DeepseekV3AttentionMLA):
@@ -286,7 +306,7 @@ class K3DSparkDecoderLayer(nn.Module):
         return norm(hidden_states, residual)
 
 
-class K3DSparkModel(nn.Module):
+class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
     """The draft network. Interface-compatible with ``DFlashDraftModel``."""
 
     def __init__(
@@ -306,23 +326,48 @@ class K3DSparkModel(nn.Module):
         hidden_size = int(config.hidden_size)
         eps = float(config.rms_norm_eps)
 
-        self.num_context_features = len(config.target_layer_ids)
-        self.context_proj = ReplicatedLinear(
-            self.num_context_features * int(config.target_hidden_size),
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("context_proj", prefix),
+        if mapping.has_pp and quant_config is not None:
+            raise ValueError("Pipeline DSpark requires an unquantized draft checkpoint")
+        # A PP stage projects only the target taps it can produce. Proposal
+        # layers live on the final stage, using that stage's existing TP groups.
+        self.checkpoint_load_group = mapping.attn.tp_group if mapping.has_pp else None
+        num_target_execution_layers = int(config.target_num_hidden_layers)
+        num_draft_blocks = int(config.num_hidden_layers)
+        self.target_capture_layer_ids = tuple(config.target_layer_ids)
+        start, end = pp_layer_window(num_target_execution_layers, mapping)
+        self.local_tap_indices = tuple(
+            tap_index
+            for tap_index, layer_id in enumerate(self.target_capture_layer_ids)
+            if start
+            <= _context_tap_owner_layer(
+                int(layer_id),
+                num_target_execution_layers,
+                config.aux_hidden_stream,
+            )
+            < end
         )
-        self.context_norm = RMSNorm(hidden_size, eps=eps)
+        self.context_proj = (
+            ReplicatedLinear(
+                len(self.local_tap_indices) * int(config.target_hidden_size),
+                hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("context_proj", prefix),
+            )
+            if self.local_tap_indices
+            else None
+        )
+        self.context_norm = (
+            RMSNorm(hidden_size, eps=eps) if mapping.is_last_pp_rank else None
+        )
         self.fc_norm = (
             nn.ModuleList(
                 [
                     RMSNorm(int(config.target_hidden_size), eps=eps)
-                    for _ in range(self.num_context_features)
+                    for _ in self.local_tap_indices
                 ]
             )
-            if bool(getattr(config, "fc_norm", False))
+            if config.fc_norm and self.local_tap_indices
             else None
         )
         self.register_buffer("_fc_norm_weight", None, persistent=False)
@@ -336,17 +381,65 @@ class K3DSparkModel(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{i}", prefix),
                 )
-                for i in range(int(config.num_hidden_layers))
+                for i in range(num_draft_blocks if mapping.is_last_pp_rank else 0)
             ]
         )
-        self.final_norm = RMSNorm(hidden_size, eps=eps)
-        self.markov_head = VanillaMarkov(
-            vocab_size=int(config.vocab_size),
-            markov_rank=int(config.markov_rank),
+        self.final_norm = (
+            RMSNorm(hidden_size, eps=eps) if mapping.is_last_pp_rank else None
+        )
+        self.markov_head = (
+            VanillaMarkov(
+                vocab_size=int(config.vocab_size),
+                markov_rank=int(config.markov_rank),
+            )
+            if mapping.is_last_pp_rank
+            else None
+        )
+        # The checkpoint contains a frozen copy of the target embedding.
+        # PP's last stage cannot borrow the first stage's module, so load its
+        # own TP shard there; non-PP serving continues to borrow the target.
+        self.embed_tokens = (
+            VocabParallelEmbedding(
+                int(config.vocab_size),
+                hidden_size,
+                org_num_embeddings=int(config.vocab_size),
+                tp_rank=mapping.attn.tp_rank,
+                tp_size=mapping.attn.tp_size,
+                tp_group=mapping.attn.tp_group,
+            )
+            if mapping.has_pp and mapping.is_last_pp_rank
+            else None
         )
         # Names the DFlash drafter reads off the draft model.
         self.block_size = None
         self.hidden_size = hidden_size
+
+    def configure_target(self, target_model, target_config) -> None:
+        """Bind trained tap indices and stream semantics on every owning stage."""
+        validate_k3_dspark_config(self.config, target_config)
+        if self.mapping.has_pp:
+            # Taps live on several stages: each projects its own into the
+            # chunk's PP state and the final stage writes the context.
+            target_model.set_target_context_capture(
+                list(self.target_capture_layer_ids),
+                self.config.aux_hidden_stream,
+                self.hidden_size,
+            )
+        else:
+            target_model.set_dflash_layers_to_capture(
+                list(self.target_capture_layer_ids)
+            )
+            target_model.set_dflash_aux_hidden_stream(self.config.aux_hidden_stream)
+
+    @property
+    def target_layer_ids(self) -> tuple[int, ...]:
+        """Target layers whose hidden states the draft was trained on."""
+        return self.target_capture_layer_ids
+
+    @property
+    def num_target_taps(self) -> int:
+        """Number of captured target streams, independent of draft block count."""
+        return len(self.target_capture_layer_ids)
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Concatenated target taps -> draft hidden space."""
@@ -372,7 +465,24 @@ class K3DSparkModel(nn.Module):
                 float(self.fc_norm[0].variance_epsilon),
             )
             target_hidden = target_hidden.flatten(-2)
-        return self.context_norm(self.context_proj(target_hidden)[0])
+        return self.finalize_target_projection(self.context_proj(target_hidden)[0])
+
+    def project_target_tap(
+        self, capture_idx: int, hidden: torch.Tensor
+    ) -> torch.Tensor:
+        """Project one target tap without applying the cross-tap output norm."""
+        local_idx = self.local_tap_indices.index(capture_idx)
+        width = int(self.config.target_hidden_size)
+        weight = self.context_proj.weight[
+            :, local_idx * width : (local_idx + 1) * width
+        ]
+        if self.fc_norm is not None:
+            hidden = self.fc_norm[local_idx](hidden)
+        return torch.nn.functional.linear(hidden.to(weight.dtype), weight)
+
+    def finalize_target_projection(self, projected: torch.Tensor) -> torch.Tensor:
+        """Apply context RMSNorm once after all target taps have contributed."""
+        return self.context_norm(projected.to(self.context_norm.weight.dtype))
 
     def _finalize_hidden(
         self, hidden_states: torch.Tensor, residual: torch.Tensor
@@ -388,7 +498,7 @@ class K3DSparkModel(nn.Module):
 
     @property
     def context_in_features(self) -> int:
-        return self.num_context_features * int(self.config.target_hidden_size)
+        return self.num_target_taps * int(self.config.target_hidden_size)
 
     @property
     def context_dtype(self) -> torch.dtype:
@@ -476,6 +586,17 @@ class K3DSparkModel(nn.Module):
     # Weight loading
     # ------------------------------------------------------------------
 
+    def checkpoint_weight_name_filter(self, name: str) -> bool:
+        """Select stage-local taps and the final stage's proposal parameters."""
+        if not self.mapping.has_pp:
+            return True
+        name = name.removeprefix("model.")
+        if name == "context_proj.weight":
+            return bool(self.local_tap_indices)
+        if name.startswith("fc_norm."):
+            return int(name.split(".")[1]) in self.local_tap_indices
+        return self.mapping.is_last_pp_rank
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         """Load the 68-tensor DSpark checkpoint.
 
@@ -493,15 +614,42 @@ class K3DSparkModel(nn.Module):
             "kv_a_proj_with_mqa": int(self.config.q_lora_rank),
         }
         params_dict = dict(self.named_parameters())
+        if not params_dict:
+            # A stage between tap owners has no draft parameters. Do not
+            # consume the lazy checkpoint iterator or join its collectives.
+            return
         loaded: set[str] = set()
         unexpected: list[str] = []
 
         for name, loaded_weight in weights:
             name = name.removeprefix("model.")
-            if name.startswith(K3_DSPARK_SKIPPED_WEIGHT_PREFIXES):
+            if not self.checkpoint_weight_name_filter(name):
+                continue
+            if (
+                name.startswith(K3_DSPARK_SKIPPED_WEIGHT_PREFIXES)
+                and name not in params_dict
+            ):
                 continue
             if "rotary_emb.inv_freq" in name:
                 continue
+            if name == "context_proj.weight" and self.mapping.has_pp:
+                width = int(self.config.target_hidden_size)
+                expected = (self.hidden_size, self.num_target_taps * width)
+                if tuple(loaded_weight.shape) != expected:
+                    raise ValueError(
+                        f"context_proj weight shape {tuple(loaded_weight.shape)} != {expected}"
+                    )
+                loaded_weight = torch.cat(
+                    [
+                        loaded_weight[:, idx * width : (idx + 1) * width]
+                        for idx in self.local_tap_indices
+                    ],
+                    dim=1,
+                )
+            if name.startswith("fc_norm."):
+                parts = name.split(".")
+                parts[1] = str(self.local_tap_indices.index(int(parts[1])))
+                name = ".".join(parts)
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if f".{weight_name}." not in name:

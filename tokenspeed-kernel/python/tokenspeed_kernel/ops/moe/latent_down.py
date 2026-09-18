@@ -51,7 +51,7 @@ from tokenspeed_kernel.ops.moe.latent_tail import (
     multicast_backend_unavailable_reason,
 )
 from tokenspeed_kernel.ops.moe.multicast_view import bf16_tensor_on_pointer
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 # Same rotation depth as the up-projection tail, for the same reason.
 _DOWN_POOL_DEPTH = 2
@@ -287,6 +287,28 @@ class KimiK3LatentDownOp:
         self.shard_dim = shard_dim
         self.rank = rank
         self.max_m = max_m
+        self._nvfp4_gather = None
+
+    def nvfp4_available(self) -> bool:
+        """Whether this mailbox and platform support fused NVFP4 quantization."""
+        platform = current_platform()
+        return (
+            self.shard_dim % 64 == 0
+            and platform.is_nvidia
+            and ArchVersion(10, 0) <= platform.arch_version <= ArchVersion(10, 3)
+        )
+
+    def prepare_nvfp4(self) -> None:
+        """Construct the NVFP4 mailbox consumer once, before graph capture."""
+        from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.lamport_copy_nvfp4_quant import (
+            LamportCopyNvfp4QuantKernel,
+        )
+
+        if self._nvfp4_gather is None:
+            self._nvfp4_gather = LamportCopyNvfp4QuantKernel(
+                hidden_dim=self._slot.mailbox.shape[-1],
+                device=self._slot.mailbox.device,
+            )
 
     @classmethod
     def available(
@@ -624,8 +646,12 @@ class KimiK3LatentDownOp:
         return 1 <= num_tokens <= self.max_m
 
     def __call__(
-        self, hidden_states: torch.Tensor, weight: torch.Tensor
-    ) -> torch.Tensor:
+        self,
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        *,
+        output_scale: torch.Tensor | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Project ``hidden_states`` through this rank's column block.
 
         Args:
@@ -633,9 +659,12 @@ class KimiK3LatentDownOp:
             weight: This rank's ``[shard_dim, hidden_size]`` block. The caller
                 slices it, because a projection that narrowed its storage has
                 no full width left to slice from.
+            output_scale: NVFP4 encoding multiplier for the fused gather, or
+                None to gather BF16. NVFP4 requires its kernel prepared before
+                capture, a width divisible by 64, and at most 1280 live rows.
 
         Returns:
-            The full ``[tokens, latent_size]`` latent, gathered from the mailbox.
+            The full BF16 latent, or (packed NVFP4 values, linear E4M3 scales).
 
         Three invariants the publish depends on: every aligned 32-bit word
         transitions exactly once a round and never in halves; the publishing
@@ -645,6 +674,8 @@ class KimiK3LatentDownOp:
         batch.
         """
         tokens = hidden_states.shape[0]
+        if output_scale is not None and self._nvfp4_gather is None:
+            raise RuntimeError("prepare_nvfp4 must run before requesting NVFP4 output")
         slot = self._slot
         slot.gemm_by_m[tokens](
             hidden_states,
@@ -652,6 +683,8 @@ class KimiK3LatentDownOp:
             slot.mailbox,
             slot.multicast_ptr,
         )
+        if output_scale is not None:
+            return self._nvfp4_gather(slot.mailbox, output_scale, m=tokens)
         return slot.gather_by_m[tokens](slot.mailbox, m=tokens)[0]
 
 
