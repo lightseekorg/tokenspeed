@@ -647,9 +647,9 @@ layers. PP construction gives these values explicit `*_cache_layers` local
 names; a drafter that shares target cache contributes no independent cache
 layers. Neither count means captured target taps or draft execution depth.
 
-`distributed/partition.py` owns the pure target execution-window calculation,
-shared by pipeline stages, model construction and PD topology. The model/cache
-construction boundary maps those execution windows to explicit
+`distributed/pp_stage.py::pp_stage_windows` owns the target execution-window
+calculation, shared by pipeline stages, model construction and PD topology.
+The model/cache construction boundary maps those execution windows to explicit
 `target_cache_windows`, then `CacheLayerOwnership` adds the final stage's draft
 cache window. Cache ownership consumes cache-ID windows; execution partitioning
 belongs to the distributed layer. Current PP targets K3 and V4 have one cache
