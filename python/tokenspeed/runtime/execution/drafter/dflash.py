@@ -146,14 +146,8 @@ class DFlash(BaseDrafter):
 
         cfg = self.model.config
         dflash_cfg = getattr(cfg, "dflash_config", {}) or {}
-        target_layer_ids = dflash_cfg.get("target_layer_ids") or getattr(
-            cfg, "target_layer_ids", None
-        )
-        self.target_layer_ids = [int(x) for x in (target_layer_ids or [])]
-        if not self.target_layer_ids:
-            raise ValueError(
-                "DFLASH draft config must define dflash_config.target_layer_ids."
-            )
+        # The draft model resolved its checkpoint's taps once, for setup.
+        self.target_layer_ids = list(self.model.target_layer_ids)
         mask_token_id = dflash_cfg.get("mask_token_id")
         if mask_token_id is None:
             mask_token_id = getattr(cfg, "mask_token_id", None)

@@ -367,22 +367,33 @@ class DFlashDecoderLayer(nn.Module):
 class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
     decoder_layer_cls = DFlashDecoderLayer
 
-    def configure_target(self, target_model, target_config) -> None:
-        """Install the capture inputs expected by this block-draft checkpoint."""
-        del target_config
+    def _checkpoint_capture_field(self, name: str):
+        """A capture field from ``dflash_config``, else the top-level config."""
         nested = getattr(self.config, "dflash_config", {}) or {}
-        layer_ids = nested.get("target_layer_ids") or getattr(
-            self.config, "target_layer_ids", None
-        )
+        return nested.get(name) or getattr(self.config, name, None)
+
+    @property
+    def target_layer_ids(self) -> tuple[int, ...]:
+        """Target layers whose hidden states this checkpoint was trained on."""
+        layer_ids = self._checkpoint_capture_field("target_layer_ids")
         if not layer_ids:
             raise ValueError(
                 "DFLASH draft config must define dflash_config.target_layer_ids."
             )
-        stream = str(
-            nested.get("aux_hidden_stream")
-            or getattr(self.config, "aux_hidden_stream", None)
-            or "prefix"
+        return tuple(int(layer_id) for layer_id in layer_ids)
+
+    @property
+    def aux_hidden_stream(self) -> str:
+        """Which target residual stream the taps read; ``prefix`` by default."""
+        return str(
+            self._checkpoint_capture_field("aux_hidden_stream") or "prefix"
         ).lower()
+
+    def configure_target(self, target_model, target_config) -> None:
+        """Install the capture inputs expected by this block-draft checkpoint."""
+        del target_config
+        layer_ids = self.target_layer_ids
+        stream = self.aux_hidden_stream
         if not hasattr(target_model, "set_dflash_layers_to_capture"):
             raise ValueError(
                 "DFLASH requires the target model to support set_dflash_layers_to_capture."
@@ -394,9 +405,7 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
                 f"{type(target_model).__name__} does not implement "
                 "set_dflash_aux_hidden_stream, so it can only supply 'prefix'."
             )
-        target_model.set_dflash_layers_to_capture(
-            [int(layer_id) for layer_id in layer_ids]
-        )
+        target_model.set_dflash_layers_to_capture(list(layer_ids))
         if stream_setter is not None:
             stream_setter(stream)
 

@@ -432,6 +432,11 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
             target_model.set_dflash_aux_hidden_stream(self.config.aux_hidden_stream)
 
     @property
+    def target_layer_ids(self) -> tuple[int, ...]:
+        """Target layers whose hidden states the draft was trained on."""
+        return self.target_capture_layer_ids
+
+    @property
     def num_target_taps(self) -> int:
         """Number of captured target streams, independent of draft block count."""
         return len(self.target_capture_layer_ids)
