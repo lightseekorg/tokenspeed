@@ -114,7 +114,7 @@ def _make_mxfp4_module(
     return module, raw
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 5, 8, 16])
 def test_ep_decode_matches_kimi_k3_shape_gfx950(
     num_tokens: int,
     monkeypatch: pytest.MonkeyPatch,
@@ -241,7 +241,8 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
     assert actual.dtype == torch.bfloat16
     assert actual.data_ptr() == output_storage.data_ptr()
     assert actual.stride() == (latent_size + 7168, 1)
-    assert decode_calls == ([] if num_tokens == 2 else [num_tokens])
+    # Strided inputs and batches above four rows use the MXFP8 expert path.
+    assert decode_calls == ([num_tokens] if num_tokens in (1, 4) else [])
     torch.testing.assert_close(actual, expected, atol=2e-3, rtol=8e-2)
 
 
@@ -1381,11 +1382,11 @@ def test_tp_situ_package_prefill_block64_matches_block128_gfx950(
 def test_ep_situ_package_prefill_matches_reference_gfx950(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import moe as fused_moe
+    from tokenspeed_kernel.ops.moe.gluon import mxfp4 as gluon_mxfp4
 
     generator = torch.Generator(device="cuda").manual_seed(20260830)
-    # One row past the warp-decode bound, for the same reason.
-    num_tokens, top_k = fused_moe._SITU_WARP_DECODE_MAX_M + 1, 16
+    # Exercise a ragged MXFP8 tile beyond this plan's four-row A16 decode path.
+    num_tokens, top_k = 33, 16
     num_local_experts, num_experts = 2, 16
     ep_size, ep_rank = 8, 3
     latent_size, intermediate_size = 3584, 3072
@@ -1434,17 +1435,19 @@ def test_ep_situ_package_prefill_matches_reference_gfx950(
     assert not output.is_contiguous()
     module._situ_output_buffer = output
 
-    activation_formats = []
-    package_prefill = fused_moe._maybe_gluon_package_mxfp4_prefill
+    prefill_calls = []
+    package_prefill = gluon_mxfp4.mxfp8_situ_prefill
 
-    def record_activation_format(*args, **kwargs):
-        activation_formats.append(kwargs["activation_format"])
+    def record_prefill(*args, **kwargs):
+        prefill_calls.append(
+            (args[0].dtype, kwargs["expert_start"], kwargs["global_experts"])
+        )
         return package_prefill(*args, **kwargs)
 
     monkeypatch.setattr(
-        fused_moe,
-        "_maybe_gluon_package_mxfp4_prefill",
-        record_activation_format,
+        gluon_mxfp4,
+        "mxfp8_situ_prefill",
+        record_prefill,
     )
 
     actual = tokenspeed_kernel.moe_apply(
@@ -1478,7 +1481,7 @@ def test_ep_situ_package_prefill_matches_reference_gfx950(
     )
 
     assert actual.data_ptr() == output.data_ptr()
-    assert activation_formats == ["e4m3"]
+    assert prefill_calls == [(torch.bfloat16, ep_rank * num_local_experts, num_experts)]
     torch.testing.assert_close(actual, expected, atol=2e-3, rtol=8e-2)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()

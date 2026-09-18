@@ -70,6 +70,7 @@ def _group_spec(
             family=family,
             transfer_policy=policy,
             checkpoint_granularity=prefix_granularity,
+            replayable=False,
         )
     return CacheGroupSpec(
         group_id=group_id,
@@ -79,6 +80,7 @@ def _group_spec(
         sliding_window_tokens=sliding_window_tokens,
         family=family,
         transfer_policy=policy,
+        replayable=False,
     )
 
 
@@ -518,6 +520,7 @@ _LCM_SPECS = (
         sliding_window_tokens=None,
         family="history",
         transfer_policy="full_suffix",
+        replayable=False,
     ),
 )
 

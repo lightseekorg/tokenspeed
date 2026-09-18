@@ -270,6 +270,11 @@ class DisaggPrefillExecutor:
                 block_manifest=block_manifest,
             )
 
+    def record_cached_tokens(self, request_id: str, cached_tokens: int) -> None:
+        sender = self.senders.get(request_id)
+        if sender is not None:
+            self.kv_manager.record_cached_tokens(sender.bootstrap_room, cached_tokens)
+
     def register(
         self,
         request_id: str,

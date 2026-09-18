@@ -116,25 +116,39 @@ CacheBoundaryKind consumeCompletedBoundaryKind(fsm::CacheProgress& cache_progres
     return num_computed_tokens == prefill_size ? CacheBoundaryKind::kEndpoint : CacheBoundaryKind::kChunk;
 }
 
-struct CompletedPrefixPages {
-    std::int32_t first_new_prefix_page{0};
-    std::optional<CacheBoundaryKind> boundary_kind;
-};
+// What a scheduled prefill window proves about state: local prefill
+// materializes its latest internal aligned checkpoint; a remote landing
+// brings only the endpoint state, a checkpoint when the window ends aligned.
+void recordPrefillStateCheckpoint(fsm::CacheProgress& cache_progress, fsm::PrefillSource source,
+                                  std::int32_t after_tokens, std::int32_t prefix_granularity) {
+    const std::int32_t aligned = after_tokens / prefix_granularity * prefix_granularity;
+    if (source == fsm::PrefillSource::kLocal || aligned == after_tokens) {
+        cache_progress.RecordMaterializedStateBoundary(aligned, prefix_granularity);
+    }
+}
 
-CompletedPrefixPages updateCompletedPrefixHashes(Request& request, fsm::CacheProgress& cache_progress,
-                                                 std::int32_t num_computed_tokens, std::int32_t prefix_granularity) {
-    CompletedPrefixPages completed{
-        .first_new_prefix_page = static_cast<std::int32_t>(cache_progress.prefix_hashes.size()),
-    };
+// Hashes the prefix pages that num_computed_tokens has filled since the
+// previous admission and states the request's progress for the coordinator.
+// The returned spans view cache_progress, which must outlive their use.
+RequestProgress advanceRequestProgress(Request& request, fsm::CacheProgress& cache_progress,
+                                       std::int32_t num_computed_tokens, std::int32_t prefix_granularity,
+                                       bool stream_completed_to_host) {
+    const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
     const std::int32_t filled_prefix_pages = num_computed_tokens / prefix_granularity;
-    if (filled_prefix_pages > static_cast<std::int32_t>(cache_progress.prefix_hashes.size())) {
+    if (filled_prefix_pages > first_new_prefix_page) {
         appendCompletedPrefixHashes(cache_progress.prefix_hashes, request.FullPrefixPages(false), filled_prefix_pages);
     }
-    if (completed.first_new_prefix_page < static_cast<std::int32_t>(cache_progress.prefix_hashes.size())) {
-        completed.boundary_kind =
-            consumeCompletedBoundaryKind(cache_progress, num_computed_tokens, request.PrefillSize());
+    RequestProgress progress{.num_computed_tokens = num_computed_tokens};
+    if (first_new_prefix_page < static_cast<std::int32_t>(cache_progress.prefix_hashes.size())) {
+        progress.completed_pages = CompletedPages{
+            .prefix_hashes = cache_progress.prefix_hashes,
+            .first_new_prefix_page = first_new_prefix_page,
+            .boundary_kind = consumeCompletedBoundaryKind(cache_progress, num_computed_tokens, request.PrefillSize()),
+            .stream_completed_to_host = stream_completed_to_host,
+            .materialized_state_boundaries = cache_progress.materialized_state_boundaries,
+        };
     }
-    return completed;
+    return progress;
 }
 
 template <typename Event>
@@ -219,9 +233,10 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
 std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                                   CacheCoordinator::PrefixProbe&& prefix,
                                                                   std::span<const GroupDemand> demands,
+                                                                  const RequestProgress& progress,
                                                                   std::optional<std::uint64_t> request_access_epoch) {
     std::optional<CacheCoordinator::AdmissionResult> result =
-        coordinator_.Admit(std::move(prefix), demands, request_access_epoch);
+        coordinator_.Admit(std::move(prefix), demands, progress, request_access_epoch);
     if (!result) {
         feedback.admission_failed = true;
         return std::nullopt;
@@ -237,18 +252,16 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(ExecutionPlan&
     return result;
 }
 
-std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
-                                                                  std::span<const GroupDemand> demands,
-                                                                  std::uint64_t request_access_epoch) {
-    return admit(plan, feedback, coordinator_.ProbePrefix({}), demands, request_access_epoch);
-}
-
 bool Scheduler::admitWithKvEventTracking(ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request,
-                                         const fsm::CacheProgress& cache_progress, std::int32_t new_prefix_hash_begin,
-                                         std::span<const GroupDemand> demands) {
+                                         const fsm::CacheProgress& cache_progress, std::span<const GroupDemand> demands,
+                                         const RequestProgress& progress) {
+    const std::int32_t first_new_prefix_page = progress.completed_pages
+                                                   ? progress.completed_pages->first_new_prefix_page
+                                                   : static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
     std::vector<CacheKey> event_keys =
-        registerKvEventPrefixPages(request, cache_progress.prefix_hashes, new_prefix_hash_begin);
-    const bool admitted = admit(plan, feedback, demands, cache_progress.access_epoch).has_value();
+        registerKvEventPrefixPages(request, cache_progress.prefix_hashes, first_new_prefix_page);
+    const bool admitted =
+        admit(plan, feedback, coordinator_.ProbePrefix({}), demands, progress, cache_progress.access_epoch).has_value();
     discardUncachedKvEventPages(event_keys);
     return admitted;
 }
@@ -299,7 +312,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
             config_.role != Role::kP && (source == fsm::PrefillSource::kRemote || completes_prefill),
     };
     std::vector<BlockTable> tables(static_cast<std::size_t>(coordinator_.NumGroups()));
-    std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.num_tokens = prefill_tokens});
+    std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.extent = DenseGrowth{prefill_tokens}});
     ReservePrefillDemands(demands, config_.cache_groups, reserve);
     if (source == fsm::PrefillSource::kLocal) {
         MakeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, hit_tokens, after_tokens);
@@ -311,20 +324,25 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
             const std::int32_t block_granularity = coordinator_.GroupBlockGranularity(i);
             if (group.transfer_policy == CacheTransferPolicy::LatestSnapshot) {
                 // The peer lands only the endpoint snapshot, in slot (PrefillSize-1)/g.
-                demands[i].num_tokens = request->PrefillSize();
-                demands[i].materialized_suffix_start = (request->PrefillSize() - 1) / block_granularity;
+                demands[i].extent = SparseSuffix{
+                    .extent_tokens = request->PrefillSize(),
+                    .first_block = (request->PrefillSize() - 1) / block_granularity,
+                };
             } else if (group.retention == CacheGroupConfig::Retention::SlidingWindow) {
                 const std::int32_t retained_begin =
                     std::max(0, request->PrefillSize() - *group.sliding_window_tokens + 1);
-                demands[i].num_tokens = request->PrefillSize();
-                demands[i].materialized_suffix_start =
-                    std::max(hit_tokens / block_granularity, retained_begin / block_granularity);
+                demands[i].extent = SparseSuffix{
+                    .extent_tokens = request->PrefillSize(),
+                    .first_block = std::max(hit_tokens / block_granularity, retained_begin / block_granularity),
+                };
             }
         }
     }
     std::vector<CacheKey> event_keys = registerKvEventPrefixPages(*request, match.candidate_prefix_hashes, 0);
-    std::optional<CacheCoordinator::AdmissionResult> admission =
-        admit(plan, feedback, std::move(match.probe), demands, /*request_access_epoch=*/std::nullopt);
+    // A first admission has computed nothing yet: nothing to publish, nothing
+    // for retention to reclaim.
+    std::optional<CacheCoordinator::AdmissionResult> admission = admit(
+        plan, feedback, std::move(match.probe), demands, RequestProgress{}, /*request_access_epoch=*/std::nullopt);
     if (!admission) {
         discardUncachedKvEventPages(event_keys);
         return std::nullopt;
@@ -338,6 +356,12 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
                                      CacheBoundaryKind::kChunk);
     }
     discardUncachedKvEventPages(event_keys);
+    fsm::CacheProgress cache_progress{
+        .prefix_hashes = std::move(match.prefix_hashes),
+        .access_epoch = admission->access_epoch,
+        .promotion_boundary_tokens = admission->promotion_boundary_tokens,
+    };
+    recordPrefillStateCheckpoint(cache_progress, source, after_tokens, coordinator_.PrefixGranularity());
     return fsm::SchedulePrefillFirstChunkEvent{
         prefill_tokens,
         decode_reserve,
@@ -346,15 +370,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         &coordinator_,
         std::move(tables),
         hit_tokens,
-        fsm::CacheProgress{
-            .prefix_hashes = std::move(match.prefix_hashes),
-            .access_epoch = admission->access_epoch,
-            .promotion_boundary_tokens = admission->promotion_boundary_tokens,
-            .materialized_state_boundary_tokens =
-                source == fsm::PrefillSource::kLocal
-                    ? after_tokens / coordinator_.PrefixGranularity() * coordinator_.PrefixGranularity()
-                    : 0,
-        },
+        std::move(cache_progress),
         std::move(admission->load_pairs),
         // The P role holds a completed prompt until its result lands: the
         // remote decode that hands it off carries the bootstrap token.
@@ -384,30 +400,21 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         .prompt_headroom_tokens = 0,
         .reserve_snapshot_state_growth = config_.role != Role::kP && completes_prefill,
     };
-    const PrefillInfo previous = request->CurrentPrefillInfo();
-    const std::int32_t num_computed_tokens = previous.already_scheduled_len + previous.extend_len;
-    const CompletedPrefixPages completed =
-        updateCompletedPrefixHashes(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity());
+    const RequestProgress progress =
+        advanceRequestProgress(*request, cache_progress, request->NumComputedTokens(), coordinator_.PrefixGranularity(),
+                               config_.StreamsDeviceCacheToHost());
 
     std::vector<BlockTable>& tables = request->BlockTablesRef();
-    std::vector<GroupDemand> demands =
-        MakeGroupDemands(tables, GroupDemand{
-                                     .num_tokens = prefill_tokens,
-                                     .prefix_hashes = cache_progress.prefix_hashes,
-                                     .new_prefix_hash_begin = completed.first_new_prefix_page,
-                                     .completed_boundary_kind = completed.boundary_kind,
-                                     .num_computed_tokens = num_computed_tokens,
-                                     .stream_completed_to_host = config_.StreamsDeviceCacheToHost(),
-                                     .materialized_state_boundary_tokens = request->MaterializedStateBoundaryTokens(),
-                                 });
+    std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.extent = DenseGrowth{prefill_tokens}});
     ReservePrefillDemands(demands, config_.cache_groups, reserve);
     MakeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, first_pos, after_tokens);
-    if (!admitWithKvEventTracking(plan, feedback, *request, cache_progress, completed.first_new_prefix_page, demands)) {
+    if (!admitWithKvEventTracking(plan, feedback, *request, cache_progress, demands, progress)) {
         return std::nullopt;
     }
 
-    cache_progress.materialized_state_boundary_tokens =
-        after_tokens / coordinator_.PrefixGranularity() * coordinator_.PrefixGranularity();
+    cache_progress.DiscardHashedStateBoundaries(coordinator_.PrefixGranularity());
+    recordPrefillStateCheckpoint(cache_progress, fsm::PrefillSource::kLocal, after_tokens,
+                                 coordinator_.PrefixGranularity());
     request->CacheProgressRef() = std::move(cache_progress);
     return fsm::SchedulePrefillEvent{prefill_tokens, decode_reserve, config_.role == Role::kP};
 }
@@ -417,38 +424,22 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     std::vector<BlockTable>& tables = request->BlockTablesRef();
     const std::int32_t reserve_tokens = request->ReserveNumTokensInNextScheduleEvent();
     fsm::CacheProgress cache_progress = request->CacheProgress();
-    std::int32_t num_computed_tokens = 0;
-    if (request->Is<fsm::PrefillDone>()) {
-        const PrefillInfo previous = request->CurrentPrefillInfo();
-        num_computed_tokens = previous.already_scheduled_len + previous.extend_len;
-    } else {
-        num_computed_tokens = request->TokenSize() - config_.decode_input_tokens;
-    }
+    const std::int32_t num_computed_tokens = request->NumComputedTokens();
+    const RequestProgress progress =
+        advanceRequestProgress(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
+                               config_.StreamsDeviceCacheToHost() && request->Is<fsm::PrefillDone>());
 
-    const CompletedPrefixPages completed =
-        updateCompletedPrefixHashes(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity());
-
-    if (completed.first_new_prefix_page == static_cast<std::int32_t>(cache_progress.prefix_hashes.size()) &&
+    if (!progress.completed_pages &&
         canConsumeReservedTokensInPlace(coordinator_, tables, reserve_tokens, num_computed_tokens)) {
         coordinator_.ConsumeReservedTokens(tables, reserve_tokens);
     } else {
-        std::vector<GroupDemand> demands = MakeGroupDemands(
-            tables,
-            GroupDemand{
-                .num_tokens = reserve_tokens,
-                .prefix_hashes = cache_progress.prefix_hashes,
-                .new_prefix_hash_begin = completed.first_new_prefix_page,
-                .completed_boundary_kind = completed.boundary_kind,
-                .num_computed_tokens = num_computed_tokens,
-                .stream_completed_to_host = config_.StreamsDeviceCacheToHost() && request->Is<fsm::PrefillDone>(),
-                .materialized_state_boundary_tokens = request->MaterializedStateBoundaryTokens(),
-            });
-        if (!admitWithKvEventTracking(plan, feedback, *request, cache_progress, completed.first_new_prefix_page,
-                                      demands)) {
+        std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.extent = DenseGrowth{reserve_tokens}});
+        if (!admitWithKvEventTracking(plan, feedback, *request, cache_progress, demands, progress)) {
             return std::nullopt;
         }
     }
 
+    cache_progress.DiscardHashedStateBoundaries(coordinator_.PrefixGranularity());
     request->CacheProgressRef() = std::move(cache_progress);
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
 }
@@ -559,24 +550,15 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
     const bool recovers_as_readmission = store_snapshot || config_.role == Role::kD;
     if (store_snapshot) {
         fsm::CacheProgress cache_progress = victim.CacheProgress();
-        // Only what has actually been computed may be published as a prefix.
-        // A decoding request has its whole prompt plus generated tokens bar
-        // the one it is about to write; an incomplete prefill has only the
-        // chunks it has been through -- taking TokenSize() there would
-        // publish pages that were never computed.
-        const std::int32_t num_computed_tokens = [&] {
-            if (const auto* prefilling = victim.GetIf<fsm::Prefilling>()) {
-                return prefilling->window.begin + prefilling->window.size;
-            }
-            return victim.TokenSize() - config_.decode_input_tokens;
-        }();
-        const CompletedPrefixPages completed =
-            updateCompletedPrefixHashes(victim, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity());
-        if (completed.boundary_kind) {
-            coordinator_.CacheCompletedBlocks(
-                victim.BlockTablesRef(), cache_progress.prefix_hashes, cache_progress.access_epoch,
-                completed.first_new_prefix_page, num_computed_tokens, *completed.boundary_kind,
-                /*stream_completed_to_host=*/false, victim.MaterializedStateBoundaryTokens());
+        // Only what has actually been computed may be published as a prefix:
+        // an incomplete prefill has only the chunks it has been through --
+        // taking TokenSize() there would publish pages that were never
+        // computed.
+        const RequestProgress progress =
+            advanceRequestProgress(victim, cache_progress, victim.NumComputedTokens(), coordinator_.PrefixGranularity(),
+                                   /*stream_completed_to_host=*/false);
+        if (progress.completed_pages) {
+            coordinator_.CacheCompletedBlocks(victim.BlockTablesRef(), progress, cache_progress.access_epoch);
         }
         coordinator_.QueueCachedBlocksForStore(cache_progress.prefix_hashes);
         coordinator_.QueueLatestSnapshotBlocksForStore(cache_progress.prefix_hashes);

@@ -81,7 +81,7 @@ TEST(ReservePrefillDemandsTest, EachRetentionHoldsItsOwnShareOfTheRound) {
     std::vector<BlockTable> tables(3);
     // A first chunk that does not complete the prompt: full history prepays
     // the prompt headroom, the window and the state hold nothing yet.
-    std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.num_tokens = 6});
+    std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.extent = DenseGrowth{6}});
     ReservePrefillDemands(demands, groups,
                           PrefillReserve{.decode_input_tokens = 2,
                                          .completes_prefill = false,
@@ -91,11 +91,11 @@ TEST(ReservePrefillDemandsTest, EachRetentionHoldsItsOwnShareOfTheRound) {
     EXPECT_EQ(demands[1].reserve_tokens, 0);
     EXPECT_EQ(demands[2].reserve_tokens, 0);
     for (const GroupDemand& demand : demands) {
-        EXPECT_EQ(demand.num_tokens, 6);
+        EXPECT_EQ(demand.extent, (GroupExtent{DenseGrowth{6}}));
     }
     // The completing chunk: every group holds the decode slot, the state
     // group at least one growth block.
-    demands = MakeGroupDemands(tables, GroupDemand{.num_tokens = 6});
+    demands = MakeGroupDemands(tables, GroupDemand{.extent = DenseGrowth{6}});
     ReservePrefillDemands(demands, groups,
                           PrefillReserve{.decode_input_tokens = 2,
                                          .completes_prefill = true,
@@ -122,18 +122,16 @@ TEST(MakeSnapshotStatePrefillSparseTest, MaterializesOnlyTheStateGroupsFromTheLa
     };
     const CacheCoordinator coord = MakeCoordinator(specs, 8, pool, nullptr, false);
     std::vector<BlockTable> tables(2);
-    std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.num_tokens = 10});
+    std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.extent = DenseGrowth{10}});
     // (0, 10] crosses the checkpoint at 8: the state group covers 10 tokens
     // from the checkpoint's slot (8 - 1) / 4 = 1; the history group is dense.
     MakeSnapshotStatePrefillSparse(demands, groups, coord, /*before_tokens=*/0, /*after_tokens=*/10);
-    EXPECT_EQ(demands[0].num_tokens, 10);
-    EXPECT_EQ(demands[0].materialized_suffix_start, -1);
-    EXPECT_EQ(demands[1].num_tokens, 10);
-    EXPECT_EQ(demands[1].materialized_suffix_start, 1);
+    EXPECT_EQ(demands[0].extent, (GroupExtent{DenseGrowth{10}}));
+    EXPECT_EQ(demands[1].extent, (GroupExtent{SparseSuffix{.extent_tokens = 10, .first_block = 1}}));
     // No checkpoint crossed: only the endpoint, slot (10 - 1) / 4 = 2.
-    demands = MakeGroupDemands(tables, GroupDemand{.num_tokens = 2});
+    demands = MakeGroupDemands(tables, GroupDemand{.extent = DenseGrowth{2}});
     MakeSnapshotStatePrefillSparse(demands, groups, coord, /*before_tokens=*/8, /*after_tokens=*/10);
-    EXPECT_EQ(demands[1].materialized_suffix_start, 2);
+    EXPECT_EQ(demands[1].extent, (GroupExtent{SparseSuffix{.extent_tokens = 10, .first_block = 2}}));
 }
 
 }  // namespace

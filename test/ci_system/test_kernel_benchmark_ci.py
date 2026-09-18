@@ -91,7 +91,7 @@ def _case(
     center: float,
     *,
     case_id: str = "amd.gfx950.gemm.bmm.bf16.b12-m1-n512-k128.gluon",
-    definition_version: int = 1,
+    comparison_epoch: int = 1,
     status: str = "success",
     spread: float = 0.02,
     policy: dict | None = None,
@@ -109,7 +109,6 @@ def _case(
         },
         "registration": "gluon_bmm_a16w16_gfx950",
         "seed": 42,
-        "definition_version": definition_version,
     }
     if validated:
         definition["parameters"]["validation"] = {
@@ -119,6 +118,7 @@ def _case(
         }
     return {
         "id": case_id,
+        "comparison_epoch": comparison_epoch,
         "definition": definition,
         "policy": policy or _policy(),
         "result": _result(
@@ -269,7 +269,7 @@ def test_compare_reports_added_changed_and_missing_cases():
         _run(
             CANDIDATE_SHA,
             [
-                _case(10.0, case_id="changed", definition_version=2),
+                _case(10.0, case_id="changed", comparison_epoch=2),
                 _case(10.0, case_id="added"),
             ],
         ),

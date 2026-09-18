@@ -123,6 +123,8 @@ def _recipe(device):
             chunked_prefill_size=512,
             max_num_seqs=2,
             max_total_tokens=1024,
+            disaggregation_mode="null",
+            enable_prefix_caching=True,
         ),
         model_config=SimpleNamespace(
             num_attention_layers=40,
@@ -1067,10 +1069,10 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
     assert layout.lcm_block_bytes == 1_382_400 and len(layout.fields) == 51
     specs = {spec.group_id: spec for spec, _ in recipe.groups()}
     horizon = (1 + overlap_depth) * verify_width
-    # Retention is sized for the deepest schedule on every role so that a
-    # prefill node (no overlap) and a decode node agree on the PD contract.
-    assert specs[SWA].sliding_window_tokens == 128 + 2 * verify_width
-    assert specs[TAIL].sliding_window_tokens == 2 + 2 * verify_width
+    # Retention is the attention window (or the pair) whatever the verify
+    # width or schedule depth: the scheduled rows are reserved, not retained.
+    assert specs[SWA].sliding_window_tokens == 128
+    assert specs[TAIL].sliding_window_tokens == 2
     tables = (
         4 * config.max_bs * sum(v41_table_widths(config.context_len, horizon).values())
     )
@@ -1181,22 +1183,18 @@ def test_pd_contract_plan_and_manifest():
     assert base_addr == pool.arena.buffer.data_ptr()
     validate_cache_peer_layout(contract, contract)
     assert [spec.group_id for spec in contract.group_specs] == [SWA, R2, R1, TAIL]
-    # The replayable groups keep their replay declaration under PD (a peer
-    # that cached them would disagree on what a hit means) and travel as
-    # ordinary sliding windows: the whole retained tail ships, so the replay
-    # regenerates exactly that window and nothing is re-fed on the decode
-    # side.
+    # The replayable groups keep their declaration under PD (a peer that
+    # cached them would disagree on what a hit means) and travel as ordinary
+    # sliding windows: the whole retained tail ships, the replay regenerates
+    # exactly that window, and nothing is re-fed on the decode side.
     specs_by_id = {spec.group_id: spec for spec in contract.group_specs}
     for gid in (SWA, TAIL):
-        assert (
-            specs_by_id[gid].replay_window_tokens
-            == specs_by_id[gid].sliding_window_tokens
-        )
+        assert specs_by_id[gid].replayable
     assert all(spec.transfer_policy == "full_suffix" for spec in contract.group_specs)
     cached_peer = replace(
         contract,
         group_specs=tuple(
-            replace(spec, replay_window_tokens=None) if spec.group_id == SWA else spec
+            replace(spec, replayable=False) if spec.group_id == SWA else spec
             for spec in contract.group_specs
         ),
     )
@@ -1302,8 +1300,8 @@ def test_recipe_exact_geometry_capacity_and_dispatch():
     specs = {s.group_id: s for s, _ in recipe.groups()}
     assert [specs[g].block_granularity for g in V41_GROUP_GEOMETRY] == [64, 128, 64, 2]
     assert all(s.family == "history" for s in specs.values())
-    assert specs[SWA].sliding_window_tokens == 130
-    assert specs[TAIL].sliding_window_tokens == 4
+    assert specs[SWA].sliding_window_tokens == 128
+    assert specs[TAIL].sliding_window_tokens == 2
     payload = {
         gid: sum(f.payload_bytes for f in fields)
         for (spec, fields) in recipe.groups()
@@ -1336,28 +1334,31 @@ def test_recipe_exact_geometry_capacity_and_dispatch():
     assert _resolve_cache_family(profile, recipe.attn_config) == "deepseek_v41"
 
 
-def test_recipe_declares_replay_windows_for_the_private_groups():
+def test_recipe_declares_the_private_groups_replayable():
     """The SWA and compressor-tail groups leave prefix caching: the recipe
-    marks them replayable, the scheduler bridge forwards the windows, and
-    the backend refuses a pool that would share them through a hit."""
+    marks them replayable, the scheduler bridge forwards the flag, and the
+    backend refuses a pool that would share them through a hit."""
     from tokenspeed.runtime.engine.scheduler_utils import pool_to_cache_groups
 
     recipe = _recipe("cpu")
     specs = {s.group_id: s for s, _ in recipe.groups()}
-    # The whole retention window (attention window or pair, plus protection).
-    expected = {SWA: 130, R2: None, R1: None, TAIL: 4}
-    assert {gid: s.replay_window_tokens for gid, s in specs.items()} == expected
+    expected = {SWA: True, R2: False, R1: False, TAIL: True}
+    assert {gid: s.replayable for gid, s in specs.items()} == expected
+    # What a hit re-feeds is the whole retention window: the attention window
+    # or the pair, with no second number to declare.
+    assert {gid: s.sliding_window_tokens for gid, s in specs.items()} == {
+        SWA: 128,
+        R2: None,
+        R1: None,
+        TAIL: 2,
+    }
     backend = _backend("cpu", 2)
     groups = {g.group_id: g for g in pool_to_cache_groups(backend.cache_pool)}
-    assert {gid: g.replay_window_tokens for gid, g in groups.items()} == expected
+    assert {gid: g.replayable for gid, g in groups.items()} == expected
     with pytest.raises(ValueError, match="sliding-window"):
-        replace(specs[R1], replay_window_tokens=1)
-    with pytest.raises(ValueError, match="replay_window_tokens must be"):
-        replace(specs[SWA], replay_window_tokens=specs[SWA].sliding_window_tokens + 1)
-    with pytest.raises(ValueError, match="replay_window_tokens must be"):
-        replace(specs[TAIL], replay_window_tokens=0)
+        replace(specs[R1], replayable=True)
     cached_swa = tuple(
-        replace(spec, replay_window_tokens=None) if spec.group_id == SWA else spec
+        replace(spec, replayable=False) if spec.group_id == SWA else spec
         for spec, _ in recipe.groups()
     )
     arena = CacheArena(
@@ -1368,7 +1369,7 @@ def test_recipe_declares_replay_windows_for_the_private_groups():
         enable_memory_saver=False,
     )
     pool = DeepseekV41CachePool(arena, layer_num=40, rank=0, field_layer_offset=0)
-    with pytest.raises(ValueError, match="replay_window_tokens equal"):
+    with pytest.raises(ValueError, match="must be a replayable group"):
         backend.set_cache_pool(pool)
 
 

@@ -34,7 +34,8 @@ __all__ = ["gluon_dsv4_prefill_gfx950"]
 
 
 def _use_sparse_prefill(q: torch.Tensor, indices: torch.Tensor) -> bool:
-    return q.shape[1] in (64, 128) and indices.shape[1] >= 128
+    # Compact H=64/128 helper does not skip -1 pads; width 128 uses the generic kernel.
+    return q.shape[1] in (64, 128) and indices.shape[1] > 128
 
 
 @gluon.jit

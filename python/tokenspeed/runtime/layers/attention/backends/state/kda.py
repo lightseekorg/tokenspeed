@@ -45,10 +45,7 @@ from tokenspeed_kernel.ops.attention.kda import (
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
 )
-from tokenspeed_kernel.ops.attention.kda.triton import (
-    capture_replay_payload,
-    commit_state_pages,
-)
+from tokenspeed_kernel.ops.attention.kda.triton import capture_replay_payload
 from tokenspeed_kernel.platform import pdl_enabled
 from typing_extensions import override
 
@@ -819,36 +816,24 @@ class KdaAttnBackend(MambaAttnBackend):
             return
         from tokenspeed_kernel.ops.attention.kda import try_kda_replay_commit
 
-        committed, tables, draft_token_num, read_pages_by_group = ctx
+        _, _, draft_token_num, read_pages_by_group = ctx
         bs = accepted_length.shape[0]
-        # Runtime accept lengths count draft matches; the target token itself
-        # always advances state, matching the established scratch commit.
         group_ids = list(self._replay_group_ids or self._state_groups())
-        write_stack = torch.empty(
-            (len(group_ids), bs), dtype=torch.int32, device=accepted_length.device
+        write_stack, steps = self._resolve_verify_commit_pages(
+            accepted_length, group_ids
         )
-        steps = torch.empty(bs, dtype=torch.int32, device=accepted_length.device)
-        for out_row, group_id in enumerate(group_ids):
-            commit_state_pages(
-                accepted_length,
-                committed,
-                tables[group_id],
-                batch_size=bs,
-                draft_tokens=draft_token_num,
-                granularity=self._checkpoint_granularity,
-                pages_out=write_stack,
-                out_row=out_row,
-                steps_out=steps,
-            )
         rows = bs * draft_token_num
         if self._batched_replay_ready:
-            read_pages = torch.stack(
-                [
-                    read_pages_by_group[group_id][:bs]
-                    for group_id in self._replay_group_ids
-                ]
-            ).to(torch.int32)
-            self._batched_replay_launch(read_pages, write_stack, steps)
+            self._batched_replay_launch(
+                torch.stack(
+                    [
+                        read_pages_by_group[group_id][:bs]
+                        for group_id in self._replay_group_ids
+                    ]
+                ).to(torch.int32),
+                write_stack,
+                steps,
+            )
             self._verify_commit_ctx = None
             return
         if self._replay_uses_raw_gate:

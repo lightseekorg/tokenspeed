@@ -135,6 +135,7 @@ class InklingRecipe(CacheRecipe):
                     sliding_window_tokens=None,
                     family="state",
                     checkpoint_granularity=self.prefix_granularity,
+                    replayable=False,
                 ),
                 fields,
             )

@@ -185,7 +185,7 @@ TEST(JointMatchInvariantsTest, ReplayableGroupIsNotPartOfTheJointInvariant) {
          .block_granularity = kBlockTokens},
         {.kind = AttnKind::kSlidingWindow,
          .sliding_window = 8,
-         .replay_window = 8,
+         .replayable = true,
          .cache_blocks_per_lcm_block = 1,
          .block_granularity = kBlockTokens},
     };

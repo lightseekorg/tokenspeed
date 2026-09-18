@@ -88,14 +88,16 @@ void MakeSnapshotStatePrefillSparse(std::span<GroupDemand> demands, std::span<co
             continue;
         }
         const std::int32_t block_granularity = coordinator.GroupBlockGranularity(static_cast<std::int32_t>(i));
-        demands[i].num_tokens = after_tokens;
         // A completing prefill may end off a prefix boundary. Materialize the
         // last completed checkpoint as well as the final continuation state:
         // the runtime writes both from this one model forward. Earlier slots
         // remain holes, preserving absolute block-table positions.
         const std::int32_t first_materialized_token =
             StateCheckpointMaterializationStart(before_tokens, after_tokens, coordinator.PrefixGranularity());
-        demands[i].materialized_suffix_start = (first_materialized_token - 1) / block_granularity;
+        demands[i].extent = SparseSuffix{
+            .extent_tokens = after_tokens,
+            .first_block = (first_materialized_token - 1) / block_granularity,
+        };
     }
 }
 

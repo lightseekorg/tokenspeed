@@ -52,6 +52,30 @@ def get_scaled_dot_format_string(dtype: gl.dtype):
     return mapping[dtype]
 
 
+@gluon.constexpr_function
+def partial_tdm_warp_hint(num_warps: int) -> int:
+    # A contiguous half, so the mask and its reversal stay disjoint -- what lets
+    # two loads merge into one `async_load_fused` operation. Alternating bits
+    # satisfy that too, but measure worse: a contiguous half spreads the warps
+    # that carry a descriptor evenly over the SIMDs.
+    if num_warps == 8:
+        return 0b11110000
+    if num_warps == 4:
+        return 0b1100
+    raise ValueError(f"partial TDM requires 4 or 8 warps, got {num_warps}")
+
+
+@gluon.constexpr_function
+def reverse_tdm_warp_used_hint(hint: int | None, num_warps: int) -> int | None:
+    if hint is None:
+        return None
+    reversed_hint = 0
+    for bit in range(num_warps):
+        if hint & (1 << bit):
+            reversed_hint |= 1 << (num_warps - 1 - bit)
+    return reversed_hint
+
+
 def ragged_metadata_fields(metadata: RaggedTensorMetadata, block_size: int):
     return (
         metadata.slice_sizes,
@@ -306,6 +330,13 @@ class MoEConfig:
     NUM_BUFFERS: gl.constexpr
     NUM_LOADS_IN_BATCH: gl.constexpr
 
+    # partial TDM; a `None` hint means all warps
+    TDM_WARP_USED_HINT_X: gl.constexpr
+    TDM_WARP_USED_HINT_W: gl.constexpr
+    TDM_WARP_USED_HINT_W_SCALE: gl.constexpr
+    FUSE_X_W: gl.constexpr
+    FUSE_W_W_SCALE: gl.constexpr
+
     # scales
     SCALE_BLOCK: gl.constexpr  # Number of elements sharing one scale factor
     WITH_X_MX_SCALE: gl.constexpr
@@ -355,6 +386,7 @@ class MoEConfig:
         WITH_W_MX_SCALE,
         SCALE_PRESHUFFLE,
         index_type,
+        PARTIAL_TDM,
         NUM_SUBTILES=(1, 1, 1),
         EVEN_K=True,
         USE_GATHER=False,
@@ -374,11 +406,31 @@ class MoEConfig:
         self.DTYPE_X = gl.constexpr(DTYPE_X)
         self.DTYPE_W = gl.constexpr(DTYPE_W)
 
+        hint = partial_tdm_warp_hint(NUM_WARPS) if PARTIAL_TDM else None
+        reversed_hint = reverse_tdm_warp_used_hint(hint, NUM_WARPS)
+        if USE_GATHER:
+            # async_gather takes no warp hint, so x keeps every warp and the
+            # fusion moves onto the w pair.
+            self.TDM_WARP_USED_HINT_X = gl.constexpr(None)
+            self.TDM_WARP_USED_HINT_W = gl.constexpr(hint)
+            self.TDM_WARP_USED_HINT_W_SCALE = gl.constexpr(reversed_hint)
+        else:
+            self.TDM_WARP_USED_HINT_X = gl.constexpr(hint)
+            self.TDM_WARP_USED_HINT_W = gl.constexpr(reversed_hint)
+            self.TDM_WARP_USED_HINT_W_SCALE = gl.constexpr(None)
+        FUSE_X_W = hint is not None and not USE_GATHER
+        FUSE_W_W_SCALE = hint is not None and USE_GATHER and WITH_W_MX_SCALE
+        self.FUSE_X_W = gl.constexpr(FUSE_X_W)
+        self.FUSE_W_W_SCALE = gl.constexpr(FUSE_W_W_SCALE)
+
         num_loads = 2  # x and w
         if WITH_X_MX_SCALE:
             num_loads += 1
         if WITH_W_MX_SCALE:
             num_loads += 1
+        # A fused pair is one outstanding TDM operation, not two.
+        if FUSE_X_W or FUSE_W_W_SCALE:
+            num_loads -= 1
         self.NUM_LOADS_IN_BATCH = gl.constexpr(num_loads)
         self.NUM_SUBTILES = gl.constexpr(NUM_SUBTILES)
         self.EVEN_K = gl.constexpr(EVEN_K)
@@ -638,6 +690,20 @@ class MoEProgramBase:
             return gl.amd.cdna5.wmma(x, w, accumulator)
 
     @gluon.jit
+    def w_load_desc(self, load_idx, pred):
+        # async_load_fused takes no offset argument, so bake it into the
+        # descriptor.
+        cfg = self.cfg
+        BLOCK_K_PACKED_W: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_W
+        if cfg.W_TRANSPOSE:
+            add_offsets = [0, load_idx * BLOCK_K_PACKED_W]
+        else:
+            add_offsets = [load_idx * BLOCK_K_PACKED_W, 0]
+        return gl.amd.cdna5.tdm.update_tensor_descriptor(
+            self.w_desc, add_offsets=add_offsets, pred=pred, clamp_bounds=True
+        )
+
+    @gluon.jit
     def issue_global_loads(self, load_idx, pred=1):
         cfg = self.cfg
         BLOCK_K_PACKED_X: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_X
@@ -654,28 +720,74 @@ class MoEProgramBase:
                 self.gathered_m,
                 self.x_buffer.index(load_idx % cfg.NUM_BUFFERS),
             )
+        elif cfg.FUSE_X_W:
+            x_load_desc = gl.amd.cdna5.tdm.update_tensor_descriptor(
+                self.x_desc,
+                add_offsets=[0, load_idx * BLOCK_K_PACKED_X],
+                pred=pred,
+                clamp_bounds=True,
+            )
+            gl.amd.cdna5.tdm.async_load_fused(
+                [
+                    (
+                        x_load_desc,
+                        self.x_buffer.index(load_idx % cfg.NUM_BUFFERS),
+                        cfg.TDM_WARP_USED_HINT_X,
+                    ),
+                    (
+                        self.w_load_desc(load_idx, pred),
+                        self.w_buffer.index(load_idx % cfg.NUM_BUFFERS),
+                        cfg.TDM_WARP_USED_HINT_W,
+                    ),
+                ]
+            )
         else:
             gl.amd.cdna5.tdm.async_load(
                 self.x_desc,
                 [0, load_idx * BLOCK_K_PACKED_X],
                 self.x_buffer.index(load_idx % cfg.NUM_BUFFERS),
                 pred=pred,
+                warp_used_hint=cfg.TDM_WARP_USED_HINT_X,
             )
 
-        if cfg.W_TRANSPOSE:
-            gl.amd.cdna5.tdm.async_load(
-                self.w_desc,
-                [0, load_idx * BLOCK_K_PACKED_W],
-                self.w_buffer.index(load_idx % cfg.NUM_BUFFERS),
+        if cfg.FUSE_W_W_SCALE:
+            w_scale_load_desc = gl.amd.cdna5.tdm.update_tensor_descriptor(
+                self.w_scale_desc,
+                add_offsets=[0, load_idx * cfg.BLOCK_K_SCALE_PRESHUFFLED],
                 pred=pred,
+                clamp_bounds=True,
             )
-        else:
-            gl.amd.cdna5.tdm.async_load(
-                self.w_desc,
-                [load_idx * BLOCK_K_PACKED_W, 0],
-                self.w_buffer.index(load_idx % cfg.NUM_BUFFERS),
-                pred=pred,
+            gl.amd.cdna5.tdm.async_load_fused(
+                [
+                    (
+                        self.w_load_desc(load_idx, pred),
+                        self.w_buffer.index(load_idx % cfg.NUM_BUFFERS),
+                        cfg.TDM_WARP_USED_HINT_W,
+                    ),
+                    (
+                        w_scale_load_desc,
+                        self.w_scale_buffer.index(load_idx % cfg.NUM_BUFFERS),
+                        cfg.TDM_WARP_USED_HINT_W_SCALE,
+                    ),
+                ]
             )
+        elif not cfg.FUSE_X_W:
+            if cfg.W_TRANSPOSE:
+                gl.amd.cdna5.tdm.async_load(
+                    self.w_desc,
+                    [0, load_idx * BLOCK_K_PACKED_W],
+                    self.w_buffer.index(load_idx % cfg.NUM_BUFFERS),
+                    pred=pred,
+                    warp_used_hint=cfg.TDM_WARP_USED_HINT_W,
+                )
+            else:
+                gl.amd.cdna5.tdm.async_load(
+                    self.w_desc,
+                    [load_idx * BLOCK_K_PACKED_W, 0],
+                    self.w_buffer.index(load_idx % cfg.NUM_BUFFERS),
+                    pred=pred,
+                    warp_used_hint=cfg.TDM_WARP_USED_HINT_W,
+                )
 
         if cfg.WITH_X_MX_SCALE:
             if cfg.USE_GATHER:
@@ -700,14 +812,16 @@ class MoEProgramBase:
                     [0, load_idx * cfg.BLOCK_K_SCALE_PRESHUFFLED],
                     self.x_scale_buffer.index(load_idx % cfg.NUM_BUFFERS),
                     pred=pred,
+                    warp_used_hint=cfg.TDM_WARP_USED_HINT_X,
                 )
 
-        if cfg.WITH_W_MX_SCALE:
+        if cfg.WITH_W_MX_SCALE and not cfg.FUSE_W_W_SCALE:
             gl.amd.cdna5.tdm.async_load(
                 self.w_scale_desc,
                 [0, load_idx * cfg.BLOCK_K_SCALE_PRESHUFFLED],
                 self.w_scale_buffer.index(load_idx % cfg.NUM_BUFFERS),
                 pred=pred,
+                warp_used_hint=cfg.TDM_WARP_USED_HINT_W_SCALE,
             )
 
         return load_idx + 1

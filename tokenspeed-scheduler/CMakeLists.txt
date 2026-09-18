@@ -46,6 +46,7 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/scheduler/operations/group_demands.cpp
     csrc/scheduler/operations/prefill_chunk.cpp
 
+    csrc/scheduler/capacity_model.cpp
     csrc/scheduler/kv_cache_events.cpp
     csrc/scheduler/request.cpp
     csrc/scheduler/types.cpp
@@ -126,6 +127,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_outside_event_handler.cpp
         tests/cpp/test_cache_operations.cpp
         tests/cpp/test_req_pool_allocator.cpp
+        tests/cpp/test_capacity_model.cpp
     )
 
     target_link_libraries(tokenspeed_scheduler_tests

@@ -38,11 +38,14 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheLayout,
     pack,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
+    SchedulerLimits,
+    capacity_model,
+    scheduler_role,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    NULL_PAGES,
     CacheGroupDeclaration,
     CacheGroupSpec,
-    compute_cache_group_page_counts,
     group,
 )
 
@@ -317,39 +320,46 @@ class CacheRecipe(ABC):
         return num_lcm_blocks * self._max_packing(layout) * layout.prefix_granularity
 
     @cached_property
-    def scheduler_limits(self) -> dict[str, int]:
+    def scheduler_limits(self) -> SchedulerLimits:
         """The concurrency the cache has to hold at once.
 
         The one place a recipe reads the scheduler's limits, so per-group page
         demand and the capacity search cannot size against different numbers.
         """
-        return {
-            "max_live_requests": self.attn_config.max_bs,
-            "max_scheduled_tokens": max(0, int(self.server_args.chunked_prefill_size)),
-            "max_context_len": self.attn_config.context_len,
-            "decode_input_tokens": self.decode_input_tokens,
-            "overlap_schedule_depth": self.overlap_schedule_depth,
-        }
+        return SchedulerLimits(
+            role=scheduler_role(self.server_args.disaggregation_mode),
+            max_live_requests=self.attn_config.max_bs,
+            max_scheduled_tokens=int(self.server_args.chunked_prefill_size),
+            max_context_len=self.attn_config.context_len,
+            decode_input_tokens=self.decode_input_tokens,
+            overlap_schedule_depth=self.overlap_schedule_depth,
+            disable_prefix_cache=not self.server_args.enable_prefix_caching,
+        )
 
     def parents_needed(self, layout: CacheLayout, token_capacity: int) -> int:
         """Physical parents this capacity needs at the configured concurrency.
 
-        Reads only capacity-independent facts of the layout, so it can probe a
-        layout directly instead of binding a stand-in plan first. Families
-        whose per-group demand is not the contract's own page-count formula
-        override this.
+        The scheduler's own capacity model answers, over the groups as the
+        scheduler will read them, so the pool is sized with the per-request
+        working set the Scheduler later bounds requests with. Reads only
+        capacity-independent facts of the layout, so it can probe a layout
+        directly instead of binding a stand-in plan first.
         """
-        counts = compute_cache_group_page_counts(
+        model = capacity_model(
             self._group_specs,
-            max_total_tokens=token_capacity,
-            **self.scheduler_limits,
+            prefix_granularity=layout.prefix_granularity,
+            virtual_packing={
+                group_id: packing * self._shard_counts[group_id]
+                for group_id, packing in layout.group_packing
+            },
+            limits=self.scheduler_limits,
         )
-        parents = 0
-        for group_id, packing in layout.group_packing:
-            packing *= self._shard_counts[group_id]
-            child_pages = counts[group_id] - NULL_PAGES
-            parents += (child_pages + packing - 1) // packing
-        return parents
+        return model.lcm_blocks_needed_for(
+            model.concurrent_group_pages(
+                max_total_tokens=token_capacity,
+                max_context_len=self.scheduler_limits.max_context_len,
+            )
+        )
 
     def _capacity_from_parents(
         self, layout: CacheLayout, num_lcm_blocks: int, *, upper_bound: int

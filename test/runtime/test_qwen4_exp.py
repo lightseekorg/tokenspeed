@@ -57,13 +57,16 @@ from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple import 
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
+    SchedulerLimits,
+    capacity_model,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     prepare_cache_setup,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
-    compute_cache_group_page_counts,
 )
 from tokenspeed.runtime.layers.attention.qsa import (
     QWEN4_EXP_QSA_CACHE_GROUP,
@@ -1816,20 +1819,37 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
     assert fields[qsa_compressed_field(1)].dtype == "bfloat16"
     assert fields[qsa_rope_position_field(1)].dtype == "int64"
 
-    short_counts = compute_cache_group_page_counts(
-        setup.spec.cache_group_specs,
-        max_live_requests=2,
-        max_scheduled_tokens=128,
-        max_total_tokens=1024,
-        max_context_len=1024,
-    )
-    long_counts = compute_cache_group_page_counts(
-        setup.spec.cache_group_specs,
-        max_live_requests=2,
-        max_scheduled_tokens=128,
-        max_total_tokens=8192,
-        max_context_len=8192,
-    )
+    def group_pages(max_tokens: int) -> dict[str, int]:
+        from tokenspeed_scheduler import SchedulerConfig
+
+        specs = setup.spec.cache_group_specs
+        model = capacity_model(
+            specs,
+            prefix_granularity=setup.spec.memory_plan.prefix_granularity,
+            virtual_packing={
+                spec.group_id: setup.spec.memory_plan.group(
+                    spec.group_id
+                ).cache_blocks_per_lcm_block
+                for spec in specs
+            },
+            limits=SchedulerLimits(
+                role=SchedulerConfig.Role.Fused,
+                max_live_requests=2,
+                # A chunk must cover one PLE state checkpoint (256 tokens).
+                max_scheduled_tokens=256,
+                max_context_len=max_tokens,
+                decode_input_tokens=1,
+                overlap_schedule_depth=0,
+                disable_prefix_cache=False,
+            ),
+        )
+        pages = model.concurrent_group_pages(
+            max_total_tokens=max_tokens, max_context_len=max_tokens
+        )
+        return dict(zip((spec.group_id for spec in specs), pages))
+
+    short_counts = group_pages(1024)
+    long_counts = group_pages(8192)
     assert (
         short_counts[QWEN4_EXP_QSA_RECENT_CACHE_GROUP]
         == long_counts[QWEN4_EXP_QSA_RECENT_CACHE_GROUP]

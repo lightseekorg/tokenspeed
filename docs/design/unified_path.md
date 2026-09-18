@@ -163,10 +163,31 @@ live rows are fully written, while negative padding rows skip state access
 and leave output undefined. Consumers must ignore padded output; enabled
 intermediate caches always require real storage.
 
-GDN prefill, decode and verify follow `pdl_enabled()`. Kernels wait before
-reading inputs and signal after computation; FlashInfer adapters preserve the
-upstream CuTe body and isolate PDL compilation caches. Graphs retain their
-capture-time PDL setting and must be recaptured to change it.
+After verification, GDN, KDA and PLE resolve the accepted checkpoint with
+`commit_state_pages`, once per state group and only for live requests. It
+clamps acceptance, computes checkpoint slots and gathers destination pages in
+one launch. `state_verify_commit_rows` maps those pages to layers and computes
+`request * (verify_width + 1) + accepted` for batched copies and ReplaySSM.
+Its inputs and outputs are contiguous: pages are `[groups, batch_size]` for
+grouped state or `[batch_size]` for PLE, so no explicit strides are needed.
+Non-positive pages resolve to row -1 so copies skip the null page. Keep this
+arithmetic in the kernels, without eager casts, gathers, `index_select` or
+`repeat`. GDN and KDA share their backend page resolver; PLE uses its own
+group's page vector and copies the shared context once and local convolution
+states in one batched launch.
+
+GDN (prefill, decode and verify), QSA and gated residual kernels follow
+`pdl_enabled()`, passed explicitly to QSA indexing kernels. Waits precede
+producer-owned reads and outgoing triggers. A trigger permits successor
+setup, never publishes results; each kernel may delay it for performance.
+Streaming top-k, for example, avoids delaying scoring waves with waiting
+merge CTAs. Graphs retain their captured PDL setting; recapture to change it.
+
+Gated RMSNorm preloads weights only with `weights_independent`; a contiguous
+copy disables this preload. At RSAG-to-AR boundaries the next combine-norm
+preloads the all-gathered residual before its wait, so that collective must
+not trigger early. FlashInfer adapters preserve the upstream CuTe body and
+keep PDL compilation caches separate.
 
 ### `for_graph_replay` is for graph-mechanics asymmetries only
 
@@ -454,6 +475,12 @@ writes the full KV cache; the dense fallback honors the caller's flag.
 Draft step zero still preserves the dense decode-context
 and KV-recording override, while QSA keeps its original context and narrows
 the selected top-k rows with the queries.
+
+The QSA API preserves `decode_query_lengths`: uniform decode/verification
+uses a positive width, while prefill and mixed/ragged queries use `None`.
+Only decode may select CuTe; NVIDIA prefill uses FlashInfer FA2, including
+single-token prefill. Adapting ragged rows to one-token queries must retain
+this distinction. Both use the same cache writer and sparse-attention call.
 
 `QSAIndexerBackend` privately owns `QSAVerifyState` only for a speculative
 target. Registry construction binds the cache plan and preallocates its
