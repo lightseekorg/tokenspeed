@@ -78,7 +78,8 @@ the portable implementation whenever the configured page-table capacity exceeds
 without synchronizing device lengths to the host during graph capture or replay.
 Reindex uses candidate-list capacity, so it can use Gluon with a wide page table.
 Query tiles cap at 256 rows to bound the score workspace. Arena page strides are
-preserved without copying the full cache. Missing or out-of-range
+preserved without copying the full cache; a non-unit stride between page bytes
+is normalized to contiguous storage before scoring. Missing or out-of-range
 cache pages never contribute rows or blocks, including the newest visible
 block. A valid newest block remains eligible regardless of its score.
 

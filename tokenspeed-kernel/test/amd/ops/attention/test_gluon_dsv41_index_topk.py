@@ -228,13 +228,16 @@ def test_index_topk_latest_block_outside_table(
     assert visible.item() == length
 
 
+@pytest.mark.parametrize("byte_stride", [1, 2])
 @pytest.mark.parametrize("reindex", [False, True])
-def test_index_topk_preserves_arena_page_stride(device, require, monkeypatch, reindex):
+def test_index_topk_preserves_arena_page_stride(
+    device, require, monkeypatch, reindex, byte_stride
+):
     require("attention", "dsv41_index_topk", "gluon", torch.bfloat16, "x")
     q = torch.ones((1, 32, 128), dtype=torch.bfloat16, device=device)
     weights = torch.ones((1, 32), dtype=torch.bfloat16, device=device)
-    arena = torch.zeros((4, 2, 64, 68), dtype=torch.uint8, device=device)
-    cache = arena[:, 0]
+    arena = torch.zeros((4, 2, 64, 68 * byte_stride), dtype=torch.uint8, device=device)
+    cache = arena[:, 0, :, ::byte_stride]
     assert not cache.is_contiguous()
     dsv41.cache_scatter(
         torch.ones((256, 128), dtype=torch.bfloat16, device=device),
@@ -279,8 +282,13 @@ def test_index_topk_preserves_arena_page_stride(device, require, monkeypatch, re
     calls = []
 
     def check_page_view(q, w, cache_2d, table, visible, candidates, logits):
-        assert cache_2d.data_ptr() == cache.data_ptr()
-        assert cache_2d.stride(0) == cache.stride(0)
+        assert cache_2d.stride(1) == 1
+        if byte_stride == 1:
+            assert cache_2d.data_ptr() == cache.data_ptr()
+            assert cache_2d.stride(0) == cache.stride(0)
+        else:
+            assert cache_2d.is_contiguous()
+            assert cache_2d.data_ptr() != cache.data_ptr()
         calls.append(cache_2d.shape)
         return launch(q, w, cache_2d, table, visible, candidates, logits)
 

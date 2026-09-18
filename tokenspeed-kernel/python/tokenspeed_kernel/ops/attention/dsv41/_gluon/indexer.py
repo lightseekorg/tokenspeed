@@ -167,6 +167,10 @@ def run_dsv41_csa2_index_topk(
     # Arena pages have gaps between them but contiguous bytes within each page.
     # Flatten only the inner dimensions to preserve their storage and page stride.
     cache_2d = index_cache.flatten(1)
+    if cache_2d.stride(1) != 1:
+        # Flatten can retain a non-unit byte stride (for example [..., ::2]).
+        # The scorers address adjacent page bytes, so normalize that layout only.
+        cache_2d = cache_2d.contiguous()
     query_chunk_size = min(int(query_chunk_size), 256)
     make_blocks = bool(candidate_topk)
 
