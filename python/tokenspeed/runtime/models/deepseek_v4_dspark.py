@@ -53,6 +53,7 @@ from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import (
     DSparkConfidenceHead,
     DSparkVanillaMarkov,
 )
+from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -649,8 +650,13 @@ class DeepseekV4DSparkModel(nn.Module):
             )
 
 
-class DeepseekV4ForCausalLMDSpark(nn.Module):
+class DeepseekV4ForCausalLMDSpark(nn.Module, TargetCaptureConfigurator):
     """Draft-only DSpark model loaded from the target checkpoint."""
+
+    def configure_target(self, target_model, target_config) -> None:
+        """Install the checkpoint's target taps before draft execution exists."""
+        del target_config
+        target_model.set_dspark_layers_to_capture(list(self.model.target_layer_ids))
 
     def __init__(
         self,

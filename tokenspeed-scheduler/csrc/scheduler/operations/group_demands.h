@@ -45,8 +45,9 @@ std::vector<GroupDemand> MakeGroupDemands(std::vector<BlockTable>& tables, Group
 // per round in tokens. Every cache group derives its own reserve from it in
 // ReservePrefillDemands -- the only writer of GroupDemand::reserve_tokens.
 struct PrefillReserve {
-    // Width of the decode step that follows the completed prompt; 0 on the P
-    // role, which never decodes locally.
+    // Width of the decode step that follows the completed prompt. The P role
+    // never decodes locally, but the forward that completes a prompt drafts
+    // the first candidate window into this slot before the remote decode.
     std::int32_t decode_input_tokens{};
     bool completes_prefill{false};
     // Rest of the prompt plus escalating decode room, prepaid by a decoding

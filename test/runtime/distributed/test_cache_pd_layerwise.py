@@ -456,6 +456,7 @@ def test_heterogeneous_zero_edge_interval_does_not_fall_back_to_identity() -> No
         decode_tp_size=1,
         prefill_layout=source_layout,
         decode_layout=destination_layout,
+        prefill_field_ids=None,
     )
     rank_one_fragments = planner.plan_for_decode_rank(0).fragments_by_prefill_rank[1]
     assert tuple(

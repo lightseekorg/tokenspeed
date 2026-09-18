@@ -73,11 +73,11 @@ class DeepseekV41CachePool(CachePool):
         return view
 
     def swa(self, layer: int) -> torch.Tensor:
-        """Return layer's uint8 [pages, 64, 528] page-planar FP8 values/E8M0 scales."""
+        """Return layer's page-planar uint8 [pages, 64, R] FP8 values/E8M0 scales."""
         return self._field(layer, "swa")
 
     def global_kv(self, owner: int) -> torch.Tensor:
-        """Return owner's uint8 [pages, 64, 288] page-planar FP4 values/E4M3 scales.
+        """Return owner's page-planar uint8 [pages, 64, R] quantized values/scales.
 
         Pass the KV source layer, not a Reuse/Reindex consumer layer.
         """

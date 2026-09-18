@@ -177,6 +177,24 @@ class AttentionBackend(CachePoolBinding, ABC):
         """Allocate static buffers the breakable prefill graphs bake.
         Default: no-op — attention stays eager at the break points."""
 
+    @property
+    def prefill_metadata_is_capture_ready(self) -> bool:
+        """Whether the current execution metadata supports a captured forward."""
+        return False
+
+    def prepare_prefill_metadata(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode, *, capture: bool
+    ) -> bool:
+        """Prepare execution metadata before eager forward or graph replay.
+
+        ``capture`` only retains startup buffers at their captured addresses;
+        it must not select different computation. Return whether attention can
+        be included in the outer graph. Other backends keep their existing
+        metadata and attention breaks. Call on the consumer stream, after the
+        scheduler-derived metadata is built and before any layer consumes it.
+        """
+        return False
+
     # ------------------------------------------------------------------
     # Metadata (docs/design/unified_path.md)
     # ------------------------------------------------------------------

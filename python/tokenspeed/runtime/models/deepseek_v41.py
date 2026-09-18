@@ -23,6 +23,8 @@
 ``load_weights`` consumes the generic CPU checkpoint iterator, rejects unknown,
 duplicate and missing local text tensors, and reports explicit vision/draft skips.
 Dense FP8 codes stay unchanged: 32x32 E8M0 scale rows expand losslessly to 1x32.
+On Hopper the dense projections load as BF16 weights instead -- codes widened on
+copy, scales folded in after loading, both exact -- and run the BF16 GEMM.
 Only grouped wo_a is dequantized to BF16, after selecting this TP rank's rows.
 Engram tables load local FP8/E8M0 rows in bounded chunks without table conversion.
 The unquantized LM head follows the model loading dtype, including its logits.
@@ -68,6 +70,7 @@ from tokenspeed_kernel.ops.attention.dsv41 import (
 )
 from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32, grouped_bf16_projection
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.configs.deepseek_v41_config import DeepseekV41Config
@@ -89,6 +92,7 @@ from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41RowPlan,
 )
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -100,6 +104,7 @@ from tokenspeed.runtime.layers.linear import (
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
 from tokenspeed.runtime.layers.moe.utils import get_moe_backend
+from tokenspeed.runtime.layers.parameter import ModelWeightParameter
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
@@ -199,6 +204,26 @@ def v41_mxfp8_config(quant_config: QuantizationConfig | None) -> Mxfp8Config | N
 
 
 class _ReferenceFp8LinearMethod(Fp8LinearMethod):
+    def __init__(self, quant_config: Mxfp8Config):
+        super().__init__(quant_config)
+        # Hopper has no tensor-core kernel for 32-wide FP8 blocks; its FP8 GEMMs
+        # rescale on CUDA cores every 32 K and trail the plain BF16 GEMM at
+        # every shape. So load the codes straight into a BF16 weight and fold
+        # the power-of-two scales in once -- both exact in BF16 -- and run the
+        # BF16 GEMM. Costs the FP8 weight size again.
+        self.load_as_bf16 = current_platform().is_hopper
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        if not self.load_as_bf16:
+            super().process_weights_after_loading(layer)
+            return
+        scale = layer.weight_scale_inv.data.view(torch.float8_e8m0fnu).to(
+            torch.bfloat16
+        )
+        layer.weight.data.unflatten(-1, (-1, 32)).mul_(scale.unsqueeze(-1))
+        layer.register_parameter("weight_scale_inv", None)
+        layer.quant_method = UnquantizedLinearMethod()
+
     def apply(
         self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None
     ) -> torch.Tensor:
@@ -244,6 +269,17 @@ def configure_v41_fp8_linear(layer: LinearBase, expand_checkpoint_scales: bool) 
     ) or layer.quant_config.weight_block_size != [1, 32]:
         raise ValueError("Configure V4.1 linears with the lossless 1x32 MXFP8 config")
     layer.quant_method = _ReferenceFp8LinearMethod(layer.quant_config)
+    if layer.quant_method.load_as_bf16:
+        # Same shape and sharding loader as the FP8 parameter; the loader's
+        # copy widens each E4M3 code to BF16 exactly.
+        codes = layer.weight
+        layer.weight = ModelWeightParameter(
+            data=torch.empty_like(codes.data, dtype=torch.bfloat16),
+            input_dim=codes.input_dim,
+            output_dim=codes.output_dim,
+            weight_loader=codes.weight_loader,
+        )
+        layer.weight.loads_fp8_codes = True
     if not expand_checkpoint_scales:
         return
     scale = layer.weight_scale_inv
@@ -1755,11 +1791,14 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                     raise ValueError(
                         f"{raw_name}: expected {expected}, got {tuple(tensor.shape)}"
                     )
-                if param.dtype == torch.float8_e4m3fn and tensor.dtype != param.dtype:
+                expects_fp8 = param.dtype == torch.float8_e4m3fn or getattr(
+                    param, "loads_fp8_codes", False
+                )
+                if expects_fp8 and tensor.dtype != torch.float8_e4m3fn:
                     raise TypeError(
                         f"{raw_name}: expected checkpoint FP8 E4M3, got {tensor.dtype}"
                     )
-                if param.dtype != torch.float8_e4m3fn and not name.endswith(".scale"):
+                if not expects_fp8 and not name.endswith(".scale"):
                     fp32 = ".hc_" in name or name.endswith(
                         (".attn_sink", ".ffn.gate.bias", ".ffn.gate.bias_vl")
                     )

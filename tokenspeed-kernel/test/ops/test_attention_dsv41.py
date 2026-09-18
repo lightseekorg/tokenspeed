@@ -386,7 +386,7 @@ def test_index_scores_reference_rounding_per_head_relu_and_weights(
     out = torch.empty_like(expected)
     assert dsv41.index_score(q, weights, cache, slots, None, out) is out
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
-    quantized = dsv41.index_q_quantize(q, None)
+    quantized = dsv41.index_q_quantize(q, "index", None)
     torch.testing.assert_close(quantized, q_ref, rtol=0, atol=0)
 
 
@@ -508,6 +508,102 @@ def test_reindex_reads_only_candidate_rows_and_reapplies_causality(device):
     )
     torch.testing.assert_close(top[0, :23].long(), expected0, rtol=0, atol=0)
     assert (top[0, 23:] == -1).all() and (top[2] == -1).all()
+
+
+def test_index_topk_batch_without_any_visible_context(device):
+    # A padded warmup batch: 32 replicated heads, every visible length 0, every
+    # page null. Native scorers must not fault on a batch with no keys at all.
+    q = torch.randn((96, 32, 128), dtype=torch.bfloat16, device=device)
+    weights = torch.rand((96, 32), dtype=torch.bfloat16, device=device)
+    cache = torch.zeros((2, 64, 132), dtype=torch.uint8, device=device)
+    dsv41.cache_scatter(
+        torch.randn((128, 128), dtype=torch.bfloat16, device=device),
+        cache,
+        torch.arange(128, device=device),
+        "index_v4",
+    )
+    table = torch.full((96, 1025), -1, dtype=torch.int32, device=device)
+    visible = torch.zeros(96, dtype=torch.int32, device=device)
+    top, lengths, blocks, block_lens = dsv41.index_topk(
+        q, weights, cache, table, visible, None, 512, 64, 8, 64, 4096, None, None
+    )
+    torch.cuda.synchronize()
+    assert not lengths.any() and not block_lens.any()
+    assert (top == -1).all() and (blocks == -1).all()
+
+
+def _index_cache(k, fmt):
+    width = implementation._LAYOUTS[fmt][3]
+    cache = torch.zeros(
+        ((k.shape[0] + 63) // 64, 64, width), dtype=torch.uint8, device=k.device
+    )
+    dsv41.cache_scatter(k, cache, torch.arange(k.shape[0], device=k.device), fmt)
+    return cache
+
+
+@pytest.mark.parametrize("fmt", ["index", "index_v4"])
+@pytest.mark.parametrize("shared_table", [True, False])
+def test_index_topk_selects_top_scores_on_every_index_format(device, fmt, shared_table):
+    # 32 replicated heads, a paged history in reverse page order, mixed visible
+    # lengths: the shape every native scorer serves. A shared (stride-0) table
+    # is the chunked-prefill shape, a per-row table the decode shape; native
+    # scorers take different paths for the two. Whatever kernel the format
+    # routes to, each chosen row must score within rounding of the true top set,
+    # and the reindex pass must return exactly the candidate rows it was handed.
+    torch.manual_seed(47)
+    rows = 64 * 40
+    k = torch.randn((rows, 128), dtype=torch.bfloat16, device=device)
+    q = torch.randn((4, 32, 128), dtype=torch.bfloat16, device=device)
+    weights = torch.rand((4, 32), dtype=torch.bfloat16, device=device)
+    cache = _index_cache(k, fmt)
+    table = torch.arange(cache.shape[0] - 1, -1, -1, device=device).expand(4, -1)
+    if not shared_table:
+        table = table.contiguous()
+    visible = torch.tensor([rows, 1000, 513, 0], device=device)
+    logical = torch.arange(rows, device=device).expand(4, -1)
+    slots = table.gather(1, logical // 64) * 64 + logical % 64
+    slots = slots.masked_fill(logical >= visible[:, None], -1)
+    scores = dsv41.index_score(q, weights, cache, slots, None, None).float()
+
+    top, lengths, blocks, block_lens = dsv41.index_topk(
+        q, weights, cache, table, visible, None, 512, 64, 8, 64, 4096, None, None
+    )
+    torch.cuda.synchronize()
+    assert lengths.tolist() == [512, 512, 512, 0]
+    assert block_lens.tolist() == [64, 64, 64, 0]
+    tol = 2**-6 * scores[:, :].abs().amax()
+    for r in range(3):
+        chosen = top[r, : lengths[r]].long()
+        assert chosen.min() >= 0 and chosen.max() < visible[r]
+        threshold = scores[r, : visible[r]].topk(512).values.min()
+        assert (scores[r, chosen] >= threshold - tol).all()
+        block_max = (
+            torch.nn.functional.pad(
+                scores[r, : visible[r]], (0, -int(visible[r]) % 8), value=-torch.inf
+            )
+            .view(-1, 8)
+            .amax(-1)
+        )
+        picked = blocks[r, : block_lens[r]].long()
+        assert ((visible[r] - 1) // 8 == picked).any()
+        assert (block_max[picked] >= block_max.topk(64).values.min() - tol).all()
+    assert (top[3] == -1).all() and (blocks[3] == -1).all()
+
+    rerows, relengths, _, _ = dsv41.index_topk(
+        q, weights, cache, table, visible, blocks, 512, 0, 8, 64, 4096, None, None
+    )
+    for r in range(3):
+        allowed = (
+            blocks[r, : block_lens[r]].long()[:, None] * 8
+            + torch.arange(8, device=device)
+        ).flatten()
+        allowed = allowed[allowed < visible[r]]
+        chosen = rerows[r, : relengths[r]].long()
+        assert relengths[r] == min(512, allowed.numel())
+        assert torch.isin(chosen, allowed).all()
+        threshold = scores[r, allowed].topk(int(relengths[r])).values.min()
+        assert (scores[r, chosen] >= threshold - tol).all()
+    assert relengths[3] == 0
 
 
 def test_candidate_block_max_not_sum(device):
@@ -692,10 +788,12 @@ def test_optional_snapshot_quantization_oracle(device):
         )
 
 
-def test_fused_swa_matches_rope_quantization_and_page_bytes(device):
+@pytest.mark.parametrize("fmt", ["swa", "swa_v4"])
+def test_fused_swa_matches_rope_quantization_and_page_bytes(device, fmt):
     from tokenspeed_kernel.ops.attention.dsv41 import rope_inplace
 
     torch.manual_seed(419)
+    width = implementation._LAYOUTS[fmt][3]
     values = torch.randn(257, 512, device=device, dtype=torch.bfloat16)
     positions = torch.arange(257, device=device, dtype=torch.int64)
     angles = (
@@ -706,16 +804,63 @@ def test_fused_swa_matches_rope_quantization_and_page_bytes(device):
     rope = torch.cat((angles.cos(), angles.sin()), -1)
     slots = torch.arange(64, 321, device=device, dtype=torch.int32)
     slots[0] = -1
-    storage = torch.zeros((6, 64 * 528 + 512), device=device, dtype=torch.uint8)
-    cache = storage[:, : 64 * 528].view(6, 64, 528)
-    expected = storage.clone()[:, : 64 * 528].view(6, 64, 528)
+    storage = torch.zeros((6, 64 * width + 512), device=device, dtype=torch.uint8)
+    cache = storage[:, : 64 * width].view(6, 64, width)
+    expected = storage.clone()[:, : 64 * width].view(6, 64, width)
     rotated = rope_inplace(values.clone(), positions, rope, None)
-    dsv41.cache_scatter(rotated, expected, slots, "swa")
+    dsv41.cache_scatter(rotated, expected, slots, fmt)
     out = torch.empty_like(values)
-    dsv41.swa_rope_scatter(values, positions, rope, cache, slots, out)
-    reference = dsv41.cache_unpack(dsv41.cache_pack(rotated, "swa", None), "swa", None)
+    dsv41.swa_rope_scatter(values, positions, rope, cache, slots, fmt, out)
+    reference = dsv41.cache_unpack(dsv41.cache_pack(rotated, fmt, None), fmt, None)
     torch.testing.assert_close(out, reference, rtol=0, atol=0)
     torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fmt", ["swa_v4", "global_v4"])
+def test_v4_rows_quantize_head_and_carry_rope_tail_verbatim(device, fmt):
+    """The V4 row is three planes: E4M3 NoPE, BF16 RoPE, E8M0 scales with pad."""
+    dim, group, values, row_bytes, quantized = implementation._LAYOUTS[fmt]
+    scale_bytes = implementation._scale_bytes(fmt)
+    assert (dim, group, quantized, row_bytes) == (512, 64, 448, 584)
+    assert values + (dim - quantized) * 2 + scale_bytes == row_bytes
+
+    torch.manual_seed(41)
+    rows = 137
+    x = (torch.randn(rows, dim, device=device, dtype=torch.bfloat16) * 0.7).float()
+    x[0].zero_()
+    x[1, :quantized] = 1e-6
+    cache = torch.zeros(
+        ((rows + 63) // 64, 64, row_bytes), dtype=torch.uint8, device=device
+    )
+    slots = torch.arange(rows, device=device, dtype=torch.int32)
+    dsv41.cache_scatter(x.to(torch.bfloat16), cache, slots, fmt)
+    got = dsv41.cache_gather(cache, slots, fmt, None).float()
+
+    # Independent E8M0-per-group oracle for the head; the tail is not quantized.
+    head = x[:, :quantized].reshape(rows, -1, group)
+    amax = head.abs().amax(dim=-1).clamp_min(1e-4) / 448.0
+    bits = amax.view(torch.int32)
+    exponent = ((bits >> 23) & 255) - 127 + ((bits & 0x7FFFFF) != 0).int()
+    scale = torch.exp2(exponent.float()).unsqueeze(-1)
+    quant = (head / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    torch.testing.assert_close(
+        got[:, :quantized], (quant.float() * scale).reshape(rows, quantized)
+    )
+    torch.testing.assert_close(
+        got[:, quantized:], x[:, quantized:].to(torch.bfloat16).float(), rtol=0, atol=0
+    )
+
+    # Planes are page-planar, so the scale plane starts at a flat page offset.
+    flat = cache[0].reshape(-1)
+    plane = 64 * (values + (dim - quantized) * 2)
+    used = quantized // group
+    pad = torch.stack(
+        [
+            flat[plane + row * scale_bytes + used : plane + (row + 1) * scale_bytes]
+            for row in range(64)
+        ]
+    )
+    assert int(pad.ne(0).sum()) == 0
 
 
 def test_compressor_fused_norm_preserves_pooled_bf16_boundary(device):
@@ -758,13 +903,23 @@ def _native_available():
 
     return (
         torch.cuda.is_available()
-        and torch.cuda.get_device_capability()[0] == 10
+        and torch.cuda.get_device_capability()[0] >= 9
         and is_flash_mla_v41_available()
     )
 
 
+def _native_formats():
+    """Return the (swa, global) formats this target's FlashMLA can read.
+
+    sm90 carries the V4 cache reader only; sm100 adds V4.1 and its FP4 rows.
+    """
+    if torch.cuda.get_device_capability()[0] == 9:
+        return "swa_v4", "global_v4"
+    return "swa", "global"
+
+
 def _native_cache(rows, fmt):
-    width = {"swa": 528, "global": 288}[fmt]
+    width = implementation._LAYOUTS[fmt][3]
     backing = torch.zeros(
         (rows // 64 + 1, 64 * width + 512), device="cuda", dtype=torch.uint8
     )
@@ -778,14 +933,15 @@ def _native_cache(rows, fmt):
 
 
 @pytest.mark.skipif(
-    not _native_available(), reason="FlashMLA V4.1 on Blackwell required"
+    not _native_available(), reason="FlashMLA V4.1 on Hopper or newer required"
 )
 @pytest.mark.parametrize("batch", [1, 16, 17])
 @pytest.mark.parametrize("extra_width", [0, 512, 768])
 def test_native_decode_graph_refresh_slots_lengths_and_idle(batch, extra_width):
     torch.manual_seed(741)
-    sa, swa = _native_cache(256, "swa")
-    ga, glob = _native_cache(1024, "global")
+    swa_fmt, global_fmt = _native_formats()
+    sa, swa = _native_cache(256, swa_fmt)
+    ga, glob = _native_cache(1024, global_fmt)
     before_s, before_g = sa.clone(), ga.clone()
     q = torch.randn(batch, 16, 512, dtype=torch.bfloat16, device="cuda") * 0.3
     ss = (
@@ -839,10 +995,10 @@ def test_native_decode_graph_refresh_slots_lengths_and_idle(batch, extra_width):
         graph.replay()
         eager = run(dsv41.new_attention_schedule())
         torch.testing.assert_close(captured, eager, rtol=0, atol=0)
-        parts = [dsv41.cache_gather(swa, ss, "swa", None).float()]
+        parts = [dsv41.cache_gather(swa, ss, swa_fmt, None).float()]
         masks = [torch.arange(128, device="cuda")[None, :] < sl[:, None]]
         if extra_width:
-            parts.append(dsv41.cache_gather(glob, gs, "global", None).float())
+            parts.append(dsv41.cache_gather(glob, gs, global_fmt, None).float())
             masks.append(
                 torch.arange(extra_width, device="cuda")[None, :] < gl[:, None]
             )
@@ -859,7 +1015,7 @@ def test_native_decode_graph_refresh_slots_lengths_and_idle(batch, extra_width):
 
 
 @pytest.mark.skipif(
-    not _native_available(), reason="FlashMLA V4.1 on Blackwell required"
+    not _native_available(), reason="FlashMLA V4.1 on Hopper or newer required"
 )
 @pytest.mark.parametrize("query_chunk_size", [16, 256])
 def test_native_prefill_workspace_matches_joint_softmax(query_chunk_size):

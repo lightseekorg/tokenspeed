@@ -231,6 +231,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 "V4.1 selection sizes exceed the budgeted Top-512/2048 capacities"
             )
         self.spec = spec
+        rows = spec.row_layout()
+        # The kernel format names the cache rows are packed in. One choice for
+        # the whole pool: the recipe sized the fields from the same record.
+        self.swa_format = rows.swa_kernel_format
+        self.global_format = rows.global_kernel_format
+        self.index_format = rows.index_kernel_format
         self.context_len = config.context_len
         self.forward_metadata: V41Metadata | None = None
         self.forward_prefill_metadata: V41Metadata | None = None
@@ -1034,8 +1040,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 positions + (ratio - 1) < floor[request_indices.clamp_min(0)]
             )
             slots = slots.masked_fill(below, -1)
-        dsv41.cache_scatter(main_kv, self.cache_pool.global_kv(owner), slots, "global")
-        dsv41.cache_scatter(index_k, self.cache_pool.index_k(owner), slots, "index")
+        dsv41.cache_scatter(
+            main_kv, self.cache_pool.global_kv(owner), slots, self.global_format
+        )
+        dsv41.cache_scatter(
+            index_k, self.cache_pool.index_k(owner), slots, self.index_format
+        )
 
     def _selection_rows(self, record, positions, requests, forward_mode):
         if positions is record.positions and requests is record.request_indices:
@@ -1536,10 +1546,16 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             # The current position cannot alias one of its previous 127 logical
             # rows. Ordinary retained-page writes therefore precede paged decode.
             if swa_rope_cache is None:
-                dsv41.cache_scatter(swa_kv, cache, locations, "swa")
+                dsv41.cache_scatter(swa_kv, cache, locations, self.swa_format)
             else:
                 dsv41.swa_rope_scatter(
-                    swa_kv, positions, swa_rope_cache, cache, locations, None
+                    swa_kv,
+                    positions,
+                    swa_rope_cache,
+                    cache,
+                    locations,
+                    self.swa_format,
+                    None,
                 )
             swa_slots, swa_lens = (
                 (metadata.swa_read_slots, metadata.swa_read_lens)
@@ -1566,17 +1582,23 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         # Quantize current rows exactly as cache storage, without publishing them
         # until every request has read its old sliding prefix.
         prefixes = [
-            dsv41.cache_gather(cache, request.prefix_slots, "swa", None)
+            dsv41.cache_gather(cache, request.prefix_slots, self.swa_format, None)
             for request in plan.requests
         ]
         if swa_rope_cache is None:
             current = dsv41.cache_unpack(
-                dsv41.cache_pack(swa_kv, "swa", None), "swa", None
+                dsv41.cache_pack(swa_kv, self.swa_format, None), self.swa_format, None
             )
         else:
             current = torch.empty_like(swa_kv)
             dsv41.swa_rope_scatter(
-                swa_kv, positions, swa_rope_cache, cache, locations, current
+                swa_kv,
+                positions,
+                swa_rope_cache,
+                cache,
+                locations,
+                self.swa_format,
+                current,
             )
         logical_rows = None
         if owner >= 0:
@@ -1611,7 +1633,10 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             indices = request_plan.swa_indices
             if owner >= 0:
                 dsv41.cache_gather(
-                    global_cache, history_slots, "global", workspace[swa_count:]
+                    global_cache,
+                    history_slots,
+                    self.global_format,
+                    workspace[swa_count:],
                 )
                 selected = logical_rows[rows]
                 compressed_indices = torch.where(
@@ -1645,7 +1670,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 out[rows] = result
             del workspace, current_rows, indices
         if swa_rope_cache is None:
-            dsv41.cache_scatter(swa_kv, cache, locations, "swa")
+            dsv41.cache_scatter(swa_kv, cache, locations, self.swa_format)
         return out
 
     def forward_decode(self, *args, **kwargs):

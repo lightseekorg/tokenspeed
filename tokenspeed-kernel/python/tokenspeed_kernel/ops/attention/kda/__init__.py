@@ -40,6 +40,7 @@ from tokenspeed_kernel.signature import (
 
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
 
+from tokenspeed_kernel.ops.attention.kda._prefill_capacity import KdaPrefillCapacity
 
 # One UE8M0 scale per 32 consecutive head_dim elements (MXFP8).
 MXFP8_ATTENTION_BLOCK_SCALE = MXFP8_BLOCK_SCALE
@@ -147,6 +148,8 @@ def kda_paged_prefill(
     initial_state: torch.Tensor,
     cu_seqlens: torch.Tensor,
     cu_seqlens_cpu: torch.Tensor,
+    capacity: KdaPrefillCapacity | None,
+    inputs_packed: bool,
     lower_bound: float | None = -5.0,
     override: str | None = None,
     solution: str | None = None,
@@ -167,6 +170,10 @@ def kda_paged_prefill(
             stream-synchronizing D2H per KDA layer per chunk, which stalls
             the launch thread behind all queued work (and serializes the
             chunk pipeline's stages).
+        capacity: Explicit CuTeDSL graph planning bounds, or None for exact
+            live-length planning. Live boundaries retain their normal meaning.
+        inputs_packed: The checkpoint packer produced contiguous Q/K/V and
+            beta with zero padding. Gate padding still requires initialization.
         lower_bound: Optional safe lower bound for log decay.
         override: Optional exact kernel name.
         solution: Optional registered solution name.
@@ -200,6 +207,13 @@ def kda_paged_prefill(
         )
     if solution == "fla":
         solution = "triton"
+    capacity_kwargs = {}
+    if capacity is not None:
+        if solution != "cutedsl_kda":
+            raise ValueError("KDA capacity planning requires explicit cutedsl_kda")
+        capacity.validate(cu_seqlens_cpu, q.shape[1])
+        capacity_kwargs["capacity"] = capacity
+        capacity_kwargs["inputs_packed"] = inputs_packed
     kernel = select_kernel(
         "attention",
         "kda_paged_prefill",
@@ -208,6 +222,10 @@ def kda_paged_prefill(
         override=override,
     )
     spec = KernelRegistry.get().get_by_name(kernel.name)
+    if capacity is not None and (
+        spec is None or True not in spec.traits.get("prefill_capacity", ())
+    ):
+        raise ValueError("Selected KDA kernel does not support planning capacity")
     supported = None if spec is None else spec.traits.get("recurrent_layout")
     # Kernels that declare no layout consume the caller's state as it is.
     relayout = supported is not None and recurrent_layout not in supported
@@ -225,6 +243,7 @@ def kda_paged_prefill(
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens_cpu,
         lower_bound=lower_bound,
+        **capacity_kwargs,
     )
     if relayout:
         # Hand the final state back in the caller's layout (a view; no copy).

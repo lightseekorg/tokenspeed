@@ -654,6 +654,7 @@ def test_only_dedicated_tasks_declare_gb300():
         "kimi-k3-mxfp4-dspark-tp8-two-node-kvv-ocr-bench-gb300-slurm.yaml",
         "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
         "kimi-k3-nvfp4-dflash2-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
+        "kimi-k3-nvfp4-dp16-four-node-evalscope-aime26-gb300-slurm.yaml",
         "kimi-k3-nvfp4-dspark-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
         "kimi-k3-nvfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
     ]
@@ -898,6 +899,18 @@ def test_gb300_slurm_per_commit_matrix_selects_model_tasks(monkeypatch):
             "config": (
                 "test/ci/eval/"
                 "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml"
+            ),
+            "runner": "slurm-gb300-4gpu",
+            "priority": "normal",
+            "optional": False,
+            "workflow_stage": "model-test",
+        },
+        {
+            "name": "eval-kimi-k3-nvfp4-dp16-four-node-aime26-gb300-slurm",
+            "type": "eval",
+            "config": (
+                "test/ci/eval/"
+                "kimi-k3-nvfp4-dp16-four-node-evalscope-aime26-gb300-slurm.yaml"
             ),
             "runner": "slurm-gb300-4gpu",
             "priority": "normal",

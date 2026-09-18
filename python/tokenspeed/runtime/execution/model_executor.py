@@ -180,6 +180,11 @@ class ModelExecutorConfig:
     disable_cuda_graph_padding: bool
     max_cudagraph_capture_size: int
     model_is_mrope: bool
+    # The prefill role of a disaggregated deployment computes prompts only:
+    # it never runs a decode/verify step of its own.
+    prefill_only: bool
+    # Explicit None selects the minimum request count for each token bucket.
+    prefill_graph_capture_batch_sizes: list[int] | None
     enable_nan_detection: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
@@ -286,7 +291,9 @@ class ModelExecutorConfig:
             disable_prefill_graph=disable_prefill_graph,
             prefill_graph_max_tokens=_resolve_prefill_graph_max_tokens(server_args),
             prefill_graph_capture_sizes=server_args.prefill_graph_capture_sizes,
+            prefill_graph_capture_batch_sizes=server_args.prefill_graph_capture_batch_sizes,
             model_is_mrope=model_is_mrope,
+            prefill_only=server_args.disaggregation_mode == "prefill",
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
             world_group=server_args.mapping.world_group,
@@ -376,7 +383,26 @@ class ModelExecutor:
             max_bs,
             self.device,
         )
-        if self.config.spec_algo is not None:
+        self.dspark_context_producer = None
+        if config.spec_algo is not None and config.pp_size > 1:
+            # Pipeline speculation: the target taps live on several stages, so
+            # each stage projects its own during the target forward and the
+            # final stage writes the draft context. Off the pipeline the
+            # drafter keeps projecting and writing context itself.
+            from tokenspeed.runtime.execution.dspark_context import (
+                DSparkContextModel,
+                DSparkContextProducer,
+            )
+
+            if not isinstance(draft_model_runner.model, DSparkContextModel):
+                raise TypeError(
+                    f"{type(draft_model_runner.model).__name__} cannot produce "
+                    "DSpark context across pipeline stages."
+                )
+            self.dspark_context_producer = DSparkContextProducer(
+                draft_model_runner.model, draft_token_to_kv_pool
+            )
+        if self.config.spec_algo is not None and self._pp_is_last_stage:
             # Model-to-model wiring (shared embed/head, eagle3 capture ids)
             # already happened in create_model_runner, right after both
             # models loaded. Here only the drafter instance is built and
@@ -478,7 +504,10 @@ class ModelExecutor:
             decode_graph_supported=graph_support.decode_graph,
         )
         # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
-        if config.enforce_eager:
+        # The prefill role never decodes: a DECODE-shaped dummy would need the
+        # verify scratch it does not allocate, and its ranks initialize lazy
+        # collectives together on their first prefill round instead.
+        if config.enforce_eager and not config.prefill_only:
             logger.info("Prewarming Triton RSAG communication states")
             self.forward_step.prewarm_comm_states(batch_sizes=(1,))
             logger.info("Finished prewarming Triton RSAG communication states")
@@ -558,8 +587,9 @@ class ModelExecutor:
         """Profile tunable kernels over one dummy prefill before graph capture.
 
         The dummy batch is capped by both the chunked-prefill token budget and
-        rank-local request capacity. ``make_dummy_batch`` splits tokens into
-        requests of at most ``context_len``, while request-indexed buffers
+        rank-local request capacity. The caller supplies the minimum request
+        count that fits the model context; ``make_dummy_batch`` balances tokens
+        across those requests, while request-indexed buffers
         contain only ``max_num_seqs // data_parallel_size`` rows. Keeping the
         token count within their product prevents autotuning from constructing
         a batch that cannot fit those buffers.
@@ -617,7 +647,8 @@ class ModelExecutor:
             ib.fill_dummy_decode_buffers(
                 batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
             )
-            ctx = self.prefill_graph.make_dummy_batch(num_tokens)
+            bs = -(-num_tokens // max(1, int(self.config.context_len)))
+            ctx = self.prefill_graph.make_dummy_batch(num_tokens, bs)
             positions = (
                 ib.mrope_positions_buf[:, :num_tokens]
                 if self.config.model_is_mrope
@@ -757,6 +788,16 @@ class ModelExecutor:
                 ctx,
                 self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
                 self._active_multimodal_context,
+            )
+        if (
+            mode is not None
+            and mode.is_extend()
+            and self.config.data_parallel_size == 1
+        ):
+            # The same execution metadata as replay, sized to eager's physical
+            # input extent. This neither pads requests nor captures new graphs.
+            self.attn_backend.prepare_prefill_metadata(
+                ctx.input_num_tokens, ctx.bs, mode, capture=False
             )
         return self.model_runner.forward(
             ctx,
@@ -921,6 +962,7 @@ class ModelExecutor:
             )
             self.capturable_grammar.schedule_fill(input_ids_buf_slice=slice_)
 
+        ctx.dspark_context_producer = self.dspark_context_producer
         if self.drafter is not None:
             self.drafter.prepare_target_forward(ctx)
 
@@ -1418,6 +1460,7 @@ class ModelExecutor:
                     capture_hidden_mode=(
                         CaptureHiddenMode.FULL
                         if self.drafter is not None
+                        and self.dspark_context_producer is None
                         else CaptureHiddenMode.NULL
                     ),
                     gather_ids=gather_ids,
@@ -1630,8 +1673,13 @@ class ModelExecutor:
 
     def register_draft_final_step_counter(self, step_counter) -> None:
         """Publish one CachePD step after a supported drafter's complete run."""
-        if self.drafter is None or not getattr(
-            self.drafter, "supports_pd_layerwise_finalization", False
+        producer = (
+            self.dspark_context_producer
+            if self.dspark_context_producer is not None
+            else self.drafter
+        )
+        if producer is None or not getattr(
+            producer, "supports_pd_layerwise_finalization", False
         ):
             raise RuntimeError(
                 "the speculative drafter cannot finalize layerwise CachePD writes"

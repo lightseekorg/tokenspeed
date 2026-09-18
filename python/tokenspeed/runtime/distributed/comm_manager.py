@@ -174,6 +174,8 @@ class CommManager:
             # For first layer, the input residual has attn_tp_num_tokens.
             # Otherwise, if this layer experiences a RSAG -> AR switch, residual needs allgather.
             if self.layer_id > 0 and not self.use_all_reduce(self.prev_is_moe):
+                # Keep this residual-producing collective free of early PDL
+                # triggers: the next gated combine-norm may preload its result.
                 residual = token_all_gather(
                     residual,
                     group=self.mapping.attn.tp_group,

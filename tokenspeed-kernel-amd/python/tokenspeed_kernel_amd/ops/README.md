@@ -105,3 +105,42 @@ Larger rows use double-buffered TDM loads, overlapping the next tile's transfer
 with per-lane candidate updates and reducing across lanes once per row. TDM's
 zero padding is masked before comparison. Tile sizes account for element size
 and batch size to limit shared-memory usage.
+
+## MoE
+
+### MXFP8 SiTU Experts
+
+On gfx950, the MoE API selects Gluon kernels with MXFP8 activations and MXFP4
+weights for EP8 SiTU experts with a 3072-wide intermediate and supported clamp
+settings. The `input` activation policy selects
+BF16-activation decode for eligible batches of up to four tokens; explicit
+`fp8` uses MXFP8 throughout.
+
+Weight preparation interleaves gate/up weights and arranges weights and scales
+for tiled loads. MXFP8 and BF16-activation kernels share one prepared
+weight bank.
+
+#### Algorithm
+
+Starting from BF16 activations and precomputed top-k expert IDs and weights:
+
+1. **Sort routes** into padded blocks for local experts, preserving repeated
+   expert selections as distinct slots. Zero the output during route scatter.
+2. **Quantize inputs** to E4M3 values with one E8M0 scale per 32 values.
+   Values remain in token order; only scales are gathered into sorted-route
+   order.
+3. **Gate/up GEMM + SiTU** uses scaled matrix instructions and FP32
+   accumulation, fusing the activation into a BF16 token-slot intermediate.
+4. **Quantize intermediates** to MXFP8, keeping values in token-slot
+   order and scales in sorted-route order.
+5. **Down GEMM + weighted combine** accumulates in FP32, applies route
+   weights, and atomically adds BF16 results into each token's output row.
+
+Batches of up to 1024 tokens use 32-row expert tiles to reduce padding;
+larger batches use 128-row tiles. With 32-row tiles, quantization and sorted-scale
+production share a launch. Small route sets use a two-launch sorter; larger
+route sets use four phases. Blocks beyond the valid routed prefix skip work.
+
+Both GEMMs overlap loads with matrix computation using double-buffered shared
+memory. Phased operand loading and scheduling barriers limit live registers;
+compiler-inserted shared-memory barriers provide inter-wave synchronization.
