@@ -32,6 +32,12 @@ best people and average people is more than tenfold.
 * Use f-strings for Python string interpolation, including logging messages.
   Keep format templates required by APIs such as `strftime` and logging
   formatters in their required syntax.
+* Declare and initialize instance fields explicitly in `__init__` or as
+  dataclass fields. Do not attach undeclared attributes after construction.
+  Represent optional state with an initialized field, such as
+  `self.x: int | None = None`, rather than a sometimes-missing attribute.
+  Access fields directly; avoid `hasattr`, `getattr`, and `setattr` for class
+  state, including fallback values that hide missing declarations.
 * Use the repository's full MIT license header for copyright notices; do not use
   an abbreviated copyright-only header.
 * Before creating commits, run `pre-commit run --all-files` to format.

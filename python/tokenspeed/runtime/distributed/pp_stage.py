@@ -100,7 +100,7 @@ def pp_layer_window(num_hidden_layers: int, mapping: Mapping) -> tuple[int, int]
     """
     pp_size = mapping.pp_size
     pp_rank = mapping.pp_rank if pp_size > 1 else 0
-    partition = getattr(mapping, "pp_layer_partition", None)
+    partition = mapping.pp_layer_partition
     return pp_stage_windows(num_hidden_layers, pp_size, partition)[pp_rank]
 
 

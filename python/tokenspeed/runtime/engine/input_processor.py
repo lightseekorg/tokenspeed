@@ -61,7 +61,7 @@ class InputProcessor:
         # model can't emit ``<think>…</think>`` before the JSON.
         if "json_schema" not in sampling:
             return
-        reasoning_parser = getattr(self.engine.server_args, "reasoning_parser", None)
+        reasoning_parser = self.engine.server_args.reasoning_parser
         if not reasoning_parser:
             return
         try:

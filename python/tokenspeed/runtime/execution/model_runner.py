@@ -91,6 +91,8 @@ class ModelRunner:
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
         self.is_draft_worker = is_draft_worker
+        self._weight_update_pg: torch.distributed.ProcessGroup | None = None
+        self._weight_update_device: torch.device | None = None
         self.mambaish_config = getattr(model_config, "mambaish_config", None)
         self.is_hybrid_gdn = getattr(model_config, "is_hybrid_gdn", False)
 
@@ -304,7 +306,7 @@ class ModelRunner:
         """Receive trainer-broadcast weights over the NCCL group and load them."""
         import torch.distributed as dist
 
-        pg = getattr(self, "_weight_update_pg", None)
+        pg = self._weight_update_pg
         if pg is None:
             return False, "weight update group not initialized"
         try:
@@ -342,7 +344,7 @@ class ModelRunner:
         clean group. Idempotent: tearing down when no group is live is a success
         so a trainer that always calls destroy (e.g. slime) never errors.
         """
-        pg = getattr(self, "_weight_update_pg", None)
+        pg = self._weight_update_pg
         if pg is None:
             return True, "weight update group not initialized"
 

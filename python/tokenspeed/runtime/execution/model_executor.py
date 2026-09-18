@@ -347,6 +347,7 @@ class ModelExecutor:
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self._draft_final_step_counter = None
+        self._pp_wire_logged = False
 
         max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
 
@@ -709,7 +710,7 @@ class ModelExecutor:
         spec = self.model_runner.model.model.pp_stage_state_spec(
             num_tokens, torch.device(self.device)
         )
-        if not getattr(self, "_pp_wire_logged", False):
+        if not self._pp_wire_logged:
             self._pp_wire_logged = True
             logger.info(
                 f"PP stage {self.config.pp_rank:d} recv wire: "
@@ -732,7 +733,7 @@ class ModelExecutor:
         from tokenspeed.runtime.distributed.comm_ops import pp_send
 
         tensors = state.tensors()
-        if not getattr(self, "_pp_wire_logged", False):
+        if not self._pp_wire_logged:
             self._pp_wire_logged = True
             logger.info(
                 f"PP stage {self.config.pp_rank:d} send wire: "
@@ -1233,7 +1234,7 @@ class ModelExecutor:
 
         with nvtx_range("zero_cache_pages", color="purple"):
             sanitized = sanitize(self.token_to_kv_pool, pages)
-            draft_pool = getattr(self, "draft_token_to_kv_pool", None)
+            draft_pool = self.draft_token_to_kv_pool
             if draft_pool is not None and getattr(
                 draft_pool,
                 "requires_page_zeroing",

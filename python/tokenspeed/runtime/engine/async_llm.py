@@ -686,7 +686,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         """Launch the SGLang-compatible RL control app on this event loop."""
         if self._rl_control_task is not None:
             return
-        port = getattr(self.server_args, "rl_control_port", None)
+        port = self.server_args.rl_control_port
         if not port:
             return
         self._rl_control_task = loop.create_task(self._serve_rl_control_plane(port))

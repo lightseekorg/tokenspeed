@@ -132,8 +132,8 @@ def _warmup_deep_gemm_fp8_linears(plans: list[object], max_tokens: int) -> None:
         set_pdl(pdl_enabled())
     by_device: dict[torch.device, set[tuple[int, int]]] = {}
     for plan in plans:
-        warmup_key = getattr(plan, "warmup_key")
-        prepared_weight_scales = getattr(plan, "prepared_weight_scales")
+        warmup_key = plan.warmup_key
+        prepared_weight_scales = plan.prepared_weight_scales
         assert warmup_key is not None
         assert prepared_weight_scales is not None
         n, k = warmup_key

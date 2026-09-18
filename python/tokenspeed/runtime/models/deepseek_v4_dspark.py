@@ -549,7 +549,7 @@ class DeepseekV4DSparkModel(nn.Module):
         if lm_head is not None:
             head_fp32 = lm_head.weight.float()
         else:
-            head_fp32 = getattr(self, "_local_base_head_fp32", None)
+            head_fp32 = self._local_base_head_fp32
             if head_fp32 is None:
                 raise RuntimeError(
                     "DSpark local base logits require a cached target LM head."
