@@ -377,13 +377,21 @@ class ModelExecutor:
             self.device,
         )
         self.dspark_context_producer = None
-        if draft_model_runner is not None and getattr(
-            draft_model_runner.model, "supports_dspark_context_projection", False
-        ):
+        if config.spec_algo is not None and config.pp_size > 1:
+            # Pipeline speculation: the target taps live on several stages, so
+            # each stage projects its own during the target forward and the
+            # final stage writes the draft context. Off the pipeline the
+            # drafter keeps projecting and writing context itself.
             from tokenspeed.runtime.execution.dspark_context import (
+                DSparkContextModel,
                 DSparkContextProducer,
             )
 
+            if not isinstance(draft_model_runner.model, DSparkContextModel):
+                raise TypeError(
+                    f"{type(draft_model_runner.model).__name__} cannot produce "
+                    "DSpark context across pipeline stages."
+                )
             self.dspark_context_producer = DSparkContextProducer(
                 draft_model_runner.model, draft_token_to_kv_pool
             )

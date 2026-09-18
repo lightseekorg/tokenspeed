@@ -322,7 +322,6 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
             logger.warning("K3 DSpark: %s", note)
         self.config = config
         self.mapping = mapping
-        self.supports_dspark_context_projection = quant_config is None
         self.attention_kind = "kimi_mla"
         hidden_size = int(config.hidden_size)
         eps = float(config.rms_norm_eps)
@@ -418,7 +417,9 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
     def configure_target(self, target_model, target_config) -> None:
         """Bind trained tap indices and stream semantics on every owning stage."""
         validate_k3_dspark_config(self.config, target_config)
-        if self.supports_dspark_context_projection:
+        if self.mapping.has_pp:
+            # Taps live on several stages: each projects its own into the
+            # chunk's PP state and the final stage writes the context.
             target_model.set_target_context_capture(
                 list(self.target_capture_layer_ids),
                 self.config.aux_hidden_stream,

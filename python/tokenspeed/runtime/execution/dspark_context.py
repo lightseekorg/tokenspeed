@@ -28,7 +28,7 @@ K3 DSpark is currently the model using this production path.
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import torch
 
@@ -40,8 +40,9 @@ class _DSparkContextStage(Protocol):
     is_last_pp_rank: bool
 
 
+@runtime_checkable
 class DSparkContextModel(Protocol):
-    """DSpark projection and cache writes for local and pipeline execution."""
+    """DSpark projection and cache writes for pipeline execution."""
 
     hidden_size: int
     mapping: _DSparkContextStage

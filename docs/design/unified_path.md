@@ -681,13 +681,16 @@ interface it consumes. K3 tap ownership and projection arithmetic live in
 This interface covers DSpark context production, not a requirement for all
 draft algorithms. K3 DSpark is currently the model using this production path.
 
-Unquantized K3 drafts use `DSparkContextProducer` on both topologies: normalize
-each tap if configured, apply its projection columns, sum in FP32, then apply
-context normalization once. The accumulator stays local or travels with the
-chunk's PP state. Only the final owner writes native context KV. Quantized
-non-PP drafts retain their quantization-aware concatenated projection; raw
-per-tap weight slicing is not a quantized linear operation. PP drafts require
-unquantized projection weights.
+Pipeline stages use `DSparkContextProducer`: each stage normalizes the taps it
+owns if configured, applies their projection columns and sums in FP32; the
+accumulator travels with the chunk's PP state and the final stage applies
+context normalization once and writes native context KV. The executor selects
+the producer from the pipeline configuration alone (`pp_size > 1` with a
+speculative algorithm) and requires the draft model to implement
+`DSparkContextModel`. Off the pipeline every tap is local, so the drafter keeps
+its concatenated projection and its own context writes -- including the
+quantization-aware path, since raw per-tap weight slicing is not a quantized
+linear operation. PP drafts require unquantized projection weights.
 
 The producer is stateless across forwards. Each chunk owns its accumulator;
 queued chunks cannot alias it. A configured `ctx.dspark_context_producer`

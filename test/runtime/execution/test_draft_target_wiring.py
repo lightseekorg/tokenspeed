@@ -494,8 +494,8 @@ def test_drafter_owned_context_requires_matching_target_hidden(hidden, error):
     drafter._write_native_cache.assert_not_called()
 
 
-@pytest.mark.parametrize("project_context", [False, True])
-def test_k3_setup_capture_survives_resource_binding(monkeypatch, project_context):
+@pytest.mark.parametrize("has_pp", [False, True])
+def test_k3_setup_capture_survives_resource_binding(monkeypatch, has_pp):
     from tokenspeed.runtime.models import kimi_k3_dspark
 
     draft = kimi_k3_dspark.K3DSparkModel.__new__(kimi_k3_dspark.K3DSparkModel)
@@ -503,7 +503,9 @@ def test_k3_setup_capture_survives_resource_binding(monkeypatch, project_context
     draft.config = SimpleNamespace(aux_hidden_stream="attn_res")
     draft.target_capture_layer_ids = (2, 5)
     draft.hidden_size = 8
-    draft.supports_dspark_context_projection = project_context
+    # Only a pipeline splits the taps across stages; off the pipeline the
+    # drafter keeps projecting and writing the context itself.
+    draft.mapping = SimpleNamespace(has_pp=has_pp)
     validation = mock.Mock()
     monkeypatch.setattr(kimi_k3_dspark, "validate_k3_dspark_config", validation)
     target = SimpleNamespace(
@@ -524,7 +526,7 @@ def test_k3_setup_capture_survives_resource_binding(monkeypatch, project_context
         SimpleNamespace(model=draft),
     )
     validation.assert_called_once_with(draft.config, target_config)
-    if project_context:
+    if has_pp:
         target.set_target_context_capture.assert_called_once_with([2, 5], "attn_res", 8)
         target.set_dflash_layers_to_capture.assert_not_called()
     else:
