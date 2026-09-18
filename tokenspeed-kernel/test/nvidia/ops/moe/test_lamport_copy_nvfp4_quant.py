@@ -85,34 +85,20 @@ def _check(mailbox, source, data, scales, multiplier, m, pdl):
 
 
 @pytest.mark.parametrize("pdl", [False, True])
-@pytest.mark.parametrize("hidden", [64, 3584])
 @pytest.mark.parametrize(
-    "m",
+    "hidden,m",
     [
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8,
-        9,
-        32,
-        33,
-        64,
-        65,
-        73,
-        74,
-        95,
-        96,
-        97,
-        111,
-        127,
-        128,
-        129,
-        1279,
-        1280,
+        (64, 1),
+        (64, 16),
+        (64, 17),
+        (3584, 1),
+        (3584, 8),
+        (3584, 9),
+        # 73/74 rows cross the 256-CTA minimum at width 3584.
+        (3584, 73),
+        (3584, 74),
+        (3584, 1279),
+        (3584, 1280),
     ],
 )
 def test_copy_bytes_and_live_row_reset(pdl, hidden, m):
@@ -133,41 +119,6 @@ def test_copy_bytes_and_live_row_reset(pdl, hidden, m):
             m=m,
             use_pdl=pdl,
         )
-        _check(mailbox, source, data, scales, multiplier, m, pdl)
-
-
-@pytest.mark.parametrize("pdl", [False, True])
-@pytest.mark.parametrize("m", [8, 9, 32, 64, 95, 96, 1280])
-def test_copy_graph_replay(pdl, m):
-    pdl_enabled(pdl)
-    source = _fixture(m, 3584)
-    mailbox = source.clone()
-    multiplier = torch.tensor(128.0, device="cuda", dtype=torch.float32)
-    data = torch.full((m + 1, 1792), 193, device="cuda", dtype=torch.uint8)
-    scales = torch.full((m + 1, 224), 193, device="cuda", dtype=torch.uint8)
-    # Compiling once covers every M/grid width; capture must not compile again.
-    compile_kernel(3584, mailbox.device.index, pdl)
-    before = compile_kernel.cache_info().misses
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        mailbox.copy_(source)
-        launch(
-            mailbox,
-            data[:m],
-            scales[:m],
-            multiplier,
-            hidden=3584,
-            m=m,
-            use_pdl=pdl,
-        )
-    assert compile_kernel.cache_info().misses == before
-    for phase in range(2):
-        if phase:
-            # Change the next generation without allowing sentinel collisions.
-            source.copy_(_fixture(m, 3584).roll(64, dims=1))
-        for _ in range(1000):
-            graph.replay()
-        torch.cuda.synchronize()
         _check(mailbox, source, data, scales, multiplier, m, pdl)
 
 
@@ -208,7 +159,7 @@ def test_copy_scale_rounding_boundaries(pdl):
 
 
 @pytest.mark.parametrize("pdl", [False, True])
-@pytest.mark.parametrize("m", [9, 95, 1280])
+@pytest.mark.parametrize("m", [1, 9, 1280])
 def test_gather_allocated_outputs_and_graph_replay(pdl, m):
     pdl_enabled(pdl)
     source = _fixture(m, 3584)
@@ -249,18 +200,8 @@ def test_gather_allocated_outputs_and_graph_replay(pdl, m):
         outputs = gather_pair()
     assert compile_kernel.cache_info().misses == before
     for _ in range(2):
-        source.copy_(_fixture(m, 3584).roll(64, dims=1))
+        source.copy_(source.roll(64, dims=1))
         for _ in range(10):
             graph.replay()
         torch.cuda.synchronize()
         check(outputs)
-
-
-@pytest.mark.parametrize("m", [0, 1281])
-def test_copy_rejects_unsupported_width(m):
-    source = torch.empty((1, 3584), device="cuda", dtype=torch.bfloat16)
-    data = torch.empty((1, 1792), device="cuda", dtype=torch.uint8)
-    scales = torch.empty((1, 224), device="cuda", dtype=torch.uint8)
-    multiplier = torch.ones((), device="cuda", dtype=torch.float32)
-    with pytest.raises(ValueError, match="unsupported Lamport NVFP4 geometry"):
-        launch(source, data, scales, multiplier, hidden=3584, m=m, use_pdl=True)

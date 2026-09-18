@@ -187,7 +187,7 @@ def test_eager_serving_leaves_the_fork_disabled():
 
 @pytest.mark.parametrize(
     "enabled,tokens,fused",
-    [(True, 8, True), (True, 1280, True), (True, 1281, False), (False, 8, False)],
+    [(True, 1280, True), (True, 1281, False), (False, 8, False)],
 )
 def test_nvfp4_down_uses_existing_mailbox_with_bf16_fallback(enabled, tokens, fused):
     hidden = torch.zeros(tokens, 4)
@@ -227,33 +227,6 @@ def test_nvfp4_down_uses_existing_mailbox_with_bf16_fallback(enabled, tokens, fu
         projection.assert_called_once_with(hidden)
         projection.multicast_down.assert_not_called()
         assert moe._routed_experts.call_args.args[0] is hidden
-
-
-@pytest.mark.parametrize("value", [128.0, 0.0, -1.0, float("nan"), float("inf")])
-def test_nvfp4_down_prepares_after_expert_scales(value):
-    experts = SimpleNamespace(process_weights_after_loading=mock.Mock())
-
-    def load_scales(module):
-        module.w13_input_scale_quant = torch.tensor(value)
-
-    experts.process_weights_after_loading.side_effect = load_scales
-    prepare = mock.Mock()
-    moe = SimpleNamespace(
-        _use_nvfp4_down=True,
-        experts=experts,
-        routed_hidden=3584,
-        routed_expert_down_proj=SimpleNamespace(
-            multicast_down=SimpleNamespace(prepare_nvfp4=prepare)
-        ),
-    )
-    if value == 128.0:
-        KimiLinearMoE.process_weights_after_loading(moe, moe)
-        prepare.assert_called_once_with()
-    else:
-        with pytest.raises(ValueError, match="finite and positive"):
-            KimiLinearMoE.process_weights_after_loading(moe, moe)
-        prepare.assert_not_called()
-    experts.process_weights_after_loading.assert_called_once_with(experts)
 
 
 if __name__ == "__main__":

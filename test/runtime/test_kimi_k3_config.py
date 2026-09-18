@@ -199,7 +199,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 self.w13_weight_scale = torch.empty(0)
                 self.w2_weight = torch.empty(0)
                 self.w2_weight_scale = torch.empty(0)
-                self.plan = {}
+                self.plan = {"weight_dtype": "unquant"}
                 self.supports_deferred_finalize = False
 
         class FakeSharedExperts(torch.nn.Module):
@@ -908,7 +908,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 self.w13_weight_scale = torch.empty(0)
                 self.w2_weight = torch.empty(0)
                 self.w2_weight_scale = torch.empty(0)
-                self.plan = {}
+                self.plan = {"weight_dtype": "unquant"}
                 self.activation_situ_linear_beta = kwargs["activation_situ_linear_beta"]
                 # Consumed by K3MoeTailComm arming (real MoELayer exposes it
                 # from the selected kernel's plan trait).

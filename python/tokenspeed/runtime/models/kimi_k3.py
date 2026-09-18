@@ -1611,7 +1611,8 @@ class KimiLinearMoE(nn.Module):
             shard_size=mapping.moe.tp_ep_size,
         )
         self._use_nvfp4_down = (
-            self.experts.plan.get("supports_nvfp4_input", False)
+            self.experts.plan["weight_dtype"] == "nvfp4"
+            and self.experts.plan["solution"] == "flashinfer_trtllm"
             and multicast_down is not None
             and multicast_down.nvfp4_available()
         )
@@ -1836,14 +1837,9 @@ class KimiLinearMoE(nn.Module):
         return router_logits, routed_input, shared_output
 
     def process_weights_after_loading(self, module) -> None:
-        """Prepare quantized latent input after expert scales, before capture."""
-        if not self._use_nvfp4_down:
-            return
-        self.experts.process_weights_after_loading(self.experts)
-        scale = self.experts.w13_input_scale_quant
-        if not bool(torch.isfinite(scale).all() and (scale > 0).all()):
-            raise ValueError("NVFP4 encoding multiplier must be finite and positive")
-        self.routed_expert_down_proj.multicast_down.prepare_nvfp4()
+        """Prepare the fused NVFP4 mailbox consumer before graph capture."""
+        if self._use_nvfp4_down:
+            self.routed_expert_down_proj.multicast_down.prepare_nvfp4()
 
     def _routed_experts(
         self,

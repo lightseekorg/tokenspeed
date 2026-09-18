@@ -710,9 +710,6 @@ def moe_plan(
         "support_routing": support_routing,
         "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,
-        "supports_nvfp4_input": weight_dtype == "nvfp4"
-        and format_signature(x=dense_tensor_format(torch.uint8))
-        in apply_spec.format_signatures,
         "solution": apply_spec.solution,
         "internal_activation_dtype": internal_activation_dtype,
     }

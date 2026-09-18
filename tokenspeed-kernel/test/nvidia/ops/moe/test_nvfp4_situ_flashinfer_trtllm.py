@@ -378,7 +378,6 @@ def test_moe_plan_selects_nvfp4_situ_routed_kernel(
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_nvfp4_situ_routed_moe_apply"
     assert plan["support_routing"] is False
-    assert plan["supports_nvfp4_input"] is True
     preprocessor = plan["weight_preprocessor"]
     assert (
         getattr(preprocessor, "__name__", None)
