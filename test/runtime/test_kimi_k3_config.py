@@ -305,6 +305,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
         built = self._build_moe_block(
             kimi_k3.Kimi3MoEExecutionPlan(
+                use_mega_moe=False,
                 use_native=False,
                 use_trtllm=True,
                 overlap_shared_experts=False,
@@ -328,6 +329,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
         built = self._build_moe_block(
             kimi_k3.Kimi3MoEExecutionPlan(
+                use_mega_moe=False,
                 use_native=False,
                 use_trtllm=True,
                 overlap_shared_experts=False,
@@ -371,6 +373,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
         built = self._build_moe_block(
             kimi_k3.Kimi3MoEExecutionPlan(
+                use_mega_moe=False,
                 use_native=False,
                 use_trtllm=True,
                 overlap_shared_experts=False,
@@ -388,6 +391,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
         built = self._build_moe_block(
             kimi_k3.Kimi3MoEExecutionPlan(
+                use_mega_moe=False,
                 use_native=False,
                 use_trtllm=False,
                 use_marlin=True,
@@ -410,6 +414,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
         built = self._build_moe_block(
             kimi_k3.Kimi3MoEExecutionPlan(
+                use_mega_moe=False,
                 use_native=False,
                 use_trtllm=True,
                 overlap_shared_experts=False,
@@ -967,6 +972,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 kimi_k3.Kimi3MoEExecutionPlan,
                 "build",
                 return_value=kimi_k3.Kimi3MoEExecutionPlan(
+                    use_mega_moe=False,
                     use_native=True,
                     use_trtllm=False,
                     overlap_shared_experts=False,
@@ -1056,6 +1062,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 kimi_k3.Kimi3MoEExecutionPlan,
                 "build",
                 return_value=kimi_k3.Kimi3MoEExecutionPlan(
+                    use_mega_moe=False,
                     use_native=True,
                     use_trtllm=False,
                     overlap_shared_experts=False,
@@ -1096,6 +1103,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 kimi_k3.Kimi3MoEExecutionPlan,
                 "build",
                 return_value=kimi_k3.Kimi3MoEExecutionPlan(
+                    use_mega_moe=False,
                     use_native=True,
                     use_trtllm=False,
                     overlap_shared_experts=False,
