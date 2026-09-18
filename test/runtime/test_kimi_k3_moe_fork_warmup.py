@@ -111,7 +111,6 @@ def _make_moe(fork: _SpyFork) -> SimpleNamespace:
     )
     return SimpleNamespace(
         mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=1)),
-        _use_nvfp4_down=False,
         native_latent_moe=None,
         stream_fork=fork,
         _topk_ready=None,
@@ -185,21 +184,17 @@ def test_eager_serving_leaves_the_fork_disabled():
     assert call["enable"] is False
 
 
-@pytest.mark.parametrize(
-    "enabled,tokens,fused",
-    [(True, 1280, True), (True, 1281, False), (False, 8, False)],
-)
-def test_nvfp4_down_uses_existing_mailbox_with_bf16_fallback(enabled, tokens, fused):
-    hidden = torch.zeros(tokens, 4)
-    packed = (torch.empty(tokens, 2, dtype=torch.uint8), torch.empty(tokens, 1))
-    projection = mock.Mock(return_value=(hidden, None))
-    projection.weight = torch.zeros(4, 4)
-    projection.multicast_down = mock.Mock(return_value=packed)
-    projection.multicast_down.handles.side_effect = lambda m: 1 <= m <= 1280
+@pytest.mark.parametrize("prequantized", [False, True])
+def test_moe_passes_projection_payload_to_experts(prequantized):
+    hidden = torch.zeros(8, 4)
+    payload = (
+        (torch.empty(8, 2, dtype=torch.uint8), torch.empty(8, 1))
+        if prequantized
+        else hidden
+    )
+    projection = mock.Mock(spec=["__call__"], return_value=(payload, None))
     moe = _make_moe(_SpyFork())
-    moe._use_nvfp4_down = enabled
     moe.routed_expert_down_proj = projection
-    moe.experts.w13_input_scale_quant = torch.tensor(128.0)
     moe._routed_experts = mock.Mock(return_value=hidden)
     with (
         mock.patch(
@@ -214,19 +209,40 @@ def test_nvfp4_down_uses_existing_mailbox_with_bf16_fallback(enabled, tokens, fu
             moe,
             hidden,
             hidden,
-            num_global_tokens=tokens,
-            max_num_tokens_per_gpu=tokens,
+            num_global_tokens=8,
+            max_num_tokens_per_gpu=8,
         )
-    if fused:
-        projection.assert_not_called()
-        projection.multicast_down.assert_called_once_with(
-            hidden, projection.weight, output_scale=moe.experts.w13_input_scale_quant
-        )
-        assert moe._routed_experts.call_args.args[0] is packed
+    projection.assert_called_once_with(hidden)
+    assert moe._routed_experts.call_args.args[0] is payload
+
+
+@pytest.mark.parametrize(
+    "weight_dtype,solution,enabled",
+    [
+        ("nvfp4", "flashinfer_trtllm", True),
+        ("mxfp4", "flashinfer_trtllm", False),
+        ("nvfp4", "flashinfer_cutlass", False),
+    ],
+)
+def test_nvfp4_projection_setup_uses_processed_expert_scale(
+    weight_dtype, solution, enabled
+):
+    experts = SimpleNamespace(plan={"weight_dtype": weight_dtype, "solution": solution})
+    scale = torch.nn.Parameter(torch.tensor(128.0), requires_grad=False)
+
+    def process_weights(module):
+        module.w13_input_scale_quant = scale
+
+    experts.process_weights_after_loading = mock.Mock(side_effect=process_weights)
+    projection = mock.Mock(spec=["prepare_nvfp4_output"])
+    moe = SimpleNamespace(experts=experts, routed_expert_down_proj=projection)
+    KimiLinearMoE.process_weights_after_loading(moe, moe)
+    if enabled:
+        experts.process_weights_after_loading.assert_called_once_with(experts)
+        projection.prepare_nvfp4_output.assert_called_once_with(scale)
     else:
-        projection.assert_called_once_with(hidden)
-        projection.multicast_down.assert_not_called()
-        assert moe._routed_experts.call_args.args[0] is hidden
+        experts.process_weights_after_loading.assert_not_called()
+        projection.prepare_nvfp4_output.assert_not_called()
 
 
 if __name__ == "__main__":

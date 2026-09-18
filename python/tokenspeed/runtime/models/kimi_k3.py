@@ -1610,12 +1610,6 @@ class KimiLinearMoE(nn.Module):
             shard_rank=mapping.moe.tp_ep_rank,
             shard_size=mapping.moe.tp_ep_size,
         )
-        self._use_nvfp4_down = (
-            self.experts.plan["weight_dtype"] == "nvfp4"
-            and self.experts.plan["solution"] == "flashinfer_trtllm"
-            and multicast_down is not None
-            and multicast_down.nvfp4_available()
-        )
         self.routed_expert_up_proj = Kimi3LatentProjection(
             self.routed_hidden,
             config.hidden_size,
@@ -1837,9 +1831,16 @@ class KimiLinearMoE(nn.Module):
         return router_logits, routed_input, shared_output
 
     def process_weights_after_loading(self, module) -> None:
-        """Prepare the fused NVFP4 mailbox consumer before graph capture."""
-        if self._use_nvfp4_down:
-            self.routed_expert_down_proj.multicast_down.prepare_nvfp4()
+        """Configure the latent projection from the processed expert input scale."""
+        if (
+            self.experts.plan["weight_dtype"] == "nvfp4"
+            and self.experts.plan["solution"] == "flashinfer_trtllm"
+        ):
+            # The loader visits this parent before its expert child.
+            self.experts.process_weights_after_loading(self.experts)
+            self.routed_expert_down_proj.prepare_nvfp4_output(
+                self.experts.w13_input_scale_quant
+            )
 
     def _routed_experts(
         self,
@@ -2182,19 +2183,7 @@ class KimiLinearMoE(nn.Module):
                         shared_partial
                     )
             if routed_in is None:
-                if (
-                    self._use_nvfp4_down
-                    and self.routed_expert_down_proj.multicast_down.handles(
-                        hidden_states.shape[0]
-                    )
-                ):
-                    routed_in = self.routed_expert_down_proj.multicast_down(
-                        hidden_states,
-                        self.routed_expert_down_proj.weight,
-                        output_scale=self.experts.w13_input_scale_quant,
-                    )
-                else:
-                    routed_in, _ = self.routed_expert_down_proj(hidden_states)
+                routed_in, _ = self.routed_expert_down_proj(hidden_states)
             if self._topk_ready is not None and precompute_topk and fork._active:
                 self._topk_ready.wait(torch.cuda.current_stream())
             routed_partial = self._routed_experts(
