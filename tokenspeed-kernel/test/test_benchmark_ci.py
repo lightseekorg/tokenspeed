@@ -58,7 +58,6 @@ def _definition(*, seed: int = 42) -> dict:
         },
         "registration": "gluon_bmm_a16w16_gfx950",
         "seed": seed,
-        "definition_version": 1,
     }
 
 
@@ -74,7 +73,8 @@ def _suite_payload(cases: list[dict] | None = None) -> dict:
     if cases is None:
         cases = [
             {
-                "id": "gemm.bmm/example/v1",
+                "id": "gemm.bmm/example",
+                "comparison_epoch": 1,
                 "definition": _definition(),
                 "policy": _policy(),
             }
@@ -108,8 +108,8 @@ def _success_result(request) -> KernelBenchmarkResult:
         selection_mode=request.selection_mode,
         requested_solution=request.solution,
         requested_registration=request.registration,
+        cold_cache=request.cold_cache,
         seed=request.seed,
-        definition_version=request.definition_version,
         platform_vendor="amd",
         platform_arch="9.5",
         device_name="test accelerator",
@@ -137,7 +137,8 @@ def test_starter_suite_selects_exact_gfx950_registration():
     assert suite.required_environment == {"vendor": "amd", "arch": "9.5"}
     assert len(suite.cases) == 1
     case = suite.cases[0]
-    assert case.id == ("gemm.bmm/gluon_bmm_a16w16_gfx950/b12-m1-n512-k128-bfloat16/v1")
+    assert case.id == ("gemm.bmm/gluon_bmm_a16w16_gfx950/b12-m1-n512-k128-bfloat16")
+    assert case.comparison_epoch == 1
     assert case.request.parameters == {
         "batch": 12,
         "M": 1,
@@ -152,20 +153,22 @@ def test_starter_suite_selects_exact_gfx950_registration():
     }
     assert case.request.registration == "gluon_bmm_a16w16_gfx950"
     assert case.request.solution is None
+    assert case.request.cold_cache is True
     assert case.request.seed == 42
-    assert case.request.definition_version == 1
     assert case.policy == _policy()
 
 
 def test_run_suite_uses_one_timer_and_emits_deterministic_envelope(tmp_path):
     cases = [
         {
-            "id": "gemm.bmm/z-case/v1",
+            "id": "gemm.bmm/z-case",
+            "comparison_epoch": 2,
             "definition": _definition(seed=43),
             "policy": _policy(),
         },
         {
-            "id": "gemm.bmm/a-case/v1",
+            "id": "gemm.bmm/a-case",
+            "comparison_epoch": 1,
             "definition": _definition(seed=42),
             "policy": _policy(),
         },
@@ -203,14 +206,16 @@ def test_run_suite_uses_one_timer_and_emits_deterministic_envelope(tmp_path):
     assert payload["environment"] == _ENVIRONMENT
     assert len(created_configs) == 1
     assert [case["id"] for case in payload["cases"]] == [
-        "gemm.bmm/a-case/v1",
-        "gemm.bmm/z-case/v1",
+        "gemm.bmm/a-case",
+        "gemm.bmm/z-case",
     ]
+    assert [case["comparison_epoch"] for case in payload["cases"]] == [1, 2]
     assert [request.seed for request in requests] == [42, 43]
     assert payload["cases"][0]["result"]["status"] == "success"
     assert payload["cases"][0]["result"] == {
         "status": "success",
         "registration_name": "gluon_bmm_a16w16_gfx950",
+        "cold_cache": True,
         "timing_mode": "graph_replay",
         "metric": "device_time_per_invocation",
         "unit": "us",
@@ -221,10 +226,24 @@ def test_run_suite_uses_one_timer_and_emits_deterministic_envelope(tmp_path):
         "error_message": None,
     }
     assert payload["cases"][0]["policy"] == _policy()
-    assert payload["cases"][0].keys() == {"id", "definition", "policy", "result"}
+    assert payload["cases"][0].keys() == {
+        "id",
+        "comparison_epoch",
+        "definition",
+        "policy",
+        "result",
+    }
 
 
-def test_run_suite_rejects_success_with_the_wrong_measurement_context(tmp_path):
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("calls_per_graph", 1), ("cold_cache", False)],
+)
+def test_run_suite_rejects_success_with_the_wrong_measurement_context(
+    tmp_path,
+    field,
+    value,
+):
     suite = load_suite(_write_suite(tmp_path, _suite_payload()))
 
     class Harness:
@@ -234,7 +253,7 @@ def test_run_suite_rejects_success_with_the_wrong_measurement_context(tmp_path):
                 **{
                     **result.to_dict(),
                     "status": BenchmarkStatus.SUCCESS,
-                    "calls_per_graph": 1,
+                    field: value,
                 }
             )
 
@@ -250,15 +269,29 @@ def test_run_suite_rejects_success_with_the_wrong_measurement_context(tmp_path):
     assert result["error_message"] == "successful benchmark reported the wrong context"
 
 
+def test_suite_defaults_to_cold_cache_and_can_disable_it(tmp_path):
+    default_suite = load_suite(_write_suite(tmp_path, _suite_payload()))
+    assert default_suite.cases[0].request.cold_cache is True
+    assert default_suite.cases[0].definition["cold_cache"] is True
+
+    payload = _suite_payload()
+    payload["cases"][0]["definition"]["cold_cache"] = False
+    hot_suite = load_suite(_write_suite(tmp_path, payload))
+    assert hot_suite.cases[0].request.cold_cache is False
+    assert hot_suite.cases[0].definition["cold_cache"] is False
+
+
 def test_benchmark_exception_is_result_data_and_later_cases_run(tmp_path):
     cases = [
         {
-            "id": "gemm.bmm/fails/v1",
+            "id": "gemm.bmm/fails",
+            "comparison_epoch": 1,
             "definition": _definition(seed=42),
             "policy": _policy(),
         },
         {
-            "id": "gemm.bmm/succeeds/v1",
+            "id": "gemm.bmm/succeeds",
+            "comparison_epoch": 1,
             "definition": _definition(seed=43),
             "policy": _policy(),
         },
@@ -339,6 +372,7 @@ def test_environment_mismatch_produces_complete_results_without_timing(tmp_path)
     assert factory_called is False
     result = payload["cases"][0]["result"]
     assert result["status"] == "environment_invalid"
+    assert result["cold_cache"] is True
     assert payload["environment"]["vendor"] == "nvidia"
     assert payload["environment"]["arch"] == "9.0"
     assert "required 'amd'" in result["error_message"]
@@ -377,6 +411,14 @@ def test_builtin_harness_factory_passes_explicit_dependencies(tmp_path, monkeypa
         (
             lambda payload: payload["cases"][0]["definition"].pop("seed"),
             "seed",
+        ),
+        (
+            lambda payload: payload["cases"][0]["definition"].update(cold_cache="yes"),
+            "cold_cache",
+        ),
+        (
+            lambda payload: payload["cases"][0].update(comparison_epoch=0),
+            "comparison_epoch",
         ),
     ],
 )

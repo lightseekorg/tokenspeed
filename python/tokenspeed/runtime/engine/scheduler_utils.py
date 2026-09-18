@@ -32,8 +32,6 @@ from tokenspeed_scheduler import (
     Cache,
     CacheGroupConfig,
     CacheGroupFamily,
-    CacheRetention,
-    CacheTransferPolicy,
     ExecutionEvent,
     ForwardEvent,
     RequestSpec,
@@ -44,6 +42,10 @@ from tokenspeed.runtime.execution.types import NGramInputs
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
+    cache_group_config,
+    scheduler_role,
+)
 
 _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
@@ -53,20 +55,6 @@ _CACHE_EVENT_TYPES = {
 if hasattr(Cache, "LoadBackDoneEvent"):
     _CACHE_EVENT_TYPES["LoadBackDoneEvent"] = Cache.LoadBackDoneEvent
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
-
-# Pool-spec string -> scheduler enum (pool_to_cache_groups).
-_RETENTION_MAP = {
-    "full_history": CacheRetention.FullHistory,
-    "sliding_window": CacheRetention.SlidingWindow,
-}
-_FAMILY_MAP = {
-    "history": CacheGroupFamily.History,
-    "state": CacheGroupFamily.State,
-}
-_TRANSFER_POLICY_MAP = {
-    "full_suffix": CacheTransferPolicy.FullSuffix,
-    "latest_snapshot": CacheTransferPolicy.LatestSnapshot,
-}
 
 
 def engram_context_len(text_config) -> int:
@@ -215,7 +203,7 @@ def make_config(
     decode_input_tokens: int = 1,
     overlap_schedule_depth: int = 0,
     disable_prefix_cache: bool = False,
-    cache_groups: Sequence["CacheGroupConfig"] | None = None,
+    cache_groups: Sequence[CacheGroupConfig] | None = None,
     enable_mixed_prefill_decode: bool = False,
     prefix_replay_tokens: int = 0,
 ) -> SchedulerConfig:
@@ -235,12 +223,7 @@ def make_config(
     cfg.enable_l3_storage = False
     cfg.enable_kv_cache_events = enable_kv_cache_events
 
-    if role == "prefill":
-        cfg.role = SchedulerConfig.Role.P
-    elif role == "decode":
-        cfg.role = SchedulerConfig.Role.D
-    else:
-        cfg.role = SchedulerConfig.Role.Fused
+    cfg.role = scheduler_role(role)
     cfg.decode_input_tokens = decode_input_tokens
     cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_prefix_cache = disable_prefix_cache
@@ -258,47 +241,16 @@ def pool_to_cache_groups(pool: Any) -> list:
     # The arena is the sole publisher, so there is exactly one source here --
     # no fallback to pool-side copies of the same specs.
     contract = pool.arena.runtime_contract
-    specs = contract.group_specs
     counts = contract.virtual_block_counts
     packing = contract.virtual_packing
-    out = []
-    for spec in specs:
-        retention = _RETENTION_MAP.get(spec.retention)
-        if retention is None:
-            raise ValueError(
-                f"pool_to_cache_groups: unsupported retention "
-                f"{spec.retention!r} for group {spec.group_id!r}"
-            )
-        family = _FAMILY_MAP.get(spec.family)
-        if family is None:
-            raise ValueError(
-                f"pool_to_cache_groups: unsupported family "
-                f"{spec.family!r} for group {spec.group_id!r}"
-            )
-        # The declaration shape (row geometry or state checkpoint) stops here:
-        # the scheduler only learns how many tokens one block-table slot spans.
-        kwargs = dict(
-            group_id=spec.group_id,
-            block_granularity=int(spec.block_granularity),
-            total_pages=int(counts[spec.group_id]),
-            retention=retention,
-            family=family,
-            cache_blocks_per_lcm_block=int(packing[spec.group_id]),
-            shard_count=spec.shard_count,
+    return [
+        cache_group_config(
+            spec,
+            total_pages=counts[spec.group_id],
+            cache_blocks_per_lcm_block=packing[spec.group_id],
         )
-        transfer_policy = spec.transfer_policy
-        if transfer_policy is not None:
-            mapped_policy = _TRANSFER_POLICY_MAP.get(transfer_policy)
-            if mapped_policy is None:
-                raise ValueError(
-                    "pool_to_cache_groups: unsupported transfer policy "
-                    f"{transfer_policy!r} for group {spec.group_id!r}"
-                )
-            kwargs["transfer_policy"] = mapped_policy
-        if spec.retention == "sliding_window":
-            kwargs["sliding_window_tokens"] = int(spec.sliding_window_tokens)
-        out.append(CacheGroupConfig(**kwargs))
-    return out
+        for spec in contract.group_specs
+    ]
 
 
 def should_use_overlap_schedule(
@@ -328,39 +280,44 @@ def resolve_dspark_prefix_replay_tokens(
     """Resolve the prompt tail needed to rebuild DSpark runtime state.
 
     DeepSeek V4 DSpark advertises the requirement through its draft
-    ``ModelConfig``. Same-checkpoint DSpark configurations without that
-    capability remain fail-closed. External generic DSpark configurations keep
-    their existing scheduler behavior until they advertise an equivalent
-    contract.
+    ``ModelConfig``; V4.1 advertises zero because its windows are cache
+    resident. Same-checkpoint DSpark configurations without that capability
+    remain fail-closed. External generic DSpark configurations keep their
+    existing scheduler behavior until they advertise an equivalent contract.
     """
 
-    if not enable_prefix_caching or speculative_algorithm != "DSPARK":
+    if speculative_algorithm != "DSPARK":
         return 0
     if draft_model_config is None:
-        raise ValueError(
-            "DSPARK prefix caching requires a resolved draft model configuration."
-        )
+        raise ValueError("DSPARK requires a resolved draft model configuration.")
 
     replay_tokens = getattr(draft_model_config, "dspark_prefix_replay_tokens", None)
     if replay_tokens is None:
         if draft_model_path_use_base:
             raise ValueError(
-                "DSPARK same-checkpoint prefix caching requires a draft model "
-                "that advertises captured-context replay support."
+                "DSPARK same-checkpoint decoding requires a draft model that "
+                "advertises captured-context replay support."
             )
         return 0
 
     replay_tokens = int(replay_tokens)
-    if not 0 < replay_tokens <= (1 << 31) - 1:
+    if not 0 <= replay_tokens <= (1 << 31) - 1:
         raise ValueError(
-            "DSPARK captured-context replay requirement must fit a positive int32; "
-            f"got {replay_tokens}."
+            "DSPARK captured-context replay requirement must fit a non-negative "
+            f"int32; got {replay_tokens}."
         )
+    if replay_tokens == 0:
+        # The draft's context lives in the KV cache and follows the prefix.
+        return 0
+    # A drafter-private context cannot be restored from the host tier, with or
+    # without prefix reuse.
     if enable_kvstore:
         raise ValueError(
             "DSPARK captured-context replay does not support KVStore; "
             "use --disable-kvstore."
         )
+    if not enable_prefix_caching:
+        return 0
     if disaggregation_mode != "null":
         raise ValueError(
             "DSPARK captured-context replay does not support disaggregated "

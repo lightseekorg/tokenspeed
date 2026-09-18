@@ -221,6 +221,13 @@ def prepare_k3_all_reduce_buffers(
         allreduce_residual_attnres_max_tokens(mapping.attn.tp_size),
     )
     groups_are_equal = mapping.attn.tp_group == mapping.moe.tp_ep_group
+    # The Lamport crossover was measured with attention TP8 and MoE TP8.
+    enable_lamport = (
+        groups_are_equal
+        and mapping.attn.tp_size == 8
+        and mapping.moe.tp_size == 8
+        and mapping.moe.ep_size == 1
+    )
     # Keep the full producer-direct window for equal TP8 groups. Its 50K/500
     # C16 gain survives content-sensitive EAGLE3 trajectories; retain 48 tokens
     # for other mappings.
@@ -244,6 +251,7 @@ def prepare_k3_all_reduce_buffers(
             ),
             attnres_max_numel=attnres_max_rows * hidden_size,
             attnres_max_rows=attnres_max_rows,
+            enable_lamport=enable_lamport,
             dtype=torch.bfloat16,
             backend=None,
         )
@@ -256,6 +264,7 @@ def prepare_k3_all_reduce_buffers(
                 * (hidden_size + routed_hidden_size),
                 attnres_max_numel=0,
                 attnres_max_rows=0,
+                enable_lamport=False,
                 dtype=torch.bfloat16,
                 backend=None,
             )
@@ -525,6 +534,34 @@ class K3AttnComm:
     # ------------------------------------------------------------------
     # Attention-side reduction, hoisted from KimiLinearDecoderLayer.
     # ------------------------------------------------------------------
+    def fused_attnres_reduce_available(
+        self,
+        partial: torch.Tensor,
+        residual: torch.Tensor,
+        combine: tuple,
+        score_weight: torch.Tensor | None,
+    ) -> bool:
+        """Whether the communication path can consume the AttnRes epilogue."""
+        scratch, _, _, output_weight, _ = combine
+        if score_weight is None or output_weight is None:
+            return False
+        from tokenspeed_kernel.ops.communication.triton import (
+            allreduce_residual_attnres_combine_supported,
+        )
+
+        return not global_server_args_dict.get(
+            "force_deterministic_rsag", False
+        ) and allreduce_residual_attnres_combine_supported(
+            partial,
+            residual,
+            score_weight,
+            output_weight,
+            scratch,
+            rank=self.mapping.attn.tp_rank,
+            group=_get_process_group(self.mapping.attn.tp_group),
+            local_world_size=self.mapping.nprocs_per_node,
+        )
+
     def attn_reduce(
         self,
         attn_partial: torch.Tensor,
@@ -612,16 +649,18 @@ class K3AttnComm:
                 return residual_out, None
         if combine is not None and prefix_sum is not None and num_tokens > 0:
             scratch, _, _, out_norm_w, eps = combine
-            if out_norm_w is not None:
+            if out_norm_w is not None and self.fused_attnres_reduce_available(
+                attn_partial,
+                prefix_sum,
+                combine,
+                mlp_wp,
+            ):
                 from tokenspeed_kernel.ops.communication.triton import (
                     allreduce_residual_attnres_combine,
-                    allreduce_residual_attnres_combine_supported,
                 )
 
                 group = _get_process_group(self.mapping.attn.tp_group)
-                fused_supported = not global_server_args_dict.get(
-                    "force_deterministic_rsag", False
-                ) and allreduce_residual_attnres_combine_supported(
+                h, residual_out = allreduce_residual_attnres_combine(
                     attn_partial,
                     prefix_sum,
                     mlp_wp,
@@ -630,20 +669,9 @@ class K3AttnComm:
                     rank=self.mapping.attn.tp_rank,
                     group=group,
                     local_world_size=self.mapping.nprocs_per_node,
+                    eps=eps,
                 )
-                if fused_supported:
-                    h, residual_out = allreduce_residual_attnres_combine(
-                        attn_partial,
-                        prefix_sum,
-                        mlp_wp,
-                        out_norm_w,
-                        scratch,
-                        rank=self.mapping.attn.tp_rank,
-                        group=group,
-                        local_world_size=self.mapping.nprocs_per_node,
-                        eps=eps,
-                    )
-                    return residual_out, h
+                return residual_out, h
         reduced = all_reduce(attn_partial, self.mapping.attn.tp_group)
         return (reduced if prefix_sum is None else prefix_sum + reduced), None
 

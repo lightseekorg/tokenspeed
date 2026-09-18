@@ -1425,6 +1425,7 @@ class KimiLinearMoE(nn.Module):
                 )
         elif mapping.attn.tp_size != mapping.moe.tp_ep_size:
             raise ValueError("Kimi-K3 attention TP must match the MoE TP x EP group.")
+        moe_backend = get_moe_backend()
         all2all_backend = get_all2all_backend()
         if mapping.attn.dp_size > 1:
             if all2all_backend is All2AllBackend.DEEPEP:
@@ -1435,6 +1436,18 @@ class KimiLinearMoE(nn.Module):
         elif all2all_backend in (All2AllBackend.AGRS, All2AllBackend.FLASHINFER):
             raise ValueError(
                 "Kimi-K3 agrs/flashinfer transport requires attention DP > 1."
+            )
+        self.execution_plan = Kimi3MoEExecutionPlan.build(
+            mapping,
+            moe_backend,
+            alt_stream,
+        )
+        if self.execution_plan.use_mega_moe and (
+            mapping.attn.dp_size <= 1 or all2all_backend is not All2AllBackend.NONE
+        ):
+            raise ValueError(
+                "K3 MegaMoE requires attention DP > 1 and --all2all-backend none; "
+                "the fused kernel owns dispatch/combine."
             )
         # Router (gate+topk) and shared experts run on this stream during
         # graph capture, overlapped with the main-stream routed chain
@@ -1452,16 +1465,10 @@ class KimiLinearMoE(nn.Module):
         )
         situ_beta, situ_linear_beta = _situ_betas(config)
 
-        moe_backend = get_moe_backend()
-        self.execution_plan = Kimi3MoEExecutionPlan.build(
-            mapping,
-            moe_backend,
-            alt_stream,
-        )
         # AUTO intentionally requests the flashinfer-backed SiTU plan when it was
         # registered at import time; AUTO cannot override MoELayer per model.
         plan = self.execution_plan
-        if not plan.use_native and not plan.use_marlin:
+        if not plan.use_mega_moe and not plan.use_native and not plan.use_marlin:
             if not plan.use_trtllm:
                 raise RuntimeError(
                     "Kimi-K3 MXFP4 SiTU MoE requires the native, FlashInfer "
@@ -1547,7 +1554,9 @@ class KimiLinearMoE(nn.Module):
             # bf16 weights out: makes precomputed TRT-LLM SiTU consume them
             # without a cast. This setting is unused by kernel-routing plans.
             topk_weights_dtype=(
-                torch.bfloat16 if self.execution_plan.use_trtllm else torch.float32
+                torch.bfloat16
+                if plan.use_trtllm or plan.use_mega_moe
+                else torch.float32
             ),
         )
 
@@ -1644,6 +1653,12 @@ class KimiLinearMoE(nn.Module):
 
         if mapping.attn.dp_size > 1:
             self.moe_alltoall = None
+            if self.execution_plan.use_mega_moe:
+                if layer_index == config.first_k_dense_replace:
+                    logger.info(
+                        f"K3 routed MoE: TRTLLM NVFP4 SiTU MegaMoE (EP={mapping.moe.ep_size})",
+                    )
+                return
             if all2all_backend is not All2AllBackend.AGRS:
                 self.moe_alltoall = get_flashinfer_moe_alltoall(
                     group=pg_manager.get_device_process_group(mapping.moe.ep_group),
@@ -1816,7 +1831,9 @@ class KimiLinearMoE(nn.Module):
     ) -> torch.Tensor:
         """Run the selected SiTU MoE (kernel-routing or precomputed-TopK)."""
         plan = self.execution_plan
-        if not plan.use_native and not plan.use_trtllm and not plan.use_marlin:
+        if not (
+            plan.use_mega_moe or plan.use_native or plan.use_trtllm or plan.use_marlin
+        ):
             raise RuntimeError(
                 "Kimi-K3 has no portable SiTU Triton fallback; use the native, "
                 "FlashInfer TRT-LLM, or Marlin SiTU MoE path."
@@ -1968,7 +1985,9 @@ class KimiLinearMoE(nn.Module):
                         ),
                     )
 
-            if self.moe_alltoall is not None:
+            if self.execution_plan.use_mega_moe:
+                pass
+            elif self.moe_alltoall is not None:
                 routed_input, topk_ids, topk_weights, combine_offset = (
                     self.moe_alltoall.dispatch(
                         routed_input, topk_ids, topk_weights, max_tokens
@@ -2006,11 +2025,13 @@ class KimiLinearMoE(nn.Module):
                 routed_input,
                 routing,
                 num_global_tokens=total_tokens,
-                max_num_tokens_per_gpu=total_tokens,
+                max_num_tokens_per_gpu=max_tokens,
                 do_finalize=True,
             )
 
-            if self.moe_alltoall is not None:
+            if self.execution_plan.use_mega_moe:
+                pass
+            elif self.moe_alltoall is not None:
                 routed_output = self.moe_alltoall.combine(
                     routed_output, num_tokens, max_tokens, combine_offset
                 )
@@ -2384,6 +2405,29 @@ class KimiLinearDecoderLayer(nn.Module):
         if hidden_states.shape[0] == 1:
             return False
 
+        num_tokens = hidden_states.shape[0]
+        if (
+            not self.is_block_write_layer
+            and hidden_states.is_cuda
+            and self.prev_valid_blocks > 0
+            and self._mlp_wp is not None
+            and 0 < num_tokens <= ATTNRES_FAST_PATH_MAX_TOKENS
+        ):
+            combine = (
+                _sliced_scratch(hidden_states, self._mlp_slot, num_tokens),
+                self.mlp_res_proj.weight.reshape(-1),
+                self.mlp_res_norm.weight,
+                self.post_attention_layernorm.weight,
+                self.mlp_res_norm.variance_epsilon,
+            )
+            if self.k3_comm.fused_attnres_reduce_available(
+                hidden_states,
+                hidden_states,
+                combine,
+                self._mlp_wp,
+            ):
+                return False
+
         block_write_idx = self.block_write_idx if self.is_block_write_layer else -1
         pre_attn = attn_res_fwd_available(
             hidden_states,
@@ -2582,11 +2626,11 @@ class KimiLinearDecoderLayer(nn.Module):
                     and num_tokens
                     <= global_server_args_dict["comm_fusion_max_num_tokens"]
                 )
-                or (
-                    # The gfx950 fused reducer consumes the AttnRes scratch
-                    # through M=16, so its producer stream must join first.
-                    current_platform().is_cdna4
-                    and num_tokens <= ATTNRES_STREAM_FORK_THRESHOLD
+                or self.k3_comm.fused_attnres_reduce_available(
+                    h,
+                    prefix_sum,
+                    ar_combine,
+                    self._mlp_wp,
                 )
             )
         )

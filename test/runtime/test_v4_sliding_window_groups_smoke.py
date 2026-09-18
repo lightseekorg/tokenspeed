@@ -22,36 +22,71 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     CacheRuntimeContract,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
-    v4_c4_state_window,
     v4_compressed_kv_spec,
     v4_compressor_state_spec,
     v4_indexer_kv_spec,
     v4_indexer_state_spec,
     v4_swa_kv_spec,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
+    SchedulerLimits,
+    capacity_model,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
-    compute_cache_group_page_counts,
     compute_max_logical_pages_for_capture,
 )
 
 
-def build_v4_cache_specs(hf_config, *, layer_ratio, decode_input_tokens=1):
+def build_v4_cache_specs(hf_config, *, layer_ratio):
     """The spec set a ratio vector declares, in the recipe's own order.
 
     The recipe reaches for these constructors one group at a time as it walks
     layers; here the whole set is what is under test.
     """
     ratios = {int(ratio) for ratio in layer_ratio}
-    window = v4_c4_state_window(decode_input_tokens)
     specs = [v4_swa_kv_spec(hf_config)]
     for ratio in sorted(r for r in ratios if r > 1):
-        specs.append(v4_compressor_state_spec(ratio, c4_state_window=window))
+        specs.append(v4_compressor_state_spec(ratio))
         specs.append(v4_compressed_kv_spec(ratio))
     if 4 in ratios:
         specs.append(v4_indexer_kv_spec())
-        specs.append(v4_indexer_state_spec(c4_state_window=window))
+        specs.append(v4_indexer_state_spec())
     return tuple(specs)
+
+
+def compute_cache_group_pages(
+    specs,
+    *,
+    prefix_granularity,
+    max_live_requests,
+    max_scheduled_tokens,
+    max_total_tokens,
+    max_context_len,
+    decode_input_tokens,
+    overlap_schedule_depth,
+):
+    """Child pages per group (null page excluded) from the scheduler's model."""
+    from tokenspeed_scheduler import SchedulerConfig
+
+    model = capacity_model(
+        specs,
+        prefix_granularity=prefix_granularity,
+        virtual_packing={spec.group_id: 1 for spec in specs},
+        limits=SchedulerLimits(
+            role=SchedulerConfig.Role.Fused,
+            max_live_requests=max_live_requests,
+            max_scheduled_tokens=max_scheduled_tokens,
+            max_context_len=max_context_len,
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=overlap_schedule_depth,
+            disable_prefix_cache=False,
+        ),
+    )
+    pages = model.concurrent_group_pages(
+        max_total_tokens=max_total_tokens, max_context_len=max_context_len
+    )
+    return dict(zip((spec.group_id for spec in specs), pages))
 
 
 class _CapacityProbe(CacheRecipe):
@@ -66,9 +101,9 @@ class _CapacityProbe(CacheRecipe):
     family = "deepseek_v4"
     layer_types = ()
 
-    def __init__(self, specs, limits) -> None:
+    def __init__(self, specs, limits: SchedulerLimits) -> None:
         self._specs = tuple(specs)
-        self._limits = dict(limits)
+        self._limits = limits
 
     @property
     def _group_specs(self):
@@ -94,6 +129,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                     rows_per_page=rows_per_page,
                     entry_stride_tokens=entry_stride_tokens,
                     sliding_window_tokens=None,
+                    replayable=False,
                 ),
                 CacheGroupSpec(
                     group_id="sliding",
@@ -101,41 +137,48 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                     rows_per_page=rows_per_page,
                     entry_stride_tokens=entry_stride_tokens,
                     sliding_window_tokens=3 * raw_per_page + 1,
+                    replayable=False,
                 ),
             ]
             common = {
+                "prefix_granularity": raw_per_page,
                 "max_live_requests": max_live_requests,
                 "max_scheduled_tokens": 1024,
                 "max_total_tokens": 4096,
                 "max_context_len": 4096,
             }
             for verify_width in (1, 2, 4, 8):
-                baseline = compute_cache_group_page_counts(
+                baseline = compute_cache_group_pages(
                     specs,
                     **common,
                     decode_input_tokens=verify_width,
                     overlap_schedule_depth=0,
                 )
-                for overlap_depth in (0, 1):
-                    with self.subTest(
-                        raw_per_page=raw_per_page,
-                        verify_width=verify_width,
-                        overlap_depth=overlap_depth,
-                    ):
-                        actual = compute_cache_group_page_counts(
-                            specs,
-                            **common,
-                            decode_input_tokens=verify_width,
-                            overlap_schedule_depth=overlap_depth,
+                overlapped = compute_cache_group_pages(
+                    specs,
+                    **common,
+                    decode_input_tokens=verify_width,
+                    overlap_schedule_depth=1,
+                )
+                with self.subTest(raw_per_page=raw_per_page, verify_width=verify_width):
+                    # One overlapped step protects one more verify window per
+                    # live request: never fewer pages, never more than the
+                    # window's own page span. A dense history has one tail page
+                    # of slack per request, so the window costs a page only
+                    # past what that slack absorbs.
+                    for group_id in ("full", "sliding"):
+                        delta = overlapped[group_id] - baseline[group_id]
+                        self.assertGreaterEqual(delta, 0, group_id)
+                        self.assertLessEqual(
+                            delta,
+                            max_live_requests * math.ceil(verify_width / raw_per_page),
+                            group_id,
                         )
-                        protected_pages = max_live_requests * math.ceil(
-                            overlap_depth * verify_width / raw_per_page
-                        )
-                        for group_id in ("full", "sliding"):
-                            self.assertEqual(
-                                actual[group_id],
-                                baseline[group_id] + protected_pages,
-                            )
+                    self.assertEqual(
+                        overlapped["full"] - baseline["full"],
+                        max_live_requests
+                        * math.ceil((verify_width - 1) / raw_per_page),
+                    )
 
     def test_capture_table_width_is_parameterized_by_verify_width_and_depth(self):
         for rows_per_page, entry_stride_tokens in _PAGE_SHAPES:
@@ -146,6 +189,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                 rows_per_page=rows_per_page,
                 entry_stride_tokens=entry_stride_tokens,
                 sliding_window_tokens=None,
+                replayable=False,
             )
             window = 3 * raw_per_page + 1
             sliding = CacheGroupSpec(
@@ -154,6 +198,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                 rows_per_page=rows_per_page,
                 entry_stride_tokens=entry_stride_tokens,
                 sliding_window_tokens=window,
+                replayable=False,
             )
             context_len = 5 * raw_per_page + 1
             for verify_width in (1, 2, 4, 8):
@@ -205,6 +250,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                     rows_per_page=rows_per_page,
                     entry_stride_tokens=entry_stride_tokens,
                     sliding_window_tokens=window,
+                    replayable=False,
                 )
                 for context_len in (2 * raw_per_page + 1, 5 * raw_per_page + 1):
                     for verify_width in (1, 2, 4, 8):
@@ -242,13 +288,18 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             rows_per_page=4,
             entry_stride_tokens=1,
             sliding_window_tokens=None,
+            replayable=False,
         )
         count_args = {
+            "prefix_granularity": 4,
             "max_live_requests": 1,
             "max_scheduled_tokens": 8,
             "max_total_tokens": 8,
             "max_context_len": 8,
+            "decode_input_tokens": 1,
+            "overlap_schedule_depth": 0,
         }
+        # The scheduler's own validation, surfaced as ValueError by the binding.
         for overrides, message in (
             ({"decode_input_tokens": -1}, "decode_input_tokens"),
             ({"overlap_schedule_depth": 2}, "overlap_schedule_depth"),
@@ -256,12 +307,13 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                 {"decode_input_tokens": 0, "overlap_schedule_depth": 1},
                 "decode_input_tokens",
             ),
+            ({"max_total_tokens": -1}, "max_total_tokens"),
         ):
             with (
                 self.subTest(function="page_counts", overrides=overrides),
                 self.assertRaisesRegex(ValueError, message),
             ):
-                compute_cache_group_page_counts([spec], **count_args, **overrides)
+                compute_cache_group_pages([spec], **{**count_args, **overrides})
 
         for overrides, message in (
             ({"max_context_len": -1}, "max_context_len"),
@@ -286,15 +338,19 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             self.subTest(group="bad-rows"),
             self.assertRaisesRegex(ValueError, "rows_per_page"),
         ):
-            CacheGroupSpec("bad-rows", "full_history", 0, 1, None)
+            CacheGroupSpec("bad-rows", "full_history", 0, 1, None, replayable=False)
 
         invalid_specs = (
             (
-                CacheGroupSpec("bad-window", "sliding_window", 4, 1, 0),
+                CacheGroupSpec(
+                    "bad-window", "sliding_window", 4, 1, 0, replayable=False
+                ),
                 "sliding_window_tokens",
             ),
             (
-                CacheGroupSpec("bad-retention", "unknown", 4, 1, None),
+                CacheGroupSpec(
+                    "bad-retention", "unknown", 4, 1, None, replayable=False
+                ),
                 "unsupported retention",
             ),
         )
@@ -338,41 +394,49 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                 rows_per_page=4,
                 entry_stride_tokens=1,
                 sliding_window_tokens=8,
+                replayable=False,
             )
         ]
 
-        counts = compute_cache_group_page_counts(
+        pages = compute_cache_group_pages(
             specs,
+            prefix_granularity=4,
             max_live_requests=10,
             max_scheduled_tokens=100,
             max_total_tokens=20,
             max_context_len=4096,
+            decode_input_tokens=1,
+            overlap_schedule_depth=0,
         )
 
-        resident_pages = 10 * math.ceil(7 / 4)
+        # Each request retains its 7-token window plus the decode token at any
+        # page alignment; one chunk in flight -- capped by the total -- adds its
+        # rows behind the resumable-boundary lookback.
+        resident_pages = 10 * math.ceil((7 + 1 + 3) / 4)
+        lookback_pages = math.ceil(7 / 4)
         scheduled_pages = math.ceil(20 / 4)
-        request_fragment_pages = 10
-        dummy_pages = 1
         self.assertEqual(
-            counts["sliding"],
-            resident_pages + scheduled_pages + request_fragment_pages + dummy_pages,
+            pages["sliding"], resident_pages + lookback_pages + scheduled_pages
         )
 
     def test_page_counts_positive_finite_and_under_total_times_live(self):
         inputs = {
+            "prefix_granularity": 256,
             "max_live_requests": 32,
             "max_scheduled_tokens": 2048,
             "max_total_tokens": 64 * 1024,
             "max_context_len": 64 * 1024,
+            "decode_input_tokens": 1,
+            "overlap_schedule_depth": 0,
         }
         specs = build_v4_cache_specs(
             SimpleNamespace(sliding_window=128),
             layer_ratio=(1, 4, 128),
         )
-        counts = compute_cache_group_page_counts(specs, **inputs)
+        pages = compute_cache_group_pages(specs, **inputs)
         bound = inputs["max_total_tokens"] * inputs["max_live_requests"]
         for spec in specs:
-            n = counts[spec.group_id]
+            n = pages[spec.group_id]
             self.assertIsInstance(n, int, spec.group_id)
             self.assertGreater(n, 0, spec.group_id)
             self.assertTrue(math.isfinite(n), spec.group_id)
@@ -468,27 +532,22 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         Scheduler(config)
         self.assertEqual(aligned_max_scheduled_tokens(8192, groups), 8192)
 
-    def test_c4_state_window_covers_wide_verify_blocks(self):
-        base = build_v4_cache_specs(
+    def test_c4_state_window_is_the_kernel_read_window(self):
+        """The ratio-4 compress kernel reads eight positions (two groups) when a
+        position completes a group; the verify rows of that step are written in
+        the same forward, so no verify width widens the retained window."""
+        specs = build_v4_cache_specs(
             SimpleNamespace(sliding_window=128),
-            layer_ratio=(4,),
+            layer_ratio=(4, 128),
         )
-        wide = build_v4_cache_specs(
-            SimpleNamespace(sliding_window=128),
-            layer_ratio=(4,),
-            decode_input_tokens=6,
-        )
-
-        base_windows = {spec.group_id: spec.sliding_window_tokens for spec in base}
-        wide_windows = {spec.group_id: spec.sliding_window_tokens for spec in wide}
-        for group_id in (
-            "v4.c4a.compressor_state",
-            "v4.c4a.indexer_compressor_state",
-        ):
-            self.assertEqual(base_windows[group_id], 8)
-            self.assertEqual(wide_windows[group_id], 10)
+        windows = {spec.group_id: spec.sliding_window_tokens for spec in specs}
+        self.assertEqual(windows["v4.c4a.compressor_state"], 8)
+        self.assertEqual(windows["v4.c4a.indexer_compressor_state"], 8)
+        self.assertEqual(windows["v4.c128a.compressor_state"], 128)
 
     def test_lcm_capacity_is_the_inverse_of_parent_demand(self):
+        from tokenspeed_scheduler import SchedulerConfig
+
         layout = SimpleNamespace(
             prefix_granularity=256,
             group_packing=(
@@ -497,6 +556,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                 ("v4.c4a.compressed_kv", 2),
                 ("v4.c128a.compressor_state", 1),
                 ("v4.c128a.compressed_kv", 8),
+                ("v4.c4a.indexer_kv", 2),
                 ("v4.c4a.indexer_compressor_state", 4),
             ),
         )
@@ -505,13 +565,15 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                 SimpleNamespace(sliding_window=128),
                 layer_ratio=(1, 4, 128),
             ),
-            {
-                "max_live_requests": 1,
-                "max_scheduled_tokens": 256,
-                "max_context_len": 4096,
-                "decode_input_tokens": 1,
-                "overlap_schedule_depth": 0,
-            },
+            SchedulerLimits(
+                role=SchedulerConfig.Role.Fused,
+                max_live_requests=1,
+                max_scheduled_tokens=256,
+                max_context_len=4096,
+                decode_input_tokens=1,
+                overlap_schedule_depth=0,
+                disable_prefix_cache=False,
+            ),
         )
         num_lcm_blocks = 100
         capacity = probe._capacity_from_parents(

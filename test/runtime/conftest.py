@@ -110,6 +110,8 @@ def kimi_recipe(
         server_args=SimpleNamespace(
             max_total_tokens=None,
             chunked_prefill_size=max_scheduled_tokens,
+            disaggregation_mode="null",
+            enable_prefix_caching=True,
             speculative_algorithm=speculative_algorithm,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         ),

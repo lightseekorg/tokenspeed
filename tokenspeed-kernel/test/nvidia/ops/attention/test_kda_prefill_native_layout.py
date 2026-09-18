@@ -25,7 +25,7 @@ import math
 import pytest
 import tokenspeed_kernel.ops.attention.kda.cute_dsl as cutedsl_op
 import torch
-from tokenspeed_kernel.ops.attention.kda import kda_paged_prefill
+from tokenspeed_kernel.ops.attention.kda import KdaPrefillCapacity, kda_paged_prefill
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.registry import KernelRegistry
 
@@ -53,6 +53,8 @@ def _inputs(device, lengths):
 
 def _actual(inputs, state, bounds, cpu, layout):
     return kda_paged_prefill(
+        capacity=None,
+        inputs_packed=False,
         *inputs,
         initial_state=state,
         cu_seqlens=bounds,
@@ -170,6 +172,97 @@ def test_native_prefill_bitwise_parity(native_cuda, lengths, fresh):
     assert torch.equal(actual.out, expected_out)
     assert torch.equal(actual.final_state, expected_state)
     assert torch.equal(state, state_before)
+
+
+def test_capacity_compatibility_fallback(native_cuda, monkeypatch):
+    inputs, state, bounds, cpu = _inputs("cuda", [1, 67])
+    tensors = (
+        tuple(
+            torch.cat((tensor, torch.full_like(tensor[:, :32], float("nan"))), dim=1)
+            for tensor in inputs[:5]
+        )
+        + inputs[5:]
+    )
+    expected = _actual(inputs, state, bounds, cpu, "v_major")
+    monkeypatch.setattr(cutedsl_op, "cutedsl_kda_supports_prepared_plan", lambda: False)
+    actual = kda_paged_prefill(
+        *tensors,
+        initial_state=state,
+        cu_seqlens=bounds,
+        cu_seqlens_cpu=cpu,
+        capacity=KdaPrefillCapacity(100, 2),
+        inputs_packed=False,
+        lower_bound=-5.0,
+        override=None,
+        solution="cutedsl_kda",
+        recurrent_layout="v_major",
+    )
+    torch.testing.assert_close(actual.out[:, :68], expected.out, rtol=0, atol=0)
+    torch.testing.assert_close(actual.final_state, expected.final_state, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("sequences", [1, 2, 4, 8])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("capacity", [256, 2048, 8192])
+def test_capacity_preparation_dynamic_replay(native_cuda, sequences, packed, capacity):
+    """Isolate device-plan replay with new GPU bounds and poisoned padding.
+
+    The captured call does not rerun Python admission against its CPU mirror.
+    Production runtime must refresh both mirrors before replay.
+    """
+    assert cutedsl_op.cutedsl_kda_supports_prepared_plan()
+    lengths = [capacity // sequences] * sequences
+    inputs, state, bounds, cpu = _inputs("cuda", lengths)
+    if packed:
+        inputs = tuple(t.contiguous() for t in inputs)
+    state_before = state.clone()
+
+    def run():
+        return kda_paged_prefill(
+            *inputs,
+            initial_state=state,
+            cu_seqlens=bounds,
+            cu_seqlens_cpu=cpu,
+            capacity=KdaPrefillCapacity(capacity, sequences),
+            inputs_packed=packed,
+            lower_bound=-5.0,
+            override=None,
+            solution="cutedsl_kda",
+            recurrent_layout="v_major",
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = run()
+    partitions = [
+        [capacity - sequences + 1] + [1] * (sequences - 1),
+        [1] * (sequences - 1) + [capacity - sequences + 1],
+        [17 + i for i in range(sequences)],
+        [1] * sequences,
+    ]
+    for lengths in partitions * 2:
+        live = sum(lengths)
+        new_cpu = torch.tensor([0, *lengths], dtype=torch.int64).cumsum(0)
+        bounds.copy_(new_cpu)
+        for tensor in inputs[:5]:
+            tensor.copy_(torch.randn_like(tensor) * 0.1)
+            # The packed producer guarantees only Q/K/V/beta; gate is always scrubbed.
+            tensor[:, live:].fill_(
+                0 if packed and tensor is not inputs[3] else float("nan")
+            )
+        exact = tuple(t[:, :live] for t in inputs[:5]) + inputs[5:]
+        expected = _actual(exact, state, bounds, new_cpu, "v_major")
+        graph.replay()
+        torch.testing.assert_close(actual.out[:, :live], expected.out, rtol=0, atol=0)
+        torch.testing.assert_close(
+            actual.final_state, expected.final_state, rtol=0, atol=0
+        )
+        torch.testing.assert_close(state, state_before, rtol=0, atol=0)
 
 
 def test_native_prefill_cuda_graph_replay(native_cuda):

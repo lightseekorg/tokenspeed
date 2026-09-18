@@ -200,9 +200,9 @@ if platform.is_hopper_plus:
         if dispatcher is not None:
             return dispatcher
 
-        group = plan.get("deepep_group")
+        group = plan.get("process_group")
         if group is None:
-            raise ValueError("DeepEP MoE plan is missing deepep_group")
+            raise ValueError("DeepEP MoE plan is missing process_group")
         deepep_mode = DeepEPMode(plan.get("deepep_mode") or DeepEPMode.auto.value)
         capacity = plan.get("deepep_low_latency_max_num_tokens_per_gpu")
         if deepep_mode.enable_low_latency() and not capacity:

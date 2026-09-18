@@ -28,7 +28,7 @@ native scaled upcast expands each E2M1/UE8M0 tile directly to exact BF16 weight
 values, avoiding scalar nibble and exponent decoding in both GEMVs. Its scale
 operand stays compact--one e8m0 byte per 32-value block.
 
-Kimi K3's 1792-byte packed hidden dimension uses a masked 1024-byte W13 tile.
+Linear-bank Kimi K3's 1792-byte packed hidden dimension uses a masked 1024-byte W13 tile.
 The 14.3% padded tail is cheaper than five additional loop iterations on
 gfx950; masked values and scales are zero-filled before the reduction. The
 compact scale tile matters most here: an expanded tile carries a distinct tail
@@ -49,10 +49,16 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_common import (
     _compact_mxfp4_scale_tile,
     _gluon_dot_preshuffled_w_offset,
 )
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.n16_weights import (
+    _n16_weight_offset,
+    _n32_scale_offset,
+    n16_mxfp4_shape,
+)
 
 _LANES = gl.constexpr(64)
-# Kimi K3 W13 uses a deliberately masked wide-K tile. W2 prefers exact tiles,
-# but retains the 256-byte minimum required by scaled upcast and masks its tail.
+# Rank-3 banks retain the wide-K W13 tile. W2 prefers exact tiles, with a
+# 256-byte minimum required by scaled upcast and a masked tail when needed.
+# N16 banks change physical-cell loads, not the compute geometry.
 WARP_DECODE_STAGE1_BLOCK_N = 8
 WARP_DECODE_STAGE1_BLOCK_KB = 1024
 WARP_DECODE_STAGE1_NUM_WARPS = 4
@@ -79,8 +85,42 @@ _GDOT_STAGE2_BLOCK_N = gl.constexpr(16)
 _GDOT_STAGE2_NUM_WARPS = gl.constexpr(4)
 
 
+@gluon.constexpr_function
+def _a16_weight_layouts(block_n, block_kb, num_warps, n16_weights):
+    rows = (block_n + num_warps - 1) // num_warps
+    compute = gl.BlockedLayout(
+        [rows, 2 * block_kb // 64], [1, 64], [num_warps, 1], [1, 0]
+    )
+    if n16_weights:
+        # Split N across lanes only within each compute wave's rows.
+        n_lanes = min(rows, 2)
+        n_per_lane = rows // n_lanes
+        k_lanes = 64 // n_lanes
+        packed_per_lane = max(4, min(16, block_kb // k_lanes))
+        return (
+            gl.BlockedLayout(
+                [n_per_lane, packed_per_lane],
+                [n_lanes, k_lanes],
+                [num_warps, 1],
+                [0, 1],
+            ),
+            gl.BlockedLayout(
+                [n_per_lane, 2 * packed_per_lane],
+                [n_lanes, k_lanes],
+                [num_warps, 1],
+                [0, 1],
+            ),
+            compute,
+        )
+    return (
+        gl.BlockedLayout([rows, block_kb // 64], [1, 64], [num_warps, 1], [1, 0]),
+        compute,
+        compute,
+    )
+
+
 def _largest_exact_block_kb(packed_k: int, max_block_kb: int) -> int:
-    """Select the widest power-of-two K tile that does not need masking."""
+    """Step down toward an exact packed-K tile, bounded by the minimum size."""
 
     block_kb = max_block_kb
     while block_kb > _MIN_WARP_DECODE_BLOCK_KB and packed_k % block_kb:
@@ -98,13 +138,20 @@ def _supports_a16w4_warp_decode_ep_gfx950(
     linear_weights: bool = True,
 ) -> bool:
     """Return whether route-direct decode supports this weight representation."""
-    if hidden_states.ndim != 2 or any(
-        tensor.ndim != 3 for tensor in (w13_weight, w13_scale, w2_weight, w2_scale)
-    ):
+    tensors = (w13_weight, w13_scale, w2_weight, w2_scale)
+    if hidden_states.ndim != 2:
         return False
 
     hidden = int(hidden_states.shape[1])
-    if linear_weights:
+    if linear_weights and any(t.ndim == 6 for t in tensors):
+        try:
+            _, packed_hidden, intermediate = n16_mxfp4_shape(*tensors)
+        except ValueError:
+            return False
+        shapes_match = packed_hidden == hidden
+    elif any(t.ndim != 3 for t in tensors):
+        return False
+    elif linear_weights:
         num_experts, two_intermediate, packed_hidden = w13_weight.shape
         intermediate = int(two_intermediate) // 2
         shapes_match = (
@@ -187,6 +234,7 @@ def _stage1_a16w4_situ_warp_gemv(
     NUM_LOCAL_EXPERTS: gl.constexpr,
     LINEAR_WEIGHTS: gl.constexpr,
     W13_INTERLEAVED: gl.constexpr,
+    N16_WEIGHTS: gl.constexpr,
     NUM_PID_N: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_KB: gl.constexpr,
@@ -206,24 +254,16 @@ def _stage1_a16w4_situ_warp_gemv(
     if expert >= NUM_LOCAL_EXPERTS:
         return
 
-    # Warps span output neurons while each wave's lanes reduce packed K bytes.
-    layout: gl.constexpr = gl.BlockedLayout(
-        [(BLOCK_N + NUM_WARPS - 1) // NUM_WARPS, BLOCK_KB // _LANES],
-        [1, _LANES],
-        [NUM_WARPS, 1],
-        [1, 0],
+    layouts: gl.constexpr = _a16_weight_layouts(
+        BLOCK_N, BLOCK_KB, NUM_WARPS, N16_WEIGHTS
     )
+    layout: gl.constexpr = layouts[0]
     n_layout: gl.constexpr = gl.SliceLayout(1, layout)
     k_layout: gl.constexpr = gl.SliceLayout(0, layout)
-    expanded_layout: gl.constexpr = gl.BlockedLayout(
-        [(BLOCK_N + NUM_WARPS - 1) // NUM_WARPS, (2 * BLOCK_KB) // _LANES],
-        [1, _LANES],
-        [NUM_WARPS, 1],
-        [1, 0],
-    )
+    expanded_layout: gl.constexpr = layouts[2]
     expanded_n_layout: gl.constexpr = gl.SliceLayout(1, expanded_layout)
     expanded_k_layout: gl.constexpr = gl.SliceLayout(0, expanded_layout)
-    scale_tile: gl.constexpr = _compact_mxfp4_scale_tile(expanded_layout, 1)
+    scale_tile: gl.constexpr = _compact_mxfp4_scale_tile(layouts[1], 1)
     scale_layout: gl.constexpr = scale_tile[0]
     SCALE_GROUP: gl.constexpr = scale_tile[1]
     scale_n_layout: gl.constexpr = gl.SliceLayout(1, scale_layout)
@@ -236,7 +276,15 @@ def _stage1_a16w4_situ_warp_gemv(
     x_row = token.to(gl.int64) * stride_xm
     w_expert = expert.to(gl.int64) * stride_we
     scale_expert = expert.to(gl.int64) * stride_se
-    if LINEAR_WEIGHTS and not W13_INTERLEAVED:
+    if N16_WEIGHTS:
+        gate_col = offs_n // 16 * 32 + offs_n % 16
+        up_col = gate_col + 16
+        scale_gate_col = scale_offs_n // 16 * 32 + scale_offs_n % 16
+        scale_up_col = scale_gate_col + 16
+        # Each expert is a scalar base; intra-expert byte offsets stay compact.
+        w13_ptr += w_expert
+        w13_scale_ptr += scale_expert
+    elif LINEAR_WEIGHTS and not W13_INTERLEAVED:
         gate_col = offs_n
         up_col = intermediate_dim + offs_n
         scale_gate_col = scale_offs_n
@@ -285,7 +333,20 @@ def _stage1_a16w4_situ_warp_gemv(
             + offs_kb[None, :].to(gl.int64) * stride_wk
             + up_col[:, None].to(gl.int64) * stride_wn
         )
-        if LINEAR_WEIGHTS:
+        if N16_WEIGHTS:
+            gate_w_offsets = _n16_weight_offset(
+                gate_col[:, None], offs_kb[None, :], packed_k
+            )
+            up_w_offsets = _n16_weight_offset(
+                up_col[:, None], offs_kb[None, :], packed_k
+            )
+            gate_scale_offsets = _n32_scale_offset(
+                scale_gate_col[:, None], scale_k[None, :] // 32, hidden_dim // 32
+            )
+            up_scale_offsets = _n32_scale_offset(
+                scale_up_col[:, None], scale_k[None, :] // 32, hidden_dim // 32
+            )
+        elif LINEAR_WEIGHTS:
             gate_scale_offsets = (
                 scale_expert
                 + scale_gate_col[:, None].to(gl.int64) * stride_slin
@@ -345,6 +406,10 @@ def _stage1_a16w4_situ_warp_gemv(
             gl.bfloat16,
             axis=1,
         )
+        # Restore the original per-row K ownership before FP32 arithmetic.
+        if N16_WEIGHTS:
+            gate_w = gl.convert_layout(gate_w, expanded_layout)
+            up_w = gl.convert_layout(up_w, expanded_layout)
         x_tile = gl.convert_layout(x[None, :], expanded_layout)
         gate_acc += gl.sum(gate_w.to(gl.float32) * x_tile, axis=1)
         up_acc += gl.sum(up_w.to(gl.float32) * x_tile, axis=1)
@@ -569,6 +634,7 @@ def _stage2_a16w4_warp_gemv_combine(
     EXPERT_START: gl.constexpr,
     NUM_LOCAL_EXPERTS: gl.constexpr,
     LINEAR_WEIGHTS: gl.constexpr,
+    N16_WEIGHTS: gl.constexpr,
     NUM_PID_N: gl.constexpr,
     NUM_TOPK_GROUPS: gl.constexpr,
     NUM_SHARED_PID_N: gl.constexpr,
@@ -634,23 +700,16 @@ def _stage2_a16w4_warp_gemv_combine(
     token_pid = pid % (NUM_TOPK_GROUPS * NUM_PID_N)
     topk_group = token_pid // NUM_PID_N
     pid_n = token_pid % NUM_PID_N
-    layout: gl.constexpr = gl.BlockedLayout(
-        [(BLOCK_N + NUM_WARPS - 1) // NUM_WARPS, BLOCK_KB // _LANES],
-        [1, _LANES],
-        [NUM_WARPS, 1],
-        [1, 0],
+    layouts: gl.constexpr = _a16_weight_layouts(
+        BLOCK_N, BLOCK_KB, NUM_WARPS, N16_WEIGHTS
     )
+    layout: gl.constexpr = layouts[0]
     n_layout: gl.constexpr = gl.SliceLayout(1, layout)
     k_layout: gl.constexpr = gl.SliceLayout(0, layout)
-    expanded_layout: gl.constexpr = gl.BlockedLayout(
-        [(BLOCK_N + NUM_WARPS - 1) // NUM_WARPS, (2 * BLOCK_KB) // _LANES],
-        [1, _LANES],
-        [NUM_WARPS, 1],
-        [1, 0],
-    )
+    expanded_layout: gl.constexpr = layouts[2]
     expanded_n_layout: gl.constexpr = gl.SliceLayout(1, expanded_layout)
     expanded_k_layout: gl.constexpr = gl.SliceLayout(0, expanded_layout)
-    scale_tile: gl.constexpr = _compact_mxfp4_scale_tile(expanded_layout, 1)
+    scale_tile: gl.constexpr = _compact_mxfp4_scale_tile(layouts[1], 1)
     scale_layout: gl.constexpr = scale_tile[0]
     SCALE_GROUP: gl.constexpr = scale_tile[1]
     scale_n_layout: gl.constexpr = gl.SliceLayout(1, scale_layout)
@@ -678,6 +737,12 @@ def _stage2_a16w4_warp_gemv_combine(
             inter_row = (token * TOP_K + slot).to(gl.int64) * stride_ipm
             w_expert = expert.to(gl.int64) * stride_we
             scale_expert = expert.to(gl.int64) * stride_se
+            if N16_WEIGHTS:
+                weight_base = w2_ptr + w_expert
+                scale_base = w2_scale_ptr + scale_expert
+            else:
+                weight_base = w2_ptr
+                scale_base = w2_scale_ptr
             route_acc = gl.zeros([BLOCK_N], gl.float32, expanded_n_layout)
             for kb0 in range(0, packed_k, BLOCK_KB):
                 offs_kb = kb0 + gl.arange(0, BLOCK_KB, layout=k_layout)
@@ -713,7 +778,16 @@ def _stage2_a16w4_warp_gemv_combine(
                     + offs_kb[None, :].to(gl.int64) * stride_wk
                     + offs_n[:, None].to(gl.int64) * stride_wn
                 )
-                if LINEAR_WEIGHTS:
+                if N16_WEIGHTS:
+                    w_offsets = _n16_weight_offset(
+                        offs_n[:, None], offs_kb[None, :], packed_k
+                    )
+                    scale_offsets = _n32_scale_offset(
+                        scale_offs_n[:, None],
+                        scale_k[None, :] // 32,
+                        intermediate_dim // 32,
+                    )
+                elif LINEAR_WEIGHTS:
                     scale_offsets = (
                         scale_expert
                         + scale_offs_n[:, None].to(gl.int64) * stride_slin
@@ -728,7 +802,7 @@ def _stage2_a16w4_warp_gemv_combine(
                         stride_snb,
                     )
                 packed = gl.amd.cdna4.buffer_load(
-                    ptr=w2_ptr,
+                    ptr=weight_base,
                     offsets=w_offsets.to(gl.int32),
                     mask=packed_k_valid[None, :],
                     other=0,
@@ -736,7 +810,7 @@ def _stage2_a16w4_warp_gemv_combine(
                 weight = gl.amd.cdna4.scaled_upcast(
                     packed,
                     gl.amd.cdna4.buffer_load(
-                        ptr=w2_scale_ptr,
+                        ptr=scale_base,
                         offsets=scale_offsets.to(gl.int32),
                         mask=scale_k_valid[None, :],
                         other=0,
@@ -744,6 +818,8 @@ def _stage2_a16w4_warp_gemv_combine(
                     gl.bfloat16,
                     axis=1,
                 )
+                if N16_WEIGHTS:
+                    weight = gl.convert_layout(weight, expanded_layout)
                 inter_tile = gl.convert_layout(inter[None, :], expanded_layout)
                 route_acc += gl.sum(weight.to(gl.float32) * inter_tile, axis=1)
             # Match the reference's BF16 W2 result before route weighting.
@@ -957,12 +1033,15 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
 
     ``linear_weights=False`` consumes K-packed values and CDNA4-swizzled
     scales, including the gdot128 layout used by the prefill kernels.
-    ``linear_weights=True`` consumes the Gluon EP8 plan's original contiguous
-    ``[E, N, K / 2]`` values and linear scales.
-    Kimi K3's W13 packed-K size uses a tuned masked tail; W2 and other
-    supported widths retain unmasked execution by stepping down to an exact
-    tile. ``activation="swiglu"`` selects standard alpha=1, beta=0 SwiGLU
-    with an optional symmetric clamp on the gate/up inputs.
+    ``linear_weights=True`` consumes logical ``[E, N, K / 2]`` tensors.
+    These are either the original rank-3 linear bank or explicit rank-6 N16
+    cells shared with MXFP8 prefill. Rank-3 banks retain their existing layouts
+    and tile selection: the wide-K W13 tile may be masked, and W2 steps down
+    to an exact tile where supported. N16 weight/scale loads retain each compute
+    wave's output rows, then convert BF16 weights to the original lane layout.
+    Both stages retain their K tiles and mask partial tails when required.
+    ``activation="swiglu"`` selects standard alpha=1, beta=0 SwiGLU with an
+    optional symmetric clamp on the gate/up inputs.
     """
     if hidden_states.dtype != torch.bfloat16 or hidden_states.ndim != 2:
         raise ValueError("gfx950 warp decode requires rank-2 BF16 activations")
@@ -1014,6 +1093,11 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
             )
     num_tokens, hidden_dim = hidden_states.shape
     top_k = int(local_topk_ids.shape[1])
+    n16_weights = any(
+        tensor.ndim == 6 for tensor in (w13_weight, w13_scale, w2_weight, w2_scale)
+    )
+    if n16_weights and not linear_weights:
+        raise ValueError("N16 decode requires logical linear weight dimensions")
     gdot_weights = not linear_weights and all(
         bool(getattr(weight, "is_shuffled_for_gluon_dot", False))
         and int(getattr(weight, "gluon_dot_block_k_pk", 0)) == 128
@@ -1022,7 +1106,20 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
     )
     if gdot_weights and (fuse_shared_down or shared_out is not None):
         raise ValueError("gdot A16W4 decode does not support shared down fusion")
-    if linear_weights:
+    if n16_weights:
+        num_experts, weight_hidden, intermediate_dim = n16_mxfp4_shape(
+            w13_weight,
+            w13_scale,
+            w2_weight,
+            w2_scale,
+        )
+        if weight_hidden != hidden_dim:
+            raise ValueError("N16 W13 shape is inconsistent with activations")
+        packed_hidden = hidden_dim // 2
+        w13_stride_k = w2_stride_k = 1
+        w13_stride_n = packed_hidden
+        w2_stride_n = intermediate_dim // 2
+    elif linear_weights:
         num_experts, two_intermediate, packed_hidden = w13_weight.shape
         intermediate_dim = two_intermediate // 2
         if two_intermediate % 2 or packed_hidden * 2 != hidden_dim:
@@ -1192,6 +1289,7 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
             NUM_LOCAL_EXPERTS=num_experts,
             LINEAR_WEIGHTS=linear_weights,
             W13_INTERLEAVED=(w13_interleaved if linear_weights else True),
+            N16_WEIGHTS=n16_weights,
             NUM_PID_N=intermediate_dim // stage1_block_n,
             BLOCK_N=stage1_block_n,
             BLOCK_KB=stage1_block_kb,
@@ -1362,11 +1460,12 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         shared_out.stride(0),
         shared_out.stride(1),
         FUSE_SHARED_DOWN=fuse_shared_down,
-        NUM_ROUTED_PROGRAMS=stage2_grid,
+        NUM_ROUTED_PROGRAMS=stage2_grid if fuse_shared_down else 0,
         TOP_K=top_k,
         EXPERT_START=int(expert_start),
         NUM_LOCAL_EXPERTS=num_experts,
         LINEAR_WEIGHTS=linear_weights,
+        N16_WEIGHTS=n16_weights,
         NUM_PID_N=hidden_dim // stage2_block_n,
         NUM_TOPK_GROUPS=num_topk_groups,
         NUM_SHARED_PID_N=7168 // stage2_block_n,

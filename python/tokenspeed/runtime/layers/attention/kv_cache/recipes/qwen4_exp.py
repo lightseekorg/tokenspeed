@@ -252,6 +252,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                         sliding_window_tokens=None,
                         family="state",
                         checkpoint_granularity=self.prefix_granularity,
+                        replayable=False,
                     ),
                     ple_fields,
                 ),
@@ -265,6 +266,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                 entry_stride_tokens=self._qsa_compress_ratio,
                 sliding_window_tokens=None,
                 family="history",
+                replayable=False,
             )
             # Raw block ids require exactly one model/kernel page per block.
             for field in qsa_compressed_fields:
@@ -290,6 +292,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                         entry_stride_tokens=1,
                         sliding_window_tokens=self._qsa_compress_ratio,
                         family="history",
+                        replayable=False,
                     ),
                     qsa_recent_fields,
                 ),

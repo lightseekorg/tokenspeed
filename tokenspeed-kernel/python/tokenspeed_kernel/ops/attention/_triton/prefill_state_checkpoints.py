@@ -79,6 +79,7 @@ def _write_prefill_conv_checkpoints_kernel(
     destination = tl.load(checkpoint_blocks + request_row, mask=live, other=0).to(
         tl.int64
     )
+    position_live = position_live & (destination >= 0)
 
     relative_token = checkpoint_len - state_len + positions
     from_raw = relative_token >= 0
@@ -114,6 +115,12 @@ def _torch_write_prefill_conv_checkpoints(
     checkpoint_seq_lens: torch.Tensor,
 ) -> None:
     state_len = conv_states.shape[-1]
+    active = checkpoint_blocks.index_select(0, rows) >= 0
+    rows = rows[active]
+    sequence_starts = sequence_starts[active]
+    checkpoint_seq_lens = checkpoint_seq_lens[active]
+    if rows.numel() == 0:
+        return
     destinations = checkpoint_blocks.index_select(0, rows).to(torch.int64)
     state_in = state_in_blocks.index_select(0, rows)
     state_out = state_out_blocks.index_select(0, rows)
@@ -154,7 +161,8 @@ def write_prefill_conv_checkpoints(
         conv_states: State pool ``[pages, channels, state_len]``, updated in place.
         state_in_blocks: Per-request input state page ids.
         state_out_blocks: Per-request final output state page ids.
-        checkpoint_blocks: Per-request internal-checkpoint destination page ids.
+        checkpoint_blocks: Per-request internal-checkpoint destination page ids;
+            negative destinations skip both state reads and writes.
         rows: Request rows that own an internal checkpoint.
         sequence_starts: Token offset of each selected request in ``raw_inputs``.
         checkpoint_seq_lens: Request-local length of each selected checkpoint.
@@ -261,7 +269,11 @@ def _pack_prefill_recurrent_inputs_kernel(
     source_token = tl.load(token_indices + token, mask=mask, other=0)
     tl.store(
         query_out + token * query_width + feature,
-        tl.load(query + source_token * query_stride + feature, mask=mask),
+        tl.load(
+            query + source_token * query_stride + feature,
+            mask=mask & (source_token >= 0),
+            other=0,
+        ),
         mask=mask,
     )
 
@@ -271,7 +283,11 @@ def _pack_prefill_recurrent_inputs_kernel(
     source_token = tl.load(token_indices + token, mask=mask, other=0)
     tl.store(
         key_out + token * key_width + feature,
-        tl.load(key + source_token * key_stride + feature, mask=mask),
+        tl.load(
+            key + source_token * key_stride + feature,
+            mask=mask & (source_token >= 0),
+            other=0,
+        ),
         mask=mask,
     )
 
@@ -281,7 +297,11 @@ def _pack_prefill_recurrent_inputs_kernel(
     source_token = tl.load(token_indices + token, mask=mask, other=0)
     tl.store(
         value_out + token * value_width + feature,
-        tl.load(value + source_token * value_stride + feature, mask=mask),
+        tl.load(
+            value + source_token * value_stride + feature,
+            mask=mask & (source_token >= 0),
+            other=0,
+        ),
         mask=mask,
     )
 
@@ -312,7 +332,11 @@ def _pack_prefill_recurrent_inputs_kernel(
         source_token = tl.load(token_indices + token, mask=mask, other=0)
         tl.store(
             a_out + token * a_width + feature,
-            tl.load(a + source_token * a_stride + feature, mask=mask),
+            tl.load(
+                a + source_token * a_stride + feature,
+                mask=mask & (source_token >= 0),
+                other=0,
+            ),
             mask=mask,
         )
     if HAS_B:
@@ -322,7 +346,11 @@ def _pack_prefill_recurrent_inputs_kernel(
         source_token = tl.load(token_indices + token, mask=mask, other=0)
         tl.store(
             b_out + token * b_width + feature,
-            tl.load(b + source_token * b_stride + feature, mask=mask),
+            tl.load(
+                b + source_token * b_stride + feature,
+                mask=mask & (source_token >= 0),
+                other=0,
+            ),
             mask=mask,
         )
     if HAS_G:
@@ -332,7 +360,11 @@ def _pack_prefill_recurrent_inputs_kernel(
         source_token = tl.load(token_indices + token, mask=mask, other=0)
         tl.store(
             g_raw_out + token * g_width + feature,
-            tl.load(g_raw + source_token * g_stride + feature, mask=mask),
+            tl.load(
+                g_raw + source_token * g_stride + feature,
+                mask=mask & (source_token >= 0),
+                other=0,
+            ),
             mask=mask,
         )
     if HAS_F_A:
@@ -342,7 +374,11 @@ def _pack_prefill_recurrent_inputs_kernel(
         source_token = tl.load(token_indices + token, mask=mask, other=0)
         tl.store(
             f_a_packed + token * f_a_width + feature,
-            tl.load(f_a_out + source_token * f_a_stride + feature, mask=mask),
+            tl.load(
+                f_a_out + source_token * f_a_stride + feature,
+                mask=mask & (source_token >= 0),
+                other=0,
+            ),
             mask=mask,
         )
     if HAS_BETA:
@@ -352,7 +388,11 @@ def _pack_prefill_recurrent_inputs_kernel(
         source_token = tl.load(token_indices + token, mask=mask, other=0)
         tl.store(
             beta_raw_out + token * beta_width + feature,
-            tl.load(beta_raw + source_token * beta_stride + feature, mask=mask),
+            tl.load(
+                beta_raw + source_token * beta_stride + feature,
+                mask=mask & (source_token >= 0),
+                other=0,
+            ),
             mask=mask,
         )
 
@@ -399,7 +439,8 @@ def pack_prefill_recurrent_checkpoint_inputs(
         recurrent_state: Per-request initial recurrent states. Row and feature
             strides may be noncontiguous, including transposed scan results.
         rows: Request rows selected for checkpoint scans.
-        token_indices: Source-token indices for all selected checkpoint prefixes.
+        token_indices: Source-token indices for all selected checkpoint prefixes;
+            negative entries produce zero rows for capacity padding.
         a: Optional token-major GDN scan input.
         b: Optional token-major GDN scan input.
         g_raw: Optional token-major KDA gate input.
@@ -412,20 +453,23 @@ def pack_prefill_recurrent_checkpoint_inputs(
     num_rows = rows.numel()
     optional_inputs = (a, b, g_raw, f_a_out, beta_raw)
     if not query.is_cuda:
+
+        def gather(tensor, dim):
+            selected = tensor.index_select(dim, token_indices.clamp_min(0))
+            shape = [1] * selected.ndim
+            shape[dim] = num_tokens
+            return selected.masked_fill((token_indices < 0).view(shape), 0)
+
         return PackedPrefillCheckpointInputs(
-            query=query.index_select(1, token_indices),
-            key=key.index_select(1, token_indices),
-            value=value.index_select(1, token_indices),
+            query=gather(query, 1),
+            key=gather(key, 1),
+            value=gather(value, 1),
             recurrent_state=recurrent_state.index_select(0, rows),
-            a=None if a is None else a.index_select(0, token_indices),
-            b=None if b is None else b.index_select(0, token_indices),
-            g_raw=None if g_raw is None else g_raw.index_select(0, token_indices),
-            f_a_out=(
-                None if f_a_out is None else f_a_out.index_select(0, token_indices)
-            ),
-            beta_raw=(
-                None if beta_raw is None else beta_raw.index_select(0, token_indices)
-            ),
+            a=None if a is None else gather(a, 0),
+            b=None if b is None else gather(b, 0),
+            g_raw=None if g_raw is None else gather(g_raw, 0),
+            f_a_out=(None if f_a_out is None else gather(f_a_out, 0)),
+            beta_raw=(None if beta_raw is None else gather(beta_raw, 0)),
         )
 
     query_out = _allocate_token_pack(query, 1, num_tokens)
@@ -539,6 +583,152 @@ def pack_prefill_recurrent_checkpoint_inputs(
     )
 
 
+@triton.jit
+def _scatter_checkpoint_output_kernel(
+    source,
+    indices,
+    output,
+    STRIDES: tl.constexpr,
+    SHAPE: tl.constexpr,
+    TOKENS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    token, feature = offset // WIDTH, offset % WIDTH
+    destination = tl.load(indices + token, token < TOKENS, other=-1)
+    source_offset = token * STRIDES[0]
+    for dim in tl.static_range(len(SHAPE) - 1, 0, -1):
+        source_offset += (feature % SHAPE[dim]) * STRIDES[dim]
+        feature = feature // SHAPE[dim]
+    live = (token < TOKENS) & (destination >= 0)
+    value = tl.load(source + source_offset, live, other=0)
+    tl.store(output + destination * WIDTH + offset % WIDTH, value, live)
+
+
+@triton.jit
+def _gather_checkpoint_output_kernel(
+    body,
+    tail,
+    sources,
+    output,
+    BODY_STRIDES: tl.constexpr,
+    TAIL_STRIDES: tl.constexpr,
+    FEATURES: tl.constexpr,
+    BODY_TOKENS: tl.constexpr,
+    TAIL_TOKENS: tl.constexpr,
+    TOKENS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    token, feature = offset // WIDTH, offset % WIDTH
+    source = tl.load(sources + token, token < TOKENS, -1)
+    is_body = (token < TOKENS) & (source >= 0) & (source < BODY_TOKENS)
+    is_tail = (
+        (token < TOKENS)
+        & (source >= BODY_TOKENS)
+        & (source < BODY_TOKENS + TAIL_TOKENS)
+    )
+    body_offset = source * BODY_STRIDES[0]
+    tail_offset = (source - BODY_TOKENS) * TAIL_STRIDES[0]
+    for dim in tl.static_range(len(FEATURES) - 1, -1, -1):
+        component = feature % FEATURES[dim]
+        feature //= FEATURES[dim]
+        body_offset += component * BODY_STRIDES[dim + 1]
+        tail_offset += component * TAIL_STRIDES[dim + 1]
+    body_value = tl.load(body + body_offset, is_body, 0)
+    tail_value = tl.load(tail + tail_offset, is_tail, 0)
+    tl.store(output + offset, tl.where(is_body, body_value, tail_value), token < TOKENS)
+
+
+def merge_prefill_checkpoint_outputs(
+    body: torch.Tensor,
+    tail: torch.Tensor,
+    body_indices: torch.Tensor,
+    tail_indices: torch.Tensor,
+    token_dim: int,
+    token_extent: int,
+    output_sources: torch.Tensor | None,
+) -> torch.Tensor:
+    """Restore packed body/tail outputs to original token order.
+
+    Without a CUDA inverse map, zero-initialize and scatter each scan's output.
+    With one, a single gather writes the full output, including zero padding.
+    The caller guarantees valid indices are in range. This copies token outputs,
+    not checkpoint state.
+
+    Args:
+        body: Body scan output, with dense or strided feature dimensions.
+        tail: Tail scan output with the same feature geometry as body.
+        body_indices: Original token indices, with negative padding entries.
+        tail_indices: Original token indices, disjoint from body indices.
+        token_dim: Token axis; any preceding dimensions must be singleton.
+        token_extent: Output token capacity; unwritten padding stays zero.
+        output_sources: Optional per-forward inverse token map. Nonnegative
+            entries index concatenated body/tail tokens; negative entries
+            produce zero. Shared across layers, including graph replays.
+
+    Returns:
+        Contiguous output with the original token order and zero bucket padding.
+        Nonnegative indices must cover each live output token exactly once.
+    """
+    if any(size != 1 for size in body.shape[:token_dim]):
+        raise ValueError("checkpoint outputs require singleton leading dimensions")
+    for source, indices in ((body, body_indices), (tail, tail_indices)):
+        if source.shape[token_dim] != indices.numel():
+            raise ValueError("checkpoint output extent differs from token indices")
+    shape = list(body.shape)
+    shape[token_dim] = token_extent
+    if output_sources is not None and body.is_cuda:
+        if output_sources.numel() != token_extent:
+            raise ValueError("checkpoint inverse map differs from output extent")
+        if (
+            body.shape[token_dim + 1 :] != tail.shape[token_dim + 1 :]
+            or body.dtype != tail.dtype
+        ):
+            raise ValueError("checkpoint outputs have different feature geometry")
+        output = torch.empty(shape, dtype=body.dtype, device=body.device)
+        width = body.numel() // body.shape[token_dim]
+        _gather_checkpoint_output_kernel[(triton.cdiv(output.numel(), 1024),)](
+            body,
+            tail,
+            output_sources,
+            output,
+            BODY_STRIDES=body.stride()[token_dim:],
+            TAIL_STRIDES=tail.stride()[token_dim:],
+            FEATURES=body.shape[token_dim + 1 :],
+            BODY_TOKENS=body.shape[token_dim],
+            TAIL_TOKENS=tail.shape[token_dim],
+            TOKENS=token_extent,
+            WIDTH=width,
+            BLOCK=1024,
+        )
+        return output
+    output = torch.zeros(shape, dtype=body.dtype, device=body.device)
+    for source, indices in ((body, body_indices), (tail, tail_indices)):
+        if not source.is_cuda:
+            live = indices >= 0
+            output.index_copy_(
+                token_dim,
+                indices[live],
+                source.index_select(token_dim, torch.nonzero(live).flatten()),
+            )
+            continue
+        width = source.numel() // source.shape[token_dim]
+        _scatter_checkpoint_output_kernel[(triton.cdiv(source.numel(), 256),)](
+            source,
+            indices,
+            output,
+            STRIDES=source.stride()[token_dim:],
+            SHAPE=source.shape[token_dim:],
+            TOKENS=indices.numel(),
+            WIDTH=width,
+            BLOCK=256,
+        )
+    return output
+
+
 @triton.jit(do_not_specialize=["num_rows", "state_width"])
 def _write_prefill_recurrent_checkpoints_kernel(
     checkpoint_state,
@@ -564,9 +754,11 @@ def _write_prefill_recurrent_checkpoints_kernel(
     feature = offsets % state_width
     live = (row < num_rows) & (feature < state_width)
     request_row = tl.load(rows + row, mask=live, other=0)
-    destination = tl.load(checkpoint_blocks + request_row, mask=live, other=0).to(
+    live = live & (request_row >= 0)
+    destination = tl.load(checkpoint_blocks + request_row, mask=live, other=-1).to(
         tl.int64
     )
+    live = live & (destination >= 0)
     dim_1_index = feature // (state_dim_2 * state_dim_3)
     remainder = feature % (state_dim_2 * state_dim_3)
     dim_2_index = remainder // state_dim_3
@@ -593,13 +785,18 @@ def write_prefill_recurrent_checkpoints(
     checkpoint_blocks: torch.Tensor,
     rows: torch.Tensor,
 ) -> None:
-    """Scatter packed recurrent checkpoint states into the state pool.
+    """Scatter packed recurrent states into a pool or temporary state tensor.
 
     Args:
-        checkpoint_state: Dense scan results, one state per selected row.
-        ssm_states: Dense recurrent-state pool, updated in place.
-        checkpoint_blocks: Per-request checkpoint destination ids.
-        rows: Request rows corresponding to ``checkpoint_state``.
+        checkpoint_state: Scan results, one state per selected row; strides
+            determine the state layout.
+        ssm_states: Recurrent-state destination, updated in place. May also be
+            temporary body final states receiving the active tail states.
+        checkpoint_blocks: Per-request destination indices into ``ssm_states``;
+            these are pool block IDs or temporary state row numbers. Negative
+            destinations skip the write. Destination zero is valid.
+        rows: Request rows corresponding to ``checkpoint_state``; negative
+            rows skip the write without reading a destination.
 
     Returns:
         None. ``ssm_states`` is updated in place.
@@ -611,8 +808,11 @@ def write_prefill_recurrent_checkpoints(
     if checkpoint_state.shape[1:] != ssm_states.shape[1:]:
         raise ValueError("checkpoint and pool recurrent-state shapes must agree")
     if not checkpoint_state.is_cuda:
-        destinations = checkpoint_blocks.index_select(0, rows).to(torch.int64)
-        ssm_states.index_copy_(0, destinations, checkpoint_state.to(ssm_states.dtype))
+        active = rows >= 0
+        destinations = checkpoint_blocks.index_select(0, rows[active]).to(torch.int64)
+        values = checkpoint_state[active]
+        live = destinations >= 0
+        ssm_states.index_copy_(0, destinations[live], values[live].to(ssm_states.dtype))
         return
     state_width = checkpoint_state[0].numel()
     block = 256

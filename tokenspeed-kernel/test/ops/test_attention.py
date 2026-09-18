@@ -181,6 +181,71 @@ def test_mha_prefill_lse(
 
 
 @pytest.mark.parametrize(
+    "is_causal,use_custom_mask",
+    [(True, False), (False, False), (True, True)],
+    ids=["causal", "noncausal", "custom-future"],
+)
+def test_mha_prefill_triton_window_bounds(
+    device: str, require, is_causal: bool, use_custom_mask: bool
+) -> None:
+    from tokenspeed_kernel.ops.attention.mha._triton.prefill import (
+        prefill_attention_fwd,
+    )
+
+    require("attention", "mha_extend_with_kvcache", "triton", torch.bfloat16, "q")
+    # A cached suffix with unaligned window boundaries and a partial query tile.
+    query_len, prefix_len, window_left, page_size = 257, 577, 511, 64
+    kv_len = prefix_len + query_len
+    num_pages = (kv_len + page_size - 1) // page_size
+    q = _randn((query_len, 4, 64), device=device, dtype=torch.bfloat16)
+    k = _randn((num_pages * page_size, 2, 64), device=device, dtype=q.dtype)
+    v = _randn(k.shape, device=device, dtype=q.dtype)
+    out = torch.empty_like(q)
+    page_table = torch.arange(num_pages - 1, -1, -1, device=device, dtype=torch.int32)
+    q_pos = prefix_len + torch.arange(query_len, device=device)
+    k_pos = torch.arange(kv_len, device=device)
+    mask = q_pos[:, None] - k_pos[None, :] <= window_left
+    if use_custom_mask:
+        # The custom mask replaces causality and selects a future key tile.
+        mask &= k_pos[None, :] == kv_len - 1
+    elif is_causal:
+        mask &= q_pos[:, None] >= k_pos[None, :]
+
+    # Call the shared kernel entry point because the public API has no custom mask.
+    prefill_attention_fwd(
+        q_extend=q,
+        k_extend=k,
+        v_extend=v,
+        o_extend=out,
+        k_buffer=k.view(num_pages, page_size, 2, 64).flip(0).flatten(0, 1),
+        v_buffer=v.view(num_pages, page_size, 2, 64).flip(0).flatten(0, 1),
+        cu_seqlens_q=torch.tensor([0, query_len], device=device, dtype=torch.int32),
+        cache_seqlens=torch.tensor([kv_len], device=device, dtype=torch.int32),
+        custom_mask=mask if use_custom_mask else None,
+        is_causal=is_causal,
+        max_len_extend=query_len,
+        sm_scale=1.0 / math.sqrt(q.shape[-1]),
+        logit_cap=0.0,
+        skip_prefix_custom_mask=False,
+        sliding_window_size=window_left,
+        sinks=None,
+        page_table=page_table,
+        page_table_stride_b=num_pages,
+        page_size=page_size,
+        has_kv_cache=True,
+        lse_extend=None,
+    )
+
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.float().transpose(0, 1),
+        k[:kv_len].float().repeat_interleave(2, dim=1).transpose(0, 1),
+        v[:kv_len].float().repeat_interleave(2, dim=1).transpose(0, 1),
+        attn_mask=mask,
+    ).transpose(0, 1)
+    torch.testing.assert_close(out.float(), expected, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.parametrize(
     "dtype,head_dim,num_q_heads,num_kv_heads",
     [
         pytest.param(torch.bfloat16, 64, 8, 2, id="bf16"),

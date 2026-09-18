@@ -151,6 +151,7 @@ def test_cache_batch_metadata_accepts_npu_tables():
                 retention="full_history",
                 rows_per_page=4,
                 entry_stride_tokens=1,
+                replayable=False,
             ),
         ),
         group_page_counts={"full_attention": 2},

@@ -150,6 +150,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_backend.init_cuda_graph_state(max_bs, **kwargs)
         self.linear_attn_backend.init_cuda_graph_state(max_bs, **kwargs)
 
+    def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
+        self.full_attn_backend.init_prefill_graph_state(max_num_tokens, max_bs)
+        self.linear_attn_backend.init_prefill_graph_state(max_num_tokens, max_bs)
+
     def register_step_counter(self, step_counter):
         # Hybrid layerwise transfer needs one global step per model layer,
         # including both full-attention and mamba layers. Normal attention
@@ -175,7 +179,15 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     # ---- Forward dispatch ----
 
-    @break_point
+    def prepare_prefill_metadata(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode, *, capture: bool
+    ) -> bool:
+        if self.step_counter is not None:
+            return False
+        return self.linear_attn_backend.prepare_prefill_metadata(
+            token_capacity, bs, forward_mode, capture=capture
+        )
+
     def forward(
         self,
         q: torch.Tensor,
@@ -189,9 +201,48 @@ class HybridLinearAttnBackend(AttentionBackend):
         record_kv_cache: bool | None = None,
         **kwargs,
     ):
-        """Dispatch one layer to its full-attention or GDN backend (the break point).
+        layer_id = layer.layer_id if layer else kwargs["layer_id"]
+        backend = self._backend_for_layer(layer_id)
+        forward = (
+            self._forward
+            if backend.prefill_metadata_is_capture_ready and self.step_counter is None
+            else self._forward_break
+        )
+        return forward(
+            q,
+            k,
+            v,
+            layer,
+            token_to_kv_pool,
+            forward_mode,
+            bs,
+            save_kv_cache,
+            record_kv_cache,
+            **kwargs,
+        )
 
-        Overrides the base forward, so it carries its own ``@break_point``;
+    @break_point
+    def _forward_break(self, *args, **kwargs):
+        # Keep the outer graph boundary and host transfer callbacks here;
+        # _forward is shared by this route and inline attention capture.
+        return self._forward(*args, **kwargs)
+
+    def _forward(
+        self,
+        q,
+        k,
+        v,
+        layer,
+        token_to_kv_pool,
+        forward_mode,
+        bs,
+        save_kv_cache,
+        record_kv_cache,
+        **kwargs,
+    ):
+        """Dispatch shared compute to the layer's full- or state-attention backend.
+
+        The ordinary route carries its own ``@break_point``;
         the frozen capture-time scalars (forward_mode/bs) are re-read from the
         ambient ctx (semantics: see breakable_cuda_graph). The GDN scan's
         batched [1, T, Hv, D] output is collapsed to z-shaped [T, Hv, D].

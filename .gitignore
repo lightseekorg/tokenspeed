@@ -196,4 +196,5 @@ Testing/
 .serena/*
 
 AGENTS.local.md
+AGENTS.override.md
 outputs/

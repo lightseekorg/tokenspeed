@@ -125,8 +125,7 @@ iteration.
   (FLOPs / bytes) per op family, tabular reports, and Proton integration.
 - `KernelBenchmarkHarness` — registration-level device timing through warmed
   graph replay, with raw samples, resolved registration metadata, and explicit
-  failure outcomes. The first operation-owned generator covers dense BF16
-  batched GEMM.
+  failure outcomes.
 - Runtime shape capture feeds replay and tuning workflows; `kernel_scope`
   scopes are visible in Proton/Chrome traces.
 - End-to-end serving: POST `/start_profile` with

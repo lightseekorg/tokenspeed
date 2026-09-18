@@ -74,6 +74,13 @@ if platform.is_amd:
         gluon_mxfp_fused_moe,
         gluon_mxfp_precomputed_mxfp4_fused_moe,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.n16_weights import (
+        n16_mxfp4_shape,
+        preprocess_n16_mxfp4_weights,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_mxfp8 import (
+        mxfp8_situ_prefill,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (
         _supports_a16w4_warp_decode_ep_gfx950,
         gluon_a16w4_situ_warp_decode_ep_gfx950,
@@ -94,10 +101,17 @@ if platform.is_amd:
         return preprocess_gluon_mxfp4_gfx950_moe_weights(plan, w, preshuffle=True)
 
     def gluon_mxfp4_gfx950_a8w4_situ_ep_weights(plan: dict, w: torch.nn.Module) -> None:
+        if hasattr(w, "w13_weight") and w.w13_weight.ndim == 6:
+            raise ValueError("N16 MXFP4 weights were already prepared")
         if getattr(w, "activation_situ_linear_beta", None) is None:
+            if plan.get("internal_activation_dtype") == "fp8":
+                raise ValueError("explicit FP8 SiTU requires a linear clamp")
             validate_linear_mxfp4_moe_weights(plan, w)
             return
-        gluon_mxfp4_gfx950_moe_weights(plan, w)
+        if w.w13_weight.shape[-1] * 2 % 256 or w.w2_weight.shape[-1] * 2 % 256:
+            gluon_mxfp4_gfx950_moe_weights(plan, w)
+            return
+        preprocess_n16_mxfp4_weights(w)
 
     def gluon_mxfp4_gfx1250_moe_weights(plan: dict, w: torch.nn.Module):
         return preprocess_gluon_mxfp4_gfx1250_moe_weights(plan, w)
@@ -334,13 +348,11 @@ if platform.is_amd:
             "supports_all_to_all_ep": frozenset({False}),
             "ep_size": frozenset({8}),
             "ispp": frozenset({3072}),
-            "internal_activation_dtype": frozenset({"input"}),
+            "internal_activation_dtype": frozenset({"input", "fp8"}),
             "supports_bias": frozenset({False}),
         },
-        # The A8 preprocessor replaces the linear weights required by Kimi's
-        # joint routed/shared M<=4 decode pipeline. Keep the A16 plan as the
-        # automatic EP8 choice until the A8 plan can preserve that fast path.
-        priority=Priority.SPECIALIZED - 1,
+        # One N16 bank serves MXFP8 prefill and the existing A16 joint decoder.
+        priority=Priority.SPECIALIZED + 1,
     )
     def gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply(
         plan: dict,
@@ -354,6 +366,7 @@ if platform.is_amd:
         do_finalize: bool = True,
         enable_pdl: bool = False,
     ):
+        require_fp8 = plan.get("internal_activation_dtype") == "fp8"
         del plan, router_logits, num_tokens_global, max_num_tokens_per_gpu
         del enable_pdl
         if not do_finalize:
@@ -378,6 +391,10 @@ if platform.is_amd:
 
         situ_linear_beta = getattr(w, "activation_situ_linear_beta", None)
         if situ_linear_beta is None:
+            if require_fp8:
+                raise ValueError("explicit FP8 SiTU requires a linear clamp")
+            if w.w13_weight.ndim == 6:
+                raise ValueError("SiTU linear clamp changed after weight preparation")
             return _gluon_mxfp4_a16w4_ep_precomputed_moe_apply(
                 x,
                 w,
@@ -386,48 +403,74 @@ if platform.is_amd:
                 activation="situ",
                 do_finalize=do_finalize,
             )
-        if _supports_a16w4_warp_decode_ep_gfx950(
-            x,
-            w.w13_weight_triton_tensor,
-            w.w13_precision_config.b_mx_scale,
-            w.w2_weight_triton_tensor,
-            w.w2_precision_config.b_mx_scale,
-            linear_weights=False,
+        num_local_experts = int(getattr(w, "num_local_experts"))
+        global_num_experts = int(getattr(w, "num_experts"))
+        if hasattr(w, "w13_weight_triton_tensor"):
+            # Widths outside full K256/N128 cells retain the existing bank and
+            # A8 implementation; they do not materialize a second layout.
+            out = gluon_mxfp4_fp8_precomputed_situ(
+                x,
+                topk_weights,
+                topk_ids,
+                w.w13_weight_triton_tensor,
+                w.w2_weight_triton_tensor,
+                w13_mx_scale=w.w13_precision_config.b_mx_scale,
+                w2_mx_scale=w.w2_precision_config.b_mx_scale,
+                situ_beta=float(getattr(w, "activation_situ_beta", 1.0)),
+                situ_linear_beta=float(situ_linear_beta),
+                out=getattr(w, "_situ_output_buffer", None),
+                expert_start=int(getattr(w, "ep_rank", 0)) * num_local_experts,
+                global_num_experts=global_num_experts,
+                prefill_activation_format="e4m3",
+            )
+            if out is None:
+                raise ValueError("gfx950 A8W4 SiTU EP MoE does not support this shape")
+            return out
+        n16_mxfp4_shape(
+            w.w13_weight, w.w13_weight_scale, w.w2_weight, w.w2_weight_scale
+        )
+        if (
+            not require_fp8
+            and x.shape[0] <= 4
+            and _supports_a16w4_warp_decode_ep_gfx950(
+                x,
+                w.w13_weight,
+                w.w13_weight_scale,
+                w.w2_weight,
+                w.w2_weight_scale,
+                linear_weights=True,
+            )
         ):
-            num_local_experts = int(getattr(w, "num_local_experts"))
             return gluon_a16w4_situ_warp_decode_ep_gfx950(
                 x,
-                w.w13_weight_triton_tensor,
-                w.w13_precision_config.b_mx_scale,
-                w.w2_weight_triton_tensor,
-                w.w2_precision_config.b_mx_scale,
+                w.w13_weight,
+                w.w13_weight_scale,
+                w.w2_weight,
+                w.w2_weight_scale,
                 topk_weights,
                 topk_ids,
                 situ_beta=float(getattr(w, "activation_situ_beta", 1.0)),
                 situ_linear_beta=float(situ_linear_beta),
                 expert_start=int(getattr(w, "ep_rank", 0)) * num_local_experts,
+                linear_weights=True,
+                w13_interleaved=getattr(w, "w13_input_layout", "concatenated")
+                == "interleaved",
                 routed_out=getattr(w, "_situ_output_buffer", None),
             )
-        num_local_experts = int(getattr(w, "num_local_experts"))
-        global_num_experts = int(getattr(w, "num_experts"))
-        out = gluon_mxfp4_fp8_precomputed_situ(
+        return mxfp8_situ_prefill(
             x,
-            topk_weights,
+            w.w13_weight,
+            w.w13_weight_scale,
+            w.w2_weight,
+            w.w2_weight_scale,
             topk_ids,
-            w.w13_weight_triton_tensor,
-            w.w2_weight_triton_tensor,
-            w13_mx_scale=w.w13_precision_config.b_mx_scale,
-            w2_mx_scale=w.w2_precision_config.b_mx_scale,
+            topk_weights,
             situ_beta=float(getattr(w, "activation_situ_beta", 1.0)),
             situ_linear_beta=float(situ_linear_beta),
             out=getattr(w, "_situ_output_buffer", None),
             expert_start=int(getattr(w, "ep_rank", 0)) * num_local_experts,
-            global_num_experts=global_num_experts,
-            prefill_activation_format="e4m3",
+            global_experts=global_num_experts,
         )
-        if out is None:
-            raise ValueError("gfx950 A8W4 SiTU EP MoE does not support this shape")
-        return out
 
     @register_kernel(
         "moe",

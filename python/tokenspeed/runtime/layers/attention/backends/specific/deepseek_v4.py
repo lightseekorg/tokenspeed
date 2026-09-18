@@ -47,7 +47,10 @@ from tokenspeed_kernel.ops.attention.dsv4.triton import (
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.distributed.comm_ops import token_all_gather
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.backends.base import (
+    AttentionBackend,
+    reject_bounded_replay,
+)
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.dcp.comm import (
@@ -910,6 +913,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         extend_seq_lens_cpu: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
+        extend_replay_lens_cpu: torch.Tensor,
+        extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
         num_tokens: int,
         **kwargs,
@@ -917,6 +922,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         """Build extend/mixed metadata; ``block_tables_cpu`` mirrors
         ``block_tables`` on the host so the DCP history exchange is planned
         without waiting on the device."""
+        del extend_prompt_lens_cpu
+        reject_bounded_replay(extend_replay_lens_cpu, "DeepseekV4AttentionBackend")
         if forward_mode.is_decode():
             raise RuntimeError(
                 "DeepSeek V4 decode metadata goes through "

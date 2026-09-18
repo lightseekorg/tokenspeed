@@ -68,6 +68,7 @@ __all__ = [
     "IrisAllReduce",
     "IrisAllReduceKernelConfig",
     "KimiK3AttnResKernelConfig",
+    "KimiK3MoeAllReduceKernelConfig",
     "IrisRSAG",
     "IrisAllReduceResidualRMSNorm",
     "create_iris_state",
@@ -91,6 +92,15 @@ _PRODUCER_DIRECT_GL_DTYPES = {
     torch.float16: gl.float16,
     torch.float32: gl.float32,
 }
+
+
+def _peer_addresses(
+    tensor: torch.Tensor,
+    heap_bases: tuple[int, ...],
+    rank: int,
+) -> tuple[int, ...]:
+    heap_offset = tensor.data_ptr() - heap_bases[rank]
+    return tuple(heap_base + heap_offset for heap_base in heap_bases)
 
 
 @dataclass(frozen=True)
@@ -256,6 +266,69 @@ class KimiK3AttnResKernelConfig:
 
 
 @dataclass(frozen=True)
+class KimiK3MoeAllReduceKernelConfig:
+    """Shape and mailbox contract for the CDNA4 K3 BF16 Lamport all-reduce.
+
+    Attributes:
+        world_size: Required communication group size.
+        routed_hidden_size: Width of the routed-expert output.
+        hidden_size: Width of the shared-expert output.
+        lamport_max_rows: Largest row count using Lamport instead of pull.
+        lamport_stages: Number of mailbox generations before reuse.
+        lamport_block_elements: Elements owned by one workgroup.
+        lamport_num_subgroups: Subgroups per workgroup; polling uses one.
+        lamport_transaction_bytes: Width of each lane's publication/read.
+    """
+
+    world_size: int
+    routed_hidden_size: int
+    hidden_size: int
+    lamport_max_rows: int
+    lamport_stages: int
+    lamport_block_elements: int
+    lamport_num_subgroups: int
+    lamport_transaction_bytes: int
+
+    def __post_init__(self) -> None:
+        if (
+            self.world_size != 8
+            or self.routed_hidden_size <= 0
+            or self.hidden_size <= 0
+            or self.lamport_max_rows <= 0
+            or self.lamport_stages < 3
+            or self.lamport_block_elements != 512
+            or self.lamport_num_subgroups != 1
+            or self.lamport_transaction_bytes != 16
+            or self.row_numel % self.lamport_block_elements
+        ):
+            raise ValueError("invalid Kimi-K3 MoE Lamport kernel configuration")
+
+    @property
+    def row_numel(self) -> int:
+        return self.routed_hidden_size + self.hidden_size
+
+    @property
+    def lamport_max_numel(self) -> int:
+        return self.lamport_max_rows * self.row_numel
+
+    def rows_for_shapes(self, shapes: tuple[tuple[int, ...], ...]) -> int | None:
+        if len(shapes) != 2 or any(len(shape) != 2 for shape in shapes):
+            return None
+        rows = shapes[0][0]
+        if (
+            rows <= 0
+            or shapes[1][0] != rows
+            or (shapes[0][1], shapes[1][1])
+            not in (
+                (self.routed_hidden_size, self.hidden_size),
+                (self.hidden_size, self.routed_hidden_size),
+            )
+        ):
+            return None
+        return rows
+
+
+@dataclass(frozen=True)
 class IrisAllReduceKernelConfig:
     """Launch and workspace contract for TokenSpeed's Iris all-reduces.
 
@@ -272,6 +345,7 @@ class IrisAllReduceKernelConfig:
             all-reduce.
         two_stage: Launch and workspace parameters shared by ordinary staged and
             producer-direct two-stage all-reduce.
+        kimi_k3_moe: Shape, launch, and mailbox parameters for K3 MoE Lamport.
         kimi_k3_attnres: Launch and shape parameters for Kimi-K3 AttnRes.
     """
 
@@ -280,6 +354,7 @@ class IrisAllReduceKernelConfig:
     staged: _StagedAllReduceKernelConfig
     producer_direct: _ProducerDirectAllReduceKernelConfig
     two_stage: _TwoStageAllReduceKernelConfig
+    kimi_k3_moe: KimiK3MoeAllReduceKernelConfig
     kimi_k3_attnres: KimiK3AttnResKernelConfig
 
     def __post_init__(self) -> None:
@@ -296,6 +371,8 @@ class IrisAllReduceKernelConfig:
             raise ValueError(
                 "producer-direct two-stage thresholds require kernel support"
             )
+        if self.subgroup_size != 64:
+            raise ValueError("Kimi-K3 Lamport requires a 64-thread subgroup")
 
 
 IRIS_ALL_REDUCE_KERNEL_CONFIG = IrisAllReduceKernelConfig(
@@ -331,13 +408,35 @@ IRIS_ALL_REDUCE_KERNEL_CONFIG = IrisAllReduceKernelConfig(
         num_subgroups=8,
         words_per_lane=2,
     ),
+    kimi_k3_moe=KimiK3MoeAllReduceKernelConfig(
+        world_size=8,
+        routed_hidden_size=3584,
+        hidden_size=7168,
+        lamport_max_rows=6,
+        lamport_stages=3,
+        lamport_block_elements=512,
+        lamport_num_subgroups=1,
+        lamport_transaction_bytes=16,
+    ),
     kimi_k3_attnres=KimiK3AttnResKernelConfig(
         world_size=8,
         hidden_size=7168,
-        num_subgroups=4,
-        elements_per_thread=1,
+        num_subgroups=16,
+        elements_per_thread=8,
     ),
 )
+
+
+def _kimi_k3_moe_producer_direct_protocol(
+    world_size: int,
+    shapes: tuple[tuple[int, ...], ...],
+    dtype: torch.dtype,
+) -> str | None:
+    config = IRIS_ALL_REDUCE_KERNEL_CONFIG.kimi_k3_moe
+    if world_size != config.world_size or dtype != torch.bfloat16:
+        return None
+    rows = config.rows_for_shapes(shapes)
+    return "lamport" if rows is not None and rows <= config.lamport_max_rows else None
 
 
 def producer_direct_all_reduce_can_run(
@@ -689,6 +788,7 @@ class IrisAllReduce(object):
         producer_direct_max_numel: int,
         attnres_max_numel: int,
         attnres_max_rows: int,
+        enable_lamport: bool,
         dtype: torch.dtype,
         heap_size: int | None,
         device: torch.device | None,
@@ -711,6 +811,7 @@ class IrisAllReduce(object):
         self.producer_direct_max_numel = producer_direct_max_numel
         self.attnres_max_numel = attnres_max_numel
         self.attnres_max_rows = attnres_max_rows
+        self.enable_lamport = enable_lamport
         self.dtype = dtype
         self.device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
         self.world_size = group.size()
@@ -732,8 +833,26 @@ class IrisAllReduce(object):
         producer_config = self._kernel_config.producer_direct
         staged_config = self._kernel_config.staged
         two_stage_config = self._kernel_config.two_stage
+        moe_config = self._kernel_config.kimi_k3_moe
         self._elements_per_word = (
             self._kernel_config.packed_word_bytes // dtype.itemsize
+        )
+        # Reserve complete eligible rows. One program owns one tile for every
+        # invocation, independently of the pull path's 84-program cap.
+        self._kimi_k3_moe_lamport_max_numel = (
+            min(
+                producer_direct_max_numel // moe_config.row_numel,
+                moe_config.lamport_max_rows,
+            )
+            * moe_config.row_numel
+            if enable_lamport
+            and _platform.is_cdna4
+            and self.world_size == moe_config.world_size
+            and dtype == torch.bfloat16
+            else 0
+        )
+        self._kimi_k3_moe_lamport_max_programs = (
+            self._kimi_k3_moe_lamport_max_numel // moe_config.lamport_block_elements
         )
         self._producer_direct_two_stage_workspace_required = (
             producer_direct_max_numel > 0
@@ -795,9 +914,12 @@ class IrisAllReduce(object):
                 + staged_config.input_slots * staged_max_numel
                 + staged_config.input_slots
                 * sum(tuning.numel for tuning in self._staged_tunings)
-                + 2 * attnres_max_numel
+                + 2 * self.world_size * attnres_max_numel
                 + (staged_max_numel if self._staged_two_stage_supported else 0)
                 + self._staged_two_stage_scratch_numel
+                + moe_config.lamport_stages
+                * self.world_size
+                * self._kimi_k3_moe_lamport_max_numel
             )
             flag_numel = self.world_size * (
                 self._staged_max_programs
@@ -831,18 +953,18 @@ class IrisAllReduce(object):
             if producer_direct_max_numel
             else None
         )
-        self._attnres_input_buf = (
-            self._ctx.zeros((2, attnres_max_numel), dtype=dtype)
+        self._attnres_push_inbox = (
+            self._ctx.zeros((2, self.world_size, attnres_max_numel), dtype=dtype)
             if attnres_max_numel
             else None
         )
-        self._attnres_ready_flags = (
-            self._ctx.zeros((attnres_max_rows, self.world_size), dtype=torch.int32)
+        self._attnres_push_epochs = (
+            torch.zeros((attnres_max_rows,), dtype=torch.int32, device=self.device)
             if attnres_max_numel
             else None
         )
-        self._attnres_consumed_flags = (
-            self._ctx.zeros((attnres_max_rows, self.world_size), dtype=torch.int32)
+        self._attnres_push_ready_flags = (
+            self._ctx.zeros((2, attnres_max_rows, self.world_size), dtype=torch.int32)
             if attnres_max_numel
             else None
         )
@@ -851,13 +973,9 @@ class IrisAllReduce(object):
             if self._producer_direct_scratch_numel
             else None
         )
-        output_max_numel = max(
-            producer_direct_max_numel,
-            staged_max_numel if self._staged_two_stage_supported else 0,
-        )
         self._reduced_output_buf = (
-            torch.empty(output_max_numel, dtype=dtype, device=self.device)
-            if output_max_numel
+            torch.empty(producer_direct_max_numel, dtype=dtype, device=self.device)
+            if producer_direct_max_numel
             else None
         )
         self._ready_flags = (
@@ -925,6 +1043,33 @@ class IrisAllReduce(object):
             if producer_direct_max_numel
             else None
         )
+        self._kimi_k3_moe_lamport_region = (
+            self._ctx.zeros(
+                (
+                    moe_config.lamport_stages,
+                    self.world_size,
+                    self._kimi_k3_moe_lamport_max_numel,
+                ),
+                dtype=dtype,
+            )
+            if self._kimi_k3_moe_lamport_max_numel
+            else None
+        )
+        self._kimi_k3_moe_lamport_epochs = (
+            torch.zeros(
+                (self._kimi_k3_moe_lamport_max_programs,),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            if self._kimi_k3_moe_lamport_max_numel
+            else None
+        )
+        if self._kimi_k3_moe_lamport_region is not None:
+            # Alternating +0/-0 halves: every lane's 16-byte pack has sentinel
+            # halves. Legitimate -0 inputs are normalized before publication.
+            self._kimi_k3_moe_lamport_region.view(torch.int32).fill_(-2147483648)
+            torch.cuda.synchronize(self.device)
+            dist.barrier(group=self.group)
         # Separate epochs from the producer-direct reduce: in a tensor-parallel
         # MoE both collectives run inside one layer, and a shared counter would
         # let one path's epoch satisfy the other's barrier.
@@ -936,11 +1081,36 @@ class IrisAllReduce(object):
             if self._staged_two_stage_supported
             else None
         )
+        if self._attnres_push_inbox is not None:
+            torch.cuda.synchronize(self.device)
+            dist.barrier(group=self.group)
         heap_bases = self._ctx.get_heap_bases()
         self._group_heap_bases = heap_bases[group_ranks].contiguous()
         group_heap_bases = [int(address) for address in self._group_heap_bases.tolist()]
         self._heap_base_addresses = tuple(
             group_heap_bases + [group_heap_bases[-1]] * (8 - self.world_size)
+        )
+        self._kimi_k3_moe_lamport_peer_addresses = None
+        if self._kimi_k3_moe_lamport_region is not None:
+            heap_offset = (
+                self._kimi_k3_moe_lamport_region.data_ptr()
+                - self._heap_base_addresses[rank_in_group]
+            )
+            self._kimi_k3_moe_lamport_peer_addresses = tuple(
+                heap_base + heap_offset for heap_base in self._heap_base_addresses
+            )
+            assert all(
+                address % moe_config.lamport_transaction_bytes == 0
+                for address in self._kimi_k3_moe_lamport_peer_addresses
+            )
+        self._attnres_push_peer_inboxes = (
+            _peer_addresses(
+                self._attnres_push_inbox,
+                self._heap_base_addresses,
+                rank_in_group,
+            )
+            if self._attnres_push_inbox is not None
+            else None
         )
         free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
         logger.info(
@@ -1076,6 +1246,9 @@ class IrisAllReduce(object):
     ) -> torch.Tensor:
         """Reduce ``tensor`` in place via reduce-scatter then all-gather.
 
+        Unaligned destinations use a temporary and copy-back so every rank
+        keeps the same collective protocol while the kernel uses packed stores.
+
         Args:
             tensor: Contiguous local contribution; overwritten with the sum.
             numel: ``tensor.numel()``, already checked against the heap capacity.
@@ -1098,8 +1271,10 @@ class IrisAllReduce(object):
         )
         num_tiles = triton.cdiv(partition_words, block_words)
         num_programs = min(num_tiles, kernel_config.max_programs)
-        assert self._reduced_output_buf is not None
-        output = self._reduced_output_buf[:numel]
+        output = tensor.view(-1)
+        copy_output = output.data_ptr() % self._kernel_config.packed_word_bytes != 0
+        if copy_output:
+            output = torch.empty_like(output)
         iris_reduce_symmetric_two_stage_gluon_kernel[(num_programs,)](
             staged,
             self._staged_two_stage_scratch_buf,
@@ -1120,7 +1295,8 @@ class IrisAllReduce(object):
             EXIT_BARRIER=True,
             num_warps=kernel_config.num_subgroups,
         )
-        tensor.view(-1).copy_(output)
+        if copy_output:
+            tensor.view(-1).copy_(output)
         return tensor.clone() if safe else tensor
 
     def all_reduce_symmetric(
@@ -1141,12 +1317,48 @@ class IrisAllReduce(object):
                 f"producer-direct Iris all-reduce does not support {self.dtype}"
             )
 
+        shapes = tuple(tuple(tensor.shape) for tensor in tensors)
         total_numel = sum(tensor.numel() for tensor in tensors)
         assert self._reduced_output_buf is not None
         outputs = self._views(
             self._reduced_output_buf,
-            tuple(tuple(tensor.shape) for tensor in tensors),
+            shapes,
         )
+        if (
+            self.enable_lamport
+            and _kimi_k3_moe_producer_direct_protocol(
+                self.world_size, shapes, self.dtype
+            )
+            == "lamport"
+        ):
+            self._all_reduce_symmetric_lamport(total_numel)
+        else:
+            self._all_reduce_symmetric_pull(total_numel)
+        return outputs
+
+    def _all_reduce_symmetric_lamport(self, total_numel: int) -> None:
+        config = self._kernel_config.kimi_k3_moe
+        assert total_numel <= self._kimi_k3_moe_lamport_max_numel
+        assert self._kimi_k3_moe_lamport_region is not None
+        assert self._kimi_k3_moe_lamport_epochs is not None
+        assert self._kimi_k3_moe_lamport_peer_addresses is not None
+        num_programs = total_numel // config.lamport_block_elements
+        lamport_all_reduce_bf16[(num_programs,)](
+            self._input_buf,
+            self._kimi_k3_moe_lamport_region,
+            self._reduced_output_buf,
+            self._kimi_k3_moe_lamport_epochs,
+            *self._kimi_k3_moe_lamport_peer_addresses,
+            RANK=self._iris_rank,
+            WORLD_SIZE=self.world_size,
+            TOTAL_ELEMENTS=total_numel,
+            MAX_ELEMENTS=self._kimi_k3_moe_lamport_max_numel,
+            NUM_STAGES=config.lamport_stages,
+            num_warps=config.lamport_num_subgroups,
+        )
+
+    def _all_reduce_symmetric_pull(self, total_numel: int) -> None:
+        kernel_config = self._kernel_config.producer_direct
         use_two_stage = _use_two_stage_producer_direct(
             world_size=self.world_size,
             total_numel=total_numel,
@@ -1206,7 +1418,6 @@ class IrisAllReduce(object):
                 ELEMENTS_PER_WORD=self._elements_per_word,
                 num_warps=kernel_config.one_stage_num_subgroups,
             )
-        return outputs
 
     def all_reduce_residual_attnres(
         self,
@@ -1235,7 +1446,10 @@ class IrisAllReduce(object):
             f"tensor numel ({partial.numel()}) exceeds iris buffer capacity "
             f"({self.attnres_max_numel})"
         )
-        assert self._attnres_input_buf is not None
+        assert self._attnres_push_inbox is not None
+        assert self._attnres_push_epochs is not None
+        assert self._attnres_push_ready_flags is not None
+        assert self._attnres_push_peer_inboxes is not None
         assert score_weight.shape == output_weight.shape == (kernel_config.hidden_size,)
         assert score_weight.dtype == output_weight.dtype == torch.bfloat16
         assert score_weight.device == output_weight.device == self.device
@@ -1250,10 +1464,10 @@ class IrisAllReduce(object):
 
         hidden = torch.empty_like(partial)
         residual_out = torch.empty_like(residual)
-        iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel[(num_tokens,)](
+        iris_push_one_shot_allreduce_residual_attnres_gluon_kernel[(num_tokens,)](
             partial,
             residual,
-            self._attnres_input_buf,
+            self._attnres_push_inbox,
             score_weight,
             output_weight,
             m,
@@ -1261,15 +1475,16 @@ class IrisAllReduce(object):
             acc,
             hidden,
             residual_out,
-            self._attnres_ready_flags,
-            self._attnres_consumed_flags,
+            self._attnres_push_epochs,
+            self._attnres_push_ready_flags,
+            *self._attnres_push_peer_inboxes,
             *self._heap_base_addresses,
             RANK=self._iris_rank,
             WORLD_SIZE=self.world_size,
-            M=num_tokens,
             HIDDEN=kernel_config.hidden_size,
             BLOCK=triton.next_power_of_2(kernel_config.hidden_size),
-            INPUT_SLOT_STRIDE=self.attnres_max_numel,
+            MAX_ELEMENTS=self.attnres_max_numel,
+            READY_SLOT_STRIDE=self.attnres_max_rows * self.world_size,
             EPS=eps,
             ELEMENTS_PER_THREAD=kernel_config.elements_per_thread,
             NUM_WARPS=kernel_config.num_subgroups,
@@ -1358,6 +1573,155 @@ def iris_stage_one_shot_allreduce_kernel(
 
 
 @gluon.jit
+def _iris_sanitize_lamport_bf16(values):
+    bits = values.to(gl.uint16, bitcast=True)
+    return gl.where(bits == 0x8000, 0, bits).to(gl.bfloat16, bitcast=True)
+
+
+@gluon.jit
+def _iris_wait_lamport_peers(
+    region,
+    generation,
+    offsets,
+    valid,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    MAX_ELEMENTS: gl.constexpr,
+    LAYOUT: gl.constexpr,
+):
+    values = ()
+    for _ in gl.static_range(1, WORLD_SIZE):
+        values += (gl.full([64, 8], 0, gl.bfloat16, LAYOUT),)
+    active = valid
+    while gl.max(active.to(gl.int32), 0) != 0:
+        loaded = ()
+        # A lane reloads every peer until all seven packs are ready. Issue the
+        # independent reads before checking them; retired lanes keep their data.
+        # .cv controls hardware caches, not compiler volatility. The compiler
+        # regression test checks that these reads remain in the polling cycle.
+        for delta in gl.static_range(1, WORLD_SIZE):
+            peer = (RANK + delta) % WORLD_SIZE
+            pointer = (
+                region + generation * WORLD_SIZE * MAX_ELEMENTS + peer * MAX_ELEMENTS
+            )
+            loaded += (
+                gl.amd.cdna4.buffer_load(
+                    pointer,
+                    offsets,
+                    mask=active[:, None],
+                    other=values[delta - 1],
+                    cache=".cv",
+                ),
+            )
+        active = gl.full([64], False, gl.int1, gl.SliceLayout(1, LAYOUT))
+        for delta in gl.static_range(0, WORLD_SIZE - 1):
+            active |= valid & (
+                gl.max(
+                    (loaded[delta].to(gl.uint16, bitcast=True) == 0x8000).to(gl.int32),
+                    1,
+                )
+                != 0
+            )
+        values = loaded
+    return values
+
+
+@gluon.jit
+def lamport_all_reduce_bf16(
+    input_sym_ptr,
+    region_sym_ptr,
+    output_ptr,
+    epochs,
+    region_0,
+    region_1,
+    region_2,
+    region_3,
+    region_4,
+    region_5,
+    region_6,
+    region_7,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    TOTAL_ELEMENTS: gl.constexpr,
+    MAX_ELEMENTS: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
+):
+    """Push K3 BF16 tiles and poll all peer packs with one subgroup per tile."""
+    gl.static_assert(WORLD_SIZE == 8)
+    gl.static_assert(TOTAL_ELEMENTS % 512 == 0)
+    gl.static_assert(TOTAL_ELEMENTS <= MAX_ELEMENTS)
+    gl.static_assert(NUM_STAGES >= 3)
+    layout: gl.constexpr = gl.BlockedLayout([1, 8], [64, 1], [1, 1], [0, 1])
+    pack = gl.program_id(0) * 64 + gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
+    element = gl.arange(0, 8, layout=gl.SliceLayout(0, layout))
+    offsets = pack[:, None] * 8 + element[None, :]
+    mask = offsets < TOTAL_ELEMENTS
+    generation = (
+        gl.load(epochs + gl.program_id(0)).to(gl.uint32).to(gl.uint64) % NUM_STAGES
+    )
+    stride: gl.constexpr = WORLD_SIZE * MAX_ELEMENTS
+    local = gl.amd.cdna4.buffer_load(input_sym_ptr, offsets, mask=mask, other=0.0)
+    local = _iris_sanitize_lamport_bf16(local)
+    for delta in gl.static_range(1, WORLD_SIZE):
+        peer = (RANK + delta) % WORLD_SIZE
+        destination = _iris_heap_base(
+            peer,
+            region_0,
+            region_1,
+            region_2,
+            region_3,
+            region_4,
+            region_5,
+            region_6,
+            region_7,
+        )
+        # Preserve 16-byte publication stores after casting integer addresses.
+        destination = gl.multiple_of(destination.to(gl.pointer_type(gl.bfloat16)), 16)
+        destination += generation * stride + RANK * MAX_ELEMENTS
+        gl.amd.cdna4.buffer_store(local, destination, offsets, mask=mask, cache=".wt")
+
+    peers = _iris_wait_lamport_peers(
+        region_sym_ptr,
+        generation,
+        offsets,
+        pack * 8 < TOTAL_ELEMENTS,
+        RANK,
+        WORLD_SIZE,
+        MAX_ELEMENTS,
+        layout,
+    )
+    # All ranks use the same FP32 addition order, then round once to BF16.
+    for peer in gl.static_range(0, WORLD_SIZE):
+        if peer == RANK:
+            term = local
+        else:
+            term = peers[(peer - RANK + WORLD_SIZE) % WORLD_SIZE - 1]
+        if peer == 0:
+            accumulator = term.to(gl.float32)
+        else:
+            accumulator += term.to(gl.float32)
+    gl.amd.cdna4.buffer_store(
+        accumulator.to(gl.bfloat16), output_ptr, offsets, mask=mask
+    )
+
+    # Clear only this tile's consumed generation. Skipped tiles keep their
+    # own epochs, so mixed row counts need no global counter or tail clearing.
+    sentinel = (
+        gl.where(offsets % 2 == 0, 0, 0x8000)
+        .to(gl.uint16)
+        .to(gl.bfloat16, bitcast=True)
+    )
+    for delta in gl.static_range(1, WORLD_SIZE):
+        peer = (RANK + delta) % WORLD_SIZE
+        destination = region_sym_ptr + generation * stride + peer * MAX_ELEMENTS
+        gl.amd.cdna4.buffer_store(
+            sentinel, destination, offsets, mask=mask, cache=".wt"
+        )
+    gl.barrier()
+    gl.store(epochs + gl.program_id(0), ((generation + 1) % NUM_STAGES).to(gl.int32))
+
+
+@gluon.jit
 def _iris_heap_base(
     rank: gl.constexpr,
     heap_base_0,
@@ -1384,6 +1748,86 @@ def _iris_heap_base(
     if rank == 6:
         return heap_base_6
     return heap_base_7
+
+
+@gluon.jit
+def _iris_drain_subgroup_vmem():
+    gl.inline_asm_elementwise(
+        "s_waitcnt vmcnt(0)",
+        "=r,~{memory}",
+        [],
+        dtype=gl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@gluon.jit
+def _iris_sync_rank_token(
+    flags,
+    row,
+    token,
+    local_heap,
+    heap_base_0,
+    heap_base_1,
+    heap_base_2,
+    heap_base_3,
+    heap_base_4,
+    heap_base_5,
+    heap_base_6,
+    heap_base_7,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    SUBGROUP_SIZE: gl.constexpr,
+):
+    layout: gl.constexpr = gl.BlockedLayout([1], [SUBGROUP_SIZE], [NUM_WARPS], [0])
+    peers = gl.arange(0, WORLD_SIZE, layout=layout)
+    peer_mask = peers != RANK
+    peer_heaps = gl.where(peers == 0, heap_base_0, heap_base_7)
+    peer_heaps = gl.where(peers == 1, heap_base_1, peer_heaps)
+    peer_heaps = gl.where(peers == 2, heap_base_2, peer_heaps)
+    peer_heaps = gl.where(peers == 3, heap_base_3, peer_heaps)
+    peer_heaps = gl.where(peers == 4, heap_base_4, peer_heaps)
+    peer_heaps = gl.where(peers == 5, heap_base_5, peer_heaps)
+    peer_heaps = gl.where(peers == 6, heap_base_6, peer_heaps)
+    flags_heap_offset = tl.cast(flags, gl.uint64) - local_heap
+    peer_flags = tl.cast(
+        peer_heaps + flags_heap_offset,
+        gl.pointer_type(gl.int32),
+    )
+    gl.atomic_xchg(
+        peer_flags + row * WORLD_SIZE + RANK,
+        token,
+        mask=peer_mask,
+        sem="release",
+        scope="sys",
+    )
+    local_flags = flags + row * WORLD_SIZE + peers
+    seen = gl.load(
+        local_flags,
+        mask=peer_mask,
+        other=token,
+        cache_modifier=".cv",
+        volatile=True,
+    )
+    while gl.max(gl.where(peer_mask & (seen != token), 1, 0), axis=0) != 0:
+        seen = gl.load(
+            local_flags,
+            mask=peer_mask,
+            other=token,
+            cache_modifier=".cv",
+            volatile=True,
+        )
+    gl.atomic_add(
+        local_flags,
+        0,
+        mask=peer_mask,
+        sem="acquire",
+        scope="sys",
+    )
+    _iris_drain_subgroup_vmem()
+    gl.barrier()
 
 
 @gluon.jit
@@ -1869,6 +2313,80 @@ def iris_reduce_symmetric_two_stage_gluon_kernel(
 
 
 @gluon.jit
+def _iris_attnres_epilogue(
+    reduced,
+    residual_ptr,
+    score_weight_ptr,
+    output_weight_ptr,
+    scratch_m_ptr,
+    scratch_s_ptr,
+    scratch_acc_ptr,
+    hidden_ptr,
+    residual_out_ptr,
+    row_offsets,
+    weight_offsets,
+    mask,
+    row,
+    HIDDEN: gl.constexpr,
+    EPS: gl.constexpr,
+):
+    reduced = reduced.to(gl.bfloat16).to(gl.float32)
+    residual = gl.amd.cdna4.buffer_load(
+        residual_ptr,
+        row_offsets,
+        mask=mask,
+        other=0.0,
+    ).to(gl.float32)
+    prefix = (reduced + residual).to(gl.bfloat16).to(gl.float32)
+    gl.amd.cdna4.buffer_store(
+        prefix.to(residual_out_ptr.dtype.element_ty),
+        residual_out_ptr,
+        row_offsets,
+        mask=mask,
+    )
+    score_weight = gl.amd.cdna4.buffer_load(
+        score_weight_ptr,
+        weight_offsets,
+        mask=mask,
+        other=0.0,
+    ).to(gl.float32)
+    square_sum = gl.sum(gl.where(mask, prefix * prefix, 0.0), axis=0)
+    dot = gl.sum(gl.where(mask, prefix * score_weight, 0.0), axis=0)
+    prefix_logit = dot * gl.rsqrt(square_sum / HIDDEN + EPS)
+    block_m = gl.load(scratch_m_ptr + row)
+    block_s = gl.load(scratch_s_ptr + row)
+    maximum = gl.maximum(block_m, prefix_logit)
+    block_correction = gl.exp(block_m - maximum)
+    prefix_weight = gl.exp(prefix_logit - maximum)
+    inverse_sum = 1.0 / (block_s * block_correction + prefix_weight)
+    block_acc = gl.amd.cdna4.buffer_load(
+        scratch_acc_ptr,
+        row_offsets,
+        mask=mask,
+        other=0.0,
+    ).to(gl.float32)
+    mixed = (
+        ((block_acc * block_correction + prefix_weight * prefix) * inverse_sum)
+        .to(gl.bfloat16)
+        .to(gl.float32)
+    )
+    output_square_sum = gl.sum(gl.where(mask, mixed * mixed, 0.0), axis=0)
+    inverse_rms = gl.rsqrt(output_square_sum / HIDDEN + EPS)
+    output_weight = gl.amd.cdna4.buffer_load(
+        output_weight_ptr,
+        weight_offsets,
+        mask=mask,
+        other=0.0,
+    ).to(gl.float32)
+    gl.amd.cdna4.buffer_store(
+        (mixed * inverse_rms * output_weight).to(hidden_ptr.dtype.element_ty),
+        hidden_ptr,
+        row_offsets,
+        mask=mask,
+    )
+
+
+@gluon.jit
 def iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel(
     partial_ptr,
     residual_ptr,
@@ -2015,62 +2533,183 @@ def iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel(
     consumed = consumed_flags + row * WORLD_SIZE + RANK
     gl.atomic_xchg(consumed, epoch, sem="release", scope="sys")
 
-    reduced = reduced.to(gl.bfloat16).to(gl.float32)
-    residual = gl.amd.cdna4.buffer_load(
+    _iris_attnres_epilogue(
+        reduced,
         residual_ptr,
-        offset_i32,
-        mask=mask,
-        other=0.0,
-    ).to(gl.float32)
-    prefix = (reduced + residual).to(gl.bfloat16).to(gl.float32)
-    gl.amd.cdna4.buffer_store(
-        prefix.to(residual_out_ptr.dtype.element_ty),
+        score_weight_ptr,
+        output_weight_ptr,
+        scratch_m_ptr,
+        scratch_s_ptr,
+        scratch_acc_ptr,
+        hidden_ptr,
         residual_out_ptr,
         offset_i32,
-        mask=mask,
+        weight_offset_i32,
+        mask,
+        row,
+        HIDDEN,
+        EPS,
     )
 
-    score_weight = gl.amd.cdna4.buffer_load(
+
+@gluon.jit
+def iris_push_one_shot_allreduce_residual_attnres_gluon_kernel(
+    partial_ptr,
+    residual_ptr,
+    inbox_sym_ptr,
+    score_weight_ptr,
+    output_weight_ptr,
+    scratch_m_ptr,
+    scratch_s_ptr,
+    scratch_acc_ptr,
+    hidden_ptr,
+    residual_out_ptr,
+    generations,
+    ready_flags,
+    inbox_0: gl.pointer_type(gl.bfloat16),
+    inbox_1: gl.pointer_type(gl.bfloat16),
+    inbox_2: gl.pointer_type(gl.bfloat16),
+    inbox_3: gl.pointer_type(gl.bfloat16),
+    inbox_4: gl.pointer_type(gl.bfloat16),
+    inbox_5: gl.pointer_type(gl.bfloat16),
+    inbox_6: gl.pointer_type(gl.bfloat16),
+    inbox_7: gl.pointer_type(gl.bfloat16),
+    heap_base_0,
+    heap_base_1,
+    heap_base_2,
+    heap_base_3,
+    heap_base_4,
+    heap_base_5,
+    heap_base_6,
+    heap_base_7,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    HIDDEN: gl.constexpr,
+    BLOCK: gl.constexpr,
+    MAX_ELEMENTS: gl.constexpr,
+    READY_SLOT_STRIDE: gl.constexpr,
+    EPS: gl.constexpr,
+    ELEMENTS_PER_THREAD: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    SUBGROUP_SIZE: gl.constexpr,
+):
+    """Push Kimi-K3 attention rows into two-slot rank-ordered inboxes.
+
+    Peer inboxes are host-computed byte addresses. Explicit BF16 pointer
+    annotations preserve their pointer ABI and element-wise device offsets
+    without a Python pointer wrapper. The Iris context owns the mappings.
+    """
+    row = gl.program_id(0)
+    layout: gl.constexpr = gl.BlockedLayout(
+        [ELEMENTS_PER_THREAD], [SUBGROUP_SIZE], [NUM_WARPS], [0]
+    )
+    element = gl.arange(0, BLOCK, layout=layout)
+    mask = element < HIDDEN
+    row_offsets = (row * HIDDEN + element).to(gl.int32)
+    weight_offsets = element.to(gl.int32)
+    local = gl.amd.cdna4.buffer_load(
+        partial_ptr,
+        row_offsets,
+        mask=mask,
+        other=0.0,
+    )
+    generation = gl.load(generations + row).to(gl.int32) + 1
+    slot = generation & 1
+    inbox_slot_offset = slot * WORLD_SIZE * MAX_ELEMENTS
+    sync_ready_flags = ready_flags + slot * READY_SLOT_STRIDE
+    local_heap = _iris_heap_base(
+        RANK,
+        heap_base_0,
+        heap_base_1,
+        heap_base_2,
+        heap_base_3,
+        heap_base_4,
+        heap_base_5,
+        heap_base_6,
+        heap_base_7,
+    )
+    for peer_delta in gl.static_range(1, WORLD_SIZE):
+        destination = (RANK + peer_delta) % WORLD_SIZE
+        destination_inbox = _iris_heap_base(
+            destination,
+            inbox_0,
+            inbox_1,
+            inbox_2,
+            inbox_3,
+            inbox_4,
+            inbox_5,
+            inbox_6,
+            inbox_7,
+        )
+        gl.amd.cdna4.buffer_store(
+            local,
+            destination_inbox + inbox_slot_offset + RANK * MAX_ELEMENTS,
+            row_offsets,
+            mask=mask,
+            cache=".wt",
+        )
+    _iris_drain_subgroup_vmem()
+    gl.barrier()
+
+    _iris_sync_rank_token(
+        sync_ready_flags,
+        row,
+        generation,
+        local_heap,
+        heap_base_0,
+        heap_base_1,
+        heap_base_2,
+        heap_base_3,
+        heap_base_4,
+        heap_base_5,
+        heap_base_6,
+        heap_base_7,
+        RANK,
+        WORLD_SIZE,
+        NUM_WARPS,
+        SUBGROUP_SIZE,
+    )
+    local_inbox = inbox_sym_ptr + inbox_slot_offset
+
+    if RANK == 0:
+        reduced = local.to(gl.float32)
+    else:
+        reduced = gl.amd.cdna4.buffer_load(
+            local_inbox,
+            row_offsets,
+            mask=mask,
+            other=0.0,
+            cache=".cg",
+        ).to(gl.float32)
+    for source in gl.static_range(1, WORLD_SIZE):
+        if source == RANK:
+            reduced += local.to(gl.float32)
+        else:
+            reduced += gl.amd.cdna4.buffer_load(
+                local_inbox + source * MAX_ELEMENTS,
+                row_offsets,
+                mask=mask,
+                other=0.0,
+                cache=".cg",
+            ).to(gl.float32)
+
+    gl.store(generations + row, generation)
+    _iris_attnres_epilogue(
+        reduced,
+        residual_ptr,
         score_weight_ptr,
-        weight_offset_i32,
-        mask=mask,
-        other=0.0,
-    ).to(gl.float32)
-    square_sum = gl.sum(gl.where(mask, prefix * prefix, 0.0), axis=0)
-    dot = gl.sum(gl.where(mask, prefix * score_weight, 0.0), axis=0)
-    prefix_logit = dot * gl.rsqrt(square_sum / HIDDEN + EPS)
-
-    block_m = gl.load(scratch_m_ptr + row)
-    block_s = gl.load(scratch_s_ptr + row)
-    maximum = gl.maximum(block_m, prefix_logit)
-    block_correction = gl.exp(block_m - maximum)
-    prefix_weight = gl.exp(prefix_logit - maximum)
-    inverse_sum = 1.0 / (block_s * block_correction + prefix_weight)
-    block_acc = gl.amd.cdna4.buffer_load(
-        scratch_acc_ptr,
-        offset_i32,
-        mask=mask,
-        other=0.0,
-    ).to(gl.float32)
-    mixed = (
-        ((block_acc * block_correction + prefix_weight * prefix) * inverse_sum)
-        .to(gl.bfloat16)
-        .to(gl.float32)
-    )
-
-    output_square_sum = gl.sum(gl.where(mask, mixed * mixed, 0.0), axis=0)
-    inverse_rms = gl.rsqrt(output_square_sum / HIDDEN + EPS)
-    output_weight = gl.amd.cdna4.buffer_load(
         output_weight_ptr,
-        weight_offset_i32,
-        mask=mask,
-        other=0.0,
-    ).to(gl.float32)
-    gl.amd.cdna4.buffer_store(
-        (mixed * inverse_rms * output_weight).to(hidden_ptr.dtype.element_ty),
+        scratch_m_ptr,
+        scratch_s_ptr,
+        scratch_acc_ptr,
         hidden_ptr,
-        offset_i32,
-        mask=mask,
+        residual_out_ptr,
+        row_offsets,
+        weight_offsets,
+        mask,
+        row,
+        HIDDEN,
+        EPS,
     )
 
 
@@ -2369,6 +3008,7 @@ def create_iris_state(
     producer_direct_max_numel: int,
     attnres_max_numel: int,
     attnres_max_rows: int,
+    enable_lamport: bool,
     dtype: torch.dtype,
     heap_size: int | None,
     device: torch.device | None,
@@ -2382,6 +3022,7 @@ def create_iris_state(
         producer_direct_max_numel: Maximum producer-direct payload.
         attnres_max_numel: Maximum fused attention/AttnRes payload.
         attnres_max_rows: Maximum fused attention/AttnRes rows.
+        enable_lamport: Allow Lamport for eligible producer-direct payloads.
         dtype: Element type for all payload buffers.
         heap_size: Optional symmetric heap size in bytes.
         device: Device on which buffers are allocated.
@@ -2396,6 +3037,7 @@ def create_iris_state(
         producer_direct_max_numel=producer_direct_max_numel,
         attnres_max_numel=attnres_max_numel,
         attnres_max_rows=attnres_max_rows,
+        enable_lamport=enable_lamport,
         dtype=dtype,
         heap_size=heap_size,
         device=device,

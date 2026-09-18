@@ -96,7 +96,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
     DeepseekV4Recipe,
-    v4_c4_state_window,
     v4_compressed_kv_spec,
     v4_compressor_state_spec,
     v4_indexer_kv_spec,
@@ -246,21 +245,23 @@ def _extend_kwargs(
         extend_seq_lens_cpu=extend_seq_lens_cpu,
         extend_prefix_lens=extend_prefix_lens_cpu.clone(),
         extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+        extend_replay_lens_cpu=torch.zeros_like(extend_prefix_lens_cpu),
+        extend_prompt_lens_cpu=extend_prefix_lens_cpu
+        + extend_seq_lens_cpu[: extend_prefix_lens_cpu.numel()],
         extend_with_prefix=bool(extend_prefix_lens_cpu.any()),
     )
 
 
-def _v4_spec_set(hf_config, *, layer_ratio, decode_input_tokens: int = 1):
+def _v4_spec_set(hf_config, *, layer_ratio):
     """The spec set a ratio vector declares, in the recipe's own order."""
     ratios = {int(ratio) for ratio in layer_ratio}
-    window = v4_c4_state_window(decode_input_tokens)
     specs = [v4_swa_kv_spec(hf_config)]
     for ratio in sorted(r for r in ratios if r > 1):
-        specs.append(v4_compressor_state_spec(ratio, c4_state_window=window))
+        specs.append(v4_compressor_state_spec(ratio))
         specs.append(v4_compressed_kv_spec(ratio))
     if 4 in ratios:
         specs.append(v4_indexer_kv_spec())
-        specs.append(v4_indexer_state_spec(c4_state_window=window))
+        specs.append(v4_indexer_state_spec())
     return tuple(specs)
 
 
@@ -279,6 +280,8 @@ def _v4_recipe(
             chunked_prefill_size=prefix_granularity,
             attention_use_fp4_indexer_cache=True,
             speculative_algorithm=None,
+            disaggregation_mode="null",
+            enable_prefix_caching=True,
         ),
         model_config=SimpleNamespace(
             hf_config=hf_config, num_attention_layers=num_layers
@@ -403,12 +406,12 @@ def _v4_cache_group_spec(group_id: str) -> CacheGroupSpec:
     if group_id == V4_SWA_KV_GROUP_ID:
         return v4_swa_kv_spec(SimpleNamespace(sliding_window=128))
     if group_id == V4_INDEXER_COMPRESSOR_STATE_GROUP_ID:
-        return v4_indexer_state_spec(c4_state_window=v4_c4_state_window(1))
+        return v4_indexer_state_spec()
     if group_id == V4_INDEXER_KV_GROUP_ID:
         return v4_indexer_kv_spec()
     ratio = parse_v4_compressor_state_group_id(group_id)
     if ratio is not None:
-        return v4_compressor_state_spec(ratio, c4_state_window=v4_c4_state_window(1))
+        return v4_compressor_state_spec(ratio)
     ratio = parse_v4_compressed_kv_group_id(group_id)
     if ratio is not None:
         return v4_compressed_kv_spec(ratio)
@@ -2522,47 +2525,23 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(server_args.enable_prefix_caching)
         self.assertTrue(server_args.draft_model_path_use_base)
 
-    def test_dspark_same_checkpoint_rejects_kvstore(self):
-        with self.assertRaisesRegex(
-            ValueError,
-            "does not support KVStore",
-        ):
-            ServerArgs(
-                model="unused",
-                speculative_config=json.dumps(
-                    {"method": "dspark", "num_speculative_tokens": 5}
-                ),
-            )
-
-    def test_dspark_explicit_same_checkpoint_rejects_kvstore(self):
-        with self.assertRaisesRegex(ValueError, "does not support KVStore"):
-            ServerArgs(
-                model="same-checkpoint",
-                speculative_config=json.dumps(
-                    {
-                        "method": "dspark",
-                        "model": "same-checkpoint",
-                        "num_speculative_tokens": 5,
-                    }
-                ),
-            )
-
-    def test_dspark_explicit_redirected_same_checkpoint_rejects_kvstore(self):
-        with (
-            patch(
-                "tokenspeed.runtime.utils.server_args.maybe_model_redirect",
-                side_effect=lambda model: (
-                    "resolved-checkpoint" if model == "model-alias" else model
-                ),
+    def test_dspark_same_checkpoint_keeps_kvstore_default(self):
+        # Whether same-checkpoint DSpark can use KVStore depends on where the
+        # draft keeps its windows, which only the resolved draft config knows;
+        # argument parsing no longer pre-empts that decision.
+        server_args = ServerArgs(
+            model="same-checkpoint",
+            speculative_config=json.dumps(
+                {
+                    "method": "dspark",
+                    "model": "same-checkpoint",
+                    "num_speculative_tokens": 5,
+                }
             ),
-            self.assertRaisesRegex(ValueError, "does not support KVStore"),
-        ):
-            ServerArgs(
-                model="model-alias",
-                speculative_algorithm="DSPARK",
-                speculative_draft_model_path="model-alias",
-                speculative_num_steps=5,
-            )
+        )
+
+        self.assertTrue(server_args.enable_kvstore)
+        self.assertTrue(server_args.draft_model_path_use_base)
 
     def test_dspark_explicit_external_checkpoint_preserves_cache_behavior(self):
         server_args = ServerArgs(
@@ -2586,17 +2565,6 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertTrue(server_args.enable_kvstore)
         self.assertFalse(server_args.enable_prefix_caching)
-
-    def test_dspark_same_checkpoint_decode_still_rejects_kvstore(self):
-        with self.assertRaisesRegex(ValueError, "does not support KVStore"):
-            ServerArgs(
-                model="same-checkpoint",
-                enable_prefix_caching=False,
-                disaggregation_mode="decode",
-                speculative_algorithm="DSPARK",
-                speculative_draft_model_path="same-checkpoint",
-                speculative_num_steps=5,
-            )
 
     def test_dspark_external_decode_preserves_generic_cache_behavior(self):
         server_args = ServerArgs(
@@ -3107,6 +3075,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 rows_per_page=4,
                 entry_stride_tokens=1,
                 sliding_window_tokens=None,
+                replayable=False,
             ),
             CacheGroupSpec(
                 group_id="coarse",
@@ -3114,6 +3083,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 rows_per_page=256,
                 entry_stride_tokens=1,
                 sliding_window_tokens=None,
+                replayable=False,
             ),
         )
         counts = {"fine": 20001, "coarse": 1025}
@@ -3940,6 +3910,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     rows_per_page=64,
                     entry_stride_tokens=1,
                     sliding_window_tokens=128,
+                    replayable=False,
                 ),
             ),
             {"v4.swa_kv": 1024},
@@ -4283,6 +4254,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     entry_stride_tokens=1,
                     family="history",
                     sliding_window_tokens=128,
+                    replayable=False,
                 ),
             ),
             {V4_SWA_KV_GROUP_ID: 128},
@@ -4661,7 +4633,6 @@ class TestDeepseekV4Config(unittest.TestCase):
             for spec in _v4_spec_set(
                 SimpleNamespace(sliding_window=128),
                 layer_ratio=(1, 4, 128),
-                decode_input_tokens=1,
             )
         }
         c4 = specs["v4.c4a.compressed_kv"]
@@ -5307,6 +5278,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     rows_per_page=64,
                     entry_stride_tokens=4,
                     sliding_window_tokens=None,
+                    replayable=False,
                 ),
             ),
             {group_id: 128},
@@ -6879,6 +6851,8 @@ def test_v4_pd_recipe_and_readiness_follow_cache_producers():
             attention_use_fp4_indexer_cache=False,
             max_total_tokens=64 * 1024,
             chunked_prefill_size=256,
+            disaggregation_mode="prefill",
+            enable_prefix_caching=True,
         ),
         model_config=SimpleNamespace(
             num_attention_layers=3,
