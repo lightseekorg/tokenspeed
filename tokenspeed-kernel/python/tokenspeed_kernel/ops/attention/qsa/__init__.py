@@ -95,7 +95,7 @@ def qsa_sparse_attention(
     selected_slots: torch.Tensor,
     *,
     scale: float,
-    max_seqlen_q: int,
+    max_seqlen_q: int | None,
     metadata_capacity_rows: int | None,
     k_scale: float | torch.Tensor | None,
     v_scale: float | torch.Tensor | None,
@@ -113,9 +113,10 @@ def qsa_sparse_attention(
         selected_slots: Physical cache slots shaped ``[tokens, budget]``;
             non-positive values are ignored.
         scale: Softmax scale applied to query-key scores.
-        max_seqlen_q: Number of uniformly packed query tokens per request. This
-            is 1 for normal decode and ``spec_num_tokens`` for compact
-            speculative decode.
+        max_seqlen_q: Uniform query tokens per request for decode: 1 for
+            normal decode and ``spec_num_tokens`` for compact speculative
+            decode. Pass None for prefill or mixed/ragged queries, including
+            a prefill containing only one token.
         metadata_capacity_rows: Row capacity reserved by stateful fallback
             implementations. Pass ``None`` to use the actual query-row count;
             workspace-free kernels ignore it.
@@ -129,24 +130,28 @@ def qsa_sparse_attention(
         Attention output shaped
         ``[tokens, query_heads, value_head_dim]`` with the query dtype.
 
-    The SM100 CuTe DSL implementation is preferred when its specialization
-    matches. Other supported NVIDIA architectures use FlashInfer FA2 sparse
-    attention as the registered fallback.
+    The SM100/SM103 CuTe DSL implementation is preferred when its specialization
+    matches a uniform decode. Prefill and mixed/ragged queries use FlashInfer
+    FA2 on supported NVIDIA architectures; other decode geometries retain
+    the registered fallback. Kernel selection preserves this distinction
+    before adapting ragged inputs to independent one-token query rows.
     """
 
     if q.ndim != 3 or k_cache.ndim != 3 or v_cache.ndim != 3:
         raise ValueError("QSA sparse attention expects rank-three Q/K/V tensors")
     if selected_slots.ndim != 2 or selected_slots.shape[0] != q.shape[0]:
         raise ValueError("QSA selected slots must have one row per query token")
-    if max_seqlen_q < 1:
+    query_width = 1 if max_seqlen_q is None else max_seqlen_q
+    if query_width < 1:
         raise ValueError("QSA max_seqlen_q must be positive")
-    if q.shape[0] % max_seqlen_q:
+    if q.shape[0] % query_width:
         raise ValueError("QSA query rows must be divisible by max_seqlen_q")
     if q.shape[0] == 0:
         return q.new_empty((0, q.shape[1], v_cache.shape[-1]))
     traits = {
-        "batch_size": q.shape[0] // max_seqlen_q,
-        "q_len": max_seqlen_q,
+        "batch_size": q.shape[0] // query_width,
+        "q_len": query_width,
+        "is_decode": max_seqlen_q is not None,
         "head_dim": q.shape[-1],
         "value_head_dim": v_cache.shape[-1],
         "num_q_heads": q.shape[1],
@@ -168,7 +173,7 @@ def qsa_sparse_attention(
         v_cache,
         selected_slots,
         scale=scale,
-        max_seqlen_q=max_seqlen_q,
+        max_seqlen_q=query_width,
         metadata_capacity_rows=metadata_capacity_rows,
         k_scale=k_scale,
         v_scale=v_scale,

@@ -25,7 +25,9 @@ from tokenspeed_scheduler import (
     CacheGroupConfig,
     CacheGroupFamily,
     CacheRetention,
+    CacheTransferPolicy,
     ExecutionEvent,
+    ForwardEvent,
     RequestSpec,
     Scheduler,
     SchedulerConfig,
@@ -80,3 +82,79 @@ def test_execution_plan_exposes_forward():
 
     assert len(plan.forward) == 1
     assert plan.forward[0].request_ids == ["r0"]
+
+
+def test_pd_counters_follow_request_state():
+    cfg = SchedulerConfig()
+    cfg.role = SchedulerConfig.Role.D
+    cfg.prefix_granularity = 16
+    cfg.max_scheduled_tokens = 32
+    cfg.max_batch_size = 4
+    cfg.num_device_pages = 64
+    cfg.disable_l2_cache = True
+    cfg.cache_groups = [
+        CacheGroupConfig(
+            group_id="history",
+            block_granularity=16,
+            total_pages=64,
+            transfer_policy=CacheTransferPolicy.FullSuffix,
+            retention=CacheRetention.FullHistory,
+            family=CacheGroupFamily.History,
+        )
+    ]
+    scheduler = Scheduler(cfg)
+    scheduler.submit_requests([make_spec("remote", [1, 2, 3, 4])])
+    assert scheduler.bootstrapping_size() == 1
+    assert scheduler.remote_prefilling_size() == scheduler.pd_transfer_size() == 0
+    scheduler.advance(ExecutionEvent().add_event(PD.BootstrappedEvent("remote")))
+    assert scheduler.bootstrapping_size() == 0
+    scheduler.next_execution_plan()
+    assert scheduler.remote_prefilling_size() == scheduler.pd_transfer_size() == 1
+    scheduler.advance(
+        ExecutionEvent().add_event(PD.RemotePrefillDoneEvent("remote", 5))
+    )
+    assert scheduler.remote_prefilling_size() == scheduler.pd_transfer_size() == 0
+    finish = ForwardEvent.Finish()
+    finish.request_id = "remote"
+    scheduler.advance(ExecutionEvent().add_event(finish))
+    assert scheduler.active_lcm_blocks() == 0
+
+
+def test_prefill_role_reserves_the_decode_window_on_the_completing_chunk():
+    """The P role never decodes, but the chunk that completes a prompt drafts
+    the first candidate window, so it reserves ``decode_input_tokens`` exactly
+    like a decoding role; intermediate chunks hold only their own tokens."""
+    cfg = SchedulerConfig()
+    cfg.role = SchedulerConfig.Role.P
+    cfg.prefix_granularity = 2
+    cfg.max_scheduled_tokens = 4
+    cfg.max_batch_size = 1
+    cfg.num_device_pages = 17
+    cfg.disable_l2_cache = True
+    cfg.decode_input_tokens = 3
+    cfg.cache_groups = [
+        CacheGroupConfig(
+            group_id="history",
+            block_granularity=2,
+            total_pages=17,
+            transfer_policy=CacheTransferPolicy.FullSuffix,
+            retention=CacheRetention.FullHistory,
+            family=CacheGroupFamily.History,
+        )
+    ]
+    scheduler = Scheduler(cfg)
+    scheduler.submit_requests([make_spec("chunked", list(range(8)))])
+    scheduler.advance(ExecutionEvent().add_event(PD.BootstrappedEvent("chunked")))
+
+    def held_pages(batch) -> int:
+        return len(
+            [page for page in dict(batch.block_tables)["history"][0] if page > 0]
+        )
+
+    first_chunk = scheduler.next_execution_plan().forward[0]
+    assert list(first_chunk.input_lengths) == [4]
+    assert held_pages(first_chunk) == 2, "tokens 0..3 only, no reserve yet"
+
+    completing_chunk = scheduler.next_execution_plan().forward[0]
+    assert list(completing_chunk.input_lengths) == [4]
+    assert held_pages(completing_chunk) == 6, "tokens 0..7 plus a 3-token window"

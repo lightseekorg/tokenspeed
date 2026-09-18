@@ -273,6 +273,11 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     }
 }
 
+std::size_t Scheduler::BootstrappingSize() const {
+    return static_cast<std::size_t>(std::ranges::count_if(
+        requests_, [](const std::unique_ptr<Request>& request) { return request->Is<fsm::Bootstrapping>(); }));
+}
+
 std::size_t Scheduler::WaitingSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
         return request->IsAnyOf<fsm::Submitted, fsm::Retracted>();
@@ -288,6 +293,16 @@ std::size_t Scheduler::PrefillSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
         return request->IsAnyOf<fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillAwaitingResult, fsm::PrefillDone>();
     }));
+}
+
+std::size_t Scheduler::RemotePrefillSize() const {
+    return static_cast<std::size_t>(std::ranges::count_if(
+        requests_, [](const std::unique_ptr<Request>& request) { return request->Is<fsm::RemotePrefilling>(); }));
+}
+
+std::size_t Scheduler::PdTransferSize() const {
+    return static_cast<std::size_t>(std::ranges::count_if(
+        requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); }));
 }
 
 std::int32_t Scheduler::ActiveLcmBlocks() const {

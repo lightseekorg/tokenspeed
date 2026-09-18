@@ -23,9 +23,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
-    cache_field_layer_id,
-)
 from tokenspeed.runtime.pd.cache_protocol import (
     CacheTransferContract,
     validate_cache_peer_layout,
@@ -102,17 +99,13 @@ class CacheTransferPlanner:
         decode_tp_size: int,
         prefill_layout: CacheTransferContract,
         decode_layout: CacheTransferContract,
-        prefill_layer_window: tuple[int, int] | None = None,
+        prefill_field_ids: frozenset[str] | None,
     ):
         """Plan fragments between one Prefill rank set and one Decode rank set.
 
         Args:
-            prefill_layer_window: With prefill chunk-pipeline parallelism, the
-                ``[start, end)`` global layer window whose KV THIS planning
-                context transfers. Fields owned by other pipeline stages are
-                excluded from the route (each stage runs its own planner over
-                its own window, and the union of stages covers the plan).
-                None plans every field (no PP).
+            prefill_field_ids: Explicit resident fields to transfer, or None
+                for the complete plan. Model/cache setup determines placement.
         """
         if prefill_tp_size <= 0 or decode_tp_size <= 0:
             raise UnsupportedPDLayoutError("Cache TP sizes must be positive")
@@ -122,14 +115,13 @@ class CacheTransferPlanner:
             )
         self.prefill_tp_size = prefill_tp_size
         self.decode_tp_size = decode_tp_size
-        self._layer_window = prefill_layer_window
+        all_fields = frozenset(field.field_id for field in prefill_layout.plan.fields)
+        if prefill_field_ids is not None and not prefill_field_ids <= all_fields:
+            raise UnsupportedPDLayoutError(
+                "stage placement contains unknown cache fields"
+            )
+        self._field_ids = None if prefill_field_ids == all_fields else prefill_field_ids
         validate_cache_peer_layout(prefill_layout, decode_layout)
-
-        def in_window(field_id: str) -> bool:
-            if prefill_layer_window is None:
-                return True
-            layer_id = cache_field_layer_id(field_id)
-            return prefill_layer_window[0] <= layer_id < prefill_layer_window[1]
 
         self._partitions = {
             field.field_id: prefill_layout.transfer_schema.partition_for(field.field_id)
@@ -147,7 +139,8 @@ class CacheTransferPlanner:
                 decode_layout.fields_for_group(decode_spec.group_id),
                 strict=True,
             )
-            if in_window(prefill_segment.field_id)
+            if prefill_field_ids is None
+            or prefill_segment.field_id in prefill_field_ids
         )
         for _, prefill_segment, decode_segment in self._segment_pairs:
             self._validate_tp_mapping(prefill_segment, decode_segment)
@@ -164,9 +157,8 @@ class CacheTransferPlanner:
                 f"decode_tp_rank={decode_tp_rank} is out of range"
             )
         # Equal-TP fast path: empty fragments mean "copy every field whole".
-        # A PP layer window cannot use it — only the window's fields may be
-        # copied, so the explicit fragment route is mandatory.
-        if self.prefill_tp_size == self.decode_tp_size and self._layer_window is None:
+        # A stage owning only a subset must keep its explicit fragment route.
+        if self.prefill_tp_size == self.decode_tp_size and self._field_ids is None:
             return RankTransferPlan(
                 fragments_by_prefill_rank={decode_tp_rank: ()},
             )
@@ -373,3 +365,67 @@ class CacheTransferPlanner:
             for prefill_rank in self._fragments_for_decode_rank(decode_tp_rank):
                 decode_ranks[prefill_rank].add(decode_tp_rank)
         return {rank: frozenset(ranks) for rank, ranks in decode_ranks.items()}
+
+
+def build_pipeline_transfer_plan(
+    *,
+    prefill_tp_size: int,
+    decode_tp_size: int,
+    decode_tp_rank: int,
+    prefill_layout: CacheTransferContract,
+    decode_layout: CacheTransferContract,
+    cache_fields_by_stage: tuple[tuple[str, ...], ...],
+) -> tuple[RankTransferPlan, tuple[int, ...]]:
+    """Plan every Prefill stage's resident fields for one Decode TP rank.
+
+    Args:
+        prefill_tp_size: Attention TP width inside one Prefill stage.
+        decode_tp_size: Attention TP width inside one Decode replica.
+        decode_tp_rank: Receiving TP coordinate inside that replica.
+        prefill_layout: Complete logical source cache contract.
+        decode_layout: Complete destination cache contract.
+        cache_fields_by_stage: Explicit resident field IDs for every Prefill stage.
+
+    Returns:
+        The stage-major source-rank plan and ranks joining completion with no data.
+    """
+    validate_cache_stage_fields(prefill_layout, cache_fields_by_stage)
+    fragments: dict[int, tuple[CacheTransferFragment, ...]] = {}
+    dummy_ranks: list[int] = []
+    for stage, field_ids in enumerate(cache_fields_by_stage):
+        planner = CacheTransferPlanner(
+            prefill_tp_size=prefill_tp_size,
+            decode_tp_size=decode_tp_size,
+            prefill_layout=prefill_layout,
+            decode_layout=decode_layout,
+            prefill_field_ids=frozenset(field_ids),
+        )
+        stage_plan = planner.plan_for_decode_rank(decode_tp_rank)
+        base = stage * prefill_tp_size
+        for rank, stage_fragments in stage_plan.fragments_by_prefill_rank.items():
+            fragments[base + rank] = stage_fragments
+        if decode_tp_rank == 0:
+            dummy_ranks.extend(
+                base + rank
+                for rank, decode_ranks in planner.decode_ranks_by_prefill_rank.items()
+                if not decode_ranks
+            )
+    return RankTransferPlan(fragments_by_prefill_rank=fragments), tuple(
+        sorted(dummy_ranks)
+    )
+
+
+def validate_cache_stage_fields(
+    layout: CacheTransferContract, cache_fields_by_stage: tuple[tuple[str, ...], ...]
+) -> None:
+    """Require a nonempty stage list covering each logical field exactly once."""
+    fields = [field for stage in cache_fields_by_stage for field in stage]
+    if (
+        not cache_fields_by_stage
+        or any(not isinstance(field, str) for field in fields)
+        or len(fields) != len(set(fields))
+        or set(fields) != {field.field_id for field in layout.plan.fields}
+    ):
+        raise ValueError(
+            "cache stage placement must cover every logical field exactly once"
+        )

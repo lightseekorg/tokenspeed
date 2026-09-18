@@ -801,8 +801,10 @@ void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& buil
 // first -- their KV pages stay pinned until the transfer finishes
 // (pdTransferInFlight: on this role every page-holding state is pinned, from
 // the first scheduled chunk to the PD ACK), so releasing them outranks
-// feeding more prompt work -- then the prefill
-// phases run with no decode reserve (this role never decodes locally). No
+// feeding more prompt work -- then the prefill phases run with the same
+// completing-chunk decode reserve as every other role: this node never
+// decodes locally, but the forward that completes a prompt drafts the first
+// candidate window into that reserve before the remote decode ships it. No
 // retraction either: a P node's pressure valve is the transfer itself, so
 // this grammar never calls maybeRetractForCapacity and nothing here is ever
 // readmitted.
@@ -824,7 +826,7 @@ void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& b
         }
     }
 
-    scheduleLocalPrefillWork(feedback, build, candidates, /*readmission=*/nullptr, /*decode_reserve=*/0);
+    scheduleLocalPrefillWork(feedback, build, candidates, /*readmission=*/nullptr, config_.decode_input_tokens);
 }
 
 // D role: decode worker. Local recovery work runs alone in its batch;

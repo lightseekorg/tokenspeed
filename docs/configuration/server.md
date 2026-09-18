@@ -107,8 +107,24 @@ distributed update mode until that implementation is added.
 | `--enable-prefix-caching` / `--disable-prefix-caching` | Enable or disable prefix cache reuse. |
 | `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |
 | `--disable-prefill-graph` | Keep prefill eager while leaving decode device graphs enabled. |
+| `--disable-kda-prefill-graph` | Disable KDA prefill CUDA graphs while retaining ordinary prefill and decode graph settings. Enabled by default for supported `cutedsl_kda` prefill attention when prefill graphs are enabled. |
 | `--max-cudagraph-capture-size` | Largest decode batch size to capture as a device graph. |
 | `--cudagraph-capture-sizes` | Explicit decode batch sizes to capture as device graphs. |
+| `--prefill-graph-capture-token-sizes` | Total input-token capacities per forward, summed across the batch. Shorter inputs are padded. |
+| `--prefill-graph-capture-batch-sizes` | Request capacities for inline KDA prefill capture. Replay selects the smallest compatible capacity that fits the batch. |
+
+For pure prefill, token capacities count newly computed tokens, not cached
+prefixes or each request's full sequence length. Two requests extending by
+868 and 869 tokens use the 2048-token bucket and request capacity 2 when
+configured. A smaller batch can reuse that capture if there is room for its
+dummy request slots. These settings do not replace the scheduler's
+`--max-num-seqs` limit.
+
+`--prefill-graph-capture-sizes` remains a compatibility alias for
+`--prefill-graph-capture-token-sizes`; specify only one spelling per command.
+Both populate the existing `prefill_graph_capture_sizes` Python field.
+Unset token sizes use the existing default ladder; unset batch sizes use the
+minimum request count that fits each token bucket within the model context.
 
 `--chunked-prefill-size` is intentionally separate from
 `--max-num-batched-tokens`: in TokenSpeed it is the scheduler's per-iteration

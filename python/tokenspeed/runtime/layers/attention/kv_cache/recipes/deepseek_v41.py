@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""V4.1 Flash: four history groups sharing one 1,382,400-byte LCM plane.
+"""V4.1 Flash: four history groups sharing one LCM plane.
 
 Only source layers own global fields; Reuse/Reindex layers read those views.
 The FP32 compressor input is position-addressed history, not a mutable
@@ -37,20 +37,13 @@ from typing_extensions import override
 from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import DeepseekV41Config
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_COMPRESSOR_TAIL_GROUP_ID,
-    V41_DSPARK_GROUP_PACKING,
-    V41_DSPARK_LCM_BLOCK_BYTES,
     V41_GLOBAL_R1_GROUP_ID,
     V41_GLOBAL_R2_GROUP_ID,
-    V41_GLOBAL_ROW_BYTES,
     V41_GROUP_GEOMETRY,
-    V41_GROUP_PACKING,
     V41_HEAD_DIM,
     V41_INDEX_HEAD_DIM,
-    V41_INDEX_ROW_BYTES,
-    V41_LCM_BLOCK_BYTES,
     V41_PREFILL_QUERY_TILE,
     V41_SWA_GROUP_ID,
-    V41_SWA_ROW_BYTES,
     V41_WINDOW_SIZE,
     v41_dspark_field_name,
     v41_layer_mapping,
@@ -79,6 +72,10 @@ class DeepseekV41Recipe(CacheRecipe):
     """
 
     family = "deepseek_v41"
+
+    def _row_layout(self):
+        """Return the row widths and packing the configured cache format uses."""
+        return self.attn_config.component(DeepseekV41Config).row_layout()
 
     @property
     @override
@@ -165,8 +162,9 @@ class DeepseekV41Recipe(CacheRecipe):
                 )
             )
 
+        rows = self._row_layout()
         for layer in range(self.num_target_layers):
-            add(V41_SWA_GROUP_ID, layer, "swa", (64, V41_SWA_ROW_BYTES), "uint8")
+            add(V41_SWA_GROUP_ID, layer, "swa", (64, rows.swa_row_bytes), "uint8")
         # The draft reads each stage's window with the target's SWA slots, so
         # the rows live in the SWA group; the last target layer owns the field
         # ids, so PD and L2 treat them as target state produced with that layer.
@@ -182,8 +180,8 @@ class DeepseekV41Recipe(CacheRecipe):
             gid = (
                 V41_GLOBAL_R2_GROUP_ID if ratios[owner] == 2 else V41_GLOBAL_R1_GROUP_ID
             )
-            add(gid, owner, "global_kv", (64, V41_GLOBAL_ROW_BYTES), "uint8")
-            add(gid, owner, "index_k", (64, V41_INDEX_ROW_BYTES), "uint8")
+            add(gid, owner, "global_kv", (64, rows.global_row_bytes), "uint8")
+            add(gid, owner, "index_k", (64, rows.index_row_bytes), "uint8")
             if ratios[owner] == 2:
                 add(
                     V41_COMPRESSOR_TAIL_GROUP_ID,
@@ -234,11 +232,15 @@ class DeepseekV41Recipe(CacheRecipe):
         return tuple((spec, tuple(fields[spec.group_id])) for spec in specs)
 
     def _group_packing(self) -> Mapping[str, int]:
-        return V41_DSPARK_GROUP_PACKING if self.dspark_stages() else V41_GROUP_PACKING
+        rows = self._row_layout()
+        return rows.dspark_group_packing if self.dspark_stages() else rows.group_packing
 
     def _lcm_block_bytes(self) -> int:
+        rows = self._row_layout()
         return (
-            V41_DSPARK_LCM_BLOCK_BYTES if self.dspark_stages() else V41_LCM_BLOCK_BYTES
+            rows.dspark_lcm_block_bytes
+            if self.dspark_stages()
+            else rows.lcm_block_bytes
         )
 
     @override
@@ -288,15 +290,16 @@ class DeepseekV41Recipe(CacheRecipe):
             * max_bs
             * sum(v41_table_widths(self.attn_config.context_len, horizon).values())
         )
-        queries = self.attn_config.component(DeepseekV41Config).max_query_tokens
+        spec = self.attn_config.component(DeepseekV41Config)
+        rows = spec.row_layout()
+        queries = spec.max_query_tokens
         # Tables/lengths stay request-shaped; positions, request maps, write
         # locations and compact SWA slots/lengths cover every verify query.
         # Budget extend plus persistent decode views.
         metadata = 2 * (tables + max_bs * 32 + queries * (64 + 128 * 4 + 4) + 4)
         # Both MIXED windows together are bounded by queries. Include the
         # packed current SWA rows and two generations of selection records.
-        selections = queries * ((2048 + 2 * 512 + 128) * 8 + 528)
-        spec = self.attn_config.component(DeepseekV41Config)
+        selections = queries * ((2048 + 2 * 512 + 128) * 8 + rows.swa_row_bytes)
         local_heads = spec.num_attention_heads // spec.attn_tp_size
         padded_heads = 64 if local_heads <= 64 else 128
         query_tile = min(queries, V41_PREFILL_QUERY_TILE)
@@ -313,16 +316,19 @@ class DeepseekV41Recipe(CacheRecipe):
         )
         # BF16 current SWA and compact [T,128+512] indices coexist with that KV.
         compact_metadata = queries * (V41_HEAD_DIM * 2 + (128 + 512) * 4)
-        # Packed index Q (32 global heads, 64 value + 4 scale bytes) and a
-        # 32-MiB logits tile plus selection copies; score/selection is bounded
+        # Packed index Q (32 global heads, one packed row each) and a 32-MiB
+        # logits tile plus selection copies; score/selection is bounded
         # independently of the complete context or the prefill query count.
-        index_queries = queries * 32 * (128 * 2 + 68)
+        index_queries = queries * 32 * (128 * 2 + rows.index_row_bytes)
         score_columns = (self.attn_config.context_len + 63) // 64 * 64
         score_scratch = min(128 << 20, min(queries, 1024) * score_columns * 4)
         block_k = max(32, 1 << (min(2048, max(1, score_columns // 8)) - 1).bit_length())
         # Sixteen portable partitions plus bounded TopK merge temporaries.
         portable_scratch = min(queries, 256) * 24 * (512 + block_k) * 12
-        index_selection = max(3 * score_scratch, portable_scratch) + score_columns * 68
+        index_selection = (
+            max(3 * score_scratch, portable_scratch)
+            + score_columns * rows.index_row_bytes
+        )
         # Ratio-2 pooling returns T FP32 rows, including inactive (-1) positions.
         compressor_output = queries * V41_HEAD_DIM * 4
         return (

@@ -258,13 +258,26 @@ both cases and always returns outputs and final states; its caller writes the
 final states to the continuation blocks. Target verification remains separate.
 Every request in a checkpoint
 batch participates in the body: rows crossing a checkpoint stop at that
-boundary, while other rows run to completion. Only crossing rows enter the
-packed tail scan, initialized directly
-from their body final states. Body and tail outputs are scattered back to
-original token order, so every token is evaluated exactly once while the aligned
-and final states are both retained. Batch size one uses zero-copy body/tail
-views; larger batches use the same batched pack/scatter contract. This split
+boundary, while other rows run to completion. In the ordinary compact path,
+only crossing rows enter the packed tail scan, initialized directly
+from their body final states. Body and tail outputs are restored to original
+token order, so every valid token is evaluated exactly once while the aligned
+and final states are both retained. Ordinary batch size one uses zero-copy
+body/tail views and concatenates the outputs; larger compact batches pack
+inputs and scatter outputs. Inline capacity graphs pack even one request
+because its live boundary cannot be encoded as a capture-time Python slice.
+They restore outputs with a shared inverse-map gather. Negative token indices
+make packing write zeros; negative inverse sources make gathering write zero
+output padding. GPU boundaries still determine the real tokens in each scan.
+This split
 does not change cache ownership or scheduler metadata.
+
+Merged capacity graphs may reserve a checkpoint/tail execution slot for every
+request, including requests with no internal checkpoint. Such an inactive
+slot has a negative checkpoint destination and output map; its dummy scan
+result cannot overwrite the body's final state. These slots are transient
+graph scratch, never new cache blocks or publishable checkpoints. The
+ordinary compact-tail path and the capacity path share masked state writers.
 
 The body/tail split uses the existing prefill-op state-layout contract. KDA
 solutions may retain their original K-major Python adapters; the kernel facade
@@ -670,6 +683,36 @@ layers ──group──▶ groups ──pack──▶ CacheLayout ──bind─
   by a count and yields the `CacheMemoryPlan` the arena allocates from and
   the PD wire carries.
 
+Cache-layer counts come from the recipe's existing `CacheSetup.num_target_layers`
+and `num_draft_layers`: target cache layers first, then independent draft cache
+layers. PP construction gives these values explicit `*_cache_layers` local
+names; a drafter that shares target cache contributes no independent cache
+layers. Neither count means captured target taps or draft execution depth.
+
+`distributed/pp_stage.py::pp_stage_windows` owns the target execution-window
+calculation, shared by pipeline stages, model construction and PD topology.
+The model/cache construction boundary maps those execution windows to explicit
+`target_cache_windows`, then `CacheLayerOwnership` adds the final stage's draft
+cache window. Cache ownership consumes cache-ID windows; execution partitioning
+belongs to the distributed layer. Current PP targets K3 and V4 have one cache
+layer per execution block; non-PP ownership covers the complete cache namespace
+without assuming that equality. Resident windows, transfer filtering and
+producer-field groups all use cache-layer IDs.
+Cache construction resolves ownership into explicit field IDs once:
+`cache_fields_by_stage` describes residency, and `producer_fields_by_step`
+describes the local readiness barriers. These sets cover resident fields
+exactly once. PD never derives placement from target/draft identities,
+execution-layer counts or contiguous layer windows. Noncontiguous field sets
+are valid. The bootstrap wire carries `cache_fields_by_stage`; all prefill
+ranks must register the same complete placement and logical field plan.
+Old bootstrap peers without explicit placement must be upgraded together.
+
+`create_attn_components` returns a frozen `AttentionBuild` naming target and
+draft backends/pools, cache storage, field placement, readiness and optional
+`logical_plan`. The complete logical plan is retained when PP narrows the
+physical arena. The builder passes these values explicitly to PD; none are
+attached to the event loop or added to the allocation owner after construction.
+
 `CacheRecipe` (`recipes/base.py`) is a template method: `setup()` is the one
 place the four stages appear in order, and a family fills in uniformly named
 seams — `layer_types`, `group_ids`, `fields_for_layer`, `prefix_granularity`,
@@ -693,6 +736,19 @@ would otherwise need cross-checking cannot differ:
 
 If you find yourself writing a check that two derived views agree, the
 design is wrong: make one of them the source.
+
+**Recipes do not inspect the hardware.** A row encoding can be a property of
+the target — DeepSeek V4.1's packed rows are read natively by FlashMLA above
+sm100, while sm90 reads only the wider V4 layout — but the recipe never asks
+which machine it is on. The choice is made once where the model's attention
+config is generated (`configs/deepseek_v41.py`), recorded on the spec, and
+read back by everyone who needs it: the recipe sizes fields and looks up the
+packing from it, the backend names its kernel cache formats from it. Row
+width forces the packing and the plane, so each format owns its own frozen
+`group_packing` / `lcm_block_bytes` tables (`deepseek_v41_geometry.py`); the
+geometry module is a table keyed by format name and knows nothing about
+architectures. Adding a platform probe below the config layer would give one
+parent two possible sizes with no single place that decided which.
 
 ### Storage vs. visibility
 

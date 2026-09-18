@@ -2604,9 +2604,11 @@ protected:
 };
 
 TEST_F(AdmissionHeadroomPrefillRoleSuite, ThePrefillRoleDoesNotPrepayDecodeHeadroom) {
-    // The P role never decodes locally and never retracts, so a declared
-    // generation budget -- even one far beyond this pool -- charges nothing
-    // at admission: the prompt's own 2*ceil(6/2) = 6 blocks and no more.
+    // The P role never retracts, so a declared generation budget -- even one
+    // far beyond this pool -- charges nothing at admission. What the
+    // completing chunk does hold is the same decode slot every role reserves
+    // (the drafter writes its first candidate block there): the prompt plus
+    // one token, 2*ceil(7/2) = 8 blocks, exactly the fused charge for "a".
     RequestSpec heavy = MakeRequestSpec("heavy", /*num_pages=*/3);
     heavy.max_new_tokens = 6000;
     Submit(heavy);
@@ -2616,7 +2618,7 @@ TEST_F(AdmissionHeadroomPrefillRoleSuite, ThePrefillRoleDoesNotPrepayDecodeHeadr
     const ForwardBatch* op = FindForwardBatch(plan);
     ASSERT_NE(op, nullptr);
     EXPECT_EQ(op->request_ids, std::vector<std::string>{"heavy"});
-    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 8);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 6);
 }
 
 TEST_F(PrefillHeadOfLineSuite, AnIncompletePrefillGivesWayBeforeACompletedOne) {

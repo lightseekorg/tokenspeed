@@ -61,8 +61,9 @@ def test_attn_dp_rejects_partial_world_layout_before_backend_setup(
 
 @pytest.mark.parametrize("backend", ["none", "agrs", "flashinfer"])
 @pytest.mark.parametrize("fabric_available", [False, True])
+@pytest.mark.parametrize("mega_moe", [False, True])
 def test_attn_dp_replicates_dense_weights_and_selects_transport(
-    monkeypatch, backend: str, fabric_available: bool
+    monkeypatch, backend: str, fabric_available: bool, mega_moe: bool
 ) -> None:
     class Experts(nn.Module):
         def __init__(self, **kwargs):
@@ -73,11 +74,14 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
             self.plan = {"a2a_backend": "none"}
 
     monkeypatch.setattr(
-        kimi_k3, "get_moe_backend", lambda: SimpleNamespace(value="flashinfer_trtllm")
+        kimi_k3,
+        "get_moe_backend",
+        lambda: SimpleNamespace(value="mega_moe" if mega_moe else "flashinfer_trtllm"),
     )
     plan = kimi_k3.Kimi3MoEExecutionPlan(
+        use_mega_moe=mega_moe,
         use_native=False,
-        use_trtllm=True,
+        use_trtllm=not mega_moe,
         overlap_shared_experts=False,
         joint_moe_reduce=False,
     )
@@ -124,9 +128,14 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
             dp_size=1,
         ),
     )
-    expected_error = backend == "flashinfer" and not fabric_available
+    expected_error = (mega_moe and backend != "none") or (
+        not mega_moe and backend == "flashinfer" and not fabric_available
+    )
     with (
-        pytest.raises(ValueError, match="sharing a CUDA fabric")
+        pytest.raises(
+            ValueError,
+            match="owns dispatch/combine" if mega_moe else "sharing a CUDA fabric",
+        )
         if expected_error
         else nullcontext()
     ):
@@ -149,7 +158,7 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
         )
     if expected_error:
         return
-    if backend == "agrs":
+    if mega_moe or backend == "agrs":
         factory.assert_not_called()
         assert layer.moe_alltoall is None
     else:
@@ -164,7 +173,7 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
     assert layer.shared_experts.gate_up_proj.weight.shape == (64, 64)
     assert layer.shared_experts.down_proj.weight.shape == (64, 32)
     assert layer.shared_experts.down_proj.tp_size == 1
-    assert layer.shared_experts.down_proj.tp_group == (1,)
+    assert layer.shared_experts.down_proj.tp_group is None
     assert layer.experts.kwargs["routing_mode"] == "precomputed_topk"
     assert not hasattr(layer, "comm")
     assert not hasattr(layer, "native_latent_moe")
@@ -173,7 +182,6 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
 @pytest.mark.parametrize(
     "backend,dp,match",
     [
-        ("deepep", 2, "does not support DeepEP"),
         ("agrs", 1, "requires attention DP"),
         ("flashinfer", 1, "requires attention DP"),
     ],
@@ -285,10 +293,16 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
         return expected.reshape(2 * capacity, expected.shape[-1])
 
     def experts(
-        routed, routing, *, num_global_tokens, max_num_tokens_per_gpu, do_finalize
+        routed,
+        routing,
+        *,
+        num_global_tokens,
+        max_num_tokens_per_gpu,
+        do_finalize,
     ):
         events.append("experts")
-        assert num_global_tokens == max_num_tokens_per_gpu == 2 * capacity
+        assert num_global_tokens == 2 * capacity
+        assert max_num_tokens_per_gpu == capacity
         assert do_finalize
         assert routing.router_logits is None
         if nvfp4:
@@ -352,6 +366,7 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
             attn=SimpleNamespace(dp_rank=rank),
             moe=SimpleNamespace(ep_group=group),
         ),
+        execution_plan=SimpleNamespace(use_mega_moe=False),
         moe_alltoall=(
             SimpleNamespace(dispatch=dispatch, combine=combine)
             if use_alltoall
@@ -485,3 +500,64 @@ def test_attn_dp_forward_requires_context() -> None:
             max_num_tokens_per_gpu=1,
             ctx=None,
         )
+
+
+@pytest.mark.parametrize("rows", [0, 2])
+def test_attn_dp_megamoe_keeps_inputs_local_and_owns_combine(monkeypatch, rows):
+    hidden = torch.randn(rows, 8, dtype=torch.bfloat16)
+    prefix = torch.randn_like(hidden)
+    latent = hidden[:, :4].contiguous()
+    ids = torch.zeros(rows, 2, dtype=torch.int32)
+    weights = torch.full((rows, 2), 0.5, dtype=torch.bfloat16)
+    payload = (
+        torch.ones(rows, 2, dtype=torch.uint8),
+        torch.ones(rows, 1, dtype=torch.uint8),
+    )
+    quantize = mock.Mock(return_value=payload)
+    monkeypatch.setattr(kimi_k3, "fp4_quantize", quantize)
+    for name in ("all_gather", "reduce_scatter", "all_reduce"):
+        monkeypatch.setattr(kimi_k3, name, mock.Mock(side_effect=AssertionError(name)))
+
+    @contextmanager
+    def scope(**kwargs):
+        yield SimpleNamespace(branch=nullcontext)
+
+    routed = mock.Mock(return_value=latent)
+    up = mock.Mock(return_value=hidden + prefix)
+    layer = SimpleNamespace(
+        execution_plan=SimpleNamespace(use_mega_moe=True),
+        mapping=SimpleNamespace(world_size=2, attn=SimpleNamespace(dp_rank=0)),
+        stream_fork=SimpleNamespace(scope=scope),
+        topk=mock.Mock(return_value=StandardTopKOutput(weights, ids, None)),
+        gate=mock.Mock(return_value=torch.zeros(rows, 2)),
+        routed_expert_down_proj=mock.Mock(return_value=(latent, None)),
+        experts=SimpleNamespace(
+            plan={"weight_dtype": "nvfp4"}, w13_input_scale_quant=torch.ones(1)
+        ),
+        moe_alltoall=None,
+        _routed_experts=routed,
+        routed_expert_norm=None,
+        routed_expert_up_proj=SimpleNamespace(forward_add3=up),
+        shared_experts=mock.Mock(return_value=hidden),
+        routed_hidden=4,
+        top_k=2,
+    )
+    layer.topk.topk_config = SimpleNamespace(
+        topk_weights_dtype=torch.bfloat16, topk_indices_dtype=torch.int32
+    )
+    ctx = SimpleNamespace(
+        collective_global_num_tokens=[rows, 3], global_num_tokens=None
+    )
+    result = KimiLinearMoE._forward_attn_dp(layer, hidden, prefix, ctx)
+    routed.assert_called_once()
+    call = routed.call_args
+    assert call.args[0][0].shape[0] == rows
+    assert call.args[1].topk_ids.shape == (rows, 2)
+    assert call.kwargs["max_num_tokens_per_gpu"] == 3
+    assert call.kwargs["num_global_tokens"] == 6
+    if rows:
+        assert call.args[0] is payload
+        torch.testing.assert_close(result, hidden + prefix)
+    else:
+        assert result is prefix
+        up.assert_not_called()

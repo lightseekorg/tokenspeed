@@ -42,10 +42,12 @@ if current_platform().is_amd:
             gluon_linear_attnres_partials_gfx950 as _linear_attnres_partials_impl,
         )
     except ImportError as exc:
-        _IMPORT_ERROR = exc
+        # Keep the message only: an exception object carries its traceback,
+        # which pins every frame that was importing at the time.
+        _IMPORT_ERROR_MESSAGE = str(exc)
         _linear_attnres_partials_impl = None
     else:
-        _IMPORT_ERROR = None
+        _IMPORT_ERROR_MESSAGE = None
 
     @register_kernel(
         "gemm",
@@ -208,8 +210,9 @@ if current_platform().is_amd:
 
         def gluon_linear_attnres_partials_gfx950(**kwargs):
             raise ImportError(
-                "gluon_linear_attnres_partials_gfx950 requires tokenspeed-kernel-amd"
-            ) from _IMPORT_ERROR
+                "gluon_linear_attnres_partials_gfx950 requires "
+                f"tokenspeed-kernel-amd: {_IMPORT_ERROR_MESSAGE}"
+            )
 
 else:
 

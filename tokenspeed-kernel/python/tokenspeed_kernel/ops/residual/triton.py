@@ -69,6 +69,7 @@ def _projection_epilogue_kernel(
     down_mask = offsets < LOWRANK
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     value = tl.load(
         projected_ptr + row * projected_row_stride + offsets,
         mask=down_mask,
@@ -93,8 +94,6 @@ def _projection_epilogue_kernel(
             inject * projection_scale,
             mask=inject_mask,
         )
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -115,6 +114,7 @@ def _mix_epilogue_kernel(
     mask = offsets < hidden_size
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     mixed = tl.zeros([BLOCK], dtype=tl.float32)
     for branch in tl.static_range(HC_COUNT):
         column = branch * hidden_size + offsets
@@ -128,8 +128,6 @@ def _mix_epilogue_kernel(
         ).to(tl.float32)
         mixed += tl.sigmoid(gate) * value
     tl.store(out_ptr + row * out_row_stride + offsets, mixed / HC_COUNT, mask=mask)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
