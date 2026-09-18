@@ -21,7 +21,7 @@
 """Automatic K3 TP8 NVFP4 down-projection input preparation.
 
 A prepared op owns communication storage; each call returns a borrowed
-Nvfp4Activation for immediate, same-stream MoE consumption.
+(packed_values, scales) tuple for immediate, same-stream MoE consumption.
 """
 
 from __future__ import annotations
@@ -32,7 +32,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.moe.activation import Nvfp4Activation
 from tokenspeed_kernel.ops.moe.latent_down import KimiK3LatentDownOp
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -419,13 +418,11 @@ class KimiK3Nvfp4DownOp:
                 mailbox=True,
                 use_pdl=self.use_pdl,
             )
-        return Nvfp4Activation(
-            data, scales.view(torch.float8_e4m3fn), (m, self.hidden), self.scale
-        )
+        return data, scales.view(torch.float8_e4m3fn)
 
     def __call__(
         self, hidden_states: torch.Tensor, weight: torch.Tensor
-    ) -> Nvfp4Activation:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Project a TP8 weight shard and prepare its quantized MoE input.
 
         Args:
@@ -433,7 +430,8 @@ class KimiK3Nvfp4DownOp:
             weight: This rank's BF16 [448, hidden] projection rows.
 
         Returns:
-            Borrowed packed activation, valid until this workspace is reused.
+            Borrowed (uint8 [M,H/2] packed values, E4M3 [M,H/16] block scales),
+            valid until this workspace is reused.
         """
         from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.nvfp4_input import (
             MAILBOX,
@@ -473,9 +471,7 @@ class KimiK3Nvfp4DownOp:
             ctas=ctas,
             threads=threads,
         )
-        return Nvfp4Activation(
-            data, scales.view(torch.float8_e4m3fn), (m, self.hidden), self.scale
-        )
+        return data, scales.view(torch.float8_e4m3fn)
 
 
 __all__ = ["KimiK3Nvfp4DownOp", "fusion_mode"]

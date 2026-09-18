@@ -86,7 +86,6 @@ from tokenspeed_kernel.ops.moe import (
     latent_moe_decode_pipeline_available,
     latent_moe_input_projections,
 )
-from tokenspeed_kernel.ops.moe.activation import Nvfp4Activation
 from tokenspeed_kernel.ops.moe.latent_down import KimiK3LatentDownOp
 from tokenspeed_kernel.ops.moe.latent_down_nvfp4 import (
     KimiK3Nvfp4DownOp,
@@ -1871,7 +1870,7 @@ class KimiLinearMoE(nn.Module):
 
     def _routed_experts(
         self,
-        routed_in: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | Nvfp4Activation,
+        routed_in: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         topk_output: TopKOutput,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
