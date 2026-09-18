@@ -234,7 +234,7 @@ def tp_group():
 
 
 def run_index_scan_graph_oracle(
-    device, shards, dtype, tp_group, require, solution, rtol=0, atol=0
+    device, shards, dtype, tp_group, require, solution, rtol, atol
 ):
     require("attention", "dsv41_index_topk", solution, torch.bfloat16, "x")
     if shards == 4 and (
@@ -366,7 +366,9 @@ def run_index_scan_graph_oracle(
 @pytest.mark.parametrize("shards", [1, 4], ids=["local", "tp4"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_index_scan_graph_oracle(device, shards, dtype, tp_group, require):
-    run_index_scan_graph_oracle(device, shards, dtype, tp_group, require, "triton")
+    run_index_scan_graph_oracle(
+        device, shards, dtype, tp_group, require, "triton", rtol=0, atol=0
+    )
 
 
 def run_index_topk_full_and_reindex(
