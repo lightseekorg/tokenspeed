@@ -18,115 +18,28 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""GPU contracts for joint FI GEMV dispatch and fused add3."""
+"""GPU contracts for joint FI GEMV dispatch and registry fallbacks."""
 
 from __future__ import annotations
 
 import pytest
 import tokenspeed_kernel.ops.gemm  # noqa: F401  (registration side effects)
 import torch
-from tokenspeed_kernel.ops.gemm.routed_gemv import decode_gemv_routed
-from tokenspeed_kernel.ops.gemm.triton_gemv import _select, decode_gemv
+from tokenspeed_kernel.ops.gemm.triton_gemv import _select, decode_gemv, use_decode_gemv
 from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def _is_routed_arch() -> bool:
-    # Mirrors _CAPABILITY in routed_gemv: sm100 and up, not sm103 exactly.
+def _is_joint_fi_arch() -> bool:
+    # Joint FI tuning covers supported Blackwell devices, not just sm103.
     return (
         current_platform().vendor == "nvidia"
         and torch.cuda.get_device_capability() >= (10, 0)
     )
 
 
-def _is_add3_arch() -> bool:
-    # ADD3_ROUTE stores sm103-tuned TILE CONFIGS, not just a backend choice, so
-    # it stays gated where it was swept -- mirrors _is_measured_arch. Widening
-    # it would run another architecture's tuning parameters unmeasured.
-    return (
-        current_platform().vendor == "nvidia"
-        and torch.cuda.get_device_capability() >= (10, 3)
-    )
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or not _is_routed_arch(),
-    reason="add3 route is measured for sm103 only",
-)
-@pytest.mark.parametrize("m", [1, 2])
-def test_skinny_add3_matches_reference(m):
-    from tokenspeed_kernel.ops.gemm.routed_gemv import skinny_gemv_add3
-
-    torch.manual_seed(0)
-    n, k = 7168, 3584
-    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / 8
-    a = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
-    # Column slice of a wider tensor, as the serving call site passes it.
-    c_wide = torch.randn(m, 2 * n, device="cuda", dtype=torch.bfloat16)
-    c = c_wide[:, n:]
-    got = skinny_gemv_add3(x, w, a, c).float()
-    ref = a.float() + x.float() @ w.float().t() + c.float()
-    assert torch.allclose(got, ref, atol=0.5, rtol=2e-2)
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or not _is_add3_arch(),
-    reason="ADD3_ROUTE holds sm103-tuned tile configs; unswept below that",
-)
-def test_kimi3_add3_auto_selects_the_skinny_epilogue():
-    from tokenspeed_kernel.ops.gemm.kimi3 import kimi3_latent_projection_add3
-
-    torch.manual_seed(1)
-    m, n, k = 1, 7168, 3584
-    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / 8
-    a = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
-    c = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
-    auto = kimi3_latent_projection_add3(x, w, a, c).float()
-    forced = kimi3_latent_projection_add3(x, w, a, c, solution="skinny_add3").float()
-    composed = kimi3_latent_projection_add3(x, w, a, c, solution="composed").float()
-    assert torch.allclose(auto, forced, atol=0.0, rtol=0.0)
-    assert torch.allclose(auto, composed, atol=0.5, rtol=2e-2)
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or not _is_routed_arch(),
-    reason="add3 route is measured for sm103 only",
-)
-def test_skinny_add3_unwarmed_capture_falls_back(monkeypatch):
-    import tokenspeed_kernel.ops.gemm.routed_gemv as route
-    from tokenspeed_kernel.thirdparty.cute_dsl import skinny_gemm
-
-    torch.manual_seed(2)
-    m, n, k = 1, 7168, 3584
-    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / 8
-    a = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
-    c = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
-    dev = x.device.index or 0
-    with route._warmed_lock:
-        route._warmed.discard(("skinny_add3", dev, m, n, k))
-
-    def _no_jit(*args, **kwargs):
-        raise AssertionError("JIT compile attempted inside capture")
-
-    monkeypatch.setattr(skinny_gemm.shape_dynamic_skinny_gemm, "_compile", _no_jit)
-    g = torch.cuda.CUDAGraph()
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
-        ref = a.float() + x.float() @ w.float().t() + c.float()
-        with torch.cuda.graph(g):
-            out = route.skinny_gemv_add3(x, w, a, c)
-        g.replay()
-    torch.cuda.current_stream().wait_stream(s)
-    torch.cuda.synchronize()
-    assert torch.allclose(out.float(), ref, atol=0.5, rtol=2e-2)
-
-
-def test_unlisted_shapes_keep_the_generic_selection():
+def test_registry_fallback_selection():
     _select.cache_clear()
     impl = _select(1, 999, 4096, True)
     assert "rowcta" in getattr(impl, "__name__", "")
@@ -146,7 +59,7 @@ def test_kimi_projections_honor_small_m_joint_route(monkeypatch, projection, n):
     x = torch.empty(32, 7168, device="meta", dtype=torch.bfloat16)
     weight = torch.empty(n, 7168, device="meta", dtype=torch.bfloat16)
     output = torch.empty(32, n, device="meta", dtype=torch.bfloat16)
-    monkeypatch.setattr(kimi3, "decode_gemv_routed", lambda *_: True)
+    monkeypatch.setattr(kimi3, "use_decode_gemv", lambda *_: True)
     monkeypatch.setattr(triton_gemv, "decode_gemv", lambda *_: output)
     if projection == "kda":
         assert kimi3.kimi3_qkvfab_projection(x, weight) is output
@@ -159,8 +72,8 @@ def test_kimi_projections_honor_small_m_joint_route(monkeypatch, projection, n):
 
 @pytest.mark.parametrize("m", [1, 2, 4])
 def test_shared_projections_route_and_match_torch(m):
-    """The K3 shared gate_up/down call sites take the measured route on
-    covered shapes and stay bit-compatible with the torch composition."""
+    """The K3 shared gate_up/down call sites use the joint path and
+    agree with the Torch composition within BF16 tolerances."""
     from tokenspeed_kernel.ops.gemm.kimi3 import (
         kimi3_shared_down_projection,
         kimi3_shared_situ_projection,
@@ -184,7 +97,7 @@ def test_shared_projections_route_and_match_torch(m):
 
 def test_forced_torch_solution_is_not_routed():
     """solution="torch" must stay the vendor-BLAS baseline even for shapes the
-    measured route covers, or A/B comparisons silently measure the route."""
+    joint FI path supports, or A/B comparisons silently measure the route."""
     from unittest.mock import patch
 
     from tokenspeed_kernel.ops.gemm import kimi3
@@ -212,7 +125,7 @@ def test_forced_torch_solution_is_not_routed():
 @pytest.mark.parametrize("m", [1, 2, 16, 17, 32])
 @pytest.mark.parametrize("n,k", [(7168, 1536), (7168, 3584)])
 def test_cdna5_route_admits_decode_shapes(m, n, k):
-    """K3 decode shapes must route on CDNA5, which has no sm100 route table.
+    """K3 decode shapes must route on CDNA5 through its registered kernels.
 
     The unquantized Linear path relies on this: o_proj is 93 calls a forward
     and reached the vendor GEMM. M == 1 lands on row-CTA and the rest on the
@@ -223,7 +136,7 @@ def test_cdna5_route_admits_decode_shapes(m, n, k):
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
 
-    assert decode_gemv_routed(x, w)
+    assert use_decode_gemv(x, w)
 
     got = decode_gemv(x, w).float()
     ref = (x @ w.t()).float()
@@ -241,34 +154,35 @@ def test_cdna5_route_declines_unregistered_calls():
     w_bf16 = torch.randn(7168, 1536, device="cuda", dtype=torch.bfloat16)
 
     x_fp16 = torch.randn(1, 1536, device="cuda", dtype=torch.float16)
-    assert not decode_gemv_routed(x_fp16, w_bf16.half())
+    assert not use_decode_gemv(x_fp16, w_bf16.half())
 
     strided = torch.randn(1, 3072, device="cuda", dtype=torch.bfloat16)[:, ::2]
-    assert not decode_gemv_routed(strided, w_bf16)
+    assert not use_decode_gemv(strided, w_bf16)
 
     # K=128 is registered but measured slower than the vendor GEMM at wide N.
     thin = torch.randn(1, 128, device="cuda", dtype=torch.bfloat16)
     thin_w = torch.randn(8448, 128, device="cuda", dtype=torch.bfloat16)
-    assert not decode_gemv_routed(thin, thin_w)
+    assert not use_decode_gemv(thin, thin_w)
 
     # Past the WMMA band nothing is registered: each 16-row chunk re-reads the
     # whole weight, and by this M rocBLAS is measured faster.
     wide = torch.randn(64, 1536, device="cuda", dtype=torch.bfloat16)
-    assert not decode_gemv_routed(wide, w_bf16)
+    assert not use_decode_gemv(wide, w_bf16)
 
     # In-band M, but the WMMA kernel tiles K by 128 and N by its output tile.
     unaligned_k = torch.randn(16, 1600, device="cuda", dtype=torch.bfloat16)
-    assert not decode_gemv_routed(
+    assert not use_decode_gemv(
         unaligned_k, torch.randn(7168, 1600, device="cuda", dtype=torch.bfloat16)
     )
     unaligned_n = torch.randn(16, 1536, device="cuda", dtype=torch.bfloat16)
-    assert not decode_gemv_routed(
+    assert not use_decode_gemv(
         unaligned_n, torch.randn(7000, 1536, device="cuda", dtype=torch.bfloat16)
     )
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not _is_routed_arch(), reason="Blackwell required"
+    not torch.cuda.is_available() or not _is_joint_fi_arch(),
+    reason="Blackwell required",
 )
 @pytest.mark.parametrize(
     "n,k,expected_runners",
@@ -370,7 +284,7 @@ def test_joint_fi_tuning_roundtrip_and_changed_input_replay(
 
     with torch.no_grad(), autotune(tune_mode=False, tuning_buckets=None, round_up=None):
         for m in range(1, 33):
-            assert decode_gemv_routed(x[:m], weight)
+            assert use_decode_gemv(x[:m], weight)
             buffer = torch.full((m * n + 32,), 42, dtype=torch.bfloat16, device="cuda")
             out = buffer[: m * n].view(m, n)
             out.fill_(float("nan"))
@@ -410,7 +324,7 @@ def test_joint_fi_tuning_roundtrip_and_changed_input_replay(
 
         monkeypatch.setattr(fi_adapter._fi_gemm, "bf16_gemm_sm100", reject_fi)
         for m in (33, 48, 64, 128):
-            assert not decode_gemv_routed(x[:m], weight)
+            assert not use_decode_gemv(x[:m], weight)
             out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
             assert mm(x[:m], weight, out=out).data_ptr() == out.data_ptr()
             torch.testing.assert_close(out, x[:m] @ weight.T, rtol=0, atol=0)

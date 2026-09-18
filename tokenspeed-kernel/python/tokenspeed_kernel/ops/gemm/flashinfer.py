@@ -707,34 +707,6 @@ def has_flashinfer_cute_dsl_bf16() -> bool:
     return _mm_bf16 is not error_fn and _declares_cute_dsl_backend(_mm_bf16)
 
 
-def flashinfer_cute_dsl_mm_bf16(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """``x @ weight.T (+ bias)`` through the cute-dsl ``mm_bf16`` backend.
-
-    Args:
-        x: ``[M, K]`` contiguous BF16 activation.
-        weight: ``[N, K]`` contiguous BF16 weight; its transpose is the
-            column-major ``(K, N)`` operand the backend wants, with no copy.
-        bias: Optional contiguous ``[N]`` BF16 bias, fused into the epilogue.
-        out: Optional ``[M, N]`` BF16 destination; allocated when omitted.
-
-    Returns:
-        ``[M, N]`` BF16 output, ``out`` when it was given.
-    """
-    return _mm_bf16(
-        x,
-        weight.t(),
-        bias=bias,
-        pdl=pdl_enabled(),
-        out=out,
-        backend=_CUTE_DSL_BACKEND,
-    )
-
-
 def _bf16_gemm_runner_names(k: int) -> list[str]:
     """Admit each backend by its own K contract, not their intersection."""
     if k <= 0:

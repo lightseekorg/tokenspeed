@@ -137,33 +137,6 @@ class ShapeDynamicSkinnyGemm:
             (device.index or 0, dtype, config, has_residual, has_residual2)
         ] = compiled
 
-    @staticmethod
-    def default_config(m: int, n: int, k: int) -> SkinnyGemmConfig:
-        """vLLM's shape heuristic, used when no measured config is on file."""
-        wide_block = 224
-        if m == 1 and k >= 7168 and k % (wide_block * 8) == 0:
-            if n % 3 == 0:
-                return SkinnyGemmConfig(m, wide_block, 3, 2 if n <= 2304 else 4)
-            if 2304 < n < 4096 and n % 2 == 0:
-                return SkinnyGemmConfig(m, wide_block, 2, k_unroll=4)
-
-        if k <= 2048 or k % (128 * 8) != 0:
-            outputs_per_block = 2 if k <= 2048 else 4
-            if n % outputs_per_block:
-                outputs_per_block = 1
-            if k % (64 * 8) == 0:
-                return SkinnyGemmConfig(m, 64, outputs_per_block, 2)
-            if k % (32 * 8) == 0:
-                return SkinnyGemmConfig(m, 32, outputs_per_block, 2)
-            return SkinnyGemmConfig(m, 32, outputs_per_block, 2, vector_width=4)
-
-        block_size = 64 if 4096 <= n < 8192 else 128
-        outputs_per_block = 1 if m == 1 and n <= 2304 else 2
-        if n % outputs_per_block:
-            outputs_per_block = 1
-        k_unroll = 2 if n <= 2304 or n >= 16384 else 1
-        return SkinnyGemmConfig(m, block_size, outputs_per_block, k_unroll=k_unroll)
-
     def supports(self, config: SkinnyGemmConfig, m: int, n: int, k: int) -> bool:
         """Whether ``config`` can run this shape, without compiling anything."""
         return (

@@ -27,12 +27,15 @@ These check branch coverage and output ownership, not GPU tactic performance.
 from __future__ import annotations
 
 import ast
+import inspect
 import logging
 import sys
+import threading
 import time
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal, get_args
 from unittest.mock import Mock
 
 import pytest
@@ -886,3 +889,113 @@ def test_joint_bf16_restores_previously_routed_shapes(n, k):
         assert api.flashinfer_joint_bf16_supported(
             tensor((m, k)), tensor((n, k)), tensor((m, n))
         )
+
+
+def test_flashinfer_probe_reads_the_declared_backends() -> None:
+    """0.6.18 declares the backend; earlier wheels name every other one."""
+
+    def upstreamed(backend: Literal["cudnn", "cute-dsl"] = "cudnn") -> None: ...
+
+    def earlier(backend: Literal["cudnn", "tgv", "tinygemm"] = "cudnn") -> None: ...
+
+    api = _functions(
+        KERNEL / "ops/gemm/flashinfer.py",
+        None,
+        ("_declares_cute_dsl_backend",),
+        dict(inspect=inspect, get_args=get_args, _CUTE_DSL_BACKEND="cute-dsl"),
+    )
+    assert api._declares_cute_dsl_backend(upstreamed)
+    assert not api._declares_cute_dsl_backend(earlier)
+    assert not api._declares_cute_dsl_backend(lambda: None)
+
+
+@pytest.mark.parametrize(
+    "fi,m,cdna5,k,registered,expected",
+    [
+        (True, 1, False, 128, False, True),
+        (True, 32, False, 128, False, True),
+        (True, 33, False, 128, False, False),
+        (False, 16, True, 1536, True, True),
+        (False, 32, True, 1536, True, True),
+        (False, 16, True, 1536, False, False),
+        (False, 1, True, 128, True, False),
+        (False, 16, False, 1536, True, False),
+    ],
+)
+def test_decode_gemv_eligibility_preserves_fi_and_cdna5(
+    fi, m, cdna5, k, registered, expected
+):
+    fallback = Mock()
+    select = Mock(return_value=Mock() if registered else fallback)
+    tensor = lambda shape: SimpleNamespace(
+        shape=shape,
+        ndim=2,
+        dtype=torch.bfloat16,
+        is_cuda=True,
+        is_contiguous=lambda: True,
+    )
+    api = _functions(
+        KERNEL / "ops/gemm/triton_gemv.py",
+        None,
+        ("use_decode_gemv",),
+        dict(
+            torch=torch,
+            BF16_GEMM_MAX_M=32,
+            flashinfer_joint_bf16_supported=lambda *args: fi,
+            current_platform=lambda: SimpleNamespace(is_cdna5=cdna5),
+            _select=select,
+            torch_decode_gemv=fallback,
+        ),
+    )
+    assert api.use_decode_gemv(tensor((m, k)), tensor((7168, k))) is expected
+    if fi and m <= 32:
+        select.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "capturing,warmed", [(False, False), (True, False), (True, True)]
+)
+@pytest.mark.parametrize("failure", [False, True])
+def test_skinny_add3_preserves_capture_trust(capturing, warmed, failure):
+    key = (0, 1, 4, 8)
+    known = {key} if warmed else set()
+    kernel = Mock(side_effect=RuntimeError("compile failed") if failure else None)
+    kernel.supports.return_value = True
+    fallback = Mock()
+    api = _functions(
+        KERNEL / "ops/gemm/kimi3.py",
+        None,
+        ("_skinny_gemv_add3",),
+        dict(
+            torch=SimpleNamespace(
+                bfloat16=torch.bfloat16,
+                cuda=SimpleNamespace(is_current_stream_capturing=lambda: capturing),
+            ),
+            _SKINNY_ADD3_CONFIGS={(1, 4, 8): (64, 4, 2)},
+            _skinny_add3_arch_supported=lambda dev: True,
+            _skinny_add3_warmed=known,
+            _skinny_add3_warmed_lock=threading.Lock(),
+            _skinny_add3_fallback=fallback,
+            SkinnyGemmConfig=lambda *args: args,
+            shape_dynamic_skinny_gemm=kernel,
+        ),
+    )
+    x, w = torch.empty(1, 8, dtype=torch.bfloat16), torch.empty(
+        4, 8, dtype=torch.bfloat16
+    )
+    a, c = torch.empty(1, 4, dtype=torch.bfloat16), torch.empty(
+        1, 4, dtype=torch.bfloat16
+    )
+    if capturing and not warmed:
+        assert api._skinny_gemv_add3(x, w, a, c, None) is fallback.return_value
+        kernel.assert_not_called()
+        assert not known
+    elif failure:
+        with pytest.raises(RuntimeError, match="compile failed"):
+            api._skinny_gemv_add3(x, w, a, c, None)
+        assert known == ({key} if warmed else set())
+    else:
+        assert api._skinny_gemv_add3(x, w, a, c, None) is kernel.return_value
+        kernel.assert_called_once()
+        fallback.assert_not_called()
+        assert key in known
