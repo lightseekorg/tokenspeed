@@ -1,4 +1,4 @@
-"""Dense FP8 (128,128) load-time scale preparation for FlashInfer."""
+"""Dense FP8 (128,128) preparation and dispatch for selectable backends."""
 
 from __future__ import annotations
 
@@ -55,7 +55,13 @@ def test_process_weights_prepares_and_uses_native_scales(
 
     method.process_weights_after_loading(layer)
 
-    assert method.prepared_linear_plan(layer) is not None
+    plan = method.prepared_linear_plan(layer)
+    assert plan is not None
+    expected_override = {
+        "auto": "flashinfer_mm_fp8_blockscale",
+        "trtllm_cutedsl": "trtllm_cutedsl_mm_fp8_blockscale",
+    }
+    assert plan.override == expected_override[backend]
     assert torch.equal(layer.weight_scale_inv, canonical_scales)
 
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
