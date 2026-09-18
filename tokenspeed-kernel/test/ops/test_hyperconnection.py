@@ -540,6 +540,8 @@ def test_grouped_gemma_rmsnorm_validates_out_for_zero_rows() -> None:
         (8, True, "triton_hyperconnection_mix"),
         (4, False, "cute_fused_hyperconnection_mix"),
         (16, True, "cute_fused_hyperconnection_mix"),
+        (33, True, "cute_fused_hyperconnection_mix"),
+        (1024, True, "cute_fused_hyperconnection_mix"),
     ],
 )
 def test_hc_full_chain_cuda_graph_replays(
@@ -689,6 +691,10 @@ def _publish_mix_inputs_kernel(
         (4, torch.bfloat16, True, "cute_fused", False, 0.25),
         (1, torch.float16, False, "cute_fused", True, 0.25),
         (16, torch.bfloat16, True, "cute_fused", True, 0.25),
+        (33, torch.bfloat16, True, "cute_fused", False, 0.25),
+        (33, torch.bfloat16, True, "cute_fused", True, 0.25),
+        (1024, torch.bfloat16, True, "cute_fused", False, 0.25),
+        (1024, torch.bfloat16, True, "cute_fused", True, 0.25),
     ],
 )
 def test_mix_prefetch_observes_pdl_producer_updates(
@@ -792,7 +798,7 @@ def test_fused_cute_dispatch_requires_explicit_weight_contract(
     )
     expected_name = (
         "cute_fused_hyperconnection_mix"
-        if weights_independent and rows <= 16
+        if weights_independent
         else "triton_hyperconnection_mix"
     )
     assert capture._records[-1].kernel_name == expected_name
@@ -888,7 +894,10 @@ def test_fused_cute_graphs_share_only_stream_private_generations(has_inject):
     torch.cuda.synchronize()
     for results, refs, counter in zip(outputs, expected, counters):
         torch.testing.assert_close(results, refs, rtol=0.04, atol=0.04)
-        assert counter.cpu().tolist() == [generation + 15] * clusters
+        assert counter[:clusters].cpu().tolist() == [generation + 15] * clusters
+        # Single-microtile invocations do not recycle their slot, so the
+        # separate consumer-completion epochs remain untouched.
+        assert counter[clusters:].cpu().tolist() == [generation] * clusters
 
 
 @pytest.mark.parametrize(("rows", "dtype"), [(4, torch.bfloat16), (16, torch.float16)])
@@ -922,7 +931,7 @@ def test_fused_cluster_split_k_does_not_exceed_sixteen():
     _require_fused_hc()
     from tokenspeed_kernel.thirdparty.cute_dsl.hc_fused import FusedGatedResidualKernel
 
-    with pytest.raises(ValueError, match="split-K=16"):
+    with pytest.raises(ValueError, match="split-K"):
         FusedGatedResidualKernel(4, 324, 32, True, 1.0, True)
 
 
@@ -943,19 +952,23 @@ def test_fused_down_consumes_every_k128_stage_on_graph_replay(
 
     _require_fused_hc()
 
-    class StagedKernel(cute_fused.FusedGatedResidualKernel):
-        def __init__(
-            self, rows, projection_rows, split_k, use_pdl, scale, weights_independent
-        ):
-            super().__init__(
-                rows, projection_rows, split_k, use_pdl, scale, weights_independent
-            )
-            self.down_stages = down_stages
-
     # Two buffers must recycle and wrap their phases while consuming all five
     # K128 tiles; five buffers must consume the same data without recycling.
     # Isolate compilation because the public dispatch key fixes the tactic.
-    monkeypatch.setattr(cute_fused, "FusedGatedResidualKernel", StagedKernel)
+    monkeypatch.setattr(
+        cute_fused,
+        "_tactic",
+        lambda rows, projection_rows: (
+            16,
+            64,
+            8 if rows <= 8 else 16,
+            1,
+            1,
+            down_stages,
+            32,
+        ),
+    )
+    monkeypatch.setattr(cute_fused, "_PLANS", {})
     monkeypatch.setattr(cute_fused, "_COMPILED", {})
     x, w, u = _inputs(rows, dtype, seed=6023 + rows)
     if not has_inject:
@@ -1063,5 +1076,6 @@ def test_fused_distributed_reduce_applies_activation_after_complete_sum(
     tolerance = 0.04 if dtype == torch.bfloat16 else 0.008
     torch.testing.assert_close(actual[0], expected[0], rtol=tolerance, atol=tolerance)
     torch.testing.assert_close(actual[1], expected[1], rtol=0.0, atol=0.0)
-    assert epochs.numel() == (w.shape[0] + 63) // 64
-    assert len(set(epochs.cpu().tolist())) == 1
+    assert epochs.numel() == 2 * ((w.shape[0] + 63) // 64)
+    clusters = (w.shape[0] + 63) // 64
+    assert len(set(epochs[:clusters].cpu().tolist())) == 1

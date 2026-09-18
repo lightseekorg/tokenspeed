@@ -40,6 +40,7 @@ def fused_inputs(monkeypatch):
         pytest.skip("requires six resident Blackwell clusters and CuTe")
     monkeypatch.setattr(cute_fused, "_WORKSPACES", {})
     monkeypatch.setattr(cute_fused, "_COMPILED", {})
+    monkeypatch.setattr(cute_fused, "_PLANS", {})
     generator = torch.Generator(device="cuda").manual_seed(719)
     return tuple(
         torch.randn(shape, device="cuda", dtype=torch.bfloat16, generator=generator)
