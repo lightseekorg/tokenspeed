@@ -179,7 +179,14 @@ def test_prepared_plan_takes_the_prepacked_path(device: str, m: int) -> None:
     )
 
     plan = prepare_fp8_linear(weight, weight_scales, [128, 128])
-    planned = fp8_linear(plan, x, weight, weight_scales, out_dtype=torch.bfloat16)
+    planned = fp8_linear(
+        plan,
+        x,
+        weight,
+        weight_scales,
+        out_dtype=torch.bfloat16,
+        out=None,
+    )
     prepacked = mm(
         x,
         weight,
@@ -191,6 +198,37 @@ def test_prepared_plan_takes_the_prepacked_path(device: str, m: int) -> None:
         prepacked_scales=True,
     )
     torch.testing.assert_close(planned, prepacked, atol=0, rtol=0)
+
+    # Exercise direct destinations and the padded/strided copy fallback with
+    # canaries: a padded kernel must never overwrite the caller's next row.
+    for stride in (1, 2):
+        storage = torch.full((m + 1, n * stride), 7, device=device, dtype=x.dtype)
+        destination = storage[:m, :n]
+
+        def run_into():
+            return fp8_linear(
+                plan,
+                x,
+                weight,
+                weight_scales,
+                input_scales=None,
+                bias=None,
+                out_dtype=x.dtype,
+                out=destination,
+            )
+
+        result = run_into()
+        assert result.data_ptr() == destination.data_ptr()
+        torch.testing.assert_close(result, planned, atol=0, rtol=0)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run_into()
+        graph.replay()
+        torch.testing.assert_close(destination, planned, atol=0, rtol=0)
+        assert torch.all(storage[m] == 7)
+        if stride == 2:
+            assert torch.all(storage[:m, n:] == 7)
 
 
 def test_prepared_plan_falls_back_above_the_padding_threshold(device: str) -> None:
@@ -204,7 +242,14 @@ def test_prepared_plan_falls_back_above_the_padding_threshold(device: str) -> No
     )
 
     plan = prepare_fp8_linear(weight, weight_scales, [128, 128])
-    planned = fp8_linear(plan, x, weight, weight_scales, out_dtype=torch.bfloat16)
+    planned = fp8_linear(
+        plan,
+        x,
+        weight,
+        weight_scales,
+        out_dtype=torch.bfloat16,
+        out=None,
+    )
     canonical = mm(
         x,
         weight,
@@ -230,7 +275,14 @@ def test_prepared_plan_is_exact_for_partial_row_tiles(device: str, m: int) -> No
     )
 
     plan = prepare_fp8_linear(weight, weight_scales, [128, 128])
-    got = fp8_linear(plan, x, weight, weight_scales, out_dtype=torch.bfloat16)
+    got = fp8_linear(
+        plan,
+        x,
+        weight,
+        weight_scales,
+        out_dtype=torch.bfloat16,
+        out=None,
+    )
 
     # Compare against the exact product of the quantized operands.
     quantized_x, activation_scales = flashinfer_fp8_blockscale_quantize_prepacked(x)

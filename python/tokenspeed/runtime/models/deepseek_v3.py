@@ -584,7 +584,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             tp_group=self.mapping.attn.tp_group,
         )
         # O projection.
-        self.o_proj = RowParallelLinear(
+        self.o_proj = self._make_output_projection(
             self.num_heads * self.v_head_dim,
             self.hidden_size,
             bias=False,
@@ -642,6 +642,38 @@ class DeepseekV3AttentionMLA(nn.Module):
 
         self.w_kc = None
         self.w_vc = None
+
+    def _make_output_projection(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        bias: bool,
+        reduce_results: bool,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+        tp_rank: int,
+        tp_size: int,
+        tp_group: tuple[int, ...],
+    ) -> RowParallelLinear:
+        """Construct the output linear; subclasses may give it a separate TP group."""
+        return RowParallelLinear(
+            input_size,
+            output_size,
+            bias=bias,
+            reduce_results=reduce_results,
+            quant_config=quant_config,
+            prefix=prefix,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            tp_group=tp_group,
+            input_is_parallel=True,
+            skip_bias_add=False,
+            params_dtype=None,
+            use_presharded_weights=False,
+            override_kernel_name=None,
+            interleave_linear_and_gate=False,
+        )
 
     def forward(
         self,

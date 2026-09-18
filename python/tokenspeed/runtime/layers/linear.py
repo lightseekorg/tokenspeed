@@ -1266,6 +1266,17 @@ class RowParallelLinear(LinearBase):
         return None
 
     def forward(self, input_, scale=None):
+        return self._forward_into(input_, scale, None)
+
+    def forward_into(self, input_, scale, out):
+        """Project into caller-owned storage; unsupported methods copy the result.
+
+        Shares input sharding, bias handling and reduction with ordinary forward.
+        Communication consumers may supply persistent symmetric GEMM storage.
+        """
+        return self._forward_into(input_, scale, out)
+
+    def _forward_into(self, input_, scale, out):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1280,7 +1291,16 @@ class RowParallelLinear(LinearBase):
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
 
-        if scale is not None:
+        if out is not None and hasattr(self.quant_method, "apply_into"):
+            output_parallel = self.quant_method.apply_into(
+                self,
+                input_parallel,
+                bias_,
+                scale,
+                torch.bfloat16 if scale is not None else input_parallel.dtype,
+                out,
+            )
+        elif scale is not None:
             output_parallel = self.quant_method.apply(
                 self, input_parallel, bias_, scale, torch.bfloat16
             )
@@ -1293,6 +1313,9 @@ class RowParallelLinear(LinearBase):
 
         output_bias = self.bias if self.skip_bias_add else None
 
+        if out is not None and output is not out:
+            out.copy_(output)
+            output = out
         return output, output_bias
 
     def forward_with_activation(

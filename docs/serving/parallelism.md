@@ -103,6 +103,14 @@ Select the transport with `--all2all-backend`:
 Both transports quantize NVFP4 activations before dispatch and transfer their
 block scales alongside the routing IDs and weights. Combine outputs remain BF16.
 
+Kimi-K3 can independently shard KDA/MLA output projections with
+`TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE` (unset or `1` preserves existing behavior).
+For DEP16, `4` redistributes attention outputs within four-rank subgroups,
+projects input-channel shards, and reduce-scatters complete outputs back to
+their original token owners before AttnRes and MoE. Attention and caches remain
+TP1/DP16; MoE remains EP16. See the
+[DEP16/projection-TP4 runbook](../recipes/kimi-k3-dep-o-proj-tp.md).
+
 ### DeepEP all-to-all
 
 `--all2all-backend deepep` moves expert routing off all-gather and onto DeepEP

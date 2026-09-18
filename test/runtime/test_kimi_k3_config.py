@@ -739,6 +739,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             out=down_out,
         )
 
+    @mock.patch.dict(os.environ, {"TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE": "1"})
     def test_kda_stacks_qkvfab_projection_weights(self):
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearKDA
 
@@ -761,6 +762,9 @@ class KimiK3RegistrationTests(unittest.TestCase):
             attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
             linear_attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
         )
+        # Projection mapping also needs the global single-rank topology.
+        mapping.rank = 0
+        mapping.world_size = 1
         layer = KimiLinearKDA(config, mapping, layer_id=0)
 
         self.assertEqual(tuple(layer.qkvgb_proj.weight.shape), (288, 64))
@@ -808,6 +812,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             gate.untyped_storage().data_ptr(),
         )
 
+    @mock.patch.dict(os.environ, {"TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE": "1"})
     def test_kda_compacts_prefill_qkv_before_backend_break(self):
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearKDA
@@ -831,6 +836,9 @@ class KimiK3RegistrationTests(unittest.TestCase):
             attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
             linear_attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
         )
+        # Projection mapping also needs the global single-rank topology.
+        mapping.rank = 0
+        mapping.world_size = 1
         layer = KimiLinearKDA(config, mapping, layer_id=0)
         rows, projection_width = 4, 64
         packed = torch.randn(rows, 288, dtype=torch.bfloat16)

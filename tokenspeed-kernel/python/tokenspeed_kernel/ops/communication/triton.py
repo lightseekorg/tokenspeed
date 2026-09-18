@@ -31,7 +31,76 @@ from tokenspeed_kernel.platform import current_platform
 
 logger = logging.getLogger(__file__)
 
+
+@triton.jit
+def _pack_channel_shards_for_a2a_kernel(
+    source,
+    destination,
+    N: tl.constexpr,
+    M: tl.constexpr,
+    D: tl.constexpr,
+    P: tl.constexpr,
+    S0: tl.constexpr,
+    S1: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    peer = offsets // (M * D)
+    row = offsets // D % M
+    column = peer * D + offsets % D
+    values = tl.load(
+        source + row * S0 + column * S1, (offsets < P * M * D) & (row < N), other=0
+    )
+    tl.store(destination + offsets, values, offsets < P * M * D)
+
+
+def triton_pack_channel_shards_for_a2a(
+    inputs: torch.Tensor, workspace: torch.Tensor
+) -> torch.Tensor:
+    """Split channels across peers and zero-pad destination-rank-major A2A messages.
+
+    Args:
+        inputs: Local ``[N, P*D]`` rows; arbitrary positive strides are allowed.
+        workspace: Contiguous ``[P, M, D]`` persistent scratch, with ``M >= N``.
+            When used, every element is overwritten, including zero padding.
+
+    Returns:
+        Contiguous ``[P*M, D]`` send rows. For one contiguous input row and
+        ``M == 1``, this aliases inputs without launching a kernel. Otherwise
+        it aliases workspace. Neither case changes dtype or quantization.
+    """
+    if inputs.ndim != 2 or workspace.ndim != 3:
+        raise ValueError("Channel-shard A2A packing expects [N,K] and [P,M,D]")
+    peers, rows, shard = workspace.shape
+    if (
+        peers < 1
+        or rows < 1
+        or shard < 1
+        or inputs.shape[0] > rows
+        or inputs.shape[1] != peers * shard
+        or not workspace.is_contiguous()
+        or inputs.dtype != workspace.dtype
+        or inputs.device != workspace.device
+    ):
+        raise ValueError("Incompatible channel-shard A2A packing workspace")
+    if rows == 1 and inputs.shape[0] == 1 and inputs.is_contiguous():
+        return inputs.view(peers, shard)
+    _pack_channel_shards_for_a2a_kernel[(triton.cdiv(workspace.numel(), 1024),)](
+        inputs,
+        workspace,
+        inputs.shape[0],
+        rows,
+        shard,
+        peers,
+        inputs.stride(0),
+        inputs.stride(1),
+        1024,
+    )
+    return workspace.view(peers * rows, shard)
+
+
 __all__ = [
+    "triton_pack_channel_shards_for_a2a",
     "create_state",
     "get_token_dist",
     "reduce_scatter",

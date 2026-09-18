@@ -25,9 +25,56 @@ from typing import List, Tuple
 import torch
 from tokenspeed_kernel.ops.communication.fabric import group_has_fabric
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import register_kernel
+from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.thirdparty.flashinfer.moe_alltoall import FlashInferMoeAlltoAll
+from tokenspeed_kernel.thirdparty.flashinfer.projection_alltoall import (
+    create_projection_a2a as create_projection_a2a,
+)
+from tokenspeed_kernel.thirdparty.flashinfer.projection_alltoall import (
+    flashinfer_projection_a2a as _flashinfer_projection_a2a,
+)
+from tokenspeed_kernel.thirdparty.flashinfer.projection_alltoall import (
+    prepare_borrowed_projection_a2a as prepare_borrowed_projection_a2a,
+)
+
+
+@register_kernel(
+    "communication",
+    "projection_a2a",
+    name="flashinfer_projection_a2a",
+    solution="flashinfer",
+    signatures=format_signatures(
+        ("inputs",), "dense", {torch.float16, torch.bfloat16, torch.float32}
+    ),
+)
+def flashinfer_projection_a2a(comm, inputs: torch.Tensor) -> torch.Tensor:
+    """Exchange contiguous [N,K] rows into [P*N,K/P] using a prepared NVLink group.
+
+    All peers supply equal positive N. The caller owns communicator lifetime
+    and serializes calls; output token order is source-rank major.
+    """
+    return _flashinfer_projection_a2a(comm, inputs)
+
 
 logger = logging.getLogger(__name__)
+
+
+@register_kernel(
+    "communication",
+    "projection_a2a_borrowed",
+    name="flashinfer_projection_a2a_borrowed",
+    solution="flashinfer",
+    signatures=format_signatures(("inputs",), "dense", {torch.bfloat16}),
+)
+def flashinfer_projection_a2a_borrowed(prepared, inputs: torch.Tensor) -> torch.Tensor:
+    """Return borrowed rank-major [P*N,K/P] rows, consumed before the next exchange.
+
+    Equal positive physical rows and serialized same-stream consumers are
+    required on every peer. IPC allocation and JIT must precede graph capture.
+    """
+    return prepared.exchange(inputs)
+
 
 _custom_allreduce = None
 

@@ -260,16 +260,26 @@ if gemm_fp8_nt_groupwise is not error_fn:
                 orig_m,
                 block_size,
             )
+            # A padded GEMM must not write past the caller's unpadded output.
+            # Aligned projection batches can write straight into communication
+            # scratch; strided or padded destinations retain the copy fallback.
+            direct_out = (
+                out is not None
+                and out.is_contiguous()
+                and out.shape == (A.shape[0], B.shape[0])
+                and orig_m == A.shape[0]
+            )
             output = gemm_fp8_nt_groupwise(
                 A,
                 B,
                 A_scales,
                 B_scales,
                 scale_major_mode="MN",
+                out=out if direct_out else None,
                 out_dtype=out_dtype,
             )
             output = output[:orig_m] if output.shape[0] != orig_m else output
-            if out is not None:
+            if out is not None and not direct_out:
                 out.copy_(output)
                 return out
             return output
