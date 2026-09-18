@@ -1,0 +1,16 @@
+# Experimental Hopper/cu129 recipe. Kernel versions come from the existing
+# CUDA requirements; these constraints select the CUDA 12 runtime stack.
+torch==2.13.0+cu129
+torchvision==0.28.0+cu129
+cuda-toolkit==12.9.1
+cuda-python==12.9.7
+cuda-bindings==12.9.7
+tokenspeed-mooncake==0.3.13.post20260825
+nvidia-cutlass-dsl-libs-cu13<0
+nvidia-cublas<0
+nvidia-cuda-runtime<0
+nvidia-cuda-nvrtc<0
+nvidia-cudnn-cu13<0
+nvidia-nccl-cu13<0
+nvidia-nvshmem-cu13<0
+tokenspeed-cutedsl-kda<0

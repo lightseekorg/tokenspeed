@@ -37,6 +37,16 @@ cd tokenspeed
 
 ## Install Packages
 
+For H100/H200 with CUDA Toolkit 12.9, use the
+[Hopper / CUDA 12.9 source-install recipe](hopper-cu129.md). In an activated
+Python 3.11 environment, run:
+
+```bash
+CUDA_VARIANT=cu129 bash test/ci_system/install_deps.sh
+```
+
+For the default runner environment, follow the package installation steps below.
+
 Install the Python runtime:
 
 ```bash
