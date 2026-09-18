@@ -92,8 +92,9 @@ def _functions(path, owner, names, namespace):
 @pytest.mark.parametrize("speculative", [False, True])
 @pytest.mark.parametrize("disabled", [False, True])
 @pytest.mark.parametrize("failure", [False, True])
+@pytest.mark.parametrize("prefill_only", [False, True])
 def test_startup_uses_native_buckets_without_reading_capture_sizes(
-    chunk_size, speculative, disabled, failure
+    chunk_size, speculative, disabled, failure, prefill_only
 ):
     events = []
     metadata = []
@@ -154,6 +155,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
             pp_size=1,
             disable_autotune=disabled,
             model_is_mrope=False,
+            prefill_only=prefill_only,
         ),
         model_runner=SimpleNamespace(forward=forward),
         input_buffers=SimpleNamespace(
@@ -199,7 +201,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
             ("group", None),
             "scrub",
             ("target", (32 if chunk_size < 0 else chunk_size)),
-            *(["draft"] if speculative else []),
+            *(["draft"] if speculative and not prefill_only else []),
             ("group", None),
             "save",
         ]

@@ -150,8 +150,12 @@ def test_non_yarn_rope_yields_no_scaling() -> None:
 
 
 def test_tap_count_must_match_num_target_layers() -> None:
-    with pytest.raises(ValueError, match="context_proj expects"):
-        validate_k3_dspark_config(make_config(target_layer_ids=[2, 23, 47]))
+    with pytest.raises(
+        ValueError, match="target_layer_ids has 3 entries but num_target_layers=5"
+    ):
+        validate_k3_dspark_config(
+            make_config(target_layer_ids=[2, 23, 47]), target_config=None
+        )
 
 
 def test_taps_must_be_ascending() -> None:
@@ -362,3 +366,47 @@ def test_every_remaining_checkpoint_key_has_a_destination() -> None:
         routed.add(target)
 
     assert routed == expected_params
+
+
+@pytest.mark.parametrize(
+    "stream,layer,expected",
+    [
+        ("prefix", 2, 2),
+        ("prefix", 7, 7),
+        ("attn_res", 2, 3),
+        ("attn_res", 7, 7),
+    ],
+)
+def test_k3_tap_ownership_matches_the_stream_producer(stream, layer, expected):
+    assert dspark_model_module._context_tap_owner_layer(layer, 8, stream) == expected
+
+
+@pytest.mark.parametrize("capture_idx", [0, 2])
+@pytest.mark.parametrize("with_norm", [False, True])
+def test_k3_per_tap_projection_uses_local_checkpoint_columns(capture_idx, with_norm):
+    model = K3DSparkModel.__new__(K3DSparkModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(target_hidden_size=3)
+    model.local_tap_indices = (0, 2)
+    model.context_proj = torch.nn.Linear(6, 4, bias=False)
+    model.context_proj.weight.data.copy_(torch.arange(24).reshape(4, 6) / 24)
+    model.fc_norm = (
+        torch.nn.ModuleList([torch.nn.RMSNorm(3, eps=1e-5) for _ in range(2)])
+        if with_norm
+        else None
+    )
+    hidden = torch.tensor([[1.0, 2.0, 4.0], [3.0, -1.0, 2.0]])
+    local_idx = (0, 2).index(capture_idx)
+    reference = hidden
+    if with_norm:
+        for index, norm in enumerate(model.fc_norm):
+            norm.weight.data.copy_(torch.arange(3) + index + 1)
+        reference = torch.nn.functional.rms_norm(
+            hidden, (3,), model.fc_norm[local_idx].weight, 1e-5
+        )
+    expected = torch.nn.functional.linear(
+        reference, model.context_proj.weight[:, local_idx * 3 : (local_idx + 1) * 3]
+    )
+    torch.testing.assert_close(model.project_target_tap(capture_idx, hidden), expected)
+    with pytest.raises(ValueError):
+        model.project_target_tap(1, hidden)

@@ -87,7 +87,8 @@ under MoE TP4 is padded from 160 to 192 values per rank.
 
 ### Kimi-K3 attention DP with MoE EP
 
-When attention DP is greater than one, Kimi-K3 requires
+With `none`, `agrs`, or `flashinfer` transport and attention DP greater than one,
+Kimi-K3 requires
 `attention DP == MoE EP == world size`. Shared experts and latent projections
 are replicated; only the routed experts require dispatch/combine communication.
 
@@ -98,21 +99,43 @@ Select the transport with `--all2all-backend`:
 - `agrs`: use reference all-gather dispatch and reduce-scatter combine.
 - `flashinfer`: use FlashInfer MNNVL all-to-all; errors without the required
   CUDA fabric.
-- `deepep`: unsupported for this K3 path.
+- `deepep`: Hopper Marlin supports attention TP combined with DP and pipeline
+  parallelism. It requires attention CP=1, MoE TP=1/DP=1, and
+  `MoE EP == attention TP * attention DP` within each pipeline stage. DeepEP
+  owns routed dispatch/combine; shared experts stay in the attention TP group.
+  The construction-selected `KimiLinearMoEDeepEP` keeps this token ownership
+  and its projection/shared-expert weight placement in one module.
+  See [Kimi-K3 Hopper PD](../guides/kimi-k3-hopper-pd.md) for deployment layouts.
 
 For NVIDIA NVFP4 checkpoints, `--moe-backend mega_moe` replaces routed
 dispatch, SiTU expert computation, and combine with MegaMoE. It requires
 `--all2all-backend none`, keeps routing weights after FC2, and returns BF16 outputs.
 
-Both transports quantize NVFP4 activations before dispatch and transfer their
+The AG/RS and FlashInfer transports quantize NVFP4 activations before dispatch and transfer their
 block scales alongside the routing IDs and weights. Combine outputs remain BF16.
 
 ### DeepEP all-to-all
 
 `--all2all-backend deepep` moves expert routing off all-gather and onto DeepEP
 dispatch/combine. It requires a MoE backend whose kernels own those legs:
-`--moe-backend deep_gemm` (block-scale FP8) or `--moe-backend flashinfer_cutedsl`
-(nvfp4, decode-shaped batches only).
+`--moe-backend deep_gemm` (block-scale FP8), `--moe-backend flashinfer_cutedsl`
+(nvfp4, decode-shaped batches only), or `--moe-backend marlin` (MXFP4 W4A16
+with BF16 activations, normal and low-latency legs). K3 on Hopper uses the
+Marlin bridge with disjoint TP token slices; its shared experts and restored
+output stay within each attention-TP group. See the
+[K3 Hopper PD guide](../guides/kimi-k3-hopper-pd.md) for PP4/TP8/EP8 prefill
+and DP4/TP8/EP32 decode.
+
+All DeepEP MoE plans reserve their persistent communication buffer during the
+common `moe_process_weights` call, after backend weight preprocessing and before
+KV cache memory profiling. This applies to Marlin, DeepGEMM and FlashInfer;
+non-DeepEP plans do not initialize DeepEP. The input hidden width and global
+expert count come from the MoE module's declared geometry, never inferred from
+packed weights. Dispatchers retain their backend-specific execution settings
+and reuse the prepared buffer. Compatible layers share the process-wide buffer;
+incompatible geometry, mode or capacity fails through the same reuse checks as
+runtime acquisition. The capacity remains the explicit server setting (256 by
+default), with no model-name-based sizing in `ModelRunner`.
 
 DeepEP has two sets of legs, and `--deepep-mode` picks between them:
 
@@ -132,7 +155,7 @@ prefill, must fit `--low-latency-max-num-tokens-per-gpu`.
 
 A batch above the low-latency capacity is rejected rather than truncated, so
 raise `--low-latency-max-num-tokens-per-gpu` if decode plus speculative draft
-tokens exceed it. Both current DeepEP MoE backends require BF16 activations;
+tokens exceed it. All current DeepEP MoE backends require BF16 activations;
 `--dtype float16` is not supported.
 
 The mode is chosen per forward from a value every rank agrees on, because the two

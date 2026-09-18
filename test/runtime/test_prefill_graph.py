@@ -151,6 +151,7 @@ class PrefillCaptureArgsTest(unittest.TestCase):
             max_cudagraph_capture_size=4,
             model_is_mrope=False,
             autotune_cache_key=None,
+            prefill_only=False,
         )
         with self.assertRaisesRegex(TypeError, "prefill_graph_capture_batch_sizes"):
             ModelExecutorConfig(**config_args)

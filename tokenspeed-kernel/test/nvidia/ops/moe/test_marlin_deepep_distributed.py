@@ -42,6 +42,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from kimi3_reference import mxfp4_moe_reference
+from tokenspeed_kernel.ops.communication.deep_ep import DeepEPBuffer
 from utils import make_mxfp4_moe_weights
 
 
@@ -120,6 +121,7 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
     module.w13_weight_scale = torch.nn.Parameter(raw["w13_scale"][lo:hi].clone(), False)
     module.w2_weight = torch.nn.Parameter(raw["w2_weight"][lo:hi].clone(), False)
     module.w2_weight_scale = torch.nn.Parameter(raw["w2_scale"][lo:hi].clone(), False)
+    module.hidden_size = hidden_size
     module.top_k = top_k
     module.num_experts = num_experts
     module.num_local_experts = num_local
@@ -148,6 +150,8 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
     )
     assert plan["apply_kernel_name"] == "marlin_mxfp4_deepep_moe_apply"
     tokenspeed_kernel.moe_process_weights(plan, module)
+    prepared_buffer = DeepEPBuffer._buffer
+    assert prepared_buffer is not None
 
     actual = tokenspeed_kernel.moe_apply(
         plan,
@@ -159,5 +163,6 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
         low_latency=(mode == "low_latency"),
     )
 
+    assert DeepEPBuffer._buffer is prepared_buffer
     torch.testing.assert_close(actual.float(), expected.float(), atol=5e-2, rtol=5e-2)
     dist.barrier()

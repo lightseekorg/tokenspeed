@@ -78,7 +78,9 @@ class TestInstantTensorWeights(unittest.TestCase):
             self.assertGreater(len(safetensors_files), 0)
 
             instanttensor_tensors = {}
-            for name, tensor in instanttensor_weights_iterator(safetensors_files):
+            for name, tensor in instanttensor_weights_iterator(
+                safetensors_files, process_group=None
+            ):
                 # Copy immediately in case InstantTensor exposes internal buffers.
                 instanttensor_tensors[name] = tensor.to("cpu")
 
@@ -156,7 +158,7 @@ class TestInstantTensorRejectsSubByteCheckpoints(unittest.TestCase):
 
             # Validating on the first ``next()`` would defer this past alloc.
             with self.assertRaises(ValueError) as caught:
-                instanttensor_weights_iterator([shard])
+                instanttensor_weights_iterator([shard], process_group=None)
             self.assertIn("F4", str(caught.exception))
 
 

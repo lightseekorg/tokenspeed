@@ -446,6 +446,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
             prefix=prefix,
         )
         self.solution = solution
+        self.register_buffer("_nvfp4_output_scale", None, persistent=False)
 
     def weight_loader(self, param, loaded_weight, shard_id=None, begin_size=None):
         """Take this rank's column block; replicated instances load full width."""
@@ -560,10 +561,31 @@ class Kimi3LatentProjection(ReplicatedLinear):
         rows = self.multicast_down.shard_dim
         return self.weight[self.shard_rank * rows : (self.shard_rank + 1) * rows]
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, None]:
+    def prepare_nvfp4_output(self, output_scale: torch.Tensor) -> None:
+        """Prepare fused NVFP4 output using the expert's loaded encoding scale.
+
+        Unsupported mailboxes retain BF16 output for the expert to quantize.
+        Preparation must finish before CUDA graph capture.
+        """
+        if self.multicast_down is None or not self.multicast_down.nvfp4_available():
+            return
+        self.multicast_down.prepare_nvfp4()
+        self._nvfp4_output_scale = output_scale.detach()
+
+    def forward(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], None]:
+        """Return (BF16 latent or packed NVFP4 values/scales, None)."""
         num_tokens = hidden_states.shape[0]
         if self.multicast_down is not None and self.multicast_down.handles(num_tokens):
-            return self.multicast_down(hidden_states, self._multicast_block()), None
+            return (
+                self.multicast_down(
+                    hidden_states,
+                    self._multicast_block(),
+                    output_scale=self._nvfp4_output_scale,
+                ),
+                None,
+            )
         if self.narrowed and self.column_group is not None:
             return self._gather_shards(self.project_shard(hidden_states)), None
         return self._gather_shards(self._project_replicated(hidden_states)), None

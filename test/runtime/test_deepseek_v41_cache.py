@@ -1216,6 +1216,8 @@ def test_pd_contract_plan_and_manifest():
         decode_tp_size=2,
         prefill_layout=contract,
         decode_layout=contract,
+        # A single-stage prefill owns every field.
+        prefill_field_ids=None,
     )
     for decode_rank, source in ((0, 0), (1, 2)):
         plan = planner.plan_for_decode_rank(decode_rank)

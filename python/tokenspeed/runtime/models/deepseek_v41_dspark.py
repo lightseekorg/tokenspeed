@@ -56,6 +56,7 @@ from tokenspeed.runtime.models.deepseek_v41 import (
     v41_mxfp8_config,
     v41_quantize_fp8,
 )
+from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.utils import add_prefix
 
 
@@ -313,8 +314,13 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         )
 
 
-class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM):
+class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigurator):
     """Strict mtp-only adapter sharing embedding/head with its V4.1 target."""
+
+    def configure_target(self, target_model, target_config) -> None:
+        """Install the checkpoint's target taps before draft execution exists."""
+        del target_config
+        target_model.set_dspark_layers_to_capture(list(self.model.target_layer_ids))
 
     def __init__(self, config, mapping, quant_config):
         super().__init__(

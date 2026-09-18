@@ -40,6 +40,8 @@ def _logger(**overrides) -> BatchLogger:
         num_total_pages=100,
         spec_num_steps=0,
         spec_num_tokens=0,
+        dp_rank=2,
+        pd_lifecycle=None,
     )
     kwargs.update(overrides)
     return BatchLogger(**kwargs)
@@ -73,8 +75,8 @@ def test_extend_round_counts_cached_tokens_once_per_request():
         # cached-token news a second time.
         logger.log_dispatch(op, STATS)
 
-    assert log.call_args_list[0].args[1:] == ("Prefill", 2, 30, 10, 2, 7)
-    assert log.call_args_list[1].args[1:] == ("Prefill", 2, 30, 0, 2, 7)
+    assert log.call_args_list[0].args[1:] == ("Prefill", 2, 2, 30, 10, 2, 7, "")
+    assert log.call_args_list[1].args[1:] == ("Prefill", 2, 2, 30, 0, 2, 7, "")
 
 
 def test_mixed_round_is_labelled_mix():
@@ -100,9 +102,10 @@ def test_decode_rounds_log_once_per_interval_with_committed_throughput():
     # Rounds 1 and 2 are throttled; round 3 prints the window.
     log.assert_called_once()
     args = log.call_args.args
-    assert args[1:5] == (2, 40, 15, 100)  # running-req, pages active/cached/total
-    assert args[5] == 0.4  # page ratio
-    assert args[6] > 0  # gen throughput over the window
+    # dp-rank, running-req, pages active/cached/total
+    assert args[1:6] == (2, 2, 40, 15, 100)
+    assert args[6] == 0.4  # page ratio
+    assert args[7] > 0  # gen throughput over the window
 
 
 def test_state_group_pages_ride_the_decode_line_at_debug():
@@ -125,7 +128,7 @@ def test_state_group_pages_ride_the_decode_line_at_debug():
             logger.log_dispatch(_decode_op(2), STATS)
 
     assert queried == ["state_a", "state_b"]
-    assert debug.call_args.args[1] == (
+    assert debug.call_args.args[2] == (
         "state_a: used=6/10, available=4; state_b: used=0/8, available=8"
     )
 
@@ -167,7 +170,8 @@ def test_step_acceptance_log_separates_committed_and_draft_tokens():
         logger.record_decode(result, bs=3)
 
     log.assert_called_once_with(
-        "Spec verify step. accept_lengths=%s, accepted_draft_tokens=%s",
+        "Spec verify step. #dp-rank: %s, accept_lengths=%s, accepted_draft_tokens=%s",
+        2,
         [1, 3, 8],
         [0, 2, 7],
     )
@@ -188,9 +192,38 @@ def test_step_token_log_aligns_drafts_with_predecessor_target_logits():
         logger.record_decode(result, bs=1)
 
     assert log.call_args_list[1] == mock.call(
-        "Spec token compare. anchor=%s, draft=%s, target=%s, match=%s",
+        "Spec token compare. #dp-rank: %s, anchor=%s, draft=%s, target=%s, match=%s",
+        2,
         [10],
         [[11, 12, 13]],
         [[11, 12, 99]],
         [[True, True, False]],
     )
+
+
+def test_pd_lifecycle_counts_are_read_only_when_a_line_is_emitted():
+    reads = []
+
+    def lifecycle():
+        reads.append(True)
+        return (3, 5, 4, 2, 4)
+
+    logger = _logger(pd_lifecycle=lifecycle)
+    with mock.patch.object(batch_log_module.logger, "info") as log:
+        # Decode rounds 1 and 2 are throttled: no line, no scheduler reads.
+        logger.log_dispatch(_decode_op(2), STATS)
+        assert reads == []
+        logger.log_dispatch(_decode_op(2), STATS)
+
+    assert len(reads) == 1
+    assert log.call_args.args[-1] == (
+        ", #req-state(bootstrap/prefill/remote-prefill/decode/pd-pinned): 3/5/4/2/4"
+    )
+
+
+def test_a_fused_engine_appends_no_lifecycle_counts():
+    logger = _logger(pd_lifecycle=None)
+    with mock.patch.object(batch_log_module.logger, "info") as log:
+        logger.log_dispatch(_extend_op(["a"], 1, [10], [0]), STATS)
+
+    assert log.call_args.args[-1] == ""

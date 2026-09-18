@@ -63,15 +63,6 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 
-def _resolve_aux_hidden_stream(cfg) -> str:
-    """Read the target residual stream from the draft config."""
-    dflash_cfg = getattr(cfg, "dflash_config", {}) or {}
-    stream = dflash_cfg.get("aux_hidden_stream") or getattr(
-        cfg, "aux_hidden_stream", None
-    )
-    return str(stream or "prefix").lower()
-
-
 def _resolve_block_geometry(
     cfg, spec_num_tokens: int, spec_algorithm: str
 ) -> tuple[int, int]:
@@ -155,14 +146,8 @@ class DFlash(BaseDrafter):
 
         cfg = self.model.config
         dflash_cfg = getattr(cfg, "dflash_config", {}) or {}
-        target_layer_ids = dflash_cfg.get("target_layer_ids") or getattr(
-            cfg, "target_layer_ids", None
-        )
-        self.target_layer_ids = [int(x) for x in (target_layer_ids or [])]
-        if not self.target_layer_ids:
-            raise ValueError(
-                "DFLASH draft config must define dflash_config.target_layer_ids."
-            )
+        # The draft model resolved its checkpoint's taps once, for setup.
+        self.target_layer_ids = list(self.model.target_layer_ids)
         mask_token_id = dflash_cfg.get("mask_token_id")
         if mask_token_id is None:
             mask_token_id = getattr(cfg, "mask_token_id", None)
@@ -278,32 +263,17 @@ class DFlash(BaseDrafter):
         )
 
     def wire_target(self, target_model) -> None:
+        """Bind execution resources without changing model capture configuration."""
         language_model = getattr(target_model, "language_model", target_model)
         self.target_model = target_model
         self.target_language_model = language_model
+        # Setup may provide a local draft embedding when the target's embedding
+        # lives on another stage. Resource availability determines the binding.
         self.embed_tokens = target_model.get_input_embeddings()
+        if self.embed_tokens is None:
+            self.embed_tokens = self.model.embed_tokens
         self.lm_head = target_model.lm_head
         self.logits_processor = language_model.logits_processor
-        if not hasattr(target_model, "set_dflash_layers_to_capture"):
-            raise ValueError(
-                "DFLASH requires the target model to support "
-                "set_dflash_layers_to_capture."
-            )
-        target_model.set_dflash_layers_to_capture(self.target_layer_ids)
-        self._wire_aux_hidden_stream(target_model)
-
-    def _wire_aux_hidden_stream(self, target_model) -> None:
-        """Tell the target which residual stream the draft was trained on."""
-        stream = _resolve_aux_hidden_stream(self.model.config)
-        setter = getattr(target_model, "set_dflash_aux_hidden_stream", None)
-        if setter is not None:
-            setter(stream)
-        elif stream != "prefix":
-            raise ValueError(
-                f"The draft asks for the {stream!r} target hidden stream but "
-                f"{type(target_model).__name__} does not implement "
-                "set_dflash_aux_hidden_stream, so it can only supply 'prefix'."
-            )
 
     def _probe_dist_argmax_state(self, dtype: torch.dtype, device: torch.device):
         """Ask for a drafting state, once the head's shard is a fit for one."""
@@ -531,6 +501,13 @@ class DFlash(BaseDrafter):
         logits_output: LogitsProcessorOutput,
         accept_lengths: torch.Tensor,
     ) -> None:
+        """Advance accepted history and write context only when the drafter owns it."""
+        self._update_draft_prefix_lengths(base_ctx, accept_lengths)
+        if base_ctx.dspark_context_producer is not None:
+            # The configured producer writes during target forward, before this
+            # call on the same stream. Missing production is not a fallback mode.
+            return
+
         hidden = logits_output.hidden_states
         if hidden is None:
             raise RuntimeError("DFLASH requires target hidden states.")
@@ -539,29 +516,31 @@ class DFlash(BaseDrafter):
                 "DFLASH hidden-state/token mismatch: "
                 f"hidden_tokens={hidden.shape[0]}, input_tokens={base_ctx.input_num_tokens}."
             )
+        if base_ctx.input_num_tokens == 0:
+            return
 
-        bs = base_ctx.bs
-        # The target verify forward emits spec_num_tokens hidden states per
-        # decode request (the candidate block); input_lengths_buf only tracks
-        # the committed-token count there, so split decode rows by
-        # spec_num_tokens. Prefill rows keep their real chunk lengths.
-        lengths = self.input_buffers.input_lengths_buf[:bs].to(torch.int64).clone()
-        lengths[base_ctx.num_extends :] = self.spec_num_tokens
-        req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
         positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
-        # The TARGET round's write vector, from the target router (the pools
-        # share one page-id space): the extend span for prefill rows, the
-        # verify window behind it for decode rows — the same token order the
-        # hidden states arrive in.
+        # Target and draft views share the full-history group's page-id space.
+        # Preserve the target's packed order: extend rows, then verify rows.
         target_backend = base_ctx.attn_backend
         cache_locs = target_backend.decode_window_locations()
         if base_ctx.num_extends > 0:
             cache_locs = torch.cat((target_backend.extend_span_locations(), cache_locs))
-        cache_locs = cache_locs[: base_ctx.input_num_tokens]
+        self._write_native_cache(
+            hidden,
+            positions,
+            cache_locs[: base_ctx.input_num_tokens],
+            decode_only=base_ctx.num_extends == 0,
+        )
 
-        decode_only = base_ctx.num_extends == 0
+    def _update_draft_prefix_lengths(
+        self, base_ctx: ForwardContext, accept_lengths: torch.Tensor
+    ) -> None:
+        """Publish valid draft history independently of who produces cache bytes."""
+        bs = base_ctx.bs
+        req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
         if (
-            decode_only
+            base_ctx.num_extends == 0
             and torch.cuda.is_available()
             and torch.cuda.is_current_stream_capturing()
         ):
@@ -571,21 +550,20 @@ class DFlash(BaseDrafter):
             self.draft_seq_lens_buf[:bs].copy_(
                 old_lens.to(torch.int32) + accept_lengths[:bs].to(torch.int32)
             )
-            self._write_native_cache(hidden, positions, cache_locs, decode_only=True)
             return
 
         if base_ctx.input_num_tokens == 0:
             return
 
-        # Which rows a request kept is a device-side fact, and slicing per
-        # request to drop the rejected ones cost one device-to-host sync per
-        # request. Write every row instead: a rejected row lands past its
-        # request's new valid length, exactly where the CUDA-graph decode path
-        # above already leaves it, and a later round overwrites that slot.
+        # Target verification produces spec_num_tokens rows per decode request;
+        # prefill rows retain their actual chunk lengths.
+        lengths = self.input_buffers.input_lengths_buf[:bs].to(torch.int64).clone()
+        lengths[base_ctx.num_extends :] = self.spec_num_tokens
+        positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
         starts = torch.cumsum(lengths, 0) - lengths
         takes = lengths.clone()
         if bs > base_ctx.num_extends:
-            takes[base_ctx.num_extends :] = (
+            takes[base_ctx.num_extends : bs] = (
                 accept_lengths[base_ctx.num_extends : bs]
                 .to(torch.int64)
                 .clamp(min=0, max=self.spec_num_tokens)
@@ -594,10 +572,11 @@ class DFlash(BaseDrafter):
         old_lens = self.runtime_states.valid_cache_lengths.index_select(
             0, req_pool_indices
         ).to(torch.int32)
+        # Writers may materialize rejected rows too; only this accepted prefix
+        # is visible to the next draft, and later rounds overwrite the rest.
         self.draft_seq_lens_buf[:bs].copy_(
             torch.where(takes > 0, (positions[last_row] + 1).to(torch.int32), old_lens)
         )
-        self._write_native_cache(hidden, positions, cache_locs, decode_only=decode_only)
 
     def _write_native_cache(
         self,
@@ -986,7 +965,8 @@ class DFlash(BaseDrafter):
             torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
         )
         return (
-            ctx.num_extends == 0
+            ctx.dspark_context_producer is None
+            and ctx.num_extends == 0
             and self._fused_kv_enabled
             and self._kv_aux_stream is not None
             and (capturing or not get_is_cuda_graph_phase())
