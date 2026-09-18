@@ -350,6 +350,7 @@ class QSAIndexer(nn.Module):
             return torch.empty((0, output_width), dtype=torch.int32, device=q.device)
         page_size = compressed.shape[1]
         cache = compressed.view(-1, 1, self.index_head_dim)
+        enable_pdl = pdl_enabled()
         # Auto normally materializes scores for persistent radix selection;
         # oversized matrices retain the zero-materialization streaming path.
         selected_blocks = qwen4_exp_qsa_block_topk(
@@ -362,7 +363,7 @@ class QSAIndexer(nn.Module):
             block_topk=self.block_topk,
             solution=self._topk_solution(q.shape[0], qsa_page_table, page_size),
             persistent_topk_workspace=self._persistent_topk_workspace,
-            enable_pdl=pdl_enabled(),
+            enable_pdl=enable_pdl,
         )
         return qwen4_exp_qsa_selected_slots(
             selected_blocks,
@@ -373,6 +374,7 @@ class QSAIndexer(nn.Module):
             full_page_size,
             self.compress_ratio,
             self.token_topk,
+            enable_pdl=enable_pdl,
         )
 
     @break_point

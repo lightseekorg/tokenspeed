@@ -80,6 +80,9 @@ struct CacheGroupConfig {
     bool IsSnapshotStateGroup() const { return family == CacheGroupFamily::State; }
 
     void Validate() const;
+    // Validate() without the total_pages check: every field the capacity
+    // model reads, so a group can be sized before its pages exist.
+    void ValidateCapacityInputs() const;
 };
 
 }  // namespace tokenspeed

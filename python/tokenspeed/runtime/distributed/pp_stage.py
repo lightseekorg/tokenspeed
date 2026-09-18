@@ -92,7 +92,7 @@ def pp_stage_windows(
 
 
 def pp_layer_window(num_hidden_layers: int, mapping: Mapping) -> tuple[int, int]:
-    """Return this stage's [start, end) global layer window.
+    """Return this stage's [start, end) target execution-block window.
 
     Honors ``mapping.pp_layer_partition`` when set (explicit per-stage layer
     counts, e.g. to lighten the embed/lm_head stages). Otherwise layers split
@@ -123,6 +123,9 @@ class PPStageState:
     # own (full-size) buffer with these rows; its block-write layers fill the
     # rest.
     block_residual: torch.Tensor | None = None
+    # Sum of projected target taps, [num_tokens, draft_hidden], in float32.
+    # The final stage normalizes it once and materializes draft context KV.
+    projected_context: torch.Tensor | None = None
 
     def tensors(self) -> list[torch.Tensor]:
         out = []

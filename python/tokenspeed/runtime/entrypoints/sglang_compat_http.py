@@ -386,6 +386,12 @@ async def update_weight_version(request: Request) -> JSONResponse:
         if new_version is None:
             raise ValueError("Missing 'new_version' in request body")
         llm = _llm(request)
+        if getattr(llm.server_args, "kvstore_storage_backend", None) is not None:
+            raise ValueError(
+                "Direct weight-version changes are not supported with L3 storage; "
+                "use /update_weights_from_distributed with an explicit "
+                "weight_version and flush_cache=True"
+            )
         llm.server_args.weight_version = str(new_version)
         return {
             "success": True,

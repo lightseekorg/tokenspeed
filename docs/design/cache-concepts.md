@@ -258,13 +258,26 @@ both cases and always returns outputs and final states; its caller writes the
 final states to the continuation blocks. Target verification remains separate.
 Every request in a checkpoint
 batch participates in the body: rows crossing a checkpoint stop at that
-boundary, while other rows run to completion. Only crossing rows enter the
-packed tail scan, initialized directly
-from their body final states. Body and tail outputs are scattered back to
-original token order, so every token is evaluated exactly once while the aligned
-and final states are both retained. Batch size one uses zero-copy body/tail
-views; larger batches use the same batched pack/scatter contract. This split
+boundary, while other rows run to completion. In the ordinary compact path,
+only crossing rows enter the packed tail scan, initialized directly
+from their body final states. Body and tail outputs are restored to original
+token order, so every valid token is evaluated exactly once while the aligned
+and final states are both retained. Ordinary batch size one uses zero-copy
+body/tail views and concatenates the outputs; larger compact batches pack
+inputs and scatter outputs. Inline capacity graphs pack even one request
+because its live boundary cannot be encoded as a capture-time Python slice.
+They restore outputs with a shared inverse-map gather. Negative token indices
+make packing write zeros; negative inverse sources make gathering write zero
+output padding. GPU boundaries still determine the real tokens in each scan.
+This split
 does not change cache ownership or scheduler metadata.
+
+Merged capacity graphs may reserve a checkpoint/tail execution slot for every
+request, including requests with no internal checkpoint. Such an inactive
+slot has a negative checkpoint destination and output map; its dummy scan
+result cannot overwrite the body's final state. These slots are transient
+graph scratch, never new cache blocks or publishable checkpoints. The
+ordinary compact-tail path and the capacity path share masked state writers.
 
 The body/tail split uses the existing prefill-op state-layout contract. KDA
 solutions may retain their original K-major Python adapters; the kernel facade
@@ -554,6 +567,35 @@ Its responsibilities:
   `ProbeDecodeDevicePrefix` is the PD-decode variant: local history
   pages are reused while final-state groups are restored from the remote
   endpoint snapshot.
+
+  `Admit` takes two inputs of different scope and tense. One `GroupDemand`
+  per group says what that group needs for the round ahead: an extent and a
+  reserve beyond it. The extent is one of two shapes in different reference
+  frames — `DenseGrowth` appends tokens relative to the table's current fill,
+  `SparseSuffix` names an absolute token extent and the first slot to
+  materialize, leaving the slots below as null holes — so the bounded-replay
+  rewrite in `Admit` is a visible conversion from one to the other (hit plus
+  growth becomes the absolute extent), not an arithmetic side effect. One
+  `RequestProgress` per
+  request says what the request has done since the coordinator's previous
+  transaction for it: the prefix pages it completed (`CompletedPages`, present
+  only when the newly hashed range is non-empty, so "new hashes without a
+  boundary kind" cannot be expressed) and its computed-token count for
+  retention. Publication fields are request-scoped and therefore live on the
+  progress, not replicated onto every group's demand.
+
+  Publication rides inside `Admit` on purpose. "Completed" means scheduled
+  stream order for prefill (`NumComputedTokens` is the scheduled window end;
+  the FIFO data plane orders any hitter's forward after the writer) and
+  landed order for decode (token ids, hence hashes, exist only after
+  landing); the next admission is the first point after both, and one rule
+  covers both. Inside the transaction it is side-effect free when the
+  admission fails and is retried in the same round, it is ordered before
+  retention reclaims the slots it publishes, and victim planning sees the
+  pre-publication state so a request's own expired, still-unpublished tail
+  can fund the same admission. `CacheCompletedBlocks` takes the same
+  `RequestProgress` for finish, retraction and remote completion, which
+  publish without admitting.
 * **Prefix publication.** `CacheFullBlocks` / `CacheCompletedBlocks` register
   computed blocks into the prefix indexes for later requests. Prefix-closed
   groups match first; non-closed groups (SWA, Mamba) match only within the
@@ -719,6 +761,10 @@ Its responsibilities:
   publish under `default-u1`, and the second flush would leave the first
   server's objects in place. After a successful RPC the Engine facade
   stamps the supplied version into `server_args.weight_version`.
+  The metadata-only HTTP `/update_weight_version` endpoint rejects updates
+  while L3 is enabled, including requests for the current version. It cannot
+  coordinate a cache flush or worker namespace change, so callers must use
+  the distributed weight-update path with an explicit version and a flush.
   `ENABLE_CP` workers share `attn_tp_rank==0`
   and are distinguished by `c{cp_rank}` and `cp_size`. Without PP they
   would each PULL a different ZMQ message, so only `cp_rank==0` owns
@@ -866,6 +912,36 @@ layers ──group──▶ groups ──pack──▶ CacheLayout ──bind─
   by a count and yields the `CacheMemoryPlan` the arena allocates from and
   the PD wire carries.
 
+Cache-layer counts come from the recipe's existing `CacheSetup.num_target_layers`
+and `num_draft_layers`: target cache layers first, then independent draft cache
+layers. PP construction gives these values explicit `*_cache_layers` local
+names; a drafter that shares target cache contributes no independent cache
+layers. Neither count means captured target taps or draft execution depth.
+
+`distributed/pp_stage.py::pp_stage_windows` owns the target execution-window
+calculation, shared by pipeline stages, model construction and PD topology.
+The model/cache construction boundary maps those execution windows to explicit
+`target_cache_windows`, then `CacheLayerOwnership` adds the final stage's draft
+cache window. Cache ownership consumes cache-ID windows; execution partitioning
+belongs to the distributed layer. Current PP targets K3 and V4 have one cache
+layer per execution block; non-PP ownership covers the complete cache namespace
+without assuming that equality. Resident windows, transfer filtering and
+producer-field groups all use cache-layer IDs.
+Cache construction resolves ownership into explicit field IDs once:
+`cache_fields_by_stage` describes residency, and `producer_fields_by_step`
+describes the local readiness barriers. These sets cover resident fields
+exactly once. PD never derives placement from target/draft identities,
+execution-layer counts or contiguous layer windows. Noncontiguous field sets
+are valid. The bootstrap wire carries `cache_fields_by_stage`; all prefill
+ranks must register the same complete placement and logical field plan.
+Old bootstrap peers without explicit placement must be upgraded together.
+
+`create_attn_components` returns a frozen `AttentionBuild` naming target and
+draft backends/pools, cache storage, field placement, readiness and optional
+`logical_plan`. The complete logical plan is retained when PP narrows the
+physical arena. The builder passes these values explicitly to PD; none are
+attached to the event loop or added to the allocation owner after construction.
+
 `CacheRecipe` (`recipes/base.py`) is a template method: `setup()` is the one
 place the four stages appear in order, and a family fills in uniformly named
 seams — `layer_types`, `group_ids`, `fields_for_layer`, `prefix_granularity`,
@@ -889,6 +965,19 @@ would otherwise need cross-checking cannot differ:
 
 If you find yourself writing a check that two derived views agree, the
 design is wrong: make one of them the source.
+
+**Recipes do not inspect the hardware.** A row encoding can be a property of
+the target — DeepSeek V4.1's packed rows are read natively by FlashMLA above
+sm100, while sm90 reads only the wider V4 layout — but the recipe never asks
+which machine it is on. The choice is made once where the model's attention
+config is generated (`configs/deepseek_v41.py`), recorded on the spec, and
+read back by everyone who needs it: the recipe sizes fields and looks up the
+packing from it, the backend names its kernel cache formats from it. Row
+width forces the packing and the plane, so each format owns its own frozen
+`group_packing` / `lcm_block_bytes` tables (`deepseek_v41_geometry.py`); the
+geometry module is a table keyed by format name and knows nothing about
+architectures. Adding a platform probe below the config layer would give one
+parent two possible sizes with no single place that decided which.
 
 ### Storage vs. visibility
 
@@ -963,11 +1052,22 @@ the decode node re-feeds nothing.
 
 Capacity has exactly two shapes, both on the base class. The default is the
 flat product (`parents × tightest packing × P`). Families whose per-group
-demand differs — K3's state groups riding inside MLA planes, V4's SWA and
-compressed chains — override `parents_needed` and get the inverse for free
-from `_capacity_from_parents`, one monotonic binary search shared by all.
+demand decides the pool — K3's state groups riding inside MLA planes, V4's
+SWA and compressed chains, GLM-5.3-Flash — size from `parents_needed` and get
+the inverse for free from `_capacity_from_parents`, one monotonic binary
+search shared by all. `parents_needed` itself is not a Python formula: it
+hands the group specs, the layout's virtual packing and `scheduler_limits`
+to the scheduler's own `CapacityModel` (`recipes/scheduler_bridge.py` →
+`csrc/scheduler/capacity_model.h`), whose `ConcurrentGroupPages` reports each
+group's demand at the configured concurrency and whose `LcmBlocksNeededFor`
+folds it by packing. The per-request working set — decode reservation,
+overlap-protected step, a state group's checkpoints and banked growth, a
+sliding group's lookback and resident window — is therefore defined once, in
+C++, and the `Scheduler` bounds single requests against the pool with the
+same model (`docs/design/scheduler.md` §1.4). No recipe restates any of it.
 `scheduler_limits` is the single place a recipe reads the scheduler's
-concurrency, so demand and capacity cannot size against different numbers.
+concurrency, role and reserve widths, so demand and capacity cannot size
+against different numbers.
 
 The runtime's global `max_num_seqs` is divided across attention DP ranks to
 produce each scheduler's rank-local `max_batch_size`. These values limit
@@ -1154,12 +1254,13 @@ events (wire-format constrained; unify deliberately if ever).
 ### Principle 2 — scheduler perceives only logical quantities: fixed, now with hard vocabulary rules
 
 Scheduling and FSM code do no geometry arithmetic. The coordinator exposes
-capacity views — `LcmBlocksNeededFor(group_pages)`,
-`NumActiveLcmBlocks(request_tables)`, `NumAvailableLcmBlocks`,
-`TotalLcmBlocks`, `GroupAvailablePages(group)` — and the scheduler treats the
-counts as opaque capacity units. The null-page reservation lives in
-`SchedulerConfig::AllocatorConfig::NumUsableBlocks()`, and nothing outside the
-cache layer enumerates LCM block ids.
+capacity views — `NumActiveLcmBlocks(request_tables)`,
+`NumAvailableLcmBlocks`, `TotalLcmBlocks`, `GroupAvailablePages(group)` — and
+the config-only `CapacityModel` (`csrc/scheduler/capacity_model.h`) folds
+page demand into LCM blocks (`LcmBlocksNeededFor(group_pages)`); the
+scheduler treats the counts as opaque capacity units. The null-page
+reservation lives in `SchedulerConfig::AllocatorConfig::NumUsableBlocks()`,
+and nothing outside the cache layer enumerates LCM block ids.
 
 Enforced:
 
@@ -1174,16 +1275,19 @@ Enforced:
 * `SchedulerConfig::Validate()` is the **single** configuration gate: every
   scheduler scalar, every `CacheGroupConfig::Validate()`, and the cross-checks
   between them (P divisibility, PD transfer policy, one-cache-block chunks for
-  a recurrent-state group). The `Scheduler` runs it before constructing any
-  member, because the pools and the coordinator assert on the same fields and
-  would otherwise preempt the diagnostic. Python callers must also pass
-  `Scheduler(config)` explicitly; the binding retains no module-lifetime
-  default configuration. Consequently `MakeSpecsFromConfig`
-  is pure translation — it validates nothing;
+  a recurrent-state group). Its sizing half, `ValidateCapacityInputs()`, is
+  the same checks minus the page counts that describe a sized pool; the
+  `CapacityModel` runs that half so a pool can be sized before it exists, and
+  `Validate()` runs it too, so no rule is stated twice. The `Scheduler` runs
+  `Validate()` before constructing any member, because the pools and the
+  coordinator assert on the same fields and would otherwise preempt the
+  diagnostic. Python callers must also pass `Scheduler(config)` explicitly;
+  the binding retains no module-lifetime default configuration. Consequently
+  `MakeSpecsFromConfig` is pure translation — it validates nothing;
 * the scheduler layer **transports** `cache_blocks_per_lcm_block` rather than
   reasoning with it. It appears in `csrc/scheduler/` only as a config field
   copied into the spec; capacity math stays in tokens and pages and folds to
-  LCM blocks inside `LcmBlocksNeededFor`.
+  LCM blocks inside `CapacityModel::LcmBlocksNeededFor`.
 
 Note on naming: the capacity counts intentionally keep *LCM block* names. An
 LCM parent is a byte-uniform storage unit whose token span differs per group

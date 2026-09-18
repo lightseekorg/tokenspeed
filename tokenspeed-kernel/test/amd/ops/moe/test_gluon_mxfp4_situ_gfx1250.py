@@ -194,6 +194,87 @@ def test_kimi_k3_tp_situ_compiles_and_matches_with_upcast_indices_gfx1250(
     torch.testing.assert_close(wide, narrow, atol=0.0, rtol=0.0)
 
 
+def _situ_apply_recording_kernels(
+    monkeypatch: pytest.MonkeyPatch,
+    plan: dict,
+    module: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    partial_tdm: bool,
+) -> tuple[torch.Tensor, list]:
+    kernels: list = []
+    original_matmul = fused.matmul
+
+    def recording_matmul(*args, **kwargs):
+        kwargs["partial_tdm"] = partial_tdm
+        out, kernel = original_matmul(*args, **kwargs)
+        kernels.append(kernel)
+        return out, kernel
+
+    monkeypatch.setattr(fused, "matmul", recording_matmul)
+    try:
+        result = tokenspeed_kernel.moe_apply(
+            plan,
+            hidden_states,
+            module,
+            router_logits,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        ).clone()
+    finally:
+        monkeypatch.undo()
+    assert len(kernels) == 2, "SiTU runs one matmul per projection"
+    return result, kernels
+
+
+def _count_tensor_loads(kernels: list) -> int:
+    return sum(kernel.asm["amdgcn"].count("tensor_load") for kernel in kernels)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 4, 32, 65])
+def test_kimi_k3_tp_situ_partial_tdm_matches_whole_warp_loads_gfx1250(
+    num_tokens: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, _, hidden_states, topk_weights, topk_ids, router_logits = _make_case(
+        num_tokens
+    )
+    plan = _make_plan()
+    tokenspeed_kernel.moe_process_weights(plan, module)
+
+    control, control_kernels = _situ_apply_recording_kernels(
+        monkeypatch,
+        plan,
+        module,
+        hidden_states,
+        router_logits,
+        topk_weights,
+        topk_ids,
+        partial_tdm=False,
+    )
+    fused_out, fused_kernels = _situ_apply_recording_kernels(
+        monkeypatch,
+        plan,
+        module,
+        hidden_states,
+        router_logits,
+        topk_weights,
+        topk_ids,
+        partial_tdm=True,
+    )
+
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(control).item() > 0
+    # The hint changes who issues the load, not what lands in shared memory.
+    assert torch.equal(fused_out, control)
+    # Without this, a partial_tdm that silently degraded to whole-warp loads
+    # would still pass the equality check above.
+    assert _count_tensor_loads(fused_kernels) < _count_tensor_loads(control_kernels)
+
+
 def test_kimi_k3_tp_situ_is_cuda_graph_capturable_gfx1250() -> None:
     module, _, hidden_states, topk_weights, topk_ids, router_logits = _make_case(1)
     plan = _make_plan()

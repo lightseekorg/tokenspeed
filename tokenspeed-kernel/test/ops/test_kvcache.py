@@ -394,6 +394,7 @@ def test_state_verify_commit_rows_matches_torch(
         dst_rows,
         verify_width=verify_width,
         num_layers=num_layers,
+        group_indices=None,
     )
     torch.cuda.synchronize()
 
@@ -434,6 +435,7 @@ def test_state_verify_commit_rows_single_layer_matches_tiled_prefix(
         tiled_dst,
         verify_width=verify_width,
         num_layers=num_layers,
+        group_indices=None,
     )
     state_verify_commit_rows(
         accepted,
@@ -442,6 +444,7 @@ def test_state_verify_commit_rows_single_layer_matches_tiled_prefix(
         single_dst,
         verify_width=verify_width,
         num_layers=1,
+        group_indices=None,
     )
     torch.cuda.synchronize()
 
@@ -458,7 +461,7 @@ def test_state_verify_commit_rows_rejects_bad_args(device: str) -> None:
     pages = torch.tensor([3, 4], device=device, dtype=torch.int64)
     src = torch.empty(2, device=device, dtype=torch.int64)
     dst = torch.empty(2, device=device, dtype=torch.int64)
-    kwargs = {"verify_width": 2, "num_layers": 1}
+    kwargs = {"verify_width": 2, "num_layers": 1, "group_indices": None}
 
     with pytest.raises(ValueError, match="one page id per request"):
         state_verify_commit_rows(accepted, pages[:1], src, dst, **kwargs)
@@ -468,11 +471,11 @@ def test_state_verify_commit_rows_rejects_bad_args(device: str) -> None:
         state_verify_commit_rows(accepted, pages, src, dst[:1], **kwargs)
     with pytest.raises(ValueError, match="verify_width"):
         state_verify_commit_rows(
-            accepted, pages, src, dst, verify_width=0, num_layers=1
+            accepted, pages, src, dst, verify_width=0, num_layers=1, group_indices=None
         )
     with pytest.raises(ValueError, match="num_layers"):
         state_verify_commit_rows(
-            accepted, pages, src, dst, verify_width=2, num_layers=0
+            accepted, pages, src, dst, verify_width=2, num_layers=0, group_indices=None
         )
     with pytest.raises(ValueError, match="torch.int32 or torch.int64"):
         state_verify_commit_rows(
@@ -482,6 +485,12 @@ def test_state_verify_commit_rows_rejects_bad_args(device: str) -> None:
             dst,
             **kwargs,
         )
+    for lengths, destinations in (
+        (accepted.repeat_interleave(2)[::2], pages),
+        (accepted, pages.repeat_interleave(2)[::2]),
+    ):
+        with pytest.raises(ValueError, match="contiguous"):
+            state_verify_commit_rows(lengths, destinations, src, dst, **kwargs)
 
 
 def test_state_verify_commit_rows_empty_batch_is_noop(device: str) -> None:
@@ -490,9 +499,105 @@ def test_state_verify_commit_rows_empty_batch_is_noop(device: str) -> None:
     src = torch.empty(0, device=device, dtype=torch.int64)
     dst = torch.empty(0, device=device, dtype=torch.int64)
 
-    state_verify_commit_rows(accepted, pages, src, dst, verify_width=2, num_layers=3)
+    state_verify_commit_rows(
+        accepted, pages, src, dst, verify_width=2, num_layers=3, group_indices=None
+    )
     torch.cuda.synchronize()
     assert src.numel() == 0 and dst.numel() == 0
+
+
+@pytest.mark.parametrize("batch_size", [1, 257])
+@pytest.mark.parametrize("row_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("cuda_graph", [False, True])
+def test_state_verify_commit_rows_grouped_replay(
+    device: str, batch_size: int, row_dtype: torch.dtype, cuda_graph: bool
+) -> None:
+    """Layer order and repeated groups survive live graph updates."""
+    num_layers, verify_width = 4, 3
+    accepted = torch.arange(batch_size, dtype=row_dtype, device=device)
+    accepted.remainder_(6).sub_(1)
+    pages = torch.arange(3 * batch_size, dtype=row_dtype, device=device).view(
+        3, batch_size
+    )
+    pages.sub_(3)
+    groups = torch.tensor([2, 0, 2, 1], dtype=row_dtype, device=device)
+    total = num_layers * batch_size
+    src_guard = torch.full((total + 4,), -99, dtype=row_dtype, device=device)
+    dst_guard = torch.full_like(src_guard, -99)
+    src, dst = src_guard[2:-2], dst_guard[2:-2]
+
+    def launch() -> None:
+        state_verify_commit_rows(
+            accepted,
+            pages,
+            src,
+            dst,
+            verify_width=verify_width,
+            num_layers=num_layers,
+            group_indices=groups,
+        )
+
+    launch()
+    graph = None
+    if cuda_graph:
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch()
+    for _ in range(2):
+        accepted.add_(1)
+        pages[:, 0].zero_()
+        pages[:, 1:].add_(1)
+        if graph is None:
+            launch()
+        else:
+            graph.replay()
+        expected_src = (
+            torch.arange(batch_size, dtype=row_dtype, device=device)
+            * (verify_width + 1)
+            + accepted.clamp(1, verify_width)
+        ).repeat(num_layers)
+        selected = pages.index_select(0, groups.to(torch.int64)).reshape(-1)
+        expected_dst = torch.where(selected > 0, selected, -1)
+        torch.testing.assert_close(src, expected_src, rtol=0, atol=0)
+        torch.testing.assert_close(dst, expected_dst, rtol=0, atol=0)
+        assert torch.all(src_guard[:2] == -99) and torch.all(src_guard[-2:] == -99)
+        assert torch.all(dst_guard[:2] == -99) and torch.all(dst_guard[-2:] == -99)
+
+
+def test_state_verify_commit_rows_rejects_invalid_group_layout(device: str) -> None:
+    accepted = torch.ones(2, dtype=torch.int32, device=device)
+    pages = torch.ones((2, 2), dtype=torch.int32, device=device)
+    src = torch.empty(6, dtype=torch.int32, device=device)
+    dst = torch.empty_like(src)
+    groups = torch.tensor([1, 0, 1], dtype=torch.int64, device=device)
+    for invalid in (
+        groups[:2],
+        groups.float(),
+        groups.view(1, 3),
+        groups.repeat_interleave(2)[::2],
+    ):
+        with pytest.raises(ValueError, match="group_indices"):
+            state_verify_commit_rows(
+                accepted,
+                pages,
+                src,
+                dst,
+                verify_width=3,
+                num_layers=3,
+                group_indices=invalid,
+            )
+    for invalid in (pages[0], pages[:, :1], pages[:0], pages.T):
+        with pytest.raises(ValueError, match="destination_pages"):
+            state_verify_commit_rows(
+                accepted,
+                invalid,
+                src,
+                dst,
+                verify_width=3,
+                num_layers=3,
+                group_indices=groups,
+            )
 
 
 def test_transfer_kv_per_layer(device: str) -> None:

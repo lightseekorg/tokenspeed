@@ -24,15 +24,24 @@ server:
   command: >-
     ts serve /models/nvidia--Kimi-K3-NVFP4/f8c5234a0a880bcc6cbf779a315e7ee2f405b812
     --served-model-name kimi-k3
-    --trust-remote-code
-    --max-model-len 65536
-    --kv-cache-dtype fp8
-    --tensor-parallel-size 8
-    --mm-encoder-tp-mode data
-    --moe-backend flashinfer_trtllm
-    --gpu-memory-utilization 0.94
+    --attn-tp-size 8
+    --moe-tp-size 8
+    --max-model-len 80000
     --max-num-seqs 16
-    --disable-kvstore
+    --gpu-memory-utilization 0.9
+    --disable-cuda-graph-padding
+    --trust-remote-code
+    --attention-backend tokenspeed_mla
+    --kda-backend cutedsl_kda
+    --moe-backend flashinfer_trtllm
+    --kv-cache-dtype fp8
+    --speculative-algorithm EAGLE3
+    --speculative-draft-model-path lightseekorg/kimi-k3-eagle3-mla
+    --speculative-num-steps 3
+    --speculative-num-draft-tokens 4
+    --speculative-eagle-topk 1
+    --drafter-attention-backend tokenspeed_mla
+    --mm-encoder-tp-mode data
     --host 0.0.0.0
     --port 8000
   ready:
@@ -53,7 +62,7 @@ eval:
     --dataset-args '{"aime26":{"dataset_id":"math-ai/aime26"}}'
     --eval-batch-size 16
     --stream
-    --generation-config '{"do_sample":true,"temperature":1.0,"max_tokens":63488,"extra_body":{"reasoning_effort":"high"}}'
+    --generation-config '{"do_sample":true,"temperature":1.0,"max_tokens":65536,"extra_body":{"reasoning_effort":"high"}}'
 report:
   github_step_summary: true
 # Same bar as the mxfp4 sibling gate. NVFP4 measured 0.9333-0.9667 on the

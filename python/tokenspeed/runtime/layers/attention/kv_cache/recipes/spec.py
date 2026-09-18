@@ -154,11 +154,6 @@ class CacheGroupSpec:
 # One declared cache group: what the scheduler is told, and the bytes it costs.
 CacheGroupDeclaration = tuple[CacheGroupSpec, tuple[plan.CacheFieldSpec, ...]]
 
-# Every group's page 0 is the reserved null page (padding rows, holes and
-# failed slots resolve to it); recipes subtract it again when they count
-# allocatable children per LCM parent.
-NULL_PAGES = 1
-
 # The scale-tile span lives with the field geometry it defines (plan.py); it is
 # re-exported here because scheduler-side callers reason about the tile as a
 # token span, not as a shape.
@@ -211,78 +206,6 @@ def validate_scheduler_config(
             f"{type(attn_backend).__name__} is missing "
             f"{sorted(missing_families)}"
         )
-
-
-def compute_cache_group_page_counts(
-    specs: Sequence[CacheGroupSpec],
-    *,
-    max_live_requests: int,
-    max_scheduled_tokens: int,
-    max_total_tokens: int,
-    max_context_len: int,
-    decode_input_tokens: int = 1,
-    overlap_schedule_depth: int = 0,
-) -> dict[str, int]:
-    if max_live_requests < 0:
-        raise ValueError(f"max_live_requests must be >= 0, got {max_live_requests}")
-    if max_scheduled_tokens < 0:
-        raise ValueError(
-            f"max_scheduled_tokens must be >= 0, got {max_scheduled_tokens}"
-        )
-    if max_total_tokens < 0:
-        raise ValueError(f"max_total_tokens must be >= 0, got {max_total_tokens}")
-    if max_context_len < 0:
-        raise ValueError(f"max_context_len must be >= 0, got {max_context_len}")
-    if decode_input_tokens < 0:
-        raise ValueError(f"decode_input_tokens must be >= 0, got {decode_input_tokens}")
-    if overlap_schedule_depth not in (0, 1):
-        raise ValueError(
-            f"overlap_schedule_depth must be 0 or 1, got {overlap_schedule_depth}"
-        )
-    if overlap_schedule_depth > 0 and decode_input_tokens == 0:
-        raise ValueError("overlapped cache sizing requires decode_input_tokens > 0")
-
-    counts: dict[str, int] = {}
-    for spec in specs:
-        block_granularity = spec.block_granularity
-        protected_pages = max_live_requests * _ceil_div(
-            overlap_schedule_depth * decode_input_tokens, block_granularity
-        )
-        # A state group holds two rolling checkpoints per request (input and
-        # output), whatever the prompt or chunk width.
-        if spec.family == "state":
-            total = max_live_requests * 2 + NULL_PAGES
-        elif spec.retention == "full_history":
-            full_pages = _ceil_div(max_total_tokens, block_granularity)
-            total = full_pages + max_live_requests + protected_pages + NULL_PAGES
-        elif spec.retention == "sliding_window":
-            window = spec.sliding_window_tokens
-            if window is None or window <= 0:
-                raise ValueError(
-                    f"CacheGroupSpec {spec.group_id}: sliding group missing "
-                    "positive sliding_window_tokens"
-                )
-            # Capacity tracks resident history before the next token.
-            resident_tokens_per_req = min(max(window - 1, 0), max_context_len)
-            resident_pages = max_live_requests * _ceil_div(
-                resident_tokens_per_req, block_granularity
-            )
-            scheduled_tokens = min(max_scheduled_tokens, max_total_tokens)
-            scheduled_pages = _ceil_div(scheduled_tokens, block_granularity)
-            total = (
-                resident_pages
-                + scheduled_pages
-                + max_live_requests
-                + protected_pages
-                + NULL_PAGES
-            )
-        else:
-            raise ValueError(
-                f"CacheGroupSpec {spec.group_id}: unsupported retention "
-                f"{spec.retention!r}"
-            )
-        counts[spec.group_id] = int(total)
-    return counts
 
 
 def compute_max_logical_pages_for_capture(
@@ -747,7 +670,6 @@ __all__ = [
     "apply_pd_transfer_policies",
     "group",
     "compute_max_logical_pages_for_capture",
-    "compute_cache_group_page_counts",
     "hybrid_slab_group_size",
     "layer_group_ids",
     "split_recurrent_state_groups",

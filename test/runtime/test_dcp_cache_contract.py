@@ -119,6 +119,8 @@ def _recipe(*, dcp_size: int, fp4: bool, draft: bool) -> DeepseekV4Recipe:
         server_args=SimpleNamespace(
             max_total_tokens=None,
             chunked_prefill_size=8192,
+            disaggregation_mode="null",
+            enable_prefix_caching=True,
             attention_use_fp4_indexer_cache=fp4,
         ),
         model_config=SimpleNamespace(hf_config=hf, num_attention_layers=43),
@@ -432,11 +434,16 @@ class RecipeDeclarationTest(unittest.TestCase):
             sharded.memory_plan.arena_bytes,
             _recipe(dcp_size=4, fp4=True, draft=True).cache_budget_bytes,
         )
-        # Physical geometry is identical: only the scheduler's virtual view widens.
+        # Physical geometry is identical: every group packs the same physical
+        # children into one parent, and only the scheduler's virtual view
+        # widens. The parent count itself may differ by the capacity search's
+        # rounding, so compare the per-parent packing rather than raw pages.
         for spec in base.cache_group_specs:
             self.assertEqual(
-                base.memory_plan.group(spec.group_id).page_count,
-                sharded.memory_plan.group(spec.group_id).page_count,
+                (base.memory_plan.group(spec.group_id).page_count - 1)
+                // base.memory_plan.num_lcm_blocks,
+                (sharded.memory_plan.group(spec.group_id).page_count - 1)
+                // sharded.memory_plan.num_lcm_blocks,
                 spec.group_id,
             )
 

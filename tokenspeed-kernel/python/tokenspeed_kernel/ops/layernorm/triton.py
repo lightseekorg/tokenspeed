@@ -148,6 +148,7 @@ def _grouped_gemma_rmsnorm_kernel(
     group_offset = group * GROUP_SIZE
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     x = tl.load(
         x_ptr + row * row_stride + group_offset + offsets,
         mask=mask,
@@ -163,8 +164,6 @@ def _grouped_gemma_rmsnorm_kernel(
         normalized,
         mask=mask,
     )
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def grouped_gemma_rmsnorm(
@@ -255,12 +254,14 @@ def _gated_residual_combine_norm_kernel(
 
     if ENABLE_PDL and not PRELOAD_RESIDUAL:
         tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     residual = tl.load(residual_ptr + positions, mask=mask, other=0.0).to(tl.float32)
     weight = tl.load(
         weight_ptr + group * weight_group_stride + offsets, mask=mask, other=0.0
     ).to(tl.float32)
     if ENABLE_PDL and PRELOAD_RESIDUAL:
         tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
 
     block_output = tl.load(
         block_ptr + row * GROUP_SIZE + offsets, mask=mask, other=0.0
@@ -275,8 +276,6 @@ def _gated_residual_combine_norm_kernel(
     variance = tl.sum(combined * combined, axis=0) / GROUP_SIZE
     normalized = combined * tl.rsqrt(variance + eps) * (1.0 + weight)
     tl.store(norm_out_ptr + positions, normalized, mask=mask)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def gated_residual_combine_norm(

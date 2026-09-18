@@ -298,7 +298,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         """Validate and cache the route owned by this Prefill rank once."""
         # Plan against the LOGICAL layout (full model): peer validation and
         # fragment geometry must match what Decode sees on the wire. The
-        # window filter below keeps only fields this stage's physical arena
+        # field filter below keeps only fields this stage's physical arena
         # actually holds, so local addressing never touches a dropped plane.
         layout = getattr(self.kv_args, "wire_layout", None) or self.kv_args.cache_layout
         peer_layout = registration.peer_cache_layout
@@ -309,10 +309,10 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             decode_tp_size=registration.decode_tp_size,
             prefill_layout=layout,
             decode_layout=peer_layout,
-            # PP: this stage transfers only its own layers' fields; the other
-            # stages run their own planners over their windows, and the union
-            # covers the whole plan on the Decode side.
-            prefill_layer_window=getattr(self.kv_args, "pp_layer_window", None),
+            # Construction declares residency; transfer never infers model layers.
+            prefill_field_ids=frozenset(
+                self.kv_args.cache_fields_by_stage[self.topology.pp_rank]
+            ),
         )
         route = planner.plan_for_decode_rank(registration.decode_tp_rank)
         expected_decode_ranks = planner.decode_ranks_by_prefill_rank[local_tp_rank]
@@ -1148,15 +1148,12 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
 
         bootstrap_server_url = f"{ip_address}:{self.bootstrap_port}"
         url = f"http://{bootstrap_server_url}/route"
-        pp_layer_partition = getattr(self.topology, "pp_layer_partition", None)
         payload = {
             "role": "Prefill",
             "world_size": self.topology.world_size,
             "dp_size": self.topology.dp_size,
             "pp_size": self.topology.pp_size,
-            "pp_layer_partition": (
-                list(pp_layer_partition) if pp_layer_partition else None
-            ),
+            "cache_fields_by_stage": self.kv_args.cache_fields_by_stage,
             "rank_ip": get_local_ip_by_remote(),
             "rank_port": self.rank_port,
             "engine_rank": self.topology.global_rank,

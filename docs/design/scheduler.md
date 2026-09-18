@@ -16,7 +16,13 @@ A prompt is prefilled in chunks bounded by `max_scheduled_tokens`
 scheduled, never for the whole prompt**: `schedulePrefill` /
 `schedulePrefillFirstChunk` build one `GroupDemand` per cache group sized by
 this chunk's tokens, and the coordinator either grants the pages or the
-request stays put.
+request stays put. Alongside the demands, one `RequestProgress` per request
+carries what it computed since its previous admission — the prefix pages
+just completed and its computed-token count — which the coordinator publishes
+and reclaims inside the same `Admit` (`advanceRequestProgress` in
+`scheduler/operations/forward.cpp` is the one place that hashes those pages
+and builds it; see [cache-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)
+for why publication rides with admission).
 
 When L3 Host prefetch cannot allocate every probed page, `Admit` shortens
 `host_prefix_tokens` and rounds that length down to `prefix_granularity`
@@ -67,6 +73,16 @@ never by call site:
   waiting on a pool that had room for it.
 - *Snapshot-state* groups reserve at least one growth block on a decoding
   role's completing chunk or remote landing, and nothing on other rounds (§1.2).
+
+The decode slot is reserved on **every** role, the P role included. A P node
+never decodes locally, but with speculation configured the forward that
+completes a prompt runs the drafter once and writes its candidate block into
+the `decode_input_tokens` slots behind the prompt — the same window a decoding
+role verifies into — before `plan.remote_decode` ships the candidates. Without
+that reserve those rows have no page and fall to the dummy slot, and the block
+attention that reads them back proposes garbage. What P does *not* reserve is
+decode growth: no admission headroom, no snapshot-state growth block, no
+overlap protection (§3.1). The capacity model (§1.4) states the same split.
 
 ### 1.1 Head-of-line: an incomplete prefill holds the queue
 
@@ -265,13 +281,40 @@ regeneration anywhere.
 ### 1.4 What bounds a single request
 
 `MaxSingleRequestTokens` is a **startup** bound computed by binary search over
-`singleRequestLcmBlocksRequired`: the largest prompt whose worst-case working
-set — aligned checkpoint + final continuation state, decode reserve,
-overlap-depth protection, the state growth block, and for chunked sparse local
-recovery the retained input checkpoint (and, with the prefix cache on, a first
-chunk's cached one) — fits the pool. It is not a live
-check against currently free capacity; a prompt within the bound can still fail
-admission right now and simply waits.
+`CapacityModel::SingleRequestGroupPages` (`csrc/scheduler/capacity_model.h`):
+the largest prompt whose worst-case working set — aligned checkpoint + final
+continuation state, decode reserve, overlap-depth protection, the state growth
+block, and for chunked sparse local recovery the retained input checkpoint
+(and, with the prefix cache on, a first chunk's cached one) — fits the pool.
+It is not a live check against currently free capacity; a prompt within the
+bound can still fail admission right now and simply waits.
+
+The `CapacityModel` is deliberately **config-only**: it reads every
+`SchedulerConfig` field that is known before a pool exists and no
+`total_pages`, validating that subset through
+`SchedulerConfig::ValidateCapacityInputs()`. That is what lets the Python
+recipes size a pool from the same model before the arena is allocated
+(`recipes/scheduler_bridge.py` builds an unsized config and asks
+`ConcurrentGroupPages(max_total_tokens, max_context_len)` for each group's
+demand at `max_batch_size` live requests), and then lets the `Scheduler`
+bound requests against the pool they sized. The per-request working set —
+`decode_width + overlap_schedule_depth * decode_width` protected tokens,
+`SnapshotStateReserveTokens`, a group's prefix-match lookback (the same
+`PrefixMatcher` the coordinator builds, via `MakePrefixMatcher`) — exists in
+that one file; neither side restates it. The two answers are tied by an
+invariant the model's tests sweep: for one live request of `L` tokens,
+`ConcurrentGroupPages(L, L)` is never below `SingleRequestGroupPages(L)` in
+any group, so a pool sized for the configured concurrency admits every
+request the bound accepts.
+
+Per group, `ConcurrentGroupPages` charges: a snapshot-state group its
+single-request peak once per live request (the working set does not grow
+with history); a prefix-closed history group `ceil(T / g)` dense pages plus,
+per request, `ceil((g - 1 + protected) / g)` for the unaligned tail and the
+protected tokens that may spill past it; a sliding group, per request,
+`ceil((min(W - 1, ctx) + decode_width + protected + g - 1) / g)` resident
+pages, plus one in-flight prefill chunk behind its lookback (or, on the
+decode role, the landing bound `min(dense, lookback + window)` per request).
 
 For an internal checkpoint followed by `tail` tokens, the forward holds
 both the tail and the ordinary growth reserve: the output working set is
@@ -416,6 +459,13 @@ it can report outcomes but never compose the batch.
 pinned until the transfer finishes, so releasing them outranks feeding more
 prompt work), then the shared local-prefill phases
 (`scheduleLocalPrefillWork`): resident chunks, then new prompts.
+
+**Reserve: the decode slot, nothing else.** The completing chunk reserves
+`decode_input_tokens` like every role, because the drafter writes the first
+candidate block there before the remote decode carries it to the peer. The
+growth reserves stay off: no admission headroom (nothing is ever retracted),
+no snapshot-state growth block (the peer banks its own), no overlap protection
+(no local decode is ever in flight).
 
 **Retraction: none.** A P node's pressure valve is the transfer itself — pages
 are pinned until the peer acknowledges, then released wholesale. Retracting a

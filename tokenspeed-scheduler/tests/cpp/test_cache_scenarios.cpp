@@ -2605,9 +2605,11 @@ protected:
 };
 
 TEST_F(AdmissionHeadroomPrefillRoleSuite, ThePrefillRoleDoesNotPrepayDecodeHeadroom) {
-    // The P role never decodes locally and never retracts, so a declared
-    // generation budget -- even one far beyond this pool -- charges nothing
-    // at admission: the prompt's own 2*ceil(6/2) = 6 blocks and no more.
+    // The P role never retracts, so a declared generation budget -- even one
+    // far beyond this pool -- charges nothing at admission. What the
+    // completing chunk does hold is the same decode slot every role reserves
+    // (the drafter writes its first candidate block there): the prompt plus
+    // one token, 2*ceil(7/2) = 8 blocks, exactly the fused charge for "a".
     RequestSpec heavy = MakeRequestSpec("heavy", /*num_pages=*/3);
     heavy.max_new_tokens = 6000;
     Submit(heavy);
@@ -2617,7 +2619,7 @@ TEST_F(AdmissionHeadroomPrefillRoleSuite, ThePrefillRoleDoesNotPrepayDecodeHeadr
     const ForwardBatch* op = FindForwardBatch(plan);
     ASSERT_NE(op, nullptr);
     EXPECT_EQ(op->request_ids, std::vector<std::string>{"heavy"});
-    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 8);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 6);
 }
 
 TEST_F(PrefillHeadOfLineSuite, AnIncompletePrefillGivesWayBeforeACompletedOne) {
@@ -2976,21 +2978,27 @@ TEST(CacheProgressTest, StateBoundariesRecordAtLandingAndSurviveFailedAdmission)
     fsm::CacheProgress staged = resources.cache_progress;
     staged.prefix_hashes = {"h4", "h8", "h12"};
     GroupDemand demand{
-        .table = &tables[0],
-        .num_tokens = 128,  // fails before either publication or reclamation
-        .prefix_hashes = staged.prefix_hashes,
-        .new_prefix_hash_begin = 0,
-        .completed_boundary_kind = CacheBoundaryKind::kChunk,
-        .num_computed_tokens = 13,
-        .materialized_state_boundaries = staged.materialized_state_boundaries,
+        .table = &tables[0], .extent = DenseGrowth{128},  // fails before either publication or reclamation
     };
-    EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), std::span{&demand, 1}, admission->access_epoch));
+    const RequestProgress progress{
+        .completed_pages =
+            CompletedPages{
+                .prefix_hashes = staged.prefix_hashes,
+                .first_new_prefix_page = 0,
+                .boundary_kind = CacheBoundaryKind::kChunk,
+                .materialized_state_boundaries = staged.materialized_state_boundaries,
+            },
+        .num_computed_tokens = 13,
+    };
+    EXPECT_FALSE(
+        coordinator.Admit(coordinator.ProbePrefix({}), std::span{&demand, 1}, progress, admission->access_epoch));
     EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 0);
     EXPECT_TRUE(resources.cache_progress.prefix_hashes.empty());
     EXPECT_EQ(resources.cache_progress.materialized_state_boundaries, (std::vector<std::int32_t>{4, 8, 16}));
 
-    demand.num_tokens = 0;
-    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), std::span{&demand, 1}, admission->access_epoch));
+    demand.extent = DenseGrowth{0};
+    ASSERT_TRUE(
+        coordinator.Admit(coordinator.ProbePrefix({}), std::span{&demand, 1}, progress, admission->access_epoch));
     staged.DiscardHashedStateBoundaries(4);
     resources.cache_progress = std::move(staged);
     EXPECT_EQ(resources.cache_progress.materialized_state_boundaries, (std::vector<std::int32_t>{16}));
@@ -3112,7 +3120,7 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
     request.Apply(fsm::BootstrappedEvent{});
     std::vector<BlockTable> tables(coordinator.NumGroups());
     const std::optional<CacheCoordinator::AdmissionResult> admission =
-        AdmitForTest(coordinator, tables, GroupDemand{.num_tokens = 4, .reserve_tokens = 3});
+        AdmitForTest(coordinator, tables, GroupDemand{.extent = DenseGrowth{4}, .reserve_tokens = 3});
     ASSERT_TRUE(admission);
 
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{/*tokens_this_round=*/4,
@@ -3142,7 +3150,7 @@ TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) 
     Request request{spec, /*prefix_granularity=*/2, Role::kD};
     request.Apply(fsm::BootstrappedEvent{});
     std::vector<BlockTable> tables(coordinator.NumGroups());
-    auto admission = AdmitForTest(coordinator, tables, GroupDemand{.num_tokens = 4, .reserve_tokens = 1});
+    auto admission = AdmitForTest(coordinator, tables, GroupDemand{.extent = DenseGrowth{4}, .reserve_tokens = 1});
     ASSERT_TRUE(admission);
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{
         /*tokens_this_round=*/4,
@@ -3168,8 +3176,8 @@ TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) 
     EXPECT_EQ(device_pool.NumEmptyLcmBlocks(), device_pool.NumLcmBlocks());
 
     std::vector<BlockTable> recovery_tables(coordinator.NumGroups());
-    auto recovery_admission = AdmitForTest(coordinator, recovery_tables,
-                                           GroupDemand{.num_tokens = request.PrefillSize(), .reserve_tokens = 1});
+    auto recovery_admission = AdmitForTest(
+        coordinator, recovery_tables, GroupDemand{.extent = DenseGrowth{request.PrefillSize()}, .reserve_tokens = 1});
     ASSERT_TRUE(recovery_admission);
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{
         request.PrefillSize(),
@@ -3366,7 +3374,9 @@ TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
-                                 .num_tokens = 1,
+                                 .extent = DenseGrowth{1},
+                             },
+                             RequestProgress{
                                  .num_computed_tokens = 4,
                              }));
 
@@ -3377,7 +3387,9 @@ TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     // N=5; keys [2,5] -> page 0 out: slot 0 punched, slot 1 kept.
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
-                                 .num_tokens = 1,
+                                 .extent = DenseGrowth{1},
+                             },
+                             RequestProgress{
                                  .num_computed_tokens = 5,
                              }));
     EXPECT_TRUE(swa_slot_null(0));
@@ -3387,7 +3399,9 @@ TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     const std::int32_t free_before = pool.NumEmptyLcmBlocks();
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
-                                 .num_tokens = 1,
+                                 .extent = DenseGrowth{1},
+                             },
+                             RequestProgress{
                                  .num_computed_tokens = 6,
                              }));
     EXPECT_FALSE(swa_slot_null(1)) << "key 3 of the pending query lives in page 1; freeing it is the off-by-one";
@@ -3397,7 +3411,9 @@ TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     // N=7; keys [4,7] -> page 1 fully out, punched exactly now.
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
-                                 .num_tokens = 1,
+                                 .extent = DenseGrowth{1},
+                             },
+                             RequestProgress{
                                  .num_computed_tokens = 7,
                              }));
     EXPECT_TRUE(swa_slot_null(1));

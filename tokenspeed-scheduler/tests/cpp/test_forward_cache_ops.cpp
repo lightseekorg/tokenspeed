@@ -128,7 +128,7 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
     const std::int32_t free_before = pool.NumEmptyLcmBlocks();
     std::vector<BlockTable> r2(coordinator.NumGroups());
     CacheCoordinator::PrefixProbe prefix = coordinator.ProbePrefix(hashes8);
-    ASSERT_TRUE(AdmitForTest(coordinator, r2, std::move(prefix), GroupDemand{.num_tokens = 4}));
+    ASSERT_TRUE(AdmitForTest(coordinator, r2, std::move(prefix), GroupDemand{.extent = DenseGrowth{4}}));
 
     // Per-group table: 4 claimed prefix pages + ceil(4 new / 2) = 2 fresh = 6.
     ASSERT_EQ(r2[0].NumBlocks(), 6);
@@ -156,9 +156,15 @@ TEST(ForwardCacheOpsPrefill, ChunkAcquiresAndCachesFullBlocks) {
     std::vector<std::string> hashes2{std::string(64, 'a'), std::string(64, 'b')};
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
-                                 .num_tokens = 4,
-                                 .prefix_hashes = hashes2,
-                                 .completed_boundary_kind = CacheBoundaryKind::kChunk,
+                                 .extent = DenseGrowth{4},
+                             },
+                             RequestProgress{
+                                 .completed_pages =
+                                     CompletedPages{
+                                         .prefix_hashes = hashes2,
+                                         .first_new_prefix_page = 0,
+                                         .boundary_kind = CacheBoundaryKind::kChunk,
+                                     },
                                  .num_computed_tokens = 4,
                              }));
     EXPECT_EQ(tables[0].NumBlocks(), 4);
@@ -186,9 +192,15 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
                                     std::string(64, 'd')};
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
-                                 .num_tokens = 4,
-                                 .prefix_hashes = hashes,
-                                 .completed_boundary_kind = CacheBoundaryKind::kChunk,
+                                 .extent = DenseGrowth{4},
+                             },
+                             RequestProgress{
+                                 .completed_pages =
+                                     CompletedPages{
+                                         .prefix_hashes = hashes,
+                                         .first_new_prefix_page = 0,
+                                         .boundary_kind = CacheBoundaryKind::kChunk,
+                                     },
                                  .num_computed_tokens = 8,
                              }));
 
@@ -231,9 +243,15 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowBeforeAcquire) {
     }
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
-                                 .num_tokens = 1,
-                                 .prefix_hashes = hashes,
-                                 .completed_boundary_kind = CacheBoundaryKind::kChunk,
+                                 .extent = DenseGrowth{1},
+                             },
+                             RequestProgress{
+                                 .completed_pages =
+                                     CompletedPages{
+                                         .prefix_hashes = hashes,
+                                         .first_new_prefix_page = 0,
+                                         .boundary_kind = CacheBoundaryKind::kChunk,
+                                     },
                                  .num_computed_tokens = 12,
                              }));
 
@@ -260,7 +278,9 @@ TEST(ForwardCacheOpsDecode, StepAcquiresAndSlidesSwaWindow) {
     for (std::int32_t computed = 7; computed <= 13; ++computed) {
         ASSERT_TRUE(AdmitForTest(coordinator, tables,
                                  GroupDemand{
-                                     .num_tokens = 1,
+                                     .extent = DenseGrowth{1},
+                                 },
+                                 RequestProgress{
                                      .num_computed_tokens = computed,
                                  }));
     }
@@ -299,10 +319,15 @@ TEST(ForwardCacheOpsDecode, DecodeStepRegistersFilledPages) {
 
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
-                                 .num_tokens = 1,
-                                 .prefix_hashes = hashes,
-                                 .new_prefix_hash_begin = 2,
-                                 .completed_boundary_kind = CacheBoundaryKind::kChunk,
+                                 .extent = DenseGrowth{1},
+                             },
+                             RequestProgress{
+                                 .completed_pages =
+                                     CompletedPages{
+                                         .prefix_hashes = hashes,
+                                         .first_new_prefix_page = 2,
+                                         .boundary_kind = CacheBoundaryKind::kChunk,
+                                     },
                                  .num_computed_tokens = 8,
                              }));
 
@@ -324,7 +349,9 @@ TEST(ForwardCacheOpsDecode, AdmissionWithEmptyHashesOnlySlidesAndAllocates) {
 
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
-                                 .num_tokens = 1,
+                                 .extent = DenseGrowth{1},
+                             },
+                             RequestProgress{
                                  .num_computed_tokens = 8,
                              }));
 

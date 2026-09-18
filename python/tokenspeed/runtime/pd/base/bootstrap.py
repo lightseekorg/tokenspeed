@@ -63,9 +63,6 @@ class DisaggBootstrapServerBase:
         self.tp_size_per_dp_rank = None
         # Prefill chunk-pipeline stage count (1 when the source has no PP).
         self.pp_size = 1
-        # Optional explicit per-stage layer counts; the Decode side must plan
-        # its transfer routes over the SAME stage windows the Prefill used.
-        self.pp_layer_partition: list[int] | None = None
         self.prefill_port_table: dict[int, dict[int, dict[str, str | int]]] = {}
 
         # Initialize every field shared with the server thread before starting
@@ -158,10 +155,6 @@ class DisaggBootstrapServerBase:
             self.dp_size = dp_size
 
         self.pp_size = int(data.get("pp_size", self.pp_size or 1))
-        if data.get("pp_layer_partition") is not None:
-            self.pp_layer_partition = [
-                int(count) for count in data["pp_layer_partition"]
-            ]
 
         # With PP the per-dp world spans pp stages; the port table keys by the
         # dense stage-major rank (pp_rank * tp + tp_rank == global rank at
@@ -204,7 +197,6 @@ class DisaggBootstrapServerBase:
                 "prefill_tp_size": self.world_size,
                 "prefill_dp_size": self.dp_size,
                 "prefill_pp_size": self.pp_size,
-                "prefill_pp_layer_partition": self.pp_layer_partition,
             }
             prefill_parallel_info.update(self._extra_parallel_info())
             return web.json_response(prefill_parallel_info, status=200)

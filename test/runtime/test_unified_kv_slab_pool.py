@@ -457,52 +457,92 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
 
 
 class StateCacheGroupPageCountTest(unittest.TestCase):
-    """compute_cache_group_page_counts: the family="state" branch is
-    positive and bounded by the full-history formula for the same inputs
-    (sparse state uses two rolling checkpoints independent of overlap and
-    prefill chunk width).
-    The direct-loaded module still imports ceil_div from the real package
-    at call time, so this skips on a bare interpreter.
+    """The scheduler's capacity model over a state + full-history pair: a
+    snapshot-state group's demand is a fixed working set per live request
+    (retained input checkpoint, aligned checkpoint, final continuation and
+    banked growth), independent of how much history the requests hold.
+    Needs the real package and the scheduler extension.
     """
 
     def setUp(self):
         try:
-            from tokenspeed.runtime.utils.common import ceil_div  # noqa: F401
-        except ImportError as exc:
-            self.skipTest(f"page-count math needs the real package: {exc}")
+            import tokenspeed_scheduler  # noqa: F401
 
-    def _counts(self, **overrides):
+            from tokenspeed.runtime.layers.attention.kv_cache.recipes import (  # noqa: F401
+                scheduler_bridge,
+            )
+        except ImportError as exc:
+            self.skipTest(f"page-count math needs the scheduler extension: {exc}")
+
+    def _pages(
+        self,
+        *,
+        max_total_tokens=1024,
+        max_scheduled_tokens=64,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    ):
+        from tokenspeed_scheduler import SchedulerConfig
+
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
+            SchedulerLimits,
+            capacity_model,
+        )
+
         specs = _specs_for_layers(
             layer_types=("linear_attention", "full_attention"),
             group_ids=("linear_attention", "full_attention"),
             sliding_window_tokens=None,
             prefix_granularity=16,
         )
-        params = {
-            "max_live_requests": 2,
-            "max_scheduled_tokens": 64,
-            "max_total_tokens": 1024,
-            "max_context_len": 4096,
-        }
-        params.update(overrides)
-        return _pcs.compute_cache_group_page_counts(specs, **params)
+        model = capacity_model(
+            specs,
+            prefix_granularity=16,
+            virtual_packing={spec.group_id: 1 for spec in specs},
+            limits=SchedulerLimits(
+                role=SchedulerConfig.Role.Fused,
+                max_live_requests=2,
+                max_scheduled_tokens=max_scheduled_tokens,
+                max_context_len=4096,
+                decode_input_tokens=decode_input_tokens,
+                overlap_schedule_depth=overlap_schedule_depth,
+                disable_prefix_cache=False,
+            ),
+        )
+        pages = model.concurrent_group_pages(
+            max_total_tokens=max_total_tokens, max_context_len=4096
+        )
+        return dict(zip((spec.group_id for spec in specs), pages))
 
     def test_state_count_positive_and_bounded_by_full_history(self):
-        counts = self._counts()
-        self.assertGreater(counts["linear_attention"], 0)
-        self.assertLessEqual(counts["linear_attention"], counts["full_attention"])
+        pages = self._pages()
+        self.assertGreater(pages["linear_attention"], 0)
+        self.assertLessEqual(pages["linear_attention"], pages["full_attention"])
 
-    def test_state_branch_is_independent_of_chunk_and_total_token_width(self):
-        small = self._counts(max_scheduled_tokens=16, max_total_tokens=128)
-        large = self._counts(max_scheduled_tokens=4096, max_total_tokens=1 << 20)
+    def test_state_branch_is_independent_of_total_token_width(self):
+        small = self._pages(max_total_tokens=128)
+        large = self._pages(max_total_tokens=1 << 20)
         self.assertEqual(small["linear_attention"], large["linear_attention"])
-        # R=2: two input/output blocks each plus one allocator dummy page.
-        self.assertEqual(small["linear_attention"], 2 * 2 + 1)
+        # Per live request: the retained input checkpoint, the aligned
+        # checkpoint, and 1 + ceil((15 + 16) / 16) blocks for an unaligned
+        # finishing tail plus one banked growth block -- four, times two.
+        self.assertEqual(small["linear_attention"], 2 * 4)
+        # A chunk that always ends on a block boundary has no tail to hold.
+        self.assertEqual(
+            self._pages(max_scheduled_tokens=16)["linear_attention"], 2 * 3
+        )
 
-    def test_state_branch_is_independent_of_overlap(self):
-        baseline = self._counts(overlap_schedule_depth=0, decode_input_tokens=1)
-        overlapped = self._counts(overlap_schedule_depth=1, decode_input_tokens=1)
+    def test_overlap_protects_a_growth_block_only_past_one_block(self):
+        # One protected token still fits the banked growth block.
+        baseline = self._pages(overlap_schedule_depth=0, decode_input_tokens=1)
+        overlapped = self._pages(overlap_schedule_depth=1, decode_input_tokens=1)
         self.assertEqual(baseline["linear_attention"], overlapped["linear_attention"])
+        # A full-block decode width plus its protected step needs one more.
+        wide = self._pages(overlap_schedule_depth=0, decode_input_tokens=16)
+        wide_overlapped = self._pages(overlap_schedule_depth=1, decode_input_tokens=16)
+        self.assertEqual(
+            wide_overlapped["linear_attention"] - wide["linear_attention"], 2 * 1
+        )
 
 
 class CachePoolFieldBindingTest(unittest.TestCase):

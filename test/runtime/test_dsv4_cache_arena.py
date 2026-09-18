@@ -59,6 +59,8 @@ def _recipe(degree, fp4):
         server_args=SimpleNamespace(
             max_total_tokens=None,
             chunked_prefill_size=8192,
+            disaggregation_mode="null",
+            enable_prefix_caching=True,
             attention_use_fp4_indexer_cache=fp4,
         ),
         model_config=SimpleNamespace(hf_config=hf, num_attention_layers=43),

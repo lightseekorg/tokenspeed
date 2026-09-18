@@ -29,10 +29,25 @@ how long the caller may hold each piece:
 | `encoder_model_facts` | a callable resolving the encoder facts EPD admission needs (raises on text-only) | consumed at startup, past the EPD gate |
 
 The device side is built **complete**, not built-then-wired: the transfer peer
-is constructed inside the builder (everything it needs is `server_args` or the
-KV pool the builder already owns) and the engine's role is read off it once, at
-construction. An earlier shape had the loop assemble the peer and hand it back
-through a setter, which left the role mutable after startup for no reason.
+is constructed inside the builder from its prepared components and startup
+arguments, and the engine's role is read off it once, at construction. An
+earlier shape had the loop assemble the peer and hand it back through a setter,
+which left the role mutable after startup for no reason.
+
+Persistent DeepEP communication storage is reserved during common MoE weight
+processing, before attention/cache construction profiles available memory.
+The kernel package owns allocation and compatible reuse; this rule is shared
+by every DeepEP backend. Runtime orchestration supplies configuration but does
+not infer token layouts or capacities from model names. Backend dispatchers
+reuse that storage when model execution begins.
+
+Attention construction returns a frozen, named `AttentionBuild` containing its
+backends, pools, cache storage, field placement/readiness and optional logical plan.
+`build_device_side` consumes this result locally and passes stage field
+placement, producer readiness and `logical_plan` explicitly through PD
+construction to `get_kv_args`.
+These startup dependencies stay within device construction; neither the build
+result nor its ownership/layout fields are exposed to the event loop.
 
 The handle owns BOTH executors of a scheduler plan, and treats their work
 identically: a model forward runs asynchronously on the GPU, and handing a

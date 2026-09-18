@@ -32,6 +32,7 @@
 
 #include "scheduler/outside_events/inc.h"
 #include "scheduler/operations/inc.h"
+#include "scheduler/capacity_model.h"
 #include "scheduler/execution_event.h"
 #include "scheduler/kv_cache_events.h"
 #include "scheduler/request.h"
@@ -159,6 +160,25 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens);
+
+    // The config-only sizing model. Python builds it from a SchedulerConfig
+    // whose page counts are still zero, sizes the pool from its answers, and
+    // the Scheduler later bounds requests against that pool with the same
+    // model. Group results are indexed like config.cache_groups.
+    nb::class_<tokenspeed::CapacityModel>(m, "CapacityModel")
+        .def(nb::init<const tokenspeed::SchedulerConfig&>(), nb::arg("config"))
+        .def_prop_ro("num_groups", &tokenspeed::CapacityModel::NumGroups)
+        .def("single_request_group_pages", &tokenspeed::CapacityModel::SingleRequestGroupPages, nb::arg("token_limit"))
+        .def("concurrent_group_pages", &tokenspeed::CapacityModel::ConcurrentGroupPages, nb::arg("max_total_tokens"),
+             nb::arg("max_context_len"))
+        .def(
+            "lcm_blocks_needed_for",
+            [](const tokenspeed::CapacityModel& model, const std::vector<std::int64_t>& group_pages) {
+                return model.LcmBlocksNeededFor(group_pages);
+            },
+            nb::arg("group_pages"))
+        .def("max_single_request_tokens", &tokenspeed::CapacityModel::MaxSingleRequestTokens,
+             nb::arg("usable_lcm_blocks"));
 
     nb::class_<tokenspeed::RequestSpec>(m, "RequestSpec")
         .def(nb::init<>())
@@ -344,9 +364,17 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                  }
                  return result;
              })
-        .def("waiting_size", &tokenspeed::Scheduler::WaitingSize)
-        .def("decoding_size", &tokenspeed::Scheduler::DecodingSize)
-        .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize)
+        .def("bootstrapping_size", &tokenspeed::Scheduler::BootstrappingSize,
+             "Count requests waiting for their PD bootstrap handshake.")
+        .def("waiting_size", &tokenspeed::Scheduler::WaitingSize,
+             "Count Submitted and Retracted requests awaiting admission or readmission.")
+        .def("decoding_size", &tokenspeed::Scheduler::DecodingSize, "Count requests in the Decoding FSM state.")
+        .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize,
+             "Count local/remote prefills, PrefillAwaitingResult, and PrefillDone requests.")
+        .def("remote_prefilling_size", &tokenspeed::Scheduler::RemotePrefillSize,
+             "Count RemotePrefilling requests; these are also included in prefilling_size().")
+        .def("pd_transfer_size", &tokenspeed::Scheduler::PdTransferSize,
+             "Count requests with PD-pinned pages; this resource count overlaps lifecycle states.")
         .def("pd_transfer_pinned", &tokenspeed::Scheduler::PdTransferPinned, nb::arg("request_id"))
         .def("available_lcm_blocks", &tokenspeed::Scheduler::AvailableLcmBlocks)
         .def("empty_lcm_blocks", &tokenspeed::Scheduler::EmptyLcmBlocks)

@@ -13,6 +13,7 @@ import os
 import sys
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1051,6 +1052,235 @@ class VerifyMetadataTest(unittest.TestCase):
             [[1, 2, 3, 4], [6, 7, 8, 9], [11, 12, 13, 14]],
         )
 
+    def test_verify_commit_resolves_pages_with_fused_group_kernel(self):
+        torch = self.torch
+        from tokenspeed.runtime.layers.attention.backends.state import (
+            mamba as mamba_module,
+        )
+
+        block_tables = {
+            "linear_attention_0": torch.tensor(
+                [[11, 12, 13], [21, 22, 23]], dtype=torch.int32
+            ),
+            "linear_attention_1": torch.tensor(
+                [[31, 32, 33], [41, 42, 43]], dtype=torch.int32
+            ),
+        }
+        self.backend.refresh_decode_metadata(
+            2,
+            2,
+            torch.tensor([0, 1], dtype=torch.int32),
+            torch.tensor([7, 10], dtype=torch.int32),
+            forward_mode=self.ForwardMode.DECODE,
+            block_tables=block_tables,
+        )
+        accepted = torch.tensor([0, 5], dtype=torch.int32)
+        resolve_calls = []
+        copy_calls = []
+        original_commit = mamba_module.commit_state_pages
+
+        def counted_commit(*args, **kwargs):
+            resolve_calls.append((args, kwargs))
+            return original_commit(*args, **kwargs)
+
+        def recorded_copy(*args, **kwargs):
+            copy_calls.append((args, kwargs))
+
+        def reference_rows(
+            steps, pages, src, dst, *, verify_width, num_layers, group_indices
+        ):
+            base = torch.arange(steps.numel(), dtype=torch.int32) * (verify_width + 1)
+            src.copy_((base + steps.clamp(1, verify_width)).repeat(num_layers))
+            selected = pages.index_select(0, group_indices).reshape(-1)
+            dst.copy_(torch.where(selected > 0, selected, -1))
+
+        with (
+            patch.object(mamba_module, "commit_state_pages", counted_commit),
+            patch.object(mamba_module, "copy_state_rows", recorded_copy),
+            patch.object(mamba_module, "state_verify_commit_rows", reference_rows),
+        ):
+            self.backend.commit_verified_state(accepted)
+
+        self.assertEqual(len(resolve_calls), 2)
+        self.assertEqual(
+            [
+                kwargs["pages_out"][kwargs["out_row"]].tolist()
+                for _, kwargs in resolve_calls
+            ],
+            [[11, 23], [31, 43]],
+        )
+        for _, kwargs in resolve_calls:
+            self.assertEqual(kwargs["batch_size"], 2)
+            self.assertEqual(kwargs["draft_tokens"], 4)
+            self.assertEqual(kwargs["granularity"], 4)
+            self.assertEqual(kwargs["pages_out"].dtype, torch.int32)
+            self.assertEqual(kwargs["steps_out"].tolist(), [1, 4])
+
+        self.assertEqual(len(copy_calls), 2)
+        for args, _ in copy_calls:
+            self.assertEqual(args[2].dtype, torch.int32)
+            self.assertEqual(args[3].dtype, torch.int32)
+            self.assertEqual(args[2].tolist(), [1, 9, 1, 9])
+            self.assertEqual(args[3].tolist(), [11, 23, 31, 43])
+        self.assertIsNone(self.backend._verify_commit_ctx)
+
+
+class VerifyCommitGPUTest(unittest.TestCase):
+    def test_grouped_commit_copies_and_replay_share_fused_rows(self):
+        import torch
+
+        if not torch.cuda.is_available():
+            self.skipTest("needs a CUDA device")
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+        from tokenspeed.runtime.layers.attention.backends.state import mamba
+
+        width, capacity = 3, 4
+        # Sorted layers select groups [1, 0, 1], exercising both reordering
+        # and a group shared by multiple non-adjacent layers.
+        layer_groups = {0: "group0", 2: "group1", 5: "group0"}
+        tables = {
+            "group0": torch.tensor(
+                [[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=torch.int32, device="cuda"
+            ),
+            "group1": torch.tensor(
+                [[-1, 11], [12, 0], [14, 15]], dtype=torch.int32, device="cuda"
+            ),
+        }
+        seq_lens = torch.tensor([6, 7, 11, 3], dtype=torch.int32, device="cuda")
+        accepted = torch.tensor([0, 2, 9], dtype=torch.int32, device="cuda")
+        expected_pages = {"group0": [1, 5, 9], "group1": [-1, -1, 15]}
+        for replay_ssm in (False, True):
+            for live_bs in (1, 3):
+                with self.subTest(replay_ssm=replay_ssm, live_bs=live_bs):
+                    components = {
+                        layer: (
+                            group,
+                            torch.full(
+                                (16, 6, 3), -7, dtype=torch.bfloat16, device="cuda"
+                            ),
+                            torch.full(
+                                (16, 1, 2, 2), -7, dtype=torch.float32, device="cuda"
+                            ),
+                        )
+                        for layer, group in layer_groups.items()
+                    }
+                    pool = _ContractPool(4, components)
+                    pool.arena.runtime_contract.group_specs = tuple(
+                        reversed(pool.arena.runtime_contract.group_specs)
+                    )
+                    backend = mamba.MambaAttnBackend(
+                        *_mamba_config_pair(
+                            torch,
+                            heads=1,
+                            head_dim=2,
+                            spec_tokens=width,
+                            max_bs=capacity,
+                            device="cuda",
+                            replay_ssm=replay_ssm,
+                        )
+                    )
+                    backend.set_kv_pool(pool)
+                    backend.init_cuda_graph_state(capacity)
+                    backend.refresh_decode_metadata(
+                        capacity,
+                        live_bs,
+                        torch.arange(capacity, dtype=torch.int32, device="cuda"),
+                        seq_lens,
+                        forward_mode=ForwardMode.DECODE,
+                        block_tables=tables,
+                    )
+                    read_pages = backend._verify_commit_ctx[3]
+                    for layer, scratches in backend._verify_scratch.items():
+                        for tensor in scratches:
+                            if tensor is not None:
+                                values = torch.arange(
+                                    tensor.shape[0], device="cuda", dtype=tensor.dtype
+                                ) + 100 * (layer + 1)
+                                tensor.copy_(
+                                    values.view(
+                                        -1, *([1] * (tensor.ndim - 1))
+                                    ).expand_as(tensor)
+                                )
+                    # Warm pointer tables outside profiling, as forward seeding does.
+                    backend._verify_copy_tables_get()
+                    with patch.object(mamba, "gdn_replay_commit") as replay:
+                        with torch.profiler.profile(
+                            activities=[
+                                torch.profiler.ProfilerActivity.CPU,
+                                torch.profiler.ProfilerActivity.CUDA,
+                            ]
+                        ) as profile:
+                            backend.commit_verified_state(accepted[:live_bs])
+                            torch.cuda.synchronize()
+                    events = profile.events()
+                    gpu_kernels = [
+                        e.name
+                        for e in events
+                        if e.device_type == torch.autograd.DeviceType.CUDA
+                    ]
+                    self.assertEqual(
+                        sum(
+                            "_state_verify_commit_rows_kernel" in name
+                            for name in gpu_kernels
+                        ),
+                        1,
+                    )
+                    # Replay still assembles its separate read indices; the
+                    # scratch-copy path needs no PyTorch index arithmetic.
+                    if not replay_ssm:
+                        self.assertFalse(
+                            {
+                                "aten::index_select",
+                                "aten::add",
+                                "aten::repeat",
+                                "aten::stack",
+                            }.intersection(e.name for e in events)
+                        )
+                        self.assertFalse(
+                            any("elementwise" in name for name in gpu_kernels)
+                        )
+                    source_rows = [1, 6, 11][:live_bs]
+                    for layer, group in layer_groups.items():
+                        for kind, name in enumerate(("conv_state", "recurrent_state")):
+                            actual = pool.get_component(layer, name)
+                            expected = torch.full_like(actual, -7)
+                            if kind == 0 or not replay_ssm:
+                                for src, dst in zip(
+                                    source_rows,
+                                    expected_pages[group][:live_bs],
+                                    strict=True,
+                                ):
+                                    if dst > 0:
+                                        expected[dst] = backend._verify_scratch[layer][
+                                            kind
+                                        ][src]
+                            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    if replay_ssm:
+                        replay.assert_called_once()
+                        kwargs = replay.call_args.kwargs
+                        torch.testing.assert_close(
+                            kwargs["accepted_length"],
+                            accepted[:live_bs].clamp(1, width),
+                        )
+                        expected_write = torch.tensor(
+                            [
+                                expected_pages[g][:live_bs]
+                                for g in layer_groups.values()
+                            ],
+                            dtype=torch.int32,
+                            device="cuda",
+                        )
+                        torch.testing.assert_close(
+                            kwargs["write_indices"], expected_write
+                        )
+                        torch.testing.assert_close(
+                            kwargs["read_indices"],
+                            torch.stack([read_pages[g] for g in layer_groups.values()]),
+                        )
+                    else:
+                        replay.assert_not_called()
+                    self.assertIsNone(backend._verify_commit_ctx)
+
 
 class GDNStatePagingGPUTest(unittest.TestCase):
     """MambaAttnBackend state paging vs the
@@ -1518,6 +1748,7 @@ class TritonCheckpointContinuationTest(unittest.TestCase):
                     seq_len=n,
                     num_real_tokens=n,
                     cu_seqlens_cpu=bounds_cpu,
+                    inputs_packed=False,
                     **kwargs,
                 )
                 self.assertFalse(expected_state[0].is_contiguous())
@@ -1565,6 +1796,7 @@ class TritonCheckpointContinuationTest(unittest.TestCase):
                         seq_len=4,
                         num_real_tokens=4,
                         cu_seqlens_cpu=prefix_bounds,
+                        inputs_packed=False,
                         **body_kwargs,
                     )
                     torch.testing.assert_close(

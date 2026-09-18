@@ -29,6 +29,7 @@ kernel build is present) the CUDA kernel must match the torch fallback.
 import os
 import sys
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
@@ -128,7 +129,7 @@ class AttnResTests(unittest.TestCase):
         self.assertIs(supported.call_args.args[2], mlp_wp)
         fused.assert_called_once()
 
-    def test_unsupported_iris_reduce_defers_attnres_combine(self):
+    def test_fused_attention_window_defers_attnres_combine(self):
         import tokenspeed_kernel.ops.communication.triton as triton_comm
 
         import tokenspeed.runtime.models.kimi_k3_comm as kimi_k3_comm
@@ -159,8 +160,8 @@ class AttnResTests(unittest.TestCase):
             mock.patch.object(
                 triton_comm,
                 "allreduce_residual_attnres_combine_supported",
-                return_value=False,
-            ),
+                side_effect=lambda partial, *_args, **_kwargs: partial.shape[0] <= 16,
+            ) as supported,
             mock.patch.object(
                 kimi_k3_comm,
                 "all_reduce",
@@ -176,7 +177,63 @@ class AttnResTests(unittest.TestCase):
 
         torch.testing.assert_close(residual, prefix + reduced)
         self.assertIsNone(hidden)
+        supported.assert_called_once()
         fallback_reduce.assert_called_once_with(partial, state.mapping.attn.tp_group)
+
+    def test_fused_attention_reduce_window(self):
+        import tokenspeed_kernel.ops.communication.triton as triton_comm
+
+        import tokenspeed.runtime.models.kimi_k3_comm as kimi_k3_comm
+
+        combine = (
+            (object(), object(), object()),
+            object(),
+            object(),
+            torch.randn(_HIDDEN, dtype=torch.bfloat16),
+            _EPS,
+        )
+
+        with (
+            mock.patch.object(
+                kimi_k3_comm, "_get_process_group", return_value=object()
+            ),
+            mock.patch.object(
+                triton_comm,
+                "allreduce_residual_attnres_combine_supported",
+                side_effect=lambda partial, *_args, **_kwargs: partial.shape[0] <= 16,
+            ) as supported,
+        ):
+            for num_tokens, expected in (
+                (16, True),
+                (17, False),
+            ):
+                with self.subTest(num_tokens=num_tokens):
+                    partial = torch.randn(
+                        num_tokens,
+                        _HIDDEN,
+                        dtype=torch.bfloat16,
+                    )
+                    state = SimpleNamespace(
+                        mapping=SimpleNamespace(
+                            nprocs_per_node=8,
+                            attn=SimpleNamespace(
+                                tp_rank=0,
+                                tp_group=tuple(range(8)),
+                            ),
+                        )
+                    )
+                    comm = kimi_k3_comm.K3AttnComm(state)
+                    self.assertEqual(
+                        comm.fused_attnres_reduce_available(
+                            partial,
+                            partial,
+                            combine,
+                            torch.randn(_HIDDEN, dtype=torch.bfloat16),
+                        ),
+                        expected,
+                    )
+
+        self.assertEqual(supported.call_count, 2)
 
     def test_torch_fallback_matches_reference(self):
         prefix_sum, block_residual, proj, norm = _make_inputs(17)
@@ -400,12 +457,17 @@ class AttnResTests(unittest.TestCase):
             is_block_write_layer=False,
             block_write_idx=1,
             prev_valid_blocks=1,
+            _mlp_wp=weight,
+            _mlp_slot=3,
             self_attention_res_proj=SimpleNamespace(weight=weight.reshape(1, -1)),
             self_attention_res_norm=norm,
             input_layernorm=norm,
             mlp_res_proj=SimpleNamespace(weight=weight.reshape(1, -1)),
             mlp_res_norm=norm,
             post_attention_layernorm=norm,
+            k3_comm=SimpleNamespace(
+                fused_attnres_reduce_available=mock.Mock(return_value=False)
+            ),
         )
         block_residual = torch.empty(2, 2, _HIDDEN, dtype=torch.bfloat16)
 
@@ -429,6 +491,159 @@ class AttnResTests(unittest.TestCase):
                 )
             )
             self.assertEqual(available.call_count, 2)
+
+    def test_fused_attention_reduce_preempts_decomposed_graph(self):
+        weight = torch.empty(_HIDDEN, dtype=torch.bfloat16)
+        norm = SimpleNamespace(weight=weight, variance_epsilon=_EPS)
+        use_fused_reduce = mock.Mock(
+            side_effect=lambda partial, *_args: partial.shape[0] <= 16
+        )
+        layer = SimpleNamespace(
+            is_block_write_layer=False,
+            block_write_idx=1,
+            prev_valid_blocks=1,
+            _mlp_wp=weight,
+            _mlp_slot=3,
+            self_attention_res_proj=SimpleNamespace(weight=weight.reshape(1, -1)),
+            self_attention_res_norm=norm,
+            input_layernorm=norm,
+            mlp_res_proj=SimpleNamespace(weight=weight.reshape(1, -1)),
+            mlp_res_norm=norm,
+            post_attention_layernorm=norm,
+            k3_comm=SimpleNamespace(fused_attnres_reduce_available=use_fused_reduce),
+        )
+        hidden_states = SimpleNamespace(shape=(16, _HIDDEN), is_cuda=True)
+        fallback_hidden_states = SimpleNamespace(shape=(17, _HIDDEN), is_cuda=True)
+        scratch = (object(), object(), object())
+
+        with (
+            mock.patch.object(kimi_k3, "_sliced_scratch", return_value=scratch),
+            mock.patch.object(
+                kimi_k3,
+                "attn_res_fwd_available",
+                return_value=True,
+            ) as available,
+        ):
+            self.assertFalse(
+                kimi_k3.KimiLinearDecoderLayer._fused_attnres_graph_available(
+                    layer,
+                    hidden_states,
+                    object(),
+                )
+            )
+            self.assertTrue(
+                kimi_k3.KimiLinearDecoderLayer._fused_attnres_graph_available(
+                    layer,
+                    fallback_hidden_states,
+                    object(),
+                )
+            )
+
+        self.assertEqual(available.call_count, 2)
+        self.assertEqual(use_fused_reduce.call_count, 2)
+        fused_args = use_fused_reduce.call_args_list[0].args
+        self.assertIs(fused_args[0], hidden_states)
+        self.assertIs(fused_args[1], hidden_states)
+        self.assertIs(fused_args[2][0], scratch)
+        self.assertIs(fused_args[3], weight)
+        self.assertIs(
+            use_fused_reduce.call_args_list[1].args[0], fallback_hidden_states
+        )
+
+    def test_fused_attention_reduce_runs_after_scratch_production(self):
+        events = []
+
+        class Fork:
+            @contextmanager
+            def scope(self, *, enable):
+                self.assert_enabled = enable
+                yield self
+                # An enabled StreamFork joins before leaving the scope.
+                events.append("scope_exit")
+
+            @contextmanager
+            def branch(self):
+                yield
+
+        h = SimpleNamespace(shape=(16, _HIDDEN), is_cuda=True)
+        prefix = torch.zeros(16, _HIDDEN, dtype=torch.bfloat16)
+        hidden = torch.ones_like(prefix)
+        weight = mock.Mock()
+        weight.reshape.return_value = weight
+        fork = Fork()
+        reduce = mock.Mock(
+            side_effect=lambda *_args, **_kwargs: (
+                events.append("reduce"),
+                (prefix, hidden),
+            )[1]
+        )
+        attention = mock.Mock(side_effect=lambda **_kwargs: events.append("attention"))
+        attention.return_value = object()
+        layer = SimpleNamespace(
+            _fused_attnres_graph_available=mock.Mock(return_value=False),
+            _mix_into_attention=mock.Mock(return_value=(h, prefix)),
+            prev_valid_blocks=1,
+            is_block_write_layer=False,
+            _mlp_slot=3,
+            _mlp_split=False,
+            _next_attn_mix=None,
+            _hoist_next_mlp=False,
+            _mlp_wp=object(),
+            mlp_res_proj=SimpleNamespace(weight=weight),
+            mlp_res_norm=SimpleNamespace(weight=object(), variance_epsilon=_EPS),
+            post_attention_layernorm=SimpleNamespace(weight=object()),
+            self_attn=attention,
+            comm_manager=object(),
+            k3_comm=SimpleNamespace(
+                state=SimpleNamespace(attn_ar_fusion_ok=False),
+                fused_attnres_reduce_available=mock.Mock(return_value=True),
+            ),
+            attn_fork=fork,
+            _reduce_attn_accumulate=reduce,
+            is_moe_layer=False,
+            mlp=mock.Mock(return_value=torch.zeros_like(prefix)),
+        )
+
+        # Exercise NVIDIA (0) and AMD (16) thresholds on either host. Scratch
+        # consumers must follow scope exit even when the producer overlaps.
+        for fork_threshold, is_capture, fork_enabled in (
+            (0, False, False),
+            (0, True, True),
+            (16, False, False),
+            (16, True, False),
+        ):
+            with self.subTest(fork_threshold=fork_threshold, is_capture=is_capture):
+                events.clear()
+                reduce.reset_mock()
+                with (
+                    mock.patch.object(
+                        kimi_k3, "ATTNRES_STREAM_FORK_THRESHOLD", fork_threshold
+                    ),
+                    mock.patch.object(
+                        kimi_k3, "get_is_capture_mode", return_value=is_capture
+                    ),
+                    mock.patch.object(
+                        kimi_k3, "_sliced_scratch", return_value=object()
+                    ),
+                    mock.patch.object(
+                        kimi_k3,
+                        "attnres_partial",
+                        side_effect=lambda *_args: events.append("partial"),
+                    ),
+                ):
+                    kimi_k3.KimiLinearDecoderLayer.forward(
+                        layer,
+                        object(),
+                        object(),
+                        object(),
+                        [object()],
+                    )
+
+                self.assertEqual(fork.assert_enabled, fork_enabled)
+                self.assertEqual(
+                    events, ["partial", "attention", "scope_exit", "reduce"]
+                )
+                reduce.assert_called_once()
 
     def test_fused_to_fallback_populates_next_split_partial(self):
         hidden_states = SimpleNamespace(shape=(4, _HIDDEN), is_cuda=True)

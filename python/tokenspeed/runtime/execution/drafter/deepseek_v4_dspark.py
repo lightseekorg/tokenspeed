@@ -188,15 +188,10 @@ class DeepseekV4DSpark(BaseDrafter):
         )
 
     def wire_target(self, target_model) -> None:
+        """Bind execution resources without changing model capture configuration."""
         self.target_model = target_model
         self.lm_head = self.draft_model.lm_head
         self.tp_group = target_model.logits_processor.tp_group
-        if not hasattr(target_model, "set_dspark_layers_to_capture"):
-            raise ValueError(
-                "DSPARK requires the target model to support "
-                "set_dspark_layers_to_capture."
-            )
-        target_model.set_dspark_layers_to_capture(self.target_layer_ids)
 
     def prepare_request_state(
         self,
