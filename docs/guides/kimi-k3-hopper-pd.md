@@ -23,16 +23,10 @@ Build the kernel package with its Marlin CUDA extension on the GPU hosts.
 `--kda-backend flashkda` requires the matching FlashKDA package; it selects
 the prefill scan, while KDA decode/verify uses the platform-selected kernels.
 
-For Linux H100/H200 hosts with CUDA Toolkit 12.9 and an active Python 3.11
-virtual environment, install this checkout through the dedicated recipe:
-
-```bash
-CUDA_VARIANT=cu129 bash test/ci_system/install_deps.sh
-```
-
-The [Hopper/cu129 installation guide](hopper-cu129.md) describes the host
-prerequisites and dependency sources. The command rebuilds the checkout's
-kernel and scheduler packages; it does not start the P, D, or SMG services.
+Install this checkout with the standard recipe
+(`bash test/ci_system/install_deps.sh`, see the
+[getting-started guide](getting-started.md)); it rebuilds the checkout's
+kernel and scheduler packages and does not start the P, D, or SMG services.
 
 This runtime requires `tokenspeed-scheduler>=0.1.18` for the prefill role's
 decode-slot reserve and the PD lifecycle counters. Rebuild the scheduler from
