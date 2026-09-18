@@ -46,21 +46,10 @@ class CacheLayerOwnership:
     target_cache_window: tuple[int, int]
 
     def __post_init__(self) -> None:
-        for name, minimum in (
-            ("num_target_cache_layers", 1),
-            ("num_draft_cache_layers", 0),
-        ):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-                raise ValueError(f"{name} must be an integer >= {minimum}")
+        if self.num_target_cache_layers < 1 or self.num_draft_cache_layers < 0:
+            raise ValueError("cache layer counts must be non-negative, target >= 1")
         start, end = self.target_cache_window
-        if (
-            any(
-                isinstance(value, bool) or not isinstance(value, int)
-                for value in (start, end)
-            )
-            or not 0 <= start < end <= self.num_target_cache_layers
-        ):
+        if not 0 <= start < end <= self.num_target_cache_layers:
             raise ValueError(
                 "cache layer window is outside the target cache layer range"
             )
