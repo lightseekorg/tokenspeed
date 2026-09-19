@@ -289,7 +289,7 @@ def get_tdm_gather_scatter_idx_layout(NUM_INDICES, NUM_WARPS):
 
 
 @gluon.constexpr_function
-def get_wmma_layout(num_warps, packed, use_wmma_scaled, scale_preshuffle):
+def get_wmma_layout(num_warps, block_m, packed, use_wmma_scaled, scale_preshuffle):
     assert num_warps in (4, 8)
     if scale_preshuffle:
         reg_bases = [[0, 1], [1, 0]]
@@ -298,16 +298,23 @@ def get_wmma_layout(num_warps, packed, use_wmma_scaled, scale_preshuffle):
         reg_bases = []
         tiles_per_warp = 1
 
-    # [NUM_WARPS // 2, 2]
-    if num_warps == 4:
-        warp_bases = [[0, tiles_per_warp], [tiles_per_warp, 0]]
-    else:
-        warp_bases = [[0, tiles_per_warp], [0, tiles_per_warp * 2], [tiles_per_warp, 0]]
-
     if use_wmma_scaled:
         WMMA_INSTR_SHAPE: gl.constexpr = [16, 16, 64] if packed else [16, 16, 128]
     else:
         WMMA_INSTR_SHAPE: gl.constexpr = [16, 16, 32]
+
+    # Warp bits continue the doubling the register bits started, so the first
+    # one steps N by the tiles_per_warp tiles a warp's registers already cover.
+    warp_bases = [
+        [0, tiles_per_warp << bit] for bit in range(num_warps.bit_length() - 1)
+    ]
+
+    # One warp's registers already span tiles_per_warp tiles of M. A warp bit
+    # stepping M beyond that covers rows the block does not have, so below the
+    # threshold every bit goes to N instead.
+    split_m = block_m > tiles_per_warp * WMMA_INSTR_SHAPE[0]
+    if split_m:
+        warp_bases[-1] = [tiles_per_warp, 0]
 
     return gl.amd.AMDWMMALayout(3, True, warp_bases, reg_bases, WMMA_INSTR_SHAPE)
 
@@ -452,10 +459,10 @@ class MoEConfig:
         )
 
         WMMA_LAYOUT: gl.constexpr = get_wmma_layout(
-            NUM_WARPS, False, self.USE_WMMA_SCALED, SCALE_PRESHUFFLE
+            NUM_WARPS, BLOCK_M, False, self.USE_WMMA_SCALED, SCALE_PRESHUFFLE
         )
         WMMA_LAYOUT_PACKED: gl.constexpr = get_wmma_layout(
-            NUM_WARPS, True, self.USE_WMMA_SCALED, SCALE_PRESHUFFLE
+            NUM_WARPS, BLOCK_M, True, self.USE_WMMA_SCALED, SCALE_PRESHUFFLE
         )
 
         DOT_K_WIDTH: gl.constexpr = 16 if self.USE_WMMA_SCALED else 8
