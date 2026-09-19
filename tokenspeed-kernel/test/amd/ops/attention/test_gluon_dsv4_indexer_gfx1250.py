@@ -338,6 +338,13 @@ def test_decode_tdm_threshold_logits() -> None:
 
 
 def test_decode_graph_refresh_and_plan_aliasing() -> None:
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class RejectClone(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            assert func != torch.ops.aten.clone.default
+            return func(*args, **(kwargs or {}))
+
     index_q, weights, cache, _, _ = _inputs(2, 32, 24)
     block_table = torch.arange(24, device="cuda", dtype=torch.int32).reshape(2, 12)
     lengths = torch.tensor([[720], [0]], device="cuda", dtype=torch.int32)
@@ -352,6 +359,15 @@ def test_decode_graph_refresh_and_plan_aliasing() -> None:
             solution="gluon",
         )
     assert plan.data_ptr() != lengths.data_ptr()
+    with RejectClone():
+        refreshed = dsv4_plan(
+            page_size=_PAGE_SIZE,
+            seq_lens_2d=lengths,
+            out=plan,
+            override=None,
+            solution="gluon",
+        )
+    assert refreshed.data_ptr() == plan.data_ptr()
 
     def run() -> torch.Tensor:
         refreshed = dsv4_plan(

@@ -1115,13 +1115,16 @@ def gluon_dsv4_plan_gfx1250(
 
     if int(page_size) != _PAGE_SIZE:
         raise ValueError(f"GFX1250 DSV4 indexer requires page_size=64, got {page_size}")
-    plan = seq_lens_2d.clone(memory_format=torch.contiguous_format)
     if out is None:
-        return plan
+        return seq_lens_2d.clone(memory_format=torch.contiguous_format)
     if not isinstance(out, torch.Tensor):
         raise TypeError("GFX1250 DSV4 plan output must be a tensor")
-    if out.shape != plan.shape or out.dtype != plan.dtype or out.device != plan.device:
+    if (
+        out.shape != seq_lens_2d.shape
+        or out.dtype != seq_lens_2d.dtype
+        or out.device != seq_lens_2d.device
+    ):
         raise ValueError("GFX1250 DSV4 plan output must match seq_lens_2d")
     with torch.inference_mode():
-        out.copy_(plan)
+        out.copy_(seq_lens_2d)
     return out
