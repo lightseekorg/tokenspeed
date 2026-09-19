@@ -214,7 +214,7 @@ def _get_pool(engine: Any, device: Any) -> _RecvBufferPool | None:
         else:
             pool = _RecvBufferPool(engine, device, slot_mb << 20, n_slots)
             logger.info(
-                "EPD recv pool up: %d slots x %d MB (lifetime MR)", n_slots, slot_mb
+                f"EPD recv pool up: {n_slots:d} slots x {slot_mb:d} MB (lifetime MR)",
             )
         _POOLS[key] = pool
     return pool or None
@@ -477,10 +477,9 @@ class EmbeddingReceiveJob:
                     )
                 else:
                     logger.info(
-                        "EPD recv pool: no slot for %d B (free=%d); falling back "
+                        f"EPD recv pool: no slot for {nbytes:d} B (free="
+                        f"{len(pool._free):d}); falling back "
                         "to per-request registration",
-                        nbytes,
-                        len(pool._free),
                     )
                     pool = None
         if recv_main is None:
@@ -1019,8 +1018,8 @@ class EpdPrefillAdmission:
             dist.broadcast(warmup, src=self._group_ranks[0], group=self._nccl_group)
             torch.cuda.current_stream().synchronize()
             logger.info(
-                "EPD embedding row-sharding enabled (attn_tp=%d, NCCL group warm)",
-                attn_tp_size,
+                f"EPD embedding row-sharding enabled (attn_tp={attn_tp_size:d}, NCCL "
+                "group warm)",
             )
 
     def stage(self, request_id, mm_items) -> None:
@@ -1073,9 +1072,8 @@ class EpdPrefillAdmission:
             if codes[_i] == 1 and (_now - self._pending[_i][2]) > self._embed_timeout:
                 codes[_i] = 0
                 logger.warning(
-                    "EPD embedding receive timed out after %.0fs for rid=%s; aborting",
-                    self._embed_timeout,
-                    self._pending[_i][0],
+                    f"EPD embedding receive timed out after {self._embed_timeout:.0f}s "
+                    f"for rid={self._pending[_i][0]!s}; aborting",
                 )
 
         if self._attn_tp_size > 1:

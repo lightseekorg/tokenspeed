@@ -400,10 +400,9 @@ class PrefillGraph:
             }
             sample = next(iter(ordinary.values()), None)
             logger.info(
-                "prefill breakable graph: captured buckets %s (segments=%d, eager "
-                "attention breaks)",
-                sorted(ordinary),
-                sample[0].num_segments if sample is not None else 0,
+                f"prefill breakable graph: captured buckets {sorted(ordinary)!s} "
+                f"(segments={(sample[0].num_segments if sample is not None else 0):d}, "
+                "eager attention breaks)",
             )
             variants = {
                 key: value
@@ -412,11 +411,11 @@ class PrefillGraph:
             }
             if variants:
                 logger.info(
-                    "prefill inline attention: captured (tokens, requests) %s "
+                    "prefill inline attention: captured (tokens, requests) "
+                    f"{sorted(variants)!s} "
                     "with fixed checkpoint slots "
-                    "(segments=%d, ordinary captures retained for fallback)",
-                    sorted(variants),
-                    next(iter(variants.values()))[0].num_segments,
+                    f"(segments={next(iter(variants.values()))[0].num_segments:d}, "
+                    "ordinary captures retained for fallback)",
                 )
 
     def _capture_bucket(
@@ -863,11 +862,9 @@ class PrefillGraph:
             return
         self._engaged_logged.add(kind)
         logger.info(
-            "prefill breakable graph ENGAGED (%s): bucket=%d dp=%s mode=%s "
-            "(mixed prefill+decode batches supported)",
-            kind,
-            bucket,
             # The replay mode actually taken (mirrors _select_bucket), a DP-debug anchor.
-            self.dp_size > 1 and ctx.global_num_tokens is not None,
-            ctx.forward_mode,
+            f"prefill breakable graph ENGAGED ({kind!s}): bucket={bucket:d} dp="
+            f"{self.dp_size > 1 and ctx.global_num_tokens is not None!s} mode="
+            f"{ctx.forward_mode!s} "
+            "(mixed prefill+decode batches supported)",
         )

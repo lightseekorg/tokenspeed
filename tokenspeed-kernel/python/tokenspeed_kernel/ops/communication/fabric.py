@@ -182,7 +182,7 @@ def fabric_allocation_supported(device_index: int) -> bool:
     if cached is None:
         cached = _probe_fabric_allocation(device_index)
         _probe_cache[device_index] = cached
-        logger.info("fabric allocation on device %s: %s", device_index, cached)
+        logger.info(f"fabric allocation on device {device_index!s}: {cached!s}")
     return cached
 
 
@@ -248,10 +248,8 @@ def gather_fabric_map() -> list[bool]:
     _fabric_map = [bool(value[0].item()) for value in gathered]
     _host_map = [int(value[1].item()) for value in gathered]
     logger.info(
-        "fabric allocation available on %s/%s ranks across %s hosts",
-        sum(_fabric_map),
-        len(_fabric_map),
-        len(set(_host_map)),
+        f"fabric allocation available on {sum(_fabric_map)!s}/{len(_fabric_map)!s} "
+        f"ranks across {len(set(_host_map))!s} hosts",
     )
     return _fabric_map
 

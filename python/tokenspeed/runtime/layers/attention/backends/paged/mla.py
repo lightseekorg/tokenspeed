@@ -163,14 +163,11 @@ class MLAAttnBackend(PagedAttentionBackend):
             )
             self._query_block_decode[key] = answer
             logger.info(
-                "MLA block decode uses the %s layout "
-                "(heads=%d, block=%d, page=%d, dtype=%s, window=%s).",
-                "query-axis" if answer else "flattened",
-                num_q_heads,
-                q_len,
-                self.kernel_page_size,
-                self.data_type,
-                sliding_window,
+                "MLA block decode uses the "
+                f"{('query-axis' if answer else 'flattened')!s} layout "
+                f"(heads={num_q_heads:d}, block={q_len:d}, page="
+                f"{self.kernel_page_size:d}, dtype={self.data_type!s}, window="
+                f"{sliding_window!s}).",
             )
         return answer
 

@@ -199,7 +199,7 @@ def download_weights_from_hf(
                 allow_patterns = [pattern]
                 break
 
-    logger.info("Using model weights format %s", allow_patterns)
+    logger.info(f"Using model weights format {allow_patterns!s}")
     # Use file lock to prevent multiple processes from
     # downloading the same model weights at the same time.
     with get_lock(model_name_or_path, cache_dir):
@@ -244,9 +244,9 @@ def download_safetensors_index_file_from_hf(
         # If file not found on remote or locally, we should not fail since
         # only some models will have index_file.
         except huggingface_hub.utils.EntryNotFoundError:
-            logger.info("No %s found in remote.", index_file)
+            logger.info(f"No {index_file!s} found in remote.")
         except huggingface_hub.utils.LocalEntryNotFoundError:
-            logger.info("No %s found in local cache.", index_file)
+            logger.info(f"No {index_file!s} found in local cache.")
 
 
 # For models like Mistral-7B-v0.3, there are both sharded
@@ -927,18 +927,17 @@ def kv_cache_scales_loader(
             layer_scales_map = schema.kv_cache.scaling_factor[tp_rank]
             return layer_scales_map.items()
     except FileNotFoundError:
-        logger.error("File or directory '%s' not found.", filename)
+        logger.error(f"File or directory '{filename!s}' not found.")
     except json.JSONDecodeError:
-        logger.error("Error decoding JSON in file '%s'.", filename)
+        logger.error(f"Error decoding JSON in file '{filename!s}'.")
     except Exception:
-        logger.error("An error occurred while reading '%s'.", filename)
+        logger.error(f"An error occurred while reading '{filename!s}'.")
     # This section is reached if and only if any of the excepts are hit
     # Return an empty iterable (list) => no KV cache scales are loaded
     # which ultimately defaults to 1.0 scales
     logger.warning(
         "Defaulting to KV cache scaling factors = 1.0 for all "
-        "layers in TP rank %d as an error occurred during loading.",
-        tp_rank,
+        f"layers in TP rank {tp_rank:d} as an error occurred during loading.",
     )
     return []
 

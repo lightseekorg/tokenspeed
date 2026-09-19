@@ -129,7 +129,7 @@ class Engine(EngineBase):
 
         # Allocate ports for inter-process communications
         self.port_args = PortArgs.init_new(server_args)
-        logger.info("server_args=%r", server_args)
+        logger.info(f"server_args={server_args!r}")
 
         # Launch subprocesses
         tokenizer_manager, _, scheduler_info = _launch_subprocesses(
@@ -526,7 +526,7 @@ def _launch_subprocesses(
     # Allocate ports for inter-process communications
     if port_args is None:
         port_args = PortArgs.init_new(server_args)
-        logger.info("server_args=%r", server_args)
+        logger.info(f"server_args={server_args!r}")
 
     # If using model from www.modelscope.cn, first download the model.
     server_args.model, server_args.tokenizer = prepare_model_and_tokenizer(
@@ -596,9 +596,8 @@ def _launch_subprocesses(
         for proc in scheduler_procs:
             proc.join()
             logger.error(
-                "Scheduler or DataParallelController %s terminated with %s",
-                proc.pid,
-                proc.exitcode,
+                f"Scheduler or DataParallelController {proc.pid!s} terminated with "
+                f"{proc.exitcode!s}",
             )
         return None, None, None
 
@@ -613,10 +612,11 @@ def _launch_subprocesses(
             data = scheduler_pipe_readers[i].recv()
         except EOFError:
             logger.error(
-                "Rank %s scheduler is dead. Please check if there are relevant logs.", i
+                f"Rank {i!s} scheduler is dead. Please check if there are relevant "
+                "logs.",
             )
             scheduler_procs[i].join()
-            logger.error("Exit code: %s", scheduler_procs[i].exitcode)
+            logger.error(f"Exit code: {scheduler_procs[i].exitcode!s}")
             raise
 
         if data["status"] != "ready":
@@ -662,7 +662,7 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
     # PortArgs is still derived (nccl_port drives torch.distributed); the pickle
     # scheduler_input/tokenizer IPC names it carries are unused in msgpack mode.
     port_args = PortArgs.init_new(server_args)
-    logger.info("headless server_args=%r", server_args)
+    logger.info(f"headless server_args={server_args!r}")
 
     server_args.model, server_args.tokenizer = prepare_model_and_tokenizer(
         server_args.model, server_args.tokenizer
@@ -679,7 +679,7 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
     def _terminate_schedulers(signum=None, _frame=None):
         """Forward a shutdown (or child-failure SIGUSR1) to every scheduler."""
         if signum is not None:
-            logger.info("received signal %s; terminating scheduler(s)", signum)
+            logger.info(f"received signal {signum!s}; terminating scheduler(s)")
         if signum == signal.SIGUSR1:
             child_failed.set()
         for proc in scheduler_procs:
@@ -728,20 +728,19 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
                 data = reader.recv()
             except EOFError:
                 logger.error(
-                    "Rank %s scheduler is dead. Please check if there are "
+                    f"Rank {i!s} scheduler is dead. Please check if there are "
                     "relevant logs.",
-                    i,
                 )
                 scheduler_procs[i].join()
-                logger.error("Exit code: %s", scheduler_procs[i].exitcode)
+                logger.error(f"Exit code: {scheduler_procs[i].exitcode!s}")
                 raise
             if data.get("status") != "ready":
                 raise RuntimeError(
                     "Scheduler initialization failed. See the error messages above."
                 )
         logger.info(
-            "headless scheduler(s) ready; SMG handshake endpoint=%s",
-            server_args.zmq_handshake_endpoint(),
+            "headless scheduler(s) ready; SMG handshake endpoint="
+            f"{server_args.zmq_handshake_endpoint()!s}",
         )
 
         # Supervise until every scheduler exits. If any rank dies (e.g. OOM
@@ -757,14 +756,13 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
                 alive.remove(proc)
                 if proc.exitcode == 0:
                     logger.info(
-                        "scheduler %s exited with code %s", proc.pid, proc.exitcode
+                        f"scheduler {proc.pid!s} exited with code {proc.exitcode!s}",
                     )
                 else:
                     logger.error(
-                        "scheduler %s exited with code %s; terminating the "
+                        f"scheduler {proc.pid!s} exited with code {proc.exitcode!s}; "
+                        "terminating the "
                         "remaining scheduler(s)",
-                        proc.pid,
-                        proc.exitcode,
                     )
                     failed = True
                     _terminate_schedulers()

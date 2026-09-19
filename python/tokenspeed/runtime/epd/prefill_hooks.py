@@ -122,9 +122,7 @@ class EpdPrefillHooks:
                     loop.kv_transfer.abort(rid, bootstrap)
                 except Exception as exc:  # never let it wedge the loop
                     logger.warning(
-                        "EPD abort->decode signal failed for rid=%s: %s",
-                        rid,
-                        exc,
+                        f"EPD abort->decode signal failed for rid={rid!s}: {exc!s}",
                     )
             state.set_finish_with_abort("EPD embedding receive failed or timed out")
             loop.output_processor.publish_finished_at_admission(rid, state)

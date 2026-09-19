@@ -136,7 +136,7 @@ def override_model_config(model_config, ext_yaml):
             else:
                 new_v = v
             model_config.__setattr__(k, new_v)
-            logger.info("Override model config: %s=%r", k, new_v)
+            logger.info(f"Override model config: {k!s}={new_v!r}")
 
 
 def is_deepseek_v4(config: PretrainedConfig) -> bool:
@@ -386,11 +386,9 @@ def _apply_attention_family_defaults(
         ].default
         if server_args.prefix_granularity == granularity_default:
             logger.info(
-                "%s default prefix_granularity=%d; pass --prefix-granularity "
-                "with a value other than %d to keep that value.",
-                spec.name,
-                spec.default_prefix_granularity,
-                granularity_default,
+                f"{spec.name!s} default prefix_granularity="
+                f"{spec.default_prefix_granularity:d}; pass --prefix-granularity "
+                f"with a value other than {granularity_default:d} to keep that value.",
             )
             server_args.prefix_granularity = spec.default_prefix_granularity
     if spec.default_backend is not None and server_args.attention_backend is None:
@@ -594,9 +592,9 @@ class ModelConfig:
             and server_args.gpu_memory_utilization > 0.9
         ):
             logger.info(
-                "Clamping gpu_memory_utilization %.2f -> 0.9 to leave headroom "
+                "Clamping gpu_memory_utilization "
+                f"{server_args.gpu_memory_utilization:.2f} -> 0.9 to leave headroom "
                 "for the vision encoder.",
-                server_args.gpu_memory_utilization,
             )
             server_args.gpu_memory_utilization = 0.9
         self.mm_attention_backend = getattr(server_args, "mm_attention_backend", None)
@@ -608,11 +606,11 @@ class ModelConfig:
             if context_length > derived_context_len:
                 if envs.TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.get():
                     logger.warning(
-                        "User-specified context_length (%s) is greater than the derived "
-                        "context_length (%s). This may lead to incorrect model outputs or "
+                        f"User-specified context_length ({context_length!s}) is greater"
+                        " than the derived "
+                        f"context_length ({derived_context_len!s}). This may lead to "
+                        "incorrect model outputs or "
                         "CUDA errors.",
-                        context_length,
-                        derived_context_len,
                     )
                     self.context_len = context_length
                 else:
@@ -720,9 +718,8 @@ class ModelConfig:
                     )
                 except Exception as exc:
                     logger.debug(
-                        "Unable to resolve local quantization config for %s: %s",
-                        self.model_path,
-                        exc,
+                        "Unable to resolve local quantization config for "
+                        f"{self.model_path!s}: {exc!s}",
                     )
                     model_dir = None
             if model_dir is not None:
@@ -797,10 +794,9 @@ class ModelConfig:
 
             if self.quantization not in optimized_quantization_methods:
                 logger.warning(
-                    "%s quantization is not fully "
+                    f"{self.quantization!s} quantization is not fully "
                     "optimized yet. The speed can be slower than "
                     "non-quantized models.",
-                    self.quantization,
                 )
 
     def get_hf_eos_token_id(self) -> set[int] | None:
@@ -898,13 +894,13 @@ def _get_and_verify_dtype(
     if torch_dtype != config_dtype:
         if torch_dtype == torch.float32:
             # Upcasting to float32 is allowed.
-            logger.info("Upcasting %s to %s.", config_dtype, torch_dtype)
+            logger.info(f"Upcasting {config_dtype!s} to {torch_dtype!s}.")
         elif config_dtype == torch.float32:
             # Downcasting from float32 to float16 or bfloat16 is allowed.
-            logger.info("Downcasting %s to %s.", config_dtype, torch_dtype)
+            logger.info(f"Downcasting {config_dtype!s} to {torch_dtype!s}.")
         else:
             # Casting between float16 and bfloat16 is allowed with a warning.
-            logger.warning("Casting %s to %s.", config_dtype, torch_dtype)
+            logger.warning(f"Casting {config_dtype!s} to {torch_dtype!s}.")
 
     return torch_dtype
 

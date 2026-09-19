@@ -446,22 +446,13 @@ def _log_selection(
     breakdown = next((s for spec, s in scored if spec.name == winner.name), None)
     if breakdown:
         logger.info(
-            "[tokenspeed_kernel] %s.%s(%s) -> %s (%s, %s)",
-            family,
-            mode,
-            format_signature,
-            winner.name,
-            breakdown,
-            platform.arch,
+            f"[tokenspeed_kernel] {family!s}.{mode!s}({format_signature!s}) -> "
+            f"{winner.name!s} ({breakdown!s}, {platform.arch!s})",
         )
     else:
         logger.info(
-            "[tokenspeed_kernel] %s.%s(%s) -> %s (%s)",
-            family,
-            mode,
-            format_signature,
-            winner.name,
-            platform.arch,
+            f"[tokenspeed_kernel] {family!s}.{mode!s}({format_signature!s}) -> "
+            f"{winner.name!s} ({platform.arch!s})",
         )
 
 
@@ -605,10 +596,8 @@ def _autotune_select(
     )
     winner = scored[0][0]
     logger.debug(
-        "[tokenspeed_kernel:autotune] falling back to heuristic for %s.%s(%s)",
-        family,
-        mode,
-        format_signature,
+        f"[tokenspeed_kernel:autotune] falling back to heuristic for {family!s}."
+        f"{mode!s}({format_signature!s})",
     )
     return winner, scored
 
@@ -766,8 +755,6 @@ def warmup_selection(
             select_kernel(family, mode, format_signature, traits=traits)
         except NoKernelFoundError:
             logger.debug(
-                "[tokenspeed_kernel] warmup: no kernel for %s.%s(%s)",
-                family,
-                mode,
-                format_signature,
+                f"[tokenspeed_kernel] warmup: no kernel for {family!s}.{mode!s}("
+                f"{format_signature!s})",
             )

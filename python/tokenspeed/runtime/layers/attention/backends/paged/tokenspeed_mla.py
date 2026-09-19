@@ -374,14 +374,11 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             return
         self._logged_block_layouts.add(key)
         logger.info(
-            "CuteDSL MLA block decode uses the %s layout "
-            "(heads=%d, block=%d, page=%d, dtype=%s, window=%s).",
-            "query-axis" if q_len == self.spec_num_tokens else "flattened",
-            num_q_heads,
-            q_len,
-            self.kernel_page_size,
-            self.data_type,
-            sliding_window,
+            "CuteDSL MLA block decode uses the "
+            f"{('query-axis' if q_len == self.spec_num_tokens else 'flattened')!s} "
+            "layout "
+            f"(heads={num_q_heads:d}, block={q_len:d}, page={self.kernel_page_size:d}, "
+            f"dtype={self.data_type!s}, window={sliding_window!s}).",
         )
 
     def _decode_views(self, bs: int) -> CuteDSLMLADecodeMetadata:
@@ -542,9 +539,8 @@ class CuteDSLMLABackend(PagedAttentionBackend):
 
         if not CuteDSLMLABackend._logged_decode:
             logger.info(
-                "CuteDSL MLA decode kernel invoked (tokenspeed_mla_decode, query_dtype=%s, kv_dtype=%s)",
-                query.dtype,
-                kv_cache.dtype,
+                "CuteDSL MLA decode kernel invoked (tokenspeed_mla_decode, query_dtype="
+                f"{query.dtype!s}, kv_dtype={kv_cache.dtype!s})",
             )
             CuteDSLMLABackend._logged_decode = True
 

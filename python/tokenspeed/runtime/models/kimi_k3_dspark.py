@@ -319,7 +319,7 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         super().__init__()
         validate_k3_dspark_config(config)
         for note in k3_dspark_inactive_features(config):
-            logger.warning("K3 DSpark: %s", note)
+            logger.warning(f"K3 DSpark: {note!s}")
         self.config = config
         self.mapping = mapping
         self.attention_kind = "kimi_mla"

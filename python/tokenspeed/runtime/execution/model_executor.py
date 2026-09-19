@@ -252,15 +252,13 @@ class ModelExecutorConfig:
         derived_context_len = get_context_length(model_config.hf_text_config)
         if physical_context_len > derived_context_len:
             logger.warning(
-                "physical context extent %s (context_len %s + spec overshoot "
-                "pad %s) exceeds the model's derived context length %s; "
+                f"physical context extent {physical_context_len!s} (context_len "
+                f"{model_config.context_len!s} + spec overshoot "
+                f"pad {server_args.spec_context_pad!s}) exceeds the model's derived "
+                f"context length {derived_context_len!s}; "
                 "positions in the pad index past the precomputed rope tables. "
-                "Lower --max-model-len by at least %s to stay in bounds.",
-                physical_context_len,
-                model_config.context_len,
-                server_args.spec_context_pad,
-                derived_context_len,
-                physical_context_len - derived_context_len,
+                "Lower --max-model-len by at least "
+                f"{physical_context_len - derived_context_len!s} to stay in bounds.",
             )
 
         # User intent only; backend-imposed graph restrictions are declared on
@@ -349,6 +347,7 @@ class ModelExecutor:
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self._draft_final_step_counter = None
+        self._pp_wire_logged = False
 
         max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
 
@@ -711,12 +710,11 @@ class ModelExecutor:
         spec = self.model_runner.model.model.pp_stage_state_spec(
             num_tokens, torch.device(self.device)
         )
-        if not getattr(self, "_pp_wire_logged", False):
+        if not self._pp_wire_logged:
             self._pp_wire_logged = True
             logger.info(
-                "PP stage %d recv wire: %s",
-                self.config.pp_rank,
-                [(tuple(shape), str(dtype)) for _, shape, dtype in spec],
+                f"PP stage {self.config.pp_rank:d} recv wire: "
+                f"{[(tuple(shape), str(dtype)) for _, shape, dtype in spec]!s}",
             )
         tensors = [
             pp_recv(
@@ -735,12 +733,11 @@ class ModelExecutor:
         from tokenspeed.runtime.distributed.comm_ops import pp_send
 
         tensors = state.tensors()
-        if not getattr(self, "_pp_wire_logged", False):
+        if not self._pp_wire_logged:
             self._pp_wire_logged = True
             logger.info(
-                "PP stage %d send wire: %s",
-                self.config.pp_rank,
-                [(tuple(t.shape), str(t.dtype)) for t in tensors],
+                f"PP stage {self.config.pp_rank:d} send wire: "
+                f"{[(tuple(t.shape), str(t.dtype)) for t in tensors]!s}",
             )
         for tensor in tensors:
             pp_send(tensor, self.config.pp_rank + 1, self.config.pp_group)
@@ -934,15 +931,10 @@ class ModelExecutor:
             return
         self._last_dp_sampling_route_log = route_key
         logger.debug(
-            "Batch-DP route: forward_mode=%s bs=%d effective_bs=%d "
-            "use_graph=%s bucket_bs=%d dp_sampling=%s min_bs=%d",
-            ctx.forward_mode.name.lower(),
-            bs,
-            effective_bs,
-            use_graph,
-            bucket_bs,
-            dp_sampling,
-            runtime.min_bs,
+            f"Batch-DP route: forward_mode={ctx.forward_mode.name.lower()!s} bs={bs:d} "
+            f"effective_bs={effective_bs:d} "
+            f"use_graph={use_graph!s} bucket_bs={bucket_bs:d} dp_sampling="
+            f"{dp_sampling!s} min_bs={runtime.min_bs:d}",
         )
 
     @maybe_inference_mode()
@@ -1242,7 +1234,7 @@ class ModelExecutor:
 
         with nvtx_range("zero_cache_pages", color="purple"):
             sanitized = sanitize(self.token_to_kv_pool, pages)
-            draft_pool = getattr(self, "draft_token_to_kv_pool", None)
+            draft_pool = self.draft_token_to_kv_pool
             if draft_pool is not None and getattr(
                 draft_pool,
                 "requires_page_zeroing",
@@ -1629,24 +1621,17 @@ class ModelExecutor:
                     multimodal_context
                 )
                 logger.info(
-                    "mm_timing forward_execute_ms total=%.3f input_fill=%.3f "
-                    "mrope=%.3f sampling=%.3f forward_step=%.3f output_d2h=%.3f "
-                    "mode=%s bs=%s total_tokens=%s graph=%s padded_bs=%s "
-                    "has_mm=%s mm_count=%s mm_delta_count=%s",
-                    (time.perf_counter() - timing_start) * 1000.0,
-                    input_fill_ms,
-                    mrope_ms,
-                    sampling_prep_ms,
-                    forward_step_ms,
-                    output_d2h_ms,
-                    forward_mode.name,
-                    bs,
-                    total_tokens,
-                    graph_capable,
-                    graph_padded_bs,
-                    has_mm,
-                    mm_count,
-                    mm_delta_count,
+                    "mm_timing forward_execute_ms total="
+                    f"{(time.perf_counter() - timing_start) * 1000.0:.3f} input_fill="
+                    f"{input_fill_ms:.3f} "
+                    f"mrope={mrope_ms:.3f} sampling={sampling_prep_ms:.3f} "
+                    f"forward_step={forward_step_ms:.3f} output_d2h={output_d2h_ms:.3f}"
+                    " "
+                    f"mode={forward_mode.name!s} bs={bs!s} total_tokens="
+                    f"{total_tokens!s} graph={graph_capable!s} padded_bs="
+                    f"{graph_padded_bs!s} "
+                    f"has_mm={has_mm!s} mm_count={mm_count!s} mm_delta_count="
+                    f"{mm_delta_count!s}",
                 )
 
         return ModelExecutionResult(

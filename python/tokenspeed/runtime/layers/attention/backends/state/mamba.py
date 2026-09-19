@@ -877,9 +877,7 @@ class MambaAttnBackend(AttentionBackend):
 
     def _verify_scratch_base_rows(self, bs: int, draft_token_num: int) -> torch.Tensor:
         """Graph-stable scratch initialization row for each request."""
-        cache = getattr(self, "_verify_base_cache", None)
-        if cache is None:
-            cache = self._verify_base_cache = {}
+        cache = self._verify_base_cache
         key = (bs, draft_token_num)
         rows = cache.get(key)
         if rows is None:

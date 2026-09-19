@@ -75,9 +75,9 @@ def resolve_cuda_graph_support(*backends) -> CudaGraphSupport:
         backend = stack.pop()
         declared = backend.cuda_graph_support
         if not declared.decode_graph:
-            logger.info("Decode CUDA graphs disabled by %s", type(backend).__name__)
+            logger.info(f"Decode CUDA graphs disabled by {type(backend).__name__!s}")
         if not declared.prefill_graph:
-            logger.info("Prefill CUDA graphs disabled by %s", type(backend).__name__)
+            logger.info(f"Prefill CUDA graphs disabled by {type(backend).__name__!s}")
         resolved = resolved & declared
         stack.extend(backend.child_backends())
     return resolved

@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.distributed_initializer import DistributedConfig
 from tokenspeed.runtime.utils import server_args as server_args_module
 from tokenspeed.runtime.utils.server_args import PortArgs
@@ -25,13 +26,7 @@ def test_resolved_dist_init_addr_moves_with_busy_control_port(monkeypatch):
 
 
 def test_distributed_config_uses_resolved_dist_init_addr():
-    mapping = SimpleNamespace(
-        world_size=1,
-        nprocs_per_node=1,
-        attn=SimpleNamespace(tp_rank=0, tp_size=1, dp_size=1),
-        dense=SimpleNamespace(tp_size=1),
-        moe=SimpleNamespace(ep_size=1, ep_rank=0),
-    )
+    mapping = Mapping(rank=0, world_size=1, nprocs_per_node=1)
     args = SimpleNamespace(
         device="cuda",
         mapping=mapping,
