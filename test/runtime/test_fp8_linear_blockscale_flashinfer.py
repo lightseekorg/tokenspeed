@@ -1,4 +1,4 @@
-"""Dense FP8 (128,128) load-time scale preparation for FlashInfer."""
+"""Dense FP8 (128,128) preparation and dispatch for selectable backends."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -42,7 +43,11 @@ def _method() -> Fp8LinearMethod:
 
 
 @pytest.mark.parametrize("m", [1, 3, 4, 5])
-def test_process_weights_prepares_and_uses_native_scales(m: int) -> None:
+@pytest.mark.parametrize("backend", ["auto", "trtllm_cutedsl"])
+def test_process_weights_prepares_and_uses_native_scales(
+    m: int, backend: str, monkeypatch
+) -> None:
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", backend)
     n, k = 256, 512
     layer = _make_layer(n, k)
     canonical_scales = layer.weight_scale_inv.data.clone()
@@ -50,7 +55,13 @@ def test_process_weights_prepares_and_uses_native_scales(m: int) -> None:
 
     method.process_weights_after_loading(layer)
 
-    assert method.prepared_linear_plan(layer) is not None
+    plan = method.prepared_linear_plan(layer)
+    assert plan is not None
+    expected_override = {
+        "auto": "flashinfer_mm_fp8_blockscale",
+        "trtllm_cutedsl": "trtllm_cutedsl_mm_fp8_blockscale",
+    }
+    assert plan.override == expected_override[backend]
     assert torch.equal(layer.weight_scale_inv, canonical_scales)
 
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)

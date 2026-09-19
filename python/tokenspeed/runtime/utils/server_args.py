@@ -212,6 +212,9 @@ class ServerArgs:
     enable_expert_distribution_metrics: bool = False
     enable_eplb: bool = False
 
+    # Dense GEMM selection is independent of routed-expert kernels.
+    dense_gemm_backend: str = "auto"
+
     # MoE backend
     moe_backend: str = "auto"
     draft_moe_backend: str | None = None
@@ -513,6 +516,8 @@ class ServerArgs:
                 self.max_num_seqs = 160
 
     def resolve_kernel_backends(self):
+        if self.dense_gemm_backend not in {"auto", "trtllm_cutedsl"}:
+            raise ValueError("--dense-gemm-backend must be auto or trtllm_cutedsl")
         if self.sampling_backend is None:
             # ``flashinfer`` is the only built-in backend that respects per-request
             # ``temperature`` / ``top_p`` / ``top_k``. ``greedy`` is argmax-only
@@ -1481,6 +1486,16 @@ class ServerArgs:
             "--enable-eplb",
             action="store_true",
             help="Enable EPLB algorithm",
+        )
+        parser.add_argument(
+            "--dense-gemm-backend",
+            type=str,
+            default=ServerArgs.dense_gemm_backend,
+            choices=["auto", "trtllm_cutedsl"],
+            help="Backend for standard 128x128 block-FP8 dense linears. "
+            "trtllm_cutedsl requires Blackwell and preserves checkpoint FP8 "
+            "weights and FP32 scales without requantization. "
+            "Other quantization formats and routed experts are unchanged.",
         )
         parser.add_argument(
             "--moe-backend",

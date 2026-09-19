@@ -240,6 +240,23 @@ pip install flash-linear-attention
 Notes:
 
 - K3 uses the cache-group scheduler and KDA state groups.
+- On Blackwell, `--dense-gemm-backend trtllm_cutedsl` opts the
+  block-FP8 attention projections into TRT-LLM CuTe-DSL: KDA fused QKV/gates and output,
+  and MLA fused QKV-a/gate, Q-b, and output. Omit it (or use `auto`) to keep
+  the existing backend selection. This shared option applies across models
+  to standard 128x128 block-FP8 dense linears. BF16/NVFP4 linears, MXFP8,
+  per-tensor FP8, specialized grouped projections, and routed experts are
+  unchanged; it does not change tensor-parallel mapping.
+- This backend preserves checkpoint FP8 values and their FP32 128x128 block
+  scales; it does not requantize weights or convert scales to E8M0.
+  Activations use the existing 1x128 FP8 quantization path. The kernel uses
+  FP32 accumulation and BF16 output. Validate model accuracy on your workload;
+  preserving the quantization contract does not guarantee bitwise equality
+  across GEMM implementations.
+- It requires Blackwell, CuTe-DSL with TVM-FFI support, BF16 outputs, and aligned
+  local weight dimensions. Kernel variants compile during preparation before
+  CUDA-graph capture. Unsupported selected linears fail instead of silently
+  falling back. Faster GEMMs alone do not establish an end-to-end speedup.
 - KDA dispatch is vendor-neutral at the runtime boundary. The kernel registry
   selects the existing FLA-derived NVIDIA implementation or the native AMD
   implementation, including each backend's preferred recurrent-state layout.
