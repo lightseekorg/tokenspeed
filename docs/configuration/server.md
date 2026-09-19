@@ -201,11 +201,41 @@ the values accepted by the bundled `tokenspeed-smg` package.
 | `--speculative-draft-model-quantization` | Draft model quantization. Defaults to `unquant`. |
 | `--speculative-num-steps` | Number of draft model steps. Defaults to `3`. |
 | `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`. |
+| `--synthetic-acceptance-length` | Benchmark-only mean emitted tokens per speculative verification, including the guaranteed target token. Unset disables it. |
 | `--speculative-eagle-topk` | EAGLE top-k. Defaults to `1`. |
 | `--eagle3-layers-to-capture` | EAGLE3 layers to capture. |
 
 Prefer `--speculative-config` for recipe-style launches because it keeps method,
 draft model, and token count together.
+
+### Synthetic Acceptance Length
+
+Use `--synthetic-acceptance-length L` to benchmark speculative execution at a
+fixed mean acceptance length (AL). AL includes the guaranteed target token,
+so `1 <= L <= --speculative-num-draft-tokens` (the verify width). AL `1`
+rejects every draft; AL equal to the verify width accepts every draft. A
+fractional AL emits either `floor(L)` or `ceil(L)` tokens per verification,
+with probability `L - floor(L)` of the larger length. For example, AL `2.6`
+accepts one draft token on 40% of steps and two on 60%, plus a target token.
+
+The draft and target models still execute, but acceptance is synthetic.
+**Do not use generated text for correctness or accuracy evaluation.** Request
+termination can truncate the last verification's output.
+
+Either spelling below configures three draft slots (verify width four) and
+AL `2.6`:
+
+```bash
+--speculative-algorithm MTP --speculative-num-steps 3 --synthetic-acceptance-length 2.6
+--speculative-config '{"method":"mtp","num_speculative_tokens":3,"synthetic_acceptance_length":2.6}'
+```
+
+Conflicting values between the flag and JSON configuration are rejected.
+The value must be finite and speculative decoding must be enabled.
+For block drafters with implicit widths, the upper bound is checked against
+the checkpoint's resolved verify width when the sampler is initialized.
+
+### Block Drafters
 
 `DFLASH` and `DSPARK` are block drafters: one draft forward proposes a whole
 block instead of one token per step, so their two token counts are coupled.

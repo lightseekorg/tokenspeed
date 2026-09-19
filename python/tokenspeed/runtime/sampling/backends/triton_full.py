@@ -527,13 +527,24 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             self._gumbel_verify_out[: bs * num_tokens_per_req],
             num_tokens_per_req=num_tokens_per_req,
         )
-        verify_chain_target_sampled(
-            predicts=predict,
-            accept_index=accept_index,
-            accept_token_num=accept_length,
-            candidates=candidates.to(torch.int32),
-            target_sampled=target_sampled,
-        )
+        if self.config.synthetic_acceptance_length is not None:
+            lengths = self.synthetic_lengths(candidates, sampling_info.batch_row_offset)
+            target_tokens = (
+                target_sampled.reshape(bs, num_tokens_per_req)
+                .gather(1, (lengths - 1).long()[:, None])
+                .squeeze(1)
+            )
+            self.write_synthetic_outputs(
+                candidates, target_tokens, lengths, predict, accept_index, accept_length
+            )
+        else:
+            verify_chain_target_sampled(
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=accept_length,
+                candidates=candidates.to(torch.int32),
+                target_sampled=target_sampled,
+            )
 
         accept_length += 1
 

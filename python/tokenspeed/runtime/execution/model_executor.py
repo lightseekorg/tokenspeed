@@ -1495,6 +1495,17 @@ class ModelExecutor:
                         sampling_params_list=sampling_params_list,
                         num_tokens_per_req=self.config.output_length,
                     )
+                    if (
+                        self.sampling_backend.config.synthetic_acceptance_length
+                        is not None
+                        and decode_input_ids is not None
+                    ):
+                        self.sampling_backend.limit_synthetic_acceptance(
+                            self.input_buffers.force_single_token_verify_buf[
+                                num_extends:bs
+                            ],
+                            num_extends,
+                        )
                     if timing_enabled:
                         sampling_prep_ms = (
                             time.perf_counter() - sampling_start

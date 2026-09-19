@@ -432,26 +432,43 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         coins = self._coins_buf[row0 : row0 + bs, :num_tokens_per_req]
         coins_for_final_sampling = self._final_coins_buf[row0 : row0 + bs]
 
-        chain_speculative_sampling_target_only(
-            predicts=predict,
-            accept_index=accept_index,
-            accept_token_num=accept_length,
-            candidates=candidates.to(torch.int32),
-            uniform_samples=coins,
-            uniform_samples_for_final_sampling=coins_for_final_sampling,
-            target_probs=target_probs,
-            draft_probs=None,
-            threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
-            threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
-            deterministic=True,
-        )
+        if self.config.synthetic_acceptance_length is not None:
+            lengths = self.synthetic_lengths(candidates, sampling_info.batch_row_offset)
+            self.verify_synthetic_probs(
+                candidates,
+                target_probs,
+                coins_for_final_sampling,
+                lengths,
+                predict,
+                accept_index,
+                accept_length,
+                True,
+            )
+        else:
+            chain_speculative_sampling_target_only(
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=accept_length,
+                candidates=candidates.to(torch.int32),
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                target_probs=target_probs,
+                draft_probs=None,
+                threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
+                threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
+                deterministic=True,
+            )
 
         accept_length += 1
 
         # TP-rank sync BEFORE _accumulate_counts so per-rank counts stay aligned.
-        # For fused top-k + top-p, the results are bit-identical across ranks.
-        # So we don't need to broadcast the results.
-        if not _FUSED_TOPK_TOPP_AVAILABLE:
+        # Ordinary fused top-k + top-p verification can skip the broadcast.
+        # Synthetic verification conservatively keeps rank-0 committed outputs
+        # until target sampling at forced cutoffs is validated without TP sync.
+        if (
+            self.config.synthetic_acceptance_length is not None
+            or not _FUSED_TOPK_TOPP_AVAILABLE
+        ):
             self.maybe_broadcast(predict, accept_index, accept_length)
 
         # Accumulate accepted tokens into counts. accept_index is [bs, N]

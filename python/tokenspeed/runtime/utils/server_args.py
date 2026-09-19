@@ -23,6 +23,7 @@
 import argparse
 import dataclasses
 import json
+import math
 import os
 import random
 import socket
@@ -283,6 +284,7 @@ class ServerArgs:
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int | None = None
+    synthetic_acceptance_length: float | None = None
     enable_replay_ssm: bool = False
     eagle3_layers_to_capture: str | None = None
     # Logprob support flags — all OFF by default. Enabling extends the
@@ -425,6 +427,27 @@ class ServerArgs:
 
             if not isinstance(config, dict):
                 raise ValueError("--speculative-config must be a JSON object")
+
+            if "synthetic_acceptance_length" in config:
+                length = config["synthetic_acceptance_length"]
+                if (
+                    isinstance(length, bool)
+                    or not isinstance(length, (int, float))
+                    or not math.isfinite(length)
+                ):
+                    raise ValueError(
+                        "synthetic_acceptance_length must be a finite number"
+                    )
+                if (
+                    self.synthetic_acceptance_length is not None
+                    and self.synthetic_acceptance_length != length
+                ):
+                    raise ValueError(
+                        "--synthetic-acceptance-length conflicts with "
+                        "synthetic_acceptance_length in --speculative-config"
+                    )
+                if self.synthetic_acceptance_length is None:
+                    self.synthetic_acceptance_length = length
 
             method = config.get("method")
             if method is not None and self.speculative_algorithm is None:
@@ -704,6 +727,39 @@ class ServerArgs:
         self.validate_cache_options()
 
     def resolve_speculative_decoding(self):
+        if self.synthetic_acceptance_length is not None:
+            length = self.synthetic_acceptance_length
+            if (
+                isinstance(length, bool)
+                or not isinstance(length, (int, float))
+                or not math.isfinite(length)
+            ):
+                raise ValueError("synthetic_acceptance_length must be a finite number")
+            if self.speculative_algorithm is None:
+                raise ValueError(
+                    "--synthetic-acceptance-length requires speculative decoding"
+                )
+            # Block checkpoints may replace the default width in ModelConfig.
+            # SamplingBackend checks the final width before allocating buffers.
+            checkpoint_sets_width = (
+                self.speculative_algorithm in BLOCK_SPEC_ALGORITHMS
+                and not self._speculative_widths_explicit
+            )
+            if length < 1 or (
+                not checkpoint_sets_width and length > self.speculative_num_draft_tokens
+            ):
+                raise ValueError(
+                    "synthetic_acceptance_length must be in "
+                    f"[1, {self.speculative_num_draft_tokens}] "
+                    "(the speculative verify width including the target token)"
+                )
+            logger.warning(
+                "Synthetic acceptance length %.4f enabled for benchmarking. "
+                "Generated text is synthetic and must not be used for correctness "
+                "or accuracy evaluation.",
+                length,
+            )
+
         # Keep drafter backend consistent with the main model unless explicitly set.
         if (
             self.speculative_algorithm is not None
@@ -1788,7 +1844,7 @@ class ServerArgs:
             "--speculative_config",
             type=str,
             default=ServerArgs.speculative_config,
-            help="JSON speculative decoding configuration. Supported keys are method, model, and num_speculative_tokens.",
+            help="JSON speculative decoding configuration. Supported keys are method, model, num_speculative_tokens, and synthetic_acceptance_length.",
         )
         parser.add_argument(
             "--speculative-algorithm",
@@ -1825,6 +1881,15 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--synthetic-acceptance-length",
+            type=float,
+            default=ServerArgs.synthetic_acceptance_length,
+            help="Benchmark-only mean accepted length including the guaranteed "
+            "target token, in [1, speculative_num_draft_tokens]. Forces a "
+            "floor/ceil acceptance distribution; generated text is not valid "
+            "for correctness evaluation. Unset disables synthetic acceptance.",
         )
         parser.add_argument(
             "--enable-replay-ssm",
