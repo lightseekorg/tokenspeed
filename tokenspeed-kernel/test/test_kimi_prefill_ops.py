@@ -18,7 +18,7 @@ from tokenspeed_kernel.ops.gemm import (
 from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk
 
 
-def test_sigmoid_bias_topk_torch_is_byte_exact() -> None:
+def test_sigmoid_bias_topk_reference_is_byte_exact() -> None:
     torch.manual_seed(2)
     logits = torch.randn(5, 32)
     bias = torch.randn(32)
@@ -28,7 +28,7 @@ def test_sigmoid_bias_topk_torch_is_byte_exact() -> None:
     expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
 
     actual_weights, actual_ids = moe_sigmoid_bias_topk(
-        logits, bias, 8, solution="torch"
+        logits, bias, 8, solution="reference"
     )
     assert torch.equal(actual_ids, expected_ids.to(torch.int32))
     assert torch.equal(actual_weights, expected_weights)

@@ -41,8 +41,10 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 import tokenspeed_kernel.ops.residual as residual_ops  # noqa: E402
+from tokenspeed_kernel.numerics.reference.residual import (  # noqa: E402
+    torch_attn_res_fwd,
+)
 from tokenspeed_kernel.ops.residual import attn_res_fwd  # noqa: E402
-from tokenspeed_kernel.ops.residual.torch import torch_attn_res_fwd  # noqa: E402
 
 from tokenspeed.runtime.layers.layernorm import RMSNorm  # noqa: E402
 from tokenspeed.runtime.models import kimi_k3  # noqa: E402

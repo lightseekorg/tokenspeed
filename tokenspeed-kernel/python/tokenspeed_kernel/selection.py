@@ -28,7 +28,7 @@ from enum import Enum
 from typing import Any, Callable, Generator
 
 from tokenspeed_kernel.platform import PlatformInfo, current_platform
-from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
+from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, Priority
 from tokenspeed_kernel.signature import FormatSignature
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,7 @@ __all__ = [
     "register_oracle",
     "kernel_override",
     "explain_selection",
+    "is_ground_truth",
     "spec_matches_traits",
     "ref_compatible_with_spec",
     "spec_matches_shape_traits",
@@ -406,6 +407,19 @@ def _filter_by_traits(
     return [spec for spec in specs if spec_matches_traits(spec, traits)]
 
 
+def is_ground_truth(spec: KernelSpec) -> bool:
+    """Return whether ``spec`` sits in the REFERENCE band.
+
+    Ground-truth kernels are never auto-selected: they are reachable only
+    when the caller names them through ``solution=`` or ``override=``.
+    """
+    return spec.priority < int(Priority.PORTABLE)
+
+
+def _drop_ground_truth(specs: list[KernelSpec]) -> list[KernelSpec]:
+    return [spec for spec in specs if not is_ground_truth(spec)]
+
+
 def _resolve_override(
     registry: KernelRegistry,
     family: str,
@@ -535,6 +549,11 @@ def select_kernel(
         format_signature=format_signature,
         solution=solution,
     )
+    if solution is None:
+        # REFERENCE-band ground truth never wins automatic selection; a
+        # missing real kernel surfaces as NoKernelFoundError instead of a
+        # silent slow path.
+        candidates = _drop_ground_truth(candidates)
 
     solution_clause = f" with solution {solution!r}" if solution else ""
     if not candidates:
@@ -660,6 +679,8 @@ def explain_selection(
         format_signature=format_signature,
         solution=solution,
     )
+    if solution is None:
+        candidates = _drop_ground_truth(candidates)
 
     if traits:
         candidates = _filter_by_traits(candidates, traits)
@@ -715,6 +736,10 @@ def explain_selection(
                 )
             if solution and spec.solution != solution:
                 reasons.append(f"solution mismatch (is {spec.solution!r})")
+            if solution is None and is_ground_truth(spec):
+                reasons.append(
+                    f"ground truth (REFERENCE band; request solution={spec.solution!r})"
+                )
             reason_str = "; ".join(reasons) if reasons else "unknown"
             lines.append(f"  - {spec.name}: {reason_str}")
 

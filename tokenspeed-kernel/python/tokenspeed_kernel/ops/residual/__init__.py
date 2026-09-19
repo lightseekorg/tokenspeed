@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 
 import torch as _torch
+from tokenspeed_kernel.numerics.reference.residual import torch_attn_res_fwd
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
@@ -126,7 +127,7 @@ def _select_attn_res_kernel(
             "separate_output_eps": out_norm_weight is not None and output_eps != eps,
             "writes_block": block_write_idx >= 0,
         },
-        solution=None if eligible else "torch",
+        solution=None if eligible else "reference",
     )
     return kernel, valid_blocks
 
@@ -249,8 +250,6 @@ def attn_res_fwd_available(
         )
     except (NoKernelFoundError, ValueError):
         return False
-    from tokenspeed_kernel.ops.residual.torch import torch_attn_res_fwd
-
     return kernel.impl is not torch_attn_res_fwd
 
 
@@ -760,7 +759,6 @@ import tokenspeed_kernel.ops.residual.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.cute_fused  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.gluon  # noqa: E402,F401
-import tokenspeed_kernel.ops.residual.torch  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.triton  # noqa: E402,F401
 
 # isort: on

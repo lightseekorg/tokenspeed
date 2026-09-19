@@ -35,6 +35,7 @@ import functools
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.numerics.reference.gemm import torch_decode_gemv
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -202,25 +203,6 @@ def gluon_wmma_dense_gemv_gfx1250(
     )
 
     return gluon_wmma_tdm_dense_gfx1250(x, weight, out=out)
-
-
-@register_kernel(
-    "gemm",
-    "decode_gemv",
-    name="torch_decode_gemv",
-    solution="torch",
-    signatures=_BF16_SIG,
-    traits={},
-    priority=Priority.PORTABLE,
-)
-def torch_decode_gemv(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    if out is not None:
-        return torch.mm(x, weight.t(), out=out)
-    return x @ weight.t()
 
 
 @functools.lru_cache(maxsize=64)

@@ -40,16 +40,22 @@ TOPK = 8
 
 
 def _torch_moe_ref(x, w13, w2, topk_ids, topk_weights) -> torch.Tensor:
-    xf, w13f, w2f = x.float(), w13.float(), w2.float()
-    ids, wts = topk_ids.cpu(), topk_weights.float().cpu()
-    out = torch.zeros(x.shape[0], D, dtype=torch.float32, device=x.device)
-    for t in range(x.shape[0]):
-        for s in range(TOPK):
-            e = int(ids[t, s])
-            g = xf[t] @ w13f[e].T
-            inter = torch.nn.functional.silu(g[:I_R]) * g[I_R:]
-            out[t] += float(wts[t, s]) * (inter @ w2f[e].T)
-    return out
+    """Registered ground truth: unquantized experts, precomputed top-k."""
+    plan = tokenspeed_kernel.moe_plan(
+        "unquant",
+        input_dtype=x.dtype,
+        activation="silu",
+        routing_mode="precomputed_topk",
+        ispp=I_R,
+        solution="reference",
+    )
+    w = torch.nn.Module()
+    w.w13_weight = w13
+    w.w2_weight = w2
+    w.top_k = TOPK
+    return tokenspeed_kernel.moe_apply(
+        plan, x, w, None, topk_weights=topk_weights, topk_ids=topk_ids
+    ).float()
 
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 16])

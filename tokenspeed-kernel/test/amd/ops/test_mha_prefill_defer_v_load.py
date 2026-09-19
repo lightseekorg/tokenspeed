@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn.functional as F
 from utils import is_cdna4
 
 if not is_cdna4():
@@ -42,6 +41,7 @@ if not is_cdna4():
         allow_module_level=True,
     )
 
+from tokenspeed_kernel.ops.attention.mha import mha_prefill  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.attention.mha.prefill import (  # noqa: E402
     gluon_mha_prefill_gfx950,
 )
@@ -69,10 +69,17 @@ def _qkv(seed: int = 0):
 
 
 def _dense_ref(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Single-sequence causal dense reference; fp32 SDPA math. [S,H,D] layout."""
-    qt, kt, vt = (x.transpose(0, 1).float().unsqueeze(0) for x in (q, k, v))
-    out = F.scaled_dot_product_attention(qt, kt, vt, is_causal=True)
-    return out.squeeze(0).transpose(0, 1).to(q.dtype)
+    """Single-sequence causal dense reference; [S,H,D] layout, one sequence."""
+    seqlen = q.shape[0]
+    return mha_prefill(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens=torch.tensor([0, seqlen], device=q.device, dtype=torch.int32),
+        cu_seqlens_cpu=[0, seqlen],
+        max_seqlen=seqlen,
+        solution="reference",
+    )
 
 
 def _rel_err(a: torch.Tensor, b: torch.Tensor) -> float:
