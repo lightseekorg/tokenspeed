@@ -168,7 +168,7 @@ def run_deepswe_resolve_script(tmp_path: Path, *, pr: str, pr_files: str) -> str
     )
     script = step["run"].replace("${{ github.repository }}", "lightseekorg/tokenspeed")
     for placeholder in ("task_count", "sample_seed", "concurrency"):
-        script = script.replace("${{ inputs.%s }}" % placeholder, "1")
+        script = script.replace(f"${{{{ inputs.{placeholder!s} }}}}", "1")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     gh = bin_dir / "gh"

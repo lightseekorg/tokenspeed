@@ -801,8 +801,9 @@ def test_union_contract_flows_draft_groups_to_scheduler_config() -> None:
     conversion carry them with their natural retention — the C++ side
     instantiates its existing SwaManager for them, no draft concept
     anywhere."""
+    from test.runtime.cache_pool_test_utils import MinimalCacheView
+
     import torch
-    from cache_pool_test_utils import MinimalCacheView
 
     from tokenspeed.runtime.engine.scheduler_utils import pool_to_cache_groups
 
@@ -845,7 +846,7 @@ def test_draft_view_maps_local_layer_ids_to_continuation_planes() -> None:
     REJECTED rather than offset a second time -- silently addressing another
     model's planes is how the KV of two models gets crossed.
     """
-    from cache_pool_test_utils import MinimalCacheView
+    from test.runtime.cache_pool_test_utils import MinimalCacheView
 
     class _Window(MinimalCacheView):
         """Just a layer window: the subject is _field_layer_id's arithmetic."""

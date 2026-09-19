@@ -235,7 +235,7 @@ class RequestHandler:
                 if output is not None:
                     self.send_func.send_pyobj(output)
             elif isinstance(recv_req, AbortReq):
-                logger.debug("AbortReq for rid=%s", recv_req.rid)
+                logger.debug(f"AbortReq for rid={recv_req.rid!s}")
                 abort_rids.append(recv_req.rid)
             elif isinstance(recv_req, FlushCacheReqInput):
                 success = self.clear_cache_fn is not None and self.clear_cache_fn()
@@ -528,10 +528,9 @@ class RequestHandler:
         if activities:
             if activities != ["CUDA_PROFILER"]:
                 logger.info(
-                    "Profiling starts%s. Traces will be saved to: %s (with profile id: %s)",
-                    stage_str,
-                    self.profiler_output_dir,
-                    self.profile_id,
+                    f"Profiling starts{stage_str!s}. Traces will be saved to: "
+                    f"{self.profiler_output_dir!s} (with profile id: "
+                    f"{self.profile_id!s})",
                 )
             self.profile_in_progress = True
 
@@ -570,7 +569,7 @@ class RequestHandler:
         Path(self.profiler_output_dir).mkdir(parents=True, exist_ok=True)
 
         stage_suffix = f"-{stage.name}" if stage else ""
-        logger.info("Stop profiling%s...", stage_suffix)
+        logger.info(f"Stop profiling{stage_suffix!s}...")
 
         if self.torch_profiler is not None:
             self.torch_profiler.stop()
@@ -613,7 +612,7 @@ class RequestHandler:
 
         if self.profiler_activities and self.profiler_activities != ["CUDA_PROFILER"]:
             logger.info(
-                "Profiling done. Traces are saved to: %s", self.profiler_output_dir
+                f"Profiling done. Traces are saved to: {self.profiler_output_dir!s}",
             )
 
         self.torch_profiler = None

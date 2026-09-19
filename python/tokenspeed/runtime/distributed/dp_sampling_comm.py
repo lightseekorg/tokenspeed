@@ -187,14 +187,9 @@ class DpSamplingComm:
         self._state = None
 
         logger.info(
-            "DpSamplingComm backend=%s tp_size=%d rank=%d max_pad_bs=%d "
-            "num_tokens_per_req=%d vocab_size=%d",
-            self._backend,
-            tp_size,
-            rank,
-            max_pad_bs,
-            num_tokens_per_req,
-            vocab_size,
+            f"DpSamplingComm backend={self._backend!s} tp_size={tp_size:d} rank="
+            f"{rank:d} max_pad_bs={max_pad_bs:d} "
+            f"num_tokens_per_req={num_tokens_per_req:d} vocab_size={vocab_size:d}",
         )
 
         n = num_tokens_per_req

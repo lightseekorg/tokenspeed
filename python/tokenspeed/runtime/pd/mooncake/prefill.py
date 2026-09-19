@@ -155,8 +155,8 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         with self.bootstrap_token_cond:
             if self.request_status.get(room) in (None, TransferPoll.Failed):
                 logger.warning(
-                    "Dropping late prefill metadata for expired bootstrap_room=%s",
-                    room,
+                    "Dropping late prefill metadata for expired bootstrap_room="
+                    f"{room!s}",
                 )
                 return
             self.prefill_metadata[room] = (token, spec_candidate_ids)
@@ -200,18 +200,14 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 if self.request_status.get(room) in (None, TransferPoll.Failed):
                     logger.warning(
                         "Prefill metadata unavailable for failed "
-                        "bootstrap_room=%s; using fallback=%s",
-                        room,
-                        fallback_token,
+                        f"bootstrap_room={room!s}; using fallback={fallback_token!s}",
                     )
                     return fallback_token, fallback_candidate_ids
                 now = time.monotonic()
                 if now >= next_log_time:
                     logger.debug(
                         "Still waiting for prefill metadata for "
-                        "bootstrap_room=%s after %.2fs",
-                        room,
-                        now - start_time,
+                        f"bootstrap_room={room!s} after {now - start_time:.2f}s",
                     )
                     next_log_time = now + wait_log_interval
                 self.bootstrap_token_cond.wait(timeout=0.01)
@@ -225,19 +221,15 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             return False
         elapsed = time.monotonic() - failed_at
         logger.info(
-            "Session %s failed for %.2fs (TTL=%ds).",
-            mooncake_session_id,
-            elapsed,
-            self.failed_session_ttl,
+            f"Session {mooncake_session_id!s} failed for {elapsed:.2f}s (TTL="
+            f"{self.failed_session_ttl:d}s).",
         )
         if elapsed < self.failed_session_ttl:
             return True
         del self.failed_sessions[mooncake_session_id]
         logger.info(
-            "Session %s failed TTL expired (%.2fs >= %ds), reset.",
-            mooncake_session_id,
-            elapsed,
-            self.failed_session_ttl,
+            f"Session {mooncake_session_id!s} failed TTL expired ({elapsed:.2f}s >= "
+            f"{self.failed_session_ttl:d}s), reset.",
         )
         return False
 
@@ -248,18 +240,16 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             return
         self.failed_sessions[mooncake_session_id] = time.monotonic()
         logger.warning(
-            "Session %s marked failed (reason=%s, ttl=%ds).",
-            mooncake_session_id,
-            reason,
-            self.failed_session_ttl,
+            f"Session {mooncake_session_id!s} marked failed (reason={reason!s}, ttl="
+            f"{self.failed_session_ttl:d}s).",
         )
 
     def _clear_failed_session(self, mooncake_session_id: str) -> None:
         if mooncake_session_id in self.failed_sessions:
             del self.failed_sessions[mooncake_session_id]
             logger.info(
-                "Session %s failed state cleared due to KVArgs registration.",
-                mooncake_session_id,
+                f"Session {mooncake_session_id!s} failed state cleared due to KVArgs "
+                "registration.",
             )
         if mooncake_session_id in self.session_failures:
             del self.session_failures[mooncake_session_id]
@@ -387,11 +377,8 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             if ret != 0:
                 break
         logger.info(
-            "CachePD WRITE n_sge=%d bytes=%d wait_ms=%.1f ret=%s",
-            n_sge,
-            n_bytes,
-            (time.monotonic() - started) * 1e3,
-            ret,
+            f"CachePD WRITE n_sge={n_sge:d} bytes={n_bytes:d} wait_ms="
+            f"{(time.monotonic() - started) * 1000.0:.1f} ret={ret!s}",
         )
         return ret
 
@@ -613,13 +600,9 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             ) % StepCounter.COUNT_NUM_MAX
             if self.layerwise_debug:
                 logger.info(
-                    "[cache_layerwise_transfer] room=%s producer_steps=[%d,%d) "
-                    "wait_cache_step=%d peers=%d",
-                    kv_chunk.room,
-                    begin_step,
-                    end_step,
-                    target_step,
-                    len(reqs),
+                    f"[cache_layerwise_transfer] room={kv_chunk.room!s} "
+                    f"producer_steps=[{begin_step:d},{end_step:d}) "
+                    f"wait_cache_step={target_step:d} peers={len(reqs):d}",
                 )
             self._wait_until_cache_step(
                 target_step,
@@ -784,9 +767,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 except Exception:
                     logger.exception(
                         "Failed to notify Decode about room-level transfer "
-                        "failure (room=%s session=%s)",
-                        room,
-                        req.mooncake_session_id,
+                        f"failure (room={room!s} session={req.mooncake_session_id!s})",
                     )
         self.transfer_infos.pop(room, None)
 
@@ -895,7 +876,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 self.update_status(kv_chunk.room, TransferPoll.Success)
                 self.transfer_infos.pop(kv_chunk.room, None)
             except Exception as exc:
-                logger.exception("CachePD transfer failed for room=%s", kv_chunk.room)
+                logger.exception(f"CachePD transfer failed for room={kv_chunk.room!s}")
                 self.abort_room(kv_chunk.room, f"CachePD transfer failed: {exc}")
 
     def _handle_bootstrap_message(self, frames: list[bytes]) -> None:
@@ -936,8 +917,8 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     reason=reason,
                 )
                 logger.error(
-                    "Rejecting conflicting CachePD registration for session=%s",
-                    session_id,
+                    "Rejecting conflicting CachePD registration for session="
+                    f"{session_id!s}",
                 )
                 return
             self.decode_kv_args_table[session_id] = registration
@@ -945,8 +926,8 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             with self.session_lock:
                 self._clear_failed_session(session_id)
             logger.info(
-                "[Prefill bootstrap_thread] registered kv_args from decode session=%s",
-                session_id,
+                "[Prefill bootstrap_thread] registered kv_args from decode session="
+                f"{session_id!s}",
             )
             return
 
@@ -985,8 +966,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 self._validate_cache_room_fanout(tuple(candidate_infos.values()))
         except (IndexError, UnicodeError, ValueError) as exc:
             logger.exception(
-                "Rejecting malformed pre-allocation metadata for room=%s",
-                room_header,
+                f"Rejecting malformed pre-allocation metadata for room={room_header!s}",
             )
             if parsed_room is None:
                 return
@@ -997,7 +977,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 )
             except Exception:
                 logger.exception(
-                    "Could not abort malformed CachePD room=%s", parsed_room
+                    f"Could not abort malformed CachePD room={parsed_room!s}",
                 )
             try:
                 if registration is None and session_id is not None:
@@ -1023,8 +1003,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 )
             except Exception:
                 logger.exception(
-                    "Could not notify malformed Decode peer for room=%s",
-                    parsed_room,
+                    f"Could not notify malformed Decode peer for room={parsed_room!s}",
                 )
             return
 
@@ -1044,13 +1023,9 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             return
         complete = len(candidate_infos) == expected_fanout
         logger.info(
-            "[Prefill bootstrap_thread] pre-alloc received: room=%d "
-            "session=%s got=%d/%d, status -> %s",
-            parsed_room,
-            session_id,
-            len(candidate_infos),
-            expected_fanout,
-            "Bootstrapped" if complete else "waiting more",
+            f"[Prefill bootstrap_thread] pre-alloc received: room={parsed_room:d} "
+            f"session={session_id!s} got={len(candidate_infos):d}/{expected_fanout:d}, "
+            f"status -> {('Bootstrapped' if complete else 'waiting more')!s}",
         )
         if complete:
             self.update_status(parsed_room, TransferPoll.Bootstrapped)
@@ -1108,7 +1083,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             or self.check_status(bootstrap_room) == TransferPoll.Failed
         ):
             logger.debug(
-                "Request with bootstrap_room=%s already failed", bootstrap_room
+                f"Request with bootstrap_room={bootstrap_room!s} already failed",
             )
             return
 
@@ -1170,13 +1145,12 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 logger.debug("Prefill successfully registered to bootstrap server.")
             else:
                 logger.error(
-                    "Prefill instance failed to connect to bootstrap server: %s, %s",
-                    response.status_code,
-                    response.text,
+                    "Prefill instance failed to connect to bootstrap server: "
+                    f"{response.status_code!s}, {response.text!s}",
                 )
         except Exception as exc:
             logger.error(
-                "Prefill instance failed to register with bootstrap server: %s", exc
+                f"Prefill instance failed to register with bootstrap server: {exc!s}",
             )
 
 

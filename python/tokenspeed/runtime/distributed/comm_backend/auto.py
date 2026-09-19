@@ -71,9 +71,9 @@ class AutoBackend(CommBackend):
     @staticmethod
     def _group_spans_nodes(group: Group) -> bool:
         mapping = global_server_args_dict.get("mapping")
-        nprocs_per_node = getattr(mapping, "nprocs_per_node", None)
-        if not nprocs_per_node:
+        if mapping is None or not mapping.nprocs_per_node:
             return False
+        nprocs_per_node = mapping.nprocs_per_node
         return len({rank // nprocs_per_node for rank in group}) > 1
 
     @staticmethod

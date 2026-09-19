@@ -115,8 +115,8 @@ class OutputProcessor:
             state: ReqState = self.engine.rid_to_state.get(rid, None)
             if state is None:
                 logger.error(
-                    "Received output for rid=%r but the state was deleted in AsyncLLM.",
-                    rid,
+                    f"Received output for rid={rid!r} but the state was deleted in "
+                    "AsyncLLM.",
                 )
                 continue
 
@@ -152,9 +152,8 @@ class OutputProcessor:
                     meta_info.update(logprobs_info)
                 except Exception as exc:
                     logger.warning(
-                        "Failed to attach logprobs for rid=%s: %s. Returning response without logprobs.",
-                        rid,
-                        exc,
+                        f"Failed to attach logprobs for rid={rid!s}: {exc!s}. Returning"
+                        " response without logprobs.",
                     )
 
             if not isinstance(recv_obj, BatchEmbeddingOut):
@@ -257,8 +256,7 @@ class OutputProcessor:
                             "enable_inline_detokenizer=True and "
                             "skip_tokenizer_init=False; "
                             "self.tokenizer is unexpectedly None. "
-                            "Output text will be empty for rid=%s.",
-                            rid,
+                            f"Output text will be empty for rid={rid!s}.",
                         )
 
                     output_multi_ids = None
@@ -406,7 +404,7 @@ class OutputProcessor:
                 datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".pkl"
             )
             logger.info(
-                "Dump %s requests to %s", len(self.engine.dump_request_list), filename
+                f"Dump {len(self.engine.dump_request_list)!s} requests to {filename!s}",
             )
 
             to_dump = self.engine.dump_request_list

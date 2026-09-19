@@ -1,5 +1,38 @@
 # AMD LLM Kernels
 
+## Kernel Conventions
+
+### Barriers
+
+Do not write `gl.barrier()` for shared-memory (LDS) hazards. The Gluon
+compiler's membar analysis tracks every LDS read, write, atomic, async copy,
+and scratch-backed op (layout conversions, reductions, atomic result
+broadcasts), and inserts a CTA barrier immediately before the first conflicting
+access, including across loop back-edges. It also emits a barrier right after
+every `async_copy.wait_group`/`tdm.async_wait`, and the lowering of a
+`release`/`acq_rel` atomic emits one before it (an `acquire` atomic emits one
+after it). A manual barrier next to any of these is a duplicate `s_barrier`, or
+worse, it lands earlier than the compiler's minimal placement and pins the
+instruction schedule.
+
+Keep an explicit `gl.barrier()` only where the compiler cannot see the hazard:
+
+- Ordering global-memory traffic across threads of one workgroup: init stores
+  followed by an overlapping scatter, all-thread stores or atomics that must be
+  issued before one thread bumps a `relaxed` counter, or re-reading a global
+  buffer other threads just wrote. Say what the barrier orders in a comment.
+- `load_shared_relaxed` pipelines. That load opts out of the compiler's
+  async-copy hazard tracking, so the write-after-read against the next
+  `buffer_load_to_shared` into the same slot is the kernel's responsibility.
+  Place the barrier before the copy that reuses the slot.
+
+Iris push collectives also keep explicit workgroup barriers around their
+cross-rank publication protocol. The VMEM drain and system-scope atomics order
+one subgroup's traffic, but the barriers join all producer subgroups before a
+generation is published and all consumer subgroups before the peer inbox is
+read. Removing either rendezvous can potentially increase cross-rank skew and
+regress perf even when the generated kernel remains correct.
+
 ## Attention
 
 ### DeepSeek V4 attention

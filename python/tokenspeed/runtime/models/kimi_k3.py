@@ -2455,7 +2455,7 @@ class KimiLinearDecoderLayer(nn.Module):
         self, hidden_states: torch.Tensor, block_residual: torch.Tensor
     ) -> bool:
         # Split beats fused at decode: 47 us/step faster at bs = 8 (aux-stream partial).
-        if getattr(self, "_dflash_attnres_capture_fallback", False):
+        if self._dflash_attnres_capture_fallback:
             return False
 
         # B1 already fuses the post-attention mix into the all-reduce.
@@ -3195,9 +3195,8 @@ class KimiLinearForCausalLM(BaseCausalLM):
         self.model.dflash_aux_stream = stream
         self.model._refresh_dflash_capture_fallback()
         logger.info(
-            "DFLASH/DSpark target capture: layers=%s stream=%s",
-            tuple(self.model.layers_to_capture),
-            stream,
+            "DFLASH/DSpark target capture: layers="
+            f"{tuple(self.model.layers_to_capture)!s} stream={stream!s}",
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
@@ -3784,10 +3783,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 pass
         if dropped_vision_weights:
             logger.warning(
-                "Dropping %d vision weights: multimodal path is inactive.",
-                dropped_vision_weights,
+                f"Dropping {dropped_vision_weights:d} vision weights: multimodal path "
+                "is inactive.",
             )
-        logger.debug("Loaded %d Kimi-K3 vision tensors.", loaded_vision_weights)
+        logger.debug(f"Loaded {loaded_vision_weights:d} Kimi-K3 vision tensors.")
 
 
 EntryClass = [KimiK3ForConditionalGeneration]

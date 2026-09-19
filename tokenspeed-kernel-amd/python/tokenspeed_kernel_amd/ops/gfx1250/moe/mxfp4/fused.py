@@ -1892,6 +1892,8 @@ def _precomputed_topk_route_small_m_gfx1250_kernel(
     # The atomic rank does not need to be stable: gather/scatter preserve each
     # routed row's token and top-k slot, and each expert row is independent.
     gl.store(route_positions_ptr + expert_offset, 0, mask=expert_mask)
+    # Global-memory ordering the compiler cannot see: every thread's zero
+    # store must be issued before any thread's atomic on the same slots.
     gl.barrier()
     rank = gl.atomic_add(
         route_positions_ptr + safe_expert,

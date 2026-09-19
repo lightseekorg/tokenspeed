@@ -363,14 +363,14 @@ def _apply_backend_overrides(
         server_args.attention_backend = "hybrid_linear_attn"
     elif server_args.attention_backend == "hybrid_linear_attn":
         logger.warning(
-            "Ignoring hybrid_linear_attn backend for non-hybrid model architectures=%s",
-            target.architectures,
+            "Ignoring hybrid_linear_attn backend for non-hybrid model architectures="
+            f"{target.architectures!s}",
         )
         server_args.attention_backend = None
         if server_args.drafter_attention_backend == "hybrid_linear_attn":
             logger.warning(
-                "Ignoring hybrid_linear_attn backend for non-hybrid model architectures=%s",
-                draft.architectures if draft is not None else (),
+                "Ignoring hybrid_linear_attn backend for non-hybrid model "
+                f"architectures={(draft.architectures if draft is not None else ())!s}",
             )
             server_args.drafter_attention_backend = None
 
@@ -638,7 +638,7 @@ def _resolve_kda_backend(kda_backend: str) -> str:
             resolved = "flashkda"
         else:
             resolved = "fla"
-        logger.info("KDA prefill backend auto-resolved to %s", resolved)
+        logger.info(f"KDA prefill backend auto-resolved to {resolved!s}")
         return resolved
     if kda_backend == "cutedsl_kda" and not cutedsl_kda_supported():
         raise ValueError(
@@ -661,8 +661,7 @@ def _resolve_hybrid_full_backend_name(
         if name is not None:
             logger.warning(
                 "Qwen4-Exp QSA pins its sparse dispatch to the qsa backend; "
-                "ignoring explicit attention backend %r",
-                requested_name,
+                f"ignoring explicit attention backend {requested_name!r}",
             )
         return "qsa"
     if has_cache_plan and is_dsa and name is None:
@@ -738,9 +737,9 @@ def _create_hybrid_linear_attn_backend(
 
     if linear_attn is None or not pool.state_group_by_layer:
         logger.info(
-            "Created hybrid_linear_attn backend: %d full attn layers, 0 linear "
+            f"Created hybrid_linear_attn backend: {len(full_attn_layers):d} full attn "
+            "layers, 0 linear "
             "attn layers in this cache view (skipping linear backend)",
-            len(full_attn_layers),
         )
         backend = full_attn_backend
     else:
@@ -762,10 +761,9 @@ def _create_hybrid_linear_attn_backend(
             full_attn_backend, linear_attn_backend, full_attn_layers
         )
         logger.info(
-            "Created hybrid_linear_attn backend: %d full attn layers, %d linear attn layers, %s",
-            len(full_attn_layers),
-            len(linear_attn.layer_ids),
-            "LCM state fields",
+            f"Created hybrid_linear_attn backend: {len(full_attn_layers):d} full attn "
+            f"layers, {len(linear_attn.layer_ids):d} linear attn layers, "
+            f"{'LCM state fields'!s}",
         )
     if is_qwen4_exp(hf_config):
         backend = _compose_qwen4_exp_backend(config, pool, backend)
@@ -860,11 +858,9 @@ def _wrap_inkling_backend(
         device=attn_config.device,
     )
     logger.info(
-        "Inkling %sconv state pool: %d layers x %d slots, %.1f MiB",
-        "draft " if is_draft else "",
-        num_layers,
-        attn_config.max_bs + 2,
-        conv_pool.mem_usage_bytes() / (1 << 20),
+        f"Inkling {('draft ' if is_draft else '')!s}conv state pool: {num_layers:d} "
+        f"layers x {attn_config.max_bs + 2:d} slots, "
+        f"{conv_pool.mem_usage_bytes() / (1 << 20):.1f} MiB",
     )
     backend = InklingAttnBackend(
         inner,
@@ -1175,18 +1171,12 @@ def create_attn_components(
     cache_budget_bytes = cache_setup.cache_budget_bytes
     fixed_workspace_bytes = cache_setup.fixed_workspace_bytes
     logger.info(
-        "Cache profile: parent_bytes=%d, P=%d, parents=%d, token_capacity=%d, "
-        "layers=%d (draft %d), groups=%s",
-        spec.memory_plan.lcm_block_bytes,
-        spec.memory_plan.prefix_granularity,
-        spec.memory_plan.num_lcm_blocks,
-        spec.token_capacity,
-        len(spec.layer_types),
-        num_draft_cache_layers,
-        {
-            group.group_id: group.cache_blocks_per_lcm_block
-            for group in spec.memory_plan.groups
-        },
+        f"Cache profile: parent_bytes={spec.memory_plan.lcm_block_bytes:d}, P="
+        f"{spec.memory_plan.prefix_granularity:d}, parents="
+        f"{spec.memory_plan.num_lcm_blocks:d}, token_capacity={spec.token_capacity:d}, "
+        f"layers={len(spec.layer_types):d} (draft {num_draft_cache_layers:d}), "
+        "groups="
+        f"{ {group.group_id: group.cache_blocks_per_lcm_block for group in spec.memory_plan.groups}!s}",
     )
 
     # One model, one arena: the merged plan's single allocation, which every

@@ -72,7 +72,7 @@ def _resolve_allow_mnnvl(device_index: int) -> bool:
         else:
             _allow_mnnvl_resolved = fabric_allocation_supported(device_index)
             source = "fabric allocation probe"
-        logger.info("DeepEP allow_mnnvl=%s (%s)", _allow_mnnvl_resolved, source)
+        logger.info(f"DeepEP allow_mnnvl={_allow_mnnvl_resolved!s} ({source!s})")
     return _allow_mnnvl_resolved
 
 
@@ -104,9 +104,8 @@ else:
 def _get_available_gpu_memory(gpu_id: int, empty_cache: bool = True) -> float:
     if torch.cuda.current_device() != gpu_id:
         logger.warning(
-            "current device is not %s, but %s, which may cause useless memory allocation for torch CUDA context.",
-            gpu_id,
-            torch.cuda.current_device(),
+            f"current device is not {gpu_id!s}, but {torch.cuda.current_device()!s}, "
+            "which may cause useless memory allocation for torch CUDA context.",
         )
     if empty_cache:
         torch.cuda.empty_cache()
@@ -236,7 +235,8 @@ class DeepEPBuffer:
         )
         free_gpu_memory_end = _get_available_gpu_memory(torch.cuda.current_device())
         logger.info(
-            "DeepEPBuffer use memory %s GB", free_gpu_memory_begin - free_gpu_memory_end
+            f"DeepEPBuffer use memory {free_gpu_memory_begin - free_gpu_memory_end!s} "
+            "GB",
         )
         return cls._buffer
 

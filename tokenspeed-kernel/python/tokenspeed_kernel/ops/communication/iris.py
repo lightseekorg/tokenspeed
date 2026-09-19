@@ -619,8 +619,8 @@ class IrisRSAG(object):
         self._out_buff = self._ctx.empty((max_tokens, hidden_size), dtype=self.dtype)
         free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
         logger.info(
-            "Iris RSAG symmetric-heap buffers allocated: %s GB",
-            free_gpu_memory_begin - free_gpu_memory_after,
+            "Iris RSAG symmetric-heap buffers allocated: "
+            f"{free_gpu_memory_begin - free_gpu_memory_after!s} GB",
         )
 
         assert self._ctx.get_num_ranks() == dist.get_world_size(), (
@@ -1114,8 +1114,8 @@ class IrisAllReduce(object):
         )
         free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
         logger.info(
-            "Iris all-reduce symmetric-heap buffers allocated: %s GB",
-            free_gpu_memory_begin - free_gpu_memory_after,
+            "Iris all-reduce symmetric-heap buffers allocated: "
+            f"{free_gpu_memory_begin - free_gpu_memory_after!s} GB",
         )
 
         self._rank_start = 0
@@ -1827,6 +1827,9 @@ def _iris_sync_rank_token(
         scope="sys",
     )
     _iris_drain_subgroup_vmem()
+    # The acquire is subgroup-local. Keep every subgroup at the protocol
+    # boundary until all of them have observed the peer publications; the
+    # caller consumes the peer inbox immediately after this helper returns.
     gl.barrier()
 
 
@@ -2216,7 +2219,6 @@ def iris_reduce_symmetric_two_stage_gluon_kernel(
             cache_modifier=".cg",
         )
         peer_values.store(values)
-        gl.barrier()
 
         packed = peer_values.load(reduce_layout)
         value_0, value_1, value_2, value_3 = _unpack_word(
@@ -2237,7 +2239,6 @@ def iris_reduce_symmetric_two_stage_gluon_kernel(
             mask=tile_id * BLOCK_WORDS + reduce_words < PARTITION_WORDS,
             cache=".wt",
         )
-        gl.barrier()
         tile_id += NUM_PROGRAMS
 
     partitions_ready = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
@@ -2477,7 +2478,6 @@ def iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel(
         mask=mask,
         cache=".wt",
     )
-    gl.barrier()
 
     gl.atomic_xchg(local_ready, epoch, sem="release", scope="sys")
     _iris_sync_rank_epoch(
@@ -2529,7 +2529,6 @@ def iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel(
 
     # Publish consumption without serializing this epilogue. Reuse waits only
     # when a later invocation wraps back to the same staging slot.
-    gl.barrier()
     consumed = consumed_flags + row * WORLD_SIZE + RANK
     gl.atomic_xchg(consumed, epoch, sem="release", scope="sys")
 
@@ -2649,6 +2648,8 @@ def iris_push_one_shot_allreduce_residual_attnres_gluon_kernel(
             cache=".wt",
         )
     _iris_drain_subgroup_vmem()
+    # The drain is subgroup-local. Join all producer subgroups before the
+    # control subgroup publishes the generation to peer ranks.
     gl.barrier()
 
     _iris_sync_rank_token(
@@ -2912,8 +2913,8 @@ class IrisAllReduceResidualRMSNorm(object):
         self._input_buf = self._ctx.zeros((max_token_num, hidden_dim), dtype=dtype)
         free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
         logger.info(
-            "Iris AR+RMSNorm symmetric-heap buffer allocated: %s GB",
-            free_gpu_memory_begin - free_gpu_memory_after,
+            "Iris AR+RMSNorm symmetric-heap buffer allocated: "
+            f"{free_gpu_memory_begin - free_gpu_memory_after!s} GB",
         )
 
         self._rank_start = 0

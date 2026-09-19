@@ -414,11 +414,9 @@ class DataParallelController:
                 self.dp_budget.dispatch(pinned_rank=rank)
                 return
             logger.warning(
-                "data_parallel_rank=%r invalid (need an int in [0, %d)); "
-                "falling back to the %s policy",
-                rank,
-                len(self.workers),
-                self.load_balance_method.name,
+                f"data_parallel_rank={rank!r} invalid (need an int in [0, "
+                f"{len(self.workers):d})); "
+                f"falling back to the {self.load_balance_method.name!s} policy",
             )
         self.dispatching(req)
 
@@ -489,11 +487,10 @@ def run_data_parallel_controller_process(
         for proc in controller.scheduler_procs:
             proc.join()
             logger.error(
-                "Scheduler or DataParallelController %s terminated with %s",
-                proc.pid,
-                proc.exitcode,
+                f"Scheduler or DataParallelController {proc.pid!s} terminated with "
+                f"{proc.exitcode!s}",
             )
     except Exception:
         traceback = get_exception_traceback()
-        logger.error("DataParallelController hit an exception: %s", traceback)
+        logger.error(f"DataParallelController hit an exception: {traceback!s}")
         parent_process.send_signal(signal.SIGUSR1)

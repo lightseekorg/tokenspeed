@@ -509,10 +509,10 @@ class MSAHybridAttnBackend(AttentionBackend):
         )
         self.sparse_layer_ids = spec.sparse_layer_ids
         logger.info(
-            "Created MiniMax hybrid attention backend: %d dense layers, "
-            "%d sparse layers",
-            len(spec.compute_layer_types) - len(spec.sparse_layer_ids),
-            len(spec.sparse_layer_ids),
+            "Created MiniMax hybrid attention backend: "
+            f"{len(spec.compute_layer_types) - len(spec.sparse_layer_ids):d} dense "
+            "layers, "
+            f"{len(spec.sparse_layer_ids):d} sparse layers",
         )
 
     def _router_for_layer(self, layer_id: int):

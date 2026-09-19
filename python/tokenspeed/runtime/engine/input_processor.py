@@ -61,7 +61,7 @@ class InputProcessor:
         # model can't emit ``<think>…</think>`` before the JSON.
         if "json_schema" not in sampling:
             return
-        reasoning_parser = getattr(self.engine.server_args, "reasoning_parser", None)
+        reasoning_parser = self.engine.server_args.reasoning_parser
         if not reasoning_parser:
             return
         try:
@@ -71,10 +71,9 @@ class InputProcessor:
             wrapped = structural_tag_for_reasoning_json_schema(reasoning_parser, schema)
         except Exception as exc:
             self.engine.logger.warning(
-                "reasoning-parser=%s: failed to wrap json_schema (%s); "
+                f"reasoning-parser={reasoning_parser!s}: failed to wrap json_schema ("
+                f"{exc!s}); "
                 "falling back.",
-                reasoning_parser,
-                exc,
             )
             return
         if wrapped is None:
@@ -163,12 +162,9 @@ class InputProcessor:
                     or room % dp_size != rank
                 ):
                     self.engine.logger.warning(
-                        "data_parallel_rank=%s conflicts with bootstrap_room "
-                        "residue (room=%s, dp_size=%d); the room stays "
+                        f"data_parallel_rank={rank!s} conflicts with bootstrap_room "
+                        f"residue (room={room!s}, dp_size={dp_size:d}); the room stays "
                         "authoritative on disaggregation engines — pin ignored.",
-                        rank,
-                        room,
-                        dp_size,
                     )
                     break
             obj.data_parallel_rank = None
@@ -303,13 +299,12 @@ class InputProcessor:
             obj.sampling_params.update({"max_new_tokens": adjusted_max_new_tokens})
         elif max_new_tokens + input_token_num >= self.engine.context_len:
             self.engine.logger.warning(
-                "Requested(rid=%s) token count exceeds the model's maximum context length of %s tokens. You requested a total of %s tokens: %s tokens from the input messages and %s tokens for the completion. The max_new_tokens will be truncated to %s.",
-                obj.rid,
-                self.engine.context_len,
-                max_new_tokens + input_token_num,
-                input_token_num,
-                max_new_tokens,
-                adjusted_max_new_tokens,
+                f"Requested(rid={obj.rid!s}) token count exceeds the model's maximum "
+                f"context length of {self.engine.context_len!s} tokens. You requested a"
+                f" total of {max_new_tokens + input_token_num!s} tokens: "
+                f"{input_token_num!s} tokens from the input messages and "
+                f"{max_new_tokens!s} tokens for the completion. The max_new_tokens will"
+                f" be truncated to {adjusted_max_new_tokens!s}.",
             )
             obj.sampling_params.update({"max_new_tokens": adjusted_max_new_tokens})
 

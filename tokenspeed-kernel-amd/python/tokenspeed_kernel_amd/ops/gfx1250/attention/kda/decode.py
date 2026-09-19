@@ -425,9 +425,6 @@ def _kda_fused_decode_kernel(
 
     combined = gl.where(is_decay, decay_value, qkv_value)
     shared_vectors.index(0).store(combined)
-
-    gl.barrier()
-
     q_value = shared_vectors.index(0).slice(0, D, dim=0).load(key_layout)
     k_value = shared_vectors.index(0).slice(D, D, dim=0).load(key_layout)
     decay = shared_vectors.index(0).slice(3 * D, D, dim=0).load(key_layout)
@@ -482,7 +479,6 @@ def _kda_fused_decode_kernel(
             off_pipe = off_pipe[1:] + (off_pipe[-1],)
             raw_pipe = raw_pipe[1:] + (raw_pipe[-1],)
     output_sumsq = gl.sum(output_squares, axis=0)
-    gl.barrier()
     out_value = output_shared.load(compact_layout)
     inverse_rms = gl.rsqrt(output_sumsq / D + NORM_EPS)
     gate = gl.load(
@@ -669,9 +665,6 @@ def _kda_fused_verify_kernel(
         qkv_history1 = qkv_history2
         qkv_history2 = qkv_input
 
-    # Publish all convolution results before cross-warp normalization; retain
-    # per-token vectors for reuse across state panels.
-    gl.barrier()
     q_values = ()
     k_values = ()
     decay_values = ()
@@ -943,7 +936,6 @@ def _kda_fused_replay_kernel(
         qkv_history1 = gl.where(token_active, qkv_history2, qkv_history1)
         qkv_history2 = gl.where(token_active, qkv_input, qkv_history2)
 
-    gl.barrier()
     q_values = ()
     k_values = ()
     decay_values = ()

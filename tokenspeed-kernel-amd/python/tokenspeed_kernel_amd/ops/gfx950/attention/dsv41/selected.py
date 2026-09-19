@@ -269,7 +269,6 @@ def _dsv41_fused_selected_kernel(
         [HEAD_DIM, TILE_K],
         layout=kv_shared_layout,
     )
-    gl.barrier()
     q_dot = q_shared.load(q_dot_layout)
 
     score_heads = head_offset + gl.arange(
@@ -356,7 +355,6 @@ def _dsv41_fused_selected_kernel(
 
         valid_mfma = gl.convert_layout(valid_load, gl.SliceLayout(0, mfma_score))
         kv_shared.store(kv_values)
-        gl.barrier()
 
         k_dot = kv_shared.load(k_dot_layout)
         v_dot = kv_shared.permute([1, 0]).load(v_dot_layout)
@@ -382,7 +380,6 @@ def _dsv41_fused_selected_kernel(
         p_dot = gl.convert_layout(probabilities.to(q.dtype.element_ty), p_dot_layout)
         accumulator = gl.amd.cdna4.mfma(p_dot, v_dot, accumulator)
         max_value = next_max
-        gl.barrier()
 
     denominator_value = gl.convert_layout(denominator, gl.SliceLayout(1, mfma_value))
     safe_denominator = gl.where(denominator_value > 0.0, denominator_value, 1.0)

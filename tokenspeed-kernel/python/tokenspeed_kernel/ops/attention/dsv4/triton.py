@@ -1121,8 +1121,7 @@ def _dsv4_indexer_q_cuda_capability(
 def _log_serial_four_block_indexer_q_selection(capability: tuple[int, int]) -> None:
     logger.info(
         "DeepSeek V4 Indexer-Q launch selection: serial_four_block=True "
-        "tokens=8192 capability=%s",
-        capability,
+        f"tokens=8192 capability={capability!s}",
     )
 
 
@@ -1420,9 +1419,8 @@ def _wide_compress_launch_supported(device: torch.device | int | None) -> bool:
         capability = torch.cuda.get_device_capability(device)
         supported = capability == (10, 0)
         logger.info(
-            "DeepSeek V4 sparse-compress launch selection: capability=%s num_warps=%d",
-            capability,
-            16 if supported else 4,
+            f"DeepSeek V4 sparse-compress launch selection: capability={capability!s} "
+            f"num_warps={(16 if supported else 4):d}",
         )
         return supported
     except (AssertionError, RuntimeError, TypeError, ValueError):
