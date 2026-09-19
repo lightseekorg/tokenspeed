@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.attention.dsv4 import (
 )
 from tokenspeed_kernel.ops.attention.dsv4._triton.indexer import _indexer_logits
 from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4.indexer import (
+    _TDM_MIN_CANDIDATES,
     _dsv4_mxfp4_logits,
 )
 
@@ -294,13 +295,21 @@ def test_decode_clamps_lengths_and_masks_unaddressable_candidates() -> None:
 
 
 def test_decode_tdm_threshold_logits() -> None:
+    # tokens * max_candidates reaches the TDM threshold while every context
+    # stays short: the scorer must take the TDM path over the pages it needs
+    # and fill the chunks past each length with -inf without touching the cache.
     tokens = 32
-    context = 32 * 1024
-    pages = context // _PAGE_SIZE
-    index_q, weights, cache, _, _ = _inputs(tokens, 32, pages)
-    shared_table = torch.arange(pages, device="cuda", dtype=torch.int32)
-    block_table = shared_table[None, :].expand(tokens, -1)
-    lengths = torch.full((tokens,), context, device="cuda", dtype=torch.int32)
+    max_candidates = 32 * 1024
+    assert tokens * max_candidates >= _TDM_MIN_CANDIDATES
+    context = 1024 + 37
+    pages = (context + _PAGE_SIZE - 1) // _PAGE_SIZE
+    index_q, weights, cache, _, _ = _inputs(tokens, 32, tokens * pages)
+    block_table = torch.arange(
+        tokens * pages - 1, -1, -1, device="cuda", dtype=torch.int32
+    ).reshape(tokens, pages)
+    lengths = torch.tensor(
+        [context, 0, 512, 513, 64, 65, 1, 100] * 4, device="cuda", dtype=torch.int32
+    )
 
     actual = _dsv4_mxfp4_logits(
         index_q,
@@ -309,7 +318,7 @@ def test_decode_tdm_threshold_logits() -> None:
         lengths,
         block_table,
         page_size=_PAGE_SIZE,
-        max_candidates=context,
+        max_candidates=max_candidates,
         cu_seq_lens=None,
         cu_seqlen_k_start=None,
     )
@@ -324,7 +333,8 @@ def test_decode_tdm_threshold_logits() -> None:
         cu_seq_lens=None,
         starts=None,
     )
-    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-5)
+    torch.testing.assert_close(actual[:, :context], expected, atol=2e-3, rtol=2e-5)
+    assert torch.isneginf(actual[:, context:]).all()
 
 
 def test_decode_graph_refresh_and_plan_aliasing() -> None:
