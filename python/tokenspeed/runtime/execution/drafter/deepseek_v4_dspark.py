@@ -333,7 +333,7 @@ class DeepseekV4DSpark(BaseDrafter):
         self.kv_windows[self.first_padding_slot].zero_()
         self.context_lengths[self.first_padding_slot].zero_()
         self._prefill_graph = graph
-        logger.info("DSpark prefill CUDA graph captured (window=%d)", window)
+        logger.info(f"DSpark prefill CUDA graph captured (window={window:d})")
 
     def _seed_prefill_windows(
         self,

@@ -193,10 +193,8 @@ class L2CacheExecutor:
             )
         )
         logger.info(
-            "Allocated %.2f GB compact Host L2 (%s LCM blocks, %s bytes/block)",
-            requested_host_bytes / 1e9,
-            host_lcm_blocks,
-            host_lcm_block_bytes,
+            f"Allocated {requested_host_bytes / 1000000000.0:.2f} GB compact Host L2 ("
+            f"{host_lcm_blocks!s} LCM blocks, {host_lcm_block_bytes!s} bytes/block)",
         )
 
         pool_layouts = [(device_pool, target_layout)]
@@ -741,10 +739,8 @@ class L2CacheExecutor:
         backup_pages = list(backup_pages)
         if self.attn_tp_rank == 0:
             logger.info(
-                "[L2] writeback started: operations=%d blocks=%d pinned=%s",
-                len(op_ids),
-                len(transfers),
-                lane is self._pinned_write_lane,
+                f"[L2] writeback started: operations={len(op_ids):d} blocks="
+                f"{len(transfers):d} pinned={lane is self._pinned_write_lane!s}",
             )
         # Behind the forwards that wrote the source pages: that is what lets
         # the copy read their final bytes.
@@ -830,9 +826,8 @@ class L2CacheExecutor:
             return None
         if self.attn_tp_rank == 0:
             logger.info(
-                "[L2] load started: operations=%d blocks=%d",
-                len(op_ids),
-                len(transfers),
+                f"[L2] load started: operations={len(op_ids):d} blocks="
+                f"{len(transfers):d}",
             )
 
         # EventLoop zeroes freshly allocated Device blocks on the prerequisite

@@ -216,8 +216,6 @@ def _dsv4_paged_split_stage_kernel(
         [HEAD_DIM, TILE_K],
         layout=kv_shared_layout,
     )
-
-    gl.barrier()
     q_dot = q_shared.load(q_dot_layout)
     score_heads = head_offset + gl.arange(
         0,
@@ -305,7 +303,6 @@ def _dsv4_paged_split_stage_kernel(
             gl.SliceLayout(0, mfma_score),
         )
         kv_shared.store(kv_values)
-        gl.barrier()
 
         k_dot = kv_shared.load(k_dot_layout)
         v_dot = kv_shared.permute([1, 0]).load(v_dot_layout)
@@ -334,7 +331,6 @@ def _dsv4_paged_split_stage_kernel(
         )
         accumulator = gl.amd.cdna4.mfma(p_dot, v_dot, accumulator)
         max_value = next_max
-        gl.barrier()
 
     denominator_value = gl.convert_layout(
         denominator,

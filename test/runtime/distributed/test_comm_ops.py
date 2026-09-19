@@ -18,6 +18,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from tokenspeed.runtime.distributed.comm_ops import all_to_all_single
+from tokenspeed.runtime.distributed.mapping import Mapping
 
 
 class TestAutoBackendTopology:
@@ -275,15 +276,7 @@ def test_distributed_initializer_gathers_fabric_after_groups(monkeypatch):
     import tokenspeed.runtime.execution.distributed_initializer as initializer
 
     events = []
-    mapping = SimpleNamespace(
-        world_group=(0,),
-        attn=SimpleNamespace(tp_group=(0,), dp_group=(0,), tp_rank=0, dp_rank=0),
-        linear_attn=SimpleNamespace(tp_group=(0,)),
-        dense=SimpleNamespace(tp_group=(0,)),
-        moe=SimpleNamespace(tp_ep_group=(0,)),
-        has_pp=False,
-        rank=0,
-    )
+    mapping = Mapping(rank=0, world_size=1)
     config = SimpleNamespace(
         device="cuda",
         gpu_id=0,

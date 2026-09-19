@@ -646,7 +646,7 @@ def _detect_cuda_numa_cpu_affinity() -> tuple[tuple[int, ...], ...]:
                 )
             )
     except Exception as e:
-        logger.warning("NVML failed to query NUMA affinity: %s", e)
+        logger.warning(f"NVML failed to query NUMA affinity: {e!s}")
         return ()
     finally:
         if nvml_initialized:
@@ -695,7 +695,7 @@ def _detect_cuda_nvlink_topology() -> str | None:
                 except pynvml.NVMLError:
                     full_nvlink = False
     except Exception as e:
-        logger.warning("NVML failed to query NVLink topology: %s", e)
+        logger.warning(f"NVML failed to query NVLink topology: {e!s}")
         return None
     finally:
         if nvml_initialized:

@@ -2087,9 +2087,8 @@ class InklingForConditionalGeneration(nn.Module):
 
         if dropped:
             logger.warning(
-                "Inkling load_weights dropped %d checkpoint tensors (first: %s)",
-                len(dropped),
-                dropped[:8],
+                f"Inkling load_weights dropped {len(dropped):d} checkpoint tensors "
+                f"(first: {dropped[:8]!s})",
             )
         if not loaded:
             raise RuntimeError("Inkling load_weights consumed no checkpoint tensors")

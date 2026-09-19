@@ -454,6 +454,7 @@ class AttnResTests(unittest.TestCase):
         weight = torch.empty(_HIDDEN, dtype=torch.bfloat16)
         norm = SimpleNamespace(weight=weight, variance_epsilon=_EPS)
         layer = SimpleNamespace(
+            _dflash_attnres_capture_fallback=False,
             is_block_write_layer=False,
             block_write_idx=1,
             prev_valid_blocks=1,
@@ -502,6 +503,7 @@ class AttnResTests(unittest.TestCase):
             is_block_write_layer=False,
             block_write_idx=1,
             prev_valid_blocks=1,
+            _dflash_attnres_capture_fallback=False,
             _mlp_wp=weight,
             _mlp_slot=3,
             self_attention_res_proj=SimpleNamespace(weight=weight.reshape(1, -1)),

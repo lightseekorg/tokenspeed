@@ -1827,7 +1827,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 f"Missing {len(missing)} V4.1 checkpoint tensors: {', '.join(sorted(missing)[:16])}"
             )
         self.checkpoint_load_report = {"loaded": len(loaded), "skipped": dict(skipped)}
-        logger.info("V4.1 checkpoint coverage: %s", self.checkpoint_load_report)
+        logger.info(f"V4.1 checkpoint coverage: {self.checkpoint_load_report!s}")
         self.post_load_weights()
 
     def _load_missing_engram_tables(self, loaded: set[str]) -> None:

@@ -358,7 +358,6 @@ def _dsa_persistent_radix_topk_kernel(
     # Initialize local state before this row's radix passes.
     shared_histogram.store(histogram_zeros)
     shared_output_counters.store(output_counter_zeros)
-    gl.barrier()
 
     bucket_offsets = gl.arange(
         0,
@@ -377,9 +376,7 @@ def _dsa_persistent_radix_topk_kernel(
     # radix loop.
     for pass_index in gl.static_range(_PERSISTENT_NUM_PASSES):
         if pass_index != 0:
-            gl.barrier()
             shared_histogram.store(histogram_zeros)
-            gl.barrier()
 
         shift = gl.maximum(21 - pass_index * 11, 0)
         bucket_mask = gl.where(pass_index == 2, 0x3FF, 0x7FF)
@@ -430,7 +427,6 @@ def _dsa_persistent_radix_topk_kernel(
                 value_layout,
             )
 
-        gl.barrier()
         local_counts = shared_histogram.load(hist_layout)
         row_histogram = (
             histograms
@@ -560,7 +556,6 @@ def _dsa_persistent_radix_topk_kernel(
             value_layout,
         )
 
-    gl.barrier()
     output_counter_offsets = gl.arange(0, 2, layout=output_counter_layout)
     local_output_counts = shared_output_counters.load(output_counter_layout)
     local_greater = gl.sum(
@@ -620,7 +615,6 @@ def _dsa_persistent_radix_topk_kernel(
         mask=equal_write,
     )
 
-    gl.barrier()
     reset_old = gl.atomic_add(
         reset_arrivals + row * _PERSISTENT_COUNTER_STRIDE,
         1,
@@ -1139,7 +1133,6 @@ def _dsa_oneblock_manual_radix_topk_kernel(
 
     shared_histogram.store(histogram_zeros)
     shared_output_counters.store(output_counter_zeros)
-    gl.barrier()
 
     candidate_logits = logits + row * logits_stride + candidate_start
     vector_end = candidate_len & -4
@@ -1160,9 +1153,7 @@ def _dsa_oneblock_manual_radix_topk_kernel(
             shift = 0
 
         if pass_index != 0:
-            gl.barrier()
             shared_histogram.store(histogram_zeros)
-            gl.barrier()
 
         full_end = candidate_len & -BLOCK_N
         if USE_COMPACT_FINAL and pass_index == 2:
@@ -1303,7 +1294,6 @@ def _dsa_oneblock_manual_radix_topk_kernel(
                     True,
                 )
 
-        gl.barrier()
         counts = shared_histogram.load(histogram_layout)
         count_pairs = counts.reshape([MAX_BUCKETS // 2, 2])
         count_low, count_high = gl.split(count_pairs)
@@ -1389,6 +1379,8 @@ def _dsa_oneblock_manual_radix_topk_kernel(
                     )
 
                 if IS_DECODE:
+                    # ``out`` was just written by other threads; the
+                    # compiler only orders shared-memory hazards.
                     gl.barrier()
                     logical_offsets = gl.load(
                         out + row * out_stride + output_offsets,
@@ -1468,6 +1460,8 @@ def _dsa_oneblock_manual_radix_topk_kernel(
         )
 
     if IS_DECODE:
+        # ``out`` was just written by other threads; the compiler only
+        # orders shared-memory hazards.
         gl.barrier()
         logical_offsets = gl.load(
             out + row * out_stride + output_offsets,

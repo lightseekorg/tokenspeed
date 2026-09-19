@@ -143,9 +143,8 @@ def count_dspark_stages(
             )
         except Exception as exc:  # noqa: BLE001 - fail closed below
             logger.debug(
-                "Unable to resolve DSpark safetensors index for %s: %s",
-                model_path,
-                exc,
+                f"Unable to resolve DSpark safetensors index for {model_path!s}: "
+                f"{exc!s}",
             )
             return None
     if not os.path.isfile(index_path):
@@ -550,7 +549,7 @@ class DeepseekV4DSparkModel(nn.Module):
         if lm_head is not None:
             head_fp32 = lm_head.weight.float()
         else:
-            head_fp32 = getattr(self, "_local_base_head_fp32", None)
+            head_fp32 = self._local_base_head_fp32
             if head_fp32 is None:
                 raise RuntimeError(
                     "DSpark local base logits require a cached target LM head."
@@ -833,7 +832,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module, TargetCaptureConfigurator):
                     continue
                 param = params.get(name)
                 if param is None:
-                    logger.debug("Skipping unmatched DSpark weight: %s", name)
+                    logger.debug(f"Skipping unmatched DSpark weight: {name!s}")
                     continue
                 loader = getattr(param, "weight_loader", default_weight_loader)
                 loader(param, loaded_weight)

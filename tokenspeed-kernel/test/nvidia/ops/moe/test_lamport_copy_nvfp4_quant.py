@@ -23,9 +23,14 @@
 
 import pytest
 import torch
-from flashinfer import fp4_quantize
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
-from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.lamport_copy_nvfp4_quant import (
+from utils import is_nvidia
+
+if not is_nvidia():
+    pytest.skip("NVIDIA GPU required", allow_module_level=True)
+
+from flashinfer import fp4_quantize  # noqa: E402
+from tokenspeed_kernel.platform import current_platform, pdl_enabled  # noqa: E402
+from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.lamport_copy_nvfp4_quant import (  # noqa: E402
     LamportCopyNvfp4QuantKernel,
     compile_kernel,
     launch,

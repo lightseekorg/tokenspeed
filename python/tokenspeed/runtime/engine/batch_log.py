@@ -146,16 +146,11 @@ class BatchLogger:
             self._seen_prefill_ids.clear()
         self._seen_prefill_ids.update(forward_op.request_ids[:num_extends])
         logger.info(
-            "%s batch. #dp-rank: %s, #new-seq: %s, #new-token: %s, "
-            "#cached-token: %s, #running-req: %s, #queue-req: %s%s",
-            mode,
-            self._dp_rank,
-            num_extends,
-            total_tokens,
-            cached_tokens,
-            bs,
-            stats["num_queue_reqs"],
-            self._lifecycle_suffix(),
+            f"{mode!s} batch. #dp-rank: {self._dp_rank!s}, "
+            f"#new-seq: {num_extends!s}, #new-token: {total_tokens!s}, "
+            f"#cached-token: {cached_tokens!s}, "
+            f"#running-req: {bs!s}, #queue-req: {stats['num_queue_reqs']!s}"
+            f"{self._lifecycle_suffix()!s}",
         )
 
     def _log_decode(self, bs: int, stats: dict) -> None:
@@ -173,37 +168,23 @@ class BatchLogger:
         )
         if self._spec_num_steps:
             logger.info(
-                "Decode batch. #dp-rank: %s, #running-req: %s, "
-                "#pages(active/cached/total): %s/%s/%s, "
-                "page ratio: %.2f, gen throughput (token/s): %.2f, "
-                "avg_accept_len: %.2f, accept_rate: %.2f, #queue-req: %s%s",
-                self._dp_rank,
-                bs,
-                num_active_pages,
-                stats["num_cached_pages"],
-                self._num_total_pages,
-                page_ratio,
-                gen_throughput,
-                avg_accept,
-                (avg_accept - 1) / self._spec_num_steps,
-                stats["num_queue_reqs"],
-                self._lifecycle_suffix(),
+                f"Decode batch. #dp-rank: {self._dp_rank!s}, #running-req: {bs!s}, "
+                f"#pages(active/cached/total): {num_active_pages!s}/"
+                f"{stats['num_cached_pages']!s}/{self._num_total_pages!s}, "
+                f"page ratio: {page_ratio:.2f}, gen throughput (token/s): "
+                f"{gen_throughput:.2f}, "
+                f"avg_accept_len: {avg_accept:.2f}, accept_rate: "
+                f"{(avg_accept - 1) / self._spec_num_steps:.2f}, #queue-req: "
+                f"{stats['num_queue_reqs']!s}{self._lifecycle_suffix()!s}",
             )
         else:
             logger.info(
-                "Decode batch. #dp-rank: %s, #running-req: %s, "
-                "#pages(active/cached/total): %s/%s/%s, "
-                "page ratio: %.2f, gen throughput (token/s): %.2f, "
-                "#queue-req: %s%s",
-                self._dp_rank,
-                bs,
-                num_active_pages,
-                stats["num_cached_pages"],
-                self._num_total_pages,
-                page_ratio,
-                gen_throughput,
-                stats["num_queue_reqs"],
-                self._lifecycle_suffix(),
+                f"Decode batch. #dp-rank: {self._dp_rank!s}, #running-req: {bs!s}, "
+                f"#pages(active/cached/total): {num_active_pages!s}/"
+                f"{stats['num_cached_pages']!s}/{self._num_total_pages!s}, "
+                f"page ratio: {page_ratio:.2f}, gen throughput (token/s): "
+                f"{gen_throughput:.2f}, "
+                f"#queue-req: {stats['num_queue_reqs']!s}{self._lifecycle_suffix()!s}",
             )
         self._log_cache_state_group_pages()
         self._num_generated_tokens = 0
@@ -228,9 +209,8 @@ class BatchLogger:
                 f"{group_id}: used={total - available}/{total}, available={available}"
             )
         logger.debug(
-            "Cache state group pages. #dp-rank: %s, %s",
-            self._dp_rank,
-            "; ".join(parts),
+            f"Cache state group pages. #dp-rank: {self._dp_rank!s}, "
+            f"{'; '.join(parts)!s}"
         )
 
     def record_decode(self, results, bs: int) -> None:
@@ -245,10 +225,10 @@ class BatchLogger:
             return
         accepted_widths = [int(value) for value in accept_lengths.tolist()]
         logger.info(
-            "Spec verify step. #dp-rank: %s, accept_lengths=%s, accepted_draft_tokens=%s",
-            self._dp_rank,
-            accepted_widths,
-            [max(0, value - 1) for value in accepted_widths],
+            f"Spec verify step. #dp-rank: {self._dp_rank!s}, "
+            f"accept_lengths={accepted_widths!s}, "
+            "accepted_draft_tokens="
+            f"{[max(0, value - 1) for value in accepted_widths]!s}",
         )
         candidates = results.spec_candidate_tokens
         if candidates is None:
@@ -261,10 +241,8 @@ class BatchLogger:
         draft_rows = candidate_rows[:, 1:]
         target_draft_rows = target_rows[:, :-1]
         logger.info(
-            "Spec token compare. #dp-rank: %s, anchor=%s, draft=%s, target=%s, match=%s",
-            self._dp_rank,
-            candidate_rows[:, 0].tolist(),
-            draft_rows.tolist(),
-            target_draft_rows.tolist(),
-            draft_rows.eq(target_draft_rows).tolist(),
+            f"Spec token compare. #dp-rank: {self._dp_rank!s}, "
+            f"anchor={candidate_rows[:, 0].tolist()!s}, draft="
+            f"{draft_rows.tolist()!s}, target={target_draft_rows.tolist()!s}, match="
+            f"{draft_rows.eq(target_draft_rows).tolist()!s}",
         )

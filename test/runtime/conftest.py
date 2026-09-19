@@ -166,7 +166,7 @@ def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True)
     recipe = kimi_recipe()
     group_ids = recipe.target_group_ids
     layer_types = recipe.layer_types
-    from cache_pool_test_utils import make_pool
+    from test.runtime.cache_pool_test_utils import make_pool
 
     _, pool = make_pool(
         HybridKDATokenToKVPool,

@@ -28,8 +28,9 @@ rest of the process. Anything owned by such a local (a CUDA graph holding an
 NCCL collective, for one) is never released, and a later
 ``destroy_process_group`` waits on it forever.
 
-The probe runs in a fresh interpreter so the modules are imported for the
-first time from inside the probing function.
+The probe runs in a fresh interpreter and preloads PyTorch, whose own first
+import retains its caller's frame independently of TokenSpeed. The TokenSpeed
+modules are still imported for the first time from inside the probing function.
 """
 
 from __future__ import annotations
@@ -50,6 +51,8 @@ _PROBE = textwrap.dedent("""
     import importlib
     import sys
     import weakref
+
+    import torch
 
 
     class Sentinel:

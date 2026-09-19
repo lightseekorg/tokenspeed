@@ -298,11 +298,8 @@ class MoELayer(torch.nn.Module):
             return
         padded = round_up(ispp, alignment)
         logger.info(
-            "%s: padding MoE intermediate size per partition %d -> %d so %s",
-            self.prefix,
-            ispp,
-            padded,
-            reason,
+            f"{self.prefix!s}: padding MoE intermediate size per partition {ispp:d} -> "
+            f"{padded:d} so {reason!s}",
         )
         self.intermediate_size = padded * self.tp_size
         self._spec = replace(self._spec, intermediate_size=self.intermediate_size)
