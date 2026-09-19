@@ -133,12 +133,7 @@ class GrammarManager:
         """
         sp = state.sampling_params
 
-        if (
-            sp.json_schema is None
-            and sp.regex is None
-            and sp.ebnf is None
-            and sp.structural_tag is None
-        ):
+        if not sp.has_grammar:
             return True
 
         if self.grammar_backend is None:
