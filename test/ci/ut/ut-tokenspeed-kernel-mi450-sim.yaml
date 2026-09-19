@@ -22,6 +22,14 @@ env:
   # remain covered on AMD hardware; MXFP4 MoE alone exceeds this lane's budget.
   MI450_SIM_TEST_ROOT: tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_tile_shapes
   MI450_SIM_TESTS: |
+    # DeepSeek V4.1 CSA2 scoring, reindexing, and invalid-page selection.
+    tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/attention.dsv41_index_topk/gluon_dsv41_index_topk_gfx1250@mi450]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_full_and_reindex_gluon[65-17-32]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_missing_latest_page[-1-gluon]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_missing_latest_page[3-gluon]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_latest_block_outside_table[320-31-gluon]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_preserves_arena_page_stride[True-1]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_preserves_arena_page_stride[True-2]
     tokenspeed-kernel/test/ops/test_attention.py::test_mha_decode_with_kvcache_gluon_peeled_split
     tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache[gluon-bh16bn64]
     tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_extend_with_kvcache[bf16]
@@ -63,6 +71,12 @@ env:
     tokenspeed-kernel/test/ops/attention/test_triton_dsv4_indexer.py::test_decode_logits_and_topk[64-2048]
     tokenspeed-kernel/test/ops/attention/test_triton_dsv4_indexer.py::test_prefill_ragged_candidates[True]
     tokenspeed-kernel/test/ops/attention/test_triton_dsv4_indexer.py::test_decode_graph_refresh_and_padding
+    # DeepSeek V4 indexer: buffer-load prefill/decode, native TDM decode,
+    # radix top-k, padded page strides, and graph-stable plan refresh.
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv4_indexer_gfx1250.py::test_decode_logits_and_topk[64-2048]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv4_indexer_gfx1250.py::test_prefill_ragged_candidates_and_int64_base_offsets
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv4_indexer_gfx1250.py::test_decode_tdm_threshold_logits
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv4_indexer_gfx1250.py::test_decode_graph_refresh_and_plan_aliasing
     tokenspeed-kernel/test/ops/attention/test_triton_dsv4_attention.py::test_selected_attention_and_graph_replay[True-64]
     tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[True-False-dtype0-plain]
     tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[True-False-dtype1-bias]
@@ -73,8 +87,8 @@ env:
     tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_ties_and_graph_replay
     tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_nan_logits_keep_expert_ids_in_range[True]
     tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_to_mxfp4_experts[17]
-    tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/attention.dsv4_prefill_topk/triton_dsv4_prefill_topk_mxfp4/mxfp4@mi450]
-    tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/attention.dsv4_decode_topk/triton_dsv4_decode_topk_mxfp4/mxfp4@mi450]
+    tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/attention.dsv4_prefill_topk/gluon_dsv4_prefill_topk_mxfp4_gfx1250/mxfp4@mi450]
+    tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/attention.dsv4_decode_topk/gluon_dsv4_decode_topk_mxfp4_gfx1250/mxfp4@mi450]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/moe.dsv4_select_experts/triton_dsv4_select_experts/bias-tokens17@mi450]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/moe.dsv4_select_experts/triton_dsv4_select_experts/hash@mi450]
     # DeepSeek V4 Gluon paged decode, one case per host-side specialization:

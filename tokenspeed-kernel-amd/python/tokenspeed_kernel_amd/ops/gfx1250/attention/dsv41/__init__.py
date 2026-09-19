@@ -20,8 +20,14 @@
 
 """DeepSeek V4.1 attention kernels for AMD GFX1250."""
 
+from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41.indexer import (
+    dsv41_index_logits_gfx1250,
+)
 from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41.selected import (
     gluon_dsv41_selected_attention_gfx1250,
 )
 
-__all__ = ["gluon_dsv41_selected_attention_gfx1250"]
+__all__ = [
+    "dsv41_index_logits_gfx1250",
+    "gluon_dsv41_selected_attention_gfx1250",
+]

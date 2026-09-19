@@ -53,6 +53,9 @@ import tokenspeed_kernel.ops.attention.dsv4 as _attention_dsv4_pkg
 import tokenspeed_kernel.ops.attention.dsv4.cuda as _attention_cuda_dsv4
 import tokenspeed_kernel.ops.attention.dsv4.deep_gemm as _attention_deep_gemm_dsv4
 import tokenspeed_kernel.ops.attention.dsv4.gluon as _attention_gluon_dsv4
+import tokenspeed_kernel.ops.attention.dsv41 as _attention_dsv41_pkg
+import tokenspeed_kernel.ops.attention.dsv41.gluon as _attention_gluon_dsv41
+import tokenspeed_kernel.ops.attention.dsv41.triton as _attention_triton_dsv41
 import tokenspeed_kernel.ops.attention.gdn as _attention_gdn_pkg
 import tokenspeed_kernel.ops.attention.gdn.flashinfer as _attention_flashinfer_gdn
 import tokenspeed_kernel.ops.attention.kda as _attention_kda_pkg
@@ -145,6 +148,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 _ATTENTION_GLUON_MODULES = [
     _attention_gluon_dsa,
     _attention_gluon_dsv4,
+    _attention_gluon_dsv41,
     _attention_gluon_kda,
     _attention_gluon_mha,
     _attention_gluon_mla,
@@ -175,6 +179,7 @@ _RELOAD_MODULES = [
     _attention_triton_rel_mha,
     _attention_triton_merge_state,
     _attention_triton_dsv4,
+    _attention_triton_dsv41,
     _attention_triton_dsa,
     _attention_triton_gdn,
     # Variant packages own public result classes imported by other test modules.
@@ -1844,6 +1849,28 @@ def _attention_dsa_prefill_fp8_packed_rank512() -> object:
         qk_rope_head_dim=64,
         softmax_scale=1.0,
         page_size=64,
+    )
+
+
+def _attention_dsv41_index_topk(
+    heads: int, process_group: object, row_bytes: int
+) -> object:
+    q = torch.empty((2, heads, 128), dtype=torch.bfloat16)
+    return _attention_dsv41_pkg.index_topk(
+        q,
+        torch.empty((2, heads), dtype=torch.bfloat16),
+        torch.empty((4, 64, row_bytes), dtype=torch.uint8),
+        torch.zeros((2, 4), dtype=torch.int32),
+        torch.tensor([64, 32], dtype=torch.int32),
+        None,
+        512,
+        0,
+        8,
+        2,
+        64,
+        process_group,
+        None,
+        None,
     )
 
 
@@ -3819,6 +3846,22 @@ _CASES = [
         _is_cdna4,
         "cdna4",
         "attention",
+        "dsv41_index_topk",
+        "gluon_dsv41_index_topk_gfx950",
+        partial(_attention_dsv41_index_topk, 32, None, 68),
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsv41_index_topk",
+        "gluon_dsv41_index_topk_gfx1250",
+        partial(_attention_dsv41_index_topk, 32, None, 68),
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
         "dsv4_prefill_topk",
         "gluon_dsv4_prefill_topk_mxfp4_gfx950",
         _attention_dsv4_prefill_topk_mxfp4,
@@ -3838,7 +3881,7 @@ _CASES = [
         "cdna5",
         "attention",
         "dsv4_prefill_topk",
-        "triton_dsv4_prefill_topk_mxfp4",
+        "gluon_dsv4_prefill_topk_mxfp4_gfx1250",
         _attention_dsv4_prefill_topk_mxfp4,
         id_suffix="mxfp4",
     ),
@@ -3847,7 +3890,7 @@ _CASES = [
         "cdna5",
         "attention",
         "dsv4_decode_topk",
-        "triton_dsv4_decode_topk_mxfp4",
+        "gluon_dsv4_decode_topk_mxfp4_gfx1250",
         _attention_dsv4_decode_topk_mxfp4,
         id_suffix="mxfp4",
     ),
@@ -5073,6 +5116,23 @@ def selected_kernel_spy(monkeypatch):
                 )
             if case.mode == "dsa_plan":
                 return torch.empty((1, 4), dtype=torch.int32)
+            if case.mode == "dsv41_index_topk":
+                index_q = args[0]
+                topk = args[6]
+                candidate_topk = args[7]
+                tokens = index_q.shape[0]
+                return (
+                    torch.empty(
+                        (tokens, topk), dtype=torch.int32, device=index_q.device
+                    ),
+                    torch.empty((tokens,), dtype=torch.int32, device=index_q.device),
+                    torch.empty(
+                        (tokens, candidate_topk),
+                        dtype=torch.int32,
+                        device=index_q.device,
+                    ),
+                    torch.empty((tokens,), dtype=torch.int32, device=index_q.device),
+                )
             if case.mode in {"dsv4_prefill_topk", "dsv4_decode_topk"}:
                 q_values, _ = kwargs["index_q"]
                 indices = torch.empty(
@@ -5613,6 +5673,86 @@ def test_gluon_mla_fixed_regime_auto_selection(
         registry.clear_cache()
 
     assert calls == [expected]
+
+
+@pytest.mark.parametrize("platform_fixture", ["mi350_platform", "mi450_platform"])
+@pytest.mark.parametrize(("heads", "shards"), [(64, 1), (16, 4), (8, 4)])
+def test_dsv41_index_topk_unsupported_gluon_geometry_selects_triton(
+    platform_fixture, heads, shards, request, monkeypatch, selected_kernel_spy
+):
+    platform = request.getfixturevalue(platform_fixture)
+    group = object() if shards > 1 else None
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: shards)
+    case = _case(
+        lambda platform: platform.is_amd,
+        "cdna4",
+        "attention",
+        "dsv41_index_topk",
+        "triton_dsv41_index_topk",
+        partial(_attention_dsv41_index_topk, heads, group, 68),
+    )
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = case
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    try:
+        Platform.override(platform)
+        registry.clear_cache()
+        case.invoke()
+        assert calls == [case.expected]
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+
+
+@pytest.mark.parametrize("platform_fixture", ["mi350_platform", "mi450_platform"])
+def test_dsv41_index_topk_fp8_rows_select_triton(
+    platform_fixture, request, selected_kernel_spy
+):
+    platform = request.getfixturevalue(platform_fixture)
+    case = _case(
+        lambda platform: platform.is_amd,
+        "cdna4",
+        "attention",
+        "dsv41_index_topk",
+        "triton_dsv41_index_topk",
+        partial(_attention_dsv41_index_topk, 32, None, 132),
+    )
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = case
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    try:
+        Platform.override(platform)
+        registry.clear_cache()
+        case.invoke()
+        assert calls == [case.expected]
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+
+
+# Capture host-available registrations before the fixture clears them. CI runs
+# this guard on each vendor; explicit DSV4.1 module checks also run across vendors.
+_CASE_REGISTRATION_MODULES = {
+    case.expected: impl.__module__
+    for case in _CASES
+    if (impl := KernelRegistry.get().get_impl(case.expected)) is not None
+}
+
+
+def test_selection_fixture_reloads_available_case_registrations():
+    assert _attention_gluon_dsv41 in _RELOAD_MODULES
+    assert _attention_triton_dsv41 in _RELOAD_MODULES
+    registry = KernelRegistry.get()
+    missing = {
+        name: module
+        for name, module in _CASE_REGISTRATION_MODULES.items()
+        if registry.get_impl(name) is None
+    }
+    assert (
+        not missing
+    ), f"Add registration modules to _RELOAD_MODULES for missing cases: {missing}"
 
 
 _CASE_PLATFORM_PARAMS = [

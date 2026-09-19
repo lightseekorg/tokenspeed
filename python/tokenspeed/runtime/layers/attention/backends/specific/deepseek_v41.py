@@ -1247,6 +1247,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     blocks[start:stop],
                     block_lens[start:stop],
                 ),
+                None,
             )
         if produce_candidates:
             candidates = V41Candidates(positions, request_indices, blocks, block_lens)

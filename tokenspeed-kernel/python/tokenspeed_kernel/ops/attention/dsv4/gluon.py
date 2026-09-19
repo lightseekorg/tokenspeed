@@ -51,7 +51,16 @@ if current_platform().is_amd:
         gluon_dsv4_decode_gfx1250 as _dsv4_decode_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4 import (
+        gluon_dsv4_decode_topk_mxfp4_gfx1250 as _dsv4_decode_topk_gfx1250_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4 import (
+        gluon_dsv4_plan_gfx1250 as _dsv4_plan_gfx1250_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4 import (
         gluon_dsv4_prefill_gfx1250 as _dsv4_prefill_gfx1250_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4 import (
+        gluon_dsv4_prefill_topk_mxfp4_gfx1250 as _dsv4_prefill_topk_gfx1250_impl,
     )
 
     _DSV4_MXFP4_SIGNATURE = format_signature(
@@ -120,6 +129,68 @@ if current_platform().is_amd:
     )
     def gluon_dsv4_plan_gfx950(**kwargs):
         return _dsv4_plan_impl(**kwargs)
+
+    @register_kernel(
+        "attention",
+        "dsv4_prefill_topk",
+        name="gluon_dsv4_prefill_topk_mxfp4_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset({_DSV4_MXFP4_SIGNATURE}),
+        traits=_DSV4_MXFP4_TRAITS,
+        priority=Priority.SPECIALIZED,
+        tags={"amd", "gfx1250", "mxfp4", "sparse", "radix_topk", "wmma"},
+    )
+    def gluon_dsv4_prefill_topk_mxfp4_gfx1250(*args, **kwargs):
+        return _dsv4_prefill_topk_gfx1250_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "dsv4_decode_topk",
+        name="gluon_dsv4_decode_topk_mxfp4_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset({_DSV4_MXFP4_SIGNATURE}),
+        traits=_DSV4_MXFP4_TRAITS,
+        priority=Priority.SPECIALIZED,
+        tags={
+            "amd",
+            "gfx1250",
+            "mxfp4",
+            "sparse",
+            "radix_topk",
+            "tdm",
+            "wmma",
+        },
+    )
+    def gluon_dsv4_decode_topk_mxfp4_gfx1250(*args, **kwargs):
+        return _dsv4_decode_topk_gfx1250_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "dsv4_plan",
+        name="gluon_dsv4_plan_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset({format_signature()}),
+        traits={"page_size": frozenset({64})},
+        priority=Priority.SPECIALIZED,
+        tags={"amd", "gfx1250", "cuda_graph"},
+    )
+    def gluon_dsv4_plan_gfx1250(**kwargs):
+        return _dsv4_plan_gfx1250_impl(**kwargs)
 
     @register_kernel(
         "attention",

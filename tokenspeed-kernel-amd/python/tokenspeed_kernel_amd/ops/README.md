@@ -37,16 +37,22 @@ regress perf even when the generated kernel remains correct.
 
 ### DeepSeek V4 attention
 
-The gfx950 package provides MXFP4 index selection, dense-workspace selected
-prefill, and page-planar selected decode. Gfx1250 provides page-planar selected
-decode. Decode reads a sliding-window (SWA) cache and an optional compressed
-cache; both segments share one softmax, and the attention sink is applied once.
+The gfx950 and gfx1250 packages provide MXFP4 index selection. Gfx950 also
+provides dense-workspace selected prefill, while both architectures provide
+page-planar selected decode. Decode reads a sliding-window (SWA) cache and an
+optional compressed cache; both segments share one softmax, and the attention
+sink is applied once.
 
 #### Contract
 
 - The gfx950 MXFP4 indexers support 32 or 64 index heads of dimension 128,
   64-row pages, and top-k 512, 1024, or 2048. Prefill and decode return int32
   logical offsets; `dsv4_plan` preserves graph-stable sequence metadata.
+- The gfx1250 MXFP4 indexers implement the same logical contract for packed
+  E2M1 values with one E8M0 scale per 32 elements. They accept padded page and
+  block-table strides, reject invalid physical pages, and support caller-owned
+  outputs and graph replay. Each page stores its packed key rows followed by
+  the corresponding scale rows.
 - The gfx950 prefill kernel accepts contiguous BF16 queries shaped
   `(tokens, heads, 512)`, a dense BF16 KV workspace, contiguous int32 selected
   indices and lengths, and a contiguous BF16 or FP32 sink. Registered selected
@@ -78,6 +84,16 @@ uses 16-head by 32-row tiles, four wave64s, and 18 fixed KV partitions. Its
 second kernel combines the partial outputs and log-sum-exp values before
 applying the sink.
 
+The gfx1250 indexer scores 64 candidates at a time with native scaled E2M1
+wave32 WMMA, accumulates weighted ReLU scores in FP32, and reuses the gfx1250
+DSA radix top-k. Four waves cover 32 index heads; 64-head inputs reuse the same
+key tile for a second WMMA group. Prefill and smaller decode workloads use
+vectorized CDNA5 buffer loads. Larger decode workloads stage page-planar keys
+and scales through native TDM into padded LDS. Double buffering and a
+one-page-ahead software pipeline overlap these transfers with WMMA scoring
+while keeping the transfer geometry aligned and the number of nearby TDM
+operations bounded.
+
 On gfx1250, decode fuses page-planar dequantization, BF16 wave32 WMMA attention,
 FP32 online softmax, and output reduction. A workgroup covers 32 or 64 query
 heads and 32 selected KV rows with four or eight waves. Shape-based KV
@@ -95,6 +111,28 @@ For `BLOCK_H=64`, `TILE_K=32`, and `HEAD_DIM=512`, one eight-wave workgroup is
 resident per WGP, giving two wave32s per SIMD. The logical shared structures are
 one BF16 Q tile, one BF16 dequantized KV tile, and, on the asynchronous path,
 two raw FP8 buffers. Lifetime reuse keeps the physical LDS allocation unchanged.
+
+### DeepSeek V4.1 CSA2 index selection
+
+The gfx950 scorer uses scaled MXFP4 MFMA; gfx1250 dequantizes keys to BF16
+and uses wave32 WMMA. Both accept 32 padded index heads of dimension 128 and
+64-row, page-planar MXFP4 caches. Launch metadata reports score-capacity FLOPs
+and estimated tensor traffic without reading device-resident sequence lengths.
+
+The `tokenspeed-kernel` adapter owns query preparation, validation, and sorted
+row/block selection. Gluon accepts one local or replicated shard with 1..32
+heads and the 68-byte MXFP4 index format; sharded heads, wider head counts, and
+132-byte FP8 index rows use portable Triton. Full selection scores the configured
+page-table capacity without reading device lengths on the host. Its query tile
+shrinks with history width to keep FP32 logits within 32 MiB (at most 256
+queries at 32K rows, 64 at 128K, and 8 at 1M). Reindex scores at most the
+candidate-list capacity. Score CTAs honor the caller's row-chunk bound up to the
+256-row tuned maximum; masked 32-row hardware tiles cover smaller bounds. Arena
+page strides are preserved without copying the full cache; a non-unit stride
+between page bytes is normalized to contiguous storage before scoring. Missing
+or out-of-range cache pages never contribute rows or blocks, including the
+newest visible block. A valid newest block remains eligible regardless of its
+score.
 
 ## Sampling
 

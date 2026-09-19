@@ -49,10 +49,23 @@ def test_index_topk_graph_full_candidates_and_reindex():
 
     def run():
         full = dsv41.index_topk(
-            q, weights, cache, table, visible, None, 16, 4, 8, 2, 64, None, None
+            q, weights, cache, table, visible, None, 16, 4, 8, 2, 64, None, None, None
         )
         reindex = dsv41.index_topk(
-            q, weights, cache, table, visible, full[2], 16, 0, 8, 2, 64, None, None
+            q,
+            weights,
+            cache,
+            table,
+            visible,
+            full[2],
+            16,
+            0,
+            8,
+            2,
+            64,
+            None,
+            None,
+            None,
         )
         return full + reindex
 

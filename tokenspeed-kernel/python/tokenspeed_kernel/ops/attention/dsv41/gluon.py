@@ -18,11 +18,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Registration shims for AMD Gluon DeepSeek V4.1 selected attention."""
+"""Registration shims for AMD Gluon DeepSeek V4.1 attention kernels."""
 
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.attention.dsv41._gluon.indexer import (
+    launch_gfx950_logits,
+    launch_gfx1250_logits,
+    run_dsv41_csa2_index_topk,
+)
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -40,6 +45,12 @@ if current_platform().is_amd:
     )
 
     _SIGNATURES = frozenset({format_signature(x=dense_tensor_format(torch.bfloat16))})
+    _INDEX_TRAITS = {
+        "native_indexer": frozenset({False}),
+        "index_heads": frozenset(range(1, 33)),
+        "index_k_format": frozenset({"mxfp4"}),
+        "index_shards": frozenset({1}),
+    }
 
     @register_kernel(
         "attention",
@@ -60,6 +71,26 @@ if current_platform().is_amd:
 
     @register_kernel(
         "attention",
+        "dsv41_index_topk",
+        name="gluon_dsv41_index_topk_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=_SIGNATURES,
+        traits=_INDEX_TRAITS,
+        priority=Priority.SPECIALIZED,
+        tags={"amd", "gfx950", "indexer", "fusion"},
+    )
+    def gluon_dsv41_index_topk_gfx950(*args, **kwargs):
+        return run_dsv41_csa2_index_topk(
+            *args, **kwargs, launch_logits=launch_gfx950_logits
+        )
+
+    @register_kernel(
+        "attention",
         "dsv41_selected_attention",
         name="gluon_dsv41_selected_attention_gfx1250",
         solution="gluon",
@@ -74,3 +105,23 @@ if current_platform().is_amd:
     )
     def gluon_dsv41_selected_attention_gfx1250(*args, **kwargs):
         return _dsv41_selected_gfx1250(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "dsv41_index_topk",
+        name="gluon_dsv41_index_topk_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=_SIGNATURES,
+        traits=_INDEX_TRAITS,
+        priority=Priority.SPECIALIZED,
+        tags={"amd", "gfx1250", "indexer", "fusion"},
+    )
+    def gluon_dsv41_index_topk_gfx1250(*args, **kwargs):
+        return run_dsv41_csa2_index_topk(
+            *args, **kwargs, launch_logits=launch_gfx1250_logits
+        )
