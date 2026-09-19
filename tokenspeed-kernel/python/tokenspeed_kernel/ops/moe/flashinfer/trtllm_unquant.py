@@ -116,7 +116,9 @@ if platform.is_nvidia:
 
         ``routed`` selects between ``trtllm_bf16_moe`` (in-kernel routing from
         ``router_logits``) and ``trtllm_bf16_routed_moe`` (precomputed
-        ``topk_ids``/``topk_weights``); everything else is identical.
+        ``topk_ids``/``topk_weights``). Precomputed routes use FlashInfer's
+        unpacked (int32 IDs, BF16 weights) ABI, preserving the packed path's
+        weight rounding; everything else is identical.
         """
         if x.shape[0] == 0:
             # Idle DP ranks run a dummy forward with 0 tokens; the fused kernel
@@ -147,17 +149,14 @@ if platform.is_nvidia:
         )
 
         if routed:
-            # PackedScoreIdx = (expert_id<<16)|bf16 bits, applied verbatim; &0xFFFF stops int16 sign-extension.
-            weight_bits = (
-                topk_weights.to(torch.bfloat16)
-                .contiguous()
-                .view(torch.int16)
-                .to(torch.int32)
-                & 0xFFFF
+            # Preserve the packed path's BF16 rounding without constructing
+            # score/index words. FlashInfer accepts these tensors directly.
+            topk = (
+                topk_ids.to(torch.int32).contiguous(),
+                topk_weights.to(torch.bfloat16).contiguous(),
             )
-            packed_topk = (topk_ids.to(torch.int32) << 16) | weight_bits
             result = trtllm_bf16_routed_moe(
-                topk_ids=packed_topk,
+                topk_ids=topk,
                 n_group=None,
                 topk_group=None,
                 routed_scaling_factor=None,
@@ -196,7 +195,7 @@ if platform.is_nvidia:
         # Deferred: [gemm2_out, expert_weights, expanded_idx_to_permuted_idx].
         gemm2_out, expert_weights, expanded_idx = result
         if routed:
-            # expert_weights echoes the caller's packed input; shared-sink callers drop it at finalize.
+            # Shared-sink callers use their original route weights at finalize.
             return (gemm2_out, expert_weights, expanded_idx)
         # In-kernel routing may hand back an fp32-typed buffer that actually
         # holds bf16 data (see trtllm_nvfp4.py); reinterpret to bf16 and keep
