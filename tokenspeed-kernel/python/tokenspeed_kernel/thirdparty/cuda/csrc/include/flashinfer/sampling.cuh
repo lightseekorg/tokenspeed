@@ -594,7 +594,8 @@ __global__ void OnlineSoftmaxReduceKernel(DType* logits, DType* output,
 }
 
 template <uint32_t VEC_SIZE, uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
-          BlockReduceAlgorithm REDUCE_ALGORITHM, bool DETERMINISTIC, typename Predicate>
+          BlockReduceAlgorithm REDUCE_ALGORITHM, bool DETERMINISTIC, bool TRACK_LAST_VALID,
+          typename Predicate>
 __device__ __forceinline__ void DeviceSamplingFromProb(
     uint32_t i, uint32_t d, Predicate pred, float u, vec_t<float, VEC_SIZE> prob_vec,
     float& aggregate,
@@ -652,21 +653,23 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
     __syncthreads();
   }
 
-  // update the last valid index
-  int valid_index[VEC_SIZE];
+  // Target-only chain sampling never reads this fallback index.
+  if constexpr (TRACK_LAST_VALID) {
+    int valid_index[VEC_SIZE];
 #pragma unroll
-  for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-    if (valid[j]) {
-      valid_index[j] = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
-    } else {
-      valid_index[j] = -1;
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      if (valid[j]) {
+        valid_index[j] = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
+      } else {
+        valid_index[j] = -1;
+      }
     }
-  }
-  int max_valid_index =
-      BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce_int)
-          .Reduce(valid_index, MaxReduceOp{});
-  if (tx == 0 && max_valid_index != -1) {
-    temp_storage->last_valid_id = max_valid_index;
+    int max_valid_index =
+        BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce_int)
+            .Reduce(valid_index, MaxReduceOp{});
+    if (tx == 0 && max_valid_index != -1) {
+      temp_storage->last_valid_id = max_valid_index;
+    }
   }
   __syncthreads();
   aggregate += aggregate_local;
@@ -813,7 +816,7 @@ __global__ void SamplingFromProbKernel(DType* probs, IdType* output, IdType* ind
     }
 
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
-                           DETERMINISTIC>(
+                           DETERMINISTIC, true>(
         i, d, [](float x) { return x > 0; }, u, probs_vec, aggregate, &temp_storage);
     if (float(aggregate) > u) {
       break;
@@ -869,7 +872,7 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, IdType*
       }
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
-                             DETERMINISTIC>(
+                             DETERMINISTIC, true>(
           i, d, [&](float x) { return x > low; }, u, probs_vec, aggregate, &temp_storage);
       if (aggregate > u) {
         break;
@@ -982,7 +985,7 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType*
       }
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
-                             DETERMINISTIC>(
+                             DETERMINISTIC, true>(
           i, d, [&](float x) { return x > low; }, u, probs_vec, aggregate, &temp_storage);
       if (aggregate > u) {
         break;
@@ -1113,7 +1116,7 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdTyp
     }
 
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
-                           DETERMINISTIC>(
+                           DETERMINISTIC, true>(
         i, d, [&](float x) { return x >= pivot; }, u, probs_vec, aggregate, &temp_storage);
     if (aggregate > u) {
       break;
@@ -1169,7 +1172,7 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
       }
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
-                             DETERMINISTIC>(
+                             DETERMINISTIC, true>(
           i, d, [&](float x) { return x > low; }, u, probs_vec, aggregate, &temp_storage);
       if (aggregate > u) {
         break;
@@ -2284,7 +2287,8 @@ __global__ void ChainSpeculativeSamplingKernelTargetOnlyFastPath(
       relu_q_minus_p_vec[j] = max(q_vec[j] - p_vec[j], DType(0));
     }
 
-    DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DETERMINISTIC>(
+    DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
+                           DETERMINISTIC, false>(
         i, d, [&](DType x) { return x > 0; }, u, relu_q_minus_p_vec, aggregate_relu_q_minus_p, &temp_storage);
     if (aggregate_relu_q_minus_p > u) {
       break;
@@ -2483,7 +2487,7 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
     }
 
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
-                           DETERMINISTIC>(
+                           DETERMINISTIC, true>(
         i, d, [&](float x) { return x > 0; }, u, relu_q_minus_p_vec, aggregate_relu_q_minus_p,
         &temp_storage);
     if (aggregate_relu_q_minus_p > u) {
