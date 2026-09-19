@@ -18,8 +18,8 @@ sink is applied once.
 - The gfx1250 MXFP4 indexers implement the same logical contract for packed
   E2M1 values with one E8M0 scale per 32 elements. They accept padded page and
   block-table strides, reject invalid physical pages, and support caller-owned
-  outputs and graph replay. Each page stores all 64-byte packed key rows,
-  followed by all four-byte scale rows, for 4,352 useful bytes per page.
+  outputs and graph replay. Each page stores its packed key rows followed by
+  the corresponding scale rows.
 - The gfx950 prefill kernel accepts contiguous BF16 queries shaped
   `(tokens, heads, 512)`, a dense BF16 KV workspace, contiguous int32 selected
   indices and lengths, and a contiguous BF16 or FP32 sink. Registered selected
@@ -54,33 +54,12 @@ applying the sink.
 The gfx1250 indexer scores 64 candidates at a time with native scaled E2M1
 wave32 WMMA, accumulates weighted ReLU scores in FP32, and reuses the gfx1250
 DSA radix top-k. Four waves cover 32 index heads; 64-head inputs reuse the same
-key tile for a second WMMA group. Prefill and lower-volume decode use vectorized
-CDNA5 buffer loads in 1,024-candidate workgroups. Decode switches at
-`tokens * max_context_len >= 2^20` to 512-candidate workgroups that load each
-64-row page as a 16-by-256-byte key tensor plus a 1-by-256-byte scale tensor
-through native TDM. Padded LDS layouts, two buffers, and a one-page-ahead
-software pipeline overlap those transfers with WMMA scoring. The measured
-`waves_per_eu=4` setting balances latency hiding against register pressure.
-
-For the indexer, key traffic alone gives useful arithmetic intensities of about
-120 FLOP/byte for 32 heads and 241 FLOP/byte for 64 heads. Against the published
-19.6 TB/s MI450 HBM rate, the corresponding bandwidth rooflines are about 2.35
-and 4.72 PFLOP/s, so realized performance depends strongly on exposing enough
-concurrent pages and overlapping transfers with WMMA. On 32 decode queries,
-64 heads, and 32K candidates, the TDM route measured about 405 TFLOP/s and 1.78
-TB/s of useful work: 0.042 ms for scoring and 0.124 ms including radix top-k,
-versus 0.141 ms and 0.515 ms for the portable Triton implementation. Smaller
-decode and prefill workloads stay on buffer loads because TDM setup and LDS
-staging cost more than they hide at those volumes.
-
-The profiling flow used benchmark timings first, then rocprofv3 dispatch and
-resource data to validate each change. Relative to the vector-load large-shape
-kernel, the selected TDM specialization reduced a warm dispatch from about
-72.4 us to 39.4 us, reduced architectural VGPRs from 176 to 104, and used 9,216
-bytes of LDS. The current profiler stack reports zero for the relevant SQ
-instruction/cycle counters and `TX_VCD_TD_BUSY` even when the compiled TDM path
-is active; dispatch duration, specialization names, LDS, VGPRs, and repeated
-benchmark timings are therefore the reliable evidence for this kernel.
+key tile for a second WMMA group. Prefill and smaller decode workloads use
+vectorized CDNA5 buffer loads. Larger decode workloads stage page-planar keys
+and scales through native TDM into padded LDS. Double buffering and a
+one-page-ahead software pipeline overlap these transfers with WMMA scoring
+while keeping the transfer geometry aligned and the number of nearby TDM
+operations bounded.
 
 On gfx1250, decode fuses page-planar dequantization, BF16 wave32 WMMA attention,
 FP32 online softmax, and output reduction. A workgroup covers 32 or 64 query
