@@ -274,6 +274,10 @@ before Mooncake WRITE — that CUDA copy is data-plane work, not loop work.
 All hooks obey Principle 3: they return events or decisions; they never call
 `advance_scheduler`.
 
+An empty memory-resume request is a successful no-op while a drain is
+pending. It must preserve that drain's admission hold until the owning
+pause or memory-release operation finishes.
+
 ## Anatomy of a round
 
 For orientation, one iteration of `event_loop`:
