@@ -168,6 +168,12 @@ Set backend choices explicitly in production. `auto` is useful for bring-up, but
 explicit values make benchmark comparisons and regressions easier to reason
 about.
 
+LongCat-Flash computes top-k routing in the model to handle its zero experts.
+Its MoE layers require a backend that accepts precomputed expert IDs and weights,
+and request `swiglu` for their gated SiLU activation. These requirements apply to
+both unquantized and block-FP8 expert layers, including when selecting
+`--moe-backend flashinfer_trtllm` on Blackwell.
+
 When `--dp-sampling` is enabled, the logits processor owns the per-forward
 logits layout decision and carries the resulting plan to the sampling backend
 with the logits output.

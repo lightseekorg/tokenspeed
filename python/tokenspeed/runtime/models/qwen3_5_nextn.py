@@ -404,7 +404,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                     continue
 
                 if name not in params_dict:
-                    logger.warning("MTP weight not in params_dict: %s", name)
+                    logger.warning(f"MTP weight not in params_dict: {name!s}")
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)

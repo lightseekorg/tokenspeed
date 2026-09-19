@@ -188,15 +188,10 @@ class DeepseekV4DSpark(BaseDrafter):
         )
 
     def wire_target(self, target_model) -> None:
+        """Bind execution resources without changing model capture configuration."""
         self.target_model = target_model
         self.lm_head = self.draft_model.lm_head
         self.tp_group = target_model.logits_processor.tp_group
-        if not hasattr(target_model, "set_dspark_layers_to_capture"):
-            raise ValueError(
-                "DSPARK requires the target model to support "
-                "set_dspark_layers_to_capture."
-            )
-        target_model.set_dspark_layers_to_capture(self.target_layer_ids)
 
     def prepare_request_state(
         self,
@@ -338,7 +333,7 @@ class DeepseekV4DSpark(BaseDrafter):
         self.kv_windows[self.first_padding_slot].zero_()
         self.context_lengths[self.first_padding_slot].zero_()
         self._prefill_graph = graph
-        logger.info("DSpark prefill CUDA graph captured (window=%d)", window)
+        logger.info(f"DSpark prefill CUDA graph captured (window={window:d})")
 
     def _seed_prefill_windows(
         self,

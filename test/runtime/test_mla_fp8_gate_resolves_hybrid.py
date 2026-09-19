@@ -111,9 +111,11 @@ def _wrapper_classes():
 
     from tokenspeed.runtime.layers.attention import backends
 
-    for info in pkgutil.iter_modules(backends.__path__):
+    for info in pkgutil.walk_packages(
+        backends.__path__, prefix=f"{backends.__name__}."
+    ):
         try:
-            mod = importlib.import_module(f"{backends.__name__}.{info.name}")
+            mod = importlib.import_module(info.name)
         except Exception:  # optional vendor backends may not import here
             continue
         for _, cls in inspect.getmembers(mod, inspect.isclass):
@@ -131,11 +133,8 @@ def _wrapper_classes():
                 yield cls
 
 
-# MSAHybridAttnBackend owns a sub-backend and deliberately does not forward
-# data_type. It belongs to MiniMax M3, which routes through its own
-# MiniMaxM3Attention rather than DeepseekV3AttentionMLA, so the gate never reads
-# it. Any *other* non-forwarding wrapper is a bug, so this list stays explicit.
-NON_FORWARDING_BY_DESIGN = {"MSAHybridAttnBackend"}
+# MiniMax MSA and Qwen4's QSA indexer do not execute the DeepseekV3 MLA gate.
+NON_FORWARDING_BY_DESIGN = {"MSAHybridAttnBackend", "QSAIndexerBackend"}
 
 
 def _forwards_dtype(cls):

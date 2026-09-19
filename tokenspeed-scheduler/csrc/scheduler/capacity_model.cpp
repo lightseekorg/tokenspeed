@@ -59,13 +59,19 @@ CapacityModel::CapacityModel(const SchedulerConfig& config) : config_{config} {
 }
 
 std::int64_t CapacityModel::decodeWidth() const {
-    // The prefill role banks no decode growth.
-    return config_.role == Role::kP ? 0 : config_.decode_input_tokens;
+    // The slot the chunk completing a prompt reserves on every role: the
+    // first decode/verify window, which the P role's drafter fills before
+    // the remote decode ships it.
+    return config_.decode_input_tokens;
 }
 
 std::int64_t CapacityModel::protectedTokens() const {
     // An overlapped forward protects one additional decode reservation that
-    // cannot yet be reclaimed from the request table.
+    // cannot yet be reclaimed from the request table. The prefill role never
+    // decodes locally, so it has no in-flight decode step to protect.
+    if (config_.role == Role::kP) {
+        return 0;
+    }
     return static_cast<std::int64_t>(config_.overlap_schedule_depth) * decodeWidth();
 }
 

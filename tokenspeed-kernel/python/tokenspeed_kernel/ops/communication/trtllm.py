@@ -119,7 +119,7 @@ if current_platform().is_nvidia:
                 return False
             return hasattr(_load_trtllm_comm_module(), "trtllm_mnnvl_allreduce_fusion")
         except Exception as exc:  # noqa: BLE001 - capability probe must not raise
-            logger.debug("mnnvl capability probe failed: %s", exc)
+            logger.debug(f"mnnvl capability probe failed: {exc!s}")
             return False
 
     def _try_create_mnnvl_workspace(
@@ -152,7 +152,7 @@ if current_platform().is_nvidia:
                 rank, world_size, max_token_num, hidden_dim, group=group
             )
         except Exception as exc:  # noqa: BLE001 - fall back to the IPC path
-            logger.warning("mnnvl workspace creation failed, using IPC: %s", exc)
+            logger.warning(f"mnnvl workspace creation failed, using IPC: {exc!s}")
 
         ok = torch.tensor(
             [1 if workspace is not None else 0], dtype=torch.int32, device=device
@@ -161,13 +161,10 @@ if current_platform().is_nvidia:
         if ok.item() == 0:
             return None
         logger.info(
-            "MNNVL one-shot AR workspace armed: rank=%s world_size=%s "
-            "max_token_num=%s hidden_dim=%s buffer=%s bytes",
-            rank,
-            world_size,
-            workspace.max_token_num,
-            hidden_dim,
-            workspace.buffer_size_bytes,
+            f"MNNVL one-shot AR workspace armed: rank={rank!s} world_size="
+            f"{world_size!s} "
+            f"max_token_num={workspace.max_token_num!s} hidden_dim={hidden_dim!s} "
+            f"buffer={workspace.buffer_size_bytes!s} bytes",
         )
         return workspace
 
@@ -434,15 +431,12 @@ if current_platform().is_nvidia:
                 # Recreating would leave captured graphs on freed peer pointers.
                 logger.warning(
                     "trtllm AR: refusing to grow the fusion workspace "
-                    "(tokens %s->%s hidden %s->%s fp32 %s->%s): a captured "
+                    f"(tokens {manager.max_token_num!s}->{target_max_token_num!s} "
+                    f"hidden {manager.hidden_dim!s}->{target_hidden_dim!s} fp32 "
+                    f"{manager.use_fp32_lamport!s}->{target_use_fp32_lamport!s}): a "
+                    "captured "
                     "CUDA graph references it. Arm the full geometry before "
                     "graph capture.",
-                    manager.max_token_num,
-                    target_max_token_num,
-                    manager.hidden_dim,
-                    target_hidden_dim,
-                    manager.use_fp32_lamport,
-                    target_use_fp32_lamport,
                 )
                 return False
             if (
@@ -457,16 +451,11 @@ if current_platform().is_nvidia:
                 )
             logger.info(
                 "Re/initializing TRT-LLM fusion IPC workspace: "
-                "world_size=%s rank=%s max_token_num=%s hidden_dim=%s use_fp32_lamport=%s "
-                "(prev max_token_num=%s hidden_dim=%s use_fp32_lamport=%s)",
-                world_size,
-                rank,
-                target_max_token_num,
-                target_hidden_dim,
-                target_use_fp32_lamport,
-                manager.max_token_num,
-                manager.hidden_dim,
-                manager.use_fp32_lamport,
+                f"world_size={world_size!s} rank={rank!s} max_token_num="
+                f"{target_max_token_num!s} hidden_dim={target_hidden_dim!s} "
+                f"use_fp32_lamport={target_use_fp32_lamport!s} "
+                f"(prev max_token_num={manager.max_token_num!s} hidden_dim="
+                f"{manager.hidden_dim!s} use_fp32_lamport={manager.use_fp32_lamport!s})",
             )
             manager.initialize(
                 world_size=world_size,
@@ -554,15 +543,12 @@ if current_platform().is_nvidia:
         # hand the kernel a null workspace.
         if not ipc_ok:
             logger.debug(
-                "trtllm AR fusion: shape (tokens=%s, hidden=%s, dtype=%s, "
-                "pattern=%s, oneshot=%s) not supported by mnnvl and no "
+                f"trtllm AR fusion: shape (tokens={token_num!s}, hidden={hidden_dim!s},"
+                f" dtype={dtype!s}, "
+                f"pattern={pattern_code!s}, oneshot={use_oneshot!s}) not supported by "
+                "mnnvl and no "
                 "compatible IPC workspace (missing or sentinel-width "
                 "mismatch); caller falls back unfused",
-                token_num,
-                hidden_dim,
-                dtype,
-                pattern_code,
-                use_oneshot,
             )
             return None
         return _mark_captured(manager, manager.workspace_tensor)

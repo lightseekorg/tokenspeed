@@ -128,16 +128,13 @@ class L2CacheHooks:
         if not ready_payloads:
             return []
         logger.debug(
-            "[cache_poll] got %s synchronized results",
-            len(ready_payloads),
+            f"[cache_poll] got {len(ready_payloads)!s} synchronized results",
         )
         events = []
         for payload in ready_payloads:
             e = cache_event_from_payload(payload)
             logger.debug(
-                "[cache_poll] event: op_id=%s type=%s",
-                e.op_id,
-                type(e).__name__,
+                f"[cache_poll] event: op_id={e.op_id!s} type={type(e).__name__!s}",
             )
             events.append(e)
         return events
@@ -181,13 +178,9 @@ class L2CacheHooks:
                 ]
                 if len({tuple(rank_ops) for rank_ops in pending_ops}) > 1:
                     logger.info(
-                        "[cache_sync] rank=%s pending_ops=%s ready_ops=%s",
-                        self._global_rank,
-                        pending_ops,
-                        [
-                            (payload["kind"], payload["op_id"])
-                            for payload in ready_payloads
-                        ],
+                        f"[cache_sync] rank={self._global_rank!s} pending_ops="
+                        f"{pending_ops!s} ready_ops="
+                        f"{[(payload['kind'], payload['op_id']) for payload in ready_payloads]!s}",
                     )
 
         for payload in ready_payloads:

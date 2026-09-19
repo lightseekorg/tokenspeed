@@ -240,9 +240,12 @@ def _route_manager():
     from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
 
     manager = object.__new__(MooncakeKVManagerPrefill)
+    layout = _typed_layout(local_heads=4, global_heads=4)
     manager.kv_args = SimpleNamespace(
-        cache_layout=_typed_layout(local_heads=4, global_heads=4),
+        cache_layout=layout,
         kv_data_ptr=0x1000,
+        # A single stage owns every field, as a non-PP prefill declares.
+        cache_fields_by_stage=(tuple(field.field_id for field in layout.plan.fields),),
     )
     manager.topology = _topology()
     return manager
@@ -452,6 +455,12 @@ def test_cache_factory_exposes_only_typed_arena() -> None:
         0,
         "mlx5_0",
         pool,
+        draft_model_config=None,
+        cache_fields_by_stage=(tuple(field.field_id for field in layout.plan.fields),),
+        producer_fields_by_step=tuple(
+            (field.field_id,) for field in layout.plan.fields
+        ),
+        logical_plan=None,
         model_config=SimpleNamespace(
             num_attention_layers=2,
             num_key_value_heads=1,
@@ -1141,6 +1150,9 @@ def test_cache_heterogeneous_gqa_route_rendezvous_idle_prefill_ranks() -> None:
     prefill = PrefillParallelInfo(
         tp_size=4,
         dp_size=1,
+        cache_fields_by_stage=(
+            tuple(field.field_id for field in prefill_layout.plan.fields),
+        ),
         cache_layout=prefill_layout,
     )
 

@@ -243,10 +243,9 @@ class MoELayer(torch.nn.Module):
                 mapping.moe.tp_ep_group,
             )
             deepep_mode = get_deepep_mode().value
-            # Pin the low-latency capacity from the server arg: the DeepEP
-            # buffer is allocated once, on the first forward that dispatches,
-            # so sizing it from that batch would make decode depend on
-            # whichever batch happened to arrive first.
+            # Pin capacity before common weight processing reserves the DeepEP
+            # buffer. The first dispatch must not choose persistent capacity
+            # from whichever batch happens to arrive first.
             deepep_low_latency_max_num_tokens_per_gpu = global_server_args_dict[
                 "low_latency_max_num_tokens_per_gpu"
             ]
@@ -299,11 +298,8 @@ class MoELayer(torch.nn.Module):
             return
         padded = round_up(ispp, alignment)
         logger.info(
-            "%s: padding MoE intermediate size per partition %d -> %d so %s",
-            self.prefix,
-            ispp,
-            padded,
-            reason,
+            f"{self.prefix!s}: padding MoE intermediate size per partition {ispp:d} -> "
+            f"{padded:d} so {reason!s}",
         )
         self.intermediate_size = padded * self.tp_size
         self._spec = replace(self._spec, intermediate_size=self.intermediate_size)

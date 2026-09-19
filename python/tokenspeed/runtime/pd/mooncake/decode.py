@@ -46,13 +46,11 @@ logger = get_colorful_logger(__name__)
 class PrefillParallelInfo:
     tp_size: int
     dp_size: int
+    cache_fields_by_stage: tuple[tuple[str, ...], ...]
     cache_layout: CacheTransferContract | None = None
     # Prefill chunk-pipeline stage count; each stage sends only its own
     # layers' KV, so Decode plans per stage and unions the routes.
     pp_size: int = 1
-    # Optional explicit per-stage layer counts the Prefill split with; None
-    # means the even split. Decode must derive the SAME stage windows.
-    pp_layer_partition: tuple[int, ...] | None = None
 
     @property
     def prefill_tp_size_per_dp_rank(self):
@@ -168,7 +166,7 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
                                     )
                         else:
                             logger.info(
-                                "Attempting to reconnect to %s...", bootstrap_addr
+                                f"Attempting to reconnect to {bootstrap_addr!s}...",
                             )
                             self.heartbeat_failures[bootstrap_addr] = (
                                 self.heartbeat_failures.get(bootstrap_addr, 0) + 1
@@ -177,7 +175,7 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
                                 if bootstrap_addr in self.session_pool:
                                     del self.session_pool[bootstrap_addr]
                     except Exception:
-                        logger.info("Attempting to reconnect to %s...", bootstrap_addr)
+                        logger.info(f"Attempting to reconnect to {bootstrap_addr!s}...")
                         self.heartbeat_failures[bootstrap_addr] = (
                             self.heartbeat_failures.get(bootstrap_addr, 0) + 1
                         )
@@ -320,7 +318,6 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
                 self.update_status(room, TransferPoll.Failed)
                 affected_rooms.append(room)
         logger.error(
-            "Losing connection with prefill instance (bootstrap_addr: %s), affected %s requests",
-            failed_bootstrap_addr,
-            len(affected_rooms),
+            "Losing connection with prefill instance (bootstrap_addr: "
+            f"{failed_bootstrap_addr!s}), affected {len(affected_rooms)!s} requests",
         )

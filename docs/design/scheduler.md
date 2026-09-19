@@ -56,6 +56,16 @@ never by call site:
 - *Snapshot-state* groups reserve at least one growth block on a decoding
   role's completing chunk or remote landing, and nothing on other rounds (§1.2).
 
+The decode slot is reserved on **every** role, the P role included. A P node
+never decodes locally, but with speculation configured the forward that
+completes a prompt runs the drafter once and writes its candidate block into
+the `decode_input_tokens` slots behind the prompt — the same window a decoding
+role verifies into — before `plan.remote_decode` ships the candidates. Without
+that reserve those rows have no page and fall to the dummy slot, and the block
+attention that reads them back proposes garbage. What P does *not* reserve is
+decode growth: no admission headroom, no snapshot-state growth block, no
+overlap protection (§3.1). The capacity model (§1.4) states the same split.
+
 ### 1.1 Head-of-line: an incomplete prefill holds the queue
 
 `holdsHeadOfLine` breaks the candidate loop after scheduling a chunk of a
@@ -431,6 +441,13 @@ it can report outcomes but never compose the batch.
 pinned until the transfer finishes, so releasing them outranks feeding more
 prompt work), then the shared local-prefill phases
 (`scheduleLocalPrefillWork`): resident chunks, then new prompts.
+
+**Reserve: the decode slot, nothing else.** The completing chunk reserves
+`decode_input_tokens` like every role, because the drafter writes the first
+candidate block there before the remote decode carries it to the peer. The
+growth reserves stay off: no admission headroom (nothing is ever retracted),
+no snapshot-state growth block (the peer banks its own), no overlap protection
+(no local decode is ever in flight).
 
 **Retraction: none.** A P node's pressure valve is the transfer itself — pages
 are pinned until the peer acknowledges, then released wholesale. Retracting a

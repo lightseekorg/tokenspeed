@@ -55,7 +55,8 @@ class BatchLogger:
     """Per-round batch logging for one rank's event loop.
 
     Args:
-        enabled: Emit lines at all (rank 0 only; other ranks still count).
+        enabled: Emit lines on this scheduler's representative rank; other
+            ranks still update counters.
         decode_log_interval: Rounds between two "Decode batch." lines.
         num_total_pages: Device KV pages, for the active/total page ratio.
         spec_num_steps: Draft steps per verify, 0 when speculation is off.
@@ -64,6 +65,13 @@ class BatchLogger:
             each decode line at DEBUG. Empty for pools with no such group.
         cache_group_pages: ``group_id -> (total, available)`` page counts,
             read from the C++ scheduler. None disables the extra line.
+        dp_rank: Attention-DP scheduler coordinate printed on every line;
+            each DP rank runs its own scheduler, so their lines differ.
+        pd_lifecycle: Query returning the PD request lifecycle counts
+            ``(bootstrapping, prefilling, remote_prefilling, decoding,
+            pd_pinned)`` read from the C++ scheduler, appended to each batch
+            line. None on a fused engine, where every count but prefilling
+            and decoding is zero by construction.
     """
 
     def __init__(
@@ -74,6 +82,8 @@ class BatchLogger:
         num_total_pages: int,
         spec_num_steps: int,
         spec_num_tokens: int,
+        dp_rank: int,
+        pd_lifecycle,
         cache_state_group_ids=(),
         cache_group_pages=None,
     ) -> None:
@@ -84,6 +94,8 @@ class BatchLogger:
         self._spec_num_tokens = spec_num_tokens
         self._cache_state_group_ids = tuple(cache_state_group_ids)
         self._cache_group_pages = cache_group_pages
+        self._dp_rank = dp_rank
+        self._pd_lifecycle = pd_lifecycle
 
         self._step = 0
         self._seen_prefill_ids: set[str] = set()
@@ -91,6 +103,16 @@ class BatchLogger:
         self._num_generated_tokens = 0
         self._num_decode_steps = 0
         self._last_decode_tic = time.time()
+
+    def _lifecycle_suffix(self) -> str:
+        """The PD request-state counts, read only when a line is emitted."""
+        if self._pd_lifecycle is None:
+            return ""
+        counts = self._pd_lifecycle()
+        return (
+            ", #req-state(bootstrap/prefill/remote-prefill/decode/pd-pinned): "
+            + "/".join(str(count) for count in counts)
+        )
 
     def log_dispatch(self, forward_op, stats: dict) -> None:
         """Log the round being dispatched; ``stats`` is its scheduler sample.
@@ -124,14 +146,11 @@ class BatchLogger:
             self._seen_prefill_ids.clear()
         self._seen_prefill_ids.update(forward_op.request_ids[:num_extends])
         logger.info(
-            "%s batch. #new-seq: %s, #new-token: %s, #cached-token: %s, "
-            "#running-req: %s, #queue-req: %s",
-            mode,
-            num_extends,
-            total_tokens,
-            cached_tokens,
-            bs,
-            stats["num_queue_reqs"],
+            f"{mode!s} batch. #dp-rank: {self._dp_rank!s}, "
+            f"#new-seq: {num_extends!s}, #new-token: {total_tokens!s}, "
+            f"#cached-token: {cached_tokens!s}, "
+            f"#running-req: {bs!s}, #queue-req: {stats['num_queue_reqs']!s}"
+            f"{self._lifecycle_suffix()!s}",
         )
 
     def _log_decode(self, bs: int, stats: dict) -> None:
@@ -149,33 +168,23 @@ class BatchLogger:
         )
         if self._spec_num_steps:
             logger.info(
-                "Decode batch. #running-req: %s, "
-                "#pages(active/cached/total): %s/%s/%s, "
-                "page ratio: %.2f, gen throughput (token/s): %.2f, "
-                "avg_accept_len: %.2f, accept_rate: %.2f, #queue-req: %s",
-                bs,
-                num_active_pages,
-                stats["num_cached_pages"],
-                self._num_total_pages,
-                page_ratio,
-                gen_throughput,
-                avg_accept,
-                (avg_accept - 1) / self._spec_num_steps,
-                stats["num_queue_reqs"],
+                f"Decode batch. #dp-rank: {self._dp_rank!s}, #running-req: {bs!s}, "
+                f"#pages(active/cached/total): {num_active_pages!s}/"
+                f"{stats['num_cached_pages']!s}/{self._num_total_pages!s}, "
+                f"page ratio: {page_ratio:.2f}, gen throughput (token/s): "
+                f"{gen_throughput:.2f}, "
+                f"avg_accept_len: {avg_accept:.2f}, accept_rate: "
+                f"{(avg_accept - 1) / self._spec_num_steps:.2f}, #queue-req: "
+                f"{stats['num_queue_reqs']!s}{self._lifecycle_suffix()!s}",
             )
         else:
             logger.info(
-                "Decode batch. #running-req: %s, "
-                "#pages(active/cached/total): %s/%s/%s, "
-                "page ratio: %.2f, gen throughput (token/s): %.2f, "
-                "#queue-req: %s",
-                bs,
-                num_active_pages,
-                stats["num_cached_pages"],
-                self._num_total_pages,
-                page_ratio,
-                gen_throughput,
-                stats["num_queue_reqs"],
+                f"Decode batch. #dp-rank: {self._dp_rank!s}, #running-req: {bs!s}, "
+                f"#pages(active/cached/total): {num_active_pages!s}/"
+                f"{stats['num_cached_pages']!s}/{self._num_total_pages!s}, "
+                f"page ratio: {page_ratio:.2f}, gen throughput (token/s): "
+                f"{gen_throughput:.2f}, "
+                f"#queue-req: {stats['num_queue_reqs']!s}{self._lifecycle_suffix()!s}",
             )
         self._log_cache_state_group_pages()
         self._num_generated_tokens = 0
@@ -199,7 +208,10 @@ class BatchLogger:
             parts.append(
                 f"{group_id}: used={total - available}/{total}, available={available}"
             )
-        logger.debug("Cache state group pages. %s", "; ".join(parts))
+        logger.debug(
+            f"Cache state group pages. #dp-rank: {self._dp_rank!s}, "
+            f"{'; '.join(parts)!s}"
+        )
 
     def record_decode(self, results, bs: int) -> None:
         """Fold one committed decode step into the throughput window.
@@ -213,9 +225,10 @@ class BatchLogger:
             return
         accepted_widths = [int(value) for value in accept_lengths.tolist()]
         logger.info(
-            "Spec verify step. accept_lengths=%s, accepted_draft_tokens=%s",
-            accepted_widths,
-            [max(0, value - 1) for value in accepted_widths],
+            f"Spec verify step. #dp-rank: {self._dp_rank!s}, "
+            f"accept_lengths={accepted_widths!s}, "
+            "accepted_draft_tokens="
+            f"{[max(0, value - 1) for value in accepted_widths]!s}",
         )
         candidates = results.spec_candidate_tokens
         if candidates is None:
@@ -228,9 +241,8 @@ class BatchLogger:
         draft_rows = candidate_rows[:, 1:]
         target_draft_rows = target_rows[:, :-1]
         logger.info(
-            "Spec token compare. anchor=%s, draft=%s, target=%s, match=%s",
-            candidate_rows[:, 0].tolist(),
-            draft_rows.tolist(),
-            target_draft_rows.tolist(),
-            draft_rows.eq(target_draft_rows).tolist(),
+            f"Spec token compare. #dp-rank: {self._dp_rank!s}, "
+            f"anchor={candidate_rows[:, 0].tolist()!s}, draft="
+            f"{draft_rows.tolist()!s}, target={target_draft_rows.tolist()!s}, match="
+            f"{draft_rows.eq(target_draft_rows).tolist()!s}",
         )

@@ -695,7 +695,7 @@ def _warmup_prefill_jit(
         warmup_count += 1
 
     if warmup_count > 0:
-        logger.info("Warmed up %d deep_gemm prefill kernel families", warmup_count)
+        logger.info(f"Warmed up {warmup_count:d} deep_gemm prefill kernel families")
         torch.cuda.synchronize()
 
 

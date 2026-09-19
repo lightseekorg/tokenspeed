@@ -345,6 +345,15 @@ decode too. (`_cache_contract_bound` is gone: every LCM pool publishes a
 cache contract, so the target allocates its write-location buffer
 unconditionally and drafts are gated structurally on `is_draft`.)
 
+K3 DSpark pipeline prefill distributes target-tap projection across stages,
+while the final stage owns the proposal network and draft cache. After
+target prefill sampling, that stage runs the ordinary drafter; its completed
+call publishes the final cache producer barrier. PD transfers the sampled
+anchor and real draft candidates with the target and draft caches. Decode
+installs that window before its first ordinary verify round. Stage ownership
+changes where context and proposals are produced; candidate handoff and
+verification follow the same path as other speculative prefills.
+
 ### Sampling has no greedy branch
 
 Greedy requests normalize to `top_k=1` in `SamplingParams.__post_init__`; the
@@ -658,6 +667,70 @@ buffer; `fill_input_buffers` takes no table.
   degraded mapping fails closed to `-1` (skipped write), never to a raw
   fallback vector.
 
+## Target capture is configured once during model setup
+
+`create_model_runner` calls `execution.factory.configure_draft_target`
+after both models load and before cache construction. DFLASH/DSPARK models
+must implement the explicit `TargetCaptureConfigurator` interface; missing
+implementations fail at setup. A method with the same name on an unrelated
+object is not treated as an implementation or as evidence of prior setup.
+DFlash, DFlash2 and generic DSpark use their model's ordinary capture setup;
+K3 owns its trained stream/projection contract; DeepSeek V4/V4.1 DSpark owns
+its checkpoint tap selection. `models/target_capture.py` contains only the
+shared interface. DFlash checkpoint parsing and target configuration live in
+`DFlashDraftModel.configure_target`, inherited by DFlash2 and generic DSpark.
+Setup calls only the parent interface
+`configure_target`; each concrete draft directly adapts to its target family.
+There is no generic DSpark helper probing for a DeepSeek-specific setter, and
+K3 targets need not implement that setter. EAGLE3 selection remains in this same setup
+phase, including its explicit server-argument override.
+
+This runs on every PP stage even when that stage has no executing drafter.
+`wire_target` only binds embeddings, heads and other execution resources; it
+never selects capture layers, changes streams or replaces the output layout.
+This also applies to V4.1's dedicated drafter with scheduler-owned context windows.
+There is no configured flag or optional-method probe in resource binding.
+A last pipeline stage borrows its local draft embedding when the target
+embedding lives elsewhere; this is resource binding, not a different proposal
+algorithm. Per-forward capture hooks consume the established configuration.
+
+Checkpoint tap labels remain zero-based completed-layer IDs. Prefix tap L is
+produced after L. AttnRes tap L is produced at L+1's entry by that layer's
+mixer, before input-layer normalization or snapshot mutation; the final tap
+belongs to the output mixer. Capture execution and projection-weight placement
+use this same owner on both PP and non-PP. There is no boundary deferral or
+recovery operation. Capture's mixed stream must not be replaced by the fused
+attention input, which already includes input-layer normalization.
+
+`execution/dspark_context.py` contains `DSparkContextProducer` and the model
+interface it consumes. K3 tap ownership and projection arithmetic live in
+`models/kimi_k3_dspark.py`; the producer does not interpret K3 layer IDs.
+This interface covers DSpark context production, not a requirement for all
+draft algorithms. K3 DSpark is currently the model using this production path.
+
+Pipeline stages use `DSparkContextProducer`: each stage normalizes the taps it
+owns if configured, applies their projection columns and sums in FP32; the
+accumulator travels with the chunk's PP state and the final stage applies
+context normalization once and writes native context KV. The executor selects
+the producer from the pipeline configuration alone (`pp_size > 1` with a
+speculative algorithm) and requires the draft model to implement
+`DSparkContextModel`. Off the pipeline every tap is local, so the drafter keeps
+its concatenated projection and its own context writes -- including the
+quantization-aware path, since raw per-tap weight slicing is not a quantized
+linear operation. PP drafts require unquantized projection weights.
+
+The producer is stateless across forwards. Each chunk owns its accumulator;
+queued chunks cannot alias it. A configured `ctx.dspark_context_producer`
+owns native context writes during target forward; otherwise the drafter owns
+them. This responsibility is fixed at construction, not inferred from a
+per-round readiness flag. The producer enqueues writes before the drafter on
+the same stream; failures propagate instead of selecting a fallback writer.
+The common block drafter always updates accepted-prefix lengths, but only
+projects/writes context when no producer is configured. Its optional auxiliary-stream writer is disabled for a forward with
+this producer, avoiding a second writer or a missing stream dependency.
+The final PD readiness barrier remains after the whole proposal call, since
+proposal execution can write the same draft fields after context injection.
+
 ## Per-forward drafter work rides on the context
 
 What a drafter wants done *during* the target forward is a property of that
@@ -673,9 +746,9 @@ DFLASH is the one user: its incremental projection attaches
 draft's `fc` projection on the aux stream so the draft KV is written under
 the target's remaining layers. The arming gate is the same
 `_overlap_allowed` the drafter's `run` decides the overlap path by, so a
-round can never be armed on one side and drained on the other. Model-side
-capture wiring (`set_dflash_layers_to_capture`) is static — which layers,
-in which tap order — and carries no per-round state.
+round can never be armed on one side and drained on the other. These hooks
+consume the target's capture configuration; they do not change the tap
+selection or output layout.
 
 The reverse direction rides on the context as well: a target that captures
 its taps on a row subset reports it as `ctx.captured_rows`

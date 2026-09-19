@@ -26,6 +26,7 @@ from tokenspeed.runtime.configs.kimi_k3_config import (  # noqa: E402
     KimiK3VisionConfig,
     KimiLinearConfig,
 )
+from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa: E402
     FULL_ATTENTION,
     LINEAR_ATTENTION,
@@ -199,7 +200,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 self.w13_weight_scale = torch.empty(0)
                 self.w2_weight = torch.empty(0)
                 self.w2_weight_scale = torch.empty(0)
-                self.plan = {}
+                self.plan = {"weight_dtype": "unquant"}
                 self.supports_deferred_finalize = False
 
         class FakeSharedExperts(torch.nn.Module):
@@ -434,12 +435,12 @@ class KimiK3RegistrationTests(unittest.TestCase):
         config = SimpleNamespace(
             num_hidden_layers=93, first_k_dense_replace=1, moe_layer_freq=1
         )
-        one = SimpleNamespace(pp_size=1, pp_rank=0)
+        one = Mapping(rank=0, world_size=1, pp_size=1)
         self.assertEqual(kimi_k3._k3_local_moe_blocks(config, one), 92)
         # 93 over three stages is 31 apiece; the first loses its dense layer.
         counts = [
             kimi_k3._k3_local_moe_blocks(
-                config, SimpleNamespace(pp_size=3, pp_rank=rank)
+                config, Mapping(rank=rank, world_size=3, pp_size=3)
             )
             for rank in range(3)
         ]
@@ -458,13 +459,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             num_experts_per_token=2,
             num_shared_experts=1,
         )
-        mapping = SimpleNamespace(
-            pp_size=1,
-            pp_rank=0,
-            moe=SimpleNamespace(
-                tp_ep_size=8, tp_ep_rank=0, tp_ep_group=tuple(range(8))
-            ),
-        )
+        mapping = Mapping(rank=0, world_size=8, pp_size=1, moe_tp_size=8)
         with (
             mock.patch.object(
                 kimi_k3, "KimiLinearKDA", lambda *a, **kw: torch.nn.Module()
@@ -497,7 +492,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         # At PP1 the stage's blocks and the model's happen to be the same number,
         # so the handoff has to be pinned where they differ.
         recorded.clear()
-        staged = SimpleNamespace(pp_size=3, pp_rank=1, moe=mapping.moe)
+        staged = Mapping(rank=8, world_size=24, pp_size=3, moe_tp_size=8)
         with (
             mock.patch.object(
                 kimi_k3, "KimiLinearKDA", lambda *a, **kw: torch.nn.Module()
@@ -525,9 +520,8 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
     def test_the_draft_states_a_rotation_of_one(self):
         """The draft runs its one block every step, so nothing rotates."""
-        from tokenspeed.runtime.models import kimi_k3, kimi_k3_nextn
+        from tokenspeed.runtime.models import kimi_k3_nextn
 
-        recorded: list[dict] = []
         config = KimiLinearConfig(
             hidden_size=64,
             routed_expert_hidden_size=32,
@@ -549,9 +543,10 @@ class KimiK3RegistrationTests(unittest.TestCase):
             ),
             mock.patch.object(
                 kimi_k3_nextn,
-                "KimiLinearMoE",
-                lambda **kw: recorded.append(kw) or torch.nn.Module(),
-            ),
+                "create_kimi_linear_moe",
+                autospec=True,
+                return_value=torch.nn.Module(),
+            ) as create_moe,
             mock.patch.object(
                 kimi_k3_nextn, "CommManager", lambda *a, **kw: SimpleNamespace()
             ),
@@ -561,13 +556,26 @@ class KimiK3RegistrationTests(unittest.TestCase):
             ),
         ):
             kimi_k3_nextn.KimiK3DraftDecoderLayer(
-                config=config, mapping=mapping, model_scope="draft"
+                config=config,
+                mapping=mapping,
+                model_scope="draft",
+                quant_config=None,
+                prefix="",
+                alt_stream=None,
             )
 
-        self.assertEqual(len(recorded), 1)
         # One block is a count the pool refuses; that refusal is pinned on the
         # op itself, in test_availability_needs_a_whole_number_of_rotations.
-        self.assertEqual(recorded[0]["moe_block_count"], 1)
+        create_moe.assert_called_once_with(
+            config=config,
+            mapping=mapping,
+            layer_index=0,
+            model_scope="draft",
+            moe_block_count=1,
+            quant_config=None,
+            prefix="block_sparse_moe",
+            alt_stream=None,
+        )
 
     def test_shard_predicate_requires_a_divisible_multi_rank_nvidia_group(self):
         """Each term of the shard predicate has to be visible on its own."""
@@ -726,11 +734,15 @@ class KimiK3RegistrationTests(unittest.TestCase):
             layer = kimi_k3.KimiLinearMLP(
                 hidden_size=7168,
                 intermediate_size=6144,
-                mapping=mapping,
+                tp_rank=mapping.moe.tp_ep_rank,
+                tp_size=mapping.moe.tp_ep_size,
+                tp_group=mapping.moe.tp_ep_group,
                 quant_config=None,
                 prefix="shared_experts",
                 reduce_results=False,
                 is_shared_expert=True,
+                activation_situ_beta=1.0,
+                activation_situ_linear_beta=None,
             )
             actual = layer(
                 torch.empty(2, 7168, dtype=torch.bfloat16),
@@ -908,7 +920,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 self.w13_weight_scale = torch.empty(0)
                 self.w2_weight = torch.empty(0)
                 self.w2_weight_scale = torch.empty(0)
-                self.plan = {}
+                self.plan = {"weight_dtype": "unquant"}
                 self.activation_situ_linear_beta = kwargs["activation_situ_linear_beta"]
                 # Consumed by K3MoeTailComm arming (real MoELayer exposes it
                 # from the selected kernel's plan trait).
@@ -1140,6 +1152,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 mock.Mock(),
                 num_global_tokens=1,
                 max_num_tokens_per_gpu=1,
+                do_finalize=True,
             ),
             routed_input + 1,
         )

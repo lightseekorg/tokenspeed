@@ -817,7 +817,7 @@ def load_qwen4_exp_weights(
             if name.endswith(ignored_suffixes) and name not in params:
                 continue
             if name not in params:
-                logger.warning("Qwen4-Exp parameter %s was not found", name)
+                logger.warning(f"Qwen4-Exp parameter {name!s} was not found")
                 continue
             loader = getattr(params[name], "weight_loader", default_weight_loader)
             loader(params[name], loaded_weight)

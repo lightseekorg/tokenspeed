@@ -53,6 +53,7 @@ from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import (
     DSparkConfidenceHead,
     DSparkVanillaMarkov,
 )
+from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -142,9 +143,8 @@ def count_dspark_stages(
             )
         except Exception as exc:  # noqa: BLE001 - fail closed below
             logger.debug(
-                "Unable to resolve DSpark safetensors index for %s: %s",
-                model_path,
-                exc,
+                f"Unable to resolve DSpark safetensors index for {model_path!s}: "
+                f"{exc!s}",
             )
             return None
     if not os.path.isfile(index_path):
@@ -549,7 +549,7 @@ class DeepseekV4DSparkModel(nn.Module):
         if lm_head is not None:
             head_fp32 = lm_head.weight.float()
         else:
-            head_fp32 = getattr(self, "_local_base_head_fp32", None)
+            head_fp32 = self._local_base_head_fp32
             if head_fp32 is None:
                 raise RuntimeError(
                     "DSpark local base logits require a cached target LM head."
@@ -649,8 +649,13 @@ class DeepseekV4DSparkModel(nn.Module):
             )
 
 
-class DeepseekV4ForCausalLMDSpark(nn.Module):
+class DeepseekV4ForCausalLMDSpark(nn.Module, TargetCaptureConfigurator):
     """Draft-only DSpark model loaded from the target checkpoint."""
+
+    def configure_target(self, target_model, target_config) -> None:
+        """Install the checkpoint's target taps before draft execution exists."""
+        del target_config
+        target_model.set_dspark_layers_to_capture(list(self.model.target_layer_ids))
 
     def __init__(
         self,
@@ -827,7 +832,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                     continue
                 param = params.get(name)
                 if param is None:
-                    logger.debug("Skipping unmatched DSpark weight: %s", name)
+                    logger.debug(f"Skipping unmatched DSpark weight: {name!s}")
                     continue
                 loader = getattr(param, "weight_loader", default_weight_loader)
                 loader(param, loaded_weight)

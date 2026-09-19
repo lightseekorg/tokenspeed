@@ -372,14 +372,12 @@ class K3AttnCommState:
                     hidden_size=hidden,
                     max_tokens=ATTN_AR_MAX_TOKENS,
                 )
-        logger.info(
-            "Kimi K3 attention reduce: %s",
-            (
-                "tokenspeed CuteDSL collective at M<=%d" % ATTN_AR_MAX_TOKENS
-                if self.cute_ar is not None
-                else "not armed; the existing backends serve every M"
-            ),
+        attention_reduce_backend = (
+            f"tokenspeed CuteDSL collective at M<={ATTN_AR_MAX_TOKENS}"
+            if self.cute_ar is not None
+            else "not armed; the existing backends serve every M"
         )
+        logger.info(f"Kimi K3 attention reduce: {attention_reduce_backend}")
 
 
 class K3MoeTailCommState:
@@ -514,9 +512,8 @@ class K3MoeTailCommState:
             )
         self.latent_tail_ok = tail_ok
         logger.info(
-            "K3 comm negotiated: multimem=%s latent_tail=%s",
-            self.multimem_ar_ok,
-            self.latent_tail_ok,
+            f"K3 comm negotiated: multimem={self.multimem_ar_ok!s} latent_tail="
+            f"{self.latent_tail_ok!s}",
         )
 
 
@@ -837,10 +834,8 @@ class K3MoeTailComm:
             )
             logger.info(
                 "multicast latent tail engaged "
-                "(%s, deferred_finalize=%s, split_shared_rs=%s)",
-                prefix,
-                tail_finalize_top_k is not None,
-                self.latent_tail.supports_split_collective,
+                f"({prefix!s}, deferred_finalize={tail_finalize_top_k is not None!s}, "
+                f"split_shared_rs={self.latent_tail.supports_split_collective!s})",
             )
 
     # ------------------------------------------------------------------

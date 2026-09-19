@@ -482,7 +482,11 @@ def test_fused_tail_matches_reference(m):
     rank, dev = _setup()
     if not _agreed(
         latent_tail_supported(
-            tp_size=_world_size(), hidden_size=H, latent_size=L, dtype=torch.bfloat16
+            tp_size=_world_size(),
+            hidden_size=H,
+            latent_size=L,
+            dtype=torch.bfloat16,
+            group=dist.group.WORLD,
         )
     ):
         pytest.skip("fused latent tail unsupported here")
@@ -524,7 +528,11 @@ def test_fused_tail_deferred_finalize_matches_reference(m):
     rank, dev = _setup()
     if not _agreed(
         latent_tail_supported(
-            tp_size=_world_size(), hidden_size=H, latent_size=L, dtype=torch.bfloat16
+            tp_size=_world_size(),
+            hidden_size=H,
+            latent_size=L,
+            dtype=torch.bfloat16,
+            group=dist.group.WORLD,
         )
     ):
         pytest.skip("fused latent tail unsupported here")
@@ -687,7 +695,11 @@ def test_tiers_agree_with_each_other():
     tail = None
     if _agreed(
         latent_tail_supported(
-            tp_size=_world_size(), hidden_size=H, latent_size=L, dtype=torch.bfloat16
+            tp_size=_world_size(),
+            hidden_size=H,
+            latent_size=L,
+            dtype=torch.bfloat16,
+            group=dist.group.WORLD,
         )
     ):
         tail = KimiK3LatentTailOp.initialize(

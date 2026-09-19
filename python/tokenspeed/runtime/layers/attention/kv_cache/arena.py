@@ -121,11 +121,9 @@ class CacheArena:
             },
         )
         logger.info(
-            "Allocated cache arena: %d bytes, prefix_granularity=%d, num_lcm_blocks=%d, device %s",
-            plan.arena_bytes,
-            plan.prefix_granularity,
-            plan.num_lcm_blocks,
-            device,
+            f"Allocated cache arena: {plan.arena_bytes:d} bytes, prefix_granularity="
+            f"{plan.prefix_granularity:d}, num_lcm_blocks={plan.num_lcm_blocks:d}, "
+            f"device {device!s}",
         )
 
     @property

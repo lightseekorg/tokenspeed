@@ -980,6 +980,103 @@ def test_kimi3_latent_projection_without_a_group_has_no_shard_size() -> None:
     assert proj.input_size == 64
 
 
+@pytest.mark.parametrize("tokens", [0, 1, 1280, 1281])
+@pytest.mark.parametrize("narrowed", [False, True])
+@pytest.mark.parametrize("nvfp4_available", [False, True])
+def test_latent_projection_nvfp4_dispatch_and_bf16_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tokens: int,
+    narrowed: bool,
+    nvfp4_available: bool,
+) -> None:
+    world, rank, out, k = 4, 1, 16, 8
+    weight = torch.arange(out * k, dtype=torch.float32).reshape(out, k) / 128
+    hidden = torch.arange(tokens * k, dtype=torch.float32).reshape(tokens, k) / 128
+    expected = hidden @ weight.T
+    expected_block = weight[rank * (out // world) : (rank + 1) * (out // world)]
+    packed = (
+        torch.empty(tokens, out // 2, dtype=torch.uint8),
+        torch.empty(tokens, 1, dtype=torch.uint8),
+    )
+    scale = nn.Parameter(torch.tensor(128.0), requires_grad=False)
+    mailbox = mock.Mock(rank=rank, shard_dim=out // world)
+    mailbox.handles.side_effect = lambda rows: 1 <= rows <= 1280
+    mailbox.nvfp4_available.return_value = nvfp4_available
+
+    def multicast(x, block, *, output_scale):
+        assert x is hidden
+        torch.testing.assert_close(block, expected_block)
+        if output_scale is not None:
+            assert output_scale.data_ptr() == scale.data_ptr()
+            mailbox.prepare_nvfp4.assert_called_once_with()
+            return packed
+        return expected
+
+    mailbox.side_effect = multicast
+    monkeypatch.setattr(
+        latent_module.tokenspeed_kernel,
+        "kimi3_latent_projection",
+        lambda x, w, solution: x @ w.T,
+    )
+    gathers = []
+
+    def gather(local, group, dim):
+        assert group == tuple(range(world))
+        assert dim == -1
+        torch.testing.assert_close(local, hidden @ expected_block.T)
+        gathers.append(local)
+        return expected
+
+    monkeypatch.setattr(latent_module, "all_gather", gather)
+    proj = latent_module.Kimi3LatentProjection(
+        k,
+        out,
+        params_dtype=torch.float32,
+        column_group=tuple(range(world)) if narrowed else None,
+        shard_rank=rank,
+        shard_size=world,
+        multicast_down=mailbox,
+    )
+    proj.weight_loader(proj.weight, weight)
+    proj.prepare_nvfp4_output(scale)
+    assert set(proj.state_dict()) == {"weight"}
+    if nvfp4_available:
+        mailbox.prepare_nvfp4.assert_called_once_with()
+    else:
+        mailbox.prepare_nvfp4.assert_not_called()
+    payload, bias = proj(hidden)
+    assert bias is None
+    if 1 <= tokens <= 1280:
+        mailbox.assert_called_once()
+        assert gathers == []
+        if nvfp4_available:
+            assert payload is packed
+        else:
+            torch.testing.assert_close(payload, expected)
+    else:
+        mailbox.assert_not_called()
+        assert len(gathers) == int(narrowed)
+        torch.testing.assert_close(payload, expected)
+
+
+def test_latent_projection_nvfp4_without_mailbox_stays_dense(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        latent_module.tokenspeed_kernel,
+        "kimi3_latent_projection",
+        lambda x, w, solution: x @ w.T,
+    )
+    proj = latent_module.Kimi3LatentProjection(8, 16, params_dtype=torch.float32)
+    weight = torch.arange(128, dtype=torch.float32).reshape(16, 8)
+    proj.weight_loader(proj.weight, weight)
+    proj.prepare_nvfp4_output(torch.tensor(128.0))
+    hidden = torch.ones(2, 8)
+    payload, bias = proj(hidden)
+    assert bias is None
+    torch.testing.assert_close(payload, hidden @ weight.T)
+
+
 class _FakeMulticastDown:
     """A multicast op that records what the projection dispatched to it."""
 
@@ -995,7 +1092,8 @@ class _FakeMulticastDown:
     def handles(self, num_tokens: int) -> bool:
         return 1 <= num_tokens <= self.max_m
 
-    def __call__(self, hidden_states, block):
+    def __call__(self, hidden_states, block, *, output_scale):
+        assert output_scale is None
         # The caller hands over this rank's rows; the op does not carve them.
         self._calls.append((hidden_states.shape[0], tuple(block.shape)))
         return hidden_states @ block.T

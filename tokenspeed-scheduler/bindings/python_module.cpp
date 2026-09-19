@@ -352,9 +352,17 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                  }
                  return result;
              })
-        .def("waiting_size", &tokenspeed::Scheduler::WaitingSize)
-        .def("decoding_size", &tokenspeed::Scheduler::DecodingSize)
-        .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize)
+        .def("bootstrapping_size", &tokenspeed::Scheduler::BootstrappingSize,
+             "Count requests waiting for their PD bootstrap handshake.")
+        .def("waiting_size", &tokenspeed::Scheduler::WaitingSize,
+             "Count Submitted and Retracted requests awaiting admission or readmission.")
+        .def("decoding_size", &tokenspeed::Scheduler::DecodingSize, "Count requests in the Decoding FSM state.")
+        .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize,
+             "Count local/remote prefills, PrefillAwaitingResult, and PrefillDone requests.")
+        .def("remote_prefilling_size", &tokenspeed::Scheduler::RemotePrefillSize,
+             "Count RemotePrefilling requests; these are also included in prefilling_size().")
+        .def("pd_transfer_size", &tokenspeed::Scheduler::PdTransferSize,
+             "Count requests with PD-pinned pages; this resource count overlaps lifecycle states.")
         .def("pd_transfer_pinned", &tokenspeed::Scheduler::PdTransferPinned, nb::arg("request_id"))
         .def("available_lcm_blocks", &tokenspeed::Scheduler::AvailableLcmBlocks)
         .def("empty_lcm_blocks", &tokenspeed::Scheduler::EmptyLcmBlocks)
