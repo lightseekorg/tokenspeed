@@ -239,6 +239,50 @@ def test_glm53_flash_decode_topk_skips_only_overwritten_workspace_fills(
     assert result.topk_lens is topk_lens
 
 
+def test_glm53_flash_prefill_topk_forwards_prepared_query() -> None:
+    attention = Glm53FlashAttention.__new__(Glm53FlashAttention)
+    attention.indexer = SimpleNamespace(weights_softmax_scale=0.25)
+    attention.attn_mqa = SimpleNamespace(layer_id=3)
+    captured = {}
+    selected = SimpleNamespace(
+        workspace_indices=torch.zeros((2, 3), dtype=torch.int32),
+        topk_lens=torch.zeros(2, dtype=torch.int32),
+        page_table=torch.zeros((1, 1), dtype=torch.int32),
+        seq_lens=torch.tensor([8], dtype=torch.int32),
+        kv_seq_lens=torch.tensor([7, 8], dtype=torch.int32),
+        max_seq_len=8,
+        kv_workspace_slots=torch.zeros(6, dtype=torch.int32),
+    )
+
+    def select_prefill(**kwargs):
+        captured.update(kwargs)
+        return selected
+
+    ctx = SimpleNamespace(
+        attn_backend=SimpleNamespace(
+            require_kpool_runtime=lambda: SimpleNamespace(select_prefill=select_prefill)
+        )
+    )
+    indexer_output = Glm53FlashIndexerOutput(
+        query=torch.zeros((2, 1, 128), dtype=torch.bfloat16),
+        key=torch.empty(0),
+        weights=torch.zeros((2, 1), dtype=torch.bfloat16),
+        gate=torch.empty(0),
+    )
+    prepared = object()
+
+    result = attention._compute_prefill_topk_indices(indexer_output, ctx, 2, prepared)
+
+    assert captured["prepared_query"] is prepared
+    assert captured["query"] is indexer_output.query
+    assert captured["weights"] is indexer_output.weights
+    assert captured["softmax_scale"] == 0.25
+    assert captured["num_prefill_tokens"] == 2
+    assert isinstance(result, GlmDsaPrefillTopK)
+    assert result.workspace_indices is selected.workspace_indices
+    assert result.kv_workspace_slots is selected.kv_workspace_slots
+
+
 def _build_model(monkeypatch) -> Glm53FlashForConditionalGeneration:
     monkeypatch.setattr(glm53_flash, "Glm53FlashForCausalLM", _FakeLanguageModel)
     return Glm53FlashForConditionalGeneration(

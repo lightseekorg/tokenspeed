@@ -34,6 +34,24 @@ from tokenspeed_kernel.platform import (
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
+_DEEP_GEMM_CAPABILITY = CapabilityRequirement(
+    min_arch_version=ArchVersion(9, 0),
+    vendors=frozenset({"nvidia"}),
+)
+_DEEP_GEMM_SIGNATURES = frozenset(
+    {format_signature(q=dense_tensor_format(torch.bfloat16))}
+)
+_DEEP_GEMM_TRAITS = {
+    "head_dim": frozenset({128}),
+    "pool_size": frozenset({4}),
+    "page_size": frozenset({16, 64}),
+    "index_k_format": frozenset({"fp8_scaled"}),
+    "score_activation": frozenset({"relu"}),
+    "topk_layout": frozenset({"global_slots"}),
+    "topk_pools": frozenset({512, 1024, 2048}),
+    "prefill_plan": frozenset({True}),
+}
+
 
 def _kpool_cache_views(
     cache: torch.Tensor, page_size: int, head_dim: int
@@ -58,27 +76,49 @@ if current_platform().is_hopper_plus:
     from tokenspeed_kernel.ops.attention.dsa.deep_gemm import (
         deep_gemm_dsa_prefill_topk,
     )
+    from tokenspeed_kernel.ops.attention.dsa.triton import combine_topk_weights
+    from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+
+    @register_kernel(
+        "attention",
+        "kpool_prefill_prepare_query",
+        name="deep_gemm_kpool_prefill_prepare_query",
+        solution="deep_gemm",
+        capability=_DEEP_GEMM_CAPABILITY,
+        signatures=_DEEP_GEMM_SIGNATURES,
+        traits=_DEEP_GEMM_TRAITS,
+        priority=Priority.PERFORMANT,
+        tags={"deep_gemm", "kpool", "ragged-prefill"},
+    )
+    def deep_gemm_kpool_prefill_prepare_query(
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        *,
+        softmax_scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize queries and fold their scales into the head weights.
+
+        This is the query-side half of ``deep_gemm_kpool_prefill_topk``; it
+        depends only on the indexer projections, so callers can issue it while
+        the pooled cache is still being written.
+        """
+        q = q.contiguous()
+        q_fp8, q_scale = quantize_fp8_with_scale(
+            q.view(-1, q.shape[-1]),
+            granularity="token_group",
+            group_size=128,
+            scale_encoding="float32",
+        )
+        return q_fp8.view_as(q), combine_topk_weights(weights, q_scale, softmax_scale)
 
     @register_kernel(
         "attention",
         "kpool_prefill_topk",
         name="deep_gemm_kpool_prefill_topk",
         solution="deep_gemm",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 0),
-            vendors=frozenset({"nvidia"}),
-        ),
-        signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
-        traits={
-            "head_dim": frozenset({128}),
-            "pool_size": frozenset({4}),
-            "page_size": frozenset({16, 64}),
-            "index_k_format": frozenset({"fp8_scaled"}),
-            "score_activation": frozenset({"relu"}),
-            "topk_layout": frozenset({"global_slots"}),
-            "topk_pools": frozenset({512, 1024, 2048}),
-            "prefill_plan": frozenset({True}),
-        },
+        capability=_DEEP_GEMM_CAPABILITY,
+        signatures=_DEEP_GEMM_SIGNATURES,
+        traits=_DEEP_GEMM_TRAITS,
         priority=Priority.PERFORMANT,
         tags={"deep_gemm", "kpool", "ragged-prefill"},
     )
@@ -96,6 +136,7 @@ if current_platform().is_hopper_plus:
         kv_page_size: int,
         topk_pools: int,
         softmax_scale: float,
+        prepared_query: tuple[torch.Tensor, torch.Tensor] | None,
         apply_relu: bool = True,
         append_tail: bool = True,
         chunk_pools: int = 8192,
@@ -180,6 +221,9 @@ if current_platform().is_hopper_plus:
         index_k_fp8 = values[pages, rows]
         index_k_scale = scales[pages, rows]
 
+        q_fp8, scaled_weights = (
+            (None, None) if prepared_query is None else prepared_query
+        )
         workspace_indices, _ = deep_gemm_dsa_prefill_topk(
             q,
             weights,
@@ -190,6 +234,8 @@ if current_platform().is_hopper_plus:
             softmax_scale=softmax_scale,
             index_k_fp8=index_k_fp8,
             index_k_scale=index_k_scale,
+            q_fp8=q_fp8,
+            scaled_weights=scaled_weights,
             max_logits_bytes=max_logits_bytes,
             max_seqlen_k=max(max_num_pools, 1),
         )

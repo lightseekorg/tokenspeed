@@ -444,6 +444,99 @@ def kpool_decode_topk(
         )
 
 
+def _kpool_prefill_topk_traits(
+    q: torch.Tensor,
+    *,
+    pool_size: int,
+    page_size: int,
+    topk_pools: int,
+    apply_relu: bool,
+    has_prefill_plan: bool,
+) -> dict[str, object]:
+    tokens, num_heads, head_dim = q.shape
+    del tokens
+    return {
+        "index_heads": int(num_heads),
+        "head_dim": int(head_dim),
+        "pool_size": int(pool_size),
+        "page_size": int(page_size),
+        "index_k_format": "fp8_scaled",
+        "score_activation": "relu" if apply_relu else "none",
+        "topk_layout": "global_slots",
+        "topk_pools": int(topk_pools),
+        "prefill_plan": has_prefill_plan,
+    }
+
+
+def kpool_prefill_prepare_query(
+    q: torch.Tensor,
+    pooled_k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    pool_size: int,
+    page_size: int,
+    topk_pools: int,
+    softmax_scale: float,
+    apply_relu: bool,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Build the query-side inputs of the planned ``kpool_prefill_topk`` early.
+
+    Selection resolves with the same traits as a planned ``kpool_prefill_topk``
+    call, so the returned value is exactly what that solution consumes:
+    ``(q_fp8, scaled_weights)`` for logits-based scoring, where the FP32
+    ``[tokens, heads]`` weights carry the query dequant scale and the softmax
+    scale, or ``None`` for solutions that score the BF16 queries directly.
+
+    Args:
+        q: Packed indexer queries shaped ``[tokens, heads, head_dim]``.
+        pooled_k_cache: Paged compressed index-key cache the top-k will read.
+        weights: Per-token indexer head weights.
+        pool_size: Number of raw tokens represented by a pooled row.
+        page_size: Number of pooled rows per index-cache page.
+        topk_pools: Number of completed pools to select.
+        softmax_scale: Scale applied to indexer scores.
+        apply_relu: Whether the top-k applies ReLU before selection.
+
+    Returns:
+        The prepared query tensors, or ``None`` when nothing is prepared.
+    """
+    _validate_kpool_topk_inputs(
+        q, pooled_k_cache, weights, pool_size, topk_pools, page_size
+    )
+    traits = _kpool_prefill_topk_traits(
+        q,
+        pool_size=pool_size,
+        page_size=page_size,
+        topk_pools=topk_pools,
+        apply_relu=apply_relu,
+        has_prefill_plan=True,
+    )
+    signature = _attention_format_signature(q=q)
+    kernel = select_kernel(
+        "attention",
+        "kpool_prefill_prepare_query",
+        signature,
+        traits=traits,
+    )
+    tokens, num_heads, head_dim = q.shape
+    shape_params = {
+        "tokens": int(tokens),
+        "num_heads": int(num_heads),
+        "head_dim": int(head_dim),
+    }
+    ShapeCapture.get().record(
+        "attention", "kpool_prefill_prepare_query", kernel.name, q.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention",
+        "kpool_prefill_prepare_query",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(q=q, weights=weights, softmax_scale=softmax_scale)
+
+
 def kpool_prefill_topk(
     q: torch.Tensor,
     pooled_k_cache: torch.Tensor,
@@ -458,6 +551,7 @@ def kpool_prefill_topk(
     kv_page_size: int,
     topk_pools: int,
     softmax_scale: float,
+    prepared_query: tuple[torch.Tensor, torch.Tensor] | None,
     apply_relu: bool = True,
     append_tail: bool = True,
     chunk_pools: int = 8192,
@@ -486,6 +580,8 @@ def kpool_prefill_topk(
         kv_page_size: Number of raw tokens per FlatKV page.
         topk_pools: Number of completed pools to select.
         softmax_scale: Scale applied to indexer scores.
+        prepared_query: Query-side inputs from ``kpool_prefill_prepare_query``
+            for the same traits, or ``None`` to build them in the call.
         apply_relu: Whether to apply ReLU before top-k selection.
         append_tail: Whether to append visible partial-pool tokens.
         chunk_pools: Number of pools scored per reduction window.
@@ -523,17 +619,14 @@ def kpool_prefill_topk(
             "KPool prefill plan requires req_ids, causal_lens, "
             "pool_workspace_slots, row_starts, row_ends, and max_num_pools together"
         )
-    traits = {
-        "index_heads": int(num_heads),
-        "head_dim": int(head_dim),
-        "pool_size": int(pool_size),
-        "page_size": int(page_size),
-        "index_k_format": "fp8_scaled",
-        "score_activation": "relu" if apply_relu else "none",
-        "topk_layout": "global_slots",
-        "topk_pools": int(topk_pools),
-        "prefill_plan": has_prefill_plan,
-    }
+    traits = _kpool_prefill_topk_traits(
+        q,
+        pool_size=pool_size,
+        page_size=page_size,
+        topk_pools=topk_pools,
+        apply_relu=apply_relu,
+        has_prefill_plan=has_prefill_plan,
+    )
     signature = _attention_format_signature(q=q)
     kernel = select_kernel(
         "attention",
@@ -577,6 +670,7 @@ def kpool_prefill_topk(
             kv_page_size=kv_page_size,
             topk_pools=topk_pools,
             softmax_scale=softmax_scale,
+            prepared_query=prepared_query,
             apply_relu=apply_relu,
             append_tail=append_tail,
             chunk_pools=chunk_pools,
@@ -602,6 +696,7 @@ import tokenspeed_kernel.ops.attention.kpool.deep_gemm  # noqa: E402,F401
 
 
 __all__ = [
+    "kpool_prefill_prepare_query",
     "kpool_prefill_write",
     "kpool_prefill_tail_write",
     "kpool_decode_append",
