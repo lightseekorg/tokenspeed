@@ -223,7 +223,7 @@ def prepare_fp8_linear(
             )
         if not enable_pdl:
             return _PreparedFp8Linear(
-                override="triton_mm_fp8_blockscale",
+                override=(None if platform.is_cdna4 else "triton_mm_fp8_blockscale"),
                 block_size=(block_n, block_k),
             )
 
@@ -1258,6 +1258,10 @@ def mm(
         block_scale_layout = "flashinfer_mn"
 
     traits: dict[str, object] = {
+        # TODO: the following list is growingly large--clean up them.
+        "M": M,
+        "N": N,
+        "K": K,
         "n_align_16": N % 16 == 0,
         "k_align_16": K % 16 == 0,
         "k_align_32": K % 32 == 0,
@@ -1269,6 +1273,9 @@ def mm(
         "k_min_128": K >= 128,
         "block_scale_layout": block_scale_layout,
         "pdl_enabled": pdl_enabled(),
+        "a_inner_stride_one": A.stride(-1) == 1,
+        "b_inner_stride_one": B.stride(-1) == 1,
+        "out_dtype": out_dtype,
     }
 
     signature = _gemm_format_signature(

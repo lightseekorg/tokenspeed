@@ -441,6 +441,41 @@ class TestSpecMatchesShapeTraits:
         assert spec_matches_shape_traits(spec, {"K": 128})
         assert not spec_matches_shape_traits(spec, {"K": 96})
 
+    def test_mnk_problem_filter_matches_concrete_shape(self):
+        def is_tuned_problem(m: int, n: int, k: int) -> bool:
+            return (
+                m % 256 == 0
+                and n % 256 == 0
+                and k >= 512
+                and k % 256 == 0
+                and (m >= 1024 or (n >= 4096 and k <= 1280))
+            )
+
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"mnk_problem_filter": frozenset({is_tuned_problem})},
+        )
+
+        assert spec_matches_shape_traits(spec, {"M": 1024, "N": 1792, "K": 5120})
+        assert spec_matches_shape_traits(spec, {"M": 256, "N": 4096, "K": 1280})
+        assert not spec_matches_shape_traits(spec, {"M": 256, "N": 1792, "K": 5120})
+        assert not spec_matches_shape_traits(spec, {"M": 1024, "N": 1664, "K": 5120})
+        assert not spec_matches_shape_traits(spec, {"M": 1024, "N": 1792, "K": 256})
+        assert _filter_by_traits([spec], {"M": 1024, "N": 1792, "K": 5120}) == [spec]
+        assert not _filter_by_traits([spec], {"M": 256, "N": 1792, "K": 5120})
+
+    def test_mnk_problem_filter_is_ignored_without_complete_shape(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"mnk_problem_filter": frozenset({lambda m, n, k: False})},
+        )
+
+        assert spec_matches_shape_traits(spec, {"M": 256, "N": 4096})
+
     def test_non_alignment_traits_do_not_affect_shape_matching(self):
         spec = KernelSpec(
             name="k",

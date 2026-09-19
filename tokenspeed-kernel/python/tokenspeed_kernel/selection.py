@@ -351,7 +351,13 @@ def ref_compatible_with_spec(ref: KernelSpec, spec: KernelSpec) -> bool:
 
 
 def spec_matches_shape_traits(spec: KernelSpec, shape: dict[str, Any]) -> bool:
-    """Return whether a spec's dimension traits match a concrete shape."""
+    """Return whether a spec's dimension traits match a concrete shape.
+
+    The ``mnk_problem_filter`` trait contains predicates with the signature
+    ``(M, N, K) -> bool``. Predicates are evaluated only when all three
+    dimensions are available, consistent with the partial-shape behavior of
+    the exact, alignment, and minimum traits below.
+    """
     exact_traits: dict[str, tuple[str, ...]] = {
         "batch": ("B", "batch"),
         "m": ("M",),
@@ -395,6 +401,12 @@ def spec_matches_shape_traits(spec: KernelSpec, shape: dict[str, Any]) -> bool:
         if isinstance(dim, int) and dim < minimum:
             return False
 
+    problem_filters = spec.traits.get("mnk_problem_filter")
+    m, n, k = shape.get("M"), shape.get("N"), shape.get("K")
+    if problem_filters is not None and all(isinstance(dim, int) for dim in (m, n, k)):
+        if not any(problem_filter(m, n, k) for problem_filter in problem_filters):
+            return False
+
     return True
 
 
@@ -403,7 +415,11 @@ def _filter_by_traits(
     traits: dict[str, Any],
 ) -> list[KernelSpec]:
     """Filter kernels by op-specific trait compatibility."""
-    return [spec for spec in specs if spec_matches_traits(spec, traits)]
+    return [
+        spec
+        for spec in specs
+        if spec_matches_traits(spec, traits) and spec_matches_shape_traits(spec, traits)
+    ]
 
 
 def _resolve_override(

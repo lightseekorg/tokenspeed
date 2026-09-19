@@ -33,6 +33,40 @@ generation is published and all consumer subgroups before the peer inbox is
 read. Removing either rendezvous can potentially increase cross-rank skew and
 regress perf even when the generated kernel remains correct.
 
+## GEMM
+
+### gfx950 dense MXFP8 projection
+
+The gfx950 package provides a prefill-oriented MXFP8 GEMM for DeepSeek V4.1
+dense projections, with portable Triton fallback outside the tuned domain.
+
+#### Contract
+
+- The operation computes `A @ B.T` from K-contiguous E4M3 matrices shaped
+  `[M, K]` and `[N, K]`; padded row strides are accepted.
+- Scales are strided uint8 E8M0 matrices shaped `[M, K/32]` and `[N, K/32]`
+  with an explicit `[1, 32]` scale block.
+- Output is BF16 or FP16. A caller-owned output may have a padded row stride,
+  but its inner stride must be one.
+- The kernel requires `M` and `N` divisible by 256 and `K >= 512` divisible by
+  256. Automatic selection further requires `M >= 1024`, `N >= 1536`, and
+  `K >= 1024`.
+
+#### Algorithm
+
+One workgroup computes a `256 x 256 x 128` tile with eight wave64s. Four
+`128 x 128` accumulator quadrants use native `32 x 32 x 64` E4M3 scaled MFMA.
+Two K tiles are software-pipelined at a time, and phase-shifted MFMA and memory
+stages implement the eight-wave warp-pipeline schedule. XCD-aware grouped tile
+ordering spreads adjacent output tiles across the eight XCDs.
+
+E4M3 values use vectorized asynchronous global-to-LDS copies into separate,
+padded double buffers for A and B. Canonical row-major A scales use dword
+asynchronous copies. Each B-scale copy combines both N quadrants and two K
+steps in one LDS tile, then splits the four MFMA fragments in registers. Two
+waves per EU avoid spills from the longer-lived fragments. Strided scales fall
+back to direct fragment loads, and output uses vectorized buffer stores.
+
 ## Attention
 
 ### DeepSeek V4 attention
