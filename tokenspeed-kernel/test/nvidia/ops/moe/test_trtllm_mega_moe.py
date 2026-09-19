@@ -266,7 +266,9 @@ def run_correctness(capacity: int, live_tokens: int, tune: bool):
             side_effect=AssertionError("MegaMoE tuning requires explicit opt-in"),
         )
     )
-    with guard, autotune(), torch.inference_mode():
+    with guard, autotune(
+        tune_mode=True, tuning_buckets=None, round_up=None
+    ), torch.inference_mode():
         output = run()
     torch.cuda.synchronize()
     _check(output, expected, "eager")
@@ -306,7 +308,7 @@ def run_correctness(capacity: int, live_tokens: int, tune: bool):
         with patch.object(
             tuner, "_profile_single_kernel", wraps=tuner._profile_single_kernel
         ) as profile:
-            with autotune():
+            with autotune(tune_mode=True, tuning_buckets=None, round_up=None):
                 output = run()
             profile.assert_not_called()
     else:

@@ -26,9 +26,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-import torch.distributed as dist
 from tokenspeed_kernel.ops.tuning import (
     autotune,
+    autotune_cache_path,
+    load_autotune_cache,
+    save_autotune_cache,
     set_autotune_max_num_tokens,
     set_autotune_process_group,
 )
@@ -147,6 +149,30 @@ def _cache_arena_attr(pool, name: str, default):
     return getattr(getattr(pool, "arena", None), name, default)
 
 
+def _autotune_cache_key(
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+) -> dict[str, object]:
+    """Rank-independent identity for tactics that may safely share a cache."""
+    mapping = server_args.mapping
+    return {
+        "model": model_config.model_path,
+        "revision": model_config.revision,
+        "architectures": getattr(model_config.hf_config, "architectures", None),
+        "quantization": model_config.quantization,
+        "dtype": server_args.dtype,
+        "moe_backend": str(server_args.moe_backend),
+        "attention_backend": str(server_args.attention_backend),
+        "attention": (mapping.attn.tp_size, mapping.attn.cp_size, mapping.attn.dp_size),
+        "dense": (mapping.dense.tp_size, mapping.dense.dp_size),
+        "moe": (mapping.moe.tp_size, mapping.moe.ep_size, mapping.moe.dp_size),
+        "linear_attention_tp": mapping.linear_attn.tp_size,
+        "pipeline_parallel": mapping.pp_size,
+        "speculative_algorithm": server_args.speculative_algorithm,
+        "speculative_num_draft_tokens": server_args.speculative_num_draft_tokens,
+    }
+
+
 @dataclass
 class ModelExecutorConfig:
     """
@@ -180,6 +206,7 @@ class ModelExecutorConfig:
     disable_cuda_graph_padding: bool
     max_cudagraph_capture_size: int
     model_is_mrope: bool
+    autotune_cache_key: dict[str, object] | None
     # The prefill role of a disaggregated deployment computes prompts only:
     # it never runs a decode/verify step of its own.
     prefill_only: bool
@@ -284,6 +311,7 @@ class ModelExecutorConfig:
             cudagraph_capture_sizes=server_args.cudagraph_capture_sizes,
             disable_cuda_graph_padding=server_args.disable_cuda_graph_padding,
             disable_autotune=server_args.disable_autotune,
+            autotune_cache_key=_autotune_cache_key(server_args, model_config),
             enable_cudagraph_gc=server_args.enable_cudagraph_gc,
             max_cudagraph_capture_size=server_args.max_cudagraph_capture_size,
             disable_prefill_graph=disable_prefill_graph,
@@ -508,7 +536,7 @@ class ModelExecutor:
         # collectives together on their first prefill round instead.
         if config.enforce_eager and not config.prefill_only:
             logger.info("Prewarming Triton RSAG communication states")
-            self.forward_step.prewarm_comm_states(batch_sizes=(1,))
+            self.forward_step.warmup_decode_path(batch_sizes=(1,), graph_phase=True)
             logger.info("Finished prewarming Triton RSAG communication states")
 
         # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
@@ -583,66 +611,58 @@ class ModelExecutor:
                 self.drafter.capture_prefill_graph(self.forward_step.stream)
 
     def _autotune(self) -> None:
-        """Profile tunable kernels over one dummy prefill before graph capture.
-
-        The dummy batch is capped by both the chunked-prefill token budget and
-        rank-local request capacity. The caller supplies the minimum request
-        count that fits the model context; ``make_dummy_batch`` balances tokens
-        across those requests, while request-indexed buffers
-        contain only ``max_num_seqs // data_parallel_size`` rows. Keeping the
-        token count within their product prevents autotuning from constructing
-        a batch that cannot fit those buffers.
-
-        The tuner enumerates every smaller shape bucket from this pass, so a
-        separate decode-sized pass is unnecessary. This must run before graph
-        capture because a captured graph retains the tactic selected during
-        capture. On distributed boots, per-tactic timings are averaged across
-        ranks so every rank selects the same tactic.
-        """
+        """Tune missing prefill/decode configs and persist the shared cache."""
         per_rank_max_batch = max(
             1,
             int(self.config.max_num_seqs)
             // max(int(self.config.data_parallel_size), 1),
         )
+        if self.model_runner is None:
+            return
+        ib = self.input_buffers
         num_tokens = min(
-            int(self.config.chunked_prefill_size),
+            ib.input_ids_buf.numel(),
             int(self.config.context_len) * per_rank_max_batch,
         )
-        if num_tokens <= 0 or self.model_runner is None:
-            return
-        if self.config.pp_size > 1:
-            # The tuning forward drives the model directly (no stage recv/send
-            # threading), which a mid-pipeline stage cannot run. Fall back to
-            # heuristic tactics on every rank so the world-averaged tactic
-            # collective is skipped consistently.
-            set_autotune_max_num_tokens(num_tokens)
-            logger.info(
-                "Kernel tuning skipped under pipeline parallelism; tunable "
-                "kernels use heuristic tactics"
-            )
-            return
-
-        # The bucket mapper keys serving-time tactic lookups, so it must match
-        # any pre-swept table loaded earlier even when tuning itself is off.
+        if self.config.chunked_prefill_size > 0:
+            num_tokens = min(num_tokens, int(self.config.chunked_prefill_size))
         set_autotune_max_num_tokens(num_tokens)
-        if self.config.disable_autotune:
-            logger.info(
-                "Kernel tuning disabled (--disable-autotune); tunable kernels "
-                "use heuristic tactics"
-            )
-            return
-
         cpu_group = None
         if self.config.world_size > 1:
             cpu_group = pg_manager.get_process_group("gloo", self.config.world_group)
+        owner_rank = (
+            self.config.world_group[0]
+            if self.config.world_group
+            else self.config.global_rank
+        )
 
-        logger.info(f"Kernel tuning with a dummy prefill of {num_tokens} tokens")
-        ib = self.input_buffers
+        cache_path = (
+            autotune_cache_path(self.config.autotune_cache_key)
+            if self.config.autotune_cache_key is not None
+            else None
+        )
+        load_autotune_cache(cache_path, cpu_group, owner_rank)
+
+        if self.config.pp_size > 1:
+            # These dummy forwards do not perform pipeline stage transfers.
+            logger.info("Kernel tuning skipped under pipeline parallelism")
+            return
+        if self.config.disable_autotune:
+            logger.info("Kernel tuning disabled (--disable-autotune)")
+            return
+
+        # One traversal discovers each operator. Its dispatch exposes the
+        # tunable branches; FI enumerates native buckets independently of the
+        # graph ladder. Prefill stays inside the actual buffer/request limits.
+        logger.info(f"Kernel startup tuning with {num_tokens} prefill tokens")
+
         tic = time.time()
         set_autotune_process_group(cpu_group)
-        with autotune(), maybe_inference_mode():
-            # Reuse idle's dummy-input scrub before prefill writes its geometry;
-            # borrowed Engram views must not retain live history or masks.
+        # Capture later refreshes the metadata created here in place.
+        with torch.no_grad(), autotune(
+            tune_mode=True, tuning_buckets=None, round_up=None
+        ):
+            # Dummy forwards must not borrow live Engram history or masks.
             ib.fill_dummy_decode_buffers(
                 batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
             )
@@ -660,10 +680,20 @@ class ModelExecutor:
                     positions=positions,
                     **ib.ngram_model_kwargs(num_tokens),
                 )
+            if self.drafter is not None and not self.config.prefill_only:
+                # Prefill-only roles do not allocate decode/verify scratch.
+                # The draft model is reached through the shared speculative
+                # forward, not model_runner.forward above. One request exposes
+                # its operators; FI still owns their bucket enumeration.
+                self.forward_step.warmup_decode_path(
+                    batch_sizes=(1,), graph_phase=False
+                )
         set_autotune_process_group(None)
+
         torch.get_device_module(self.device).synchronize()
-        dist.barrier()
-        logger.info(f"Kernel tuning finished in {time.time() - tic:.1f}s")
+        save_autotune_cache(cache_path, cpu_group, owner_rank)
+
+        logger.info(f"Kernel startup tuning finished in {time.time() - tic:.1f}s")
 
     @property
     def capturable_grammar(self):
