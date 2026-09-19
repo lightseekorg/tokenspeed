@@ -370,6 +370,9 @@ def test_swiglu_limit_reads_standard_swiglu(swiglu_arg, swiglu_beta, limit) -> N
     [
         (SimpleNamespace(alpha=1.702, limit=7.0), None),
         (SimpleNamespace(alpha=None, limit=None), 1.0),
+        # swiglu_beta is stored on the module on its own; a missing swiglu_arg
+        # must not let it through.
+        (None, 1.0),
     ],
 )
 def test_swiglu_limit_rejects_alpha_and_beta(swiglu_arg, swiglu_beta) -> None:

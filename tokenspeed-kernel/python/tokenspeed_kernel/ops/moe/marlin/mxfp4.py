@@ -73,15 +73,17 @@ def _swiglu_limit(w: torch.nn.Module) -> float | None:
     epilogue, so it is rejected instead of silently dropped.
     """
     swiglu_arg = getattr(w, "swiglu_arg", None)
-    if swiglu_arg is None:
-        return None
-    alpha = getattr(swiglu_arg, "alpha", None)
+    alpha = None if swiglu_arg is None else getattr(swiglu_arg, "alpha", None)
+    # swiglu_beta lives on the module independently of swiglu_arg, so check it
+    # even when no SwiGLU args were attached.
     beta = getattr(w, "swiglu_beta", None)
     if alpha not in (None, 1.0) or beta not in (None, 0.0):
         raise ValueError(
             "Marlin MXFP4 MoE supports only standard SwiGLU with an optional "
             f"clamp limit; got alpha={alpha!r}, swiglu_beta={beta!r}"
         )
+    if swiglu_arg is None:
+        return None
     limit = getattr(swiglu_arg, "limit", None)
     return None if limit is None else float(limit)
 
