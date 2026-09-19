@@ -64,6 +64,8 @@ _WORKER_RELATIVE_PATH = Path(
     "tokenspeed-kernel/python/tokenspeed_kernel/benchmark/ci.py"
 )
 _KERNEL_REQUIREMENTS = Path("tokenspeed-kernel/python/requirements/rocm.txt")
+_DEFAULT_TOKENSPEED_TESTPYPI_INDEX = "https://test.pypi.org/simple"
+_TOKENSPEED_VENDOR_PREFIXES = ("tokenspeed-proton==", "tokenspeed-triton==")
 
 
 class CoordinatorError(RuntimeError):
@@ -618,6 +620,14 @@ def _run_logged(
     )
 
 
+def _staged_vendor_requirements(path: Path) -> list[str]:
+    return [
+        line
+        for raw_line in path.read_text(encoding="utf-8").splitlines()
+        if (line := raw_line.strip()).startswith(_TOKENSPEED_VENDOR_PREFIXES)
+    ]
+
+
 def _prepare_python_environment(
     checkout: Path,
     environment_dir: Path,
@@ -673,6 +683,29 @@ def _prepare_python_environment(
     requirements = checkout / _KERNEL_REQUIREMENTS
     if not requirements.is_file():
         raise CoordinatorError(f"ROCm requirements are missing: {requirements}")
+    vendor_requirements = _staged_vendor_requirements(requirements)
+    if vendor_requirements:
+        testpypi_index = (
+            os.environ.get("TOKENSPEED_TESTPYPI_INDEX")
+            or _DEFAULT_TOKENSPEED_TESTPYPI_INDEX
+        )
+        _run_logged(
+            [
+                str(python),
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--no-input",
+                "--no-deps",
+                "--index-url",
+                testpypi_index,
+                *vendor_requirements,
+            ],
+            cwd=checkout,
+            log_path=log_path,
+            attempts=3,
+        )
     _run_logged(
         [
             str(python),

@@ -12,6 +12,19 @@ TORCH_DEVICE_PACKAGE=${TORCH_DEVICE_PACKAGE:-}
 
 export MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL}
 WORKSPACE=${WORKSPACE:-$(pwd)}
+ROCM_REQ="${WORKSPACE}/tokenspeed-kernel/python/requirements/rocm.txt"
+TOKENSPEED_TESTPYPI_INDEX=${TOKENSPEED_TESTPYPI_INDEX:-https://test.pypi.org/simple}
+
+preinstall_tokenspeed_testpypi_packages() {
+    local vendor_requirements=()
+    mapfile -t vendor_requirements < <(grep -E '^tokenspeed-(triton|proton)==' "${ROCM_REQ}")
+    if [ "${#vendor_requirements[@]}" -eq 0 ]; then
+        echo "No tokenspeed vendor requirements found in ${ROCM_REQ}" >&2
+        return 1
+    fi
+    pip3 install --no-deps --index-url "${TOKENSPEED_TESTPYPI_INDEX}" \
+        "${vendor_requirements[@]}"
+}
 
 pip_install_with_retry() {
     local max_attempts=5
@@ -68,6 +81,8 @@ pip3 install --force-reinstall --no-deps \
     "${WORKSPACE}/tokenspeed-kernel-amd" --no-build-isolation
 
 cd "${WORKSPACE}"
+echo "Preinstalling staged TokenSpeed vendor packages from ${TOKENSPEED_TESTPYPI_INDEX}"
+preinstall_tokenspeed_testpypi_packages
 
 TOKENSPEED_KERNEL_BACKEND=rocm \
 pip_install_with_retry pip3 install tokenspeed-kernel/python/ \

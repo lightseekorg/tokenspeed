@@ -131,6 +131,14 @@ unversioned `libamdhip64.so` linker name. The gfx1250 PyTorch wheel and
 TokenSpeed use separate Triton distributions in the same process, and this
 path is accepted by both while still resolving to the same TheRock runtime.
 
+The CUDA and ROCm kernel requirement files exact-pin the staged
+`tokenspeed-triton` and `tokenspeed-proton` builds. The corresponding normal
+installers and registration-level kernel benchmark coordinator preinstall those
+wheels from TestPyPI before installing the kernel requirements, so both
+packages must be published there before updating the pins. Set
+`TOKENSPEED_TESTPYPI_INDEX` to use a compatible package mirror instead of
+`https://test.pypi.org/simple`.
+
 To enable `push` and `workflow_dispatch` runs of the three PR test workflows
 outside the official repository, set the `TOKENSPEED_CI_REPOSITORY` repository
 variable at the same settings path to the configured repository's exact

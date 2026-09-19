@@ -518,6 +518,74 @@ def test_revision_environment_inherits_and_pins_prepared_rocm(monkeypatch, tmp_p
     assert sum("torch.cuda.is_available" in " ".join(command) for command in calls) == 2
 
 
+@pytest.mark.parametrize(
+    ("configured_index", "expected_index"),
+    [
+        (None, "https://test.pypi.org/simple"),
+        (
+            "https://packages.example/simple",
+            "https://packages.example/simple",
+        ),
+    ],
+)
+def test_revision_environment_preinstalls_staged_vendor_wheels(
+    monkeypatch, tmp_path, configured_index, expected_index
+):
+    checkout = tmp_path / "checkout"
+    requirements = checkout / "tokenspeed-kernel/python/requirements/rocm.txt"
+    requirements.parent.mkdir(parents=True)
+    requirements.write_text(
+        "torch\nnumpy\ntokenspeed-proton==1.2.3\ntokenspeed-triton==1.2.3\n",
+        encoding="utf-8",
+    )
+    inherited = tmp_path / "prepared/site-packages"
+    inherited.mkdir(parents=True)
+    environment_dir = tmp_path / "revision-venv"
+    calls: list[list[str]] = []
+
+    def run_logged(command, **kwargs):
+        del kwargs
+        calls.append(list(command))
+        if command[1:3] == ["-m", "venv"]:
+            (environment_dir / "bin").mkdir(parents=True)
+            (environment_dir / "bin/python").touch()
+            (environment_dir / "lib/python3.13/site-packages").mkdir(parents=True)
+
+    monkeypatch.setattr(benchmark_ci, "_run_logged", run_logged)
+    monkeypatch.setattr(benchmark_ci.sys, "path", [str(inherited)])
+    monkeypatch.setattr(
+        benchmark_ci.importlib.metadata,
+        "version",
+        lambda package: "2.13.0+rocm7.2",
+    )
+    if configured_index is None:
+        monkeypatch.delenv("TOKENSPEED_TESTPYPI_INDEX", raising=False)
+    else:
+        monkeypatch.setenv("TOKENSPEED_TESTPYPI_INDEX", configured_index)
+
+    python = _prepare_python_environment(
+        checkout, environment_dir, tmp_path / "setup.log"
+    )
+
+    pip_calls = [command for command in calls if command[1:3] == ["-m", "pip"]]
+    assert len(pip_calls) == 2
+    vendor_call, requirements_call = pip_calls
+    assert vendor_call == [
+        str(python),
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--no-input",
+        "--no-deps",
+        "--index-url",
+        expected_index,
+        "tokenspeed-proton==1.2.3",
+        "tokenspeed-triton==1.2.3",
+    ]
+    assert requirements_call[-2:] == ["-r", str(requirements)]
+
+
 def test_shared_task_runner_preserves_paired_benchmark_outputs():
     path = REPO_ROOT / ".github/workflows/run-pr-test-stage.yml"
     workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
