@@ -203,7 +203,9 @@ class SchedulerControlClient:
         )
 
     async def flush_cache(self: AsyncLLM) -> FlushCacheReqOutput:
-        return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
+        """Report success only when every data-parallel scheduler clears its cache."""
+        results = await self.flush_cache_communicator(FlushCacheReqInput())
+        return FlushCacheReqOutput(success=all(result.success for result in results))
 
     async def pause_scheduler(self: AsyncLLM, *, mode: PauseMode = "abort") -> bool:
         """Pause generation to allow model weight updates.
