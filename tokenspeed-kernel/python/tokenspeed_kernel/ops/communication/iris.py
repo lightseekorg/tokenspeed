@@ -1827,6 +1827,10 @@ def _iris_sync_rank_token(
         scope="sys",
     )
     _iris_drain_subgroup_vmem()
+    # The acquire is subgroup-local. Keep every subgroup at the protocol
+    # boundary until all of them have observed the peer publications; the
+    # caller consumes the peer inbox immediately after this helper returns.
+    gl.barrier()
 
 
 @gluon.jit
@@ -2644,6 +2648,9 @@ def iris_push_one_shot_allreduce_residual_attnres_gluon_kernel(
             cache=".wt",
         )
     _iris_drain_subgroup_vmem()
+    # The drain is subgroup-local. Join all producer subgroups before the
+    # control subgroup publishes the generation to peer ranks.
+    gl.barrier()
 
     _iris_sync_rank_token(
         sync_ready_flags,

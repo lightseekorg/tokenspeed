@@ -26,6 +26,13 @@ Keep an explicit `gl.barrier()` only where the compiler cannot see the hazard:
   `buffer_load_to_shared` into the same slot is the kernel's responsibility.
   Place the barrier before the copy that reuses the slot.
 
+Iris push collectives also keep explicit workgroup barriers around their
+cross-rank publication protocol. The VMEM drain and system-scope atomics order
+one subgroup's traffic, but the barriers join all producer subgroups before a
+generation is published and all consumer subgroups before the peer inbox is
+read. Removing either rendezvous can potentially increase cross-rank skew and
+regress perf even when the generated kernel remains correct.
+
 ## Attention
 
 ### DeepSeek V4 attention
