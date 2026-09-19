@@ -18,12 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Private FlashInfer TRT-LLM launcher with initialized routing-map padding.
+"""Private FlashInfer TRT-LLM module with producer-owned routing-map padding.
 
-Keep the upstream routing, tuning and GEMM implementations. Only the native
-routing workspace allocation gains a stream-ordered initialization, recorded
-during capture and executed on every replay. The installed package, upstream
-Python globals and upstream JIT artifacts remain untouched.
+Keep upstream routing decisions, tuning and GEMM implementations. The routing
+kernels also write invalid rows, including tile padding and the allocation
+guard, on every invocation/replay. The installed package, upstream Python
+globals and upstream JIT artifacts remain untouched.
 """
 
 from __future__ import annotations
@@ -31,38 +31,47 @@ from __future__ import annotations
 import functools
 import hashlib
 import inspect
+import posixpath
 import re
 import types
 from dataclasses import replace
 from pathlib import Path
 
-# Match the named allocation, not a token count or an allocator callback.
-_ROUTE_ALLOCATION = re.compile(
-    r"(?m)^(?P<indent>[ \t]*)permuted_idx_to_token_idx\s*=\s*"
-    r"alloc_tensor\(\{max_num_padded_tokens(?:\s*\+\s*1)?\},\s*"
-    r"dl_int32,\s*hidden_states\.device\(\)\);"
+from tokenspeed_kernel.thirdparty.flashinfer._routing_padding import (
+    patch_routing_sources,
 )
 
 
-def _initialize_routing_map(source: str) -> str:
-    matches = list(_ROUTE_ALLOCATION.finditer(source))
-    if len(matches) != 1:
-        raise RuntimeError(
-            "Unsupported FlashInfer TRT-LLM routing workspace: expected exactly "
-            "one permuted_idx_to_token_idx allocation; review the native adapter."
-        )
-    match = matches[0]
-    indent = match["indent"]
-    lines = (
-        "// Initialize tile padding and any guard entry before routing writes live rows.",
-        "// Graph-pool reuse can overwrite this storage: initialization must replay.",
-        "CHECK_CUDA_ERROR(cudaMemsetAsync(",
-        "    permuted_idx_to_token_idx.data_ptr(), 0xff,",
-        "    static_cast<size_t>(permuted_idx_to_token_idx.numel()) * sizeof(int32_t),",
-        "    get_stream(hidden_states.device())));",
+def _relocate_header(source: str) -> str:
+    # Copied siblings retain their local includes. Includes climbing out of the
+    # copied directory must instead resolve from FlashInfer's installed root.
+    return re.sub(
+        r'(?m)^#include "(?P<path>\.\./[^"\n]+)"',
+        lambda match: '#include "'
+        + posixpath.normpath("flashinfer/trtllm/fused_moe/" + match["path"])
+        + '"',
+        source,
     )
-    initialization = "\n" + "\n".join(indent + line for line in lines)
-    return source[: match.end()] + initialization + source[match.end() :]
+
+
+def _prepare_routing_sources(
+    sources: dict[str, str], headers: set[str]
+) -> dict[str, str]:
+    patched = patch_routing_sources(sources)
+    for name, source in patched.items():
+        if name in headers:
+            source = _relocate_header(source)
+        if source != sources[name]:
+            # Also mark headers changed only by include relocation. Retain the
+            # complete upstream copyright/license header after this notice.
+            source = (
+                "// Modified by TokenSpeed (LightSeek Foundation) for its routing-map\n"
+                "// padding adapter: padding initialization and/or private-JIT include relocation.\n"
+                "// Original copyright and license notices are retained below.\n"
+                + source
+            )
+        patched[name] = source
+    return patched
 
 
 def _routing_initialized_spec(*args, **kwargs):
@@ -71,32 +80,41 @@ def _routing_initialized_spec(*args, **kwargs):
     from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
 
     spec = gen_trtllm_gen_fused_moe_sm100_module(*args, **kwargs)
-    launchers = [
-        Path(path)
-        for path in spec.sources
-        if Path(path).name == "trtllm_fused_moe_kernel_launcher.cu"
-    ]
-    if len(launchers) != 1:
-        raise RuntimeError("Unsupported FlashInfer TRT-LLM JIT source list")
-    source = _initialize_routing_map(launchers[0].read_text())
-    digest = hashlib.sha256(source.encode()).hexdigest()[:16]
-    name = f"tokenspeed_{spec.name}_route_init_{digest}"
+    native_sources = {Path(path).name: Path(path) for path in spec.sources}
+    header_root = jit_env.FLASHINFER_INCLUDE_DIR / "flashinfer/trtllm/fused_moe"
+    # Include the unchanged sibling headers too: their quoted relative includes
+    # must resolve to our private RoutingKernel/runner rather than installed ones.
+    headers = {path.name: path for path in header_root.iterdir() if path.is_file()}
+    inputs = {key: path.read_text() for key, path in (native_sources | headers).items()}
+    patched = _prepare_routing_sources(inputs, set(headers))
+    digest = hashlib.sha256()
+    for key, source in sorted(patched.items()):
+        digest.update(key.encode() + b"\0" + source.encode() + b"\0")
+    name = f"tokenspeed_{spec.name}_route_padding_{digest.hexdigest()[:16]}"
     directory = jit_env.FLASHINFER_GEN_SRC_DIR / name
     directory.mkdir(parents=True, exist_ok=True)
-    launcher = directory / launchers[0].name
     # Concurrent TP workers produce identical content; never rewrite a source
     # another worker's compiler may currently be reading.
     with FileLock(str(directory / "source.lock")):
-        if not launcher.exists():
-            launcher.write_text(source)
-        elif launcher.read_text() != source:
-            raise RuntimeError("FlashInfer routing adapter source-cache mismatch")
+        private_sources = {}
+        for key, source in patched.items():
+            if key in headers:
+                target = directory / "include/flashinfer/trtllm/fused_moe" / key
+            elif source != inputs[key]:
+                target = directory / key
+                private_sources[key] = target
+            else:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                target.write_text(source)
+            elif target.read_text() != source:
+                raise RuntimeError("FlashInfer routing adapter source-cache mismatch")
     return replace(
         spec,
         name=name,
-        sources=[
-            launcher if Path(path) == launchers[0] else path for path in spec.sources
-        ],
+        sources=[private_sources.get(Path(path).name, path) for path in spec.sources],
+        extra_include_dirs=[directory / "include", *(spec.extra_include_dirs or [])],
     )
 
 

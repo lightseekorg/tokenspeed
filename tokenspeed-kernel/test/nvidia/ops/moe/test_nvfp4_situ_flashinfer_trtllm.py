@@ -522,8 +522,20 @@ def test_nvfp4_situ_deferred_triple_matches_finalized() -> None:
 
 @requires_flashinfer_situ
 @pytest.mark.parametrize(
-    "num_tokens,top_k,local_count",
-    [(1, 2, 16), (17, 8, 16), (129, 2, 8), (257, 8, 16)],
+    "num_tokens,top_k,local_count,force_offsets",
+    [
+        (1, 1, 8, False),
+        (17, 1, 8, False),
+        (64, 1, 8, False),
+        (1, 2, 16, False),
+        (17, 8, 16, False),
+        (64, 8, 16, False),
+        (129, 2, 8, False),
+        (257, 8, 16, False),
+        (1025, 8, 8, False),
+        (8193, 8, 16, False),
+        (8193, 8, 16, True),
+    ],
 )
 @pytest.mark.parametrize("routed", [False, True])
 @pytest.mark.parametrize("enable_pdl", [False, True])
@@ -531,6 +543,7 @@ def test_nvfp4_route_padding_is_initialized_on_every_replay(
     num_tokens: int,
     top_k: int,
     local_count: int,
+    force_offsets: bool,
     routed: bool,
     enable_pdl: bool,
     monkeypatch,
@@ -539,12 +552,20 @@ def test_nvfp4_route_padding_is_initialized_on_every_replay(
 
     The allocation observer is test-only: it retains the guarded int32 routing
     map so the test can inspect padding and corrupt it between replays. Product
-    initialization occurs in the native launcher, without allocation interception.
+    initialization occurs in the routing producers, without allocation interception.
     """
     from flashinfer.fused_moe import core
-    from flashinfer.tllm_enums import ActivationType
+    from flashinfer.tllm_enums import ActivationType, RoutingMethodType
     from tokenspeed_kernel.ops.moe.flashinfer import trtllm_nvfp4 as impl
     from torch.utils._python_dispatch import TorchDispatchMode
+
+    if force_offsets:
+        # Limit the cooperative path to one SM so this geometry exercises the
+        # multi-kernel histogram/offsets producer, without enormous MoE inputs.
+        monkeypatch.setenv(
+            "FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS",
+            str(torch.cuda.get_device_properties(0).multi_processor_count - 1),
+        )
 
     generator = torch.Generator().manual_seed(401)
     raw = _make_nvfp4_moe_weights(generator, logical_ispp=ISPP)
@@ -562,6 +583,10 @@ def test_nvfp4_route_padding_is_initialized_on_every_replay(
     w._spec.num_local_experts = local_count
     w._spec.ep_rank = local_offset // local_count
     impl.flashinfer_trtllm_nvfp4_situ_moe_weights({}, w)
+    if top_k == 1:
+        # Llama4's small-token warp path reserves remote-expert rows too.
+        # Precomputed-top-k tests still use the shared routed entry point.
+        w._routing_method_type = RoutingMethodType.Llama4
     x = (torch.randn(num_tokens, HIDDEN, generator=generator) * 0.2).bfloat16().cuda()
     logits = torch.randn(num_tokens, NUM_EXPERTS, generator=generator).bfloat16().cuda()
     values, ids = logits.float().softmax(-1).topk(top_k, dim=-1)
@@ -636,13 +661,17 @@ def test_nvfp4_route_padding_is_initialized_on_every_replay(
     output_graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(output_graph):
         graph_output = apply(True)
-    for shift in (0, 3, 7, 0):
+    for round_idx, (shift, poison) in enumerate(
+        ((0, 0), (3, 0x7FFFFFFF), (7, -123), (0, 0))
+    ):
         # Move between expert distributions, including empty local experts.
         logits.copy_(logits.roll(shift, dims=-1))
+        if round_idx == 3 and local_offset > 0:
+            logits[:, local_offset:].fill_(-1000)
         next_weights, next_ids = logits.float().softmax(-1).topk(top_k, dim=-1)
         ids.copy_(next_ids)
         weights.copy_(next_weights)
-        route_map.zero_()
+        route_map.fill_(poison)
         graph.replay()
         check_map(route_map, graph_expanded)
         actual = apply(True)
