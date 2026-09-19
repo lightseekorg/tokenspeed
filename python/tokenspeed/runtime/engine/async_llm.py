@@ -275,8 +275,8 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
             logger.info(
-                "Receive: obj=%s",
-                dataclass_to_string_truncated(obj, max_length, skip_names=skip_names),
+                "Receive: obj="
+                f"{dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)!s}",
             )
 
         async with self.model_update_lock.reader_lock:
@@ -530,7 +530,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         # default the load format to the server_args
         if obj.load_format is None:
             obj.load_format = self.server_args.load_format
-        logger.info("Start update_weights. Load format=%s", obj.load_format)
+        logger.info(f"Start update_weights. Load format={obj.load_format!s}")
 
         # Hold the lock if it is not async. This means that weight sync
         # cannot run while requests are in progress.
@@ -625,7 +625,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             self.dump_requests_folder = obj.dump_requests_folder
         if obj.dump_requests_threshold is not None:
             self.dump_requests_threshold = obj.dump_requests_threshold
-        logging.info("Config logging: obj=%r", obj)
+        logging.info(f"Config logging: obj={obj!r}")
         self.log_request_metadata = self.get_log_request_metadata()
 
     # ---- Server lifecycle / health -------------------------------
@@ -686,7 +686,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         """Launch the SGLang-compatible RL control app on this event loop."""
         if self._rl_control_task is not None:
             return
-        port = getattr(self.server_args, "rl_control_port", None)
+        port = self.server_args.rl_control_port
         if not port:
             return
         self._rl_control_task = loop.create_task(self._serve_rl_control_plane(port))
@@ -710,7 +710,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             )
             await server.serve()
         except Exception as e:  # noqa: BLE001
-            logger.error("RL control plane stopped: %s", e)
+            logger.error(f"RL control plane stopped: {e!s}")
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
@@ -720,7 +720,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         while True:
             remain_num_req = len(self.rid_to_state)
             logger.info(
-                "Gracefully exiting... remaining number of requests %s", remain_num_req
+                f"Gracefully exiting... remaining number of requests {remain_num_req!s}",
             )
             if remain_num_req > 0:
                 await asyncio.sleep(5)
@@ -762,7 +762,7 @@ async def print_exception_wrapper(func):
         await func()
     except Exception:
         traceback = get_exception_traceback()
-        logger.error("AsyncLLM hit an exception: %s", traceback)
+        logger.error(f"AsyncLLM hit an exception: {traceback!s}")
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(1)
 
@@ -773,9 +773,8 @@ class SignalHandler:
 
     def signal_handler(self, signum=None, frame=None):
         logger.warning(
-            "SIGTERM received. signum=%r frame=%r. Draining requests and shutting down...",
-            signum,
-            frame,
+            f"SIGTERM received. signum={signum!r} frame={frame!r}. Draining requests "
+            "and shutting down...",
         )
         self.tokenizer_manager.gracefully_exit = True
 

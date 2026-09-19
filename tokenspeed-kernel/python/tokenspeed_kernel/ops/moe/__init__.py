@@ -716,19 +716,44 @@ def moe_plan(
 
 
 def moe_process_weights(plan: dict, w: torch.nn.Module):
-    """Process loaded MoE weights according to a plan.
+    """Process loaded MoE weights and prepare persistent communication storage.
 
     Args:
         plan: Execution plan returned by moe_plan.
         w: Module containing loaded MoE weights. This module is mutated in
-            place to prepare solution-specific layouts and scales.
+            place to prepare solution-specific layouts and scales. DeepEP
+            modules must declare hidden_size (the unquantized input width)
+            and num_experts (the global expert count).
+
+    Returns:
+        The selected weight preprocessor's result, or None without one.
     """
+    # Preserve input geometry before a kernel transforms its weight storage.
+    # Every DeepEP backend reserves through this one lifecycle entry point.
+    deepep_geometry = (
+        (w.hidden_size, w.num_experts) if plan.get("a2a_backend") == "deepep" else None
+    )
     preprocessor = plan.get("weight_preprocessor")
-    if preprocessor is None:
-        return None
-    if not callable(preprocessor):
-        raise RuntimeError(f"Weight preprocessor is not callable: {preprocessor!r}")
-    return preprocessor(plan=plan, w=w)
+    result = None
+    if preprocessor is not None:
+        if not callable(preprocessor):
+            raise RuntimeError(f"Weight preprocessor is not callable: {preprocessor!r}")
+        result = preprocessor(plan=plan, w=w)
+    if deepep_geometry is not None:
+        # Keep the optional communication dependency out of non-DeepEP plans.
+        from tokenspeed_kernel.ops.communication.deep_ep import prepare_deepep_buffer
+
+        hidden_size, num_experts = deepep_geometry
+        prepare_deepep_buffer(
+            group=plan["process_group"],
+            hidden_size=hidden_size,
+            num_experts=num_experts,
+            deepep_mode=plan["deepep_mode"],
+            max_dispatch_tokens_per_rank=plan[
+                "deepep_low_latency_max_num_tokens_per_gpu"
+            ],
+        )
+    return result
 
 
 def moe_apply(

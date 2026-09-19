@@ -272,9 +272,8 @@ def _warmup_mega_moe_jit(
     """Pre-compile MegaMoE kernel tiles using the initialized model state."""
     token_counts = _warmup_m_values(max_num_tokens)
     logger.info(
-        "Warming up mega_moe JIT: %d token counts up to %d",
-        len(token_counts),
-        max_num_tokens,
+        f"Warming up mega_moe JIT: {len(token_counts):d} token counts up to "
+        f"{max_num_tokens:d}",
     )
 
     for num_tokens in token_counts:

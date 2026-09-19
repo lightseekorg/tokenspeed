@@ -464,7 +464,6 @@ def _dsa_dense_mfma_kv_kernel(
                 other=0.0,
             ).to(smem_dtype)
             smem_krope.index(0).store(k_rope)
-        gl.barrier()
     else:
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             dest=smem_klora.index(0),
@@ -554,7 +553,6 @@ def _dsa_dense_mfma_kv_kernel(
                     other=0.0,
                 ).to(smem_dtype)
                 smem_krope.index(next_buf).store(k_rope_next)
-            gl.barrier()
         else:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
                 dest=smem_klora.index(next_buf),
@@ -611,8 +609,6 @@ def _dsa_dense_mfma_kv_kernel(
         l_i = l_new
         cur_buf = next_buf
         valid_mma = valid_mma_next
-        if FP8_INPUTS:
-            gl.barrier()
 
     if not FP8_INPUTS:
         gl.amd.cdna4.async_copy.wait_group(0)

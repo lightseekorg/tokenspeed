@@ -734,7 +734,14 @@ def test_producer_schedule_groups_draft_fields_in_the_final_step() -> None:
         ),
     )
 
-    schedule = build_cache_fields_by_producer_step(layout.plan, num_target_layers=2)
+    schedule = build_cache_fields_by_producer_step(
+        layout.plan,
+        producer_fields_by_step=(
+            ("layer.0.kv",),
+            ("layer.1.kv",),
+            ("layer.2.kv", "layer.3.kv"),
+        ),
+    )
 
     assert schedule.fields_by_step == (
         ("layer.0.kv",),
@@ -745,3 +752,49 @@ def test_producer_schedule_groups_draft_fields_in_the_final_step() -> None:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_cache_construction_resolves_draft_readiness_before_transfer():
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
+        cache_field_placement,
+        pipeline_cache_ownership,
+    )
+
+    plan = SimpleNamespace(
+        fields=[SimpleNamespace(field_id=f"layer.{i}.kv") for i in range(6)]
+    )
+    owners = pipeline_cache_ownership(4, 2, ((0, 2), (2, 4)))
+    resident, schedules = cache_field_placement(plan, owners)
+    assert resident == (
+        ("layer.0.kv", "layer.1.kv"),
+        ("layer.2.kv", "layer.3.kv", "layer.4.kv", "layer.5.kv"),
+    )
+    assert schedules == (
+        (("layer.0.kv",), ("layer.1.kv",)),
+        (("layer.2.kv",), ("layer.3.kv",), ("layer.4.kv", "layer.5.kv")),
+    )
+    for fields, steps in zip(resident, schedules):
+        physical_plan = SimpleNamespace(
+            fields=[SimpleNamespace(field_id=field) for field in fields]
+        )
+        schedule = build_cache_fields_by_producer_step(
+            physical_plan, producer_fields_by_step=steps
+        )
+        assert schedule.fields_in_range(0, schedule.step_count) == frozenset(fields)
+
+
+def test_cache_readiness_rejects_missing_resident_fields():
+    from types import SimpleNamespace
+
+    plan = SimpleNamespace(
+        fields=[
+            SimpleNamespace(field_id="layer.0.kv"),
+            SimpleNamespace(field_id="layer.1.kv"),
+        ]
+    )
+    with pytest.raises(ValueError, match="every resident field"):
+        build_cache_fields_by_producer_step(
+            plan, producer_fields_by_step=(("layer.0.kv",),)
+        )

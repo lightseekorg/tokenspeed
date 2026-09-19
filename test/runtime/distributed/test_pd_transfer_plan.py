@@ -82,6 +82,7 @@ def _planner(prefill_tp, decode_tp, prefill_layout, decode_layout):
         decode_tp_size=decode_tp,
         prefill_layout=prefill_layout,
         decode_layout=decode_layout,
+        prefill_field_ids=None,
     )
 
 
@@ -240,14 +241,14 @@ def test_pp_layer_window_filters_fragments():
         decode_tp_size=1,
         prefill_layout=layout,
         decode_layout=layout,
-        prefill_layer_window=(0, 1),
+        prefill_field_ids=frozenset({"layer.0.k"}),
     )
     stage1 = CacheTransferPlanner(
         prefill_tp_size=1,
         decode_tp_size=1,
         prefill_layout=layout,
         decode_layout=layout,
-        prefill_layer_window=(1, 2),
+        prefill_field_ids=frozenset({"layer.1.latent"}),
     )
     frags0 = stage0.plan_for_decode_rank(0).fragments_by_prefill_rank[0]
     frags1 = stage1.plan_for_decode_rank(0).fragments_by_prefill_rank[0]
@@ -275,6 +276,7 @@ def test_pp_receiver_calc_merges_stage_routes():
     info = PrefillParallelInfo(
         tp_size=2,  # registered world = pp(2) x tp(1)
         dp_size=1,
+        cache_fields_by_stage=(("layer.0.k",), ("layer.1.latent",)),
         cache_layout=layout,
         pp_size=2,
     )
@@ -319,9 +321,13 @@ def test_pp_receiver_calc_honors_layer_partition():
         info = PrefillParallelInfo(
             tp_size=2,
             dp_size=1,
+            cache_fields_by_stage=(
+                (("layer.0.latent", "layer.1.latent"), ("layer.2.latent",))
+                if partition is None
+                else (("layer.0.latent",), ("layer.1.latent", "layer.2.latent"))
+            ),
             cache_layout=layout,
             pp_size=2,
-            pp_layer_partition=partition,
         )
         frags = _calc(kv_mgr, info).transfer_plan.fragments_by_prefill_rank
         return {rank: {f.field_id for f in fields} for rank, fields in frags.items()}
@@ -336,3 +342,65 @@ def test_pp_receiver_calc_honors_layer_partition():
         0: {"layer.0.latent"},
         1: {"layer.1.latent", "layer.2.latent"},
     }
+
+
+@pytest.mark.parametrize(
+    "placement",
+    [
+        (("layer.0.k", "layer.1.latent"), ("layer.0.k",)),
+        (("layer.0.k",),),
+        (("layer.0.k", "unknown"), ("layer.1.latent",)),
+    ],
+)
+def test_stage_placement_rejects_duplicate_missing_or_unknown_fields(placement):
+    from tokenspeed.runtime.pd.transfer_plan import build_pipeline_transfer_plan
+
+    layout = _paged_layout(
+        local_heads=4, global_heads=4, page_stride=4096, page_zero_offset=128
+    )
+    with pytest.raises(ValueError, match="exactly once"):
+        build_pipeline_transfer_plan(
+            prefill_tp_size=1,
+            decode_tp_size=1,
+            decode_tp_rank=0,
+            prefill_layout=layout,
+            decode_layout=layout,
+            cache_fields_by_stage=placement,
+        )
+
+
+def test_stage_placement_supports_noncontiguous_fields_without_model_counts():
+    from tokenspeed.runtime.pd.transfer_plan import build_pipeline_transfer_plan
+
+    layout = make_layout(
+        group(
+            "history",
+            *[
+                segment(
+                    f"layer.{index}.latent",
+                    dtype="bfloat16",
+                    shape=(2, 1),
+                    offset=index * 512,
+                    stride=16,
+                )
+                for index in range(4)
+            ],
+        ),
+        page_bytes=128,
+    )
+    fields = (
+        ("layer.0.latent", "layer.3.latent"),
+        ("layer.1.latent", "layer.2.latent"),
+    )
+    plan, _ = build_pipeline_transfer_plan(
+        prefill_tp_size=1,
+        decode_tp_size=1,
+        decode_tp_rank=0,
+        prefill_layout=layout,
+        decode_layout=layout,
+        cache_fields_by_stage=fields,
+    )
+    assert {
+        rank: {fragment.field_id for fragment in fragments}
+        for rank, fragments in plan.fragments_by_prefill_rank.items()
+    } == {rank: set(stage) for rank, stage in enumerate(fields)}

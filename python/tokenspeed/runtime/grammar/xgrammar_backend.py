@@ -199,10 +199,8 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
         except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
             logger.warning(
-                "Failed to compile %s grammar: key_string=%r, e=%r",
-                key_type,
-                key_string,
-                exc,
+                f"Failed to compile {key_type!s} grammar: key_string={key_string!r}, e="
+                f"{exc!r}",
             )
             return InvalidGrammarObject(f"{type(exc).__name__}: {exc}")
 

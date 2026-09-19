@@ -231,35 +231,24 @@ class KimiLinearMLP(nn.Module):
     place because Kimi-K3 runs the AttnRes residual path outside
     ``CommManager`` (see decision D4). EP Kimi can defer the shared-expert
     reduction so one Iris launch reduces it together with the routed latent.
+    Unsharded callers use tp_size=1 and tp_group=None.
     """
 
     def __init__(
         self,
         hidden_size: int,
         intermediate_size: int,
-        mapping: Mapping,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-        reduce_results: bool = True,
-        is_shared_expert: bool = False,
-        activation_situ_beta: float = 1.0,
-        activation_situ_linear_beta: float | None = None,
+        tp_rank: int,
+        tp_size: int,
+        tp_group: tuple[int, ...] | None,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+        reduce_results: bool,
+        is_shared_expert: bool,
+        activation_situ_beta: float,
+        activation_situ_linear_beta: float | None,
     ) -> None:
         super().__init__()
-        self.mapping = mapping
-        if is_shared_expert and mapping.attn.dp_size > 1:
-            tp_rank = 0
-            tp_size = 1
-            tp_group = (mapping.rank,)
-        elif is_shared_expert:
-            tp_rank = mapping.moe.tp_ep_rank
-            tp_size = mapping.moe.tp_ep_size
-            tp_group = mapping.moe.tp_ep_group
-        else:
-            tp_rank = mapping.dense.tp_rank
-            tp_size = mapping.dense.tp_size
-            tp_group = mapping.dense.tp_group
-
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -1463,13 +1452,10 @@ class KimiLinearMoE(nn.Module):
             raise ValueError("Kimi-K3 attention TP must match the MoE TP x EP group.")
         moe_backend = get_moe_backend()
         all2all_backend = get_all2all_backend()
-        if mapping.attn.dp_size > 1:
-            if all2all_backend is All2AllBackend.DEEPEP:
-                raise ValueError(
-                    "Kimi-K3 attention DP does not support DeepEP; "
-                    "use --all2all-backend agrs or flashinfer."
-                )
-        elif all2all_backend in (All2AllBackend.AGRS, All2AllBackend.FLASHINFER):
+        if mapping.attn.dp_size == 1 and all2all_backend in (
+            All2AllBackend.AGRS,
+            All2AllBackend.FLASHINFER,
+        ):
             raise ValueError(
                 "Kimi-K3 agrs/flashinfer transport requires attention DP > 1."
             )
@@ -1684,7 +1670,9 @@ class KimiLinearMoE(nn.Module):
         self.shared_experts = KimiLinearMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size * config.num_shared_experts,
-            mapping=mapping,
+            tp_rank=0 if mapping.attn.dp_size > 1 else mapping.moe.tp_ep_rank,
+            tp_size=1 if mapping.attn.dp_size > 1 else mapping.moe.tp_ep_size,
+            tp_group=None if mapping.attn.dp_size > 1 else mapping.moe.tp_ep_group,
             quant_config=quant_config,
             prefix=add_prefix("shared_experts", prefix),
             # TP combines shared partials in the tail; DP keeps complete local outputs.
@@ -1864,6 +1852,18 @@ class KimiLinearMoE(nn.Module):
             out=shared_out,
         )
         return router_logits, routed_input, shared_output
+
+    def process_weights_after_loading(self, module) -> None:
+        """Configure the latent projection from the processed expert input scale."""
+        if (
+            self.experts.plan["weight_dtype"] == "nvfp4"
+            and self.experts.plan["solution"] == "flashinfer_trtllm"
+        ):
+            # The loader visits this parent before its expert child.
+            self.experts.process_weights_after_loading(self.experts)
+            self.routed_expert_down_proj.prepare_nvfp4_output(
+                self.experts.w13_input_scale_quant
+            )
 
     def _routed_experts(
         self,
@@ -2238,6 +2238,38 @@ class KimiLinearMoE(nn.Module):
         return self.comm.reduce_shared(shared_partial)
 
 
+def create_kimi_linear_moe(
+    config: KimiLinearConfig,
+    mapping: Mapping,
+    layer_index: int,
+    model_scope: str,
+    moe_block_count: int,
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+    alt_stream: torch.cuda.Stream | None,
+) -> nn.Module:
+    """Construct K3 MoE with the token ownership required by its transport.
+
+    Arguments match the K3 MoE constructor; the returned module preserves the
+    checkpoint parameter names and the common model-forward interface.
+    """
+    implementation = KimiLinearMoE
+    if get_all2all_backend().is_deepep():
+        from tokenspeed.runtime.models.kimi_k3_deepep import KimiLinearMoEDeepEP
+
+        implementation = KimiLinearMoEDeepEP
+    return implementation(
+        config=config,
+        mapping=mapping,
+        layer_index=layer_index,
+        model_scope=model_scope,
+        moe_block_count=moe_block_count,
+        quant_config=quant_config,
+        prefix=prefix,
+        alt_stream=alt_stream,
+    )
+
+
 class KimiLinearDecoderLayer(nn.Module):
     """Kimi-K3 decoder layer: KDA/MLA dispatch + dense/MoE FFN + AttnRes.
 
@@ -2300,7 +2332,7 @@ class KimiLinearDecoderLayer(nn.Module):
         if self.is_moe_layer:
             # Named for the checkpoint index; not aliased as self.mlp (double
             # registration would duplicate every MoE param in state_dict).
-            self.block_sparse_moe = KimiLinearMoE(
+            self.block_sparse_moe = create_kimi_linear_moe(
                 moe_block_count=_k3_local_moe_blocks(config, mapping),
                 config=config,
                 mapping=mapping,
@@ -2314,9 +2346,12 @@ class KimiLinearDecoderLayer(nn.Module):
             self.mlp = KimiLinearMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
-                mapping=mapping,
+                tp_rank=mapping.dense.tp_rank,
+                tp_size=mapping.dense.tp_size,
+                tp_group=mapping.dense.tp_group,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                is_shared_expert=False,
                 reduce_results=True,
                 activation_situ_beta=situ_beta,
                 activation_situ_linear_beta=situ_linear_beta,
@@ -2397,6 +2432,19 @@ class KimiLinearDecoderLayer(nn.Module):
             attn_partial, prefix_sum, combine, mlp_wp=self._mlp_wp
         )
 
+    def capture_attnres(
+        self, prefix_sum: torch.Tensor, block_residual: torch.Tensor
+    ) -> torch.Tensor:
+        """Produce the preceding checkpoint tap before input norm and state writes."""
+        mixed = _apply_attn_res(
+            prefix_sum,
+            block_residual,
+            self.self_attention_res_proj,
+            self.self_attention_res_norm,
+            self.prev_valid_blocks,
+        )
+        return prefix_sum.clone() if mixed is prefix_sum else mixed
+
     def _mix_into_attention(
         self, hidden_states: torch.Tensor, block_residual: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -2442,7 +2490,7 @@ class KimiLinearDecoderLayer(nn.Module):
         self, hidden_states: torch.Tensor, block_residual: torch.Tensor
     ) -> bool:
         # Split beats fused at decode: 47 us/step faster at bs = 8 (aux-stream partial).
-        if getattr(self, "_dflash_attnres_capture_fallback", False):
+        if self._dflash_attnres_capture_fallback:
             return False
 
         # B1 already fuses the post-attention mix into the all-reduce.
@@ -2879,6 +2927,7 @@ class KimiLinearModel(nn.Module):
         # Each capture layer's positional tap index (the draft concatenates
         # taps in this order).
         self._dflash_capture_idx_map: dict[int, int] = {}
+        self.pp_context_hidden_size: int | None = None
 
     def _refresh_dflash_capture_fallback(self) -> None:
         """Mark AttnRes consumers that need split execution."""
@@ -2920,10 +2969,19 @@ class KimiLinearModel(nn.Module):
                 break
         if dtype is None:
             dtype = torch.bfloat16
-        return [
+        spec = [
             ("hidden_states", (num_tokens, hidden), dtype),
             ("block_residual", (valid_blocks, num_tokens, hidden), dtype),
         ]
+        if self.pp_context_hidden_size is not None:
+            spec.append(
+                (
+                    "projected_context",
+                    (num_tokens, self.pp_context_hidden_size),
+                    torch.float32,
+                )
+            )
+        return spec
 
     def _dspark_capture_stream(
         self,
@@ -2936,16 +2994,14 @@ class KimiLinearModel(nn.Module):
             return prefix_sum.clone()
 
         if layer_idx + 1 < len(self.layers):
-            consumer = self.layers[layer_idx + 1]
-            proj = consumer.self_attention_res_proj
-            norm = consumer.self_attention_res_norm
-            num_blocks = consumer.prev_valid_blocks
-        else:
-            proj = self.output_attn_res_proj
-            norm = self.output_attn_res_norm
-            num_blocks = ceil_div(
-                self.config.num_hidden_layers, self.config.attn_res_block_size
+            return self.layers[layer_idx + 1].capture_attnres(
+                prefix_sum, block_residual
             )
+        proj = self.output_attn_res_proj
+        norm = self.output_attn_res_norm
+        num_blocks = ceil_div(
+            self.config.num_hidden_layers, self.config.attn_res_block_size
+        )
 
         mixed = _apply_attn_res(prefix_sum, block_residual, proj, norm, num_blocks)
         return prefix_sum.clone() if mixed is prefix_sum else mixed
@@ -2987,27 +3043,47 @@ class KimiLinearModel(nn.Module):
         capture_layers = self.layers_to_capture
         capture_dflash = bool(capture_layers)
         capture_eagle3 = bool(self.eagle3_layers_to_capture)
+        dspark_context = ctx.dspark_context_producer
         aux_hidden_states: list[torch.Tensor] | None = (
-            [] if capture_dflash or capture_eagle3 else None
+            []
+            if (capture_dflash and dspark_context is None) or capture_eagle3
+            else None
         )
+        projected_context = None
+        if dspark_context is not None:
+            projected_context = dspark_context.begin_stage(
+                hidden_states,
+                pp_inbound.projected_context if pp_inbound is not None else None,
+            )
 
         prefix_sum = hidden_states
-        for layer_idx in range(self.pp_start_layer, self.pp_end_layer):
-            layer = self.layers[layer_idx]
-            prefix_sum, block_residual = layer(
-                positions, prefix_sum, ctx, block_residual
+
+        def capture_tap(layer_idx: int) -> None:
+            captured = self._dspark_capture_stream(
+                layer_idx, prefix_sum, block_residual
             )
-            if capture_dflash and layer_idx in capture_layers:
-                captured = self._dspark_capture_stream(
-                    layer_idx, prefix_sum, block_residual
-                )
-                capture_idx = self._dflash_capture_idx_map.get(layer_idx)
-                if ctx.target_capture_sink is not None and capture_idx is not None:
+            capture_idx = self._dflash_capture_idx_map[layer_idx]
+            if dspark_context is not None:
+                dspark_context.add_capture(projected_context, capture_idx, captured)
+            else:
+                if ctx.target_capture_sink is not None:
                     ctx.target_capture_sink.on_target_capture(capture_idx, captured)
                 assert aux_hidden_states is not None
                 aux_hidden_states.append(captured)
+
+        for layer_idx in range(self.pp_start_layer, self.pp_end_layer):
+            layer = self.layers[layer_idx]
+            # Tap labels stay checkpoint indices. AttnRes L is produced at
+            # L+1's entry on every topology, before that layer mutates snapshots.
+            if self.dflash_aux_stream == "attn_res" and layer_idx - 1 in capture_layers:
+                capture_tap(layer_idx - 1)
+            prefix_sum, block_residual = layer(
+                positions, prefix_sum, ctx, block_residual
+            )
+            if self.dflash_aux_stream == "prefix" and layer_idx in capture_layers:
+                capture_tap(layer_idx)
             # Clone: the copy must survive the next layer's in-place residual writes.
-            elif capture_eagle3 and layer_idx + 1 in self.eagle3_layers_to_capture:
+            if capture_eagle3 and layer_idx + 1 in self.eagle3_layers_to_capture:
                 assert aux_hidden_states is not None
                 aux_hidden_states.append(prefix_sum.clone())
 
@@ -3021,8 +3097,27 @@ class KimiLinearModel(nn.Module):
                 PPStageState(
                     hidden_states=prefix_sum,
                     block_residual=block_residual[:valid_blocks],
+                    projected_context=projected_context,
                 ),
                 None,
+            )
+
+        if (
+            self.dflash_aux_stream == "attn_res"
+            and self.config.num_hidden_layers - 1 in capture_layers
+        ):
+            capture_tap(self.config.num_hidden_layers - 1)
+
+        if dspark_context is not None:
+            cache_locs = ctx.attn_backend.decode_window_locations()
+            if ctx.num_extends > 0:
+                cache_locs = torch.cat(
+                    (ctx.attn_backend.extend_span_locations(), cache_locs)
+                )
+            dspark_context.write_context(
+                projected_context,
+                positions,
+                cache_locs[: ctx.input_num_tokens],
             )
 
         hidden_states = _apply_attn_res(
@@ -3109,6 +3204,15 @@ class KimiLinearForCausalLM(BaseCausalLM):
         }
         self.model._refresh_dflash_capture_fallback()
 
+    def set_target_context_capture(
+        self, layer_ids: list[int], stream: str, hidden_size: int
+    ) -> None:
+        """Configure per-tap projection without retaining concatenated hidden rows."""
+        self.set_dflash_layers_to_capture(layer_ids)
+        self.set_dflash_aux_hidden_stream(stream)
+        self.capture_aux_hidden_states = False
+        self.model.pp_context_hidden_size = hidden_size
+
     def set_dflash_aux_hidden_stream(self, stream: str) -> None:
         """Select which K3 residual stream the DFLASH/DSpark taps read."""
         if stream not in ("prefix", "attn_res"):
@@ -3126,9 +3230,8 @@ class KimiLinearForCausalLM(BaseCausalLM):
         self.model.dflash_aux_stream = stream
         self.model._refresh_dflash_capture_fallback()
         logger.info(
-            "DFLASH/DSpark target capture: layers=%s stream=%s",
-            tuple(self.model.layers_to_capture),
-            stream,
+            "DFLASH/DSpark target capture: layers="
+            f"{tuple(self.model.layers_to_capture)!s} stream={stream!s}",
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
@@ -3543,6 +3646,14 @@ class KimiK3ForConditionalGeneration(nn.Module):
             )
         self.language_model.set_dflash_layers_to_capture(layer_ids)
 
+    def set_target_context_capture(
+        self, layer_ids: list[int], stream: str, hidden_size: int
+    ) -> None:
+        """Forward the pipeline context capture contract to the language model."""
+        if self.language_model is None:
+            raise AttributeError("Encoder-only Kimi-K3 cannot produce draft context")
+        self.language_model.set_target_context_capture(layer_ids, stream, hidden_size)
+
     def set_dflash_aux_hidden_stream(self, stream: str) -> None:
         if self.language_model is None:
             raise AttributeError(
@@ -3714,10 +3825,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 pass
         if dropped_vision_weights:
             logger.warning(
-                "Dropping %d vision weights: multimodal path is inactive.",
-                dropped_vision_weights,
+                f"Dropping {dropped_vision_weights:d} vision weights: multimodal path "
+                "is inactive.",
             )
-        logger.debug("Loaded %d Kimi-K3 vision tensors.", loaded_vision_weights)
+        logger.debug(f"Loaded {loaded_vision_weights:d} Kimi-K3 vision tensors.")
 
 
 EntryClass = [KimiK3ForConditionalGeneration]

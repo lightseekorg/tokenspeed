@@ -36,6 +36,7 @@ __all__ = [
     "DeepEPDispatchMode",
     "DeepEPDispatcher",
     "DeepEPMode",
+    "prepare_deepep_buffer",
 ]
 
 logger = logging.getLogger(__file__)
@@ -43,6 +44,10 @@ logger = logging.getLogger(__file__)
 # FP8 block-scale granularity shared by the dispatch quantization and the
 # per-local-expert receive alignment DeepGEMM's contiguous layout requires.
 _FP8_BLOCK = 128
+
+# Reserve the BF16 input staging width even for dispatchers that quantize
+# payloads to FP8. Startup preparation and runtime acquisition must agree.
+_DEEPEP_BUFFER_ELEMENT_BYTES = 2
 
 # MNNVL/fabric buffers need the full IMEX stack, which only exists on multi-node
 # NVLink domains such as GB200 NVL72. TS_DEEPEP_ALLOW_MNNVL=0/1 forces the
@@ -67,7 +72,7 @@ def _resolve_allow_mnnvl(device_index: int) -> bool:
         else:
             _allow_mnnvl_resolved = fabric_allocation_supported(device_index)
             source = "fabric allocation probe"
-        logger.info("DeepEP allow_mnnvl=%s (%s)", _allow_mnnvl_resolved, source)
+        logger.info(f"DeepEP allow_mnnvl={_allow_mnnvl_resolved!s} ({source!s})")
     return _allow_mnnvl_resolved
 
 
@@ -99,9 +104,8 @@ else:
 def _get_available_gpu_memory(gpu_id: int, empty_cache: bool = True) -> float:
     if torch.cuda.current_device() != gpu_id:
         logger.warning(
-            "current device is not %s, but %s, which may cause useless memory allocation for torch CUDA context.",
-            gpu_id,
-            torch.cuda.current_device(),
+            f"current device is not {gpu_id!s}, but {torch.cuda.current_device()!s}, "
+            "which may cause useless memory allocation for torch CUDA context.",
         )
     if empty_cache:
         torch.cuda.empty_cache()
@@ -231,7 +235,8 @@ class DeepEPBuffer:
         )
         free_gpu_memory_end = _get_available_gpu_memory(torch.cuda.current_device())
         logger.info(
-            "DeepEPBuffer use memory %s GB", free_gpu_memory_begin - free_gpu_memory_end
+            f"DeepEPBuffer use memory {free_gpu_memory_begin - free_gpu_memory_end!s} "
+            "GB",
         )
         return cls._buffer
 
@@ -298,6 +303,50 @@ class DeepEPBuffer:
         cls._dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
 
 
+def prepare_deepep_buffer(
+    *,
+    group: dist.ProcessGroup,
+    hidden_size: int,
+    num_experts: int,
+    deepep_mode: str,
+    max_dispatch_tokens_per_rank: int | None,
+) -> None:
+    """Reserve shared communication storage before the KV cache is sized.
+
+    All EP ranks call this during common MoE weight processing. It performs no
+    token dispatch and reuses a compatible buffer through the ordinary runtime
+    acquisition path. Kernel-specific dispatcher settings remain unchanged.
+
+    Args:
+        group: The process group used by the selected DeepEP MoE plan.
+        hidden_size: Width of unquantized dispatch inputs, not packed weights.
+        num_experts: Global expert count across the process group.
+        deepep_mode: Selected normal, low_latency or auto communication mode.
+        max_dispatch_tokens_per_rank: Configured source-row capacity; may be
+            None when only normal-mode buffers are required.
+
+    Returns:
+        None. Dispatchers later acquire the same persistent buffer.
+    """
+    if group is None:
+        raise ValueError("DeepEP MoE plan is missing its process_group")
+    if hidden_size <= 0 or num_experts <= 0:
+        raise ValueError("DeepEP hidden size and expert count must be positive")
+    mode = DeepEPMode(deepep_mode)
+    if mode.enable_low_latency() and (
+        max_dispatch_tokens_per_rank is None or max_dispatch_tokens_per_rank <= 0
+    ):
+        raise ValueError("DeepEP low-latency mode requires a positive token capacity")
+    DeepEPBuffer.get_deepep_buffer(
+        group=group,
+        hidden_size=hidden_size,
+        param_bytes=_DEEPEP_BUFFER_ELEMENT_BYTES,
+        deepep_mode=mode,
+        num_max_dispatch_tokens_per_rank=max_dispatch_tokens_per_rank,
+        num_experts=num_experts,
+    )
+
+
 class _DeepEPDispatcherImplBase:
     def __init__(
         self,
@@ -320,7 +369,7 @@ class _DeepEPDispatcherImplBase:
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
 
-        self.params_bytes = 2
+        self.params_bytes = _DEEPEP_BUFFER_ELEMENT_BYTES
         self.num_max_dispatch_tokens_per_rank = low_latency_max_num_tokens_per_gpu
 
         self.handle = None

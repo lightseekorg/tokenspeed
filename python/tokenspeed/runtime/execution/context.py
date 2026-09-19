@@ -32,6 +32,9 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 )
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.execution.dspark_context import (
+        DSparkContextProducer,
+    )
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
@@ -141,6 +144,10 @@ class ForwardContext:
     # by the drafter (prepare_target_forward) for the rounds it overlaps with
     # the target; None means the taps are only collected in aux_hidden_states.
     target_capture_sink: TargetCaptureSink | None = None
+    # Context production carries behavior. Its accumulator stays in the model
+    # forward or travels in PPStageState, never on ctx. A configured producer
+    # owns context cache writes; otherwise the drafter owns them.
+    dspark_context_producer: DSparkContextProducer | None = None
 
 
 @contextmanager

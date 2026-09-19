@@ -391,7 +391,6 @@ def _preprocess_intra_fwd_kernel(
     q_smem.store(normalized_q)
     k_smem.store(normalized_k)
     bg_smem.store(gate_value)
-    gl.barrier()
 
     scan_layout: gl.constexpr = gl.BlockedLayout([1, 2], [4, 8], [1, NUM_WARPS], [1, 0])
     scan_rows = gl.arange(0, BT, layout=gl.SliceLayout(1, scan_layout))
@@ -406,7 +405,6 @@ def _preprocess_intra_fwd_kernel(
     gated_query *= gl.exp(cumulative_gate) * SCALE
     gl.store(qg + scan_offsets, gated_query.to(gl.bfloat16), mask=scan_mask)
     bg_smem.store(cumulative_gate)
-    gl.barrier()
 
     load_layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [NUM_WARPS, 1], [1, 0])
     warp_bases: gl.constexpr = (

@@ -52,6 +52,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     ngram_inputs_for_forward,
     resolve_dspark_prefix_replay_tokens,
     scheduler_cache_group_pages,
+    scheduler_pd_lifecycle,
     should_use_overlap_schedule,
 )
 from tokenspeed.runtime.epd.prefill_hooks import EpdPrefillHooks
@@ -144,7 +145,6 @@ class EventLoop:
         shutdown_event: threading.Event | None = None,
     ) -> None:
         # Do not pass server_args further down the stack after this point.
-
         self.server_args = server_args
         self.port_args = port_args
         self.gpu_id = gpu_id
@@ -327,31 +327,33 @@ class EventLoop:
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
         )
         logger.info(
-            "Scheduler config: prefix_granularity=%s num_device_pages=%s "
-            "max_scheduled_tokens=%s decode_input_tokens=%s "
-            "overlap_schedule_depth=%s disable_l2_cache=%s "
-            "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
-            "disable_prefix_cache=%s prefix_replay_tokens=%s "
-            "cache_groups=%s",
-            scheduler_cfg.prefix_granularity,
-            scheduler_cfg.num_device_pages,
-            scheduler_cfg.max_scheduled_tokens,
-            scheduler_cfg.decode_input_tokens,
-            scheduler_cfg.overlap_schedule_depth,
-            scheduler_cfg.disable_l2_cache,
-            scheduler_cfg.max_batch_size,
-            server_args.max_num_seqs,
-            self.dp_size,
-            scheduler_cfg.disable_prefix_cache,
-            scheduler_cfg.prefix_replay_tokens,
-            [group.group_id for group in cache_groups],
+            f"Scheduler config: prefix_granularity={scheduler_cfg.prefix_granularity!s}"
+            f" num_device_pages={scheduler_cfg.num_device_pages!s} "
+            f"max_scheduled_tokens={scheduler_cfg.max_scheduled_tokens!s} "
+            f"decode_input_tokens={scheduler_cfg.decode_input_tokens!s} "
+            f"overlap_schedule_depth={scheduler_cfg.overlap_schedule_depth!s} "
+            f"disable_l2_cache={scheduler_cfg.disable_l2_cache!s} "
+            f"max_batch_size={scheduler_cfg.max_batch_size!s} (global max_num_seqs="
+            f"{server_args.max_num_seqs!s}, dp_size={self.dp_size!s}) "
+            f"disable_prefix_cache={scheduler_cfg.disable_prefix_cache!s} "
+            f"prefix_replay_tokens={scheduler_cfg.prefix_replay_tokens!s} "
+            f"cache_groups={[group.group_id for group in cache_groups]!s}",
         )
         self.scheduler = Scheduler(scheduler_cfg)
         # Per-round batch logging lives on the control plane: it reports
         # scheduler quantities (queue depth, page usage) that the loop already
         # samples, and its counters stay on this thread.
         self._batch_logger = BatchLogger(
-            enabled=global_rank == 0,
+            # One TP representative per attention-DP scheduler makes load skew
+            # visible. Every pipeline stage runs the same scheduler and sees
+            # the same plan, so only the first stage speaks for it.
+            enabled=attn_tp_rank == 0 and (not mapping.has_pp or mapping.pp_rank == 0),
+            dp_rank=dp_rank,
+            pd_lifecycle=(
+                scheduler_pd_lifecycle(self.scheduler)
+                if server_args.disaggregation_mode != "null"
+                else None
+            ),
             decode_log_interval=server_args.decode_log_interval,
             # Usable pages, the same total the load snapshot and the
             # Prometheus gauge publish, so the three never disagree.
@@ -365,11 +367,9 @@ class EventLoop:
         self.max_model_len = min(
             self.model_config.context_len, self.max_single_request_tokens
         )
-        input_reserve = (
-            1
-            if server_args.disaggregation_mode == "prefill"
-            else max(decode_input_tokens, 1)
-        )
+        # Every role reserves the first decode/verify window behind the prompt:
+        # a decoding role to verify into it, the prefill role to draft into it.
+        input_reserve = max(decode_input_tokens, 1)
         self.max_req_input_len = self.max_model_len - input_reserve
         if self.max_req_input_len < 1:
             raise RuntimeError(
@@ -378,11 +378,9 @@ class EventLoop:
                 f"{self.max_single_request_tokens}, reserve={input_reserve}"
             )
         logger.info(
-            "Single-request token limit: cache=%s model=%s effective=%s max_input=%s",
-            self.max_single_request_tokens,
-            self.model_config.context_len,
-            self.max_model_len,
-            self.max_req_input_len,
+            f"Single-request token limit: cache={self.max_single_request_tokens!s} "
+            f"model={self.model_config.context_len!s} effective={self.max_model_len!s} "
+            f"max_input={self.max_req_input_len!s}",
         )
         if attn_tp_rank == 0:
             self.kv_event_publisher = EventPublisherFactory.create(
@@ -975,16 +973,17 @@ class EventLoop:
                 # advance_scheduler call at the tail.
                 request_changes = []
                 forward_op = None
-                # An idle round (freeze or DP idle) runs no dispatch and no
-                # kv-transfer event poll.
-                idle_round = False
+                # A deliberate pause freezes scheduling progress. DP idle only
+                # replaces this rank's model forward; bootstrap, admission and
+                # transfer completion still have to advance on every round.
+                paused_round = False
 
                 if self._pause.forward_blocked:
                     # Freeze: dispatched forwards can't be un-launched; commit them
                     # all before idling.
                     request_changes.extend(self._drain_in_flight(in_flight))
                     self._pause_hooks.paused_idle_step()
-                    idle_round = True
+                    paused_round = True
                 else:
                     execution_plan = self.scheduler.next_execution_plan()
                     self._cache_hooks.count_plan_ops(execution_plan)
@@ -1001,20 +1000,19 @@ class EventLoop:
                     # consistent with waiting/pages).
                     self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
 
-                    # DP sync: all ranks must participate even when idle. Checked
-                    # right after forward_op is derived so an idle round commits
-                    # pending steps and skips the per-batch work below (the
-                    # gathers are local and read-only, so ordering them after the
-                    # collective is rank-safe).
+                    # DP sync: all ranks participate even without local model
+                    # work. An idle forward substitutes only the model batch;
+                    # it must not suppress the rest of the scheduler plan.
                     dp_metadata = None
+                    need_idle_forward = False
                     if self.has_dp:
                         dp_metadata = self._dp_sync_and_check(forward_op)
                         if dp_metadata.need_idle_forward:
                             request_changes.extend(self._drain_in_flight(in_flight))
-                            idle_round = True
+                            need_idle_forward = True
 
                     planned = None
-                    if not idle_round and forward_op is not None:
+                    if not need_idle_forward and forward_op is not None:
                         # Gather sampling params and grammar state BEFORE any
                         # pending commit below — a commit can finish requests and
                         # pop them from output_processor.rid_to_state, which would
@@ -1060,12 +1058,12 @@ class EventLoop:
                     # routes. ``planned`` is None on idle/empty rounds — the
                     # plan hygiene still runs.
                     pending = self._device.execute(execution_plan, planned)
-                    if idle_round:
+                    if need_idle_forward:
                         self._device.run_idle_forward(dp_metadata)
                     if pending is not None:
                         in_flight.append((forward_op, pending))
 
-                if not idle_round:
+                if not paused_round:
                     # Commit from the head once the queue exceeds the depth
                     # (immediately at depth 0; one step behind at depth 1; a full
                     # pipeline behind under PP). A round with no new work drains
@@ -1179,7 +1177,7 @@ def run_event_loop(
     # processes may be spawned without inheriting the launcher's setting.
     if envs.NVSHMEM_IB_TRAFFIC_CLASS.is_set():
         envs.NVSHMEM_IB_TRAFFIC_CLASS.set(envs.NVSHMEM_IB_TRAFFIC_CLASS.get())
-        logger.info("NVSHMEM_IB_TRAFFIC_CLASS=%d", envs.NVSHMEM_IB_TRAFFIC_CLASS.get())
+        logger.info(f"NVSHMEM_IB_TRAFFIC_CLASS={envs.NVSHMEM_IB_TRAFFIC_CLASS.get():d}")
     faulthandler.enable()
     parent_process = psutil.Process().parent()
     register_usr_signal()
@@ -1249,18 +1247,15 @@ def run_event_loop(
 
     except Exception:  # noqa: BLE001 - process boundary; report and signal parent
         traceback = get_exception_traceback()
-        logger.error("Scheduler hit an exception: %s", traceback)
+        logger.error(f"Scheduler hit an exception: {traceback!s}")
         parent_process.send_signal(signal.SIGUSR1)
     finally:
         # SystemExit/KeyboardInterrupt bypass the Exception handler above;
         # report their traceback without swallowing or changing the exit status.
         exception_info = sys.exc_info()
         logger.warning(
-            "Scheduler exiting: rank=%d pid=%d shutdown_requested=%s signal=%s",
-            global_rank,
-            os.getpid(),
-            shutdown_event.is_set(),
-            received_signal,
+            f"Scheduler exiting: rank={global_rank:d} pid={os.getpid():d} "
+            f"shutdown_requested={shutdown_event.is_set()!s} signal={received_signal!s}",
             exc_info=exception_info if exception_info[0] is not None else None,
         )
         if event_loop is not None:
@@ -1268,8 +1263,8 @@ def run_event_loop(
                 event_loop.close()
             except Exception:  # noqa: BLE001 - best-effort teardown; signal parent
                 logger.error(
-                    "Scheduler transport shutdown failed: %s",
-                    get_exception_traceback(),
+                    "Scheduler transport shutdown failed: "
+                    f"{get_exception_traceback()!s}",
                 )
                 parent_process.send_signal(signal.SIGUSR1)
         if (

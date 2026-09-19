@@ -133,9 +133,8 @@ class KdaAttnBackend(MambaAttnBackend):
                 f"got {self.kda_backend!r}"
             )
         logger.info(
-            "KDA prefill routes through %s; decode remains on the "
+            f"KDA prefill routes through {self.kda_backend!s}; decode remains on the "
             "platform-selected kernels",
-            self.kda_backend,
         )
 
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:

@@ -161,11 +161,9 @@ def _prefetch_a_data_lds(
         )
     else:
         values = gl.load(a_base_ptr + offsets, mask=mask, other=0)
-        # E4M3 MFMAs share each A row across N-partitioned waves. Finish
-        # reading the old tile before any wave reuses this LDS slot.
-        gl.barrier()
+        # The compiler's LDS dependence analysis orders this store against
+        # the previous tile's cross-wave reads and the reads that follow.
         smem_a_tile.store(values)
-        gl.barrier()
 
 
 @gluon.jit
@@ -742,10 +740,8 @@ def gluon_mxfp4_moe_stage1_e4m3_async_kernel(
             offsets=b_scale_lo_offsets + scale_tile_offset,
         )
         cdna4_async_copy.wait_group(1)
-        # The copy wait is wave-local. A is loaded across four waves but each
-        # N-partitioned MFMA wave consumes every row, so make all LDS writes
-        # visible before the cross-wave reads.
-        gl.barrier()
+        # The copy wait is wave-local; the compiler emits the CTA barrier
+        # that publishes every wave's LDS writes right after the wait.
         a_lo = cdna4_async_copy.load_shared_relaxed(
             smem_a_lo.index(load_slot), dot_a_layout
         )
@@ -785,6 +781,8 @@ def gluon_mxfp4_moe_stage1_e4m3_async_kernel(
         )
         # All N-partitioned waves must finish reading the current A slot
         # before the next iteration reuses it as the async-copy destination.
+        # load_shared_relaxed opts out of the compiler's async-copy hazard
+        # tracking, so this write-after-read barrier stays explicit.
         gl.barrier()
 
     last_tile: gl.constexpr = NUM_K_TILES - 1
@@ -804,7 +802,6 @@ def gluon_mxfp4_moe_stage1_e4m3_async_kernel(
         offsets=b_scale_lo_offsets + last_scale_offset,
     )
     cdna4_async_copy.wait_group(0)
-    gl.barrier()
     a_lo = cdna4_async_copy.load_shared_relaxed(
         smem_a_lo.index(last_slot), dot_a_layout
     )

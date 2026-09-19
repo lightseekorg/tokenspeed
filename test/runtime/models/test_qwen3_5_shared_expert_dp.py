@@ -67,7 +67,7 @@ class TestSharedExpertReplication(unittest.TestCase):
             mlp = _mlp(world_size=world_size, replicate=True)
             self.assertEqual(mlp.gate_up_proj.weight.shape, (2 * INTERMEDIATE, HIDDEN))
 
-    def test_replicated_deep_gemm_fuses_swiglu_quant_with_pdl(self):
+    def test_replicated_deep_gemm_fuses_swiglu_quant(self):
         class FakeGateUp(nn.Module):
             _use_deep_gemm_fp8 = True
 
@@ -107,7 +107,6 @@ class TestSharedExpertReplication(unittest.TestCase):
         scales = torch.empty((3, INTERMEDIATE // 512), dtype=torch.int32)
         with (
             mock.patch.object(qwen3_5_moe, "_is_blackwell", True),
-            mock.patch.object(qwen3_5_moe, "pdl_enabled", return_value=True),
             mock.patch.object(
                 qwen3_5_moe,
                 "fused_swiglu_fp8_ue8m0",
@@ -116,9 +115,7 @@ class TestSharedExpertReplication(unittest.TestCase):
         ):
             output = mlp(torch.randn((3, HIDDEN), dtype=torch.bfloat16))
 
-        fused_args, fused_kwargs = fused.call_args
-        self.assertIs(fused_args[0], gate_up.output)
-        self.assertEqual(fused_kwargs, {"enable_pdl": True})
+        fused.assert_called_once_with(gate_up.output)
         self.assertIs(down.call[0], quantized)
         self.assertIs(down.call[1], scales)
         self.assertIs(down.call[2], torch.bfloat16)

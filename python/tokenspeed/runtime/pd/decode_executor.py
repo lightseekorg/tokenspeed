@@ -120,13 +120,13 @@ class DisaggDecodeExecutor:
                 and poll == TransferPoll.Bootstrapped
             ):
                 logger.debug(
-                    "[decode][generate_events] rid=%s -> BootstrappedEvent", req_id
+                    f"[decode][generate_events] rid={req_id!s} -> BootstrappedEvent",
                 )
                 events.append(PD.BootstrappedEvent(req_id))
                 self._local_states[req_id] = TransferPoll.Bootstrapped
             elif poll == TransferPoll.Failed:
                 logger.warning(
-                    "[decode][generate_events] rid=%s -> FailedEvent", req_id
+                    f"[decode][generate_events] rid={req_id!s} -> FailedEvent",
                 )
                 events.append(PD.FailedEvent(req_id))
                 # Drop the failed receiver so it is not polled again. Without this
@@ -157,9 +157,8 @@ class DisaggDecodeExecutor:
                         spec_candidate_ids,
                     )
                 logger.debug(
-                    "[decode][generate_events] rid=%s -> RemotePrefillDoneEvent bootstrap_token=%s",
-                    req_id,
-                    bootstrap_token,
+                    f"[decode][generate_events] rid={req_id!s} -> "
+                    f"RemotePrefillDoneEvent bootstrap_token={bootstrap_token!s}",
                 )
                 # The C++ FSM extends the token into the TokenContainer as it
                 # applies this event (RemotePrefilling -> PrefillDone).

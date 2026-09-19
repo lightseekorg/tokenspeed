@@ -30,10 +30,12 @@ from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.engine.scheduler_utils import (
     engram_context_len,
     ngram_inputs_for_forward,
@@ -657,9 +659,10 @@ def test_executor_input_capacity_covers_decode_capture(
         enable_nan_detection=False,
     )
     runner = SimpleNamespace(
+        mapping=Mapping(rank=0, world_size=pp_size, pp_size=pp_size),
         model_config=SimpleNamespace(
             hf_text_config=SimpleNamespace(engram_layer_ids=[1], ngram_context_len=3)
-        )
+        ),
     )
     unsupported = pp_size != 1 or depth > 1
     with pytest.raises(NotImplementedError if unsupported else BuffersReady):
@@ -702,11 +705,14 @@ def test_target_runner_passes_model_kwargs_not_context_tensors(buffers, mode):
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.model_runner = runner
     executor.input_buffers = ib
-    executor.config = SimpleNamespace(model_is_mrope=False, pp_size=1)
+    executor.config = SimpleNamespace(
+        model_is_mrope=False, pp_size=1, data_parallel_size=1
+    )
+    executor.attn_backend = SimpleNamespace(prepare_prefill_metadata=Mock())
     executor._active_positions_override = None
     executor._active_multimodal_context = None
     executor.prefill_graph = SimpleNamespace(can_run=lambda ctx, mm: False)
-    ctx = SimpleNamespace(input_num_tokens=num_tokens, forward_mode=mode)
+    ctx = SimpleNamespace(input_num_tokens=num_tokens, forward_mode=mode, bs=1)
     original = vars(ctx).copy()
     result = executor._run_target_forward(ctx)
     assert result["engram_previous_tokens"].shape == (num_tokens, 3)

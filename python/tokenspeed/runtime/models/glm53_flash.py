@@ -949,6 +949,7 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
         )
         self._decode_topk_indices_buffer: torch.Tensor | None = None
         self._decode_topk_lens_buffer: torch.Tensor | None = None
+        self._retired_decode_workspaces: list[torch.Tensor] = []
         self._absorbed_kv_b_version = -1
 
     def _prepare_absorbed_mla_weights(self) -> None:
@@ -1180,7 +1181,6 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
         del topk
         writes_full_workspace = decode_start == 0 and num_decode_tokens == num_tokens
         topk_indices = self._get_decode_topk_workspace(
-            "_decode_topk_indices_buffer",
             num_tokens,
             self.index_topk + self.index_kpool - 1,
             indexer_output.query.device,

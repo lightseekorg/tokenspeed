@@ -64,8 +64,8 @@ class WeightLoader:
             LoadedModel with model and dtype
         """
         logger.info(
-            "Load weight begin. avail mem=%.2f GB",
-            get_available_gpu_memory(device, gpu_id),
+            "Load weight begin. avail mem="
+            f"{get_available_gpu_memory(device, gpu_id):.2f} GB",
         )
 
         # Reduce thread conflicts during weight loading
@@ -110,8 +110,8 @@ class WeightLoader:
                 if callable(getattr(model, "load_kv_cache_scales", None)):
                     model.load_kv_cache_scales(server_args.quantization_param_path)
                     logger.info(
-                        "Loaded KV cache scaling factors from %s",
-                        server_args.quantization_param_path,
+                        "Loaded KV cache scaling factors from "
+                        f"{server_args.quantization_param_path!s}",
                     )
                 else:
                     raise RuntimeError(
@@ -128,10 +128,8 @@ class WeightLoader:
         dtype = model_config.dtype
 
         logger.info(
-            "Load weight end. type=%s, dtype=%s, avail mem=%.2f GB",
-            type(model).__name__,
-            dtype,
-            get_available_gpu_memory(device, gpu_id),
+            f"Load weight end. type={type(model).__name__!s}, dtype={dtype!s}, avail "
+            f"mem={get_available_gpu_memory(device, gpu_id):.2f} GB",
         )
 
         return model

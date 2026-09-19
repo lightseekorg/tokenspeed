@@ -191,10 +191,9 @@ if platform.is_hopper_plus:
     ) -> DeepEPDispatcher:
         """Build (once per plan) the dispatcher owning this layer's DeepEP legs.
 
-        Sizing comes from the plan rather than the live batch: the DeepEP buffer
-        is allocated on first use and reused for every later forward, so a
-        low-latency capacity taken from whichever batch happened to arrive first
-        would leave decode either over-provisioned or too small.
+        Common MoE weight processing reserves the shared buffer from the plan
+        before KV cache profiling. This dispatcher reuses it; a live batch
+        never chooses persistent low-latency capacity.
         """
         dispatcher = plan.get("_deepep_dispatcher")
         if dispatcher is not None:

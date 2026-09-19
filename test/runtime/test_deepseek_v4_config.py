@@ -2180,7 +2180,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         target_head = SimpleNamespace(weight=torch.ones(4, 3), tp_size=2)
         drafter = object.__new__(DeepseekV4DSpark)
         drafter.draft_model = SimpleNamespace(lm_head=draft_head)
-        drafter.target_layer_ids = [1, 3]
         target_model = SimpleNamespace(
             lm_head=target_head,
             logits_processor=SimpleNamespace(tp_group=(0, 1)),
@@ -2189,9 +2188,12 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         drafter.wire_target(target_model)
 
+        self.assertIs(drafter.target_model, target_model)
         self.assertIs(drafter.lm_head, draft_head)
         self.assertEqual(drafter.tp_group, (0, 1))
-        target_model.set_dspark_layers_to_capture.assert_called_once_with([1, 3])
+        # The draft model's configure_target installs the capture layers
+        # before any drafter exists; wiring only binds execution resources.
+        target_model.set_dspark_layers_to_capture.assert_not_called()
 
     def test_dspark_tp_only_contract_uses_resolved_mapping(self):
         mapping = SimpleNamespace(attn=SimpleNamespace(dp_size=1, cp_size=1))
@@ -6877,8 +6879,16 @@ def test_v4_pd_recipe_and_readiness_follow_cache_producers():
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     ).setup()
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
+        CacheLayerOwnership,
+        cache_field_placement,
+    )
+
+    _, schedules = cache_field_placement(
+        setup.spec.memory_plan, (CacheLayerOwnership(3, 0, (0, 3)),)
+    )
     schedule = build_cache_fields_by_producer_step(
-        setup.spec.memory_plan, num_target_layers=3
+        setup.spec.memory_plan, producer_fields_by_step=schedules[0]
     )
     assert schedule.step_count == 3
     assert all(schedule.fields_by_step)
