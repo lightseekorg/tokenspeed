@@ -110,7 +110,10 @@ class OrdinaryRecipe(CacheRecipe):
     @property
     @override
     def max_padding_fraction(self) -> float:
-        return 1.0
+        # One-block packing fixes each group's stride regardless of its layer
+        # count or cache dtype. Small groups can therefore have arbitrary tail
+        # padding; the profiled byte budget still bounds the arena capacity.
+        return float("inf")
 
     @override
     def packing(self, groups: tuple[CacheGroupDeclaration, ...]) -> Mapping[str, int]:
