@@ -2,7 +2,7 @@ tokenspeed-deepep==2.1.0.post20260810
 tokenspeed-deepgemm==2.8.0.post20260911
 tokenspeed-flashmla==1.0.0.post20260910
 tokenspeed-deepselect==1.0.0.post20260910
-tokenspeed-mla==0.2.9
+tokenspeed-mla==0.2.10
 tokenspeed-fast-hadamard-transform==1.1.0.post20260810
 tokenspeed-fa3==3.0.0.post20260810
 tokenspeed-fa4==4.0.0.post20260829
