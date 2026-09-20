@@ -20,11 +20,24 @@ best people and average people is more than tenfold.
 ## Code changes
 
 * Add tests and update docs for the changed code.
-* Avoid default parameter values; pass every argument explicitly at every call
-  site. Explicit arguments matter more than convenience: a default silently
-  supplies a value the caller never chose, so a missing or swallowed argument
-  goes unnoticed instead of failing at the call.
+* Parameters that select execution paths, algorithms, or correctness-critical
+  behavior must be explicit and have no defaults. This includes execution modes,
+  backend selection, and flags that switch between implementations.
+* Genuinely optional inputs may have defaults when omission has a clear meaning
+  within the selected path. Review each default individually; convenience alone
+  does not justify defaulting a behavioral choice.
+* Wrappers must preserve explicitly supplied arguments and must not silently
+  discard unsupported arguments.
 * Use absolute imports instead of relative imports.
+* Use f-strings for Python string interpolation, including logging messages.
+  Keep format templates required by APIs such as `strftime` and logging
+  formatters in their required syntax.
+* Declare and initialize instance fields explicitly in `__init__` or as
+  dataclass fields. Do not attach undeclared attributes after construction.
+  Represent optional state with an initialized field, such as
+  `self.x: int | None = None`, rather than a sometimes-missing attribute.
+  Access fields directly; avoid `hasattr`, `getattr`, and `setattr` for class
+  state, including fallback values that hide missing declarations.
 * Use the repository's full MIT license header for copyright notices; do not use
   an abbreviated copyright-only header.
 * Before creating commits, run `pre-commit run --all-files` to format.
@@ -87,6 +100,24 @@ change.
 * AMD GPU support is currently limited to `gfx950` and `gfx1250`.
 * NPU support targets only one or two specific models. There are currently no
   plans to expand NPU model coverage.
+
+## tokenspeed-scheduler releases
+
+Prefer separate PRs for scheduler code changes and version bumps. A scheduler
+code change does not require a version bump or an immediate release; multiple
+code changes may accumulate until a release is needed.
+
+Follow this sequence:
+
+1. Make and merge code changes under `tokenspeed-scheduler/`.
+2. When ready to release, update `[project].version` in
+   `tokenspeed-scheduler/pyproject.toml` and merge the version bump into `main`.
+3. Trigger the
+   [release-tokenspeed-scheduler workflow](https://github.com/lightseekorg/tokenspeed/actions/workflows/release-tokenspeed-scheduler.yml)
+   from `main`. Wait for the GitHub release and PyPI publication to succeed.
+4. Once the new version is available on PyPI, update the main TokenSpeed
+   project's `tokenspeed-scheduler` dependency requirement in
+   `python/pyproject.toml` through a follow-up PR targeting `main`.
 
 ## tokenspeed-kernel
 

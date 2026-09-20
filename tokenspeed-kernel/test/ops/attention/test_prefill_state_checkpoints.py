@@ -418,6 +418,42 @@ def test_recurrent_input_pack_is_one_semantic_path(
     torch.testing.assert_close(packed.beta_raw, beta_raw.index_select(0, token_indices))
 
 
+def test_recurrent_input_pack_large_transposed_state() -> None:
+    device = _device()
+    tokens = 2
+    query = torch.arange(tokens * 2 * 4, dtype=torch.bfloat16, device=device).view(
+        1, tokens, 2, 4
+    )
+    state = torch.arange(3 * 2 * 128 * 128, dtype=torch.float32, device=device).view(
+        3, 2, 128, 128
+    )
+    state = state.transpose(-1, -2)
+    assert state.stride() == (32768, 16384, 1, 128)
+    rows = torch.tensor([1, 2], dtype=torch.int64, device=device)
+    token_indices = torch.tensor([0, 1], dtype=torch.int64, device=device)
+
+    packed = pack_prefill_recurrent_checkpoint_inputs(
+        query,
+        query,
+        query,
+        state,
+        rows,
+        token_indices,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+    torch.testing.assert_close(
+        packed.recurrent_state,
+        state.index_select(0, rows),
+        rtol=0,
+        atol=0,
+    )
+
+
 @pytest.mark.parametrize("num_rows", [1, 2])
 def test_recurrent_state_scatter_supports_noncontiguous_result(num_rows: int) -> None:
     device = _device()

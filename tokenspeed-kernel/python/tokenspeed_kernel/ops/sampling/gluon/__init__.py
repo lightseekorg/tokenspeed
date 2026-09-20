@@ -60,7 +60,6 @@ if _IMPORT_ERROR_MESSAGE is None:
             "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
         ),
         priority=Priority.SPECIALIZED,
-        tags={"latency", "throughput"},
     )
     def gluon_argmax_gfx950(
         logits: torch.Tensor,
@@ -83,7 +82,6 @@ if _IMPORT_ERROR_MESSAGE is None:
             "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
         ),
         priority=Priority.SPECIALIZED,
-        tags={"latency", "throughput"},
     )
     def gluon_argmax_gfx1250(
         logits: torch.Tensor,

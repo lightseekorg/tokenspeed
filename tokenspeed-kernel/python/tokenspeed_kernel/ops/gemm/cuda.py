@@ -37,7 +37,6 @@ except ImportError:
         "k_match": frozenset({True}),
     },
     priority=Priority.SPECIALIZED,
-    tags={"nvidia", "latency"},
 )
 def cuda_dsv3_dsv4_linear_fp32(
     hidden_states: torch.Tensor,

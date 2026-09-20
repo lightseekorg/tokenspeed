@@ -1,19 +1,92 @@
 # AMD LLM Kernels
 
+## Kernel Conventions
+
+### Barriers
+
+Do not write `gl.barrier()` for shared-memory (LDS) hazards. The Gluon
+compiler's membar analysis tracks every LDS read, write, atomic, async copy,
+and scratch-backed op (layout conversions, reductions, atomic result
+broadcasts), and inserts a CTA barrier immediately before the first conflicting
+access, including across loop back-edges. It also emits a barrier right after
+every `async_copy.wait_group`/`tdm.async_wait`, and the lowering of a
+`release`/`acq_rel` atomic emits one before it (an `acquire` atomic emits one
+after it). A manual barrier next to any of these is a duplicate `s_barrier`, or
+worse, it lands earlier than the compiler's minimal placement and pins the
+instruction schedule.
+
+Keep an explicit `gl.barrier()` only where the compiler cannot see the hazard:
+
+- Ordering global-memory traffic across threads of one workgroup: init stores
+  followed by an overlapping scatter, all-thread stores or atomics that must be
+  issued before one thread bumps a `relaxed` counter, or re-reading a global
+  buffer other threads just wrote. Say what the barrier orders in a comment.
+- `load_shared_relaxed` pipelines. That load opts out of the compiler's
+  async-copy hazard tracking, so the write-after-read against the next
+  `buffer_load_to_shared` into the same slot is the kernel's responsibility.
+  Place the barrier before the copy that reuses the slot.
+
+Iris push collectives also keep explicit workgroup barriers around their
+cross-rank publication protocol. The VMEM drain and system-scope atomics order
+one subgroup's traffic, but the barriers join all producer subgroups before a
+generation is published and all consumer subgroups before the peer inbox is
+read. Removing either rendezvous can potentially increase cross-rank skew and
+regress perf even when the generated kernel remains correct.
+
+## GEMM
+
+### gfx950 dense MXFP8 projection
+
+The gfx950 package provides a prefill-oriented MXFP8 GEMM for DeepSeek V4.1
+dense projections, with portable Triton fallback outside the tuned domain.
+
+#### Contract
+
+- The operation computes `A @ B.T` from K-contiguous E4M3 matrices shaped
+  `[M, K]` and `[N, K]`; padded row strides are accepted.
+- Scales are strided uint8 E8M0 matrices shaped `[M, K/32]` and `[N, K/32]`
+  with an explicit `[1, 32]` scale block.
+- Output is BF16 or FP16. A caller-owned output may have a padded row stride,
+  but its inner stride must be one.
+- The kernel requires `M` and `N` divisible by 256 and `K >= 512` divisible by
+  256. Automatic selection further requires `M >= 1024`, `N >= 1536`, and
+  `K >= 1024`.
+
+#### Algorithm
+
+One workgroup computes a `256 x 256 x 128` tile with eight wave64s. Four
+`128 x 128` accumulator quadrants use native `32 x 32 x 64` E4M3 scaled MFMA.
+Two K tiles are software-pipelined at a time, and phase-shifted MFMA and memory
+stages implement the eight-wave warp-pipeline schedule. XCD-aware grouped tile
+ordering spreads adjacent output tiles across the eight XCDs.
+
+E4M3 values use vectorized asynchronous global-to-LDS copies into separate,
+padded double buffers for A and B. Canonical row-major A scales use dword
+asynchronous copies. Each B-scale copy combines both N quadrants and two K
+steps in one LDS tile, then splits the four MFMA fragments in registers. Two
+waves per EU avoid spills from the longer-lived fragments. Strided scales fall
+back to direct fragment loads, and output uses vectorized buffer stores.
+
 ## Attention
 
 ### DeepSeek V4 attention
 
-The gfx950 package provides MXFP4 index selection, dense-workspace selected
-prefill, and page-planar selected decode. Gfx1250 provides page-planar selected
-decode. Decode reads a sliding-window (SWA) cache and an optional compressed
-cache; both segments share one softmax, and the attention sink is applied once.
+The gfx950 and gfx1250 packages provide MXFP4 index selection. Gfx950 also
+provides dense-workspace selected prefill, while both architectures provide
+page-planar selected decode. Decode reads a sliding-window (SWA) cache and an
+optional compressed cache; both segments share one softmax, and the attention
+sink is applied once.
 
 #### Contract
 
 - The gfx950 MXFP4 indexers support 32 or 64 index heads of dimension 128,
   64-row pages, and top-k 512, 1024, or 2048. Prefill and decode return int32
   logical offsets; `dsv4_plan` preserves graph-stable sequence metadata.
+- The gfx1250 MXFP4 indexers implement the same logical contract for packed
+  E2M1 values with one E8M0 scale per 32 elements. They accept padded page and
+  block-table strides, reject invalid physical pages, and support caller-owned
+  outputs and graph replay. Each page stores its packed key rows followed by
+  the corresponding scale rows.
 - The gfx950 prefill kernel accepts contiguous BF16 queries shaped
   `(tokens, heads, 512)`, a dense BF16 KV workspace, contiguous int32 selected
   indices and lengths, and a contiguous BF16 or FP32 sink. Registered selected
@@ -45,6 +118,16 @@ uses 16-head by 32-row tiles, four wave64s, and 18 fixed KV partitions. Its
 second kernel combines the partial outputs and log-sum-exp values before
 applying the sink.
 
+The gfx1250 indexer scores 64 candidates at a time with native scaled E2M1
+wave32 WMMA, accumulates weighted ReLU scores in FP32, and reuses the gfx1250
+DSA radix top-k. Four waves cover 32 index heads; 64-head inputs reuse the same
+key tile for a second WMMA group. Prefill and smaller decode workloads use
+vectorized CDNA5 buffer loads. Larger decode workloads stage page-planar keys
+and scales through native TDM into padded LDS. Double buffering and a
+one-page-ahead software pipeline overlap these transfers with WMMA scoring
+while keeping the transfer geometry aligned and the number of nearby TDM
+operations bounded.
+
 On gfx1250, decode fuses page-planar dequantization, BF16 wave32 WMMA attention,
 FP32 online softmax, and output reduction. A workgroup covers 32 or 64 query
 heads and 32 selected KV rows with four or eight waves. Shape-based KV
@@ -62,6 +145,28 @@ For `BLOCK_H=64`, `TILE_K=32`, and `HEAD_DIM=512`, one eight-wave workgroup is
 resident per WGP, giving two wave32s per SIMD. The logical shared structures are
 one BF16 Q tile, one BF16 dequantized KV tile, and, on the asynchronous path,
 two raw FP8 buffers. Lifetime reuse keeps the physical LDS allocation unchanged.
+
+### DeepSeek V4.1 CSA2 index selection
+
+The gfx950 scorer uses scaled MXFP4 MFMA; gfx1250 dequantizes keys to BF16
+and uses wave32 WMMA. Both accept 32 padded index heads of dimension 128 and
+64-row, page-planar MXFP4 caches. Launch metadata reports score-capacity FLOPs
+and estimated tensor traffic without reading device-resident sequence lengths.
+
+The `tokenspeed-kernel` adapter owns query preparation, validation, and sorted
+row/block selection. Gluon accepts one local or replicated shard with 1..32
+heads and the 68-byte MXFP4 index format; sharded heads, wider head counts, and
+132-byte FP8 index rows use portable Triton. Full selection scores the configured
+page-table capacity without reading device lengths on the host. Its query tile
+shrinks with history width to keep FP32 logits within 32 MiB (at most 256
+queries at 32K rows, 64 at 128K, and 8 at 1M). Reindex scores at most the
+candidate-list capacity. Score CTAs honor the caller's row-chunk bound up to the
+256-row tuned maximum; masked 32-row hardware tiles cover smaller bounds. Arena
+page strides are preserved without copying the full cache; a non-unit stride
+between page bytes is normalized to contiguous storage before scoring. Missing
+or out-of-range cache pages never contribute rows or blocks, including the
+newest visible block. A valid newest block remains eligible regardless of its
+score.
 
 ## Sampling
 

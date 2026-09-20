@@ -322,7 +322,7 @@ class ForwardStepRunner:
             ]
             capture_range = tqdm.tqdm(capture_items) if rank == 0 else capture_items
             if rank == 0:
-                logger.info("Capturing batches: %s", self.capture_bs)
+                logger.info(f"Capturing batches: {self.capture_bs!s}")
             for variant, bs in capture_range:
                 if rank == 0:
                     avail_mem = get_available_gpu_memory(

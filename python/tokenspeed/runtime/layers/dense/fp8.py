@@ -46,6 +46,7 @@ from tokenspeed.runtime.layers.parameter import (
 from tokenspeed.runtime.layers.quantization.base_config import LinearMethodBase
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.quantization.utils import convert_to_channelwise
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 class Fp8LinearMethod(LinearMethodBase):
@@ -208,6 +209,21 @@ class Fp8LinearMethod(LinearMethodBase):
                         grouped_output_projection_plan,
                         layer.weight.data,
                         layer.weight_scale_inv.data,
+                    )
+                )
+                return
+            # This opt-in applies across models, but only to the standard
+            # 128x128 block-FP8 contract. Specialized/grouped projections,
+            # MXFP8 and per-tensor FP8 keep their existing implementations.
+            backend = global_server_args_dict["dense_gemm_backend"]
+            if backend == "trtllm_cutedsl" and tuple(
+                self.quant_config.weight_block_size
+            ) == (128, 128):
+                layer._prepared_fp8_linear = (
+                    tokenspeed_kernel.prepare_trtllm_cutedsl_fp8_linear(
+                        layer.weight.data,
+                        layer.weight_scale_inv.data,
+                        self.quant_config.weight_block_size,
                     )
                 )
                 return

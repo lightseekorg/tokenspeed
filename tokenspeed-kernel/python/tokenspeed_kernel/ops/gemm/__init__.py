@@ -34,6 +34,7 @@ import tokenspeed_kernel.ops.gemm.gluon  # noqa: F401
 import tokenspeed_kernel.ops.gemm.ll_bf16  # noqa: F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
+import tokenspeed_kernel.ops.gemm.trtllm_cutedsl  # noqa: F401
 import torch
 from tokenspeed_kernel.ops.gemm.deep_gemm import (
     _warmup_deep_gemm_fp8_linears,
@@ -111,6 +112,7 @@ __all__ = [
     "kimi3_shared_situ_projection",
     "mm",
     "prepare_fp8_linear",
+    "prepare_trtllm_cutedsl_fp8_linear",
     "prepare_nvfp4_a16_weights",
     "warmup_prepared_fp8_linears",
 ]
@@ -225,7 +227,7 @@ def prepare_fp8_linear(
             )
         if not enable_pdl:
             return _PreparedFp8Linear(
-                override="triton_mm_fp8_blockscale",
+                override=(None if platform.is_cdna4 else "triton_mm_fp8_blockscale"),
                 block_size=(block_n, block_k),
             )
 
@@ -293,6 +295,46 @@ def quantize_fp8_group32_for_linear(
         enable_pdl=False,
         override="triton_quantize_fp8_group32_ue8m0",
         solution=None,
+    )
+
+
+def prepare_trtllm_cutedsl_fp8_linear(
+    weight: torch.Tensor,
+    weight_scales: torch.Tensor,
+    block_size: tuple[int, int] | list[int],
+) -> object:
+    """Prepare original-scale block-FP8 GEMM and compile before graph capture.
+
+    Args:
+        weight: Contiguous CUDA E4M3 [N,K], with N and K divisible by 128.
+        weight_scales: Canonical FP32 [N/128,K/128] checkpoint scales.
+        block_size: Must be (128,128).
+    Returns:
+        An opaque fp8_linear plan; weight values and scales are not modified.
+    """
+    platform = current_platform()
+    if not platform.is_nvidia or not platform.is_blackwell:
+        raise RuntimeError("TRT-LLM CuTe-DSL block-FP8 requires Blackwell")
+    if (
+        tuple(block_size) != (128, 128)
+        or weight.ndim != 2
+        or weight.dtype != torch.float8_e4m3fn
+        or not weight.is_cuda
+        or not weight.is_contiguous()
+        or any(d == 0 or d % 128 for d in weight.shape)
+        or weight_scales.dtype != torch.float32
+        or weight_scales.device != weight.device
+        or weight_scales.shape != (weight.shape[0] // 128, weight.shape[1] // 128)
+    ):
+        raise ValueError(
+            "TRT-LLM CuTe-DSL requires aligned E4M3 weights and canonical 128x128 FP32 scales"
+        )
+    from tokenspeed_kernel.thirdparty.trtllm_blockwise import prepare
+
+    prepare(weight.device)
+    return _PreparedFp8Linear(
+        override="trtllm_cutedsl_mm_fp8_blockscale",
+        block_size=(128, 128),
     )
 
 
@@ -1090,6 +1132,13 @@ def _online_quantize_mxfp8(
             scale_ue8m0=_platform.is_blackwell_plus,
             enable_pdl=enable_pdl,
         )
+    elif kernel_name == "trtllm_cutedsl_mm_fp8_blockscale":
+        from tokenspeed_kernel.ops.gemm.fp8_utils import (
+            flashinfer_fp8_blockscale_quantize_prepacked,
+        )
+
+        values, scales = flashinfer_fp8_blockscale_quantize_prepacked(A, block_k)
+        return values[: A.shape[0]], scales[:, : A.shape[0]].T
     elif kernel_name == "flashinfer_mm_fp8_blockscale":
         from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 
@@ -1237,6 +1286,10 @@ def mm(
         block_scale_layout = "flashinfer_mn"
 
     traits: dict[str, object] = {
+        # TODO: the following list is growingly large--clean up them.
+        "M": M,
+        "N": N,
+        "K": K,
         "n_align_16": N % 16 == 0,
         "k_align_16": K % 16 == 0,
         "k_align_32": K % 32 == 0,
@@ -1248,6 +1301,9 @@ def mm(
         "k_min_128": K >= 128,
         "block_scale_layout": block_scale_layout,
         "pdl_enabled": pdl_enabled(),
+        "a_inner_stride_one": A.stride(-1) == 1,
+        "b_inner_stride_one": B.stride(-1) == 1,
+        "out_dtype": out_dtype,
     }
 
     signature = _gemm_format_signature(

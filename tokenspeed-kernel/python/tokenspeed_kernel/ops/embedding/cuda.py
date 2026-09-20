@@ -51,7 +51,6 @@ if platform.is_nvidia:
             "has_q_out": frozenset({True, False}),
             "has_k_out": frozenset({True, False}),
         },
-        tags={"latency"},
     )
     def cuda_embedding_rope(
         *,

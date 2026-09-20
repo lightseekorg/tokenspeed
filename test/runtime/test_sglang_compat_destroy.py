@@ -71,6 +71,7 @@ class ModelRunnerDestroyIdempotentTest(unittest.TestCase):
         from tokenspeed.runtime.execution.model_runner import ModelRunner
 
         runner = object.__new__(ModelRunner)  # bypass __init__/model load
+        runner._weight_update_pg = None
         ok, msg = runner.destroy_weights_update_group(None)
 
         self.assertTrue(ok)

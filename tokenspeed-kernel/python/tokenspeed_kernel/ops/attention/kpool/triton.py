@@ -327,7 +327,6 @@ def _select_pools_dense(
     signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
     traits=_TRAITS,
     priority=Priority.PORTABLE,
-    tags={"portability", "kpool", "dense-score"},
 )
 def triton_dense_kpool_decode_topk(
     q: torch.Tensor,
@@ -455,7 +454,6 @@ def triton_dense_kpool_decode_topk(
     signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
     traits=_TRAITS,
     priority=Priority.PORTABLE,
-    tags={"portability", "kpool"},
 )
 def triton_kpool_prefill_topk(
     q: torch.Tensor,

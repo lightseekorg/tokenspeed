@@ -9,6 +9,9 @@ set -e
 # Hand off to the ROCm-specific script when running on an AMD runner.
 # ============================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ "${CUDA_VARIANT:-}" = "cu129" ]; then
+    exec python3 "${SCRIPT_DIR}/install_deps_cu129.py"
+fi
 source "${SCRIPT_DIR}/package_cache.sh"
 AMD_RUNNER_LABEL_PATTERNS=(*mi350* *mi355* *mi35x*)
 
@@ -285,6 +288,32 @@ if [ "${CUDA_VERSION%%.*}" = "13" ]; then
         ln -sf /usr/local/cuda/bin/ptxas "${TRITON_BIN}/ptxas" 2>/dev/null || run_as_root ln -sf /usr/local/cuda/bin/ptxas "${TRITON_BIN}/ptxas" 2>/dev/null || true
     fi
 fi
+
+echo "=== Verify installed Torch and native kernel dependencies ==="
+python3 - "${CUDA_REQ}" "${THIRDPARTY_REQ}" "${CUINDEX}" <<'PY'
+import importlib.metadata
+import sys
+from pathlib import Path
+
+import torch
+from packaging.requirements import Requirement
+
+requirements = {}
+for path in sys.argv[1:3]:
+    for line in Path(path).read_text().splitlines():
+        if line.startswith(("torch==", "tokenspeed-trtllm-kernel==", "tokenspeed-cutedsl-kda==")):
+            requirement = Requirement(line)
+            requirements[requirement.name] = requirement
+for name in ("torch", "tokenspeed-trtllm-kernel", "tokenspeed-cutedsl-kda"):
+    installed = torch.__version__ if name == "torch" else importlib.metadata.version(name)
+    print(f"Installed {name}=={installed}", flush=True)
+    if installed not in requirements[name].specifier:
+        raise SystemExit(f"Installed {name}=={installed} does not satisfy {requirements[name]}")
+expected_cuda = f"{sys.argv[3][:-1]}.{sys.argv[3][-1]}"
+print(f"Torch CUDA runtime: {torch.version.cuda}", flush=True)
+if torch.version.cuda != expected_cuda:
+    raise SystemExit(f"Expected Torch CUDA {expected_cuda}, got {torch.version.cuda}")
+PY
 
 echo ""
 echo "=========================================="

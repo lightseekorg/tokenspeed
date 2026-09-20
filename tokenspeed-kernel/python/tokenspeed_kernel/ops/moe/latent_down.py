@@ -143,8 +143,8 @@ def _decline(reason: str) -> None:
     if reason not in _DECLINED:
         _DECLINED.add(reason)
         logger.info(
-            "Kimi-K3 down mailbox unavailable (%s); the projection stays replicated",
-            reason,
+            f"Kimi-K3 down mailbox unavailable ({reason!s}); the projection stays "
+            "replicated",
         )
     return None
 

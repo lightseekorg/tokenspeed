@@ -24,6 +24,24 @@ and reclaims inside the same `Admit` (`advanceRequestProgress` in
 and builds it; see [cache-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)
 for why publication rides with admission).
 
+When L3 Host prefetch cannot allocate every probed page, `Admit` shortens
+`host_prefix_tokens` and rounds that length down to `prefix_granularity`
+(the identity boundary every group's `block_granularity` divides).
+`acquireHostWithKeys` re-runs the non-prefix-closed matcher at that bound
+and reconverges the groups: truncating a sliding-window or Mamba hits
+mask (for example `[0, 1, 1]` to `[0, 1]`, with a five-token window and
+two-token blocks requiring two lookback pages) can leave the first live
+lookback page as a hole, and a full re-probe would see the same L3 keys
+as a complete hit again. Retry count is the probed Host span in prefix
+pages, not a fixed cap, so a long window/Mamba hit can shrink to the
+Device floor instead of asserting. `schedulePrefillFirstChunk` then frees that
+attempt — including the discarded `AdmissionResult`, whose `load_pairs`
+pin Host sources and Device destinations independently of the tables —
+and retries from the shortened probe so `hit_tokens` / `tokens_this_round`
+match the tables. Each retry recomputes the reserve from the cache group's
+declared `block_granularity`, using the same reservation interface as later
+prefill chunks.
+
 Two adjustments ride on top of the raw chunk size. Both are pure token
 arithmetic kept out of the planner: how a chunk is cut lives in
 `scheduler/operations/prefill_chunk.h` (`PrefillChunkTokens` is the one
@@ -536,9 +554,16 @@ Prefilling again, but its generated tokens still exist (an earlier
 retraction rebased them into its prefill window), and its standing survives.
 A store-less fused retraction is not in this ordering at all — it has no L2
 pages to load back, so it re-prefills through the ordinary admission path
-(`admitsLikeNewPrompt`). There is no queue to keep in step with the FSM: a
-request that finishes or aborts while retracted simply stops qualifying,
-with no bookkeeping to prune. Nor is bounded replay (§1.3) carried across a
+(`admitsLikeNewPrompt`). The runtime can also emit `forward::Retract` without
+a Host snapshot: an L3 prefetch that missed after Admit. Dest pages were
+not filled, so publishing would cache empty KV; the request re-prefills
+the same way. Mixed partners in that forward retract together so ranks
+stay aligned, and a D-role `plan.remote_prefill` admission retracts with
+them — the peer pull is withheld so suffix-only KV cannot land on empty
+prefix pages. The client is not failed. There is no queue to keep in
+step with the FSM: a request that finishes or aborts while retracted
+simply stops qualifying, with no bookkeeping to prune.
+Nor is bounded replay (§1.3) carried across a
 retraction: the readmission re-probes and derives its replay window from the
 new hit, and the L2 snapshot never holds a replayable group's pages.
 

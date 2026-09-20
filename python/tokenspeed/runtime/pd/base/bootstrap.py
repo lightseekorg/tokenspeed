@@ -177,10 +177,8 @@ class DisaggBootstrapServerBase:
                 "rank_port": rank_port,
             }
             logger.debug(
-                "Register prefill bootstrap: %s with rank_ip: %s and rank_port: %s",
-                engine_rank,
-                rank_ip,
-                rank_port,
+                f"Register prefill bootstrap: {engine_rank!s} with rank_ip: {rank_ip!s}"
+                f" and rank_port: {rank_port!s}",
             )
 
         return web.Response(text="OK", status=200)
@@ -264,7 +262,7 @@ class DisaggBootstrapServerBase:
                 logger.exception("Bootstrap server failed after startup")
             else:
                 self._startup_error = exc
-                logger.error("Bootstrap server startup failed: %s", str(exc))
+                logger.error(f"Bootstrap server startup failed: {str(exc)!s}")
         finally:
             # Wake a constructor waiting for startup even when loop creation,
             # runner setup, or TCP bind failed.

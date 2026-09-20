@@ -69,6 +69,30 @@ def _block_size_m(num_tokens: int, top_k: int, num_experts: int) -> int:
     return block
 
 
+def _swiglu_limit(w: torch.nn.Module) -> float | None:
+    """The checkpoint's SwiGLU clamp, or None for a plain ``silu(gate) * up``.
+
+    The clamp is the only SwiGLU knob this path can honor: ``silu_and_mul``
+    clips ``gate`` from above and ``up`` on both sides. A sigmoid multiplier
+    (``alpha``) or an up-branch offset (``swiglu_beta``) has no Marlin
+    epilogue, so it is rejected instead of silently dropped.
+    """
+    swiglu_arg = getattr(w, "swiglu_arg", None)
+    alpha = None if swiglu_arg is None else getattr(swiglu_arg, "alpha", None)
+    # swiglu_beta lives on the module independently of swiglu_arg, so check it
+    # even when no SwiGLU args were attached.
+    beta = getattr(w, "swiglu_beta", None)
+    if alpha not in (None, 1.0) or beta not in (None, 0.0):
+        raise ValueError(
+            "Marlin MXFP4 MoE supports only standard SwiGLU with an optional "
+            f"clamp limit; got alpha={alpha!r}, swiglu_beta={beta!r}"
+        )
+    if swiglu_arg is None:
+        return None
+    limit = getattr(swiglu_arg, "limit", None)
+    return None if limit is None else float(limit)
+
+
 def marlin_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
     """Repack loader-format MXFP4 experts into the Marlin layout, once.
 
@@ -184,7 +208,13 @@ def marlin_mxfp4_precomputed_moe_apply(
     """Apply a Marlin W4A16 MXFP4 MoE with precomputed routing.
 
     Args:
-        plan: MoE plan; ``activation`` selects the GEMM1 epilogue.
+        plan: MoE plan; ``activation`` selects the GEMM1 epilogue: ``situ``
+            reads ``w.activation_situ_beta``/``activation_situ_linear_beta``;
+            ``silu``/``swiglu`` compute ``silu(gate) * up`` clamped to
+            ``w.swiglu_arg.limit`` when the checkpoint sets one (``gate`` from
+            above, ``up`` on both sides). A SwiGLU ``alpha`` other than 1 or a
+            non-zero ``w.swiglu_beta`` is rejected: Marlin has no epilogue for
+            them.
         x: bf16 hidden states ``[tokens, hidden]``.
         w: Module holding Marlin-repacked ``w13_weight``/``w2_weight`` (int32)
             and permuted ``w13_weight_scale``/``w2_weight_scale``
@@ -309,7 +339,7 @@ def marlin_mxfp4_local_moe_apply(
     else:
         from tokenspeed_kernel.ops.activation.triton import silu_and_mul
 
-        intermediate2 = silu_and_mul(intermediate1)
+        intermediate2 = silu_and_mul(intermediate1, limit=_swiglu_limit(w))
 
     # GEMM2: fold the route weights in (mul_topk_weights) so finalize is a
     # plain sum over top_k. EP-masked routes wrote nothing, so zero-init c.

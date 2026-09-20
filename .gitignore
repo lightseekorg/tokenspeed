@@ -156,6 +156,8 @@ cython_debug/
 *.dylib
 *.dll
 *.so.*
+# Local CUDA build identities contain host-specific toolchain paths.
+tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cuda/objs/**/build-identity.*
 
 # Fortran module files
 *.mod

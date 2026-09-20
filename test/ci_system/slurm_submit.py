@@ -236,7 +236,7 @@ def source_pr_summary(value: str) -> str:
 
 def print_target(repo: Path, source_pr: str | None, test_commit: str) -> None:
     if source_pr is None:
-        print("Target: latest main", flush=True)
+        print("Target: current checkout", flush=True)
         print(f"Target commit: {test_commit}", flush=True)
         return
 

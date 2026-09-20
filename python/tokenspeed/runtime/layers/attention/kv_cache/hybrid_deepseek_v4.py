@@ -485,13 +485,10 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
         self._bind_layer_planes()
 
         logger.info(
-            "Initialized DeepSeek V4 cache pool: %d parents, P=%d, %d layers, "
-            "fp4 indexer=%s, compressed block sizes=%s",
-            plan.num_lcm_blocks,
-            prefix_granularity,
-            layer_num,
-            layout.use_fp4_indexer_cache,
-            self.compressed_block_sizes,
+            f"Initialized DeepSeek V4 cache pool: {plan.num_lcm_blocks:d} parents, P="
+            f"{prefix_granularity:d}, {layer_num:d} layers, "
+            f"fp4 indexer={layout.use_fp4_indexer_cache!s}, compressed block sizes="
+            f"{self.compressed_block_sizes!s}",
         )
 
     # A ratio-1 layer plans no compressed/state planes and only ratio-4 plans

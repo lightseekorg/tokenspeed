@@ -36,10 +36,15 @@ from unittest.mock import patch
 import pytest
 import torch
 import torch.distributed as dist
-from flashinfer.autotuner import AutoTuner
-from tokenspeed_kernel import moe_apply, moe_plan, moe_process_weights
-from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
-from tokenspeed_kernel.ops.tuning import (
+from utils import is_nvidia
+
+if not is_nvidia():
+    pytest.skip("NVIDIA GPU required", allow_module_level=True)
+
+from flashinfer.autotuner import AutoTuner  # noqa: E402
+from tokenspeed_kernel import moe_apply, moe_plan, moe_process_weights  # noqa: E402
+from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize  # noqa: E402
+from tokenspeed_kernel.ops.tuning import (  # noqa: E402
     autotune,
     get_autotune_max_num_tokens,
     set_autotune_max_num_tokens,

@@ -80,7 +80,6 @@ if current_platform().is_hopper_plus:
             "prefill_plan": frozenset({True}),
         },
         priority=Priority.PERFORMANT,
-        tags={"deep_gemm", "kpool", "ragged-prefill"},
     )
     def deep_gemm_kpool_prefill_topk(
         q: torch.Tensor,

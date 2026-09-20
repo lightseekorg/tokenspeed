@@ -346,7 +346,6 @@ def _register_cute_argmax(fn):
             "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
         ),
         priority=Priority.SPECIALIZED,
-        tags={"latency", "determinism"},
     )(fn)
 
 

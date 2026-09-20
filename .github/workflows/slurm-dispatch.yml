@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       pr:
-        description: "Optional pull request number or URL; blank runs latest main"
+        description: "Optional pull request number or URL; blank runs the selected workflow ref"
         required: false
         default: ""
         type: string
@@ -103,7 +103,7 @@ on:
           - slurm
 
 concurrency:
-  group: slurm-dispatch-${{ inputs.cluster }}-${{ inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.runners }}-${{ inputs.match }}-${{ inputs.container_image || 'default-image' }}
+  group: slurm-dispatch-${{ inputs.cluster }}-${{ github.ref }}-${{ inputs.pr || 'checkout' }}-${{ inputs.yaml }}-${{ inputs.runners }}-${{ inputs.match }}-${{ inputs.container_image || 'default-image' }}
   cancel-in-progress: false
 
 jobs:
@@ -118,8 +118,9 @@ jobs:
       - name: Checkout trusted dispatcher
         uses: actions/checkout@v4
         with:
-          # pr_worktree fetches and merges the requested private-repo PR below.
-          ref: main
+          # PRs use the main dispatcher and merge in a temporary worktree.
+          # Without a PR, test the exact commit selected for this manual run.
+          ref: ${{ inputs.pr && 'main' || github.sha }}
           fetch-depth: 0
           persist-credentials: true
 

@@ -1140,7 +1140,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name not in params_dict:
-                    logger.warning("Parameter %s not found in params_dict", name)
+                    logger.warning(f"Parameter {name!s} not found in params_dict")
                     continue
                 param = params_dict[name]
 
@@ -1264,7 +1264,7 @@ class Qwen3_5MoeModel(Qwen3_5ForCausalLM):
                     )
                     weight_loader(param, loaded_weight)
                 else:
-                    logger.warning("Parameter %s not found in params_dict", name)
+                    logger.warning(f"Parameter {name!s} not found in params_dict")
             loaded_params.add(name)
 
         return loaded_params
@@ -1564,7 +1564,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             # embed) weight up front, before any rename or params_dict lookup,
             # so none is routed into a None module. self.model is None here, so
             # named_parameters() exposes only visual params.
-            if getattr(self, "encoder_only", False) and "visual" not in name:
+            if self.encoder_only and "visual" not in name:
                 continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
@@ -1601,7 +1601,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
                 if name not in params_dict:
                     if _is_ignored_checkpoint_param(self, name):
                         continue
-                    logger.warning("Parameter %s not found in params_dict", name)
+                    logger.warning(f"Parameter {name!s} not found in params_dict")
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -1690,7 +1690,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             # lookup, or moe_loader.load (which would KeyError on a missing
             # expert param). self.model is None here, so named_parameters()
             # exposes only visual params.
-            if getattr(self, "encoder_only", False) and "visual" not in name:
+            if self.encoder_only and "visual" not in name:
                 continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
@@ -1739,7 +1739,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                     )
                     weight_loader(param, loaded_weight)
                 else:
-                    logger.warning("Parameter %s not found in params_dict", name)
+                    logger.warning(f"Parameter {name!s} not found in params_dict")
             loaded_params.add(name)
 
         return loaded_params

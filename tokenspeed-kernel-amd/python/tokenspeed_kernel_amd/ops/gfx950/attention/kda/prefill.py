@@ -370,7 +370,6 @@ def _preprocess_intra_fwd_kernel(
     q_smem.store(normalized_q)
     k_smem.store(normalized_k)
     bg_smem.store(cumulative_gate)
-    gl.barrier()
 
     load_layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [NUM_WARPS, 1], [1, 0])
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(

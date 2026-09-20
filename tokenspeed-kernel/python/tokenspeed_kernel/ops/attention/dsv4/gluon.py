@@ -51,7 +51,16 @@ if current_platform().is_amd:
         gluon_dsv4_decode_gfx1250 as _dsv4_decode_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4 import (
+        gluon_dsv4_decode_topk_mxfp4_gfx1250 as _dsv4_decode_topk_gfx1250_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4 import (
+        gluon_dsv4_plan_gfx1250 as _dsv4_plan_gfx1250_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4 import (
         gluon_dsv4_prefill_gfx1250 as _dsv4_prefill_gfx1250_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4 import (
+        gluon_dsv4_prefill_topk_mxfp4_gfx1250 as _dsv4_prefill_topk_gfx1250_impl,
     )
 
     _DSV4_MXFP4_SIGNATURE = format_signature(
@@ -80,7 +89,6 @@ if current_platform().is_amd:
         signatures=frozenset({_DSV4_MXFP4_SIGNATURE}),
         traits=_DSV4_MXFP4_TRAITS,
         priority=Priority.SPECIALIZED,
-        tags={"amd", "gfx950", "mxfp4", "sparse", "radix_topk"},
     )
     def gluon_dsv4_prefill_topk_mxfp4_gfx950(*args, **kwargs):
         return _dsv4_prefill_topk_impl(*args, **kwargs)
@@ -98,7 +106,6 @@ if current_platform().is_amd:
         signatures=frozenset({_DSV4_MXFP4_SIGNATURE}),
         traits=_DSV4_MXFP4_TRAITS,
         priority=Priority.SPECIALIZED,
-        tags={"amd", "gfx950", "mxfp4", "sparse", "radix_topk"},
     )
     def gluon_dsv4_decode_topk_mxfp4_gfx950(*args, **kwargs):
         return _dsv4_decode_topk_impl(*args, **kwargs)
@@ -116,10 +123,60 @@ if current_platform().is_amd:
         signatures=frozenset({format_signature()}),
         traits={"page_size": frozenset({64})},
         priority=Priority.SPECIALIZED,
-        tags={"amd", "gfx950", "cuda_graph"},
     )
     def gluon_dsv4_plan_gfx950(**kwargs):
         return _dsv4_plan_impl(**kwargs)
+
+    @register_kernel(
+        "attention",
+        "dsv4_prefill_topk",
+        name="gluon_dsv4_prefill_topk_mxfp4_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset({_DSV4_MXFP4_SIGNATURE}),
+        traits=_DSV4_MXFP4_TRAITS,
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_dsv4_prefill_topk_mxfp4_gfx1250(*args, **kwargs):
+        return _dsv4_prefill_topk_gfx1250_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "dsv4_decode_topk",
+        name="gluon_dsv4_decode_topk_mxfp4_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset({_DSV4_MXFP4_SIGNATURE}),
+        traits=_DSV4_MXFP4_TRAITS,
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_dsv4_decode_topk_mxfp4_gfx1250(*args, **kwargs):
+        return _dsv4_decode_topk_gfx1250_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "dsv4_plan",
+        name="gluon_dsv4_plan_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset({format_signature()}),
+        traits={"page_size": frozenset({64})},
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_dsv4_plan_gfx1250(**kwargs):
+        return _dsv4_plan_gfx1250_impl(**kwargs)
 
     @register_kernel(
         "attention",
@@ -155,7 +212,6 @@ if current_platform().is_amd:
             "extra_page_size": frozenset({64}),
             "metadata_dtypes": frozenset({torch.int32}),
         },
-        tags={"amd", "gfx950", "paged_cache", "selected_attention"},
     )
     def gluon_dsv4_decode_split_gfx950(*args, **kwargs):
         return _dsv4_decode_split_impl(*args, **kwargs)
@@ -186,7 +242,6 @@ if current_platform().is_amd:
             "selected_width": frozenset({128, 384, 512, 640, 768, 1024, 1152}),
             "metadata_dtypes": frozenset({torch.int32}),
         },
-        tags={"amd", "gfx950", "selected_attention"},
     )
     def gluon_dsv4_prefill_gfx950(*args, **kwargs):
         return _dsv4_prefill_impl(*args, **kwargs)
@@ -218,7 +273,6 @@ if current_platform().is_amd:
             "return_lse": frozenset({False}),
             "metadata_dtypes": frozenset({torch.int32}),
         },
-        tags={"amd", "gfx1250", "paged_cache", "selected_attention"},
     )
     def gluon_dsv4_decode_gfx1250(
         q,
@@ -275,7 +329,6 @@ if current_platform().is_amd:
             "selected_width": frozenset({128, 384, 512, 640, 768, 1024, 1152}),
             "metadata_dtypes": frozenset({torch.int32}),
         },
-        tags={"amd", "gfx1250", "selected_attention"},
     )
     def gluon_dsv4_prefill_gfx1250(*args, **kwargs):
         return _dsv4_prefill_gfx1250_impl(*args, **kwargs)

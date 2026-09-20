@@ -292,12 +292,10 @@ def _dsa_wave32_radix_topk_kernel(
     prefix = gl.full([], 0, gl.uint32)
     remaining = gl.full([], topk, gl.int32)
     shared_output_counters.store(counter_zeros)
-    gl.barrier()
 
     # The three-pass schedule resolves the full ordered FP32 key.
     for pass_index in gl.static_range(3):
         shared_histogram.store(histogram_zeros)
-        gl.barrier()
         radix_bits = _RADIX0_BITS
         shift = 32 - _RADIX0_BITS
         if pass_index == 1:
@@ -319,7 +317,6 @@ def _dsa_wave32_radix_topk_kernel(
                 BLOCK_N,
                 pass_index == 0,
             )
-            gl.barrier()
 
         counts = shared_histogram.load(histogram_layout)
         count_pairs = counts.reshape([_MAX_BUCKETS // 2, 2])
@@ -349,7 +346,6 @@ def _dsa_wave32_radix_topk_kernel(
         packed = gl.sum(gl.where(selected_group, packed, 0), axis=0)
         prefix = (prefix << radix_bits) | (packed & 0xFFF)
         remaining -= ((packed >> 12) & 0x7FF).to(gl.int32)
-        gl.barrier()
         if pass_index == 1:
             if ((packed >> 23) & 1) != 0:
                 count_greater = topk - remaining

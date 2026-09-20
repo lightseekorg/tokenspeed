@@ -163,7 +163,6 @@ def _register_tokenspeed_mla_decode_kernel() -> None:
             # dispatcher's contract; a caller that wants LSE keeps the Triton path.
             "return_lse": frozenset({False}),
         },
-        tags={"latency"},
     )
     def tokenspeed_mla_decode_with_kvcache(
         q: torch.Tensor,

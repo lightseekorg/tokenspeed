@@ -84,7 +84,6 @@ if _attn_res_rmsnorm_gfx950_impl is not None:
             "separate_output_eps": frozenset({False, True}),
             "writes_block": frozenset({False, True}),
         },
-        tags={"decode", "prefill", "fusion"},
     )
     def gluon_attn_res_fwd_gfx950(
         *,
@@ -141,7 +140,6 @@ if _attn_res_rmsnorm_gfx950_impl is not None:
             "separate_output_eps": frozenset({False, True}),
             "writes_block": frozenset({False, True}),
         },
-        tags={"decode", "prefill", "fusion", "gfx1250"},
     )
     def gluon_attn_res_fwd_gfx1250(
         *,
@@ -219,7 +217,6 @@ if current_platform().is_amd:
             "sinkhorn_iters": frozenset({20}),
         },
         priority=Priority.SPECIALIZED,
-        tags={"amd", "gfx950", "latency"},
     )
     def gluon_mhc_pre_gfx950(
         residual: torch.Tensor,

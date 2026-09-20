@@ -26,7 +26,6 @@ server:
     --chunked-prefill-size 8192
     --gpu-memory-utilization 0.9
     --disable-kvstore
-    --disable-prefill-graph
     --trust-remote-code
     --max-cudagraph-capture-size 32
     --reasoning-parser deepseek_v31

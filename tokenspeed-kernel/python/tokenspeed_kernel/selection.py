@@ -36,7 +36,6 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "NoKernelFoundError",
     "SelectedKernel",
-    "SelectionObjective",
     "SelectionStrategy",
     "ScoreBreakdown",
     "SelectionOracle",
@@ -77,19 +76,6 @@ class SelectedKernel:
         return f"SelectedKernel(name={self.name!r})"
 
 
-class SelectionObjective(Enum):
-    """Objectives are a closed enum — they directly control scoring logic,
-    so an unknown value would silently fall through with no effect.
-    """
-
-    DEFAULT = "default"  # Balanced heuristic (priority-weighted)
-    LATENCY = "latency"  # Minimize per-call latency
-    THROUGHPUT = "throughput"  # Maximize tokens/second for large batches
-    PORTABILITY = "portability"  # Prefer solutions that work across vendors (Triton)
-    DETERMINISM = "determinism"  # Prefer bit-reproducible implementations
-    DEBUG = "debug"  # Prefer readable implementations (reference, Triton)
-
-
 class SelectionStrategy(Enum):
     HEURISTIC = "heuristic"  # Score-based ranking (default, instant)
     AUTOTUNE = "autotune"  # Benchmark candidates, pick fastest
@@ -99,21 +85,20 @@ class SelectionStrategy(Enum):
 class ScoreBreakdown:
     """Per-kernel scoring breakdown across all dimensions.
 
-    Ranking is lexicographic on ``(oracle, objective, priority)`` — the oracle's
-    per-family knowledge wins first, then objective alignment, with the kernel's
-    declared priority band as the final tiebreaker.
+    Ranking is lexicographic on ``(oracle, priority)`` — the oracle's
+    per-family knowledge wins first, with the kernel's declared priority band
+    as the tiebreaker.
     """
 
     priority: int  # [0, 20) — from KernelSpec.priority
-    objective: int  # 0 or 1 — 1 if the kernel matches the requested objective
     oracle: int  # [0, 20) — per-family oracle adjustment
 
-    def sort_key(self) -> tuple[int, int, int]:
+    def sort_key(self) -> tuple[int, int]:
         """Lex sort key (descending — higher is better)."""
-        return (self.oracle, self.objective, self.priority)
+        return (self.oracle, self.priority)
 
     def __str__(self) -> str:
-        return f"ora={self.oracle} obj={self.objective} pri={self.priority}"
+        return f"ora={self.oracle} pri={self.priority}"
 
 
 class SelectionOracle:
@@ -185,7 +170,6 @@ def _make_cache_key(
     mode: str,
     format_signature: FormatSignature,
     arch: str,
-    objective: SelectionObjective,
     features: frozenset[str] | None,
     traits: dict[str, Any] | None,
     solution: str | None = None,
@@ -198,7 +182,6 @@ def _make_cache_key(
         mode,
         format_signature,
         arch,
-        objective,
         mods_key,
         traits_key,
         solution,
@@ -208,25 +191,6 @@ def _make_cache_key(
 def _score_priority(spec: KernelSpec) -> int:
     """Priority dimension: kernel's inherent quality/maturity."""
     return max(0, min(19, spec.priority))
-
-
-_OBJECTIVE_TAG: dict[SelectionObjective, str] = {
-    SelectionObjective.LATENCY: "latency",
-    SelectionObjective.THROUGHPUT: "throughput",
-    SelectionObjective.PORTABILITY: "portability",
-    SelectionObjective.DETERMINISM: "determinism",
-    SelectionObjective.DEBUG: "determinism",
-}
-
-
-def _score_objective(spec: KernelSpec, objective: SelectionObjective) -> int:
-    """Objective dimension: 1 if the kernel declares the matching tag, else 0.
-
-    DEFAULT returns 0 so every kernel ties on this dimension and ranking
-    falls through to oracle/priority.
-    """
-    tag = _OBJECTIVE_TAG.get(objective)
-    return 1 if tag is not None and tag in spec.tags else 0
 
 
 def _score_oracle(
@@ -244,31 +208,28 @@ def _score_oracle(
 
 def _score(
     spec: KernelSpec,
-    objective: SelectionObjective,
     platform: PlatformInfo,
     traits: dict[str, Any] | None,
 ) -> ScoreBreakdown:
     """Score a kernel across all ranking dimensions."""
     return ScoreBreakdown(
         priority=_score_priority(spec),
-        objective=_score_objective(spec, objective),
         oracle=_score_oracle(spec, platform, traits),
     )
 
 
-def _rank_by_objective(
+def _rank(
     specs: list[KernelSpec],
-    objective: SelectionObjective,
     platform: PlatformInfo,
     traits: dict[str, Any] | None,
 ) -> list[tuple[KernelSpec, ScoreBreakdown]]:
-    """Rank kernels lexicographically by (oracle, objective, priority).
+    """Rank kernels lexicographically by (oracle, priority).
 
     Higher is better. Oracle wins first because per-family oracles encode the
-    most domain knowledge; objective alignment breaks ties next; the kernel's
-    declared priority band is the final tiebreaker.
+    most domain knowledge; the kernel's declared priority band is the
+    tiebreaker.
     """
-    scored = [(spec, _score(spec, objective, platform, traits)) for spec in specs]
+    scored = [(spec, _score(spec, platform, traits)) for spec in specs]
     scored.sort(key=lambda x: x[1].sort_key(), reverse=True)
     return scored
 
@@ -352,7 +313,13 @@ def ref_compatible_with_spec(ref: KernelSpec, spec: KernelSpec) -> bool:
 
 
 def spec_matches_shape_traits(spec: KernelSpec, shape: dict[str, Any]) -> bool:
-    """Return whether a spec's dimension traits match a concrete shape."""
+    """Return whether a spec's dimension traits match a concrete shape.
+
+    The ``mnk_problem_filter`` trait contains predicates with the signature
+    ``(M, N, K) -> bool``. Predicates are evaluated only when all three
+    dimensions are available, consistent with the partial-shape behavior of
+    the exact, alignment, and minimum traits below.
+    """
     exact_traits: dict[str, tuple[str, ...]] = {
         "batch": ("B", "batch"),
         "m": ("M",),
@@ -396,6 +363,12 @@ def spec_matches_shape_traits(spec: KernelSpec, shape: dict[str, Any]) -> bool:
         if isinstance(dim, int) and dim < minimum:
             return False
 
+    problem_filters = spec.traits.get("mnk_problem_filter")
+    m, n, k = shape.get("M"), shape.get("N"), shape.get("K")
+    if problem_filters is not None and all(isinstance(dim, int) for dim in (m, n, k)):
+        if not any(problem_filter(m, n, k) for problem_filter in problem_filters):
+            return False
+
     return True
 
 
@@ -404,7 +377,11 @@ def _filter_by_traits(
     traits: dict[str, Any],
 ) -> list[KernelSpec]:
     """Filter kernels by op-specific trait compatibility."""
-    return [spec for spec in specs if spec_matches_traits(spec, traits)]
+    return [
+        spec
+        for spec in specs
+        if spec_matches_traits(spec, traits) and spec_matches_shape_traits(spec, traits)
+    ]
 
 
 def _resolve_override(
@@ -438,7 +415,6 @@ def _log_selection(
     winner: KernelSpec,
     scored: list[tuple[KernelSpec, ScoreBreakdown]],
     platform: PlatformInfo,
-    objective: SelectionObjective,
 ) -> None:
     """Log selection result if verbose mode is enabled."""
     if not os.environ.get("TOKENSPEED_KERNEL_VERBOSE"):
@@ -447,22 +423,13 @@ def _log_selection(
     breakdown = next((s for spec, s in scored if spec.name == winner.name), None)
     if breakdown:
         logger.info(
-            "[tokenspeed_kernel] %s.%s(%s) -> %s (%s, %s)",
-            family,
-            mode,
-            format_signature,
-            winner.name,
-            breakdown,
-            platform.arch,
+            f"[tokenspeed_kernel] {family!s}.{mode!s}({format_signature!s}) -> "
+            f"{winner.name!s} ({breakdown!s}, {platform.arch!s})",
         )
     else:
         logger.info(
-            "[tokenspeed_kernel] %s.%s(%s) -> %s (%s)",
-            family,
-            mode,
-            format_signature,
-            winner.name,
-            platform.arch,
+            f"[tokenspeed_kernel] {family!s}.{mode!s}({format_signature!s}) -> "
+            f"{winner.name!s} ({platform.arch!s})",
         )
 
 
@@ -483,14 +450,13 @@ def select_kernel(
     *,
     features: frozenset[str] | None = None,
     platform: PlatformInfo | None = None,
-    objective: SelectionObjective = SelectionObjective.DEFAULT,
     traits: dict[str, Any] | None = None,
     solution: str | None = None,
     override: str | None = None,
 ) -> SelectedKernel:
     """Select the best kernel for an operation.
 
-    On first call for a given (family, mode, format_signature, platform, objective, traits,
+    On first call for a given (family, mode, format_signature, platform, traits,
     solution) combination, runs the full selection pipeline. Subsequent calls
     with the same arguments return the cached result — a single dict lookup.
 
@@ -500,7 +466,6 @@ def select_kernel(
         format_signature: Role-indexed tensor format signature
         features: Required operator features (e.g., {"paged"})
         platform: Hardware to match (auto-detected if None)
-        objective: Selection objective (see SelectionObjective enum)
         traits: Op-specific trait values that affect kernel applicability
                (e.g., {"head_dim": 128, "num_kv_heads": 8})
         solution: Restrict selection to a registered solution while preserving
@@ -522,7 +487,6 @@ def select_kernel(
         mode,
         format_signature,
         platform.arch,
-        objective,
         features,
         traits,
         solution,
@@ -577,10 +541,10 @@ def select_kernel(
             _policy.autotune_params,
         )
     else:
-        scored = _rank_by_objective(candidates, objective, platform, traits)
+        scored = _rank(candidates, platform, traits)
         winner = scored[0][0]
 
-    _log_selection(family, mode, format_signature, winner, scored, platform, objective)
+    _log_selection(family, mode, format_signature, winner, scored, platform)
 
     impl = registry.get_impl(winner.name)
     result = SelectedKernel(name=winner.name, impl=impl)
@@ -602,15 +566,11 @@ def _autotune_select(
     Falls back to heuristic ranking when the autotuning infrastructure
     (input generators, benchmark runner) is not yet available.
     """
-    scored = _rank_by_objective(
-        candidates, SelectionObjective.DEFAULT, platform, traits
-    )
+    scored = _rank(candidates, platform, traits)
     winner = scored[0][0]
     logger.debug(
-        "[tokenspeed_kernel:autotune] falling back to heuristic for %s.%s(%s)",
-        family,
-        mode,
-        format_signature,
+        f"[tokenspeed_kernel:autotune] falling back to heuristic for {family!s}."
+        f"{mode!s}({format_signature!s})",
     )
     return winner, scored
 
@@ -639,7 +599,6 @@ def explain_selection(
     *,
     features: frozenset[str] | None = None,
     platform: PlatformInfo | None = None,
-    objective: SelectionObjective = SelectionObjective.DEFAULT,
     traits: dict[str, Any] | None = None,
     solution: str | None = None,
 ) -> str:
@@ -649,14 +608,13 @@ def explain_selection(
 
         Op: attention.decode (bfloat16)
         Platform: NVIDIA H100 (sm_90)
-        Objective: default
-        Ranking: lex (oracle, objective, priority); higher wins
+        Ranking: lex (oracle, priority); higher wins
 
         Candidates (3 matched, 5 registered):
           1. flashinfer_decode  [SELECTED]
-             ora=16 obj=1 pri=14
+             ora=16 pri=14
           2. triton_decode
-             ora=10 obj=0 pri=10
+             ora=10 pri=10
 
         Filtered out:
           - aiter_decode: vendor mismatch (requires amd)
@@ -677,7 +635,7 @@ def explain_selection(
     if traits:
         candidates = _filter_by_traits(candidates, traits)
 
-    scored = _rank_by_objective(candidates, objective, platform, traits)
+    scored = _rank(candidates, platform, traits)
 
     filtered_names = {s.name for s in candidates}
     filtered_out = [s for s in all_specs if s.name not in filtered_names]
@@ -686,8 +644,7 @@ def explain_selection(
         f"Op: {family}.{mode} ({format_signature})",
         f"Platform: {platform.device_name} ({platform.arch})",
         f"Solution: {solution or 'any'}",
-        f"Objective: {objective.value}",
-        "Ranking: lex (oracle, objective, priority); higher wins",
+        "Ranking: lex (oracle, priority); higher wins",
         "",
         f"Candidates ({len(scored)} matched, {len(all_specs)} registered):",
     ]
@@ -768,8 +725,6 @@ def warmup_selection(
             select_kernel(family, mode, format_signature, traits=traits)
         except NoKernelFoundError:
             logger.debug(
-                "[tokenspeed_kernel] warmup: no kernel for %s.%s(%s)",
-                family,
-                mode,
-                format_signature,
+                f"[tokenspeed_kernel] warmup: no kernel for {family!s}.{mode!s}("
+                f"{format_signature!s})",
             )

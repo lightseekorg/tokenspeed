@@ -129,8 +129,8 @@ class DistributedInitializer:
     def initialize(config: DistributedConfig) -> float:
         torch.get_device_module(config.device).set_device(config.gpu_id)
         logger.info(
-            "Init torch distributed begin. Avail mem=%.4f GB",
-            get_available_gpu_memory(config.device, config.gpu_id),
+            "Init torch distributed begin. Avail mem="
+            f"{get_available_gpu_memory(config.device, config.gpu_id):.4f} GB",
         )
         if config.device == "cuda":
             maybe_set_numa_aware_cpu_affinity(config.gpu_id)
@@ -170,6 +170,12 @@ class DistributedInitializer:
         # address; init_process_group is idempotent and handles size 1.
         pg_manager.init_process_group(config.mapping.attn.dcp_group)
         pg_manager.init_process_group(config.mapping.attn.dp_group)
+        if config.mapping.has_attn_cp:
+            # Context-parallel ranks own different token blocks but must
+            # agree on L3 prefix hits before admit. ENABLE_CP folds attn TP
+            # into CP, so attn.tp_group is size 1 and this group is the
+            # replica's cache-owning set inside a stage.
+            pg_manager.init_process_group(config.mapping.attn.cp_group)
         # No-op at the default linear_attn.tp == attn.tp (same group,
         # idempotent).
         pg_manager.init_process_group(config.mapping.linear_attn.tp_group)
@@ -209,21 +215,19 @@ class DistributedInitializer:
                             hidden_dim=config.hidden_size,
                         )
                         logger.info(
-                            "trtllm one-shot all-reduce for group %s: %s",
-                            group,
-                            "enabled" if ok else "unavailable (NCCL fallback)",
+                            f"trtllm one-shot all-reduce for group {group!s}: "
+                            f"{('enabled' if ok else 'unavailable (NCCL fallback)')!s}",
                         )
 
         logger.info(
-            "Init comm buff end. Avail mem=%.4f GB",
-            get_available_gpu_memory(config.device, config.gpu_id),
+            "Init comm buff end. Avail mem="
+            f"{get_available_gpu_memory(config.device, config.gpu_id):.4f} GB",
         )
         mapping = config.mapping
         logger.info(
-            "Current Process distributed state:  global rank: %s  attn_tp_rank: %s  attn_dp_rank: %s",
-            mapping.rank,
-            mapping.attn.tp_rank,
-            mapping.attn.dp_rank,
+            f"Current Process distributed state:  global rank: {mapping.rank!s}  "
+            f"attn_tp_rank: {mapping.attn.tp_rank!s}  attn_dp_rank: "
+            f"{mapping.attn.dp_rank!s}",
         )
 
         # Get minimum available GPU memory across all ranks

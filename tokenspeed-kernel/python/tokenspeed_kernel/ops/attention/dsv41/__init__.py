@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import bounded_group_slots
-from tokenspeed_kernel.selection import SelectionObjective, select_kernel
+from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
@@ -77,7 +77,6 @@ def _kernel(mode: str, x: torch.Tensor):
         format_signature(x=dense_tensor_format(x.dtype)),
         features=None,
         platform=None,
-        objective=SelectionObjective.DEFAULT,
         traits=None,
         solution=None,
         override=None,
@@ -305,7 +304,6 @@ def selected_attention(
         format_signature(x=dense_tensor_format(q.dtype)),
         features=None,
         platform=None,
-        objective=SelectionObjective.DEFAULT,
         traits={"flashmla_eligible": native},
         solution=None,
         override=None,
@@ -377,6 +375,7 @@ def index_topk(
     score_chunk_size: int,
     process_group: torch.distributed.ProcessGroup | None,
     out: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    solution: str | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bounded Full/Reindex scoring, Top-K rows, and optional source candidates.
 
@@ -402,11 +401,14 @@ def index_topk(
             collectives. All head contributions are combined before selection.
         out: Four contiguous int32 destinations ([T, topk], [T],
             [T, candidate_topk], [T]), or None to allocate them.
+        solution: Optional registered implementation restriction. Pass None for
+            automatic kernel selection.
 
     Returns:
         (logical_row_ids, row_lengths, candidate_block_ids, candidate_lengths).
         IDs are position-sorted, packed into valid prefixes, then padded -1.
-        Blocks include the latest visible block even if its score is low.
+        Blocks include the latest visible block with valid cache rows even if
+        its score is low. Missing or out-of-range pages never become candidates.
         Empty history has zero lengths. Equal-score boundary ties may select
         any equivalent subset; no cross-chunk/TP bitwise tie guarantee.
 
@@ -424,7 +426,10 @@ def index_topk(
     reference's intermediate BF16 rounding. Native query tiles cap logits at
     32MiB for paged queries and 128MiB for a zero-row-stride request table.
     That broadcast layout gathers packed history once per call and packs Q
-    once before the score tiles; no payload survives the call.
+    once before the score tiles; no payload survives the call. For unsharded
+    68-byte MXFP4 caches, AMD Gluon Full similarly caps each FP32 logits query
+    tile at 32MiB instead of limiting history width; Reindex scores only the
+    candidate rows.
     """
     from tokenspeed_kernel.ops.attention.dsv41.deep_gemm import (
         is_hopper_indexer_available,
@@ -455,15 +460,28 @@ def index_topk(
         )
         or (row_bytes == 132 and is_hopper_indexer_available())
     )
+    index_k_format = {
+        68: "mxfp4",
+        132: "fp8_scaled",
+    }.get(row_bytes, "unknown")
+    index_shards = 1
+    index_heads = index_q.shape[1]
+    if process_group is not None:
+        index_shards = torch.distributed.get_world_size(process_group)
+        index_heads *= index_shards
     kernel = select_kernel(
         "attention",
         "dsv41_index_topk",
         format_signature(x=dense_tensor_format(index_q.dtype)),
         features=None,
         platform=None,
-        objective=SelectionObjective.DEFAULT,
-        traits={"native_indexer": native},
-        solution=None,
+        traits={
+            "native_indexer": native,
+            "index_heads": index_heads,
+            "index_k_format": index_k_format,
+            "index_shards": index_shards,
+        },
+        solution=solution,
         override=None,
     )
     return kernel(

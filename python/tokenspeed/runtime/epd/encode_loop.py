@@ -83,14 +83,13 @@ def _make_embedding_cache(l1_bytes: int, l2_bytes: int, device: str):
     (VRAM L1 + host-DRAM L2) when the L2 capacity is enabled (``l2_bytes > 0``)."""
     if l2_bytes > 0:
         logger.info(
-            "EPD encode embedding cache: L1(VRAM)=%d MiB, L2(host DRAM)=%d MiB",
-            l1_bytes >> 20,
-            l2_bytes >> 20,
+            f"EPD encode embedding cache: L1(VRAM)={l1_bytes >> 20:d} MiB, L2(host "
+            f"DRAM)={l2_bytes >> 20:d} MiB",
         )
         return TieredEmbeddingCache(l1_bytes, l2_bytes, device=device)
     logger.info(
-        "EPD encode embedding cache: L1(VRAM)=%d MiB (host-DRAM L2 disabled)",
-        l1_bytes >> 20,
+        f"EPD encode embedding cache: L1(VRAM)={l1_bytes >> 20:d} MiB (host-DRAM L2 "
+        "disabled)",
     )
     return EmbeddingCache(l1_bytes)
 

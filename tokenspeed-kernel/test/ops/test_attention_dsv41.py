@@ -124,11 +124,11 @@ def test_compressor_tail_scatter_graph_strides_and_replay(device):
 def test_public_arguments_are_explicit():
     for name in dsv41.__all__:
         fn = getattr(dsv41, name)
-        assert fn.__doc__
-        assert all(
-            p.default is inspect.Parameter.empty
-            for p in inspect.signature(fn).parameters.values()
-        )
+        assert fn.__doc__, name
+        for parameter in inspect.signature(fn).parameters.values():
+            assert (
+                parameter.default is inspect.Parameter.empty
+            ), f"{name}.{parameter.name} must be explicit"
 
 
 @pytest.mark.parametrize("fmt", _LAYOUTS)
@@ -413,7 +413,7 @@ def test_full_top512_and_block_candidates_boundaries(device, visible):
     dsv41.cache_scatter(k, cache, logical_slots, "index")
     lens = torch.tensor([visible], device=device)
     out = dsv41.index_topk(
-        q, weights, cache, table, lens, None, 512, 2048, 8, 1, 256, None, None
+        q, weights, cache, table, lens, None, 512, 2048, 8, 1, 256, None, None, None
     )
     selected, lengths, candidates, candidate_lens = out
     assert lengths.item() == min(512, visible)
@@ -476,6 +476,7 @@ def test_source_uses_block_max_not_top512_and_forces_latest(device):
         512,
         None,
         None,
+        None,
     )
     top, lens, candidates, candidate_lens = result
     assert lens.item() == 512 and candidate_lens.item() == 2048
@@ -498,7 +499,20 @@ def test_reindex_reads_only_candidate_rows_and_reapplies_causality(device):
     )
     with patch.object(implementation, "cache_gather", side_effect=AssertionError):
         top, lengths, blocks, block_lens = dsv41.index_topk(
-            q, weights, cache, table, visible, candidates, 512, 0, 8, 2, 16, None, None
+            q,
+            weights,
+            cache,
+            table,
+            visible,
+            candidates,
+            512,
+            0,
+            8,
+            2,
+            16,
+            None,
+            None,
+            None,
         )
     assert lengths.tolist() == [23, 8, 0]
     assert blocks.shape == (3, 0) and not block_lens.any()
@@ -525,7 +539,7 @@ def test_index_topk_batch_without_any_visible_context(device):
     table = torch.full((96, 1025), -1, dtype=torch.int32, device=device)
     visible = torch.zeros(96, dtype=torch.int32, device=device)
     top, lengths, blocks, block_lens = dsv41.index_topk(
-        q, weights, cache, table, visible, None, 512, 64, 8, 64, 4096, None, None
+        q, weights, cache, table, visible, None, 512, 64, 8, 64, 4096, None, None, None
     )
     torch.cuda.synchronize()
     assert not lengths.any() and not block_lens.any()
@@ -566,7 +580,7 @@ def test_index_topk_selects_top_scores_on_every_index_format(device, fmt, shared
     scores = dsv41.index_score(q, weights, cache, slots, None, None).float()
 
     top, lengths, blocks, block_lens = dsv41.index_topk(
-        q, weights, cache, table, visible, None, 512, 64, 8, 64, 4096, None, None
+        q, weights, cache, table, visible, None, 512, 64, 8, 64, 4096, None, None, None
     )
     torch.cuda.synchronize()
     assert lengths.tolist() == [512, 512, 512, 0]
@@ -590,7 +604,20 @@ def test_index_topk_selects_top_scores_on_every_index_format(device, fmt, shared
     assert (top[3] == -1).all() and (blocks[3] == -1).all()
 
     rerows, relengths, _, _ = dsv41.index_topk(
-        q, weights, cache, table, visible, blocks, 512, 0, 8, 64, 4096, None, None
+        q,
+        weights,
+        cache,
+        table,
+        visible,
+        blocks,
+        512,
+        0,
+        8,
+        64,
+        4096,
+        None,
+        None,
+        None,
     )
     for r in range(3):
         allowed = (
@@ -626,6 +653,7 @@ def test_candidate_block_max_not_sum(device):
         8,
         1,
         8,
+        None,
         None,
         None,
     )
@@ -674,6 +702,7 @@ def test_full_tiles_causal_page_mask_and_output_reuse(device):
                 score_chunk,
                 None,
                 outputs,
+                None,
             )
         assert result is outputs
         for call in finish.call_args_list:
@@ -711,6 +740,7 @@ def test_reject_unbounded_candidate_input(device):
             8,
             1,
             64,
+            None,
             None,
             None,
         )

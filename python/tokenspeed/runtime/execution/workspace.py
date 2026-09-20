@@ -118,10 +118,8 @@ class WorkspacePool:
                     "first capture."
                 )
             logger.info(
-                "workspace block: %.2f MB -> %.2f MB (%s)",
-                block.numel() / (1 << 20),
-                total / (1 << 20),
-                _caller(),
+                f"workspace block: {block.numel() / (1 << 20):.2f} MB -> "
+                f"{total / (1 << 20):.2f} MB ({_caller()!s})",
             )
             # Point _block at an empty tensor first so the old block is
             # actually released, letting the caching allocator serve the new
@@ -142,7 +140,7 @@ class WorkspacePool:
     def freeze(self) -> None:
         """Pin the block's address; growth now raises. Call before graph capture."""
         self._frozen = True
-        logger.info("workspace frozen: %.2f MB", self._block.numel() / (1 << 20))
+        logger.info(f"workspace frozen: {self._block.numel() / (1 << 20):.2f} MB")
 
     def unfreeze(self) -> None:
         """Allow growth again, for reconfiguration that re-runs cache sizing."""

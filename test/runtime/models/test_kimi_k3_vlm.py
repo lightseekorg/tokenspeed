@@ -37,7 +37,7 @@ class _FakeLanguageModel(nn.Module):
         self.forward_kwargs = None
         self.loaded_weights = None
 
-    def forward(self, _ctx, _input_ids, _positions, _out_cache_loc, **kwargs):
+    def forward(self, _ctx, _input_ids, _positions, **kwargs):
         self.forward_kwargs = kwargs
         return kwargs.get("input_embeds")
 
@@ -135,7 +135,6 @@ def test_kimi_k3_forward_splices_prefill_and_skips_decode(monkeypatch):
     args = (
         torch.tensor([1, 2, 3]),
         torch.arange(3),
-        torch.arange(3),
     )
 
     output = model.forward(
@@ -208,7 +207,7 @@ def test_kimi_k3_encoder_only_skips_language_model(monkeypatch):
     with pytest.raises(AttributeError, match="encoder-only"):
         model.get_input_embeddings()
     with pytest.raises(RuntimeError, match="encoder-only"):
-        model.forward(None, None, None, None)
+        model.forward(None, None, None)
 
 
 def test_kimi_k3_encoder_only_drains_stream_and_loads_all_vision_weights(

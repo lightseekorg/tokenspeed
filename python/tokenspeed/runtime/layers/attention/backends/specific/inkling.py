@@ -320,9 +320,9 @@ class InklingAttnBackend(AttentionBackend):
         self.conv_columns = conv_columns_for_pool(cache_pool)
         self._conv_geometry_latched = self._conv_geometry(cache_pool)
         logger.info(
-            "Inkling ShortConv boundary checkpoints: P=%d, groups=%s",
-            cache_pool.arena.plan.prefix_granularity,
-            tuple(self.conv_columns["group_block_tokens"]),
+            "Inkling ShortConv boundary checkpoints: P="
+            f"{cache_pool.arena.plan.prefix_granularity:d}, groups="
+            f"{tuple(self.conv_columns['group_block_tokens'])!s}",
         )
 
     @property

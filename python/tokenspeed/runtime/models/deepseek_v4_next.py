@@ -550,7 +550,7 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
                     continue
                 param = params_dict.get(name)
                 if param is None:
-                    logger.debug("Skipping unmatched DeepSeek V4 MTP weight: %s", name)
+                    logger.debug(f"Skipping unmatched DeepSeek V4 MTP weight: {name!s}")
                     continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)

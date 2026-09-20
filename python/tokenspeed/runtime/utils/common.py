@@ -90,9 +90,8 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
     if (value not in truthy_values) and (value not in falsy_values):
         if value not in _warned_bool_env_var_keys:
             logger.warning(
-                "get_bool_env_var(%s) see non-understandable value=%s and treat as false",
-                name,
-                value,
+                f"get_bool_env_var({name!s}) see non-understandable value={value!s} and"
+                " treat as false",
             )
         _warned_bool_env_var_keys.add(value)
 
@@ -141,10 +140,8 @@ def maybe_set_numa_aware_cpu_affinity(device_id: int) -> None:
 
     proc.cpu_affinity(list(cpu_affinity))
     logger.info(
-        "Worker process %s pinned to %s NUMA-local CPUs for device %s.",
-        proc.pid,
-        len(cpu_affinity),
-        device_id,
+        f"Worker process {proc.pid!s} pinned to {len(cpu_affinity)!s} NUMA-local CPUs "
+        f"for device {device_id!s}.",
     )
 
 
@@ -163,10 +160,9 @@ def get_available_gpu_memory(
 
         if device_module.current_device() != gpu_id:
             logger.debug(
-                "Current device is not %s, but %s, which may cause useless "
+                f"Current device is not {gpu_id!s}, but "
+                f"{device_module.current_device()!s}, which may cause useless "
                 "memory allocation for torch CUDA context.",
-                gpu_id,
-                device_module.current_device(),
             )
 
         if empty_cache:
@@ -413,7 +409,7 @@ def set_ulimit(target_soft_limit=65535):
         try:
             resource.setrlimit(resource_type, (target_soft_limit, current_hard))
         except ValueError as e:
-            logger.warning("Failed to set RLIMIT_NOFILE: %s", e)
+            logger.warning(f"Failed to set RLIMIT_NOFILE: {e!s}")
 
     # stack size
     resource_type = resource.RLIMIT_STACK
@@ -425,7 +421,7 @@ def set_ulimit(target_soft_limit=65535):
                 resource_type, (target_soft_limit_stack_size, current_hard)
             )
         except ValueError as e:
-            logger.warning("Failed to set RLIMIT_STACK: %s", e)
+            logger.warning(f"Failed to set RLIMIT_STACK: {e!s}")
 
 
 def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
@@ -648,7 +644,7 @@ def delete_directory(dirpath):
         # This will remove the directory and all its contents
         shutil.rmtree(dirpath)
     except OSError as e:
-        logger.warning("Failed to delete directory %s: %s", dirpath, e.strerror)
+        logger.warning(f"Failed to delete directory {dirpath!s}: {e.strerror!s}")
 
 
 # Temporary directory for prometheus multiprocess mode
@@ -671,7 +667,9 @@ def set_prometheus_multiproc_dir():
     else:
         prometheus_multiproc_dir = tempfile.TemporaryDirectory()
         os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
-    logger.debug("PROMETHEUS_MULTIPROC_DIR: %s", os.environ["PROMETHEUS_MULTIPROC_DIR"])
+    logger.debug(
+        f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']!s}"
+    )
 
 
 def add_prometheus_middleware(app):
@@ -889,7 +887,7 @@ def debug_timing(func):
             num_tokens = len(indices) if indices is not None else 0
             throughput = num_tokens / elapsed * 1000 if elapsed > 0 else 0
             logger.debug(
-                "Transfer time: %s ms, throughput: %s tokens/s", elapsed, throughput
+                f"Transfer time: {elapsed!s} ms, throughput: {throughput!s} tokens/s",
             )
             return result
         else:
@@ -948,12 +946,12 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     try:
         loop = asyncio.get_running_loop()
         logger.info(
-            "Dummy health check server scheduled on existing loop at %s:%s", host, port
+            f"Dummy health check server scheduled on existing loop at {host!s}:{port!s}",
         )
         loop.create_task(server.serve())
 
     except RuntimeError:
-        logger.info("Starting dummy health check server at %s:%s", host, port)
+        logger.info(f"Starting dummy health check server at {host!s}:{port!s}")
         server.run()
 
 
@@ -1216,7 +1214,7 @@ def maybe_model_redirect(model: str) -> str:
         model_redirect_path
     )
     if redirect_model := redirect_dict.get(model):
-        logger.info("model redirect: [ %s ] -> [ %s ]", model, redirect_model)
+        logger.info(f"model redirect: [ {model!s} ] -> [ {redirect_model!s} ]")
         return redirect_model
 
     return model

@@ -103,11 +103,9 @@ class MsgpackRecvSocket:
                 # the engine; drop the message and keep draining.
                 logger.warning(
                     "msgpack input: dropping malformed message "
-                    "(%d frames, sizes=%s, head=%s): %s",
-                    len(frames),
-                    [len(frame) for frame in frames],
-                    frames[0][:8].hex() if frames else "",
-                    exc,
+                    f"({len(frames):d} frames, sizes="
+                    f"{[len(frame) for frame in frames]!s}, head="
+                    f"{(frames[0][:8].hex() if frames else '')!s}): {exc!s}",
                 )
                 continue
             for obj in decoded:
@@ -118,9 +116,8 @@ class MsgpackRecvSocket:
                     reason = obj.validation_error or self._validation_error(obj)
                     if reason is not None:
                         logger.warning(
-                            "msgpack input: aborting invalid request %s: %s",
-                            obj.rid,
-                            reason,
+                            f"msgpack input: aborting invalid request {obj.rid!s}: "
+                            f"{reason!s}",
                         )
                         obj.validation_error = reason
                 self._pending.append(obj)
@@ -187,8 +184,8 @@ class MsgpackSendSocket:
             self._socket.send_multipart(self._encoder.encode(slim), copy=False)
         else:
             logger.warning(
-                "msgpack output: dropping unsupported control reply %s",
-                type(obj).__name__,
+                "msgpack output: dropping unsupported control reply "
+                f"{type(obj).__name__!s}",
             )
 
     def send_engine_dead(self) -> None:
@@ -200,7 +197,7 @@ class MsgpackSendSocket:
         try:
             self._socket.send(ENGINE_CORE_DEAD, zmq.NOBLOCK)
         except Exception as exc:
-            logger.warning("msgpack output: ENGINE_CORE_DEAD send failed: %s", exc)
+            logger.warning(f"msgpack output: ENGINE_CORE_DEAD send failed: {exc!s}")
 
     def close(self) -> None:
         self._socket.close()
@@ -215,8 +212,7 @@ def _recv_init_with_timeout(socket: zmq.Socket) -> list[bytes]:
             return socket.recv_multipart()
         waited_ms += _INIT_POLL_SLICE_MS
         logger.info(
-            "msgpack handshake: waiting for SMG INIT (%ds elapsed)",
-            waited_ms // 1000,
+            f"msgpack handshake: waiting for SMG INIT ({waited_ms // 1000:d}s elapsed)",
         )
     raise TimeoutError(
         f"SMG msgpack handshake timed out waiting for INIT after {_INIT_TIMEOUT_MS} ms"
@@ -248,7 +244,7 @@ def connect_msgpack_engine(
     handshake = context.socket(zmq.DEALER)
     handshake.setsockopt(zmq.IDENTITY, identity)
     handshake.connect(handshake_address)
-    logger.info("msgpack handshake: connected to %s", handshake_address)
+    logger.info(f"msgpack handshake: connected to {handshake_address!s}")
 
     handshake.send(
         zmq_wire.encode(
@@ -271,7 +267,7 @@ def connect_msgpack_engine(
     input_address = init.addresses.inputs[0]
     output_address = init.addresses.outputs[0]
     logger.info(
-        "msgpack handshake: INIT input=%s output=%s", input_address, output_address
+        f"msgpack handshake: INIT input={input_address!s} output={output_address!s}",
     )
 
     input_socket = context.socket(zmq.DEALER)
@@ -284,7 +280,7 @@ def connect_msgpack_engine(
     output_socket.connect(output_address)
 
     handshake.close()
-    logger.info("msgpack handshake: complete (engine_index=%s)", engine_index)
+    logger.info(f"msgpack handshake: complete (engine_index={engine_index!s})")
     return (
         MsgpackRecvSocket(input_socket, vocab_size, enable_output_logprobs),
         MsgpackSendSocket(output_socket, engine_index=engine_index),

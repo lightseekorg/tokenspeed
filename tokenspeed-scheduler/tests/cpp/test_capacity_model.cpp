@@ -126,6 +126,17 @@ std::vector<SchedulerConfig> Sweep() {
 
 }  // namespace
 
+TEST(CapacityModelTest, L3SizingDoesNotRequireHostPagesBeforeAllocation) {
+    SchedulerConfig sizing = SizingConfig(Role::kFused, 4, 8, 1, 0, false, {Full("full", 4, 1)});
+    sizing.disable_l2_cache = false;
+    sizing.enable_l3_storage = true;
+    const CapacityModel model{sizing};
+    SchedulerConfig sized = SizedConfig(sizing, 8);
+    EXPECT_THROW(sized.Validate(), std::invalid_argument);
+    sized.host_allocator.total_pages = 9;
+    EXPECT_EQ(Scheduler{sized}.MaxSingleRequestTokens(), model.MaxSingleRequestTokens(8));
+}
+
 TEST(CapacityModelTest, MatchesTheSchedulerStartupBound) {
     for (const SchedulerConfig& sizing : Sweep()) {
         for (std::int32_t usable_lcm_blocks = 2; usable_lcm_blocks <= 12; ++usable_lcm_blocks) {

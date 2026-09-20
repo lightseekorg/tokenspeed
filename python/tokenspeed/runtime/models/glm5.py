@@ -332,16 +332,16 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             )
         self._decode_topk_indices_buffer: torch.Tensor | None = None
         self._decode_topk_lens_buffer: torch.Tensor | None = None
+        self._retired_decode_workspaces: list[torch.Tensor] = []
 
     def _get_decode_topk_workspace(
         self,
-        attr_name: str,
         rows: int,
         cols: int,
         device: torch.device,
         fill_value: int | None = -1,
     ) -> torch.Tensor:
-        buffer = getattr(self, attr_name, None)
+        buffer = self._decode_topk_indices_buffer
         if (
             buffer is None
             or buffer.device != device
@@ -357,7 +357,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 dtype=torch.int32,
                 device=device,
             )
-            setattr(self, attr_name, buffer)
+            self._decode_topk_indices_buffer = buffer
         workspace = buffer[:rows]
         if fill_value is not None:
             workspace.fill_(fill_value)
@@ -369,7 +369,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         device: torch.device,
         fill: bool = True,
     ) -> torch.Tensor:
-        buffer = getattr(self, "_decode_topk_lens_buffer", None)
+        buffer = self._decode_topk_lens_buffer
         if buffer is None or buffer.device != device or buffer.numel() < rows:
             if buffer is not None:
                 self._retire_decode_workspace(buffer)
@@ -474,11 +474,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         return decode_topk.topk_indices[start:end], decode_topk.topk_lens[start:end]
 
     def _retire_decode_workspace(self, buffer: torch.Tensor) -> None:
-        retired = getattr(self, "_retired_decode_workspaces", None)
-        if retired is None:
-            retired = []
-            self._retired_decode_workspaces = retired
-        retired.append(buffer)
+        self._retired_decode_workspaces.append(buffer)
 
     @staticmethod
     def _check_decode_q_len_per_req(q_len_per_req: int) -> None:
@@ -566,7 +562,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         # where leading rows stay unwritten but readable.
         writes_full_workspace = decode_start == 0 and num_decode_tokens == num_tokens
         topk_indices = self._get_decode_topk_workspace(
-            "_decode_topk_indices_buffer",
             num_tokens,
             topk,
             q.device,

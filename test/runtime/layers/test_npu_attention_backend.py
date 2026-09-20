@@ -62,6 +62,7 @@ def test_npu_validates_required_options_without_rewriting_them():
         model="Qwen/Qwen3-0.6B",
         device="npu",
         attention_backend="mha",
+        sampling_backend="greedy",
         disable_prefill_graph=True,
         disable_pdl=True,
         max_num_seqs=1,

@@ -1058,7 +1058,6 @@ def mla_rope_quantize_fp8_triton(
         "has_q_out": frozenset({True, False}),
         "has_k_out": frozenset({True, False}),
     },
-    tags={"portability"},
 )
 def triton_embedding_rope(
     *,
@@ -1106,7 +1105,6 @@ def triton_embedding_rope(
         "is_neox": frozenset({True, False}),
         "fused_mla_full_query": frozenset({True, False}),
     },
-    tags={"portability"},
 )
 def triton_embedding_rope_mla_set_kv(
     *,
@@ -1150,7 +1148,6 @@ def triton_embedding_rope_mla_set_kv(
         "has_scale_q_tensor": frozenset({True, False}),
         "has_scale_kv_tensor": frozenset({True, False}),
     },
-    tags={"portability"},
 )
 def triton_embedding_nope_mla(
     *,
@@ -1203,7 +1200,6 @@ def triton_embedding_nope_mla(
         "has_scale_q_tensor": frozenset({True, False}),
         "has_scale_kv_tensor": frozenset({True, False}),
     },
-    tags={"portability"},
 )
 def triton_embedding_rope_mla(
     *,

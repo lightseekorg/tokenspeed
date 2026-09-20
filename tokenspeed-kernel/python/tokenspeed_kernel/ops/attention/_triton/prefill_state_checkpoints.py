@@ -239,8 +239,12 @@ def _pack_prefill_recurrent_inputs_kernel(
     key_stride: tl.constexpr,
     value_stride: tl.constexpr,
     state_stride: tl.constexpr,
-    state_shape: tl.constexpr,
-    state_feature_strides: tl.constexpr,
+    state_dim_1: tl.constexpr,
+    state_dim_2: tl.constexpr,
+    state_dim_3: tl.constexpr,
+    state_stride_1: tl.constexpr,
+    state_stride_2: tl.constexpr,
+    state_stride_3: tl.constexpr,
     a_stride: tl.constexpr,
     b_stride: tl.constexpr,
     g_stride: tl.constexpr,
@@ -309,13 +313,15 @@ def _pack_prefill_recurrent_inputs_kernel(
     feature = offsets % state_width
     mask = (row < num_rows) & (feature < state_width)
     source_row = tl.load(rows + row, mask=mask, other=0)
-    state_feature_offset = tl.full((BLOCK,), 0, tl.int32)
-    remaining_feature = feature
-    for dim in tl.static_range(len(state_shape) - 1, -1, -1):
-        state_feature_offset += (
-            remaining_feature % state_shape[dim]
-        ) * state_feature_strides[dim]
-        remaining_feature = remaining_feature // state_shape[dim]
+    dim_1_index = feature // (state_dim_2 * state_dim_3)
+    remainder = feature % (state_dim_2 * state_dim_3)
+    dim_2_index = remainder // state_dim_3
+    dim_3_index = remainder % state_dim_3
+    state_feature_offset = (
+        dim_1_index * state_stride_1
+        + dim_2_index * state_stride_2
+        + dim_3_index * state_stride_3
+    )
     tl.store(
         recurrent_state_out + row * state_width + feature,
         tl.load(
@@ -427,10 +433,11 @@ def pack_prefill_recurrent_checkpoint_inputs(
     """Pack every checkpoint prefix and its initial state with one GPU launch.
 
     Token dimension is 1 for query/key/value (with batch dimension 1) and 0
-    for gate tensors. Features within each token or state row must be dense,
-    but rows may have noncontiguous strides, as with fused projection slices.
-    The returned tensors are contiguous and preserve the corresponding input
-    shapes with packed token/request counts.
+    for gate tensors. Recurrent state uses the four-dimensional ``[N, H, V,
+    K]`` cache layout. Features within each token must be dense, but token and
+    state dimensions may have noncontiguous strides, as with fused projection
+    slices and transposed scan results. The returned tensors are contiguous and
+    preserve the corresponding input shapes with packed token/request counts.
 
     Args:
         query: Query tensor with token dimension 1.
@@ -452,6 +459,8 @@ def pack_prefill_recurrent_checkpoint_inputs(
     num_tokens = token_indices.numel()
     num_rows = rows.numel()
     optional_inputs = (a, b, g_raw, f_a_out, beta_raw)
+    if recurrent_state.ndim != 4:
+        raise ValueError("checkpoint recurrent state must be four-dimensional")
     if not query.is_cuda:
 
         def gather(tensor, dim):
@@ -547,8 +556,12 @@ def pack_prefill_recurrent_checkpoint_inputs(
         key_stride=strides[1],
         value_stride=strides[2],
         state_stride=strides[3],
-        state_shape=tuple(recurrent_state.shape[1:]),
-        state_feature_strides=tuple(recurrent_state.stride()[1:]),
+        state_dim_1=recurrent_state.shape[1],
+        state_dim_2=recurrent_state.shape[2],
+        state_dim_3=recurrent_state.shape[3],
+        state_stride_1=recurrent_state.stride(1),
+        state_stride_2=recurrent_state.stride(2),
+        state_stride_3=recurrent_state.stride(3),
         a_stride=strides[4],
         b_stride=strides[5],
         g_stride=strides[6],

@@ -245,6 +245,9 @@ class _RuntimeLongcatMoE(nn.Module):
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
             zero_expert_type=config.zero_expert_type,
+            # LongCat applies its own zero-expert routing to gated SiLU experts.
+            activation="swiglu",
+            routing_mode="precomputed_topk",
             routing_config={
                 "routed_scaling_factor": self.routed_scaling_factor,
                 "normalize_topk_weights": config.norm_topk_prob,
@@ -717,7 +720,7 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
             return None
         if name.endswith(_LONGCAT_OPTIONAL_MISSING_WEIGHT_SUFFIXES):
             return None
-        _longcat_logger.warning("The %s is not in the model.", name)
+        _longcat_logger.warning(f"The {name!s} is not in the model.")
         return None
 
     def load_weights(self, weights: _Iterable[tuple[str, torch.Tensor]]):
