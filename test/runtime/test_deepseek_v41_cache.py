@@ -825,8 +825,9 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool, verify_
 
     assert DeepseekV41AttentionBackend.cuda_graph_support.decode_graph
     # Decoder narrowing makes the prefill row count depend on prompt
-    # completion, not on the token bucket, so prefill graphs stay off.
-    assert not DeepseekV41AttentionBackend.cuda_graph_support.prefill_graph
+    # completion, not on the token bucket; the prefill graph captures the
+    # encoder and decoder stages separately around it (NarrowingPrefillModel).
+    assert DeepseekV41AttentionBackend.cuda_graph_support.prefill_graph
     torch.manual_seed(42)
     backend = _verify_backend("cuda", 5, verify_width)
     backend.cache_pool.arena.buffer.zero_()

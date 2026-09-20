@@ -202,10 +202,11 @@ class V41SWAQueryPlan:
 
 class DeepseekV41AttentionBackend(AttentionBackend):
     # Decode uses fixed-capacity rows and refresh-time history validation. The
-    # CED decoder runs on a per-request tail of the prefill rows, so a prefill
-    # forward changes its row count mid-way and cannot be captured as one
-    # token-shaped graph.
-    cuda_graph_support = CudaGraphSupport(decode_graph=True, prefill_graph=False)
+    # CED decoder runs on a per-request tail of the prefill rows, so the model
+    # is a NarrowingPrefillModel: the prefill graph captures the encoder and
+    # decoder stages separately around the eager narrowing layer, attention
+    # staying at its breaks in both.
+    cuda_graph_support = CudaGraphSupport(decode_graph=True, prefill_graph=True)
     supports_layer_sliding_window = True
 
     def __init__(self, config: AttnConfig, spec: DeepseekV41Config) -> None:
