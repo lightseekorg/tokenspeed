@@ -228,7 +228,8 @@ class BenchmarkRunner:
         dtype_role: str | Iterable[str],
         generator: Any,
     ) -> tuple[bool | None, float | None, float | None]:
-        if spec.solution == "reference":
+        if spec.solution == "torch":
+            # PyTorch references are the ground truth, not verified subjects.
             return None, None, None
 
         registry = KernelRegistry.get()

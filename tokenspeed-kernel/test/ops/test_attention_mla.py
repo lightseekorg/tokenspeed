@@ -94,33 +94,12 @@ def test_mla_prefill(
         solution=solution,
     )
     out, lse = mla_prefill(**kwargs)
-
-    refs = []
-    ref_lses = []
-    q_offset = 0
-    kv_offset = 0
-    for q_len, kv_len in zip(q_lens, kv_lens, strict=True):
-        q_i = q[q_offset : q_offset + q_len].float()
-        k_i = k[kv_offset : kv_offset + kv_len].float()
-        v_i = v[kv_offset : kv_offset + kv_len].float()
-        scores = torch.einsum("qhd,khd->hqk", q_i, k_i) * softmax_scale
-        if is_causal:
-            q_pos = torch.arange(q_len, device=device) + max(kv_len - q_len, 0)
-            k_pos = torch.arange(kv_len, device=device)
-            mask = q_pos[:, None] >= k_pos[None, :]
-            scores = scores.masked_fill(~mask[None, :, :], float("-inf"))
-        probs = torch.softmax(scores, dim=-1)
-        refs.append(torch.einsum("hqk,khd->qhd", probs, v_i))
-        ref_lses.append(torch.logsumexp(scores, dim=-1).transpose(0, 1))
-        q_offset += q_len
-        kv_offset += kv_len
-    out_ref = torch.cat(refs, dim=0)
-    lse_ref = torch.cat(ref_lses, dim=0)
+    out_ref, lse_ref = mla_prefill(**{**kwargs, "solution": "reference"})
 
     assert out.shape == (q.shape[0], q.shape[1], v.shape[-1])
     assert lse.shape == (q.shape[0], q.shape[1])
     out_tol = 2e-1 if dtype in _FP8_DTYPES else 8e-2
-    torch.testing.assert_close(out.float(), out_ref, rtol=out_tol, atol=out_tol)
+    torch.testing.assert_close(out.float(), out_ref.float(), rtol=out_tol, atol=out_tol)
     torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
 
 
@@ -400,7 +379,7 @@ def test_mla_decode_with_kvcache(
     )
     softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
 
-    out, lse = mla_decode_with_kvcache(
+    kwargs = dict(
         q=q,
         kv_cache=kv_cache,
         page_table=page_table,
@@ -411,31 +390,16 @@ def test_mla_decode_with_kvcache(
         qk_rope_head_dim=qk_rope_head_dim,
         softmax_scale=softmax_scale,
         return_lse=True,
-        solution=solution,
     )
-
-    refs = []
-    ref_lses = []
-    for batch_idx in range(batch_size):
-        kv_rows = []
-        for pos in range(int(cache_seqlens[batch_idx].item())):
-            page = page_table[batch_idx, pos // page_size]
-            kv_rows.append(kv_cache[page, pos % page_size, 0])
-        kv = torch.stack(kv_rows).float()
-        scores = torch.einsum("hd,kd->hk", q[batch_idx, 0].float(), kv)
-        scores = scores * softmax_scale
-        probs = torch.softmax(scores, dim=-1)
-        refs.append(torch.matmul(probs, kv[:, :kv_lora_rank]).unsqueeze(0))
-        ref_lses.append(torch.logsumexp(scores, dim=-1).unsqueeze(0))
-    out_ref = torch.stack(refs, dim=0)
-    lse_ref = torch.stack(ref_lses, dim=0)
+    out, lse = mla_decode_with_kvcache(**kwargs, solution=solution)
+    out_ref, lse_ref = mla_decode_with_kvcache(**kwargs, solution="reference")
 
     assert out.shape == (batch_size, q_len, num_heads, kv_lora_rank)
     if q_dtype in _FP8_DTYPES:
         assert out.dtype == torch.bfloat16
     assert lse.shape == (batch_size, q_len, num_heads)
     out_tol = 1e-1 if q_dtype in _FP8_DTYPES or kv_dtype in _FP8_DTYPES else 8e-2
-    torch.testing.assert_close(out.float(), out_ref, rtol=out_tol, atol=out_tol)
+    torch.testing.assert_close(out.float(), out_ref.float(), rtol=out_tol, atol=out_tol)
     torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
 
 
@@ -479,7 +443,7 @@ def test_mla_decode_noncausal_block_sliding_window_matches_reference_and_capture
     )
     softmax_scale = 1.0 / math.sqrt(qk_head_dim)
 
-    def run(query: torch.Tensor) -> torch.Tensor:
+    def run(query: torch.Tensor, solution: str | None = None) -> torch.Tensor:
         return mla_decode_with_kvcache(
             q=query,
             kv_cache=kv_cache,
@@ -492,22 +456,14 @@ def test_mla_decode_noncausal_block_sliding_window_matches_reference_and_capture
             softmax_scale=softmax_scale,
             window_left=window_left,
             noncausal_block_size=block_size,
+            solution=solution,
         )
 
     output = run(q)
-    dense_kv = kv_cache.reshape(-1, qk_head_dim)[:cache_len].float()
-    expected = []
-    for block_position in range(block_size):
-        start = max(
-            0,
-            context_len - window_left + block_position,
-        )
-        visible = dense_kv[start:cache_len]
-        scores = torch.einsum("hd,kd->hk", q[block_position, 0].float(), visible)
-        probs = torch.softmax(scores * softmax_scale, dim=-1)
-        expected.append(torch.matmul(probs, visible[:, :kv_lora_rank]))
-    expected_output = torch.stack(expected).unsqueeze(1)
-    torch.testing.assert_close(output.float(), expected_output, rtol=8e-2, atol=8e-2)
+    expected_output = run(q, solution="reference")
+    torch.testing.assert_close(
+        output.float(), expected_output.float(), rtol=8e-2, atol=8e-2
+    )
 
     graph_output = torch.empty_like(output)
     graph = torch.cuda.CUDAGraph()
@@ -573,7 +529,7 @@ def test_mla_extend_with_kvcache(device: str, dtype: torch.dtype, require) -> No
     cu_seqlens_kv = torch.tensor([0, 3, 10], device=device, dtype=torch.int32)
     softmax_scale = 1.0 / math.sqrt(128 + rope_dim)
 
-    out = mla_extend_with_kvcache(
+    kwargs = dict(
         q=q,
         kv_cache=kv_cache,
         page_table=page_table,
@@ -587,28 +543,13 @@ def test_mla_extend_with_kvcache(device: str, dtype: torch.dtype, require) -> No
         qk_rope_head_dim=rope_dim,
         softmax_scale=softmax_scale,
         is_causal=True,
-        solution="gluon",
     )
+    out = mla_extend_with_kvcache(**kwargs, solution="gluon")
     assert out.dtype == torch.bfloat16
 
-    refs = []
-    q_start = 0
-    for batch_idx, (q_len, prefix_len) in enumerate(
-        zip(query_lens, prefix_lens, strict=True)
-    ):
-        kv = kv_cache[batch_idx, : cache_lens[batch_idx], 0].float()
-        for query_idx in range(q_len):
-            visible_kv = kv[: prefix_len + query_idx + 1]
-            scores = torch.einsum(
-                "hd,kd->hk", q[q_start + query_idx].float(), visible_kv
-            )
-            scores *= softmax_scale
-            probs = torch.softmax(scores, dim=-1)
-            refs.append(torch.matmul(probs, visible_kv[:, :kv_lora_rank]))
-        q_start += q_len
-
+    expected = mla_extend_with_kvcache(**kwargs, solution="reference")
     tol = 1.5e-1 if dtype in _FP8_DTYPES else 8e-2
-    torch.testing.assert_close(out.float(), torch.stack(refs), rtol=tol, atol=tol)
+    torch.testing.assert_close(out.float(), expected.float(), rtol=tol, atol=tol)
 
 
 def _run_fixed_bf16_mla_decode_case(
@@ -736,26 +677,24 @@ def _run_fixed_bf16_mla_decode_case(
                 atol=2e-2,
             )
 
-    refs = []
-    ref_lses = []
-    for batch_idx in range(batch_size):
-        kv_rows = []
-        for pos in range(int(cache_seqlens[batch_idx].item())):
-            page = page_table[batch_idx, pos // page_size]
-            kv_rows.append(kv_cache[page, pos % page_size, 0])
-        kv = torch.stack(kv_rows).float()
-        scores = torch.einsum("hd,kd->hk", q[batch_idx, 0].float(), kv)
-        scores = scores * softmax_scale
-        probs = torch.softmax(scores, dim=-1)
-        refs.append(torch.matmul(probs, kv[:, :kv_lora_rank]).unsqueeze(0))
-        ref_lses.append(torch.logsumexp(scores, dim=-1).unsqueeze(0))
-    out_ref = torch.stack(refs, dim=0)
+    out_ref, lse_ref = mla_decode_with_kvcache(
+        q=q,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=max_seqlen_k,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        return_lse=True,
+        solution="reference",
+    )
 
     assert out.shape == (batch_size, 1, num_heads, kv_lora_rank)
-    torch.testing.assert_close(out.float(), out_ref, rtol=8e-2, atol=8e-2)
+    torch.testing.assert_close(out.float(), out_ref.float(), rtol=8e-2, atol=8e-2)
     if return_lse:
         assert lse is not None
-        lse_ref = torch.stack(ref_lses, dim=0)
         assert lse.shape == (batch_size, 1, num_heads)
         torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
 

@@ -528,7 +528,7 @@ def test_dense_bmm_uses_registered_reference_for_local_correctness(
         name="unit_reference_bmm",
         family="gemm",
         mode="bmm",
-        solution="reference",
+        solution="torch",
         format_signatures=frozenset({signature}),
     )
     calls = {"candidate": 0, "reference": 0}
@@ -645,7 +645,7 @@ def test_dense_bmm_validation_requires_a_compatible_registered_reference(
             name="unit_incompatible_reference",
             family="gemm",
             mode="bmm",
-            solution="reference",
+            solution="torch",
             format_signatures=frozenset({signature}),
             traits={"m": frozenset({99})},
         )

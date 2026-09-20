@@ -40,6 +40,11 @@ from tokenspeed_kernel.ops.residual import (  # noqa: E402
     attn_res_fwd,
     attn_res_fwd_available,
 )
+from tokenspeed_kernel.selection import select_kernel  # noqa: E402
+from tokenspeed_kernel.signature import (  # noqa: E402
+    dense_tensor_format,
+    format_signature,
+)
 
 if is_cdna4():
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.attn_res import (  # noqa: E402
@@ -53,7 +58,7 @@ else:
 
 def _attn_res_reference(
     layer: torch.Tensor,
-    history: torch.Tensor,
+    blocks: torch.Tensor,
     res_weight: torch.Tensor,
     score_weight: torch.Tensor,
     output_weight: torch.Tensor,
@@ -61,16 +66,28 @@ def _attn_res_reference(
     score_eps: float,
     output_eps: float,
 ) -> torch.Tensor:
-    values = torch.cat((history[:, :valid_blocks], layer.unsqueeze(1)), dim=1).float()
-    inverse_rms = torch.rsqrt(values.square().mean(-1, keepdim=True) + score_eps)
-    logits = values.mul(inverse_rms) @ (score_weight * res_weight.float())
-    mixed = torch.matmul(logits.softmax(-1).unsqueeze(1), values).squeeze(1)
-    mixed = mixed.to(torch.bfloat16).float()
-    return (
-        mixed
-        * torch.rsqrt(mixed.square().mean(-1, keepdim=True) + output_eps)
-        * output_weight
-    ).to(torch.bfloat16)
+    """Registered reference over block-major ``blocks`` shaped ``[K, T, H]``."""
+    kernel = select_kernel(
+        "residual",
+        "attn_res_fwd",
+        format_signature(
+            layer_residual=dense_tensor_format(layer.dtype),
+            block_residual=dense_tensor_format(blocks.dtype),
+        ),
+        solution="reference",
+    )
+    return kernel(
+        layer_residual=layer,
+        block_residual=blocks,
+        res_weight=res_weight,
+        rms_weight=score_weight,
+        eps=score_eps,
+        out_norm_weight=output_weight,
+        out_norm_eps=output_eps,
+        delta=None,
+        num_valid_blocks=valid_blocks,
+        block_write_idx=-1,
+    )
 
 
 def _bf16_add_rne(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
@@ -110,7 +127,7 @@ def test_attn_res_public_block_major_dispatch_matches_reference() -> None:
     )
     expected = _attn_res_reference(
         layer,
-        history.transpose(0, 1),
+        history,
         res_weight,
         score_weight,
         output_weight,
@@ -149,7 +166,7 @@ def test_attn_res_large_prefill_dispatch_boundary(monkeypatch) -> None:
             out_norm_weight=weight if fuse_output_norm else None,
         )
 
-    assert selected_solutions == [None, None, None, "torch", "torch", "torch"]
+    assert selected_solutions == [None, None, None] + ["torch"] * 3
 
 
 def test_attn_res_amd_entrypoint_accepts_legacy_keywords() -> None:
@@ -189,7 +206,7 @@ def test_attn_res_amd_entrypoint_accepts_legacy_keywords() -> None:
     )
     expected = _attn_res_reference(
         layer,
-        history,
+        history.transpose(0, 1),
         res_weight,
         score_weight,
         output_weight,
@@ -238,7 +255,7 @@ def test_attn_res_first_layer_snapshot_write() -> None:
     )
     expected = _attn_res_reference(
         original_prefix,
-        blocks.transpose(0, 1),
+        blocks,
         res_weight,
         score_weight,
         output_weight,
@@ -311,7 +328,7 @@ def test_attn_res_delta_and_block_write_batches(tokens: int) -> None:
     updated_prefix = _bf16_add_rne(original_prefix, delta)
     expected = _attn_res_reference(
         updated_prefix,
-        original_blocks.transpose(0, 1),
+        original_blocks,
         res_weight,
         score_weight,
         output_weight,
@@ -374,7 +391,7 @@ def test_attn_res_noncontiguous_delta_uses_fallback() -> None:
     updated_prefix = (original_prefix + delta).to(torch.bfloat16)
     expected = _attn_res_reference(
         updated_prefix,
-        blocks.transpose(0, 1),
+        blocks,
         res_weight,
         score_weight,
         output_weight,
@@ -461,7 +478,7 @@ def test_attn_res_model_update_modes_graph_replay(
     )
     expected = _attn_res_reference(
         updated_prefix,
-        original_blocks.transpose(0, 1),
+        original_blocks,
         res_weight,
         score_weight,
         output_weight,

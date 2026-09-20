@@ -67,7 +67,7 @@ def _register_test_gemm_kernels() -> None:
         name="test_gemm_reference",
         family="gemm",
         mode="mm",
-        solution="reference",
+        solution="torch",
         format_signatures=format_signatures(("a", "b"), "dense", {dtype}),
         traits=_TEST_GEMM_TRAITS,
         priority=0,

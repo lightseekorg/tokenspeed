@@ -40,10 +40,32 @@ __all__ = [
     "KernelSpec",
     "KernelRegistry",
     "Priority",
+    "REFERENCE_SOLUTION",
+    "REFERENCE_SOLUTION_ORDER",
     "load_builtin_kernels",
     "register_kernel",
+    "resolve_solutions",
     "describe_kernel",
 ]
+
+# ``"reference"`` is a meta solution, never a registered one: a request for it
+# resolves to the first concrete solution in this order that has a kernel for
+# the call. PyTorch references register as ``"torch"``; the portable Triton
+# kernels are the ground truth where no PyTorch reference exists.
+REFERENCE_SOLUTION = "reference"
+REFERENCE_SOLUTION_ORDER: tuple[str, ...] = ("torch", "triton")
+
+
+def resolve_solutions(solution: str | None) -> tuple[str | None, ...]:
+    """Expand a requested solution into the concrete solutions to try in order.
+
+    ``None`` (automatic selection) and concrete solution names map to
+    themselves; the ``"reference"`` meta solution maps to
+    :data:`REFERENCE_SOLUTION_ORDER`.
+    """
+    if solution == REFERENCE_SOLUTION:
+        return REFERENCE_SOLUTION_ORDER
+    return (solution,)
 
 
 def _normalize_roles(roles: str | Iterable[str]) -> tuple[str, ...]:
@@ -87,20 +109,22 @@ class Priority(IntEnum):
         priority=Priority.PERFORMANT       # band start (8)
         priority=Priority.PERFORMANT + 2   # +2 within the band (10)
 
-    Band layout (each occupies a contiguous range of ints in [0, 20).
-    ints in 1..3 are unused — that range previously held a separate FALLBACK
-    band that was folded into PORTABLE):
+    Band layout (each occupies a contiguous range of ints in [0, 20)):
 
     +--------------+--------+----------------------------------------------------+
     | Band         | Range  | When to use                                        |
     +==============+========+====================================================+
-    | REFERENCE    |    0   | Correctness reference. Never auto-selected when a  |
-    |              |        | real implementation is available; useful as a      |
-    |              |        | numeric ground truth in tests.                     |
+    | REFERENCE    |  0..3  | Ground truth only. Never auto-selected, even when   |
+    |              |        | nothing else matches: selection skips this band    |
+    |              |        | unless the caller names a solution (``"torch"`` or |
+    |              |        | the ``"reference"`` meta solution) or the kernel   |
+    |              |        | through ``override=``. Use it for PyTorch          |
+    |              |        | references whose cost or memory shape must never   |
+    |              |        | reach a serving path.                              |
     +--------------+--------+----------------------------------------------------+
     | PORTABLE     |  4..7  | In-tree generic implementation with no arch or     |
     |              |        | shape gating beyond the family contract — e.g.     |
-    |              |        | default Triton, or PyTorch reference patsh used as |
+    |              |        | default Triton, or PyTorch reference paths used as |
     |              |        | last-resort coverage.                              |
     +--------------+--------+----------------------------------------------------+
     | PERFORMANT   | 8..11  | In-tree generally optimized kernel, covering a     |
@@ -273,6 +297,12 @@ class KernelRegistry:
 
     def register(self, spec: KernelSpec, impl: Callable) -> None:
         """Register a kernel specification and its implementation."""
+        if spec.solution == REFERENCE_SOLUTION:
+            raise ValueError(
+                f"Kernel {spec.name!r} cannot register as the "
+                f"{REFERENCE_SOLUTION!r} meta solution; PyTorch references "
+                "register as 'torch'"
+            )
         if spec.name in self._by_name:
             # Allow re-registration (plugin override)
             self._unregister(spec.name)
@@ -314,7 +344,12 @@ class KernelRegistry:
         tags: set[str] | None = None,
         solution: str | None = None,
     ) -> list[KernelSpec]:
-        """Get all kernels for an operator, optionally filtered."""
+        """Get all kernels for an operator, optionally filtered.
+
+        ``solution="reference"`` resolves through
+        :data:`REFERENCE_SOLUTION_ORDER`: the result holds the kernels of the
+        first concrete solution that has any after the other filters.
+        """
         specs = list(self._by_operator.get((family, mode), []))
 
         if features is not None:
@@ -326,7 +361,11 @@ class KernelRegistry:
         if tags:
             specs = [s for s in specs if tags.issubset(s.tags)]
         if solution:
-            specs = [s for s in specs if s.solution == solution]
+            for concrete in resolve_solutions(solution):
+                matched = [s for s in specs if s.solution == concrete]
+                if matched:
+                    return matched
+            return []
 
         return specs
 

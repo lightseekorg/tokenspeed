@@ -109,8 +109,17 @@ folder.
   for decode
 - **Vendor libraries** — wrapped (FlashAttention, TRT-LLM, etc.);
   no in-tree C++ build
-- **PyTorch reference** — under `numerics/reference/`; never auto-selects
-  over a real backend but always available as ground truth
+- **PyTorch reference** — under `numerics/reference/`, registered as the
+  `torch` solution and named `torch_<mode>`. Two bands: PORTABLE
+  references (dense GEMM, MoE routing, AttnRes) are the last-resort path
+  when no fused kernel covers an input and lose to every real backend;
+  REFERENCE-band references (attention) are ground truth only and are
+  never auto-selected. `reference` is a meta solution, never a registered
+  one: `solution="reference"` resolves to `torch` when a PyTorch reference
+  covers the call and to the portable `triton` kernel otherwise, so every
+  op with a Triton solution has a ground truth. Public APIs forward
+  `solution=`; tests compare fused kernels against it instead of carrying
+  their own PyTorch re-implementations
 
 Overall we carefully curate external dependencies and actively re-evaluate
 their inclusion, in order to maintain minimal dependencies and enable faster

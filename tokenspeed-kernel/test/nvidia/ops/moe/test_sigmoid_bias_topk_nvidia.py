@@ -18,14 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""NVIDIA sigmoid_bias_topk: the fused minimax adapter must match the torch
-reference (same expert set, same weights) and win selection on NVIDIA."""
+"""NVIDIA sigmoid_bias_topk: the fused minimax adapter must match the
+registered reference (same expert set, same weights) and win selection on
+NVIDIA."""
 
 import pytest
 import torch
 from tokenspeed_kernel.ops.moe.sigmoid_topk import (
     moe_sigmoid_bias_topk,
-    torch_sigmoid_bias_topk,
     triton_minimax_sigmoid_bias_topk,
 )
 from tokenspeed_kernel.platform import Platform
@@ -39,19 +39,25 @@ if not Platform.get().is_nvidia:
 @pytest.mark.parametrize("tokens", [1, 3, 8, 64])
 @pytest.mark.parametrize("experts,topk", [(896, 16), (256, 8)])
 @pytest.mark.parametrize("normalize", [True, False])
-def test_minimax_adapter_matches_torch(tokens, experts, topk, normalize):
+def test_minimax_adapter_matches_reference(tokens, experts, topk, normalize):
     torch.manual_seed(tokens * experts)
     logits = torch.randn(tokens, experts, dtype=torch.float32, device="cuda")
     bias = torch.randn(experts, dtype=torch.float32, device="cuda")
-    kwargs = dict(
+    ref_w, ref_i = moe_sigmoid_bias_topk(
+        logits,
+        bias,
+        topk,
+        routed_scaling_factor=2.5,
+        normalize_topk_weights=normalize,
+        solution="reference",
+    )
+    got_w, got_i = triton_minimax_sigmoid_bias_topk(
         router_logits=logits,
         correction_bias=bias,
         topk=topk,
         routed_scaling_factor=2.5,
         normalize_topk_weights=normalize,
     )
-    ref_w, ref_i = torch_sigmoid_bias_topk(**kwargs)
-    got_w, got_i = triton_minimax_sigmoid_bias_topk(**kwargs)
     assert got_w.dtype == torch.float32 and got_i.dtype == torch.int32
     for row in range(tokens):
         ref_map = dict(zip(ref_i[row].tolist(), ref_w[row].tolist(), strict=True))
@@ -62,7 +68,7 @@ def test_minimax_adapter_matches_torch(tokens, experts, topk, normalize):
 
 
 def test_entry_point_selects_fused_kernel():
-    """The public entry point must not fall back to the multi-launch torch
+    """The public entry point must not fall back to the multi-launch
     reference on NVIDIA."""
     logits = torch.randn(2, 896, dtype=torch.float32, device="cuda")
     bias = torch.randn(896, dtype=torch.float32, device="cuda")
@@ -84,7 +90,7 @@ def test_entry_point_selects_fused_kernel():
 @pytest.mark.parametrize("scale", [1.0, 2.5])
 def test_decode_shape_uses_lean_kernel_and_is_exact(normalize, scale):
     """The K3 decode shape (1, 896) topk=16 takes the packed-key single-CTA
-    kernel on NVIDIA: exact expert set and weights vs torch, and CUDA-graph
+    kernel on NVIDIA: exact expert set and weights vs the reference, and CUDA-graph
     capturable (the decode path replays it inside the step graph)."""
     torch.manual_seed(7)
     logits = (torch.randn(1, 896, device="cuda") * 0.2).float()

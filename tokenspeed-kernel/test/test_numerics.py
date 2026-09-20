@@ -318,7 +318,7 @@ def test_verification_uses_signature_with_compatible_reference(fresh_registry) -
         name="test_tensor_scale_reference",
         family="gemm",
         mode="mm",
-        solution="reference",
+        solution="torch",
         format_signatures=frozenset({tensor_signature}),
         traits={"b_layout": frozenset({"KN"})},
     )
@@ -354,7 +354,7 @@ class TestNumericsVerification:
             if family and family_name != family:
                 continue
             for spec in registry.get_for_operator(family_name, mode, platform=platform):
-                if spec.solution == "reference":
+                if spec.solution == "torch":
                     continue
                 if spec.solution == "deep_gemm":
                     continue
@@ -390,7 +390,7 @@ class TestNumericsVerification:
                 name="test_dense_reference",
                 family="gemm",
                 mode="collector_mm",
-                solution="reference",
+                solution="torch",
                 format_signatures=frozenset({dense_signature}),
             ),
             KernelSpec(

@@ -27,7 +27,7 @@ import pytest
 import tokenspeed_kernel.ops.gemm as gemm
 import torch
 from tokenspeed_kernel.platform import PlatformInfo
-from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
+from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, Priority
 from tokenspeed_kernel.selection import (
     AutotuneParams,
     NoKernelFoundError,
@@ -43,6 +43,7 @@ from tokenspeed_kernel.selection import (
     _score_objective,
     _score_priority,
     explain_selection,
+    is_ground_truth,
     kernel_override,
     register_oracle,
     select_kernel,
@@ -221,7 +222,7 @@ class TestRanking:
             name="oracle_winner",
             family="f",
             mode="m",
-            solution="reference",
+            solution="torch",
             priority=0,
         )
         objective_winner = KernelSpec(
@@ -765,6 +766,190 @@ class TestSelectKernel:
                 traits={"head_dim": 256},
             )
 
+    def _register_ground_truth_pair(self) -> KernelRegistry:
+        reg = KernelRegistry.get()
+        reg.register(
+            KernelSpec(
+                name="torch_prefill",
+                family="attention",
+                mode="prefill",
+                solution="torch",
+                format_signatures=frozenset({ATTN_PREFILL_BF16}),
+                priority=Priority.REFERENCE,
+            ),
+            lambda: "torch_prefill",
+        )
+        reg.register(
+            KernelSpec(
+                name="triton_128",
+                family="attention",
+                mode="prefill",
+                solution="triton",
+                format_signatures=frozenset({ATTN_PREFILL_BF16}),
+                traits={"head_dim": frozenset({128})},
+                priority=Priority.PORTABLE,
+            ),
+            lambda: "triton_128",
+        )
+        return reg
+
+    def test_ground_truth_never_auto_selected(self, h100_platform):
+        """A REFERENCE-band kernel loses even when it is the only match."""
+        self._register_ground_truth_pair()
+
+        impl = select_kernel(
+            "attention",
+            "prefill",
+            ATTN_PREFILL_BF16,
+            platform=h100_platform,
+            traits={"head_dim": 128},
+        )
+        assert impl() == "triton_128"
+
+        with pytest.raises(NoKernelFoundError, match="traits"):
+            select_kernel(
+                "attention",
+                "prefill",
+                ATTN_PREFILL_BF16,
+                platform=h100_platform,
+                traits={"head_dim": 256},
+            )
+
+    def test_ground_truth_selected_on_request(self, h100_platform):
+        self._register_ground_truth_pair()
+
+        by_solution = select_kernel(
+            "attention",
+            "prefill",
+            ATTN_PREFILL_BF16,
+            platform=h100_platform,
+            traits={"head_dim": 256},
+            solution="torch",
+        )
+        assert by_solution() == "torch_prefill"
+
+        by_meta = select_kernel(
+            "attention",
+            "prefill",
+            ATTN_PREFILL_BF16,
+            platform=h100_platform,
+            traits={"head_dim": 256},
+            solution="reference",
+        )
+        assert by_meta() == "torch_prefill"
+
+        by_override = select_kernel(
+            "attention",
+            "prefill",
+            ATTN_PREFILL_BF16,
+            platform=h100_platform,
+            override="torch_prefill",
+        )
+        assert by_override() == "torch_prefill"
+
+    def test_reference_meta_solution_falls_back_to_triton(self, h100_platform):
+        """ "reference" means torch when it covers the call, else triton."""
+        reg = KernelRegistry.get()
+        reg.register(
+            KernelSpec(
+                name="torch_64",
+                family="attention",
+                mode="prefill",
+                solution="torch",
+                format_signatures=frozenset({ATTN_PREFILL_BF16}),
+                traits={"head_dim": frozenset({64})},
+                priority=Priority.REFERENCE,
+            ),
+            lambda: "torch_64",
+        )
+        reg.register(
+            KernelSpec(
+                name="triton_any",
+                family="attention",
+                mode="prefill",
+                solution="triton",
+                format_signatures=frozenset({ATTN_PREFILL_BF16}),
+                priority=Priority.PORTABLE,
+            ),
+            lambda: "triton_any",
+        )
+        reg.register(
+            KernelSpec(
+                name="fa4_any",
+                family="attention",
+                mode="prefill",
+                solution="fa4",
+                format_signatures=frozenset({ATTN_PREFILL_BF16}),
+                priority=Priority.SPECIALIZED,
+            ),
+            lambda: "fa4_any",
+        )
+
+        def pick(**traits):
+            return select_kernel(
+                "attention",
+                "prefill",
+                ATTN_PREFILL_BF16,
+                platform=h100_platform,
+                traits=traits,
+                solution="reference",
+            )()
+
+        # torch covers head_dim 64; a trait miss falls through to triton, never
+        # to a faster non-reference solution.
+        assert pick(head_dim=64) == "torch_64"
+        assert pick(head_dim=128) == "triton_any"
+
+        reg._unregister("triton_any")
+        assert pick(head_dim=64) == "torch_64"
+        with pytest.raises(NoKernelFoundError, match="solution 'reference'"):
+            pick(head_dim=128)
+
+        reg._unregister("torch_64")
+        with pytest.raises(NoKernelFoundError, match="solution 'reference'"):
+            pick(head_dim=64)
+
+    def test_reference_meta_solution_as_override(self, sample_specs, h100_platform):
+        reg = KernelRegistry.get()
+        register_all_samples(reg, sample_specs)
+
+        impl = select_kernel(
+            "attention",
+            "decode",
+            ATTN_DECODE_BF16,
+            platform=h100_platform,
+            override="reference",
+        )
+        assert impl() == "reference_decode"
+
+        reg._unregister("reference_decode")
+        impl = select_kernel(
+            "attention",
+            "decode",
+            ATTN_DECODE_BF16,
+            platform=h100_platform,
+            override="reference",
+        )
+        assert impl() == "triton_decode"
+
+    def test_portable_reference_remains_the_fallback(self, h100_platform):
+        """PORTABLE-band references keep serving as last-resort coverage."""
+        reg = KernelRegistry.get()
+        reg.register(
+            KernelSpec(
+                name="torch_mm_like",
+                family="gemm",
+                mode="mm",
+                solution="torch",
+                format_signatures=frozenset({GEMM_BF16}),
+                priority=Priority.PORTABLE,
+            ),
+            lambda: "torch_mm_like",
+        )
+        impl = select_kernel("gemm", "mm", GEMM_BF16, platform=h100_platform)
+        assert impl() == "torch_mm_like"
+        assert not is_ground_truth(reg.get_by_name("torch_mm_like"))
+
     def test_override_not_found_raises(self, sample_specs, h100_platform):
         reg = KernelRegistry.get()
         register_all_samples(reg, sample_specs)
@@ -961,6 +1146,37 @@ class TestExplainSelection:
             platform=h100_platform,
         )
         assert "0 matched" in explanation
+
+    def test_ground_truth_reported_as_filtered(self, h100_platform):
+        KernelRegistry.get().register(
+            KernelSpec(
+                name="torch_prefill",
+                family="attention",
+                mode="prefill",
+                solution="torch",
+                format_signatures=frozenset({ATTN_PREFILL_BF16}),
+                priority=Priority.REFERENCE,
+            ),
+            lambda: "torch_prefill",
+        )
+        explanation = explain_selection(
+            "attention",
+            "prefill",
+            ATTN_PREFILL_BF16,
+            platform=h100_platform,
+        )
+        assert "0 matched" in explanation
+        assert "torch_prefill: ground truth" in explanation
+
+        requested = explain_selection(
+            "attention",
+            "prefill",
+            ATTN_PREFILL_BF16,
+            platform=h100_platform,
+            solution="reference",
+        )
+        assert "Solution: reference (resolved to 'torch')" in requested
+        assert "torch_prefill  [SELECTED]" in requested
 
 
 class TestWarmupSelection:

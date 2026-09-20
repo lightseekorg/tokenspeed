@@ -211,7 +211,7 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
             "reference_decode",
             "attention",
             "decode",
-            "reference",
+            "torch",
             format_signatures(
                 ("q", "k_cache", "v_cache"),
                 "dense",

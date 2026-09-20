@@ -1154,8 +1154,9 @@ def _online_quantize_mxfp8(
 
 
 def _kernel_handles_online_mxfp8(kernel_name: str) -> bool:
+    # The PyTorch references quantize activations themselves.
     spec = KernelRegistry.get().get_by_name(kernel_name)
-    return spec is not None and spec.solution == "reference"
+    return spec is not None and spec.solution == "torch"
 
 
 # ---------------------------------------------------------------------------

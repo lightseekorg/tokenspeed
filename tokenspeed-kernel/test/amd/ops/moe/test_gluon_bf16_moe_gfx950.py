@@ -30,6 +30,7 @@ if not is_cdna4():
         allow_module_level=True,
     )
 
+import tokenspeed_kernel  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import gluon_bf16_moe  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_device import (  # noqa: E402
     moe_align_block_size_device,
@@ -51,18 +52,23 @@ def _routing_softmax_topk(logits: torch.Tensor, topk: int):
     return ids.to(torch.int32), weights.to(torch.float32)
 
 
-def _torch_moe_ref(hidden, w1, w2, topk_ids, topk_weights) -> torch.Tensor:
-    """Golden fp32 MoE FFN: y[t] = sum_s w * (silu(h@wg) * (h@wu)) @ wd."""
-    hf, w1f, w2f = hidden.float(), w1.float(), w2.float()
-    ids, wts = topk_ids.cpu(), topk_weights.float().cpu()
-    out = torch.zeros(hidden.shape[0], D, dtype=torch.float32, device=hidden.device)
-    for t in range(hidden.shape[0]):
-        for s in range(TOPK):
-            e = int(ids[t, s])
-            g = hf[t] @ w1f[e].T
-            inter = torch.nn.functional.silu(g[:I_R]) * g[I_R:]
-            out[t] += float(wts[t, s]) * (inter @ w2f[e].T)
-    return out
+def _torch_moe_ref(hidden, w13, w2, topk_ids, topk_weights) -> torch.Tensor:
+    """Registered ground truth: unquantized experts, precomputed top-k."""
+    plan = tokenspeed_kernel.moe_plan(
+        "unquant",
+        input_dtype=hidden.dtype,
+        activation="silu",
+        routing_mode="precomputed_topk",
+        ispp=I_R,
+        solution="reference",
+    )
+    w = torch.nn.Module()
+    w.w13_weight = w13
+    w.w2_weight = w2
+    w.top_k = TOPK
+    return tokenspeed_kernel.moe_apply(
+        plan, hidden, w, None, topk_weights=topk_weights, topk_ids=topk_ids
+    ).float()
 
 
 def _build(num_tokens: int, seed: int = 0):

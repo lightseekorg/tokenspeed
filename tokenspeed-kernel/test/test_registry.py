@@ -348,7 +348,35 @@ class TestRegistryQueries:
         solutions = reg.list_solutions("attention", "decode")
         assert "flashinfer" in solutions
         assert "triton" in solutions
-        assert "reference" in solutions
+        assert "torch" in solutions
+        # "reference" is a meta solution, never a registered one.
+        assert "reference" not in solutions
+
+    def test_reference_resolves_to_torch_then_triton(self, sample_specs):
+        reg = KernelRegistry.get()
+        register_all_samples(reg, sample_specs)
+
+        resolved = reg.get_for_operator("attention", "decode", solution="reference")
+        assert {s.solution for s in resolved} == {"torch"}
+
+        reg._unregister("reference_decode")
+        resolved = reg.get_for_operator("attention", "decode", solution="reference")
+        assert resolved and {s.solution for s in resolved} == {"triton"}
+
+        for spec in reg.get_for_operator("attention", "decode", solution="triton"):
+            reg._unregister(spec.name)
+        assert reg.get_for_operator("attention", "decode", solution="reference") == []
+
+    def test_registering_the_reference_meta_solution_is_rejected(self):
+        spec = KernelSpec(
+            name="meta_gemm_mm",
+            family="gemm",
+            mode="mm",
+            solution="reference",
+            format_signatures=format_signatures(("a", "b"), "dense", {torch.bfloat16}),
+        )
+        with pytest.raises(ValueError, match="meta solution"):
+            KernelRegistry.get().register(spec, lambda a, b: a @ b)
 
 
 class TestRegistryCache:
@@ -398,7 +426,7 @@ class TestRegisterKernelDecorator:
         @register_kernel(
             "gemm",
             "mm",
-            solution="reference",
+            solution="torch",
             signatures=format_signatures(("a", "b"), "dense", {torch.bfloat16}),
             priority=12,
         )
@@ -406,16 +434,16 @@ class TestRegisterKernelDecorator:
             return a @ b
 
         reg = KernelRegistry.get()
-        spec = reg.get_by_name("reference_gemm_mm")
+        spec = reg.get_by_name("torch_gemm_mm")
         assert spec is not None
-        assert spec.solution == "reference"
+        assert spec.solution == "torch"
         assert spec.priority == 12
         assert (
             next(iter(format_signatures(("a", "b"), "dense", {torch.bfloat16})))
             in spec.format_signatures
         )
 
-        impl = reg.get_impl("reference_gemm_mm")
+        impl = reg.get_impl("torch_gemm_mm")
         assert impl is my_torch_gemm
 
     def test_custom_name(self):

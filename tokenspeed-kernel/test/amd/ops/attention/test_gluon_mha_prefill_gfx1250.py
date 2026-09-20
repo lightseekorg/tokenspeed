@@ -20,8 +20,6 @@
 
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
 from utils import is_cdna5
@@ -32,6 +30,7 @@ if not is_cdna5():
     )
 
 
+from tokenspeed_kernel.ops.attention.mha import mha_prefill  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx1250.attention.mha import prefill  # noqa: E402
 
 
@@ -47,23 +46,17 @@ def _inputs(seqlens, n_q_heads, n_kv_heads, head_dim, device, dtype):
     return q, k, v, cu, cu_cpu, max(seqlens)
 
 
-def _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim, window_left=-1):
-    sm_scale = 1.0 / math.sqrt(head_dim)
-    group = n_q_heads // n_kv_heads
-    outs = []
-    for start, end in zip(cu_cpu[:-1], cu_cpu[1:]):
-        q_i = q[start:end].float()
-        k_exp = k[start:end].float().repeat_interleave(group, dim=1)
-        v_exp = v[start:end].float().repeat_interleave(group, dim=1)
-        n = end - start
-        scores = torch.einsum("qhd,khd->hqk", q_i, k_exp) * sm_scale
-        pos = torch.arange(n, device=q.device)
-        mask = pos[:, None] >= pos[None, :]
-        if window_left >= 0:
-            mask &= (pos[:, None] - pos[None, :]) <= window_left
-        scores = scores.masked_fill(~mask[None, :, :], float("-inf"))
-        outs.append(torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), v_exp))
-    return torch.cat(outs, dim=0)
+def _reference(q, k, v, cu, cu_cpu, max_seqlen, window_left):
+    return mha_prefill(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens=cu,
+        cu_seqlens_cpu=cu_cpu,
+        max_seqlen=max_seqlen,
+        window_left=window_left,
+        solution="reference",
+    )
 
 
 @pytest.mark.parametrize(
@@ -121,8 +114,8 @@ def test_mha_prefill_tile_shapes(block_m, num_warps, head_dim, window_left):
 
     assert out.shape == q.shape
     assert not torch.isnan(out).any()
-    expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim, window_left)
-    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+    expected = _reference(q, k, v, cu, cu_cpu, max_seqlen, window_left)
+    torch.testing.assert_close(out.float(), expected.float(), rtol=8e-2, atol=8e-2)
 
 
 def test_select_llvm_fn_attrs():
@@ -244,8 +237,8 @@ def test_mha_prefill_tdm_warp_hint_remainder():
         prefill._select_tdm_warp_hint = original_hint
 
     assert torch.equal(out, control)
-    expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim)
-    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+    expected = _reference(q, k, v, cu, cu_cpu, max_seqlen, -1)
+    torch.testing.assert_close(out.float(), expected.float(), rtol=8e-2, atol=8e-2)
 
 
 def test_mha_prefill_reverse_q_blocks_ragged():
@@ -281,8 +274,8 @@ def test_mha_prefill_reverse_q_blocks_ragged():
         prefill._select_reverse_q_blocks = original_order
 
     assert torch.equal(out, control)
-    expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim)
-    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+    expected = _reference(q, k, v, cu, cu_cpu, max_seqlen, -1)
+    torch.testing.assert_close(out.float(), expected.float(), rtol=8e-2, atol=8e-2)
 
 
 def test_select_m_tile_gates():

@@ -115,7 +115,7 @@ def _reference_mxfp8_quantize(
     "gemm",
     "mm",
     name="torch_mm_fp8_blockscale",
-    solution="reference",
+    solution="torch",
     signatures=_MXFP8_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PORTABLE + 2,
@@ -177,7 +177,7 @@ def torch_mm_fp8_blockscale(
     "gemm",
     "mm",
     name="torch_mm_fp8_scaled_mnk",
-    solution="reference",
+    solution="torch",
     signatures=_FP8_TENSOR_FORMAT_SIGNATURES,
     traits={
         "b_layout": frozenset({"NK"}),
@@ -226,7 +226,7 @@ def torch_mm_fp8_scaled_mnk(
     "gemm",
     "mm",
     name="torch_mm_fp8_scaled_nkm",
-    solution="reference",
+    solution="torch",
     signatures=_FP8_TENSOR_FORMAT_SIGNATURES,
     traits={
         "b_layout": frozenset({"KN"}),
@@ -273,7 +273,7 @@ def torch_mm_fp8_scaled_nkm(
     "gemm",
     "mm",
     name="torch_mm",
-    solution="reference",
+    solution="torch",
     signatures=_DENSE_GEMM_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PORTABLE + 3,
@@ -320,7 +320,7 @@ def torch_mm(
     "gemm",
     "bmm",
     name="torch_bmm_fp8_blockscale",
-    solution="reference",
+    solution="torch",
     signatures=_MXFP8_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PORTABLE + 2,
@@ -401,7 +401,7 @@ def _bmm_scaled_fp8_scale(
     "gemm",
     "bmm",
     name="torch_bmm_fp8_scaled",
-    solution="reference",
+    solution="torch",
     signatures=_FP8_SCALED_BMM_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PORTABLE,
@@ -445,7 +445,7 @@ def torch_bmm_fp8_scaled(
     "gemm",
     "bmm",
     name="torch_bmm",
-    solution="reference",
+    solution="torch",
     signatures=_DENSE_GEMM_FORMAT_SIGNATURES,
     priority=Priority.PORTABLE + 3,
     tags={"determinism", "portability"},
@@ -530,23 +530,48 @@ def torch_bmm(
     return output
 
 
+_BF16_X_WEIGHT_FORMAT_SIGNATURES = frozenset(
+    {
+        format_signature(
+            x=dense_tensor_format(torch.bfloat16),
+            weight=dense_tensor_format(torch.bfloat16),
+        )
+    }
+)
+
+
+@register_kernel(
+    "gemm",
+    "decode_gemv",
+    name="torch_decode_gemv",
+    solution="torch",
+    signatures=_BF16_X_WEIGHT_FORMAT_SIGNATURES,
+    traits={},
+    priority=Priority.PORTABLE,
+    tags={"portability"},
+)
+def torch_decode_gemv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``x @ weight.T`` through the vendor BLAS PyTorch selects."""
+    if out is not None:
+        return torch.mm(x, weight.t(), out=out)
+    return x @ weight.t()
+
+
 @register_kernel(
     "gemm",
     "grouped_bf16_projection",
-    name="grouped_bf16_projection_torch",
+    name="torch_grouped_bf16_projection",
     solution="torch",
-    signatures=frozenset(
-        {
-            format_signature(
-                x=dense_tensor_format(torch.bfloat16),
-                weight=dense_tensor_format(torch.bfloat16),
-            )
-        }
-    ),
+    signatures=_BF16_X_WEIGHT_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PORTABLE,
+    tags={"portability"},
 )
-def grouped_bf16_projection_torch(
+def torch_grouped_bf16_projection(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
 ) -> torch.Tensor:
     """Preserve the original batched projection and its BF16 rounding."""
