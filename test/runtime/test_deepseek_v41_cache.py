@@ -1576,10 +1576,16 @@ def test_packed_compressor_rejected_suffix_every_acceptance(prefix, accepted):
     # with either retained accepted inputs or an input in the replacement window.
     full_content = torch.cat((content[: prefix + accepted], new_content))
     full_scores = torch.cat((scores[: prefix + accepted], new_scores))
-    live = positions >= 0
-    pair = positions[live, None] + torch.arange(2)
+    replacement_positions = prefix + accepted + torch.arange(width)
+    live = replacement_positions % 2 == 1
+    torch.testing.assert_close(
+        positions, torch.where(live, replacement_positions - 1, -1), rtol=0, atol=0
+    )
+    # Keep the full query width through softmax: selecting live rows first can
+    # change CPU rounding with many threads, despite identical pair inputs.
+    pair = replacement_positions[:, None] + torch.tensor([-1, 0])
     expected = (full_content[pair] * full_scores[pair].softmax(1)).sum(1)
-    torch.testing.assert_close(pooled[live], expected, rtol=0, atol=0)
+    torch.testing.assert_close(pooled[live], expected[live], rtol=0, atol=0)
     assert not pooled[~live].any()
     assert not backend.cache_pool.compressor_tail(2)[0].any()
 
