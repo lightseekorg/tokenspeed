@@ -3,7 +3,7 @@ wheel
 psutil
 numpy
 # torch version needs to pinned here for CUDA builds
-torch==2.13.0
+torch==2.14.0
 apache-tvm-ffi==0.1.13.post3
 tokenspeed-proton>=3.8.10.post20260920
 tokenspeed-triton>=3.8.10.post20260920

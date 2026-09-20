@@ -32,7 +32,7 @@ import tomllib
 from pathlib import Path
 
 PYPI = "https://pypi.org/simple"
-PYTORCH = "https://download.pytorch.org/whl/cu129"
+PYTORCH = "https://download.pytorch.org/whl/cu126"
 WHEELS = "https://lightseek.org/whl/cu129/"
 NATIVE_PACKAGES = {
     "tokenspeed-deepep",

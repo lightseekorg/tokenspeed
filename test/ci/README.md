@@ -45,7 +45,10 @@ The Qwen3.5 FP8 DeepEP correctness task runs GSM8K on four B200 GPUs with
 attention TP2, attention DP2, and MoE EP4. DeepEP `auto` mode exercises its
 normal path during prefill and low-latency path during decode, and the task
 uses the bounded non-thinking chat template for CI stability. The task requires
-a score of at least 0.90.
+a score of at least 0.90. After installation, it imports `tokenspeed_kernel` on
+GPU before launching the model, so incompatible native wheels fail at the
+installation stage. This GPU check is kept outside the general installer,
+which also runs during image builds without GPU access.
 
 The Qwen3.8 Flash Next FP8 correctness task runs GSM8K on two GB200 GPUs with
 tensor parallelism 2 and three-step MTP. It keeps KVStore enabled and uses the
@@ -515,7 +518,8 @@ The manual `Slurm Dispatch` GitHub workflow runs on the organization runner
 with the `slurm-dispatch` label. That runner belongs on the Slurm coordinator and
 only needs GitHub runner prerequisites, this repository, Python/PyYAML, and
 Slurm client commands; it does not need GPUs. Leaving the PR input blank checks
-out and runs the latest `main`; otherwise the requested PR is merged into that
+out the exact commit selected by the workflow's branch/ref; selecting `main`
+tests its commit at dispatch time. Otherwise the requested PR is merged into a
 trusted `main` checkout. From the Actions UI, optionally provide a PR,
 comma-separated runner labels and task types, and an optional comma-separated
 task/model filter. The workflow submits the selected matrix, waits for all
@@ -535,8 +539,21 @@ GB200, every B200 or GB200 runner label declared by the selected YAML is
 submitted as its own Slurm job. On GB300, those logical labels are submitted on
 the corresponding GB300 runner; native GB300 labels are submitted unchanged.
 
-The manual workflow keeps the dispatcher checkout on trusted `main` and merges
-the requested PR only in the submitter's temporary worktree. The per-commit
+To test a same-repository branch without opening a PR, leave `pr` blank:
+
+```bash
+gh workflow run slurm-dispatch.yml --ref <branch> -f cluster=gb200
+```
+
+The Slurm wrapper defaults to the digest-pinned Torch 2.14 / CUDA 13.0 runner
+image. The install stage checks the final Torch, TRTLLM, and CuteDSL KDA versions
+against the checkout's requirements and checks Torch's CUDA runtime, so a later
+dependency install cannot silently downgrade the tested stack.
+
+For PR input, the manual workflow keeps the dispatcher checkout on trusted
+`main` and merges the requested PR only in the submitter's temporary worktree.
+Without PR input, the selected branch also supplies dispatcher code: select
+only trusted same-repository refs for the persistent coordinator. The per-commit
 workflow instead executes a same-repository PR's merge commit so dispatcher
 changes can be validated before merge. Fork PRs must not use that path while
 the coordinator pool is persistent.

@@ -465,7 +465,8 @@ def test_slurm_dispatch_routes_gb300_to_its_coordinator():
         "'slurm-dispatch-gb300' || 'slurm-dispatch' }}"
     )
     assert "${{ inputs.cluster }}" in workflow["concurrency"]["group"]
-    assert checkout["with"]["ref"] == "main"
+    assert checkout["with"]["ref"] == "${{ inputs.pr && 'main' || github.sha }}"
+    assert "${{ github.ref }}" in workflow["concurrency"]["group"]
     assert 'python3 - "$YAML_SELECTION" "$CLUSTER" "$PR"' in dispatch_script
     assert "from slurm_submit import pr_worktree" in dispatch_script
     assert "with pr_worktree(repo, pr) as checkout:" in dispatch_script
