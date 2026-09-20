@@ -1,12 +1,5 @@
 # Experimental Hopper / CUDA 12.9 installation
 
-The Torch 2.14 upgrade currently publishes the pinned DeepGEMM, FlashMLA,
-and fast-hadamard-transform wheels for CUDA 13.0 only. Their CUDA 12.9
-wheels still require SM90 validation and publication. Until then, this
-checkout's CUDA 12.9 installation cannot complete because those versions
-are missing from the cu129 index. The instructions below describe the recipe
-for use once those wheels are available.
-
 This source-install recipe targets H100/H200, CUDA Toolkit 12.9, and Python
 3.11 on Linux. It installs the kernel package, scheduler, and Python runtime
 from this checkout. GPU build and serving validation must be performed on
