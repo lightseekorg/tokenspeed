@@ -1581,19 +1581,9 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
         for name, param in sharded.named_parameters():
             source = full_params[name]
             loader = getattr(param, "weight_loader", v41.default_weight_loader)
-            if name in (
-                "wq_a.weight",
-                "wkv.weight",
-                "compressor.wkv.weight",
-                "compressor.wkv_wgate.weight",
-                "wq_a_wkv.weight",
-                "indexer.wq_b.weight",
-                "indexer.weights_proj.weight",
-                "indexer.wk.weight",
-            ):
-                loader(param, source, shard_id=None, begin_size=None)
-            else:
-                loader(param, source)
+            # Each loader receives the complete reference weight and owns any
+            # TP slicing, including fused projections and attention sinks.
+            loader(param, source)
         pos = torch.arange(4, device=device)
         backend = _Backend(pos, torch.zeros_like(pos))
         x = torch.randn(4, 128, dtype=torch.bfloat16, device=device)
