@@ -530,23 +530,48 @@ def torch_bmm(
     return output
 
 
+_BF16_X_WEIGHT_FORMAT_SIGNATURES = frozenset(
+    {
+        format_signature(
+            x=dense_tensor_format(torch.bfloat16),
+            weight=dense_tensor_format(torch.bfloat16),
+        )
+    }
+)
+
+
+@register_kernel(
+    "gemm",
+    "decode_gemv",
+    name="torch_decode_gemv",
+    solution="reference",
+    signatures=_BF16_X_WEIGHT_FORMAT_SIGNATURES,
+    traits={},
+    priority=Priority.PORTABLE,
+    tags={"portability"},
+)
+def torch_decode_gemv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``x @ weight.T`` through the vendor BLAS PyTorch selects."""
+    if out is not None:
+        return torch.mm(x, weight.t(), out=out)
+    return x @ weight.t()
+
+
 @register_kernel(
     "gemm",
     "grouped_bf16_projection",
-    name="grouped_bf16_projection_torch",
-    solution="torch",
-    signatures=frozenset(
-        {
-            format_signature(
-                x=dense_tensor_format(torch.bfloat16),
-                weight=dense_tensor_format(torch.bfloat16),
-            )
-        }
-    ),
+    name="torch_grouped_bf16_projection",
+    solution="reference",
+    signatures=_BF16_X_WEIGHT_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PORTABLE,
+    tags={"portability"},
 )
-def grouped_bf16_projection_torch(
+def torch_grouped_bf16_projection(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
 ) -> torch.Tensor:
     """Preserve the original batched projection and its BF16 rounding."""

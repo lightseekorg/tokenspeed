@@ -606,6 +606,7 @@ def gdn_replay_commit_supported(
 
 # Backend registration (side-effect imports)
 # isort: off
+import tokenspeed_kernel.numerics.reference.attention  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.gdn.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.gdn.triton  # noqa: E402,F401
 

@@ -139,7 +139,7 @@ def moe_sigmoid_bias_topk(
             topk_ids = logical_to_physical_map[topk_ids.long()].to(torch.int32)
         return topk_weights, topk_ids
     if solution is None and not _gluon_eligible(router_logits, correction_bias, topk):
-        solution = "torch"
+        solution = "reference"
 
     signature = format_signature(router_logits=dense_tensor_format(router_logits.dtype))
     traits = {"tokens": tokens, "experts": experts, "topk": topk}
@@ -234,38 +234,6 @@ def triton_minimax_sigmoid_bias_topk(
         topk_weights.mul_(routed_scaling_factor)
         topk_weights = topk_weights.to(weights_dtype)
     return topk_weights, topk_ids.to(torch.int32)
-
-
-@register_kernel(
-    "moe",
-    "sigmoid_bias_topk",
-    name="torch_sigmoid_bias_topk",
-    solution="torch",
-    signatures=format_signatures(
-        "router_logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
-    ),
-    priority=Priority.PORTABLE,
-    tags={"portability", "reference"},
-)
-def torch_sigmoid_bias_topk(
-    *,
-    router_logits: torch.Tensor,
-    correction_bias: torch.Tensor,
-    topk: int,
-    routed_scaling_factor: float,
-    normalize_topk_weights: bool,
-    weights_dtype: torch.dtype = torch.float32,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """PyTorch implementation matching Kimi's existing routing path."""
-    scores = router_logits.sigmoid()
-    topk_ids = torch.topk(
-        scores + correction_bias.unsqueeze(0), topk, dim=-1, sorted=False
-    ).indices
-    topk_weights = scores.gather(1, topk_ids)
-    if normalize_topk_weights:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    topk_weights = topk_weights * routed_scaling_factor
-    return topk_weights.to(weights_dtype), topk_ids.to(torch.int32)
 
 
 import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk  # noqa: E402,F401

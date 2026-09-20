@@ -3,12 +3,11 @@ from __future__ import annotations
 import pytest
 import tokenspeed_kernel
 import torch
-import torch.nn.functional as F
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize("activation", ["silu", "situ"])
-def test_triton_bf16_moe_matches_torch(activation: str) -> None:
+def test_triton_bf16_moe_matches_reference(activation: str) -> None:
     generator = torch.Generator(device="cuda").manual_seed(0)
     x = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16, generator=generator)
     w13 = (
@@ -38,43 +37,25 @@ def test_triton_bf16_moe_matches_torch(activation: str) -> None:
     weights.top_k = 2
     weights.activation_situ_beta = 4.0
     weights.activation_situ_linear_beta = 25.0
-    plan = tokenspeed_kernel.moe_plan(
-        "unquant",
-        input_dtype=torch.bfloat16,
-        activation=activation,
-        routing_mode="precomputed_topk",
-        ispp=32,
-        solution="triton",
-    )
-    actual = tokenspeed_kernel.moe_apply(
-        plan,
-        x,
-        weights,
-        torch.empty((4, 4), device="cuda"),
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-    )
 
-    expected = torch.zeros((4, 128), device="cuda", dtype=torch.float32)
-    for expert_id in range(4):
-        token_ids, slots = torch.where(topk_ids == expert_id)
-        gate_up = F.linear(x[token_ids].float(), w13[expert_id].float())
-        gate, up = gate_up.chunk(2, dim=-1)
-        if activation == "situ":
-            gate = gate.to(torch.bfloat16).float()
-            up = up.to(torch.bfloat16).float()
-            gate = 4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)
-            up = 25.0 * torch.tanh(up / 25.0)
-            intermediate = (gate * up).to(torch.bfloat16)
-        else:
-            intermediate = (F.silu(gate) * up).to(torch.bfloat16)
-        expert_output = F.linear(intermediate.float(), w2[expert_id].float()).to(
-            torch.bfloat16
+    def run(solution: str) -> torch.Tensor:
+        plan = tokenspeed_kernel.moe_plan(
+            "unquant",
+            input_dtype=torch.bfloat16,
+            activation=activation,
+            routing_mode="precomputed_topk",
+            ispp=32,
+            solution=solution,
         )
-        expected.index_add_(
-            0,
-            token_ids,
-            expert_output.float() * topk_weights[token_ids, slots, None],
+        return tokenspeed_kernel.moe_apply(
+            plan,
+            x,
+            weights,
+            torch.empty((4, 4), device="cuda"),
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
         )
 
-    torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.01)
+    actual = run("triton")
+    expected = run("reference")
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=0.02, atol=0.01)
