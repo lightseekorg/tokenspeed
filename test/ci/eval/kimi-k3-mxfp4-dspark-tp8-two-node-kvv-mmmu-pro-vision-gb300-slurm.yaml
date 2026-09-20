@@ -45,7 +45,7 @@ eval:
     - git init -q /tmp/kvv && git -C /tmp/kvv fetch --depth 1 https://github.com/MoonshotAI/Kimi-Vendor-Verifier.git 3dad65a760a8867cda72f6dd8848d876a4e851b4 && git -C /tmp/kvv checkout --detach FETCH_HEAD && python3 -m uv sync --project /tmp/kvv --frozen
   command: >-
     HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
-    INSPECT_LOG_DIR=${RUNNER_TEMP:-/tmp}/kvv-logs
+    INSPECT_LOG_DIR="$PWD/.ci-artifacts/published/kvv"
     KIMI_API_KEY=EMPTY_TOKEN
     KIMI_BASE_URL=http://127.0.0.1:8000/v1
     /tmp/kvv/.venv/bin/python /tmp/kvv/eval.py mmmu

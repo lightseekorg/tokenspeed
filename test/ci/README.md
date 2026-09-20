@@ -452,6 +452,12 @@ preserves the draft checkpoint's required `attn_res` auxiliary stream.
 The MXFP4 DSpark OCRBench and MMMU-Pro Vision tasks are nightly baselines that
 use a pinned Kimi Vendor Verifier revision. Either YAML can still be rerun
 explicitly through `Slurm Dispatch` with the `gb300` cluster.
+Their Inspect `.eval` logs are written directly to
+`.ci-artifacts/published/kvv`, which Slurm mounts from the job's persistent
+`runs/<job-id>/published/kvv` directory. The logs survive scratch cleanup even
+when the accuracy gate fails. Before treating an archive as complete, check
+its final status and sample count; interrupted evaluations can leave partial
+archives in the same directory.
 
 GB200 examples:
 
