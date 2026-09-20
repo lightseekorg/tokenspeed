@@ -101,6 +101,24 @@ change.
 * NPU support targets only one or two specific models. There are currently no
   plans to expand NPU model coverage.
 
+## tokenspeed-scheduler releases
+
+Prefer separate PRs for scheduler code changes and version bumps. A scheduler
+code change does not require a version bump or an immediate release; multiple
+code changes may accumulate until a release is needed.
+
+Follow this sequence:
+
+1. Make and merge code changes under `tokenspeed-scheduler/`.
+2. When ready to release, update `[project].version` in
+   `tokenspeed-scheduler/pyproject.toml` and merge the version bump into `main`.
+3. Trigger the
+   [release-tokenspeed-scheduler workflow](https://github.com/lightseekorg/tokenspeed/actions/workflows/release-tokenspeed-scheduler.yml)
+   from `main`. Wait for the GitHub release and PyPI publication to succeed.
+4. Once the new version is available on PyPI, update the main TokenSpeed
+   project's `tokenspeed-scheduler` dependency requirement in
+   `python/pyproject.toml` through a follow-up PR targeting `main`.
+
 ## tokenspeed-kernel
 
 Inside the root `tokenspeed-kernel/` directory:
