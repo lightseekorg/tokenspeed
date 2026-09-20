@@ -377,6 +377,7 @@ class EventLoop:
                 if server_args.disaggregation_mode != "null"
                 else None
             ),
+            context_length=self._request_context_length,
             decode_log_interval=server_args.decode_log_interval,
             # Usable pages, the same total the load snapshot and the
             # Prometheus gauge publish, so the three never disagree.
@@ -1168,6 +1169,11 @@ class EventLoop:
     def _num_running(self) -> int:
         return len(self.output_processor.rid_to_state)
 
+    def _request_context_length(self, rid: str) -> int:
+        """Tokens ``rid`` holds right now: its prompt plus everything committed."""
+        state = self.output_processor.rid_to_state[rid]
+        return state.input_length + state.output_length
+
     def _get_scheduler_stats(self):
         empty = self.scheduler.empty_lcm_blocks()
         active = self.scheduler.active_lcm_blocks()
@@ -1327,10 +1333,11 @@ class EventLoop:
 
                     planned = None
                     if not need_idle_forward and forward_op is not None:
-                        # Gather sampling params and grammar state BEFORE any
-                        # pending commit below — a commit can finish requests and
-                        # pop them from output_processor.rid_to_state, which would
-                        # KeyError on rids still present in the current forward_op.
+                        # Gather sampling params, grammar state and the batch
+                        # log's per-request reads BEFORE any pending commit
+                        # below — a commit can finish requests and pop them from
+                        # output_processor.rid_to_state, which would KeyError on
+                        # rids still present in the current forward_op.
                         sampling_params_list = self._gather_sampling_params(forward_op)
                         grammar_inputs = self._gather_grammar_state(forward_op)
                         ngram_inputs = ngram_inputs_for_forward(
@@ -1338,6 +1345,7 @@ class EventLoop:
                             self.output_processor.rid_to_state,
                             self._ngram_context_len,
                         )
+                        self._batch_logger.log_dispatch(forward_op, stats)
 
                         if in_flight and self._dispatch_depends_on_pending_commit(
                             forward_op, grammar_inputs
@@ -1345,7 +1353,6 @@ class EventLoop:
                             request_changes.extend(self._drain_in_flight(in_flight))
 
                         self._mark_stats_scheduled(forward_op)
-                        self._batch_logger.log_dispatch(forward_op, stats)
                         planned = PlannedForward(
                             forward_op=forward_op,
                             sampling_params_list=sampling_params_list,

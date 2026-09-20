@@ -267,6 +267,14 @@ widening the draft's attention to the full history.
 | `--decode-log-interval` | Decode batch log interval. |
 | `--kv-events-config` | JSON config for KV cache mutation events. Set `enable_kv_cache_events` and a publisher such as `zmq` to publish device prefix-cache stores and removals. |
 
+Every `--decode-log-interval` decode rounds the scheduler's representative rank
+prints one `Decode batch.` line: `#running-req`, `avg_seq_len` (the mean of
+prompt plus generated tokens over the running requests, so a step's attention
+cost can be read alongside its batch size), device page usage, the generation
+throughput accumulated since the previous line, `avg_accept_len` /
+`accept_rate` under speculative decoding, and `#queue-req`. Every field is a
+host-side scheduler counter; the line adds no GPU synchronization.
+
 Set `TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS=1` to log each speculative verify
 step's committed widths and accepted draft-token counts. This reads the
 already-synchronized CPU result and does not add a GPU synchronization, but it
