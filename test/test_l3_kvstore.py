@@ -128,17 +128,20 @@ class StorageKeyTest(unittest.TestCase):
         )
         ast.fix_missing_locations(expression)
         arch = SimpleNamespace(MHA="mha", MLA="mla", DSA="dsa", MSA="msa")
-        namespace = {"AttentionArch": arch}
-        default_name = next(
+
+        class MSAConfig:
+            def __init__(self, full_attn_backend_name):
+                self.full_attn_backend_name = full_attn_backend_name
+
+        namespace = {"AttentionArch": arch, "MSAConfig": MSAConfig}
+        helpers = [
             node
             for node in tree.body
             if isinstance(node, ast.FunctionDef)
-            and node.name == "_get_default_backend_name"
-        )
+            and node.name in {"_get_default_backend_name", "_cache_backend_name"}
+        ]
         exec(
-            compile(
-                ast.Module(body=[default_name], type_ignores=[]), str(path), "exec"
-            ),
+            compile(ast.Module(body=helpers, type_ignores=[]), str(path), "exec"),
             namespace,
         )
         cases = [
@@ -154,12 +157,36 @@ class StorageKeyTest(unittest.TestCase):
                 namespace.update(
                     target_full_attn_backend_name=target_name,
                     draft_full_attn_backend_name=draft_name,
+                    softmax_attn=object(),
+                    draft_softmax_attn=object(),
                     model_config=SimpleNamespace(attention_arch=arch.MHA),
                     draft_model_config=SimpleNamespace(attention_arch=arch.MLA),
                     draft_attn_backend=object() if has_draft else None,
                 )
                 self.assertEqual(
                     eval(compile(expression, str(path), "eval"), namespace), expected
+                )
+
+        # Outer MSA names stay identical while its dense implementations
+        # differ. Both target and draft identities must retain that choice.
+        for target_dense, draft_dense in (
+            ("trtllm", "fa3"),
+            ("fa3", "trtllm"),
+            (None, None),
+        ):
+            with self.subTest(target_dense=target_dense, draft_dense=draft_dense):
+                namespace.update(
+                    target_full_attn_backend_name="msa",
+                    draft_full_attn_backend_name="msa",
+                    softmax_attn=MSAConfig(target_dense),
+                    draft_softmax_attn=MSAConfig(draft_dense),
+                    model_config=SimpleNamespace(attention_arch=arch.MSA),
+                    draft_model_config=SimpleNamespace(attention_arch=arch.MSA),
+                    draft_attn_backend=object(),
+                )
+                self.assertEqual(
+                    eval(compile(expression, str(path), "eval"), namespace),
+                    (f"msa:{target_dense or 'mha'}", f"msa:{draft_dense or 'mha'}"),
                 )
 
     def test_weight_version_factory_preserves_resolved_backend_identity(self):
@@ -257,6 +284,13 @@ class StorageKeyTest(unittest.TestCase):
             prefix(attention_backend="fa3"), prefix(attention_backend="fa4")
         )
         self.assertNotEqual(base, prefix(draft_attention_backend="mha"))
+        self.assertNotEqual(
+            prefix(attention_backend="msa:trtllm"), prefix(attention_backend="msa:fa3")
+        )
+        self.assertNotEqual(
+            prefix(draft_attention_backend="msa:trtllm"),
+            prefix(draft_attention_backend="msa:fa3"),
+        )
         self.assertNotEqual(
             prefix(draft_attention_backend="fa3"), prefix(draft_attention_backend="fa4")
         )
