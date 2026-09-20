@@ -20,6 +20,8 @@
 
 """Attention-DP MoE ownership and collective ordering."""
 
+import os
+import sys
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest import mock
@@ -27,6 +29,11 @@ from unittest import mock
 import pytest
 import torch
 from torch import nn
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput, TopKOutputFormat
@@ -650,3 +657,7 @@ def test_attn_dp_megamoe_keeps_inputs_local_and_owns_combine(
     else:
         assert result is prefix
         up.assert_not_called()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

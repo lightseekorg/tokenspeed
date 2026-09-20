@@ -20,9 +20,16 @@
 
 """Stream-fork staging orders event generations without host synchronization."""
 
+import os
+import sys
 from contextlib import contextmanager
 
 import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed.runtime.utils import cuda_stream
 
@@ -93,3 +100,7 @@ def test_staged_branch_event_generations(monkeypatch, enable, overlap):
             expected.append(("wait", 1, generation + 1, "main"))
         expected.extend([("wait", 1, generation + 1, "main")] * 2)
     assert calls == expected
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

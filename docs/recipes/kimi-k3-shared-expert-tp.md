@@ -76,6 +76,12 @@ remain in `SharedExpertCommunication`.
 
 Run the model orchestration and stream-ordering tests:
 
+These tests are registered in the per-commit `runtime-1gpu` CI suite. The
+distributed real-weight validator below is separate and is not automatically
+run by that suite. A green unit-test job does not establish real collective
+or real-weight validation. Multi-node Slurm CI skips fork PRs; running that
+validation requires a reviewed dispatch with suitable GPUs and checkpoint access.
+
 ```bash
 python -m pytest -q test/runtime/test_kimi_k3_moe_attn_dp.py test/runtime/test_cuda_stream.py \
   test/runtime/test_kimi_k3_config.py
