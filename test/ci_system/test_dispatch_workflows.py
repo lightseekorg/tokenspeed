@@ -983,10 +983,16 @@ def test_mi450_sim_uses_direct_runner_and_bounded_timeout():
 
 
 @pytest.mark.parametrize(
-    "workflow_stage", ["unit-test", "kernel-benchmark", "model-test"]
+    ("workflow_stage", "task_type"),
+    [
+        ("unit-test", "ut"),
+        ("kernel-benchmark", "perf"),
+        ("model-test", "eval"),
+        ("model-test", "perf"),
+    ],
 )
 def test_pr_task_caches_are_isolated_and_cleaned_with_their_job(
-    tmp_path, workflow_stage
+    tmp_path, workflow_stage, task_type
 ):
     workflow = load_yaml(REPO_ROOT / ".github/workflows/run-pr-test-stage.yml")
     steps = workflow["jobs"]["test"]["steps"]
@@ -1003,6 +1009,11 @@ def test_pr_task_caches_are_isolated_and_cleaned_with_their_job(
         "MIOPEN_USER_DB_PATH",
         "MIOPEN_CUSTOM_CACHE_DIR",
     )
+    isolated_variables = tuple(
+        variable
+        for variable in cache_variables
+        if variable != "TRITON_CACHE_DIR" or task_type == "eval"
+    )
     job_envs = []
     for attempt in (1, 2):
         env_file = tmp_path / f"env-{attempt}"
@@ -1014,6 +1025,7 @@ def test_pr_task_caches_are_isolated_and_cleaned_with_their_job(
             "matrix.name": "eval-cache-test",
             "matrix.runner": "amd-mi35x-2gpu-test",
             "matrix.workflow_stage": workflow_stage,
+            "matrix.type": task_type,
         }.items():
             script = script.replace("${{ " + expression + " }}", value)
         subprocess.run(
@@ -1032,7 +1044,9 @@ def test_pr_task_caches_are_isolated_and_cleaned_with_their_job(
         if workflow_stage != "model-test":
             assert all(variable not in job_env for variable in cache_variables)
             continue
-        for variable in cache_variables:
+        if task_type == "perf":
+            assert "TRITON_CACHE_DIR" not in job_env
+        for variable in isolated_variables:
             cache = Path(job_env[variable])
             assert cache.is_relative_to(Path(job_env["WORK_DIR"]))
             assert cache != shared_cache
@@ -1044,11 +1058,11 @@ def test_pr_task_caches_are_isolated_and_cleaned_with_their_job(
         assert sentinel.exists()
         return
     first, second = job_envs
-    assert all(first[variable] != second[variable] for variable in cache_variables)
+    assert all(first[variable] != second[variable] for variable in isolated_variables)
     script = cleanup["run"].replace("${{ env.WORK_DIR }}", first["WORK_DIR"])
     script = script.replace("${{ matrix.runner }}", "amd-mi35x-2gpu-test")
     subprocess.run(["bash", "-c", script], check=True)
-    for variable in cache_variables:
+    for variable in isolated_variables:
         assert not Path(first[variable]).exists()
         assert (Path(second[variable]) / "download").exists()
     assert sentinel.exists()

@@ -136,11 +136,20 @@ space in a persistent `/cache/uv` volume. The existing always-run work-directory
 cleanup removes the job's uv cache on success or failure. Unit-test, kernel
 benchmark, pip, and release-wheel caches retain their existing policy.
 
-Model jobs also keep Triton's compiled kernels in `.triton-cache` under their
+Accuracy jobs also keep Triton's compiled kernels in `.triton-cache` under their
 work directory. Lazy compilation during a request can then write its cache even
 when the runner's shared `/cache/triton` volume is full. The directory survives
 the task's server restarts and is removed by the same job cleanup; compiler
-options and test workloads are unchanged.
+options and test workloads are unchanged. Performance jobs retain the runner's
+Triton cache policy so cold compilation is not newly introduced into measured
+requests.
+
+The AMD Kimi-K3 EAGLE3 performance task publishes its EvalScope outputs and
+tokenizer under `.ci-artifacts/published/kimi-k3-eagle3-perf`, including the
+request/response database. These artifacts allow input, output, and speculative
+acceptance differences to be investigated alongside timing changes. The task
+still measures one 4K-input/1K-output request with zero benchmark warmup requests
+and its original performance reference and threshold.
 
 The AMD DeepSeek-V4.1-Flash GSM8K task downloads its weights into
 `.hf-model-cache` in the job's work directory. Its uncached checkpoint can exceed
