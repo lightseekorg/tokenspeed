@@ -479,7 +479,7 @@ class DeepseekV3FusedQkvAProjWithMqa(ReplicatedLinear):
 
 class DeepseekV3AttentionMLA(nn.Module):
     # Backends that use non-absorbed MLA kernels (ragged prefill, paged KV decode).
-    _MLA_KERNEL_BACKENDS = ("mla", "trtllm_mla", "tokenspeed_mla")
+    _MLA_KERNEL_BACKENDS = ("mla", "gluon", "trtllm_mla", "tokenspeed_mla")
     # Backends that support chunked ragged prefill with prefix replay.
     _RAGGED_PREFILL_BACKENDS = ("mla", "trtllm_mla", "tokenspeed_mla")
 
