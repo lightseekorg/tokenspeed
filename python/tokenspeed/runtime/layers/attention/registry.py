@@ -97,6 +97,10 @@ class AttentionBuild:
     Placement stays in the build result rather than on the allocation owner.
     """
 
+    # Resolved full-attention choices, including hybrid sub-backends. These
+    # are startup compatibility facts; they do not expose backend internals.
+    attention_backend_name: str
+    draft_attention_backend_name: str
     attn_backend: AttentionBackend
     token_to_kv_pool: CachePool
     draft_attn_backend: AttentionBackend | None
@@ -1251,6 +1255,18 @@ def create_attn_components(
     )
 
     return AttentionBuild(
+        attention_backend_name=(
+            target_full_attn_backend_name
+            or _get_default_backend_name(model_config.attention_arch)
+        ),
+        draft_attention_backend_name=(
+            (
+                draft_full_attn_backend_name
+                or _get_default_backend_name(draft_model_config.attention_arch)
+            )
+            if draft_attn_backend is not None
+            else ""
+        ),
         attn_backend=backend,
         token_to_kv_pool=pool,
         draft_attn_backend=draft_attn_backend,
