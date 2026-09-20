@@ -58,6 +58,7 @@ from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
 )
 from tokenspeed.runtime.layers.linear import LinearBase
 from tokenspeed.runtime.layers.moe.expert import MoELayer
+from tokenspeed.runtime.models import deepseek_v41 as v41
 from tokenspeed.runtime.models.deepseek_v41 import (
     DeepseekV41ForCausalLM,
     DeepseekV41Model,
@@ -99,8 +100,9 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
             self.layer_id = layer_id
             self.engram = Engram(layer_id) if layer_id >= 37 else None
 
-        def forward(self, hidden, pre_mix, positions, input_ids, ctx, rows):
+        def forward(self, hidden, pre_mix, positions, image_mask, ctx):
             events.append(("layer", self.layer_id))
+            rows = v41._row_plan(self.layer_id, 20, ctx)
             assert rows.keep_rows is None and rows.source is rows.query
             # Distinct HC streams and a non-mean final mix catch weighted/output taps.
             return embeddings[:, None, :] + streams + 10 * self.layer_id, pre_mix
@@ -113,6 +115,7 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
         num_hidden_layers=40, hidden_size=2, hc_mult=4, engram_layer_ids=[37, 38, 39]
     )
     target.model.ced_decoder_start = 20
+    target.model.decoder_uses_engram = True
     target.model.layers = nn.ModuleList(Layer(i) for i in range(40))
     target.model.engram_hash = Mock(return_value=torch.tensor([[0, 1, 2], [0, 1, 2]]))
     target.model.norm = SimpleNamespace(weight=torch.ones(2), variance_epsilon=1e-6)

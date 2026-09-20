@@ -41,9 +41,6 @@ from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import rope_inplace
 from torch import nn
 
-from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
-    V41RowPlan,
-)
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_PREFILL_QUERY_TILE,
 )
@@ -384,7 +381,6 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
                 positions,
                 image_mask=None,
                 ctx=replace(ctx, attn_backend=backend),
-                rows=V41RowPlan(backend.meta, backend.meta, None),
             )
         return _norm(v41_hc_pre(h, pre_mix), self.norm).reshape(
             batch, self.block_size, -1
