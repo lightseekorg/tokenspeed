@@ -50,7 +50,6 @@ _PORTABLE_CAPABILITY = CapabilityRequirement(vendors=frozenset({"nvidia", "amd"}
         "support_logit_cap": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
     },
-    tags={"portability"},
 )
 def triton_mla_prefill(
     q: torch.Tensor,
@@ -99,7 +98,6 @@ def triton_mla_prefill(
         "support_logit_cap": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
     },
-    tags={"portability"},
 )
 def triton_mla_decode_with_kvcache(
     q: torch.Tensor,

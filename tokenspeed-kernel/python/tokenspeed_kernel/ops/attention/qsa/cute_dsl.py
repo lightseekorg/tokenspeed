@@ -141,7 +141,6 @@ if _IS_NVIDIA_BLACKWELL:
             "selected_width": frozenset({_SELECTED_WIDTH}),
         },
         priority=Priority.SPECIALIZED + 2,
-        tags={"latency", "blackwell", "sparse", "cluster"},
     )(cute_dsl_blackwell_qsa_sparse_attention)
     __all__ = ["cute_dsl_blackwell_qsa_sparse_attention"]
 else:

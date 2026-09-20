@@ -225,7 +225,6 @@ if gemm_fp8_nt_groupwise is not error_fn:
             ),
         },
         priority=Priority.SPECIALIZED + 3,
-        tags={"throughput"},
     )
     def flashinfer_mm_fp8_blockscale(
         A: torch.Tensor,

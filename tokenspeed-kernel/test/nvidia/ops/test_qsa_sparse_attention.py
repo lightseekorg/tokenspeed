@@ -30,11 +30,7 @@ import torch
 from tokenspeed_kernel.ops.attention.qsa import qsa_sparse_attention
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import (
-    SelectedKernel,
-    SelectionObjective,
-    select_kernel,
-)
+from tokenspeed_kernel.selection import SelectedKernel, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 if current_platform().is_nvidia:
@@ -165,7 +161,6 @@ def test_qsa_sparse_attention_selects_cute_on_b200_and_b300(
             signature,
             features=None,
             platform=platform,
-            objective=SelectionObjective.DEFAULT,
             traits=traits,
             solution=None,
             override=None,
@@ -178,7 +173,6 @@ def test_qsa_sparse_attention_selects_cute_on_b200_and_b300(
         signature,
         features=None,
         platform=replace(b300_platform, arch_version=ArchVersion(12, 0)),
-        objective=SelectionObjective.DEFAULT,
         traits=traits,
         solution=None,
         override=None,
@@ -222,7 +216,6 @@ def test_qsa_sparse_attention_routes_prefill_and_uniform_decode(
             select_kernel,
             features=None,
             platform=b200_platform,
-            objective=SelectionObjective.DEFAULT,
         ),
     )
     monkeypatch.setattr(SelectedKernel, "__call__", run)

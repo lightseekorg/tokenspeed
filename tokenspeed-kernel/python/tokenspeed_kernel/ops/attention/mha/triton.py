@@ -52,7 +52,6 @@ _PORTABLE_DTYPES = {torch.float16, torch.bfloat16}
         "return_lse": frozenset({False, True}),
         "support_skip_softmax": frozenset({False}),
     },
-    tags={"portability"},
 )
 def triton_mha_prefill(
     q: torch.Tensor,
@@ -105,7 +104,6 @@ def triton_mha_prefill(
         "support_logit_cap": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
     },
-    tags={"portability"},
 )
 def triton_mha_extend_with_kvcache(
     q: torch.Tensor,
@@ -167,7 +165,6 @@ def triton_mha_extend_with_kvcache(
         "support_logit_cap": frozenset({False, True}),
         "return_lse": frozenset({False}),
     },
-    tags={"portability"},
 )
 def triton_mha_decode_with_kvcache(
     q: torch.Tensor,
@@ -234,7 +231,6 @@ if current_platform().is_npu:
         signatures=format_signatures(("q", "k", "v"), "dense", _PORTABLE_DTYPES),
         priority=Priority.PERFORMANT,
         traits=_NPU_OPTIONS,
-        tags={"portability"},
     )
     def torch_npu_mha_prefill(**kwargs):
         return _mha_prefill(**kwargs)
@@ -254,7 +250,6 @@ if current_platform().is_npu:
             "page_size": frozenset({64, 128}),
             "is_causal": frozenset({False, True}),
         },
-        tags={"portability"},
     )
     def torch_npu_mha_extend_with_kvcache(**kwargs):
         return _mha_extend_with_kvcache(**kwargs)
@@ -274,7 +269,6 @@ if current_platform().is_npu:
             "page_size": frozenset({64, 128}),
             "q_len": frozenset({1}),
         },
-        tags={"portability"},
     )
     def torch_npu_mha_decode_with_kvcache(**kwargs):
         return _mha_decode_with_kvcache(**kwargs)

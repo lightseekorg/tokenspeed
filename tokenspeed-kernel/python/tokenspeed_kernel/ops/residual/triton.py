@@ -249,7 +249,6 @@ def _launch_mix_epilogue(
     solution="triton",
     signatures=_MIX_SIGNATURES,
     priority=Priority.PERFORMANT,
-    tags={"determinism", "portability", "throughput"},
 )
 def triton_hyperconnection_mix(
     normalized: torch.Tensor,
@@ -277,7 +276,6 @@ def triton_hyperconnection_mix(
     solution="triton",
     signatures=_COMBINE_SIGNATURES,
     priority=Priority.PERFORMANT,
-    tags={"determinism", "portability"},
 )
 def triton_hyperconnection_combine(
     block_output: torch.Tensor,
@@ -1018,7 +1016,6 @@ def _tiled_mhc_pre_hc4(
         }
     ),
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def triton_mhc_pre(
     residual: torch.Tensor,
@@ -1081,7 +1078,6 @@ def triton_mhc_pre(
         }
     ),
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def triton_mhc_post(
     hidden_states: torch.Tensor,

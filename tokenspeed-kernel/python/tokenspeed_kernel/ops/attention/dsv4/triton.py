@@ -83,7 +83,6 @@ _INDEXER_TRAITS = {
     traits=_INDEXER_TRAITS,
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     priority=Priority.PORTABLE,
-    tags={"portability", "mxfp4", "sparse"},
 )
 def triton_dsv4_prefill_topk_mxfp4(
     index_q: tuple[torch.Tensor, torch.Tensor],
@@ -133,7 +132,6 @@ def triton_dsv4_prefill_topk_mxfp4(
     traits=_INDEXER_TRAITS,
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     priority=Priority.PORTABLE,
-    tags={"portability", "mxfp4", "sparse"},
 )
 def triton_dsv4_decode_topk_mxfp4(
     index_q: tuple[torch.Tensor, torch.Tensor],
@@ -177,7 +175,6 @@ def triton_dsv4_decode_topk_mxfp4(
     traits={"page_size": frozenset({64})},
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     priority=Priority.PORTABLE,
-    tags={"portability", "cuda_graph"},
 )
 def triton_dsv4_plan(
     *,
@@ -401,7 +398,6 @@ def _dsv4_qnorm_rope_kv_insert_kernel(
         "has_q_out": frozenset({True, False}),
     },
     priority=Priority.PORTABLE,
-    tags={"portability", "cache_insert"},
 )
 def triton_dsv4_swa_cache_insert(
     q: torch.Tensor,
@@ -555,7 +551,6 @@ def _dsv4_sparse_attention_kernel(
         "metadata_dtypes": frozenset({torch.int32, torch.int64}),
     },
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def triton_dsv4_prefill(
     q: torch.Tensor,
@@ -756,7 +751,6 @@ def _dsv4_dequantize_selected_cache_segment(
         "metadata_dtypes": frozenset({torch.int32, torch.int64}),
     },
     priority=Priority.PORTABLE,
-    tags={"portability", "paged_cache", "selected_attention"},
 )
 def triton_dsv4_decode(
     q: torch.Tensor,
@@ -1695,7 +1689,6 @@ def _dsv4_fused_csa_indexer_fp8_cache_kernel(
         "cache_format": frozenset({"fp8_scaled_page_planar"}),
     },
     priority=Priority.PORTABLE,
-    tags={"portability", "cache_insert"},
 )
 def triton_dsv4_csa_indexer_fp8_cache_insert(
     *,

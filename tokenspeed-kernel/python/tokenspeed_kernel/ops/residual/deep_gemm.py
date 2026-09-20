@@ -68,7 +68,6 @@ if platform.is_hopper_plus:
             }
         ),
         priority=Priority.PERFORMANT,
-        tags={"throughput"},
     )
     def deep_gemm_mhc_pre(
         residual: torch.Tensor,

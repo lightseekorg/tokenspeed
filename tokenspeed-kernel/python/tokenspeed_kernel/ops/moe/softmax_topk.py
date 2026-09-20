@@ -134,7 +134,6 @@ def moe_softmax_topk(
     solution="torch",
     signatures=format_signatures("router_logits", "dense", set(_SUPPORTED_DTYPES)),
     priority=Priority.PORTABLE,
-    tags={"portability", "reference"},
 )
 def torch_softmax_topk(
     *,

@@ -58,7 +58,6 @@ if current_platform().is_amd:
             "routing_kind": frozenset({"plain", "bias", "hash"}),
         },
         priority=Priority.SPECIALIZED,
-        tags={"amd", "gfx950", "routing", "latency"},
     )
     def gluon_dsv4_select_experts_gfx950(*args, **kwargs):
         return _select_experts_impl(*args, **kwargs)

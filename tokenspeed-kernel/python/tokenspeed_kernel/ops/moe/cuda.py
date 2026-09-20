@@ -35,7 +35,6 @@ except ImportError:
         "routing_kind": frozenset({"bias", "hash"}),
     },
     priority=Priority.SPECIALIZED,
-    tags={"nvidia", "routing", "latency"},
 )
 def cuda_dsv4_select_experts(
     router_logits: torch.Tensor,

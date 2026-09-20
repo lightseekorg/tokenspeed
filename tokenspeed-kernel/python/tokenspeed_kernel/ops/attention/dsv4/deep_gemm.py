@@ -454,7 +454,6 @@ def _register(format_name: str, min_arch: ArchVersion) -> None:
             "index_k_format": frozenset({format_name}),
         },
         priority=Priority.SPECIALIZED,
-        tags={"nvidia", "sparse", "latency"},
     )
     register_kernel(
         "attention",

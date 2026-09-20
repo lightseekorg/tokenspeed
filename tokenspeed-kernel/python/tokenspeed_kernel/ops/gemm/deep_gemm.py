@@ -252,7 +252,6 @@ if platform.is_hopper_plus:
             "weight_scale_dtype": frozenset({torch.float32}),
         },
         priority=Priority.SPECIALIZED + 2,
-        tags={"throughput"},
         weight_preprocessor=_deep_gemm_dsv4_grouped_output_projection_weights,
     )
     def deep_gemm_dsv4_grouped_output_projection(
@@ -328,7 +327,6 @@ if platform.is_hopper_plus:
             "block_scale_layout": frozenset({"canonical"}),
         },
         priority=Priority.SPECIALIZED + 2,
-        tags={"throughput"},
     )
     def deep_gemm_mm_fp8_blockscale(
         A: torch.Tensor,

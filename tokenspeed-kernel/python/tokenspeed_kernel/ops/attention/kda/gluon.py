@@ -80,7 +80,6 @@ if current_platform().is_amd:
             {torch.float16, torch.bfloat16},
         ),
         priority=Priority.SPECIALIZED,
-        tags={"amd", "gfx950", "paged_cache"},
     )
     def gluon_kda_paged_prefill_gfx950(**kwargs) -> KdaPrefillResult:
         """Run specialized gfx950 KDA prefill with V-major state."""
@@ -105,7 +104,6 @@ if current_platform().is_amd:
             {torch.float16, torch.bfloat16},
         ),
         priority=Priority.SPECIALIZED,
-        tags={"amd", "gfx1250", "paged_cache"},
     )
     def gluon_kda_paged_prefill_gfx1250(**kwargs) -> KdaPrefillResult:
         """Run specialized gfx1250 KDA prefill with V-major state."""
@@ -135,7 +133,6 @@ if current_platform().is_amd:
             "single_token": frozenset({True}),
             "recurrent_layout": frozenset({"v_major"}),
         },
-        tags={"amd", "gfx950", "paged_cache", "cuda_graph"},
     )
     def gluon_kda_paged_decode_gfx950(**kwargs):
         """Run specialized gfx950 KDA decode against the physical V-major pool."""
@@ -165,7 +162,6 @@ if current_platform().is_amd:
             "conv_kernel_size": frozenset({4}),
             "recurrent_layout": frozenset({"v_major"}),
         },
-        tags={"amd", "gfx950", "paged_cache", "cuda_graph", "fusion"},
     )
     def gluon_kda_fused_paged_decode_vmajor_gfx950(
         mixed_qkv: torch.Tensor,
@@ -278,15 +274,6 @@ if current_platform().is_amd:
             "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
         },
-        tags={
-            "amd",
-            "gfx950",
-            "paged_cache",
-            "cuda_graph",
-            "fusion",
-            "speculative",
-            "replay",
-        },
     )
     def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(*args, **kwargs):
         return _gluon_kda_fused_paged_verify_vmajor_gfx950(*args, **kwargs)
@@ -310,16 +297,6 @@ if current_platform().is_amd:
             "replay_raw_gate": frozenset({True}),
             "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
-        },
-        tags={
-            "amd",
-            "gfx950",
-            "paged_cache",
-            "cuda_graph",
-            "speculative",
-            "replay",
-            "batched_layers",
-            "raw_gate",
         },
     )
     def gluon_kda_fused_replay_gfx950(
@@ -384,7 +361,6 @@ if current_platform().is_amd:
             "single_token": frozenset({True}),
             "recurrent_layout": frozenset({"v_major"}),
         },
-        tags={"amd", "gfx1250", "paged_cache", "cuda_graph"},
     )
     def gluon_kda_paged_decode_gfx1250(**kwargs):
         """Run specialized gfx1250 KDA decode against the physical V-major pool."""
@@ -414,7 +390,6 @@ if current_platform().is_amd:
             "conv_kernel_size": frozenset({4}),
             "recurrent_layout": frozenset({"v_major"}),
         },
-        tags={"amd", "gfx1250", "paged_cache", "cuda_graph", "fusion"},
     )
     def gluon_kda_fused_paged_decode_vmajor_gfx1250(
         mixed_qkv: torch.Tensor,
@@ -527,15 +502,6 @@ if current_platform().is_amd:
             "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
         },
-        tags={
-            "amd",
-            "gfx1250",
-            "paged_cache",
-            "cuda_graph",
-            "fusion",
-            "speculative",
-            "replay",
-        },
     )
     def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(*args, **kwargs):
         return _gluon_kda_fused_paged_verify_vmajor_gfx1250(*args, **kwargs)
@@ -559,16 +525,6 @@ if current_platform().is_amd:
             "replay_raw_gate": frozenset({True}),
             "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
-        },
-        tags={
-            "amd",
-            "gfx1250",
-            "paged_cache",
-            "cuda_graph",
-            "speculative",
-            "replay",
-            "batched_layers",
-            "raw_gate",
         },
     )
     def gluon_kda_fused_replay_gfx1250(

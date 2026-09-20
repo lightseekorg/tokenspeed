@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import bounded_group_slots
-from tokenspeed_kernel.selection import SelectionObjective, select_kernel
+from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
@@ -77,7 +77,6 @@ def _kernel(mode: str, x: torch.Tensor):
         format_signature(x=dense_tensor_format(x.dtype)),
         features=None,
         platform=None,
-        objective=SelectionObjective.DEFAULT,
         traits=None,
         solution=None,
         override=None,
@@ -305,7 +304,6 @@ def selected_attention(
         format_signature(x=dense_tensor_format(q.dtype)),
         features=None,
         platform=None,
-        objective=SelectionObjective.DEFAULT,
         traits={"flashmla_eligible": native},
         solution=None,
         override=None,
@@ -477,7 +475,6 @@ def index_topk(
         format_signature(x=dense_tensor_format(index_q.dtype)),
         features=None,
         platform=None,
-        objective=SelectionObjective.DEFAULT,
         traits={
             "native_indexer": native,
             "index_heads": index_heads,

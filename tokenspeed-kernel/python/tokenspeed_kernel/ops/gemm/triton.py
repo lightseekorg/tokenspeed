@@ -824,7 +824,6 @@ def triton_scaled_mm(
     signatures=_MXFP8_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PERFORMANT + 3,
-    tags={"portability"},
 )
 def triton_mm_fp8_blockscale(
     A: torch.Tensor,
@@ -954,7 +953,6 @@ def _w8a8_block_fp8_bmm(
         "out_inner_stride_one": frozenset({True}),
     },
     priority=Priority.PERFORMANT + 3,
-    tags={"portability"},
 )
 def triton_bmm_fp8_blockscale(
     A: torch.Tensor,
@@ -1074,7 +1072,6 @@ def _triton_dsv4_grouped_output_projection_weights(
     ),
     traits={},
     priority=Priority.PERFORMANT + 3,
-    tags={"portability"},
     weight_preprocessor=_triton_dsv4_grouped_output_projection_weights,
 )
 def triton_dsv4_grouped_output_projection(
@@ -1289,7 +1286,6 @@ def triton_mm_mxfp4(
         "b_layout": frozenset({"KN"}),
     },
     priority=Priority.PERFORMANT + 2,
-    tags={"portability"},
 )
 def triton_mm_fp8_scaled(
     A: torch.Tensor,

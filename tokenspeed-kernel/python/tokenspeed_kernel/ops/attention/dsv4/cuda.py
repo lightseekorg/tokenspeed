@@ -95,7 +95,6 @@ if platform.is_nvidia and has_fused_qnorm_rope_kv_insert():
             "has_q_out": frozenset({True, False}),
         },
         priority=Priority.SPECIALIZED,
-        tags={"nvidia", "cache_insert", "latency"},
     )
     def cuda_dsv4_swa_cache_insert(
         q: torch.Tensor,
@@ -226,7 +225,6 @@ if platform.is_nvidia and platform.is_hopper_plus:
             "metadata_dtypes": frozenset({torch.int32}),
         },
         priority=Priority.PERFORMANT,
-        tags={"nvidia", "paged_cache", "selected_attention"},
     )
     def flashmla_dsv4_decode(
         q: torch.Tensor,

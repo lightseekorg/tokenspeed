@@ -343,7 +343,6 @@ if current_platform().is_amd:
             "index_k_format": frozenset({"fp8_scaled"}),
             "index_k_layout": frozenset({"packed", "page_planar"}),
         },
-        tags={"amd", "gfx1250"},
     )
     def gluon_dsa_decode_topk_standard_gfx1250(*args, **kwargs):
         return _dsa_decode_topk_standard_gfx1250_impl(*args, **kwargs)
@@ -377,7 +376,6 @@ if current_platform().is_amd:
             "index_k_format": frozenset({"fp8_scaled"}),
             "index_k_layout": frozenset({"packed", "page_planar"}),
         },
-        tags={"amd", "gfx1250"},
     )
     def gluon_dsa_prefill_topk_standard_gfx1250(*args, **kwargs):
         return _dsa_prefill_topk_standard_gfx1250_impl(*args, **kwargs)
@@ -413,7 +411,6 @@ if current_platform().is_amd:
             "index_k_format": frozenset({"fp8_scaled"}),
             "index_k_layout": frozenset({"packed", "page_planar"}),
         },
-        tags={"amd", "gfx1250"},
     )
     def gluon_dsa_decode_topk_fp8_gfx1250(*args, **kwargs):
         return _dsa_decode_topk_gfx1250_impl(*args, **kwargs)
@@ -448,7 +445,6 @@ if current_platform().is_amd:
             "index_k_format": frozenset({"fp8_scaled"}),
             "index_k_layout": frozenset({"packed", "page_planar"}),
         },
-        tags={"amd", "gfx1250"},
     )
     def gluon_dsa_prefill_topk_fp8_gfx1250(*args, **kwargs):
         return _dsa_prefill_topk_gfx1250_impl(*args, **kwargs)
@@ -484,7 +480,6 @@ if current_platform().is_amd:
             "support_logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
         },
-        tags={"amd", "gfx1250"},
     )
     def gluon_dsa_decode_gfx1250(*args, enable_pdl: bool = False, **kwargs):
         kwargs.pop("kv_seq_lens", None)
@@ -519,7 +514,6 @@ if current_platform().is_amd:
             "support_logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
         },
-        tags={"amd", "gfx1250"},
     )
     def gluon_dsa_prefill_gfx1250(*args, enable_pdl: bool = False, **kwargs):
         kwargs.pop("kv_seq_lens", None)
@@ -555,7 +549,6 @@ if current_platform().is_amd:
             "support_logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
         },
-        tags={"amd", "gfx1250"},
     )
     def gluon_dsa_prefill_fp8_dense_gfx1250(*args, enable_pdl: bool = False, **kwargs):
         kwargs.pop("kv_seq_lens", None)

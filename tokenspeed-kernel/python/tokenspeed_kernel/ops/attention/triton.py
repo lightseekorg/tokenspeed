@@ -77,7 +77,6 @@ def attn_merge_state_kernel(
     ),
     priority=Priority.PORTABLE,
     traits={},
-    tags={"portability"},
 )
 def triton_attn_merge_state(
     out_a: torch.Tensor,

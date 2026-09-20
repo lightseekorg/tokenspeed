@@ -61,9 +61,8 @@ choices (still evolving; subject to change):
   non-format traits (head dim, GQA factor, ...), and a priority band.
 - **Auto-selection** — `select_kernel` filters by capability and traits,
   ranks the survivors with an optional per-family `SelectionOracle` and
-  priority, and returns a callable. Selection accepts an objective (latency,
-  throughput, determinism, portability) and supports per-call `override=` plus
-  config-file overrides for development.
+  priority, and returns a callable. Selection supports per-call `solution=`
+  and `override=` plus config-file overrides for development.
 
 ### Directory structure
 
