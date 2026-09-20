@@ -997,7 +997,12 @@ def test_pr_task_caches_are_isolated_and_cleaned_with_their_job(
     shared_cache.mkdir()
     sentinel = shared_cache / "another-job"
     sentinel.touch()
-    cache_variables = ("UV_CACHE_DIR", "MIOPEN_USER_DB_PATH", "MIOPEN_CUSTOM_CACHE_DIR")
+    cache_variables = (
+        "UV_CACHE_DIR",
+        "TRITON_CACHE_DIR",
+        "MIOPEN_USER_DB_PATH",
+        "MIOPEN_CUSTOM_CACHE_DIR",
+    )
     job_envs = []
     for attempt in (1, 2):
         env_file = tmp_path / f"env-{attempt}"

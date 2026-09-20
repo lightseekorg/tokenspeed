@@ -16,6 +16,7 @@ server:
   command: >-
     ts serve
     --model deepseek-ai/DeepSeek-V4.1-Flash
+    --download-dir "${PWD}/.hf-model-cache"
     --tensor-parallel-size 4
     --dtype bfloat16
     --max-model-len 1048576

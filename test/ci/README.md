@@ -136,6 +136,19 @@ space in a persistent `/cache/uv` volume. The existing always-run work-directory
 cleanup removes the job's uv cache on success or failure. Unit-test, kernel
 benchmark, pip, and release-wheel caches retain their existing policy.
 
+Model jobs also keep Triton's compiled kernels in `.triton-cache` under their
+work directory. Lazy compilation during a request can then write its cache even
+when the runner's shared `/cache/triton` volume is full. The directory survives
+the task's server restarts and is removed by the same job cleanup; compiler
+options and test workloads are unchanged.
+
+The AMD DeepSeek-V4.1-Flash GSM8K task downloads its weights into
+`.hf-model-cache` in the job's work directory. Its uncached checkpoint can exceed
+the remaining capacity of the shared model volume; the job filesystem provides
+separate writable storage, cleaned up with the work directory. The model ID,
+precision, evaluation workload, and score threshold stay the same. This task
+downloads a fresh checkpoint for each job, so startup includes the download time.
+
 The same model jobs isolate MIOpen's writable user database and kernel cache
 under `.miopen-db` and `.miopen-kernels` in their work directory. This avoids
 SQLite I/O failures from a runner's shared cache. MIOpen's system database and

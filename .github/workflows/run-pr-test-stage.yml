@@ -80,6 +80,8 @@ jobs:
           # The existing work-directory cleanup also removes this cache.
           if [ "${{ matrix.workflow_stage }}" = "model-test" ]; then
             echo "UV_CACHE_DIR=$work_dir/.uv-cache" >> "$GITHUB_ENV"
+            # Lazy kernel compilation must also avoid a full shared volume.
+            echo "TRITON_CACHE_DIR=$work_dir/.triton-cache" >> "$GITHUB_ENV"
             # MIOpen's writable SQLite databases also need job-local storage.
             mkdir -p "$work_dir/.miopen-db" "$work_dir/.miopen-kernels"
             echo "MIOPEN_USER_DB_PATH=$work_dir/.miopen-db" >> "$GITHUB_ENV"
