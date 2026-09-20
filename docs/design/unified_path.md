@@ -292,7 +292,13 @@ decoder stage eager. Layers read their row plan from the live context, never
 from a loose argument a captured break would freeze. Capture runs the
 narrowing before every decoder run, as serving does: the decoder consumes
 per-forward backend state its predecessor produces (V4.1's reuse layers read
-the index source's selection, which later sources overwrite).
+the index source's selection, which later sources overwrite). Under
+attention DP the split graph stays off: the narrowed row count is rank-local
+(which prompts complete on this rank), so the decoder bucket and the
+collective shapes its graph bakes would differ across ranks, and the stages
+size their collectives from their own rows, which the DP metadata gather
+does not carry (the same gap that keeps narrowing itself unimplemented under
+DP).
 
 ### One draft metadata contract
 

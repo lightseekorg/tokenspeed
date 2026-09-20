@@ -1054,6 +1054,45 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
             self.assertIs(graph._narrowing, inner if expected_buckets else None)
             self.assertEqual(graph.decoder_buckets, expected_buckets)
 
+    def test_narrowing_model_stays_eager_under_attention_dp(self):
+        """The narrowed row count is rank-local, so decoder buckets (and the
+        collective shapes their graphs bake) could differ across DP ranks:
+        the split graph is off under DP; an ordinary model keeps its graph."""
+        from unittest import mock
+
+        model, _ = self._model(128, [])
+        for inner, expected_disable in (
+            (model, True),
+            (SimpleNamespace(embed_tokens=object()), False),
+        ):
+            inner.embed_tokens = object()
+            model_runner = SimpleNamespace(
+                model=SimpleNamespace(model=inner),
+                is_generation=True,
+                is_multimodal=False,
+            )
+            config = SimpleNamespace(
+                enforce_eager=False,
+                disable_prefill_graph=False,
+                data_parallel_size=2,
+                max_num_seqs=8,
+            )
+            with (
+                mock.patch.object(
+                    self.mod, "get_prefill_token_buckets", return_value=[64, 256]
+                ),
+                mock.patch.object(self.mod.PrefillGraph, "capture"),
+            ):
+                graph = self.mod.PrefillGraph(
+                    model_runner=model_runner,
+                    attn_backend=object(),
+                    token_to_kv_pool=_fake_pool(runtime_contract=object()),
+                    input_buffers=object(),
+                    config=config,
+                )
+            self.assertEqual(graph.disable, expected_disable)
+            self.assertEqual(graph.decoder_buckets, [])
+
     def _bare(self, model, State, decoder_buckets, calls):
         pg = self.mod.PrefillGraph.__new__(self.mod.PrefillGraph)
         pg._narrowing = model

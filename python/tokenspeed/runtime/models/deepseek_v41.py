@@ -1463,14 +1463,6 @@ class DeepseekV41Model(nn.Module):
         h = h.unsqueeze(1).repeat(1, self.config.hc_mult, 1)
         pre_mix = torch.zeros(h.shape[:2], dtype=torch.float32, device=h.device)
         pre_mix[:, 0] = 1
-        if (
-            ctx.attn_backend.decoder_view().keep_rows is not None
-            and ctx.global_num_tokens is not None
-        ):
-            raise NotImplementedError(
-                "V4.1 CED narrowing under attention data parallelism needs the "
-                "narrowed row counts exchanged across ranks"
-            )
         state = V41RowState(
             h, pre_mix, positions, image_mask, hashes, engram_token_mask, []
         )
@@ -1498,6 +1490,13 @@ class DeepseekV41Model(nn.Module):
         if state.rows > rows:
             state = state.leading(rows)
         view = backend.decoder_view()
+        # Checked here, in the stage that always runs eagerly: a replayed
+        # encoder graph would skip a check placed before it.
+        if view.keep_rows is not None and ctx.global_num_tokens is not None:
+            raise NotImplementedError(
+                "V4.1 CED narrowing under attention data parallelism needs the "
+                "narrowed row counts exchanged across ranks"
+            )
         captured = list(state.captured)
         with report_collective_sizing(ctx, view.metadata.positions.numel(), None):
             hidden, pre_mix = self._run_layer(

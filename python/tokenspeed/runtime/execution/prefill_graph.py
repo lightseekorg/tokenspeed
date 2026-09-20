@@ -52,7 +52,8 @@ graphs per token bucket (``encoder_forward``) and decoder graphs per
 decoder-row bucket (``decoder_forward`` from a fixed-row static state). The
 decoder graphs depend only on their row count, so they are shared by every
 token bucket; a forward whose narrowed rows exceed the largest decoder bucket
-runs its decoder stage eager after the encoder replay.
+runs its decoder stage eager after the encoder replay. Under attention DP the
+narrowed row count is rank-local, so the split graph is disabled there.
 """
 
 from __future__ import annotations
@@ -379,6 +380,15 @@ class PrefillGraph:
         self.num_warmup = num_warmup
         self.dp_size = config.data_parallel_size
 
+        # A narrowing model is captured as encoder + decoder graph families
+        # around its eager narrowing stage (module docstring); None means the
+        # whole inner forward is one token-shaped capture.
+        self._narrowing: NarrowingPrefillModel | None = (
+            self.inner_model
+            if isinstance(self.inner_model, NarrowingPrefillModel)
+            else None
+        )
+
         self.capture_buckets = get_prefill_token_buckets(config)
         self.disable = (
             config.enforce_eager
@@ -397,16 +407,25 @@ class PrefillGraph:
             # collectives. Until the DP metadata gather carries a multimodal
             # flag, keep the graph off for multimodal models under DP.
             or (config.data_parallel_size > 1 and model_runner.is_multimodal)
+            # The narrowed row count is rank-local (which prompts complete on
+            # this rank), so the decoder bucket -- and the collective shapes
+            # its graph bakes -- would differ across ranks; the stages also
+            # size their collectives from their own rows, which the DP
+            # gather does not carry. Until narrowed counts are exchanged,
+            # the split graph stays off under attention DP.
+            or (config.data_parallel_size > 1 and self._narrowing is not None)
         )
+        if (
+            self._narrowing is not None
+            and config.data_parallel_size > 1
+            and not config.enforce_eager
+            and not config.disable_prefill_graph
+        ):
+            logger.info(
+                "Prefill CUDA graphs disabled: the narrowing prefill model's "
+                "decoder rows are rank-local under attention DP"
+            )
 
-        # A narrowing model is captured as encoder + decoder graph families
-        # around its eager narrowing stage (module docstring); None means the
-        # whole inner forward is one token-shaped capture.
-        self._narrowing: NarrowingPrefillModel | None = (
-            self.inner_model
-            if isinstance(self.inner_model, NarrowingPrefillModel)
-            else None
-        )
         self.decoder_buckets: list[int] = (
             get_decoder_row_buckets(
                 self.capture_buckets,
