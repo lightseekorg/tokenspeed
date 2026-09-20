@@ -71,8 +71,9 @@ class BatchLogger:
         pd_lifecycle: Query returning the PD request lifecycle counts
             ``(bootstrapping, prefilling, remote_prefilling, decoding,
             pd_pinned)`` read from the C++ scheduler, appended to each batch
-            line. None on a fused engine, where every count but prefilling
-            and decoding is zero by construction.
+            line; the bootstrapping count is also folded into ``#queue-req``.
+            None on a fused engine, where every count but prefilling and
+            decoding is zero by construction.
         context_length: ``request_id -> int`` giving the tokens a running
             request currently holds (prompt plus generated so far). Read for
             each request of a decode round only when its line is emitted,
@@ -111,12 +112,22 @@ class BatchLogger:
         self._num_decode_steps = 0
         self._last_decode_tic = time.time()
 
-    def _lifecycle_suffix(self) -> str:
-        """The PD request-state counts, read only when a line is emitted."""
+    def _queue_suffix(self, stats: dict) -> str:
+        """``#queue-req`` and the PD request-state counts for one line.
+
+        Under PD every request parks in Bootstrapping until the peer has set
+        its side up -- on the prefill role, until decode has allocated the KV
+        pages -- and the scheduler's waiting count leaves that state out. To
+        the operator those requests are queued all the same, so the line
+        counts them in ``#queue-req``; the state suffix still shows the
+        bootstrap share on its own. Read only when a line is emitted.
+        """
+        queued = stats["num_queue_reqs"]
         if self._pd_lifecycle is None:
-            return ""
+            return f", #queue-req: {queued!s}"
         counts = self._pd_lifecycle()
         return (
+            f", #queue-req: {queued + counts[0]!s}"
             ", #req-state(bootstrap/prefill/remote-prefill/decode/pd-pinned): "
             + "/".join(str(count) for count in counts)
         )
@@ -156,8 +167,7 @@ class BatchLogger:
             f"{mode!s} batch. #dp-rank: {self._dp_rank!s}, "
             f"#new-seq: {num_extends!s}, #new-token: {total_tokens!s}, "
             f"#cached-token: {cached_tokens!s}, "
-            f"#running-req: {bs!s}, #queue-req: {stats['num_queue_reqs']!s}"
-            f"{self._lifecycle_suffix()!s}",
+            f"#running-req: {bs!s}{self._queue_suffix(stats)!s}",
         )
 
     def _log_decode(self, request_ids, bs: int, stats: dict) -> None:
@@ -185,8 +195,8 @@ class BatchLogger:
                 f"page ratio: {page_ratio:.2f}, gen throughput (token/s): "
                 f"{gen_throughput:.2f}, "
                 f"avg_accept_len: {avg_accept:.2f}, accept_rate: "
-                f"{(avg_accept - 1) / self._spec_num_steps:.2f}, #queue-req: "
-                f"{stats['num_queue_reqs']!s}{self._lifecycle_suffix()!s}",
+                f"{(avg_accept - 1) / self._spec_num_steps:.2f}"
+                f"{self._queue_suffix(stats)!s}",
             )
         else:
             logger.info(
@@ -195,8 +205,7 @@ class BatchLogger:
                 f"#pages(active/cached/total): {num_active_pages!s}/"
                 f"{stats['num_cached_pages']!s}/{self._num_total_pages!s}, "
                 f"page ratio: {page_ratio:.2f}, gen throughput (token/s): "
-                f"{gen_throughput:.2f}, "
-                f"#queue-req: {stats['num_queue_reqs']!s}{self._lifecycle_suffix()!s}",
+                f"{gen_throughput:.2f}{self._queue_suffix(stats)!s}",
             )
         self._log_cache_state_group_pages()
         self._num_generated_tokens = 0

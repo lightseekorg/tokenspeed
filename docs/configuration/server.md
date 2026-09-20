@@ -275,6 +275,14 @@ throughput accumulated since the previous line, `avg_accept_len` /
 `accept_rate` under speculative decoding, and `#queue-req`. Every field is a
 host-side scheduler counter; the line adds no GPU synchronization.
 
+`#queue-req` counts requests admitted to the scheduler but not yet running.
+On a PD engine that includes requests still bootstrapping with the peer —
+on the prefill role, waiting for the decode side to allocate their KV pages —
+which the `#req-state(bootstrap/prefill/remote-prefill/decode/pd-pinned)`
+suffix also lists on its own. The Prometheus waiting gauge and the router
+load snapshot report the scheduler's narrower waiting count, without the
+bootstrapping share.
+
 Set `TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS=1` to log each speculative verify
 step's committed widths and accepted draft-token counts. This reads the
 already-synchronized CPU result and does not add a GPU synchronization, but it

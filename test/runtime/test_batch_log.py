@@ -249,8 +249,24 @@ def test_pd_lifecycle_counts_are_read_only_when_a_line_is_emitted():
         logger.log_dispatch(_decode_op(2), STATS)
 
     assert len(reads) == 1
+    # #queue-req adds the 3 bootstrapping requests to the scheduler's 7
+    # waiting ones: on the prefill role they sit there until decode has
+    # allocated their KV pages, which is queueing to the operator.
     assert log.call_args.args[0].endswith(
+        ", #queue-req: 10"
         ", #req-state(bootstrap/prefill/remote-prefill/decode/pd-pinned): 3/5/4/2/4"
+    )
+
+
+def test_pd_prefill_line_queues_bootstrapping_requests():
+    logger = _logger(pd_lifecycle=lambda: (9, 1, 0, 0, 1))
+    with mock.patch.object(batch_log_module.logger, "info") as log:
+        logger.log_dispatch(_extend_op(["a"], 1, [10], [0]), STATS)
+
+    log.assert_called_once_with(
+        "Prefill batch. #dp-rank: 2, #new-seq: 1, #new-token: 10, "
+        "#cached-token: 0, #running-req: 1, #queue-req: 16"
+        ", #req-state(bootstrap/prefill/remote-prefill/decode/pd-pinned): 9/1/0/0/1"
     )
 
 
