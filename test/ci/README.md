@@ -136,6 +136,11 @@ space in a persistent `/cache/uv` volume. The existing always-run work-directory
 cleanup removes the job's uv cache on success or failure. Unit-test, kernel
 benchmark, pip, and release-wheel caches retain their existing policy.
 
+The same model jobs isolate MIOpen's writable user database and kernel cache
+under `.miopen-db` and `.miopen-kernels` in their work directory. This avoids
+SQLite I/O failures from a runner's shared cache. MIOpen's system database and
+tuning settings remain unchanged; the job cleanup removes the writable caches.
+
 The MI450 simulator launcher sets `TRITON_LIBHIP_PATH` to the ROCm SDK's
 unversioned `libamdhip64.so` linker name. The gfx1250 PyTorch wheel and
 TokenSpeed use separate Triton distributions in the same process, and this

@@ -985,7 +985,7 @@ def test_mi450_sim_uses_direct_runner_and_bounded_timeout():
 @pytest.mark.parametrize(
     "workflow_stage", ["unit-test", "kernel-benchmark", "model-test"]
 )
-def test_pr_task_uv_cache_is_isolated_and_cleaned_with_its_job(
+def test_pr_task_caches_are_isolated_and_cleaned_with_their_job(
     tmp_path, workflow_stage
 ):
     workflow = load_yaml(REPO_ROOT / ".github/workflows/run-pr-test-stage.yml")
@@ -997,6 +997,7 @@ def test_pr_task_uv_cache_is_isolated_and_cleaned_with_its_job(
     shared_cache.mkdir()
     sentinel = shared_cache / "another-job"
     sentinel.touch()
+    cache_variables = ("UV_CACHE_DIR", "MIOPEN_USER_DB_PATH", "MIOPEN_CUSTOM_CACHE_DIR")
     job_envs = []
     for attempt in (1, 2):
         env_file = tmp_path / f"env-{attempt}"
@@ -1015,31 +1016,36 @@ def test_pr_task_uv_cache_is_isolated_and_cleaned_with_its_job(
             env={
                 **os.environ,
                 "GITHUB_ENV": str(env_file),
-                "UV_CACHE_DIR": str(shared_cache),
+                **{variable: str(shared_cache) for variable in cache_variables},
             },
             check=True,
         )
         job_env = dict(line.split("=", 1) for line in env_file.read_text().splitlines())
+        assert "MIOPEN_SYSTEM_DB_PATH" not in job_env
+        assert "MIOPEN_FIND_MODE" not in job_env
+        assert "MIOPEN_FIND_ENFORCE" not in job_env
         if workflow_stage != "model-test":
-            assert "UV_CACHE_DIR" not in job_env
+            assert all(variable not in job_env for variable in cache_variables)
             continue
-        cache = Path(job_env["UV_CACHE_DIR"])
-        assert cache.is_relative_to(Path(job_env["WORK_DIR"]))
-        assert cache != shared_cache
-        cache.mkdir(parents=True)
-        (cache / "download").touch()
+        for variable in cache_variables:
+            cache = Path(job_env[variable])
+            assert cache.is_relative_to(Path(job_env["WORK_DIR"]))
+            assert cache != shared_cache
+            cache.mkdir(parents=True, exist_ok=True)
+            (cache / "download").touch()
         job_envs.append(job_env)
 
     if workflow_stage != "model-test":
         assert sentinel.exists()
         return
     first, second = job_envs
-    assert first["UV_CACHE_DIR"] != second["UV_CACHE_DIR"]
+    assert all(first[variable] != second[variable] for variable in cache_variables)
     script = cleanup["run"].replace("${{ env.WORK_DIR }}", first["WORK_DIR"])
     script = script.replace("${{ matrix.runner }}", "amd-mi35x-2gpu-test")
     subprocess.run(["bash", "-c", script], check=True)
-    assert not Path(first["UV_CACHE_DIR"]).exists()
-    assert (Path(second["UV_CACHE_DIR"]) / "download").exists()
+    for variable in cache_variables:
+        assert not Path(first[variable]).exists()
+        assert (Path(second[variable]) / "download").exists()
     assert sentinel.exists()
 
 
