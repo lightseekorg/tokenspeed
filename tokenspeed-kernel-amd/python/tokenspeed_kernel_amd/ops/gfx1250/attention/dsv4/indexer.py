@@ -48,9 +48,9 @@ _WAVES_PER_EU = 4
 _SUPPORTED_TOPK = (512, 1024, 2048)
 
 __all__ = [
-    "gluon_dsv4_decode_topk_mxfp4_gfx1250",
-    "gluon_dsv4_plan_gfx1250",
-    "gluon_dsv4_prefill_topk_mxfp4_gfx1250",
+    "launch_gluon_dsv4_decode_topk_mxfp4_gfx1250",
+    "launch_gluon_dsv4_plan_gfx1250",
+    "launch_gluon_dsv4_prefill_topk_mxfp4_gfx1250",
 ]
 
 
@@ -975,7 +975,7 @@ def _select_topk(
     )
 
 
-def gluon_dsv4_prefill_topk_mxfp4_gfx1250(
+def launch_gluon_dsv4_prefill_topk_mxfp4_gfx1250(
     index_q: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
     index_k_cache: torch.Tensor,
@@ -1049,7 +1049,7 @@ def gluon_dsv4_prefill_topk_mxfp4_gfx1250(
     return result, None
 
 
-def gluon_dsv4_decode_topk_mxfp4_gfx1250(
+def launch_gluon_dsv4_decode_topk_mxfp4_gfx1250(
     index_q: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
     index_k_cache: torch.Tensor,
@@ -1105,7 +1105,7 @@ def gluon_dsv4_decode_topk_mxfp4_gfx1250(
     return result
 
 
-def gluon_dsv4_plan_gfx1250(
+def launch_gluon_dsv4_plan_gfx1250(
     *,
     page_size: int,
     seq_lens_2d: torch.Tensor,

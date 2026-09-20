@@ -39,10 +39,10 @@ from tokenspeed_kernel.signature import (
 
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
-        gluon_bmm_a16w16_gfx950 as _bmm_a16w16_impl,
+        launch_gluon_bmm_a16w16_gfx950 as _bmm_a16w16_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.mm import (
-        gluon_mm_mxfp8_gfx950 as _mm_mxfp8_impl,
+        launch_gluon_mm_mxfp8_gfx950 as _mm_mxfp8_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.mm import (
         supports_mxfp8_gemm_shape as _supports_mxfp8_gemm_shape,
@@ -50,7 +50,7 @@ if current_platform().is_amd:
 
     try:
         from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.linear_attnres_partials_gfx950 import (
-            gluon_linear_attnres_partials_gfx950 as _linear_attnres_partials_impl,
+            launch_gluon_linear_attnres_partials_gfx950 as _linear_attnres_partials_impl,
         )
     except ImportError as exc:
         # Keep the message only: an exception object carries its traceback,
@@ -197,7 +197,7 @@ if current_platform().is_amd:
     if current_platform().is_cdna5:
         try:
             from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.linear_attnres_partials_gfx1250 import (
-                gluon_linear_attnres_partials_gfx1250 as _linear_attnres_partials_gfx1250_impl,
+                launch_gluon_linear_attnres_partials_gfx1250 as _linear_attnres_partials_gfx1250_impl,
             )
         except ImportError:
             _linear_attnres_partials_gfx1250_impl = None

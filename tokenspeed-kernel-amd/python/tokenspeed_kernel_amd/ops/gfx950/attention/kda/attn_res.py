@@ -55,7 +55,7 @@ def _load_candidate(
 
 
 @gluon.jit
-def _attn_res_rmsnorm_kernel(
+def gluon_attn_res_fwd_gfx950(
     layer_residual,
     delta,
     block_residual,
@@ -229,7 +229,7 @@ def attn_res_rmsnorm_gfx950(
     output = torch.empty_like(layer_residual)
     num_warps = 4 if tokens >= 256 or num_valid_blocks <= 1 else 8
     delta_tensor = layer_residual if delta is None else delta
-    _attn_res_rmsnorm_kernel[(tokens,)](
+    gluon_attn_res_fwd_gfx950[(tokens,)](
         layer_residual,
         delta_tensor,
         block_residual,

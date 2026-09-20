@@ -2,6 +2,19 @@
 
 ## Kernel Conventions
 
+### Names
+
+Proton names a launch after the `@gluon.jit` function it compiled, so the
+kernel that does a registered op's work carries the `tokenspeed-kernel`
+registration name verbatim (`gluon_mm_mxfp8_gfx950`), and the Python launcher
+around it is `launch_<name>` (`launch_gluon_mm_mxfp8_gfx950`). Companion
+kernels launched only by that op insert a role before the arch suffix
+(`gluon_dsv4_decode_reduce_gfx1250`, `gluon_mha_prefill_sliding_gfx950`).
+Kernels shared by several registered ops (routing, sorting, quantize, radix
+top-k, MoE stage pipelines) keep descriptive names.
+`tokenspeed-kernel/test/amd/test_gluon_kernel_naming.py` checks the contract
+from source.
+
 ### Barriers
 
 Do not write `gl.barrier()` for shared-memory (LDS) hazards. The Gluon
