@@ -45,7 +45,10 @@ The Qwen3.5 FP8 DeepEP correctness task runs GSM8K on four B200 GPUs with
 attention TP2, attention DP2, and MoE EP4. DeepEP `auto` mode exercises its
 normal path during prefill and low-latency path during decode, and the task
 uses the bounded non-thinking chat template for CI stability. The task requires
-a score of at least 0.90.
+a score of at least 0.90. After installation, it imports `tokenspeed_kernel` on
+GPU before launching the model, so incompatible native wheels fail at the
+installation stage. This GPU check is kept outside the general installer,
+which also runs during image builds without GPU access.
 
 The Qwen3.8 Flash Next FP8 correctness task runs GSM8K on two GB200 GPUs with
 tensor parallelism 2 and three-step MTP. It keeps KVStore enabled and uses the
