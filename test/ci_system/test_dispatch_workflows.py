@@ -982,6 +982,67 @@ def test_mi450_sim_uses_direct_runner_and_bounded_timeout():
     )
 
 
+@pytest.mark.parametrize(
+    "workflow_stage", ["unit-test", "kernel-benchmark", "model-test"]
+)
+def test_pr_task_uv_cache_is_isolated_and_cleaned_with_its_job(
+    tmp_path, workflow_stage
+):
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/run-pr-test-stage.yml")
+    steps = workflow["jobs"]["test"]["steps"]
+    setup = next(step for step in steps if step["name"] == "Set work directory")
+    cleanup = next(step for step in steps if step["name"] == "Cleanup work directory")
+    assert cleanup["if"] == "always()"
+    shared_cache = tmp_path / "shared-uv"
+    shared_cache.mkdir()
+    sentinel = shared_cache / "another-job"
+    sentinel.touch()
+    job_envs = []
+    for attempt in (1, 2):
+        env_file = tmp_path / f"env-{attempt}"
+        script = setup["run"]
+        for expression, value in {
+            "github.workspace": str(tmp_path / "workspace with spaces"),
+            "github.run_id": "1234",
+            "github.run_attempt": str(attempt),
+            "matrix.name": "eval-cache-test",
+            "matrix.runner": "amd-mi35x-2gpu-test",
+            "matrix.workflow_stage": workflow_stage,
+        }.items():
+            script = script.replace("${{ " + expression + " }}", value)
+        subprocess.run(
+            ["bash", "-c", script],
+            env={
+                **os.environ,
+                "GITHUB_ENV": str(env_file),
+                "UV_CACHE_DIR": str(shared_cache),
+            },
+            check=True,
+        )
+        job_env = dict(line.split("=", 1) for line in env_file.read_text().splitlines())
+        if workflow_stage != "model-test":
+            assert "UV_CACHE_DIR" not in job_env
+            continue
+        cache = Path(job_env["UV_CACHE_DIR"])
+        assert cache.is_relative_to(Path(job_env["WORK_DIR"]))
+        assert cache != shared_cache
+        cache.mkdir(parents=True)
+        (cache / "download").touch()
+        job_envs.append(job_env)
+
+    if workflow_stage != "model-test":
+        assert sentinel.exists()
+        return
+    first, second = job_envs
+    assert first["UV_CACHE_DIR"] != second["UV_CACHE_DIR"]
+    script = cleanup["run"].replace("${{ env.WORK_DIR }}", first["WORK_DIR"])
+    script = script.replace("${{ matrix.runner }}", "amd-mi35x-2gpu-test")
+    subprocess.run(["bash", "-c", script], check=True)
+    assert not Path(first["UV_CACHE_DIR"]).exists()
+    assert (Path(second["UV_CACHE_DIR"]) / "download").exists()
+    assert sentinel.exists()
+
+
 def test_gb300_per_commit_forwards_the_tokenspeed_mla_override():
     workflow = load_yaml(REPO_ROOT / ".github/workflows/gb300-slurm-per-commit.yml")
     step = next(

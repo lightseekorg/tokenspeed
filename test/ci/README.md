@@ -129,6 +129,13 @@ runner pod recreation and avoids downloading the same large wheels again on
 that node. Other runner families keep their existing cache behavior because
 their cluster storage layouts may differ.
 
+For model evaluation and performance jobs, the reusable PR task workflow puts
+uv's cache in `.uv-cache` under the job's work directory, overriding an inherited
+shared uv cache. EvalScope dependency installs therefore do not depend on free
+space in a persistent `/cache/uv` volume. The existing always-run work-directory
+cleanup removes the job's uv cache on success or failure. Unit-test, kernel
+benchmark, pip, and release-wheel caches retain their existing policy.
+
 The MI450 simulator launcher sets `TRITON_LIBHIP_PATH` to the ROCm SDK's
 unversioned `libamdhip64.so` linker name. The gfx1250 PyTorch wheel and
 TokenSpeed use separate Triton distributions in the same process, and this
