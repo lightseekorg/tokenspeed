@@ -48,6 +48,54 @@ regress perf even when the generated kernel remains correct.
 
 ## GEMM
 
+### gfx950 dense BF16 projections
+
+The gfx950 dense projection path computes `A @ B.T` for K-contiguous BF16
+matrices shaped `[M, K]` and `[N, K]`, producing BF16 output. Padded row
+strides and caller-owned outputs are supported when their inner stride is one.
+Quantization scales and block sizes are not part of this contract.
+
+Only the eight-wave `256 x 256` MFMA/LDS implementation is registered. Its
+`mnk_problem_filter` covers the contiguous, 256-aligned prefill range
+`2816 <= M <= 4096` for Kimi K3's shared gate/up projection
+`(N, K) = (3072, 512)`. This range predicate deliberately generalizes beyond
+the individual sequence lengths measured during tuning. The small- and
+medium-M implementations remain available for direct use and future tuning,
+but are not selected by the default registry path.
+
+The prefill sweep also covered Kimi K3 projections with `(N, K)` of
+`(2304, 1536)`, `(7168, 1536)`, `(7168, 4224)`, `(3584, 7168)`, and
+`(7168, 3584)`; DeepSeek V4/V4.1 projections with `(64, 4096)`, `(32, 4096)`,
+and `(128, 512)`; and GLM 5.3 projections with `(2048, 128)`, `(8192, 512)`,
+`(4096, 1536)`, `(4096, 2048)`, `(2048, 4096)`, and `(4096, 4096)`. They
+remain on the PyTorch/rocBLAS path. In particular, the DeepSeek projection
+widths do not fit this kernel's 256-column output tile, and the compatible Kimi
+and GLM shapes did not produce a stable cold-cache win.
+
+#### Cold-cache results
+
+These are median device times from `rocprofv3` on one MI350X. A 512 MiB
+streaming operation evicted operands immediately before every measured launch.
+Only the contiguous range whose measured points beat PyTorch by at least four
+percent is registered. TFLOP/s uses logical GEMM work, and TB/s uses logical
+input and output tensor traffic.
+
+| Model projection `(M, N, K)` | PyTorch us | Gluon us | Speedup | PyTorch TF/TB | Gluon TF/TB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Kimi K3 shared prefill `(2816, 3072, 512)` | 30.64 | 22.32 | 1.37x | 289.1/0.76 | 396.9/1.05 |
+| Kimi K3 shared prefill `(3072, 3072, 512)` | 31.28 | 22.54 | 1.39x | 308.9/0.80 | 428.7/1.12 |
+| Kimi K3 shared prefill `(3328, 3072, 512)` | 24.58 | 22.86 | 1.08x | 425.9/1.10 | 458.0/1.18 |
+| Kimi K3 shared prefill `(3584, 3072, 512)` | 37.26 | 23.16 | 1.61x | 302.6/0.77 | 486.8/1.25 |
+| Kimi K3 shared prefill `(3840, 3072, 512)` | 37.40 | 23.74 | 1.58x | 323.0/0.82 | 508.8/1.29 |
+| Kimi K3 shared prefill `(4096, 3072, 512)` | 38.40 | 26.64 | 1.44x | 335.5/0.85 | 483.7/1.22 |
+
+The prefill kernel matches the tutorial's current eight-wave inter-wave
+pipeline: `256 x 256 x 64` tiling, two LDS buffers, four accumulator
+quadrants, eight-XCD ordering, and a four-row tile group. Alternate XCD group
+sizes did not improve the model sweep, so no tutorial update was needed. The
+tutorial's intra-wave variants require out-of-tree LLIR scheduling and
+assembly plugins and are not used as a runtime dependency.
+
 ### gfx950 MXFP8 projection
 
 The gfx950 package provides a prefill-oriented MXFP8 GEMM for DeepSeek V4.1

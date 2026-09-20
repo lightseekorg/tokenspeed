@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from utils import is_cdna4
@@ -31,43 +33,158 @@ if not is_cdna4():
     )
 
 
+from tokenspeed_kernel.ops.gemm import mm  # noqa: E402
+from tokenspeed_kernel.registry import KernelRegistry  # noqa: E402
+from tokenspeed_kernel.selection import select_kernel  # noqa: E402
+from tokenspeed_kernel.signature import (  # noqa: E402
+    dense_tensor_format,
+    format_signature,
+)
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
+    _largem_launch_metadata,
     _supports_largem_shape,
-    gluon_mm_a16w16_largem_gfx950,
+    gluon_mm_a16w16_prefill_gfx950,
+    launch_gluon_mm_a16w16_prefill_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     _choose_mfma_lds_mediumm_config,
+    _dense16_bmm_launch_metadata,
+    _dense16_mediumm_launch_metadata,
+    _dense16_mm_launch_metadata,
+    _dense16_splitk_launch_metadata,
+    _dense16_splitk_reduce_launch_metadata,
     _get_partial_scratch,
+    _mfma_lds_smallm_reduce_kernel,
     _supports_mfma_lds_smallm,
     _use_mfma_lds_largem,
     _use_mfma_lds_mediumm,
     _use_mfma_lds_smallm,
     _use_warp_reduce_smallm,
+    gluon_bmm_a16w16_gfx950,
     gluon_mm_a16w16_gfx950,
-    gluon_mm_a16w16_mfma_lds_mediumm_gfx950,
-    gluon_mm_a16w16_mfma_lds_smallm_gfx950,
-    gluon_mm_a16w16_warp_reduce_smallm_gfx950,
+    gluon_mm_a16w16_medium_gfx950,
+    gluon_mm_a16w16_splitk_gfx950,
+    gluon_mm_a16w16_warp_gfx950,
     launch_gluon_bmm_a16w16_gfx950,
+    launch_gluon_mm_a16w16_medium_gfx950,
+    launch_gluon_mm_a16w16_splitk_gfx950,
+    launch_gluon_mm_a16w16_warp_gfx950,
 )
+
+_REGISTERED_CASES = [
+    pytest.param(
+        "gluon_mm_a16w16_prefill_gfx950",
+        (2816, 3072, 512),
+        (
+            (2560, 3072, 512),
+            (2817, 3072, 512),
+            (4352, 3072, 512),
+            (2816, 3328, 512),
+            (2816, 3072, 640),
+        ),
+        id="prefill",
+    ),
+]
+
+_REGISTERED_IMPLEMENTATIONS = {
+    "gluon_mm_a16w16_prefill_gfx950": gluon_mm_a16w16_prefill_gfx950,
+}
+
+_UNREGISTERED_SMALL_M_KERNELS = (
+    "gluon_mm_a16w16_warp_gfx950",
+    "gluon_mm_a16w16_splitk_gfx950",
+    "gluon_mm_a16w16_medium_gfx950",
+)
+
+
+@pytest.mark.parametrize("kernel_name", _UNREGISTERED_SMALL_M_KERNELS)
+def test_dense16_small_m_kernels_are_not_registered(kernel_name: str) -> None:
+    assert KernelRegistry.get().get_by_name(kernel_name) is None
+
+
+@pytest.mark.parametrize("kernel_name,accepted,rejected", _REGISTERED_CASES)
+def test_dense16_registration_selects_only_measured_problems(
+    kernel_name: str,
+    accepted: tuple[int, int, int],
+    rejected: tuple[tuple[int, int, int], ...],
+) -> None:
+    spec = KernelRegistry.get().get_by_name(kernel_name)
+    assert spec is not None
+    registered_implementation = KernelRegistry.get().get_impl(kernel_name)
+    assert registered_implementation is not None
+    assert registered_implementation.__name__ == kernel_name
+    assert _REGISTERED_IMPLEMENTATIONS[kernel_name].__name__ == kernel_name
+
+    problem_filters = spec.traits["mnk_problem_filter"]
+    assert len(problem_filters) == 1
+    problem_filter = next(iter(problem_filters))
+    assert problem_filter(*accepted)
+    assert problem_filter(4096, 3072, 512)
+    assert all(not problem_filter(*shape) for shape in rejected)
+
+
+@pytest.mark.parametrize("kernel_name,shape,_rejected", _REGISTERED_CASES)
+def test_dense16_registration_is_selected_and_correct(
+    kernel_name: str,
+    shape: tuple[int, int, int],
+    _rejected: tuple[tuple[int, int, int], ...],
+) -> None:
+    m, n, k = shape
+    signature = format_signature(
+        a=dense_tensor_format(torch.bfloat16),
+        b=dense_tensor_format(torch.bfloat16),
+    )
+    selected = select_kernel(
+        "gemm",
+        "mm",
+        signature,
+        traits={
+            "m": m,
+            "n": n,
+            "k": k,
+            "a_inner_stride_one": True,
+            "b_inner_stride_one": True,
+            "out_dtype": torch.bfloat16,
+            "block_scale_layout": "canonical",
+            "pdl_enabled": False,
+        },
+    )
+    assert selected.name == kernel_name
+
+    torch.manual_seed(0)
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+
+    actual = mm(a, b, out=out)
+
+    assert actual is out
+    torch.testing.assert_close(
+        actual,
+        torch.mm(a, b.T),
+        atol=2e-2,
+        rtol=2e-2,
+    )
+
 
 _CORRECTNESS_CASES = [
     pytest.param(
-        gluon_mm_a16w16_warp_reduce_smallm_gfx950,
+        launch_gluon_mm_a16w16_warp_gfx950,
         (2, 128, 1024),
         id="warp-reduce",
     ),
     pytest.param(
-        gluon_mm_a16w16_mfma_lds_smallm_gfx950,
+        launch_gluon_mm_a16w16_splitk_gfx950,
         (4, 256, 2048),
         id="splitk-smallm",
     ),
     pytest.param(
-        gluon_mm_a16w16_mfma_lds_mediumm_gfx950,
+        launch_gluon_mm_a16w16_medium_gfx950,
         (8, 128, 64),
         id="mediumm",
     ),
     pytest.param(
-        gluon_mm_a16w16_largem_gfx950,
+        launch_gluon_mm_a16w16_prefill_gfx950,
         (256, 256, 256),
         id="largem",
     ),
@@ -108,6 +225,154 @@ def test_dense16_kernel_variant_writes_strided_out(
     torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-2, rtol=1e-2)
 
 
+def test_dense16_mm_launch_metadata_reports_flops_and_tensor_bytes() -> None:
+    m, n, k = 2, 128, 512
+    a = torch.empty((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.empty((n, k), device="cuda", dtype=torch.bfloat16)
+    c = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    args = {"M": m, "N": n, "K": k, "a_ptr": a, "b_ptr": b, "c_ptr": c}
+
+    metadata = _dense16_mm_launch_metadata(
+        None,
+        SimpleNamespace(name="dense16"),
+        args,
+    )
+
+    assert metadata == {
+        "name": "dense16",
+        "flops16": 2 * m * n * k,
+        "bytes": (m * k + n * k + m * n) * 2,
+    }
+    assert gluon_mm_a16w16_warp_gfx950.launch_metadata is _dense16_mm_launch_metadata
+    assert gluon_mm_a16w16_prefill_gfx950.launch_metadata is _largem_launch_metadata
+    assert _largem_launch_metadata(
+        None,
+        SimpleNamespace(name="largem"),
+        args,
+    ) == {
+        "name": "largem",
+        "flops16": 2 * m * n * k,
+        "bytes": (m * k + n * k + m * n) * 2,
+    }
+
+
+def test_dense16_medium_launch_metadata_reports_add3_work() -> None:
+    m, n, k = 16, 128, 512
+    a = torch.empty((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.empty((n, k), device="cuda", dtype=torch.bfloat16)
+    c = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    args = {
+        "M": m,
+        "N": n,
+        "K": k,
+        "a_ptr": a,
+        "b_ptr": b,
+        "c_ptr": c,
+        "ADD3": True,
+        "addend_a_ptr": c,
+        "addend_b_ptr": c,
+    }
+
+    metadata = _dense16_mediumm_launch_metadata(
+        None,
+        SimpleNamespace(name="medium"),
+        args,
+    )
+
+    assert metadata == {
+        "name": "medium",
+        "flops16": 2 * m * n * k,
+        "flops32": 2 * m * n,
+        "bytes": (m * k + n * k + 3 * m * n) * 2,
+    }
+    assert (
+        gluon_mm_a16w16_medium_gfx950.launch_metadata
+        is _dense16_mediumm_launch_metadata
+    )
+
+
+def test_dense16_splitk_launch_metadata_reports_scratch_traffic() -> None:
+    m, n, k = 2, 7168, 4224
+    split_k, reduce_m, block_n = 6, 4, 256
+    a = torch.empty((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.empty((n, k), device="cuda", dtype=torch.bfloat16)
+    c = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    partial = torch.empty((n * reduce_m * split_k,), device="cuda")
+
+    producer = _dense16_splitk_launch_metadata(
+        None,
+        SimpleNamespace(name="splitk"),
+        {
+            "M": m,
+            "N": n,
+            "a_ptr": a,
+            "b_ptr": b,
+            "partial_ptr": partial,
+            "SPLIT_K": split_k,
+            "PARTIAL_M": reduce_m,
+            "K_TILES_PER_SPLIT": 11,
+            "BLOCK_K": 64,
+        },
+    )
+    reducer = _dense16_splitk_reduce_launch_metadata(
+        (n // block_n,),
+        SimpleNamespace(name="reduce"),
+        {
+            "partial_ptr": partial,
+            "c_ptr": c,
+            "BLOCK_N": block_n,
+            "REDUCE_M": reduce_m,
+            "OUTPUT_M": m,
+            "SPLIT_K": split_k,
+        },
+    )
+
+    assert producer == {
+        "name": "splitk",
+        "flops16": 2 * m * n * k,
+        "bytes": (m * k + n * k) * 2 + n * reduce_m * split_k * 4,
+    }
+    assert reducer == {
+        "name": "reduce",
+        "flops32": m * n * (split_k - 1),
+        "bytes": reduce_m * n * split_k * 4 + m * n * 2,
+    }
+    assert (
+        gluon_mm_a16w16_splitk_gfx950.launch_metadata is _dense16_splitk_launch_metadata
+    )
+    assert (
+        _mfma_lds_smallm_reduce_kernel.launch_metadata
+        is _dense16_splitk_reduce_launch_metadata
+    )
+
+
+def test_dense16_bmm_launch_metadata_reports_batched_work() -> None:
+    batch, n, k, block_n = 12, 512, 128, 32
+    a = torch.empty((batch, 1, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.empty((batch, n, k), device="cuda", dtype=torch.bfloat16)
+    output = torch.empty((batch, 1, n), device="cuda", dtype=torch.bfloat16)
+
+    metadata = _dense16_bmm_launch_metadata(
+        (batch * n // block_n,),
+        SimpleNamespace(name="bmm"),
+        {
+            "N": n,
+            "K": k,
+            "BLOCK_N": block_n,
+            "a_ptr": a,
+            "b_ptr": b,
+            "output_ptr": output,
+        },
+    )
+
+    assert metadata == {
+        "name": "bmm",
+        "flops16": 2 * batch * n * k,
+        "bytes": (batch * k + batch * n * k + batch * n) * 2,
+    }
+    assert gluon_bmm_a16w16_gfx950.launch_metadata is _dense16_bmm_launch_metadata
+
+
 @pytest.mark.parametrize("batch", [12, 16])
 def test_dense16_bmm_writes_strided_out(batch: int) -> None:
     torch.manual_seed(0)
@@ -142,7 +407,7 @@ def test_splitk_smallm_out_handles_padded_reducer_rows() -> None:
     backing = torch.empty((m, n + 17), device="cuda", dtype=dtype)
     out = backing[:, :n]
 
-    actual = gluon_mm_a16w16_mfma_lds_smallm_gfx950(a, b, dtype, out=out)
+    actual = launch_gluon_mm_a16w16_splitk_gfx950(a, b, dtype, out=out)
 
     assert actual is out
     torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-2, rtol=1e-2)
