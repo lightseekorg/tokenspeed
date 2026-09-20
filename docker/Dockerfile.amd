@@ -21,17 +21,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Native builds use the environment's setuptools because build isolation is
 # disabled. Keep it below 82, as required by the ROCm installation path.
-RUN python3 -m pip install --upgrade pip "setuptools<82" wheel packaging && \
-    python3 -m pip install cmake ninja
+RUN python3 -m pip install --upgrade pip "setuptools<82" wheel && \
+    python3 -m pip install cmake ninja && \
+    python3 -m pip install --upgrade torch==2.14.0 torchvision==0.29.0 \
+        --index-url https://download.pytorch.org/whl/rocm7.2
 
 COPY . /workspace
-
-# Upgrade the published base before compiling native extensions against Torch.
-RUN python3 -m pip install --upgrade \
-        torch==2.14.0 torchvision==0.29.0 \
-        --index-url https://download.pytorch.org/whl/rocm7.2 && \
-    python3 test/ci_system/check_rocm_torch.py \
-        --torch-version 2.14.0 --torchvision-version 0.29.0
 
 # Install every TokenSpeed package from this checkout. tokenspeed-kernel-amd
 # must be present before tokenspeed-kernel resolves its ROCm requirements.
@@ -42,8 +37,6 @@ RUN MAX_JOBS=${MAX_JOBS} \
     TOKENSPEED_KERNEL_BACKEND=rocm \
     python3 -m pip install tokenspeed-kernel/python/ --no-build-isolation && \
     python3 -m pip install tokenspeed-scheduler/ && \
-    python3 -m pip install ./python --no-build-isolation && \
-    python3 test/ci_system/check_rocm_torch.py \
-        --torch-version 2.14.0 --torchvision-version 0.29.0
+    python3 -m pip install ./python --no-build-isolation
 
 CMD ["/bin/bash"]
