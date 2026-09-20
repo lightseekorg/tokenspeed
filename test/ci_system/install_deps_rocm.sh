@@ -6,9 +6,11 @@ set -e
 # ============================================================
 GFX_ARCH=${GFX_ARCH:-gfx950}
 BUILD_AND_DOWNLOAD_PARALLEL=${BUILD_AND_DOWNLOAD_PARALLEL:-16}
-TORCH_VERSION=${TORCH_VERSION:-2.13.0}
+TORCH_VERSION=${TORCH_VERSION:-2.14.0}
+TORCHVISION_VERSION=${TORCHVISION_VERSION:-0.29.0}
 TORCH_INDEX_URL=${TORCH_INDEX_URL:-https://download.pytorch.org/whl/rocm7.2}
 TORCH_DEVICE_PACKAGE=${TORCH_DEVICE_PACKAGE:-}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 export MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL}
 WORKSPACE=${WORKSPACE:-$(pwd)}
@@ -41,22 +43,25 @@ echo "=== Step 1: apt deps ==="
 sudo apt-get install -y openmpi-bin libopenmpi-dev libssl-dev pkg-config
 
 echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
-pip install --upgrade pip "setuptools<82" wheel
+pip install --upgrade pip "setuptools<82" wheel packaging
 
 echo "=== Step 3: Check PyTorch for ROCm ==="
-torch_device_name=${TORCH_DEVICE_PACKAGE%%==*}
-if ! python3 -c 'import torch, torchvision' >/dev/null 2>&1 \
-    || { [ -n "${TORCH_DEVICE_PACKAGE}" ] \
-        && ! pip3 show "${torch_device_name}" >/dev/null 2>&1; }; then
+torch_check=(python3 "${SCRIPT_DIR}/check_rocm_torch.py"
+    --torch-version "${TORCH_VERSION}"
+    --torchvision-version "${TORCHVISION_VERSION}")
+if [ -n "${TORCH_DEVICE_PACKAGE}" ]; then
+    torch_check+=(--device-package "${TORCH_DEVICE_PACKAGE}")
+fi
+if ! "${torch_check[@]}"; then
     echo "Installing torch ${TORCH_VERSION} and matching ROCm packages"
-    torch_packages=("torch==${TORCH_VERSION}" "torchvision==0.28.0")
+    torch_packages=("torch==${TORCH_VERSION}" "torchvision==${TORCHVISION_VERSION}")
     if [ -n "${TORCH_DEVICE_PACKAGE}" ]; then
         torch_packages+=("${TORCH_DEVICE_PACKAGE}")
     fi
-    pip_install_with_retry pip3 install "${torch_packages[@]}" \
+    pip_install_with_retry pip3 install --force-reinstall "${torch_packages[@]}" \
         --index-url "${TORCH_INDEX_URL}"
 fi
-python3 -c 'import torch, torchvision; assert torch.__version__.startswith("2.13.0"), torch.__version__; assert torchvision.__version__.startswith("0.28.0"), torchvision.__version__'
+"${torch_check[@]}"
 
 echo "=== Step 4: Install tokenspeed-kernel packages ==="
 
@@ -82,6 +87,7 @@ echo "=== Step 6: Install TokenSpeed ==="
 # python/pyproject.toml; pip resolves them from PyPI as part of the
 # editable install below.
 pip_install_with_retry pip3 install -e ./python --no-build-isolation
+"${torch_check[@]}"
 
 echo ""
 echo "=========================================="

@@ -129,6 +129,16 @@ runner pod recreation and avoids downloading the same large wheels again on
 that node. Other runner families keep their existing cache behavior because
 their cluster storage layouts may differ.
 
+AMD CI and the AMD Docker image use Torch 2.14.0 and torchvision 0.29.0 from
+the ROCm 7.2 index. The installers replace an older preinstalled Torch before
+compiling native extensions and verify the requested versions and HIP build.
+Kernel benchmarks also check the Torch version before creating their isolated
+environments. The MI450 simulator uses matching Torch 2.14 and torchvision 0.29
+builds from AMD's multi-architecture index, pinned with the gfx1250 device
+package to ROCm SDK `10.1.0a20260822`. Its explicit `TORCH_VERSION`,
+`TORCHVISION_VERSION`, `TORCH_INDEX_URL`, and `TORCH_DEVICE_PACKAGE` settings
+are checked without requiring a GPU during installation.
+
 The MI450 simulator launcher sets `TRITON_LIBHIP_PATH` to the ROCm SDK's
 unversioned `libamdhip64.so` linker name. The gfx1250 PyTorch wheel and
 TokenSpeed use separate Triton distributions in the same process, and this
