@@ -851,9 +851,7 @@ def build_device_side(
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
-    from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
-
-    logger = get_colorful_logger(__name__)
+    from tokenspeed.runtime.utils import set_random_seed
 
     target, draft = create_model_runner(
         server_args, model_config, draft_model_config, gpu_id, global_rank

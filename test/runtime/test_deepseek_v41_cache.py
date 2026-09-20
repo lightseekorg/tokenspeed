@@ -1112,6 +1112,13 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
     assert all(spec.transfer_policy is None for spec in specs.values())
 
 
+def test_pool_reports_the_whole_arena_as_kv_bytes():
+    # The startup memory summary reads this; without it the arena is
+    # misattributed to activations and the KV row prints 0.
+    pool = _pool(_recipe("cpu"), "cpu")
+    assert pool.get_kv_size_bytes() == pool.arena.buffer.nbytes > 0
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_pool_zeroes_fresh_pages_per_group():
     pool = _pool(_recipe("cuda"), "cuda")

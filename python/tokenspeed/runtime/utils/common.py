@@ -1162,13 +1162,17 @@ def get_colorful_logger(name):
     logger.propagate = False
     logger.setLevel(LOG_LEVEL)
 
+    # ``logging.getLogger`` returns the one logger per name; a second call for
+    # the same name must not stack a second stream handler, or every record
+    # of that logger is emitted twice.
+    if any(isinstance(h.formatter, CustomFormatter) for h in logger.handlers):
+        return logger
+
     ch = logging.StreamHandler()
     ch.setLevel(LOG_LEVEL)
     ch.setFormatter(CustomFormatter())
-    # ch.flush = lambda: True
 
     logger.addHandler(ch)
-    logger.propagate = False
     return logger
 
 
