@@ -1300,11 +1300,9 @@ class KimiLinearKDA(nn.Module):
             and h.dtype == torch.bfloat16
             and envs.TOKENSPEED_MAMBA_SSM_DTYPE.get() == "bfloat16"
         ):
-            get_plan = getattr(self.o_proj.quant_method, "prepared_linear_plan", None)
-            if get_plan is not None:
-                candidate_plan = get_plan(self.o_proj)
-                if fp8_linear_gated_rmsnorm_supported(candidate_plan):
-                    output_plan = candidate_plan
+            candidate_plan = self.o_proj.quant_method.prepared_linear_plan(self.o_proj)
+            if fp8_linear_gated_rmsnorm_supported(candidate_plan):
+                output_plan = candidate_plan
         fuse_decode_output_norm = (
             ctx.forward_mode.is_decode()
             and num_tokens == ctx.bs
