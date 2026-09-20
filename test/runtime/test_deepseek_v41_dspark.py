@@ -66,6 +66,7 @@ from tokenspeed.runtime.models.deepseek_v41_dspark import (
     DeepseekV41ForCausalLMDSpark,
     _quantized_kv,
     _WindowAttention,
+    _WindowSelection,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.hf_transformers_utils import get_config
@@ -272,7 +273,9 @@ def test_window_attention_matches_dense_reference():
     history = _history_slots(starts, window, rows)
     positions = (starts[:, None] + 1 + torch.arange(block)).flatten()
     sink = torch.tensor([0.1, -0.3])
-    backend = _WindowAttention(positions, cache, history, block)
+    backend = _WindowAttention(
+        positions, cache, history, block, _WindowSelection.build(history, block, rows)
+    )
     actual = backend.forward_v41(
         q,
         current,
@@ -300,6 +303,99 @@ def test_window_attention_matches_dense_reference():
                 expected[b, j, h] = probs @ kv
     torch.testing.assert_close(
         actual, expected.reshape_as(actual), rtol=0.01, atol=0.01
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_window_attention_kernel_matches_reference():
+    """The workspace kernel path reproduces the fp32 reference on real shapes.
+
+    Rows cover an empty, a partial and a full 128-row history plus one graph
+    padding row (all -1 slots); q arrives 64-head padded with a -inf padded
+    sink exactly as ``DeepseekV41Attention.forward`` hands it over, and the
+    window field is strided like the LCM arena so the gather cannot rely on a
+    flat view.
+    """
+    from tokenspeed_kernel.ops.attention.dsv41.flash_mla import (
+        is_flash_mla_v41_available,
+    )
+    from tokenspeed_kernel.platform import current_platform
+    from tokenspeed_kernel.selection import select_kernel
+    from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+
+    from tokenspeed.runtime.models.deepseek_v41 import DeepseekV41RotaryEmbedding
+
+    torch.manual_seed(7)
+    device = torch.device("cuda:0")
+    block, real_heads, padded_heads, dim, window, rows = 5, 2, 64, 512, 128, 64
+    config = _config()
+    config.head_dim, config.qk_rope_head_dim = dim, 64
+    config.max_position_embeddings = 4096
+    rotary = DeepseekV41RotaryEmbedding(config, 0)
+    rotary._prepare_cache(device)
+    starts = torch.tensor([0, 40, 300, -1], device=device)
+    batch = starts.numel()
+    history = _history_slots(starts.clamp_min(0), window, rows).to(device)
+    history[3] = -1
+    positions = starts.clamp_min(0)[:, None] + 1 + torch.arange(block, device=device)
+    positions = positions.flatten()
+    # 97-row strides: reshape(-1, dim) on this field would copy, not view.
+    field = torch.randn(9, 97, dim, dtype=torch.bfloat16, device=device)[:, :rows]
+    field_before = field.clone()
+    q = torch.zeros(
+        batch * block, padded_heads, dim, dtype=torch.bfloat16, device=device
+    )
+    q[:, :real_heads] = torch.randn(batch * block, real_heads, dim, device=device)
+    swa = torch.randn(batch * block, dim, dtype=torch.bfloat16, device=device)
+    sink = torch.full((padded_heads,), -float("inf"), device=device)
+    sink[:real_heads] = torch.tensor([0.1, -0.3], device=device)
+    backend = _WindowAttention(
+        positions, field, history, block, _WindowSelection.build(history, block, rows)
+    )
+    kwargs = dict(
+        layer_id=0,
+        positions=positions,
+        request_indices=backend.meta.request_indices,
+        forward_mode=ForwardMode.DECODE,
+        index_q=None,
+        index_weights=None,
+        attn_sink=sink,
+        softmax_scale=dim**-0.5,
+        index_process_group=None,
+        swa_rope_cache=rotary.cos_sin_cache,
+    )
+    actual = backend.forward_v41(q, swa, **kwargs)
+    kv = backend._workspace(swa, positions, rotary.cos_sin_cache)
+    expected = backend._reference_forward(q, kv, sink, dim**-0.5)
+    # Both branches feed the kernel the very same quantized block rows.
+    torch.testing.assert_close(
+        backend._workspace(swa, positions, rotary.cos_sin_cache), kv, rtol=0, atol=0
+    )
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(
+        actual[:, :real_heads], expected[:, :real_heads], rtol=0.02, atol=0.004
+    )
+    assert torch.equal(field, field_before)
+    # The same launch on the same bytes must be deterministic: graph replay
+    # parity in test_draft_forward_graph_and_context_seeding relies on it.
+    torch.testing.assert_close(
+        backend.forward_v41(q, swa, **kwargs), actual, rtol=0, atol=0
+    )
+    selected = select_kernel(
+        "attention",
+        "dsv41_selected_attention",
+        format_signature(x=dense_tensor_format(torch.bfloat16)),
+        features=None,
+        platform=None,
+        traits={"flashmla_eligible": is_flash_mla_v41_available()},
+        solution=None,
+        override=None,
+    )
+    native = current_platform().is_nvidia and is_flash_mla_v41_available()
+    assert selected.name == (
+        "flashmla_dsv41_selected_attention"
+        if native
+        else "triton_dsv41_selected_attention"
     )
 
 

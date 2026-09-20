@@ -1015,7 +1015,11 @@ tokenspeed serve deepseek-ai/DeepSeek-V4.1-Flash \
 ```
 
 Add `--speculative-algorithm DSPARK` for same-checkpoint DSpark decoding;
-the draft seeds its context windows from the decoder's kept rows. A hit
+the draft seeds its context windows from the decoder's kept rows, and each
+draft stage attends its 128-row window plus the non-causal proposal block
+through the same `selected_attention` workspace kernel as the target's
+prefill (FlashMLA on sm90+, Triton elsewhere); the fp32 arithmetic remains
+the CPU reference. A hit
 re-feeds the groups' whole retention window, which is exactly the 128-token
 attention window (the compressor-tail group retains its unfinished pair the
 same way); the scheduler requires
