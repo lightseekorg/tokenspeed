@@ -239,19 +239,30 @@ def _trait_value_matches(spec_values: frozenset[Any], trait_value: Any) -> bool:
     return trait_value.issubset(spec_values)
 
 
-def _ispp_satisfies_alignment(spec: KernelSpec, ispp: Any) -> bool:
+# MoE size traits a kernel may constrain either exactly (``<name>`` lists the
+# accepted sizes) or by divisibility (``<name>_alignment`` lists accepted
+# multiples). ``ispp`` is the intermediate size per partition; ``hidden`` the
+# MoE input width. Both are geometry a kernel's weight layout may reject, so
+# they must veto selection rather than fail later in weight preprocessing.
+_ALIGNED_SIZE_TRAITS = {
+    "ispp": "ispp_alignment",
+    "hidden": "hidden_alignment",
+}
+
+
+def _size_satisfies_alignment(spec: KernelSpec, name: str, size: Any) -> bool:
     try:
-        ispp_value = int(ispp)
+        size_value = int(size)
     except (TypeError, ValueError):
         return False
-    exact_sizes = spec.traits.get("ispp")
-    if exact_sizes is not None and ispp_value not in exact_sizes:
+    exact_sizes = spec.traits.get(name)
+    if exact_sizes is not None and size_value not in exact_sizes:
         return False
-    alignments = spec.traits.get("ispp_alignment")
+    alignments = spec.traits.get(_ALIGNED_SIZE_TRAITS[name])
     if alignments is None:
         return True
     return any(
-        int(alignment) > 0 and ispp_value % int(alignment) == 0
+        int(alignment) > 0 and size_value % int(alignment) == 0
         for alignment in alignments
     )
 
@@ -272,15 +283,16 @@ def spec_matches_traits(
             the spec are ignored. When ``True`` (reference compatibility checks),
             every requested trait must be explicitly present on the spec.
     """
-    # ispp stands for "intermediate size per partition" and has special
-    # requirements that depend on the kernel's declared exact sizes and
-    # supported alignments (if any). It is used in some MoE ops to ensure the
-    # intermediate buffer sizes are compatible with the kernel's requirements.
-    if "ispp" in spec.traits and "ispp" not in traits:
-        return False
+    # Size traits (see _ALIGNED_SIZE_TRAITS) match against the kernel's
+    # declared exact sizes and supported alignments (if any), so a MoE kernel
+    # whose weight layout cannot take the layer's geometry is never selected.
+    # A kernel pinned to exact sizes needs the request to state the size.
+    for size_name in _ALIGNED_SIZE_TRAITS:
+        if size_name in spec.traits and size_name not in traits:
+            return False
     for trait_name, trait_value in traits.items():
-        if trait_name == "ispp":
-            if not _ispp_satisfies_alignment(spec, trait_value):
+        if trait_name in _ALIGNED_SIZE_TRAITS:
+            if not _size_satisfies_alignment(spec, trait_name, trait_value):
                 return False
             continue
 

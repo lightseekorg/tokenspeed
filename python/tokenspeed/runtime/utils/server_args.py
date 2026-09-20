@@ -218,6 +218,9 @@ class ServerArgs:
     # MoE backend
     moe_backend: str = "auto"
     draft_moe_backend: str | None = None
+    # Opt-in: run MXFP4 routed experts with FP8 activations (FlashInfer cutlass
+    # W4A8 on Hopper). Off keeps the checkpoint's BF16 activation contract.
+    moe_mxfp4_fp8_activation: bool = False
     all2all_backend: str = "none"
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
@@ -916,6 +919,16 @@ class ServerArgs:
             if not self.disable_pdl:
                 raise ValueError("NPU execution requires --disable-pdl")
 
+        if self.moe_mxfp4_fp8_activation and self.moe_backend not in (
+            "auto",
+            "flashinfer_cutlass",
+        ):
+            raise ValueError(
+                "--moe-mxfp4-fp8-activation is served by the FlashInfer cutlass "
+                f"MoE only; pass --moe-backend auto or flashinfer_cutlass, not "
+                f"{self.moe_backend!r}"
+            )
+
         if (
             self.max_num_seqs is not None
             and self.max_num_seqs < self.mapping.attn.dp_size
@@ -1503,6 +1516,15 @@ class ServerArgs:
             default=ServerArgs.moe_backend,
             help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm, "
             "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe",
+        )
+        parser.add_argument(
+            "--moe-mxfp4-fp8-activation",
+            action="store_true",
+            help="Run MXFP4 routed experts with FP8 activations through the "
+            "FlashInfer cutlass W4A8 (Humming) MoE on Hopper. About 1.8x faster "
+            "than the default W4A16 path but adds a few percent of relative error "
+            "to the expert outputs; validate the served model before relying on "
+            "it. Requires --moe-backend auto or flashinfer_cutlass.",
         )
         parser.add_argument(
             "--draft-moe-backend",

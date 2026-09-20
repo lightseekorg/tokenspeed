@@ -294,6 +294,25 @@ class TestSpecMatchesTraits:
         assert spec_matches_traits(spec, {"ispp": 384})
         assert not spec_matches_traits(spec, {"ispp": 512})
 
+    def test_hidden_alignment_vetoes_misaligned_widths(self):
+        # Same contract as ispp_alignment, for the MoE input width: a kernel
+        # whose weight layout needs hidden % 128 == 0 drops out of selection
+        # for other widths instead of failing in weight preprocessing.
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"hidden_alignment": frozenset({128})},
+        )
+
+        assert spec_matches_traits(spec, {"hidden": 5120})
+        assert not spec_matches_traits(spec, {"hidden": 2880})
+        # Without a declared constraint the width is unconstrained; without a
+        # requested width an alignment-only kernel stays eligible.
+        assert spec_matches_traits(spec, {})
+        plain = KernelSpec(name="p", family="f", mode="m", traits={})
+        assert spec_matches_traits(plain, {"hidden": 2880})
+
 
 class TestSpecMatchesShapeTraits:
     def test_exact_dimension_traits_match(self):
