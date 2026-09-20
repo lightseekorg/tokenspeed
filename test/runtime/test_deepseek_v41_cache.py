@@ -208,6 +208,7 @@ def test_rebinding_cache_pool_drops_pool_derived_state():
     backend._swa_plans[ForwardMode.DECODE] = object()
     backend._prefill_spans = ((0, 0, 0, 1),)
     backend._decode_schedule_keepalive.append(torch.empty(1))
+    backend._decode_schedules[(0, 0)] = (torch.empty(1), None, object())
     backend._prepared_selections[()] = ()
 
     new_pool = _pool(_recipe("cpu"), "cpu")
@@ -224,6 +225,7 @@ def test_rebinding_cache_pool_drops_pool_derived_state():
     assert not backend._swa_plans
     assert not backend._prefill_spans
     assert not backend._decode_schedule_keepalive
+    assert not backend._decode_schedules
     assert not backend._prepared_selections
     backend.init_cuda_graph_state(2, max_tokens_per_req=1, overlap_schedule_depth=1)
     assert backend._decode_buffers is not old_buffers
@@ -2043,6 +2045,50 @@ def test_native_decode_receives_compact_window_and_real_lengths(monkeypatch, pos
     if count:
         expected = torch.arange(position - count + 1, position + 1) + 64
         torch.testing.assert_close(slots[0, :count], expected.int())
+
+
+def test_native_decode_schedule_shared_per_length_pair_within_a_forward(
+    monkeypatch,
+):
+    from tokenspeed_kernel.ops.attention import dsv41
+
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    produced = []
+    monkeypatch.setattr(
+        dsv41,
+        "new_attention_schedule",
+        lambda: produced.append(object()) or produced[-1],
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    def refresh():
+        backend.refresh_decode_metadata(
+            1,
+            1,
+            torch.tensor([0]),
+            torch.tensor([6]),
+            forward_mode=ForwardMode.DECODE,
+            block_tables=tables,
+            for_graph_replay=False,
+        )
+
+    refresh()
+    swa_lens = backend.forward_decode_metadata.swa_read_lens
+    global_lens = torch.tensor([512])
+    # Every layer that reads the same length tensors gets the same producer;
+    # SWA-only layers (no global lengths) form their own group.
+    shared = backend._decode_schedule(swa_lens, global_lens)
+    assert backend._decode_schedule(swa_lens, global_lens) is shared
+    swa_only = backend._decode_schedule(swa_lens, None)
+    assert swa_only is not shared
+    assert backend._decode_schedule(swa_lens, None) is swa_only
+    assert backend._decode_schedule(swa_lens, torch.tensor([512])) is not shared
+    assert len(produced) == 3
+    # The next forward's refreshed lengths must not reuse an initialized producer.
+    refresh()
+    assert backend._decode_schedule(swa_lens, global_lens) is not shared
+    assert len(produced) == 4
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

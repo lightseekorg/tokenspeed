@@ -249,6 +249,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._prefill_spans: tuple[V41PrefillSpan, ...] = ()
         self._decoder_view: V41DecoderView | None = None
         self._decode_schedule_keepalive: list[object] = []
+        # One native decode schedule per distinct (SWA lengths, global lengths)
+        # pair within a forward; layers reusing a selection share it.
+        self._decode_schedules: dict[
+            tuple[int, int], tuple[torch.Tensor, torch.Tensor | None, object]
+        ] = {}
         self._prepared_selections: dict[tuple, tuple] = {}
 
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
@@ -282,6 +287,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._prefill_spans = ()
         self._decoder_view = None
         self._decode_schedule_keepalive.clear()
+        self._decode_schedules.clear()
         self._prepared_selections.clear()
 
     def init_cuda_graph_state(
@@ -391,6 +397,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             raise ValueError("V4.1 num_tokens must equal batch size times verify width")
         del for_graph_replay, kwargs
         self._prepared_selections.clear()
+        self._decode_schedules.clear()
         if not forward_mode.is_decode_or_idle():
             raise ValueError("V4.1 refresh requires decode or idle mode")
         if not 0 <= num_extends <= actual_bs <= bs:
@@ -539,6 +546,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._check_tables(block_tables, bs)
         self._swa_plans.clear()
         self._prepared_selections.clear()
+        self._decode_schedules.clear()
         if not 0 <= num_extends <= bs:
             raise ValueError("V4.1 invalid extend/decode batch sizes")
         width = self.spec_num_tokens
@@ -1403,14 +1411,23 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             )
         return plan.history_slots[ratio]
 
-    def _decode_schedule(self):
+    def _decode_schedule(self, swa_lens, global_lens):
         from tokenspeed_kernel.ops.attention import dsv41
 
-        # Each call owns a fresh scheduler producer. Reusing initialized warmup
-        # metadata during capture would omit its length-dependent GPU work.
+        # The native schedule is a function of the per-request lengths, so
+        # layers that read the same length tensors within one forward share
+        # one producer and its GPU work runs once. Every forward starts from
+        # an empty table: a producer initialized by an earlier forward (or by
+        # warmup during capture) would skip its length-dependent GPU work.
+        key = (id(swa_lens), id(global_lens))
+        entry = self._decode_schedules.get(key)
+        if entry is not None and entry[0] is swa_lens and entry[1] is global_lens:
+            return entry[2]
         schedule = dsv41.new_attention_schedule()
-        if schedule is not None and torch.cuda.is_current_stream_capturing():
-            self._decode_schedule_keepalive.append(schedule)
+        if schedule is not None:
+            self._decode_schedules[key] = (swa_lens, global_lens, schedule)
+            if torch.cuda.is_current_stream_capturing():
+                self._decode_schedule_keepalive.append(schedule)
         return schedule
 
     def forward_v41(
@@ -1575,7 +1592,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 softmax_scale,
                 None,
                 256,
-                self._decode_schedule(),
+                self._decode_schedule(swa_lens, global_lens),
                 None,
                 None,
             )
