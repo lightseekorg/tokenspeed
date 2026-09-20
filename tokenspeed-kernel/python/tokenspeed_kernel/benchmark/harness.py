@@ -172,9 +172,13 @@ def set_benchmark_generator(
 
 
 def _load_builtin_generators() -> None:
-    from tokenspeed_kernel.benchmark.generators.gemm import prepare_dense_bmm
+    from tokenspeed_kernel.benchmark.generators.gemm import (
+        prepare_dense_bmm,
+        prepare_mxfp8_mm,
+    )
 
     _BENCHMARK_GENERATORS.setdefault(("gemm", "bmm"), prepare_dense_bmm)
+    _BENCHMARK_GENERATORS.setdefault(("gemm", "mm"), prepare_mxfp8_mm)
 
 
 @dataclass(frozen=True)

@@ -49,14 +49,16 @@ from tokenspeed_kernel.selection import (
 )
 from tokenspeed_kernel.signature import (
     FormatSignature,
+    ScaleFormat,
     dense_tensor_format,
     format_signature,
+    tensor_format,
 )
 
 # isort: split
 import tokenspeed_kernel.numerics.gemm  # noqa: F401
 
-__all__ = ["prepare_dense_bmm"]
+__all__ = ["prepare_dense_bmm", "prepare_mxfp8_mm"]
 
 
 _DTYPE_NAMES = {
@@ -65,13 +67,24 @@ _DTYPE_NAMES = {
 }
 
 _DEFAULT_VALIDATION_RUNS = 5
+_MXFP8_DTYPE = torch.float8_e4m3fn
+_MXFP8_BLOCK_SIZE = (1, 32)
+_MXFP8_SCALE = ScaleFormat(
+    storage_dtype=torch.uint8,
+    granularity="block",
+    block_shape=_MXFP8_BLOCK_SIZE,
+)
+_MXFP8_SIGNATURE = format_signature(
+    a=tensor_format("mxfp8", _MXFP8_DTYPE, scale=_MXFP8_SCALE),
+    b=tensor_format("mxfp8", _MXFP8_DTYPE, scale=_MXFP8_SCALE),
+)
 
 
 def _positive_int(value: object, name: str) -> int:
     if not isinstance(value, int) or value <= 0:
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
-            f"gemm.bmm parameter {name!r} must be a positive integer",
+            f"GEMM parameter {name!r} must be a positive integer",
         )
     return value
 
@@ -82,7 +95,7 @@ def _parse_dtype(value: object) -> torch.dtype:
         supported = ", ".join(sorted(_DTYPE_NAMES))
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
-            f"dense gemm.bmm currently supports dtype names: {supported}",
+            f"GEMM currently supports dtype names: {supported}",
         )
     return dtype
 
@@ -91,7 +104,7 @@ def _tolerance(value: object, name: str) -> float:
     if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
-            f"gemm.bmm validation parameter {name!r} must be finite and nonnegative",
+            f"GEMM validation parameter {name!r} must be finite and nonnegative",
         )
     return float(value)
 
@@ -108,7 +121,7 @@ def _parse_validation(
     if unknown:
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
-            f"Unknown gemm.bmm validation parameters: {', '.join(unknown)}",
+            f"Unknown GEMM validation parameters: {', '.join(unknown)}",
         )
 
     tolerance = get_family_tolerance("gemm")(dtype, K=K)
@@ -343,6 +356,212 @@ def prepare_dense_bmm(
             inputs = generate_inputs(request.seed + run_index + 1)
             candidate = prepare_invocation(inputs, selected, spec)
             expected = prepare_invocation(inputs, reference, reference_spec)
+            return ValidationInvocation(
+                candidate=lambda: (candidate(),),
+                reference=lambda: (expected(),),
+            )
+
+        validation = PreparedValidation(
+            output_specs=(
+                OutputValidationSpec(
+                    "close",
+                    {
+                        "atol": validation_config["atol"],
+                        "rtol": validation_config["rtol"],
+                    },
+                ),
+            ),
+            runs=validation_config["runs"],
+            prepare_run=prepare_validation_run,
+        )
+
+    return PreparedBenchmark(
+        registration=spec,
+        invocation=PreparedInvocation(
+            invoke=performance_invoke,
+            repeat_safe=True,
+        ),
+        parameters=normalized_parameters,
+        validation=validation,
+    )
+
+
+def _mxfp8_mm_traits(
+    M: int,
+    N: int,
+    K: int,
+    out_dtype: torch.dtype,
+) -> dict[str, object]:
+    return {
+        "m": M,
+        "n": N,
+        "k": K,
+        "a_inner_stride_one": True,
+        "b_inner_stride_one": True,
+        "block_scale_layout": "canonical",
+        "out_dtype": out_dtype,
+    }
+
+
+def prepare_mxfp8_mm(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare a canonical E4M3/UE8M0 MXFP8 GEMM benchmark."""
+
+    allowed = {
+        "M",
+        "N",
+        "K",
+        "quant",
+        "block_size",
+        "out_dtype",
+        "validation",
+    }
+    unknown = sorted(set(request.parameters) - allowed)
+    if unknown:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            f"Unknown MXFP8 gemm.mm parameters: {', '.join(unknown)}",
+        )
+
+    M = _positive_int(request.parameters.get("M"), "M")
+    N = _positive_int(request.parameters.get("N"), "N")
+    K = _positive_int(request.parameters.get("K"), "K")
+    if request.parameters.get("quant") != "mxfp8":
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "MXFP8 gemm.mm requires quant='mxfp8'",
+        )
+    if request.parameters.get("block_size") != list(_MXFP8_BLOCK_SIZE):
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "MXFP8 gemm.mm requires block_size=[1, 32]",
+        )
+    out_dtype = _parse_dtype(request.parameters.get("out_dtype"))
+    validation_config = _parse_validation(
+        request.parameters.get("validation"),
+        dtype=out_dtype,
+        K=K,
+    )
+
+    block_size = list(_MXFP8_BLOCK_SIZE)
+    normalized_parameters: dict[str, object] = {
+        "M": M,
+        "N": N,
+        "K": K,
+        "quant": "mxfp8",
+        "value_dtype": "float8_e4m3fn",
+        "scale_dtype": "uint8",
+        "block_size": block_size,
+        "out_dtype": "bfloat16",
+        "a_layout": "MK",
+        "b_layout": "NK",
+        "scale_layout": "canonical",
+        "out_layout": "MN",
+    }
+    if validation_config is not None:
+        normalized_parameters["validation"] = validation_config
+
+    shape = {"M": M, "N": N, "K": K}
+    traits = _mxfp8_mm_traits(M, N, K, out_dtype)
+    load_builtin_kernels()
+    spec, selected = _select_registration(
+        request,
+        platform,
+        _MXFP8_SIGNATURE,
+        traits,
+        shape,
+    )
+
+    def generate_inputs(seed: int) -> dict[str, Any]:
+        generator = get_input_generator(
+            request.family,
+            request.mode,
+            dtype=_MXFP8_DTYPE,
+            traits={"a_layout": "MK", "b_layout": "NK"},
+            format_signature=_MXFP8_SIGNATURE,
+            device="cuda",
+            seed=seed,
+        )
+        inputs = generator.generate(**shape)
+        # Match the quantized projection range used by the kernel's exact
+        # correctness tests. Full-scale random FP8 values combined with large
+        # UE8M0 exponents create unrealistic outputs near BF16 rounding ties.
+        inputs["A"] = (inputs["A"].float() * 0.05).to(_MXFP8_DTYPE)
+        inputs["B"] = (inputs["B"].float() * 0.05).to(_MXFP8_DTYPE)
+        inputs["A_scales"].clamp_max_(128)
+        inputs["B_scales"].clamp_max_(128)
+        return inputs
+
+    def prepare_invocation(
+        inputs: dict[str, Any],
+        kernel: Callable[..., object],
+        kernel_spec: KernelSpec,
+        *,
+        validate_layout: bool,
+    ) -> Callable[[], torch.Tensor]:
+        A = inputs["A"]
+        B = inputs["B"]
+        out = torch.empty((M, N), dtype=out_dtype, device=A.device)
+        if validate_layout:
+            actual_traits = _mxfp8_mm_traits(M, N, K, out_dtype)
+            actual_traits["a_inner_stride_one"] = A.stride(-1) == 1
+            actual_traits["b_inner_stride_one"] = B.stride(-1) == 1
+            if not spec_matches_shape_traits(
+                kernel_spec, actual_traits
+            ) or not spec_matches_traits(kernel_spec, actual_traits):
+                raise BenchmarkCaseError(
+                    BenchmarkStatus.INVALID_CASE,
+                    "Generated tensor layouts do not satisfy registration "
+                    f"{kernel_spec.name!r}",
+                )
+
+        call_kwargs = dict(inputs)
+        call_kwargs["out"] = out
+
+        def invoke() -> torch.Tensor:
+            result = kernel(**call_kwargs)
+            if result is not out:
+                raise RuntimeError(
+                    f"Registration {kernel_spec.name!r} did not return the "
+                    "prepared output buffer"
+                )
+            return result
+
+        return invoke
+
+    performance_inputs = generate_inputs(request.seed)
+    performance_invoke = prepare_invocation(
+        performance_inputs,
+        selected,
+        spec,
+        validate_layout=True,
+    )
+
+    validation: PreparedValidation | None = None
+    if validation_config is not None:
+        reference_spec, reference = _select_reference_registration(
+            spec,
+            _MXFP8_SIGNATURE,
+            traits,
+            platform,
+        )
+
+        def prepare_validation_run(run_index: int) -> ValidationInvocation:
+            inputs = generate_inputs(request.seed + run_index + 1)
+            candidate = prepare_invocation(
+                inputs,
+                selected,
+                spec,
+                validate_layout=True,
+            )
+            expected = prepare_invocation(
+                inputs,
+                reference,
+                reference_spec,
+                validate_layout=False,
+            )
             return ValidationInvocation(
                 candidate=lambda: (candidate(),),
                 reference=lambda: (expected(),),

@@ -426,6 +426,45 @@ def test_harness_reports_missing_generator_as_invalid_case():
     assert "No benchmark generator" in (result.error_message or "")
 
 
+def _mxfp8_parameters(**updates):
+    parameters = {
+        "M": 256,
+        "N": 256,
+        "K": 512,
+        "quant": "mxfp8",
+        "block_size": [1, 32],
+        "out_dtype": "bfloat16",
+    }
+    parameters.update(updates)
+    return parameters
+
+
+@pytest.mark.parametrize(
+    ("parameters", "match"),
+    [
+        (_mxfp8_parameters(extra=1), "Unknown"),
+        (_mxfp8_parameters(quant="fp8"), "quant"),
+        (_mxfp8_parameters(block_size=[128, 128]), "block_size"),
+        (_mxfp8_parameters(out_dtype="float16"), "dtype"),
+    ],
+)
+def test_mxfp8_mm_rejects_invalid_generator_parameters(parameters, match):
+    request = BenchmarkRequest(
+        family="gemm",
+        mode="mm",
+        parameters=parameters,
+        solution=None,
+        registration=None,
+        cold_cache=True,
+        seed=42,
+    )
+
+    with pytest.raises(BenchmarkCaseError, match=match) as raised:
+        gemm_generator.prepare_mxfp8_mm(request, _platform())
+
+    assert raised.value.status is BenchmarkStatus.INVALID_CASE
+
+
 @pytest.mark.parametrize(
     "parameters, match",
     [
