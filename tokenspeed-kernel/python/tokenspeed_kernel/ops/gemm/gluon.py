@@ -98,9 +98,9 @@ if current_platform().is_amd:
             "mnk_problem_filter": frozenset({_is_mxfp8_prefill_problem}),
             "a_inner_stride_one": frozenset({True}),
             "b_inner_stride_one": frozenset({True}),
+            "block_scale_layout": frozenset({"canonical"}),
             # GEMM format signatures currently describe input roles only.
             "out_dtype": frozenset({torch.bfloat16, torch.float16}),
-            "block_scale_layout": frozenset({"canonical"}),
         },
     )
     def gluon_mm_mxfp8_gfx950(
@@ -156,8 +156,8 @@ if current_platform().is_amd:
             "k": frozenset({128}),
             "a_inner_stride_one": frozenset({True}),
             "b_n_stride_one": frozenset({True}),
-            "out_inner_stride_one": frozenset({True}),
             "out_dtype": frozenset({torch.bfloat16}),
+            "out_inner_stride_one": frozenset({True}),
         },
     )
     def gluon_bmm_a16w16_gfx950(

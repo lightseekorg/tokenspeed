@@ -58,7 +58,10 @@ choices (still evolving; subject to change):
 
 - **Registration** — backends register with `@register_kernel(family, mode, ...)`,
   declaring supported `format_signatures`, arch capability requirements,
-  non-format traits (head dim, GQA factor, ...), and a priority band.
+  non-format traits (head dim, GQA factor, ...), and a priority band. GEMM
+  kernels state their problem-shape envelope with the `batch`/`m`/`n`/`k`
+  traits, their `_align`/`_min` variants, and `mnk_problem_filter` predicates
+  for anything those cannot express (see `selection.spec_matches_shape_traits`).
 - **Auto-selection** — `select_kernel` filters by capability and traits,
   ranks the survivors with an optional per-family `SelectionOracle` and
   priority, and returns a callable. Selection supports per-call `solution=`

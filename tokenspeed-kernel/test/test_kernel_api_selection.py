@@ -978,7 +978,7 @@ def test_gemm_nvfp4_a16_square_weight_uses_weight_rows_for_n(monkeypatch) -> Non
         return torch.empty((A.shape[0], B.shape[0]), dtype=out_dtype)
 
     def select_nvfp4_a16(*args, traits, **kwargs) -> SelectedKernel:
-        assert traits["n_align_16"] is True
+        assert (traits["m"], traits["n"], traits["k"]) == (4, 144, 144)
         return SelectedKernel("test_nvfp4_a16_shape", kernel)
 
     monkeypatch.setattr(_gemm_pkg, "select_kernel", select_nvfp4_a16)

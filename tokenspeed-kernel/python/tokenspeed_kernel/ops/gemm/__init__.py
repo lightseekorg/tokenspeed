@@ -816,9 +816,9 @@ def grouped_bf16_projection(
             "m": x.shape[0],
             "n": weight.shape[1],
             "k": weight.shape[2],
-            "is_cuda": x.is_cuda,
             "a_inner_stride_one": x.stride(-1) == 1,
             "b_inner_stride_one": weight.stride(-1) == 1,
+            "is_cuda": x.is_cuda,
         },
         solution=solution,
     )
@@ -856,10 +856,8 @@ def dsv4_linear_fp32(
 
     enable_pdl = pdl_enabled()
     traits = {
-        "hidden_rank": hidden_states.ndim,
-        "weight_rank": weight.ndim,
         "has_tokens": hidden_states.numel() > 0,
-        "k_match": True,
+        "hidden_rank": hidden_states.ndim,
     }
     signature = format_signature(
         hidden_states=dense_tensor_format(hidden_states.dtype),
@@ -1258,24 +1256,14 @@ def mm(
         block_scale_layout = "flashinfer_mn"
 
     traits: dict[str, object] = {
-        # TODO: the following list is growingly large--clean up them.
-        "M": M,
-        "N": N,
-        "K": K,
-        "n_align_16": N % 16 == 0,
-        "k_align_16": K % 16 == 0,
-        "k_align_32": K % 32 == 0,
-        "n_align_64": N % 64 == 0,
-        "n_align_128": N % 128 == 0,
-        "k_align_64": K % 64 == 0,
-        "k_align_128": K % 128 == 0,
-        "n_min_128": N >= 128,
-        "k_min_128": K >= 128,
-        "block_scale_layout": block_scale_layout,
-        "pdl_enabled": pdl_enabled(),
+        "m": M,
+        "n": N,
+        "k": K,
         "a_inner_stride_one": A.stride(-1) == 1,
         "b_inner_stride_one": B.stride(-1) == 1,
+        "block_scale_layout": block_scale_layout,
         "out_dtype": out_dtype,
+        "pdl_enabled": enable_pdl,
     }
 
     signature = _gemm_format_signature(
@@ -1441,17 +1429,8 @@ def bmm(
         "k": K,
         "a_inner_stride_one": A.stride(-1) == 1,
         "b_n_stride_one": B.stride(1) == 1,
-        "out_inner_stride_one": out is None or out.stride(-1) == 1,
         "out_dtype": out_dtype,
-        "n_align_16": N % 16 == 0,
-        "k_align_16": K % 16 == 0,
-        "k_align_32": K % 32 == 0,
-        "n_align_64": N % 64 == 0,
-        "n_align_128": N % 128 == 0,
-        "k_align_64": K % 64 == 0,
-        "k_align_128": K % 128 == 0,
-        "n_min_128": N >= 128,
-        "k_min_128": K >= 128,
+        "out_inner_stride_one": out is None or out.stride(-1) == 1,
     }
 
     signature = _gemm_format_signature(
