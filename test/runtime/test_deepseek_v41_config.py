@@ -494,4 +494,6 @@ def test_real_server_args_prepare_cache_pool_and_backend(runtime_config, overlap
             == arena.buffer.untyped_storage().data_ptr()
         )
     assert backend.cuda_graph_support.decode_graph
-    assert not backend.cuda_graph_support.prefill_graph
+    # The prefill graph captures the encoder and decoder stages around the
+    # eager narrowing (NarrowingPrefillModel), so the backend allows it.
+    assert backend.cuda_graph_support.prefill_graph

@@ -990,10 +990,15 @@ them into the request's own pages (SWA bounded replay,
 The global KV and index rows those replayed tokens recompute are masked, so
 the shared rows stay exactly what the first computation produced. The CED
 decoder (layers 20–39) runs only on each prompt's last 128 positions
-(one row per chunk that does not complete its prompt), which is why the
-backend declares `prefill_graph=False`: the prefill row count changes at
-layer 20. Pass `--disable-prefill-graph` explicitly or let the backend
-resolution turn it off; decode CUDA graphs are unaffected.
+(one row per chunk that does not complete its prompt), so the prefill row
+count changes at layer 20. The prefill CUDA graph therefore captures the
+model in two halves around that layer, which runs eager: encoder graphs per
+token bucket and decoder graphs per decoder-row bucket, the latter shared by
+every token bucket and capped at 128 rows per request
+(`--max-num-seqs` × 128, see
+[`docs/design/unified_path.md`](../design/unified_path.md#prefill-graphs-around-a-row-narrowing)).
+`--prefill-graph-capture-sizes` sets both ladders; `--disable-prefill-graph`
+turns both off. Decode CUDA graphs are unaffected.
 
 ```bash
 tokenspeed serve deepseek-ai/DeepSeek-V4.1-Flash \
@@ -1008,14 +1013,17 @@ tokenspeed serve deepseek-ai/DeepSeek-V4.1-Flash \
   --max-num-seqs 32 \
   --chunked-prefill-size 8192 \
   --max-cudagraph-capture-size 32 \
-  --disable-prefill-graph \
   --disable-kvstore \
   --host 0.0.0.0 \
   --port 8000
 ```
 
 Add `--speculative-algorithm DSPARK` for same-checkpoint DSpark decoding;
-the draft seeds its context windows from the decoder's kept rows. A hit
+the draft seeds its context windows from the decoder's kept rows, and each
+draft stage attends its 128-row window plus the non-causal proposal block
+through the same `selected_attention` workspace kernel as the target's
+prefill (FlashMLA on sm90+, Triton elsewhere); the fp32 arithmetic remains
+the CPU reference. A hit
 re-feeds the groups' whole retention window, which is exactly the 128-token
 attention window (the compressor-tail group retains its unfinished pair the
 same way); the scheduler requires

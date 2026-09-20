@@ -196,7 +196,6 @@ def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
         assert flag_value(server_tokens, "--max-cudagraph-capture-size") == "32"
         assert flag_value(server_tokens, "--reasoning-parser") == "deepseek_v31"
         assert "--disable-kvstore" in server_tokens
-        assert "--disable-prefill-graph" in server_tokens
         assert "--trust-remote-code" in server_tokens
         assert flag_value(eval_tokens, "--model") == "deepseek-ai/DeepSeek-V4.1-Flash"
         assert flag_value(eval_tokens, "--datasets") == "gsm8k"
@@ -206,9 +205,14 @@ def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
         if label == "b200-4gpu":
             assert "--enable-expert-parallel" in server_tokens
             assert flag_value(server_tokens, "--moe-backend") == "mega_moe"
+            # The NVIDIA gate exercises the split prefill graph (encoder and
+            # decoder graphs around the eager narrowing layer).
+            assert "--disable-prefill-graph" not in server_tokens
         else:
             assert "--enable-expert-parallel" not in server_tokens
             assert "--moe-backend" not in server_tokens
+            # Not yet exercised on AMD; keep that gate on eager prefill.
+            assert "--disable-prefill-graph" in server_tokens
 
 
 def test_kimi_k3_amd_gates_use_eagle3():

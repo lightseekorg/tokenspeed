@@ -23,22 +23,26 @@
 The target supplies HC-mean layer inputs. Three text-only stages share its
 embedding/head but have their own 128-expert MoEs and shared experts. Single-pass
 HC and FP8 projections use the target implementation; draft attention is dense
-within its small context window plus the entire non-causal proposal block.
+within its small context window plus the entire non-causal proposal block, and
+runs through the same ``selected_attention`` workspace kernel as the target's
+prefill (FlashMLA on sm90+, Triton elsewhere); the fp32 arithmetic stays as the
+CPU reference.
 """
 
 from __future__ import annotations
 
 import re
 from copy import copy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 import torch
+from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import rope_inplace
 from torch import nn
 
-from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
-    V41RowPlan,
+from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
+    V41_PREFILL_QUERY_TILE,
 )
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
@@ -68,14 +72,35 @@ def _quantized_kv(x: torch.Tensor) -> torch.Tensor:
     return values.flatten(-2).reshape_as(x).to(x.dtype)
 
 
-def _window_rows(window: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
-    """Gather ``[..., head_dim]`` rows of a paged window field by SWA slots.
+@dataclass(frozen=True)
+class _WindowSelection:
+    """Stage-invariant addressing of one draft forward's window attention.
 
-    Negative slots resolve to the null page's first row; callers mask them.
+    ``page``/``row`` gather the history rows of a paged window field by SWA
+    slot (negative slots resolve to the null page's first row and are masked
+    through ``indices``). ``indices`` is the int32 ``[batch * block, width]``
+    selection into the compact per-request workspace ``[history rows, block
+    rows]``: history columns are -1 where the slot is invalid, the block's own
+    rows are always visible. All three are shared by every stage.
     """
-    rows_per_page = window.shape[1]
-    slots = slots.clamp_min(0).long()
-    return window[slots // rows_per_page, slots % rows_per_page]
+
+    page: torch.Tensor
+    row: torch.Tensor
+    indices: torch.Tensor
+
+    @classmethod
+    def build(
+        cls, history_slots: torch.Tensor, block_size: int, rows_per_page: int
+    ) -> _WindowSelection:
+        batch, window = history_slots.shape
+        slots = history_slots.clamp_min(0).long()
+        width = window + block_size
+        indices = torch.arange(
+            batch * width, dtype=torch.int32, device=history_slots.device
+        ).view(batch, width)
+        indices[:, :window].masked_fill_(history_slots < 0, -1)
+        indices = indices[:, None, :].expand(-1, block_size, -1).reshape(-1, width)
+        return cls(slots // rows_per_page, slots % rows_per_page, indices)
 
 
 def _write_window_rows(
@@ -98,7 +123,7 @@ def _write_window_rows(
 class _WindowAttention:
     """Borrow one stage's LCM window pages for one forward; no state survives."""
 
-    def __init__(self, positions, window, history_slots, block_size):
+    def __init__(self, positions, window, history_slots, block_size, selection):
         self.meta = SimpleNamespace(
             positions=positions,
             request_indices=torch.arange(
@@ -108,9 +133,23 @@ class _WindowAttention:
         self.window = window
         self.history_slots = history_slots
         self.block_size = block_size
+        self.selection: _WindowSelection = selection
 
     def query_metadata(self, mode):
         return self.meta
+
+    def _workspace(self, swa, positions, swa_rope_cache):
+        """Per-request ``[batch, window + block, head_dim]`` BF16 rows.
+
+        History rows are gathered straight from the strided paged field; the
+        block rows carry the reference all-channel FP8 round trip, exactly as
+        the target writes its own SWA rows.
+        """
+        batch, block = self.history_slots.shape[0], self.block_size
+        history = self.window[self.selection.page, self.selection.row]
+        if swa_rope_cache is not None:
+            swa = rope_inplace(swa.clone(), positions, swa_rope_cache, None)
+        return torch.cat((history, _quantized_kv(swa).reshape(batch, block, -1)), dim=1)
 
     def forward_v41(
         self,
@@ -130,13 +169,39 @@ class _WindowAttention:
     ):
         if index_q is not None or index_weights is not None:
             raise ValueError("DSpark window attention has no indexer")
+        kv = self._workspace(swa, positions, swa_rope_cache)
+        if q.is_cuda and q.shape[-1] == 512:
+            return self._kernel_forward(q, kv, attn_sink, softmax_scale)
+        return self._reference_forward(q, kv, attn_sink, softmax_scale)
+
+    def _kernel_forward(self, q, kv, attn_sink, softmax_scale):
+        """The target's prefill workspace kernel over ``[history, block]`` rows.
+
+        ``q`` arrives 64/128-head padded from ``rope_pad_query`` with a
+        matching ``-inf``-padded sink; the caller slices the real heads. No
+        paged cache is involved, so the SWA/global arguments are all None.
+        """
+        return dsv41.selected_attention(
+            q,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            attn_sink,
+            softmax_scale,
+            None,
+            V41_PREFILL_QUERY_TILE,
+            None,
+            kv.view(-1, 1, kv.shape[-1]),
+            self.selection.indices,
+        )
+
+    def _reference_forward(self, q, kv, attn_sink, softmax_scale):
+        """FP32 reference arithmetic for CPU and non-512 head dims."""
         batch, block = self.history_slots.shape[0], self.block_size
-        history = _window_rows(self.window, self.history_slots)
-        if swa_rope_cache is not None:
-            swa = rope_inplace(swa.clone(), positions, swa_rope_cache, None)
-        kv = torch.cat((history, _quantized_kv(swa).reshape(batch, block, -1)), dim=1)
         queries = q.reshape(batch, block, q.shape[-2], q.shape[-1])
-        # ponytail: the draft attends only 128+5 rows; fuse after parity is pinned.
         scores = torch.einsum("bqhd,bkd->bhqk", queries.float(), kv.float())
         scores *= softmax_scale
         visible = self.history_slots >= 0
@@ -297,9 +362,18 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         h = h[:, None, :].repeat(1, self.config.hc_mult, 1)
         pre_mix = h.new_zeros(h.shape[:2], dtype=torch.float32)
         pre_mix[:, 0] = 1
+        # Every stage's window field shares the SWA page geometry, so the
+        # history addressing and the workspace selection are built once.
+        selection = _WindowSelection.build(
+            history_slots, self.block_size, cache_pool.dspark_kv(0).shape[1]
+        )
         for stage, layer in enumerate(self.layers):
             backend = _WindowAttention(
-                positions, cache_pool.dspark_kv(stage), history_slots, self.block_size
+                positions,
+                cache_pool.dspark_kv(stage),
+                history_slots,
+                self.block_size,
+                selection,
             )
             h, pre_mix = layer(
                 h,
@@ -307,7 +381,6 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
                 positions,
                 image_mask=None,
                 ctx=replace(ctx, attn_backend=backend),
-                rows=V41RowPlan(backend.meta, backend.meta, None),
             )
         return _norm(v41_hc_pre(h, pre_mix), self.norm).reshape(
             batch, self.block_size, -1
