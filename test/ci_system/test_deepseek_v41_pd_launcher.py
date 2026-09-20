@@ -33,6 +33,7 @@ CONFIG = (
     SCRIPT.parents[1]
     / "ci/eval/deepseek-v4.1-flash-pd-1p1d-dspark-evalscope-gsm8k-gb300-slurm.yaml"
 )
+B200_CONFIG = SCRIPT.parents[1] / "ci/ut/deepseek-v4.1-flash-pd-1p1d.yaml"
 
 
 @pytest.fixture
@@ -46,6 +47,8 @@ def launcher(tmp_path):
 import json, os, signal, sys, time
 from pathlib import Path
 args = sys.argv[1:]
+if args[0].endswith('/gpu_visibility.py'):
+    os.execv(sys.executable, [sys.executable, *args])
 if args[0] == '-':
     code = sys.stdin.read()
     if 'get_local_ip_by_remote' in code:
@@ -80,7 +83,7 @@ while True:
 
     def start(overrides):
         env = {
-            **os.environ,
+            **{k: v for k, v in os.environ.items() if k != "MC_FORCE_TCP"},
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
             "MODEL_PATH": str(tmp_path),
             "PD_CI_LOG_DIR": str(tmp_path / "logs"),
@@ -187,16 +190,27 @@ def test_two_node_roles_keep_engines_independent(launcher):
     assert "decode: health status" not in prefill_output
 
 
-def test_single_node_defaults_still_launch_both_roles(launcher):
+@pytest.mark.parametrize(
+    "overrides,expected_utilization",
+    [({}, "0.92"), (yaml.safe_load(B200_CONFIG.read_text())["env"], "0.95")],
+)
+def test_single_node_configuration_reaches_both_roles(
+    launcher, overrides, expected_utilization
+):
     start, calls, _ = launcher
-    start({"PD_SLURM": "0"})
+    start({"PD_SLURM": "0", **overrides})
     wait_for(lambda: any(c["kind"] == "router" for c in calls()))
     records = {c["kind"]: c for c in calls()}
     assert records.keys() == {"prefill", "decode", "router"}
     for role, gpus in (("prefill", "0,1"), ("decode", "2,3")):
         assert records[role]["env"]["CUDA_VISIBLE_DEVICES"] == gpus
+        assert records[role]["env"].get("MC_FORCE_TCP") == overrides.get("MC_FORCE_TCP")
         assert value(records[role]["args"], "--host") == "127.0.0.1"
         assert value(records[role]["args"], "--world-size") == "2"
+        assert (
+            value(records[role]["args"], "--gpu-memory-utilization")
+            == expected_utilization
+        )
         assert value(records[role]["args"], "--max-cudagraph-capture-size") == "16"
     assert value(records["router"]["args"], "--reasoning-parser") == "passthrough"
 
@@ -233,3 +247,37 @@ def test_invalid_slurm_topology_fails_before_workers_start(launcher, nodes, rank
     )
     assert process.wait(timeout=5) == 2
     assert calls() == []
+
+
+@pytest.mark.parametrize(
+    "parent,expected",
+    [
+        ("4,6,5,7", ("4,6", "5,7")),
+        ("GPU-a,GPU-b,GPU-c,GPU-d", ("GPU-a,GPU-b", "GPU-c,GPU-d")),
+    ],
+)
+def test_roles_stay_inside_parent_mask(launcher, parent, expected):
+    start, calls, _ = launcher
+    start({"PD_SLURM": "0", "CUDA_VISIBLE_DEVICES": parent})
+    wait_for(lambda: any(c["kind"] == "router" for c in calls()))
+    records = {c["kind"]: c for c in calls()}
+    for role, mask in zip(("prefill", "decode"), expected):
+        assert records[role]["env"]["CUDA_VISIBLE_DEVICES"] == mask
+
+
+@pytest.mark.parametrize("parent", ["", "-1", "4,5"])
+def test_invalid_allocation_starts_no_workers(launcher, parent):
+    start, calls, _ = launcher
+    process = start({"PD_SLURM": "0", "CUDA_VISIBLE_DEVICES": parent})
+    assert process.wait(timeout=5) != 0
+    assert calls() == []
+
+
+def test_slurm_roles_resolve_masks_independently(launcher):
+    start, calls, _ = launcher
+    start({**slurm_env(1), "CUDA_VISIBLE_DEVICES": "4,5,6,7"})
+    start({**slurm_env(0), "CUDA_VISIBLE_DEVICES": "4,5,6,7"})
+    wait_for(lambda: any(c["kind"] == "router" for c in calls()))
+    records = {c["kind"]: c for c in calls()}
+    assert records["prefill"]["env"]["CUDA_VISIBLE_DEVICES"] == "4,5,6,7"
+    assert records["decode"]["env"]["CUDA_VISIBLE_DEVICES"] == "4,5,6,7"

@@ -61,6 +61,9 @@ export LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
 export NO_PROXY=${NO_PROXY:-*}
 export no_proxy=${no_proxy:-*}
 
+gpu_groups=$(python3 "$SCRIPT_DIR/gpu_visibility.py" groups "$ENCODE_GPUS" "$PREFILL_GPUS" "$DECODE0_GPUS" "$DECODE1_GPUS")
+read -r ENCODE_GPUS PREFILL_GPUS DECODE0_GPUS DECODE1_GPUS <<< "$gpu_groups"
+
 mkdir -p "$LOG_DIR"
 
 resolve_model_snapshot() {

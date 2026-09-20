@@ -22,6 +22,7 @@ from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
+from gpu_visibility import prepare_environment
 from process_group_manager import ProcessGroupManager, make_manager
 
 try:
@@ -1857,6 +1858,12 @@ def execute_task(
         reuse_state=reuse_runner_state,
         setup_mode=setup_mode,
     )
+    if (
+        setup_mode == "ci"
+        and not is_amd_runner(runner)
+        and not is_cpu_only_runner(runner)
+    ):
+        runner_env = prepare_environment(runner_env)
     enable_perf_diagnostics = should_run_perf_diagnostics(task, runner)
     stages_run: List[str] = []
     command_results: List[Dict[str, Any]] = []
@@ -1880,7 +1887,30 @@ def execute_task(
     def _run_task_stages() -> None:
         nonlocal server_process, server_log_path
         nonlocal eval_score_check, eval_accept_rate, stages_run, command_results
+        gpu_allocation_checked = False
         for stage_name, stage_payload in stages:
+            if (
+                stage_name != "install"
+                and not gpu_allocation_checked
+                and not external_server
+                and not is_amd_runner(runner)
+                and not is_cpu_only_runner(runner)
+            ):
+                if pgm is not None:
+                    pgm.run(
+                        f"python3 test/ci_system/gpu_visibility.py diagnose --runner {shlex.quote(runner)}",
+                        env=runner_env,
+                        cwd=repo_root,
+                        dry_run=dry_run,
+                    )
+                else:
+                    shell_run(
+                        f"python3 test/ci_system/gpu_visibility.py diagnose --runner {shlex.quote(runner)}",
+                        env=runner_env,
+                        cwd=repo_root,
+                        dry_run=dry_run,
+                    )
+                gpu_allocation_checked = True
             stages_run.append(stage_name)
             if stage_name == "server":
                 ready = dict(stage_payload["ready"])

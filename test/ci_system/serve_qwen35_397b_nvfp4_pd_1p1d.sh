@@ -53,6 +53,9 @@ if [[ ${#DECODE_GPU_LIST[@]} -ne $WORLD_SIZE ]]; then
   exit 2
 fi
 
+gpu_groups=$(python3 "$SCRIPT_DIR/gpu_visibility.py" groups "$PREFILL_GPUS" "$DECODE_GPUS")
+read -r PREFILL_GPUS DECODE_GPUS <<< "$gpu_groups"
+
 mkdir -p "$LOG_DIR"
 
 resolve_model_snapshot() {

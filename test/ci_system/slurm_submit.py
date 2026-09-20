@@ -20,9 +20,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from gpu_visibility import gpu_count
 from pipeline import build_matrix, normalize_task, validate_gb300_runner_alias
 
-GPU_RE = re.compile(r"(?:^|-)([1-9]\d*)gpu(?:-|$)")
 TASK_TYPES = {"ut", "server_smoke", "eval", "perf"}
 DEFAULT_TASK_TYPES = {"eval", "perf"}
 PR_RE = re.compile(
@@ -64,13 +64,6 @@ class Submission:
     task: Task
     job_id: str
     log: Path
-
-
-def gpu_count(runner: str) -> int:
-    matches = GPU_RE.findall(runner)
-    if len(matches) != 1:
-        raise ValueError(f"runner {runner!r} must contain one '<N>gpu' segment")
-    return int(matches[0])
 
 
 def load_task(

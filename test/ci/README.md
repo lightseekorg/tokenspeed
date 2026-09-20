@@ -245,6 +245,38 @@ runner fleet must prevent two jobs from sharing one physical GPU.
 Harness, suite, correctness, timing, and local reproduction details are in the
 [kernel benchmark documentation](../../tokenspeed-kernel/benchmarks/README.md).
 
+## GPU allocation
+
+NVIDIA tasks preserve an explicit `CUDA_VISIBLE_DEVICES`. In ordinary CI mode,
+when it is absent, the pipeline derives a UUID mask from an explicit
+`NVIDIA_VISIBLE_DEVICES` allocation. Slurm mode preserves the scheduler-provided
+environment, including an unset mask, for multi-node NVLink compatibility.
+An empty or `void` NVIDIA mask does not describe devices injected by other
+runtime mechanisms, so it does not create an empty CUDA mask. An explicit
+empty CUDA mask remains empty.
+
+The pipeline requires the visible CUDA count to equal the selected runner's
+per-node GPU count, checks device UUIDs against any explicit allocation, and
+reports available memory before executing the task. These checks detect count
+and allocation conflicts; a matching count alone cannot prove isolation from
+other jobs. Conflicting allocations fail before model loading.
+
+PD/EPD role GPU numbers are logical ordinals within that parent mask. For example,
+with `CUDA_VISIBLE_DEVICES=4,6,5,7`, the default PD split selects `4,6` for prefill
+and `5,7` for decode. UUID overrides must belong to the parent mask. Empty masks,
+out-of-range selections, and overlapping roles on the same node are rejected.
+Multi-node PD resolves only the role on the current node. These CI launchers
+accept full-GPU allocations; MIG identifiers are not supported. Resolved role
+masks must use one identifier format so numeric/UUID aliases cannot overlap.
+
+The B200 DeepSeek V4.1 PD smoke task sets `GPU_MEMORY_UTILIZATION=0.95`:
+with two GPUs per role, the main and DSpark weights leave less free memory
+than the launcher's default 8% reserve, preventing even a minimal KV cache.
+The task keeps a 5% reserve and validates both roles with the original quality
+and draft-acceptance checks. It uses Mooncake TCP for runners without RDMA:
+the automatic NVLink fabric fallback cannot export the Torch-allocated KV
+arena. This task validates TCP PD transfers.
+
 ## Slurm with Pyxis/Enroot
 
 `slurm_submit.py` submits an existing task YAML without copying its server,

@@ -432,6 +432,7 @@ def test_slurm_server_modes_split_server_from_client(monkeypatch, tmp_path):
     )
     assert serve_manager.commands == [
         "install project",
+        "python3 test/ci_system/gpu_visibility.py diagnose --runner slurm-gb200-4node-4gpu",
         "ts serve --model example/model --engine-startup-timeout 7200",
     ]
 
@@ -648,6 +649,10 @@ def test_slurm_runner_override_keeps_task_env_and_uses_gb300_hardware(
         "ut": {"commands": ["run test"]},
     }
     captured = {}
+    prepare = Mock(
+        side_effect=AssertionError("Slurm must preserve its allocated environment")
+    )
+    monkeypatch.setattr(pipeline, "prepare_environment", prepare)
 
     class FakeProcessGroupManager:
         def run(self, command, *, cwd, env, dry_run):

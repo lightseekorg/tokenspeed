@@ -92,6 +92,17 @@ if [[ ${#DECODE_GPU_LIST[@]} -ne $WORLD_SIZE ]]; then
   exit 2
 fi
 
+# Resolve every role on this node before starting any worker. Slurm roles
+# live on different nodes and may use identical local GPU ordinals.
+if [[ "$ROLE" == both ]]; then
+  gpu_groups=$(python3 "$SCRIPT_DIR/gpu_visibility.py" groups "$PREFILL_GPUS" "$DECODE_GPUS")
+  read -r PREFILL_GPUS DECODE_GPUS <<< "$gpu_groups"
+elif [[ "$ROLE" == prefill ]]; then
+  PREFILL_GPUS=$(python3 "$SCRIPT_DIR/gpu_visibility.py" groups "$PREFILL_GPUS")
+else
+  DECODE_GPUS=$(python3 "$SCRIPT_DIR/gpu_visibility.py" groups "$DECODE_GPUS")
+fi
+
 mkdir -p "$LOG_DIR"
 if [[ -n "$READY_FILE" ]]; then
   rm -f "$READY_FILE"
