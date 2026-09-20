@@ -28,6 +28,7 @@ byte width so no parent is wasted.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from functools import cached_property
 
@@ -241,7 +242,7 @@ class KimiK3Recipe(CacheRecipe):
                 f"layer.{layer_id}.recurrent_state",
                 plane_id,
                 recurrent_shape,
-                cache_dtype_name(torch.float32),
+                cache_dtype_name(getattr(torch, self.server_args.mamba_ssm_dtype)),
                 exact_page_stride=False,
             ),
         )
@@ -372,7 +373,15 @@ class KimiK3Recipe(CacheRecipe):
                 else torch.float32.itemsize
             )
             payload_bytes_per_row += heads * head_dim * gate_itemsize
-            return conv_bytes + layer_count * rows * payload_bytes_per_row
+            # One compact BF16 verify input, shared across all KDA layers.
+            state_bytes = (
+                self.attn_config.max_bs
+                * math.prod(recurrent_shape)
+                * torch.bfloat16.itemsize
+                if self.server_args.mamba_ssm_dtype == "bfloat16"
+                else 0
+            )
+            return conv_bytes + layer_count * rows * payload_bytes_per_row + state_bytes
         verify_rows = self.attn_config.max_bs * (
             int(self.server_args.speculative_num_draft_tokens) + 1
         )

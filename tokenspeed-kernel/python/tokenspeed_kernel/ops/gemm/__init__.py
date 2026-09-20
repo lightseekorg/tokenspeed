@@ -96,6 +96,8 @@ __all__ = [
     "dsv4_linear_fp32",
     "fp8_linear",
     "quantize_fp8_group32_for_linear",
+    "fp8_linear_gated_rmsnorm",
+    "fp8_linear_gated_rmsnorm_supported",
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "linear_attnres_partials",
     "linear_attnres_partials_available",
@@ -412,6 +414,87 @@ def _fp8_linear_activation(
         swiglu_beta=beta,
         enable_pdl=enable_pdl,
     )
+
+
+def fp8_linear_gated_rmsnorm_supported(plan: object | None) -> bool:
+    """Check a prepared linear's gated RMSNorm/quantization contract.
+
+    Args:
+        plan: Opaque result of ``prepare_fp8_linear``, or None.
+
+    Returns:
+        Whether this plan supports the MN-major scale fusion.
+    """
+    if plan is None:
+        return False
+    typed = _require_fp8_linear_plan(plan)
+    return (
+        typed.override == "flashinfer_mm_fp8_blockscale"
+        and typed.block_size == (128, 128)
+        and typed.prepacked_scales
+        and typed.prepared_weight_scales is not None
+    )
+
+
+def fp8_linear_gated_rmsnorm(
+    plan: object,
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    eps: float,
+    num_heads: int,
+    head_dim: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Apply gated RMSNorm, quantize once, and execute the prepared FP8 GEMM.
+
+    Retains the ordinary BF16 norm rounding and the prepared linear's existing
+    MN-major scale layout, weight scales, GEMM implementation and row padding.
+
+    Args:
+        plan: Compatible opaque result of ``prepare_fp8_linear``.
+        x: Contiguous BF16 input ``[tokens, num_heads * head_dim]``.
+        gate: Raw sigmoid gate with the same shape and dense inner dimension.
+        norm_weight: Per-head RMSNorm weight ``[head_dim]``.
+        weight: Prepared linear's FP8 weight matrix ``[output_width, input_width]``.
+        eps: RMSNorm epsilon.
+        num_heads: Number of independently normalized heads.
+        head_dim: Per-head width; this implementation requires 128.
+        out_dtype: Projection result dtype.
+
+    Returns:
+        Projection output ``[tokens, output_width]``, without padded rows.
+    """
+    if not fp8_linear_gated_rmsnorm_supported(plan):
+        raise ValueError("prepared linear does not support gated RMSNorm fusion")
+    typed = _require_fp8_linear_plan(plan)
+    from tokenspeed_kernel.thirdparty.flashinfer.kda._epilogue import (
+        gated_rmsnorm_fp8_prepacked,
+    )
+
+    values, scales = gated_rmsnorm_fp8_prepacked(
+        x,
+        gate,
+        norm_weight,
+        eps=eps,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        enable_pdl=pdl_enabled(),
+    )
+    out = mm(
+        values,
+        weight,
+        A_scales=scales,
+        B_scales=typed.prepared_weight_scales,
+        out_dtype=out_dtype,
+        quant="mxfp8",
+        block_size=list(typed.block_size),
+        override=typed.override,
+        prepacked_scales=True,
+    )
+    return out[: x.shape[0]]
 
 
 def warmup_prepared_fp8_linears(plans: Iterable[object], max_tokens: int) -> None:

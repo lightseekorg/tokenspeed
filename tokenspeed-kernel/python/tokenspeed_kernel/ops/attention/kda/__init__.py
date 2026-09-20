@@ -310,6 +310,7 @@ def kda_paged_decode(
         traits={
             "indexed_state": True,
             "single_token": q.shape[1] == num_sequences,
+            "state_dtype": state_pool.dtype,
             "recurrent_layout": recurrent_layout,
         },
         solution=solution,
@@ -386,6 +387,7 @@ def try_kda_fused_paged_decode(
             signature,
             traits={
                 "paged_state": True,
+                "state_dtype": state_pool.dtype,
                 "fused_output_norm": output_gate is not None,
                 "num_heads": num_heads,
                 "head_dim": head_dim,
@@ -405,6 +407,7 @@ def try_kda_fused_paged_decode(
                 signature,
                 traits={
                     "paged_state": True,
+                    "state_dtype": state_pool.dtype,
                     "fused_output_norm": False,
                     "num_heads": num_heads,
                     "head_dim": head_dim,
@@ -464,6 +467,7 @@ def try_kda_fused_paged_verify(
     *,
     state_pool: torch.Tensor,
     state_scratch: torch.Tensor | None,
+    replay_payload: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
     read_indices: torch.Tensor,
     write_indices: torch.Tensor,
     num_heads: int,
@@ -488,8 +492,14 @@ def try_kda_fused_paged_verify(
     rollback-tape variant and ``recurrent_layout`` defaults to the
     platform's state layout; which producer arrangement runs is the
     registry's choice. Returns ``None`` only when no implementation
-    supports the current platform.
+    supports the current platform. ``replay_payload`` supplies existing raw
+    QKV, low-rank gate-input and beta destinations. Implementations without
+    fused capture retain the normal separate capture kernel.
     """
+    if replay_payload is not None and (store_states or replay_mixed_qkv is not None):
+        raise ValueError(
+            "Replay input capture requires frozen verify without raw-g payload"
+        )
     recurrent_layout = recurrent_layout or kda_recurrent_layout()
     if recurrent_layout not in ("k_major", "v_major"):
         raise ValueError(f"unsupported KDA recurrent layout {recurrent_layout!r}")
@@ -509,6 +519,8 @@ def try_kda_fused_paged_verify(
             traits={
                 "paged_state": True,
                 "store_states": store_states,
+                "draft_token_num": draft_token_num,
+                "state_dtype": state_pool.dtype,
                 "recurrent_layout": recurrent_layout,
                 "num_heads": num_heads,
                 "head_dim": head_dim,
@@ -520,6 +532,24 @@ def try_kda_fused_paged_verify(
     except NoKernelFoundError:
         return None
     kwargs = {}
+    registered = KernelRegistry.get().get_by_name(kernel.name)
+    captures_inputs = registered is not None and registered.traits.get(
+        "fused_replay_payload"
+    ) == frozenset({True})
+    if captures_inputs:
+        kwargs["replay_payload"] = replay_payload
+    elif replay_payload is not None:
+        # Preserve the existing capture for backends without this capability.
+        from tokenspeed_kernel.ops.attention.kda._triton.capture_payload import (
+            capture_replay_payload,
+        )
+
+        rows = read_indices.numel() * draft_token_num
+        capture_replay_payload(
+            (mixed_qkv[:rows], f_a_out[:rows], beta_logits[:rows]),
+            replay_payload,
+            rows,
+        )
     if replay_mixed_qkv is not None:
         kwargs.update(
             {
@@ -555,7 +585,9 @@ def try_kda_fused_paged_verify(
 def kda_fused_paged_verify_uses_split_producers(
     dtype: torch.dtype,
     *,
+    state_dtype: torch.dtype,
     store_states: bool,
+    draft_token_num: int,
     recurrent_layout: str,
     num_heads: int,
     head_dim: int,
@@ -564,7 +596,9 @@ def kda_fused_paged_verify_uses_split_producers(
 
     Args:
         dtype: Activation dtype used to resolve the registered kernel.
+        state_dtype: Persistent recurrent-state dtype.
         store_states: Whether verify materializes per-position rollback state.
+        draft_token_num: Verify positions per request, including the anchor token.
         recurrent_layout: Committed recurrent-state layout.
         num_heads: Per-rank KDA head count.
         head_dim: KDA head width.
@@ -578,6 +612,8 @@ def kda_fused_paged_verify_uses_split_producers(
     traits = {
         "paged_state": True,
         "store_states": store_states,
+        "draft_token_num": draft_token_num,
+        "state_dtype": state_dtype,
         "recurrent_layout": recurrent_layout,
     }
     traits["num_heads"] = num_heads
@@ -870,6 +906,7 @@ import tokenspeed_kernel.ops.attention.kda.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.gluon  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.kda.flashinfer  # noqa: E402,F401
 
 # isort: on
 

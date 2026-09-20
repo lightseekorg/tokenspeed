@@ -313,6 +313,9 @@ Notes:
   a warning when it adjusts); the page grain is budget-dependent (e.g. 1472
   at 32k context, 1536 at 1M), so do not hand-tune the chunk size against a
   hard-coded page value. Prefix hits are page-granular.
+- Use `--mamba-ssm-dtype bfloat16` to halve KDA recurrent-state memory
+  versus the FP32 default and automatically select compatible FlashInfer
+  decode/verify kernels on B200/B300 when available.
 
 ### NVIDIA
 
