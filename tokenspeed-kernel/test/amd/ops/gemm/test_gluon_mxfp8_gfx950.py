@@ -81,9 +81,7 @@ def test_mxfp8_gemm_matches_dequantized_reference(k: int) -> None:
         block_size=[1, 32],
         out=out,
     )
-    expected = (
-        _dequantize(a, a_scales) @ _dequantize(b, b_scales).T
-    ).to(actual.dtype)
+    expected = (_dequantize(a, a_scales) @ _dequantize(b, b_scales).T).to(actual.dtype)
 
     assert actual is out
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -120,9 +118,7 @@ def test_mxfp8_gemm_accepts_row_padded_operands_and_strided_scales() -> None:
         block_size=[1, 32],
         out=None,
     )
-    expected = (
-        _dequantize(a, a_scales) @ _dequantize(b, b_scales).T
-    ).to(actual.dtype)
+    expected = (_dequantize(a, a_scales) @ _dequantize(b, b_scales).T).to(actual.dtype)
 
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
@@ -150,9 +146,7 @@ def test_mxfp8_gemm_async_scales_accept_row_padding() -> None:
         block_size=[1, 32],
         out=None,
     )
-    expected = (
-        _dequantize(a, a_scales) @ _dequantize(b, b_scales).T
-    ).to(actual.dtype)
+    expected = (_dequantize(a, a_scales) @ _dequantize(b, b_scales).T).to(actual.dtype)
 
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
