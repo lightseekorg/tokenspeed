@@ -402,6 +402,15 @@ def test_print_target_distinguishes_pr_head_from_merge(monkeypatch, capsys, tmp_
     ]
 
 
+def test_print_target_without_pr_uses_current_checkout(capsys, tmp_path):
+    print_target(tmp_path, None, "branch-commit")
+
+    assert capsys.readouterr().out.splitlines() == [
+        "Target: current checkout",
+        "Target commit: branch-commit",
+    ]
+
+
 def test_print_target_accepts_non_merge_checkout(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(
         "slurm_submit.git",
