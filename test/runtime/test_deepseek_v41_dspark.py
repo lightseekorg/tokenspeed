@@ -323,6 +323,7 @@ def test_window_attention_kernel_matches_reference():
         is_flash_mla_v41_available,
     )
     from tokenspeed_kernel.platform import current_platform
+    from tokenspeed_kernel.registry import KernelRegistry
     from tokenspeed_kernel.selection import select_kernel
     from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -394,12 +395,31 @@ def test_window_attention_kernel_matches_reference():
         solution=None,
         override=None,
     )
-    native = current_platform().is_nvidia and is_flash_mla_v41_available()
-    assert selected.name == (
+    # Expect what the registry can serve here: FlashMLA inside its declared
+    # arch window (sm90-sm103, not sm107) when importable, a specialized Gluon
+    # kernel on the AMD parts that register one, the portable Triton kernel
+    # everywhere else.
+    registry, platform = KernelRegistry.get(), current_platform()
+
+    def _registered_here(name: str) -> bool:
+        spec = registry.get_by_name(name)
+        return spec is not None and spec.capability.satisfied_by(platform)
+
+    if is_flash_mla_v41_available() and _registered_here(
         "flashmla_dsv41_selected_attention"
-        if native
-        else "triton_dsv41_selected_attention"
-    )
+    ):
+        expected = "flashmla_dsv41_selected_attention"
+    else:
+        specialized = [
+            name
+            for name in (
+                "gluon_dsv41_selected_attention_gfx950",
+                "gluon_dsv41_selected_attention_gfx1250",
+            )
+            if _registered_here(name)
+        ]
+        expected = specialized[0] if specialized else "triton_dsv41_selected_attention"
+    assert selected.name == expected
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
