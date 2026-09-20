@@ -57,7 +57,6 @@ if flashinfer_kda_recurrent_available():
             "conv_kernel_size": frozenset({4}),
             "recurrent_layout": frozenset({"v_major"}),
         },
-        tags={"nvidia", "paged_cache", "cuda_graph"},
     )(flashinfer_kda_producer_decode)
 
     register_kernel(
@@ -82,5 +81,4 @@ if flashinfer_kda_recurrent_available():
             "head_dim": frozenset({128}),
             "recurrent_layout": frozenset({"v_major"}),
         },
-        tags={"nvidia", "paged_cache", "cuda_graph", "speculative"},
     )(flashinfer_kda_producer_verify)
