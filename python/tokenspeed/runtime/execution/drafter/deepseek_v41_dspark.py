@@ -35,6 +35,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.attention import dsv41
 
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
@@ -111,6 +112,9 @@ class DeepseekV41DSpark(BaseDrafter):
         self.draft_tokens_buf = torch.empty(
             (max_bs, self.block_size), dtype=torch.int32, device=self.device
         )
+        self.start_pos_buf = torch.empty(
+            (max_bs,), dtype=torch.int64, device=self.device
+        )
         self.candidates, self.partials = dspark_greedy_workspace(
             int(self.draft_model.mapping.attn.tp_size),
             max_bs,
@@ -136,7 +140,7 @@ class DeepseekV41DSpark(BaseDrafter):
     def _draft_decode_rows(
         self,
         base_ctx: ForwardContext,
-        accept_lengths: torch.Tensor,
+        start_pos: torch.Tensor,
         next_tokens: torch.Tensor,
     ) -> None:
         num_extends = base_ctx.num_extends
@@ -147,12 +151,8 @@ class DeepseekV41DSpark(BaseDrafter):
         pool = base_ctx.token_to_kv_pool
         meta = backend.query_metadata(ForwardMode.DECODE)
         width = self.spec_num_tokens
-        positions = meta.positions[: num_decodes * width].view(num_decodes, width)
-        accepted = accept_lengths[num_extends:].to(torch.int64).clamp(1, width)
-        rows = torch.arange(num_decodes, dtype=torch.int64, device=self.device)
         # The anchor is the last accepted verify row; it and every earlier
         # accepted position were written above, so history ends at start_pos.
-        start_pos = positions[rows, accepted - 1]
         history_slots, _ = backend.window_slots(
             V41_SWA_GROUP_ID,
             start_pos,
@@ -220,15 +220,20 @@ class DeepseekV41DSpark(BaseDrafter):
                 f"{rows} > {hidden_states.shape[0]}."
             )
 
+        # Every row's bonus token fills its next-round row (extend rows keep
+        # it; decode rows overwrite the proposal columns below), and each
+        # decode request's anchor is its last accepted verify position.
         next_tokens = self.next_tokens_buf[: base_ctx.bs]
-        DeepseekV4DSpark._bonus_tokens_from_output(
+        start_pos = self.start_pos_buf[:num_decodes]
+        dsv41.dspark_anchors(
             output_tokens,
             accept_lengths,
+            view.metadata.positions[prefill_tokens:rows],
             num_extends,
             self.spec_num_tokens,
-            next_tokens[:, 0],
+            next_tokens,
+            start_pos,
         )
-        next_tokens[:, 1:].copy_(next_tokens[:, :1])
 
         # Every captured row writes its window row: a prompt's kept tail seeds
         # the history the first decode reads, verify rows refresh the block
@@ -240,7 +245,7 @@ class DeepseekV41DSpark(BaseDrafter):
             view.metadata.swa_write_slots[:rows],
             pool,
         )
-        self._draft_decode_rows(base_ctx, accept_lengths, next_tokens)
+        self._draft_decode_rows(base_ctx, start_pos, next_tokens)
         next_tokens.clamp_(0, int(self.vocab_size) - 1)
         return next_tokens
 

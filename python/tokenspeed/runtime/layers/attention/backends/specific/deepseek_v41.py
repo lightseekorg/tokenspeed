@@ -468,17 +468,27 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             ``[n, 128]`` int32 slots of positions ``p-127..p`` (``-1`` before
             the sequence start) and the ``[n]`` int32 count of live rows.
         """
-        wanted = (positions - 127).clamp_min(0)[:, None] + torch.arange(
-            128, device=self.device
+        from tokenspeed_kernel.ops.attention.dsv41 import decode_window
+
+        if V41_GROUP_GEOMETRY[group_id] != V41_GROUP_GEOMETRY[V41_SWA_GROUP_ID]:
+            raise ValueError(f"{group_id} does not have the SWA row geometry")
+        if positions.shape != request_indices.shape or positions.ndim != 1:
+            raise ValueError("window queries need equal [n] positions and requests")
+        n = positions.numel()
+        slots = torch.empty((n, 128), dtype=torch.int32, device=self.device)
+        lens = torch.empty((n,), dtype=torch.int32, device=self.device)
+        # The kernel also resolves each query's own write slot; the callers
+        # of this resolver address only the history rows.
+        decode_window(
+            positions,
+            request_indices,
+            torch.empty((n,), dtype=torch.int64, device=self.device),
+            slots,
+            lens,
+            self.query_metadata(ForwardMode.DECODE).block_tables[group_id],
+            self.cache_pool.arena.cache_group_page_counts[group_id],
         )
-        wanted = wanted.masked_fill(wanted > positions[:, None], -1)
-        slots = self.cache_slots(
-            group_id,
-            wanted,
-            request_indices[:, None].expand_as(wanted),
-            ForwardMode.DECODE,
-        ).to(torch.int32)
-        return slots, (positions + 1).clamp(0, 128).to(torch.int32)
+        return slots, lens
 
     def _refresh_decode_window(self, metadata):
         """Build SWA query addresses before any layer runs.
