@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.activation.triton import (
+    add3,
     fused_gate_sigmoid_mul_add,
     sigmoid_mul,
     silu_and_mul,
@@ -411,3 +412,64 @@ def test_fused_swiglu_fp8_ue8m0_pdl_matches_serial(device: str) -> None:
 
     assert torch.equal(pdl_out, serial_out)
     assert torch.equal(pdl_scale, serial_scale)
+
+
+# --- PDL parity tests ---
+
+
+@pytest.mark.skipif(not platform.is_hopper_plus, reason="PDL requires SM90+")
+def test_sigmoid_mul_pdl_matches_serial(device: str) -> None:
+    x = torch.randn(17, 4096, device=device, dtype=torch.bfloat16)
+    gate = torch.randn_like(x)
+    serial = sigmoid_mul(x.clone(), gate, enable_pdl=False)
+    pdl = sigmoid_mul(x.clone(), gate, enable_pdl=True)
+    assert torch.equal(pdl, serial)
+
+
+@pytest.mark.skipif(not platform.is_hopper_plus, reason="PDL requires SM90+")
+def test_silu_and_mul_pdl_matches_serial(device: str) -> None:
+    x = torch.randn(17, 1024, device=device, dtype=torch.bfloat16) * 20
+    serial = silu_and_mul(x, limit=7.0, enable_pdl=False)
+    pdl = silu_and_mul(x, limit=7.0, enable_pdl=True)
+    assert torch.equal(pdl, serial)
+
+
+@pytest.mark.skipif(not platform.is_hopper_plus, reason="PDL requires SM90+")
+def test_swiglu_oai_pdl_matches_serial(device: str) -> None:
+    x = torch.randn(17, 256, device=device, dtype=torch.bfloat16)
+    serial = swiglu_oai(x, alpha=1.702, limit=7.0, enable_pdl=False)
+    pdl = swiglu_oai(x, alpha=1.702, limit=7.0, enable_pdl=True)
+    assert torch.equal(pdl, serial)
+
+
+@pytest.mark.skipif(not platform.is_hopper_plus, reason="PDL requires SM90+")
+def test_situ_and_mul_pdl_matches_serial(device: str) -> None:
+    x = torch.randn(17, 2 * 3072, device=device, dtype=torch.bfloat16) * 8
+    serial = situ_and_mul(x, beta=4.0, linear_beta=25.0, enable_pdl=False)
+    pdl = situ_and_mul(x, beta=4.0, linear_beta=25.0, enable_pdl=True)
+    assert torch.equal(pdl, serial)
+
+
+@pytest.mark.skipif(not platform.is_hopper_plus, reason="PDL requires SM90+")
+def test_fused_gate_sigmoid_mul_add_pdl_matches_serial(device: str) -> None:
+    hidden_states = torch.randn(17, 3584, device=device, dtype=torch.bfloat16)
+    gate_weight = torch.randn(3584, device=device, dtype=torch.bfloat16)
+    shared_output = torch.randn(17, 3584, device=device, dtype=torch.bfloat16)
+    final = torch.randn(17, 3584, device=device, dtype=torch.bfloat16)
+    serial = fused_gate_sigmoid_mul_add(
+        hidden_states, gate_weight, shared_output, final.clone(), enable_pdl=False
+    )
+    pdl = fused_gate_sigmoid_mul_add(
+        hidden_states, gate_weight, shared_output, final.clone(), enable_pdl=True
+    )
+    assert torch.equal(pdl, serial)
+
+
+@pytest.mark.skipif(not platform.is_hopper_plus, reason="PDL requires SM90+")
+def test_add3_pdl_matches_serial(device: str) -> None:
+    a = torch.randn(17, 4096, device=device, dtype=torch.bfloat16)
+    b = torch.randn_like(a)
+    c = torch.randn_like(a)
+    serial = add3(a, b, c, enable_pdl=False)
+    pdl = add3(a, b, c, enable_pdl=True)
+    assert torch.equal(pdl, serial)

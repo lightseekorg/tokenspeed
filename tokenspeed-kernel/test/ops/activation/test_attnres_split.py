@@ -133,3 +133,28 @@ def test_combine_pdl_parity(use_norm):
         enable_pdl=True,
     )
     assert torch.equal(plain, pdl)
+
+
+@pytest.mark.skipif(not platform.is_hopper_plus, reason="PDL requires SM90+")
+def test_partial_pdl_parity():
+    """PDL launches of the blocks-side partials must match the serial launch
+    bit-for-bit; standalone each degenerates to an immediate wait."""
+    torch.manual_seed(11)
+    T, KB = 4, 8
+    blocks = torch.randn(KB, T, H, dtype=torch.bfloat16, device="cuda")
+    wp_a = torch.randn(H, dtype=torch.bfloat16, device="cuda")
+    wp_b = torch.randn(H, dtype=torch.bfloat16, device="cuda")
+
+    serial_single, pdl_single = _scratch(T), _scratch(T)
+    attnres_partial(blocks, wp_a, 1e-5, serial_single)
+    attnres_partial(blocks, wp_a, 1e-5, pdl_single, enable_pdl=True)
+    for got, ref in zip(pdl_single, serial_single):
+        assert torch.equal(got, ref)
+
+    serial_a, serial_b = _scratch(T), _scratch(T)
+    pdl_a, pdl_b = _scratch(T), _scratch(T)
+    attnres_partial_dual(blocks, wp_a, wp_b, 1e-5, serial_a, serial_b)
+    attnres_partial_dual(blocks, wp_a, wp_b, 1e-5, pdl_a, pdl_b, enable_pdl=True)
+    for got, ref in ((pdl_a, serial_a), (pdl_b, serial_b)):
+        for x, y in zip(got, ref):
+            assert torch.equal(x, y)
