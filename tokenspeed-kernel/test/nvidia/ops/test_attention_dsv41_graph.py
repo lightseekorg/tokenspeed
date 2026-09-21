@@ -90,21 +90,19 @@ def test_index_topk_graph_full_candidates_and_reindex():
             torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
-# 255 pages make an int32 table row 1020 bytes, so every chunk after the first
-# lands on an offset that is not 16-byte aligned.
-@pytest.mark.parametrize("pages", [256, 255])
-@pytest.mark.parametrize("blocks", [16, 64, 2048])
-def test_sparse_reindex_selects_what_the_dense_score_selects(blocks, pages):
-    device = torch.device("cuda:0")
-    # The Hopper Reindex pass scores only its candidate pool. Existing reindex
-    # cases use pools narrower than one gather tile, so they never reach that
-    # kernel; these widths do, and 2048 blocks give a CTA several tiles so the
-    # gather pipeline rotates stages and flips parity.
-    from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm
+def _hopper_index_case(device, tokens, blocks, pages, table_width, seed):
+    """An FP8 index cache, quantized queries and a candidate pool for the Hopper scorers.
 
-    if not deep_gemm.is_hopper_indexer_available():
-        pytest.skip("requires the Hopper FP8 indexer")
-    torch.manual_seed(52)
+    The page table is a permutation with a null and an out-of-range page, so a
+    scorer that addressed pages by block id instead of through the table, or
+    scored an unmapped page, would not match. Candidates cover the whole cache,
+    so a pool wider than the table has blocks past it, and every fifth
+    candidate of the second row is null. Visibility ends inside a block for
+    the first row and at zero for the last.
+    """
+    from tokenspeed_kernel.ops.attention.dsv41.triton import quantize_index_queries
+
+    torch.manual_seed(seed)
     rows = pages * 64
     # 132-byte rows: 128 E4M3 values then the FP32 scale, the format the
     # Hopper scorers read. The shared helper only knows the shorter layouts.
@@ -115,18 +113,120 @@ def test_sparse_reindex_selects_what_the_dense_score_selects(blocks, pages):
         torch.arange(rows, device=device),
         "index_v4",
     )
-    tokens = 4
-    q = torch.randn((tokens, 32, 128), dtype=torch.bfloat16, device=device)
-    weights = torch.randn((tokens, 32), dtype=torch.float32, device=device)
-    table = torch.arange(pages, dtype=torch.int32, device=device).repeat(tokens, 1)
-    visible = torch.full((tokens,), rows, dtype=torch.int32, device=device)
-    # A partial trailing block, and a query that can see nothing at all.
-    visible[0] = rows - 11
+    q = torch.randn((tokens, 64, 128), dtype=torch.bfloat16, device=device)
+    weights = torch.rand((tokens, 64), dtype=torch.float32, device=device)
+    table = torch.stack(
+        [torch.randperm(pages, device=device)[:table_width] for _ in range(tokens)]
+    ).to(torch.int32)
+    table[:, 1] = -1
+    table[:, 2] = pages
+    capacity = table_width * 64
+    visible = torch.randint(0, capacity + 1, (tokens,), device=device).to(torch.int32)
+    visible[0] = capacity - 11
     visible[tokens - 1] = 0
     candidates = torch.randint(
         0, rows // 8, (tokens, blocks), dtype=torch.int32, device=device
     )
-    candidates[1, ::5] = -1
+    candidates[1 % tokens, ::5] = -1
+    queries, folded = quantize_index_queries(q, weights)
+    return cache, q, weights, queries, folded, table, visible, candidates, capacity
+
+
+@pytest.mark.parametrize(
+    "blocks,pages,table_width", [(16, 64, 64), (48, 64, 32), (2048, 300, 256)]
+)
+def test_sparse_index_scores_match_the_dense_scorer(blocks, pages, table_width):
+    """The pool scorer reproduces the dense score's masks exactly and its values closely.
+
+    Masks (null candidates, blocks past the table, unmapped pages, rows past
+    the visibility bound) must agree bit for bit; values follow the same FP8
+    tensor-core arithmetic in a different reduction order, which lands well
+    inside 1e-3 of the scores' RMS. 48 blocks give a CTA three tiles.
+    """
+    from tokenspeed_kernel.ops.attention.dsv41 import cute_dsl, deep_gemm
+    from tokenspeed_kernel.ops.attention.dsv41.triton import candidate_scores
+    from tokenspeed_kernel.platform import pdl_enabled
+
+    if not deep_gemm.is_hopper_indexer_available():
+        pytest.skip("requires the Hopper FP8 indexer")
+    device = torch.device("cuda:0")
+    tokens = 5
+    cache, _, _, queries, folded, table, visible, candidates, capacity = (
+        _hopper_index_case(device, tokens, blocks, pages, table_width, 53)
+    )
+    assert cute_dsl.sparse_index_scores_supported(queries, candidates)
+
+    def dense():
+        logits = deep_gemm._hopper_paged_scores(
+            (queries,), cache, folded, table, visible, capacity
+        )
+        return candidate_scores(logits, candidates)
+
+    def sparse(field):
+        values, scales = deep_gemm._index_planes(field)
+        return cute_dsl.sparse_index_scores(
+            queries,
+            folded,
+            values.view(torch.float8_e4m3fn),
+            scales,
+            table,
+            visible,
+            candidates,
+            pdl_enabled(),
+        )
+
+    expected = dense()
+    actual = sparse(cache)
+    assert actual.shape == (tokens, blocks * 8)
+    torch.testing.assert_close(
+        torch.isinf(actual), torch.isinf(expected), rtol=0, atol=0
+    )
+    assert torch.isinf(expected[tokens - 1]).all()
+    finite = ~torch.isinf(expected)
+    assert finite.any()
+    assert (actual[finite] - expected[finite]).norm() <= 1e-3 * expected[finite].norm()
+    # The same launch is deterministic, as graph replay parity relies on.
+    torch.testing.assert_close(sparse(cache), actual, rtol=0, atol=0)
+    # A field with the same page count but another page stride is a different
+    # kernel: strides are compiled in, so the cache must not hand out the first.
+    padded = torch.zeros((pages, 2, 64, 132), dtype=torch.uint8, device=device)[:, 0]
+    padded.copy_(cache)
+    torch.testing.assert_close(sparse(padded), actual, rtol=0, atol=0)
+    # A ragged pool would read past the candidate buffer; it is refused.
+    values, scales = deep_gemm._index_planes(cache)
+    with pytest.raises(ValueError, match="16-block tiles"):
+        cute_dsl.sparse_index_scores(
+            queries,
+            folded,
+            values.view(torch.float8_e4m3fn),
+            scales,
+            table,
+            visible,
+            candidates[:, :8],
+            pdl_enabled(),
+        )
+
+
+# 255 pages make an int32 table row 1020 bytes, so every chunk after the first
+# lands on an offset that is not 16-byte aligned.
+@pytest.mark.parametrize("pages", [256, 255])
+@pytest.mark.parametrize("blocks", [16, 64, 2048])
+def test_sparse_reindex_selects_what_the_dense_score_selects(blocks, pages):
+    """index_topk picks the same rows with the pool scorer on and off.
+
+    Existing reindex cases use pools narrower than one gather tile, so they
+    never reach the sparse kernel; these widths do, and 2048 blocks give a CTA
+    several tiles so the gather pipeline rotates stages and flips parity.
+    """
+    from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm
+
+    if not deep_gemm.is_hopper_indexer_available():
+        pytest.skip("requires the Hopper FP8 indexer")
+    device = torch.device("cuda:0")
+    tokens = 4
+    cache, q, weights, _, _, table, visible, candidates, _ = _hopper_index_case(
+        device, tokens, blocks, pages, pages, 52
+    )
 
     def select():
         return dsv41.index_topk(
