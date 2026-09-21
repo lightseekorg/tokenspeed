@@ -81,7 +81,6 @@ class MoELayer(torch.nn.Module):
         routing_mode: str | None = None,
         internal_activation_dtype_override: str | None = None,
         persistent_max_num_tokens_per_gpu: int | None = None,
-        process_group: object | None = None,
     ):
         super().__init__()
         self.layer_index = layer_index
@@ -286,13 +285,10 @@ class MoELayer(torch.nn.Module):
                 "low_latency_max_num_tokens_per_gpu"
             ]
         elif moe_backend == "mega_moe":
-            if process_group is not None:
-                plan_process_group = process_group
-            else:
-                mapping = global_server_args_dict["mapping"]
-                plan_process_group = pg_manager.get_device_process_group(
-                    mapping.moe.ep_group
-                )
+            mapping = global_server_args_dict["mapping"]
+            plan_process_group = pg_manager.get_device_process_group(
+                mapping.moe.ep_group
+            )
         self.plan = tokenspeed_kernel.moe_plan(
             self._quant_kind,
             input_dtype=input_dtype,

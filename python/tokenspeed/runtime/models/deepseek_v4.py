@@ -1720,11 +1720,6 @@ class DeepseekV4MoE(nn.Module):
         routed_quant_config, _ = _deepseek_v4_routed_expert_quant_config(
             config, quant_config
         )
-        expert_process_group = (
-            pg_manager.get_device_process_group(mapping.moe.tp_ep_group)
-            if self.use_mega_moe
-            else None
-        )
         self.experts = MoELayer(
             top_k=config.num_experts_per_tok,
             num_experts=config.n_routed_experts
@@ -1757,7 +1752,6 @@ class DeepseekV4MoE(nn.Module):
                 if self.use_mega_moe
                 else None
             ),
-            process_group=expert_process_group,
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
