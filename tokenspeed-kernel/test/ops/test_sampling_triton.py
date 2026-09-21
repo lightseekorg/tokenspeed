@@ -980,3 +980,12 @@ def test_dspark_block_greedy_rejects_mismatched_workspaces(device: str) -> None:
         )
     with pytest.raises(ValueError, match="output must be int32"):
         dspark_block_greedy_resolve(candidates, out.long(), 0)
+    # A step that resolves candidates may not write its tiles over them.
+    single = torch.empty(1, rows, tiles, dtype=torch.int64, device=device)
+    dspark_block_greedy_step(
+        base, 0, anchors, single, embedding, projection, 0, vocab, single[0], out
+    )
+    with pytest.raises(ValueError, match="must not overlap"):
+        dspark_block_greedy_step(
+            base, 1, anchors, single, embedding, projection, 0, vocab, single[0], out
+        )

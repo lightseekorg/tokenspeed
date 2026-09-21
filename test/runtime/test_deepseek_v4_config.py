@@ -2152,6 +2152,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
 
         gather.assert_not_called()
+        self.assertIsNone(partials)
+        self.assertEqual(candidates.shape[:2], (2, 1))
         self.assertTrue(torch.equal(output.long(), expected))
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
@@ -2186,7 +2188,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 markov,
                 lm_head,
                 object(),
-                candidates[:, :2],
+                candidates[:, :, :2].contiguous(),
                 partials[:2],
                 output,
             )

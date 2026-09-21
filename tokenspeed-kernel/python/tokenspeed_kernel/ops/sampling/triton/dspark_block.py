@@ -244,7 +244,8 @@ def dspark_block_greedy_step(
         anchor_ids: ``[rows]`` int32/int64 tokens preceding step 0; read only
             when ``step == 0``.
         candidates: ``[tp, rows, n_tiles]`` int64 candidates gathered after
-            the previous step; read only when ``step > 0``.
+            the previous step; read only when ``step > 0``, and then disjoint
+            from ``partials``.
         embedding: ``[vocab, rank]`` BF16 replicated bigram table.
         projection: ``[padded_local_vocab, rank]`` BF16 projection shard whose
             row ``v`` belongs to token ``vocab_start + v``.
@@ -299,6 +300,13 @@ def dspark_block_greedy_step(
         raise ValueError(f"partials must be [{rows}, {n_tiles}] int64")
     if not partials.is_contiguous():
         raise ValueError("partials must be contiguous")
+    # Programs read every previous candidate while others already write their
+    # tile; the two buffers must not share memory.
+    if step > 0 and (
+        candidates.data_ptr() < partials.data_ptr() + partials.numel() * 8
+        and partials.data_ptr() < candidates.data_ptr() + candidates.numel() * 8
+    ):
+        raise ValueError("candidates and partials must not overlap")
     _check_output_column(output, rows, block)
     if rows == 0:
         return
