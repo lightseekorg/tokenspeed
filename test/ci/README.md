@@ -55,6 +55,12 @@ tensor parallelism 2 and three-step MTP. It keeps KVStore enabled and uses the
 bounded non-thinking chat template for CI stability. The task requires a score
 of at least 0.96.
 
+The long-context performance report accepts both current EvalScope metrics
+(`Avg TPOT (ms)`, `Avg Decoded Tok/Iter`) and their older names. Missing or
+invalid TPOT fails collection instead of producing a zero-throughput report.
+Unavailable acceptance metrics appear as `N/A` (empty CSV cells); an aggregate
+is unavailable if any run for that prompt length lacks the metric.
+
 Each task expands into one matrix entry per runner label. Add a top-level
 `priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix
 jobs in include-list order, so `high` entries reach a contended runner pool
