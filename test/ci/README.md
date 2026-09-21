@@ -62,6 +62,11 @@ It also sets `MC_FORCE_TCP=1` because runners without RDMA fall back to fabric
 NVLink, which cannot export this Torch-allocated KV arena. This task validates
 PD correctness over TCP; it does not validate the NVLink fallback. The GB300
 Slurm task retains its own memory and RDMA configuration.
+The manual B200 task allows 3600 seconds for worker startup because cold weight
+loading can take 38 minutes before kernel tuning begins. Its outer pytest
+startup budget is 4500 seconds, including the gateway's 600-second readiness
+wait and setup overhead. The four quality requests and DSpark acceptance
+checks still have to pass after startup.
 
 Each task expands into one matrix entry per runner label. Add a top-level
 `priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix

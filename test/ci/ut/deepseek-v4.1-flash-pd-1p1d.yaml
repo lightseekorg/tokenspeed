@@ -18,6 +18,10 @@ env:
   GPU_MEMORY_UTILIZATION: "0.95"
   # Without RDMA, fabric NVLink cannot export the Torch-allocated KV arena.
   MC_FORCE_TCP: "1"
+  # Cold weight loading can consume 38 minutes before kernel tuning starts.
+  STARTUP_TIMEOUT: "3600"
+  # Include the gateway's 600-second wait plus setup and polling headroom.
+  PD_STARTUP_TIMEOUT: "4500"
 install:
   - bash test/ci_system/install_deps.sh
 ut:
