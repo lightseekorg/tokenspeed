@@ -303,8 +303,8 @@ class TopKConfig:
     # Shared-expert sink (Inkling)
     num_sink_experts: int = 0
     sink_global_scale: torch.Tensor | None = None
-    score_function: str | None = None
-    selection_method: str = "topk"
+    score_function: Literal["softmax", "sigmoid", "sqrt_softplus"] | None = None
+    selection_method: Literal["topk", "hash"] = "topk"
 
 
 class StandardTopKOutput(NamedTuple):
@@ -364,8 +364,8 @@ class TopK(torch.nn.Module):
         topk_weights_dtype: torch.dtype = torch.float32,
         num_sink_experts: int = 0,
         sink_global_scale: torch.Tensor | None = None,
-        score_function: str | None = None,
-        selection_method: str = "topk",
+        score_function: Literal["softmax", "sigmoid", "sqrt_softplus"] | None = None,
+        selection_method: Literal["topk", "hash"] = "topk",
     ):
         super().__init__()
 

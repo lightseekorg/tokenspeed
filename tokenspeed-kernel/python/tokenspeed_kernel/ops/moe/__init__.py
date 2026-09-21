@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.moe.cuda  # noqa: F401
@@ -90,8 +90,8 @@ def _routing_kind(
 def moe_topk(
     router_logits: torch.Tensor,
     top_k: int,
-    score_function: str,
-    selection_method: str = "topk",
+    score_function: Literal["softmax", "sigmoid", "sqrt_softplus"],
+    selection_method: Literal["topk", "hash"] = "topk",
     renormalize: bool = True,
     routed_scaling_factor: float | None = 1.0,
     correction_bias: torch.Tensor | None = None,
