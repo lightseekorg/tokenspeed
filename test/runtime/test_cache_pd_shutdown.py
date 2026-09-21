@@ -257,6 +257,7 @@ def test_run_event_loop_reports_exit_and_finally_closes(
     )
     server_args = SimpleNamespace(
         mapping=mapping,
+        device="cpu",
         base_gpu_id=0,
         disaggregation_mode="decode",
         max_num_seqs=8,
@@ -264,6 +265,7 @@ def test_run_event_loop_reports_exit_and_finally_closes(
     )
     pipe_writer = _PipeWriter()
 
+    monkeypatch.setenv("TOKENSPEED_DATA_PLANE_SYNC_DEBUG", "default")
     monkeypatch.setattr(event_loop_module, "EventLoop", _FakeEventLoop)
     monkeypatch.setattr(event_loop_module.psutil, "Process", _Process)
     monkeypatch.setattr(
