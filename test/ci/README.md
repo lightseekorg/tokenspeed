@@ -85,10 +85,11 @@ score miss. Use it for infrastructure flakes (CUDA launch failure, NVLink
 barrier timeout, GPU memory-access fault) where a clean second attempt is
 cheap relative to a red PR.
 
-The AMD Kimi-K2.5 AIME25 and B200 GLM-5.2 AIME26 gates write EvalScope results
-under `.ci-artifacts/published/evalscope-results`. Their CI artifact upload runs on both
-success and failure, including timestamped per-question predictions and scoring
-records. Compare the
+The AMD Kimi-K2.5 AIME25, NVIDIA Kimi-K2.5 EAGLE3 AIME25, and B200 GLM-5.2
+AIME26 gates write EvalScope results under
+`.ci-artifacts/published/evalscope-results`. Their CI artifact upload runs on
+both success and failure, including timestamped per-question predictions and
+scoring records. Compare the
 responses, stop reasons, and extracted answers when investigating an accuracy
 miss before changing the token limit or sampling configuration.
 
