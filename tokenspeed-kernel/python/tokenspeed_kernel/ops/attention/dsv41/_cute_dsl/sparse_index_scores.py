@@ -206,6 +206,11 @@ class SparseIndexScoreKernel:
             byte_alignment=128,
             swizzle=Q_tma.smem_layout.inner,
         )
+        # Per-row key scales and the resolved block id of each candidate, staged
+        # alongside K. The gather warp has already read the page table, so
+        # publishing them here keeps the epilogue off global memory entirely.
+        sScales = smem.allocate_array(Float32, self.TILE_ROWS * num_stages)
+        sBlocks = smem.allocate_array(Int32, self.BLOCKS_PER_TILE * num_stages)
         tma_full_mbar = smem.allocate_array(Int64, num_stages)
         tma_empty_mbar = smem.allocate_array(Int64, num_stages)
         q_full_mbar = smem.allocate_array(Int64, 1)
@@ -213,7 +218,10 @@ class SparseIndexScoreKernel:
         if warp_id == 0:
             with cute.arch.elect_one():
                 for i in cutlass.range_constexpr(num_stages):
-                    cute.arch.mbarrier_init(tma_full_mbar + i, 1)
+                    # Two arrivals: the bulk copies' transaction count, and the
+                    # gather warp once its plain stores to sScales/sBlocks are
+                    # published. The MMA side must not see either half early.
+                    cute.arch.mbarrier_init(tma_full_mbar + i, 2)
                     cute.arch.mbarrier_init(tma_empty_mbar + i, 32 * self.NUM_MMA_WARPS)
                 cute.arch.mbarrier_init(q_full_mbar, 1)
                 cute.arch.mbarrier_init_fence()
@@ -225,6 +233,7 @@ class SparseIndexScoreKernel:
         # Every global read of another kernel's output sits behind this wait,
         # including the visibility bound the epilogue masks with.
         cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_launch_dependents()
         visible = gVisible[token]
 
         if warp_id == self.NUM_MMA_WARPS:
@@ -251,6 +260,7 @@ class SparseIndexScoreKernel:
                 # cache -- and the epilogue masks the result.
                 lane_page = Int32(0)
                 lane_row0 = Int32(0)
+                lane_block = Int32(-1)
                 if lane_id < self.BLOCKS_PER_TILE:
                     block = gCandidates[token, tile * self.BLOCKS_PER_TILE + lane_id]
                     if block >= 0 and block // BLOCKS_PER_PAGE < table_width:
@@ -261,6 +271,13 @@ class SparseIndexScoreKernel:
                             # change these variables' type.
                             lane_page = Int32(entry)
                             lane_row0 = Int32((block % BLOCKS_PER_PAGE) * BLOCK_ROWS)
+                            lane_block = Int32(block)
+                # Issued before the bulk copies so the eight scale loads sit
+                # under their latency rather than after it.
+                lane_scales = cute.make_rmem_tensor(BLOCK_ROWS, Float32)
+                for r in cutlass.range_constexpr(BLOCK_ROWS):
+                    lane_scales[r] = gK_scales[lane_page, lane_row0 + r]
+
                 mbar = tma_full_mbar + stage
                 cute.arch.mbarrier_wait(tma_empty_mbar + stage, parity)
                 with cute.arch.elect_one():
@@ -288,6 +305,19 @@ class SparseIndexScoreKernel:
                         mbar,
                         cache_policy=EVICT_FIRST,
                     )
+
+                if lane_id < self.BLOCKS_PER_TILE:
+                    sBlocks[stage * self.BLOCKS_PER_TILE + lane_id] = lane_block
+                    for r in cutlass.range_constexpr(BLOCK_ROWS):
+                        sScales[stage * self.TILE_ROWS + lane_id * BLOCK_ROWS + r] = (
+                            lane_scales[r]
+                        )
+                # Publishes the stores above; the copies publish their own
+                # bytes through the barrier's transaction count. One arrival,
+                # matching the init count of two.
+                cute.arch.sync_warp()
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive(mbar)
 
                 stage = (stage + 1) % num_stages
                 if stage == 0:
@@ -352,6 +382,19 @@ class SparseIndexScoreKernel:
                                 rQ[(None, k % 2), k // 2, n],
                                 rC[None, m, n],
                             )
+                # The staged scales and block ids live in the stage's buffers,
+                # so take them into registers before releasing it.
+                rScale = cute.make_rmem_tensor((2, 2), Float32)
+                rBlock = cute.make_rmem_tensor((2, 2), Int32)
+                for m in cutlass.range_constexpr(2):
+                    for half in cutlass.range_constexpr(2):
+                        local = (
+                            warp_id * self.ROWS_PER_WARP + m * 16 + row_lo + half * 8
+                        )
+                        rScale[m, half] = sScales[stage * self.TILE_ROWS + local]
+                        rBlock[m, half] = sBlocks[
+                            stage * self.BLOCKS_PER_TILE + local // BLOCK_ROWS
+                        ]
                 cute.arch.mbarrier_arrive(tma_empty_mbar + stage)
 
                 for m in cutlass.range_constexpr(2):
@@ -374,79 +417,40 @@ class SparseIndexScoreKernel:
                         base = warp_id * self.ROWS_PER_WARP + m * 16
                         self._store(
                             gOut,
-                            gTable,
-                            gCandidates,
-                            gK_scales,
                             token,
                             tile,
                             base + row_lo,
                             acc_lo,
+                            rScale[m, 0],
+                            rBlock[m, 0],
                             visible,
-                            pages,
-                            table_width,
                         )
                         self._store(
                             gOut,
-                            gTable,
-                            gCandidates,
-                            gK_scales,
                             token,
                             tile,
                             base + row_lo + 8,
                             acc_hi,
+                            rScale[m, 1],
+                            rBlock[m, 1],
                             visible,
-                            pages,
-                            table_width,
                         )
 
                 stage = (stage + 1) % num_stages
                 if stage == 0:
                     parity ^= 1
 
-        # Dependents may start once this kernel's scores are in memory.
-        cute.arch.sync_threads()
-        cute.arch.griddepcontrol_launch_dependents()
-
     @cute.jit
-    def _store(
-        self,
-        gOut,
-        gTable,
-        gCandidates,
-        gK_scales,
-        token,
-        tile,
-        local_row,
-        acc,
-        visible,
-        pages,
-        table_width,
-    ):
+    def _store(self, gOut, token, tile, local_row, acc, scale, block, visible):
         """Scale and write one score, masking rows the pool cannot reach.
 
-        The candidate id, its page and the row's scale are read here rather
-        than staged in shared memory by the gather warp: those are plain shared
-        stores, which the copies' transaction barrier does not publish, and the
-        dense scorer reads them from global memory too.
+        ``block`` is the gather warp's resolved candidate id: negative when the
+        candidate was null or its page unmapped, so the page-table check is
+        already folded in and only the visibility bound remains.
         """
         column = tile * self.TILE_ROWS + local_row
-        block = gCandidates[
-            token, tile * self.BLOCKS_PER_TILE + local_row // BLOCK_ROWS
-        ]
         value = Float32(float("-inf"))
-        if (
-            block >= 0
-            and block * BLOCK_ROWS + local_row % BLOCK_ROWS < visible
-            and block // BLOCKS_PER_PAGE < table_width
-        ):
-            page = gTable[token, block // BLOCKS_PER_PAGE]
-            if page >= 0 and page < pages:
-                value = (
-                    acc
-                    * gK_scales[
-                        page,
-                        (block % BLOCKS_PER_PAGE) * BLOCK_ROWS + local_row % BLOCK_ROWS,
-                    ]
-                )
+        if block >= 0 and block * BLOCK_ROWS + local_row % BLOCK_ROWS < visible:
+            value = acc * scale
         if column < gOut.shape[1]:
             gOut[token, column] = value
