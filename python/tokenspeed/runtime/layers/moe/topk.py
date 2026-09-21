@@ -286,6 +286,8 @@ def grouped_topk_gpu(
 @dataclass
 class TopKConfig:
     top_k: int
+    score_function: Literal["runtime", "softmax", "sigmoid", "sqrt_softplus"]
+    selection_method: Literal["runtime", "topk", "hash"]
     use_grouped_topk: bool = False
     topk_group: int | None = None
     num_expert_group: int | None = None
@@ -303,8 +305,6 @@ class TopKConfig:
     # Shared-expert sink (Inkling)
     num_sink_experts: int = 0
     sink_global_scale: torch.Tensor | None = None
-    score_function: Literal["softmax", "sigmoid", "sqrt_softplus"] | None = None
-    selection_method: Literal["topk", "hash"] = "topk"
 
 
 class StandardTopKOutput(NamedTuple):
@@ -350,6 +350,8 @@ class TopK(torch.nn.Module):
         self,
         top_k: int,
         *,
+        score_function: Literal["runtime", "softmax", "sigmoid", "sqrt_softplus"],
+        selection_method: Literal["runtime", "topk", "hash"],
         use_grouped_topk: bool = False,
         topk_group: int | None = None,
         num_expert_group: int | None = None,
@@ -364,11 +366,13 @@ class TopK(torch.nn.Module):
         topk_weights_dtype: torch.dtype = torch.float32,
         num_sink_experts: int = 0,
         sink_global_scale: torch.Tensor | None = None,
-        score_function: Literal["softmax", "sigmoid", "sqrt_softplus"] | None = None,
-        selection_method: Literal["topk", "hash"] = "topk",
     ):
         super().__init__()
 
+        if (score_function == "runtime") != (selection_method == "runtime"):
+            raise ValueError(
+                "score_function and selection_method must both select runtime routing"
+            )
         if use_grouped_topk:
             assert num_expert_group is not None and topk_group is not None
         if num_sink_experts > 0:
@@ -378,6 +382,8 @@ class TopK(torch.nn.Module):
 
         self.topk_config = TopKConfig(
             top_k=top_k,
+            score_function=score_function,
+            selection_method=selection_method,
             use_grouped_topk=use_grouped_topk,
             renormalize=renormalize,
             topk_group=topk_group,
@@ -392,8 +398,6 @@ class TopK(torch.nn.Module):
             topk_weights_dtype=topk_weights_dtype,
             num_sink_experts=num_sink_experts,
             sink_global_scale=sink_global_scale,
-            score_function=score_function,
-            selection_method=selection_method,
         )
 
     def forward(
@@ -412,7 +416,7 @@ class TopK(torch.nn.Module):
             output_format or self.topk_config.output_format or TopKOutputFormat.STANDARD
         )
 
-        if self.topk_config.score_function is not None:
+        if self.topk_config.score_function != "runtime":
             correction_bias = (
                 self.topk_config.correction_bias
                 if routing_correction_bias is None

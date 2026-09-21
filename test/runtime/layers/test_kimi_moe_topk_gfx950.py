@@ -22,6 +22,8 @@ from tokenspeed.runtime.layers.moe.topk import TopK  # noqa: E402
 def _make_topk(correction_bias: torch.Tensor):
     return TopK(
         top_k=16,
+        score_function="runtime",
+        selection_method="runtime",
         renormalize=True,
         use_grouped_topk=True,
         num_expert_group=1,

@@ -9,6 +9,7 @@ from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed_kernel.thirdparty.cuda.routing import (
     hash_softplus_sqrt_topk_flash,
+    routing_available,
     softplus_sqrt_topk_flash,
 )
 
@@ -18,25 +19,6 @@ except ImportError:
     moe_finalize_fuse_shared = error_fn
 
 
-@register_kernel(
-    "moe",
-    "topk",
-    name="cuda_sqrt_softplus_topk",
-    solution="cuda",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
-    signatures=frozenset(
-        format_signature(router_logits=dense_tensor_format(dtype))
-        for dtype in (torch.float16, torch.bfloat16, torch.float32)
-    ),
-    traits={
-        "experts": frozenset({256, 384}),
-        "top_k": frozenset({6}),
-        "renormalize": frozenset({True}),
-        "routing_kind": frozenset({"bias", "hash"}),
-        "score_function": frozenset({"sqrt_softplus"}),
-    },
-    priority=Priority.SPECIALIZED,
-)
 def cuda_sqrt_softplus_topk(
     router_logits: torch.Tensor,
     top_k: int,
@@ -93,6 +75,28 @@ def cuda_sqrt_softplus_topk(
         torch.sqrt(F.softplus(router_logits.float())) if need_scores else router_logits
     )
     return topk_weights, topk_ids, scores
+
+
+if routing_available():
+    cuda_sqrt_softplus_topk = register_kernel(
+        "moe",
+        "topk",
+        name="cuda_sqrt_softplus_topk",
+        solution="cuda",
+        capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+        signatures=frozenset(
+            format_signature(router_logits=dense_tensor_format(dtype))
+            for dtype in (torch.float16, torch.bfloat16, torch.float32)
+        ),
+        traits={
+            "experts": frozenset({256, 384}),
+            "top_k": frozenset({6}),
+            "renormalize": frozenset({True}),
+            "routing_kind": frozenset({"bias", "hash"}),
+            "score_function": frozenset({"sqrt_softplus"}),
+        },
+        priority=Priority.SPECIALIZED,
+    )(cuda_sqrt_softplus_topk)
 
 
 __all__ = ["cuda_sqrt_softplus_topk", "moe_finalize_fuse_shared"]

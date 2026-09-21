@@ -227,6 +227,8 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
+            score_function="runtime",
+            selection_method="runtime",
             renormalize=True,
             use_grouped_topk=True,
             num_expert_group=1,

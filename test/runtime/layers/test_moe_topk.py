@@ -13,7 +13,12 @@ from tokenspeed.runtime.layers.moe.topk import (
 
 
 def test_topk_call_can_override_configured_output_format() -> None:
-    topk = TopK(top_k=2, output_format=TopKOutputFormat.STANDARD)
+    topk = TopK(
+        top_k=2,
+        score_function="runtime",
+        selection_method="runtime",
+        output_format=TopKOutputFormat.STANDARD,
+    )
     hidden_states = torch.empty((3, 4))
     router_logits = torch.empty((3, 8))
 
@@ -60,6 +65,8 @@ def test_plain_route_uses_kernel_package_softmax_topk(
         router_logits=torch.empty((2, 8), dtype=torch.float32),
         topk_config=TopKConfig(
             top_k=2,
+            score_function="runtime",
+            selection_method="runtime",
             renormalize=True,
             routed_scaling_factor=2.5,
             topk_indices_dtype=torch.int32,
@@ -102,6 +109,8 @@ def test_correction_bias_route_forwards_renormalize(
         router_logits=torch.empty((1, 8), dtype=torch.float32),
         topk_config=TopKConfig(
             top_k=2,
+            score_function="runtime",
+            selection_method="runtime",
             renormalize=renormalize,
             correction_bias=torch.zeros((8,), dtype=torch.float32),
             routed_scaling_factor=1.0,

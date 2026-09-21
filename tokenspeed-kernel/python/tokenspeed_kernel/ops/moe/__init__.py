@@ -121,6 +121,13 @@ def moe_topk(
     Returns:
         FP32 weights and INT32 expert ids shaped [tokens, top_k].
     """
+    if selection_method not in {"topk", "hash"}:
+        raise ValueError(f"unsupported MoE selection method: {selection_method!r}")
+    if selection_method == "hash":
+        if hash_indices_table is None or input_ids is None:
+            raise ValueError("hash selection requires hash_indices_table and input_ids")
+    elif hash_indices_table is not None or input_ids is not None:
+        raise ValueError("hash routing inputs require hash selection")
     if score_function in {"softmax", "sigmoid"} and override is not None:
         raise ValueError("override is only supported for sqrt_softplus routing")
     if score_function == "softmax":
@@ -157,12 +164,6 @@ def moe_topk(
         )
     if score_function != "sqrt_softplus":
         raise ValueError(f"unsupported MoE score function: {score_function!r}")
-    if selection_method not in {"topk", "hash"}:
-        raise ValueError(f"unsupported MoE selection method: {selection_method!r}")
-    if selection_method == "hash" and hash_indices_table is None:
-        raise ValueError("hash selection requires hash_indices_table")
-    if selection_method != "hash" and hash_indices_table is not None:
-        raise ValueError("hash_indices_table requires hash selection")
     if router_logits.ndim != 2:
         raise ValueError("router_logits must have shape [tokens, experts]")
     if not router_logits.is_floating_point():
@@ -490,6 +491,8 @@ def moe_plan(
         persistent_max_num_tokens_per_gpu: Optional fixed per-GPU capacity for
             implementations that own persistent communication buffers.
         fast_math: Whether the selected implementation may use fast math.
+            Implementations without a fast-math path always compute precisely.
+            Required keyword.
         solution: Optional kernel solution to force through normal selection.
             None leaves the concrete kernel choice to the registry.
 

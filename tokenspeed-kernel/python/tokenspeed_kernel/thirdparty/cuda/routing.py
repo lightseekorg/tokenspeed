@@ -41,6 +41,14 @@ def _load_routing_module():
     return tvm_ffi.load_module(str(so_path))
 
 
+def routing_available() -> bool:
+    try:
+        _load_routing_module()
+    except (ImportError, OSError, RuntimeError):
+        return False
+    return True
+
+
 def routing_flash(
     input: torch.Tensor,
     correction_bias: torch.Tensor,
