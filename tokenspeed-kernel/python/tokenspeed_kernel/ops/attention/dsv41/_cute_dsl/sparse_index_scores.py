@@ -101,7 +101,7 @@ class SparseIndexScoreKernel:
         tokens = gQ.shape[0]
         num_heads = self.num_heads
 
-        # 16B TMA inner mode.
+        # Elements per 128B TMA inner mode; one E4M3 head row is exactly one.
         elems = 128 * 8 // Float8E4M3FN.width
         swizzle_128B = cute.make_swizzle(3, 4, 3)
 

@@ -595,7 +595,7 @@ def hopper_index_topk(
         candidate_blocks is not None
         and not candidate_topk
         and not dense
-        and sparse_index_scores_supported(queries, candidate_blocks)
+        and sparse_index_scores_supported(queries, folded, page_table, candidate_blocks)
     )
     planes = None
     if sparse:

@@ -154,7 +154,7 @@ def test_sparse_index_scores_match_the_dense_scorer(blocks, pages, table_width):
     cache, _, _, queries, folded, table, visible, candidates, capacity = (
         _hopper_index_case(device, tokens, blocks, pages, table_width, 53)
     )
-    assert cute_dsl.sparse_index_scores_supported(queries, candidates)
+    assert cute_dsl.sparse_index_scores_supported(queries, folded, table, candidates)
 
     def dense():
         logits = deep_gemm._hopper_paged_scores(

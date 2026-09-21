@@ -77,15 +77,21 @@ def _kernel():
     return SparseIndexScoreKernel
 
 
-def sparse_index_scores_supported(queries, candidates) -> bool:
+def sparse_index_scores_supported(queries, weights, table, candidates) -> bool:
     """Whether the CuTe DSL sparse scorer can serve this call.
 
     Args:
         queries: ``[tokens, heads, 128]`` FP8-E4M3 index queries.
+        weights: ``[tokens, heads]`` FP32 per-head weights.
+        table: ``[tokens, table_width]`` page ids.
         candidates: ``[tokens, blocks]`` int32 candidate block ids.
 
     Returns:
-        True when the platform is Hopper and the shapes tile evenly.
+        True when the platform is Hopper, the shapes tile evenly, and every
+        per-token tensor is compact. The indexer accepts strided page-table
+        views, which this path cannot express: it hands CuTe a compact
+        symbolic layout so the token count can stay dynamic. The dense scorer
+        honours any layout, so those calls fall back to it.
     """
     global _SUPPORTED
     if _SUPPORTED is None:
@@ -102,6 +108,10 @@ def sparse_index_scores_supported(queries, candidates) -> bool:
         and queries.shape[1] % 8 == 0
         and candidates is not None
         and candidates.shape[1] % _BLOCKS_PER_TILE == 0
+        and queries.is_contiguous()
+        and weights.is_contiguous()
+        and table.is_contiguous()
+        and candidates.is_contiguous()
     )
 
 
