@@ -249,6 +249,13 @@ def test_kimi_k3_amd_gates_use_eagle3():
     eval_tokens = shlex.split(tasks[0]["eval"]["command"])
     generation_config = json.loads(flag_value(eval_tokens, "--generation-config"))
     assert generation_config["seed"] == 42
+    assert generation_config["max_tokens"] == 32768
+    assert flag_value(eval_tokens, "--eval-batch-size") == "16"
+    assert "--limit" not in eval_tokens
+    assert (
+        flag_value(eval_tokens, "--work-dir")
+        == ".ci-artifacts/published/kimi-k3-eagle3-aime26"
+    )
     assert tasks[0]["score_threshold"] == 0.90
     assert tasks[1]["perf_reference"] == {1: [161, 18.8]}
     assert tasks[1]["perf_threshold"] == 0.9

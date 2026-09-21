@@ -151,6 +151,12 @@ acceptance differences to be investigated alongside timing changes. The task
 still measures one 4K-input/1K-output request with zero benchmark warmup requests
 and its original performance reference and threshold.
 
+The corresponding AMD Kimi-K3 EAGLE3 AIME26 gate publishes its per-question
+predictions and scoring records under
+`.ci-artifacts/published/kimi-k3-eagle3-aime26`. This retains evidence for accuracy
+misses without changing the full 30-question workload, generation settings, or
+score threshold.
+
 The AMD DeepSeek-V4.1-Flash GSM8K task downloads its weights into
 `.hf-model-cache` in the job's work directory. Its uncached checkpoint can exceed
 the remaining capacity of the shared model volume; the job filesystem provides
