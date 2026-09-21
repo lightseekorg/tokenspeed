@@ -187,6 +187,34 @@ def test_gfx950_suite_selects_exact_registrations():
         assert mxfp8_case.policy == _policy()
 
 
+def test_glm53_dsa_suite_exercises_dispatch_for_supported_modes():
+    suite_path = Path(__file__).parents[1] / "benchmarks" / "amd" / "gfx950.json"
+    suite = load_suite(suite_path)
+    dsa_modes = {
+        "kpool_prefill_write",
+        "kpool_prefill_topk",
+        "dsa_prefill",
+        "kpool_decode_append",
+        "kpool_decode_topk",
+        "dsa_decode",
+    }
+    cases = [
+        case
+        for case in suite.cases
+        if case.id.startswith("glm53_flash.attention.")
+        and case.request.mode in dsa_modes
+    ]
+
+    assert {case.request.mode for case in cases} == dsa_modes
+    assert all(case.request.family == "attention" for case in cases)
+    assert all(case.request.solution is None for case in cases)
+    assert all(case.request.registration is None for case in cases)
+    assert all(case.request.cold_cache for case in cases)
+    assert all(
+        case.request.parameters["model_profile"] == "glm53_flash_tp4" for case in cases
+    )
+
+
 def test_load_suite_includes_case_files(tmp_path):
     fragment_path = tmp_path / "operation.json"
     fragment_path.write_text(
