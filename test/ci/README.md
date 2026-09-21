@@ -55,6 +55,14 @@ tensor parallelism 2 and three-step MTP. It keeps KVStore enabled and uses the
 bounded non-thinking chat template for CI stability. The task requires a score
 of at least 0.96.
 
+The DeepSeek V4.1 Flash PD correctness task uses two B200 GPUs per role with
+DSpark enabled. Its YAML sets `GPU_MEMORY_UTILIZATION=0.95`: after loading TP2
+weights and DSpark, reserving 8% of device memory leaves no KV-cache budget.
+It also sets `MC_FORCE_TCP=1` because runners without RDMA fall back to fabric
+NVLink, which cannot export this Torch-allocated KV arena. This task validates
+PD correctness over TCP; it does not validate the NVLink fallback. The GB300
+Slurm task retains its own memory and RDMA configuration.
+
 Each task expands into one matrix entry per runner label. Add a top-level
 `priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix
 jobs in include-list order, so `high` entries reach a contended runner pool

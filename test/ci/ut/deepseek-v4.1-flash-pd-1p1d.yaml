@@ -14,6 +14,10 @@ env:
   PREFILL_GPUS: "0,1"
   DECODE_GPUS: "2,3"
   MOE_BACKEND: mega_moe
+  # TP2 weights plus DSpark leave no KV budget at 92% utilization on B200.
+  GPU_MEMORY_UTILIZATION: "0.95"
+  # Without RDMA, fabric NVLink cannot export the Torch-allocated KV arena.
+  MC_FORCE_TCP: "1"
 install:
   - bash test/ci_system/install_deps.sh
 ut:

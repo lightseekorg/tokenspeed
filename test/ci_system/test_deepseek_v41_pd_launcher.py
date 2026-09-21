@@ -33,6 +33,7 @@ CONFIG = (
     SCRIPT.parents[1]
     / "ci/eval/deepseek-v4.1-flash-pd-1p1d-dspark-evalscope-gsm8k-gb300-slurm.yaml"
 )
+B200_CONFIG = SCRIPT.parents[1] / "ci/ut/deepseek-v4.1-flash-pd-1p1d.yaml"
 
 
 @pytest.fixture
@@ -80,7 +81,11 @@ while True:
 
     def start(overrides):
         env = {
-            **os.environ,
+            **{
+                k: v
+                for k, v in os.environ.items()
+                if k not in {"MC_FORCE_TCP", "GPU_MEMORY_UTILIZATION"}
+            },
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
             "MODEL_PATH": str(tmp_path),
             "PD_CI_LOG_DIR": str(tmp_path / "logs"),
@@ -160,6 +165,11 @@ def test_two_node_roles_keep_engines_independent(launcher):
             value(args, "--world-size") == value(args, "--tensor-parallel-size") == "4"
         )
         assert value(args, "--speculative-algorithm") == "DSPARK"
+        assert (
+            value(args, "--gpu-memory-utilization")
+            == slurm_env(node=0)["GPU_MEMORY_UTILIZATION"]
+        )
+        assert "MC_FORCE_TCP" not in env
         assert value(args, "--max-cudagraph-capture-size") == "8"
         assert value(args, "--disaggregation-layerwise-interval") == "0"
         assert (
@@ -187,16 +197,27 @@ def test_two_node_roles_keep_engines_independent(launcher):
     assert "decode: health status" not in prefill_output
 
 
-def test_single_node_defaults_still_launch_both_roles(launcher):
+@pytest.mark.parametrize(
+    "overrides,expected_utilization,expected_tcp",
+    [({}, "0.92", None), (yaml.safe_load(B200_CONFIG.read_text())["env"], "0.95", "1")],
+)
+def test_single_node_configuration_reaches_both_roles(
+    launcher, overrides, expected_utilization, expected_tcp
+):
     start, calls, _ = launcher
-    start({"PD_SLURM": "0"})
+    start({"PD_SLURM": "0", **overrides})
     wait_for(lambda: any(c["kind"] == "router" for c in calls()))
     records = {c["kind"]: c for c in calls()}
     assert records.keys() == {"prefill", "decode", "router"}
     for role, gpus in (("prefill", "0,1"), ("decode", "2,3")):
         assert records[role]["env"]["CUDA_VISIBLE_DEVICES"] == gpus
+        assert records[role]["env"].get("MC_FORCE_TCP") == expected_tcp
         assert value(records[role]["args"], "--host") == "127.0.0.1"
         assert value(records[role]["args"], "--world-size") == "2"
+        assert (
+            value(records[role]["args"], "--gpu-memory-utilization")
+            == expected_utilization
+        )
         assert value(records[role]["args"], "--max-cudagraph-capture-size") == "16"
     assert value(records["router"]["args"], "--reasoning-parser") == "passthrough"
 
