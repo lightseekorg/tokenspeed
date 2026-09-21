@@ -35,7 +35,7 @@ regress perf even when the generated kernel remains correct.
 
 ## GEMM
 
-### gfx950 dense MXFP8 projection
+### gfx950 MXFP8 projection
 
 The gfx950 package provides a prefill-oriented MXFP8 GEMM for DeepSeek V4.1
 dense projections, with portable Triton fallback outside the tuned domain.
@@ -66,6 +66,36 @@ asynchronous copies. Each B-scale copy combines both N quadrants and two K
 steps in one LDS tile, then splits the four MFMA fragments in registers. Two
 waves per EU avoid spills from the longer-lived fragments. Strided scales fall
 back to direct fragment loads, and output uses vectorized buffer stores.
+
+### gfx1250 MXFP8 decode projection
+
+The gfx1250 package provides decode-oriented MXFP8 projections for DeepSeek V4
+and V4.1, with portable fallback outside the tuned domain.
+
+#### Contract
+
+- The operation computes `A @ B.T` from K-contiguous E4M3 matrices shaped
+  `[M, K]` and `[N, K]`, with `1 <= M <= 16` and `N` divisible by 16.
+- DeepSeek V4.1 uses row-major uint8 UE8M0 scales shaped `[M, K/32]` and
+  `[N, K/32]`, with `K >= 256` divisible by 32.
+- DeepSeek V4 uses row-major FP32 activation scales `[M, K/128]` and canonical
+  weight scales `[N/128, K/128]`, with `N` and `K` divisible by 128.
+- Output is BF16. A caller-owned output may have a padded row stride, but all
+  input, scale, and output inner strides must be one.
+
+#### Algorithm
+
+The direct path assigns one wave32 to an output tile of up to `16 x 16`.
+Native TDM stages values, and for V4.1 scales, into padded triple-buffered LDS.
+V4.1 uses scaled WMMA directly; V4 applies one FP32 scale pair to each
+128-wide raw-WMMA partial before accumulation.
+
+Measured long-K shapes use the same producers in split-K mode and a separate
+FP32-to-BF16 reduction. One V4 Pro route combines adjacent output tiles in a
+two-wave workgroup and uses fused A/B TDM loads. Other shapes remain on the
+one-wave direct path when extra partitions or fusion do not pay for their
+overhead. The kernel docstrings record the exact tiling, pipeline, and routing
+decisions.
 
 ## Attention
 
