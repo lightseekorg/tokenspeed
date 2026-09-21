@@ -23,7 +23,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.metadata import PrepTape, Reg
+from tokenspeed_kernel.ops.metadata import PrepTape, Reg, fill_ngram_history
 
 from tokenspeed.runtime.execution.cache_loc_kernel import fused_decode_input_prep
 from tokenspeed.runtime.execution.forward_batch_info import compute_position_triton
@@ -161,10 +161,6 @@ class InputBuffers:
         context_len = self.ngram_previous_tokens_buf.shape[1]
         if any(len(row) != context_len + 1 for row in snapshot.tokens):
             raise ValueError("Engram snapshot has the wrong history width")
-        self.ngram_previous_tokens_buf[total_tokens:].fill_(-1)
-        self.ngram_token_mask_buf[total_tokens:].zero_()
-        if bs == 0:
-            return
 
         num_extends = forward_op.num_extends()
         overrides = forward_op.decode_input_ids
@@ -176,55 +172,35 @@ class InputBuffers:
                 zip(forward_op.request_ids, forward_op.request_pool_indices)
             )
         ]
-        tokens_cpu, positions_cpu, reset_cpu = self._bulk_pinned(
-            (bs * (context_len + 1), torch.int64),
-            (bs, torch.int64),
-            (bs, torch.bool),
+        # One pinned upload carries the snapshot rows, their positions and
+        # the reset flags; the kernels read them as views.
+        rows = bs * (context_len + 1)
+        (staging_cpu,) = self._bulk_pinned((rows + 2 * bs, torch.int64))
+        staging_cpu[:rows].copy_(
+            torch.tensor(snapshot.tokens, dtype=torch.int64).view(-1)
         )
-        tokens_cpu.view(bs, -1).copy_(torch.tensor(snapshot.tokens, dtype=torch.int64))
-        positions_cpu.copy_(torch.tensor(snapshot.positions, dtype=torch.int64))
-        reset_cpu.copy_(torch.tensor(reset, dtype=torch.bool))
-        tokens = tokens_cpu.view(bs, -1).to(self.device, non_blocking=True)
-        positions = positions_cpu.to(self.device, non_blocking=True)
-        slots = self.req_pool_indices_buf[:bs]
-        seed = reset_cpu.to(self.device, non_blocking=True) | needs_seed[slots]
-        delta = runtime_states.valid_cache_lengths[slots] - positions
-        # Only lifecycle seeds need host coverage. In steady-state decode a
-        # delayed commit can leave delta much larger than the entire window.
-        torch._assert_async(
-            (~seed | ((delta >= 0) & (delta <= 1))).all(),
-            "Engram seed snapshot does not cover the accepted input frontier",
+        staging_cpu[rows : rows + bs].copy_(
+            torch.tensor(snapshot.positions, dtype=torch.int64)
         )
-        distances = torch.arange(1, context_len + 1, device=self.device)
-        columns = (distances - delta[:, None]).clamp(0, context_len)
-        prefix = torch.where(seed[:, None], tokens.gather(1, columns), tail[slots])
-        vocab_size = runtime_states.vocab_size
-        prefix.masked_fill_((prefix < 0) | (prefix >= vocab_size), -1)
-        tail[slots] = prefix
-        # index_fill_ takes the scalar natively; ``needs_seed[slots] = False``
-        # would stage it through a pageable host tensor, whose copy blocks the
-        # forward thread until the in-flight step drains.
-        needs_seed.index_fill_(0, slots, False)
+        staging_cpu[rows + bs :].copy_(torch.tensor(reset, dtype=torch.int64))
+        staging = staging_cpu.to(self.device, non_blocking=True)
+        fill_ngram_history(
+            staging[:rows].view(bs, context_len + 1),
+            staging[rows : rows + bs],
+            staging[rows + bs :],
+            self.req_pool_indices_buf[:bs],
+            self.input_lengths_buf[:bs],
+            self.input_ids_buf,
+            runtime_states.valid_cache_lengths,
+            tail,
+            needs_seed,
+            self.ngram_previous_tokens_buf,
+            self.ngram_token_mask_buf,
+            total_tokens,
+            runtime_states.vocab_size,
+        )
         for rid, slot in zip(forward_op.request_ids, forward_op.request_pool_indices):
             runtime_states.ngram_request_ids[slot] = rid
-        if total_tokens == 0:
-            return
-
-        lengths = self.input_lengths_buf[:bs]
-        ends = lengths.cumsum(0)
-        rows = torch.arange(total_tokens, device=self.device)
-        requests = torch.searchsorted(ends, rows, right=True)
-        local_rows = rows - (ends - lengths)[requests]
-        columns = (distances - local_rows[:, None] - 1).clamp(0, context_len - 1)
-        ids = self.input_ids_buf[:total_tokens]
-        previous = torch.where(
-            local_rows[:, None] >= distances,
-            ids[(rows[:, None] - distances).clamp_min(0)],
-            prefix[requests].gather(1, columns),
-        )
-        previous.masked_fill_((previous < 0) | (previous >= vocab_size), -1)
-        self.ngram_previous_tokens_buf[:total_tokens].copy_(previous)
-        self.ngram_token_mask_buf[:total_tokens].copy_((ids >= 0) & (ids < vocab_size))
 
     def _record_pad_tape(self) -> "PrepTape | None":
         """One launch for the whole padding-tail scrub.

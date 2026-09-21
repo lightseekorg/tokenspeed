@@ -290,6 +290,21 @@ class EngramHashState(nn.Module):
             or previous_token_ids.dtype not in (torch.int32, torch.int64)
         ):
             raise TypeError("Engram expects int32/int64 IDs and a bool token mask")
+        if input_ids.is_cuda:
+            from tokenspeed_kernel.ops.embedding import engram_hash
+
+            hashes = engram_hash(
+                input_ids.reshape(-1).contiguous(),
+                previous_token_ids.reshape(-1, 3).contiguous(),
+                token_mask.reshape(-1).contiguous(),
+                self.token_map,
+                self.multipliers,
+                self.primes,
+                self.offsets,
+                self.pad_id,
+                DEAD_TOKEN_ID,
+            )
+            return hashes.view(*input_ids.shape, *self.offsets.shape)
         raw = torch.cat((input_ids.unsqueeze(-1), previous_token_ids), dim=-1).long()
         dead = raw == DEAD_TOKEN_ID
         dead[..., 0] |= ~token_mask
