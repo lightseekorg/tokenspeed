@@ -147,6 +147,7 @@ Inside the root `tokenspeed-kernel/` directory:
 * Vendor-specific tests should be placed under `test/<vendor>/` subdirectory.
   Tests for common infra and covering multi-vendors reside under `test/`
   directly.
+* Use tight atol/rtol in correctness comparison tests.
 
 ## tokenspeed-kernel-amd
 
