@@ -21,7 +21,7 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.moe import _route_experts
+from tokenspeed_kernel.ops.moe import MoeTopKConfig, moe_topk
 from tokenspeed_kernel.ops.attention.dsv4 import dsv4_padded_heads
 from tokenspeed_kernel.ops.attention.dsv4.cuda import (
     has_indexer_topk_prefill,
@@ -745,14 +745,17 @@ class TestDeepseekV4Config(unittest.TestCase):
             self.assertIs(ids, input_ids)
             return torch.zeros(states.shape[0], 4), None, None, ids
 
+        def topk(states, router_logits, **kwargs):
+            calls.append("topk")
+            self.assertIs(states, hidden_states)
+            self.assertEqual(tuple(router_logits.shape), (states.shape[0], 4))
+            return SimpleNamespace(scale=2.0)
+
         def routed_experts(**kwargs):
             calls.append("routed")
             self.assertIs(kwargs["hidden_states"], hidden_states)
-            self.assertIsNone(kwargs["topk_output"])
-            self.assertEqual(kwargs["routing_score_function"], "sqrt_softplus")
-            self.assertEqual(kwargs["routing_renormalize"], norm_topk_prob)
-            scale = kwargs["routed_scaling_factor"]
-            return (hidden_states + 1) * scale
+            self.assertIsNotNone(kwargs["topk_output"])
+            return (hidden_states + 1) * kwargs["topk_output"].scale
 
         def shared_experts(states):
             calls.append("shared")
@@ -767,6 +770,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             routed_scaling_factor=2.0,
             config=SimpleNamespace(norm_topk_prob=norm_topk_prob),
             experts=routed_experts,
+            topk=topk,
             _routing_inputs=routing_inputs,
         )
         return self._bind_deepseek_v4_moe_methods(moe)
@@ -791,12 +795,12 @@ class TestDeepseekV4Config(unittest.TestCase):
             max_num_tokens_per_gpu=2,
         )
 
-        self.assertEqual(calls, ["routing_inputs", "routed", "shared"])
+        self.assertEqual(calls, ["routing_inputs", "topk", "routed", "shared"])
         self.assertTrue(
             torch.equal(actual, (hidden_states + 1) * 2 + hidden_states + 3)
         )
 
-    def test_deepseek_v4_moe_routes_inside_apply(self):
+    def test_deepseek_v4_moe_always_builds_topk_output(self):
         hidden_states = torch.ones(2, 3)
         input_ids = torch.arange(2)
 
@@ -820,16 +824,21 @@ class TestDeepseekV4Config(unittest.TestCase):
                 )
 
                 expected = (hidden_states + 1) * 2 + hidden_states + 3
-                self.assertEqual(calls, ["routing_inputs", "routed", "shared"])
+                self.assertEqual(calls, ["routing_inputs", "topk", "routed", "shared"])
                 self.assertTrue(torch.equal(actual, expected))
 
-    def test_deepseek_v4_moe_kernel_does_not_repeat_output_scaling(self):
+    def test_deepseek_v4_moe_topk_owns_routed_scaling(self):
         captured = {}
+        topk_config = {}
 
         class FakeExperts:
             def __init__(self, **kwargs):
                 captured.update(kwargs)
                 self.topk_output_format = object()
+
+        class FakeTopK:
+            def __init__(self, **kwargs):
+                topk_config.update(kwargs)
 
         backend = SimpleNamespace(
             is_mega_moe=lambda: False,
@@ -867,11 +876,13 @@ class TestDeepseekV4Config(unittest.TestCase):
                 return_value=(None, False),
             ),
             patch.object(deepseek_v4_model, "MoELayer", FakeExperts),
+            patch.object(deepseek_v4_model, "TopK", FakeTopK),
         ):
             moe = DeepseekV4MoE(config, mapping, None, 0, "model.layers.0.ffn")
 
         self.assertEqual(moe.routed_scaling_factor, 2.5)
         self.assertEqual(captured["routing_config"]["routed_scaling_factor"], 1.0)
+        self.assertEqual(topk_config["routed_scaling_factor"], 2.5)
 
     def test_deepseek_v4_shared_mlp_uses_dense_tp(self):
         mapping = Mapping(
@@ -909,10 +920,16 @@ class TestDeepseekV4Config(unittest.TestCase):
             self.assertIs(ids, input_ids)
             return torch.zeros(states.shape[0], 4), None, None, ids
 
+        def topk(states, router_logits, **kwargs):
+            calls.append("topk")
+            self.assertIs(states, hidden_states)
+            self.assertEqual(tuple(router_logits.shape), (states.shape[0], 4))
+            return object()
+
         def routed_experts(**kwargs):
             calls.append("routed")
             self.assertIs(kwargs["hidden_states"], hidden_states)
-            self.assertIsNone(kwargs["topk_output"])
+            self.assertIsNotNone(kwargs["topk_output"])
             return hidden_states + 1
 
         moe = SimpleNamespace(
@@ -923,6 +940,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             stream_fork=StreamFork(None),
             routed_scaling_factor=1.0,
             experts=routed_experts,
+            topk=topk,
             _routing_inputs=routing_inputs,
         )
         return self._bind_deepseek_v4_moe_methods(moe)
@@ -967,7 +985,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             comm_manager=FakeCommManager(),
         )
 
-        self.assertEqual(calls, ["routing_inputs", "routed", "shared"])
+        self.assertEqual(calls, ["routing_inputs", "topk", "routed", "shared"])
         self.assertTrue(torch.equal(actual, hidden_states + 1 + hidden_states + 3))
 
     def test_deepseek_v4_mega_moe_shared_uses_comm_manager(self):
@@ -1016,7 +1034,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             comm_manager=FakeCommManager(),
         )
 
-        self.assertEqual(calls, ["routing_inputs", "routed", "shared"])
+        self.assertEqual(calls, ["routing_inputs", "topk", "routed", "shared"])
         self.assertEqual(comm_calls, [("pre", ctx), ("post", ctx)])
         self.assertTrue(torch.equal(actual, hidden_states + 1 + hidden_states + 3))
 
@@ -1043,7 +1061,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         torch.cuda.synchronize()
 
-        self.assertEqual(calls, ["routing_inputs", "routed", "shared"])
+        self.assertEqual(calls, ["routing_inputs", "topk", "routed", "shared"])
         self.assertTrue(
             torch.equal(actual, (hidden_states + 1) * 2 + hidden_states + 3)
         )
@@ -6539,10 +6557,9 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         bias = torch.tensor([0.0, -0.4, 0.6, 0.0], dtype=torch.float32)
 
-        topk_weights, topk_ids, scores = _route_experts(
+        topk_weights, topk_ids = moe_topk(
             logits,
-            top_k=2,
-            renormalize=True,
+            MoeTopKConfig(top_k=2, score_function="sqrt_softplus"),
             correction_bias=bias,
             solution="torch",
         )
@@ -6552,7 +6569,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         expected_weights = expected_scores.gather(1, expected_ids)
         expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
 
-        self.assertTrue(torch.allclose(scores, expected_scores))
         self.assertTrue(torch.equal(topk_ids, expected_ids.to(torch.int32)))
         self.assertTrue(torch.allclose(topk_weights, expected_weights))
 
@@ -6575,10 +6591,13 @@ class TestDeepseekV4Config(unittest.TestCase):
             dtype=torch.int32,
         )
 
-        topk_weights, topk_ids, _ = _route_experts(
+        topk_weights, topk_ids = moe_topk(
             logits,
-            top_k=2,
-            renormalize=True,
+            MoeTopKConfig(
+                top_k=2,
+                score_function="sqrt_softplus",
+                selection_method="hash",
+            ),
             hash_indices_table=table,
             input_ids=input_ids,
             solution="torch",
@@ -6662,16 +6681,15 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(torch.allclose(topk_weights, expected_weights, atol=1e-6))
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_deepseek_v4_fused_route_experts_returns_scores(self):
+    def test_deepseek_v4_fused_moe_topk_matches_reference(self):
         logits = torch.linspace(
             -3.0, 3.0, 256, device="cuda", dtype=torch.float32
         ).repeat(2, 1)
         bias = torch.linspace(0.25, -0.25, 256, device="cuda", dtype=torch.float32)
 
-        topk_weights, topk_ids, scores = _route_experts(
+        topk_weights, topk_ids = moe_topk(
             logits,
-            top_k=6,
-            renormalize=True,
+            MoeTopKConfig(top_k=6, score_function="sqrt_softplus"),
             correction_bias=bias,
         )
 
@@ -6680,7 +6698,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         expected_weights = expected_scores.gather(1, expected_ids)
         expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
 
-        self.assertTrue(torch.allclose(scores, expected_scores))
         self.assertTrue(torch.equal(topk_ids, expected_ids.to(torch.int32)))
         self.assertTrue(torch.allclose(topk_weights, expected_weights, atol=1e-6))
 

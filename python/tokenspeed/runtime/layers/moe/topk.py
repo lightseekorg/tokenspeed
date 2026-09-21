@@ -25,7 +25,13 @@ from typing import Any, Literal, NamedTuple, Protocol, runtime_checkable
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk, moe_softmax_topk
+from tokenspeed_kernel.ops.moe import (
+    MoeTopKConfig,
+    moe_sigmoid_bias_topk,
+    moe_softmax_topk,
+    moe_topk,
+    pack_topk_router_logits,
+)
 from tokenspeed_kernel.ops.moe.sigmoid_topk import minimax_biased_grouped_topk
 from tokenspeed_kernel.ops.moe.triton.inkling_topk import inkling_topk
 from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flash
@@ -298,6 +304,7 @@ class TopKConfig:
     # Shared-expert sink (Inkling)
     num_sink_experts: int = 0
     sink_global_scale: torch.Tensor | None = None
+    kernel_config: MoeTopKConfig | None = None
 
 
 class StandardTopKOutput(NamedTuple):
@@ -320,6 +327,7 @@ class BypassedTopKOutput(NamedTuple):
     topk_config: TopKConfig
     num_token_non_padded: torch.Tensor | None = None
     expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None
+    output_scale: float | torch.Tensor = 1.0
 
     @property
     def format(self) -> TopKOutputFormat:
@@ -356,6 +364,8 @@ class TopK(torch.nn.Module):
         topk_weights_dtype: torch.dtype = torch.float32,
         num_sink_experts: int = 0,
         sink_global_scale: torch.Tensor | None = None,
+        score_function: str | None = None,
+        selection_method: str = "topk",
     ):
         super().__init__()
 
@@ -382,6 +392,21 @@ class TopK(torch.nn.Module):
             topk_weights_dtype=topk_weights_dtype,
             num_sink_experts=num_sink_experts,
             sink_global_scale=sink_global_scale,
+            kernel_config=(
+                None
+                if score_function is None
+                else MoeTopKConfig(
+                    top_k=top_k,
+                    score_function=score_function,
+                    selection_method=selection_method,
+                    renormalize=renormalize,
+                    routed_scaling_factor=(
+                        1.0
+                        if routed_scaling_factor is None
+                        else routed_scaling_factor
+                    ),
+                )
+            ),
         )
 
     def forward(
@@ -392,10 +417,43 @@ class TopK(torch.nn.Module):
         output_format: TopKOutputFormat | None = None,
         num_token_non_padded: torch.Tensor | None = None,
         expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None,
+        routing_correction_bias: torch.Tensor | None = None,
+        hash_indices_table: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
     ) -> TopKOutput:
         output_format = (
             output_format or self.topk_config.output_format or TopKOutputFormat.STANDARD
         )
+
+        if self.topk_config.kernel_config is not None:
+            correction_bias = (
+                self.topk_config.correction_bias
+                if routing_correction_bias is None
+                else routing_correction_bias
+            )
+            topk_weights, topk_ids = moe_topk(
+                router_logits,
+                self.topk_config.kernel_config,
+                correction_bias=correction_bias,
+                hash_indices_table=hash_indices_table,
+                input_ids=input_ids,
+            )
+            if output_format == TopKOutputFormat.BYPASSED:
+                output_scale = topk_weights.sum(dim=-1, keepdim=True)
+                packed_logits = pack_topk_router_logits(
+                    topk_weights,
+                    topk_ids,
+                    router_logits.shape[1],
+                )
+                return BypassedTopKOutput(
+                    hidden_states=hidden_states,
+                    router_logits=packed_logits,
+                    topk_config=self.topk_config,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=expert_location_dispatch_info,
+                    output_scale=output_scale,
+                )
+            return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
         if output_format == TopKOutputFormat.BYPASSED:
             return BypassedTopKOutput(

@@ -20,8 +20,8 @@ except ImportError:
 
 @register_kernel(
     "moe",
-    "select_experts",
-    name="cuda_sqrt_softplus_select_experts",
+    "topk",
+    name="cuda_sqrt_softplus_topk",
     solution="cuda",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=frozenset(
@@ -37,7 +37,7 @@ except ImportError:
     },
     priority=Priority.SPECIALIZED,
 )
-def cuda_sqrt_softplus_select_experts(
+def cuda_sqrt_softplus_topk(
     router_logits: torch.Tensor,
     top_k: int,
     renormalize: bool,
@@ -95,4 +95,4 @@ def cuda_sqrt_softplus_select_experts(
     return topk_weights, topk_ids, scores
 
 
-__all__ = ["cuda_sqrt_softplus_select_experts", "moe_finalize_fuse_shared"]
+__all__ = ["cuda_sqrt_softplus_topk", "moe_finalize_fuse_shared"]

@@ -45,7 +45,7 @@ import torch.nn.functional as F
 import tokenspeed_kernel
 from safetensors import safe_open
 from safetensors.torch import save_file
-from tokenspeed_kernel.ops.moe import _route_experts
+from tokenspeed_kernel.ops.moe import MoeTopKConfig, moe_topk
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -2220,10 +2220,13 @@ def test_routing_matches_reference_bias_and_normalization(topk, vision, with_ima
     )
     moe.hash_indices_dtype = torch.int64
     router_logits, actual_bias, _, _ = moe._routing_inputs(logits, image_mask)
-    weights, ids, scores = _route_experts(
+    weights, ids = moe_topk(
         router_logits,
-        topk,
-        topk > 1,
+        MoeTopKConfig(
+            top_k=topk,
+            score_function="sqrt_softplus",
+            renormalize=topk > 1,
+        ),
         correction_bias=actual_bias,
         solution="torch",
     )
@@ -2234,7 +2237,6 @@ def test_routing_matches_reference_bias_and_normalization(topk, vision, with_ima
     if topk > 1:
         expected_weights /= expected_weights.sum(-1, keepdim=True) + 1e-20
     torch.testing.assert_close(ids, expected_ids, rtol=0, atol=0)
-    torch.testing.assert_close(scores, expected_scores, rtol=0, atol=0)
     torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
 
 

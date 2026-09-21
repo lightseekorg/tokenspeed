@@ -107,8 +107,8 @@ def _sqrt_softplus_topk_kernel(
 
 @register_kernel(
     "moe",
-    "select_experts",
-    name="triton_sqrt_softplus_select_experts",
+    "topk",
+    name="triton_sqrt_softplus_topk",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     signatures=frozenset(
@@ -121,7 +121,7 @@ def _sqrt_softplus_topk_kernel(
     },
     priority=Priority.PORTABLE,
 )
-def triton_sqrt_softplus_select_experts(
+def triton_sqrt_softplus_topk(
     router_logits: torch.Tensor,
     top_k: int,
     renormalize: bool,

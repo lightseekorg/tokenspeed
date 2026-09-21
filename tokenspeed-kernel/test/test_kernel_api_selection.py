@@ -3553,31 +3553,31 @@ def _moe_apply_unquant_trtllm() -> object:
     )
 
 
-def _moe_route_experts_bias(tokens: int) -> object:
+def _moe_topk_bias(tokens: int) -> object:
     """Exercise bias-router selection across specialized and portable batches."""
     router_logits = torch.empty((tokens, 256), dtype=torch.float32)
     correction_bias = torch.empty((256,), dtype=torch.float32)
-    return _moe_pkg._route_experts(
+    return tokenspeed_kernel.moe_topk(
         router_logits,
-        6,
-        True,
+        tokenspeed_kernel.MoeTopKConfig(
+            top_k=6,
+            score_function="sqrt_softplus",
+        ),
         correction_bias=correction_bias,
-        hash_indices_table=None,
-        input_ids=None,
-        need_scores=False,
-        override=None,
-        solution=None,
     )
 
 
-def _moe_route_experts_hash() -> object:
+def _moe_topk_hash() -> object:
     router_logits = torch.empty((2, 384), dtype=torch.bfloat16)
     hash_indices_table = torch.zeros((8, 6), dtype=torch.int32)
     input_ids = torch.zeros((2,), dtype=torch.int64)
-    return _moe_pkg._route_experts(
+    return tokenspeed_kernel.moe_topk(
         router_logits,
-        6,
-        True,
+        tokenspeed_kernel.MoeTopKConfig(
+            top_k=6,
+            score_function="sqrt_softplus",
+            selection_method="hash",
+        ),
         hash_indices_table=hash_indices_table,
         input_ids=input_ids,
     )
@@ -5294,9 +5294,9 @@ _CASES = [
             _is_cdna5,
             "cdna5",
             "moe",
-            "select_experts",
-            "triton_sqrt_softplus_select_experts",
-            partial(_moe_route_experts_bias, tokens=tokens),
+            "topk",
+            "triton_sqrt_softplus_topk",
+            partial(_moe_topk_bias, tokens=tokens),
             id_suffix=f"bias-tokens{tokens}",
         )
         for tokens in (1, 2, 17)
@@ -5305,27 +5305,27 @@ _CASES = [
         _is_cdna5,
         "cdna5",
         "moe",
-        "select_experts",
-        "triton_sqrt_softplus_select_experts",
-        _moe_route_experts_hash,
+        "topk",
+        "triton_sqrt_softplus_topk",
+        _moe_topk_hash,
         id_suffix="hash",
     ),
     _case(
         _is_hopper_plus,
         "hopper-plus",
         "moe",
-        "select_experts",
-        "cuda_sqrt_softplus_select_experts",
-        partial(_moe_route_experts_bias, tokens=2),
+        "topk",
+        "cuda_sqrt_softplus_topk",
+        partial(_moe_topk_bias, tokens=2),
         id_suffix="bias",
     ),
     _case(
         _is_hopper_plus,
         "hopper-plus",
         "moe",
-        "select_experts",
-        "cuda_sqrt_softplus_select_experts",
-        _moe_route_experts_hash,
+        "topk",
+        "cuda_sqrt_softplus_topk",
+        _moe_topk_hash,
         id_suffix="hash",
     ),
     *[
@@ -5333,15 +5333,15 @@ _CASES = [
             _is_cdna4,
             "cdna4",
             "moe",
-            "select_experts",
+            "topk",
             expected,
-            partial(_moe_route_experts_bias, tokens=tokens),
+            partial(_moe_topk_bias, tokens=tokens),
             id_suffix=f"bias-tokens{tokens}",
         )
         for tokens, expected in (
-            (1, "gluon_sqrt_softplus_select_experts_gfx950"),
-            (2, "gluon_sqrt_softplus_select_experts_gfx950"),
-            (17, "triton_sqrt_softplus_select_experts"),
+            (1, "gluon_sqrt_softplus_topk_gfx950"),
+            (2, "gluon_sqrt_softplus_topk_gfx950"),
+            (17, "triton_sqrt_softplus_topk"),
         )
     ],
     _case(
@@ -5648,7 +5648,7 @@ def selected_kernel_spy(monkeypatch):
             )
 
         if case.family == "moe":
-            if case.mode == "select_experts":
+            if case.mode == "topk":
                 router_logits, top_k = args[:2]
                 shape = (router_logits.shape[0], top_k)
                 return (

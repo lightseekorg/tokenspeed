@@ -13,8 +13,8 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 @register_kernel(
     "moe",
-    "select_experts",
-    name="torch_sqrt_softplus_select_experts",
+    "topk",
+    name="torch_sqrt_softplus_topk",
     solution="torch",
     signatures=frozenset(
         format_signature(router_logits=dense_tensor_format(dtype))
@@ -26,7 +26,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
     },
     priority=Priority.REFERENCE,
 )
-def torch_sqrt_softplus_select_experts(
+def torch_sqrt_softplus_topk(
     router_logits: torch.Tensor,
     top_k: int,
     renormalize: bool,

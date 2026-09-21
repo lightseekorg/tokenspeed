@@ -120,6 +120,7 @@ from tokenspeed.runtime.layers.moe import (
     build_moe_checkpoint_loader,
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer
+from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
 from tokenspeed.runtime.layers.quantization import Fp8Config, Mxfp4Config
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -1758,6 +1759,15 @@ class DeepseekV4MoE(nn.Module):
             ),
             process_group=expert_process_group,
         )
+        self.topk = TopK(
+            top_k=config.num_experts_per_tok,
+            renormalize=self._renormalize_routing_weights(),
+            correction_bias=self.gate.e_score_correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor,
+            output_format=self.experts.topk_output_format,
+            score_function="sqrt_softplus",
+            selection_method=("hash" if self.gate.tid2eid is not None else "topk"),
+        )
 
     def _routing_inputs(
         self,
@@ -1795,18 +1805,18 @@ class DeepseekV4MoE(nn.Module):
         router_logits, correction_bias, hash_indices_table, routing_input_ids = (
             self._routing_inputs(hidden_states, input_ids)
         )
+        topk_output = self.topk(
+            hidden_states,
+            router_logits,
+            routing_correction_bias=correction_bias,
+            hash_indices_table=hash_indices_table,
+            input_ids=routing_input_ids,
+        )
         return self.experts(
             hidden_states=hidden_states,
-            topk_output=None,
+            topk_output=topk_output,
             num_global_tokens=num_global_tokens,
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
-            router_logits=router_logits,
-            routing_score_function="sqrt_softplus",
-            routing_renormalize=self._renormalize_routing_weights(),
-            routing_correction_bias=correction_bias,
-            routing_hash_indices_table=hash_indices_table,
-            routing_input_ids=routing_input_ids,
-            routed_scaling_factor=self.routed_scaling_factor,
         )
 
     def _forward_shared_experts(
