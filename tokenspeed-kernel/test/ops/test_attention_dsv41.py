@@ -1554,3 +1554,65 @@ def test_dspark_block_expands_anchors_and_window_addressing(device):
         assert torch.equal(got.cpu(), reference.to(got.dtype))
     with pytest.raises(ValueError):
         dsv41.dspark_block(bonus[:2], start, history, noise, rows_per_page, hc, block)
+
+
+@pytest.mark.parametrize("blocks", [16, 64, 2048])
+def test_sparse_reindex_selects_what_the_dense_score_selects(device, blocks):
+    # The Hopper Reindex pass scores only its candidate pool. Existing reindex
+    # cases use pools narrower than one gather tile, so they never reach that
+    # kernel; these widths do, and 2048 blocks give a CTA several tiles so the
+    # gather pipeline rotates stages and flips parity.
+    from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm
+
+    if not deep_gemm.is_hopper_indexer_available():
+        pytest.skip("requires the Hopper FP8 indexer")
+    torch.manual_seed(52)
+    pages = 256
+    rows = pages * 64
+    # 132-byte rows: 128 E4M3 values then the FP32 scale, the format the
+    # Hopper scorers read. The shared helper only knows the shorter layouts.
+    cache = torch.zeros((pages, 64, 132), dtype=torch.uint8, device=device)
+    dsv41.cache_scatter(
+        torch.randn((rows, 128), dtype=torch.bfloat16, device=device),
+        cache,
+        torch.arange(rows, device=device),
+        "index_v4",
+    )
+    tokens = 4
+    q = torch.randn((tokens, 32, 128), dtype=torch.bfloat16, device=device)
+    weights = torch.randn((tokens, 32), dtype=torch.float32, device=device)
+    table = torch.arange(pages, dtype=torch.int32, device=device).repeat(tokens, 1)
+    visible = torch.full((tokens,), rows, dtype=torch.int32, device=device)
+    # A partial trailing block, and a query that can see nothing at all.
+    visible[0] = rows - 11
+    visible[tokens - 1] = 0
+    candidates = torch.randint(
+        0, rows // 8, (tokens, blocks), dtype=torch.int32, device=device
+    )
+    candidates[1, ::5] = -1
+
+    def select():
+        return dsv41.index_topk(
+            q,
+            weights,
+            cache,
+            table,
+            visible,
+            candidates,
+            512,
+            0,
+            8,
+            1,
+            256,
+            None,
+            None,
+            None,
+        )
+
+    sparse, sparse_lengths = (tensor.clone() for tensor in select()[:2])
+    with patch.object(deep_gemm, "sparse_index_scores_supported", return_value=False):
+        dense, dense_lengths = (tensor.clone() for tensor in select()[:2])
+    # The two scorers reduce over heads in a different order, so agreement is
+    # on the selection, which is what the pass exists to produce.
+    torch.testing.assert_close(sparse_lengths, dense_lengths, rtol=0, atol=0)
+    torch.testing.assert_close(sparse, dense, rtol=0, atol=0)

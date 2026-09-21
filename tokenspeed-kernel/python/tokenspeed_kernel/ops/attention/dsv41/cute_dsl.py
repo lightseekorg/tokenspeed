@@ -1,0 +1,212 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""CuTe DSL entry point for Hopper sparse index scoring.
+
+This is an implementation detail of the registered ``deep_gemm_hopper`` indexer
+rather than a separately selectable solution: it replaces the dense score of a
+Reindex pass, which reads the whole history only to discard everything outside
+the candidate pool.
+"""
+
+import torch
+from tokenspeed_kernel.platform import ArchVersion, current_platform
+
+__all__ = ["sparse_index_scores", "sparse_index_scores_supported"]
+
+_BLOCKS_PER_TILE = 16
+_SUPPORTED = None
+_COMPILED = {}
+
+
+class _GraphSafeDLPack:
+    """DLPack view that does not synchronize with the producer stream."""
+
+    def __init__(self, tensor):
+        self._tensor = tensor
+
+    def __dlpack__(self, stream=None):
+        return self._tensor.__dlpack__(stream=-1)
+
+    def __dlpack_device__(self):
+        return self._tensor.__dlpack_device__()
+
+
+def _to_cute(tensor, dynamic_rows):
+    """Wrap a torch tensor for CuTe, leaving only the row count dynamic.
+
+    Every other extent stays static so the candidate width and table width
+    become compile-time tile counts; the compile cache keys on them.
+    """
+    from cutlass.cute.runtime import from_dlpack
+
+    wrapped = from_dlpack(_GraphSafeDLPack(tensor.detach()), assumed_align=16)
+    if dynamic_rows:
+        wrapped = wrapped.mark_compact_shape_dynamic(
+            mode=0, stride_order=tuple(range(tensor.dim()))
+        )
+    return wrapped
+
+
+def _kernel():
+    from tokenspeed_kernel.ops.attention.dsv41._cute_dsl.sparse_index_scores import (
+        SparseIndexScoreKernel,
+    )
+
+    return SparseIndexScoreKernel
+
+
+def sparse_index_scores_supported(queries, candidates) -> bool:
+    """Whether the CuTe DSL sparse scorer can serve this call.
+
+    Args:
+        queries: ``[tokens, heads, 128]`` FP8-E4M3 index queries.
+        candidates: ``[tokens, blocks]`` int32 candidate block ids.
+
+    Returns:
+        True when the platform is Hopper and the shapes tile evenly.
+    """
+    global _SUPPORTED
+    if _SUPPORTED is None:
+        platform = current_platform()
+        _SUPPORTED = (
+            platform.is_nvidia
+            and platform.arch_version == ArchVersion(9, 0)
+            and _import_ok()
+        )
+    return (
+        _SUPPORTED
+        and queries.dtype == torch.float8_e4m3fn
+        and queries.shape[-1] == 128
+        and queries.shape[1] % 8 == 0
+        and candidates is not None
+        and candidates.shape[1] % _BLOCKS_PER_TILE == 0
+    )
+
+
+def _import_ok() -> bool:
+    try:
+        _kernel()
+    except ImportError:
+        return False
+    return True
+
+
+# CTAs to aim for per SM. The kernel is bound by how fast its gather warp can
+# issue 1 KiB bulk copies, not by bandwidth, so oversubscribing the machine
+# keeps copies in flight. Measured at the production shape (8 queries, 2048
+# candidate blocks): 64 CTAs 24.2 us, 128 CTAs 21.0, 512 CTAs 19.4, 1024 CTAs
+# 25.4 -- past that the per-CTA setup outweighs the work each one does.
+_CTAS_PER_SM = 8
+
+
+def _split_k(tokens: int, tiles: int) -> int:
+    """Fill the machine without splitting a query into more tiles than it has.
+
+    Powers of two only: ``tiles`` is itself a power of two in practice, and a
+    split that does not divide it leaves the last wave ragged, which measured
+    worse than a smaller even split.
+    """
+    target = max(1, _CTAS_PER_SM * current_platform().sm_count // max(1, tokens))
+    split = 1
+    while split * 2 <= min(target, tiles):
+        split *= 2
+    return split
+
+
+def sparse_index_scores(
+    queries,
+    weights,
+    values,
+    scales,
+    table,
+    visible,
+    candidates,
+    enable_pdl,
+):
+    """Score each query's candidate pool, compacted in candidate order.
+
+    Args:
+        queries: ``[tokens, heads, 128]`` FP8-E4M3 index queries; the query
+            scale is already folded into ``weights``.
+        weights: ``[tokens, heads]`` FP32 per-head weights.
+        values: ``[pages, 64, 128]`` FP8-E4M3 index-key value plane.
+        scales: ``[pages, 64]`` FP32 index-key scale plane.
+        table: ``[tokens, table_width]`` int32 page ids; a negative or
+            out-of-range entry scores its rows ``-inf``.
+        visible: ``[tokens]`` int32 visible row count per query.
+        candidates: ``[tokens, blocks]`` int32 request-local block ids, ``-1``
+            padded.
+        enable_pdl: Request Programmatic Dependent Launch.
+
+    Returns:
+        FP32 ``[tokens, blocks * 8]``. Column ``c`` holds the score of row
+        ``candidates[:, c // 8] * 8 + c % 8``, or ``-inf`` when that row is
+        null, past ``visible``, or on an unmapped page.
+    """
+    import cuda.bindings.driver as cuda
+    from cutlass import cute
+
+    # The gather resolves a whole tile of candidates per lane and the MMA reads
+    # whole eight-head groups, so a ragged tail would read past either buffer.
+    # Checked here rather than left to callers: getting it wrong is silent.
+    blocks = candidates.shape[1]
+    if blocks % _BLOCKS_PER_TILE or queries.shape[1] % 8:
+        raise ValueError(
+            f"sparse index scoring needs {_BLOCKS_PER_TILE}-block tiles and "
+            f"8-head groups, got {blocks} blocks and {queries.shape[1]} heads"
+        )
+    if values.shape[0] == 0:
+        raise ValueError("sparse index scoring needs at least one cache page")
+    tokens = queries.shape[0]
+    out = torch.empty((tokens, blocks * 8), dtype=torch.float32, device=queries.device)
+    if tokens == 0 or blocks == 0:
+        return out
+    # The cache planes carry the 132-byte row pitch, so they are not compact
+    # and their page count stays a compile-time extent; the key covers it.
+    args = (
+        _to_cute(queries, True),
+        _to_cute(weights, True),
+        _to_cute(values, False),
+        _to_cute(scales, False),
+        _to_cute(table, True),
+        _to_cute(visible, True),
+        _to_cute(candidates, True),
+        _to_cute(out, True),
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    heads = queries.shape[1]
+    split = _split_k(tokens, blocks // _BLOCKS_PER_TILE)
+    key = (
+        heads,
+        split,
+        bool(enable_pdl),
+        blocks,
+        table.shape[1],
+        values.shape[0],
+    )
+    compiled = _COMPILED.get(key)
+    if compiled is None:
+        compiled = cute.compile(
+            _kernel()(heads, split, bool(enable_pdl)), *args, stream
+        )
+        _COMPILED[key] = compiled
+    compiled(*args, stream)
+    return out
