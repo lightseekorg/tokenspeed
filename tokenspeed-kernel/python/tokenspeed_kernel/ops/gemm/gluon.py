@@ -246,7 +246,6 @@ if current_platform().is_amd:
                 }
             ),
             priority=Priority.SPECIALIZED,
-            tags={"latency"},
             traits={
                 "m": frozenset(range(1, 17)),
                 "n_align": frozenset({16}),
@@ -304,7 +303,6 @@ if current_platform().is_amd:
                 }
             ),
             priority=Priority.SPECIALIZED,
-            tags={"latency"},
             traits={
                 "m": frozenset(range(1, 17)),
                 "n_align": frozenset({128}),
