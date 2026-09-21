@@ -1095,10 +1095,9 @@ class MixedInputFusedMultiHeadAttentionDecode:
                             for _ in cutlass.range_constexpr(_CONVERT_WARPGROUPS - 1):
                                 cvt_producer.advance()
                     else:
-                        # Intermediate convert type
+                        # K/V dtypes match; BF16 uses the producer above.
+                        # Only FP8 converts through FP32 to the MMA dtype here.
                         cvt_type = cutlass.Float32
-                        if cutlass.const_expr(k_dtype is cutlass.BFloat16):
-                            cvt_type = mma_dtype
 
                         assert tiles_dk % _CONVERT_WARPGROUPS == 0
                         assert (tiles_dm * tiles_sk) % _CONVERT_WARPGROUPS == 0
@@ -1115,20 +1114,12 @@ class MixedInputFusedMultiHeadAttentionDecode:
                             tcgen05.St16x256bOp(tcgen05.Repetition(mma_k_bits // 256)),
                             mma_dtype,
                         )
-                        if cutlass.const_expr(k_dtype is cutlass.BFloat16):
-                            # The K partition keeps four BF16 values contiguous per lane.
-                            smem_load_atom_k = cute.make_copy_atom(
-                                cute.nvgpu.CopyUniversalOp(),
-                                kv_smem_dtype,
-                                num_bits_per_copy=64,
-                            )
-                        else:
-                            smem_load_op_k = cute.nvgpu.warp.LdMatrix8x16x8bOp(
-                                num_matrices=4,
-                            )
-                            smem_load_atom_k = cute.make_copy_atom(
-                                smem_load_op_k, kv_smem_dtype
-                            )
+                        smem_load_op_k = cute.nvgpu.warp.LdMatrix8x16x8bOp(
+                            num_matrices=4,
+                        )
+                        smem_load_atom_k = cute.make_copy_atom(
+                            smem_load_op_k, kv_smem_dtype
+                        )
 
                         tmem_store_k = tcgen05.make_tmem_copy(
                             tmem_store_atom_k, tAtK_cvt[mma_dice + (0,)]
@@ -1149,21 +1140,13 @@ class MixedInputFusedMultiHeadAttentionDecode:
                             tcgen05.St16x256bOp(tcgen05.Repetition(mma_k_bits // 256)),
                             mma_dtype,
                         )
-                        if cutlass.const_expr(v_dtype is cutlass.BFloat16):
-                            smem_load_atom_v = cute.make_copy_atom(
-                                cute.nvgpu.warp.LdMatrix8x8x16bOp(
-                                    transpose=True, num_matrices=4
-                                ),
-                                kv_smem_dtype,
-                            )
-                        else:
-                            smem_load_op_v = cute.nvgpu.warp.LdMatrix16x16x8bOp(
-                                transpose=True,
-                                num_matrices=2,
-                            )
-                            smem_load_atom_v = cute.make_copy_atom(
-                                smem_load_op_v, kv_smem_dtype
-                            )
+                        smem_load_op_v = cute.nvgpu.warp.LdMatrix16x16x8bOp(
+                            transpose=True,
+                            num_matrices=2,
+                        )
+                        smem_load_atom_v = cute.make_copy_atom(
+                            smem_load_op_v, kv_smem_dtype
+                        )
 
                         tmem_store_v = tcgen05.make_tmem_copy(
                             tmem_store_atom_v, tAtV_cvt[mma_dice + (0,)]
@@ -1179,80 +1162,103 @@ class MixedInputFusedMultiHeadAttentionDecode:
                         tVsV = thr_load_v.partition_S(tAsV)
                         tVrV_shape = thr_load_v.partition_D(tAsV).shape[:-1]
 
-                        if cutlass.const_expr(k_dtype is cutlass.BFloat16):
-                            # Use all active SMEM ring slots for GMEM prefetch. A stage
-                            # is one logical 128x256 K-or-V item, split over two warpgroups.
-                            assert tiles_dk == _CONVERT_WARPGROUPS
-                            assert tiles_dm * tiles_sk == _CONVERT_WARPGROUPS
-                            stream_length = iters_s * 2
-                            ring_depth = min(self.kv_ring_stages, stream_length)
-                            for item in cutlass.range_constexpr(ring_depth):
-                                self._issue_sparse_stream_item(
-                                    k_iter,
-                                    v_iter,
-                                    selected_slots,
-                                    row_idx,
-                                    kv_split_idx,
-                                    kv_splits,
-                                    item,
-                                    stream_length,
-                                    ring_depth,
-                                    convert_phase * mma_tile_k,
-                                    sKV_vector_address,
-                                    convert_phase,
-                                    warpgroup_tidx,
-                                    lane_idx,
-                                    kv_smem_dtype,
-                                )
+                        # Prime the unified K-or-V ring with K0. Each conversion
+                        # warpgroup owns one 128-D half of every logical ring item.
+                        self._issue_sparse_tile_for_dtype(
+                            k_iter,
+                            selected_slots,
+                            row_idx,
+                            kv_split_idx,
+                            convert_phase * mma_tile_k,
+                            sKV_vector_address,
+                            convert_phase,
+                            warpgroup_tidx,
+                            lane_idx,
+                            kv_smem_dtype,
+                        )
 
-                            for item in cutlass.range_constexpr(stream_length):
-                                pending = min(ring_depth - 1, stream_length - item - 1)
-                                cute.arch.cp_async_wait_group(pending)
-                                cvt_load_nbar.arrive_and_wait()
-                                smem_stage = (
-                                    item % ring_depth
-                                ) * _CONVERT_WARPGROUPS + convert_phase
-                                if cutlass.const_expr(
-                                    item == 0
-                                    or (item < stream_length - 1 and item % 2 == 1)
+                        #
+                        # Sequence loop
+                        #
+                        for s in cutlass.range(prefetch_iters + iters_s):
+                            if s < iters_s:
+                                # Convert and scale K
+                                for _ in cutlass.range(
+                                    tiles_dk // _CONVERT_WARPGROUPS, unroll=2
                                 ):
-                                    tKrK = cute.make_rmem_tensor(
-                                        tKrK_shape, kv_smem_dtype
-                                    )
-                                    tKrK_cvt = cute.make_rmem_tensor(
-                                        tKrK_cvt_shape, mma_dtype
-                                    )
-                                    cute.copy(
-                                        thr_load_k, tKsK[cpy_dice + (smem_stage,)], tKrK
-                                    )
-                                    cute.arch.fence_view_async_shared()
-                                    if cutlass.const_expr(iters_s > 1):
-                                        # Every warp must finish reading before this slot
-                                        # can be refilled by any warp in its converter group.
-                                        cvt_load_nbar.arrive_and_wait()
-                                    if cutlass.const_expr(
-                                        item + ring_depth < stream_length
-                                    ):
-                                        self._issue_sparse_stream_item(
-                                            k_iter,
+                                    # Issue the next logical K-or-V item before
+                                    # consuming K_s. One pending cp.async group overlaps
+                                    # its latency with conversion and UMMA.
+                                    if s == 0:
+                                        if iters_s > 1:
+                                            self._issue_sparse_tile_for_dtype(
+                                                k_iter,
+                                                selected_slots,
+                                                row_idx,
+                                                kv_split_idx + kv_splits,
+                                                convert_phase * mma_tile_k,
+                                                sKV_vector_address,
+                                                _CONVERT_WARPGROUPS + convert_phase,
+                                                warpgroup_tidx,
+                                                lane_idx,
+                                                kv_smem_dtype,
+                                            )
+                                        else:
+                                            # With one tile, the next ring item is V0.
+                                            self._issue_sparse_tile_for_dtype(
+                                                v_iter,
+                                                selected_slots,
+                                                row_idx,
+                                                kv_split_idx,
+                                                convert_phase * mma_tile_m,
+                                                sKV_vector_address,
+                                                _CONVERT_WARPGROUPS + convert_phase,
+                                                warpgroup_tidx,
+                                                lane_idx,
+                                                kv_smem_dtype,
+                                            )
+                                    else:
+                                        self._issue_sparse_tile_for_dtype(
                                             v_iter,
                                             selected_slots,
                                             row_idx,
-                                            kv_split_idx,
-                                            kv_splits,
-                                            item + ring_depth,
-                                            stream_length,
-                                            ring_depth,
-                                            convert_phase * mma_tile_k,
+                                            kv_split_idx + (s - 1) * kv_splits,
+                                            convert_phase * mma_tile_m,
                                             sKV_vector_address,
                                             convert_phase,
                                             warpgroup_tidx,
                                             lane_idx,
                                             kv_smem_dtype,
                                         )
+                                    cute.arch.cp_async_wait_group(1)
+                                    k_smem_stage = convert_phase
+                                    if s > 0:
+                                        k_smem_stage = (
+                                            _CONVERT_WARPGROUPS + convert_phase
+                                        )
+                                    cvt_load_nbar.arrive_and_wait()
+
+                                    tKrK = cute.make_rmem_tensor(
+                                        tKrK_shape, kv_smem_dtype
+                                    )
+                                    tKrK_cvt = cute.make_rmem_tensor(
+                                        tKrK_cvt_shape, mma_dtype
+                                    )
+
+                                    cute.copy(
+                                        thr_load_k,
+                                        tKsK[cpy_dice + (k_smem_stage,)],
+                                        tKrK,
+                                    )
+                                    cute.arch.fence_view_async_shared()
+                                    if cutlass.const_expr(iters_s > 1):
+                                        # A faster warp may otherwise refill this ring
+                                        # slot while a peer warp still reads its K tile.
+                                        cvt_load_nbar.arrive_and_wait()
 
                                     tKrK_ssa = tKrK.load().to(cvt_type).to(mma_dtype)
                                     tKrK_cvt.store(tKrK_ssa.reshape(tKrK_cvt_shape))
+
                                     cvt_handle = cvt_producer.acquire_and_advance()
                                     cute.copy(
                                         thr_store_k,
@@ -1261,42 +1267,77 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                     )
                                     cute.arch.fence_view_async_tmem_store()
                                     cvt_handle.commit()
-                                else:
+
+                                    # Advance again for multiple warpgroups
+                                    for _ in cutlass.range_constexpr(
+                                        _CONVERT_WARPGROUPS - 1
+                                    ):
+                                        cvt_producer.advance()
+
+                            if s >= prefetch_iters:
+                                # Convert and scale V
+                                for _ in cutlass.range(
+                                    tiles_dm * tiles_sk // _CONVERT_WARPGROUPS,
+                                    unroll=2,
+                                ):
+                                    # V_(s-1) is resident/in flight. Refill the other
+                                    # ring slot with K_(s+1), or the final V item.
+                                    if s < iters_s:
+                                        if s + 1 < iters_s:
+                                            self._issue_sparse_tile_for_dtype(
+                                                k_iter,
+                                                selected_slots,
+                                                row_idx,
+                                                kv_split_idx + (s + 1) * kv_splits,
+                                                convert_phase * mma_tile_k,
+                                                sKV_vector_address,
+                                                _CONVERT_WARPGROUPS + convert_phase,
+                                                warpgroup_tidx,
+                                                lane_idx,
+                                                kv_smem_dtype,
+                                            )
+                                        else:
+                                            self._issue_sparse_tile_for_dtype(
+                                                v_iter,
+                                                selected_slots,
+                                                row_idx,
+                                                kv_split_idx + s * kv_splits,
+                                                convert_phase * mma_tile_m,
+                                                sKV_vector_address,
+                                                _CONVERT_WARPGROUPS + convert_phase,
+                                                warpgroup_tidx,
+                                                lane_idx,
+                                                kv_smem_dtype,
+                                            )
+                                        cute.arch.cp_async_wait_group(1)
+                                    else:
+                                        cute.arch.cp_async_wait_group(0)
+                                    v_smem_stage = convert_phase
+                                    if s == iters_s:
+                                        v_smem_stage = (
+                                            _CONVERT_WARPGROUPS + convert_phase
+                                        )
+                                    cvt_load_nbar.arrive_and_wait()
+
                                     tVrV = cute.make_rmem_tensor(
                                         tVrV_shape, kv_smem_dtype
                                     )
                                     tVrV_cvt = cute.make_rmem_tensor(
                                         tVrV_cvt_shape, mma_dtype
                                     )
+
                                     cute.copy(
-                                        thr_load_v, tVsV[cpy_dice + (smem_stage,)], tVrV
+                                        thr_load_v,
+                                        tVsV[cpy_dice + (v_smem_stage,)],
+                                        tVrV,
                                     )
                                     cute.arch.fence_view_async_shared()
                                     if cutlass.const_expr(iters_s > 1):
                                         cvt_load_nbar.arrive_and_wait()
-                                    if cutlass.const_expr(
-                                        item + ring_depth < stream_length
-                                    ):
-                                        self._issue_sparse_stream_item(
-                                            k_iter,
-                                            v_iter,
-                                            selected_slots,
-                                            row_idx,
-                                            kv_split_idx,
-                                            kv_splits,
-                                            item + ring_depth,
-                                            stream_length,
-                                            ring_depth,
-                                            convert_phase * mma_tile_k,
-                                            sKV_vector_address,
-                                            convert_phase,
-                                            warpgroup_tidx,
-                                            lane_idx,
-                                            kv_smem_dtype,
-                                        )
 
                                     tVrV_ssa = tVrV.load().to(cvt_type).to(mma_dtype)
                                     tVrV_cvt.store(tVrV_ssa.reshape(tVrV_cvt_shape))
+
                                     cvt_handle = cvt_producer.acquire_and_advance()
                                     cute.copy(
                                         thr_store_v,
@@ -1305,206 +1346,12 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                     )
                                     cute.arch.fence_view_async_tmem_store()
                                     cvt_handle.commit()
-                                for _ in cutlass.range_constexpr(
-                                    _CONVERT_WARPGROUPS - 1
-                                ):
-                                    cvt_producer.advance()
 
-                        else:
-                            # Prime the unified K-or-V ring with K0. Each conversion
-                            # warpgroup owns one 128-D half of every logical ring item.
-                            self._issue_sparse_tile_for_dtype(
-                                k_iter,
-                                selected_slots,
-                                row_idx,
-                                kv_split_idx,
-                                convert_phase * mma_tile_k,
-                                sKV_vector_address,
-                                convert_phase,
-                                warpgroup_tidx,
-                                lane_idx,
-                                kv_smem_dtype,
-                            )
-
-                            #
-                            # Sequence loop
-                            #
-                            for s in cutlass.range(prefetch_iters + iters_s):
-                                if s < iters_s:
-                                    # Convert and scale K
-                                    for _ in cutlass.range(
-                                        tiles_dk // _CONVERT_WARPGROUPS, unroll=2
+                                    # Advance again for multiple warpgroups
+                                    for _ in cutlass.range_constexpr(
+                                        _CONVERT_WARPGROUPS - 1
                                     ):
-                                        # Issue the next logical K-or-V item before
-                                        # consuming K_s. One pending cp.async group overlaps
-                                        # its latency with conversion and UMMA.
-                                        if s == 0:
-                                            if iters_s > 1:
-                                                self._issue_sparse_tile_for_dtype(
-                                                    k_iter,
-                                                    selected_slots,
-                                                    row_idx,
-                                                    kv_split_idx + kv_splits,
-                                                    convert_phase * mma_tile_k,
-                                                    sKV_vector_address,
-                                                    _CONVERT_WARPGROUPS + convert_phase,
-                                                    warpgroup_tidx,
-                                                    lane_idx,
-                                                    kv_smem_dtype,
-                                                )
-                                            else:
-                                                # With one tile, the next ring item is V0.
-                                                self._issue_sparse_tile_for_dtype(
-                                                    v_iter,
-                                                    selected_slots,
-                                                    row_idx,
-                                                    kv_split_idx,
-                                                    convert_phase * mma_tile_m,
-                                                    sKV_vector_address,
-                                                    _CONVERT_WARPGROUPS + convert_phase,
-                                                    warpgroup_tidx,
-                                                    lane_idx,
-                                                    kv_smem_dtype,
-                                                )
-                                        else:
-                                            self._issue_sparse_tile_for_dtype(
-                                                v_iter,
-                                                selected_slots,
-                                                row_idx,
-                                                kv_split_idx + (s - 1) * kv_splits,
-                                                convert_phase * mma_tile_m,
-                                                sKV_vector_address,
-                                                convert_phase,
-                                                warpgroup_tidx,
-                                                lane_idx,
-                                                kv_smem_dtype,
-                                            )
-                                        cute.arch.cp_async_wait_group(1)
-                                        k_smem_stage = convert_phase
-                                        if s > 0:
-                                            k_smem_stage = (
-                                                _CONVERT_WARPGROUPS + convert_phase
-                                            )
-                                        cvt_load_nbar.arrive_and_wait()
-
-                                        tKrK = cute.make_rmem_tensor(
-                                            tKrK_shape, kv_smem_dtype
-                                        )
-                                        tKrK_cvt = cute.make_rmem_tensor(
-                                            tKrK_cvt_shape, mma_dtype
-                                        )
-
-                                        cute.copy(
-                                            thr_load_k,
-                                            tKsK[cpy_dice + (k_smem_stage,)],
-                                            tKrK,
-                                        )
-                                        cute.arch.fence_view_async_shared()
-                                        if cutlass.const_expr(iters_s > 1):
-                                            # A faster warp may otherwise refill this ring
-                                            # slot while a peer warp still reads its K tile.
-                                            cvt_load_nbar.arrive_and_wait()
-
-                                        tKrK_ssa = (
-                                            tKrK.load().to(cvt_type).to(mma_dtype)
-                                        )
-                                        tKrK_cvt.store(tKrK_ssa.reshape(tKrK_cvt_shape))
-
-                                        cvt_handle = cvt_producer.acquire_and_advance()
-                                        cute.copy(
-                                            thr_store_k,
-                                            tKrK_cvt,
-                                            tKtK_cvt[cpy_dice + (cvt_handle.index,)],
-                                        )
-                                        cute.arch.fence_view_async_tmem_store()
-                                        cvt_handle.commit()
-
-                                        # Advance again for multiple warpgroups
-                                        for _ in cutlass.range_constexpr(
-                                            _CONVERT_WARPGROUPS - 1
-                                        ):
-                                            cvt_producer.advance()
-
-                                if s >= prefetch_iters:
-                                    # Convert and scale V
-                                    for _ in cutlass.range(
-                                        tiles_dm * tiles_sk // _CONVERT_WARPGROUPS,
-                                        unroll=2,
-                                    ):
-                                        # V_(s-1) is resident/in flight. Refill the other
-                                        # ring slot with K_(s+1), or the final V item.
-                                        if s < iters_s:
-                                            if s + 1 < iters_s:
-                                                self._issue_sparse_tile_for_dtype(
-                                                    k_iter,
-                                                    selected_slots,
-                                                    row_idx,
-                                                    kv_split_idx + (s + 1) * kv_splits,
-                                                    convert_phase * mma_tile_k,
-                                                    sKV_vector_address,
-                                                    _CONVERT_WARPGROUPS + convert_phase,
-                                                    warpgroup_tidx,
-                                                    lane_idx,
-                                                    kv_smem_dtype,
-                                                )
-                                            else:
-                                                self._issue_sparse_tile_for_dtype(
-                                                    v_iter,
-                                                    selected_slots,
-                                                    row_idx,
-                                                    kv_split_idx + s * kv_splits,
-                                                    convert_phase * mma_tile_m,
-                                                    sKV_vector_address,
-                                                    _CONVERT_WARPGROUPS + convert_phase,
-                                                    warpgroup_tidx,
-                                                    lane_idx,
-                                                    kv_smem_dtype,
-                                                )
-                                            cute.arch.cp_async_wait_group(1)
-                                        else:
-                                            cute.arch.cp_async_wait_group(0)
-                                        v_smem_stage = convert_phase
-                                        if s == iters_s:
-                                            v_smem_stage = (
-                                                _CONVERT_WARPGROUPS + convert_phase
-                                            )
-                                        cvt_load_nbar.arrive_and_wait()
-
-                                        tVrV = cute.make_rmem_tensor(
-                                            tVrV_shape, kv_smem_dtype
-                                        )
-                                        tVrV_cvt = cute.make_rmem_tensor(
-                                            tVrV_cvt_shape, mma_dtype
-                                        )
-
-                                        cute.copy(
-                                            thr_load_v,
-                                            tVsV[cpy_dice + (v_smem_stage,)],
-                                            tVrV,
-                                        )
-                                        cute.arch.fence_view_async_shared()
-                                        if cutlass.const_expr(iters_s > 1):
-                                            cvt_load_nbar.arrive_and_wait()
-
-                                        tVrV_ssa = (
-                                            tVrV.load().to(cvt_type).to(mma_dtype)
-                                        )
-                                        tVrV_cvt.store(tVrV_ssa.reshape(tVrV_cvt_shape))
-
-                                        cvt_handle = cvt_producer.acquire_and_advance()
-                                        cute.copy(
-                                            thr_store_v,
-                                            tVrV_cvt,
-                                            tVtV_cvt[cpy_dice + (cvt_handle.index,)],
-                                        )
-                                        cute.arch.fence_view_async_tmem_store()
-                                        cvt_handle.commit()
-
-                                        # Advance again for multiple warpgroups
-                                        for _ in cutlass.range_constexpr(
-                                            _CONVERT_WARPGROUPS - 1
-                                        ):
-                                            cvt_producer.advance()
+                                        cvt_producer.advance()
 
                 ##############################
                 # MMA KQ Dispatch
