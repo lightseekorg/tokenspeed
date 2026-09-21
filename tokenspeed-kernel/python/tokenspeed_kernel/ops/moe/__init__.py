@@ -543,6 +543,12 @@ def moe_plan(
         apply_spec.name,
         apply_spec.traits,
     )
+    if persistent_max_num_tokens_per_gpu is not None and True not in (
+        apply_spec.traits.get("persistent_workspace", frozenset())
+    ):
+        raise ValueError(
+            f"MoE kernel {apply_spec.name!r} does not support persistent workspace"
+        )
 
     routing_modes = apply_spec.traits.get("routing_mode", frozenset())
     support_routing = "kernel_routing" in routing_modes

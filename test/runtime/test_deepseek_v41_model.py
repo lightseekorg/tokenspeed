@@ -1640,7 +1640,7 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
                 module.quant_method.process_weights_after_loading(module)
         assert all(
             layer.ffn.experts._weights_processed
-            and hasattr(layer.ffn.experts, "_moe_backend_state")
+            and layer.ffn.experts._moe_backend_state is not None
             for layer in adapter.model.layers
         )
         backend = _backend(str(device), 2)
