@@ -1001,11 +1001,20 @@ def test_qwen4_exp_qsa_grouped_scores_match_independent_queries(
             query, key_cache, table, requests, complete, page_size, num_blocks
         )
     )
-    torch.testing.assert_close(scores[0], expected, rtol=1e-5, atol=1e-4)
-    torch.testing.assert_close(scores[0], scores[1], rtol=0, atol=0)
-    torch.testing.assert_close(selected[0], selected[1], rtol=0, atol=0)
-    assert torch.isneginf(scores[0][-widths[-1] :]).all()
-    assert (selected[0][-widths[-1] :] == -1).all()
+    # Grouping changes the dot/reduction layout, so FP32 scores may round
+    # differently even when both layouts agree with the reference.
+    torch.testing.assert_close(scores[0], scores[1], rtol=1e-5, atol=1e-4)
+    n_cols_padded = 1 << (max(num_blocks, block_topk) - 1).bit_length()
+    for logits, indices in zip(scores, selected):
+        torch.testing.assert_close(logits, expected, rtol=1e-5, atol=1e-4)
+        assert torch.isneginf(logits[-widths[-1] :]).all()
+        assert (indices[-widths[-1] :] == -1).all()
+        # Near-ties can change membership across layouts. Each selection
+        # must still match its own scores, including tie-breaking and padding.
+        for row in range(rows):
+            expected_ids = _expected_logits_ids(logits[row], block_topk, n_cols_padded)
+            expected_ids += [-1] * (block_topk - len(expected_ids))
+            assert sorted(indices[row].tolist()) == sorted(expected_ids)
 
 
 def test_qwen4_exp_qsa_grouped_scores_refresh_during_graph_replay(device: str) -> None:
@@ -1055,7 +1064,9 @@ def test_qwen4_exp_qsa_grouped_scores_refresh_during_graph_replay(device: str) -
         keys.normal_()
         complete.copy_(torch.tensor(frontiers, device=device, dtype=torch.int32))
         requests.copy_(torch.tensor([2, 0, 1], device=device).repeat_interleave(width))
-        expected = forward(None)
+        # Check replay refresh against the same layout; cross-layout score
+        # agreement is covered separately without requiring identical top-k.
+        expected = forward(width)
         graph.replay()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 

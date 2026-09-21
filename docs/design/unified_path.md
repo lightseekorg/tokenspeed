@@ -521,6 +521,14 @@ selection. Group size one and larger groups use the same scoring kernel, in
 both eager and captured forwards. Grouping must not be inferred from the total
 row count or page-table batch size for a ragged layout.
 
+Different query groups can produce slightly different FP32 scores because
+their dot/reduction layouts differ; cross-layout bitwise equality is not a
+contract. Tests check each layout against the FP32 reference with
+`rtol=1e-5, atol=1e-4`, and validate selection exactly against that layout's
+own scores and tie-breaking rule. Near-ties may select different block IDs
+across layouts. Graph replay is compared with eager execution of the same
+layout so metadata-refresh checks do not depend on cross-layout rounding.
+
 Qwen4-Exp attention callers pass `topk_indices` explicitly, using `None` for
 dense attention. Sparse QSA requires `save_kv_cache=True` because it always
 writes the full KV cache; the dense fallback honors the caller's flag.
