@@ -1019,13 +1019,76 @@ def _index_finish_parts(scores, ids, k, output, lengths):
     _finish_topk(values, ids.gather(1, positions), output, lengths)
 
 
-def _finish_topk(scores, ids, output, lengths):
-    valid = scores > -torch.inf
-    ids = ids.masked_fill(~valid, torch.iinfo(torch.int64).max).sort(dim=1).values
-    ids = ids.masked_fill(ids == torch.iinfo(torch.int64).max, -1)
-    output.fill_(-1)
-    output[:, : ids.shape[1]].copy_(ids)
-    lengths.copy_(valid.sum(dim=1))
+@triton.jit
+def _finish_topk_kernel(
+    Scores,
+    Ids,
+    Cands,
+    Out,
+    Lens,
+    S0,
+    I0,
+    C0,
+    C1,
+    O0,
+    WIDTH,
+    K,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_CANDIDATES: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    i = tl.arange(0, BLOCK)
+    taken = i < WIDTH
+    score = tl.load(Scores + row * S0 + i, taken, other=-float("inf"))
+    ident = tl.load(Ids + row * I0 + i, taken, other=0).to(tl.int64)
+    if HAS_CANDIDATES:
+        # Pool columns, not row ids: resolve each through its candidate block.
+        block = tl.load(
+            Cands + row * C0 + (ident // BLOCK_SIZE) * C1, taken, other=-1
+        ).to(tl.int64)
+        ident = block * BLOCK_SIZE + ident % BLOCK_SIZE
+    # A selector may return padding or masked entries; the score, not the id,
+    # says which ones count. Sentinels sort past every real id.
+    live = taken & (score > -float("inf"))
+    ident = tl.where(live, ident, 9223372036854775807)
+    ident = tl.sort(ident)
+    tl.store(
+        Out + row * O0 + i,
+        tl.where(ident == 9223372036854775807, -1, ident).to(tl.int32),
+        i < K,
+    )
+    tl.store(Lens + row, tl.sum(live.to(tl.int32), axis=0))
+
+
+def _finish_topk(scores, ids, output, lengths, candidates=None):
+    """Pack the selected ids into a sorted, -1 padded prefix and count them.
+
+    ``scores``/``ids`` are one selector's unsorted picks; entries scoring -inf
+    are padding. ``output`` is at least as wide as the picks, so one sorted
+    pass covers it. With ``candidates``, ``ids`` index the compacted candidate
+    pool and are resolved to row ids here rather than by the caller.
+    """
+    rows, width = scores.shape
+    if rows == 0:
+        return
+    _finish_topk_kernel[(rows,)](
+        scores,
+        ids,
+        candidates if candidates is not None else ids,
+        output,
+        lengths,
+        scores.stride(0),
+        ids.stride(0),
+        *(candidates.stride() if candidates is not None else (0, 0)),
+        output.stride(0),
+        width,
+        output.shape[1],
+        BLOCK_SIZE=8,
+        HAS_CANDIDATES=candidates is not None,
+        BLOCK=triton.next_power_of_2(max(1, output.shape[1])),
+        num_warps=8,
+    )
 
 
 def _index_topk_outputs(
@@ -1678,6 +1741,71 @@ def _pack_index_queries(X, V, S, X0, X1):
     tl.store(S + row, word.to(tl.int32))
 
 
+@triton.jit
+def _quantize_index_queries_kernel(
+    Q,
+    W,
+    QOut,
+    WOut,
+    Q0,
+    Q1,
+    Q2,
+    W0,
+    W1,
+    O0,
+    O1,
+    F0,
+    F1,
+    D: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+    d = tl.arange(0, D)
+    value = tl.load(Q + row * Q0 + head * Q1 + d * Q2).to(tl.float32)
+    # PyTorch divides a tensor by a Python scalar as a multiply by its
+    # reciprocal, so the reference scale is amax * (1 / 448), not amax / 448.
+    scale = tl.maximum(tl.max(tl.abs(value), axis=0), 1.0e-6) * (1.0 / 448.0)
+    quantized = tl.minimum(tl.maximum(tl.div_rn(value, scale), -448.0), 448.0)
+    tl.store(QOut + row * O0 + head * O1 + d, quantized.to(tl.float8e4nv))
+    weight = tl.load(W + row * W0 + head * W1).to(tl.float32)
+    tl.store(WOut + row * F0 + head * F1, weight * scale)
+
+
+def quantize_index_queries(index_q, weights):
+    """Quantize index queries to E4M3 and fold their scale into the weights.
+
+    Args:
+        index_q: BF16 [tokens, heads, 128] post-RoPE queries.
+        weights: [tokens, heads] per-head score weights.
+
+    Returns:
+        (E4M3 [tokens, heads, 128], FP32 [tokens, heads]) -- the scale rides in
+        the returned weights because DeepGEMM's FP8 logits kernels take no
+        query scale of their own. Quantization mirrors the ``index_v4`` cache
+        codec so queries and keys are quantized the same way.
+    """
+    tokens, heads, dim = index_q.shape
+    quantized = torch.empty(
+        (tokens, heads, dim), dtype=torch.float8_e4m3fn, device=index_q.device
+    )
+    folded = torch.empty((tokens, heads), dtype=torch.float32, device=index_q.device)
+    if tokens:
+        _quantize_index_queries_kernel[(tokens, heads)](
+            index_q,
+            weights,
+            quantized,
+            folded,
+            *index_q.stride(),
+            *weights.stride(),
+            *quantized.stride()[:2],
+            *folded.stride(),
+            D=dim,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    return quantized, folded
+
+
 def pack_index_queries(values):
     flat = values.reshape(-1, 128)
     data = torch.empty(
@@ -1875,6 +2003,62 @@ def dense_ranges(lengths, capacity):
             num_warps=4,
         )
     return starts, ends
+
+
+@triton.jit
+def _candidate_scores_kernel(
+    Logits,
+    Cands,
+    Out,
+    WIDTH,
+    COLUMNS,
+    L0,
+    L1,
+    C0,
+    C1,
+    O0,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    col = (tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
+    keep = col < COLUMNS
+    block = tl.load(Cands + token * C0 + (col // 8) * C1, keep, other=-1).to(tl.int64)
+    row = block * 8 + col % 8
+    live = keep & (block >= 0) & (row < WIDTH)
+    score = tl.load(Logits + token * L0 + row * L1, live, other=-float("inf"))
+    tl.store(Out + token * O0 + col, score, keep)
+
+
+def candidate_scores(logits, candidates):
+    """Gather each query's candidate-block scores into one compact row.
+
+    Args:
+        logits: FP32 [tokens, width] scores addressed by row id.
+        candidates: Int [tokens, blocks] request-local block ids, -1 padded.
+
+    Returns:
+        FP32 [tokens, blocks * 8] scores in candidate order. A null block or a
+        row past ``width`` scores -inf, so it loses to any live row. Column
+        ``c`` holds row ``candidates[:, c // 8] * 8 + c % 8``; the caller maps
+        winners back with that identity rather than materializing the ids.
+    """
+    tokens, width = logits.shape
+    columns = candidates.shape[1] * 8
+    out = torch.empty((tokens, columns), dtype=logits.dtype, device=logits.device)
+    if tokens and columns:
+        _candidate_scores_kernel[(tokens, triton.cdiv(columns, 512))](
+            logits,
+            candidates,
+            out,
+            width,
+            columns,
+            *logits.stride(),
+            *candidates.stride(),
+            out.stride(0),
+            BLOCK=512,
+            num_warps=4,
+        )
+    return out
 
 
 @triton.jit(
