@@ -1646,43 +1646,48 @@ def _qwen4_exp_qsa_score_blocks_kernel(
     query_offsets = tl.arange(0, QUERY_GROUP_SIZE)
     complete = tl.load(complete_blocks + row + query_offsets).to(tl.int64)
     max_complete = tl.max(complete, axis=0)
-    head_offsets = tl.arange(0, BLOCK_H * QUERY_GROUP_SIZE)
-    dim_offsets = tl.arange(0, BLOCK_D)
-    head_mask = head_offsets % BLOCK_H < num_heads
-    dim_mask = dim_offsets < head_dim
-    q = tl.load(
-        query
-        + (row + head_offsets[:, None] // BLOCK_H) * stride_q_n
-        + (head_offsets[:, None] % BLOCK_H) * stride_q_h
-        + dim_offsets[None, :] * stride_q_d,
-        mask=head_mask[:, None] & dim_mask[None, :],
-        other=0.0,
-    )
     block_ids = tile * BLOCK_N + tl.arange(0, BLOCK_N)
     tile_mask = block_ids < num_blocks
-    columns = block_ids // page_size
-    offsets = block_ids % page_size
-    pages = tl.load(
-        page_table + request * stride_pt_b + columns,
-        mask=tile_mask,
-        other=0,
-    ).to(tl.int64)
-    slots = pages * page_size + offsets
-    valid = tile_mask & (block_ids < max_complete)
-    keys = tl.load(
-        key_cache + slots[None, :] * stride_k_n + dim_offsets[:, None] * stride_k_d,
-        mask=valid[None, :] & dim_mask[:, None],
-        other=0.0,
-    )
-    scores = tl.dot(q, keys, out_dtype=tl.float32)
-    scores = tl.maximum(scores, 0.0)
-    scores = tl.sum(
-        tl.reshape(
-            tl.where(head_mask[:, None], scores, 0.0),
-            (QUERY_GROUP_SIZE, BLOCK_H, BLOCK_N),
-        ),
-        axis=1,
-    )
+    # A masked load alone still executes the dot on zero keys. Skip all
+    # producers and tensor-core work for tiles beyond every query frontier.
+    if tile * BLOCK_N < max_complete:
+        head_offsets = tl.arange(0, BLOCK_H * QUERY_GROUP_SIZE)
+        dim_offsets = tl.arange(0, BLOCK_D)
+        head_mask = head_offsets % BLOCK_H < num_heads
+        dim_mask = dim_offsets < head_dim
+        q = tl.load(
+            query
+            + (row + head_offsets[:, None] // BLOCK_H) * stride_q_n
+            + (head_offsets[:, None] % BLOCK_H) * stride_q_h
+            + dim_offsets[None, :] * stride_q_d,
+            mask=head_mask[:, None] & dim_mask[None, :],
+            other=0.0,
+        )
+        columns = block_ids // page_size
+        offsets = block_ids % page_size
+        pages = tl.load(
+            page_table + request * stride_pt_b + columns,
+            mask=tile_mask,
+            other=0,
+        ).to(tl.int64)
+        slots = pages * page_size + offsets
+        valid = tile_mask & (block_ids < max_complete)
+        keys = tl.load(
+            key_cache + slots[None, :] * stride_k_n + dim_offsets[:, None] * stride_k_d,
+            mask=valid[None, :] & dim_mask[:, None],
+            other=0.0,
+        )
+        scores = tl.dot(q, keys, out_dtype=tl.float32)
+        scores = tl.maximum(scores, 0.0)
+        scores = tl.sum(
+            tl.reshape(
+                tl.where(head_mask[:, None], scores, 0.0),
+                (QUERY_GROUP_SIZE, BLOCK_H, BLOCK_N),
+            ),
+            axis=1,
+        )
+    else:
+        scores = tl.full((QUERY_GROUP_SIZE, BLOCK_N), -float("inf"), tl.float32)
     # Invalid blocks become -inf so the downstream selection drops them.
     scores = tl.where(block_ids[None, :] < complete[:, None], scores, -float("inf"))
     tl.store(
@@ -1863,11 +1868,14 @@ def _qwen4_exp_qsa_block_topk_logits(
     use_pdl = _is_nvidia and enable_pdl
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
     block_h = triton.next_power_of_2(query.shape[1])
-    # Share each K tile across up to four consecutive queries of one request.
-    # A divisor of the uniform width cannot cross request boundaries; ragged
-    # layouts use the same kernel with one query per group. Cap the grouped
-    # head count at 16 to avoid inflating register pressure.
-    query_group_size = math.gcd(queries_per_request or 1, max(1, min(4, 16 // block_h)))
+    # Long uniform runs reuse K across 32 queries. With four index heads this
+    # exposes a 128-row dot to Blackwell tensor cores instead of padding a
+    # four-row dot to mma.sync's 16-row instruction. Small/ragged batches keep
+    # their latency-oriented grouping; every group stays within one request.
+    max_query_group = max(1, min(4, 16 // block_h))
+    if _is_nvidia and rows >= 1024 and block_h == 4 and query.shape[2] == 128:
+        max_query_group = 32
+    query_group_size = math.gcd(queries_per_request or 1, max_query_group)
     # The old 512-block tile used 129 KiB shared memory for 4x128 BF16 heads,
     # limiting a B300 SM to one CTA. 128 blocks leave room for concurrent CTAs.
     block_n = 128

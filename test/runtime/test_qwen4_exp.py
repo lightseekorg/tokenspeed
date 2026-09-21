@@ -895,8 +895,19 @@ def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
         result = indexer(torch.ones((rows, 4)), torch.arange(rows), ctx)
         assert result.shape == (rows, 1)
 
+    single_request_ctx = ForwardContext(
+        attn_backend=ordinary_backend,
+        token_to_kv_pool=pool,
+        bs=1,
+        num_extends=1,
+        input_num_tokens=8,
+        forward_mode=ForwardMode.EXTEND,
+    )
+    result = indexer(torch.ones((8, 4)), torch.arange(8), single_request_ctx)
+    assert result.shape == (8, 1)
+
     assert verify_calls == [(3, 2), (3, 2), (3, 1)]
-    assert selection_widths == [4, 1, 4, None, 1]
+    assert selection_widths == [4, 1, 4, None, 1, 8]
     assert writes[0]["stage_verify_buffers"] is verify_scratch
     assert writes[1]["stage_verify_buffers"] is None
     assert writes[1]["draft_scratch"] is draft_scratch

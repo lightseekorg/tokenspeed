@@ -189,6 +189,18 @@ preloads the all-gathered residual before its wait, so that collective must
 not trigger early. FlashInfer adapters preserve the upstream CuTe body and
 keep PDL compilation caches separate.
 
+QSA logits scoring uses the same paged kernel for every query layout. A batch
+whose request lengths are all available on the host may shorten its compressed
+block-table view to the maximum prefix-plus-query length, rounded to the cache
+group's logical block granularity. This changes neither the allocation nor the
+page mapping. Mixed batches with device-only decode lengths, and persistent
+decode views, retain the capacity bound; decode graph shapes stay fixed.
+Uniform query runs may share a K tile, but groups must never cross requests.
+A single-request forward is uniform regardless of its forward mode. Long runs
+use larger query groups; ragged layouts retain independent rows. A score tile
+beyond all of its queries' complete-block frontiers must write `-inf` without
+reading K or executing its dot, including padded graph requests.
+
 ### `for_graph_replay` is for graph-mechanics asymmetries only
 
 `for_graph_replay=True` means a graph is in play — live replay AND the base
@@ -537,7 +549,8 @@ and KV-recording override, while QSA keeps its original context and narrows
 the selected top-k rows with the queries.
 
 The QSA API preserves `decode_query_lengths`: uniform decode/verification
-uses a positive width, while prefill and mixed/ragged queries use `None`.
+uses a positive width, as does every single-request forward. Multi-request
+prefill and mixed/ragged queries use `None`.
 Only decode may select CuTe; NVIDIA prefill uses FlashInfer FA2, including
 single-token prefill. Adapting ragged rows to one-token queries must retain
 this distinction. Both use the same cache writer and sparse-attention call.

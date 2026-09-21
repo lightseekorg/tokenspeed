@@ -511,8 +511,10 @@ class QSAIndexer(nn.Module):
             compressed,
             full_page_size=layout.full_kernel_page_size,
             complete_blocks=complete_blocks,
-            queries_per_request=decode_query_lengths(
-                ctx, q.shape[0], force_uniform=False
+            queries_per_request=(
+                q.shape[0]
+                if ctx.bs == 1
+                else decode_query_lengths(ctx, q.shape[0], force_uniform=False)
             ),
         )
         if self.share_topk_for_mtp_iteration:
