@@ -45,6 +45,10 @@ def test_triton_bf16_moe_matches_torch(activation: str) -> None:
         routing_mode="precomputed_topk",
         ispp=32,
         solution="triton",
+        hidden=None,
+        swiglu_form=("standard" if activation == "swiglu" else None),
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     actual = tokenspeed_kernel.moe_apply(
         plan,

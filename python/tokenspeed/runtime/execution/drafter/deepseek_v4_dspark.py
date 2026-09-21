@@ -233,7 +233,11 @@ class DeepseekV4DSpark(BaseDrafter):
                 changed_slots.append(pool_slot)
 
         if changed_slots:
-            changed = torch.tensor(changed_slots, dtype=torch.int64, device=self.device)
+            # Pinned staging keeps the upload stream-ordered instead of waiting
+            # for the round in flight (a pageable copy would).
+            changed = torch.tensor(
+                changed_slots, dtype=torch.int64, pin_memory=self.device.type == "cuda"
+            ).to(self.device, non_blocking=True)
             self.kv_windows.index_fill_(0, changed, 0)
             self.context_lengths.index_fill_(0, changed, 0)
 

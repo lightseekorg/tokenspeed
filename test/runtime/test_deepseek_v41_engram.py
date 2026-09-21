@@ -268,6 +268,9 @@ def test_bounded_shard_loading_and_four_way_lookup(tmp_path, monkeypatch):
     def reduce_local(tensor, group, backend, op):
         assert group == (4, 5, 6, 7)  # not WORLD or the other attention DP replica
         assert backend is None and op == torch.distributed.ReduceOp.SUM
+        # One row per token: [rows, columns * head_dim] keeps a decode batch
+        # inside the workspace all-reduce's row window.
+        assert tensor.shape == (1, 10 * width)
         return tensor
 
     monkeypatch.setattr(engram, "all_reduce", reduce_local)
@@ -342,6 +345,17 @@ def _model(device, quant_config):
         device,
         False,
         "gpu",
+    )
+
+
+def test_engram_reduce_lane_is_one_row_per_token():
+    """The embedding reduces [tokens, n_hash_cols * head_dim] across attention
+    TP; the lane armed for it is that width (V4.1-Flash: 24 * 256 = 6144),
+    not head_dim with n_hash_cols folded into the rows, which would overflow
+    the one-shot row window on every decode batch."""
+    layout = engram.EngramLayout.from_config(_config())
+    assert engram.engram_reduce_lane_width(layout) == (
+        (layout.max_ngram_size - 1) * layout.n_heads * layout.head_dim
     )
 
 
