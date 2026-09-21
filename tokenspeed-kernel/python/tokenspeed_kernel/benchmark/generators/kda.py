@@ -454,6 +454,8 @@ def prepare_kda_paged_prefill(
             initial_state=initial_state,
             cu_seqlens=kernel_cu_seqlens,
             cu_seqlens_cpu=cu_seqlens_cpu,
+            capacity=None,
+            inputs_packed=False,
             lower_bound=lower_bound,
             override=request.registration,
             solution=request.solution,

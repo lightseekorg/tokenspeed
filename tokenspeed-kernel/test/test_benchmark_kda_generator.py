@@ -129,13 +129,21 @@ def test_kda_prefill_binds_chunk_hint_to_converted_boundaries(
 
     source_boundaries = torch.tensor([0, 64], dtype=torch.int64)
     host_boundaries = source_boundaries.clone()
-    seen: dict[str, torch.Tensor] = {}
+    seen: dict[str, object] = {}
 
     def record_hint(_batch, _tokens, boundaries, _chunk_sizes):
         seen["hint"] = boundaries
 
-    def record_operation(*_args, cu_seqlens, **_kwargs):
+    def record_operation(
+        *_args,
+        cu_seqlens,
+        capacity,
+        inputs_packed,
+        **_kwargs,
+    ):
         seen["operation"] = cu_seqlens
+        seen["capacity"] = capacity
+        seen["inputs_packed"] = inputs_packed
         return object()
 
     monkeypatch.setattr(kda_generator.torch, "randn", cpu_randn)
@@ -182,8 +190,12 @@ def test_kda_prefill_binds_chunk_hint_to_converted_boundaries(
     prepared.invocation.invoke()
 
     assert source_boundaries.dtype == torch.int64
-    assert seen["operation"].dtype == torch.int32
+    operation_boundaries = seen["operation"]
+    assert isinstance(operation_boundaries, torch.Tensor)
+    assert operation_boundaries.dtype == torch.int32
     assert seen["hint"] is seen["operation"]
+    assert seen["capacity"] is None
+    assert seen["inputs_packed"] is False
 
 
 def test_kda_generator_builds_flat_decay_bias() -> None:
