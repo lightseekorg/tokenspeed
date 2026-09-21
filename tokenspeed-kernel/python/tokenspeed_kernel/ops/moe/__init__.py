@@ -255,9 +255,7 @@ def moe_topk(
                 torch.empty(
                     (0, top_k), dtype=torch.float32, device=router_logits.device
                 ),
-                torch.empty(
-                    (0, top_k), dtype=torch.int32, device=router_logits.device
-                ),
+                torch.empty((0, top_k), dtype=torch.int32, device=router_logits.device),
             )
         topk_weights, topk_ids, _ = kernel(
             router_logits,

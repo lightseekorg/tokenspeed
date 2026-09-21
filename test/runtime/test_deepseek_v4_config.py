@@ -21,7 +21,6 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.ops.attention.dsv4 import dsv4_padded_heads
 from tokenspeed_kernel.ops.attention.dsv4.cuda import (
     has_indexer_topk_prefill,
@@ -30,6 +29,7 @@ from tokenspeed_kernel.ops.attention.dsv4.cuda import (
 from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_compute_global_topk_indices_and_lens,
 )
+from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda import (
     hash_softplus_sqrt_topk_flash,

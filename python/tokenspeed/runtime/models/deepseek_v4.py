@@ -38,8 +38,8 @@ from tokenspeed_kernel import (
     dsv4_grouped_output_projection,
     dsv4_grouped_output_projection_plan,
     dsv4_grouped_output_projection_warmup_model,
+    dsv4_linear_fp32,
 )
-from tokenspeed_kernel import dsv4_linear_fp32
 from tokenspeed_kernel import mhc_fused_hc as fast_mhc_fused_hc
 from tokenspeed_kernel import mhc_post as fast_mhc_post
 from tokenspeed_kernel import mhc_pre as fast_mhc_pre
@@ -1710,9 +1710,7 @@ class DeepseekV4MoE(nn.Module):
         else:
             self.shared_experts = None
 
-        if self.use_mega_moe and global_server_args_dict[
-            "moe_mxfp4_fp8_activation"
-        ]:
+        if self.use_mega_moe and global_server_args_dict["moe_mxfp4_fp8_activation"]:
             raise ValueError(
                 "--moe-mxfp4-fp8-activation selects the FlashInfer cutlass W4A8 "
                 "MoE; it does not apply to MegaMoE"
@@ -1737,9 +1735,7 @@ class DeepseekV4MoE(nn.Module):
             swiglu_limit=getattr(config, "swiglu_limit", None),
             with_bias=False,
             routing_mode=(
-                None
-                if get_moe_backend().is_flashinfer_trtllm()
-                else "precomputed_topk"
+                None if get_moe_backend().is_flashinfer_trtllm() else "precomputed_topk"
             ),
             routing_config={
                 "routed_scaling_factor": 1.0,
@@ -1748,9 +1744,7 @@ class DeepseekV4MoE(nn.Module):
                 "routing_method_type": RoutingMethodType.Renormalize,
             },
             persistent_max_num_tokens_per_gpu=(
-                _deepseek_v4_mega_moe_max_num_tokens()
-                if self.use_mega_moe
-                else None
+                _deepseek_v4_mega_moe_max_num_tokens() if self.use_mega_moe else None
             ),
         )
         self.topk = TopK(

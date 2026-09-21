@@ -50,9 +50,7 @@ class TestDeepseekV4MegaMoE(unittest.TestCase):
         experts.w13_weight.weight_loader(
             experts.w13_weight, w3, "w3", local_expert_id=1
         )
-        experts.w2_weight.weight_loader(
-            experts.w2_weight, w2, "w2", local_expert_id=1
-        )
+        experts.w2_weight.weight_loader(experts.w2_weight, w2, "w2", local_expert_id=1)
         experts.w13_weight_scale.weight_loader(
             experts.w13_weight_scale, s1, "w1", local_expert_id=1
         )

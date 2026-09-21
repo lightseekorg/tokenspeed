@@ -287,9 +287,7 @@ class MoELayer(torch.nn.Module):
             ]
         elif moe_backend == "mega_moe":
             mapping = global_server_args_dict["mapping"]
-            process_group = pg_manager.get_device_process_group(
-                mapping.moe.ep_group
-            )
+            process_group = pg_manager.get_device_process_group(mapping.moe.ep_group)
         self.plan = tokenspeed_kernel.moe_plan(
             self._quant_kind,
             input_dtype=input_dtype,

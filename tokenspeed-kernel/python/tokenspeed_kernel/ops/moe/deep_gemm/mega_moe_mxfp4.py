@@ -160,9 +160,7 @@ def deep_gemm_mxfp4_mega_moe_process_weights(
     intermediate_size = w.intermediate_size
     max_num_tokens = plan.get("persistent_max_num_tokens_per_gpu")
     if max_num_tokens is None or max_num_tokens <= 0:
-        raise ValueError(
-            "DeepGEMM MegaMoE requires persistent_max_num_tokens_per_gpu"
-        )
+        raise ValueError("DeepGEMM MegaMoE requires persistent_max_num_tokens_per_gpu")
     if w.top_k > w.num_experts:
         raise ValueError("top_k cannot exceed num_experts")
     tensors = (w13_weight, w13_weight_scale, w2_weight, w2_weight_scale)
@@ -435,9 +433,7 @@ if platform.is_blackwell:
             )
         expected_routing_shape = (x.shape[0], w.top_k)
         if topk_weights is None or tuple(topk_weights.shape) != expected_routing_shape:
-            raise ValueError(
-                f"topk_weights must have shape {expected_routing_shape}"
-            )
+            raise ValueError(f"topk_weights must have shape {expected_routing_shape}")
         if topk_ids is None or tuple(topk_ids.shape) != expected_routing_shape:
             raise ValueError(f"topk_ids must have shape {expected_routing_shape}")
         max_num_tokens = plan["persistent_max_num_tokens_per_gpu"]
@@ -474,9 +470,7 @@ if platform.is_blackwell:
             state.l1_weights,
             state.l2_weights,
             symm_buffer,
-            activation_clamp=(
-                None if w.swiglu_arg is None else w.swiglu_arg.limit
-            ),
+            activation_clamp=(None if w.swiglu_arg is None else w.swiglu_arg.limit),
             fast_math=plan["fast_math"],
         )
         return output
