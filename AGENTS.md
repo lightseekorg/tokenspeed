@@ -143,17 +143,6 @@ Inside the root `tokenspeed-kernel/` directory:
   under corresponding `ops/` directory.
 * Prefer to `@register_kernel` with the name as the Python `def` function
   attached to, prefixed with its solution (e.g, `triton_mha_prefill`).
-* For Gluon kernels, one name threads the whole stack: the
-  `register_kernel(name=...)` value, the registered Python `def` it decorates,
-  and the `@gluon.jit` (or `@triton.jit`) kernel in `tokenspeed-kernel-amd`
-  that does the op's work all share it, so Proton profiles, `override=`
-  strings and `describe_kernel` agree without a lookup table. The AMD Python
-  launcher never takes that name; call it `launch_<name>`. Extra kernels
-  launched only by that op insert a role before the arch suffix
-  (`gluon_mha_decode_reduce_gfx950`). Kernels shared by several registered ops
-  (routing, sorting, quantize, top-k, MoE stage pipelines) keep descriptive
-  names; list such registrations, with the shared family they ride on, in
-  `test/amd/test_gluon_kernel_naming.py`, which enforces the rest.
 * When defining new public APIs, explain arguments and returns in docstring.
 * Vendor-specific tests should be placed under `test/<vendor>/` subdirectory.
   Tests for common infra and covering multi-vendors reside under `test/`
@@ -169,3 +158,10 @@ Inside the root `tokenspeed-kernel-amd/` directory:
   common platform utilities and reference computations.
 * For per kernel contract and algorithm details, put in
   `python/tokenspeed_kernel_amd/ops/README.md`.
+* For Triton/Gluon kernels, one name should thread the whole stack: the
+  `register_kernel(name=...)` value, the registered Python `def` it decorates,
+  and the `@gluon.jit` (or `@triton.jit`) kernel that does the op's work all
+  share it. The AMD Python launcher should be called as `launch_<name>`.
+  Extra kernels launched only by that op insert a role before the arch suffix
+  (`gluon_mha_decode_reduce_gfx950`). Kernels shared by several registered ops
+  keep descriptive names.
