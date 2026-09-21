@@ -366,13 +366,6 @@ class MoELayer(torch.nn.Module):
         tokenspeed_kernel.moe_process_weights(self.plan, module)
         self._weights_processed = True
 
-    def warmup(self) -> None:
-        warmup = self.plan.get("warmup")
-        if warmup is not None:
-            if not self._weights_processed:
-                raise RuntimeError("MoE weights must be processed before warmup")
-            warmup(self.plan, self)
-
     @property
     def support_routing(self) -> bool:
         return self.plan["support_routing"]

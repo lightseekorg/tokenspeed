@@ -2131,7 +2131,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
 
     def post_quant_warmup(self) -> None:
         for module in self.modules():
-            if isinstance(module, MoELayer):
+            if isinstance(module, DeepseekV4MoE):
                 module.warmup()
 
     def get_input_embeddings(self) -> nn.Module:

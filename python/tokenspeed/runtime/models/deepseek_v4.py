@@ -1763,6 +1763,13 @@ class DeepseekV4MoE(nn.Module):
             selection_method=("hash" if self.gate.tid2eid is not None else "topk"),
         )
 
+    def warmup(self) -> None:
+        warmup = self.experts.plan.get("warmup")
+        if warmup is not None:
+            if not self.experts._weights_processed:
+                raise RuntimeError("MoE weights must be processed before warmup")
+            warmup(self.experts.plan, self.experts)
+
     def _routing_inputs(
         self,
         hidden_states: torch.Tensor,
@@ -3625,7 +3632,7 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         gc.collect()
         torch.cuda.empty_cache()
         for module in self.modules():
-            if isinstance(module, MoELayer):
+            if isinstance(module, DeepseekV4MoE):
                 module.warmup()
         config = self.config
         tp_size = self.mapping.attn.tp_size if self.mapping else 1
