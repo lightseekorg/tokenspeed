@@ -957,7 +957,6 @@ def build_device_side(
     executor.capture_graphs()
     # Tuning and capture draw from the generator; this is the state startup leaves.
     set_random_seed(48)
-    _arm_data_plane_sync_debug(server_args.device)
 
     # Per-rank GPU memory breakdown (weights by group, KV/graph/non-torch).
     if attn_tp_rank == 0:
@@ -1167,6 +1166,10 @@ def build_device_side(
             dtype=dtype,
         )
 
+    # Last: the L2 executor and the PD transfer built above still upload
+    # their own startup state through pageable copies, which the armed mode
+    # would (rightly, on a serving path) reject.
+    _arm_data_plane_sync_debug(server_args.device)
     return DeviceBuild(
         specs=specs,
         transfer=kv_transfer,

@@ -104,3 +104,26 @@ def test_flag_agrees_with_a_matching_model_override(monkeypatch):
 def test_without_the_flag_the_model_override_is_authoritative(monkeypatch):
     plan = _layer(monkeypatch, _mxfp4(), flag=False, override="input")
     assert plan["internal_activation_dtype"] == "input"
+
+
+@pytest.mark.parametrize(
+    "argv, message",
+    [
+        (["--moe-backend", "marlin"], "--moe-backend auto or flashinfer_cutlass"),
+        # The draft worker swaps draft_moe_backend in for moe_backend, so its
+        # MXFP4 experts would plan FP8 activations against a kernel set that
+        # has no W4A8 registration.
+        (
+            ["--draft-moe-backend", "triton"],
+            "--draft-moe-backend auto or flashinfer_cutlass",
+        ),
+    ],
+)
+def test_flag_rejects_backends_without_the_w4a8_kernel(argv, message):
+    from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+    with pytest.raises(ValueError, match=message):
+        prepare_server_args(["--model", "x", "--moe-mxfp4-fp8-activation", *argv])
+    prepare_server_args(
+        ["--model", "x", "--moe-mxfp4-fp8-activation", "--draft-moe-backend", "auto"]
+    )

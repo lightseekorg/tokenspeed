@@ -919,15 +919,19 @@ class ServerArgs:
             if not self.disable_pdl:
                 raise ValueError("NPU execution requires --disable-pdl")
 
-        if self.moe_mxfp4_fp8_activation and self.moe_backend not in (
-            "auto",
-            "flashinfer_cutlass",
-        ):
-            raise ValueError(
-                "--moe-mxfp4-fp8-activation is served by the FlashInfer cutlass "
-                f"MoE only; pass --moe-backend auto or flashinfer_cutlass, not "
-                f"{self.moe_backend!r}"
-            )
+        if self.moe_mxfp4_fp8_activation:
+            # The draft worker installs draft_moe_backend in place of
+            # moe_backend, and its MXFP4 experts plan with FP8 activations too.
+            for flag, backend in (
+                ("--moe-backend", self.moe_backend),
+                ("--draft-moe-backend", self.draft_moe_backend),
+            ):
+                if backend not in (None, "auto", "flashinfer_cutlass"):
+                    raise ValueError(
+                        "--moe-mxfp4-fp8-activation is served by the FlashInfer "
+                        f"cutlass MoE only; pass {flag!s} auto or flashinfer_cutlass, "
+                        f"not {backend!r}"
+                    )
 
         if (
             self.max_num_seqs is not None
