@@ -3482,6 +3482,7 @@ def _moe_apply_mxfp4_plan(
     hidden: int = 5120,
     ep_size: int = 8,
     swiglu_form: str | None = "standard",
+    activation_clamped: bool = True,
     expert_id_repeats: bool = False,
 ) -> dict:
     # DeepSeek-V4.1-Flash on one EP8 rank: SwiGLU experts, 5120-wide hidden,
@@ -3497,6 +3498,7 @@ def _moe_apply_mxfp4_plan(
         ispp=ispp,
         hidden=hidden,
         swiglu_form=swiglu_form if activation == "swiglu" else None,
+        activation_clamped=activation_clamped,
         expert_id_repeats=expert_id_repeats,
         internal_activation_dtype=internal_activation_dtype,
         solution=solution,
@@ -3610,6 +3612,30 @@ def _moe_apply_mxfp4_zero_experts_auto() -> object:
         preprocessor="marlin_mxfp4_moe_weights",
     )
     return _moe_apply_mxfp4_invoke(plan)
+
+
+def test_mxfp4_w4a8_needs_the_swiglu_clamp() -> None:
+    # Humming's fixed FC2 activation scale needs the SwiGLU clamp; an FP8
+    # activation request for an unclamped layer must fail closed at plan time
+    # rather than saturate FP8 at runtime.
+    if not _is_hopper(Platform.get()):
+        pytest.skip("Hopper registrations only")
+    with pytest.raises(tokenspeed_kernel.NoKernelFoundError):
+        _moe_apply_mxfp4_plan(
+            activation="swiglu",
+            ispp=2304,
+            internal_activation_dtype="fp8",
+            solution=None,
+            activation_clamped=False,
+        )
+    plan = _moe_apply_mxfp4_plan(
+        activation="swiglu",
+        ispp=2304,
+        internal_activation_dtype="fp8",
+        solution=None,
+        activation_clamped=True,
+    )
+    assert plan["apply_kernel_name"] == "flashinfer_cutlass_mxfp4_w4a8_moe_apply"
 
 
 def _moe_apply_mxfp4_situ_auto() -> object:
@@ -5670,15 +5696,23 @@ def test_cutlass_mxfp4_weights_interleave_and_attach(monkeypatch) -> None:
         module.flashinfer_cutlass_mxfp4_w4a8_moe_weights({}, weights)
 
     calls.clear()
+    # W4A8's fixed FC2 activation scale is only sound under the clamp: an
+    # unclamped layer is refused before any layout is touched.
     weights = _mxfp4_loader_weights(num_experts, hidden, ispp, seed=3)
     weights.swiglu_arg = SimpleNamespace(alpha=None, limit=None)
+    with pytest.raises(ValueError, match="SwiGLU clamp"):
+        module.flashinfer_cutlass_mxfp4_w4a8_moe_weights({}, weights)
+    assert not calls
+    weights = _mxfp4_loader_weights(num_experts, hidden, ispp, seed=3)
     module.flashinfer_cutlass_mxfp4_w4a8_moe_weights({}, weights)
     assert [c[0] for c in calls] == ["humming", "humming"]
     assert torch.equal(calls[0][1], up_gate_w13) and torch.equal(
         calls[0][2], up_gate_s13
     )
     assert torch.equal(calls[1][1], w2) and torch.equal(calls[1][2], s2)
-    assert weights.swiglu_limit_t is None
+    torch.testing.assert_close(
+        weights.swiglu_limit_t, torch.full((num_experts,), 10.0, dtype=torch.float32)
+    )
     # Humming residuals carry FlashInfer's fixed 2^6 exponent compensation.
     torch.testing.assert_close(
         weights.w13_weight_residual, torch.full((num_experts,), 32.0)

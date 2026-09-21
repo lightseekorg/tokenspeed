@@ -858,6 +858,7 @@ def test_autotune_covers_the_draft_experts_once_per_geometry(monkeypatch):
         layer.prefix = prefix
         layer.hidden_size, layer.intermediate_size = 64, 32
         layer.num_experts, layer.top_k = num_experts, 3
+        layer.input_dtype = torch.float16
         layer.plan = {
             "apply_kernel_name": "fake_apply",
             "a2a_backend": a2a,
@@ -879,6 +880,9 @@ def test_autotune_covers_the_draft_experts_once_per_geometry(monkeypatch):
 
     def fake_apply(plan, x, layer, router_logits, **kwargs):
         calls.append((layer.prefix, tuple(x.shape), kwargs["topk_ids"]))
+        # Synthetic activations must carry the dtype the plan was signed for
+        # (--dtype float16 drafts plan FP16 inputs, not BF16).
+        assert x.dtype == layer.input_dtype
         return x
 
     monkeypatch.setattr(model_executor.tokenspeed_kernel, "moe_apply", fake_apply)

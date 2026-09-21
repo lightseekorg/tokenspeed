@@ -702,7 +702,10 @@ class ModelExecutor:
                 continue
             tuned.add(key)
             hidden_states = torch.zeros(
-                num_tokens, layer.hidden_size, dtype=torch.bfloat16, device=self.device
+                num_tokens,
+                layer.hidden_size,
+                dtype=layer.input_dtype,
+                device=self.device,
             )
             # Distinct expert ids per token: kernels may reject repeats.
             scores = torch.rand(num_tokens, layer.num_experts, device=self.device)

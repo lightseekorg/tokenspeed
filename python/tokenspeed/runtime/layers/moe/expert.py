@@ -258,6 +258,9 @@ class MoELayer(torch.nn.Module):
         input_dtype = torch.get_default_dtype()
         if input_dtype not in {torch.float16, torch.bfloat16}:
             input_dtype = torch.float16
+        # The activation dtype the plan is signed for; callers that feed the
+        # layer synthetic inputs (kernel tuning) must match it.
+        self.input_dtype = input_dtype
 
         # Moe Backend plan
         moe_backend = get_moe_backend().value
@@ -292,6 +295,9 @@ class MoELayer(torch.nn.Module):
             ispp=self.intermediate_size // self.tp_size,
             hidden=hidden_size,
             swiglu_form=self._swiglu_form(),
+            activation_clamped=(
+                self.swiglu_arg is not None and self.swiglu_arg.limit is not None
+            ),
             expert_id_repeats=self.zero_expert_num > 0,
             fp8_scale_block_shape=fp8_scale_block_shape,
             internal_activation_dtype=internal_activation_dtype,

@@ -92,3 +92,17 @@ def test_zero_experts_declare_repeated_expert_ids(monkeypatch):
         monkeypatch, activation="swiglu", zero_expert_type="copy", zero_expert_num=2
     )
     assert longcat["expert_id_repeats"] is True
+
+
+@pytest.mark.parametrize(
+    "layer, clamped",
+    [
+        (dict(activation="swiglu", swiglu_limit=10.0), True),
+        (dict(activation="swiglu"), False),
+        (dict(activation="silu"), False),
+    ],
+)
+def test_activation_clamped_follows_the_swiglu_limit(monkeypatch, layer, clamped):
+    # The W4A8 kernel's fixed FC2 activation scale assumes a bounded SwiGLU
+    # output; the plan states whether the checkpoint provides that bound.
+    assert _plan_kwargs(monkeypatch, **layer)["activation_clamped"] is clamped

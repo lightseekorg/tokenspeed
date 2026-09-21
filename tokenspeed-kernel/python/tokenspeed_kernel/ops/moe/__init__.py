@@ -556,6 +556,7 @@ def _build_traits(
     ispp: int | None,
     hidden: int | None,
     swiglu_form: str | None,
+    activation_clamped: bool,
     expert_id_repeats: bool,
     fp8_scale_block_shape: tuple[int, int] | None,
     internal_activation_dtype: str | None,
@@ -589,6 +590,7 @@ def _build_traits(
         traits["hidden"] = int(hidden)
     if swiglu_form is not None:
         traits["swiglu_form"] = swiglu_form
+    traits["activation_clamped"] = activation_clamped
     if expert_id_repeats:
         traits["expert_id_repeats"] = True
     if fp8_scale_block_shape is not None:
@@ -610,6 +612,7 @@ def moe_plan(
     ispp: int | None = None,
     hidden: int | None = None,
     swiglu_form: str | None = None,
+    activation_clamped: bool = False,
     expert_id_repeats: bool = False,
     fp8_scale_block_shape: tuple[int, int] | None = None,
     internal_activation_dtype: str | None = None,
@@ -646,6 +649,11 @@ def moe_plan(
             an up-branch offset beta). Kernels whose epilogue implements only
             the standard form declare ``swiglu_form={"standard"}``. None leaves
             it unconstrained.
+        activation_clamped: True when the activation's output is bounded by
+            the checkpoint (a SwiGLU clamp limit). Kernels whose FP8
+            activation path relies on a fixed scale declare
+            ``activation_clamped={True}`` so unbounded layers never select
+            them.
         expert_id_repeats: True when the routing may hand a kernel the same
             expert id more than once for one token (zero-expert placeholders).
             Kernels whose permutation needs distinct ids per token declare
@@ -693,6 +701,7 @@ def moe_plan(
         ispp=ispp,
         hidden=hidden,
         swiglu_form=swiglu_form,
+        activation_clamped=activation_clamped,
         expert_id_repeats=expert_id_repeats,
         fp8_scale_block_shape=fp8_scale_block_shape,
         internal_activation_dtype=internal_activation_dtype,

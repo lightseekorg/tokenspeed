@@ -204,6 +204,13 @@ if platform.is_nvidia:
         is a fixed 1.0 because the SwiGLU clamp already bounds that input.
         """
         del plan
+        if _swiglu_limit(w) is None:
+            # Selection already requires activation_clamped; a forced solution
+            # must not get past it either (fc2_act_scale below assumes the bound).
+            raise ValueError(
+                "FlashInfer cutlass W4A8 needs the checkpoint's SwiGLU clamp to "
+                "bound the FC2 input; this layer's activation is unclamped"
+            )
         if not _begin_preprocess(w, _W4A8):
             return
         w13, w13_scale, w2, w2_scale = _loader_layout(w)
@@ -283,7 +290,7 @@ if platform.is_nvidia:
     )
 
     def _traits(internal_activation_dtype: str) -> dict:
-        return {
+        traits = {
             "weight_dtype": frozenset({"mxfp4"}),
             # The CUTLASS epilogue is gated SiLU (== SwiGLU); SiTU stays on marlin.
             "activation": frozenset({"silu", "swiglu"}),
@@ -304,6 +311,13 @@ if platform.is_nvidia:
             "internal_activation_dtype": frozenset({internal_activation_dtype}),
             "supports_bias": frozenset({False}),
         }
+        if internal_activation_dtype == "fp8":
+            # Humming feeds FC2 through a fixed activation scale of 1.0, which
+            # is sound only when the SwiGLU clamp bounds silu(gate) * up
+            # (10 * 10 for DeepSeek-V4.1); an unbounded activation would
+            # saturate the FP8 conversion, so unclamped layers never plan here.
+            traits["activation_clamped"] = frozenset({True})
+        return traits
 
     @register_kernel(
         "moe",
