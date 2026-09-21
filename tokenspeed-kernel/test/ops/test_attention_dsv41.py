@@ -633,6 +633,55 @@ def test_index_topk_selects_top_scores_on_every_index_format(device, fmt, shared
     assert relengths[3] == 0
 
 
+@pytest.mark.parametrize("fmt", ["index", "index_v4"])
+def test_reindex_maps_every_candidate_block_order_back_to_row_ids(device, fmt):
+    # A produced pool ascends, but the op accepts any block order with -1
+    # padding anywhere, and a scorer that compacts the history down to the pool
+    # must still report row ids rather than pool columns. Top-K capacity sits
+    # above the pool, so every visible candidate row comes back regardless of
+    # score, which pins the mapping itself on each format's scorer.
+    torch.manual_seed(46)
+    q = torch.randn((3, 32, 128), dtype=torch.bfloat16, device=device)
+    weights = torch.rand((3, 32), dtype=torch.bfloat16, device=device)
+    k = torch.randn((64 * 6, 128), dtype=torch.bfloat16, device=device)
+    cache = _index_cache(k, fmt)
+    table = torch.arange(cache.shape[0], device=device).expand(3, -1).contiguous()
+    visible = torch.tensor([263, 8, 0], device=device)
+    candidates = torch.tensor(
+        [[32, 0, -1, 17], [0, 1, -1, -1], [1, -1, -1, -1]],
+        dtype=torch.int32,
+        device=device,
+    )
+    top, lengths, blocks, block_lens = dsv41.index_topk(
+        q,
+        weights,
+        cache,
+        table,
+        visible,
+        candidates,
+        512,
+        0,
+        8,
+        64,
+        4096,
+        None,
+        None,
+        None,
+    )
+    torch.cuda.synchronize()
+    assert lengths.tolist() == [23, 8, 0]
+    assert blocks.shape == (3, 0) and not block_lens.any()
+    expected = torch.tensor(
+        list(range(8)) + list(range(136, 144)) + list(range(256, 263)), device=device
+    )
+    torch.testing.assert_close(top[0, :23].long(), expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        top[1, :8].long(), torch.arange(8, device=device), rtol=0, atol=0
+    )
+    assert (top[0, 23:] == -1).all() and (top[1, 8:] == -1).all()
+    assert (top[2] == -1).all()
+
+
 def test_candidate_block_max_not_sum(device):
     k = torch.zeros((17, 128), dtype=torch.bfloat16, device=device)
     k[0, 0] = 6

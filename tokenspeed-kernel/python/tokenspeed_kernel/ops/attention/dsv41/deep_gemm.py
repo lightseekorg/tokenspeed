@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
     _LAYOUTS,
     _finish_topk,
     _index_topk_outputs,
+    candidate_scores,
     clean_logits,
     dense_ranges,
     gather_index_cache,
@@ -443,26 +444,6 @@ def _hopper_paged_scores(queries, cache, weights, block_table, valid_lengths, ca
     )
 
 
-def _restrict_to_candidates(logits, candidates):
-    """Mask every row outside the candidate blocks, keeping the row addressing.
-
-    Null blocks are routed to a sentinel column instead of being scattered as
-    False: a scatter writes duplicate indices in an undefined order, so a null
-    block sharing columns with a live one could otherwise erase it.
-    """
-    tokens, width = logits.shape
-    blocks = candidates.to(torch.int64)
-    columns = (
-        blocks.clamp_min(0)[:, :, None] * 8
-        + torch.arange(8, device=logits.device, dtype=torch.int64)
-    ).reshape(tokens, -1)
-    live = (blocks >= 0)[:, :, None].expand(-1, -1, 8).reshape(tokens, -1)
-    columns = torch.where(live & (columns < width), columns, width)
-    allowed = torch.zeros((tokens, width + 1), dtype=torch.bool, device=logits.device)
-    allowed.scatter_(1, columns, True)
-    return logits.masked_fill(~allowed[:, :width], -float("inf"))
-
-
 def _block_maxima(logits, visible):
     """Reduce rows to their 8-row block maximum, pinning the newest block."""
     tokens, width = logits.shape
@@ -481,15 +462,24 @@ def _block_maxima(logits, visible):
     return blocks
 
 
-def _select(scores, k, graph_safe, destination, lengths):
+def _select(scores, k, graph_safe, destination, lengths, candidates=None):
     """Take the k best columns per row with FlashInfer's radix selector.
 
     ``tie_break`` matches the portable path's packed ordering, which breaks
     equal scores toward the smaller row id, and costs nothing. ``graph_safe``
     does cost: it is ~1.7x slower on prefill-sized rows, so only the captured
     decode path asks for it. V4.1 never captures a prefill graph.
+
+    ``candidates`` marks ``scores`` as candidate-compacted and maps the winning
+    columns back to row ids. Ties then break toward the smaller candidate
+    column, which is the smaller row id whenever the block ids ascend, as a
+    produced pool's do; the op guarantees no particular tie order regardless.
     """
     width = min(k, scores.shape[1])
+    if width == 0:
+        destination.fill_(-1)
+        lengths.zero_()
+        return
     values, indices = flashinfer.top_k(
         scores,
         width,
@@ -498,20 +488,19 @@ def _select(scores, k, graph_safe, destination, lengths):
         tie_break=flashinfer.TopKTieBreak.SMALL,
         dsa_graph_safe=graph_safe,
     )
-    _finish_topk(values, indices.to(torch.int64), destination, lengths)
+    # Null blocks resolve to negative ids; their -inf score drops them below.
+    _finish_topk(values, indices, destination, lengths, candidates)
 
 
 def _flashinfer_select(
     logits, visible, candidates, topk, candidate_topk, graph_safe, out
 ):
     rows, lengths, blocks, block_lengths = out
-    _select(
-        logits if candidates is None else _restrict_to_candidates(logits, candidates),
-        topk,
-        graph_safe,
-        rows,
-        lengths,
-    )
+    if candidates is None:
+        _select(logits, topk, graph_safe, rows, lengths)
+    else:
+        scores = candidate_scores(logits, candidates)
+        _select(scores, topk, graph_safe, rows, lengths, candidates)
     if candidate_topk:
         _select(
             _block_maxima(logits, visible),
@@ -520,6 +509,11 @@ def _flashinfer_select(
             blocks,
             block_lengths,
         )
+    else:
+        # Outputs may be uninitialized; a pass that sources no candidates still
+        # owes the caller the empty pool every other solution writes.
+        blocks.fill_(-1)
+        block_lengths.zero_()
 
 
 @register_kernel(
