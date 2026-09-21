@@ -101,6 +101,7 @@ def _block_step_kernel(
     base_ptr,
     base_row_stride,
     anchor_ptr,
+    anchor_stride,
     candidates_ptr,
     previous_out_ptr,
     out_row_stride,
@@ -141,9 +142,9 @@ def _block_step_kernel(
                 previous_out_ptr + row_offsets * out_row_stride, previous, mask=row_mask
             )
     else:
-        previous = tl.load(anchor_ptr + row_offsets, mask=row_mask, other=0).to(
-            tl.int32
-        )
+        previous = tl.load(
+            anchor_ptr + row_offsets * anchor_stride, mask=row_mask, other=0
+        ).to(tl.int32)
     # Graph padding rows carry arbitrary anchors; keep their gathers in bounds.
     previous = tl.minimum(tl.maximum(previous, 0), vocab_size - 1)
 
@@ -241,8 +242,9 @@ def dspark_block_greedy_step(
         base_logits: ``[rows, block, local_vocab]`` FP32 base logits of this
             rank's shard; column ``v`` is token ``vocab_start + v``.
         step: Block step in ``[0, block)`` being scored.
-        anchor_ids: ``[rows]`` int32/int64 tokens preceding step 0; read only
-            when ``step == 0``.
+        anchor_ids: ``[rows]`` int32/int64 tokens preceding step 0, in any
+            stride (the drafters pass a column of their token table); read
+            only when ``step == 0``.
         candidates: ``[tp, rows, n_tiles]`` int64 candidates gathered after
             the previous step; read only when ``step > 0``, and then disjoint
             from ``partials``.
@@ -317,6 +319,7 @@ def dspark_block_greedy_step(
         base_logits[:, step],
         base_logits.stride(0),
         anchor_ids,
+        anchor_ids.stride(0),
         candidates,
         previous_out,
         output.stride(0),

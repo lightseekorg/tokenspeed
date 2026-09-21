@@ -535,6 +535,104 @@ def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None
     assert b_format.scale.block_shape == (128, 128)
 
 
+@pytest.mark.parametrize(
+    "contract,online,expected_name",
+    [
+        ("ue8m0", False, "gluon_mm_mxfp8_ue8m0_gfx1250"),
+        ("ue8m0", True, "gluon_mm_mxfp8_ue8m0_gfx1250"),
+        ("fp32", False, "gluon_mm_fp8_blockscale_gfx1250"),
+        ("fp32", True, "gluon_mm_fp8_blockscale_gfx1250"),
+    ],
+)
+def test_public_mm_selects_gfx1250_decode_kernel(
+    contract: str,
+    online: bool,
+    expected_name: str,
+    mi450_platform: PlatformInfo,
+    monkeypatch,
+    selected_kernel_spy,
+) -> None:
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    expected_spec = registry.get_by_name(expected_name)
+    if expected_spec is None:
+        assert not host_platform.is_cdna5
+        pytest.skip(f"{expected_name!r} is not registered (optional backend missing)")
+    assert expected_spec.capability.satisfied_by(mi450_platform)
+
+    m, n, k = 1, 128, 256
+    a_dtype = torch.bfloat16 if online else _fp8_dtype()
+    a = torch.empty((m, k), dtype=a_dtype)
+    b = torch.empty((n, k), dtype=_fp8_dtype())
+    if contract == "ue8m0":
+        block_size = [1, 32]
+        scale_dtype = torch.uint8
+        a_scales = torch.empty((m, k // 32), dtype=scale_dtype)
+        b_scales = torch.empty((n, k // 32), dtype=scale_dtype)
+    else:
+        block_size = [128, 128]
+        scale_dtype = torch.float32
+        a_scales = torch.empty((m, k // 128), dtype=scale_dtype)
+        b_scales = torch.empty((n // 128, k // 128), dtype=scale_dtype)
+    if online:
+        a_scales = None
+
+        def fake_online_quantize_mxfp8(
+            activation: torch.Tensor,
+            selected_block_size: list[int],
+            kernel_name: str,
+            enable_pdl: bool,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            assert selected_block_size == block_size
+            assert kernel_name == expected_name
+            assert not enable_pdl
+            return (
+                torch.empty_like(activation, dtype=_fp8_dtype()),
+                torch.empty(
+                    (m, k // block_size[1]),
+                    dtype=scale_dtype,
+                    device=activation.device,
+                ),
+            )
+
+        monkeypatch.setattr(
+            _gemm_pkg,
+            "_online_quantize_mxfp8",
+            fake_online_quantize_mxfp8,
+        )
+
+    case = _case(
+        _is_cdna5,
+        "cdna5",
+        "gemm",
+        "mm",
+        expected_name,
+        lambda: None,
+        id_suffix=f"{contract}-{'online' if online else 'prequantized'}",
+    )
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = case
+    try:
+        Platform.override(mi450_platform)
+        monkeypatch.setattr(_gemm_pkg, "_platform", mi450_platform)
+        registry.clear_cache()
+        actual = tokenspeed_kernel.mm(
+            a,
+            b,
+            A_scales=a_scales,
+            B_scales=b_scales,
+            out_dtype=torch.bfloat16,
+            quant="mxfp8",
+            block_size=block_size,
+        )
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+
+    assert calls == [expected_name]
+    assert actual.shape == (m, n)
+
+
 def test_bmm_mxfp8_online_activation_signature_uses_quantized_storage() -> None:
     a = torch.empty((2, 4, 128), dtype=torch.bfloat16)
     b = torch.empty((2, 128, 128), dtype=_fp8_dtype())
