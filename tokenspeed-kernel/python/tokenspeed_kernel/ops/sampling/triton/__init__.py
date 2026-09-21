@@ -20,12 +20,13 @@
 
 """Triton sampling kernel entry points."""
 
-from .common import gather_and_expand_scalars
-from .dspark_block import (
+from tokenspeed_kernel.ops.sampling.triton.dspark_block import (
     dspark_block_candidate_tiles,
     dspark_block_greedy_resolve,
     dspark_block_greedy_step,
 )
+
+from .common import gather_and_expand_scalars
 from .generic import gumbel_sample_from_pools_generic
 from .gumbel import (
     gumbel_sample_from_pools,

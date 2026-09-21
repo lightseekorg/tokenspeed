@@ -26,7 +26,8 @@ request's valid cache, and, when the model keeps an n-gram history, the
 request's history tail becomes the last accepted input row's token followed
 by that row's own history. Recorded eagerly this is a cumsum, a handful of
 gathers and two scatters -- about twenty launches on the critical path
-between the forward and the results copy; this kernel does it in one program.
+between the forward and the results copy. On CUDA (and ROCm) devices one
+Triton launch does it; other devices run the same arithmetic as tensor ops.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ from tokenspeed_kernel._triton import tl, triton
 
 __all__ = ["advance_accepted_frontier"]
 
-_MAX_BATCH = 4096
+_BLOCK = 1024
 
 
 @triton.jit
@@ -58,7 +59,8 @@ def _advance_accepted_frontier_kernel(
     CONTEXT_PAD: tl.constexpr,
     HAS_TAIL: tl.constexpr,
 ):
-    rows = tl.arange(0, BLOCK)
+    first = tl.program_id(0) * BLOCK
+    rows = first + tl.arange(0, BLOCK)
     row_mask = rows < batch_size
     slots = tl.load(req_pool_indices_ptr + rows, mask=row_mask, other=padding_index)
     input_lengths = tl.load(input_lengths_ptr + rows, mask=row_mask, other=0).to(
@@ -72,9 +74,17 @@ def _advance_accepted_frontier_kernel(
     deltas = tl.where(live, deltas, 0)
 
     if HAS_TAIL:
+        # Row start = inputs of every earlier request: the full blocks before
+        # this one, then the exclusive scan inside it.
+        base = tl.zeros((), tl.int32)
+        for chunk in range(0, first, BLOCK):
+            base += tl.sum(
+                tl.load(input_lengths_ptr + chunk + tl.arange(0, BLOCK)).to(tl.int32),
+                axis=0,
+            )
+        starts = base + tl.cumsum(input_lengths, axis=0) - input_lengths
         # Accepted inputs end at row start + delta - 1, not at the sampled
         # bonus or the end of the proposed window.
-        starts = tl.cumsum(input_lengths, axis=0) - input_lengths
         last_rows = tl.minimum(
             tl.maximum(starts + deltas - 1, 0), max_num_tokens - 1
         ).to(tl.int64)
@@ -98,6 +108,39 @@ def _advance_accepted_frontier_kernel(
 
     valid = tl.load(valid_cache_lengths_ptr + slots, mask=live, other=0)
     tl.store(valid_cache_lengths_ptr + slots, valid + deltas, mask=live)
+
+
+def _advance_accepted_frontier_torch(
+    req_pool_indices: torch.Tensor,
+    input_lengths: torch.Tensor,
+    accept_lengths: torch.Tensor,
+    valid_cache_lengths: torch.Tensor,
+    num_extends: int,
+    padding_index: int,
+    ngram_tail: torch.Tensor | None,
+    ngram_previous_tokens: torch.Tensor | None,
+    ngram_token_mask: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+) -> None:
+    deltas = torch.cat([input_lengths[:num_extends], accept_lengths[num_extends:]])
+    deltas = torch.where(req_pool_indices != padding_index, deltas, 0).to(torch.int32)
+    if ngram_tail is not None:
+        assert ngram_previous_tokens is not None
+        assert ngram_token_mask is not None
+        assert input_ids is not None
+        last_rows = (input_lengths.cumsum(0) - input_lengths + deltas - 1).clamp(
+            0, input_ids.shape[0] - 1
+        )
+        current = torch.where(
+            ngram_token_mask[last_rows], input_ids[last_rows].to(torch.int64), -1
+        )
+        history = torch.cat(
+            [current[:, None], ngram_previous_tokens[last_rows, :-1]], dim=1
+        )
+        ngram_tail[req_pool_indices] = torch.where(
+            (deltas > 0)[:, None], history, ngram_tail[req_pool_indices]
+        )
+    valid_cache_lengths.index_add_(0, req_pool_indices, deltas)
 
 
 def advance_accepted_frontier(
@@ -139,7 +182,7 @@ def advance_accepted_frontier(
         None. ``valid_cache_lengths`` and ``ngram_tail`` are updated in place.
 
     Raises:
-        ValueError: A tensor is not the shape, dtype or layout the kernel
+        ValueError: A tensor is not the shape, dtype or layout the update
             indexes with.
     """
     batch_size = req_pool_indices.shape[0]
@@ -158,8 +201,6 @@ def advance_accepted_frontier(
         raise ValueError("valid_cache_lengths must be a 1D int32 tensor")
     if not 0 <= num_extends <= batch_size:
         raise ValueError(f"num_extends {num_extends} exceeds the batch of {batch_size}")
-    if batch_size > _MAX_BATCH:
-        raise ValueError(f"batch of {batch_size} exceeds {_MAX_BATCH} requests")
     tensors = [req_pool_indices, input_lengths, accept_lengths, valid_cache_lengths]
 
     given = [
@@ -198,12 +239,27 @@ def advance_accepted_frontier(
         tensors += [ngram_tail, ngram_previous_tokens, ngram_token_mask, input_ids]
     if not all(t.is_contiguous() for t in tensors):
         raise ValueError("advance_accepted_frontier needs contiguous tensors")
-    if not all(t.is_cuda for t in tensors):
-        raise ValueError("advance_accepted_frontier needs CUDA tensors")
+    if any(t.device != req_pool_indices.device for t in tensors):
+        raise ValueError("advance_accepted_frontier needs colocated tensors")
     if batch_size == 0:
         return
+    if not req_pool_indices.is_cuda:
+        _advance_accepted_frontier_torch(
+            req_pool_indices,
+            input_lengths,
+            accept_lengths,
+            valid_cache_lengths,
+            num_extends,
+            padding_index,
+            ngram_tail,
+            ngram_previous_tokens,
+            ngram_token_mask,
+            input_ids,
+        )
+        return
 
-    _advance_accepted_frontier_kernel[(1,)](
+    block = min(_BLOCK, triton.next_power_of_2(batch_size))
+    _advance_accepted_frontier_kernel[(triton.cdiv(batch_size, block),)](
         req_pool_indices,
         input_lengths,
         accept_lengths,
@@ -216,7 +272,7 @@ def advance_accepted_frontier(
         num_extends,
         padding_index,
         max_num_tokens,
-        BLOCK=triton.next_power_of_2(batch_size),
+        BLOCK=block,
         CONTEXT=context,
         CONTEXT_PAD=max(2, triton.next_power_of_2(context)),
         HAS_TAIL=has_tail,

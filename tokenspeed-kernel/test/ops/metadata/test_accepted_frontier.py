@@ -73,10 +73,18 @@ def _batch(batch, num_extends, pool, tokens, context, padding_rows, seed):
 
 @pytest.mark.parametrize(
     ("batch", "num_extends", "padding_rows", "context"),
-    ((7, 3, 0, 3), (16, 0, 5, 3), (4, 4, 0, 1), (33, 1, 2, 4), (1, 0, 0, 3)),
+    (
+        (7, 3, 0, 3),
+        (16, 0, 5, 3),
+        (4, 4, 0, 1),
+        (33, 1, 2, 4),
+        (1, 0, 0, 3),
+        # Several programs: the row starts must carry across blocks.
+        (5000, 1700, 9, 3),
+    ),
 )
 def test_fused_advance_matches_eager_chain(batch, num_extends, padding_rows, context):
-    pool, tokens = 64, 256
+    pool, tokens = max(64, batch + 1), max(256, batch * 6)
     slots, inputs, accepts, valid, tail, previous, mask, ids = _batch(
         batch, num_extends, pool, tokens, context, padding_rows, seed=batch
     )
@@ -156,6 +164,54 @@ def test_fused_advance_without_ngram_history_only_moves_cache_lengths():
             inputs,
             accepts,
             valid.long(),
+            2,
+            pool - 1,
+            ngram_tail=None,
+            ngram_previous_tokens=None,
+            ngram_token_mask=None,
+            input_ids=None,
+        )
+
+
+def test_advance_runs_on_cpu_tensors_as_tensor_ops():
+    """Devices without the kernel (NPU, CPU tests) take the tensor path."""
+    pool = 16
+    args = _batch(6, 2, pool, 64, 3, 1, seed=5)
+    cpu = [t.cpu() for t in args]
+    slots, inputs, accepts, valid, tail, previous, mask, ids = args
+    advance_accepted_frontier(
+        slots,
+        inputs,
+        accepts,
+        valid,
+        2,
+        pool - 1,
+        ngram_tail=tail,
+        ngram_previous_tokens=previous,
+        ngram_token_mask=mask,
+        input_ids=ids,
+    )
+    advance_accepted_frontier(
+        cpu[0],
+        cpu[1],
+        cpu[2],
+        cpu[3],
+        2,
+        pool - 1,
+        ngram_tail=cpu[4],
+        ngram_previous_tokens=cpu[5],
+        ngram_token_mask=cpu[6],
+        input_ids=cpu[7],
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(valid.cpu(), cpu[3])
+    assert torch.equal(tail.cpu(), cpu[4])
+    with pytest.raises(ValueError, match="colocated"):
+        advance_accepted_frontier(
+            cpu[0],
+            inputs,
+            accepts,
+            valid,
             2,
             pool - 1,
             ngram_tail=None,

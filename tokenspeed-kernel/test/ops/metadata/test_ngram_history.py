@@ -113,10 +113,26 @@ def _batch(batch, context, pool, capacity, vocab, seed):
 
 @pytest.mark.parametrize(
     ("batch", "context", "capacity"),
-    ((1, 3, 32), (7, 3, 64), (16, 3, 128), (5, 1, 40), (33, 4, 300), (0, 3, 16)),
+    (
+        (1, 3, 32),
+        (7, 3, 64),
+        (16, 3, 128),
+        (5, 1, 40),
+        (33, 4, 300),
+        (0, 3, 16),
+        # More requests than one seed block or request chunk holds.
+        (3000, 3, 20000),
+    ),
 )
 def test_fused_history_matches_eager_chain(batch, context, capacity):
-    args = _batch(batch, context, pool=64, capacity=capacity, vocab=100, seed=batch)
+    args = _batch(
+        batch,
+        context,
+        pool=max(64, batch + 8),
+        capacity=capacity,
+        vocab=100,
+        seed=batch,
+    )
     (
         tokens,
         positions,
@@ -237,3 +253,19 @@ def test_fused_history_rejects_misshapen_inputs():
             33,
             vocab,
         )
+
+
+def test_fused_history_runs_on_cpu_tensors_as_tensor_ops():
+    """Devices without the kernels (CPU tests, NPU) take the tensor path."""
+    args = _batch(9, 3, pool=32, capacity=96, vocab=60, seed=8)
+    cpu = [t.cpu() if isinstance(t, torch.Tensor) else t for t in args]
+    fill_ngram_history(*args)
+    fill_ngram_history(*cpu)
+    torch.cuda.synchronize()
+    for gpu_tensor, cpu_tensor in zip(args[7:11], cpu[7:11]):
+        assert torch.equal(gpu_tensor.cpu(), cpu_tensor)
+    # The frontier check raises where the kernel would trip a device assertion.
+    cpu[1][0] = 10_000
+    cpu[2][0] = 1
+    with pytest.raises(RuntimeError, match="does not cover"):
+        fill_ngram_history(*cpu)

@@ -33,6 +33,8 @@ The seed kernel settles every request's prefix into the tail; the history
 kernel then reads the tails and the packed input ids to write the per-row
 history and validity mask, and blanks the rows past the batch so graph
 padding rows see no history. Recorded eagerly this was about fifty launches.
+On CUDA (and ROCm) devices the two Triton launches run; other devices run the
+same arithmetic as tensor ops.
 """
 
 from __future__ import annotations
@@ -42,7 +44,8 @@ from tokenspeed_kernel._triton import tl, triton
 
 __all__ = ["fill_ngram_history"]
 
-_MAX_BATCH = 4096
+_SEED_BLOCK = 1024
+_REQUEST_CHUNK = 256
 
 
 @triton.jit
@@ -59,7 +62,7 @@ def _ngram_seed_kernel(
     BLOCK: tl.constexpr,
     CONTEXT: tl.constexpr,
 ):
-    rows = tl.arange(0, BLOCK)
+    rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     row_mask = rows < batch_size
     slots = tl.load(slots_ptr + rows, mask=row_mask, other=0)
     seed = (tl.load(reset_ptr + rows, mask=row_mask, other=0) != 0) | (
@@ -102,22 +105,29 @@ def _ngram_history_kernel(
     capacity,
     vocab_size,
     BLOCK_T: tl.constexpr,
-    BLOCK_BS: tl.constexpr,
+    CHUNK: tl.constexpr,
     CONTEXT: tl.constexpr,
 ):
     rows = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
     in_buffer = rows < capacity
     live = rows < total_tokens
-    requests = tl.arange(0, BLOCK_BS)
-    lengths = tl.load(
-        input_lengths_ptr + requests, mask=requests < batch_size, other=0
-    ).to(tl.int64)
-    ends = tl.cumsum(lengths, axis=0)
     # A request lies entirely before row j when its end is <= j; counting
-    # them is the row's request index and summing them is its start row.
-    before = ends[None, :] <= rows[:, None]
-    request = tl.sum(before.to(tl.int32), axis=1)
-    start = tl.sum(tl.where(before, lengths[None, :], 0), axis=1)
+    # them is the row's request index and summing their lengths is its start
+    # row. Requests are scanned a chunk at a time so any batch size fits.
+    request = tl.zeros((BLOCK_T,), tl.int32)
+    start = tl.zeros((BLOCK_T,), tl.int64)
+    base = tl.zeros((), tl.int64)
+    for chunk in range(0, batch_size, CHUNK):
+        requests = chunk + tl.arange(0, CHUNK)
+        request_mask = requests < batch_size
+        lengths = tl.load(input_lengths_ptr + requests, mask=request_mask, other=0).to(
+            tl.int64
+        )
+        ends = base + tl.cumsum(lengths, axis=0)
+        before = (ends[None, :] <= rows[:, None]) & request_mask[None, :]
+        request += tl.sum(before.to(tl.int32), axis=1)
+        start += tl.sum(tl.where(before, lengths[None, :], 0), axis=1)
+        base += tl.sum(lengths, axis=0)
     local = rows - start
     request_ok = live & (request < batch_size)
     slots = tl.load(slots_ptr + request, mask=request_ok, other=0)
@@ -143,6 +153,58 @@ def _ngram_history_kernel(
         )
     valid = live & (ids >= 0) & (ids < vocab_size)
     tl.store(mask_ptr + rows, valid.to(tl.int8), mask=in_buffer)
+
+
+def _fill_ngram_history_torch(
+    tokens: torch.Tensor,
+    positions: torch.Tensor,
+    reset: torch.Tensor,
+    slots: torch.Tensor,
+    input_lengths: torch.Tensor,
+    input_ids: torch.Tensor,
+    valid_cache_lengths: torch.Tensor,
+    tail: torch.Tensor,
+    needs_seed: torch.Tensor,
+    previous_tokens: torch.Tensor,
+    token_mask: torch.Tensor,
+    total_tokens: int,
+    vocab_size: int,
+) -> None:
+    context = tail.shape[1]
+    device = tail.device
+    previous_tokens[total_tokens:].fill_(-1)
+    token_mask[total_tokens:].zero_()
+    if slots.numel():
+        seed = (reset != 0) | needs_seed[slots]
+        delta = valid_cache_lengths[slots].to(torch.int64) - positions
+        if not bool((~seed | ((delta >= 0) & (delta <= 1))).all()):
+            raise RuntimeError(
+                "Engram seed snapshot does not cover the accepted input frontier"
+            )
+        distances = torch.arange(1, context + 1, device=device)
+        columns = (distances - delta[:, None]).clamp(0, context)
+        prefix = torch.where(seed[:, None], tokens.gather(1, columns), tail[slots])
+        prefix.masked_fill_((prefix < 0) | (prefix >= vocab_size), -1)
+        tail[slots] = prefix
+        needs_seed[slots] = False
+    if total_tokens == 0:
+        return
+    lengths = input_lengths.to(torch.int64)
+    ends = lengths.cumsum(0)
+    rows = torch.arange(total_tokens, device=device)
+    requests = torch.searchsorted(ends, rows, right=True)
+    local_rows = rows - (ends - lengths)[requests]
+    distances = torch.arange(1, context + 1, device=device)
+    columns = (distances - local_rows[:, None] - 1).clamp(0, context - 1)
+    ids = input_ids[:total_tokens].to(torch.int64)
+    previous = torch.where(
+        local_rows[:, None] >= distances,
+        ids[(rows[:, None] - distances).clamp_min(0)],
+        tail[slots[requests]].gather(1, columns),
+    )
+    previous.masked_fill_((previous < 0) | (previous >= vocab_size), -1)
+    previous_tokens[:total_tokens].copy_(previous)
+    token_mask[:total_tokens].copy_((ids >= 0) & (ids < vocab_size))
 
 
 def fill_ngram_history(
@@ -190,7 +252,8 @@ def fill_ngram_history(
     Returns:
         None. ``tail``, ``needs_seed``, ``previous_tokens`` and ``token_mask``
         are written in place. A seeded request whose accepted frontier is not
-        within one token of its snapshot position trips a device assertion.
+        within one token of its snapshot position trips a device assertion
+        (a ``RuntimeError`` on devices without the kernels).
 
     Raises:
         ValueError: A tensor is not the shape, dtype or layout the kernels
@@ -231,8 +294,6 @@ def fill_ngram_history(
         raise ValueError(f"token_mask must be [{capacity}] bool")
     if not 0 <= total_tokens <= capacity:
         raise ValueError(f"total_tokens {total_tokens} exceeds capacity {capacity}")
-    if batch_size > _MAX_BATCH:
-        raise ValueError(f"batch of {batch_size} exceeds {_MAX_BATCH} requests")
     tensors = (
         tokens,
         positions,
@@ -248,11 +309,29 @@ def fill_ngram_history(
     )
     if not all(t.is_contiguous() for t in tensors):
         raise ValueError("fill_ngram_history needs contiguous tensors")
-    if not all(t.is_cuda for t in tensors):
-        raise ValueError("fill_ngram_history needs CUDA tensors")
+    if any(t.device != tail.device for t in tensors):
+        raise ValueError("fill_ngram_history needs colocated tensors")
+    if not tail.is_cuda:
+        _fill_ngram_history_torch(
+            tokens,
+            positions,
+            reset,
+            slots,
+            input_lengths,
+            input_ids,
+            valid_cache_lengths,
+            tail,
+            needs_seed,
+            previous_tokens,
+            token_mask,
+            total_tokens,
+            vocab_size,
+        )
+        return
 
     if batch_size:
-        _ngram_seed_kernel[(1,)](
+        block = min(_SEED_BLOCK, triton.next_power_of_2(batch_size))
+        _ngram_seed_kernel[(triton.cdiv(batch_size, block),)](
             tokens,
             positions,
             reset,
@@ -262,17 +341,14 @@ def fill_ngram_history(
             needs_seed.view(torch.int8),
             batch_size,
             vocab_size,
-            BLOCK=triton.next_power_of_2(batch_size),
+            BLOCK=block,
             CONTEXT=context,
             num_warps=4,
             debug=True,
         )
     if capacity == 0:
         return
-    # The row-to-request search is a [BLOCK_T, BLOCK_BS] compare; keep it
-    # register-sized for wide batches.
-    block_bs = triton.next_power_of_2(max(batch_size, 1))
-    block_t = max(16, min(256, 65536 // block_bs))
+    block_t = 256
     _ngram_history_kernel[(triton.cdiv(capacity, block_t),)](
         input_ids,
         input_lengths,
@@ -285,7 +361,7 @@ def fill_ngram_history(
         capacity,
         vocab_size,
         BLOCK_T=block_t,
-        BLOCK_BS=block_bs,
+        CHUNK=min(_REQUEST_CHUNK, triton.next_power_of_2(max(batch_size, 1))),
         CONTEXT=context,
         num_warps=4,
     )

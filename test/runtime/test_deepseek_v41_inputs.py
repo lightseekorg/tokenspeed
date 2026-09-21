@@ -121,95 +121,9 @@ def buffers(request, monkeypatch):
             )
             seq_lens_out_ptr.copy_(starts + uniform_input_length)
 
-        def advance_accepted_frontier(
-            req_pool_indices,
-            input_lengths,
-            accept_lengths,
-            valid_cache_lengths,
-            num_extends,
-            padding_index,
-            *,
-            ngram_tail,
-            ngram_previous_tokens,
-            ngram_token_mask,
-            input_ids,
-        ):
-            deltas = torch.cat(
-                [input_lengths[:num_extends], accept_lengths[num_extends:]]
-            ).to(torch.int32)
-            deltas = torch.where(req_pool_indices != padding_index, deltas, 0)
-            if ngram_tail is not None:
-                last = (input_lengths.cumsum(0) - input_lengths + deltas - 1).clamp(
-                    0, input_ids.shape[0] - 1
-                )
-                current = torch.where(ngram_token_mask[last], input_ids[last], -1)
-                history = torch.cat(
-                    [current[:, None], ngram_previous_tokens[last, :-1]], dim=1
-                )
-                ngram_tail[req_pool_indices] = torch.where(
-                    (deltas > 0)[:, None], history, ngram_tail[req_pool_indices]
-                )
-            valid_cache_lengths.index_add_(0, req_pool_indices, deltas)
-
-        def fill_ngram_history(
-            tokens,
-            positions,
-            reset,
-            slots,
-            input_lengths,
-            input_ids,
-            valid_cache_lengths,
-            tail,
-            needs_seed,
-            previous_tokens,
-            token_mask,
-            total_tokens,
-            vocab_size,
-        ):
-            context_len = tail.shape[1]
-            previous_tokens[total_tokens:].fill_(-1)
-            token_mask[total_tokens:].zero_()
-            if slots.numel():
-                seed = (reset != 0) | needs_seed[slots]
-                delta = valid_cache_lengths[slots] - positions
-                if not bool((~seed | ((delta >= 0) & (delta <= 1))).all()):
-                    raise RuntimeError(
-                        "Engram seed snapshot does not cover the accepted input frontier"
-                    )
-                distances = torch.arange(1, context_len + 1)
-                columns = (distances - delta[:, None]).clamp(0, context_len)
-                prefix = torch.where(
-                    seed[:, None], tokens.gather(1, columns), tail[slots]
-                )
-                prefix.masked_fill_((prefix < 0) | (prefix >= vocab_size), -1)
-                tail[slots] = prefix
-                needs_seed[slots] = False
-            if total_tokens == 0:
-                return
-            lengths = input_lengths.long()
-            ends = lengths.cumsum(0)
-            rows = torch.arange(total_tokens)
-            requests = torch.searchsorted(ends, rows, right=True)
-            local_rows = rows - (ends - lengths)[requests]
-            distances = torch.arange(1, context_len + 1)
-            columns = (distances - local_rows[:, None] - 1).clamp(0, context_len - 1)
-            ids = input_ids[:total_tokens].long()
-            previous = torch.where(
-                local_rows[:, None] >= distances,
-                ids[(rows[:, None] - distances).clamp_min(0)],
-                tail[slots[requests]].gather(1, columns),
-            )
-            previous.masked_fill_((previous < 0) | (previous >= vocab_size), -1)
-            previous_tokens[:total_tokens].copy_(previous)
-            token_mask[:total_tokens].copy_((ids >= 0) & (ids < vocab_size))
-
         monkeypatch.setattr(InputBuffers, "_bulk_pinned", bulk)
         monkeypatch.setattr(input_buffer, "compute_position_triton", positions)
         monkeypatch.setattr(input_buffer, "fused_decode_input_prep", decode_positions)
-        monkeypatch.setattr(input_buffer, "fill_ngram_history", fill_ngram_history)
-        monkeypatch.setattr(
-            model_executor, "advance_accepted_frontier", advance_accepted_frontier
-        )
         tensor = torch.tensor
 
         def unpinned_tensor(*args, **kwargs):
