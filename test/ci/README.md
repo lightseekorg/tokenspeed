@@ -35,6 +35,10 @@ runs unit tests, then kernel benchmarks, then model tests. Matrix entries within
 each stage run in parallel. A stage with no matching tasks is treated as
 successfully satisfied.
 
+Each NVIDIA x86 model task has a 120-minute job limit, including installation,
+server startup, evaluation, and artifact upload. This applies to both normal
+and high-priority model stages so long OCR generations can finish after startup.
+
 PRs labeled `high priority` start `unit-test` and `model-test` concurrently.
 Applying the label starts a new CI run immediately and cancels the older run
 through the workflow's concurrency policy. A unit-test failure does not cancel
