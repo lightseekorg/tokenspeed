@@ -20,8 +20,8 @@
 
 """Golden selection tests for top-level tokenspeed-kernel public APIs.
 
-Each case invokes a real public API (``mm``, ``moe_plan``/``moe_apply``,
-attention, sampling) with :class:`SelectedKernel` calls intercepted by a spy,
+Each case invokes a real API or an internal registry facade used by a public
+API with :class:`SelectedKernel` calls intercepted by a spy,
 and asserts the auto-selected kernel name.  Cases run on every host: the
 platform each case targets is injected via ``Platform.override`` with the
 fixture platforms from ``conftest.py``, so an NVIDIA CI machine also checks
@@ -88,15 +88,16 @@ import tokenspeed_kernel.ops.moe.cuda as _moe_cuda
 import tokenspeed_kernel.ops.moe.deep_gemm as _moe_deep_gemm
 import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
 import tokenspeed_kernel.ops.moe.gluon as _moe_gluon
-import tokenspeed_kernel.ops.moe.gluon.dsv4 as _moe_gluon_dsv4
+import tokenspeed_kernel.ops.moe.gluon.sqrt_softplus_topk as _moe_gluon_sqrt_softplus
 import tokenspeed_kernel.ops.moe.gluon.fp8 as _moe_gluon_fp8
 import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk as _moe_gluon_sigmoid_topk
 import tokenspeed_kernel.ops.moe.latent_decode as _moe_latent_decode
 import tokenspeed_kernel.ops.moe.marlin as _moe_marlin
+import tokenspeed_kernel.ops.moe.native as _moe_native
 import tokenspeed_kernel.ops.moe.sigmoid_topk as _moe_sigmoid_topk
 import tokenspeed_kernel.ops.moe.softmax_topk as _moe_softmax_topk
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
-import tokenspeed_kernel.ops.moe.triton.dsv4 as _moe_triton_dsv4
+import tokenspeed_kernel.ops.moe.triton.sqrt_softplus_topk as _moe_triton_sqrt_softplus
 import tokenspeed_kernel.ops.moe.triton.softmax_topk as _moe_triton_softmax_topk
 import tokenspeed_kernel.ops.quantization as _quantization_pkg
 import tokenspeed_kernel.ops.quantization.flashinfer as _quantization_flashinfer
@@ -221,7 +222,7 @@ _RELOAD_MODULES = [
     _moe_trtllm_nvfp4,
     _moe_trtllm_unquant,
     _moe_flashinfer,
-    _moe_gluon_dsv4,
+    _moe_gluon_sqrt_softplus,
     _moe_gluon_fp8,
     _moe_gluon_mxfp4,
     _moe_sigmoid_topk,
@@ -231,9 +232,10 @@ _RELOAD_MODULES = [
     _moe_marlin_deepep_mxfp4,
     _moe_marlin_mxfp4,
     _moe_marlin,
+    _moe_native,
     _moe_triton_bf16,
     _moe_triton_decode_sigmoid_topk,
-    _moe_triton_dsv4,
+    _moe_triton_sqrt_softplus,
     _moe_triton_mxfp4,
     _moe_triton_softmax_topk,
     _moe_triton,
@@ -3551,11 +3553,11 @@ def _moe_apply_unquant_trtllm() -> object:
     )
 
 
-def _dsv4_select_experts_bias(tokens: int) -> object:
+def _moe_select_experts_bias(tokens: int) -> object:
     """Exercise bias-router selection across specialized and portable batches."""
     router_logits = torch.empty((tokens, 256), dtype=torch.float32)
     correction_bias = torch.empty((256,), dtype=torch.float32)
-    return tokenspeed_kernel.dsv4_select_experts(
+    return _moe_pkg._select_experts(
         router_logits,
         6,
         True,
@@ -3568,11 +3570,11 @@ def _dsv4_select_experts_bias(tokens: int) -> object:
     )
 
 
-def _dsv4_select_experts_hash() -> object:
+def _moe_select_experts_hash() -> object:
     router_logits = torch.empty((2, 384), dtype=torch.bfloat16)
     hash_indices_table = torch.zeros((8, 6), dtype=torch.int32)
     input_ids = torch.zeros((2,), dtype=torch.int64)
-    return tokenspeed_kernel.dsv4_select_experts(
+    return _moe_pkg._select_experts(
         router_logits,
         6,
         True,
@@ -5292,9 +5294,9 @@ _CASES = [
             _is_cdna5,
             "cdna5",
             "moe",
-            "dsv4_select_experts",
-            "triton_dsv4_select_experts",
-            partial(_dsv4_select_experts_bias, tokens=tokens),
+            "select_experts",
+            "triton_sqrt_softplus_select_experts",
+            partial(_moe_select_experts_bias, tokens=tokens),
             id_suffix=f"bias-tokens{tokens}",
         )
         for tokens in (1, 2, 17)
@@ -5303,27 +5305,27 @@ _CASES = [
         _is_cdna5,
         "cdna5",
         "moe",
-        "dsv4_select_experts",
-        "triton_dsv4_select_experts",
-        _dsv4_select_experts_hash,
+        "select_experts",
+        "triton_sqrt_softplus_select_experts",
+        _moe_select_experts_hash,
         id_suffix="hash",
     ),
     _case(
         _is_hopper_plus,
         "hopper-plus",
         "moe",
-        "dsv4_select_experts",
-        "cuda_dsv4_select_experts",
-        partial(_dsv4_select_experts_bias, tokens=2),
+        "select_experts",
+        "cuda_sqrt_softplus_select_experts",
+        partial(_moe_select_experts_bias, tokens=2),
         id_suffix="bias",
     ),
     _case(
         _is_hopper_plus,
         "hopper-plus",
         "moe",
-        "dsv4_select_experts",
-        "cuda_dsv4_select_experts",
-        _dsv4_select_experts_hash,
+        "select_experts",
+        "cuda_sqrt_softplus_select_experts",
+        _moe_select_experts_hash,
         id_suffix="hash",
     ),
     *[
@@ -5331,15 +5333,15 @@ _CASES = [
             _is_cdna4,
             "cdna4",
             "moe",
-            "dsv4_select_experts",
+            "select_experts",
             expected,
-            partial(_dsv4_select_experts_bias, tokens=tokens),
+            partial(_moe_select_experts_bias, tokens=tokens),
             id_suffix=f"bias-tokens{tokens}",
         )
         for tokens, expected in (
-            (1, "gluon_dsv4_select_experts_gfx950"),
-            (2, "gluon_dsv4_select_experts_gfx950"),
-            (17, "triton_dsv4_select_experts"),
+            (1, "gluon_sqrt_softplus_select_experts_gfx950"),
+            (2, "gluon_sqrt_softplus_select_experts_gfx950"),
+            (17, "triton_sqrt_softplus_select_experts"),
         )
     ],
     _case(
@@ -5646,7 +5648,7 @@ def selected_kernel_spy(monkeypatch):
             )
 
         if case.family == "moe":
-            if case.mode == "dsv4_select_experts":
+            if case.mode == "select_experts":
                 router_logits, top_k = args[:2]
                 shape = (router_logits.shape[0], top_k)
                 return (

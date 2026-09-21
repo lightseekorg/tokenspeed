@@ -107,18 +107,21 @@ def _select_experts_kernel(
 
 @register_kernel(
     "moe",
-    "dsv4_select_experts",
-    name="triton_dsv4_select_experts",
+    "select_experts",
+    name="triton_sqrt_softplus_select_experts",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     signatures=frozenset(
         format_signature(router_logits=dense_tensor_format(dtype))
         for dtype in (torch.float16, torch.bfloat16, torch.float32)
     ),
-    traits={"routing_kind": frozenset({"plain", "bias", "hash"})},
+    traits={
+        "routing_kind": frozenset({"plain", "bias", "hash"}),
+        "score_function": frozenset({"sqrt_softplus"}),
+    },
     priority=Priority.PORTABLE,
 )
-def triton_dsv4_select_experts(
+def triton_sqrt_softplus_select_experts(
     router_logits: torch.Tensor,
     top_k: int,
     renormalize: bool,
@@ -127,7 +130,7 @@ def triton_dsv4_select_experts(
     input_ids: torch.Tensor | None,
     need_scores: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Select experts using the public dsv4_select_experts contract.
+    """Select experts using the sqrt-softplus routing contract.
 
     Args:
         router_logits: Floating-point logits shaped [tokens, experts].

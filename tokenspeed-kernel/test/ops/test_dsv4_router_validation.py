@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe import dsv4_select_experts
+from tokenspeed_kernel.ops.moe import _select_experts
 
 
 @pytest.mark.parametrize("invalid", [-1, 4])
@@ -32,7 +32,7 @@ def test_default_hash_router_rejects_invalid_table_values(invalid: int) -> None:
     input_ids = torch.zeros((1,), dtype=torch.int64)
 
     with pytest.raises(ValueError, match=r"entries must be in \[0, 4\)"):
-        dsv4_select_experts(
+        _select_experts(
             logits,
             top_k=2,
             renormalize=True,
