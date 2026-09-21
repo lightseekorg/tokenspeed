@@ -56,6 +56,44 @@ def test_fp8_tp_lookup_masks_remote_rows() -> None:
     assert torch.count_nonzero(output[2:].float()) == 0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused gather requires CUDA")
+@pytest.mark.parametrize("tp_rank", [0, 1])
+def test_bf16_tp_lookup_matches_masked_reference(tp_rank: int) -> None:
+    """The one-kernel shard gather equals mask-then-lookup on every rank."""
+    embedding = VocabParallelEmbedding(
+        num_embeddings=130,
+        embedding_dim=8,
+        params_dtype=torch.bfloat16,
+        tp_rank=tp_rank,
+        tp_size=2,
+        tp_group=(0, 1),
+        padding_size=64,
+    ).cuda()
+    embedding.weight.data.copy_(
+        torch.randn(embedding.weight.shape, device="cuda").to(torch.bfloat16)
+    )
+    token_ids = torch.tensor([0, 63, 64, 65, 127, 128, 129, 191, 192], device="cuda")
+    assert embedding._fused_shard_gather(token_ids)
+
+    output = embedding(token_ids, reduce_results=False)
+
+    shard = embedding.shard_indices
+    masked, mask = get_masked_input_and_mask(
+        token_ids,
+        shard.org_vocab_start_index,
+        shard.org_vocab_end_index,
+        shard.num_org_vocab_padding,
+        shard.added_vocab_start_index,
+        shard.added_vocab_end_index,
+    )
+    expected = torch.nn.functional.embedding(masked, embedding.weight)
+    expected.masked_fill_(mask.unsqueeze(-1), 0)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    assert (
+        torch.count_nonzero(expected) > 0 and torch.count_nonzero(~mask) < mask.numel()
+    )
+
+
 def test_masked_input_stays_inside_local_vocab_shard():
     input_ids = torch.tensor(
         [-1, 0, 75967, 75968, 151644, 151935, 151936, torch.iinfo(torch.int32).max]

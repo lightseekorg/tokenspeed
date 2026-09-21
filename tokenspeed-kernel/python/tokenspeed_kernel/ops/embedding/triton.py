@@ -1265,6 +1265,75 @@ def _mxfp8_embedding_kernel(
     tl.store(O + row * D + d, value, d < D)
 
 
+@triton.jit(
+    do_not_specialize=[
+        "ORG_START",
+        "ORG_END",
+        "ADDED_START",
+        "ADDED_END",
+        "ADDED_OFFSET",
+    ]
+)
+def _vocab_shard_embedding_kernel(
+    W,
+    I,
+    O,
+    WS,
+    ORG_START,
+    ORG_END,
+    ADDED_START,
+    ADDED_END,
+    ADDED_OFFSET,
+    D: tl.constexpr,
+    B: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    d = tl.arange(0, B)
+    index = tl.load(I + row).to(tl.int64)
+    original = (index >= ORG_START) & (index < ORG_END)
+    added = (index >= ADDED_START) & (index < ADDED_END)
+    local = tl.where(original, index - ORG_START, index - ADDED_OFFSET)
+    value = tl.load(W + local * WS + d, (original | added) & (d < D), 0.0)
+    tl.store(O + row * D + d, value, d < D)
+
+
+@register_kernel(
+    "embedding",
+    "vocab_shard_embedding",
+    name="triton_vocab_shard_embedding",
+    solution="triton",
+    signatures=[
+        format_signature(weight=dense_tensor_format(dtype))
+        for dtype in (torch.bfloat16, torch.float16, torch.float32)
+    ],
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    priority=Priority.PORTABLE,
+)
+def vocab_shard_embedding(weight, indices, org_range, num_org_padding, added_range):
+    """Gather this shard's rows for global IDs and zero every other row."""
+    out = torch.empty(
+        (*indices.shape, weight.shape[1]), dtype=weight.dtype, device=indices.device
+    )
+    org_start, org_end = org_range
+    added_start, added_end = added_range
+    if indices.numel():
+        _vocab_shard_embedding_kernel[(indices.numel(),)](
+            weight,
+            indices,
+            out,
+            weight.stride(0),
+            org_start,
+            org_end,
+            added_start,
+            added_end,
+            added_start - (org_end - org_start) - num_org_padding,
+            weight.shape[1],
+            triton.next_power_of_2(weight.shape[1]),
+            num_warps=4,
+        )
+    return out
+
+
 @register_kernel(
     "embedding",
     "mxfp8_embedding",

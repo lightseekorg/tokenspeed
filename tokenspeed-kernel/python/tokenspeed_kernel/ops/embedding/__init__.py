@@ -486,6 +486,7 @@ __all__ = [
     "apply_rope_mla",
     "apply_rope_mla_set_kv",
     "supports_fused_mla_kv_write",
+    "vocab_shard_embedding",
 ]
 
 
@@ -617,3 +618,60 @@ def mxfp8_embedding(weight, scales, indices, row_start, row_end):
         solution=None,
     )
     return kernel(weight, scales, indices, row_start, row_end)
+
+
+def vocab_shard_embedding(
+    weight: torch.Tensor,
+    indices: torch.Tensor,
+    org_range: tuple[int, int],
+    num_org_padding: int,
+    added_range: tuple[int, int],
+) -> torch.Tensor:
+    """Gather one vocabulary shard's embeddings, zeroing IDs of other shards.
+
+    The shard holds its original-vocabulary rows ``org_range`` (global
+    ``[start, end)``), ``num_org_padding`` padding rows, then its added
+    (LoRA) rows ``added_range``. IDs outside both ranges produce zero rows,
+    so summing every shard's output over the model-parallel group yields the
+    full embedding; the caller owns that collective.
+
+    Args:
+        weight: Floating ``[local_capacity, D]`` shard with contiguous columns.
+        indices: Contiguous integer IDs of any shape, on the shard's GPU.
+        org_range: Global ``(start, end)`` of the shard's original rows.
+        num_org_padding: Padding rows between the original and added rows.
+        added_range: Global ``(start, end)`` of the shard's added rows.
+
+    Returns:
+        ``[*indices.shape, D]`` embeddings in the weight's dtype.
+    """
+    org_start, org_end = org_range
+    added_start, added_end = added_range
+    if weight.ndim != 2 or weight.stride(1) != 1 or not weight.is_floating_point():
+        raise ValueError(
+            "vocabulary shard weight must be floating [rows, D] with contiguous columns"
+        )
+    if not (0 <= org_start <= org_end and 0 <= added_start <= added_end):
+        raise ValueError("vocabulary shard ranges must be ordered and non-negative")
+    if (org_end - org_start) + num_org_padding + (
+        added_end - added_start
+    ) > weight.shape[0]:
+        raise ValueError("vocabulary shard ranges exceed the weight's rows")
+    if (
+        not indices.is_cuda
+        or indices.dtype not in (torch.int32, torch.int64)
+        or not indices.is_contiguous()
+        or weight.device != indices.device
+    ):
+        raise ValueError(
+            "vocabulary shard gather requires colocated GPU tensors and contiguous IDs"
+        )
+    kernel = select_kernel(
+        "embedding",
+        "vocab_shard_embedding",
+        format_signature(weight=dense_tensor_format(weight.dtype)),
+        traits=None,
+        override=None,
+        solution=None,
+    )
+    return kernel(weight, indices, org_range, num_org_padding, added_range)
