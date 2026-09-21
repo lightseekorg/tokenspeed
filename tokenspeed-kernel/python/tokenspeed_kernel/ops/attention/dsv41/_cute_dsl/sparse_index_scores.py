@@ -275,8 +275,16 @@ class SparseIndexScoreKernel:
                 # Issued before the bulk copies so the eight scale loads sit
                 # under their latency rather than after it.
                 lane_scales = cute.make_rmem_tensor(BLOCK_ROWS, Float32)
+                # The scale plane spans the whole cache field, which is tens of
+                # gigabytes in a real deployment: its element count passes 2^32
+                # and a 32-bit offset would wrap. Advance the pointer in 64-bit
+                # and index within the page.
+                page_scales = cute.make_tensor(
+                    gK_scales.iterator + Int64(lane_page) * Int64(gK_scales.stride[0]),
+                    cute.make_layout(PAGE_ROWS),
+                )
                 for r in cutlass.range_constexpr(BLOCK_ROWS):
-                    lane_scales[r] = gK_scales[lane_page, lane_row0 + r]
+                    lane_scales[r] = page_scales[lane_row0 + r]
 
                 mbar = tma_full_mbar + stage
                 cute.arch.mbarrier_wait(tma_empty_mbar + stage, parity)

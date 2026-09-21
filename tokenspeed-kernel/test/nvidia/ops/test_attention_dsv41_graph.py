@@ -271,3 +271,77 @@ def test_sparse_reindex_selects_what_the_dense_score_selects(blocks, pages):
     strided, strided_lengths = select()[:2]
     torch.testing.assert_close(strided_lengths, dense_lengths, rtol=0, atol=0)
     torch.testing.assert_close(strided, dense, rtol=0, atol=0)
+
+
+def test_sparse_index_scores_address_a_cache_whose_scale_plane_passes_four_gigaelements():
+    """Pages far into a deployment-sized cache field score like the dense path.
+
+    The FP32 scale plane spans the whole field, so its element count passes
+    2**32 once the field is 16 GiB -- an ordinary size here, where a served
+    cache runs to tens of gigabytes. A 32-bit offset wraps there and every
+    page past the boundary reads another page's scales, which leaves the
+    masks intact and the values wrong, so only a case this large catches it.
+    """
+    from tokenspeed_kernel.ops.attention.dsv41 import cute_dsl, deep_gemm
+    from tokenspeed_kernel.ops.attention.dsv41.triton import (
+        candidate_scores,
+        quantize_index_queries,
+    )
+
+    if not deep_gemm.is_hopper_indexer_available():
+        pytest.skip("requires the Hopper FP8 indexer")
+    device = torch.device("cuda:0")
+    # 132-byte rows give a 2112-element scale page, so the plane passes 2**32
+    # at 2_033_899 pages; the field that implies is 17.2 GiB.
+    pages, pitch = 2_100_000, 8448
+    free, _ = torch.cuda.mem_get_info(device)
+    if free < pages * pitch + (4 << 30):
+        pytest.skip("needs about 22 GiB free to build a cache this large")
+    assert pages * (pitch // 4) > 2**32
+    torch.manual_seed(61)
+    field = torch.zeros((pages, pitch), dtype=torch.uint8, device=device)
+    tokens, heads, table_width, blocks = 4, 32, 16, 16
+    # Only the pages the table reaches are written; filling the whole field
+    # would cost another copy of it.
+    low = pages - 1000
+    rows = torch.arange(low * 64, pages * 64, device=device)
+    view = field.view(pages, 64, 132)
+    dsv41.cache_scatter(
+        torch.randn((rows.numel(), 128), dtype=torch.bfloat16, device=device),
+        view,
+        rows,
+        "index_v4",
+    )
+    q = torch.randn((tokens, heads, 128), dtype=torch.bfloat16, device=device)
+    weights = torch.rand((tokens, heads), dtype=torch.float32, device=device)
+    table = torch.randint(
+        low, pages, (tokens, table_width), device=device, dtype=torch.int32
+    )
+    capacity = table_width * 64
+    visible = torch.full((tokens,), capacity, device=device, dtype=torch.int32)
+    candidates = torch.randint(
+        0, capacity // 8, (tokens, blocks), device=device, dtype=torch.int32
+    )
+    queries, folded = quantize_index_queries(q, weights)
+    expected = candidate_scores(
+        deep_gemm._hopper_paged_scores(
+            (queries,), view, folded, table, visible, capacity
+        ),
+        candidates,
+    )
+    values, scales = deep_gemm._index_planes(view)
+    actual = cute_dsl.sparse_index_scores(
+        queries,
+        folded,
+        values.view(torch.float8_e4m3fn),
+        scales,
+        table,
+        visible,
+        candidates,
+        False,
+    )
+    finite = torch.isfinite(expected) & torch.isfinite(actual)
+    assert bool(finite.any())
+    assert (actual[finite] - expected[finite]).abs().max() <= 1e-3 * expected[
+        finite
+    ].abs().max()
