@@ -30,8 +30,8 @@ Engram tables load local FP8/E8M0 rows in bounded chunks without table conversio
 The unquantized LM head follows the model loading dtype, including its logits.
 Packed routed experts use the V4 MoE loader, with zero-padded intermediate lanes
 for MegaMoE's TMA alignment (2304 -> 2560); shared experts are not padded.
-The generic model loader still owns
-dense/MoELayer postprocessing, while post_load_weights finalizes MegaMoE.
+The generic model loader owns dense and MoELayer postprocessing, including
+MegaMoE weight preparation.
 
 Call initialize_engram(tokenizer) once after construction, then pass caller-owned
 ``engram_previous_tokens`` [T,3] and bool ``engram_token_mask`` [T] as forward
@@ -112,6 +112,7 @@ from tokenspeed.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
 from tokenspeed.runtime.layers.moe.utils import get_moe_backend
@@ -127,7 +128,6 @@ from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import BaseCausalLM
 from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4ForCausalLM,
-    DeepseekV4MegaMoEExperts,
     DeepseekV4MLP,
     DeepseekV4MoE,
 )
@@ -2128,14 +2128,13 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             torch.distributed.barrier()
 
     def post_load_weights(self) -> None:
-        """Finalize packed MegaMoE weights; generic hooks own all other modules."""
         for module in self.modules():
-            if isinstance(module, DeepseekV4MegaMoEExperts):
-                module.finalize_weights()
+            if isinstance(module, MoELayer):
+                module.process_weights_after_loading(module)
 
     def post_quant_warmup(self) -> None:
         for module in self.modules():
-            if isinstance(module, DeepseekV4MegaMoEExperts):
+            if isinstance(module, MoELayer):
                 module.warmup()
 
     def get_input_embeddings(self) -> nn.Module:

@@ -21,6 +21,7 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.moe import _select_experts
 from tokenspeed_kernel.ops.attention.dsv4 import dsv4_padded_heads
 from tokenspeed_kernel.ops.attention.dsv4.cuda import (
     has_indexer_topk_prefill,
@@ -140,7 +141,6 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     _deepseek_v4_routed_expert_quant_config,
     _DeepseekV4TopKBuffer,
     deepseek_v4_rope_config,
-    dsv4_select_experts,
     hc_head,
     mhc_post,
     mhc_pre,
@@ -6568,11 +6568,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         bias = torch.tensor([0.0, -0.4, 0.6, 0.0], dtype=torch.float32)
 
-        topk_weights, topk_ids, scores = dsv4_select_experts(
+        topk_weights, topk_ids, scores = _select_experts(
             logits,
             top_k=2,
             renormalize=True,
             correction_bias=bias,
+            solution="torch",
         )
 
         expected_scores = F.softplus(logits).sqrt()
@@ -6603,12 +6604,13 @@ class TestDeepseekV4Config(unittest.TestCase):
             dtype=torch.int32,
         )
 
-        topk_weights, topk_ids, _ = dsv4_select_experts(
+        topk_weights, topk_ids, _ = _select_experts(
             logits,
             top_k=2,
             renormalize=True,
             hash_indices_table=table,
             input_ids=input_ids,
+            solution="torch",
         )
 
         expected_ids = torch.tensor([[3, 1], [2, 3]], dtype=torch.int32)
@@ -6695,7 +6697,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         ).repeat(2, 1)
         bias = torch.linspace(0.25, -0.25, 256, device="cuda", dtype=torch.float32)
 
-        topk_weights, topk_ids, scores = dsv4_select_experts(
+        topk_weights, topk_ids, scores = _select_experts(
             logits,
             top_k=6,
             renormalize=True,

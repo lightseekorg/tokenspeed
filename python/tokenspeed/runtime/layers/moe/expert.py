@@ -25,6 +25,7 @@ from dataclasses import replace
 
 import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.moe import _select_experts
 from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
     TRTLLM_NVFP4_ISPP_ALIGNMENT,
 )
@@ -80,6 +81,8 @@ class MoELayer(torch.nn.Module):
         routing_config: dict = {},
         routing_mode: str | None = None,
         internal_activation_dtype_override: str | None = None,
+        persistent_max_num_tokens_per_gpu: int | None = None,
+        process_group: object | None = None,
     ):
         super().__init__()
         self.layer_index = layer_index
@@ -264,13 +267,15 @@ class MoELayer(torch.nn.Module):
 
         # Moe Backend plan
         moe_backend = get_moe_backend().value
+        if moe_backend == "deep_gemm_mega_moe":
+            moe_backend = "mega_moe"
         moe_backend = None if moe_backend == "auto" else moe_backend
-        process_group = None
+        plan_process_group = None
         deepep_mode = None
         deepep_low_latency_max_num_tokens_per_gpu = None
         if self._spec.use_deepep:
             mapping = global_server_args_dict["mapping"]
-            process_group = pg_manager.get_process_group(
+            plan_process_group = pg_manager.get_process_group(
                 "nccl",
                 mapping.moe.tp_ep_group,
             )
@@ -282,8 +287,13 @@ class MoELayer(torch.nn.Module):
                 "low_latency_max_num_tokens_per_gpu"
             ]
         elif moe_backend == "mega_moe":
-            mapping = global_server_args_dict["mapping"]
-            process_group = pg_manager.get_device_process_group(mapping.moe.ep_group)
+            if process_group is not None:
+                plan_process_group = process_group
+            else:
+                mapping = global_server_args_dict["mapping"]
+                plan_process_group = pg_manager.get_device_process_group(
+                    mapping.moe.ep_group
+                )
         self.plan = tokenspeed_kernel.moe_plan(
             self._quant_kind,
             input_dtype=input_dtype,
@@ -302,11 +312,12 @@ class MoELayer(torch.nn.Module):
             fp8_scale_block_shape=fp8_scale_block_shape,
             internal_activation_dtype=internal_activation_dtype,
             with_bias=with_bias,
-            process_group=process_group,
+            process_group=plan_process_group,
             deepep_mode=deepep_mode,
             deepep_low_latency_max_num_tokens_per_gpu=(
                 deepep_low_latency_max_num_tokens_per_gpu
             ),
+            persistent_max_num_tokens_per_gpu=persistent_max_num_tokens_per_gpu,
             solution=moe_backend,
         )
 
@@ -359,6 +370,34 @@ class MoELayer(torch.nn.Module):
 
         tokenspeed_kernel.moe_process_weights(self.plan, module)
         self._weights_processed = True
+
+    def warmup(self) -> None:
+        warmup = self.plan.get("warmup")
+        if warmup is not None:
+            if not self._weights_processed:
+                raise RuntimeError("MoE weights must be processed before warmup")
+            warmup(self.plan, self)
+
+    def select_experts(
+        self,
+        router_logits: torch.Tensor,
+        renormalize: bool,
+        correction_bias: torch.Tensor | None = None,
+        hash_indices_table: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
+        need_scores: bool = True,
+        score_function: str = "sqrt_softplus",
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return _select_experts(
+            router_logits,
+            self.top_k,
+            renormalize,
+            correction_bias,
+            hash_indices_table,
+            input_ids,
+            need_scores,
+            score_function,
+        )
 
     @property
     def support_routing(self) -> bool:
