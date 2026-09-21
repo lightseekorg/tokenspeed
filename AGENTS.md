@@ -165,4 +165,5 @@ Inside the root `tokenspeed-kernel-amd/` directory:
   share it. The AMD Python launcher should be called as `launch_<name>`.
   Extra kernels launched only by that op insert a role before the arch suffix
   (`gluon_mha_decode_reduce_gfx950`). Kernels shared by several registered ops
-  keep descriptive names.
+  keep descriptive names. A `repr=` on the jit decorator replaces the compiled
+  symbol, so its base string must be the kernel's `def` name as well.

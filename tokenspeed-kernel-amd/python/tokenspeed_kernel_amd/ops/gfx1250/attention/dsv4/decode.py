@@ -258,7 +258,7 @@ def _prefetch_tile(
 @gluon.jit(
     launch_metadata=_decode_launch_metadata,
     repr=make_kernel_repr(
-        "_dsv4_paged_split_stage",
+        "gluon_dsv4_decode_gfx1250",
         [
             "NUM_HEADS",
             "NUM_KV_SPLITS",
@@ -688,7 +688,9 @@ def gluon_dsv4_decode_gfx1250(
 
 @gluon.jit(
     launch_metadata=_reduce_launch_metadata,
-    repr=make_kernel_repr("_dsv4_paged_split_reduce", ["NUM_KV_SPLITS", "HEAD_DIM"]),
+    repr=make_kernel_repr(
+        "gluon_dsv4_decode_reduce_gfx1250", ["NUM_KV_SPLITS", "HEAD_DIM"]
+    ),
 )
 def gluon_dsv4_decode_reduce_gfx1250(
     partial_out,

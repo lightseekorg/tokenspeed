@@ -203,10 +203,10 @@ if current_platform().is_amd:
 
     if current_platform().is_cdna5:
         from tokenspeed_kernel_amd.ops.gfx1250.gemm.mxfp8.decode_mm import (
-            gluon_mm_fp8_blockscale_gfx1250 as _mm_fp8_blockscale_gfx1250_impl,
+            launch_gluon_mm_fp8_blockscale_gfx1250 as _mm_fp8_blockscale_gfx1250_impl,
         )
         from tokenspeed_kernel_amd.ops.gfx1250.gemm.mxfp8.decode_mm import (
-            gluon_mm_mxfp8_ue8m0_gfx1250 as _mm_mxfp8_ue8m0_gfx1250_impl,
+            launch_gluon_mm_mxfp8_ue8m0_gfx1250 as _mm_mxfp8_ue8m0_gfx1250_impl,
         )
 
         _GFX1250_MXFP8_COMMON_TRAITS = {

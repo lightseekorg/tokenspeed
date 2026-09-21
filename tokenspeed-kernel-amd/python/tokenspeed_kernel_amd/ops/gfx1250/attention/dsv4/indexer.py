@@ -398,7 +398,7 @@ def _issue_decode_page_tdm(
         ],
     ),
 )
-def _dsv4_mxfp4_logits_kernel(
+def _dsv4_mxfp4_logits_gfx1250(
     q,
     q_scales,
     weights,
@@ -901,7 +901,7 @@ def _dsv4_mxfp4_logits(
         and q.shape[0] * max_candidates >= _TDM_MIN_CANDIDATES
     )
     chunk_n = _TDM_CHUNK_N if use_tdm else _BUFFER_CHUNK_N
-    _dsv4_mxfp4_logits_kernel[
+    _dsv4_mxfp4_logits_gfx1250[
         (
             q.shape[0],
             triton.cdiv(max_candidates, chunk_n),
