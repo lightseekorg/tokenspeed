@@ -33,34 +33,34 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
-        gluon_dsv4_decode_split_gfx950 as _dsv4_decode_split_impl,
+        launch_gluon_dsv4_decode_split_gfx950 as _dsv4_decode_split_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
-        gluon_dsv4_decode_topk_mxfp4_gfx950 as _dsv4_decode_topk_impl,
+        launch_gluon_dsv4_decode_topk_mxfp4_gfx950 as _dsv4_decode_topk_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
-        gluon_dsv4_plan_gfx950 as _dsv4_plan_impl,
+        launch_gluon_dsv4_plan_gfx950 as _dsv4_plan_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
-        gluon_dsv4_prefill_gfx950 as _dsv4_prefill_impl,
+        launch_gluon_dsv4_prefill_gfx950 as _dsv4_prefill_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
-        gluon_dsv4_prefill_topk_mxfp4_gfx950 as _dsv4_prefill_topk_impl,
+        launch_gluon_dsv4_prefill_topk_mxfp4_gfx950 as _dsv4_prefill_topk_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4 import (
-        gluon_dsv4_decode_gfx1250 as _dsv4_decode_gfx1250_impl,
+        launch_gluon_dsv4_decode_gfx1250 as _dsv4_decode_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4 import (
-        gluon_dsv4_decode_topk_mxfp4_gfx1250 as _dsv4_decode_topk_gfx1250_impl,
+        launch_gluon_dsv4_decode_topk_mxfp4_gfx1250 as _dsv4_decode_topk_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4 import (
-        gluon_dsv4_plan_gfx1250 as _dsv4_plan_gfx1250_impl,
+        launch_gluon_dsv4_plan_gfx1250 as _dsv4_plan_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4 import (
-        gluon_dsv4_prefill_gfx1250 as _dsv4_prefill_gfx1250_impl,
+        launch_gluon_dsv4_prefill_gfx1250 as _dsv4_prefill_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4 import (
-        gluon_dsv4_prefill_topk_mxfp4_gfx1250 as _dsv4_prefill_topk_gfx1250_impl,
+        launch_gluon_dsv4_prefill_topk_mxfp4_gfx1250 as _dsv4_prefill_topk_gfx1250_impl,
     )
 
     _DSV4_MXFP4_SIGNATURE = format_signature(

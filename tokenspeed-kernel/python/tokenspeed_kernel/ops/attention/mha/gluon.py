@@ -33,19 +33,19 @@ from tokenspeed_kernel.signature import format_signatures
 
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
-        gluon_mha_decode_gfx950 as _decode_impl,
+        launch_gluon_mha_decode_gfx950 as _decode_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha.extend import (
-        gluon_mha_extend_gfx950 as _extend_impl,
+        launch_gluon_mha_extend_gfx950 as _extend_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha.prefill import (
-        gluon_mha_prefill_gfx950 as _prefill_impl,
+        launch_gluon_mha_prefill_gfx950 as _prefill_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mha.decode import (
-        gluon_mha_decode_gfx1250 as _decode_gfx1250_impl,
+        launch_gluon_mha_decode_gfx1250 as _decode_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mha.prefill import (
-        gluon_mha_prefill_gfx1250 as _prefill_gfx1250_impl,
+        launch_gluon_mha_prefill_gfx1250 as _prefill_gfx1250_impl,
     )
 
     @register_kernel(

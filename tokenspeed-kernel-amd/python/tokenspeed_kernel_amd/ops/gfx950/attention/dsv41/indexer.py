@@ -214,7 +214,7 @@ def _index_launch_metadata(grid, kernel, args):
         "num_pages",
     ),
 )
-def _dsv41_mxfp4_logits_kernel(
+def gluon_dsv41_index_topk_gfx950(
     q,
     q_scales,
     weights,
@@ -404,7 +404,7 @@ def dsv41_index_logits_gfx950(
     queries, width = logits.shape
     cand = table if candidates is None else candidates
     scale_dim = 4
-    _dsv41_mxfp4_logits_kernel[(queries, triton.cdiv(width, score_chunk_size))](
+    gluon_dsv41_index_topk_gfx950[(queries, triton.cdiv(width, score_chunk_size))](
         values,
         scales.view(torch.uint8).reshape(queries, _MFMA_HEADS, scale_dim),
         w,

@@ -29,7 +29,7 @@ from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx1250.attention.mla._common import make_kernel_repr
 
 __all__ = [
-    "gluon_dsv4_decode_gfx1250",
+    "launch_gluon_dsv4_decode_gfx1250",
 ]
 
 
@@ -258,7 +258,7 @@ def _prefetch_tile(
 @gluon.jit(
     launch_metadata=_decode_launch_metadata,
     repr=make_kernel_repr(
-        "_dsv4_paged_split_stage",
+        "gluon_dsv4_decode_gfx1250",
         [
             "NUM_HEADS",
             "NUM_KV_SPLITS",
@@ -272,7 +272,7 @@ def _prefetch_tile(
         ],
     ),
 )
-def _dsv4_paged_split_stage_kernel(
+def gluon_dsv4_decode_gfx1250(
     q,
     swa_cache_u8,
     swa_cache_fp8,
@@ -688,9 +688,11 @@ def _dsv4_paged_split_stage_kernel(
 
 @gluon.jit(
     launch_metadata=_reduce_launch_metadata,
-    repr=make_kernel_repr("_dsv4_paged_split_reduce", ["NUM_KV_SPLITS", "HEAD_DIM"]),
+    repr=make_kernel_repr(
+        "gluon_dsv4_decode_reduce_gfx1250", ["NUM_KV_SPLITS", "HEAD_DIM"]
+    ),
 )
-def _dsv4_paged_split_reduce_kernel(
+def gluon_dsv4_decode_reduce_gfx1250(
     partial_out,
     partial_lse,
     attn_sink,
@@ -943,7 +945,7 @@ def _validate_paged_attention_inputs(
     return output, has_extra, scale
 
 
-def gluon_dsv4_decode_gfx1250(
+def launch_gluon_dsv4_decode_gfx1250(
     q: torch.Tensor,
     swa_kv_cache: torch.Tensor,
     swa_slots: torch.Tensor,
@@ -1056,7 +1058,7 @@ def gluon_dsv4_decode_gfx1250(
         dtype=torch.float32,
         device=q.device,
     )
-    _dsv4_paged_split_stage_kernel[(tokens, head_blocks, num_splits)](
+    gluon_dsv4_decode_gfx1250[(tokens, head_blocks, num_splits)](
         q,
         swa_kv_cache,
         swa_kv_cache.view(torch.float8_e4m3fn),
@@ -1101,7 +1103,7 @@ def gluon_dsv4_decode_gfx1250(
         num_stages=1,
     )
     if num_splits > 1:
-        _dsv4_paged_split_reduce_kernel[(tokens, num_heads)](
+        gluon_dsv4_decode_reduce_gfx1250[(tokens, num_heads)](
             partial_out,
             partial_lse,
             attn_sink,

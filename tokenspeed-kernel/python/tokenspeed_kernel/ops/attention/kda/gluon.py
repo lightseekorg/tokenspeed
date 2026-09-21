@@ -37,22 +37,19 @@ if current_platform().is_amd:
         gluon_kda_fused_decode_gfx950 as _kda_fused_decode_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
-        gluon_kda_fused_replay_gfx950 as _kda_fused_replay_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
         gluon_kda_fused_verify_gfx950 as _kda_fused_verify_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
         gluon_kda_recurrent_decode_gfx950 as _kda_decode_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
+        launch_gluon_kda_fused_replay_gfx950 as _kda_fused_replay_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.prefill import (
-        gluon_kda_paged_prefill_gfx950 as _kda_prefill_impl,
+        launch_gluon_kda_paged_prefill_gfx950 as _kda_prefill_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.decode import (
         gluon_kda_fused_decode_gfx1250 as _kda_fused_decode_gfx1250_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.decode import (
-        gluon_kda_fused_replay_gfx1250 as _kda_fused_replay_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.decode import (
         gluon_kda_fused_verify_gfx1250 as _kda_fused_verify_gfx1250_impl,
@@ -60,8 +57,11 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.decode import (
         gluon_kda_recurrent_decode_gfx1250 as _kda_decode_gfx1250_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.decode import (
+        launch_gluon_kda_fused_replay_gfx1250 as _kda_fused_replay_gfx1250_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.prefill import (
-        gluon_kda_paged_prefill_gfx1250 as _kda_prefill_gfx1250_impl,
+        launch_gluon_kda_paged_prefill_gfx1250 as _kda_prefill_gfx1250_impl,
     )
 
     @register_kernel(

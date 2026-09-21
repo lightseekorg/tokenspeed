@@ -2,6 +2,19 @@
 
 ## Kernel Conventions
 
+### Names
+
+Profilers show kernel names after the `def` function `@gluon.jit` attached to,
+so the kernel should carry the `tokenspeed-kernel` registration name verbatim
+(e.g, `gluon_mm_mxfp8_gfx950`), and the Python launcher calling the kernel
+should be named as `launch_<name>` (e.g., `launch_gluon_mm_mxfp8_gfx950`).
+Companion kernels launched only by that op insert a role before the arch suffix
+(e.g., `gluon_dsv4_decode_reduce_gfx1250`, `gluon_mha_prefill_sliding_gfx950`).
+Kernels shared by several registered ops keep descriptive names. A `repr=` on
+the jit decorator replaces the compiled symbol that profilers report, so its
+base string must be the kernel's `def` name as well (the constexpr suffix it
+appends is fine).
+
 ### Barriers
 
 Do not write `gl.barrier()` for shared-memory (LDS) hazards. The Gluon

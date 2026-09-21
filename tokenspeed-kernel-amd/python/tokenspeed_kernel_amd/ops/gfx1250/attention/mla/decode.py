@@ -708,7 +708,7 @@ def _select_projected_value_num_kv_splits(
     return triton.next_power_of_2(min(pages, split_cap, target))
 
 
-def gluon_mla_decode_gfx1250(
+def launch_gluon_mla_decode_gfx1250(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -929,7 +929,7 @@ def gluon_mla_decode_gfx1250(
     return (out, lse) if return_lse else out
 
 
-def gluon_mla_decode_projected_value_gfx1250(
+def launch_gluon_mla_decode_projected_value_gfx1250(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -995,7 +995,7 @@ def gluon_mla_decode_projected_value_gfx1250(
         or out.device != q.device
     ):
         raise ValueError("projected-value MLA requires contiguous colocated bf16 out")
-    return gluon_mla_decode_gfx1250(
+    return launch_gluon_mla_decode_gfx1250(
         q=q,
         kv_cache=kv_cache,
         page_table=page_table,
@@ -1013,6 +1013,6 @@ def gluon_mla_decode_projected_value_gfx1250(
 
 
 __all__ = [
-    "gluon_mla_decode_gfx1250",
-    "gluon_mla_decode_projected_value_gfx1250",
+    "launch_gluon_mla_decode_gfx1250",
+    "launch_gluon_mla_decode_projected_value_gfx1250",
 ]
