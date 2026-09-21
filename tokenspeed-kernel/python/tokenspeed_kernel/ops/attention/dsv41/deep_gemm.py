@@ -486,13 +486,13 @@ def _select(scores, k, graph_safe, destination, lengths, candidates=None):
 
 
 def _flashinfer_select(
-    logits, visible, candidates, topk, candidate_topk, graph_safe, out, scores=None
+    logits, visible, candidates, topk, candidate_topk, graph_safe, out, scores
 ):
     """Select rows, and blocks when this pass sources the candidate pool.
 
     ``scores`` is the candidate-compacted score matrix when it was produced
-    directly; otherwise it is gathered here from the dense ``logits``. A pass
-    that sources candidates always needs the dense row, so it never supplies it.
+    directly, or None to gather it here from the dense ``logits``. A pass that
+    sources candidates always needs the dense row, so it never supplies it.
     """
     rows, lengths, blocks, block_lengths = out
     if candidates is None:
@@ -614,7 +614,7 @@ def hopper_index_topk(
                 candidate_topk,
                 not dense,
                 tuple(tensor[begin:end] for tensor in out),
-                scores=sparse_index_scores(
+                sparse_index_scores(
                     queries[begin:end],
                     folded[begin:end],
                     planes[0],
@@ -656,5 +656,6 @@ def hopper_index_topk(
             candidate_topk,
             not dense,
             tuple(tensor[begin:end] for tensor in out),
+            None,
         )
     return out

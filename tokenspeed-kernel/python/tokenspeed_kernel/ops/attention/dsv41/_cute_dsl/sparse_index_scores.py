@@ -61,6 +61,10 @@ class SparseIndexScoreKernel:
     K tile, so the MMA sees dense rows even though the gather is scattered. The
     four MMA warps split the tile's rows; the gather warp issues one bulk copy
     per candidate block.
+
+    The split over tiles is the launch's grid height, read back through
+    ``grid_dim`` rather than compiled in, so one compiled kernel serves every
+    batch size.
     """
 
     TILE_ROWS = 128
@@ -76,9 +80,8 @@ class SparseIndexScoreKernel:
     BAR_MMA = 1
     num_stages = 3
 
-    def __init__(self, num_heads: int, split_k: int, enable_pdl: bool):
+    def __init__(self, num_heads: int, enable_pdl: bool):
         self.num_heads = num_heads
-        self.split_k = split_k
         self.enable_pdl = enable_pdl
 
     @cute.jit
@@ -92,6 +95,7 @@ class SparseIndexScoreKernel:
         gVisible: cute.Tensor,  # [tokens] int32 visible row count
         gCandidates: cute.Tensor,  # [tokens, blocks] int32 block ids, -1 padded
         gOut: cute.Tensor,  # [tokens, blocks * 8] FP32
+        split_k: Int32,  # CTAs per query token, each owning every split_k-th tile
         stream: CUstream,
     ):
         tokens = gQ.shape[0]
@@ -142,7 +146,7 @@ class SparseIndexScoreKernel:
             gCandidates,
             gOut,
         ).launch(
-            grid=(tokens, self.split_k, 1),
+            grid=(tokens, split_k, 1),
             block=(32 * (self.NUM_MMA_WARPS + 1), 1, 1),
             stream=stream,
             use_pdl=self.enable_pdl,
@@ -161,6 +165,7 @@ class SparseIndexScoreKernel:
         gOut: cute.Tensor,
     ):
         token, split_id, _ = cute.arch.block_idx()
+        _, split_k, _ = cute.arch.grid_dim()
         warp_id = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane_id = cute.arch.lane_idx()
 
@@ -169,7 +174,6 @@ class SparseIndexScoreKernel:
         num_tiles = cute.ceil_div(gCandidates.shape[1], self.BLOCKS_PER_TILE)
         pages = gK_scales.shape[0]
         table_width = gTable.shape[1]
-        visible = gVisible[token]
 
         # The gather writes eight-row boxes into this tile; the box atom and
         # this layout share a swizzle whose row period is eight, so every box
@@ -226,8 +230,11 @@ class SparseIndexScoreKernel:
             cpasync.prefetch_descriptor(K_tma.atom)
         cute.arch.sync_threads()
 
+        # Every global read of another kernel's output sits behind this wait,
+        # including the visibility bound the epilogue masks with.
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
+        visible = gVisible[token]
 
         if warp_id == self.NUM_MMA_WARPS:
             gQ_tile = cute.local_tile(
@@ -243,7 +250,7 @@ class SparseIndexScoreKernel:
 
             stage = 0
             parity = 1
-            for tile in cutlass.range(split_id, num_tiles, self.split_k):
+            for tile in cutlass.range(split_id, num_tiles, split_k):
                 # Resolve the tile's blocks one per lane. The page-table read
                 # depends on the candidate id, so resolving them inside the
                 # issue loop would serialise the whole gather behind sixteen
@@ -361,7 +368,7 @@ class SparseIndexScoreKernel:
             row_lo = lane_id // 4
             stage = 0
             parity = 0
-            for tile in cutlass.range(split_id, num_tiles, self.split_k):
+            for tile in cutlass.range(split_id, num_tiles, split_k):
                 rC.fill(0.0)
                 cute.arch.mbarrier_wait(tma_full_mbar + stage, parity)
                 for k in cutlass.range_constexpr(K_STEPS):

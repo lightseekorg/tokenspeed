@@ -53,7 +53,8 @@ def _to_cute(tensor, dynamic_rows, align=16):
     """Wrap a torch tensor for CuTe, leaving only the row count dynamic.
 
     Every other extent stays static so the candidate width and table width
-    become compile-time tile counts; the compile cache keys on them.
+    become compile-time tile counts, and every stride is compiled in as well;
+    the compile cache keys on all of them.
 
     ``align`` is a promise about the data pointer, so it has to hold for the
     row slices the caller chunks the batch into, not just for whole tensors.
@@ -165,7 +166,7 @@ def sparse_index_scores(
         null, past ``visible``, or on an unmapped page.
     """
     import cuda.bindings.driver as cuda
-    from cutlass import cute
+    from cutlass import Int32, cute
 
     # The gather resolves a whole tile of candidates per lane and the MMA reads
     # whole eight-head groups, so a ragged tail would read past either buffer.
@@ -182,8 +183,9 @@ def sparse_index_scores(
     out = torch.empty((tokens, blocks * 8), dtype=torch.float32, device=queries.device)
     if tokens == 0 or blocks == 0:
         return out
-    # The cache planes carry the 132-byte row pitch, so they are not compact
-    # and their page count stays a compile-time extent; the key covers it.
+    # The cache planes are views of a page-planar field: their rows are dense
+    # but the page stride is the field's, so they stay fully static and both
+    # their page count and their strides are part of the compile key.
     args = (
         _to_cute(queries, True),
         _to_cute(weights, True),
@@ -199,13 +201,15 @@ def sparse_index_scores(
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     heads = queries.shape[1]
-    split = _split_k(tokens, blocks // _BLOCKS_PER_TILE)
-    # cute.compile specialises on element type as well as extent, and the
+    # The split is a launch parameter, not a compile-time constant, so batch
+    # sizes do not multiply the compiled variants.
+    split = Int32(_split_k(tokens, blocks // _BLOCKS_PER_TILE))
+    # cute.compile specialises on element type, extent and stride, and the
     # public entry accepts either integer width for the index tensors, so the
-    # dtypes belong in the key rather than riding on the first caller's choice.
+    # dtypes and the static planes' strides belong in the key rather than
+    # riding on the first caller's choice.
     key = (
         heads,
-        split,
         bool(enable_pdl),
         blocks,
         table.shape[1],
@@ -213,12 +217,14 @@ def sparse_index_scores(
         table.dtype,
         visible.dtype,
         candidates.dtype,
+        values.stride(),
+        scales.stride(),
     )
     compiled = _COMPILED.get(key)
     if compiled is None:
         compiled = cute.compile(
-            _kernel()(heads, split, bool(enable_pdl)), *args, stream
+            _kernel()(heads, bool(enable_pdl)), *args, split, stream
         )
         _COMPILED[key] = compiled
-    compiled(*args, stream)
+    compiled(*args, split, stream)
     return out
