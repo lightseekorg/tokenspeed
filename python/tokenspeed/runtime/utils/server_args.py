@@ -218,6 +218,9 @@ class ServerArgs:
     # MoE backend
     moe_backend: str = "auto"
     draft_moe_backend: str | None = None
+    # Opt-in: run MXFP4 routed experts with FP8 activations (FlashInfer cutlass
+    # W4A8 on Hopper). Off keeps the checkpoint's BF16 activation contract.
+    moe_mxfp4_fp8_activation: bool = False
     all2all_backend: str = "none"
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
@@ -1503,6 +1506,17 @@ class ServerArgs:
             default=ServerArgs.moe_backend,
             help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm, "
             "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe",
+        )
+        parser.add_argument(
+            "--moe-mxfp4-fp8-activation",
+            action="store_true",
+            help="Run MXFP4 routed experts with FP8 activations (on Hopper the "
+            "FlashInfer cutlass W4A8 Humming MoE: about 1.8x faster than the "
+            "default W4A16 path, a few percent of relative error on the expert "
+            "outputs; validate the served model before relying on it). Applies to "
+            "every MXFP4 expert layer, target and draft; the MoE plan fails at "
+            "startup where the selected backend has no FP8-activation kernel for "
+            "the layer.",
         )
         parser.add_argument(
             "--draft-moe-backend",

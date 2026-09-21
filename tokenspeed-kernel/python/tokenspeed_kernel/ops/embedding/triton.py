@@ -1265,6 +1265,190 @@ def _mxfp8_embedding_kernel(
     tl.store(O + row * D + d, value, d < D)
 
 
+@triton.jit(
+    do_not_specialize=[
+        "ORG_START",
+        "ORG_END",
+        "ADDED_START",
+        "ADDED_END",
+        "ADDED_OFFSET",
+    ]
+)
+def _vocab_shard_embedding_kernel(
+    W,
+    I,
+    O,
+    WS,
+    ORG_START,
+    ORG_END,
+    ADDED_START,
+    ADDED_END,
+    ADDED_OFFSET,
+    D: tl.constexpr,
+    B: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    d = tl.arange(0, B)
+    index = tl.load(I + row).to(tl.int64)
+    original = (index >= ORG_START) & (index < ORG_END)
+    added = (index >= ADDED_START) & (index < ADDED_END)
+    local = tl.where(original, index - ORG_START, index - ADDED_OFFSET)
+    value = tl.load(W + local * WS + d, (original | added) & (d < D), 0.0)
+    tl.store(O + row * D + d, value, d < D)
+
+
+@register_kernel(
+    "embedding",
+    "vocab_shard_embedding",
+    name="triton_vocab_shard_embedding",
+    solution="triton",
+    signatures=[
+        format_signature(weight=dense_tensor_format(dtype))
+        for dtype in (torch.bfloat16, torch.float16, torch.float32)
+    ],
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    priority=Priority.PORTABLE,
+)
+def vocab_shard_embedding(weight, indices, org_range, num_org_padding, added_range):
+    """Gather this shard's rows for global IDs and zero every other row."""
+    out = torch.empty(
+        (*indices.shape, weight.shape[1]), dtype=weight.dtype, device=indices.device
+    )
+    org_start, org_end = org_range
+    added_start, added_end = added_range
+    if indices.numel():
+        _vocab_shard_embedding_kernel[(indices.numel(),)](
+            weight,
+            indices,
+            out,
+            weight.stride(0),
+            org_start,
+            org_end,
+            added_start,
+            added_end,
+            added_start - (org_end - org_start) - num_org_padding,
+            weight.shape[1],
+            triton.next_power_of_2(weight.shape[1]),
+            num_warps=4,
+        )
+    return out
+
+
+@triton.jit
+def _engram_hash_kernel(
+    I,
+    P,
+    M,
+    TOKEN_MAP,
+    MULTIPLIERS,
+    PRIMES,
+    OFFSETS,
+    O,
+    num_tokens,
+    pad_id,
+    dead_id,
+    LAYERS: tl.constexpr,
+    HEADS: tl.constexpr,
+    HEADS_PAD: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    rows = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    live = rows < num_tokens
+    heads = tl.arange(0, HEADS_PAD)
+    head_ok = heads < HEADS
+    # The current token and its three predecessors, newest first. A token is
+    # dead when missing (barrier) or, for the current one, masked out; every
+    # lookback at or beyond a dead token hashes as padding.
+    raw0 = tl.load(I + rows, live, dead_id).to(tl.int64)
+    raw1 = tl.load(P + rows * 3, live, dead_id).to(tl.int64)
+    raw2 = tl.load(P + rows * 3 + 1, live, dead_id).to(tl.int64)
+    raw3 = tl.load(P + rows * 3 + 2, live, dead_id).to(tl.int64)
+    blocked0 = (raw0 == dead_id) | (tl.load(M + rows, live, 0) == 0)
+    blocked1 = blocked0 | (raw1 == dead_id)
+    blocked2 = blocked1 | (raw2 == dead_id)
+    blocked3 = blocked2 | (raw3 == dead_id)
+    # Dead ids may lie outside the tokenizer vocabulary: map row 0 instead.
+    token0 = tl.load(TOKEN_MAP + tl.where(blocked0, 0, raw0), live, 0)
+    token1 = tl.load(TOKEN_MAP + tl.where(blocked1, 0, raw1), live, 0)
+    token2 = tl.load(TOKEN_MAP + tl.where(blocked2, 0, raw2), live, 0)
+    token3 = tl.load(TOKEN_MAP + tl.where(blocked3, 0, raw3), live, 0)
+    token0 = tl.where(blocked0, pad_id, token0)
+    token1 = tl.where(blocked1, pad_id, token1)
+    token2 = tl.where(blocked2, pad_id, token2)
+    token3 = tl.where(blocked3, pad_id, token3)
+    for layer in tl.static_range(LAYERS):
+        rolling = token0 * tl.load(MULTIPLIERS + layer * 4)
+        for shift in tl.static_range(1, 4):
+            if shift == 1:
+                rolling = rolling ^ (token1 * tl.load(MULTIPLIERS + layer * 4 + shift))
+            elif shift == 2:
+                rolling = rolling ^ (token2 * tl.load(MULTIPLIERS + layer * 4 + shift))
+            else:
+                rolling = rolling ^ (token3 * tl.load(MULTIPLIERS + layer * 4 + shift))
+            column = (layer * 3 + shift - 1) * HEADS
+            primes = tl.load(PRIMES + column + heads, head_ok, 1)
+            offsets = tl.load(OFFSETS + column + heads, head_ok, 0)
+            # Python's modulo: the bucket takes the sign of the (positive) prime.
+            bucket = rolling[:, None] % primes[None, :]
+            bucket = tl.where(bucket < 0, bucket + primes[None, :], bucket)
+            tl.store(
+                O + rows[:, None] * (LAYERS * 3 * HEADS) + column + heads[None, :],
+                bucket + offsets[None, :],
+                live[:, None] & head_ok[None, :],
+            )
+
+
+@register_kernel(
+    "embedding",
+    "engram_hash",
+    name="triton_engram_hash",
+    solution="triton",
+    signatures=[format_signature(indices=dense_tensor_format(torch.int64))],
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    priority=Priority.PORTABLE,
+)
+def engram_hash(
+    input_ids,
+    previous_token_ids,
+    token_mask,
+    token_map,
+    multipliers,
+    primes,
+    offsets,
+    pad_id,
+    dead_id,
+):
+    """Hash each token's 2/3/4-gram windows into per-layer table rows."""
+    layers, heads = primes.shape[0], primes.shape[2]
+    num_tokens = input_ids.shape[0]
+    out = torch.empty(
+        (num_tokens, layers, 3 * heads), dtype=torch.int64, device=input_ids.device
+    )
+    if num_tokens:
+        # 64-bit remainders dominate; small blocks keep each thread at one
+        # bucket per (layer, order) even for a decode step's dozen tokens.
+        block = 16
+        _engram_hash_kernel[(triton.cdiv(num_tokens, block),)](
+            input_ids,
+            previous_token_ids,
+            token_mask.view(torch.int8),
+            token_map,
+            multipliers,
+            primes,
+            offsets,
+            out,
+            num_tokens,
+            pad_id,
+            dead_id,
+            LAYERS=layers,
+            HEADS=heads,
+            HEADS_PAD=triton.next_power_of_2(heads),
+            BLOCK=block,
+            num_warps=4,
+        )
+    return out
+
+
 @register_kernel(
     "embedding",
     "mxfp8_embedding",

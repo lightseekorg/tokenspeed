@@ -68,6 +68,7 @@ class MoELayer(torch.nn.Module):
         ep_rank: int | None = None,
         ep_size: int | None = None,
         zero_expert_type: str = "",
+        zero_expert_num: int = 0,
         activation: str = "silu",
         activation_situ_beta: float | None = None,
         activation_situ_linear_beta: float | None = None,
@@ -95,6 +96,12 @@ class MoELayer(torch.nn.Module):
             "ep_num_redundant_experts"
         ]
         self.zero_expert_type = zero_expert_type
+        # LongCat routes some top-k slots to "zero experts" that no kernel
+        # computes; the model rewrites those slots to a placeholder expert id
+        # with weight zero, so a token can hand the kernel the same expert id
+        # more than once. Kernels whose permutation assumes distinct ids per
+        # token declare that and drop out of selection.
+        self.zero_expert_num = zero_expert_num
         self.activation = activation
         self.activation_situ_beta = activation_situ_beta
         self.activation_situ_linear_beta = activation_situ_linear_beta
@@ -223,12 +230,37 @@ class MoELayer(torch.nn.Module):
                 internal_activation_dtype = "fp8"
             elif getattr(self.quant_config, "use_dynamic_mxfp4_activations", False):
                 internal_activation_dtype = "mxfp4"
+        # --moe-mxfp4-fp8-activation: FP8 activations for every MXFP4 routed
+        # expert layer in the model. "fp8" matches only the FlashInfer cutlass
+        # W4A8 registration, so the flag fails closed where that kernel is
+        # unavailable; a layer that is not MXFP4 cannot honour it and rejects
+        # it rather than silently serving the default path.
+        if global_server_args_dict["moe_mxfp4_fp8_activation"]:
+            if self._quant_kind != "mxfp4":
+                raise ValueError(
+                    "--moe-mxfp4-fp8-activation applies to MXFP4 routed experts; "
+                    f"{self.prefix!s} stores them as {self._quant_kind!s}"
+                )
+            # A model that pins its own activation precision (Kimi-K3 passes
+            # "input" for its Marlin and gfx950 paths) cannot honour the flag;
+            # refuse rather than let the pin overwrite the explicit request.
+            if self._internal_activation_dtype_override not in (None, "fp8"):
+                raise ValueError(
+                    "--moe-mxfp4-fp8-activation asks for FP8 activations, but "
+                    f"{self.prefix!s} pins its MXFP4 experts to "
+                    f"{self._internal_activation_dtype_override!r} activations; "
+                    "drop the flag for this model"
+                )
+            internal_activation_dtype = "fp8"
         if self._internal_activation_dtype_override is not None:
             internal_activation_dtype = self._internal_activation_dtype_override
 
         input_dtype = torch.get_default_dtype()
         if input_dtype not in {torch.float16, torch.bfloat16}:
             input_dtype = torch.float16
+        # The activation dtype the plan is signed for; callers that feed the
+        # layer synthetic inputs (kernel tuning) must match it.
+        self.input_dtype = input_dtype
 
         # Moe Backend plan
         moe_backend = get_moe_backend().value
@@ -261,6 +293,12 @@ class MoELayer(torch.nn.Module):
             a2a_backend=self._spec.a2a_backend,
             ep_size=self.ep_size,
             ispp=self.intermediate_size // self.tp_size,
+            hidden=hidden_size,
+            swiglu_form=self._swiglu_form(),
+            activation_clamped=(
+                self.swiglu_arg is not None and self.swiglu_arg.limit is not None
+            ),
+            expert_id_repeats=self.zero_expert_num > 0,
             fp8_scale_block_shape=fp8_scale_block_shape,
             internal_activation_dtype=internal_activation_dtype,
             with_bias=with_bias,
@@ -281,6 +319,17 @@ class MoELayer(torch.nn.Module):
             solution=self.plan["solution"],
         )
         self._weights_processed = False
+
+    def _swiglu_form(self) -> str | None:
+        """``"standard"`` for silu(gate)*up with an optional clamp, ``"generalized"``
+        when a sigmoid multiplier (alpha) or an up-branch offset (swiglu_beta) is
+        in play (gpt-oss, MiniMax-M3); None for other activations."""
+        if self.activation != "swiglu":
+            return None
+        alpha = None if self.swiglu_arg is None else self.swiglu_arg.alpha
+        if alpha in (None, 1.0) and self.swiglu_beta in (None, 0.0):
+            return "standard"
+        return "generalized"
 
     def _apply_trtllm_ispp_padding(self, alignment: int, reason: str) -> None:
         """Round the intermediate size up when the trtllm backend needs it.

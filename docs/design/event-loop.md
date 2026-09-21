@@ -131,6 +131,23 @@ broadcasts on the same issuing thread as the model's collectives, restoring
 the cross-rank launch-order guarantee the old non-overlap-loop assumption
 provided.
 
+The symmetric rule holds on the data plane: **the forward thread never
+synchronizes with the device on the per-round path.** Every host
+synchronization it performs — `.cpu()`, `.item()`, `.tolist()`,
+`bool(tensor)`, `nonzero`, a copy from or to pageable host memory,
+`stream.synchronize()` — waits for the whole stream, and the stream holds
+the step in flight, so the next step's prologue and graph launch slip
+behind the current step's completion and `in_flight_depth` degrades to 0
+however it is configured. Results cross back through pinned non-blocking
+copies and an event the control plane waits on. This rule is enforced by
+torch's sync-debug mode, armed by `run_event_loop` as its last step before
+entering the round loop (weight loading, tuning, capture, the transfer and
+L2 builders and `EventLoop.__init__` all synchronize on purpose):
+`TOKENSPEED_DATA_PLANE_SYNC_DEBUG=warn` reports each offending site with its
+Python location, `error` raises there. CI runs the serving paths with
+`error`; the control plane's event wait and non-blocking copies are not
+flagged, so a report is always a real stall.
+
 ### The capture contract
 
 Information crosses to the data plane **only** inside the submitted closure,
@@ -337,6 +354,8 @@ For orientation, one iteration of `event_loop`:
 * Never call `scheduler.advance`, `advance_scheduler`, or the KV event
   publisher from a helper or hooks class.
 * Never issue CUDA work, or hold something that can, from the control plane.
+* Never synchronize with the device from the data plane's per-round path;
+  run with `TOKENSPEED_DATA_PLANE_SYNC_DEBUG=error` while developing on it.
 * L3 `batch_exists` registration is on the admit path, but only when
   `--kvstore-storage-backend` is set. Hashing every admitted prefix on the
   default (`--disable-kvstore`) path is a control-plane cost the loop must

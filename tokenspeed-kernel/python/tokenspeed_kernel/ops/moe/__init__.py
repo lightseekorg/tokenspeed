@@ -554,6 +554,10 @@ def _build_traits(
     a2a_backend: str | None,
     ep_size: int | None,
     ispp: int | None,
+    hidden: int | None,
+    swiglu_form: str | None,
+    activation_clamped: bool,
+    expert_id_repeats: bool,
     fp8_scale_block_shape: tuple[int, int] | None,
     internal_activation_dtype: str | None,
     with_bias: bool,
@@ -582,6 +586,13 @@ def _build_traits(
 
     if ispp is not None:
         traits["ispp"] = int(ispp)
+    if hidden is not None:
+        traits["hidden"] = int(hidden)
+    if swiglu_form is not None:
+        traits["swiglu_form"] = swiglu_form
+    traits["activation_clamped"] = activation_clamped
+    if expert_id_repeats:
+        traits["expert_id_repeats"] = True
     if fp8_scale_block_shape is not None:
         traits["fp8_scale_block_shape"] = tuple(fp8_scale_block_shape)
     traits["internal_activation_dtype"] = internal_activation_dtype
@@ -599,6 +610,11 @@ def moe_plan(
     a2a_backend: str | None = None,
     ep_size: int | None = None,
     ispp: int | None = None,
+    *,
+    hidden: int | None,
+    swiglu_form: str | None,
+    activation_clamped: bool,
+    expert_id_repeats: bool,
     fp8_scale_block_shape: tuple[int, int] | None = None,
     internal_activation_dtype: str | None = None,
     with_bias: bool = False,
@@ -626,6 +642,24 @@ def moe_plan(
             The exact value is also passed as a selection trait when a kernel
             declares an ``ep_size`` constraint.
         ispp: Optional intermediate size per partition for alignment checks.
+        hidden: MoE input width (hidden size) for alignment checks; kernels
+            declare ``hidden`` / ``hidden_alignment`` traits the same way as
+            ``ispp`` / ``ispp_alignment``. Required keyword: pass None only
+            to leave the width unconstrained on purpose.
+        swiglu_form: For SwiGLU layers, ``"standard"`` (silu(gate) * up with an
+            optional clamp) or ``"generalized"`` (a sigmoid multiplier alpha or
+            an up-branch offset beta). Kernels whose epilogue implements only
+            the standard form declare ``swiglu_form={"standard"}``. Required
+            keyword: None for activations other than SwiGLU.
+        activation_clamped: True when the activation's output is bounded by
+            the checkpoint (a SwiGLU clamp limit). Kernels whose FP8
+            activation path relies on a fixed scale declare
+            ``activation_clamped={True}`` so unbounded layers never select
+            them. Required keyword.
+        expert_id_repeats: True when the routing may hand a kernel the same
+            expert id more than once for one token (zero-expert placeholders).
+            Kernels whose permutation needs distinct ids per token declare
+            ``expert_id_repeats={False}``. Required keyword.
         fp8_scale_block_shape: Optional FP8 block-scale shape requirement.
         internal_activation_dtype: Optional internal activation dtype requirement.
             "input" is a special value that uses the whatever dtype the input
@@ -667,6 +701,10 @@ def moe_plan(
         a2a_backend=a2a_backend,
         ep_size=ep_size,
         ispp=ispp,
+        hidden=hidden,
+        swiglu_form=swiglu_form,
+        activation_clamped=activation_clamped,
+        expert_id_repeats=expert_id_repeats,
         fp8_scale_block_shape=fp8_scale_block_shape,
         internal_activation_dtype=internal_activation_dtype,
         with_bias=with_bias,

@@ -130,6 +130,10 @@ def test_routed_deferred_finalize_matches_finalized():
         ispp=inter,
         internal_activation_dtype="input",
         solution="flashinfer_trtllm",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_unquant_routed_moe_apply"
     assert plan["supports_deferred_finalize"] is True
