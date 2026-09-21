@@ -49,15 +49,18 @@ class _GraphSafeDLPack:
         return self._tensor.__dlpack_device__()
 
 
-def _to_cute(tensor, dynamic_rows):
+def _to_cute(tensor, dynamic_rows, align=16):
     """Wrap a torch tensor for CuTe, leaving only the row count dynamic.
 
     Every other extent stays static so the candidate width and table width
     become compile-time tile counts; the compile cache keys on them.
+
+    ``align`` is a promise about the data pointer, so it has to hold for the
+    row slices the caller chunks the batch into, not just for whole tensors.
     """
     from cutlass.cute.runtime import from_dlpack
 
-    wrapped = from_dlpack(_GraphSafeDLPack(tensor.detach()), assumed_align=16)
+    wrapped = from_dlpack(_GraphSafeDLPack(tensor.detach()), assumed_align=align)
     if dynamic_rows:
         wrapped = wrapped.mark_compact_shape_dynamic(
             mode=0, stride_order=tuple(range(tensor.dim()))
@@ -186,9 +189,12 @@ def sparse_index_scores(
         _to_cute(weights, True),
         _to_cute(values, False),
         _to_cute(scales, False),
-        _to_cute(table, True),
-        _to_cute(visible, True),
-        _to_cute(candidates, True),
+        # An int32 row is four bytes wide, so a page table of, say, 255 pages
+        # puts every chunk after the first on a 1020-byte offset. These are
+        # read one element at a time, so four bytes is the honest promise.
+        _to_cute(table, True, align=4),
+        _to_cute(visible, True, align=4),
+        _to_cute(candidates, True, align=4),
         _to_cute(out, True),
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)

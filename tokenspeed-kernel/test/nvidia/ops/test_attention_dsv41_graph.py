@@ -90,8 +90,11 @@ def test_index_topk_graph_full_candidates_and_reindex():
             torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
+# 255 pages make an int32 table row 1020 bytes, so every chunk after the first
+# lands on an offset that is not 16-byte aligned.
+@pytest.mark.parametrize("pages", [256, 255])
 @pytest.mark.parametrize("blocks", [16, 64, 2048])
-def test_sparse_reindex_selects_what_the_dense_score_selects(blocks):
+def test_sparse_reindex_selects_what_the_dense_score_selects(blocks, pages):
     device = torch.device("cuda:0")
     # The Hopper Reindex pass scores only its candidate pool. Existing reindex
     # cases use pools narrower than one gather tile, so they never reach that
@@ -102,7 +105,6 @@ def test_sparse_reindex_selects_what_the_dense_score_selects(blocks):
     if not deep_gemm.is_hopper_indexer_available():
         pytest.skip("requires the Hopper FP8 indexer")
     torch.manual_seed(52)
-    pages = 256
     rows = pages * 64
     # 132-byte rows: 128 E4M3 values then the FP32 scale, the format the
     # Hopper scorers read. The shared helper only knows the shorter layouts.
