@@ -155,6 +155,17 @@ def test_sparse_index_scores_match_the_dense_scorer(blocks, pages, table_width):
         _hopper_index_case(device, tokens, blocks, pages, table_width, 53)
     )
     assert cute_dsl.sparse_index_scores_supported(queries, folded, table, candidates)
+    # The op contract admits noncontiguous table and candidate views; the
+    # scorer compiles compact layouts, so those stay on the dense path.
+    assert not cute_dsl.sparse_index_scores_supported(
+        queries, folded, table.repeat(1, 2)[:, ::2], candidates
+    )
+    assert not cute_dsl.sparse_index_scores_supported(
+        queries, folded, table, candidates.repeat(1, 2)[:, :blocks]
+    )
+    assert cute_dsl.sparse_index_scores_supported(
+        queries[:1], folded[:1], table[:1], candidates[:1]
+    )
 
     def dense():
         logits = deep_gemm._hopper_paged_scores(
@@ -253,3 +264,10 @@ def test_sparse_reindex_selects_what_the_dense_score_selects(blocks, pages):
     # on the selection, which is what the pass exists to produce.
     torch.testing.assert_close(sparse_lengths, dense_lengths, rtol=0, atol=0)
     torch.testing.assert_close(sparse, dense, rtol=0, atol=0)
+    # Noncontiguous views are part of the op contract: they take the dense
+    # path and select the same rows.
+    table = torch.stack((table, table), dim=-1).reshape(tokens, -1)[:, ::2]
+    candidates = torch.cat((candidates, candidates), dim=1)[:, :blocks]
+    strided, strided_lengths = select()[:2]
+    torch.testing.assert_close(strided_lengths, dense_lengths, rtol=0, atol=0)
+    torch.testing.assert_close(strided, dense, rtol=0, atol=0)
