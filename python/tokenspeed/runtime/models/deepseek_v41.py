@@ -350,7 +350,11 @@ def _column(input_size, output_size, dtype, quant_config, prefix, mapping):
 
 
 def _norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
-    # ponytail: eager reference arithmetic; fuse only with cast-order parity tests.
+    """RMSNorm in the reference cast order: FP32 scale, FP32 weight, one round."""
+    if x.is_cuda:
+        from tokenspeed_kernel.ops.layernorm import reference_rmsnorm
+
+        return reference_rmsnorm(x, norm.weight, norm.variance_epsilon, None)
     values = x.float()
     values = values * torch.rsqrt(
         values.square().mean(-1, keepdim=True) + norm.variance_epsilon

@@ -439,7 +439,8 @@ def _commit_ngram(
     capacity: tl.constexpr,
     ROWS: tl.constexpr,
 ):
-    rows = tl.arange(0, ROWS)
+    first = tl.program_id(0) * ROWS
+    rows = first + tl.arange(0, ROWS)
     cols = tl.arange(0, 4)
     valid = rows < bs
     slot = tl.load(slots + rows, valid, other=padding_slot)
@@ -448,7 +449,12 @@ def _commit_ngram(
     count = tl.load(accepted + rows, valid, other=0)
     delta = tl.where(rows < num_extends, sizes, count)
     delta = tl.where(live, delta, 0)
-    last = tl.minimum(tl.maximum(tl.cumsum(sizes) - sizes + delta - 1, 0), capacity - 1)
+    start = tl.full((), 0, tl.int32)
+    for chunk in range(0, first, ROWS):
+        start += tl.sum(tl.load(lengths + chunk + tl.arange(0, ROWS)))
+    last = tl.minimum(
+        tl.maximum(start + tl.cumsum(sizes) - sizes + delta - 1, 0), capacity - 1
+    )
     advancing = live & (delta > 0)
     raw = tl.load(ids + last, advancing, other=-1).to(tl.int64)
     mask = tl.load(token_mask + last, advancing, other=False)
@@ -515,7 +521,8 @@ def commit_ngram_inputs(
         cache_lengths[slots[live]] += delta[live]
         return
     if bs:
-        _commit_ngram[(1,)](
+        rows = min(1024, triton.next_power_of_2(bs))
+        _commit_ngram[(triton.cdiv(bs, rows),)](
             slots,
             lengths,
             accepted,
@@ -530,6 +537,6 @@ def commit_ngram_inputs(
             num_extends,
             padding_slot,
             previous.shape[0],
-            triton.next_power_of_2(bs),
+            rows,
             num_warps=4,
         )

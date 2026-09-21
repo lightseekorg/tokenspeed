@@ -41,7 +41,8 @@ def hash_params(device):
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize(
-    "bs,max_length", [(1, 1), (16, 1), (16, 4), (16, 256), (128, 3), (3, 2731)]
+    "bs,max_length",
+    [(1, 1), (16, 1), (16, 4), (16, 256), (128, 3), (3, 2731), (5000, 3)],
 )
 @pytest.mark.parametrize("graph", [False, True])
 @pytest.mark.parametrize("uniform", [False, True])
@@ -144,23 +145,32 @@ def test_ngram_preparation(bs, max_length, graph, device, uniform):
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("graph", [False, True])
 @pytest.mark.parametrize("num_extends", [0, 2, 4])
-def test_commit_ngram_independent_reference(graph, num_extends, device):
+@pytest.mark.parametrize("repeat", [1, 1250])
+def test_commit_ngram_independent_reference(graph, num_extends, device, repeat):
     from tokenspeed_kernel.ops.metadata.ngram import commit_ngram_inputs
 
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     if graph and device == "cpu":
         pytest.skip("CUDA graph")
-    lengths = torch.tensor([3, 2, 4, 1], dtype=torch.int32, device=device)
-    slots = torch.tensor([3, 0, 1, 4], device=device)
-    accepted = torch.tensor([0, 1, 2, 0], dtype=torch.int32, device=device)
-    ids = torch.arange(10, dtype=torch.int32, device=device)
-    previous = torch.arange(30, dtype=torch.int64, device=device).reshape(10, 3)
+    bs, capacity, pool = 4 * repeat, 10 * repeat, 5 * repeat
+    num_extends *= repeat
+    lengths = torch.tensor([3, 2, 4, 1] * repeat, dtype=torch.int32, device=device)
+    slots = (
+        torch.arange(repeat, device=device)[:, None] * 5
+        + torch.tensor([3, 0, 1, 4], device=device)
+    ).flatten()
+    slots[3::4] = pool - 1
+    accepted = torch.tensor([0, 1, 2, 0] * repeat, dtype=torch.int32, device=device)
+    ids = torch.arange(capacity, dtype=torch.int32, device=device)
+    previous = torch.arange(capacity * 3, dtype=torch.int64, device=device).reshape(
+        capacity, 3
+    )
     mask = ids % 2 == 0
-    tail = torch.full((5, 3), 91, device=device, dtype=torch.int64)
-    prefix = torch.arange(12, dtype=torch.int64, device=device).reshape(4, 3)
-    needs_seed = torch.ones(5, dtype=torch.bool, device=device)
-    cache = torch.arange(5, dtype=torch.int32, device=device)
+    tail = torch.full((pool, 3), 91, device=device, dtype=torch.int64)
+    prefix = torch.arange(bs * 3, dtype=torch.int64, device=device).reshape(bs, 3)
+    needs_seed = torch.ones(pool, dtype=torch.bool, device=device)
+    cache = torch.arange(pool, dtype=torch.int32, device=device)
 
     def invoke():
         commit_ngram_inputs(
@@ -175,7 +185,7 @@ def test_commit_ngram_independent_reference(graph, num_extends, device):
             needs_seed,
             cache,
             num_extends,
-            4,
+            pool - 1,
         )
 
     invoke()
@@ -184,22 +194,27 @@ def test_commit_ngram_independent_reference(graph, num_extends, device):
         with torch.cuda.graph(capture):
             invoke()
     for shift in [0, 100]:
-        ids.copy_(torch.arange(10, device=device) + shift)
+        ids.copy_(torch.arange(capacity, device=device) + shift)
         tail.fill_(91)
-        cache.copy_(torch.arange(5, dtype=torch.int32, device=device))
+        cache.copy_(torch.arange(pool, dtype=torch.int32, device=device))
         ref_tail, ref_cache = tail.cpu().clone(), cache.cpu().clone()
+        ref_ids, ref_mask, ref_previous, ref_prefix = (
+            t.cpu() for t in (ids, mask, previous, prefix)
+        )
         pos = 0
         for i, (slot, length, count) in enumerate(
             zip(slots.tolist(), lengths.tolist(), accepted.tolist())
         ):
             delta = length if i < num_extends else count
-            if slot != 4:
+            if slot != pool - 1:
                 if delta:
                     last = pos + delta - 1
-                    ref_tail[slot, 0] = int(ids[last]) if bool(mask[last]) else -1
-                    ref_tail[slot, 1:] = previous[last, :2].cpu()
+                    ref_tail[slot, 0] = (
+                        int(ref_ids[last]) if bool(ref_mask[last]) else -1
+                    )
+                    ref_tail[slot, 1:] = ref_previous[last, :2]
                 else:
-                    ref_tail[slot] = prefix[i].cpu()
+                    ref_tail[slot] = ref_prefix[i]
                 ref_cache[slot] += delta
             pos += length
         capture.replay() if graph else invoke()

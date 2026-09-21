@@ -603,3 +603,51 @@ def test_k_only_rope_matches_a_paired_call(
         solution=solution,
     )
     torch.testing.assert_close(k_only, paired, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_vocab_shard_embedding_masks_other_shards(
+    dtype: torch.dtype, index_dtype: torch.dtype, device: str
+) -> None:
+    """One gather reproduces the mask-then-lookup vocabulary-parallel path."""
+    from tokenspeed_kernel.ops.embedding import vocab_shard_embedding
+
+    torch.manual_seed(3)
+    org_start, org_end, padding, added_start, added_end = 500, 1000, 24, 2000, 2016
+    weight = torch.randn(
+        org_end - org_start + padding + added_end - added_start + 8,
+        96,
+        device=device,
+        dtype=dtype,
+    )
+    ids = torch.tensor(
+        [0, 499, 500, 777, 999, 1000, 1999, 2000, 2015, 2016, 5000],
+        device=device,
+        dtype=index_dtype,
+    ).view(1, -1)
+
+    original = (ids >= org_start) & (ids < org_end)
+    added = (ids >= added_start) & (ids < added_end)
+    added_offset = added_start - (org_end - org_start) - padding
+    local = (original | added) * (ids - org_start * original - added_offset * added)
+    expected = torch.nn.functional.embedding(local, weight)
+    expected.masked_fill_(~(original | added).unsqueeze(-1), 0)
+
+    out = vocab_shard_embedding(
+        weight, ids, (org_start, org_end), padding, (added_start, added_end)
+    )
+    assert out.shape == (1, ids.shape[1], 96) and out.dtype == dtype
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    assert out[0, [0, 1, 5, 6, 9, 10]].eq(0).all()
+    assert vocab_shard_embedding(
+        weight, ids[:, :0], (org_start, org_end), padding, (added_start, added_end)
+    ).shape == (1, 0, 96)
+    with pytest.raises(ValueError):
+        vocab_shard_embedding(
+            weight, ids, (org_start, org_end), padding, (added_start, added_end + 100)
+        )
+    with pytest.raises(ValueError):
+        vocab_shard_embedding(
+            weight, ids[:, ::2], (org_start, org_end), padding, (added_start, added_end)
+        )

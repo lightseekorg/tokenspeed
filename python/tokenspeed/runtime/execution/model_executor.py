@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 import tokenspeed_kernel
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.metadata import advance_accepted_frontier
 from tokenspeed_kernel.ops.metadata.ngram import commit_ngram_inputs
 from tokenspeed_kernel.ops.tuning import (
     autotune,
@@ -1127,17 +1128,18 @@ class ModelExecutor:
                 ib.state_write_padding_pool_index,
             )
             return
-        if num_extends == 0:
-            deltas = accept_lengths
-        elif num_extends == bs:
-            deltas = input_lengths
-        else:
-            deltas = torch.cat(
-                [input_lengths[:num_extends], accept_lengths[num_extends:]]
-            )
-        live = req_pool_indices != ib.state_write_padding_pool_index
-        deltas = torch.where(live, deltas, 0)
-        self.runtime_states.update_valid_cache_length(req_pool_indices, deltas)
+        advance_accepted_frontier(
+            req_pool_indices,
+            input_lengths,
+            accept_lengths,
+            self.runtime_states.valid_cache_lengths,
+            num_extends,
+            ib.state_write_padding_pool_index,
+            ngram_tail=None,
+            ngram_previous_tokens=None,
+            ngram_token_mask=None,
+            input_ids=None,
+        )
 
     def _build_sampling_info(self, bs: int) -> SamplingBatchInfo:
         return SamplingBatchInfo(

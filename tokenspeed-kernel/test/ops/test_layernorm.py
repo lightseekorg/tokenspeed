@@ -579,3 +579,55 @@ def test_fused_qk_rmsnorm_rope_non_contiguous_input(
 
     torch.testing.assert_close(q_fused, q_contig_fused, atol=0, rtol=0)
     torch.testing.assert_close(k_fused, k_contig_fused, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("hidden_size", [128, 512, 5120])
+def test_reference_rmsnorm_matches_eager_cast_order(
+    dtype: torch.dtype, hidden_size: int, device: str
+) -> None:
+    """The fused kernel reproduces the eager reference row by row.
+
+    The reference scales in FP32, multiplies the FP32 weight, and rounds
+    once; ``torch.mean`` multiplies by the reciprocal of N. Only the FP32
+    summation order may differ, which a bf16/fp16 round trip absorbs.
+    """
+    from tokenspeed_kernel.ops.layernorm import reference_rmsnorm
+
+    torch.manual_seed(7)
+    eps = 1e-6
+    x = torch.randn(33, hidden_size, device=device, dtype=dtype) * 4
+    x[0] *= 1e-3
+    x[1] *= 1e3
+    weight = (torch.rand(hidden_size, device=device) + 0.5).to(torch.bfloat16)
+    values = x.float()
+    values = values * torch.rsqrt(values.square().mean(-1, keepdim=True) + eps)
+    expected = (weight.float() * values).to(dtype)
+    out = reference_rmsnorm(x, weight, eps, None)
+    if dtype == torch.float32:
+        torch.testing.assert_close(out, expected, rtol=2e-6, atol=0)
+    else:
+        # A different FP32 summation order can move a value across a
+        # rounding boundary, never further than one low-precision ulp.
+        ulp = 2.0 ** (-7 if dtype == torch.bfloat16 else -10)
+        torch.testing.assert_close(out.float(), expected.float(), rtol=ulp, atol=0)
+        assert out.eq(expected).float().mean() > 0.999
+    # Column slices of a wider row are accepted and land in a caller buffer.
+    wide = torch.randn(9, 3 * hidden_size, device=device, dtype=dtype)
+    destination = torch.empty(9, hidden_size, device=device, dtype=dtype)
+    got = reference_rmsnorm(
+        wide[:, hidden_size : 2 * hidden_size], weight, eps, destination
+    )
+    assert got is destination
+    torch.testing.assert_close(
+        got,
+        reference_rmsnorm(
+            wide[:, hidden_size : 2 * hidden_size].contiguous(), weight, eps, None
+        ),
+        rtol=0,
+        atol=0,
+    )
+    with pytest.raises(ValueError):
+        reference_rmsnorm(x.t(), weight, eps, None)
+    with pytest.raises(ValueError):
+        reference_rmsnorm(x, weight[:-1], eps, None)

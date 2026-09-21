@@ -54,6 +54,7 @@ from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import DSparkVanilla
 from tokenspeed.runtime.models.deepseek_v41 import (
     DeepseekV41ForCausalLM,
     DeepseekV41Model,
+    _merged,
     _norm,
     _replicated,
     v41_hc_pre,
@@ -81,26 +82,13 @@ class _WindowSelection:
     through ``indices``). ``indices`` is the int32 ``[batch * block, width]``
     selection into the compact per-request workspace ``[history rows, block
     rows]``: history columns are -1 where the slot is invalid, the block's own
-    rows are always visible. All three are shared by every stage.
+    rows are always visible. All three come from ``dsv41.dspark_block`` and
+    are shared by every stage.
     """
 
     page: torch.Tensor
     row: torch.Tensor
     indices: torch.Tensor
-
-    @classmethod
-    def build(
-        cls, history_slots: torch.Tensor, block_size: int, rows_per_page: int
-    ) -> _WindowSelection:
-        batch, window = history_slots.shape
-        slots = history_slots.clamp_min(0).long()
-        width = window + block_size
-        indices = torch.arange(
-            batch * width, dtype=torch.int32, device=history_slots.device
-        ).view(batch, width)
-        indices[:, :window].masked_fill_(history_slots < 0, -1)
-        indices = indices[:, None, :].expand(-1, block_size, -1).reshape(-1, width)
-        return cls(slots // rows_per_page, slots % rows_per_page, indices)
 
 
 def _write_window_rows(
@@ -123,12 +111,11 @@ def _write_window_rows(
 class _WindowAttention:
     """Borrow one stage's LCM window pages for one forward; no state survives."""
 
-    def __init__(self, positions, window, history_slots, block_size, selection):
+    def __init__(
+        self, positions, window, history_slots, block_size, selection, request_indices
+    ):
         self.meta = SimpleNamespace(
-            positions=positions,
-            request_indices=torch.arange(
-                history_slots.shape[0], device=history_slots.device
-            ).repeat_interleave(block_size),
+            positions=positions, request_indices=request_indices
         )
         self.window = window
         self.history_slots = history_slots
@@ -147,9 +134,22 @@ class _WindowAttention:
         """
         batch, block = self.history_slots.shape[0], self.block_size
         history = self.window[self.selection.page, self.selection.row]
-        if swa_rope_cache is not None:
-            swa = rope_inplace(swa.clone(), positions, swa_rope_cache, None)
-        return torch.cat((history, _quantized_kv(swa).reshape(batch, block, -1)), dim=1)
+        if swa.is_cuda and swa.shape[-1] == 512:
+            rows = dsv41.dspark_rows(
+                swa,
+                None,
+                None,
+                positions if swa_rope_cache is not None else None,
+                swa_rope_cache,
+                None,
+                None,
+                torch.empty_like(swa),
+            )
+        else:
+            if swa_rope_cache is not None:
+                swa = rope_inplace(swa.clone(), positions, swa_rope_cache, None)
+            rows = _quantized_kv(swa)
+        return torch.cat((history, rows.reshape(batch, block, -1)), dim=1)
 
     def forward_v41(
         self,
@@ -215,9 +215,6 @@ class _WindowAttention:
 
 class DeepseekV41DSparkModel(DeepseekV41Model):
     local_base_logits = DeepseekV4DSparkModel.local_base_logits
-    refresh_local_base_logits_head = (
-        DeepseekV4DSparkModel.refresh_local_base_logits_head
-    )
 
     def __init__(self, config, mapping, quant_config, prefix):
         if (
@@ -269,27 +266,40 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
             add_prefix("main_proj", prefix),
         )
         self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        vocab_args = dict(
+        # Every stage's wkv shard side by side: the context write needs only
+        # the KV columns of each stage's wq_a_wkv, so one GEMM serves all
+        # stages without computing their wq_a columns.
+        self.context_wkv = _merged(
+            config.hidden_size,
+            [config.head_dim] * stages,
+            torch.bfloat16,
+            v41_mxfp8_config(quant_config),
+            add_prefix("context_wkv", prefix),
+        )
+        # The bigram table is replicated so the block sampler gathers rows
+        # locally; the projection shares the LM head's vocabulary shards.
+        self.markov_embedding = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.dspark_markov_rank,
+            params_dtype=torch.bfloat16,
             org_num_embeddings=None,
             padding_size=64,
             quant_config=None,
+            prefix=add_prefix("markov_embedding", prefix),
+        )
+        self.markov_projection = ParallelLMHead(
+            num_embeddings=config.vocab_size,
+            embedding_dim=config.dspark_markov_rank,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            org_num_embeddings=None,
+            padding_size=64,
+            quant_config=None,
+            prefix=add_prefix("markov_projection", prefix),
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
             use_presharded_weights=False,
-        )
-        self.markov_embedding = VocabParallelEmbedding(
-            params_dtype=torch.bfloat16,
-            prefix=add_prefix("markov_embedding", prefix),
-            **vocab_args,
-        )
-        self.markov_projection = ParallelLMHead(
-            bias=False,
-            params_dtype=torch.float32,
-            prefix=add_prefix("markov_projection", prefix),
-            **vocab_args,
         )
         self.markov_head = DSparkVanillaMarkov(
             self.markov_embedding, self.markov_projection
@@ -302,9 +312,6 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
             device=self.norm.weight.device,
             dtype=torch.float32,
         )
-        self.register_buffer("_local_base_head_fp32", None, persistent=False)
-        self._local_base_head_source_ptr = None
-        self._local_base_head_source_version = None
 
     def _main_input(self, captured):
         if captured.shape[-1] != len(self.target_layer_ids) * self.hidden_size:
@@ -316,9 +323,8 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         )
         return _norm(projected, self.main_norm)
 
-    def _main_kv(self, attention, main_x, positions):
-        qkv, _ = attention.wq_a_wkv(main_x, block_scale=None, output_dtype=None)
-        _, kv = qkv.split((attention.q_norm.weight.numel(), attention.head_dim), dim=-1)
+    def _main_kv(self, attention, kv, positions):
+        """Reference chain for one stage's context rows: kv_norm, RoPE, FP8 round trip."""
         return _quantized_kv(
             attention.rotary_emb(_norm(kv, attention.kv_norm), positions, False)
         )
@@ -333,13 +339,29 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         if captured_hidden_states.numel() == 0:
             return
         main_x = self._main_input(captured_hidden_states)
+        kv, _ = self.context_wkv(main_x, block_scale=None, output_dtype=None)
         positions = positions.reshape(-1)
+        slots = slots.reshape(-1)
+        head_dim = self.attention_params["head_dim"]
         for stage, layer in enumerate(self.layers):
-            _write_window_rows(
-                cache_pool.dspark_kv(stage),
-                slots.reshape(-1),
-                self._main_kv(layer.attn, main_x, positions),
-            )
+            window = cache_pool.dspark_kv(stage)
+            stage_kv = kv[:, stage * head_dim : (stage + 1) * head_dim]
+            if kv.is_cuda and head_dim == 512:
+                layer.attn.rotary_emb._prepare_cache(kv.device)
+                dsv41.dspark_rows(
+                    stage_kv,
+                    layer.attn.kv_norm.weight,
+                    layer.attn.kv_norm.variance_epsilon,
+                    positions,
+                    layer.attn.rotary_emb.cos_sin_cache,
+                    window,
+                    slots,
+                    None,
+                )
+            else:
+                _write_window_rows(
+                    window, slots, self._main_kv(layer.attn, stage_kv, positions)
+                )
 
     def forward_backbone(
         self, bonus_token_ids, start_pos, history_slots, cache_pool, ctx
@@ -351,22 +373,22 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         verify row before this call.
         """
         batch = bonus_token_ids.numel()
-        ids = bonus_token_ids.new_full((batch, self.block_size), self.noise_token_id)
-        ids[:, 0] = bonus_token_ids
-        positions = (
-            start_pos[:, None]
-            + 1
-            + torch.arange(self.block_size, device=start_pos.device)[None, :]
-        ).reshape(-1)
-        h = self.embed_tokens(ids.reshape(-1))
-        h = h[:, None, :].repeat(1, self.config.hc_mult, 1)
-        pre_mix = h.new_zeros(h.shape[:2], dtype=torch.float32)
-        pre_mix[:, 0] = 1
         # Every stage's window field shares the SWA page geometry, so the
         # history addressing and the workspace selection are built once.
-        selection = _WindowSelection.build(
-            history_slots, self.block_size, cache_pool.dspark_kv(0).shape[1]
+        ids, positions, pre_mix, request_indices, page, row, indices = (
+            dsv41.dspark_block(
+                bonus_token_ids,
+                start_pos,
+                history_slots,
+                self.noise_token_id,
+                cache_pool.dspark_kv(0).shape[1],
+                self.config.hc_mult,
+                self.block_size,
+            )
         )
+        selection = _WindowSelection(page, row, indices)
+        h = self.embed_tokens(ids)
+        h = h[:, None, :].repeat(1, self.config.hc_mult, 1)
         for stage, layer in enumerate(self.layers):
             backend = _WindowAttention(
                 positions,
@@ -374,6 +396,7 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
                 history_slots,
                 self.block_size,
                 selection,
+                request_indices,
             )
             h, pre_mix = layer(
                 h,
@@ -425,7 +448,6 @@ class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigur
     def set_embed_and_head(self, embed, head) -> None:
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        self.model.refresh_local_base_logits_head(head, force=True)
 
     def checkpoint_weight_name_filter(self, name: str) -> bool:
         return name.removeprefix("model.").startswith("mtp.")
@@ -435,6 +457,13 @@ class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigur
         # These tensors are bound from the target before the drafter is constructed.
         del targets["embed.weight"]
         del targets["head.weight"]
+        # context_wkv gathers one shard per stage; load_weights presents each
+        # stage's checkpoint wkv tensor under a stage-qualified name.
+        for field in ("weight", "scale"):
+            merged = targets.pop(f"context_wkv.{field}", None)
+            if merged is not None:
+                for stage in range(self.model.num_stages):
+                    targets[f"context_wkv.{stage}.{field}"] = (merged[0], stage)
         return targets
 
     def load_weights(self, weights, **kwargs) -> None:
@@ -449,6 +478,11 @@ class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigur
                         f"Unexpected V4.1 DSpark checkpoint tensor: {raw_name}"
                     )
                 stage, suffix = int(match[1]), match[2]
+                wkv = re.fullmatch(r"attn\.wkv\.(weight|scale)", suffix)
+                if wkv is not None:
+                    # The context write's merged projection loads the same
+                    # shard as this stage's own wq_a_wkv.
+                    yield f"context_wkv.{stage}.{wkv[1]}", tensor
                 if stage == 0 and suffix.startswith(("main_proj.", "main_norm.")):
                     name = suffix
                 elif stage == self.model.num_stages - 1 and suffix == "norm.weight":
