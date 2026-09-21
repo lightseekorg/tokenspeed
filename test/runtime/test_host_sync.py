@@ -87,15 +87,15 @@ def test_allow_host_sync_scopes_the_exemption(sync_debug_off):
 def test_arming_follows_the_env(monkeypatch, sync_debug_off):
     monkeypatch.setenv("TOKENSPEED_DATA_PLANE_SYNC_DEBUG", "warn")
     assert envs.TOKENSPEED_DATA_PLANE_SYNC_DEBUG.get() == "warn"
-    device_module._arm_data_plane_sync_debug("cuda")
+    device_module.arm_data_plane_sync_debug("cuda")
     assert torch.cuda.get_sync_debug_mode() == 1
     monkeypatch.setenv("TOKENSPEED_DATA_PLANE_SYNC_DEBUG", "default")
     torch.cuda.set_sync_debug_mode(0)
-    device_module._arm_data_plane_sync_debug("cuda")
+    device_module.arm_data_plane_sync_debug("cuda")
     assert torch.cuda.get_sync_debug_mode() == 0
 
 
 def test_arming_rejects_unknown_modes(monkeypatch):
     monkeypatch.setenv("TOKENSPEED_DATA_PLANE_SYNC_DEBUG", "loud")
     with pytest.raises(ValueError, match="default, warn or error"):
-        device_module._arm_data_plane_sync_debug("cuda")
+        device_module.arm_data_plane_sync_debug("cuda")

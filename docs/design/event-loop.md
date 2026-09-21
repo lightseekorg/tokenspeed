@@ -140,7 +140,9 @@ the step in flight, so the next step's prologue and graph launch slip
 behind the current step's completion and `in_flight_depth` degrades to 0
 however it is configured. Results cross back through pinned non-blocking
 copies and an event the control plane waits on. This rule is enforced by
-torch's sync-debug mode, armed once startup (tuning, capture) has finished:
+torch's sync-debug mode, armed by `run_event_loop` as its last step before
+entering the round loop (weight loading, tuning, capture, the transfer and
+L2 builders and `EventLoop.__init__` all synchronize on purpose):
 `TOKENSPEED_DATA_PLANE_SYNC_DEBUG=warn` reports each offending site with its
 Python location, `error` raises there. CI runs the serving paths with
 `error`; the control plane's event wait and non-blocking copies are not

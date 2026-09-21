@@ -59,6 +59,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
 from tokenspeed.runtime.epd.prefill_hooks import EpdPrefillHooks
 from tokenspeed.runtime.execution.device import (
     DeviceRole,
+    arm_data_plane_sync_debug,
     build_device_side,
     maybe_control_plane_guard,
 )
@@ -1576,6 +1577,9 @@ def run_event_loop(
             # the loop and starts the first DP metadata collective.
             dist.barrier(group=event_loop.world_cpu_group)
 
+        # Everything before this point is startup and may synchronize; from
+        # here on a host synchronization on the data plane is a stall.
+        arm_data_plane_sync_debug(server_args.device)
         event_loop.event_loop()
 
     except Exception:  # noqa: BLE001 - process boundary; report and signal parent

@@ -787,11 +787,13 @@ class DeviceHandle:
         return self._thread.run(_apply_update)
 
 
-def _arm_data_plane_sync_debug(device: str) -> None:
+def arm_data_plane_sync_debug(device: str) -> None:
     """Arm torch's sync-debug mode for the serving phase when asked to.
 
-    Startup (weight loading, tuning, graph capture) synchronizes on purpose,
-    so the mode is set only once those have finished. It is process-wide:
+    Startup synchronizes on purpose -- weight loading, tuning, graph capture,
+    the PD transfer and L2 executor builders, the EPD admission's NCCL
+    warm-up in ``EventLoop.__init__`` -- so the loop arms the mode as its
+    very last step before entering the round loop. It is process-wide:
     the control plane's ``copy_event.synchronize()`` and non-blocking D2H
     copies are not flagged, so what it reports is exactly the host
     synchronization that serializes the data plane against the step in
@@ -1166,10 +1168,6 @@ def build_device_side(
             dtype=dtype,
         )
 
-    # Last: the L2 executor and the PD transfer built above still upload
-    # their own startup state through pageable copies, which the armed mode
-    # would (rightly, on a serving path) reject.
-    _arm_data_plane_sync_debug(server_args.device)
     return DeviceBuild(
         specs=specs,
         transfer=kv_transfer,
