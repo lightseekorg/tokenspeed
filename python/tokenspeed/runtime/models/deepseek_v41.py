@@ -989,21 +989,18 @@ class DeepseekV41MoE(DeepseekV4MoE):
                     is_shared_expert=False,
                 )
 
-    def _select_experts(self, hidden_states, image_mask):
+    def _renormalize_routing_weights(self) -> bool:
+        return self.config.norm_topk_prob and self.config.num_experts_per_tok > 1
+
+    def _routing_inputs(self, hidden_states, image_mask):
         bias_vl = self.gate.bias_vl
         if hidden_states.is_cuda and (bias_vl is None or image_mask is None):
-            return super()._select_experts(hidden_states, None)
+            return super()._routing_inputs(hidden_states, None)
         bias = self.gate.e_score_correction_bias
         if bias_vl is not None and image_mask is not None:
             bias = torch.where(image_mask.unsqueeze(-1), bias_vl, bias)
         logits = F.linear(hidden_states.float(), self.gate.weight.float())
-        scores = F.softplus(logits).sqrt()
-        ids = (scores + bias).topk(self.config.num_experts_per_tok, dim=-1).indices
-        weights = scores.gather(1, ids)
-        if self.config.norm_topk_prob and self.config.num_experts_per_tok > 1:
-            weights = weights / (weights.sum(-1, keepdim=True) + 1e-20)
-        # V4 applies routed_scaling_factor at its expert execution boundary.
-        return weights, ids.to(self.hash_indices_dtype), scores
+        return logits, bias, None, None
 
 
 class DeepseekV41DecoderLayer(nn.Module):

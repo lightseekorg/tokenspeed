@@ -25,7 +25,6 @@ from dataclasses import replace
 
 import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.moe import _select_experts
 from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
     TRTLLM_NVFP4_ISPP_ALIGNMENT,
 )
@@ -378,27 +377,6 @@ class MoELayer(torch.nn.Module):
                 raise RuntimeError("MoE weights must be processed before warmup")
             warmup(self.plan, self)
 
-    def select_experts(
-        self,
-        router_logits: torch.Tensor,
-        renormalize: bool,
-        correction_bias: torch.Tensor | None = None,
-        hash_indices_table: torch.Tensor | None = None,
-        input_ids: torch.Tensor | None = None,
-        need_scores: bool = True,
-        score_function: str = "sqrt_softplus",
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return _select_experts(
-            router_logits,
-            self.top_k,
-            renormalize,
-            correction_bias,
-            hash_indices_table,
-            input_ids,
-            need_scores,
-            score_function,
-        )
-
     @property
     def support_routing(self) -> bool:
         return self.plan["support_routing"]
@@ -433,7 +411,7 @@ class MoELayer(torch.nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        topk_output: TopKOutput,
+        topk_output: TopKOutput | None,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
         do_finalize: bool = True,
@@ -442,6 +420,13 @@ class MoELayer(torch.nn.Module):
         shared_input: torch.Tensor | None = None,
         shared_weight: torch.Tensor | None = None,
         shared_out: torch.Tensor | None = None,
+        router_logits: torch.Tensor | None = None,
+        routing_score_function: str | None = None,
+        routing_renormalize: bool = False,
+        routing_correction_bias: torch.Tensor | None = None,
+        routing_hash_indices_table: torch.Tensor | None = None,
+        routing_input_ids: torch.Tensor | None = None,
+        routed_scaling_factor: float = 1.0,
     ):
         """Run the planned MoE kernel over this layer's weights.
 
@@ -449,8 +434,8 @@ class MoELayer(torch.nn.Module):
             hidden_states: ``[tokens, hidden]`` local hidden states, or a
                 ``(packed_nvfp4, block_scales)`` pair for kernels accepting
                 prequantized input. Block scales use linear per-token layout.
-            topk_output: Routing result, or the raw logits when the kernel
-                routes itself.
+            topk_output: Precomputed routing result, or None when moe_apply
+                should produce routing from router_logits.
             num_global_tokens: Token count summed over the attention DP ranks.
             max_num_tokens_per_gpu: Largest per-GPU token count this forward.
             do_finalize: Whether the kernel must produce the finalized output.
@@ -460,6 +445,13 @@ class MoELayer(torch.nn.Module):
                 ``moe.utils.use_deepep_low_latency``.
             overlap_fn: Optional work to run inside an all-to-all EP dispatch
                 window; ignored by plans that own no dispatch legs.
+            router_logits: Router output used when topk_output is None.
+            routing_score_function: Score transformation performed by moe_apply.
+            routing_renormalize: Whether selected routing weights sum to one.
+            routing_correction_bias: Optional selection-only expert bias.
+            routing_hash_indices_table: Optional token-to-expert lookup table.
+            routing_input_ids: Token IDs used by hash routing.
+            routed_scaling_factor: Scale for the routed expert contribution.
         """
         if not do_finalize and not self.supports_deferred_finalize:
             raise AssertionError("MoELayer does not support do_finalize=False")
@@ -480,6 +472,27 @@ class MoELayer(torch.nn.Module):
             if all(value is not None for value in shared_tensors)
             else {}
         )
+
+        if topk_output is None:
+            return tokenspeed_kernel.moe_apply(
+                self.plan,
+                hidden_states,
+                self,
+                router_logits,
+                num_tokens_global=num_global_tokens,
+                max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                do_finalize=do_finalize,
+                low_latency=low_latency,
+                overlap_fn=overlap_fn,
+                routing_score_function=routing_score_function,
+                routing_top_k=self.top_k,
+                routing_renormalize=routing_renormalize,
+                routing_correction_bias=routing_correction_bias,
+                routing_hash_indices_table=routing_hash_indices_table,
+                routing_input_ids=routing_input_ids,
+                routed_scaling_factor=routed_scaling_factor,
+                **shared_kwargs,
+            )
 
         use_kernel_routing = topk_output.format.is_bypassed() or (
             self.support_routing and not self.supports_precomputed_topk

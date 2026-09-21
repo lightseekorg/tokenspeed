@@ -43,9 +43,6 @@ from tokenspeed_kernel import dsv4_linear_fp32 as _kernel_dsv4_linear_fp32
 from tokenspeed_kernel import mhc_fused_hc as fast_mhc_fused_hc
 from tokenspeed_kernel import mhc_post as fast_mhc_post
 from tokenspeed_kernel import mhc_pre as fast_mhc_pre
-from tokenspeed_kernel import (
-    pack_topk_router_logits,
-)
 from tokenspeed_kernel.ops.attention.dsa import dsa_decode_topk, dsa_prefill_topk
 from tokenspeed_kernel.ops.attention.dsv4 import (
     dsv4_decode_topk,
@@ -123,11 +120,6 @@ from tokenspeed.runtime.layers.moe import (
     build_moe_checkpoint_loader,
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer
-from tokenspeed.runtime.layers.moe.topk import (
-    BypassedTopKOutput,
-    StandardTopKOutput,
-    TopK,
-)
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
 from tokenspeed.runtime.layers.quantization import Fp8Config, Mxfp4Config
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -314,22 +306,6 @@ def hc_head(
     pre = torch.sigmoid(mixes * hc_scale.float() + hc_base.float()) + hc_eps
     y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
     return y.to(dtype)
-
-
-def pack_topk_as_router_logits(
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    num_experts: int,
-) -> torch.Tensor:
-    """Encode preselected top-k weights for BYPASSED TokenSpeed MoE backends.
-
-    MXFP4 backends currently build routing data from logits internally. Packing
-    the normalized top-k weights as log-probabilities with very negative values
-    elsewhere makes their TopK -> Softmax/Renormalize route recover the same
-    selected ids and weights without changing the shared backend.
-    """
-
-    return pack_topk_router_logits(topk_weights, topk_ids, num_experts)
 
 
 @dataclass(frozen=True)
@@ -1793,48 +1769,56 @@ class DeepseekV4MoE(nn.Module):
             ),
             process_group=expert_process_group,
         )
-        self.topk = TopK(
-            top_k=config.num_experts_per_tok,
-            renormalize=config.norm_topk_prob,
-            correction_bias=self.gate.e_score_correction_bias,
-            routed_scaling_factor=self.routed_scaling_factor,
-            output_format=self.experts.topk_output_format,
-        )
 
-    def _select_experts(
+    def _routing_inputs(
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        router_logits = self.gate(hidden_states)
-        fmt = getattr(self.experts, "topk_output_format", None)
-        need_scores = (
-            not self.use_mega_moe and fmt is not None and not fmt.is_bypassed()
-        )
-        return self.experts.select_experts(
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        if hidden_states.shape[0] == 0:
+            router_logits = hidden_states.new_empty(
+                (0, self.config.n_routed_experts), dtype=torch.float32
+            )
+        else:
+            router_logits = self.gate(hidden_states)
+        return (
             router_logits,
-            self.config.norm_topk_prob,
-            correction_bias=self.gate.e_score_correction_bias,
-            hash_indices_table=self.gate.tid2eid,
-            input_ids=input_ids,
-            need_scores=need_scores,
+            self.gate.e_score_correction_bias,
+            self.gate.tid2eid,
+            input_ids,
         )
 
-    def _make_topk_output(
+    def _renormalize_routing_weights(self) -> bool:
+        return self.config.norm_topk_prob
+
+    def _forward_routed_experts(
         self,
         hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        router_scores: torch.Tensor,
-    ):
-        if not self.experts.supports_precomputed_topk:
-            router_logits = pack_topk_as_router_logits(
-                topk_weights, topk_ids, self.config.n_routed_experts
-            )
-            return BypassedTopKOutput(
-                hidden_states, router_logits, self.topk.topk_config
-            )
-        return StandardTopKOutput(topk_weights, topk_ids, router_scores)
+        input_ids: torch.Tensor | None,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+    ) -> torch.Tensor:
+        router_logits, correction_bias, hash_indices_table, routing_input_ids = (
+            self._routing_inputs(hidden_states, input_ids)
+        )
+        return self.experts(
+            hidden_states=hidden_states,
+            topk_output=None,
+            num_global_tokens=num_global_tokens,
+            max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+            router_logits=router_logits,
+            routing_score_function="sqrt_softplus",
+            routing_renormalize=self._renormalize_routing_weights(),
+            routing_correction_bias=correction_bias,
+            routing_hash_indices_table=hash_indices_table,
+            routing_input_ids=routing_input_ids,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
 
     def _forward_shared_experts(
         self,
@@ -1863,36 +1847,14 @@ class DeepseekV4MoE(nn.Module):
         ctx: ForwardContext,
         comm_manager: CommManager,
     ) -> torch.Tensor:
-        if hidden_states.shape[0] == 0:
-            topk_weights = hidden_states.new_empty(
-                (0, self.config.num_experts_per_tok), dtype=torch.float32
-            )
-            topk_ids = torch.empty(
-                (0, self.config.num_experts_per_tok),
-                device=hidden_states.device,
-                dtype=torch.int64,
-            )
-        else:
-            with nvtx_range("moe_select_experts"):
-                topk_weights, topk_ids, _ = self._select_experts(
-                    hidden_states, input_ids
-                )
-
         shared = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
             with nvtx_range("moe_mega_experts"):
-                if self.routed_scaling_factor != 1.0:
-                    topk_weights = topk_weights * self.routed_scaling_factor
-                topk_output = StandardTopKOutput(
-                    topk_weights,
-                    topk_ids,
-                    None,
-                )
-                routed = self.experts(
-                    hidden_states=hidden_states,
-                    topk_output=topk_output,
-                    num_global_tokens=num_global_tokens,
-                    max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                routed = self._forward_routed_experts(
+                    hidden_states,
+                    input_ids,
+                    num_global_tokens,
+                    max_num_tokens_per_gpu,
                 )
             with fork.branch():
                 shared = self._forward_shared_experts(
@@ -1911,27 +1873,15 @@ class DeepseekV4MoE(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
-        with nvtx_range("moe_select_experts"):
-            topk_weights, topk_ids, router_scores = self._select_experts(
-                hidden_states, input_ids
-            )
-        with nvtx_range("moe_make_topk_output"):
-            topk_output = self._make_topk_output(
-                hidden_states, topk_weights, topk_ids, router_scores
-            )
         shared = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
             with nvtx_range("moe_experts"):
-                routed = self.experts(
-                    hidden_states=hidden_states,
-                    topk_output=topk_output,
-                    num_global_tokens=num_global_tokens,
-                    max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                routed = self._forward_routed_experts(
+                    hidden_states,
+                    input_ids,
+                    num_global_tokens,
+                    max_num_tokens_per_gpu,
                 )
-                if topk_output.format.is_bypassed() and not self.config.norm_topk_prob:
-                    routed *= topk_weights.sum(dim=-1, keepdim=True).to(routed.dtype)
-                if self.routed_scaling_factor != 1.0:
-                    routed *= self.routed_scaling_factor
             with fork.branch():
                 shared = self._forward_shared_experts(hidden_states)
         return routed + shared if shared is not None else routed

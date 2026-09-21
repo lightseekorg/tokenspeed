@@ -86,7 +86,7 @@ def _routing_kind(
     return "plain"
 
 
-def _select_experts(
+def _route_experts(
     router_logits: torch.Tensor,
     top_k: int,
     renormalize: bool,
@@ -130,8 +130,14 @@ def _select_experts(
     tokens, experts = router_logits.shape
     if not 0 < top_k <= experts:
         raise ValueError(f"top_k must be in [1, {experts}], got {top_k}")
-    if correction_bias is not None and correction_bias.shape != (experts,):
-        raise ValueError(f"correction_bias must have shape [{experts}]")
+    valid_bias_shapes = {(experts,), (tokens, experts)}
+    if (
+        correction_bias is not None
+        and tuple(correction_bias.shape) not in valid_bias_shapes
+    ):
+        raise ValueError(
+            f"correction_bias must have shape [{experts}] or [{tokens}, {experts}]"
+        )
     if hash_indices_table is not None:
         if input_ids is None:
             raise ValueError("hash-routed DeepSeek V4 MoE requires input_ids")
@@ -425,7 +431,8 @@ def moe_plan(
             None leaves the concrete kernel choice to the registry.
 
     The selected apply kernel owns plan metadata. A plan with support_routing
-    false requires precomputed top-k ids and weights when calling moe_apply.
+    false requires precomputed top-k ids and weights, either supplied by the
+    caller or produced by moe_apply's configured routing stage.
     Weight preprocessing is selected from the ordered candidates advertised by
     the selected apply kernel, then pinned by callable in the returned plan so load
     time does not rerun selection or conflict resolution.
@@ -480,6 +487,9 @@ def moe_plan(
     supports_deferred_finalize = True in apply_spec.traits.get(
         "supports_deferred_finalize", frozenset({False})
     )
+    requires_prescaled_routing_weights = True in apply_spec.traits.get(
+        "requires_prescaled_routing_weights", frozenset({False})
+    )
     return {
         "weight_dtype": weight_dtype,
         "activation": activation,
@@ -497,6 +507,7 @@ def moe_plan(
         "support_routing": support_routing,
         "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,
+        "requires_prescaled_routing_weights": requires_prescaled_routing_weights,
         "solution": apply_spec.solution,
         "internal_activation_dtype": internal_activation_dtype,
     }
@@ -562,6 +573,13 @@ def moe_apply(
     shared_input: torch.Tensor | None = None,
     shared_weight: torch.Tensor | None = None,
     shared_out: torch.Tensor | None = None,
+    routing_score_function: str | None = None,
+    routing_top_k: int | None = None,
+    routing_renormalize: bool = False,
+    routing_correction_bias: torch.Tensor | None = None,
+    routing_hash_indices_table: torch.Tensor | None = None,
+    routing_input_ids: torch.Tensor | None = None,
+    routed_scaling_factor: float = 1.0,
 ):
     """Apply a planned MoE kernel.
 
@@ -575,9 +593,9 @@ def moe_apply(
         router_logits: Router logits with shape [tokens, num_experts], or None
             for a precomputed-TopK kernel that consumes only IDs and weights.
         topk_weights: Optional precomputed expert weights with shape
-            [tokens, top_k]. Required when plan support_routing is false.
+            [tokens, top_k]. May be omitted when routing_score_function is set.
         topk_ids: Optional precomputed expert ids with shape [tokens, top_k].
-            Required when plan support_routing is false.
+            May be omitted when routing_score_function is set.
         num_tokens_global: Optional global token count for distributed MoE.
         max_num_tokens_per_gpu: Optional per-GPU token capacity hint.
         do_finalize: Whether the kernel must produce the finalized output.
@@ -601,10 +619,73 @@ def moe_apply(
         shared_out: Optional destination for the shared-expert down projection
             with shape [tokens, output_size]. Must be provided together with
             ``shared_input`` and ``shared_weight``.
+        routing_score_function: Optional score transformation used to produce
+            top-k routes before invoking the selected expert implementation.
+        routing_top_k: Number of routes selected when routing is requested.
+        routing_renormalize: Whether selected routing weights sum to one.
+        routing_correction_bias: Optional selection-only expert bias.
+        routing_hash_indices_table: Optional token-to-expert routing table.
+        routing_input_ids: Token IDs used by hash routing.
+        routed_scaling_factor: Scale applied once to the routed contribution.
 
     Solutions may use precomputed top-k tensors or route from logits directly.
     """
     data = x[0] if isinstance(x, tuple) else x
+    post_scale: float | torch.Tensor = routed_scaling_factor
+    if routing_score_function is not None:
+        if router_logits is None:
+            raise ValueError("router_logits are required for configured routing")
+        if routing_top_k is None:
+            raise ValueError("routing_top_k is required for configured routing")
+        if router_logits.shape[0] == 0:
+            topk_weights = torch.empty(
+                (0, routing_top_k),
+                dtype=torch.float32,
+                device=router_logits.device,
+            )
+            topk_ids = torch.empty(
+                (0, routing_top_k),
+                dtype=torch.int32,
+                device=router_logits.device,
+            )
+        else:
+            routing_solution = (
+                "torch"
+                if routing_correction_bias is not None
+                and routing_correction_bias.ndim == 2
+                else None
+            )
+            topk_weights, topk_ids, _ = _route_experts(
+                router_logits,
+                routing_top_k,
+                routing_renormalize,
+                routing_correction_bias,
+                routing_hash_indices_table,
+                routing_input_ids,
+                False,
+                routing_score_function,
+                solution=routing_solution,
+            )
+        if plan.get("requires_prescaled_routing_weights", False):
+            if routed_scaling_factor != 1.0:
+                topk_weights = topk_weights * routed_scaling_factor
+            post_scale = 1.0
+        elif not plan["supports_precomputed_topk"]:
+            if not plan["support_routing"]:
+                raise ValueError(
+                    "selected MoE kernel cannot consume configured routing"
+                )
+            router_logits = pack_topk_router_logits(
+                topk_weights,
+                topk_ids,
+                router_logits.shape[1],
+            )
+            if not routing_renormalize:
+                post_scale = (
+                    topk_weights.sum(dim=-1, keepdim=True) * routed_scaling_factor
+                )
+            topk_weights = None
+            topk_ids = None
     kernel = select_kernel(
         "moe",
         "apply",
@@ -632,7 +713,7 @@ def moe_apply(
         if all(value is not None for value in shared_tensors)
         else {}
     )
-    return kernel(
+    output = kernel(
         plan=plan,
         x=x,
         w=w,
@@ -646,3 +727,6 @@ def moe_apply(
         **a2a_kwargs,
         **shared_kwargs,
     )
+    if isinstance(post_scale, torch.Tensor) or post_scale != 1.0:
+        output = output * post_scale
+    return output

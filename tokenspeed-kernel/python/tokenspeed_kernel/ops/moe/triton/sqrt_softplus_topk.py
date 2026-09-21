@@ -30,7 +30,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 
 @triton.jit
-def _select_experts_kernel(
+def _sqrt_softplus_topk_kernel(
     logits_ptr,
     bias_ptr,
     hash_ptr,
@@ -165,7 +165,7 @@ def triton_sqrt_softplus_select_experts(
         else router_logits
     )
     if tokens:
-        _select_experts_kernel[(tokens,)](
+        _sqrt_softplus_topk_kernel[(tokens,)](
             router_logits,
             correction_bias,
             hash_indices_table,

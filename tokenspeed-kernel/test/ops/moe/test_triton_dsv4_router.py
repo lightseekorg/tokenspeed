@@ -27,7 +27,7 @@ import torch
 import torch.nn.functional as F
 from kimi3_reference import dequantize_mxfp4
 from tokenspeed_kernel import moe_apply, moe_plan, moe_process_weights
-from tokenspeed_kernel.ops.moe import _select_experts
+from tokenspeed_kernel.ops.moe import _route_experts
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
@@ -63,7 +63,7 @@ def test_router_matches_reference(
         if table is not None
         else None
     )
-    weights, ids, scores = _select_experts(
+    weights, ids, scores = _route_experts(
         logits,
         top_k=6,
         renormalize=renormalize,
@@ -100,7 +100,7 @@ def test_router_ties_and_graph_replay() -> None:
     logits = torch.zeros((2, 256), device="cuda", dtype=torch.float32)
 
     def run():
-        return _select_experts(
+        return _route_experts(
             logits,
             top_k=6,
             renormalize=True,
@@ -144,7 +144,7 @@ def test_router_nan_logits_keep_expert_ids_in_range(with_bias: bool) -> None:
     )
 
     def run() -> torch.Tensor:
-        _, ids, _ = _select_experts(
+        _, ids, _ = _route_experts(
             logits,
             top_k=6,
             renormalize=True,
@@ -243,24 +243,11 @@ def test_router_to_mxfp4_experts(tokens: int) -> None:
     w2 = dequantize_mxfp4(weights.w2_weight, weights.w2_weight_scale, group_size=32)
 
     def run() -> torch.Tensor:
-        route_weights, route_ids, _ = _select_experts(
-            logits,
-            top_k=top_k,
-            renormalize=True,
-            correction_bias=bias,
-            hash_indices_table=None,
-            input_ids=None,
-            need_scores=False,
-            override="triton_sqrt_softplus_select_experts",
-            solution=None,
-        )
         return moe_apply(
             plan,
             x,
             weights,
             logits,
-            topk_weights=route_weights,
-            topk_ids=route_ids,
             num_tokens_global=None,
             max_num_tokens_per_gpu=None,
             do_finalize=True,
@@ -269,6 +256,10 @@ def test_router_to_mxfp4_experts(tokens: int) -> None:
             shared_input=None,
             shared_weight=None,
             shared_out=None,
+            routing_score_function="sqrt_softplus",
+            routing_top_k=top_k,
+            routing_renormalize=True,
+            routing_correction_bias=bias,
         )
 
     def reference() -> torch.Tensor:

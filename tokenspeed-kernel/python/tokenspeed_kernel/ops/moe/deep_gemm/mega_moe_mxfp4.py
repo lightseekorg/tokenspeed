@@ -396,6 +396,7 @@ if platform.is_blackwell:
             "activation": frozenset({"swiglu"}),
             "routing_mode": frozenset({"precomputed_topk"}),
             "supports_deferred_finalize": frozenset({False}),
+            "requires_prescaled_routing_weights": frozenset({True}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
             "ispp_alignment": frozenset({128}),

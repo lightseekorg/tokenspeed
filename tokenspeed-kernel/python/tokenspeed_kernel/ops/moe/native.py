@@ -45,10 +45,10 @@ def torch_sqrt_softplus_select_experts(
     else:
         selection_scores = scores
         if correction_bias is not None:
-            selection_scores = selection_scores + correction_bias.to(
-                device=scores.device,
-                dtype=scores.dtype,
-            ).unsqueeze(0)
+            bias = correction_bias.to(device=scores.device, dtype=scores.dtype)
+            if bias.ndim == 1:
+                bias = bias.unsqueeze(0)
+            selection_scores = selection_scores + bias
         topk_ids = torch.topk(
             selection_scores,
             k=top_k,

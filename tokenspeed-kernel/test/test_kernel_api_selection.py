@@ -3553,11 +3553,11 @@ def _moe_apply_unquant_trtllm() -> object:
     )
 
 
-def _moe_select_experts_bias(tokens: int) -> object:
+def _moe_route_experts_bias(tokens: int) -> object:
     """Exercise bias-router selection across specialized and portable batches."""
     router_logits = torch.empty((tokens, 256), dtype=torch.float32)
     correction_bias = torch.empty((256,), dtype=torch.float32)
-    return _moe_pkg._select_experts(
+    return _moe_pkg._route_experts(
         router_logits,
         6,
         True,
@@ -3570,11 +3570,11 @@ def _moe_select_experts_bias(tokens: int) -> object:
     )
 
 
-def _moe_select_experts_hash() -> object:
+def _moe_route_experts_hash() -> object:
     router_logits = torch.empty((2, 384), dtype=torch.bfloat16)
     hash_indices_table = torch.zeros((8, 6), dtype=torch.int32)
     input_ids = torch.zeros((2,), dtype=torch.int64)
-    return _moe_pkg._select_experts(
+    return _moe_pkg._route_experts(
         router_logits,
         6,
         True,
@@ -5296,7 +5296,7 @@ _CASES = [
             "moe",
             "select_experts",
             "triton_sqrt_softplus_select_experts",
-            partial(_moe_select_experts_bias, tokens=tokens),
+            partial(_moe_route_experts_bias, tokens=tokens),
             id_suffix=f"bias-tokens{tokens}",
         )
         for tokens in (1, 2, 17)
@@ -5307,7 +5307,7 @@ _CASES = [
         "moe",
         "select_experts",
         "triton_sqrt_softplus_select_experts",
-        _moe_select_experts_hash,
+        _moe_route_experts_hash,
         id_suffix="hash",
     ),
     _case(
@@ -5316,7 +5316,7 @@ _CASES = [
         "moe",
         "select_experts",
         "cuda_sqrt_softplus_select_experts",
-        partial(_moe_select_experts_bias, tokens=2),
+        partial(_moe_route_experts_bias, tokens=2),
         id_suffix="bias",
     ),
     _case(
@@ -5325,7 +5325,7 @@ _CASES = [
         "moe",
         "select_experts",
         "cuda_sqrt_softplus_select_experts",
-        _moe_select_experts_hash,
+        _moe_route_experts_hash,
         id_suffix="hash",
     ),
     *[
@@ -5335,7 +5335,7 @@ _CASES = [
             "moe",
             "select_experts",
             expected,
-            partial(_moe_select_experts_bias, tokens=tokens),
+            partial(_moe_route_experts_bias, tokens=tokens),
             id_suffix=f"bias-tokens{tokens}",
         )
         for tokens, expected in (

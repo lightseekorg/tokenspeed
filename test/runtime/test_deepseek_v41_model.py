@@ -45,6 +45,7 @@ import torch.nn.functional as F
 import tokenspeed_kernel
 from safetensors import safe_open
 from safetensors.torch import save_file
+from tokenspeed_kernel.ops.moe import _route_experts
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -2218,7 +2219,14 @@ def test_routing_matches_reference_bias_and_normalization(topk, vision, with_ima
         weight=torch.eye(4), e_score_correction_bias=bias, bias_vl=bias_vl
     )
     moe.hash_indices_dtype = torch.int64
-    weights, ids, scores = moe._select_experts(logits, image_mask)
+    router_logits, actual_bias, _, _ = moe._routing_inputs(logits, image_mask)
+    weights, ids, scores = _route_experts(
+        router_logits,
+        topk,
+        topk > 1,
+        correction_bias=actual_bias,
+        solution="torch",
+    )
     expected_scores = F.softplus(logits).sqrt()
     expected_bias = torch.stack([bias, bias_vl]) if with_images else bias
     expected_ids = (expected_scores + expected_bias).topk(topk, dim=-1).indices
