@@ -265,6 +265,7 @@ class MoELayer(torch.nn.Module):
 
         # Moe Backend plan
         moe_backend = get_moe_backend().value
+        # Preserve the legacy CLI name; weight dtype selects the MegaMoE implementation.
         if moe_backend == "deep_gemm_mega_moe":
             moe_backend = "mega_moe"
         moe_backend = None if moe_backend == "auto" else moe_backend
