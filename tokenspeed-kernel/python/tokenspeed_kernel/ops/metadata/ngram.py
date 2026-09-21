@@ -21,7 +21,7 @@
 from dataclasses import dataclass
 
 import torch
-from tokenspeed_kernel._triton import libdevice, tl, triton
+from tokenspeed_kernel._triton import tl, triton
 
 
 @dataclass(frozen=True)
@@ -73,7 +73,7 @@ def _engram_remainder(value, prime, reciprocal):
     # reciprocal = floor(2**64 / prime). The high product underestimates the
     # quotient by at most one, so one subtraction corrects the remainder.
     # This is exact over uint64; no floating-point reciprocal or approximation.
-    quotient = libdevice.mulhi(value.to(tl.uint64), reciprocal.to(tl.uint64))
+    quotient = tl.umulhi(value.to(tl.uint64), reciprocal.to(tl.uint64))
     remainder = value - quotient * prime
     return tl.where(remainder >= prime, remainder - prime, remainder)
 
