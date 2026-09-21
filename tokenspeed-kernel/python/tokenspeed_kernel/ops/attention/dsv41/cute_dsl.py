@@ -194,6 +194,9 @@ def sparse_index_scores(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     heads = queries.shape[1]
     split = _split_k(tokens, blocks // _BLOCKS_PER_TILE)
+    # cute.compile specialises on element type as well as extent, and the
+    # public entry accepts either integer width for the index tensors, so the
+    # dtypes belong in the key rather than riding on the first caller's choice.
     key = (
         heads,
         split,
@@ -201,6 +204,9 @@ def sparse_index_scores(
         blocks,
         table.shape[1],
         values.shape[0],
+        table.dtype,
+        visible.dtype,
+        candidates.dtype,
     )
     compiled = _COMPILED.get(key)
     if compiled is None:
