@@ -92,8 +92,16 @@ records. Compare the
 responses, stop reasons, and extracted answers when investigating an accuracy
 miss before changing the token limit or sampling configuration.
 
+The NVIDIA Kimi-K2.5 EAGLE3 AIME25 gate allows `max_tokens=131072` within a
+262144-token context. A fixed-version diagnostic reproduced a 65536-token
+truncation; with the larger budget, the identical generated prefix continued
+to a correct answer and stopped naturally at 70332 tokens. This single-question
+result motivates the budget; the full 30-question gate still requires 0.93
+accuracy with batch size 16 and greedy sampling. EvalScope records are saved
+under `.ci-artifacts/published/evalscope-results` on success and failure.
+
 The AMD Kimi-K2.5 AIME25 gate allows `max_tokens=65536`, matching the NVIDIA
-Kimi-K2.5 EAGLE3 and DFlash tasks. The same question was truncated in both the
+Kimi-K2.5 DFlash task. The same question was truncated in both the
 [8K run](https://github.com/lightseekorg/tokenspeed/actions/runs/34763795877) and
 [16K run](https://github.com/lightseekorg/tokenspeed/actions/runs/34764637152).
 With the larger budget, the [64K run](https://github.com/lightseekorg/tokenspeed/actions/runs/34765831078)
