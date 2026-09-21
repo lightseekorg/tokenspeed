@@ -59,11 +59,6 @@ platform = current_platform()
 if platform.is_blackwell:
     prepare_cuda_toolkit_env()
     import deep_gemm
-    from tokenspeed_kernel.ops._deep_gemm.mega_moe_bf16 import (
-        prepare_mega_moe_bf16_jit,
-    )
-
-    prepare_mega_moe_bf16_jit()
 
 if platform.is_hopper:
     prepare_cuda_toolkit_env()

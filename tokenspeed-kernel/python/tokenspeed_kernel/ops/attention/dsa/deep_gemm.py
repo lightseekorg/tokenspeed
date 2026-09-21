@@ -121,11 +121,6 @@ if platform.is_hopper_plus:
     import deep_ep  # noqa: F401
     import deep_gemm
     import trtllm_kernel  # noqa: F401
-    from tokenspeed_kernel.ops._deep_gemm.mega_moe_bf16 import (
-        prepare_mega_moe_bf16_jit,
-    )
-
-    prepare_mega_moe_bf16_jit()
 
     def _deep_gemm_paged_mqa_plan(
         *,
