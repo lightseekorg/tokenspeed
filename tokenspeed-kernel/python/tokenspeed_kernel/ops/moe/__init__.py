@@ -432,7 +432,7 @@ def moe_plan(
     deepep_mode: str | None = None,
     deepep_low_latency_max_num_tokens_per_gpu: int | None = None,
     persistent_max_num_tokens_per_gpu: int | None = None,
-    fast_math: bool = True,
+    fast_math: bool,
     solution: str | None = None,
 ) -> dict:
     """Create a MoE execution plan.

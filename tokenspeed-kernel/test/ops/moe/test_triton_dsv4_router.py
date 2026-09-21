@@ -234,6 +234,7 @@ def test_router_to_mxfp4_experts(tokens: int) -> None:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     assert plan["apply_kernel_name"] == "triton_mxfp4_precomputed_moe_apply"
     moe_process_weights(plan, weights)

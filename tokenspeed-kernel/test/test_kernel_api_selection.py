@@ -2650,6 +2650,7 @@ def test_deepep_selects_apply_kernel_by_weight_dtype_without_pinned_solution(
             swiglu_form=None,
             activation_clamped=False,
             expert_id_repeats=False,
+            fast_math=True,
         )
     finally:
         Platform.override(real_platform)
@@ -2690,6 +2691,7 @@ def test_nvfp4_deepep_rejects_modes_without_normal_legs(
                 swiglu_form=None,
                 activation_clamped=False,
                 expert_id_repeats=False,
+                fast_math=True,
             )
     finally:
         Platform.override(real_platform)
@@ -2743,6 +2745,7 @@ def test_deepep_plan_carries_mode_and_low_latency_capacity(b200_platform) -> Non
             swiglu_form=None,
             activation_clamped=False,
             expert_id_repeats=False,
+            fast_math=True,
         )
     finally:
         Platform.override(real_platform)
@@ -2766,6 +2769,7 @@ def test_moe_plan_defaults_deepep_mode_to_auto() -> None:
         swiglu_form=None,
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     assert plan["deepep_mode"] == "auto"
     assert plan["deepep_low_latency_max_num_tokens_per_gpu"] is None
@@ -2795,6 +2799,7 @@ def test_moe_plan_rejects_invalid_deepep_mode(
             swiglu_form=None,
             activation_clamped=False,
             expert_id_repeats=False,
+            fast_math=True,
         )
 
 
@@ -3057,6 +3062,7 @@ def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
             swiglu_form="standard",
             activation_clamped=False,
             expert_id_repeats=False,
+            fast_math=True,
         )
     finally:
         Platform.override(real_platform)
@@ -3092,6 +3098,7 @@ def test_triton_mxfp4_supports_input_activation_dtype(
             swiglu_form="standard",
             activation_clamped=False,
             expert_id_repeats=False,
+            fast_math=True,
         )
         assert plan["apply_kernel_name"] == "triton_mxfp4_precomputed_moe_apply"
     finally:
@@ -3153,6 +3160,7 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
             swiglu_form=None,
             activation_clamped=False,
             expert_id_repeats=False,
+            fast_math=True,
         )
     finally:
         Platform.override(real_platform)
@@ -3197,6 +3205,7 @@ def test_gluon_mxfp4_swiglu_ep_traits_select_matching_kernel(
             swiglu_form="standard",
             activation_clamped=False,
             expert_id_repeats=False,
+            fast_math=True,
         )
     finally:
         Platform.override(real_platform)
@@ -3230,6 +3239,7 @@ def test_kimi3_mxfp4_situ_ep8_bias_avoids_a8_apply(
             swiglu_form=None,
             activation_clamped=False,
             expert_id_repeats=False,
+            fast_math=True,
         )
     finally:
         Platform.override(real_platform)
@@ -3320,6 +3330,7 @@ def test_kimi3_mxfp4_situ_tp_selection_on_cdna5(
             swiglu_form=None,
             activation_clamped=False,
             expert_id_repeats=False,
+            fast_math=True,
         )
     finally:
         Platform.override(real_platform)
@@ -3536,6 +3547,7 @@ def _moe_apply_unquant_trtllm() -> object:
         swiglu_form=None,
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3596,6 +3608,7 @@ def _moe_apply_unquant_cutlass() -> object:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3620,6 +3633,7 @@ def _moe_apply_fp8_cutlass() -> object:
         swiglu_form=None,
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3660,6 +3674,7 @@ def _moe_apply_mxfp4_plan(
         expert_id_repeats=expert_id_repeats,
         internal_activation_dtype=internal_activation_dtype,
         solution=solution,
+        fast_math=True,
     )
 
 
@@ -3840,6 +3855,7 @@ def _moe_apply_fp8_trtllm() -> object:
         swiglu_form=None,
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3864,6 +3880,7 @@ def _moe_apply_nvfp4_trtllm() -> object:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3894,6 +3911,7 @@ def _moe_apply_nvfp4_cutlass() -> object:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3919,6 +3937,7 @@ def _moe_apply_nvfp4_trtllm_routed() -> object:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3956,6 +3975,7 @@ def _moe_apply_nvfp4_trtllm_unconstrained_routing() -> object:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3982,6 +4002,7 @@ def _moe_apply_unquant_trtllm_routed() -> object:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -4019,6 +4040,7 @@ def _moe_apply_nvfp4_deepep_cutedsl() -> object:
         swiglu_form=None,
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -4047,6 +4069,7 @@ def _moe_apply_fp8_deepep_deep_gemm() -> object:
         swiglu_form=None,
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -4081,6 +4104,7 @@ def _moe_apply_mxfp4_trtllm() -> object:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -4106,6 +4130,7 @@ def _moe_apply_mxfp4_triton() -> object:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -4140,6 +4165,7 @@ def _moe_apply_unquant_triton() -> object:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -4172,6 +4198,7 @@ def _moe_apply_mxfp4_gluon() -> object:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -4195,6 +4222,7 @@ def _moe_apply_mxint4_trtllm() -> object:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -4218,6 +4246,7 @@ def _moe_apply_mxfp4_dynamic_tp() -> object:
         swiglu_form=None,
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -5763,6 +5792,7 @@ def test_b200_fp8_swiglu_selects_trtllm_routed_moe(
             swiglu_form="standard",
             activation_clamped=False,
             expert_id_repeats=False,
+            fast_math=True,
         )
 
         assert plan["apply_kernel_name"] == ("flashinfer_trtllm_fp8_routed_moe_apply")

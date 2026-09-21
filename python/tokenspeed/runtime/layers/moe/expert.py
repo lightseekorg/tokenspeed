@@ -313,6 +313,7 @@ class MoELayer(torch.nn.Module):
             ),
             persistent_max_num_tokens_per_gpu=persistent_max_num_tokens_per_gpu,
             solution=moe_backend,
+            fast_math=True,
         )
 
         create_layer_weights(
