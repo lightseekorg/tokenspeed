@@ -339,7 +339,10 @@ class BypassedTopKOutput(NamedTuple):
 class TopKOutput(Protocol):
     """Protocol for top-k outputs in different formats."""
 
-    output_scale: float | torch.Tensor
+    @property
+    def output_scale(self) -> float | torch.Tensor:
+        """Post-kernel scale to apply to the routed output."""
+        ...
 
     @property
     def format(self) -> TopKOutputFormat:
