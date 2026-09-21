@@ -47,7 +47,7 @@ _PORTABLE_CAPABILITY = CapabilityRequirement(vendors=frozenset({"nvidia", "amd"}
     priority=Priority.PORTABLE,
     traits={
         "is_causal": frozenset({False, True}),
-        "support_logit_cap": frozenset({False, True}),
+        "logit_cap": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
     },
 )
@@ -94,9 +94,9 @@ def triton_mla_prefill(
     priority=Priority.PORTABLE,
     traits={
         "q_len": frozenset({1}),
-        "sliding_window": frozenset({False, True}),
-        "support_logit_cap": frozenset({False, True}),
+        "logit_cap": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
+        "sliding_window": frozenset({False, True}),
     },
 )
 def triton_mla_decode_with_kvcache(

@@ -71,8 +71,8 @@ if current_platform().is_amd:
     _DSV4_MXFP4_TRAITS = {
         "index_heads": frozenset({32, 64}),
         "head_dim": frozenset({128}),
-        "topk": frozenset({512, 1024, 2048}),
         "page_size": frozenset({64}),
+        "topk": frozenset({512, 1024, 2048}),
         "index_k_format": frozenset({"mxfp4"}),
     }
 
@@ -198,19 +198,18 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "tokens": frozenset({1, 2, 3, 4, 5, 6}),
+            "num_tokens": frozenset({1, 2, 3, 4, 5, 6}),
+            "num_q_heads": frozenset({16, 32}),
             "head_dim": frozenset({512}),
-            "num_heads": frozenset({16, 32}),
-            "cache_layout": frozenset({"fp8_swa_page_planar"}),
-            "topk_layout": frozenset({"global_slots"}),
-            "support_sink": frozenset({True}),
-            "has_extra": frozenset({True}),
-            "has_extra_segment": frozenset({True}),
-            "swa_selected_width": frozenset({128}),
-            "extra_selected_width": frozenset({1024}),
             "swa_page_size": frozenset({64}),
             "extra_page_size": frozenset({64}),
+            "swa_selected_width": frozenset({128}),
+            "extra_selected_width": frozenset({1024}),
+            "cache_layout": frozenset({"fp8_swa_page_planar"}),
+            "has_extra_segment": frozenset({True}),
             "metadata_dtypes": frozenset({torch.int32}),
+            "sinks": frozenset({True}),
+            "topk_layout": frozenset({"global_slots"}),
         },
     )
     def gluon_dsv4_decode_split_gfx950(*args, **kwargs):
@@ -237,10 +236,10 @@ if current_platform().is_amd:
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({512}),
-            "cache_layout": frozenset({"dense_workspace"}),
-            "support_sink": frozenset({True}),
             "selected_width": frozenset({128, 384, 512, 640, 768, 1024, 1152}),
+            "cache_layout": frozenset({"dense_workspace"}),
             "metadata_dtypes": frozenset({torch.int32}),
+            "sinks": frozenset({True}),
         },
     )
     def gluon_dsv4_prefill_gfx950(*args, **kwargs):
@@ -268,10 +267,10 @@ if current_platform().is_amd:
         traits={
             "head_dim": frozenset({512}),
             "cache_layout": frozenset({"fp8_swa_page_planar"}),
-            "topk_layout": frozenset({"global_slots"}),
-            "support_sink": frozenset({True}),
-            "return_lse": frozenset({False}),
             "metadata_dtypes": frozenset({torch.int32}),
+            "return_lse": frozenset({False}),
+            "sinks": frozenset({True}),
+            "topk_layout": frozenset({"global_slots"}),
         },
     )
     def gluon_dsv4_decode_gfx1250(
@@ -324,10 +323,10 @@ if current_platform().is_amd:
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({512}),
-            "cache_layout": frozenset({"dense_workspace"}),
-            "support_sink": frozenset({True}),
             "selected_width": frozenset({128, 384, 512, 640, 768, 1024, 1152}),
+            "cache_layout": frozenset({"dense_workspace"}),
             "metadata_dtypes": frozenset({torch.int32}),
+            "sinks": frozenset({True}),
         },
     )
     def gluon_dsv4_prefill_gfx1250(*args, **kwargs):

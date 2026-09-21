@@ -56,8 +56,8 @@ if current_platform().is_amd:
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({64, 128}),
-            "sliding_window": frozenset({False, True}),
             "return_lse": frozenset({False, True}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def gluon_rel_mha_prefill_gfx950(*args, **kwargs):
@@ -89,8 +89,8 @@ if current_platform().is_amd:
         traits={
             "head_dim": frozenset({64, 128}),
             "page_size": frozenset({64, 128, 256}),
-            "sliding_window": frozenset({False, True}),
             "return_lse": frozenset({False, True}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def gluon_rel_mha_extend_gfx950(*args, **kwargs):
@@ -122,8 +122,8 @@ if current_platform().is_amd:
         traits={
             "head_dim": frozenset({64, 128}),
             "page_size": frozenset({64, 128, 256}),
-            "sliding_window": frozenset({False, True}),
             "return_lse": frozenset({False}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def gluon_rel_mha_decode_gfx950(*args, **kwargs):

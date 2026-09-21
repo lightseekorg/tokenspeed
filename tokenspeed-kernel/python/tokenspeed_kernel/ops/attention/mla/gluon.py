@@ -104,10 +104,10 @@ if current_platform().is_amd:
         traits={
             "q_len": frozenset({1}),
             "num_q_heads": frozenset(range(1, 17)),
-            "page_size": frozenset({64}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),
-            "support_logit_cap": frozenset({False}),
+            "page_size": frozenset({64}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
         },
     )
@@ -134,11 +134,10 @@ if current_platform().is_amd:
             "batch_size": frozenset({1}),
             "q_len": frozenset({1}),
             "num_q_heads": frozenset({64}),
-            "batch_size_div_64": frozenset({False}),
-            "page_size": frozenset({64}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),
-            "support_logit_cap": frozenset({False}),
+            "page_size": frozenset({64}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
         },
     )
@@ -165,11 +164,10 @@ if current_platform().is_amd:
             "batch_size": frozenset({2, 4}),
             "q_len": frozenset({1}),
             "num_q_heads": frozenset({64}),
-            "batch_size_div_64": frozenset({False}),
-            "page_size": frozenset({64}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),
-            "support_logit_cap": frozenset({False}),
+            "page_size": frozenset({64}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
         },
     )
@@ -200,10 +198,10 @@ if current_platform().is_amd:
         traits={
             "q_len": frozenset({1}),
             "num_q_heads": frozenset(range(1, 17)),
-            "page_size": frozenset({64}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),
-            "support_logit_cap": frozenset({False}),
+            "page_size": frozenset({64}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
         },
     )
@@ -232,10 +230,10 @@ if current_platform().is_amd:
         traits={
             "q_len": frozenset({1}),
             "num_q_heads": frozenset(range(1, 17)),
-            "page_size": frozenset({64}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),
-            "support_logit_cap": frozenset({False}),
+            "page_size": frozenset({64}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
         },
     )
@@ -273,12 +271,12 @@ if current_platform().is_amd:
             "batch_size": frozenset({1, 2, 4}),
             "q_len": frozenset({1}),
             "num_q_heads": frozenset({12, 16}),
-            "page_size": frozenset({64}),
+            "value_head_dim": frozenset({128}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),
-            "value_head_dim": frozenset({128}),
+            "page_size": frozenset({64}),
             "gate_kind": frozenset({"none", "sigmoid"}),
-            "support_logit_cap": frozenset({False}),
+            "logit_cap": frozenset({False}),
         },
     )
     def gluon_mla_decode_projected_value_gfx950(*args, **kwargs):
@@ -306,9 +304,9 @@ if current_platform().is_amd:
         priority=Priority.SPECIALIZED,
         traits={
             "batch_size": frozenset({1, 2, 4}),
-            "num_heads": frozenset({12, 16}),
-            "latent_dim": frozenset({512}),
-            "value_dim": frozenset({128}),
+            "num_q_heads": frozenset({12, 16}),
+            "value_head_dim": frozenset({128}),
+            "kv_lora_rank": frozenset({512}),
             "gate_kind": frozenset({"none", "sigmoid"}),
             "inputs_contiguous": frozenset({True}),
         },
@@ -351,9 +349,9 @@ if current_platform().is_amd:
             "output_width": frozenset({2304, 3072}),
             "output_prefix_width": frozenset({128, 2304, 3072}),
             "output_tail_width": frozenset({0, 64}),
-            "split_output": frozenset({False, True}),
             "inputs_contiguous": frozenset({True}),
             "outputs_inner_contiguous": frozenset({True}),
+            "split_output": frozenset({False, True}),
         },
     )
     def gluon_mla_normalize_project_query_gfx950(*args, **kwargs):
@@ -394,9 +392,9 @@ if current_platform().is_amd:
             "output_width": frozenset({2304, 3072}),
             "output_prefix_width": frozenset({128, 2304, 3072}),
             "output_tail_width": frozenset({0, 64}),
-            "split_output": frozenset({False, True}),
             "inputs_contiguous": frozenset({True}),
             "outputs_inner_contiguous": frozenset({True}),
+            "split_output": frozenset({False, True}),
         },
     )
     def gluon_mla_normalize_project_query_gfx1250(*args, **kwargs):
@@ -419,13 +417,13 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "batch_size_align": frozenset({64}),
             "q_len": frozenset({1}),
             "num_q_heads": frozenset({64, 128}),
-            "batch_size_div_64": frozenset({True}),
-            "page_size": frozenset({64}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),
-            "support_logit_cap": frozenset({False}),
+            "page_size": frozenset({64}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
         },
     )
@@ -456,10 +454,10 @@ if current_platform().is_amd:
         traits={
             "q_len": frozenset({1}),
             "num_q_heads": frozenset(range(1, 129)),
-            "page_size": frozenset({64}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),
-            "support_logit_cap": frozenset({False}),
+            "page_size": frozenset({64}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
         },
     )
@@ -497,12 +495,12 @@ if current_platform().is_amd:
             "batch_size": frozenset({1, 2, 4, 8}),
             "q_len": frozenset({1}),
             "num_q_heads": frozenset({12, 16}),
-            "page_size": frozenset({64}),
+            "value_head_dim": frozenset({128}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),
-            "value_head_dim": frozenset({128}),
+            "page_size": frozenset({64}),
             "gate_kind": frozenset({"none", "sigmoid"}),
-            "support_logit_cap": frozenset({False}),
+            "logit_cap": frozenset({False}),
         },
     )
     def gluon_mla_decode_projected_value_gfx1250(*args, **kwargs):
@@ -530,9 +528,9 @@ if current_platform().is_amd:
         priority=Priority.SPECIALIZED,
         traits={
             "batch_size": frozenset({1, 2, 4, 8}),
-            "num_heads": frozenset({12, 16}),
-            "latent_dim": frozenset({512}),
-            "value_dim": frozenset({128}),
+            "num_q_heads": frozenset({12, 16}),
+            "value_head_dim": frozenset({128}),
+            "kv_lora_rank": frozenset({512}),
             "gate_kind": frozenset({"none", "sigmoid"}),
             "inputs_contiguous": frozenset({True}),
         },
@@ -562,16 +560,16 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "num_q_heads": frozenset(range(1, 129)),
             # Absorbed attention wins only for short cached extends; longer
             # queries should use expanded prefix replay.
             "max_seqlen_q": frozenset(range(1, 257)),
-            "page_size": frozenset({64}),
+            "num_q_heads": frozenset(range(1, 129)),
             "qk_nope_head_dim": frozenset({128}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),
+            "page_size": frozenset({64}),
             "is_causal": frozenset({True}),
-            "support_logit_cap": frozenset({False}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
         },
     )
@@ -600,10 +598,10 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "qk_head_dim": frozenset({192}),
-            "v_head_dim": frozenset({128}),
+            "head_dim": frozenset({192}),
+            "value_head_dim": frozenset({128}),
             "is_causal": frozenset({False, True}),
-            "support_logit_cap": frozenset({False}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
         },
     )
@@ -632,10 +630,10 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "qk_head_dim": frozenset({192}),
-            "v_head_dim": frozenset({128}),
+            "head_dim": frozenset({192}),
+            "value_head_dim": frozenset({128}),
             "is_causal": frozenset({False, True}),
-            "support_logit_cap": frozenset({False}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
         },
     )

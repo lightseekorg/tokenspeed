@@ -716,11 +716,11 @@ def test_public_dispatch_supports_both_addressing_modes_and_geometry_fallbacks()
         "index_k_format": "fp8_scaled",
         "score_activation": "relu",
         "topk_layout": "global_slots",
-        "prefill_plan": True,
+        "has_prefill_plan": True,
     }
 
     planned = select_kernel("attention", "kpool_prefill_topk", signature, traits=traits)
-    traits["prefill_plan"] = False
+    traits["has_prefill_plan"] = False
     table_addressed = select_kernel(
         "attention", "kpool_prefill_topk", signature, traits=traits
     )
