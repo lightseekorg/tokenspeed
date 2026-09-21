@@ -121,9 +121,42 @@ def buffers(request, monkeypatch):
             )
             seq_lens_out_ptr.copy_(starts + uniform_input_length)
 
+        def advance_accepted_frontier(
+            req_pool_indices,
+            input_lengths,
+            accept_lengths,
+            valid_cache_lengths,
+            num_extends,
+            padding_index,
+            *,
+            ngram_tail,
+            ngram_previous_tokens,
+            ngram_token_mask,
+            input_ids,
+        ):
+            deltas = torch.cat(
+                [input_lengths[:num_extends], accept_lengths[num_extends:]]
+            ).to(torch.int32)
+            deltas = torch.where(req_pool_indices != padding_index, deltas, 0)
+            if ngram_tail is not None:
+                last = (input_lengths.cumsum(0) - input_lengths + deltas - 1).clamp(
+                    0, input_ids.shape[0] - 1
+                )
+                current = torch.where(ngram_token_mask[last], input_ids[last], -1)
+                history = torch.cat(
+                    [current[:, None], ngram_previous_tokens[last, :-1]], dim=1
+                )
+                ngram_tail[req_pool_indices] = torch.where(
+                    (deltas > 0)[:, None], history, ngram_tail[req_pool_indices]
+                )
+            valid_cache_lengths.index_add_(0, req_pool_indices, deltas)
+
         monkeypatch.setattr(InputBuffers, "_bulk_pinned", bulk)
         monkeypatch.setattr(input_buffer, "compute_position_triton", positions)
         monkeypatch.setattr(input_buffer, "fused_decode_input_prep", decode_positions)
+        monkeypatch.setattr(
+            model_executor, "advance_accepted_frontier", advance_accepted_frontier
+        )
         tensor = torch.tensor
 
         def unpinned_tensor(*args, **kwargs):

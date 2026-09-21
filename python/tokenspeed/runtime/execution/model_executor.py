@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 import tokenspeed_kernel
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.metadata import advance_accepted_frontier
 from tokenspeed_kernel.ops.tuning import (
     autotune,
     set_autotune_max_num_tokens,
@@ -1104,39 +1105,20 @@ class ModelExecutor:
                 next_round_input_ids
             )
 
-        bs = req_pool_indices.shape[0]
-        if num_extends == 0:
-            deltas = accept_lengths
-        elif num_extends == bs:
-            deltas = input_lengths
-        else:
-            deltas = torch.cat(
-                [input_lengths[:num_extends], accept_lengths[num_extends:]]
-            )
         ib = self.input_buffers
-        live = req_pool_indices != ib.state_write_padding_pool_index
-        deltas = torch.where(live, deltas, 0)
         tail = self.runtime_states.ngram_accepted_tokens
-        if tail is not None:
-            assert ib.ngram_previous_tokens_buf is not None
-            assert ib.ngram_token_mask_buf is not None
-            # A accepted inputs end at row A-1, NOT at the sampled bonus or
-            # the end of the proposed window. Masks retain raw OOV barriers
-            # after input_ids_buf has been clamped for the embedding lookup.
-            last_rows = (input_lengths.cumsum(0) - input_lengths + deltas - 1).clamp(
-                0, ib.max_num_tokens - 1
-            )
-            current = torch.where(
-                ib.ngram_token_mask_buf[last_rows], ib.input_ids_buf[last_rows], -1
-            )
-            accepted_tail = torch.cat(
-                [current[:, None], ib.ngram_previous_tokens_buf[last_rows, :-1]],
-                dim=1,
-            )
-            tail[req_pool_indices] = torch.where(
-                (deltas > 0)[:, None], accepted_tail, tail[req_pool_indices]
-            )
-        self.runtime_states.update_valid_cache_length(req_pool_indices, deltas)
+        advance_accepted_frontier(
+            req_pool_indices,
+            input_lengths,
+            accept_lengths,
+            self.runtime_states.valid_cache_lengths,
+            num_extends,
+            ib.state_write_padding_pool_index,
+            ngram_tail=tail,
+            ngram_previous_tokens=ib.ngram_previous_tokens_buf,
+            ngram_token_mask=ib.ngram_token_mask_buf,
+            input_ids=ib.input_ids_buf if tail is not None else None,
+        )
 
     def _build_sampling_info(self, bs: int) -> SamplingBatchInfo:
         return SamplingBatchInfo(

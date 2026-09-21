@@ -336,17 +336,18 @@ class DeepseekV4DSparkModel(nn.Module):
             prefix=add_prefix("embed_tokens", prefix),
             **target_vocab_parallel_kwargs,
         )
+        # The bigram table is replicated so the block sampler gathers rows
+        # locally; the projection shares the LM head's vocabulary shards.
         self.markov_embedding = VocabParallelEmbedding(
             int(config.vocab_size),
             self.markov_rank,
-            params_dtype=torch.float32,
+            params_dtype=torch.bfloat16,
             prefix=add_prefix("markov_embedding", prefix),
-            **target_vocab_parallel_kwargs,
         )
         self.markov_projection = ParallelLMHead(
             int(config.vocab_size),
             self.markov_rank,
-            params_dtype=torch.float32,
+            params_dtype=torch.bfloat16,
             quant_config=None,
             prefix=add_prefix("markov_projection", prefix),
             **target_vocab_parallel_kwargs,
@@ -364,9 +365,6 @@ class DeepseekV4DSparkModel(nn.Module):
             prefix=add_prefix("confidence_projection", prefix),
         )
         self.confidence_head = DSparkConfidenceHead(self.confidence_projection)
-        self.register_buffer("_local_base_head_fp32", None, persistent=False)
-        self._local_base_head_source_ptr: int | None = None
-        self._local_base_head_source_version: int | None = None
 
         head_dim = int(getattr(config, "head_dim"))
         self.attention_params = {
@@ -537,71 +535,27 @@ class DeepseekV4DSparkModel(nn.Module):
     def local_base_logits(
         self,
         hidden_states: torch.Tensor,
-        lm_head: nn.Module | None,
+        head: torch.Tensor,
     ) -> torch.Tensor:
         """Compute public FP32 base logits from the local vocabulary shard.
 
-        Production DSpark replay uses a stable FP32 head buffer initialized by
-        ``set_embed_and_head``. Passing a head keeps the uncached reference
-        path available; production callers pass ``None`` for the replay buffer.
+        ``head`` is the target's BF16 shard shared with the draft. BF16
+        products are exact in FP32, so accumulating them in FP32 reproduces
+        the reference's FP32 head GEMM up to summation order without keeping
+        an FP32 copy of the head.
         """
 
-        if lm_head is not None:
-            head_fp32 = lm_head.weight.float()
-        else:
-            head_fp32 = self._local_base_head_fp32
-            if head_fp32 is None:
-                raise RuntimeError(
-                    "DSpark local base logits require a cached target LM head."
-                )
-        return torch.matmul(hidden_states.float(), head_fp32.T)
-
-    def refresh_local_base_logits_head(
-        self,
-        head: torch.Tensor,
-        *,
-        force: bool,
-    ) -> bool:
-        """Refresh the stable FP32 local-head buffer after a weight update.
-
-        Returns ``True`` when the buffer was initialized or updated. Once the
-        buffer exists, its storage address and shape stay fixed so CUDA Graph
-        replays remain valid.
-        """
-
-        if head.ndim != 2:
+        if head.ndim != 2 or head.dtype != hidden_states.dtype:
             raise ValueError(
-                "DSpark target LM-head weight must be rank 2; "
-                f"got shape {tuple(head.shape)}."
+                "DSpark base logits need a rank-2 head in the hidden dtype; got "
+                f"{tuple(head.shape)} {head.dtype} for {hidden_states.dtype}."
             )
-        source_ptr = head.data_ptr()
-        source_version = int(head._version)
-        cached = self._local_base_head_fp32
-        if cached is None:
-            cached = torch.empty(
-                head.shape,
-                dtype=torch.float32,
-                device=head.device,
-            )
-            with torch.no_grad():
-                cached.copy_(head)
-            self._local_base_head_fp32 = cached
-        elif not force and (
-            source_ptr == self._local_base_head_source_ptr
-            and source_version == self._local_base_head_source_version
-        ):
-            return False
+        flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        if flat.is_cuda:
+            logits = torch.mm(flat, head.T, out_dtype=torch.float32)
         else:
-            if cached.shape != head.shape or cached.device != head.device:
-                raise RuntimeError(
-                    "DSpark target LM-head shape or device changed after the "
-                    "FP32 replay buffer was initialized."
-                )
-            with torch.no_grad():
-                cached.copy_(head)
-        self._local_base_head_source_ptr = source_ptr
-        self._local_base_head_source_version = source_version
-        return True
+            logits = flat.float() @ head.float().T
+        return logits.view(*hidden_states.shape[:-1], head.shape[0])
 
     def write_context_windows_batched(
         self,
@@ -695,7 +649,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module, TargetCaptureConfigurator):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        self.model.refresh_local_base_logits_head(head, force=True)
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 

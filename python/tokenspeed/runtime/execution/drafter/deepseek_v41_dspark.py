@@ -49,6 +49,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_SWA_GROUP_ID,
 )
 from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import (
+    dspark_greedy_workspace,
     sample_dspark_block_greedy,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -110,12 +111,11 @@ class DeepseekV41DSpark(BaseDrafter):
         self.draft_tokens_buf = torch.empty(
             (max_bs, self.block_size), dtype=torch.int32, device=self.device
         )
-        tp_size = int(self.draft_model.mapping.attn.tp_size)
-        self.gathered_values = torch.empty(
-            (tp_size, max_bs), dtype=torch.float32, device=self.device
-        )
-        self.gathered_ids = torch.empty(
-            (tp_size, max_bs), dtype=torch.int64, device=self.device
+        self.candidates, self.partials = dspark_greedy_workspace(
+            int(self.draft_model.mapping.attn.tp_size),
+            max_bs,
+            int(self.draft_model.lm_head.num_embeddings_per_partition),
+            self.device,
         )
 
     def wire_target(self, target_model) -> None:
@@ -130,13 +130,8 @@ class DeepseekV41DSpark(BaseDrafter):
         request_pool_indices: list[int],
         num_extends: int,
     ) -> None:
-        """Refresh target-derived weights; window pages are scheduler-owned."""
+        """Window pages are scheduler-owned; nothing to refresh per round."""
         del request_ids, request_pool_indices, num_extends
-        if hasattr(self, "lm_head"):
-            self.model.refresh_local_base_logits_head(self.lm_head.weight, force=False)
-
-    def on_target_weights_updated(self) -> None:
-        self.model.refresh_local_base_logits_head(self.lm_head.weight, force=True)
 
     def _draft_decode_rows(
         self,
@@ -177,15 +172,15 @@ class DeepseekV41DSpark(BaseDrafter):
         draft_hidden = self.model.forward_backbone(
             bonus, start_pos, history_slots, pool, draft_ctx
         )
-        local_logits = self.model.local_base_logits(draft_hidden, None)
+        local_logits = self.model.local_base_logits(draft_hidden, self.lm_head.weight)
         sample_dspark_block_greedy(
             local_logits,
             bonus,
             self.model.markov_head,
             self.lm_head,
             self.tp_group,
-            self.gathered_values,
-            self.gathered_ids,
+            self.candidates,
+            self.partials,
             self.draft_tokens_buf[:num_decodes],
         )
         next_tokens[num_extends:, 1:].copy_(self.draft_tokens_buf[:num_decodes])

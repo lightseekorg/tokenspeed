@@ -215,9 +215,6 @@ class _WindowAttention:
 
 class DeepseekV41DSparkModel(DeepseekV41Model):
     local_base_logits = DeepseekV4DSparkModel.local_base_logits
-    refresh_local_base_logits_head = (
-        DeepseekV4DSparkModel.refresh_local_base_logits_head
-    )
 
     def __init__(self, config, mapping, quant_config, prefix):
         if (
@@ -269,27 +266,30 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
             add_prefix("main_proj", prefix),
         )
         self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        vocab_args = dict(
+        # The bigram table is replicated so the block sampler gathers rows
+        # locally; the projection shares the LM head's vocabulary shards.
+        self.markov_embedding = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.dspark_markov_rank,
+            params_dtype=torch.bfloat16,
             org_num_embeddings=None,
             padding_size=64,
             quant_config=None,
+            prefix=add_prefix("markov_embedding", prefix),
+        )
+        self.markov_projection = ParallelLMHead(
+            num_embeddings=config.vocab_size,
+            embedding_dim=config.dspark_markov_rank,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            org_num_embeddings=None,
+            padding_size=64,
+            quant_config=None,
+            prefix=add_prefix("markov_projection", prefix),
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
             use_presharded_weights=False,
-        )
-        self.markov_embedding = VocabParallelEmbedding(
-            params_dtype=torch.bfloat16,
-            prefix=add_prefix("markov_embedding", prefix),
-            **vocab_args,
-        )
-        self.markov_projection = ParallelLMHead(
-            bias=False,
-            params_dtype=torch.float32,
-            prefix=add_prefix("markov_projection", prefix),
-            **vocab_args,
         )
         self.markov_head = DSparkVanillaMarkov(
             self.markov_embedding, self.markov_projection
@@ -302,9 +302,6 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
             device=self.norm.weight.device,
             dtype=torch.float32,
         )
-        self.register_buffer("_local_base_head_fp32", None, persistent=False)
-        self._local_base_head_source_ptr = None
-        self._local_base_head_source_version = None
 
     def _main_input(self, captured):
         if captured.shape[-1] != len(self.target_layer_ids) * self.hidden_size:
@@ -425,7 +422,6 @@ class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigur
     def set_embed_and_head(self, embed, head) -> None:
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        self.model.refresh_local_base_logits_head(head, force=True)
 
     def checkpoint_weight_name_filter(self, name: str) -> bool:
         return name.removeprefix("model.").startswith("mtp.")

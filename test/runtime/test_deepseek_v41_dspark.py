@@ -437,11 +437,12 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch):
             SimpleNamespace(text_config=config), _mapping(0, 1, 1), _quant()
         )
     adapter.load_weights(_draft_checkpoint(adapter.model).items())
-    with torch.no_grad():
-        adapter.model.embed_tokens.weight.fill_(0.1)
-        adapter.lm_head.weight.fill_(0.1)
+    # The target lends its BF16 embedding and head; the draft's own are placeholders.
     adapter.set_embed_and_head(
-        adapter.model.embed_tokens.weight, adapter.lm_head.weight
+        *(
+            nn.Parameter(torch.full_like(p, 0.1, dtype=torch.bfloat16))
+            for p in (adapter.model.embed_tokens.weight, adapter.lm_head.weight)
+        )
     )
     model = adapter.model
     for module in model.modules():
