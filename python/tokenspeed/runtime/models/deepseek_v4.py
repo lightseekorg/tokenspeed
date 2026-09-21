@@ -39,7 +39,7 @@ from tokenspeed_kernel import (
     dsv4_grouped_output_projection_plan,
     dsv4_grouped_output_projection_warmup_model,
 )
-from tokenspeed_kernel import dsv4_linear_fp32 as _kernel_dsv4_linear_fp32
+from tokenspeed_kernel import dsv4_linear_fp32
 from tokenspeed_kernel import mhc_fused_hc as fast_mhc_fused_hc
 from tokenspeed_kernel import mhc_post as fast_mhc_post
 from tokenspeed_kernel import mhc_pre as fast_mhc_pre
@@ -1546,17 +1546,6 @@ class DeepseekV4MLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         out, _ = self.down_proj.forward_with_activation(gate_up, self.act_fn)
         return out
-
-
-def dsv4_linear_fp32(
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-) -> torch.Tensor:
-    """Use the registered accelerator projection."""
-    return _kernel_dsv4_linear_fp32(
-        hidden_states,
-        weight,
-    )
 
 
 class DeepseekV4MoEGate(nn.Module):
