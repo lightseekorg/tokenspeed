@@ -865,7 +865,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 ep_rank=0,
             ),
         )
-        gate = SimpleNamespace(e_score_correction_bias=None)
+        gate = SimpleNamespace(e_score_correction_bias=None, tid2eid=None)
 
         with (
             patch.object(deepseek_v4_model, "get_moe_backend", return_value=backend),
