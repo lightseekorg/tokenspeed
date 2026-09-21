@@ -25,6 +25,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import tokenspeed_kernel
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.tuning import (
@@ -660,10 +661,78 @@ class ModelExecutor:
                     positions=positions,
                     **ib.ngram_model_kwargs(num_tokens),
                 )
+            if self.drafter is not None:
+                self._autotune_draft_experts(num_tokens)
         set_autotune_process_group(None)
         torch.get_device_module(self.device).synchronize()
         dist.barrier()
         logger.info(f"Kernel tuning finished in {time.time() - tic:.1f}s")
+
+    def _autotune_draft_experts(self, num_tokens: int) -> None:
+        """Tune the draft model's routed-expert kernels inside the tuning window.
+
+        The dummy prefill drives the target model only. A draft with its own
+        expert geometry (DSpark's 128-expert MoE) is keyed separately by the
+        tuner and would otherwise fall back to untuned tactics on every draft
+        step. One apply per distinct expert geometry at the prefill token
+        count lets the tuner enumerate every smaller bucket, exactly as the
+        target's prefill does for the target experts.
+        """
+        from tokenspeed.runtime.layers.moe.expert import MoELayer
+
+        tuned: set[tuple] = set()
+        for layer in self.drafter.draft_model_runner.model.modules():
+            if not isinstance(layer, MoELayer):
+                continue
+            # All-to-all and MegaMoE plans own collectives sized by the real
+            # batch geometry; they have no FlashInfer tactics to tune either.
+            if (
+                layer.plan["a2a_backend"] == "deepep"
+                or layer.plan["solution"] == "mega_moe"
+            ):
+                continue
+            key = (
+                layer.plan["apply_kernel_name"],
+                layer.hidden_size,
+                layer.intermediate_size,
+                layer.num_experts,
+                layer.top_k,
+            )
+            if key in tuned:
+                continue
+            tuned.add(key)
+            hidden_states = torch.zeros(
+                num_tokens,
+                layer.hidden_size,
+                dtype=layer.input_dtype,
+                device=self.device,
+            )
+            # Distinct expert ids per token: kernels may reject repeats.
+            scores = torch.rand(num_tokens, layer.num_experts, device=self.device)
+            topk_weights, topk_ids = torch.topk(scores, layer.top_k, dim=-1)
+            topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
+            if layer.supports_precomputed_topk:
+                tokenspeed_kernel.moe_apply(
+                    layer.plan,
+                    hidden_states,
+                    layer,
+                    None,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids.to(torch.int32),
+                    num_tokens_global=num_tokens,
+                )
+            else:
+                tokenspeed_kernel.moe_apply(
+                    layer.plan,
+                    hidden_states,
+                    layer,
+                    scores.to(torch.float32),
+                    num_tokens_global=num_tokens,
+                )
+            logger.info(
+                f"Kernel tuning covered draft experts {layer.prefix!s} "
+                f"({layer.plan['apply_kernel_name']!s}, {layer.num_experts:d} experts)"
+            )
 
     @property
     def capturable_grammar(self):
