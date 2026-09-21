@@ -23,6 +23,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import resolve_group_slot
+from tokenspeed_kernel.ops.layernorm.triton import reference_rmsnorm_row
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -1019,13 +1020,76 @@ def _index_finish_parts(scores, ids, k, output, lengths):
     _finish_topk(values, ids.gather(1, positions), output, lengths)
 
 
-def _finish_topk(scores, ids, output, lengths):
-    valid = scores > -torch.inf
-    ids = ids.masked_fill(~valid, torch.iinfo(torch.int64).max).sort(dim=1).values
-    ids = ids.masked_fill(ids == torch.iinfo(torch.int64).max, -1)
-    output.fill_(-1)
-    output[:, : ids.shape[1]].copy_(ids)
-    lengths.copy_(valid.sum(dim=1))
+@triton.jit
+def _finish_topk_kernel(
+    Scores,
+    Ids,
+    Cands,
+    Out,
+    Lens,
+    S0,
+    I0,
+    C0,
+    C1,
+    O0,
+    WIDTH,
+    K,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_CANDIDATES: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    i = tl.arange(0, BLOCK)
+    taken = i < WIDTH
+    score = tl.load(Scores + row * S0 + i, taken, other=-float("inf"))
+    ident = tl.load(Ids + row * I0 + i, taken, other=0).to(tl.int64)
+    if HAS_CANDIDATES:
+        # Pool columns, not row ids: resolve each through its candidate block.
+        block = tl.load(
+            Cands + row * C0 + (ident // BLOCK_SIZE) * C1, taken, other=-1
+        ).to(tl.int64)
+        ident = block * BLOCK_SIZE + ident % BLOCK_SIZE
+    # A selector may return padding or masked entries; the score, not the id,
+    # says which ones count. Sentinels sort past every real id.
+    live = taken & (score > -float("inf"))
+    ident = tl.where(live, ident, 9223372036854775807)
+    ident = tl.sort(ident)
+    tl.store(
+        Out + row * O0 + i,
+        tl.where(ident == 9223372036854775807, -1, ident).to(tl.int32),
+        i < K,
+    )
+    tl.store(Lens + row, tl.sum(live.to(tl.int32), axis=0))
+
+
+def _finish_topk(scores, ids, output, lengths, candidates=None):
+    """Pack the selected ids into a sorted, -1 padded prefix and count them.
+
+    ``scores``/``ids`` are one selector's unsorted picks; entries scoring -inf
+    are padding. ``output`` is at least as wide as the picks, so one sorted
+    pass covers it. With ``candidates``, ``ids`` index the compacted candidate
+    pool and are resolved to row ids here rather than by the caller.
+    """
+    rows, width = scores.shape
+    if rows == 0:
+        return
+    _finish_topk_kernel[(rows,)](
+        scores,
+        ids,
+        candidates if candidates is not None else ids,
+        output,
+        lengths,
+        scores.stride(0),
+        ids.stride(0),
+        *(candidates.stride() if candidates is not None else (0, 0)),
+        output.stride(0),
+        width,
+        output.shape[1],
+        BLOCK_SIZE=8,
+        HAS_CANDIDATES=candidates is not None,
+        BLOCK=triton.next_power_of_2(max(1, output.shape[1])),
+        num_warps=8,
+    )
 
 
 def _index_topk_outputs(
@@ -1658,6 +1722,338 @@ def _launch_query(values, positions, cache, output, heads_to_write):
     return output
 
 
+@triton.jit
+def _dspark_rows_kernel(
+    X,
+    W,
+    POS,
+    CS,
+    SLOTS,
+    WINDOW,
+    OUT,
+    X0,
+    POS0,
+    CS0,
+    S0,
+    W0,
+    W1,
+    O0,
+    PAGES,
+    P: tl.constexpr,
+    MAX_POS: tl.constexpr,
+    R: tl.constexpr,
+    EPS: tl.constexpr,
+    HAS_NORM: tl.constexpr,
+    HAS_ROPE: tl.constexpr,
+    HAS_WINDOW: tl.constexpr,
+    HAS_OUT: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    d = tl.arange(0, 512)
+    x = tl.load(X + token * X0 + d).to(tl.float32)
+    if HAS_NORM:
+        weight = tl.load(W + d).to(tl.float32)
+        # The reference rounds the normalized row to BF16 before rotating it.
+        x = reference_rmsnorm_row(x, weight, EPS, 512).to(tl.bfloat16).to(tl.float32)
+    if HAS_ROPE:
+        position = tl.maximum(tl.load(POS + token * POS0).to(tl.int64), 0)
+        valid = position < MAX_POS
+        tl.device_assert(valid, "DSpark RoPE position is outside the cosine/sine table")
+        partner = tl.gather(x, d ^ 1, axis=0)
+        tail = d >= 512 - R
+        pair = (d - (512 - R)) // 2
+        cosine = tl.load(CS + position * CS0 + pair, tail & valid, 1.0)
+        sine = tl.load(CS + position * CS0 + R // 2 + pair, tail & valid, 0.0)
+        rotated = _rotate_interleaved(x, partner, cosine, sine, (d & 1) != 0)
+        x = tl.where(tail, rotated.to(tl.bfloat16), x.to(tl.bfloat16)).to(tl.float32)
+    # All-channel 1x32 E4M3/E8M0 round trip, the reference SWA row codec.
+    values = tl.reshape(x, (16, 32))
+    amax = tl.maximum(tl.max(tl.abs(values), 1), 1.0e-4)
+    bits = (amax * (1.0 / 448.0)).to(tl.int32, bitcast=True)
+    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    scale = (exponent << 23).to(tl.float32, bitcast=True)
+    quantized = tl.div_rn(values, scale[:, None]).to(tl.float8e4nv)
+    restored = tl.reshape(quantized.to(tl.float32) * scale[:, None], (512,)).to(
+        tl.bfloat16
+    )
+    if HAS_OUT:
+        tl.store(OUT + token * O0 + d, restored)
+    if HAS_WINDOW:
+        slot = tl.load(SLOTS + token * S0).to(tl.int64)
+        live = (slot >= 0) & (slot < PAGES * P)
+        page = tl.maximum(slot, 0) // P
+        row = tl.maximum(slot, 0) % P
+        tl.store(WINDOW + page * W0 + row * W1 + d, restored, live)
+
+
+@register_kernel(
+    "attention",
+    "dsv41_dspark_rows",
+    name="triton_dsv41_dspark_rows",
+    solution="triton",
+    capability=_CAPABILITY,
+    signatures=frozenset({format_signature(x=dense_tensor_format(torch.bfloat16))}),
+    traits={},
+    priority=Priority.PORTABLE,
+)
+def triton_dsv41_dspark_rows(
+    values, norm_weight, norm_eps, positions, cos_sin_cache, window, slots, out
+):
+    if values.ndim != 2 or values.shape[1] != 512 or values.stride(1) != 1:
+        raise ValueError(
+            "DSpark rows must be BF16 [tokens,512] with unit column stride"
+        )
+    tokens = values.shape[0]
+    has_norm = norm_weight is not None
+    if has_norm != (norm_eps is not None):
+        raise ValueError("DSpark kv_norm weight and epsilon come together")
+    if has_norm and (norm_weight.shape != (512,) or not norm_weight.is_contiguous()):
+        raise ValueError("DSpark kv_norm weight must be a contiguous [512] vector")
+    has_rope = cos_sin_cache is not None
+    if has_rope:
+        if positions is None:
+            raise ValueError("DSpark RoPE needs the rows' positions")
+        _integers(positions, (tokens,), "positions")
+        if (
+            cos_sin_cache.ndim != 2
+            or cos_sin_cache.dtype != torch.float32
+            or cos_sin_cache.shape[1] % 2
+            or not 2 <= cos_sin_cache.shape[1] <= 512
+            or cos_sin_cache.stride(1) != 1
+        ):
+            raise ValueError(
+                "DSpark RoPE table must be FP32 [positions,even rotary_dim]"
+            )
+    elif positions is not None:
+        raise ValueError("DSpark rows without a RoPE table take no positions")
+    has_window = window is not None
+    if has_window:
+        if slots is None:
+            raise ValueError("DSpark window writes need the rows' slots")
+        _integers(slots, (tokens,), "slots")
+        if (
+            window.ndim != 3
+            or window.dtype != torch.bfloat16
+            or window.shape[2] != 512
+            or window.stride(2) != 1
+        ):
+            raise ValueError("DSpark window must be a BF16 [pages,rows,512] field")
+    elif slots is not None:
+        raise ValueError("DSpark rows without a window take no slots")
+    if out is not None:
+        _output(out, (tokens, 512), torch.bfloat16, values.device)
+    if not (has_window or out is not None):
+        raise ValueError("DSpark rows need a window and/or an out destination")
+    _same_device(values, (norm_weight, positions, cos_sin_cache, window, slots, out))
+    if tokens == 0:
+        return
+    _dspark_rows_kernel[(tokens,)](
+        values,
+        norm_weight if has_norm else values,
+        positions if has_rope else values,
+        cos_sin_cache if has_rope else values,
+        slots if has_window else values,
+        window if has_window else values,
+        out if out is not None else values,
+        values.stride(0),
+        positions.stride(0) if has_rope else 0,
+        cos_sin_cache.stride(0) if has_rope else 0,
+        slots.stride(0) if has_window else 0,
+        window.stride(0) if has_window else 0,
+        window.stride(1) if has_window else 0,
+        out.stride(0) if out is not None else 0,
+        window.shape[0] if has_window else 0,
+        window.shape[1] if has_window else 1,
+        cos_sin_cache.shape[0] if has_rope else 1,
+        cos_sin_cache.shape[1] if has_rope else 2,
+        float(norm_eps) if has_norm else 0.0,
+        has_norm,
+        has_rope,
+        has_window,
+        out is not None,
+        num_warps=4,
+        enable_fp_fusion=False,
+        debug=True,
+    )
+
+
+@triton.jit
+def _dspark_anchors_kernel(
+    TOKENS,
+    ACCEPT,
+    POSITIONS,
+    NEXT,
+    START,
+    N0,
+    EXTENDS,
+    WIDTH: tl.constexpr,
+    SPEC: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    one = tl.arange(0, 1)
+    decode = row >= EXTENDS
+    index = row - EXTENDS
+    accepted = tl.minimum(tl.maximum(tl.load(ACCEPT + row).to(tl.int64), 1), WIDTH)
+    verify = EXTENDS + index * WIDTH + accepted - 1
+    bonus = tl.load(TOKENS + tl.where(decode, verify, row)).to(tl.int32)
+    columns = tl.arange(0, BLOCK)
+    tl.store(NEXT + row * N0 + columns, tl.zeros_like(columns) + bonus, columns < SPEC)
+    anchor_mask = decode & (one == 0)
+    anchor = tl.load(POSITIONS + index * WIDTH + accepted - 1 + one, anchor_mask, -1)
+    tl.store(START + index + one, anchor.to(tl.int64), anchor_mask)
+
+
+@register_kernel(
+    "attention",
+    "dsv41_dspark_anchors",
+    name="triton_dsv41_dspark_anchors",
+    solution="triton",
+    capability=_CAPABILITY,
+    signatures=_INTEGER_SIGNATURES,
+    traits={},
+    priority=Priority.PORTABLE,
+)
+def triton_dsv41_dspark_anchors(
+    output_tokens, accept_lengths, positions, num_extends, width, next_tokens, start_pos
+):
+    rows = accept_lengths.shape[0]
+    if rows == 0:
+        return
+    _dspark_anchors_kernel[(rows,)](
+        output_tokens,
+        accept_lengths,
+        positions,
+        next_tokens,
+        start_pos,
+        next_tokens.stride(0),
+        num_extends,
+        WIDTH=width,
+        SPEC=next_tokens.shape[1],
+        BLOCK=triton.next_power_of_2(next_tokens.shape[1]),
+        num_warps=1,
+    )
+
+
+@triton.jit
+def _dspark_block_kernel(
+    BONUS,
+    START,
+    HISTORY,
+    IDS,
+    POSITIONS,
+    PRE_MIX,
+    REQUESTS,
+    PAGE,
+    ROW,
+    INDICES,
+    B0,
+    S0,
+    H0,
+    NOISE,
+    WINDOW: tl.constexpr,
+    BLOCK: tl.constexpr,
+    HC: tl.constexpr,
+    P: tl.constexpr,
+    WINDOW_P2: tl.constexpr,
+    BLOCK_P2: tl.constexpr,
+    HC_P2: tl.constexpr,
+    WIDTH_P2: tl.constexpr,
+):
+    request = tl.program_id(0).to(tl.int64)
+    j = tl.arange(0, BLOCK_P2)
+    in_block = j < BLOCK
+    token = request * BLOCK + j
+    bonus = tl.load(BONUS + request * B0).to(tl.int32)
+    tl.store(IDS + token, tl.where(j == 0, bonus, NOISE), in_block)
+    start = tl.load(START + request * S0).to(tl.int64)
+    tl.store(POSITIONS + token, start + 1 + j, in_block)
+    tl.store(REQUESTS + token, tl.zeros_like(token) + request, in_block)
+    c = tl.arange(0, HC_P2)
+    one_hot = tl.where(c == 0, 1.0, 0.0).to(tl.float32)
+    tl.store(
+        PRE_MIX + token[:, None] * HC + c[None, :],
+        tl.broadcast_to(one_hot[None, :], (BLOCK_P2, HC_P2)),
+        in_block[:, None] & (c[None, :] < HC),
+    )
+    k = tl.arange(0, WINDOW_P2)
+    in_window = k < WINDOW
+    slot = tl.load(HISTORY + request * H0 + k, in_window, -1).to(tl.int64)
+    clamped = tl.maximum(slot, 0)
+    tl.store(PAGE + request * WINDOW + k, clamped // P, in_window)
+    tl.store(ROW + request * WINDOW + k, clamped % P, in_window)
+    # Workspace columns: history rows first, then the block's own rows; a
+    # history column is -1 where its slot is invalid.
+    WIDTH: tl.constexpr = WINDOW + BLOCK
+    column = tl.arange(0, WIDTH_P2)
+    history = column < WINDOW
+    in_width = column < WIDTH
+    hidden = tl.load(HISTORY + request * H0 + column, history, -1) < 0
+    value = tl.where(history & hidden, -1, request * WIDTH + column).to(tl.int32)
+    tl.store(
+        INDICES + token[:, None] * WIDTH + column[None, :],
+        tl.broadcast_to(value[None, :], (BLOCK_P2, WIDTH_P2)),
+        in_block[:, None] & in_width[None, :],
+    )
+
+
+@register_kernel(
+    "attention",
+    "dsv41_dspark_block",
+    name="triton_dsv41_dspark_block",
+    solution="triton",
+    capability=_CAPABILITY,
+    signatures=_INTEGER_SIGNATURES,
+    traits={},
+    priority=Priority.PORTABLE,
+)
+def triton_dsv41_dspark_block(
+    bonus, start_pos, history_slots, noise_token, rows_per_page, hc_mult, block_size
+):
+    requests, window = history_slots.shape
+    device = bonus.device
+    ids = torch.empty((requests * block_size,), dtype=torch.int32, device=device)
+    positions = torch.empty((requests * block_size,), dtype=torch.int64, device=device)
+    pre_mix = torch.empty(
+        (requests * block_size, hc_mult), dtype=torch.float32, device=device
+    )
+    request_indices = torch.empty(
+        (requests * block_size,), dtype=torch.int64, device=device
+    )
+    page = torch.empty((requests, window), dtype=torch.int64, device=device)
+    row = torch.empty((requests, window), dtype=torch.int64, device=device)
+    indices = torch.empty(
+        (requests * block_size, window + block_size), dtype=torch.int32, device=device
+    )
+    if requests:
+        _dspark_block_kernel[(requests,)](
+            bonus,
+            start_pos,
+            history_slots,
+            ids,
+            positions,
+            pre_mix,
+            request_indices,
+            page,
+            row,
+            indices,
+            bonus.stride(0),
+            start_pos.stride(0),
+            history_slots.stride(0),
+            noise_token,
+            WINDOW=window,
+            BLOCK=block_size,
+            HC=hc_mult,
+            P=rows_per_page,
+            WINDOW_P2=triton.next_power_of_2(window),
+            BLOCK_P2=triton.next_power_of_2(block_size),
+            HC_P2=triton.next_power_of_2(hc_mult),
+            WIDTH_P2=triton.next_power_of_2(window + block_size),
+            num_warps=4,
+        )
+    return ids, positions, pre_mix, request_indices, page, row, indices
+
+
 @triton.jit(do_not_specialize=["X0", "X1"], do_not_specialize_on_alignment=["X0", "X1"])
 def _pack_index_queries(X, V, S, X0, X1):
     row = tl.program_id(0).to(tl.int64)
@@ -1676,6 +2072,71 @@ def _pack_index_queries(X, V, S, X0, X1):
     word = tl.sum(exponent.to(tl.uint32) << (tl.arange(0, 4) * 8), 0)
     tl.store(V + row * 64 + tl.arange(0, 64), packed)
     tl.store(S + row, word.to(tl.int32))
+
+
+@triton.jit
+def _quantize_index_queries_kernel(
+    Q,
+    W,
+    QOut,
+    WOut,
+    Q0,
+    Q1,
+    Q2,
+    W0,
+    W1,
+    O0,
+    O1,
+    F0,
+    F1,
+    D: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+    d = tl.arange(0, D)
+    value = tl.load(Q + row * Q0 + head * Q1 + d * Q2).to(tl.float32)
+    # PyTorch divides a tensor by a Python scalar as a multiply by its
+    # reciprocal, so the reference scale is amax * (1 / 448), not amax / 448.
+    scale = tl.maximum(tl.max(tl.abs(value), axis=0), 1.0e-6) * (1.0 / 448.0)
+    quantized = tl.minimum(tl.maximum(tl.div_rn(value, scale), -448.0), 448.0)
+    tl.store(QOut + row * O0 + head * O1 + d, quantized.to(tl.float8e4nv))
+    weight = tl.load(W + row * W0 + head * W1).to(tl.float32)
+    tl.store(WOut + row * F0 + head * F1, weight * scale)
+
+
+def quantize_index_queries(index_q, weights):
+    """Quantize index queries to E4M3 and fold their scale into the weights.
+
+    Args:
+        index_q: BF16 [tokens, heads, 128] post-RoPE queries.
+        weights: [tokens, heads] per-head score weights.
+
+    Returns:
+        (E4M3 [tokens, heads, 128], FP32 [tokens, heads]) -- the scale rides in
+        the returned weights because DeepGEMM's FP8 logits kernels take no
+        query scale of their own. Quantization mirrors the ``index_v4`` cache
+        codec so queries and keys are quantized the same way.
+    """
+    tokens, heads, dim = index_q.shape
+    quantized = torch.empty(
+        (tokens, heads, dim), dtype=torch.float8_e4m3fn, device=index_q.device
+    )
+    folded = torch.empty((tokens, heads), dtype=torch.float32, device=index_q.device)
+    if tokens:
+        _quantize_index_queries_kernel[(tokens, heads)](
+            index_q,
+            weights,
+            quantized,
+            folded,
+            *index_q.stride(),
+            *weights.stride(),
+            *quantized.stride()[:2],
+            *folded.stride(),
+            D=dim,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    return quantized, folded
 
 
 def pack_index_queries(values):
@@ -1875,6 +2336,62 @@ def dense_ranges(lengths, capacity):
             num_warps=4,
         )
     return starts, ends
+
+
+@triton.jit
+def _candidate_scores_kernel(
+    Logits,
+    Cands,
+    Out,
+    WIDTH,
+    COLUMNS,
+    L0,
+    L1,
+    C0,
+    C1,
+    O0,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    col = (tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
+    keep = col < COLUMNS
+    block = tl.load(Cands + token * C0 + (col // 8) * C1, keep, other=-1).to(tl.int64)
+    row = block * 8 + col % 8
+    live = keep & (block >= 0) & (row < WIDTH)
+    score = tl.load(Logits + token * L0 + row * L1, live, other=-float("inf"))
+    tl.store(Out + token * O0 + col, score, keep)
+
+
+def candidate_scores(logits, candidates):
+    """Gather each query's candidate-block scores into one compact row.
+
+    Args:
+        logits: FP32 [tokens, width] scores addressed by row id.
+        candidates: Int [tokens, blocks] request-local block ids, -1 padded.
+
+    Returns:
+        FP32 [tokens, blocks * 8] scores in candidate order. A null block or a
+        row past ``width`` scores -inf, so it loses to any live row. Column
+        ``c`` holds row ``candidates[:, c // 8] * 8 + c % 8``; the caller maps
+        winners back with that identity rather than materializing the ids.
+    """
+    tokens, width = logits.shape
+    columns = candidates.shape[1] * 8
+    out = torch.empty((tokens, columns), dtype=logits.dtype, device=logits.device)
+    if tokens and columns:
+        _candidate_scores_kernel[(tokens, triton.cdiv(columns, 512))](
+            logits,
+            candidates,
+            out,
+            width,
+            columns,
+            *logits.stride(),
+            *candidates.stride(),
+            out.stride(0),
+            BLOCK=512,
+            num_warps=4,
+        )
+    return out
 
 
 @triton.jit(
@@ -2317,20 +2834,14 @@ def _decode_window_kernel(
     Write,
     Read,
     ReadLen,
-    Status,
     Swa,
-    Tail,
     SW,
-    TW,
     SS,
-    TS,
     SC,
-    TC,
     TABLE_ROWS,
     PS: tl.constexpr,
     RS: tl.constexpr,
     SWA_PAGES: tl.constexpr,
-    TAIL_PAGES: tl.constexpr,
 ):
     row = tl.program_id(0)
     pos = tl.load(Positions + row * PS).to(tl.int64)
@@ -2347,22 +2858,6 @@ def _decode_window_kernel(
     tl.store(Write + row, write)
     tl.store(Read + row * 128 + offsets, slots)
     tl.store(ReadLen + row, tl.minimum(tl.maximum(pos + 1, 0), 128))
-    # Only span starts need external history; later rows use current projections.
-    prior_pos = tl.load(Positions + (row - 1) * PS, row > 0, other=-2).to(tl.int64)
-    prior_req = tl.load(Requests + (row - 1) * RS, row > 0, other=-1)
-    window_start = (
-        (pos >= 0)
-        & (req >= 0)
-        & ((row == 0) | (req != prior_req) | (pos != prior_pos + 1))
-    )
-    missing_swa = tl.max(((wanted >= 0) & (wanted < pos) & (slots < 0)).to(tl.int32), 0)
-    previous = tl.where((pos >= 0) & (pos % 2 == 1), pos - 1, -1)
-    tail = resolve_group_slot(
-        Tail, previous, req, TABLE_ROWS, TW, TS, TC, 2, 1, 1, TAIL_PAGES
-    )
-    missing_tail = (previous >= 0) & (tail < 0)
-    error = missing_swa | (missing_tail.to(tl.int32) * 2)
-    tl.store(Status + row, tl.where(window_start, error, 0))
 
 
 @register_kernel(
@@ -2380,18 +2875,14 @@ def decode_window(
     write_slots,
     read_slots,
     read_lens,
-    status,
     swa_table,
-    tail_table,
     swa_pages,
-    tail_pages,
 ):
     """Write SWA addresses for consecutive, possibly ragged request spans.
 
-    positions/requests include negative padding. Tables contain LCM group pages.
-    Output buffers have N rows (read_slots [N,128]); status bits 0/1 denote
-    missing external SWA/tail history at span starts, and are zero elsewhere.
-    Every output row is overwritten, so the buffers are reusable under graphs.
+    positions/requests include negative padding. swa_table contains LCM group
+    pages. Output buffers have N rows (read_slots [N,128]). Every output row
+    is overwritten, so the buffers are reusable under graphs.
     """
     if positions.numel():
         _decode_window_kernel[(positions.numel(),)](
@@ -2400,20 +2891,14 @@ def decode_window(
             write_slots,
             read_slots,
             read_lens,
-            status,
             swa_table,
-            tail_table,
             swa_table.shape[1],
-            tail_table.shape[1],
             swa_table.stride(0),
-            tail_table.stride(0),
             swa_table.stride(1),
-            tail_table.stride(1),
             swa_table.shape[0],
             positions.stride(0),
             requests.stride(0),
             swa_pages,
-            tail_pages,
             num_warps=4,
         )
 

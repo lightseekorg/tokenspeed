@@ -218,6 +218,9 @@ class ServerArgs:
     # MoE backend
     moe_backend: str = "auto"
     draft_moe_backend: str | None = None
+    # Opt-in: run MXFP4 routed experts with FP8 activations (FlashInfer cutlass
+    # W4A8 on Hopper). Off keeps the checkpoint's BF16 activation contract.
+    moe_mxfp4_fp8_activation: bool = False
     all2all_backend: str = "none"
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
@@ -227,6 +230,9 @@ class ServerArgs:
     kvstore_ratio: float = 2.0
     kvstore_size: int = 0
     kvstore_io_backend: str = "kernel"
+    # Optional L3 storage beneath the compact Host cache.
+    kvstore_storage_backend: str | None = None
+    kvstore_storage_backend_extra_config: str | None = None
 
     # Multi-node distributed serving. ``None`` means "not given by the user",
     # which is what lets the launcher environment fill them in.
@@ -877,6 +883,12 @@ class ServerArgs:
         elif not self.disable_kvstore:
             self.enable_kvstore = True
 
+        if self.kvstore_storage_backend is not None and not self.enable_kvstore:
+            raise ValueError(
+                "L3 storage (--kvstore-storage-backend) requires Host L2; "
+                "unset --disable-kvstore"
+            )
+
     def validate_cache_options(self):
         # Runs after _handle_kvstore() has applied the KVStore default, so the
         # check sees the effective setting rather than the pre-resolution flag.
@@ -1228,6 +1240,24 @@ class ServerArgs:
             default=ServerArgs.kvstore_io_backend,
             help="The IO backend for KVStore transfer between CPU and GPU.",
         )
+        parser.add_argument(
+            "--kvstore-storage-backend",
+            type=str,
+            choices=["mooncake", "memory"],
+            default=ServerArgs.kvstore_storage_backend,
+            help="L3 store under compact Host (flat) KV. "
+            "'mooncake' is Mooncake Store (SGLang/vLLM HiCache equivalent). "
+            "'memory' is an in-process dict for tests. Requires Host L2 "
+            "(do not pass --disable-kvstore).",
+        )
+        parser.add_argument(
+            "--kvstore-storage-backend-extra-config",
+            type=str,
+            default=ServerArgs.kvstore_storage_backend_extra_config,
+            help="JSON object of extra L3 backend settings. For mooncake: "
+            "master_server_address, local_hostname, metadata_server, "
+            "global_segment_size, protocol, device_name, tenant_id.",
+        )
         # Mamba Cache
         parser.add_argument(
             "--mamba-ssm-dtype",
@@ -1476,6 +1506,17 @@ class ServerArgs:
             default=ServerArgs.moe_backend,
             help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm, "
             "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe",
+        )
+        parser.add_argument(
+            "--moe-mxfp4-fp8-activation",
+            action="store_true",
+            help="Run MXFP4 routed experts with FP8 activations (on Hopper the "
+            "FlashInfer cutlass W4A8 Humming MoE: about 1.8x faster than the "
+            "default W4A16 path, a few percent of relative error on the expert "
+            "outputs; validate the served model before relying on it). Applies to "
+            "every MXFP4 expert layer, target and draft; the MoE plan fails at "
+            "startup where the selected backend has no FP8-activation kernel for "
+            "the layer.",
         )
         parser.add_argument(
             "--draft-moe-backend",

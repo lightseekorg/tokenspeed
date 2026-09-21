@@ -2,6 +2,19 @@
 
 ## Kernel Conventions
 
+### Names
+
+Profilers show kernel names after the `def` function `@gluon.jit` attached to,
+so the kernel should carry the `tokenspeed-kernel` registration name verbatim
+(e.g, `gluon_mm_mxfp8_gfx950`), and the Python launcher calling the kernel
+should be named as `launch_<name>` (e.g., `launch_gluon_mm_mxfp8_gfx950`).
+Companion kernels launched only by that op insert a role before the arch suffix
+(e.g., `gluon_dsv4_decode_reduce_gfx1250`, `gluon_mha_prefill_sliding_gfx950`).
+Kernels shared by several registered ops keep descriptive names. A `repr=` on
+the jit decorator replaces the compiled symbol that profilers report, so its
+base string must be the kernel's `def` name as well (the constexpr suffix it
+appends is fine).
+
 ### Barriers
 
 Do not write `gl.barrier()` for shared-memory (LDS) hazards. The Gluon
@@ -32,6 +45,70 @@ one subgroup's traffic, but the barriers join all producer subgroups before a
 generation is published and all consumer subgroups before the peer inbox is
 read. Removing either rendezvous can potentially increase cross-rank skew and
 regress perf even when the generated kernel remains correct.
+
+## GEMM
+
+### gfx950 MXFP8 projection
+
+The gfx950 package provides a prefill-oriented MXFP8 GEMM for DeepSeek V4.1
+dense projections, with portable Triton fallback outside the tuned domain.
+
+#### Contract
+
+- The operation computes `A @ B.T` from K-contiguous E4M3 matrices shaped
+  `[M, K]` and `[N, K]`; padded row strides are accepted.
+- Scales are strided uint8 E8M0 matrices shaped `[M, K/32]` and `[N, K/32]`
+  with an explicit `[1, 32]` scale block.
+- Output is BF16 or FP16. A caller-owned output may have a padded row stride,
+  but its inner stride must be one.
+- The kernel requires `M` and `N` divisible by 256 and `K >= 512` divisible by
+  256. Automatic selection further requires `M >= 1024`, `N >= 1536`, and
+  `K >= 1024`.
+
+#### Algorithm
+
+One workgroup computes a `256 x 256 x 128` tile with eight wave64s. Four
+`128 x 128` accumulator quadrants use native `32 x 32 x 64` E4M3 scaled MFMA.
+Two K tiles are software-pipelined at a time, and phase-shifted MFMA and memory
+stages implement the eight-wave warp-pipeline schedule. XCD-aware grouped tile
+ordering spreads adjacent output tiles across the eight XCDs.
+
+E4M3 values use vectorized asynchronous global-to-LDS copies into separate,
+padded double buffers for A and B. Canonical row-major A scales use dword
+asynchronous copies. Each B-scale copy combines both N quadrants and two K
+steps in one LDS tile, then splits the four MFMA fragments in registers. Two
+waves per EU avoid spills from the longer-lived fragments. Strided scales fall
+back to direct fragment loads, and output uses vectorized buffer stores.
+
+### gfx1250 MXFP8 decode projection
+
+The gfx1250 package provides decode-oriented MXFP8 projections for DeepSeek V4
+and V4.1, with portable fallback outside the tuned domain.
+
+#### Contract
+
+- The operation computes `A @ B.T` from K-contiguous E4M3 matrices shaped
+  `[M, K]` and `[N, K]`, with `1 <= M <= 16` and `N` divisible by 16.
+- DeepSeek V4.1 uses row-major uint8 UE8M0 scales shaped `[M, K/32]` and
+  `[N, K/32]`, with `K >= 256` divisible by 32.
+- DeepSeek V4 uses row-major FP32 activation scales `[M, K/128]` and canonical
+  weight scales `[N/128, K/128]`, with `N` and `K` divisible by 128.
+- Output is BF16. A caller-owned output may have a padded row stride, but all
+  input, scale, and output inner strides must be one.
+
+#### Algorithm
+
+The direct path assigns one wave32 to an output tile of up to `16 x 16`.
+Native TDM stages values, and for V4.1 scales, into padded triple-buffered LDS.
+V4.1 uses scaled WMMA directly; V4 applies one FP32 scale pair to each
+128-wide raw-WMMA partial before accumulation.
+
+Measured long-K shapes use the same producers in split-K mode and a separate
+FP32-to-BF16 reduction. One V4 Pro route combines adjacent output tiles in a
+two-wave workgroup and uses fused A/B TDM loads. Other shapes remain on the
+one-wave direct path when extra partitions or fusion do not pay for their
+overhead. The kernel docstrings record the exact tiling, pipeline, and routing
+decisions.
 
 ## Attention
 

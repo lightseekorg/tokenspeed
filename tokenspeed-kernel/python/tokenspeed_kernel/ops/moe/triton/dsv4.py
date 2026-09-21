@@ -117,7 +117,6 @@ def _select_experts_kernel(
     ),
     traits={"routing_kind": frozenset({"plain", "bias", "hash"})},
     priority=Priority.PORTABLE,
-    tags={"portability", "routing"},
 )
 def triton_dsv4_select_experts(
     router_logits: torch.Tensor,

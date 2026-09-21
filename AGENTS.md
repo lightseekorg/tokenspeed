@@ -101,6 +101,24 @@ change.
 * NPU support targets only one or two specific models. There are currently no
   plans to expand NPU model coverage.
 
+## tokenspeed-scheduler releases
+
+Prefer separate PRs for scheduler code changes and version bumps. A scheduler
+code change does not require a version bump or an immediate release; multiple
+code changes may accumulate until a release is needed.
+
+Follow this sequence:
+
+1. Make and merge code changes under `tokenspeed-scheduler/`.
+2. When ready to release, update `[project].version` in
+   `tokenspeed-scheduler/pyproject.toml` and merge the version bump into `main`.
+3. Trigger the
+   [release-tokenspeed-scheduler workflow](https://github.com/lightseekorg/tokenspeed/actions/workflows/release-tokenspeed-scheduler.yml)
+   from `main`. Wait for the GitHub release and PyPI publication to succeed.
+4. Once the new version is available on PyPI, update the main TokenSpeed
+   project's `tokenspeed-scheduler` dependency requirement in
+   `python/pyproject.toml` through a follow-up PR targeting `main`.
+
 ## tokenspeed-kernel
 
 Inside the root `tokenspeed-kernel/` directory:
@@ -129,6 +147,7 @@ Inside the root `tokenspeed-kernel/` directory:
 * Vendor-specific tests should be placed under `test/<vendor>/` subdirectory.
   Tests for common infra and covering multi-vendors reside under `test/`
   directly.
+* Use tight atol/rtol in correctness comparison tests.
 
 ## tokenspeed-kernel-amd
 
@@ -140,3 +159,11 @@ Inside the root `tokenspeed-kernel-amd/` directory:
   common platform utilities and reference computations.
 * For per kernel contract and algorithm details, put in
   `python/tokenspeed_kernel_amd/ops/README.md`.
+* For Triton/Gluon kernels, one name should thread the whole stack: the
+  `register_kernel(name=...)` value, the registered Python `def` it decorates,
+  and the `@gluon.jit` (or `@triton.jit`) kernel that does the op's work all
+  share it. The AMD Python launcher should be called as `launch_<name>`.
+  Extra kernels launched only by that op insert a role before the arch suffix
+  (`gluon_mha_decode_reduce_gfx950`). Kernels shared by several registered ops
+  keep descriptive names. A `repr=` on the jit decorator replaces the compiled
+  symbol, so its base string must be the kernel's `def` name as well.

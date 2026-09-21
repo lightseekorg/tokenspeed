@@ -32,6 +32,7 @@ import json
 import math
 import os
 import re
+from copy import copy
 from pathlib import Path
 from test.runtime.test_deepseek_v41_cache import R1, R2, _backend, _extend, _tables
 from test.runtime.test_deepseek_v41_engram import _mapping, _Tokenizer
@@ -57,7 +58,6 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41DecoderView,
     V41PrefillSpan,
-    V41RowPlan,
 )
 from tokenspeed.runtime.layers.linear import LinearBase, MergedColumnParallelLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
@@ -139,6 +139,7 @@ def _config():
         candidate_source_layer_id=20,
         candidate_block_size=8,
         candidate_topk_blocks=2,
+        sliding_window=128,
         hc_mult=4,
         hc_sinkhorn_iters=3,
         hc_eps=1e-6,
@@ -244,9 +245,6 @@ class _Backend:
 
     def decoder_view(self):
         return self.view
-
-    def rows(self):
-        return V41RowPlan(self.meta, self.meta, None)
 
     def compress(self, owner, content, scores, mode, norm_weight, norm_eps):
         assert content.dtype == scores.dtype == torch.float32
@@ -402,7 +400,13 @@ def test_scale_expansion_then_tp_and_merged_sharding():
     for rank in range(4):
         mapping = _mapping(rank, 4, 4)
         attn = DeepseekV41Attention(
-            config, mapping, 2, quant, "model.layers.2.attn", aux_stream=None
+            config,
+            mapping,
+            2,
+            v41._ced_decoder_start(config),
+            quant,
+            "model.layers.2.attn",
+            aux_stream=None,
         )
         for linear in (attn.wq_a_wkv, attn.wq_b, attn.wo_b, attn.indexer.wq_b):
             shape = (linear.output_size // 32, linear.input_size // 32)
@@ -476,7 +480,16 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
     torch.manual_seed(41)
     layers = [
         DeepseekV41DecoderLayer(
-            config, _mapping(0, 1, 1), i, None, f"layers.{i}", None, None, False, "gpu"
+            config,
+            _mapping(0, 1, 1),
+            i,
+            v41._ced_decoder_start(config),
+            None,
+            f"layers.{i}",
+            None,
+            None,
+            False,
+            "gpu",
         )
         for i in (0, 1)
     ]
@@ -490,9 +503,7 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
     actual, expected = initial.clone(), initial.clone()
     actual_pre, expected_pre = pre.clone(), pre.clone()
     for layer in layers:
-        actual, actual_pre = layer(
-            actual, actual_pre, positions, torch.arange(3), ctx, backend.rows()
-        )
+        actual, actual_pre = layer(actual, actual_pre, positions, torch.arange(3), ctx)
         for sublayer, norm, name in (
             (layer.attn, layer.attn_norm, "attn"),
             (layer.ffn, layer.ffn_norm, "ffn"),
@@ -513,7 +524,7 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
             )
             x = _norm(collapsed, norm.weight, 1e-20)
             x = (
-                sublayer(positions, x, ctx, backend.rows())
+                sublayer(positions, x, ctx)
                 if name == "attn"
                 else sublayer(x, None, 3, 3, None, None)
             )
@@ -550,6 +561,7 @@ def test_attention_owner_cast_index_and_grouped_output(layer_id):
         config,
         _mapping(0, 1, 1),
         layer_id,
+        v41._ced_decoder_start(config),
         None,
         f"layers.{layer_id}.attn",
         aux_stream=None,
@@ -560,7 +572,7 @@ def test_attention_owner_cast_index_and_grouped_output(layer_id):
     backend = _Backend(positions, requests)
     ctx = _ctx(backend, 6, ForwardMode.EXTEND)
     x = torch.randn(6, 128, dtype=torch.bfloat16)
-    actual = attn(positions, x, ctx, backend.rows())
+    actual = attn(positions, x, ctx)
     qr = _norm(
         F.linear(x, attn.wq_a_wkv.weight[: config.q_lora_rank]),
         attn.q_norm.weight,
@@ -744,12 +756,15 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
 
     def observe(layer_id):
         def hook(module, args):
-            hidden, _, layer_positions, image_mask, layer_ctx, rows = args
+            hidden, _, layer_positions, image_mask, layer_ctx = args
             seen[layer_id] = (
                 hidden.shape[0],
                 layer_positions.tolist(),
                 layer_ctx.collective_num_tokens,
-                rows.keep_rows is not None,
+                v41._row_plan(
+                    module.layer_id, module.ced_decoder_start, layer_ctx
+                ).keep_rows
+                is not None,
             )
 
         return hook
@@ -787,6 +802,169 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
     assert [h.shape for h in aux] == [(3, config.hidden_size)] * 3
     assert ctx.captured_rows == CapturedRows(tail.positions, ((0, 1), (1, 2)))
     assert torch.isfinite(actual).all()
+
+
+def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
+    """The four stages compose to ``forward`` under the prefill graph's padding
+    contract: the narrowing stage accepts an encoder state padded past the
+    real rows, the decoder stage computes a fixed-row static state whose
+    leading rows are the narrowed state, and the finish stage recovers the
+    sampled rows, taps and the DSpark row report from the leading rows."""
+    from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
+    from tokenspeed.runtime.execution.prefill_graph import NarrowingPrefillModel
+
+    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    torch.manual_seed(7)
+    config = _config()
+    model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", False, "gpu")
+    _initialize(model)
+    model.initialize_engram(_Tokenizer())
+    model.dspark_capture_layers = (19, 20, 39)
+    assert isinstance(model, NarrowingPrefillModel)
+    assert model.max_decoder_rows_per_request == 128
+    assert not model.decoder_uses_engram
+    ids = torch.tensor([0, 3, 4, 6, 3, 4])
+    positions = torch.tensor([0, 1, 2, 3, 0, 1])
+    requests = torch.tensor([0, 0, 0, 0, 1, 1])
+    keep_rows = torch.tensor([3, 4, 5])
+    tail = SimpleNamespace(
+        positions=positions[keep_rows], request_indices=requests[keep_rows]
+    )
+    view = V41DecoderView(
+        tail,
+        tail,
+        (V41PrefillSpan(0, 0, 3, 1, 3), V41PrefillSpan(1, 1, 0, 2, 0)),
+        keep_rows,
+        torch.tensor([0, 2]),
+    )
+    backend = _Backend(positions, requests, view)
+    previous = torch.tensor([[-1, -1, -1], [0, -1, -1], [3, 0, -1], [4, 3, 0]])
+    previous = torch.cat((previous, previous[:2]))
+    mask = torch.ones(6, dtype=torch.bool)
+
+    def whole():
+        ctx = _ctx(backend, 6, ForwardMode.EXTEND)
+        ctx.capture_hidden_mode = CaptureHiddenMode.FULL
+        out = model(
+            ids,
+            positions,
+            ctx,
+            None,
+            None,
+            engram_previous_tokens=previous,
+            engram_token_mask=mask,
+            image_mask=None,
+        )
+        return out, ctx
+
+    (expected, expected_aux), expected_ctx = whole()
+
+    ctx = _ctx(backend, 6, ForwardMode.EXTEND)
+    ctx.capture_hidden_mode = CaptureHiddenMode.FULL
+    assert model.decoder_rows(ctx) == 3
+    state = model.encoder_forward(
+        ids,
+        positions,
+        ctx,
+        None,
+        None,
+        engram_previous_tokens=previous,
+        engram_token_mask=mask,
+        image_mask=None,
+    )
+    # The layer-19 tap is taken below the candidate source, on every row.
+    assert state.rows == 6 and [tap.shape[0] for tap in state.captured] == [6]
+    # An encoder graph output carries a padded tail past the real rows.
+    padded = v41.V41RowState(
+        torch.cat((state.hidden, torch.zeros_like(state.hidden[:2]))),
+        torch.cat((state.pre_mix, torch.zeros_like(state.pre_mix[:2]))),
+        torch.cat((state.positions, torch.zeros_like(state.positions[:2]))),
+        None,
+        torch.cat((state.hashes, torch.zeros_like(state.hashes[:2]))),
+        torch.cat((state.engram_token_mask, torch.zeros(2, dtype=torch.bool))),
+        [torch.cat((tap, torch.zeros_like(tap[:2]))) for tap in state.captured],
+    )
+    narrowed = model.narrowing_forward(padded, ctx)
+    assert narrowed.rows == 3
+    assert narrowed.positions.tolist() == [3, 0, 1]
+    assert narrowed.hashes is None and narrowed.engram_token_mask is None
+    assert [tap.shape for tap in narrowed.captured] == [(3, config.hidden_size)] * 2
+    # The decoder graph's static state: fixed rows, the narrowed state landed
+    # into its leading rows, a zero tail.
+    statics = model.allocate_decoder_state(8)
+    assert statics.rows == 8 and len(statics.captured) == 2
+    statics.hidden.fill_(3)
+    narrowed.land_into(statics)
+    torch.testing.assert_close(statics.hidden[:3], narrowed.hidden, rtol=0, atol=0)
+    assert not statics.hidden[3:].any()
+    assert statics.positions.tolist() == [3, 0, 1, 0, 0, 0, 0, 0]
+
+    # Under the graph's ambient context the attention breaks slice the padded
+    # rows down to the live metadata and the break machinery lands their
+    # output back into a bucket-shaped handoff with a zero tail; the
+    # row-local compute in between covers every row. Emulate the handoff
+    # here, where no CUDA graph can run.
+    def landed(original):
+        def forward(self, positions, hidden_states, ctx):
+            out = original(self, positions, hidden_states, ctx)
+            pad = hidden_states.shape[0] - out.shape[0]
+            return (
+                torch.cat((out, out.new_zeros((pad, *out.shape[1:])))) if pad else out
+            )
+
+        return forward
+
+    with active_forward(ctx), monkeypatch.context() as patched:
+        patched.setattr(
+            DeepseekV41Attention, "forward", landed(DeepseekV41Attention.forward)
+        )
+        hidden, captured = model.decoder_forward(statics, ctx)
+    assert hidden.shape == (8, config.hidden_size)
+    assert [tap.shape for tap in captured] == [(8, config.hidden_size)] * 3
+    actual, aux = model.finish_forward(hidden[:3], [tap[:3] for tap in captured], ctx)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for tap, expected_tap in zip(aux, expected_aux, strict=True):
+        torch.testing.assert_close(tap, expected_tap, rtol=0, atol=0)
+    assert ctx.captured_rows == expected_ctx.captured_rows
+    # A state that does not fit, or disagrees on its optional tensors, is refused.
+    with pytest.raises(ValueError, match="exceeds"):
+        narrowed.land_into(model.allocate_decoder_state(2))
+    with pytest.raises(ValueError, match="optional tensors"):
+        narrowed.land_into(
+            v41.V41RowState(
+                statics.hidden,
+                statics.pre_mix,
+                statics.positions,
+                torch.zeros(8, dtype=torch.bool),
+                None,
+                None,
+                statics.captured,
+            )
+        )
+    # A window-only stack (the draft) has no candidate source: the narrowing
+    # stage passes through and the decoder stage sizes nothing.
+    draft = copy(config)
+    draft.num_hidden_layers, draft.engram_layer_ids = 2, []
+    draft.kv_source_layer_ids = draft.index_source_layer_ids = []
+    draft.compress_ratios = [0, 0]
+    stack = DeepseekV41Model(draft, _mapping(0, 1, 1), None, "draft", False, "gpu")
+    _initialize(stack)
+    plain = _Backend(positions, requests)
+    ctx = _ctx(plain, 6, ForwardMode.EXTEND)
+    state = stack.encoder_forward(
+        ids,
+        positions,
+        ctx,
+        None,
+        None,
+        engram_previous_tokens=None,
+        engram_token_mask=None,
+        image_mask=None,
+    )
+    assert stack.narrowing_forward(state, ctx) is state
+    hidden, captured = stack.decoder_forward(state, ctx)
+    assert hidden.shape == (6, config.hidden_size) and captured == []
+    assert ctx.collective_num_tokens is None
 
 
 def test_upstream_rope_and_hc_methods():
@@ -851,7 +1029,13 @@ def test_cuda_exact_fp8_linear_and_engram_method(monkeypatch):
     quant = v41_mxfp8_config(_quant())
     with torch.device("cuda:0"):
         attn = DeepseekV41Attention(
-            config, _mapping(0, 1, 1), 0, quant, "layers.0.attn", aux_stream=None
+            config,
+            _mapping(0, 1, 1),
+            0,
+            v41._ced_decoder_start(config),
+            quant,
+            "layers.0.attn",
+            aux_stream=None,
         )
     linear = attn.wq_a_wkv
     weight = torch.randn_like(linear.weight, dtype=torch.float32).to(
@@ -893,7 +1077,9 @@ def test_cuda_exact_fp8_linear_and_engram_method(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("execution_mode", ["eager", "decode", "prefill"])
+@pytest.mark.parametrize(
+    "execution_mode", ["eager", "decode", "prefill", "split_prefill_graph"]
+)
 def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode):
     config = _config()
     config.hidden_size = 256
@@ -969,6 +1155,9 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
         return
     if execution_mode == "prefill":
         _assert_chunked_prefill_replays_and_narrows(adapter, backend, tables)
+        return
+    if execution_mode == "split_prefill_graph":
+        _assert_split_prefill_graph_matches_eager(adapter, backend, tables)
         return
 
     _assert_decode_graph_matches_eager(
@@ -1088,6 +1277,216 @@ def _assert_chunked_prefill_replays_and_narrows(adapter, backend, tables):
         )
 
 
+@torch.inference_mode()
+def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
+    """The prefill graph's two captured stages around the eager narrowing
+    reproduce the eager forward, driven through the real breakable-graph
+    machinery: an encoder graph over a padded token bucket, a decoder graph
+    over a padded static state (its breaks landing narrowed rows into
+    bucket-shaped handoffs) and the eager decoder route a forward takes when
+    its narrowed rows exceed every decoder bucket. A prompt prefilled in two
+    chunks exercises one kept row (open chunk) and a kept window (final)."""
+    from tokenspeed.runtime.execution.breakable_cuda_graph import (
+        BreakableCapture,
+        active_forward,
+    )
+
+    model, device = adapter.model, backend.device
+    bucket, decoder_bucket, length, first = 256, 192, 200, 72
+    hidden_size = model.config.hidden_size
+    dtype = model.embed_tokens.weight.dtype
+    # The graph owner's static inputs: the encoder graph reads these.
+    ids_buf = torch.ones(bucket, dtype=torch.int64, device=device)
+    positions_buf = torch.zeros(bucket, dtype=torch.int64, device=device)
+    embeds_buf = torch.zeros((bucket, hidden_size), dtype=dtype, device=device)
+    previous_buf = torch.full((bucket, 3), -1, dtype=torch.int64, device=device)
+    mask_buf = torch.zeros(bucket, dtype=torch.bool, device=device)
+
+    def land(prompt, positions, history):
+        n = prompt.numel()
+        ids_buf[:n].copy_(prompt)
+        ids_buf[n:].fill_(1)
+        positions_buf[:n].copy_(positions)
+        positions_buf[n:].zero_()
+        embeds_buf[:n].copy_(model.embed_tokens(prompt))
+        embeds_buf[n:].zero_()
+        previous_buf[:n].copy_(history)
+        previous_buf[n:].fill_(-1)
+        mask_buf[:n].fill_(True)
+        mask_buf[n:].fill_(False)
+
+    def context(tokens, bs, gather_ids):
+        return ForwardContext(
+            attn_backend=backend,
+            token_to_kv_pool=backend.cache_pool,
+            bs=bs,
+            num_extends=bs,
+            input_num_tokens=tokens,
+            forward_mode=ForwardMode.EXTEND,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            gather_ids=torch.tensor(gather_ids, device=device),
+        )
+
+    def encoder(ctx):
+        return model.encoder_forward(
+            ids_buf,
+            positions_buf,
+            ctx,
+            embeds_buf,
+            None,
+            engram_previous_tokens=previous_buf,
+            engram_token_mask=mask_buf,
+            image_mask=None,
+        )
+
+    # Encoder capture: one completing request over the whole bucket.
+    _extend(backend, tables, [bucket], [0], [0], [bucket])
+    land(
+        torch.ones(bucket, dtype=torch.int64, device=device),
+        backend.query_metadata(ForwardMode.EXTEND).positions,
+        torch.full((bucket, 3), -1, dtype=torch.int64, device=device),
+    )
+    ctx = context(bucket, 1, [bucket - 1])
+    with active_forward(ctx):
+        for _ in range(2):
+            encoder(ctx)
+        torch.cuda.synchronize()
+        encoder_capture = BreakableCapture()
+        with encoder_capture:
+            encoder_state = encoder(ctx)
+        encoder_capture.replay()
+    assert encoder_state.rows == bucket
+    # Decoder capture: two completing requests of at most a window each, so
+    # the dummy decoder view keeps exactly the bucket's rows. The eager
+    # encoder and narrowing stages run first: the reuse layers need the index
+    # source's selection from this forward, and their output fills the statics.
+    statics = model.allocate_decoder_state(decoder_bucket)
+    half = decoder_bucket // 2
+    _extend(backend, tables, [half, half], [0, 0], [0, 0], [half, half])
+    land(
+        torch.ones(decoder_bucket, dtype=torch.int64, device=device),
+        backend.query_metadata(ForwardMode.EXTEND).positions,
+        torch.full((decoder_bucket, 3), -1, dtype=torch.int64, device=device),
+    )
+    ctx = context(decoder_bucket, 2, [half - 1, decoder_bucket - 1])
+    assert model.decoder_rows(ctx) == decoder_bucket
+    with active_forward(ctx):
+        encoded = model.encoder_forward(
+            ids_buf[:decoder_bucket],
+            positions_buf[:decoder_bucket],
+            ctx,
+            embeds_buf[:decoder_bucket],
+            None,
+            engram_previous_tokens=previous_buf[:decoder_bucket],
+            engram_token_mask=mask_buf[:decoder_bucket],
+            image_mask=None,
+        )
+
+        def rearm():
+            # Every decoder run follows a narrowing run, as it does when serving:
+            # later index sources overwrite the selection the reuse layers read.
+            narrowed = model.narrowing_forward(encoded, ctx)
+            assert narrowed.rows == decoder_bucket
+            narrowed.land_into(statics)
+
+        for _ in range(2):
+            rearm()
+            model.decoder_forward(statics, ctx)
+        torch.cuda.synchronize()
+        rearm()
+        decoder_capture = BreakableCapture(pool=encoder_capture.pool)
+        with decoder_capture:
+            decoder_hidden, decoder_taps = model.decoder_forward(statics, ctx)
+        rearm()
+        decoder_capture.replay()
+    torch.cuda.synchronize()
+    assert decoder_hidden.shape == (decoder_bucket, hidden_size)
+    assert [tap.shape for tap in decoder_taps] == []
+
+    torch.manual_seed(5)
+    prompt = torch.randint(0, 7, (length,), device=device)
+    history = torch.stack(
+        [
+            torch.cat((torch.full((d,), -1, device=device), prompt[:-d]))
+            for d in (1, 2, 3)
+        ],
+        dim=1,
+    )
+    arena = backend.cache_pool.arena.buffer
+    chunks = ((0, first), (first, length - first))
+
+    def run(route):
+        """Prefill the prompt in two chunks; return each chunk's logits and
+        DSpark row report."""
+        arena.zero_()
+        outputs, reports = [], []
+        for start, count in chunks:
+            rows = slice(start, start + count)
+            _extend(backend, tables, [count], [start], [0], [length])
+            positions = backend.query_metadata(ForwardMode.EXTEND).positions
+            ctx = context(count, 1, [count - 1])
+            mask = torch.ones(count, dtype=torch.bool, device=device)
+            if route == "eager":
+                logits = adapter(
+                    ctx=ctx,
+                    input_ids=prompt[rows],
+                    positions=positions,
+                    engram_previous_tokens=history[rows],
+                    engram_token_mask=mask,
+                    image_mask=None,
+                ).next_token_logits
+                outputs.append(logits.clone())
+                reports.append(ctx.captured_rows)
+                continue
+            land(prompt[rows], positions, history[rows])
+            kept = model.decoder_rows(ctx)
+            assert kept == (1 if start + count < length else 128)
+            # PrefillGraph._padded_to: the ambient context is pinned to the bucket.
+            ctx.input_num_tokens = bucket
+            with active_forward(ctx):
+                encoder_capture.replay(valid_rows=count)
+                narrowed = model.narrowing_forward(encoder_state, ctx)
+                assert narrowed.rows == kept
+                if route == "decoder graph":
+                    narrowed.land_into(statics)
+                    decoder_capture.replay(valid_rows=kept)
+                    hidden = decoder_hidden[:kept]
+                    taps = [tap[:kept] for tap in decoder_taps]
+                else:
+                    hidden, taps = model.decoder_forward(narrowed, ctx)
+            ctx.input_num_tokens = count
+            hidden, aux = model.finish_forward(hidden, list(taps), ctx)
+            logits = adapter.logits_processor(
+                prompt[rows],
+                hidden,
+                adapter.lm_head,
+                LogitsMetadata.from_forward_context(ctx),
+                aux,
+            ).next_token_logits
+            outputs.append(logits.clone())
+            reports.append(ctx.captured_rows)
+        return outputs, reports
+
+    expected, expected_reports = run("eager")
+    # The open chunk narrowed to one row; the final chunk's view is the identity.
+    assert expected_reports[0].prefill_spans == ((0, 1),)
+    assert expected_reports[0].positions.tolist() == [first - 1]
+    assert expected_reports[1] is None
+    for route in ("decoder graph", "decoder eager"):
+        actual, reports = run(route)
+        assert reports[1] is None
+        assert reports[0].prefill_spans == expected_reports[0].prefill_spans
+        assert torch.equal(reports[0].positions, expected_reports[0].positions)
+        for logits, reference in zip(actual, expected, strict=True):
+            assert logits.shape == reference.shape == (1, reference.shape[1])
+            assert torch.isfinite(logits).all()
+            # Padded GEMM shapes round differently in BF16/FP8 than eager.
+            torch.testing.assert_close(logits, reference, rtol=2**-6, atol=2**-7)
+            torch.testing.assert_close(
+                logits.argmax(-1), reference.argmax(-1), rtol=0, atol=0
+            )
+
+
 def _assert_decode_graph_matches_eager(adapter, backend, tables, device, steps):
     ids = torch.zeros(2, dtype=torch.int64, device=device)
     previous = torch.full((2, 3), -1, dtype=torch.int64, device=device)
@@ -1169,11 +1568,12 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
     try:
         config = _config()
         with torch.device(device):
+            start = v41._ced_decoder_start(config)
             sharded = DeepseekV41Attention(
-                config, mapping, 2, None, "attn", aux_stream=None
+                config, mapping, 2, start, None, "attn", aux_stream=None
             )
             full = DeepseekV41Attention(
-                config, _mapping(0, 1, 1), 2, None, "attn", aux_stream=None
+                config, _mapping(0, 1, 1), 2, start, None, "attn", aux_stream=None
             )
         torch.manual_seed(41)
         _initialize(full)

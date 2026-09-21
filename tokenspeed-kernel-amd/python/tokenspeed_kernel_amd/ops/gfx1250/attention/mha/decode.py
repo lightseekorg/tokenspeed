@@ -121,7 +121,7 @@ class AttentionConfig:
 
 
 @gluon.jit
-def _mha_decode(
+def gluon_mha_decode_gfx1250(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -321,7 +321,7 @@ def _mha_decode(
 
 
 @gluon.jit
-def _mha_decode_peeled(
+def gluon_mha_decode_peeled_gfx1250(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -764,7 +764,7 @@ def _mha_decode_peeled(
 
 
 @gluon.jit
-def _mha_decode_reduce(
+def gluon_mha_decode_reduce_gfx1250(
     mid_o_ptr,
     mid_l_ptr,
     mid_m_ptr,
@@ -878,7 +878,7 @@ def _launch_mha_decode(
     min_tiles_per_split = (last_chunk_size + BLOCK_N - 1) // BLOCK_N
 
     def launch_row1_reduce(src_o, src_l, src_m, src_split_factor):
-        _mha_decode_reduce[(BATCH, NUM_Q_HEADS, 1)](
+        gluon_mha_decode_reduce_gfx1250[(BATCH, NUM_Q_HEADS, 1)](
             src_o,
             src_l,
             src_m,
@@ -905,7 +905,7 @@ def _launch_mha_decode(
             raise RuntimeError(
                 "full-gqa-peeled-direct requires at least four K/V tiles"
             )
-        _mha_decode_peeled[(BATCH, num_gqa_head_groups, 1)](
+        gluon_mha_decode_peeled_gfx1250[(BATCH, num_gqa_head_groups, 1)](
             q,
             k_cache,
             v_cache,
@@ -971,7 +971,7 @@ def _launch_mha_decode(
             raise RuntimeError(
                 "full-gqa-peeled requires at least four K/V tiles per split"
             )
-        _mha_decode_peeled[(BATCH, num_gqa_head_groups, split_factor)](
+        gluon_mha_decode_peeled_gfx1250[(BATCH, num_gqa_head_groups, split_factor)](
             q,
             k_cache,
             v_cache,
@@ -1008,7 +1008,7 @@ def _launch_mha_decode(
             waves_per_eu=1,
         )
     else:
-        _mha_decode[(BATCH, num_gqa_head_groups, split_factor)](
+        gluon_mha_decode_gfx1250[(BATCH, num_gqa_head_groups, split_factor)](
             q,
             k_cache,
             v_cache,
@@ -1156,7 +1156,7 @@ def get_config(
     )
 
 
-def gluon_mha_decode_gfx1250(
+def launch_gluon_mha_decode_gfx1250(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,

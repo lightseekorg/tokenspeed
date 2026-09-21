@@ -62,7 +62,6 @@ def _pack_topk_router_logits_kernel(
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=format_signatures("topk_weights", "dense", {torch.float32}),
     priority=Priority.PERFORMANT,
-    tags={"nvidia", "cuda_graph", "latency"},
 )
 def triton_pack_topk_router_logits(
     *,

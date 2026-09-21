@@ -92,7 +92,6 @@ def pack_topk_router_logits(
     solution="torch",
     signatures=format_signatures("topk_weights", "dense", {torch.float32}),
     priority=Priority.PORTABLE,
-    tags={"portability", "reference"},
 )
 def torch_pack_topk_router_logits(
     *,

@@ -120,7 +120,7 @@ TEST(MakeSnapshotStatePrefillSparseTest, MaterializesOnlyTheStateGroupsFromTheLa
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 4},
     };
-    const CacheCoordinator coord = MakeCoordinator(specs, 8, pool, nullptr, false);
+    const CacheCoordinator coord = MakeCoordinator(specs, 8, pool, /*enable_l3_storage=*/false, nullptr, false);
     std::vector<BlockTable> tables(2);
     std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.extent = DenseGrowth{10}});
     // (0, 10] crosses the checkpoint at 8: the state group covers 10 tokens

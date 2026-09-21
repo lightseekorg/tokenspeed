@@ -45,12 +45,21 @@ The Qwen3.5 FP8 DeepEP correctness task runs GSM8K on four B200 GPUs with
 attention TP2, attention DP2, and MoE EP4. DeepEP `auto` mode exercises its
 normal path during prefill and low-latency path during decode, and the task
 uses the bounded non-thinking chat template for CI stability. The task requires
-a score of at least 0.90.
+a score of at least 0.90. After installation, it imports `tokenspeed_kernel` on
+GPU before launching the model, so incompatible native wheels fail at the
+installation stage. This GPU check is kept outside the general installer,
+which also runs during image builds without GPU access.
 
 The Qwen3.8 Flash Next FP8 correctness task runs GSM8K on two GB200 GPUs with
 tensor parallelism 2 and three-step MTP. It keeps KVStore enabled and uses the
 bounded non-thinking chat template for CI stability. The task requires a score
 of at least 0.96.
+
+The long-context performance report accepts both current EvalScope metrics
+(`Avg TPOT (ms)`, `Avg Decoded Tok/Iter`) and their older names. Missing or
+invalid TPOT fails collection instead of producing a zero-throughput report.
+Unavailable acceptance metrics appear as `N/A` (empty CSV cells); an aggregate
+is unavailable if any run for that prompt length lacks the metric.
 
 Each task expands into one matrix entry per runner label. Add a top-level
 `priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix
@@ -81,6 +90,33 @@ managed server and reruns later stages that many extra times after a crash or
 score miss. Use it for infrastructure flakes (CUDA launch failure, NVLink
 barrier timeout, GPU memory-access fault) where a clean second attempt is
 cheap relative to a red PR.
+
+The AMD Kimi-K2.5 AIME25, NVIDIA Kimi-K2.5 EAGLE3 AIME25, and B200 GLM-5.2
+AIME26 gates write EvalScope results under
+`.ci-artifacts/published/evalscope-results`. Their CI artifact upload runs on
+both success and failure, including timestamped per-question predictions and
+scoring records. Compare the
+responses, stop reasons, and extracted answers when investigating an accuracy
+miss before changing the token limit or sampling configuration.
+
+The NVIDIA Kimi-K2.5 EAGLE3 AIME25 gate allows `max_tokens=131072` within a
+262138-token context. EAGLE3 with one speculative step uses two draft tokens;
+its three overlap spans reserve six positions below the model's 262144-token
+limit. A fixed-version diagnostic reproduced a 65536-token
+truncation; with the larger budget, the identical generated prefix continued
+to a correct answer and stopped naturally at 70332 tokens. This single-question
+result motivates the budget; the full 30-question gate still requires 0.93
+accuracy with batch size 16 and greedy sampling. EvalScope records are saved
+under `.ci-artifacts/published/evalscope-results` on success and failure.
+
+The AMD Kimi-K2.5 AIME25 gate allows `max_tokens=65536`, matching the NVIDIA
+Kimi-K2.5 DFlash task. The same question was truncated in both the
+[8K run](https://github.com/lightseekorg/tokenspeed/actions/runs/34763795877) and
+[16K run](https://github.com/lightseekorg/tokenspeed/actions/runs/34764637152).
+With the larger budget, the [64K run](https://github.com/lightseekorg/tokenspeed/actions/runs/34765831078)
+completed all four answers correctly with natural stops; the longest used 41181
+output tokens. The four questions, batch size four, greedy sampling, EAGLE3
+configuration, score threshold of 0.75, and timeouts remain unchanged.
 
 `optional` marks a task or per-label matrix entry as non-blocking.
 Optional entries are emitted with `matrix.optional: true`, and the PR workflows
@@ -213,11 +249,11 @@ finishes. It validates the untrusted artifact and source revision before
 creating or replacing one bot-owned comment. Runs where the benchmark task was
 not selected have no report and are ignored.
 
-The first pull request introducing the benchmark can run only a candidate
-bootstrap because its merge base has no suite. It also cannot trigger its own
-comment publisher because GitHub requires the receiving `workflow_run` workflow
-to exist on the default branch. Manual runs produce summaries and artifacts but
-not pull request comments.
+A merge base that does not contain the suite yields a candidate-only
+bootstrap instead of a comparison. Changes to the comment workflow take effect
+only after they merge, since `workflow_run` workflows execute from the default
+branch. Manual runs produce summaries and artifacts but not pull request
+comments.
 
 `CUDA_VISIBLE_DEVICES=0` does not limit the shared cleanup process scan, so the
 runner must provide scheduler-enforced GPU or process-namespace isolation. The
@@ -499,7 +535,8 @@ The manual `Slurm Dispatch` GitHub workflow runs on the organization runner
 with the `slurm-dispatch` label. That runner belongs on the Slurm coordinator and
 only needs GitHub runner prerequisites, this repository, Python/PyYAML, and
 Slurm client commands; it does not need GPUs. Leaving the PR input blank checks
-out and runs the latest `main`; otherwise the requested PR is merged into that
+out the exact commit selected by the workflow's branch/ref; selecting `main`
+tests its commit at dispatch time. Otherwise the requested PR is merged into a
 trusted `main` checkout. From the Actions UI, optionally provide a PR,
 comma-separated runner labels and task types, and an optional comma-separated
 task/model filter. The workflow submits the selected matrix, waits for all
@@ -519,8 +556,21 @@ GB200, every B200 or GB200 runner label declared by the selected YAML is
 submitted as its own Slurm job. On GB300, those logical labels are submitted on
 the corresponding GB300 runner; native GB300 labels are submitted unchanged.
 
-The manual workflow keeps the dispatcher checkout on trusted `main` and merges
-the requested PR only in the submitter's temporary worktree. The per-commit
+To test a same-repository branch without opening a PR, leave `pr` blank:
+
+```bash
+gh workflow run slurm-dispatch.yml --ref <branch> -f cluster=gb200
+```
+
+The Slurm wrapper defaults to the digest-pinned Torch 2.14 / CUDA 13.0 runner
+image. The install stage checks the final Torch, TRTLLM, and CuteDSL KDA versions
+against the checkout's requirements and checks Torch's CUDA runtime, so a later
+dependency install cannot silently downgrade the tested stack.
+
+For PR input, the manual workflow keeps the dispatcher checkout on trusted
+`main` and merges the requested PR only in the submitter's temporary worktree.
+Without PR input, the selected branch also supplies dispatcher code: select
+only trusted same-repository refs for the persistent coordinator. The per-commit
 workflow instead executes a same-repository PR's merge commit so dispatcher
 changes can be validated before merge. Fork PRs must not use that path while
 the coordinator pool is persistent.

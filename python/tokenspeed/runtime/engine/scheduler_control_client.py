@@ -76,6 +76,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def combined_flush_cache_output(
+    results: list[FlushCacheReqOutput],
+) -> FlushCacheReqOutput:
+    """AND every DP replica's flush reply into one frontend result.
+
+    ``/flush_cache`` fans out to ``attn.dp_size`` workers. Object keys omit
+    DP rank, so those replicas share the Mooncake namespace. Returning only
+    replica 0 would report success after a peer rejected, or hide a peer
+    that already deleted the namespace. Worker-side DP MIN still has to
+    agree before any rank deletes; this AND is the frontend's matching
+    report.
+    """
+
+    return FlushCacheReqOutput(
+        success=bool(results) and all(result.success for result in results),
+    )
+
+
 class SchedulerControlClient:
     """Scheduler control-plane client methods for AsyncLLM."""
 
@@ -203,7 +221,8 @@ class SchedulerControlClient:
         )
 
     async def flush_cache(self: AsyncLLM) -> FlushCacheReqOutput:
-        return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
+        results = await self.flush_cache_communicator(FlushCacheReqInput())
+        return combined_flush_cache_output(results)
 
     async def pause_scheduler(self: AsyncLLM, *, mode: PauseMode = "abort") -> bool:
         """Pause generation to allow model weight updates.

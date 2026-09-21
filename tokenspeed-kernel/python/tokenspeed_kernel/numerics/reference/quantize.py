@@ -52,7 +52,6 @@ def _quantize_fp8(x_fp32: torch.Tensor, max_abs: torch.Tensor) -> torch.Tensor:
     signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
     traits={},
     priority=10,
-    tags={"determinism", "portability"},
 )
 def torch_fp8_token_group_128(x: torch.Tensor) -> torch.Tensor:
     """Per-token grouped fp8 quantization with group size 128."""
@@ -72,7 +71,6 @@ def torch_fp8_token_group_128(x: torch.Tensor) -> torch.Tensor:
     signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
     traits={},
     priority=10,
-    tags={"determinism", "portability"},
 )
 def torch_fp8_token(x: torch.Tensor) -> torch.Tensor:
     """Per-token fp8 quantization (one scale per row)."""
@@ -89,7 +87,6 @@ def torch_fp8_token(x: torch.Tensor) -> torch.Tensor:
     signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
     traits={},
     priority=10,
-    tags={"determinism", "portability"},
 )
 def torch_fp8_tensor(x: torch.Tensor) -> torch.Tensor:
     """Per-tensor fp8 quantization (one scalar scale for the whole tensor)."""

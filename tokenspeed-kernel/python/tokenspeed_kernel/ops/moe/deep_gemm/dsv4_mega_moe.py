@@ -395,7 +395,6 @@ if platform.is_blackwell:
             "supports_ep": frozenset({True}),
         },
         priority=Priority.SPECIALIZED,
-        tags={"throughput"},
         weight_preprocessor=_deep_gemm_dsv4_mega_moe_process_weights,
     )
     def deep_gemm_dsv4_mega_moe_sm100(

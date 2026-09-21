@@ -60,6 +60,7 @@ global_server_args_dict: dict = {
     "max_model_len": ServerArgs.max_model_len,
     "max_num_seqs": ServerArgs.max_num_seqs,
     "moe_backend": ServerArgs.moe_backend,
+    "moe_mxfp4_fp8_activation": ServerArgs.moe_mxfp4_fp8_activation,
     "dense_gemm_backend": ServerArgs.dense_gemm_backend,
     "enforce_eager": ServerArgs.enforce_eager,
     "max_cudagraph_capture_size": ServerArgs.max_cudagraph_capture_size,
@@ -109,6 +110,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "max_model_len": server_args.max_model_len,
             "max_num_seqs": server_args.max_num_seqs,
             "moe_backend": server_args.moe_backend,
+            "moe_mxfp4_fp8_activation": server_args.moe_mxfp4_fp8_activation,
             "dense_gemm_backend": server_args.dense_gemm_backend,
             "enforce_eager": server_args.enforce_eager,
             "max_cudagraph_capture_size": server_args.max_cudagraph_capture_size,
@@ -247,6 +249,12 @@ class Envs:
     TOKENSPEED_TEST_REQUEST_TIME_STATS = EnvBool(False)
     TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS = EnvBool(False)
     TOKENSPEED_PROFILER_DIR = EnvStr("/tmp")
+    # torch.cuda sync-debug mode armed once serving starts (after capture and
+    # tuning, which synchronize legitimately): "warn" reports every host
+    # synchronization on a serving path with its Python location, "error"
+    # raises. Any such synchronization on the data plane stalls the forward
+    # thread until the in-flight step drains and defeats overlap scheduling.
+    TOKENSPEED_DATA_PLANE_SYNC_DEBUG = EnvStr("default")
     TOKENSPEED_CI_SMALL_KV_SIZE = EnvInt(-1)
     TOKENSPEED_NVTX = EnvBool(False)
     TOKENSPEED_DP_SAMPLING_BACKEND = EnvStr(None)

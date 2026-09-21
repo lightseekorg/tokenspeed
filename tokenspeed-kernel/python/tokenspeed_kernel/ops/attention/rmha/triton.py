@@ -850,7 +850,6 @@ def _rel_mha_decode_fwd(
         "sliding_window": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
     },
-    tags={"portability"},
 )
 def triton_rel_mha_prefill(
     q: torch.Tensor,
@@ -917,7 +916,6 @@ def triton_rel_mha_prefill(
         "sliding_window": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
     },
-    tags={"portability"},
 )
 def triton_rel_mha_extend_with_kvcache(
     q: torch.Tensor,
@@ -1000,7 +998,6 @@ def triton_rel_mha_extend_with_kvcache(
         "sliding_window": frozenset({False, True}),
         "return_lse": frozenset({False}),
     },
-    tags={"portability"},
 )
 def triton_rel_mha_decode_with_kvcache(
     q: torch.Tensor,

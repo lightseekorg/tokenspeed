@@ -252,10 +252,6 @@ two graph subsystems (`ForwardStepRunner.disable`, `PrefillGraph.disable`).
 `DSABackend` and Qwen4-Exp's PLE/indexer consumers disable the prefill graph
 (rationale comments live on those classes). Qwen4-Exp's root composes its
 actual children, so these restrictions also apply when there is no GDN leaf.
-`DeepseekV41AttentionBackend` disables it too: the CED decoder runs on a
-per-request tail of the prefill rows (`decoder_view()`), so a prefill
-forward changes its row count at layer 20 by an amount that depends on
-which requests complete their prompt — not a token bucket.
 
 Rules: declarations are static "never works" facts — a runtime prefill
 capture failure is FATAL (no silent eager degrade: a family that cannot
@@ -264,6 +260,45 @@ class-attribute-driven, so every DP rank derives the same answer
 (event-loop.md). `disable_prefill_graph` in the config carries user intent
 only. `decode_graph=False` still requires `refresh_decode_metadata` and
 `init_cuda_graph_state` — eager decode runs the same unified path.
+
+### Prefill graphs around a row narrowing
+
+A prefill forward whose row count drops once, at a fixed layer, by an amount
+that is not a function of the token bucket cannot be one token-shaped
+breakable graph. DeepSeek-V4.1 is the case: its CED decoder (layer 20 on)
+runs on a per-request tail of the prefill rows (`decoder_view()` — a
+completing prompt's last window, one row for an open chunk, every decode
+row), so the row count at layer 20 depends on which requests complete.
+
+The model declares the split instead of opting out: it implements
+`PrefillGraph`'s `NarrowingPrefillModel` contract — `encoder_forward` (the
+token-shaped layers), `narrowing_forward` (the candidate source layer, all
+rows in, the view's rows out), `decoder_forward` (the remaining layers and
+the final norm on whatever rows it is given) and `finish_forward` (the
+sampled-row gather, the DSpark row report); `forward` is their composition,
+so eager and graphed prefill are one path. `PrefillGraph` captures the
+encoder per token bucket and the decoder per decoder-row bucket, from a
+fixed-row static state the narrowing lands into (leading rows copied, tail
+zeroed). The decoder graphs depend only on their row count, so one ladder
+serves every token bucket; it is the token ladder clipped to
+`max_decoder_rows_per_request × max_num_seqs` (a request contributes at most
+its window). A replay is encoder graph → eager narrowing → decoder graph,
+all under the bucket-pinned ambient context; the narrowing and decoder
+stages size their own collectives from their row counts
+(`report_collective_sizing`), the decoder graph replays with the narrowed
+row count as its valid rows so its breaks scrub the static tail, and a
+forward whose narrowed rows exceed the largest decoder bucket runs its
+decoder stage eager. Layers read their row plan from the live context, never
+from a loose argument a captured break would freeze. Capture runs the
+narrowing before every decoder run, as serving does: the decoder consumes
+per-forward backend state its predecessor produces (V4.1's reuse layers read
+the index source's selection, which later sources overwrite). Under
+attention DP the split graph stays off: the narrowed row count is rank-local
+(which prompts complete on this rank), so the decoder bucket and the
+collective shapes its graph bakes would differ across ranks, and the stages
+size their collectives from their own rows, which the DP metadata gather
+does not carry (the same gap that keeps narrowing itself unimplemented under
+DP).
 
 ### One draft metadata contract
 

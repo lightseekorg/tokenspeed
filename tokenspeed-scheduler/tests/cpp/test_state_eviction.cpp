@@ -122,7 +122,7 @@ protected:
         EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{expected_prefix});
         for (const CacheOperation& operation : ExtractCacheOpsOfKind<LoadBackBatch>(plan)) {
             for (std::uint32_t op_id : std::get<LoadBackBatch>(operation).op_ids) {
-                SendLoadBackDone(op_id);
+                SendLoadBackDone(op_id, /*success=*/true);
             }
         }
         AckWriteBacks(plan);
@@ -619,7 +619,7 @@ TEST_F(StatePublicationSuite, IncompletePrefillRetractionPublishesItsComputedSta
             loaded_state |= std::ranges::find(group_ids, 1u) != group_ids.end();
         }
         for (std::uint32_t op_id : loads.op_ids) {
-            SendLoadBackDone(op_id);
+            SendLoadBackDone(op_id, /*success=*/true);
         }
     }
     EXPECT_TRUE(loaded_state);
@@ -745,7 +745,7 @@ TEST_F(StatePublicationSuite, RetractionRecomputesDecodeFromPrefillOrFromScratch
                 loaded_state |= std::ranges::find(group_ids, 1u) != group_ids.end();
             }
             for (std::uint32_t op_id : loads.op_ids) {
-                SendLoadBackDone(op_id);
+                SendLoadBackDone(op_id, /*success=*/true);
             }
         }
         EXPECT_EQ(loaded_state, host_cache);

@@ -84,7 +84,6 @@ from tokenspeed_kernel.signature import format_signatures
         "qk_l2norm": frozenset({False, True}),
         "output_h": frozenset({False, True}),
     },
-    tags={"portability"},
 )
 def triton_gdn_chunk_prefill(
     q: torch.Tensor,
@@ -422,7 +421,6 @@ def _launch_fused_gdn_decode_update(
         ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
     ),
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def triton_gdn_decode_step(
     q: torch.Tensor,
@@ -473,7 +471,6 @@ def triton_gdn_decode_step(
         ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
     ),
     priority=Priority.PORTABLE,
-    tags={"portability", "speculative-decoding"},
 )
 def triton_gdn_decode_mtp(
     q: torch.Tensor,
@@ -641,7 +638,6 @@ def _gdn_replay_commit_kernel(
     ),
     priority=Priority.PORTABLE,
     traits={"flat_state": frozenset({True})},
-    tags={"portability", "speculative-decoding", "replay"},
 )
 def triton_gdn_replay_commit(
     payload: torch.Tensor,

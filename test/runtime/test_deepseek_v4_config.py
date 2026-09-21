@@ -162,7 +162,10 @@ from tokenspeed.runtime.models.deepseek_v4_dspark_ops.attention import (
     dspark_fp8_quant_dequant,
     get_dspark_topk_idxs_batched,
 )
-from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import _local_vocab_argmax
+from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import (
+    dspark_greedy_workspace,
+    sample_dspark_block_greedy,
+)
 from tokenspeed.runtime.models.deepseek_v4_next import DeepseekV4ForCausalLMNextN
 from tokenspeed.runtime.pd.cache_protocol import build_cache_fields_by_producer_step
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
@@ -2105,75 +2108,95 @@ class TestDeepseekV4Config(unittest.TestCase):
                 0,
             )
 
-    def test_dspark_tp_argmax_uses_contiguous_full_workspace_for_partial_batch(self):
-        local_logits = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
-        lm_head = SimpleNamespace(
-            shard_indices=SimpleNamespace(
-                num_org_elements=4,
-                num_org_elements_padded=4,
-                num_added_elements=0,
-                org_vocab_start_index=0,
-                added_vocab_start_index=4,
-            )
+    @staticmethod
+    def _greedy_fixture(vocab, rank, rows, block, tp_size, device):
+        """A single vocabulary shard plus the reference argmax over it."""
+        torch.manual_seed(0)
+        shard = SimpleNamespace(
+            num_org_elements=vocab,
+            num_added_elements=0,
+            org_vocab_start_index=0,
         )
-        gathered_values = torch.empty(4, 8)
-        gathered_ids = torch.empty(4, 8, dtype=torch.int64)
+        embedding = SimpleNamespace(
+            weight=torch.randn(vocab, rank, device=device).to(torch.bfloat16)
+        )
+        projection = SimpleNamespace(
+            weight=torch.randn(vocab, rank, device=device).to(torch.bfloat16),
+            shard_indices=shard,
+        )
+        markov = SimpleNamespace(embedding=embedding, projection=projection)
+        lm_head = SimpleNamespace(shard_indices=shard)
+        logits = torch.randn(rows, block, vocab, device=device)
+        bonus = torch.randint(0, vocab, (rows,), device=device, dtype=torch.int32)
+        expected = torch.empty(rows, block, dtype=torch.int64, device=device)
+        previous = bonus.long()
+        for step in range(block):
+            bias = embedding.weight[previous].float() @ projection.weight.float().T
+            previous = torch.argmax(logits[:, step] + bias, dim=-1)
+            expected[:, step] = previous
+        candidates, partials = dspark_greedy_workspace(tp_size, rows + 3, vocab, device)
+        return markov, lm_head, logits, bonus, expected, candidates, partials
 
-        def fake_all_gather(output, input_, group):
-            self.assertTrue(output.is_contiguous())
-            self.assertEqual(output.numel(), 4)
-            output.copy_(input_.repeat(4))
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_dspark_single_rank_block_sampler_matches_reference_without_gathers(self):
+        markov, lm_head, logits, bonus, expected, candidates, partials = (
+            self._greedy_fixture(300, 32, 5, 4, 1, "cuda")
+        )
+        output = torch.empty(5, 4, dtype=torch.int32, device="cuda")
+
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads.all_gather_single"
+        ) as gather:
+            sample_dspark_block_greedy(
+                logits, bonus, markov, lm_head, object(), candidates, partials, output
+            )
+
+        gather.assert_not_called()
+        self.assertIsNone(partials)
+        self.assertEqual(candidates.shape[:2], (2, 1))
+        self.assertTrue(torch.equal(output.long(), expected))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_dspark_tp_block_sampler_gathers_one_candidate_buffer_per_step(self):
+        markov, lm_head, logits, bonus, expected, candidates, partials = (
+            self._greedy_fixture(300, 32, 5, 4, 4, "cuda")
+        )
+        output = torch.empty(5, 4, dtype=torch.int32, device="cuda")
+
+        def fake_all_gather(gathered, scored, group):
+            # Every rank contributes this shard: the packed keys tie and the
+            # resolve must still pick this shard's winner.
+            self.assertTrue(gathered.is_contiguous() and scored.is_contiguous())
+            self.assertEqual(gathered.numel(), 4 * scored.numel())
+            gathered.view(4, -1).copy_(scored.expand(4, -1))
 
         with patch(
             "tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads.all_gather_single",
             side_effect=fake_all_gather,
         ) as gather:
-            token_ids = _local_vocab_argmax(
-                local_logits,
-                lm_head,
-                object(),
-                gathered_values,
-                gathered_ids,
+            sample_dspark_block_greedy(
+                logits, bonus, markov, lm_head, object(), candidates, partials, output
             )
 
-        self.assertEqual(gather.call_count, 2)
-        self.assertTrue(torch.equal(token_ids, torch.tensor([3], dtype=torch.int32)))
+        self.assertEqual(gather.call_count, 4)
+        self.assertTrue(torch.equal(output.long(), expected))
 
-        with self.assertRaisesRegex(ValueError, "must be contiguous"):
-            _local_vocab_argmax(
-                local_logits,
+        with self.assertRaisesRegex(ValueError, "does not cover the batch"):
+            sample_dspark_block_greedy(
+                logits,
+                bonus,
+                markov,
                 lm_head,
                 object(),
-                gathered_values[:, :1],
-                gathered_ids[:, :1],
+                candidates[:, :, :2].contiguous(),
+                partials[:2],
+                output,
             )
-
-    def test_dspark_single_rank_argmax_bypasses_collective_workspaces(self):
-        local_logits = torch.tensor([[1.0, 7.0, 3.0, 4.0]])
-        lm_head = SimpleNamespace(
-            tp_size=1,
-            shard_indices=SimpleNamespace(
-                num_org_elements=4,
-                num_org_elements_padded=4,
-                num_added_elements=0,
-                org_vocab_start_index=0,
-                added_vocab_start_index=4,
-            ),
-        )
-
-        with patch(
-            "tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads.all_gather_single"
-        ) as gather:
-            token_ids = _local_vocab_argmax(
-                local_logits,
-                lm_head,
-                object(),
-                torch.empty(0),
-                torch.empty(0, dtype=torch.int64),
+        lm_head.shard_indices.num_added_elements = 8
+        with self.assertRaisesRegex(ValueError, "without added vocabulary"):
+            sample_dspark_block_greedy(
+                logits, bonus, markov, lm_head, object(), candidates, partials, output
             )
-
-        gather.assert_not_called()
-        self.assertTrue(torch.equal(token_ids, torch.tensor([1], dtype=torch.int32)))
 
     def test_dspark_wire_target_uses_draft_head(self):
         draft_head = SimpleNamespace(weight=torch.ones(8, 3), tp_size=1)
@@ -2211,11 +2234,6 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_dspark_padding_slots_reset_before_every_graph_replay(self):
         drafter = object.__new__(DeepseekV4DSpark)
         drafter.device = torch.device("cpu")
-        drafter.lm_head = SimpleNamespace(weight=torch.ones(2, 2))
-        refresh_head = Mock(return_value=False)
-        drafter.model = SimpleNamespace(
-            refresh_local_base_logits_head=refresh_head,
-        )
         drafter.first_padding_slot = 3
         drafter.padding_slots = torch.arange(3, 7, dtype=torch.int64)
         drafter.slot_indices_buf = drafter.padding_slots.clone()
@@ -2272,8 +2290,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                 torch.zeros_like(drafter.context_lengths[3:]),
             )
         )
-        self.assertEqual(refresh_head.call_count, 11)
-        refresh_head.assert_called_with(drafter.lm_head.weight, force=False)
 
     def test_dspark_fp8_quant_dequant_matches_ue8m0_reference(self):
         values = torch.linspace(-7.0, 7.0, 256, dtype=torch.float32).reshape(2, 128)
@@ -2398,108 +2414,45 @@ class TestDeepseekV4Config(unittest.TestCase):
 
     def test_dspark_base_logits_use_public_fp32_head_math(self):
         model = object.__new__(DeepseekV4DSparkModel)
-        hidden = torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16)
-        head = SimpleNamespace(
-            weight=torch.tensor([[0.5, 0.25], [-1.0, 2.0]], dtype=torch.bfloat16)
-        )
+        hidden = torch.tensor([[[1.0, -2.0]], [[0.5, 4.0]]], dtype=torch.bfloat16)
+        head = torch.tensor([[0.5, 0.25], [-1.0, 2.0]], dtype=torch.bfloat16)
 
         logits = model.local_base_logits(hidden, head)
 
         self.assertEqual(logits.dtype, torch.float32)
-        self.assertTrue(torch.equal(logits, hidden.float() @ head.weight.float().T))
-
-    def test_dspark_base_logits_reuse_and_refresh_stable_fp32_head(self):
-        model = object.__new__(DeepseekV4DSparkModel)
-        torch.nn.Module.__init__(model)
-        model.register_buffer("_local_base_head_fp32", None, persistent=False)
-        model._local_base_head_source_ptr = None
-        model._local_base_head_source_version = None
-        hidden = torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16)
-        head = torch.tensor(
-            [[0.5, 0.25], [-1.0, 2.0]],
-            dtype=torch.bfloat16,
-        )
-
-        self.assertTrue(model.refresh_local_base_logits_head(head, force=False))
-        cached_ptr = model._local_base_head_fp32.data_ptr()
-        self.assertFalse(model.refresh_local_base_logits_head(head, force=False))
-        self.assertEqual(model._local_base_head_fp32.data_ptr(), cached_ptr)
-        self.assertTrue(
-            torch.equal(
-                model.local_base_logits(hidden, None),
-                hidden.float() @ head.float().T,
-            )
-        )
-
-        head.add_(1)
-        self.assertTrue(model.refresh_local_base_logits_head(head, force=False))
-        self.assertEqual(model._local_base_head_fp32.data_ptr(), cached_ptr)
-        self.assertTrue(
-            torch.equal(
-                model.local_base_logits(hidden, None),
-                hidden.float() @ head.float().T,
-            )
-        )
-
-        with self.assertRaisesRegex(RuntimeError, "shape or device changed"):
-            model.refresh_local_base_logits_head(torch.ones(3, 2), force=False)
-
-        original_version = int(head._version)
-        replacement = torch.full_like(head, 3)
-        head.data.copy_(replacement)
-        self.assertEqual(int(head._version), original_version)
-        self.assertFalse(model.refresh_local_base_logits_head(head, force=False))
-        self.assertTrue(model.refresh_local_base_logits_head(head, force=True))
-        self.assertTrue(
-            torch.equal(
-                model.local_base_logits(hidden, None),
-                hidden.float() @ replacement.float().T,
-            )
-        )
+        self.assertEqual(logits.shape, (2, 1, 2))
+        self.assertTrue(torch.equal(logits, hidden.float() @ head.float().T))
+        with self.assertRaisesRegex(ValueError, "hidden dtype"):
+            model.local_base_logits(hidden, head.float())
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
-    def test_dspark_cached_base_logits_survive_cuda_graph_refresh(self):
+    def test_dspark_base_logits_read_the_shared_head_in_place_under_cuda_graph(self):
         model = object.__new__(DeepseekV4DSparkModel)
-        torch.nn.Module.__init__(model)
-        model.register_buffer("_local_base_head_fp32", None, persistent=False)
-        model._local_base_head_source_ptr = None
-        model._local_base_head_source_version = None
-        hidden = torch.tensor(
-            [[1.0, -2.0]],
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
+        hidden = torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16, device="cuda")
         head = torch.tensor(
-            [[0.5, 0.25], [-1.0, 2.0]],
-            dtype=torch.bfloat16,
-            device="cuda",
+            [[0.5, 0.25], [-1.0, 2.0]], dtype=torch.bfloat16, device="cuda"
         )
-        model.refresh_local_base_logits_head(head, force=False)
-        cached_ptr = model._local_base_head_fp32.data_ptr()
 
         warmup_stream = torch.cuda.Stream()
         warmup_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(warmup_stream):
             for _ in range(3):
-                model.local_base_logits(hidden, None)
+                model.local_base_logits(hidden, head)
         torch.cuda.current_stream().wait_stream(warmup_stream)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            logits = model.local_base_logits(hidden, None)
+            logits = model.local_base_logits(hidden, head)
         graph.replay()
         torch.cuda.synchronize()
-        self.assertTrue(
-            torch.equal(logits, hidden.float() @ head.float().T),
-        )
+        self.assertEqual(logits.dtype, torch.float32)
+        self.assertTrue(torch.equal(logits, hidden.float() @ head.float().T))
 
+        # No FP32 copy sits between the target's head and the draft: an
+        # in-place weight update is visible to the next replay as is.
         head.add_(1)
-        model.refresh_local_base_logits_head(head, force=False)
-        self.assertEqual(model._local_base_head_fp32.data_ptr(), cached_ptr)
         graph.replay()
         torch.cuda.synchronize()
-        self.assertTrue(
-            torch.equal(logits, hidden.float() @ head.float().T),
-        )
+        self.assertTrue(torch.equal(logits, hidden.float() @ head.float().T))
 
     def test_dspark_speculative_config_uses_block_plus_bonus_width(self):
         server_args = ServerArgs(

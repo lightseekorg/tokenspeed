@@ -537,7 +537,7 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
 
         accept_length += 1
 
-        self.maybe_broadcast(predict, accept_index, accept_length)
+        self.broadcast_verify_outputs()
 
         valid = accept_index >= 0
         safe_positions = accept_index.clamp(min=0).long()

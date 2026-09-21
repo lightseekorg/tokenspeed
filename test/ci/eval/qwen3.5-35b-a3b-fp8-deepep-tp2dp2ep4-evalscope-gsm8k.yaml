@@ -12,6 +12,9 @@ env:
   CI: "true"
 install:
   - bash test/ci_system/install_deps.sh
+  - >-
+    python3 -c "import torch; assert torch.cuda.is_available();
+    import tokenspeed_kernel; print('CUDA kernel imports passed')"
 server:
   command: >-
     ts serve

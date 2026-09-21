@@ -189,8 +189,8 @@ def test_index_topk_rejects_invalid_page_table_shape(device, require, solution):
 @pytest.mark.parametrize(
     ("arch", "dtype", "width", "metric", "kernel_name"),
     [
-        ("gfx950", torch.uint8, 64, "flops4", "_dsv41_mxfp4_logits_kernel"),
-        ("gfx1250", torch.bfloat16, 128, "flops16", "_dsv41_wmma_logits_kernel"),
+        ("gfx950", torch.uint8, 64, "flops4", "gluon_dsv41_index_topk_gfx950"),
+        ("gfx1250", torch.bfloat16, 128, "flops16", "gluon_dsv41_index_topk_gfx1250"),
     ],
 )
 def test_indexer_launch_metadata(arch, dtype, width, metric, kernel_name):
@@ -214,8 +214,8 @@ def test_indexer_launch_metadata(arch, dtype, width, metric, kernel_name):
 @pytest.mark.parametrize(
     ("arch", "entry_name", "kernel_name"),
     [
-        ("gfx950", "dsv41_index_logits_gfx950", "_dsv41_mxfp4_logits_kernel"),
-        ("gfx1250", "dsv41_index_logits_gfx1250", "_dsv41_wmma_logits_kernel"),
+        ("gfx950", "dsv41_index_logits_gfx950", "gluon_dsv41_index_topk_gfx950"),
+        ("gfx1250", "dsv41_index_logits_gfx1250", "gluon_dsv41_index_topk_gfx1250"),
     ],
 )
 @pytest.mark.parametrize(

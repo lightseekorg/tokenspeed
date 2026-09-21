@@ -4,7 +4,6 @@ Speed-of-light TokenSpeed MLA kernels for Blackwell (`SM100/SM103`) with:
 
 - `MLA prefill`:
   - CuTe DSL JIT backend for ragged varlen FMHA (no padding)
-  - Optional AOT binary backend (pre-compiled `.so`) for FP8 E4M3 prefill
   - BF16 output, optional LSE output, causal/non-causal modes, PDL support
 - `MLA decode`:
   - CuTe DSL decode kernels for FP16/BF16/FP8 input paths
@@ -17,9 +16,7 @@ Speed-of-light TokenSpeed MLA kernels for Blackwell (`SM100/SM103`) with:
 This package includes performance-oriented optimizations for latency-sensitive
 serving workloads, especially coding agent style use cases with high request
 concurrency, short decode steps, and strict time-to-first-token/next-token
-requirements. For MLA prefill kernel, we supported two version, one is the open
-source version, and another is the binary version with some Nvidia internal knobs
-for better performance. For MLA decode kernel, small `q_len * num_heads`
+requirements. For MLA decode kernel, small `q_len * num_heads`
 configurations can fold a query-token group (`fold_sq_factor`) into heads for
 better tile utilization; remaining query groups are scheduled across the query
 sequence dimension.
@@ -38,7 +35,9 @@ use case 4: batch_size = 4, seqlen_qo = 512,      seqlen_kv = 80 * 1024
 use case 5: batch_size = 4, seqlen_qo = 1024,     seqlen_kv = 80 * 1024
 ```
 
-TensorRT-LLM’s MLA performance is already strong. The TokenSpeed MLA Prefill kernel offers two backends: the open-source version and a binary version with superior performance. While the open-source version is slightly slower than TensorRT-LLM’s native implementation, the AOT binary version excels across tested use cases. Its key optimization is a fine-tuned softmax implementation leveraging NVIDIA-internal knobs.
+The prefill comparison above includes historical results from an AOT
+implementation. Current releases ship the public CuTe DSL JIT implementation;
+the historical AOT backend is not included in the package.
 
 The performance numbers can be collected using the following command line:
 ```
@@ -167,9 +166,7 @@ What it supports:
 - Kernel compile cache keyed by static config (`dtype`, `d_qk`, `d_v`, causal, LSE, PDL, etc.)
 - Skip-correction is enabled in the wrapped FMHA path.
 - ex2-emulation (disabled by default on B200, and not supported on B300)
-- Two different MLA Prefill backends:
-  - CuTe DSL JIT backend (default)
-  - AOT binary backend (if compatible SO is present)
+- CuTe DSL JIT backend
 
 Input/output dtype behavior:
 
@@ -178,15 +175,6 @@ Input/output dtype behavior:
   - MLA Prefill only support `torch.float8_e4m3fn`
 - Prefill output tensor is BF16 (`torch.bfloat16`)
 - Optional LSE output is FP32
-
-Backend selection:
-
-- Default: CuTe DSL JIT (`TOKENSPEED_MLA_PREFILL_BACKEND=cutedsl`)
-- Optional: binary AOT (`TOKENSPEED_MLA_PREFILL_BACKEND=binary`)
-- Binary `.so` path override: `TOKENSPEED_MLA_FMHA_BINARY_SO`
-- Availability probe API: `has_binary_prefill()`
-
-
 
 ### MLA Decode (`tokenspeed_mla_decode`)
 
@@ -259,4 +247,42 @@ out, lse = tokenspeed_mla_prefill(
     max_seq_len_q=max_q_len,        # optional
     enable_pdl=False,
 )
+```
+
+## Releases
+
+The [release-tokenspeed-mla workflow](https://github.com/lightseekorg/tokenspeed/actions/workflows/release-tokenspeed-mla.yml)
+builds a source-only `py3-none-any` wheel from this repository and publishes it to
+PyPI. Packaging does not require a GPU or CUDA compiler; the kernels compile with
+CuTe DSL and Triton at runtime.
+
+Before the first release through this workflow, configure a
+[PyPI Trusted Publisher](https://docs.pypi.org/trusted-publishers/adding-a-publisher/)
+for the existing `tokenspeed-mla` project:
+
+- Owner: `lightseekorg`
+- Repository: `tokenspeed`
+- Workflow filename: `release-tokenspeed-mla.yml`
+- Environment: `pypi`
+
+Release steps:
+
+1. Merge kernel changes, then update `[project].version` in
+   `tokenspeed-mla/pyproject.toml` when a release is needed. Prefer a separate
+   version-bump PR; multiple code changes can share one release.
+2. After merging the version bump, dispatch from `main`:
+   `gh workflow run release-tokenspeed-mla.yml -R lightseekorg/tokenspeed --ref main`.
+   The workflow refuses versions already present on PyPI and checks the wheel's
+   metadata, JIT sources, and license notices before publishing.
+3. Wait for PyPI publication, then use `update-tokenspeed-kernel-mla.yml` with
+   `mla_version=<version>` to open the dependency-update PR.
+
+For local packaging checks, use Python 3.12 and install `build`, `packaging`,
+`pytest`, and `twine` in a virtual environment. From the repository root:
+
+```bash
+(cd tokenspeed-mla && python -m pytest tests/test_release.py -q)
+python -m build tokenspeed-mla --wheel --outdir dist
+python -m twine check --strict dist/*
+python tokenspeed-mla/scripts/check_release.py --package-dir tokenspeed-mla --dist-dir dist
 ```

@@ -148,7 +148,6 @@ if is_available():
             "qk_l2norm": frozenset({False, True}),
             "output_h": frozenset({False, True}),
         },
-        tags={"hopper", "blackwell", "latency"},
     )
     def flashinfer_gdn_chunk_prefill(
         q: torch.Tensor,
@@ -297,7 +296,6 @@ if is_decode_available():
         traits={
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
         },
-        tags={"hopper", "latency"},
     )
     def flashinfer_gdn_decode_step(
         q: torch.Tensor,
@@ -366,7 +364,6 @@ if is_decode_available():
         traits={
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
         },
-        tags={"hopper", "latency", "speculative-decoding"},
     )
     def flashinfer_gdn_decode_mtp(
         q: torch.Tensor,

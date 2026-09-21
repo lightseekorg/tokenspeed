@@ -199,7 +199,6 @@ def moe_sigmoid_bias_topk(
         "router_logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
     ),
     priority=Priority.PERFORMANT,
-    tags={"nvidia", "cuda_graph"},
 )
 def triton_minimax_sigmoid_bias_topk(
     *,
@@ -245,7 +244,6 @@ def triton_minimax_sigmoid_bias_topk(
         "router_logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
     ),
     priority=Priority.PORTABLE,
-    tags={"portability", "reference"},
 )
 def torch_sigmoid_bias_topk(
     *,

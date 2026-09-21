@@ -144,7 +144,6 @@ def _sample_registration(
     features: frozenset[str] | None = None,
     capability: CapabilityRequirement | None = None,
     priority: int = 10,
-    tags: frozenset[str] | None = None,
 ) -> SampleRegistration:
     return (
         {
@@ -156,7 +155,6 @@ def _sample_registration(
             "capability": capability,
             "signatures": signatures,
             "priority": priority,
-            "tags": tags,
         },
         dummy_impl(name),
     )
@@ -178,7 +176,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
                 min_arch_version=ArchVersion(8, 0),
             ),
             priority=18,
-            tags=frozenset({"latency"}),
         ),
         "triton_decode": _sample_registration(
             "triton_decode",
@@ -190,7 +187,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
             ),
             features=frozenset({"paged"}),
             priority=10,
-            tags=frozenset({"portability"}),
         ),
         "cutlass_prefill": _sample_registration(
             "cutlass_prefill",
@@ -205,7 +201,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
                 min_arch_version=ArchVersion(9, 0),
             ),
             priority=16,
-            tags=frozenset({"throughput"}),
         ),
         "reference_decode": _sample_registration(
             "reference_decode",
@@ -220,7 +215,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
             features=frozenset({"paged"}),
             capability=CapabilityRequirement(),
             priority=10,
-            tags=frozenset({"determinism", "portability"}),
         ),
         "aiter_decode": _sample_registration(
             "aiter_decode",
@@ -233,7 +227,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
             features=frozenset({"paged"}),
             capability=CapabilityRequirement(vendors=frozenset({"amd"})),
             priority=16,
-            tags=frozenset({"latency", "portability"}),
         ),
         "cutlass_gemm": _sample_registration(
             "cutlass_gemm",
@@ -246,7 +239,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
                 min_arch_version=ArchVersion(8, 0),
             ),
             priority=15,
-            tags=frozenset({"throughput", "latency"}),
         ),
         "triton_gemm": _sample_registration(
             "triton_gemm",
@@ -255,7 +247,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
             "triton",
             format_signatures(("a", "b"), "dense", {torch.float16, torch.bfloat16}),
             priority=10,
-            tags=frozenset({"portability"}),
         ),
         "cutlass_grouped_gemm": _sample_registration(
             "cutlass_grouped_gemm",
@@ -268,7 +259,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
                 min_arch_version=ArchVersion(9, 0),
             ),
             priority=16,
-            tags=frozenset({"throughput"}),
         ),
         "triton_grouped_gemm": _sample_registration(
             "triton_grouped_gemm",
@@ -277,7 +267,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
             "triton",
             format_signatures(("a", "b"), "dense", {torch.float16, torch.bfloat16}),
             priority=10,
-            tags=frozenset({"portability"}),
         ),
         "triton_fused_moe": _sample_registration(
             "triton_fused_moe",
@@ -288,7 +277,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
                 ("x", "weight"), "dense", {torch.float16, torch.bfloat16}
             ),
             priority=12,
-            tags=frozenset({"throughput", "portability"}),
         ),
         "cutlass_fused_moe": _sample_registration(
             "cutlass_fused_moe",
@@ -303,7 +291,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
                 min_arch_version=ArchVersion(9, 0),
             ),
             priority=15,
-            tags=frozenset({"latency", "throughput"}),
         ),
         "triton_modular_moe": _sample_registration(
             "triton_modular_moe",
@@ -312,7 +299,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
             "triton",
             format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
             priority=10,
-            tags=frozenset({"determinism", "portability"}),
         ),
         "cutlass_modular_moe": _sample_registration(
             "cutlass_modular_moe",
@@ -325,7 +311,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
                 min_arch_version=ArchVersion(8, 0),
             ),
             priority=14,
-            tags=frozenset({"throughput"}),
         ),
     }
 

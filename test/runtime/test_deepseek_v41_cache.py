@@ -208,6 +208,7 @@ def test_rebinding_cache_pool_drops_pool_derived_state():
     backend._swa_plans[ForwardMode.DECODE] = object()
     backend._prefill_spans = ((0, 0, 0, 1),)
     backend._decode_schedule_keepalive.append(torch.empty(1))
+    backend._decode_schedules[(0, 0)] = (torch.empty(1), None, object())
     backend._prepared_selections[()] = ()
 
     new_pool = _pool(_recipe("cpu"), "cpu")
@@ -219,11 +220,11 @@ def test_rebinding_cache_pool_drops_pool_derived_state():
     assert backend.forward_decode_metadata is None
     assert not backend._decode_views_by_bs
     assert backend._decode_buffers is None
-    assert backend._decode_history_status is None
     assert backend._max_decode_bs == 0
     assert not backend._swa_plans
     assert not backend._prefill_spans
     assert not backend._decode_schedule_keepalive
+    assert not backend._decode_schedules
     assert not backend._prepared_selections
     backend.init_cuda_graph_state(2, max_tokens_per_req=1, overlap_schedule_depth=1)
     assert backend._decode_buffers is not old_buffers
@@ -288,29 +289,6 @@ def _final(lengths, prefixes):
     return [p + n for p, n in zip(prefixes, lengths)]
 
 
-@pytest.mark.parametrize("for_graph_replay", [False, True])
-@pytest.mark.parametrize(
-    "group,message", [(SWA, "SWA prefix"), (TAIL, "compressor tail")]
-)
-def test_refresh_rejects_missing_history_before_execution(
-    for_graph_replay, group, message
-):
-    backend = _backend("cpu", 2)
-    tables = _tables("cpu")
-    tables[group][0].zero_()
-    with pytest.raises(RuntimeError, match=message):
-        backend.refresh_decode_metadata(
-            2,
-            1,
-            torch.tensor([19]),
-            torch.tensor([4]),
-            forward_mode=ForwardMode.DECODE,
-            block_tables=tables,
-            num_extends=0,
-            for_graph_replay=for_graph_replay,
-        )
-
-
 @pytest.mark.parametrize("verify_width", [1, 3, 5, 6])
 @pytest.mark.parametrize("for_graph_replay", [False, True])
 def test_packed_refresh_positions_padding_and_token_count(
@@ -337,7 +315,6 @@ def test_packed_refresh_positions_padding_and_token_count(
         meta.swa_read_lens,
         *meta.compressor,
     ]
-    assert backend._decode_history_status.numel() == 3 * verify_width
     assert all(tensor.shape == (3 * verify_width,) for tensor in meta.compressor)
     pointers = [tensor.data_ptr() for tensor in tensors]
     runner = SimpleNamespace(
@@ -474,47 +451,6 @@ def test_packed_mixed_metadata_and_count_validation(verify_width):
         )
 
 
-@pytest.mark.parametrize("for_graph_replay", [False, True])
-@pytest.mark.parametrize(
-    "group,start,column,message",
-    [(SWA, 190, 0, "SWA prefix"), (TAIL, 3, 1, "compressor tail")],
-)
-def test_packed_history_checks_each_window_start(
-    for_graph_replay, group, start, column, message
-):
-    width = 5
-    backend = _verify_backend("cpu", 2, width)
-    tables = _tables("cpu")
-    # Request 0 has no external tail; missing internal pair rows must not be
-    # treated as old history. Request 1 exercises the first query, not its last.
-    tables[TAIL][0].zero_()
-    tables[group][1, column] = 0
-    with pytest.raises(RuntimeError, match=message):
-        backend.refresh_decode_metadata(
-            2,
-            2,
-            torch.tensor([19, 7]),
-            torch.tensor([width, start + width]),
-            forward_mode=ForwardMode.DECODE,
-            block_tables=tables,
-            num_extends=0,
-            num_tokens=2 * width,
-            for_graph_replay=for_graph_replay,
-        )
-    tables[group][1, column] = _tables("cpu")[group][1, column]
-    backend.refresh_decode_metadata(
-        2,
-        2,
-        torch.tensor([19, 7]),
-        torch.tensor([width, start + width]),
-        forward_mode=ForwardMode.DECODE,
-        block_tables=tables,
-        num_extends=0,
-        num_tokens=2 * width,
-        for_graph_replay=for_graph_replay,
-    )
-
-
 def test_full_scan_is_bounded_by_table_and_physical_capacity():
     pool = _backend("cpu", 2).cache_pool
     config = replace(_config("cpu"), context_len=1 << 20)
@@ -544,36 +480,6 @@ def test_full_scan_is_bounded_by_table_and_physical_capacity():
                 None,
             )
             assert topk.call_args.args[3].shape[1] == pool.index_k(layer).shape[0] - 1
-
-
-def test_mixed_decode_rejects_missing_history():
-    backend = _backend("cpu", 2)
-    tables = _tables("cpu")
-    tables[SWA][1].zero_()
-    with pytest.raises(RuntimeError, match="SWA prefix"):
-        backend.init_forward_metadata(
-            2,
-            1,
-            torch.tensor([23, 17]),
-            torch.tensor([2, 9]),
-            ForwardMode.MIXED,
-            block_tables=tables,
-            extend_seq_lens=torch.tensor([2]),
-            extend_seq_lens_cpu=torch.tensor([2]),
-            extend_prefix_lens=torch.tensor([0]),
-            extend_prefix_lens_cpu=torch.tensor([0]),
-            extend_replay_lens_cpu=torch.tensor([0]),
-            extend_prompt_lens_cpu=torch.tensor([2]),
-            extend_with_prefix=False,
-        )
-
-
-def test_compressor_prefill_rejects_missing_history():
-    backend = _backend("cpu", 2)
-    tables = _tables("cpu")
-    tables[TAIL].zero_()
-    with pytest.raises(RuntimeError, match="compressor tail"):
-        _extend(backend, tables, [1], [3], [0], _final([1], [3]))
 
 
 def test_replay_span_truncates_swa_prefix_and_validates_lengths():
@@ -823,8 +729,9 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool, verify_
 
     assert DeepseekV41AttentionBackend.cuda_graph_support.decode_graph
     # Decoder narrowing makes the prefill row count depend on prompt
-    # completion, not on the token bucket, so prefill graphs stay off.
-    assert not DeepseekV41AttentionBackend.cuda_graph_support.prefill_graph
+    # completion, not on the token bucket; the prefill graph captures the
+    # encoder and decoder stages separately around it (NarrowingPrefillModel).
+    assert DeepseekV41AttentionBackend.cuda_graph_support.prefill_graph
     torch.manual_seed(42)
     backend = _verify_backend("cuda", 5, verify_width)
     backend.cache_pool.arena.buffer.zero_()
@@ -1108,6 +1015,13 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
     assert set(pd_specs) == set(specs)
     assert all(spec.transfer_policy == "full_suffix" for spec in pd_specs.values())
     assert all(spec.transfer_policy is None for spec in specs.values())
+
+
+def test_pool_reports_the_whole_arena_as_kv_bytes():
+    # The startup memory summary reads this; without it the arena is
+    # misattributed to activations and the KV row prints 0.
+    pool = _pool(_recipe("cpu"), "cpu")
+    assert pool.get_kv_size_bytes() == pool.arena.buffer.nbytes > 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1985,13 +1899,8 @@ def test_prefill_plan_distinguishes_reordered_subset_and_checks_dependencies(dev
     wanted = positions[:, None] - torch.arange(127, -1, -1, device=device)
     actual = workspace_positions[request.swa_indices.long()]
     torch.testing.assert_close(actual, wanted)
-    # A missing required historical row must fail, even if a same-sized window
-    # was previously cached. Failed validation must not publish a plan.
+    # A changed table must resolve to a new plan, not the cached one.
     backend._swa_plans.clear()
-    tables[SWA][0, 0] = 0
-    with pytest.raises(RuntimeError, match="SWA prefix is missing"):
-        backend._swa_query_plan(positions, requests, ForwardMode.EXTEND)
-    assert not backend._swa_plans
     tables[SWA][0, 0] = 1
     assert backend._swa_query_plan(positions, requests, ForwardMode.EXTEND).requests
 
@@ -2043,6 +1952,50 @@ def test_native_decode_receives_compact_window_and_real_lengths(monkeypatch, pos
     if count:
         expected = torch.arange(position - count + 1, position + 1) + 64
         torch.testing.assert_close(slots[0, :count], expected.int())
+
+
+def test_native_decode_schedule_shared_per_length_pair_within_a_forward(
+    monkeypatch,
+):
+    from tokenspeed_kernel.ops.attention import dsv41
+
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    produced = []
+    monkeypatch.setattr(
+        dsv41,
+        "new_attention_schedule",
+        lambda: produced.append(object()) or produced[-1],
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    def refresh():
+        backend.refresh_decode_metadata(
+            1,
+            1,
+            torch.tensor([0]),
+            torch.tensor([6]),
+            forward_mode=ForwardMode.DECODE,
+            block_tables=tables,
+            for_graph_replay=False,
+        )
+
+    refresh()
+    swa_lens = backend.forward_decode_metadata.swa_read_lens
+    global_lens = torch.tensor([512])
+    # Every layer that reads the same length tensors gets the same producer;
+    # SWA-only layers (no global lengths) form their own group.
+    shared = backend._decode_schedule(swa_lens, global_lens)
+    assert backend._decode_schedule(swa_lens, global_lens) is shared
+    swa_only = backend._decode_schedule(swa_lens, None)
+    assert swa_only is not shared
+    assert backend._decode_schedule(swa_lens, None) is swa_only
+    assert backend._decode_schedule(swa_lens, torch.tensor([512])) is not shared
+    assert len(produced) == 3
+    # The next forward's refreshed lengths must not reuse an initialized producer.
+    refresh()
+    assert backend._decode_schedule(swa_lens, global_lens) is not shared
+    assert len(produced) == 4
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -2171,8 +2124,7 @@ def test_compressor_plan_shared_owners_and_reused_tail_page(device, monkeypatch)
         backend.compress(2, content[:2], scores[:2], ForwardMode.EXTEND, None, 0.0)
     # Preparing a new forward must resolve the changed LCM assignment again.
     tables[TAIL][0, 1] = 0
-    with pytest.raises(RuntimeError, match="compressor tail"):
-        _extend(backend, tables, [4, 3], [3, 0], [0, 0], _final([4, 3], [3, 0]))
+    _extend(backend, tables, [4, 3], [3, 0], [0, 0], _final([4, 3], [3, 0]))
     assert len(calls) == 2
 
 

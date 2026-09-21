@@ -91,7 +91,6 @@ __all__ = ["cutedsl_kda_chunk_prefill", "cutedsl_kda_supported"]
         "recurrent_layout": frozenset({"v_major"}),
         "prefill_capacity": frozenset({True}),
     },
-    tags={"nvidia", "paged_cache"},
 )
 def cutedsl_kda_nvidia_paged_prefill(**kwargs) -> KdaPrefillResult:
     # Capacity admission is checked against the actual CPU mirror by the

@@ -633,6 +633,80 @@ def test_index_topk_selects_top_scores_on_every_index_format(device, fmt, shared
     assert relengths[3] == 0
 
 
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_index_query_quantization_matches_the_reference_codec(device, contiguous):
+    # The fused quantizer replaces a chain of eager ops, so it has to reproduce
+    # them bit for bit: the E4M3 payload decides which rows a pass scores, and
+    # the folded weight carries the query scale the logits kernels never apply.
+    # A head-major view is the shape a projection hands over before any copy.
+    torch.manual_seed(51)
+    q = torch.randn((5, 32, 128), dtype=torch.bfloat16, device=device)
+    weights = torch.rand((5, 32), dtype=torch.bfloat16, device=device)
+    if not contiguous:
+        q = q.transpose(0, 1).contiguous().transpose(0, 1)
+        assert not q.is_contiguous()
+    quantized, folded = implementation.quantize_index_queries(q, weights)
+
+    values = q.float()
+    scale = values.abs().amax(-1, keepdim=True).clamp_min(1.0e-6) / 448.0
+    expected = (values / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    torch.testing.assert_close(
+        quantized.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        folded, weights.float() * scale.squeeze(-1), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("fmt", ["index", "index_v4"])
+def test_reindex_maps_every_candidate_block_order_back_to_row_ids(device, fmt):
+    # A produced pool ascends, but the op accepts any block order with -1
+    # padding anywhere, and a scorer that compacts the history down to the pool
+    # must still report row ids rather than pool columns. Top-K capacity sits
+    # above the pool, so every visible candidate row comes back regardless of
+    # score, which pins the mapping itself on each format's scorer.
+    torch.manual_seed(46)
+    q = torch.randn((3, 32, 128), dtype=torch.bfloat16, device=device)
+    weights = torch.rand((3, 32), dtype=torch.bfloat16, device=device)
+    k = torch.randn((64 * 6, 128), dtype=torch.bfloat16, device=device)
+    cache = _index_cache(k, fmt)
+    table = torch.arange(cache.shape[0], device=device).expand(3, -1).contiguous()
+    visible = torch.tensor([263, 8, 0], device=device)
+    candidates = torch.tensor(
+        [[32, 0, -1, 17], [0, 1, -1, -1], [1, -1, -1, -1]],
+        dtype=torch.int32,
+        device=device,
+    )
+    top, lengths, blocks, block_lens = dsv41.index_topk(
+        q,
+        weights,
+        cache,
+        table,
+        visible,
+        candidates,
+        512,
+        0,
+        8,
+        64,
+        4096,
+        None,
+        None,
+        None,
+    )
+    torch.cuda.synchronize()
+    assert lengths.tolist() == [23, 8, 0]
+    assert blocks.shape == (3, 0) and not block_lens.any()
+    expected = torch.tensor(
+        list(range(8)) + list(range(136, 144)) + list(range(256, 263)), device=device
+    )
+    torch.testing.assert_close(top[0, :23].long(), expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        top[1, :8].long(), torch.arange(8, device=device), rtol=0, atol=0
+    )
+    assert (top[0, 23:] == -1).all() and (top[1, 8:] == -1).all()
+    assert (top[2] == -1).all()
+
+
 def test_candidate_block_max_not_sum(device):
     k = torch.zeros((17, 128), dtype=torch.bfloat16, device=device)
     k[0, 0] = 6
@@ -1254,27 +1328,22 @@ def test_decode_rows_rejects_request_token_shape_confusion():
 
 
 @pytest.mark.parametrize("target", ["cpu", "cuda"])
-def test_decode_window_ragged_external_history_only_and_replay(target):
+def test_decode_window_ragged_addresses_and_replay(target):
     if target == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA/ROCm")
     p = torch.tensor([-1, 0, 1, 2, 3, 4, 3, 4, 5, 6, 7, 190, 191, -1], device=target)
     r = torch.tensor([-1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, -1], device=target)
     swa = torch.ones((3, 4), dtype=torch.int32, device=target)
-    tail = torch.ones((3, 100), dtype=torch.int32, device=target)
-    tail[0].zero_()  # All pairs are internal to the first request's window.
-    tail[1, 1] = 0  # Request 1 really needs token 2 from its external tail.
-    tail[2].zero_()  # Token 190 is supplied by this forward, not its tail page.
-    swa[2, 0] = 0  # Token 63 belongs to request 2's external SWA history.
+    swa[2, 0] = 0  # A null page resolves to -1 rows; residency is not judged here.
     n = p.numel()
     out = (
         torch.empty(n, dtype=torch.int64, device=target),
         torch.empty((n, 128), dtype=torch.int32, device=target),
         torch.empty(n, dtype=torch.int32, device=target),
-        torch.empty(n, dtype=torch.int32, device=target),
     )
 
     def prepare():
-        dsv41.decode_window(p, r, *out, swa, tail, 2, 2)
+        dsv41.decode_window(p, r, *out, swa, 2)
 
     prepare()
     if target == "cuda":
@@ -1283,7 +1352,6 @@ def test_decode_window_ragged_external_history_only_and_replay(target):
             prepare()
     for step in range(3):
         if step == 1:
-            tail[1, 1] = 1
             swa[2, 0] = 1
         if step == 2:
             p.fill_(-1)
@@ -1293,10 +1361,6 @@ def test_decode_window_ragged_external_history_only_and_replay(target):
             graph.replay()
         else:
             prepare()
-        errors = [0] * n
-        if step == 0:
-            errors[6], errors[11] = 2, 1
-        assert out[3].cpu().tolist() == errors
         table = swa.cpu().tolist()
 
         def slot(position, request):
@@ -1322,7 +1386,171 @@ def test_decode_window_ragged_external_history_only_and_replay(target):
             ],
             [min(max(position + 1, 0), 128) for position, _ in coordinates],
         )
-        for got, want in zip(out[:3], expected, strict=True):
+        for got, want in zip(out, expected, strict=True):
             torch.testing.assert_close(
                 got.cpu(), torch.tensor(want, dtype=got.dtype), rtol=0, atol=0
             )
+
+
+def _rope_table(device, positions=4096, rotary_dim=64):
+    inv_freq = 1.0 / (
+        10000 ** (torch.arange(0, rotary_dim, 2, device=device).float() / rotary_dim)
+    )
+    angles = torch.arange(positions, device=device)[:, None].float() * inv_freq
+    return torch.cat((angles.cos(), angles.sin()), -1).contiguous()
+
+
+def test_dspark_rows_matches_norm_rope_round_trip_and_scatter(device):
+    """One launch reproduces kv_norm -> RoPE -> SWA codec round trip -> scatter."""
+    from tokenspeed_kernel.ops.attention.dsv41 import rope_inplace
+
+    torch.manual_seed(4)
+    rows, eps = 12, 1e-6
+    merged = torch.randn(rows, 3 * 512, device=device, dtype=torch.bfloat16) * 3
+    values = merged[:, 512:1024]
+    weight = (torch.rand(512, device=device) + 0.5).to(torch.bfloat16)
+    table = _rope_table(device)
+    positions = torch.randint(0, 4000, (rows,), device=device)
+    slots = torch.arange(64, 64 + 7 * rows, 7, device=device, dtype=torch.int32)
+    slots[3], slots[5] = -1, 8 * 64 + 5
+    window = torch.zeros(8, 64, 512, device=device, dtype=torch.bfloat16)
+
+    def round_trip(x):
+        return dsv41.cache_unpack(dsv41.cache_pack(x, "swa", None), "swa", None)
+
+    normalized = values.float()
+    normalized = normalized * torch.rsqrt(
+        normalized.square().mean(-1, keepdim=True) + eps
+    )
+    normalized = (weight.float() * normalized).to(torch.bfloat16)
+    expected = round_trip(rope_inplace(normalized.clone(), positions, table, None))
+
+    out = torch.empty_like(values)
+    dsv41.dspark_rows(values, weight, eps, positions, table, window, slots, out)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    live = (slots >= 0) & (slots < 8 * 64)
+    torch.testing.assert_close(
+        window[slots[live].long() // 64, slots[live].long() % 64],
+        expected[live],
+        rtol=0,
+        atol=0,
+    )
+    assert window.reshape(-1, 512).ne(0).any(-1).sum() == int(live.sum())
+    # Without the norm the input is used as is; without the table nothing rotates.
+    torch.testing.assert_close(
+        dsv41.dspark_rows(
+            values, None, None, positions, table, None, None, torch.empty_like(values)
+        ),
+        round_trip(rope_inplace(values.clone(), positions, table, None)),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        dsv41.dspark_rows(
+            values, None, None, None, None, None, None, torch.empty_like(values)
+        ),
+        round_trip(values),
+        rtol=0,
+        atol=0,
+    )
+    dsv41.dspark_rows(
+        values[:0], weight, eps, positions[:0], table, window, slots[:0], None
+    )
+    for bad in (
+        dict(norm_weight=None),
+        dict(norm_eps=None),
+        dict(positions=None),
+        dict(cos_sin_cache=None),
+        dict(slots=None),
+        dict(window=window[:, :, :256]),
+        dict(window=None, out=None),
+        dict(values=values.t()),
+    ):
+        kwargs = dict(
+            values=values,
+            norm_weight=weight,
+            norm_eps=eps,
+            positions=positions,
+            cos_sin_cache=table,
+            window=window,
+            slots=slots,
+            out=None,
+        )
+        kwargs.update(bad)
+        with pytest.raises(ValueError):
+            dsv41.dspark_rows(**kwargs)
+
+
+def test_dspark_anchors_pick_last_accepted_verify_rows(device):
+    bs, extends, width, spec = 4, 1, 6, 6
+    decodes = bs - extends
+    tokens = torch.arange(100, 100 + extends + decodes * width, device=device).to(
+        torch.int32
+    )
+    accept = torch.tensor([1, 4, 0, 9], device=device, dtype=torch.int32)
+    positions = torch.arange(1000, 1000 + decodes * width, device=device)
+    next_tokens = torch.zeros(bs, spec, device=device, dtype=torch.int32)
+    start = torch.zeros(decodes, device=device, dtype=torch.int64)
+    dsv41.dspark_anchors(tokens, accept, positions, extends, width, next_tokens, start)
+    # Extend rows keep their sampled token; decode rows take the token at the
+    # last accepted verify row, with accept lengths clamped into 1..width.
+    assert next_tokens.tolist() == [[100] * 6, [104] * 6, [107] * 6, [118] * 6]
+    assert start.tolist() == [1003, 1006, 1017]
+    cpu_next = torch.zeros(bs, spec, dtype=torch.int32)
+    cpu_start = torch.zeros(decodes, dtype=torch.int64)
+    dsv41.dspark_anchors(
+        tokens.cpu(), accept.cpu(), positions.cpu(), extends, width, cpu_next, cpu_start
+    )
+    assert torch.equal(cpu_next, next_tokens.cpu()) and torch.equal(
+        cpu_start, start.cpu()
+    )
+    with pytest.raises(ValueError):
+        dsv41.dspark_anchors(
+            tokens[:-1], accept, positions, extends, width, next_tokens, start
+        )
+
+
+def test_dspark_block_expands_anchors_and_window_addressing(device):
+    torch.manual_seed(5)
+    n, window, block, hc, rows_per_page, noise = 3, 128, 5, 4, 64, 77
+    history = torch.randint(-1, 600, (n, window), device=device, dtype=torch.int32)
+    history[0, :100] = -1
+    # The drafter hands over the bonus column of its [bs, spec] token table.
+    bonus = torch.tensor([[3, 9], [4, 9], [5, 9]], device=device, dtype=torch.int32)[
+        :, 0
+    ]
+    start = torch.tensor([10, 200, 7], device=device)
+    outputs = dsv41.dspark_block(bonus, start, history, noise, rows_per_page, hc, block)
+    ids, positions, pre_mix, requests, page, row, indices = outputs
+    assert [t.dtype for t in outputs] == [
+        torch.int32,
+        torch.int64,
+        torch.float32,
+        torch.int64,
+        torch.int64,
+        torch.int64,
+        torch.int32,
+    ]
+    assert ids.view(n, block)[:, 0].tolist() == [3, 4, 5]
+    assert ids.view(n, block)[:, 1:].eq(noise).all()
+    assert positions.view(n, block).tolist() == [
+        [s + 1 + j for j in range(block)] for s in (10, 200, 7)
+    ]
+    assert pre_mix.tolist() == [[1.0, 0.0, 0.0, 0.0]] * (n * block)
+    assert requests.tolist() == [r for r in range(n) for _ in range(block)]
+    clamped = history.clamp_min(0).long()
+    assert torch.equal(page, clamped // rows_per_page)
+    assert torch.equal(row, clamped % rows_per_page)
+    width = window + block
+    expected = torch.arange(n * width, device=device, dtype=torch.int32).view(n, width)
+    expected[:, :window].masked_fill_(history < 0, -1)
+    assert torch.equal(
+        indices.view(n, block, width), expected[:, None, :].expand(-1, block, -1)
+    )
+    cpu = dsv41.dspark_block(
+        bonus.cpu(), start.cpu(), history.cpu(), noise, rows_per_page, hc, block
+    )
+    for got, reference in zip(outputs, cpu, strict=True):
+        assert torch.equal(got.cpu(), reference.to(got.dtype))
+    with pytest.raises(ValueError):
+        dsv41.dspark_block(bonus[:2], start, history, noise, rows_per_page, hc, block)

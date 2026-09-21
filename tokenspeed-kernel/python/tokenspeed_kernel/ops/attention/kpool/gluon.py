@@ -723,7 +723,6 @@ if _IS_AMD:
             "topk_layout": frozenset({"global_slots"}),
             "prefill_plan": frozenset({False, True}),
         },
-        tags={"amd", "gfx950", "hybrid", "kpool", "mfma-score", "radix-topk"},
     )(gluon_kpool_prefill_topk_fp8_gfx950)
     register_kernel(
         "attention",
@@ -747,14 +746,6 @@ if _IS_AMD:
             "score_activation": frozenset({"relu"}),
             "topk_layout": frozenset({"global_slots"}),
             "prefill_plan": frozenset({False, True}),
-        },
-        tags={
-            "amd",
-            "gfx1250",
-            "hybrid",
-            "kpool",
-            "wave32-wmma-score",
-            "wave32-radix-topk",
         },
     )(gluon_kpool_prefill_topk_fp8_gfx1250)
     __all__ = [

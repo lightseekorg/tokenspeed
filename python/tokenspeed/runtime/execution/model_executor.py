@@ -25,8 +25,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import tokenspeed_kernel
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.metadata import advance_accepted_frontier
 from tokenspeed_kernel.ops.tuning import (
     autotune,
     set_autotune_max_num_tokens,
@@ -660,10 +662,78 @@ class ModelExecutor:
                     positions=positions,
                     **ib.ngram_model_kwargs(num_tokens),
                 )
+            if self.drafter is not None:
+                self._autotune_draft_experts(num_tokens)
         set_autotune_process_group(None)
         torch.get_device_module(self.device).synchronize()
         dist.barrier()
         logger.info(f"Kernel tuning finished in {time.time() - tic:.1f}s")
+
+    def _autotune_draft_experts(self, num_tokens: int) -> None:
+        """Tune the draft model's routed-expert kernels inside the tuning window.
+
+        The dummy prefill drives the target model only. A draft with its own
+        expert geometry (DSpark's 128-expert MoE) is keyed separately by the
+        tuner and would otherwise fall back to untuned tactics on every draft
+        step. One apply per distinct expert geometry at the prefill token
+        count lets the tuner enumerate every smaller bucket, exactly as the
+        target's prefill does for the target experts.
+        """
+        from tokenspeed.runtime.layers.moe.expert import MoELayer
+
+        tuned: set[tuple] = set()
+        for layer in self.drafter.draft_model_runner.model.modules():
+            if not isinstance(layer, MoELayer):
+                continue
+            # All-to-all and MegaMoE plans own collectives sized by the real
+            # batch geometry; they have no FlashInfer tactics to tune either.
+            if (
+                layer.plan["a2a_backend"] == "deepep"
+                or layer.plan["solution"] == "mega_moe"
+            ):
+                continue
+            key = (
+                layer.plan["apply_kernel_name"],
+                layer.hidden_size,
+                layer.intermediate_size,
+                layer.num_experts,
+                layer.top_k,
+            )
+            if key in tuned:
+                continue
+            tuned.add(key)
+            hidden_states = torch.zeros(
+                num_tokens,
+                layer.hidden_size,
+                dtype=layer.input_dtype,
+                device=self.device,
+            )
+            # Distinct expert ids per token: kernels may reject repeats.
+            scores = torch.rand(num_tokens, layer.num_experts, device=self.device)
+            topk_weights, topk_ids = torch.topk(scores, layer.top_k, dim=-1)
+            topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
+            if layer.supports_precomputed_topk:
+                tokenspeed_kernel.moe_apply(
+                    layer.plan,
+                    hidden_states,
+                    layer,
+                    None,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids.to(torch.int32),
+                    num_tokens_global=num_tokens,
+                )
+            else:
+                tokenspeed_kernel.moe_apply(
+                    layer.plan,
+                    hidden_states,
+                    layer,
+                    scores.to(torch.float32),
+                    num_tokens_global=num_tokens,
+                )
+            logger.info(
+                f"Kernel tuning covered draft experts {layer.prefix!s} "
+                f"({layer.plan['apply_kernel_name']!s}, {layer.num_experts:d} experts)"
+            )
 
     @property
     def capturable_grammar(self):
@@ -1035,39 +1105,20 @@ class ModelExecutor:
                 next_round_input_ids
             )
 
-        bs = req_pool_indices.shape[0]
-        if num_extends == 0:
-            deltas = accept_lengths
-        elif num_extends == bs:
-            deltas = input_lengths
-        else:
-            deltas = torch.cat(
-                [input_lengths[:num_extends], accept_lengths[num_extends:]]
-            )
         ib = self.input_buffers
-        live = req_pool_indices != ib.state_write_padding_pool_index
-        deltas = torch.where(live, deltas, 0)
         tail = self.runtime_states.ngram_accepted_tokens
-        if tail is not None:
-            assert ib.ngram_previous_tokens_buf is not None
-            assert ib.ngram_token_mask_buf is not None
-            # A accepted inputs end at row A-1, NOT at the sampled bonus or
-            # the end of the proposed window. Masks retain raw OOV barriers
-            # after input_ids_buf has been clamped for the embedding lookup.
-            last_rows = (input_lengths.cumsum(0) - input_lengths + deltas - 1).clamp(
-                0, ib.max_num_tokens - 1
-            )
-            current = torch.where(
-                ib.ngram_token_mask_buf[last_rows], ib.input_ids_buf[last_rows], -1
-            )
-            accepted_tail = torch.cat(
-                [current[:, None], ib.ngram_previous_tokens_buf[last_rows, :-1]],
-                dim=1,
-            )
-            tail[req_pool_indices] = torch.where(
-                (deltas > 0)[:, None], accepted_tail, tail[req_pool_indices]
-            )
-        self.runtime_states.update_valid_cache_length(req_pool_indices, deltas)
+        advance_accepted_frontier(
+            req_pool_indices,
+            input_lengths,
+            accept_lengths,
+            self.runtime_states.valid_cache_lengths,
+            num_extends,
+            ib.state_write_padding_pool_index,
+            ngram_tail=tail,
+            ngram_previous_tokens=ib.ngram_previous_tokens_buf,
+            ngram_token_mask=ib.ngram_token_mask_buf,
+            input_ids=ib.input_ids_buf if tail is not None else None,
+        )
 
     def _build_sampling_info(self, bs: int) -> SamplingBatchInfo:
         return SamplingBatchInfo(
