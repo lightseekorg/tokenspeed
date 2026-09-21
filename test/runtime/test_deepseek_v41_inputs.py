@@ -134,12 +134,31 @@ def buffers(request, monkeypatch):
     ib = InputBuffers(
         max_bs=4, max_num_tokens=32, state_write_padding_pool_index=5, device=device
     )
-    ib.init_ngram_buffers(3)
+    ib.init_ngram_buffers(3, _hash_params(ib.device))
     runtime = RuntimeStates(
         req_pool_size=5, vocab_size=VOCAB_SIZE, output_length=1, device=device
     )
     runtime.init_ngram_state(3)
     return ib, runtime
+
+
+def _hash_params(device):
+    from tokenspeed_kernel.ops.metadata.ngram import (
+        NGramHashParams,
+        engram_hash_reciprocals,
+    )
+
+    primes = torch.tensor([101, 103, 107, 109, 113, 127] * 2, device=device).reshape(
+        2, 3, 2
+    )
+    return NGramHashParams(
+        torch.arange(VOCAB_SIZE, device=device).flip(0),
+        primes,
+        engram_hash_reciprocals(primes),
+        primes.flatten(1).cumsum(-1) - primes.flatten(1),
+        torch.tensor([[13, 17, 23, 29], [31, 37, 41, 43]], device=device),
+        2,
+    )
 
 
 def _fill(ib, runtime, op, snapshot):
@@ -164,8 +183,16 @@ def _expected(tokens, positions):
 def _assert_rows(ib, expected, mask):
     count = len(expected)
     kwargs = ib.ngram_model_kwargs(count)
-    assert kwargs["engram_previous_tokens"].dtype == torch.int64
-    assert kwargs["engram_previous_tokens"].cpu().tolist() == expected
+    assert kwargs["engram_hash_ids"].dtype == torch.int64
+    assert ib.ngram_previous_tokens_buf[:count].cpu().tolist() == expected
+    torch.testing.assert_close(
+        kwargs["engram_hash_ids"].cpu(),
+        _hash_params("cpu").hash(
+            ib.input_ids_buf[:count].cpu(),
+            torch.tensor(expected, dtype=torch.int64).reshape(count, 3),
+            torch.tensor(mask, dtype=torch.bool),
+        ),
+    )
     assert kwargs["engram_token_mask"].dtype == torch.bool
     assert kwargs["engram_token_mask"].cpu().tolist() == mask
     assert (ib.ngram_previous_tokens_buf[count:] == -1).all()
@@ -314,15 +341,63 @@ def test_empty_prefill_padding_and_idle_scrub(buffers):
     _assert_rows(ib, [[-1] * 3] * 4, [False] * 4)
     op = _op(states, ["a"], [1], [0], [3], [0], [])
     _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
-    assert ib.ngram_model_kwargs(0)["engram_previous_tokens"].shape == (0, 3)
+    assert ib.ngram_model_kwargs(0)["engram_hash_ids"].shape == (0, 2, 6)
     assert (ib.ngram_previous_tokens_buf == -1).all()
     assert not ib.ngram_token_mask_buf.any()
     assert ib.ngram_previous_tokens_buf.data_ptr() == pointer
-    assert runtime.ngram_accepted_tokens[1].tolist() == [3, 2, 1]
+    assert ib.ngram_prefix_buf[0].tolist() == [3, 2, 1]
     states["a"].output_ids.append(4)
     op = _op(states, ["a"], [1], [1], [], [], [4])
     _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
     _assert_rows(ib, [[3, 2, 1]], [True])
+
+
+def test_large_prefill_to_small_decode_keeps_graph_padding_dead(buffers):
+    original, runtime = buffers
+    ib = InputBuffers(
+        max_bs=4,
+        max_num_tokens=8192,
+        state_write_padding_pool_index=5,
+        device=original.device,
+    )
+    ib.init_ngram_buffers(3, _hash_params(ib.device))
+    prompt = [i % 80 + 1 for i in range(1024)]
+    states = {"a": _state(prompt, [])}
+    op = _op(states, ["a"], [1], [1024], [0], [0], [])
+    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    _assert_rows(ib, _expected(prompt, range(1024)), [True] * 1024)
+    _sample(ib, runtime, [81], 1, [1], False)
+    states["a"].output_ids.append(81)
+
+    history = torch.empty((4, 3), dtype=torch.int64, device=ib.device)
+    mask = torch.empty(4, dtype=torch.bool, device=ib.device)
+
+    def read_padded_inputs():
+        history.copy_(ib.ngram_previous_tokens_buf[:4])
+        mask.copy_(ib.ngram_model_kwargs(4)["engram_token_mask"])
+
+    graph = None
+    if ib.device == "cuda":
+        read_padded_inputs()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            read_padded_inputs()
+    pointers = (ib.ngram_seed_buf.data_ptr(), ib.ngram_hash_ids_buf.data_ptr())
+    for next_token in [82, 83, 84]:
+        op = _op(states, ["a"], [1], [1], [], [], [-1])
+        _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+        full = states["a"].prompt_input_ids + states["a"].output_ids
+        expected = _expected(full, [len(full) - 1])
+        _assert_rows(ib, expected, [True])
+        graph.replay() if graph is not None else read_padded_inputs()
+        assert history.cpu().tolist() == expected + [[-1] * 3] * 3
+        assert mask.cpu().tolist() == [True, False, False, False]
+        assert pointers == (
+            ib.ngram_seed_buf.data_ptr(),
+            ib.ngram_hash_ids_buf.data_ptr(),
+        )
+        _sample(ib, runtime, [next_token], 0, [1], False)
+        states["a"].output_ids.append(next_token)
 
 
 def test_snapshot_validation_and_no_long_history_copy(buffers):
@@ -660,6 +735,7 @@ def test_executor_input_capacity_covers_decode_capture(
     )
     runner = SimpleNamespace(
         mapping=Mapping(rank=0, world_size=pp_size, pp_size=pp_size),
+        model=SimpleNamespace(get_ngram_hash_parameters=lambda: _hash_params("cpu")),
         model_config=SimpleNamespace(
             hf_text_config=SimpleNamespace(engram_layer_ids=[1], ngram_context_len=3)
         ),
@@ -715,13 +791,10 @@ def test_target_runner_passes_model_kwargs_not_context_tensors(buffers, mode):
     ctx = SimpleNamespace(input_num_tokens=num_tokens, forward_mode=mode, bs=1)
     original = vars(ctx).copy()
     result = executor._run_target_forward(ctx)
-    assert result["engram_previous_tokens"].shape == (num_tokens, 3)
+    assert result["engram_hash_ids"].shape == (num_tokens, 2, 6)
     assert result["engram_token_mask"].shape == (num_tokens,)
     if num_tokens:
-        assert (
-            result["engram_previous_tokens"].data_ptr()
-            == ib.ngram_previous_tokens_buf.data_ptr()
-        )
+        assert result["engram_hash_ids"].data_ptr() == ib.ngram_hash_ids_buf.data_ptr()
     assert vars(ctx) == original
 
 
@@ -773,7 +846,10 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
             assert actual.shape == view.shape
             assert actual.dtype == view.dtype
             assert actual.data_ptr() == view.data_ptr()
-        assert (model_kwargs["engram_previous_tokens"] == -1).all()
+        torch.testing.assert_close(
+            model_kwargs["engram_hash_ids"],
+            ib.ngram_padding_hash.expand(num_tokens, -1, -1),
+        )
         assert not model_kwargs["engram_token_mask"].any()
         assert input_ids.shape == (num_tokens,)
         assert input_ids.data_ptr() == ib.input_ids_buf.data_ptr()
@@ -783,7 +859,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         assert ctx.input_num_tokens == num_tokens
         assert ctx.bs == ctx.num_extends == bs
         assert ctx.forward_mode == ForwardMode.EXTEND
-        assert "engram_previous_tokens" not in vars(ctx)
+        assert "engram_hash_ids" not in vars(ctx)
         assert "engram_token_mask" not in vars(ctx)
         events.append("forward")
 
@@ -953,16 +1029,26 @@ def test_history_views_replay_after_batch_shrink_and_idle(buffers):
     graph = torch.cuda.CUDAGraph()
     torch.cuda.synchronize()
     with torch.cuda.graph(graph):
-        history = ib.ngram_model_kwargs(4)["engram_previous_tokens"].clone()
+        hashes = ib.ngram_model_kwargs(4)["engram_hash_ids"].clone()
+        history = ib.ngram_previous_tokens_buf[:4].clone()
         mask = ib.ngram_model_kwargs(4)["engram_token_mask"].clone()
     states["b"] = _state([20, 21], [])
     op = _op(states, ["b"], [1], [1], [1], [0], [])
     _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
     graph.replay()
+    torch.testing.assert_close(
+        hashes,
+        ib.ngram_hash_params.hash(ib.input_ids_buf[:4], history, mask),
+        rtol=0,
+        atol=0,
+    )
     assert history.tolist() == [[20, -1, -1]] + [[-1] * 3] * 3
     assert mask.tolist() == [True, False, False, False]
     ib.fill_dummy_decode_buffers(batch_size=4, total_tokens=4)
     graph.replay()
+    torch.testing.assert_close(
+        hashes, ib.ngram_padding_hash.expand(4, -1, -1), rtol=0, atol=0
+    )
     assert history.tolist() == [[-1] * 3] * 4
     assert not mask.any()
 

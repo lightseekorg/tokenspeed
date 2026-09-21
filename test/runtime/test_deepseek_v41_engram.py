@@ -238,6 +238,7 @@ def test_history_chunk_prefix_reorder_and_speculative_rollback():
     assert set(dict(state.named_buffers())) == {
         "token_map",
         "primes",
+        "reciprocals",
         "offsets",
         "multipliers",
     }

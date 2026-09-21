@@ -22,11 +22,13 @@
 
 Integration contract:
 * Construct one EngramHashState from the text config and the actual tokenizer.
-  Pass raw previous-three IDs, newest first, alongside every current token.
+  Its immutable input_parameters are borrowed by runtime preparation, which
+  resolves raw previous-three IDs and computes hashes before model execution.
   -1 denotes a sequence boundary or a nonparticipating (e.g. image) token.
 * Input preparation owns these small windows, including pending overlap tokens
   and the current speculative branch. Refresh pointer-stable input buffers for
-  eager and graph forwards alike; never put request tensors in ForwardContext.
+  eager and graph forwards alike. Models receive prepared hashes and masks;
+  never put request tensors in ForwardContext.
 * Hidden states, hashes and masks must be replicated within mapping.attn.tp_group.
   GPU-resident tables are row-sharded across attention TP and all-reduced.
   Host tables stay in anonymous or shared host memory and gather through UVA.
@@ -62,6 +64,10 @@ import torch
 from sympy import isprime
 from tokenizers import Regex, normalizers
 from tokenspeed_kernel.ops.embedding import host_gather
+from tokenspeed_kernel.ops.metadata.ngram import (
+    NGramHashParams,
+    engram_hash_reciprocals,
+)
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -247,9 +253,15 @@ class EngramHashState(nn.Module):
         if not 0 <= config.engram_pad_token_id < len(token_map):
             raise ValueError("Engram pad token is outside the tokenizer vocabulary")
         self.pad_id = token_map[config.engram_pad_token_id]
-        primes = torch.tensor(self.layout.primes, dtype=torch.int64, device=device)
+        host_primes = torch.tensor(self.layout.primes, dtype=torch.int64, device="cpu")
+        primes = host_primes.to(device=device)
         flat = primes.flatten(1)
         self.register_buffer("primes", primes, persistent=False)
+        self.register_buffer(
+            "reciprocals",
+            engram_hash_reciprocals(host_primes).to(device=device),
+            persistent=False,
+        )
         self.register_buffer("offsets", flat.cumsum(-1) - flat, persistent=False)
         self.register_buffer(
             "token_map",
@@ -290,19 +302,19 @@ class EngramHashState(nn.Module):
             or previous_token_ids.dtype not in (torch.int32, torch.int64)
         ):
             raise TypeError("Engram expects int32/int64 IDs and a bool token mask")
-        raw = torch.cat((input_ids.unsqueeze(-1), previous_token_ids), dim=-1).long()
-        dead = raw == DEAD_TOKEN_ID
-        dead[..., 0] |= ~token_mask
-        # Replace BEFORE indexing: nonparticipating current IDs can be out of vocab.
-        mapped = self.token_map[raw.masked_fill(dead, 0)]
-        blocked = dead.long().cumsum(-1) > 0
-        tokens = mapped.masked_fill(blocked, self.pad_id)
-        products = tokens.unsqueeze(-2) * self.multipliers
-        rolling, hashes = products[..., 0], []
-        for shift in range(1, 4):
-            rolling = torch.bitwise_xor(rolling, products[..., shift])
-            hashes.append(rolling.unsqueeze(-1) % self.primes[:, shift - 1])
-        return torch.cat(hashes, dim=-1) + self.offsets
+        return self.input_parameters.hash(input_ids, previous_token_ids, token_mask)
+
+    @property
+    def input_parameters(self) -> NGramHashParams:
+        """Expose the current immutable buffers to executor-owned input preparation."""
+        return NGramHashParams(
+            self.token_map,
+            self.primes,
+            self.reciprocals,
+            self.offsets,
+            self.multipliers,
+            self.pad_id,
+        )
 
 
 def _host_table_dir(nbytes: int) -> str:

@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 import tokenspeed_kernel
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.metadata.ngram import commit_ngram_inputs
 from tokenspeed_kernel.ops.tuning import (
     autotune,
     set_autotune_max_num_tokens,
@@ -369,7 +370,10 @@ class ModelExecutor:
             raise NotImplementedError(
                 "Engram input history requires PP=1 and in-flight depth <= 1"
             )
-        self.input_buffers.init_ngram_buffers(ngram_context)
+        self.input_buffers.init_ngram_buffers(
+            ngram_context,
+            model_runner.model.get_ngram_hash_parameters() if ngram_context else None,
+        )
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
             vocab_size=config.vocab_size,
@@ -1105,6 +1109,24 @@ class ModelExecutor:
             )
 
         bs = req_pool_indices.shape[0]
+        ib = self.input_buffers
+        tail = self.runtime_states.ngram_accepted_tokens
+        if tail is not None:
+            commit_ngram_inputs(
+                req_pool_indices,
+                input_lengths,
+                accept_lengths,
+                ib.input_ids_buf,
+                ib.ngram_previous_tokens_buf,
+                ib.ngram_token_mask_buf,
+                ib.ngram_prefix_buf[:bs],
+                tail,
+                self.runtime_states.ngram_needs_seed,
+                self.runtime_states.valid_cache_lengths,
+                num_extends,
+                ib.state_write_padding_pool_index,
+            )
+            return
         if num_extends == 0:
             deltas = accept_lengths
         elif num_extends == bs:
@@ -1113,29 +1135,8 @@ class ModelExecutor:
             deltas = torch.cat(
                 [input_lengths[:num_extends], accept_lengths[num_extends:]]
             )
-        ib = self.input_buffers
         live = req_pool_indices != ib.state_write_padding_pool_index
         deltas = torch.where(live, deltas, 0)
-        tail = self.runtime_states.ngram_accepted_tokens
-        if tail is not None:
-            assert ib.ngram_previous_tokens_buf is not None
-            assert ib.ngram_token_mask_buf is not None
-            # A accepted inputs end at row A-1, NOT at the sampled bonus or
-            # the end of the proposed window. Masks retain raw OOV barriers
-            # after input_ids_buf has been clamped for the embedding lookup.
-            last_rows = (input_lengths.cumsum(0) - input_lengths + deltas - 1).clamp(
-                0, ib.max_num_tokens - 1
-            )
-            current = torch.where(
-                ib.ngram_token_mask_buf[last_rows], ib.input_ids_buf[last_rows], -1
-            )
-            accepted_tail = torch.cat(
-                [current[:, None], ib.ngram_previous_tokens_buf[last_rows, :-1]],
-                dim=1,
-            )
-            tail[req_pool_indices] = torch.where(
-                (deltas > 0)[:, None], accepted_tail, tail[req_pool_indices]
-            )
         self.runtime_states.update_valid_cache_length(req_pool_indices, deltas)
 
     def _build_sampling_info(self, bs: int) -> SamplingBatchInfo:
