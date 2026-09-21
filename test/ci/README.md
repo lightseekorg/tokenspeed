@@ -93,7 +93,9 @@ responses, stop reasons, and extracted answers when investigating an accuracy
 miss before changing the token limit or sampling configuration.
 
 The NVIDIA Kimi-K2.5 EAGLE3 AIME25 gate allows `max_tokens=131072` within a
-262144-token context. A fixed-version diagnostic reproduced a 65536-token
+262138-token context. EAGLE3 with one speculative step uses two draft tokens;
+its three overlap spans reserve six positions below the model's 262144-token
+limit. A fixed-version diagnostic reproduced a 65536-token
 truncation; with the larger budget, the identical generated prefix continued
 to a correct answer and stopped naturally at 70332 tokens. This single-question
 result motivates the budget; the full 30-question gate still requires 0.93

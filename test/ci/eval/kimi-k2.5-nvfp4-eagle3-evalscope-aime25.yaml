@@ -15,12 +15,13 @@ install:
   - bash test/ci_system/install_deps.sh
 server:
   # Temporary NFS cold-load headroom; revert after the startup bottleneck is fixed.
+  # Leave 6 positions below the model's 262144 limit for EAGLE3 overlap overshoot.
   command: >-
     ts serve
     --disable-kvstore
     --model nvidia/Kimi-K2.5-NVFP4
     --tp 4
-    --max-model-len 262144
+    --max-model-len 262138
     --enable-mixed-batch
     --trust-remote-code
     --attention-backend tokenspeed_mla
