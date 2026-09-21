@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe import MoeTopKConfig, moe_topk
+from tokenspeed_kernel.ops.moe import moe_topk
 
 
 @pytest.mark.parametrize("invalid", [-1, 4])
@@ -34,11 +34,9 @@ def test_default_hash_router_rejects_invalid_table_values(invalid: int) -> None:
     with pytest.raises(ValueError, match=r"entries must be in \[0, 4\)"):
         moe_topk(
             logits,
-            MoeTopKConfig(
-                top_k=2,
-                score_function="sqrt_softplus",
-                selection_method="hash",
-            ),
+            top_k=2,
+            score_function="sqrt_softplus",
+            selection_method="hash",
             hash_indices_table=table,
             input_ids=input_ids,
         )

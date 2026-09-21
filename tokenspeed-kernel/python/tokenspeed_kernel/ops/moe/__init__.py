@@ -18,7 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any
 
 # Backend registration (side-effect imports)
@@ -37,7 +36,6 @@ from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
-    "MoeTopKConfig",
     "moe_topk",
     "native_latent_moe_available",
     "latent_moe_decode_pipeline_available",
@@ -89,18 +87,13 @@ def _routing_kind(
     return "plain"
 
 
-@dataclass(frozen=True)
-class MoeTopKConfig:
-    top_k: int
-    score_function: str
-    selection_method: str = "topk"
-    renormalize: bool = True
-    routed_scaling_factor: float = 1.0
-
-
 def moe_topk(
     router_logits: torch.Tensor,
-    config: MoeTopKConfig,
+    top_k: int,
+    score_function: str,
+    selection_method: str = "topk",
+    renormalize: bool = True,
+    routed_scaling_factor: float | None = 1.0,
     correction_bias: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
@@ -114,7 +107,11 @@ def moe_topk(
 
     Args:
         router_logits: Router logits shaped [tokens, experts].
-        config: Static scoring, selection, normalization, and scaling policy.
+        top_k: Number of experts selected for each token.
+        score_function: Transformation from router logits to routing scores.
+        selection_method: Select experts by score or token hash.
+        renormalize: Whether selected routing weights sum to one.
+        routed_scaling_factor: Optional scale applied to selected weights.
         correction_bias: Optional selection-only bias shaped [experts] or
             [tokens, experts].
         hash_indices_table: Optional token-id to expert-id table.
@@ -124,13 +121,10 @@ def moe_topk(
     Returns:
         FP32 weights and INT32 expert ids shaped [tokens, top_k].
     """
-    top_k = config.top_k
-    renormalize = config.renormalize
-    score_function = config.score_function
     if score_function in {"softmax", "sigmoid"} and override is not None:
         raise ValueError("override is only supported for sqrt_softplus routing")
     if score_function == "softmax":
-        if config.selection_method != "topk":
+        if selection_method != "topk":
             raise ValueError("softmax routing only supports topk selection")
         if correction_bias is not None or hash_indices_table is not None:
             raise ValueError("softmax routing does not accept bias or hash inputs")
@@ -139,11 +133,13 @@ def moe_topk(
             top_k,
             topk_indices_dtype=torch.int32,
             renormalize=renormalize,
-            routed_scaling_factor=config.routed_scaling_factor,
+            routed_scaling_factor=(
+                1.0 if routed_scaling_factor is None else routed_scaling_factor
+            ),
             solution=solution,
         )
     if score_function == "sigmoid":
-        if config.selection_method != "topk":
+        if selection_method != "topk":
             raise ValueError("sigmoid routing only supports topk selection")
         if correction_bias is None:
             raise ValueError("sigmoid routing requires correction_bias")
@@ -153,19 +149,19 @@ def moe_topk(
             router_logits,
             correction_bias,
             top_k,
-            routed_scaling_factor=config.routed_scaling_factor,
+            routed_scaling_factor=(
+                1.0 if routed_scaling_factor is None else routed_scaling_factor
+            ),
             normalize_topk_weights=renormalize,
             solution=solution,
         )
     if score_function != "sqrt_softplus":
         raise ValueError(f"unsupported MoE score function: {score_function!r}")
-    if config.selection_method not in {"topk", "hash"}:
-        raise ValueError(
-            f"unsupported MoE selection method: {config.selection_method!r}"
-        )
-    if config.selection_method == "hash" and hash_indices_table is None:
+    if selection_method not in {"topk", "hash"}:
+        raise ValueError(f"unsupported MoE selection method: {selection_method!r}")
+    if selection_method == "hash" and hash_indices_table is None:
         raise ValueError("hash selection requires hash_indices_table")
-    if config.selection_method != "hash" and hash_indices_table is not None:
+    if selection_method != "hash" and hash_indices_table is not None:
         raise ValueError("hash_indices_table requires hash selection")
     if router_logits.ndim != 2:
         raise ValueError("router_logits must have shape [tokens, experts]")
@@ -272,8 +268,8 @@ def moe_topk(
             input_ids,
             False,
         )
-        if config.routed_scaling_factor != 1.0:
-            topk_weights = topk_weights * config.routed_scaling_factor
+        if routed_scaling_factor not in (None, 1.0):
+            topk_weights = topk_weights * routed_scaling_factor
         return topk_weights, topk_ids
 
 

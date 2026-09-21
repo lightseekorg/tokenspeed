@@ -3559,10 +3559,8 @@ def _moe_topk_bias(tokens: int) -> object:
     correction_bias = torch.empty((256,), dtype=torch.float32)
     return tokenspeed_kernel.moe_topk(
         router_logits,
-        tokenspeed_kernel.MoeTopKConfig(
-            top_k=6,
-            score_function="sqrt_softplus",
-        ),
+        top_k=6,
+        score_function="sqrt_softplus",
         correction_bias=correction_bias,
     )
 
@@ -3573,11 +3571,9 @@ def _moe_topk_hash() -> object:
     input_ids = torch.zeros((2,), dtype=torch.int64)
     return tokenspeed_kernel.moe_topk(
         router_logits,
-        tokenspeed_kernel.MoeTopKConfig(
-            top_k=6,
-            score_function="sqrt_softplus",
-            selection_method="hash",
-        ),
+        top_k=6,
+        score_function="sqrt_softplus",
+        selection_method="hash",
         hash_indices_table=hash_indices_table,
         input_ids=input_ids,
     )

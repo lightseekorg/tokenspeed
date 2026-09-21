@@ -21,7 +21,7 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.moe import MoeTopKConfig, moe_topk
+from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.ops.attention.dsv4 import dsv4_padded_heads
 from tokenspeed_kernel.ops.attention.dsv4.cuda import (
     has_indexer_topk_prefill,
@@ -6559,7 +6559,8 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         topk_weights, topk_ids = moe_topk(
             logits,
-            MoeTopKConfig(top_k=2, score_function="sqrt_softplus"),
+            top_k=2,
+            score_function="sqrt_softplus",
             correction_bias=bias,
             solution="torch",
         )
@@ -6593,11 +6594,9 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         topk_weights, topk_ids = moe_topk(
             logits,
-            MoeTopKConfig(
-                top_k=2,
-                score_function="sqrt_softplus",
-                selection_method="hash",
-            ),
+            top_k=2,
+            score_function="sqrt_softplus",
+            selection_method="hash",
             hash_indices_table=table,
             input_ids=input_ids,
             solution="torch",
@@ -6689,7 +6688,8 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         topk_weights, topk_ids = moe_topk(
             logits,
-            MoeTopKConfig(top_k=6, score_function="sqrt_softplus"),
+            top_k=6,
+            score_function="sqrt_softplus",
             correction_bias=bias,
         )
 

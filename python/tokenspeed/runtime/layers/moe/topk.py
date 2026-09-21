@@ -26,7 +26,6 @@ from typing import Any, Literal, NamedTuple, Protocol, runtime_checkable
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.moe import (
-    MoeTopKConfig,
     moe_sigmoid_bias_topk,
     moe_softmax_topk,
     moe_topk,
@@ -304,7 +303,8 @@ class TopKConfig:
     # Shared-expert sink (Inkling)
     num_sink_experts: int = 0
     sink_global_scale: torch.Tensor | None = None
-    kernel_config: MoeTopKConfig | None = None
+    score_function: str | None = None
+    selection_method: str = "topk"
 
 
 class StandardTopKOutput(NamedTuple):
@@ -392,21 +392,8 @@ class TopK(torch.nn.Module):
             topk_weights_dtype=topk_weights_dtype,
             num_sink_experts=num_sink_experts,
             sink_global_scale=sink_global_scale,
-            kernel_config=(
-                None
-                if score_function is None
-                else MoeTopKConfig(
-                    top_k=top_k,
-                    score_function=score_function,
-                    selection_method=selection_method,
-                    renormalize=renormalize,
-                    routed_scaling_factor=(
-                        1.0
-                        if routed_scaling_factor is None
-                        else routed_scaling_factor
-                    ),
-                )
-            ),
+            score_function=score_function,
+            selection_method=selection_method,
         )
 
     def forward(
@@ -425,7 +412,7 @@ class TopK(torch.nn.Module):
             output_format or self.topk_config.output_format or TopKOutputFormat.STANDARD
         )
 
-        if self.topk_config.kernel_config is not None:
+        if self.topk_config.score_function is not None:
             correction_bias = (
                 self.topk_config.correction_bias
                 if routing_correction_bias is None
@@ -433,7 +420,11 @@ class TopK(torch.nn.Module):
             )
             topk_weights, topk_ids = moe_topk(
                 router_logits,
-                self.topk_config.kernel_config,
+                self.topk_config.top_k,
+                self.topk_config.score_function,
+                self.topk_config.selection_method,
+                self.topk_config.renormalize,
+                self.topk_config.routed_scaling_factor,
                 correction_bias=correction_bias,
                 hash_indices_table=hash_indices_table,
                 input_ids=input_ids,

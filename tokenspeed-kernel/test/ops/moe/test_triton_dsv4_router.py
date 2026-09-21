@@ -27,7 +27,6 @@ import torch
 import torch.nn.functional as F
 from kimi3_reference import dequantize_mxfp4
 from tokenspeed_kernel import (
-    MoeTopKConfig,
     moe_apply,
     moe_plan,
     moe_process_weights,
@@ -70,12 +69,10 @@ def test_router_matches_reference(
     )
     weights, ids = moe_topk(
         logits,
-        MoeTopKConfig(
-            top_k=6,
-            score_function="sqrt_softplus",
-            selection_method="hash" if kind == "hash" else "topk",
-            renormalize=renormalize,
-        ),
+        top_k=6,
+        score_function="sqrt_softplus",
+        selection_method="hash" if kind == "hash" else "topk",
+        renormalize=renormalize,
         correction_bias=bias,
         hash_indices_table=table,
         input_ids=input_ids,
@@ -105,7 +102,8 @@ def test_router_ties_and_graph_replay() -> None:
     def run():
         return moe_topk(
             logits,
-            MoeTopKConfig(top_k=6, score_function="sqrt_softplus"),
+            top_k=6,
+            score_function="sqrt_softplus",
             override="triton_sqrt_softplus_topk",
         )
 
@@ -143,7 +141,8 @@ def test_router_nan_logits_keep_expert_ids_in_range(with_bias: bool) -> None:
     def run() -> torch.Tensor:
         _, ids = moe_topk(
             logits,
-            MoeTopKConfig(top_k=6, score_function="sqrt_softplus"),
+            top_k=6,
+            score_function="sqrt_softplus",
             correction_bias=bias,
             override="triton_sqrt_softplus_topk",
         )
@@ -237,11 +236,9 @@ def test_router_to_mxfp4_experts(tokens: int) -> None:
     def run() -> torch.Tensor:
         route_weights, route_ids = moe_topk(
             logits,
-            MoeTopKConfig(
-                top_k=top_k,
-                score_function="sqrt_softplus",
-                renormalize=True,
-            ),
+            top_k=top_k,
+            score_function="sqrt_softplus",
+            renormalize=True,
             correction_bias=bias,
         )
         return moe_apply(

@@ -57,7 +57,6 @@ from tokenspeed_kernel.ops.layernorm import (
     grouped_gemma_rmsnorm,
 )
 from tokenspeed_kernel.ops.moe import (
-    MoeTopKConfig,
     moe_apply,
     moe_plan,
     moe_process_weights,
@@ -134,7 +133,6 @@ __all__ = [
     "silu_and_mul",
     "situ_and_mul",
     # moe
-    "MoeTopKConfig",
     "native_latent_moe_available",
     "moe_apply",
     "moe_plan",

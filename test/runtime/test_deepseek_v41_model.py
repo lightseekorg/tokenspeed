@@ -45,7 +45,7 @@ import torch.nn.functional as F
 import tokenspeed_kernel
 from safetensors import safe_open
 from safetensors.torch import save_file
-from tokenspeed_kernel.ops.moe import MoeTopKConfig, moe_topk
+from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -2222,11 +2222,9 @@ def test_routing_matches_reference_bias_and_normalization(topk, vision, with_ima
     router_logits, actual_bias, _, _ = moe._routing_inputs(logits, image_mask)
     weights, ids = moe_topk(
         router_logits,
-        MoeTopKConfig(
-            top_k=topk,
-            score_function="sqrt_softplus",
-            renormalize=topk > 1,
-        ),
+        top_k=topk,
+        score_function="sqrt_softplus",
+        renormalize=topk > 1,
         correction_bias=actual_bias,
         solution="torch",
     )
