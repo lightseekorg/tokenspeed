@@ -29,7 +29,9 @@ from tokenspeed.runtime.execution import device as device_module
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.host_sync import allow_host_sync
 
-requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires CUDA"
+)
 
 
 @pytest.fixture
