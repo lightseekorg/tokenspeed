@@ -16,6 +16,8 @@ env:
   MOE_BACKEND: mega_moe
   # TP2 weights plus DSpark need more cache budget than the 0.92 default leaves.
   GPU_MEMORY_UTILIZATION: "0.95"
+  # The runner's NVLink transport cannot export the Torch-allocated KV arena.
+  MC_FORCE_TCP: "1"
 install:
   - bash test/ci_system/install_deps.sh
 ut:
