@@ -2317,20 +2317,14 @@ def _decode_window_kernel(
     Write,
     Read,
     ReadLen,
-    Status,
     Swa,
-    Tail,
     SW,
-    TW,
     SS,
-    TS,
     SC,
-    TC,
     TABLE_ROWS,
     PS: tl.constexpr,
     RS: tl.constexpr,
     SWA_PAGES: tl.constexpr,
-    TAIL_PAGES: tl.constexpr,
 ):
     row = tl.program_id(0)
     pos = tl.load(Positions + row * PS).to(tl.int64)
@@ -2347,22 +2341,6 @@ def _decode_window_kernel(
     tl.store(Write + row, write)
     tl.store(Read + row * 128 + offsets, slots)
     tl.store(ReadLen + row, tl.minimum(tl.maximum(pos + 1, 0), 128))
-    # Only span starts need external history; later rows use current projections.
-    prior_pos = tl.load(Positions + (row - 1) * PS, row > 0, other=-2).to(tl.int64)
-    prior_req = tl.load(Requests + (row - 1) * RS, row > 0, other=-1)
-    window_start = (
-        (pos >= 0)
-        & (req >= 0)
-        & ((row == 0) | (req != prior_req) | (pos != prior_pos + 1))
-    )
-    missing_swa = tl.max(((wanted >= 0) & (wanted < pos) & (slots < 0)).to(tl.int32), 0)
-    previous = tl.where((pos >= 0) & (pos % 2 == 1), pos - 1, -1)
-    tail = resolve_group_slot(
-        Tail, previous, req, TABLE_ROWS, TW, TS, TC, 2, 1, 1, TAIL_PAGES
-    )
-    missing_tail = (previous >= 0) & (tail < 0)
-    error = missing_swa | (missing_tail.to(tl.int32) * 2)
-    tl.store(Status + row, tl.where(window_start, error, 0))
 
 
 @register_kernel(
@@ -2380,18 +2358,14 @@ def decode_window(
     write_slots,
     read_slots,
     read_lens,
-    status,
     swa_table,
-    tail_table,
     swa_pages,
-    tail_pages,
 ):
     """Write SWA addresses for consecutive, possibly ragged request spans.
 
-    positions/requests include negative padding. Tables contain LCM group pages.
-    Output buffers have N rows (read_slots [N,128]); status bits 0/1 denote
-    missing external SWA/tail history at span starts, and are zero elsewhere.
-    Every output row is overwritten, so the buffers are reusable under graphs.
+    positions/requests include negative padding. swa_table contains LCM group
+    pages. Output buffers have N rows (read_slots [N,128]). Every output row
+    is overwritten, so the buffers are reusable under graphs.
     """
     if positions.numel():
         _decode_window_kernel[(positions.numel(),)](
@@ -2400,20 +2374,14 @@ def decode_window(
             write_slots,
             read_slots,
             read_lens,
-            status,
             swa_table,
-            tail_table,
             swa_table.shape[1],
-            tail_table.shape[1],
             swa_table.stride(0),
-            tail_table.stride(0),
             swa_table.stride(1),
-            tail_table.stride(1),
             swa_table.shape[0],
             positions.stride(0),
             requests.stride(0),
             swa_pages,
-            tail_pages,
             num_warps=4,
         )
 

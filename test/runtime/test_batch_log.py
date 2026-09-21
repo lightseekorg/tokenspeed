@@ -32,6 +32,9 @@ from tokenspeed.runtime.engine.batch_log import BatchLogger
 
 STATS = {"num_active_pages": 40, "num_cached_pages": 15, "num_queue_reqs": 7}
 
+# Request "r<i>" holds 100 + i tokens, so a bs-2 decode round averages 100.5.
+CONTEXT_LENGTHS = {f"r{i}": 100 + i for i in range(8)}
+
 
 def _logger(**overrides) -> BatchLogger:
     kwargs = dict(
@@ -42,6 +45,7 @@ def _logger(**overrides) -> BatchLogger:
         spec_num_tokens=0,
         dp_rank=2,
         pd_lifecycle=None,
+        context_length=CONTEXT_LENGTHS.__getitem__,
     )
     kwargs.update(overrides)
     return BatchLogger(**kwargs)
@@ -114,10 +118,32 @@ def test_decode_rounds_log_once_per_interval_with_committed_throughput():
 
     # Rounds 1 and 2 are throttled; round 3 prints the window.
     log.assert_called_once_with(
-        "Decode batch. #dp-rank: 2, #running-req: 2, "
+        "Decode batch. #dp-rank: 2, #running-req: 2, avg_seq_len: 100.5, "
         "#pages(active/cached/total): 40/15/100, "
         "page ratio: 0.40, gen throughput (token/s): 6.00, #queue-req: 7"
     )
+
+
+def test_decode_context_lengths_are_read_only_when_a_line_is_emitted():
+    reads = []
+
+    def context_length(rid):
+        reads.append(rid)
+        return {"r0": 1000, "r1": 2000, "r2": 3000}[rid]
+
+    logger = _logger(spec_num_steps=3, context_length=context_length)
+    with mock.patch.object(batch_log_module.logger, "info") as log:
+        # Round 1 is throttled: no line, no per-request reads.
+        logger.log_dispatch(_decode_op(3), STATS)
+        assert reads == []
+        logger.log_dispatch(_decode_op(3), STATS)
+
+    assert reads == ["r0", "r1", "r2"]
+    assert log.call_args.args[0].startswith(
+        "Decode batch. #dp-rank: 2, #running-req: 3, avg_seq_len: 2000.0, "
+        "#pages(active/cached/total): 40/15/100, "
+    )
+    assert "avg_accept_len: 0.00" in log.call_args.args[0]
 
 
 def test_state_group_pages_ride_the_decode_line_at_debug():
@@ -223,8 +249,24 @@ def test_pd_lifecycle_counts_are_read_only_when_a_line_is_emitted():
         logger.log_dispatch(_decode_op(2), STATS)
 
     assert len(reads) == 1
+    # #queue-req adds the 3 bootstrapping requests to the scheduler's 7
+    # waiting ones: on the prefill role they sit there until decode has
+    # allocated their KV pages, which is queueing to the operator.
     assert log.call_args.args[0].endswith(
+        ", #queue-req: 10"
         ", #req-state(bootstrap/prefill/remote-prefill/decode/pd-pinned): 3/5/4/2/4"
+    )
+
+
+def test_pd_prefill_line_queues_bootstrapping_requests():
+    logger = _logger(pd_lifecycle=lambda: (9, 1, 0, 0, 1))
+    with mock.patch.object(batch_log_module.logger, "info") as log:
+        logger.log_dispatch(_extend_op(["a"], 1, [10], [0]), STATS)
+
+    log.assert_called_once_with(
+        "Prefill batch. #dp-rank: 2, #new-seq: 1, #new-token: 10, "
+        "#cached-token: 0, #running-req: 1, #queue-req: 16"
+        ", #req-state(bootstrap/prefill/remote-prefill/decode/pd-pinned): 9/1/0/0/1"
     )
 
 

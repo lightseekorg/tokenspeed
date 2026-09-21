@@ -201,7 +201,10 @@ class InputBuffers:
         vocab_size = runtime_states.vocab_size
         prefix.masked_fill_((prefix < 0) | (prefix >= vocab_size), -1)
         tail[slots] = prefix
-        needs_seed[slots] = False
+        # index_fill_ takes the scalar natively; ``needs_seed[slots] = False``
+        # would stage it through a pageable host tensor, whose copy blocks the
+        # forward thread until the in-flight step drains.
+        needs_seed.index_fill_(0, slots, False)
         for rid, slot in zip(forward_op.request_ids, forward_op.request_pool_indices):
             runtime_states.ngram_request_ids[slot] = rid
         if total_tokens == 0:

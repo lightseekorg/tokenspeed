@@ -66,12 +66,15 @@ from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.distributed import Mapping
-from tokenspeed.runtime.distributed.comm_ops import all_reduce
+from tokenspeed.runtime.distributed.comm_ops import all_reduce, prepare_all_reduce_lane
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict
+
+logger = get_colorful_logger(__name__)
 
 DEAD_TOKEN_ID = -1
 _ENGRAM_EMBED_SUFFIXES = (".engram.embed.weight", ".engram.embed.scale")
@@ -721,12 +724,20 @@ class RowShardedEngramEmbedding(nn.Module):
                 )
             values = values.masked_fill(~local.unsqueeze(-1), 0)
         if len(self.tp_group) > 1 and self.host_layout != "shared":
+            # The workspace all-reduce sizes itself on rows x trailing width.
+            # Reduce one row per token, [rows, columns * head_dim]: the lane is
+            # widened for that at construction (DeepseekV41Engram), so a
+            # decode batch stays inside the one-shot window. As
+            # [rows * columns, head_dim] the same bytes exceed the window's
+            # row capacity and drop to NCCL, which costs a ring latency plus a
+            # launch stall on every step.
+            flat = values.reshape(-1, values.shape[-2] * values.shape[-1])
             values = all_reduce(
-                values,
+                flat,
                 group=self.tp_group,
                 backend=None,
                 op=torch.distributed.ReduceOp.SUM,
-            )
+            ).view(values.shape)
         return values
 
 
@@ -740,6 +751,17 @@ def _load_projection_scale(param: nn.Parameter, loaded_weight: torch.Tensor) -> 
     # exactly preserves the checkpoint's 32x32 values without requantization.
     values = codes.repeat_interleave(32, dim=0)[: param.shape[0]]
     default_weight_loader(param, values)
+
+
+def engram_reduce_lane_width(layout: EngramLayout) -> int:
+    """Trailing width of the embedding all-reduce: one row per token.
+
+    The gathered values are ``[tokens, n_hash_cols, head_dim]``; they are
+    reduced as ``[tokens, n_hash_cols * head_dim]`` so the workspace
+    all-reduce sees one row per token and a decode batch stays inside its
+    one-shot row window. This is the lane width to arm for it.
+    """
+    return (layout.max_ngram_size - 1) * layout.n_heads * layout.head_dim
 
 
 class DeepseekV41Engram(nn.Module):
@@ -825,6 +847,24 @@ class DeepseekV41Engram(nn.Module):
         self.k_weight.weight_loader = default_weight_loader
         if hasattr(self.wkv, "weight_scale_inv"):
             self.wkv.weight_scale_inv._weight_loader = _load_projection_scale
+        # The embedding reduces [tokens, n_hash_cols * head_dim] across attention
+        # TP; widen the one-shot lane to that width so decode batches take the
+        # workspace kernel. Collective: every rank builds the same layers.
+        self.reduce_lane_armed = False
+        if (
+            len(mapping.attn.tp_group) > 1
+            and host_layout != "shared"
+            and torch.distributed.is_initialized()
+        ):
+            width = engram_reduce_lane_width(layout)
+            self.reduce_lane_armed = prepare_all_reduce_lane(
+                mapping.attn.tp_group, width
+            )
+            if not self.reduce_lane_armed:
+                logger.warning(
+                    f"{prefix!s}: one-shot all-reduce lane of width {width:d} not "
+                    "armed; the Engram embedding reduce falls back to NCCL"
+                )
 
     def checkpoint_weight_aliases(self) -> dict[str, str]:
         """Return raw layers.<id>.engram checkpoint names to runtime param paths.

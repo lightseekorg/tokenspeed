@@ -1254,27 +1254,22 @@ def test_decode_rows_rejects_request_token_shape_confusion():
 
 
 @pytest.mark.parametrize("target", ["cpu", "cuda"])
-def test_decode_window_ragged_external_history_only_and_replay(target):
+def test_decode_window_ragged_addresses_and_replay(target):
     if target == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA/ROCm")
     p = torch.tensor([-1, 0, 1, 2, 3, 4, 3, 4, 5, 6, 7, 190, 191, -1], device=target)
     r = torch.tensor([-1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, -1], device=target)
     swa = torch.ones((3, 4), dtype=torch.int32, device=target)
-    tail = torch.ones((3, 100), dtype=torch.int32, device=target)
-    tail[0].zero_()  # All pairs are internal to the first request's window.
-    tail[1, 1] = 0  # Request 1 really needs token 2 from its external tail.
-    tail[2].zero_()  # Token 190 is supplied by this forward, not its tail page.
-    swa[2, 0] = 0  # Token 63 belongs to request 2's external SWA history.
+    swa[2, 0] = 0  # A null page resolves to -1 rows; residency is not judged here.
     n = p.numel()
     out = (
         torch.empty(n, dtype=torch.int64, device=target),
         torch.empty((n, 128), dtype=torch.int32, device=target),
         torch.empty(n, dtype=torch.int32, device=target),
-        torch.empty(n, dtype=torch.int32, device=target),
     )
 
     def prepare():
-        dsv41.decode_window(p, r, *out, swa, tail, 2, 2)
+        dsv41.decode_window(p, r, *out, swa, 2)
 
     prepare()
     if target == "cuda":
@@ -1283,7 +1278,6 @@ def test_decode_window_ragged_external_history_only_and_replay(target):
             prepare()
     for step in range(3):
         if step == 1:
-            tail[1, 1] = 1
             swa[2, 0] = 1
         if step == 2:
             p.fill_(-1)
@@ -1293,10 +1287,6 @@ def test_decode_window_ragged_external_history_only_and_replay(target):
             graph.replay()
         else:
             prepare()
-        errors = [0] * n
-        if step == 0:
-            errors[6], errors[11] = 2, 1
-        assert out[3].cpu().tolist() == errors
         table = swa.cpu().tolist()
 
         def slot(position, request):
@@ -1322,7 +1312,7 @@ def test_decode_window_ragged_external_history_only_and_replay(target):
             ],
             [min(max(position + 1, 0), 128) for position, _ in coordinates],
         )
-        for got, want in zip(out[:3], expected, strict=True):
+        for got, want in zip(out, expected, strict=True):
             torch.testing.assert_close(
                 got.cpu(), torch.tensor(want, dtype=got.dtype), rtol=0, atol=0
             )
