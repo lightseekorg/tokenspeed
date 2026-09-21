@@ -1780,11 +1780,12 @@ class DeepseekV4MoE(nn.Module):
             )
         else:
             router_logits = self.gate(hidden_states)
+        hash_indices_table = self.gate.tid2eid
         return (
             router_logits,
             self.gate.e_score_correction_bias,
-            self.gate.tid2eid,
-            input_ids,
+            hash_indices_table,
+            input_ids if hash_indices_table is not None else None,
         )
 
     def _renormalize_routing_weights(self) -> bool:

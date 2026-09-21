@@ -6547,6 +6547,23 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertEqual(tuple(y.shape), (tokens, hidden))
 
+    def test_deepseek_v4_score_routing_does_not_forward_input_ids(self):
+        hidden_states = torch.ones((2, 4))
+        input_ids = torch.arange(2)
+        gate = Mock(return_value=torch.zeros((2, 8)))
+        gate.e_score_correction_bias = torch.zeros(8)
+        gate.tid2eid = None
+        moe = DeepseekV4MoE.__new__(DeepseekV4MoE)
+        moe.config = SimpleNamespace(n_routed_experts=8)
+        moe.gate = gate
+
+        _, _, hash_indices_table, routing_input_ids = moe._routing_inputs(
+            hidden_states, input_ids
+        )
+
+        self.assertIsNone(hash_indices_table)
+        self.assertIsNone(routing_input_ids)
+
     def test_deepseek_v4_router_matches_noaux_bias_semantics(self):
         logits = torch.tensor(
             [

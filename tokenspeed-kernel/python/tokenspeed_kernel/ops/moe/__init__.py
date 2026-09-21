@@ -182,8 +182,6 @@ def moe_topk(
             f"correction_bias must have shape [{experts}] or [{tokens}, {experts}]"
         )
     if hash_indices_table is not None:
-        if input_ids is None:
-            raise ValueError("hash-routed DeepSeek V4 MoE requires input_ids")
         if (
             hash_indices_table.ndim != 2
             or hash_indices_table.shape[0] == 0

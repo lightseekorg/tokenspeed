@@ -44,6 +44,21 @@ def test_default_hash_router_rejects_invalid_table_values(invalid: int) -> None:
         )
 
 
+def test_non_hash_router_rejects_input_ids() -> None:
+    logits = torch.zeros((1, 4), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="hash routing inputs"):
+        moe_topk(
+            logits,
+            top_k=2,
+            score_function="sqrt_softplus",
+            selection_method="topk",
+            renormalize=True,
+            routed_scaling_factor=1.0,
+            input_ids=torch.zeros((1,), dtype=torch.int64),
+        )
+
+
 def test_hash_router_rejects_correction_bias() -> None:
     logits = torch.zeros((1, 4), dtype=torch.float32)
     table = torch.tensor([[0, 1]], dtype=torch.int32)
