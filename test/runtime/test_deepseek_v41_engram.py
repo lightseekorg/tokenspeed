@@ -438,6 +438,31 @@ def test_quantized_projection_loader_aliases_and_real_table_metadata(config_clas
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_hash_kernel_matches_the_cpu_chain():
+    """The fused hash kernel reproduces the eager reference bit for bit."""
+    config = _config()
+    cpu, cuda = (EngramHashState(config, _Tokenizer(), d) for d in ("cpu", "cuda:0"))
+    torch.manual_seed(5)
+    vocab = cpu.token_map.shape[0]
+    ids = torch.randint(0, vocab, (513,))
+    previous = torch.randint(-1, vocab, (513, 3))
+    mask = torch.rand(513) > 0.25
+    # Masked-out current ids may be clamped image placeholders outside the vocab.
+    ids[~mask] = 999_999
+    expected = cpu(ids, previous, mask)
+    actual = cuda(ids.cuda(), previous.cuda(), mask.cuda())
+    assert actual.device.type == "cuda" and actual.dtype == torch.int64
+    assert torch.equal(actual.cpu(), expected)
+    # Any leading shape is preserved, as with the eager chain.
+    batched = cuda(
+        ids.cuda().view(3, 171),
+        previous.cuda().view(3, 171, 3),
+        mask.cuda().view(3, 171),
+    )
+    assert torch.equal(batched.cpu(), expected.view(3, 171, *expected.shape[1:]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cuda_lookup_hash_and_graph_replay():
     state = EngramHashState(_config(), _Tokenizer(), "cuda:0")
     embed = RowShardedEngramEmbedding(

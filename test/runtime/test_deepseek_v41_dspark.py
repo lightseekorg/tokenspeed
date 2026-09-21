@@ -40,6 +40,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.attention import dsv41
 from torch import nn
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
@@ -68,6 +69,7 @@ from tokenspeed.runtime.models.deepseek_v41_dspark import (
     _quantized_kv,
     _WindowAttention,
     _WindowSelection,
+    _write_window_rows,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.hf_transformers_utils import get_config
@@ -221,6 +223,21 @@ def test_draft_checkpoint_strict_shards(monkeypatch, rank):
     weights = _draft_checkpoint(model.model)
     model.load_weights(reversed(list(weights.items())))
     assert model.checkpoint_load_report["loaded"] > 0
+    # The context write's merged projection holds every stage's wkv shard,
+    # loaded from the same checkpoint tensors as the stage's own wq_a_wkv.
+    merged = model.model.context_wkv
+    d, q_lora = config.head_dim, config.q_lora_rank
+    for stage, layer in enumerate(model.model.layers):
+        rows = slice(stage * d, (stage + 1) * d)
+        torch.testing.assert_close(
+            merged.weight[rows], layer.attn.wq_a_wkv.weight[q_lora:], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            merged.weight_scale_inv[rows],
+            layer.attn.wq_a_wkv.weight_scale_inv[q_lora:],
+            rtol=0,
+            atol=0,
+        )
     assert config.n_shared_experts == model.model.config.n_shared_experts == 1
     assert all(layer.ffn.shared_experts is not None for layer in model.model.layers)
     assert all(
@@ -266,6 +283,23 @@ def _history_slots(starts, window, rows_per_page):
     return _paged_slots(wanted, rows_per_page).to(torch.int32)
 
 
+def _window_backend(positions, cache, history, block, rows_per_page):
+    """One stage's borrowed window over the block geometry ``dspark_block`` derives."""
+    n = history.shape[0]
+    anchors = torch.zeros(n, dtype=torch.int64, device=history.device)
+    _, _, _, request_indices, page, row, indices = dsv41.dspark_block(
+        anchors, anchors, history, 0, rows_per_page, 1, block
+    )
+    return _WindowAttention(
+        positions,
+        cache,
+        history,
+        block,
+        _WindowSelection(page, row, indices),
+        request_indices,
+    )
+
+
 def test_window_attention_matches_dense_reference():
     torch.manual_seed(41)
     batch, block, heads, dim, window, rows = 2, 5, 2, 64, 8, 4
@@ -276,9 +310,7 @@ def test_window_attention_matches_dense_reference():
     history = _history_slots(starts, window, rows)
     positions = (starts[:, None] + 1 + torch.arange(block)).flatten()
     sink = torch.tensor([0.1, -0.3])
-    backend = _WindowAttention(
-        positions, cache, history, block, _WindowSelection.build(history, block, rows)
-    )
+    backend = _window_backend(positions, cache, history, block, rows)
     actual = backend.forward_v41(
         q,
         current,
@@ -353,9 +385,7 @@ def test_window_attention_kernel_matches_reference():
     swa = torch.randn(batch * block, dim, dtype=torch.bfloat16, device=device)
     sink = torch.full((padded_heads,), -float("inf"), device=device)
     sink[:real_heads] = torch.tensor([0.1, -0.3], device=device)
-    backend = _WindowAttention(
-        positions, field, history, block, _WindowSelection.build(history, block, rows)
-    )
+    backend = _window_backend(positions, field, history, block, rows)
     kwargs = dict(
         layer_id=0,
         positions=positions,
@@ -437,11 +467,12 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch):
             SimpleNamespace(text_config=config), _mapping(0, 1, 1), _quant()
         )
     adapter.load_weights(_draft_checkpoint(adapter.model).items())
-    with torch.no_grad():
-        adapter.model.embed_tokens.weight.fill_(0.1)
-        adapter.lm_head.weight.fill_(0.1)
+    # The target lends its BF16 embedding and head; the draft's own are placeholders.
     adapter.set_embed_and_head(
-        adapter.model.embed_tokens.weight, adapter.lm_head.weight
+        *(
+            nn.Parameter(torch.full_like(p, 0.1, dtype=torch.bfloat16))
+            for p in (adapter.model.embed_tokens.weight, adapter.lm_head.weight)
+        )
     )
     model = adapter.model
     for module in model.modules():
@@ -462,6 +493,22 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch):
     written = windows[:, slots // 64, slots % 64]
     assert written.count_nonzero() > 0
     assert windows.count_nonzero() == written.count_nonzero()
+    # The fused row kernel reproduces the eager reference chain (kv_norm,
+    # RoPE, FP8 round trip, masked scatter) bit for bit, and the merged
+    # projection agrees with each stage's own wkv columns.
+    main_x = model._main_input(hidden)
+    kv, _ = model.context_wkv(main_x, block_scale=None, output_dtype=None)
+    reference = torch.zeros_like(windows)
+    for stage, layer in enumerate(model.layers):
+        stage_kv = kv[:, stage * 512 : (stage + 1) * 512]
+        qkv, _ = layer.attn.wq_a_wkv(main_x, block_scale=None, output_dtype=None)
+        torch.testing.assert_close(
+            stage_kv, qkv[:, config.q_lora_rank :], rtol=0.02, atol=0.02
+        )
+        _write_window_rows(
+            reference[stage], slots, model._main_kv(layer.attn, stage_kv, positions)
+        )
+    torch.testing.assert_close(windows, reference, rtol=0, atol=0)
     # A -1 slot is a padding or nonresident row: the null page stays zero.
     model.write_context_kv(
         hidden[:1], positions[:1], torch.tensor([-1], device="cuda:0"), pool

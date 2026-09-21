@@ -1390,3 +1390,167 @@ def test_decode_window_ragged_addresses_and_replay(target):
             torch.testing.assert_close(
                 got.cpu(), torch.tensor(want, dtype=got.dtype), rtol=0, atol=0
             )
+
+
+def _rope_table(device, positions=4096, rotary_dim=64):
+    inv_freq = 1.0 / (
+        10000 ** (torch.arange(0, rotary_dim, 2, device=device).float() / rotary_dim)
+    )
+    angles = torch.arange(positions, device=device)[:, None].float() * inv_freq
+    return torch.cat((angles.cos(), angles.sin()), -1).contiguous()
+
+
+def test_dspark_rows_matches_norm_rope_round_trip_and_scatter(device):
+    """One launch reproduces kv_norm -> RoPE -> SWA codec round trip -> scatter."""
+    from tokenspeed_kernel.ops.attention.dsv41 import rope_inplace
+
+    torch.manual_seed(4)
+    rows, eps = 12, 1e-6
+    merged = torch.randn(rows, 3 * 512, device=device, dtype=torch.bfloat16) * 3
+    values = merged[:, 512:1024]
+    weight = (torch.rand(512, device=device) + 0.5).to(torch.bfloat16)
+    table = _rope_table(device)
+    positions = torch.randint(0, 4000, (rows,), device=device)
+    slots = torch.arange(64, 64 + 7 * rows, 7, device=device, dtype=torch.int32)
+    slots[3], slots[5] = -1, 8 * 64 + 5
+    window = torch.zeros(8, 64, 512, device=device, dtype=torch.bfloat16)
+
+    def round_trip(x):
+        return dsv41.cache_unpack(dsv41.cache_pack(x, "swa", None), "swa", None)
+
+    normalized = values.float()
+    normalized = normalized * torch.rsqrt(
+        normalized.square().mean(-1, keepdim=True) + eps
+    )
+    normalized = (weight.float() * normalized).to(torch.bfloat16)
+    expected = round_trip(rope_inplace(normalized.clone(), positions, table, None))
+
+    out = torch.empty_like(values)
+    dsv41.dspark_rows(values, weight, eps, positions, table, window, slots, out)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    live = (slots >= 0) & (slots < 8 * 64)
+    torch.testing.assert_close(
+        window[slots[live].long() // 64, slots[live].long() % 64],
+        expected[live],
+        rtol=0,
+        atol=0,
+    )
+    assert window.reshape(-1, 512).ne(0).any(-1).sum() == int(live.sum())
+    # Without the norm the input is used as is; without the table nothing rotates.
+    torch.testing.assert_close(
+        dsv41.dspark_rows(
+            values, None, None, positions, table, None, None, torch.empty_like(values)
+        ),
+        round_trip(rope_inplace(values.clone(), positions, table, None)),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        dsv41.dspark_rows(
+            values, None, None, None, None, None, None, torch.empty_like(values)
+        ),
+        round_trip(values),
+        rtol=0,
+        atol=0,
+    )
+    dsv41.dspark_rows(
+        values[:0], weight, eps, positions[:0], table, window, slots[:0], None
+    )
+    for bad in (
+        dict(norm_weight=None),
+        dict(norm_eps=None),
+        dict(positions=None),
+        dict(cos_sin_cache=None),
+        dict(slots=None),
+        dict(window=window[:, :, :256]),
+        dict(window=None, out=None),
+        dict(values=values.t()),
+    ):
+        kwargs = dict(
+            values=values,
+            norm_weight=weight,
+            norm_eps=eps,
+            positions=positions,
+            cos_sin_cache=table,
+            window=window,
+            slots=slots,
+            out=None,
+        )
+        kwargs.update(bad)
+        with pytest.raises(ValueError):
+            dsv41.dspark_rows(**kwargs)
+
+
+def test_dspark_anchors_pick_last_accepted_verify_rows(device):
+    bs, extends, width, spec = 4, 1, 6, 6
+    decodes = bs - extends
+    tokens = torch.arange(100, 100 + extends + decodes * width, device=device).to(
+        torch.int32
+    )
+    accept = torch.tensor([1, 4, 0, 9], device=device, dtype=torch.int32)
+    positions = torch.arange(1000, 1000 + decodes * width, device=device)
+    next_tokens = torch.zeros(bs, spec, device=device, dtype=torch.int32)
+    start = torch.zeros(decodes, device=device, dtype=torch.int64)
+    dsv41.dspark_anchors(tokens, accept, positions, extends, width, next_tokens, start)
+    # Extend rows keep their sampled token; decode rows take the token at the
+    # last accepted verify row, with accept lengths clamped into 1..width.
+    assert next_tokens.tolist() == [[100] * 6, [104] * 6, [107] * 6, [118] * 6]
+    assert start.tolist() == [1003, 1006, 1017]
+    cpu_next = torch.zeros(bs, spec, dtype=torch.int32)
+    cpu_start = torch.zeros(decodes, dtype=torch.int64)
+    dsv41.dspark_anchors(
+        tokens.cpu(), accept.cpu(), positions.cpu(), extends, width, cpu_next, cpu_start
+    )
+    assert torch.equal(cpu_next, next_tokens.cpu()) and torch.equal(
+        cpu_start, start.cpu()
+    )
+    with pytest.raises(ValueError):
+        dsv41.dspark_anchors(
+            tokens[:-1], accept, positions, extends, width, next_tokens, start
+        )
+
+
+def test_dspark_block_expands_anchors_and_window_addressing(device):
+    torch.manual_seed(5)
+    n, window, block, hc, rows_per_page, noise = 3, 128, 5, 4, 64, 77
+    history = torch.randint(-1, 600, (n, window), device=device, dtype=torch.int32)
+    history[0, :100] = -1
+    # The drafter hands over the bonus column of its [bs, spec] token table.
+    bonus = torch.tensor([[3, 9], [4, 9], [5, 9]], device=device, dtype=torch.int32)[
+        :, 0
+    ]
+    start = torch.tensor([10, 200, 7], device=device)
+    outputs = dsv41.dspark_block(bonus, start, history, noise, rows_per_page, hc, block)
+    ids, positions, pre_mix, requests, page, row, indices = outputs
+    assert [t.dtype for t in outputs] == [
+        torch.int32,
+        torch.int64,
+        torch.float32,
+        torch.int64,
+        torch.int64,
+        torch.int64,
+        torch.int32,
+    ]
+    assert ids.view(n, block)[:, 0].tolist() == [3, 4, 5]
+    assert ids.view(n, block)[:, 1:].eq(noise).all()
+    assert positions.view(n, block).tolist() == [
+        [s + 1 + j for j in range(block)] for s in (10, 200, 7)
+    ]
+    assert pre_mix.tolist() == [[1.0, 0.0, 0.0, 0.0]] * (n * block)
+    assert requests.tolist() == [r for r in range(n) for _ in range(block)]
+    clamped = history.clamp_min(0).long()
+    assert torch.equal(page, clamped // rows_per_page)
+    assert torch.equal(row, clamped % rows_per_page)
+    width = window + block
+    expected = torch.arange(n * width, device=device, dtype=torch.int32).view(n, width)
+    expected[:, :window].masked_fill_(history < 0, -1)
+    assert torch.equal(
+        indices.view(n, block, width), expected[:, None, :].expand(-1, block, -1)
+    )
+    cpu = dsv41.dspark_block(
+        bonus.cpu(), start.cpu(), history.cpu(), noise, rows_per_page, hc, block
+    )
+    for got, reference in zip(outputs, cpu, strict=True):
+        assert torch.equal(got.cpu(), reference.to(got.dtype))
+    with pytest.raises(ValueError):
+        dsv41.dspark_block(bonus[:2], start, history, noise, rows_per_page, hc, block)

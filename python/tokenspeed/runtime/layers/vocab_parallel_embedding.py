@@ -503,6 +503,20 @@ class VocabParallelEmbedding(torch.nn.Module):
         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
         param[loaded_weight.shape[0] :].data.fill_(0)
 
+    def _fused_shard_gather(self, input_: torch.Tensor) -> bool:
+        """Whether the plain table lookup can run as one masked gather kernel.
+
+        Quantized embedding methods and the FP8 PLE table keep the two-step
+        mask-then-lookup path; their lookups are not a row gather of
+        ``self.weight``.
+        """
+        return (
+            input_.is_cuda
+            and type(self.quant_method) is UnquantizedEmbeddingMethod
+            and self.weight.dtype not in _FLOAT8_DTYPES
+            and self.weight.is_cuda
+        )
+
     def forward(
         self, input_: torch.Tensor, reduce_results: bool = True
     ) -> torch.Tensor:
@@ -516,6 +530,27 @@ class VocabParallelEmbedding(torch.nn.Module):
             The output tensor.
 
         """
+        if self.tp_size > 1 and self._fused_shard_gather(input_):
+            # One gather resolves the shard mask, the local index and the
+            # zeroing of other ranks' rows.
+            from tokenspeed_kernel.ops.embedding import vocab_shard_embedding
+
+            output_parallel = vocab_shard_embedding(
+                self.weight,
+                input_.contiguous(),
+                (
+                    self.shard_indices.org_vocab_start_index,
+                    self.shard_indices.org_vocab_end_index,
+                ),
+                self.shard_indices.num_org_vocab_padding,
+                (
+                    self.shard_indices.added_vocab_start_index,
+                    self.shard_indices.added_vocab_end_index,
+                ),
+            )
+            if reduce_results:
+                return all_reduce(output_parallel, self.tp_group)
+            return output_parallel
         if self.tp_size > 1:
             # Build the mask.
             masked_input, input_mask = get_masked_input_and_mask(
