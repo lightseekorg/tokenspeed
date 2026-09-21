@@ -249,6 +249,12 @@ class Envs:
     TOKENSPEED_TEST_REQUEST_TIME_STATS = EnvBool(False)
     TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS = EnvBool(False)
     TOKENSPEED_PROFILER_DIR = EnvStr("/tmp")
+    # torch.cuda sync-debug mode armed once serving starts (after capture and
+    # tuning, which synchronize legitimately): "warn" reports every host
+    # synchronization on a serving path with its Python location, "error"
+    # raises. Any such synchronization on the data plane stalls the forward
+    # thread until the in-flight step drains and defeats overlap scheduling.
+    TOKENSPEED_DATA_PLANE_SYNC_DEBUG = EnvStr("default")
     TOKENSPEED_CI_SMALL_KV_SIZE = EnvInt(-1)
     TOKENSPEED_NVTX = EnvBool(False)
     TOKENSPEED_DP_SAMPLING_BACKEND = EnvStr(None)

@@ -68,6 +68,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v41 import (
     DeepseekV41CachePool,
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
+from tokenspeed.runtime.utils.host_sync import allow_host_sync
 
 
 class V41CompressorPlan(NamedTuple):
@@ -244,7 +245,6 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self.forward_decode_metadata: V41Metadata | None = None
         self._decode_views_by_bs: dict[int, V41Metadata] = {}
         self._decode_buffers: V41Metadata | None = None
-        self._decode_history_status: torch.Tensor | None = None
         self._max_decode_bs = 0
         self._swa_plans: dict[tuple[ForwardMode, int], V41SWAQueryPlan] = {}
         self._prefill_spans: tuple[V41PrefillSpan, ...] = ()
@@ -282,7 +282,6 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self.forward_decode_metadata = None
         self._decode_views_by_bs.clear()
         self._decode_buffers = None
-        self._decode_history_status = None
         self._max_decode_bs = 0
         self._swa_plans.clear()
         self._prefill_spans = ()
@@ -315,9 +314,6 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 )
             return
         self._max_decode_bs = max_bs
-        self._decode_history_status = torch.empty(
-            max_tokens, dtype=torch.int32, device=self.device
-        )
         horizon = (1 + overlap_schedule_depth) * max_tokens_per_req
         self._decode_buffers = V41Metadata(
             block_tables={
@@ -437,7 +433,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             self.spec_num_tokens,
         )
         self._prepare_compressor(meta)
-        self._refresh_decode_window(meta, actual_bs)
+        self._refresh_decode_window(meta)
         if num_extends:
             self.sparse_topk.decode = None
         else:
@@ -484,19 +480,20 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         ).to(torch.int32)
         return slots, (positions + 1).clamp(0, 128).to(torch.int32)
 
-    def _refresh_decode_window(self, metadata, actual_bs):
-        """Build query addresses and check dependencies before any layer runs.
+    def _refresh_decode_window(self, metadata):
+        """Build SWA query addresses before any layer runs.
 
         Eager, mixed, capture setup and live graph replay use the same producer.
-        All persistent outputs are refreshed in place; history remains LCM-owned.
+        All persistent outputs are refreshed in place; history remains LCM-owned,
+        and its residency is the scheduler's retention contract: the window
+        rows [p-127, p-1] of a decoding request are retained (or replayed) by
+        construction, so nothing here reads back to the host.
         """
         from tokenspeed_kernel.ops.attention.dsv41 import decode_window
 
         n = metadata.positions.numel()
         if not n:
             return
-        assert self._decode_history_status is not None
-        status = self._decode_history_status[:n]
         counts = self.cache_pool.arena.cache_group_page_counts
         decode_window(
             metadata.positions,
@@ -504,24 +501,22 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             metadata.swa_write_slots,
             metadata.swa_read_slots,
             metadata.swa_read_lens,
-            status,
             metadata.block_tables[V41_SWA_GROUP_ID],
-            metadata.block_tables[V41_COMPRESSOR_TAIL_GROUP_ID],
             counts[V41_SWA_GROUP_ID],
-            counts[V41_COMPRESSOR_TAIL_GROUP_ID],
         )
-        # The fused producer reports only span-start errors. Observe all token
-        # rows: request starts need not have a uniform stride in mixed batches.
-        # Padding, leading extends and internal pairs contribute no errors.
-        errors = status.cpu().tolist() if actual_bs else []
-        if any(error & 1 for error in errors):
-            raise RuntimeError(
-                "V4.1 SWA prefix is missing; supply the dependency tail or recover the request"
-            )
-        if any(error & 2 for error in errors):
-            raise RuntimeError(
-                "V4.1 required compressor tail is absent; request needs recovery"
-            )
+
+    def _upload_int64(self, values: list[int]) -> torch.Tensor:
+        """Host ints to a device int64 tensor without waiting for the stream.
+
+        A pageable upload blocks until the copy engine reaches it, i.e. until
+        the round in flight drains; pinned staging makes it stream-ordered
+        and asynchronous. CPU backends (tests) take the plain path.
+        """
+        if torch.device(self.device).type != "cuda":
+            return torch.tensor(values, dtype=torch.int64, device=self.device)
+        return torch.tensor(values, dtype=torch.int64, pin_memory=True).to(
+            self.device, non_blocking=True
+        )
 
     def init_forward_metadata(
         self,
@@ -582,7 +577,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._prefill_spans = tuple(spans)
         if total > self.spec.max_query_tokens:
             raise ValueError("V4.1 forward exceeds budgeted query workspace")
-        lengths = torch.tensor(counts, dtype=torch.int64, device=self.device)
+        lengths = self._upload_int64(counts)
         requests = torch.repeat_interleave(
             torch.arange(bs, device=self.device), lengths, output_size=total
         )
@@ -604,9 +599,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         tables = {
             gid: t[:bs] for gid, t in block_tables.items() if gid in V41_GROUP_GEOMETRY
         }
-        global_write_floor = torch.tensor(
-            floors + [0] * (bs - num_extends), dtype=torch.int64, device=self.device
-        )
+        global_write_floor = self._upload_int64(floors + [0] * (bs - num_extends))
         meta = V41Metadata(
             tables,
             positions,
@@ -621,11 +614,6 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             global_write_floor,
         )
         self._prepare_compressor(meta)
-        plan = meta.compressor
-        if bool((plan.active & (plan.previous < 0) & (plan.read_slots < 0)).any()):
-            raise RuntimeError(
-                "V4.1 required compressor tail is absent; request needs recovery"
-            )
         self.forward_metadata = meta
         meta.swa_write_slots.copy_(
             self.cache_slots(V41_SWA_GROUP_ID, positions, requests, ForwardMode.MIXED)
@@ -657,7 +645,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             meta.compressor.window(n, total),
             None,
         )
-        self._refresh_decode_window(self.forward_decode_metadata, bs - num_extends)
+        self._refresh_decode_window(self.forward_decode_metadata)
         self._decoder_view = self._build_decoder_view(
             meta, completes, window, forward_mode
         )
@@ -713,7 +701,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         k = view_offset
         rows.extend(range(n, total))
         logits_rows.extend(range(k, k + total - n))
-        keep_rows = torch.tensor(rows, dtype=torch.int64, device=self.device)
+        keep_rows = self._upload_int64(rows)
         positions = meta.positions[keep_rows]
         requests = meta.request_indices[keep_rows]
         write_slots = meta.swa_write_slots[keep_rows]
@@ -754,7 +742,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             prefill,
             tuple(spans),
             keep_rows,
-            torch.tensor(logits_rows, dtype=torch.int64, device=self.device),
+            self._upload_int64(logits_rows),
         )
 
     def decoder_view(self) -> V41DecoderView:
@@ -896,10 +884,6 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         slots = self.cache_slots(
             V41_COMPRESSOR_TAIL_GROUP_ID, positions, request_indices, forward_mode
         )
-        if bool((slots < 0).any()):
-            raise RuntimeError(
-                "V4.1 required compressor tail is absent; request needs recovery"
-            )
         return self.cache_pool.compressor_tail(owner)[slots // 2, slots % 2]
 
     def write_compressor_tail(
@@ -1025,12 +1009,6 @@ class DeepseekV41AttentionBackend(AttentionBackend):
 
         gid = self._owner_group(owner)
         ratio = self.spec.compress_ratios[owner]
-        if not forward_mode.is_decode() and bool(
-            ((positions >= 0) & (positions % ratio != 0)).any()
-        ):
-            raise ValueError(
-                "global write positions must name compression-group starts"
-            )
         if main_kv.shape != (positions.numel(), 512) or index_k.shape != (
             positions.numel(),
             128,
@@ -1056,28 +1034,17 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             index_k, self.cache_pool.index_k(owner), slots, self.index_format
         )
 
-    def _selection_rows(self, record, positions, requests, forward_mode):
+    def _selection_rows(self, record, positions, requests):
         if positions is record.positions and requests is record.request_indices:
             return torch.arange(positions.numel(), device=positions.device).masked_fill(
                 (positions < 0) | (requests < 0), -1
             )
-        index = self._lookup_rows(
+        # Coverage of a consumer's rows by its source is the selection
+        # contract (a source scores the refresh-validated request window, and
+        # subset consumers reorder within it); it is not re-verified per round.
+        return self._lookup_rows(
             record.positions, record.request_indices, positions, requests
         )
-        # A full decode source covers the refresh-validated request window,
-        # including reordered/subset consumers. Noncanonical source windows
-        # retain the explicit coverage check used by arbitrary-chunk prefill.
-        meta = self.query_metadata(forward_mode)
-        full_decode_source = (
-            forward_mode.is_decode()
-            and record.positions is meta.positions
-            and record.request_indices is meta.request_indices
-        )
-        if not full_decode_source and bool(((index < 0) & (positions >= 0)).any()):
-            raise RuntimeError(
-                "V4.1 source did not select a consumer's request/absolute query position"
-            )
-        return index
 
     def select_global(
         self,
@@ -1134,9 +1101,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 and request_indices is record.request_indices
             ):
                 return record.physical_slots, record.lengths
-            index = self._selection_rows(
-                record, positions, request_indices, forward_mode
-            )
+            index = self._selection_rows(record, positions, request_indices)
             rows = record.logical_rows[index.clamp_min(0)].masked_fill(
                 index[:, None] < 0, -1
             )
@@ -1160,7 +1125,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             and request_indices is candidates.request_indices
         )
         candidate_index = (
-            self._selection_rows(candidates, positions, request_indices, forward_mode)
+            self._selection_rows(candidates, positions, request_indices)
             if reindex and not same_candidate_rows
             else None
         )
@@ -1336,13 +1301,14 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         else:
             # This is prefill-only control metadata. All layer consumers share
             # the resulting plan; decode/capture never reads device values here.
-            snapshot = torch.stack((requests, positions), dim=-1).cpu().tolist()
+            with allow_host_sync("prefill-only SWA plan grouping"):
+                snapshot = torch.stack((requests, positions), dim=-1).cpu().tolist()
             grouped = {}
             for row, (request, position) in enumerate(snapshot):
                 if request >= 0 and position >= 0:
                     grouped.setdefault(request, []).append((row, position))
             for request, entries in grouped.items():
-                rows = torch.tensor([row for row, _ in entries], device=self.device)
+                rows = self._upload_int64([row for row, _ in entries])
                 groups.append(
                     (request, rows, [position for _, position in entries], None, 0)
                 )
@@ -1361,9 +1327,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 needed = set()
                 for position in current:
                     needed.update(range(max(0, position - 127), position + 1))
-                prefix_positions = torch.tensor(
-                    sorted(needed - current), dtype=torch.int64, device=self.device
-                )
+                prefix_positions = self._upload_int64(sorted(needed - current))
                 last_position = max(prefix)
             prefix_slots = self.cache_slots(
                 V41_SWA_GROUP_ID,
@@ -1371,10 +1335,6 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 torch.full_like(prefix_positions, request),
                 forward_mode,
             )
-            if prefix_slots.numel() and bool((prefix_slots < 0).any()):
-                raise RuntimeError(
-                    "V4.1 SWA prefix is missing; supply the dependency tail or recover the request"
-                )
             workspace_positions = torch.cat((prefix_positions, current_positions))
             keys, order = workspace_positions.sort()
             wanted = current_positions[:, None] - torch.arange(
@@ -1628,9 +1588,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             ):
                 logical_rows = record.logical_rows
             else:
-                selected = self._selection_rows(
-                    record, positions, request_indices, forward_mode
-                )
+                selected = self._selection_rows(record, positions, request_indices)
                 logical_rows = record.logical_rows[selected.clamp_min(0)].masked_fill(
                     selected[:, None] < 0, -1
                 )
