@@ -310,43 +310,80 @@ class TestSpecMatchesShapeTraits:
         )
 
         assert spec_matches_shape_traits(
-            spec, {"batch": 12, "M": 1, "N": 512, "K": 128}
+            spec, {"batch": 12, "m": 1, "n": 512, "k": 128}
         )
         assert not spec_matches_shape_traits(
-            spec, {"batch": 8, "M": 1, "N": 512, "K": 128}
+            spec, {"batch": 8, "m": 1, "n": 512, "k": 128}
+        )
+        assert not spec_matches_shape_traits(
+            spec, {"batch": 12, "m": 2, "n": 512, "k": 128}
         )
 
-    def test_required_alignment_trait_matches(self):
+    def test_alignment_trait_accepts_any_declared_alignment(self):
         spec = KernelSpec(
             name="k",
             family="f",
             mode="m",
-            traits={"n_align_16": frozenset({True})},
+            traits={"n_align": frozenset({16}), "k_align": frozenset({64, 96})},
         )
 
-        assert spec_matches_shape_traits(spec, {"N": 32})
-        assert not spec_matches_shape_traits(spec, {"N": 30})
+        assert spec_matches_shape_traits(spec, {"n": 32, "k": 128})
+        assert spec_matches_shape_traits(spec, {"n": 32, "k": 96})
+        assert not spec_matches_shape_traits(spec, {"n": 30, "k": 128})
+        assert not spec_matches_shape_traits(spec, {"n": 32, "k": 80})
 
-    def test_missing_shape_dim_is_ignored(self):
+    def test_minimum_trait_matches(self):
         spec = KernelSpec(
             name="k",
             family="f",
             mode="m",
-            traits={"k_align_128": frozenset({True})},
+            traits={"n_min": frozenset({128}), "k_min": frozenset({128})},
         )
 
-        assert spec_matches_shape_traits(spec, {})
+        assert spec_matches_shape_traits(spec, {"n": 128, "k": 4096})
+        assert not spec_matches_shape_traits(spec, {"n": 64, "k": 4096})
+        assert not spec_matches_shape_traits(spec, {"n": 128, "k": 96})
 
-    def test_required_k64_alignment_trait_matches(self):
+    def test_constrained_dim_must_be_supplied(self):
         spec = KernelSpec(
             name="k",
             family="f",
             mode="m",
-            traits={"k_align_64": frozenset({True})},
+            traits={
+                "m": frozenset({1}),
+                "k_align": frozenset({128}),
+                "k_min": frozenset({128}),
+            },
         )
 
-        assert spec_matches_shape_traits(spec, {"K": 128})
-        assert not spec_matches_shape_traits(spec, {"K": 96})
+        assert spec_matches_shape_traits(spec, {"m": 1, "k": 4096})
+        assert spec_matches_shape_traits(spec, {"m": 1, "k": 4096, "n": 30})
+        assert not spec_matches_shape_traits(spec, {})
+        assert not spec_matches_shape_traits(spec, {"m": 1})
+        assert not spec_matches_shape_traits(spec, {"k": 4096})
+        assert not spec_matches_shape_traits(spec, {"m": 1, "k": None})
+
+    def test_unconstrained_dim_is_ignored(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"m": frozenset({1})},
+        )
+
+        assert spec_matches_shape_traits(spec, {"m": 1})
+        assert spec_matches_shape_traits(spec, {"m": 1, "n": 30, "k": 70})
+
+    def test_uppercase_shape_keys_are_not_traits(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"m": frozenset({1}), "k_align": frozenset({128})},
+        )
+
+        assert not spec_matches_shape_traits(spec, {"M": 1, "K": 128})
+        assert spec_matches_shape_traits(spec, {"m": 1, "k": 128})
 
     def test_mnk_problem_filter_matches_concrete_shape(self):
         def is_tuned_problem(m: int, n: int, k: int) -> bool:
@@ -365,25 +402,47 @@ class TestSpecMatchesShapeTraits:
             traits={"mnk_problem_filter": frozenset({is_tuned_problem})},
         )
 
-        assert spec_matches_shape_traits(spec, {"M": 1024, "N": 1792, "K": 5120})
-        assert spec_matches_shape_traits(spec, {"M": 256, "N": 4096, "K": 1280})
-        assert not spec_matches_shape_traits(spec, {"M": 256, "N": 1792, "K": 5120})
-        assert not spec_matches_shape_traits(spec, {"M": 1024, "N": 1664, "K": 5120})
-        assert not spec_matches_shape_traits(spec, {"M": 1024, "N": 1792, "K": 256})
-        assert _filter_by_traits([spec], {"M": 1024, "N": 1792, "K": 5120}) == [spec]
-        assert not _filter_by_traits([spec], {"M": 256, "N": 1792, "K": 5120})
+        assert spec_matches_shape_traits(spec, {"m": 1024, "n": 1792, "k": 5120})
+        assert spec_matches_shape_traits(spec, {"m": 256, "n": 4096, "k": 1280})
+        assert not spec_matches_shape_traits(spec, {"m": 256, "n": 1792, "k": 5120})
+        assert not spec_matches_shape_traits(spec, {"m": 1024, "n": 1664, "k": 5120})
+        assert not spec_matches_shape_traits(spec, {"m": 1024, "n": 1792, "k": 256})
+        assert _filter_by_traits([spec], {"m": 1024, "n": 1792, "k": 5120}) == [spec]
+        assert not _filter_by_traits([spec], {"m": 256, "n": 1792, "k": 5120})
 
-    def test_mnk_problem_filter_is_ignored_without_complete_shape(self):
+    def test_mnk_problem_filter_requires_complete_shape(self):
         spec = KernelSpec(
             name="k",
             family="f",
             mode="m",
-            traits={"mnk_problem_filter": frozenset({lambda m, n, k: False})},
+            traits={"mnk_problem_filter": frozenset({lambda m, n, k: True})},
         )
 
-        assert spec_matches_shape_traits(spec, {"M": 256, "N": 4096})
+        assert spec_matches_shape_traits(spec, {"m": 256, "n": 4096, "k": 1280})
+        assert not spec_matches_shape_traits(spec, {"m": 256, "n": 4096})
+        assert not spec_matches_shape_traits(spec, {})
 
-    def test_non_alignment_traits_do_not_affect_shape_matching(self):
+    def test_filter_by_traits_applies_shape_and_value_traits(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={
+                "m": frozenset({1}),
+                "n_min": frozenset({128}),
+                "k_align": frozenset({128}),
+                "out_dtype": frozenset({"bf16"}),
+            },
+        )
+        request = {"m": 1, "n": 256, "k": 4096, "out_dtype": "bf16"}
+
+        assert _filter_by_traits([spec], request) == [spec]
+        assert not _filter_by_traits([spec], {**request, "m": 2})
+        assert not _filter_by_traits([spec], {**request, "n": 64})
+        assert not _filter_by_traits([spec], {**request, "k": 4000})
+        assert not _filter_by_traits([spec], {**request, "out_dtype": "fp16"})
+
+    def test_non_shape_traits_do_not_affect_shape_matching(self):
         spec = KernelSpec(
             name="k",
             family="f",
@@ -391,7 +450,7 @@ class TestSpecMatchesShapeTraits:
             traits={"persistent": frozenset({True})},
         )
 
-        assert spec_matches_shape_traits(spec, {"N": 30, "K": 70})
+        assert spec_matches_shape_traits(spec, {"n": 30, "k": 70})
 
 
 class TestMakeCacheKey:

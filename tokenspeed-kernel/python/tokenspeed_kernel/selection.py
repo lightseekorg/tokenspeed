@@ -311,60 +311,58 @@ def ref_compatible_with_spec(ref: KernelSpec, spec: KernelSpec) -> bool:
     return True
 
 
-def spec_matches_shape_traits(spec: KernelSpec, shape: dict[str, Any]) -> bool:
-    """Return whether a spec's dimension traits match a concrete shape.
+# Problem-shape dimensions a request may carry as traits. Each dimension can
+# be constrained on a spec by an exact value set (``m``), an alignment set
+# (``m_align``) and a minimum set (``m_min``).
+_SHAPE_DIMS: tuple[str, ...] = ("batch", "m", "n", "k")
 
-    The ``mnk_problem_filter`` trait contains predicates with the signature
-    ``(M, N, K) -> bool``. Predicates are evaluated only when all three
-    dimensions are available, consistent with the partial-shape behavior of
-    the exact, alignment, and minimum traits below.
+
+def spec_matches_shape_traits(spec: KernelSpec, traits: dict[str, Any]) -> bool:
+    """Return whether a spec's problem-shape traits accept the requested shape.
+
+    The requested shape is read from the ``batch``, ``m``, ``n`` and ``k``
+    entries of ``traits``. For each dimension ``<dim>`` a spec may declare:
+
+    * ``<dim>``: the exact supported values.
+    * ``<dim>_align``: the value must be a multiple of one declared alignment.
+    * ``<dim>_min``: the value must reach one declared minimum.
+
+    Rules those cannot express go in ``mnk_problem_filter``, a set of
+    ``(m, n, k) -> bool`` predicates of which at least one must accept.
+
+    A declared bound is a hard requirement: a spec that constrains a
+    dimension rejects any request that does not supply it, and a
+    ``mnk_problem_filter`` rejects a request missing any of ``m``, ``n`` or
+    ``k``. Dimensions a spec does not constrain are ignored.
+
+    By convention a trait dict lists the shape traits first, in ``batch``,
+    ``m``, ``n``, ``k`` order with ``_align`` and ``_min`` after the exact
+    sets and ``mnk_problem_filter`` last, followed by the remaining traits in
+    alphabetical order.
     """
-    exact_traits: dict[str, tuple[str, ...]] = {
-        "batch": ("B", "batch"),
-        "m": ("M",),
-        "n": ("N",),
-        "k": ("K",),
-    }
-    for trait_name, dim_names in exact_traits.items():
-        values = spec.traits.get(trait_name)
-        dim = next((shape[name] for name in dim_names if name in shape), None)
-        if values is not None and dim is not None and dim not in values:
-            return False
-
-    alignment_traits: dict[str, tuple[str, int]] = {
-        "n_align_16": ("N", 16),
-        "n_align_64": ("N", 64),
-        "n_align_128": ("N", 128),
-        "k_align_16": ("K", 16),
-        "k_align_32": ("K", 32),
-        "k_align_64": ("K", 64),
-        "k_align_128": ("K", 128),
-    }
-    for trait_name, (dim_name, alignment) in alignment_traits.items():
-        values = spec.traits.get(trait_name)
-        if values is None or True not in values:
+    shape = {dim: traits.get(dim) for dim in _SHAPE_DIMS}
+    for dim, value in shape.items():
+        exact = spec.traits.get(dim)
+        alignments = spec.traits.get(f"{dim}_align")
+        minimums = spec.traits.get(f"{dim}_min")
+        if exact is None and alignments is None and minimums is None:
             continue
-
-        dim = shape.get(dim_name)
-        if isinstance(dim, int) and dim % alignment != 0:
+        if not isinstance(value, int):
             return False
-
-    minimum_traits: dict[str, tuple[str, int]] = {
-        "n_min_128": ("N", 128),
-        "k_min_128": ("K", 128),
-    }
-    for trait_name, (dim_name, minimum) in minimum_traits.items():
-        values = spec.traits.get(trait_name)
-        if values is None or True not in values:
-            continue
-
-        dim = shape.get(dim_name)
-        if isinstance(dim, int) and dim < minimum:
+        if exact is not None and value not in exact:
+            return False
+        if alignments is not None and not any(
+            value % alignment == 0 for alignment in alignments
+        ):
+            return False
+        if minimums is not None and not any(value >= minimum for minimum in minimums):
             return False
 
     problem_filters = spec.traits.get("mnk_problem_filter")
-    m, n, k = shape.get("M"), shape.get("N"), shape.get("K")
-    if problem_filters is not None and all(isinstance(dim, int) for dim in (m, n, k)):
+    if problem_filters is not None:
+        m, n, k = shape["m"], shape["n"], shape["k"]
+        if not all(isinstance(dim, int) for dim in (m, n, k)):
+            return False
         if not any(problem_filter(m, n, k) for problem_filter in problem_filters):
             return False
 
