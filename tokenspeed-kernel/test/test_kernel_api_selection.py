@@ -3561,6 +3561,9 @@ def _moe_topk_bias(tokens: int) -> object:
         router_logits,
         top_k=6,
         score_function="sqrt_softplus",
+        selection_method="topk",
+        renormalize=True,
+        routed_scaling_factor=1.0,
         correction_bias=correction_bias,
     )
 
@@ -3574,6 +3577,8 @@ def _moe_topk_hash() -> object:
         top_k=6,
         score_function="sqrt_softplus",
         selection_method="hash",
+        renormalize=True,
+        routed_scaling_factor=1.0,
         hash_indices_table=hash_indices_table,
         input_ids=input_ids,
     )

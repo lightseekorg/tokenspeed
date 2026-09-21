@@ -6561,6 +6561,9 @@ class TestDeepseekV4Config(unittest.TestCase):
             logits,
             top_k=2,
             score_function="sqrt_softplus",
+            selection_method="topk",
+            renormalize=True,
+            routed_scaling_factor=1.0,
             correction_bias=bias,
             solution="torch",
         )
@@ -6597,6 +6600,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             top_k=2,
             score_function="sqrt_softplus",
             selection_method="hash",
+            renormalize=True,
+            routed_scaling_factor=1.0,
             hash_indices_table=table,
             input_ids=input_ids,
             solution="torch",
@@ -6690,6 +6695,9 @@ class TestDeepseekV4Config(unittest.TestCase):
             logits,
             top_k=6,
             score_function="sqrt_softplus",
+            selection_method="topk",
+            renormalize=True,
+            routed_scaling_factor=1.0,
             correction_bias=bias,
         )
 

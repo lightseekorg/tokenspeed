@@ -2222,7 +2222,9 @@ def test_routing_matches_reference_bias_and_normalization(topk, vision, with_ima
         router_logits,
         top_k=topk,
         score_function="sqrt_softplus",
+        selection_method="topk",
         renormalize=topk > 1,
+        routed_scaling_factor=1.0,
         correction_bias=actual_bias,
         solution="torch",
     )

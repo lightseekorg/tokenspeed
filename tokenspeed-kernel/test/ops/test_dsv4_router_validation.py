@@ -37,6 +37,8 @@ def test_default_hash_router_rejects_invalid_table_values(invalid: int) -> None:
             top_k=2,
             score_function="sqrt_softplus",
             selection_method="hash",
+            renormalize=True,
+            routed_scaling_factor=1.0,
             hash_indices_table=table,
             input_ids=input_ids,
         )

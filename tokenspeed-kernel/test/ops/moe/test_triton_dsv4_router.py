@@ -73,6 +73,7 @@ def test_router_matches_reference(
         score_function="sqrt_softplus",
         selection_method="hash" if kind == "hash" else "topk",
         renormalize=renormalize,
+        routed_scaling_factor=1.0,
         correction_bias=bias,
         hash_indices_table=table,
         input_ids=input_ids,
@@ -104,6 +105,9 @@ def test_router_ties_and_graph_replay() -> None:
             logits,
             top_k=6,
             score_function="sqrt_softplus",
+            selection_method="topk",
+            renormalize=True,
+            routed_scaling_factor=1.0,
             override="triton_sqrt_softplus_topk",
         )
 
@@ -143,6 +147,9 @@ def test_router_nan_logits_keep_expert_ids_in_range(with_bias: bool) -> None:
             logits,
             top_k=6,
             score_function="sqrt_softplus",
+            selection_method="topk",
+            renormalize=True,
+            routed_scaling_factor=1.0,
             correction_bias=bias,
             override="triton_sqrt_softplus_topk",
         )
@@ -238,7 +245,9 @@ def test_router_to_mxfp4_experts(tokens: int) -> None:
             logits,
             top_k=top_k,
             score_function="sqrt_softplus",
+            selection_method="topk",
             renormalize=True,
+            routed_scaling_factor=1.0,
             correction_bias=bias,
         )
         return moe_apply(

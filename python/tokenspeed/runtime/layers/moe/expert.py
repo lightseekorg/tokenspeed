@@ -324,6 +324,7 @@ class MoELayer(torch.nn.Module):
             solution=self.plan["solution"],
         )
         self._weights_processed = False
+        self._moe_backend_state: object | None = None
 
     def _swiglu_form(self) -> str | None:
         """``"standard"`` for silu(gate)*up with an optional clamp, ``"generalized"``
@@ -470,6 +471,8 @@ class MoELayer(torch.nn.Module):
                 **shared_kwargs,
             )
             output_scale = getattr(topk_output, "output_scale", 1.0)
+            if isinstance(output_scale, torch.Tensor):
+                output_scale = output_scale.to(output.dtype)
             if isinstance(output_scale, torch.Tensor) or output_scale != 1.0:
                 output = output * output_scale
             return output

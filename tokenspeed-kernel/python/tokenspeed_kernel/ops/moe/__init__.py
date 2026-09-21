@@ -91,9 +91,9 @@ def moe_topk(
     router_logits: torch.Tensor,
     top_k: int,
     score_function: Literal["softmax", "sigmoid", "sqrt_softplus"],
-    selection_method: Literal["topk", "hash"] = "topk",
-    renormalize: bool = True,
-    routed_scaling_factor: float | None = 1.0,
+    selection_method: Literal["topk", "hash"],
+    renormalize: bool,
+    routed_scaling_factor: float | None,
     correction_bias: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
@@ -215,11 +215,20 @@ def moe_topk(
         "score_function": score_function,
     }
     signature = format_signature(router_logits=dense_tensor_format(router_logits.dtype))
-    routing_solution = (
-        "torch"
-        if correction_bias is not None and correction_bias.ndim == 2
-        else solution
-    )
+    per_token_bias = correction_bias is not None and correction_bias.ndim == 2
+    if per_token_bias and solution not in {None, "torch"}:
+        raise ValueError(
+            f"per-token correction bias does not support solution {solution!r}"
+        )
+    if per_token_bias and override not in {
+        None,
+        "torch",
+        "torch_sqrt_softplus_topk",
+    }:
+        raise ValueError(
+            f"per-token correction bias does not support override {override!r}"
+        )
+    routing_solution = "torch" if per_token_bias else solution
     kernel = select_kernel(
         "moe",
         "topk",
@@ -515,6 +524,7 @@ def moe_plan(
         internal_activation_dtype=internal_activation_dtype,
         with_bias=with_bias,
     )
+    traits["persistent_workspace"] = persistent_max_num_tokens_per_gpu is not None
 
     kernel = select_kernel(
         "moe",

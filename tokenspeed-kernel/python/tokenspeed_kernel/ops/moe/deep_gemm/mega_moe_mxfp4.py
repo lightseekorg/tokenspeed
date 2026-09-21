@@ -318,7 +318,7 @@ def warmup_deep_gemm_mxfp4_mega_moe(plan: dict, w: torch.nn.Module) -> None:
         set_pdl(pdl_enabled())
     if os.environ.get(_DISABLE_WARMUP_ENV) == "1":
         return
-    state = getattr(w, "_moe_backend_state", None)
+    state = w._moe_backend_state
     if not isinstance(state, _DeepGemmMegaMoEState):
         raise TypeError("invalid DeepGEMM MegaMoE state")
     process_group = plan.get("process_group")
@@ -396,6 +396,7 @@ if platform.is_blackwell:
             "supports_deferred_finalize": frozenset({False}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
+            "persistent_workspace": frozenset({True}),
             "ispp_alignment": frozenset({128}),
             "hidden_alignment": frozenset({128}),
             "swiglu_form": frozenset({"standard"}),
@@ -422,7 +423,7 @@ if platform.is_blackwell:
             raise ValueError("DeepGEMM MegaMoE requires complete finalization")
         if not isinstance(x, torch.Tensor):
             raise TypeError("DeepGEMM MegaMoE requires dense input activations")
-        state = getattr(w, "_moe_backend_state", None)
+        state = w._moe_backend_state
         if not isinstance(state, _DeepGemmMegaMoEState):
             raise TypeError("invalid DeepGEMM MegaMoE state")
         if x.device != state.device:
