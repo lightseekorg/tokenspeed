@@ -14,6 +14,8 @@ env:
   PREFILL_GPUS: "0,1"
   DECODE_GPUS: "2,3"
   MOE_BACKEND: mega_moe
+  # TP2 weights plus DSpark need more cache budget than the 0.92 default leaves.
+  GPU_MEMORY_UTILIZATION: "0.95"
 install:
   - bash test/ci_system/install_deps.sh
 ut:
