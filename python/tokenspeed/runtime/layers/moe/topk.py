@@ -313,6 +313,7 @@ class StandardTopKOutput(NamedTuple):
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
     router_logits: torch.Tensor | None
+    output_scale: float | torch.Tensor = 1.0
 
     @property
     def format(self) -> TopKOutputFormat:
@@ -337,6 +338,8 @@ class BypassedTopKOutput(NamedTuple):
 @runtime_checkable
 class TopKOutput(Protocol):
     """Protocol for top-k outputs in different formats."""
+
+    output_scale: float | torch.Tensor
 
     @property
     def format(self) -> TopKOutputFormat:

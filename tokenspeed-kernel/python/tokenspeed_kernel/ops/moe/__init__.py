@@ -124,6 +124,8 @@ def moe_topk(
     if selection_method not in {"topk", "hash"}:
         raise ValueError(f"unsupported MoE selection method: {selection_method!r}")
     if selection_method == "hash":
+        if correction_bias is not None:
+            raise ValueError("hash selection does not accept correction_bias")
         if hash_indices_table is None or input_ids is None:
             raise ValueError("hash selection requires hash_indices_table and input_ids")
     elif hash_indices_table is not None or input_ids is not None:

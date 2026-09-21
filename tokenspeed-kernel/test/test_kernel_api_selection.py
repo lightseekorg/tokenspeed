@@ -2698,6 +2698,36 @@ def test_nvfp4_deepep_rejects_modes_without_normal_legs(
         registry.clear_cache()
 
 
+def test_moe_plan_rejects_persistent_workspace_for_ordinary_kernel(
+    h100_platform,
+) -> None:
+    real_platform = Platform.get()
+    try:
+        Platform.override(h100_platform)
+        KernelRegistry.get().clear_cache()
+        with pytest.raises(ValueError, match="does not support persistent workspace"):
+            tokenspeed_kernel.moe_plan(
+                "unquant",
+                input_dtype=torch.bfloat16,
+                activation="silu",
+                routing_mode="precomputed_topk",
+                a2a_backend=None,
+                ep_size=1,
+                ispp=128,
+                internal_activation_dtype="input",
+                persistent_max_num_tokens_per_gpu=16,
+                solution="triton",
+                hidden=128,
+                swiglu_form=None,
+                activation_clamped=False,
+                expert_id_repeats=False,
+                fast_math=True,
+            )
+    finally:
+        Platform.override(real_platform)
+        KernelRegistry.get().clear_cache()
+
+
 @pytest.mark.parametrize(
     "kernel_name",
     [
