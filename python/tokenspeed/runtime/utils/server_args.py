@@ -919,20 +919,6 @@ class ServerArgs:
             if not self.disable_pdl:
                 raise ValueError("NPU execution requires --disable-pdl")
 
-        if self.moe_mxfp4_fp8_activation:
-            # The draft worker installs draft_moe_backend in place of
-            # moe_backend, and its MXFP4 experts plan with FP8 activations too.
-            for flag, backend in (
-                ("--moe-backend", self.moe_backend),
-                ("--draft-moe-backend", self.draft_moe_backend),
-            ):
-                if backend not in (None, "auto", "flashinfer_cutlass"):
-                    raise ValueError(
-                        "--moe-mxfp4-fp8-activation is served by the FlashInfer "
-                        f"cutlass MoE only; pass {flag!s} auto or flashinfer_cutlass, "
-                        f"not {backend!r}"
-                    )
-
         if (
             self.max_num_seqs is not None
             and self.max_num_seqs < self.mapping.attn.dp_size
@@ -1524,11 +1510,13 @@ class ServerArgs:
         parser.add_argument(
             "--moe-mxfp4-fp8-activation",
             action="store_true",
-            help="Run MXFP4 routed experts with FP8 activations through the "
-            "FlashInfer cutlass W4A8 (Humming) MoE on Hopper. About 1.8x faster "
-            "than the default W4A16 path but adds a few percent of relative error "
-            "to the expert outputs; validate the served model before relying on "
-            "it. Requires --moe-backend auto or flashinfer_cutlass.",
+            help="Run MXFP4 routed experts with FP8 activations (on Hopper the "
+            "FlashInfer cutlass W4A8 Humming MoE: about 1.8x faster than the "
+            "default W4A16 path, a few percent of relative error on the expert "
+            "outputs; validate the served model before relying on it). Applies to "
+            "every MXFP4 expert layer, target and draft; the MoE plan fails at "
+            "startup where the selected backend has no FP8-activation kernel for "
+            "the layer.",
         )
         parser.add_argument(
             "--draft-moe-backend",

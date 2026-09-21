@@ -106,24 +106,17 @@ def test_without_the_flag_the_model_override_is_authoritative(monkeypatch):
     assert plan["internal_activation_dtype"] == "input"
 
 
-@pytest.mark.parametrize(
-    "argv, message",
-    [
-        (["--moe-backend", "marlin"], "--moe-backend auto or flashinfer_cutlass"),
-        # The draft worker swaps draft_moe_backend in for moe_backend, so its
-        # MXFP4 experts would plan FP8 activations against a kernel set that
-        # has no W4A8 registration.
-        (
-            ["--draft-moe-backend", "triton"],
-            "--draft-moe-backend auto or flashinfer_cutlass",
-        ),
-    ],
-)
-def test_flag_rejects_backends_without_the_w4a8_kernel(argv, message):
+def test_flag_is_accepted_for_any_backend_and_fails_closed_in_the_plan():
+    # Which backends can honour FP8 activations is a registry fact (Hopper
+    # cutlass, SM100 trtllm SiTU, AMD Gluon...), so ServerArgs does not keep
+    # an allowlist; an unsupported backend fails at plan time instead.
     from tokenspeed.runtime.utils.server_args import prepare_server_args
 
-    with pytest.raises(ValueError, match=message):
-        prepare_server_args(["--model", "x", "--moe-mxfp4-fp8-activation", *argv])
-    prepare_server_args(
-        ["--model", "x", "--moe-mxfp4-fp8-activation", "--draft-moe-backend", "auto"]
-    )
+    for argv in (
+        ["--moe-backend", "flashinfer_trtllm"],
+        ["--draft-moe-backend", "triton"],
+    ):
+        args = prepare_server_args(
+            ["--model", "x", "--moe-mxfp4-fp8-activation", *argv]
+        )
+        assert args.moe_mxfp4_fp8_activation

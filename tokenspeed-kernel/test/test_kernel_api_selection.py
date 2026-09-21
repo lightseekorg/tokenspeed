@@ -3638,6 +3638,21 @@ def test_mxfp4_w4a8_needs_the_swiglu_clamp() -> None:
     assert plan["apply_kernel_name"] == "flashinfer_cutlass_mxfp4_w4a8_moe_apply"
 
 
+def test_mxfp4_fp8_activation_fails_closed_on_backends_without_a_w4a8_kernel() -> None:
+    # --moe-mxfp4-fp8-activation is not gated by a backend allowlist in
+    # ServerArgs; the plan refuses a backend that has no FP8-activation kernel.
+    if not _is_hopper(Platform.get()):
+        pytest.skip("Hopper registrations only")
+    for solution in ("marlin", "triton"):
+        with pytest.raises(tokenspeed_kernel.NoKernelFoundError):
+            _moe_apply_mxfp4_plan(
+                activation="swiglu",
+                ispp=2304,
+                internal_activation_dtype="fp8",
+                solution=solution,
+            )
+
+
 def _moe_apply_mxfp4_situ_auto() -> object:
     # The cutlass epilogue has no SiTU, so Kimi-K3 keeps marlin under auto.
     plan = _moe_apply_mxfp4_plan(
