@@ -2545,6 +2545,10 @@ def test_deepep_selects_apply_kernel_by_weight_dtype_without_pinned_solution(
             internal_activation_dtype="input",
             process_group=object(),
             deepep_mode=deepep_mode,
+            hidden=None,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
         )
     finally:
         Platform.override(real_platform)
@@ -2581,6 +2585,10 @@ def test_nvfp4_deepep_rejects_modes_without_normal_legs(
                 internal_activation_dtype="input",
                 process_group=object(),
                 deepep_mode=deepep_mode,
+                hidden=None,
+                swiglu_form=None,
+                activation_clamped=False,
+                expert_id_repeats=False,
             )
     finally:
         Platform.override(real_platform)
@@ -2630,6 +2638,10 @@ def test_deepep_plan_carries_mode_and_low_latency_capacity(b200_platform) -> Non
             process_group=process_group,
             deepep_mode="auto",
             deepep_low_latency_max_num_tokens_per_gpu=256,
+            hidden=None,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
         )
     finally:
         Platform.override(real_platform)
@@ -2649,6 +2661,10 @@ def test_moe_plan_defaults_deepep_mode_to_auto() -> None:
         ep_size=1,
         ispp=128,
         solution="triton",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     assert plan["deepep_mode"] == "auto"
     assert plan["deepep_low_latency_max_num_tokens_per_gpu"] is None
@@ -2674,6 +2690,10 @@ def test_moe_plan_rejects_invalid_deepep_mode(
             ispp=256,
             fp8_scale_block_shape=(128, 128),
             deepep_mode=deepep_mode,
+            hidden=None,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
         )
 
 
@@ -2932,6 +2952,10 @@ def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
             internal_activation_dtype="input",
             with_bias=True,
             solution="gluon",
+            hidden=None,
+            swiglu_form="standard",
+            activation_clamped=False,
+            expert_id_repeats=False,
         )
     finally:
         Platform.override(real_platform)
@@ -2963,6 +2987,10 @@ def test_triton_mxfp4_supports_input_activation_dtype(
             ispp=128,
             internal_activation_dtype="input",
             solution="triton",
+            hidden=None,
+            swiglu_form="standard",
+            activation_clamped=False,
+            expert_id_repeats=False,
         )
         assert plan["apply_kernel_name"] == "triton_mxfp4_precomputed_moe_apply"
     finally:
@@ -3020,6 +3048,10 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
             ispp=ispp,
             internal_activation_dtype="input",
             solution=solution,
+            hidden=None,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
         )
     finally:
         Platform.override(real_platform)
@@ -3060,6 +3092,10 @@ def test_gluon_mxfp4_swiglu_ep_traits_select_matching_kernel(
             ispp=128,
             internal_activation_dtype="input",
             solution="gluon",
+            hidden=None,
+            swiglu_form="standard",
+            activation_clamped=False,
+            expert_id_repeats=False,
         )
     finally:
         Platform.override(real_platform)
@@ -3089,6 +3125,10 @@ def test_kimi3_mxfp4_situ_ep8_bias_avoids_a8_apply(
             internal_activation_dtype="input",
             with_bias=True,
             solution="gluon",
+            hidden=None,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
         )
     finally:
         Platform.override(real_platform)
@@ -3175,6 +3215,10 @@ def test_kimi3_mxfp4_situ_tp_selection_on_cdna5(
             ispp=384,
             internal_activation_dtype="input",
             solution="gluon",
+            hidden=None,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
         )
     finally:
         Platform.override(real_platform)
@@ -3387,6 +3431,10 @@ def _moe_apply_unquant_trtllm() -> object:
         ep_size=2,
         ispp=128,
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     _assert_moe_plan(
         plan,
@@ -3442,6 +3490,10 @@ def _moe_apply_unquant_cutlass() -> object:
         ep_size=2,
         ispp=128,
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     _assert_moe_plan(
         plan,
@@ -3462,6 +3514,10 @@ def _moe_apply_fp8_cutlass() -> object:
         ispp=128,
         fp8_scale_block_shape=(128, 128),
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     _assert_moe_plan(
         plan,
@@ -3678,6 +3734,10 @@ def _moe_apply_fp8_trtllm() -> object:
         ispp=128,
         fp8_scale_block_shape=(128, 128),
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     _assert_moe_plan(
         plan,
@@ -3698,6 +3758,10 @@ def _moe_apply_nvfp4_trtllm() -> object:
         ep_size=2,
         ispp=128,
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     _assert_moe_plan(
         plan,
@@ -3724,6 +3788,10 @@ def _moe_apply_nvfp4_cutlass() -> object:
         ispp=128,
         internal_activation_dtype="input",
         solution="flashinfer_cutlass",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     _assert_moe_plan(
         plan,
@@ -3745,6 +3813,10 @@ def _moe_apply_nvfp4_trtllm_routed() -> object:
         ispp=128,
         internal_activation_dtype="input",
         solution="flashinfer_trtllm",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     _assert_moe_plan(
         plan,
@@ -3778,6 +3850,10 @@ def _moe_apply_nvfp4_trtllm_unconstrained_routing() -> object:
         ispp=128,
         internal_activation_dtype="input",
         solution="flashinfer_trtllm",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     _assert_moe_plan(
         plan,
@@ -3800,6 +3876,10 @@ def _moe_apply_unquant_trtllm_routed() -> object:
         ispp=128,
         internal_activation_dtype="input",
         solution="flashinfer_trtllm",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     _assert_moe_plan(
         plan,
@@ -3833,6 +3913,10 @@ def _moe_apply_nvfp4_deepep_cutedsl() -> object:
         process_group=object(),
         deepep_mode="low_latency",
         solution="flashinfer_cutedsl",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     _assert_moe_plan(
         plan,
@@ -3857,6 +3941,10 @@ def _moe_apply_fp8_deepep_deep_gemm() -> object:
         internal_activation_dtype="input",
         process_group=object(),
         solution="deep_gemm",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     _assert_moe_plan(
         plan,
@@ -3887,6 +3975,10 @@ def _moe_apply_mxfp4_trtllm() -> object:
         ispp=128,
         internal_activation_dtype="input",
         with_bias=True,
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     _assert_moe_plan(
         plan,
@@ -3908,6 +4000,10 @@ def _moe_apply_mxfp4_triton() -> object:
         internal_activation_dtype="mxfp4",
         with_bias=False,
         solution="triton",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     _assert_moe_plan(
         plan,
@@ -3938,6 +4034,10 @@ def _moe_apply_unquant_triton() -> object:
         internal_activation_dtype="input",
         with_bias=False,
         solution="triton",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     _assert_moe_plan(
         plan,
@@ -3966,6 +4066,10 @@ def _moe_apply_mxfp4_gluon() -> object:
         ispp=128,
         internal_activation_dtype="fp8",
         with_bias=True,
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     _assert_moe_plan(
         plan,
@@ -3985,6 +4089,10 @@ def _moe_apply_mxint4_trtllm() -> object:
         ep_size=2,
         ispp=256,
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     _assert_moe_plan(
         plan,
@@ -4004,6 +4112,10 @@ def _moe_apply_mxfp4_dynamic_tp() -> object:
         ep_size=1,
         ispp=2048,
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     _assert_moe_plan(
         plan,
@@ -5545,6 +5657,10 @@ def test_b200_fp8_swiglu_selects_trtllm_routed_moe(
             ispp=2048,
             fp8_scale_block_shape=(128, 128),
             internal_activation_dtype="input",
+            hidden=None,
+            swiglu_form="standard",
+            activation_clamped=False,
+            expert_id_repeats=False,
         )
 
         assert plan["apply_kernel_name"] == ("flashinfer_trtllm_fp8_routed_moe_apply")
