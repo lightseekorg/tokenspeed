@@ -37,52 +37,52 @@ from tokenspeed_kernel.signature import (
 
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
-        gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock as _mla_decode_bf16xbf16_bh16_multiblock_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
-        gluon_mla_decode_bf16xbf16_gfx950_bh16bn64 as _mla_decode_bf16xbf16_bh16bn64_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
-        gluon_mla_decode_bf16xbf16_gfx950_bh64 as _mla_decode_bf16xbf16_bh64_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
-        gluon_mla_decode_bf16xbf16_gfx950_bh64_small as _mla_decode_bf16xbf16_bh64_small_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
         gluon_mla_decode_bf16xfp8_gfx950 as _mla_decode_bf16xfp8_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
         gluon_mla_decode_fp8xfp8_gfx950 as _mla_decode_fp8xfp8_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
-        gluon_mla_decode_projected_value_gfx950 as _mla_decode_projected_value_impl,
+        launch_gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock as _mla_decode_bf16xbf16_bh16_multiblock_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
+        launch_gluon_mla_decode_bf16xbf16_gfx950_bh16bn64 as _mla_decode_bf16xbf16_bh16bn64_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
+        launch_gluon_mla_decode_bf16xbf16_gfx950_bh64 as _mla_decode_bf16xbf16_bh64_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
+        launch_gluon_mla_decode_bf16xbf16_gfx950_bh64_small as _mla_decode_bf16xbf16_bh64_small_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
+        launch_gluon_mla_decode_projected_value_gfx950 as _mla_decode_projected_value_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.normalize_project_query import (
-        gluon_mla_normalize_project_query_gfx950 as _mla_normalize_project_query_impl,
+        launch_gluon_mla_normalize_project_query_gfx950 as _mla_normalize_project_query_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.prefill import (
-        gluon_mla_prefill_gfx950 as _mla_prefill_gfx950_impl,
+        launch_gluon_mla_prefill_gfx950 as _mla_prefill_gfx950_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.project_value import (
-        gluon_mla_project_value_gfx950 as _mla_project_value_impl,
+        launch_gluon_mla_project_value_gfx950 as _mla_project_value_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.decode import (
-        gluon_mla_decode_gfx1250 as _mla_decode_gfx1250_impl,
+        launch_gluon_mla_decode_gfx1250 as _mla_decode_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.decode import (
-        gluon_mla_decode_projected_value_gfx1250 as _mla_decode_projected_value_gfx1250_impl,
+        launch_gluon_mla_decode_projected_value_gfx1250 as _mla_decode_projected_value_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.extend import (
-        gluon_mla_extend_gfx1250 as _mla_extend_gfx1250_impl,
+        launch_gluon_mla_extend_gfx1250 as _mla_extend_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.normalize_project_query import (
-        gluon_mla_normalize_project_query_gfx1250 as _mla_normalize_project_query_gfx1250_impl,
+        launch_gluon_mla_normalize_project_query_gfx1250 as _mla_normalize_project_query_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.prefill import (
-        gluon_mla_prefill_gfx1250 as _mla_prefill_gfx1250_impl,
+        launch_gluon_mla_prefill_gfx1250 as _mla_prefill_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.project_value import (
-        gluon_mla_project_value_gfx1250 as _mla_project_value_gfx1250_impl,
+        launch_gluon_mla_project_value_gfx1250 as _mla_project_value_gfx1250_impl,
     )
 
     @register_kernel(

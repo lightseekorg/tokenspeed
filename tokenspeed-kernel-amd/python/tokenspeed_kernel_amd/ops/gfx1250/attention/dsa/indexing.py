@@ -28,8 +28,8 @@ from tokenspeed_kernel_amd.ops.gfx1250.attention._common import maximum
 
 __all__ = [
     "_check_packed_fp8_inputs",
-    "_dsa_decode_logits_fp8_kernel",
-    "_dsa_prefill_logits_fp8_kernel",
+    "gluon_dsa_decode_topk_fp8_gfx1250",
+    "gluon_dsa_prefill_topk_fp8_gfx1250",
 ]
 
 
@@ -43,7 +43,7 @@ def _score_layout(
 
 
 @gluon.jit
-def _dsa_decode_logits_fp8_kernel(
+def gluon_dsa_decode_topk_fp8_gfx1250(
     q,
     index_k_fp8,
     index_k_scale,
@@ -133,7 +133,7 @@ def _dsa_decode_logits_fp8_kernel(
 
 
 @gluon.jit
-def _dsa_prefill_logits_fp8_kernel(
+def gluon_dsa_prefill_topk_fp8_gfx1250(
     q,
     index_k_fp8,
     index_k_scale,

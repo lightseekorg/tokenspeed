@@ -37,7 +37,7 @@ _PARTIAL_BLOCK = gl.constexpr(8192)
 
 
 @gluon.jit
-def _linear_attnres_partials_kernel(
+def gluon_linear_attnres_partials_gfx950(
     hidden_ptr,
     weight_ptr,
     output_ptr,
@@ -208,7 +208,7 @@ def _linear_attnres_partials_kernel(
 
 
 @gluon.jit
-def _linear_attnres_partials_m4_mfma_kernel(
+def gluon_linear_attnres_partials_m4_gfx950(
     hidden_ptr,
     weight_ptr,
     output_ptr,
@@ -259,7 +259,7 @@ def _linear_attnres_partials_m4_mfma_kernel(
             PID_OFFSET=4,
         )
     else:
-        _linear_attnres_partials_kernel(
+        gluon_linear_attnres_partials_gfx950(
             hidden_ptr,
             weight_ptr,
             output_ptr,
@@ -281,7 +281,7 @@ def _linear_attnres_partials_m4_mfma_kernel(
         )
 
 
-def gluon_linear_attnres_partials_gfx950(
+def launch_gluon_linear_attnres_partials_gfx950(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
     blocks: torch.Tensor,
@@ -349,7 +349,7 @@ def gluon_linear_attnres_partials_gfx950(
         raise ValueError("AttnRes epsilon must be positive")
 
     if num_tokens == 4 and output_size == 6288:
-        _linear_attnres_partials_m4_mfma_kernel[(output_size // _BLOCK_N_SIZE + 4,)](
+        gluon_linear_attnres_partials_m4_gfx950[(output_size // _BLOCK_N_SIZE + 4,)](
             hidden_states,
             weight,
             out,
@@ -373,7 +373,7 @@ def gluon_linear_attnres_partials_gfx950(
     attnres_program_offset = (
         192 if num_tokens == 2 and output_size == 6288 else projection_programs
     )
-    _linear_attnres_partials_kernel[(projection_programs + num_tokens,)](
+    gluon_linear_attnres_partials_gfx950[(projection_programs + num_tokens,)](
         hidden_states,
         weight,
         out,
@@ -395,4 +395,4 @@ def gluon_linear_attnres_partials_gfx950(
     return out
 
 
-__all__ = ["gluon_linear_attnres_partials_gfx950"]
+__all__ = ["launch_gluon_linear_attnres_partials_gfx950"]

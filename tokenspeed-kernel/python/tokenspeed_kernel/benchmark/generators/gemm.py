@@ -133,17 +133,8 @@ def _bmm_traits(
         "k": K,
         "a_inner_stride_one": True,
         "b_n_stride_one": True,
-        "out_inner_stride_one": True,
         "out_dtype": out_dtype,
-        "n_align_16": N % 16 == 0,
-        "k_align_16": K % 16 == 0,
-        "k_align_32": K % 32 == 0,
-        "n_align_64": N % 64 == 0,
-        "n_align_128": N % 128 == 0,
-        "k_align_64": K % 64 == 0,
-        "k_align_128": K % 128 == 0,
-        "n_min_128": N >= 128,
-        "k_min_128": K >= 128,
+        "out_inner_stride_one": True,
     }
 
 
@@ -178,7 +169,9 @@ def _validate_exact_registration(
             BenchmarkStatus.INVALID_CASE,
             f"Registration {spec.name!r} does not support dense BF16 inputs",
         )
-    if not spec_matches_traits(spec, traits):
+    if not spec_matches_traits(spec, traits) or not spec_matches_shape_traits(
+        spec, traits
+    ):
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
             f"Registration {spec.name!r} does not support parameters {shape}",
@@ -227,7 +220,7 @@ def _select_registration(
 def _select_reference_registration(
     spec: KernelSpec,
     signature: FormatSignature,
-    shape: dict[str, int],
+    traits: dict[str, object],
     platform: PlatformInfo,
 ) -> tuple[KernelSpec, SelectedKernel]:
     registry = KernelRegistry.get()
@@ -242,7 +235,7 @@ def _select_reference_registration(
         if (
             reference.name == spec.name
             or not ref_compatible_with_spec(reference, spec)
-            or not spec_matches_shape_traits(reference, shape)
+            or not spec_matches_shape_traits(reference, traits)
         ):
             continue
         implementation = registry.get_impl(reference.name)
@@ -342,7 +335,7 @@ def prepare_dense_bmm(
         reference_spec, reference = _select_reference_registration(
             spec,
             signature,
-            shape,
+            traits,
             platform,
         )
 

@@ -2,121 +2,44 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
 # SPDX-License-Identifier: MIT AND Apache-2.0
 
-"""Tensor-parallel DSpark Markov and confidence heads."""
+"""Tensor-parallel DSpark Markov and confidence heads.
+
+The Markov head keeps the checkpoint's BF16 dtypes: its bigram table is
+replicated on every rank so a lookup is a plain gather, and its rank-``R``
+projection is sharded over the vocabulary exactly like the LM head, so the
+bias of a shard column lands on the rank that owns that column's base logit.
+"""
 
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.sampling.triton import (
+    dspark_block_candidate_tiles,
+    dspark_block_greedy_resolve,
+    dspark_block_greedy_step,
+)
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_single
-
-
-def _local_vocab_argmax(
-    local_logits: torch.Tensor,
-    lm_head: nn.Module,
-    tp_group,
-    gathered_values: torch.Tensor,
-    gathered_ids: torch.Tensor,
-) -> torch.Tensor:
-    """Return global argmax IDs for vocab-sharded logits."""
-    shard = lm_head.shard_indices
-    num_org = int(shard.num_org_elements)
-    num_org_padded = int(shard.num_org_elements_padded)
-    num_added = int(shard.num_added_elements)
-    org_vocab_start = int(shard.org_vocab_start_index)
-    added_vocab_start = int(shard.added_vocab_start_index)
-    rows = local_logits.shape[0]
-
-    if num_org > 0:
-        local_max, local_arg = torch.max(local_logits[:, :num_org], dim=-1)
-    else:
-        local_max = torch.full(
-            (rows,),
-            torch.finfo(local_logits.dtype).min,
-            dtype=local_logits.dtype,
-            device=local_logits.device,
-        )
-        local_arg = torch.zeros(
-            (rows,),
-            dtype=torch.int64,
-            device=local_logits.device,
-        )
-
-    if num_added > 0:
-        added_logits = local_logits[
-            :,
-            num_org_padded : num_org_padded + num_added,
-        ]
-        added_max, added_arg = torch.max(added_logits, dim=-1)
-        use_added = added_max > local_max
-        local_max = torch.where(use_added, added_max, local_max)
-        local_arg = torch.where(
-            use_added,
-            added_arg.to(local_arg.dtype) + num_org_padded,
-            local_arg,
-        )
-
-    if num_added == 0:
-        global_ids = local_arg + org_vocab_start
-    else:
-        global_ids = torch.empty_like(local_arg)
-        is_base = local_arg < num_org
-        global_ids[is_base] = org_vocab_start + local_arg[is_base]
-        global_ids[~is_base] = added_vocab_start + (
-            local_arg[~is_base] - num_org_padded
-        )
-
-    tp_size = int(getattr(lm_head, "tp_size", gathered_values.shape[0]))
-    if tp_size == 1:
-        return global_ids.to(torch.int32)
-
-    if (
-        gathered_values.ndim != 2
-        or gathered_ids.ndim != 2
-        or gathered_values.shape != gathered_ids.shape
-        or gathered_values.shape[0] != tp_size
-        or gathered_values.shape[1] < local_logits.shape[0]
-    ):
-        raise ValueError(
-            "DSpark TP gather workspaces must be matching [tp_size, capacity] "
-            "tensors with capacity for every active row."
-        )
-    if not gathered_values.is_contiguous() or not gathered_ids.is_contiguous():
-        raise ValueError("DSpark TP gather workspaces must be contiguous.")
-
-    flat_values = gathered_values.reshape(-1)[: tp_size * rows]
-    flat_ids = gathered_ids.reshape(-1)[: tp_size * rows]
-    all_gather_single(
-        flat_values,
-        local_max.contiguous(),
-        tp_group,
-    )
-    all_gather_single(
-        flat_ids,
-        global_ids.contiguous(),
-        tp_group,
-    )
-    values = flat_values.view(tp_size, rows)
-    ids = flat_ids.view(tp_size, rows)
-    best_rank = torch.argmax(values, dim=0).unsqueeze(0)
-    return torch.gather(ids, 0, best_rank).squeeze(0).to(torch.int32)
+from tokenspeed.runtime.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 
 
 class DSparkVanillaMarkov(nn.Module):
     """Low-rank token-bigram correction over a vocab-sharded output."""
 
-    def __init__(self, embedding: nn.Module, projection: nn.Module) -> None:
+    def __init__(
+        self, embedding: VocabParallelEmbedding, projection: ParallelLMHead
+    ) -> None:
         super().__init__()
+        if embedding.tp_size != 1:
+            raise ValueError("DSpark Markov bigram table must be replicated")
+        if embedding.embedding_dim != projection.embedding_dim:
+            raise ValueError("DSpark Markov table and projection ranks differ")
         self.embedding = embedding
         self.projection = projection
-
-    def local_bias(self, token_ids: torch.Tensor) -> torch.Tensor:
-        hidden = self.embedding(token_ids.long())
-        return torch.matmul(
-            hidden.to(self.projection.weight.dtype),
-            self.projection.weight.T,
-        )
 
 
 class DSparkConfidenceHead(nn.Module):
@@ -144,27 +67,109 @@ class DSparkConfidenceHead(nn.Module):
         return logits.squeeze(-1)
 
 
+def dspark_greedy_workspace(
+    tp_size: int, max_rows: int, local_vocab: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Allocate the candidate buffers ``sample_dspark_block_greedy`` gathers into.
+
+    Args:
+        tp_size: Ranks the LM head is sharded over.
+        max_rows: Most rows one call will sample.
+        local_vocab: Columns of this rank's head shard.
+        device: Device of the draft.
+
+    Returns:
+        ``(candidates, partials)``: a ``[2, tp_size, max_rows, tiles]`` int64
+        double buffer holding every rank's packed candidates -- consecutive
+        steps alternate slots, so a step's programs never overwrite the
+        candidates they are still resolving -- and, when the head spans
+        several ranks, the ``[max_rows, tiles]`` buffer this rank scores into
+        before the gather. A single rank scores straight into its slot, so
+        ``partials`` is None.
+    """
+    tiles = dspark_block_candidate_tiles(local_vocab)
+    candidates = torch.empty(
+        (2, tp_size, max_rows, tiles), dtype=torch.int64, device=device
+    )
+    partials = (
+        None
+        if tp_size == 1
+        else torch.empty((max_rows, tiles), dtype=torch.int64, device=device)
+    )
+    return candidates, partials
+
+
 def sample_dspark_block_greedy(
     local_base_logits: torch.Tensor,
     bonus_token_ids: torch.Tensor,
     markov_head: DSparkVanillaMarkov,
-    lm_head: nn.Module,
+    lm_head: ParallelLMHead,
     tp_group,
-    gathered_values: torch.Tensor,
-    gathered_ids: torch.Tensor,
+    candidates: torch.Tensor,
+    partials: torch.Tensor | None,
     output: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply the trained Markov correction and greedily sample a fixed block."""
+    """Apply the trained Markov correction and greedily sample a fixed block.
 
-    previous = bonus_token_ids.to(torch.int32)
-    for step in range(local_base_logits.shape[1]):
-        corrected = local_base_logits[:, step] + markov_head.local_bias(previous)
-        previous = _local_vocab_argmax(
-            corrected,
-            lm_head,
-            tp_group,
-            gathered_values,
-            gathered_ids,
+    Args:
+        local_base_logits: ``[rows, block, local_vocab]`` FP32 logits of this
+            rank's head shard for every block position.
+        bonus_token_ids: ``[rows]`` token each block continues from.
+        markov_head: Bigram table and projection shard.
+        lm_head: Head whose shard geometry the logits follow.
+        tp_group: Tensor-parallel group of the head.
+        candidates: Gathered-candidate double buffer from
+            ``dspark_greedy_workspace``.
+        partials: This rank's candidate buffer from
+            ``dspark_greedy_workspace``; None on a single rank.
+        output: ``[rows, block]`` int32 destination for the block tokens.
+
+    Returns:
+        ``output``, filled in place.
+    """
+    rows, block, local_vocab = local_base_logits.shape
+    shard = lm_head.shard_indices
+    if shard.num_added_elements != 0:
+        raise ValueError("DSpark greedy sampling needs a head without added vocabulary")
+    projection = markov_head.projection
+    if (
+        projection.shard_indices.org_vocab_start_index != shard.org_vocab_start_index
+        or projection.shard_indices.num_org_elements != shard.num_org_elements
+    ):
+        raise ValueError("DSpark Markov projection is not sharded like the LM head")
+    if candidates.ndim != 4 or candidates.shape[0] != 2:
+        raise ValueError(
+            "DSpark greedy candidates must be a [2, tp, rows, tiles] buffer"
         )
-        output[:, step] = previous
+    _, tp_size, capacity, tiles = candidates.shape
+    if capacity < rows or (partials is None) != (tp_size == 1):
+        raise ValueError("DSpark greedy workspace does not cover the batch")
+    if partials is not None and partials.shape != (capacity, tiles):
+        raise ValueError("DSpark greedy workspace does not cover the batch")
+    slots = [
+        candidates[slot].view(-1)[: tp_size * rows * tiles].view(tp_size, rows, tiles)
+        for slot in range(2)
+    ]
+    for step in range(block):
+        previous, current = slots[(step - 1) % 2], slots[step % 2]
+        scored = (
+            current[0]
+            if partials is None
+            else partials.view(-1)[: rows * tiles].view(rows, tiles)
+        )
+        dspark_block_greedy_step(
+            local_base_logits,
+            step,
+            bonus_token_ids,
+            previous,
+            markov_head.embedding.weight,
+            projection.weight,
+            shard.org_vocab_start_index,
+            shard.num_org_elements,
+            scored,
+            output,
+        )
+        if partials is not None:
+            all_gather_single(current.view(-1), scored.view(-1), tp_group)
+    dspark_block_greedy_resolve(slots[(block - 1) % 2], output, block - 1)
     return output

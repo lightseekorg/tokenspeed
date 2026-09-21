@@ -1214,7 +1214,7 @@ def _mxfp4_mm_kernel(
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=_MXFP4_FORMAT_SIGNATURES,
-    traits={"quant": frozenset({"mxfp4"})},
+    traits={},
     priority=Priority.PORTABLE,
 )
 def triton_mm_mxfp4(

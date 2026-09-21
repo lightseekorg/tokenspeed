@@ -36,40 +36,40 @@ if current_platform().is_amd:
     _DSA_PREFILL_TOPK_WIDTHS = _DSA_FULL_TOPK_WIDTHS
 
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
-        gluon_dsa_decode_gfx950 as _dsa_decode_impl,
+        launch_gluon_dsa_decode_gfx950 as _dsa_decode_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
-        gluon_dsa_prefill_gfx950 as _dsa_prefill_impl,
+        launch_gluon_dsa_prefill_gfx950 as _dsa_prefill_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
-        gluon_dsa_decode_topk_fp8_gfx950 as _dsa_decode_topk_impl,
+        launch_gluon_dsa_decode_topk_fp8_gfx950 as _dsa_decode_topk_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
-        gluon_dsa_decode_topk_standard_gfx950 as _dsa_decode_topk_standard_impl,
+        launch_gluon_dsa_decode_topk_standard_gfx950 as _dsa_decode_topk_standard_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
-        gluon_dsa_prefill_topk_fp8_gfx950 as _dsa_prefill_topk_impl,
+        launch_gluon_dsa_prefill_topk_fp8_gfx950 as _dsa_prefill_topk_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
-        gluon_dsa_prefill_topk_standard_gfx950 as _dsa_prefill_topk_standard_impl,
+        launch_gluon_dsa_prefill_topk_standard_gfx950 as _dsa_prefill_topk_standard_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.attention import (
-        gluon_dsa_decode_gfx1250 as _dsa_decode_gfx1250_impl,
+        launch_gluon_dsa_decode_gfx1250 as _dsa_decode_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.attention import (
-        gluon_dsa_prefill_gfx1250 as _dsa_prefill_gfx1250_impl,
+        launch_gluon_dsa_prefill_gfx1250 as _dsa_prefill_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (
-        gluon_dsa_decode_topk_fp8_gfx1250 as _dsa_decode_topk_gfx1250_impl,
+        launch_gluon_dsa_decode_topk_fp8_gfx1250 as _dsa_decode_topk_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (
-        gluon_dsa_decode_topk_standard_gfx1250 as _dsa_decode_topk_standard_gfx1250_impl,
+        launch_gluon_dsa_decode_topk_standard_gfx1250 as _dsa_decode_topk_standard_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (
-        gluon_dsa_prefill_topk_fp8_gfx1250 as _dsa_prefill_topk_gfx1250_impl,
+        launch_gluon_dsa_prefill_topk_fp8_gfx1250 as _dsa_prefill_topk_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (
-        gluon_dsa_prefill_topk_standard_gfx1250 as _dsa_prefill_topk_standard_gfx1250_impl,
+        launch_gluon_dsa_prefill_topk_standard_gfx1250 as _dsa_prefill_topk_standard_gfx1250_impl,
     )
 
     @register_kernel(

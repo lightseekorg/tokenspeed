@@ -52,7 +52,7 @@ _BF16_IN_FP32_OUT = {
     ),
     signatures=_BF16_IN_FP32_OUT,
     priority=Priority.SPECIALIZED,
-    traits={"out_dtype": frozenset({"float32"})},
+    traits={"out_dtype": frozenset({torch.float32})},
 )
 def cute_dsl_ll_bf16_router(
     hidden_states: torch.Tensor,

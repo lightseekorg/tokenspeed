@@ -33,7 +33,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.moe import (
-        gluon_dsv4_select_experts_gfx950 as _select_experts_impl,
+        launch_gluon_dsv4_select_experts_gfx950 as _select_experts_impl,
     )
 
     @register_kernel(

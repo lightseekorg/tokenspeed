@@ -16,6 +16,7 @@ Usage:
 import argparse
 import csv
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -24,28 +25,31 @@ from pathlib import Path
 LEN_ORDER = ["32k", "64k", "128k", "256k", "512k", "1024k"]
 
 # Speculative-decoding acceptance keys produced by different evalscope versions.
-# Newer evalscope[perf] (>= the version installed by this CI job) reports
-# "Avg Decoded Tokens/Iter". Older evalscope used "Decoded Tok/Iter".
+# Current evalscope[perf] reports "Avg Decoded Tok/Iter". Other versions used
+# "Avg Decoded Tokens/Iter" or "Decoded Tok/Iter".
 # "Spec Decode Acceptance (%)" is a percent-form alternative on some builds.
 AR_KEYS = (
+    "Avg Decoded Tok/Iter",
     "Avg Decoded Tokens/Iter",
     "Decoded Tok/Iter",
     "Spec Decode Acceptance (%)",
 )
 
 
-def _extract_ar(summary: dict, source: str) -> float:
+def _extract_ar(summary: dict, source: str) -> float | None:
     """Return MTP acceptance rate (avg decoded tokens per iter).
 
     Prefers the new evalscope key, falls back to the old one. Treats the
     percent-form acceptance as `1 + pct/100` only if it's the sole signal
-    available.  Warns (not silent zero) when no known key is present.
+    available. Missing metrics remain unavailable instead of becoming zero.
     """
-    for key in ("Avg Decoded Tokens/Iter", "Decoded Tok/Iter"):
+    for key in AR_KEYS[:-1]:
         v = summary.get(key)
         if v is not None:
             try:
-                return float(v)
+                value = float(v)
+                if math.isfinite(value):
+                    return value
             except (TypeError, ValueError):
                 pass
     pct = summary.get("Spec Decode Acceptance (%)")
@@ -53,15 +57,31 @@ def _extract_ar(summary: dict, source: str) -> float:
         try:
             # acceptance% is the fraction of draft tokens accepted; convert to
             # an avg-decoded-tokens-per-iter approximation only as a fallback.
-            return 1.0 + float(pct) / 100.0
+            value = 1.0 + float(pct) / 100.0
+            if math.isfinite(value):
+                return value
         except (TypeError, ValueError):
             pass
     print(
         f"[warn] {source}: none of {AR_KEYS} found in benchmark_summary.json; "
-        f"acceptance rate will be reported as 0",
+        f"acceptance rate will be reported as N/A",
         file=sys.stderr,
     )
-    return 0.0
+    return None
+
+
+def _extract_tpot(summary: dict, source: Path) -> float:
+    key = "Avg TPOT (ms)" if "Avg TPOT (ms)" in summary else "TPOT (ms)"
+    raw = summary.get(key)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        value = float("nan")
+    if isinstance(raw, bool) or not math.isfinite(value) or value <= 0:
+        raise ValueError(
+            f"{source}: {key} must be a finite positive number, got {raw!r}"
+        )
+    return value
 
 
 def _len_key(length: str) -> int:
@@ -91,10 +111,13 @@ def collect(sweep_dir: Path):
         try:
             s = json.loads(summary_path.read_text())
         except (OSError, json.JSONDecodeError) as e:
-            print(f"[warn] skip {summary_path}: {e}", file=sys.stderr)
-            continue
-        tpot_ms = s.get("TPOT (ms)") or 0.0
-        tps_user = 1000.0 / tpot_ms if tpot_ms else 0.0
+            raise ValueError(
+                f"{summary_path}: cannot read benchmark summary: {e}"
+            ) from e
+        if not isinstance(s, dict):
+            raise ValueError(f"{summary_path}: benchmark summary must be a JSON object")
+        tpot_ms = _extract_tpot(s, summary_path)
+        tps_user = 1000.0 / tpot_ms
         ar = _extract_ar(s, str(summary_path))
         total_tps = float(s.get("Total Throughput (tok/s)") or 0.0)
         rows.append(
@@ -102,7 +125,7 @@ def collect(sweep_dir: Path):
                 "prompt_len": length,
                 "run": run_id,
                 "tps_per_user": round(tps_user, 2),
-                "acceptance_rate": round(ar, 4),
+                "acceptance_rate": round(ar, 4) if ar is not None else None,
                 "total_throughput": round(total_tps, 2),
                 "tpot_ms": round(tpot_ms, 3),
             }
@@ -121,6 +144,7 @@ def aggregate(rows):
         group = by_len[length]
         tps_vals = [r["tps_per_user"] for r in group]
         ar_vals = [r["acceptance_rate"] for r in group]
+        complete_ar = all(value is not None for value in ar_vals)
         thr_vals = [r["total_throughput"] for r in group]
         n = len(group)
         summary.append(
@@ -130,9 +154,11 @@ def aggregate(rows):
                 "avg_tps_per_user": round(sum(tps_vals) / n, 2) if n else 0.0,
                 "min_tps_per_user": min(tps_vals) if tps_vals else 0.0,
                 "max_tps_per_user": max(tps_vals) if tps_vals else 0.0,
-                "avg_acceptance_rate": round(sum(ar_vals) / n, 4) if n else 0.0,
-                "min_acceptance_rate": min(ar_vals) if ar_vals else 0.0,
-                "max_acceptance_rate": max(ar_vals) if ar_vals else 0.0,
+                "avg_acceptance_rate": (
+                    round(sum(ar_vals) / n, 4) if complete_ar else None
+                ),
+                "min_acceptance_rate": min(ar_vals) if complete_ar else None,
+                "max_acceptance_rate": max(ar_vals) if complete_ar else None,
                 "avg_total_throughput": round(sum(thr_vals) / n, 2) if n else 0.0,
             }
         )
@@ -167,11 +193,15 @@ def print_table(rows, summary):
     print(sep)
     for s in summary:
         tps_rng = f"{s['min_tps_per_user']:.1f} - {s['max_tps_per_user']:.1f}"
-        ar_rng = f"{s['min_acceptance_rate']:.2f} - {s['max_acceptance_rate']:.2f}"
+        ar_avg = "N/A"
+        ar_rng = "N/A"
+        if s["avg_acceptance_rate"] is not None:
+            ar_avg = f"{s['avg_acceptance_rate']:.3f}"
+            ar_rng = f"{s['min_acceptance_rate']:.2f} - {s['max_acceptance_rate']:.2f}"
         print(
             f"{s['prompt_len']:<8}  {s['n_runs']:>4}  "
             f"{s['avg_tps_per_user']:>13.2f}  {tps_rng:>17}  "
-            f"{s['avg_acceptance_rate']:>8.3f}  {ar_rng:>15}  "
+            f"{ar_avg:>8}  {ar_rng:>15}  "
             f"{s['avg_total_throughput']:>14.2f}"
         )
     print()
@@ -250,7 +280,10 @@ def main():
     if not args.sweep_dir.is_dir():
         sys.exit(f"Not a directory: {args.sweep_dir}")
 
-    rows = collect(args.sweep_dir)
+    try:
+        rows = collect(args.sweep_dir)
+    except (OSError, ValueError) as exc:
+        sys.exit(str(exc))
     summary = aggregate(rows)
     print_table(rows, summary)
     if args.output:

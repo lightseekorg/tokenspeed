@@ -147,6 +147,7 @@ Inside the root `tokenspeed-kernel/` directory:
 * Vendor-specific tests should be placed under `test/<vendor>/` subdirectory.
   Tests for common infra and covering multi-vendors reside under `test/`
   directly.
+* Use tight atol/rtol in correctness comparison tests.
 
 ## tokenspeed-kernel-amd
 
@@ -158,3 +159,11 @@ Inside the root `tokenspeed-kernel-amd/` directory:
   common platform utilities and reference computations.
 * For per kernel contract and algorithm details, put in
   `python/tokenspeed_kernel_amd/ops/README.md`.
+* For Triton/Gluon kernels, one name should thread the whole stack: the
+  `register_kernel(name=...)` value, the registered Python `def` it decorates,
+  and the `@gluon.jit` (or `@triton.jit`) kernel that does the op's work all
+  share it. The AMD Python launcher should be called as `launch_<name>`.
+  Extra kernels launched only by that op insert a role before the arch suffix
+  (`gluon_mha_decode_reduce_gfx950`). Kernels shared by several registered ops
+  keep descriptive names. A `repr=` on the jit decorator replaces the compiled
+  symbol, so its base string must be the kernel's `def` name as well.

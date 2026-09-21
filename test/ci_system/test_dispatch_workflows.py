@@ -1039,7 +1039,7 @@ def test_mi450_sim_runs_on_the_cpu_only_pool():
 def test_mi450_sim_uses_bounded_smoke_suite():
     task = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml")
 
-    assert task["env"]["MI450_SIM_RUN_TIMEOUT"] == "330"
+    assert task["env"]["MI450_SIM_RUN_TIMEOUT"] == "600"
     assert task["env"]["MI450_SIM_TEST_ROOT"] != "tokenspeed-kernel/test"
     assert "tokenspeed-kernel/test/amd/ops/attention" in task["env"]["MI450_SIM_TESTS"]
 

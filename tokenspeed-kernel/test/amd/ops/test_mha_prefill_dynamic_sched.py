@@ -54,7 +54,7 @@ if not is_cdna4():
     )
 
 from tokenspeed_kernel_amd.ops.gfx950.attention.mha.prefill import (  # noqa: E402
-    gluon_mha_prefill_gfx950,
+    launch_gluon_mha_prefill_gfx950,
 )
 
 _SEQLEN = 4096
@@ -99,7 +99,7 @@ def _run(q, k, v, seqlens: list[int], threshold: float, **kwargs):
     cu = [0]
     for s in seqlens:
         cu.append(cu[-1] + s)
-    return gluon_mha_prefill_gfx950(
+    return launch_gluon_mha_prefill_gfx950(
         q=q,
         k=k,
         v=v,
