@@ -39,6 +39,7 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
     dense_ranges,
     gather_index_cache,
     pack_index_queries,
+    quantize_index_queries,
     safe_metadata,
     write_selection,
 )
@@ -342,18 +343,6 @@ def _hopper_api(queries):
     return deep_gemm
 
 
-def _quantize_index_queries(index_q):
-    """Return E4M3 queries and the per-(token, head) scale to fold into weights.
-
-    Mirrors the ``index_v4`` cache codec so queries and keys are quantized the
-    same way. DeepGEMM's FP8 logits kernels take no query scale of their own.
-    """
-    values = index_q.float()
-    scale = values.abs().amax(-1, keepdim=True).clamp_min(1.0e-6) / 448.0
-    quantized = (values / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-    return quantized.contiguous(), scale.squeeze(-1)
-
-
 def _index_pages(cache):
     """View a strided [pages, 64, 132] index field as its contiguous page bytes."""
     return cache.as_strided(
@@ -583,9 +572,8 @@ def hopper_index_topk(
     dense = page_table.stride(0) == 0 and n > 1
     budget = (128 if dense else 32) << 20
     tile = min(query_chunk_size, max(1, budget // (capacity * 4)))
-    queries, query_scales = _quantize_index_queries(index_q)
     # The logits kernels apply no query scale, so it rides in the weights.
-    folded = (weights.float() * query_scales).contiguous()
+    queries, folded = quantize_index_queries(index_q, weights)
     keys = None
     if dense:
         logical = torch.arange(capacity, dtype=torch.int64, device=index_q.device)

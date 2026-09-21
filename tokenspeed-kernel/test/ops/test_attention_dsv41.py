@@ -633,6 +633,31 @@ def test_index_topk_selects_top_scores_on_every_index_format(device, fmt, shared
     assert relengths[3] == 0
 
 
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_index_query_quantization_matches_the_reference_codec(device, contiguous):
+    # The fused quantizer replaces a chain of eager ops, so it has to reproduce
+    # them bit for bit: the E4M3 payload decides which rows a pass scores, and
+    # the folded weight carries the query scale the logits kernels never apply.
+    # A head-major view is the shape a projection hands over before any copy.
+    torch.manual_seed(51)
+    q = torch.randn((5, 32, 128), dtype=torch.bfloat16, device=device)
+    weights = torch.rand((5, 32), dtype=torch.bfloat16, device=device)
+    if not contiguous:
+        q = q.transpose(0, 1).contiguous().transpose(0, 1)
+        assert not q.is_contiguous()
+    quantized, folded = implementation.quantize_index_queries(q, weights)
+
+    values = q.float()
+    scale = values.abs().amax(-1, keepdim=True).clamp_min(1.0e-6) / 448.0
+    expected = (values / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    torch.testing.assert_close(
+        quantized.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        folded, weights.float() * scale.squeeze(-1), rtol=0, atol=0
+    )
+
+
 def test_candidate_block_max_not_sum(device):
     k = torch.zeros((17, 128), dtype=torch.bfloat16, device=device)
     k[0, 0] = 6
