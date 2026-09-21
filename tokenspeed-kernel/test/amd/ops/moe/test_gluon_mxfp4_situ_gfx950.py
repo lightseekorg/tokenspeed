@@ -81,6 +81,10 @@ def _a8w4_ep_plan(intermediate_size: int) -> dict:
             ispp=intermediate_size,
             internal_activation_dtype="input",
             solution="gluon",
+            hidden=None,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
         )
 
 
@@ -426,6 +430,10 @@ def test_ep_unclipped_situ_uses_a16_fallback_gfx950() -> None:
         ispp=intermediate_size,
         internal_activation_dtype="input",
         solution="gluon",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
 
     tokenspeed_kernel.moe_process_weights(plan, module)
@@ -489,6 +497,10 @@ def test_ep_decode_all_remote_routes_return_zero_gfx950(
         ispp=512,
         internal_activation_dtype="input",
         solution="gluon",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     tokenspeed_kernel.moe_process_weights(plan, module)
     actual = tokenspeed_kernel.moe_apply(
@@ -538,6 +550,10 @@ def test_gluon_grouped_a16w4_situ_matches_kimi_k3_shape_gfx950() -> None:
         routing_mode="precomputed_topk",
         internal_activation_dtype="input",
         solution="gluon",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     tokenspeed_kernel.moe_process_weights(plan, module)
     actual = tokenspeed_kernel.moe_apply(
@@ -713,6 +729,10 @@ def test_gluon_grouped_device_align_localizes_global_ep_routes_gfx950() -> None:
         ispp=intermediate_size,
         internal_activation_dtype="input",
         solution="gluon",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     tokenspeed_kernel.moe_process_weights(plan, module)
     actual = tokenspeed_kernel.moe_apply(
@@ -791,6 +811,10 @@ def test_mxfp4_situ_virtual_ep_sum_matches_global_reference_gfx950(
         ispp=512,
         internal_activation_dtype="input",
         solution="gluon",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
 
     partials = []
@@ -883,6 +907,10 @@ def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
         ispp=512,
         internal_activation_dtype="input",
         solution="gluon",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     tokenspeed_kernel.moe_process_weights(plan, module)
     expected = tokenspeed_kernel.moe_apply(
@@ -958,6 +986,10 @@ def test_tp_situ_selects_a8w4_and_matches_reference_gfx950(
         ispp=intermediate_size,
         internal_activation_dtype="input",
         solution="gluon",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     assert plan["apply_kernel_name"] == "gluon_mxfp4_a8w4_situ_precomputed_moe_apply"
     tokenspeed_kernel.moe_process_weights(plan, module)
@@ -1351,6 +1383,10 @@ def test_tp_situ_package_prefill_block64_matches_block128_gfx950(
         ispp=intermediate_size,
         internal_activation_dtype="input",
         solution="gluon",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     tokenspeed_kernel.moe_process_weights(plan, module)
 
@@ -1527,6 +1563,10 @@ def test_tp_situ_joint_shared_projection_gfx950(num_tokens: int) -> None:
         ispp=384,
         internal_activation_dtype="input",
         solution="gluon",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     tokenspeed_kernel.moe_process_weights(plan, module)
     routed_reference = tokenspeed_kernel.moe_apply(

@@ -675,21 +675,18 @@ def decode_window(
     write_slots,
     read_slots,
     read_lens,
-    status,
     swa_table,
-    tail_table,
     swa_pages,
-    tail_pages,
 ):
-    """Fill SWA addresses and history errors for N logical query coordinates.
+    """Fill SWA addresses for N logical query coordinates.
 
     positions/requests are integer [N] in consecutive request-major spans;
-    spans may have different lengths. Tables are LCM group pages. Destinations
-    are write_slots[N], read_slots[N,128], read_lens[N], status[N]. Only the
-    first live row of each span reports history errors: bit 0 for missing SWA
-    history, bit 1 for a required compressor tail. Internal pairs use current
-    projections, not retained tails. Padding status is zero. Page zero and
-    pages beyond the supplied capacities never address live cache. Returns None.
+    spans may have different lengths. swa_table holds LCM group pages.
+    Destinations are write_slots[N], read_slots[N,128] and read_lens[N].
+    Padding rows (negative position or request) resolve to -1. Page zero and
+    pages beyond swa_pages never address live cache. Whether the window's
+    history is resident is the scheduler's retention contract, not checked
+    here. Returns None.
     """
     if not positions.is_cuda:
         from tokenspeed_kernel.ops.attention.mla._triton.page_table import (
@@ -706,23 +703,6 @@ def decode_window(
         write_slots.copy_(
             bounded_group_slots(positions, requests, swa_table, 64, 1, 1, swa_pages)
         )
-        missing_swa = ((wanted >= 0) & (wanted < positions[:, None]) & (slots < 0)).any(
-            -1
-        )
-        previous = (positions - 1).masked_fill(
-            (positions < 0) | (positions % 2 != 1), -1
-        )
-        tail = bounded_group_slots(previous, requests, tail_table, 2, 1, 1, tail_pages)
-        window_start = (positions >= 0) & (requests >= 0)
-        window_start[1:] &= (requests[1:] != requests[:-1]) | (
-            positions[1:] != positions[:-1] + 1
-        )
-        status.copy_(
-            (
-                missing_swa.to(torch.int32)
-                | (((previous >= 0) & (tail < 0)).to(torch.int32) * 2)
-            ).masked_fill(~window_start, 0)
-        )
         return
     _kernel("decode_window", positions)(
         positions,
@@ -730,11 +710,8 @@ def decode_window(
         write_slots,
         read_slots,
         read_lens,
-        status,
         swa_table,
-        tail_table,
         swa_pages,
-        tail_pages,
     )
 
 

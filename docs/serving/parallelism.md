@@ -85,6 +85,13 @@ packed weights and block scales in the padded tail are zero-filled, so the
 extra dimensions do not change the MoE result. For example, a 640-wide expert
 under MoE TP4 is padded from 160 to 192 values per rank.
 
+On Hopper, MXFP4 routed experts with a SiLU/SwiGLU activation and dense EP
+(`--all2all-backend none`) default to the FlashInfer CUTLASS mixed-input
+kernel (`flashinfer_cutlass`), which needs the per-rank intermediate size and
+the hidden size to be multiples of 128. Other widths, SiTU experts and DeepEP
+all-to-all layouts keep `marlin`. `--moe-mxfp4-fp8-activation` selects its
+W4A8 variant.
+
 ### Kimi-K3 attention DP with MoE EP
 
 With `none`, `agrs`, or `flashinfer` transport and attention DP greater than one,

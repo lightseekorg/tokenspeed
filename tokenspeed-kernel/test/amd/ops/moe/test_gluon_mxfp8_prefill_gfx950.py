@@ -115,6 +115,10 @@ def _plan(policy: str):
         ispp=3072,
         internal_activation_dtype=policy,
         solution="gluon",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
 
 

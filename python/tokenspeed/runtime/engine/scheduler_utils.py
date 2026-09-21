@@ -677,6 +677,8 @@ def packed_block_tables_from_forward_op(
 def _classify_param(name: str) -> str:
     """Bucket a parameter/buffer name into a weight group for the memory
     summary. Names follow the Kimi-K3 / DeepSeek module layout."""
+    if ".engram." in name:
+        return "engram_weights"
     if "self_attn" in name or ".attn." in name or "kv_a" in name or "q_a" in name:
         return "attention_weights"
     if (
@@ -761,6 +763,7 @@ def log_gpu_memory_summary(
             "attention_weights": 0,
             "moe_weights": 0,
             "dense_mlp_weights": 0,
+            "engram_weights": 0,
             "other_weights": 0,
         }
         seen: set[int] = set()
@@ -817,6 +820,10 @@ def log_gpu_memory_summary(
             ("Dense/MLP weights", groups["dense_mlp_weights"] / GB),
             ("Other weights (embed/head/norm)", groups["other_weights"] / GB),
         ]
+        # Engram tables are only listed when resident on the device; with
+        # --engram-host-table they live in host memory and are not counted.
+        if groups["engram_weights"]:
+            rows.append(("Engram weights (tables/wkv)", groups["engram_weights"] / GB))
         if draft_model is not None:
             rows.append(("Draft model weights", draft_gb))
         rows += [
