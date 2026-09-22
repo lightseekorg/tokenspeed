@@ -176,7 +176,17 @@ def _load_builtin_generators() -> None:
         prepare_dense_bmm,
         prepare_mxfp8_mm,
     )
+    from tokenspeed_kernel.benchmark.generators.kda import (
+        prepare_kda_paged_decode,
+        prepare_kda_paged_prefill,
+    )
 
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "kda_paged_decode"), prepare_kda_paged_decode
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "kda_paged_prefill"), prepare_kda_paged_prefill
+    )
     _BENCHMARK_GENERATORS.setdefault(("gemm", "bmm"), prepare_dense_bmm)
     _BENCHMARK_GENERATORS.setdefault(("gemm", "mm"), prepare_mxfp8_mm)
 
@@ -208,7 +218,6 @@ class KernelBenchmarkResult:
     min_us: float | None = None
     max_us: float | None = None
     relative_mad: float | None = None
-    calls_per_graph: int = 0
     eager_warmup_iterations: int = 0
     replay_warmup_iterations: int = 0
     measurement_blocks: int = 0
@@ -262,8 +271,13 @@ class KernelBenchmarkHarness:
         self._timer = timer
         self._platform_provider = platform_provider
 
-    def run(self, request: BenchmarkRequest) -> KernelBenchmarkResult:
-        """Run one request and return a success or explicit failure result."""
+    def run(
+        self,
+        request: BenchmarkRequest,
+        *,
+        measurement_blocks: int,
+    ) -> KernelBenchmarkResult:
+        """Run one request for the requested sample count and return its result."""
 
         started = time.perf_counter()
         try:
@@ -356,6 +370,7 @@ class KernelBenchmarkHarness:
             measurement = self._timer.measure(
                 prepared.invocation,
                 cold_cache=request.cold_cache,
+                measurement_blocks=measurement_blocks,
             )
         except GraphBenchmarkError as exc:
             status = _GRAPH_STATUS_BY_PHASE.get(
@@ -507,7 +522,6 @@ class KernelBenchmarkHarness:
             min_us=measurement.min_us,
             max_us=measurement.max_us,
             relative_mad=measurement.relative_mad,
-            calls_per_graph=measurement.calls_per_graph,
             eager_warmup_iterations=measurement.eager_warmup_iterations,
             replay_warmup_iterations=measurement.replay_warmup_iterations,
             measurement_blocks=len(measurement.samples_us),

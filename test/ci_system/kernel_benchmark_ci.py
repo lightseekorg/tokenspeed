@@ -49,10 +49,14 @@ CLASSIFICATIONS = (
 )
 
 _TIMER_FIELDS = (
-    "calls_per_graph",
     "eager_warmup_iterations",
     "replay_warmup_iterations",
     "measurement_blocks",
+)
+_SUITE_TIMER_FIELDS = (
+    "eager_warmup_iterations",
+    "replay_warmup_iterations",
+    "_sample_contract",
 )
 _KERNEL_REQUIREMENTS = Path("tokenspeed-kernel/python/requirements/rocm.txt")
 
@@ -102,7 +106,14 @@ def validate_run_document(
                 f"benchmark run revision {run['revision']} does not match "
                 f"{expected_revision}"
             )
-        timer = {field: run["timer"][field] for field in _TIMER_FIELDS}
+        raw_timer = run["timer"]
+        timer = {field: raw_timer[field] for field in _TIMER_FIELDS}
+        legacy_calls = raw_timer.get("calls_per_graph")
+        timer["_sample_contract"] = (
+            "single_operation_graph_replay"
+            if legacy_calls in (None, 1)
+            else f"legacy_{legacy_calls}_operation_graph_replay"
+        )
         environment = {
             field: run["environment"][field]
             for field in ("vendor", "arch", "device_name")
@@ -170,12 +181,6 @@ def _measurement_comparison(
                 f"{label} benchmark returned {result.get('status', 'unknown')}",
             )
 
-    if base_result["registration_name"] != candidate_result["registration_name"]:
-        return _empty_comparison(
-            case_id,
-            "invalid",
-            "selected kernel registrations differ between revisions",
-        )
     if any(
         base_result[field] != candidate_result[field]
         for field in ("timing_mode", "metric", "unit")
@@ -216,6 +221,12 @@ def _measurement_comparison(
         classification = "within_budget"
         detail = "change does not exceed both regression budgets"
 
+    if base_result["registration_name"] != candidate_result["registration_name"]:
+        detail += (
+            "; selected registration changed from "
+            f"{base_result['registration_name']} to "
+            f"{candidate_result['registration_name']}"
+        )
     if policy != candidate_policy:
         detail += "; candidate policy changed, so the baseline policy was used"
 
@@ -291,7 +302,10 @@ def compare_runs(
             )
 
         environments_match = base["environment"] == candidate["environment"]
-        timers_match = base["timer"] == candidate["timer"]
+        suite_timers_match = all(
+            base["timer"][field] == candidate["timer"][field]
+            for field in _SUITE_TIMER_FIELDS
+        )
 
         for case_id in sorted(candidate_cases.keys() | base_cases.keys()):
             base_case = base_cases.get(case_id)
@@ -324,7 +338,7 @@ def compare_runs(
             if (
                 base_case["comparison_epoch"] != candidate_case["comparison_epoch"]
                 or base_case["definition"] != candidate_case["definition"]
-                or not timers_match
+                or not suite_timers_match
             ):
                 classification = (
                     "changed" if _case_succeeded(candidate_case) else "invalid"
@@ -481,8 +495,8 @@ def render_summary(report: Mapping[str, Any]) -> str:
             "",
             (
                 "Comparisons require matching comparison epochs, benchmark "
-                "definitions, timing settings, registrations, and hardware. The "
-                "merge-base policy supplies the regression and noise budgets."
+                "definitions, timing settings, and hardware. The merge-base "
+                "policy supplies the regression and noise budgets."
             ),
         ]
     )

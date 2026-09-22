@@ -49,7 +49,7 @@ sys.path.insert(0, _TEST_DIR)
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
 from ci_system.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=90, suite="runtime-1gpu")
+register_cuda_ci(est_time=180, suite="runtime-1gpu")
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_hopper_plus, reason="PDL requires NVIDIA SM90+"
@@ -121,16 +121,53 @@ def restore_pdl():
         pdl_enabled(previous)
 
 
+@pytest.fixture
+def forbid_cake_backend(request, monkeypatch):
+    if request.node.callspec.params["solution"] != "flashinfer":
+        yield
+        return
+
+    decode = pytest.importorskip("flashinfer.gdn_decode")
+    prefill = pytest.importorskip("flashinfer.gdn_prefill")
+    from tokenspeed_kernel.ops.attention.gdn._flashinfer import adapter
+
+    def unexpected_cake(*args, **kwargs):
+        pytest.fail("GDN must retain the CuTe implementation wrapped for PDL")
+
+    runners = (adapter._decode_runner, adapter._prefill_runner)
+    for runner in runners:
+        runner.cache_clear()
+    monkeypatch.setattr(decode, "_run_cake_gdn_decode_pretranspose", unexpected_cake)
+    monkeypatch.setattr(prefill, "_run_cake_gdn_prefill", unexpected_cake)
+    try:
+        yield
+    finally:
+        # Private namespaces copied the patched globals; never retain them.
+        for runner in runners:
+            runner.cache_clear()
+
+
 @pytest.mark.parametrize("batch", [1, 8])
 @pytest.mark.parametrize("steps", [1, 4])
 @pytest.mark.parametrize("solution", ["triton", "flashinfer"])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-def test_gdn_chain_pdl_toggle(batch, steps, solution, state_dtype, restore_pdl):
+@pytest.mark.parametrize("heads,value_heads", [(4, 12), (4, 8)])
+def test_gdn_chain_pdl_toggle(
+    batch,
+    steps,
+    solution,
+    state_dtype,
+    heads,
+    value_heads,
+    restore_pdl,
+    forbid_cake_backend,
+):
     if solution == "flashinfer" and not flashinfer_gdn.is_decode_available():
         pytest.skip("FlashInfer GDN unavailable")
     torch.manual_seed(31)
-    # TP4 Qwen3.8 uses 4 QK / 12 V heads; MTP with 3 draft steps verifies T=4.
-    heads, value_heads, dim = 4, 12, 128
+    # TP4 Qwen3.8 uses 4 QK / 12 V heads; 4 / 8 also covers Cake-admitted
+    # head grouping. MTP with 3 draft steps verifies T=4.
+    dim = 128
     rows = batch * steps
     qkv_width = (2 * heads + value_heads) * dim
     qkvz_width = qkv_width + value_heads * dim
@@ -265,20 +302,23 @@ def test_gdn_chain_pdl_toggle(batch, steps, solution, state_dtype, restore_pdl):
 
 
 @pytest.mark.parametrize("solution", ["triton", "flashinfer"])
-def test_gdn_prefill_pdl_toggle(solution, restore_pdl):
+@pytest.mark.parametrize("heads,value_heads", [(4, 8), (16, 32), (16, 64)])
+def test_gdn_prefill_pdl_toggle(
+    solution, heads, value_heads, restore_pdl, forbid_cake_backend
+):
     if solution == "flashinfer" and not flashinfer_gdn.is_supported(
-        128, torch.bfloat16, 4, 8
+        128, torch.bfloat16, heads, value_heads
     ):
         pytest.skip("FlashInfer SM100 prefill unavailable")
     torch.manual_seed(41)
     q, k = [
-        torch.randn(1, 130, 4, 128, device="cuda", dtype=torch.bfloat16)
+        torch.randn(1, 130, heads, 128, device="cuda", dtype=torch.bfloat16)
         for _ in range(2)
     ]
-    v = torch.randn(1, 130, 8, 128, device="cuda", dtype=q.dtype)
-    gate = -torch.rand(1, 130, 8, device="cuda")
-    beta = torch.rand(1, 130, 8, device="cuda", dtype=q.dtype)
-    state = torch.randn(2, 8, 128, 128, device="cuda")
+    v = torch.randn(1, 130, value_heads, 128, device="cuda", dtype=q.dtype)
+    gate = -torch.rand(1, 130, value_heads, device="cuda")
+    beta = torch.rand(1, 130, value_heads, device="cuda", dtype=q.dtype)
+    state = torch.randn(2, value_heads, 128, 128, device="cuda")
     cu = torch.tensor([0, 65, 130], device="cuda", dtype=torch.int32)
 
     query_source = q.clone()
@@ -317,6 +357,12 @@ def test_gdn_prefill_pdl_toggle(solution, restore_pdl):
         with torch.cuda.graph(graph):
             result = forward()
         names, edges = _graph_kernel_edges(graph)
+        if solution == "flashinfer":
+            gdn_nodes = {name for name in names.values() if "gdn" in name.lower()}
+            assert gdn_nodes, names
+            gdn_edges = [edge for edge in edges if edge[1] in gdn_nodes]
+            assert gdn_edges, edges
+            assert all(edge_type == int(enabled) for _, _, edge_type in gdn_edges)
         custom = (
             "l2norm",
             "chunk_",

@@ -235,10 +235,16 @@ class ForwardStepRunner:
         self.overlap_schedule_depth = config.overlap_schedule_depth
         self.dp_size = config.data_parallel_size
         self.world_size = config.world_size
-        # User intent (enforce_eager) OR a backend-declared restriction
-        # (resolve_cuda_graph_support in ModelExecutor); the unified refresh
-        # still serves eager decode either way.
-        self.disable = config.enforce_eager or not decode_graph_supported
+        # User intent (enforce_eager), a backend-declared restriction
+        # (resolve_cuda_graph_support in ModelExecutor), or a role with no
+        # decode step to capture: the prefill role of a disaggregated
+        # deployment runs extend forwards only, and its verify-width-1
+        # attention configuration has no verify scratch for a DECODE-shaped
+        # dummy anyway. The unified refresh still serves eager decode either
+        # way; the prefill graph is gated separately (PrefillGraph.disable).
+        self.disable = (
+            config.enforce_eager or not decode_graph_supported or config.prefill_only
+        )
         # Backends alias their cache_seqlens buffer. Draft backend aliases
         # the drafter-owned draft_seq_lens to keep InputBuffers read-only.
         attn_backend.init_cuda_graph_state(
