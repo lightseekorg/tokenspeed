@@ -233,7 +233,6 @@ class SparseIndexScoreKernel:
         # Every global read of another kernel's output sits behind this wait,
         # including the visibility bound the epilogue masks with.
         cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
         visible = gVisible[token]
 
         if warp_id == self.NUM_MMA_WARPS:
@@ -447,6 +446,12 @@ class SparseIndexScoreKernel:
                 stage = (stage + 1) % num_stages
                 if stage == 0:
                     parity ^= 1
+
+        # Successors read the scores this kernel writes, so they are released
+        # once every warp's stores are in memory, not on entry. The kernel has
+        # no early return, so both the gather and the MMA warps reach this.
+        cute.arch.sync_threads()
+        cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit
     def _store(self, gOut, token, tile, local_row, acc, scale, block, visible):
