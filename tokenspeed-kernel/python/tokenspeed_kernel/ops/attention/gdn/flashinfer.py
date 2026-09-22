@@ -142,11 +142,10 @@ if is_available():
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
-            "head_v_dim": frozenset({SUPPORTED_HEAD_DIM}),
-            "head_v_eq_head_k": frozenset({True}),
+            "value_head_dim": frozenset({SUPPORTED_HEAD_DIM}),
             "num_v_gte_num_q": frozenset({True}),
-            "qk_l2norm": frozenset({False, True}),
             "output_h": frozenset({False, True}),
+            "qk_l2norm": frozenset({False, True}),
         },
     )
     def flashinfer_gdn_chunk_prefill(
@@ -249,6 +248,9 @@ if is_available():
             # upstream. Disabling CP can slow long-context GDN prefill but
             # does not change correctness.
             use_cp=False,
+            # Keep the CuTe implementation wrapped by our PDL adapter; 0.7.0's
+            # default auto backend may otherwise bypass it through Cake GDN.
+            backend="flashinfer",
             enable_pdl=pdl_enabled(),
         )
 
@@ -332,6 +334,7 @@ if is_decode_available():
         dt_bias = dt_bias.detach().float()
         out, _ = _gated_delta_rule_decode_pretranspose(
             enable_pdl=pdl_enabled(),
+            backend="flashinfer",
             q=q,
             k=k,
             v=v,

@@ -249,18 +249,17 @@ def test_deepseek_dspark_wire_target_only_binds_resources():
     target.set_dspark_layers_to_capture.assert_not_called()
 
 
-def test_dspark_weight_update_forces_cached_head_refresh():
-    drafter = mock.MagicMock(spec=DeepseekV4DSpark)
-    head = mock.MagicMock()
-    drafter.lm_head = mock.MagicMock(weight=head)
-    drafter.model = mock.MagicMock()
-
-    DeepseekV4DSpark.on_target_weights_updated(drafter)
-
-    drafter.model.refresh_local_base_logits_head.assert_called_once_with(
-        head,
-        force=True,
+@pytest.mark.parametrize("drafter_cls", [DeepseekV4DSpark, DeepseekV41DSpark])
+def test_dspark_weight_update_needs_no_derived_head_refresh(drafter_cls):
+    # The draft reads the target's BF16 head in place, so an in-place target
+    # weight update needs no drafter-side refresh: the base no-op applies.
+    assert (
+        drafter_cls.on_target_weights_updated is BaseDrafter.on_target_weights_updated
     )
+    drafter = mock.MagicMock(spec=drafter_cls)
+    drafter.model = mock.MagicMock()
+    drafter_cls.on_target_weights_updated(drafter)
+    assert drafter.model.mock_calls == []
 
 
 def test_device_weight_update_notifies_drafter_before_returning():

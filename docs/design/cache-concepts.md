@@ -213,22 +213,31 @@ skipped intermediate checkpoints as null holes (`0`). State consumers may gather
 input/output slots; compacting the row or publishing an unwritten intermediate
 checkpoint would break position identity.
 
-Publication requires provenance, not just an allocated block or completed hash.
-The request's cache progress keeps every aligned boundary whose state is
-written but not yet hashed: the checkpoint a scheduled prefill materializes
-(carried through the same ordered-forward contract as its token progress) and
-each accepted endpoint a landed result stops on. Verification commits only its
-accepted endpoint; a boundary it crosses proves nothing and is never recorded.
-Admission, finish and retraction pass the list to the coordinator, which
-publishes each recorded boundary inside the newly hashed range and no other —
-several in one admission when the overlap schedule lands two results back to
-back — before retention can reclaim the slot. Entries leave the list only after
-the admission that hashed them succeeds, so a failed attempt retries. The
-hashed range comes from `Request::NumComputedTokens()`, which is exact under
-any verify width ([Scheduler §5](scheduler.md#5-invariants-a-change-must-preserve)),
-so an aligned accepted endpoint is hashed by the very next admission rather
-than after a lag of up to the verify width. Remote endpoint-only landings do
-not claim an internal prefill checkpoint, only their endpoint when aligned.
+Computed state publication requires an Endpoint or Promoted boundary and
+checkpoint provenance at that exact prefix boundary. Scheduled local prefill
+records its last aligned checkpoint; endpoint-only PD records only an aligned
+final state, not an earlier internal checkpoint. The coordinator publishes
+only recorded boundaries covered by the newly hashed range. A successful
+admission discards those records; a failed one leaves them for retry.
+Allocated slots and completed hashes alone are not proof.
+
+Ordinary computed Chunks have no prefix-index reference and do not stream to
+Host. Their working references follow normal block-table reclamation.
+Newly completed prefill boundaries at the prompt's last aligned checkpoint
+are classified as Endpoint, unless already Promoted, including before a short
+final tail. A step with no newly completed hash does not reclassify a boundary.
+`PrefillDone` can publish pending prefill state before decode or PD handoff;
+decode itself records and publishes no state checkpoints. History publication
+and working-state retention use the exact `Request::NumComputedTokens()`
+frontier under every verify width
+([Scheduler §5](scheduler.md#5-invariants-a-change-must-preserve)).
+
+Host restores still use `CacheFullBlocks` and may register `kChunk` entries.
+All cached checkpoints remain subject to ordinary capacity eviction; Endpoint
+does not pin storage. Allocation, reservations and transfer fences are unchanged.
+Finish queues existing prefill checkpoints for L2 without upgrading their kind.
+With L2, prefill retraction may publish a computed recovery Endpoint; decode
+retraction uses available prefill cache and recomputes the suffix.
 
 Snapshot selection and slot addressing are distinct even within this mapping:
 the last internal reusable checkpoint is at
@@ -622,13 +631,13 @@ Its responsibilities:
   stream to the Host tier (`stream_device_cache_to_host_`); a
   `pending_stores_` queue drives D2H transfers, alongside Host-side
   acquire/contains/pin queries. During prefill, each completed scheduling
-  boundary queues all newly published full-attention pages and one checkpoint
-  per snapshot-state group; the pending candidates are merged into a batched
+  boundary queues all newly published full-attention pages and any published
+  Endpoint/Promoted state checkpoints; the candidates are merged into a batched
   writeback. The first decode admission from `PrefillDone` applies the same
-  policy to the final prompt boundary. Ordinary decode still publishes Device
-  entries but does not stream full-attention or snapshot-state entries to
-  Host. At finish or retraction, all eligible Device-resident non-state pages
-  and only the newest Device-resident checkpoint per state group are queued
+  policy to the final prompt boundary. Ordinary decode publishes history-cache
+  Device entries but no state entries; full-attention pages do not stream to
+  Host during decode. At finish or retraction, eligible non-state Device pages
+  and the newest existing prefill checkpoint per state group are queued
   before request ownership is released. Ordinary sliding-window entries
   always stream when published. The queue is drained by
   `TierTransferManager::StartPendingStores(guard)`: every store but a

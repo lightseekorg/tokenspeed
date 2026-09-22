@@ -88,6 +88,7 @@ from tokenspeed.runtime.execution.types import (
     PlannedForward,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.env import envs
 
 logger = get_colorful_logger(__name__)
 
@@ -786,6 +787,39 @@ class DeviceHandle:
         return self._thread.run(_apply_update)
 
 
+def arm_data_plane_sync_debug(device: str) -> None:
+    """Arm torch's sync-debug mode for the serving phase when asked to.
+
+    Startup synchronizes on purpose -- weight loading, tuning, graph capture,
+    the PD transfer and L2 executor builders, the EPD admission's NCCL
+    warm-up in ``EventLoop.__init__`` -- so the loop arms the mode as its
+    very last step before entering the round loop. It is process-wide:
+    the control plane's ``copy_event.synchronize()`` and non-blocking D2H
+    copies are not flagged, so what it reports is exactly the host
+    synchronization that serializes the data plane against the step in
+    flight -- ``.cpu()``, ``.item()``, ``.tolist()``, ``bool(tensor)``,
+    ``nonzero``, pageable host<->device copies, ``stream.synchronize()``.
+    """
+    mode = envs.TOKENSPEED_DATA_PLANE_SYNC_DEBUG.get()
+    if mode == "default":
+        return
+    if mode not in ("warn", "error"):
+        raise ValueError(
+            f"TOKENSPEED_DATA_PLANE_SYNC_DEBUG must be default, warn or error, got {mode!r}"
+        )
+    if torch.device(device).type != "cuda":
+        logger.warning(
+            f"TOKENSPEED_DATA_PLANE_SYNC_DEBUG={mode!s} ignored on {device!s}: "
+            "sync-debug mode is a CUDA facility"
+        )
+        return
+    torch.cuda.set_sync_debug_mode(mode)
+    logger.info(
+        f"Data-plane sync debug armed ({mode!s}): host synchronizations on the "
+        "serving path are reported"
+    )
+
+
 def build_device_side(
     *,
     server_args,
@@ -851,9 +885,7 @@ def build_device_side(
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
-    from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
-
-    logger = get_colorful_logger(__name__)
+    from tokenspeed.runtime.utils import set_random_seed
 
     target, draft = create_model_runner(
         server_args, model_config, draft_model_config, gpu_id, global_rank

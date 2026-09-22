@@ -218,6 +218,9 @@ class ServerArgs:
     # MoE backend
     moe_backend: str = "auto"
     draft_moe_backend: str | None = None
+    # Opt-in: run MXFP4 routed experts with FP8 activations (FlashInfer cutlass
+    # W4A8 on Hopper). Off keeps the checkpoint's BF16 activation contract.
+    moe_mxfp4_fp8_activation: bool = False
     all2all_backend: str = "none"
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
@@ -781,7 +784,7 @@ class ServerArgs:
     def resolve_disaggregation(self):
         # Pipeline parallelism is a prefill-node-only capability: the chunk
         # pipeline needs the P role's structural guarantees (no decode token
-        # feedback, eager execution, non-overlap loop).
+        # feedback, non-overlap loop).
         if self.pipeline_parallel_size > 1:
             # Debug escape hatch: run PP without PD to validate the stage
             # pipeline numerically (prefill + first token only — decode
@@ -799,7 +802,11 @@ class ServerArgs:
                     "for pipeline validation; only prefill/first-token output "
                     "is meaningful"
                 )
-                self.enforce_eager = True
+            # A pipeline stage threads its boundary state through an eager
+            # stage forward (ModelExecutor._run_target_forward); no graph
+            # subsystem captures that, so every stage runs eager.
+            self.enforce_eager = True
+            logger.info("CUDA graph is disabled under pipeline parallelism")
             if self.mapping.has_attn_dp:
                 raise ValueError(
                     "--pipeline-parallel-size > 1 with attention DP is not "
@@ -838,11 +845,11 @@ class ServerArgs:
             raise ValueError(
                 "--pp-layer-partition requires --pipeline-parallel-size > 1"
             )
-        # PD disaggregation
-        if self.disaggregation_mode == "prefill":
-            self.enforce_eager = True
-            logger.warning("CUDA graph is disabled for prefill server")
-        elif self.disaggregation_mode == "decode":
+        # PD disaggregation. The prefill role keeps the ordinary graph flags:
+        # it never runs a decode step, so the decode graph has nothing to
+        # capture (ModelExecutorConfig.prefill_only), while its extend
+        # forwards replay the prefill graph like any server's.
+        if self.disaggregation_mode == "decode":
             # Prefix caching stays configurable for decode servers.
             logger.info(
                 f"enable_prefix_caching={self.enable_prefix_caching!r} for decode "
@@ -1503,6 +1510,17 @@ class ServerArgs:
             default=ServerArgs.moe_backend,
             help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm, "
             "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe",
+        )
+        parser.add_argument(
+            "--moe-mxfp4-fp8-activation",
+            action="store_true",
+            help="Run MXFP4 routed experts with FP8 activations (on Hopper the "
+            "FlashInfer cutlass W4A8 Humming MoE: about 1.8x faster than the "
+            "default W4A16 path, a few percent of relative error on the expert "
+            "outputs; validate the served model before relying on it). Applies to "
+            "every MXFP4 expert layer, target and draft; the MoE plan fails at "
+            "startup where the selected backend has no FP8-activation kernel for "
+            "the layer.",
         )
         parser.add_argument(
             "--draft-moe-backend",

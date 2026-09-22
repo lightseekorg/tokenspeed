@@ -39,7 +39,7 @@ _TOTAL_GRID = 896 // 4 + 3584 // 16 + 768 // 4
 
 
 @gluon.jit
-def _latent_input_decode_kernel(
+def gluon_latent_input_decode_gfx950(
     hidden_ptr,
     router_weight_ptr,
     routed_weight_ptr,
@@ -159,7 +159,7 @@ def _latent_input_decode_kernel(
     gl.store(shared_out_ptr + offs_n, gate * up)
 
 
-def gluon_latent_input_decode_gfx950(
+def launch_gluon_latent_input_decode_gfx950(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,
     routed_down_weight: torch.Tensor,
@@ -208,7 +208,7 @@ def gluon_latent_input_decode_gfx950(
     shared_out = torch.empty(
         (1, 768), dtype=torch.bfloat16, device=hidden_states.device
     )
-    _latent_input_decode_kernel[(_TOTAL_GRID,)](
+    gluon_latent_input_decode_gfx950[(_TOTAL_GRID,)](
         hidden_states,
         router_weight,
         routed_down_weight,
@@ -226,4 +226,4 @@ def gluon_latent_input_decode_gfx950(
     return router_out, routed_out, shared_out
 
 
-__all__ = ["gluon_latent_input_decode_gfx950"]
+__all__ = ["launch_gluon_latent_input_decode_gfx950"]

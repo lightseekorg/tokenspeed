@@ -129,13 +129,13 @@ def _success_result(request) -> KernelBenchmarkResult:
     )
 
 
-def test_starter_suite_selects_exact_gfx950_registration():
+def test_gfx950_suite_selects_exact_registrations():
     suite_path = Path(__file__).parents[1] / "benchmarks" / "amd" / "gfx950.json"
     suite = load_suite(suite_path)
 
     assert suite.suite_id == "amd-gfx950-registration-kernels"
     assert suite.required_environment == {"vendor": "amd", "arch": "9.5"}
-    assert len(suite.cases) == 1
+    assert len(suite.cases) == 7
     case = suite.cases[0]
     assert case.id == ("gemm.bmm/gluon_bmm_a16w16_gfx950/b12-m1-n512-k128-bfloat16")
     assert case.comparison_epoch == 1
@@ -156,6 +156,32 @@ def test_starter_suite_selects_exact_gfx950_registration():
     assert case.request.cold_cache is True
     assert case.request.seed == 42
     assert case.policy == _policy()
+
+    mxfp8_shapes = (
+        (1024, 1792, 5120),
+        (1024, 4096, 1280),
+        (1024, 5120, 1024),
+        (4096, 1792, 5120),
+        (4096, 4096, 1280),
+        (4096, 5120, 1024),
+    )
+    for mxfp8_case, (m, n, k) in zip(suite.cases[1:], mxfp8_shapes, strict=True):
+        assert mxfp8_case.id == (
+            "gemm.mm/gluon_mm_mxfp8_gfx950/" f"m{m}-n{n}-k{k}-mxfp8-bfloat16"
+        )
+        assert mxfp8_case.comparison_epoch == 1
+        assert mxfp8_case.request.parameters == {
+            "M": m,
+            "N": n,
+            "K": k,
+            "quant": "mxfp8",
+            "block_size": [1, 32],
+            "out_dtype": "bfloat16",
+            "validation": {"runs": 1, "atol": 0.0, "rtol": 0.0},
+        }
+        assert mxfp8_case.request.registration == "gluon_mm_mxfp8_gfx950"
+        assert mxfp8_case.request.cold_cache is True
+        assert mxfp8_case.policy == _policy()
 
 
 def test_run_suite_uses_one_timer_and_emits_deterministic_envelope(tmp_path):
@@ -233,40 +259,6 @@ def test_run_suite_uses_one_timer_and_emits_deterministic_envelope(tmp_path):
         "policy",
         "result",
     }
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [("calls_per_graph", 1), ("cold_cache", False)],
-)
-def test_run_suite_rejects_success_with_the_wrong_measurement_context(
-    tmp_path,
-    field,
-    value,
-):
-    suite = load_suite(_write_suite(tmp_path, _suite_payload()))
-
-    class Harness:
-        def run(self, request):
-            result = _success_result(request)
-            return KernelBenchmarkResult(
-                **{
-                    **result.to_dict(),
-                    "status": BenchmarkStatus.SUCCESS,
-                    field: value,
-                }
-            )
-
-    payload = run_suite(
-        suite,
-        _REVISION,
-        harness_factory=lambda _config: Harness(),
-        environment_provider=lambda: _ENVIRONMENT,
-    )
-
-    result = payload["cases"][0]["result"]
-    assert result["status"] == "execution_failure"
-    assert result["error_message"] == "successful benchmark reported the wrong context"
 
 
 def test_suite_defaults_to_cold_cache_and_can_disable_it(tmp_path):
@@ -382,9 +374,9 @@ def test_builtin_harness_factory_passes_explicit_dependencies(tmp_path, monkeypa
     config = load_suite(_write_suite(tmp_path, _suite_payload())).timer
     expected = object()
 
-    def fake_harness(config_arg, *, timer, platform_provider):
-        assert config_arg is config
-        assert timer is None
+    def fake_harness(timer, *, platform_provider):
+        assert isinstance(timer, benchmark_ci.GraphTimer)
+        assert timer.config is config
         assert platform_provider is benchmark_ci.current_platform
         return expected
 

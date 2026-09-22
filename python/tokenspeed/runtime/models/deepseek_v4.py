@@ -1963,6 +1963,11 @@ class DeepseekV4MoE(nn.Module):
             self.shared_experts = None
 
         if self.use_mega_moe:
+            if global_server_args_dict["moe_mxfp4_fp8_activation"]:
+                raise ValueError(
+                    "--moe-mxfp4-fp8-activation selects the FlashInfer cutlass W4A8 "
+                    "MoE; it does not apply to MegaMoE"
+                )
             self.experts = DeepseekV4MegaMoEExperts(
                 num_experts=config.n_routed_experts,
                 num_local_experts=config.n_routed_experts // mapping.moe.ep_size,

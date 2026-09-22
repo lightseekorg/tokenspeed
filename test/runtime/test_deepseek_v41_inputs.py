@@ -806,6 +806,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     )
     executor.input_buffers = ib
     executor.model_runner = runner
+    executor.drafter = None
     pg = PrefillGraph.__new__(PrefillGraph)
     pg.config = executor.config
     pg.input_buffers = ib
@@ -844,6 +845,63 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         ("group", None),
         "barrier",
     ]
+
+
+def test_autotune_covers_the_draft_experts_once_per_geometry(monkeypatch):
+    """The tuning prefill drives the target only; the draft's own expert
+    geometry (DSpark: 128 experts) is tuned by one apply per distinct plan."""
+    from tokenspeed.runtime.layers.moe.expert import MoELayer
+
+    def moe_layer(prefix, num_experts, a2a="none", solution="flashinfer_cutlass"):
+        layer = MoELayer.__new__(MoELayer)
+        torch.nn.Module.__init__(layer)
+        layer.prefix = prefix
+        layer.hidden_size, layer.intermediate_size = 64, 32
+        layer.num_experts, layer.top_k = num_experts, 3
+        layer.input_dtype = torch.float16
+        layer.plan = {
+            "apply_kernel_name": "fake_apply",
+            "a2a_backend": a2a,
+            "solution": solution,
+            "support_routing": False,
+            "supports_precomputed_topk": True,
+        }
+        return layer
+
+    class Draft(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = moe_layer("draft.a", 128)
+            self.b = moe_layer("draft.b", 128)  # same geometry: tuned once
+            self.c = moe_layer("draft.c", 64)  # different geometry
+            self.d = moe_layer("draft.d", 128, a2a="deepep")  # collective: skipped
+
+    calls = []
+
+    def fake_apply(plan, x, layer, router_logits, **kwargs):
+        calls.append((layer.prefix, tuple(x.shape), kwargs["topk_ids"]))
+        # Synthetic activations must carry the dtype the plan was signed for
+        # (--dtype float16 drafts plan FP16 inputs, not BF16).
+        assert x.dtype == layer.input_dtype
+        return x
+
+    monkeypatch.setattr(model_executor.tokenspeed_kernel, "moe_apply", fake_apply)
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.device = torch.device("cpu")
+    executor.drafter = SimpleNamespace(
+        draft_model_runner=SimpleNamespace(model=Draft())
+    )
+
+    executor._autotune_draft_experts(16)
+
+    assert [(c[0], c[1]) for c in calls] == [
+        ("draft.a", (16, 64)),
+        ("draft.c", (16, 64)),
+    ]
+    for _, _, ids in calls:
+        assert ids.dtype == torch.int32
+        # Distinct ids per token: FlashInfer's permutation rejects repeats.
+        assert all(len(set(row.tolist())) == 3 for row in ids)
 
 
 def test_execute_idle_forward_passes_empty_engram_views(buffers):

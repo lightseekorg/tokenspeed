@@ -13,8 +13,8 @@ env:
   BUILD_AND_DOWNLOAD_PARALLEL: "4"
   CI: "true"
   GFX_ARCH: gfx1250
-  # Keep emulation within the PR lane's five-and-a-half-minute execution budget.
-  MI450_SIM_RUN_TIMEOUT: "330"
+  # Keep emulation within the PR lane's ten-minute execution budget.
+  MI450_SIM_RUN_TIMEOUT: "600"
   # A ceiling on concurrent simulators. A simulator takes two CPU threads.
   MI450_SIM_WORKERS: "16"
   # rocJITsu is a functional simulator, so run architecture-specific compile and
@@ -152,6 +152,20 @@ env:
     tokenspeed-kernel/test/ops/moe/test_softmax_topk.py::test_triton_matches_softmax_topk[2-896-16-dtype4-True]
     tokenspeed-kernel/test/ops/moe/test_softmax_topk.py::test_triton_matches_softmax_topk[7-16-3-dtype3-False]
     tokenspeed-kernel/test/ops/moe/test_softmax_topk.py::test_public_entry_point_is_cuda_graph_capturable
+    # MXFP8 decode projections.
+    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_ue8m0_gemv_matches_dequantized_reference[16-256-288]
+    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_split_k_matches_direct[ue8m0-576-5120-5]
+    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_gfx1250_gemv_uses_native_pipeline[ue8m0-16-5120-v_wmma_scale_f32_16x16x128_f8f6f4]
+    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_gemv_matches_dequantized_reference[1-128-128]
+    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_gemv_matches_dequantized_reference[16-256-512]
+    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_split_k_matches_direct[fp32-128-4096-2]
+    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_gfx1250_gemv_uses_native_pipeline[fp32-128-7168-v_wmma_f32_16x16x128_fp8_fp8]
+    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_fused_tdm_matches_single_wave
+    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_split_k_selection[fp32-15-1536-4096-4]
+    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_split_k_selection[ue8m0-16-1792-5120-5]
+    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_tdm_fusion_selection[fp32-16-2048-7168-1-0]
+    tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[ue8m0-False-gluon_mm_mxfp8_ue8m0_gfx1250]
+    tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[fp32-True-gluon_mm_fp8_blockscale_gfx1250]
   TORCH_DEVICE_PACKAGE: amd-torch-device-gfx1250==2.14.0+rocm10.1.0a20260822
   TORCH_INDEX_URL: https://rocm.nightlies.amd.com/whl-multi-arch/
   TORCH_VERSION: 2.14.0+rocm10.1.0a20260822

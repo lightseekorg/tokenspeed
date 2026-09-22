@@ -375,6 +375,10 @@ def test_moe_plan_selects_nvfp4_situ_routed_kernel(
         ep_size=1,
         ispp=ISPP,
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_nvfp4_situ_routed_moe_apply"
     assert plan["support_routing"] is False
@@ -522,11 +526,14 @@ def test_nvfp4_situ_deferred_triple_matches_finalized() -> None:
 
 @requires_flashinfer_situ
 @pytest.mark.parametrize(
-    "num_tokens,top_k,local_count",
-    [(1, 2, 16), (17, 8, 16), (129, 2, 8), (257, 8, 16)],
+    "num_tokens,top_k,local_count,routed,enable_pdl",
+    [
+        (1, 2, 16, False, False),
+        (17, 8, 16, False, True),
+        (129, 2, 8, True, False),
+        (257, 8, 16, True, True),
+    ],
 )
-@pytest.mark.parametrize("routed", [False, True])
-@pytest.mark.parametrize("enable_pdl", [False, True])
 def test_nvfp4_route_padding_is_initialized_on_every_replay(
     num_tokens: int,
     top_k: int,

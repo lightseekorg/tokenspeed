@@ -21,7 +21,7 @@
 """Dispatch of ``skip_softmax_threshold`` in ``mha_prefill``.
 
 Zero leaves the pre-existing call form untouched; non-zero routes to a kernel
-declaring the ``support_skip_softmax`` trait, and raises ``NoKernelFoundError``
+declaring the ``skip_softmax`` trait, and raises ``NoKernelFoundError``
 where there is none.
 """
 
@@ -91,7 +91,7 @@ def test_mha_prefill_nonzero_threshold_routes_to_gfx950_gluon(
         k=torch.empty((1, _NUM_KV_HEADS, _HEAD_DIM), dtype=_DTYPE),
         v=torch.empty((1, _NUM_KV_HEADS, _HEAD_DIM), dtype=_DTYPE),
     )
-    traits = {"head_dim": _HEAD_DIM, "support_skip_softmax": True}
+    traits = {"head_dim": _HEAD_DIM, "skip_softmax": True}
 
     selected = select_kernel(
         "attention",

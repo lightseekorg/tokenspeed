@@ -55,6 +55,12 @@ tensor parallelism 2 and three-step MTP. It keeps KVStore enabled and uses the
 bounded non-thinking chat template for CI stability. The task requires a score
 of at least 0.96.
 
+The long-context performance report accepts both current EvalScope metrics
+(`Avg TPOT (ms)`, `Avg Decoded Tok/Iter`) and their older names. Missing or
+invalid TPOT fails collection instead of producing a zero-throughput report.
+Unavailable acceptance metrics appear as `N/A` (empty CSV cells); an aggregate
+is unavailable if any run for that prompt length lacks the metric.
+
 Each task expands into one matrix entry per runner label. Add a top-level
 `priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix
 jobs in include-list order, so `high` entries reach a contended runner pool
@@ -85,15 +91,26 @@ score miss. Use it for infrastructure flakes (CUDA launch failure, NVLink
 barrier timeout, GPU memory-access fault) where a clean second attempt is
 cheap relative to a red PR.
 
-The AMD Kimi-K2.5 AIME25 gate writes EvalScope results under
-`.ci-artifacts/published/evalscope-results`. Its CI artifact upload runs on both
-success and failure, including timestamped per-question predictions and scoring
-records. Compare the
+The AMD Kimi-K2.5 AIME25, NVIDIA Kimi-K2.5 EAGLE3 AIME25, and B200 GLM-5.2
+AIME26 gates write EvalScope results under
+`.ci-artifacts/published/evalscope-results`. Their CI artifact upload runs on
+both success and failure, including timestamped per-question predictions and
+scoring records. Compare the
 responses, stop reasons, and extracted answers when investigating an accuracy
 miss before changing the token limit or sampling configuration.
 
+The NVIDIA Kimi-K2.5 EAGLE3 AIME25 gate allows `max_tokens=131072` within a
+262138-token context. EAGLE3 with one speculative step uses two draft tokens;
+its three overlap spans reserve six positions below the model's 262144-token
+limit. A fixed-version diagnostic reproduced a 65536-token
+truncation; with the larger budget, the identical generated prefix continued
+to a correct answer and stopped naturally at 70332 tokens. This single-question
+result motivates the budget; the full 30-question gate still requires 0.93
+accuracy with batch size 16 and greedy sampling. EvalScope records are saved
+under `.ci-artifacts/published/evalscope-results` on success and failure.
+
 The AMD Kimi-K2.5 AIME25 gate allows `max_tokens=65536`, matching the NVIDIA
-Kimi-K2.5 EAGLE3 and DFlash tasks. The same question was truncated in both the
+Kimi-K2.5 DFlash task. The same question was truncated in both the
 [8K run](https://github.com/lightseekorg/tokenspeed/actions/runs/34763795877) and
 [16K run](https://github.com/lightseekorg/tokenspeed/actions/runs/34764637152).
 With the larger budget, the [64K run](https://github.com/lightseekorg/tokenspeed/actions/runs/34765831078)
@@ -272,11 +289,11 @@ finishes. It validates the untrusted artifact and source revision before
 creating or replacing one bot-owned comment. Runs where the benchmark task was
 not selected have no report and are ignored.
 
-The first pull request introducing the benchmark can run only a candidate
-bootstrap because its merge base has no suite. It also cannot trigger its own
-comment publisher because GitHub requires the receiving `workflow_run` workflow
-to exist on the default branch. Manual runs produce summaries and artifacts but
-not pull request comments.
+A merge base that does not contain the suite yields a candidate-only
+bootstrap instead of a comparison. Changes to the comment workflow take effect
+only after they merge, since `workflow_run` workflows execute from the default
+branch. Manual runs produce summaries and artifacts but not pull request
+comments.
 
 `CUDA_VISIBLE_DEVICES=0` does not limit the shared cleanup process scan, so the
 runner must provide scheduler-enforced GPU or process-namespace isolation. The
@@ -452,6 +469,23 @@ hardware. A selected YAML follows the same rule; YAMLs that already declare a
 `slurm-dispatch-gb300` coordinators form one shared pool for manual, nightly,
 and per-commit submissions.
 
+The `GB200 Slurm Per Commit` workflow runs single-node `slurm-gb200-*`
+tasks through the `slurm-dispatch` coordinator. Qwen four-GPU tasks migrated
+from B200 use `slurm-gb200-4gpu`: the 397B NVFP4 AIME25 evaluation, 35B FP8
+DeepEP GSM8K evaluation, and 122B EPD OCRBench evaluation and unit test.
+Their existing commands, triggers, and score thresholds are preserved.
+
+It runs automatically for relevant pushes to `main` and non-draft,
+same-repository pull requests; manual dispatch selects the `manual` trigger.
+The ordinary NVIDIA ARM workflow excludes `slurm-*` tasks. The dedicated
+Slurm scan clears `TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS`, so the Kubernetes
+`gb200` exclusion does not disable these tasks. Closing a PR cancels its run;
+the approved-PR and latest-main retry workflows also cover this workflow.
+
+`Slurm Dispatch` includes `slurm-gb200-4gpu` in its default bulk runners.
+Its default `eval,perf` selection covers the three migrated evaluations;
+select `ut` explicitly to include the EPD unit test.
+
 The `GB300 Slurm Per Commit` workflow selects only multi-node model tasks with
 the `per-commit` trigger and submits them through the same
 `slurm-dispatch-gb300` coordinator pool used by manual dispatch. It runs for
@@ -504,6 +538,10 @@ test/ci/run_slurm.sh \
 # Every existing YAML for one exact runner label:
 test/ci/run_slurm.sh --all --runner gb200-4gpu --trigger manual
 
+# Migrated Qwen four-GPU evaluations and EPD unit test:
+test/ci/run_slurm.sh --all --runner slurm-gb200-4gpu \
+  --type eval --type ut --trigger manual
+
 # List Kimi eval/perf tasks from PR 795 for two runner labels:
 test/ci/run_slurm.sh \
   --pr 795 \
@@ -530,11 +568,22 @@ This is a manual launcher, not a GitHub Actions runner. Override its defaults
 with `TS_CI_ARTIFACT_ROOT`, `TS_CI_CACHE_DIR`, or
 `TS_CI_CONTAINER_IMAGE`.
 
+The default Slurm image pins Torch 2.14.0 and FlashInfer 0.7.0 by image digest.
+Keep the FlashInfer Python requirement, release cubin checksum, and runner
+JIT-cache version aligned when upgrading. FlashInfer 0.7.0 also requires
+cuDNN frontend 1.29.0 or newer and splits its JIT cache into provider packages.
+GB200/B200 setup resolves those providers from the matching FlashInfer CUDA
+index and checks their installed versions again after dependency installation.
+
 `--pr` accepts a pull request number or GitHub URL. It fetches the PR head and
 merges it into the launcher's committed `HEAD` in an isolated temporary
 worktree. The original checkout is not modified, and submitted jobs use an
 immutable archive of that merged commit. A merge conflict stops before any job
 is submitted.
+
+Concurrent submissions publish each commit's snapshot without replacing an
+existing archive. Reuse requires byte-for-byte agreement with a fresh Git
+archive; a mismatched snapshot fails submission and is left unchanged.
 
 `--source-pr` accepts the same values but only labels the report; it neither
 fetches nor merges, and is for callers that already checked out the pull

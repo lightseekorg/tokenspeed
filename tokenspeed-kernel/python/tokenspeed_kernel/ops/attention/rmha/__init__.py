@@ -115,8 +115,8 @@ def rel_mha_plan(
 
     traits = {
         "head_dim": head_dim,
-        "sliding_window": window_left >= 0,
         "return_lse": return_lse,
+        "sliding_window": window_left >= 0,
     }
     signature = format_signature(
         q=dense_tensor_format(dtype),
@@ -190,8 +190,8 @@ def rel_mha_prefill(
 
     traits = {
         "head_dim": q.shape[-1],
-        "sliding_window": window_left >= 0,
         "return_lse": return_lse,
+        "sliding_window": window_left >= 0,
     }
     signature = _attention_format_signature(q=q, k=k, v=v)
     kernel = select_kernel(
@@ -311,8 +311,8 @@ def rel_mha_extend_with_kvcache(
     traits = {
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
-        "sliding_window": window_left >= 0,
         "return_lse": return_lse,
+        "sliding_window": window_left >= 0,
     }
     kernel = select_kernel(
         "attention",
@@ -439,8 +439,8 @@ def rel_mha_decode_with_kvcache(
     traits = {
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
-        "sliding_window": window_left >= 0,
         "return_lse": False,
+        "sliding_window": window_left >= 0,
     }
     kernel = select_kernel(
         "attention",
