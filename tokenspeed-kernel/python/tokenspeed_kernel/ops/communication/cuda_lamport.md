@@ -135,6 +135,3 @@ maximum rank time, and reports the median of five samples. Output restoration
 is included. The benchmark is communication-only: it does not establish a
 projection or model speedup. AG/RS are latency references, not interchangeable
 A2A algorithms; compare their message-size definitions explicitly.
-
-Benchmark results and tuning measurements are recorded in
-[PR #1690](https://github.com/lightseekorg/tokenspeed/pull/1690).
