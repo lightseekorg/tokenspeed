@@ -41,7 +41,6 @@ __all__ = ["prepare_moe_apply", "prepare_sigmoid_bias_topk"]
 
 
 _DTYPE_NAMES = {
-    "bf16": torch.bfloat16,
     "bfloat16": torch.bfloat16,
     "float32": torch.float32,
     "fp32": torch.float32,
