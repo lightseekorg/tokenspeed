@@ -52,7 +52,6 @@ if platform.is_blackwell:
     from tokenspeed_kernel.ops.moe.deep_gemm._triton.mega_moe_stage import (
         stage_mxfp4_mega_moe_inputs,
     )
-    )
 
 
 _MXFP4_BLOCK_SIZE = 32
