@@ -144,8 +144,7 @@ def gluon_attn_res_fwd_gfx1250(
                 N,
             )
             square_sum = gl.sum(value * value, axis=0)
-            # Match the established high-precision score reduction.
-            dot = gl.sum((value * scorer).to(gl.float64), axis=0).to(gl.float32)
+            dot = gl.sum(value * scorer, axis=0)
             score = dot * gl.rsqrt(square_sum / H + SCORE_EPS)
             next_max = gl.maximum(max_logit, score)
             old_scale = gl.exp(max_logit - next_max)
