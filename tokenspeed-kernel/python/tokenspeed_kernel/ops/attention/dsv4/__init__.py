@@ -507,7 +507,7 @@ def dsv4_prefill(
         )
 
 
-_DSV4_PARTIAL_DECODE_TRAITS = {"support_sink": False, "return_lse": True}
+_DSV4_PARTIAL_DECODE_TRAITS = {"return_lse": True, "sinks": False}
 
 
 def dsv4_decode_supports_partials(platform: PlatformInfo) -> bool:
@@ -515,8 +515,8 @@ def dsv4_decode_supports_partials(platform: PlatformInfo) -> bool:
 
     Decode context parallelism attends to each rank's cache shard separately
     and merges the partials through their LSE, so it needs a ``dsv4_decode``
-    kernel registered with ``support_sink`` including False and ``return_lse``
-    including True.
+    kernel explicitly registered with ``sinks`` including False and
+    ``return_lse`` including True.
 
     Args:
         platform: Hardware the kernel must be registered for.
@@ -528,7 +528,10 @@ def dsv4_decode_supports_partials(platform: PlatformInfo) -> bool:
     specs = KernelRegistry.get().get_for_operator(
         "attention", "dsv4_decode", platform=platform
     )
-    return any(spec_matches_traits(spec, _DSV4_PARTIAL_DECODE_TRAITS) for spec in specs)
+    return any(
+        spec_matches_traits(spec, _DSV4_PARTIAL_DECODE_TRAITS, require_all_traits=True)
+        for spec in specs
+    )
 
 
 def dsv4_decode(
