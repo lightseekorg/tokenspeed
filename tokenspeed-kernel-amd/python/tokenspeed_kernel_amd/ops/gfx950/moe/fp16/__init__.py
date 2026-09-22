@@ -38,10 +38,10 @@ Reference shape: DeepSeek-V3 (E=256, D=7168, I=256, topk=8).
 """
 
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_decode import (
-    gluon_latent_input_decode_gfx950,
+    launch_gluon_latent_input_decode_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_small_batch import (
-    gluon_latent_input_small_batch_gfx950,
+    launch_gluon_latent_input_small_batch_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe import gluon_bf16_moe
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_device import (
@@ -69,8 +69,8 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.stage2_kernel import (
 
 __all__ = [
     "gluon_bf16_moe",
-    "gluon_latent_input_decode_gfx950",
-    "gluon_latent_input_small_batch_gfx950",
+    "launch_gluon_latent_input_decode_gfx950",
+    "launch_gluon_latent_input_small_batch_gfx950",
     "invoke_stage1",
     "invoke_stage1_splitk",
     "auto_split_k",

@@ -123,17 +123,17 @@ def _register_flashinfer_trtllm_dsa(
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "page_size": frozenset({64}),
-            "q_len_per_req": q_len_per_req,
+            "q_len": q_len_per_req,
             "qk_nope_head_dim": qk_nope_head_dim,
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": qk_rope_head_dim,
+            "page_size": frozenset({64}),
             "topk": topk,
-            "kv_cache_available": frozenset({True}),
-            "sparse_kv_cache_available": frozenset({False, True}),
-            "topk_layout": frozenset({"global_slots"}),
-            "support_logit_cap": frozenset({False}),
+            "has_kv_cache": frozenset({True}),
+            "has_sparse_kv_cache": frozenset({False, True}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
+            "topk_layout": frozenset({"global_slots"}),
         },
     )
 

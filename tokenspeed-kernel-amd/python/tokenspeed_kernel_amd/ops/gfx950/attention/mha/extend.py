@@ -551,7 +551,7 @@ class ExtendProgram:
 
 
 @gluon.jit
-def _mha_extend(
+def gluon_mha_extend_gfx950(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
@@ -718,7 +718,7 @@ def _mha_extend(
 
 
 @gluon.jit
-def _mha_extend_split(
+def gluon_mha_extend_split_gfx950(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
@@ -878,7 +878,7 @@ def _mha_extend_split(
 
 
 @gluon.jit
-def _mha_extend_reduce(
+def gluon_mha_extend_reduce_gfx950(
     mid_o_ptr,
     mid_lse_ptr,
     out_ptr,
@@ -932,7 +932,7 @@ def _mha_extend_reduce(
 _GFX950_SM_COUNT = 256
 
 
-def gluon_mha_extend_gfx950(
+def launch_gluon_mha_extend_gfx950(
     q: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_kv: torch.Tensor,
@@ -1028,7 +1028,7 @@ def gluon_mha_extend_gfx950(
             split_grid = (ragged_num_q_blocks, n_kv_heads, num_kv_splits)
         else:
             split_grid = (blocks_per_req * num_kv_splits, batch, n_kv_heads)
-        _mha_extend_split[split_grid](
+        gluon_mha_extend_split_gfx950[split_grid](
             q,
             k_cache,
             v_cache,
@@ -1059,7 +1059,7 @@ def gluon_mha_extend_gfx950(
             num_warps=num_warps,
         )
         reduce_grid = (total_q, n_heads)
-        _mha_extend_reduce[reduce_grid](
+        gluon_mha_extend_reduce_gfx950[reduce_grid](
             mid_o,
             mid_lse,
             output,
@@ -1080,7 +1080,7 @@ def gluon_mha_extend_gfx950(
         grid = (ragged_num_q_blocks, n_kv_heads)
     else:
         grid = (blocks_per_req, batch, n_kv_heads)
-    _mha_extend[grid](
+    gluon_mha_extend_gfx950[grid](
         q,
         k_cache,
         v_cache,

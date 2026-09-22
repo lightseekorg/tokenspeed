@@ -954,11 +954,32 @@ enabled, or the draft checkpoint contains only MTP/NextN weights. External
 DSpark checkpoints that do not advertise this capability keep the generic
 scheduler behavior.
 
-Same-checkpoint DSpark materializes a stable FP32 view of the local target
-LM-head shard before cache sizing. Public FP32 Markov logits then reuse this
-buffer instead of converting the complete shard during every CUDA Graph
-replay. In-place target weight updates refresh the existing buffer outside the
-replay, preserving the address captured by CUDA Graph.
+Same-checkpoint DSpark computes its public FP32 base logits straight from the
+target's BF16 LM-head shard: BF16 products are exact in FP32, so a BF16 GEMM
+with an FP32 accumulator reproduces the reference's FP32 head math up to
+summation order without an FP32 copy of the shard. The head is read in place
+under CUDA Graph replay, so in-place target weight updates need no refresh.
+
+The greedy block sampler runs one Triton kernel per block step on each
+tensor-parallel rank: it gathers the previous token's BF16 Markov bigram row
+from a replicated table, adds the bigram bias (a BF16 tensor-core dot against
+the rank's Markov projection shard, which is sharded like the LM head) to the
+rank's base logits, and packs the best `(logit, token)` of every vocabulary
+tile into one int64 candidate. One all-gather per step shares the candidates;
+the next step's kernel (or the final resolve) reduces them to the
+`torch.argmax` winner over the whole vocabulary, ties broken toward the lowest
+token id. A five-token block is therefore six kernels and five all-gathers
+instead of a per-step chain of masked embedding lookups, GEMMs, reductions and
+two all-gathers.
+
+Engram's per-step inputs follow the same pattern. Before each forward, one
+pinned upload carries every request's history snapshot, and two launches
+(`fill_ngram_history`) seed the per-slot accepted prefixes and write every
+input row's previous-three tokens and validity mask, blanking the graph
+padding rows. Inside the forward, `engram_hash` maps the current token and its
+three predecessors, applies the per-layer multipliers, rolling XOR and prime
+buckets, and emits the table rows for all Engram layers in one launch; its
+output is bit-identical to the eager reference, which remains the CPU path.
 
 The CUDA draft path also preserves the checkpoint's UE8M0-scaled FP8 activation
 round-trip with a fused `tokenspeed-kernel` operation. It computes the same
@@ -1006,7 +1027,6 @@ tokenspeed serve deepseek-ai/DeepSeek-V4.1-Flash \
   --trust-remote-code \
   --tensor-parallel-size 8 \
   --enable-expert-parallel \
-  --moe-backend marlin \
   --dtype bfloat16 \
   --max-model-len 32768 \
   --max-total-tokens 262144 \
@@ -1017,6 +1037,27 @@ tokenspeed serve deepseek-ai/DeepSeek-V4.1-Flash \
   --host 0.0.0.0 \
   --port 8000
 ```
+
+On Hopper the routed MXFP4 experts run on FlashInfer's CUTLASS mixed-input
+grouped GEMM (`flashinfer_cutlass_mxfp4_w4a16_moe_apply`), which `auto`
+selects over Marlin. Marlin dequantizes in registers and scales linearly with
+the token count; the CUTLASS kernel stays weight-bandwidth bound. Measured per
+MoE layer on one EP8 rank of an H20 (µs, CUDA-graph replay): 502 vs 656 at 96
+tokens, 621 vs 1552 at 192, 671 vs 2855 at 576, 4517 vs 7999 at an 8192-token
+prefill chunk. Two consequences:
+
+- Startup runs FlashInfer's tactic autotuner inside the kernel tuning window
+  (about five minutes for this kernel on H20). `--disable-autotune` skips it
+  and serves heuristic tactics, which is fine for bring-up.
+- `--moe-mxfp4-fp8-activation` switches to the W4A8 variant (FP8 activations,
+  Humming residual scales): 282/338/380/2195 µs at the same token counts,
+  another 1.8x, at a few percent of relative error on the expert outputs
+  (FP8 activation rounding). Treat it as opt-in and confirm the served model
+  on GSM8K or a similar check before relying on it.
+
+`--moe-backend marlin` keeps the previous kernel, and stays required for
+DeepEP all-to-all layouts and for Kimi-K3's SiTU experts, which the CUTLASS
+epilogue does not implement.
 
 Add `--speculative-algorithm DSPARK` for same-checkpoint DSpark decoding;
 the draft seeds its context windows from the decoder's kept rows, and each

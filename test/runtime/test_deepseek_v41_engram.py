@@ -268,6 +268,9 @@ def test_bounded_shard_loading_and_four_way_lookup(tmp_path, monkeypatch):
     def reduce_local(tensor, group, backend, op):
         assert group == (4, 5, 6, 7)  # not WORLD or the other attention DP replica
         assert backend is None and op == torch.distributed.ReduceOp.SUM
+        # One row per token: [rows, columns * head_dim] keeps a decode batch
+        # inside the workspace all-reduce's row window.
+        assert tensor.shape == (1, 10 * width)
         return tensor
 
     monkeypatch.setattr(engram, "all_reduce", reduce_local)
@@ -342,6 +345,17 @@ def _model(device, quant_config):
         device,
         False,
         "gpu",
+    )
+
+
+def test_engram_reduce_lane_is_one_row_per_token():
+    """The embedding reduces [tokens, n_hash_cols * head_dim] across attention
+    TP; the lane armed for it is that width (V4.1-Flash: 24 * 256 = 6144),
+    not head_dim with n_hash_cols folded into the rows, which would overflow
+    the one-shot row window on every decode batch."""
+    layout = engram.EngramLayout.from_config(_config())
+    assert engram.engram_reduce_lane_width(layout) == (
+        (layout.max_ngram_size - 1) * layout.n_heads * layout.head_dim
     )
 
 
@@ -421,6 +435,31 @@ def test_quantized_projection_loader_aliases_and_real_table_metadata(config_clas
         assert large.scale.shape == (96004171, 8)
         assert large.weight.element_size() == large.scale.element_size() == 1
         assert large.row_end <= 384016682
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_hash_kernel_matches_the_cpu_chain():
+    """The fused hash kernel reproduces the eager reference bit for bit."""
+    config = _config()
+    cpu, cuda = (EngramHashState(config, _Tokenizer(), d) for d in ("cpu", "cuda:0"))
+    torch.manual_seed(5)
+    vocab = cpu.token_map.shape[0]
+    ids = torch.randint(0, vocab, (513,))
+    previous = torch.randint(-1, vocab, (513, 3))
+    mask = torch.rand(513) > 0.25
+    # Masked-out current ids may be clamped image placeholders outside the vocab.
+    ids[~mask] = 999_999
+    expected = cpu(ids, previous, mask)
+    actual = cuda(ids.cuda(), previous.cuda(), mask.cuda())
+    assert actual.device.type == "cuda" and actual.dtype == torch.int64
+    assert torch.equal(actual.cpu(), expected)
+    # Any leading shape is preserved, as with the eager chain.
+    batched = cuda(
+        ids.cuda().view(3, 171),
+        previous.cuda().view(3, 171, 3),
+        mask.cuda().view(3, 171),
+    )
+    assert torch.equal(batched.cpu(), expected.view(3, 171, *expected.shape[1:]))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

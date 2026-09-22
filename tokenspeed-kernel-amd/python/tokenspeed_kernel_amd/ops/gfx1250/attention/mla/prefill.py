@@ -544,7 +544,7 @@ def store_empty_query_block(program: AttentionProgram):
 
 
 @gluon.jit
-def _mla_prefill_gfx1250_kernel(
+def gluon_mla_prefill_gfx1250(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -664,7 +664,7 @@ def get_config(
     )
 
 
-def gluon_mla_prefill_gfx1250(
+def launch_gluon_mla_prefill_gfx1250(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -742,7 +742,7 @@ def gluon_mla_prefill_gfx1250(
         max_seqlen_q=max_seqlen_q,
         softmax_scale=softmax_scale,
     )
-    _mla_prefill_gfx1250_kernel[config.grid](
+    gluon_mla_prefill_gfx1250[config.grid](
         q,
         k,
         v,

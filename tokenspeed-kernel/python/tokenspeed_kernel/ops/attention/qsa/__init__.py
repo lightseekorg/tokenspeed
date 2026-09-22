@@ -151,12 +151,12 @@ def qsa_sparse_attention(
     traits = {
         "batch_size": q.shape[0] // query_width,
         "q_len": query_width,
-        "is_decode": max_seqlen_q is not None,
-        "head_dim": q.shape[-1],
-        "value_head_dim": v_cache.shape[-1],
         "num_q_heads": q.shape[1],
         "num_kv_heads": k_cache.shape[1],
+        "head_dim": q.shape[-1],
+        "value_head_dim": v_cache.shape[-1],
         "selected_width": selected_slots.shape[1],
+        "is_decode": max_seqlen_q is not None,
     }
     signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
     kernel = select_kernel(

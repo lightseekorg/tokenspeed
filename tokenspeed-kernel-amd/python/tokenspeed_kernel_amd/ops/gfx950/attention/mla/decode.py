@@ -1951,7 +1951,7 @@ def _gluon_mla_decode_gfx950(
     return out
 
 
-def gluon_mla_decode_bf16xbf16_gfx950_bh16bn64(*args, **kwargs):
+def launch_gluon_mla_decode_bf16xbf16_gfx950_bh16bn64(*args, **kwargs):
     """Run the fixed BLOCK_H=16, (batch, split) BF16 MLA decode regime."""
     return _gluon_mla_decode_gfx950(
         *args,
@@ -1960,7 +1960,7 @@ def gluon_mla_decode_bf16xbf16_gfx950_bh16bn64(*args, **kwargs):
     )
 
 
-def gluon_mla_decode_bf16xbf16_gfx950_bh64(*args, **kwargs):
+def launch_gluon_mla_decode_bf16xbf16_gfx950_bh64(*args, **kwargs):
     """Run the fixed BLOCK_H=64, XCD-aware BF16 MLA decode regime."""
     return _gluon_mla_decode_gfx950(
         *args,
@@ -1969,7 +1969,7 @@ def gluon_mla_decode_bf16xbf16_gfx950_bh64(*args, **kwargs):
     )
 
 
-def gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock(*args, **kwargs):
+def launch_gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock(*args, **kwargs):
     """Run the fixed BLOCK_H=16 small-batch BF16 MLA decode regime."""
     return _gluon_mla_decode_gfx950(
         *args,
@@ -1978,7 +1978,7 @@ def gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock(*args, **kwargs):
     )
 
 
-def gluon_mla_decode_bf16xbf16_gfx950_bh64_small(*args, **kwargs):
+def launch_gluon_mla_decode_bf16xbf16_gfx950_bh64_small(*args, **kwargs):
     """Run the fixed BLOCK_H=64 small-batch BF16 MLA decode regime."""
     return _gluon_mla_decode_gfx950(
         *args,
@@ -2013,13 +2013,13 @@ def gluon_mla_decode_bf16xbf16_gfx950(
         )
     batch_size, _, nhead, _ = q.shape
     if 1 <= nhead <= 16:
-        impl = gluon_mla_decode_bf16xbf16_gfx950_bh16bn64
+        impl = launch_gluon_mla_decode_bf16xbf16_gfx950_bh16bn64
     elif nhead == 64 and batch_size == 1:
-        impl = gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock
+        impl = launch_gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock
     elif nhead == 64 and batch_size in (2, 4):
-        impl = gluon_mla_decode_bf16xbf16_gfx950_bh64_small
+        impl = launch_gluon_mla_decode_bf16xbf16_gfx950_bh64_small
     elif nhead in (64, 128) and batch_size % 64 == 0:
-        impl = gluon_mla_decode_bf16xbf16_gfx950_bh64
+        impl = launch_gluon_mla_decode_bf16xbf16_gfx950_bh64
     else:
         raise NotImplementedError(
             "gluon MLA decode supports H in [1, 16], H=64 with B in {1, 2, 4}, "
@@ -2124,7 +2124,7 @@ def gluon_mla_decode_fp8xfp8_gfx950(
     )
 
 
-def gluon_mla_decode_projected_value_gfx950(
+def launch_gluon_mla_decode_projected_value_gfx950(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,
