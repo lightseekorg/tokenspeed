@@ -145,6 +145,7 @@ from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import (
     SelectedKernel,
     select_kernel,
+    spec_matches_shape_traits,
     spec_matches_traits,
 )
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -6097,17 +6098,17 @@ def test_gluon_dsa_prefill_fp8_dense_traits(
     if spec is None:
         pytest.skip("gfx950 Gluon DSA registration is unavailable")
     traits = {
-        "page_size": 64,
-        "q_len_per_req": 1,
+        "q_len": 1,
         "qk_nope_head_dim": qk_nope_head_dim,
         "kv_lora_rank": kv_lora_rank,
         "qk_rope_head_dim": qk_rope_head_dim,
+        "page_size": 64,
         "topk": 2051,
-        "kv_cache_available": True,
-        "sparse_kv_cache_available": False,
-        "topk_layout": "global_slots",
-        "support_logit_cap": False,
+        "has_kv_cache": True,
+        "has_sparse_kv_cache": False,
+        "logit_cap": False,
         "return_lse": False,
+        "topk_layout": "global_slots",
     }
     assert spec_matches_traits(spec, traits) is matches
 
@@ -6129,7 +6130,7 @@ _GLUON_MLA_FIXED_KERNELS = (
         pytest.param("batch_size", 16, False, id="batch16"),
         pytest.param("value_head_dim", 64, False, id="unsupported-value"),
         pytest.param("page_size", 128, False, id="unsupported-page"),
-        pytest.param("support_logit_cap", True, False, id="unsupported-logit-cap"),
+        pytest.param("logit_cap", True, False, id="unsupported-logit-cap"),
     ],
 )
 def test_gluon_mla_projected_value_gfx1250_traits_are_narrow(
@@ -6144,12 +6145,12 @@ def test_gluon_mla_projected_value_gfx1250_traits_are_narrow(
         "batch_size": 1,
         "q_len": 1,
         "num_q_heads": 12,
-        "page_size": 64,
+        "value_head_dim": 128,
         "kv_lora_rank": 512,
         "qk_rope_head_dim": 64,
-        "value_head_dim": 128,
+        "page_size": 64,
         "gate_kind": "sigmoid",
-        "support_logit_cap": False,
+        "logit_cap": False,
     }
     traits[trait] = value
     assert spec_matches_traits(spec, traits) is matches
@@ -6172,9 +6173,9 @@ def test_gluon_mla_project_value_gfx1250_batch_traits(
         pytest.skip("gfx1250 Gluon MLA projection registration is unavailable")
     traits = {
         "batch_size": batch_size,
-        "num_heads": 12,
-        "latent_dim": 512,
-        "value_dim": 128,
+        "num_q_heads": 12,
+        "value_head_dim": 128,
+        "kv_lora_rank": 512,
         "gate_kind": "sigmoid",
         "inputs_contiguous": True,
     }
@@ -6208,10 +6209,15 @@ def test_gluon_mla_fixed_entrypoints_are_registered(name: str) -> None:
             frozenset({2, 4}),
             id="bh64-small",
         ),
+        pytest.param(
+            "gluon_mla_decode_bf16xbf16_gfx950_bh64",
+            frozenset({64, 128}),
+            id="bh64",
+        ),
     ],
 )
-@pytest.mark.parametrize("batch", [1, 2, 3, 4, 64])
-def test_gluon_mla_small_batch_registrations_have_disjoint_traits(
+@pytest.mark.parametrize("batch", [1, 2, 3, 4, 64, 96, 128])
+def test_gluon_mla_batch_registrations_have_disjoint_traits(
     name: str,
     expected_batches: frozenset[int],
     batch: int,
@@ -6220,16 +6226,18 @@ def test_gluon_mla_small_batch_registrations_have_disjoint_traits(
 
     traits = {
         "batch_size": batch,
-        "batch_size_div_64": batch % 64 == 0,
         "q_len": 1,
         "num_q_heads": 64,
-        "page_size": 64,
         "kv_lora_rank": 512,
         "qk_rope_head_dim": 64,
-        "support_logit_cap": False,
+        "page_size": 64,
+        "logit_cap": False,
         "return_lse": False,
     }
-    assert spec_matches_traits(spec, traits) is (batch in expected_batches)
+    matches = spec_matches_traits(spec, traits) and spec_matches_shape_traits(
+        spec, traits
+    )
+    assert matches is (batch in expected_batches)
 
 
 @pytest.mark.parametrize(

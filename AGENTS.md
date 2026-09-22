@@ -20,6 +20,8 @@ best people and average people is more than tenfold.
 ## Code changes
 
 * Add tests and update docs for the changed code.
+* For code comments, use common/existing terms for easy human understanding;
+  avoid obsecure terms or coining unnecessary new concepts.
 * Parameters that select execution paths, algorithms, or correctness-critical
   behavior must be explicit and have no defaults. This includes execution modes,
   backend selection, and flags that switch between implementations.
@@ -138,6 +140,8 @@ Inside the root `tokenspeed-kernel/` directory:
   `gemm/trtllm.py`. Attention adds its variant before the solution, for example
   `attention/mha/triton.py`; multi-file implementations keep helpers under a
   private directory such as `attention/mha/_triton/`.
+* For op traits, use existing ones if there are. If needing to create new ones,
+  name it consistently with existing ones.
 * Top-level `README.md` should only contain high-level kernel system designs
   geared for human understanding. For per-op details, use `README.md` files
   under corresponding `ops/` directory.

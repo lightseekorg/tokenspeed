@@ -71,13 +71,13 @@ if current_platform().is_hopper_plus:
         signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
         traits={
             "head_dim": frozenset({128}),
-            "pool_size": frozenset({4}),
             "page_size": frozenset({16, 64}),
+            "pool_size": frozenset({4}),
+            "topk_pools": frozenset({512, 1024, 2048}),
+            "has_prefill_plan": frozenset({True}),
             "index_k_format": frozenset({"fp8_scaled"}),
             "score_activation": frozenset({"relu"}),
             "topk_layout": frozenset({"global_slots"}),
-            "topk_pools": frozenset({512, 1024, 2048}),
-            "prefill_plan": frozenset({True}),
         },
         priority=Priority.PERFORMANT,
     )

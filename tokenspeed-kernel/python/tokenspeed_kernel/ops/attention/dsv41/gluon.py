@@ -46,10 +46,10 @@ if current_platform().is_amd:
 
     _SIGNATURES = frozenset({format_signature(x=dense_tensor_format(torch.bfloat16))})
     _INDEX_TRAITS = {
-        "native_indexer": frozenset({False}),
         "index_heads": frozenset(range(1, 33)),
         "index_k_format": frozenset({"mxfp4"}),
         "index_shards": frozenset({1}),
+        "native_indexer": frozenset({False}),
     }
 
     @register_kernel(

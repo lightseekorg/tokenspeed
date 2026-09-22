@@ -72,10 +72,10 @@ if current_platform().is_amd:
         traits={
             "head_dim": frozenset({64, 128}),
             "page_size": frozenset({64}),
-            "sliding_window": frozenset({False, True}),
-            "support_sinks": frozenset({False, True}),
-            "support_logit_cap": frozenset({False}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
+            "sinks": frozenset({False, True}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def gluon_mha_decode_gfx950(*args, enable_pdl: bool = False, **kwargs):
@@ -106,10 +106,10 @@ if current_platform().is_amd:
             "q_len": frozenset({1}),
             "head_dim": frozenset({64, 128}),
             "page_size": frozenset({64, 128}),
-            "sliding_window": frozenset({False}),
-            "support_sinks": frozenset({False}),
-            "support_logit_cap": frozenset({False}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
+            "sinks": frozenset({False}),
+            "sliding_window": frozenset({False}),
         },
     )
     def gluon_mha_decode_gfx1250(*args, enable_pdl: bool = False, **kwargs):
@@ -138,11 +138,11 @@ if current_platform().is_amd:
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({64, 128}),
-            "sliding_window": frozenset({False, True}),
-            "support_sinks": frozenset({False, True}),
-            "support_logit_cap": frozenset({False}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
-            "support_skip_softmax": frozenset({False, True}),
+            "sinks": frozenset({False, True}),
+            "skip_softmax": frozenset({False, True}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def gluon_mha_prefill_gfx950(*args, **kwargs):
@@ -171,11 +171,11 @@ if current_platform().is_amd:
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({64, 128}),
-            "sliding_window": frozenset({False, True}),
-            "support_sinks": frozenset({False, True}),
-            "support_logit_cap": frozenset({False}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
-            "support_skip_softmax": frozenset({False}),
+            "sinks": frozenset({False, True}),
+            "skip_softmax": frozenset({False}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def gluon_mha_prefill_gfx1250(*args, **kwargs):
@@ -206,10 +206,10 @@ if current_platform().is_amd:
             "head_dim": frozenset({64, 128}),
             "page_size": frozenset({64}),
             "is_causal": frozenset({False, True}),
-            "sliding_window": frozenset({False, True}),
-            "support_sinks": frozenset({False, True}),
-            "support_logit_cap": frozenset({False}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
+            "sinks": frozenset({False, True}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def gluon_mha_extend_gfx950(*args, enable_pdl: bool = False, **kwargs):

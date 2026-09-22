@@ -50,8 +50,8 @@ _CUTE_DSL_Q_LENS = frozenset({1, 2, 3, 4, 5, 6})
 
 _TRAITS = {
     "head_dim": frozenset({128}),
-    "pool_size": frozenset({2, 4, 8, 16}),
     "page_size": frozenset({16, 64}),
+    "pool_size": frozenset({2, 4, 8, 16}),
     "index_k_format": frozenset({"fp8_scaled"}),
     "score_activation": frozenset({"relu", "none"}),
     "topk_layout": frozenset({"global_slots"}),
