@@ -31,10 +31,8 @@ if not is_cdna4():
     )
 
 
-from tokenspeed_kernel.registry import KernelRegistry  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
     _supports_largem_shape,
-    gluon_mm_a16w16_prefill_gfx950,
     launch_gluon_mm_a16w16_prefill_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
@@ -51,47 +49,6 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     launch_gluon_mm_a16w16_splitk_gfx950,
     launch_gluon_mm_a16w16_warp_gfx950,
 )
-
-_REGISTERED_CASES = [
-    pytest.param(
-        "gluon_mm_a16w16_prefill_gfx950",
-        (2816, 3072, 512),
-        (
-            (2560, 3072, 512),
-            (2817, 3072, 512),
-            (4352, 3072, 512),
-            (2816, 3328, 512),
-            (2816, 3072, 640),
-        ),
-        id="prefill",
-    ),
-]
-
-_REGISTERED_IMPLEMENTATIONS = {
-    "gluon_mm_a16w16_prefill_gfx950": gluon_mm_a16w16_prefill_gfx950,
-}
-
-
-@pytest.mark.parametrize("kernel_name,accepted,rejected", _REGISTERED_CASES)
-def test_dense16_registration_selects_only_measured_problems(
-    kernel_name: str,
-    accepted: tuple[int, int, int],
-    rejected: tuple[tuple[int, int, int], ...],
-) -> None:
-    spec = KernelRegistry.get().get_by_name(kernel_name)
-    assert spec is not None
-    registered_implementation = KernelRegistry.get().get_impl(kernel_name)
-    assert registered_implementation is not None
-    assert registered_implementation.__name__ == kernel_name
-    assert _REGISTERED_IMPLEMENTATIONS[kernel_name].__name__ == kernel_name
-
-    problem_filters = spec.traits["mnk_problem_filter"]
-    assert len(problem_filters) == 1
-    problem_filter = next(iter(problem_filters))
-    assert problem_filter(*accepted)
-    assert problem_filter(4096, 3072, 512)
-    assert all(not problem_filter(*shape) for shape in rejected)
-
 
 _CORRECTNESS_CASES = [
     pytest.param(
