@@ -51,6 +51,27 @@ def test_kda_generator_rejects_unsupported_validation_before_allocating_inputs(
         prepare_kda_paged_prefill(request, mi350_platform)
 
 
+def test_kda_generator_rejects_unimplemented_model_profile(
+    mi350_platform: PlatformInfo,
+) -> None:
+    request = BenchmarkRequest(
+        family="attention",
+        mode="kda_paged_prefill",
+        parameters={
+            "model_profile": "unimplemented",
+            "batch": 1,
+            "tokens_per_sequence": 64,
+        },
+        solution=None,
+        registration=None,
+        cold_cache=True,
+        seed=42,
+    )
+
+    with pytest.raises(BenchmarkCaseError, match="Implemented KDA model_profile"):
+        prepare_kda_paged_prefill(request, mi350_platform)
+
+
 def test_kda_generator_builds_glm_decode_input_strides(monkeypatch) -> None:
     def cpu_randn(shape, *, dtype, generator):
         _ = generator

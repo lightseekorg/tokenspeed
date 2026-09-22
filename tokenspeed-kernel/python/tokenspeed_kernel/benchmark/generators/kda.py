@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-import math
+from collections.abc import Collection
 from typing import Any
 
 import torch
@@ -39,11 +39,13 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 __all__ = ["prepare_kda_paged_decode", "prepare_kda_paged_prefill"]
 
 
-_DTYPE_NAMES = {
+_IMPLEMENTED_DTYPES = {
     "bf16": torch.bfloat16,
     "bfloat16": torch.bfloat16,
 }
-_MODEL_PROFILE = "glm53_flash_tp4"
+_IMPLEMENTED_MODEL_PROFILES = frozenset({"glm53_flash_tp4"})
+_IMPLEMENTED_RECURRENT_LAYOUTS = frozenset({"k_major", "v_major"})
+_IMPLEMENTED_STATE_PAGE_RELATIONS = frozenset({"in_place", "distinct"})
 _DEFAULT_HEADS = 16
 _DEFAULT_DIM = 128
 _DEFAULT_LOWER_BOUND = -5.0
@@ -51,80 +53,41 @@ _DEFAULT_RECURRENT_LAYOUT = "v_major"
 _DEFAULT_STATE_PAGES = 841
 _DEFAULT_STATE_PAGE_STRIDE = 294912
 _DISTINCT_WRITE_PAGE_OFFSET = 16
-_STATE_PAGE_RELATIONS = {"in_place", "distinct"}
 
 
-def _positive_dimension(parameters: dict[str, Any], name: str) -> int:
-    value = parameters.get(name)
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+def _implemented_value(
+    name: str,
+    value: object,
+    implemented: Collection[str],
+) -> str:
+    if value not in implemented:
+        accepted = ", ".join(sorted(implemented))
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
-            f"KDA parameter {name!r} must be a positive integer",
-        )
-    return value
-
-
-def _optional_positive_dimension(
-    parameters: dict[str, Any], name: str, fallback: int
-) -> int:
-    value = parameters.get(name, fallback)
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            f"KDA parameter {name!r} must be a positive integer",
+            f"Implemented KDA {name} values: {accepted}",
         )
     return value
 
 
 def _parse_dtype(value: object) -> torch.dtype:
-    if isinstance(value, str):
-        dtype = _DTYPE_NAMES.get(value.lower())
-    else:
-        dtype = value if isinstance(value, torch.dtype) else None
-    if dtype is not torch.bfloat16:
-        supported = ", ".join(sorted(_DTYPE_NAMES))
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            f"KDA benchmarks currently support dtype names: {supported}",
-        )
-    return dtype
+    name = _implemented_value("dtype", value, _IMPLEMENTED_DTYPES)
+    return _IMPLEMENTED_DTYPES[name]
 
 
 def _parse_model_profile(parameters: dict[str, Any]) -> str:
-    value = parameters.get("model_profile", _MODEL_PROFILE)
-    if value != _MODEL_PROFILE:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            f"KDA model_profile must be {_MODEL_PROFILE!r}",
-        )
-    return value
-
-
-def _parse_lower_bound(value: object) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "KDA lower_bound must be a finite number or null",
-        )
-    converted = float(value)
-    if not math.isfinite(converted):
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "KDA lower_bound must be finite",
-        )
-    return converted
+    return _implemented_value(
+        "model_profile",
+        parameters["model_profile"],
+        _IMPLEMENTED_MODEL_PROFILES,
+    )
 
 
 def _parse_recurrent_layout(parameters: dict[str, Any]) -> str:
-    value = parameters.get("recurrent_layout", _DEFAULT_RECURRENT_LAYOUT)
-    if value not in {"k_major", "v_major"}:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "KDA recurrent_layout must be 'k_major' or 'v_major'",
-        )
-    return value
+    return _implemented_value(
+        "recurrent_layout",
+        parameters.get("recurrent_layout", _DEFAULT_RECURRENT_LAYOUT),
+        _IMPLEMENTED_RECURRENT_LAYOUTS,
+    )
 
 
 def _generator(seed: int) -> torch.Generator:
@@ -309,42 +272,27 @@ def _state_page_indices(
 
 
 def _parse_state_page_relation(parameters: dict[str, Any]) -> str:
-    relation = parameters.get("state_page_relation", "in_place")
-    if relation not in _STATE_PAGE_RELATIONS:
-        accepted = ", ".join(sorted(_STATE_PAGE_RELATIONS))
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            f"KDA state_page_relation must be one of: {accepted}",
-        )
-    return relation
+    return _implemented_value(
+        "state_page_relation",
+        parameters.get("state_page_relation", "in_place"),
+        _IMPLEMENTED_STATE_PAGE_RELATIONS,
+    )
 
 
 def _normalize_common_parameters(
     request: BenchmarkRequest,
-    *,
-    allowed: set[str],
 ) -> tuple[str, int, int, int, torch.dtype, float | None, str]:
-    unknown = sorted(set(request.parameters) - allowed)
-    if unknown:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            f"Unknown KDA parameters: {', '.join(unknown)}",
-        )
     if request.parameters.get("validation") is not None:
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
             "KDA benchmark correctness validation is not implemented yet",
         )
     model_profile = _parse_model_profile(request.parameters)
-    heads = _optional_positive_dimension(request.parameters, "heads", _DEFAULT_HEADS)
-    key_dim = _optional_positive_dimension(request.parameters, "key_dim", _DEFAULT_DIM)
-    value_dim = _optional_positive_dimension(
-        request.parameters, "value_dim", _DEFAULT_DIM
-    )
+    heads = request.parameters.get("heads", _DEFAULT_HEADS)
+    key_dim = request.parameters.get("key_dim", _DEFAULT_DIM)
+    value_dim = request.parameters.get("value_dim", _DEFAULT_DIM)
     dtype = _parse_dtype(request.parameters.get("dtype", "bfloat16"))
-    lower_bound = _parse_lower_bound(
-        request.parameters.get("lower_bound", _DEFAULT_LOWER_BOUND)
-    )
+    lower_bound = request.parameters.get("lower_bound", _DEFAULT_LOWER_BOUND)
     recurrent_layout = _parse_recurrent_layout(request.parameters)
     return (
         model_profile,
@@ -382,20 +330,8 @@ def prepare_kda_paged_prefill(
     request: BenchmarkRequest,
     platform: PlatformInfo,
 ) -> PreparedBenchmark:
-    """Prepare a GLM-5.3-Flash KDA prefill benchmark."""
+    """Prepare a KDA prefill benchmark."""
 
-    allowed = {
-        "model_profile",
-        "batch",
-        "tokens_per_sequence",
-        "heads",
-        "key_dim",
-        "value_dim",
-        "dtype",
-        "lower_bound",
-        "recurrent_layout",
-        "validation",
-    }
     (
         model_profile,
         heads,
@@ -404,9 +340,9 @@ def prepare_kda_paged_prefill(
         dtype,
         lower_bound,
         recurrent_layout,
-    ) = _normalize_common_parameters(request, allowed=allowed)
-    batch = _positive_dimension(request.parameters, "batch")
-    tokens_per_sequence = _positive_dimension(request.parameters, "tokens_per_sequence")
+    ) = _normalize_common_parameters(request)
+    batch = request.parameters["batch"]
+    tokens_per_sequence = request.parameters["tokens_per_sequence"]
     total_tokens = batch * tokens_per_sequence
 
     load_builtin_kernels()
@@ -493,22 +429,8 @@ def prepare_kda_paged_decode(
     request: BenchmarkRequest,
     platform: PlatformInfo,
 ) -> PreparedBenchmark:
-    """Prepare a GLM-5.3-Flash single-token KDA decode benchmark."""
+    """Prepare a single-token KDA decode benchmark."""
 
-    allowed = {
-        "model_profile",
-        "batch",
-        "heads",
-        "key_dim",
-        "value_dim",
-        "dtype",
-        "lower_bound",
-        "recurrent_layout",
-        "state_pages",
-        "state_page_stride",
-        "state_page_relation",
-        "validation",
-    }
     (
         model_profile,
         heads,
@@ -517,28 +439,22 @@ def prepare_kda_paged_decode(
         dtype,
         lower_bound,
         recurrent_layout,
-    ) = _normalize_common_parameters(request, allowed=allowed)
-    batch = _positive_dimension(request.parameters, "batch")
+    ) = _normalize_common_parameters(request)
+    batch = request.parameters["batch"]
     state_page_relation = _parse_state_page_relation(request.parameters)
     minimum_state_pages = (
         _DISTINCT_WRITE_PAGE_OFFSET + batch + 1
         if state_page_relation == "distinct"
         else batch + 1
     )
-    state_pages = _optional_positive_dimension(
-        request.parameters,
-        "state_pages",
-        _DEFAULT_STATE_PAGES,
-    )
+    state_pages = request.parameters.get("state_pages", _DEFAULT_STATE_PAGES)
     if state_pages < minimum_state_pages:
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
             f"KDA decode state_pages must be at least {minimum_state_pages}",
         )
-    state_page_stride = _optional_positive_dimension(
-        request.parameters,
-        "state_page_stride",
-        _DEFAULT_STATE_PAGE_STRIDE,
+    state_page_stride = request.parameters.get(
+        "state_page_stride", _DEFAULT_STATE_PAGE_STRIDE
     )
     state_payload = heads * value_dim * key_dim
     if state_page_stride < state_payload:
