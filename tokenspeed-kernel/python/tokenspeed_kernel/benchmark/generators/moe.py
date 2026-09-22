@@ -68,7 +68,7 @@ _IMPLEMENTED_WEIGHT_FORMATS = {
 _IMPLEMENTED_ACTIVATIONS = frozenset({"silu", "situ", "swiglu"})
 _IMPLEMENTED_ROUTING_MODES = frozenset({"precomputed_topk"})
 _IMPLEMENTED_ROUTE_SCOPES = frozenset({"global", "local"})
-_IMPLEMENTED_ROUTE_DISTRIBUTIONS = frozenset({"balanced_global", "router"})
+_IMPLEMENTED_ROUTE_DISTRIBUTIONS = frozenset({"router"})
 _IMPLEMENTED_TOKEN_COUNT_SCOPES = frozenset({"global", "local"})
 _IMPLEMENTED_INTERNAL_ACTIVATION_DTYPES = frozenset({"input"})
 _IMPLEMENTED_FP8_BLOCK_SHAPES = frozenset({(128, 128)})
@@ -210,68 +210,6 @@ def _routing_tensors(
     )
     if expert_start:
         topk_ids = topk_ids + expert_start
-    return router_logits, topk_weights.contiguous(), topk_ids.contiguous()
-
-
-def _balanced_global_routing_tensors(
-    *,
-    tokens: int,
-    experts: int,
-    topk: int,
-    ep_size: int,
-    seed: int,
-    routed_scaling_factor: float,
-    normalize_topk_weights: bool,
-    router_logits_dtype: torch.dtype,
-    weights_dtype: torch.dtype,
-    generator: torch.Generator,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if experts % ep_size or topk % ep_size:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "Balanced global routing requires experts and topk divisible by ep_size",
-        )
-    local_experts = experts // ep_size
-    routes_per_rank = topk // ep_size
-    if routes_per_rank > local_experts:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "Balanced global routing selects too many experts per EP rank",
-        )
-
-    router_logits = 0.01 * _randn(
-        (tokens, experts),
-        generator=generator,
-        dtype=router_logits_dtype,
-    )
-    token_offsets = (
-        torch.arange(tokens, dtype=torch.int64)[:, None, None] * routes_per_rank
-    )
-    rank_offsets = (
-        torch.arange(ep_size, dtype=torch.int64)[None, :, None] * local_experts
-    )
-    route_offsets = torch.arange(routes_per_rank, dtype=torch.int64)[None, None, :] * 17
-    ids = rank_offsets + (seed + token_offsets + route_offsets) % local_experts
-    ids = ids.reshape(tokens, topk).to(device=router_logits.device)
-    selected_logits = torch.linspace(
-        8.0,
-        9.0,
-        topk,
-        device=router_logits.device,
-        dtype=router_logits_dtype,
-    ).expand(tokens, -1)
-    router_logits.scatter_(1, ids, selected_logits)
-
-    from tokenspeed_kernel.ops import moe as moe_ops
-
-    topk_weights, topk_ids = moe_ops.moe_sigmoid_bias_topk(
-        router_logits,
-        _correction_bias(experts, device=router_logits.device),
-        topk,
-        routed_scaling_factor=routed_scaling_factor,
-        normalize_topk_weights=normalize_topk_weights,
-        weights_dtype=weights_dtype,
-    )
     return router_logits, topk_weights.contiguous(), topk_ids.contiguous()
 
 
@@ -607,11 +545,6 @@ def prepare_moe_apply(
         parameters["route_distribution"],
         _IMPLEMENTED_ROUTE_DISTRIBUTIONS,
     )
-    if route_distribution == "balanced_global" and route_scope != "global":
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "Balanced global routing requires route_scope='global'",
-        )
     token_count_scope = _implemented_value(
         "token_count_scope",
         parameters["token_count_scope"],
@@ -677,31 +610,17 @@ def prepare_moe_apply(
     )
     route_experts = num_local_experts if route_scope == "local" else num_experts
     expert_start = ep_rank * num_local_experts if route_scope == "local" else 0
-    if route_distribution == "balanced_global":
-        router_logits, topk_weights, topk_ids = _balanced_global_routing_tensors(
-            tokens=tokens,
-            experts=num_experts,
-            topk=topk,
-            ep_size=ep_size,
-            seed=request.seed,
-            routed_scaling_factor=routed_scaling_factor,
-            normalize_topk_weights=normalize_topk_weights,
-            router_logits_dtype=router_logits_dtype,
-            weights_dtype=torch.float32,
-            generator=generator,
-        )
-    else:
-        router_logits, topk_weights, topk_ids = _routing_tensors(
-            tokens=tokens,
-            experts=route_experts,
-            topk=topk,
-            routed_scaling_factor=routed_scaling_factor,
-            normalize_topk_weights=normalize_topk_weights,
-            router_logits_dtype=router_logits_dtype,
-            weights_dtype=torch.float32,
-            generator=generator,
-            expert_start=expert_start,
-        )
+    router_logits, topk_weights, topk_ids = _routing_tensors(
+        tokens=tokens,
+        experts=route_experts,
+        topk=topk,
+        routed_scaling_factor=routed_scaling_factor,
+        normalize_topk_weights=normalize_topk_weights,
+        router_logits_dtype=router_logits_dtype,
+        weights_dtype=torch.float32,
+        generator=generator,
+        expert_start=expert_start,
+    )
     if weight_dtype_name == "fp8":
         assert block_shape is not None
         weights = _make_fp8_weights(
@@ -956,17 +875,16 @@ def prepare_latent_expert_shared(
         generator=generator,
         dtype=input_dtype,
     )
-    router_logits, topk_weights, topk_ids = _balanced_global_routing_tensors(
+    router_logits, topk_weights, topk_ids = _routing_tensors(
         tokens=tokens,
         experts=num_experts,
         topk=topk,
-        ep_size=ep_size,
-        seed=request.seed,
         routed_scaling_factor=routed_scaling_factor,
         normalize_topk_weights=normalize_topk_weights,
         router_logits_dtype=router_logits_dtype,
         weights_dtype=torch.float32,
         generator=generator,
+        expert_start=0,
     )
     weights = _make_mxfp4_weights(
         num_experts=num_experts,
@@ -1068,7 +986,7 @@ def prepare_latent_expert_shared(
             "activation_situ_beta": situ_beta,
             "activation_situ_linear_beta": situ_linear_beta,
             "route_scope": "global",
-            "route_distribution": "balanced_global",
+            "route_distribution": "router",
             "routed_scaling_factor": routed_scaling_factor,
             "normalize_topk_weights": normalize_topk_weights,
             "topk_generation": "sigmoid_bias_topk",

@@ -268,15 +268,16 @@ def test_moe_apply_generator_builds_mxfp4_situ_global_ep_contract(
         "_randn",
         lambda shape, *, generator, dtype: torch.zeros(shape, dtype=dtype),
     )
-    monkeypatch.setattr(
-        moe_generator,
-        "_balanced_global_routing_tensors",
-        lambda **_kwargs: (
+
+    def fake_routing(**kwargs):
+        seen["routing_kwargs"] = kwargs
+        return (
             torch.zeros(16, 16, dtype=torch.float32),
             torch.ones(16, 8, dtype=torch.float32),
             torch.arange(8, dtype=torch.int32).repeat(16, 1),
-        ),
-    )
+        )
+
+    monkeypatch.setattr(moe_generator, "_routing_tensors", fake_routing)
 
     def fake_plan(**kwargs):
         seen["plan_kwargs"] = kwargs
@@ -327,7 +328,7 @@ def test_moe_apply_generator_builds_mxfp4_situ_global_ep_contract(
                 "activation_situ_linear_beta": 25.0,
                 "routing_mode": "precomputed_topk",
                 "route_scope": "global",
-                "route_distribution": "balanced_global",
+                "route_distribution": "router",
                 "routed_scaling_factor": 1.0,
                 "normalize_topk_weights": True,
                 "internal_activation_dtype": "input",
@@ -363,6 +364,8 @@ def test_moe_apply_generator_builds_mxfp4_situ_global_ep_contract(
     assert seen["num_tokens_global"] == 16
     assert seen["max_num_tokens_per_gpu"] == 2
     assert seen["ids"][0].tolist() == list(range(8))
+    assert seen["routing_kwargs"]["experts"] == 16
+    assert seen["routing_kwargs"]["expert_start"] == 0
 
 
 def test_latent_input_generator_matches_runtime_packed_projection_contract(
@@ -464,43 +467,6 @@ def test_mxfp4_weight_builder_preserves_swiglu_parameters(monkeypatch) -> None:
     assert weights.swiglu_arg.limit == 7.0
 
 
-def test_balanced_global_routes_cover_every_ep_shard(monkeypatch) -> None:
-    from tokenspeed_kernel.ops import moe as moe_ops
-
-    monkeypatch.setattr(
-        moe_generator,
-        "_randn",
-        lambda shape, *, generator, dtype: torch.randn(
-            shape,
-            generator=generator,
-            dtype=dtype,
-        ),
-    )
-
-    def fake_topk(router_logits, correction_bias, topk, **_kwargs):
-        scores = torch.sigmoid(router_logits.float()) + correction_bias
-        values, ids = torch.topk(scores, topk, dim=1)
-        return values, ids.to(torch.int32)
-
-    monkeypatch.setattr(moe_ops, "moe_sigmoid_bias_topk", fake_topk)
-    _, _, topk_ids = moe_generator._balanced_global_routing_tensors(
-        tokens=3,
-        experts=896,
-        topk=16,
-        ep_size=8,
-        seed=42,
-        routed_scaling_factor=1.0,
-        normalize_topk_weights=True,
-        router_logits_dtype=torch.float32,
-        weights_dtype=torch.float32,
-        generator=torch.Generator(device="cpu").manual_seed(42),
-    )
-
-    for row in topk_ids:
-        assert row.unique().numel() == 16
-        assert torch.bincount(row // 112, minlength=8).tolist() == [2] * 8
-
-
 def test_latent_expert_shared_generator_uses_global_ep_routes_and_reset(
     fresh_registry,
     monkeypatch,
@@ -530,15 +496,16 @@ def test_latent_expert_shared_generator_uses_global_ep_routes_and_reset(
         "_randn",
         lambda shape, *, generator, dtype: torch.zeros(shape, dtype=dtype),
     )
-    monkeypatch.setattr(
-        moe_generator,
-        "_balanced_global_routing_tensors",
-        lambda **_kwargs: (
+
+    def fake_routing(**kwargs):
+        seen["routing_kwargs"] = kwargs
+        return (
             torch.zeros(2, 8, dtype=torch.float32),
             torch.ones(2, 2, dtype=torch.float32),
             torch.tensor([[0, 4], [1, 5]], dtype=torch.int32),
-        ),
-    )
+        )
+
+    monkeypatch.setattr(moe_generator, "_routing_tensors", fake_routing)
 
     def fake_joint(*args, **kwargs):
         seen["ids"] = args[6].clone()
@@ -585,6 +552,9 @@ def test_latent_expert_shared_generator_uses_global_ep_routes_and_reset(
 
     assert prepared.registration is spec
     assert prepared.parameters["route_scope"] == "global"
+    assert prepared.parameters["route_distribution"] == "router"
     assert seen["ids"].tolist() == [[0, 4], [1, 5]]
     assert seen["expert_start"] == 4
+    assert seen["routing_kwargs"]["experts"] == 8
+    assert seen["routing_kwargs"]["expert_start"] == 0
     assert all(torch.count_nonzero(output) == 0 for output in seen["outputs"])
