@@ -33,6 +33,7 @@ from tokenspeed_kernel.benchmark.harness import (
 _GLM53_CONFIG = {
     "model_profile": "glm53_flash_tp4",
     "dtype": "bfloat16",
+    "kv_cache_dtype": "bfloat16",
     "index_heads": 32,
     "index_head_dim": 128,
     "local_attention_heads": 16,
@@ -72,6 +73,7 @@ def test_dsa_generator_resolves_explicit_config_and_derived_geometry() -> None:
     config = _config()
 
     assert config.dtype is torch.bfloat16
+    assert config.kv_cache_dtype is torch.bfloat16
     assert config.index_heads == 32
     assert config.local_attention_heads == 16
     assert config.index_rows_per_page == 16
@@ -82,11 +84,20 @@ def test_dsa_generator_resolves_explicit_config_and_derived_geometry() -> None:
     assert dsa_generator._common_parameters(config)["attention_heads"] == 16
 
 
+def test_dsa_generator_supports_fp8_kv_cache_configuration() -> None:
+    config = _config(kv_cache_dtype="float8_e4m3fn")
+
+    assert config.dtype is torch.bfloat16
+    assert config.kv_cache_dtype is torch.float8_e4m3fn
+    assert dsa_generator._common_parameters(config)["kv_cache_dtype"] == "float8_e4m3fn"
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [
         ("model_profile", "unknown"),
         ("dtype", "float32"),
+        ("kv_cache_dtype", "float32"),
     ],
 )
 def test_dsa_generator_rejects_unimplemented_config_values(

@@ -3,6 +3,7 @@
   "common_parameters": {
     "model_profile": "glm53_flash_tp4",
     "dtype": "bfloat16",
+    "kv_cache_dtype": "bfloat16",
     "index_heads": 32,
     "index_head_dim": 128,
     "local_attention_heads": 16,
@@ -161,13 +162,14 @@
       }
     },
     {
-      "id": "glm53_flash.attention.dsa_prefill/cold-prefill-bfloat16",
+      "id": "glm53_flash.attention.dsa_prefill/cold-prefill-kv-cache",
       "comparison_epoch": 1,
       "measurement_blocks": 10,
       "definition": {
         "family": "attention",
         "mode": "dsa_prefill",
         "parameters": {
+          "kv_cache_dtype": ["bfloat16", "float8_e4m3fn"],
           "batch": 1,
           "prefix_tokens": [0, 57344, 122880],
           "query_tokens_per_sequence": 8192
@@ -182,13 +184,14 @@
       }
     },
     {
-      "id": "glm53_flash.attention.dsa_prefill/extend-small-bfloat16",
+      "id": "glm53_flash.attention.dsa_prefill/extend-small-kv-cache",
       "comparison_epoch": 1,
       "measurement_blocks": 30,
       "definition": {
         "family": "attention",
         "mode": "dsa_prefill",
         "parameters": {
+          "kv_cache_dtype": ["bfloat16", "float8_e4m3fn"],
           "batch": [1, 2],
           "prefix_tokens": [7936, 130816],
           "query_tokens_per_sequence": 256
@@ -203,13 +206,14 @@
       }
     },
     {
-      "id": "glm53_flash.attention.dsa_prefill/extend-large-bfloat16",
+      "id": "glm53_flash.attention.dsa_prefill/extend-large-kv-cache",
       "comparison_epoch": 1,
       "measurement_blocks": 10,
       "definition": {
         "family": "attention",
         "mode": "dsa_prefill",
         "parameters": {
+          "kv_cache_dtype": ["bfloat16", "float8_e4m3fn"],
           "batch": [4, 8, 16],
           "prefix_tokens": [7936, 130816],
           "query_tokens_per_sequence": 256
@@ -224,13 +228,14 @@
       }
     },
     {
-      "id": "glm53_flash.attention.dsa_prefill/tail-align-small-bfloat16",
+      "id": "glm53_flash.attention.dsa_prefill/tail-align-small-kv-cache",
       "comparison_epoch": 1,
       "measurement_blocks": 30,
       "definition": {
         "family": "attention",
         "mode": "dsa_prefill",
         "parameters": {
+          "kv_cache_dtype": ["bfloat16", "float8_e4m3fn"],
           "batch": [1, 2],
           "prefix_tokens": [8128, 131008],
           "query_tokens_per_sequence": 64
@@ -245,13 +250,14 @@
       }
     },
     {
-      "id": "glm53_flash.attention.dsa_prefill/tail-align-large-bfloat16",
+      "id": "glm53_flash.attention.dsa_prefill/tail-align-large-kv-cache",
       "comparison_epoch": 1,
       "measurement_blocks": 10,
       "definition": {
         "family": "attention",
         "mode": "dsa_prefill",
         "parameters": {
+          "kv_cache_dtype": ["bfloat16", "float8_e4m3fn"],
           "batch": [4, 8, 16],
           "prefix_tokens": [8128, 131008],
           "query_tokens_per_sequence": 64
@@ -455,13 +461,14 @@
       }
     },
     {
-      "id": "glm53_flash.attention.dsa_decode/ordinary-bfloat16",
+      "id": "glm53_flash.attention.dsa_decode/ordinary-kv-cache",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
         "family": "attention",
         "mode": "dsa_decode",
         "parameters": {
+          "kv_cache_dtype": ["bfloat16", "float8_e4m3fn"],
           "batch": [1, 2, 4, 8, 16],
           "q_len_per_req": 1,
           "sequence_length": [8189, 131069]
@@ -476,13 +483,14 @@
       }
     },
     {
-      "id": "glm53_flash.attention.dsa_decode/pool-complete-bfloat16",
+      "id": "glm53_flash.attention.dsa_decode/pool-complete-kv-cache",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
         "family": "attention",
         "mode": "dsa_decode",
         "parameters": {
+          "kv_cache_dtype": ["bfloat16", "float8_e4m3fn"],
           "batch": [1, 2, 4, 8, 16],
           "q_len_per_req": 1,
           "sequence_length": [8192, 131072]
@@ -497,13 +505,14 @@
       }
     },
     {
-      "id": "glm53_flash.attention.dsa_decode/spec-verify-bfloat16",
+      "id": "glm53_flash.attention.dsa_decode/spec-verify-kv-cache",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
         "family": "attention",
         "mode": "dsa_decode",
         "parameters": {
+          "kv_cache_dtype": ["bfloat16", "float8_e4m3fn"],
           "batch": [1, 2, 4, 8, 16],
           "q_len_per_req": 4,
           "sequence_length": [8192, 131072]

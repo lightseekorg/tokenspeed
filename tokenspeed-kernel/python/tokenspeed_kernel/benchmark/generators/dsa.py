@@ -52,6 +52,11 @@ _IMPLEMENTED_DTYPES = {
     "bf16": torch.bfloat16,
     "bfloat16": torch.bfloat16,
 }
+_IMPLEMENTED_KV_CACHE_DTYPES = {
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+    "float8_e4m3fn": torch.float8_e4m3fn,
+}
 _IMPLEMENTED_MODEL_PROFILES = frozenset({"glm53_flash_tp4"})
 _POOL_PERMUTATION_STRIDE = 1_000_003
 _TOKEN_PERMUTATION_STRIDE = 7_919
@@ -61,6 +66,7 @@ _TOKEN_PERMUTATION_STRIDE = 7_919
 class _DSAConfig:
     model_profile: str
     dtype: torch.dtype
+    kv_cache_dtype: torch.dtype
     index_heads: int
     index_head_dim: int
     local_attention_heads: int
@@ -117,9 +123,13 @@ def _implemented_value(
     return value
 
 
-def _parse_dtype(value: object) -> torch.dtype:
-    name = _implemented_value("dtype", value, _IMPLEMENTED_DTYPES)
-    return _IMPLEMENTED_DTYPES[name]
+def _parse_dtype(
+    name: str,
+    value: object,
+    implemented: dict[str, torch.dtype],
+) -> torch.dtype:
+    dtype_name = _implemented_value(name, value, implemented)
+    return implemented[dtype_name]
 
 
 def _validate_config(config: _DSAConfig) -> None:
@@ -167,7 +177,12 @@ def _resolve_config(
             parameters["model_profile"],
             _IMPLEMENTED_MODEL_PROFILES,
         ),
-        dtype=_parse_dtype(parameters["dtype"]),
+        dtype=_parse_dtype("dtype", parameters["dtype"], _IMPLEMENTED_DTYPES),
+        kv_cache_dtype=_parse_dtype(
+            "kv_cache_dtype",
+            parameters["kv_cache_dtype"],
+            _IMPLEMENTED_KV_CACHE_DTYPES,
+        ),
         index_heads=parameters["index_heads"],
         index_head_dim=parameters["index_head_dim"],
         local_attention_heads=parameters["local_attention_heads"],
@@ -461,6 +476,7 @@ def _common_parameters(config: _DSAConfig) -> dict[str, object]:
     return {
         "model_profile": config.model_profile,
         "dtype": str(config.dtype).removeprefix("torch."),
+        "kv_cache_dtype": str(config.kv_cache_dtype).removeprefix("torch."),
         "index_heads": config.index_heads,
         "index_head_dim": config.index_head_dim,
         "attention_heads": config.local_attention_heads,
@@ -859,37 +875,38 @@ def _prepare_dsa_attention(
 
     traits = {
         "page_size": config.kv_page_size,
-        "q_len_per_req": q_len_per_req,
+        "q_len": q_len_per_req,
         "qk_nope_head_dim": config.qk_nope_head_dim,
         "kv_lora_rank": config.kv_lora_rank,
         "qk_rope_head_dim": config.qk_rope_head_dim,
         "topk": config.selected_width,
-        "kv_cache_available": True,
-        "sparse_kv_cache_available": False,
+        "has_kv_cache": True,
+        "has_sparse_kv_cache": False,
         "topk_layout": "global_slots",
-        "support_logit_cap": False,
+        "logit_cap": False,
         "return_lse": False,
     }
     load_builtin_kernels()
     spec = _select_registration(
         request,
         platform,
-        signature_roles={"q": config.dtype},
+        signature_roles={"q": config.kv_cache_dtype},
         traits=traits,
     )
 
     generator = _generator(request.seed)
     tokens = batch * query_tokens_per_sequence
+    # Production casts the query to the cache dtype for FP8 DSA configurations.
     q = _randn(
         (tokens, config.local_attention_heads, config.qk_head_dim),
         generator=generator,
         dtype=config.dtype,
-    )
+    ).to(config.kv_cache_dtype)
     kv_cache = _randn(
         (batch * sequence_length, 1, config.qk_head_dim),
         generator=generator,
         dtype=config.dtype,
-    )
+    ).to(config.kv_cache_dtype)
     topk_slots, topk_lens = _selected_slots(
         causal_lens,
         req_ids,
