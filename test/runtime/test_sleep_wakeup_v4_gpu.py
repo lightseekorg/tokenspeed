@@ -63,6 +63,7 @@ def main() -> None:
     from tokenspeed.runtime.entrypoints.engine import Engine
 
     engine = Engine(
+        disable_autotune=True,
         model=model,
         data_parallel_size=len(_visible()),
         enable_expert_parallel=True,

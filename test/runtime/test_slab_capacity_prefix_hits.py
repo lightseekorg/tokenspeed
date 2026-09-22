@@ -159,6 +159,7 @@ def _build_prompt(i: int) -> str:
 
 def _make_engine() -> Engine:
     return Engine(
+        disable_autotune=True,
         model=_MODEL,
         dtype=get_dtype_str(torch.bfloat16),
         seed=42,

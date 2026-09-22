@@ -213,6 +213,7 @@ class TestInklingReferenceParity(unittest.TestCase):
         from tokenspeed.runtime.entrypoints.engine import Engine
 
         engine = Engine(
+            disable_autotune=True,
             model=INKLING_BF16,
             hf_overrides=truncation_hf_overrides(),
             load_format="dummy",

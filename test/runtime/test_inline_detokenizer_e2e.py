@@ -122,6 +122,7 @@ def _run_rt_generate(
     the module docstring for details).
     """
     engine = Engine(
+        disable_autotune=True,
         model=_MODEL,
         dtype=get_dtype_str(torch_dtype),
         seed=42,

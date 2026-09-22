@@ -49,6 +49,7 @@ def _serve_server(log_path: Path) -> subprocess.Popen:
         "-m",
         "tokenspeed.cli",
         "serve",
+        "--disable-autotune",
         "--gateway-startup-timeout",
         "300",
         "--model",
