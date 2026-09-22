@@ -92,7 +92,7 @@ apt_install_with_retry() {
 ensure_flashinfer_jit_cache() {
     # GB200 and B200 runner images preinstall flashinfer-jit-cache; it must
     # match the flashinfer-python pin exactly or flashinfer refuses to import.
-    if [[ "${CI_RUNNER_LABEL:-}" != gb200* && "${CI_RUNNER_LABEL:-}" != b200* ]]; then
+    if [[ "${CI_RUNNER_LABEL:-}" != gb200* && "${CI_RUNNER_LABEL:-}" != b200* && "${CI_RUNNER_LABEL:-}" != slurm-gb200-* ]]; then
         return 0
     fi
 

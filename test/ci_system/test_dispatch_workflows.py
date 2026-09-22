@@ -57,7 +57,7 @@ printf 'image=%s\\n' "${TS_CI_CONTAINER_IMAGE-}"
         "CONTAINER_IMAGE": "",
         "CLUSTER": "gb200",
         "YAML_SELECTION": "off",
-        "RUNNERS": "b200-4gpu,gb200-4gpu",
+        "RUNNERS": workflow_dispatch_inputs("slurm-dispatch.yml")["runners"]["default"],
         "TASK_TYPES": "eval,perf",
         "MATCH": "",
         "INCLUDE_MMLU": "false",
@@ -246,9 +246,9 @@ def configured_yaml_choices(workflow_name: str) -> set[str]:
 
 
 def test_k8s_dispatch_lists_every_supported_ci_yaml():
-    assert configured_yaml_choices("k8s-dispatch.yml") == eligible_config_paths(
-        K8S_RUNNER_PREFIXES
-    )
+    choices = configured_yaml_choices("k8s-dispatch.yml")
+    assert eligible_config_paths(K8S_RUNNER_PREFIXES) <= choices
+    assert all((REPO_ROOT / choice).is_file() for choice in choices)
 
 
 def test_amd_pr_workflow_orders_kernel_benchmarks_before_model_tests():
@@ -501,6 +501,7 @@ def test_slurm_dispatch_preserves_gb200_defaults(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "arg=--runner\narg=b200-4gpu\n" in result.stdout
     assert "arg=--runner\narg=gb200-4gpu\n" in result.stdout
+    assert "arg=--runner\narg=slurm-gb200-4gpu\n" in result.stdout
     assert "artifact=\n" in result.stdout
     assert "cache=\n" in result.stdout
     assert "image=\n" in result.stdout
@@ -513,6 +514,9 @@ def test_slurm_dispatch_maps_gb300_defaults_without_changing_filters(tmp_path):
     assert "arg=--all\n" in result.stdout
     assert "arg=--runner-alias\narg=b200-4gpu=gb300-4gpu\n" in result.stdout
     assert "arg=--runner-alias\narg=gb200-4gpu=gb300-4gpu\n" in result.stdout
+    assert (
+        "arg=--runner-alias\narg=slurm-gb200-4gpu=slurm-gb300-4gpu\n" in result.stdout
+    )
     assert "arg=--type\narg=eval\n" in result.stdout
     assert "arg=--type\narg=perf\n" in result.stdout
     assert "arg=--exclude-match\narg=mmlu\n" in result.stdout

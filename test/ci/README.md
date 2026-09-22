@@ -429,6 +429,23 @@ hardware. A selected YAML follows the same rule; YAMLs that already declare a
 `slurm-dispatch-gb300` coordinators form one shared pool for manual, nightly,
 and per-commit submissions.
 
+The `GB200 Slurm Per Commit` workflow runs single-node `slurm-gb200-*`
+tasks through the `slurm-dispatch` coordinator. Qwen four-GPU tasks migrated
+from B200 use `slurm-gb200-4gpu`: the 397B NVFP4 AIME25 evaluation, 35B FP8
+DeepEP GSM8K evaluation, and 122B EPD OCRBench evaluation and unit test.
+Their existing commands, triggers, and score thresholds are preserved.
+
+It runs automatically for relevant pushes to `main` and non-draft,
+same-repository pull requests; manual dispatch selects the `manual` trigger.
+The ordinary NVIDIA ARM workflow excludes `slurm-*` tasks. The dedicated
+Slurm scan clears `TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS`, so the Kubernetes
+`gb200` exclusion does not disable these tasks. Closing a PR cancels its run;
+the approved-PR and latest-main retry workflows also cover this workflow.
+
+`Slurm Dispatch` includes `slurm-gb200-4gpu` in its default bulk runners.
+Its default `eval,perf` selection covers the three migrated evaluations;
+select `ut` explicitly to include the EPD unit test.
+
 The `GB300 Slurm Per Commit` workflow selects only multi-node model tasks with
 the `per-commit` trigger and submits them through the same
 `slurm-dispatch-gb300` coordinator pool used by manual dispatch. It runs for
@@ -480,6 +497,10 @@ test/ci/run_slurm.sh \
 
 # Every existing YAML for one exact runner label:
 test/ci/run_slurm.sh --all --runner gb200-4gpu --trigger manual
+
+# Migrated Qwen four-GPU evaluations and EPD unit test:
+test/ci/run_slurm.sh --all --runner slurm-gb200-4gpu \
+  --type eval --type ut --trigger manual
 
 # List Kimi eval/perf tasks from PR 795 for two runner labels:
 test/ci/run_slurm.sh \
