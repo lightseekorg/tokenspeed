@@ -113,7 +113,6 @@ from tokenspeed.runtime.layers.attention.page_table import (
     mask_invalid_graph_tokens as _mask_invalid_graph_tokens,
 )
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
-from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
 from tokenspeed.runtime.layers.paged_attention import bind_cache_groups
 from tokenspeed.runtime.layers.quantization import (
     QUANTIZATION_METHODS,
@@ -778,7 +777,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         return self._bind_deepseek_v4_moe_methods(moe)
 
-    def test_deepseek_v4_topk_builds_standard_and_bypassed_outputs(self):
+    def test_deepseek_v4_topk_builds_precomputed_output(self):
         hidden_states = torch.ones((2, 3))
         router_logits = torch.zeros((2, 4))
         correction_bias = torch.zeros(4)
@@ -791,36 +790,18 @@ class TestDeepseekV4Config(unittest.TestCase):
             return topk_weights, topk_ids
 
         with patch.object(deepseek_v4_model, "moe_topk", fake_moe_topk):
-            standard = DeepseekV4TopK(
+            output = DeepseekV4TopK(
                 top_k=2,
                 renormalize=True,
                 correction_bias=correction_bias,
                 routed_scaling_factor=2.0,
-                output_format=TopKOutputFormat.STANDARD,
-                hash_routing=False,
-            )(hidden_states, router_logits)
-            bypassed = DeepseekV4TopK(
-                top_k=2,
-                renormalize=True,
-                correction_bias=correction_bias,
-                routed_scaling_factor=2.0,
-                output_format=TopKOutputFormat.BYPASSED,
                 hash_routing=False,
             )(hidden_states, router_logits)
 
-        self.assertIs(standard.topk_weights, topk_weights)
-        self.assertIs(standard.topk_ids, topk_ids)
+        self.assertIs(output.topk_weights, topk_weights)
+        self.assertIs(output.topk_ids, topk_ids)
+        self.assertIs(output.router_logits, router_logits)
         self.assertEqual(calls[0][0][2:6], ("sqrt_softplus", "topk", True, 2.0))
-        self.assertEqual(calls[1][0][2:6], ("sqrt_softplus", "topk", True, 2.0))
-        torch.testing.assert_close(
-            bypassed.output_scale,
-            topk_weights.sum(dim=-1, keepdim=True),
-        )
-        recovered = bypassed.router_logits.softmax(dim=-1).gather(1, topk_ids.long())
-        torch.testing.assert_close(
-            recovered,
-            topk_weights / topk_weights.sum(dim=-1, keepdim=True),
-        )
 
     def test_deepseek_v4_moe_stream_fork_disabled_order(self):
         calls = []
@@ -928,6 +909,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             moe = DeepseekV4MoE(config, mapping, None, 0, "model.layers.0.ffn")
 
         self.assertEqual(moe.routed_scaling_factor, 2.5)
+        self.assertEqual(captured["routing_mode"], "precomputed_topk")
         self.assertEqual(captured["routing_config"]["routed_scaling_factor"], 1.0)
         self.assertEqual(topk_config["routed_scaling_factor"], 2.5)
 
