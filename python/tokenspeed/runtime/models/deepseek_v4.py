@@ -1868,23 +1868,29 @@ class DeepseekV4MoE(nn.Module):
     def _renormalize_routing_weights(self) -> bool:
         return self.config.norm_topk_prob
 
-    def _forward_routed_experts(
+    def _compute_topk_output(
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None,
-        num_global_tokens: int,
-        max_num_tokens_per_gpu: int,
-    ) -> torch.Tensor:
+    ) -> TopKOutput:
         router_logits, correction_bias, hash_indices_table, routing_input_ids = (
             self._routing_inputs(hidden_states, input_ids)
         )
-        topk_output = self.topk(
+        return self.topk(
             hidden_states,
             router_logits,
             routing_correction_bias=correction_bias,
             hash_indices_table=hash_indices_table,
             input_ids=routing_input_ids,
         )
+
+    def _forward_routed_experts(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+    ) -> torch.Tensor:
         return self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
@@ -1919,12 +1925,14 @@ class DeepseekV4MoE(nn.Module):
         ctx: ForwardContext,
         comm_manager: CommManager,
     ) -> torch.Tensor:
+        with nvtx_range("moe_select_experts"):
+            topk_output = self._compute_topk_output(hidden_states, input_ids)
         shared = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
             with nvtx_range("moe_mega_experts"):
                 routed = self._forward_routed_experts(
                     hidden_states,
-                    input_ids,
+                    topk_output,
                     num_global_tokens,
                     max_num_tokens_per_gpu,
                 )
@@ -1945,12 +1953,14 @@ class DeepseekV4MoE(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
+        with nvtx_range("moe_select_experts"):
+            topk_output = self._compute_topk_output(hidden_states, input_ids)
         shared = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
             with nvtx_range("moe_experts"):
                 routed = self._forward_routed_experts(
                     hidden_states,
-                    input_ids,
+                    topk_output,
                     num_global_tokens,
                     max_num_tokens_per_gpu,
                 )

@@ -724,6 +724,7 @@ class TestDeepseekV4Config(unittest.TestCase):
     def _bind_deepseek_v4_moe_methods(self, moe):
         for name in (
             "_renormalize_routing_weights",
+            "_compute_topk_output",
             "_forward_routed_experts",
             "_forward_shared_experts",
             "forward_mega_moe",
