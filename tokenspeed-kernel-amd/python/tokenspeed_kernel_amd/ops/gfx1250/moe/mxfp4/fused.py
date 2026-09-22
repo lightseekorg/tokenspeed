@@ -1653,7 +1653,7 @@ def _fp8_quantize_kernel(
     HAS_SCALE: tl.constexpr,
     HAS_SCALE_TENSOR: tl.constexpr,
 ):
-    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
     x = tl.load(x_ptr + offsets, mask=mask).to(tl.float32)
     if HAS_SCALE:
@@ -1677,12 +1677,13 @@ def _quantize_fp8_activation(
             raise ValueError("FP8 activation scale must be scalar")
         scale = scale.contiguous()
     out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    _fp8_quantize_kernel[(triton.cdiv(x.numel(), 256),)](
+    block_size = 4096
+    _fp8_quantize_kernel[(triton.cdiv(x.numel(), block_size),)](
         x,
         out,
         1.0 if scale is None else scale,
         x.numel(),
-        BLOCK_SIZE=256,
+        BLOCK_SIZE=block_size,
         HAS_SCALE=scale is not None,
         HAS_SCALE_TENSOR=isinstance(scale, torch.Tensor),
     )
