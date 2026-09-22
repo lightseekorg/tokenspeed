@@ -218,6 +218,59 @@ def test_sparse_index_scores_match_the_dense_scorer(blocks, pages, table_width):
         )
 
 
+def test_sparse_index_scores_compile_once_across_table_and_pool_widths():
+    """One compiled kernel serves every table width and candidate width.
+
+    Prefill slices the page table to the visible history, so its width grows
+    with every chunk and the candidate width follows it on short contexts. A
+    kernel specialised on either would recompile per chunk, which is the
+    stall this guards against: after the first launch, further widths must
+    hit the cache and still match the dense scorer.
+    """
+    from tokenspeed_kernel.ops.attention.dsv41 import cute_dsl, deep_gemm
+    from tokenspeed_kernel.ops.attention.dsv41.triton import candidate_scores
+    from tokenspeed_kernel.platform import pdl_enabled
+
+    if not deep_gemm.is_hopper_indexer_available():
+        pytest.skip("requires the Hopper FP8 indexer")
+    device = torch.device("cuda:0")
+    pages = 300
+    shapes = [(16, 64), (48, 32), (2048, 256), (2048, 128), (64, 300)]
+    compiled_before = None
+    for blocks, table_width in shapes:
+        cache, _, _, queries, folded, table, visible, candidates, capacity = (
+            _hopper_index_case(device, 3, 64, blocks, pages, table_width, 7)
+        )
+        values, scales = deep_gemm._index_planes(cache)
+        actual = cute_dsl.sparse_index_scores(
+            queries,
+            folded,
+            values.view(torch.float8_e4m3fn),
+            scales,
+            table,
+            visible,
+            candidates,
+            pdl_enabled(),
+        )
+        if compiled_before is None:
+            compiled_before = len(cute_dsl._COMPILED)
+        else:
+            assert (
+                len(cute_dsl._COMPILED) == compiled_before
+            ), f"table width {table_width} / {blocks} blocks recompiled"
+        logits = deep_gemm._hopper_paged_scores(
+            (queries,), cache, folded, table, visible, capacity
+        )
+        expected = candidate_scores(logits, candidates)
+        torch.testing.assert_close(
+            torch.isinf(actual), torch.isinf(expected), rtol=0, atol=0
+        )
+        finite = ~torch.isinf(expected)
+        assert (actual[finite] - expected[finite]).norm() <= 1e-3 * expected[
+            finite
+        ].norm()
+
+
 # 255 pages make an int32 table row 1020 bytes, so every chunk after the first
 # lands on an offset that is not 16-byte aligned.
 @pytest.mark.parametrize("pages", [256, 255])

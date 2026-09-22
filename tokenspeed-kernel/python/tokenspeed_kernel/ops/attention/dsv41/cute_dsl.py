@@ -49,12 +49,20 @@ class _GraphSafeDLPack:
         return self._tensor.__dlpack_device__()
 
 
-def _to_cute(tensor, dynamic_rows, align):
-    """Wrap a torch tensor for CuTe, leaving only the row count dynamic.
+def _to_cute(tensor, dynamic, align):
+    """Wrap a torch tensor for CuTe with the requested specialisation.
 
-    Every other extent stays static so the candidate width and table width
-    become compile-time tile counts, and every stride is compiled in as well;
-    the compile cache keys on all of them.
+    ``dynamic`` is one of:
+
+    * ``"static"`` -- every extent and stride is compiled in (the cache planes,
+      whose geometry is fixed for the life of the process).
+    * ``"rows"`` -- only the row count is a kernel argument; the remaining
+      extents become compile-time tile counts and the strides are compiled in
+      (queries, weights, visible: head count and head width are fixed).
+    * ``"layout"`` -- every extent and every stride but the unit one is a
+      kernel argument. The page table is sliced to the visible history and
+      the candidate width follows it, so a prefill chunk sees a new width
+      every time; specialising on it would recompile per chunk.
 
     ``align`` is a promise about the data pointer, so it has to hold for the
     row slices the caller chunks the batch into, not just for whole tensors.
@@ -62,11 +70,22 @@ def _to_cute(tensor, dynamic_rows, align):
     from cutlass.cute.runtime import from_dlpack
 
     wrapped = from_dlpack(_GraphSafeDLPack(tensor.detach()), assumed_align=align)
-    if dynamic_rows:
+    if dynamic == "rows":
         wrapped = wrapped.mark_compact_shape_dynamic(
             mode=0, stride_order=tuple(range(tensor.dim()))
         )
+    elif dynamic == "layout":
+        wrapped = wrapped.mark_layout_dynamic(leading_dim=tensor.dim() - 1)
     return wrapped
+
+
+def _specialised(tensor, dynamic):
+    """The extents and strides ``_to_cute`` compiles in for ``dynamic``."""
+    if dynamic == "static":
+        return (tuple(tensor.shape), tensor.stride())
+    if dynamic == "rows":
+        return (tuple(tensor.shape[1:]), tensor.stride())
+    return ()
 
 
 def _kernel():
@@ -200,14 +219,14 @@ def sparse_index_scores(
     # every chunk after the first on a 1020-byte offset. The index tensors are
     # read one element at a time, so four bytes is the honest promise for them.
     operands = (
-        (queries, True, 16),
-        (weights, True, 16),
-        (values, False, 16),
-        (scales, False, 16),
-        (table, True, 4),
-        (visible, True, 4),
-        (candidates, True, 4),
-        (out, True, 16),
+        (queries, "rows", 16),
+        (weights, "rows", 16),
+        (values, "static", 16),
+        (scales, "static", 16),
+        (table, "layout", 4),
+        (visible, "rows", 4),
+        (candidates, "layout", 4),
+        (out, "layout", 16),
     )
     args = tuple(_to_cute(*operand) for operand in operands)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -218,15 +237,11 @@ def sparse_index_scores(
     # cute.compile specialises on element type, extent and stride, so the key
     # is derived from exactly those rather than listed by hand: a hand-written
     # key has already been found short twice, and a missing entry silently
-    # hands one caller another's compiled binary. A row count marked dynamic
-    # is a kernel argument rather than a specialisation, so it stays out.
+    # hands one caller another's compiled binary. Whatever _to_cute marked
+    # dynamic is a kernel argument rather than a specialisation, so it stays out.
     key = (bool(enable_pdl),) + tuple(
-        (
-            tensor.dtype,
-            tuple(tensor.shape[1:] if dynamic_rows else tensor.shape),
-            tensor.stride(),
-        )
-        for tensor, dynamic_rows, _ in operands
+        (tensor.dtype,) + _specialised(tensor, dynamic)
+        for tensor, dynamic, _ in operands
     )
     compiled = _COMPILED.get(key)
     if compiled is None:
