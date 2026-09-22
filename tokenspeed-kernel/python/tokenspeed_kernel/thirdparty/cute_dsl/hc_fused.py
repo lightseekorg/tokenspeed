@@ -180,14 +180,14 @@ def _cluster_arrive(bar):
 
 
 @cute.jit
-def _cluster_wait(bar):
+def _cluster_wait(bar, phase):
     llvm.inline_asm(
         None,
-        [bar.toint().ir_value()],
+        [bar.toint().ir_value(), cutlass.Int32(phase).ir_value()],
         "{ .reg .pred ready; wait_loop: "
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 ready, [$0], 0; "
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 ready, [$0], $1; "
         "@!ready bra wait_loop; }",
-        "r,~{memory}",
+        "r,r,~{memory}",
         has_side_effects=True,
         asm_dialect=0,
     )
@@ -214,9 +214,17 @@ class FusedGatedResidualKernel:
 
     def __init__(
         self,
+        *,
+        projection_tile: int,
         token_tile: int,
         projection_rows: int,
         split_k: int,
+        projection_tiles: int,
+        batch_tiles: int,
+        workers: int,
+        stages: int,
+        final_tile: int,
+        rounds: int,
         use_pdl: bool,
         scale: float,
         weights_independent: bool,
@@ -225,6 +233,12 @@ class FusedGatedResidualKernel:
     ):
         if split_k not in (1, 2, 4, 8, 16):
             raise ValueError("The fused HC tactic requires split-K in 1, 2, 4, 8, 16")
+        if projection_tile not in (64, 128) or token_tile not in (8, 16, 32, 64):
+            raise ValueError("Unsupported native MMA tile")
+        if final_tile not in (16, 32):
+            raise ValueError("Final hidden tile must be 16 or 32")
+        if min(projection_tiles, batch_tiles, workers, stages, rounds) < 1:
+            raise ValueError("Tile counts, workers and stages must be positive")
         self.single_tile = single_tile
         self.full_tiles = full_tiles
         self.p = projection_rows
@@ -232,30 +246,6 @@ class FusedGatedResidualKernel:
         self.split_k = split_k
         self.down_k = 128
         self.k_tiles = 10240 // split_k // self.down_k
-        self.pdl = use_pdl
-        self.scale = scale
-        self.weights_independent = weights_independent
-        self.group = tcgen05.CtaGroup.ONE
-        self.configure(64, token_tile, 1, 1, 1, min(self.k_tiles, 5), 32, 1)
-
-    def configure(
-        self,
-        projection_tile: int,
-        token_tile: int,
-        projection_tiles: int,
-        batch_tiles: int,
-        workers: int,
-        stages: int,
-        final_tile: int,
-        rounds: int,
-    ):
-        """Set independent output tiling and persistent work per CTA group."""
-        if projection_tile not in (64, 128) or token_tile not in (8, 16, 32, 64):
-            raise ValueError("Unsupported native MMA tile")
-        if final_tile not in (16, 32):
-            raise ValueError("Final hidden tile must be 16 or 32")
-        if min(projection_tiles, batch_tiles, workers, stages, rounds) < 1:
-            raise ValueError("Tile counts, workers and stages must be positive")
         if stages > self.k_tiles:
             raise ValueError("Down stages must not exceed the per-rank K tile count")
         self.down_m = projection_tile
@@ -270,40 +260,15 @@ class FusedGatedResidualKernel:
         self.final_tile = final_tile
         self.up_m = 4 * final_tile
         self.up_tiles = 2560 // final_tile
-        self.clusters = (self.p + projection_tile * projection_tiles - 1) // (
+        self.clusters = (projection_rows + projection_tile * projection_tiles - 1) // (
             projection_tile * projection_tiles
         )
-        self.group_ctas = self.clusters * self.split_k
-        self.owner_cols = projection_tile // self.split_k
-        # Preserve the original specialization's launch allocation. Other
-        # configurations use the complete fused allocation, rounded for TMA.
-        allocation = (
-            (
-                projection_tile * stages + self.up_m * 3
-                if token_tile <= 16
-                else max(projection_tile * stages, self.up_m * 3)
-            )
-            * 128
-            * 2
-            + token_tile * 128 * (stages + 3) * 2
-            + (
-                self.up_m + projection_tile
-                if token_tile <= 16
-                else max(self.up_m, projection_tile)
-            )
-            * token_tile
-            * 4
-            + (projection_tile + 4) * token_tile * 4
-            + 512
-        )
-        self.smem_bytes = (allocation + 1023) // 1024 * 1024
-        if (
-            projection_tile == 64
-            and token_tile in (8, 16)
-            and stages == 5
-            and final_tile == 32
-        ):
-            self.smem_bytes = 227 * 1024
+        self.group_ctas = self.clusters * split_k
+        self.owner_cols = projection_tile // split_k
+        self.pdl = use_pdl
+        self.scale = scale
+        self.weights_independent = weights_independent
+        self.group = tcgen05.CtaGroup.ONE
 
     @cute.experimental.jit
     def __call__(self, x, w, u, activation, epochs, out, inject, stream: CUstream):
@@ -324,7 +289,6 @@ class FusedGatedResidualKernel:
             grid=(self.clusters, self.split_k, workers),
             cluster=(1, self.split_k, 1),
             block=(192, 1, 1),
-            smem=self.smem_bytes,
             stream=stream,
             use_pdl=self.pdl,
             cooperative=self.clusters > 1,
@@ -371,10 +335,8 @@ class FusedGatedResidualKernel:
     def _prefetch_x(
         self, x_regs, coords, x_values, pid, token, full_tile: cutlass.Constexpr
     ):
-        # The dispatch contract bounds rows to signed 32 bits. Compare native
-        # row offsets with the tile's remaining rows so every element need not
-        # reconstruct its global row for the predicate. Widen the tile address
-        # before adding those offsets to preserve linear, 64-bit addressing.
+        # Compare native row offsets with the tile's remaining rows. Widen the
+        # tile address before adding them to preserve linear 64-bit addressing.
         for i in cutlass.range_constexpr(cute.size(x_regs)):
             col, row = coords[i]
             global_row = row + token * self.n
@@ -440,6 +402,46 @@ class FusedGatedResidualKernel:
                 update_expect_tx=False,
             )
 
+    @cute.experimental.jit
+    def _initialize_barriers(self, bars, warp):
+        """Initialize shared barriers once for all projection and token phases."""
+        down_full = bars
+        down_empty = down_full + self.down_stages
+        down_done = down_empty + self.down_stages
+        epi_done = down_done + 1
+        up_full = epi_done + 1
+        control_ready = up_full + 3
+        projection_ready = control_ready + 1
+        up_done = projection_ready + 1
+        reduce_ready = up_done + 1
+        cluster_done = reduce_ready + 1
+        up_empty = cluster_done + 1
+        consumed = up_empty + int(self.group_ctas < self.up_tiles)
+        if warp == 4:
+            with cute.arch.elect_one():
+                for stage in cutlass.range_constexpr(self.down_stages):
+                    cute.arch.mbarrier_init(down_full + stage, 2)
+                if cutlass.const_expr(self.k_tiles > self.down_stages):
+                    for stage in cutlass.range_constexpr(self.down_stages):
+                        cute.arch.mbarrier_init(down_empty + stage, 1)
+                cute.arch.mbarrier_init(down_done, 1)
+                cute.arch.mbarrier_init(epi_done, 128)
+                for stage in cutlass.range_constexpr(3):
+                    cute.arch.mbarrier_init(up_full + stage, 2)
+                cute.arch.mbarrier_init(control_ready, 1)
+                cute.arch.mbarrier_init(projection_ready, 1)
+                cute.arch.mbarrier_init(up_done, 1)
+                cute.arch.mbarrier_init(reduce_ready, 1)
+                cute.arch.mbarrier_init(cluster_done, self.split_k)
+                if cutlass.const_expr(self.group_ctas < self.up_tiles):
+                    cute.arch.mbarrier_init(up_empty, 1)
+                if cutlass.const_expr(self.rounds * self.batch_tiles > 1):
+                    cute.arch.mbarrier_init(consumed, self.split_k)
+        # Remote DSM destinations must be initialized before any peer store.
+        cute.arch.mbarrier_init_fence()
+        cute.arch.cluster_arrive_relaxed()
+        cute.arch.cluster_wait()
+
     @cute.experimental.kernel
     def kernel(self, x, w, up, activation, epochs, out, inject):
         tid = cute.arch.thread_idx()[0]
@@ -448,7 +450,7 @@ class FusedGatedResidualKernel:
         split_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         pid = cluster * self.split_k + split_rank
         worker = 0
-        if cutlass.const_expr(self.workers > 1):
+        if cutlass.const_expr(self.clusters == 1 or self.workers > 1):
             worker = cute.arch.block_idx()[2]
         dtype = x.element_type
         down_mma = sm100_utils.make_trivial_tiled_mma(
@@ -569,9 +571,11 @@ class FusedGatedResidualKernel:
             if cutlass.const_expr(self.pdl):
                 cute.arch.griddepcontrol_wait()
                 cute.arch.griddepcontrol_launch_dependents()
+        self._initialize_barriers(bars, warp)
         token_tiles = cutlass.Int32(cute.ceil_div(x.shape[0], self.n))
         for job_round in cutlass.range(self.rounds, unroll_full=self.rounds == 1):
             for micro in cutlass.range_constexpr(self.batch_tiles):
+                tile_iteration = job_round * self.batch_tiles + micro
                 token = (job_round * self.workers + worker) * self.batch_tiles + micro
                 if cutlass.const_expr(self.single_tile):
                     token = 0
@@ -594,6 +598,7 @@ class FusedGatedResidualKernel:
                         pid,
                         worker,
                         token,
+                        tile_iteration,
                         down_mma,
                         up_mma,
                         sd,
@@ -631,6 +636,7 @@ class FusedGatedResidualKernel:
         pid,
         worker,
         token,
+        tile_iteration,
         down_mma,
         up_mma,
         sd,
@@ -668,34 +674,19 @@ class FusedGatedResidualKernel:
         if cutlass.const_expr(self.clusters == 1):
             epoch_half = epochs.shape[0] // 2
         generation = cutlass.Int64(0)
+        up_steps = (self.up_tiles + self.group_ctas - 1) // self.group_ctas
+        cta_up_steps = (self.up_tiles + self.group_ctas - 1 - pid) // self.group_ctas
+        tile_phase = tile_iteration % 2
         for projection_step in cutlass.range_constexpr(self.projection_tiles):
             projection = cluster + projection_step * self.clusters
-            if warp == 4:
-                with cute.arch.elect_one():
-                    # Down only needs empty barriers when its stages are recycled.
-                    for stage in cutlass.range_constexpr(self.down_stages):
-                        cute.arch.mbarrier_init(down_full + stage, 2)
-                    if cutlass.const_expr(self.k_tiles > self.down_stages):
-                        for stage in cutlass.range_constexpr(self.down_stages):
-                            cute.arch.mbarrier_init(down_empty + stage, 1)
-                    cute.arch.mbarrier_init(down_done, 1)
-                    cute.arch.mbarrier_init(epi_done, 128)
-                    for stage in cutlass.range_constexpr(3):
-                        cute.arch.mbarrier_init(up_full + stage, 2)
-                    cute.arch.mbarrier_init(control_ready, 1)
-                    cute.arch.mbarrier_init(projection_ready, 1)
-                    cute.arch.mbarrier_init(up_done, 1)
-                    cute.arch.mbarrier_init(reduce_ready, 1)
-                    cute.arch.mbarrier_init(cluster_done, self.split_k)
-                    if cutlass.const_expr(self.group_ctas < self.up_tiles):
-                        cute.arch.mbarrier_init(up_empty, 1)
-                    if cutlass.const_expr(self.rounds * self.batch_tiles > 1):
-                        cute.arch.mbarrier_init(consumed, self.split_k)
-            # Every remote destination and its mbarrier must exist before a peer
-            # can issue st.async.shared::cluster into it.
-            cute.arch.mbarrier_init_fence()
-            cute.arch.cluster_arrive_relaxed()
-            cute.arch.cluster_wait()
+            projection_iteration = (
+                tile_iteration * self.projection_tiles + projection_step
+            )
+            projection_phase = projection_iteration % 2
+            epi_phase = (
+                tile_iteration * (self.projection_tiles + cta_up_steps)
+                + projection_step
+            ) % 2
             if warp == 4:
                 # Both weight projections use this one producer. No activation
                 # dependency precedes their initial loads in independent mode.
@@ -707,8 +698,6 @@ class FusedGatedResidualKernel:
                     w, (self.down_m, self.down_k), (projection, None, 0)
                 )
                 for stage in cutlass.range_constexpr(self.down_stages):
-                    if cutlass.const_expr(self.k_tiles > self.down_stages):
-                        cute.arch.mbarrier_wait(down_empty + stage, 1)
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive_and_expect_tx(
                             down_full + stage, self.down_m * self.down_k * 2
@@ -730,8 +719,14 @@ class FusedGatedResidualKernel:
                 # Up weight requests have already been issued before that wait.
                 for tile in cutlass.range_constexpr(self.down_stages, self.k_tiles):
                     stage = tile % self.down_stages
+                    stage_uses = (
+                        self.k_tiles + self.down_stages - 1 - stage
+                    ) // self.down_stages
+                    down_iteration = (
+                        projection_iteration * stage_uses + tile // self.down_stages
+                    )
                     cute.arch.mbarrier_wait(
-                        down_empty + stage, (tile // self.down_stages - 1) % 2
+                        down_empty + stage, (down_iteration - 1) % 2
                     )
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive_and_expect_tx(
@@ -749,15 +744,14 @@ class FusedGatedResidualKernel:
                     if cutlass.const_expr(self.n > 16):
                         # The shared weight allocation changes ownership only
                         # after the final Down MMA read has completed.
-                        cute.arch.mbarrier_wait(down_done, 0)
+                        cute.arch.mbarrier_wait(down_done, projection_phase)
                         if pid < self.up_tiles:
                             self._load_up(up, su, up_full, map_u, pid)
-                    for up_step in cutlass.range_constexpr(
-                        1, (self.up_tiles + self.group_ctas - 1) // self.group_ctas
-                    ):
+                    for up_step in cutlass.range_constexpr(1, up_steps):
                         up_id = pid + up_step * self.group_ctas
                         if up_id < self.up_tiles:
-                            cute.arch.mbarrier_wait(up_empty, (up_step - 1) % 2)
+                            up_iteration = tile_iteration * cta_up_steps + up_step
+                            cute.arch.mbarrier_wait(up_empty, (up_iteration - 1) % 2)
                             map_u = cute_ext.get_cta_v_map_ab(up, up_tiler, up_mma, "A")
                             self._load_up(up, su, up_full, map_u, up_id)
             elif warp == 5:
@@ -811,7 +805,12 @@ class FusedGatedResidualKernel:
                 )
                 for tile in cutlass.range_constexpr(self.k_tiles):
                     stage = tile % self.down_stages
-                    phase = tile // self.down_stages % 2
+                    stage_uses = (
+                        self.k_tiles + self.down_stages - 1 - stage
+                    ) // self.down_stages
+                    phase = (
+                        projection_iteration * stage_uses + tile // self.down_stages
+                    ) % 2
                     cute.arch.mbarrier_wait(down_full + stage, phase)
                     with cute.arch.elect_one():
                         for kb in cutlass.range_constexpr(self.down_k // 16):
@@ -827,12 +826,12 @@ class FusedGatedResidualKernel:
                             tcgen05.commit(down_empty + stage, None, self.group)
                 with cute.arch.elect_one():
                     tcgen05.commit(down_done, None, self.group)
-                cute.arch.mbarrier_wait(epi_done, 0)
+                cute.arch.mbarrier_wait(epi_done, epi_phase)
                 if cutlass.const_expr(projection_step == self.projection_tiles - 1):
                     with cute.arch.elect_one():
                         _cluster_arrive(cluster_done)
                         if split_rank == 0:
-                            _cluster_wait(cluster_done)
+                            _cluster_wait(cluster_done, tile_phase)
                             _store_epoch_release(
                                 epochs.iterator + worker * self.clusters + cluster,
                                 generation,
@@ -852,11 +851,10 @@ class FusedGatedResidualKernel:
                     cute.arch.sync_warp(mask=0xFFFFFFFF)
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive(projection_ready)
-                    for up_step in cutlass.range_constexpr(
-                        (self.up_tiles + self.group_ctas - 1) // self.group_ctas
-                    ):
+                    for up_step in cutlass.range_constexpr(up_steps):
                         up_id = pid + up_step * self.group_ctas
                         if up_id < self.up_tiles:
+                            up_phase = (tile_iteration * cta_up_steps + up_step) % 2
                             up_acc = cute.make_tensor(
                                 cute.arch.retrieve_tmem_ptr(
                                     cutlass.Float32, 16, tmem_base
@@ -880,9 +878,9 @@ class FusedGatedResidualKernel:
                                 k_dim=0,
                                 max_shift=0,
                             )
-                            # A K64 group spans extent*128 bytes. Every group base is
-                            # 1024-byte aligned, so swizzle/base/layout fields are unchanged.
-                            # The 14-bit start field uses16-byte units, with no carry here.
+                            # K64 group bases are 1024-byte aligned, preserving
+                            # swizzle/base/layout fields. The 14-bit start field
+                            # uses 16-byte units, with no carry here.
                             up_a = su[None, None, 0, 0]
                             up_b = sa[None, None, 0, 0]
                             desc_a = tcgen05.smem_descriptor_to_int(
@@ -902,7 +900,7 @@ class FusedGatedResidualKernel:
                                 )
                             )
                             for stage in cutlass.range_constexpr(3):
-                                cute.arch.mbarrier_wait(up_full + stage, up_step % 2)
+                                cute.arch.mbarrier_wait(up_full + stage, up_phase)
                                 with cute.arch.elect_one():
                                     for block in cutlass.range_constexpr(
                                         8 if stage < 2 else 4
@@ -923,9 +921,11 @@ class FusedGatedResidualKernel:
                                 tcgen05.commit(up_done, None, self.group)
                                 if cutlass.const_expr(self.group_ctas < self.up_tiles):
                                     tcgen05.commit(up_empty, None, self.group)
-                            # Phase zero acknowledged down reads and DSM reduction. Phase one
-                            # acknowledges all up reads, before the independent gate work.
-                            cute.arch.mbarrier_wait(epi_done, (up_step + 1) % 2)
+                            # Each phase acknowledges the preceding TMEM read
+                            # before its storage is reused by the next step.
+                            cute.arch.mbarrier_wait(
+                                epi_done, (epi_phase + up_step + 1) % 2
+                            )
                     if cutlass.const_expr(self.single_tile):
                         tcgen05_fence("after_thread_sync")
                         cute.arch.dealloc_tmem(
@@ -935,15 +935,23 @@ class FusedGatedResidualKernel:
                         )
             elif warp < 4:
                 epi_tid = tid
-                cute.arch.mbarrier_wait(control_ready, 0)
+                cute.arch.mbarrier_wait(control_ready, projection_phase)
                 if warp == 0:
                     map_x = cute_ext.get_cta_v_map_ab(x, down_tiler, down_mma, "B")
                     gx = cute.local_tile(x, (self.n, self.down_k), (token, None, 0))
                     for tile in cutlass.range_constexpr(self.k_tiles):
                         stage = tile % self.down_stages
-                        phase = (tile // self.down_stages + 1) % 2
-                        if cutlass.const_expr(self.k_tiles > self.down_stages):
-                            cute.arch.mbarrier_wait(down_empty + stage, phase)
+                        if cutlass.const_expr(tile >= self.down_stages):
+                            stage_uses = (
+                                self.k_tiles + self.down_stages - 1 - stage
+                            ) // self.down_stages
+                            down_iteration = (
+                                projection_iteration * stage_uses
+                                + tile // self.down_stages
+                            )
+                            cute.arch.mbarrier_wait(
+                                down_empty + stage, (down_iteration - 1) % 2
+                            )
                         with cute.arch.elect_one():
                             cute.arch.mbarrier_arrive_and_expect_tx(
                                 down_full + stage, self.n * self.down_k * 2
@@ -956,7 +964,7 @@ class FusedGatedResidualKernel:
                             tma_operation_type=cute_ext.OperationTypeEnum.SM90_TMA_LOAD,
                             update_expect_tx=False,
                         )
-                cute.arch.mbarrier_wait(down_done, 0)
+                cute.arch.mbarrier_wait(down_done, projection_phase)
                 down_acc, down_thr, down_values, down_coords = self._accumulator_tile(
                     tmem_base, down_acc_layout, self.down_m, activation, epi_tid
                 )
@@ -993,7 +1001,7 @@ class FusedGatedResidualKernel:
                         reduce_ready,
                         owner,
                     )
-                cute.arch.mbarrier_wait(reduce_ready, 0)
+                cute.arch.mbarrier_wait(reduce_ready, projection_phase)
                 for part in cutlass.range_constexpr(
                     (self.n * self.owner_cols + 127) // 128
                 ):
@@ -1031,7 +1039,7 @@ class FusedGatedResidualKernel:
                             else:
                                 _store_tail(
                                     inject.iterator
-                                    + (token * self.n + row) * 4
+                                    + (cutlass.Int64(token) * self.n + row) * 4
                                     + col
                                     - 320,
                                     value.to(dtype),
@@ -1043,17 +1051,20 @@ class FusedGatedResidualKernel:
                 cute.arch.mbarrier_arrive(epi_done)
                 if cutlass.const_expr(projection_step == self.projection_tiles - 1):
                     epi_tid = tid
-                    cute.arch.mbarrier_wait(projection_ready, 0)
-                    for up_step in cutlass.range_constexpr(
-                        (self.up_tiles + self.group_ctas - 1) // self.group_ctas
-                    ):
+                    cute.arch.mbarrier_wait(projection_ready, tile_phase)
+                    for up_step in cutlass.range_constexpr(up_steps):
                         up_id = pid + up_step * self.group_ctas
                         if up_id < self.up_tiles:
+                            up_phase = (tile_iteration * cta_up_steps + up_step) % 2
                             if cutlass.const_expr(up_step > 0):
                                 _epilogue_barrier()
                             if warp == 0:
                                 if cutlass.const_expr(up_step > 0):
-                                    cute.arch.mbarrier_wait(up_empty, (up_step - 1) % 2)
+                                    cute.arch.mbarrier_wait(
+                                        up_empty,
+                                        (tile_iteration * cta_up_steps + up_step - 1)
+                                        % 2,
+                                    )
                                 workspace_rows = self.workers * self.slot_rows
                                 if cutlass.const_expr(self.clusters == 1):
                                     workspace_rows = activation.shape[0]
@@ -1100,11 +1111,10 @@ class FusedGatedResidualKernel:
                                 x_values,
                                 up_id,
                                 token,
-                                up_step % 2,
+                                up_phase,
                             )
-                            # All 128 readers have completed their tcgen05.wait::ld before
-                            # releasing this second phase. Gate/output use only registers
-                            # and shared memory, so TMEM can now be retired concurrently.
+                            # All 128 readers complete tcgen05.wait::ld before
+                            # releasing this phase. Gate/output no longer use TMEM.
                             tcgen05_fence("before_thread_sync")
                             cute.arch.mbarrier_arrive(epi_done)
                             for i in cutlass.range_constexpr(cute.size(gates)):
@@ -1133,7 +1143,7 @@ class FusedGatedResidualKernel:
                                 else:
                                     _store_tail(
                                         out.iterator
-                                        + (row + token * self.n) * 2560
+                                        + (row + cutlass.Int64(token) * self.n) * 2560
                                         + up_id * self.final_tile
                                         + j,
                                         (value * 0.25).to(dtype),
@@ -1152,7 +1162,7 @@ class FusedGatedResidualKernel:
                 with cute.arch.elect_one():
                     _cluster_arrive(consumed)
                     if split_rank == 0:
-                        _cluster_wait(consumed)
+                        _cluster_wait(consumed, tile_phase)
                         _store_epoch_release(
                             epochs.iterator
                             + epoch_half

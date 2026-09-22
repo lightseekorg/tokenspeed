@@ -47,6 +47,18 @@ LOWRANK = 320
 WIDE = HC_COUNT * HIDDEN_SIZE
 
 
+def _fused_diagnostic_workspace(device: torch.device, projection_rows: int):
+    from tokenspeed_kernel.ops.residual.cute_fused import _workspace_for_plan
+
+    return _workspace_for_plan(
+        device,
+        projection_rows,
+        1,
+        (projection_rows + 63) // 64,
+        16,
+    )
+
+
 @pytest.fixture(autouse=True)
 def restore_kernel_state():
     previous_pdl = pdl_enabled()
@@ -829,8 +841,6 @@ def test_fused_cute_dispatch_checks_all_tma_alignments(input_index, offset):
 
 @pytest.mark.parametrize("has_inject", [False, True])
 def test_fused_cute_graphs_share_ordered_generations(has_inject):
-    from tokenspeed_kernel.ops.residual.cute_fused import _persistent_workspace
-
     _require_fused_hc()
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     graphs = []
@@ -863,7 +873,9 @@ def test_fused_cute_graphs_share_ordered_generations(has_inject):
                     projection_scale=1.0,
                     weights_independent=True,
                 )
-            raw, count = _persistent_workspace(values[0][0].device, projection_rows)
+            raw, count = _fused_diagnostic_workspace(
+                values[0][0].device, projection_rows
+            )
             generation = 2**32 - 1
             # All consumed projection elements must be overwritten even when
             # the workspace is uninitialized and row counts change in a graph.
@@ -936,7 +948,23 @@ def test_fused_cluster_split_k_does_not_exceed_sixteen():
     from tokenspeed_kernel.thirdparty.cute_dsl.hc_fused import FusedGatedResidualKernel
 
     with pytest.raises(ValueError, match="split-K"):
-        FusedGatedResidualKernel(8, 324, 32, True, 1.0, True, True, True)
+        FusedGatedResidualKernel(
+            projection_tile=64,
+            token_tile=8,
+            projection_rows=324,
+            split_k=32,
+            projection_tiles=1,
+            batch_tiles=1,
+            workers=1,
+            stages=2,
+            final_tile=32,
+            rounds=1,
+            use_pdl=True,
+            scale=1.0,
+            weights_independent=True,
+            single_tile=True,
+            full_tiles=True,
+        )
 
 
 @pytest.mark.parametrize(
@@ -952,7 +980,6 @@ def test_fused_down_consumes_every_k128_stage_on_graph_replay(
     rows, dtype, has_inject, down_stages, monkeypatch
 ):
     from tokenspeed_kernel.ops.residual import cute_fused
-    from tokenspeed_kernel.ops.residual.cute_fused import _persistent_workspace
 
     _require_fused_hc()
 
@@ -999,7 +1026,7 @@ def test_fused_down_consumes_every_k128_stage_on_graph_replay(
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         call()
-        storage, _ = _persistent_workspace(x.device, w.shape[0])
+        storage, _ = _fused_diagnostic_workspace(x.device, w.shape[0])
     stream.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
@@ -1043,8 +1070,6 @@ def test_fused_down_consumes_every_k128_stage_on_graph_replay(
 def test_fused_distributed_reduce_applies_activation_after_complete_sum(
     rows, dtype, has_inject
 ):
-    from tokenspeed_kernel.ops.residual.cute_fused import _persistent_workspace
-
     _require_fused_hc()
     x, w, u = _inputs(rows, dtype, seed=5711 + rows)
     if not has_inject:
@@ -1062,7 +1087,7 @@ def test_fused_distributed_reduce_applies_activation_after_complete_sum(
     w[:, ::640] = columns[:, None] * pattern[None, :]
     scale = 0.25
     pdl_enabled(True)
-    storage, epochs = _persistent_workspace(x.device, w.shape[0])
+    storage, epochs = _fused_diagnostic_workspace(x.device, w.shape[0])
     storage.fill_(-1)
     actual = _mix(
         (x, w, u),

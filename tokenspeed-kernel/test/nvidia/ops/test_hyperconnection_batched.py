@@ -317,14 +317,19 @@ def test_serialized_stream_graphs_share_plans_and_workspaces(monkeypatch):
     )
 
     states = []
-    with mock.patch.object(
-        cute_fused.cute_ext,
-        "compile",
-        side_effect=AssertionError("warmed stream graphs must share compiled plans"),
-    ), mock.patch.object(
-        cute_fused,
-        "_capacity",
-        side_effect=AssertionError("warmed stream graphs must reuse occupancy"),
+    with (
+        mock.patch.object(
+            cute_fused.cute_ext,
+            "compile",
+            side_effect=AssertionError(
+                "warmed stream graphs must share compiled plans"
+            ),
+        ),
+        mock.patch.object(
+            cute_fused,
+            "_capacity",
+            side_effect=AssertionError("warmed stream graphs must reuse occupancy"),
+        ),
     ):
         for stream, stream_values in zip(streams, values):
             graph = torch.cuda.CUDAGraph()
@@ -365,10 +370,11 @@ def test_stream_capacity_selects_worker_key_without_stream_key(monkeypatch):
         return kernel.clusters * resident_workers[stream_id]
 
     values = inputs(97, torch.bfloat16, True)
-    with mock.patch.object(
-        cute_fused.cute_ext, "compile", side_effect=fake_compile
-    ) as compile_kernel, mock.patch.object(
-        cute_fused, "_capacity", side_effect=fake_capacity
+    with (
+        mock.patch.object(
+            cute_fused.cute_ext, "compile", side_effect=fake_compile
+        ) as compile_kernel,
+        mock.patch.object(cute_fused, "_capacity", side_effect=fake_capacity),
     ):
         for stream in streams:
             stream.wait_stream(torch.cuda.current_stream())
@@ -407,14 +413,38 @@ def test_compiled_capacity_guards_cooperative_grid(monkeypatch):
         assert kernel.clusters * kernel.workers <= clusters
 
 
-def test_wider_native_tile_does_not_inherit_small_tile_smem_override():
-    kernel = cute_fused.FusedGatedResidualKernel(8, 324, 4, True, 1.0, True, True, True)
-    kernel.configure(64, 8, 1, 1, 1, 5, 32, 1)
-    assert kernel.smem_bytes == 227 * 1024
-    # This oversized tuning configuration must advertise its actual storage
-    # requirement so the compiler/driver rejects it instead of underallocating.
-    kernel.configure(64, 64, 1, 1, 1, 5, 32, 1)
-    assert kernel.smem_bytes == 274 * 1024
+def test_kernel_configuration_is_complete_at_construction():
+    def make(token_tile):
+        return cute_fused.FusedGatedResidualKernel(
+            projection_tile=64,
+            token_tile=token_tile,
+            projection_rows=324,
+            split_k=4,
+            projection_tiles=1,
+            batch_tiles=1,
+            workers=1,
+            stages=5,
+            final_tile=32,
+            rounds=1,
+            use_pdl=True,
+            scale=1.0,
+            weights_independent=True,
+            single_tile=True,
+            full_tiles=True,
+        )
+
+    small = make(8)
+    wide = make(64)
+    assert (small.n, small.slot_rows, small.tmem_columns) == (8, 16, 32)
+    assert (wide.n, wide.slot_rows, wide.tmem_columns) == (64, 64, 64)
+    assert "configure" not in vars(type(small))
+    assert "smem_bytes" not in vars(small)
+
+
+def test_exact_override_rejects_unvalidated_row_count():
+    values = inputs(1025, torch.bfloat16, True)
+    with pytest.raises(ValueError, match="at most 1024 rows"):
+        mix(values, 1.0, True)
 
 
 @pytest.mark.parametrize(
@@ -442,14 +472,17 @@ def test_dynamic_rows_reuse_plan_in_eager_and_capture(row_counts, dtype, monkeyp
     plans = dict(cute_fused._PLANS)
     workspaces = dict(cute_fused._WORKSPACES)
     graph = torch.cuda.CUDAGraph()
-    with mock.patch.object(
-        cute_fused.cute_ext,
-        "compile",
-        side_effect=AssertionError("row changes must reuse the compiled tactic"),
-    ), mock.patch.object(
-        cute_fused,
-        "_capacity",
-        side_effect=AssertionError("row changes must reuse the occupancy result"),
+    with (
+        mock.patch.object(
+            cute_fused.cute_ext,
+            "compile",
+            side_effect=AssertionError("row changes must reuse the compiled tactic"),
+        ),
+        mock.patch.object(
+            cute_fused,
+            "_capacity",
+            side_effect=AssertionError("row changes must reuse the occupancy result"),
+        ),
     ):
         # Capture unseen sizes, including a different active worker count
         # sharing the already warmed workspace.

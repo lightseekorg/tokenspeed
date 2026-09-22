@@ -50,8 +50,8 @@ except ImportError:
 _CACHE_LOCK = threading.Lock()
 _WORKSPACES = {}
 _WORKSPACE_LOCK = threading.Lock()
-_SPLIT_K = 16
-_MAX_TOKENS = 2**31 - 1
+_PROBE_SPLIT_K = 16
+_MAX_OVERRIDE_TOKENS = 1024
 _PLANS = {}
 _CAPACITIES = {}
 
@@ -61,7 +61,9 @@ def _resident_clusters(index: int, stream: int) -> int:
     # CuTe queries cuOccupancyMaxActiveClusters with the device's maximum
     # shared-memory allocation. The stream also identifies a green context.
     with torch.cuda.device(index):
-        return HardwareInfo(index).get_max_active_clusters(_SPLIT_K, CUstream(stream))
+        return HardwareInfo(index).get_max_active_clusters(
+            _PROBE_SPLIT_K, CUstream(stream)
+        )
 
 
 def supports_fused_hc(device: torch.device) -> bool:
@@ -107,10 +109,9 @@ def _workspace_for_plan(
                         "fused CuTe HC workspace is not initialized for CUDA graph "
                         "capture; warm up this workspace layout before capture"
                     )
-                # Opaque 16-bit storage allows ordered BF16/FP16 calls on the
-                # model execution lane to reuse one layout workspace. The
-                # invocation supplies the typed view. Reducers overwrite every
-                # consumed post-SiLU activation.
+                # Ordered BF16/FP16 calls reuse opaque 16-bit storage through
+                # an invocation-typed view. Reducers overwrite every consumed
+                # post-SiLU activation.
                 activation_storage = torch.empty(
                     (workers * slot_rows, 320), device=device, dtype=torch.int16
                 )
@@ -122,13 +123,6 @@ def _workspace_for_plan(
     return workspace
 
 
-def _persistent_workspace(device: torch.device, projection_rows: int):
-    """Return the original one-worker layout for small-tile diagnostics."""
-    return _workspace_for_plan(
-        device, projection_rows, 1, (projection_rows + 63) // 64, 16
-    )
-
-
 def _checked(result):
     if result[0] != cuda_driver.CUresult.CUDA_SUCCESS:
         raise RuntimeError(f"CUDA occupancy query failed: {result[0]}")
@@ -136,20 +130,32 @@ def _checked(result):
 
 
 def _capacity(compiled, kernel, device: torch.device, stream: CUstream):
-    """Query the loaded kernel, not a dummy kernel or SM-count heuristic."""
+    """Query a conservative cluster capacity from the loaded kernel."""
     compiled.to(device.index)
     libraries = compiled.jit_module.cuda_library
     if len(libraries) != 1:
         raise RuntimeError("Expected one CuTe HC device library")
     library = cuda_driver.CUlibrary(int(libraries[0]))
-    handles = _checked(cuda_driver.cuLibraryEnumerateKernels(1, library))
+    kernel_count = _checked(cuda_driver.cuLibraryGetKernelCount(library))
+    if kernel_count != 1:
+        raise RuntimeError("Expected one CuTe HC kernel in the device library")
+    handles = _checked(cuda_driver.cuLibraryEnumerateKernels(kernel_count, library))
     function = _checked(cuda_driver.cuKernelGetFunction(handles[0]))
+    smem_limit = _checked(
+        cuda_driver.cuFuncGetAttribute(
+            cuda_driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            function,
+        )
+    )
     config = cuda_driver.CUlaunchConfig()
     config.blockDimX, config.blockDimY, config.blockDimZ = 192, 1, 1
     config.gridDimX = kernel.clusters
     config.gridDimY = kernel.split_k
     config.gridDimZ = kernel.workers
-    config.sharedMemBytes = kernel.smem_bytes
+    # CuTe infers exact launch storage from its allocations. Supported tactics
+    # consume over half an SM, so the opt-in limit preserves one-CTA-per-SM
+    # residency and remains conservative if allocations change.
+    config.sharedMemBytes = smem_limit
     config.hStream = stream
     attribute = cuda_driver.CUlaunchAttribute()
     attribute.id = cuda_driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
@@ -224,8 +230,8 @@ if _AVAILABLE:
         the mixed tensor and optional inject logits, owned by this invocation.
 
         Automatic selection is limited to 1..256 rows; larger batches use the
-        GEMM/Triton implementation. Exact overrides retain larger-row support
-        for kernel diagnostics.
+        GEMM/Triton implementation. Exact overrides support up to 1024 rows for
+        kernel diagnostics.
 
         Different row counts and streams share a compiled plan within the same
         CTA tactic, resident-worker count and scheduling-round bucket, with
@@ -235,20 +241,22 @@ if _AVAILABLE:
         READY/CONSUMED split across row changes. Calls which share a workspace
         must be ordered on the model execution lane. Warm each tactic/round
         bucket and each capture stream's occupancy result before graph capture;
-        capture may then use a previously unseen row count in that bucket.
+        capture may then use a previously unseen row count in that bucket. Plan
+        and occupancy caches live for the process lifetime; diagnostic callers
+        must not scan unbounded scale or stream variants.
         """
         rows = int(normalized.shape[0])
         tensors = (normalized, projection_weight, up_weight)
         if (
             not supports_fused_hc(normalized.device)
             or (hc_count, hidden_size, lowrank) != (4, 2560, 320)
-            or not 1 <= rows <= _MAX_TOKENS
+            or not 1 <= rows <= _MAX_OVERRIDE_TOKENS
             or normalized.dtype not in (torch.bfloat16, torch.float16)
             or any(not t.is_contiguous() or t.data_ptr() % 16 for t in tensors)
         ):
             raise ValueError(
                 "fused CuTe HC requires six resident Blackwell clusters and 16-byte-aligned "
-                "contiguous BF16/FP16 tensors with HC4/H2560/R320 and positive T"
+                "contiguous BF16/FP16 tensors with HC4/H2560/R320 and at most 1024 rows"
             )
         projection_rows = int(projection_weight.shape[0])
         with torch.cuda.device(normalized.device):
@@ -321,16 +329,22 @@ if _AVAILABLE:
                         "capture; warm up this variant before capture"
                     )
                 kernel = FusedGatedResidualKernel(
-                    n,
-                    projection_rows,
-                    split_k,
-                    enable_pdl,
-                    projection_scale,
-                    weights_independent,
-                    single_tile,
-                    full_tiles,
+                    projection_tile=m,
+                    token_tile=n,
+                    projection_rows=projection_rows,
+                    split_k=split_k,
+                    projection_tiles=lp,
+                    batch_tiles=lb,
+                    workers=workers,
+                    stages=stages,
+                    final_tile=f,
+                    rounds=rounds,
+                    use_pdl=enable_pdl,
+                    scale=projection_scale,
+                    weights_independent=weights_independent,
+                    single_tile=single_tile,
+                    full_tiles=full_tiles,
                 )
-                kernel.configure(m, n, lp, lb, workers, stages, f, rounds)
                 compiled = cute_ext.compile(kernel, *operands_for(kernel), stream)
                 return kernel, compiled
 
