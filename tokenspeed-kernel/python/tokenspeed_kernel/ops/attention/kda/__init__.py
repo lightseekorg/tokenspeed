@@ -309,9 +309,9 @@ def kda_paged_decode(
         _attention_format_signature(q=q, k=k, v=v),
         traits={
             "indexed_state": True,
+            "recurrent_layout": recurrent_layout,
             "single_token": q.shape[1] == num_sequences,
             "state_dtype": state_pool.dtype,
-            "recurrent_layout": recurrent_layout,
         },
         solution=solution,
         override=override,
@@ -386,13 +386,13 @@ def try_kda_fused_paged_decode(
             "kda_fused_paged_decode",
             signature,
             traits={
-                "paged_state": True,
-                "state_dtype": state_pool.dtype,
-                "fused_output_norm": output_gate is not None,
                 "num_heads": num_heads,
                 "head_dim": head_dim,
                 "conv_kernel_size": conv_weights.shape[-1],
+                "fused_output_norm": output_gate is not None,
+                "paged_state": True,
                 "recurrent_layout": recurrent_layout,
+                "state_dtype": state_pool.dtype,
             },
             solution=solution,
             override=override,
@@ -406,13 +406,13 @@ def try_kda_fused_paged_decode(
                 "kda_fused_paged_decode",
                 signature,
                 traits={
-                    "paged_state": True,
-                    "state_dtype": state_pool.dtype,
-                    "fused_output_norm": False,
                     "num_heads": num_heads,
                     "head_dim": head_dim,
                     "conv_kernel_size": conv_weights.shape[-1],
+                    "fused_output_norm": False,
+                    "paged_state": True,
                     "recurrent_layout": recurrent_layout,
+                    "state_dtype": state_pool.dtype,
                 },
                 solution=solution,
                 override=override,
@@ -517,14 +517,14 @@ def try_kda_fused_paged_verify(
             "kda_fused_paged_verify",
             signature,
             traits={
-                "paged_state": True,
-                "store_states": store_states,
                 "draft_token_num": draft_token_num,
-                "state_dtype": state_pool.dtype,
-                "recurrent_layout": recurrent_layout,
                 "num_heads": num_heads,
                 "head_dim": head_dim,
+                "paged_state": True,
+                "recurrent_layout": recurrent_layout,
                 "split_producers": split_producers,
+                "state_dtype": state_pool.dtype,
+                "store_states": store_states,
             },
             solution=solution,
             override=override,
@@ -610,11 +610,11 @@ def kda_fused_paged_verify_uses_split_producers(
     probe = torch.empty(0, dtype=dtype, device="meta")
     signature = _attention_format_signature(q=probe, k=probe, v=probe)
     traits = {
-        "paged_state": True,
-        "store_states": store_states,
         "draft_token_num": draft_token_num,
-        "state_dtype": state_dtype,
+        "paged_state": True,
         "recurrent_layout": recurrent_layout,
+        "state_dtype": state_dtype,
+        "store_states": store_states,
     }
     traits["num_heads"] = num_heads
     traits["head_dim"] = head_dim
@@ -668,8 +668,8 @@ def kda_verify_conv_update(
         signature,
         traits={
             "paged_state": True,
-            "split_producers": True,
             "recurrent_layout": recurrent_layout,
+            "split_producers": True,
         },
     )
     return kernel(
@@ -735,10 +735,10 @@ def try_kda_replay_commit(
             "kda_replay_commit",
             signature,
             traits={
-                "flat_state": True,
-                "recurrent_layout": recurrent_layout,
                 "num_heads": num_heads,
                 "head_dim": head_dim,
+                "flat_state": True,
+                "recurrent_layout": recurrent_layout,
             },
             solution=solution,
             override=override,
@@ -791,7 +791,7 @@ def resolve_kda_batched_replay_commit(
         return None
     probe = torch.empty(0, dtype=dtype, device="meta")
     signature = _attention_format_signature(q=probe, k=probe, v=probe)
-    traits = {"flat_state": True, "batched_layers": True}
+    traits = {"batched_layers": True, "flat_state": True}
     if num_heads is not None:
         traits["num_heads"] = num_heads
     if head_dim is not None:
@@ -877,9 +877,9 @@ def kda_replay_commit_supported(
             "kda_replay_commit",
             signature,
             traits={
+                **shape_traits,
                 "flat_state": True,
                 "recurrent_layout": recurrent_layout,
-                **shape_traits,
             },
             solution=solution,
         )
@@ -888,10 +888,10 @@ def kda_replay_commit_supported(
             "kda_fused_paged_verify",
             signature,
             traits={
-                "paged_state": True,
-                "store_states": False,
-                "recurrent_layout": recurrent_layout,
                 **shape_traits,
+                "paged_state": True,
+                "recurrent_layout": recurrent_layout,
+                "store_states": False,
             },
             solution=solution,
         )

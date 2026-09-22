@@ -110,6 +110,10 @@ def test_distributed_ep_partial_sum_matches_global_reference() -> None:
         ispp=intermediate_size,
         internal_activation_dtype="input",
         solution="gluon",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     tokenspeed_kernel.moe_process_weights(plan, module)
     partial = tokenspeed_kernel.moe_apply(

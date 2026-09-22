@@ -89,6 +89,19 @@ void fillBlockTables(Operation& operation, Request& request, const CacheCoordina
     operation.block_tables = BuildBlockTables(coordinator, request.BlockTablesRef(), group_ids);
 }
 
+void classifyCompletedStateBoundaries(CompletedPages& completed, std::int32_t endpoint_tokens,
+                                      std::int32_t prefix_granularity) {
+    if (completed.boundary_kind != CacheBoundaryKind::kChunk) {
+        return;
+    }
+    const std::int32_t endpoint_boundary = endpoint_tokens / prefix_granularity * prefix_granularity;
+    if (endpoint_boundary > 0 && std::ranges::find(completed.materialized_state_boundaries, endpoint_boundary) !=
+                                     completed.materialized_state_boundaries.end()) {
+        // Classify the last aligned prompt or recovery checkpoint without upgrading history.
+        completed.state_boundary_kind = CacheBoundaryKind::kEndpoint;
+    }
+}
+
 void appendCompletedPrefixHashes(std::vector<std::string>& prefix_hashes,
                                  const std::vector<std::span<const std::int32_t>>& prefix_pages,
                                  std::int32_t filled_prefix_pages) {
@@ -157,6 +170,7 @@ RequestProgress advanceRequestProgress(Request& request, fsm::CacheProgress& cac
             .stream_completed_to_host = stream_completed_to_host,
             .materialized_state_boundaries = cache_progress.materialized_state_boundaries,
         };
+        classifyCompletedStateBoundaries(*progress.completed_pages, request.PrefillSize(), prefix_granularity);
     }
     return progress;
 }
@@ -644,14 +658,21 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
         // an incomplete prefill has only the chunks it has been through --
         // taking TokenSize() there would publish pages that were never
         // computed.
-        const RequestProgress progress =
-            advanceRequestProgress(victim, cache_progress, victim.NumComputedTokens(), coordinator_.PrefixGranularity(),
+        const std::int32_t num_computed_tokens = victim.NumComputedTokens();
+        RequestProgress progress =
+            advanceRequestProgress(victim, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
                                    /*stream_completed_to_host=*/false);
         if (progress.completed_pages) {
+            classifyCompletedStateBoundaries(*progress.completed_pages, num_computed_tokens,
+                                             coordinator_.PrefixGranularity());
             coordinator_.CacheCompletedBlocks(victim.BlockTablesRef(), progress, cache_progress.access_epoch);
         }
         coordinator_.QueueCachedBlocksForStore(cache_progress.prefix_hashes);
-        coordinator_.QueueLatestSnapshotBlocksForStore(cache_progress.prefix_hashes);
+        // Recover from a prefill checkpoint and recompute the generated suffix.
+        const auto prefill_hashes = std::span<const std::string>{cache_progress.prefix_hashes}.first(
+            std::min(cache_progress.prefix_hashes.size(),
+                     static_cast<std::size_t>(victim.PrefillSize() / coordinator_.PrefixGranularity())));
+        coordinator_.QueueLatestSnapshotBlocksForStore(prefill_hashes);
         // The victim's pages are granted away in this very round, so the
         // ticket cannot pin them: the runtime orders the copy on the forward
         // thread's stream ahead of the plan's page reuse instead.

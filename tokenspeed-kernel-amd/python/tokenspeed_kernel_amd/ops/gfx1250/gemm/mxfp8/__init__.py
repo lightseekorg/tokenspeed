@@ -17,3 +17,15 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
+"""MXFP8 projection kernels for gfx1250."""
+
+from tokenspeed_kernel_amd.ops.gfx1250.gemm.mxfp8.decode_mm import (
+    launch_gluon_mm_fp8_blockscale_gfx1250,
+    launch_gluon_mm_mxfp8_ue8m0_gfx1250,
+)
+
+__all__ = [
+    "launch_gluon_mm_fp8_blockscale_gfx1250",
+    "launch_gluon_mm_mxfp8_ue8m0_gfx1250",
+]

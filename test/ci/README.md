@@ -55,6 +55,12 @@ tensor parallelism 2 and three-step MTP. It keeps KVStore enabled and uses the
 bounded non-thinking chat template for CI stability. The task requires a score
 of at least 0.96.
 
+The long-context performance report accepts both current EvalScope metrics
+(`Avg TPOT (ms)`, `Avg Decoded Tok/Iter`) and their older names. Missing or
+invalid TPOT fails collection instead of producing a zero-throughput report.
+Unavailable acceptance metrics appear as `N/A` (empty CSV cells); an aggregate
+is unavailable if any run for that prompt length lacks the metric.
+
 Each task expands into one matrix entry per runner label. Add a top-level
 `priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix
 jobs in include-list order, so `high` entries reach a contended runner pool
@@ -85,15 +91,26 @@ score miss. Use it for infrastructure flakes (CUDA launch failure, NVLink
 barrier timeout, GPU memory-access fault) where a clean second attempt is
 cheap relative to a red PR.
 
-The AMD Kimi-K2.5 AIME25 gate writes EvalScope results under
-`.ci-artifacts/published/evalscope-results`. Its CI artifact upload runs on both
-success and failure, including timestamped per-question predictions and scoring
-records. Compare the
+The AMD Kimi-K2.5 AIME25, NVIDIA Kimi-K2.5 EAGLE3 AIME25, and B200 GLM-5.2
+AIME26 gates write EvalScope results under
+`.ci-artifacts/published/evalscope-results`. Their CI artifact upload runs on
+both success and failure, including timestamped per-question predictions and
+scoring records. Compare the
 responses, stop reasons, and extracted answers when investigating an accuracy
 miss before changing the token limit or sampling configuration.
 
+The NVIDIA Kimi-K2.5 EAGLE3 AIME25 gate allows `max_tokens=131072` within a
+262138-token context. EAGLE3 with one speculative step uses two draft tokens;
+its three overlap spans reserve six positions below the model's 262144-token
+limit. A fixed-version diagnostic reproduced a 65536-token
+truncation; with the larger budget, the identical generated prefix continued
+to a correct answer and stopped naturally at 70332 tokens. This single-question
+result motivates the budget; the full 30-question gate still requires 0.93
+accuracy with batch size 16 and greedy sampling. EvalScope records are saved
+under `.ci-artifacts/published/evalscope-results` on success and failure.
+
 The AMD Kimi-K2.5 AIME25 gate allows `max_tokens=65536`, matching the NVIDIA
-Kimi-K2.5 EAGLE3 and DFlash tasks. The same question was truncated in both the
+Kimi-K2.5 DFlash task. The same question was truncated in both the
 [8K run](https://github.com/lightseekorg/tokenspeed/actions/runs/34763795877) and
 [16K run](https://github.com/lightseekorg/tokenspeed/actions/runs/34764637152).
 With the larger budget, the [64K run](https://github.com/lightseekorg/tokenspeed/actions/runs/34765831078)
@@ -232,11 +249,11 @@ finishes. It validates the untrusted artifact and source revision before
 creating or replacing one bot-owned comment. Runs where the benchmark task was
 not selected have no report and are ignored.
 
-The first pull request introducing the benchmark can run only a candidate
-bootstrap because its merge base has no suite. It also cannot trigger its own
-comment publisher because GitHub requires the receiving `workflow_run` workflow
-to exist on the default branch. Manual runs produce summaries and artifacts but
-not pull request comments.
+A merge base that does not contain the suite yields a candidate-only
+bootstrap instead of a comparison. Changes to the comment workflow take effect
+only after they merge, since `workflow_run` workflows execute from the default
+branch. Manual runs produce summaries and artifacts but not pull request
+comments.
 
 `CUDA_VISIBLE_DEVICES=0` does not limit the shared cleanup process scan, so the
 runner must provide scheduler-enforced GPU or process-namespace isolation. The

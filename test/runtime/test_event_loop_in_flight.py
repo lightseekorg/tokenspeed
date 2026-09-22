@@ -92,5 +92,45 @@ def test_drain_in_flight_commits_oldest_first() -> None:
     assert request_changes == ["change-op0", "change-op1"]
 
 
+def test_per_request_reads_precede_the_dependent_drain() -> None:
+    """Every per-request lookup on rid_to_state happens before the drain.
+
+    A drained commit can finish a request and pop it from rid_to_state while
+    its id is still in the planned forward_op, so sampling params, grammar
+    state, ngram inputs and the batch log's context lengths must all be read
+    first. Pinned on the statement order of EventLoop.event_loop.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    source = textwrap.dedent(inspect.getsource(EventLoop.event_loop))
+    calls = [
+        node.func.attr
+        for node in sorted(
+            (
+                n
+                for n in ast.walk(ast.parse(source))
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            ),
+            key=lambda n: (n.lineno, n.col_offset),
+        )
+    ]
+    drain = calls.index("_dispatch_depends_on_pending_commit")
+    for reader in (
+        "_gather_sampling_params",
+        "_gather_grammar_state",
+        "log_dispatch",
+    ):
+        assert calls.index(reader) < drain, f"{reader} runs after the drain"
+
+
+def test_request_context_length_sums_prompt_and_output() -> None:
+    state = SimpleNamespace(input_length=1000, output_length=24)
+    loop = SimpleNamespace(output_processor=SimpleNamespace(rid_to_state={"r": state}))
+
+    assert EventLoop._request_context_length(loop, "r") == 1024
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

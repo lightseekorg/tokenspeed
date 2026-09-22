@@ -411,7 +411,7 @@ def _warp_reduce_smallm_kernel(
 
 
 @gluon.jit
-def _bmm_a16w16_m1_kernel(
+def gluon_bmm_a16w16_gfx950(
     a_ptr,
     b_ptr,
     output_ptr,
@@ -1322,7 +1322,7 @@ def gluon_mm_a16w16_warp_reduce_smallm_gfx950(
     return C
 
 
-def gluon_bmm_a16w16_gfx950(
+def launch_gluon_bmm_a16w16_gfx950(
     A: torch.Tensor,
     B: torch.Tensor,
     out_dtype: torch.dtype,
@@ -1361,7 +1361,7 @@ def gluon_bmm_a16w16_gfx950(
         out,
         "small-M dense16 warp-reduce BMM",
     )
-    _bmm_a16w16_m1_kernel[(batch * N // BMM_M1_BLOCK_N,)](
+    gluon_bmm_a16w16_gfx950[(batch * N // BMM_M1_BLOCK_N,)](
         A,
         B,
         C,

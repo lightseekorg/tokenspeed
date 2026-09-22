@@ -169,6 +169,7 @@ different process groups.
 | `--attention-backend` | Attention kernel backend. Common values include `mha`, `fa3`, `fa4`, `triton`, `flashinfer`, `trtllm_mla`, and `tokenspeed_mla`. |
 | `--drafter-attention-backend` | Attention backend for speculative decoding drafter model. |
 | `--moe-backend` | MoE backend. |
+| `--moe-mxfp4-fp8-activation` | Opt-in: run MXFP4 routed experts with FP8 activations. On Hopper this is the FlashInfer cutlass W4A8 MoE (faster than the default W4A16 kernel, a few percent of extra error on expert outputs). Applies to every MXFP4 expert layer, target and draft; startup fails where the selected MoE backend has no FP8-activation kernel for a layer, when a model's routed experts are not MXFP4, when the model pins another activation precision (Kimi-K3 on Hopper Marlin), or when the layer's SwiGLU is unclamped (the W4A8 FC2 scale relies on the clamp). |
 | `--draft-moe-backend` | MoE backend for the speculative decoding draft model. |
 | `--all2all-backend` | MoE all-to-all backend. |
 | `--deepep-mode` | DeepEP mode: `auto`, `normal`, or `low_latency`. |
@@ -266,6 +267,22 @@ widening the draft's attention to the full history.
 | `--metrics-reporters` | Metrics reporter, such as `prometheus`. |
 | `--decode-log-interval` | Decode batch log interval. |
 | `--kv-events-config` | JSON config for KV cache mutation events. Set `enable_kv_cache_events` and a publisher such as `zmq` to publish device prefix-cache stores and removals. |
+
+Every `--decode-log-interval` decode rounds the scheduler's representative rank
+prints one `Decode batch.` line: `#running-req`, `avg_seq_len` (the mean of
+prompt plus generated tokens over the running requests, so a step's attention
+cost can be read alongside its batch size), device page usage, the generation
+throughput accumulated since the previous line, `avg_accept_len` /
+`accept_rate` under speculative decoding, and `#queue-req`. Every field is a
+host-side scheduler counter; the line adds no GPU synchronization.
+
+`#queue-req` counts requests admitted to the scheduler but not yet running.
+On a PD engine that includes requests still bootstrapping with the peer —
+on the prefill role, waiting for the decode side to allocate their KV pages —
+which the `#req-state(bootstrap/prefill/remote-prefill/decode/pd-pinned)`
+suffix also lists on its own. The Prometheus waiting gauge and the router
+load snapshot report the scheduler's narrower waiting count, without the
+bootstrapping share.
 
 Set `TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS=1` to log each speculative verify
 step's committed widths and accepted draft-token counts. This reads the
