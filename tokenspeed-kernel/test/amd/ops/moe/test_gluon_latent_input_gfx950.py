@@ -24,18 +24,20 @@ import pytest
 import torch
 from utils import is_cdna4
 
-if not is_cdna4():
-    pytest.skip(
-        "AMD CDNA4 is required for Gluon latent input tests",
-        allow_module_level=True,
-    )
-
+pytest.importorskip(
+    "tokenspeed_kernel_amd.ops.gfx950.moe.fp16",
+    reason="tokenspeed-kernel-amd is required for Gluon latent input tests",
+)
 
 from tokenspeed_kernel.registry import KernelRegistry  # noqa: E402
 from tokenspeed_kernel.selection import spec_matches_shape_traits  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import (  # noqa: E402
     latent_input_prefill,
     latent_input_small_batch,
+)
+
+requires_cdna4 = pytest.mark.skipif(
+    not is_cdna4(), reason="AMD CDNA4 is required to launch Gluon latent input kernels"
 )
 
 
@@ -58,19 +60,25 @@ def test_split_k_does_not_drop_k_tiles() -> None:
 
 @pytest.mark.parametrize(
     ("tokens", "expected"),
-    [(2048, False), (4096, True), (4097, False), (4352, True)],
+    [(2048, False), (4095, False), (4096, True), (4097, True), (6000, True)],
 )
 def test_prefill_dispatch_bounds(tokens: int, expected: bool) -> None:
     spec = KernelRegistry.get().get_by_name("gluon_latent_input_prefill_gfx950")
     assert spec is not None
+    assert "tokens_align" not in spec.traits
     assert spec_matches_shape_traits(spec, {"tokens": tokens}) is expected
 
 
+@requires_cdna4
+# 256 is one full row tile; 512 puts a second workgroup row in the grid so the
+# pid_m addressing is exercised; 300 and 577 leave a partial final tile whose
+# rows the load clamp duplicates and the epilogue must mask away.
+@pytest.mark.parametrize("tokens", [256, 300, 512, 577])
 @pytest.mark.parametrize("linear_beta", [None, 25.0])
 def test_prefill_routes_packed_projection_and_applies_situ(
+    tokens: int,
     linear_beta: float | None,
 ) -> None:
-    tokens = 256
     hidden_size = 7168
     widths = (896, 3584, 1536)
     beta = 4.0
@@ -106,7 +114,17 @@ def test_prefill_routes_packed_projection_and_applies_situ(
         expected_routed,
         (expected_gate * expected_up).bfloat16(),
     )
+    # Expert selection reads the router in FP32, so the packed GEMM must not
+    # round those logits to the activation dtype.
     assert actual[0].dtype == torch.float32
-    torch.testing.assert_close(actual[0], expected[0], atol=1e-6, rtol=1e-6)
-    torch.testing.assert_close(actual[1], expected[1], atol=5e-4, rtol=5e-4)
-    torch.testing.assert_close(actual[2], expected[2], atol=1e-5, rtol=1e-5)
+    assert actual[0].shape == (tokens, widths[0])
+    assert actual[1].shape == (tokens, widths[1])
+    assert actual[2].shape == (tokens, widths[2] // 2)
+    # Both sides multiply exactly representable BF16 pairs, but the kernel sums
+    # them in a different order than the reference over K=7168, so the FP32
+    # router logits differ by more than an FP32 epsilon. These are the
+    # tolerances test_latent_input.py holds the portable kernel to for the same
+    # comparison, on inputs 2.5x larger than these.
+    torch.testing.assert_close(actual[0], expected[0], atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(actual[1], expected[1], atol=8e-3, rtol=8e-3)
+    torch.testing.assert_close(actual[2], expected[2], atol=8e-3, rtol=8e-3)

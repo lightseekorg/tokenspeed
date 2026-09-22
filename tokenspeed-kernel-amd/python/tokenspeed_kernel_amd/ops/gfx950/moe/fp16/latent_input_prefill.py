@@ -87,6 +87,7 @@ def _store_latent_input_half(
     acc_bottom,
     n_start,
     pid_m,
+    M,
     router_ptr,
     routed_ptr,
     shared_raw_ptr,
@@ -106,14 +107,22 @@ def _store_latent_input_half(
         return
 
     row_base = pid_m * BLOCK_M
+    # Rows the load clamp duplicated onto the last valid row carry a repeat of
+    # that row's projection, so they must not reach memory.
+    top_mask = (row_base + offs_cm < M)[:, None]
+    bottom_mask = (row_base + BLOCK_M // 2 + offs_cm < M)[:, None]
     if n_start < ROUTER_N:
         top = gl.convert_layout(acc_top, layout=STORE_LAYOUT)
         bottom = gl.convert_layout(acc_bottom, layout=STORE_LAYOUT)
         offsets = offs_cm[:, None] * stride_router_m + offs_cn[None, :]
         top_base = router_ptr + row_base * stride_router_m + n_start
         bottom_base = top_base + (BLOCK_M // 2) * stride_router_m
-        cdna4.buffer_store(ptr=top_base, offsets=offsets, stored_value=top)
-        cdna4.buffer_store(ptr=bottom_base, offsets=offsets, stored_value=bottom)
+        cdna4.buffer_store(
+            ptr=top_base, offsets=offsets, stored_value=top, mask=top_mask
+        )
+        cdna4.buffer_store(
+            ptr=bottom_base, offsets=offsets, stored_value=bottom, mask=bottom_mask
+        )
         return
 
     if n_start < ROUTER_N + ROUTED_N:
@@ -127,8 +136,12 @@ def _store_latent_input_half(
         offsets = offs_cm[:, None] * stride_routed_m + offs_cn[None, :]
         top_base = routed_ptr + row_base * stride_routed_m + column
         bottom_base = top_base + (BLOCK_M // 2) * stride_routed_m
-        cdna4.buffer_store(ptr=top_base, offsets=offsets, stored_value=top)
-        cdna4.buffer_store(ptr=bottom_base, offsets=offsets, stored_value=bottom)
+        cdna4.buffer_store(
+            ptr=top_base, offsets=offsets, stored_value=top, mask=top_mask
+        )
+        cdna4.buffer_store(
+            ptr=bottom_base, offsets=offsets, stored_value=bottom, mask=bottom_mask
+        )
         return
 
     column = n_start - ROUTER_N - ROUTED_N
@@ -141,8 +154,10 @@ def _store_latent_input_half(
     offsets = offs_cm[:, None] * stride_shared_m + offs_cn[None, :]
     top_base = shared_raw_ptr + row_base * stride_shared_m + column
     bottom_base = top_base + (BLOCK_M // 2) * stride_shared_m
-    cdna4.buffer_store(ptr=top_base, offsets=offsets, stored_value=top)
-    cdna4.buffer_store(ptr=bottom_base, offsets=offsets, stored_value=bottom)
+    cdna4.buffer_store(ptr=top_base, offsets=offsets, stored_value=top, mask=top_mask)
+    cdna4.buffer_store(
+        ptr=bottom_base, offsets=offsets, stored_value=bottom, mask=bottom_mask
+    )
 
 
 @gluon.jit(launch_metadata=_prefill_launch_metadata)
@@ -269,8 +284,17 @@ def gluon_latent_input_prefill_gfx950(
     a_base = a_ptr + pid_m * BLOCK_M * stride_am
     b_base = b_ptr + pid_n * BLOCK_N * stride_bn
 
-    a_top_offsets = offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak
-    a_bot_offsets = a_top_offsets + (BLOCK_M // 2) * stride_am
+    # A row tile runs past the activation whenever M is not a multiple of
+    # BLOCK_M. Clamp those rows onto the last valid one instead of predicating
+    # the loads: the tile stays in bounds, the K loop keeps its unconditional
+    # schedule, and the epilogue masks the rows back out. The clamp is the
+    # identity on every full tile.
+    last_row = M - 1 - pid_m * BLOCK_M
+    rows_top = gl.minimum(offs_am, last_row)
+    rows_bot = gl.minimum(offs_am + BLOCK_M // 2, last_row)
+
+    a_top_offsets = rows_top[:, None] * stride_am + offs_ak[None, :] * stride_ak
+    a_bot_offsets = rows_bot[:, None] * stride_am + offs_ak[None, :] * stride_ak
     b_left_offsets = offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
     right_delta = BLOCK_N // 2
     if pid_n * BLOCK_N + right_delta >= TOTAL_N:
@@ -437,6 +461,7 @@ def gluon_latent_input_prefill_gfx950(
         acc_bl,
         pid_n * BLOCK_N,
         pid_m,
+        M,
         router_ptr,
         routed_ptr,
         shared_raw_ptr,
@@ -457,6 +482,7 @@ def gluon_latent_input_prefill_gfx950(
         acc_br,
         pid_n * BLOCK_N + BLOCK_N // 2,
         pid_m,
+        M,
         router_ptr,
         routed_ptr,
         shared_raw_ptr,
@@ -520,12 +546,12 @@ def launch_gluon_latent_input_prefill_gfx950(
     beta: float,
     linear_beta: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Project the aligned K3 prefill input from one packed weight pass.
+    """Project the K3 prefill input from one packed weight pass.
 
     Args:
-        hidden_states: Contiguous BF16 activation shaped ``[tokens, 7168]``;
-            ``tokens`` must be at least 256 and divisible by 256. Automatic
-            dispatch uses this kernel from 4096 tokens.
+        hidden_states: Contiguous BF16 activation shaped ``[tokens, 7168]``.
+            Any positive ``tokens`` works; a partial final row tile is masked.
+            Automatic dispatch uses this kernel from 4096 tokens.
         router_weight: Packed weight view shaped ``[896, 7168]``.
         routed_weight: Packed weight view shaped ``[3584, 7168]``.
         shared_gate_up_weight: Packed weight view shaped ``[1536, 7168]``.
@@ -549,12 +575,10 @@ def launch_gluon_latent_input_prefill_gfx950(
     if (
         hidden_states.ndim != 2
         or hidden_states.shape[1] != _K3_HIDDEN
-        or hidden_states.shape[0] < _BLOCK_M
-        or hidden_states.shape[0] % _BLOCK_M != 0
+        or hidden_states.shape[0] < 1
     ):
         raise ValueError(
-            "Kimi K3 prefill hidden states must have shape [M, 7168] with "
-            "M >= 256 divisible by 256"
+            "Kimi K3 prefill hidden states must have shape [M, 7168] with M >= 1"
         )
     for tensor, shape, name in expected:
         if tuple(tensor.shape) != shape:
@@ -581,7 +605,7 @@ def launch_gluon_latent_input_prefill_gfx950(
     )
     shared_out = torch.empty((tokens, _K3_SHARED), dtype=torch.bfloat16, device=device)
 
-    grid_mn = (tokens // _BLOCK_M) * triton.cdiv(_K3_TOTAL, _BLOCK_N)
+    grid_mn = triton.cdiv(tokens, _BLOCK_M) * triton.cdiv(_K3_TOTAL, _BLOCK_N)
     gluon_latent_input_prefill_gfx950[(grid_mn,)](
         hidden_states,
         packed_weight,

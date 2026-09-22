@@ -143,8 +143,8 @@ if current_platform().is_amd:
         signatures=_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
+            # A partial final row tile is masked, so no alignment is required.
             "tokens_min": frozenset({4096}),
-            "tokens_align": frozenset({256}),
             "hidden_size": frozenset({7168}),
             "num_experts": frozenset({896}),
             "latent_size": frozenset({3584}),

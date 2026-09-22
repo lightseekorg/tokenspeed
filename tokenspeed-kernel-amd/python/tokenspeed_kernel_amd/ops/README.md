@@ -284,7 +284,7 @@ and batch size to limit shared-memory usage.
 
 ## MoE
 
-### gfx950 Kimi K3 latent input projection
+### gfx950 latent input projection
 
 The Kimi K3 prefill path projects one packed BF16 input weight into router,
 routed-latent, and shared-expert inputs. Automatic selection uses the specialist
@@ -293,8 +293,7 @@ kernel.
 
 #### Contract
 
-- The input is contiguous BF16 with shape `[M, 7168]`, where `M >= 4096` and
-  `M` is divisible by 256 for automatic dispatch.
+- The input is contiguous BF16 with shape `[M, 7168]`. where `M >= 4096`.
 - Router `[896, 7168]`, routed `[3584, 7168]`, and shared gate/up
   `[1536, 7168]` weights must be consecutive row views of one packed allocation.
 - Outputs are FP32 router logits, BF16 routed latents, and a BF16 768-wide
@@ -303,12 +302,14 @@ kernel.
 
 #### Algorithm
 
-The projection preserves the `gluon_mm_a16w16_prefill_gfx950` inner loop: one
+The projection adopts 8-wave warp-pipeline approach for its inner loop: one
 eight-wave workgroup computes a `256 x 256` tile in 64-wide K steps through a
 double-buffered MFMA/LDS pipeline. Each 128-column accumulator half is routed
 independently because the packed output boundaries are only 128-column aligned.
 The unused final half-tile safely rereads the last valid weight half and is not
-stored.
+stored. A row tile past the end of the activation is handled the same way: the
+rows clamp onto the last valid one and the epilogue masks them out, so the K
+loop needs no predicate and any token count is accepted.
 
 All final MFMAs complete before the mixed-dtype stores, keeping dot operands
 out of the epilogue live range. Router halves remain FP32 while routed and
