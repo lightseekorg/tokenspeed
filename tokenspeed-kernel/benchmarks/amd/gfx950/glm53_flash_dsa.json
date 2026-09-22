@@ -1,5 +1,21 @@
 {
   "schema_version": 1,
+  "common_parameters": {
+    "model_profile": "glm53_flash_tp4",
+    "dtype": "bfloat16",
+    "index_heads": 32,
+    "index_head_dim": 128,
+    "local_attention_heads": 16,
+    "kv_lora_rank": 512,
+    "qk_nope_head_dim": 256,
+    "qk_rope_head_dim": 0,
+    "pool_size": 4,
+    "index_page_stride_bytes": 23296,
+    "kv_page_size": 64,
+    "topk_tokens": 2048,
+    "max_context": 131072,
+    "max_logits_bytes": 536870912
+  },
   "cases": [
     {
       "id": "glm53_flash.attention.kpool_prefill_write/small-bfloat16",
@@ -9,8 +25,6 @@
         "family": "attention",
         "mode": "kpool_prefill_write",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "rows": [16, 32, 64, 128]
         },
         "cold_cache": true,
@@ -30,8 +44,6 @@
         "family": "attention",
         "mode": "kpool_prefill_write",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "rows": [256, 512, 1024, 2048]
         },
         "cold_cache": true,
@@ -51,8 +63,6 @@
         "family": "attention",
         "mode": "kpool_prefill_topk",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "batch": 1,
           "prefix_tokens": [0, 57344, 122880],
           "query_tokens_per_sequence": 8192
@@ -74,8 +84,6 @@
         "family": "attention",
         "mode": "kpool_prefill_topk",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "batch": [1, 2],
           "prefix_tokens": [7936, 130816],
           "query_tokens_per_sequence": 256
@@ -97,8 +105,6 @@
         "family": "attention",
         "mode": "kpool_prefill_topk",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "batch": [4, 8, 16],
           "prefix_tokens": [7936, 130816],
           "query_tokens_per_sequence": 256
@@ -120,8 +126,6 @@
         "family": "attention",
         "mode": "kpool_prefill_topk",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "batch": [1, 2],
           "prefix_tokens": [8128, 131008],
           "query_tokens_per_sequence": 64
@@ -143,8 +147,6 @@
         "family": "attention",
         "mode": "kpool_prefill_topk",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "batch": [4, 8, 16],
           "prefix_tokens": [8128, 131008],
           "query_tokens_per_sequence": 64
@@ -166,8 +168,6 @@
         "family": "attention",
         "mode": "dsa_prefill",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "batch": 1,
           "prefix_tokens": [0, 57344, 122880],
           "query_tokens_per_sequence": 8192
@@ -189,8 +189,6 @@
         "family": "attention",
         "mode": "dsa_prefill",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "batch": [1, 2],
           "prefix_tokens": [7936, 130816],
           "query_tokens_per_sequence": 256
@@ -212,8 +210,6 @@
         "family": "attention",
         "mode": "dsa_prefill",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "batch": [4, 8, 16],
           "prefix_tokens": [7936, 130816],
           "query_tokens_per_sequence": 256
@@ -235,8 +231,6 @@
         "family": "attention",
         "mode": "dsa_prefill",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "batch": [1, 2],
           "prefix_tokens": [8128, 131008],
           "query_tokens_per_sequence": 64
@@ -258,8 +252,6 @@
         "family": "attention",
         "mode": "dsa_prefill",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "batch": [4, 8, 16],
           "prefix_tokens": [8128, 131008],
           "query_tokens_per_sequence": 64
@@ -281,8 +273,6 @@
         "family": "attention",
         "mode": "kpool_decode_append",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "batch": [1, 2, 4, 8, 16],
           "q_len_per_req": 1,
           "sequence_length": 8189
@@ -304,8 +294,6 @@
         "family": "attention",
         "mode": "kpool_decode_append",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "batch": [1, 2, 4, 8, 16],
           "q_len_per_req": 1,
           "sequence_length": 8192
@@ -327,8 +315,6 @@
         "family": "attention",
         "mode": "kpool_decode_append",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "batch": [1, 2, 4, 8, 16],
           "q_len_per_req": 4,
           "sequence_length": 8192
@@ -350,8 +336,6 @@
         "family": "attention",
         "mode": "kpool_decode_topk",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "batch": [1, 2],
           "q_len_per_req": 1,
           "sequence_length": [8189, 131069]
@@ -373,8 +357,6 @@
         "family": "attention",
         "mode": "kpool_decode_topk",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "batch": [4, 8, 16],
           "q_len_per_req": 1,
           "sequence_length": [8189, 131069]
@@ -396,8 +378,6 @@
         "family": "attention",
         "mode": "kpool_decode_topk",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "batch": [1, 2],
           "q_len_per_req": 1,
           "sequence_length": [8192, 131072]
@@ -419,8 +399,6 @@
         "family": "attention",
         "mode": "kpool_decode_topk",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "batch": [4, 8, 16],
           "q_len_per_req": 1,
           "sequence_length": [8192, 131072]
@@ -442,8 +420,6 @@
         "family": "attention",
         "mode": "kpool_decode_topk",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "batch": [1, 2],
           "q_len_per_req": 4,
           "sequence_length": [8192, 131072]
@@ -465,8 +441,6 @@
         "family": "attention",
         "mode": "kpool_decode_topk",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "batch": [4, 8, 16],
           "q_len_per_req": 4,
           "sequence_length": [8192, 131072]
@@ -488,8 +462,6 @@
         "family": "attention",
         "mode": "dsa_decode",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "batch": [1, 2, 4, 8, 16],
           "q_len_per_req": 1,
           "sequence_length": [8189, 131069]
@@ -511,8 +483,6 @@
         "family": "attention",
         "mode": "dsa_decode",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "batch": [1, 2, 4, 8, 16],
           "q_len_per_req": 1,
           "sequence_length": [8192, 131072]
@@ -534,8 +504,6 @@
         "family": "attention",
         "mode": "dsa_decode",
         "parameters": {
-          "model_profile": "glm53_flash_tp4",
-          "dtype": "bfloat16",
           "batch": [1, 2, 4, 8, 16],
           "q_len_per_req": 4,
           "sequence_length": [8192, 131072]

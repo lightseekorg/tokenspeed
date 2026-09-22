@@ -21,8 +21,8 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Collection
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -48,17 +48,18 @@ __all__ = [
 ]
 
 
-_DTYPE_NAMES = {
+_IMPLEMENTED_DTYPES = {
     "bf16": torch.bfloat16,
     "bfloat16": torch.bfloat16,
 }
+_IMPLEMENTED_MODEL_PROFILES = frozenset({"glm53_flash_tp4"})
 _POOL_PERMUTATION_STRIDE = 1_000_003
 _TOKEN_PERMUTATION_STRIDE = 7_919
 
 
 @dataclass(frozen=True)
 class _DSAConfig:
-    model_profile: str | None
+    model_profile: str
     dtype: torch.dtype
     index_heads: int
     index_head_dim: int
@@ -102,91 +103,23 @@ class _DSAConfig:
         return (self.qk_nope_head_dim + self.qk_rope_head_dim) ** -0.5
 
 
-_GLM53_FLASH_TP4 = _DSAConfig(
-    model_profile="glm53_flash_tp4",
-    dtype=torch.bfloat16,
-    index_heads=32,
-    index_head_dim=128,
-    local_attention_heads=16,
-    kv_lora_rank=512,
-    qk_nope_head_dim=256,
-    qk_rope_head_dim=0,
-    pool_size=4,
-    # Eleven DSA layer fields share this aligned index-cache plane.
-    index_page_stride_bytes=23_296,
-    kv_page_size=64,
-    topk_tokens=2_048,
-    max_context=131_072,
-    max_logits_bytes=512 * 1024 * 1024,
-)
-_MODEL_PROFILES: dict[str, _DSAConfig] = {
-    "glm53_flash_tp4": _GLM53_FLASH_TP4,
-}
-_CONFIG_PARAMETER_NAMES = frozenset(
-    {
-        "dtype",
-        "index_heads",
-        "index_head_dim",
-        "local_attention_heads",
-        "kv_lora_rank",
-        "qk_nope_head_dim",
-        "qk_rope_head_dim",
-        "pool_size",
-        "index_page_stride_bytes",
-        "kv_page_size",
-        "topk_tokens",
-        "max_context",
-        "max_logits_bytes",
-    }
-)
-
-
-def _positive_int(parameters: dict[str, Any], name: str) -> int:
-    value = parameters.get(name)
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+def _implemented_value(
+    name: str,
+    value: object,
+    implemented: Collection[str],
+) -> str:
+    if value not in implemented:
+        accepted = ", ".join(sorted(implemented))
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
-            f"DSA parameter {name!r} must be a positive integer",
-        )
-    return value
-
-
-def _nonnegative_int(parameters: dict[str, Any], name: str) -> int:
-    value = parameters.get(name)
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            f"DSA parameter {name!r} must be a nonnegative integer",
+            f"Implemented DSA {name} values: {accepted}",
         )
     return value
 
 
 def _parse_dtype(value: object) -> torch.dtype:
-    if isinstance(value, str):
-        dtype = _DTYPE_NAMES.get(value.lower())
-    else:
-        dtype = value if isinstance(value, torch.dtype) else None
-    if dtype is not torch.bfloat16:
-        supported = ", ".join(sorted(_DTYPE_NAMES))
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            f"DSA benchmarks currently support dtype names: {supported}",
-        )
-    return dtype
-
-
-def _config_int(
-    parameters: dict[str, Any], name: str, *, allow_zero: bool = False
-) -> int:
-    value = parameters[name]
-    minimum = 0 if allow_zero else 1
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-        qualifier = "nonnegative" if allow_zero else "positive"
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            f"DSA parameter {name!r} must be a {qualifier} integer",
-        )
-    return value
+    name = _implemented_value("dtype", value, _IMPLEMENTED_DTYPES)
+    return _IMPLEMENTED_DTYPES[name]
 
 
 def _validate_config(config: _DSAConfig) -> None:
@@ -221,80 +154,35 @@ def _validate_config(config: _DSAConfig) -> None:
 
 def _resolve_config(
     request: BenchmarkRequest,
-    *,
-    specific: set[str],
 ) -> _DSAConfig:
-    allowed = specific | _CONFIG_PARAMETER_NAMES | {"model_profile", "validation"}
-    unknown = sorted(set(request.parameters) - allowed)
-    if unknown:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            f"Unknown DSA parameters: {', '.join(unknown)}",
-        )
     if request.parameters.get("validation") is not None:
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
             "DSA benchmark correctness validation is not implemented yet",
         )
-    if request.solution is not None or request.registration is not None:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "DSA benchmarks exercise normal kernel selection",
-        )
-
-    profile_name = request.parameters.get("model_profile")
-    if profile_name is not None:
-        profile = _MODEL_PROFILES.get(profile_name)
-        if profile is None:
-            available = ", ".join(sorted(_MODEL_PROFILES))
-            raise BenchmarkCaseError(
-                BenchmarkStatus.INVALID_CASE,
-                f"Unknown DSA model_profile {profile_name!r}; available: {available}",
-            )
-        values = {
-            name: request.parameters.get(name, getattr(profile, name))
-            for name in _CONFIG_PARAMETER_NAMES
-        }
-    else:
-        missing = sorted(_CONFIG_PARAMETER_NAMES - request.parameters.keys())
-        if missing:
-            raise BenchmarkCaseError(
-                BenchmarkStatus.INVALID_CASE,
-                "DSA benchmarks without model_profile require: " + ", ".join(missing),
-            )
-        profile = None
-        values = {name: request.parameters[name] for name in _CONFIG_PARAMETER_NAMES}
-
-    parsed = {
-        name: _config_int(
-            values,
-            name,
-            allow_zero=name == "qk_rope_head_dim",
-        )
-        for name in _CONFIG_PARAMETER_NAMES - {"dtype"}
-    }
-    if profile is None:
-        config = _DSAConfig(
-            model_profile=None,
-            dtype=_parse_dtype(values["dtype"]),
-            **parsed,
-        )
-    else:
-        config = replace(
-            profile,
-            dtype=_parse_dtype(values["dtype"]),
-            **parsed,
-        )
+    parameters = request.parameters
+    config = _DSAConfig(
+        model_profile=_implemented_value(
+            "model_profile",
+            parameters["model_profile"],
+            _IMPLEMENTED_MODEL_PROFILES,
+        ),
+        dtype=_parse_dtype(parameters["dtype"]),
+        index_heads=parameters["index_heads"],
+        index_head_dim=parameters["index_head_dim"],
+        local_attention_heads=parameters["local_attention_heads"],
+        kv_lora_rank=parameters["kv_lora_rank"],
+        qk_nope_head_dim=parameters["qk_nope_head_dim"],
+        qk_rope_head_dim=parameters["qk_rope_head_dim"],
+        pool_size=parameters["pool_size"],
+        index_page_stride_bytes=parameters["index_page_stride_bytes"],
+        kv_page_size=parameters["kv_page_size"],
+        topk_tokens=parameters["topk_tokens"],
+        max_context=parameters["max_context"],
+        max_logits_bytes=parameters["max_logits_bytes"],
+    )
     _validate_config(config)
     return config
-
-
-def _validate_sequence_length(config: _DSAConfig, sequence_length: int) -> None:
-    if sequence_length > config.max_context:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "DSA sequence_length exceeds the configured max_context",
-        )
 
 
 def _generator(seed: int) -> torch.Generator:
@@ -327,6 +215,8 @@ def _select_registration(
             signature,
             platform=platform,
             traits=traits,
+            solution=request.solution,
+            override=request.registration,
         )
     except NoKernelFoundError as error:
         raise BenchmarkCaseError(
@@ -568,8 +458,9 @@ def _snapshot_reset(*tensors: torch.Tensor) -> Callable[[], None]:
 
 
 def _common_parameters(config: _DSAConfig) -> dict[str, object]:
-    parameters: dict[str, object] = {
-        "dtype": "bfloat16",
+    return {
+        "model_profile": config.model_profile,
+        "dtype": str(config.dtype).removeprefix("torch."),
         "index_heads": config.index_heads,
         "index_head_dim": config.index_head_dim,
         "attention_heads": config.local_attention_heads,
@@ -584,9 +475,6 @@ def _common_parameters(config: _DSAConfig) -> dict[str, object]:
         "max_context": config.max_context,
         "max_logits_bytes": config.max_logits_bytes,
     }
-    if config.model_profile is not None:
-        parameters["model_profile"] = config.model_profile
-    return parameters
 
 
 def prepare_kpool_prefill_write(
@@ -595,8 +483,8 @@ def prepare_kpool_prefill_write(
 ) -> PreparedBenchmark:
     """Prepare one completed-pool compression call."""
 
-    config = _resolve_config(request, specific={"rows"})
-    rows = _positive_int(request.parameters, "rows")
+    config = _resolve_config(request)
+    rows = request.parameters["rows"]
     load_builtin_kernels()
     spec = _select_registration(
         request,
@@ -661,19 +549,10 @@ def prepare_kpool_decode_append(
 ) -> PreparedBenchmark:
     """Prepare one decode KPool append call."""
 
-    config = _resolve_config(
-        request,
-        specific={"batch", "q_len_per_req", "sequence_length"},
-    )
-    batch = _positive_int(request.parameters, "batch")
-    q_len_per_req = _positive_int(request.parameters, "q_len_per_req")
-    sequence_length = _positive_int(request.parameters, "sequence_length")
-    if sequence_length < q_len_per_req:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "DSA sequence_length must cover q_len_per_req",
-        )
-    _validate_sequence_length(config, sequence_length)
+    config = _resolve_config(request)
+    batch = request.parameters["batch"]
+    q_len_per_req = request.parameters["q_len_per_req"]
+    sequence_length = request.parameters["sequence_length"]
     load_builtin_kernels()
     spec = _select_registration(
         request,
@@ -773,32 +652,18 @@ def _prepare_kpool_topk(
     prefill: bool,
 ) -> PreparedBenchmark:
     if prefill:
-        config = _resolve_config(
-            request,
-            specific={"batch", "prefix_tokens", "query_tokens_per_sequence"},
-        )
-        batch = _positive_int(request.parameters, "batch")
-        prefix_tokens = _nonnegative_int(request.parameters, "prefix_tokens")
-        query_tokens_per_sequence = _positive_int(
-            request.parameters, "query_tokens_per_sequence"
-        )
+        config = _resolve_config(request)
+        batch = request.parameters["batch"]
+        prefix_tokens = request.parameters["prefix_tokens"]
+        query_tokens_per_sequence = request.parameters["query_tokens_per_sequence"]
         sequence_length = prefix_tokens + query_tokens_per_sequence
         q_len_per_req = 1
     else:
-        config = _resolve_config(
-            request,
-            specific={"batch", "q_len_per_req", "sequence_length"},
-        )
-        batch = _positive_int(request.parameters, "batch")
-        q_len_per_req = _positive_int(request.parameters, "q_len_per_req")
-        sequence_length = _positive_int(request.parameters, "sequence_length")
-        if sequence_length < q_len_per_req:
-            raise BenchmarkCaseError(
-                BenchmarkStatus.INVALID_CASE,
-                "DSA sequence_length must cover q_len_per_req",
-            )
+        config = _resolve_config(request)
+        batch = request.parameters["batch"]
+        q_len_per_req = request.parameters["q_len_per_req"]
+        sequence_length = request.parameters["sequence_length"]
         query_tokens_per_sequence = q_len_per_req
-    _validate_sequence_length(config, sequence_length)
 
     traits: dict[str, object] = {
         "head_dim": config.index_head_dim,
@@ -958,18 +823,12 @@ def _prepare_dsa_attention(
     prefill: bool,
 ) -> PreparedBenchmark:
     if prefill:
-        config = _resolve_config(
-            request,
-            specific={"batch", "prefix_tokens", "query_tokens_per_sequence"},
-        )
-        batch = _positive_int(request.parameters, "batch")
-        prefix_tokens = _nonnegative_int(request.parameters, "prefix_tokens")
-        query_tokens_per_sequence = _positive_int(
-            request.parameters, "query_tokens_per_sequence"
-        )
+        config = _resolve_config(request)
+        batch = request.parameters["batch"]
+        prefix_tokens = request.parameters["prefix_tokens"]
+        query_tokens_per_sequence = request.parameters["query_tokens_per_sequence"]
         sequence_length = prefix_tokens + query_tokens_per_sequence
         q_len_per_req = 1
-        _validate_sequence_length(config, sequence_length)
         metadata = _prefill_metadata(
             batch,
             prefix_tokens,
@@ -980,20 +839,11 @@ def _prepare_dsa_attention(
         causal_lens = metadata["causal_lens"]
         req_ids = metadata["req_ids"]
     else:
-        config = _resolve_config(
-            request,
-            specific={"batch", "q_len_per_req", "sequence_length"},
-        )
-        batch = _positive_int(request.parameters, "batch")
-        q_len_per_req = _positive_int(request.parameters, "q_len_per_req")
-        sequence_length = _positive_int(request.parameters, "sequence_length")
-        if sequence_length < q_len_per_req:
-            raise BenchmarkCaseError(
-                BenchmarkStatus.INVALID_CASE,
-                "DSA sequence_length must cover q_len_per_req",
-            )
+        config = _resolve_config(request)
+        batch = request.parameters["batch"]
+        q_len_per_req = request.parameters["q_len_per_req"]
+        sequence_length = request.parameters["sequence_length"]
         query_tokens_per_sequence = q_len_per_req
-        _validate_sequence_length(config, sequence_length)
         offsets = torch.arange(
             1 - q_len_per_req,
             1,

@@ -294,7 +294,20 @@ def load_suite(path: str | Path) -> BenchmarkSuite:
             fragment_cases = fragment.get("cases")
             if not isinstance(fragment_cases, list):
                 raise SuiteConfigError(f"case file {name} must contain a cases array")
-            cases_raw.extend(fragment_cases)
+            common_parameters = fragment.get("common_parameters", {})
+            cases_raw.extend(
+                {
+                    **case,
+                    "definition": {
+                        **case["definition"],
+                        "parameters": {
+                            **common_parameters,
+                            **case["definition"]["parameters"],
+                        },
+                    },
+                }
+                for case in fragment_cases
+            )
         if not cases_raw:
             raise SuiteConfigError("cases must be a non-empty JSON array")
         expanded_cases = [
