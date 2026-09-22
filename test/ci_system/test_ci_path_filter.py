@@ -4,22 +4,24 @@ from ci_path_filter import RUNNER_GROUPS, path_vendor, should_run
 NVIDIA_GROUPS = tuple(group for group in RUNNER_GROUPS if group != "amd")
 
 
-def test_gb300_slurm_path_filter_covers_shared_and_own_workflow_changes():
-    group = "nvidia-gb300-slurm"
+@pytest.mark.parametrize("cluster", ["gb200", "gb300"])
+def test_slurm_path_filter_covers_shared_and_own_workflow_changes(cluster):
+    group = f"nvidia-{cluster}-slurm"
 
     assert should_run({"test/ci/eval/task.yaml"}, group, "pull_request")
     assert should_run({"tokenspeed-mla/src/kernel.cu"}, group, "pull_request")
     assert should_run(
-        {".github/workflows/gb300-slurm-per-commit.yml"},
+        {f".github/workflows/{cluster}-slurm-per-commit.yml"},
         group,
         "pull_request",
     )
 
 
-def test_gb300_slurm_path_filter_ignores_other_vendor_workflows():
+@pytest.mark.parametrize("cluster", ["gb200", "gb300"])
+def test_slurm_path_filter_ignores_other_vendor_workflows(cluster):
     assert not should_run(
         {".github/workflows/pr-test-nvidia-arm.yml"},
-        "nvidia-gb300-slurm",
+        f"nvidia-{cluster}-slurm",
         "pull_request",
     )
 

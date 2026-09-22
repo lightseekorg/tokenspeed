@@ -44,9 +44,7 @@ on:
           - test/ci/eval/kimi-k3-mxfp4-tp8ep1-evalscope-aime26-amd.yaml
           - test/ci/eval/minimax-m3-nvfp4-dspark-evalscope-aime26.yaml
           - test/ci/eval/minimax-m3-nvfp4-evalscope-aime25.yaml
-          - test/ci/eval/qwen3.5-122b-a10b-nvfp4-epd-1e1p2d-evalscope-ocr-bench.yaml
           - test/ci/eval/qwen3.5-122b-a10b-nvfp4-evalscope-ocr-bench.yaml
-          - test/ci/eval/qwen3.5-35b-a3b-fp8-deepep-tp2dp2ep4-evalscope-gsm8k.yaml
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-dp4ep4-evalscope-aime25.yaml
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-evalscope-aime25.yaml
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-pd-1p1d-evalscope-aime25.yaml
@@ -62,7 +60,6 @@ on:
           - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic.yaml
           - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-longctx.yaml
           - test/ci/ut/deepseek-v4.1-flash-pd-1p1d.yaml
-          - test/ci/ut/qwen3.5-122b-a10b-nvfp4-epd-1e1p2d.yaml
           - test/ci/ut/qwen3.5-397b-a17b-nvfp4-pd-1p1d.yaml
           - test/ci/ut/ut-runtime-1gpu.yaml
           - test/ci/ut/ut-runtime-2gpu.yaml

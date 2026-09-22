@@ -4,13 +4,20 @@ import argparse
 import sys
 from pathlib import Path
 
-RUNNER_GROUPS = ("amd", "nvidia-arm", "nvidia-gb300-slurm", "nvidia-x86")
+RUNNER_GROUPS = (
+    "amd",
+    "nvidia-arm",
+    "nvidia-gb200-slurm",
+    "nvidia-gb300-slurm",
+    "nvidia-x86",
+)
 
 # Every runner group belongs to one vendor; vendor-owned paths below are
 # expressed per vendor so a new NVIDIA runner group needs no new path list.
 RUNNER_GROUP_VENDORS = {
     "amd": "amd",
     "nvidia-arm": "nvidia",
+    "nvidia-gb200-slurm": "nvidia",
     "nvidia-gb300-slurm": "nvidia",
     "nvidia-x86": "nvidia",
 }
@@ -42,6 +49,7 @@ VENDOR_DIRECTORIES = {
 VENDOR_WORKFLOWS = {
     "amd": ".github/workflows/pr-test-amd.yml",
     "nvidia-arm": ".github/workflows/pr-test-nvidia-arm.yml",
+    "nvidia-gb200-slurm": ".github/workflows/gb200-slurm-per-commit.yml",
     "nvidia-gb300-slurm": ".github/workflows/gb300-slurm-per-commit.yml",
     "nvidia-x86": ".github/workflows/pr-test-nvidia.yml",
 }
