@@ -104,8 +104,13 @@ ensure_flashinfer_jit_cache() {
         return 0
     fi
 
+    # Since 0.7.0 the pinned wheel depends on separate architecture providers.
+    local index_url="https://flashinfer.ai/whl/cu${CUINDEX}"
+    if [[ "${wheel_url}" == */nightly-v* ]]; then
+        index_url="https://flashinfer.ai/whl/nightly/cu${CUINDEX}"
+    fi
     pip_install_with_retry pip3 install --break-system-packages \
-        --force-reinstall --no-deps "${wheel_url}"
+        --force-reinstall --index-url "${index_url}" "${wheel_url}"
 }
 
 echo "=========================================="
@@ -251,6 +256,7 @@ if [ -n "${FLASHINFER_PYTHON_SPEC}" ]; then
     FLASHINFER_VERSION="${FLASHINFER_PYTHON_SPEC##*==}"
     case "${FLASHINFER_VERSION}" in
         0.6.18) FLASHINFER_CUBIN_SHA256="2dd65c0fcfc6bc44c67f148530de5372979c2e3d260e47935730f94156d4d873" ;;
+        0.7.0) FLASHINFER_CUBIN_SHA256="f1821e11ad4ea9666a09c2b04cc16b1e34f601296dc7a7b689649281c0358a9c" ;;
         *) echo "No SHA256 pinned for flashinfer-cubin ${FLASHINFER_VERSION}" >&2; exit 1 ;;
     esac
     # Nightlies version as X.Y.Z.devYYYYMMDD but tag as nightly-vX.Y.Z-YYYYMMDD,
@@ -297,21 +303,35 @@ if [ "${CUDA_VERSION%%.*}" = "13" ]; then
 fi
 
 echo "=== Verify installed Torch and native kernel dependencies ==="
-python3 - "${CUDA_REQ}" "${THIRDPARTY_REQ}" "${CUINDEX}" <<'PY'
+python3 - "${CUDA_REQ}" "${THIRDPARTY_REQ}" "${CUINDEX}" "${SCRIPT_DIR}" <<'PY'
 import importlib.metadata
+import os
 import sys
 from pathlib import Path
 
 import torch
 from packaging.requirements import Requirement
 
+sys.path.insert(0, sys.argv[4])
+from flashinfer_jit_cache_installer import install_url_if_needed
+
+checked_packages = (
+    "torch",
+    "tokenspeed-trtllm-kernel",
+    "tokenspeed-cutedsl-kda",
+    "flashinfer-python",
+    "nvidia-cudnn-frontend",
+)
 requirements = {}
 for path in sys.argv[1:3]:
     for line in Path(path).read_text().splitlines():
-        if line.startswith(("torch==", "tokenspeed-trtllm-kernel==", "tokenspeed-cutedsl-kda==")):
+        if line.startswith(tuple(f"{name}==" for name in checked_packages)):
             requirement = Requirement(line)
             requirements[requirement.name] = requirement
-for name in ("torch", "tokenspeed-trtllm-kernel", "tokenspeed-cutedsl-kda"):
+requirements["flashinfer-cubin"] = Requirement(
+    f"flashinfer-cubin{requirements['flashinfer-python'].specifier}"
+)
+for name in (*checked_packages, "flashinfer-cubin"):
     installed = torch.__version__ if name == "torch" else importlib.metadata.version(name)
     print(f"Installed {name}=={installed}", flush=True)
     if installed not in requirements[name].specifier:
@@ -320,6 +340,11 @@ expected_cuda = f"{sys.argv[3][:-1]}.{sys.argv[3][-1]}"
 print(f"Torch CUDA runtime: {torch.version.cuda}", flush=True)
 if torch.version.cuda != expected_cuda:
     raise SystemExit(f"Expected Torch CUDA {expected_cuda}, got {torch.version.cuda}")
+if os.environ.get("CI_RUNNER_LABEL", "").startswith(("gb200", "b200", "slurm-gb200-")):
+    url, expected, installed = install_url_if_needed(Path(sys.argv[1]), sys.argv[3])
+    print(f"Installed flashinfer-jit-cache=={installed}", flush=True)
+    if url is not None:
+        raise SystemExit(f"FlashInfer JIT cache or providers do not match {expected}")
 PY
 
 echo ""
