@@ -49,13 +49,13 @@ if flashinfer_kda_recurrent_available():
         # Prefer this BF16-only path over native decode (SPECIALIZED).
         priority=Priority.SPECIALIZED + 1,
         traits={
-            "paged_state": frozenset({True}),
-            "fused_output_norm": frozenset({False, True}),
-            "state_dtype": frozenset({torch.bfloat16}),
             "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
             "conv_kernel_size": frozenset({4}),
+            "fused_output_norm": frozenset({False, True}),
+            "paged_state": frozenset({True}),
             "recurrent_layout": frozenset({"v_major"}),
+            "state_dtype": frozenset({torch.bfloat16}),
         },
     )(flashinfer_kda_producer_decode)
 
@@ -69,16 +69,16 @@ if flashinfer_kda_recurrent_available():
         # Native split verify uses SPECIALIZED + 1.
         priority=Priority.SPECIALIZED + 2,
         traits={
-            "paged_state": frozenset({True}),
-            "store_states": frozenset({False}),
             "draft_token_num": frozenset(
                 range(1, FLASHINFER_KDA_MAX_VERIFY_TOKENS + 1)
             ),
-            "fused_replay_payload": frozenset({True}),
-            "split_producers": frozenset({False}),
-            "state_dtype": frozenset({torch.bfloat16}),
             "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
+            "fused_replay_payload": frozenset({True}),
+            "paged_state": frozenset({True}),
             "recurrent_layout": frozenset({"v_major"}),
+            "split_producers": frozenset({False}),
+            "state_dtype": frozenset({torch.bfloat16}),
+            "store_states": frozenset({False}),
         },
     )(flashinfer_kda_producer_verify)
