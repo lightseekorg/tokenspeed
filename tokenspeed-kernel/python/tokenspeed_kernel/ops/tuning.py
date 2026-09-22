@@ -247,7 +247,7 @@ def _mirror_autotune_cache(
     try:
         _install_autotune_cache_bytes(path, payload)
     except OSError:
-        logger.warning("Could not mirror FlashInfer cache to %s", path, exc_info=True)
+        logger.warning(f"Could not mirror FlashInfer cache to {path}", exc_info=True)
         return False
     return True
 
@@ -286,22 +286,18 @@ def load_autotune_cache(
             except FileNotFoundError:
                 pass
             except OSError:
-                logger.warning(
-                    "Could not read FlashInfer cache %s", path, exc_info=True
-                )
+                logger.warning(f"Could not read FlashInfer cache {path}", exc_info=True)
         if _mirror_autotune_cache(path, payload, process_group, owner_rank):
             try:
                 loaded = bool(tuner.load_configs(path))
             except Exception:
-                logger.warning(
-                    "Could not load FlashInfer cache %s", path, exc_info=True
-                )
+                logger.warning(f"Could not load FlashInfer cache {path}", exc_info=True)
     if process_group is not None:
         rank_states = [False] * dist.get_world_size(process_group)
         dist.all_gather_object(rank_states, loaded, group=process_group)
         loaded = all(rank_states)
     if loaded:
-        logger.info("loaded FlashInfer autotune cache from %s", path)
+        logger.info(f"loaded FlashInfer autotune cache from {path}")
     else:
         # Partial loads must not let ranks enter different timing collectives.
         tuner.clear_cache()
@@ -335,7 +331,7 @@ def save_autotune_cache(
             _autotuner.AutoTuner.get().save_configs(path)
             payload = Path(path).read_bytes()
         except Exception:
-            logger.warning("Could not save FlashInfer cache %s", path, exc_info=True)
+            logger.warning(f"Could not save FlashInfer cache {path}", exc_info=True)
     return _mirror_autotune_cache(path, payload, process_group, owner_rank)
 
 
