@@ -379,7 +379,6 @@ def prepare_dense_bmm(
         registration=spec,
         invocation=PreparedInvocation(
             invoke=performance_invoke,
-            repeat_safe=True,
         ),
         parameters=normalized_parameters,
         validation=validation,
@@ -585,7 +584,6 @@ def prepare_mxfp8_mm(
         registration=spec,
         invocation=PreparedInvocation(
             invoke=performance_invoke,
-            repeat_safe=True,
         ),
         parameters=normalized_parameters,
         validation=validation,
