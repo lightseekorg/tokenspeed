@@ -1085,17 +1085,16 @@ def cudagraph_probe_supported(
     Resolved the way ``create_attn_components`` resolves it, without building
     a pool and without writing back into ``server_args`` -- the build that
     follows reads the operator's own backend choice, and family dispatch keys
-    on architecture facts rather than on the backend name. Two families cannot:
-    one stages speculative verify scratch in the bound pool, which needs a row
-    per request at the serving concurrency; the other's backends latch their
-    pool at construction and reject a rebind.
+    on architecture facts rather than on the backend name. A family that stages
+    speculative verify scratch in the bound pool cannot: it needs a row per
+    request at the serving concurrency.
     """
     # The build's own resolver, on a copy: deriving it here would drift.
     probe_args = copy.copy(server_args)
     target = _resolve_attn_side(model_config, probe_args.attention_backend)
     _apply_backend_overrides(probe_args, target, None)
     config = _create_attn_config(probe_args, model_config)
-    # The two seams read only server_args and attn_config; the rest is fabricated.
+    # The seam reads only server_args and attn_config; the rest is fabricated.
     recipe = cache_recipe(
         _resolve_cache_family(target, config),
         server_args=probe_args,
@@ -1108,10 +1107,7 @@ def cudagraph_probe_supported(
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
-    return (
-        not recipe.verify_scratch_in_pool()
-        and recipe.backends_accept_pool_replacement()
-    )
+    return not recipe.verify_scratch_in_pool()
 
 
 def create_attn_components(

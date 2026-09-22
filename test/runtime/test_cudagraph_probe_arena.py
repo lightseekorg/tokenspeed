@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import ast
-import functools
 import inspect
 import pathlib
 import sys
@@ -361,17 +360,12 @@ def test_the_probe_support_query_calls_the_factorys_resolvers(monkeypatch) -> No
     before = dict(vars(args))
     monkeypatch.setattr(registry, "_create_attn_config", lambda *a, **k: object())
     monkeypatch.setattr(registry, "_resolve_cache_family", lambda *a, **k: "mha")
-    for scratch, latch, expected in (
-        (False, True, True),
-        (True, True, False),
-        (False, False, False),
-    ):
+    for scratch, expected in ((False, True), (True, False)):
         monkeypatch.setattr(
             registry,
             "cache_recipe",
-            lambda *a, _s=scratch, _l=latch, **k: SimpleNamespace(
-                verify_scratch_in_pool=lambda: _s,
-                backends_accept_pool_replacement=lambda: _l,
+            lambda *a, _s=scratch, **k: SimpleNamespace(
+                verify_scratch_in_pool=lambda: _s
             ),
         )
         config = SimpleNamespace(
@@ -381,14 +375,11 @@ def test_the_probe_support_query_calls_the_factorys_resolvers(monkeypatch) -> No
     assert dict(vars(args)) == before
 
 
-def test_only_pool_staged_verify_scratch_and_a_latched_pool_refuse(monkeypatch) -> None:
+def test_only_pool_staged_verify_scratch_refuses(monkeypatch) -> None:
     from tokenspeed_kernel.ops.attention import kda as kda_ops
 
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
         kda_verify_scratch_in_pool,
-    )
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen4_exp import (
-        Qwen4ExpRecipe,
     )
 
     for family in sorted(_RECIPES):
@@ -414,17 +405,6 @@ def test_only_pool_staged_verify_scratch_and_a_latched_pool_refuse(monkeypatch) 
     speculative.server_args.disaggregation_mode = "prefill"
     assert speculative.workspace_bytes() == 0
     assert speculative.verify_scratch_in_pool() is False
-
-    def _class_of(entry):
-        return entry.func if isinstance(entry, functools.partial) else entry
-
-    latched = {
-        family
-        for family, entry in setup._RECIPES.items()
-        if not _class_of(entry).backends_accept_pool_replacement(object())
-    }
-    assert latched == {"qwen4_exp"}
-    assert _class_of(setup._RECIPES["qwen4_exp"]) is Qwen4ExpRecipe
 
 
 def test_each_refusal_turns_the_probe_off_and_names_itself(monkeypatch) -> None:

@@ -433,14 +433,6 @@ class CacheRecipe(ABC):
         """Cache-adjacent fixed allocation this family also needs."""
         return 0
 
-    def backends_accept_pool_replacement(self) -> bool:
-        """Whether this family's backends can be handed a replacement pool.
-
-        A backend that latched its pool at construction rejects a rebind, so a
-        probe would bind one arena and die publishing the next.
-        """
-        return True
-
     def verify_scratch_in_pool(self) -> bool:
         """Whether speculative verify stages its scratch in the bound pool.
 
