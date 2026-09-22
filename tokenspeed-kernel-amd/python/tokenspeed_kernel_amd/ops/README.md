@@ -284,6 +284,38 @@ and batch size to limit shared-memory usage.
 
 ## MoE
 
+### gfx950 Kimi K3 latent input projection
+
+The Kimi K3 prefill path projects one packed BF16 input weight into router,
+routed-latent, and shared-expert inputs. Automatic selection uses the specialist
+for aligned prefills of at least 4096 tokens; smaller prefills retain the Triton
+kernel.
+
+#### Contract
+
+- The input is contiguous BF16 with shape `[M, 7168]`, where `M >= 4096` and
+  `M` is divisible by 256 for automatic dispatch.
+- Router `[896, 7168]`, routed `[3584, 7168]`, and shared gate/up
+  `[1536, 7168]` weights must be consecutive row views of one packed allocation.
+- Outputs are FP32 router logits, BF16 routed latents, and a BF16 768-wide
+  shared input after SiTU. Positive gate clamp and optional linear clamp values
+  are applied in FP32.
+
+#### Algorithm
+
+The projection preserves the `gluon_mm_a16w16_prefill_gfx950` inner loop: one
+eight-wave workgroup computes a `256 x 256` tile in 64-wide K steps through a
+double-buffered MFMA/LDS pipeline. Each 128-column accumulator half is routed
+independently because the packed output boundaries are only 128-column aligned.
+The unused final half-tile safely rereads the last valid weight half and is not
+stored.
+
+All final MFMAs complete before the mixed-dtype stores, keeping dot operands
+out of the epilogue live range. Router halves remain FP32 while routed and
+shared gate/up halves convert to BF16. A companion Gluon kernel reads the
+materialized BF16 gate/up values, applies SiTU in FP32, and writes BF16 shared
+input.
+
 ### MXFP8 SiTU Experts
 
 On gfx950, the MoE API selects Gluon kernels with MXFP8 activations and MXFP4
