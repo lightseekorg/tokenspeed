@@ -146,10 +146,10 @@ if current_platform().is_amd:
             # A partial final row tile is masked, so no alignment is required.
             "tokens_min": frozenset({4096}),
             "hidden_size": frozenset({7168}),
-            "num_experts": frozenset({896}),
-            "latent_size": frozenset({3584}),
-            "shared_size": frozenset({768}),
             "inputs_contiguous": frozenset({True}),
+            "latent_size": frozenset({3584}),
+            "num_experts": frozenset({896}),
+            "shared_size": frozenset({768}),
             "weights_packed": frozenset({True}),
         },
     )

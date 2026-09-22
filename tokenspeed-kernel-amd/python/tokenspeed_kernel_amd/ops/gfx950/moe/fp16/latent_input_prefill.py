@@ -57,7 +57,7 @@ _K3_TOTAL = _K3_ROUTER + _K3_ROUTED + _K3_SHARED_RAW
 
 
 def _prefill_launch_metadata(grid, kernel, args):
-    """Report packed projection work and main-kernel traffic to Proton."""
+    """Report packed projection work and traffic to Proton."""
     m = args["M"]
     return {
         "name": kernel.name,
