@@ -506,8 +506,8 @@ class MixedInputFusedMultiHeadAttentionDecode:
         mma_tile_k = 128
         mma_tile_mnk = (mma_tile_m, mma_tile_n, mma_tile_k)
         bf16_kv = k_iter.dtype is cutlass.BFloat16
-        self.dual_cta_bf16 = bf16_kv and self.bf16_smem_slots == 1
-        self.kv_ring_stages = 1 if cutlass.const_expr(self.dual_cta_bf16) else 2
+        dual_cta_bf16 = bf16_kv and self.bf16_smem_slots == 1
+        self.kv_ring_stages = 1 if cutlass.const_expr(dual_cta_bf16) else 2
         kv_mma_source = (
             tcgen05.OperandSource.SMEM
             if cutlass.const_expr(bf16_kv)
@@ -665,7 +665,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
             block=[self.threads_per_cta, 1, 1],
             cluster=[kv_splits, 1, 1],
             stream=stream,
-            min_blocks_per_mp=2 if cutlass.const_expr(self.dual_cta_bf16) else 1,
+            min_blocks_per_mp=2 if cutlass.const_expr(dual_cta_bf16) else 1,
             use_pdl=self.enable_pdl,
         )
 
