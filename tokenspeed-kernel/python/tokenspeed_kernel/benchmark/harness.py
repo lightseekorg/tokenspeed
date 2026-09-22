@@ -137,7 +137,7 @@ class PreparedValidation:
 class PreparedBenchmark:
     """Operation-owned state handed to the shared graph timer."""
 
-    registration: KernelSpec | None
+    registration: KernelSpec
     invocation: PreparedInvocation
     parameters: dict[str, Any]
     validation: PreparedValidation | None = None
@@ -229,7 +229,7 @@ def _load_builtin_generators() -> None:
 
 @dataclass(frozen=True)
 class KernelBenchmarkResult:
-    """Structured outcome for one operation benchmark request."""
+    """Structured outcome for one registration-level benchmark request."""
 
     status: BenchmarkStatus
     family: str
@@ -296,7 +296,7 @@ _GRAPH_STATUS_BY_PHASE = {
 
 
 class KernelBenchmarkHarness:
-    """Prepare and measure one operation with graph replay."""
+    """Prepare and measure one registered operation with graph replay."""
 
     def __init__(
         self,
@@ -550,16 +550,8 @@ class KernelBenchmarkHarness:
         return KernelBenchmarkResult(
             status=BenchmarkStatus.SUCCESS,
             **self._base_fields(request, platform, prepared.parameters),
-            registration_name=(
-                prepared.registration.name
-                if prepared.registration is not None
-                else None
-            ),
-            solution=(
-                prepared.registration.solution
-                if prepared.registration is not None
-                else None
-            ),
+            registration_name=prepared.registration.name,
+            solution=prepared.registration.solution,
             samples_us=measurement.samples_us,
             median_us=measurement.median_us,
             p90_us=measurement.p90_us,
@@ -601,15 +593,9 @@ class KernelBenchmarkHarness:
                 prepared.parameters if prepared is not None else None,
             ),
             registration_name=(
-                prepared.registration.name
-                if prepared is not None and prepared.registration is not None
-                else None
+                prepared.registration.name if prepared is not None else None
             ),
-            solution=(
-                prepared.registration.solution
-                if prepared is not None and prepared.registration is not None
-                else None
-            ),
+            solution=(prepared.registration.solution if prepared is not None else None),
             setup_time_ms=setup_time_ms,
             correctness=correctness,
             correctness_time_ms=correctness_time_ms,

@@ -167,28 +167,6 @@ def _select_sigmoid_bias_topk(
     return spec
 
 
-def _uses_kimi_direct_router(
-    platform: PlatformInfo,
-    *,
-    router_logits_dtype: torch.dtype,
-    tokens: int,
-    experts: int,
-    topk: int,
-) -> bool:
-    if platform.is_nvidia:
-        max_rows = 256
-    elif platform.is_cdna4:
-        max_rows = 1
-    else:
-        max_rows = 0
-    return (
-        router_logits_dtype is torch.float32
-        and 0 < tokens <= max_rows
-        and experts == 896
-        and topk == 16
-    )
-
-
 def _correction_bias(
     experts: int,
     *,
@@ -526,24 +504,13 @@ def prepare_sigmoid_bias_topk(
     normalize_topk_weights = parameters["normalize_topk_weights"]
 
     load_builtin_kernels()
-    direct_router = _uses_kimi_direct_router(
+    spec = _select_sigmoid_bias_topk(
+        request,
         platform,
         router_logits_dtype=router_logits_dtype,
         tokens=tokens,
         experts=experts,
         topk=topk,
-    )
-    spec = (
-        None
-        if direct_router
-        else _select_sigmoid_bias_topk(
-            request,
-            platform,
-            router_logits_dtype=router_logits_dtype,
-            tokens=tokens,
-            experts=experts,
-            topk=topk,
-        )
     )
     generator = _generator(request.seed)
     router_logits = _randn(

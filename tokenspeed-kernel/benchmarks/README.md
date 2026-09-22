@@ -71,7 +71,7 @@ not changed by the benchmark harness.
 
 ## Timing
 
-The shared timer measures warmed graph replay of the prepared operation.
+The shared timer measures warmed graph replay of the selected registration.
 Input creation, selection, compilation, eager warmup, graph capture, replay
 warmup, correctness checks, and result serialization are outside the reported
 device time.
@@ -87,10 +87,9 @@ an explicit override. Eager and graph-replay warmup counts remain suite-wide.
 Warmup settings and cache mode must match across revisions before measurements
 can be compared; measurement-block counts may differ.
 
-The result contains the raw device-time samples, resolved registration when the
-operation uses registry selection, timing mode, and structured failure
-information. Direct operation paths report a null registration. Suite-level
-comparison uses the sample median and relative median absolute deviation.
+The result contains the raw device-time samples, resolved registration, timing
+mode, and structured failure information. Suite-level comparison uses the
+sample median and relative median absolute deviation.
 
 ## Correctness
 

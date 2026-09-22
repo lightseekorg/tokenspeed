@@ -222,40 +222,6 @@ def test_harness_returns_measurement_and_actual_registration():
     assert timer.measurement_blocks == [3]
 
 
-def test_harness_supports_invocation_without_registration() -> None:
-    def prepare_direct(
-        request: BenchmarkRequest,
-        platform: PlatformInfo,
-    ) -> PreparedBenchmark:
-        _ = request, platform
-        return PreparedBenchmark(
-            registration=None,
-            invocation=PreparedInvocation(invoke=lambda: None),
-            parameters={"size": 8},
-        )
-
-    set_benchmark_generator("unit_direct", "test", prepare_direct)
-    result = KernelBenchmarkHarness(
-        _FakeTimer(),
-        platform_provider=_platform,
-    ).run(
-        BenchmarkRequest(
-            family="unit_direct",
-            mode="test",
-            parameters={"size": 8},
-            solution=None,
-            registration=None,
-            cold_cache=True,
-            seed=7,
-        ),
-        measurement_blocks=3,
-    )
-
-    assert result.status is BenchmarkStatus.SUCCESS
-    assert result.registration_name is None
-    assert result.solution is None
-
-
 def test_harness_requires_explicit_measurement_blocks() -> None:
     harness = KernelBenchmarkHarness(
         _FakeTimer(),

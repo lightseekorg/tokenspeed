@@ -229,66 +229,6 @@ def test_moe_apply_generator_precomputes_local_ep_routes(
     assert seen["apply"]["max_num_tokens_per_gpu"] == 3
 
 
-def test_kimi_single_token_router_has_no_registration(
-    monkeypatch,
-    mi350_platform: PlatformInfo,
-) -> None:
-    from tokenspeed_kernel.ops import moe as moe_ops
-
-    seen = {}
-    monkeypatch.setattr(moe_generator, "load_builtin_kernels", lambda: None)
-    monkeypatch.setattr(
-        moe_generator,
-        "_generator",
-        lambda seed: torch.Generator(device="cpu").manual_seed(seed),
-    )
-    monkeypatch.setattr(
-        moe_generator,
-        "_randn",
-        lambda shape, *, generator, dtype: torch.zeros(shape, dtype=dtype),
-    )
-    monkeypatch.setattr(
-        moe_generator,
-        "_correction_bias",
-        lambda experts, *, device: torch.zeros(experts, dtype=torch.float32),
-    )
-
-    def fake_topk(router_logits, correction_bias, topk, **_kwargs):
-        seen["shape"] = tuple(router_logits.shape)
-        return (
-            torch.ones(1, topk, dtype=torch.float32),
-            torch.arange(topk, dtype=torch.int32).unsqueeze(0),
-        )
-
-    monkeypatch.setattr(moe_ops, "moe_sigmoid_bias_topk", fake_topk)
-    prepared = moe_generator.prepare_sigmoid_bias_topk(
-        BenchmarkRequest(
-            family="moe",
-            mode="sigmoid_bias_topk",
-            parameters={
-                "model_profile": "kimi_k3_tp8",
-                "tokens": 1,
-                "num_experts": 896,
-                "topk": 16,
-                "router_logits_dtype": "float32",
-                "weights_dtype": "float32",
-                "routed_scaling_factor": 1.0,
-                "normalize_topk_weights": True,
-            },
-            solution=None,
-            registration=None,
-            cold_cache=True,
-            seed=42,
-        ),
-        mi350_platform,
-    )
-
-    prepared.invocation.invoke()
-
-    assert prepared.registration is None
-    assert seen["shape"] == (1, 896)
-
-
 def test_moe_apply_generator_builds_mxfp4_situ_global_ep_contract(
     fresh_registry,
     monkeypatch,
