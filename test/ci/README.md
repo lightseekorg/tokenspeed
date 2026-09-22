@@ -249,11 +249,11 @@ finishes. It validates the untrusted artifact and source revision before
 creating or replacing one bot-owned comment. Runs where the benchmark task was
 not selected have no report and are ignored.
 
-The first pull request introducing the benchmark can run only a candidate
-bootstrap because its merge base has no suite. It also cannot trigger its own
-comment publisher because GitHub requires the receiving `workflow_run` workflow
-to exist on the default branch. Manual runs produce summaries and artifacts but
-not pull request comments.
+A merge base that does not contain the suite yields a candidate-only
+bootstrap instead of a comparison. Changes to the comment workflow take effect
+only after they merge, since `workflow_run` workflows execute from the default
+branch. Manual runs produce summaries and artifacts but not pull request
+comments.
 
 `CUDA_VISIBLE_DEVICES=0` does not limit the shared cleanup process scan, so the
 runner must provide scheduler-enforced GPU or process-namespace isolation. The
@@ -429,6 +429,23 @@ hardware. A selected YAML follows the same rule; YAMLs that already declare a
 `slurm-dispatch-gb300` coordinators form one shared pool for manual, nightly,
 and per-commit submissions.
 
+The `GB200 Slurm Per Commit` workflow runs single-node `slurm-gb200-*`
+tasks through the `slurm-dispatch` coordinator. Qwen four-GPU tasks migrated
+from B200 use `slurm-gb200-4gpu`: the 397B NVFP4 AIME25 evaluation, 35B FP8
+DeepEP GSM8K evaluation, and 122B EPD OCRBench evaluation and unit test.
+Their existing commands, triggers, and score thresholds are preserved.
+
+It runs automatically for relevant pushes to `main` and non-draft,
+same-repository pull requests; manual dispatch selects the `manual` trigger.
+The ordinary NVIDIA ARM workflow excludes `slurm-*` tasks. The dedicated
+Slurm scan clears `TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS`, so the Kubernetes
+`gb200` exclusion does not disable these tasks. Closing a PR cancels its run;
+the approved-PR and latest-main retry workflows also cover this workflow.
+
+`Slurm Dispatch` includes `slurm-gb200-4gpu` in its default bulk runners.
+Its default `eval,perf` selection covers the three migrated evaluations;
+select `ut` explicitly to include the EPD unit test.
+
 The `GB300 Slurm Per Commit` workflow selects only multi-node model tasks with
 the `per-commit` trigger and submits them through the same
 `slurm-dispatch-gb300` coordinator pool used by manual dispatch. It runs for
@@ -481,6 +498,10 @@ test/ci/run_slurm.sh \
 # Every existing YAML for one exact runner label:
 test/ci/run_slurm.sh --all --runner gb200-4gpu --trigger manual
 
+# Migrated Qwen four-GPU evaluations and EPD unit test:
+test/ci/run_slurm.sh --all --runner slurm-gb200-4gpu \
+  --type eval --type ut --trigger manual
+
 # List Kimi eval/perf tasks from PR 795 for two runner labels:
 test/ci/run_slurm.sh \
   --pr 795 \
@@ -507,11 +528,22 @@ This is a manual launcher, not a GitHub Actions runner. Override its defaults
 with `TS_CI_ARTIFACT_ROOT`, `TS_CI_CACHE_DIR`, or
 `TS_CI_CONTAINER_IMAGE`.
 
+The default Slurm image pins Torch 2.14.0 and FlashInfer 0.7.0 by image digest.
+Keep the FlashInfer Python requirement, release cubin checksum, and runner
+JIT-cache version aligned when upgrading. FlashInfer 0.7.0 also requires
+cuDNN frontend 1.29.0 or newer and splits its JIT cache into provider packages.
+GB200/B200 setup resolves those providers from the matching FlashInfer CUDA
+index and checks their installed versions again after dependency installation.
+
 `--pr` accepts a pull request number or GitHub URL. It fetches the PR head and
 merges it into the launcher's committed `HEAD` in an isolated temporary
 worktree. The original checkout is not modified, and submitted jobs use an
 immutable archive of that merged commit. A merge conflict stops before any job
 is submitted.
+
+Concurrent submissions publish each commit's snapshot without replacing an
+existing archive. Reuse requires byte-for-byte agreement with a fresh Git
+archive; a mismatched snapshot fails submission and is left unchanged.
 
 `--source-pr` accepts the same values but only labels the report; it neither
 fetches nor merges, and is for callers that already checked out the pull

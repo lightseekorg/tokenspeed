@@ -29,7 +29,9 @@ import pytest
 @pytest.fixture
 def installed_stack(monkeypatch, tmp_path):
     requirements = tmp_path / "cuda.txt"
-    requirements.write_text("torch==2.14.0\n")
+    requirements.write_text(
+        "torch==2.14.0\n" "flashinfer-python==0.7.0\n" "nvidia-cudnn-frontend==1.29.0\n"
+    )
     thirdparty = tmp_path / "cuda-thirdparty.txt"
     thirdparty.write_text(
         "tokenspeed-trtllm-kernel==1.3.0.post20260919\n"
@@ -38,15 +40,36 @@ def installed_stack(monkeypatch, tmp_path):
     versions = {
         "tokenspeed-trtllm-kernel": "1.3.0.post20260919",
         "tokenspeed-cutedsl-kda": "0.1.0.post20260919",
+        "flashinfer-python": "0.7.0",
+        "flashinfer-cubin": "0.7.0",
+        "nvidia-cudnn-frontend": "1.29.0",
+        "flashinfer-jit-cache": "0.7.0+cu130",
+        "flashinfer-jit-cache-sm100a": "0.7.0+cu130",
     }
     torch = SimpleNamespace(
         __version__="2.14.0+cu130", version=SimpleNamespace(cuda="13.0")
     )
     monkeypatch.setitem(sys.modules, "torch", torch)
-    monkeypatch.setattr(importlib.metadata, "version", versions.__getitem__)
-    monkeypatch.setattr(sys, "argv", ["-", str(requirements), str(thirdparty), "130"])
+
+    def installed_version(name):
+        if name not in versions:
+            raise importlib.metadata.PackageNotFoundError(name)
+        return versions[name]
+
+    monkeypatch.setattr(importlib.metadata, "version", installed_version)
+    monkeypatch.setattr(
+        importlib.metadata,
+        "requires",
+        lambda _: ["flashinfer-jit-cache-sm100a==0.7.0+cu130"],
+    )
+    monkeypatch.setenv("CI_RUNNER_LABEL", "gb200-1gpu")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["-", str(requirements), str(thirdparty), "130", str(Path(__file__).parent)],
+    )
     installer = Path(__file__).with_name("install_deps.sh").read_text()
-    marker = 'python3 - "${CUDA_REQ}" "${THIRDPARTY_REQ}" "${CUINDEX}" <<\'PY\'\n'
+    marker = 'python3 - "${CUDA_REQ}" "${THIRDPARTY_REQ}" "${CUINDEX}" "${SCRIPT_DIR}" <<\'PY\'\n'
     script = installer.split(marker, 1)[1].split("\nPY", 1)[0]
     return compile(script, "install_deps.sh:validation", "exec"), torch, versions
 
@@ -59,6 +82,9 @@ def test_cuda_install_logs_and_accepts_matching_versions(installed_stack, capsys
     assert "Installed tokenspeed-trtllm-kernel==1.3.0.post20260919" in output
     assert "Installed tokenspeed-cutedsl-kda==0.1.0.post20260919" in output
     assert "Torch CUDA runtime: 13.0" in output
+    assert "Installed flashinfer-python==0.7.0" in output
+    assert "Installed flashinfer-cubin==0.7.0" in output
+    assert "Installed flashinfer-jit-cache==0.7.0+cu130" in output
 
 
 def test_cuda_install_rejects_torch_downgrade(installed_stack):
@@ -81,4 +107,28 @@ def test_cuda_install_rejects_wrong_cuda_runtime(installed_stack, cuda):
     script, torch, _ = installed_stack
     torch.version.cuda = cuda
     with pytest.raises(SystemExit, match="Expected Torch CUDA 13.0"):
+        exec(script, {})
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "flashinfer-python",
+        "flashinfer-cubin",
+        "nvidia-cudnn-frontend",
+        "flashinfer-jit-cache",
+        "flashinfer-jit-cache-sm100a",
+    ],
+)
+def test_cuda_install_rejects_final_flashinfer_version_drift(installed_stack, name):
+    script, _, versions = installed_stack
+    versions[name] = "0.0.0"
+    with pytest.raises(SystemExit):
+        exec(script, {})
+
+
+def test_cuda_install_rejects_missing_jit_provider(installed_stack):
+    script, _, versions = installed_stack
+    del versions["flashinfer-jit-cache-sm100a"]
+    with pytest.raises(SystemExit, match="JIT cache or providers do not match"):
         exec(script, {})

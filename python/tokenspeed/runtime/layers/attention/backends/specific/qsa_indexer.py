@@ -193,12 +193,26 @@ class QSAIndexerBackend(AttentionBackend):
         self._tables.fill(bs, actual_bs, block_tables)
 
     def _metadata(
-        self, bs: int, seq_lens: torch.Tensor, extend_seq_lens: torch.Tensor | None
+        self,
+        bs: int,
+        seq_lens: torch.Tensor,
+        extend_seq_lens: torch.Tensor | None,
+        max_seq_len: int,
     ) -> QSAIndexerMetadata:
+        # The host bound covers prefix + new tokens, not just this chunk.
+        # Keep the persistent allocation intact; only this invocation's view
+        # is shortened. Decode passes the capacity to preserve graph shapes.
+        table = self._tables.table(QWEN4_EXP_QSA_CACHE_GROUP, bs)
+        granularity = next(
+            spec.block_granularity
+            for spec in self._table_specs
+            if spec.group_id == QWEN4_EXP_QSA_CACHE_GROUP
+        )
+        columns = max(1, (max_seq_len + granularity - 1) // granularity)
         return QSAIndexerMetadata(
             seq_lens=seq_lens,
             extend_seq_lens=extend_seq_lens,
-            qsa_block_table=self._tables.table(QWEN4_EXP_QSA_CACHE_GROUP, bs),
+            qsa_block_table=table[:, :columns],
             recent_block_table=self._tables.table(QWEN4_EXP_QSA_RECENT_CACHE_GROUP, bs),
         )
 
@@ -220,8 +234,8 @@ class QSAIndexerBackend(AttentionBackend):
         extend_with_prefix: bool,
         **kwargs,
     ) -> None:
-        del req_pool_indices, extend_seq_lens_cpu, extend_prefix_lens
-        del extend_prefix_lens_cpu, extend_prompt_lens_cpu, extend_with_prefix, kwargs
+        del req_pool_indices, extend_prefix_lens
+        del extend_prompt_lens_cpu, extend_with_prefix, kwargs
         reject_bounded_replay(extend_replay_lens_cpu, "QSAIndexerBackend")
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
             raise RuntimeError("QSA decode metadata uses refresh_decode_metadata")
@@ -236,8 +250,18 @@ class QSAIndexerBackend(AttentionBackend):
                     torch.full_like(seq_lens[num_extends:bs], self.spec_num_tokens),
                 )
             )
+        max_seq_len = self.max_context_len
+        if bs > 0 and num_extends == bs:
+            # All request lengths are already known on the host. Mixed batches
+            # retain the capacity bound for their device-only decode lengths.
+            max_seq_len = int(
+                (
+                    extend_prefix_lens_cpu[:num_extends]
+                    + extend_seq_lens_cpu[:num_extends]
+                ).max()
+            )
         self.forward_extend_metadata = self._metadata(
-            bs, seq_lens[:bs].clone(), lengths
+            bs, seq_lens[:bs].clone(), lengths, max_seq_len
         )
         self._active_metadata = None
 
@@ -263,7 +287,9 @@ class QSAIndexerBackend(AttentionBackend):
         )
         metadata = self._decode_views.get(bs)
         if metadata is None:
-            metadata = self._metadata(bs, self._seq_lens[:bs], None)
+            metadata = self._metadata(
+                bs, self._seq_lens[:bs], None, self.max_context_len
+            )
             self._decode_views[bs] = metadata
         self.forward_decode_metadata = metadata
         self._active_metadata = None

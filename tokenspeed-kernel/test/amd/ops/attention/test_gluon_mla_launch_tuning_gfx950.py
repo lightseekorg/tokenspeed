@@ -97,25 +97,25 @@ def test_small_batch_split_selection_caps_at_available_kv_blocks() -> None:
     "entrypoint,batch,num_heads",
     [
         pytest.param(
-            "gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock",
+            "launch_gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock",
             1,
             16,
             id="bh16-multiblock-invalid-heads",
         ),
         pytest.param(
-            "gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock",
+            "launch_gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock",
             3,
             64,
             id="bh16-multiblock-invalid-batch",
         ),
         pytest.param(
-            "gluon_mla_decode_bf16xbf16_gfx950_bh64_small",
+            "launch_gluon_mla_decode_bf16xbf16_gfx950_bh64_small",
             1,
             16,
             id="bh64-small-invalid-heads",
         ),
         pytest.param(
-            "gluon_mla_decode_bf16xbf16_gfx950_bh64_small",
+            "launch_gluon_mla_decode_bf16xbf16_gfx950_bh64_small",
             3,
             64,
             id="bh64-small-invalid-batch",

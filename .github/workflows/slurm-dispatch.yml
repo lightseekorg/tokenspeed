@@ -73,7 +73,7 @@ on:
       runners:
         description: "Logical bulk runners; GB300 maps B200/GB200 labels to matching GB300 runners"
         required: true
-        default: "b200-4gpu,gb200-4gpu"
+        default: "b200-4gpu,gb200-4gpu,slurm-gb200-4gpu"
         type: string
       task_types:
         description: "Comma-separated task types (ut,server_smoke,eval,perf)"
@@ -236,7 +236,8 @@ jobs:
             args+=(--type "$yaml_task_type")
             if [ "$CLUSTER" = gb300 ]; then
               selected_runners=()
-              if [ "${RUNNERS//[[:space:]]/}" = "b200-4gpu,gb200-4gpu" ]; then
+              if [[ "${RUNNERS//[[:space:]]/}" == "b200-4gpu,gb200-4gpu" || \
+                    "${RUNNERS//[[:space:]]/}" == "b200-4gpu,gb200-4gpu,slurm-gb200-4gpu" ]]; then
                 selected_runners=("${yaml_runners[@]}")
               else
                 IFS=',' read -ra values <<< "$RUNNERS"

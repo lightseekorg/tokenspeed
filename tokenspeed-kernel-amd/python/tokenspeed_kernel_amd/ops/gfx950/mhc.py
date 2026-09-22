@@ -31,7 +31,7 @@ __all__ = [
 
 
 @gluon.jit
-def _mhc_pre_reduce_apply_kernel(
+def gluon_mhc_pre_gfx950(
     gemm_out_mul,
     gemm_out_sqrsum,
     hc_scale,
@@ -200,7 +200,7 @@ def gluon_mhc_pre_reduce_apply_gfx950(
         raise ValueError("GFX950 mHC specialization requires 1-64 tokens")
 
     block_h = _mhc_pre_reduce_apply_block_h(num_tokens, hidden_size, n_splits)
-    _mhc_pre_reduce_apply_kernel[(num_tokens, hidden_size // block_h)](
+    gluon_mhc_pre_gfx950[(num_tokens, hidden_size // block_h)](
         gemm_out_mul,
         gemm_out_sqrsum,
         hc_scale,

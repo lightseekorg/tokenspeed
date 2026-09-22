@@ -563,6 +563,70 @@ def test_qsa_indexer_requires_both_live_tables() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "prefixes, queries, decode_lengths, expected_columns",
+    [
+        ([0], [1], [], 1),
+        ([0], [512], [], 2),
+        ([700], [15], [], 3),
+        ([768, 0], [20, 32], [], 4),
+        ([0], [16], [900], 4),
+    ],
+)
+def test_qsa_extend_table_bound_includes_prefix_and_mixed_decode(
+    prefixes, queries, decode_lengths, expected_columns
+) -> None:
+    root, indexer = _root_with_indexer(
+        _qsa_config(max_bs=4, is_draft=False, device="cpu"),
+        _qsa_pool(device="cpu", layer_offset=0),
+    )
+    root.init_cuda_graph_state(4)
+    bs = len(queries) + len(decode_lengths)
+    seq_lens = torch.tensor(
+        [prefix + query for prefix, query in zip(prefixes, queries, strict=True)]
+        + decode_lengths,
+        dtype=torch.int32,
+    )
+    query_lengths = torch.tensor(queries, dtype=torch.int32)
+    prefix_lengths = torch.tensor(prefixes, dtype=torch.int32)
+    tables = {
+        gid: torch.arange(1, bs * 4 + 1, dtype=torch.int32).reshape(bs, 4)
+        for gid in (QWEN4_EXP_QSA_CACHE_GROUP, QWEN4_EXP_QSA_RECENT_CACHE_GROUP)
+    }
+    indexer.init_forward_metadata(
+        bs,
+        len(queries),
+        torch.arange(bs),
+        seq_lens,
+        ForwardMode.MIXED if decode_lengths else ForwardMode.EXTEND,
+        block_tables=tables,
+        extend_seq_lens=query_lengths,
+        extend_seq_lens_cpu=query_lengths,
+        extend_prefix_lens=prefix_lengths,
+        extend_prefix_lens_cpu=prefix_lengths,
+        extend_replay_lens_cpu=torch.zeros_like(query_lengths),
+        extend_prompt_lens_cpu=seq_lens[: len(queries)],
+        extend_with_prefix=any(prefixes),
+    )
+    metadata = indexer.forward_extend_metadata
+    table = indexer._tables.table(QWEN4_EXP_QSA_CACHE_GROUP, bs)
+    assert table.shape == (bs, 4)
+    assert metadata.qsa_block_table.shape == (bs, expected_columns)
+    assert metadata.qsa_block_table.data_ptr() == table.data_ptr()
+    torch.testing.assert_close(metadata.qsa_block_table, table[:, :expected_columns])
+    # A later decode must retain capacity even after a compact extend view.
+    indexer.refresh_decode_metadata(
+        bs,
+        bs,
+        torch.arange(bs),
+        seq_lens,
+        forward_mode=ForwardMode.DECODE,
+        block_tables=tables,
+    )
+    assert indexer.forward_decode_metadata.qsa_block_table.shape == (bs, 4)
+    assert indexer.forward_extend_metadata is metadata
+
+
 def test_qsa_draft_narrowing_preserves_layout_and_updates_the_frontier(
     monkeypatch,
 ) -> None:

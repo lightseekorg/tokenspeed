@@ -1238,5 +1238,96 @@ class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
         )
 
 
+class PrefillRoleGraphsTest(unittest.TestCase):
+    """The PD prefill role never runs a decode step, so the decode graph has
+    nothing to capture there; the prefill graph keeps its ordinary gating
+    instead of the role forcing eager execution."""
+
+    def setUp(self):
+        try:
+            import torch  # noqa: F401
+
+            from tokenspeed.runtime.execution import forward_step, prefill_graph
+            from tokenspeed.runtime.execution.model_executor import (
+                ModelExecutorConfig,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + runtime deps: {exc}")
+        self.forward_step = forward_step
+        self.prefill_graph = prefill_graph
+        self.ModelExecutorConfig = ModelExecutorConfig
+
+    def _config(self, *, prefill_only: bool, enforce_eager: bool = False):
+        return self.ModelExecutorConfig(
+            max_req_pool_size=5,
+            output_length=1,
+            enforce_eager=enforce_eager,
+            prefix_granularity=128,
+            max_num_seqs=4,
+            chunked_prefill_size=4096,
+            vocab_size=32,
+            context_len=4096,
+            physical_context_len=4096,
+            device="cpu",
+            gpu_id=0,
+            global_rank=0,
+            cudagraph_capture_sizes=[1, 2, 4],
+            disable_cuda_graph_padding=False,
+            max_cudagraph_capture_size=4,
+            model_is_mrope=False,
+            prefill_only=prefill_only,
+            prefill_graph_capture_batch_sizes=None,
+            prefill_graph_max_tokens=256,
+        )
+
+    def _decode_runner(self, config):
+        class Backend:
+            def init_cuda_graph_state(self, *args, **kwargs):
+                pass
+
+        return self.forward_step.ForwardStepRunner(
+            forward_func=lambda *args, **kwargs: None,
+            attn_backend=Backend(),
+            token_to_kv_pool=_fake_pool(cache_group_page_counts={}),
+            input_buffers=object(),
+            config=config,
+        )
+
+    def _prefill_owner(self, config):
+        from unittest import mock
+
+        inner = SimpleNamespace(embed_tokens=object())
+        model_runner = SimpleNamespace(
+            model=SimpleNamespace(model=inner),
+            is_generation=True,
+            is_multimodal=False,
+        )
+        with mock.patch.object(self.prefill_graph.PrefillGraph, "capture"):
+            return self.prefill_graph.PrefillGraph(
+                model_runner=model_runner,
+                attn_backend=object(),
+                token_to_kv_pool=_fake_pool(runtime_contract=object()),
+                input_buffers=object(),
+                config=config,
+            )
+
+    def test_prefill_role_skips_the_decode_graph_and_keeps_the_prefill_graph(
+        self,
+    ):
+        config = self._config(prefill_only=True)
+        self.assertTrue(self._decode_runner(config).disable)
+        self.assertFalse(self._prefill_owner(config).disable)
+
+    def test_a_serving_node_keeps_both_graphs(self):
+        config = self._config(prefill_only=False)
+        self.assertFalse(self._decode_runner(config).disable)
+        self.assertFalse(self._prefill_owner(config).disable)
+
+    def test_explicit_eager_still_disables_the_prefill_graph_on_the_role(self):
+        config = self._config(prefill_only=True, enforce_eager=True)
+        self.assertTrue(self._decode_runner(config).disable)
+        self.assertTrue(self._prefill_owner(config).disable)
+
+
 if __name__ == "__main__":
     unittest.main()

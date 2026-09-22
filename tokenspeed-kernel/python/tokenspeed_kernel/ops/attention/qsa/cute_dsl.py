@@ -133,12 +133,12 @@ if _IS_NVIDIA_BLACKWELL:
             }
         ),
         traits={
-            "is_decode": frozenset({True}),
-            "head_dim": frozenset({_HEAD_DIM}),
-            "value_head_dim": frozenset({_HEAD_DIM}),
             "num_q_heads": frozenset({6, 12, 24}),
             "num_kv_heads": frozenset({1, 2, 4}),
+            "head_dim": frozenset({_HEAD_DIM}),
+            "value_head_dim": frozenset({_HEAD_DIM}),
             "selected_width": frozenset({_SELECTED_WIDTH}),
+            "is_decode": frozenset({True}),
         },
         priority=Priority.SPECIALIZED + 2,
     )(cute_dsl_blackwell_qsa_sparse_attention)
