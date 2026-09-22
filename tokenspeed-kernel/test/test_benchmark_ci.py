@@ -332,7 +332,6 @@ def test_run_suite_uses_one_timer_and_emits_deterministic_envelope(tmp_path):
     assert payload["cases"][0]["result"] == {
         "status": "success",
         "registration_name": "gluon_bmm_a16w16_gfx950",
-        "implementation_name": None,
         "cold_cache": True,
         "timing_mode": "graph_replay",
         "metric": "device_time_per_invocation",

@@ -175,24 +175,6 @@ def _compare(base: dict | None, candidate: dict, **overrides) -> dict:
     return compare_runs(base, candidate, **arguments)
 
 
-def test_validate_run_accepts_direct_implementation_without_registration() -> None:
-    case = _case(10.0, validated=False)
-    case["definition"].pop("registration")
-    case["result"]["registration_name"] = None
-    case["result"]["implementation_name"] = "kimi3_sigmoid_bias_topk"
-
-    validated = validate_run_document(
-        _run(CANDIDATE_SHA, [case]),
-        expected_revision=CANDIDATE_SHA,
-    )
-
-    assert validated["cases"][0]["result"]["registration_name"] is None
-    assert (
-        validated["cases"][0]["result"]["implementation_name"]
-        == "kimi3_sigmoid_bias_topk"
-    )
-
-
 def test_compare_reports_regression_with_minimal_schema():
     report = _compare(
         _run(BASE_SHA, [_case(10.0)]),
@@ -371,7 +353,7 @@ def test_compare_allows_registration_and_measurement_count_changes():
 
     comparison = report["comparisons"][0]
     assert comparison["classification"] == "within_budget"
-    assert "selected implementation changed" in comparison["detail"]
+    assert "selected registration changed" in comparison["detail"]
 
 
 def test_validate_run_requires_identity_and_unique_case_ids():

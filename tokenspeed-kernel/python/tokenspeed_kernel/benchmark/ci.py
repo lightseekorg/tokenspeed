@@ -398,7 +398,6 @@ def _failure_payload(
     return {
         "status": status.value,
         "registration_name": None,
-        "implementation_name": None,
         "cold_cache": cold_cache,
         "timing_mode": "graph_replay",
         "metric": "device_time_per_invocation",
@@ -417,7 +416,6 @@ def _result_payload(result: KernelBenchmarkResult) -> dict[str, Any]:
     return {
         "status": result.status.value,
         "registration_name": result.registration_name,
-        "implementation_name": result.implementation_name,
         "cold_cache": result.cold_cache,
         "timing_mode": result.timing_mode,
         "metric": result.metric,

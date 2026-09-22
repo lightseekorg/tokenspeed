@@ -229,7 +229,7 @@ def test_moe_apply_generator_precomputes_local_ep_routes(
     assert seen["apply"]["max_num_tokens_per_gpu"] == 3
 
 
-def test_kimi_single_token_router_reports_direct_implementation(
+def test_kimi_single_token_router_has_no_registration(
     monkeypatch,
     mi350_platform: PlatformInfo,
 ) -> None:
@@ -286,7 +286,6 @@ def test_kimi_single_token_router_reports_direct_implementation(
     prepared.invocation.invoke()
 
     assert prepared.registration is None
-    assert prepared.selected_implementation_name == "kimi3_sigmoid_bias_topk"
     assert seen["shape"] == (1, 896)
 
 

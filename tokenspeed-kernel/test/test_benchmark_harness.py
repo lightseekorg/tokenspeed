@@ -206,7 +206,6 @@ def test_harness_returns_measurement_and_actual_registration():
 
     assert result.status is BenchmarkStatus.SUCCESS
     assert result.registration_name == "test_registration"
-    assert result.implementation_name == "test_registration"
     assert result.solution == "test_solution"
     assert result.selection_mode == "solution"
     assert result.cold_cache is True
@@ -223,7 +222,7 @@ def test_harness_returns_measurement_and_actual_registration():
     assert timer.measurement_blocks == [3]
 
 
-def test_harness_reports_direct_implementation_without_registration() -> None:
+def test_harness_supports_invocation_without_registration() -> None:
     def prepare_direct(
         request: BenchmarkRequest,
         platform: PlatformInfo,
@@ -231,7 +230,6 @@ def test_harness_reports_direct_implementation_without_registration() -> None:
         _ = request, platform
         return PreparedBenchmark(
             registration=None,
-            implementation_name="unit_direct_implementation",
             invocation=PreparedInvocation(invoke=lambda: None),
             parameters={"size": 8},
         )
@@ -255,7 +253,6 @@ def test_harness_reports_direct_implementation_without_registration() -> None:
 
     assert result.status is BenchmarkStatus.SUCCESS
     assert result.registration_name is None
-    assert result.implementation_name == "unit_direct_implementation"
     assert result.solution is None
 
 

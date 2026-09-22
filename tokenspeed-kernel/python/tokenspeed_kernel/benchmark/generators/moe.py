@@ -69,7 +69,6 @@ _IMPLEMENTED_TOKEN_COUNT_SCOPES = frozenset({"global", "local"})
 _IMPLEMENTED_INTERNAL_ACTIVATION_DTYPES = frozenset({"input"})
 _IMPLEMENTED_FP8_BLOCK_SHAPES = frozenset({(128, 128)})
 _IMPLEMENTED_MXFP4_GROUP_SIZES = frozenset({32})
-_KIMI_DIRECT_ROUTER = "kimi3_sigmoid_bias_topk"
 
 
 def _implemented_value(
@@ -580,7 +579,6 @@ def prepare_sigmoid_bias_topk(
             "normalize_topk_weights": normalize_topk_weights,
         },
         validation=None,
-        implementation_name=_KIMI_DIRECT_ROUTER if direct_router else None,
     )
 
 
