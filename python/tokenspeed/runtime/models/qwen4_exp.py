@@ -118,6 +118,7 @@ def _build_qwen4_exp_mlp(
         )
     else:
         mlp = Qwen3_5MoeMLP(
+            parallelism="dense",
             mapping=mapping,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,

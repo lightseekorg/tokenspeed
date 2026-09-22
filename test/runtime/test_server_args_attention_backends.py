@@ -440,6 +440,41 @@ class TestDecodeHostL2(unittest.TestCase):
         self.assertTrue(args.enable_kvstore)
 
 
+class TestDisaggregationGraphFlags(unittest.TestCase):
+    """The prefill role is a role with no decode step, not an eager role."""
+
+    def test_prefill_role_keeps_the_ordinary_graph_flags(self):
+        args = prepare_server_args(["--model", "x", "--disaggregation-mode", "prefill"])
+        self.assertFalse(args.enforce_eager)
+        self.assertFalse(args.disable_prefill_graph)
+
+    def test_prefill_role_honours_explicit_eager(self):
+        args = prepare_server_args(
+            ["--model", "x", "--disaggregation-mode", "prefill", "--enforce-eager"]
+        )
+        self.assertTrue(args.enforce_eager)
+
+    def test_pipeline_parallelism_forces_eager(self):
+        args = prepare_server_args(
+            [
+                "--model",
+                "x",
+                "--disaggregation-mode",
+                "prefill",
+                "--pipeline-parallel-size",
+                "2",
+            ]
+        )
+        self.assertTrue(args.enforce_eager)
+
+    def test_pipeline_debug_without_pd_forces_eager(self):
+        with mock.patch.dict(os.environ, {"TS_PP_DEBUG_ALLOW_NON_PREFILL": "1"}):
+            args = prepare_server_args(
+                ["--model", "x", "--pipeline-parallel-size", "2"]
+            )
+        self.assertTrue(args.enforce_eager)
+
+
 class TestL3StorageBackend(unittest.TestCase):
     def test_cli_accepts_mooncake_and_memory(self):
         parser = argparse.ArgumentParser()

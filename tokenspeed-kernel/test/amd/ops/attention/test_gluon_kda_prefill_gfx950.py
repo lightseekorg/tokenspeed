@@ -13,7 +13,7 @@ if not is_cdna4():
 
 
 from tokenspeed_kernel_amd.ops.gfx950.attention.kda.prefill import (  # noqa: E402
-    gluon_kda_paged_prefill_gfx950,
+    launch_gluon_kda_paged_prefill_gfx950,
 )
 
 
@@ -98,7 +98,7 @@ def test_kda_prefill_matches_packed_recurrent_reference(
         expected_outputs.append(output)
         expected_states.append(state)
 
-    actual_output, actual_state = gluon_kda_paged_prefill_gfx950(
+    actual_output, actual_state = launch_gluon_kda_paged_prefill_gfx950(
         q,
         k,
         v,

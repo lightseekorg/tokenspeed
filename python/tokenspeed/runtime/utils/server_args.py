@@ -784,7 +784,7 @@ class ServerArgs:
     def resolve_disaggregation(self):
         # Pipeline parallelism is a prefill-node-only capability: the chunk
         # pipeline needs the P role's structural guarantees (no decode token
-        # feedback, eager execution, non-overlap loop).
+        # feedback, non-overlap loop).
         if self.pipeline_parallel_size > 1:
             # Debug escape hatch: run PP without PD to validate the stage
             # pipeline numerically (prefill + first token only — decode
@@ -802,7 +802,11 @@ class ServerArgs:
                     "for pipeline validation; only prefill/first-token output "
                     "is meaningful"
                 )
-                self.enforce_eager = True
+            # A pipeline stage threads its boundary state through an eager
+            # stage forward (ModelExecutor._run_target_forward); no graph
+            # subsystem captures that, so every stage runs eager.
+            self.enforce_eager = True
+            logger.info("CUDA graph is disabled under pipeline parallelism")
             if self.mapping.has_attn_dp:
                 raise ValueError(
                     "--pipeline-parallel-size > 1 with attention DP is not "
@@ -841,11 +845,11 @@ class ServerArgs:
             raise ValueError(
                 "--pp-layer-partition requires --pipeline-parallel-size > 1"
             )
-        # PD disaggregation
-        if self.disaggregation_mode == "prefill":
-            self.enforce_eager = True
-            logger.warning("CUDA graph is disabled for prefill server")
-        elif self.disaggregation_mode == "decode":
+        # PD disaggregation. The prefill role keeps the ordinary graph flags:
+        # it never runs a decode step, so the decode graph has nothing to
+        # capture (ModelExecutorConfig.prefill_only), while its extend
+        # forwards replay the prefill graph like any server's.
+        if self.disaggregation_mode == "decode":
             # Prefix caching stays configurable for decode servers.
             logger.info(
                 f"enable_prefix_caching={self.enable_prefix_caching!r} for decode "

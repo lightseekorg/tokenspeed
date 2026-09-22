@@ -156,7 +156,7 @@ def _index_launch_metadata(grid, kernel, args):
         "num_pages",
     ),
 )
-def _dsv41_wmma_logits_kernel(
+def gluon_dsv41_index_topk_gfx1250(
     q,
     weights,
     index_k_cache,
@@ -328,7 +328,7 @@ def dsv41_index_logits_gfx1250(
     chunk_n = triton.cdiv(score_chunk_size, _BLOCK_N) * _BLOCK_N
     queries, width = logits.shape
     cand = table if candidates is None else candidates
-    _dsv41_wmma_logits_kernel[(queries, triton.cdiv(width, score_chunk_size))](
+    gluon_dsv41_index_topk_gfx1250[(queries, triton.cdiv(width, score_chunk_size))](
         q,
         w,
         cache_2d,

@@ -66,9 +66,8 @@ perf:
     REPO_ROOT=$PWD &&
     MODEL=kimi-k3 &&
     URL=http://127.0.0.1:21000/v1/completions &&
-    OUTPUTS_DIR=/tmp/tokenspeed-kimi-k3-eagle3-mi35x-perf &&
+    OUTPUTS_DIR="$PWD/.ci-artifacts/published/kimi-k3-eagle3-perf" &&
     TOKENIZER_PATH="$OUTPUTS_DIR/tokenizer" &&
-    trap 'rm -rf "$OUTPUTS_DIR"' EXIT &&
     rm -rf "$OUTPUTS_DIR" &&
     /tmp/evalscope-perf/bin/python -c 'import sys; from transformers import AutoTokenizer; AutoTokenizer.from_pretrained("moonshotai/Kimi-K3", trust_remote_code=True).save_pretrained(sys.argv[1])' "$TOKENIZER_PATH" &&
     set +e &&

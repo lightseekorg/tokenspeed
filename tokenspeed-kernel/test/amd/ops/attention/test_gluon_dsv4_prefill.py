@@ -45,9 +45,9 @@ def _prefill_name(width: int, heads: int = 16) -> str:
         ),
         traits={
             "head_dim": 512,
-            "num_heads": heads,
+            "num_q_heads": heads,
             "cache_layout": "dense_workspace",
-            "support_sink": True,
+            "sinks": True,
             "selected_width": width,
             "metadata_dtypes": frozenset({torch.int32}),
         },

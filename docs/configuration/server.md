@@ -464,7 +464,11 @@ in the hashed namespace. Without PP, only `cp_rank==0` owns the request
 socket and load reporting, and `recv_reqs` broadcasts across CP so exists
 MIN is rank-identical. GQA with TP above the KV-head count assigns
 different heads to the same `r{tp_rank}`, so `attn_tp_size` (resolved
-`mapping.attn.tp_size`) is also in the namespace.
+`mapping.attn.tp_size`) is also in the namespace. Resolved target and draft
+attention backends, including the full-attention sub-backend of a hybrid model,
+are isolated too: different implementations can produce different downstream
+KV even with identical cache layouts. This namespace extension intentionally
+starts a cold L3 cache instead of reusing objects written without backend identity.
 `global_segment_size` is split across
 attention-TP × context-parallel × pipeline-parallel ranks so the
 mounted total matches the configured size. Use the resolved mapping

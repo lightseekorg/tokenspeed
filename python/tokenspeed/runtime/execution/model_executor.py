@@ -183,7 +183,8 @@ class ModelExecutorConfig:
     max_cudagraph_capture_size: int
     model_is_mrope: bool
     # The prefill role of a disaggregated deployment computes prompts only:
-    # it never runs a decode/verify step of its own.
+    # it never runs a decode/verify step of its own, so the decode graph is
+    # never captured there while the prefill graph keeps its ordinary gating.
     prefill_only: bool
     # Explicit None selects the minimum request count for each token bucket.
     prefill_graph_capture_batch_sizes: list[int] | None
@@ -831,8 +832,9 @@ class ModelExecutor:
             else:
                 positions = self.input_buffers.positions_buf[: ctx.input_num_tokens]
         # PP mid-pipeline: receive the upstream boundary state and thread it
-        # through the model's pp_inbound channel. The P role forces eager, so
-        # neither graph path below can be active alongside PP.
+        # through the model's pp_inbound channel. Pipeline parallelism forces
+        # eager (ServerArgs.resolve_disaggregation), so neither graph path
+        # below can be active alongside PP.
         if self.config.pp_size > 1 and not self._pp_is_first_stage:
             pp_inbound = self._pp_recv_stage_state(ctx.input_num_tokens)
             output = self.model_runner.forward(

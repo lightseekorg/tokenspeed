@@ -25,17 +25,16 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import platform as host_platform
 import sys
-import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
+from itertools import product
 from pathlib import Path
 from typing import Any
 
 import torch
-from tokenspeed_kernel.benchmark.graph import GraphBenchmarkConfig
+from tokenspeed_kernel.benchmark.graph import GraphBenchmarkConfig, GraphTimer
 from tokenspeed_kernel.benchmark.harness import (
     BenchmarkRequest,
     BenchmarkStatus,
@@ -68,6 +67,7 @@ class SuiteCase:
     comparison_epoch: int
     definition: dict[str, Any]
     policy: dict[str, float]
+    measurement_blocks: int
     request: BenchmarkRequest
 
 
@@ -78,6 +78,7 @@ class BenchmarkSuite:
     suite_id: str
     required_environment: dict[str, str]
     timer: GraphBenchmarkConfig
+    default_measurement_blocks: int
     cases: tuple[SuiteCase, ...]
     schema_version: int = _SCHEMA_VERSION
 
@@ -94,11 +95,8 @@ def _nonempty_string(value: object, location: str) -> str:
     return value
 
 
-def _number(
-    value: object,
-    location: str,
-) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+def _number(value: object, location: str) -> float:
+    if not isinstance(value, (int, float)):
         raise SuiteConfigError(f"{location} must be a number")
     result = float(value)
     if not math.isfinite(result):
@@ -106,17 +104,20 @@ def _number(
     return result
 
 
-def _parse_timer(raw: object) -> GraphBenchmarkConfig:
+def _parse_timer(raw: object) -> tuple[GraphBenchmarkConfig, int]:
     timer = _object(raw, "timer")
+    if "calls_per_graph" in timer:
+        raise SuiteConfigError(
+            "timer.calls_per_graph was removed; each graph contains one operation"
+        )
     config = GraphBenchmarkConfig(
-        calls_per_graph=timer["calls_per_graph"],
         eager_warmup_iterations=timer["eager_warmup_iterations"],
         replay_warmup_iterations=timer["replay_warmup_iterations"],
-        measurement_blocks=timer["measurement_blocks"],
     )
-    if config.measurement_blocks < 5:
+    measurement_blocks = timer["measurement_blocks"]
+    if not isinstance(measurement_blocks, int) or measurement_blocks < 5:
         raise SuiteConfigError("timer.measurement_blocks must be at least 5")
-    return config
+    return config, measurement_blocks
 
 
 def _parse_environment(raw: object) -> dict[str, str]:
@@ -177,16 +178,16 @@ def _parse_definition(
     return normalized, request
 
 
-def _parse_case(raw: object, index: int) -> SuiteCase:
+def _parse_case(
+    raw: object,
+    index: int,
+    suite_measurement_blocks: int,
+) -> SuiteCase:
     location = f"cases[{index}]"
     case = _object(raw, location)
     case_id = _nonempty_string(case["id"], f"{location}.id")
     comparison_epoch = case["comparison_epoch"]
-    if (
-        isinstance(comparison_epoch, bool)
-        or not isinstance(comparison_epoch, int)
-        or comparison_epoch <= 0
-    ):
+    if not isinstance(comparison_epoch, int) or comparison_epoch <= 0:
         raise SuiteConfigError(
             f"{location}.comparison_epoch must be a positive integer"
         )
@@ -194,38 +195,117 @@ def _parse_case(raw: object, index: int) -> SuiteCase:
         case["definition"], f"{location}.definition"
     )
     policy = _parse_policy(case["policy"], f"{location}.policy")
+    measurement_blocks = case.get("measurement_blocks", suite_measurement_blocks)
+    if not isinstance(measurement_blocks, int) or measurement_blocks < 5:
+        raise SuiteConfigError(f"{location}.measurement_blocks must be at least 5")
     return SuiteCase(
         id=case_id,
         comparison_epoch=comparison_epoch,
         definition=definition,
         policy=policy,
+        measurement_blocks=measurement_blocks,
         request=request,
     )
+
+
+def _expand_case(raw: object, index: int) -> list[dict[str, Any]]:
+    location = f"cases[{index}]"
+    case = _object(raw, location)
+    definition = _object(case.get("definition"), f"{location}.definition")
+    parameters = _object(
+        definition.get("parameters"), f"{location}.definition.parameters"
+    )
+    dimensions = sorted(
+        (name, values)
+        for name, values in parameters.items()
+        if isinstance(values, list)
+    )
+    if not dimensions:
+        return [case]
+
+    case_id = _nonempty_string(case.get("id"), f"{location}.id")
+    for name, values in dimensions:
+        if not values:
+            raise SuiteConfigError(
+                f"{location}.definition.parameters.{name} must not be an empty list"
+            )
+
+    combinations = tuple(product(*(values for _, values in dimensions)))
+    expanded = []
+    for expansion_index, combination in enumerate(combinations):
+        expanded_parameters = dict(parameters)
+        for (name, _), value in zip(dimensions, combination, strict=True):
+            expanded_parameters[name] = value
+        expanded.append(
+            {
+                **case,
+                "id": (
+                    case_id
+                    if len(combinations) == 1
+                    else f"{case_id}_{expansion_index}"
+                ),
+                "definition": {
+                    **definition,
+                    "parameters": expanded_parameters,
+                },
+            }
+        )
+    return expanded
+
+
+def _read_json(path: Path) -> object:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SuiteConfigError(f"cannot read {path}: {error}") from error
 
 
 def load_suite(path: str | Path) -> BenchmarkSuite:
     """Load the fields needed to execute a benchmark suite."""
 
     suite_path = Path(path)
-    try:
-        raw = json.loads(suite_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise SuiteConfigError(f"cannot read {suite_path}: {error}") from error
-
-    suite = _object(raw, "suite")
+    suite = _object(_read_json(suite_path), "suite")
     try:
         schema_version = suite["schema_version"]
-        if isinstance(schema_version, bool) or schema_version != _SCHEMA_VERSION:
+        if schema_version != _SCHEMA_VERSION:
             raise SuiteConfigError(
                 f"unsupported schema_version {schema_version}; expected {_SCHEMA_VERSION}"
             )
         suite_id = _nonempty_string(suite["suite_id"], "suite_id")
         required_environment = _parse_environment(suite["environment"])
-        timer = _parse_timer(suite["timer"])
-        cases_raw = suite["cases"]
-        if not isinstance(cases_raw, list) or not cases_raw:
+        timer, default_measurement_blocks = _parse_timer(suite["timer"])
+        root_cases = suite["cases"]
+        if not isinstance(root_cases, list):
+            raise SuiteConfigError("cases must be a JSON array")
+        cases_raw = list(root_cases)
+        case_files = suite.get("case_files", [])
+        if not isinstance(case_files, list) or not all(
+            isinstance(name, str) and name for name in case_files
+        ):
+            raise SuiteConfigError("case_files must be an array of file names")
+        for name in case_files:
+            fragment = _object(
+                _read_json(suite_path.parent / name), f"case file {name}"
+            )
+            if fragment.get("schema_version") != schema_version:
+                raise SuiteConfigError(
+                    f"case file {name} must use schema_version {schema_version}"
+                )
+            fragment_cases = fragment.get("cases")
+            if not isinstance(fragment_cases, list):
+                raise SuiteConfigError(f"case file {name} must contain a cases array")
+            cases_raw.extend(fragment_cases)
+        if not cases_raw:
             raise SuiteConfigError("cases must be a non-empty JSON array")
-        cases = tuple(_parse_case(case, index) for index, case in enumerate(cases_raw))
+        expanded_cases = [
+            expanded
+            for index, case in enumerate(cases_raw)
+            for expanded in _expand_case(case, index)
+        ]
+        cases = tuple(
+            _parse_case(case, index, default_measurement_blocks)
+            for index, case in enumerate(expanded_cases)
+        )
     except SuiteConfigError:
         raise
     except (KeyError, TypeError, ValueError) as error:
@@ -239,6 +319,7 @@ def load_suite(path: str | Path) -> BenchmarkSuite:
         suite_id=suite_id,
         required_environment=required_environment,
         timer=timer,
+        default_measurement_blocks=default_measurement_blocks,
         cases=tuple(sorted(cases, key=lambda case: case.id)),
         schema_version=schema_version,
     )
@@ -283,12 +364,14 @@ def _collect_environment() -> dict[str, Any]:
     return environment
 
 
-def _timer_payload(timer: GraphBenchmarkConfig) -> dict[str, int]:
+def _timer_payload(
+    timer: GraphBenchmarkConfig,
+    default_measurement_blocks: int,
+) -> dict[str, int]:
     return {
-        "calls_per_graph": timer.calls_per_graph,
         "eager_warmup_iterations": timer.eager_warmup_iterations,
         "replay_warmup_iterations": timer.replay_warmup_iterations,
-        "measurement_blocks": timer.measurement_blocks,
+        "measurement_blocks": default_measurement_blocks,
     }
 
 
@@ -348,8 +431,7 @@ def _environment_mismatch(
 
 def _create_harness(config: GraphBenchmarkConfig) -> KernelBenchmarkHarness:
     return KernelBenchmarkHarness(
-        config,
-        timer=None,
+        GraphTimer(config),
         platform_provider=current_platform,
     )
 
@@ -404,32 +486,12 @@ def run_suite(
         else:
             assert harness is not None
             try:
-                result = harness.run(case.request)
-                expected_context = (
-                    suite.timer.calls_per_graph,
-                    suite.timer.eager_warmup_iterations,
-                    suite.timer.replay_warmup_iterations,
-                    suite.timer.measurement_blocks,
-                    case.request.cold_cache,
-                    environment.get("vendor"),
-                    environment.get("arch"),
-                    environment.get("device_name"),
-                )
-                actual_context = (
-                    result.calls_per_graph,
-                    result.eager_warmup_iterations,
-                    result.replay_warmup_iterations,
-                    result.measurement_blocks,
-                    result.cold_cache,
-                    result.platform_vendor,
-                    result.platform_arch,
-                    result.device_name,
-                )
-                if result.succeeded and actual_context != expected_context:
-                    raise RuntimeError(
-                        "successful benchmark reported the wrong context"
+                result_payload = _result_payload(
+                    harness.run(
+                        case.request,
+                        measurement_blocks=case.measurement_blocks,
                     )
-                result_payload = _result_payload(result)
+                )
             except Exception as error:  # noqa: BLE001 - benchmark failures are data
                 result_payload = _failure_payload(
                     BenchmarkStatus.EXECUTION_FAILURE,
@@ -444,6 +506,7 @@ def run_suite(
                 "comparison_epoch": case.comparison_epoch,
                 "definition": case.definition,
                 "policy": case.policy,
+                "measurement_blocks": case.measurement_blocks,
                 "result": result_payload,
             }
         )
@@ -453,7 +516,7 @@ def run_suite(
         "suite_id": suite.suite_id,
         "revision": revision,
         "environment": environment,
-        "timer": _timer_payload(suite.timer),
+        "timer": _timer_payload(suite.timer, suite.default_measurement_blocks),
         "cases": case_payloads,
     }
 
@@ -463,25 +526,9 @@ def _write_output(payload: dict[str, Any], path: str | Path) -> None:
     if str(path) == "-":
         sys.stdout.write(serialized)
         return
-
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=output_path.parent,
-        prefix=f".{output_path.name}.",
-        suffix=".tmp",
-        text=True,
-    )
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(serialized)
-        os.replace(temporary_name, output_path)
-    except BaseException:
-        try:
-            os.unlink(temporary_name)
-        except FileNotFoundError:
-            pass
-        raise
+    output_path.write_text(serialized, encoding="utf-8")
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -172,7 +172,7 @@ class L3HostStore:
             keys, self.host_storage.host_buffer, offsets, sizes
         )
         logger.info(
-            "[L3] backup pages=%d ok=%d", len(pages), sum(1 for ok in results if ok)
+            f"[L3] backup pages={len(pages)} ok={sum(1 for ok in results if ok)}"
         )
         return results
 
@@ -184,7 +184,7 @@ class L3HostStore:
             keys, self.host_storage.host_buffer, offsets, sizes
         )
         logger.info(
-            "[L3] prefetch pages=%d ok=%d", len(pages), sum(1 for ok in results if ok)
+            f"[L3] prefetch pages={len(pages)} ok={sum(1 for ok in results if ok)}"
         )
         return results
 

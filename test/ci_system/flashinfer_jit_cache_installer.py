@@ -7,6 +7,8 @@ import sys
 from importlib import metadata
 from pathlib import Path
 
+from packaging.requirements import Requirement
+
 JIT_CACHE_DIST = "flashinfer-jit-cache"
 FLASHINFER_PYTHON_DIST = "flashinfer-python"
 _QUERY_INSTALLED = object()
@@ -26,6 +28,22 @@ def installed_distribution_version(distribution: str = JIT_CACHE_DIST) -> str | 
         return metadata.version(distribution)
     except metadata.PackageNotFoundError:
         return None
+
+
+def jit_cache_dependencies_satisfied() -> bool:
+    try:
+        requirements = metadata.requires(JIT_CACHE_DIST) or []
+    except metadata.PackageNotFoundError:
+        return False
+    for spec in requirements:
+        requirement = Requirement(spec)
+        if requirement.marker and not requirement.marker.evaluate():
+            continue
+        installed = installed_distribution_version(requirement.name)
+        print(f"Installed {requirement.name}=={installed}", file=sys.stderr)
+        if installed is None or installed not in requirement.specifier:
+            return False
+    return True
 
 
 def expected_jit_cache_version(flashinfer_version: str, cuda_index: str) -> str:
@@ -75,7 +93,7 @@ def install_url_if_needed(
         if installed_version is _QUERY_INSTALLED
         else installed_version
     )
-    if current_version == expected_version:
+    if current_version == expected_version and jit_cache_dependencies_satisfied():
         return None, expected_version, current_version
     return (
         jit_cache_wheel_url(flashinfer_version, cuda_index),
@@ -104,8 +122,8 @@ def main(argv: list[str] | None = None) -> int:
 
     current = installed_version or "not installed"
     print(
-        f"{JIT_CACHE_DIST} {current} does not match {expected_version}; "
-        "installing matching wheel",
+        f"{JIT_CACHE_DIST} {current} or its dependencies do not match "
+        f"{expected_version}; installing matching wheel and dependencies",
         file=sys.stderr,
     )
     print(url)

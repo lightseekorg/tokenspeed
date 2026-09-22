@@ -135,6 +135,8 @@ jobs:
               --runner-group "nvidia-arm" \
               --workflow-stage "$workflow_stage" \
               --multi-node exclude)
+            matrix=$(printf '%s' "$matrix" | python3 -c \
+              "import json, sys; data=json.load(sys.stdin); data['include']=[item for item in data.get('include', []) if not item['runner'].startswith('slurm-')]; print(json.dumps(data, separators=(',', ':')))")
             echo "${output}_matrix=${matrix}" >> "$GITHUB_OUTPUT"
             printf '%s' "$matrix" | python3 -c "import json, sys; print('${output}_has_tasks=' + ('true' if json.load(sys.stdin).get('include') else 'false'))" >> "$GITHUB_OUTPUT"
           done

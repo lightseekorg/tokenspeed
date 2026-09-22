@@ -145,6 +145,7 @@ from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import (
     SelectedKernel,
     select_kernel,
+    spec_matches_shape_traits,
     spec_matches_traits,
 )
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -533,6 +534,104 @@ def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None
     assert b_format.scale is not None
     assert a_format.scale.block_shape == (128, 128)
     assert b_format.scale.block_shape == (128, 128)
+
+
+@pytest.mark.parametrize(
+    "contract,online,expected_name",
+    [
+        ("ue8m0", False, "gluon_mm_mxfp8_ue8m0_gfx1250"),
+        ("ue8m0", True, "gluon_mm_mxfp8_ue8m0_gfx1250"),
+        ("fp32", False, "gluon_mm_fp8_blockscale_gfx1250"),
+        ("fp32", True, "gluon_mm_fp8_blockscale_gfx1250"),
+    ],
+)
+def test_public_mm_selects_gfx1250_decode_kernel(
+    contract: str,
+    online: bool,
+    expected_name: str,
+    mi450_platform: PlatformInfo,
+    monkeypatch,
+    selected_kernel_spy,
+) -> None:
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    expected_spec = registry.get_by_name(expected_name)
+    if expected_spec is None:
+        assert not host_platform.is_cdna5
+        pytest.skip(f"{expected_name!r} is not registered (optional backend missing)")
+    assert expected_spec.capability.satisfied_by(mi450_platform)
+
+    m, n, k = 1, 128, 256
+    a_dtype = torch.bfloat16 if online else _fp8_dtype()
+    a = torch.empty((m, k), dtype=a_dtype)
+    b = torch.empty((n, k), dtype=_fp8_dtype())
+    if contract == "ue8m0":
+        block_size = [1, 32]
+        scale_dtype = torch.uint8
+        a_scales = torch.empty((m, k // 32), dtype=scale_dtype)
+        b_scales = torch.empty((n, k // 32), dtype=scale_dtype)
+    else:
+        block_size = [128, 128]
+        scale_dtype = torch.float32
+        a_scales = torch.empty((m, k // 128), dtype=scale_dtype)
+        b_scales = torch.empty((n // 128, k // 128), dtype=scale_dtype)
+    if online:
+        a_scales = None
+
+        def fake_online_quantize_mxfp8(
+            activation: torch.Tensor,
+            selected_block_size: list[int],
+            kernel_name: str,
+            enable_pdl: bool,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            assert selected_block_size == block_size
+            assert kernel_name == expected_name
+            assert not enable_pdl
+            return (
+                torch.empty_like(activation, dtype=_fp8_dtype()),
+                torch.empty(
+                    (m, k // block_size[1]),
+                    dtype=scale_dtype,
+                    device=activation.device,
+                ),
+            )
+
+        monkeypatch.setattr(
+            _gemm_pkg,
+            "_online_quantize_mxfp8",
+            fake_online_quantize_mxfp8,
+        )
+
+    case = _case(
+        _is_cdna5,
+        "cdna5",
+        "gemm",
+        "mm",
+        expected_name,
+        lambda: None,
+        id_suffix=f"{contract}-{'online' if online else 'prequantized'}",
+    )
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = case
+    try:
+        Platform.override(mi450_platform)
+        monkeypatch.setattr(_gemm_pkg, "_platform", mi450_platform)
+        registry.clear_cache()
+        actual = tokenspeed_kernel.mm(
+            a,
+            b,
+            A_scales=a_scales,
+            B_scales=b_scales,
+            out_dtype=torch.bfloat16,
+            quant="mxfp8",
+            block_size=block_size,
+        )
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+
+    assert calls == [expected_name]
+    assert actual.shape == (m, n)
 
 
 def test_bmm_mxfp8_online_activation_signature_uses_quantized_storage() -> None:
@@ -5999,17 +6098,17 @@ def test_gluon_dsa_prefill_fp8_dense_traits(
     if spec is None:
         pytest.skip("gfx950 Gluon DSA registration is unavailable")
     traits = {
-        "page_size": 64,
-        "q_len_per_req": 1,
+        "q_len": 1,
         "qk_nope_head_dim": qk_nope_head_dim,
         "kv_lora_rank": kv_lora_rank,
         "qk_rope_head_dim": qk_rope_head_dim,
+        "page_size": 64,
         "topk": 2051,
-        "kv_cache_available": True,
-        "sparse_kv_cache_available": False,
-        "topk_layout": "global_slots",
-        "support_logit_cap": False,
+        "has_kv_cache": True,
+        "has_sparse_kv_cache": False,
+        "logit_cap": False,
         "return_lse": False,
+        "topk_layout": "global_slots",
     }
     assert spec_matches_traits(spec, traits) is matches
 
@@ -6031,7 +6130,7 @@ _GLUON_MLA_FIXED_KERNELS = (
         pytest.param("batch_size", 16, False, id="batch16"),
         pytest.param("value_head_dim", 64, False, id="unsupported-value"),
         pytest.param("page_size", 128, False, id="unsupported-page"),
-        pytest.param("support_logit_cap", True, False, id="unsupported-logit-cap"),
+        pytest.param("logit_cap", True, False, id="unsupported-logit-cap"),
     ],
 )
 def test_gluon_mla_projected_value_gfx1250_traits_are_narrow(
@@ -6046,12 +6145,12 @@ def test_gluon_mla_projected_value_gfx1250_traits_are_narrow(
         "batch_size": 1,
         "q_len": 1,
         "num_q_heads": 12,
-        "page_size": 64,
+        "value_head_dim": 128,
         "kv_lora_rank": 512,
         "qk_rope_head_dim": 64,
-        "value_head_dim": 128,
+        "page_size": 64,
         "gate_kind": "sigmoid",
-        "support_logit_cap": False,
+        "logit_cap": False,
     }
     traits[trait] = value
     assert spec_matches_traits(spec, traits) is matches
@@ -6074,9 +6173,9 @@ def test_gluon_mla_project_value_gfx1250_batch_traits(
         pytest.skip("gfx1250 Gluon MLA projection registration is unavailable")
     traits = {
         "batch_size": batch_size,
-        "num_heads": 12,
-        "latent_dim": 512,
-        "value_dim": 128,
+        "num_q_heads": 12,
+        "value_head_dim": 128,
+        "kv_lora_rank": 512,
         "gate_kind": "sigmoid",
         "inputs_contiguous": True,
     }
@@ -6110,10 +6209,15 @@ def test_gluon_mla_fixed_entrypoints_are_registered(name: str) -> None:
             frozenset({2, 4}),
             id="bh64-small",
         ),
+        pytest.param(
+            "gluon_mla_decode_bf16xbf16_gfx950_bh64",
+            frozenset({64, 128}),
+            id="bh64",
+        ),
     ],
 )
-@pytest.mark.parametrize("batch", [1, 2, 3, 4, 64])
-def test_gluon_mla_small_batch_registrations_have_disjoint_traits(
+@pytest.mark.parametrize("batch", [1, 2, 3, 4, 64, 96, 128])
+def test_gluon_mla_batch_registrations_have_disjoint_traits(
     name: str,
     expected_batches: frozenset[int],
     batch: int,
@@ -6122,16 +6226,18 @@ def test_gluon_mla_small_batch_registrations_have_disjoint_traits(
 
     traits = {
         "batch_size": batch,
-        "batch_size_div_64": batch % 64 == 0,
         "q_len": 1,
         "num_q_heads": 64,
-        "page_size": 64,
         "kv_lora_rank": 512,
         "qk_rope_head_dim": 64,
-        "support_logit_cap": False,
+        "page_size": 64,
+        "logit_cap": False,
         "return_lse": False,
     }
-    assert spec_matches_traits(spec, traits) is (batch in expected_batches)
+    matches = spec_matches_traits(spec, traits) and spec_matches_shape_traits(
+        spec, traits
+    )
+    assert matches is (batch in expected_batches)
 
 
 @pytest.mark.parametrize(

@@ -36,7 +36,7 @@ import tokenspeed_kernel  # noqa: E402
 from tokenspeed_kernel.profiling import ShapeCapture  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.mm import (  # noqa: E402
     _mxfp8_launch_metadata,
-    gluon_mm_mxfp8_gfx950,
+    launch_gluon_mm_mxfp8_gfx950,
     supports_mxfp8_gemm_shape,
 )
 
@@ -71,7 +71,7 @@ def test_mxfp8_gemm_matches_dequantized_reference(k: int) -> None:
     backing = torch.empty((m, n + 17), device="cuda", dtype=torch.bfloat16)
     out = backing[:, :n]
 
-    actual = gluon_mm_mxfp8_gfx950(
+    actual = launch_gluon_mm_mxfp8_gfx950(
         a,
         b,
         a_scales,
@@ -108,7 +108,7 @@ def test_mxfp8_gemm_accepts_row_padded_operands_and_strided_scales() -> None:
     a_scales = a_scale_backing[:, ::2]
     b_scales = b_scale_backing[:, ::2]
 
-    actual = gluon_mm_mxfp8_gfx950(
+    actual = launch_gluon_mm_mxfp8_gfx950(
         a,
         b,
         a_scales,
@@ -136,7 +136,7 @@ def test_mxfp8_gemm_async_scales_accept_row_padding() -> None:
     a_scales = a_scale_backing[:, :groups]
     b_scales = b_scale_backing[:, :groups]
 
-    actual = gluon_mm_mxfp8_gfx950(
+    actual = launch_gluon_mm_mxfp8_gfx950(
         a,
         b,
         a_scales,
@@ -186,7 +186,7 @@ def test_mxfp8_gemm_rejects_non_mxfp8_scale_contract() -> None:
     a, b, a_scales, b_scales = _inputs(256, 256, 512)
 
     with pytest.raises(ValueError, match=r"block_size=\[1, 32\]"):
-        gluon_mm_mxfp8_gfx950(
+        launch_gluon_mm_mxfp8_gfx950(
             a,
             b,
             a_scales,
