@@ -21,8 +21,8 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Collection
 from types import SimpleNamespace
-from typing import Any
 
 import torch
 from tokenspeed_kernel.benchmark.graph import PreparedInvocation
@@ -40,146 +40,67 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 __all__ = ["prepare_moe_apply", "prepare_sigmoid_bias_topk"]
 
 
-_DTYPE_NAMES = {
+_IMPLEMENTED_MODEL_PROFILES = frozenset({"glm53_flash_tp4"})
+_IMPLEMENTED_INPUT_DTYPES = {
+    "bfloat16": torch.bfloat16,
+}
+_IMPLEMENTED_ROUTER_DTYPES = {
     "bfloat16": torch.bfloat16,
     "float32": torch.float32,
-    "fp32": torch.float32,
 }
-_FP8_DTYPE_NAMES = {
+_IMPLEMENTED_ROUTING_WEIGHT_DTYPES = {
+    "float32": torch.float32,
+}
+_IMPLEMENTED_WEIGHT_FORMATS = {
     "fp8": torch.float8_e4m3fn,
-    "float8_e4m3fn": torch.float8_e4m3fn,
 }
-_SUPPORTED_FP8_BLOCK = 128
+_IMPLEMENTED_ACTIVATIONS = frozenset({"silu", "swiglu"})
+_IMPLEMENTED_ROUTING_MODES = frozenset({"precomputed_topk"})
+_IMPLEMENTED_ROUTE_SCOPES = frozenset({"global", "local"})
+_IMPLEMENTED_ROUTE_DISTRIBUTIONS = frozenset({"router"})
+_IMPLEMENTED_TOKEN_COUNT_SCOPES = frozenset({"local"})
+_IMPLEMENTED_INTERNAL_ACTIVATION_DTYPES = frozenset({"input"})
+_IMPLEMENTED_FP8_BLOCK_SHAPES = frozenset({(128, 128)})
 
 
-def _positive_int(parameters: dict[str, Any], name: str) -> int:
-    value = parameters.get(name)
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            f"MoE parameter {name!r} must be a positive integer",
-        )
-    return value
-
-
-def _optional_positive_int(
-    parameters: dict[str, Any],
+def _implemented_value(
     name: str,
-    fallback: int,
-) -> int:
-    value = parameters.get(name, fallback)
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+    value: object,
+    implemented: Collection[object],
+):
+    if value not in implemented:
+        accepted = ", ".join(str(item) for item in sorted(implemented))
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
-            f"MoE parameter {name!r} must be a positive integer",
+            f"Implemented MoE {name} values: {accepted}",
         )
     return value
 
 
-def _nonnegative_int(
-    parameters: dict[str, Any],
+def _parse_dtype(
     name: str,
-    fallback: int,
-) -> int:
-    value = parameters.get(name, fallback)
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            f"MoE parameter {name!r} must be a nonnegative integer",
-        )
-    return value
+    value: object,
+    implemented: dict[str, torch.dtype],
+) -> torch.dtype:
+    dtype_name = _implemented_value(name, value, implemented)
+    return implemented[dtype_name]
 
 
-def _finite_float(parameters: dict[str, Any], name: str, fallback: float) -> float:
-    value = parameters.get(name, fallback)
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            f"MoE parameter {name!r} must be a finite number",
-        )
-    converted = float(value)
-    if not math.isfinite(converted):
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            f"MoE parameter {name!r} must be finite",
-        )
-    return converted
+def _parse_weight_dtype(value: object) -> tuple[str, torch.dtype]:
+    name = _implemented_value("weight_dtype", value, _IMPLEMENTED_WEIGHT_FORMATS)
+    return name, _IMPLEMENTED_WEIGHT_FORMATS[name]
 
 
-def _bool_parameter(parameters: dict[str, Any], name: str, fallback: bool) -> bool:
-    value = parameters.get(name, fallback)
-    if not isinstance(value, bool):
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            f"MoE parameter {name!r} must be a boolean",
-        )
-    return value
+def _parse_block_shape(value: object) -> tuple[int, int]:
+    block_shape = tuple(value)
+    return _implemented_value(
+        "fp8_scale_block_shape",
+        block_shape,
+        _IMPLEMENTED_FP8_BLOCK_SHAPES,
+    )
 
 
-def _parse_dtype(parameters: dict[str, Any], name: str, fallback: str) -> torch.dtype:
-    value = parameters.get(name, fallback)
-    if isinstance(value, str):
-        dtype = _DTYPE_NAMES.get(value.lower())
-    else:
-        dtype = value if isinstance(value, torch.dtype) else None
-    if dtype not in {torch.bfloat16, torch.float32}:
-        supported = ", ".join(sorted(_DTYPE_NAMES))
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            f"MoE parameter {name!r} must use one of: {supported}",
-        )
-    return dtype
-
-
-def _parse_weight_dtype(parameters: dict[str, Any]) -> tuple[str, torch.dtype]:
-    value = parameters.get("weight_dtype", "fp8")
-    if not isinstance(value, str):
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "MoE weight_dtype must be a string",
-        )
-    normalized = value.lower()
-    dtype = _FP8_DTYPE_NAMES.get(normalized)
-    if dtype is None:
-        supported = ", ".join(sorted(_FP8_DTYPE_NAMES))
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            f"MoE apply benchmarks currently support weight_dtype names: {supported}",
-        )
-    return "fp8", dtype
-
-
-def _parse_block_shape(parameters: dict[str, Any]) -> tuple[int, int]:
-    value = parameters.get("fp8_scale_block_shape", [_SUPPORTED_FP8_BLOCK] * 2)
-    if (
-        not isinstance(value, (list, tuple))
-        or len(value) != 2
-        or any(isinstance(item, bool) or not isinstance(item, int) for item in value)
-    ):
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "MoE fp8_scale_block_shape must contain two integer dimensions",
-        )
-    block_shape = (int(value[0]), int(value[1]))
-    if block_shape != (_SUPPORTED_FP8_BLOCK, _SUPPORTED_FP8_BLOCK):
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "MoE FP8 apply benchmarks currently support 128x128 scale blocks",
-        )
-    return block_shape
-
-
-def _normalize_parameters(
-    request: BenchmarkRequest,
-    *,
-    allowed: set[str],
-) -> None:
-    unknown = sorted(set(request.parameters) - allowed)
-    if unknown:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            f"Unknown MoE parameters: {', '.join(unknown)}",
-        )
+def _validate_request_options(request: BenchmarkRequest) -> None:
     if request.parameters.get("validation") is not None:
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
@@ -388,43 +309,28 @@ def prepare_sigmoid_bias_topk(
 ) -> PreparedBenchmark:
     """Prepare one biased sigmoid top-k router benchmark."""
 
-    _normalize_parameters(
-        request,
-        allowed={
-            "tokens",
-            "num_experts",
-            "topk",
-            "router_logits_dtype",
-            "weights_dtype",
-            "routed_scaling_factor",
-            "normalize_topk_weights",
-            "validation",
-        },
+    _validate_request_options(request)
+    parameters = request.parameters
+    model_profile = _implemented_value(
+        "model_profile",
+        parameters["model_profile"],
+        _IMPLEMENTED_MODEL_PROFILES,
     )
-    tokens = _positive_int(request.parameters, "tokens")
-    experts = _positive_int(request.parameters, "num_experts")
-    topk = _positive_int(request.parameters, "topk")
-    if topk > experts:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "MoE topk cannot exceed num_experts",
-        )
+    tokens = parameters["tokens"]
+    experts = parameters["num_experts"]
+    topk = parameters["topk"]
     router_logits_dtype = _parse_dtype(
-        request.parameters,
         "router_logits_dtype",
-        "float32",
+        parameters["router_logits_dtype"],
+        _IMPLEMENTED_ROUTER_DTYPES,
     )
-    weights_dtype = _parse_dtype(request.parameters, "weights_dtype", "float32")
-    routed_scaling_factor = _finite_float(
-        request.parameters,
-        "routed_scaling_factor",
-        1.0,
+    weights_dtype = _parse_dtype(
+        "weights_dtype",
+        parameters["weights_dtype"],
+        _IMPLEMENTED_ROUTING_WEIGHT_DTYPES,
     )
-    normalize_topk_weights = _bool_parameter(
-        request.parameters,
-        "normalize_topk_weights",
-        True,
-    )
+    routed_scaling_factor = float(parameters["routed_scaling_factor"])
+    normalize_topk_weights = parameters["normalize_topk_weights"]
 
     load_builtin_kernels()
     spec = _select_sigmoid_bias_topk(
@@ -459,6 +365,7 @@ def prepare_sigmoid_bias_topk(
         registration=spec,
         invocation=PreparedInvocation(invoke=invoke),
         parameters={
+            "model_profile": model_profile,
             "tokens": tokens,
             "num_experts": experts,
             "topk": topk,
@@ -477,110 +384,80 @@ def prepare_moe_apply(
 ) -> PreparedBenchmark:
     """Prepare one precomputed-routing MoE apply benchmark."""
 
-    _normalize_parameters(
-        request,
-        allowed={
-            "tokens",
-            "hidden_size",
-            "intermediate_size",
-            "num_experts",
-            "num_local_experts",
-            "topk",
-            "tp_size",
-            "ep_size",
-            "ep_rank",
-            "input_dtype",
-            "router_logits_dtype",
-            "weight_dtype",
-            "activation",
-            "swiglu_limit",
-            "routing_mode",
-            "routed_scaling_factor",
-            "normalize_topk_weights",
-            "fp8_scale_block_shape",
-            "internal_activation_dtype",
-            "route_scope",
-            "validation",
-        },
+    _validate_request_options(request)
+    parameters = request.parameters
+    model_profile = _implemented_value(
+        "model_profile",
+        parameters["model_profile"],
+        _IMPLEMENTED_MODEL_PROFILES,
     )
-    tokens = _positive_int(request.parameters, "tokens")
-    hidden_size = _positive_int(request.parameters, "hidden_size")
-    intermediate_size = _positive_int(request.parameters, "intermediate_size")
-    num_experts = _positive_int(request.parameters, "num_experts")
-    topk = _positive_int(request.parameters, "topk")
-    tp_size = _optional_positive_int(request.parameters, "tp_size", 1)
-    ep_size = _optional_positive_int(request.parameters, "ep_size", 1)
-    ep_rank = _nonnegative_int(request.parameters, "ep_rank", 0)
-    if ep_rank >= ep_size:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "MoE ep_rank must be smaller than ep_size",
-        )
-    input_dtype = _parse_dtype(request.parameters, "input_dtype", "bfloat16")
-    if input_dtype is not torch.bfloat16:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "MoE apply benchmarks currently support bfloat16 inputs",
-        )
+    tokens = parameters["tokens"]
+    hidden_size = parameters["hidden_size"]
+    intermediate_size = parameters["intermediate_size"]
+    num_experts = parameters["num_experts"]
+    topk = parameters["topk"]
+    tp_size = parameters["tp_size"]
+    ep_size = parameters["ep_size"]
+    ep_rank = parameters["ep_rank"]
+    input_dtype = _parse_dtype(
+        "input_dtype",
+        parameters["input_dtype"],
+        _IMPLEMENTED_INPUT_DTYPES,
+    )
     router_logits_dtype = _parse_dtype(
-        request.parameters,
         "router_logits_dtype",
-        "bfloat16",
+        parameters["router_logits_dtype"],
+        _IMPLEMENTED_ROUTER_DTYPES,
     )
-    weight_dtype_name, weight_dtype = _parse_weight_dtype(request.parameters)
-    block_shape = _parse_block_shape(request.parameters)
-    activation = request.parameters.get("activation", "silu")
-    if activation not in {"silu", "swiglu"}:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "MoE apply benchmarks currently support silu and swiglu activations",
-        )
+    weight_dtype_name, weight_dtype = _parse_weight_dtype(parameters["weight_dtype"])
+    block_shape = _parse_block_shape(parameters["fp8_scale_block_shape"])
+    activation = _implemented_value(
+        "activation",
+        parameters["activation"],
+        _IMPLEMENTED_ACTIVATIONS,
+    )
     swiglu_limit = None
     if activation == "swiglu":
-        swiglu_limit = _finite_float(request.parameters, "swiglu_limit", 0.0)
-        if swiglu_limit <= 0.0:
-            raise BenchmarkCaseError(
-                BenchmarkStatus.INVALID_CASE,
-                "MoE swiglu_limit must be positive for swiglu activation",
-            )
-    routing_mode = request.parameters.get("routing_mode", "precomputed_topk")
-    if routing_mode != "precomputed_topk":
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "MoE apply benchmarks currently use precomputed_topk routing",
-        )
-    route_scope = request.parameters.get("route_scope", "local")
-    if route_scope not in {"local", "global"}:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "MoE route_scope must be 'local' or 'global'",
-        )
-    routed_scaling_factor = _finite_float(
-        request.parameters,
-        "routed_scaling_factor",
-        1.0,
+        swiglu_limit = float(parameters["swiglu_limit"])
+    routing_mode = _implemented_value(
+        "routing_mode",
+        parameters["routing_mode"],
+        _IMPLEMENTED_ROUTING_MODES,
     )
-    normalize_topk_weights = _bool_parameter(
-        request.parameters,
-        "normalize_topk_weights",
-        True,
+    route_scope = _implemented_value(
+        "route_scope",
+        parameters["route_scope"],
+        _IMPLEMENTED_ROUTE_SCOPES,
+    )
+    route_distribution = _implemented_value(
+        "route_distribution",
+        parameters["route_distribution"],
+        _IMPLEMENTED_ROUTE_DISTRIBUTIONS,
+    )
+    token_count_scope = _implemented_value(
+        "token_count_scope",
+        parameters["token_count_scope"],
+        _IMPLEMENTED_TOKEN_COUNT_SCOPES,
+    )
+    routed_scaling_factor = float(parameters["routed_scaling_factor"])
+    normalize_topk_weights = parameters["normalize_topk_weights"]
+    internal_activation_dtype = _implemented_value(
+        "internal_activation_dtype",
+        parameters["internal_activation_dtype"],
+        _IMPLEMENTED_INTERNAL_ACTIVATION_DTYPES,
     )
     intermediate_size_per_partition = _intermediate_per_partition(
         intermediate_size,
         tp_size,
     )
     expected_local_experts = _num_local_experts(num_experts, ep_size)
-    num_local_experts = _optional_positive_int(
-        request.parameters,
-        "num_local_experts",
-        expected_local_experts,
-    )
+    num_local_experts = parameters["num_local_experts"]
     if num_local_experts != expected_local_experts:
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
             "MoE num_local_experts must match num_experts / ep_size",
         )
-    if topk > num_experts or (route_scope == "local" and topk > num_local_experts):
+    if route_scope == "local" and topk > num_local_experts:
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
             "MoE topk exceeds the selected expert pool",
@@ -603,10 +480,7 @@ def prepare_moe_apply(
         activation_clamped=swiglu_limit is not None,
         expert_id_repeats=False,
         fp8_scale_block_shape=block_shape,
-        internal_activation_dtype=request.parameters.get(
-            "internal_activation_dtype",
-            "input",
-        ),
+        internal_activation_dtype=internal_activation_dtype,
         with_bias=False,
         solution=None,
     )
@@ -666,6 +540,7 @@ def prepare_moe_apply(
         registration=spec,
         invocation=PreparedInvocation(invoke=invoke),
         parameters={
+            "model_profile": model_profile,
             "tokens": tokens,
             "hidden_size": hidden_size,
             "intermediate_size": intermediate_size,
@@ -683,6 +558,8 @@ def prepare_moe_apply(
             "swiglu_limit": swiglu_limit,
             "routing_mode": routing_mode,
             "route_scope": route_scope,
+            "route_distribution": route_distribution,
+            "token_count_scope": token_count_scope,
             "routed_scaling_factor": routed_scaling_factor,
             "normalize_topk_weights": normalize_topk_weights,
             "fp8_scale_block_shape": block_shape,

@@ -20,10 +20,11 @@
 
 from __future__ import annotations
 
+import pytest
 import tokenspeed_kernel.benchmark.generators.moe as moe_generator
 import torch
 from tokenspeed_kernel.benchmark.generators.moe import prepare_moe_apply
-from tokenspeed_kernel.benchmark.harness import BenchmarkRequest
+from tokenspeed_kernel.benchmark.harness import BenchmarkCaseError, BenchmarkRequest
 from tokenspeed_kernel.platform import PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 
@@ -54,6 +55,21 @@ def test_moe_fp8_weight_shapes_match_tp_and_ep_layouts() -> None:
         "w2": (72, 4096, 2048),
         "w2_scale": (72, 32, 16),
     }
+
+
+def test_moe_generator_rejects_unimplemented_model_profile() -> None:
+    request = BenchmarkRequest(
+        family="moe",
+        mode="apply",
+        parameters={"model_profile": "unimplemented"},
+        solution=None,
+        registration=None,
+        cold_cache=True,
+        seed=42,
+    )
+
+    with pytest.raises(BenchmarkCaseError, match="Implemented MoE model_profile"):
+        prepare_moe_apply(request, None)
 
 
 def test_moe_apply_generator_precomputes_local_ep_routes(
@@ -135,6 +151,7 @@ def test_moe_apply_generator_precomputes_local_ep_routes(
             family="moe",
             mode="apply",
             parameters={
+                "model_profile": "glm53_flash_tp4",
                 "tokens": 3,
                 "hidden_size": 8,
                 "intermediate_size": 16,
@@ -151,6 +168,8 @@ def test_moe_apply_generator_precomputes_local_ep_routes(
                 "swiglu_limit": 10.0,
                 "routing_mode": "precomputed_topk",
                 "route_scope": "local",
+                "route_distribution": "router",
+                "token_count_scope": "local",
                 "routed_scaling_factor": 2.5,
                 "normalize_topk_weights": True,
                 "fp8_scale_block_shape": [128, 128],

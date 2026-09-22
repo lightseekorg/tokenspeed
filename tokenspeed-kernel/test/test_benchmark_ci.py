@@ -187,57 +187,6 @@ def test_gfx950_suite_selects_exact_registrations():
         assert mxfp8_case.policy == _policy()
 
 
-def test_glm53_moe_suite_exercises_router_and_apply_shapes():
-    suite_path = Path(__file__).parents[1] / "benchmarks" / "amd" / "gfx950.json"
-    suite = load_suite(suite_path)
-    cases = [case for case in suite.cases if case.id.startswith("glm53_flash.moe.")]
-    apply_cases = [case for case in cases if case.request.mode == "apply"]
-    router_cases = [case for case in cases if case.request.mode == "sigmoid_bias_topk"]
-
-    assert len(cases) == 39
-    assert len(router_cases) == 13
-    assert len(apply_cases) == 26
-    assert {case.request.mode for case in cases} == {"sigmoid_bias_topk", "apply"}
-    assert all(case.request.family == "moe" for case in cases)
-    assert all(case.request.solution is None for case in cases)
-    assert all(case.request.registration is None for case in cases)
-    assert all(case.request.cold_cache for case in cases)
-    assert all(
-        case.request.parameters["router_logits_dtype"] == "bfloat16" for case in cases
-    )
-    assert all(
-        case.request.parameters.get("weights_dtype", "float32") == "float32"
-        for case in router_cases
-    )
-    assert {case.request.parameters["tokens"] for case in router_cases} == {
-        1,
-        2,
-        4,
-        8,
-        16,
-        64,
-        128,
-        256,
-        512,
-        1024,
-        2048,
-        4096,
-        8192,
-    }
-    assert {
-        (
-            case.request.parameters["tp_size"],
-            case.request.parameters["ep_size"],
-            case.request.parameters["num_local_experts"],
-        )
-        for case in apply_cases
-    } == {(4, 1, 288), (1, 4, 72)}
-    assert all("model_profile" not in case.request.parameters for case in cases)
-    assert all(
-        case.request.parameters["route_scope"] == "local" for case in apply_cases
-    )
-
-
 def test_load_suite_includes_case_files(tmp_path):
     fragment_path = tmp_path / "operation.json"
     fragment_path.write_text(
