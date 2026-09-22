@@ -25,12 +25,7 @@ from typing import Any, Literal, NamedTuple, Protocol, runtime_checkable
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.moe import (
-    moe_sigmoid_bias_topk,
-    moe_softmax_topk,
-    moe_topk,
-    pack_topk_router_logits,
-)
+from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk, moe_softmax_topk
 from tokenspeed_kernel.ops.moe.sigmoid_topk import minimax_biased_grouped_topk
 from tokenspeed_kernel.ops.moe.triton.inkling_topk import inkling_topk
 from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flash
@@ -286,8 +281,6 @@ def grouped_topk_gpu(
 @dataclass
 class TopKConfig:
     top_k: int
-    score_function: Literal["runtime", "softmax", "sigmoid", "sqrt_softplus"]
-    selection_method: Literal["runtime", "topk", "hash"]
     use_grouped_topk: bool = False
     topk_group: int | None = None
     num_expert_group: int | None = None
@@ -356,8 +349,6 @@ class TopK(torch.nn.Module):
         self,
         top_k: int,
         *,
-        score_function: Literal["runtime", "softmax", "sigmoid", "sqrt_softplus"],
-        selection_method: Literal["runtime", "topk", "hash"],
         use_grouped_topk: bool = False,
         topk_group: int | None = None,
         num_expert_group: int | None = None,
@@ -375,10 +366,6 @@ class TopK(torch.nn.Module):
     ):
         super().__init__()
 
-        if (score_function == "runtime") != (selection_method == "runtime"):
-            raise ValueError(
-                "score_function and selection_method must both select runtime routing"
-            )
         if use_grouped_topk:
             assert num_expert_group is not None and topk_group is not None
         if num_sink_experts > 0:
@@ -388,8 +375,6 @@ class TopK(torch.nn.Module):
 
         self.topk_config = TopKConfig(
             top_k=top_k,
-            score_function=score_function,
-            selection_method=selection_method,
             use_grouped_topk=use_grouped_topk,
             renormalize=renormalize,
             topk_group=topk_group,
@@ -414,47 +399,10 @@ class TopK(torch.nn.Module):
         output_format: TopKOutputFormat | None = None,
         num_token_non_padded: torch.Tensor | None = None,
         expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None,
-        routing_correction_bias: torch.Tensor | None = None,
-        hash_indices_table: torch.Tensor | None = None,
-        input_ids: torch.Tensor | None = None,
     ) -> TopKOutput:
         output_format = (
             output_format or self.topk_config.output_format or TopKOutputFormat.STANDARD
         )
-
-        if self.topk_config.score_function != "runtime":
-            correction_bias = (
-                self.topk_config.correction_bias
-                if routing_correction_bias is None
-                else routing_correction_bias
-            )
-            topk_weights, topk_ids = moe_topk(
-                router_logits,
-                self.topk_config.top_k,
-                self.topk_config.score_function,
-                self.topk_config.selection_method,
-                self.topk_config.renormalize,
-                self.topk_config.routed_scaling_factor,
-                correction_bias=correction_bias,
-                hash_indices_table=hash_indices_table,
-                input_ids=input_ids,
-            )
-            if output_format == TopKOutputFormat.BYPASSED:
-                output_scale = topk_weights.sum(dim=-1, keepdim=True)
-                packed_logits = pack_topk_router_logits(
-                    topk_weights,
-                    topk_ids,
-                    router_logits.shape[1],
-                )
-                return BypassedTopKOutput(
-                    hidden_states=hidden_states,
-                    router_logits=packed_logits,
-                    topk_config=self.topk_config,
-                    num_token_non_padded=num_token_non_padded,
-                    expert_location_dispatch_info=expert_location_dispatch_info,
-                    output_scale=output_scale,
-                )
-            return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
         if output_format == TopKOutputFormat.BYPASSED:
             return BypassedTopKOutput(

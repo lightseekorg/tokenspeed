@@ -744,8 +744,6 @@ class InklingGate(nn.Module):
         assert self.n_routed <= 256
         self.topk = TopK(
             self.top_k,
-            score_function="runtime",
-            selection_method="runtime",
             renormalize=False,
             correction_bias=self.bias,
             routed_scaling_factor=self.route_scale,

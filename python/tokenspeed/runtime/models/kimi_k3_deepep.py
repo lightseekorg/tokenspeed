@@ -122,8 +122,6 @@ class KimiLinearMoEDeepEP(nn.Module):
 
         self.topk = TopK(
             top_k=self.top_k,
-            score_function="runtime",
-            selection_method="runtime",
             renormalize=config.moe_renormalize,
             use_grouped_topk=config.use_grouped_topk,
             num_expert_group=config.num_expert_group,

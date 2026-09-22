@@ -265,8 +265,6 @@ class _RuntimeLongcatMoE(nn.Module):
             )
         self.topk = _TopK(
             top_k=config.moe_topk,
-            score_function="runtime",
-            selection_method="runtime",
             renormalize=config.norm_topk_prob,
             correction_bias=self.router.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,

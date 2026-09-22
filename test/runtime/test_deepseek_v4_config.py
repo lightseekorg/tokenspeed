@@ -876,7 +876,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 return_value=(None, False),
             ),
             patch.object(deepseek_v4_model, "MoELayer", FakeExperts),
-            patch.object(deepseek_v4_model, "TopK", FakeTopK),
+            patch.object(deepseek_v4_model, "DeepseekV4TopK", FakeTopK),
         ):
             moe = DeepseekV4MoE(config, mapping, None, 0, "model.layers.0.ffn")
 

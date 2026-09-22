@@ -42,11 +42,7 @@ def test_hybrid_moe_dispatches_from_actual_topk_format(
         BypassedTopKOutput(
             hidden_states,
             router_logits,
-            TopKConfig(
-                top_k=2,
-                score_function="runtime",
-                selection_method="runtime",
-            ),
+            TopKConfig(top_k=2),
             output_scale=torch.ones((2, 1), dtype=torch.float32),
         ),
         num_global_tokens=2,

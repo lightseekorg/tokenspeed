@@ -119,8 +119,8 @@ from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
+from tokenspeed.runtime.layers.moe.deepseek_v4 import DeepseekV4TopK
 from tokenspeed.runtime.layers.moe.expert import MoELayer
-from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
 from tokenspeed.runtime.layers.quantization import Fp8Config, Mxfp4Config
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -1747,14 +1747,13 @@ class DeepseekV4MoE(nn.Module):
                 _deepseek_v4_mega_moe_max_num_tokens() if self.use_mega_moe else None
             ),
         )
-        self.topk = TopK(
+        self.topk = DeepseekV4TopK(
             top_k=config.num_experts_per_tok,
             renormalize=self._renormalize_routing_weights(),
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
             output_format=self.experts.topk_output_format,
-            score_function="sqrt_softplus",
-            selection_method=("hash" if self.gate.tid2eid is not None else "topk"),
+            hash_routing=self.gate.tid2eid is not None,
         )
 
     def warmup(self) -> None:

@@ -360,8 +360,6 @@ class GptOssSparseMoeBlock(nn.Module):
         # platform- and shape-specific softmax top-k implementation.
         self.topk = TopK(
             top_k=top_k,
-            score_function="runtime",
-            selection_method="runtime",
             renormalize=True,
             custom_routing_function=None,
             output_format=self.experts.topk_output_format,
