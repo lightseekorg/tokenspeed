@@ -398,9 +398,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
     def _get_dcp_local_bound(self, global_bound: Int32) -> Int32:
         """Map global causal bound to this rank's local bound."""
         if cutlass.const_expr(self.cp_interleave_size == 1):
-            return (
-                global_bound - self.cp_rank + self.cp_world - 1
-            ) // self.cp_world
+            return (global_bound - self.cp_rank + self.cp_world - 1) // self.cp_world
 
         cycle_width = self.cp_world * self.cp_interleave_size
         full_cycles = global_bound // cycle_width
@@ -3389,9 +3387,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
                         else:
                             global_bound = (
-                                common_params.K_causal
-                                - (self.seq_len_q - 1)
-                                + q_tok
+                                common_params.K_causal - (self.seq_len_q - 1) + q_tok
                             )
                             k_bound = self._get_dcp_local_bound(global_bound)
                     else:
@@ -3495,9 +3491,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
                         else:
                             global_bound = (
-                                common_params.K_causal
-                                - (self.seq_len_q - 1)
-                                + q_tok
+                                common_params.K_causal - (self.seq_len_q - 1) + q_tok
                             )
                             k_bound = self._get_dcp_local_bound(global_bound)
                     else:
