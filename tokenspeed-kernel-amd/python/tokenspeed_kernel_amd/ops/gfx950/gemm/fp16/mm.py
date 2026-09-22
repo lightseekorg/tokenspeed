@@ -30,6 +30,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
+    _dense16_mm_launch_metadata,
     _supports_largem_shape,
     launch_gluon_mm_a16w16_prefill_gfx950,
 )
@@ -56,18 +57,6 @@ LARGEM_DISPATCH_MIN_M = 2048
 
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 _partial_cache: dict[tuple[int, int, int, int, int], torch.Tensor] = {}
-
-
-def _dense16_mm_launch_metadata(grid, kernel, args):
-    """Report logical GEMM work and tensor traffic to Proton."""
-    m, n, k = args["M"], args["N"], args["K"]
-    return {
-        "name": kernel.name,
-        "flops16": 2 * m * n * k,
-        "bytes": m * k * args["a_ptr"].element_size()
-        + n * k * args["b_ptr"].element_size()
-        + m * n * args["c_ptr"].element_size(),
-    }
 
 
 def _dense16_bmm_launch_metadata(grid, kernel, args):
@@ -101,13 +90,14 @@ def _dense16_splitk_launch_metadata(grid, kernel, args):
 def _dense16_splitk_reduce_launch_metadata(grid, kernel, args):
     """Report FP32 partial reduction work and traffic to Proton."""
     n = grid[0] * args["BLOCK_N"]
-    m, split_k = args["OUTPUT_M"], args["SPLIT_K"]
-    values = m * n
+    output_values = args["OUTPUT_M"] * n
+    reduced_values = args["REDUCE_M"] * n
+    split_k = args["SPLIT_K"]
     return {
         "name": kernel.name,
-        "flops32": values * (split_k - 1),
+        "flops32": reduced_values * (split_k - 1),
         "bytes": args["REDUCE_M"] * n * split_k * args["partial_ptr"].element_size()
-        + values * args["c_ptr"].element_size(),
+        + output_values * args["c_ptr"].element_size(),
     }
 
 
@@ -733,7 +723,7 @@ def gluon_mm_a16w16_splitk_gfx950(
 
 
 @gluon.jit(launch_metadata=_dense16_splitk_reduce_launch_metadata)
-def _mfma_lds_smallm_reduce_kernel(
+def gluon_mm_a16w16_splitk_reduce_gfx950(
     partial_ptr,
     c_ptr,
     stride_cm,
@@ -1537,7 +1527,7 @@ def launch_gluon_mm_a16w16_splitk_gfx950(
         num_warps=MFMA_LDS_NUM_WARPS,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
-    _mfma_lds_smallm_reduce_kernel[(num_n_tiles,)](
+    gluon_mm_a16w16_splitk_reduce_gfx950[(num_n_tiles,)](
         partial,
         C,
         C.stride(0),

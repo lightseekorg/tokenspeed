@@ -159,11 +159,7 @@ if current_platform().is_amd:
         "mm",
         name="gluon_mm_mxfp8_gfx950",
         solution="gluon",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 5),
-            max_arch_version=ArchVersion(9, 5),
-            vendors=frozenset({"amd"}),
-        ),
+        capability=_GFX950_CAPABILITY,
         signatures=_MXFP8_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
@@ -207,19 +203,8 @@ if current_platform().is_amd:
         "bmm",
         name="gluon_bmm_a16w16_gfx950",
         solution="gluon",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 5),
-            max_arch_version=ArchVersion(9, 5),
-            vendors=frozenset({"amd"}),
-        ),
-        signatures=frozenset(
-            {
-                format_signature(
-                    a=dense_tensor_format(torch.bfloat16),
-                    b=dense_tensor_format(torch.bfloat16),
-                ),
-            }
-        ),
+        capability=_GFX950_CAPABILITY,
+        signatures=_DENSE16_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
             "batch": frozenset({12, 16}),
@@ -467,11 +452,7 @@ if current_platform().is_amd:
             "linear_attnres_partials",
             name="gluon_linear_attnres_partials_gfx950",
             solution="gluon",
-            capability=CapabilityRequirement(
-                min_arch_version=ArchVersion(9, 5),
-                max_arch_version=ArchVersion(9, 5),
-                vendors=frozenset({"amd"}),
-            ),
+            capability=_GFX950_CAPABILITY,
             signatures=frozenset(
                 {
                     format_signature(

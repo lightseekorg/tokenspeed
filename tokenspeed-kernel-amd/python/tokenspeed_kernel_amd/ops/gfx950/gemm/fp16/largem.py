@@ -49,7 +49,7 @@ LARGEM_MIN_K = 4 * LARGEM_BLOCK_K
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 
 
-def _largem_launch_metadata(grid, kernel, args):
+def _dense16_mm_launch_metadata(grid, kernel, args):
     """Report logical GEMM work and tensor traffic to Proton."""
     m, n, k = args["M"], args["N"], args["K"]
     return {
@@ -104,7 +104,7 @@ def _largem_get_pids(
     return pid_m, pid_n
 
 
-@gluon.jit(launch_metadata=_largem_launch_metadata)
+@gluon.jit(launch_metadata=_dense16_mm_launch_metadata)
 def gluon_mm_a16w16_prefill_gfx950(
     a_ptr,
     b_ptr,
