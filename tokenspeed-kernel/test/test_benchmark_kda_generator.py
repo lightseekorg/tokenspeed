@@ -198,6 +198,12 @@ def test_kda_prefill_binds_chunk_hint_to_converted_boundaries(
             mode="kda_paged_prefill",
             parameters={
                 "model_profile": "glm53_flash_tp4",
+                "heads": 16,
+                "key_dim": 128,
+                "value_dim": 128,
+                "dtype": "bfloat16",
+                "lower_bound": -5.0,
+                "recurrent_layout": "v_major",
                 "batch": 1,
                 "tokens_per_sequence": 64,
             },

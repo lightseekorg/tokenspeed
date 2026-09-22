@@ -46,12 +46,6 @@ _IMPLEMENTED_DTYPES = {
 _IMPLEMENTED_MODEL_PROFILES = frozenset({"glm53_flash_tp4"})
 _IMPLEMENTED_RECURRENT_LAYOUTS = frozenset({"k_major", "v_major"})
 _IMPLEMENTED_STATE_PAGE_RELATIONS = frozenset({"in_place", "distinct"})
-_DEFAULT_HEADS = 16
-_DEFAULT_DIM = 128
-_DEFAULT_LOWER_BOUND = -5.0
-_DEFAULT_RECURRENT_LAYOUT = "v_major"
-_DEFAULT_STATE_PAGES = 841
-_DEFAULT_STATE_PAGE_STRIDE = 294912
 _DISTINCT_WRITE_PAGE_OFFSET = 16
 
 
@@ -85,7 +79,7 @@ def _parse_model_profile(parameters: dict[str, Any]) -> str:
 def _parse_recurrent_layout(parameters: dict[str, Any]) -> str:
     return _implemented_value(
         "recurrent_layout",
-        parameters.get("recurrent_layout", _DEFAULT_RECURRENT_LAYOUT),
+        parameters["recurrent_layout"],
         _IMPLEMENTED_RECURRENT_LAYOUTS,
     )
 
@@ -274,7 +268,7 @@ def _state_page_indices(
 def _parse_state_page_relation(parameters: dict[str, Any]) -> str:
     return _implemented_value(
         "state_page_relation",
-        parameters.get("state_page_relation", "in_place"),
+        parameters["state_page_relation"],
         _IMPLEMENTED_STATE_PAGE_RELATIONS,
     )
 
@@ -288,11 +282,11 @@ def _normalize_common_parameters(
             "KDA benchmark correctness validation is not implemented yet",
         )
     model_profile = _parse_model_profile(request.parameters)
-    heads = request.parameters.get("heads", _DEFAULT_HEADS)
-    key_dim = request.parameters.get("key_dim", _DEFAULT_DIM)
-    value_dim = request.parameters.get("value_dim", _DEFAULT_DIM)
-    dtype = _parse_dtype(request.parameters.get("dtype", "bfloat16"))
-    lower_bound = request.parameters.get("lower_bound", _DEFAULT_LOWER_BOUND)
+    heads = request.parameters["heads"]
+    key_dim = request.parameters["key_dim"]
+    value_dim = request.parameters["value_dim"]
+    dtype = _parse_dtype(request.parameters["dtype"])
+    lower_bound = request.parameters["lower_bound"]
     recurrent_layout = _parse_recurrent_layout(request.parameters)
     return (
         model_profile,
@@ -447,15 +441,13 @@ def prepare_kda_paged_decode(
         if state_page_relation == "distinct"
         else batch + 1
     )
-    state_pages = request.parameters.get("state_pages", _DEFAULT_STATE_PAGES)
+    state_pages = request.parameters["state_pages"]
     if state_pages < minimum_state_pages:
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
             f"KDA decode state_pages must be at least {minimum_state_pages}",
         )
-    state_page_stride = request.parameters.get(
-        "state_page_stride", _DEFAULT_STATE_PAGE_STRIDE
-    )
+    state_page_stride = request.parameters["state_page_stride"]
     state_payload = heads * value_dim * key_dim
     if state_page_stride < state_payload:
         raise BenchmarkCaseError(
