@@ -131,6 +131,49 @@ def test_dsa_generator_rejects_unsupported_validation() -> None:
         dsa_generator._resolve_config(request)
 
 
+@pytest.mark.parametrize(
+    ("mode", "prepare", "shape", "trait_name", "trait_value"),
+    [
+        (
+            "kpool_prefill_topk",
+            dsa_generator.prepare_kpool_prefill_topk,
+            {"batch": 1, "prefix_tokens": 0, "query_tokens_per_sequence": 64},
+            "has_prefill_plan",
+            True,
+        ),
+        (
+            "kpool_decode_topk",
+            dsa_generator.prepare_kpool_decode_topk,
+            {"batch": 1, "q_len_per_req": 4, "sequence_length": 8192},
+            "q_len",
+            4,
+        ),
+    ],
+)
+def test_kpool_generator_selection_traits_match_operation_api(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    prepare: Any,
+    shape: dict[str, object],
+    trait_name: str,
+    trait_value: object,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def capture_selection(*_args, traits, **_kwargs):
+        captured.update(traits)
+        raise RuntimeError("selection captured")
+
+    monkeypatch.setattr(dsa_generator, "load_builtin_kernels", lambda: None)
+    monkeypatch.setattr(dsa_generator, "_select_registration", capture_selection)
+    request = _request(mode, {**_GLM53_CONFIG, **shape})
+
+    with pytest.raises(RuntimeError, match="selection captured"):
+        prepare(request, None)
+
+    assert captured[trait_name] == trait_value
+
+
 def test_dsa_generator_builds_page_aligned_prefill_metadata() -> None:
     metadata = dsa_generator._prefill_metadata(
         2,

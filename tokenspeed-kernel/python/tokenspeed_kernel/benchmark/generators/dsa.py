@@ -689,9 +689,9 @@ def _prepare_kpool_topk(
         "topk_pools": config.topk_pools,
     }
     if prefill:
-        traits.update({"index_heads": config.index_heads, "prefill_plan": True})
+        traits.update({"index_heads": config.index_heads, "has_prefill_plan": True})
     else:
-        traits["q_len_per_req"] = q_len_per_req
+        traits["q_len"] = q_len_per_req
     load_builtin_kernels()
     spec = _select_registration(
         request,
