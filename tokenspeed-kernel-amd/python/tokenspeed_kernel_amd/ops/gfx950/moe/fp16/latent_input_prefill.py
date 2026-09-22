@@ -48,6 +48,12 @@ _WARPS_N = 4
 _NUM_XCDS = 8
 _GROUP_SIZE_M = 4
 
+# SiTU epilogue tile. BLOCK_N divides the 768-wide shared output, so no lane is
+# masked along the columns, and the layout gives each lane a dwordx4 of them.
+_SITU_BLOCK_M = 8
+_SITU_BLOCK_N = 256
+_SITU_NUM_WARPS = 4
+
 _K3_HIDDEN = 7168
 _K3_ROUTER = 896
 _K3_ROUTED = 3584
@@ -278,34 +284,49 @@ def gluon_latent_input_prefill_situ_gfx950(
     shared_raw_ptr,
     shared_ptr,
     beta,
+    inv_beta,
     linear_beta,
+    inv_linear_beta,
     M,
     stride_raw_m,
     stride_shared_m,
     SHARED_N: gl.constexpr,
+    BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     HAS_LINEAR_BETA: gl.constexpr,
 ):
-    """Apply SiTU to one materialized BF16 gate/up projection row."""
-    row = gl.program_id(axis=0)
-    layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
-    offs = gl.arange(0, BLOCK_N, layout=layout)
-    mask = offs < SHARED_N
-    gate_raw = gl.load(
-        shared_raw_ptr + row * stride_raw_m + offs, mask=mask, other=0.0
+    """Apply SiTU to one tile of the materialized BF16 gate/up projection.
+
+    The tile is two dimensional so the column extent can divide the 768-wide
+    shared width while each lane still holds 8 contiguous BF16 columns, which
+    is one dwordx4.
+    """
+    layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [1, 4], [1, 0])
+    rows = gl.arange(0, BLOCK_M, gl.SliceLayout(1, layout))
+    cols = gl.arange(0, BLOCK_N, gl.SliceLayout(0, layout))
+    row_base = gl.program_id(0) * BLOCK_M
+    col_base = gl.program_id(1) * BLOCK_N
+    # Columns always land inside the tile; only the last row tile is partial.
+    mask = (row_base + rows < M)[:, None]
+
+    raw_base = shared_raw_ptr + row_base * stride_raw_m + col_base
+    gate_offsets = rows[:, None] * stride_raw_m + cols[None, :]
+    gate_raw = cdna4.buffer_load(
+        ptr=raw_base, offsets=gate_offsets, mask=mask, other=0.0
     ).to(gl.float32)
-    up = gl.load(
-        shared_raw_ptr + row * stride_raw_m + SHARED_N + offs,
-        mask=mask,
-        other=0.0,
+    up = cdna4.buffer_load(
+        ptr=raw_base + SHARED_N, offsets=gate_offsets, mask=mask, other=0.0
     ).to(gl.float32)
-    gate = beta * gl.extra.libdevice.tanh(gate_raw / beta)
+    # Both clamps scale by a reciprocal the launcher computed, so only the
+    # sigmoid still expands to the div_scale/div_fmas/div_fixup sequence.
+    gate = beta * gl.extra.libdevice.tanh(gate_raw * inv_beta)
     gate *= 1.0 / (1.0 + gl.exp(-gate_raw))
     if HAS_LINEAR_BETA:
-        up = linear_beta * gl.extra.libdevice.tanh(up / linear_beta)
-    gl.store(
-        shared_ptr + row * stride_shared_m + offs,
-        (gate * up).to(shared_ptr.dtype.element_ty),
+        up = linear_beta * gl.extra.libdevice.tanh(up * inv_linear_beta)
+    cdna4.buffer_store(
+        ptr=shared_ptr + row_base * stride_shared_m + col_base,
+        offsets=rows[:, None] * stride_shared_m + cols[None, :],
+        stored_value=(gate * up).to(shared_ptr.dtype.element_ty),
         mask=mask,
     )
 
@@ -409,18 +430,22 @@ def launch_gluon_latent_input_prefill_gfx950(
         num_warps=_NUM_WARPS,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
-    gluon_latent_input_prefill_situ_gfx950[(tokens,)](
+    situ_grid = (triton.cdiv(tokens, _SITU_BLOCK_M), _K3_SHARED // _SITU_BLOCK_N)
+    gluon_latent_input_prefill_situ_gfx950[situ_grid](
         shared_raw,
         shared_out,
         float(beta),
+        1.0 / float(beta),
         1.0 if linear_beta is None else float(linear_beta),
+        1.0 if linear_beta is None else 1.0 / float(linear_beta),
         tokens,
         shared_raw.stride(0),
         shared_out.stride(0),
         SHARED_N=_K3_SHARED,
-        BLOCK_N=1024,
+        BLOCK_M=_SITU_BLOCK_M,
+        BLOCK_N=_SITU_BLOCK_N,
         HAS_LINEAR_BETA=linear_beta is not None,
-        num_warps=4,
+        num_warps=_SITU_NUM_WARPS,
     )
     return router_out, routed_out, shared_out
 
