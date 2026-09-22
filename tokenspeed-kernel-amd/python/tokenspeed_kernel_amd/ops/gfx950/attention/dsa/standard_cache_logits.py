@@ -31,10 +31,10 @@ reductions over one resident key tile.
 from tokenspeed_kernel_amd._triton import gl, gluon, tl
 
 __all__ = [
-    "_dsa_kpool_prefill_logits_kernel",
-    "_dsa_kpool_prefill_plan_logits_kernel",
-    "_dsa_standard_decode_logits_kernel",
-    "_dsa_standard_prefill_logits_kernel",
+    "gluon_kpool_prefill_topk_fp8_gfx950",
+    "gluon_kpool_prefill_topk_fp8_plan_gfx950",
+    "gluon_dsa_decode_topk_standard_gfx950",
+    "gluon_dsa_prefill_topk_standard_gfx950",
 ]
 
 
@@ -722,7 +722,7 @@ def _standard_cache_logits_body(
 
 
 @gluon.jit
-def _dsa_standard_prefill_logits_kernel(
+def gluon_dsa_prefill_topk_standard_gfx950(
     q,
     q_scales,
     index_k_fp8,
@@ -797,7 +797,7 @@ def _dsa_standard_prefill_logits_kernel(
 
 
 @gluon.jit
-def _dsa_kpool_prefill_logits_kernel(
+def gluon_kpool_prefill_topk_fp8_gfx950(
     q,
     q_scales,
     index_k_fp8,
@@ -883,7 +883,7 @@ def _dsa_kpool_prefill_logits_kernel(
 
 
 @gluon.jit
-def _dsa_kpool_prefill_plan_logits_kernel(
+def gluon_kpool_prefill_topk_fp8_plan_gfx950(
     q,
     q_scales,
     index_k_fp8,
@@ -968,7 +968,7 @@ def _dsa_kpool_prefill_plan_logits_kernel(
 
 
 @gluon.jit
-def _dsa_standard_decode_logits_kernel(
+def gluon_dsa_decode_topk_standard_gfx950(
     q,
     q_scales,
     index_k_fp8,

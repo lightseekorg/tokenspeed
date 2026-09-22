@@ -239,6 +239,10 @@ def test_moe_plan_selects_mxfp4_situ_hybrid_routing() -> None:
         ispp=ISPP,
         internal_activation_dtype="fp8",
         solution="flashinfer_trtllm",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_mxfp4_situ_moe_apply"
     assert plan["support_routing"] is True
@@ -269,6 +273,10 @@ def test_situ_dispatch_autotune_preserves_normal_output(
         a2a_backend=None,
         ep_size=1,
         ispp=ISPP,
+        hidden=HIDDEN,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
         fp8_scale_block_shape=None,
         internal_activation_dtype="fp8",
         with_bias=False,

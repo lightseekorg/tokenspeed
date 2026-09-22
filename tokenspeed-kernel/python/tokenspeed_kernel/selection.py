@@ -240,19 +240,30 @@ def _trait_value_matches(spec_values: frozenset[Any], trait_value: Any) -> bool:
     return trait_value.issubset(spec_values)
 
 
-def _ispp_satisfies_alignment(spec: KernelSpec, ispp: Any) -> bool:
+# MoE size traits a kernel may constrain either exactly (``<name>`` lists the
+# accepted sizes) or by divisibility (``<name>_alignment`` lists accepted
+# multiples). ``ispp`` is the intermediate size per partition; ``hidden`` the
+# MoE input width. Both are geometry a kernel's weight layout may reject, so
+# they must veto selection rather than fail later in weight preprocessing.
+_ALIGNED_SIZE_TRAITS = {
+    "ispp": "ispp_alignment",
+    "hidden": "hidden_alignment",
+}
+
+
+def _size_satisfies_alignment(spec: KernelSpec, name: str, size: Any) -> bool:
     try:
-        ispp_value = int(ispp)
+        size_value = int(size)
     except (TypeError, ValueError):
         return False
-    exact_sizes = spec.traits.get("ispp")
-    if exact_sizes is not None and ispp_value not in exact_sizes:
+    exact_sizes = spec.traits.get(name)
+    if exact_sizes is not None and size_value not in exact_sizes:
         return False
-    alignments = spec.traits.get("ispp_alignment")
+    alignments = spec.traits.get(_ALIGNED_SIZE_TRAITS[name])
     if alignments is None:
         return True
     return any(
-        int(alignment) > 0 and ispp_value % int(alignment) == 0
+        int(alignment) > 0 and size_value % int(alignment) == 0
         for alignment in alignments
     )
 
@@ -273,15 +284,16 @@ def spec_matches_traits(
             the spec are ignored. When ``True`` (reference compatibility checks),
             every requested trait must be explicitly present on the spec.
     """
-    # ispp stands for "intermediate size per partition" and has special
-    # requirements that depend on the kernel's declared exact sizes and
-    # supported alignments (if any). It is used in some MoE ops to ensure the
-    # intermediate buffer sizes are compatible with the kernel's requirements.
-    if "ispp" in spec.traits and "ispp" not in traits:
-        return False
+    # Size traits (see _ALIGNED_SIZE_TRAITS) match against the kernel's
+    # declared exact sizes and supported alignments (if any), so a MoE kernel
+    # whose weight layout cannot take the layer's geometry is never selected.
+    # A kernel pinned to exact sizes needs the request to state the size.
+    for size_name in _ALIGNED_SIZE_TRAITS:
+        if size_name in spec.traits and size_name not in traits:
+            return False
     for trait_name, trait_value in traits.items():
-        if trait_name == "ispp":
-            if not _ispp_satisfies_alignment(spec, trait_value):
+        if trait_name in _ALIGNED_SIZE_TRAITS:
+            if not _size_satisfies_alignment(spec, trait_name, trait_value):
                 return False
             continue
 
@@ -312,60 +324,68 @@ def ref_compatible_with_spec(ref: KernelSpec, spec: KernelSpec) -> bool:
     return True
 
 
-def spec_matches_shape_traits(spec: KernelSpec, shape: dict[str, Any]) -> bool:
-    """Return whether a spec's dimension traits match a concrete shape.
+# GEMM problem-shape dimensions. Their exact value sets are enforced here as
+# well as by ``spec_matches_traits`` so that shape-only callers (numerics,
+# benchmarks) see the full envelope, and a spec that constrains one of them
+# rejects a request that omits it.
+_SHAPE_DIMS: tuple[str, ...] = ("batch", "m", "n", "k")
 
-    The ``mnk_problem_filter`` trait contains predicates with the signature
-    ``(M, N, K) -> bool``. Predicates are evaluated only when all three
-    dimensions are available, consistent with the partial-shape behavior of
-    the exact, alignment, and minimum traits below.
+# Suffixes that turn a dimension trait ``<dim>`` into a bound on a spec.
+_BOUND_SUFFIXES: tuple[tuple[str, Callable[[int, int], bool]], ...] = (
+    ("_align", lambda value, alignment: value % alignment == 0),
+    ("_min", lambda value, minimum: value >= minimum),
+)
+
+
+def spec_matches_shape_traits(spec: KernelSpec, traits: dict[str, Any]) -> bool:
+    """Return whether a spec's problem-shape traits accept the requested shape.
+
+    A request describes its shape with integer traits such as ``m``, ``k`` or
+    ``batch_size``. For any such dimension ``<dim>`` a spec may declare:
+
+    * ``<dim>``: the exact supported values.
+    * ``<dim>_align``: the value must be a multiple of one declared alignment.
+    * ``<dim>_min``: the value must reach one declared minimum.
+
+    Rules those cannot express go in ``mnk_problem_filter``, a set of
+    ``(m, n, k) -> bool`` predicates of which at least one must accept.
+
+    A declared bound is a hard requirement: a spec that declares
+    ``<dim>_align`` or ``<dim>_min`` rejects any request that does not supply
+    ``<dim>``, and a ``mnk_problem_filter`` rejects a request missing any of
+    ``m``, ``n`` or ``k``. Exact sets are matched by value membership; for the
+    GEMM dimensions ``batch``, ``m``, ``n`` and ``k`` that is also enforced
+    here and a spec constraining one of them rejects a request that omits it.
+    Dimensions a spec does not constrain are ignored.
+
+    By convention a trait dict lists the shape traits first, each ``_align``
+    and ``_min`` bound right after the dimension it bounds and
+    ``mnk_problem_filter`` last, followed by the remaining traits in
+    alphabetical order.
     """
-    exact_traits: dict[str, tuple[str, ...]] = {
-        "batch": ("B", "batch"),
-        "m": ("M",),
-        "n": ("N",),
-        "k": ("K",),
-    }
-    for trait_name, dim_names in exact_traits.items():
-        values = spec.traits.get(trait_name)
-        dim = next((shape[name] for name in dim_names if name in shape), None)
-        if values is not None and dim is not None and dim not in values:
-            return False
+    for trait_name, bounds in spec.traits.items():
+        for suffix, satisfies in _BOUND_SUFFIXES:
+            if not trait_name.endswith(suffix):
+                continue
+            value = traits.get(trait_name[: -len(suffix)])
+            if not isinstance(value, int):
+                return False
+            if not any(satisfies(value, bound) for bound in bounds):
+                return False
 
-    alignment_traits: dict[str, tuple[str, int]] = {
-        "n_align_16": ("N", 16),
-        "n_align_64": ("N", 64),
-        "n_align_128": ("N", 128),
-        "k_align_16": ("K", 16),
-        "k_align_32": ("K", 32),
-        "k_align_64": ("K", 64),
-        "k_align_128": ("K", 128),
-    }
-    for trait_name, (dim_name, alignment) in alignment_traits.items():
-        values = spec.traits.get(trait_name)
-        if values is None or True not in values:
+    for dim in _SHAPE_DIMS:
+        exact = spec.traits.get(dim)
+        if exact is None:
             continue
-
-        dim = shape.get(dim_name)
-        if isinstance(dim, int) and dim % alignment != 0:
-            return False
-
-    minimum_traits: dict[str, tuple[str, int]] = {
-        "n_min_128": ("N", 128),
-        "k_min_128": ("K", 128),
-    }
-    for trait_name, (dim_name, minimum) in minimum_traits.items():
-        values = spec.traits.get(trait_name)
-        if values is None or True not in values:
-            continue
-
-        dim = shape.get(dim_name)
-        if isinstance(dim, int) and dim < minimum:
+        value = traits.get(dim)
+        if not isinstance(value, int) or value not in exact:
             return False
 
     problem_filters = spec.traits.get("mnk_problem_filter")
-    m, n, k = shape.get("M"), shape.get("N"), shape.get("K")
-    if problem_filters is not None and all(isinstance(dim, int) for dim in (m, n, k)):
+    if problem_filters is not None:
+        m, n, k = traits.get("m"), traits.get("n"), traits.get("k")
+        if not all(isinstance(dim, int) for dim in (m, n, k)):
+            return False
         if not any(problem_filter(m, n, k) for problem_filter in problem_filters):
             return False
 

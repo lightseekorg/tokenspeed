@@ -25,13 +25,13 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon
 
-__all__ = ["gluon_dsv4_select_experts_gfx950"]
+__all__ = ["launch_gluon_dsv4_select_experts_gfx950"]
 
 cdna4 = gl.amd.cdna4
 
 
 @gluon.jit
-def _dsv4_select_experts_kernel(
+def gluon_dsv4_select_experts_gfx950(
     router_logits,
     correction_bias,
     hash_indices_table,
@@ -157,7 +157,7 @@ def _validate_tensor_device(
         raise ValueError(f"{name} must be on the same device as router_logits")
 
 
-def gluon_dsv4_select_experts_gfx950(
+def launch_gluon_dsv4_select_experts_gfx950(
     router_logits: torch.Tensor,
     top_k: int,
     renormalize: bool,
@@ -262,7 +262,7 @@ def gluon_dsv4_select_experts_gfx950(
     bias = correction_bias if bias_routing else topk_weights
     hash_table = hash_indices_table if hash_indices_table is not None else topk_ids
     token_ids = input_ids if hash_routing else topk_ids
-    _dsv4_select_experts_kernel[(tokens,)](
+    gluon_dsv4_select_experts_gfx950[(tokens,)](
         router_logits,
         bias,
         hash_table,

@@ -232,6 +232,10 @@ def run_correctness(capacity: int, live_tokens: int, tune: bool):
         deepep_mode=None,
         deepep_low_latency_max_num_tokens_per_gpu=None,
         solution="mega_moe",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
     )
     w, ref = _weights(plan)
     tokens = live_tokens if dist.get_rank() == 0 else max(1, live_tokens - 2)

@@ -31,6 +31,7 @@ from tokenspeed_kernel.numerics.comparison import (
 from tokenspeed_kernel.numerics.inputs import (
     get_input_generator,
     get_standard_shapes,
+    shape_traits,
 )
 from tokenspeed_kernel.numerics.tolerance import (
     Tolerance,
@@ -153,7 +154,7 @@ def verify_kernel(
 
     results: list[ComparisonResult] = []
     for shape in test_shapes:
-        if not spec_matches_shape_traits(spec, shape):
+        if not spec_matches_shape_traits(spec, shape_traits(shape)):
             if verbose:
                 print(f"[SKIP] {kernel_name} shape={shape} incompatible with traits")
             continue

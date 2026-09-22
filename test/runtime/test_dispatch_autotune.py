@@ -27,6 +27,7 @@ These check branch coverage and output ownership, not GPU tactic performance.
 from __future__ import annotations
 
 import ast
+import functools
 import inspect
 import logging
 import sys
@@ -173,6 +174,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
         # Deliberately no capture_bs or graph-enabled flag: neither controls tuning.
         forward_step=SimpleNamespace(warmup_decode_path=draft),
         drafter=object() if speculative else None,
+        _autotune_draft_experts=lambda n: events.append(("draft_experts", n)),
         device="cpu",
     )
     method = _functions(
@@ -201,6 +203,11 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
             ("group", None),
             "scrub",
             ("target", (32 if chunk_size < 0 else chunk_size)),
+            *(
+                [("draft_experts", (32 if chunk_size < 0 else chunk_size))]
+                if speculative
+                else []
+            ),
             *(["draft"] if speculative and not prefill_only else []),
             ("group", None),
             "save",
@@ -256,8 +263,12 @@ def _make_moe_plan(api, routing_mode):
         a2a_backend=None,
         ep_size=1,
         ispp=128,
+        hidden=6,
         fp8_scale_block_shape=None,
         internal_activation_dtype="fp8",
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
         with_bias=False,
         process_group=None,
         deepep_mode=None,
@@ -951,6 +962,59 @@ def test_decode_gemv_eligibility_preserves_fi_and_cdna5(
     assert api.use_decode_gemv(tensor((m, k)), tensor((7168, k))) is expected
     if fi and m <= 32:
         select.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "m,n,k,on_cuda,expected",
+    [
+        (1, 32, 256, True, True),
+        (1, 48, 256, True, True),
+        (2, 32, 256, True, False),
+        (1, 31, 256, True, False),
+        (1, 32, 128, True, False),
+        (1, 32, 256, False, False),
+    ],
+)
+def test_decode_gemv_selection_obeys_shape_traits(m, n, k, on_cuda, expected):
+    from tokenspeed_kernel.selection import (
+        spec_matches_shape_traits,
+        spec_matches_traits,
+    )
+
+    platform = object()
+    impl, fallback = Mock(), Mock()
+    spec = SimpleNamespace(
+        name="specialized",
+        traits={
+            "m": frozenset({1}),
+            "n_align": frozenset({16}),
+            "k_min": frozenset({256}),
+        },
+    )
+    registry = SimpleNamespace(
+        get_for_operator=Mock(return_value=[spec]),
+        get_impl=Mock(return_value=impl),
+    )
+    api = _functions(
+        KERNEL / "ops/gemm/triton_gemv.py",
+        None,
+        ("_select",),
+        dict(
+            functools=functools,
+            KernelRegistry=SimpleNamespace(get=lambda: registry),
+            current_platform=lambda: platform,
+            spec_matches_traits=spec_matches_traits,
+            spec_matches_shape_traits=spec_matches_shape_traits,
+            torch_decode_gemv=fallback,
+        ),
+    )
+    assert api._select(m, n, k, on_cuda) is (impl if expected else fallback)
+    if on_cuda:
+        registry.get_for_operator.assert_called_once_with(
+            "gemm", "decode_gemv", platform=platform
+        )
+    else:
+        registry.get_for_operator.assert_not_called()
 
 
 @pytest.mark.parametrize(

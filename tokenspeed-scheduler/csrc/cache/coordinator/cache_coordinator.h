@@ -226,9 +226,7 @@ public:
     // Queue every already-published non-state Device cache entry for D2H Store.
     // Missing keys and an absent Host tier are silently skipped.
     void QueueCachedBlocksForStore(std::span<const std::string> prefix_hashes);
-    // Queue the newest Device-resident checkpoint from each snapshot-state
-    // group. State checkpoints are intentionally deferred from continuous
-    // Host streaming and persisted at request lifecycle boundaries instead.
+    // Queue the newest already-published Device checkpoint from each state group.
     void QueueLatestSnapshotBlocksForStore(std::span<const std::string> prefix_hashes);
     std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;

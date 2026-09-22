@@ -142,11 +142,10 @@ if is_available():
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
-            "head_v_dim": frozenset({SUPPORTED_HEAD_DIM}),
-            "head_v_eq_head_k": frozenset({True}),
+            "value_head_dim": frozenset({SUPPORTED_HEAD_DIM}),
             "num_v_gte_num_q": frozenset({True}),
-            "qk_l2norm": frozenset({False, True}),
             "output_h": frozenset({False, True}),
+            "qk_l2norm": frozenset({False, True}),
         },
     )
     def flashinfer_gdn_chunk_prefill(

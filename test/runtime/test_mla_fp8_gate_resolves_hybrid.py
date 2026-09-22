@@ -12,6 +12,7 @@ that coverage structural rather than incidental.
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -97,6 +98,42 @@ def test_decode_and_prefill_share_one_gate():
         assert (
             "self._mla_kv_is_fp8(ctx, k_scale)" in src
         ), f"the {name} path open-codes the fp8 gate instead of sharing it"
+
+
+@pytest.mark.parametrize(
+    "backend_name,supported",
+    [
+        ("mla", True),
+        ("gluon", True),
+        ("trtllm_mla", True),
+        ("tokenspeed_mla", True),
+        ("flashmla", False),
+    ],
+)
+@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize(
+    "dtype,k_scale,can_quantize",
+    [
+        (torch.float8_e4m3fn, 1.0, True),
+        (torch.bfloat16, 1.0, False),
+        (torch.float8_e4m3fn, 0.5, False),
+    ],
+)
+def test_model_fp8_gate_backends(
+    backend_name, supported, hybrid, dtype, k_scale, can_quantize
+):
+    from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3AttentionMLA
+
+    attention = object.__new__(DeepseekV3AttentionMLA)
+    torch.nn.Module.__init__(attention)
+    attention.attention_backend = backend_name
+    backend = SimpleNamespace(data_type=dtype)
+    if hybrid:
+        backend = SimpleNamespace(full_attn_backend=backend)
+
+    assert attention._mla_kv_is_fp8(SimpleNamespace(attn_backend=backend), k_scale) is (
+        supported and can_quantize
+    )
 
 
 def _wrapper_classes():
