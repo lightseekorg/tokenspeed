@@ -36,7 +36,11 @@ from tokenspeed_kernel.ops import moe as moe_ops
 from tokenspeed_kernel.platform import PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_kernels
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.signature import (
+    FormatSignature,
+    dense_tensor_format,
+    format_signature,
+)
 
 __all__ = [
     "prepare_latent_expert_shared",
@@ -68,7 +72,7 @@ _IMPLEMENTED_ROUTE_DISTRIBUTIONS = frozenset({"balanced_global", "router"})
 _IMPLEMENTED_TOKEN_COUNT_SCOPES = frozenset({"global", "local"})
 _IMPLEMENTED_INTERNAL_ACTIVATION_DTYPES = frozenset({"input"})
 _IMPLEMENTED_FP8_BLOCK_SHAPES = frozenset({(128, 128)})
-_IMPLEMENTED_MXFP4_GROUP_SIZES = frozenset({32})
+_MXFP4_GROUP_SIZE = 32
 
 
 def _implemented_value(
@@ -134,23 +138,19 @@ def _randn(
     return torch.randn(shape, device="cuda", dtype=dtype, generator=generator)
 
 
-def _select_sigmoid_bias_topk(
+def _selected_spec(
     request: BenchmarkRequest,
     platform: PlatformInfo,
-    *,
-    router_logits_dtype: torch.dtype,
-    tokens: int,
-    experts: int,
-    topk: int,
+    signature: FormatSignature,
+    traits: dict[str, object],
 ) -> KernelSpec:
-    signature = format_signature(router_logits=dense_tensor_format(router_logits_dtype))
     try:
         selected = select_kernel(
             request.family,
             request.mode,
             signature,
             platform=platform,
-            traits={"tokens": tokens, "experts": experts, "topk": topk},
+            traits=traits,
         )
     except NoKernelFoundError as error:
         raise BenchmarkCaseError(
@@ -333,22 +333,6 @@ def _ones(shape: tuple[int, ...]) -> torch.Tensor:
     return torch.ones(shape, dtype=torch.float32, device="cuda")
 
 
-def _device_zeros(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
-    return torch.zeros(shape, dtype=dtype, device="cuda")
-
-
-def _device_empty(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
-    return torch.empty(shape, dtype=dtype, device="cuda")
-
-
-def _device_full(
-    shape: tuple[int, ...],
-    value: int,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    return torch.full(shape, value, dtype=dtype, device="cuda")
-
-
 def _make_fp8_weights(
     *,
     num_local_experts: int,
@@ -394,17 +378,19 @@ def _mxfp4_weight_shapes(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size_per_partition: int,
-    group_size: int,
 ) -> dict[str, tuple[int, ...]]:
     if hidden_size % 2 or intermediate_size_per_partition % 2:
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
             "MoE MXFP4 packed dimensions must be even",
         )
-    if hidden_size % group_size or intermediate_size_per_partition % group_size:
+    if (
+        hidden_size % _MXFP4_GROUP_SIZE
+        or intermediate_size_per_partition % _MXFP4_GROUP_SIZE
+    ):
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
-            f"MoE MXFP4 dimensions must be divisible by group size {group_size}",
+            f"MoE MXFP4 dimensions must be divisible by group size {_MXFP4_GROUP_SIZE}",
         )
     return {
         "w13": (
@@ -415,7 +401,7 @@ def _mxfp4_weight_shapes(
         "w13_scale": (
             num_local_experts,
             2 * intermediate_size_per_partition,
-            hidden_size // group_size,
+            hidden_size // _MXFP4_GROUP_SIZE,
         ),
         "w2": (
             num_local_experts,
@@ -425,7 +411,7 @@ def _mxfp4_weight_shapes(
         "w2_scale": (
             num_local_experts,
             hidden_size,
-            intermediate_size_per_partition // group_size,
+            intermediate_size_per_partition // _MXFP4_GROUP_SIZE,
         ),
     }
 
@@ -436,7 +422,6 @@ def _make_mxfp4_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size_per_partition: int,
-    group_size: int,
     activation: str,
     swiglu_limit: float | None,
     situ_beta: float | None,
@@ -448,7 +433,6 @@ def _make_mxfp4_weights(
         num_local_experts=num_local_experts,
         hidden_size=hidden_size,
         intermediate_size_per_partition=intermediate_size_per_partition,
-        group_size=group_size,
     )
     swiglu_arg = (
         SimpleNamespace(alpha=1.0, limit=swiglu_limit)
@@ -456,10 +440,14 @@ def _make_mxfp4_weights(
         else None
     )
     return SimpleNamespace(
-        w13_weight=_device_zeros(shapes["w13"], torch.uint8),
-        w13_weight_scale=_device_full(shapes["w13_scale"], 127, torch.uint8),
-        w2_weight=_device_zeros(shapes["w2"], torch.uint8),
-        w2_weight_scale=_device_full(shapes["w2_scale"], 127, torch.uint8),
+        w13_weight=torch.zeros(shapes["w13"], dtype=torch.uint8, device="cuda"),
+        w13_weight_scale=torch.full(
+            shapes["w13_scale"], 127, dtype=torch.uint8, device="cuda"
+        ),
+        w2_weight=torch.zeros(shapes["w2"], dtype=torch.uint8, device="cuda"),
+        w2_weight_scale=torch.full(
+            shapes["w2_scale"], 127, dtype=torch.uint8, device="cuda"
+        ),
         activation=activation,
         activation_situ_beta=situ_beta,
         activation_situ_linear_beta=situ_linear_beta,
@@ -504,13 +492,12 @@ def prepare_sigmoid_bias_topk(
     normalize_topk_weights = parameters["normalize_topk_weights"]
 
     load_builtin_kernels()
-    spec = _select_sigmoid_bias_topk(
+    signature = format_signature(router_logits=dense_tensor_format(router_logits_dtype))
+    spec = _selected_spec(
         request,
         platform,
-        router_logits_dtype=router_logits_dtype,
-        tokens=tokens,
-        experts=experts,
-        topk=topk,
+        signature,
+        {"tokens": tokens, "experts": experts, "topk": topk},
     )
     generator = _generator(request.seed)
     router_logits = _randn(
@@ -584,15 +571,6 @@ def prepare_moe_apply(
     block_shape = (
         _parse_block_shape(parameters["fp8_scale_block_shape"])
         if weight_dtype_name == "fp8"
-        else None
-    )
-    mxfp4_group_size = (
-        _implemented_value(
-            "mxfp4_group_size",
-            parameters["mxfp4_group_size"],
-            _IMPLEMENTED_MXFP4_GROUP_SIZES,
-        )
-        if weight_dtype_name == "mxfp4"
         else None
     )
     activation = _implemented_value(
@@ -743,7 +721,6 @@ def prepare_moe_apply(
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size_per_partition=intermediate_size_per_partition,
-            group_size=mxfp4_group_size,
             activation=activation,
             swiglu_limit=swiglu_limit,
             situ_beta=situ_beta,
@@ -802,40 +779,12 @@ def prepare_moe_apply(
             "normalize_topk_weights": normalize_topk_weights,
             "fp8_scale_block_shape": block_shape,
             "mxfp4_group_size": (
-                mxfp4_group_size if weight_dtype_name == "mxfp4" else None
+                _MXFP4_GROUP_SIZE if weight_dtype_name == "mxfp4" else None
             ),
             "topk_generation": "sigmoid_bias_topk",
         },
         validation=None,
     )
-
-
-def _selected_spec(
-    request: BenchmarkRequest,
-    platform: PlatformInfo,
-    signature: str,
-    traits: dict[str, object],
-) -> KernelSpec:
-    try:
-        selected = select_kernel(
-            request.family,
-            request.mode,
-            signature,
-            platform=platform,
-            traits=traits,
-        )
-    except NoKernelFoundError as error:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.NOT_APPLICABLE,
-            str(error),
-        ) from error
-    spec = KernelRegistry.get().get_by_name(selected.name)
-    if spec is None:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.REGISTRATION_MISSING,
-            f"Selected registration {selected.name!r} is not available",
-        )
-    return spec
 
 
 def _packed_projection_weights(
@@ -847,7 +796,7 @@ def _packed_projection_weights(
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     rows = num_experts + latent_size + 2 * shared_size
-    packed = _device_zeros((rows, hidden_size), dtype)
+    packed = torch.zeros((rows, hidden_size), dtype=dtype, device="cuda")
     router_weight = packed.narrow(0, 0, num_experts)
     routed_weight = packed.narrow(0, num_experts, latent_size)
     shared_gate_up_weight = packed.narrow(
@@ -995,11 +944,6 @@ def prepare_latent_expert_shared(
         parameters["router_logits_dtype"],
         _IMPLEMENTED_ROUTER_DTYPES,
     )
-    group_size = _implemented_value(
-        "mxfp4_group_size",
-        parameters["mxfp4_group_size"],
-        _IMPLEMENTED_MXFP4_GROUP_SIZES,
-    )
     situ_beta = float(parameters["activation_situ_beta"])
     linear_beta = parameters["activation_situ_linear_beta"]
     situ_linear_beta = None if linear_beta is None else float(linear_beta)
@@ -1029,7 +973,6 @@ def prepare_latent_expert_shared(
         num_local_experts=num_local_experts,
         hidden_size=latent_size,
         intermediate_size_per_partition=intermediate_size,
-        group_size=group_size,
         activation="situ",
         swiglu_limit=None,
         situ_beta=situ_beta,
@@ -1042,9 +985,11 @@ def prepare_latent_expert_shared(
         generator=generator,
         dtype=input_dtype,
     )
-    shared_weight = _device_zeros((output_size, shared_size), input_dtype)
+    shared_weight = torch.zeros(
+        (output_size, shared_size), dtype=input_dtype, device="cuda"
+    )
     routed_out = torch.empty_like(hidden_states)
-    shared_out = _device_empty((tokens, output_size), input_dtype)
+    shared_out = torch.empty((tokens, output_size), dtype=input_dtype, device="cuda")
     expert_start = ep_rank * num_local_experts
 
     load_builtin_kernels()
@@ -1118,7 +1063,7 @@ def prepare_latent_expert_shared(
             "input_dtype": str(input_dtype).removeprefix("torch."),
             "router_logits_dtype": str(router_logits_dtype).removeprefix("torch."),
             "weight_dtype": "mxfp4",
-            "mxfp4_group_size": group_size,
+            "mxfp4_group_size": _MXFP4_GROUP_SIZE,
             "activation": "situ",
             "activation_situ_beta": situ_beta,
             "activation_situ_linear_beta": situ_linear_beta,

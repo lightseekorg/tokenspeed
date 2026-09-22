@@ -32,6 +32,17 @@ from tokenspeed_kernel.platform import PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 
 
+def _use_cpu_allocations(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("empty", "full", "zeros"):
+        allocation = getattr(torch, name)
+
+        def cpu_allocation(*args, _allocation=allocation, **kwargs):
+            kwargs.pop("device", None)
+            return _allocation(*args, **kwargs)
+
+        monkeypatch.setattr(torch, name, cpu_allocation)
+
+
 def test_moe_fp8_weight_shapes_match_tp_and_ep_layouts() -> None:
     tp_shapes = moe_generator._fp8_weight_shapes(
         num_local_experts=288,
@@ -245,6 +256,7 @@ def test_moe_apply_generator_builds_mxfp4_situ_global_ep_contract(
     )
     KernelRegistry.get().register(spec, lambda **_kwargs: None)
     seen = {}
+    _use_cpu_allocations(monkeypatch)
     monkeypatch.setattr(moe_generator, "load_builtin_kernels", lambda: None)
     monkeypatch.setattr(
         moe_generator,
@@ -255,16 +267,6 @@ def test_moe_apply_generator_builds_mxfp4_situ_global_ep_contract(
         moe_generator,
         "_randn",
         lambda shape, *, generator, dtype: torch.zeros(shape, dtype=dtype),
-    )
-    monkeypatch.setattr(
-        moe_generator,
-        "_device_zeros",
-        lambda shape, dtype: torch.zeros(shape, dtype=dtype),
-    )
-    monkeypatch.setattr(
-        moe_generator,
-        "_device_full",
-        lambda shape, value, dtype: torch.full(shape, value, dtype=dtype),
     )
     monkeypatch.setattr(
         moe_generator,
@@ -320,7 +322,6 @@ def test_moe_apply_generator_builds_mxfp4_situ_global_ep_contract(
                 "input_dtype": "bfloat16",
                 "router_logits_dtype": "float32",
                 "weight_dtype": "mxfp4",
-                "mxfp4_group_size": 32,
                 "activation": "situ",
                 "activation_situ_beta": 4.0,
                 "activation_situ_linear_beta": 25.0,
@@ -350,6 +351,7 @@ def test_moe_apply_generator_builds_mxfp4_situ_global_ep_contract(
     assert seen["plan_kwargs"]["swiglu_form"] is None
     assert seen["plan_kwargs"]["activation_clamped"] is False
     assert seen["plan_kwargs"]["expert_id_repeats"] is False
+    assert prepared.parameters["mxfp4_group_size"] == 32
     assert seen["weight_shapes"] == {
         "w13": (2, 64, 16),
         "w13_scale": (2, 64, 1),
@@ -376,6 +378,7 @@ def test_latent_input_generator_matches_runtime_packed_projection_contract(
         solution="unit",
     )
     seen = {}
+    _use_cpu_allocations(monkeypatch)
     latent_input_ops = importlib.import_module("tokenspeed_kernel.ops.moe.latent_input")
     monkeypatch.setattr(moe_generator, "load_builtin_kernels", lambda: None)
     monkeypatch.setattr(moe_generator, "_selected_spec", lambda *_args: spec)
@@ -388,11 +391,6 @@ def test_latent_input_generator_matches_runtime_packed_projection_contract(
         moe_generator,
         "_randn",
         lambda shape, *, generator, dtype: torch.zeros(shape, dtype=dtype),
-    )
-    monkeypatch.setattr(
-        moe_generator,
-        "_device_zeros",
-        lambda shape, dtype: torch.zeros(shape, dtype=dtype),
     )
 
     def fake_latent_input(
@@ -446,23 +444,13 @@ def test_latent_input_generator_matches_runtime_packed_projection_contract(
 
 
 def test_mxfp4_weight_builder_preserves_swiglu_parameters(monkeypatch) -> None:
-    monkeypatch.setattr(
-        moe_generator,
-        "_device_zeros",
-        lambda shape, dtype: torch.zeros(shape, dtype=dtype),
-    )
-    monkeypatch.setattr(
-        moe_generator,
-        "_device_full",
-        lambda shape, value, dtype: torch.full(shape, value, dtype=dtype),
-    )
+    _use_cpu_allocations(monkeypatch)
 
     weights = moe_generator._make_mxfp4_weights(
         num_experts=8,
         num_local_experts=8,
         hidden_size=32,
         intermediate_size_per_partition=32,
-        group_size=32,
         activation="swiglu",
         swiglu_limit=7.0,
         situ_beta=None,
@@ -526,6 +514,7 @@ def test_latent_expert_shared_generator_uses_global_ep_routes_and_reset(
         solution="unit",
     )
     seen = {}
+    _use_cpu_allocations(monkeypatch)
     latent_decode_ops = importlib.import_module(
         "tokenspeed_kernel.ops.moe.latent_decode"
     )
@@ -540,21 +529,6 @@ def test_latent_expert_shared_generator_uses_global_ep_routes_and_reset(
         moe_generator,
         "_randn",
         lambda shape, *, generator, dtype: torch.zeros(shape, dtype=dtype),
-    )
-    monkeypatch.setattr(
-        moe_generator,
-        "_device_zeros",
-        lambda shape, dtype: torch.zeros(shape, dtype=dtype),
-    )
-    monkeypatch.setattr(
-        moe_generator,
-        "_device_empty",
-        lambda shape, dtype: torch.empty(shape, dtype=dtype),
-    )
-    monkeypatch.setattr(
-        moe_generator,
-        "_device_full",
-        lambda shape, value, dtype: torch.full(shape, value, dtype=dtype),
     )
     monkeypatch.setattr(
         moe_generator,
@@ -593,7 +567,6 @@ def test_latent_expert_shared_generator_uses_global_ep_routes_and_reset(
                 "output_size": 64,
                 "input_dtype": "bfloat16",
                 "router_logits_dtype": "float32",
-                "mxfp4_group_size": 32,
                 "activation_situ_beta": 4.0,
                 "activation_situ_linear_beta": 25.0,
                 "routed_scaling_factor": 1.0,
