@@ -165,6 +165,17 @@ class PrefillCaptureArgsTest(unittest.TestCase):
                     resolve_prefill_capture_batch_sizes(config, 1024), expected
                 )
 
+    def test_dummy_batch_size_is_the_ceil_it_replaced(self):
+        from tokenspeed.runtime.execution.prefill_graph import dummy_batch_size
+
+        for context_len in (0, 1, 7, 1024, 4096):
+            for num_tokens in range(0, 20000, 37):
+                self.assertEqual(
+                    dummy_batch_size(num_tokens, context_len),
+                    -(-num_tokens // max(1, int(context_len))),
+                    (num_tokens, context_len),
+                )
+
 
 class KdaPrefillFallbackTest(unittest.TestCase):
     def test_outer_attention_break_does_not_capture_kda_graphs(self):

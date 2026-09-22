@@ -181,6 +181,14 @@ def _prefill_bucket_step(size: int) -> int:
     return min(largest_pow2, PREFILL_BUCKET_MAX_STEP)
 
 
+def dummy_batch_size(num_tokens: int, context_len: int) -> int:
+    """Minimum request count for a fabricated extend of ``num_tokens`` tokens.
+
+    Each request holds at most ``context_len`` tokens.
+    """
+    return -(-num_tokens // max(1, int(context_len)))
+
+
 def resolve_prefill_capture_batch_sizes(
     config: ModelExecutorConfig, token_bucket: int
 ) -> list[int]:
@@ -192,8 +200,7 @@ def resolve_prefill_capture_batch_sizes(
     empty sequences. Invalid configured counts fail before capture. The result
     is sorted and deduplicated; backend support is checked separately.
     """
-    context = max(1, int(config.context_len))
-    minimum = -(-token_bucket // context)
+    minimum = dummy_batch_size(token_bucket, config.context_len)
     maximum = config.max_num_seqs // config.data_parallel_size
     sizes = config.prefill_graph_capture_batch_sizes
     if sizes is None:
@@ -517,7 +524,7 @@ class PrefillGraph:
                 capture_range.set_description(
                     f"Capturing prefill buckets ({bucket=} {avail_mem=:.2f} GB)"
                 )
-            minimum_bs = -(-bucket // max(1, int(self.config.context_len)))
+            minimum_bs = dummy_batch_size(bucket, self.config.context_len)
             batch_sizes = resolve_prefill_capture_batch_sizes(self.config, bucket)
             self._ctx = self.make_dummy_batch(bucket, minimum_bs)
             self._land_input_embeds(

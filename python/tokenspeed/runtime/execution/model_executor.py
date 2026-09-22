@@ -55,7 +55,7 @@ from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.nan_guard import NanGuard
-from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+from tokenspeed.runtime.execution.prefill_graph import PrefillGraph, dummy_batch_size
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
@@ -649,7 +649,7 @@ class ModelExecutor:
             ib.fill_dummy_decode_buffers(
                 batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
             )
-            bs = -(-num_tokens // max(1, int(self.config.context_len)))
+            bs = dummy_batch_size(num_tokens, self.config.context_len)
             ctx = self.prefill_graph.make_dummy_batch(num_tokens, bs)
             positions = (
                 ib.mrope_positions_buf[:, :num_tokens]
