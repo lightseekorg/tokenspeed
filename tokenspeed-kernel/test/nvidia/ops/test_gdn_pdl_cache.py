@@ -25,18 +25,18 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import cutlass.cute as cute
 import pytest
 import torch
+from tokenspeed_kernel.platform import current_platform
+
+if not current_platform().is_hopper_plus:
+    pytest.skip("PDL requires NVIDIA SM90+", allow_module_level=True)
+
+import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 from flashinfer.jit import env as jit_env
 from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from tokenspeed_kernel.ops.attention.gdn._flashinfer import pdl
-from tokenspeed_kernel.platform import current_platform
-
-pytestmark = pytest.mark.skipif(
-    not current_platform().is_hopper_plus, reason="PDL requires NVIDIA SM90+"
-)
 
 _compile_cache = {}
 _compile_calls = []
