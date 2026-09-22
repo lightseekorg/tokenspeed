@@ -19,7 +19,7 @@
 # SOFTWARE.
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.moe.cuda  # noqa: F401
@@ -48,10 +48,9 @@ __all__ = [
     "latent_moe_input_projections",
     "moe_apply",
     "moe_plan",
-    "pack_topk_router_logits",
     "moe_process_weights",
-    "moe_sigmoid_bias_topk",
-    "moe_softmax_topk",
+    "moe_topk",
+    "pack_topk_router_logits",
 ]
 
 from tokenspeed_kernel.ops.moe.latent_decode import (  # noqa: E402
@@ -63,8 +62,10 @@ from tokenspeed_kernel.ops.moe.latent_input import (  # noqa: E402
 )
 from tokenspeed_kernel.ops.moe.native import native_latent_moe_available  # noqa: E402
 from tokenspeed_kernel.ops.moe.pack_topk import pack_topk_router_logits  # noqa: E402
-from tokenspeed_kernel.ops.moe.sigmoid_topk import moe_sigmoid_bias_topk  # noqa: E402
-from tokenspeed_kernel.ops.moe.softmax_topk import moe_softmax_topk  # noqa: E402
+from tokenspeed_kernel.ops.moe.sigmoid_topk import (  # noqa: E402
+    _moe_sigmoid_bias_topk,
+)
+from tokenspeed_kernel.ops.moe.softmax_topk import _moe_softmax_topk  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -468,6 +469,94 @@ def dsv4_select_experts(
             input_ids,
             need_scores,
         )
+
+
+def moe_topk(
+    router_logits: torch.Tensor,
+    top_k: int,
+    score_function: Literal["softmax", "sigmoid", "sqrt_softplus"],
+    selection_method: Literal["topk", "hash"],
+    renormalize: bool,
+    routed_scaling_factor: float | None,
+    correction_bias: torch.Tensor | None = None,
+    hash_indices_table: torch.Tensor | None = None,
+    input_ids: torch.Tensor | None = None,
+    logical_to_physical_map: torch.Tensor | None = None,
+    topk_indices_dtype: torch.dtype = torch.int32,
+    topk_weights_dtype: torch.dtype = torch.float32,
+    override: str | None = None,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Produce expert weights and ids using a registered MoE TopK kernel."""
+    if selection_method not in {"topk", "hash"}:
+        raise ValueError(f"unsupported MoE selection method: {selection_method!r}")
+    if selection_method == "hash":
+        if correction_bias is not None:
+            raise ValueError("hash selection does not accept correction_bias")
+        if hash_indices_table is None or input_ids is None:
+            raise ValueError("hash selection requires hash_indices_table and input_ids")
+    elif hash_indices_table is not None or input_ids is not None:
+        raise ValueError("hash routing inputs require hash selection")
+    if topk_indices_dtype not in (torch.int32, torch.int64):
+        raise ValueError("topk_indices_dtype must be torch.int32 or torch.int64")
+    if not topk_weights_dtype.is_floating_point:
+        raise ValueError("topk_weights_dtype must be a floating-point dtype")
+
+    scaling_factor = 1.0 if routed_scaling_factor is None else routed_scaling_factor
+    if score_function == "softmax":
+        if selection_method != "topk":
+            raise ValueError("softmax routing only supports topk selection")
+        if correction_bias is not None:
+            raise ValueError("softmax routing does not accept correction_bias")
+        if logical_to_physical_map is not None:
+            raise ValueError("softmax routing does not accept an expert-id map")
+        topk_weights, topk_ids = _moe_softmax_topk(
+            router_logits,
+            top_k,
+            topk_indices_dtype=topk_indices_dtype,
+            renormalize=renormalize,
+            routed_scaling_factor=scaling_factor,
+            override=override,
+            solution=solution,
+        )
+        return topk_weights.to(topk_weights_dtype), topk_ids
+
+    if score_function == "sigmoid":
+        if selection_method != "topk":
+            raise ValueError("sigmoid routing only supports topk selection")
+        if correction_bias is None:
+            raise ValueError("sigmoid routing requires correction_bias")
+        topk_weights, topk_ids = _moe_sigmoid_bias_topk(
+            router_logits,
+            correction_bias,
+            top_k,
+            routed_scaling_factor=scaling_factor,
+            normalize_topk_weights=renormalize,
+            logical_to_physical_map=logical_to_physical_map,
+            weights_dtype=topk_weights_dtype,
+            override=override,
+            solution=solution,
+        )
+        return topk_weights, topk_ids.to(topk_indices_dtype)
+
+    if score_function != "sqrt_softplus":
+        raise ValueError(f"unsupported MoE score function: {score_function!r}")
+    if logical_to_physical_map is not None:
+        raise ValueError("sqrt_softplus routing does not accept an expert-id map")
+    topk_weights, topk_ids, _ = dsv4_select_experts(
+        router_logits,
+        top_k,
+        renormalize,
+        correction_bias=correction_bias,
+        hash_indices_table=hash_indices_table,
+        input_ids=input_ids,
+        need_scores=False,
+        override=override,
+        solution=solution,
+    )
+    if scaling_factor != 1.0:
+        topk_weights = topk_weights * scaling_factor
+    return topk_weights.to(topk_weights_dtype), topk_ids.to(topk_indices_dtype)
 
 
 def _normalize_weight_dtype(weight_dtype: str) -> str:

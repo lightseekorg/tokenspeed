@@ -10,7 +10,9 @@ from tokenspeed_kernel.ops.gemm.kimi3 import (
     _use_gluon_mediumm,
     _use_gluon_smallm,
 )
-from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk
+from tokenspeed_kernel.ops.moe.sigmoid_topk import (
+    _moe_sigmoid_bias_topk as moe_sigmoid_bias_topk,
+)
 from utils import is_cdna4
 
 if not is_cdna4():

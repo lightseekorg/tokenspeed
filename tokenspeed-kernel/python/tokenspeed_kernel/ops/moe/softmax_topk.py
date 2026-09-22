@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Softmax top-k routing entry point."""
+"""Softmax top-k routing implementations and internal dispatch."""
 
 from __future__ import annotations
 
@@ -48,13 +48,14 @@ def _triton_eligible(router_logits: torch.Tensor, topk: int) -> bool:
     )
 
 
-def moe_softmax_topk(
+def _moe_softmax_topk(
     router_logits: torch.Tensor,
     topk: int,
     *,
     topk_indices_dtype: torch.dtype,
     renormalize: bool = True,
     routed_scaling_factor: float = 1.0,
+    override: str | None = None,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select experts using softmax routing in one fused launch when supported.
@@ -68,7 +69,8 @@ def moe_softmax_topk(
         renormalize: Normalize the selected weights to sum to one. When false,
             return probabilities from the softmax over all experts.
         routed_scaling_factor: Scale applied to every selected route weight.
-        solution: Optional implementation override, such as ``"triton"`` or
+        override: Optional exact registered kernel name.
+        solution: Optional implementation solution, such as ``"triton"`` or
             ``"torch"``.
 
     Returns:
@@ -95,10 +97,14 @@ def moe_softmax_topk(
             ),
         )
 
-    if solution is None and not _triton_eligible(router_logits, topk):
+    if (
+        override is None
+        and solution is None
+        and not _triton_eligible(router_logits, topk)
+    ):
         solution = "torch"
     enable_pdl = pdl_enabled()
-    if solution == "torch":
+    if override is None and solution == "torch":
         return torch_softmax_topk(
             router_logits=router_logits,
             topk=topk,
@@ -115,6 +121,7 @@ def moe_softmax_topk(
             router_logits=dense_tensor_format(router_logits.dtype),
         ),
         traits={"tokens": int(tokens), "experts": int(experts), "topk": int(topk)},
+        override=override,
         solution=solution,
     )
     return kernel(
@@ -157,4 +164,4 @@ def torch_softmax_topk(
     return topk_weights, topk_ids.to(topk_indices_dtype)
 
 
-__all__ = ["moe_softmax_topk", "torch_softmax_topk"]
+__all__ = ["torch_softmax_topk"]
