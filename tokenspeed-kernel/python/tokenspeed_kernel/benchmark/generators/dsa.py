@@ -49,11 +49,9 @@ __all__ = [
 
 
 _IMPLEMENTED_DTYPES = {
-    "bf16": torch.bfloat16,
     "bfloat16": torch.bfloat16,
 }
 _IMPLEMENTED_KV_CACHE_DTYPES = {
-    "bf16": torch.bfloat16,
     "bfloat16": torch.bfloat16,
     "float8_e4m3fn": torch.float8_e4m3fn,
 }

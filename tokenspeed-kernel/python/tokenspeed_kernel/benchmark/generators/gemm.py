@@ -62,7 +62,6 @@ __all__ = ["prepare_dense_bmm", "prepare_mxfp8_mm"]
 
 
 _DTYPE_NAMES = {
-    "bf16": torch.bfloat16,
     "bfloat16": torch.bfloat16,
 }
 
