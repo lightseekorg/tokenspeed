@@ -17,7 +17,7 @@
         "family": "moe",
         "mode": "sigmoid_bias_topk",
         "parameters": {
-          "tokens": [1, 2, 4, 8, 16],
+          "tokens": [1, 2, 4, 8, 16, 32, 64],
           "weights_dtype": "float32"
         },
         "cold_cache": true,
@@ -37,7 +37,7 @@
         "family": "moe",
         "mode": "sigmoid_bias_topk",
         "parameters": {
-          "tokens": [64, 128, 256, 512, 1024],
+          "tokens": [128, 256, 512, 1024],
           "weights_dtype": "float32"
         },
         "cold_cache": true,
@@ -77,7 +77,7 @@
         "family": "moe",
         "mode": "apply",
         "parameters": {
-          "tokens": [1, 2, 4, 8, 16],
+          "tokens": [1, 2, 4, 8, 16, 32, 64],
           "hidden_size": 4096,
           "intermediate_size": 2048,
           "num_local_experts": 288,
@@ -112,7 +112,7 @@
         "family": "moe",
         "mode": "apply",
         "parameters": {
-          "tokens": [64, 128, 256, 512, 1024],
+          "tokens": [128, 256, 512, 1024],
           "hidden_size": 4096,
           "intermediate_size": 2048,
           "num_local_experts": 288,
@@ -182,7 +182,7 @@
         "family": "moe",
         "mode": "apply",
         "parameters": {
-          "tokens": [1, 2, 4, 8, 16],
+          "tokens": [1, 2, 4, 8, 16, 32, 64],
           "hidden_size": 4096,
           "intermediate_size": 2048,
           "num_local_experts": 72,
@@ -217,7 +217,7 @@
         "family": "moe",
         "mode": "apply",
         "parameters": {
-          "tokens": [64, 128, 256, 512, 1024],
+          "tokens": [128, 256, 512, 1024],
           "hidden_size": 4096,
           "intermediate_size": 2048,
           "num_local_experts": 72,
