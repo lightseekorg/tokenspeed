@@ -77,8 +77,8 @@ def kda_recurrent_decode_mtp(
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
     traits={
-        "paged_state": frozenset({True}),
         "fused_output_norm": frozenset({False, True}),
+        "paged_state": frozenset({True}),
         "recurrent_layout": frozenset({"v_major"}),
     },
 )
@@ -209,8 +209,8 @@ def _nvidia_fused_verify(
     priority=Priority.SPECIALIZED,
     traits={
         "paged_state": frozenset({True}),
-        "split_producers": frozenset({True}),
         "recurrent_layout": frozenset({"v_major"}),
+        "split_producers": frozenset({True}),
     },
 )
 def triton_nvidia_kda_verify_conv_update(
@@ -249,9 +249,9 @@ def triton_nvidia_kda_verify_conv_update(
     priority=Priority.SPECIALIZED,
     traits={
         "paged_state": frozenset({True}),
-        "store_states": frozenset({True}),
-        "split_producers": frozenset({False}),
         "recurrent_layout": frozenset({"v_major"}),
+        "split_producers": frozenset({False}),
+        "store_states": frozenset({True}),
     },
 )
 def triton_nvidia_kda_fused_paged_verify(
@@ -308,9 +308,9 @@ def triton_nvidia_kda_fused_paged_verify(
     priority=Priority.SPECIALIZED,
     traits={
         "paged_state": frozenset({True}),
-        "store_states": frozenset({False}),
-        "split_producers": frozenset({False}),
         "recurrent_layout": frozenset({"v_major"}),
+        "split_producers": frozenset({False}),
+        "store_states": frozenset({False}),
     },
 )
 def triton_nvidia_kda_fused_paged_verify_no_store(
@@ -369,9 +369,9 @@ def triton_nvidia_kda_fused_paged_verify_no_store(
     priority=Priority.SPECIALIZED + 1,
     traits={
         "paged_state": frozenset({True}),
-        "store_states": frozenset({False}),
-        "split_producers": frozenset({True}),
         "recurrent_layout": frozenset({"v_major"}),
+        "split_producers": frozenset({True}),
+        "store_states": frozenset({False}),
     },
 )
 def triton_nvidia_kda_fused_paged_verify_split(
@@ -575,8 +575,8 @@ def triton_nvidia_kda_replay_commit(
     signatures=_DENSE_BF16_SIGNATURES,
     priority=Priority.SPECIALIZED,
     traits={
-        "flat_state": frozenset({True}),
         "batched_layers": frozenset({True}),
+        "flat_state": frozenset({True}),
         "recurrent_layout": frozenset({"v_major"}),
     },
 )

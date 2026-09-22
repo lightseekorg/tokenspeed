@@ -20,6 +20,8 @@ best people and average people is more than tenfold.
 ## Code changes
 
 * Add tests and update docs for the changed code.
+* For code comments, use common/existing terms for easy human understanding;
+  avoid obsecure terms or coining unnecessary new concepts.
 * Parameters that select execution paths, algorithms, or correctness-critical
   behavior must be explicit and have no defaults. This includes execution modes,
   backend selection, and flags that switch between implementations.
@@ -138,6 +140,8 @@ Inside the root `tokenspeed-kernel/` directory:
   `gemm/trtllm.py`. Attention adds its variant before the solution, for example
   `attention/mha/triton.py`; multi-file implementations keep helpers under a
   private directory such as `attention/mha/_triton/`.
+* For op traits, use existing ones if there are. If needing to create new ones,
+  name it consistently with existing ones.
 * Top-level `README.md` should only contain high-level kernel system designs
   geared for human understanding. For per-op details, use `README.md` files
   under corresponding `ops/` directory.
@@ -159,3 +163,11 @@ Inside the root `tokenspeed-kernel-amd/` directory:
   common platform utilities and reference computations.
 * For per kernel contract and algorithm details, put in
   `python/tokenspeed_kernel_amd/ops/README.md`.
+* For Triton/Gluon kernels, one name should thread the whole stack: the
+  `register_kernel(name=...)` value, the registered Python `def` it decorates,
+  and the `@gluon.jit` (or `@triton.jit`) kernel that does the op's work all
+  share it. The AMD Python launcher should be called as `launch_<name>`.
+  Extra kernels launched only by that op insert a role before the arch suffix
+  (`gluon_mha_decode_reduce_gfx950`). Kernels shared by several registered ops
+  keep descriptive names. A `repr=` on the jit decorator replaces the compiled
+  symbol, so its base string must be the kernel's `def` name as well.

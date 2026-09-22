@@ -2,6 +2,19 @@
 
 ## Kernel Conventions
 
+### Names
+
+Profilers show kernel names after the `def` function `@gluon.jit` attached to,
+so the kernel should carry the `tokenspeed-kernel` registration name verbatim
+(e.g, `gluon_mm_mxfp8_gfx950`), and the Python launcher calling the kernel
+should be named as `launch_<name>` (e.g., `launch_gluon_mm_mxfp8_gfx950`).
+Companion kernels launched only by that op insert a role before the arch suffix
+(e.g., `gluon_dsv4_decode_reduce_gfx1250`, `gluon_mha_prefill_sliding_gfx950`).
+Kernels shared by several registered ops keep descriptive names. A `repr=` on
+the jit decorator replaces the compiled symbol that profilers report, so its
+base string must be the kernel's `def` name as well (the constexpr suffix it
+appends is fine).
+
 ### Barriers
 
 Do not write `gl.barrier()` for shared-memory (LDS) hazards. The Gluon
@@ -34,6 +47,34 @@ read. Removing either rendezvous can potentially increase cross-rank skew and
 regress perf even when the generated kernel remains correct.
 
 ## GEMM
+
+### gfx950 dense BF16 projections
+
+The gfx950 package provides dense BF16 projection kernels, including an
+eight-wave prefill kernel adapted from the gfx950 Gluon tutorials.
+
+#### Contract
+
+- The operation computes `A @ B.T` from K-contiguous BF16 matrices shaped
+  `[M, K]` and `[N, K]`, producing BF16 output.
+- Padded row strides and caller-owned outputs are supported when their inner
+  stride is one. Quantization scales and block sizes are not supported.
+- Automatic selection uses the prefill kernel when `2816 <= M <= 4096`, `M` is
+  divisible by 256, and `(N, K) = (3072, 512)`. Other shapes retain the default
+  PyTorch path. The small- and medium-M kernels remain available for direct use
+  but are not registered for automatic selection.
+
+#### Algorithm
+
+One workgroup computes a `256 x 256` output tile in 64-wide K steps with eight
+wave64s. Four `128 x 128` accumulator quadrants use native BF16 MFMA. The waves
+divide both the global-to-LDS loads and the output quadrants.
+
+Vectorized asynchronous copies stage A and B into padded, double-buffered LDS.
+MFMA work on one buffer overlaps loading the next K tile into the other buffer.
+The epilogue converts each accumulator quadrant to BF16 and stores it with
+vectorized buffer operations. XCD-aware grouped tile ordering distributes
+adjacent output tiles across the eight XCDs.
 
 ### gfx950 MXFP8 projection
 

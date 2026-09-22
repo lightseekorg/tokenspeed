@@ -17,3 +17,20 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
+"""Optional FlashInfer JIT/FFI utilities for TokenSpeed-owned CUDA sources."""
+
+
+def build_cuda_module(name, sources):
+    """Compile and load sources on first use, before CUDA graph capture.
+
+    Args:
+        name: Unique cache/module identifier.
+        sources: Explicit sequence of CUDA source paths.
+
+    Returns:
+        Loaded TVM-FFI module. Missing compiler/dependency errors propagate.
+    """
+    from flashinfer.jit.core import gen_jit_spec
+
+    return gen_jit_spec(name, sources).build_and_load()

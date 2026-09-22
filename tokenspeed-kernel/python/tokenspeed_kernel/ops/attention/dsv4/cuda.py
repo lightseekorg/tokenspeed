@@ -89,8 +89,8 @@ if platform.is_nvidia and has_fused_qnorm_rope_kv_insert():
         ),
         traits={
             "head_dim": frozenset({512}),
-            "rope_dim": frozenset({64}),
             "quant_block_size": frozenset({64}),
+            "rope_dim": frozenset({64}),
             "cache_layout": frozenset({"fp8_swa_page_planar"}),
             "has_q_out": frozenset({True, False}),
         },
@@ -215,14 +215,14 @@ if platform.is_nvidia and platform.is_hopper_plus:
             }
         ),
         traits={
+            "num_q_heads": frozenset({64, 128}),
             "head_dim": frozenset({512}),
-            "num_heads": frozenset({64, 128}),
             "cache_layout": frozenset({"fp8_swa_page_planar"}),
-            "topk_layout": frozenset({"global_slots"}),
-            "support_sink": frozenset({True, False}),
-            "return_lse": frozenset({False, True}),
             "has_extra_segment": frozenset({False, True}),
             "metadata_dtypes": frozenset({torch.int32}),
+            "return_lse": frozenset({False, True}),
+            "sinks": frozenset({True, False}),
+            "topk_layout": frozenset({"global_slots"}),
         },
         priority=Priority.PERFORMANT,
     )
@@ -309,11 +309,11 @@ if platform.is_nvidia and platform.is_hopper_plus:
             }
         ),
         traits={
+            "num_q_heads": frozenset({64, 128}),
             "head_dim": frozenset({512}),
-            "num_heads": frozenset({64, 128}),
             "cache_layout": frozenset({"dense_workspace"}),
-            "support_sink": frozenset({True}),
             "metadata_dtypes": frozenset({torch.int32}),
+            "sinks": frozenset({True}),
         },
         priority=Priority.PERFORMANT,
     )

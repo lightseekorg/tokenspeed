@@ -792,6 +792,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
     assert qsa_table[:, :1].tolist() == [[3], [5]]
     assert recent_table[:, :1].tolist() == [[3], [5]]
     assert selections[0][0][3] is qsa_table
+    assert selections[0][1]["queries_per_request"] is None
     assert torch.equal(selections[0][0][4], stacks.table(FULL_ATTENTION, 2))
     assert prepare_calls[0][1] == {
         "compressed_token_page_size": 256,
@@ -832,9 +833,13 @@ def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
     pool = SimpleNamespace(layerwise_load_tracker=None)
     indexer._fields = lambda pool: (None, torch.empty(0), None)
     indexer._project_qk_raw = lambda hidden: (hidden, hidden[:, None, :])
-    indexer._select_slots = lambda q, *args, **kwargs: torch.zeros(
-        (q.shape[0], 1), dtype=torch.int32
-    )
+    selection_widths = []
+
+    def select(q, *args, **kwargs):
+        selection_widths.append(kwargs["queries_per_request"])
+        return torch.zeros((q.shape[0], 1), dtype=torch.int32)
+
+    indexer._select_slots = select
     draft_scratch = tuple(torch.empty(2) for _ in range(3))
     indexer._draft_scratch_buffers = lambda *args: draft_scratch
     prepared = SimpleNamespace(
@@ -890,7 +895,19 @@ def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
         result = indexer(torch.ones((rows, 4)), torch.arange(rows), ctx)
         assert result.shape == (rows, 1)
 
+    single_request_ctx = ForwardContext(
+        attn_backend=ordinary_backend,
+        token_to_kv_pool=pool,
+        bs=1,
+        num_extends=1,
+        input_num_tokens=8,
+        forward_mode=ForwardMode.EXTEND,
+    )
+    result = indexer(torch.ones((8, 4)), torch.arange(8), single_request_ctx)
+    assert result.shape == (8, 1)
+
     assert verify_calls == [(3, 2), (3, 2), (3, 1)]
+    assert selection_widths == [4, 1, 4, None, 1, 8]
     assert writes[0]["stage_verify_buffers"] is verify_scratch
     assert writes[1]["stage_verify_buffers"] is None
     assert writes[1]["draft_scratch"] is draft_scratch
@@ -1380,6 +1397,7 @@ def test_qwen4_exp_qsa_select_slots_matches_reference() -> None:
         compressed,
         full_page_size=full_page_size,
         complete_blocks=complete.to(torch.int32),
+        queries_per_request=1,
     )
 
     # Only blocks before ``complete_blocks`` hold valid compressed keys, so

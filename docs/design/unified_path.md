@@ -189,6 +189,18 @@ preloads the all-gathered residual before its wait, so that collective must
 not trigger early. FlashInfer adapters preserve the upstream CuTe body and
 keep PDL compilation caches separate.
 
+QSA logits scoring uses the same paged kernel for every query layout. A batch
+whose request lengths are all available on the host may shorten its compressed
+block-table view to the maximum prefix-plus-query length, rounded to the cache
+group's logical block granularity. This changes neither the allocation nor the
+page mapping. Mixed batches with device-only decode lengths, and persistent
+decode views, retain the capacity bound; decode graph shapes stay fixed.
+Uniform query runs may share a K tile, but groups must never cross requests.
+A single-request forward is uniform regardless of its forward mode. Long runs
+use larger query groups; ragged layouts retain independent rows. A score tile
+beyond all of its queries' complete-block frontiers must write `-inf` without
+reading K or executing its dot, including padded graph requests.
+
 ### `for_graph_replay` is for graph-mechanics asymmetries only
 
 `for_graph_replay=True` means a graph is in play — live replay AND the base
@@ -513,6 +525,22 @@ and kernel page size from
 with the existing forward and MTP reuse boundaries. The router clears this
 share before the root prepares its indexer child; the indexer does not clear it again.
 
+QSA block selection carries the same uniform query width from
+`decode_query_lengths` into its kernel API, using `None` for ragged or mixed
+queries. Materialized scoring may group a divisor of that width to share K
+within a request; it must retain each query's complete-block frontier and
+selection. Group size one and larger groups use the same scoring kernel, in
+both eager and captured forwards. Grouping must not be inferred from the total
+row count or page-table batch size for a ragged layout.
+
+Different query groups can produce slightly different FP32 scores because
+their dot/reduction layouts differ; cross-layout bitwise equality is not a
+contract. Tests check each layout against the FP32 reference with
+`rtol=1e-5, atol=1e-4`, and validate selection exactly against that layout's
+own scores and tie-breaking rule. Near-ties may select different block IDs
+across layouts. Graph replay is compared with eager execution of the same
+layout so metadata-refresh checks do not depend on cross-layout rounding.
+
 Qwen4-Exp attention callers pass `topk_indices` explicitly, using `None` for
 dense attention. Sparse QSA requires `save_kv_cache=True` because it always
 writes the full KV cache; the dense fallback honors the caller's flag.
@@ -521,7 +549,8 @@ and KV-recording override, while QSA keeps its original context and narrows
 the selected top-k rows with the queries.
 
 The QSA API preserves `decode_query_lengths`: uniform decode/verification
-uses a positive width, while prefill and mixed/ragged queries use `None`.
+uses a positive width, as does every single-request forward. Multi-request
+prefill and mixed/ragged queries use `None`.
 Only decode may select CuTe; NVIDIA prefill uses FlashInfer FA2, including
 single-token prefill. Adapting ragged rows to one-token queries must retain
 this distinction. Both use the same cache writer and sparse-attention call.
