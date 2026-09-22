@@ -959,7 +959,9 @@ place the four stages appear in order, and a family fills in uniformly named
 seams — `layer_types`, `group_ids`, `fields_for_layer`, `prefix_granularity`,
 `alignment`, `max_padding_fraction`, `packing`, `check_layout`,
 `num_lcm_blocks`, `token_capacity`, `parents_needed`, `workspace_bytes`,
-`pool_options`. `groups()` itself is a seam for the two families whose groups
+`pool_options`, `backends_accept_pool_replacement`, `verify_scratch_in_pool`.
+The last two answer whether this family can be rebound onto a second pool at
+boot; the CUDA-graph memory probe asks them before it binds anything. `groups()` itself is a seam for the two families whose groups
 are not per-layer (Inkling appends conv columns; V4 declares each group
 whole). No family restates the order of the stages, and `_RECIPES`
 (`recipes/setup.py`) is the single family → recipe map.
@@ -1062,9 +1064,13 @@ window the first decode consumes. Under PD the retained tail of the SWA group
 ships to the decode node like any sliding window, draft rows included, and
 the decode node re-feeds nothing.
 
-Capacity has exactly two shapes, both on the base class. The default is the
-flat product (`parents × tightest packing × P`). Families whose per-group
-demand decides the pool — K3's state groups riding inside MLA planes, V4's
+Capacity has three shapes, all on the base class. The default is the flat
+product (`parents × tightest packing × P`). A probe arena is the third and
+narrowest: `probe_batch_rows` says how many requests the CUDA-graph probe
+fabricates, and the pool takes one parent block per fabricated row, floored at
+what a single request needs — it binds before the memory profile has run, so
+it cannot size from a budget at all. Families whose per-group demand decides
+the pool — K3's state groups riding inside MLA planes, V4's
 SWA and compressed chains, GLM-5.3-Flash — size from `parents_needed` and get
 the inverse for free from `_capacity_from_parents`, one monotonic binary
 search shared by all. `parents_needed` itself is not a Python formula: it
@@ -1079,7 +1085,10 @@ C++, and the `Scheduler` bounds single requests against the pool with the
 same model (`docs/design/scheduler.md` §1.4). No recipe restates any of it.
 `scheduler_limits` is the single place a recipe reads the scheduler's
 concurrency, role and reserve widths, so demand and capacity cannot size
-against different numbers.
+against different numbers. Under a probe it reports the probe's fabricated
+batch instead: that arena holds a capture, not requests, and the same
+`probe_batch_rows` feeds both its block floor and this concurrency so the two
+cannot disagree.
 
 The runtime's global `max_num_seqs` is divided across attention DP ranks to
 produce each scheduler's rank-local `max_batch_size`. These values limit

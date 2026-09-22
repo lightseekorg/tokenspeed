@@ -116,12 +116,13 @@ from one first bound to that pool:
   model are the caller's to re-publish, as are the graph owners' own pool
   references and the placeholder tables the decode runner sizes from the
   arena. Of the sequence above only `init_prefill_graph_state` runs inside
-  `capture_graphs()`: `configure_runtime`, `init_cuda_graph_state` and
-  `preallocate_verify_workspace` all ran before the executor was returned,
-  so the orchestrator re-runs them itself.
-* A rebind is an operation between the executor's construction and
-  `ModelExecutor.capture_graphs()`, owned by the orchestrator a later change
-  adds; nothing in the backend tree guards against a rebind at another time.
+  `capture_graphs()`: `configure_runtime` and `init_cuda_graph_state` ran
+  before the executor was returned, so `set_cache_pool` re-publishes them.
+  `preallocate_verify_workspace` is the factory's, re-issued when the rebind
+  rebuilds through it -- a rebind that skipped the factory would strand it.
+* A rebind is an operation between the probe's `capture_graphs()` and the
+  serving one, owned by `reserve_and_rebind`; nothing in the backend tree
+  guards against a rebind at another time.
   That orchestrator releases both graph owners' captures first (the captured
   graphs record the buffers a publish drops, and eager kernels cache
   pointers they allocated inside a capture, such as flashinfer's trtllm-gen
@@ -129,6 +130,22 @@ from one first bound to that pool:
   global workspace pool the executor froze before capturing, rebinds the
   trees, re-runs `bind_cache_groups` and the initialisation sequence above,
   freezes the workspace again and captures again.
+* The KV budget reserves what the graphs will cost: a probe binds the
+  smallest arena the family can run on, captures the largest few entries of
+  each ladder with a driver-memory delta around each capture, extrapolates
+  the rest at the window's positive bytes over every marginal, and reduces
+  the result across ranks with MAX. The orchestrator
+  releases the probe's graphs and collects the cycles they sit in, then
+  rebuilds on the memory profile the probe build took -- where a boot without
+  a reserve takes it -- minus the projection, since the utilization headroom
+  funds activations and fragmentation rather than graph pools. Profiling
+  again after the probe would charge the cache a second time for what tuning
+  and the probe left allocated. The buffers capture allocates
+  around the measured regions are covered, but only because the reserve starts
+  from what the whole probe spent rather than from the sum of the per-entry
+  windows: those bytes are one-time, so capturing more entries does not raise
+  them. Not covered: a ladder every one of whose sampled marginals was served
+  from allocator slack, which is priced at nothing and says so in the log.
 
 ### Padding contract
 
@@ -905,6 +922,10 @@ The same metadata contract controls scan capacity, checkpoint packing and
 output restoration in every case; there is no temporary metadata binding or
 mutable inline flag. Only startup capture retains the metadata's addresses.
 Uncaptured shapes use temporary storage through the same builder.
+Whether a shape can be captured is also asked on its own, through
+`admits_prefill_graph`, which reads no forward context and writes nothing; the
+seam must return the same answer, and startup capture raises when a backend
+admits a shape and then refuses to prepare it.
 
 For retained shapes, the hybrid wrapper can omit the KDA attention break and
 capture neighboring projections, KDA kernels and post-attention compute together.

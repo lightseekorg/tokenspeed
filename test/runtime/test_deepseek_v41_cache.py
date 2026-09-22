@@ -142,6 +142,7 @@ def _recipe(device):
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=256 << 20,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=1,
     )
