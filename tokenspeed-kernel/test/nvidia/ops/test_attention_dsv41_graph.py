@@ -155,12 +155,13 @@ def test_sparse_index_scores_match_the_dense_scorer(blocks, pages, table_width):
         _hopper_index_case(device, tokens, 64, blocks, pages, table_width, 53)
     )
     assert cute_dsl.sparse_index_scores_supported(queries, folded, table, candidates)
-    # The op contract admits noncontiguous table and candidate views; the
-    # scorer compiles compact layouts, so those stay on the dense path.
+    # The op contract admits any table and candidate view. The scorer's
+    # dynamic layouts express a row stride but not a column one, so a view
+    # sliced to fewer columns is served and one striding along the row is not.
     assert not cute_dsl.sparse_index_scores_supported(
         queries, folded, table.repeat(1, 2)[:, ::2], candidates
     )
-    assert not cute_dsl.sparse_index_scores_supported(
+    assert cute_dsl.sparse_index_scores_supported(
         queries, folded, table, candidates.repeat(1, 2)[:, :blocks]
     )
     assert cute_dsl.sparse_index_scores_supported(
@@ -269,7 +270,30 @@ def test_sparse_index_scores_compile_once_across_table_and_pool_widths():
         assert (actual[finite] - expected[finite]).norm() <= 1e-3 * expected[
             finite
         ].norm()
-    # A one-row broadcast table passes is_contiguous() with a zero row stride,
+    # A table sliced to fewer columns keeps its wider row stride; that stride
+    # is a kernel argument, so the view is served by the same kernel.
+    wide = torch.full((3, 2 * table.shape[1]), -1, dtype=torch.int32, device=device)
+    wide[:, : table.shape[1]] = table
+    sliced = wide[:, : table.shape[1]]
+    assert not sliced.is_contiguous()
+    assert cute_dsl.sparse_index_scores_supported(queries, folded, sliced, candidates)
+    torch.testing.assert_close(
+        cute_dsl.sparse_index_scores(
+            queries,
+            folded,
+            values.view(torch.float8_e4m3fn),
+            scales,
+            sliced,
+            visible,
+            candidates,
+            pdl_enabled(),
+        ),
+        actual,
+        rtol=0,
+        atol=0,
+    )
+    assert len(cute_dsl._COMPILED) == compiled_before
+    # A one-row broadcast table has a unit last stride with a zero row stride,
     # which the dynamic layout compiles in as a constant: it is its own
     # variant, not the compact one's binary, and must read the same rows.
     zero_stride = torch.as_strided(table[0], table[:1].shape, (0, 1))

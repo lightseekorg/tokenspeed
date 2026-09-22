@@ -76,6 +76,8 @@ def _to_cute(tensor, dynamic, align):
         )
     elif dynamic == "layout":
         wrapped = wrapped.mark_layout_dynamic(leading_dim=tensor.dim() - 1)
+    elif dynamic != "static":
+        raise ValueError(f"unknown specialisation {dynamic!r}")
     return wrapped
 
 
@@ -85,9 +87,11 @@ def _specialised(tensor, dynamic):
         return (tuple(tensor.shape), tensor.stride())
     if dynamic == "rows":
         return (tuple(tensor.shape[1:]), tensor.stride())
+    if dynamic != "layout":
+        raise ValueError(f"unknown specialisation {dynamic!r}")
     # A dynamic layout still compiles a zero stride in as the constant 0, and
-    # a one-row broadcast view passes is_contiguous(), so the broadcast
-    # pattern is a specialisation even though the stride values are not.
+    # a one-row broadcast view has one with a unit last stride, so the
+    # broadcast pattern is a specialisation even though the stride values are not.
     return (tuple(stride == 0 for stride in tensor.stride()),)
 
 
@@ -109,11 +113,11 @@ def sparse_index_scores_supported(queries, weights, table, candidates) -> bool:
         candidates: ``[tokens, blocks]`` int32 candidate block ids.
 
     Returns:
-        True when the platform is Hopper, the shapes tile evenly, and every
-        per-token tensor is compact. The indexer accepts strided page-table
-        views, which this path cannot express: it hands CuTe a compact
-        symbolic layout so the token count can stay dynamic. The dense scorer
-        honours any layout, so those calls fall back to it.
+        True when the platform is Hopper, the shapes tile evenly, the query
+        tensors are compact and the table and candidates have unit-stride
+        rows. Those two are handed to CuTe with a dynamic layout, so a view
+        sliced to fewer columns is served; a view striding along the row is
+        not, and the dense scorer, which honours any layout, takes it.
     """
     global _SUPPORTED
     if _SUPPORTED is None:
@@ -132,8 +136,8 @@ def sparse_index_scores_supported(queries, weights, table, candidates) -> bool:
         and candidates.shape[1] % _BLOCKS_PER_TILE == 0
         and queries.is_contiguous()
         and weights.is_contiguous()
-        and table.is_contiguous()
-        and candidates.is_contiguous()
+        and table.stride(-1) == 1
+        and candidates.stride(-1) == 1
     )
 
 
