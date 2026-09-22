@@ -90,7 +90,7 @@ def test_index_topk_graph_full_candidates_and_reindex():
             torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
-def _hopper_index_case(device, tokens, blocks, pages, table_width, seed):
+def _hopper_index_case(device, tokens, heads, blocks, pages, table_width, seed):
     """An FP8 index cache, quantized queries and a candidate pool for the Hopper scorers.
 
     The page table is a permutation with a null and an out-of-range page, so a
@@ -113,8 +113,8 @@ def _hopper_index_case(device, tokens, blocks, pages, table_width, seed):
         torch.arange(rows, device=device),
         "index_v4",
     )
-    q = torch.randn((tokens, 64, 128), dtype=torch.bfloat16, device=device)
-    weights = torch.rand((tokens, 64), dtype=torch.float32, device=device)
+    q = torch.randn((tokens, heads, 128), dtype=torch.bfloat16, device=device)
+    weights = torch.rand((tokens, heads), dtype=torch.float32, device=device)
     table = torch.stack(
         [torch.randperm(pages, device=device)[:table_width] for _ in range(tokens)]
     ).to(torch.int32)
@@ -152,7 +152,7 @@ def test_sparse_index_scores_match_the_dense_scorer(blocks, pages, table_width):
     device = torch.device("cuda:0")
     tokens = 5
     cache, _, _, queries, folded, table, visible, candidates, capacity = (
-        _hopper_index_case(device, tokens, blocks, pages, table_width, 53)
+        _hopper_index_case(device, tokens, 64, blocks, pages, table_width, 53)
     )
     assert cute_dsl.sparse_index_scores_supported(queries, folded, table, candidates)
     # The op contract admits noncontiguous table and candidate views; the
@@ -223,11 +223,18 @@ def test_sparse_index_scores_match_the_dense_scorer(blocks, pages, table_width):
 @pytest.mark.parametrize("pages", [256, 255])
 @pytest.mark.parametrize("blocks", [16, 64, 2048])
 def test_sparse_reindex_selects_what_the_dense_score_selects(blocks, pages):
-    """index_topk picks the same rows with the pool scorer on and off.
+    """index_topk picks rows worth the same with the pool scorer on and off.
 
     Existing reindex cases use pools narrower than one gather tile, so they
     never reach the sparse kernel; these widths do, and 2048 blocks give a CTA
     several tiles so the gather pipeline rotates stages and flips parity.
+
+    The two scorers reduce over heads in a different order, so the row ids
+    cannot be required to match: a pair straddling the top-k boundary with
+    near-equal scores can swap. What must hold is that a swap is only ever
+    that -- the row taken is worth what the row dropped was worth, priced by
+    the scorer being reproduced. A scorer reading the wrong keys would trade
+    rows of unrelated value, which is what this checks.
     """
     from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm
 
@@ -235,8 +242,12 @@ def test_sparse_reindex_selects_what_the_dense_score_selects(blocks, pages):
         pytest.skip("requires the Hopper FP8 indexer")
     device = torch.device("cuda:0")
     tokens = 4
-    cache, q, weights, _, _, table, visible, candidates, _ = _hopper_index_case(
-        device, tokens, blocks, pages, pages, 52
+    # 32 heads: ``index_topk`` routes to the Hopper indexer, and so to the
+    # scorer under test, only at that width. A wider query reaches the
+    # portable Triton kernel on both sides of the comparison below, which
+    # would then hold trivially.
+    cache, q, weights, queries, folded, table, visible, candidates, capacity = (
+        _hopper_index_case(device, tokens, 32, blocks, pages, pages, 52)
     )
 
     def select():
@@ -257,13 +268,41 @@ def test_sparse_reindex_selects_what_the_dense_score_selects(blocks, pages):
             None,
         )
 
-    sparse, sparse_lengths = (tensor.clone() for tensor in select()[:2])
+    scored = []
+    unpatched = deep_gemm.sparse_index_scores
+
+    def spy(*args, **kwargs):
+        scored.append(None)
+        return unpatched(*args, **kwargs)
+
+    with patch.object(deep_gemm, "sparse_index_scores", spy):
+        sparse, sparse_lengths = (tensor.clone() for tensor in select()[:2])
+    # Without this the comparison below can pass by running the same kernel
+    # twice, which is what a query width the Hopper indexer refuses does.
+    assert scored, "index_topk did not reach the sparse scorer"
     with patch.object(deep_gemm, "sparse_index_scores_supported", return_value=False):
         dense, dense_lengths = (tensor.clone() for tensor in select()[:2])
-    # The two scorers reduce over heads in a different order, so agreement is
-    # on the selection, which is what the pass exists to produce.
     torch.testing.assert_close(sparse_lengths, dense_lengths, rtol=0, atol=0)
-    torch.testing.assert_close(sparse, dense, rtol=0, atol=0)
+    # Row ``r`` of a query is worth ``logits[query, r]`` to the dense scorer,
+    # which is the selection the pass reproduces.
+    logits = deep_gemm._hopper_paged_scores(
+        (queries,), cache, folded, table, visible, capacity
+    )
+    for query in range(tokens):
+        kept = int(dense_lengths[query])
+        taken = set(sparse[query, :kept].tolist())
+        reference = set(dense[query, :kept].tolist())
+        dropped, gained = sorted(reference - taken), sorted(taken - reference)
+        assert len(dropped) == len(gained)
+        # A boundary swap is rare; a scorer reading the wrong keys would move
+        # far more than this.
+        assert len(dropped) <= max(1, kept // 100)
+        out_price = sorted((logits[query, r].item() for r in dropped), reverse=True)
+        in_price = sorted((logits[query, r].item() for r in gained), reverse=True)
+        for lost, won in zip(out_price, in_price, strict=True):
+            assert abs(lost - won) <= 1e-4 * abs(
+                lost
+            ), f"query {query} traded a row worth {lost} for one worth {won}"
     # Noncontiguous views are part of the op contract: they take the dense
     # path and select the same rows.
     table = torch.stack((table, table), dim=-1).reshape(tokens, -1)[:, ::2]

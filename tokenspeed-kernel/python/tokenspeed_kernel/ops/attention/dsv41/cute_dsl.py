@@ -49,7 +49,7 @@ class _GraphSafeDLPack:
         return self._tensor.__dlpack_device__()
 
 
-def _to_cute(tensor, dynamic_rows, align=16):
+def _to_cute(tensor, dynamic_rows, align):
     """Wrap a torch tensor for CuTe, leaving only the row count dynamic.
 
     Every other extent stays static so the candidate width and table width
@@ -196,39 +196,37 @@ def sparse_index_scores(
     # The cache planes are views of a page-planar field: their rows are dense
     # but the page stride is the field's, so they stay fully static and both
     # their page count and their strides are part of the compile key.
-    args = (
-        _to_cute(queries, True),
-        _to_cute(weights, True),
-        _to_cute(values, False),
-        _to_cute(scales, False),
-        # An int32 row is four bytes wide, so a page table of, say, 255 pages
-        # puts every chunk after the first on a 1020-byte offset. These are
-        # read one element at a time, so four bytes is the honest promise.
-        _to_cute(table, True, align=4),
-        _to_cute(visible, True, align=4),
-        _to_cute(candidates, True, align=4),
-        _to_cute(out, True),
+    # An int32 row is four bytes wide, so a page table of, say, 255 pages puts
+    # every chunk after the first on a 1020-byte offset. The index tensors are
+    # read one element at a time, so four bytes is the honest promise for them.
+    operands = (
+        (queries, True, 16),
+        (weights, True, 16),
+        (values, False, 16),
+        (scales, False, 16),
+        (table, True, 4),
+        (visible, True, 4),
+        (candidates, True, 4),
+        (out, True, 16),
     )
+    args = tuple(_to_cute(*operand) for operand in operands)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     heads = queries.shape[1]
     # The split is a launch parameter, not a compile-time constant, so batch
     # sizes do not multiply the compiled variants.
     split = Int32(_split_k(tokens, blocks // _BLOCKS_PER_TILE))
-    # cute.compile specialises on element type, extent and stride, and the
-    # public entry accepts either integer width for the index tensors, so the
-    # dtypes and the static planes' strides belong in the key rather than
-    # riding on the first caller's choice.
-    key = (
-        heads,
-        bool(enable_pdl),
-        blocks,
-        table.shape[1],
-        values.shape[0],
-        table.dtype,
-        visible.dtype,
-        candidates.dtype,
-        values.stride(),
-        scales.stride(),
+    # cute.compile specialises on element type, extent and stride, so the key
+    # is derived from exactly those rather than listed by hand: a hand-written
+    # key has already been found short twice, and a missing entry silently
+    # hands one caller another's compiled binary. A row count marked dynamic
+    # is a kernel argument rather than a specialisation, so it stays out.
+    key = (bool(enable_pdl),) + tuple(
+        (
+            tensor.dtype,
+            tuple(tensor.shape[1:] if dynamic_rows else tensor.shape),
+            tensor.stride(),
+        )
+        for tensor, dynamic_rows, _ in operands
     )
     compiled = _COMPILED.get(key)
     if compiled is None:
