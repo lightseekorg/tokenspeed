@@ -155,12 +155,13 @@ def test_sparse_index_scores_match_the_dense_scorer(blocks, pages, table_width):
         _hopper_index_case(device, tokens, 64, blocks, pages, table_width, 53)
     )
     assert cute_dsl.sparse_index_scores_supported(queries, folded, table, candidates)
-    # The op contract admits noncontiguous table and candidate views; the
-    # scorer compiles compact layouts, so those stay on the dense path.
+    # The op contract admits any table and candidate view. The scorer's
+    # dynamic layouts express a row stride but not a column one, so a view
+    # sliced to fewer columns is served and one striding along the row is not.
     assert not cute_dsl.sparse_index_scores_supported(
         queries, folded, table.repeat(1, 2)[:, ::2], candidates
     )
-    assert not cute_dsl.sparse_index_scores_supported(
+    assert cute_dsl.sparse_index_scores_supported(
         queries, folded, table, candidates.repeat(1, 2)[:, :blocks]
     )
     assert cute_dsl.sparse_index_scores_supported(
@@ -216,6 +217,104 @@ def test_sparse_index_scores_match_the_dense_scorer(blocks, pages, table_width):
             candidates[:, :8],
             pdl_enabled(),
         )
+
+
+def test_sparse_index_scores_compile_once_across_table_and_pool_widths():
+    """One compiled kernel serves every table width and candidate width.
+
+    Prefill slices the page table to the visible history, so its width grows
+    with every chunk and the candidate width follows it on short contexts. A
+    kernel specialised on either would recompile per chunk, which is the
+    stall this guards against: after the first launch, further widths must
+    hit the cache and still match the dense scorer.
+    """
+    from tokenspeed_kernel.ops.attention.dsv41 import cute_dsl, deep_gemm
+    from tokenspeed_kernel.ops.attention.dsv41.triton import candidate_scores
+    from tokenspeed_kernel.platform import pdl_enabled
+
+    if not deep_gemm.is_hopper_indexer_available():
+        pytest.skip("requires the Hopper FP8 indexer")
+    device = torch.device("cuda:0")
+    pages = 300
+    shapes = [(16, 64), (48, 32), (2048, 256), (2048, 128), (64, 300)]
+    compiled_before = None
+    for blocks, table_width in shapes:
+        cache, _, _, queries, folded, table, visible, candidates, capacity = (
+            _hopper_index_case(device, 3, 64, blocks, pages, table_width, 7)
+        )
+        values, scales = deep_gemm._index_planes(cache)
+        actual = cute_dsl.sparse_index_scores(
+            queries,
+            folded,
+            values.view(torch.float8_e4m3fn),
+            scales,
+            table,
+            visible,
+            candidates,
+            pdl_enabled(),
+        )
+        if compiled_before is None:
+            compiled_before = len(cute_dsl._COMPILED)
+        else:
+            assert (
+                len(cute_dsl._COMPILED) == compiled_before
+            ), f"table width {table_width} / {blocks} blocks recompiled"
+        logits = deep_gemm._hopper_paged_scores(
+            (queries,), cache, folded, table, visible, capacity
+        )
+        expected = candidate_scores(logits, candidates)
+        torch.testing.assert_close(
+            torch.isinf(actual), torch.isinf(expected), rtol=0, atol=0
+        )
+        finite = ~torch.isinf(expected)
+        assert (actual[finite] - expected[finite]).norm() <= 1e-3 * expected[
+            finite
+        ].norm()
+    # A table sliced to fewer columns keeps its wider row stride; that stride
+    # is a kernel argument, so the view is served by the same kernel.
+    wide = torch.full((3, 2 * table.shape[1]), -1, dtype=torch.int32, device=device)
+    wide[:, : table.shape[1]] = table
+    sliced = wide[:, : table.shape[1]]
+    assert not sliced.is_contiguous()
+    assert cute_dsl.sparse_index_scores_supported(queries, folded, sliced, candidates)
+    torch.testing.assert_close(
+        cute_dsl.sparse_index_scores(
+            queries,
+            folded,
+            values.view(torch.float8_e4m3fn),
+            scales,
+            sliced,
+            visible,
+            candidates,
+            pdl_enabled(),
+        ),
+        actual,
+        rtol=0,
+        atol=0,
+    )
+    assert len(cute_dsl._COMPILED) == compiled_before
+    # A one-row broadcast table has a unit last stride with a zero row stride,
+    # which the dynamic layout compiles in as a constant: it is its own
+    # variant, not the compact one's binary, and must read the same rows.
+    zero_stride = torch.as_strided(table[0], table[:1].shape, (0, 1))
+
+    def one_row(page_table):
+        return cute_dsl.sparse_index_scores(
+            queries[:1],
+            folded[:1],
+            values.view(torch.float8_e4m3fn),
+            scales,
+            page_table,
+            visible[:1],
+            candidates[:1],
+            pdl_enabled(),
+        )
+
+    compact = one_row(table[:1])
+    assert len(cute_dsl._COMPILED) == compiled_before
+    broadcast = one_row(zero_stride)
+    assert len(cute_dsl._COMPILED) == compiled_before + 1
+    torch.testing.assert_close(broadcast, compact, rtol=0, atol=0)
 
 
 # 255 pages make an int32 table row 1020 bytes, so every chunk after the first

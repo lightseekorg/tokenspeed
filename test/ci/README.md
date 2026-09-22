@@ -541,6 +541,10 @@ worktree. The original checkout is not modified, and submitted jobs use an
 immutable archive of that merged commit. A merge conflict stops before any job
 is submitted.
 
+Concurrent submissions publish each commit's snapshot without replacing an
+existing archive. Reuse requires byte-for-byte agreement with a fresh Git
+archive; a mismatched snapshot fails submission and is left unchanged.
+
 `--source-pr` accepts the same values but only labels the report; it neither
 fetches nor merges, and is for callers that already checked out the pull
 request's merge commit.
