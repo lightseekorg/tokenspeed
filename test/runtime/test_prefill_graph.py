@@ -1276,6 +1276,7 @@ class PrefillRoleGraphsTest(unittest.TestCase):
             disable_cuda_graph_padding=False,
             max_cudagraph_capture_size=4,
             model_is_mrope=False,
+            autotune_cache_key=None,
             prefill_only=prefill_only,
             prefill_graph_capture_batch_sizes=None,
             prefill_graph_max_tokens=256,

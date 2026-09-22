@@ -264,3 +264,57 @@ def test_default_cache_directory_is_flashinfer_autotune(monkeypatch, tmp_path):
     path = autotune_cache_path({"model": "model-a"})
     assert Path(path).parent.parent == tmp_path / "tokenspeed" / "flashinfer-autotune"
     assert Path(path).name == "autotune_configs.json"
+
+
+@pytest.mark.parametrize(
+    "rank,local_payload",
+    [(None, b"tactics"), (0, b"tactics"), (1, b"tactics"), (1, b"stale"), (1, None)],
+)
+def test_read_only_cache_load_does_not_rewrite_files(
+    monkeypatch, tmp_path, rank, local_payload
+):
+    tuner, _ = _install_fake_flashinfer(monkeypatch, metadata={})
+    directory = tmp_path / "read-only"
+    directory.mkdir()
+    path = directory / "configs.json"
+    if local_payload is not None:
+        path.write_bytes(local_payload)
+        path.chmod(0o444)
+    directory.chmod(0o555)
+    installer = Mock(side_effect=AssertionError("loading must not rewrite the cache"))
+    monkeypatch.setattr(tuning, "_install_autotune_cache_bytes", installer)
+    loader = Mock(wraps=tuner.load_configs)
+    monkeypatch.setattr(tuner, "load_configs", loader)
+    group = None if rank is None else object()
+    if group is not None:
+        monkeypatch.setattr(tuning.dist, "get_rank", lambda: rank)
+        monkeypatch.setattr(tuning.dist, "get_world_size", lambda group: 2)
+
+        def broadcast(payload_box, *, src, group):
+            assert src == 0
+            assert payload_box == ([b"tactics"] if rank == 0 else [None])
+            payload_box[0] = b"tactics"
+
+        def gather(states, loaded, *, group):
+            states[:] = [loaded, loaded]
+
+        monkeypatch.setattr(tuning.dist, "broadcast_object_list", broadcast)
+        monkeypatch.setattr(tuning.dist, "all_gather_object", gather)
+    try:
+        assert load_autotune_cache(str(path), group, 0)
+        assert tuner.active
+        installer.assert_not_called()
+        loaded_path = Path(loader.call_args.args[0])
+        if rank in (None, 0):
+            assert loaded_path == path
+        else:
+            assert loaded_path != path
+            assert not loaded_path.exists()
+        if local_payload is None:
+            assert not path.exists()
+        else:
+            assert path.read_bytes() == local_payload
+    finally:
+        directory.chmod(0o755)
+        if path.exists():
+            path.chmod(0o644)

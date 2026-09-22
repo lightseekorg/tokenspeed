@@ -257,7 +257,7 @@ def load_autotune_cache(
     process_group: dist.ProcessGroup | None,
     owner_rank: int,
 ) -> bool:
-    """Mirror the owner's cache and load it consistently across ranks.
+    """Load the owner's cache consistently without rewriting existing files.
 
     Args:
         path: Local cache filename, or None to start without a cache.
@@ -280,16 +280,28 @@ def load_autotune_cache(
     loaded = False
     if path is not None:
         payload = None
-        if process_group is None or dist.get_rank() == owner_rank:
+        is_owner = process_group is None or dist.get_rank() == owner_rank
+        if is_owner:
             try:
                 payload = Path(path).read_bytes()
             except FileNotFoundError:
                 pass
             except OSError:
                 logger.warning(f"Could not read FlashInfer cache {path}", exc_info=True)
-        if _mirror_autotune_cache(path, payload, process_group, owner_rank):
+        if process_group is not None:
+            payload_box = [payload]
+            dist.broadcast_object_list(payload_box, src=owner_rank, group=process_group)
+            payload = payload_box[0]
+        if payload is not None:
             try:
-                loaded = bool(tuner.load_configs(path))
+                if is_owner:
+                    loaded = bool(tuner.load_configs(path))
+                else:
+                    # A peer's persistent cache directory may also be read-only.
+                    with tempfile.NamedTemporaryFile() as tmp:
+                        tmp.write(payload)
+                        tmp.flush()
+                        loaded = bool(tuner.load_configs(tmp.name))
             except Exception:
                 logger.warning(f"Could not load FlashInfer cache {path}", exc_info=True)
     if process_group is not None:
