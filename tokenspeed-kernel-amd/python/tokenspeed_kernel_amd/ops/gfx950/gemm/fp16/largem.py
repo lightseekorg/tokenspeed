@@ -49,6 +49,18 @@ LARGEM_MIN_K = 4 * LARGEM_BLOCK_K
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 
 
+def _dense16_mm_launch_metadata(grid, kernel, args):
+    """Report logical GEMM work and tensor traffic to Proton."""
+    m, n, k = args["M"], args["N"], args["K"]
+    return {
+        "name": kernel.name,
+        "flops16": 2 * m * n * k,
+        "bytes": m * k * args["a_ptr"].element_size()
+        + n * k * args["b_ptr"].element_size()
+        + m * n * args["c_ptr"].element_size(),
+    }
+
+
 @gluon.jit
 def _largem_get_pids(
     M,
@@ -92,8 +104,8 @@ def _largem_get_pids(
     return pid_m, pid_n
 
 
-@gluon.jit
-def _mfma_lds_largem_kernel(
+@gluon.jit(launch_metadata=_dense16_mm_launch_metadata)
+def gluon_mm_a16w16_prefill_gfx950(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -422,7 +434,7 @@ def _resolve_largem_output(
     return out
 
 
-def gluon_mm_a16w16_largem_gfx950(
+def launch_gluon_mm_a16w16_prefill_gfx950(
     A: torch.Tensor,
     B: torch.Tensor,
     out_dtype: torch.dtype,
@@ -449,7 +461,7 @@ def gluon_mm_a16w16_largem_gfx950(
     grid_m = triton.cdiv(M, LARGEM_BLOCK_M)
     grid_n = triton.cdiv(N, LARGEM_BLOCK_N)
     grid_mn = grid_m * grid_n
-    _mfma_lds_largem_kernel[(grid_mn,)](
+    gluon_mm_a16w16_prefill_gfx950[(grid_mn,)](
         A,
         B,
         C,

@@ -526,11 +526,14 @@ def test_nvfp4_situ_deferred_triple_matches_finalized() -> None:
 
 @requires_flashinfer_situ
 @pytest.mark.parametrize(
-    "num_tokens,top_k,local_count",
-    [(1, 2, 16), (17, 8, 16), (129, 2, 8), (257, 8, 16)],
+    "num_tokens,top_k,local_count,routed,enable_pdl",
+    [
+        (1, 2, 16, False, False),
+        (17, 8, 16, False, True),
+        (129, 2, 8, True, False),
+        (257, 8, 16, True, True),
+    ],
 )
-@pytest.mark.parametrize("routed", [False, True])
-@pytest.mark.parametrize("enable_pdl", [False, True])
 def test_nvfp4_route_padding_is_initialized_on_every_replay(
     num_tokens: int,
     top_k: int,

@@ -50,6 +50,9 @@ _FP8_BLOCK_SCALE = ScaleFormat(
 )
 
 if current_platform().is_amd:
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
+        launch_gluon_mm_a16w16_prefill_gfx950 as _mm_a16w16_prefill_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
         launch_gluon_bmm_a16w16_gfx950 as _bmm_a16w16_impl,
     )
@@ -71,6 +74,68 @@ if current_platform().is_amd:
         _linear_attnres_partials_impl = None
     else:
         _IMPORT_ERROR_MESSAGE = None
+
+    _GFX950_CAPABILITY = CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+        vendors=frozenset({"amd"}),
+    )
+    _DENSE16_SIGNATURES = frozenset(
+        {
+            format_signature(
+                a=dense_tensor_format(torch.bfloat16),
+                b=dense_tensor_format(torch.bfloat16),
+            )
+        }
+    )
+
+    # Cold-cache rocprof measurements on MI350X identify one contiguous prefill
+    # range. Shapes outside it keep the PyTorch/rocBLAS path.
+    def _is_dense16_prefill_problem(m: int, n: int, k: int) -> bool:
+        return 2816 <= m <= 4096 and m % 256 == 0 and n == 3072 and k == 512
+
+    def _validate_dense16_mm_arguments(
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        block_size: list[int] | None,
+    ) -> None:
+        if A_scales is not None or B_scales is not None:
+            raise ValueError("dense16 Gluon MM does not accept quantization scales")
+        if block_size is not None:
+            raise ValueError("dense16 Gluon MM does not accept block_size")
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="gluon_mm_a16w16_prefill_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=_DENSE16_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={
+            "mnk_problem_filter": frozenset({_is_dense16_prefill_problem}),
+            "a_inner_stride_one": frozenset({True}),
+            "b_inner_stride_one": frozenset({True}),
+            "out_dtype": frozenset({torch.bfloat16}),
+        },
+    )
+    def gluon_mm_a16w16_prefill_gfx950(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None,
+        block_size: list[int] | None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Dispatch measured Kimi shared-projection prefills to the large kernel."""
+        _validate_dense16_mm_arguments(A_scales, B_scales, block_size)
+        output = _mm_a16w16_prefill_impl(A, B, out_dtype, alpha=alpha, out=out)
+        if output is None:
+            raise RuntimeError("registered gfx950 prefill shape was rejected")
+        return output
 
     _MXFP8_SIGNATURES = frozenset(
         {
@@ -94,11 +159,7 @@ if current_platform().is_amd:
         "mm",
         name="gluon_mm_mxfp8_gfx950",
         solution="gluon",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 5),
-            max_arch_version=ArchVersion(9, 5),
-            vendors=frozenset({"amd"}),
-        ),
+        capability=_GFX950_CAPABILITY,
         signatures=_MXFP8_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
@@ -142,19 +203,8 @@ if current_platform().is_amd:
         "bmm",
         name="gluon_bmm_a16w16_gfx950",
         solution="gluon",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 5),
-            max_arch_version=ArchVersion(9, 5),
-            vendors=frozenset({"amd"}),
-        ),
-        signatures=frozenset(
-            {
-                format_signature(
-                    a=dense_tensor_format(torch.bfloat16),
-                    b=dense_tensor_format(torch.bfloat16),
-                ),
-            }
-        ),
+        capability=_GFX950_CAPABILITY,
+        signatures=_DENSE16_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
             "batch": frozenset({12, 16}),
@@ -402,11 +452,7 @@ if current_platform().is_amd:
             "linear_attnres_partials",
             name="gluon_linear_attnres_partials_gfx950",
             solution="gluon",
-            capability=CapabilityRequirement(
-                min_arch_version=ArchVersion(9, 5),
-                max_arch_version=ArchVersion(9, 5),
-                vendors=frozenset({"amd"}),
-            ),
+            capability=_GFX950_CAPABILITY,
             signatures=frozenset(
                 {
                     format_signature(
@@ -441,6 +487,11 @@ if current_platform().is_amd:
 
 else:
 
+    def gluon_mm_a16w16_prefill_gfx950(**kwargs):
+        raise ImportError(
+            "gluon_mm_a16w16_prefill_gfx950 requires tokenspeed-kernel-amd"
+        )
+
     def gluon_mm_mxfp8_gfx950(**kwargs):
         raise ImportError("gluon_mm_mxfp8_gfx950 requires tokenspeed-kernel-amd")
 
@@ -462,6 +513,7 @@ else:
 
 
 __all__ = [
+    "gluon_mm_a16w16_prefill_gfx950",
     "gluon_mm_mxfp8_gfx950",
     "gluon_mm_fp8_blockscale_gfx1250",
     "gluon_mm_mxfp8_ue8m0_gfx1250",

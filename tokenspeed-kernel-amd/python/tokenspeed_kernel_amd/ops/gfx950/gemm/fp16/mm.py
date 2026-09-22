@@ -30,8 +30,9 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
+    _dense16_mm_launch_metadata,
     _supports_largem_shape,
-    gluon_mm_a16w16_largem_gfx950,
+    launch_gluon_mm_a16w16_prefill_gfx950,
 )
 
 cdna4 = gl.amd.cdna4
@@ -56,6 +57,60 @@ LARGEM_DISPATCH_MIN_M = 2048
 
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 _partial_cache: dict[tuple[int, int, int, int, int], torch.Tensor] = {}
+
+
+def _dense16_bmm_launch_metadata(grid, kernel, args):
+    """Report the fixed-M=1 batched GEMM work and tensor traffic."""
+    n, k = args["N"], args["K"]
+    batch = grid[0] * args["BLOCK_N"] // n
+    return {
+        "name": kernel.name,
+        "flops16": 2 * batch * n * k,
+        "bytes": batch * k * args["a_ptr"].element_size()
+        + batch * n * k * args["b_ptr"].element_size()
+        + batch * n * args["output_ptr"].element_size(),
+    }
+
+
+def _dense16_splitk_launch_metadata(grid, kernel, args):
+    """Report split-K producer work, including FP32 partial traffic."""
+    m, n = args["M"], args["N"]
+    split_k = args["SPLIT_K"]
+    k = args["K_TILES_PER_SPLIT"] * args["BLOCK_K"] * split_k
+    partial_values = n * args["PARTIAL_M"] * split_k
+    return {
+        "name": kernel.name,
+        "flops16": 2 * m * n * k,
+        "bytes": m * k * args["a_ptr"].element_size()
+        + n * k * args["b_ptr"].element_size()
+        + partial_values * args["partial_ptr"].element_size(),
+    }
+
+
+def _dense16_splitk_reduce_launch_metadata(grid, kernel, args):
+    """Report FP32 partial reduction work and traffic to Proton."""
+    n = grid[0] * args["BLOCK_N"]
+    output_values = args["OUTPUT_M"] * n
+    reduced_values = args["REDUCE_M"] * n
+    split_k = args["SPLIT_K"]
+    return {
+        "name": kernel.name,
+        "flops32": reduced_values * (split_k - 1),
+        "bytes": args["REDUCE_M"] * n * split_k * args["partial_ptr"].element_size()
+        + output_values * args["c_ptr"].element_size(),
+    }
+
+
+def _dense16_mediumm_launch_metadata(grid, kernel, args):
+    """Report tiled GEMM work and optional dual-addend traffic."""
+    metadata = _dense16_mm_launch_metadata(grid, kernel, args)
+    if args["ADD3"]:
+        values = args["M"] * args["N"]
+        metadata["flops32"] = 2 * values
+        metadata["bytes"] += values * (
+            args["addend_a_ptr"].element_size() + args["addend_b_ptr"].element_size()
+        )
+    return metadata
 
 
 @gluon.jit
@@ -346,8 +401,8 @@ def _mfma_lds_shared_layout_b(dot_layout_b, block_n: int, block_k: int, dtype):
     return _mfma_lds_manual_shared_layout_b(block_n, block_k)
 
 
-@gluon.jit
-def _warp_reduce_smallm_kernel(
+@gluon.jit(launch_metadata=_dense16_mm_launch_metadata)
+def gluon_mm_a16w16_warp_gfx950(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -410,7 +465,7 @@ def _warp_reduce_smallm_kernel(
     )
 
 
-@gluon.jit
+@gluon.jit(launch_metadata=_dense16_bmm_launch_metadata)
 def gluon_bmm_a16w16_gfx950(
     a_ptr,
     b_ptr,
@@ -462,8 +517,8 @@ def gluon_bmm_a16w16_gfx950(
     )
 
 
-@gluon.jit
-def _mfma_lds_smallm_splitk_kernel(
+@gluon.jit(launch_metadata=_dense16_splitk_launch_metadata)
+def gluon_mm_a16w16_splitk_gfx950(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -667,14 +722,15 @@ def _mfma_lds_smallm_splitk_kernel(
         work_id += NUM_PROGRAMS
 
 
-@gluon.jit
-def _mfma_lds_smallm_reduce_kernel(
+@gluon.jit(launch_metadata=_dense16_splitk_reduce_launch_metadata)
+def gluon_mm_a16w16_splitk_reduce_gfx950(
     partial_ptr,
     c_ptr,
     stride_cm,
     stride_cn,
     BLOCK_N: gl.constexpr,
     REDUCE_M: gl.constexpr,
+    OUTPUT_M: gl.constexpr,
     SPLIT_K: gl.constexpr,
 ):
     """Partial-sum reducer for small-M split-K dense16 partials."""
@@ -707,11 +763,12 @@ def _mfma_lds_smallm_reduce_kernel(
         ptr=c_base,
         offsets=c_offsets,
         stored_value=reduced.to(c_ptr.dtype.element_ty),
+        mask=offs_m[:, None] < OUTPUT_M,
     )
 
 
-@gluon.jit
-def _mfma_lds_mediumm_kernel(
+@gluon.jit(launch_metadata=_dense16_mediumm_launch_metadata)
+def gluon_mm_a16w16_medium_gfx950(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -1251,7 +1308,7 @@ def _use_mfma_lds_largem(M: int, N: int, K: int) -> bool:
     return M >= LARGEM_DISPATCH_MIN_M and _supports_largem_shape(M, N, K)
 
 
-def gluon_mm_a16w16_warp_reduce_smallm_gfx950(
+def launch_gluon_mm_a16w16_warp_gfx950(
     A: torch.Tensor,
     B: torch.Tensor,
     out_dtype: torch.dtype,
@@ -1299,7 +1356,7 @@ def gluon_mm_a16w16_warp_reduce_smallm_gfx950(
     C = _resolve_output(A, (M, N), out_dtype, out, "small-M dense16 warp-reduce GEMM")
     total_outputs = M * N
     grid = (triton.cdiv(total_outputs, WARP_REDUCE_OUTPUTS),)
-    _warp_reduce_smallm_kernel[grid](
+    gluon_mm_a16w16_warp_gfx950[grid](
         A,
         B,
         C,
@@ -1381,7 +1438,7 @@ def launch_gluon_bmm_a16w16_gfx950(
     return C
 
 
-def gluon_mm_a16w16_mfma_lds_smallm_gfx950(
+def launch_gluon_mm_a16w16_splitk_gfx950(
     A: torch.Tensor,
     B: torch.Tensor,
     out_dtype: torch.dtype,
@@ -1436,13 +1493,7 @@ def gluon_mm_a16w16_mfma_lds_smallm_gfx950(
             f"got M={M}, N={N}, K={K}"
         )
 
-    if out is not None:
-        _resolve_output(A, (M, N), out_dtype, out, "small-M dense16 MFMA LDS GEMM")
-    if out is not None and M == MFMA_LDS_REDUCE_M:
-        C = out
-    else:
-        C_full = torch.empty((MFMA_LDS_REDUCE_M, N), device=A.device, dtype=out_dtype)
-        C = C_full[:M, :]
+    C = _resolve_output(A, (M, N), out_dtype, out, "small-M dense16 MFMA LDS GEMM")
     split_k = _choose_mfma_lds_split_k(K)
     num_n_tiles = triton.cdiv(N, MFMA_LDS_BLOCK_N)
     total_work = num_n_tiles * split_k
@@ -1453,7 +1504,7 @@ def gluon_mm_a16w16_mfma_lds_smallm_gfx950(
     )
     k_tiles_per_split = (K // MFMA_LDS_BLOCK_K) // split_k
 
-    _mfma_lds_smallm_splitk_kernel[(grid,)](
+    gluon_mm_a16w16_splitk_gfx950[(grid,)](
         A,
         B,
         C,
@@ -1476,13 +1527,14 @@ def gluon_mm_a16w16_mfma_lds_smallm_gfx950(
         num_warps=MFMA_LDS_NUM_WARPS,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
-    _mfma_lds_smallm_reduce_kernel[(num_n_tiles,)](
+    gluon_mm_a16w16_splitk_reduce_gfx950[(num_n_tiles,)](
         partial,
         C,
         C.stride(0),
         C.stride(1),
         BLOCK_N=MFMA_LDS_BLOCK_N,
         REDUCE_M=MFMA_LDS_REDUCE_M,
+        OUTPUT_M=M,
         SPLIT_K=split_k,
         num_warps=MFMA_LDS_NUM_WARPS,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
@@ -1490,13 +1542,10 @@ def gluon_mm_a16w16_mfma_lds_smallm_gfx950(
 
     if alpha is not None:
         C.mul_(alpha.to(device=C.device, dtype=C.dtype))
-    if out is not None and C is not out:
-        out.copy_(C)
-        return out
     return C
 
 
-def gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
+def launch_gluon_mm_a16w16_medium_gfx950(
     A: torch.Tensor,
     B: torch.Tensor,
     out_dtype: torch.dtype,
@@ -1549,7 +1598,7 @@ def gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
     block_m, block_n, block_k, warps_m, warps_n, num_buffers = config
     C = _resolve_output(A, (M, N), out_dtype, out, "medium-M dense16 MFMA LDS GEMM")
     grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n),)
-    _mfma_lds_mediumm_kernel[grid](
+    gluon_mm_a16w16_medium_gfx950[grid](
         A,
         B,
         C,
@@ -1619,7 +1668,7 @@ def gluon_mm_a16w16_add3_m16_gfx950(
     block_m, block_n, block_k = 16, 32, 128
     warps_m, warps_n, num_buffers = 2, 2, 3
     grid = (triton.cdiv(7168, block_n),)
-    _mfma_lds_mediumm_kernel[grid](
+    gluon_mm_a16w16_medium_gfx950[grid](
         A,
         B,
         C,
@@ -1697,7 +1746,7 @@ def gluon_mm_a16w16_gfx950(
         return None
 
     if _use_mfma_lds_largem(M, N, K):
-        return gluon_mm_a16w16_largem_gfx950(
+        return launch_gluon_mm_a16w16_prefill_gfx950(
             A,
             B,
             out_dtype,
@@ -1708,7 +1757,7 @@ def gluon_mm_a16w16_gfx950(
         return None
 
     if _use_warp_reduce_smallm(M, N, K):
-        return gluon_mm_a16w16_warp_reduce_smallm_gfx950(
+        return launch_gluon_mm_a16w16_warp_gfx950(
             A,
             B,
             out_dtype,
@@ -1716,7 +1765,7 @@ def gluon_mm_a16w16_gfx950(
             out=out,
         )
     if _use_mfma_lds_smallm(M, N, K):
-        return gluon_mm_a16w16_mfma_lds_smallm_gfx950(
+        return launch_gluon_mm_a16w16_splitk_gfx950(
             A,
             B,
             out_dtype,
@@ -1724,7 +1773,7 @@ def gluon_mm_a16w16_gfx950(
             out=out,
         )
     if _use_mfma_lds_mediumm(M, N, K):
-        return gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
+        return launch_gluon_mm_a16w16_medium_gfx950(
             A,
             B,
             out_dtype,

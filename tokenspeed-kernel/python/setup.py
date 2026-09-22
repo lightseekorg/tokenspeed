@@ -1031,6 +1031,7 @@ setup(
     install_requires=_selected_install_requires(),
     packages=find_packages(),
     package_data={
+        "tokenspeed_kernel.ops.communication": ["_cuda/*.cu", "README.md"],
         "tokenspeed_kernel.thirdparty.cuda": ["objs/**/*.so"],
         # Vendored MiniMax MSA CuTe sources: cute/ has no __init__.py (it is
         # loaded via the upstream sys.path bootstrap), so ship it as data.
