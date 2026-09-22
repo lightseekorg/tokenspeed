@@ -900,18 +900,20 @@ void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, Blo
                                       access_epoch, completed.boundary_kind, completed.stream_completed_to_host);
         return;
     }
-    // A non-closed group publishes, per resumable boundary, the pages needed
-    // to resume from it: the trailing window, or one snapshot slot for state.
-    // A sliding window resumes from the newest hashed boundary. A state
-    // snapshot exists only where a forward stopped -- prefill writes its
-    // latest internal aligned checkpoint, decode commits its accepted
-    // endpoint -- so never infer one from an allocated slot or a completed
-    // hash (including finish/retraction): only proven boundaries inside the
-    // newly hashed range publish, several at once when results landed back
-    // to back, and before retention can reclaim their table slots.
+    // Ordinary state chunks remain request-owned. Retained state boundaries
+    // publish only proven prefill checkpoints in the newly hashed range;
+    // allocated slots and completed hashes are not evidence of written state.
+    const bool is_state = groups_[group_index].Spec().kind == AttnKind::kMambaState;
+    const CacheBoundaryKind boundary_kind =
+        is_state ? completed.state_boundary_kind.value_or(completed.boundary_kind) : completed.boundary_kind;
+    if (is_state && boundary_kind == CacheBoundaryKind::kChunk) {
+        return;
+    }
+    // Sliding windows resume from the newest hashed boundary. State groups
+    // may have several materialized boundaries awaiting publication.
     const std::int32_t hashed_prefix_pages = static_cast<std::int32_t>(completed.prefix_hashes.size());
     std::vector<std::int32_t> boundaries_in_prefix_pages;
-    if (groups_[group_index].Spec().kind != AttnKind::kMambaState) {
+    if (!is_state) {
         boundaries_in_prefix_pages.push_back(hashed_prefix_pages);
     } else {
         for (const std::int32_t boundary : completed.materialized_state_boundaries) {
@@ -940,7 +942,7 @@ void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, Blo
             group_index, table,
             std::span<const CacheKey>{keys}.subspan(static_cast<std::size_t>(first_cache_block),
                                                     static_cast<std::size_t>(lookback)),
-            first_cache_block, access_epoch, completed.boundary_kind, completed.stream_completed_to_host);
+            first_cache_block, access_epoch, boundary_kind, completed.stream_completed_to_host);
     }
 }
 

@@ -108,29 +108,37 @@ jobs:
             "won't fix", "disagree"), respect their response. Do not re-flag
             issues that the author has acknowledged or intentionally declined.
 
-            IMPORTANT — PR description template check (run this FIRST,
+            IMPORTANT — PR description content check (run this FIRST,
             before the code review steps below, on every event):
 
-            The PR body must follow .github/pull_request_template.md.
-            Required headers (literal lines, anywhere in body, any order):
-              ## Summary
-              ## Test Plan
+            .github/pull_request_template.md is a writing aid, not a required
+            format. Check the meaning of the entire PR body for:
+              - Change context: what changes and why.
+              - Validation: tests or checks performed or planned, or an
+                explanation of why testing was not run or is not applicable.
 
-            "Section content" = text between a header and the NEXT ## or ###
-            header line (or end of body) in BODY. After
-            stripping all HTML comments (<!-- ... -->, including multi-line)
-            and trimming whitespace, content must be non-empty.
+            Accept this information anywhere in the body, in any language,
+            with any headings or no headings. For example, substantive
+            "Validation", "Testing", or "Test Plan" text all satisfy the
+            validation requirement. Never flag heading names, heading levels,
+            section order, or formatting alone.
+
+            Ignore HTML comments (<!-- ... -->, including multi-line), empty
+            headings, and unfilled template placeholders. Judge the remaining
+            text by its substance; do not require separate sections or a
+            particular length. A concise description can satisfy both needs.
 
             To check:
             a. Fetch the body:
                  BODY=$(gh pr view ${{ github.event.pull_request.number }} \
                    --repo ${{ github.repository }} --json body --jq .body)
-            b. Verify each required header appears in BODY.
-            c. For each of Summary and Test Plan, verify the
-               section is filled per the definition above.
-            d. Build a bulleted gap list, e.g.
-                 - Missing header: `## Test Plan`
-                 - Empty section: `## Summary` (only contains HTML comments)
+            b. Read all substantive content in BODY and determine whether it
+               provides change context and validation information.
+            c. Build a bulleted gap list only for missing information, e.g.
+                 - Please explain what changes and why.
+                 - Please describe validation performed or planned, or why
+                   testing was not run or is not applicable.
+               Do not ask authors to rename or add headings.
 
             Dedup by a hidden marker on a claude[bot] top-level (issue) comment:
                  EXISTING=$(gh api \
@@ -150,17 +158,16 @@ jobs:
                 gh api repos/${{ github.repository }}/issues/comments/$EXISTING -X DELETE
               no gaps + no EXISTING → do nothing.
 
-            $MSG body (verbatim, with the gap list from step d substituted in):
+            $MSG body (verbatim, with the gap list from step c substituted in):
               <!-- claude-pr-template-check -->
-              👋 The PR description doesn't fully follow
-              [pull_request_template.md](https://github.com/${{ github.repository }}/blob/main/.github/pull_request_template.md):
+              👋 Please add the following context to the PR description:
 
-              <bulleted gap list from step d>
+              <bulleted gap list from step c>
 
-              Please update the PR description so reviewers have the context they need.
+              Any headings or plain paragraphs are fine; no specific format is required.
 
             Finish this check (post/update/delete) before moving on, so a
-            turn-limit cutoff during code review doesn't lose the template check.
+            turn-limit cutoff during code review doesn't lose the content check.
 
             Steps (do steps 1-3 in parallel):
             1. Run the appropriate git diff (see incremental review rules above).
