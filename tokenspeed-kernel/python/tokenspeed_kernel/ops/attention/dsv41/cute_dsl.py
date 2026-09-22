@@ -85,7 +85,10 @@ def _specialised(tensor, dynamic):
         return (tuple(tensor.shape), tensor.stride())
     if dynamic == "rows":
         return (tuple(tensor.shape[1:]), tensor.stride())
-    return ()
+    # A dynamic layout still compiles a zero stride in as the constant 0, and
+    # a one-row broadcast view passes is_contiguous(), so the broadcast
+    # pattern is a specialisation even though the stride values are not.
+    return (tuple(stride == 0 for stride in tensor.stride()),)
 
 
 def _kernel():

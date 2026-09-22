@@ -269,6 +269,28 @@ def test_sparse_index_scores_compile_once_across_table_and_pool_widths():
         assert (actual[finite] - expected[finite]).norm() <= 1e-3 * expected[
             finite
         ].norm()
+    # A one-row broadcast table passes is_contiguous() with a zero row stride,
+    # which the dynamic layout compiles in as a constant: it is its own
+    # variant, not the compact one's binary, and must read the same rows.
+    zero_stride = torch.as_strided(table[0], table[:1].shape, (0, 1))
+
+    def one_row(page_table):
+        return cute_dsl.sparse_index_scores(
+            queries[:1],
+            folded[:1],
+            values.view(torch.float8_e4m3fn),
+            scales,
+            page_table,
+            visible[:1],
+            candidates[:1],
+            pdl_enabled(),
+        )
+
+    compact = one_row(table[:1])
+    assert len(cute_dsl._COMPILED) == compiled_before
+    broadcast = one_row(zero_stride)
+    assert len(cute_dsl._COMPILED) == compiled_before + 1
+    torch.testing.assert_close(broadcast, compact, rtol=0, atol=0)
 
 
 # 255 pages make an int32 table row 1020 bytes, so every chunk after the first
