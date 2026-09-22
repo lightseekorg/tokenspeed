@@ -293,7 +293,8 @@ kernel.
 
 #### Contract
 
-- The input is contiguous BF16 with shape `[M, 7168]`. where `M >= 4096`.
+- The input is contiguous BF16 with shape `[M, 7168]` for any `M >= 1`; automatic
+  dispatch selects this kernel from 4096 tokens.
 - Router `[896, 7168]`, routed `[3584, 7168]`, and shared gate/up
   `[1536, 7168]` weights must be consecutive row views of one packed allocation.
 - Outputs are FP32 router logits, BF16 routed latents, and a BF16 768-wide

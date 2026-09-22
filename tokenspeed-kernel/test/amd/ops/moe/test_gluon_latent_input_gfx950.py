@@ -89,7 +89,7 @@ def test_prefill_routes_packed_projection_and_applies_situ(
     )
     router_weight, routed_weight, shared_weight = packed.split(widths)
     hidden = (
-        torch.randn(tokens, hidden_size, dtype=torch.bfloat16, device="cuda") * 0.02
+        torch.randn(tokens, hidden_size, dtype=torch.bfloat16, device="cuda") * 0.05
     )
 
     actual = latent_input_prefill.launch_gluon_latent_input_prefill_gfx950(
@@ -121,10 +121,10 @@ def test_prefill_routes_packed_projection_and_applies_situ(
     assert actual[1].shape == (tokens, widths[1])
     assert actual[2].shape == (tokens, widths[2] // 2)
     # Both sides multiply exactly representable BF16 pairs, but the kernel sums
-    # them in a different order than the reference over K=7168, so the FP32
-    # router logits differ by more than an FP32 epsilon. These are the
-    # tolerances test_latent_input.py holds the portable kernel to for the same
-    # comparison, on inputs 2.5x larger than these.
+    # them in a different order than the reference over K=7168. The router and
+    # routed tolerances match the portable packed-projection test at this input
+    # scale. The shared output stays tighter: its BF16 rounding error is about
+    # one ULP, and this bound still rejects zero output or an omitted clamp.
     torch.testing.assert_close(actual[0], expected[0], atol=2e-3, rtol=2e-3)
     torch.testing.assert_close(actual[1], expected[1], atol=8e-3, rtol=8e-3)
-    torch.testing.assert_close(actual[2], expected[2], atol=8e-3, rtol=8e-3)
+    torch.testing.assert_close(actual[2], expected[2], atol=1.5e-4, rtol=1e-3)
