@@ -129,7 +129,7 @@ def test_w4a16_matches_clamped_reference(num_tokens) -> None:
     w = _weights({k: v.clone() for k, v in raw.items()}, 8, 1, 0, limit)
     plan = {"activation": "swiglu"}
     flashinfer_cutlass_mxfp4_w4a16_moe_weights(plan, w)
-    with autotune():
+    with autotune(tune_mode=True, tuning_buckets=None, round_up=None):
         actual = flashinfer_cutlass_mxfp4_w4a16_moe_apply(
             plan, x, w, None, topk_weights=topk_weights, topk_ids=topk_ids
         )
@@ -154,7 +154,7 @@ def test_w4a8_tracks_clamped_reference_within_fp8_noise(num_tokens) -> None:
     w = _weights({k: v.clone() for k, v in raw.items()}, 8, 1, 0, limit)
     plan = {"activation": "swiglu"}
     flashinfer_cutlass_mxfp4_w4a8_moe_weights(plan, w)
-    with autotune():
+    with autotune(tune_mode=True, tuning_buckets=None, round_up=None):
         actual = flashinfer_cutlass_mxfp4_w4a8_moe_apply(
             plan, x, w, None, topk_weights=topk_weights, topk_ids=topk_ids
         )
