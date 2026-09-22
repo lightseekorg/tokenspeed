@@ -69,6 +69,7 @@ eval:
     --dataset-hub huggingface
     --dataset-args '{"aime26":{"dataset_id":"math-ai/aime26"}}'
     --eval-batch-size 16
+    --work-dir .ci-artifacts/published/kimi-k3-eagle3-aime26
     --stream
     --generation-config '{"do_sample":true,"temperature":1.0,"seed":42,"max_tokens":32768,"extra_body":{"reasoning_effort":"high"}}'
 report:

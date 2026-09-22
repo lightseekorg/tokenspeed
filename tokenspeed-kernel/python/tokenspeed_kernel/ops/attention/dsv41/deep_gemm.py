@@ -27,6 +27,10 @@ from tokenspeed_kernel.ops.attention.dsv4.deep_gemm import (
     _mxfp4_cache_view,
     warmup_mqa_logits,
 )
+from tokenspeed_kernel.ops.attention.dsv41.cute_dsl import (
+    sparse_index_scores,
+    sparse_index_scores_supported,
+)
 from tokenspeed_kernel.ops.attention.dsv41.deep_select import (
     select_candidates,
     select_topk,
@@ -477,13 +481,20 @@ def _select(scores, k, graph_safe, destination, lengths, candidates=None):
 
 
 def _flashinfer_select(
-    logits, visible, candidates, topk, candidate_topk, graph_safe, out
+    logits, visible, candidates, topk, candidate_topk, graph_safe, out, scores
 ):
+    """Select rows, and blocks when this pass sources the candidate pool.
+
+    ``scores`` is the candidate-compacted score matrix when it was produced
+    directly, or None to gather it here from the dense ``logits``. A pass that
+    sources candidates always needs the dense row, so it never supplies it.
+    """
     rows, lengths, blocks, block_lengths = out
     if candidates is None:
         _select(logits, topk, graph_safe, rows, lengths)
     else:
-        scores = candidate_scores(logits, candidates)
+        if scores is None:
+            scores = candidate_scores(logits, candidates)
         _select(scores, topk, graph_safe, rows, lengths, candidates)
     if candidate_topk:
         _select(
@@ -571,10 +582,45 @@ def hopper_index_topk(
             (pages < 0) | (pages >= index_cache.shape[0]), -1
         )
         keys = _gather_index_fp8(index_cache, slots)
+    # A Reindex pass reads only its candidate pool, so scoring the whole
+    # history and discarding the rest is pure waste. DeepGEMM has no sm90
+    # sparse kernel, so the pool is scored by the CuTe DSL one. A pass that
+    # also sources candidates still needs every row for the block maxima.
+    sparse = (
+        candidate_blocks is not None
+        and not candidate_topk
+        and not dense
+        and sparse_index_scores_supported(queries, folded, page_table, candidate_blocks)
+    )
+    planes = None
+    if sparse:
+        values, scales = _index_planes(index_cache)
+        planes = (values.view(torch.float8_e4m3fn), scales)
     for begin in range(0, n, tile):
         end = min(begin + tile, n)
         visible = visible_lens[begin:end].clamp(0, capacity).to(torch.int32)
         packed = (queries[begin:end],)
+        if sparse:
+            _flashinfer_select(
+                None,
+                visible,
+                candidate_blocks[begin:end],
+                topk,
+                candidate_topk,
+                not dense,
+                tuple(tensor[begin:end] for tensor in out),
+                sparse_index_scores(
+                    queries[begin:end],
+                    folded[begin:end],
+                    planes[0],
+                    planes[1],
+                    page_table[begin:end],
+                    visible,
+                    candidate_blocks[begin:end],
+                    pdl_enabled(),
+                ),
+            )
+            continue
         if dense:
             logits = _hopper_dense_scores(
                 packed,
@@ -605,5 +651,6 @@ def hopper_index_topk(
             candidate_topk,
             not dense,
             tuple(tensor[begin:end] for tensor in out),
+            None,
         )
     return out

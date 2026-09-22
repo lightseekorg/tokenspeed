@@ -672,7 +672,10 @@ Its responsibilities:
   fields that change cached keys), the pipeline stage, the
   context-parallel width (`cp_size`), the resolved attention-TP width
   (`attn.tp_size`), the speculative
-  draft checkpoint when a separate draft pool is present,
+  draft checkpoint when a separate draft pool is present, the resolved target
+  and draft full-attention backends (including hybrid sub-backend choices
+  and MSA's dense sub-backend, represented as `msa:<dense-backend>`;
+  no draft backend is recorded as an empty name),
   `--skip-softmax-threshold` (a nonzero gfx950 MHA prefill skip changes
   attention output and therefore downstream cached K/V; 0.0 is exact
   dense attention), the resolved EAGLE3 capture-layer list

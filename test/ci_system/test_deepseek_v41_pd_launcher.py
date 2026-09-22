@@ -167,6 +167,9 @@ def test_two_node_roles_keep_engines_independent(launcher):
         )
         assert "--enable-expert-parallel" in args
         assert ("--disable-prefix-caching" in args) == (role == "decode")
+        # Only the prefill role captures prefill graphs; decode never extends.
+        assert ("--disable-prefill-graph" in args) == (role == "decode")
+        assert "--enforce-eager" not in args
         assert (tmp_path / "logs/123-1" / f"{role}.log").is_file()
     assert records["health"]["args"] == ["-", "192.0.2.1:18346", "192.0.2.2:18347"]
     router = records["router"]
