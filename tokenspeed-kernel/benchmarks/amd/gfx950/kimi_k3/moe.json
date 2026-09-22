@@ -13,7 +13,7 @@
         "family": "moe",
         "mode": "latent_input",
         "parameters": {
-          "tokens": [1, 2, 4, 8, 16],
+          "tokens": [1, 2, 4, 8, 16, 32, 64],
           "hidden_size": 7168,
           "latent_size": 3584,
           "shared_size": 768,
@@ -113,7 +113,7 @@
         "family": "moe",
         "mode": "sigmoid_bias_topk",
         "parameters": {
-          "tokens": [1, 2, 4, 8, 16],
+          "tokens": [1, 2, 4, 8, 16, 32, 64],
           "topk": 16,
           "router_logits_dtype": "float32",
           "weights_dtype": "float32",
@@ -224,7 +224,7 @@
         "family": "moe",
         "mode": "apply",
         "parameters": {
-          "tokens": [8, 16],
+          "tokens": [8, 16, 32, 64],
           "hidden_size": 3584,
           "intermediate_size": 3072,
           "num_local_experts": 896,
@@ -341,7 +341,7 @@
         "family": "moe",
         "mode": "apply",
         "parameters": {
-          "tokens": [8, 16],
+          "tokens": [8, 16, 32, 64],
           "hidden_size": 3584,
           "intermediate_size": 3072,
           "num_local_experts": 112,
