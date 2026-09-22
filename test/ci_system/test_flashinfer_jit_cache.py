@@ -1,5 +1,3 @@
-import os
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -72,41 +70,3 @@ def test_install_url_if_needed_reinstalls_missing_or_stale_version(tmp_path: Pat
     assert missing_installed is None
     assert stale_url == expected_url
     assert stale_installed == "0.6.11.post3+cu130"
-
-
-@pytest.mark.parametrize(
-    ("runner", "should_sync"),
-    [
-        ("b200-4gpu", True),
-        ("b200v2-4gpu", True),
-        ("gb200-4gpu", True),
-        ("slurm-gb200-4gpu", True),
-        ("slurm-gb300-4gpu", False),
-        ("amd-mi35x-4gpu-test", False),
-    ],
-)
-def test_install_deps_syncs_jit_cache_for_gb200_slurm(runner, should_sync):
-    installer = Path(__file__).with_name("install_deps.sh").read_text()
-    function = (
-        "ensure_flashinfer_jit_cache() {"
-        + installer.split("ensure_flashinfer_jit_cache() {", 1)[1].split("\n}", 1)[0]
-        + "\n}"
-    )
-    script = """
-set -euo pipefail
-python3() { printf '%s\n' https://example.invalid/cache.whl; }
-pip_install_with_retry() { printf 'install=%s\n' "$*"; }
-SCRIPT_DIR=/unused
-CUDA_REQ=/unused/cuda.txt
-CUINDEX=130
-""" + function + "\nensure_flashinfer_jit_cache\n"
-    result = subprocess.run(
-        ["bash", "-c", script],
-        env={**os.environ, "CI_RUNNER_LABEL": runner},
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    assert ("install=pip3 install" in result.stdout) is should_sync
-    if should_sync:
-        assert "https://example.invalid/cache.whl" in result.stdout

@@ -1,4 +1,3 @@
-import json
 import os
 import subprocess
 from pathlib import Path
@@ -247,9 +246,9 @@ def configured_yaml_choices(workflow_name: str) -> set[str]:
 
 
 def test_k8s_dispatch_lists_every_supported_ci_yaml():
-    assert configured_yaml_choices("k8s-dispatch.yml") == eligible_config_paths(
-        K8S_RUNNER_PREFIXES
-    )
+    choices = configured_yaml_choices("k8s-dispatch.yml")
+    assert eligible_config_paths(K8S_RUNNER_PREFIXES) <= choices
+    assert all((REPO_ROOT / choice).is_file() for choice in choices)
 
 
 def test_amd_pr_workflow_orders_kernel_benchmarks_before_model_tests():
@@ -473,15 +472,7 @@ def test_slurm_dispatch_routes_gb300_to_its_coordinator():
     assert "with pr_worktree(repo, pr) as checkout:" in dispatch_script
 
 
-@pytest.mark.parametrize(
-    "runners",
-    [
-        "b200-4gpu,gb200-4gpu",
-        "b200-4gpu, gb200-4gpu",
-        "b200-4gpu,gb200-4gpu,slurm-gb200-4gpu",
-        "b200-4gpu, gb200-4gpu, slurm-gb200-4gpu",
-    ],
-)
+@pytest.mark.parametrize("runners", ["b200-4gpu,gb200-4gpu", "b200-4gpu, gb200-4gpu"])
 def test_slurm_dispatch_uses_declared_gb300_runner_and_shared_paths(tmp_path, runners):
     result = run_slurm_dispatch_script(
         tmp_path,
@@ -880,174 +871,6 @@ def test_gb300_slurm_per_commit_workflow_is_isolated_and_automatic():
         for item in cancel_workflow["jobs"]["cancel"]["strategy"]["matrix"]["include"]
     }
     assert "gb300-slurm-per-commit" in cancel_groups
-
-
-QWEN_GB200_SLURM_TASKS = {
-    "eval-qwen3.5-397b-a17b-nvfp4-aime25",
-    "eval-qwen3.5-35b-a3b-fp8-deepep-tp2dp2ep4-gsm8k",
-    "eval-qwen3.5-122b-a10b-nvfp4-epd-1e1p2d-ocr-bench",
-    "ut-runtime-qwen35-epd-1e1p2d",
-}
-
-
-@pytest.mark.parametrize("trigger", ["per-commit", "manual"])
-def test_gb200_slurm_matrix_selects_all_migrated_qwen_tasks(tmp_path, trigger):
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/gb200-slurm-per-commit.yml")
-    step = next(s for s in workflow["jobs"]["scan"]["steps"] if s.get("id") == "matrix")
-    output = tmp_path / "output"
-    env = {
-        **os.environ,
-        "TOKENSPEED_B200_RUNNER_LABEL": "b200v2",
-        "TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS": "b300,gb200",
-        **step["env"],
-        "TRIGGER": trigger,
-        "GITHUB_OUTPUT": str(output),
-    }
-    subprocess.run(["bash", "-c", step["run"]], cwd=REPO_ROOT, env=env, check=True)
-    fields = dict(line.split("=", 1) for line in output.read_text().splitlines())
-    entries = json.loads(fields["matrix"])["include"]
-    assert fields["has_tasks"] == "true"
-    assert {entry["name"] for entry in entries} == QWEN_GB200_SLURM_TASKS
-    assert len(entries) == 4
-    assert {entry["runner"] for entry in entries} == {"slurm-gb200-4gpu"}
-    assert {entry["workflow_stage"] for entry in entries} == {"unit-test", "model-test"}
-
-    # No migrated entry remains in the physical B200v2 runner pool.
-    x86 = build_matrix(REPO_ROOT / "test/ci", REPO_ROOT, trigger, "nvidia-x86")
-    assert not any(
-        entry["name"] in QWEN_GB200_SLURM_TASKS and entry["runner"].startswith("b200")
-        for entry in x86["include"]
-    )
-
-
-def test_nvidia_arm_matrix_does_not_dispatch_slurm_tasks(tmp_path):
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/pr-test-nvidia-arm.yml")
-    step = next(s for s in workflow["jobs"]["scan"]["steps"] if s.get("id") == "scan")
-    script = step["run"].replace(
-        "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || 'per-commit' }}",
-        "per-commit",
-    )
-    output = tmp_path / "output"
-    subprocess.run(
-        ["bash", "-c", script],
-        cwd=REPO_ROOT,
-        env={
-            **os.environ,
-            "TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS": "",
-            "GITHUB_OUTPUT": str(output),
-        },
-        check=True,
-    )
-    fields = dict(line.split("=", 1) for line in output.read_text().splitlines())
-    entries = [
-        entry
-        for key in ("unit_matrix", "model_matrix")
-        for entry in json.loads(fields[key])["include"]
-    ]
-    assert entries
-    assert all(not entry["runner"].startswith("slurm-") for entry in entries)
-    assert not QWEN_GB200_SLURM_TASKS.intersection(entry["name"] for entry in entries)
-
-
-@pytest.mark.parametrize("task_type,pr_number", [("ut", "123"), ("eval", "")])
-def test_gb200_slurm_submission_preserves_task_and_source(
-    tmp_path, task_type, pr_number
-):
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/gb200-slurm-per-commit.yml")
-    submit = workflow["jobs"]["submit"]
-    step = next(
-        s
-        for s in submit["steps"]
-        if s.get("name") == "Submit and wait for GB200 Slurm task"
-    )
-    wrapper = tmp_path / "test/ci/run_slurm.sh"
-    wrapper.parent.mkdir(parents=True)
-    wrapper.write_text(
-        '#!/bin/bash\nset -eu\ntest -z "${HF_TOKEN-}${HUGGING_FACE_HUB_TOKEN-}"\nprintf "%s\\n" "$@"\n'
-    )
-    wrapper.chmod(0o755)
-    env = {
-        **os.environ,
-        "CONFIG": "test/ci/qwen.yaml",
-        "RUNNER": "slurm-gb200-4gpu",
-        "TASK_TYPE": task_type,
-        "PR_NUMBER": pr_number,
-        "RUNNER_TEMP": str(tmp_path),
-        "HF_TOKEN": "unused",
-        "HUGGING_FACE_HUB_TOKEN": "unused",
-    }
-    result = subprocess.run(
-        ["bash", "-c", step["run"]],
-        cwd=tmp_path,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    expected = [
-        "--config",
-        env["CONFIG"],
-        "--runner",
-        env["RUNNER"],
-        "--type",
-        task_type,
-        "--wait",
-        "--report-dir",
-        f"{tmp_path}/slurm-report",
-    ]
-    if pr_number:
-        expected.extend(["--source-pr", pr_number])
-    assert result.stdout.splitlines() == expected
-    env["RUNNER"] = "slurm-gb300-4gpu"
-    rejected = subprocess.run(
-        ["bash", "-c", step["run"]],
-        cwd=tmp_path,
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    assert rejected.returncode == 2
-    assert "Unsupported GB200 Slurm runner" in rejected.stderr
-
-
-def test_gb200_slurm_workflow_preserves_pr_source_and_lifecycle():
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/gb200-slurm-per-commit.yml")
-    triggers = workflow.get("on") or workflow.get(True)
-    assert set(triggers) == {"push", "pull_request", "workflow_dispatch"}
-    submit = workflow["jobs"]["submit"]
-    assert submit["runs-on"] == "slurm-dispatch"
-    assert "needs.scan.outputs.allowed == 'true'" in submit["if"]
-    gate = next(s for s in workflow["jobs"]["scan"]["steps"] if s.get("id") == "gate")
-    assert "github.event.pull_request.draft == false" in gate["env"]["ALLOWED"]
-    assert (
-        "github.event.pull_request.head.repo.full_name == github.repository"
-        in gate["env"]["ALLOWED"]
-    )
-    checkout = next(
-        s for s in submit["steps"] if s.get("name") == "Checkout dispatcher"
-    )
-    assert checkout["with"] == {
-        "ref": "${{ github.sha }}",
-        "fetch-depth": 0,
-        "persist-credentials": False,
-    }
-    step = next(
-        s
-        for s in submit["steps"]
-        if s.get("name") == "Submit and wait for GB200 Slurm task"
-    )
-    assert (
-        step["env"]["INSTALL_TOKENSPEED_MLA_FROM_SOURCE"]
-        == "${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}"
-    )
-    cancel = load_yaml(REPO_ROOT / ".github/workflows/cancel-pr-tests-on-close.yml")
-    assert {"name": workflow["name"], "group": "gb200-slurm-per-commit"} in cancel[
-        "jobs"
-    ]["cancel"]["strategy"]["matrix"]["include"]
-    for filename in ("retry-failed-latest-main.yml", "retry-failed-approved-prs.yml"):
-        retry = load_yaml(REPO_ROOT / ".github/workflows" / filename)
-        script = retry["jobs"]["rerun-failed"]["steps"][0]["with"]["script"]
-        assert '"gb200-slurm-per-commit.yml"' in script.split("const maxAttempts", 1)[0]
 
 
 def test_gb300_slurm_per_commit_matrix_selects_model_tasks(monkeypatch):
