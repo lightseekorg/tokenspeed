@@ -43,6 +43,10 @@ from tokenspeed_kernel import (
 from tokenspeed_kernel import mhc_fused_hc as fast_mhc_fused_hc
 from tokenspeed_kernel import mhc_post as fast_mhc_post
 from tokenspeed_kernel import mhc_pre as fast_mhc_pre
+from tokenspeed_kernel import (
+    moe_topk,
+    pack_topk_router_logits,
+)
 from tokenspeed_kernel.ops.attention.dsa import dsa_decode_topk, dsa_prefill_topk
 from tokenspeed_kernel.ops.attention.dsv4 import (
     dsv4_decode_topk,
@@ -119,8 +123,15 @@ from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
-from tokenspeed.runtime.layers.moe.deepseek_v4 import DeepseekV4TopK
 from tokenspeed.runtime.layers.moe.expert import MoELayer
+from tokenspeed.runtime.layers.moe.topk import (
+    BypassedTopKOutput,
+    ExpertLocationDispatchInfo,
+    StandardTopKOutput,
+    TopK,
+    TopKOutput,
+    TopKOutputFormat,
+)
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
 from tokenspeed.runtime.layers.quantization import Fp8Config, Mxfp4Config
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -1586,6 +1597,73 @@ class DeepseekV4MoEGate(nn.Module):
             hidden_states,
             self.weight,
         )
+
+
+class DeepseekV4TopK(TopK):
+    def __init__(
+        self,
+        top_k: int,
+        renormalize: bool,
+        correction_bias: torch.Tensor | None,
+        routed_scaling_factor: float,
+        output_format: TopKOutputFormat,
+        hash_routing: bool,
+    ) -> None:
+        super().__init__(
+            top_k=top_k,
+            renormalize=renormalize,
+            correction_bias=correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
+            output_format=output_format,
+        )
+        self.hash_routing = hash_routing
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        output_format: TopKOutputFormat | None = None,
+        num_token_non_padded: torch.Tensor | None = None,
+        expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None,
+        routing_correction_bias: torch.Tensor | None = None,
+        hash_indices_table: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
+    ) -> TopKOutput:
+        output_format = (
+            output_format or self.topk_config.output_format or TopKOutputFormat.STANDARD
+        )
+        correction_bias = (
+            self.topk_config.correction_bias
+            if routing_correction_bias is None
+            else routing_correction_bias
+        )
+        topk_weights, topk_ids = moe_topk(
+            router_logits,
+            self.topk_config.top_k,
+            "sqrt_softplus",
+            "hash" if self.hash_routing else "topk",
+            self.topk_config.renormalize,
+            self.topk_config.routed_scaling_factor,
+            correction_bias=correction_bias,
+            hash_indices_table=hash_indices_table,
+            input_ids=input_ids,
+        )
+        if output_format == TopKOutputFormat.BYPASSED:
+            output_scale = topk_weights.sum(dim=-1, keepdim=True)
+            packed_logits = pack_topk_router_logits(
+                topk_weights,
+                topk_ids,
+                router_logits.shape[1],
+            )
+            return BypassedTopKOutput(
+                hidden_states=hidden_states,
+                router_logits=packed_logits,
+                topk_config=self.topk_config,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+                output_scale=output_scale,
+            )
+        return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
 
 def _deepseek_v4_routed_expert_quant_config(
