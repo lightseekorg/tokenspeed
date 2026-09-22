@@ -90,8 +90,7 @@ host synchronization is performed by the forward call or graph replay.
 The recommended threshold keeps exactly 8 MiB on the tuned packet kernel and
 uses chunk exchange above it. An explicitly supplied threshold still takes
 precedence; supplying 8 MiB selects chunk exchange at exactly 8 MiB.
-These are measured GB300 tuning points, not universal optima.
-Vector-packet experiments did not justify replacing the small-message kernel.
+Choose the threshold for your hardware and workload.
 Correctness tests exercise both directions, repeated transitions between
 packet/chunk sizes, delayed peers, arbitrary payload bits and graph replay.
 
@@ -104,23 +103,8 @@ Both variants use the same packet layout and full 32-bit generation IDs;
 switching sizes needs neither additional scratch nor a new barrier. This
 increases GPU occupancy; concurrent compute performance is not established.
 
-Same-node four-GB300 BF16 graph measurements, width 2048, 128 CTAs, three
-interleaved A/B rounds (microseconds):
-
-| Size | Previous packet/chunk selection | Tuned packet | TRT-LLM AllGather |
-|---|---:|---:|---:|
-| 4 MiB | 14.80 | 13.00 | 10.05 |
-| 8 MiB | 24.24 | 22.58 | 16.56 |
-
-The baseline uses packet at 4 MiB and chunk at 8 MiB. Gains are 12.1% and 6.9%
-in latency, not parity with AllGather. AllGather sizes denote total output;
-A2A sizes denote total input/output. Wire traffic and staging work differ.
-
 The medium kernel additionally specializes each TP4 rank at compile time to
 remove dynamic peer indexing and self-owner branches in its unrolled loops.
-Three interleaved A/B rounds on another four-GB300 allocation measured
-13.01 → 12.78 microseconds at 4 MiB and 22.13 → 21.98 at 8 MiB. This is a small
-1–2% incremental gain, not AllGather parity (10.07 / 16.53 on that allocation).
 Packet format, generation checks, workspace size, and dispatch thresholds are
 unchanged; four rank variants increase compiled code size. GPU tests cover all
 ranks, both directions, and transitions across the packet/chunk boundary.
@@ -152,28 +136,5 @@ is included. The benchmark is communication-only: it does not establish a
 projection or model speedup. AG/RS are latency references, not interchangeable
 A2A algorithms; compare their message-size definitions explicitly.
 
-### Measured low-latency behavior
-
-Four GB300 GPUs, BF16, CUDA Graphs, A2A input `[C,12288]`, 128 CTAs:
-
-| C/rank | Logical S/GPU | Ulysses A2A | Packet A2A | TRT-LLM AG | TRT-LLM RS |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 24 KiB | 7.63 µs | 4.01 µs | 3.91 µs | 4.33 µs |
-| 4 | 96 KiB | 8.03 µs | 4.14 µs | 4.12 µs | 4.49 µs |
-| 16 | 384 KiB | 9.74 µs | 4.66 µs | 4.32 µs | 4.64 µs |
-| 32 | 768 KiB | 9.88 µs | 5.64 µs | 5.09 µs | 4.98 µs |
-| 64 | 1.5 MiB | 11.68 µs | 7.52 µs | 6.57 µs | 6.03 µs |
-| 128 | 3 MiB | 14.75 µs | 11.80 µs | 8.94 µs | 8.31 µs |
-
-All backends ran sequentially on the same allocation with the timing protocol
-above. Ulysses uses its borrowed-output adapter, not an extra copy-out. AG/RS
-are unfused one-shot kernels, PDL disabled, hidden width 1536; RS accumulates
-in FP32. `S` means full per-rank input/output for A2A, full output for AG, and
-full input for RS. AG sends `S/4` local input, RS returns `S/4` local output.
-Packet A2A additionally sends its readiness tags; physical wire bytes are not
-equal between these algorithms.
-
-For C1–C16 this reaches the AG/RS latency range and reduces Ulysses latency
-by 47–52%. The C64/C128 reduction is 36%/20%, but those cases **do not match**
-AG/RS latency. Do not extrapolate these communication-only gains to full-model
-latency or large-message bandwidth.
+Benchmark results and tuning measurements are recorded in
+[PR #1690](https://github.com/lightseekorg/tokenspeed/pull/1690).
