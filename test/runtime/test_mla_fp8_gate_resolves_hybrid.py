@@ -92,12 +92,46 @@ def test_decode_and_prefill_share_one_gate():
 
     cls = deepseek_v3.DeepseekV3AttentionMLA
     decode = inspect.getsource(cls.forward_absorb_qkv_proj)
-    prefill = inspect.getsource(cls.forward_normal_chunked_kv_prepare)
+    prefill = inspect.getsource(cls._prepare_prefix_replay_qkv_and_cache)
 
     for name, src in (("decode", decode), ("prefill", prefill)):
         assert (
             "self._mla_kv_is_fp8(ctx, k_scale)" in src
         ), f"the {name} path open-codes the fp8 gate instead of sharing it"
+
+
+@pytest.mark.parametrize(
+    "uses_rope,has_full_history,expected",
+    [
+        (False, True, True),
+        (False, False, False),
+        (True, True, False),
+    ],
+)
+def test_full_history_prefill_gate(uses_rope, has_full_history, expected):
+    from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3AttentionMLA
+
+    attention = object.__new__(DeepseekV3AttentionMLA)
+    torch.nn.Module.__init__(attention)
+    attention.rotary_emb = object() if uses_rope else None
+
+    assert (
+        attention._can_use_full_history_prefill(
+            full_kv_indices=(torch.empty(0) if has_full_history else None)
+        )
+        is expected
+    )
+
+
+def test_full_history_prefill_dispatch_shares_one_gate():
+    from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3AttentionMLA
+
+    for method in (
+        DeepseekV3AttentionMLA._attn,
+        DeepseekV3AttentionMLA.forward_normal_chunked,
+    ):
+        source = inspect.getsource(method)
+        assert "self._can_use_full_history_prefill(" in source
 
 
 @pytest.mark.parametrize(
