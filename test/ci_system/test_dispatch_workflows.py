@@ -975,6 +975,13 @@ def test_nvidia_arm_model_tests_allow_runner_wait_time():
     assert workflow["jobs"]["model-test"]["with"]["timeout_minutes"] >= 120
 
 
+def test_amd_model_tests_allow_cold_model_startup_and_evaluation():
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/pr-test-amd.yml")
+
+    for job_name in ("model-test", "model-test-eager"):
+        assert workflow["jobs"][job_name]["with"]["timeout_minutes"] >= 120
+
+
 def test_mi450_sim_uses_direct_runner_and_bounded_timeout():
     workflow = load_yaml(REPO_ROOT / ".github/workflows/run-pr-test-stage.yml")
     job = workflow["jobs"]["test"]
