@@ -524,9 +524,6 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             for layer in self.layers
             if getattr(layer, "indexer", None) is not None
         )
-        self.ple_layers = tuple(
-            layer.ple for layer in self.layers if layer.ple is not None
-        )
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         """Load per-tensor FP8 KV scales for full-attention layers."""
@@ -547,10 +544,13 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             paged_attention.k_scale_float = scale
             paged_attention.v_scale_float = scale
 
-    def _start_ple_prefetch(self, input_ids: torch.Tensor, ctx: ForwardContext) -> None:
-        """Issue every PLE layer's host gather ahead of the decoder loop."""
-
-        for ple in self.ple_layers:
+    def _start_ple_prefetch(
+        self, ple: Qwen4ExpPLELayer, input_ids: torch.Tensor, ctx: ForwardContext
+    ) -> None:
+        cap = BreakableCapture.current()
+        if cap is not None and cap._capturing:
+            cap.add_eager(lambda: ple.start_prefetch(input_ids, current_forward_ctx()))
+        else:
             ple.start_prefetch(input_ids, ctx)
 
     @torch.no_grad()
@@ -567,22 +567,14 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
-        # Start the host-resident PLE gather now so it overlaps the decoder
-        # layers that precede the PLE layer. DP also gathers global queries for
-        # device tables (see Qwen4ExpPLELayer.start_prefetch). Under a
-        # breakable capture the trigger must itself be an eager break: it runs
-        # the per-request hash kernel and a side-stream copy, neither of which
-        # can be baked into a graph segment.
-        if self.ple_layers:
-            cap = BreakableCapture.current()
-            if cap is not None and cap._capturing:
-                cap.add_eager(
-                    lambda: self._start_ple_prefetch(input_ids, current_forward_ctx())
-                )
-            else:
-                self._start_ple_prefetch(input_ids, ctx)
+        if self.layers and self.layers[0].ple is not None:
+            self._start_ple_prefetch(self.layers[0].ple, input_ids, ctx)
         residual = None
         for layer_id, layer in enumerate(self.layers):
+            if layer_id + 1 < len(self.layers):
+                next_ple = self.layers[layer_id + 1].ple
+                if next_ple is not None:
+                    self._start_ple_prefetch(next_ple, input_ids, ctx)
             with get_global_expert_distribution_recorder().with_current_layer(layer_id):
                 hidden_states, residual = layer(
                     positions=positions,

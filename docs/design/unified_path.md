@@ -653,10 +653,12 @@ rank joins the stage-wide all-reduce, then takes its DP slice. Device-resident
 tables use the same query/reduction layout. An idle DP rank owns table rows
 needed by active peers and must participate in both collectives before returning
 its empty output. Only an entirely empty global lookup skips communication.
-Model construction records PLE layers in execution order; the forward prefetch
-entry visits that same order on every rank. No cross-DP collective is added
-to the side stream. DP combined with attention CP is rejected at construction
-until CP's query ownership is represented in this layout.
+The model starts each PLE lookup immediately before its preceding decoder layer,
+in layer order on every rank. A PLE on the first layer starts at model entry.
+Under breakable capture, each trigger is an eager break and reads the live
+forward context on replay. No cross-DP collective is added to the side stream.
+DP combined with attention CP is rejected at construction until CP's query
+ownership is represented in this layout.
 
 `PLELookup.start(ids, layout)` owns table reads and returns one `PendingLookup`;
 `finish` waits on its completion event, reduces a two-dimensional compute-dtype
