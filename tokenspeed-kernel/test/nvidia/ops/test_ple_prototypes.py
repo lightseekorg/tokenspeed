@@ -45,6 +45,7 @@ import pytest
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.ple import (
+    ple_conv_sequences,
     ple_gate_norm,
     ple_ngram_ids,
     prepare_ngram_reciprocals,
@@ -229,6 +230,118 @@ def test_ngram(lengths, hpn, pdl, monkeypatch):
     )
     assert torch.equal(scratch[args[2] * stride + 1 + args[3]], baseline[1])
     assert (scratch[len(lengths) * stride :] == -1).all()
+
+
+def _conv_case(lengths, *, windows):
+    torch.manual_seed(73)
+    channels, state = 37, 9
+    total, batch = sum(lengths), len(lengths)
+    values = torch.randn(total, channels, device="cuda") * 0.1
+    initial = torch.randn(batch, channels, state, device="cuda") * 0.1
+    weight = torch.randn(channels, 4, device="cuda") * 0.1
+    lens = torch.tensor(lengths, device="cuda", dtype=torch.int64)
+    req = torch.repeat_interleave(torch.arange(batch, device="cuda"), lens)
+    col = torch.tensor(
+        [i for length in lengths for i in range(length)],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    starts = lens.cumsum(0) - lens
+    stride = max(lengths) + 1
+    scratch = (
+        torch.full((batch * stride, channels, state), -1.0, device="cuda")
+        if windows
+        else None
+    )
+    args = (values, initial, weight, req, col, lens, starts)
+    opts = dict(
+        total_tokens=total,
+        batch_size=batch,
+        dilation=3,
+        kernel_size=4,
+        state_len=state,
+        weights_independent=True,
+        windows=scratch,
+        windows_block_rows=stride if windows else 0,
+        scatter_windows=windows,
+    )
+    return args, opts
+
+
+@pytest.mark.parametrize("lengths", [[1], [4], [2, 0, 3], [0, 0, 0], [1, 0, 0]])
+@pytest.mark.parametrize(
+    "write_final,windows", [(True, False), (True, True), (False, True)]
+)
+@pytest.mark.parametrize("pdl", [False, True])
+def test_conv_runtime_bounds(lengths, write_final, windows, pdl, monkeypatch):
+    monkeypatch.setattr("tokenspeed_kernel.ops.ple.pdl_enabled", lambda: pdl)
+    args, opts = _conv_case(lengths, windows=windows)
+    values, initial, weight = args[:3]
+    expected = torch.empty_like(values)
+    expected_final = torch.empty_like(initial)
+    expected_windows = opts["windows"].clone() if windows else None
+    start = 0
+    for request, length in enumerate(lengths):
+        sequence = torch.cat(
+            (initial[request], values[start : start + length].T), dim=1
+        )
+        expected_final[request] = sequence[:, length : length + 9]
+        if windows:
+            base = request * opts["windows_block_rows"]
+            expected_windows[base] = initial[request]
+        for column in range(length):
+            acc = (sequence[:, column : column + 10 : 3] * weight).sum(dim=1)
+            expected[start + column] = acc * torch.sigmoid(acc)
+            if windows:
+                expected_windows[base + 1 + column] = sequence[
+                    :, column + 1 : column + 10
+                ]
+        start += length
+
+    def run():
+        return ple_conv_sequences(*args, **opts, write_final=write_final)
+
+    eager = run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    if windows:
+        opts["windows"].fill_(-1)
+    graph.replay()
+    for output, final, scratch in (eager, captured):
+        torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-7)
+        if write_final:
+            torch.testing.assert_close(final, expected_final, rtol=0, atol=0)
+        else:
+            assert final.shape[0] == 0
+        if windows:
+            torch.testing.assert_close(scratch, expected_windows, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("pdl", [False, True])
+def test_conv_reuses_specialization_across_shapes(pdl, monkeypatch):
+    import tokenspeed_kernel.ops.ple as ple
+
+    monkeypatch.setattr(ple, "pdl_enabled", lambda: pdl)
+    kernel = ple._ple_conv_state_kernel
+    compiled = []
+
+    class LaunchRecorder:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                result = kernel[grid](*args, **kwargs)
+                compiled.append(result)
+                return result
+
+            return launch
+
+    monkeypatch.setattr(ple, "_ple_conv_state_kernel", LaunchRecorder())
+    for total, batch in [(3, 3), (5, 3), (7, 3), (3, 5), (3, 7)]:
+        args, opts = _conv_case([total] + [0] * (batch - 1), windows=False)
+        ple_conv_sequences(*args, **opts, write_final=True)
+    torch.cuda.synchronize()
+    assert compiled[0] is not None
+    assert all(item is compiled[0] for item in compiled)
 
 
 @pytest.mark.parametrize("tokens", [1, 4, 16])
