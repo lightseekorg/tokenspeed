@@ -162,11 +162,12 @@ Triton cache policy so cold compilation is not newly introduced into measured
 requests.
 
 The AMD Kimi-K3 EAGLE3 performance task publishes its EvalScope outputs and
-tokenizer under `.ci-artifacts/published/kimi-k3-eagle3-perf`, including the
+tokenizer under
+`.ci-artifacts/published/kimi-k3-eagle3-tp8ep1-50k-500-perf`, including the
 request/response database. These artifacts allow input, output, and speculative
 acceptance differences to be investigated alongside timing changes. The task
-still measures one 4K-input/1K-output request with zero benchmark warmup requests
-and its original performance reference and threshold.
+measures 16 concurrent 50K-input/500-output requests with TP8/EP1 and zero
+benchmark warmup requests.
 
 The corresponding AMD Kimi-K3 EAGLE3 AIME26 gate publishes its per-question
 predictions and scoring records under
