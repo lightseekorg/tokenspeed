@@ -263,7 +263,24 @@ def launch_gluon_latent_input_prefill_gfx1250(
     beta: float,
     linear_beta: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Project a prefill chunk of Kimi-K3 latent-MoE inputs."""
+    """Project a prefill chunk of Kimi-K3 latent-MoE inputs.
+
+    Args:
+        hidden_states: Contiguous BF16 activation shaped ``[tokens, 7168]``.
+            Any positive ``tokens`` works; a partial final row tile is
+            masked. Automatic dispatch uses this kernel from 1536 tokens.
+        router_weight: Packed weight view shaped ``[896, 7168]``.
+        routed_down_weight: Packed weight view shaped ``[3584, 7168]``.
+        shared_gate_up_weight: Packed weight view shaped ``[1536, 7168]``.
+        packed_weight: Consecutive row view covering all three weights. The
+            kernels read only this tensor, so it is rejected unless the
+            three above live inside it.
+        beta: Positive SiTU gate clipping scale.
+        linear_beta: Optional positive SiTU linear-branch clipping scale.
+
+    Returns:
+        FP32 router logits, BF16 routed latent, and BF16 shared-expert input.
+    """
 
     tokens = hidden_states.shape[0]
     expected = (

@@ -27,14 +27,8 @@ from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
 _LARGEM_MIN_M = 512
 _LARGEM_BLOCK_M_CROSSOVER = 12288
-# Where the 256x256x128 wide schedule starts paying, measured on MI455X
-# across every whitelisted shape. It needs both bounds: that tile launches a
-# quarter the workgroups of the 128x128 one, so it under-fills the device
-# unless M and N are both large. Inside them it runs 1.05x to 1.2x the
-# narrower schedule; outside, 0.7x at N = 1536 and 0.42x at M = 512.
 _LARGEM_WIDE_M = 4096
 _LARGEM_WIDE_N = 3072
-# Tuples rather than lists: Triton hashes constexpr arguments for its cache.
 _WARP_BASES_4 = ((0, 1), (1, 0))
 _WARP_BASES_8 = ((0, 1), (1, 0), (2, 0))
 _LARGEM_SHAPES = {
