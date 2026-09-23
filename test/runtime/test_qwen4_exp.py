@@ -25,7 +25,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.ple import ple_page_gather_pair
+from tokenspeed_kernel.ops.ple import (
+    ple_host_gather,
+    ple_page_gather_pair,
+    prepare_ngram_reciprocals,
+)
 
 import tokenspeed.runtime.layers.attention.backends.paged.qsa as qsa_backend_module
 import tokenspeed.runtime.layers.attention.qsa.indexer as qsa_indexer_module
@@ -2220,6 +2224,9 @@ def _ngram_stub(ngram_size: int, heads_per_ngram: int = 4, eos: int = 7):
         offsets.append(running)
         running += size
     stub.ngram_heads_vocab_sizes = torch.tensor(sizes, dtype=torch.long)
+    stub.ngram_mod_reciprocals = prepare_ngram_reciprocals(
+        sizes, device=stub.ngram_heads_vocab_sizes.device
+    )
     stub.ngram_heads_offsets = torch.tensor(offsets, dtype=torch.long)
     return stub
 
@@ -2284,9 +2291,12 @@ def test_ngram_ids_anchor_rewrite_matches_legacy(ngram_size) -> None:
     not torch.cuda.is_available(), reason="triton n-gram kernel requires CUDA"
 )
 @pytest.mark.parametrize("ngram_size", [2, 3, 4])
+@pytest.mark.parametrize("heads_per_ngram", [1, 3, 8])
 @pytest.mark.parametrize("lengths", [[1, 1, 1, 1], [3, 1, 5], [0, 4, 2], [0, 0]])
-def test_ngram_ids_flat_kernel_matches_legacy(ngram_size, lengths) -> None:
-    stub = _ngram_stub(ngram_size)
+def test_ngram_ids_flat_kernel_matches_legacy(
+    ngram_size, heads_per_ngram, lengths
+) -> None:
+    stub = _ngram_stub(ngram_size, heads_per_ngram)
     context_len = ngram_size - 1
     bs, total = len(lengths), sum(lengths)
     torch.manual_seed(1)
@@ -2316,6 +2326,7 @@ def test_ngram_ids_flat_kernel_matches_legacy(ngram_size, lengths) -> None:
     )
     stub.layer_multipliers = stub.layer_multipliers.cuda()
     stub.ngram_heads_vocab_sizes = stub.ngram_heads_vocab_sizes.cuda()
+    stub.ngram_mod_reciprocals = stub.ngram_mod_reciprocals.cuda()
     stub.ngram_heads_offsets = stub.ngram_heads_offsets.cuda()
     flat = Qwen4ExpNGramEmbedding._ngram_ids_flat_cuda.__get__(stub)
 
@@ -2537,8 +2548,15 @@ def test_ple_conv_epilogue_folds_full_width_adds(dtype) -> None:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="fused PLE conv requires CUDA"
 )
-@pytest.mark.parametrize("lengths", [[3, 1, 5], [0, 4, 2], [0, 0]])
-def test_ple_conv_scatters_windows_into_verify_scratch(lengths) -> None:
+@pytest.mark.parametrize("lengths", [[1], [4], [3, 1, 5], [0, 4, 2], [0, 0]])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("graph_replay", [False, True])
+def test_ple_conv_scatters_windows_into_verify_scratch(
+    lengths, enable_pdl, graph_replay, monkeypatch
+) -> None:
+    if enable_pdl and (torch.version.hip or torch.cuda.get_device_capability()[0] < 9):
+        pytest.skip("PDL requires NVIDIA SM90+")
+    monkeypatch.setattr("tokenspeed_kernel.ops.ple.pdl_enabled", lambda: enable_pdl)
     channels = 8
     dtype = torch.bfloat16
     stub, _, _ = _ple_stub(ngram_size=3, conv_kernel_size=4, channels=channels)
@@ -2573,11 +2591,28 @@ def test_ple_conv_scatters_windows_into_verify_scratch(lengths) -> None:
         windows_out=scratch,
         windows_block_rows=stride,
     )
+    if graph_replay:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            scattered = stub._conv_sequences_cuda(
+                values,
+                initial,
+                req,
+                col,
+                lengths_t,
+                tot,
+                bs,
+                True,
+                windows_out=scratch,
+                windows_block_rows=stride,
+            )
+        scratch.zero_()
+        graph.replay()
 
     # Same conv results, with carried and token windows landing in their
     # rollback rows and nothing else in the scratch disturbed.
     assert torch.equal(scattered[0], packed[0])
-    assert torch.equal(scattered[1], packed[1])
+    assert scattered[1].shape == (0, channels, state_len)
     assert scattered[2] is scratch
     initial_rows = torch.arange(bs, device="cuda") * stride
     assert torch.equal(scratch[initial_rows], initial)
@@ -3087,6 +3122,38 @@ def test_ple_unsplit_checkpoint_key_maps_to_lookup():
 
 
 @_requires_cuda
+def test_ple_ngram_reciprocals_are_derived_buffer() -> None:
+    embedding, _ = _ngram_embedding_pair(False)
+    sizes = embedding.ngram_heads_vocab_sizes
+    reciprocal = embedding.ngram_mod_reciprocals
+    expected = prepare_ngram_reciprocals(sizes.cpu().tolist(), device=sizes.device)
+    assert torch.equal(reciprocal, expected)
+    assert reciprocal.dtype == torch.uint64
+    assert reciprocal.device == sizes.device
+    assert "ngram_mod_reciprocals" in dict(embedding.named_buffers())
+    assert "ngram_mod_reciprocals" not in embedding.state_dict()
+    embedding = embedding.cpu().to(dtype=torch.float32).cuda()
+    assert embedding.ngram_mod_reciprocals.dtype == torch.uint64
+    assert torch.equal(embedding.ngram_mod_reciprocals, expected)
+    replacement = sizes + 2
+    embedding.load_state_dict({"ngram_heads_vocab_sizes": replacement}, strict=False)
+    expected = prepare_ngram_reciprocals(
+        replacement.cpu().tolist(), device=replacement.device
+    )
+    assert torch.equal(embedding.ngram_mod_reciprocals, expected)
+    # The streaming model loader writes buffers directly, bypassing load_state_dict.
+    load_qwen4_exp_weights(
+        embedding,
+        SimpleNamespace(num_experts=None, split_ngram_parts=1),
+        SimpleNamespace(),
+        [("ngram_heads_vocab_sizes", sizes)],
+        include_visual=False,
+    )
+    expected = prepare_ngram_reciprocals(sizes.cpu().tolist(), device=sizes.device)
+    assert torch.equal(embedding.ngram_mod_reciprocals, expected)
+
+
+@_requires_cuda
 def test_ple_online_fp8_host_lookup_matches_device():
     device, host = _ngram_embedding_pair(True)
     rows = torch.randn_like(device.lookup.ngram_embedding.weight, dtype=torch.bfloat16)
@@ -3200,6 +3267,33 @@ def _ngram_embedding_pair(
     device.lookup.ngram_embedding.weight.data.copy_(payload)
     host.lookup.ngram_embedding.weight.data.copy_(payload.cpu())
     return device, host
+
+
+@_requires_cuda
+@pytest.mark.parametrize("store_fp8", [False, True])
+@pytest.mark.parametrize("scale_mode", ["none", "scalar", "row"])
+def test_ple_host_gather_shard_mask(store_fp8, scale_mode) -> None:
+    payload = torch.arange(4 * 37, dtype=torch.float32).reshape(4, 37) / 16
+    dtype = torch.float8_e4m3fn if store_fp8 else torch.bfloat16
+    table = payload.to(dtype).pin_memory()
+    ids = torch.tensor([9, 10, 13, 14, -1, 100], device="cuda")
+    out = torch.full((6, 37), float("nan"), device="cuda", dtype=torch.bfloat16)
+    scales = (
+        torch.tensor([2.0, 3.0, 4.0, 5.0], device="cuda")
+        if scale_mode == "row"
+        else None
+    )
+    scalar = 0.5 if scale_mode == "scalar" else None
+    ple_host_gather(table, ids, out, 10, 14, scalar, scales)
+    expected = torch.zeros_like(out)
+    for output_row, local_row in [(1, 0), (2, 3)]:
+        scale = (
+            scales[local_row]
+            if scales is not None
+            else scalar if scalar is not None else 1.0
+        )
+        expected[output_row] = table[local_row].float().cuda() * scale
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(

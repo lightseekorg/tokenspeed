@@ -749,6 +749,10 @@ def load_qwen4_exp_weights(
                     f"got {tuple(loaded_weight.shape)}"
                 )
             buffer.copy_(loaded_weight.to(device=buffer.device, dtype=buffer.dtype))
+            if buffer_name == "ngram_heads_vocab_sizes":
+                owner = dict(module.named_modules())[name.rpartition(".")[0]]
+                if isinstance(owner, Qwen4ExpNGramEmbedding):
+                    owner.refresh_ngram_reciprocals()
             loaded.add(name)
             continue
         scale_name = _load_ple_weight_scale(module, name, loaded_weight)

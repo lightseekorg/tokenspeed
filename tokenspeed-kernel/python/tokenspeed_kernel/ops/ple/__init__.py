@@ -41,8 +41,7 @@ import torch
 from tokenspeed_kernel._triton import triton as _triton
 from tokenspeed_kernel.ops.ple.triton import (
     _ngram_ids_kernel,
-    _ple_conv_final_kernel,
-    _ple_dilated_conv_kernel,
+    _ple_conv_state_kernel,
     _ple_gate_norm_kernel,
     _ple_host_gather_kernel,
     _ple_page_gather_kernel,
@@ -56,6 +55,7 @@ __all__ = [
     "ple_gate_norm",
     "ple_host_gather",
     "ple_ngram_ids",
+    "prepare_ngram_reciprocals",
     "ple_page_gather",
     "ple_page_gather_pair",
     "ple_page_scatter",
@@ -93,6 +93,23 @@ def ple_host_gather(
     return out
 
 
+def prepare_ngram_reciprocals(
+    vocab_sizes: list[int], *, device: torch.device
+) -> torch.Tensor:
+    """Prepare exact unsigned reciprocal parameters from host-known moduli.
+
+    Each size must be in [1, 2**63). Call once outside graph capture, and keep
+    the result paired with the identical device vocab_sizes tensor.
+    """
+    if any(not 1 <= size < 2**63 for size in vocab_sizes):
+        raise ValueError("ngram moduli must be positive signed int64 values")
+    return torch.tensor(
+        [0 if size == 1 else (1 << 64) // size for size in vocab_sizes],
+        dtype=torch.uint64,
+        device=device,
+    )
+
+
 def ple_ngram_ids(
     input_ids: torch.Tensor,
     initial: torch.Tensor,
@@ -108,6 +125,7 @@ def ple_ngram_ids(
     heads_per_ngram: int,
     eos_token_id: int,
     uniform_length: int,
+    mod_reciprocals: torch.Tensor | None,
     need_tail: bool = False,
     tail_out: torch.Tensor | None = None,
     tail_block_rows: int = 0,
@@ -129,6 +147,9 @@ def ple_ngram_ids(
         eos_token_id: Token that blocks the window from reaching further left.
         uniform_length: Common request length to derive and write the index
             tensors in this kernel, or zero when the tensors are already filled.
+        mod_reciprocals: Explicitly select exact integer reciprocal remainder;
+            uint64 floor(2**64 / size) per head (zero for size one), prepared
+            from the same positive sizes. None selects the division baseline.
         need_tail: Also return the packed raw trailing windows.
         tail_out: Optional verify scratch receiving carried and trailing contexts.
         tail_block_rows: Rows reserved per request in ``tail_out``.
@@ -148,6 +169,13 @@ def ple_ngram_ids(
     device = input_ids.device
     context_len = ngram_size - 1
     ngram_heads = context_len * heads_per_ngram
+    if mod_reciprocals is not None and (
+        mod_reciprocals.dtype != torch.uint64
+        or mod_reciprocals.device != device
+        or mod_reciprocals.shape != (ngram_heads,)
+        or not mod_reciprocals.is_contiguous()
+    ):
+        raise ValueError("mod_reciprocals must be a contiguous uint64 per-head tensor")
     ids = torch.empty((total, ngram_heads), dtype=torch.long, device=device)
     tail = (
         torch.empty((total, context_len), dtype=torch.long, device=device)
@@ -169,6 +197,7 @@ def ple_ngram_ids(
     work_items = max(total, batch_size) if scatter_tail else total
     if work_items == 0:
         return ids, tail
+    work_items *= ngram_heads
     block = min(256, max(32, _triton.next_power_of_2(work_items)))
     use_pdl = pdl_enabled()
     _ngram_ids_kernel[(_triton.cdiv(work_items, block),)](
@@ -181,6 +210,7 @@ def ple_ngram_ids(
         multipliers,
         vocab_sizes,
         offsets,
+        mod_reciprocals if mod_reciprocals is not None else vocab_sizes,
         ids,
         tail_out if scatter_tail else tail if need_tail else ids,
         total,
@@ -193,6 +223,7 @@ def ple_ngram_ids(
         UNIFORM_LENGTH=uniform_length,
         WRITE_TAIL=need_tail or scatter_tail,
         SCATTER_TAIL=scatter_tail,
+        USE_RECIPROCAL=mod_reciprocals is not None,
         ENABLE_PDL=use_pdl,
         BLOCK=block,
         num_warps=1 if block <= 32 else 4,
@@ -327,6 +358,8 @@ def ple_conv_sequences(
     dilation: int,
     kernel_size: int,
     state_len: int,
+    write_final: bool,
+    weights_independent: bool,
     add_terms: tuple[torch.Tensor, ...] = (),
     windows: torch.Tensor | None = None,
     windows_block_rows: int = 0,
@@ -349,6 +382,10 @@ def ple_conv_sequences(
         dilation: Stride between consecutive taps.
         kernel_size: Number of taps.
         state_len: Width of the carried state, ``(kernel_size - 1) * dilation``.
+        write_final: Produce trailing request states. Verify may disable this
+            while still writing carried rows and all rollback windows.
+        weights_independent: Weights are ready independently of the preceding
+            kernel. Enables pre-wait loads unless contiguity requires a copy.
         add_terms: Up to two full-width addends folded into the epilogue, each
             applied in order with a round to the output dtype in between. Only
             the last dimension has to be dense.
@@ -360,8 +397,8 @@ def ple_conv_sequences(
 
     Returns:
         A triple of the conv output shaped like ``values``, the trailing state
-        shaped ``[bs, channels, state_len]``, and the window tensor (an empty
-        placeholder when ``windows`` is ``None``).
+        shaped ``[bs, channels, state_len]`` (zero rows if disabled), and the
+        window tensor (an empty placeholder when ``windows`` is ``None``).
     """
 
     if len(add_terms) > 2:
@@ -405,16 +442,22 @@ def ple_conv_sequences(
     block_c = 256
     use_pdl = pdl_enabled()
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
-    if total_tokens:
-        grid = (total_tokens, _triton.cdiv(channels, block_c))
-        _ple_dilated_conv_kernel[grid](
+    final_conv = values.new_empty(
+        (batch_size if write_final else 0, channels, state_len)
+    )
+    work_items = max(total_tokens, batch_size if write_final or scatter_windows else 0)
+    if work_items:
+        grid = (work_items, _triton.cdiv(channels, block_c))
+        _ple_conv_state_kernel[grid](
             values_c,
             initial_c,
             weight.contiguous(),
             req,
             col,
+            lengths,
             starts,
             conv_output,
+            final_conv,
             windows,
             gated,
             residual,
@@ -422,30 +465,17 @@ def ple_conv_sequences(
             gated.stride(0),
             residual.stride(0),
             channels,
+            TOTAL=total_tokens,
+            BATCH=batch_size,
             D=dilation,
             K=kernel_size,
             STATE=state_len,
             WRITE_WINDOWS=write_windows,
             SCATTER_WINDOWS=scatter_windows,
+            WRITE_FINAL=write_final,
+            WEIGHTS_INDEPENDENT=weights_independent and weight.is_contiguous(),
             ADD_GATED=len(addends) > 0,
             ADD_RESIDUAL=len(addends) > 1,
-            ENABLE_PDL=use_pdl,
-            BLOCK_C=block_c,
-            **pdl_kwargs,
-        )
-    final_conv = values.new_empty((batch_size, channels, state_len))
-    if batch_size:
-        _ple_conv_final_kernel[(batch_size, _triton.cdiv(channels, block_c))](
-            values_c,
-            initial_c,
-            lengths,
-            starts,
-            final_conv,
-            windows,
-            windows_block_rows,
-            channels,
-            STATE=state_len,
-            WRITE_CARRIED=scatter_windows,
             ENABLE_PDL=use_pdl,
             BLOCK_C=block_c,
             **pdl_kwargs,

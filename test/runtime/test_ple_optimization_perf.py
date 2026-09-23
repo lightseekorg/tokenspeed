@@ -122,6 +122,7 @@ def test_ple_uniform_index_perf(batch_size: int, length: int, mode: str) -> None
             heads_per_ngram=4,
             eos_token_id=0,
             uniform_length=uniform_length,
+            mod_reciprocals=None,
         )
         return ids, req, col, lengths_t, starts
 
@@ -173,7 +174,7 @@ def test_ple_ngram_launch_config_perf(batch_size: int, length: int, mode: str) -
     use_pdl = pdl_enabled()
 
     def launch(block: int, warps: int):
-        _ngram_ids_kernel[((total + block - 1) // block,)](
+        _ngram_ids_kernel[((total * 8 + block - 1) // block,)](
             input_ids,
             initial,
             req,
@@ -183,6 +184,7 @@ def test_ple_ngram_launch_config_perf(batch_size: int, length: int, mode: str) -
             multipliers,
             vocab_sizes,
             offsets,
+            vocab_sizes,
             out,
             out,
             total,
@@ -195,6 +197,7 @@ def test_ple_ngram_launch_config_perf(batch_size: int, length: int, mode: str) -
             UNIFORM_LENGTH=0,
             WRITE_TAIL=False,
             SCATTER_TAIL=False,
+            USE_RECIPROCAL=False,
             ENABLE_PDL=use_pdl,
             BLOCK=block,
             num_warps=warps,

@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.ple import (
     ple_page_gather,
     ple_page_gather_pair,
     ple_page_scatter,
+    prepare_ngram_reciprocals,
 )
 from torch import nn
 
@@ -163,6 +164,15 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             torch.tensor(sizes, dtype=torch.long),
             persistent=True,
         )
+        # Derived from the same moduli and refreshed on checkpoint load. A buffer
+        # follows module device moves without adding a checkpoint requirement.
+        self.register_buffer(
+            "ngram_mod_reciprocals",
+            prepare_ngram_reciprocals(
+                sizes, device=self.ngram_heads_vocab_sizes.device
+            ),
+            persistent=False,
+        )
         self.register_buffer(
             "ngram_heads_offsets",
             torch.tensor(offsets, dtype=torch.long),
@@ -202,6 +212,36 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         value = ((value ^ (value >> 30)) * cls._SPLITMIX_M1) & cls._MASK64
         value = ((value ^ (value >> 27)) * cls._SPLITMIX_M2) & cls._MASK64
         return (value ^ (value >> 31)) & cls._MASK64
+
+    def refresh_ngram_reciprocals(self) -> None:
+        """Refresh derived divisors after loading moduli, never during forward."""
+        self.ngram_mod_reciprocals.copy_(
+            prepare_ngram_reciprocals(
+                self.ngram_heads_vocab_sizes.detach().cpu().tolist(),
+                device=self.ngram_heads_vocab_sizes.device,
+            )
+        )
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        self.refresh_ngram_reciprocals()
 
     def _build_layer_multipliers(self, size: int, seed: int) -> torch.Tensor:
         max_long = (1 << 63) - 1
@@ -269,6 +309,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             heads_per_ngram=self.heads_per_ngram,
             eos_token_id=self.eos_token_id,
             uniform_length=uniform_length,
+            mod_reciprocals=self.ngram_mod_reciprocals,
             need_tail=need_tail,
             tail_out=tail_out,
             tail_block_rows=tail_block_rows,
@@ -637,7 +678,8 @@ class Qwen4ExpPLELayer(nn.Module):
         ``add_terms`` are full-width ``[tokens, channels]`` tensors folded into
         the conv output in order, letting callers skip separate tensor adds.
         On CUDA, ``windows_out`` receives the carried row and per-token state
-        windows directly. The fallback caller fills its carried row separately.
+        windows directly and the unused final-state result has zero rows.
+        The fallback caller fills its carried row separately.
         """
         device = values.device
         req, col, lengths_t, starts, max_len, total, bs = (
@@ -730,6 +772,8 @@ class Qwen4ExpPLELayer(nn.Module):
             dilation=self.ngram_size,
             kernel_size=self.conv_kernel_size,
             state_len=state_len,
+            write_final=windows_out is None,
+            weights_independent=True,
             add_terms=add_terms,
             windows=windows,
             windows_block_rows=windows_block_rows,
