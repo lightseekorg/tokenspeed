@@ -37,13 +37,21 @@ from tokenspeed_kernel.ops.activation.triton import (
     situ_and_mul,
     swiglu_oai,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_hopper_plus, reason="PDL requires NVIDIA SM90+"
 )
 
 H = 7168
+
+
+@pytest.fixture(autouse=True)
+def restore_pdl():
+    previous = pdl_enabled()
+    pdl_enabled(overwrite=False)
+    yield
+    pdl_enabled(overwrite=previous)
 
 
 @triton.jit
@@ -95,11 +103,12 @@ def _scratch(tokens: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 def test_sigmoid_mul_waits_for_published_inputs():
     x = torch.randn(17, 4096, device="cuda", dtype=torch.bfloat16)
     gate = torch.randn_like(x)
-    serial = sigmoid_mul(x.clone(), gate, enable_pdl=False)
+    serial = sigmoid_mul(x.clone(), gate)
     target_x, target_gate = _unpublished(x, gate)
 
     _publish((x, gate), (target_x, target_gate))
-    pdl = sigmoid_mul(target_x, target_gate, enable_pdl=True)
+    pdl_enabled(overwrite=True)
+    pdl = sigmoid_mul(target_x, target_gate)
     assert torch.equal(pdl, serial)
 
 
@@ -112,11 +121,12 @@ def test_gated_activation_waits_for_published_input(operation: str):
     target = _unpublished(x)[0]
 
     def run(input_: torch.Tensor, enable_pdl: bool) -> torch.Tensor:
+        pdl_enabled(overwrite=enable_pdl)
         if operation == "silu":
-            return silu_and_mul(input_, limit=7.0, enable_pdl=enable_pdl)
+            return silu_and_mul(input_, limit=7.0)
         if operation == "swiglu":
-            return swiglu_oai(input_, alpha=1.702, limit=7.0, enable_pdl=enable_pdl)
-        return situ_and_mul(input_, beta=4.0, linear_beta=25.0, enable_pdl=enable_pdl)
+            return swiglu_oai(input_, alpha=1.702, limit=7.0)
+        return situ_and_mul(input_, beta=4.0, linear_beta=25.0)
 
     serial = run(x, False)
     _publish((x,), (target,))
@@ -129,9 +139,7 @@ def test_fused_gate_sigmoid_mul_add_waits_for_published_inputs():
     weight = torch.randn(3584, device="cuda", dtype=torch.bfloat16)
     shared = torch.randn_like(hidden)
     final = torch.randn_like(hidden)
-    serial = fused_gate_sigmoid_mul_add(
-        hidden, weight, shared, final.clone(), enable_pdl=False
-    )
+    serial = fused_gate_sigmoid_mul_add(hidden, weight, shared, final.clone())
     target_hidden, target_weight, target_shared, target_final = _unpublished(
         hidden, weight, shared, final
     )
@@ -140,8 +148,9 @@ def test_fused_gate_sigmoid_mul_add_waits_for_published_inputs():
         (hidden, weight, shared, final),
         (target_hidden, target_weight, target_shared, target_final),
     )
+    pdl_enabled(overwrite=True)
     pdl = fused_gate_sigmoid_mul_add(
-        target_hidden, target_weight, target_shared, target_final, enable_pdl=True
+        target_hidden, target_weight, target_shared, target_final
     )
     assert torch.equal(pdl, serial)
 
@@ -150,11 +159,12 @@ def test_add3_waits_for_published_inputs():
     a = torch.randn(17, 4096, device="cuda", dtype=torch.bfloat16)
     b = torch.randn_like(a)
     c = torch.randn_like(a)
-    serial = add3(a, b, c, enable_pdl=False)
+    serial = add3(a, b, c)
     targets = _unpublished(a, b, c)
 
     _publish((a, b, c), targets)
-    pdl = add3(*targets, enable_pdl=True)
+    pdl_enabled(overwrite=True)
+    pdl = add3(*targets)
     assert torch.equal(pdl, serial)
 
 
@@ -180,7 +190,7 @@ def test_attnres_combine_waits_for_published_scratch(use_norm: bool):
         torch.rand(H, dtype=torch.bfloat16, device="cuda") + 0.5 if use_norm else None
     )
     source_scratch = _scratch(tokens)
-    attnres_partial(blocks, weight, 1e-5, source_scratch, enable_pdl=False)
+    attnres_partial(blocks, weight, 1e-5, source_scratch)
     serial = attnres_combine(
         prefix,
         weight,
@@ -188,12 +198,12 @@ def test_attnres_combine_waits_for_published_scratch(use_norm: bool):
         1e-5,
         source_scratch,
         torch.empty_like(prefix),
-        enable_pdl=False,
     )
     target_scratch = _unpublished(*source_scratch)
     out = torch.empty_like(prefix)
 
     _publish(source_scratch, target_scratch)
+    pdl_enabled(overwrite=True)
     pdl = attnres_combine(
         prefix,
         weight,
@@ -201,7 +211,6 @@ def test_attnres_combine_waits_for_published_scratch(use_norm: bool):
         1e-5,
         target_scratch,
         out,
-        enable_pdl=True,
     )
     assert torch.equal(pdl, serial)
 
@@ -219,7 +228,7 @@ def test_attnres_partial_to_combine_pdl_chain(mode: str):
     if mode == "single":
         serial_scratch = _scratch(tokens)
         pdl_scratch = _unpublished(*serial_scratch)
-        attnres_partial(blocks, weight_a, 1e-5, serial_scratch, enable_pdl=False)
+        attnres_partial(blocks, weight_a, 1e-5, serial_scratch)
         serial = attnres_combine(
             prefix,
             weight_a,
@@ -227,19 +236,15 @@ def test_attnres_partial_to_combine_pdl_chain(mode: str):
             1e-5,
             serial_scratch,
             torch.empty_like(prefix),
-            enable_pdl=False,
         )
-        attnres_partial(blocks, weight_a, 1e-5, pdl_scratch, enable_pdl=True)
-        pdl = attnres_combine(
-            prefix, weight_a, None, 1e-5, pdl_scratch, out, enable_pdl=True
-        )
+        pdl_enabled(overwrite=True)
+        attnres_partial(blocks, weight_a, 1e-5, pdl_scratch)
+        pdl = attnres_combine(prefix, weight_a, None, 1e-5, pdl_scratch, out)
     else:
         serial_a, serial_b = _scratch(tokens), _scratch(tokens)
         pdl_a = _unpublished(*serial_a)
         pdl_b = _unpublished(*serial_b)
-        attnres_partial_dual(
-            blocks, weight_a, weight_b, 1e-5, serial_a, serial_b, enable_pdl=False
-        )
+        attnres_partial_dual(blocks, weight_a, weight_b, 1e-5, serial_a, serial_b)
         weight, serial_scratch, pdl_scratch = (
             (weight_a, serial_a, pdl_a)
             if mode == "dual_a"
@@ -252,13 +257,9 @@ def test_attnres_partial_to_combine_pdl_chain(mode: str):
             1e-5,
             serial_scratch,
             torch.empty_like(prefix),
-            enable_pdl=False,
         )
-        attnres_partial_dual(
-            blocks, weight_a, weight_b, 1e-5, pdl_a, pdl_b, enable_pdl=True
-        )
-        pdl = attnres_combine(
-            prefix, weight, None, 1e-5, pdl_scratch, out, enable_pdl=True
-        )
+        pdl_enabled(overwrite=True)
+        attnres_partial_dual(blocks, weight_a, weight_b, 1e-5, pdl_a, pdl_b)
+        pdl = attnres_combine(prefix, weight, None, 1e-5, pdl_scratch, out)
 
     assert torch.equal(pdl, serial)

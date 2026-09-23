@@ -630,7 +630,7 @@ class AttnResTests(unittest.TestCase):
                     mock.patch.object(
                         kimi_k3,
                         "attnres_partial",
-                        side_effect=lambda *_args, **_kwargs: events.append("partial"),
+                        side_effect=lambda *_args: events.append("partial"),
                     ),
                 ):
                     kimi_k3.KimiLinearDecoderLayer.forward(

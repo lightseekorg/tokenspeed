@@ -11,11 +11,20 @@ from tokenspeed_kernel.ops.activation.triton import (
     attnres_partial,
     attnres_partial_dual,
 )
+from tokenspeed_kernel.platform import pdl_enabled
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
 H = 7168  # K3 hidden size; the kernels static-assert two 4096 sweeps.
+
+
+@pytest.fixture(autouse=True)
+def disable_pdl():
+    previous = pdl_enabled()
+    pdl_enabled(overwrite=False)
+    yield
+    pdl_enabled(overwrite=previous)
 
 
 def _reference(prefix, blocks, wp, eps, out_w):
@@ -55,8 +64,8 @@ def test_partial_combine_parity(T, KB, use_norm):
 
     scratch = _scratch(T)
     out = torch.empty(T, H, dtype=torch.bfloat16, device="cuda")
-    attnres_partial(blocks, wp, eps, scratch, enable_pdl=False)
-    attnres_combine(prefix, wp, out_w, eps, scratch, out, enable_pdl=False)
+    attnres_partial(blocks, wp, eps, scratch)
+    attnres_combine(prefix, wp, out_w, eps, scratch, out)
 
     ref = _reference(prefix, blocks, wp, eps, out_w)
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
@@ -71,9 +80,9 @@ def test_partial_dual_matches_two_singles(T, KB):
     wp_a = torch.randn(H, dtype=torch.bfloat16, device="cuda")
     wp_b = torch.randn(H, dtype=torch.bfloat16, device="cuda")
     sa, sb, ra, rb = _scratch(T), _scratch(T), _scratch(T), _scratch(T)
-    attnres_partial_dual(blocks, wp_a, wp_b, 1e-5, sa, sb, enable_pdl=False)
-    attnres_partial(blocks, wp_a, 1e-5, ra, enable_pdl=False)
-    attnres_partial(blocks, wp_b, 1e-5, rb, enable_pdl=False)
+    attnres_partial_dual(blocks, wp_a, wp_b, 1e-5, sa, sb)
+    attnres_partial(blocks, wp_a, 1e-5, ra)
+    attnres_partial(blocks, wp_b, 1e-5, rb)
     for got, ref in ((sa, ra), (sb, rb)):
         for x, y in zip(got, ref):
             torch.testing.assert_close(x, y, atol=1e-4, rtol=1e-4)
@@ -89,8 +98,8 @@ def test_partial_dual_probes_are_independent(T, KB):
     wp_b = torch.randn(H, dtype=torch.bfloat16, device="cuda") * 0.05
     ab_a, ab_b = _scratch(T), _scratch(T)
     ba_a, ba_b = _scratch(T), _scratch(T)
-    attnres_partial_dual(blocks, wp_a, wp_b, 1e-5, ab_a, ab_b, enable_pdl=False)
-    attnres_partial_dual(blocks, wp_b, wp_a, 1e-5, ba_a, ba_b, enable_pdl=False)
+    attnres_partial_dual(blocks, wp_a, wp_b, 1e-5, ab_a, ab_b)
+    attnres_partial_dual(blocks, wp_b, wp_a, 1e-5, ba_a, ba_b)
     for got, ref, side in ((ba_b, ab_a, "A->B"), (ba_a, ab_b, "B->A")):
         for x, y in zip(got, ref):
             assert torch.equal(x, y), f"probe {side} changed when slots swapped"

@@ -459,7 +459,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 hidden_states, block_scale, torch.bfloat16
             )
             if attnres_partial_args is not None:
-                attnres_partial_dual(*attnres_partial_args, enable_pdl=pdl_enabled())
+                attnres_partial_dual(*attnres_partial_args)
             if self._fused_qkv_a_pad_rows:
                 # Drop the zero pad rows of the 128-aligned FP8 projection
                 # before anything consumes the output.
@@ -474,7 +474,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             # (can_fuse_attnres_partials already returns False for FP8
             # weights, so args are normally None here.)
             if attnres_partial_args is not None:
-                attnres_partial_dual(*attnres_partial_args, enable_pdl=pdl_enabled())
+                attnres_partial_dual(*attnres_partial_args)
             qkv_gate = self.fused_qkv_a_proj_with_mqa(hidden_states)
             if self._fused_qkv_a_pad_rows:
                 # Drop the zero pad rows of the 128-aligned FP8 projection
@@ -594,7 +594,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             )
         else:
             if attnres_partial_args is not None:
-                attnres_partial_dual(*attnres_partial_args, enable_pdl=pdl_enabled())
+                attnres_partial_dual(*attnres_partial_args)
             q, latent_cache = self._project_q_latent(
                 hidden_states, ctx, comm_manager, block_scale
             )
@@ -616,7 +616,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         if gate is not None and not fuse_value_gate:
             # Fused in-place fp32 sigmoid+mul; the gate shard matches the
             # head-sharded attn_output.
-            attn_output = sigmoid_mul(attn_output, gate, enable_pdl=pdl_enabled())
+            attn_output = sigmoid_mul(attn_output, gate)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -1195,7 +1195,7 @@ class KimiLinearKDA(nn.Module):
             Fp8LinearMethod,
         ):
             if attnres_partial_args is not None:
-                attnres_partial_dual(*attnres_partial_args, enable_pdl=pdl_enabled())
+                attnres_partial_dual(*attnres_partial_args)
             output = fp8_linear(
                 self.qkvgb_proj._prepared_fp8_linear,
                 hidden_states,
@@ -2471,7 +2471,6 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.self_attention_res_norm.variance_epsilon,
                 _sliced_scratch(prefix_sum, 1, n_tok),
                 torch.empty_like(prefix_sum),
-                enable_pdl=pdl_enabled(),
             )
         else:
             h = _apply_attn_res(
@@ -2636,7 +2635,6 @@ class KimiLinearDecoderLayer(nn.Module):
                 next_layer.mlp_res_norm.variance_epsilon,
                 _sliced_scratch(hidden_states, next_layer._mlp_slot, num_tokens),
                 attn_scratch,
-                enable_pdl=pdl_enabled(),
             )
         else:
             attnres_partial(
@@ -2644,7 +2642,6 @@ class KimiLinearDecoderLayer(nn.Module):
                 next_layer._attn_wp,
                 next_layer.self_attention_res_norm.variance_epsilon,
                 attn_scratch,
-                enable_pdl=pdl_enabled(),
             )
 
     @torch.no_grad()
@@ -2748,7 +2745,6 @@ class KimiLinearDecoderLayer(nn.Module):
                                 self.mlp_res_norm.variance_epsilon,
                                 _sliced_scratch(h, next_layer._mlp_slot, num_tokens),
                                 sc1,
-                                enable_pdl=pdl_enabled(),
                             )
                     else:
                         attnres_partial(
@@ -2756,7 +2752,6 @@ class KimiLinearDecoderLayer(nn.Module):
                             next_layer._attn_wp,
                             self.mlp_res_norm.variance_epsilon,
                             sc1,
-                            enable_pdl=pdl_enabled(),
                         )
                 if own_mlp:
                     attnres_partial(
@@ -2764,7 +2759,6 @@ class KimiLinearDecoderLayer(nn.Module):
                         self._mlp_wp,
                         self.mlp_res_norm.variance_epsilon,
                         scratch,
-                        enable_pdl=pdl_enabled(),
                     )
             attn_out = self.self_attn(
                 positions=positions,
@@ -2792,7 +2786,6 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.mlp_res_norm.variance_epsilon,
                 scratch,
                 torch.empty_like(prefix_sum),
-                enable_pdl=pdl_enabled(),
             )
         else:
             h = _apply_attn_res(

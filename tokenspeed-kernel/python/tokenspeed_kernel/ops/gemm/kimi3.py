@@ -704,7 +704,7 @@ def kimi3_latent_projection_add3(
 
             normalized = rmsnorm(hidden_states, norm_weight, eps)
             projected = torch.nn.functional.linear(normalized, weight)
-            return add3(prefix, projected, shared_output, enable_pdl=pdl_enabled())
+            return add3(prefix, projected, shared_output)
         if (
             solution == "auto"
             and Platform.get().is_cdna4
@@ -850,7 +850,7 @@ def kimi3_latent_projection_add3(
     projected = kimi3_latent_projection(hidden_states, weight)
     from tokenspeed_kernel.ops.activation.triton import add3
 
-    return add3(prefix, projected, shared_output, enable_pdl=pdl_enabled())
+    return add3(prefix, projected, shared_output)
 
 
 def kimi3_shared_situ_projection(
@@ -957,7 +957,6 @@ def kimi3_shared_situ_projection(
         return situ_and_mul(
             gate_up,
             out=out,
-            enable_pdl=pdl_enabled(),
             beta=beta,
             linear_beta=linear_beta,
         )

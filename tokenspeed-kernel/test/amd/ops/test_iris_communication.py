@@ -914,7 +914,7 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
             torch.empty(num_tokens, device=device, dtype=torch.float32),
             torch.empty(num_tokens, hidden, device=device, dtype=torch.float32),
         )
-        attnres_partial(blocks, score_weight, 1e-6, scratch, enable_pdl=False)
+        attnres_partial(blocks, score_weight, 1e-6, scratch)
 
         reduced = iris_all_reduce(state, local.clone(), safe=False)
         expected_residual = residual + reduced
@@ -925,7 +925,6 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
             1e-6,
             scratch,
             torch.empty_like(residual),
-            enable_pdl=False,
         )
         assert allreduce_residual_attnres_combine_supported(
             local,
@@ -988,7 +987,6 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
                 1e-6,
                 scratch,
                 torch.empty_like(residual),
-                enable_pdl=False,
             )
             dist.barrier()
             if rank == replay:

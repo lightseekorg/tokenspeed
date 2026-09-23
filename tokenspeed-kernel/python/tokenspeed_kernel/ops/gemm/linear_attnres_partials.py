@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.gemm.kimi3 import KIMI3_HIDDEN_SIZE
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -326,7 +326,6 @@ def linear_attnres_partials(
             eps,
             scratch_a,
             scratch_b,
-            enable_pdl=pdl_enabled(),
         )
     else:
         values = blocks.float()

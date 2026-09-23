@@ -34,7 +34,7 @@ from tokenspeed_kernel.ops.gemm.cute_dsl import (
     nvfp4_gemm_swiglu_nvfp4_quant,
 )
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen3_5_text_base_config import Qwen3_5BaseTextConfig
@@ -421,7 +421,6 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
                     self.shared_expert_gate.weight.squeeze(0),
                     shared_output,
                     final_hidden_states,
-                    enable_pdl=pdl_enabled(),
                 )
             else:
                 final_hidden_states = final_hidden_states + shared_output
@@ -489,7 +488,6 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
                     self.shared_expert_gate.weight.squeeze(0),
                     shared_output,
                     final_hidden_states,
-                    enable_pdl=pdl_enabled(),
                 )
             else:
                 final_hidden_states = final_hidden_states + shared_output

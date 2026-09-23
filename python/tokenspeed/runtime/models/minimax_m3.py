@@ -31,7 +31,7 @@ from tokenspeed_kernel.ops.activation.triton import swiglu_oai
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda.minimax_m3_fused import (
     fused_qknorm_rope_kv_insert,
 )
@@ -152,7 +152,6 @@ class MiniMaxM3MLP(nn.Module):
             gate_up,
             alpha=self.swiglu_alpha,
             limit=self.swiglu_limit,
-            enable_pdl=pdl_enabled(),
         )
         output, _ = self.down_proj(activated)
         return output

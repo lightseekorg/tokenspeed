@@ -37,23 +37,20 @@ def silu_and_mul(
     x: torch.Tensor,
     out: torch.Tensor | None = None,
     limit: float | None = None,
-    *,
-    enable_pdl: bool,
 ) -> torch.Tensor:
     """Apply SwiGLU through the platform implementation.
 
     Positive ``limit`` values use the portable Triton implementation because
     the CUDA implementation does not expose the checkpoint's clamp semantics.
 
-    ``enable_pdl`` selects Programmatic Dependent Launch for the chosen kernel.
     """
     if (
         limit is not None
         or current_platform().is_amd
         or flashinfer_silu_and_mul is error_fn
     ):
-        return triton_silu_and_mul(x, out, enable_pdl=enable_pdl, limit=limit)
-    return flashinfer_silu_and_mul(x, out, enable_pdl=enable_pdl)
+        return triton_silu_and_mul(x, out, limit=limit)
+    return flashinfer_silu_and_mul(x, out, enable_pdl=pdl_enabled())
 
 
 def prepare_fp8_linear_activation(
@@ -98,21 +95,16 @@ def situ_and_mul(
     x: torch.Tensor,
     out: torch.Tensor | None = None,
     *,
-    enable_pdl: bool,
     beta: float = 1.0,
     linear_beta: float | None = None,
 ) -> torch.Tensor:
-    """Apply SiTU through the portable Triton implementation.
-
-    ``enable_pdl`` selects Programmatic Dependent Launch.
-    """
+    """Apply SiTU through the portable Triton implementation."""
 
     return triton_situ_and_mul(
         x,
         out,
         beta=beta,
         linear_beta=linear_beta,
-        enable_pdl=enable_pdl,
     )
 
 

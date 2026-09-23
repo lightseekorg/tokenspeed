@@ -289,7 +289,6 @@ def test_kimi3_shared_situ_projection_matches_reference_and_captures(
         gate_up,
         beta=1.5,
         linear_beta=linear_beta,
-        enable_pdl=False,
     )
 
     graph = torch.cuda.CUDAGraph()

@@ -28,7 +28,7 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel import prepare_fp8_linear_activation, silu_and_mul
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.utils import (
     get_colorful_logger,
@@ -92,7 +92,6 @@ class SiluAndMul(torch.nn.Module):
                 x,
                 out,
                 limit=self.swiglu_limit,
-                enable_pdl=pdl_enabled(),
             )
 
         if fp8_out:
@@ -103,7 +102,6 @@ class SiluAndMul(torch.nn.Module):
             x,
             out,
             limit=self.swiglu_limit,
-            enable_pdl=pdl_enabled(),
         )
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
@@ -164,7 +162,6 @@ class SituAndMul(torch.nn.Module):
 
             return situ_and_mul(
                 x,
-                enable_pdl=pdl_enabled(),
                 beta=self.beta,
                 linear_beta=self.linear_beta,
             )

@@ -442,9 +442,7 @@ class Glm53FlashMLP(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
         gate_up, _ = self.gate_up_proj(hidden_states)
-        activated = silu_and_mul(
-            gate_up, limit=self.swiglu_limit, enable_pdl=pdl_enabled()
-        )
+        activated = silu_and_mul(gate_up, limit=self.swiglu_limit)
         output, _ = self.down_proj(activated)
         return output
 

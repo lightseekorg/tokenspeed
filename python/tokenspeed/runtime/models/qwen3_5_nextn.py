@@ -26,7 +26,6 @@ from dataclasses import replace
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
-from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -110,7 +109,7 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
             record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
         )
         if gate is not None:
-            sigmoid_mul(attn_output, gate, enable_pdl=pdl_enabled())
+            sigmoid_mul(attn_output, gate)
         return attn_output
 
     def _maybe_narrow_residual(
