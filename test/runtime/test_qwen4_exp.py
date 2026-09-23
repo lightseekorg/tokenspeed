@@ -25,6 +25,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.ple import ple_page_gather_pair
 
 import tokenspeed.runtime.layers.attention.backends.paged.qsa as qsa_backend_module
 import tokenspeed.runtime.layers.attention.qsa.indexer as qsa_indexer_module
@@ -2310,7 +2311,7 @@ def test_ngram_ids_flat_kernel_matches_legacy(ngram_size, lengths) -> None:
 
     # The bundle's starts feed the hash kernel's addressing, so a wrong scan
     # here would show up as mismatched ids rather than passing silently.
-    req, col, _, starts, _, tot, _ = Qwen4ExpPLELayer._batch_indices(
+    req, col, lengths_t, starts, _, tot, _ = Qwen4ExpPLELayer._batch_indices(
         lengths, torch.device("cuda")
     )
     stub.layer_multipliers = stub.layer_multipliers.cuda()
@@ -2318,12 +2319,14 @@ def test_ngram_ids_flat_kernel_matches_legacy(ngram_size, lengths) -> None:
     stub.ngram_heads_offsets = stub.ngram_heads_offsets.cuda()
     flat = Qwen4ExpNGramEmbedding._ngram_ids_flat_cuda.__get__(stub)
 
-    ids, tail = flat(flat_ids.cuda(), initial.cuda(), req, col, starts, need_tail=True)
+    ids, tail = flat(
+        flat_ids.cuda(), initial.cuda(), req, col, lengths_t, starts, True, 0
+    )
     assert torch.equal(ids.cpu(), reference)
     assert torch.equal(tail.cpu(), contexts[:, 1:])
 
     ids_only, no_tail = flat(
-        flat_ids.cuda(), initial.cuda(), req, col, starts, need_tail=False
+        flat_ids.cuda(), initial.cuda(), req, col, lengths_t, starts, False, 0
     )
     assert torch.equal(ids_only.cpu(), reference)
     assert no_tail is None
@@ -2337,8 +2340,10 @@ def test_ngram_ids_flat_kernel_matches_legacy(ngram_size, lengths) -> None:
         initial.cuda(),
         req,
         col,
+        lengths_t,
         starts,
-        need_tail=False,
+        False,
+        0,
         tail_out=scratch,
         tail_block_rows=stride,
     )
@@ -2352,6 +2357,63 @@ def test_ngram_ids_flat_kernel_matches_legacy(ngram_size, lengths) -> None:
     untouched[initial_rows] = False
     untouched[token_rows] = False
     assert torch.all(scratch[untouched] == -1)
+
+    if total and len(set(lengths)) == 1:
+        uniform_index, uniform_length = Qwen4ExpPLELayer._prefetch_indices(
+            lengths, torch.device("cuda")
+        )
+        fast_req, fast_col, fast_lengths, fast_starts, _, _, _ = uniform_index
+        fast_ids, fast_tail = flat(
+            flat_ids.cuda(),
+            initial.cuda(),
+            fast_req,
+            fast_col,
+            fast_lengths,
+            fast_starts,
+            True,
+            uniform_length,
+        )
+        assert torch.equal(fast_ids.cpu(), reference)
+        assert torch.equal(fast_tail.cpu(), contexts[:, 1:])
+        torch.testing.assert_close(fast_req, req)
+        torch.testing.assert_close(fast_col, col)
+        torch.testing.assert_close(fast_lengths, lengths_t)
+        torch.testing.assert_close(fast_starts, starts)
+
+        fast_scratch = torch.full_like(scratch, -1)
+        fast_ids, fast_tail = flat(
+            flat_ids.cuda(),
+            initial.cuda(),
+            fast_req,
+            fast_col,
+            fast_lengths,
+            fast_starts,
+            False,
+            uniform_length,
+            tail_out=fast_scratch,
+            tail_block_rows=stride,
+        )
+        assert torch.equal(fast_ids.cpu(), reference)
+        assert fast_tail is None
+        torch.testing.assert_close(fast_scratch, scratch)
+
+
+@_requires_cuda
+def test_ple_page_gather_pair_matches_separate_reads() -> None:
+    context = torch.empty((3, 4), dtype=torch.long, device="cuda")[:, :2]
+    conv_storage = torch.empty((3, 32), dtype=torch.bfloat16, device="cuda")
+    conv = conv_storage.as_strided((3, 4, 6), (32, 6, 1))
+    context[1:] = torch.tensor([[11, 12], [21, 22]], device="cuda")
+    conv[1:] = torch.arange(48, device="cuda").reshape(2, 4, 6)
+    pages = torch.tensor([0, 2, 1, 0], dtype=torch.int32, device="cuda")
+
+    actual_context, actual_conv = ple_page_gather_pair(
+        context, conv, pages, context.stride(0), conv.stride(0), 99
+    )
+    expected_context = Qwen4ExpPLELayer._read_pages(context, pages, 99)
+    expected_conv = Qwen4ExpPLELayer._read_pages(conv, pages)
+    torch.testing.assert_close(actual_context, expected_context)
+    torch.testing.assert_close(actual_conv, expected_conv)
 
 
 @pytest.mark.parametrize("lengths", _PLE_LENGTH_CASES)
@@ -2800,13 +2862,12 @@ def test_ple_host_prefetch_matches_inline_gather(store_fp8: bool) -> None:
         torch.tensor(lengths, device="cuda"),
     )
     col = torch.cat([torch.arange(length, device="cuda") for length in lengths])
-    starts = torch.cumsum(
-        torch.tensor([0] + lengths[:-1], device="cuda"), dim=0
-    )
+    lengths_t = torch.tensor(lengths, device="cuda", dtype=torch.long)
+    starts = torch.cumsum(torch.tensor([0] + lengths[:-1], device="cuda"), dim=0)
 
     inline, _ = _lookup_flat(host, input_ids, initial, req, col, starts)
     ids, _ = host._ngram_ids_flat_cuda(
-        input_ids, initial, req, col, starts, False
+        input_ids, initial, req, col, lengths_t, starts, False, 0
     )
     pending = host.lookup.start(ids, host.lookup.make_layout(None, ids.shape[0]))
     with torch.cuda.stream(torch.cuda.Stream()):
@@ -3067,8 +3128,9 @@ def test_ple_device_lookup_cross_stream(monkeypatch):
 
 
 def _lookup_flat(embedding, input_ids, initial, req, col, starts):
+    lengths_t = torch.empty(initial.shape[0], device=input_ids.device, dtype=torch.long)
     ids, tail = embedding._ngram_ids_flat_cuda(
-        input_ids, initial, req, col, starts, False
+        input_ids, initial, req, col, lengths_t, starts, False, 0
     )
     lookup = embedding.lookup
     return (

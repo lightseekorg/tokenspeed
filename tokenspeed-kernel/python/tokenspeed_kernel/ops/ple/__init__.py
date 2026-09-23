@@ -46,6 +46,7 @@ from tokenspeed_kernel.ops.ple.triton import (
     _ple_gate_norm_kernel,
     _ple_host_gather_kernel,
     _ple_page_gather_kernel,
+    _ple_page_gather_pair_kernel,
     _ple_page_scatter_kernel,
 )
 from tokenspeed_kernel.platform import pdl_enabled
@@ -56,6 +57,7 @@ __all__ = [
     "ple_host_gather",
     "ple_ngram_ids",
     "ple_page_gather",
+    "ple_page_gather_pair",
     "ple_page_scatter",
 ]
 
@@ -96,6 +98,7 @@ def ple_ngram_ids(
     initial: torch.Tensor,
     req: torch.Tensor,
     col: torch.Tensor,
+    lengths: torch.Tensor,
     starts: torch.Tensor,
     multipliers: torch.Tensor,
     vocab_sizes: torch.Tensor,
@@ -104,6 +107,7 @@ def ple_ngram_ids(
     ngram_size: int,
     heads_per_ngram: int,
     eos_token_id: int,
+    uniform_length: int,
     need_tail: bool = False,
     tail_out: torch.Tensor | None = None,
     tail_block_rows: int = 0,
@@ -115,6 +119,7 @@ def ple_ngram_ids(
         initial: Carried context ids shaped ``[bs, ngram_size - 1]``.
         req: Owning request index per token row.
         col: Position within the request per token row.
+        lengths: Number of tokens in each request.
         starts: First flat row of each request, shaped ``[bs]``.
         multipliers: Int64 SplitMix multipliers shaped ``[ngram_size]``.
         vocab_sizes: Per-head hash moduli shaped ``[ngram_heads]``.
@@ -122,6 +127,8 @@ def ple_ngram_ids(
         ngram_size: Window width, including the anchor.
         heads_per_ngram: Independent hash heads per window position.
         eos_token_id: Token that blocks the window from reaching further left.
+        uniform_length: Common request length to derive and write the index
+            tensors in this kernel, or zero when the tensors are already filled.
         need_tail: Also return the packed raw trailing windows.
         tail_out: Optional verify scratch receiving carried and trailing contexts.
         tail_block_rows: Rows reserved per request in ``tail_out``.
@@ -136,6 +143,8 @@ def ple_ngram_ids(
         raise ValueError("need_tail and tail_out are mutually exclusive")
     total = input_ids.shape[0]
     batch_size = initial.shape[0]
+    if uniform_length < 0 or (uniform_length and total != batch_size * uniform_length):
+        raise ValueError("uniform_length must cover every input token")
     device = input_ids.device
     context_len = ngram_size - 1
     ngram_heads = context_len * heads_per_ngram
@@ -160,13 +169,14 @@ def ple_ngram_ids(
     work_items = max(total, batch_size) if scatter_tail else total
     if work_items == 0:
         return ids, tail
-    block = 256
+    block = min(256, max(32, _triton.next_power_of_2(work_items)))
     use_pdl = pdl_enabled()
     _ngram_ids_kernel[(_triton.cdiv(work_items, block),)](
         input_ids.contiguous(),
         initial.contiguous(),
         req,
         col,
+        lengths,
         starts,
         multipliers,
         vocab_sizes,
@@ -180,10 +190,12 @@ def ple_ngram_ids(
         N=ngram_size,
         HPN=heads_per_ngram,
         H=ngram_heads,
+        UNIFORM_LENGTH=uniform_length,
         WRITE_TAIL=need_tail or scatter_tail,
         SCATTER_TAIL=scatter_tail,
         ENABLE_PDL=use_pdl,
         BLOCK=block,
+        num_warps=1 if block <= 32 else 4,
         **({"launch_pdl": True} if use_pdl else {}),
     )
     return ids, tail
@@ -227,6 +239,45 @@ def ple_page_gather(
         **({"launch_pdl": True} if use_pdl else {}),
     )
     return out
+
+
+def ple_page_gather_pair(
+    context: torch.Tensor,
+    conv: torch.Tensor,
+    page_ids: torch.Tensor,
+    context_stride: int,
+    conv_stride: int,
+    context_default: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Read context and convolution state for the same page IDs in one launch."""
+
+    rows = page_ids.shape[0]
+    context_out = context.new_empty((rows, *context.shape[1:]))
+    conv_out = conv.new_empty((rows, *conv.shape[1:]))
+    if rows == 0:
+        return context_out, conv_out
+    context_numel = context_out[0].numel()
+    conv_numel = conv_out[0].numel()
+    block = min(1024, _triton.next_power_of_2(max(context_numel, conv_numel)))
+    use_pdl = pdl_enabled()
+    _ple_page_gather_pair_kernel[
+        (rows, _triton.cdiv(max(context_numel, conv_numel), block))
+    ](
+        context,
+        conv,
+        page_ids,
+        context_out,
+        conv_out,
+        context_default,
+        context_stride,
+        conv_stride,
+        CONTEXT_N=context_numel,
+        CONV_N=conv_numel,
+        ENABLE_PDL=use_pdl,
+        BLOCK=block,
+        **({"launch_pdl": True} if use_pdl else {}),
+    )
+    return context_out, conv_out
 
 
 def ple_page_scatter(

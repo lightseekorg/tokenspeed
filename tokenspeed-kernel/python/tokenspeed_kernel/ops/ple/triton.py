@@ -53,6 +53,7 @@ def _ngram_ids_kernel(
     init_ptr,
     req_ptr,
     col_ptr,
+    lengths_ptr,
     starts_ptr,
     mult_ptr,
     sizes_ptr,
@@ -66,6 +67,7 @@ def _ngram_ids_kernel(
     N: tl.constexpr,
     HPN: tl.constexpr,
     H: tl.constexpr,
+    UNIFORM_LENGTH: tl.constexpr,
     WRITE_TAIL: tl.constexpr,
     SCATTER_TAIL: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
@@ -88,9 +90,19 @@ def _ngram_ids_kernel(
     mask = rows < total
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
-    req = tl.load(req_ptr + rows, mask=mask, other=0).to(tl.int64)
-    col = tl.load(col_ptr + rows, mask=mask, other=0).to(tl.int64)
-    start = tl.load(starts_ptr + req, mask=mask, other=0).to(tl.int64)
+    if UNIFORM_LENGTH:
+        req = (rows // UNIFORM_LENGTH).to(tl.int64)
+        col = (rows % UNIFORM_LENGTH).to(tl.int64)
+        start = req * UNIFORM_LENGTH
+        tl.store(req_ptr + rows, req, mask=mask)
+        tl.store(col_ptr + rows, col, mask=mask)
+        request_mask = rows < batch_size
+        tl.store(lengths_ptr + rows, UNIFORM_LENGTH, mask=request_mask)
+        tl.store(starts_ptr + rows, rows * UNIFORM_LENGTH, mask=request_mask)
+    else:
+        req = tl.load(req_ptr + rows, mask=mask, other=0).to(tl.int64)
+        col = tl.load(col_ptr + rows, mask=mask, other=0).to(tl.int64)
+        start = tl.load(starts_ptr + req, mask=mask, other=0).to(tl.int64)
 
     tail_row = rows.to(tl.int64)
     if SCATTER_TAIL:
@@ -168,6 +180,54 @@ def _ple_page_gather_kernel(
         other=default.to(field_dtype),
     )
     tl.store(out_ptr + row * N + off, value, mask=mask)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@triton.jit
+def _ple_page_gather_pair_kernel(
+    context_ptr,
+    conv_ptr,
+    page_ptr,
+    context_out_ptr,
+    conv_out_ptr,
+    context_default,
+    context_stride,
+    conv_stride,
+    CONTEXT_N: tl.constexpr,
+    CONV_N: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    off = tile * BLOCK + tl.arange(0, BLOCK)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    page = tl.load(page_ptr + row).to(tl.int64)
+    if tile == 0:
+        context_dtype = context_ptr.dtype.element_ty
+        context = tl.load(
+            context_ptr + tl.maximum(page, 0) * context_stride + off,
+            mask=(off < CONTEXT_N) & (page > 0),
+            other=context_default.to(context_dtype),
+        )
+        tl.store(
+            context_out_ptr + row * CONTEXT_N + off,
+            context,
+            mask=off < CONTEXT_N,
+        )
+    conv_dtype = conv_ptr.dtype.element_ty
+    conv = tl.load(
+        conv_ptr + tl.maximum(page, 0) * conv_stride + off,
+        mask=(off < CONV_N) & (page > 0),
+        other=0.0,
+    )
+    tl.store(
+        conv_out_ptr + row * CONV_N + off,
+        conv.to(conv_dtype),
+        mask=off < CONV_N,
+    )
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 

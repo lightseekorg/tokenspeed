@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.ple import (
     ple_gate_norm,
     ple_ngram_ids,
     ple_page_gather,
+    ple_page_gather_pair,
     ple_page_scatter,
 )
 from torch import nn
@@ -247,8 +248,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         initial: torch.Tensor,
         req: torch.Tensor,
         col: torch.Tensor,
+        lengths_t: torch.Tensor,
         starts: torch.Tensor,
         need_tail: bool,
+        uniform_length: int,
         tail_out: torch.Tensor | None = None,
         tail_block_rows: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -257,6 +260,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             initial,
             req,
             col,
+            lengths_t,
             starts,
             self.layer_multipliers,
             self.ngram_heads_vocab_sizes,
@@ -264,6 +268,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ngram_size=self.ngram_size,
             heads_per_ngram=self.heads_per_ngram,
             eos_token_id=self.eos_token_id,
+            uniform_length=uniform_length,
             need_tail=need_tail,
             tail_out=tail_out,
             tail_block_rows=tail_block_rows,
@@ -290,6 +295,7 @@ class _PleExecutionPlan(NamedTuple):
     num_real_tokens: int
     flat_ids: torch.Tensor
     index: tuple
+    uniform_length: int
     output_pages: torch.Tensor
     context_field: torch.Tensor
     conv_field: torch.Tensor
@@ -563,6 +569,21 @@ class Qwen4ExpPLELayer(nn.Module):
             req = torch.searchsorted(ends.contiguous(), positions, right=True)
             col = positions - starts[req]
         return req, col, lengths_t, starts, max_len, total, bs
+
+    @staticmethod
+    def _prefetch_indices(
+        lengths: list[int], device: torch.device
+    ) -> tuple[tuple, int]:
+        bs = len(lengths)
+        total = sum(lengths)
+        max_len = max(lengths) if lengths else 0
+        if device.type == "cuda" and max_len > 0 and total == bs * max_len:
+            req = torch.empty(total, device=device, dtype=torch.long)
+            col = torch.empty(total, device=device, dtype=torch.long)
+            lengths_t = torch.empty(bs, device=device, dtype=torch.long)
+            starts = torch.empty(bs, device=device, dtype=torch.long)
+            return (req, col, lengths_t, starts, max_len, total, bs), max_len
+        return Qwen4ExpPLELayer._batch_indices(lengths, device), 0
 
     def _token_contexts(
         self,
@@ -854,11 +875,21 @@ class Qwen4ExpPLELayer(nn.Module):
             load_tracker.wait_for_layer(self.layer_id)
         context_field = pool.arena.field(self.context_field_id)
         conv_field = pool.arena.field(qwen4_exp_ple_conv_field(self.layer_id))
-        initial_context = self._read_pages(
-            context_field, input_pages, self.ple_embedding.eos_token_id
-        )
-        initial_conv = self._read_pages(conv_field, input_pages)
-        index = self._batch_indices(lengths, input_ids.device)
+        if input_ids.is_cuda:
+            initial_context, initial_conv = ple_page_gather_pair(
+                context_field,
+                conv_field,
+                input_pages,
+                self._page_row_stride(context_field),
+                self._page_row_stride(conv_field),
+                self.ple_embedding.eos_token_id,
+            )
+        else:
+            initial_context = self._read_pages(
+                context_field, input_pages, self.ple_embedding.eos_token_id
+            )
+            initial_conv = self._read_pages(conv_field, input_pages)
+        index, uniform_length = self._prefetch_indices(lengths, input_ids.device)
         flat_ids = input_ids.flatten()
         verify = metadata.verify_width is not None
         context_scratch = conv_scratch = None
@@ -873,6 +904,7 @@ class Qwen4ExpPLELayer(nn.Module):
             num_real_tokens=num_real_tokens,
             flat_ids=flat_ids,
             index=index,
+            uniform_length=uniform_length,
             output_pages=output_pages,
             context_field=context_field,
             conv_field=conv_field,
@@ -901,8 +933,10 @@ class Qwen4ExpPLELayer(nn.Module):
                 plan.initial_context,
                 req,
                 col,
+                lengths_t,
                 starts,
                 False,
+                plan.uniform_length,
                 tail_out=plan.context_scratch,
                 tail_block_rows=plan.scratch_stride,
             )

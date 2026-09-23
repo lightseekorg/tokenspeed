@@ -152,9 +152,9 @@ pointer-stable: a captured graph holds their addresses forever.
 Helpers that memoize tensors created inside capture must not return those
 tensors to eager callers. Keeping a Python reference preserves the allocation,
 but an earlier graph sharing the same private pool can overwrite its contents
-on replay. PLE's uniform index bundles are reused during capture only; eager
-prefill and decode construct their indices through the same builder outside
-the capture pool.
+on replay. PLE's uniform index bundles are reused during capture only; the
+eager n-gram kernel writes uniform request indices alongside hash IDs, while
+ragged batches construct their indices outside the capture pool.
 
 GDN verify shares memoized scratch seed indices (`i * (T + 1)`) between conv
 and recurrent reads in eager and captured forwards. FlashInfer FP32 MTP may
