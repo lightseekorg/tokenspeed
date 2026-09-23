@@ -188,6 +188,10 @@ def _load_builtin_generators() -> None:
         prepare_kda_paged_decode,
         prepare_kda_paged_prefill,
     )
+    from tokenspeed_kernel.benchmark.generators.moe import (
+        prepare_moe_apply,
+        prepare_sigmoid_bias_topk,
+    )
 
     _BENCHMARK_GENERATORS.setdefault(
         ("attention", "kda_paged_decode"), prepare_kda_paged_decode
@@ -211,6 +215,10 @@ def _load_builtin_generators() -> None:
     _BENCHMARK_GENERATORS.setdefault(("attention", "dsa_decode"), prepare_dsa_decode)
     _BENCHMARK_GENERATORS.setdefault(("gemm", "bmm"), prepare_dense_bmm)
     _BENCHMARK_GENERATORS.setdefault(("gemm", "mm"), prepare_mxfp8_mm)
+    _BENCHMARK_GENERATORS.setdefault(
+        ("moe", "sigmoid_bias_topk"), prepare_sigmoid_bias_topk
+    )
+    _BENCHMARK_GENERATORS.setdefault(("moe", "apply"), prepare_moe_apply)
 
 
 @dataclass(frozen=True)
