@@ -278,6 +278,7 @@ def test_situ_dispatch_autotune_preserves_normal_output(
         swiglu_form=None,
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
         fp8_scale_block_shape=None,
         internal_activation_dtype="fp8",
         with_bias=False,
