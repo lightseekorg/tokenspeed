@@ -114,6 +114,7 @@ def test_distributed_ep_partial_sum_matches_global_reference() -> None:
         swiglu_form=None,
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     tokenspeed_kernel.moe_process_weights(plan, module)
     partial = tokenspeed_kernel.moe_apply(

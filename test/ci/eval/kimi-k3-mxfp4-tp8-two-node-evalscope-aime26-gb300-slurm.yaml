@@ -3,7 +3,7 @@ name: eval-kimi-k3-mxfp4-tp8-two-node-aime26-gb300-slurm
 type: eval
 workflow_stage: model-test
 triggers:
-  - per-commit
+  - nightly
 runner:
   labels:
     - slurm-gb300-4gpu

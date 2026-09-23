@@ -12,29 +12,30 @@
 # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 
 import unittest
-from unittest.mock import patch
 
 import torch
+from torch import nn
 
-from tokenspeed.runtime.models import deepseek_v4 as deepseek_v4_model
-from tokenspeed.runtime.models.deepseek_v4 import DeepseekV4MegaMoEExperts
+from tokenspeed.runtime.layers.moe.types import MoELayerSpec
+from tokenspeed.runtime.layers.moe.weights.mxfp4 import create_mxfp4_weight_pair
 
 
 class TestDeepseekV4MegaMoE(unittest.TestCase):
-    def test_weight_loader_places_expert_shards(self):
-        with patch.object(
-            deepseek_v4_model, "dsv4_mega_moe_plan", return_value=object()
-        ):
-            experts = DeepseekV4MegaMoEExperts(
-                num_experts=4,
-                num_local_experts=2,
-                top_k=2,
-                hidden_size=128,
-                intermediate_size=128,
-                mapping=None,
-                prefix="layers.0.ffn.experts",
-                swiglu_limit=None,
-            )
+    def test_standard_mxfp4_weights_load_expert_shards(self):
+        experts = nn.Module()
+        spec = MoELayerSpec(
+            top_k=2,
+            num_experts=4,
+            num_local_experts=2,
+            hidden_size=128,
+            intermediate_size=128,
+            activation="swiglu",
+            tp_rank=0,
+            tp_size=1,
+            ep_rank=0,
+            ep_size=2,
+        )
+        create_mxfp4_weight_pair(spec, experts)
 
         w1 = torch.full((128, 64), 1, dtype=torch.uint8)
         w3 = torch.full((128, 64), 3, dtype=torch.uint8)
@@ -43,12 +44,22 @@ class TestDeepseekV4MegaMoE(unittest.TestCase):
         s3 = torch.full((128, 4), 13, dtype=torch.uint8)
         s2 = torch.full((128, 4), 12, dtype=torch.uint8)
 
-        experts.weight_loader(experts.w13_weight, w1, "w1", local_expert_id=1)
-        experts.weight_loader(experts.w13_weight, w3, "w3", local_expert_id=1)
-        experts.weight_loader(experts.w2_weight, w2, "w2", local_expert_id=1)
-        experts.weight_loader(experts.w13_weight_scale, s1, "w1", local_expert_id=1)
-        experts.weight_loader(experts.w13_weight_scale, s3, "w3", local_expert_id=1)
-        experts.weight_loader(experts.w2_weight_scale, s2, "w2", local_expert_id=1)
+        experts.w13_weight.weight_loader(
+            experts.w13_weight, w1, "w1", local_expert_id=1
+        )
+        experts.w13_weight.weight_loader(
+            experts.w13_weight, w3, "w3", local_expert_id=1
+        )
+        experts.w2_weight.weight_loader(experts.w2_weight, w2, "w2", local_expert_id=1)
+        experts.w13_weight_scale.weight_loader(
+            experts.w13_weight_scale, s1, "w1", local_expert_id=1
+        )
+        experts.w13_weight_scale.weight_loader(
+            experts.w13_weight_scale, s3, "w3", local_expert_id=1
+        )
+        experts.w2_weight_scale.weight_loader(
+            experts.w2_weight_scale, s2, "w2", local_expert_id=1
+        )
 
         torch.testing.assert_close(experts.w13_weight[1, :128], w1)
         torch.testing.assert_close(experts.w13_weight[1, 128:], w3)
@@ -56,22 +67,6 @@ class TestDeepseekV4MegaMoE(unittest.TestCase):
         torch.testing.assert_close(experts.w13_weight_scale[1, :128], s1)
         torch.testing.assert_close(experts.w13_weight_scale[1, 128:], s3)
         torch.testing.assert_close(experts.w2_weight_scale[1], s2)
-
-    def test_init_passes_swiglu_limit_to_kernel_plan(self):
-        with patch.object(
-            deepseek_v4_model, "dsv4_mega_moe_plan", return_value=object()
-        ) as plan:
-            DeepseekV4MegaMoEExperts(
-                num_experts=4,
-                num_local_experts=2,
-                top_k=2,
-                hidden_size=128,
-                intermediate_size=128,
-                mapping=None,
-                prefix="layers.0.ffn.experts",
-                swiglu_limit=10.0,
-            )
-        self.assertEqual(plan.call_args.kwargs["activation_clamp"], 10.0)
 
 
 if __name__ == "__main__":

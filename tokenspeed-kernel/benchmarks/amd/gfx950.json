@@ -11,7 +11,8 @@
     "measurement_blocks": 30
   },
   "case_files": [
-    "gfx950/glm53_flash_attention.json"
+    "gfx950/glm53_flash/kda.json",
+    "gfx950/glm53_flash/dsa.json"
   ],
   "cases": [
     {

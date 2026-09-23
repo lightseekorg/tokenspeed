@@ -193,6 +193,10 @@ def test_load_suite_includes_case_files(tmp_path):
         json.dumps(
             {
                 "schema_version": 1,
+                "common_parameters": {
+                    "model_profile": "test-model",
+                    "M": 4,
+                },
                 "cases": [
                     {
                         "id": "gemm.bmm/included",
@@ -214,6 +218,9 @@ def test_load_suite_includes_case_files(tmp_path):
         "gemm.bmm/example",
         "gemm.bmm/included",
     ]
+    included = next(case for case in suite.cases if case.id.endswith("included"))
+    assert included.request.parameters["model_profile"] == "test-model"
+    assert included.request.parameters["M"] == 1
 
 
 def test_load_suite_applies_case_measurement_block_overrides(tmp_path):
