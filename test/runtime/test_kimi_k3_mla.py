@@ -414,6 +414,83 @@ def _init_prefill(backend, page_table, prefix, extend):
 
 
 @requires_cuda
+def test_full_history_prefill_metadata_and_bottom_right_causal_attention(
+    backend_factory, gpu_pool
+) -> None:
+    """A fitting history resolves once and drives the native MLA kernel."""
+    pool = gpu_pool
+    page_size = pool.arena.prefix_granularity
+    logical_rows = [[2, 4], [1, 3]]
+    prefix = [48, 32]
+    extend = [40, 48]
+    seq_lens = [p + e for p, e in zip(prefix, extend)]
+
+    backend = backend_factory()
+    _init_prefill(
+        backend,
+        _expand_via_stacks(backend, pool, logical_rows),
+        prefix,
+        extend,
+    )
+    metadata = backend.chunked_prefill_metadata
+    assert metadata.full_kv_indices is not None
+    assert metadata.full_seq_lens.tolist() == seq_lens
+    assert metadata.cu_full_seq_lens.tolist() == [0, seq_lens[0], sum(seq_lens)]
+    assert metadata.max_full_seq_len == max(seq_lens)
+
+    expected_indices = torch.cat(
+        [
+            _token_locs(
+                pages,
+                torch.arange(length, device="cuda", dtype=torch.int64),
+                page_size,
+            )
+            for pages, length in zip(logical_rows, seq_lens)
+        ]
+    )
+    assert torch.equal(metadata.full_kv_indices.to(torch.int64), expected_indices)
+
+    torch.manual_seed(7)
+    q = torch.randn(sum(extend), _HEADS, 192, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(sum(seq_lens), _HEADS, 192, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(sum(seq_lens), _HEADS, 128, device="cuda", dtype=torch.bfloat16)
+    output, _ = backend.forward_extend_chunked(
+        q,
+        k,
+        v,
+        192**-0.5,
+        0.0,
+        cum_seq_lens_q=metadata.cum_extend_seq_lens,
+        cum_seq_lens_kv=metadata.cu_full_seq_lens,
+        max_q_len=metadata.max_extend_seq_len,
+        max_kv_len=metadata.max_full_seq_len,
+        seq_lens=metadata.full_seq_lens,
+        batch_size=len(seq_lens),
+        causal=True,
+    )
+
+    q_offset = 0
+    kv_offset = 0
+    for prefix_len, q_len, kv_len in zip(prefix, extend, seq_lens):
+        q_req = q[q_offset : q_offset + q_len].float()
+        k_req = k[kv_offset : kv_offset + kv_len].float()
+        v_req = v[kv_offset : kv_offset + kv_len].float()
+        scores = torch.einsum("thd,shd->hts", q_req, k_req) * (192**-0.5)
+        causal = torch.arange(kv_len, device="cuda")[None, :] <= (
+            prefix_len + torch.arange(q_len, device="cuda")[:, None]
+        )
+        scores = scores.masked_fill(~causal.unsqueeze(0), float("-inf"))
+        reference = torch.einsum("hts,shd->thd", torch.softmax(scores, dim=-1), v_req)
+        got = output[q_offset : q_offset + q_len].float()
+        relative_l2 = torch.linalg.vector_norm(
+            reference - got
+        ) / torch.linalg.vector_norm(reference)
+        assert relative_l2.item() < 0.03
+        q_offset += q_len
+        kv_offset += kv_len
+
+
+@requires_cuda
 def test_chunked_prefill_grouped_matches_single_table_and_reference(
     backend_factory, gpu_pool
 ) -> None:
@@ -458,6 +535,8 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
     # Chunked-prefill metadata parity with the hand-built page_table build.
     grouped_cm = grouped_backend.chunked_prefill_metadata
     single_table_cm = single_table_backend.chunked_prefill_metadata
+    assert grouped_cm.full_kv_indices is None
+    assert single_table_cm.full_kv_indices is None
     assert grouped_cm.chunked_loop_num == single_table_cm.chunked_loop_num
     assert grouped_cm.chunked_loop_num >= 2, "test must exercise multiple chunks"
     for grouped_idx, single_table_idx in zip(
@@ -555,3 +634,102 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
         max_err = (reference - got).abs().max().item()
         assert max_err < 0.05 * reference.abs().max().item(), (row, max_err)
         offset += extend_len
+
+
+class _RecordingPool:
+    """Records the one-pass MLA path's cache writes."""
+
+    def __init__(self) -> None:
+        self.writes: list[dict] = []
+
+    def set_mla_kv_buffer(self, layer, loc, cache_k_nope, cache_k_rope, *, write_mask):
+        self.writes.append({"layer": layer, "loc": loc, "write_mask": write_mask})
+
+
+def _full_history_layer():
+    from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3AttentionMLA
+
+    layer = SimpleNamespace(
+        rotary_emb=None,
+        kv_lora_rank=4,
+        qk_rope_head_dim=2,
+        num_local_heads=2,
+        qk_head_dim=6,
+        attn_mha=SimpleNamespace(k_scale_float=1.0),
+        _mla_kv_is_fp8=lambda ctx, k_scale: False,
+    )
+    return DeepseekV3AttentionMLA, layer
+
+
+@pytest.mark.parametrize("owns_every_row", [True, False])
+def test_full_history_cache_write_uses_placement_slots_and_mask(
+    monkeypatch, owns_every_row
+) -> None:
+    """One-pass MLA writes through the same ownership contract as bounded replay."""
+    from tokenspeed.runtime.models import deepseek_v3
+
+    cls, layer = _full_history_layer()
+    placement = None if owns_every_row else object()
+    slots = torch.tensor([7, 8, 9])
+    local = torch.tensor([3, 4, 5])
+    mask = None if owns_every_row else torch.tensor([True, False, True])
+    seen = {}
+
+    def resolve(loc, given):
+        seen["placement"] = given
+        assert torch.equal(loc, slots)
+        return local, mask
+
+    monkeypatch.setattr(deepseek_v3, "resolve_cache_slots", resolve)
+    pool = _RecordingPool()
+    ctx = SimpleNamespace(
+        token_to_kv_pool=pool,
+        attn_backend=SimpleNamespace(cache_placement=lambda attn: placement),
+    )
+    q = torch.randn(3, 2 * 6)
+    latent = torch.randn(3, 4 + 2)
+    cls._prepare_full_history_q_and_cache(layer, q, latent, ctx, slots)
+
+    assert seen["placement"] is placement
+    (write,) = pool.writes
+    assert torch.equal(write["loc"], local)
+    assert write["write_mask"] is mask
+
+
+def test_full_history_read_gathers_history_under_context_parallelism(
+    monkeypatch,
+) -> None:
+    """A placed cache must be read through the owner-aware history gather."""
+    from tokenspeed.runtime.models import deepseek_v3
+
+    cls, layer = _full_history_layer()
+    placement = object()
+    indices = torch.tensor([0, 1, 2, 3])
+
+    class Gathered(Exception):
+        pass
+
+    def gather(pool, attn, kv_indices, *, dst_dtype, placement):
+        assert kv_indices is indices and placement is expected_placement
+        raise Gathered
+
+    expected_placement = placement
+    monkeypatch.setattr(deepseek_v3, "gather_mla_history", gather)
+    pool = SimpleNamespace(
+        get_mla_kv_buffer=lambda *args: pytest.fail("local read under DCP")
+    )
+    meta = SimpleNamespace(
+        full_kv_indices=indices,
+        full_seq_lens=torch.tensor([4]),
+        cu_full_seq_lens=torch.tensor([0, 4]),
+    )
+    ctx = SimpleNamespace(
+        token_to_kv_pool=pool,
+        attn_backend=SimpleNamespace(
+            chunked_prefill_metadata=meta, cache_placement=lambda attn: placement
+        ),
+    )
+    with pytest.raises(Gathered):
+        cls._forward_full_history_prefill(
+            layer, torch.randn(4, 2, 6, dtype=torch.bfloat16), ctx, None
+        )
