@@ -129,7 +129,7 @@ def test_latent_input_without_up_clamp() -> None:
 
 @pytest.mark.skipif(
     not current_platform().is_cdna5,
-    reason="requires the gfx1250 single-token specialist",
+    reason="requires the gfx1250 decode latent-input kernel",
 )
 def test_gfx1250_latent_input_decode_matches_and_replays() -> None:
     hidden_size = 7168
