@@ -78,6 +78,8 @@ change.
 * `docs/design/unified_path.md` — the unified decode path: one
   refresh-in-place metadata contract for eager and CUDA-graph decode, the
   padding contract, buffer sizing, and what stays graph-only.
+* `docs/design/hyperconnection.md` — fused HC mix dispatch, occupancy planning,
+  persistent workspace ownership, and graph capture constraints.
 
 ## Public pull requests
 

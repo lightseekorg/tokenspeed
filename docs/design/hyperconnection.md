@@ -20,9 +20,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 -->
 
-# Residual kernels
-
-## Fused hyperconnection mix
+# Fused Hyperconnection Mix
 
 The Blackwell CuTe implementation fuses the down projection, SiLU, up
 projection, gating, and residual reduction. Automatic dispatch uses it for one
@@ -59,7 +57,7 @@ K tiles assigned to each stage, including tactics where stages receive unequal
 numbers of tiles.
 
 Shared workspaces follow the main-stream scratch ownership contract documented
-in `docs/design/event-loop.md`. Calls on different streams must have an explicit
+in [event-loop.md](event-loop.md). Calls on different streams must have an explicit
 ordering edge before they use the same layout; concurrent side-stream launches
 require caller-owned isolated storage and are not supported by this wrapper.
 CUDA graph capture records the workspace addresses, so warm all needed layouts
