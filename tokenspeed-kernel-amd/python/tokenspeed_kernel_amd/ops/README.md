@@ -342,15 +342,14 @@ bound by arithmetic.
 
 #### Contract
 
-- The input is contiguous BF16 with shape `[M, 7168]`. Automatic dispatch
-  selects the decode kernel for 1 to 32 tokens and the prefill kernel from
-  1536 tokens; the range between them retains the Triton kernel.
-- Router `[896, 7168]`, routed `[3584, 7168]`, and shared gate/up
-  `[1536, 7168]` weights must be consecutive row views of one packed
-  allocation, and the packed tensor passed alongside them must be that view.
-- Outputs are FP32 router logits, BF16 routed latents, and a BF16 768-wide
-  shared input after SiTU. Positive gate clamp and optional linear clamp
-  values are applied in FP32.
+Input, weight, and output shapes and dtypes are the gfx950 entry's. Two
+things differ:
+
+- Automatic dispatch selects the decode kernel for 1 to 32 tokens and the
+  prefill kernel from 1536; the range between them retains the Triton kernel.
+- The packed tensor passed alongside the three weights must be their
+  consecutive view. The kernels read only it, so the launchers reject a
+  packed tensor the weights do not live inside.
 
 #### Algorithm
 
