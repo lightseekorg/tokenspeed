@@ -134,9 +134,10 @@ from one first bound to that pool:
   smallest arena the family can run on and captures a few entries of each
   ladder -- the widest three, then one a third and one two thirds of the
   way down -- with a driver-memory delta around each capture. The widest
-  samples form a window priced at its positive bytes, plus one driver
-  granule the window may hide, over every marginal; each sample further
-  down anchors its width at its reading plus that granule, and a skipped
+  samples form a window priced at its positive bytes, plus one granule the
+  window may hide (readings move in 2 MiB, from the driver's graph memory
+  and the allocator's segments alike), over every marginal; each sample
+  further down anchors its width at its reading plus that granule, and a skipped
   entry is priced on the line between the anchors around its width, or at
   the narrowest anchor below it. Every ladder is sampled and priced the same
   way: a decode graph costs about the same at every batch size, so its

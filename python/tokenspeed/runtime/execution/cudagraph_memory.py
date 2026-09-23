@@ -42,8 +42,8 @@ logger = get_colorful_logger(__name__)
 
 # Ladder positions, not graphs: the widest three and two down the ladder.
 PROBE_ENTRIES_PER_LADDER = 5
-# Driver allocations come in 2 MiB granules: the gcd of every reading, six ladders.
-DRIVER_GRANULE_BYTES = 2 << 20
+# Readings move in 2 MiB: driver graph memory and allocator segments both round to it.
+READING_GRANULE_BYTES = 2 << 20
 
 
 def probe_positions(count: int, entries: int | None) -> list[int]:
@@ -111,9 +111,11 @@ def _estimate_series(
     The widest samples form a window priced at its mean marginal: the
     positive marginals summed over every marginal, since driver segments make
     single readings lumpy and a region that handed memory back is not a
-    credit, plus one driver granule for the slack the window started in.
-    Each sample after the window anchors its own width at its reading plus
-    that granule. A skipped entry is priced on the line between
+    credit, plus one granule for the slack the window started in: the
+    readings move in whole granules, whether the driver's graph memory or
+    the caching allocator's segments moved them, so a window can start
+    inside one. Each sample after the window anchors its own width at its
+    reading plus that granule. A skipped entry is priced on the line between
     the anchors around its width; narrower than every anchor, at the
     narrowest one. A cost that drops between two anchors is priced short
     there, and the utilization headroom absorbs the difference either way
@@ -140,8 +142,8 @@ def _estimate_series(
 
     first, *marginals = samples
     observed = [marginal for marginal in marginals if marginal > 0]
-    # Readings come in whole driver granules; the window can hide up to one of them.
-    granule = DRIVER_GRANULE_BYTES if observed else 0
+    # A ladder read entirely from slack is priced at nothing; the probe logs it.
+    granule = READING_GRANULE_BYTES if observed else 0
     # The window: the run of consecutive positions the samples open with.
     window = next(
         (i for i, position in enumerate(sampled) if position != i), len(sampled)

@@ -148,7 +148,7 @@ def test_the_decode_probe_samples_the_probe_positions_of_each_variant(variants) 
     runner = _decode_runner([2**i for i in range(WIDTH + 2)], variants)
     names = [f"decode:{v}" for v in (variants or ("default",))]
     ladder = sorted((2**i for i in range(WIDTH + 2)), reverse=True)
-    # Seven entries: the widest three, then position 4 (both thirds fall together).
+    # Seven entries: the widest three, then position 4 (the third falls among them).
     assert runner.capture_ladders(WIDTH) == {
         name: CapturedLadder(ladder, [0, 1, 2, 4]) for name in names
     }
