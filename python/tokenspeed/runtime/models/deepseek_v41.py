@@ -30,8 +30,8 @@ Engram tables load local FP8/E8M0 rows in bounded chunks without table conversio
 The unquantized LM head follows the model loading dtype, including its logits.
 Packed routed experts use the V4 MoE loader, with zero-padded intermediate lanes
 for MegaMoE's TMA alignment (2304 -> 2560); shared experts are not padded.
-The generic model loader still owns
-dense/MoELayer postprocessing, while post_load_weights finalizes MegaMoE.
+The generic model loader owns dense and MoELayer postprocessing, including
+MegaMoE weight preparation.
 
 Call initialize_engram(tokenizer) once after construction, then pass caller-owned
 ``engram_previous_tokens`` [T,3] and bool ``engram_token_mask`` [T] as forward
@@ -112,6 +112,7 @@ from tokenspeed.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
 from tokenspeed.runtime.layers.moe.utils import get_moe_backend
@@ -127,7 +128,6 @@ from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import BaseCausalLM
 from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4ForCausalLM,
-    DeepseekV4MegaMoEExperts,
     DeepseekV4MLP,
     DeepseekV4MoE,
 )
@@ -989,21 +989,18 @@ class DeepseekV41MoE(DeepseekV4MoE):
                     is_shared_expert=False,
                 )
 
-    def _select_experts(self, hidden_states, image_mask):
+    def _renormalize_routing_weights(self) -> bool:
+        return self.config.norm_topk_prob and self.config.num_experts_per_tok > 1
+
+    def _routing_inputs(self, hidden_states, image_mask):
         bias_vl = self.gate.bias_vl
         if hidden_states.is_cuda and (bias_vl is None or image_mask is None):
-            return super()._select_experts(hidden_states, None)
+            return super()._routing_inputs(hidden_states, None)
         bias = self.gate.e_score_correction_bias
         if bias_vl is not None and image_mask is not None:
             bias = torch.where(image_mask.unsqueeze(-1), bias_vl, bias)
         logits = F.linear(hidden_states.float(), self.gate.weight.float())
-        scores = F.softplus(logits).sqrt()
-        ids = (scores + bias).topk(self.config.num_experts_per_tok, dim=-1).indices
-        weights = scores.gather(1, ids)
-        if self.config.norm_topk_prob and self.config.num_experts_per_tok > 1:
-            weights = weights / (weights.sum(-1, keepdim=True) + 1e-20)
-        # V4 applies routed_scaling_factor at its expert execution boundary.
-        return weights, ids.to(self.hash_indices_dtype), scores
+        return logits, bias, None, None
 
 
 class DeepseekV41DecoderLayer(nn.Module):
@@ -2128,14 +2125,13 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             torch.distributed.barrier()
 
     def post_load_weights(self) -> None:
-        """Finalize packed MegaMoE weights; generic hooks own all other modules."""
         for module in self.modules():
-            if isinstance(module, DeepseekV4MegaMoEExperts):
-                module.finalize_weights()
+            if isinstance(module, MoELayer):
+                module.process_weights_after_loading(module)
 
     def post_quant_warmup(self) -> None:
         for module in self.modules():
-            if isinstance(module, DeepseekV4MegaMoEExperts):
+            if isinstance(module, DeepseekV4MoE):
                 module.warmup()
 
     def get_input_embeddings(self) -> nn.Module:

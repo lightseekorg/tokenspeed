@@ -223,6 +223,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         seq_len_q: int = 1,
         window_left: int = -1,
         cp_world: int = 1,  # DCP world size; >1 enables strided global-coord causal masking
+        cp_rank: int = 0,
+        cp_interleave_size: int = 1,
         reducer_d_tiles: int = 1,
         reducer_max_splits: int = MAX_SPLITS,
         pack_q: bool = False,
@@ -301,6 +303,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.seq_len_q = seq_len_q
         self.window_left = window_left
         self.cp_world = cp_world
+        self.cp_rank = cp_rank
+        self.cp_interleave_size = cp_interleave_size
         if mma_qk_tiler_mn[0] == 128:
             self.cluster_shape_mnk = (2, 1, 1)
             self.use_2cta_instrs = True
@@ -389,6 +393,21 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.epilogue_exchange_sync_bar_pair13 = pipeline.NamedBarrier(
             barrier_id=5, num_threads=(self.threads_per_warp * 2)
         )
+
+    @cute.jit
+    def _get_dcp_local_bound(self, global_bound: Int32) -> Int32:
+        """Map global causal bound to this rank's local bound."""
+        if cutlass.const_expr(self.cp_interleave_size == 1):
+            return (global_bound - self.cp_rank + self.cp_world - 1) // self.cp_world
+
+        cycle_width = self.cp_world * self.cp_interleave_size
+        full_cycles = global_bound // cycle_width
+        cycle_offset = global_bound - full_cycles * cycle_width
+        local_tail = cycle_offset - self.cp_rank * self.cp_interleave_size
+        if cute.elem_less(local_tail, 0):
+            local_tail = Int32(0)
+        local_tail = cutlass.min(local_tail, self.cp_interleave_size)
+        return full_cycles * self.cp_interleave_size + local_tail
 
     def _setup_attributes(self):
         """Set up configurations and parameters for the MLA kernel operation.
@@ -3367,17 +3386,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             # (identical to the pre-DCP behavior; folded at compile time).
                             k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
                         else:
-                            # DCP (cp_world>1): this rank holds a strided 1/cp_world slice of
-                            # the context (key c -> global position c*cp_world + dcp_rank). The
-                            # causal bound is therefore taken over the GLOBAL length passed in
-                            # K_causal (= global_seq - dcp_rank), divided by cp_world.
-                            k_bound = (
-                                common_params.K_causal
-                                - (self.seq_len_q - 1)
-                                + q_tok
-                                + self.cp_world
-                                - 1
-                            ) // self.cp_world
+                            global_bound = (
+                                common_params.K_causal - (self.seq_len_q - 1) + q_tok
+                            )
+                            k_bound = self._get_dcp_local_bound(global_bound)
                     else:
                         k_bound = common_params.K
                     tTR_rAcc[i] = (
@@ -3478,17 +3490,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             # (identical to the pre-DCP behavior; folded at compile time).
                             k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
                         else:
-                            # DCP (cp_world>1): this rank holds a strided 1/cp_world slice of
-                            # the context (key c -> global position c*cp_world + dcp_rank). The
-                            # causal bound is therefore taken over the GLOBAL length passed in
-                            # K_causal (= global_seq - dcp_rank), divided by cp_world.
-                            k_bound = (
-                                common_params.K_causal
-                                - (self.seq_len_q - 1)
-                                + q_tok
-                                + self.cp_world
-                                - 1
-                            ) // self.cp_world
+                            global_bound = (
+                                common_params.K_causal - (self.seq_len_q - 1) + q_tok
+                            )
+                            k_bound = self._get_dcp_local_bound(global_bound)
                     else:
                         k_bound = common_params.K
                     tTR_rAcc[i] = (

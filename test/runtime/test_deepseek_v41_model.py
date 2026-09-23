@@ -40,10 +40,12 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import tokenspeed_kernel
 import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import save_file
+from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -61,6 +63,7 @@ from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
 )
 from tokenspeed.runtime.layers.linear import LinearBase, MergedColumnParallelLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
+from tokenspeed.runtime.layers.moe import expert as expert_module
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.utils import MoeBackend
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
@@ -1605,9 +1608,12 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
         )
         torch.testing.assert_close(out, expected, rtol=0.02, atol=0.003)
         # Exercise the real packed-weight MegaMoE lifecycle, not the CPU loader
-        # plan mocks: load -> finalize -> dense preparation -> full text forward.
+        # plan mocks: load -> process -> dense preparation -> full text forward.
         monkeypatch.setattr(v4, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
         monkeypatch.setattr(v41, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
+        monkeypatch.setattr(
+            expert_module, "get_moe_backend", lambda: MoeBackend.MEGA_MOE
+        )
         monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
         monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", 128)
         monkeypatch.setitem(global_server_args_dict, "max_num_seqs", 8)
@@ -1633,7 +1639,8 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
             if isinstance(module, LinearBase):
                 module.quant_method.process_weights_after_loading(module)
         assert all(
-            layer.ffn.experts._processed_state is not None
+            layer.ffn.experts._weights_processed
+            and layer.ffn.experts._moe_backend_state is not None
             for layer in adapter.model.layers
         )
         backend = _backend(str(device), 2)
@@ -1676,13 +1683,25 @@ def _loader_config():
 
 
 def _mock_loader_hardware(monkeypatch):
-    # Keep real V4 MegaMoE allocation and per-expert loading; only hardware
-    # plan/finalization are mocked in CPU/meta checkpoint tests.
+    # Keep standard MXFP4 allocation and per-expert loading; only hardware
+    # planning and processing are mocked in CPU/meta checkpoint tests.
     monkeypatch.setattr(v4, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
     monkeypatch.setattr(v41, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
-    monkeypatch.setattr(v4, "dsv4_mega_moe_plan", lambda **kwargs: object())
+    monkeypatch.setattr(expert_module, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
+    monkeypatch.setattr(
+        tokenspeed_kernel,
+        "moe_plan",
+        lambda *args, **kwargs: {
+            "solution": "mega_moe",
+            "support_routing": False,
+            "supports_precomputed_topk": True,
+            "supports_deferred_finalize": False,
+            "weight_preprocessor": None,
+            "warmup": None,
+        },
+    )
     monkeypatch.setattr(pg_manager, "get_device_process_group", lambda group: None)
-    monkeypatch.setattr(v4.DeepseekV4MegaMoEExperts, "finalize_weights", Mock())
+    monkeypatch.setattr(MoELayer, "process_weights_after_loading", Mock())
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
 
 
@@ -1914,7 +1933,7 @@ def test_strict_checkpoint_load_tp4_ep4(monkeypatch, rank, prefixed, reverse, tm
         "remote_expert": 54,
     }
     assert report["loaded"] == len(weights) - sum(report["skipped"].values())
-    assert v4.DeepseekV4MegaMoEExperts.finalize_weights.call_count == 3
+    assert MoELayer.process_weights_after_loading.call_count == 3
     assert model.lm_head.weight.dtype == torch.bfloat16
     torch.testing.assert_close(
         model.lm_head.weight,
@@ -2057,7 +2076,7 @@ def test_checkpoint_requires_every_local_constituent(monkeypatch, missing, tmp_p
     rest = _bind_engram_tables(model, weights, tmp_path)
     with pytest.raises(ValueError, match=re.escape(missing)):
         model.load_weights(rest.items())
-    v4.DeepseekV4MegaMoEExperts.finalize_weights.assert_not_called()
+    MoELayer.process_weights_after_loading.assert_not_called()
     assert not hasattr(model, "checkpoint_load_report")
 
 
@@ -2198,7 +2217,17 @@ def test_routing_matches_reference_bias_and_normalization(topk, vision, with_ima
         weight=torch.eye(4), e_score_correction_bias=bias, bias_vl=bias_vl
     )
     moe.hash_indices_dtype = torch.int64
-    weights, ids, scores = moe._select_experts(logits, image_mask)
+    router_logits, actual_bias, _, _ = moe._routing_inputs(logits, image_mask)
+    weights, ids = moe_topk(
+        router_logits,
+        top_k=topk,
+        score_function="sqrt_softplus",
+        selection_method="topk",
+        renormalize=topk > 1,
+        routed_scaling_factor=1.0,
+        correction_bias=actual_bias,
+        solution="torch",
+    )
     expected_scores = F.softplus(logits).sqrt()
     expected_bias = torch.stack([bias, bias_vl]) if with_images else bias
     expected_ids = (expected_scores + expected_bias).topk(topk, dim=-1).indices
@@ -2206,7 +2235,6 @@ def test_routing_matches_reference_bias_and_normalization(topk, vision, with_ima
     if topk > 1:
         expected_weights /= expected_weights.sum(-1, keepdim=True) + 1e-20
     torch.testing.assert_close(ids, expected_ids, rtol=0, atol=0)
-    torch.testing.assert_close(scores, expected_scores, rtol=0, atol=0)
     torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
 
 

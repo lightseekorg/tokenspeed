@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe import dsv4_select_experts
+from tokenspeed_kernel.ops.moe import moe_topk
 
 
 @pytest.mark.parametrize("invalid", [-1, 4])
@@ -32,10 +32,47 @@ def test_default_hash_router_rejects_invalid_table_values(invalid: int) -> None:
     input_ids = torch.zeros((1,), dtype=torch.int64)
 
     with pytest.raises(ValueError, match=r"entries must be in \[0, 4\)"):
-        dsv4_select_experts(
+        moe_topk(
             logits,
             top_k=2,
+            score_function="sqrt_softplus",
+            selection_method="hash",
             renormalize=True,
+            routed_scaling_factor=1.0,
+            hash_indices_table=table,
+            input_ids=input_ids,
+        )
+
+
+def test_non_hash_router_rejects_input_ids() -> None:
+    logits = torch.zeros((1, 4), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="hash routing inputs"):
+        moe_topk(
+            logits,
+            top_k=2,
+            score_function="sqrt_softplus",
+            selection_method="topk",
+            renormalize=True,
+            routed_scaling_factor=1.0,
+            input_ids=torch.zeros((1,), dtype=torch.int64),
+        )
+
+
+def test_hash_router_rejects_correction_bias() -> None:
+    logits = torch.zeros((1, 4), dtype=torch.float32)
+    table = torch.tensor([[0, 1]], dtype=torch.int32)
+    input_ids = torch.zeros((1,), dtype=torch.int64)
+
+    with pytest.raises(ValueError, match="correction_bias"):
+        moe_topk(
+            logits,
+            top_k=2,
+            score_function="sqrt_softplus",
+            selection_method="hash",
+            renormalize=True,
+            routed_scaling_factor=1.0,
+            correction_bias=torch.zeros(4),
             hash_indices_table=table,
             input_ids=input_ids,
         )
