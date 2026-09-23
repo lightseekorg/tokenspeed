@@ -327,11 +327,9 @@ def test_fp8_quantize_rejects_e4m3fnuz(device: str) -> None:
 
 
 @pytest.mark.parametrize("solution", ["trtllm"])
-@pytest.mark.parametrize("granularity", ["tensor", "token"])
-def test_quantize_fp8_dynamic_tensor_and_token(
+def test_quantize_fp8_dynamic_token(
     device: str,
     solution: str,
-    granularity: str,
     require,
 ) -> None:
     torch.manual_seed(4)
@@ -341,7 +339,7 @@ def test_quantize_fp8_dynamic_tensor_and_token(
     x = torch.randn(16, 128, device=device, dtype=dtype) * 10
     out, scale = quantize_fp8(
         x,
-        granularity=granularity,
+        granularity="token",
         solution=solution,
     )
     torch.cuda.synchronize()
@@ -349,10 +347,7 @@ def test_quantize_fp8_dynamic_tensor_and_token(
     assert out.shape == x.shape
     assert out.dtype == _FP8_DTYPE
     assert scale.dtype == torch.float32
-    if granularity == "tensor":
-        assert scale.shape == (1,)
-    else:
-        assert scale.shape == (x.shape[0], 1)
+    assert scale.shape == (x.shape[0], 1)
 
 
 @pytest.mark.parametrize(

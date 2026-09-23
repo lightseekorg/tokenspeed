@@ -107,7 +107,7 @@ def _quantize_fp8_roundtrip(
 def quantize_fp8(
     x: torch.Tensor,
     scale: float | torch.Tensor | None = None,
-    granularity: Literal["tensor", "token", "token_group", "block"] | None = None,
+    granularity: Literal["token", "token_group", "block"] | None = None,
     group_size: int | None = None,
     block_size: tuple[int, int] | list[int] | None = None,
     scale_encoding: Literal["float32", "ue8m0", "packed_ue8m0"] = "float32",
@@ -183,7 +183,7 @@ def quantize_fp8(
 def _quantize_fp8_dynamic(
     x: torch.Tensor,
     # quantization options
-    granularity: Literal["tensor", "token", "token_group", "block"] = "tensor",
+    granularity: Literal["token", "token_group", "block"] = "token",
     group_size: int | None = None,
     block_size: tuple[int, int] | list[int] | None = None,
     scale_encoding: Literal["float32", "ue8m0", "packed_ue8m0"] = "float32",
@@ -195,15 +195,14 @@ def _quantize_fp8_dynamic(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize x to FP8 while dynamically computing scales.
 
-    Use granularity="tensor" for one scale over the whole tensor,
-    granularity="token" for one scale per row/token,
+    Use granularity="token" for one scale per row/token,
     granularity="token_group" for one scale per row/token and contiguous group
     along the last dimension, and granularity="block" for one scale per 2-D
     block.
 
     Args:
         x: Input tensor.
-        granularity: Scale granularity: tensor, token, token_group, or block.
+        granularity: Scale granularity: token, token_group, or block.
         group_size: Number of contiguous values per scale group along the last
             dimension. Required for token_group granularity.
         block_size: Two-dimensional scale block. Required for block granularity.
@@ -216,15 +215,15 @@ def _quantize_fp8_dynamic(
     Returns:
         Tuple of quantized FP8 tensor and scale tensor.
 
-    The expected scale shapes are [1] for tensor granularity, [M, 1] for token
-    granularity, [M, ceil(K / group_size)] for token_group granularity, and
+    The expected scale shapes are [M, 1] for token granularity,
+    [M, ceil(K / group_size)] for token_group granularity, and
     [ceil(M / block_m), ceil(K / block_k)] for block granularity.
     Returned scales use float32 dtype for scale_encoding="float32" and a
     backend-specific encoded integer dtype for non-float encodings such as
     "ue8m0".
     """
 
-    if granularity not in {"tensor", "token", "token_group", "block"}:
+    if granularity not in {"token", "token_group", "block"}:
         raise ValueError(f"unsupported FP8 dynamic granularity: {granularity!r}")
     if granularity == "token_group":
         if group_size is None or group_size <= 0:
