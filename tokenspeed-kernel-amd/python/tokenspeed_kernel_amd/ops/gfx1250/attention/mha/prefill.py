@@ -301,6 +301,8 @@ class AttentionProgram:
         offsets = cfg.q_strides.offsets(
             self.seq_base + offs_m[:, None], self.q_head, offs_d[None, :]
         )
+        if cfg.FULL_QUERY_TILES:
+            return cdna5.buffer_load(self.q_ptr, offsets)
         mask = offs_m[:, None] < self.seq_len
         return cdna5.buffer_load(self.q_ptr, offsets, mask=mask, other=0.0)
 
@@ -417,9 +419,10 @@ class AttentionProgram:
         offs_n = kv_start + gl.arange(
             0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout)
         )
-        valid = offs_m[:, None] < self.seq_len
-        valid &= offs_n[None, :] < self.seq_len
-        valid &= offs_n[None, :] <= offs_m[:, None]
+        valid = offs_n[None, :] <= offs_m[:, None]
+        if not cfg.FULL_QUERY_TILES:
+            valid &= offs_m[:, None] < self.seq_len
+            valid &= offs_n[None, :] < self.seq_len
         if cfg.WINDOW_LEFT >= 0:
             valid &= offs_m[:, None] <= offs_n[None, :] + cfg.WINDOW_LEFT
         return gl.where(valid, qk, -float("inf"))
@@ -495,10 +498,13 @@ class AttentionProgram:
             offsets = ((self.seq_base + offs_m) * cfg.N_HEADS + self.q_head).to(
                 gl.int32
             )
-            mask = offs_m < self.seq_len
             safe_l = gl.where(l_i > 0.0, l_i, 1.0)
             lse = (m_i * cfg.SM_SCALE + gl.log2(safe_l)) * _LN2
-            cdna5.buffer_store(lse, self.lse_ptr, offsets, mask=mask)
+            if cfg.FULL_QUERY_TILES:
+                cdna5.buffer_store(lse, self.lse_ptr, offsets)
+            else:
+                mask = offs_m < self.seq_len
+                cdna5.buffer_store(lse, self.lse_ptr, offsets, mask=mask)
 
     @gluon.jit
     def store_output(self, output):
@@ -512,9 +518,12 @@ class AttentionProgram:
             * cfg.HEAD_DIM
             + offs_d[None, :]
         ).to(gl.int32)
-        mask = offs_m[:, None] < self.seq_len
         output = output.to(self.output_ptr.dtype.element_ty)
-        cdna5.buffer_store(output, self.output_ptr, offsets, mask=mask)
+        if cfg.FULL_QUERY_TILES:
+            cdna5.buffer_store(output, self.output_ptr, offsets)
+        else:
+            mask = offs_m[:, None] < self.seq_len
+            cdna5.buffer_store(output, self.output_ptr, offsets, mask=mask)
 
 
 @gluon.jit
