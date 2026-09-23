@@ -56,7 +56,6 @@ from tokenspeed_kernel.ops.moe import (
     native_latent_moe_available,
 )
 from tokenspeed_kernel.ops.quantization import (
-    fp8_quantize_dequantize,
     quantize_fp8,
     quantize_mxfp4,
     quantize_mxfp8,
@@ -123,7 +122,6 @@ __all__ = [
     "moe_softmax_topk",
     "moe_topk",
     # quantization
-    "fp8_quantize_dequantize",
     "quantize_fp8",
     "quantize_mxfp8",
     "quantize_nvfp4",

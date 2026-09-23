@@ -338,7 +338,7 @@ def _fp8_block_quantize(
 
 
 @triton.jit
-def _fp8_quantize_dequantize_kernel(
+def _fp8_roundtrip_kernel(
     x_ptr,
     out_ptr,
     x_row_stride,
@@ -361,20 +361,21 @@ def _fp8_quantize_dequantize_kernel(
 
 @register_kernel(
     "quantization",
-    "fp8_quantize_dequantize",
-    name="triton_fp8_quantize_dequantize",
+    "fp8",
+    name="triton_quantize_fp8_roundtrip",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
     signatures=format_signatures(
         "x", "dense", {torch.bfloat16, torch.float16, torch.float32}
     ),
     traits={
+        "dequantize": frozenset({True}),
         "group_size": frozenset({64, 128}),
         "scale_encoding": frozenset({"ue8m0"}),
     },
     priority=Priority.PORTABLE,
 )
-def triton_fp8_quantize_dequantize(
+def triton_quantize_fp8_roundtrip(
     x: torch.Tensor,
     group_size: int,
     scale_encoding: str,
@@ -395,7 +396,7 @@ def triton_fp8_quantize_dequantize(
     out_rows, _, out_row_stride = _flatten_to_2d(out)
     assert out_rows == rows
     groups_per_row = width // group_size
-    _fp8_quantize_dequantize_kernel[(rows * groups_per_row,)](
+    _fp8_roundtrip_kernel[(rows * groups_per_row,)](
         x,
         out,
         x_row_stride,
@@ -414,7 +415,10 @@ def triton_fp8_quantize_dequantize(
     name="triton_quantize_fp8",
     solution="triton",
     signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
-    traits={"has_scale": frozenset({True, False})},
+    traits={
+        "dequantize": frozenset({False}),
+        "has_scale": frozenset({True, False}),
+    },
     priority=Priority.PORTABLE,
 )
 def triton_quantize_fp8(
@@ -730,7 +734,7 @@ def triton_quantize_mxfp4(
 __all__ = [
     "fp8_quantize",
     "mxfp4_quantize",
-    "triton_fp8_quantize_dequantize",
+    "triton_quantize_fp8_roundtrip",
     "triton_quantize_mxfp4",
     "triton_quantize_fp8_with_scale",
 ]

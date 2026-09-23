@@ -24,7 +24,6 @@ from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
-    "fp8_quantize_dequantize",
     "quantize_fp8",
     "quantize_mxfp8",
     "quantize_nvfp4",
@@ -32,7 +31,7 @@ __all__ = [
 ]
 
 
-def fp8_quantize_dequantize(
+def _quantize_fp8_roundtrip(
     x: torch.Tensor,
     group_size: int,
     scale_encoding: Literal["ue8m0"],
@@ -66,13 +65,14 @@ def fp8_quantize_dequantize(
             f"group_size={group_size}."
         )
     traits = {
+        "dequantize": True,
         "group_size": group_size,
         "scale_encoding": scale_encoding,
     }
     signature = format_signature(x=dense_tensor_format(x.dtype))
     kernel = select_kernel(
         "quantization",
-        "fp8_quantize_dequantize",
+        "fp8",
         signature,
         traits=traits,
         solution=solution,
@@ -85,14 +85,14 @@ def fp8_quantize_dequantize(
     }
     ShapeCapture.get().record(
         "quantization",
-        "fp8_quantize_dequantize",
+        "fp8",
         kernel.name,
         x.dtype,
         shape_params,
     )
     with kernel_scope(
         "quantization",
-        "fp8_quantize_dequantize",
+        "fp8",
         x.dtype,
         kernel_name=kernel.name,
         **shape_params,
@@ -111,6 +111,7 @@ def quantize_fp8(
     group_size: int | None = None,
     block_size: tuple[int, int] | list[int] | None = None,
     scale_encoding: Literal["float32", "ue8m0", "packed_ue8m0"] = "float32",
+    dequantize: bool = False,
     enable_pdl: bool = False,
     override: str | None = None,
     solution: str | None = None,
@@ -118,8 +119,30 @@ def quantize_fp8(
     """Quantize a tensor to FP8 and return its scale when one is used.
 
     With no granularity this performs a plain or static-scale cast. Dynamic
-    granularities compute canonical scales from the input.
+    granularities compute canonical scales from the input. With dequantize=True,
+    the FP8 values are immediately reconstructed in the input dtype and the
+    returned scale is None.
     """
+    if dequantize:
+        if scale is not None:
+            raise ValueError("FP8 dequantization does not accept a static scale")
+        if granularity != "token_group" or group_size is None:
+            raise ValueError(
+                "FP8 dequantization requires token_group granularity and group_size"
+            )
+        if block_size is not None or scale_encoding != "ue8m0":
+            raise ValueError("FP8 dequantization requires UE8M0 token-group scales")
+        return (
+            _quantize_fp8_roundtrip(
+                x,
+                group_size=group_size,
+                scale_encoding=scale_encoding,
+                override=override,
+                solution=solution,
+            ),
+            None,
+        )
+
     if granularity is not None:
         if scale is not None:
             raise ValueError("dynamic FP8 quantization does not accept scale")
@@ -134,7 +157,7 @@ def quantize_fp8(
             solution=solution or (None if override is not None else "triton"),
         )
 
-    traits = {"has_scale": scale is not None}
+    traits = {"dequantize": False, "has_scale": scale is not None}
     signature = format_signature(x=dense_tensor_format(x.dtype))
     kernel = select_kernel(
         "quantization",
