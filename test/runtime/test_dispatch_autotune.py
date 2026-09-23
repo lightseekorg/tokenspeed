@@ -746,6 +746,8 @@ def test_mm_joint_dispatch_respects_overrides_and_contract(
 ):
     probe = Mock()
     joint = Mock(side_effect=lambda a, b, out: torch.mm(a, b.T, out=out))
+    record = Mock()
+    scope = Mock(return_value=nullcontext())
 
     def generic(a, b, a_scales, b_scales, out_dtype, *, alpha, block_size, out):
         return out.copy_(torch.mm(a, b.T).to(out_dtype))
@@ -766,8 +768,8 @@ def test_mm_joint_dispatch_respects_overrides_and_contract(
         select_kernel=lambda *args, **kwargs: generic,
         _KERNELS_WITH_FUSED_BIAS=set(),
         _KERNELS_WITH_PDL=set(),
-        ShapeCapture=SimpleNamespace(get=lambda: SimpleNamespace(record=Mock())),
-        kernel_scope=lambda *args, **kwargs: nullcontext(),
+        ShapeCapture=SimpleNamespace(get=lambda: SimpleNamespace(record=record)),
+        kernel_scope=scope,
     )
     api = _functions(
         KERNEL / "ops/gemm/__init__.py", None, ("mm", "_validate_gemm_out"), ns
@@ -798,6 +800,20 @@ def test_mm_joint_dispatch_respects_overrides_and_contract(
     assert probe.call_count == int(override is None and out_dtype == torch.bfloat16)
     assert joint.call_count == int(
         override is None and not bias and out_dtype == torch.bfloat16 and rows <= 32
+    )
+    kernel_name = "flashinfer_bf16_gemm" if joint.called else "test_mm"
+    record.assert_called_once_with(
+        "gemm", "mm", kernel_name, x.dtype, {"M": rows, "N": 8, "K": 4}
+    )
+    scope.assert_called_once_with(
+        "gemm",
+        "mm",
+        x.dtype,
+        kernel_name=kernel_name,
+        M=rows,
+        N=8,
+        K=4,
+        has_out=True,
     )
 
 

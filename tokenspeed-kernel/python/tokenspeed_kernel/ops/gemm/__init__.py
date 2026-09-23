@@ -1335,7 +1335,19 @@ def mm(
             and M <= BF16_GEMM_MAX_M
             and flashinfer_joint_bf16_supported(A, B, out)
         ):
-            return flashinfer_bf16_gemm(A, B, out)
+            shape_params = {"M": M, "N": N, "K": K}
+            ShapeCapture.get().record(
+                "gemm", "mm", "flashinfer_bf16_gemm", A.dtype, shape_params
+            )
+            with kernel_scope(
+                "gemm",
+                "mm",
+                A.dtype,
+                kernel_name="flashinfer_bf16_gemm",
+                **shape_params,
+                has_out=out is not None,
+            ):
+                return flashinfer_bf16_gemm(A, B, out)
 
     block_scale_layout = (
         "canonical_blackwell" if Platform.get().is_blackwell_plus else "canonical"
