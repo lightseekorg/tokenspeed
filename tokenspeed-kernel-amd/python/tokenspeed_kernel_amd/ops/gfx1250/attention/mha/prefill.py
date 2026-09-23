@@ -63,6 +63,7 @@ class AttentionConfig:
     TDM_WARP_HINT: gl.constexpr
     REVERSE_Q_BLOCKS: gl.constexpr
     DEEP_PIPELINE: gl.constexpr
+    FULL_QUERY_TILES: gl.constexpr
     q_strides: InputStrides
     k_strides: InputStrides
     v_strides: InputStrides
@@ -94,6 +95,7 @@ class AttentionConfig:
         TDM_WARP_HINT,
         REVERSE_Q_BLOCKS,
         DEEP_PIPELINE,
+        FULL_QUERY_TILES,
         q_strides,
         k_strides,
         v_strides,
@@ -142,6 +144,7 @@ class AttentionConfig:
         self.TDM_WARP_HINT = gl.constexpr(TDM_WARP_HINT)
         self.REVERSE_Q_BLOCKS = gl.constexpr(REVERSE_Q_BLOCKS)
         self.DEEP_PIPELINE = gl.constexpr(DEEP_PIPELINE)
+        self.FULL_QUERY_TILES = gl.constexpr(FULL_QUERY_TILES)
         self.q_strides = q_strides
         self.k_strides = k_strides
         self.v_strides = v_strides
@@ -456,6 +459,16 @@ class AttentionProgram:
         return p, alpha, m_new
 
     @gluon.jit
+    def softmax_part0_full_rows(self, qk, m_i):
+        cfg = self.cfg
+        row_max = max(qk, 1)
+        m_new = maximum(m_i, row_max)
+        m_new_scaled = m_new * cfg.SM_SCALE
+        p = gl.exp2(qk * cfg.SM_SCALE - m_new_scaled[:, None])
+        alpha = gl.exp2(m_i * cfg.SM_SCALE - m_new_scaled)
+        return p, alpha, m_new
+
+    @gluon.jit
     def softmax_part1(self, p, l_i, acc, alpha):
         cfg = self.cfg
         l_ij = gl.sum(p, axis=1)
@@ -655,7 +668,10 @@ def process_attention_tile_deep(program: AttentionProgram, kv_start, num_tiles):
             qk = program.apply_mask(qk, kv_start)
     else:
         qk = program.apply_mask(qk, kv_start)
-    p, alpha, m_i = program.softmax_part0(qk, m_i)
+    if cfg.FULL_QUERY_TILES:
+        p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
+    else:
+        p, alpha, m_i = program.softmax_part0(qk, m_i)
 
     program.tdm_load_global_to_shared_k(kv_start + 2 * cfg.BLOCK_N, 0)
     program.tdm_load_global_to_shared_v(kv_start + cfg.BLOCK_N, 1)
@@ -680,7 +696,10 @@ def process_attention_tile_deep(program: AttentionProgram, kv_start, num_tiles):
         )
 
         acc = program.compute_pv(p, v, acc)
-        p, alpha, m_i = program.softmax_part0(qk, m_i)
+        if cfg.FULL_QUERY_TILES:
+            p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
+        else:
+            p, alpha, m_i = program.softmax_part0(qk, m_i)
         k = program.tdm_shared_load_k(iter_id % cfg.NUM_BUFFERS, wait_count=2)
 
         program.tdm_load_global_to_shared_v(
@@ -702,7 +721,10 @@ def process_attention_tile_deep(program: AttentionProgram, kv_start, num_tiles):
             qk = program.apply_mask(qk, penultimate_kv_start)
     else:
         qk = program.apply_mask(qk, penultimate_kv_start)
-    p, alpha, m_i = program.softmax_part0(qk, m_i)
+    if cfg.FULL_QUERY_TILES:
+        p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
+    else:
+        p, alpha, m_i = program.softmax_part0(qk, m_i)
 
     k = program.tdm_shared_load_k(iter_id % cfg.NUM_BUFFERS, wait_count=1)
     program.tdm_load_global_to_shared_v(last_kv_start, iter_id % cfg.NUM_BUFFERS)
@@ -713,7 +735,10 @@ def process_attention_tile_deep(program: AttentionProgram, kv_start, num_tiles):
     v = program.tdm_shared_load_v((iter_id + 1) % cfg.NUM_BUFFERS, wait_count=1)
     acc = program.compute_pv(p, v, acc)
 
-    p, alpha, m_i = program.softmax_part0(qk, m_i)
+    if cfg.FULL_QUERY_TILES:
+        p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
+    else:
+        p, alpha, m_i = program.softmax_part0(qk, m_i)
     p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
     v = program.tdm_shared_load_v(iter_id % cfg.NUM_BUFFERS, wait_count=0)
     acc = program.compute_pv(p, v, acc)
@@ -758,6 +783,7 @@ def gluon_mha_prefill_gfx1250(
     TDM_WARP_HINT: gl.constexpr,
     REVERSE_Q_BLOCKS: gl.constexpr,
     DEEP_PIPELINE: gl.constexpr,
+    FULL_QUERY_TILES: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
 ):
@@ -777,6 +803,7 @@ def gluon_mha_prefill_gfx1250(
         TDM_WARP_HINT,
         REVERSE_Q_BLOCKS,
         DEEP_PIPELINE,
+        FULL_QUERY_TILES,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
         InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
         InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
@@ -879,6 +906,22 @@ def _select_deep_pipeline(
 ) -> bool:
     """Compiler-gated specialization; disabled by default."""
     return False
+
+
+def _select_full_query_tiles(
+    *,
+    deep_pipeline: bool,
+    seqlens: list[int],
+    max_seqlen: int,
+    block_m: int,
+) -> bool:
+    """Specialize deep attention when every query tile is fully populated."""
+    return (
+        deep_pipeline
+        and max_seqlen % block_m == 0
+        and bool(seqlens)
+        and all(seqlen == max_seqlen for seqlen in seqlens)
+    )
 
 
 def _select_m_tile(
@@ -1027,11 +1070,11 @@ def launch_gluon_mha_prefill_gfx1250(
         window_left=config.window_left,
         workgroups=live_workgroups,
     )
-    positive_seqlens = [
+    seqlens = [
         seq_end - seq_start
         for seq_start, seq_end in zip(cu_seqlens_cpu, cu_seqlens_cpu[1:])
-        if seq_end > seq_start
     ]
+    positive_seqlens = [seqlen for seqlen in seqlens if seqlen > 0]
     min_positive_seqlen = min(positive_seqlens, default=0)
     deep_pipeline = _select_deep_pipeline(
         dtype=q.dtype,
@@ -1042,6 +1085,12 @@ def launch_gluon_mha_prefill_gfx1250(
         window_left=config.window_left,
         workgroups=live_workgroups,
         min_positive_seqlen=min_positive_seqlen,
+    )
+    full_query_tiles = _select_full_query_tiles(
+        deep_pipeline=deep_pipeline,
+        seqlens=seqlens,
+        max_seqlen=config.max_seqlen,
+        block_m=config.block_m,
     )
     llvm_fn_attrs = (
         "amdgpu-sched-strategy=coexec"
@@ -1083,6 +1132,7 @@ def launch_gluon_mha_prefill_gfx1250(
         tdm_warp_hint,
         reverse_q_blocks,
         deep_pipeline,
+        full_query_tiles,
         config.num_warps,
         config.num_buffers,
         num_warps=config.num_warps,

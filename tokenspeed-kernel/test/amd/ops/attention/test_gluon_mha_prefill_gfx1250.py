@@ -185,6 +185,22 @@ def test_select_llvm_fn_attrs():
     )
 
 
+def test_select_full_query_tiles():
+    kwargs = {
+        "deep_pipeline": True,
+        "seqlens": [4096] * 4,
+        "max_seqlen": 4096,
+        "block_m": 256,
+    }
+    assert prefill._select_full_query_tiles(**kwargs)
+    assert not prefill._select_full_query_tiles(**(kwargs | {"deep_pipeline": False}))
+    assert not prefill._select_full_query_tiles(**(kwargs | {"seqlens": [4096, 3840]}))
+    assert not prefill._select_full_query_tiles(**(kwargs | {"seqlens": []}))
+    assert not prefill._select_full_query_tiles(
+        **(kwargs | {"max_seqlen": 4097, "seqlens": [4097] * 4})
+    )
+
+
 def test_select_tdm_warp_hint():
     kwargs = {
         "block_m": 256,
