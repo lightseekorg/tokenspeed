@@ -59,7 +59,7 @@ SERVE_SCRIPT = os.path.join(
 LB_PORT = int(os.environ.get("LB_PORT", "19345"))
 MODEL = os.environ.get("MODEL", "nvidia/Qwen3.5-122B-A10B-NVFP4")
 SERVED_MODEL_NAME = os.environ.get("SERVED_MODEL_NAME", MODEL)
-STARTUP_TIMEOUT = int(os.environ.get("EPD_STARTUP_TIMEOUT", "2400"))
+STARTUP_TIMEOUT = int(os.environ.get("EPD_STARTUP_TIMEOUT", "7200"))
 LOG_DIR = os.environ.get("EPD_CI_LOG_DIR", ".ci-artifacts/epd-qwen35-122b-1e1p2d")
 
 

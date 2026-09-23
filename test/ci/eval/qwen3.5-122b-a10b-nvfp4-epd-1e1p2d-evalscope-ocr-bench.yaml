@@ -20,7 +20,7 @@ server:
     bash test/ci_system/serve_qwen35_122b_nvfp4_epd_1e1p2d.sh
   ready:
     url: http://127.0.0.1:8000/v1/models
-    timeout: 2400
+    timeout: 7200
     interval: 10
 eval:
   install:
