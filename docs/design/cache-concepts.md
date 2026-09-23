@@ -961,8 +961,9 @@ seams — `layer_types`, `group_ids`, `fields_for_layer`, `prefix_granularity`,
 `num_lcm_blocks`, `token_capacity`, `parents_needed`, `workspace_bytes`,
 `pool_options`, `backends_accept_pool_replacement`, `verify_scratch_in_pool`.
 The last two answer whether this family can be rebound onto a second pool at
-boot; the CUDA-graph memory probe asks them before it binds anything. `groups()` itself is a seam for the two families whose groups
-are not per-layer (Inkling appends conv columns; V4 declares each group
+boot; the CUDA-graph memory probe asks them before it binds anything.
+`groups()` itself is a seam for the two families whose groups are not
+per-layer (Inkling appends conv columns; V4 declares each group
 whole). No family restates the order of the stages, and `_RECIPES`
 (`recipes/setup.py`) is the single family → recipe map.
 
@@ -1086,9 +1087,10 @@ same model (`docs/design/scheduler.md` §1.4). No recipe restates any of it.
 `scheduler_limits` is the single place a recipe reads the scheduler's
 concurrency, role and reserve widths, so demand and capacity cannot size
 against different numbers. Under a probe it reports the probe's fabricated
-batch instead: that arena holds a capture, not requests, and the same
-`probe_batch_rows` feeds both its block floor and this concurrency so the two
-cannot disagree.
+batch instead: that arena holds a capture, not requests. `probe_batch_rows`
+sets both sides: the arena holds at least that many parent blocks (more when
+admitting one token per group needs more), and the concurrency is that many
+rows, capped at the scheduler's `max_bs`.
 
 The runtime's global `max_num_seqs` is divided across attention DP ranks to
 produce each scheduler's rank-local `max_batch_size`. These values limit
