@@ -722,6 +722,7 @@ def process_attention_tile_deep(program: AttentionProgram, kv_start, num_tiles):
     program.store_lse(l_i, m_i)
     denom = gl.where(l_i > 0.0, l_i, 1.0)
     output = acc * (1.0 / denom)[:, None]
+    output = output.to(program.output_ptr.dtype.element_ty)
     output = gl.convert_layout(output, cfg.store_layout)
     program.store_output(output)
 
