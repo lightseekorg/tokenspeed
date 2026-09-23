@@ -368,10 +368,11 @@ def _ple_dilated_conv_kernel(
     SCATTER_WINDOWS: tl.constexpr,
     ADD_GATED: tl.constexpr,
     ADD_RESIDUAL: tl.constexpr,
-    ENABLE_PDL: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
     """Fused dilated depthwise conv + SiLU over the packed-free layout.
+
+    Inlined by _ple_conv_state_kernel, which owns PDL synchronization.
 
     Each program covers one token and a channel block. The virtual per-request
     sequence is ``[carried state (STATE cols) | tokens]``; tap ``k`` of output
@@ -399,8 +400,6 @@ def _ple_dilated_conv_kernel(
     block = tl.program_id(1)
     ch = block * BLOCK_C + tl.arange(0, BLOCK_C)
     cmask = ch < C
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
     req = tl.load(req_ptr + token).to(tl.int64)
     col = tl.load(col_ptr + token).to(tl.int64)
     start = tl.load(starts_ptr + req).to(tl.int64)
@@ -466,8 +465,6 @@ def _ple_dilated_conv_kernel(
                 tl.where(from_state, w_state, w_tok),
                 mask=cmask,
             )
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -483,10 +480,11 @@ def _ple_conv_final_kernel(
     STATE: tl.constexpr,
     WRITE_CARRIED: tl.constexpr,
     WRITE_FINAL: tl.constexpr,
-    ENABLE_PDL: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
     """Trailing conv window per request (the state carried to the next step).
+
+    Inlined by _ple_conv_state_kernel, which owns PDL synchronization.
 
     Reads virtual positions ``length .. length + STATE - 1``; zero-length
     requests naturally pass their carried state through unchanged.
@@ -496,8 +494,6 @@ def _ple_conv_final_kernel(
     block = tl.program_id(1)
     ch = block * BLOCK_C + tl.arange(0, BLOCK_C)
     cmask = ch < C
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
     if WRITE_FINAL:
         length = tl.load(lengths_ptr + req).to(tl.int64)
         start = tl.load(starts_ptr + req).to(tl.int64)
@@ -533,8 +529,6 @@ def _ple_conv_final_kernel(
                 carried,
                 mask=cmask,
             )
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -608,7 +602,6 @@ def _ple_conv_state_kernel(
             SCATTER_WINDOWS,
             ADD_GATED,
             ADD_RESIDUAL,
-            False,
             BLOCK_C,
         )
     if WRITE_FINAL or SCATTER_WINDOWS:
@@ -625,7 +618,6 @@ def _ple_conv_state_kernel(
                 STATE,
                 SCATTER_WINDOWS,
                 WRITE_FINAL,
-                False,
                 BLOCK_C,
             )
 

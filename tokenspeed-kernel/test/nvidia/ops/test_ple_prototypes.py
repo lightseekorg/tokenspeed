@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""PLE prototype correctness and CUDA-graph A/B benchmarks.
+"""PLE kernel correctness and exact-remainder CUDA-graph A/B benchmarks.
 
 Normal: pytest test/nvidia/ops/test_ple_prototypes.py -s
 Minimal dependency setup: python test_ple_prototypes.py -s
@@ -49,7 +49,6 @@ from tokenspeed_kernel.ops.ple import (
     ple_ngram_ids,
     prepare_ngram_reciprocals,
 )
-from tokenspeed_kernel.ops.ple.cute_dsl import ple_gate_norm_cute
 from tokenspeed_kernel.ops.ple.triton import _exact_remainder
 
 
@@ -117,20 +116,14 @@ def test_gate(tokens, d, dtype, pdl, monkeypatch):
     inputs = _gate_inputs(tokens, d, dtype)
     opts = dict(hc_count=4, hidden_size=d, eps=1e-6)
     expected = _gate_reference(inputs, d)
-    baseline = ple_gate_norm(*inputs, **opts)
-    actual = ple_gate_norm_cute(*inputs, **opts, enable_pdl=pdl)
-    tol = 2e-5 if dtype == torch.float32 else 8e-3
-    for ref, old, new in zip(expected, baseline, actual):
-        # Both GPU kernels differ from eager BF16 at a double-rounding boundary.
-        # Keep the tighter new-vs-baseline criterion, and check both against
-        # the independent eager reference with the same BF16 tolerance.
+    actual = ple_gate_norm(*inputs, **opts)
+    for ref, result in zip(expected, actual):
+        # The fused GPU kernel differs from eager BF16 at rounding boundaries.
         ref_tol = 2e-5 if dtype == torch.float32 else 1e-2
-        torch.testing.assert_close(old, ref, rtol=ref_tol, atol=ref_tol)
-        torch.testing.assert_close(new, ref, rtol=ref_tol, atol=ref_tol)
-        torch.testing.assert_close(new, old, rtol=tol, atol=tol)
+        torch.testing.assert_close(result, ref, rtol=ref_tol, atol=ref_tol)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = ple_gate_norm_cute(*inputs, **opts, enable_pdl=pdl)
+        captured = ple_gate_norm(*inputs, **opts)
     graph.replay()
     for a, b in zip(captured, actual):
         torch.testing.assert_close(a, b, rtol=0, atol=0)
@@ -242,13 +235,6 @@ def test_ngram(lengths, hpn, pdl, monkeypatch):
 @pytest.mark.parametrize("pdl", [False, True])
 def test_performance(tokens, pdl, monkeypatch):
     monkeypatch.setattr("tokenspeed_kernel.ops.ple.pdl_enabled", lambda: pdl)
-    inputs = _gate_inputs(tokens, 2560, torch.bfloat16)
-    opts = dict(hc_count=4, hidden_size=2560, eps=1e-6)
-    old = _measure(lambda: ple_gate_norm(*inputs, **opts))
-    new = _measure(lambda: ple_gate_norm_cute(*inputs, **opts, enable_pdl=pdl))
-    print(
-        f"GATE tokens={tokens} pdl={pdl} triton_us={old:.3f} cute_us={new:.3f} speedup={old/new:.3f}"
-    )
     args, opts, reciprocal = _ngram_case([tokens], 8)
     # Use embedding-sized moduli for timing, not the adversarial correctness mix.
     sizes = [1_000_003 + 2 * i for i in range(16)]
