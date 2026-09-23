@@ -27,11 +27,11 @@ from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
 _LARGEM_MIN_M = 512
 _LARGEM_BLOCK_M_CROSSOVER = 12288
-# Where the wide schedule starts paying, measured on MI455X across every
-# whitelisted shape. It needs both bounds: a 256x256 tile launches a quarter
-# the workgroups of the 128x128 one, so it under-fills the device unless M
-# and N are both large. At M = 512 it runs at roughly half the narrower
-# schedule's speed on every shape, and it is still behind on some at 2048.
+# Where the 256x256x128 wide schedule starts paying, measured on MI455X
+# across every whitelisted shape. It needs both bounds: that tile launches a
+# quarter the workgroups of the 128x128 one, so it under-fills the device
+# unless M and N are both large. Inside them it runs 1.05x to 1.2x the
+# narrower schedule; outside, 0.7x at N = 1536 and 0.42x at M = 512.
 _LARGEM_WIDE_M = 4096
 _LARGEM_WIDE_N = 3072
 # Tuples rather than lists: Triton hashes constexpr arguments for its cache.
@@ -866,11 +866,6 @@ def gluon_mm_a16w16_largem_gfx1250(
             f"{(m, n)} on {A.device}"
         )
 
-    # A large projection is better served by a 256x256x128 tile on eight
-    # warps, which uses 256 KB of the WGP's 320 KB of LDS and measures 1.05x
-    # to 1.2x the narrower schedule. Outside those bounds it loses instead,
-    # down to 0.7x at N = 1536 and 0.42x at M = 512, because a 256-wide tile
-    # leaves too few tiles to fill the device.
     if m >= _LARGEM_WIDE_M and n >= _LARGEM_WIDE_N:
         block_m, block_n, block_k = 256, 256, 128
         warp_bases, num_warps = _WARP_BASES_8, 8

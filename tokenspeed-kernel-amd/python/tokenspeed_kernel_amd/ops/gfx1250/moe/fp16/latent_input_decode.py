@@ -34,6 +34,9 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
+from tokenspeed_kernel_amd.ops.gfx1250.moe.fp16._common import (
+    _is_packed_projection_view,
+)
 
 _HIDDEN = 7168
 _ROUTER_N = 896
@@ -266,26 +269,6 @@ def gluon_latent_input_decode_epilogue_gfx1250(
         shared_ptr + row * SHARED_N + column,
         (gate * up).to(shared_ptr.dtype.element_ty),
     )
-
-
-def _is_packed_projection_view(packed, router, routed, shared) -> bool:
-    """Whether ``packed`` is exactly the three weights as consecutive rows.
-
-    The kernels read only ``packed``, so weights that do not live inside it
-    would be silently ignored. Checked here rather than through
-    ``tokenspeed_kernel``: this package must not depend on it.
-    """
-    parts = (router, routed, shared)
-    storage = packed.untyped_storage()
-    if any(part.untyped_storage().data_ptr() != storage.data_ptr() for part in parts):
-        return False
-    address = packed.data_ptr()
-    row_bytes = packed.shape[1] * packed.element_size()
-    for part in parts:
-        if part.data_ptr() != address:
-            return False
-        address += part.shape[0] * row_bytes
-    return address == packed.data_ptr() + packed.shape[0] * row_bytes
 
 
 def launch_gluon_latent_input_decode_gfx1250(
