@@ -186,7 +186,7 @@ jobs:
       install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
       b200_runner_label: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL }}
       # Large model downloads can take an hour before evaluation starts.
-      timeout_minutes: 120
+      timeout_minutes: 150
     secrets: inherit
 
   kernel-benchmark:
@@ -222,7 +222,7 @@ jobs:
       matrix: ${{ needs.scan.outputs.model_matrix }}
       install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
       b200_runner_label: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL }}
-      timeout_minutes: 120
+      timeout_minutes: 150
     secrets: inherit
 
   finish:

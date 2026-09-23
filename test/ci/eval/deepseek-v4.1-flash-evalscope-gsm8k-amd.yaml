@@ -28,13 +28,14 @@ server:
     --disable-prefill-graph
     --trust-remote-code
     --max-cudagraph-capture-size 32
+    --engine-startup-timeout 3600
     --reasoning-parser deepseek_v31
     --host 127.0.0.1
     --port 8000
   ready:
     url: http://127.0.0.1:8000/readiness
-    # Cold downloads of the 48-shard checkpoint can exceed 30 minutes on CI.
-    timeout: 3600
+    # Cold checkpoint downloads need time for engine and gateway startup.
+    timeout: 3900
     interval: 10
 eval:
   install:
