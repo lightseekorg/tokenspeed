@@ -205,6 +205,65 @@ def _ple_page_scatter_kernel(
 
 
 @triton.jit
+def _ple_host_gather_kernel(
+    table_address,
+    ids_ptr,
+    scale_value,
+    scale_ptr,
+    out_ptr,
+    head_dim,
+    vocab_start,
+    vocab_end,
+    IS_FP8: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
+    ROW_SCALE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Gather one n-gram row per program straight out of pinned host memory.
+
+    ``table_address`` is the host allocation's base address, not a device
+    tensor: under unified addressing a page-locked host pointer is a valid
+    device address, so the load below is a PCIe/C2C read issued by the GPU
+    itself. Rows outside this rank's shard emit zeros, matching the masked
+    lookup that :class:`VocabParallelEmbedding` performs before its all-reduce.
+
+    The dequant scale mirrors how the table was quantized, independent of
+    offloading. An offline FP8 checkpoint publishes one whole-table factor, so
+    ``ROW_SCALE`` is false and the scalar ``scale_value`` is used. A
+    compute-dtype checkpoint is quantized online, one row at a time, so
+    ``ROW_SCALE`` is true and each row's factor is read from ``scale_ptr`` at
+    its local id (folded row-0 for shard-masked rows is harmless: the output
+    is zeroed anyway). Either factor commutes with the all-reduce, so applying
+    it here -- before the reduce -- stays correct under tensor parallelism.
+    """
+
+    row = tl.program_id(0)
+    global_id = tl.load(ids_ptr + row)
+    in_range = (global_id >= vocab_start) & (global_id < vocab_end)
+    local_id = tl.where(in_range, global_id - vocab_start, 0)
+    offsets = tl.arange(0, BLOCK_D)
+    mask = offsets < head_dim
+    out_dtype = out_ptr.dtype.element_ty
+    if IS_FP8:
+        table = table_address.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+    else:
+        table = table_address.to(tl.int64).to(tl.pointer_type(out_dtype))
+    values = tl.load(table + local_id * head_dim + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    if HAS_SCALE:
+        if ROW_SCALE:
+            values = values * tl.load(scale_ptr + local_id)
+        else:
+            values = values * scale_value
+    tl.store(
+        out_ptr + row * head_dim + offsets,
+        tl.where(in_range, values, 0.0).to(out_dtype),
+        mask=mask,
+    )
+
+
+@triton.jit
 def _ple_dilated_conv_kernel(
     values_ptr,
     initial_ptr,

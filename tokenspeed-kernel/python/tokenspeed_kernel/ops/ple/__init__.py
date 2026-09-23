@@ -44,6 +44,7 @@ from tokenspeed_kernel.ops.ple.triton import (
     _ple_conv_final_kernel,
     _ple_dilated_conv_kernel,
     _ple_gate_norm_kernel,
+    _ple_host_gather_kernel,
     _ple_page_gather_kernel,
     _ple_page_scatter_kernel,
 )
@@ -52,10 +53,42 @@ from tokenspeed_kernel.platform import pdl_enabled
 __all__ = [
     "ple_conv_sequences",
     "ple_gate_norm",
+    "ple_host_gather",
     "ple_ngram_ids",
     "ple_page_gather",
     "ple_page_scatter",
 ]
+
+
+def ple_host_gather(
+    table: torch.Tensor,
+    ids: torch.Tensor,
+    out: torch.Tensor,
+    vocab_start: int,
+    vocab_end: int,
+    scale: float | None,
+    row_scale: torch.Tensor | None,
+) -> torch.Tensor:
+    rows = ids.numel()
+    if rows == 0:
+        return out
+    head_dim = out.shape[-1]
+    _ple_host_gather_kernel[(rows,)](
+        table.data_ptr(),
+        ids.reshape(-1),
+        scale if scale is not None else 1.0,
+        row_scale if row_scale is not None else out,
+        out.view(rows, head_dim),
+        head_dim,
+        vocab_start,
+        vocab_end,
+        IS_FP8=table.dtype == torch.float8_e4m3fn,
+        HAS_SCALE=row_scale is not None or scale is not None,
+        ROW_SCALE=row_scale is not None,
+        BLOCK_D=_triton.next_power_of_2(head_dim),
+        num_warps=1,
+    )
+    return out
 
 
 def ple_ngram_ids(

@@ -88,6 +88,7 @@ from tokenspeed.runtime.layers.hyperconnection import (
     HyperConnectionConfig,
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
+from tokenspeed.runtime.layers.ple_lookup import PLELookup
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
 from tokenspeed.runtime.layers.qwen4_exp_ple import (
@@ -1480,6 +1481,15 @@ def _ple_layer_stub(hc_count: int = 1, hidden_size: int = 2, pages: int = 5):
 
     class ContextEmbedding(torch.nn.Module):
         eos_token_id = 0
+        ngram_heads = 2
+        lookup = SimpleNamespace(
+            make_layout=lambda *args: None,
+            start=lambda ids, layout: ids.float(),
+            finish=lambda pending: pending,
+        )
+
+        def _ngram_ids_torch(self, contexts):
+            return contexts
 
         def forward(self, contexts):
             return contexts.to(torch.float32)
@@ -1494,6 +1504,7 @@ def _ple_layer_stub(hc_count: int = 1, hidden_size: int = 2, pages: int = 5):
     layer.ngram_size = 2
     layer.context_len = 1
     layer.ple_embedding = ContextEmbedding()
+    layer._prefetched = None
 
     class KVProjection(torch.nn.Module):
         """Stand-in for the fused kv_proj GEMM (hc_hidden + hidden columns)."""
@@ -1530,6 +1541,39 @@ def _ple_layer_stub(hc_count: int = 1, hidden_size: int = 2, pages: int = 5):
     return layer, fields, recorded
 
 
+@pytest.mark.parametrize("offload", [False, True])
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_qwen4_exp_ple_idle_dp_participates_in_lookup(offload, prefetch) -> None:
+    layer, _, _ = _ple_layer_stub()
+    calls = []
+    values = torch.empty((0, 4))
+
+    def start(ids, layout):
+        assert ids.shape == (0, 2)
+        assert ids.dtype == torch.int64
+        calls.append("start")
+        return values
+
+    def finish(pending):
+        assert pending is values
+        calls.append("finish")
+        return pending
+
+    layer.ple_embedding.lookup = SimpleNamespace(
+        make_layout=lambda *args: None, start=start, finish=finish
+    )
+    ctx = SimpleNamespace(forward_mode=ForwardMode.IDLE, global_num_tokens=[0, 2])
+    ids = torch.empty(0, dtype=torch.int32)
+    hidden = torch.empty((0, 2))
+    if prefetch:
+        layer.start_prefetch(ids, ctx)
+        layer.start_prefetch(ids, ctx)
+        assert calls == ["start"]
+    assert layer(hidden, ids, ctx) is hidden
+    assert calls == ["start", "finish"]
+    assert layer._prefetched is None
+
+
 def test_qwen4_exp_ple_reads_state_block_metadata() -> None:
     layer, fields, folded = _ple_layer_stub(pages=3)
     context = fields[layer.context_field_id]
@@ -1551,6 +1595,7 @@ def test_qwen4_exp_ple_reads_state_block_metadata() -> None:
         bs=1,
         forward_mode=ForwardMode.DECODE,
         token_to_kv_pool=pool,
+        global_num_tokens=None,
     )
     hidden_states = torch.tensor([[1.0, 2.0]])
 
@@ -1703,6 +1748,7 @@ def test_qwen4_exp_ple_handles_a_ragged_padded_batch() -> None:
         bs=2,
         forward_mode=ForwardMode.EXTEND,
         token_to_kv_pool=pool,
+        global_num_tokens=None,
     )
     # Eight rows for five real tokens: the tail is the padded bucket's filler.
     input_ids = torch.tensor([10, 11, 12, 20, 21, 1, 1, 1], dtype=torch.int64)
@@ -2719,7 +2765,7 @@ def test_ple_fp8_dequant_gather_matches_bf16() -> None:
         embed_output_dtype=torch.bfloat16,
     )
     raw = torch.nn.functional.embedding(ids, quantized)
-    dequant = Qwen4ExpNGramEmbedding._dequant.__get__(stub)(raw, ids)
+    dequant = PLELookup._dequant.__get__(stub)(raw, ids)
     reference = torch.nn.functional.embedding(ids, table)
 
     assert dequant.dtype == torch.bfloat16
@@ -2758,11 +2804,17 @@ def test_ple_host_prefetch_matches_inline_gather(store_fp8: bool) -> None:
         torch.tensor([0] + lengths[:-1], device="cuda"), dim=0
     )
 
-    inline, _ = host.forward_flat(input_ids, initial, req, col, starts)
-    gathered, _ = host.start_flat_gather(input_ids, initial, req, col, starts)
-    prefetched = host.finish_flat_gather(gathered)
+    inline, _ = _lookup_flat(host, input_ids, initial, req, col, starts)
+    ids, _ = host._ngram_ids_flat_cuda(
+        input_ids, initial, req, col, starts, False
+    )
+    pending = host.lookup.start(ids, host.lookup.make_layout(None, ids.shape[0]))
+    with torch.cuda.stream(torch.cuda.Stream()):
+        torch.ones(1024, device="cuda").square_()
+        prefetched = host.lookup.finish(pending)
+        torch.cuda.current_stream().synchronize()
 
-    assert host._gather_stream is not None
+    assert host.lookup._gather_stream is not None
     torch.testing.assert_close(prefetched, inline, rtol=0, atol=0)
 
 
@@ -2773,11 +2825,15 @@ def _ple_checkpoint_loader_stub(
     root = torch.nn.Module()
     ple = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
     torch.nn.Module.__init__(ple)
-    ple.embed_store_dtype = (
+    ple.lookup = PLELookup.__new__(PLELookup)
+    torch.nn.Module.__init__(ple.lookup)
+    ple.lookup.register_buffer("ngram_embedding_scale", None, persistent=False)
+    ple.lookup.embed_store_dtype = (
         torch.float8_e4m3fn if store_dtype == torch.float8_e4m3fn else None
     )
-    ple._checkpoint_weight_scale = 1.0
-    ple.offload_embedding = offload
+    ple.lookup._checkpoint_weight_scale = 1.0
+    ple.lookup.offload_embedding = offload
+    ple.lookup._compute_device = torch.device("cuda" if offload else "cpu")
 
     embedding = torch.nn.Module()
     embedding.org_vocab_size = 8
@@ -2790,10 +2846,10 @@ def _ple_checkpoint_loader_stub(
         "weight",
         torch.nn.Parameter(torch.empty(8, 4, dtype=store_dtype), requires_grad=False),
     )
-    ple.ngram_embedding = embedding
+    ple.lookup.ngram_embedding = embedding
     # Offloaded FP8 tables carry a per-tensor scalar instead of a per-row buffer.
-    if ple.embed_store_dtype is not None and not offload:
-        ple.register_buffer("ngram_embedding_scale", torch.ones(8))
+    if ple.lookup.embed_store_dtype is not None and not offload:
+        ple.lookup.register_buffer("ngram_embedding_scale", torch.ones(8))
     root.ple = ple
     return root, ple
 
@@ -2834,13 +2890,13 @@ def test_ple_offload_loader_records_scalar_scale_without_row_buffer() -> None:
         include_visual=False,
     )
 
-    assert getattr(ple, "ngram_embedding_scale", None) is None
-    assert ple._checkpoint_weight_scale == pytest.approx(
+    assert ple.lookup.ngram_embedding_scale is None
+    assert ple.lookup._checkpoint_weight_scale == pytest.approx(
         checkpoint_scale.float().item()
     )
     # The FP8 payload is preserved verbatim; the scale is applied only at gather.
-    assert torch.equal(ple.ngram_embedding.weight, source)
-    assert loaded == {"ple.ngram_embedding.weight"}
+    assert torch.equal(ple.lookup.ngram_embedding.weight, source)
+    assert loaded == {"ple.lookup.ngram_embedding.weight"}
 
 
 @_requires_cuda
@@ -2855,7 +2911,7 @@ def test_ple_offload_loader_online_quantizes_bf16_to_host() -> None:
     """
 
     root, ple = _ple_checkpoint_loader_stub(torch.float8_e4m3fn, offload=True)
-    assert getattr(ple, "ngram_embedding_scale", None) is None
+    assert ple.lookup.ngram_embedding_scale is None
     torch.manual_seed(5)
     source = torch.randn(8, 4, dtype=torch.bfloat16)
     weights = [("ple.ngram_embedding.shard_0.weight", source)]
@@ -2869,13 +2925,13 @@ def test_ple_offload_loader_online_quantizes_bf16_to_host() -> None:
     )
 
     expected_payload, expected_scale = quantize_ple_embedding_rows(source)
-    scale_buffer = getattr(ple, "ngram_embedding_scale", None)
+    scale_buffer = ple.lookup.ngram_embedding_scale
     assert scale_buffer is not None and scale_buffer.is_cuda
     assert scale_buffer.shape == (8,)
     # The payload is the online FP8 quantization; the per-row scales dequant it.
-    assert torch.equal(ple.ngram_embedding.weight, expected_payload)
+    assert torch.equal(ple.lookup.ngram_embedding.weight, expected_payload)
     torch.testing.assert_close(scale_buffer.cpu(), expected_scale)
-    assert loaded == {"ple.ngram_embedding.weight"}
+    assert loaded == {"ple.lookup.ngram_embedding.weight"}
 
 
 @pytest.mark.parametrize("scale_first", [False, True])
@@ -2912,21 +2968,21 @@ def test_ple_prequantized_checkpoint_scale_is_applied(
     )
 
     expected_scale = checkpoint_scale.float().item()
-    restored = ple.ngram_embedding.weight.float()
+    restored = ple.lookup.ngram_embedding.weight.float()
     if store_dtype == torch.float8_e4m3fn:
-        assert torch.equal(ple.ngram_embedding.weight, source)
+        assert torch.equal(ple.lookup.ngram_embedding.weight, source)
         torch.testing.assert_close(
-            ple.ngram_embedding_scale,
+            ple.lookup.ngram_embedding_scale,
             torch.full((8,), expected_scale),
         )
-        restored = restored * ple.ngram_embedding_scale.unsqueeze(1)
+        restored = restored * ple.lookup.ngram_embedding_scale.unsqueeze(1)
     torch.testing.assert_close(
         restored,
         source.float() * expected_scale,
         rtol=1e-2,
         atol=1e-5,
     )
-    assert loaded == {"ple.ngram_embedding.weight"}
+    assert loaded == {"ple.lookup.ngram_embedding.weight"}
 
 
 def test_should_exclude_quant_module_expands_fused_members() -> None:
@@ -2952,6 +3008,73 @@ def test_should_exclude_quant_module_expands_fused_members() -> None:
         f"{mlp}.gate_up_proj", [f"{mlp}.gate_proj", f"{mlp}.up_proj"]
     )
     assert not should_exclude_quant_module(f"{mlp}.gate_up_proj", [f"{mlp}.up_proj"])
+
+
+def test_ple_unsplit_checkpoint_key_maps_to_lookup():
+    root, ple = _ple_checkpoint_loader_stub(torch.bfloat16)
+    source = torch.arange(32, dtype=torch.bfloat16).reshape(8, 4)
+    loaded = load_qwen4_exp_weights(
+        root,
+        SimpleNamespace(num_experts=None, split_ngram_parts=1),
+        SimpleNamespace(),
+        [("ple.ngram_embedding.weight", source)],
+        include_visual=False,
+    )
+    assert loaded == {"ple.lookup.ngram_embedding.weight"}
+    assert list(dict(root.named_parameters())) == ["ple.lookup.ngram_embedding.weight"]
+    assert torch.equal(ple.lookup.ngram_embedding.weight, source)
+
+
+@_requires_cuda
+def test_ple_online_fp8_host_lookup_matches_device():
+    device, host = _ngram_embedding_pair(True)
+    rows = torch.randn_like(device.lookup.ngram_embedding.weight, dtype=torch.bfloat16)
+    device.lookup.load_shard(rows, 0, 1)
+    host.lookup.load_shard(rows.cpu(), 0, 1)
+    ids = torch.randint(
+        0,
+        device.lookup.ngram_embedding.org_vocab_size,
+        (7, device.ngram_heads),
+        device="cuda",
+    )
+    layout = device.lookup.make_layout(None, 7)
+    expected = device.lookup.finish(device.lookup.start(ids, layout))
+    actual = host.lookup.finish(host.lookup.start(ids, layout))
+    torch.testing.assert_close(actual, expected)
+
+
+@_requires_cuda
+def test_ple_device_lookup_cross_stream(monkeypatch):
+    embedding, _ = _ngram_embedding_pair(False)
+    lookup = embedding.lookup
+    ids = torch.ones((4, embedding.ngram_heads), dtype=torch.int64, device="cuda")
+    layout = lookup.make_layout(None, 4)
+    expected = lookup.finish(lookup.start(ids, layout))
+    pending = lookup.start(ids, layout)
+    execution_stream = torch.cuda.current_stream()
+    reduction = lookup.reduce_lookup
+
+    def reduce_on_execution_stream(values):
+        assert torch.cuda.current_stream() == execution_stream
+        return reduction(values)
+
+    monkeypatch.setattr(lookup, "reduce_lookup", reduce_on_execution_stream)
+    with torch.cuda.stream(torch.cuda.Stream()):
+        actual = lookup.finish(pending)
+        actual = actual.clone()
+        torch.cuda.current_stream().synchronize()
+    torch.testing.assert_close(actual, expected)
+
+
+def _lookup_flat(embedding, input_ids, initial, req, col, starts):
+    ids, tail = embedding._ngram_ids_flat_cuda(
+        input_ids, initial, req, col, starts, False
+    )
+    lookup = embedding.lookup
+    return (
+        lookup.finish(lookup.start(ids, lookup.make_layout(None, ids.shape[0]))),
+        tail,
+    )
 
 
 def _ngram_embedding_pair(
@@ -2994,7 +3117,7 @@ def _ngram_embedding_pair(
 
     torch.manual_seed(3)
     rows = torch.randn(
-        device.ngram_embedding.weight.shape, dtype=torch.bfloat16, device="cuda"
+        device.lookup.ngram_embedding.weight.shape, dtype=torch.bfloat16, device="cuda"
     )
     if store_fp8:
         # An offloaded table is pre-quantized offline with a single per-tensor
@@ -3005,15 +3128,15 @@ def _ngram_embedding_pair(
         scale = (values.abs().amax() / 448.0).clamp_min(1e-12)
         payload = (values / scale).to(torch.float8_e4m3fn)
         scale = float(scale)
-        device.ngram_embedding_scale.fill_(scale)
+        device.lookup.ngram_embedding_scale.fill_(scale)
         assert not hasattr(host, "ngram_embedding_scale") or (
-            getattr(host, "ngram_embedding_scale", None) is None
+            host.lookup.ngram_embedding_scale is None
         )
-        host._checkpoint_weight_scale = scale
+        host.lookup._checkpoint_weight_scale = scale
     else:
         payload = rows
-    device.ngram_embedding.weight.data.copy_(payload)
-    host.ngram_embedding.weight.data.copy_(payload.cpu())
+    device.lookup.ngram_embedding.weight.data.copy_(payload)
+    host.lookup.ngram_embedding.weight.data.copy_(payload.cpu())
     return device, host
 
 
@@ -3024,10 +3147,10 @@ def _ngram_embedding_pair(
 def test_ple_host_gather_matches_device_lookup(store_fp8: bool) -> None:
     device, host = _ngram_embedding_pair(store_fp8)
 
-    assert not host.ngram_embedding.weight.is_cuda
+    assert not host.lookup.ngram_embedding.weight.is_cuda
     # Pageable host storage has no device-visible address; the gather kernel
     # would fault on it rather than fall back.
-    assert host.ngram_embedding.weight.is_pinned()
+    assert host.lookup.ngram_embedding.weight.is_pinned()
 
     lengths = [5, 1, 9]
     tokens = sum(lengths)
@@ -3038,15 +3161,11 @@ def test_ple_host_gather_matches_device_lookup(store_fp8: bool) -> None:
         torch.arange(len(lengths), device="cuda"),
         torch.tensor(lengths, device="cuda"),
     )
-    col = torch.cat(
-        [torch.arange(length, device="cuda") for length in lengths]
-    )
-    starts = torch.cumsum(
-        torch.tensor([0] + lengths[:-1], device="cuda"), dim=0
-    )
+    col = torch.cat([torch.arange(length, device="cuda") for length in lengths])
+    starts = torch.cumsum(torch.tensor([0] + lengths[:-1], device="cuda"), dim=0)
 
-    expected, _ = device.forward_flat(input_ids, initial, req, col, starts)
-    got, _ = host.forward_flat(input_ids, initial, req, col, starts)
+    expected, _ = _lookup_flat(device, input_ids, initial, req, col, starts)
+    got, _ = _lookup_flat(host, input_ids, initial, req, col, starts)
 
     assert got.shape == expected.shape
     assert got.dtype == expected.dtype
@@ -3095,6 +3214,5 @@ def test_ple_host_table_skips_device_allocation(
         )
     growth = torch.cuda.max_memory_allocated() - before
 
-    table_bytes = embedding.ngram_embedding.weight.numel() * 2
+    table_bytes = embedding.lookup.ngram_embedding.weight.numel() * 2
     assert growth < table_bytes // 4
-    assert "PLE embedding offload enabled for layer 0" in caplog.text

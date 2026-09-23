@@ -22,15 +22,11 @@
 
 from __future__ import annotations
 
-import logging
 import math
-from contextlib import nullcontext
 from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 from tokenspeed_kernel.ops.ple import (
     ple_conv_sequences,
     ple_gate_norm,
@@ -41,7 +37,6 @@ from tokenspeed_kernel.ops.ple import (
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen4_exp_config import Qwen4ExpTextConfig
-from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
@@ -62,12 +57,15 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
 )
 from tokenspeed.runtime.layers.hyperconnection import GroupedGemmaRMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
-from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding,
-    get_masked_input_and_mask,
+from tokenspeed.runtime.layers.ple_lookup import (
+    PendingLookup,
+    PLELookup,
+    quantize_ple_embedding_rows,
 )
-from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
+
+logger = get_colorful_logger(__name__)
 
 _IndexBundle = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 # Uniform-batch index bundles captured into a CUDA graph. During capture the
@@ -78,8 +76,6 @@ _IndexBundle = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 # capture pool can overwrite their contents, so eager calls neither read nor
 # populate this cache. They compute fresh tensors instead.
 _UNIFORM_INDEX_CACHE: dict[tuple[int, int, torch.device], _IndexBundle] = {}
-
-logger = logging.getLogger(__name__)
 
 
 def _is_prime(value: int) -> bool:
@@ -104,142 +100,6 @@ def _nth_prime_after(start: int, count: int) -> int:
         if _is_prime(candidate):
             found += 1
     return candidate
-
-
-_PLE_FP8_MAX = 448.0  # torch.float8_e4m3fn finite maximum
-
-
-def quantize_ple_embedding_rows(
-    rows: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Online per-row FP8 quantization for the n-gram table.
-
-    Checkpoint shards stream in row ranges, so each row is quantized
-    independently (``scale = amax / 448``) -- no whole-table amax prescan is
-    needed and no clipping can occur. Returns the FP8 rows and their fp32
-    dequant scales.
-    """
-
-    values = rows.to(torch.float32)
-    scale = (values.abs().amax(dim=1) / _PLE_FP8_MAX).clamp_min(1e-12)
-    quantized = (values / scale.unsqueeze(1)).to(torch.float8_e4m3fn)
-    return quantized, scale
-
-
-@triton.jit
-def _ple_host_gather_kernel(
-    table_address,
-    ids_ptr,
-    scale_value,
-    scale_ptr,
-    out_ptr,
-    head_dim,
-    vocab_start,
-    vocab_end,
-    IS_FP8: tl.constexpr,
-    HAS_SCALE: tl.constexpr,
-    ROW_SCALE: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    """Gather one n-gram row per program straight out of pinned host memory.
-
-    ``table_address`` is the host allocation's base address, not a device
-    tensor: under unified addressing a page-locked host pointer is a valid
-    device address, so the load below is a PCIe/C2C read issued by the GPU
-    itself. Rows outside this rank's shard emit zeros, matching the masked
-    lookup that :class:`VocabParallelEmbedding` performs before its all-reduce.
-
-    The dequant scale mirrors how the table was quantized, independent of
-    offloading. An offline FP8 checkpoint publishes one whole-table factor, so
-    ``ROW_SCALE`` is false and the scalar ``scale_value`` is used. A
-    compute-dtype checkpoint is quantized online, one row at a time, so
-    ``ROW_SCALE`` is true and each row's factor is read from ``scale_ptr`` at
-    its local id (folded row-0 for shard-masked rows is harmless: the output
-    is zeroed anyway). Either factor commutes with the all-reduce, so applying
-    it here -- before the reduce -- stays correct under tensor parallelism.
-    """
-
-    row = tl.program_id(0)
-    global_id = tl.load(ids_ptr + row)
-    in_range = (global_id >= vocab_start) & (global_id < vocab_end)
-    local_id = tl.where(in_range, global_id - vocab_start, 0)
-    offsets = tl.arange(0, BLOCK_D)
-    mask = offsets < head_dim
-    out_dtype = out_ptr.dtype.element_ty
-    if IS_FP8:
-        table = table_address.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
-    else:
-        table = table_address.to(tl.int64).to(tl.pointer_type(out_dtype))
-    values = tl.load(
-        table + local_id * head_dim + offsets, mask=mask, other=0.0
-    ).to(tl.float32)
-    if HAS_SCALE:
-        if ROW_SCALE:
-            values = values * tl.load(scale_ptr + local_id)
-        else:
-            values = values * scale_value
-    tl.store(
-        out_ptr + row * head_dim + offsets,
-        tl.where(in_range, values, 0.0).to(out_dtype),
-        mask=mask,
-    )
-
-
-def materialize_ngram_table_on_host(embedding: VocabParallelEmbedding) -> None:
-    """Give a meta-constructed n-gram table page-locked host storage."""
-
-    source = embedding.weight
-    host_weight = nn.Parameter(
-        torch.empty(
-            source.shape, dtype=source.dtype, device="cpu", pin_memory=True
-        ),
-        requires_grad=False,
-    )
-    for name, value in vars(source).items():
-        setattr(host_weight, name, value)
-    del embedding.weight
-    embedding.register_parameter("weight", host_weight)
-
-
-def host_gather_ngram_rows(
-    embedding: VocabParallelEmbedding,
-    ids: torch.Tensor,
-    scale: float | None,
-    out: torch.Tensor,
-    row_scale: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Fill ``out`` with the ``ids`` rows of a host-resident n-gram table.
-
-    The dequant factor follows the checkpoint format (see
-    :func:`_ple_host_gather_kernel`): ``row_scale`` is the device per-row buffer
-    for an online-quantized table, ``scale`` the per-tensor scalar for an
-    offline FP8 one, and both ``None`` for a compute-dtype table that needs
-    none.
-    """
-
-    rows = ids.numel()
-    if rows == 0:
-        return out
-    head_dim = out.shape[-1]
-    has_row = row_scale is not None
-    _ple_host_gather_kernel[(rows,)](
-        embedding.weight.data_ptr(),
-        ids.reshape(-1),
-        float(scale) if scale is not None else 1.0,
-        # Unused when ROW_SCALE is false; ``out`` is a valid device pointer to
-        # keep triton's type inference happy without a throwaway allocation.
-        row_scale if has_row else out,
-        out.view(rows, head_dim),
-        head_dim,
-        embedding.shard_indices.org_vocab_start_index,
-        embedding.shard_indices.org_vocab_end_index,
-        IS_FP8=embedding.weight.dtype == torch.float8_e4m3fn,
-        HAS_SCALE=has_row or scale is not None,
-        ROW_SCALE=has_row,
-        BLOCK_D=triton.next_power_of_2(head_dim),
-        num_warps=1,
-    )
-    return out
 
 
 class Qwen4ExpNGramEmbedding(nn.Module):
@@ -315,156 +175,25 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 "Qwen4-Exp ple_embed_dtype supports only 'float8_e4m3fn', "
                 f"got {ple_embed_dtype!r}"
             )
-        self.embed_store_dtype = torch.float8_e4m3fn if ple_embed_dtype else None
-        # Lookups are dequantized back to the model compute dtype (layer
-        # construction runs under the model's default dtype).
-        self.embed_output_dtype = torch.get_default_dtype()
-        # Source checkpoints may already store the table in FP8 and publish
-        # one dequant scale beside all of its split shards. The loader updates
-        # this value when that tensor arrives; keeping it as Python state lets
-        # CPU-side shard copies apply the scale without a device sync.
-        self._checkpoint_weight_scale = 1.0
-        # Construct offloaded tables on meta so production-sized tables never
-        # transiently consume device memory before moving to pinned host RAM.
-        self.offload_embedding = bool(
-            getattr(config, "ple_offload_embedding", True)
+        offload_embedding = bool(getattr(config, "ple_offload_embedding", True))
+        self.lookup = PLELookup(
+            mapping,
+            vocab_size=padded_vocab,
+            ngram_heads=self.ngram_heads,
+            head_dim=self.head_dim,
+            storage_dtype=torch.float8_e4m3fn if ple_embed_dtype else None,
+            output_dtype=torch.get_default_dtype(),
+            offload=offload_embedding,
+            prefix=add_prefix("ngram_embedding", prefix),
         )
-        with torch.device("meta") if self.offload_embedding else nullcontext():
-            self.ngram_embedding = VocabParallelEmbedding(
-                padded_vocab,
-                self.head_dim,
-                org_num_embeddings=padded_vocab,
-                params_dtype=self.embed_store_dtype,
-                prefix=add_prefix("ngram_embedding", prefix),
-                tp_rank=mapping.attn.tp_rank,
-                tp_size=mapping.attn.tp_size,
-                tp_group=mapping.attn.tp_group,
-            )
-        if self.offload_embedding:
-            materialize_ngram_table_on_host(self.ngram_embedding)
+        if self.ple_layer_index == 0 and offload_embedding:
+            weight = self.lookup.ngram_embedding.weight
             logger.info(
-                "PLE embedding offload enabled for layer %d: n-gram table "
-                "stored in pinned host memory with local shape %s",
-                self.ple_layer_index,
-                tuple(self.ngram_embedding.weight.shape),
+                "PLE offloading enabled: "
+                f"host_table={weight.device.type == 'cpu'}, "
+                f"pinned_memory={weight.is_pinned()}, "
+                f"storage_dtype={self.lookup.embed_store_dtype}"
             )
-        # Created on first use rather than here: a host table can be built on a
-        # CUDA-less box, and only the prefetch path ever needs the stream.
-        self._gather_stream: torch.cuda.Stream | None = None
-        if self.embed_store_dtype is not None and not self.offload_embedding:
-            # Per-local-row dequant scales, written by the loader's online
-            # quantization. Ones (not zeros / empty): rows gathered before the
-            # checkpoint lands, or shard-masked rows folded to local row 0,
-            # must stay finite. Non-persistent: derived from the bf16
-            # checkpoint, never round-tripped.
-            #
-            # An offloaded table is not built with this buffer: the offline FP8
-            # checkpoint offloading targets carries a single per-tensor scale
-            # (kept in _checkpoint_weight_scale), so a per-row buffer would be
-            # ngram_vocab_size_base * 4 bytes of a repeated constant. A
-            # compute-dtype checkpoint under offload is still quantized online
-            # per row; the loader allocates this buffer lazily in that case.
-            self.register_buffer(
-                "ngram_embedding_scale",
-                torch.ones(self.ngram_embedding.num_embeddings_per_partition),
-                persistent=False,
-            )
-
-    def allocate_lookup_buffer(
-        self, tokens: int, device: torch.device
-    ) -> torch.Tensor:
-        """Destination for a host gather, shaped like a flattened lookup."""
-
-        return torch.empty(
-            (tokens, self.embedding_dim),
-            dtype=self.embed_output_dtype,
-            device=device,
-        )
-
-    def gather_host(self, ids: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-        """Read the ``ids`` rows from host memory into ``out``.
-
-        ``out`` is ``[tokens, ngram_heads * head_dim]``. Row-major order makes
-        the per-head rows land contiguously, so the flatten that the device
-        path applies afterwards is already implicit here, and the FP8 dequant
-        happens inside the kernel instead of materializing an fp32 temporary.
-        The dequant factor follows the checkpoint format: a per-row device
-        buffer for an online-quantized table, the per-tensor scalar for an
-        offline FP8 one (see :meth:`__init__`), and none for a compute-dtype
-        table.
-        """
-
-        row_scale = getattr(self, "ngram_embedding_scale", None)
-        scale = (
-            self._checkpoint_weight_scale
-            if row_scale is None and self.embed_store_dtype is not None
-            else None
-        )
-        host_gather_ngram_rows(
-            self.ngram_embedding,
-            ids,
-            scale,
-            out.view(-1, self.head_dim),
-            row_scale=row_scale,
-        )
-        return out
-
-    def reduce_lookup(self, embeddings: torch.Tensor) -> torch.Tensor:
-        """Combine per-rank shard contributions of a gathered lookup."""
-
-        if self.ngram_embedding.tp_size > 1:
-            return all_reduce(embeddings, self.ngram_embedding.tp_group)
-        return embeddings
-
-    def start_flat_gather(
-        self,
-        input_ids: torch.Tensor,
-        initial: torch.Tensor,
-        req: torch.Tensor,
-        col: torch.Tensor,
-        starts: torch.Tensor,
-        need_tail: bool = False,
-        tail_out: torch.Tensor | None = None,
-        tail_block_rows: int = 0,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Issue the host gather on a side stream and return before it lands.
-
-        Only the gather itself is moved off the caller's stream. The hash kernel
-        is microseconds of device work, so overlapping it would buy nothing,
-        while keeping its outputs on the caller's stream means the ids and the
-        destination are allocated there and only *read* across the boundary --
-        the pair of ``record_stream`` calls is what tells the caching allocator
-        the side stream still holds them.
-
-        The returned buffer is not readable until :meth:`finish_flat_gather`.
-        """
-
-        ids, tail = self._ngram_ids_flat_cuda(
-            input_ids,
-            initial,
-            req,
-            col,
-            starts,
-            need_tail,
-            tail_out,
-            tail_block_rows,
-        )
-        out = self.allocate_lookup_buffer(ids.shape[0], ids.device)
-        if self._gather_stream is None:
-            self._gather_stream = torch.cuda.Stream()
-        stream = self._gather_stream
-        stream.wait_stream(torch.cuda.current_stream())
-        ids.record_stream(stream)
-        out.record_stream(stream)
-        with torch.cuda.stream(stream):
-            self.gather_host(ids, out)
-        return out, tail
-
-    def finish_flat_gather(self, gathered: torch.Tensor) -> torch.Tensor:
-        """Wait for a :meth:`start_flat_gather` to land, then reduce it."""
-
-        torch.cuda.current_stream().wait_stream(self._gather_stream)
-        return self.reduce_lookup(gathered)
 
     @classmethod
     def _splitmix64(cls, value: int) -> int:
@@ -540,87 +269,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             tail_block_rows=tail_block_rows,
         )
 
-    def _dequant(self, raw: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
-        """Cast the FP8 lookup to compute dtype and apply per-row scales.
-
-        Must run before the TP all-reduce: FP8 payloads cannot be reduced and
-        each row's scale lives only on its owning rank. Shard-masked rows were
-        zero-filled by the embedding forward, so gathering their folded row-0
-        scale is harmless (0 * finite = 0).
-        """
-
-        module = self.ngram_embedding
-        if module.tp_size > 1:
-            local_ids, _ = get_masked_input_and_mask(
-                ids,
-                module.shard_indices.org_vocab_start_index,
-                module.shard_indices.org_vocab_end_index,
-                module.shard_indices.num_org_vocab_padding,
-                module.shard_indices.added_vocab_start_index,
-                module.shard_indices.added_vocab_end_index,
-            )
-        else:
-            local_ids = ids.clamp(min=0, max=module.num_embeddings_padded - 1)
-        scale = self.ngram_embedding_scale[local_ids]
-        return (raw.to(torch.float32) * scale.unsqueeze(-1)).to(self.embed_output_dtype)
-
-    def forward_flat(
-        self,
-        input_ids: torch.Tensor,
-        initial: torch.Tensor,
-        req: torch.Tensor,
-        col: torch.Tensor,
-        starts: torch.Tensor,
-        need_tail: bool = False,
-        tail_out: torch.Tensor | None = None,
-        tail_block_rows: int = 0,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """CUDA path: embed n-grams without materializing the window matrix."""
-
-        ids, tail = self._ngram_ids_flat_cuda(
-            input_ids,
-            initial,
-            req,
-            col,
-            starts,
-            need_tail,
-            tail_out,
-            tail_block_rows,
-        )
-        if self.offload_embedding:
-            out = self.allocate_lookup_buffer(ids.shape[0], ids.device)
-            return self.reduce_lookup(self.gather_host(ids, out)), tail
-        # Reduce the flattened [tokens, heads * head_dim] view instead of the
-        # 3D lookup: the lamport backend folds trailing dims into token count
-        # ([T * heads, head_dim]), which blows past the mnnvl token cap and
-        # demotes this all-reduce to the IPC/NCCL path. flatten(-2) is a
-        # metadata-only view and was applied to the output anyway. FP8 tables
-        # dequantize here, before the reduce.
-        embeddings = self.ngram_embedding(ids, reduce_results=False)
-        if self.embed_store_dtype is not None:
-            embeddings = self._dequant(embeddings, ids)
-        embeddings = embeddings.flatten(-2)
-        if self.ngram_embedding.tp_size > 1:
-            embeddings = all_reduce(embeddings, self.ngram_embedding.tp_group)
-        return embeddings, tail
-
     def forward(self, contexts: torch.Tensor) -> torch.Tensor:
-        """Embed contexts shaped ``[tokens, ngram_size]`` (fallback path)."""
-
-        contexts = contexts.to(torch.long)
-        ids = self._ngram_ids_torch(contexts)
-        if self.offload_embedding:
-            out = self.allocate_lookup_buffer(ids.shape[0], ids.device)
-            return self.reduce_lookup(self.gather_host(ids, out))
-        embeddings = self.ngram_embedding(ids, reduce_results=False)
-        if self.embed_store_dtype is not None:
-            embeddings = self._dequant(embeddings, ids)
-        if self.ngram_embedding.tp_size > 1:
-            embeddings = all_reduce(embeddings, self.ngram_embedding.tp_group)
-        return embeddings.flatten(-2)
+        ids = self._ngram_ids_torch(contexts.to(torch.long)).contiguous()
+        layout = self.lookup.make_layout(None, ids.shape[0])
+        return self.lookup.finish(self.lookup.start(ids, layout))
 
 
-class _PleLookupPlan(NamedTuple):
+class _PleExecutionPlan(NamedTuple):
     """What a PLE forward derives before it touches the n-gram table.
 
     Extracted so :meth:`Qwen4ExpPLELayer.start_prefetch` and
@@ -730,7 +385,15 @@ class Qwen4ExpPLELayer(nn.Module):
         )
         nn.init.zeros_(self.conv1d.weight)
         # Set by start_prefetch, consumed by the next forward; see start_prefetch.
-        self._prefetched: tuple | None = None
+        self._prefetched: (
+            tuple[
+                _PleExecutionPlan | None,
+                PendingLookup,
+                torch.Tensor | None,
+                torch.Tensor | None,
+            ]
+            | None
+        ) = None
 
     def _load_kv_proj_shard(
         self,
@@ -1163,9 +826,9 @@ class Qwen4ExpPLELayer(nn.Module):
             eps=self.norm_key.variance_epsilon,
         )
 
-    def _lookup_plan(
+    def _execution_plan(
         self, input_ids: torch.Tensor, ctx: ForwardContext
-    ) -> _PleLookupPlan | None:
+    ) -> _PleExecutionPlan | None:
         """Derive the per-request quantities a lookup needs; ``None`` when idle.
 
         Everything here is stream-agnostic bookkeeping (CPU lengths, index
@@ -1205,7 +868,7 @@ class Qwen4ExpPLELayer(nn.Module):
                 self.context_field_id, self.layer_id, ctx.bs
             )
             scratch_stride = metadata.verify_width + 1
-        return _PleLookupPlan(
+        return _PleExecutionPlan(
             lengths=lengths,
             num_real_tokens=num_real_tokens,
             flat_ids=flat_ids,
@@ -1224,32 +887,38 @@ class Qwen4ExpPLELayer(nn.Module):
         )
 
     def start_prefetch(self, input_ids: torch.Tensor, ctx: ForwardContext) -> None:
-        """Kick off the host gather so it overlaps the preceding decoder layers.
-
-        Only meaningful when the table lives on the host and the ids are on the
-        device -- otherwise there is nothing to hide behind PCIe/C2C latency and
-        this is a no-op. The plan is derived once here and carried to
-        :meth:`forward`, which reuses it verbatim instead of re-deriving (see
-        :class:`_PleLookupPlan`). Called before the layer that owns this PLE
-        runs, so its result is waited on, not recomputed.
-        """
-
-        if not self.ple_embedding.offload_embedding or self._prefetched is not None:
+        if self._prefetched is not None:
             return
-        plan = self._lookup_plan(input_ids, ctx)
-        if plan is None or not plan.flat_ids.is_cuda:
-            return
-        req, col, _, starts, _, _, _ = plan.index
-        gathered, _ = self.ple_embedding.start_flat_gather(
-            plan.flat_ids,
-            plan.initial_context,
-            req,
-            col,
-            starts,
-            tail_out=plan.context_scratch,
-            tail_block_rows=plan.scratch_stride,
-        )
-        self._prefetched = (plan, gathered)
+        plan = self._execution_plan(input_ids, ctx)
+        embedding = self.ple_embedding
+        final_context = context_tail = None
+        if plan is None:
+            ids = input_ids.new_empty((0, embedding.ngram_heads), dtype=torch.int64)
+        elif plan.flat_ids.is_cuda:
+            req, col, lengths_t, starts, _, _, _ = plan.index
+            ids, _ = embedding._ngram_ids_flat_cuda(
+                plan.flat_ids,
+                plan.initial_context,
+                req,
+                col,
+                starts,
+                False,
+                tail_out=plan.context_scratch,
+                tail_block_rows=plan.scratch_stride,
+            )
+            if not plan.verify:
+                final_context = self._final_context(
+                    plan.flat_ids, plan.initial_context, lengths_t, starts
+                )
+        else:
+            contexts, final_context = self._token_contexts(
+                plan.flat_ids, plan.initial_context, plan.lengths, plan.index
+            )
+            ids = embedding._ngram_ids_torch(contexts.to(torch.int64)).contiguous()
+            context_tail = contexts[:, 1:]
+        layout = embedding.lookup.make_layout(ctx.global_num_tokens, ids.shape[0])
+        pending = embedding.lookup.start(ids, layout)
+        self._prefetched = (plan, pending, final_context, context_tail)
 
     @break_point
     def forward(
@@ -1278,14 +947,13 @@ class Qwen4ExpPLELayer(nn.Module):
         ``hc_count * hidden_size`` while an attention break emits
         ``heads * head_dim`` -- keep those distinct.
         """
-        if ctx.forward_mode.is_idle() or hidden_states.shape[0] == 0:
-            return hidden_states
-        prefetched = getattr(self, "_prefetched", None)
+        if self._prefetched is None:
+            self.start_prefetch(input_ids, ctx)
+        plan, pending, final_context, context_tail = self._prefetched
+        embeddings = self.ple_embedding.lookup.finish(pending)
         self._prefetched = None
-        if prefetched is not None:
-            plan, gathered = prefetched
-        else:
-            plan = self._lookup_plan(input_ids, ctx)
+        if plan is None:
+            return hidden_states
         (hidden_states,) = slice_to_real_tokens(plan.num_real_tokens, hidden_states)
         req, col, lengths_t, starts, _, total, _ = plan.index
         lengths = plan.lengths
@@ -1299,40 +967,6 @@ class Qwen4ExpPLELayer(nn.Module):
         context_scratch = plan.context_scratch
         conv_scratch = plan.conv_scratch
         scratch_stride = plan.scratch_stride
-        if prefetched is not None:
-            embeddings = self.ple_embedding.finish_flat_gather(gathered)
-            final_context = (
-                None
-                if verify
-                else self._final_context(flat_ids, initial_context, lengths_t, starts)
-            )
-        elif flat_ids.is_cuda:
-            # The n-gram windows are gathered inside the hash kernel; verify
-            # writes their state rows directly instead of returning a packed tail.
-            embeddings, _ = self.ple_embedding.forward_flat(
-                flat_ids,
-                initial_context,
-                req,
-                col,
-                starts,
-                tail_out=context_scratch,
-                tail_block_rows=scratch_stride,
-            )
-            # Only the non-verify branch writes it back, and ``verify`` is fixed
-            # when a graph is captured, so skipping here keeps the gather and
-            # its ten elementwise kernels out of the captured verify graph.
-            final_context = (
-                None
-                if verify
-                else self._final_context(flat_ids, initial_context, lengths_t, starts)
-            )
-        else:
-            contexts, final_context = self._token_contexts(
-                flat_ids, initial_context, lengths, plan.index
-            )
-            embeddings = self.ple_embedding(contexts)
-            context_tail = contexts[:, 1:]
-
         kv, _ = self.kv_proj(embeddings)
         key, value = kv.split([self.hc_hidden_size, self.hidden_size], dim=-1)
         if key.is_cuda:

@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import re
 from collections.abc import Iterable
 
@@ -58,7 +57,6 @@ from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfi
 from tokenspeed.runtime.layers.qwen4_exp_ple import (
     Qwen4ExpNGramEmbedding,
     Qwen4ExpPLELayer,
-    quantize_ple_embedding_rows,
 )
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.model_loader.weight_utils import (
@@ -526,6 +524,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             for layer in self.layers
             if getattr(layer, "indexer", None) is not None
         )
+        self.ple_layers = tuple(
+            layer.ple for layer in self.layers if layer.ple is not None
+        )
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         """Load per-tensor FP8 KV scales for full-attention layers."""
@@ -546,9 +547,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             paged_attention.k_scale_float = scale
             paged_attention.v_scale_float = scale
 
-    def _start_ple_prefetch(
-        self, input_ids: torch.Tensor, ctx: ForwardContext
-    ) -> None:
+    def _start_ple_prefetch(self, input_ids: torch.Tensor, ctx: ForwardContext) -> None:
         """Issue every PLE layer's host gather ahead of the decoder loop."""
 
         for ple in self.ple_layers:
@@ -569,8 +568,8 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
         # Start the host-resident PLE gather now so it overlaps the decoder
-        # layers that precede the PLE layer. A no-op unless the table was
-        # offloaded to host memory (see Qwen4ExpPLELayer.start_prefetch). Under a
+        # layers that precede the PLE layer. DP also gathers global queries for
+        # device tables (see Qwen4ExpPLELayer.start_prefetch). Under a
         # breakable capture the trigger must itself be an eager break: it runs
         # the per-request hash kernel and a side-stream copy, neither of which
         # can be baked into a graph segment.
@@ -653,57 +652,8 @@ def _copy_ple_shard(
     ple_embedding = ple_modules.get(module_name)
     if not isinstance(ple_embedding, Qwen4ExpNGramEmbedding):
         return None
-    embedding = ple_embedding.ngram_embedding
-    shard_index = int(match.group(1))
-    shard_size = (embedding.org_vocab_size + split_parts - 1) // split_parts
-    row_start = shard_index * shard_size
-    row_end = row_start + loaded_weight.shape[0]
-    tp_start = embedding.shard_indices.org_vocab_start_index
-    tp_end = embedding.shard_indices.org_vocab_end_index
-    overlap_start = max(row_start, tp_start)
-    overlap_end = min(row_end, tp_end)
-    if overlap_start < overlap_end:
-        destination = overlap_start - tp_start
-        source = overlap_start - row_start
-        rows = overlap_end - overlap_start
-        source_rows = loaded_weight[source : source + rows]
-        target_rows = embedding.weight.data[destination : destination + rows]
-        scale_buffer = getattr(ple_embedding, "ngram_embedding_scale", None)
-        source_is_fp8 = source_rows.dtype == torch.float8_e4m3fn
-        target_is_fp8 = target_rows.dtype == torch.float8_e4m3fn
-        # Matching formats are copied unchanged. In particular, FP8-to-FP8
-        # preserves the checkpoint payload; its global scale is loaded by
-        # _load_ple_weight_scale independently of checkpoint weight ordering.
-        if target_is_fp8 and not source_is_fp8:
-            if scale_buffer is None:
-                if not ple_embedding.offload_embedding:
-                    raise RuntimeError(
-                        "FP8 PLE embedding is missing its scale buffer"
-                    )
-                # A compute-dtype checkpoint under offload is quantized online,
-                # one streamed shard at a time, and its FP8 payload lands on the
-                # host table. The offline FP8 path offloading targets carries
-                # only a per-tensor scale, so the per-row buffer is not built at
-                # construction; allocate it lazily here, on the device the
-                # gather reads scales from.
-                scale_buffer = torch.ones(
-                    embedding.num_embeddings_per_partition, device="cuda"
-                )
-                ple_embedding.register_buffer(
-                    "ngram_embedding_scale", scale_buffer, persistent=False
-                )
-            # Quantize compute-dtype checkpoint rows for FP8 storage and retain
-            # their independently derived dequant scales.
-            source_rows, scale = quantize_ple_embedding_rows(source_rows)
-            scale_buffer[destination : destination + rows].copy_(
-                scale.to(scale_buffer.device, scale_buffer.dtype)
-            )
-        elif source_is_fp8 and not target_is_fp8:
-            source_rows = (
-                source_rows.to(torch.float32) * ple_embedding._checkpoint_weight_scale
-            )
-        target_rows.copy_(source_rows.to(target_rows.device, target_rows.dtype))
-    return f"{module_name}.ngram_embedding.weight"
+    ple_embedding.lookup.load_shard(loaded_weight, int(match.group(1)), split_parts)
+    return f"{module_name}.lookup.ngram_embedding.weight"
 
 
 def _load_ple_weight_scale(
@@ -720,36 +670,8 @@ def _load_ple_weight_scale(
     ple_embedding = dict(module.named_modules()).get(module_name)
     if not isinstance(ple_embedding, Qwen4ExpNGramEmbedding):
         return None
-    if loaded_weight.numel() != 1:
-        raise ValueError(
-            f"Qwen4-Exp PLE weight scale must be scalar, got "
-            f"{tuple(loaded_weight.shape)} for {name}"
-        )
-    scale = float(loaded_weight.to(torch.float32).item())
-    if not math.isfinite(scale) or scale <= 0:
-        raise ValueError(
-            f"Qwen4-Exp PLE weight scale must be finite and positive, got "
-            f"{scale} for {name}"
-        )
-
-    scale_buffer = getattr(ple_embedding, "ngram_embedding_scale", None)
-    if scale_buffer is not None:
-        # The checkpoint scale is shared by every pre-quantized row, so one
-        # fill handles both scale-before-shards and scale-after-shards order.
-        scale_buffer.fill_(scale)
-    elif ple_embedding.embed_store_dtype is not None:
-        # Offloaded FP8: the payload stays FP8 on the host and this per-tensor
-        # scalar is applied by the gather kernel, so there is no per-row buffer
-        # to fill and no payload to rescale -- recording it below is enough.
-        pass
-    else:
-        # Compute-dtype target: rescale any raw FP8 rows copied before the
-        # scale tensor. Future shard copies multiply by the new value.
-        ple_embedding.ngram_embedding.weight.data.mul_(
-            scale / ple_embedding._checkpoint_weight_scale
-        )
-    ple_embedding._checkpoint_weight_scale = scale
-    return f"{module_name}.ngram_embedding.weight"
+    ple_embedding.lookup.load_scale(loaded_weight)
+    return f"{module_name}.lookup.ngram_embedding.weight"
 
 
 def load_qwen4_exp_weights(
@@ -845,6 +767,13 @@ def load_qwen4_exp_weights(
         if shard_name is not None:
             loaded.add(shard_name)
             continue
+        if name.endswith(".ngram_embedding.weight"):
+            module_name = name[: -len(".ngram_embedding.weight")]
+            embedding = dict(module.named_modules()).get(module_name)
+            if isinstance(embedding, Qwen4ExpNGramEmbedding):
+                embedding.lookup.load_shard(loaded_weight, 0, 1)
+                loaded.add(f"{module_name}.lookup.ngram_embedding.weight")
+                continue
         for param_name, weight_name, shard_id in stacked:
             if weight_name not in name or "mlp.experts" in name or "visual" in name:
                 continue
