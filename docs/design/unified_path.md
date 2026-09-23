@@ -140,14 +140,9 @@ from one first bound to that pool:
   further down anchors its width at its reading plus that granule, and a skipped
   entry is priced on the line between the anchors around its width, or at
   the narrowest anchor below it. Every ladder is sampled and priced the same
-  way: a decode graph costs about the same at every batch size, so its
-  anchors read close to its window; a prefill graph's cost falls with its
-  bucket's width, in a shape that differs by model (linear on Qwen3-8B, flat
-  then a drop on Inkling, recurring spikes on gpt-oss), and the anchors keep
-  the whole reserve between 1.0x and 1.5x of the capture on the models
-  measured, where the widest window alone priced a prefill ladder up to 4x.
-  That is not a bound: a cost that drops between two anchors is priced
-  short over that stretch.
+  way, whatever shape its cost takes down the ladder: flat, falling with the
+  entry's width, or lumpy. That is not a bound: a cost that drops between
+  two anchors is priced short over that stretch.
   The result is reduced across ranks with MAX. The orchestrator
   releases the probe's graphs and collects the cycles they sit in, then
   rebuilds on the memory profile the probe build took -- where a boot without
