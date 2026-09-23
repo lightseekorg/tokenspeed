@@ -5237,7 +5237,7 @@ _CASES = [
         "hopper",
         "gemm",
         "mm",
-        "deep_gemm_mm_fp8_blockscale",
+        "triton_mm_fp8_blockscale",
         _mm_mxfp8,
     ),
     _case(

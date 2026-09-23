@@ -61,7 +61,6 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel import fp8_linear
 from tokenspeed_kernel.ops.activation.triton import (
     attnres_combine,
     attnres_partial,
@@ -79,6 +78,7 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_situ_projection,
     linear_attnres_partials,
     linear_attnres_partials_available,
+    mm,
 )
 from tokenspeed_kernel.ops.gemm.triton_gemv import (
     decode_gemv,
@@ -88,6 +88,7 @@ from tokenspeed_kernel.ops.moe import (
     latent_moe_input_projections,
 )
 from tokenspeed_kernel.ops.moe.latent_down import KimiK3LatentDownOp
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.ops.residual import attn_res_fwd, attn_res_fwd_available
 from tokenspeed_kernel.ops.tuning import load_packaged_flashinfer_tuning_cache
@@ -929,8 +930,6 @@ class KimiKDAMergedProj(nn.Module):
                 requires_grad=False,
             )
             self.weight_scale_inv.weight_loader = self._load_scale
-            # flashinfer MN-major prepacked scales, prepared post-load.
-            self._flashinfer_scales_mn: torch.Tensor | None = None
             # Zero-initialized buffers make a missing shard silently read as
             # zeros; track loads explicitly and verify at post_load_weights.
             self._loaded_weight_shards: set[str] = set()
@@ -1196,23 +1195,27 @@ class KimiLinearKDA(nn.Module):
         ):
             if attnres_partial_args is not None:
                 attnres_partial_dual(*attnres_partial_args)
-            output = fp8_linear(
-                self.qkvgb_proj._prepared_fp8_linear,
+            values, scales = quantize_fp8(
                 hidden_states,
+                granularity="token_group",
+                group_size=128,
+                solution="triton",
+            )
+            output = mm(
+                values,
                 self.qkvgb_proj.weight,
-                self.qkvgb_proj.weight_scale_inv,
-                input_scales=None,
-                bias=None,
+                A_scales=scales,
+                B_scales=self.qkvgb_proj.weight_scale_inv,
                 out_dtype=hidden_states.dtype,
+                quant="mxfp8",
+                block_size=[128, 128],
+                solution="trtllm_cutedsl",
             )
         elif attnres_partial_args is None:
             output = kimi3_qkvfab_projection(
                 hidden_states,
                 self.qkvgb_proj.weight,
                 weight_scale=getattr(self.qkvgb_proj, "weight_scale_inv", None),
-                prepacked_scales=getattr(
-                    self.qkvgb_proj, "_flashinfer_scales_mn", None
-                ),
             )
         else:
             blocks, weight_a, weight_b, eps, scratch_a, scratch_b = attnres_partial_args
@@ -3511,37 +3514,6 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 merged = self_attn.qkvgb_proj
                 if getattr(merged, "fp8_block_quant", False):
                     merged.verify_fp8_load_complete()
-                    if isinstance(
-                        getattr(merged, "quant_method", None),
-                        Fp8LinearMethod,
-                    ):
-                        # The loader prepares this plan with the other FP8
-                        # linears after assembly. Do not cache stale FI scales.
-                        continue
-                    # Prepack the block scales for the flashinfer w8a8 GEMM
-                    # (the same preparation Fp8LinearMethod does for
-                    # LinearBase layers); rows are 128-padded at construction
-                    # so the shape gate always holds on this path.
-                    from tokenspeed_kernel.ops.gemm.flashinfer import (
-                        has_flashinfer_fp8_blockscale,
-                        prepare_flashinfer_fp8_blockscale_weight_scales,
-                    )
-
-                    n_rows, n_cols = merged.weight.shape
-                    if (
-                        merged._flashinfer_scales_mn is None
-                        and has_flashinfer_fp8_blockscale is not None
-                        and has_flashinfer_fp8_blockscale()
-                        and n_rows % 128 == 0
-                        and n_cols % 128 == 0
-                    ):
-                        # Build once: rebinding after a refit would leave any
-                        # captured CUDA graph holding the stale buffer.
-                        merged._flashinfer_scales_mn = (
-                            prepare_flashinfer_fp8_blockscale_weight_scales(
-                                merged.weight_scale_inv.data
-                            )
-                        )
 
         # Fold the AttnRes rms_w * res_w products once; the split kernels take a single wp pointer.
         for layer in self.model.layers:

@@ -1033,30 +1033,6 @@ def triton_bmm_fp8_blockscale(
     return C
 
 
-def _triton_dsv4_grouped_output_projection_weights(
-    *,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    num_groups: int,
-    output_dim: int,
-    input_dim: int,
-    block_size: tuple[int, int],
-    recipe: tuple[int, int, int],
-) -> torch.Tensor:
-    del weight, recipe
-    block_n, block_k = block_size
-    expected_shape = (
-        num_groups * (output_dim // block_n),
-        input_dim // block_k,
-    )
-    if tuple(weight_scale.shape) != expected_shape:
-        raise ValueError(
-            "grouped output projection scale shape mismatch: "
-            f"expected {expected_shape}, got {tuple(weight_scale.shape)}"
-        )
-    return weight_scale
-
-
 @register_kernel(
     "gemm",
     "dsv4_grouped_output_projection",
@@ -1072,7 +1048,6 @@ def _triton_dsv4_grouped_output_projection_weights(
     ),
     traits={},
     priority=Priority.PERFORMANT + 3,
-    weight_preprocessor=_triton_dsv4_grouped_output_projection_weights,
 )
 def triton_dsv4_grouped_output_projection(
     *,

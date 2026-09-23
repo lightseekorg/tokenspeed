@@ -286,7 +286,6 @@ def test_padded_fused_assembly_selects_flashinfer_blockscale() -> None:
     # Padded assembly: 768 % 128 == 0 selects the flashinfer blockscale GEMM.
     fused_w, fused_s = _assemble_fp8_fused_qkv_a(segments, total_rows=768)
     method, layer = _build(768, fused_w, fused_s)
-    assert method.prepared_linear_plan(layer) is not None
 
     x = torch.randn(9, k, device="cuda", dtype=torch.bfloat16)
     out = method.apply(layer, x)

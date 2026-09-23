@@ -21,8 +21,7 @@
 from __future__ import annotations
 
 import logging
-import os
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass
 from math import prod
 
@@ -37,20 +36,10 @@ import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm_cutedsl  # noqa: F401
 import torch
-from tokenspeed_kernel.ops.gemm.deep_gemm import (
-    _warmup_deep_gemm_fp8_linears,
-    ceil_to_ue8m0,
-    transform_sf_into_required_layout,
-)
 from tokenspeed_kernel.ops.gemm.flashinfer import (
     has_flashinfer_cute_dsl_nvfp4_a16,
-    has_flashinfer_fp8_blockscale,
-    has_flashinfer_mxfp8,
-    prepare_flashinfer_fp8_blockscale_weight_scales,
     prepare_nvfp4_a16_weights,
-    use_flashinfer_fp8_blockscale_prepacked,
 )
-from tokenspeed_kernel.ops.gemm.fp8_utils import swizzle_mxfp8_scale
 from tokenspeed_kernel.ops.gemm.kimi3 import (
     kimi3_latent_projection,
     kimi3_latent_projection_add3,
@@ -64,12 +53,8 @@ from tokenspeed_kernel.ops.gemm.linear_attnres_partials import (
     linear_attnres_partials,
     linear_attnres_partials_available,
 )
-from tokenspeed_kernel.platform import (
-    ArchVersion,
-    Platform,
-    current_platform,
-    pdl_enabled,
-)
+from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.platform import Platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
@@ -90,12 +75,9 @@ __all__ = [
     "bmm",
     "dsv4_grouped_output_projection",
     "dsv4_grouped_output_projection_plan",
-    "dsv4_grouped_output_projection_process_weights",
     "dsv4_grouped_output_projection_warmup",
     "dsv4_grouped_output_projection_warmup_model",
     "dsv4_linear_fp32",
-    "fp8_linear",
-    "quantize_fp8_group32_for_linear",
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "linear_attnres_partials",
     "linear_attnres_partials_available",
@@ -107,10 +89,7 @@ __all__ = [
     "kimi3_shared_down_projection",
     "kimi3_shared_situ_projection",
     "mm",
-    "prepare_fp8_linear",
-    "prepare_trtllm_cutedsl_fp8_linear",
     "prepare_nvfp4_a16_weights",
-    "warmup_prepared_fp8_linears",
 ]
 
 _platform = Platform.get()
@@ -142,340 +121,9 @@ _fp8_dtype = torch.float8_e4m3fn
 # ``mnk_problem_filter`` last, followed by the remaining traits alphabetically.
 
 
-class _PreparedFp8Linear(torch.nn.Module):
-    def __init__(
-        self,
-        *,
-        override: str | None,
-        block_size: tuple[int, int],
-        prepared_weight_scales: torch.Tensor | None = None,
-        prepacked_scales: bool = False,
-        activation: str | None = None,
-        warmup: Callable | None = None,
-        warmup_key: tuple[int, int] | None = None,
-    ) -> None:
-        super().__init__()
-        self.override = override
-        self.block_size = block_size
-        self.prepacked_scales = prepacked_scales
-        self.activation = activation
-        self.warmup = warmup
-        self.warmup_key = warmup_key
-        self.register_buffer(
-            "prepared_weight_scales", prepared_weight_scales, persistent=False
-        )
-
-
-def prepare_fp8_linear(
-    weight: torch.Tensor,
-    weight_scales: torch.Tensor,
-    block_size: tuple[int, int] | list[int],
-    scale_format: str | None = None,
-) -> object:
-    """Prepare an opaque block-FP8 linear implementation contract.
-
-    Backend selection, persistent scale layout conversion, fused-activation
-    support, and warmup behavior are owned by the returned plan. Callers must
-    retain the plan without inspecting it and pass it to the related execution,
-    activation, and warmup APIs.
-
-    Args:
-        weight: FP8 weight in ``[N, K]`` layout.
-        weight_scales: Canonical block scales loaded with the weight.
-        block_size: Logical scale block shape ``[block_n, block_k]``.
-        scale_format: Logical checkpoint scale encoding, such as ``"ue8m0"``.
-
-    Returns:
-        An opaque prepared FP8 linear plan.
-    """
-    if weight.ndim != 2:
-        raise ValueError(f"weight must have shape [N, K], got {tuple(weight.shape)}")
-    if len(block_size) != 2 or min(block_size) <= 0:
-        raise ValueError("block_size must contain two positive dimensions")
-
-    block_n, block_k = int(block_size[0]), int(block_size[1])
-    n, k = weight.shape
-    platform = current_platform()
-    enable_pdl = pdl_enabled()
-    deep_gemm_spec = KernelRegistry.get().get_by_name("deep_gemm_mm_fp8_blockscale")
-    scale_requires_transform = (
-        scale_format == "ue8m0" and weight_scales.dtype.is_floating_point
-    )
-    if (
-        ceil_to_ue8m0 is not None
-        and transform_sf_into_required_layout is not None
-        and deep_gemm_spec is not None
-        and scale_requires_transform
-        and platform.is_nvidia
-        and n % 64 == 0
-        and k % 128 == 0
-    ):
-        prepared_scales = transform_sf_into_required_layout(
-            sf=ceil_to_ue8m0(weight_scales),
-            mn=n,
-            k=k,
-            recipe=(1, block_n, block_k),
-            is_sfa=False,
-        )
-        supports_fused_activation = (
-            platform.is_blackwell_plus
-            and os.environ.get("TOKENSPEED_DISABLE_DEEP_GEMM_UE8M0") != "1"
-        )
-        return _PreparedFp8Linear(
-            override="deep_gemm_mm_fp8_blockscale",
-            block_size=(block_n, block_k),
-            prepared_weight_scales=prepared_scales,
-            activation=("swiglu" if supports_fused_activation else None),
-            warmup=(
-                _warmup_deep_gemm_fp8_linears if supports_fused_activation else None
-            ),
-            warmup_key=(n, k) if supports_fused_activation else None,
-        )
-
-    if (
-        (block_n, block_k) == (1, 32)
-        and weight_scales.dtype == torch.uint8
-        and weight_scales.ndim == 2
-        and n >= 128
-        and k >= 128
-        and k % 32 == 0
-    ):
-        if has_flashinfer_mxfp8() and enable_pdl:
-            return _PreparedFp8Linear(
-                override="flashinfer_mm_mxfp8",
-                block_size=(block_n, block_k),
-                prepared_weight_scales=swizzle_mxfp8_scale(weight_scales, n, k),
-            )
-        if not enable_pdl:
-            return _PreparedFp8Linear(
-                override=(
-                    None
-                    if platform.is_cdna4 or platform.is_cdna5
-                    else "triton_mm_fp8_blockscale"
-                ),
-                block_size=(block_n, block_k),
-            )
-
-    if (
-        has_flashinfer_fp8_blockscale()
-        and (block_n, block_k) == (128, 128)
-        and weight_scales.dtype == torch.float32
-        and weight_scales.ndim == 2
-        and n % 128 == 0
-        and k % 128 == 0
-    ):
-        return _PreparedFp8Linear(
-            override="flashinfer_mm_fp8_blockscale",
-            block_size=(block_n, block_k),
-            prepared_weight_scales=prepare_flashinfer_fp8_blockscale_weight_scales(
-                weight_scales
-            ),
-            prepacked_scales=True,
-        )
-
-    return _PreparedFp8Linear(
-        override=None,
-        block_size=(block_n, block_k),
-    )
-
-
-def _require_fp8_linear_plan(plan: object) -> _PreparedFp8Linear:
-    if not isinstance(plan, _PreparedFp8Linear):
-        raise TypeError("plan must be returned by prepare_fp8_linear")
-    return plan
-
-
-def quantize_fp8_group32_for_linear(
-    plan: object,
-    x: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize exact group-32 inputs in the prepared GEMM's scale layout.
-
-    Args:
-        plan: Opaque plan returned by prepare_fp8_linear for [1,32] weights.
-        x: CUDA BF16/FP16 [M,K], K divisible by32. The activation rule preserves
-            the1e-4 amax floor and IEEE upward power-of-two scale rounding.
-
-    Returns:
-        FP8 values and UE8M0 scales ready for fp8_linear(input_scales=...).
-        FlashInfer plans receive fully initialized1D F8_128x4 scales directly;
-        portable/other plans retain the2D row-major scale contract. Outputs
-        belong to this call and are never cached across eager or graph calls.
-    """
-    typed_plan = _require_fp8_linear_plan(plan)
-    if typed_plan.block_size != (1, 32):
-        raise ValueError("Exact group-32 plan quantization requires [1,32] weights")
-    from tokenspeed_kernel.ops.quantization import (
-        quantize_fp8_group32_ue8m0_swizzled,
-        quantize_fp8_with_scale,
-    )
-
-    if typed_plan.override == "flashinfer_mm_mxfp8":
-        return quantize_fp8_group32_ue8m0_swizzled(x, override=None, solution="triton")
-    return quantize_fp8_with_scale(
-        x,
-        granularity="token_group",
-        group_size=32,
-        scale_encoding="ue8m0",
-        enable_pdl=False,
-        override="triton_quantize_fp8_group32_ue8m0",
-        solution=None,
-    )
-
-
-def prepare_trtllm_cutedsl_fp8_linear(
-    weight: torch.Tensor,
-    weight_scales: torch.Tensor,
-    block_size: tuple[int, int] | list[int],
-) -> object:
-    """Prepare original-scale block-FP8 GEMM and compile before graph capture.
-
-    Args:
-        weight: Contiguous CUDA E4M3 [N,K], with N and K divisible by 128.
-        weight_scales: Canonical FP32 [N/128,K/128] checkpoint scales.
-        block_size: Must be (128,128).
-    Returns:
-        An opaque fp8_linear plan; weight values and scales are not modified.
-    """
-    platform = current_platform()
-    if not platform.is_nvidia or not platform.is_blackwell:
-        raise RuntimeError("TRT-LLM CuTe-DSL block-FP8 requires Blackwell")
-    if (
-        tuple(block_size) != (128, 128)
-        or weight.ndim != 2
-        or weight.dtype != torch.float8_e4m3fn
-        or not weight.is_cuda
-        or not weight.is_contiguous()
-        or any(d == 0 or d % 128 for d in weight.shape)
-        or weight_scales.dtype != torch.float32
-        or weight_scales.device != weight.device
-        or weight_scales.shape != (weight.shape[0] // 128, weight.shape[1] // 128)
-    ):
-        raise ValueError(
-            "TRT-LLM CuTe-DSL requires aligned E4M3 weights and canonical 128x128 FP32 scales"
-        )
-    from tokenspeed_kernel.thirdparty.trtllm_blockwise import prepare
-
-    prepare(weight.device)
-    return _PreparedFp8Linear(
-        override="trtllm_cutedsl_mm_fp8_blockscale",
-        block_size=(128, 128),
-    )
-
-
-def fp8_linear(
-    plan: object,
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scales: torch.Tensor,
-    *,
-    input_scales: torch.Tensor | None = None,
-    bias: torch.Tensor | None = None,
-    out_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """Execute a block-FP8 linear operation through a prepared plan.
-
-    Args:
-        plan: Opaque plan returned by :func:`prepare_fp8_linear`.
-        x: Input matrix ``[M, K]``. It may be floating point for online
-            quantization or FP8 when ``input_scales`` is supplied.
-        weight: FP8 weight matrix ``[N, K]``.
-        weight_scales: Canonical persistent weight block scales.
-        input_scales: Optional pre-quantized activation block scales.
-        bias: Optional output bias.
-        out_dtype: Requested output dtype.
-    Returns:
-        The linear output matrix ``[M, N]``.
-    """
-    typed_plan = _require_fp8_linear_plan(plan)
-    override = typed_plan.override
-    prepacked_scales = (
-        typed_plan.prepacked_scales
-        and input_scales is None
-        and use_flashinfer_fp8_blockscale_prepacked(x.shape[0])
-    )
-    if typed_plan.prepacked_scales and not prepacked_scales:
-        override = None
-    selected_weight_scales = (
-        typed_plan.prepared_weight_scales
-        if typed_plan.prepared_weight_scales is not None and override is not None
-        else weight_scales
-    )
-
-    return mm(
-        x,
-        weight,
-        A_scales=input_scales,
-        B_scales=selected_weight_scales,
-        bias=bias,
-        out_dtype=out_dtype,
-        quant="mxfp8",
-        block_size=list(typed_plan.block_size),
-        override=override,
-        prepacked_scales=prepacked_scales,
-    )
-
-
-def _fp8_linear_activation(
-    plan: object,
-    x: torch.Tensor,
-    *,
-    activation: str,
-    limit: float | None,
-    alpha: float,
-    beta: float,
-    enable_pdl: bool,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    typed_plan = _require_fp8_linear_plan(plan)
-    if typed_plan.activation != activation or x.ndim != 2:
-        return None
-    if x.shape[-1] % 2 != 0 or x.shape[-1] // 2 % typed_plan.block_size[1] != 0:
-        return None
-
-    from tokenspeed_kernel.ops.activation.triton import fused_swiglu_fp8_ue8m0
-
-    return fused_swiglu_fp8_ue8m0(
-        x,
-        swiglu_limit=limit or 0.0,
-        swiglu_alpha=alpha,
-        swiglu_beta=beta,
-        enable_pdl=enable_pdl,
-    )
-
-
-def warmup_prepared_fp8_linears(plans: Iterable[object], max_tokens: int) -> None:
-    """Warm backend implementations selected by prepared FP8 linear plans.
-
-    Args:
-        plans: Opaque plans returned by :func:`prepare_fp8_linear`.
-        max_tokens: Largest token count to include in backend warmup sweeps.
-
-    Returns:
-        None.
-    """
-    if max_tokens <= 0:
-        raise ValueError(f"max_tokens must be positive, got {max_tokens}")
-    grouped: dict[Callable, list[_PreparedFp8Linear]] = {}
-    seen: set[tuple[Callable, torch.device, int, int]] = set()
-    for plan in plans:
-        typed_plan = _require_fp8_linear_plan(plan)
-        if typed_plan.warmup is None or typed_plan.warmup_key is None:
-            continue
-        assert typed_plan.prepared_weight_scales is not None
-        n, k = typed_plan.warmup_key
-        key = (typed_plan.warmup, typed_plan.prepared_weight_scales.device, n, k)
-        if key in seen:
-            continue
-        seen.add(key)
-        grouped.setdefault(typed_plan.warmup, []).append(typed_plan)
-    for warmup, prepared_plans in grouped.items():
-        warmup(prepared_plans, max_tokens)
-
-
 @dataclass(frozen=True)
 class _GroupedOutputProjectionPlan:
     kernel: SelectedKernel
-    weight_preprocessor: Callable
     warmup: Callable | None
     input_dtype: torch.dtype
     weight_dtype: torch.dtype
@@ -489,7 +137,6 @@ class _GroupedOutputProjectionPlan:
     block_size: tuple[int, int]
     scale_format: str | None
     tma_aligned_scales: bool
-    preprocess_recipe: tuple[int, int, int]
     execution_recipe: tuple[int, int, int]
 
 
@@ -510,9 +157,8 @@ def dsv4_grouped_output_projection_plan(
 ) -> object:
     """Create an opaque plan for the DeepSeek V4 grouped output projection.
 
-    The selected implementation owns both weight-scale preprocessing and
-    execution. Callers must retain the returned object without inspecting it,
-    preprocess the loaded scales once, and use the same plan for execution.
+    The plan currently selects the portable Triton implementation, which
+    consumes canonical checkpoint scales without preprocessing.
 
     Args:
         input_dtype: Attention output dtype before dynamic FP8 quantization.
@@ -529,8 +175,7 @@ def dsv4_grouped_output_projection_plan(
         solution: Optional implementation family override.
 
     Returns:
-        An opaque plan accepted by the related preprocess, execute, and warmup
-        APIs.
+        An opaque plan accepted by the execution and warmup APIs.
     """
     if min(num_groups, heads_per_group, head_dim, output_dim) <= 0:
         raise ValueError("grouped output projection dimensions must be positive")
@@ -563,28 +208,24 @@ def dsv4_grouped_output_projection_plan(
         "scale_format": scale_format,
         "weight_scale_dtype": weight_scale_dtype,
     }
+    if solution not in {None, "triton"}:
+        raise NotImplementedError(
+            "DeepSeek V4 grouped output projections currently support only "
+            "canonical scales through the Triton implementation"
+        )
     kernel = select_kernel(
         "gemm",
         "dsv4_grouped_output_projection",
         signature,
         traits=traits,
-        solution=solution,
+        solution="triton",
     )
-    spec = KernelRegistry.get().get_by_name(kernel.name)
-    if spec is None or spec.weight_preprocessor is None:
-        raise RuntimeError(
-            f"Grouped output projection kernel {kernel.name!r} has no preprocessor"
-        )
 
-    tma_aligned_scales = (
-        spec.solution == "deep_gemm" and current_platform().is_blackwell_plus
-    )
-    preprocess_recipe = (1, block_n, block_k)
-    execution_recipe = (1, 1, block_n) if tma_aligned_scales else preprocess_recipe
+    tma_aligned_scales = False
+    execution_recipe = (1, block_n, block_k)
     return _GroupedOutputProjectionPlan(
         kernel=kernel,
-        weight_preprocessor=spec.weight_preprocessor,
-        warmup=getattr(kernel.impl, "_tokenspeed_warmup", None),
+        warmup=None,
         input_dtype=input_dtype,
         weight_dtype=weight_dtype,
         weight_scale_dtype=weight_scale_dtype,
@@ -597,7 +238,6 @@ def dsv4_grouped_output_projection_plan(
         block_size=(block_n, block_k),
         scale_format=scale_format,
         tma_aligned_scales=tma_aligned_scales,
-        preprocess_recipe=preprocess_recipe,
         execution_recipe=execution_recipe,
     )
 
@@ -608,43 +248,6 @@ def _require_grouped_output_projection_plan(
     if not isinstance(plan, _GroupedOutputProjectionPlan):
         raise TypeError("plan must be returned by dsv4_grouped_output_projection_plan")
     return plan
-
-
-def dsv4_grouped_output_projection_process_weights(
-    plan: object,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-) -> torch.Tensor:
-    """Prepare grouped projection scales using the implementation pinned by plan.
-
-    Args:
-        plan: Opaque grouped output projection plan.
-        weight: Loaded FP8 weight in flattened ``[groups * output_dim, input_dim]``
-            layout.
-        weight_scale: Loaded canonical block scales.
-
-    Returns:
-        The scales in the selected implementation's persistent layout.
-    """
-    typed_plan = _require_grouped_output_projection_plan(plan)
-    expected_weight_shape = (
-        typed_plan.num_groups * typed_plan.output_dim,
-        typed_plan.heads_per_group * typed_plan.head_dim,
-    )
-    if tuple(weight.shape) != expected_weight_shape:
-        raise ValueError(
-            "grouped output projection weight shape mismatch: "
-            f"expected {expected_weight_shape}, got {tuple(weight.shape)}"
-        )
-    return typed_plan.weight_preprocessor(
-        weight=weight,
-        weight_scale=weight_scale,
-        num_groups=typed_plan.num_groups,
-        output_dim=typed_plan.output_dim,
-        input_dim=expected_weight_shape[1],
-        block_size=typed_plan.block_size,
-        recipe=typed_plan.preprocess_recipe,
-    )
 
 
 def dsv4_grouped_output_projection(
@@ -948,7 +551,6 @@ _KERNELS_WITH_FUSED_BIAS: frozenset[str] = frozenset(
 # Kernels that accept an ``enable_pdl`` kwarg for Programmatic Dependent Launch.
 _KERNELS_WITH_PDL: frozenset[str] = frozenset(
     {
-        "deep_gemm_mm_fp8_blockscale",
         "flashinfer_cute_dsl_mm_nvfp4_a16",
         "flashinfer_mm_nvfp4",
     }
@@ -1080,135 +682,15 @@ def _gemm_format_signature(
 def _online_quantize_mxfp8(
     A: torch.Tensor,
     block_size: list[int],
-    kernel_name: str,
-    enable_pdl: bool = False,
+    scale_encoding: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Perform online activation quantization for mxfp8 block-scaled GEMM.
-
-    The quantization approach is chosen based on the selected kernel's
-    name because different backends require different scale layouts.
-
-    Args:
-        A: Activation matrix to quantize.
-        block_size: Block-scale dimensions used by the selected GEMM.
-        kernel_name: Name of the selected GEMM implementation.
-        enable_pdl: Request Programmatic Dependent Launch for the quantize
-            kernel. FlashInfer MXFP8 and DeepGEMM's UE8M0 path honor it;
-            other backends ignore it.
-    """
-    block_k = block_size[1]
-
-    if kernel_name == "flashinfer_mm_mxfp8":
-        from flashinfer import mxfp8_quantize
-
-        # True = F8_128x4 swizzled scales (the bool form predates the
-        # SfLayout enum overload and works on flashinfer 0.6.15).
-        return mxfp8_quantize(A, is_sf_swizzled_layout=True, enable_pdl=enable_pdl)
-
-    if kernel_name == "triton_mm_fp8_blockscale" and block_k == 32:
-        from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
-
-        return quantize_fp8_with_scale(
-            A,
-            granularity="token_group",
-            group_size=block_k,
-            scale_encoding="float32",
-            solution="triton",
-        )
-
-    if kernel_name == "gluon_mm_mxfp8_ue8m0_gfx1250":
-        from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
-
-        return quantize_fp8_with_scale(
-            A,
-            granularity="token_group",
-            group_size=block_k,
-            scale_encoding="ue8m0",
-            enable_pdl=False,
-            override="triton_quantize_fp8_group32_ue8m0",
-            solution=None,
-        )
-
-    if (
-        kernel_name in {"flashinfer_mm_fp8_blockscale", "triton_mm_fp8_blockscale"}
-        and _platform.is_nvidia
-        and _platform.arch_version == ArchVersion(12, 0)
-    ):
-        from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
-
-        return quantize_fp8_with_scale(
-            A,
-            granularity="token_group",
-            group_size=block_k,
-            scale_encoding="float32",
-            solution="triton",
-        )
-
-    def ensure_row_major_scales(
-        qA: torch.Tensor,
-        A_scales: torch.Tensor,
-        *,
-        group_major_scales: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # On NVIDIA, the TRT-LLM helper used by per_token_group_quant_fp8
-        # returns [num_groups, num_tokens] scales. FlashInfer and Triton GEMMs
-        # consume [num_tokens, num_groups].
-        expected_groups = (qA.shape[-1] + block_k - 1) // block_k
-        if group_major_scales:
-            if A_scales.dim() != 2 or A_scales.shape[0] != expected_groups:
-                raise ValueError(
-                    "TRTLLM per-token-group quantization returned unexpected "
-                    f"scale shape {tuple(A_scales.shape)} for "
-                    f"tokens={qA.shape[0]}, groups={expected_groups}."
-                )
-            A_scales = A_scales.transpose(0, 1).contiguous()
-            return qA, A_scales
-        if (
-            A_scales.shape[-1] != expected_groups
-            and A_scales.shape[0] == expected_groups
-        ):
-            A_scales = A_scales.transpose(0, 1).contiguous()
-        return qA, A_scales
-
-    if kernel_name == "deep_gemm_mm_fp8_blockscale":
-        from tokenspeed_kernel.ops.gemm.fp8_utils import (
-            per_token_group_quant_fp8,
-        )
-
-        return per_token_group_quant_fp8(
-            A,
-            block_k,
-            column_major_scales=True,
-            scale_tma_aligned=True,
-            scale_ue8m0=_platform.is_blackwell_plus,
-            enable_pdl=enable_pdl,
-        )
-    elif kernel_name == "trtllm_cutedsl_mm_fp8_blockscale":
-        from tokenspeed_kernel.ops.gemm.fp8_utils import (
-            flashinfer_fp8_blockscale_quantize_prepacked,
-        )
-
-        values, scales = flashinfer_fp8_blockscale_quantize_prepacked(A, block_k)
-        return values[: A.shape[0]], scales[:, : A.shape[0]].T
-    elif kernel_name == "flashinfer_mm_fp8_blockscale":
-        from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
-
-        return ensure_row_major_scales(
-            *per_token_group_quant_fp8(A, block_k, column_major_scales=False),
-            group_major_scales=_platform.is_nvidia,
-        )
-    elif kernel_name in {
-        "gluon_mm_fp8_blockscale_gfx1250",
-        "triton_mm_fp8_blockscale",
-    }:
-        from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
-
-        return ensure_row_major_scales(
-            *per_token_group_quant_fp8(A, block_k, column_major_scales=False),
-            group_major_scales=_platform.is_nvidia,
-        )
-    else:
-        raise ValueError(f"No online quantization defined for kernel {kernel_name!r}")
+    return quantize_fp8(
+        A,
+        granularity="token_group",
+        group_size=block_size[1],
+        scale_encoding=scale_encoding,
+        solution="triton",
+    )
 
 
 def _kernel_handles_online_mxfp8(kernel_name: str) -> bool:
@@ -1252,7 +734,7 @@ def mm(
     block_size: list[int] | None = None,
     quant: str | None = None,
     override: str | None = None,
-    prepacked_scales: bool = False,
+    solution: str | None = None,
 ) -> torch.Tensor:
     """Dense matrix multiply with automatic kernel selection.
 
@@ -1282,9 +764,7 @@ def mm(
             NVFP4 weights. If ``None``, inferred from input dtypes and scales.
         override: Force selection of a specific kernel by name (e.g.
             ``"cublaslt_mm_nvfp4"``). Bypasses heuristic scoring.
-        prepacked_scales: Whether the FP8 block scales already use the selected
-            kernel's prepared layout. This is supported only by FlashInfer's
-            FP8 ``[128, 128]`` block-scale GEMM.
+        solution: Restrict selection to a registered implementation family.
     """
     enable_pdl = pdl_enabled()
     out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
@@ -1312,9 +792,6 @@ def mm(
     block_scale_layout = (
         "canonical_blackwell" if Platform.get().is_blackwell_plus else "canonical"
     )
-    if prepacked_scales:
-        block_scale_layout = "flashinfer_mn"
-
     traits: dict[str, object] = {
         "m": M,
         "n": N,
@@ -1339,14 +816,9 @@ def mm(
         "mm",
         signature,
         traits=traits,
+        solution=solution,
         override=override,
     )
-    if prepacked_scales and kernel.name != "flashinfer_mm_fp8_blockscale":
-        raise ValueError(
-            "prepacked_scales is only supported by "
-            f"flashinfer_mm_fp8_blockscale, selected {kernel.name!r}"
-        )
-
     # Online activation quantization
     if (
         quant == "mxfp8"
@@ -1356,19 +828,11 @@ def mm(
         assert (
             block_size is not None
         ), "block_size is required for online activation quantization"
-        if prepacked_scales:
-            from tokenspeed_kernel.ops.gemm.fp8_utils import (
-                flashinfer_fp8_blockscale_quantize_prepacked,
-            )
-
-            A, A_scales = flashinfer_fp8_blockscale_quantize_prepacked(A, block_size[1])
-        else:
-            A, A_scales = _online_quantize_mxfp8(
-                A,
-                block_size,
-                kernel.name,
-                enable_pdl=enable_pdl,
-            )
+        A, A_scales = _online_quantize_mxfp8(
+            A,
+            block_size,
+            "ue8m0" if B_scales.dtype == torch.uint8 else "float32",
+        )
 
     kernel_args = (A, B, A_scales, B_scales, out_dtype)
     kernel_kwargs: dict[str, object] = {
@@ -1377,10 +841,6 @@ def mm(
     }
     if out is not None:
         kernel_kwargs["out"] = out
-    if prepacked_scales:
-        kernel_kwargs["prepacked_scales"] = True
-        kernel_kwargs["original_m"] = M
-
     fused_bias = bias is not None and kernel.name in _KERNELS_WITH_FUSED_BIAS
     if fused_bias:
         kernel_kwargs["bias"] = bias

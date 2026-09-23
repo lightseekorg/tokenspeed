@@ -26,8 +26,6 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 __all__ = [
     "fp8_quantize_dequantize",
     "quantize_fp8",
-    "quantize_fp8_with_scale",
-    "quantize_fp8_group32_ue8m0_swizzled",
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_mxfp4",
@@ -109,39 +107,34 @@ def fp8_quantize_dequantize(
 def quantize_fp8(
     x: torch.Tensor,
     scale: float | torch.Tensor | None = None,
-    # kernel options
+    granularity: Literal["tensor", "token", "token_group", "block"] | None = None,
+    group_size: int | None = None,
+    block_size: tuple[int, int] | list[int] | None = None,
+    scale_encoding: Literal["float32", "ue8m0", "packed_ue8m0"] = "float32",
     enable_pdl: bool = False,
-    # dispatch options
     override: str | None = None,
     solution: str | None = None,
-) -> torch.Tensor:
-    """Quantize x to same-shape FP8 with an optional scalar scale.
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Quantize a tensor to FP8 and return its scale when one is used.
 
-    This API covers static activation-scale cases such as GPT-OSS MXFP4 MoE
-    W4A8 input quantization and plain FP8 casts. If scale is provided, it is
-    the actual quantization scale, so the backend computes x / scale before
-    casting. If scale is omitted, the backend performs a pure FP8 cast.
-
-    Args:
-        x: Input tensor.
-        scale: Optional scalar scale, as a Python value or scalar tensor. If
-            provided, the backend computes x / scale before casting. If omitted,
-            the backend performs a pure FP8 cast.
-        enable_pdl: Whether to request Programmatic Dependent Launch support.
-        override: Optional exact kernel name or solution override.
-        solution: Optional registered solution to select.
-
-    Returns:
-        Quantized FP8 tensor with the same shape as x.
-
-    Non-scalar scales belong in dynamic quantization APIs and should be
-    on-device tensors.
-
+    With no granularity this performs a plain or static-scale cast. Dynamic
+    granularities compute canonical scales from the input.
     """
+    if granularity is not None:
+        if scale is not None:
+            raise ValueError("dynamic FP8 quantization does not accept scale")
+        return _quantize_fp8_dynamic(
+            x,
+            granularity=granularity,
+            group_size=group_size,
+            block_size=block_size,
+            scale_encoding=scale_encoding,
+            enable_pdl=enable_pdl,
+            override=override,
+            solution=solution or (None if override is not None else "triton"),
+        )
 
-    traits = {
-        "has_scale": scale is not None,
-    }
+    traits = {"has_scale": scale is not None}
     signature = format_signature(x=dense_tensor_format(x.dtype))
     kernel = select_kernel(
         "quantization",
@@ -151,26 +144,25 @@ def quantize_fp8(
         solution=solution,
         override=override,
     )
-    shape_params = {
-        "shape": tuple(x.shape),
-        "has_scale": scale is not None,
-    }
+    shape_params = {"shape": tuple(x.shape), "has_scale": scale is not None}
     ShapeCapture.get().record("quantization", "fp8", kernel.name, x.dtype, shape_params)
     with kernel_scope(
         "quantization", "fp8", x.dtype, kernel_name=kernel.name, **shape_params
     ):
-        return kernel(
-            x,
-            scale=scale,
-            enable_pdl=enable_pdl,
-        )
+        values = kernel(x, scale=scale, enable_pdl=enable_pdl)
+    if scale is None:
+        return values, None
+    if isinstance(scale, torch.Tensor):
+        return values, scale
+    return values, torch.tensor([scale], dtype=torch.float32, device=x.device)
 
 
-def quantize_fp8_with_scale(
+def _quantize_fp8_dynamic(
     x: torch.Tensor,
     # quantization options
-    granularity: Literal["tensor", "token", "token_group"] = "tensor",
+    granularity: Literal["tensor", "token", "token_group", "block"] = "tensor",
     group_size: int | None = None,
+    block_size: tuple[int, int] | list[int] | None = None,
     scale_encoding: Literal["float32", "ue8m0", "packed_ue8m0"] = "float32",
     # kernel options
     enable_pdl: bool = False,
@@ -181,16 +173,17 @@ def quantize_fp8_with_scale(
     """Quantize x to FP8 while dynamically computing scales.
 
     Use granularity="tensor" for one scale over the whole tensor,
-    granularity="token" for one scale per row/token, and
+    granularity="token" for one scale per row/token,
     granularity="token_group" for one scale per row/token and contiguous group
-    along the last dimension.
+    along the last dimension, and granularity="block" for one scale per 2-D
+    block.
 
     Args:
         x: Input tensor.
-        granularity: Scale granularity. Supported values are tensor, token, and
-            token_group.
+        granularity: Scale granularity: tensor, token, token_group, or block.
         group_size: Number of contiguous values per scale group along the last
             dimension. Required for token_group granularity.
+        block_size: Two-dimensional scale block. Required for block granularity.
         scale_encoding: Scale encoding for token_group granularity, such as
             float32, ue8m0, or packed_ue8m0.
         enable_pdl: Whether to request Programmatic Dependent Launch support.
@@ -201,14 +194,14 @@ def quantize_fp8_with_scale(
         Tuple of quantized FP8 tensor and scale tensor.
 
     The expected scale shapes are [1] for tensor granularity, [M, 1] for token
-    granularity, and [M, ceil(K / group_size)] or a backend-specific layout for
-    token_group granularity, where M = x.reshape(-1, x.shape[-1]).shape[0].
+    granularity, [M, ceil(K / group_size)] for token_group granularity, and
+    [ceil(M / block_m), ceil(K / block_k)] for block granularity.
     Returned scales use float32 dtype for scale_encoding="float32" and a
     backend-specific encoded integer dtype for non-float encodings such as
     "ue8m0".
     """
 
-    if granularity not in {"tensor", "token", "token_group"}:
+    if granularity not in {"tensor", "token", "token_group", "block"}:
         raise ValueError(f"unsupported FP8 dynamic granularity: {granularity!r}")
     if granularity == "token_group":
         if group_size is None or group_size <= 0:
@@ -216,6 +209,10 @@ def quantize_fp8_with_scale(
                 f"token_group granularity requires positive group_size, got {group_size}"
             )
         granularity_trait = f"token_group_{group_size}"
+    elif granularity == "block":
+        if block_size is None or len(block_size) != 2 or min(block_size) <= 0:
+            raise ValueError("block granularity requires a positive 2-D block_size")
+        granularity_trait = f"block_{int(block_size[0])}_{int(block_size[1])}"
     else:
         granularity_trait = granularity
     traits = {
@@ -235,6 +232,7 @@ def quantize_fp8_with_scale(
         "shape": tuple(x.shape),
         "granularity": granularity_trait,
         "group_size": group_size,
+        "block_size": tuple(block_size) if block_size is not None else None,
         "scale_encoding": scale_encoding,
     }
     ShapeCapture.get().record(
@@ -247,13 +245,15 @@ def quantize_fp8_with_scale(
         kernel_name=kernel.name,
         **shape_params,
     ):
-        return kernel(
-            x,
-            granularity=granularity,
-            group_size=group_size,
-            scale_encoding=scale_encoding,
-            enable_pdl=enable_pdl,
-        )
+        kernel_args = {
+            "granularity": granularity,
+            "group_size": group_size,
+            "scale_encoding": scale_encoding,
+            "enable_pdl": enable_pdl,
+        }
+        if block_size is not None:
+            kernel_args["block_size"] = tuple(block_size)
+        return kernel(x, **kernel_args)
 
 
 def quantize_mxfp8(
@@ -442,62 +442,6 @@ def quantize_mxfp4(
             scale_layout=scale_layout,
             enable_pdl=enable_pdl,
         )
-
-
-def quantize_fp8_group32_ue8m0_swizzled(
-    x: torch.Tensor,
-    *,
-    override: str | None,
-    solution: str | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize exact group-32 E4M3 values directly into F8_128x4 scales.
-
-    Args:
-        x: CUDA BF16/FP16 ``[M,K]`` with unit column stride and K divisible by 32.
-            Row stride may include a gap. The scale rule retains the existing
-            ``amax >= 1e-4`` floor, IEEE upward power-of-two rounding and FP32
-            round-to-nearest division before E4M3 conversion.
-        override: Optional exact registered kernel name.
-        solution: Optional registered implementation restriction.
-
-    Returns:
-        Contiguous FP8 ``[M,K]`` and uint8 one-dimensional scales in the
-        F8_128x4 layout. Every scale byte is written, including zero padding to
-        ``round_up(M,128) * round_up(K/32,4)``. Storage belongs to this call;
-        no previous eager or captured output is cached or reused.
-    """
-    if (
-        not x.is_cuda
-        or x.ndim != 2
-        or x.dtype not in (torch.bfloat16, torch.float16)
-        or x.shape[1] <= 0
-        or x.shape[1] % 32
-        or x.stride(1) != 1
-    ):
-        raise ValueError(
-            "Exact swizzled FP8 quantization requires CUDA BF16/FP16 [M,K], "
-            "positive K divisible by 32 and contiguous columns"
-        )
-    kernel = select_kernel(
-        "quantization",
-        "fp8_group32_ue8m0_swizzled",
-        format_signature(x=dense_tensor_format(x.dtype)),
-        traits={},
-        solution=solution,
-        override=override,
-    )
-    shape_params = {"shape": tuple(x.shape), "scale_layout": "F8_128x4"}
-    ShapeCapture.get().record(
-        "quantization", "fp8_group32_ue8m0_swizzled", kernel.name, x.dtype, shape_params
-    )
-    with kernel_scope(
-        "quantization",
-        "fp8_group32_ue8m0_swizzled",
-        x.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        return kernel(x)
 
 
 # Backend registration (side-effect imports).

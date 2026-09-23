@@ -160,7 +160,7 @@ def test_apply_forwards_prepared_layout_and_pdl(monkeypatch, enable_pdl: bool) -
             device=kwargs["hidden_states"].device,
         )
 
-    monkeypatch.setattr(trtllm_fp8, "per_token_group_quant_fp8", fake_quantize)
+    monkeypatch.setattr(trtllm_fp8, "quantize_fp8", fake_quantize)
     monkeypatch.setattr(trtllm_fp8, "trtllm_fp8_block_scale_routed_moe", fake_moe)
 
     weights = _MoEWeights(
@@ -224,7 +224,7 @@ def test_apply_supports_deferred_finalize(monkeypatch) -> None:
         captured.update(kwargs)
         return gemm2_out, kwargs["topk_ids"][1], expanded_idx
 
-    monkeypatch.setattr(trtllm_fp8, "per_token_group_quant_fp8", fake_quantize)
+    monkeypatch.setattr(trtllm_fp8, "quantize_fp8", fake_quantize)
     monkeypatch.setattr(trtllm_fp8, "trtllm_fp8_block_scale_routed_moe", fake_moe)
 
     weights = _MoEWeights(

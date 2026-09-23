@@ -1078,7 +1078,6 @@ def kimi3_qkvfab_projection(
     weight: torch.Tensor,
     *,
     weight_scale: torch.Tensor | None = None,
-    prepacked_scales: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     solution: str = "auto",
 ) -> torch.Tensor:
@@ -1102,8 +1101,6 @@ def kimi3_qkvfab_projection(
             ``weight_scale``.
         weight_scale: f32 ``[N/128, 7168/128]`` block dequant multipliers
             (FP8 weights only).
-        prepacked_scales: Optional flashinfer MN-major prepacked scales; when
-            given the flashinfer blockscale kernel is pinned.
         out: Optional contiguous BF16 output buffer shaped ``[M, N]``.
         solution: ``"auto"`` selects the architecture-specific BF16 route;
             ``"triton_gemv"``, ``"gluon_wmma_gfx1250"``,
@@ -1124,32 +1121,21 @@ def kimi3_qkvfab_projection(
             raise ValueError("FP8 Kimi K3 QKVFAB projection requires weight_scale")
         # Lazy import: ops.gemm.__init__ imports this module at load time.
         from tokenspeed_kernel.ops.gemm import mm as _mm
-        from tokenspeed_kernel.ops.gemm.flashinfer import (
-            use_flashinfer_fp8_blockscale_prepacked,
-        )
 
-        use_prepacked = (
-            prepacked_scales is not None and use_flashinfer_fp8_blockscale_prepacked(m)
-        )
         result = _mm(
             hidden_states,
             weight,
-            A_scales=None,
-            B_scales=(prepacked_scales if use_prepacked else weight_scale),
+            B_scales=weight_scale,
             out_dtype=hidden_states.dtype,
             quant="mxfp8",
             block_size=[128, 128],
-            override=("flashinfer_mm_fp8_blockscale" if use_prepacked else None),
-            prepacked_scales=use_prepacked,
         )
         if out is None:
             return result
         out.copy_(result)
         return out
-    if weight_scale is not None or prepacked_scales is not None:
-        raise ValueError(
-            "weight_scale / prepacked_scales are only valid with FP8 weights"
-        )
+    if weight_scale is not None:
+        raise ValueError("weight_scale is only valid with FP8 weights")
     if solution not in {
         "auto",
         "decode_gemv",
