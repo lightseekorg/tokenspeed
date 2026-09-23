@@ -53,6 +53,7 @@ def test_triton_mxfp4_moe_matches_torch(activation: str) -> None:
         swiglu_form=("standard" if activation == "swiglu" else None),
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     tokenspeed_kernel.moe_process_weights(plan, weights)
     actual = tokenspeed_kernel.moe_apply(

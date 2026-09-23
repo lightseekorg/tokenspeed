@@ -125,6 +125,8 @@ the suite's single benchmark harness receives that value for each case.
 
 The optional `case_files` list composes model-and-operation case files into the
 hardware suite. Case IDs remain unique across the composed suite.
+Case files may define `common_parameters`; these are merged into every case,
+with parameters written on an individual case taking precedence.
 
 A top-level parameter may be a non-empty list. The loader expands all such lists
 as a Cartesian product and appends `_0`, `_1`, and so on to the case ID. Parameter

@@ -172,6 +172,14 @@ def set_benchmark_generator(
 
 
 def _load_builtin_generators() -> None:
+    from tokenspeed_kernel.benchmark.generators.dsa import (
+        prepare_dsa_decode,
+        prepare_dsa_prefill,
+        prepare_kpool_decode_append,
+        prepare_kpool_decode_topk,
+        prepare_kpool_prefill_topk,
+        prepare_kpool_prefill_write,
+    )
     from tokenspeed_kernel.benchmark.generators.gemm import (
         prepare_dense_bmm,
         prepare_mxfp8_mm,
@@ -187,6 +195,20 @@ def _load_builtin_generators() -> None:
     _BENCHMARK_GENERATORS.setdefault(
         ("attention", "kda_paged_prefill"), prepare_kda_paged_prefill
     )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "kpool_prefill_write"), prepare_kpool_prefill_write
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "kpool_prefill_topk"), prepare_kpool_prefill_topk
+    )
+    _BENCHMARK_GENERATORS.setdefault(("attention", "dsa_prefill"), prepare_dsa_prefill)
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "kpool_decode_append"), prepare_kpool_decode_append
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "kpool_decode_topk"), prepare_kpool_decode_topk
+    )
+    _BENCHMARK_GENERATORS.setdefault(("attention", "dsa_decode"), prepare_dsa_decode)
     _BENCHMARK_GENERATORS.setdefault(("gemm", "bmm"), prepare_dense_bmm)
     _BENCHMARK_GENERATORS.setdefault(("gemm", "mm"), prepare_mxfp8_mm)
 

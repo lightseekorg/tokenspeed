@@ -49,8 +49,8 @@ if platform.is_blackwell:
         get_symm_buffer_for_mega_moe,
         set_pdl,
     )
-    from tokenspeed_kernel.ops.moe.deep_gemm._triton.stage import (
-        stage_dsv4_mega_moe_inputs,
+    from tokenspeed_kernel.ops.moe.deep_gemm._triton.mega_moe_stage import (
+        stage_mxfp4_mega_moe_inputs,
     )
 
 
@@ -58,7 +58,7 @@ _MXFP4_BLOCK_SIZE = 32
 _DISABLE_WARMUP_ENV = "TOKENSPEED_DISABLE_MEGA_MOE_WARMUP"
 _symm_buffer_cache: dict[tuple[int, int, int, int, int, int, int], object] = {}
 _warmed_configs: set[
-    tuple[int, torch.device, int, int, int, int, int, float | None]
+    tuple[int, torch.device, int, int, int, int, int, float | None, bool]
 ] = set()
 
 
@@ -146,16 +146,22 @@ def _reorder_scale_rows_(
     return scale
 
 
-def _deep_gemm_dsv4_mega_moe_process_weights(
-    *,
-    w13_weight: torch.Tensor,
-    w13_weight_scale: torch.Tensor,
-    w2_weight: torch.Tensor,
-    w2_weight_scale: torch.Tensor,
-    num_local_experts: int,
-    hidden_size: int,
-    intermediate_size: int,
+def deep_gemm_mxfp4_mega_moe_process_weights(
+    plan: dict,
+    w: torch.nn.Module,
 ) -> object:
+    w13_weight = w.w13_weight.data
+    w13_weight_scale = w.w13_weight_scale.data
+    w2_weight = w.w2_weight.data
+    w2_weight_scale = w.w2_weight_scale.data
+    num_local_experts = w.num_local_experts
+    hidden_size = w.hidden_size
+    intermediate_size = w.intermediate_size
+    max_num_tokens = plan.get("persistent_max_num_tokens_per_gpu")
+    if max_num_tokens is None or max_num_tokens <= 0:
+        raise ValueError("DeepGEMM MegaMoE requires persistent_max_num_tokens_per_gpu")
+    if w.top_k > w.num_experts:
+        raise ValueError("top_k cannot exceed num_experts")
     tensors = (w13_weight, w13_weight_scale, w2_weight, w2_weight_scale)
     names = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
     expected_shapes = _expected_shapes(
@@ -180,13 +186,13 @@ def _deep_gemm_dsv4_mega_moe_process_weights(
     w2_scale = _pack_ue8m0_scale_(w2_weight_scale)
     w2_scale = _reorder_scale_rows_(w2_scale, False, 8)
 
-    # The opaque state takes ownership of the canonical tensor storage when the
-    # model drops its parameters after this callback returns.
-    return _DeepGemmMegaMoEState(
+    state = _DeepGemmMegaMoEState(
         l1_weights=(w13_weight, w13_scale),
         l2_weights=(w2_weight.view(torch.int8), w2_scale),
         device=w13_weight.device,
     )
+    w._moe_backend_state = state
+    return state
 
 
 def _resolve_process_group(process_group: object | None) -> object:
@@ -194,8 +200,8 @@ def _resolve_process_group(process_group: object | None) -> object:
         return process_group
     if not dist.is_initialized():
         raise RuntimeError(
-            "DeepSeek V4 MegaMoE requires an initialized process group or an "
-            "explicit process_group in dsv4_mega_moe_plan"
+            "DeepGEMM MegaMoE requires an initialized process group or an "
+            "explicit process_group in moe_plan"
         )
     return dist.group.WORLD
 
@@ -259,6 +265,7 @@ def _warmup_mega_moe_jit(
     transformed_l2_weights: tuple[torch.Tensor, torch.Tensor],
     symm_buffer: object,
     activation_clamp: float | None,
+    fast_math: bool,
 ) -> None:
     """Pre-compile MegaMoE kernel tiles using the initialized model state."""
     token_counts = _warmup_m_values(max_num_tokens)
@@ -299,28 +306,28 @@ def _warmup_mega_moe_jit(
             transformed_l2_weights,
             symm_buffer,
             activation_clamp=activation_clamp,
+            fast_math=fast_math,
         )
 
     torch.cuda.synchronize()
 
 
-def _warmup_deep_gemm_dsv4_mega_moe(
-    *,
-    state: object,
-    process_group: object | None,
-    num_experts: int,
-    top_k: int,
-    hidden_size: int,
-    intermediate_size: int,
-    max_num_tokens: int,
-    activation_clamp: float | None,
-) -> None:
+def warmup_deep_gemm_mxfp4_mega_moe(plan: dict, w: torch.nn.Module) -> None:
     if get_pdl() != pdl_enabled():
         set_pdl(pdl_enabled())
     if os.environ.get(_DISABLE_WARMUP_ENV) == "1":
         return
+    state = w._moe_backend_state
     if not isinstance(state, _DeepGemmMegaMoEState):
         raise TypeError("invalid DeepGEMM MegaMoE state")
+    process_group = plan.get("process_group")
+    num_experts = w.num_experts
+    top_k = w.top_k
+    hidden_size = w.hidden_size
+    intermediate_size = w.intermediate_size
+    max_num_tokens = plan["persistent_max_num_tokens_per_gpu"]
+    activation_clamp = None if w.swiglu_arg is None else w.swiglu_arg.limit
+    fast_math = plan["fast_math"]
     group = _resolve_process_group(process_group)
     warmup_key = (
         id(group),
@@ -331,6 +338,7 @@ def _warmup_deep_gemm_dsv4_mega_moe(
         hidden_size,
         intermediate_size,
         activation_clamp,
+        fast_math,
     )
     if warmup_key in _warmed_configs:
         return
@@ -355,6 +363,7 @@ def _warmup_deep_gemm_dsv4_mega_moe(
         transformed_l2_weights=state.l2_weights,
         symm_buffer=symm_buffer,
         activation_clamp=activation_clamp,
+        fast_math=fast_math,
     )
     _warmed_configs.add(warmup_key)
 
@@ -363,9 +372,9 @@ if platform.is_blackwell:
 
     @register_kernel(
         "moe",
-        "dsv4_mega_moe",
-        name="deep_gemm_dsv4_mega_moe_sm100",
-        solution="deep_gemm",
+        "apply",
+        name="deep_gemm_mxfp4_mega_moe_apply",
+        solution="mega_moe",
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
@@ -375,53 +384,79 @@ if platform.is_blackwell:
         signatures=frozenset(
             {
                 format_signature(
-                    hidden_states=dense_tensor_format(torch.bfloat16),
+                    x=dense_tensor_format(torch.bfloat16),
                 )
             }
         ),
         traits={
             "weight_dtype": frozenset({"mxfp4"}),
-            "scale_format": frozenset({"ue8m0"}),
-            "scale_block_size": frozenset({_MXFP4_BLOCK_SIZE}),
+            "activation": frozenset({"swiglu"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({False}),
             "supports_ep": frozenset({True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "persistent_workspace": frozenset({True}),
+            "ispp_alignment": frozenset({128}),
+            "hidden_alignment": frozenset({128}),
+            "swiglu_form": frozenset({"standard"}),
+            "activation_clamped": frozenset({False, True}),
+            "internal_activation_dtype": frozenset({"input"}),
+            "supports_bias": frozenset({False}),
         },
         priority=Priority.SPECIALIZED,
-        weight_preprocessor=_deep_gemm_dsv4_mega_moe_process_weights,
+        weight_preprocessor=deep_gemm_mxfp4_mega_moe_process_weights,
     )
-    def deep_gemm_dsv4_mega_moe_sm100(
-        *,
-        hidden_states: torch.Tensor,
+    def deep_gemm_mxfp4_mega_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor | None,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        state: object,
-        process_group: object | None,
-        num_experts: int,
-        top_k: int,
-        hidden_size: int,
-        intermediate_size: int,
-        max_num_tokens: int,
-        activation_clamp: float | None,
-        fast_math: bool,
+        num_tokens_global: int | None,
+        max_num_tokens_per_gpu: int | None,
+        do_finalize: bool,
+        enable_pdl: bool,
     ) -> torch.Tensor:
-        if get_pdl() != pdl_enabled():
-            set_pdl(pdl_enabled())
+        if not do_finalize:
+            raise ValueError("DeepGEMM MegaMoE requires complete finalization")
+        if not isinstance(x, torch.Tensor):
+            raise TypeError("DeepGEMM MegaMoE requires dense input activations")
+        state = w._moe_backend_state
         if not isinstance(state, _DeepGemmMegaMoEState):
             raise TypeError("invalid DeepGEMM MegaMoE state")
-        if hidden_states.device != state.device:
+        if x.device != state.device:
             raise ValueError("MegaMoE inputs and processed weights must share a device")
+        if x.ndim != 2 or x.shape[1] != w.hidden_size:
+            raise ValueError(
+                f"DeepGEMM MegaMoE input must have shape [tokens, {w.hidden_size}]"
+            )
+        expected_routing_shape = (x.shape[0], w.top_k)
+        if topk_weights is None or tuple(topk_weights.shape) != expected_routing_shape:
+            raise ValueError(f"topk_weights must have shape {expected_routing_shape}")
+        if topk_ids is None or tuple(topk_ids.shape) != expected_routing_shape:
+            raise ValueError(f"topk_ids must have shape {expected_routing_shape}")
+        max_num_tokens = plan["persistent_max_num_tokens_per_gpu"]
+        if x.shape[0] > max_num_tokens:
+            raise ValueError(
+                f"DeepGEMM MegaMoE got {x.shape[0]} tokens, but its symmetric "
+                f"buffer was sized for {max_num_tokens}"
+            )
+        if get_pdl() != enable_pdl:
+            set_pdl(enable_pdl)
         symm_buffer = _get_symm_buffer(
             state=state,
-            process_group=process_group,
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
+            process_group=plan.get("process_group"),
+            num_experts=w.num_experts,
+            top_k=w.top_k,
+            hidden_size=w.hidden_size,
+            intermediate_size=w.intermediate_size,
             max_num_tokens=max_num_tokens,
         )
-        num_tokens = hidden_states.shape[0]
+        num_tokens = x.shape[0]
         topk_ids = topk_ids.to(torch.int64)
-        stage_dsv4_mega_moe_inputs(
-            hidden_states,
+        stage_mxfp4_mega_moe_inputs(
+            x,
             topk_weights,
             topk_ids,
             symm_buffer.x[:num_tokens],
@@ -429,17 +464,17 @@ if platform.is_blackwell:
             symm_buffer.topk_idx[:num_tokens],
             symm_buffer.topk_weights[:num_tokens],
         )
-        output = torch.empty_like(hidden_states, dtype=torch.bfloat16)
+        output = torch.empty_like(x, dtype=torch.bfloat16)
         fp8_fp4_mega_moe(
             output,
             state.l1_weights,
             state.l2_weights,
             symm_buffer,
-            activation_clamp=activation_clamp,
-            fast_math=fast_math,
+            activation_clamp=(None if w.swiglu_arg is None else w.swiglu_arg.limit),
+            fast_math=plan["fast_math"],
         )
         return output
 
-    deep_gemm_dsv4_mega_moe_sm100._tokenspeed_warmup = (  # type: ignore[attr-defined]
-        _warmup_deep_gemm_dsv4_mega_moe
+    deep_gemm_mxfp4_mega_moe_apply._tokenspeed_warmup = (  # type: ignore[attr-defined]
+        warmup_deep_gemm_mxfp4_mega_moe
     )

@@ -40,7 +40,6 @@ __all__ = ["prepare_kda_paged_decode", "prepare_kda_paged_prefill"]
 
 
 _IMPLEMENTED_DTYPES = {
-    "bf16": torch.bfloat16,
     "bfloat16": torch.bfloat16,
 }
 _IMPLEMENTED_MODEL_PROFILES = frozenset({"glm53_flash_tp4"})

@@ -35,23 +35,16 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel import (
-    NoKernelFoundError,
     dsv4_grouped_output_projection,
     dsv4_grouped_output_projection_plan,
     dsv4_grouped_output_projection_warmup_model,
+    dsv4_linear_fp32,
 )
-from tokenspeed_kernel import dsv4_linear_fp32 as _kernel_dsv4_linear_fp32
-from tokenspeed_kernel import (
-    dsv4_mega_moe_apply,
-    dsv4_mega_moe_plan,
-    dsv4_mega_moe_process_weights,
-    dsv4_mega_moe_warmup,
-)
-from tokenspeed_kernel import dsv4_select_experts as _kernel_dsv4_select_experts
 from tokenspeed_kernel import mhc_fused_hc as fast_mhc_fused_hc
 from tokenspeed_kernel import mhc_post as fast_mhc_post
 from tokenspeed_kernel import mhc_pre as fast_mhc_pre
 from tokenspeed_kernel import (
+    moe_topk,
     pack_topk_router_logits,
 )
 from tokenspeed_kernel.ops.attention.dsa import dsa_decode_topk, dsa_prefill_topk
@@ -133,8 +126,11 @@ from tokenspeed.runtime.layers.moe import (
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import (
     BypassedTopKOutput,
+    ExpertLocationDispatchInfo,
     StandardTopKOutput,
     TopK,
+    TopKOutput,
+    TopKOutputFormat,
 )
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
 from tokenspeed.runtime.layers.quantization import Fp8Config, Mxfp4Config
@@ -322,22 +318,6 @@ def hc_head(
     pre = torch.sigmoid(mixes * hc_scale.float() + hc_base.float()) + hc_eps
     y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
     return y.to(dtype)
-
-
-def pack_topk_as_router_logits(
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    num_experts: int,
-) -> torch.Tensor:
-    """Encode preselected top-k weights for BYPASSED TokenSpeed MoE backends.
-
-    MXFP4 backends currently build routing data from logits internally. Packing
-    the normalized top-k weights as log-probabilities with very negative values
-    elsewhere makes their TopK -> Softmax/Renormalize route recover the same
-    selected ids and weights without changing the shared backend.
-    """
-
-    return pack_topk_router_logits(topk_weights, topk_ids, num_experts)
 
 
 @dataclass(frozen=True)
@@ -1580,73 +1560,6 @@ class DeepseekV4MLP(nn.Module):
         return out
 
 
-def dsv4_select_experts(
-    router_logits: torch.Tensor,
-    top_k: int,
-    renormalize: bool,
-    correction_bias: torch.Tensor | None = None,
-    hash_indices_table: torch.Tensor | None = None,
-    input_ids: torch.Tensor | None = None,
-    need_scores: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Use an accelerator router when available, otherwise run eager routing."""
-    try:
-        return _kernel_dsv4_select_experts(
-            router_logits,
-            top_k,
-            renormalize,
-            correction_bias,
-            hash_indices_table,
-            input_ids,
-            need_scores,
-        )
-    except (NoKernelFoundError, AttributeError, RuntimeError):
-        pass
-
-    scores = torch.sqrt(F.softplus(router_logits.float()))
-    if hash_indices_table is not None:
-        if input_ids is None:
-            raise ValueError("hash-routed DeepSeek V4 MoE requires input_ids")
-        table = hash_indices_table.to(device=scores.device, dtype=torch.int64)
-        ids = input_ids.reshape(-1).to(device=scores.device, dtype=torch.int64)
-        topk_ids = table[ids]
-    else:
-        scores_for_choice = scores
-        if correction_bias is not None:
-            scores_for_choice = scores_for_choice + correction_bias.to(
-                device=scores.device,
-                dtype=scores.dtype,
-            ).unsqueeze(0)
-        topk_ids = torch.topk(
-            scores_for_choice,
-            k=top_k,
-            dim=-1,
-            sorted=True,
-        ).indices
-
-    topk_weights = scores.gather(1, topk_ids.long())
-    if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(
-            dim=-1,
-            keepdim=True,
-        ).clamp_min(torch.finfo(topk_weights.dtype).tiny)
-    return topk_weights.to(torch.float32), topk_ids.to(torch.int32), scores
-
-
-def dsv4_linear_fp32(
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-) -> torch.Tensor:
-    """Use the registered accelerator projection or an eager FP32 fallback."""
-    try:
-        return _kernel_dsv4_linear_fp32(
-            hidden_states,
-            weight,
-        )
-    except NoKernelFoundError:
-        return F.linear(hidden_states.float(), weight.float())
-
-
 class DeepseekV4MoEGate(nn.Module):
     def __init__(
         self,
@@ -1686,158 +1599,71 @@ class DeepseekV4MoEGate(nn.Module):
         )
 
 
-class DeepseekV4MegaMoEExperts(nn.Module):
+class DeepseekV4TopK(TopK):
     def __init__(
         self,
-        *,
-        num_experts: int,
-        num_local_experts: int,
         top_k: int,
-        hidden_size: int,
-        intermediate_size: int,
-        mapping: Mapping,
-        prefix: str,
-        swiglu_limit: float | None,
+        renormalize: bool,
+        correction_bias: torch.Tensor | None,
+        routed_scaling_factor: float,
+        output_format: TopKOutputFormat,
+        hash_routing: bool,
     ) -> None:
-        super().__init__()
-        self.prefix = prefix
-        self.num_experts = num_experts
-        self.num_local_experts = num_local_experts
-        self.top_k = top_k
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.max_num_tokens = _deepseek_v4_mega_moe_max_num_tokens()
-        process_group = (
-            None
-            if mapping is None
-            else pg_manager.get_device_process_group(mapping.moe.tp_ep_group)
-        )
-        self._plan = dsv4_mega_moe_plan(
-            num_experts=num_experts,
-            num_local_experts=num_local_experts,
+        super().__init__(
             top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            max_num_tokens=self.max_num_tokens,
-            process_group=process_group,
-            activation_clamp=swiglu_limit,
+            renormalize=renormalize,
+            correction_bias=correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
+            output_format=output_format,
         )
-        self._processed_state: object | None = None
-
-        weight_attrs = {"weight_loader": self.weight_loader}
-        self.w13_weight = nn.Parameter(
-            torch.zeros(
-                num_local_experts,
-                2 * intermediate_size,
-                hidden_size // 2,
-                dtype=torch.uint8,
-            ),
-            requires_grad=False,
-        )
-        set_weight_attrs(self.w13_weight, weight_attrs)
-
-        self.w13_weight_scale = nn.Parameter(
-            torch.zeros(
-                num_local_experts,
-                2 * intermediate_size,
-                hidden_size // DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
-                dtype=torch.uint8,
-            ),
-            requires_grad=False,
-        )
-        set_weight_attrs(self.w13_weight_scale, weight_attrs)
-
-        self.w2_weight = nn.Parameter(
-            torch.zeros(
-                num_local_experts,
-                hidden_size,
-                intermediate_size // 2,
-                dtype=torch.uint8,
-            ),
-            requires_grad=False,
-        )
-        set_weight_attrs(self.w2_weight, weight_attrs)
-
-        self.w2_weight_scale = nn.Parameter(
-            torch.zeros(
-                num_local_experts,
-                hidden_size,
-                intermediate_size // DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
-                dtype=torch.uint8,
-            ),
-            requires_grad=False,
-        )
-        set_weight_attrs(self.w2_weight_scale, weight_attrs)
-
-    def weight_loader(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        shard_id: str,
-        local_expert_id: int,
-    ) -> None:
-        expert_data = param.data[local_expert_id]
-        if shard_id in ("w1", "w3"):
-            if param is not self.w13_weight and param is not self.w13_weight_scale:
-                raise ValueError(f"Unexpected MegaMoE w13 shard target: {shard_id}")
-            shard_offset = 0 if shard_id == "w1" else self.intermediate_size
-            expert_data = expert_data.narrow(0, shard_offset, self.intermediate_size)
-        elif shard_id == "w2":
-            if param is not self.w2_weight and param is not self.w2_weight_scale:
-                raise ValueError(f"Unexpected MegaMoE w2 shard target: {shard_id}")
-        else:
-            raise ValueError(f"Unsupported DeepSeek V4 MegaMoE shard id: {shard_id}")
-
-        if expert_data.dtype == torch.uint8 and loaded_weight.dtype == getattr(
-            torch, "float8_e8m0fnu", None
-        ):
-            loaded_weight = loaded_weight.view(torch.uint8)
-        if expert_data.shape != loaded_weight.shape:
-            raise ValueError(
-                f"DeepSeek V4 MegaMoE expert weight shape mismatch for "
-                f"{self.prefix}: parameter shard {tuple(expert_data.shape)} "
-                f"vs checkpoint {tuple(loaded_weight.shape)}"
-            )
-        expert_data.copy_(loaded_weight)
-
-    def finalize_weights(self) -> None:
-        if self._processed_state is not None:
-            return
-        self._processed_state = dsv4_mega_moe_process_weights(
-            self._plan,
-            self.w13_weight.data,
-            self.w13_weight_scale.data,
-            self.w2_weight.data,
-            self.w2_weight_scale.data,
-        )
-
-        del self.w13_weight
-        del self.w13_weight_scale
-        del self.w2_weight
-        del self.w2_weight_scale
-
-    def warmup(self) -> None:
-        if self._processed_state is not None:
-            dsv4_mega_moe_warmup(self._plan, self._processed_state)
+        self.hash_routing = hash_routing
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        if self._processed_state is None:
-            raise RuntimeError(
-                "DeepseekV4MegaMoEExperts.finalize_weights() must run via "
-                "post_load_weights() before forward()"
-            )
-        return dsv4_mega_moe_apply(
-            self._plan,
-            self._processed_state,
-            hidden_states,
-            topk_weights,
-            topk_ids,
+        router_logits: torch.Tensor,
+        output_format: TopKOutputFormat | None = None,
+        num_token_non_padded: torch.Tensor | None = None,
+        expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None,
+        routing_correction_bias: torch.Tensor | None = None,
+        hash_indices_table: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
+    ) -> TopKOutput:
+        output_format = (
+            output_format or self.topk_config.output_format or TopKOutputFormat.STANDARD
         )
+        correction_bias = (
+            self.topk_config.correction_bias
+            if routing_correction_bias is None
+            else routing_correction_bias
+        )
+        topk_weights, topk_ids = moe_topk(
+            router_logits,
+            self.topk_config.top_k,
+            "sqrt_softplus",
+            "hash" if self.hash_routing else "topk",
+            self.topk_config.renormalize,
+            self.topk_config.routed_scaling_factor,
+            correction_bias=correction_bias,
+            hash_indices_table=hash_indices_table,
+            input_ids=input_ids,
+        )
+        if output_format == TopKOutputFormat.BYPASSED:
+            output_scale = topk_weights.sum(dim=-1, keepdim=True)
+            packed_logits = pack_topk_router_logits(
+                topk_weights,
+                topk_ids,
+                router_logits.shape[1],
+            )
+            return BypassedTopKOutput(
+                hidden_states=hidden_states,
+                router_logits=packed_logits,
+                topk_config=self.topk_config,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+                output_scale=output_scale,
+            )
+        return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
 
 def _deepseek_v4_routed_expert_quant_config(
@@ -1937,7 +1763,7 @@ class DeepseekV4MoE(nn.Module):
                 raise ValueError(
                     "DeepSeek V4 normal EP requires hidden_size divisible by 256."
                 )
-        self.hash_indices_dtype = torch.int64 if self.use_mega_moe else torch.int32
+        self.hash_indices_dtype = torch.int32
         self.gate = DeepseekV4MoEGate(
             config,
             layer_index,
@@ -1962,101 +1788,115 @@ class DeepseekV4MoE(nn.Module):
         else:
             self.shared_experts = None
 
-        if self.use_mega_moe:
-            if global_server_args_dict["moe_mxfp4_fp8_activation"]:
-                raise ValueError(
-                    "--moe-mxfp4-fp8-activation selects the FlashInfer cutlass W4A8 "
-                    "MoE; it does not apply to MegaMoE"
-                )
-            self.experts = DeepseekV4MegaMoEExperts(
-                num_experts=config.n_routed_experts,
-                num_local_experts=config.n_routed_experts // mapping.moe.ep_size,
-                top_k=config.num_experts_per_tok,
-                hidden_size=config.hidden_size,
-                intermediate_size=config.moe_intermediate_size,
-                mapping=mapping,
-                prefix=add_prefix("experts", prefix),
-                swiglu_limit=getattr(config, "swiglu_limit", None),
+        if self.use_mega_moe and global_server_args_dict["moe_mxfp4_fp8_activation"]:
+            raise ValueError(
+                "--moe-mxfp4-fp8-activation selects the FlashInfer cutlass W4A8 "
+                "MoE; it does not apply to MegaMoE"
             )
-            self.topk = None
-        else:
-            routed_quant_config, _ = _deepseek_v4_routed_expert_quant_config(
-                config, quant_config
-            )
-            self.experts = MoELayer(
-                top_k=config.num_experts_per_tok,
-                num_experts=config.n_routed_experts
-                + global_server_args_dict["ep_num_redundant_experts"],
-                hidden_size=config.hidden_size,
-                intermediate_size=config.moe_intermediate_size,
-                quant_config=routed_quant_config,
-                layer_index=layer_index,
-                prefix=prefix,
-                tp_rank=mapping.moe.tp_rank,
-                tp_size=mapping.moe.tp_size,
-                ep_rank=mapping.moe.ep_rank,
-                ep_size=mapping.moe.ep_size,
-                activation="swiglu",
-                swiglu_limit=getattr(config, "swiglu_limit", None),
-                with_bias=False,
-                # Older FlashInfer kernels require logits; use precomputed
-                # routes when the selected kernel advertises that capability.
-                routing_mode=(
-                    None
-                    if get_moe_backend().is_flashinfer_trtllm()
-                    else "precomputed_topk"
-                ),
-                routing_config={
-                    # Keep scaling at the common post-expert boundary below.
-                    # Kernel-routing backends otherwise apply the same factor
-                    # internally and the routed contribution is scaled twice.
-                    "routed_scaling_factor": 1.0,
-                    "normalize_topk_weights": config.norm_topk_prob,
-                    "correction_bias": self.gate.e_score_correction_bias,
-                    "routing_method_type": RoutingMethodType.Renormalize,
-                },
-            )
-            self.topk = TopK(
-                top_k=config.num_experts_per_tok,
-                renormalize=config.norm_topk_prob,
-                correction_bias=self.gate.e_score_correction_bias,
-                routed_scaling_factor=self.routed_scaling_factor,
-                output_format=self.experts.topk_output_format,
-            )
+        routed_quant_config, _ = _deepseek_v4_routed_expert_quant_config(
+            config, quant_config
+        )
+        self.experts = MoELayer(
+            top_k=config.num_experts_per_tok,
+            num_experts=config.n_routed_experts
+            + global_server_args_dict["ep_num_redundant_experts"],
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            quant_config=routed_quant_config,
+            layer_index=layer_index,
+            prefix=prefix,
+            tp_rank=mapping.moe.tp_rank,
+            tp_size=mapping.moe.tp_size,
+            ep_rank=mapping.moe.ep_rank,
+            ep_size=mapping.moe.ep_size,
+            activation="swiglu",
+            swiglu_limit=getattr(config, "swiglu_limit", None),
+            with_bias=False,
+            routing_mode=(
+                None if get_moe_backend().is_flashinfer_trtllm() else "precomputed_topk"
+            ),
+            routing_config={
+                "routed_scaling_factor": 1.0,
+                "normalize_topk_weights": config.norm_topk_prob,
+                "correction_bias": self.gate.e_score_correction_bias,
+                "routing_method_type": RoutingMethodType.Renormalize,
+            },
+            persistent_max_num_tokens_per_gpu=(
+                _deepseek_v4_mega_moe_max_num_tokens() if self.use_mega_moe else None
+            ),
+        )
+        self.topk = DeepseekV4TopK(
+            top_k=config.num_experts_per_tok,
+            renormalize=self._renormalize_routing_weights(),
+            correction_bias=self.gate.e_score_correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor,
+            output_format=self.experts.topk_output_format,
+            hash_routing=self.gate.tid2eid is not None,
+        )
 
-    def _select_experts(
+    def warmup(self) -> None:
+        warmup = self.experts.plan.get("warmup")
+        if warmup is not None:
+            if not self.experts._weights_processed:
+                raise RuntimeError("MoE weights must be processed before warmup")
+            warmup(self.experts.plan, self.experts)
+
+    def _routing_inputs(
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        router_logits = self.gate(hidden_states)
-        fmt = getattr(self.experts, "topk_output_format", None)
-        need_scores = fmt is not None and not fmt.is_bypassed()
-        return dsv4_select_experts(
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        if hidden_states.shape[0] == 0:
+            router_logits = hidden_states.new_empty(
+                (0, self.config.n_routed_experts), dtype=torch.float32
+            )
+        else:
+            router_logits = self.gate(hidden_states)
+        hash_indices_table = self.gate.tid2eid
+        return (
             router_logits,
-            self.config.num_experts_per_tok,
-            self.config.norm_topk_prob,
-            correction_bias=self.gate.e_score_correction_bias,
-            hash_indices_table=self.gate.tid2eid,
-            input_ids=input_ids,
-            need_scores=need_scores,
+            self.gate.e_score_correction_bias,
+            hash_indices_table,
+            input_ids if hash_indices_table is not None else None,
         )
 
-    def _make_topk_output(
+    def _renormalize_routing_weights(self) -> bool:
+        return self.config.norm_topk_prob
+
+    def _compute_topk_output(
         self,
         hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        router_scores: torch.Tensor,
-    ):
-        if not self.experts.supports_precomputed_topk:
-            router_logits = pack_topk_as_router_logits(
-                topk_weights, topk_ids, self.config.n_routed_experts
-            )
-            return BypassedTopKOutput(
-                hidden_states, router_logits, self.topk.topk_config
-            )
-        return StandardTopKOutput(topk_weights, topk_ids, router_scores)
+        input_ids: torch.Tensor | None,
+    ) -> TopKOutput:
+        router_logits, correction_bias, hash_indices_table, routing_input_ids = (
+            self._routing_inputs(hidden_states, input_ids)
+        )
+        return self.topk(
+            hidden_states,
+            router_logits,
+            routing_correction_bias=correction_bias,
+            hash_indices_table=hash_indices_table,
+            input_ids=routing_input_ids,
+        )
+
+    def _forward_routed_experts(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+    ) -> torch.Tensor:
+        return self.experts(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+            num_global_tokens=num_global_tokens,
+            max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+        )
 
     def _forward_shared_experts(
         self,
@@ -2080,33 +1920,21 @@ class DeepseekV4MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
         ctx: ForwardContext,
         comm_manager: CommManager,
     ) -> torch.Tensor:
-        if hidden_states.shape[0] == 0:
-            topk_weights = hidden_states.new_empty(
-                (0, self.config.num_experts_per_tok), dtype=torch.float32
-            )
-            topk_ids = torch.empty(
-                (0, self.config.num_experts_per_tok),
-                device=hidden_states.device,
-                dtype=torch.int64,
-            )
-        else:
-            with nvtx_range("moe_select_experts"):
-                topk_weights, topk_ids, _ = self._select_experts(
-                    hidden_states, input_ids
-                )
-
+        with nvtx_range("moe_select_experts"):
+            topk_output = self._compute_topk_output(hidden_states, input_ids)
         shared = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
             with nvtx_range("moe_mega_experts"):
-                if self.routed_scaling_factor != 1.0:
-                    topk_weights = topk_weights * self.routed_scaling_factor
-                routed = self.experts(
+                routed = self._forward_routed_experts(
                     hidden_states,
-                    topk_weights,
-                    topk_ids,
+                    topk_output,
+                    num_global_tokens,
+                    max_num_tokens_per_gpu,
                 )
             with fork.branch():
                 shared = self._forward_shared_experts(
@@ -2126,26 +1954,16 @@ class DeepseekV4MoE(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
         with nvtx_range("moe_select_experts"):
-            topk_weights, topk_ids, router_scores = self._select_experts(
-                hidden_states, input_ids
-            )
-        with nvtx_range("moe_make_topk_output"):
-            topk_output = self._make_topk_output(
-                hidden_states, topk_weights, topk_ids, router_scores
-            )
+            topk_output = self._compute_topk_output(hidden_states, input_ids)
         shared = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
             with nvtx_range("moe_experts"):
-                routed = self.experts(
-                    hidden_states=hidden_states,
-                    topk_output=topk_output,
-                    num_global_tokens=num_global_tokens,
-                    max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                routed = self._forward_routed_experts(
+                    hidden_states,
+                    topk_output,
+                    num_global_tokens,
+                    max_num_tokens_per_gpu,
                 )
-                if topk_output.format.is_bypassed() and not self.config.norm_topk_prob:
-                    routed *= topk_weights.sum(dim=-1, keepdim=True).to(routed.dtype)
-                if self.routed_scaling_factor != 1.0:
-                    routed *= self.routed_scaling_factor
             with fork.branch():
                 shared = self._forward_shared_experts(hidden_states)
         return routed + shared if shared is not None else routed
@@ -2163,6 +1981,8 @@ class DeepseekV4MoE(nn.Module):
             return self.forward_mega_moe(
                 hidden_states,
                 input_ids,
+                num_global_tokens,
+                max_num_tokens_per_gpu,
                 ctx,
                 comm_manager,
             )
@@ -3886,8 +3706,6 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         for module in self.modules():
             if isinstance(module, DeepseekV4Compressor):
                 module.process_weights_after_loading()
-            elif isinstance(module, DeepseekV4MegaMoEExperts):
-                module.finalize_weights()
             elif isinstance(module, MoELayer):
                 module.process_weights_after_loading(module)
 
@@ -3896,7 +3714,7 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         gc.collect()
         torch.cuda.empty_cache()
         for module in self.modules():
-            if isinstance(module, DeepseekV4MegaMoEExperts):
+            if isinstance(module, DeepseekV4MoE):
                 module.warmup()
         config = self.config
         tp_size = self.mapping.attn.tp_size if self.mapping else 1
