@@ -125,6 +125,44 @@ def test_mha_prefill_tile_shapes(block_m, num_warps, head_dim, window_left):
     torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_mha_prefill_deep_pipeline(dtype, head_dim):
+    """Check the compiler-gated three-tile K-ahead/V-behind schedule."""
+    device = "cuda"
+    n_q_heads, n_kv_heads, seqlen = 4, 1, 512
+    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
+        [seqlen], n_q_heads, n_kv_heads, head_dim, device, dtype
+    )
+
+    original_config = prefill.get_config
+    original_selector = prefill._select_deep_pipeline
+
+    def forced_config(**kwargs):
+        cfg = original_config(**kwargs)
+        block_m, num_warps = 256, 8
+        return cfg._replace(
+            block_m=block_m,
+            num_warps=num_warps,
+            grid=(
+                cfg.batch_size,
+                cfg.n_heads,
+                (cfg.max_seqlen + block_m - 1) // block_m,
+            ),
+        )
+
+    prefill.get_config = forced_config
+    prefill._select_deep_pipeline = lambda **_kwargs: True
+    try:
+        out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+    finally:
+        prefill.get_config = original_config
+        prefill._select_deep_pipeline = original_selector
+
+    expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim)
+    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+
+
 def test_select_llvm_fn_attrs():
     max_ilp = "amdgpu-sched-strategy=max-ilp"
 
