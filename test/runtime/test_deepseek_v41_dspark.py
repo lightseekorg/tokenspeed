@@ -516,6 +516,7 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch):
     assert windows[:, 0].count_nonzero() == 0
 
     _assert_drafter_run_writes_rows_and_drafts(adapter, windows, pool)
+    _assert_drafts_follow_their_rows(adapter, windows, pool)
 
     bonus = torch.tensor([3, 4], device="cuda:0")
     starts = torch.tensor([4, 4], device="cuda:0")
@@ -544,6 +545,97 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch):
 
 
 @torch.inference_mode()
+@torch.inference_mode()
+def _assert_drafts_follow_their_rows(adapter, windows, pool):
+    """Permuting a decode batch permutes its drafts: no row reads another's state.
+
+    Three decode requests with different bonus tokens, accept lengths and
+    windows run as ``[A, B, C]`` and as ``[C, A, B]``; each request's block
+    must come out the same in both orders. The block sampler once read the
+    drafter's strided bonus column as contiguous, which gave every row after
+    the first another row's anchor -- a single-request batch never sees that.
+    """
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
+
+    width, block, n = 6, 5, 3
+    ib = InputBuffers(n, 1024, 8, device="cuda:0")
+    drafter = DeepseekV41DSpark(
+        spec_num_tokens=width,
+        spec_num_steps=block,
+        draft_model_runner=SimpleNamespace(
+            model=adapter, mapping=adapter.mapping, device="cuda:0"
+        ),
+        attn_backend=None,
+        token_to_kv_pool=None,
+        runtime_states=None,
+        input_buffers=ib,
+        vocab_size=adapter.model.config.vocab_size,
+    )
+    drafter.wire_target(
+        SimpleNamespace(
+            set_dspark_layers_to_capture=Mock(),
+            logits_processor=SimpleNamespace(tp_group=adapter.mapping.attn.tp_group),
+        )
+    )
+    torch.manual_seed(3)
+    # The synthetic checkpoint's Markov weights are constants, which makes the
+    # bigram bias the same for every anchor; random weights make the drafts
+    # depend on which anchor each row reads.
+    for weight in (
+        adapter.model.markov_embedding.weight,
+        adapter.model.markov_projection.weight,
+    ):
+        weight.copy_(torch.randn_like(weight, dtype=torch.float32).to(weight.dtype))
+    # Positions stay inside the eight fake pages (slot = 64 + position).
+    starts = [300, 40, 380]
+    accepts = [4, 1, 6]
+    hidden = torch.randn(
+        n, width, drafter.hidden_width, dtype=torch.bfloat16, device="cuda:0"
+    )
+    tokens = torch.randint(
+        0, adapter.model.config.vocab_size, (n, width), device="cuda:0"
+    ).to(torch.int32)
+
+    def run(order):
+        positions = torch.cat(
+            [torch.arange(starts[i], starts[i] + width, device="cuda:0") for i in order]
+        )
+        meta = SimpleNamespace(
+            positions=positions,
+            swa_write_slots=_paged_slots(positions, 64),
+            request_indices=torch.arange(n, device="cuda:0").repeat_interleave(width),
+        )
+        backend = SimpleNamespace(
+            query_metadata=lambda mode: meta,
+            decoder_view=lambda: V41DecoderView(meta, None, (), None, None),
+            window_slots=lambda group, start_pos, requests: (
+                _history_slots(start_pos, 128, 64),
+                None,
+            ),
+        )
+        ctx = _ctx(None, n * width, ForwardMode.DECODE)
+        ctx.bs, ctx.num_extends = n, 0
+        ctx.attn_backend, ctx.token_to_kv_pool = backend, pool
+        windows.zero_()
+        return drafter.run(
+            base_ctx=ctx,
+            logits_output=SimpleNamespace(
+                hidden_states=hidden[order].reshape(-1, drafter.hidden_width)
+            ),
+            output_tokens=tokens[order].reshape(-1),
+            accept_lengths=torch.tensor(
+                [accepts[i] for i in order], device="cuda:0", dtype=torch.int32
+            ),
+        ).clone()
+
+    forward = run([0, 1, 2])
+    rotated = run([2, 0, 1])
+    torch.testing.assert_close(rotated, forward[[2, 0, 1]], rtol=0, atol=0)
+    # The requests differ, so identical drafts would mean the rows collapsed.
+    assert not torch.equal(forward[0], forward[1])
+    assert not torch.equal(forward[1], forward[2])
+
+
 def _assert_drafter_run_writes_rows_and_drafts(adapter, windows, pool):
     """Drive run() through a fake V4.1 backend: extend rows seed, decode rows draft."""
     from tokenspeed.runtime.execution.input_buffer import InputBuffers

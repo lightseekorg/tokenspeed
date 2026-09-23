@@ -486,10 +486,10 @@ def index_topk(
         features=None,
         platform=None,
         traits={
-            "native_indexer": native,
             "index_heads": index_heads,
             "index_k_format": index_k_format,
             "index_shards": index_shards,
+            "native_indexer": native,
         },
         solution=solution,
         override=None,

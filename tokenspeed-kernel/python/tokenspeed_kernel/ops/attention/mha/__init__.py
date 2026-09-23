@@ -123,10 +123,10 @@ def mha_plan(
 
     traits = {
         "head_dim": head_dim,
-        "sliding_window": window_left >= 0,
-        "support_logit_cap": logit_cap != 0.0,
-        "support_sinks": sinks is not None,
+        "logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
+        "sinks": sinks is not None,
+        "sliding_window": window_left >= 0,
     }
     signature = format_signature(
         q=dense_tensor_format(dtype),
@@ -209,13 +209,12 @@ def mha_prefill(
     # Select kernel
     traits = {
         "head_dim": q.shape[-1],
-        "sliding_window": window_left >= 0,
-        "support_logit_cap": logit_cap != 0.0,
-        "support_sinks": sinks is not None,
+        "logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
+        "sinks": sinks is not None,
+        "skip_softmax": skip_softmax_threshold > 0.0,
+        "sliding_window": window_left >= 0,
     }
-    if skip_softmax_threshold > 0.0:
-        traits["support_skip_softmax"] = True
     signature = _attention_format_signature(q=q, k=k, v=v)
     kernel = select_kernel(
         "attention",
@@ -344,10 +343,10 @@ def mha_extend_with_kvcache(
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
         "is_causal": is_causal,
-        "sliding_window": window_left >= 0,
-        "support_logit_cap": logit_cap != 0.0,
-        "support_sinks": sinks is not None,
+        "logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
+        "sinks": sinks is not None,
+        "sliding_window": window_left >= 0,
     }
     kernel = select_kernel(
         "attention",
@@ -468,10 +467,10 @@ def mha_decode_with_kvcache(
         "q_len": max_seqlen_q,
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
-        "sliding_window": window_left >= 0,
-        "support_logit_cap": logit_cap != 0.0,
-        "support_sinks": sinks is not None,
+        "logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
+        "sinks": sinks is not None,
+        "sliding_window": window_left >= 0,
     }
     kernel = select_kernel(
         "attention",

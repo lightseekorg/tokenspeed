@@ -97,6 +97,10 @@ class AttentionBuild:
     Placement stays in the build result rather than on the allocation owner.
     """
 
+    # Resolved full-attention choices, including hybrid sub-backends. These
+    # are startup compatibility facts; they do not expose backend internals.
+    attention_backend_name: str
+    draft_attention_backend_name: str
     attn_backend: AttentionBackend
     token_to_kv_pool: CachePool
     draft_attn_backend: AttentionBackend | None
@@ -389,6 +393,23 @@ def _resolve_full_attn_backend_name(
             has_cache_plan=True,
         )
     return softmax_attn.backend_name
+
+
+def _cache_backend_name(
+    softmax_attn: SoftmaxAttnConfig,
+    full_attn_backend_name: str | None,
+    arch: AttentionArch,
+) -> str:
+    """Identify the cache producer, including MSA's dense sub-backend.
+
+    This is startup compatibility metadata only. MSA still constructs its
+    dense/sparse routers from the original config, on the common path.
+    """
+    name = full_attn_backend_name or _get_default_backend_name(arch)
+    if isinstance(softmax_attn, MSAConfig):
+        dense_name = softmax_attn.full_attn_backend_name or "mha"
+        return f"{name}:{dense_name}"
+    return name
 
 
 def _has_state_layers(config: AttnConfig) -> bool:
@@ -1251,6 +1272,18 @@ def create_attn_components(
     )
 
     return AttentionBuild(
+        attention_backend_name=_cache_backend_name(
+            softmax_attn, target_full_attn_backend_name, model_config.attention_arch
+        ),
+        draft_attention_backend_name=(
+            _cache_backend_name(
+                draft_softmax_attn,
+                draft_full_attn_backend_name,
+                draft_model_config.attention_arch,
+            )
+            if draft_attn_backend is not None
+            else ""
+        ),
         attn_backend=backend,
         token_to_kv_pool=pool,
         draft_attn_backend=draft_attn_backend,

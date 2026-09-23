@@ -101,7 +101,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
     reduce_scatter,
 )
-from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.distributed.mapping import DenseLayerMapping, Mapping
 from tokenspeed.runtime.distributed.pp_stage import PPStageState, pp_layer_window
 from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode,
@@ -146,6 +146,12 @@ from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
     preprocess_fp8_pb_wo_weights,
 )
 from tokenspeed.runtime.layers.quantization.utils import block_dequant
+from tokenspeed.runtime.layers.shared_expert_tp import (
+    SharedExpertCommunication,
+    initialize_shared_expert_group,
+    shared_expert_mapping,
+    validate_shared_expert_settings,
+)
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader,
@@ -175,7 +181,7 @@ from tokenspeed.runtime.multimodal.inputs import (
 )
 from tokenspeed.runtime.utils import add_prefix, ceil_div, make_layers
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
@@ -241,6 +247,7 @@ class KimiLinearMLP(nn.Module):
         tp_rank: int,
         tp_size: int,
         tp_group: tuple[int, ...] | None,
+        shared_parallel: DenseLayerMapping | None,
         quant_config: QuantizationConfig | None,
         prefix: str,
         reduce_results: bool,
@@ -249,6 +256,26 @@ class KimiLinearMLP(nn.Module):
         activation_situ_linear_beta: float | None,
     ) -> None:
         super().__init__()
+        self.shared_parallel = shared_parallel
+        self.shared_communication = None
+        if self.shared_parallel is not None:
+            if intermediate_size % self.shared_parallel.tp_size:
+                raise ValueError(
+                    "Shared-expert intermediate channels must be divisible by TP size"
+                )
+            if (
+                not is_shared_expert
+                or reduce_results
+                or (tp_rank, tp_size, tp_group)
+                != (
+                    shared_parallel.tp_rank,
+                    shared_parallel.tp_size,
+                    shared_parallel.tp_group,
+                )
+            ):
+                raise ValueError(
+                    "Shared-expert TP requires matching explicit TP geometry and deferred reduction"
+                )
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -1667,12 +1694,28 @@ class KimiLinearMoE(nn.Module):
         )
 
         # Shared experts (SiTU dense MLP over the full hidden size).
+        shared_parallel = shared_expert_mapping(
+            mapping, envs.TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE.get()
+        )
         self.shared_experts = KimiLinearMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size * config.num_shared_experts,
-            tp_rank=0 if mapping.attn.dp_size > 1 else mapping.moe.tp_ep_rank,
-            tp_size=1 if mapping.attn.dp_size > 1 else mapping.moe.tp_ep_size,
-            tp_group=None if mapping.attn.dp_size > 1 else mapping.moe.tp_ep_group,
+            tp_rank=(
+                shared_parallel.tp_rank
+                if shared_parallel is not None
+                else (0 if mapping.attn.dp_size > 1 else mapping.moe.tp_ep_rank)
+            ),
+            tp_size=(
+                shared_parallel.tp_size
+                if shared_parallel is not None
+                else (1 if mapping.attn.dp_size > 1 else mapping.moe.tp_ep_size)
+            ),
+            tp_group=(
+                shared_parallel.tp_group
+                if shared_parallel is not None
+                else (None if mapping.attn.dp_size > 1 else mapping.moe.tp_ep_group)
+            ),
+            shared_parallel=shared_parallel,
             quant_config=quant_config,
             prefix=add_prefix("shared_experts", prefix),
             # TP combines shared partials in the tail; DP keeps complete local outputs.
@@ -1983,9 +2026,28 @@ class KimiLinearMoE(nn.Module):
         if max_tokens == 0:
             return prefix_sum
 
+        shared_communication = None
+        if self.shared_experts.shared_parallel is not None:
+            shared_communication = self.shared_experts.shared_communication
+            if shared_communication is None:
+                raise RuntimeError(
+                    "Shared-expert communication must be prepared before forward"
+                )
+
         with self.stream_fork.scope(
             enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
         ) as fork:
+            shared_output = None
+            if shared_communication is not None:
+                with fork.branch():
+                    # Hide gathering under local routing, but let dispatch
+                    # wait for AG alone while shared GEMMs keep running.
+                    shared_input = shared_communication.gather_inputs(
+                        hidden_states, counts
+                    )
+                    fork.record_checkpoint()
+                    shared_output = self.shared_experts(shared_input, down_out=None)
+
             if num_tokens > 0:
                 router_logits = self.gate(hidden_states)
                 topk = self.topk(
@@ -2029,6 +2091,11 @@ class KimiLinearMoE(nn.Module):
                         ),
                     )
 
+            if shared_communication is not None:
+                # Never overlap shared AG with routed communication, including
+                # the all-gather fallback and ranks with no local tokens.
+                fork.join_checkpoint()
+
             if self.execution_plan.use_mega_moe:
                 pass
             elif self.moe_alltoall is not None:
@@ -2059,6 +2126,20 @@ class KimiLinearMoE(nn.Module):
                 )
                 topk_ids, topk_weights = payloads[-2:]
 
+            if shared_communication is not None:
+                # Main has dispatched. Finish shared GEMMs before routed BMM,
+                # then let only shared reduction overlap the finite routed
+                # work. Empty owners obey the same event/collective ordering.
+                fork.join()
+                with fork.branch_after_main():
+                    shared_output = shared_communication.reduce_outputs(
+                        shared_output, num_tokens
+                    )
+                if self.execution_plan.use_mega_moe:
+                    # MegaMoE owns dispatch/combine inside the expert call;
+                    # its communication cannot overlap the shared collective.
+                    fork.join()
+
             routing = StandardTopKOutput(
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
@@ -2072,6 +2153,11 @@ class KimiLinearMoE(nn.Module):
                 max_num_tokens_per_gpu=max_tokens,
                 do_finalize=True,
             )
+
+            if shared_communication is not None:
+                # Do not allow two peer-polling collectives to occupy the GPU
+                # concurrently: combine starts only after shared RS completes.
+                fork.join()
 
             if self.execution_plan.use_mega_moe:
                 pass
@@ -2087,10 +2173,12 @@ class KimiLinearMoE(nn.Module):
             if num_tokens > 0 and self.routed_expert_norm is not None:
                 routed_output = self.routed_expert_norm(routed_output)
 
-            shared_output = None
-            with fork.branch():
-                if num_tokens > 0:
-                    shared_output = self.shared_experts(hidden_states, down_out=None)
+            if shared_communication is None:
+                with fork.branch():
+                    if num_tokens > 0:
+                        shared_output = self.shared_experts(
+                            hidden_states, down_out=None
+                        )
 
         if num_tokens == 0:
             return prefix_sum
@@ -2349,6 +2437,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 tp_rank=mapping.dense.tp_rank,
                 tp_size=mapping.dense.tp_size,
                 tp_group=mapping.dense.tp_group,
+                shared_parallel=None,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
                 is_shared_expert=False,
@@ -2839,6 +2928,12 @@ class KimiLinearModel(nn.Module):
         self.mapping = mapping
         self.quant_config = quant_config
 
+        # Agree on raw settings before any shared-expert subgroup is created.
+        shared_value = envs.TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE.get()
+        shared_parallel = validate_shared_expert_settings(mapping, shared_value)
+        if shared_parallel is not None:
+            initialize_shared_expert_group(shared_parallel)
+
         alt_stream = (
             torch.cuda.Stream(priority=-1) if torch.cuda.is_available() else None
         )
@@ -3142,17 +3237,40 @@ class KimiLinearForCausalLM(BaseCausalLM):
     model_cls = KimiLinearModel
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        shared_mlps = [
+            layer.block_sparse_moe.shared_experts
+            for layer in self.model.layers
+            if hasattr(layer, "block_sparse_moe")
+            and layer.block_sparse_moe.shared_experts.shared_parallel is not None
+        ]
+        if shared_mlps:
+            communication = shared_mlps[0].shared_communication
+            weight = shared_mlps[0].gate_up_proj.weight
+            if weight.dtype != torch.bfloat16:
+                raise ValueError("Shared-expert TP currently requires BF16 weights")
+            if communication is None:
+                communication = SharedExpertCommunication(
+                    shared_mlps[0].shared_parallel,
+                    max_num_tokens,
+                    self.config.hidden_size,
+                    weight.device,
+                )
+            elif max_num_tokens > communication.capacity:
+                raise RuntimeError("Cannot grow a prepared shared-expert workspace")
+            for mlp in shared_mlps:
+                mlp.shared_communication = communication
         routed_hidden_size = (
             self.config.routed_expert_hidden_size
             if self.config.routed_expert_hidden_size is not None
             else self.config.hidden_size
         )
-        return prepare_k3_all_reduce_buffers(
+        prepared = prepare_k3_all_reduce_buffers(
             mapping=self.mapping,
             hidden_size=self.config.hidden_size,
             routed_hidden_size=routed_hidden_size,
             max_num_tokens=max_num_tokens,
         )
+        return bool(shared_mlps) or prepared
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
         """Take the draft config's one-based completed-layer ids unchanged."""

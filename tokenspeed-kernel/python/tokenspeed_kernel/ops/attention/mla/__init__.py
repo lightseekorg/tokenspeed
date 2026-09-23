@@ -112,9 +112,9 @@ def mla_project_value_prefers_contiguous_weight(
     )
     traits = {
         "batch_size": batch_size,
-        "num_heads": heads,
-        "latent_dim": latent_dim,
-        "value_dim": value_dim,
+        "num_q_heads": heads,
+        "value_head_dim": value_dim,
+        "kv_lora_rank": latent_dim,
         "gate_kind": "sigmoid" if gated else "none",
         "inputs_contiguous": True,
     }
@@ -185,9 +185,9 @@ def mla_project_value(
     )
     traits = {
         "batch_size": batch,
-        "num_heads": heads,
-        "latent_dim": latent_dim,
-        "value_dim": value_dim,
+        "num_q_heads": heads,
+        "value_head_dim": value_dim,
+        "kv_lora_rank": latent_dim,
         "gate_kind": "none" if gate is None else "sigmoid",
         "inputs_contiguous": (
             attention.is_contiguous()
@@ -380,7 +380,6 @@ def mla_normalize_project_query(
             "output_width": output_width,
             "output_prefix_width": prefix_width,
             "output_tail_width": tail_width,
-            "split_output": split_output,
             "inputs_contiguous": all(
                 tensor.is_contiguous()
                 for tensor in (
@@ -392,6 +391,7 @@ def mla_normalize_project_query(
                 )
             ),
             "outputs_inner_contiguous": True,
+            "split_output": split_output,
         }
         try:
             return select_kernel(
@@ -580,10 +580,10 @@ def mla_prefill(
     """
     batch_size = cu_seqlens_q.shape[0] - 1
     traits = {
-        "qk_head_dim": q.shape[-1],
-        "v_head_dim": v.shape[-1],
+        "head_dim": q.shape[-1],
+        "value_head_dim": v.shape[-1],
         "is_causal": is_causal,
-        "support_logit_cap": logit_cap != 0.0,
+        "logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
     }
     signature = _attention_format_signature(q=q, k=k, v=v)
@@ -676,12 +676,12 @@ def mla_use_absorbed_extend(
     )
     traits = {
         "num_q_heads": num_q_heads,
-        "page_size": page_size,
         "qk_nope_head_dim": qk_nope_head_dim,
         "kv_lora_rank": kv_lora_rank,
         "qk_rope_head_dim": qk_rope_head_dim,
+        "page_size": page_size,
         "is_causal": True,
-        "support_logit_cap": False,
+        "logit_cap": False,
         "return_lse": False,
     }
     if max_seqlen_q is not None:
@@ -755,14 +755,14 @@ def mla_extend_with_kvcache(
     """
     batch_size = cache_seqlens.shape[0]
     traits = {
-        "page_size": kv_cache.shape[1],
-        "num_q_heads": q.shape[1],
         "max_seqlen_q": max_seqlen_q,
+        "num_q_heads": q.shape[1],
         "qk_nope_head_dim": qk_nope_head_dim,
         "kv_lora_rank": kv_lora_rank,
         "qk_rope_head_dim": qk_rope_head_dim,
+        "page_size": kv_cache.shape[1],
         "is_causal": is_causal,
-        "support_logit_cap": logit_cap != 0.0,
+        "logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
     }
     signature = _attention_format_signature(q=q, kv_cache=kv_cache)
@@ -872,16 +872,16 @@ def supports_mla_decode_query_blocks(
                 kv_cache=dense_tensor_format(kv_dtype),
             ),
             traits={
-                "sliding_window": sliding_window,
-                "page_size": page_size,
                 "q_len": q_len,
                 "num_q_heads": num_q_heads,
                 "kv_lora_rank": kv_lora_rank,
                 "qk_rope_head_dim": qk_rope_head_dim,
-                "support_logit_cap": False,
-                "return_lse": False,
-                "block_on_query_axis": True,
+                "page_size": page_size,
                 "noncausal_block_size": q_len,
+                "block_on_query_axis": True,
+                "logit_cap": False,
+                "return_lse": False,
+                "sliding_window": sliding_window,
             },
             solution=solution,
         )
@@ -1055,24 +1055,23 @@ def mla_decode_with_kvcache(
 
     traits = {
         "batch_size": q.shape[0],
-        "page_size": kv_cache.shape[1],
         "q_len": q.shape[1],
         "num_q_heads": q.shape[2],
-        "batch_size_div_64": q.shape[0] % 64 == 0,
         "qk_nope_head_dim": qk_nope_head_dim,
         "kv_lora_rank": kv_lora_rank,
         "qk_rope_head_dim": qk_rope_head_dim,
-        "support_logit_cap": logit_cap != 0.0,
-        "return_lse": return_lse,
-        "sliding_window": window_left >= 0,
-        # A proposal block reaches a kernel one of two ways: flattened to one
-        # row per position on the batch axis, or whole on the query axis. A
-        # kernel reads one or the other, never both.
-        "block_on_query_axis": q.shape[1] == noncausal_block_size,
+        "page_size": kv_cache.shape[1],
         # Greater than one only for a block drafter's non-causal proposal, so
         # a kernel can declare itself for that case without also volunteering
         # for ordinary decode or target verify.
         "noncausal_block_size": noncausal_block_size,
+        # A proposal block reaches a kernel one of two ways: flattened to one
+        # row per position on the batch axis, or whole on the query axis. A
+        # kernel reads one or the other, never both.
+        "block_on_query_axis": q.shape[1] == noncausal_block_size,
+        "logit_cap": logit_cap != 0.0,
+        "return_lse": return_lse,
+        "sliding_window": window_left >= 0,
     }
     if projected_value:
         traits.update(

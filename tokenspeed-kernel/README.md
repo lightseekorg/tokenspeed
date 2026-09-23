@@ -141,8 +141,10 @@ iteration.
   traces with `tokenspeed merge-traces`.
 
 Registration-level benchmarks combine operation-owned input and correctness
-logic with graph-replay device timing. Pull request CI can compare compatible
-cases from the merge base and candidate revision. See the
+logic with graph-replay device timing. Each operation family and mode
+contributes one benchmark generator; suites reference them by family, mode,
+and parameters. Pull request CI compares compatible cases between the merge
+base and candidate revision. See the
 [benchmark documentation](benchmarks/README.md) for the harness and suite
 contract, and the [CI documentation](../test/ci/README.md#registration-level-kernel-benchmarks)
 for workflow behavior and runner requirements.

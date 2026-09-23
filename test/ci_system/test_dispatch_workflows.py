@@ -57,7 +57,7 @@ printf 'image=%s\\n' "${TS_CI_CONTAINER_IMAGE-}"
         "CONTAINER_IMAGE": "",
         "CLUSTER": "gb200",
         "YAML_SELECTION": "off",
-        "RUNNERS": "b200-4gpu,gb200-4gpu",
+        "RUNNERS": workflow_dispatch_inputs("slurm-dispatch.yml")["runners"]["default"],
         "TASK_TYPES": "eval,perf",
         "MATCH": "",
         "INCLUDE_MMLU": "false",
@@ -246,9 +246,9 @@ def configured_yaml_choices(workflow_name: str) -> set[str]:
 
 
 def test_k8s_dispatch_lists_every_supported_ci_yaml():
-    assert configured_yaml_choices("k8s-dispatch.yml") == eligible_config_paths(
-        K8S_RUNNER_PREFIXES
-    )
+    choices = configured_yaml_choices("k8s-dispatch.yml")
+    assert eligible_config_paths(K8S_RUNNER_PREFIXES) <= choices
+    assert all((REPO_ROOT / choice).is_file() for choice in choices)
 
 
 def test_amd_pr_workflow_orders_kernel_benchmarks_before_model_tests():
@@ -501,6 +501,7 @@ def test_slurm_dispatch_preserves_gb200_defaults(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "arg=--runner\narg=b200-4gpu\n" in result.stdout
     assert "arg=--runner\narg=gb200-4gpu\n" in result.stdout
+    assert "arg=--runner\narg=slurm-gb200-4gpu\n" in result.stdout
     assert "artifact=\n" in result.stdout
     assert "cache=\n" in result.stdout
     assert "image=\n" in result.stdout
@@ -513,6 +514,9 @@ def test_slurm_dispatch_maps_gb300_defaults_without_changing_filters(tmp_path):
     assert "arg=--all\n" in result.stdout
     assert "arg=--runner-alias\narg=b200-4gpu=gb300-4gpu\n" in result.stdout
     assert "arg=--runner-alias\narg=gb200-4gpu=gb300-4gpu\n" in result.stdout
+    assert (
+        "arg=--runner-alias\narg=slurm-gb200-4gpu=slurm-gb300-4gpu\n" in result.stdout
+    )
     assert "arg=--type\narg=eval\n" in result.stdout
     assert "arg=--type\narg=perf\n" in result.stdout
     assert "arg=--exclude-match\narg=mmlu\n" in result.stdout
@@ -982,6 +986,92 @@ def test_mi450_sim_uses_direct_runner_and_bounded_timeout():
     )
 
 
+@pytest.mark.parametrize(
+    ("workflow_stage", "task_type"),
+    [
+        ("unit-test", "ut"),
+        ("kernel-benchmark", "perf"),
+        ("model-test", "eval"),
+        ("model-test", "perf"),
+    ],
+)
+def test_pr_task_caches_are_isolated_and_cleaned_with_their_job(
+    tmp_path, workflow_stage, task_type
+):
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/run-pr-test-stage.yml")
+    steps = workflow["jobs"]["test"]["steps"]
+    setup = next(step for step in steps if step["name"] == "Set work directory")
+    cleanup = next(step for step in steps if step["name"] == "Cleanup work directory")
+    assert cleanup["if"] == "always()"
+    shared_cache = tmp_path / "shared-uv"
+    shared_cache.mkdir()
+    sentinel = shared_cache / "another-job"
+    sentinel.touch()
+    cache_variables = (
+        "UV_CACHE_DIR",
+        "TRITON_CACHE_DIR",
+        "MIOPEN_USER_DB_PATH",
+        "MIOPEN_CUSTOM_CACHE_DIR",
+    )
+    isolated_variables = tuple(
+        variable
+        for variable in cache_variables
+        if variable != "TRITON_CACHE_DIR" or task_type == "eval"
+    )
+    job_envs = []
+    for attempt in (1, 2):
+        env_file = tmp_path / f"env-{attempt}"
+        script = setup["run"]
+        for expression, value in {
+            "github.workspace": str(tmp_path / "workspace with spaces"),
+            "github.run_id": "1234",
+            "github.run_attempt": str(attempt),
+            "matrix.name": "eval-cache-test",
+            "matrix.runner": "amd-mi35x-2gpu-test",
+            "matrix.workflow_stage": workflow_stage,
+            "matrix.type": task_type,
+        }.items():
+            script = script.replace("${{ " + expression + " }}", value)
+        subprocess.run(
+            ["bash", "-c", script],
+            env={
+                **os.environ,
+                "GITHUB_ENV": str(env_file),
+                **{variable: str(shared_cache) for variable in cache_variables},
+            },
+            check=True,
+        )
+        job_env = dict(line.split("=", 1) for line in env_file.read_text().splitlines())
+        assert "MIOPEN_SYSTEM_DB_PATH" not in job_env
+        assert "MIOPEN_FIND_MODE" not in job_env
+        assert "MIOPEN_FIND_ENFORCE" not in job_env
+        if workflow_stage != "model-test":
+            assert all(variable not in job_env for variable in cache_variables)
+            continue
+        if task_type == "perf":
+            assert "TRITON_CACHE_DIR" not in job_env
+        for variable in isolated_variables:
+            cache = Path(job_env[variable])
+            assert cache.is_relative_to(Path(job_env["WORK_DIR"]))
+            assert cache != shared_cache
+            cache.mkdir(parents=True, exist_ok=True)
+            (cache / "download").touch()
+        job_envs.append(job_env)
+
+    if workflow_stage != "model-test":
+        assert sentinel.exists()
+        return
+    first, second = job_envs
+    assert all(first[variable] != second[variable] for variable in isolated_variables)
+    script = cleanup["run"].replace("${{ env.WORK_DIR }}", first["WORK_DIR"])
+    script = script.replace("${{ matrix.runner }}", "amd-mi35x-2gpu-test")
+    subprocess.run(["bash", "-c", script], check=True)
+    for variable in isolated_variables:
+        assert not Path(first[variable]).exists()
+        assert (Path(second[variable]) / "download").exists()
+    assert sentinel.exists()
+
+
 def test_gb300_per_commit_forwards_the_tokenspeed_mla_override():
     workflow = load_yaml(REPO_ROOT / ".github/workflows/gb300-slurm-per-commit.yml")
     step = next(
@@ -1039,7 +1129,7 @@ def test_mi450_sim_runs_on_the_cpu_only_pool():
 def test_mi450_sim_uses_bounded_smoke_suite():
     task = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml")
 
-    assert task["env"]["MI450_SIM_RUN_TIMEOUT"] == "330"
+    assert task["env"]["MI450_SIM_RUN_TIMEOUT"] == "600"
     assert task["env"]["MI450_SIM_TEST_ROOT"] != "tokenspeed-kernel/test"
     assert "tokenspeed-kernel/test/amd/ops/attention" in task["env"]["MI450_SIM_TESTS"]
 

@@ -119,6 +119,7 @@ def _plan(policy: str):
         swiglu_form=None,
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
 
 

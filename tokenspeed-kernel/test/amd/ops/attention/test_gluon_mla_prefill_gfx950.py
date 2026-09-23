@@ -165,12 +165,14 @@ def test_mla_prefill_gluon_launch_runtime_bound(require, monkeypatch, dtype):
 
             return launch
 
-    monkeypatch.setattr(prefill, "_mla_prefill_kernel", RecordLaunch())
+    monkeypatch.setattr(prefill, "gluon_mla_prefill_gfx950", RecordLaunch())
     for tokens in (144, 160, 256, 272, 512, 2048, 8192, 16384):
         q = torch.empty((tokens, 12, 192), dtype=dtype, device="meta")
         v = torch.empty((tokens, 12, 128), dtype=dtype, device="meta")
         cu = torch.empty((2,), dtype=torch.int32, device="meta")
-        prefill.gluon_mla_prefill_gfx950(q, q, v, cu, cu, 65536, 65536, 192**-0.5)
+        prefill.launch_gluon_mla_prefill_gfx950(
+            q, q, v, cu, cu, 65536, 65536, 192**-0.5
+        )
         assert launches[-1]["max_seqlen_q"] == (
             tokens if dtype in _FP8_DTYPES else 65536
         )
@@ -188,7 +190,7 @@ def test_mla_prefill_gluon_fp8_reuses_kernel_across_query_sizes(
     require("attention", "mla_prefill", "gluon", dtype, "q")
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla import prefill
 
-    original = prefill._mla_prefill_kernel
+    original = prefill.gluon_mla_prefill_gfx950
     compiled = set()
 
     class RecordKernel:
@@ -202,14 +204,14 @@ def test_mla_prefill_gluon_fp8_reuses_kernel_across_query_sizes(
 
             return launch
 
-    monkeypatch.setattr(prefill, "_mla_prefill_kernel", RecordKernel())
+    monkeypatch.setattr(prefill, "gluon_mla_prefill_gfx950", RecordKernel())
     k = torch.zeros((128, 12, 192), dtype=dtype, device=device)
     v = torch.zeros((128, 12, 128), dtype=dtype, device=device)
     cu_kv = torch.tensor([0, 128], dtype=torch.int32, device=device)
     for tokens in (144, 272, 512, 2048, 8192, 16384):
         q = torch.zeros((tokens, 12, 192), dtype=dtype, device=device)
         cu_q = torch.tensor([0, tokens], dtype=torch.int32, device=device)
-        prefill.gluon_mla_prefill_gfx950(
+        prefill.launch_gluon_mla_prefill_gfx950(
             q, k, v, cu_q, cu_kv, tokens, 128, 192**-0.5, is_causal=is_causal
         )
     assert len(compiled) == 1

@@ -306,6 +306,7 @@ class StandardTopKOutput(NamedTuple):
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
     router_logits: torch.Tensor | None
+    output_scale: float | torch.Tensor = 1.0
 
     @property
     def format(self) -> TopKOutputFormat:
@@ -320,6 +321,7 @@ class BypassedTopKOutput(NamedTuple):
     topk_config: TopKConfig
     num_token_non_padded: torch.Tensor | None = None
     expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None
+    output_scale: float | torch.Tensor = 1.0
 
     @property
     def format(self) -> TopKOutputFormat:
@@ -329,6 +331,11 @@ class BypassedTopKOutput(NamedTuple):
 @runtime_checkable
 class TopKOutput(Protocol):
     """Protocol for top-k outputs in different formats."""
+
+    @property
+    def output_scale(self) -> float | torch.Tensor:
+        """Post-kernel scale to apply to the routed output."""
+        ...
 
     @property
     def format(self) -> TopKOutputFormat:

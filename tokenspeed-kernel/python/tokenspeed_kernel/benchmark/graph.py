@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 import statistics
 import time
@@ -51,20 +52,16 @@ GraphBenchmarkPhase = Literal[
 
 @dataclass(frozen=True)
 class GraphBenchmarkConfig:
-    """Fixed work and sampling configuration for a graph benchmark."""
+    """Fixed warmup configuration for graph benchmarks."""
 
-    calls_per_graph: int
     eager_warmup_iterations: int
     replay_warmup_iterations: int
-    measurement_blocks: int
 
     def __post_init__(self) -> None:
-        _validate_positive_int("calls_per_graph", self.calls_per_graph)
         _validate_positive_int("eager_warmup_iterations", self.eager_warmup_iterations)
         _validate_nonnegative_int(
             "replay_warmup_iterations", self.replay_warmup_iterations
         )
-        _validate_positive_int("measurement_blocks", self.measurement_blocks)
 
 
 @dataclass(frozen=True)
@@ -72,13 +69,11 @@ class PreparedInvocation:
     """A graph-capturable call and its reset hook.
 
     ``reset`` restores static device state before each eager call, capture, and
-    replay. It is always called outside the timed event interval. Setting
-    ``repeat_safe`` confirms that multiple calls may be captured in one graph.
+    replay. It is always called outside the timed event interval.
     """
 
     invoke: Callable[[], object]
     reset: Callable[[], None] | None = None
-    repeat_safe: bool = False
 
 
 @dataclass(frozen=True)
@@ -91,7 +86,6 @@ class GraphMeasurement:
     min_us: float
     max_us: float
     relative_mad: float
-    calls_per_graph: int
     eager_warmup_iterations: int
     replay_warmup_iterations: int
     warmup_time_ms: float
@@ -231,7 +225,6 @@ class GraphTimer:
     ) -> None:
         self.config = config
         self._backend = backend or _TorchCudaBackend()
-        self._stream: object | None = None
         self._cache_clear_buffer: object | None = None
 
     def measure(
@@ -239,21 +232,23 @@ class GraphTimer:
         prepared: PreparedInvocation,
         *,
         cold_cache: bool,
+        measurement_blocks: int,
     ) -> GraphMeasurement:
         """Capture and measure one prepared invocation.
 
         Cold-cache timing clears the backend cache before every invocation and
-        excludes that clear from each reported device interval.
+        excludes that clear from each reported device interval. The measurement
+        count applies only to this call, so one timer can serve cases with
+        different sample counts.
         """
-        if self.config.calls_per_graph > 1 and prepared.repeat_safe is not True:
-            cause = ValueError(
-                "calls_per_graph > 1 requires an invocation with repeat_safe=True"
-            )
+        try:
+            _validate_positive_int("measurement_blocks", measurement_blocks)
+        except ValueError as error:
             raise GraphBenchmarkError(
                 "configuration",
-                "calls_per_graph exceeds one while repeat_safe is false",
-                cause=cause,
-            ) from cause
+                str(error),
+                cause=error,
+            ) from error
 
         backend = self._backend
         try:
@@ -266,14 +261,13 @@ class GraphTimer:
             ) from error
 
         graph: object | None = None
-        active_error: BaseException | None = None
-
         try:
             with torch.no_grad():
                 warmup_started = backend.monotonic()
                 stream, event_pairs = self._warm_up(
                     prepared,
                     cold_cache=cold_cache,
+                    measurement_blocks=measurement_blocks,
                 )
                 warmup_time_ms = _elapsed_wall_ms(backend, warmup_started)
 
@@ -281,13 +275,16 @@ class GraphTimer:
                 graph = self._capture(
                     prepared,
                     stream,
-                    event_pairs,
-                    cold_cache=cold_cache,
                 )
                 capture_time_ms = _elapsed_wall_ms(backend, capture_started)
 
                 first_replay_started = backend.monotonic()
-                self._first_replay(prepared, graph, stream)
+                self._first_replay(
+                    prepared,
+                    graph,
+                    stream,
+                    cold_cache=cold_cache,
+                )
                 first_replay_time_ms = _elapsed_wall_ms(backend, first_replay_started)
 
                 measurement_started = backend.monotonic()
@@ -297,69 +294,47 @@ class GraphTimer:
                     stream,
                     event_pairs,
                     cold_cache=cold_cache,
+                    measurement_blocks=measurement_blocks,
                 )
                 measurement_time_ms = _elapsed_wall_ms(backend, measurement_started)
-
-                return _summarize(
-                    samples_us,
-                    calls_per_graph=self.config.calls_per_graph,
-                    eager_warmup_iterations=self.config.eager_warmup_iterations,
-                    replay_warmup_iterations=self.config.replay_warmup_iterations,
-                    warmup_time_ms=warmup_time_ms,
-                    capture_time_ms=capture_time_ms,
-                    first_replay_time_ms=first_replay_time_ms,
-                    measurement_time_ms=measurement_time_ms,
-                )
-        except GraphBenchmarkError as error:
-            active_error = error
+        except BaseException:
+            # The phase error is the interesting one; graph release is best effort.
+            if graph is not None:
+                with contextlib.suppress(Exception):
+                    backend.cleanup_graph(graph)
             raise
+
+        try:
+            backend.cleanup_graph(graph)
         except Exception as error:
-            active_error = error
             raise GraphBenchmarkError(
-                "warmup",
-                "failed to initialize the graph benchmark",
+                "cleanup",
+                "failed to release the captured graph",
                 cause=error,
             ) from error
-        finally:
-            if active_error is not None and self._stream is not None:
-                failed_stream = self._stream
-                self._stream = None
-                try:
-                    backend.synchronize_stream(failed_stream)
-                except Exception as error:  # noqa: BLE001
-                    active_error.add_note(f"failed stream drain also failed: {error}")
-            if graph is not None:
-                try:
-                    backend.cleanup_graph(graph)
-                except Exception as error:
-                    self._stream = None
-                    if active_error is not None:
-                        active_error.add_note(f"graph cleanup also failed: {error}")
-                    else:
-                        raise GraphBenchmarkError(
-                            "cleanup",
-                            "failed to release the captured graph",
-                            cause=error,
-                        ) from error
+
+        return _summarize(
+            samples_us,
+            eager_warmup_iterations=self.config.eager_warmup_iterations,
+            replay_warmup_iterations=self.config.replay_warmup_iterations,
+            warmup_time_ms=warmup_time_ms,
+            capture_time_ms=capture_time_ms,
+            first_replay_time_ms=first_replay_time_ms,
+            measurement_time_ms=measurement_time_ms,
+        )
 
     def _warm_up(
         self,
         prepared: PreparedInvocation,
         *,
         cold_cache: bool,
+        measurement_blocks: int,
     ) -> tuple[object, list[tuple[object, object]]]:
         backend = self._backend
         try:
-            source_stream = backend.current_stream()
-            if self._stream is None:
-                self._stream = backend.new_stream()
-            stream = self._stream
-            backend.wait_stream(stream, source_stream)
-            event_count = (
-                self.config.calls_per_graph
-                if cold_cache
-                else self.config.measurement_blocks
-            )
+            stream = backend.new_stream()
+            backend.wait_stream(stream, backend.current_stream())
+            event_count = 1 if cold_cache else measurement_blocks
             event_pairs = [
                 (backend.new_event(), backend.new_event()) for _ in range(event_count)
             ]
@@ -391,9 +366,6 @@ class GraphTimer:
         self,
         prepared: PreparedInvocation,
         stream: object,
-        event_pairs: list[tuple[object, object]],
-        *,
-        cold_cache: bool,
     ) -> object:
         backend = self._backend
         graph: object | None = None
@@ -408,30 +380,15 @@ class GraphTimer:
                 stream,
                 capture_error_mode="global",
             ):
-                if cold_cache:
-                    for start, end in event_pairs:
-                        self._clear_cache()
-                        backend.record_event(start, stream)
-                        prepared.invoke()
-                        backend.record_event(end, stream)
-                else:
-                    for _ in range(self.config.calls_per_graph):
-                        prepared.invoke()
+                # One graph replay is one operation sample. Timing events stay
+                # outside the graph so reset and cache clearing remain untimed.
+                prepared.invoke()
             backend.synchronize_stream(stream)
             return graph
         except Exception as error:
             if graph is not None:
-                try:
-                    backend.synchronize_stream(stream)
-                except Exception as synchronize_error:  # noqa: BLE001
-                    error.add_note(
-                        f"partial graph stream drain failed: {synchronize_error}"
-                    )
-                self._stream = None
-                try:
+                with contextlib.suppress(Exception):
                     backend.cleanup_graph(graph)
-                except Exception as cleanup_error:  # noqa: BLE001
-                    error.add_note(f"partial graph cleanup failed: {cleanup_error}")
             raise GraphBenchmarkError(
                 "capture",
                 "process-wide graph capture failed",
@@ -443,11 +400,15 @@ class GraphTimer:
         prepared: PreparedInvocation,
         graph: object,
         stream: object,
+        *,
+        cold_cache: bool,
     ) -> None:
         backend = self._backend
         try:
             with backend.use_stream(stream):
                 _reset(prepared)
+                if cold_cache:
+                    self._clear_cache()
                 backend.replay(graph)
             backend.synchronize_stream(stream)
         except Exception as error:
@@ -465,12 +426,15 @@ class GraphTimer:
         event_pairs: list[tuple[object, object]],
         *,
         cold_cache: bool,
+        measurement_blocks: int,
     ) -> tuple[float, ...]:
         backend = self._backend
         try:
             with backend.use_stream(stream):
                 for _ in range(self.config.replay_warmup_iterations):
                     _reset(prepared)
+                    if cold_cache:
+                        self._clear_cache()
                     backend.replay(graph)
             backend.synchronize_stream(stream)
 
@@ -479,7 +443,8 @@ class GraphTimer:
                     prepared,
                     graph,
                     stream,
-                    event_pairs,
+                    event_pairs[0],
+                    measurement_blocks=measurement_blocks,
                 )
 
             with backend.use_stream(stream):
@@ -493,12 +458,11 @@ class GraphTimer:
             samples: list[float] = []
             for start, end in event_pairs:
                 elapsed_ms = backend.elapsed_time_ms(start, end)
-                sample_us = elapsed_ms * 1000.0 / self.config.calls_per_graph
+                sample_us = elapsed_ms * 1000.0
                 if not math.isfinite(sample_us) or sample_us <= 0.0:
                     raise ValueError(
                         "device event produced an invalid per-invocation sample "
-                        f"({sample_us!r} us); increase calls_per_graph if the "
-                        "operation is below the event timer resolution"
+                        f"({sample_us!r} us)"
                     )
                 samples.append(sample_us)
             return tuple(samples)
@@ -514,26 +478,29 @@ class GraphTimer:
         prepared: PreparedInvocation,
         graph: object,
         stream: object,
-        event_pairs: list[tuple[object, object]],
+        event_pair: tuple[object, object],
+        *,
+        measurement_blocks: int,
     ) -> tuple[float, ...]:
         backend = self._backend
+        start, end = event_pair
         samples: list[float] = []
-        for _ in range(self.config.measurement_blocks):
+        for _ in range(measurement_blocks):
             with backend.use_stream(stream):
                 _reset(prepared)
+                self._clear_cache()
+                backend.record_event(start, stream)
                 backend.replay(graph)
+                backend.record_event(end, stream)
             backend.synchronize_stream(stream)
 
-            call_samples: list[float] = []
-            for start, end in event_pairs:
-                sample_us = backend.elapsed_time_ms(start, end) * 1000.0
-                if not math.isfinite(sample_us) or sample_us <= 0.0:
-                    raise ValueError(
-                        "device event produced an invalid per-invocation sample "
-                        f"({sample_us!r} us)"
-                    )
-                call_samples.append(sample_us)
-            samples.append(statistics.fmean(call_samples))
+            sample_us = backend.elapsed_time_ms(start, end) * 1000.0
+            if not math.isfinite(sample_us) or sample_us <= 0.0:
+                raise ValueError(
+                    "device event produced an invalid per-invocation sample "
+                    f"({sample_us!r} us)"
+                )
+            samples.append(sample_us)
         return tuple(samples)
 
     def _clear_cache(self) -> None:
@@ -548,12 +515,12 @@ def _reset(prepared: PreparedInvocation) -> None:
 
 
 def _validate_positive_int(name: str, value: int) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+    if not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
 
 
 def _validate_nonnegative_int(name: str, value: int) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if not isinstance(value, int) or value < 0:
         raise ValueError(f"{name} must be a nonnegative integer")
 
 
@@ -575,7 +542,6 @@ def _percentile(sorted_values: tuple[float, ...], percentile: float) -> float:
 def _summarize(
     samples_us: tuple[float, ...],
     *,
-    calls_per_graph: int,
     eager_warmup_iterations: int,
     replay_warmup_iterations: int,
     warmup_time_ms: float,
@@ -596,7 +562,6 @@ def _summarize(
         min_us=sorted_samples[0],
         max_us=sorted_samples[-1],
         relative_mad=mad_us / median_us,
-        calls_per_graph=calls_per_graph,
         eager_warmup_iterations=eager_warmup_iterations,
         replay_warmup_iterations=replay_warmup_iterations,
         warmup_time_ms=warmup_time_ms,

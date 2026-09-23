@@ -20,6 +20,7 @@
 
 #include "scheduler/scheduler.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -129,7 +130,10 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
         return std::nullopt;
     }
     coordinator_.QueueCachedBlocksForStore(progress.prefix_hashes);
-    coordinator_.QueueLatestSnapshotBlocksForStore(progress.prefix_hashes);
+    const auto prefill_hashes = std::span<const std::string>{progress.prefix_hashes}.first(
+        std::min(progress.prefix_hashes.size(),
+                 static_cast<std::size_t>(request.PrefillSize() / coordinator_.PrefixGranularity())));
+    coordinator_.QueueLatestSnapshotBlocksForStore(prefill_hashes);
     // The request's pages are released right after this (FinishEvent); the
     // pinned ticket keeps them cached and unevictable until the copy ACKs.
     return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);

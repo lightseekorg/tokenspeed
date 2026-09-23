@@ -402,10 +402,10 @@ def kimi3_latent_projection(
         )
     if solution == "gluon_smallm":
         from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
-            gluon_mm_a16w16_mfma_lds_smallm_gfx950,
+            launch_gluon_mm_a16w16_splitk_gfx950,
         )
 
-        return gluon_mm_a16w16_mfma_lds_smallm_gfx950(
+        return launch_gluon_mm_a16w16_splitk_gfx950(
             hidden_states,
             weight,
             hidden_states.dtype,
@@ -413,10 +413,10 @@ def kimi3_latent_projection(
         )
     if solution == "gluon_mediumm":
         from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
-            gluon_mm_a16w16_mfma_lds_mediumm_gfx950,
+            launch_gluon_mm_a16w16_medium_gfx950,
         )
 
-        return gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
+        return launch_gluon_mm_a16w16_medium_gfx950(
             hidden_states,
             weight,
             hidden_states.dtype,
@@ -424,10 +424,10 @@ def kimi3_latent_projection(
         )
     if solution == "gluon_largem":
         from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
-            gluon_mm_a16w16_largem_gfx950,
+            launch_gluon_mm_a16w16_prefill_gfx950,
         )
 
-        output = gluon_mm_a16w16_largem_gfx950(
+        output = launch_gluon_mm_a16w16_prefill_gfx950(
             hidden_states,
             weight,
             hidden_states.dtype,

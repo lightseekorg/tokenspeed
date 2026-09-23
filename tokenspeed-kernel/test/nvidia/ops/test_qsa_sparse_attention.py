@@ -649,6 +649,108 @@ def test_qsa_sparse_attention_blackwell_long_context_tail_replay(
 
 
 @pytest.mark.parametrize(
+    ("cache_dtype", "splits", "query_rows_per_cta"),
+    [
+        (torch.bfloat16, 4, 1),
+        (torch.bfloat16, 8, 1),
+        (torch.bfloat16, 16, 1),
+        (torch.float8_e4m3fn, 4, 1),
+        (torch.float8_e4m3fn, 8, 1),
+        (torch.float8_e4m3fn, 16, 1),
+        (torch.bfloat16, 1, 2),
+        (torch.bfloat16, 1, 4),
+    ],
+)
+def test_qsa_sparse_attention_blackwell_changed_kv_replay(
+    device: str,
+    monkeypatch: pytest.MonkeyPatch,
+    cache_dtype: torch.dtype,
+    splits: int,
+    query_rows_per_cta: int,
+) -> None:
+    """KV staging and partial query tiles must observe changes on graph replay."""
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("cluster QSA sparse attention requires NVIDIA SM100 or SM103")
+    import tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse as sparse_module
+
+    if (
+        splits == 16
+        and sparse_module._wide_cluster_capacity(torch.cuda.current_device()) == 0
+    ):
+        pytest.skip("the device cannot launch a sixteen-CTA cluster")
+
+    def select_config(
+        num_rows: int,
+        head_tiles_per_row: int,
+        bf16_kv: bool,
+        sm_count: int,
+        wide_cluster_capacity: int,
+    ) -> tuple[int, int, int, bool]:
+        del num_rows, head_tiles_per_row, bf16_kv, sm_count, wide_cluster_capacity
+        slots = 2 if splits == 1 else (3 if splits == 16 else 1)
+        return query_rows_per_cta, splits, slots, splits == 1
+
+    monkeypatch.setattr(sparse_module, "_select_launch_config", select_config)
+    torch.manual_seed(217 + splits)
+    rows, q_heads, kv_heads, cache_slots = 3, 24, 2, 4096
+    q = torch.randn(rows, q_heads, 512, device=device, dtype=torch.bfloat16)[..., ::2]
+    k_cache = (
+        torch.randn(cache_slots, kv_heads, 256, device=device, dtype=torch.bfloat16)
+        * 0.25
+    ).to(cache_dtype)
+    v_cache = (torch.randn_like(k_cache, dtype=torch.bfloat16) * 0.25).to(cache_dtype)
+    selected = torch.randint(
+        1, cache_slots, (rows, 4102), device=device, dtype=torch.int32
+    )[:, ::2]
+    selected[:, 7::11] = -1
+    selected[:, 9::17] = 0
+    selected[:, 19] = selected[:, 20]
+    selected[-1].fill_(-1)
+    v_cache[0].fill_(256)
+    kwargs = {
+        "scale": 1 / 16,
+        "max_seqlen_q": 1,
+        "metadata_capacity_rows": None,
+        "k_scale": 1.75,
+        "v_scale": 0.25,
+        "override": "cute_dsl_blackwell_qsa_sparse_attention",
+        "solution": None,
+    }
+    qsa_sparse_attention(q, k_cache, v_cache, selected, **kwargs)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = qsa_sparse_attention(q, k_cache, v_cache, selected, **kwargs)
+    graph.replay()
+    torch.cuda.synchronize()
+    previous = output.clone()
+    for update in range(2):
+        # Keep query and indices fixed so the output change must come from KV.
+        k_cache.copy_(
+            (torch.randn_like(k_cache, dtype=torch.bfloat16) * 0.35).to(cache_dtype)
+        )
+        v_cache.copy_(
+            (
+                torch.randn_like(v_cache, dtype=torch.bfloat16) * 0.35
+                + 0.5 * (update + 1)
+            ).to(cache_dtype)
+        )
+        v_cache[0].fill_(256)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = _reference(q, k_cache, v_cache, selected, 1 / 16, 1.75, 0.25)
+        torch.testing.assert_close(output, expected, rtol=0.02, atol=0.002)
+        assert torch.isfinite(output).all()
+        assert not torch.equal(output[:-1], previous[:-1])
+        assert torch.count_nonzero(output[-1]).item() == 0
+        previous.copy_(output)
+    selected.fill_(-1)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(output).item() == 0
+
+
+@pytest.mark.parametrize(
     ("num_clusters", "capacity", "splits"),
     [(1, 7, 16), (7, 7, 16), (8, 7, 8), (1, 0, 8), (9, 7, 4)],
 )
@@ -662,6 +764,34 @@ def test_qsa_sparse_attention_blackwell_cluster_capacity(
     from tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse import _num_splits
 
     assert _num_splits(num_clusters, capacity) == splits
+
+
+@pytest.mark.parametrize(
+    ("rows", "head_tiles", "bf16", "sm_count", "expected"),
+    [
+        (32, 1, True, 152, (1, 4, 2, True)),
+        (64, 1, True, 152, (1, 2, 2, True)),
+        (128, 1, True, 152, (1, 1, 2, True)),
+        (256, 1, True, 152, (1, 1, 2, True)),
+        (512, 1, True, 152, (2, 1, 2, True)),
+        (513, 1, True, 152, (2, 1, 2, True)),
+        (128, 4, True, 152, (2, 1, 2, True)),
+        (512, 1, True, 80, (4, 1, 2, True)),
+        (512, 1, False, 152, (1, 4, 1, False)),
+    ],
+)
+def test_qsa_sparse_attention_blackwell_output_tiling(
+    rows: int,
+    head_tiles: int,
+    bf16: bool,
+    sm_count: int,
+    expected: tuple[int, int, int, bool],
+) -> None:
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("CTA tiling requires NVIDIA SM100 or SM103")
+    from tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse import _select_launch_config
+
+    assert _select_launch_config(rows, head_tiles, bf16, sm_count, 7) == expected
 
 
 @pytest.mark.parametrize("cache_dtype", [torch.float8_e4m3fn, torch.bfloat16])
