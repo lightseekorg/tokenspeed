@@ -1,4 +1,22 @@
 # Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 """Prefill latent-MoE input projections for gfx1250.
 
@@ -15,8 +33,10 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
-
-from ...gemm.fp16.mm import _WARP_BASES_8, _largem_swizzle2d
+from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
+    _WARP_BASES_8,
+    _largem_swizzle2d,
+)
 
 _HIDDEN = 7168
 _ROUTER_N = 896
@@ -33,8 +53,35 @@ _GROUP_M = 8
 _SITU_BLOCK = 256
 
 
-@gluon.jit
-def _gluon_latent_input_prefill_gfx1250_kernel(
+def _prefill_launch_metadata(grid, kernel, args):
+    """Report packed projection work and traffic to Proton."""
+    m = args["M"]
+    return {
+        "name": kernel.name,
+        "flops16": 2 * m * _TOTAL_N * _HIDDEN,
+        "bytes": m * _HIDDEN * args["a_ptr"].element_size()
+        + _TOTAL_N * _HIDDEN * args["b_ptr"].element_size()
+        + m * _ROUTER_N * args["router_ptr"].element_size()
+        + m * _LATENT_N * args["routed_ptr"].element_size()
+        + m * 2 * _SHARED_N * args["shared_raw_ptr"].element_size(),
+    }
+
+
+def _situ_launch_metadata(grid, kernel, args):
+    """Report the materialized BF16 SiTU epilogue traffic to Proton."""
+    m = args["M"]
+    return {
+        "name": kernel.name,
+        "bytes": m
+        * (
+            2 * _SHARED_N * args["shared_raw_ptr"].element_size()
+            + _SHARED_N * args["shared_ptr"].element_size()
+        ),
+    }
+
+
+@gluon.jit(launch_metadata=_prefill_launch_metadata)
+def gluon_latent_input_prefill_gfx1250(
     a_ptr,
     b_ptr,
     router_ptr,
@@ -171,8 +218,8 @@ def _gluon_latent_input_prefill_gfx1250_kernel(
     )
 
 
-@gluon.jit
-def _gluon_latent_input_prefill_situ_gfx1250(
+@gluon.jit(launch_metadata=_situ_launch_metadata)
+def gluon_latent_input_prefill_situ_gfx1250(
     shared_raw_ptr,
     shared_ptr,
     beta,
@@ -244,7 +291,7 @@ def launch_gluon_latent_input_prefill_gfx1250(
     shared_out = torch.empty((tokens, _SHARED_N), dtype=torch.bfloat16, device=device)
 
     grid = triton.cdiv(tokens, _BLOCK_M) * triton.cdiv(_TOTAL_N, _BLOCK_N)
-    _gluon_latent_input_prefill_gfx1250_kernel[(grid,)](
+    gluon_latent_input_prefill_gfx1250[(grid,)](
         hidden_states,
         packed_weight,
         router_out,
@@ -269,7 +316,7 @@ def launch_gluon_latent_input_prefill_gfx1250(
         num_warps=_NUM_WARPS,
         num_stages=1,
     )
-    _gluon_latent_input_prefill_situ_gfx1250[
+    gluon_latent_input_prefill_situ_gfx1250[
         (tokens, triton.cdiv(_SHARED_N, _SITU_BLOCK))
     ](
         shared_raw,

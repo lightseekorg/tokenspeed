@@ -1,4 +1,22 @@
 # Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 """Decode-batch latent-MoE input projections for gfx1250.
 
@@ -31,8 +49,34 @@ _NUM_WARPS = 4
 _EPILOGUE_BLOCK_N = 64
 
 
-@gluon.jit
-def _gluon_latent_input_decode_gfx1250_kernel(
+def _decode_launch_metadata(grid, kernel, args):
+    """Report packed projection work and traffic to Proton."""
+    m = args["actual_m"]
+    return {
+        "name": kernel.name,
+        "flops16": 2 * m * _TOTAL_N * _HIDDEN,
+        "bytes": m * _HIDDEN * args["a_ptr"].element_size()
+        + _TOTAL_N * _HIDDEN * args["b_ptr"].element_size()
+        + args["SPLIT_K"] * m * _TOTAL_N * args["partial_ptr"].element_size(),
+    }
+
+
+def _epilogue_launch_metadata(grid, kernel, args):
+    """Report the split-partial reduction traffic to Proton."""
+    return {
+        "name": kernel.name,
+        "bytes": grid[0]
+        * (
+            args["SPLIT_K"] * _TOTAL_N * args["partial_ptr"].element_size()
+            + _ROUTER_N * args["router_ptr"].element_size()
+            + _LATENT_N * args["routed_ptr"].element_size()
+            + _SHARED_N * args["shared_ptr"].element_size()
+        ),
+    }
+
+
+@gluon.jit(launch_metadata=_decode_launch_metadata)
+def gluon_latent_input_decode_gfx1250(
     a_ptr,
     b_ptr,
     partial_ptr,
@@ -153,8 +197,8 @@ def _gluon_latent_input_decode_gfx1250_kernel(
     gl.amd.cdna5.buffer_store(acc, partial_ptr, offsets, mask=row[:, None] < actual_m)
 
 
-@gluon.jit
-def _gluon_latent_input_decode_epilogue_gfx1250(
+@gluon.jit(launch_metadata=_epilogue_launch_metadata)
+def gluon_latent_input_decode_epilogue_gfx1250(
     partial_ptr,
     router_ptr,
     routed_ptr,
@@ -268,9 +312,7 @@ def launch_gluon_latent_input_decode_gfx1250(
     shared_out = torch.empty((tokens, _SHARED_N), dtype=torch.bfloat16, device=device)
 
     m_tiles = triton.cdiv(tokens, _BLOCK_M)
-    _gluon_latent_input_decode_gfx1250_kernel[
-        (split_k * (_TOTAL_N // _BLOCK_N), m_tiles)
-    ](
+    gluon_latent_input_decode_gfx1250[(split_k * (_TOTAL_N // _BLOCK_N), m_tiles)](
         hidden_states,
         packed_weight,
         partials,
@@ -290,7 +332,7 @@ def launch_gluon_latent_input_decode_gfx1250(
         num_stages=1,
         waves_per_eu=0,
     )
-    _gluon_latent_input_decode_epilogue_gfx1250[
+    gluon_latent_input_decode_epilogue_gfx1250[
         (tokens, triton.cdiv(_ROUTER_N + _LATENT_N + _SHARED_N, _EPILOGUE_BLOCK_N))
     ](
         partials,

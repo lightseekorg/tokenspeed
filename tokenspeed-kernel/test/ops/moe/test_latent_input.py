@@ -131,12 +131,13 @@ def test_latent_input_without_up_clamp() -> None:
     not current_platform().is_cdna5,
     reason="requires the gfx1250 decode latent-input kernel",
 )
-def test_gfx1250_latent_input_decode_matches_and_replays() -> None:
+@pytest.mark.parametrize("tokens", [1, 7, 16, 17, 32])
+def test_gfx1250_latent_input_decode_matches_and_replays(tokens: int) -> None:
     hidden_size = 7168
     widths = (896, 3584, 1536)
     packed = torch.randn(sum(widths), hidden_size, dtype=torch.bfloat16, device="cuda")
     views = list(packed.split(widths))
-    hidden = torch.randn(1, hidden_size, dtype=torch.bfloat16, device="cuda")
+    hidden = torch.randn(tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
     gate_clamp, up_clamp = 4.0, 25.0
 
     def run():
@@ -207,3 +208,38 @@ def test_unpacked_weights_do_not_select_the_packed_kernel() -> None:
         packed_result, separate_result, strict=True
     ):
         torch.testing.assert_close(packed_tensor, separate_tensor, atol=8e-3, rtol=8e-3)
+
+
+@pytest.mark.skipif(
+    not current_platform().is_cdna5,
+    reason="requires the gfx1250 prefill latent-input kernel",
+)
+@pytest.mark.parametrize("tokens", [1536, 2048, 8192])
+def test_gfx1250_latent_input_prefill_matches(tokens: int) -> None:
+    hidden_size = 7168
+    widths = (896, 3584, 1536)
+    packed = torch.randn(sum(widths), hidden_size, dtype=torch.bfloat16, device="cuda")
+    views = list(packed.split(widths))
+    hidden = torch.randn(tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+    gate_clamp, up_clamp = 4.0, 25.0
+
+    router, routed, shared = latent_moe_input_projections(
+        hidden,
+        *views,
+        gate_clamp=gate_clamp,
+        up_clamp=up_clamp,
+        override="gluon_latent_input_prefill_gfx1250",
+    )
+    expected_router = torch.nn.functional.linear(hidden.float(), views[0].float())
+    expected_routed = torch.nn.functional.linear(hidden, views[1])
+    gate, up = torch.nn.functional.linear(hidden, views[2]).chunk(2, dim=-1)
+    expected_shared = (
+        gate_clamp
+        * torch.tanh(gate.float() / gate_clamp)
+        * torch.sigmoid(gate.float())
+        * (up_clamp * torch.tanh(up.float() / up_clamp))
+    ).to(hidden.dtype)
+    assert router.dtype == torch.float32
+    torch.testing.assert_close(router, expected_router, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(routed, expected_routed, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(shared, expected_shared, atol=2e-2, rtol=2e-2)
