@@ -78,7 +78,6 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_situ_projection,
     linear_attnres_partials,
     linear_attnres_partials_available,
-    mm,
 )
 from tokenspeed_kernel.ops.gemm.triton_gemv import (
     decode_gemv,
@@ -88,7 +87,6 @@ from tokenspeed_kernel.ops.moe import (
     latent_moe_input_projections,
 )
 from tokenspeed_kernel.ops.moe.latent_down import KimiK3LatentDownOp
-from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.ops.residual import attn_res_fwd, attn_res_fwd_available
 from tokenspeed_kernel.ops.tuning import load_packaged_flashinfer_tuning_cache
@@ -1195,21 +1193,9 @@ class KimiLinearKDA(nn.Module):
         ):
             if attnres_partial_args is not None:
                 attnres_partial_dual(*attnres_partial_args)
-            values, scales = quantize_fp8(
+            output = self.qkvgb_proj.quant_method.apply(
+                self.qkvgb_proj,
                 hidden_states,
-                granularity="token_group",
-                group_size=128,
-                solution="triton",
-            )
-            output = mm(
-                values,
-                self.qkvgb_proj.weight,
-                A_scales=scales,
-                B_scales=self.qkvgb_proj.weight_scale_inv,
-                out_dtype=hidden_states.dtype,
-                quant="mxfp8",
-                block_size=[128, 128],
-                solution="trtllm_cutedsl",
             )
         elif attnres_partial_args is None:
             output = kimi3_qkvfab_projection(
