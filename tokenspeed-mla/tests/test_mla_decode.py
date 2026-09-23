@@ -489,11 +489,11 @@ def _check_packed_gpu():
         )
 
 
-def _check_packed_masks_gpu():
+def _check_packed_masks_gpu(interleave):
     from tokenspeed_mla import tokenspeed_mla_decode
 
     torch.backends.cuda.matmul.allow_tf32 = False
-    workspace = torch.zeros(32 * 1024**2, dtype=torch.int8, device="cuda")
+    workspace = torch.zeros(256 * 1024**2, dtype=torch.int8, device="cuda")
     # Narrow and multi-tile windows exercise the unsplit epilogue and reducer.
     # H96/Q3 also puts both the window boundary and output in a partial tile.
     case = _Case(2, 769, 96, 3)
@@ -560,28 +560,41 @@ def _check_packed_masks_gpu():
                     flush=True,
                 )
 
-    # Strided DCP keys use global positions for the causal upper boundary.
-    # Check against an explicit reference rather than only against the old kernel.
-    torch.manual_seed(19)
-    length, world, heads, queries = 515, 2, 96, 3
-    query = torch.randn(1, queries, heads, 576, device="cuda").to(torch.float8_e4m3fn)
-    keys = torch.randn(length, 576, device="cuda").to(torch.float8_e4m3fn)
+    # DCP keys use global positions for the causal upper boundary. Check the
+    # token-strided and block-interleaved layouts against an explicit reference.
+    torch.manual_seed(31)
+    world, q_len, heads = 2, 3, 96
+    query = torch.randn(1, q_len, heads, 576, device="cuda", dtype=torch.bfloat16)
+    query = query.to(torch.float8_e4m3fn)
     for rank in range(world):
-        local = keys[rank::world]
-        pages = (local.shape[0] + 63) // 64
-        cache = torch.zeros(pages, 64, 576, dtype=keys.dtype, device="cuda")
-        cache.view(-1, 576)[: local.shape[0]] = local
-        table = torch.arange(pages, dtype=torch.int32, device="cuda")[None]
-        positions = torch.arange(rank, length, world, device="cuda")
-        expected = torch.empty(1, queries, heads, 512, device="cuda")
-        visible = torch.empty(1, queries, heads, device="cuda")
-        for row in range(queries):
-            count = int((positions < length - queries + row + 1).sum())
-            logits = query[0, row].float() @ local[:count].float().T
-            expected[0, row] = (logits * 192**-0.5).softmax(-1) @ local[
-                :count, :512
-            ].float()
+        length = 512 + rank * interleave + 3
+        global_kv = torch.randn(length, 576, device="cuda", dtype=torch.bfloat16)
+        global_kv = global_kv.to(torch.float8_e4m3fn)
+        positions = torch.arange(length, device="cuda")
+        global_bounds = length - q_len + torch.arange(1, q_len + 1, device="cuda")
+        owners = (positions // interleave) % world
+        local_positions = positions[owners == rank]
+        local_kv = global_kv[local_positions]
+        num_pages = math.ceil(local_kv.shape[0] / 64)
+        cache = torch.zeros(
+            num_pages, 64, 576, device="cuda", dtype=torch.float8_e4m3fn
+        )
+        cache.view(-1, 576)[: local_kv.shape[0]] = local_kv
+        table_width = math.ceil(num_pages / 2) * 2
+        table = torch.zeros(1, table_width, device="cuda", dtype=torch.int32)
+        table[0, :num_pages] = torch.arange(num_pages, device="cuda", dtype=torch.int32)
+
+        expected = torch.empty(1, q_len, heads, 512, device="cuda")
+        expected_lse = torch.empty(1, q_len, heads, device="cuda")
+        visible = torch.empty(1, q_len, heads, device="cuda")
+        for row, bound in enumerate(global_bounds):
+            count = int((local_positions < bound).sum())
+            logits = query[0, row].float() @ local_kv[:count].float().T
+            logits *= 192**-0.5
+            expected[0, row] = logits.softmax(-1) @ local_kv[:count, :512].float()
+            expected_lse[0, row] = logits.logsumexp(-1) / math.log(2)
             visible[0, row] = count
+
         kwargs = dict(
             query=query,
             kv_cache=cache,
@@ -589,26 +602,32 @@ def _check_packed_masks_gpu():
             kv_lora_rank=512,
             qk_rope_head_dim=64,
             block_tables=table,
-            seq_lens=torch.tensor([local.shape[0]], dtype=torch.int32, device="cuda"),
-            max_seq_len=local.shape[0],
+            seq_lens=torch.tensor(
+                [local_kv.shape[0]], device="cuda", dtype=torch.int32
+            ),
+            max_seq_len=local_kv.shape[0],
             softmax_scale=192**-0.5,
             is_var_seq=False,
             causal_mask=True,
-            window_left=-1,
             cp_world=world,
             cp_rank=rank,
-            causal_seqs=torch.tensor([length], dtype=torch.int32, device="cuda"),
+            cp_interleave_size=interleave,
+            causal_seqs=torch.tensor([length], device="cuda", dtype=torch.int32),
             return_lse=True,
         )
         for packed in (False, True):
-            output, _ = tokenspeed_mla_decode(**kwargs, enable_packed_q=packed)
+            output, lse = tokenspeed_mla_decode(**kwargs, enable_packed_q=packed)
             _check_output(output, expected, "fp8")
+            torch.testing.assert_close(lse, expected_lse, atol=0.05, rtol=0.001)
             _, lse = tokenspeed_mla_decode(
                 **dict(kwargs, query=torch.zeros_like(query)),
                 enable_packed_q=packed,
             )
             torch.testing.assert_close(lse, visible.log2(), atol=2e-5, rtol=1e-5)
-        print(f"DCP verified: rank={rank} world={world}", flush=True)
+        print(
+            f"DCP verified: rank={rank} world={world} interleave={interleave}",
+            flush=True,
+        )
 
 
 def _check_reducer_variants():
@@ -728,8 +747,9 @@ class TestGPU:
     def test_packed_q_outputs_lse_tails_and_legacy_paths(self):
         _run_gpu_check(_check_packed_gpu, (), 600)
 
-    def test_packed_q_preserves_sliding_window_and_dcp_masks(self):
-        _run_gpu_check(_check_packed_masks_gpu, (), 600)
+    @pytest.mark.parametrize("interleave", [1, 64], ids=["strided", "block64"])
+    def test_packed_q_preserves_sliding_window_and_dcp_masks(self, interleave):
+        _run_gpu_check(_check_packed_masks_gpu, (interleave,), 600)
 
     def test_reducer_bands_preserve_output_lse_and_pdl(self):
         _run_gpu_check(_check_reducer_variants, (), 240)

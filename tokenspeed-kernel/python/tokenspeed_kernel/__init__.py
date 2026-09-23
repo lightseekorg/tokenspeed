@@ -62,7 +62,6 @@ from tokenspeed_kernel.ops.moe import (
     moe_process_weights,
     moe_topk,
     native_latent_moe_available,
-    pack_topk_router_logits,
 )
 from tokenspeed_kernel.ops.quantization import (
     fp8_quantize_dequantize,
@@ -136,7 +135,6 @@ __all__ = [
     "moe_plan",
     "moe_process_weights",
     "moe_topk",
-    "pack_topk_router_logits",
     # quantization
     "fp8_quantize_dequantize",
     "quantize_fp8",
