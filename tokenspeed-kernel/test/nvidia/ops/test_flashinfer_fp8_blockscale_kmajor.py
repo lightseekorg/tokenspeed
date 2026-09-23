@@ -177,6 +177,5 @@ def test_kmajor_slices_padded_activation_scales(device: str) -> None:
         weight_scales,
         torch.bfloat16,
         block_size=[128, 128],
-        original_m=m,
     )
     torch.testing.assert_close(result, expected, atol=0, rtol=0)

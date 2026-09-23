@@ -127,6 +127,10 @@ def has_flashinfer_fp8_blockscale() -> bool:
     return gemm_fp8_nt_groupwise is not error_fn and platform.is_blackwell
 
 
+def _supports_flashinfer_fp8_blockscale(m: int, _n: int, _k: int) -> bool:
+    return not 17 <= m <= 32
+
+
 if gemm_fp8_nt_groupwise is not error_fn:
 
     @register_kernel(
@@ -142,9 +146,8 @@ if gemm_fp8_nt_groupwise is not error_fn:
         traits={
             "n_align": frozenset({128}),
             "k_align": frozenset({128}),
-            "block_scale_layout": frozenset(
-                {"canonical", "canonical_blackwell", "flashinfer_mn"}
-            ),
+            "mnk_problem_filter": frozenset({_supports_flashinfer_fp8_blockscale}),
+            "block_scale_layout": frozenset({"canonical", "canonical_blackwell"}),
         },
         priority=Priority.SPECIALIZED + 3,
     )
@@ -165,6 +168,10 @@ if gemm_fp8_nt_groupwise is not error_fn:
         ), "A_scales is required; online quantization should be done by the caller"
         assert B_scales is not None, "B_scales is required for FP8 blockscale GEMM"
         orig_m = A.shape[0]
+        if not _supports_flashinfer_fp8_blockscale(orig_m, B.shape[0], A.shape[1]):
+            raise ValueError(
+                "FlashInfer FP8 block-scale GEMM does not support 17 <= M <= 32"
+            )
         # K-major mode reads the quant kernel's native (m, k//128) activation
         # scales and the checkpoint's native (n//128, k//128) weight scales,
         # so no padding, transposes, or scale copies are needed per call.
