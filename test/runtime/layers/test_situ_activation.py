@@ -27,6 +27,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.activation.triton import add3
+from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.layers.activation import SituAndMul
 
@@ -85,8 +86,19 @@ def test_linear_beta_saturates_up_branch():
     torch.testing.assert_close(out, torch.tensor([[25.0]]), atol=5e-2, rtol=5e-2)
 
 
+@pytest.fixture
+def disable_pdl():
+    if not torch.cuda.is_available():
+        yield
+        return
+    previous = pdl_enabled()
+    pdl_enabled(overwrite=False)
+    yield
+    pdl_enabled(overwrite=previous)
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_add3_supports_row_strided_inputs(device):
+def test_add3_supports_row_strided_inputs(device, disable_pdl):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("GPU is unavailable")
     base = torch.arange(72, dtype=torch.float32, device=device).view(3, 24)

@@ -13,6 +13,7 @@
   "case_files": [
     "gfx950/glm53_flash/kda.json",
     "gfx950/glm53_flash/dsa.json",
+    "gfx950/glm53_flash/moe.json",
     "gfx950/dsv41_flash/gemm.json"
   ],
   "cases": [

@@ -251,19 +251,54 @@ def test_compare_uses_merge_base_policy():
     assert "baseline policy was used" in comparison["detail"]
 
 
-def test_compare_bootstrap_requires_candidate_success():
-    report = _compare(None, _run(CANDIDATE_SHA, [_case(10.0)]), merge_sha=None)
+@pytest.mark.parametrize(
+    ("base_status", "classification"),
+    [
+        (None, "added"),
+        ("success", "within_budget"),
+        ("not_applicable", "inconclusive"),
+        ("registration_missing", "inconclusive"),
+        ("invalid_case", "inconclusive"),
+        ("setup_failure", "inconclusive"),
+        ("capture_failure", "inconclusive"),
+        ("execution_failure", "inconclusive"),
+        ("correctness_failure", "inconclusive"),
+        ("environment_invalid", "invalid"),
+        ("unknown", "invalid"),
+    ],
+)
+def test_compare_requires_candidate_success(base_status, classification):
+    base = (
+        _run(BASE_SHA, [_case(10.0, status=base_status)])
+        if base_status is not None
+        else None
+    )
+    report = _compare(base, _run(CANDIDATE_SHA, [_case(10.0)]), merge_sha=None)
 
-    assert report["comparisons"][0]["classification"] == "added"
-    assert report["comparisons"][0]["candidate_median_us"] == 10.0
-    assert comparison_exit_code(report) == 0
+    comparison = report["comparisons"][0]
+    assert comparison["classification"] == classification
+    if classification == "invalid":
+        assert comparison_exit_code(report) == 2
+    else:
+        assert comparison["candidate_median_us"] == 10.0
+        assert comparison_exit_code(report) == 0
+    if classification == "inconclusive":
+        assert comparison["base_median_us"] is None
+        assert comparison["delta_us"] is None
+        assert comparison["delta_percent"] is None
+        assert f"baseline benchmark returned {base_status}" in comparison["detail"]
+        assert "candidate succeeded" in comparison["detail"]
+        assert "**Inconclusive:**" in render_summary(report)
 
     failed = _run(
         CANDIDATE_SHA,
         [_case(10.0, status="capture_failure")],
     )
-    failed_report = _compare(None, failed, merge_sha=None)
+    failed_report = _compare(base, failed, merge_sha=None)
     assert failed_report["comparisons"][0]["classification"] == "invalid"
+    assert "candidate benchmark returned capture_failure" in (
+        failed_report["comparisons"][0]["detail"]
+    )
     assert comparison_exit_code(failed_report) == 2
 
 
@@ -294,8 +329,9 @@ def test_compare_reports_added_changed_and_missing_cases():
 
 
 @pytest.mark.parametrize("context", ["environment", "timer"])
-def test_compare_requires_matching_measurement_context(context):
-    base = _run(BASE_SHA, [_case(10.0)])
+@pytest.mark.parametrize("base_status", ["success", "setup_failure"])
+def test_compare_requires_matching_measurement_context(context, base_status):
+    base = _run(BASE_SHA, [_case(10.0, status=base_status)])
     candidate = _run(CANDIDATE_SHA, [_case(10.0)])
     if context == "environment":
         candidate["environment"]["device_name"] = "AMD Instinct MI355X"
