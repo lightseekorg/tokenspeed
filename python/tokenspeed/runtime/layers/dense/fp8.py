@@ -25,8 +25,12 @@
 
 import logging
 
-import tokenspeed_kernel
 import torch
+import tokenspeed_kernel
+from tokenspeed_kernel import (
+    dsv4_grouped_output_projection_process_weights,
+    prepare_trtllm_cutedsl_fp8_linear,
+)
 from tokenspeed_kernel import fp8_linear, prepare_fp8_linear
 from tokenspeed_kernel.ops.gemm.fp8_utils import (
     per_block_quant_fp8,
@@ -205,7 +209,7 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             if grouped_output_projection_plan is not None:
                 layer.weight_scale_inv.data = (
-                    tokenspeed_kernel.dsv4_grouped_output_projection_process_weights(
+                    dsv4_grouped_output_projection_process_weights(
                         grouped_output_projection_plan,
                         layer.weight.data,
                         layer.weight_scale_inv.data,
@@ -220,7 +224,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 self.quant_config.weight_block_size
             ) == (128, 128):
                 layer._prepared_fp8_linear = (
-                    tokenspeed_kernel.prepare_trtllm_cutedsl_fp8_linear(
+                    prepare_trtllm_cutedsl_fp8_linear(
                         layer.weight.data,
                         layer.weight_scale_inv.data,
                         self.quant_config.weight_block_size,
