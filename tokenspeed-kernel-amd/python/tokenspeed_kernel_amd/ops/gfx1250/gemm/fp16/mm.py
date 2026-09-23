@@ -720,6 +720,7 @@ def _wmma_tdm_dense_largem_kernel(
     the rows that exist, and the output store is masked against the same
     bounds, so whatever fills the rest of the tile cannot reach memory.
     """
+    gl.static_assert(BLOCK_K == 128, "large-M path is tuned for 128-wide K tiles")
     gl.static_assert(NUM_BUFFERS == 2, "large-M path uses a double-buffer TDM pipeline")
 
     pid = gl.program_id(0)
@@ -867,12 +868,10 @@ def gluon_mm_a16w16_largem_gfx1250(
         )
 
     if m >= _LARGEM_WIDE_M and n >= _LARGEM_WIDE_N:
-        block_m, block_n, block_k = 256, 256, 128
+        block_m, block_n = 256, 256
         warp_bases, num_warps = _WARP_BASES_8, 8
-        # A 256-wide tile already covers enough columns that grouping rows for
-        # L2 reuse costs more in scheduling than it returns: a few percent
-        # at N = 6016 and 8448, and never a loss elsewhere. The margin is
-        # close to the ~2% run-to-run spread, so re-tune with repeats.
+        # A 256-wide tile already spans enough columns that grouping rows
+        # for L2 reuse costs more than it returns.
         group_m = 1
     else:
         block_m = 128 if m < _LARGEM_BLOCK_M_CROSSOVER else 256
@@ -888,7 +887,6 @@ def gluon_mm_a16w16_largem_gfx1250(
             for candidate in (block_m, 128, 64, 32)
             if (n - n % 32) % candidate == 0
         )
-        block_k = 128
         warp_bases, num_warps = _WARP_BASES_4, 4
         group_m = 8
     grid = triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
@@ -907,7 +905,7 @@ def gluon_mm_a16w16_largem_gfx1250(
         k,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
-        BLOCK_K=block_k,
+        BLOCK_K=128,
         GROUP_M=group_m,
         NUM_BUFFERS=2,
         WARP_BASES=warp_bases,

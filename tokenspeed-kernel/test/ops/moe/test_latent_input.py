@@ -125,3 +125,39 @@ def test_latent_input_without_up_clamp() -> None:
         * up.float()
     ).to(hidden.dtype)
     torch.testing.assert_close(shared, expected, atol=8e-3, rtol=8e-3)
+
+
+def test_latent_input_masks_partial_k_tile() -> None:
+    hidden_size = 192
+    widths = (ROUTER_N, ROUTED_N, 2 * SHARED_N)
+    packed = torch.randn(sum(widths), hidden_size, dtype=torch.bfloat16, device="cuda")
+    views = list(packed.split(widths))
+    hidden = torch.randn(2, hidden_size, dtype=torch.bfloat16, device="cuda")
+
+    actual = latent_moe_input_projections(
+        hidden,
+        *views,
+        gate_clamp=GATE_CLAMP,
+        up_clamp=UP_CLAMP,
+        override="triton_latent_input_packed",
+    )
+    expected = _reference(hidden, views)
+    for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_tensor, expected_tensor, atol=8e-3, rtol=8e-3)
+
+
+def test_unpacked_weights_do_not_select_the_packed_kernel() -> None:
+    _, views = _concatenated_weights()
+    separate = [view.clone() for view in views]
+    hidden = torch.randn(4, HIDDEN, dtype=torch.bfloat16, device="cuda") * 0.05
+
+    packed_result = latent_moe_input_projections(
+        hidden, *views, gate_clamp=GATE_CLAMP, up_clamp=UP_CLAMP
+    )
+    separate_result = latent_moe_input_projections(
+        hidden, *separate, gate_clamp=GATE_CLAMP, up_clamp=UP_CLAMP
+    )
+    for packed_tensor, separate_tensor in zip(
+        packed_result, separate_result, strict=True
+    ):
+        torch.testing.assert_close(packed_tensor, separate_tensor, atol=8e-3, rtol=8e-3)
