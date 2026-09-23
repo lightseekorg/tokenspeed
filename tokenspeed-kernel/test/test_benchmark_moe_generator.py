@@ -21,12 +21,17 @@
 from __future__ import annotations
 
 import importlib
+from types import SimpleNamespace
 
 import pytest
 import tokenspeed_kernel.benchmark.generators.moe as moe_generator
 import torch
 from tokenspeed_kernel.benchmark.generators.moe import prepare_moe_apply
-from tokenspeed_kernel.benchmark.harness import BenchmarkCaseError, BenchmarkRequest
+from tokenspeed_kernel.benchmark.harness import (
+    BenchmarkCaseError,
+    BenchmarkRequest,
+    BenchmarkStatus,
+)
 from tokenspeed_kernel.ops import moe as moe_ops
 from tokenspeed_kernel.platform import PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
@@ -41,6 +46,36 @@ def _use_cpu_allocations(monkeypatch: pytest.MonkeyPatch) -> None:
             return _allocation(*args, **kwargs)
 
         monkeypatch.setattr(torch, name, cpu_allocation)
+
+
+def _kimi_latent_expert_shared_request() -> BenchmarkRequest:
+    return BenchmarkRequest(
+        family="moe",
+        mode="latent_expert_shared",
+        parameters={
+            "model_profile": "kimi_k3_tp8",
+            "tokens": 2,
+            "latent_size": 256,
+            "intermediate_size": 256,
+            "num_experts": 8,
+            "num_local_experts": 4,
+            "topk": 2,
+            "ep_size": 2,
+            "ep_rank": 1,
+            "shared_size": 16,
+            "output_size": 64,
+            "input_dtype": "bfloat16",
+            "router_logits_dtype": "float32",
+            "activation_situ_beta": 4.0,
+            "activation_situ_linear_beta": 25.0,
+            "routed_scaling_factor": 1.0,
+            "normalize_topk_weights": True,
+        },
+        solution=None,
+        registration=None,
+        cold_cache=True,
+        seed=42,
+    )
 
 
 def test_moe_fp8_weight_shapes_match_tp_and_ep_layouts() -> None:
@@ -294,9 +329,14 @@ def test_moe_apply_generator_builds_mxfp4_situ_global_ep_contract(
             weights.activation_situ_beta,
             weights.activation_situ_linear_beta,
         )
+        weights.w13_weight = torch.zeros(
+            (2, 1, 1, 1, 1, 1),
+            dtype=torch.uint8,
+        )
 
-    def fake_apply(_plan, hidden_states, _weights, _router_logits, **kwargs):
+    def fake_apply(_plan, hidden_states, weights, _router_logits, **kwargs):
         seen["hidden_shape"] = tuple(hidden_states.shape)
+        seen["processed_w13_shape"] = tuple(weights.w13_weight.shape)
         seen["num_tokens_global"] = kwargs["num_tokens_global"]
         seen["max_num_tokens_per_gpu"] = kwargs["max_num_tokens_per_gpu"]
         seen["ids"] = kwargs["topk_ids"].clone()
@@ -361,6 +401,7 @@ def test_moe_apply_generator_builds_mxfp4_situ_global_ep_contract(
     }
     assert seen["situ"] == (4.0, 25.0)
     assert seen["hidden_shape"] == (16, 32)
+    assert seen["processed_w13_shape"] == (2, 1, 1, 1, 1, 1)
     assert seen["num_tokens_global"] == 16
     assert seen["max_num_tokens_per_gpu"] == 2
     assert seen["ids"][0].tolist() == list(range(8))
@@ -472,6 +513,8 @@ def test_latent_expert_shared_generator_uses_global_ep_routes_and_reset(
     monkeypatch,
     mi350_platform: PlatformInfo,
 ) -> None:
+    from tokenspeed_kernel.ops import moe as moe_ops
+
     _ = fresh_registry
     spec = KernelSpec(
         name="unit_latent_expert_shared",
@@ -485,7 +528,6 @@ def test_latent_expert_shared_generator_uses_global_ep_routes_and_reset(
         "tokenspeed_kernel.ops.moe.latent_decode"
     )
     monkeypatch.setattr(moe_generator, "load_builtin_kernels", lambda: None)
-    monkeypatch.setattr(moe_generator, "_selected_spec", lambda *_args: spec)
     monkeypatch.setattr(
         moe_generator,
         "_generator",
@@ -507,7 +549,45 @@ def test_latent_expert_shared_generator_uses_global_ep_routes_and_reset(
 
     monkeypatch.setattr(moe_generator, "_routing_tensors", fake_routing)
 
+    def fake_plan(**kwargs):
+        seen["plan_kwargs"] = kwargs
+        plan = {"apply_kernel_name": "unit_a8w4_moe_apply"}
+        seen["plan"] = plan
+        return plan
+
+    def fake_process(plan, weights):
+        seen.setdefault("events", []).append("process")
+        seen["processed_plan"] = plan
+        weights.w13_weight = torch.zeros(
+            (4, 32, 2, 4, 16, 16),
+            dtype=torch.uint8,
+        )
+        weights.w13_weight_scale = torch.zeros(
+            (4, 16, 1, 4, 16, 4),
+            dtype=torch.uint8,
+        )
+        weights.w2_weight = torch.zeros(
+            (4, 16, 2, 4, 16, 16),
+            dtype=torch.uint8,
+        )
+        weights.w2_weight_scale = torch.zeros(
+            (4, 8, 1, 4, 16, 4),
+            dtype=torch.uint8,
+        )
+        seen["processed_weights"] = weights
+
+    def fake_selected(_request, _platform, signature, traits):
+        seen.setdefault("events", []).append("select")
+        seen["selection_signature"] = signature
+        seen["selection_traits"] = traits
+        return spec
+
+    monkeypatch.setattr(moe_ops, "moe_plan", fake_plan)
+    monkeypatch.setattr(moe_ops, "moe_process_weights", fake_process)
+    monkeypatch.setattr(moe_generator, "_selected_spec", fake_selected)
+
     def fake_joint(*args, **kwargs):
+        seen["joint_weight_shapes"] = tuple(tuple(tensor.shape) for tensor in args[1:5])
         seen["ids"] = args[6].clone()
         seen["expert_start"] = kwargs["expert_start"]
         kwargs["routed_out"].fill_(1)
@@ -517,33 +597,7 @@ def test_latent_expert_shared_generator_uses_global_ep_routes_and_reset(
 
     monkeypatch.setattr(latent_decode_ops, "latent_moe_expert_shared", fake_joint)
     prepared = moe_generator.prepare_latent_expert_shared(
-        BenchmarkRequest(
-            family="moe",
-            mode="latent_expert_shared",
-            parameters={
-                "model_profile": "kimi_k3_tp8",
-                "tokens": 2,
-                "latent_size": 32,
-                "intermediate_size": 32,
-                "num_experts": 8,
-                "num_local_experts": 4,
-                "topk": 2,
-                "ep_size": 2,
-                "ep_rank": 1,
-                "shared_size": 16,
-                "output_size": 64,
-                "input_dtype": "bfloat16",
-                "router_logits_dtype": "float32",
-                "activation_situ_beta": 4.0,
-                "activation_situ_linear_beta": 25.0,
-                "routed_scaling_factor": 1.0,
-                "normalize_topk_weights": True,
-            },
-            solution=None,
-            registration=None,
-            cold_cache=True,
-            seed=42,
-        ),
+        _kimi_latent_expert_shared_request(),
         mi350_platform,
     )
 
@@ -553,8 +607,36 @@ def test_latent_expert_shared_generator_uses_global_ep_routes_and_reset(
     assert prepared.registration is spec
     assert prepared.parameters["route_scope"] == "global"
     assert prepared.parameters["route_distribution"] == "router"
+    assert seen["plan_kwargs"]["weight_dtype"] == "mxfp4"
+    assert seen["plan_kwargs"]["activation"] == "situ"
+    assert seen["plan_kwargs"]["routing_mode"] == "precomputed_topk"
+    assert seen["plan_kwargs"]["ep_size"] == 2
+    assert seen["plan_kwargs"]["hidden"] == 256
+    assert seen["plan_kwargs"]["ispp"] == 256
+    assert seen["plan_kwargs"]["internal_activation_dtype"] == "input"
+    assert seen["processed_plan"] is seen["plan"]
+    assert seen["events"] == ["process", "select"]
+    assert seen["selection_signature"].storage_dtype_for("w13_weight") is torch.uint8
+    assert seen["selection_traits"]["linear_weights"] is False
+    assert seen["selection_traits"]["intermediate_size"] == 256
+    assert seen["selection_traits"]["num_local_experts"] == 4
+    assert seen["selection_traits"]["inputs_contiguous"] is True
+    assert seen["joint_weight_shapes"] == (
+        (4, 32, 2, 4, 16, 16),
+        (4, 16, 1, 4, 16, 4),
+        (4, 16, 2, 4, 16, 16),
+        (4, 8, 1, 4, 16, 4),
+    )
     assert seen["ids"].tolist() == [[0, 4], [1, 5]]
     assert seen["expert_start"] == 4
     assert seen["routing_kwargs"]["experts"] == 8
     assert seen["routing_kwargs"]["expert_start"] == 0
     assert all(torch.count_nonzero(output) == 0 for output in seen["outputs"])
+
+
+def test_latent_expert_shared_skips_incompatible_weight_representation() -> None:
+    with pytest.raises(BenchmarkCaseError) as error:
+        moe_generator._latent_expert_shared_weights(SimpleNamespace())
+
+    assert error.value.status is BenchmarkStatus.NOT_APPLICABLE
+    assert "not compatible with the joint" in str(error.value)

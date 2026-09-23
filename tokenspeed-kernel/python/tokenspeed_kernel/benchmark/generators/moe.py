@@ -400,6 +400,94 @@ def _make_mxfp4_weights(
     )
 
 
+def _prepare_routed_weights(
+    *,
+    weight_dtype_name: str,
+    weight_dtype: torch.dtype,
+    input_dtype: torch.dtype,
+    activation: str,
+    routing_mode: str,
+    ep_size: int,
+    hidden_size: int,
+    intermediate_size_per_partition: int,
+    num_experts: int,
+    num_local_experts: int,
+    ep_rank: int,
+    swiglu_limit: float | None,
+    situ_beta: float | None,
+    situ_linear_beta: float | None,
+    block_shape: tuple[int, int] | None,
+    internal_activation_dtype: str,
+) -> tuple[dict, SimpleNamespace]:
+    from tokenspeed_kernel.ops import moe as moe_ops
+
+    plan = moe_ops.moe_plan(
+        weight_dtype=weight_dtype_name,
+        input_dtype=input_dtype,
+        activation=activation,
+        requires_deferred_finalize=False,
+        routing_mode=routing_mode,
+        a2a_backend="none",
+        ep_size=ep_size,
+        ispp=intermediate_size_per_partition,
+        hidden=hidden_size,
+        swiglu_form="standard" if activation == "swiglu" else None,
+        activation_clamped=swiglu_limit is not None,
+        expert_id_repeats=False,
+        fp8_scale_block_shape=block_shape,
+        internal_activation_dtype=internal_activation_dtype,
+        with_bias=False,
+        fast_math=False,
+        solution=None,
+    )
+    if weight_dtype_name == "fp8":
+        assert block_shape is not None
+        weights = _make_fp8_weights(
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            block_shape=block_shape,
+            weight_dtype=weight_dtype,
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+            ep_rank=ep_rank,
+            ep_size=ep_size,
+        )
+    else:
+        weights = _make_mxfp4_weights(
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            ep_rank=ep_rank,
+            ep_size=ep_size,
+        )
+    moe_ops.moe_process_weights(plan, weights)
+    return plan, weights
+
+
+def _latent_expert_shared_weights(
+    weights: SimpleNamespace,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    try:
+        return (
+            weights.w13_weight,
+            weights.w13_weight_scale,
+            weights.w2_weight,
+            weights.w2_weight_scale,
+        )
+    except AttributeError as error:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.NOT_APPLICABLE,
+            "Selected MoE weight preprocessing is not compatible with the joint "
+            "latent-expert/shared operation",
+        ) from error
+
+
 def prepare_sigmoid_bias_topk(
     request: BenchmarkRequest,
     platform: PlatformInfo,
@@ -576,24 +664,23 @@ def prepare_moe_apply(
         )
 
     load_builtin_kernels()
-    plan = moe_ops.moe_plan(
-        weight_dtype=weight_dtype_name,
+    plan, weights = _prepare_routed_weights(
+        weight_dtype_name=weight_dtype_name,
+        weight_dtype=weight_dtype,
         input_dtype=input_dtype,
         activation=activation,
-        requires_deferred_finalize=False,
         routing_mode=routing_mode,
-        a2a_backend="none",
         ep_size=ep_size,
-        ispp=intermediate_size_per_partition,
-        hidden=hidden_size,
-        swiglu_form="standard" if activation == "swiglu" else None,
-        activation_clamped=swiglu_limit is not None,
-        expert_id_repeats=False,
-        fp8_scale_block_shape=block_shape,
+        hidden_size=hidden_size,
+        intermediate_size_per_partition=intermediate_size_per_partition,
+        num_experts=num_experts,
+        num_local_experts=num_local_experts,
+        ep_rank=ep_rank,
+        swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        block_shape=block_shape,
         internal_activation_dtype=internal_activation_dtype,
-        with_bias=False,
-        fast_math=False,
-        solution=None,
     )
     spec = KernelRegistry.get().get_by_name(plan["apply_kernel_name"])
     if spec is None:
@@ -621,33 +708,6 @@ def prepare_moe_apply(
         generator=generator,
         expert_start=expert_start,
     )
-    if weight_dtype_name == "fp8":
-        assert block_shape is not None
-        weights = _make_fp8_weights(
-            num_local_experts=num_local_experts,
-            hidden_size=hidden_size,
-            intermediate_size_per_partition=intermediate_size_per_partition,
-            block_shape=block_shape,
-            weight_dtype=weight_dtype,
-            activation=activation,
-            swiglu_limit=swiglu_limit,
-            ep_rank=ep_rank,
-            ep_size=ep_size,
-        )
-    else:
-        weights = _make_mxfp4_weights(
-            num_experts=num_experts,
-            num_local_experts=num_local_experts,
-            hidden_size=hidden_size,
-            intermediate_size_per_partition=intermediate_size_per_partition,
-            activation=activation,
-            swiglu_limit=swiglu_limit,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
-            ep_rank=ep_rank,
-            ep_size=ep_size,
-        )
-    moe_ops.moe_process_weights(plan, weights)
 
     def invoke() -> object:
         return moe_ops.moe_apply(
@@ -875,7 +935,7 @@ def prepare_latent_expert_shared(
         generator=generator,
         dtype=input_dtype,
     )
-    router_logits, topk_weights, topk_ids = _routing_tensors(
+    _router_logits, topk_weights, topk_ids = _routing_tensors(
         tokens=tokens,
         experts=num_experts,
         topk=topk,
@@ -886,18 +946,26 @@ def prepare_latent_expert_shared(
         generator=generator,
         expert_start=0,
     )
-    weights = _make_mxfp4_weights(
-        num_experts=num_experts,
-        num_local_experts=num_local_experts,
+    load_builtin_kernels()
+    _plan, weights = _prepare_routed_weights(
+        weight_dtype_name="mxfp4",
+        weight_dtype=torch.uint8,
+        input_dtype=input_dtype,
+        activation="situ",
+        routing_mode="precomputed_topk",
+        ep_size=ep_size,
         hidden_size=latent_size,
         intermediate_size_per_partition=intermediate_size,
-        activation="situ",
+        num_experts=num_experts,
+        num_local_experts=num_local_experts,
+        ep_rank=ep_rank,
         swiglu_limit=None,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
-        ep_rank=ep_rank,
-        ep_size=ep_size,
+        block_shape=None,
+        internal_activation_dtype="input",
     )
+    w13_weight, w13_scale, w2_weight, w2_scale = _latent_expert_shared_weights(weights)
     shared_input = _randn(
         (tokens, shared_size),
         generator=generator,
@@ -910,13 +978,12 @@ def prepare_latent_expert_shared(
     shared_out = torch.empty((tokens, output_size), dtype=input_dtype, device="cuda")
     expert_start = ep_rank * num_local_experts
 
-    load_builtin_kernels()
     signature = format_signature(
         hidden_states=dense_tensor_format(hidden_states.dtype),
-        w13_weight=dense_tensor_format(weights.w13_weight.dtype),
-        w13_scale=dense_tensor_format(weights.w13_weight_scale.dtype),
-        w2_weight=dense_tensor_format(weights.w2_weight.dtype),
-        w2_scale=dense_tensor_format(weights.w2_weight_scale.dtype),
+        w13_weight=dense_tensor_format(w13_weight.dtype),
+        w13_scale=dense_tensor_format(w13_scale.dtype),
+        w2_weight=dense_tensor_format(w2_weight.dtype),
+        w2_scale=dense_tensor_format(w2_scale.dtype),
         topk_weights=dense_tensor_format(topk_weights.dtype),
         topk_ids=dense_tensor_format(topk_ids.dtype),
         shared_input=dense_tensor_format(shared_input.dtype),
@@ -924,16 +991,35 @@ def prepare_latent_expert_shared(
         routed_out=dense_tensor_format(routed_out.dtype),
         shared_out=dense_tensor_format(shared_out.dtype),
     )
+    weights_are_linear = w2_weight.ndim != 6
+    processed_intermediate_size = (
+        w2_weight.shape[-1] * 2 if weights_are_linear else w2_weight.shape[2] * 128
+    )
     traits = {
         "tokens": tokens,
         "latent_size": latent_size,
         "topk": topk,
-        "num_local_experts": num_local_experts,
-        "intermediate_size": intermediate_size,
+        "num_local_experts": w13_weight.shape[0],
+        "intermediate_size": processed_intermediate_size,
         "shared_size": shared_size,
         "output_size": output_size,
-        "linear_weights": True,
-        "inputs_contiguous": True,
+        "linear_weights": weights_are_linear,
+        "inputs_contiguous": all(
+            tensor.is_contiguous()
+            for tensor in (
+                hidden_states,
+                w13_weight,
+                w13_scale,
+                w2_weight,
+                w2_scale,
+                topk_weights,
+                topk_ids,
+                shared_input,
+                shared_weight,
+                routed_out,
+                shared_out,
+            )
+        ),
     }
     spec = _selected_spec(request, platform, signature, traits)
 
@@ -946,10 +1032,10 @@ def prepare_latent_expert_shared(
     def invoke() -> object:
         return latent_moe_expert_shared(
             hidden_states,
-            weights.w13_weight,
-            weights.w13_weight_scale,
-            weights.w2_weight,
-            weights.w2_weight_scale,
+            w13_weight,
+            w13_scale,
+            w2_weight,
+            w2_scale,
             topk_weights,
             topk_ids,
             shared_input,
@@ -957,7 +1043,7 @@ def prepare_latent_expert_shared(
             activation_clamp=situ_beta,
             linear_clamp=situ_linear_beta,
             expert_start=expert_start,
-            w13_interleaved=False,
+            w13_interleaved=weights.w13_input_layout == "interleaved",
             routed_out=routed_out,
             shared_out=shared_out,
         )
