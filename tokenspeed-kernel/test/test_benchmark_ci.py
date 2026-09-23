@@ -136,9 +136,9 @@ def test_gfx950_suite_selects_exact_registrations():
     assert suite.timer.eager_warmup_iterations == 5
     assert suite.timer.replay_warmup_iterations == 3
     assert suite.default_measurement_blocks == 30
-    gemm_cases = [case for case in suite.cases if case.request.family == "gemm"]
-    assert len(gemm_cases) == 7
-    case = gemm_cases[0]
+    bmm_cases = [case for case in suite.cases if case.id.startswith("gemm.")]
+    assert len(bmm_cases) == 1
+    case = bmm_cases[0]
     assert case.id == ("gemm.bmm/gluon_bmm_a16w16_gfx950/b12-m1-n512-k128-bfloat16")
     assert case.comparison_epoch == 1
     assert case.request.parameters == {
@@ -160,18 +160,29 @@ def test_gfx950_suite_selects_exact_registrations():
     assert case.measurement_blocks == 30
     assert case.policy == _policy()
 
+    mxfp8_cases = {
+        case.id: case
+        for case in suite.cases
+        if case.id.startswith("dsv41_flash.gemm.mm/")
+    }
     mxfp8_shapes = (
-        (1024, 1792, 5120),
-        (1024, 4096, 1280),
-        (1024, 5120, 1024),
-        (4096, 1792, 5120),
-        (4096, 4096, 1280),
-        (4096, 5120, 1024),
+        ("wq_a_wkv", 1024, 1792, 5120),
+        ("tp8-wq_b", 1024, 4096, 1280),
+        ("tp8-wo_b", 1024, 5120, 1024),
+        ("wq_a_wkv", 4096, 1792, 5120),
+        ("tp8-wq_b", 4096, 4096, 1280),
+        ("tp8-wo_b", 4096, 5120, 1024),
+        ("tp4-wq_b", 1024, 8192, 1280),
+        ("tp4-wo_b", 1024, 5120, 2048),
+        ("tp4-wq_b", 4096, 8192, 1280),
+        ("tp4-wo_b", 4096, 5120, 2048),
     )
-    for mxfp8_case, (m, n, k) in zip(gemm_cases[1:], mxfp8_shapes, strict=True):
-        assert mxfp8_case.id == (
-            "gemm.mm/gluon_mm_mxfp8_gfx950/" f"m{m}-n{n}-k{k}-mxfp8-bfloat16"
-        )
+    assert len(mxfp8_cases) == len(mxfp8_shapes)
+    for label, m, n, k in mxfp8_shapes:
+        mxfp8_case = mxfp8_cases[
+            "dsv41_flash.gemm.mm/gluon_mm_mxfp8_gfx950/"
+            f"{label}-m{m}-n{n}-k{k}-mxfp8-bfloat16"
+        ]
         assert mxfp8_case.comparison_epoch == 1
         assert mxfp8_case.request.parameters == {
             "M": m,
@@ -184,6 +195,7 @@ def test_gfx950_suite_selects_exact_registrations():
         }
         assert mxfp8_case.request.registration == "gluon_mm_mxfp8_gfx950"
         assert mxfp8_case.request.cold_cache is True
+        assert mxfp8_case.measurement_blocks == 30
         assert mxfp8_case.policy == _policy()
 
 
