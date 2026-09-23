@@ -146,6 +146,46 @@ runner pod recreation and avoids downloading the same large wheels again on
 that node. Other runner families keep their existing cache behavior because
 their cluster storage layouts may differ.
 
+For model evaluation and performance jobs, the reusable PR task workflow puts
+uv's cache in `.uv-cache` under the job's work directory, overriding an inherited
+shared uv cache. EvalScope dependency installs therefore do not depend on free
+space in a persistent `/cache/uv` volume. The existing always-run work-directory
+cleanup removes the job's uv cache on success or failure. Unit-test, kernel
+benchmark, pip, and release-wheel caches retain their existing policy.
+
+Accuracy jobs also keep Triton's compiled kernels in `.triton-cache` under their
+work directory. Lazy compilation during a request can then write its cache even
+when the runner's shared `/cache/triton` volume is full. The directory survives
+the task's server restarts and is removed by the same job cleanup; compiler
+options and test workloads are unchanged. Performance jobs retain the runner's
+Triton cache policy so cold compilation is not newly introduced into measured
+requests.
+
+The AMD Kimi-K3 EAGLE3 performance task publishes its EvalScope outputs and
+tokenizer under `.ci-artifacts/published/kimi-k3-eagle3-perf`, including the
+request/response database. These artifacts allow input, output, and speculative
+acceptance differences to be investigated alongside timing changes. The task
+still measures one 4K-input/1K-output request with zero benchmark warmup requests
+and its original performance reference and threshold.
+
+The corresponding AMD Kimi-K3 EAGLE3 AIME26 gate publishes its per-question
+predictions and scoring records under
+`.ci-artifacts/published/kimi-k3-eagle3-aime26`. This retains evidence for accuracy
+misses without changing the full 30-question workload, generation settings, or
+score threshold.
+
+The AMD DeepSeek-V4.1-Flash GSM8K task downloads its weights into
+`.hf-model-cache` in the job's work directory. Its uncached checkpoint can exceed
+the remaining capacity of the shared model volume; the job filesystem provides
+separate writable storage, cleaned up with the work directory. The model ID,
+precision, evaluation workload, and score threshold stay the same. This task
+downloads a fresh checkpoint for each job, so startup includes the download time.
+
+The same model jobs isolate MIOpen's writable user database and kernel cache
+under `.miopen-db` and `.miopen-kernels` in their work directory. This avoids
+SQLite I/O failures from a runner's shared cache. MIOpen's system database and
+tuning settings remain unchanged; the job cleanup removes the writable caches.
+
 The MI450 simulator launcher sets `TRITON_LIBHIP_PATH` to the ROCm SDK's
 unversioned `libamdhip64.so` linker name. The gfx1250 PyTorch wheel and
 TokenSpeed use separate Triton distributions in the same process, and this

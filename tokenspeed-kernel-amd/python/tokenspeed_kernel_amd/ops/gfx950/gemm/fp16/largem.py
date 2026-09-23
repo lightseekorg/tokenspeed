@@ -62,7 +62,7 @@ def _dense16_mm_launch_metadata(grid, kernel, args):
 
 
 @gluon.jit
-def _largem_get_pids(
+def largem_get_pids(
     M,
     N,
     BM: gl.constexpr,
@@ -104,34 +104,64 @@ def _largem_get_pids(
     return pid_m, pid_n
 
 
-@gluon.jit(launch_metadata=_dense16_mm_launch_metadata)
-def gluon_mm_a16w16_prefill_gfx950(
+@gluon.jit
+def largem_mfma_lds_tile(
     a_ptr,
     b_ptr,
-    c_ptr,
-    M,
-    N,
-    K,
+    row_base,
+    col_base,
+    last_row,
+    right_delta,
     stride_am,
     stride_ak,
     stride_bk,
     stride_bn,
-    stride_cm,
-    stride_cn,
+    K,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     WARPS_M: gl.constexpr,
     WARPS_N: gl.constexpr,
-    GRID_MN: gl.constexpr,
-    NUM_XCDS: gl.constexpr,
-    GROUP_SIZE_M: gl.constexpr,
 ):
-    """8-wave 256x256x64 MFMA/LDS GEMM for large aligned dense16 tiles."""
-    pid_m, pid_n = _largem_get_pids(
-        M, N, BLOCK_M, BLOCK_N, GRID_MN, NUM_XCDS, GROUP_SIZE_M
-    )
+    """Accumulate one ``BLOCK_M x BLOCK_N`` dense16 tile of ``A @ B.T``.
 
+    The eight-wave, two-buffer, warp-pipelined MFMA/LDS schedule. It owns the
+    layouts, the LDS buffers, the prologue, the unrolled-by-2 K loop and the
+    drain, and hands back the four quadrant accumulators for the caller to
+    write out however its output demands. Keeping the epilogue outside is the
+    point: a caller whose outputs differ in dtype or destination reuses this
+    schedule instead of forking it.
+
+    Args:
+        a_ptr: Activation base pointer, ``[M, K]`` row major.
+        b_ptr: Weight base pointer, ``[N, K]`` row major, read transposed.
+        row_base: First activation row of the tile, ``pid_m * BLOCK_M``.
+        col_base: First weight column of the tile's left half.
+        last_row: Highest valid row offset inside the tile, ``M - 1 -
+            row_base``. Rows past it clamp onto it so a partial row tile stays
+            in bounds, and the caller masks those rows out of its stores. On a
+            full tile the clamp is the identity.
+        right_delta: Column distance from the left half to the right half.
+            ``BLOCK_N // 2`` walks the tile contiguously; another value pairs
+            halves that are not adjacent, and 0 parks the right half on the
+            left one when the caller has no work for it.
+        stride_am: Activation row stride.
+        stride_ak: Activation reduction-dimension stride.
+        stride_bk: Weight reduction-dimension stride.
+        stride_bn: Weight output-dimension stride.
+        K: Reduction width. Must be at least ``4 * BLOCK_K`` and a multiple of
+            ``2 * BLOCK_K``, which is what lets the loop run unrolled by two
+            with no tail.
+        BLOCK_M: Tile rows.
+        BLOCK_N: Tile columns.
+        BLOCK_K: Reduction step.
+        WARPS_M: Warps along M.
+        WARPS_N: Warps along N.
+
+    Returns:
+        The top-left, bottom-left, top-right and bottom-right FP32 quadrant
+        accumulators, each ``BLOCK_M // 2`` by ``BLOCK_N // 2``.
+    """
     gLoadLayoutA: gl.constexpr = gl.DistributedLinearLayout(
         reg_bases=[[0, 1], [0, 2], [0, 4], [8, 0]],
         lane_bases=[[0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0]],
@@ -220,13 +250,16 @@ def gluon_mm_a16w16_prefill_gfx950(
     offs_bn = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, gLoadLayoutB))
     offs_bk = gl.arange(0, BLOCK_K, gl.SliceLayout(1, gLoadLayoutB))
 
-    a_base = a_ptr + pid_m * BLOCK_M * stride_am
-    b_base = b_ptr + pid_n * BLOCK_N * stride_bn
+    a_base = a_ptr + row_base * stride_am
+    b_base = b_ptr + col_base * stride_bn
 
-    a_top_offsets = offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak
-    a_bot_offsets = a_top_offsets + (BLOCK_M // 2) * stride_am
+    rows_top = gl.minimum(offs_am, last_row)
+    rows_bot = gl.minimum(offs_am + BLOCK_M // 2, last_row)
+
+    a_top_offsets = rows_top[:, None] * stride_am + offs_ak[None, :] * stride_ak
+    a_bot_offsets = rows_bot[:, None] * stride_am + offs_ak[None, :] * stride_ak
     b_left_offsets = offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-    b_right_offsets = b_left_offsets + (BLOCK_N // 2) * stride_bn
+    b_right_offsets = b_left_offsets + right_delta * stride_bn
 
     a_top_offsets_next = a_top_offsets + BLOCK_K * stride_ak
     a_bot_offsets_next = a_bot_offsets + BLOCK_K * stride_ak
@@ -346,17 +379,6 @@ def gluon_mm_a16w16_prefill_gfx950(
             a_base += BLOCK_K * stride_ak * 2
             b_base += BLOCK_K * stride_bk * 2
 
-    gStoreLayoutC: gl.constexpr = gl.BlockedLayout(
-        [4, 8], [4, 16], [WARPS_M, WARPS_N], [1, 0]
-    )
-    offs_cm = gl.arange(0, BLOCK_M // 2, gl.SliceLayout(1, gStoreLayoutC))
-    offs_cn = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, gStoreLayoutC))
-    c_quad_offsets = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_tl_base = c_ptr + pid_m * BLOCK_M * stride_cm + pid_n * BLOCK_N * stride_cn
-    c_bl_base = c_tl_base + (BLOCK_M // 2) * stride_cm
-    c_tr_base = c_tl_base + (BLOCK_N // 2) * stride_cn
-    c_br_base = c_bl_base + (BLOCK_N // 2) * stride_cn
-
     acc_tl = cdna4.mfma(a_top, b_left, acc_tl)
     async_copy.wait_group(5)
     l_idx = (iterMax - 2) % 2
@@ -385,6 +407,67 @@ def gluon_mm_a16w16_prefill_gfx950(
 
     acc_tr = cdna4.mfma(a_top, b_right, acc_tr)
     acc_br = cdna4.mfma(a_bot, b_right, acc_br)
+    return acc_tl, acc_bl, acc_tr, acc_br
+
+
+@gluon.jit(launch_metadata=_dense16_mm_launch_metadata)
+def gluon_mm_a16w16_prefill_gfx950(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    WARPS_M: gl.constexpr,
+    WARPS_N: gl.constexpr,
+    GRID_MN: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
+    GROUP_SIZE_M: gl.constexpr,
+):
+    """8-wave 256x256x64 MFMA/LDS GEMM for large aligned dense16 tiles."""
+    pid_m, pid_n = largem_get_pids(
+        M, N, BLOCK_M, BLOCK_N, GRID_MN, NUM_XCDS, GROUP_SIZE_M
+    )
+    row_base = pid_m * BLOCK_M
+    col_base = pid_n * BLOCK_N
+    acc_tl, acc_bl, acc_tr, acc_br = largem_mfma_lds_tile(
+        a_ptr,
+        b_ptr,
+        row_base,
+        col_base,
+        M - 1 - row_base,
+        BLOCK_N // 2,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        K,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        WARPS_M=WARPS_M,
+        WARPS_N=WARPS_N,
+    )
+
+    gStoreLayoutC: gl.constexpr = gl.BlockedLayout(
+        [4, 8], [4, 16], [WARPS_M, WARPS_N], [1, 0]
+    )
+    offs_cm = gl.arange(0, BLOCK_M // 2, gl.SliceLayout(1, gStoreLayoutC))
+    offs_cn = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, gStoreLayoutC))
+    c_quad_offsets = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_tl_base = c_ptr + row_base * stride_cm + col_base * stride_cn
+    c_bl_base = c_tl_base + (BLOCK_M // 2) * stride_cm
+    c_tr_base = c_tl_base + (BLOCK_N // 2) * stride_cn
+    c_br_base = c_bl_base + (BLOCK_N // 2) * stride_cn
 
     c_tl = gl.convert_layout(acc_tl.to(c_ptr.dtype.element_ty), layout=gStoreLayoutC)
     cdna4.buffer_store(ptr=c_tl_base, offsets=c_quad_offsets, stored_value=c_tl)

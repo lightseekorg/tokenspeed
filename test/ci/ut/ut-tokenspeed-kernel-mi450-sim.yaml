@@ -78,19 +78,19 @@ env:
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv4_indexer_gfx1250.py::test_decode_tdm_threshold_logits
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv4_indexer_gfx1250.py::test_decode_graph_refresh_and_plan_aliasing
     tokenspeed-kernel/test/ops/attention/test_triton_dsv4_attention.py::test_selected_attention_and_graph_replay[True-64]
-    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[True-False-dtype0-plain]
-    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[True-False-dtype1-bias]
-    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[True-False-dtype2-hash]
-    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[False-True-dtype0-hash]
-    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[False-True-dtype1-plain]
-    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[False-True-dtype2-bias]
+    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[True-dtype0-plain]
+    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[True-dtype1-bias]
+    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[True-dtype2-hash]
+    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[False-dtype0-hash]
+    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[False-dtype1-plain]
+    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[False-dtype2-bias]
     tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_ties_and_graph_replay
     tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_nan_logits_keep_expert_ids_in_range[True]
     tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_to_mxfp4_experts[17]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/attention.dsv4_prefill_topk/gluon_dsv4_prefill_topk_mxfp4_gfx1250/mxfp4@mi450]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/attention.dsv4_decode_topk/gluon_dsv4_decode_topk_mxfp4_gfx1250/mxfp4@mi450]
-    tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/moe.dsv4_select_experts/triton_dsv4_select_experts/bias-tokens17@mi450]
-    tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/moe.dsv4_select_experts/triton_dsv4_select_experts/hash@mi450]
+    tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/moe.topk/triton_sqrt_softplus_topk/bias-tokens17@mi450]
+    tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/moe.topk/triton_sqrt_softplus_topk/hash@mi450]
     # DeepSeek V4 Gluon paged decode, one case per host-side specialization:
     # the Pro TP8 shape (16 heads, 4-warp head block, split KV plus reduce),
     # a 16-row page with a padded stride, ragged widths and a BF16 sink,

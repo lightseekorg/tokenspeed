@@ -269,6 +269,7 @@ def _make_moe_plan(api, routing_mode):
         swiglu_form=None,
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
         with_bias=False,
         process_group=None,
         deepep_mode=None,

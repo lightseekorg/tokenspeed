@@ -37,7 +37,6 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4Compressor,
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
-    DeepseekV4MegaMoEExperts,
     _deepseek_v4_expert_scale_parameter_name,
     hc_head,
 )
@@ -867,8 +866,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module, TargetCaptureConfigurator):
         for module in self.modules():
             if isinstance(module, DeepseekV4Compressor):
                 module.process_weights_after_loading()
-            elif isinstance(module, DeepseekV4MegaMoEExperts):
-                module.finalize_weights()
             elif isinstance(module, MoELayer):
                 module.process_weights_after_loading(module)
 

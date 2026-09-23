@@ -359,12 +359,8 @@ class L2CacheExecutor:
         l3_store.set_key_prefix(factory(str(weight_version)))
 
     def _wait_l3_backups(self) -> None:
-        lock = getattr(self, "_ack_lock", None)
-        if lock is None:
-            inflight = list(getattr(self, "_backup_futures", ()))
-        else:
-            with lock:
-                inflight = list(getattr(self, "_backup_futures", ()))
+        with self._ack_lock:
+            inflight = list(self._backup_futures)
         for future, _op_ids, _pages in inflight:
             future.result()
 
