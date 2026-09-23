@@ -32,7 +32,10 @@ import torch.distributed as dist
 import tqdm
 
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.cudagraph_memory import CapturedLadder
+from tokenspeed.runtime.execution.cudagraph_memory import (
+    CapturedLadder,
+    probe_positions,
+)
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -325,9 +328,9 @@ class ForwardStepRunner:
         Capture CUDA graphs for all configured batch sizes.
 
         Args:
-            entries: Capture only the largest ``entries`` batch sizes of the
-                ladder, for a caller that measures a sample rather than
-                serving from it. None captures the whole ladder.
+            entries: Capture only the positions a probe of ``entries`` samples,
+                for a caller that measures a sample rather than serving from
+                it. None captures the whole ladder.
             observer: Measured around each capture, for the same caller.
         """
         rank = self.global_rank
@@ -382,12 +385,11 @@ class ForwardStepRunner:
 
         One series each: a variant opens its own captured buffers, so its
         first capture is a one-off that must not be extrapolated across the
-        ladder entries the probe did not sample. A decode graph costs about
-        the same at every batch size, so the probe samples only the top.
+        ladder entries the probe did not sample.
         """
         return {
             f"decode:{variant}": CapturedLadder(
-                ladder, list(range(len(ladder[:entries])))
+                ladder, probe_positions(len(ladder), entries)
             )
             for variant, ladder in self.capture_plan.items()
         }

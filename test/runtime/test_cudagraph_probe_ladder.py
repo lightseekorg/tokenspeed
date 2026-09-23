@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import math
 import pathlib
 import sys
 from types import SimpleNamespace
@@ -143,27 +144,31 @@ def _prefill_graph(buckets, *, decoder_buckets=None, context_len=4096, sizes=Non
 
 
 @pytest.mark.parametrize("variants", [None, ("default", "penalties")])
-def test_the_decode_probe_samples_the_widest_entries_of_each_variant(variants) -> None:
+def test_the_decode_probe_samples_the_probe_positions_of_each_variant(variants) -> None:
     runner = _decode_runner([2**i for i in range(WIDTH + 2)], variants)
     names = [f"decode:{v}" for v in (variants or ("default",))]
     ladder = sorted((2**i for i in range(WIDTH + 2)), reverse=True)
+    # Seven entries: the widest three, then position 4 (both thirds fall together).
     assert runner.capture_ladders(WIDTH) == {
-        name: CapturedLadder(ladder, list(range(WIDTH))) for name in names
+        name: CapturedLadder(ladder, [0, 1, 2, 4]) for name in names
     }
 
     observer = _CountingObserver()
     runner.capture(entries=WIDTH, observer=observer)
 
-    widest = sorted(2**i for i in range(2, WIDTH + 2))
     for variant in variants or ("default",):
-        assert sorted(bs for v, bs in runner.graphs if v == variant) == widest
+        assert sorted(bs for v, bs in runner.graphs if v == variant) == [4, 16, 32, 64]
     estimate = cudagraph_memory.estimate_cudagraph_memory(
         observer.samples, runner.capture_ladders(WIDTH)
     )
+    granule = 2 << 20
+    window = -(-(3 + granule) // 2)
+    anchor = 3 + granule
+    # Width 8 is on the line from the window (mean width 24) to the anchor at 4.
+    on_line = anchor + (window - anchor) * (8 - 4) / (24 - 4)
     for name in names:
-        assert observer.samples[name] == list(range(WIDTH))
-        # Marginals 1..4 plus a granule, over 4, priced for 2 skipped entries.
-        assert estimate.series[name].unsampled == 2 * -(-(10 + (2 << 20)) // 4)
+        assert observer.samples[name] == [0, 1, 2, 3]
+        assert estimate.series[name].unsampled == math.ceil(on_line + 2 * anchor)
 
     serving = _decode_runner([1, 2, 4], variants)
     serving.capture(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)

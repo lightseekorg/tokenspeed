@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 
-# Ladder positions, not graphs: the widest three and two down the ladder (prefill).
+# Ladder positions, not graphs: the widest three and two down the ladder.
 PROBE_ENTRIES_PER_LADDER = 5
 # Driver allocations come in 2 MiB granules: the gcd of every reading, six ladders.
 DRIVER_GRANULE_BYTES = 2 << 20
@@ -50,7 +50,7 @@ def probe_positions(count: int, entries: int | None) -> list[int]:
     """Which positions of a ``count``-long ladder a probe of ``entries`` captures.
 
     The widest few, then one a third and one two thirds of the way down: a
-    prefill graph's cost falls with its bucket's width, so the tail is priced
+    graph's cost can fall with its entry's width, so the tail is priced
     between samples rather than at the widest ones. ``None`` captures all.
     """
     if entries is None or count <= entries:
@@ -115,11 +115,9 @@ def _estimate_series(
     Each sample after the window anchors its own width at its reading plus
     that granule. A skipped entry is priced on the line between
     the anchors around its width; narrower than every anchor, at the
-    narrowest one. A decode ladder, sampled only at the top, is priced flat
-    at its window. The projection lands within a few percent of a decode
-    ladder and, on the prefill shapes measured, above the ladder; a cost that
-    drops between two anchors is priced short there, and the utilization
-    headroom absorbs the difference either way (docs/design/unified_path.md).
+    narrowest one. A cost that drops between two anchors is priced short
+    there, and the utilization headroom absorbs the difference either way
+    (docs/design/unified_path.md).
     """
     widths, sampled = ladder.widths, list(ladder.sampled)
     if sampled != sorted(set(sampled)) or (

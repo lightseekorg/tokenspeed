@@ -138,13 +138,11 @@ from one first bound to that pool:
   granule the window may hide, over every marginal; each sample further
   down anchors its width at its reading plus that granule, and a skipped
   entry is priced on the line between the anchors around its width, or at
-  the narrowest anchor below it. Decode graphs cost about the same at every
-  batch size (a graph's size follows its kernel count), so a decode ladder
-  is sampled only at the top and priced flat at its window, within a few
-  percent of the ladder on either side (a 160-entry Qwen3-8B ladder read
-  0.97x), which the headroom absorbs. A prefill graph's cost falls with its
+  the narrowest anchor below it. Every ladder is sampled and priced the same
+  way: a decode graph costs about the same at every batch size, so its
+  anchors read close to its window; a prefill graph's cost falls with its
   bucket's width, in a shape that differs by model (linear on Qwen3-8B, flat
-  then a drop on Inkling, recurring spikes on gpt-oss), so the anchors keep
+  then a drop on Inkling, recurring spikes on gpt-oss), and the anchors keep
   the whole reserve between 1.0x and 1.5x of the capture on the models
   measured, where the widest window alone priced a prefill ladder up to 4x.
   That is not a bound: a cost that drops between two anchors is priced
