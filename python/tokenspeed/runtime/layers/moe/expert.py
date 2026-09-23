@@ -80,6 +80,7 @@ class MoELayer(torch.nn.Module):
         routing_config: dict = {},
         routing_mode: str | None = None,
         internal_activation_dtype_override: str | None = None,
+        persistent_max_num_tokens_per_gpu: int | None = None,
     ):
         super().__init__()
         self.layer_index = layer_index
@@ -264,6 +265,9 @@ class MoELayer(torch.nn.Module):
 
         # Moe Backend plan
         moe_backend = get_moe_backend().value
+        # Preserve the legacy CLI name; weight dtype selects the MegaMoE implementation.
+        if moe_backend == "deep_gemm_mega_moe":
+            moe_backend = "mega_moe"
         moe_backend = None if moe_backend == "auto" else moe_backend
         process_group = None
         deepep_mode = None
@@ -307,7 +311,9 @@ class MoELayer(torch.nn.Module):
             deepep_low_latency_max_num_tokens_per_gpu=(
                 deepep_low_latency_max_num_tokens_per_gpu
             ),
+            persistent_max_num_tokens_per_gpu=persistent_max_num_tokens_per_gpu,
             solution=moe_backend,
+            fast_math=True,
         )
 
         create_layer_weights(
@@ -319,6 +325,7 @@ class MoELayer(torch.nn.Module):
             solution=self.plan["solution"],
         )
         self._weights_processed = False
+        self._moe_backend_state: object | None = None
 
     def _swiglu_form(self) -> str | None:
         """``"standard"`` for silu(gate)*up with an optional clamp, ``"generalized"``
@@ -452,7 +459,7 @@ class MoELayer(torch.nn.Module):
                 raise ValueError(
                     "selected MoE kernel does not support in-kernel routing"
                 )
-            return tokenspeed_kernel.moe_apply(
+            output = tokenspeed_kernel.moe_apply(
                 self.plan,
                 hidden_states,
                 self,
@@ -464,6 +471,12 @@ class MoELayer(torch.nn.Module):
                 overlap_fn=overlap_fn,
                 **shared_kwargs,
             )
+            output_scale = topk_output.output_scale
+            if isinstance(output_scale, torch.Tensor):
+                output_scale = output_scale.to(output.dtype)
+            if isinstance(output_scale, torch.Tensor) or output_scale != 1.0:
+                output = output * output_scale
+            return output
         if not self.supports_precomputed_topk:
             raise ValueError(
                 "selected MoE kernel does not support precomputed top-k routing"

@@ -18,6 +18,9 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_decode import (
         launch_gluon_latent_input_decode_gfx950 as _decode_gfx950_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_prefill import (
+        launch_gluon_latent_input_prefill_gfx950 as _prefill_gfx950_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_small_batch import (
         launch_gluon_latent_input_small_batch_gfx950 as _small_batch_impl,
     )
@@ -127,6 +130,42 @@ if current_platform().is_amd:
             kwargs["hidden_states"],
             *weights,
             packed_projection_weight_view(*weights),
+            beta=kwargs["gate_clamp"],
+            linear_beta=kwargs["up_clamp"],
+        )
+
+    @register_kernel(
+        "moe",
+        "latent_input",
+        name="gluon_latent_input_prefill_gfx950",
+        solution="gluon",
+        capability=_GFX950,
+        signatures=_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={
+            # A partial final row tile is masked, so no alignment is required.
+            "tokens_min": frozenset({4096}),
+            "hidden_size": frozenset({7168}),
+            "inputs_contiguous": frozenset({True}),
+            "latent_size": frozenset({3584}),
+            "num_experts": frozenset({896}),
+            "shared_size": frozenset({768}),
+            "weights_packed": frozenset({True}),
+        },
+    )
+    def gluon_latent_input_prefill_gfx950(**kwargs):
+        weights = (
+            kwargs["router_weight"],
+            kwargs["routed_weight"],
+            kwargs["shared_gate_up_weight"],
+        )
+        packed_weight = packed_projection_weight_view(*weights)
+        if packed_weight is None:
+            raise ValueError("Kimi K3 prefill projection weights must be packed")
+        return _prefill_gfx950_impl(
+            kwargs["hidden_states"],
+            *weights,
+            packed_weight,
             beta=kwargs["gate_clamp"],
             linear_beta=kwargs["up_clamp"],
         )

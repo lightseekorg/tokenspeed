@@ -482,6 +482,7 @@ def prepare_moe_apply(
         fp8_scale_block_shape=block_shape,
         internal_activation_dtype=internal_activation_dtype,
         with_bias=False,
+        fast_math=False,
         solution=None,
     )
     spec = KernelRegistry.get().get_by_name(plan["apply_kernel_name"])

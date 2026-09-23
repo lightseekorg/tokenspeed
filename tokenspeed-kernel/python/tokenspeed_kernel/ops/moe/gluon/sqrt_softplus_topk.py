@@ -33,13 +33,13 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.moe import (
-        launch_gluon_dsv4_select_experts_gfx950 as _select_experts_impl,
+        launch_gluon_sqrt_softplus_topk_gfx950 as _topk_impl,
     )
 
     @register_kernel(
         "moe",
-        "dsv4_select_experts",
-        name="gluon_dsv4_select_experts_gfx950",
+        "topk",
+        name="gluon_sqrt_softplus_topk_gfx950",
         solution="gluon",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 5),
@@ -56,8 +56,9 @@ if current_platform().is_amd:
             "top_k": frozenset({6}),
             "renormalize": frozenset({False, True}),
             "routing_kind": frozenset({"plain", "bias", "hash"}),
+            "score_function": frozenset({"sqrt_softplus"}),
         },
         priority=Priority.SPECIALIZED,
     )
-    def gluon_dsv4_select_experts_gfx950(*args, **kwargs):
-        return _select_experts_impl(*args, **kwargs)
+    def gluon_sqrt_softplus_topk_gfx950(*args, **kwargs):
+        return _topk_impl(*args, **kwargs)

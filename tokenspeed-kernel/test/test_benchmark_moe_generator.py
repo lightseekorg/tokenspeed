@@ -193,6 +193,7 @@ def test_moe_apply_generator_precomputes_local_ep_routes(
     assert seen["plan_kwargs"]["swiglu_form"] == "standard"
     assert seen["plan_kwargs"]["activation_clamped"] is True
     assert seen["plan_kwargs"]["expert_id_repeats"] is False
+    assert seen["plan_kwargs"]["fast_math"] is False
     assert seen["route_shape"] == (3, 4)
     assert seen["route_dtype"] is torch.bfloat16
     assert seen["correction_bias_shape"] == (4,)
