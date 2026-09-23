@@ -42,13 +42,14 @@ def silu_and_mul(
 
     Positive ``limit`` values use the portable Triton implementation because
     the CUDA implementation does not expose the checkpoint's clamp semantics.
+
     """
     if (
         limit is not None
         or current_platform().is_amd
         or flashinfer_silu_and_mul is error_fn
     ):
-        return triton_silu_and_mul(x, out, enable_pdl=pdl_enabled(), limit=limit)
+        return triton_silu_and_mul(x, out, limit=limit)
     return flashinfer_silu_and_mul(x, out, enable_pdl=pdl_enabled())
 
 
@@ -104,7 +105,6 @@ def situ_and_mul(
         out,
         beta=beta,
         linear_beta=linear_beta,
-        enable_pdl=pdl_enabled(),
     )
 
 

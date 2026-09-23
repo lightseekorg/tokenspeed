@@ -227,19 +227,24 @@ declared in task YAMLs and therefore does not enter default CI matrices.
 
 Each vendor PR workflow starts with a `scan` job that classifies the changed
 files with `test/ci_system/ci_path_filter.py --runner-group <group>` and skips
-its GPU matrix jobs when nothing requires that vendor. The classification is
-directory based:
+its GPU matrix jobs when nothing requires that runner group. The first
+matching rule decides (`ci_path_filter.py` holds the full lists):
 
-* Shared paths (`python/`, `test/`, `tokenspeed-kernel/`,
-  `tokenspeed-scheduler/`, `run-pr-test-stage.yml`) require every runner group.
-* Vendor-owned paths require only that vendor's runner groups, even inside a
-  shared directory: `tokenspeed-kernel-amd/` and
-  `tokenspeed-kernel/test/amd/` are AMD; `tokenspeed-mla/` and
-  `tokenspeed-kernel/test/nvidia/` are NVIDIA.
+* Markdown files require no runner group.
+* Vendor-owned paths (`tokenspeed-kernel-amd/`, `tokenspeed-mla/`, the
+  `tokenspeed-kernel/test/<vendor>/` subtrees, and vendor-specific requirements
+  and CI scripts) require only that vendor's runner groups.
+* Kernel sources are classified by solution name: `cuda`, `cute_dsl`,
+  `flashinfer`, `deep_gemm`, `trtllm`, etc. are NVIDIA; `gluon` is AMD. A
+  vendor-named file whose content mentions another vendor stays shared.
+* `test/ci` task YAMLs require only the runner groups matching their
+  `runner.labels`.
+* Other paths under `python/`, `test/`, `tokenspeed-kernel/`, and
+  `tokenspeed-scheduler/` require every runner group.
 * Each workflow's own YAML requires only its runner group; `workflow_dispatch`
   always runs.
 
-`tokenspeed-kernel/test/` is laid out to feed this filter. Tests whose
+`tokenspeed-kernel/test/` is laid out to feed the vendor rules. Tests whose
 module-level gate (`is_cdna4()`, `is_cdna5()`, `is_amd()`, or an import from
 `tokenspeed_kernel_amd`) skips them off AMD hardware live under
 `tokenspeed-kernel/test/amd/`; tests that require CUDA, CuTe DSL, FlashInfer,

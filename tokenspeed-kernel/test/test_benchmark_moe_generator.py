@@ -25,6 +25,7 @@ import tokenspeed_kernel.benchmark.generators.moe as moe_generator
 import torch
 from tokenspeed_kernel.benchmark.generators.moe import prepare_moe_apply
 from tokenspeed_kernel.benchmark.harness import BenchmarkCaseError, BenchmarkRequest
+from tokenspeed_kernel.ops import moe as moe_ops
 from tokenspeed_kernel.platform import PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 
@@ -77,8 +78,6 @@ def test_moe_apply_generator_precomputes_local_ep_routes(
     monkeypatch,
     mi350_platform: PlatformInfo,
 ) -> None:
-    from tokenspeed_kernel.ops import moe as moe_ops
-
     _ = fresh_registry
     spec = KernelSpec(
         name="unit_moe_apply",
@@ -121,12 +120,26 @@ def test_moe_apply_generator_precomputes_local_ep_routes(
         seen["plan"] = plan
         seen["weights"] = weights
 
-    def fake_topk(router_logits, correction_bias, topk, **_kwargs):
+    def fake_topk(
+        router_logits,
+        top_k,
+        score_function,
+        selection_method,
+        renormalize,
+        routed_scaling_factor,
+        correction_bias,
+        topk_weights_dtype,
+    ):
         seen["route_shape"] = tuple(router_logits.shape)
         seen["route_dtype"] = router_logits.dtype
         seen["correction_bias_shape"] = tuple(correction_bias.shape)
-        ids = torch.arange(topk, dtype=torch.int32).repeat(router_logits.shape[0], 1)
-        weights = torch.ones(router_logits.shape[0], topk, dtype=torch.float32)
+        seen["score_function"] = score_function
+        seen["selection_method"] = selection_method
+        seen["renormalize"] = renormalize
+        seen["routed_scaling_factor"] = routed_scaling_factor
+        seen["topk_weights_dtype"] = topk_weights_dtype
+        ids = torch.arange(top_k, dtype=torch.int32).repeat(router_logits.shape[0], 1)
+        weights = torch.ones(router_logits.shape[0], top_k, dtype=topk_weights_dtype)
         return weights, ids
 
     def fake_apply(plan, hidden_states, weights, router_logits, **kwargs):
@@ -143,7 +156,7 @@ def test_moe_apply_generator_precomputes_local_ep_routes(
         return hidden_states
 
     monkeypatch.setattr(moe_ops, "moe_process_weights", fake_process_weights)
-    monkeypatch.setattr(moe_ops, "moe_sigmoid_bias_topk", fake_topk)
+    monkeypatch.setattr(moe_ops, "moe_topk", fake_topk)
     monkeypatch.setattr(moe_ops, "moe_apply", fake_apply)
 
     prepared = prepare_moe_apply(
@@ -197,6 +210,11 @@ def test_moe_apply_generator_precomputes_local_ep_routes(
     assert seen["route_shape"] == (3, 4)
     assert seen["route_dtype"] is torch.bfloat16
     assert seen["correction_bias_shape"] == (4,)
+    assert seen["score_function"] == "sigmoid"
+    assert seen["selection_method"] == "topk"
+    assert seen["renormalize"] is True
+    assert seen["routed_scaling_factor"] == 2.5
+    assert seen["topk_weights_dtype"] is torch.float32
     assert seen["weights"].ep_rank == 2
     assert seen["weights"].ep_size == 4
     assert seen["weights"].num_local_experts == 4
