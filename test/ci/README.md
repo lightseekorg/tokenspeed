@@ -227,19 +227,46 @@ declared in task YAMLs and therefore does not enter default CI matrices.
 
 Each vendor PR workflow starts with a `scan` job that classifies the changed
 files with `test/ci_system/ci_path_filter.py --runner-group <group>` and skips
-its GPU matrix jobs when nothing requires that vendor. The classification is
-directory based:
+its GPU matrix jobs when nothing requires that runner group. The scan reads the
+checked-out revision, so it installs PyYAML before classifying. Its log lists
+the changed paths that required the group. The first matching rule decides:
 
-* Shared paths (`python/`, `test/`, `tokenspeed-kernel/`,
-  `tokenspeed-scheduler/`, `run-pr-test-stage.yml`) require every runner group.
+* Markdown (`*.md`) files require no runner group.
 * Vendor-owned paths require only that vendor's runner groups, even inside a
-  shared directory: `tokenspeed-kernel-amd/` and
-  `tokenspeed-kernel/test/amd/` are AMD; `tokenspeed-mla/` and
-  `tokenspeed-kernel/test/nvidia/` are NVIDIA.
+  shared directory. AMD owns `tokenspeed-kernel-amd/`,
+  `tokenspeed-kernel/test/amd/`, `tokenspeed-kernel/benchmarks/amd/`, the
+  `rocm*.txt` kernel requirements, and the ROCm/MI450 CI scripts under
+  `test/ci_system/`. NVIDIA owns `tokenspeed-mla/`,
+  `tokenspeed-kernel/test/nvidia/`, the `cuda*.txt` kernel requirements, and the
+  CUDA/FlashInfer CI scripts. Ascend-only files require no GPU runner group.
+* Kernel sources are classified by solution name. A path under
+  `tokenspeed_kernel/ops/` with a component (ignoring a leading `_`) such as
+  `cuda`, `cute_dsl`, `flashinfer`, `deep_gemm`, `trtllm`, or `tokenspeed_mla`
+  is NVIDIA; `gluon` or `iris` is AMD. Under `tokenspeed_kernel/thirdparty/`,
+  the `cuda`, `cute_dsl`, `cutedsl_kda`, `deep_select`, `flashinfer`, `msa`,
+  and `trtllm_blockwise` packages are NVIDIA. A vendor-named file whose current
+  content names another vendor (for example `is_amd`, `is_cdna4`, or a
+  `"nvidia"` registration) stays shared, because it can change that vendor's
+  behavior. `ci_path_filter.py` holds the full lists.
+* `test/ci/**/*.yaml` task files require only the runner groups that schedule
+  one of their `runner.labels`: `amd-*` labels are AMD, `slurm-gb200-*` and
+  `slurm-gb300-*` are the GB200/GB300 Slurm workflows, other GB200/GB300 labels
+  are NVIDIA ARM, and the remaining labels are NVIDIA x86. A deleted or
+  unreadable task falls back to the shared rule.
+* `test/ci/run_slurm.sh` and `test/ci_system/slurm_submit.py` require only the
+  Slurm workflows. `test/ci/deepswe/` is used only by the manual B300 DeepSWE
+  workflow and requires no per-commit runner group.
+* Other paths under the shared directories (`python/`, `test/`,
+  `tokenspeed-kernel/`, `tokenspeed-scheduler/`) and `run-pr-test-stage.yml`
+  require every runner group.
 * Each workflow's own YAML requires only its runner group; `workflow_dispatch`
   always runs.
 
-`tokenspeed-kernel/test/` is laid out to feed this filter. Tests whose
+The runtime under `python/tokenspeed` stays shared even where a module is named
+after an NVIDIA library, because the runtime constructs and probes those
+backends on every platform.
+
+`tokenspeed-kernel/test/` is laid out to feed the vendor rules. Tests whose
 module-level gate (`is_cdna4()`, `is_cdna5()`, `is_amd()`, or an import from
 `tokenspeed_kernel_amd`) skips them off AMD hardware live under
 `tokenspeed-kernel/test/amd/`; tests that require CUDA, CuTe DSL, FlashInfer,

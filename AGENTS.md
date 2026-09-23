@@ -148,6 +148,10 @@ Inside the root `tokenspeed-kernel/` directory:
 * Prefer to `@register_kernel` with the name as the Python `def` function
   attached to, prefixed with its solution (e.g, `triton_mha_prefill`).
 * When defining new public APIs, explain arguments and returns in docstring.
+* Keep vendor-only code in files or private directories named after its
+  vendor-specific solution (`cute_dsl`, `gluon`, ...). CI skips the other
+  vendor's GPU jobs based on these names. Code that serves both vendors belongs
+  in a shared solution (`triton`).
 * Vendor-specific tests should be placed under `test/<vendor>/` subdirectory.
   Tests for common infra and covering multi-vendors reside under `test/`
   directly.
