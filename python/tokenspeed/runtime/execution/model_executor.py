@@ -643,6 +643,8 @@ class ModelExecutor:
         through ``set_cache_pool``. Tuning is a separate step, run once per boot:
         a captured graph keeps the tactic chosen when it was captured, and
         set_autotune_max_num_tokens must be called once per process.
+        ``entries`` samples each ladder at the probe's positions; ``None``
+        captures every graph.
         """
         workspace_pool(self.device).freeze()
 

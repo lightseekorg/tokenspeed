@@ -71,6 +71,10 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     active_forward,
 )
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.cudagraph_memory import (
+    CapturedLadder,
+    probe_positions,
+)
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -281,8 +285,7 @@ def narrowing_prefill_model(model) -> NarrowingPrefillModel | None:
     """The narrowing model a prefill capture would drive, or ``None``.
 
     The protocol is implemented by the inner text model, not the causal-LM
-    wrapper the runner holds, so a caller that asks the wrapper always gets
-    ``None``.
+    wrapper the runner holds, so the wrapper is unwrapped first.
     """
     _, inner = text_and_inner_model(model)
     return inner if isinstance(inner, NarrowingPrefillModel) else None
@@ -486,9 +489,9 @@ class PrefillGraph:
     ) -> None:
         """Capture ordinary and compatible inline variants per token bucket.
 
-        No-op when disabled. ``entries`` caps the buckets captured, for a
-        caller measuring a sample rather than serving from it; ``observer``
-        is measured around each capture for the same caller.
+        No-op when disabled. ``entries`` samples each ladder's buckets at the
+        probe's positions, for a caller that sizes memory from ``observer``,
+        measured around each capture; ``None`` captures every bucket.
 
         ``decode_wrapper`` supplies the shared capture stream (used here only,
         not stored). Buckets share
@@ -540,30 +543,20 @@ class PrefillGraph:
         entries: int | None,
         observer: MemoryDeltaObserver,
     ) -> None:
-        """Capture the plan's buckets, the widest first, with every kind covered.
-
-        ``entries`` caps the buckets a probe samples, and narrower buckets are
-        added until every inline count is sampled: the widest buckets can
-        admit none, and inline graphs cost more than ordinary ones.
-        """
         rank = self.config.global_rank
         # Off the plan: a bucket it omits is one nothing here can capture.
-        plan = self.capture_plan
-        ordered: list[int] = []
-        variants: dict[int, list[int]] = {}
-        for bucket, bs in plan.get("prefill") or plan.get("prefill:encoder", ()):
+        series = "prefill" if self._narrowing is None else "prefill:encoder"
+        ladder = self.capture_ladders(entries)[series]
+        sampled = {ladder.widths[i] for i in ladder.sampled}
+        buckets: list[int] = []
+        inline_counts: dict[int, list[int]] = {}
+        for bucket, bs in self.capture_plan[series]:
+            if bucket not in sampled:
+                continue
             if bs is None:
-                ordered.append(bucket)
-            else:
-                variants.setdefault(bucket, []).append(bs)
-        buckets = ordered[:entries]
-        # The widest buckets can admit no inline count at all; cover each.
-        covered = {bs for b in buckets for bs in variants.get(b, ())}
-        for bucket in ordered:
-            missing = set(variants.get(bucket, ())) - covered
-            if missing:
                 buckets.append(bucket)
-                covered |= missing
+            else:
+                inline_counts.setdefault(bucket, []).append(bs)
         capture_range = tqdm.tqdm(buckets) if rank == 0 else buckets
         for bucket in capture_range:
             if rank == 0:
@@ -594,7 +587,7 @@ class PrefillGraph:
                         self._captures[bucket, None] = self._capture_bucket(
                             bucket, decode_wrapper, observer.measure("prefill")
                         )
-                for bs in variants.get(bucket, ()):
+                for bs in inline_counts.get(bucket, ()):
                     self._ctx = self.make_dummy_batch(bucket, bs)
                     with active_forward(self._ctx):
                         if not self.attn_backend.prepare_prefill_metadata(
@@ -665,7 +658,8 @@ class PrefillGraph:
         rank = self.config.global_rank
         per_request = max(1, int(self._narrowing.max_decoder_rows_per_request))
         # Off the plan, for the same reason the bucket ladder is.
-        buckets = [rows for rows, _ in self.capture_plan["prefill:decoder"]][:entries]
+        ladder = self.capture_ladders(entries)["prefill:decoder"]
+        buckets = [ladder.widths[i] for i in ladder.sampled]
         capture_range = tqdm.tqdm(buckets) if rank == 0 else buckets
         for rows in capture_range:
             if rank == 0:
@@ -762,10 +756,21 @@ class PrefillGraph:
             )
         return {"prefill": plan}
 
-    @property
-    def capture_entries(self) -> dict[str, int]:
-        """How many entries a full capture records, counted off the plan."""
-        return {series: len(graphs) for series, graphs in self.capture_plan.items()}
+    def capture_ladders(self, entries: int | None) -> dict[str, CapturedLadder]:
+        """Each ladder's entry widths off the plan, and the positions ``entries`` samples.
+
+        A bucket's inline variants are entries at the bucket's width, sampled
+        with it.
+        """
+        ladders = {}
+        for series, graphs in self.capture_plan.items():
+            buckets = [bucket for bucket, bs in graphs if bs is None]
+            sampled = {buckets[i] for i in probe_positions(len(buckets), entries)}
+            ladders[series] = CapturedLadder(
+                [bucket for bucket, _ in graphs],
+                [i for i, (bucket, _) in enumerate(graphs) if bucket in sampled],
+            )
+        return ladders
 
     def release_graphs(self) -> None:
         """Drop the captured buckets and the private pool they share.
@@ -789,8 +794,7 @@ class PrefillGraph:
         """Warm up and capture the breakable graph for ``bucket`` from the buffers.
 
         ``observer`` wraps the capture alone: the warmups above it are eager
-        forwards whose allocations either survive to the memory profile, which
-        already counts them, or are handed back by its empty_cache.
+        forwards, and what they keep is left to the utilization headroom.
         """
         for _ in range(self.num_warmup):
             self._run_inner(bucket)

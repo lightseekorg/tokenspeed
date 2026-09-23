@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 import pathlib
 import sys
 from types import SimpleNamespace
@@ -41,7 +42,8 @@ from tokenspeed.runtime.execution import memory_delta  # noqa: E402
 from tokenspeed.runtime.execution import model_executor  # noqa: E402
 from tokenspeed.runtime.execution.cudagraph_memory import (  # noqa: E402
     PROBE_ENTRIES_PER_LADDER,
-    _entry_counts,
+    CapturedLadder,
+    _ladders,
     estimate_cudagraph_memory,
     probe_cudagraph_memory,
     reserve_and_rebind,
@@ -89,72 +91,197 @@ def test_the_observer_brackets_each_window_on_the_device_it_was_given() -> None:
     assert NULL_MEMORY_DELTA_OBSERVER.samples == {}
 
 
+def _top(count, sampled):
+    """A ladder of ``count`` widths falling by one, sampled at its top."""
+    return CapturedLadder(list(range(count, 0, -1)), list(range(sampled)))
+
+
+def _rate(positive_sum, marginals):
+    """The window's rate: its positive bytes plus a granule over its marginals."""
+    return -(-((positive_sum + 2) * MIB) // marginals)
+
+
 @pytest.mark.parametrize(
-    "samples, entries, expected",
+    "samples, ladders, expected",
     [
-        # (measured, rate, unsampled): disjoint ladders add up.
+        # (measured, unsampled) in MiB: disjoint ladders add up.
         (
             {"prefill": (100, 7, 9, 8), "decode": (30, 5, 4)},
-            {"prefill": 5, "decode": 3},
-            {"prefill": (124, 8, 8), "decode": (39, 5, 0)},
+            {"prefill": _top(5, 4), "decode": _top(3, 3)},
+            {"prefill": (124, _rate(24, 3)), "decode": (39, 0)},
         ),
-        # A growth step is spread over the window, not dropped.
+        # A lumpy window is priced at its mean, plus one granule.
         (
-            {"prefill": (2530, 40, 650, 40)},
-            {"prefill": 48},
-            {"prefill": (3260, 244, 244 * 44)},
+            {"decode": (282, 0, 0, 0, 4)},
+            {"decode": _top(23, 5)},
+            {"decode": (286, 18 * _rate(4, 4))},
+        ),
+        (
+            {"decode": (282, 2, 0, 2, 6)},
+            {"decode": _top(23, 5)},
+            {"decode": (292, 18 * _rate(10, 4))},
         ),
         # Memory handed back is neither a credit nor a discount on the divisor.
-        ({"prefill": (100, -48, -50, -46)}, {"prefill": 40}, {"prefill": (100, 0, 0)}),
         (
-            {"prefill": (100, 38, 38, -38, 38)},
-            {"prefill": 40},
-            {"prefill": (214, 29, 29 * 35)},
+            {"decode": (100, -48, -50, -46)},
+            {"decode": _top(40, 4)},
+            {"decode": (100, 0)},
         ),
-        ({"prefill": (-100, -5, -6, -7)}, {"prefill": 4}, {"prefill": (0, 0, 0)}),
+        (
+            {"decode": (100, 38, 38, -38, 38)},
+            {"decode": _top(40, 5)},
+            {"decode": (214, 35 * _rate(114, 4))},
+        ),
+        ({"decode": (-100, -5, -6, -7)}, {"decode": _top(4, 4)}, {"decode": (0, 0)}),
         # The pool-creating capture can read negative; it is floored, not credited.
-        ({"decode": (-48, 26, 30, 26)}, {"decode": 10}, {"decode": (82, 28, 28 * 6)}),
+        (
+            {"decode": (-48, 26, 30, 26)},
+            {"decode": _top(10, 4)},
+            {"decode": (82, 6 * _rate(82, 3))},
+        ),
         # A variant's opening capture stays in its own ladder.
         (
             {"decode:a": (100, 10, 10, 10), "decode:b": (500, 10, 10, 10)},
-            {"decode:a": 8, "decode:b": 8},
-            {"decode:a": (130, 10, 40), "decode:b": (530, 10, 40)},
+            {"decode:a": _top(8, 4), "decode:b": _top(8, 4)},
+            {"decode:a": (130, 4 * _rate(30, 3)), "decode:b": (530, 4 * _rate(30, 3))},
         ),
         # Two samples are enough for a rate; the tail scales with the ladder.
-        ({"prefill": (100, 7)}, {"prefill": 40}, {"prefill": (107, 7, 7 * 38)}),
-        ({"decode": (1, 1, 1, 1)}, {"decode": 128}, {"decode": (4, 1, 124)}),
-        ({"decode": (0,) * 0}, {"decode": 0}, {"decode": (0, 0, 0)}),
+        (
+            {"decode": (100, 7)},
+            {"decode": _top(40, 2)},
+            {"decode": (107, 38 * _rate(7, 1))},
+        ),
+        (
+            {"decode": (1, 1, 1, 1)},
+            {"decode": _top(128, 4)},
+            {"decode": (4, 124 * _rate(3, 3))},
+        ),
+        ({"decode": ()}, {"decode": _top(0, 0)}, {"decode": (0, 0)}),
+        # Between the window and an anchor entries sit on the line; below it, flat.
+        (
+            {"prefill": (200, 20, 20, 10, 4)},
+            {
+                "prefill": CapturedLadder(
+                    [512, 448, 384, 320, 256, 192, 128, 64, 32], [0, 1, 2, 3, 6]
+                )
+            },
+            # Window 52/3 at 384, anchor 4 + 2 at 128: the line at 256 and 192, then 6 + 6.
+            {"prefill": (254, math.ceil(24 * MIB + 0.75 * (_rate(50, 3) - 6 * MIB)))},
+        ),
+        # Inline variants share their bucket's width; the dearer reading anchors it.
+        (
+            {"prefill": (100, 10, 8, 8, 6, 6, 2, 4)},
+            {
+                "prefill": CapturedLadder(
+                    [64, 64, 48, 48, 32, 32, 16, 16, 8, 8, 4, 4],
+                    [0, 1, 2, 3, 4, 5, 8, 9],
+                )
+            },
+            # Window 8 at 44.8, anchor 6 at 8: two on the line at 16, two flat at 4.
+            {"prefill": (144, math.ceil(MIB * (2 * (6 + 2 * 8 / 36.8) + 12)))},
+        ),
+        (
+            {"prefill": (100, 10, 8, 8, 6, 6, 4, 2)},
+            {
+                "prefill": CapturedLadder(
+                    [64, 64, 48, 48, 32, 32, 16, 16, 8, 8, 4, 4],
+                    [0, 1, 2, 3, 4, 5, 8, 9],
+                )
+            },
+            {"prefill": (144, math.ceil(MIB * (2 * (6 + 2 * 8 / 36.8) + 12)))},
+        ),
+        # An anchor served from slack, or one that handed memory back, prices at one granule.
+        (
+            {"prefill": (50, 4, 4, 4, 0)},
+            {
+                "prefill": CapturedLadder(
+                    [100, 90, 80, 70, 60, 50, 40, 30, 20], [0, 1, 2, 3, 6]
+                )
+            },
+            # Window 14/3 at 80, anchor 2 at 40: the line at 60 and 50, then 2 and 2.
+            {
+                "prefill": (
+                    62,
+                    math.ceil(8 * MIB + 0.75 * (_rate(12, 3) - 2 * MIB)),
+                )
+            },
+        ),
+        (
+            {"prefill": (50, 4, 4, 4, -6)},
+            {
+                "prefill": CapturedLadder(
+                    [100, 90, 80, 70, 60, 50, 40, 30, 20], [0, 1, 2, 3, 6]
+                )
+            },
+            {
+                "prefill": (
+                    62,
+                    math.ceil(8 * MIB + 0.75 * (_rate(12, 3) - 2 * MIB)),
+                )
+            },
+        ),
     ],
 )
-def test_the_projection(samples, entries, expected) -> None:
-    estimate = estimate_cudagraph_memory(samples, entries)
+def test_the_projection(samples, ladders, expected) -> None:
+    samples = {name: tuple(MIB * s for s in series) for name, series in samples.items()}
+    estimate = estimate_cudagraph_memory(samples, ladders)
     got = {name: tuple(vars(estimate.series[name]).values()) for name in expected}
-    assert got == expected
-    assert estimate.measured_total == sum(m for m, _r, _u in expected.values())
-    assert estimate.unsampled_total == sum(u for _m, _r, u in expected.values())
+    assert got == {name: (MIB * m, u) for name, (m, u) in expected.items()}
+    assert estimate.measured_total == sum(MIB * m for m, _u in expected.values())
+    assert estimate.unsampled_total == sum(u for _m, u in expected.values())
+
+
+def test_a_dearer_reading_never_lowers_the_reserve() -> None:
+    ladder = CapturedLadder(
+        [512, 448, 384, 320, 256, 192, 128, 64, 32], [0, 1, 2, 3, 6]
+    )
+    for base in ((200, 20, 20, 20, 20), (200, 20, 20, 10, 4), (200, 0, 2, 0, 4)):
+        samples = tuple(MIB * s for s in base)
+        before = estimate_cudagraph_memory({"prefill": samples}, {"prefill": ladder})
+        for i in range(len(samples)):
+            dearer = samples[:i] + (samples[i] + 2 * MIB,) + samples[i + 1 :]
+            after = estimate_cudagraph_memory({"prefill": dearer}, {"prefill": ladder})
+            assert after.unsampled_total + after.measured_total >= (
+                before.unsampled_total + before.measured_total
+            ), (base, i)
 
 
 @pytest.mark.parametrize(
-    "samples, entries, match",
+    "samples, ladders, match",
     [
-        ({"decode": (5,)}, {"decode": 0}, "no entries"),
-        ({"prefill": (100,)}, {"prefill": 40}, "expected between 2"),
-        ({"prefill": (100, 7, 9)}, {"prefill": 2}, "expected between 2"),
-        ({"ghost": (5, 1), "decode": (9, 1)}, {"decode": 2}, "unknown ladders"),
+        ({"decode": (5,)}, {"decode": _top(0, 0)}, "no entries"),
+        ({"prefill": (100,)}, {"prefill": _top(40, 1)}, "at least 2"),
+        ({"prefill": (100, 7, 9)}, {"prefill": _top(40, 2)}, "expected the first"),
+        (
+            {"prefill": (100, 7)},
+            {"prefill": CapturedLadder([4, 3, 2], [1, 2])},
+            "the first",
+        ),
+        (
+            {"prefill": (100, 7)},
+            {"prefill": CapturedLadder([4, 3, 2], [2, 0])},
+            "not ladder",
+        ),
+        (
+            {"prefill": (100, 7)},
+            {"prefill": CapturedLadder([4, 3, 2], [0, 3])},
+            "not ladder",
+        ),
+        (
+            {"ghost": (5, 1), "decode": (9, 1)},
+            {"decode": _top(2, 2)},
+            "unknown ladders",
+        ),
     ],
 )
 def test_the_projection_refuses_samples_the_capture_cannot_produce(
-    samples, entries, match
+    samples, ladders, match
 ) -> None:
     with pytest.raises(ValueError, match=match):
-        estimate_cudagraph_memory(samples, entries)
+        estimate_cudagraph_memory(samples, ladders)
 
 
-def test_the_probe_width_is_measured_not_arbitrary() -> None:
-    assert PROBE_ENTRIES_PER_LADDER == 5
-
-
-def _probe(samples, entries, *, world_size=1, gpu_id=0, hungriest=None):
+def _probe(samples, ladders, *, world_size=1, gpu_id=0, hungriest=None):
     """Run the probe with a fabricated observer; returns (reserve, seen)."""
     seen = {"gpu_ids": []}
 
@@ -173,10 +300,14 @@ def _probe(samples, entries, *, world_size=1, gpu_id=0, hungriest=None):
         drafter=None,
         captures_drafter_prefill_graph=False,
         forward_step=SimpleNamespace(
-            capture_entries={k: v for k, v in entries.items() if "decode" in k}
+            capture_ladders=lambda entries: {
+                k: v for k, v in ladders.items() if "decode" in k
+            }
         ),
         prefill_graph=SimpleNamespace(
-            capture_entries={k: v for k, v in entries.items() if "decode" not in k}
+            capture_ladders=lambda entries: {
+                k: v for k, v in ladders.items() if "decode" not in k
+            }
         ),
     )
     server_args = SimpleNamespace(
@@ -195,24 +326,27 @@ def _probe(samples, entries, *, world_size=1, gpu_id=0, hungriest=None):
 
 
 def test_the_probe_samples_its_own_device_and_reserves_every_ladder() -> None:
-    samples = {"prefill": [700, 10, 10, 10], "decode:default": [300, 6, 6, 6]}
-    entries = {"prefill": 8, "decode:default": 8}
+    samples = {
+        "prefill": [MIB * s for s in (700, 10, 10, 10)],
+        "decode:default": [MIB * s for s in (300, 6, 6, 6)],
+    }
+    ladders = {"prefill": _top(4, 4), "decode:default": _top(8, 4)}
 
-    reserve, seen = _probe(samples, entries, gpu_id=3)
+    reserve, seen = _probe(samples, ladders, gpu_id=3)
 
-    assert seen["gpu_ids"] == [3, 3]
+    assert seen["gpu_ids"] == [3]
     assert seen["entries"] == PROBE_ENTRIES_PER_LADDER
-    assert reserve == (730 + 10 * 4) + (318 + 6 * 4)
+    assert reserve == MIB * (730 + 318) + 4 * _rate(18, 3)
 
 
 def test_the_probe_reserves_what_the_reduction_returned() -> None:
     reserve, _ = _probe(
-        {"decode:default": [300, 6, 6, 6]},
-        {"decode:default": 8},
+        {"decode:default": [MIB * s for s in (300, 6, 6, 6)]},
+        {"decode:default": _top(8, 4)},
         world_size=8,
         hungriest=lambda _args, total: total + 777,
     )
-    assert reserve == 318 + 6 * 4 + 777
+    assert reserve == MIB * 318 + 4 * _rate(18, 3) + 777
 
 
 def test_a_ladder_the_probe_could_not_price_warns_the_operator() -> None:
@@ -224,7 +358,9 @@ def test_a_ladder_the_probe_could_not_price_warns_the_operator() -> None:
     ]
     for samples, warning in cases:
         with mock.patch.object(cudagraph_memory.logger, "warning") as warn:
-            reserve, _ = _probe({"decode:default": samples}, {"decode:default": 40})
+            reserve, _ = _probe(
+                {"decode:default": samples}, {"decode:default": _top(40, 5)}
+            )
         text = " ".join(str(call.args[0]) for call in warn.call_args_list)
         if warning is None:
             assert text == "", samples
@@ -235,15 +371,14 @@ def test_a_ladder_the_probe_could_not_price_warns_the_operator() -> None:
             assert reserve == 1 << 24
 
 
-def test_the_probe_never_reserves_less_than_it_spent() -> None:
-    # Free MiB per read; the whole-probe bracket sees 700, the two windows 150.
-    script = [10_000, 9_950, 9_850, 9_850, 9_800, 9_300]
-    reads = iter(range(100))
+def test_memory_taken_between_captures_is_not_reserved() -> None:
+    # Free MiB per read: each capture takes 50, and 400 go elsewhere between them.
+    script = iter([10_000, 9_950, 9_550, 9_500])
 
     device = SimpleNamespace(
         synchronize=lambda _gpu: None,
         empty_cache=lambda: None,
-        mem_get_info=lambda _gpu: (script[min(next(reads), 5)] * MIB, 0),
+        mem_get_info=lambda _gpu: (next(script) * MIB, 0),
     )
 
     def capture(*, entries, observer):
@@ -255,15 +390,17 @@ def test_the_probe_never_reserves_less_than_it_spent() -> None:
         device="cuda",
         drafter=None,
         captures_drafter_prefill_graph=False,
-        prefill_graph=SimpleNamespace(capture_entries={}),
-        forward_step=SimpleNamespace(capture_entries={"decode:default": 2}),
+        prefill_graph=SimpleNamespace(capture_ladders=lambda entries: {}),
+        forward_step=SimpleNamespace(
+            capture_ladders=lambda entries: {"decode:default": _top(2, 2)}
+        ),
         capture_graphs=capture,
     )
     server_args = SimpleNamespace(
         device="cuda", mapping=SimpleNamespace(world_size=1, world_group=None)
     )
     with mock.patch.object(torch, "get_device_module", lambda _d: device):
-        assert probe_cudagraph_memory(executor, server_args, 0) == 700 * MIB
+        assert probe_cudagraph_memory(executor, server_args, 0) == 100 * MIB
 
 
 def test_the_hungriest_rank_is_the_float64_max_and_one_rank_skips_it(
@@ -300,15 +437,22 @@ def test_the_drafters_own_pool_is_declared_captured_and_labelled() -> None:
     executor.device = "cuda"
     executor.drafter = drafter
     executor.forward_step = SimpleNamespace(
-        disable=True, capture_entries={}, stream="stream"
+        disable=True, capture_ladders=lambda entries: {}, stream="stream"
     )
-    executor.prefill_graph = SimpleNamespace(disable=True, capture_entries={})
-    assert _entry_counts(executor) == {}
+    executor.prefill_graph = SimpleNamespace(
+        disable=True, capture_ladders=lambda entries: {}
+    )
+    assert _ladders(executor, 5) == {}
 
     executor.prefill_graph = SimpleNamespace(
-        disable=False, capture_entries={"prefill": 4}, capture=lambda *a, **k: None
+        disable=False,
+        capture_ladders=lambda entries: {"prefill": _top(4, entries)},
+        capture=lambda *a, **k: None,
     )
-    assert _entry_counts(executor) == {"prefill": 4, "prefill:drafter": 1}
+    assert _ladders(executor, 3) == {
+        "prefill": _top(4, 3),
+        "prefill:drafter": CapturedLadder((1,), (0,)),
+    }
 
     observer = mock.Mock()
     with mock.patch.object(model_executor, "workspace_pool", lambda _d: mock.Mock()):

@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -39,8 +40,22 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 
-# Ladder positions, not graphs; measured, both narrower and wider over-reserve more.
+# Ladder positions, not graphs: the widest three and two down the ladder (prefill).
 PROBE_ENTRIES_PER_LADDER = 5
+# Driver allocations come in 2 MiB granules: the gcd of every reading, six ladders.
+DRIVER_GRANULE_BYTES = 2 << 20
+
+
+def probe_positions(count: int, entries: int | None) -> list[int]:
+    """Which positions of a ``count``-long ladder a probe of ``entries`` captures.
+
+    The widest few, then one a third and one two thirds of the way down: a
+    prefill graph's cost falls with its bucket's width, so the tail is priced
+    between samples rather than at the widest ones. ``None`` captures all.
+    """
+    if entries is None or count <= entries:
+        return list(range(count))
+    return sorted({*range(entries - 2), count // 3, 2 * count // 3})
 
 
 def probe_arena_parent_blocks(
@@ -64,17 +79,24 @@ def probe_arena_parent_blocks(
 
 
 @dataclass(frozen=True)
+class CapturedLadder:
+    """One ladder as a full capture records it, and the positions a probe sampled."""
+
+    widths: Sequence[int]
+    sampled: Sequence[int]
+
+
+@dataclass(frozen=True)
 class CudagraphSeriesEstimate:
-    """Projected bytes for one captured ladder."""
+    """Bytes one captured ladder took in the probe, and those its skipped entries add."""
 
     measured: int
-    extrapolated_rate: int
     unsampled: int
 
 
 @dataclass(frozen=True)
 class CudagraphMemoryEstimate:
-    """Bytes the unsampled entries of every ladder are projected to add."""
+    """Bytes every ladder took in the probe and its skipped entries are projected to add."""
 
     series: Mapping[str, CudagraphSeriesEstimate]
     measured_total: int
@@ -82,46 +104,84 @@ class CudagraphMemoryEstimate:
 
 
 def _estimate_series(
-    series: str, samples: Sequence[int], entry_count: int
+    series: str, samples: Sequence[int], ladder: CapturedLadder
 ) -> CudagraphSeriesEstimate:
     """Price the entries of one ladder that the probe did not capture.
 
-    An entry's cost tracks its graph's kernel-node count, not its tensor
-    sizes, so the tail is priced at the window's mean marginal: the positive
-    marginals summed over every marginal, since driver segments make single
-    readings lumpy and a region that handed memory back is not a credit.
-    Sampling each ladder from its widest entry keeps the projection on the
-    safe side (docs/design/unified_path.md).
+    The widest samples form a window priced at its mean marginal: the
+    positive marginals summed over every marginal, since driver segments make
+    single readings lumpy and a region that handed memory back is not a
+    credit, plus one driver granule for the slack the window started in.
+    Each sample after the window anchors its own width at its reading plus
+    that granule. A skipped entry is priced on the line between
+    the anchors around its width; narrower than every anchor, at the
+    narrowest one. A decode ladder, sampled only at the top, is priced flat
+    at its window. The projection lands within a few percent of a decode
+    ladder and, on the prefill shapes measured, above the ladder; a cost that
+    drops between two anchors is priced short there, and the utilization
+    headroom absorbs the difference either way (docs/design/unified_path.md).
     """
-    if entry_count == 0:
+    widths, sampled = ladder.widths, list(ladder.sampled)
+    if sampled != sorted(set(sampled)) or (
+        sampled and not 0 <= sampled[-1] < len(widths)
+    ):
+        raise ValueError(f"{series} probe positions {sampled} are not ladder positions")
+    if not widths:
         if samples:
             raise ValueError(f"{series} projection got samples for no entries")
-        return CudagraphSeriesEstimate(0, 0, 0)
+        return CudagraphSeriesEstimate(0, 0)
 
-    required = min(2, entry_count)
-    if not required <= len(samples) <= entry_count:
+    required = min(2, len(widths))
+    if len(samples) != len(sampled) or not required <= len(samples) or sampled[0] != 0:
         raise ValueError(
-            f"{series} projection got {len(samples)} samples for "
-            f"{entry_count} entries, expected between {required} and "
-            f"{entry_count}; re-run with --disable-cudagraph-memory-reserve "
-            "to size the cache without a probe"
+            f"{series} projection got {len(samples)} samples at positions "
+            f"{sampled} of {len(widths)} entries, expected the first and at "
+            f"least {required} in all; re-run with "
+            "--disable-cudagraph-memory-reserve to size the cache without a probe"
         )
 
     first, *marginals = samples
     observed = [marginal for marginal in marginals if marginal > 0]
-    rate = -(-sum(observed) // len(marginals)) if marginals else 0
-
-    return CudagraphSeriesEstimate(
-        max(first, 0) + sum(observed), rate, rate * (entry_count - len(samples))
+    # Readings come in whole driver granules; the window can hide up to one of them.
+    granule = DRIVER_GRANULE_BYTES if observed else 0
+    # The window: the run of consecutive positions the samples open with.
+    window = next(
+        (i for i, position in enumerate(sampled) if position != i), len(sampled)
     )
+    rate = (
+        -(-(sum(m for m in marginals[: window - 1] if m > 0) + granule) // (window - 1))
+        if window > 1
+        else 0
+    )
+    anchors: dict[float, int] = {}
+    if window > 1:
+        anchors[sum(widths[1:window]) / (window - 1)] = rate
+    for reading, position in zip(marginals[window - 1 :], sampled[window:]):
+        # Two samples at one width (a bucket's inline variants): the dearer one.
+        anchors[widths[position]] = max(
+            anchors.get(widths[position], 0), max(reading, 0) + granule
+        )
+    knots = sorted(anchors.items(), reverse=True)
+
+    def price(width: int) -> float:
+        for (wide, at_wide), (narrow, at_narrow) in zip(knots, knots[1:]):
+            if narrow <= width <= wide:
+                return at_narrow + (at_wide - at_narrow) * (width - narrow) / (
+                    wide - narrow
+                )
+        return knots[-1][1] if width < knots[-1][0] else knots[0][1]
+
+    skipped = [widths[i] for i in range(len(widths)) if i not in set(sampled)]
+    unsampled = math.ceil(sum(price(width) for width in skipped)) if knots else 0
+    return CudagraphSeriesEstimate(max(first, 0) + sum(observed), unsampled)
 
 
 def estimate_cudagraph_memory(
     samples: Mapping[str, Sequence[int]],
-    entry_counts: Mapping[str, int],
+    ladders: Mapping[str, CapturedLadder],
 ) -> CudagraphMemoryEstimate:
     """Project every captured ladder; their pools are disjoint and so add up."""
-    unmeasured = sorted(set(samples) - set(entry_counts))
+    unmeasured = sorted(set(samples) - set(ladders))
     if unmeasured:
         raise ValueError(
             f"projection got samples for unknown ladders: {unmeasured}; re-run "
@@ -130,8 +190,8 @@ def estimate_cudagraph_memory(
         )
 
     series = {
-        name: _estimate_series(name, samples.get(name, ()), count)
-        for name, count in entry_counts.items()
+        name: _estimate_series(name, samples.get(name, ()), ladder)
+        for name, ladder in ladders.items()
     }
 
     return CudagraphMemoryEstimate(
@@ -141,14 +201,18 @@ def estimate_cudagraph_memory(
     )
 
 
-def _entry_counts(executor: ModelExecutor) -> dict[str, int]:
-    """How many entries each captured ladder records at serving size."""
-    drafter_entries = 1 if executor.captures_drafter_prefill_graph else 0
+def _ladders(executor: ModelExecutor, entries: int) -> dict[str, CapturedLadder]:
+    """Every ladder a full capture records, and the positions the probe sampled."""
+    drafter = CapturedLadder((1,), (0,))
     return {
-        **executor.prefill_graph.capture_entries,
-        **executor.forward_step.capture_entries,
+        **executor.prefill_graph.capture_ladders(entries),
+        **executor.forward_step.capture_ladders(entries),
         # Its own private pool, captured after both ladders and released with them.
-        **({"prefill:drafter": drafter_entries} if drafter_entries else {}),
+        **(
+            {"prefill:drafter": drafter}
+            if executor.captures_drafter_prefill_graph
+            else {}
+        ),
     }
 
 
@@ -203,38 +267,38 @@ def reserve_and_rebind(
 def probe_cudagraph_memory(
     executor: ModelExecutor, server_args: ServerArgs, gpu_id: int
 ) -> int:
-    """Capture the widest few entries of each ladder, measure, and project.
+    """Capture a few entries of each ladder, measure them, and project the rest.
 
-    The reserve is what the whole probe spent plus the projected cost of the
-    entries it skipped: a capture also takes one-time bytes outside every
-    per-entry window (warmups, per-shape metadata) that the probe has paid.
+    The reserve is what the captures themselves took plus the projected cost
+    of the entries skipped -- what a boot without a probe pays inside
+    its capture windows, the one-time bytes the first captures allocate
+    there included. One-time bytes outside every capture (warmups,
+    workspaces) are left to the utilization headroom, which funds them on a
+    boot without a reserve too.
     """
     device_module = torch.get_device_module(server_args.device)
     observer = DriverMemoryDeltaObserver(device_module, gpu_id)
-    whole = DriverMemoryDeltaObserver(device_module, gpu_id)
+    executor.capture_graphs(entries=PROBE_ENTRIES_PER_LADDER, observer=observer)
 
-    with whole.measure("probe"):
-        executor.capture_graphs(entries=PROBE_ENTRIES_PER_LADDER, observer=observer)
-
-    entry_counts = _entry_counts(executor)
-    estimate = estimate_cudagraph_memory(observer.samples, entry_counts)
-    # Nested but not telescoping: memory freed between windows outlives the bracket.
-    spent = max(whole.samples["probe"][0], estimate.measured_total)
-    reserve = _hungriest_rank(server_args, spent + estimate.unsampled_total)
+    ladders = _ladders(executor, PROBE_ENTRIES_PER_LADDER)
+    estimate = estimate_cudagraph_memory(observer.samples, ladders)
+    reserve = _hungriest_rank(
+        server_args, estimate.measured_total + estimate.unsampled_total
+    )
     per_series = ", ".join(
         f"{name} {estimate.series[name].measured} measured + "
-        f"{estimate.series[name].unsampled} projected over {count} entries"
-        for name, count in sorted(entry_counts.items())
+        f"{estimate.series[name].unsampled} projected over {len(ladder.widths)} entries"
+        for name, ladder in sorted(ladders.items())
     )
     logger.info(
-        f"CUDA-graph memory reserve: {reserve} bytes (this rank: probe spent "
-        f"{spent}, unsampled entries {estimate.unsampled_total}; {per_series})"
+        f"CUDA-graph memory reserve: {reserve} bytes (this rank: captured "
+        f"{estimate.measured_total}, unsampled entries {estimate.unsampled_total}; {per_series})"
     )
     # Per series: one ladder reading free is invisible in a non-zero total.
-    for name, count in sorted(entry_counts.items()):
+    for name, ladder in sorted(ladders.items()):
         series = estimate.series[name]
         samples = observer.samples.get(name, ())
-        unsampled = count - len(samples)
+        unsampled = len(ladder.widths) - len(samples)
         positives = sum(1 for marginal in samples[1:] if marginal > 0)
         # Two, not one: a rate from a single reading prices every skipped entry.
         if unsampled and positives < 2:

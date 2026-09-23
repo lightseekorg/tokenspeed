@@ -40,6 +40,10 @@ from tokenspeed.runtime.execution import cudagraph_memory  # noqa: E402
 from tokenspeed.runtime.execution import device  # noqa: E402
 from tokenspeed.runtime.execution import forward_step  # noqa: E402
 from tokenspeed.runtime.execution import prefill_graph  # noqa: E402
+from tokenspeed.runtime.execution.cudagraph_memory import (  # noqa: E402
+    CapturedLadder,
+    probe_positions,
+)
 from tokenspeed.runtime.execution.forward_step import ForwardStepRunner  # noqa: E402
 from tokenspeed.runtime.execution.memory_delta import (  # noqa: E402
     NULL_MEMORY_DELTA_OBSERVER,
@@ -142,7 +146,10 @@ def _prefill_graph(buckets, *, decoder_buckets=None, context_len=4096, sizes=Non
 def test_the_decode_probe_samples_the_widest_entries_of_each_variant(variants) -> None:
     runner = _decode_runner([2**i for i in range(WIDTH + 2)], variants)
     names = [f"decode:{v}" for v in (variants or ("default",))]
-    assert runner.capture_entries == {name: WIDTH + 2 for name in names}
+    ladder = sorted((2**i for i in range(WIDTH + 2)), reverse=True)
+    assert runner.capture_ladders(WIDTH) == {
+        name: CapturedLadder(ladder, list(range(WIDTH))) for name in names
+    }
 
     observer = _CountingObserver()
     runner.capture(entries=WIDTH, observer=observer)
@@ -151,51 +158,80 @@ def test_the_decode_probe_samples_the_widest_entries_of_each_variant(variants) -
     for variant in variants or ("default",):
         assert sorted(bs for v, bs in runner.graphs if v == variant) == widest
     estimate = cudagraph_memory.estimate_cudagraph_memory(
-        observer.samples, runner.capture_entries
+        observer.samples, runner.capture_ladders(WIDTH)
     )
     for name in names:
         assert observer.samples[name] == list(range(WIDTH))
-        assert (
-            estimate.series[name].unsampled
-            == estimate.series[name].extrapolated_rate * 2
-        )
+        # Marginals 1..4 plus a granule, over 4, priced for 2 skipped entries.
+        assert estimate.series[name].unsampled == 2 * -(-(10 + (2 << 20)) // 4)
 
     serving = _decode_runner([1, 2, 4], variants)
     serving.capture(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
     assert len(serving.graphs) == 3 * len(names)
+    assert serving.capture_ladders(None) == {
+        name: CapturedLadder([4, 2, 1], [0, 1, 2]) for name in names
+    }
 
     serving.disable = True
-    assert serving.capture_entries == {}
+    assert serving.capture_ladders(None) == {}
 
 
-def test_the_prefill_ladder_counts_graphs_and_samples_the_widest_buckets() -> None:
+def test_the_probe_positions_are_the_widest_few_and_two_down_the_ladder() -> None:
+    assert probe_positions(40, 5) == [0, 1, 2, 13, 26]
+    assert probe_positions(56, 5) == [0, 1, 2, 18, 37]
+    assert probe_positions(7, 5) == [0, 1, 2, 4]
+    assert probe_positions(5, 5) == [0, 1, 2, 3, 4]
+    assert probe_positions(3, 5) == [0, 1, 2]
+    assert probe_positions(40, None) == list(range(40))
+
+
+def test_the_prefill_probe_samples_buckets_with_their_inline_variants() -> None:
     graph = _prefill_graph([2 ** (i + 2) for i in range(WIDTH + 2)], sizes=[1, 2, 4])
-    assert graph.capture_entries == {"prefill": 4 * (WIDTH + 2)}
+    buckets = sorted(graph.capture_buckets, reverse=True)
+    widths = [b for b in buckets for _ in range(4)]
+    assert graph.capture_ladders(None) == {
+        "prefill": CapturedLadder(widths, list(range(4 * (WIDTH + 2))))
+    }
+    # Buckets at positions 0, 1, 2 and 4 of seven; each brings its three variants.
+    sampled = [
+        i for i, b in enumerate(widths) if b in {buckets[j] for j in (0, 1, 2, 4)}
+    ]
+    assert graph.capture_ladders(WIDTH) == {"prefill": CapturedLadder(widths, sampled)}
 
     observer = _CountingObserver()
     graph._capture_all_buckets(None, WIDTH, observer)
 
-    sampled = [256, 128, 64, 32, 16]
-    assert set(graph._captures) == {(b, bs) for b in sampled for bs in (None, 1, 2, 4)}
-    assert len(observer.samples["prefill"]) == 4 * WIDTH
-    cudagraph_memory.estimate_cudagraph_memory(observer.samples, graph.capture_entries)
+    assert set(graph._captures) == {
+        (b, bs) for b in (buckets[j] for j in (0, 1, 2, 4)) for bs in (None, 1, 2, 4)
+    }
+    assert len(observer.samples["prefill"]) == 16
+    estimate = cudagraph_memory.estimate_cudagraph_memory(
+        observer.samples, graph.capture_ladders(WIDTH)
+    )
+    assert estimate.unsampled_total > 0
+
+    graph._captures.clear()
+    graph._capture_all_buckets(None, None, _CountingObserver())
+    assert set(graph._captures) == set(graph.capture_plan["prefill"])
 
     graph.dp_size = 2
-    assert graph.capture_entries == {"prefill": WIDTH + 2}
+    assert graph.capture_ladders(None) == {
+        "prefill": CapturedLadder(buckets, list(range(WIDTH + 2)))
+    }
     graph.attn_backend.admits_prefill_graph = lambda *_a: False
     graph.dp_size = 1
     assert graph.capture_plan == {
         "prefill": [(b, None) for b in reversed(graph.capture_buckets)]
     }
     graph.disable = True
-    assert graph.capture_entries == {}
+    assert graph.capture_ladders(None) == {}
 
 
-def test_the_prefill_sample_covers_inline_counts_only_narrow_buckets_admit() -> None:
+def test_a_bucket_captures_only_the_inline_counts_it_admits() -> None:
     # A bucket admits a count only from ceil(bucket / context_len) upwards.
     graph = _prefill_graph([64, 128, 256, 512, 1024], context_len=64, sizes=[1, 2, 4])
 
-    graph._capture_all_buckets(None, 2, _CountingObserver())
+    graph._capture_all_buckets(None, None, _CountingObserver())
 
     assert set(graph._captures) == {
         (1024, None),
@@ -216,13 +252,20 @@ def test_the_prefill_sample_covers_inline_counts_only_narrow_buckets_admit() -> 
 
 def test_narrowing_declares_and_samples_its_two_ladders() -> None:
     graph = _prefill_graph([64, 128, 256], decoder_buckets=[8, 16, 32, 64])
-    assert graph.capture_entries == {"prefill:encoder": 3, "prefill:decoder": 4}
+    assert graph.capture_ladders(None) == {
+        "prefill:encoder": CapturedLadder([256, 128, 64], [0, 1, 2]),
+        "prefill:decoder": CapturedLadder([64, 32, 16, 8], [0, 1, 2, 3]),
+    }
+    assert graph.capture_ladders(3) == {
+        "prefill:encoder": CapturedLadder([256, 128, 64], [0, 1, 2]),
+        "prefill:decoder": CapturedLadder([64, 32, 16, 8], [0, 1, 2]),
+    }
 
     observer = _CountingObserver()
-    graph._capture_decoders(None, 2, observer)
+    graph._capture_decoders(None, 3, observer)
 
-    assert sorted(graph._decoders, reverse=True) == [64, 32]
-    assert len(observer.samples["prefill:decoder"]) == 2
+    assert sorted(graph._decoders, reverse=True) == [64, 32, 16]
+    assert len(observer.samples["prefill:decoder"]) == 3
 
 
 def test_releasing_drops_the_graphs_and_pools_but_keeps_the_tables(monkeypatch) -> None:

@@ -131,21 +131,40 @@ from one first bound to that pool:
   trees, re-runs `bind_cache_groups` and the initialisation sequence above,
   freezes the workspace again and captures again.
 * The KV budget reserves what the graphs will cost: a probe binds the
-  smallest arena the family can run on, captures the largest few entries of
-  each ladder with a driver-memory delta around each capture, extrapolates
-  the rest at the window's positive bytes over every marginal, and reduces
-  the result across ranks with MAX. The orchestrator
+  smallest arena the family can run on and captures a few entries of each
+  ladder -- the widest three, then one a third and one two thirds of the
+  way down -- with a driver-memory delta around each capture. The widest
+  samples form a window priced at its positive bytes, plus one driver
+  granule the window may hide, over every marginal; each sample further
+  down anchors its width at its reading plus that granule, and a skipped
+  entry is priced on the line between the anchors around its width, or at
+  the narrowest anchor below it. Decode graphs cost about the same at every
+  batch size (a graph's size follows its kernel count), so a decode ladder
+  is sampled only at the top and priced flat at its window, within a few
+  percent of the ladder on either side (a 160-entry Qwen3-8B ladder read
+  0.97x), which the headroom absorbs. A prefill graph's cost falls with its
+  bucket's width, in a shape that differs by model (linear on Qwen3-8B, flat
+  then a drop on Inkling, recurring spikes on gpt-oss), so the anchors keep
+  the whole reserve between 1.0x and 1.5x of the capture on the models
+  measured, where the widest window alone priced a prefill ladder up to 4x.
+  That is not a bound: a cost that drops between two anchors is priced
+  short over that stretch.
+  The result is reduced across ranks with MAX. The orchestrator
   releases the probe's graphs and collects the cycles they sit in, then
   rebuilds on the memory profile the probe build took -- where a boot without
-  a reserve takes it -- minus the projection, since the utilization headroom
-  funds activations and fragmentation rather than graph pools. Profiling
-  again after the probe would charge the cache a second time for what tuning
-  and the probe left allocated. The buffers capture allocates
-  around the measured regions are covered, but only because the reserve starts
-  from what the whole probe spent rather than from the sum of the per-entry
-  windows: those bytes are one-time, so capturing more entries does not raise
-  them. Not covered: a ladder every one of whose sampled marginals was served
-  from allocator slack, which is priced at nothing and says so in the log.
+  a reserve takes it -- minus the projection. The reserve covers the bytes
+  inside the capture windows as projected -- what a boot without a probe
+  captures there, one-time bytes the first captures take included; the
+  probe releases them and the serving capture pays them again. The
+  utilization headroom covers everything else: activations, fragmentation,
+  the warmups and workspaces a capture allocates around its windows, and any
+  shortfall of the projection, as it covers every graph on a boot without a
+  reserve. Profiling again after the probe would charge the cache a second
+  time for what tuning and the probe left allocated. The deltas read the
+  whole device, so the probe assumes no other process allocates on it during
+  startup. Not covered: a ladder every one of whose sampled marginals was
+  served from allocator slack, which is priced at nothing and says so in the
+  log.
 
 ### Padding contract
 

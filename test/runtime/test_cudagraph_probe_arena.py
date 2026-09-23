@@ -407,6 +407,14 @@ def test_only_pool_staged_verify_scratch_and_a_latched_pool_refuse(monkeypatch) 
         # Without speculation the kernel answer is never consulted.
         assert kda_verify_scratch_in_pool(plain.server_args, plain.attn_config) is False
 
+    # A PD prefill role plans no verify workspace, so its pool stages none.
+    monkeypatch.setattr(
+        kda_ops, "kda_batched_replay_uses_raw_gate", lambda *a, **k: True
+    )
+    speculative.server_args.disaggregation_mode = "prefill"
+    assert speculative.workspace_bytes() == 0
+    assert speculative.verify_scratch_in_pool() is False
+
     def _class_of(entry):
         return entry.func if isinstance(entry, functools.partial) else entry
 

@@ -32,6 +32,7 @@ import torch.distributed as dist
 import tqdm
 
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.cudagraph_memory import CapturedLadder
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -332,15 +333,15 @@ class ForwardStepRunner:
         rank = self.global_rank
         with freeze_gc(self.enable_cudagraph_gc):
             # Capture backend-declared sampler variants explicitly.
-            plan = self.capture_plan
+            ladders = self.capture_ladders(entries)
             capture_items = [
-                (variant, bs)
-                for variant, ladder in plan.items()
-                for bs in ladder[:entries]
+                (variant, ladders[f"decode:{variant}"].widths[i])
+                for variant in self.capture_plan
+                for i in ladders[f"decode:{variant}"].sampled
             ]
             capture_range = tqdm.tqdm(capture_items) if rank == 0 else capture_items
             if rank == 0:
-                batch_sizes = next(iter(plan.values()), [])[:entries]
+                batch_sizes = list(dict.fromkeys(bs for _variant, bs in capture_items))
                 logger.info(f"Capturing batches: {batch_sizes!s}")
             for variant, bs in capture_range:
                 if rank == 0:
@@ -376,16 +377,18 @@ class ForwardStepRunner:
             variant: list(ladder) for variant in self._cuda_graph_capture_variants()
         }
 
-    @property
-    def capture_entries(self) -> dict[str, int]:
-        """How many entries a full capture records, counted off the plan.
+    def capture_ladders(self, entries: int | None) -> dict[str, CapturedLadder]:
+        """Each variant's batch sizes off the plan, and the positions ``entries`` samples.
 
         One series each: a variant opens its own captured buffers, so its
         first capture is a one-off that must not be extrapolated across the
-        ladder entries the probe did not sample.
+        ladder entries the probe did not sample. A decode graph costs about
+        the same at every batch size, so the probe samples only the top.
         """
         return {
-            f"decode:{variant}": len(ladder)
+            f"decode:{variant}": CapturedLadder(
+                ladder, list(range(len(ladder[:entries])))
+            )
             for variant, ladder in self.capture_plan.items()
         }
 

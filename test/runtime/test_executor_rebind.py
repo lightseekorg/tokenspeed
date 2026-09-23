@@ -183,7 +183,9 @@ def test_a_block_drafter_is_rechecked_against_the_targets_new_pool(
     assert [e for e in log if e[0] == "check"] == [("check", "draft model", target)]
 
 
-def test_capture_hands_both_owners_the_entries_and_the_drafter_its_window(monkeypatch):
+def test_capture_hands_both_owners_the_entries_and_the_drafter_its_window(
+    monkeypatch,
+):
     seen = []
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cuda"

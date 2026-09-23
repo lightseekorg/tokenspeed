@@ -83,8 +83,8 @@ def reserve_cache_budget(profiled_cache_bytes: int, graph_reserve_bytes: int) ->
     """The profiled cache budget less the CUDA-graph reserve.
 
     The utilization headroom was already left out of the profile; it funds
-    activations and fragmentation, not the graph pools, so the reserve comes
-    on top of it. A boot the reserve leaves with no cache fails here.
+    activations and fragmentation, and the reserve for the graphs comes on
+    top of it. A boot the reserve leaves with no cache fails here.
     """
     cache_memory = profiled_cache_bytes - graph_reserve_bytes
     if graph_reserve_bytes and cache_memory <= 0:
