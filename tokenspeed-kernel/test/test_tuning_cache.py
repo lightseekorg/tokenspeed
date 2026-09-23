@@ -66,6 +66,7 @@ def _install_fake_flashinfer(monkeypatch, *, metadata):
 
     class AutoTuner:
         choose_one = Mock()
+        search_cache = Mock()
 
         @staticmethod
         def get():
@@ -161,6 +162,71 @@ def test_cache_roundtrip_and_failures(monkeypatch, tmp_path) -> None:
         tuner, "save_configs", Mock(side_effect=TypeError("invalid tactic"))
     )
     assert not save_autotune_cache(path, None, 0)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [None, "hot", "replays", "shape", "invalid", "blocked", "gpu"],
+)
+def test_reuse_persisted_cache_ignores_measurement_policy(
+    monkeypatch, tmp_path, change
+):
+    fi = pytest.importorskip("flashinfer.autotuner.autotuner")
+    metadata = {"gpu": "gpu-a", "flashinfer_version": "0.7.0"}
+    monkeypatch.setattr(fi, "_collect_metadata", lambda: metadata)
+    monkeypatch.setattr(tuning, "_autotuner", fi)
+
+    class Runner(fi.TunableRunner):
+        def __init__(self):
+            self.identity = object()
+
+        def get_valid_tactics(self, inputs, profile):
+            return [7]
+
+        def validate_tactic(self, inputs, tactic):
+            return change != "invalid" and tactic == 7
+
+        def forward(self, inputs, tactic=-1, **kwargs):
+            raise AssertionError("Cache lookup must not launch a kernel")
+
+    runner = Runner()
+    inputs = [torch.empty(1, 128)]
+    config = fi.TuningConfig(use_cuda_graph=True, use_cold_l2_cache=True)
+    writer = fi.AutoTuner()
+    monkeypatch.setattr(fi.AutoTuner, "_instance", writer)
+    key = writer._get_cache_key("probe", runner, ((1, 128),), config, ())
+    writer.profiling_cache[key] = (7, None)
+    path = tmp_path / "configs.json"
+    assert save_autotune_cache(str(path), None, 0)
+
+    if change == "gpu":
+        metadata["gpu"] = "gpu-b"
+    reader = fi.AutoTuner()
+    monkeypatch.setattr(fi.AutoTuner, "_instance", reader)
+    assert load_autotune_cache(str(path), None, 0) == (change != "gpu")
+    if change == "blocked":
+        reader._blocklist._invalid["probe::Runner"] = {7}
+    if change == "shape":
+        inputs = [torch.empty(2, 128)]
+    config = fi.TuningConfig(
+        use_cuda_graph=True,
+        use_cold_l2_cache=change != "hot",
+        cuda_graph_profile_replays=2 if change == "replays" else 1,
+    )
+    prepare = Mock(side_effect=RuntimeError("cache miss requires profiling"))
+    monkeypatch.setattr(reader, "_prepare_input_tensors", prepare)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    original_search = fi.AutoTuner.search_cache
+    with autotune(tune_mode=True, tuning_buckets=None, round_up=None):
+        if change in (None, "hot", "replays"):
+            assert reader.choose_one("probe", [Runner()], config, inputs)[1] == 7
+            prepare.assert_not_called()
+        else:
+            with pytest.raises(RuntimeError, match="cache miss requires profiling"):
+                reader.choose_one("probe", [Runner()], config, inputs)
+            prepare.assert_called_once()
+        assert reader.is_tuning_mode
+    assert fi.AutoTuner.search_cache is original_search
 
 
 @pytest.mark.parametrize(

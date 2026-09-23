@@ -58,6 +58,45 @@ _autotune_max_num_tokens = _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS
 
 
 @contextlib.contextmanager
+def _reuse_autotune_cache():
+    """Reuse compatible FlashInfer entries regardless of measurement policy."""
+    AutoTuner = _autotuner.AutoTuner
+    original_search = AutoTuner.search_cache
+
+    def search(tuner, custom_op, runners, input_shapes, tuning_config, inputs=None):
+        with tuner._lock:
+            # FI 0.7 skips persisted entries for cold-L2 tuning. Use serving
+            # lookup rules, then restore tuning so cache misses still profile.
+            was_tuning = tuner.is_tuning_mode
+            tuner.is_tuning_mode = False
+            try:
+                result = original_search(
+                    tuner,
+                    custom_op,
+                    runners,
+                    input_shapes,
+                    tuning_config,
+                    inputs=inputs,
+                )
+            finally:
+                tuner.is_tuning_mode = was_tuning
+            hit, runner_id, tactic, _ = result
+            if (
+                was_tuning
+                and hit
+                and not tuner._blocklist.filter(custom_op, runners[runner_id], [tactic])
+            ):
+                return False, 0, -1, None
+            return result
+
+    AutoTuner.search_cache = search
+    try:
+        yield
+    finally:
+        AutoTuner.search_cache = original_search
+
+
+@contextlib.contextmanager
 def _ep_moe_candidates():
     AutoTuner = _autotuner.AutoTuner
 
@@ -198,7 +237,8 @@ def autotune(
             range(16, 29)
         )
     candidates = _ep_moe_candidates() if tune_mode else contextlib.nullcontext()
-    with candidates, _autotuner.autotune(
+    cache = _reuse_autotune_cache() if tune_mode else contextlib.nullcontext()
+    with cache, candidates, _autotuner.autotune(
         tune_mode, tuning_buckets=tuning_buckets, round_up=round_up
     ):
         yield
