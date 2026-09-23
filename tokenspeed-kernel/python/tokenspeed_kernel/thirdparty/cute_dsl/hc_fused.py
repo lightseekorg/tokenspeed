@@ -403,20 +403,22 @@ class FusedGatedResidualKernel:
             )
 
     @cute.experimental.jit
-    def _initialize_barriers(self, bars, warp):
+    def _initialize_barriers(self, barriers, warp):
         """Initialize shared barriers once for all projection and token phases."""
-        down_full = bars
-        down_empty = down_full + self.down_stages
-        down_done = down_empty + self.down_stages
-        epi_done = down_done + 1
-        up_full = epi_done + 1
-        control_ready = up_full + 3
-        projection_ready = control_ready + 1
-        up_done = projection_ready + 1
-        reduce_ready = up_done + 1
-        cluster_done = reduce_ready + 1
-        up_empty = cluster_done + 1
-        consumed = up_empty + int(self.group_ctas < self.up_tiles)
+        (
+            down_full,
+            down_empty,
+            down_done,
+            epi_done,
+            up_full,
+            control_ready,
+            projection_ready,
+            up_done,
+            reduce_ready,
+            cluster_done,
+            up_empty,
+            consumed,
+        ) = barriers
         if warp == 4:
             with cute.arch.elect_one():
                 for stage in cutlass.range_constexpr(self.down_stages):
@@ -562,6 +564,32 @@ class FusedGatedResidualKernel:
             ),
             alignment=8,
         ).iterator
+        down_full = bars
+        down_empty = down_full + self.down_stages
+        down_done = down_empty + self.down_stages
+        epi_done = down_done + 1
+        up_full = epi_done + 1
+        control_ready = up_full + 3
+        projection_ready = control_ready + 1
+        up_done = projection_ready + 1
+        reduce_ready = up_done + 1
+        cluster_done = reduce_ready + 1
+        up_empty = cluster_done + 1
+        consumed = up_empty + int(self.group_ctas < self.up_tiles)
+        barriers = (
+            down_full,
+            down_empty,
+            down_done,
+            epi_done,
+            up_full,
+            control_ready,
+            projection_ready,
+            up_done,
+            reduce_ready,
+            cluster_done,
+            up_empty,
+            consumed,
+        )
         tmem_base = cute_ext.allocate(
             cutlass.Int32, cute.AddressSpace.smem, cute.make_layout(1), alignment=4
         ).iterator
@@ -571,7 +599,7 @@ class FusedGatedResidualKernel:
             if cutlass.const_expr(self.pdl):
                 cute.arch.griddepcontrol_wait()
                 cute.arch.griddepcontrol_launch_dependents()
-        self._initialize_barriers(bars, warp)
+        self._initialize_barriers(barriers, warp)
         token_tiles = cutlass.Int32(cute.ceil_div(x.shape[0], self.n))
         for job_round in cutlass.range(self.rounds, unroll_full=self.rounds == 1):
             for micro in cutlass.range_constexpr(self.batch_tiles):
@@ -608,7 +636,7 @@ class FusedGatedResidualKernel:
                         gate,
                         mailbox,
                         partial_tile,
-                        bars,
+                        barriers,
                         tmem_base,
                     )
         if warp == 5 and cutlass.const_expr(not self.single_tile):
@@ -646,24 +674,26 @@ class FusedGatedResidualKernel:
         gate,
         mailbox,
         partial_tile,
-        bars,
+        barriers,
         tmem_base,
     ):
         dtype = x.element_type
         down_tiler = (self.down_m, self.n, self.down_k)
         up_tiler = (self.up_m, self.n, 128)
-        down_full = bars
-        down_empty = down_full + self.down_stages
-        down_done = down_empty + self.down_stages
-        epi_done = down_done + 1
-        up_full = epi_done + 1
-        control_ready = up_full + 3
-        projection_ready = control_ready + 1
-        up_done = projection_ready + 1
-        reduce_ready = up_done + 1
-        cluster_done = reduce_ready + 1
-        up_empty = cluster_done + 1
-        consumed = up_empty + int(self.group_ctas < self.up_tiles)
+        (
+            down_full,
+            down_empty,
+            down_done,
+            epi_done,
+            up_full,
+            control_ready,
+            projection_ready,
+            up_done,
+            reduce_ready,
+            cluster_done,
+            up_empty,
+            consumed,
+        ) = barriers
         down_acc_layout = cute_ext.make_tmem_layout_acc(
             down_mma, (self.down_m, self.n), acc_stage=1
         )

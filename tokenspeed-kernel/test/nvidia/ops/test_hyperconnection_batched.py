@@ -287,6 +287,40 @@ def test_projection_and_batch_loops(rows, tile, monkeypatch):
             )
 
 
+def test_uneven_down_stages_recycle_across_four_tiles(monkeypatch):
+    monkeypatch.setattr(
+        cute_fused,
+        "_tactic",
+        lambda rows, projection_rows: (16, 64, 8, 1, 2, 2, 32),
+    )
+    monkeypatch.setattr(
+        cute_fused,
+        "_capacity",
+        lambda compiled, kernel, device, stream: kernel.clusters,
+    )
+    _reset_caches(monkeypatch)
+    values = inputs(32, torch.bfloat16, True)
+    pdl_enabled(True)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        mix(values, 1.0, True)
+    stream.synchronize()
+    kernel = list(cute_fused._PLANS.values())[-1][0]
+    assert (kernel.k_tiles, kernel.down_stages) == (5, 2)
+    assert (kernel.workers, kernel.rounds, kernel.batch_tiles) == (1, 2, 2)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        result = mix(values, 1.0, True)
+    for factor in (0.75, -0.5, 1.25):
+        values[0].mul_(factor)
+        for _ in range(3):
+            graph.replay()
+        torch.cuda.synchronize()
+        check(result, reference(values, 1.0), torch.bfloat16)
+
+
 def test_serialized_stream_graphs_share_plans_and_workspaces(monkeypatch):
     _reset_caches(monkeypatch)
     pdl_enabled(True)

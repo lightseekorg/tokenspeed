@@ -53,6 +53,11 @@ duplicated for every stream. Epoch values are Lamport-style protocol state, so
 this storage cannot be borrowed from the generic scratch pool and overwritten
 between calls.
 
+Each CTA initializes its shared barriers once, then alternates their phases
+across projection and token tiles. Down-stage phases account for the number of
+K tiles assigned to each stage, including tactics where stages receive unequal
+numbers of tiles.
+
 Shared workspaces follow the main-stream scratch ownership contract documented
 in `docs/design/event-loop.md`. Calls on different streams must have an explicit
 ordering edge before they use the same layout; concurrent side-stream launches
