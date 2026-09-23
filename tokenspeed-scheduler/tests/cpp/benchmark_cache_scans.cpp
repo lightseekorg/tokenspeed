@@ -174,7 +174,7 @@ CacheCoordinator MakeAdmissionCoordinator(BlockPool& pool) {
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
-    return MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*host_pool=*/nullptr,
+    return MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                            /*stream_device_cache_to_host=*/true);
 }
 
@@ -277,8 +277,8 @@ void MeasureHostBlockAcquisition(std::int32_t pool_size, std::int32_t iterations
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/4, pool, &host_pool,
-                                                   /*stream_device_cache_to_host=*/true);
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
+                                                   &host_pool, /*stream_device_cache_to_host=*/true);
     for (std::int32_t i = 0; i < pool_size; ++i) {
         CacheBlockRef block = host_pool.AcquireBlock(/*group_id=*/0);
         if (!block) {

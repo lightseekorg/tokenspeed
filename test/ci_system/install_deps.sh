@@ -92,7 +92,7 @@ apt_install_with_retry() {
 ensure_flashinfer_jit_cache() {
     # GB200 and B200 runner images preinstall flashinfer-jit-cache; it must
     # match the flashinfer-python pin exactly or flashinfer refuses to import.
-    if [[ "${CI_RUNNER_LABEL:-}" != gb200* && "${CI_RUNNER_LABEL:-}" != b200* ]]; then
+    if [[ "${CI_RUNNER_LABEL:-}" != gb200* && "${CI_RUNNER_LABEL:-}" != b200* && "${CI_RUNNER_LABEL:-}" != slurm-gb200-* ]]; then
         return 0
     fi
 
@@ -104,8 +104,13 @@ ensure_flashinfer_jit_cache() {
         return 0
     fi
 
+    # Since 0.7.0 the pinned wheel depends on separate architecture providers.
+    local index_url="https://flashinfer.ai/whl/cu${CUINDEX}"
+    if [[ "${wheel_url}" == */nightly-v* ]]; then
+        index_url="https://flashinfer.ai/whl/nightly/cu${CUINDEX}"
+    fi
     pip_install_with_retry pip3 install --break-system-packages \
-        --force-reinstall --no-deps "${wheel_url}"
+        --force-reinstall --index-url "${index_url}" "${wheel_url}"
 }
 
 echo "=========================================="
@@ -189,7 +194,14 @@ pip_install_with_retry pip3 install tokenspeed-kernel/python/ --no-build-isolati
 # ============================================================
 echo "=== Step 5: Install TokenSpeed Scheduler ==="
 pip_install_with_retry pip3 install cmake ninja
-pip_install_with_retry pip3 install tokenspeed-scheduler/
+# Scheduler changes intentionally accumulate without a version bump. Build in
+# a fresh directory so a persistent runner cannot reuse a same-version native
+# extension left by an earlier checkout.
+SCHEDULER_BUILD_DIR="$(mktemp -d)"
+pip_install_with_retry pip3 install --force-reinstall --no-deps \
+    tokenspeed-scheduler/ \
+    --config-settings="build-dir=${SCHEDULER_BUILD_DIR}"
+rm -rf "${SCHEDULER_BUILD_DIR}"
 
 # ============================================================
 # Step 6: Install TokenSpeed
@@ -244,6 +256,7 @@ if [ -n "${FLASHINFER_PYTHON_SPEC}" ]; then
     FLASHINFER_VERSION="${FLASHINFER_PYTHON_SPEC##*==}"
     case "${FLASHINFER_VERSION}" in
         0.6.18) FLASHINFER_CUBIN_SHA256="2dd65c0fcfc6bc44c67f148530de5372979c2e3d260e47935730f94156d4d873" ;;
+        0.7.0) FLASHINFER_CUBIN_SHA256="f1821e11ad4ea9666a09c2b04cc16b1e34f601296dc7a7b689649281c0358a9c" ;;
         *) echo "No SHA256 pinned for flashinfer-cubin ${FLASHINFER_VERSION}" >&2; exit 1 ;;
     esac
     # Nightlies version as X.Y.Z.devYYYYMMDD but tag as nightly-vX.Y.Z-YYYYMMDD,
@@ -288,6 +301,51 @@ if [ "${CUDA_VERSION%%.*}" = "13" ]; then
         ln -sf /usr/local/cuda/bin/ptxas "${TRITON_BIN}/ptxas" 2>/dev/null || run_as_root ln -sf /usr/local/cuda/bin/ptxas "${TRITON_BIN}/ptxas" 2>/dev/null || true
     fi
 fi
+
+echo "=== Verify installed Torch and native kernel dependencies ==="
+python3 - "${CUDA_REQ}" "${THIRDPARTY_REQ}" "${CUINDEX}" "${SCRIPT_DIR}" <<'PY'
+import importlib.metadata
+import os
+import sys
+from pathlib import Path
+
+import torch
+from packaging.requirements import Requirement
+
+sys.path.insert(0, sys.argv[4])
+from flashinfer_jit_cache_installer import install_url_if_needed
+
+checked_packages = (
+    "torch",
+    "tokenspeed-trtllm-kernel",
+    "tokenspeed-cutedsl-kda",
+    "flashinfer-python",
+    "nvidia-cudnn-frontend",
+)
+requirements = {}
+for path in sys.argv[1:3]:
+    for line in Path(path).read_text().splitlines():
+        if line.startswith(tuple(f"{name}==" for name in checked_packages)):
+            requirement = Requirement(line)
+            requirements[requirement.name] = requirement
+requirements["flashinfer-cubin"] = Requirement(
+    f"flashinfer-cubin{requirements['flashinfer-python'].specifier}"
+)
+for name in (*checked_packages, "flashinfer-cubin"):
+    installed = torch.__version__ if name == "torch" else importlib.metadata.version(name)
+    print(f"Installed {name}=={installed}", flush=True)
+    if installed not in requirements[name].specifier:
+        raise SystemExit(f"Installed {name}=={installed} does not satisfy {requirements[name]}")
+expected_cuda = f"{sys.argv[3][:-1]}.{sys.argv[3][-1]}"
+print(f"Torch CUDA runtime: {torch.version.cuda}", flush=True)
+if torch.version.cuda != expected_cuda:
+    raise SystemExit(f"Expected Torch CUDA {expected_cuda}, got {torch.version.cuda}")
+if os.environ.get("CI_RUNNER_LABEL", "").startswith(("gb200", "b200", "slurm-gb200-")):
+    url, expected, installed = install_url_if_needed(Path(sys.argv[1]), sys.argv[3])
+    print(f"Installed flashinfer-jit-cache=={installed}", flush=True)
+    if url is not None:
+        raise SystemExit(f"FlashInfer JIT cache or providers do not match {expected}")
+PY
 
 echo ""
 echo "=========================================="

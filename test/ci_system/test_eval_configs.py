@@ -196,7 +196,6 @@ def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
         assert flag_value(server_tokens, "--max-cudagraph-capture-size") == "32"
         assert flag_value(server_tokens, "--reasoning-parser") == "deepseek_v31"
         assert "--disable-kvstore" in server_tokens
-        assert "--disable-prefill-graph" in server_tokens
         assert "--trust-remote-code" in server_tokens
         assert flag_value(eval_tokens, "--model") == "deepseek-ai/DeepSeek-V4.1-Flash"
         assert flag_value(eval_tokens, "--datasets") == "gsm8k"
@@ -204,11 +203,20 @@ def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
         assert task["score_threshold"] == 0.90
 
         if label == "b200-4gpu":
+            assert "--download-dir" not in server_tokens
             assert "--enable-expert-parallel" in server_tokens
             assert flag_value(server_tokens, "--moe-backend") == "mega_moe"
+            # The NVIDIA gate exercises the split prefill graph (encoder and
+            # decoder graphs around the eager narrowing layer).
+            assert "--disable-prefill-graph" not in server_tokens
         else:
+            assert (
+                flag_value(server_tokens, "--download-dir") == "${PWD}/.hf-model-cache"
+            )
             assert "--enable-expert-parallel" not in server_tokens
             assert "--moe-backend" not in server_tokens
+            # Not yet exercised on AMD; keep that gate on eager prefill.
+            assert "--disable-prefill-graph" in server_tokens
 
 
 def test_kimi_k3_amd_gates_use_eagle3():
@@ -241,9 +249,30 @@ def test_kimi_k3_amd_gates_use_eagle3():
     eval_tokens = shlex.split(tasks[0]["eval"]["command"])
     generation_config = json.loads(flag_value(eval_tokens, "--generation-config"))
     assert generation_config["seed"] == 42
+    assert generation_config["max_tokens"] == 32768
+    assert flag_value(eval_tokens, "--eval-batch-size") == "16"
+    assert "--limit" not in eval_tokens
+    assert (
+        flag_value(eval_tokens, "--work-dir")
+        == ".ci-artifacts/published/kimi-k3-eagle3-aime26"
+    )
     assert tasks[0]["score_threshold"] == 0.90
     assert tasks[1]["perf_reference"] == {1: [161, 18.8]}
+    assert tasks[1]["perf_threshold"] == 0.9
     assert "'evalscope[perf]==1.11.1'" in tasks[1]["perf"]["install"][0]
+    perf_tokens = shlex.split(tasks[1]["perf"]["command"])
+    assert "OUTPUTS_DIR=$PWD/.ci-artifacts/published/kimi-k3-eagle3-perf" in perf_tokens
+    assert "trap" not in perf_tokens
+    for flag, value in {
+        "--number": "1",
+        "--warmup-num": "0",
+        "--seed": "1",
+        "--min-prompt-length": "4096",
+        "--max-prompt-length": "4096",
+        "--min-tokens": "1024",
+        "--max-tokens": "1024",
+    }.items():
+        assert flag_value(perf_tokens, flag) == value
 
     control_filenames = (
         "kimi-k3-mxfp4-tp8ep8-evalscope-aime26-amd.yaml",
@@ -272,3 +301,23 @@ def test_kvv_configs_use_pinned_upstream_and_local_api():
         assert flag_value(command, "--max-tokens") == max_tokens
         assert "--thinking" in command
         assert flag_value(command, "--thinking-effort") == "max"
+
+
+def test_kimi_k25_amd_accuracy_gate_preserves_question_outputs():
+    task = yaml.safe_load(
+        (
+            EVAL_CONFIG_DIR / "kimi-k2.5-mxfp4-eagle3-evalscope-aime25-amd.yaml"
+        ).read_text()
+    )
+    command = shlex.split(task["eval"]["command"])
+    generation = json.loads(flag_value(command, "--generation-config"))
+
+    assert (
+        flag_value(command, "--work-dir") == ".ci-artifacts/published/evalscope-results"
+    )
+    assert "--no-timestamp" not in command
+    assert flag_value(command, "--limit") == "4"
+    assert flag_value(command, "--eval-batch-size") == "4"
+    assert generation == {"do_sample": False, "temperature": 0.0, "max_tokens": 65536}
+    assert task["score_threshold"] == 0.75
+    assert "retries" not in task

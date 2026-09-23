@@ -31,7 +31,7 @@ _NUM_WARPS = 8
 
 
 @gluon.jit
-def _mla_project_value_kernel(
+def gluon_mla_project_value_gfx950(
     attention_ptr,
     weight_ptr,
     gate_ptr,
@@ -92,7 +92,7 @@ def _mla_project_value_kernel(
     )
 
 
-def gluon_mla_project_value_gfx950(
+def launch_gluon_mla_project_value_gfx950(
     attention: torch.Tensor,
     weight: torch.Tensor,
     *,
@@ -142,7 +142,7 @@ def gluon_mla_project_value_gfx950(
         raise ValueError("MLA value projection out must be contiguous BF16")
 
     gate_tensor = attention if gate is None else gate
-    _mla_project_value_kernel[(batch * heads * value // _BLOCK_N,)](
+    gluon_mla_project_value_gfx950[(batch * heads * value // _BLOCK_N,)](
         attention,
         weight,
         gate_tensor,
@@ -163,4 +163,4 @@ def gluon_mla_project_value_gfx950(
     return out
 
 
-__all__ = ["gluon_mla_project_value_gfx950"]
+__all__ = ["launch_gluon_mla_project_value_gfx950"]

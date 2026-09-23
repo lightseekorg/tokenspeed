@@ -135,7 +135,7 @@ protected:
     }
 };
 
-TEST_F(FinishOnlyHybridWriteBackTestSuite, FinishStoresAllMlaPagesAndLatestKdaSnapshot) {
+TEST_F(FinishOnlyHybridWriteBackTestSuite, FinishStoresDecodeMlaPagesWithoutNewKdaSnapshot) {
     Submit(MakeRequestSpec("r0", /*num_pages=*/2, /*start=*/1));
     const ExecutionPlan prefill = PlanOnce();
     EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(prefill).empty());
@@ -162,10 +162,10 @@ TEST_F(FinishOnlyHybridWriteBackTestSuite, FinishStoresAllMlaPagesAndLatestKdaSn
     ASSERT_EQ(finish_stores.size(), 1u);
     const auto& finish_write_back = std::get<WriteBackBatch>(finish_stores.front());
     ASSERT_EQ(finish_write_back.group_ids.size(), 1u);
-    EXPECT_EQ(finish_write_back.group_ids.front(), (std::vector<std::uint32_t>{0, 1, 2, 3}))
-        << "finish writes one decode MLA page and only the latest snapshot from each KDA group";
+    EXPECT_EQ(finish_write_back.group_ids.front(), (std::vector<std::uint32_t>{0}))
+        << "finish writes decode MLA pages but no decode KDA snapshot";
     SendWriteBackDone(finish_write_back.op_ids.front());
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 9);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
 }
 
 class LoadBackDoneTestSuite : public SchedulerTestSuite {
@@ -659,7 +659,7 @@ TEST_F(DecodeRetractionMixedPrefillTestSuite, LocalRecoveryDoesNotBatchWithRemot
         for (const CacheOperation& operation : ExtractCacheOpsOfKind<LoadBackBatch>(recovery)) {
             const auto& load = std::get<LoadBackBatch>(operation);
             for (std::uint32_t op_id : load.op_ids) {
-                SendLoadBackDone(op_id);
+                SendLoadBackDone(op_id, /*success=*/true);
             }
         }
         const ForwardBatch* forward = FindForwardBatch(recovery.Operations());

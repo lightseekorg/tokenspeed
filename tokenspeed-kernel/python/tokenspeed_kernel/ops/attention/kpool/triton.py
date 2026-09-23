@@ -50,8 +50,8 @@ _CUTE_DSL_Q_LENS = frozenset({1, 2, 3, 4, 5, 6})
 
 _TRAITS = {
     "head_dim": frozenset({128}),
-    "pool_size": frozenset({2, 4, 8, 16}),
     "page_size": frozenset({16, 64}),
+    "pool_size": frozenset({2, 4, 8, 16}),
     "index_k_format": frozenset({"fp8_scaled"}),
     "score_activation": frozenset({"relu", "none"}),
     "topk_layout": frozenset({"global_slots"}),
@@ -327,7 +327,6 @@ def _select_pools_dense(
     signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
     traits=_TRAITS,
     priority=Priority.PORTABLE,
-    tags={"portability", "kpool", "dense-score"},
 )
 def triton_dense_kpool_decode_topk(
     q: torch.Tensor,
@@ -455,7 +454,6 @@ def triton_dense_kpool_decode_topk(
     signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
     traits=_TRAITS,
     priority=Priority.PORTABLE,
-    tags={"portability", "kpool"},
 )
 def triton_kpool_prefill_topk(
     q: torch.Tensor,

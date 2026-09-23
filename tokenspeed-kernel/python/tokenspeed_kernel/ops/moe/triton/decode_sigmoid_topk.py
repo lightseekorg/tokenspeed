@@ -177,7 +177,6 @@ def _decode_sigmoid_bias_topk(
         "experts": frozenset(range(1, 1025)),
         "topk": frozenset(range(1, 17)),
     },
-    tags={"decode", "routing", "cuda_graph"},
 )
 def triton_decode_sigmoid_bias_topk(
     *,
@@ -211,7 +210,6 @@ def triton_decode_sigmoid_bias_topk(
         "experts": frozenset(range(1, 1025)),
         "topk": frozenset(range(1, 17)),
     },
-    tags={"decode", "routing", "expert_map", "cuda_graph"},
 )
 def triton_decode_sigmoid_bias_topk_mapped(
     *,

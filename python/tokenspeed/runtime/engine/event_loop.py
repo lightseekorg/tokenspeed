@@ -41,6 +41,7 @@ from tokenspeed.runtime.engine.batch_log import BatchLogger
 from tokenspeed.runtime.engine.cache_hooks import L2CacheHooks
 from tokenspeed.runtime.engine.generation_output_processor import OutputProcesser
 from tokenspeed.runtime.engine.io_struct import IpcReceiver, IpcSender, NullSender
+from tokenspeed.runtime.engine.l3_cache_hooks import L3CacheHooks
 from tokenspeed.runtime.engine.load_snapshot import create_load_reporter
 from tokenspeed.runtime.engine.memory_occupation import MemoryOccupationController
 from tokenspeed.runtime.engine.pause import PauseController, PauseHooks
@@ -58,6 +59,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
 from tokenspeed.runtime.epd.prefill_hooks import EpdPrefillHooks
 from tokenspeed.runtime.execution.device import (
     DeviceRole,
+    arm_data_plane_sync_debug,
     build_device_side,
     maybe_control_plane_guard,
 )
@@ -242,6 +244,18 @@ class EventLoop:
         self.attn_tp_cpu_group = pg_manager.get_process_group(
             "gloo", server_args.mapping.attn.tp_group
         )
+        self.attn_cp_size = mapping.attn.cp_size
+        self.attn_cp_cpu_group = (
+            pg_manager.get_process_group("gloo", mapping.attn.cp_group)
+            if mapping.has_attn_cp
+            else None
+        )
+        self.pp_size = mapping.pp_size
+        self.pp_cpu_group = (
+            pg_manager.get_process_group("gloo", mapping.pp_group)
+            if mapping.has_pp
+            else None
+        )
         self.dp_rank = dp_rank
         self.dp_size = mapping.attn.dp_size
         self.has_dp = mapping.has_attn_dp
@@ -261,6 +275,10 @@ class EventLoop:
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=self.attn_tp_size,
             attn_tp_cpu_group=self.attn_tp_cpu_group,
+            attn_cp_size=self.attn_cp_size,
+            attn_cp_cpu_group=self.attn_cp_cpu_group,
+            pp_size=self.pp_size,
+            pp_cpu_group=self.pp_cpu_group,
             global_rank=global_rank,
         )
 
@@ -317,6 +335,7 @@ class EventLoop:
             prefix_granularity=geometry.prefix_granularity,
             num_host_pages=num_host_pages,
             disable_l2_cache=not server_args.enable_kvstore,
+            enable_l3_storage=server_args.kvstore_storage_backend is not None,
             role=server_args.disaggregation_mode,
             enable_kv_cache_events=self._kv_events_enabled,
             decode_input_tokens=decode_input_tokens,
@@ -333,6 +352,7 @@ class EventLoop:
             f"decode_input_tokens={scheduler_cfg.decode_input_tokens!s} "
             f"overlap_schedule_depth={scheduler_cfg.overlap_schedule_depth!s} "
             f"disable_l2_cache={scheduler_cfg.disable_l2_cache!s} "
+            f"enable_l3_storage={scheduler_cfg.enable_l3_storage!s} "
             f"max_batch_size={scheduler_cfg.max_batch_size!s} (global max_num_seqs="
             f"{server_args.max_num_seqs!s}, dp_size={self.dp_size!s}) "
             f"disable_prefix_cache={scheduler_cfg.disable_prefix_cache!s} "
@@ -340,6 +360,16 @@ class EventLoop:
             f"cache_groups={[group.group_id for group in cache_groups]!s}",
         )
         self.scheduler = Scheduler(scheduler_cfg)
+        self._l3_hooks = L3CacheHooks(
+            self.scheduler,
+            self._device if scheduler_cfg.enable_l3_storage else None,
+            attn_tp_size=self.attn_tp_size,
+            attn_tp_cpu_group=self.attn_tp_cpu_group,
+            attn_cp_size=self.attn_cp_size,
+            attn_cp_cpu_group=self.attn_cp_cpu_group,
+            pp_size=self.pp_size,
+            pp_cpu_group=self.pp_cpu_group,
+        )
         # Per-round batch logging lives on the control plane: it reports
         # scheduler quantities (queue depth, page usage) that the loop already
         # samples, and its counters stay on this thread.
@@ -354,6 +384,7 @@ class EventLoop:
                 if server_args.disaggregation_mode != "null"
                 else None
             ),
+            context_length=self._request_context_length,
             decode_log_interval=server_args.decode_log_interval,
             # Usable pages, the same total the load snapshot and the
             # Prometheus gauge publish, so the three never disagree.
@@ -443,6 +474,7 @@ class EventLoop:
             recv_func=self.recv_from_tokenizer,
             send_func=self.send_to_tokenizer,
             clear_cache_fn=self.scheduler.clear_cache,
+            can_clear_cache_fn=self.scheduler.can_clear_cache,
             architectures=self.model_config.hf_config.architectures,
             pause_controller=self._pause,
             memory_controller=self._memory,
@@ -523,6 +555,9 @@ class EventLoop:
             KVEventBatch(ts=time.time(), events=events, attn_dp_rank=self.dp_rank)
         )
 
+    def _submit_scheduler_requests(self, specs) -> None:
+        self._l3_hooks.submit_requests(specs)
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -567,17 +602,28 @@ class EventLoop:
         )
         return DistributedInitializer.initialize(distributed_config)
 
+    def _owns_request_io(self) -> bool:
+        """True when this rank owns the tokenizer ZMQ pair and load reports.
+
+        PP: only global rank 0. Otherwise attention TP rank 0 and CP rank 0,
+        because ``ENABLE_CP`` leaves every worker at ``attn_tp_rank == 0``.
+        Load reporting must use this same predicate: nonowners get a
+        ``NullSender`` with no ``set_load_snapshot``.
+        """
+
+        mapping = self.server_args.mapping
+        if mapping.has_pp:
+            return mapping.rank == 0
+        return self.attn_tp_rank == 0 and mapping.attn.cp_rank == 0
+
     def _init_interprocess_comm(self):
         context = zmq.Context(2)
         # Chunk-pipeline: request I/O is owned by GLOBAL rank 0 only —
         # every stage's tp_rank-0 would otherwise try to open the one
         # frontend socket pair. recv_reqs broadcasts over the world group.
-        owns_request_io = (
-            self.server_args.mapping.rank == 0
-            if self.server_args.mapping.has_pp
-            else self.attn_tp_rank == 0
-        )
-        if owns_request_io:
+        # ENABLE_CP without PP: every worker is attn_tp_rank 0, so only
+        # cp_rank 0 owns the socket; RequestHandler fans recv_reqs across CP.
+        if self._owns_request_io():
             if self.server_args.zmq_msgpack:
                 # SMG drives the scheduler directly: it binds the sockets and
                 # this engine connects in over the msgpack wire; the handshake
@@ -606,7 +652,7 @@ class EventLoop:
             self.send_to_tokenizer = NullSender()
 
     def _init_load_reporter(self) -> None:
-        reports_load = self.attn_tp_rank == 0
+        reports_load = self._owns_request_io()
         self.load_reporter = create_load_reporter(
             enabled=reports_load,
             # Bound only in direct-ZMQ mode, and only where it is used: other
@@ -724,7 +770,7 @@ class EventLoop:
             return
 
         if admitted_specs:
-            self.scheduler.submit_requests(admitted_specs)
+            self._submit_scheduler_requests(admitted_specs)
 
     @nvtx_range("loop:commit", color="rapids")
     def _pp_broadcast_output_tokens(self, forward_op, results) -> None:
@@ -866,6 +912,11 @@ class EventLoop:
     def _num_running(self) -> int:
         return len(self.output_processor.rid_to_state)
 
+    def _request_context_length(self, rid: str) -> int:
+        """Tokens ``rid`` holds right now: its prompt plus everything committed."""
+        state = self.output_processor.rid_to_state[rid]
+        return state.input_length + state.output_length
+
     def _get_scheduler_stats(self):
         empty = self.scheduler.empty_lcm_blocks()
         active = self.scheduler.active_lcm_blocks()
@@ -977,6 +1028,7 @@ class EventLoop:
                 # replaces this rank's model forward; bootstrap, admission and
                 # transfer completion still have to advance on every round.
                 paused_round = False
+                l3_prefetch_retracts = []
 
                 if self._pause.forward_blocked:
                     # Freeze: dispatched forwards can't be un-launched; commit them
@@ -985,10 +1037,14 @@ class EventLoop:
                     self._pause_hooks.paused_idle_step()
                     paused_round = True
                 else:
+                    self._l3_hooks.revalidate_queued_hits()
                     execution_plan = self.scheduler.next_execution_plan()
                     self._cache_hooks.count_plan_ops(execution_plan)
 
                     forward_op = self._get_forward_op(execution_plan)
+                    forward_op, l3_prefetch_retracts = self._l3_hooks.prepare_forward(
+                        execution_plan, forward_op
+                    )
                     stats = self._get_scheduler_stats()
                     self.load_reporter.observe(stats, self._num_running())
                     num_iter_tokens = (
@@ -1013,10 +1069,11 @@ class EventLoop:
 
                     planned = None
                     if not need_idle_forward and forward_op is not None:
-                        # Gather sampling params and grammar state BEFORE any
-                        # pending commit below — a commit can finish requests and
-                        # pop them from output_processor.rid_to_state, which would
-                        # KeyError on rids still present in the current forward_op.
+                        # Gather sampling params, grammar state and the batch
+                        # log's per-request reads BEFORE any pending commit
+                        # below — a commit can finish requests and pop them from
+                        # output_processor.rid_to_state, which would KeyError on
+                        # rids still present in the current forward_op.
                         sampling_params_list = self._gather_sampling_params(forward_op)
                         grammar_inputs = self._gather_grammar_state(forward_op)
                         ngram_inputs = ngram_inputs_for_forward(
@@ -1024,6 +1081,7 @@ class EventLoop:
                             self.output_processor.rid_to_state,
                             self._ngram_context_len,
                         )
+                        self._batch_logger.log_dispatch(forward_op, stats)
 
                         if in_flight and self._dispatch_depends_on_pending_commit(
                             forward_op, grammar_inputs
@@ -1031,7 +1089,6 @@ class EventLoop:
                             request_changes.extend(self._drain_in_flight(in_flight))
 
                         self._mark_stats_scheduled(forward_op)
-                        self._batch_logger.log_dispatch(forward_op, stats)
                         planned = PlannedForward(
                             forward_op=forward_op,
                             sampling_params_list=sampling_params_list,
@@ -1057,7 +1114,11 @@ class EventLoop:
                     # transfers ride the FIFO first, then the batch the role
                     # routes. ``planned`` is None on idle/empty rounds — the
                     # plan hygiene still runs.
-                    pending = self._device.execute(execution_plan, planned)
+                    pending = self._device.execute(
+                        execution_plan,
+                        planned,
+                        submit_remote_prefill=not l3_prefetch_retracts,
+                    )
                     if need_idle_forward:
                         self._device.run_idle_forward(dp_metadata)
                     if pending is not None:
@@ -1074,6 +1135,9 @@ class EventLoop:
                         request_changes.extend(self._commit_forward_results(fo, res))
 
                     request_changes.extend(self._pd_hooks.poll_transfer_events())
+
+                # Recovery follows older commits, before the next round plans.
+                request_changes.extend(l3_prefetch_retracts)
 
                 # The forward-result feedback point: everything this round
                 # committed reaches the scheduler here, before the next round
@@ -1158,6 +1222,7 @@ class EventLoop:
         close_transfer = getattr(self.kv_transfer, "close", None)
         if callable(close_transfer):
             close_transfer()
+        self._device.shutdown_cache()
 
 
 def run_event_loop(
@@ -1243,6 +1308,9 @@ def run_event_loop(
             # the loop and starts the first DP metadata collective.
             dist.barrier(group=event_loop.world_cpu_group)
 
+        # Everything before this point is startup and may synchronize; from
+        # here on a host synchronization on the data plane is a stall.
+        arm_data_plane_sync_debug(server_args.device)
         event_loop.event_loop()
 
     except Exception:  # noqa: BLE001 - process boundary; report and signal parent

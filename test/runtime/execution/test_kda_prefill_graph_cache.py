@@ -459,6 +459,8 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
     cases.append(([1] * batch_size, [0] * batch_size))
     # Exercise the real outer startup loop and shared-pool ownership.
     owner = object.__new__(PrefillGraph)
+    # KDA has no CED narrowing; the split encoder/decoder capture stays off.
+    owner._narrowing = None
     owner.config = SimpleNamespace(
         global_rank=1,
         context_len=bucket,
@@ -571,6 +573,8 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
         return SimpleNamespace(replay=lambda **kwargs: events.append(label))
 
     owner = object.__new__(PrefillGraph)
+    # KDA has no CED narrowing; the split encoder/decoder capture stays off.
+    owner._narrowing = None
     owner._captures = {
         (8, None): (capture("ordinary"), CapturedForward(torch.ones(8, 4), None)),
         (8, capture_bs): (
@@ -630,6 +634,8 @@ def test_request_bucket_selection_reserves_dummy_scan_tokens(bs, tokens, expecte
     from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
 
     owner = object.__new__(PrefillGraph)
+    # KDA has no CED narrowing; the split encoder/decoder capture stays off.
+    owner._narrowing = None
     owner.disable = False
     owner.dp_size = 1
     owner.attn_backend = SimpleNamespace(step_counter=None)
@@ -687,6 +693,8 @@ def test_outer_capture_records_one_variant_per_configured_request_count():
     from tokenspeed.runtime.execution.prefill_graph import CapturedForward, PrefillGraph
 
     owner = object.__new__(PrefillGraph)
+    # KDA has no CED narrowing; the split encoder/decoder capture stays off.
+    owner._narrowing = None
     owner.config = SimpleNamespace(
         global_rank=1,
         context_len=16,

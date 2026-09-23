@@ -592,6 +592,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_moe = True
         elif config.model_type == "qwen3_5_text":
             self.mlp = Qwen3_5MoeMLP(
+                parallelism="dense",
                 mapping=self.mapping,
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -773,6 +774,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         # Dense MLP for non-MoE variant
         if config.model_type == "qwen3_5_text":
             self.mlp = Qwen3_5MoeMLP(
+                parallelism="dense",
                 mapping=self.mapping,
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,

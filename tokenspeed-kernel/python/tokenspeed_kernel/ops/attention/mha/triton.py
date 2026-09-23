@@ -46,13 +46,12 @@ _PORTABLE_DTYPES = {torch.float16, torch.bfloat16}
     signatures=format_signatures(("q", "k", "v"), "dense", _PORTABLE_DTYPES),
     priority=Priority.PORTABLE,
     traits={
-        "sliding_window": frozenset({False, True}),
-        "support_sinks": frozenset({False, True}),
-        "support_logit_cap": frozenset({False, True}),
+        "logit_cap": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
-        "support_skip_softmax": frozenset({False}),
+        "sinks": frozenset({False, True}),
+        "skip_softmax": frozenset({False}),
+        "sliding_window": frozenset({False, True}),
     },
-    tags={"portability"},
 )
 def triton_mha_prefill(
     q: torch.Tensor,
@@ -100,12 +99,11 @@ def triton_mha_prefill(
     priority=Priority.PORTABLE,
     traits={
         "is_causal": frozenset({False, True}),
-        "sliding_window": frozenset({False, True}),
-        "support_sinks": frozenset({False, True}),
-        "support_logit_cap": frozenset({False, True}),
+        "logit_cap": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
+        "sinks": frozenset({False, True}),
+        "sliding_window": frozenset({False, True}),
     },
-    tags={"portability"},
 )
 def triton_mha_extend_with_kvcache(
     q: torch.Tensor,
@@ -162,12 +160,11 @@ def triton_mha_extend_with_kvcache(
     ),
     priority=Priority.PORTABLE,
     traits={
-        "sliding_window": frozenset({False, True}),
-        "support_sinks": frozenset({False, True}),
-        "support_logit_cap": frozenset({False, True}),
+        "logit_cap": frozenset({False, True}),
         "return_lse": frozenset({False}),
+        "sinks": frozenset({False, True}),
+        "sliding_window": frozenset({False, True}),
     },
-    tags={"portability"},
 )
 def triton_mha_decode_with_kvcache(
     q: torch.Tensor,
@@ -218,11 +215,11 @@ if current_platform().is_npu:
 
     _NPU_CAPABILITY = CapabilityRequirement(vendors=frozenset({"ascend"}))
     _NPU_OPTIONS = {
-        "sliding_window": frozenset({False}),
-        "support_sinks": frozenset({False}),
-        "support_logit_cap": frozenset({False}),
-        "support_skip_softmax": frozenset({False}),
+        "logit_cap": frozenset({False}),
         "return_lse": frozenset({False}),
+        "sinks": frozenset({False}),
+        "skip_softmax": frozenset({False}),
+        "sliding_window": frozenset({False}),
     }
 
     @register_kernel(
@@ -234,7 +231,6 @@ if current_platform().is_npu:
         signatures=format_signatures(("q", "k", "v"), "dense", _PORTABLE_DTYPES),
         priority=Priority.PERFORMANT,
         traits=_NPU_OPTIONS,
-        tags={"portability"},
     )
     def torch_npu_mha_prefill(**kwargs):
         return _mha_prefill(**kwargs)
@@ -254,7 +250,6 @@ if current_platform().is_npu:
             "page_size": frozenset({64, 128}),
             "is_causal": frozenset({False, True}),
         },
-        tags={"portability"},
     )
     def torch_npu_mha_extend_with_kvcache(**kwargs):
         return _mha_extend_with_kvcache(**kwargs)
@@ -271,10 +266,9 @@ if current_platform().is_npu:
         priority=Priority.PERFORMANT,
         traits={
             **_NPU_OPTIONS,
-            "page_size": frozenset({64, 128}),
             "q_len": frozenset({1}),
+            "page_size": frozenset({64, 128}),
         },
-        tags={"portability"},
     )
     def torch_npu_mha_decode_with_kvcache(**kwargs):
         return _mha_decode_with_kvcache(**kwargs)

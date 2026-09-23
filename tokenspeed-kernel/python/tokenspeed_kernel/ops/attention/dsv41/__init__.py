@@ -38,13 +38,20 @@ Portable codecs honor every byte stride; native kernels require contiguous
 page bytes and aligned page strides. Physical slots address a particular field;
 invalid slots read zero or skip writes. Callers own mapping, causal lengths,
 RoPE, normalization, output buffers and cache lifetime.
+
+The ``dspark_*`` helpers serve the checkpoint-local DSpark drafter, whose
+context windows are BF16 [pages,64,512] fields of the SWA group: one launch
+per stage turns projected rows into window rows (kv_norm, RoPE, the SWA
+codec's quantize-dequantize round trip, masked scatter), one launch derives a
+verify step's bonus tokens and anchors, and one launch expands anchors into
+the block's ids, positions, HC mix and workspace addressing.
 """
 
 from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import bounded_group_slots
-from tokenspeed_kernel.selection import SelectionObjective, select_kernel
+from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
@@ -67,6 +74,9 @@ __all__ = [
     "swa_rope_scatter",
     "rope_inplace",
     "rope_pad_query",
+    "dspark_rows",
+    "dspark_anchors",
+    "dspark_block",
 ]
 
 
@@ -77,7 +87,6 @@ def _kernel(mode: str, x: torch.Tensor):
         format_signature(x=dense_tensor_format(x.dtype)),
         features=None,
         platform=None,
-        objective=SelectionObjective.DEFAULT,
         traits=None,
         solution=None,
         override=None,
@@ -305,7 +314,6 @@ def selected_attention(
         format_signature(x=dense_tensor_format(q.dtype)),
         features=None,
         platform=None,
-        objective=SelectionObjective.DEFAULT,
         traits={"flashmla_eligible": native},
         solution=None,
         override=None,
@@ -477,12 +485,11 @@ def index_topk(
         format_signature(x=dense_tensor_format(index_q.dtype)),
         features=None,
         platform=None,
-        objective=SelectionObjective.DEFAULT,
         traits={
-            "native_indexer": native,
             "index_heads": index_heads,
             "index_k_format": index_k_format,
             "index_shards": index_shards,
+            "native_indexer": native,
         },
         solution=solution,
         override=None,
@@ -604,6 +611,152 @@ def rope_pad_query(
     return kernel(values, positions, cos_sin_cache)
 
 
+def dspark_rows(
+    values: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
+    positions: torch.Tensor | None,
+    cos_sin_cache: torch.Tensor | None,
+    window: torch.Tensor | None,
+    slots: torch.Tensor | None,
+    out: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Produce DSpark context-window rows from projected BF16 [T,512] values.
+
+    One launch performs the reference chain for every row: optionally the
+    kv_norm RMSNorm in the eager cast order (``norm_weight`` [512] with
+    ``norm_eps``; pass both or neither), optionally the interleaved-tail
+    RoPE at ``positions`` from the FP32 ``cos_sin_cache`` [max_position,
+    rotary_dim] (pass both or neither), then the all-channel 1x32 E4M3/E8M0
+    quantize-dequantize round trip to BF16. Rows land in the BF16 paged
+    ``window`` [pages,rows,512] at ``slots`` [T] (negative or out-of-field
+    slots write nothing; pass both or neither) and/or in ``out`` [T,512].
+    ``values`` may be a unit-column-stride slice. Returns ``out``.
+    """
+    _kernel("dspark_rows", values)(
+        values, norm_weight, norm_eps, positions, cos_sin_cache, window, slots, out
+    )
+    return out
+
+
+def dspark_anchors(
+    output_tokens: torch.Tensor,
+    accept_lengths: torch.Tensor,
+    positions: torch.Tensor,
+    num_extends: int,
+    width: int,
+    next_tokens: torch.Tensor,
+    start_pos: torch.Tensor,
+) -> None:
+    """Fill each verify row's bonus token and each decode request's anchor.
+
+    ``output_tokens`` [num_extends + num_decodes * width] holds the extend
+    rows first and then each decode request's ``width`` verify rows;
+    ``accept_lengths`` [bs] counts accepted tokens (clamped to 1..width) and
+    ``positions`` [num_decodes * width] are the decode rows' positions.
+    Every column of ``next_tokens`` [bs, spec] (int32) receives its row's
+    bonus token, and ``start_pos`` [num_decodes] (int64) the position of the
+    last accepted verify row. Both destinations are fully overwritten.
+    """
+    bs = accept_lengths.shape[0]
+    num_decodes = bs - num_extends
+    if not 0 <= num_extends <= bs or width < 1:
+        raise ValueError("DSpark anchors need 0 <= num_extends <= bs and width >= 1")
+    if (
+        output_tokens.shape != (num_extends + num_decodes * width,)
+        or positions.shape != (num_decodes * width,)
+        or next_tokens.shape[:1] != (bs,)
+        or next_tokens.ndim != 2
+        or next_tokens.dtype != torch.int32
+        or next_tokens.stride(1) != 1
+        or start_pos.shape != (num_decodes,)
+        or start_pos.dtype != torch.int64
+    ):
+        raise ValueError("DSpark anchor tensors do not match the verify layout")
+    for tensor in (output_tokens, accept_lengths, positions, start_pos):
+        if tensor.dtype not in (torch.int32, torch.int64) or not tensor.is_contiguous():
+            raise ValueError("DSpark anchor inputs must be contiguous integers")
+    if not positions.is_cuda:
+        rows = torch.arange(num_decodes)
+        accepted = accept_lengths[num_extends:].to(torch.int64).clamp(1, width)
+        verify = num_extends + rows * width + accepted - 1
+        bonus = torch.cat((output_tokens[:num_extends], output_tokens[verify]))
+        next_tokens.copy_(bonus[:, None].expand_as(next_tokens))
+        start_pos.copy_(positions[rows * width + accepted - 1])
+        return
+    _kernel("dspark_anchors", positions)(
+        output_tokens,
+        accept_lengths,
+        positions,
+        num_extends,
+        width,
+        next_tokens,
+        start_pos,
+    )
+
+
+def dspark_block(
+    bonus: torch.Tensor,
+    start_pos: torch.Tensor,
+    history_slots: torch.Tensor,
+    noise_token: int,
+    rows_per_page: int,
+    hc_mult: int,
+    block_size: int,
+) -> tuple[torch.Tensor, ...]:
+    """Expand per-request anchors into one draft block's inputs and addressing.
+
+    ``bonus`` [n] and ``start_pos`` [n] are integer anchors, ``history_slots``
+    [n, window] the requests' context-window slots (negative = absent).
+    Returns ``(ids, positions, pre_mix, request_indices, page, row,
+    indices)``: int32 ids [n*block] (bonus then ``noise_token``), int64
+    positions [n*block] (``start_pos+1..``), fp32 one-hot pre_mix
+    [n*block, hc_mult], int64 request_indices [n*block], int64 page/row
+    [n, window] resolving clamped slots with ``rows_per_page`` rows, and
+    int32 workspace indices [n*block, window+block] selecting each request's
+    history rows (-1 where absent) and its own block rows.
+    """
+    if (
+        history_slots.ndim != 2
+        or bonus.shape != history_slots.shape[:1]
+        or start_pos.shape != history_slots.shape[:1]
+    ):
+        raise ValueError("DSpark block inputs must be [n], [n] and [n, window]")
+    if block_size < 1 or hc_mult < 1 or rows_per_page < 1:
+        raise ValueError("DSpark block geometry must be positive")
+    for tensor in (bonus, start_pos, history_slots):
+        if tensor.dtype not in (torch.int32, torch.int64):
+            raise ValueError("DSpark block inputs must be int32/int64")
+    if history_slots.stride(1) != 1:
+        raise ValueError("DSpark history slots need a unit column stride")
+    if not bonus.is_cuda:
+        n, window = history_slots.shape
+        device = bonus.device
+        ids = torch.full((n, block_size), noise_token, dtype=torch.int32, device=device)
+        ids[:, 0] = bonus
+        positions = start_pos.to(torch.int64)[:, None] + 1 + torch.arange(block_size)
+        pre_mix = torch.zeros((n * block_size, hc_mult), dtype=torch.float32)
+        pre_mix[:, 0] = 1
+        request_indices = torch.arange(n).repeat_interleave(block_size)
+        slots = history_slots.clamp_min(0).long()
+        width = window + block_size
+        indices = torch.arange(n * width, dtype=torch.int32).view(n, width)
+        indices[:, :window].masked_fill_(history_slots < 0, -1)
+        indices = indices[:, None, :].expand(-1, block_size, -1).reshape(-1, width)
+        return (
+            ids.reshape(-1),
+            positions.reshape(-1),
+            pre_mix,
+            request_indices,
+            slots // rows_per_page,
+            slots % rows_per_page,
+            indices,
+        )
+    return _kernel("dspark_block", history_slots)(
+        bonus, start_pos, history_slots, noise_token, rows_per_page, hc_mult, block_size
+    )
+
+
 def decode_rows(
     seq_lens,
     request_pool_indices,
@@ -678,21 +831,18 @@ def decode_window(
     write_slots,
     read_slots,
     read_lens,
-    status,
     swa_table,
-    tail_table,
     swa_pages,
-    tail_pages,
 ):
-    """Fill SWA addresses and history errors for N logical query coordinates.
+    """Fill SWA addresses for N logical query coordinates.
 
     positions/requests are integer [N] in consecutive request-major spans;
-    spans may have different lengths. Tables are LCM group pages. Destinations
-    are write_slots[N], read_slots[N,128], read_lens[N], status[N]. Only the
-    first live row of each span reports history errors: bit 0 for missing SWA
-    history, bit 1 for a required compressor tail. Internal pairs use current
-    projections, not retained tails. Padding status is zero. Page zero and
-    pages beyond the supplied capacities never address live cache. Returns None.
+    spans may have different lengths. swa_table holds LCM group pages.
+    Destinations are write_slots[N], read_slots[N,128] and read_lens[N].
+    Padding rows (negative position or request) resolve to -1. Page zero and
+    pages beyond swa_pages never address live cache. Whether the window's
+    history is resident is the scheduler's retention contract, not checked
+    here. Returns None.
     """
     if not positions.is_cuda:
         from tokenspeed_kernel.ops.attention.mla._triton.page_table import (
@@ -709,23 +859,6 @@ def decode_window(
         write_slots.copy_(
             bounded_group_slots(positions, requests, swa_table, 64, 1, 1, swa_pages)
         )
-        missing_swa = ((wanted >= 0) & (wanted < positions[:, None]) & (slots < 0)).any(
-            -1
-        )
-        previous = (positions - 1).masked_fill(
-            (positions < 0) | (positions % 2 != 1), -1
-        )
-        tail = bounded_group_slots(previous, requests, tail_table, 2, 1, 1, tail_pages)
-        window_start = (positions >= 0) & (requests >= 0)
-        window_start[1:] &= (requests[1:] != requests[:-1]) | (
-            positions[1:] != positions[:-1] + 1
-        )
-        status.copy_(
-            (
-                missing_swa.to(torch.int32)
-                | (((previous >= 0) & (tail < 0)).to(torch.int32) * 2)
-            ).masked_fill(~window_start, 0)
-        )
         return
     _kernel("decode_window", positions)(
         positions,
@@ -733,11 +866,8 @@ def decode_window(
         write_slots,
         read_slots,
         read_lens,
-        status,
         swa_table,
-        tail_table,
         swa_pages,
-        tail_pages,
     )
 
 

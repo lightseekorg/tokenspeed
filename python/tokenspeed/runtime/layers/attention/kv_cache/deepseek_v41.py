@@ -98,6 +98,10 @@ class DeepseekV41CachePool(CachePool):
         """
         return self._field(owner, "compressor_tail")
 
+    def get_kv_size_bytes(self) -> int:
+        """Return the bytes of the arena every V4.1 cache group lives in."""
+        return int(self.arena.buffer.nbytes)
+
     def zero_new_blocks(self, new_page_ids: dict[str, list[int]]) -> None:
         """Clear freshly admitted local pages of every group before reuse."""
         self.arena.zero_blocks(new_page_ids)

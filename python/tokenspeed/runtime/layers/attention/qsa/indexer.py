@@ -48,7 +48,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     qsa_raw_key_field,
     qsa_rope_position_field,
 )
-from tokenspeed.runtime.layers.attention.qsa.metadata import qsa_forward_layout
+from tokenspeed.runtime.layers.attention.qsa.metadata import (
+    decode_query_lengths,
+    qsa_forward_layout,
+)
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -342,6 +345,7 @@ class QSAIndexer(nn.Module):
         *,
         full_page_size: int,
         complete_blocks: torch.Tensor,
+        queries_per_request: int | None,
     ) -> torch.Tensor:
         """Select logical QSA blocks and emit physical full-cache slots."""
 
@@ -361,6 +365,8 @@ class QSAIndexer(nn.Module):
             complete_blocks,
             page_size=page_size,
             block_topk=self.block_topk,
+            queries_per_request=queries_per_request,
+            max_partial_bytes=32 * 1024 * 1024,
             solution=self._topk_solution(q.shape[0], qsa_page_table, page_size),
             persistent_topk_workspace=self._persistent_topk_workspace,
             enable_pdl=enable_pdl,
@@ -505,6 +511,11 @@ class QSAIndexer(nn.Module):
             compressed,
             full_page_size=layout.full_kernel_page_size,
             complete_blocks=complete_blocks,
+            queries_per_request=(
+                q.shape[0]
+                if ctx.bs == 1
+                else decode_query_lengths(ctx, q.shape[0], force_uniform=False)
+            ),
         )
         if self.share_topk_for_mtp_iteration:
             ctx.attn_backend.sparse_topk.decode = selected_slots

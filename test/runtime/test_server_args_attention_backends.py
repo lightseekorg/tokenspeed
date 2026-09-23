@@ -440,5 +440,93 @@ class TestDecodeHostL2(unittest.TestCase):
         self.assertTrue(args.enable_kvstore)
 
 
+class TestDisaggregationGraphFlags(unittest.TestCase):
+    """The prefill role is a role with no decode step, not an eager role."""
+
+    def test_prefill_role_keeps_the_ordinary_graph_flags(self):
+        args = prepare_server_args(["--model", "x", "--disaggregation-mode", "prefill"])
+        self.assertFalse(args.enforce_eager)
+        self.assertFalse(args.disable_prefill_graph)
+
+    def test_prefill_role_honours_explicit_eager(self):
+        args = prepare_server_args(
+            ["--model", "x", "--disaggregation-mode", "prefill", "--enforce-eager"]
+        )
+        self.assertTrue(args.enforce_eager)
+
+    def test_pipeline_parallelism_forces_eager(self):
+        args = prepare_server_args(
+            [
+                "--model",
+                "x",
+                "--disaggregation-mode",
+                "prefill",
+                "--pipeline-parallel-size",
+                "2",
+            ]
+        )
+        self.assertTrue(args.enforce_eager)
+
+    def test_pipeline_debug_without_pd_forces_eager(self):
+        with mock.patch.dict(os.environ, {"TS_PP_DEBUG_ALLOW_NON_PREFILL": "1"}):
+            args = prepare_server_args(
+                ["--model", "x", "--pipeline-parallel-size", "2"]
+            )
+        self.assertTrue(args.enforce_eager)
+
+
+class TestL3StorageBackend(unittest.TestCase):
+    def test_cli_accepts_mooncake_and_memory(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        action = None
+        for candidate in parser._actions:
+            if candidate.dest == "kvstore_storage_backend":
+                action = candidate
+                break
+        self.assertIsNotNone(action)
+        self.assertEqual(set(action.choices), {"mooncake", "memory"})
+
+    def test_memory_backend_keeps_host_io(self):
+        args = object.__new__(ServerArgs)
+        args.disaggregation_mode = "null"
+        args.disable_kvstore = False
+        args.enable_kvstore = False
+        args.enable_prefix_caching = True
+        args.kvstore_storage_backend = "memory"
+        args.kvstore_io_backend = "direct"
+
+        args._handle_kvstore()
+
+        self.assertTrue(args.enable_kvstore)
+        self.assertEqual(args.kvstore_io_backend, "direct")
+
+    def test_l3_requires_host_l2(self):
+        args = object.__new__(ServerArgs)
+        args.disaggregation_mode = "null"
+        args.disable_kvstore = True
+        args.enable_kvstore = False
+        args.enable_prefix_caching = True
+        args.kvstore_storage_backend = "mooncake"
+        args.kvstore_io_backend = "direct"
+
+        with self.assertRaisesRegex(ValueError, "requires Host L2"):
+            args._handle_kvstore()
+
+    def test_mooncake_backend_keeps_host_io(self):
+        args = object.__new__(ServerArgs)
+        args.disaggregation_mode = "null"
+        args.disable_kvstore = False
+        args.enable_kvstore = False
+        args.enable_prefix_caching = True
+        args.kvstore_storage_backend = "mooncake"
+        args.kvstore_io_backend = "direct"
+
+        args._handle_kvstore()
+
+        self.assertTrue(args.enable_kvstore)
+        self.assertEqual(args.kvstore_io_backend, "direct")
+
+
 if __name__ == "__main__":
     unittest.main()

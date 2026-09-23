@@ -105,6 +105,14 @@ class HostCacheStorage:
             + child_index * host_cache_block_bytes
         )
 
+    def host_block_range(self, group_index: int, block_id: int) -> tuple[int, int]:
+        """Return ``(byte_offset, payload_bytes)`` for one Host CacheBlock."""
+
+        return (
+            self.host_block_offset(group_index, block_id),
+            self.host_cache_block_bytes[group_index],
+        )
+
     def host_field_offset(
         self, group_index: int, block_id: int, field_index: int
     ) -> int:

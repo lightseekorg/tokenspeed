@@ -140,7 +140,6 @@ if _AVAILABLE:
             "fused_grid_supported": frozenset({True}),
         },
         priority=Priority.SPECIALIZED,
-        tags={"cute_dsl", "decode", "latency"},
     )
     def cute_fused_hyperconnection_mix(
         normalized: torch.Tensor,

@@ -34,7 +34,6 @@ from tokenspeed_kernel.signature import format_signatures
         ("layer_residual", "block_residual"), "dense", {torch.bfloat16}
     ),
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def torch_attn_res_fwd(
     *,

@@ -119,6 +119,11 @@ def _make_plan() -> dict:
         ispp=384,
         internal_activation_dtype="input",
         solution="gluon",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     assert plan["apply_kernel_name"] == _KERNEL_NAME
     return plan

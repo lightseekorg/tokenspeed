@@ -20,6 +20,7 @@
 
 #include "scheduler/scheduler.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -129,7 +130,10 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
         return std::nullopt;
     }
     coordinator_.QueueCachedBlocksForStore(progress.prefix_hashes);
-    coordinator_.QueueLatestSnapshotBlocksForStore(progress.prefix_hashes);
+    const auto prefill_hashes = std::span<const std::string>{progress.prefix_hashes}.first(
+        std::min(progress.prefix_hashes.size(),
+                 static_cast<std::size_t>(request.PrefillSize() / coordinator_.PrefixGranularity())));
+    coordinator_.QueueLatestSnapshotBlocksForStore(prefill_hashes);
     // The request's pages are released right after this (FinishEvent); the
     // pinned ticket keeps them cached and unevictable until the copy ACKs.
     return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);
@@ -157,12 +161,23 @@ void Scheduler::handleEvent(const forward::Abort& event) {
     }
 }
 
+void Scheduler::handleEvent(const forward::Retract& event) {
+    Request* request = findRequest(event.request_id);
+    if (request == nullptr || request->Is<fsm::Finished>() || request->Is<fsm::Retracted>()) {
+        return;
+    }
+    // Snapshot-less: dest pages were not filled. Publishing would cache empty
+    // KV. The request re-prefills through ordinary admission.
+    request->Apply(fsm::RetractEvent{&coordinator_, next_retraction_epoch_++, /*has_recoverable_snapshot=*/false,
+                                     request->HasGeneratedOutput()});
+}
+
 void Scheduler::handleEvent(const cache::WriteBackDone& event) {
     tier_transfers_.CompleteWriteBack(event.op_id);
 }
 
 void Scheduler::handleEvent(const cache::LoadBackDone& event) {
-    tier_transfers_.CompleteLoadBack(event.op_id);
+    tier_transfers_.CompleteLoadBack(event.op_id, event.success);
 }
 
 }  // namespace tokenspeed

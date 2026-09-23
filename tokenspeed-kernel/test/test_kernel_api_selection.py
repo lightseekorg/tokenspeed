@@ -20,8 +20,8 @@
 
 """Golden selection tests for top-level tokenspeed-kernel public APIs.
 
-Each case invokes a real public API (``mm``, ``moe_plan``/``moe_apply``,
-attention, sampling) with :class:`SelectedKernel` calls intercepted by a spy,
+Each case invokes a real API or an internal registry facade used by a public
+API with :class:`SelectedKernel` calls intercepted by a spy,
 and asserts the auto-selected kernel name.  Cases run on every host: the
 platform each case targets is injected via ``Platform.override`` with the
 fixture platforms from ``conftest.py``, so an NVIDIA CI machine also checks
@@ -88,15 +88,17 @@ import tokenspeed_kernel.ops.moe.cuda as _moe_cuda
 import tokenspeed_kernel.ops.moe.deep_gemm as _moe_deep_gemm
 import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
 import tokenspeed_kernel.ops.moe.gluon as _moe_gluon
-import tokenspeed_kernel.ops.moe.gluon.dsv4 as _moe_gluon_dsv4
 import tokenspeed_kernel.ops.moe.gluon.fp8 as _moe_gluon_fp8
 import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk as _moe_gluon_sigmoid_topk
+import tokenspeed_kernel.ops.moe.gluon.sqrt_softplus_topk as _moe_gluon_sqrt_softplus
 import tokenspeed_kernel.ops.moe.latent_decode as _moe_latent_decode
+import tokenspeed_kernel.ops.moe.marlin as _moe_marlin
+import tokenspeed_kernel.ops.moe.native as _moe_native
 import tokenspeed_kernel.ops.moe.sigmoid_topk as _moe_sigmoid_topk
 import tokenspeed_kernel.ops.moe.softmax_topk as _moe_softmax_topk
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
-import tokenspeed_kernel.ops.moe.triton.dsv4 as _moe_triton_dsv4
 import tokenspeed_kernel.ops.moe.triton.softmax_topk as _moe_triton_softmax_topk
+import tokenspeed_kernel.ops.moe.triton.sqrt_softplus_topk as _moe_triton_sqrt_softplus
 import tokenspeed_kernel.ops.quantization as _quantization_pkg
 import tokenspeed_kernel.ops.quantization.flashinfer as _quantization_flashinfer
 import tokenspeed_kernel.ops.quantization.triton as _quantization_triton
@@ -123,6 +125,7 @@ from tokenspeed_kernel.ops.moe.flashinfer import (
     cutedsl_deepep_nvfp4 as _moe_cutedsl_deepep_nvfp4,
 )
 from tokenspeed_kernel.ops.moe.flashinfer import cutlass_fp8 as _moe_cutlass_fp8
+from tokenspeed_kernel.ops.moe.flashinfer import cutlass_mxfp4 as _moe_cutlass_mxfp4
 from tokenspeed_kernel.ops.moe.flashinfer import cutlass_nvfp4 as _moe_cutlass_nvfp4
 from tokenspeed_kernel.ops.moe.flashinfer import cutlass_unquant as _moe_cutlass_unquant
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_fp8 as _moe_trtllm_fp8
@@ -131,6 +134,8 @@ from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxint4 as _moe_trtllm_mx
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_nvfp4 as _moe_trtllm_nvfp4
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as _moe_trtllm_unquant
 from tokenspeed_kernel.ops.moe.gluon import mxfp4 as _moe_gluon_mxfp4
+from tokenspeed_kernel.ops.moe.marlin import deepep_mxfp4 as _moe_marlin_deepep_mxfp4
+from tokenspeed_kernel.ops.moe.marlin import mxfp4 as _moe_marlin_mxfp4
 from tokenspeed_kernel.ops.moe.triton import bf16 as _moe_triton_bf16
 from tokenspeed_kernel.ops.moe.triton import (
     decode_sigmoid_topk as _moe_triton_decode_sigmoid_topk,
@@ -141,6 +146,7 @@ from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import (
     SelectedKernel,
     select_kernel,
+    spec_matches_shape_traits,
     spec_matches_traits,
 )
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -207,6 +213,7 @@ _RELOAD_MODULES = [
     _moe_deep_gemm,
     _moe_cutedsl_deepep_nvfp4,
     _moe_cutlass_fp8,
+    _moe_cutlass_mxfp4,
     _moe_cutlass_nvfp4,
     _moe_cutlass_unquant,
     _moe_trtllm_fp8,
@@ -215,16 +222,20 @@ _RELOAD_MODULES = [
     _moe_trtllm_nvfp4,
     _moe_trtllm_unquant,
     _moe_flashinfer,
-    _moe_gluon_dsv4,
+    _moe_gluon_sqrt_softplus,
     _moe_gluon_fp8,
     _moe_gluon_mxfp4,
     _moe_sigmoid_topk,
     _moe_softmax_topk,
     _moe_gluon_sigmoid_topk,
     _moe_gluon,
+    _moe_marlin_deepep_mxfp4,
+    _moe_marlin_mxfp4,
+    _moe_marlin,
+    _moe_native,
     _moe_triton_bf16,
     _moe_triton_decode_sigmoid_topk,
-    _moe_triton_dsv4,
+    _moe_triton_sqrt_softplus,
     _moe_triton_mxfp4,
     _moe_triton_softmax_topk,
     _moe_triton,
@@ -525,6 +536,104 @@ def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None
     assert b_format.scale is not None
     assert a_format.scale.block_shape == (128, 128)
     assert b_format.scale.block_shape == (128, 128)
+
+
+@pytest.mark.parametrize(
+    "contract,online,expected_name",
+    [
+        ("ue8m0", False, "gluon_mm_mxfp8_ue8m0_gfx1250"),
+        ("ue8m0", True, "gluon_mm_mxfp8_ue8m0_gfx1250"),
+        ("fp32", False, "gluon_mm_fp8_blockscale_gfx1250"),
+        ("fp32", True, "gluon_mm_fp8_blockscale_gfx1250"),
+    ],
+)
+def test_public_mm_selects_gfx1250_decode_kernel(
+    contract: str,
+    online: bool,
+    expected_name: str,
+    mi450_platform: PlatformInfo,
+    monkeypatch,
+    selected_kernel_spy,
+) -> None:
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    expected_spec = registry.get_by_name(expected_name)
+    if expected_spec is None:
+        assert not host_platform.is_cdna5
+        pytest.skip(f"{expected_name!r} is not registered (optional backend missing)")
+    assert expected_spec.capability.satisfied_by(mi450_platform)
+
+    m, n, k = 1, 128, 256
+    a_dtype = torch.bfloat16 if online else _fp8_dtype()
+    a = torch.empty((m, k), dtype=a_dtype)
+    b = torch.empty((n, k), dtype=_fp8_dtype())
+    if contract == "ue8m0":
+        block_size = [1, 32]
+        scale_dtype = torch.uint8
+        a_scales = torch.empty((m, k // 32), dtype=scale_dtype)
+        b_scales = torch.empty((n, k // 32), dtype=scale_dtype)
+    else:
+        block_size = [128, 128]
+        scale_dtype = torch.float32
+        a_scales = torch.empty((m, k // 128), dtype=scale_dtype)
+        b_scales = torch.empty((n // 128, k // 128), dtype=scale_dtype)
+    if online:
+        a_scales = None
+
+        def fake_online_quantize_mxfp8(
+            activation: torch.Tensor,
+            selected_block_size: list[int],
+            kernel_name: str,
+            enable_pdl: bool,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            assert selected_block_size == block_size
+            assert kernel_name == expected_name
+            assert not enable_pdl
+            return (
+                torch.empty_like(activation, dtype=_fp8_dtype()),
+                torch.empty(
+                    (m, k // block_size[1]),
+                    dtype=scale_dtype,
+                    device=activation.device,
+                ),
+            )
+
+        monkeypatch.setattr(
+            _gemm_pkg,
+            "_online_quantize_mxfp8",
+            fake_online_quantize_mxfp8,
+        )
+
+    case = _case(
+        _is_cdna5,
+        "cdna5",
+        "gemm",
+        "mm",
+        expected_name,
+        lambda: None,
+        id_suffix=f"{contract}-{'online' if online else 'prequantized'}",
+    )
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = case
+    try:
+        Platform.override(mi450_platform)
+        monkeypatch.setattr(_gemm_pkg, "_platform", mi450_platform)
+        registry.clear_cache()
+        actual = tokenspeed_kernel.mm(
+            a,
+            b,
+            A_scales=a_scales,
+            B_scales=b_scales,
+            out_dtype=torch.bfloat16,
+            quant="mxfp8",
+            block_size=block_size,
+        )
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+
+    assert calls == [expected_name]
+    assert actual.shape == (m, n)
 
 
 def test_bmm_mxfp8_online_activation_signature_uses_quantized_storage() -> None:
@@ -978,7 +1087,7 @@ def test_gemm_nvfp4_a16_square_weight_uses_weight_rows_for_n(monkeypatch) -> Non
         return torch.empty((A.shape[0], B.shape[0]), dtype=out_dtype)
 
     def select_nvfp4_a16(*args, traits, **kwargs) -> SelectedKernel:
-        assert traits["n_align_16"] is True
+        assert (traits["m"], traits["n"], traits["k"]) == (4, 144, 144)
         return SelectedKernel("test_nvfp4_a16_shape", kernel)
 
     monkeypatch.setattr(_gemm_pkg, "select_kernel", select_nvfp4_a16)
@@ -2537,6 +2646,11 @@ def test_deepep_selects_apply_kernel_by_weight_dtype_without_pinned_solution(
             internal_activation_dtype="input",
             process_group=object(),
             deepep_mode=deepep_mode,
+            hidden=None,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
         )
     finally:
         Platform.override(real_platform)
@@ -2573,10 +2687,45 @@ def test_nvfp4_deepep_rejects_modes_without_normal_legs(
                 internal_activation_dtype="input",
                 process_group=object(),
                 deepep_mode=deepep_mode,
+                hidden=None,
+                swiglu_form=None,
+                activation_clamped=False,
+                expert_id_repeats=False,
+                fast_math=True,
             )
     finally:
         Platform.override(real_platform)
         registry.clear_cache()
+
+
+def test_moe_plan_rejects_persistent_workspace_for_ordinary_kernel(
+    h100_platform,
+) -> None:
+    real_platform = Platform.get()
+    try:
+        Platform.override(h100_platform)
+        KernelRegistry.get().clear_cache()
+        with pytest.raises(ValueError, match="does not support persistent workspace"):
+            tokenspeed_kernel.moe_plan(
+                "unquant",
+                input_dtype=torch.bfloat16,
+                activation="silu",
+                routing_mode="precomputed_topk",
+                a2a_backend=None,
+                ep_size=1,
+                ispp=128,
+                internal_activation_dtype="input",
+                persistent_max_num_tokens_per_gpu=16,
+                solution="triton",
+                hidden=128,
+                swiglu_form=None,
+                activation_clamped=False,
+                expert_id_repeats=False,
+                fast_math=True,
+            )
+    finally:
+        Platform.override(real_platform)
+        KernelRegistry.get().clear_cache()
 
 
 @pytest.mark.parametrize(
@@ -2622,6 +2771,11 @@ def test_deepep_plan_carries_mode_and_low_latency_capacity(b200_platform) -> Non
             process_group=process_group,
             deepep_mode="auto",
             deepep_low_latency_max_num_tokens_per_gpu=256,
+            hidden=None,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
         )
     finally:
         Platform.override(real_platform)
@@ -2641,6 +2795,11 @@ def test_moe_plan_defaults_deepep_mode_to_auto() -> None:
         ep_size=1,
         ispp=128,
         solution="triton",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     assert plan["deepep_mode"] == "auto"
     assert plan["deepep_low_latency_max_num_tokens_per_gpu"] is None
@@ -2666,6 +2825,11 @@ def test_moe_plan_rejects_invalid_deepep_mode(
             ispp=256,
             fp8_scale_block_shape=(128, 128),
             deepep_mode=deepep_mode,
+            hidden=None,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
         )
 
 
@@ -2924,6 +3088,11 @@ def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
             internal_activation_dtype="input",
             with_bias=True,
             solution="gluon",
+            hidden=None,
+            swiglu_form="standard",
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
         )
     finally:
         Platform.override(real_platform)
@@ -2955,6 +3124,11 @@ def test_triton_mxfp4_supports_input_activation_dtype(
             ispp=128,
             internal_activation_dtype="input",
             solution="triton",
+            hidden=None,
+            swiglu_form="standard",
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
         )
         assert plan["apply_kernel_name"] == "triton_mxfp4_precomputed_moe_apply"
     finally:
@@ -3012,6 +3186,11 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
             ispp=ispp,
             internal_activation_dtype="input",
             solution=solution,
+            hidden=None,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
         )
     finally:
         Platform.override(real_platform)
@@ -3052,6 +3231,11 @@ def test_gluon_mxfp4_swiglu_ep_traits_select_matching_kernel(
             ispp=128,
             internal_activation_dtype="input",
             solution="gluon",
+            hidden=None,
+            swiglu_form="standard",
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
         )
     finally:
         Platform.override(real_platform)
@@ -3081,6 +3265,11 @@ def test_kimi3_mxfp4_situ_ep8_bias_avoids_a8_apply(
             internal_activation_dtype="input",
             with_bias=True,
             solution="gluon",
+            hidden=None,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
         )
     finally:
         Platform.override(real_platform)
@@ -3167,6 +3356,11 @@ def test_kimi3_mxfp4_situ_tp_selection_on_cdna5(
             ispp=384,
             internal_activation_dtype="input",
             solution="gluon",
+            hidden=None,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
         )
     finally:
         Platform.override(real_platform)
@@ -3379,6 +3573,11 @@ def _moe_apply_unquant_trtllm() -> object:
         ep_size=2,
         ispp=128,
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3396,31 +3595,32 @@ def _moe_apply_unquant_trtllm() -> object:
     )
 
 
-def _dsv4_select_experts_bias(tokens: int) -> object:
+def _moe_topk_bias(tokens: int) -> object:
     """Exercise bias-router selection across specialized and portable batches."""
     router_logits = torch.empty((tokens, 256), dtype=torch.float32)
     correction_bias = torch.empty((256,), dtype=torch.float32)
-    return tokenspeed_kernel.dsv4_select_experts(
+    return tokenspeed_kernel.moe_topk(
         router_logits,
-        6,
-        True,
+        top_k=6,
+        score_function="sqrt_softplus",
+        selection_method="topk",
+        renormalize=True,
+        routed_scaling_factor=1.0,
         correction_bias=correction_bias,
-        hash_indices_table=None,
-        input_ids=None,
-        need_scores=False,
-        override=None,
-        solution=None,
     )
 
 
-def _dsv4_select_experts_hash() -> object:
+def _moe_topk_hash() -> object:
     router_logits = torch.empty((2, 384), dtype=torch.bfloat16)
     hash_indices_table = torch.zeros((8, 6), dtype=torch.int32)
     input_ids = torch.zeros((2,), dtype=torch.int64)
-    return tokenspeed_kernel.dsv4_select_experts(
+    return tokenspeed_kernel.moe_topk(
         router_logits,
-        6,
-        True,
+        top_k=6,
+        score_function="sqrt_softplus",
+        selection_method="hash",
+        renormalize=True,
+        routed_scaling_factor=1.0,
         hash_indices_table=hash_indices_table,
         input_ids=input_ids,
     )
@@ -3434,6 +3634,11 @@ def _moe_apply_unquant_cutlass() -> object:
         ep_size=2,
         ispp=128,
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3454,6 +3659,11 @@ def _moe_apply_fp8_cutlass() -> object:
         ispp=128,
         fp8_scale_block_shape=(128, 128),
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3465,6 +3675,203 @@ def _moe_apply_fp8_cutlass() -> object:
     return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
+def _moe_apply_mxfp4_plan(
+    *,
+    activation: str,
+    ispp: int,
+    internal_activation_dtype: str,
+    solution: str | None,
+    hidden: int = 5120,
+    ep_size: int = 8,
+    swiglu_form: str | None = "standard",
+    activation_clamped: bool = True,
+    expert_id_repeats: bool = False,
+) -> dict:
+    # DeepSeek-V4.1-Flash on one EP8 rank: SwiGLU experts, 5120-wide hidden,
+    # 2304-wide FFN, dense EP (no all-to-all). Kimi-K3 differs by SiTU and a
+    # 3072-wide FFN.
+    return tokenspeed_kernel.moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation=activation,
+        routing_mode="precomputed_topk",
+        a2a_backend="none",
+        ep_size=ep_size,
+        ispp=ispp,
+        hidden=hidden,
+        swiglu_form=swiglu_form if activation == "swiglu" else None,
+        activation_clamped=activation_clamped,
+        expert_id_repeats=expert_id_repeats,
+        internal_activation_dtype=internal_activation_dtype,
+        solution=solution,
+        fast_math=True,
+    )
+
+
+def _moe_apply_mxfp4_invoke(plan: dict) -> object:
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+
+
+def _moe_apply_mxfp4_cutlass_w4a16() -> object:
+    plan = _moe_apply_mxfp4_plan(
+        activation="swiglu",
+        ispp=2304,
+        internal_activation_dtype="input",
+        solution=None,
+    )
+    _assert_moe_plan(
+        plan,
+        apply="flashinfer_cutlass_mxfp4_w4a16_moe_apply",
+        preprocessor="flashinfer_cutlass_mxfp4_w4a16_moe_weights",
+    )
+    return _moe_apply_mxfp4_invoke(plan)
+
+
+def _moe_apply_mxfp4_cutlass_w4a8() -> object:
+    plan = _moe_apply_mxfp4_plan(
+        activation="swiglu",
+        ispp=2304,
+        internal_activation_dtype="fp8",
+        solution=None,
+    )
+    _assert_moe_plan(
+        plan,
+        apply="flashinfer_cutlass_mxfp4_w4a8_moe_apply",
+        preprocessor="flashinfer_cutlass_mxfp4_w4a8_moe_weights",
+    )
+    return _moe_apply_mxfp4_invoke(plan)
+
+
+def _moe_apply_mxfp4_marlin_explicit() -> object:
+    plan = _moe_apply_mxfp4_plan(
+        activation="swiglu",
+        ispp=2304,
+        internal_activation_dtype="input",
+        solution="marlin",
+    )
+    _assert_moe_plan(
+        plan,
+        apply="marlin_mxfp4_precomputed_moe_apply",
+        preprocessor="marlin_mxfp4_moe_weights",
+    )
+    return _moe_apply_mxfp4_invoke(plan)
+
+
+def _moe_apply_mxfp4_misaligned_hidden_auto() -> object:
+    # The cutlass scales are int32 views along K, so a hidden size that is not
+    # a multiple of 128 must be vetoed at plan time, keeping marlin under auto
+    # instead of failing later in weight preprocessing.
+    plan = _moe_apply_mxfp4_plan(
+        activation="swiglu",
+        ispp=2304,
+        internal_activation_dtype="input",
+        solution=None,
+        hidden=2880,
+    )
+    _assert_moe_plan(
+        plan,
+        apply="marlin_mxfp4_precomputed_moe_apply",
+        preprocessor="marlin_mxfp4_moe_weights",
+    )
+    return _moe_apply_mxfp4_invoke(plan)
+
+
+def _moe_apply_mxfp4_generalized_swiglu_auto() -> object:
+    # MiniMax-M3 style SwiGLU (sigmoid alpha, up-branch beta): neither the
+    # cutlass epilogue nor marlin's silu_and_mul implements it, so a TP layout
+    # stays on the Triton kernel under auto instead of failing in preprocessing.
+    plan = _moe_apply_mxfp4_plan(
+        activation="swiglu",
+        ispp=2304,
+        internal_activation_dtype="input",
+        solution=None,
+        ep_size=1,
+        swiglu_form="generalized",
+    )
+    _assert_moe_plan(
+        plan,
+        apply="triton_mxfp4_precomputed_moe_apply",
+        preprocessor="triton_mxfp4_moe_weights",
+    )
+    return _moe_apply_mxfp4_invoke(plan)
+
+
+def _moe_apply_mxfp4_zero_experts_auto() -> object:
+    # LongCat zero experts are rewritten to a placeholder id with weight zero,
+    # so one token may repeat an expert id; FlashInfer's permutation cannot
+    # take that, marlin can.
+    plan = _moe_apply_mxfp4_plan(
+        activation="swiglu",
+        ispp=2304,
+        internal_activation_dtype="input",
+        solution=None,
+        expert_id_repeats=True,
+    )
+    _assert_moe_plan(
+        plan,
+        apply="marlin_mxfp4_precomputed_moe_apply",
+        preprocessor="marlin_mxfp4_moe_weights",
+    )
+    return _moe_apply_mxfp4_invoke(plan)
+
+
+def test_mxfp4_w4a8_needs_the_swiglu_clamp() -> None:
+    # Humming's fixed FC2 activation scale needs the SwiGLU clamp; an FP8
+    # activation request for an unclamped layer must fail closed at plan time
+    # rather than saturate FP8 at runtime.
+    if not _is_hopper(Platform.get()):
+        pytest.skip("Hopper registrations only")
+    with pytest.raises(tokenspeed_kernel.NoKernelFoundError):
+        _moe_apply_mxfp4_plan(
+            activation="swiglu",
+            ispp=2304,
+            internal_activation_dtype="fp8",
+            solution=None,
+            activation_clamped=False,
+        )
+    plan = _moe_apply_mxfp4_plan(
+        activation="swiglu",
+        ispp=2304,
+        internal_activation_dtype="fp8",
+        solution=None,
+        activation_clamped=True,
+    )
+    assert plan["apply_kernel_name"] == "flashinfer_cutlass_mxfp4_w4a8_moe_apply"
+
+
+def test_mxfp4_fp8_activation_fails_closed_on_backends_without_a_w4a8_kernel() -> None:
+    # --moe-mxfp4-fp8-activation is not gated by a backend allowlist in
+    # ServerArgs; the plan refuses a backend that has no FP8-activation kernel.
+    if not _is_hopper(Platform.get()):
+        pytest.skip("Hopper registrations only")
+    for solution in ("marlin", "triton"):
+        with pytest.raises(tokenspeed_kernel.NoKernelFoundError):
+            _moe_apply_mxfp4_plan(
+                activation="swiglu",
+                ispp=2304,
+                internal_activation_dtype="fp8",
+                solution=solution,
+            )
+
+
+def _moe_apply_mxfp4_situ_auto() -> object:
+    # The cutlass epilogue has no SiTU, so Kimi-K3 keeps marlin under auto.
+    plan = _moe_apply_mxfp4_plan(
+        activation="situ",
+        ispp=3072,
+        internal_activation_dtype="input",
+        solution=None,
+    )
+    _assert_moe_plan(
+        plan,
+        apply="marlin_mxfp4_precomputed_moe_apply",
+        preprocessor="marlin_mxfp4_moe_weights",
+    )
+    return _moe_apply_mxfp4_invoke(plan)
+
+
 def _moe_apply_fp8_trtllm() -> object:
     plan = tokenspeed_kernel.moe_plan(
         "fp8",
@@ -3474,6 +3881,11 @@ def _moe_apply_fp8_trtllm() -> object:
         ispp=128,
         fp8_scale_block_shape=(128, 128),
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3494,6 +3906,11 @@ def _moe_apply_nvfp4_trtllm() -> object:
         ep_size=2,
         ispp=128,
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3520,6 +3937,11 @@ def _moe_apply_nvfp4_cutlass() -> object:
         ispp=128,
         internal_activation_dtype="input",
         solution="flashinfer_cutlass",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3541,6 +3963,11 @@ def _moe_apply_nvfp4_trtllm_routed() -> object:
         ispp=128,
         internal_activation_dtype="input",
         solution="flashinfer_trtllm",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3574,6 +4001,11 @@ def _moe_apply_nvfp4_trtllm_unconstrained_routing() -> object:
         ispp=128,
         internal_activation_dtype="input",
         solution="flashinfer_trtllm",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3596,6 +4028,11 @@ def _moe_apply_unquant_trtllm_routed() -> object:
         ispp=128,
         internal_activation_dtype="input",
         solution="flashinfer_trtllm",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3629,6 +4066,11 @@ def _moe_apply_nvfp4_deepep_cutedsl() -> object:
         process_group=object(),
         deepep_mode="low_latency",
         solution="flashinfer_cutedsl",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3653,6 +4095,11 @@ def _moe_apply_fp8_deepep_deep_gemm() -> object:
         internal_activation_dtype="input",
         process_group=object(),
         solution="deep_gemm",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3683,6 +4130,11 @@ def _moe_apply_mxfp4_trtllm() -> object:
         ispp=128,
         internal_activation_dtype="input",
         with_bias=True,
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3704,6 +4156,11 @@ def _moe_apply_mxfp4_triton() -> object:
         internal_activation_dtype="mxfp4",
         with_bias=False,
         solution="triton",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3734,6 +4191,11 @@ def _moe_apply_unquant_triton() -> object:
         internal_activation_dtype="input",
         with_bias=False,
         solution="triton",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3762,6 +4224,11 @@ def _moe_apply_mxfp4_gluon() -> object:
         ispp=128,
         internal_activation_dtype="fp8",
         with_bias=True,
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3781,6 +4248,11 @@ def _moe_apply_mxint4_trtllm() -> object:
         ep_size=2,
         ispp=256,
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3800,6 +4272,11 @@ def _moe_apply_mxfp4_dynamic_tp() -> object:
         ep_size=1,
         ispp=2048,
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -4877,9 +5354,9 @@ _CASES = [
             _is_cdna5,
             "cdna5",
             "moe",
-            "dsv4_select_experts",
-            "triton_dsv4_select_experts",
-            partial(_dsv4_select_experts_bias, tokens=tokens),
+            "topk",
+            "triton_sqrt_softplus_topk",
+            partial(_moe_topk_bias, tokens=tokens),
             id_suffix=f"bias-tokens{tokens}",
         )
         for tokens in (1, 2, 17)
@@ -4888,27 +5365,27 @@ _CASES = [
         _is_cdna5,
         "cdna5",
         "moe",
-        "dsv4_select_experts",
-        "triton_dsv4_select_experts",
-        _dsv4_select_experts_hash,
+        "topk",
+        "triton_sqrt_softplus_topk",
+        _moe_topk_hash,
         id_suffix="hash",
     ),
     _case(
         _is_hopper_plus,
         "hopper-plus",
         "moe",
-        "dsv4_select_experts",
-        "cuda_dsv4_select_experts",
-        partial(_dsv4_select_experts_bias, tokens=2),
+        "topk",
+        "cuda_sqrt_softplus_topk",
+        partial(_moe_topk_bias, tokens=2),
         id_suffix="bias",
     ),
     _case(
         _is_hopper_plus,
         "hopper-plus",
         "moe",
-        "dsv4_select_experts",
-        "cuda_dsv4_select_experts",
-        _dsv4_select_experts_hash,
+        "topk",
+        "cuda_sqrt_softplus_topk",
+        _moe_topk_hash,
         id_suffix="hash",
     ),
     *[
@@ -4916,15 +5393,15 @@ _CASES = [
             _is_cdna4,
             "cdna4",
             "moe",
-            "dsv4_select_experts",
+            "topk",
             expected,
-            partial(_dsv4_select_experts_bias, tokens=tokens),
+            partial(_moe_topk_bias, tokens=tokens),
             id_suffix=f"bias-tokens{tokens}",
         )
         for tokens, expected in (
-            (1, "gluon_dsv4_select_experts_gfx950"),
-            (2, "gluon_dsv4_select_experts_gfx950"),
-            (17, "triton_dsv4_select_experts"),
+            (1, "gluon_sqrt_softplus_topk_gfx950"),
+            (2, "gluon_sqrt_softplus_topk_gfx950"),
+            (17, "triton_sqrt_softplus_topk"),
         )
     ],
     _case(
@@ -4942,6 +5419,67 @@ _CASES = [
         "apply",
         "flashinfer_cutlass_fp8_moe_apply",
         _moe_apply_fp8_cutlass,
+    ),
+    _case(
+        _is_hopper,
+        "hopper",
+        "moe",
+        "apply",
+        "flashinfer_cutlass_mxfp4_w4a16_moe_apply",
+        _moe_apply_mxfp4_cutlass_w4a16,
+    ),
+    _case(
+        _is_hopper,
+        "hopper",
+        "moe",
+        "apply",
+        "flashinfer_cutlass_mxfp4_w4a8_moe_apply",
+        _moe_apply_mxfp4_cutlass_w4a8,
+    ),
+    _case(
+        _is_hopper,
+        "hopper",
+        "moe",
+        "apply",
+        "marlin_mxfp4_precomputed_moe_apply",
+        _moe_apply_mxfp4_marlin_explicit,
+        id_suffix="explicit",
+    ),
+    _case(
+        _is_hopper,
+        "hopper",
+        "moe",
+        "apply",
+        "marlin_mxfp4_precomputed_moe_apply",
+        _moe_apply_mxfp4_situ_auto,
+        id_suffix="situ-auto",
+    ),
+    _case(
+        _is_hopper,
+        "hopper",
+        "moe",
+        "apply",
+        "marlin_mxfp4_precomputed_moe_apply",
+        _moe_apply_mxfp4_misaligned_hidden_auto,
+        id_suffix="misaligned-hidden-auto",
+    ),
+    _case(
+        _is_hopper,
+        "hopper",
+        "moe",
+        "apply",
+        "triton_mxfp4_precomputed_moe_apply",
+        _moe_apply_mxfp4_generalized_swiglu_auto,
+        id_suffix="generalized-swiglu-auto",
+    ),
+    _case(
+        _is_hopper,
+        "hopper",
+        "moe",
+        "apply",
+        "marlin_mxfp4_precomputed_moe_apply",
+        _moe_apply_mxfp4_zero_experts_auto,
+        id_suffix="zero-experts-auto",
     ),
     _case(
         _is_blackwell_sm100,
@@ -5170,7 +5708,7 @@ def selected_kernel_spy(monkeypatch):
             )
 
         if case.family == "moe":
-            if case.mode == "dsv4_select_experts":
+            if case.mode == "topk":
                 router_logits, top_k = args[:2]
                 shape = (router_logits.shape[0], top_k)
                 return (
@@ -5280,6 +5818,11 @@ def test_b200_fp8_swiglu_selects_trtllm_routed_moe(
             ispp=2048,
             fp8_scale_block_shape=(128, 128),
             internal_activation_dtype="input",
+            hidden=None,
+            swiglu_form="standard",
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
         )
 
         assert plan["apply_kernel_name"] == ("flashinfer_trtllm_fp8_routed_moe_apply")
@@ -5355,6 +5898,139 @@ def test_cutlass_fp8_weights_attach_swiglu_tensors() -> None:
     assert weights.swiglu_alpha_t is None
     assert weights.swiglu_beta_t is None
     assert weights.swiglu_limit_t is None
+
+
+def _mxfp4_loader_weights(
+    num_experts: int, hidden: int, ispp: int, seed: int
+) -> torch.nn.Module:
+    """Loader-format MXFP4 experts: uint8 codes and raw E8M0 bytes, [gate; up]."""
+    generator = torch.Generator().manual_seed(seed)
+
+    def _bytes(*shape: int) -> torch.Tensor:
+        return torch.randint(0, 256, shape, dtype=torch.uint8, generator=generator)
+
+    weights = torch.nn.Module()
+    weights.w13_weight = torch.nn.Parameter(
+        _bytes(num_experts, 2 * ispp, hidden // 2), requires_grad=False
+    )
+    weights.w13_weight_scale = torch.nn.Parameter(
+        _bytes(num_experts, 2 * ispp, hidden // 32), requires_grad=False
+    )
+    weights.w2_weight = torch.nn.Parameter(
+        _bytes(num_experts, hidden, ispp // 2), requires_grad=False
+    )
+    weights.w2_weight_scale = torch.nn.Parameter(
+        _bytes(num_experts, hidden, ispp // 32), requires_grad=False
+    )
+    weights.swiglu_arg = SimpleNamespace(alpha=None, limit=10.0)
+    weights.swiglu_beta = None
+    weights.w13_input_layout = "concatenated"
+    return weights
+
+
+def test_cutlass_mxfp4_weights_interleave_and_attach(monkeypatch) -> None:
+    """The preprocessors hand FlashInfer [up; gate] rows and attach the epilogue tensors.
+
+    FlashInfer's SM90 interleavers are replaced by recording fakes: the layout
+    contract is what this test pins, the kernels' own numerics are covered by
+    the GPU test.
+    """
+    if not Platform.get().is_nvidia:
+        pytest.skip("FlashInfer cutlass MoE is registered only on NVIDIA")
+    module = _moe_cutlass_mxfp4
+    calls: list[tuple] = []
+
+    def fake_weights(w: torch.Tensor, dtype: str) -> torch.Tensor:
+        calls.append(("weights", w.clone(), dtype))
+        return w + 1
+
+    def fake_scales(s: torch.Tensor, group_size: int) -> torch.Tensor:
+        calls.append(("scales", s.clone(), group_size))
+        return s + 1
+
+    def fake_humming(w: torch.Tensor, s: torch.Tensor):
+        calls.append(("humming", w.clone(), s.clone()))
+        return w + 1, s + 1, torch.full(w.shape[:1], 0.5, dtype=torch.float32)
+
+    monkeypatch.setattr(
+        module, "interleave_moe_weights_for_sm90_mixed_gemm", fake_weights
+    )
+    monkeypatch.setattr(
+        module, "interleave_moe_scales_for_sm90_mixed_gemm", fake_scales
+    )
+    monkeypatch.setattr(
+        module, "preprocess_moe_weights_for_sm90_mixed_gemm_humming", fake_humming
+    )
+    num_experts, hidden, ispp = 2, 256, 128
+    weights = _mxfp4_loader_weights(num_experts, hidden, ispp, seed=3)
+    w13, s13 = weights.w13_weight.data.clone(), weights.w13_weight_scale.data.clone()
+    w2, s2 = weights.w2_weight.data.clone(), weights.w2_weight_scale.data.clone()
+    up_gate_w13 = torch.cat((w13[:, ispp:], w13[:, :ispp]), dim=1)
+    up_gate_s13 = torch.cat((s13[:, ispp:], s13[:, :ispp]), dim=1)
+
+    module.flashinfer_cutlass_mxfp4_w4a16_moe_weights({}, weights)
+    assert [c[0] for c in calls] == ["weights", "scales", "weights", "scales"]
+    assert torch.equal(calls[0][1], up_gate_w13) and calls[0][2] == "fp4"
+    assert torch.equal(calls[1][1], up_gate_s13) and calls[1][2] == 32
+    assert torch.equal(calls[2][1], w2) and torch.equal(calls[3][1], s2)
+    assert torch.equal(weights.w13_weight.data, up_gate_w13 + 1)
+    assert torch.equal(weights.w2_weight.data, w2 + 1)
+    assert weights.w13_weight_scale.dtype == torch.int32
+    assert weights.w13_weight_scale.shape == (num_experts, 2 * ispp, hidden // 128)
+    assert weights.w2_weight_scale.dtype == torch.int32
+    assert weights.w2_weight_scale.shape == (num_experts, hidden, ispp // 128)
+    torch.testing.assert_close(
+        weights.swiglu_limit_t, torch.full((num_experts,), 10.0, dtype=torch.float32)
+    )
+    # Idempotent for the same layout; the other layout cannot follow.
+    module.flashinfer_cutlass_mxfp4_w4a16_moe_weights({}, weights)
+    assert len(calls) == 4
+    with pytest.raises(ValueError, match="already interleaved"):
+        module.flashinfer_cutlass_mxfp4_w4a8_moe_weights({}, weights)
+
+    calls.clear()
+    # W4A8's fixed FC2 activation scale is only sound under the clamp: an
+    # unclamped layer is refused before any layout is touched.
+    weights = _mxfp4_loader_weights(num_experts, hidden, ispp, seed=3)
+    weights.swiglu_arg = SimpleNamespace(alpha=None, limit=None)
+    with pytest.raises(ValueError, match="SwiGLU clamp"):
+        module.flashinfer_cutlass_mxfp4_w4a8_moe_weights({}, weights)
+    assert not calls
+    weights = _mxfp4_loader_weights(num_experts, hidden, ispp, seed=3)
+    module.flashinfer_cutlass_mxfp4_w4a8_moe_weights({}, weights)
+    assert [c[0] for c in calls] == ["humming", "humming"]
+    assert torch.equal(calls[0][1], up_gate_w13) and torch.equal(
+        calls[0][2], up_gate_s13
+    )
+    assert torch.equal(calls[1][1], w2) and torch.equal(calls[1][2], s2)
+    torch.testing.assert_close(
+        weights.swiglu_limit_t, torch.full((num_experts,), 10.0, dtype=torch.float32)
+    )
+    # Humming residuals carry FlashInfer's fixed 2^6 exponent compensation.
+    torch.testing.assert_close(
+        weights.w13_weight_residual, torch.full((num_experts,), 32.0)
+    )
+    torch.testing.assert_close(
+        weights.w2_weight_residual, torch.full((num_experts,), 32.0)
+    )
+    assert weights.fc2_act_scale.item() == 1.0 and weights.fc2_act_scale.ndim == 0
+
+    # Rejections: non-standard SwiGLU knobs, interleaved gate/up rows, and an
+    # FFN width whose E8M0 scales do not pack into int32.
+    for attrs, match in (
+        ({"swiglu_arg": SimpleNamespace(alpha=1.702, limit=7.0)}, "standard SwiGLU"),
+        ({"swiglu_beta": 1.0}, "standard SwiGLU"),
+        ({"w13_input_layout": "interleaved"}, "concatenated"),
+    ):
+        weights = _mxfp4_loader_weights(num_experts, hidden, ispp, seed=3)
+        for name, value in attrs.items():
+            setattr(weights, name, value)
+        with pytest.raises(ValueError, match=match):
+            module.flashinfer_cutlass_mxfp4_w4a16_moe_weights({}, weights)
+    with pytest.raises(ValueError, match="ispp%128"):
+        module.flashinfer_cutlass_mxfp4_w4a16_moe_weights(
+            {}, _mxfp4_loader_weights(num_experts, hidden, 96, seed=3)
+        )
 
 
 def test_b300_rel_decode_registration_and_selection(
@@ -5485,17 +6161,17 @@ def test_gluon_dsa_prefill_fp8_dense_traits(
     if spec is None:
         pytest.skip("gfx950 Gluon DSA registration is unavailable")
     traits = {
-        "page_size": 64,
-        "q_len_per_req": 1,
+        "q_len": 1,
         "qk_nope_head_dim": qk_nope_head_dim,
         "kv_lora_rank": kv_lora_rank,
         "qk_rope_head_dim": qk_rope_head_dim,
+        "page_size": 64,
         "topk": 2051,
-        "kv_cache_available": True,
-        "sparse_kv_cache_available": False,
-        "topk_layout": "global_slots",
-        "support_logit_cap": False,
+        "has_kv_cache": True,
+        "has_sparse_kv_cache": False,
+        "logit_cap": False,
         "return_lse": False,
+        "topk_layout": "global_slots",
     }
     assert spec_matches_traits(spec, traits) is matches
 
@@ -5517,7 +6193,7 @@ _GLUON_MLA_FIXED_KERNELS = (
         pytest.param("batch_size", 16, False, id="batch16"),
         pytest.param("value_head_dim", 64, False, id="unsupported-value"),
         pytest.param("page_size", 128, False, id="unsupported-page"),
-        pytest.param("support_logit_cap", True, False, id="unsupported-logit-cap"),
+        pytest.param("logit_cap", True, False, id="unsupported-logit-cap"),
     ],
 )
 def test_gluon_mla_projected_value_gfx1250_traits_are_narrow(
@@ -5532,12 +6208,12 @@ def test_gluon_mla_projected_value_gfx1250_traits_are_narrow(
         "batch_size": 1,
         "q_len": 1,
         "num_q_heads": 12,
-        "page_size": 64,
+        "value_head_dim": 128,
         "kv_lora_rank": 512,
         "qk_rope_head_dim": 64,
-        "value_head_dim": 128,
+        "page_size": 64,
         "gate_kind": "sigmoid",
-        "support_logit_cap": False,
+        "logit_cap": False,
     }
     traits[trait] = value
     assert spec_matches_traits(spec, traits) is matches
@@ -5560,9 +6236,9 @@ def test_gluon_mla_project_value_gfx1250_batch_traits(
         pytest.skip("gfx1250 Gluon MLA projection registration is unavailable")
     traits = {
         "batch_size": batch_size,
-        "num_heads": 12,
-        "latent_dim": 512,
-        "value_dim": 128,
+        "num_q_heads": 12,
+        "value_head_dim": 128,
+        "kv_lora_rank": 512,
         "gate_kind": "sigmoid",
         "inputs_contiguous": True,
     }
@@ -5596,10 +6272,15 @@ def test_gluon_mla_fixed_entrypoints_are_registered(name: str) -> None:
             frozenset({2, 4}),
             id="bh64-small",
         ),
+        pytest.param(
+            "gluon_mla_decode_bf16xbf16_gfx950_bh64",
+            frozenset({64, 128}),
+            id="bh64",
+        ),
     ],
 )
-@pytest.mark.parametrize("batch", [1, 2, 3, 4, 64])
-def test_gluon_mla_small_batch_registrations_have_disjoint_traits(
+@pytest.mark.parametrize("batch", [1, 2, 3, 4, 64, 96, 128])
+def test_gluon_mla_batch_registrations_have_disjoint_traits(
     name: str,
     expected_batches: frozenset[int],
     batch: int,
@@ -5608,16 +6289,18 @@ def test_gluon_mla_small_batch_registrations_have_disjoint_traits(
 
     traits = {
         "batch_size": batch,
-        "batch_size_div_64": batch % 64 == 0,
         "q_len": 1,
         "num_q_heads": 64,
-        "page_size": 64,
         "kv_lora_rank": 512,
         "qk_rope_head_dim": 64,
-        "support_logit_cap": False,
+        "page_size": 64,
+        "logit_cap": False,
         "return_lse": False,
     }
-    assert spec_matches_traits(spec, traits) is (batch in expected_batches)
+    matches = spec_matches_traits(spec, traits) and spec_matches_shape_traits(
+        spec, traits
+    )
+    assert matches is (batch in expected_batches)
 
 
 @pytest.mark.parametrize(

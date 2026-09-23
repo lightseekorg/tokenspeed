@@ -42,6 +42,7 @@ from tokenspeed_kernel.ops.attention.dsv4.triton import (
 )
 from tokenspeed_kernel.ops.kvcache.triton_virtual_blocks import virtual_slots_to_local
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a CUDA device"
@@ -324,6 +325,51 @@ def test_weight_and_sink_reject_inconsistent_shapes():
 # ---------------------------------------------------------------------------
 # Kernel capability and the no-sink LSE contract
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "traits,expected",
+    [
+        pytest.param({}, False, id="undeclared"),
+        pytest.param({"sinks": frozenset({True})}, False, id="sink-only"),
+        pytest.param({"sinks": frozenset({False})}, False, id="missing-lse"),
+        pytest.param({"return_lse": frozenset({True})}, False, id="missing-sinks"),
+        pytest.param(
+            {"return_lse": frozenset({True}), "sinks": frozenset({True})},
+            False,
+            id="lse-includes-sink",
+        ),
+        pytest.param(
+            {"return_lse": frozenset({False}), "sinks": frozenset({False})},
+            False,
+            id="no-lse",
+        ),
+        pytest.param(
+            {"return_lse": frozenset({True}), "sinks": frozenset({False})},
+            True,
+            id="no-sink-lse",
+        ),
+        pytest.param(
+            {"return_lse": frozenset({False, True}), "sinks": frozenset({False, True})},
+            True,
+            id="optional-sink-and-lse",
+        ),
+    ],
+)
+def test_decode_partials_require_explicit_no_sink_lse_support(
+    fresh_registry, h100_platform, traits, expected
+):
+    KernelRegistry.get().register(
+        KernelSpec(
+            name="test_dsv4_decode",
+            family="attention",
+            mode="dsv4_decode",
+            traits=traits,
+        ),
+        lambda: None,
+    )
+
+    assert dsv4_decode_supports_partials(h100_platform) is expected
 
 
 def test_decode_partials_need_a_kernel_registered_for_the_platform(

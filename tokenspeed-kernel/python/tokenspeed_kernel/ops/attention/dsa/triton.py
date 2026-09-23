@@ -459,20 +459,19 @@ def _run_dsa(
         }
     ),
     traits={
-        "page_size": frozenset({64}),
-        "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
+        "q_len": frozenset({1, 2, 3, 4, 5, 6}),
         "qk_nope_head_dim": frozenset({128, 192, 256}),
         "kv_lora_rank": frozenset({128, 512}),
         "qk_rope_head_dim": frozenset({0, 64}),
+        "page_size": frozenset({64}),
         "topk": frozenset({512, 1024, 2048, 2049, 2050, 2051}),
-        "kv_cache_available": frozenset({False, True}),
-        "sparse_kv_cache_available": frozenset({False, True}),
-        "topk_layout": frozenset({"global_slots"}),
-        "support_logit_cap": frozenset({False}),
+        "has_kv_cache": frozenset({False, True}),
+        "has_sparse_kv_cache": frozenset({False, True}),
+        "logit_cap": frozenset({False}),
         "return_lse": frozenset({False}),
+        "topk_layout": frozenset({"global_slots"}),
     },
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def triton_dsa_decode(
     q: torch.Tensor,
@@ -522,20 +521,19 @@ def triton_dsa_decode(
         }
     ),
     traits={
-        "page_size": frozenset({64}),
-        "q_len_per_req": frozenset({1}),
+        "q_len": frozenset({1}),
         "qk_nope_head_dim": frozenset({128, 192, 256}),
         "kv_lora_rank": frozenset({128, 512}),
         "qk_rope_head_dim": frozenset({0, 64}),
+        "page_size": frozenset({64}),
         "topk": frozenset({512, 1024, 2048, 2049, 2050, 2051}),
-        "kv_cache_available": frozenset({False, True}),
-        "sparse_kv_cache_available": frozenset({False, True}),
-        "topk_layout": frozenset({"global_slots"}),
-        "support_logit_cap": frozenset({False}),
+        "has_kv_cache": frozenset({False, True}),
+        "has_sparse_kv_cache": frozenset({False, True}),
+        "logit_cap": frozenset({False}),
         "return_lse": frozenset({False}),
+        "topk_layout": frozenset({"global_slots"}),
     },
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def triton_dsa_prefill(
     q: torch.Tensor,
@@ -590,7 +588,6 @@ from tokenspeed_kernel.ops.attention.dsa._triton.topk import (  # noqa: E402
     signatures=frozenset({format_signature()}),
     traits={"page_size": frozenset({64})},
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def triton_dsa_plan(
     *,
@@ -628,14 +625,13 @@ _TOPK_SIGNATURES = frozenset(
     signatures=_TOPK_SIGNATURES,
     traits={
         "head_dim": frozenset({128}),
-        "topk": frozenset({512, 1024, 2048}),
         "page_size": frozenset({64}),
+        "topk": frozenset({512, 1024, 2048}),
         "index_k_format": frozenset({"fp8_scaled"}),
         "index_k_layout": frozenset({"packed", "page_planar"}),
     },
     features={"logical_offsets"},
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def triton_dsa_decode_topk_fp8(
     q: torch.Tensor,
@@ -688,7 +684,6 @@ def triton_dsa_decode_topk_fp8(
         "index_k_layout": frozenset({"packed", "page_planar"}),
     },
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def triton_dsa_prefill_topk_fp8(
     q: torch.Tensor,
