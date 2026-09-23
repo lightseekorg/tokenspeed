@@ -350,9 +350,10 @@ def test_the_probe_reserves_what_the_reduction_returned() -> None:
 
 
 def test_a_ladder_the_probe_could_not_price_warns_the_operator() -> None:
+    # One positive reading prices the tail at about a granule; only none at all warns.
     cases = [
-        ([1 << 24, 0, 0, 0, 0], "from 0 non-zero marginals"),
-        ([1 << 24, MIB, 0, 0, 0], "from 1 non-zero marginals"),
+        ([1 << 24, 0, 0, 0, 0], "priced its 35 unsampled entries at nothing"),
+        ([1 << 24, MIB, 0, 0, 0], None),
         ([1 << 24, MIB, 0, MIB, 0], None),
         ([1 << 24, MIB, MIB, MIB, 0], None),
     ]
@@ -365,10 +366,9 @@ def test_a_ladder_the_probe_could_not_price_warns_the_operator() -> None:
         if warning is None:
             assert text == "", samples
             continue
-        assert warning in text and "35 unsampled" in text
+        assert warning in text
         assert "--disable-cudagraph-memory-reserve" in text
-        if samples[1] == 0:
-            assert reserve == 1 << 24
+        assert reserve == 1 << 24
 
 
 def test_memory_taken_between_captures_is_not_reserved() -> None:

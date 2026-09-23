@@ -157,7 +157,7 @@ from one first bound to that pool:
   time for what tuning and the probe left allocated. The deltas read the
   whole device, so the probe assumes no other process allocates on it during
   startup. Not covered: a ladder every one of whose sampled marginals was
-  served from allocator slack, which is priced at nothing and says so in the
+  served from slack, which is priced at nothing and says so in the
   log.
 
 ### Padding contract

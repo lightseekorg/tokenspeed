@@ -299,14 +299,12 @@ def probe_cudagraph_memory(
         series = estimate.series[name]
         samples = observer.samples.get(name, ())
         unsampled = len(ladder.widths) - len(samples)
-        positives = sum(1 for marginal in samples[1:] if marginal > 0)
-        # Two, not one: a rate from a single reading prices every skipped entry.
-        if unsampled and positives < 2:
+        if unsampled and not series.unsampled:
             logger.warning(
                 f"CUDA-graph memory reserve: {name} measured "
                 f"{series.measured} bytes and priced its {unsampled} unsampled "
-                f"entries from {positives} non-zero marginals -- the rest were "
-                "served from allocator slack; re-run with "
-                "--disable-cudagraph-memory-reserve if the boot then OOMs"
+                "entries at nothing -- every sampled marginal was served from "
+                "slack; re-run with --disable-cudagraph-memory-reserve if the "
+                "boot then OOMs"
             )
     return reserve
