@@ -1083,6 +1083,9 @@ def build_device_side(
                             int(layer) for layer in draft_layers
                         ]
 
+            attention_backend_name = attention.attention_backend_name
+            draft_attention_backend_name = attention.draft_attention_backend_name
+
             def prefix_for_weight_version(weight_version: str) -> str:
                 return storage_key_prefix(
                     server_args.model,
@@ -1098,6 +1101,8 @@ def build_device_side(
                     draft_weight_version=weight_version if draft_model else "",
                     cache_quantization=cache_quantization,
                     runtime_compat=L3_RUNTIME_COMPAT,
+                    attention_backend=attention_backend_name,
+                    draft_attention_backend=draft_attention_backend_name,
                     skip_softmax_threshold=float(server_args.skip_softmax_threshold),
                     eagle3_layers_to_capture=eagle3_layers_to_capture,
                 )

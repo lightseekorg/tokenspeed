@@ -401,6 +401,32 @@ installs that window before its first ordinary verify round. Stage ownership
 changes where context and proposals are produced; candidate handoff and
 verification follow the same path as other speculative prefills.
 
+### PD prefill nodes
+
+The prefill role is not an eager role; it is a role with no decode step.
+`ModelExecutorConfig.prefill_only` turns the decode graph off
+(`ForwardStepRunner.disable`) because there is nothing for it to capture —
+the role's attention is configured at verify width one and allocates no
+verify scratch for a DECODE-shaped dummy — while the prefill graph keeps the
+same gating as any server (`--enforce-eager`, `--disable-prefill-graph`,
+`--prefill-graph-max-tokens`, the backend's declared support). Its extend
+forwards, chunked or prefix-hit, replay the breakable prefill graph through
+the same `_run_target_forward` dispatch; the KV handoff to decode is ordered
+behind the forward exactly as behind an eager one (the plan's remote-decode
+batch is emitted only once the final chunk's result has landed). Layerwise
+transfer keeps working under replay because the cache-step record lives
+inside the eager attention break (`record_pd_cache_step`,
+`record_layer_cache_ready`), after the layer's KV write on the same stream.
+
+Pipeline parallelism is the one prefill configuration that forces eager:
+each stage threads its boundary state through an eager stage forward
+(`ModelExecutor._run_target_forward`), so `ServerArgs.resolve_disaggregation`
+sets `enforce_eager` for `--pipeline-parallel-size > 1`, not for the role.
+The DeepSeek-V4.1 Flash PD gate
+(`test/ci_system/serve_deepseek_v41_flash_pd_1p1d.sh`) runs the prefill
+role with its graphs and passes `--disable-prefill-graph` to the decode role
+only.
+
 ### Sampling has no greedy branch
 
 Greedy requests normalize to `top_k=1` in `SamplingParams.__post_init__`; the

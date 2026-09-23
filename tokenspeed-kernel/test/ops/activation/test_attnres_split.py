@@ -122,6 +122,7 @@ def test_combine_pdl_parity(use_norm):
         eps,
         scratch,
         torch.empty(T, H, dtype=torch.bfloat16, device="cuda"),
+        enable_pdl=False,
     )
     pdl = attnres_combine(
         prefix,

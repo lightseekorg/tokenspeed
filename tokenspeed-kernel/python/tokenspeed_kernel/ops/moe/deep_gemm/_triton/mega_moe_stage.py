@@ -25,7 +25,7 @@ _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE = 128
 
 
 @triton.jit
-def _dsv4_stage_mega_moe_inputs_kernel(
+def _stage_mxfp4_mega_moe_inputs_kernel(
     hidden_states,
     x_fp8,
     x_sf,
@@ -127,7 +127,7 @@ def _dsv4_stage_mega_moe_inputs_kernel(
         )
 
 
-def stage_dsv4_mega_moe_inputs(
+def stage_mxfp4_mega_moe_inputs(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -153,7 +153,7 @@ def stage_dsv4_mega_moe_inputs(
     block_k = _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE
     grid = (num_tokens, triton.cdiv(hidden_size, block_k))
     block_topk = triton.next_power_of_2(topk_ids.shape[1])
-    _dsv4_stage_mega_moe_inputs_kernel[grid](
+    _stage_mxfp4_mega_moe_inputs_kernel[grid](
         hidden_states,
         x_fp8,
         x_sf,

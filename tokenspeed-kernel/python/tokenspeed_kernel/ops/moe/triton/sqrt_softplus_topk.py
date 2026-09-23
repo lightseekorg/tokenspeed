@@ -30,7 +30,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 
 @triton.jit
-def _select_experts_kernel(
+def _sqrt_softplus_topk_kernel(
     logits_ptr,
     bias_ptr,
     hash_ptr,
@@ -107,18 +107,21 @@ def _select_experts_kernel(
 
 @register_kernel(
     "moe",
-    "dsv4_select_experts",
-    name="triton_dsv4_select_experts",
+    "topk",
+    name="triton_sqrt_softplus_topk",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     signatures=frozenset(
         format_signature(router_logits=dense_tensor_format(dtype))
         for dtype in (torch.float16, torch.bfloat16, torch.float32)
     ),
-    traits={"routing_kind": frozenset({"plain", "bias", "hash"})},
+    traits={
+        "routing_kind": frozenset({"plain", "bias", "hash"}),
+        "score_function": frozenset({"sqrt_softplus"}),
+    },
     priority=Priority.PORTABLE,
 )
-def triton_dsv4_select_experts(
+def triton_sqrt_softplus_topk(
     router_logits: torch.Tensor,
     top_k: int,
     renormalize: bool,
@@ -127,7 +130,7 @@ def triton_dsv4_select_experts(
     input_ids: torch.Tensor | None,
     need_scores: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Select experts using the public dsv4_select_experts contract.
+    """Select experts using the sqrt-softplus routing contract.
 
     Args:
         router_logits: Floating-point logits shaped [tokens, experts].
@@ -162,7 +165,7 @@ def triton_dsv4_select_experts(
         else router_logits
     )
     if tokens:
-        _select_experts_kernel[(tokens,)](
+        _sqrt_softplus_topk_kernel[(tokens,)](
             router_logits,
             correction_bias,
             hash_indices_table,

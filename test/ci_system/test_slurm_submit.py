@@ -465,7 +465,8 @@ def test_source_pr_uses_current_checkout(monkeypatch, tmp_path):
     assert captured == {"repo": tmp_path.resolve(), "source_pr": "884"}
 
 
-def test_snapshot_replaces_existing_archive(tmp_path):
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_snapshot_preserves_published_archive(tmp_path, corrupt):
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", repo], check=True)
@@ -484,12 +485,21 @@ def test_snapshot_replaces_existing_archive(tmp_path):
         text=True,
     ).stdout.strip()
     target = tmp_path / "artifacts" / "snapshots" / f"{commit}.tar"
-    target.parent.mkdir(parents=True)
-    target.write_bytes(b"stale")
-
     snapshot(repo, tmp_path / "artifacts", commit)
-
-    assert target.read_bytes() != b"stale"
+    if corrupt:
+        target.write_bytes(b"stale")
+    original = target.read_bytes()
+    inode = target.stat().st_ino
+    with target.open("rb") as reader:
+        if corrupt:
+            with pytest.raises(ValueError, match="Existing snapshot does not match"):
+                snapshot(repo, tmp_path / "artifacts", commit)
+        else:
+            assert snapshot(repo, tmp_path / "artifacts", commit) == target
+        assert target.stat().st_ino == inode
+        assert os.fstat(reader.fileno()).st_nlink == 1
+        assert reader.read() == original == target.read_bytes()
+    assert not list(target.parent.glob("*.tmp"))
 
 
 def test_pr_worktree_rejects_shallow_checkout(tmp_path):
