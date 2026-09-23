@@ -32,6 +32,7 @@ from tokenspeed_kernel.benchmark.harness import (
     BenchmarkStatus,
     PreparedBenchmark,
 )
+from tokenspeed_kernel.ops import moe as moe_ops
 from tokenspeed_kernel.platform import PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_kernels
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
@@ -185,20 +186,20 @@ def _routing_tensors(
     generator: torch.Generator,
     expert_start: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from tokenspeed_kernel.ops import moe as moe_ops
-
     router_logits = _randn(
         (tokens, experts),
         generator=generator,
         dtype=router_logits_dtype,
     )
-    topk_weights, topk_ids = moe_ops.moe_sigmoid_bias_topk(
+    topk_weights, topk_ids = moe_ops.moe_topk(
         router_logits,
-        _correction_bias(experts, device=router_logits.device),
         topk,
+        score_function="sigmoid",
+        selection_method="topk",
+        renormalize=normalize_topk_weights,
         routed_scaling_factor=routed_scaling_factor,
-        normalize_topk_weights=normalize_topk_weights,
-        weights_dtype=weights_dtype,
+        correction_bias=_correction_bias(experts, device=router_logits.device),
+        topk_weights_dtype=weights_dtype,
     )
     if expert_start:
         topk_ids = topk_ids + expert_start
@@ -349,16 +350,16 @@ def prepare_sigmoid_bias_topk(
     )
     correction_bias = _correction_bias(experts, device=router_logits.device)
 
-    from tokenspeed_kernel.ops import moe as moe_ops
-
     def invoke() -> object:
-        return moe_ops.moe_sigmoid_bias_topk(
+        return moe_ops.moe_topk(
             router_logits,
-            correction_bias,
             topk,
+            score_function="sigmoid",
+            selection_method="topk",
+            renormalize=normalize_topk_weights,
             routed_scaling_factor=routed_scaling_factor,
-            normalize_topk_weights=normalize_topk_weights,
-            weights_dtype=weights_dtype,
+            correction_bias=correction_bias,
+            topk_weights_dtype=weights_dtype,
         )
 
     return PreparedBenchmark(
@@ -464,8 +465,6 @@ def prepare_moe_apply(
         )
 
     load_builtin_kernels()
-    from tokenspeed_kernel.ops import moe as moe_ops
-
     plan = moe_ops.moe_plan(
         weight_dtype=weight_dtype_name,
         input_dtype=input_dtype,
