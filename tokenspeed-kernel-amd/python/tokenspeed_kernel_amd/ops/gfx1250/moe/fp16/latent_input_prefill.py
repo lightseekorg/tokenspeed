@@ -32,7 +32,6 @@ while the gate and up halves sit 768 apart, so no tile holds both.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.moe.latent_input import packed_projection_weight_view
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
     _WARP_BASES_8,
@@ -251,6 +250,26 @@ def gluon_latent_input_prefill_situ_gfx1250(
     )
 
 
+def _is_packed_projection_view(packed, router, routed, shared) -> bool:
+    """Whether ``packed`` is exactly the three weights as consecutive rows.
+
+    The kernels read only ``packed``, so weights that do not live inside it
+    would be silently ignored. Checked here rather than through
+    ``tokenspeed_kernel``: this package must not depend on it.
+    """
+    parts = (router, routed, shared)
+    storage = packed.untyped_storage()
+    if any(part.untyped_storage().data_ptr() != storage.data_ptr() for part in parts):
+        return False
+    address = packed.data_ptr()
+    row_bytes = packed.shape[1] * packed.element_size()
+    for part in parts:
+        if part.data_ptr() != address:
+            return False
+        address += part.shape[0] * row_bytes
+    return address == packed.data_ptr() + packed.shape[0] * row_bytes
+
+
 def launch_gluon_latent_input_prefill_gfx1250(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,
@@ -280,12 +299,8 @@ def launch_gluon_latent_input_prefill_gfx1250(
             raise ValueError(f"Kimi K3 {name} must be contiguous on GPU")
         if tensor.device != hidden_states.device:
             raise ValueError("Kimi K3 MoE input tensors must be colocated")
-    if packed_projection_weight_view(
-        router_weight, routed_down_weight, shared_gate_up_weight
-    ) is not packed_weight and not (
-        packed_weight.data_ptr() == router_weight.data_ptr()
-        and packed_weight.untyped_storage().data_ptr()
-        == router_weight.untyped_storage().data_ptr()
+    if not _is_packed_projection_view(
+        packed_weight, router_weight, routed_down_weight, shared_gate_up_weight
     ):
         raise ValueError(
             "Kimi K3 packed weight must be the consecutive view of the "
