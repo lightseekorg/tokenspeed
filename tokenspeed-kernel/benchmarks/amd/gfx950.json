@@ -12,7 +12,8 @@
   },
   "case_files": [
     "gfx950/glm53_flash/kda.json",
-    "gfx950/glm53_flash/dsa.json"
+    "gfx950/glm53_flash/dsa.json",
+    "gfx950/glm53_flash/moe.json"
   ],
   "cases": [
     {
