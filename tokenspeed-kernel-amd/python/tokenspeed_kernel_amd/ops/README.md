@@ -279,3 +279,43 @@ route sets use four phases. Blocks beyond the valid routed prefix skip work.
 Both GEMMs overlap loads with matrix computation using double-buffered shared
 memory. Phased operand loading and scheduling barriers limit live registers;
 compiler-inserted shared-memory barriers provide inter-wave synchronization.
+
+### gfx1250 persistent A8W4 decode
+
+The gfx1250 precomputed-top-k A8W4 path uses a persistent down projection when
+the routed batch averages at most two rows per expert. Dispatch keeps the common
+small-M decode kernel, while combine uses a fixed worker grid so each workgroup
+can process multiple logical expert/output tiles. SiLU, SwiGLU, and SiTU share
+this path.
+
+#### Contract
+
+- Activations are contiguous E4M3 rows and weights are gfx1250-preprocessed
+  packed MXFP4 tensors with preshuffled E8M0 scales.
+- Routed rows use M-ragged metadata and an int32 scatter index. The output width
+  must be divisible by 128.
+- The production tile is `16 x 128 x 512` with eight wave32s and two TDM
+  buffers. The launch creates 12 workgroups per available CU and pins
+  output-column work to routed-M tiles. The standalone microbenchmark may also
+  specialize BN to 256, BK to 256, the warp count to four, and the buffer count
+  to three when sweeping against the non-persistent decode configuration.
+- The kernel supports an optional FP32 expert bias and BF16 or FP16 output.
+
+#### Algorithm
+
+Each persistent workgroup obtains a routed-M tile and iterates over its assigned
+output-column tiles. The M-pinned mapping retains the activation, expert, and
+base weight descriptors across that loop, updating only the weight and scale N
+offsets. E4M3 activations and packed E2M1 weights are staged through TDM into
+double-buffered LDS and accumulated with scaled wave32 WMMA. The epilogue adds
+the expert bias, converts to the requested output type, and scatters each route
+row back to its token/slot position for the existing weighted top-k reduction.
+
+#### Microbenchmark
+
+`tokenspeed-kernel/test/amd/ops/moe/bench_gluon_mxfp4_persistent_decode_gfx1250.py`
+compares the persistent combine directly with the current non-persistent decode
+combine. It supports compute-specialization and worker-grid sweeps, validates
+each successful candidate against the baseline, and reports CUDA Graph latency
+and speedup as JSON records. Each timing sample contains exactly 100 graph
+replays.

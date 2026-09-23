@@ -3413,15 +3413,17 @@ def test_gluon_mxfp4_dynamic_apply_forwards_precomputed_topk_by_batch_size(
 
 
 @pytest.mark.parametrize(
-    "num_tokens,expected_decode",
+    ("num_tokens", "expected_implementation", "expected_decode"),
     [
-        pytest.param(32, True, id="bpe-16"),
-        pytest.param(33, False, id="bpe-16.5"),
+        pytest.param(4, "persistent", None, id="bpe-2"),
+        pytest.param(32, "regular", True, id="bpe-16"),
+        pytest.param(33, "regular", False, id="bpe-16.5"),
     ],
 )
 def test_gluon_mxfp4_gfx1250_apply_selects_kernel_by_average_bpe(
     num_tokens: int,
-    expected_decode: bool,
+    expected_implementation: str,
+    expected_decode: bool | None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not hasattr(_moe_gluon_mxfp4, "gluon_mxfp4_gfx1250_precomputed_moe_apply"):
@@ -3429,14 +3431,26 @@ def test_gluon_mxfp4_gfx1250_apply_selects_kernel_by_average_bpe(
 
     captured: dict[str, object] = {}
 
-    def fake_fused_moe(*args, **kwargs):
+    def fake_persistent_moe(*args, **kwargs):
+        captured["implementation"] = "persistent"
+        captured.update(kwargs)
+        return "sentinel"
+
+    def fake_regular_moe(*args, **kwargs):
+        captured["implementation"] = "regular"
         captured["decode"] = kwargs.get("decode")
+        captured.update(kwargs)
         return "sentinel"
 
     monkeypatch.setattr(
+        _moe_gluon_mxfp4.persistent_decode_mxfp_gfx1250,
+        "gluon_mxfp4_a8w4_persistent_decode",
+        fake_persistent_moe,
+    )
+    monkeypatch.setattr(
         _moe_gluon_mxfp4.fused_mxfp_gfx1250,
         "gluon_mxfp_precomputed_mxfp4_fused_moe",
-        fake_fused_moe,
+        fake_regular_moe,
     )
 
     num_experts = 4
@@ -3463,10 +3477,26 @@ def test_gluon_mxfp4_gfx1250_apply_selects_kernel_by_average_bpe(
     )
 
     assert out == "sentinel"
-    assert captured["decode"] is expected_decode
+    assert captured["implementation"] == expected_implementation
+    assert captured["activation"] == "silu"
+    if expected_implementation == "regular":
+        assert captured["decode"] is expected_decode
+    else:
+        assert "decode" not in captured
 
 
-def test_gluon_mxfp4_gfx1250_situ_apply_forwards_activation(
+@pytest.mark.parametrize(
+    ("num_tokens", "expected_implementation", "expected_decode"),
+    [
+        (1, "persistent", None),
+        (3, "regular", True),
+        (17, "regular", False),
+    ],
+)
+def test_gluon_mxfp4_gfx1250_situ_apply_selects_decode_implementation(
+    num_tokens: int,
+    expected_implementation: str,
+    expected_decode: bool | None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     apply_name = "gluon_mxfp4_a8w4_situ_gfx1250_precomputed_moe_apply"
@@ -3475,14 +3505,25 @@ def test_gluon_mxfp4_gfx1250_situ_apply_forwards_activation(
 
     captured: dict[str, object] = {}
 
-    def fake_fused_moe(*args, **kwargs):
+    def fake_persistent_moe(*args, **kwargs):
+        captured["implementation"] = "persistent"
+        captured.update(kwargs)
+        return "sentinel"
+
+    def fake_regular_moe(*args, **kwargs):
+        captured["implementation"] = "regular"
         captured.update(kwargs)
         return "sentinel"
 
     monkeypatch.setattr(
+        _moe_gluon_mxfp4.persistent_decode_mxfp_gfx1250,
+        "gluon_mxfp4_a8w4_persistent_decode",
+        fake_persistent_moe,
+    )
+    monkeypatch.setattr(
         _moe_gluon_mxfp4.fused_mxfp_gfx1250,
         "gluon_mxfp_precomputed_mxfp4_fused_moe",
-        fake_fused_moe,
+        fake_regular_moe,
     )
 
     num_experts = 16
@@ -3495,12 +3536,12 @@ def test_gluon_mxfp4_gfx1250_situ_apply_forwards_activation(
     w.w2_precision_config = type(
         "PC", (), {"b_mx_scale": object(), "out_dtype": torch.bfloat16}
     )()
-    output = torch.empty((1, 16), dtype=torch.bfloat16)
+    output = torch.empty((num_tokens, 16), dtype=torch.bfloat16)
     w._situ_output_buffer = output
     x = torch.empty_like(output)
-    router_logits = torch.empty((1, num_experts), dtype=torch.float32)
-    topk_weights = torch.ones((1, num_experts), dtype=torch.float32)
-    topk_ids = torch.arange(num_experts, dtype=torch.int32).view(1, -1)
+    router_logits = torch.empty((num_tokens, num_experts), dtype=torch.float32)
+    topk_weights = torch.ones((num_tokens, num_experts), dtype=torch.float32)
+    topk_ids = torch.arange(num_experts, dtype=torch.int32).repeat(num_tokens, 1)
 
     apply = getattr(_moe_gluon_mxfp4, apply_name)
     out = apply(
@@ -3513,10 +3554,14 @@ def test_gluon_mxfp4_gfx1250_situ_apply_forwards_activation(
     )
 
     assert out == "sentinel"
+    assert captured["implementation"] == expected_implementation
     assert captured["activation"] == "situ"
     assert captured["situ_beta"] == 4.0
     assert captured["situ_linear_beta"] == 25.0
-    assert captured["decode"] is True
+    if expected_implementation == "regular":
+        assert captured["decode"] is expected_decode
+    else:
+        assert "decode" not in captured
     assert captured["out"] is output
 
 

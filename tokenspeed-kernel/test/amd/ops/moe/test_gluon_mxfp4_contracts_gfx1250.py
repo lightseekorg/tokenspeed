@@ -37,7 +37,11 @@ if not is_amd():
     )
 
 from tokenspeed_kernel_amd._triton import gl  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import _common, fused  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import (  # noqa: E402
+    _common,
+    fused,
+    persistent_decode,
+)
 
 # Read sources from the tree the import resolved to, not the repo layout.
 MXFP4_ROOT = Path(_common.__file__).parent
@@ -264,3 +268,92 @@ def test_partial_tdm_hints_exactly_the_operands_it_fuses(
     assert cfg.NUM_LOADS_IN_BATCH.value == whole_warp.NUM_LOADS_IN_BATCH.value - bool(
         fused_pair
     )
+
+
+@pytest.mark.parametrize(
+    ("available_cus", "wgs_per_cu", "expected"),
+    [(256, 1, 256), (256, 2, 512), (256, 12, 3072)],
+)
+def test_persistent_worker_grid_scales_with_wgs_per_cu(
+    available_cus: int,
+    wgs_per_cu: int,
+    expected: int,
+) -> None:
+    assert (
+        persistent_decode.persistent_moe_num_wgs(available_cus, wgs_per_cu) == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("available_cus", "wgs_per_cu"),
+    [(0, 1), (-1, 1), (256, 0), (256, -1)],
+)
+def test_persistent_worker_grid_rejects_nonpositive_inputs(
+    available_cus: int,
+    wgs_per_cu: int,
+) -> None:
+    with pytest.raises(ValueError):
+        persistent_decode.persistent_moe_num_wgs(available_cus, wgs_per_cu)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {
+            "block_m": 16,
+            "block_n": 128,
+            "block_k": 512,
+            "num_warps": 8,
+            "num_buffers": 2,
+            "wgs_per_cu": 12,
+            "work_mapping": "m_pinned",
+            "partial_tdm": False,
+        },
+        {
+            "block_m": 16,
+            "block_n": 256,
+            "block_k": 256,
+            "num_warps": 4,
+            "num_buffers": 3,
+            "wgs_per_cu": 1,
+            "work_mapping": "flat_grid",
+            "partial_tdm": True,
+        },
+    ],
+)
+def test_persistent_decode_accepts_sweep_configurations(
+    config: dict[str, object],
+) -> None:
+    persistent_decode._validate_persistent_config(**config)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("block_m", 32, "block_m=16"),
+        ("block_n", 64, "block_n must be one of"),
+        ("block_k", 128, "block_k must be one of"),
+        ("num_warps", 2, "num_warps must be one of"),
+        ("num_buffers", 4, "num_buffers must be one of"),
+        ("wgs_per_cu", 0, "wgs_per_cu must be positive"),
+        ("work_mapping", "diagonal", "work_mapping must be"),
+    ],
+)
+def test_persistent_decode_rejects_unsupported_sweep_configurations(
+    field: str,
+    value: object,
+    error: str,
+) -> None:
+    config: dict[str, object] = {
+        "block_m": 16,
+        "block_n": 128,
+        "block_k": 512,
+        "num_warps": 8,
+        "num_buffers": 2,
+        "wgs_per_cu": 12,
+        "work_mapping": "m_pinned",
+        "partial_tdm": False,
+    }
+    config[field] = value
+    with pytest.raises(ValueError, match=error):
+        persistent_decode._validate_persistent_config(**config)

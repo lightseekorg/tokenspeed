@@ -36,6 +36,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (  # no
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import (  # noqa: E402
     fused as gfx1250_fused,
 )
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import (  # noqa: E402
+    persistent_decode as gfx1250_persistent,
+)
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.fused import (  # noqa: E402
     _resolve_block_m,
 )
@@ -791,6 +794,93 @@ def test_static_fp8_activation_moe_gfx1250(
         w2_mx_scale=module.w2_precision_config.b_mx_scale,
         decode=decode,
         block_m=block_m,
+    )
+    expected = _fp8_mxfp4_swiglu_moe_reference(
+        hidden_states,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        w13_bias,
+        raw["w2_weight"],
+        raw["w2_scale"],
+        w2_bias,
+        topk_ids,
+        topk_weights,
+    )
+
+    torch.cuda.synchronize()
+    assert actual.shape == hidden_states.shape
+    assert torch.count_nonzero(expected).item() > 0
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_persistent_static_fp8_activation_moe_gfx1250() -> None:
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 persistent A8W4 MoE kernel")
+
+    generator = torch.Generator(device="cuda").manual_seed(20260921)
+    num_tokens = 1
+    hidden_size = 128
+    intermediate_size = 128
+    num_experts = 4
+    top_k = 2
+    raw = make_mxfp4_moe_weights(
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        generator,
+    )
+    w13_bias = (
+        torch.randn(
+            (num_experts, 2 * intermediate_size),
+            dtype=torch.float32,
+            device="cuda",
+            generator=generator,
+        )
+        * 0.05
+    )
+    w2_bias = (
+        torch.randn(
+            (num_experts, hidden_size),
+            dtype=torch.float32,
+            device="cuda",
+            generator=generator,
+        )
+        * 0.05
+    )
+    module = _make_static_fp8_moe_module(
+        raw,
+        preprocess_gluon_mxfp4_gfx1250_moe_weights,
+        w13_bias=w13_bias,
+        w2_bias=w2_bias,
+    )
+
+    hidden_states = torch.randn(
+        num_tokens,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    topk_weights, topk_ids = make_round_robin_topk(
+        num_tokens,
+        num_experts,
+        top_k,
+    )
+    actual = gfx1250_persistent.gluon_mxfp4_a8w4_persistent_decode(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        module.w13_weight_triton_tensor,
+        module.w2_weight_triton_tensor,
+        w13_bias=module.w13_weight_bias,
+        w2_bias=module.w2_weight_bias,
+        w13_mx_scale=module.w13_precision_config.b_mx_scale,
+        w2_mx_scale=module.w2_precision_config.b_mx_scale,
+        out_dtype=torch.bfloat16,
+        activation="swiglu",
+        swiglu_alpha=1.702,
+        swiglu_limit=7.0,
+        swiglu_beta=1.0,
     )
     expected = _fp8_mxfp4_swiglu_moe_reference(
         hidden_states,

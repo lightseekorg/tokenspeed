@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import torch
+
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -33,6 +34,7 @@ platform = current_platform()
 
 _ROUTE_DIRECT_DECODE_MAX_TOKENS = 16
 _GFX1250_DECODE_MAX_AVERAGE_BPE = 16
+_GFX1250_PERSISTENT_MAX_AVERAGE_BPE = 2
 
 
 def _select_gfx950_grouped_block_m(
@@ -67,6 +69,14 @@ def _use_gfx1250_moe_decode(num_routed_rows: int, num_experts: int) -> bool:
     )
 
 
+def _use_gfx1250_persistent_moe(num_routed_rows: int, num_experts: int) -> bool:
+    # The persistent combine is tuned for at most two routed rows per expert.
+    return (
+        0 < num_routed_rows
+        and num_routed_rows <= _GFX1250_PERSISTENT_MAX_AVERAGE_BPE * num_experts
+    )
+
+
 if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
         gluon_mxfp4_fp8_precomputed_situ,
@@ -93,6 +103,9 @@ if platform.is_amd:
         preprocess_gluon_mxfp4_gfx950_moe_weights,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import fused as fused_mxfp_gfx1250
+    from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import (
+        persistent_decode as persistent_decode_mxfp_gfx1250,
+    )
     from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.weight_preprocess import (
         preprocess_gluon_mxfp4_gfx1250_moe_weights,
     )
@@ -642,34 +655,47 @@ if platform.is_amd:
             raise ValueError("gfx1250 A8W4 SiTU MoE requires linear_beta")
         w13_pc = w.w13_precision_config
         w2_pc = w.w2_precision_config
-        decode = _use_gfx1250_moe_decode(
-            topk_ids.numel(), w.w13_weight_triton_tensor.shape[0]
-        )
+        num_routed_rows = topk_ids.numel()
+        num_experts = w.w13_weight_triton_tensor.shape[0]
+        decode = _use_gfx1250_moe_decode(num_routed_rows, num_experts)
+        persistent = _use_gfx1250_persistent_moe(num_routed_rows, num_experts)
 
+        kwargs = {
+            "w13_bias": (
+                None
+                if getattr(w, "_gluon_w13_bias_is_zero", False)
+                else getattr(w, "w13_weight_bias", None)
+            ),
+            "w2_bias": (
+                None
+                if getattr(w, "_gluon_w2_bias_is_zero", False)
+                else getattr(w, "w2_weight_bias", None)
+            ),
+            "w13_mx_scale": w13_pc.b_mx_scale,
+            "w2_mx_scale": w2_pc.b_mx_scale,
+            "out_dtype": w2_pc.out_dtype or torch.bfloat16,
+            "activation": "situ",
+            "situ_beta": situ_beta,
+            "situ_linear_beta": float(situ_linear_beta),
+            "out": getattr(w, "_situ_output_buffer", None),
+        }
+        if persistent:
+            return persistent_decode_mxfp_gfx1250.gluon_mxfp4_a8w4_persistent_decode(
+                x,
+                topk_weights,
+                topk_ids,
+                w.w13_weight_triton_tensor,
+                w.w2_weight_triton_tensor,
+                **kwargs,
+            )
         return fused_mxfp_gfx1250.gluon_mxfp_precomputed_mxfp4_fused_moe(
             x,
             topk_weights,
             topk_ids,
             w.w13_weight_triton_tensor,
             w.w2_weight_triton_tensor,
-            w13_bias=(
-                None
-                if getattr(w, "_gluon_w13_bias_is_zero", False)
-                else getattr(w, "w13_weight_bias", None)
-            ),
-            w2_bias=(
-                None
-                if getattr(w, "_gluon_w2_bias_is_zero", False)
-                else getattr(w, "w2_weight_bias", None)
-            ),
-            w13_mx_scale=w13_pc.b_mx_scale,
-            w2_mx_scale=w2_pc.b_mx_scale,
-            out_dtype=w2_pc.out_dtype or torch.bfloat16,
-            activation="situ",
-            situ_beta=situ_beta,
-            situ_linear_beta=float(situ_linear_beta),
             decode=decode,
-            out=getattr(w, "_situ_output_buffer", None),
+            **kwargs,
         )
 
     @register_kernel(
@@ -713,7 +739,7 @@ if platform.is_amd:
         do_finalize: bool = True,
         enable_pdl: bool = False,
     ):
-        del plan, router_logits, num_tokens_global, max_num_tokens_per_gpu
+        del router_logits, num_tokens_global, max_num_tokens_per_gpu
         del do_finalize, enable_pdl
         if topk_weights is None or topk_ids is None:
             raise ValueError(
@@ -722,35 +748,50 @@ if platform.is_amd:
             )
 
         swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_args(w)
+        activation = plan.get("activation") or getattr(w, "activation", "silu")
         w13_pc = w.w13_precision_config
         w2_pc = w.w2_precision_config
-        decode = _use_gfx1250_moe_decode(
-            topk_ids.numel(), w.w13_weight_triton_tensor.shape[0]
-        )
+        num_routed_rows = topk_ids.numel()
+        num_experts = w.w13_weight_triton_tensor.shape[0]
+        decode = _use_gfx1250_moe_decode(num_routed_rows, num_experts)
+        persistent = _use_gfx1250_persistent_moe(num_routed_rows, num_experts)
 
+        kwargs = {
+            "w13_bias": (
+                None
+                if getattr(w, "_gluon_w13_bias_is_zero", False)
+                else getattr(w, "w13_weight_bias", None)
+            ),
+            "w2_bias": (
+                None
+                if getattr(w, "_gluon_w2_bias_is_zero", False)
+                else getattr(w, "w2_weight_bias", None)
+            ),
+            "w13_mx_scale": w13_pc.b_mx_scale,
+            "w2_mx_scale": w2_pc.b_mx_scale,
+            "out_dtype": w2_pc.out_dtype or torch.bfloat16,
+            "activation": activation,
+            "swiglu_alpha": swiglu_alpha,
+            "swiglu_limit": swiglu_limit,
+            "swiglu_beta": swiglu_beta,
+        }
+        if persistent:
+            return persistent_decode_mxfp_gfx1250.gluon_mxfp4_a8w4_persistent_decode(
+                x,
+                topk_weights,
+                topk_ids,
+                w.w13_weight_triton_tensor,
+                w.w2_weight_triton_tensor,
+                **kwargs,
+            )
         return fused_mxfp_gfx1250.gluon_mxfp_precomputed_mxfp4_fused_moe(
             x,
             topk_weights,
             topk_ids,
             w.w13_weight_triton_tensor,
             w.w2_weight_triton_tensor,
-            w13_bias=(
-                None
-                if getattr(w, "_gluon_w13_bias_is_zero", False)
-                else getattr(w, "w13_weight_bias", None)
-            ),
-            w2_bias=(
-                None
-                if getattr(w, "_gluon_w2_bias_is_zero", False)
-                else getattr(w, "w2_weight_bias", None)
-            ),
-            w13_mx_scale=w13_pc.b_mx_scale,
-            w2_mx_scale=w2_pc.b_mx_scale,
-            out_dtype=w2_pc.out_dtype or torch.bfloat16,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_limit=swiglu_limit,
-            swiglu_beta=swiglu_beta,
             decode=decode,
+            **kwargs,
         )
 
     @register_kernel(
