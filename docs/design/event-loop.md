@@ -170,8 +170,9 @@ whose overlap is instead broken by the drain registry in Principle 4.
 
 `EventLoop.event_loop` sequences components; it does not implement them.
 Domain logic — pause/resume semantics, EPD admission, PD transfer handling,
-L2 cache-op tracking, wire handshakes, multimodal batch assembly — lives in
-its own module and enters the loop as a **single-line hook**. The loop body
+L2 cache-op tracking, L3 admission/recovery, wire handshakes, multimodal batch
+assembly — lives in its own module and enters the loop as a **single-line hook**.
+The loop body
 should read, top to bottom, as the schedule of one scheduling round, with no
 feature's internals inlined into it.
 
@@ -199,9 +200,10 @@ There are exactly two call sites, each with a documented reason:
   (`_cache_hooks.poll_ready_events()`). These must advance *before*
   `next_execution_plan`, otherwise cache-gated admissions are delayed by a
   full round.
-* **Tail of the round** — forward results and PD transfer events, funneled
-  through the single `request_changes` list. These can only exist after
-  dispatch/commit, and must advance before the *next* round plans.
+* **Tail of the round** — forward results, PD transfer events and L3 prefetch
+  recovery retracts, funneled through the single `request_changes` list.
+  Recovery retracts follow commits of older in-flight forwards; all events
+  must advance before the *next* round plans.
 
 Anything that produces scheduler events (a new transfer backend, a new async
 op kind) either returns events into one of these two points or adds a new
@@ -281,6 +283,7 @@ Current inventory:
 | `_epd_hooks`   | `EpdPrefillHooks` — `epd/prefill_hooks.py`    | glue (EpdPrefillAdmission decides)          | `try_stage`, `drain_ready_embeddings`, `assert_embeddings_received` |
 | `_pd_hooks`    | `PdTransferHooks` — `pd/transfer_hooks.py`    | glue (transfer executors decide)            | `poll_transfer_events` |
 | `_cache_hooks` | `L2CacheHooks` — `engine/cache_hooks.py`      | glue-ish (handed the `DeviceHandle`: submission rides `execute`; polling stays control-side event queries) | `count_plan_ops`, `poll_ready_events` |
+| `_l3_hooks` | `L3CacheHooks` — `engine/l3_cache_hooks.py` | self-contained (injected scheduler, `DeviceHandle`, static replica groups; no loop reference) | `submit_requests`, `revalidate_queued_hits`, `prepare_forward` |
 
 `_pause_hooks` and `_pd_hooks` are also handed the `DeviceHandle`: both have
 work that must land on the data plane — the DP idle forward and the KV repair
@@ -288,6 +291,16 @@ after a memory-saver wake, and the device writes a completed remote prefill
 lands. `PauseHooks` additionally supplies `reset_caches_for_release` and
 `kv_repair_after_wake` to the memory-occupation controller as callbacks; those
 are not loop entry points, they fire on release/wake.
+
+`L3CacheHooks` owns prefix registration at submission, candidate revalidation
+before planning, and replica-wide prefetch recovery. It returns the safe forward
+and recovery events, never advancing the scheduler. A miss suppresses the
+model batch and remote-prefill submission while the plan's cache ops still
+execute. The loop drains older forwards before applying recovery at its tail.
+With L3 disabled, the same hooks submit requests without token hashing, storage
+probes or replica collectives. Storage state and per-plan prefetch snapshots
+remain behind `DeviceHandle`; namespace deletion and flush coordination stay
+in `RequestHandler`.
 
 Per-round dispatch needs no hooks class at all: the loop hands
 `DeviceHandle.execute` the plan and the round's `PlannedForward`, and the

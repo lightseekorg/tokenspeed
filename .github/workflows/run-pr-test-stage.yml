@@ -74,7 +74,22 @@ jobs:
 
       - name: Set work directory
         run: |
-          echo "WORK_DIR=${{ github.workspace }}/run-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}-${{ matrix.runner }}" >> "$GITHUB_ENV"
+          work_dir="${{ github.workspace }}/run-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}-${{ matrix.runner }}"
+          echo "WORK_DIR=$work_dir" >> "$GITHUB_ENV"
+          # Keep eval dependencies off shared caches that can fill between jobs.
+          # The existing work-directory cleanup also removes this cache.
+          if [ "${{ matrix.workflow_stage }}" = "model-test" ]; then
+            echo "UV_CACHE_DIR=$work_dir/.uv-cache" >> "$GITHUB_ENV"
+            # Accuracy jobs must be able to compile on full shared volumes.
+            # Performance jobs retain their established warm kernel cache.
+            if [ "${{ matrix.type }}" = "eval" ]; then
+              echo "TRITON_CACHE_DIR=$work_dir/.triton-cache" >> "$GITHUB_ENV"
+            fi
+            # MIOpen's writable SQLite databases also need job-local storage.
+            mkdir -p "$work_dir/.miopen-db" "$work_dir/.miopen-kernels"
+            echo "MIOPEN_USER_DB_PATH=$work_dir/.miopen-db" >> "$GITHUB_ENV"
+            echo "MIOPEN_CUSTOM_CACHE_DIR=$work_dir/.miopen-kernels" >> "$GITHUB_ENV"
+          fi
 
       - name: Restore MI450 simulator cache
         if: matrix.runner == 'amd-mi45x-cpu-test'

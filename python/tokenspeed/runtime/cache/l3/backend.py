@@ -948,6 +948,8 @@ def storage_key_prefix(
     draft_weight_version: str,
     cache_quantization: str,
     runtime_compat: str,
+    attention_backend: str,
+    draft_attention_backend: str,
     skip_softmax_threshold: float,
     eagle3_layers_to_capture: Sequence[int],
 ) -> str:
@@ -956,13 +958,19 @@ def storage_key_prefix(
     Every component is required so a new caller cannot omit the checkpoint
     identity, cache layout, pipeline stage, attention-TP width,
     context-parallel width, draft pool, cache-quantization config (target
-    and draft), runtime HF overrides, the KV-producer compat epoch,
+    and draft), runtime HF overrides, resolved target/draft attention backends,
+    the KV-producer compat epoch,
     ``--skip-softmax-threshold``, or the resolved EAGLE3 capture layers
     and silently collide with an incompatible deployment.
     ``revision`` is the resolved immutable checkpoint (Hugging Face commit
     or local fingerprint), not a moving branch name. ``model_overrides``
     is the ``--hf-overrides`` dict applied to the HF text config
     (rope_theta, rope_scaling, and the rest of the effective architecture).
+    ``attention_backend`` and ``draft_attention_backend`` are the resolved
+    full-attention backend names from attention construction, including the
+    sub-backend of a hybrid model. An empty draft name means no draft cache
+    backend on this stage. Backend choices can change attention output and
+    therefore downstream K/V even when their packed Host layouts match.
     ``runtime_compat`` is ``L3_RUNTIME_COMPAT``: the epoch of the runtime
     that produced the KV, not a build SHA. ``skip_softmax_threshold`` is
     the resolved gfx950 MHA prefill skip-softmax threshold (0.0 is exact
@@ -1003,6 +1011,8 @@ def storage_key_prefix(
             "draft_weight_version": str(draft_weight_version),
             "cache_quantization": str(cache_quantization),
             "runtime_compat": str(runtime_compat),
+            "attention_backend": str(attention_backend),
+            "draft_attention_backend": str(draft_attention_backend),
             "skip_softmax_threshold": float(skip_softmax_threshold),
             "eagle3_layers_to_capture": [
                 int(layer) for layer in eagle3_layers_to_capture

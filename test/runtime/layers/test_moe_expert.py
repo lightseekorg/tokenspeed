@@ -35,11 +35,16 @@ def test_hybrid_moe_dispatches_from_actual_topk_format(
 
     monkeypatch.setattr(expert_module.tokenspeed_kernel, "moe_apply", fake_moe_apply)
 
-    hidden_states = torch.empty((2, 4))
+    hidden_states = torch.empty((2, 4), dtype=torch.bfloat16)
     router_logits = torch.empty((2, 8))
-    layer(
+    bypassed_output = layer(
         hidden_states,
-        BypassedTopKOutput(hidden_states, router_logits, TopKConfig(top_k=2)),
+        BypassedTopKOutput(
+            hidden_states,
+            router_logits,
+            TopKConfig(top_k=2),
+            output_scale=torch.ones((2, 1), dtype=torch.float32),
+        ),
         num_global_tokens=2,
         max_num_tokens_per_gpu=2,
     )
@@ -54,6 +59,7 @@ def test_hybrid_moe_dispatches_from_actual_topk_format(
         max_num_tokens_per_gpu=2,
     )
 
+    assert bypassed_output.dtype == hidden_states.dtype
     assert calls[0]["router_logits"] is router_logits
     assert calls[1]["router_logits"] is None
     assert "topk_weights" not in calls[0]
