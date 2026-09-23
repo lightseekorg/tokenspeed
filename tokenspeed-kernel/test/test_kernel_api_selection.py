@@ -584,11 +584,11 @@ def test_public_mm_selects_gfx1250_decode_kernel(
         def fake_online_quantize_mxfp8(
             activation: torch.Tensor,
             selected_block_size: list[int],
-            kernel_name: str,
+            scale_encoding: str,
             enable_pdl: bool,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             assert selected_block_size == block_size
-            assert kernel_name == expected_name
+            assert scale_encoding == ("ue8m0" if contract == "ue8m0" else "float32")
             assert not enable_pdl
             return (
                 torch.empty_like(activation, dtype=_fp8_dtype()),

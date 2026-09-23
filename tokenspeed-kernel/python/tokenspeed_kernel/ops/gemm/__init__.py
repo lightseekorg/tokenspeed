@@ -683,12 +683,15 @@ def _online_quantize_mxfp8(
     A: torch.Tensor,
     block_size: list[int],
     scale_encoding: str,
+    *,
+    enable_pdl: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return quantize_fp8(
         A,
         granularity="token_group",
         group_size=block_size[1],
         scale_encoding=scale_encoding,
+        enable_pdl=enable_pdl,
         solution="triton",
     )
 
@@ -832,6 +835,7 @@ def mm(
             A,
             block_size,
             "ue8m0" if B_scales.dtype == torch.uint8 else "float32",
+            enable_pdl=enable_pdl,
         )
 
     kernel_args = (A, B, A_scales, B_scales, out_dtype)
@@ -978,7 +982,10 @@ def bmm(
             block_size is not None
         ), "block_size is required for online activation quantization"
         A, A_scales = _online_quantize_mxfp8(
-            A, block_size, kernel.name, enable_pdl=enable_pdl
+            A,
+            block_size,
+            "ue8m0" if B_scales.dtype == torch.uint8 else "float32",
+            enable_pdl=enable_pdl,
         )
 
     kernel_args = (A, B, A_scales, B_scales, out_dtype)
