@@ -1,5 +1,5 @@
 tokenspeed-deepep==2.1.0.post20260810
-tokenspeed-deepgemm==2.8.0.post20260920
+tokenspeed-deepgemm==2.8.0.post20260923
 tokenspeed-flashmla==1.0.0.post20260920
 tokenspeed-deepselect==1.0.0.post20260910
 tokenspeed-mla==0.2.11
