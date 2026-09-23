@@ -115,10 +115,15 @@ def _estimate_series(
     readings move in whole granules, whether the driver's graph memory or
     the caching allocator's segments moved them, so a window can start
     inside one. Each sample after the window anchors its own width at its
-    reading plus that granule. A skipped entry is priced on the line between
-    the anchors around its width; narrower than every anchor, at the
-    narrowest one. A cost that drops between two anchors is priced short
-    there, and the utilization headroom absorbs the difference either way
+    reading plus that granule -- capped at the window's rate when the reading
+    is within three granules of it, since one reading is lumpy and a flat
+    ladder's anchors would otherwise price a lump across every entry below
+    them, and at the reading less those three granules further above, so a
+    dearer entry stays dearer and a granule more in any reading never lowers
+    the reserve. A skipped entry is priced on the line between the anchors
+    around its width; narrower than every anchor, at the narrowest one. A
+    cost that drops between two anchors is priced short there, and the
+    utilization headroom absorbs the difference either way
     (docs/design/unified_path.md).
     """
     widths, sampled = ladder.widths, list(ladder.sampled)
@@ -157,10 +162,12 @@ def _estimate_series(
     if window > 1:
         anchors[sum(widths[1:window]) / (window - 1)] = rate
     for reading, position in zip(marginals[window - 1 :], sampled[window:]):
+        # Near the window a reading is a lump at its rate; above, its excess is priced.
+        anchor = max(reading, 0) + granule
+        if window > 1:
+            anchor = min(anchor, max(rate, max(reading, 0) - 3 * granule))
         # Two samples at one width (a bucket's inline variants): the dearer one.
-        anchors[widths[position]] = max(
-            anchors.get(widths[position], 0), max(reading, 0) + granule
-        )
+        anchors[widths[position]] = max(anchors.get(widths[position], 0), anchor)
     knots = sorted(anchors.items(), reverse=True)
 
     def price(width: int) -> float:

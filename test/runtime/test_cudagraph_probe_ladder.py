@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import ast
 import contextlib
-import math
 import pathlib
 import sys
 from types import SimpleNamespace
@@ -163,12 +162,10 @@ def test_the_decode_probe_samples_the_probe_positions_of_each_variant(variants) 
     )
     granule = 2 << 20
     window = -(-(3 + granule) // 2)
-    anchor = 3 + granule
-    # Width 8 is on the line from the window (mean width 24) to the anchor at 4.
-    on_line = anchor + (window - anchor) * (8 - 4) / (24 - 4)
+    # The anchor's reading plus a granule exceeds the window's rate, so it is capped there.
     for name in names:
         assert observer.samples[name] == [0, 1, 2, 3]
-        assert estimate.series[name].unsampled == math.ceil(on_line + 2 * anchor)
+        assert estimate.series[name].unsampled == 3 * window
 
     serving = _decode_runner([1, 2, 4], variants)
     serving.capture(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)

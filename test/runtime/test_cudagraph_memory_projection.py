@@ -190,6 +190,36 @@ def _rate(positive_sum, marginals):
             },
             {"prefill": (144, math.ceil(MIB * (2 * (6 + 2 * 8 / 36.8) + 12)))},
         ),
+        # A lumpy anchor never prices above the window: every skipped entry at its rate.
+        (
+            {"prefill": (100, 4, 4, 4, 10)},
+            {
+                "prefill": CapturedLadder(
+                    [100, 90, 80, 70, 60, 50, 40, 30, 20], [0, 1, 2, 3, 6]
+                )
+            },
+            {"prefill": (122, 4 * _rate(12, 3))},
+        ),
+        # An anchor well above the window is a dearer entry: its reading less three granules.
+        (
+            {"prefill": (100, 4, 4, 4, 30)},
+            {
+                "prefill": CapturedLadder(
+                    [100, 90, 80, 70, 60, 50, 40, 30, 20], [0, 1, 2, 3, 6]
+                )
+            },
+            # Window 14/3 at 80, anchor 24 at 40: on the line at 60 and 50, then 24 and 24.
+            {
+                "prefill": (
+                    142,
+                    math.ceil(
+                        2 * 24 * MIB
+                        + (24 * MIB + (_rate(12, 3) - 24 * MIB) * 0.5)
+                        + (24 * MIB + (_rate(12, 3) - 24 * MIB) * 0.25)
+                    ),
+                )
+            },
+        ),
         # An anchor served from slack, or one that handed memory back, prices at one granule.
         (
             {"prefill": (50, 4, 4, 4, 0)},
@@ -235,7 +265,14 @@ def test_a_dearer_reading_never_lowers_the_reserve() -> None:
     ladder = CapturedLadder(
         [512, 448, 384, 320, 256, 192, 128, 64, 32], [0, 1, 2, 3, 6]
     )
-    for base in ((200, 20, 20, 20, 20), (200, 20, 20, 10, 4), (200, 0, 2, 0, 4)):
+    # The last two: a granule more in the window pulls the anchor under the lump cap.
+    for base in (
+        (200, 20, 20, 20, 20),
+        (200, 20, 20, 10, 4),
+        (200, 0, 2, 0, 4),
+        (200, 0, 0, 0, 7),
+        (200, 2, 2, 2, 9),
+    ):
         samples = tuple(MIB * s for s in base)
         before = estimate_cudagraph_memory({"prefill": samples}, {"prefill": ladder})
         for i in range(len(samples)):

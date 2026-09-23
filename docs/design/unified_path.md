@@ -137,9 +137,13 @@ from one first bound to that pool:
   samples form a window priced at its positive bytes, plus one granule the
   window may hide (readings move in 2 MiB, from the driver's graph memory
   and the allocator's segments alike), over every marginal; each sample
-  further down anchors its width at its reading plus that granule, and a skipped
-  entry is priced on the line between the anchors around its width, or at
-  the narrowest anchor below it. Every ladder is sampled and priced the same
+  further down anchors its width at its reading plus that granule, capped at
+  the window's rate when the reading is within three granules of it (one
+  reading is lumpy) and at the reading less those three granules further
+  above (a dearer entry stays dearer, and a granule more in any reading never
+  lowers the reserve), and a skipped entry is priced on the line between the
+  anchors around its width, or at the narrowest anchor below it. Every ladder
+  is sampled and priced the same
   way, whatever shape its cost takes down the ladder: flat, falling with the
   entry's width, or lumpy. That is not a bound: a cost that drops between
   two anchors is priced short over that stretch.
