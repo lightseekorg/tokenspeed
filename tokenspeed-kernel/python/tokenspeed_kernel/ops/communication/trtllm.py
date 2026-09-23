@@ -640,7 +640,6 @@ if current_platform().is_nvidia:
                 norm_out,
                 granularity="token_group",
                 group_size=128,
-                solution="trtllm",
             )
             return quant_out, residual_out, scale_out, partial_norm_out
         return norm_out, residual_out, None, partial_norm_out
