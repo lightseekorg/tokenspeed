@@ -64,7 +64,7 @@ from tokenspeed_kernel.ops.moe.latent_tail import (
     latent_tail_supported,
     multicast_backend_available,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 from tokenspeed.runtime.distributed.comm_ops import (
     acquire_all_reduce_outputs,
@@ -1302,6 +1302,7 @@ class K3MoeTailComm:
             prefix_sum,
             routed_projected.view(num_tokens, hidden_size),
             shared_reduced.view(num_tokens, hidden_size),
+            enable_pdl=pdl_enabled(),
         )
 
 

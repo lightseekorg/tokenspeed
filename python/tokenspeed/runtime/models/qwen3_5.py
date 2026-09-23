@@ -869,7 +869,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         """Backend attention call + optional gate apply. Subclasses override."""
         attn_output = self.attn(q, k, v, ctx, **kwargs)
         if gate is not None:
-            sigmoid_mul(attn_output, gate)
+            sigmoid_mul(attn_output, gate, enable_pdl=pdl_enabled())
         return attn_output
 
     def self_attention(

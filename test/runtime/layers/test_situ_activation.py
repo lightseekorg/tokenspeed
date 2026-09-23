@@ -94,7 +94,7 @@ def test_add3_supports_row_strided_inputs(device):
     b = base[:, 9:17]
     c = base[:, 16:24]
 
-    actual = add3(a, b, c)
+    actual = add3(a, b, c, enable_pdl=False)
 
     torch.testing.assert_close(actual, a + b + c)
     assert actual.is_contiguous()

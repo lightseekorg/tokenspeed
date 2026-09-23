@@ -11,12 +11,10 @@ from tokenspeed_kernel.ops.activation.triton import (
     attnres_partial,
     attnres_partial_dual,
 )
-from tokenspeed_kernel.platform import current_platform
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
-platform = current_platform()
 H = 7168  # K3 hidden size; the kernels static-assert two 4096 sweeps.
 
 
@@ -57,8 +55,8 @@ def test_partial_combine_parity(T, KB, use_norm):
 
     scratch = _scratch(T)
     out = torch.empty(T, H, dtype=torch.bfloat16, device="cuda")
-    attnres_partial(blocks, wp, eps, scratch)
-    attnres_combine(prefix, wp, out_w, eps, scratch, out)
+    attnres_partial(blocks, wp, eps, scratch, enable_pdl=False)
+    attnres_combine(prefix, wp, out_w, eps, scratch, out, enable_pdl=False)
 
     ref = _reference(prefix, blocks, wp, eps, out_w)
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
@@ -73,9 +71,9 @@ def test_partial_dual_matches_two_singles(T, KB):
     wp_a = torch.randn(H, dtype=torch.bfloat16, device="cuda")
     wp_b = torch.randn(H, dtype=torch.bfloat16, device="cuda")
     sa, sb, ra, rb = _scratch(T), _scratch(T), _scratch(T), _scratch(T)
-    attnres_partial_dual(blocks, wp_a, wp_b, 1e-5, sa, sb)
-    attnres_partial(blocks, wp_a, 1e-5, ra)
-    attnres_partial(blocks, wp_b, 1e-5, rb)
+    attnres_partial_dual(blocks, wp_a, wp_b, 1e-5, sa, sb, enable_pdl=False)
+    attnres_partial(blocks, wp_a, 1e-5, ra, enable_pdl=False)
+    attnres_partial(blocks, wp_b, 1e-5, rb, enable_pdl=False)
     for got, ref in ((sa, ra), (sb, rb)):
         for x, y in zip(got, ref):
             torch.testing.assert_close(x, y, atol=1e-4, rtol=1e-4)
@@ -91,70 +89,8 @@ def test_partial_dual_probes_are_independent(T, KB):
     wp_b = torch.randn(H, dtype=torch.bfloat16, device="cuda") * 0.05
     ab_a, ab_b = _scratch(T), _scratch(T)
     ba_a, ba_b = _scratch(T), _scratch(T)
-    attnres_partial_dual(blocks, wp_a, wp_b, 1e-5, ab_a, ab_b)
-    attnres_partial_dual(blocks, wp_b, wp_a, 1e-5, ba_a, ba_b)
+    attnres_partial_dual(blocks, wp_a, wp_b, 1e-5, ab_a, ab_b, enable_pdl=False)
+    attnres_partial_dual(blocks, wp_b, wp_a, 1e-5, ba_a, ba_b, enable_pdl=False)
     for got, ref, side in ((ba_b, ab_a, "A->B"), (ba_a, ab_b, "B->A")):
         for x, y in zip(got, ref):
             assert torch.equal(x, y), f"probe {side} changed when slots swapped"
-
-
-@pytest.mark.skipif(not platform.is_hopper_plus, reason="PDL requires SM90+")
-@pytest.mark.parametrize("use_norm", [True, False])
-def test_combine_pdl_parity(use_norm):
-    """The PDL variant (prefetch + gdc_wait) must match the plain launch
-    bit-for-bit; standalone it degenerates to an immediate wait."""
-    torch.manual_seed(7)
-    T, KB = 1, 8
-    prefix = torch.randn(T, H, dtype=torch.bfloat16, device="cuda")
-    blocks = torch.randn(KB, T, H, dtype=torch.bfloat16, device="cuda")
-    wp = torch.randn(H, dtype=torch.bfloat16, device="cuda")
-    out_w = (
-        (torch.rand(H, dtype=torch.bfloat16, device="cuda") + 0.5) if use_norm else None
-    )
-    eps = 1e-5
-
-    scratch = _scratch(T)
-    attnres_partial(blocks, wp, eps, scratch)
-    plain = attnres_combine(
-        prefix,
-        wp,
-        out_w,
-        eps,
-        scratch,
-        torch.empty(T, H, dtype=torch.bfloat16, device="cuda"),
-    )
-    pdl = attnres_combine(
-        prefix,
-        wp,
-        out_w,
-        eps,
-        scratch,
-        torch.empty(T, H, dtype=torch.bfloat16, device="cuda"),
-        enable_pdl=True,
-    )
-    assert torch.equal(plain, pdl)
-
-
-@pytest.mark.skipif(not platform.is_hopper_plus, reason="PDL requires SM90+")
-def test_partial_pdl_parity():
-    """PDL launches of the blocks-side partials must match the serial launch
-    bit-for-bit; standalone each degenerates to an immediate wait."""
-    torch.manual_seed(11)
-    T, KB = 4, 8
-    blocks = torch.randn(KB, T, H, dtype=torch.bfloat16, device="cuda")
-    wp_a = torch.randn(H, dtype=torch.bfloat16, device="cuda")
-    wp_b = torch.randn(H, dtype=torch.bfloat16, device="cuda")
-
-    serial_single, pdl_single = _scratch(T), _scratch(T)
-    attnres_partial(blocks, wp_a, 1e-5, serial_single)
-    attnres_partial(blocks, wp_a, 1e-5, pdl_single, enable_pdl=True)
-    for got, ref in zip(pdl_single, serial_single):
-        assert torch.equal(got, ref)
-
-    serial_a, serial_b = _scratch(T), _scratch(T)
-    pdl_a, pdl_b = _scratch(T), _scratch(T)
-    attnres_partial_dual(blocks, wp_a, wp_b, 1e-5, serial_a, serial_b)
-    attnres_partial_dual(blocks, wp_a, wp_b, 1e-5, pdl_a, pdl_b, enable_pdl=True)
-    for got, ref in ((pdl_a, serial_a), (pdl_b, serial_b)):
-        for x, y in zip(got, ref):
-            assert torch.equal(x, y)

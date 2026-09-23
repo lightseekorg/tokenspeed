@@ -23,7 +23,7 @@ from __future__ import annotations
 import math
 
 import torch
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
@@ -264,7 +264,7 @@ def mla_project_value(
         if out.is_cuda:
             from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 
-            sigmoid_mul(out, gate)
+            sigmoid_mul(out, gate, enable_pdl=pdl_enabled())
         else:
             out.copy_(out.float() * torch.sigmoid(gate.float()))
     return out

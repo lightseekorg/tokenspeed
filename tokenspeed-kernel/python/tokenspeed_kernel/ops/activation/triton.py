@@ -83,7 +83,7 @@ def fused_gate_sigmoid_mul_add(
     shared_output: torch.Tensor,
     final_hidden_states: torch.Tensor,
     *,
-    enable_pdl: bool | None = None,
+    enable_pdl: bool,
 ) -> torch.Tensor:
     """Fused ``final_hidden_states += sigmoid(hidden_states @ gate_weight) * shared_output``.
 
@@ -96,8 +96,7 @@ def fused_gate_sigmoid_mul_add(
         shared_output: ``[num_tokens, hidden_dim]`` contiguous shared expert output.
         final_hidden_states: ``[num_tokens, hidden_dim]`` contiguous MoE output,
             modified in-place.
-        enable_pdl: Join an SM90+ Programmatic Dependent Launch chain;
-            defaults to the platform setting.
+        enable_pdl: Join an SM90+ Programmatic Dependent Launch chain when true.
 
     Returns:
         ``final_hidden_states`` (same storage, mutated in-place).
@@ -137,7 +136,6 @@ def fused_gate_sigmoid_mul_add(
     BLOCK = triton.next_power_of_2(hidden_dim)
     num_warps = 4 if BLOCK <= 2048 else (8 if BLOCK <= 4096 else 16)
     grid = (num_tokens,)
-    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _fused_gate_sigmoid_mul_add_kernel[grid](
         hidden_states,
@@ -191,7 +189,7 @@ def sigmoid_mul(
     x: torch.Tensor,
     gate: torch.Tensor,
     *,
-    enable_pdl: bool | None = None,
+    enable_pdl: bool,
 ) -> torch.Tensor:
     """In-place ``x *= sigmoid(gate)``.
 
@@ -206,8 +204,7 @@ def sigmoid_mul(
     The strided form lets callers skip the ``.reshape(-1)`` copy after the
     chunk; both layouts share the same kernel via the explicit gate strides.
 
-    ``enable_pdl`` joins an SM90+ Programmatic Dependent Launch chain;
-    defaults to the platform setting.
+    ``enable_pdl`` joins an SM90+ Programmatic Dependent Launch chain when true.
     """
     if x.ndim != 2:
         raise ValueError(f"x must be 2D, got {x.ndim}D")
@@ -245,7 +242,6 @@ def sigmoid_mul(
 
     BLOCK_SIZE = 1024
     grid = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE,)
-    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _sigmoid_mul_kernel[grid](
         x,
@@ -302,7 +298,8 @@ def _silu_and_mul_kernel(
 def silu_and_mul(
     x: torch.Tensor,
     out: torch.Tensor | None = None,
-    enable_pdl: bool | None = None,
+    *,
+    enable_pdl: bool,
     limit: float | None = None,
 ) -> torch.Tensor:
     """Fused ``SiLU(x[..., :D]) * x[..., D:]``.
@@ -310,8 +307,7 @@ def silu_and_mul(
     ``x`` is interpreted as ``[..., 2 * D]`` with gate values in the first half
     and up values in the second half. The output has shape ``[..., D]``.
 
-    ``enable_pdl`` joins an SM90+ Programmatic Dependent Launch chain;
-    defaults to the platform setting.
+    ``enable_pdl`` joins an SM90+ Programmatic Dependent Launch chain when true.
     """
     if limit is not None and limit <= 0:
         raise ValueError(f"limit must be positive, got {limit}")
@@ -338,7 +334,6 @@ def silu_and_mul(
 
     BLOCK_SIZE = 1024
     grid = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE,)
-    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _silu_and_mul_kernel[grid](
         flat_x,
@@ -394,7 +389,7 @@ def swiglu_oai(
     *,
     alpha: float = 1.702,
     limit: float = 7.0,
-    enable_pdl: bool | None = None,
+    enable_pdl: bool,
 ) -> torch.Tensor:
     """Fused ``gate * sigmoid(alpha * gate) * (up + 1)``.
 
@@ -402,8 +397,7 @@ def swiglu_oai(
     half and up values in the second half. The gate is upper-clamped to ``limit``
     and up is clamped to ``[-limit, limit]``. The output has shape ``[..., D]``.
 
-    ``enable_pdl`` joins an SM90+ Programmatic Dependent Launch chain;
-    defaults to the platform setting.
+    ``enable_pdl`` joins an SM90+ Programmatic Dependent Launch chain when true.
     """
     if gate_up.shape[-1] % 2 != 0:
         raise ValueError(f"last dimension must be even, got {gate_up.shape[-1]}")
@@ -425,7 +419,6 @@ def swiglu_oai(
         return out
 
     block_size = 1024
-    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _swiglu_oai_kernel[((n_elements + block_size - 1) // block_size,)](
         flat_input,
@@ -494,7 +487,7 @@ def situ_and_mul(
     *,
     beta: float = 1.0,
     linear_beta: float | None = None,
-    enable_pdl: bool | None = None,
+    enable_pdl: bool,
 ) -> torch.Tensor:
     """Apply SiTU to a concatenated ``[gate, up]`` tensor.
 
@@ -508,8 +501,7 @@ def situ_and_mul(
         out: Optional output tensor shaped ``[..., D]``.
         beta: Positive gate soft-clipping scale.
         linear_beta: Optional positive up-branch soft-clipping scale.
-        enable_pdl: Join an SM90+ Programmatic Dependent Launch chain;
-            defaults to the platform setting.
+        enable_pdl: Join an SM90+ Programmatic Dependent Launch chain when true.
 
     Returns:
         Tensor shaped ``[..., D]`` in the same dtype and device as ``x``.
@@ -551,7 +543,6 @@ def situ_and_mul(
 
     block_size = 1024
     grid = (triton.cdiv(n, block_size),)
-    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _situ_and_mul_kernel[grid](
         flat_x,
@@ -1130,14 +1121,13 @@ def add3(
     b: torch.Tensor,
     c: torch.Tensor,
     *,
-    enable_pdl: bool | None = None,
+    enable_pdl: bool,
 ) -> torch.Tensor:
     """Elementwise ``a + b + c`` in one kernel (fp32 accumulate, a's dtype out).
 
     Args:
         a/b/c: same-shape contiguous CUDA tensors.
-        enable_pdl: Join an SM90+ Programmatic Dependent Launch chain;
-            defaults to the platform setting.
+        enable_pdl: Join an SM90+ Programmatic Dependent Launch chain when true.
 
     Returns:
         New tensor of ``a``'s dtype.
@@ -1150,7 +1140,6 @@ def add3(
     rows, cols = a.shape
     out = torch.empty_like(a, memory_format=torch.contiguous_format)
     BLOCK = 1024
-    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _add3_kernel[(rows, (cols + BLOCK - 1) // BLOCK)](
         a,
@@ -1200,7 +1189,8 @@ def _attnres_partial_kernel(
     mask1 = col1 < n_cols
 
     if ENABLE_PDL:
-        # Wait for the predecessor's stores; release dependents immediately.
+        # The successor waits before reading our scratch; release it now so
+        # it can prefetch ready weights while this partial is running.
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -1270,7 +1260,8 @@ def _attnres_partial_dual_kernel(
     mask1 = col1 < n_cols
 
     if ENABLE_PDL:
-        # Wait for the predecessor's stores; release dependents immediately.
+        # The successor waits before reading our scratch; release it now so
+        # it can prefetch ready weights while this partial is running.
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -1342,9 +1333,9 @@ def _attnres_combine_kernel(
 ):
     """Fold the prefix candidate into the block partial; optional out-norm.
 
-    All operands are read once and stay register-resident. Under PDL all but
-    the prefix are prefetched before ``gdc_wait``, so the caller must ensure
-    the immediate same-stream predecessor writes only the prefix.
+    All operands are read once and stay register-resident. Under PDL the
+    weights are prefetched before ``gdc_wait``; scratch and prefix are read
+    afterward. The caller must ensure the weights are already ready.
     """
     t = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
@@ -1358,18 +1349,18 @@ def _attnres_combine_kernel(
 
     wp0 = tl.load(wp_ptr + col0, mask=mask0, other=0.0).to(tl.float32)
     wp1 = tl.load(wp_ptr + col1, mask=mask1, other=0.0).to(tl.float32)
-    m_b = tl.load(m_ptr + t)
-    s_b = tl.load(s_ptr + t)
-    a0 = tl.load(acc_ptr + t * n_cols + col0, mask=mask0, other=0.0)
-    a1 = tl.load(acc_ptr + t * n_cols + col1, mask=mask1, other=0.0)
     if HAS_OUTNORM:
         ow0 = tl.load(outw_ptr + col0, mask=mask0, other=0.0).to(tl.float32)
         ow1 = tl.load(outw_ptr + col1, mask=mask1, other=0.0).to(tl.float32)
 
     if ENABLE_PDL:
-        # The prefix is the predecessor's output; everything above is not.
+        # The predecessor may still be writing scratch and prefix.
         tl.extra.cuda.gdc_wait()
 
+    m_b = tl.load(m_ptr + t)
+    s_b = tl.load(s_ptr + t)
+    a0 = tl.load(acc_ptr + t * n_cols + col0, mask=mask0, other=0.0)
+    a1 = tl.load(acc_ptr + t * n_cols + col1, mask=mask1, other=0.0)
     v0 = tl.load(prefix_ptr + t * stride_p + col0, mask=mask0, other=0.0).to(tl.float32)
     v1 = tl.load(prefix_ptr + t * stride_p + col1, mask=mask1, other=0.0).to(tl.float32)
     sq = tl.sum(v0 * v0) + tl.sum(v1 * v1)
@@ -1411,15 +1402,13 @@ def _attnres_combine_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-def attnres_partial(blocks, wp, eps, scratch, *, enable_pdl: bool | None = None):
+def attnres_partial(blocks, wp, eps, scratch, *, enable_pdl: bool):
     """Blocks-side online-softmax partial. scratch = (m [T], s [T], acc [T,H] fp32).
 
-    ``enable_pdl`` joins an SM90+ Programmatic Dependent Launch chain;
-    defaults to the platform setting.
+    ``enable_pdl`` joins an SM90+ Programmatic Dependent Launch chain when true.
     """
     KB, T, H = blocks.shape
     m, s_, acc = scratch
-    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _attnres_partial_kernel[(T,)](
         blocks,
@@ -1447,7 +1436,7 @@ def attnres_partial_dual(
     scratch_a,
     scratch_b,
     *,
-    enable_pdl: bool | None = None,
+    enable_pdl: bool,
 ):
     """Both mix partials (mlp-side A, next-layer attn-side B) in one sweep.
 
@@ -1456,13 +1445,11 @@ def attnres_partial_dual(
         wp_a/wp_b: precomputed ``rms_w * res_w`` products per side (``[H]``).
         eps: shared RMS epsilon.
         scratch_a/scratch_b: (m [T], s [T], acc [T, H] fp32) per side.
-        enable_pdl: Join an SM90+ Programmatic Dependent Launch chain;
-            defaults to the platform setting.
+        enable_pdl: Join an SM90+ Programmatic Dependent Launch chain when true.
     """
     KB, T, H = blocks.shape
     m_a, s_a, acc_a = scratch_a
     m_b, s_b, acc_b = scratch_b
-    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _attnres_partial_dual_kernel[(T,)](
         blocks,
@@ -1486,22 +1473,21 @@ def attnres_partial_dual(
     )
 
 
-def attnres_combine(prefix, wp, out_norm_w, eps, scratch, out, enable_pdl=None):
+def attnres_combine(prefix, wp, out_norm_w, eps, scratch, out, *, enable_pdl: bool):
     """Merge the prefix candidate into the partial; optional fused out-norm.
 
     Args:
         prefix: ``[T, H]`` residual stream.
         scratch: (m, s, acc) from :func:`attnres_partial`.
         out: ``[T, H]`` mixed (and out-normed) hidden destination.
-        enable_pdl: programmatic dependent launch, defaulting to the platform
-            setting; prefetches everything but the prefix before ``gdc_wait``.
+        enable_pdl: programmatic dependent launch; prefetches weights before
+            ``gdc_wait`` and reads scratch and prefix afterward.
 
     Returns:
         ``out``.
     """
     T, H = prefix.shape
     m, s_, acc = scratch
-    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _attnres_combine_kernel[(T,)](
         prefix,

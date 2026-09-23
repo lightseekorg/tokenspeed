@@ -183,6 +183,12 @@ setup, never publishes results; each kernel may delay it for performance.
 Streaming top-k, for example, avoids delaying scoring waves with waiting
 merge CTAs. Graphs retain their captured PDL setting; recapture to change it.
 
+AttnRes partial kernels may trigger their successors before writing partial
+scratch. `attnres_combine` may preload only weights known to be independent of
+its predecessor; it waits before loading the prefix and the partial scratch
+(`m`, `s`, `acc`). A PDL trigger permits early launch but does not publish
+stores, and a later wait cannot repair values already loaded into registers.
+
 Gated RMSNorm preloads weights only with `weights_independent`; a contiguous
 copy disables this preload. At RSAG-to-AR boundaries the next combine-norm
 preloads the all-gathered residual before its wait, so that collective must

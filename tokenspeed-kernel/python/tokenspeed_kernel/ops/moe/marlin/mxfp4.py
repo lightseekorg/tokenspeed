@@ -40,7 +40,7 @@ from tokenspeed_kernel.ops.moe.marlin.deepep_layout import (
     pack_recv_rows,
     unpack_recv_rows,
 )
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.thirdparty.cuda.marlin import gptq_marlin_repack
@@ -335,13 +335,16 @@ def marlin_mxfp4_local_moe_apply(
         linear_beta = getattr(w, "activation_situ_linear_beta", None)
         intermediate2 = situ_and_mul(
             intermediate1,
+            enable_pdl=pdl_enabled(),
             beta=beta,
             linear_beta=None if linear_beta is None else float(linear_beta),
         )
     else:
         from tokenspeed_kernel.ops.activation.triton import silu_and_mul
 
-        intermediate2 = silu_and_mul(intermediate1, limit=_swiglu_limit(w))
+        intermediate2 = silu_and_mul(
+            intermediate1, limit=_swiglu_limit(w), enable_pdl=pdl_enabled()
+        )
 
     # GEMM2: fold the route weights in (mul_topk_weights) so finalize is a
     # plain sum over top_k. EP-masked routes wrote nothing, so zero-init c.
