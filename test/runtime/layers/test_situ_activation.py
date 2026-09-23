@@ -88,6 +88,9 @@ def test_linear_beta_saturates_up_branch():
 
 @pytest.fixture
 def disable_pdl():
+    if not torch.cuda.is_available():
+        yield
+        return
     previous = pdl_enabled()
     pdl_enabled(overwrite=False)
     yield
