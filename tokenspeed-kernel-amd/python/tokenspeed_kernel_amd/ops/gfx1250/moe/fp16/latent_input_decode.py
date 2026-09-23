@@ -33,6 +33,7 @@ dtype, and the shared branch its gate and up halves combined.
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.moe.latent_input import packed_projection_weight_view
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
 _HIDDEN = 7168
@@ -297,6 +298,17 @@ def launch_gluon_latent_input_decode_gfx1250(
             raise ValueError(f"Kimi K3 {name} must be contiguous on GPU")
         if tensor.device != hidden_states.device:
             raise ValueError("Kimi K3 MoE input tensors must be colocated")
+    if packed_projection_weight_view(
+        router_weight, routed_down_weight, shared_gate_up_weight
+    ) is not packed_weight and not (
+        packed_weight.data_ptr() == router_weight.data_ptr()
+        and packed_weight.untyped_storage().data_ptr()
+        == router_weight.untyped_storage().data_ptr()
+    ):
+        raise ValueError(
+            "Kimi K3 packed weight must be the consecutive view of the "
+            "router, routed, and shared weights"
+        )
     if tokens <= 0:
         raise ValueError("projection needs at least one token")
     if beta <= 0.0 or (linear_beta is not None and linear_beta <= 0.0):

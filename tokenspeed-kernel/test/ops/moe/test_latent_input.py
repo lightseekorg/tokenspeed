@@ -243,3 +243,63 @@ def test_gfx1250_latent_input_prefill_matches(tokens: int) -> None:
     torch.testing.assert_close(router, expected_router, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(routed, expected_routed, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(shared, expected_shared, atol=2e-2, rtol=2e-2)
+
+
+def _k3_weights():
+    """The real Kimi K3 projection shapes, which the gfx1250 traits require."""
+    widths = (896, 3584, 1536)
+    packed = torch.randn(sum(widths), 7168, dtype=torch.bfloat16, device="cuda")
+    return packed, list(packed.split(widths))
+
+
+@pytest.mark.skipif(
+    not current_platform().is_cdna5,
+    reason="requires the gfx1250 latent-input kernels",
+)
+@pytest.mark.parametrize(
+    ("tokens", "expected"),
+    [
+        (1, "gluon_latent_input_decode_gfx1250"),
+        (32, "gluon_latent_input_decode_gfx1250"),
+        (8192, "gluon_latent_input_prefill_gfx1250"),
+    ],
+)
+def test_gfx1250_latent_input_dispatch_selects_by_tokens(
+    tokens: int, expected: str
+) -> None:
+    """Automatic selection must land on the same kernel an override picks.
+
+    Two kernels over the same shape do not agree bit for bit, so matching the
+    override exactly is what shows dispatch chose that one rather than the
+    portable fallback.
+    """
+    _packed, views = _k3_weights()
+    hidden = torch.randn(tokens, 7168, dtype=torch.bfloat16, device="cuda")
+    automatic = latent_moe_input_projections(
+        hidden, *views, gate_clamp=4.0, up_clamp=25.0
+    )
+    overridden = latent_moe_input_projections(
+        hidden, *views, gate_clamp=4.0, up_clamp=25.0, override=expected
+    )
+    for chosen, forced in zip(automatic, overridden, strict=True):
+        torch.testing.assert_close(chosen, forced, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(
+    not current_platform().is_cdna5,
+    reason="requires the gfx1250 latent-input kernels",
+)
+def test_gfx1250_launchers_reject_a_foreign_packed_weight() -> None:
+    """The kernels read only the packed tensor, so it has to be the real view."""
+    from tokenspeed_kernel_amd.ops.gfx1250.moe.fp16.latent_input_decode import (
+        launch_gluon_latent_input_decode_gfx1250,
+    )
+
+    _packed, views = _k3_weights()
+    _other, other_views = _k3_weights()
+    foreign = packed_projection_weight_view(*other_views)
+    hidden = torch.randn(1, 7168, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="consecutive view"):
+        launch_gluon_latent_input_decode_gfx1250(
+            hidden, *views, foreign, beta=4.0, linear_beta=25.0
+        )
