@@ -213,6 +213,7 @@ def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
             assert (
                 flag_value(server_tokens, "--download-dir") == "${PWD}/.hf-model-cache"
             )
+            assert task["server"]["ready"]["timeout"] == 3600
             assert "--enable-expert-parallel" not in server_tokens
             assert "--moe-backend" not in server_tokens
             # Not yet exercised on AMD; keep that gate on eager prefill.
