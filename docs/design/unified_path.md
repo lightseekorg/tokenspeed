@@ -635,6 +635,43 @@ verify workspace when the target width is one, even with a draft model
 attached; this includes the inherited GDN/PLE staging budget and PLE commit
 rows.
 
+## PLE global vocabulary lookup
+
+Qwen4-Exp keeps one vocabulary-sharded n-gram table per pipeline stage,
+across attention DP and TP ranks. Pure TP retains its existing lookup and
+all-reduce. With DP, each attention-TP lane all-gathers n-gram IDs over its
+DP group before reading the table. Query order is DP-major, with token extents
+from `ForwardContext.global_num_tokens` (including graph padding). Integer IDs
+use the generic all-gather-single interface, not activation-specific RSAG.
+All ranks, including idle ranks with int32 token inputs, send int64 n-gram IDs.
+Unequal DP batches pad only for communication; received padding is removed.
+Graph padding inside a DP extent is zero-filled and discarded with the local
+valid-token slice. Context/conv state and verify scratch remain DP-local.
+
+Host gather runs on its existing side stream. When consuming its result, every
+rank joins the stage-wide all-reduce, then takes its DP slice. Device-resident
+tables use the same query/reduction layout. An idle DP rank owns table rows
+needed by active peers and must participate in both collectives before returning
+its empty output. Only an entirely empty global lookup skips communication.
+Model construction records PLE layers in execution order; the forward prefetch
+entry visits that same order on every rank. No cross-DP collective is added
+to the side stream. DP combined with attention CP is rejected at construction
+until CP's query ownership is represented in this layout.
+
+`PLELookup.start(ids, layout)` owns table reads and returns one `PendingLookup`;
+`finish` waits on its completion event, reduces a two-dimensional compute-dtype
+buffer and returns the local valid rows. Each instance permits one pending
+lookup; foreign handles and repeated consumption are rejected. IDs are
+contiguous int64 and `LookupTokenLayout` stores immutable physical extents.
+Both host and device reads establish a dependency on the consuming stream.
+Storage and scales live under `ple_embedding.lookup`; the model loader maps
+existing checkpoint table keys to that path without registering a second table.
+`_PleExecutionPlan` remains in the PLE layer and owns history/conv/verify state.
+
+The CPU/Gloo regression in `test/runtime/test_ple_global_lookup.py` covers
+uneven and idle DP batches, TP x DP, physical padding and pipeline stage offsets.
+CUDA host-gather and graph tests remain necessary for hardware validation.
+
 ## One block-table route: router + leaves
 
 The layering between the scheduler's block vocabulary and the kernels' page

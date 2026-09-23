@@ -165,6 +165,7 @@ class DistributedInitializer:
             device_id=device_id,
         )
         pg_manager.init_process_group(config.mapping.world_group)
+        pg_manager.init_process_group(config.mapping.attn.world_group)
         pg_manager.init_process_group(config.mapping.attn.tp_group)
         # A DCP group of one is still the group the decode path collectives
         # address; init_process_group is idempotent and handles size 1.
