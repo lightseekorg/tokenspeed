@@ -75,6 +75,7 @@ class TritonAllReduceBackend(CommBackend):
             attnres_max_numel=0,
             attnres_max_rows=0,
             enable_lamport=False,
+            moe_tail_max_rows=0,
             max_tokens=0,
             hidden_size=0,
             max_numel=self._max_numel,
@@ -93,6 +94,7 @@ class TritonAllReduceBackend(CommBackend):
         attnres_max_numel: int,
         attnres_max_rows: int,
         enable_lamport: bool,
+        moe_tail_max_rows: int,
         dtype: torch.dtype,
     ) -> bool:
         """Allocate or reuse an Iris state with the requested path capacities.
@@ -104,6 +106,7 @@ class TritonAllReduceBackend(CommBackend):
             attnres_max_numel: Maximum fused AttnRes payload in elements.
             attnres_max_rows: Maximum fused AttnRes payload in rows.
             enable_lamport: Allow Lamport for eligible producer-direct payloads.
+            moe_tail_max_rows: Capacity of the borrowed K3 MoE result; zero disables it.
             dtype: Element type shared by the prepared paths.
 
         Returns:
@@ -120,6 +123,7 @@ class TritonAllReduceBackend(CommBackend):
             producer_direct_max_numel * dtype.itemsize,
             attnres_max_numel,
             attnres_max_rows,
+            moe_tail_max_rows,
         )
         if min(requested) < 0 or not any(requested):
             raise ValueError(f"invalid all-reduce buffer capacities: {requested}")
@@ -139,6 +143,7 @@ class TritonAllReduceBackend(CommBackend):
                 state.max_bytes,
                 state.attnres_max_numel,
                 state.max_token_num,
+                state.moe_tail_max_rows,
             )
             if any(have < need for have, need in zip(available, requested)):
                 raise RuntimeError(
@@ -159,6 +164,7 @@ class TritonAllReduceBackend(CommBackend):
             attnres_max_numel=attnres_max_numel,
             attnres_max_rows=attnres_max_rows,
             enable_lamport=enable_lamport,
+            moe_tail_max_rows=moe_tail_max_rows,
         )
         initialize_all_reduce_state(state, dtype)
         self._instances[group] = state

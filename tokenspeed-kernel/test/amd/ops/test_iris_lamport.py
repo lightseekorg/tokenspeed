@@ -180,6 +180,7 @@ def _new_state(rank, device, capacity, dtype):
 
     return create_iris_state(
         enable_lamport=True,
+        moe_tail_max_rows=0,
         group=dist.group.WORLD,
         rank_in_group=rank,
         staged_max_numel=0,

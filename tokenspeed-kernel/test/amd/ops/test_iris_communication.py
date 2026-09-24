@@ -94,17 +94,18 @@ def test_iris_state_uses_path_capacities(monkeypatch, enable_lamport):
         group=object(),
         rank_in_group=0,
         max_numel=16,
-        max_bytes=64,
+        max_bytes=8192 * 10752 * 2,
         attnres_max_numel=55,
         max_token_num=5,
         enable_lamport=enable_lamport,
+        moe_tail_max_rows=0,
         device=torch.device("cpu"),
     )
 
     iris_state = triton_ops._get_or_create_iris_state(state, torch.bfloat16)
 
     assert iris_state.staged_max_numel == 16
-    assert iris_state.producer_direct_max_numel == 32
+    assert iris_state.producer_direct_max_numel == 8192 * 10752
     assert iris_state.attnres_max_numel == 55
     assert iris_state.attnres_max_rows == 5
     assert iris_state.enable_lamport is enable_lamport
@@ -116,6 +117,17 @@ def test_iris_state_uses_path_capacities(monkeypatch, enable_lamport):
     assert other is not iris_state
     assert other.enable_lamport is not enable_lamport
     assert len(created) == 2
+
+    # Equal producer capacities do not make a state without a result buffer
+    # compatible with a request that borrows one. This also exercises the key.
+    state.moe_tail_max_rows = 512
+    with_result = triton_ops._get_or_create_iris_state(state, torch.bfloat16)
+    assert with_result is not other
+    assert with_result.moe_tail_max_rows == 512
+    assert len(created) == 3
+    state.moe_tail_max_rows = 256
+    assert triton_ops._get_or_create_iris_state(state, torch.bfloat16) is with_result
+    assert len(created) == 3
 
 
 @pytest.mark.parametrize("prepared_lamport", [False, True])
@@ -138,6 +150,7 @@ def test_iris_state_reuses_prepared_capacity(
         attnres_max_numel=32,
         attnres_max_rows=4,
         enable_lamport=prepared_lamport,
+        moe_tail_max_rows=0,
     )
     iris_ops = SimpleNamespace(
         IRIS_AR_STATES={"prepared": prepared},
@@ -154,6 +167,7 @@ def test_iris_state_reuses_prepared_capacity(
         attnres_max_numel=8,
         max_token_num=1,
         enable_lamport=requested_lamport,
+        moe_tail_max_rows=0,
         device=device,
     )
 
@@ -493,6 +507,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
         staged_max_numel = max(staged_max_numel, attnres_max_numel)
         state = create_iris_state(
             enable_lamport=False,
+            moe_tail_max_rows=0,
             group=dist.group.WORLD,
             rank_in_group=rank,
             staged_max_numel=staged_max_numel,
@@ -630,6 +645,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
 
         fp16_state = create_iris_state(
             enable_lamport=False,
+            moe_tail_max_rows=0,
             group=dist.group.WORLD,
             rank_in_group=rank,
             staged_max_numel=0,
@@ -658,6 +674,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
 
         fp32_state = create_iris_state(
             enable_lamport=False,
+            moe_tail_max_rows=0,
             group=dist.group.WORLD,
             rank_in_group=rank,
             staged_max_numel=0,
@@ -1048,6 +1065,7 @@ def _ar_subgroup_worker_fn(rank, world_size, port, error_dict):
 
         state = create_iris_state(
             enable_lamport=False,
+            moe_tail_max_rows=0,
             group=group,
             rank_in_group=group_rank,
             staged_max_numel=4 * 7,

@@ -789,6 +789,7 @@ class IrisAllReduce(object):
         attnres_max_numel: int,
         attnres_max_rows: int,
         enable_lamport: bool,
+        moe_tail_max_rows: int,
         dtype: torch.dtype,
         heap_size: int | None,
         device: torch.device | None,
@@ -812,6 +813,7 @@ class IrisAllReduce(object):
         self.attnres_max_numel = attnres_max_numel
         self.attnres_max_rows = attnres_max_rows
         self.enable_lamport = enable_lamport
+        self.moe_tail_max_rows = moe_tail_max_rows
         self.dtype = dtype
         self.device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
         self.world_size = group.size()
@@ -821,6 +823,7 @@ class IrisAllReduce(object):
                 producer_direct_max_numel,
                 attnres_max_numel,
                 attnres_max_rows,
+                moe_tail_max_rows,
             )
             < 0
         ):
@@ -834,6 +837,17 @@ class IrisAllReduce(object):
         staged_config = self._kernel_config.staged
         two_stage_config = self._kernel_config.two_stage
         moe_config = self._kernel_config.kimi_k3_moe
+        if moe_tail_max_rows and not (
+            _platform.is_cdna4
+            and self.world_size == 8
+            and dtype == torch.bfloat16
+            and moe_tail_max_rows <= 8192
+            and moe_tail_max_rows % 8 == 0
+            and moe_tail_max_rows * moe_config.row_numel <= producer_direct_max_numel
+        ):
+            raise ValueError(
+                "K3 MoE result requires TP8 BF16 producer capacity on CDNA4"
+            )
         self._elements_per_word = (
             self._kernel_config.packed_word_bytes // dtype.itemsize
         )
@@ -942,6 +956,12 @@ class IrisAllReduce(object):
                 + flag_numel * torch.int32.itemsize
                 + (16 << 20),
             )
+            # Preserve the base heap's headroom for other collective states.
+            if moe_tail_max_rows:
+                heap_size += (
+                    moe_tail_max_rows * moe_config.hidden_size * dtype.itemsize
+                    + 128 * self.world_size * torch.int32.itemsize
+                )
 
         free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
         self._ctx = _get_or_create_iris_context(heap_size)
@@ -951,6 +971,18 @@ class IrisAllReduce(object):
         self._input_buf = (
             self._ctx.zeros((producer_direct_max_numel,), dtype=dtype)
             if producer_direct_max_numel
+            else None
+        )
+        # One borrowed residual handoff, separate from every producer and
+        # collective workspace. Prepared before cache sizing and graph capture.
+        self._moe_tail_output_buf = (
+            self._ctx.empty((moe_tail_max_rows, moe_config.hidden_size), dtype=dtype)
+            if moe_tail_max_rows
+            else None
+        )
+        self._moe_tail_ready_flags = (
+            self._ctx.zeros((128, self.world_size), dtype=torch.int32)
+            if moe_tail_max_rows
             else None
         )
         self._attnres_push_inbox = (
@@ -3010,6 +3042,7 @@ def create_iris_state(
     attnres_max_numel: int,
     attnres_max_rows: int,
     enable_lamport: bool,
+    moe_tail_max_rows: int,
     dtype: torch.dtype,
     heap_size: int | None,
     device: torch.device | None,
@@ -3024,6 +3057,7 @@ def create_iris_state(
         attnres_max_numel: Maximum fused attention/AttnRes payload.
         attnres_max_rows: Maximum fused attention/AttnRes rows.
         enable_lamport: Allow Lamport for eligible producer-direct payloads.
+        moe_tail_max_rows: Capacity of the borrowed K3 MoE result; zero disables it.
         dtype: Element type for all payload buffers.
         heap_size: Optional symmetric heap size in bytes.
         device: Device on which buffers are allocated.
@@ -3039,6 +3073,7 @@ def create_iris_state(
         attnres_max_numel=attnres_max_numel,
         attnres_max_rows=attnres_max_rows,
         enable_lamport=enable_lamport,
+        moe_tail_max_rows=moe_tail_max_rows,
         dtype=dtype,
         heap_size=heap_size,
         device=device,

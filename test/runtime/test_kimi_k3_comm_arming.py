@@ -73,11 +73,19 @@ def test_arming_requires_fused_moe_ar():
 
 
 @needs_iris
-def test_iris_preparation_caps_attnres_for_equal_tp8_groups(monkeypatch):
+@pytest.mark.parametrize("pp_size", [1, 2])
+@pytest.mark.parametrize(
+    "max_rows,tail_rows",
+    [(511, 0), (512, 512), (519, 512), (8192, 8192), (16384, 8192)],
+)
+def test_iris_preparation_caps_attnres_for_equal_tp8_groups(
+    monkeypatch, pp_size, max_rows, tail_rows
+):
     from tokenspeed.runtime.models import kimi_k3_comm
 
     group = tuple(range(8))
     mapping = SimpleNamespace(
+        pp_size=pp_size,
         attn=SimpleNamespace(tp_size=8, tp_group=group),
         moe=SimpleNamespace(tp_size=8, ep_size=1, tp_ep_size=8, tp_ep_group=group),
     )
@@ -93,15 +101,16 @@ def test_iris_preparation_caps_attnres_for_equal_tp8_groups(monkeypatch):
         mapping=mapping,
         hidden_size=7168,
         routed_hidden_size=3584,
-        max_num_tokens=16384,
+        max_num_tokens=max_rows,
     )
     prepare.assert_called_once_with(
         group,
-        staged_max_numel=8192 * 7168,
-        producer_direct_max_numel=8192 * (7168 + 3584),
+        staged_max_numel=min(max_rows, 8192) * 7168,
+        producer_direct_max_numel=min(max_rows, 8192) * (7168 + 3584),
         attnres_max_numel=16 * 7168,
         attnres_max_rows=16,
         enable_lamport=True,
+        moe_tail_max_rows=tail_rows if pp_size == 1 else 0,
         dtype=torch.bfloat16,
         backend=None,
     )
@@ -114,6 +123,7 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
     attn_group = (0, 1, 2, 3)
     moe_group = tuple(range(8))
     mapping = SimpleNamespace(
+        pp_size=1,
         attn=SimpleNamespace(tp_size=4, tp_group=attn_group),
         moe=SimpleNamespace(tp_ep_size=8, tp_ep_group=moe_group),
     )
@@ -139,6 +149,7 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
             attnres_max_numel=0,
             attnres_max_rows=0,
             enable_lamport=False,
+            moe_tail_max_rows=0,
             dtype=torch.bfloat16,
             backend=None,
         ),
@@ -149,6 +160,7 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
             attnres_max_numel=0,
             attnres_max_rows=0,
             enable_lamport=False,
+            moe_tail_max_rows=0,
             dtype=torch.bfloat16,
             backend=None,
         ),
@@ -162,6 +174,7 @@ def test_iris_preparation_handles_moe_only_group(monkeypatch):
     attn_group = (0,)
     moe_group = tuple(range(8))
     mapping = SimpleNamespace(
+        pp_size=1,
         attn=SimpleNamespace(tp_size=1, tp_group=attn_group),
         moe=SimpleNamespace(tp_ep_size=8, tp_ep_group=moe_group),
     )
@@ -186,6 +199,7 @@ def test_iris_preparation_handles_moe_only_group(monkeypatch):
         attnres_max_numel=0,
         attnres_max_rows=0,
         enable_lamport=False,
+        moe_tail_max_rows=0,
         dtype=torch.bfloat16,
         backend=None,
     )
@@ -197,6 +211,7 @@ def test_iris_preparation_keeps_baseline_window_for_equal_tp4(monkeypatch):
 
     group = tuple(range(4))
     mapping = SimpleNamespace(
+        pp_size=1,
         attn=SimpleNamespace(tp_size=4, tp_group=group),
         moe=SimpleNamespace(tp_ep_size=4, tp_ep_group=group),
     )
@@ -221,6 +236,7 @@ def test_iris_preparation_keeps_baseline_window_for_equal_tp4(monkeypatch):
         attnres_max_numel=0,
         attnres_max_rows=0,
         enable_lamport=False,
+        moe_tail_max_rows=0,
         dtype=torch.bfloat16,
         backend=None,
     )
@@ -430,6 +446,124 @@ def test_arming_declines_when_any_probe_or_peer_says_no(
     state = mod.K3AttnCommState(mapping=_ARMING_MAPPING, hidden_size=7168)
     assert state.cute_ar is None
     assert rec["builder"].call_count == 0
+
+
+@pytest.mark.parametrize(
+    "rows,producer_direct,tp,ep,narrowed,solution,accepted,attempted,pp_size",
+    [
+        (1, True, 8, 1, False, "auto", True, False, 1),
+        (48, True, 8, 1, False, "auto", True, False, 1),
+        (504, True, 8, 1, False, "auto", True, False, 1),
+        (512, True, 8, 1, False, "auto", True, True, 1),
+        (848, True, 8, 1, False, "auto", True, True, 1),
+        (8192, True, 8, 1, False, "auto", True, True, 1),
+        (8200, True, 8, 1, False, "auto", True, False, 1),
+        (8192, False, 8, 1, False, "auto", True, False, 1),
+        (8192, True, 1, 8, False, "auto", True, False, 1),
+        (8192, True, 8, 1, True, "auto", True, False, 1),
+        (8192, True, 8, 1, False, "torch", True, False, 1),
+        (8192, True, 8, 1, False, "auto", False, True, 1),
+        (8192, True, 8, 1, False, "auto", True, False, 2),
+    ],
+)
+@pytest.mark.parametrize("has_norm", [False, True])
+def test_row_sharded_moe_tail_selection_and_fallback(
+    monkeypatch,
+    rows,
+    producer_direct,
+    tp,
+    ep,
+    narrowed,
+    solution,
+    accepted,
+    attempted,
+    has_norm,
+    pp_size,
+):
+    from tokenspeed.runtime.models import kimi_k3_comm as mod
+
+    # Meta tensors keep this a plumbing test. Distributed numerical tests
+    # exercise the actual prepared owner and the kernel's eligibility checks.
+    routed = torch.empty((rows, 3584), dtype=torch.bfloat16, device="meta")
+    shared = torch.empty((rows, 7168), dtype=torch.bfloat16, device="meta")
+    prefix = torch.empty_like(shared)
+    expected = torch.empty_like(shared)
+    fallback = torch.empty_like(shared)
+    group = tuple(range(8))
+    process_group = object()
+    norm = (
+        SimpleNamespace(
+            weight=torch.empty(3584, dtype=torch.bfloat16, device="meta"),
+            variance_epsilon=1e-5,
+        )
+        if has_norm
+        else None
+    )
+    projection = SimpleNamespace(
+        narrowed=narrowed,
+        solution=solution,
+        weight=torch.empty((7168, 3584), dtype=torch.bfloat16, device="meta"),
+    )
+    owner = SimpleNamespace(
+        mapping=SimpleNamespace(
+            pp_size=pp_size,
+            attn=SimpleNamespace(tp_size=8, tp_group=group),
+            moe=SimpleNamespace(tp_size=tp, ep_size=ep, tp_ep_group=group),
+        ),
+        routed_hidden=3584,
+        routed_norm=norm,
+        up_proj=projection,
+        execution_plan=SimpleNamespace(
+            lane_latent_norm_ar=False, comm_fusion_max_num_tokens=16
+        ),
+        _projection_tail=Mock(return_value=fallback),
+    )
+    candidate = Mock(return_value=expected if accepted else None)
+    joined = Mock(return_value=(routed, shared))
+    resolve = Mock(return_value=process_group)
+    monkeypatch.setattr(mod, "iris_kimi3_moe_tail", candidate)
+    monkeypatch.setattr(mod, "kimi3_join_reduce_moe", joined)
+    monkeypatch.setattr(mod, "_get_process_group", resolve)
+    symm_outputs = (routed, shared) if producer_direct else None
+
+    output = mod.K3MoeTailComm._tail_fused_lane_ar_replicated(
+        owner, routed, shared, prefix, None, symm_outputs, rows, 7168
+    )
+
+    if attempted:
+        candidate.assert_called_once_with(
+            routed,
+            shared,
+            prefix,
+            projection.weight,
+            norm_weight=norm.weight if has_norm else None,
+            eps=norm.variance_epsilon if has_norm else None,
+            group=process_group,
+        )
+        resolve.assert_called_once_with(group)
+    else:
+        candidate.assert_not_called()
+        resolve.assert_not_called()
+    if attempted and accepted:
+        assert output is expected
+        joined.assert_not_called()
+        owner._projection_tail.assert_not_called()
+    else:
+        assert output is fallback
+        joined.assert_called_once_with(
+            routed,
+            shared,
+            lane=None,
+            symm_outputs=symm_outputs,
+            routed_hidden=3584,
+            routed_norm=norm,
+            group=group,
+            enable_lane_norm=False,
+            max_token_num=16,
+        )
+        owner._projection_tail.assert_called_once_with(
+            routed, shared, prefix, rows, 7168
+        )
 
 
 if __name__ == "__main__":

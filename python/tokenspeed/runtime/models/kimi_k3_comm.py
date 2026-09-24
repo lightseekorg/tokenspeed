@@ -57,6 +57,7 @@ from tokenspeed_kernel.ops.communication.multimem import (
     multimem_prealloc,
     multimem_stage,
 )
+from tokenspeed_kernel.ops.moe.iris import iris_kimi3_moe_tail
 from tokenspeed_kernel.ops.moe.latent_tail import (
     KimiK3LatentTailOp,
     attn_reduce_shape_supported,
@@ -87,6 +88,7 @@ logger = logging.getLogger(__name__)
 
 _IRIS_MAX_TOKENS = 8192
 _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS = 48
+_IRIS_MOE_ROW_SHARD_MIN_TOKENS = 512
 
 # Widest reduce this instance is built for; it becomes the collective's max_m.
 ATTN_AR_MAX_TOKENS = 8
@@ -222,12 +224,13 @@ def prepare_k3_all_reduce_buffers(
     )
     groups_are_equal = mapping.attn.tp_group == mapping.moe.tp_ep_group
     # The Lamport crossover was measured with attention TP8 and MoE TP8.
-    enable_lamport = (
+    tp8_moe = (
         groups_are_equal
         and mapping.attn.tp_size == 8
         and mapping.moe.tp_size == 8
         and mapping.moe.ep_size == 1
     )
+    enable_lamport = tp8_moe
     # Keep the full producer-direct window for equal TP8 groups. Its 50K/500
     # C16 gain survives content-sensitive EAGLE3 trajectories; retain 48 tokens
     # for other mappings.
@@ -238,6 +241,15 @@ def prepare_k3_all_reduce_buffers(
         max_num_tokens
         if expand_moe_window
         else min(max_num_tokens, _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS)
+    )
+    # Reserve the reusable PP1 residual before cache sizing.
+    moe_tail_max_rows = (
+        max_num_tokens // 8 * 8
+        if tp8_moe
+        and mapping.pp_size == 1
+        and (hidden_size, routed_hidden_size) == (7168, 3584)
+        and max_num_tokens >= _IRIS_MOE_ROW_SHARD_MIN_TOKENS
+        else 0
     )
     prepared = False
     if mapping.attn.tp_size > 1:
@@ -252,6 +264,7 @@ def prepare_k3_all_reduce_buffers(
             attnres_max_numel=attnres_max_rows * hidden_size,
             attnres_max_rows=attnres_max_rows,
             enable_lamport=enable_lamport,
+            moe_tail_max_rows=moe_tail_max_rows,
             dtype=torch.bfloat16,
             backend=None,
         )
@@ -265,6 +278,7 @@ def prepare_k3_all_reduce_buffers(
                 attnres_max_numel=0,
                 attnres_max_rows=0,
                 enable_lamport=False,
+                moe_tail_max_rows=0,
                 dtype=torch.bfloat16,
                 backend=None,
             )
@@ -1237,6 +1251,40 @@ class K3MoeTailComm:
         num_tokens: int,
         hidden_size: int,
     ) -> torch.Tensor:
+        # AMD stores the complete up-projection on every rank. For large
+        # producer-direct batches, reduce token shards and project only this
+        # rank's rows before gathering the final residual. The operation checks
+        # actual producer ownership and declines before launch on a mismatch.
+        if (
+            symm_outputs is not None
+            and self.mapping.pp_size == 1
+            and _IRIS_MOE_ROW_SHARD_MIN_TOKENS <= num_tokens <= _IRIS_MAX_TOKENS
+            and self.mapping.attn.tp_size == 8
+            and self.mapping.moe.tp_size == 8
+            and self.mapping.moe.ep_size == 1
+            and self.mapping.attn.tp_group == self.mapping.moe.tp_ep_group
+            and not self.up_proj.narrowed
+            and self.up_proj.solution == "auto"
+        ):
+            # PP1 keeps the residual inside the model; the tail supports its
+            # next use as an in-place prefix. Taps and final norm own storage.
+            output = iris_kimi3_moe_tail(
+                routed_out,
+                shared_partial,
+                prefix_sum,
+                self.up_proj.weight,
+                norm_weight=(
+                    self.routed_norm.weight if self.routed_norm is not None else None
+                ),
+                eps=(
+                    self.routed_norm.variance_epsilon
+                    if self.routed_norm is not None
+                    else None
+                ),
+                group=_get_process_group(self.mapping.moe.tp_ep_group),
+            )
+            if output is not None:
+                return output
         routed_reduced, shared_reduced = kimi3_join_reduce_moe(
             routed_out,
             shared_partial,
