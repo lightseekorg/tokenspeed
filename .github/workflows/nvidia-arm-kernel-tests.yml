@@ -6,7 +6,6 @@ on:
     paths:
       - ".github/workflows/nvidia-arm-kernel-tests.yml"
       - "test/ci/ut/ut-tokenspeed-kernel-nvidia-arm.yaml"
-      - "tokenspeed-kernel/test/nvidia/thirdparty/test_deep_gemm.py"
       - "tokenspeed-kernel/test/ops/test_attention_dsv4_dcp.py"
       - "tokenspeed-kernel/test/conftest.py"
       - "tokenspeed-kernel/python/**"
@@ -17,7 +16,6 @@ on:
     paths:
       - ".github/workflows/nvidia-arm-kernel-tests.yml"
       - "test/ci/ut/ut-tokenspeed-kernel-nvidia-arm.yaml"
-      - "tokenspeed-kernel/test/nvidia/thirdparty/test_deep_gemm.py"
       - "tokenspeed-kernel/test/ops/test_attention_dsv4_dcp.py"
       - "tokenspeed-kernel/test/conftest.py"
       - "tokenspeed-kernel/python/**"
