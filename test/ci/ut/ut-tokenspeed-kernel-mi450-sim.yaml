@@ -15,7 +15,10 @@ env:
   GFX_ARCH: gfx1250
   # Keep emulation within the PR lane's ten-minute execution budget.
   MI450_SIM_RUN_TIMEOUT: "600"
-  # A ceiling on concurrent simulators. A simulator takes two CPU threads.
+  # Keep rocJITsu from selecting host-wide thread presets: the pod's 32-CPU
+  # cgroup quota does not narrow the host affinity visible inside the runner.
+  MI450_SIM_THREADS_PER_WORKER: "2"
+  # A ceiling on concurrent simulators. Each simulator uses the budget above.
   MI450_SIM_WORKERS: "16"
   # rocJITsu is a functional simulator, so run architecture-specific compile and
   # launch coverage here. Generic tests and the production-sized MXFP4 MoE test
