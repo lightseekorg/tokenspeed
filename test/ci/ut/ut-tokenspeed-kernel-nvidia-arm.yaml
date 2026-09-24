@@ -1,0 +1,26 @@
+api_version: ci.tokenspeed.io/v1
+name: ut-tokenspeed-kernel-nvidia-arm
+type: ut
+workflow_stage: unit-test
+triggers:
+  - slurm
+runner:
+  labels:
+    - slurm-nvidia-arm-4gpu
+slurm:
+  nodes: 1
+  gpus_per_node: 4
+env:
+  CI: "true"
+  CUDA_HOME: /usr/local/cuda-13.4
+  PATH: /usr/local/cuda-13.4/bin:/home/runner/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  LD_LIBRARY_PATH: /usr/local/cuda-13.4/lib64:/opt/tokenspeed-cuda-runtime
+  LD_PRELOAD: /usr/local/cuda-13.4/lib64/libnvrtc.so.13
+  TRITON_PTXAS_PATH: /usr/local/cuda-13.4/bin/ptxas
+install:
+  - python3 -m pip install --break-system-packages pytest==9.1.1 tokenspeed-deepgemm==2.8.0.post20260923 tokenspeed-flashmla==1.0.0.post20260923
+ut:
+  commands:
+    - python3 -m pytest test/ci/ut/test_native_gpu_packages.py -v
+report:
+  github_step_summary: true
