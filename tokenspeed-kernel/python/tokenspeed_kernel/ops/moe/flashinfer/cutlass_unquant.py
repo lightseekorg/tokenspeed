@@ -104,5 +104,9 @@ if platform.is_nvidia:
             tp_rank=getattr(w, "tp_rank", 0),
             tune_max_num_tokens=get_autotune_max_num_tokens(),
             activation_type=ActivationType.Swiglu,
-            enable_pdl=enable_pdl,
+            # PDL races inside this fused-MoE chain on SM90 at decode-sized
+            # batches: a routed GEMM row transiently reads NaN (rerunning the
+            # identical call is clean). Keep the chain fully serialized until
+            # the flashinfer kernels are fixed.
+            enable_pdl=False,
         )[0]
