@@ -146,16 +146,12 @@ env:
     tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_m16_add3_auto_matches_composed_and_captures
     tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_gfx1250_large_m_linear_o_proj_shape_matches
     tokenspeed-kernel/test/ops/gemm/test_routed_gemv.py::test_cdna5_route_admits_decode_shapes[7168-1536-17]
-    # Kimi K3 MoE front end: the latent-input decode kernel at one token
-    # under graph replay and at 17, where the reduction splits four ways
-    # across two row tiles, plus the packed-view guard. Its prefill sibling
-    # starts at 1536 tokens and reuses the large-M kernel, so like the
-    # 512-token projection above it stays on AMD hardware. Then prefill
-    # sigmoid-bias routing with and without weight normalization, and the
-    # fused softmax top-k.
-    tokenspeed-kernel/test/amd/ops/moe/test_gluon_latent_input_gfx1250.py::test_decode_replays_in_a_graph
-    tokenspeed-kernel/test/amd/ops/moe/test_gluon_latent_input_gfx1250.py::test_decode_matches_reference[17]
-    tokenspeed-kernel/test/amd/ops/moe/test_gluon_latent_input_gfx1250.py::test_launcher_rejects_a_packed_weight_that_is_not_the_views[tail]
+    # Kimi K3 MoE front end: prefill sigmoid-bias routing with and without
+    # weight normalization, and the fused softmax top-k. The gfx1250
+    # latent-input kernels are covered on AMD hardware instead. Both drive a
+    # split-K WMMA pipeline with a reduction epilogue over a 6016-column
+    # projection, which does not finish inside the 300s per-test limit here
+    # and starves the other workers while it tries.
     tokenspeed-kernel/test/amd/ops/test_kimi3_sigmoid_topk_amd.py::test_prefill_sigmoid_bias_topk_matches_torch_and_captures[1.0-False]
     tokenspeed-kernel/test/amd/ops/test_kimi3_sigmoid_topk_amd.py::test_prefill_sigmoid_bias_topk_matches_torch_and_captures[2.5-True]
     tokenspeed-kernel/test/ops/moe/test_softmax_topk.py::test_triton_matches_softmax_topk[2-896-16-dtype4-True]
