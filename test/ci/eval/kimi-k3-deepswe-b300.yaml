@@ -48,7 +48,7 @@ server:
     --host 0.0.0.0
     --port 80
     --policy round_robin
-    --engine-startup-timeout 3000
+    --engine-startup-timeout 3600
     --gateway-startup-timeout 600
   ready:
     url: http://127.0.0.1:80/readiness

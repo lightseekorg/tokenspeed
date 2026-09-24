@@ -1890,6 +1890,8 @@ def execute_task(
                     server_command = configure_slurm_server_command(
                         server_command, int(ready["timeout"])
                     )
+                elif not is_amd_runner(runner):
+                    ready["timeout"] = max(int(ready.get("timeout", 600)), 3600)
                 if serve_only:
                     if pgm is not None:
                         command_result = pgm.run(

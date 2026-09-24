@@ -126,7 +126,8 @@ iteration.
   graph replay, with raw samples, resolved registration metadata, and explicit
   failure outcomes.
 - Runtime shape capture feeds replay and tuning workflows; `kernel_scope`
-  scopes are visible in Proton/Chrome traces.
+  scopes are visible in Proton/Chrome traces. The joint BF16 `mm` fast path
+  records the same shape metadata and scopes as registry-selected kernels.
 - End-to-end serving: POST `/start_profile` with
   `{"activities": ["PROTON"]}`, run the workload, then POST `/stop_profile`.
   Each scheduler process — the process where

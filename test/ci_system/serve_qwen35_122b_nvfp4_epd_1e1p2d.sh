@@ -50,6 +50,8 @@ MOE_BACKEND=${MOE_BACKEND:-flashinfer_trtllm}
 ENABLE_MTP=${ENABLE_MTP:-0}
 ENCODE_ROUTING_POLICY=${ENCODE_ROUTING_POLICY:-consistent_hashing}
 LOG_DIR=${EPD_CI_LOG_DIR:-.ci-artifacts/epd-qwen35-122b-1e1p2d}
+# All startup stages share one two-hour budget.
+startup_deadline=$((SECONDS + ${EPD_STARTUP_TIMEOUT:-7200}))
 
 # The E->P embedding ships over Mooncake; pixels go inline over gRPC, sized by
 # TOKENSPEED_GRPC_MAX_MESSAGE_BYTES.
@@ -108,11 +110,9 @@ trap cleanup EXIT INT TERM
 wait_http() {
   local name=$1
   local url=$2
-  local timeout=${3:-1800}
-  local start
-  start=$(date +%s)
-  until curl -fsS "$url" >/dev/null 2>&1; do
-    if (( $(date +%s) - start > timeout )); then
+  local deadline=$3
+  until curl --connect-timeout 2 --max-time 5 -fsS "$url" >/dev/null 2>&1; do
+    if ((SECONDS >= deadline)); then
       echo "[epd-1e1p2d] timed out waiting for $name at $url" >&2
       return 1
     fi
@@ -124,17 +124,15 @@ wait_http() {
 wait_serving() {
   local label=$1
   local pid=$2
-  local timeout=${3:-2400}
+  local deadline=$3
   local log="$LOG_DIR/${label}.log"
-  local start
-  start=$(date +%s)
   until grep -q "health status -> SERVING" "$log" 2>/dev/null; do
     if ! kill -0 "$pid" 2>/dev/null; then
       echo "[epd-1e1p2d] $label exited before reaching SERVING (log=$log)" >&2
       tail -n 200 "$log" >&2 || true
       return 1
     fi
-    if (( $(date +%s) - start > timeout )); then
+    if ((SECONDS >= deadline)); then
       echo "[epd-1e1p2d] timed out waiting for $label to reach SERVING (log=$log)" >&2
       tail -n 200 "$log" >&2 || true
       return 1
@@ -215,11 +213,11 @@ start_worker decode0 decode "$DECODE0_GPUS" "$DECODE0_WS" "$DECODE0_PORT" "$DECO
 start_worker decode1 decode "$DECODE1_GPUS" "$DECODE1_WS" "$DECODE1_PORT" "$DECODE1_DIST_PORT" ""
 
 # Gate on each worker's model-loaded "SERVING" health (registration != loaded).
-wait_serving encode "${pids[0]}" 2400
-wait_serving prefill "${pids[1]}" 2400
-wait_serving decode0 "${pids[2]}" 2400
-wait_serving decode1 "${pids[3]}" 2400
-wait_http encode-bootstrap "http://127.0.0.1:${ENCODE_BOOTSTRAP_PORT}/health" 2400
+wait_serving encode "${pids[0]}" "$startup_deadline"
+wait_serving prefill "${pids[1]}" "$startup_deadline"
+wait_serving decode0 "${pids[2]}" "$startup_deadline"
+wait_serving decode1 "${pids[3]}" "$startup_deadline"
+wait_http encode-bootstrap "http://127.0.0.1:${ENCODE_BOOTSTRAP_PORT}/health" "$startup_deadline"
 
 echo "[epd-1e1p2d] starting smg gateway log=$LOG_DIR/gateway.log"
 python3 -m smg launch \
@@ -245,7 +243,7 @@ python3 -m smg launch \
   >"$LOG_DIR/gateway.log" 2>&1 &
 pids+=("$!")
 
-wait_http lb "http://127.0.0.1:${LB_PORT}/v1/models" 600
+wait_http lb "http://127.0.0.1:${LB_PORT}/v1/models" "$startup_deadline"
 echo "[epd-1e1p2d] serving on http://127.0.0.1:${LB_PORT}/v1"
 
 wait -n "${pids[@]}"

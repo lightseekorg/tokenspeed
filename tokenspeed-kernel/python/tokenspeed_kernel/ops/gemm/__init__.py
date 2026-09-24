@@ -32,7 +32,6 @@ import tokenspeed_kernel.ops.gemm.cuda  # noqa: F401
 import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.gemm.gluon  # noqa: F401
 import tokenspeed_kernel.ops.gemm.ll_bf16  # noqa: F401
-import tokenspeed_kernel.ops.gemm.routed_gemv  # noqa: F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm_cutedsl  # noqa: F401
@@ -43,6 +42,10 @@ from tokenspeed_kernel.ops.gemm.deep_gemm import (
     transform_sf_into_required_layout,
 )
 from tokenspeed_kernel.ops.gemm.flashinfer import (
+    BF16_GEMM_MAX_M,
+    autotune_bf16_gemm,
+    flashinfer_bf16_gemm,
+    flashinfer_joint_bf16_supported,
     has_flashinfer_cute_dsl_nvfp4_a16,
     has_flashinfer_fp8_blockscale,
     has_flashinfer_mxfp8,
@@ -75,6 +78,7 @@ from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
     NoKernelFoundError,
     SelectedKernel,
+    resolve_kernel_override,
     select_kernel,
 )
 from tokenspeed_kernel.signature import (
@@ -1286,6 +1290,7 @@ def mm(
             kernel's prepared layout. This is supported only by FlashInfer's
             FP8 ``[128, 128]`` block-scale GEMM.
     """
+    override = resolve_kernel_override("gemm", "mm", override)
     enable_pdl = pdl_enabled()
     out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
 
@@ -1308,6 +1313,41 @@ def mm(
             device=A.device,
             op="mm",
         )
+
+    # A dense layer's large-M arm reaches mm directly, while small M can
+    # select decode_gemv. Expose those branches at the shared kernel boundary.
+    if (
+        override is None
+        and alpha is None
+        and not prepacked_scales
+        and quant in (None, "none")
+        and A_scales is None
+        and B_scales is None
+        and out_dtype == torch.bfloat16
+        and B.shape[-1] == K
+    ):
+        # Row-parallel layers add bias only on rank 0. All ranks must expose
+        # the same bias-free tuning branch for FI's timing collectives, even
+        # when this rank's actual GEMM retains the generic biased path.
+        autotune_bf16_gemm(A, B)
+        if (
+            bias is None
+            and M <= BF16_GEMM_MAX_M
+            and flashinfer_joint_bf16_supported(A, B, out)
+        ):
+            shape_params = {"M": M, "N": N, "K": K}
+            ShapeCapture.get().record(
+                "gemm", "mm", "flashinfer_bf16_gemm", A.dtype, shape_params
+            )
+            with kernel_scope(
+                "gemm",
+                "mm",
+                A.dtype,
+                kernel_name="flashinfer_bf16_gemm",
+                **shape_params,
+                has_out=out is not None,
+            ):
+                return flashinfer_bf16_gemm(A, B, out)
 
     block_scale_layout = (
         "canonical_blackwell" if Platform.get().is_blackwell_plus else "canonical"

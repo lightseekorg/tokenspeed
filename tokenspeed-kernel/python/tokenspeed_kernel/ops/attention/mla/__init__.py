@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 
 import torch
+from tokenspeed_kernel.ops.gemm.flashinfer import autotune_bf16_gemm
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
@@ -441,6 +442,8 @@ def mla_normalize_project_query(
             "kv_width": kv_width,
             "output_width": output_width,
         }
+        if override is None and solution is None:
+            autotune_bf16_gemm(query, projection_weight)
         ShapeCapture.get().record(
             "attention",
             "mla_normalize_project_query",

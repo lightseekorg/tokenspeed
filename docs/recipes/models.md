@@ -1050,8 +1050,12 @@ tokens, 621 vs 1552 at 192, 671 vs 2855 at 576, 4517 vs 7999 at an 8192-token
 prefill chunk. Two consequences:
 
 - Startup runs FlashInfer's tactic autotuner inside the kernel tuning window
-  (about five minutes for this kernel on H20). `--disable-autotune` skips it
-  and serves heuristic tactics, which is fine for bring-up.
+  (about five minutes for this kernel on H20), including each distinct draft
+  expert geometry. Decode-capable roles also traverse the shared speculative
+  path once to discover the draft model's other operators; prefill-only roles
+  skip that traversal because they do not allocate decode/verify scratch.
+  `--disable-autotune` loads a matching persistent cache and uses heuristic
+  tactics for uncovered shapes, which is fine for bring-up.
 - `--moe-mxfp4-fp8-activation` switches to the W4A8 variant (FP8 activations,
   Humming residual scales): 282/338/380/2195 µs at the same token counts,
   another 1.8x, at a few percent of relative error on the expert outputs
