@@ -19,7 +19,14 @@
 # SOFTWARE.
 """Runtime state tensors shared by the model executor."""
 
+from __future__ import annotations
+
+import itertools
+
 import torch
+
+from tokenspeed.runtime.execution.request_token_history import RequestTokenHistoryView
+from tokenspeed.runtime.execution.types import RequestHistorySeeds
 
 
 class RuntimeStates:
@@ -37,6 +44,7 @@ class RuntimeStates:
         self.ngram_accepted_tokens: torch.Tensor | None = None
         self.ngram_needs_seed: torch.Tensor | None = None
         self.ngram_request_ids: list[str | None] = []
+        self.request_token_history_ids: torch.Tensor | None = None
 
         self.valid_cache_lengths = torch.zeros(
             req_pool_size + 1, dtype=torch.int32, device=device
@@ -67,6 +75,84 @@ class RuntimeStates:
             pool_size, dtype=torch.bool, device=self.device
         )
         self.ngram_request_ids = [None] * pool_size
+
+    def init_request_token_history(self, capacity: int) -> None:
+        """Allocate each slot's committed-token history row.
+
+        ``capacity`` is zero for a model that reads no history, else the
+        physical context length. Row ``s`` holds ``[0, valid_cache_lengths[s])``
+        committed tokens; the model's kernels append every forward's inputs
+        past that frontier, and resuming extends are reseeded from host
+        snapshots (:meth:`seed_request_token_history`). Like the n-gram tail,
+        this is executor state that follows ``valid_cache_lengths``; it is
+        never transferred or prefix-matched as a cache. Returns None.
+        """
+        if capacity < 0:
+            raise ValueError(
+                f"request token history capacity must be non-negative, got {capacity}"
+            )
+        if capacity == 0:
+            return
+        pool_size = self.valid_cache_lengths.shape[0]
+        self.request_token_history_ids = torch.zeros(
+            (pool_size, capacity), dtype=torch.int32, device=self.device
+        )
+
+    @property
+    def has_request_token_history(self) -> bool:
+        """Whether this executor keeps request-token history."""
+        return self.request_token_history_ids is not None
+
+    def request_token_history_view(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        input_start_offsets: torch.Tensor,
+        active_request_mask: torch.Tensor,
+    ) -> RequestTokenHistoryView:
+        """Combine the persistent history with one packed-batch layout."""
+        if self.request_token_history_ids is None:
+            raise RuntimeError("request token history is not enabled")
+        return RequestTokenHistoryView(
+            history_token_ids=self.request_token_history_ids,
+            committed_lengths=self.valid_cache_lengths,
+            req_pool_indices=req_pool_indices,
+            input_start_offsets=input_start_offsets,
+            active_request_mask=active_request_mask,
+        )
+
+    def seed_request_token_history(self, seeds: RequestHistorySeeds) -> None:
+        """Restore the committed prefix of each seeded slot.
+
+        One pinned upload carries every seed; each row is then written from
+        its device slice on the current stream. Returns None.
+        """
+        history = self.request_token_history_ids
+        if history is None:
+            raise RuntimeError("request token history is not enabled")
+        pool_size, capacity = history.shape
+        for slot, prefix_length in zip(seeds.slots, seeds.prefix_lengths):
+            # The last row is graph padding and never belongs to a request.
+            if not 0 <= slot < pool_size - 1:
+                raise ValueError(f"request token history slot {slot} is out of range")
+            if prefix_length > capacity:
+                raise ValueError(
+                    f"request token history prefix {prefix_length} exceeds "
+                    f"capacity {capacity}"
+                )
+        if sum(seeds.prefix_lengths) == 0:
+            return
+        device_tokens = torch.tensor(
+            list(itertools.chain.from_iterable(seeds.tokens)),
+            dtype=torch.int32,
+            pin_memory=torch.device(self.device).type != "cpu",
+        ).to(self.device, non_blocking=True)
+        offset = 0
+        for slot, prefix_length in zip(seeds.slots, seeds.prefix_lengths):
+            history[slot, :prefix_length].copy_(
+                device_tokens[offset : offset + prefix_length]
+            )
+            offset += prefix_length
 
     def reset_states(
         self,
