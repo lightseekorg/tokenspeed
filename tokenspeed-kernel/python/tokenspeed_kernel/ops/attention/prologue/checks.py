@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.attention.prologue.types import (
     KVCacheFormat,
     LatentKVCache,
     MLAExpandedKV,
+    PerTokenHeadPlanes,
     Rotary,
 )
 
@@ -147,6 +148,51 @@ def check_gqa_request(
         _cache_key(cache),
     )
     _once(key, _check_gqa_request, q, k, v, norm, rotary, cache)
+
+
+def check_latent_write(
+    latent_cache: torch.Tensor, rotary: Rotary | None, cache: LatentKVCache
+) -> None:
+    """Reject a latent write any store would misread; metadata only."""
+    key = ("latent", _layout(latent_cache), _rotary_key(rotary), _cache_key(cache))
+    _once(key, _check_latent_write, latent_cache, rotary, cache)
+
+
+def _check_latent_write(
+    latent_cache: torch.Tensor, rotary: Rotary | None, cache: LatentKVCache
+) -> None:
+    if latent_cache.dim() != 2 or latent_cache.stride(-1) != 1:
+        raise ValueError(
+            f"latent_cache {tuple(latent_cache.shape)} is not [tokens, rank + rope] rows"
+        )
+    if latent_cache.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            f"latent_cache is {latent_cache.dtype}; the prologue takes fp16 or bf16"
+        )
+    num_tokens, width = latent_cache.shape
+    if rotary is not None:
+        _check_rotary(rotary, num_tokens)
+        if width <= rotary.rotary_dim:
+            raise ValueError(
+                f"latent_cache width {width} leaves no latent beside {rotary.rotary_dim} RoPE channels"
+            )
+    _check_slots(cache, num_tokens)
+    if cache.slots.numel() != num_tokens:
+        raise ValueError(f"{cache.slots.numel()} slots for {num_tokens} latent rows")
+    kv = cache.kv_cache
+    if isinstance(kv, PerTokenHeadPlanes):
+        return
+    if kv.dim() != 3 or kv.shape[1] != 1 or kv.shape[2] != width or kv.stride(-1) != 1:
+        raise ValueError(
+            f"latent cache {tuple(kv.shape)} is not [slots, 1, {width}] rows"
+        )
+    if cache.format is KVCacheFormat.NATIVE and kv.dtype not in (
+        latent_cache.dtype,
+        torch.bfloat16,
+    ):
+        raise ValueError(
+            f"a native cache holds {latent_cache.dtype} or bf16 rows, not {kv.dtype}"
+        )
 
 
 def check_mla_request(

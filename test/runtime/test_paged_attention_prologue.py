@@ -37,6 +37,7 @@ register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed_kernel.ops.attention.prologue import (  # noqa: E402
     HeadKVCache,
+    LatentKVCache,
     MRope,
     RopeStyle,
 )
@@ -114,6 +115,36 @@ def _prologue(monkeypatch, *, qk_norm, mode, rows, slots):
         torch.zeros(rows, 4 * 64, dtype=torch.bfloat16), kv, kv, torch.arange(rows), ctx
     )
     return handed
+
+
+def test_write_latent_hands_the_entry_the_padded_span_and_the_rotary(monkeypatch):
+    """An MLA layer's pre-break write covers every row the forward carries."""
+    handed = {}
+    monkeypatch.setattr(
+        paged_attention,
+        "write_latent",
+        lambda latent, *, rotary, cache: handed.update(rotary=rotary, cache=cache),
+    )
+    rotary_emb = SimpleNamespace(as_rotary=lambda positions: ("rotary", positions))
+    layer = paged_attention.PagedAttention(
+        4, 576, 1.0, num_kv_heads=1, layer_id=0, rotary_emb=rotary_emb, qk_norm=None
+    )
+    cache = torch.zeros(8, 1, 576, dtype=torch.bfloat16)
+    ctx = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        attn_backend=SimpleNamespace(
+            padded_write_locations=lambda layer, m, rows: torch.tensor([5, 6, 0, 0])[
+                :rows
+            ]
+        ),
+        token_to_kv_pool=SimpleNamespace(
+            kv_write_target=lambda layer_id, s: LatentKVCache(cache, False, s)
+        ),
+    )
+    positions = torch.arange(4)
+    layer.write_latent(torch.zeros(4, 576, dtype=torch.bfloat16), positions, ctx)
+    assert handed["rotary"] == ("rotary", positions)
+    assert handed["cache"].slots.tolist() == [5, 6, 0, 0]
 
 
 @pytest.mark.parametrize("norm_cls", [RMSNorm, GemmaRMSNorm])

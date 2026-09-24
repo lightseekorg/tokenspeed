@@ -39,7 +39,13 @@ from tokenspeed_kernel.ops.attention.prologue.types import (
     RopeStyle,
     Rotary,
 )
-from tokenspeed_kernel.ops.embedding import apply_rope, apply_rope_mla
+from tokenspeed_kernel.ops.embedding import (
+    FusedMLASetKVBufferArg,
+    apply_k_rope,
+    apply_rope,
+    apply_rope_mla,
+)
+from tokenspeed_kernel.ops.embedding.triton import apply_rope_mla_set_kv_buffer_triton
 from tokenspeed_kernel.ops.kvcache.per_token_head import store_latent_per_token_head
 from tokenspeed_kernel.ops.kvcache.triton import (
     fused_fp8_set_kv_buffer,
@@ -216,6 +222,46 @@ def _write_latent(
         k_rope,
         enable_pdl=enable_pdl,
         sanitize=cache.sanitize,
+    )
+
+
+def store_latent(
+    latent_cache: torch.Tensor,
+    rotary: Rotary | None,
+    cache: LatentKVCache,
+    enable_pdl: bool,
+) -> None:
+    """Rotate the key RoPE part once in fp32 and store every latent row; the
+    given rows stay unrotated."""
+    rank = latent_cache.shape[-1] - (0 if rotary is None else rotary.rotary_dim)
+    latent = latent_cache.unsqueeze(1)
+    k_nope, k_pe = latent[..., :rank], latent[..., rank:]
+    if cache.format is KVCacheFormat.FP8_PER_TOKEN_HEAD:
+        if rotary is not None:
+            k_pe = apply_k_rope(
+                rotary.positions,
+                k_pe.clone(),
+                k_pe.shape[-1],
+                rotary.cos_sin_cache,
+                is_neox=rotary.style is RopeStyle.NEOX,
+            )
+        _write_latent(cache, k_nope, k_pe, enable_pdl)
+        return
+    apply_rope_mla_set_kv_buffer_triton(
+        positions=cache.slots if rotary is None else rotary.positions,
+        q_rope=None,
+        k_rope=k_pe,
+        cos_sin_cache=None if rotary is None else rotary.cos_sin_cache,
+        is_neox=rotary is not None and rotary.style is RopeStyle.NEOX,
+        fused_mla_set_kv_buffer_arg=FusedMLASetKVBufferArg(
+            k_nope=k_nope,
+            kv_buffer=cache.kv_cache.view(cache.kv_cache.shape[0], -1),
+            cache_loc=cache.slots,
+            q_nope=None,
+            sanitize=cache.sanitize,
+        ),
+        q_rope_out=None,
+        enable_pdl=enable_pdl,
     )
 
 

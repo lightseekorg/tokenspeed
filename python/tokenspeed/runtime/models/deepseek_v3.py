@@ -665,9 +665,18 @@ class DeepseekV3AttentionMLA(nn.Module):
         q, latent_cache = self._project_q_latent(
             hidden_states, ctx, comm_manager, block_scale
         )
+        self._write_latent_before_break(latent_cache, positions, ctx)
         attn_output = self._attn(positions, q, latent_cache, ctx)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _write_latent_before_break(
+        self, latent_cache: torch.Tensor, positions: torch.Tensor, ctx: ForwardContext
+    ) -> None:
+        """Write the latent rows in the captured segment; a decode round keeps its
+        one-launch prologue inside the break instead (see :meth:`_attn`)."""
+        if not ctx.forward_mode.is_decode():
+            self.attn_mqa.write_latent(latent_cache, positions, ctx)
 
     def _project_q_latent(
         self,
@@ -723,7 +732,11 @@ class DeepseekV3AttentionMLA(nn.Module):
         the padding scrub uses). Padded tail rows produce discarded garbage.
         Each half fetches its own KV write span from the backend by mode:
         EXTEND returns exactly the extend token span, DECODE exactly the
-        decode rows' verify window — no full-batch vector to slice.
+        decode rows' verify window — no full-batch vector to slice. Outside a
+        decode round the latent rows were written before the break
+        (:meth:`_write_latent_before_break`): the prefill half hands its
+        prologue no rows to store, the decode half of a MIXED round rewrites
+        its own.
         """
         spec = ctx.attn_backend.spec_num_tokens or 1
         num_decodes = max(ctx.bs - ctx.num_extends, 0)
@@ -755,6 +768,8 @@ class DeepseekV3AttentionMLA(nn.Module):
             prefill_locs = ctx.attn_backend.write_locations(
                 self.attn_mha, ForwardMode.EXTEND
             )
+            if not ctx.forward_mode.is_decode():
+                prefill_locs = prefill_locs[:0]
             if getattr(cmeta, "use_absorbed_cached_extend", False):
                 self.forward_absorb(
                     positions[:num_prefill_tokens],

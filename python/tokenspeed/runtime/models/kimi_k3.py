@@ -632,6 +632,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             and ctx.num_extends == 0
             and ctx.attn_backend.supports_mla_projected_value_decode
         )
+        self._write_latent_before_break(latent_cache, positions, ctx)
         attn_output = self._attn(
             positions,
             q,

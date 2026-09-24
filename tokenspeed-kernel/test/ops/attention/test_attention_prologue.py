@@ -61,6 +61,7 @@ from tokenspeed_kernel.ops.attention.prologue import (
     gqa_prologue,
     mla_prologue,
     qk_norm_rope,
+    write_latent,
 )
 from tokenspeed_kernel.ops.embedding import apply_rope, apply_rope_mla
 from tokenspeed_kernel.ops.kvcache.triton import (
@@ -1048,6 +1049,81 @@ def test_qk_norm_rope_is_the_prologue_without_a_cache_write():
         total=tokens,
     )
     assert bytes_equal(got_q, ref[0]) and bytes_equal(got_k, ref[3])
+
+
+@pytest.mark.parametrize("tokens", [1, 9, 64])
+@pytest.mark.parametrize("rope_style", [RopeStyle.GPTJ, RopeStyle.NEOX, None])
+@pytest.mark.parametrize("fp8_cache", [True, False])
+@pytest.mark.parametrize("sanitize", [False, True])
+def test_write_latent_stores_the_absorbed_prologue_rows(
+    tokens, rope_style, fp8_cache, sanitize
+):
+    """The captured write alone lands the bytes the absorbed prologue's fused
+    launch lands, and leaves the latent rows unrotated for the break."""
+    heads, rank, rope, total = 16, 512, 64, 256
+    cache_dtype = FP8 if fp8_cache else BF16
+    q_nope, q_pe, latent = mla_inputs(tokens, heads, rank, rope, seed=23)
+    if sanitize:
+        latent[0, 1] = float("nan")
+        latent[-1, rank + 2] = float("inf")
+    positions = torch.arange(50, 50 + tokens, device="cuda")
+    rotary = (
+        None
+        if rope_style is None
+        else Rotary(cos_sin_cache(rope), positions, rope_style, None)
+    )
+    loc = slots(tokens, total, seed=24)
+    ref_cache = poisoned_latent(total, rank + rope, cache_dtype)
+    mla_prologue(
+        mla_query(q_nope, rope),
+        q_pe.clone(),
+        latent.clone(),
+        expanded=None,
+        rotary=rotary,
+        cache=latent_target(ref_cache, loc, sanitize),
+        solution="triton",
+        override=None,
+    )
+    cache = poisoned_latent(total, rank + rope, cache_dtype)
+    given = latent.clone()
+    write_latent(given, rotary=rotary, cache=latent_target(cache, loc, sanitize))
+    assert bytes_equal(cache, ref_cache) and bytes_equal(given, latent)
+
+
+def test_write_latent_needs_one_slot_per_row():
+    _, _, latent = mla_inputs(4, 16, 512, 64, seed=25)
+    cache = poisoned_latent(16, 576, FP8)
+    with pytest.raises(ValueError, match="3 slots for 4 latent rows"):
+        write_latent(
+            latent, rotary=None, cache=latent_target(cache, slots(3, 16, seed=26))
+        )
+
+
+def test_write_latent_stores_per_token_head_planes_as_the_composite_does():
+    tokens, heads, rank, rope = 5, 16, 512, 64
+    q_nope, q_pe, latent = mla_inputs(tokens, heads, rank, rope, seed=27)
+    positions = torch.arange(tokens, device="cuda")
+    rotary = Rotary(cos_sin_cache(rope), positions, RopeStyle.GPTJ, None)
+    loc = torch.arange(tokens, device="cuda")
+    ref = _planes(rank, rope)
+    mla_prologue(
+        mla_query(q_nope, rope),
+        q_pe.clone(),
+        latent.clone(),
+        expanded=None,
+        rotary=rotary,
+        cache=latent_target(ref, loc),
+        solution="composite",
+        override=None,
+    )
+    planes = _planes(rank, rope)
+    write_latent(latent.clone(), rotary=rotary, cache=latent_target(planes, loc))
+    for a, b in (
+        (planes.latent, ref.latent),
+        (planes.scale, ref.scale),
+        (planes.rope, ref.rope),
+    ):
+        assert bytes_equal(a, b)
 
 
 @pytest.mark.parametrize("tokens", [1, 9, 64])

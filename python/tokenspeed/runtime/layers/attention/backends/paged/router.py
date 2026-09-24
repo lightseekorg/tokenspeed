@@ -434,11 +434,12 @@ class CacheGroupRouter(AttentionBackend):
         self, layer: PagedAttention, forward_mode: ForwardMode, rows: int
     ) -> torch.Tensor:
         """The extend span padded over the stack buffer's dummy-slot tail to the
-        rows a graph-padded forward carries; decode rows carry their own slots."""
+        rows a graph-padded forward carries (a MIXED round's decode rows pad too;
+        its decode half writes them); decode rows carry their own slots."""
         locations = self.forward_write_locations(layer, forward_mode)
         if locations.numel() == rows:
             return locations
-        if not forward_mode.is_extend():
+        if not forward_mode.is_extend_or_mixed():
             raise ValueError(
                 f"{locations.numel()} {forward_mode.name.lower()} write slots for {rows} rows"
             )

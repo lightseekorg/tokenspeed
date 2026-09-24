@@ -42,6 +42,7 @@ from tokenspeed_kernel.ops.attention.prologue import (
     Rotary,
     gqa_prologue,
     mla_prologue,
+    write_latent,
 )
 from torch import nn
 
@@ -268,6 +269,23 @@ class PagedAttention(nn.Module):
             ctx=decode_ctx,
             # The DECODE dispatch would skip the PD cache step a catch-up round records.
             record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
+        )
+
+    def write_latent(
+        self, latent_cache: torch.Tensor, positions: torch.Tensor, ctx: ForwardContext
+    ) -> None:
+        """Write an MLA layer's latent rows before its attention break, padded
+        to the rows the forward carries so a graph records it; the break's
+        :meth:`latent_prologue` then skips the store or rewrites the same rows.
+        """
+        write_latent(
+            latent_cache,
+            rotary=(
+                None
+                if self.rotary_emb is None
+                else self.rotary_emb.as_rotary(positions)
+            ),
+            cache=self._write_target(latent_cache, ctx),
         )
 
     def latent_prologue(

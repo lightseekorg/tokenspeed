@@ -22,6 +22,8 @@ first:
 * `qk_norm_rope(q, k, *, head_dim, norm, rotary)` for keys that are not
   attention K/V but take the norm step (MiniMax-M3's indexer): the GQA kernels
   with no cache write. Indexers that only rotate call `embedding.rope`.
+* `write_latent(latent_cache, *, rotary, cache)` for an MLA layer's cache write
+  alone, before its attention break.
 
 Head geometry comes from the cache descriptor and the input shapes, and the
 storage format from the cache's rows and planes; no argument restates either.
@@ -163,11 +165,19 @@ one slot per row it carries (`AttentionBackend.padded_write_locations`); the
 rows past the real tokens land in the dummy slot 0, which the span keeps in
 its tail and which padded decode rows and page-table holes already use.
 Padding costs only the masked programs of the tile past the real tokens. Core
-attention stays the eager break (`PagedAttention._attend`); an MLA model's
-prologue runs inside its own attention break (`_attn`, or the attention
-module's `forward`), as it did before the prologue existed. The backends' own
-breaks nest inside these and pass through, and remain for callers that reach a
-backend directly. Prefill graphs capture the target model only and replay a
+attention stays the eager break (`PagedAttention._attend`).
+
+An MLA model splits its rows into prefill and decode halves from live metadata
+inside its attention break (`_attn`), and chooses absorbed or expanded
+attention there, so its query assembly cannot leave the break. Its cache write
+can: outside a decode round the model calls `PagedAttention.write_latent`
+before the break (`write_latent` in the kernel package, the fused write's
+key-only launch, so the rows match the absorbed prologue's byte for byte and
+the latent input stays unrotated), padded like a GQA write. The break's prefill
+half then hands its prologue a zero-row cache, which skips the store; a MIXED
+round's decode half rewrites its own rows, and a decode round keeps its
+one-launch prologue inside the break. The backends' own breaks nest inside
+these and pass through, and remain for callers that reach a backend directly. Prefill graphs capture the target model only and replay a
 round with draft narrowing eagerly, so draft layers need no break.
 
 ## Formats and scales

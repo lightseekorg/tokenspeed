@@ -46,8 +46,10 @@ from functools import lru_cache
 import torch
 from tokenspeed_kernel.ops.attention.prologue.checks import (
     check_gqa_request,
+    check_latent_write,
     check_mla_request,
 )
+from tokenspeed_kernel.ops.attention.prologue.composite import store_latent
 from tokenspeed_kernel.ops.attention.prologue.types import (
     GQAPrologueOutput,
     HeadKVCache,
@@ -225,6 +227,24 @@ def qk_norm_rope(
     return out.q, out.k
 
 
+def write_latent(
+    latent_cache: torch.Tensor, *, rotary: Rotary | None, cache: LatentKVCache
+) -> None:
+    """Store an MLA layer's latent rows, their RoPE part rotated: the prologue's
+    cache write alone, for the graph segment before an attention break. The
+    break's :func:`mla_prologue` then finds its rows written and skips the
+    store (a zero-row cache) or rewrites the same rows.
+
+    Args:
+        latent_cache: ``[num_tokens, kv_lora_rank + rope_dim]`` normalized
+            latent followed by the unrotated key RoPE part, left as given.
+        rotary: Rotary embedding, or ``None`` for NoPE.
+        cache: Latent cache destination with one slot per row.
+    """
+    check_latent_write(latent_cache, rotary, cache)
+    store_latent(latent_cache, rotary, cache, pdl_enabled())
+
+
 def mla_prologue(
     query: torch.Tensor,
     q_pe: torch.Tensor,
@@ -323,9 +343,9 @@ __all__ = [
     "gqa_prologue",
     "mla_prologue",
     "qk_norm_rope",
+    "write_latent",
 ]
 
 
-# Backend registration (side-effect imports)
-import tokenspeed_kernel.ops.attention.prologue.composite  # noqa: E402,F401
+# Backend registration (side-effect import; the composite registers on its import above)
 import tokenspeed_kernel.ops.attention.prologue.triton  # noqa: E402,F401
