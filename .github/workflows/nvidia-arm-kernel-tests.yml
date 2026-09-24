@@ -6,6 +6,8 @@ on:
     paths:
       - ".github/workflows/nvidia-arm-kernel-tests.yml"
       - "test/ci/ut/ut-tokenspeed-kernel-nvidia-arm.yaml"
+      - "test/ci_system/kernel_gpu_worker.py"
+      - "test/ci_system/run_kernel_gpu_ut.sh"
       - "tokenspeed-kernel/test/**"
       - "!tokenspeed-kernel/test/amd/**"
       - "tokenspeed-kernel/python/**"
@@ -16,6 +18,8 @@ on:
     paths:
       - ".github/workflows/nvidia-arm-kernel-tests.yml"
       - "test/ci/ut/ut-tokenspeed-kernel-nvidia-arm.yaml"
+      - "test/ci_system/kernel_gpu_worker.py"
+      - "test/ci_system/run_kernel_gpu_ut.sh"
       - "tokenspeed-kernel/test/**"
       - "!tokenspeed-kernel/test/amd/**"
       - "tokenspeed-kernel/python/**"
