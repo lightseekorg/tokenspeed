@@ -36,11 +36,11 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_decode import (
         launch_gluon_latent_input_decode_gfx950 as _decode_gfx950_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_largem import (
+        launch_gluon_latent_input_largem_gfx950 as _largem_gfx950_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_mediumm import (
         launch_gluon_latent_input_mediumm_gfx950 as _mediumm_gfx950_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_prefill import (
-        launch_gluon_latent_input_largem_gfx950 as _largem_gfx950_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_small_batch import (
         launch_gluon_latent_input_small_batch_gfx950 as _small_batch_impl,

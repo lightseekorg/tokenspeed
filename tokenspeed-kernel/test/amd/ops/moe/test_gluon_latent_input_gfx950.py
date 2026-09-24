@@ -35,8 +35,8 @@ from tokenspeed_kernel.selection import (  # noqa: E402
     spec_matches_traits,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import (  # noqa: E402
+    latent_input_largem,
     latent_input_mediumm,
-    latent_input_prefill,
     latent_input_small_batch,
 )
 
@@ -168,7 +168,7 @@ def test_prefill_routes_packed_projection_and_applies_situ(
         torch.randn(tokens, hidden_size, dtype=torch.bfloat16, device="cuda") * 0.05
     )
 
-    actual = latent_input_prefill.launch_gluon_latent_input_largem_gfx950(
+    actual = latent_input_largem.launch_gluon_latent_input_largem_gfx950(
         hidden,
         router_weight,
         routed_weight,

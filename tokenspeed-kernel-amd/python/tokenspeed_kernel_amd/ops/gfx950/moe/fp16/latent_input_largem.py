@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Large-prefill Kimi K3 latent-MoE input projections for gfx950.
+"""Large-M Kimi K3 latent-MoE input projections for gfx950.
 
 The GEMM main loop intentionally follows ``gluon_mm_a16w16_prefill_gfx950``:
 an eight-wave 256x256x64, double-buffered MFMA/LDS pipeline.  K3's packed

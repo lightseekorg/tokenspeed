@@ -41,7 +41,7 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
     _mfma_lds_shared_layout_a,
     _mfma_lds_shared_layout_b,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_prefill import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_largem import (
     validate_k3_latent_input_gfx950,
 )
 
