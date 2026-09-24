@@ -34,6 +34,7 @@ from tokenspeed_kernel._triton import (
     tl,
     triton,
 )
+from tokenspeed_kernel.ops.communication._iris.sync import _iris_drain_subgroup_vmem
 
 # iris does plain ``import triton`` at module load time; route those bindings
 # to the vendored ``tokenspeed_triton`` so iris and tokenspeed-kernel share a
@@ -973,8 +974,8 @@ class IrisAllReduce(object):
             if producer_direct_max_numel
             else None
         )
-        # One borrowed residual handoff, separate from every producer and
-        # collective workspace. Prepared before cache sizing and graph capture.
+        # Keep the borrowed output separate from producer and collective scratch.
+        # Allocate before cache sizing and graph capture.
         self._moe_tail_output_buf = (
             self._ctx.empty((moe_tail_max_rows, moe_config.hidden_size), dtype=dtype)
             if moe_tail_max_rows
@@ -1780,18 +1781,6 @@ def _iris_heap_base(
     if rank == 6:
         return heap_base_6
     return heap_base_7
-
-
-@gluon.jit
-def _iris_drain_subgroup_vmem():
-    gl.inline_asm_elementwise(
-        "s_waitcnt vmcnt(0)",
-        "=r,~{memory}",
-        [],
-        dtype=gl.int32,
-        is_pure=False,
-        pack=1,
-    )
 
 
 @gluon.jit

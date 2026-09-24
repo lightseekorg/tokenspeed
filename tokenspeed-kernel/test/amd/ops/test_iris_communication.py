@@ -118,8 +118,7 @@ def test_iris_state_uses_path_capacities(monkeypatch, enable_lamport):
     assert other.enable_lamport is not enable_lamport
     assert len(created) == 2
 
-    # Equal producer capacities do not make a state without a result buffer
-    # compatible with a request that borrows one. This also exercises the key.
+    # A tail request cannot reuse a state without an output buffer.
     state.moe_tail_max_rows = 512
     with_result = triton_ops._get_or_create_iris_state(state, torch.bfloat16)
     assert with_result is not other

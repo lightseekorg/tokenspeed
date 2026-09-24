@@ -482,8 +482,7 @@ def test_row_sharded_moe_tail_selection_and_fallback(
 ):
     from tokenspeed.runtime.models import kimi_k3_comm as mod
 
-    # Meta tensors keep this a plumbing test. Distributed numerical tests
-    # exercise the actual prepared owner and the kernel's eligibility checks.
+    # Check dispatch here; GPU tests cover ownership and numerical correctness.
     routed = torch.empty((rows, 3584), dtype=torch.bfloat16, device="meta")
     shared = torch.empty((rows, 7168), dtype=torch.bfloat16, device="meta")
     prefix = torch.empty_like(shared)

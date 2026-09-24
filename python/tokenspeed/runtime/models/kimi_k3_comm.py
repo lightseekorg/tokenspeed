@@ -1251,10 +1251,8 @@ class K3MoeTailComm:
         num_tokens: int,
         hidden_size: int,
     ) -> torch.Tensor:
-        # AMD stores the complete up-projection on every rank. For large
-        # producer-direct batches, reduce token shards and project only this
-        # rank's rows before gathering the final residual. The operation checks
-        # actual producer ownership and declines before launch on a mismatch.
+        # Replicated projection weights let each rank process its token shard.
+        # The kernel wrapper checks producer ownership before launching.
         if (
             symm_outputs is not None
             and self.mapping.pp_size == 1
@@ -1266,8 +1264,6 @@ class K3MoeTailComm:
             and not self.up_proj.narrowed
             and self.up_proj.solution == "auto"
         ):
-            # PP1 keeps the residual inside the model; the tail supports its
-            # next use as an in-place prefix. Taps and final norm own storage.
             output = iris_kimi3_moe_tail(
                 routed_out,
                 shared_partial,

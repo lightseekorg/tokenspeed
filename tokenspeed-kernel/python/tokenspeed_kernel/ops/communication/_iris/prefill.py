@@ -21,18 +21,7 @@
 """CDNA4 token-sharded MoE reduction and projected-output gathering."""
 
 from tokenspeed_kernel._triton import gl, gluon
-
-
-@gluon.jit
-def _prefill_drain_vmem():
-    gl.inline_asm_elementwise(
-        "s_waitcnt vmcnt(0)",
-        "=r,~{memory}",
-        [],
-        dtype=gl.int32,
-        is_pure=False,
-        pack=1,
-    )
+from tokenspeed_kernel.ops.communication._iris.sync import _iris_drain_subgroup_vmem
 
 
 @gluon.jit
@@ -44,9 +33,8 @@ def _prefill_store_completion(
     RANK: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    # Complete every subgroup's .wt stores before publishing completion words.
-    # CDNA4 ISA 2.3/9.1.10.2: no extra writeback; receiver acquire remains.
-    _prefill_drain_vmem()
+    # Finish every subgroup's write-through stores before publishing completion.
+    _iris_drain_subgroup_vmem()
     gl.barrier()
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
     peers = gl.arange(0, 8, layout=layout)
@@ -58,13 +46,11 @@ def _prefill_store_completion(
         seen = gl.load(
             local, mask=remote, other=epoch, cache_modifier=".cv", volatile=True
         )
-    _prefill_drain_vmem()
     gl.atomic_add(local, 0, mask=remote, sem="acquire", scope="sys")
-    gl.barrier()
 
 
 @gluon.jit
-def _prefill_barrier(
+def _prefill_entry_barrier(
     flags,
     peer_flags,
     block_id,
@@ -72,18 +58,7 @@ def _prefill_barrier(
     RANK: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    # Every subgroup must finish its payload before the publishing subgroup
-    # performs the system-scope release. An atomic by itself only orders its
-    # issuing subgroup.
-    gl.inline_asm_elementwise(
-        "s_waitcnt vmcnt(0)",
-        "=r,~{memory}",
-        [],
-        dtype=gl.int32,
-        is_pure=False,
-        pack=1,
-    )
-    gl.barrier()
+    # Prior producers complete on the calling stream before this entry barrier.
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
     peers = gl.arange(0, 8, layout=layout)
     remote = peers != RANK
@@ -98,8 +73,7 @@ def _prefill_barrier(
     seen = gl.load(
         local_flags, mask=remote, other=epoch, cache_modifier=".cv", volatile=True
     )
-    # Modular comparison tolerates both a peer entering the next boundary and
-    # uint32 wraparound. Peers cannot get an entire invocation ahead.
+    # Accept newer epochs across uint32 wraparound; peers stay within one call.
     while gl.sum((remote & ((seen - epoch).to(gl.int32) < 0)).to(gl.int32), 0) != 0:
         seen = gl.load(
             local_flags, mask=remote, other=epoch, cache_modifier=".cv", volatile=True
@@ -169,7 +143,7 @@ def iris_moe_reduce_scatter_gluon_kernel(
     epoch = (
         gl.atomic_add(flags + block_id * 8 + RANK, 1, sem="relaxed", scope="gpu") + 1
     )
-    _prefill_barrier(flags, peer_flags, block_id, epoch, RANK, NUM_WARPS)
+    _prefill_entry_barrier(flags, peer_flags, block_id, epoch, RANK, NUM_WARPS)
     FIRST_ELEMENTS: gl.constexpr = ROWS // 8 * FIRST_WIDTH
     SECOND_ELEMENTS: gl.constexpr = ROWS // 8 * SECOND_WIDTH
     PARTITION_ELEMENTS: gl.constexpr = FIRST_ELEMENTS + SECOND_ELEMENTS
@@ -202,9 +176,6 @@ def iris_moe_reduce_scatter_gluon_kernel(
             )
         reduced = ((sums[0] + sums[1]) + (sums[2] + sums[3])).to(gl.bfloat16)
         gl.amd.cdna4.buffer_store(reduced, scratch_ptr, offsets, mask, cache=".wt")
-    # Projection leaves the input intact. The subsequent push gather proves
-    # every peer finished RS before the next producer may reuse it.
-    _prefill_drain_vmem()
 
 
 @gluon.jit
@@ -228,8 +199,8 @@ def iris_moe_add_push_gather_gluon_kernel(
     NUM_PROGRAMS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    # Exact prefix/output aliasing is safe: each tile reads before writing;
-    # peers write disjoint rows. RS entry joins prior full-prefix users.
+    # In-place prefixes are safe: ranks read then write disjoint rows.
+    # Reduce-scatter entry waits for prior prefix consumers.
     heaps = (
         heap_base_0,
         heap_base_1,
@@ -268,8 +239,7 @@ def iris_moe_add_push_gather_gluon_kernel(
             gl.float32
         )
         result = (a + b + c).to(gl.bfloat16)
-        # Resolve all peer bases before the loop. Consecutive system stores
-        # broadcast the register result without pointer loads or VMEM drains.
+        # Precomputed peer bases keep stores consecutive without VMEM drains.
         for step in gl.static_range(8):
             gl.amd.cdna4.buffer_store(
                 result,

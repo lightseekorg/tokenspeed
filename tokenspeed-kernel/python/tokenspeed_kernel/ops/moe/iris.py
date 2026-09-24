@@ -109,8 +109,7 @@ def iris_kimi3_moe_tail(
     ):
         return None
 
-    # Iris is optional; import it only after the architecture/shape contract
-    # holds. Look up the owner, never allocate a competing communication state.
+    # Import optional Iris only for eligible inputs and reuse their owning state.
     from tokenspeed_kernel.ops.communication.iris import IRIS_AR_STATES
 
     state = next(
@@ -152,8 +151,7 @@ def iris_kimi3_moe_tail(
             buffer_start = buffer.data_ptr()
             buffer_end = buffer_start + buffer.numel() * buffer.element_size()
             if start < buffer_end and buffer_start < end:
-                # Exact prefix aliasing is safe: each rank reads then writes
-                # only its own rows. Shifted aliases can cross unread tiles.
+                # Only exact prefix aliasing preserves row ownership.
                 if not (
                     buffer is result_buffer
                     and tensor is prefix

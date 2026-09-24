@@ -33,15 +33,23 @@ from tokenspeed_kernel.platform import current_platform
 def _moe_tail_worker(rank: int, port: int) -> None:
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
+    # Use Gloo for host coordination and RCCL for the device group.
     dist.init_process_group(
-        "gloo",
+        backend="gloo",
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=8,
         timeout=timedelta(seconds=180),
     )
-    group = dist.new_group(backend="nccl", timeout=timedelta(seconds=180))
-    dist.barrier(group=group, device_ids=[rank])
+    try:
+        group = dist.new_group(backend="nccl", timeout=timedelta(seconds=180))
+        dist.barrier(group=group, device_ids=[rank])
+        _check_moe_tail(rank, device, group)
+    finally:
+        dist.destroy_process_group()
+
+
+def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -> None:
     from tokenspeed_kernel.ops.communication import triton as comm
     from tokenspeed_kernel.ops.communication.iris import create_iris_ar_rmsnorm_state
     from tokenspeed_kernel.ops.gemm.kimi3 import kimi3_latent_projection_add3
@@ -65,7 +73,7 @@ def _moe_tail_worker(rank: int, port: int) -> None:
     )
     comm.initialize_all_reduce_state(backing, torch.bfloat16)
     state = comm._get_or_create_iris_state(backing, torch.bfloat16)
-    # EAGLE3 allocates this shared-heap buffer after K3's prefill state.
+    # Check that the shared heap still has room for EAGLE3's reduction state.
     rmsnorm_state = create_iris_ar_rmsnorm_state(
         group=group,
         rank_in_group=rank,
@@ -161,7 +169,7 @@ def _moe_tail_worker(rank: int, port: int) -> None:
             # Ordinary collectives preserve the borrowed result.
             ordinary(inputs, prefix, norm_weight)
             torch.testing.assert_close(borrowed, output, atol=0, rtol=0)
-            # Exercise exact in-place reuse with a delayed prefix writer.
+            # Delay one rank before reusing the output as its prefix.
             restore(inputs, sources)
             if rank == rows % 8:
                 torch.cuda._sleep(100_000)
@@ -171,14 +179,14 @@ def _moe_tail_worker(rank: int, port: int) -> None:
             torch.testing.assert_close(
                 inplace.view(torch.int16), output.view(torch.int16), atol=0, rtol=0
             )
-            # An explicitly retained copy survives later tails.
+            # Cloned outputs survive later calls.
             if held is not None:
                 torch.testing.assert_close(
                     held, held_expected, atol=0.03125, rtol=0.015625
                 )
             held, held_expected = output, expected
 
-    # Rejection must occur before publishing any flags or consuming inputs.
+    # Rejected inputs must leave buffers and flags untouched.
     torch.cuda.synchronize()
     dist.barrier()
     inputs = acquire(848)
@@ -220,8 +228,7 @@ def _moe_tail_worker(rank: int, port: int) -> None:
             is None
         )
     torch.testing.assert_close(state._producer_direct_ready_flags, flags_before)
-    # Only exact prefix/output aliasing preserves each tile's read/write
-    # ownership. Reject shifted prefixes and aliased weights before launch.
+    # Reject shifted prefixes and weights that overlap the output.
     result_buffer = state._moe_tail_output_buf
     invalid_aliases = (
         (result_buffer[1:849], weight, norm),
@@ -245,12 +252,10 @@ def _moe_tail_worker(rank: int, port: int) -> None:
     torch.testing.assert_close(state._moe_tail_ready_flags, gather_flags_before)
     for tensor, before in zip(inputs, inputs_before, strict=True):
         torch.testing.assert_close(tensor, before, atol=0, rtol=0)
-    # A faster rank must not publish the next ordinary reduction while a
-    # slower rank is still checking that these calls left its flags untouched.
+    # Finish checking flags on every rank before the next collective changes them.
     dist.barrier()
 
-    # Scale by powers of two, with no norm or prefix, so the expected result
-    # scales identically at every BF16 rounding boundary.
+    # Power-of-two scaling preserves BF16 rounding without a norm or prefix.
     base_sources = tuple(t.clone() for t in inputs)
     sources = tuple(t.clone() for t in base_sources)
     expected = ordinary(inputs, prefix, None)
@@ -271,8 +276,7 @@ def _moe_tail_worker(rank: int, port: int) -> None:
             torch.cuda._sleep(100_000)
         graph.replay()
         snapshots.append((scale, graph_output.clone()))
-        # Alternate Lamport, one-shot pull and two-stage pull without a host
-        # rendezvous. Their program counts and epoch increments differ.
+        # Mix Lamport and pull collectives with different grids and epoch steps.
         other = acquire((1, 48, 520)[iteration % 3])
         for tensor in other:
             tensor.fill_(rank + 1)
@@ -288,9 +292,7 @@ def _moe_tail_worker(rank: int, port: int) -> None:
         torch.testing.assert_close(output, torch.full_like(output, 36), atol=0, rtol=0)
     torch.testing.assert_close(held, held_expected, atol=0.03125, rtol=0.015625)
 
-    # Every captured invocation has changed data and an immediate consumer.
-    # This warms output caches and checks receive acquire, not just the final
-    # output of a fixed-input graph.
+    # Consume each changed output immediately to check visibility across replays.
     restore(inputs, base_sources)
     exact = projected(inputs, prefix, None).clone()
     restore(inputs, tuple(-t for t in base_sources))
@@ -359,7 +361,6 @@ def _moe_tail_worker(rank: int, port: int) -> None:
     assert tuple(t.data_ptr() for t in allocations) == allocation_pointers
     torch.cuda.synchronize()
     dist.barrier()
-    dist.destroy_process_group()
 
 
 @pytest.mark.skipif(
