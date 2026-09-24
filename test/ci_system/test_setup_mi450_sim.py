@@ -1,7 +1,9 @@
 """Exercise rocJITsu build reuse without installing the ROCm SDK."""
 
+import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 SETUP = Path(__file__).with_name("setup_mi450_sim.sh")
@@ -13,14 +15,39 @@ def _write_command(directory: Path, name: str, body: str) -> None:
     command.chmod(0o755)
 
 
-def _fake_setup(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _fake_setup(tmp_path: Path) -> tuple[dict[str, str], Path, Path, str]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     sim_root = tmp_path / "tokenspeed-mi450-sim"
-    config = sim_root / "rocm-systems/emulation/rocjitsu/configs/gfx1250_mi455x.json"
+    source_root = sim_root / "rocm-systems"
+    config = source_root / "emulation/rocjitsu/configs/gfx1250_mi455x.json"
     config.parent.mkdir(parents=True)
-    config.write_text('{"max_ticks": 100}\n')
-    (sim_root / "rocm-systems/.git").mkdir()
+    _git(source_root, "init", "-q")
+    _git(source_root, "config", "user.name", "lightseek-bot")
+    _git(
+        source_root,
+        "config",
+        "user.email",
+        "243258330+lightseek-bot@users.noreply.github.com",
+    )
+    config.write_text('{"max_ticks": 100, "revision": "a"}\n')
+    _git(source_root, "add", ".")
+    _git(source_root, "commit", "-q", "-s", "-m", "test: add first config")
+    source_a = _git(source_root, "rev-parse", "HEAD")
+    config.write_text('{"max_ticks": 200, "revision": "b"}\n')
+    _git(source_root, "add", ".")
+    _git(source_root, "commit", "-q", "-s", "-m", "test: change config")
+    source_b = _git(source_root, "rev-parse", "HEAD")
+    _git(source_root, "checkout", "-q", "--detach", source_a)
 
     _write_command(bin_dir, "sudo", 'exec "$@"\n')
     for name in ("apt-get", "pip3", "uv"):
@@ -36,7 +63,6 @@ def _fake_setup(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
         "rocm-sdk",
         'if [ "$1" = "path" ]; then printf "%s\\n" "${FAKE_ROCM_ROOT}"; fi\n',
     )
-    _write_command(bin_dir, "git", "exit 0\n")
     _write_command(
         bin_dir,
         "cmake",
@@ -59,14 +85,14 @@ def _fake_setup(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
     env = {
         **os.environ,
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
-        "FAKE_REAL_PYTHON": os.environ.get("PYTHON", "/usr/bin/python3"),
+        "FAKE_REAL_PYTHON": sys.executable,
         "FAKE_ROCM_ROOT": str(tmp_path / "rocm-sdk"),
         "FAKE_BUILD_LOG": str(build_log),
         "TOKENSPEED_MI450_SIM_ROOT": str(sim_root),
-        "ROCM_SYSTEMS_REF": "source-a",
+        "ROCM_SYSTEMS_REF": source_a,
         "ROCM_SDK_VERSION": "sdk-a",
     }
-    return env, sim_root / "rocjitsu-build", build_log
+    return env, sim_root / "rocjitsu-build", build_log, source_b
 
 
 def _run_setup(env: dict[str, str], *, succeeds: bool = True) -> str:
@@ -82,12 +108,14 @@ def _run_setup(env: dict[str, str], *, succeeds: bool = True) -> str:
 
 
 def test_rocjitsu_reuses_only_matching_complete_build(tmp_path: Path) -> None:
-    env, build_dir, build_log = _fake_setup(tmp_path)
+    env, build_dir, build_log, source_b = _fake_setup(tmp_path)
     stamp = build_dir / ".tokenspeed-build-id"
 
     _run_setup(env)
     assert len(build_log.read_text().splitlines()) == 1
-    assert stamp.read_text().strip() == f"source-a:sdk-a:{env['FAKE_ROCM_ROOT']}"
+    assert stamp.read_text().strip() == (
+        f"{env['ROCM_SYSTEMS_REF']}:sdk-a:{env['FAKE_ROCM_ROOT']}"
+    )
 
     assert "Reusing cached rocJITsu" in _run_setup(env)
     assert len(build_log.read_text().splitlines()) == 1
@@ -97,17 +125,30 @@ def test_rocjitsu_reuses_only_matching_complete_build(tmp_path: Path) -> None:
         lambda: stamp.write_text("stale\n"),
         lambda: (build_dir / "librocjitsu.so").unlink(),
         lambda: env.update(ROCM_SDK_VERSION="sdk-b"),
-        lambda: env.update(ROCM_SYSTEMS_REF="source-b"),
-        lambda: env.update(FAKE_ROCM_ROOT=str(tmp_path / "other-sdk")),
     ):
         previous = len(build_log.read_text().splitlines())
         change()
         _run_setup(env)
         assert len(build_log.read_text().splitlines()) == previous + 1
 
+    previous = len(build_log.read_text().splitlines())
+    env["ROCM_SYSTEMS_REF"] = source_b
+    _run_setup(env)
+    assert len(build_log.read_text().splitlines()) == previous + 1
+    config = (
+        Path(env["TOKENSPEED_MI450_SIM_ROOT"])
+        / "rocm-systems/emulation/rocjitsu/configs/gfx1250_mi455x.json"
+    )
+    assert json.loads(config.read_text()) == {"max_ticks": 0, "revision": "b"}
+
+    previous += 1
+    env["FAKE_ROCM_ROOT"] = str(tmp_path / "other-sdk")
+    _run_setup(env)
+    assert len(build_log.read_text().splitlines()) == previous + 1
+
 
 def test_failed_rocjitsu_build_cannot_be_reused(tmp_path: Path) -> None:
-    env, build_dir, build_log = _fake_setup(tmp_path)
+    env, build_dir, build_log, _ = _fake_setup(tmp_path)
     _run_setup(env)
     env["ROCM_SDK_VERSION"] = "sdk-b"
     env["FAKE_CMAKE_FAIL"] = "1"

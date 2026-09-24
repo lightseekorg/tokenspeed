@@ -56,7 +56,9 @@ if ! git -C "${SOURCE_ROOT}" cat-file -e "${ROCM_SYSTEMS_REF}^{commit}"; then
         sleep 10
     done
 fi
-git -C "${SOURCE_ROOT}" checkout --detach "${ROCM_SYSTEMS_REF}"
+# The max_ticks adjustment below dirties a tracked config on every run.
+# Reset it before switching source revisions on a reused runner.
+git -C "${SOURCE_ROOT}" checkout --force --detach "${ROCM_SYSTEMS_REF}"
 
 # HIP initialization needs the KMD simulator to remain alive for the full
 # process lifetime. The upstream gfx1250 functional config has a finite limit.

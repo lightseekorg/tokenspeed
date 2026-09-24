@@ -10,6 +10,9 @@ outputs exist. A missing or different stamp causes a clean rebuild so a runner
 cannot execute binaries left by an earlier nightly. The stamp is written only
 after the build succeeds.
 
+The source checkout resets its local config patch before changing revisions,
+then reapplies the unlimited `max_ticks` setting to the selected revision.
+
 The `amd-mi45x-cpu-test` GitHub job has a 60-minute limit to cover a cold ROCm
 installation and clean rocJITsu build. The simulator suite still has its own
 600-second limit, with a 300-second limit for each test.
