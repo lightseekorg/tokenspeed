@@ -10,6 +10,7 @@ on:
       - "tokenspeed-kernel/test/ops/test_attention_dsv4_dcp.py"
       - "tokenspeed-kernel/test/conftest.py"
       - "tokenspeed-kernel/python/**"
+      - "tokenspeed-mla/**"
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
@@ -20,6 +21,7 @@ on:
       - "tokenspeed-kernel/test/ops/test_attention_dsv4_dcp.py"
       - "tokenspeed-kernel/test/conftest.py"
       - "tokenspeed-kernel/python/**"
+      - "tokenspeed-mla/**"
   workflow_dispatch:
 
 permissions:
