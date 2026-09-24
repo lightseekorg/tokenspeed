@@ -84,6 +84,7 @@ _PROLOGUE_STEPS = {
     "set_mla_kv_buffer_triton",
     "store_kv_cache",
     "store_latent_per_token_head",
+    "write_kv",
 }
 
 
@@ -111,6 +112,69 @@ def _prologue(monkeypatch, *, qk_norm, mode, rows, slots):
         torch.zeros(rows, 4 * 64, dtype=torch.bfloat16), kv, kv, torch.arange(rows), ctx
     )
     return handed
+
+
+def _forward(monkeypatch, *, capturing: bool) -> tuple[dict, list]:
+    """Run ``PagedAttention.forward`` for an extend; return what the kernel entry
+    got and the norm-and-RoPE calls made before the break."""
+    handed, before_break = {}, []
+    monkeypatch.setattr(
+        paged_attention, "is_breakable_capture_active", lambda: capturing
+    )
+    monkeypatch.setattr(
+        paged_attention,
+        "qk_norm_rope",
+        lambda q, k, **kw: before_break.append(kw) or (q, k),
+    )
+    monkeypatch.setattr(
+        paged_attention,
+        "gqa_prologue",
+        lambda q, k, v, **kw: handed.update(kw, q=q, k=k, v=v)
+        or SimpleNamespace(q=q, k=k, v=v),
+    )
+    monkeypatch.setattr(
+        paged_attention, "write_kv", lambda k, v, *, cache: handed.update(written=cache)
+    )
+    q_norm, k_norm = RMSNorm(64, eps=1e-5), RMSNorm(64, eps=1e-5)
+    layer = paged_attention.PagedAttention(
+        4,
+        64,
+        1.0,
+        num_kv_heads=2,
+        layer_id=0,
+        rotary_emb=None,
+        qk_norm=(q_norm, k_norm),
+    )
+    cache = torch.zeros(8, 2, 64, dtype=torch.bfloat16)
+    ctx = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        bs=1,
+        attn_backend=SimpleNamespace(
+            forward_write_locations=lambda layer, m: torch.arange(3),
+            forward=lambda q, *a, **kw: q,
+        ),
+        token_to_kv_pool=SimpleNamespace(
+            kv_write_target=lambda layer_id, s: HeadKVCache(cache, cache, None, s)
+        ),
+    )
+    kv = torch.zeros(3, 2 * 64, dtype=torch.bfloat16)
+    layer.forward(
+        torch.zeros(3, 4 * 64, dtype=torch.bfloat16), kv, kv, torch.arange(3), ctx
+    )
+    return handed, before_break
+
+
+def test_a_breakable_capture_norms_and_rotates_before_the_break(monkeypatch):
+    """The captured segment prepares q and k; the break only stores."""
+    handed, before_break = _forward(monkeypatch, capturing=True)
+    assert len(before_break) == 1 and before_break[0]["norm"] is not None
+    assert "norm" not in handed and handed["written"].slots.numel() == 3
+
+
+def test_outside_a_capture_the_prologue_is_one_call(monkeypatch):
+    handed, before_break = _forward(monkeypatch, capturing=False)
+    assert before_break == [] and "written" not in handed
+    assert handed["norm"] is not None and handed["cache"].slots.numel() == 3
 
 
 @pytest.mark.parametrize("norm_cls", [RMSNorm, GemmaRMSNorm])

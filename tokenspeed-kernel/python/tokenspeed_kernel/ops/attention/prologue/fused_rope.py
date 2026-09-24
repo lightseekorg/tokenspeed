@@ -50,12 +50,12 @@ from tokenspeed_kernel.signature import format_signatures
         "head_dim": CUDA_ROPE_HEAD_DIMS,
         # Up to 512 token-heads the one-launch Triton kernel is faster.
         "token_heads_min": frozenset({513}),
-        "full_write": frozenset({True}),
         "has_norm": frozenset({False}),
         "kv_format": frozenset({"native", "fp8"}),
         "kv_convert": frozenset({False}),
         "mrope": frozenset({False}),
         "partial_rotary": frozenset({False}),
+        "partial_write": frozenset({False}),
         "return_kv": BOOLS,
         "rope_style": frozenset({"neox", "gptj"}),
     },
@@ -76,6 +76,16 @@ def fused_rope_gqa_prologue(
     num_tokens = q.shape[0]
     q = q.flatten(1)
     q_rope = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    fused_store = (
+        FusedSetKVBufferArg(
+            value=v.reshape(num_tokens, *cache.v_cache.shape[1:]),
+            k_buffer=cache.k_cache.view(cache.k_cache.shape[0], -1),
+            v_buffer=cache.v_cache.view(cache.v_cache.shape[0], -1),
+            cache_loc=cache.slots,
+        )
+        if cache.slots.numel()
+        else None
+    )
     apply_rope(
         rotary.positions,
         q,
@@ -83,12 +93,7 @@ def fused_rope_gqa_prologue(
         cache.k_cache.shape[-1],
         rotary.cos_sin_cache,
         is_neox=rotary.style is RopeStyle.NEOX,
-        fused_set_kv_buffer_arg=FusedSetKVBufferArg(
-            value=v.reshape(num_tokens, *cache.v_cache.shape[1:]),
-            k_buffer=cache.k_cache.view(cache.k_cache.shape[0], -1),
-            v_buffer=cache.v_cache.view(cache.v_cache.shape[0], -1),
-            cache_loc=cache.slots,
-        ),
+        fused_set_kv_buffer_arg=fused_store,
         q_rope_out=q_rope,
         k_rope_out=None,
     )

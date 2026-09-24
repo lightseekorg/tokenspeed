@@ -35,16 +35,22 @@ from typing import Protocol
 import torch
 from tokenspeed_kernel.ops.attention.prologue import (
     GQAPrologueOutput,
+    HeadKVCache,
     HeadNorm,
     MLAExpandedKV,
     MLAPrologueOutput,
     Rotary,
     gqa_prologue,
     mla_prologue,
+    qk_norm_rope,
+    write_kv,
 )
 from torch import nn
 
-from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    break_point,
+    is_breakable_capture_active,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
@@ -151,7 +157,6 @@ class PagedAttention(nn.Module):
             )
         self._group_id = group_id
 
-    @break_point
     def forward(
         self,
         q: torch.Tensor,
@@ -164,16 +169,44 @@ class PagedAttention(nn.Module):
         """Run this layer's attention.
 
         A GQA layer given K/V takes its projected rows: the prologue normalizes
-        and rotates them and writes K/V at the backend's write locations, inside
-        this eager break so a replayed graph never reuses stale locations.
-        ``k = v = None`` means the inputs are prepared and the cache written
-        (by :meth:`prologue`, or by an MLA layer's :meth:`latent_prologue`).
+        and rotates them and writes K/V at the backend's write locations. The
+        write runs inside the attention break so a replayed graph never reuses
+        stale locations; under a breakable capture the norm and RoPE run here,
+        in the captured segment, and the break only writes. ``k = v = None``
+        means the inputs are prepared and the cache written (by
+        :meth:`prologue`, or by an MLA layer's :meth:`latent_prologue`).
         """
         if k is not None and v is None:
             raise ValueError("v must be provided when k is provided.")
+        prepared = k is not None and is_breakable_capture_active()
+        if prepared and not ctx.forward_mode.is_idle():
+            norm, rotary = self._steps(positions)
+            q, k = qk_norm_rope(
+                q, k, head_dim=self.qk_head_dim, norm=norm, rotary=rotary
+            )
+        return self._attend(
+            q, k, v, None if prepared else positions, ctx, prepared, **kwargs
+        )
+
+    @break_point
+    def _attend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        ctx: ForwardContext,
+        prepared: bool,
+        **kwargs,
+    ) -> torch.Tensor:
         if k is not None and not ctx.forward_mode.is_idle():
-            prepared = self.prologue(q, k, v, positions, ctx)
-            q, k, v = prepared.q, prepared.k, prepared.v
+            if prepared:
+                write_kv(k, v, cache=self._write_target(q, ctx))
+                if ctx.forward_mode.is_decode():
+                    k = v = None
+            else:
+                out = self.prologue(q, k, v, positions, ctx)
+                q, k, v = out.q, out.k, out.v
         if k is not None:
             k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
             v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
@@ -207,27 +240,34 @@ class PagedAttention(nn.Module):
             The prepared query, and the key/value rows unless the forward
             decodes (decode attention reads the cache).
         """
-        slots = ctx.attn_backend.forward_write_locations(self, ctx.forward_mode)
-        decode = ctx.forward_mode.is_decode()
-        if decode and slots.numel() != q.shape[0]:
-            raise ValueError(
-                f"{slots.numel()} decode write slots for {q.shape[0]} rows"
-            )
+        norm, rotary = self._steps(positions)
         return gqa_prologue(
             q,
             k,
             v,
-            norm=None if self.qk_norm is None else head_norm(*self.qk_norm),
-            rotary=(
-                None
-                if self.rotary_emb is None
-                else self.rotary_emb.as_rotary(positions)
-            ),
-            cache=ctx.token_to_kv_pool.kv_write_target(self.layer_id, slots),
-            return_kv=not decode,
+            norm=norm,
+            rotary=rotary,
+            cache=self._write_target(q, ctx),
+            return_kv=not ctx.forward_mode.is_decode(),
             solution=None,
             override=None,
         )
+
+    def _steps(
+        self, positions: torch.Tensor | None
+    ) -> tuple[HeadNorm | None, Rotary | None]:
+        return (
+            None if self.qk_norm is None else head_norm(*self.qk_norm),
+            None if self.rotary_emb is None else self.rotary_emb.as_rotary(positions),
+        )
+
+    def _write_target(self, q: torch.Tensor, ctx: ForwardContext) -> HeadKVCache:
+        slots = ctx.attn_backend.forward_write_locations(self, ctx.forward_mode)
+        if ctx.forward_mode.is_decode() and slots.numel() != q.shape[0]:
+            raise ValueError(
+                f"{slots.numel()} decode write slots for {q.shape[0]} rows"
+            )
+        return ctx.token_to_kv_pool.kv_write_target(self.layer_id, slots)
 
     def attend_live_rows(
         self,

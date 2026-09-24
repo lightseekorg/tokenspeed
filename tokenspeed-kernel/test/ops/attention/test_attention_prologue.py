@@ -61,6 +61,7 @@ from tokenspeed_kernel.ops.attention.prologue import (
     gqa_prologue,
     mla_prologue,
     qk_norm_rope,
+    write_kv,
 )
 from tokenspeed_kernel.ops.embedding import apply_rope, apply_rope_mla
 from tokenspeed_kernel.ops.kvcache.triton import (
@@ -1025,6 +1026,45 @@ def test_triton_writes_only_the_slotted_rows_of_a_strided_query(tokens, rows):
     untouched[loc] = False
     for cache in (k_cache, v_cache):
         assert (cache[untouched].view(torch.uint8) == POISON).all()
+
+
+@pytest.mark.parametrize("fmt", [KVCacheFormat.NATIVE, KVCacheFormat.FP8])
+def test_write_kv_stores_prepared_rows_where_the_prologue_does(fmt):
+    """The break of a captured prefill graph stores through write_kv alone."""
+    tokens, hq, hkv, dim, total = 6, 4, 2, 64, 16
+    q, k, v = split(qkv(tokens, hq, hkv, dim, seed=51), hq, hkv, dim)
+    written = slots(tokens - 1, total, seed=52)
+    cache_dtype = FP8 if fmt is KVCacheFormat.FP8 else BF16
+    k_cache, v_cache = gqa_cache(total, hkv, dim, cache_dtype)
+    write_kv(k, v, cache=HeadKVCache(k_cache, v_cache, None, written))
+    k_ref, v_ref = gqa_cache(total, hkv, dim, cache_dtype)
+    gqa_prologue(
+        q,
+        k,
+        v,
+        norm=None,
+        rotary=None,
+        cache=HeadKVCache(k_ref, v_ref, None, written),
+        return_kv=False,
+        solution="triton",
+        override=None,
+    )
+    assert bytes_equal(k_cache, k_ref) and bytes_equal(v_cache, v_ref)
+
+
+@pytest.mark.parametrize(
+    "change,message",
+    [
+        (dict(k=lambda r: r["k"][:, :64]), "dense rows of the cache heads"),
+        (dict(v=lambda r: r["v"].to(torch.float16)), "same rows and dtype"),
+        (dict(cache__slots=lambda c: c.slots.to(torch.int16)), "dense vector"),
+        (dict(cache__slots=lambda c: torch.arange(5, device="cuda")), "at most 4"),
+    ],
+)
+def test_write_kv_rejects_rows_the_store_would_misread(change, message):
+    request = _changed(_gqa_request(), change)
+    with pytest.raises(ValueError, match=message):
+        write_kv(request["k"], request["v"], cache=request["cache"])
 
 
 def test_qk_norm_rope_is_the_prologue_without_a_cache_write():

@@ -22,6 +22,8 @@ first:
 * `qk_norm_rope(q, k, *, head_dim, norm, rotary)` for keys that are not
   attention K/V but take the norm step (MiniMax-M3's indexer): the GQA kernels
   with no cache write. Indexers that only rotate call `embedding.rope`.
+* `write_kv(k, v, *, cache)` for the write step alone: prepared rows into a
+  native, FP8 or MXFP8 cache, the store the composite solution runs.
 
 Head geometry comes from the cache descriptor and the input shapes, and the
 storage format from the cache's rows and planes; no argument restates either.
@@ -156,11 +158,15 @@ override the prologue's write.
 ## Breakable prefill graphs
 
 The KV write runs inside the same eager break as core attention, so a replayed
-graph never reuses a recorded write location. A GQA layer's prologue runs
-inside `PagedAttention.forward`'s `@break_point`, an MLA model's inside its
-attention break (`_attn`, or the attention module's `forward`); the backends'
-own breaks nest inside these and pass through, and remain for callers that
-reach a backend directly. Prefill graphs capture the target model only and
+graph never reuses a recorded write location. A GQA layer's write runs inside
+`PagedAttention._attend`'s `@break_point`; under a breakable capture the norm
+and RoPE run before it, in the captured segment (`qk_norm_rope`), and the
+break stores the rows with `write_kv`, so the eager segment holds one store
+launch per layer as before the prologue existed. Outside a capture the whole
+prologue is one launch. An MLA model's prologue
+runs inside its attention break (`_attn`, or the attention module's
+`forward`); the backends' own breaks nest inside these and pass through, and
+remain for callers that reach a backend directly. Prefill graphs capture the target model only and
 replay a round with draft narrowing eagerly, so draft layers need no break.
 
 ## Formats and scales
@@ -194,7 +200,7 @@ native, FP8 or MXFP8 cache; every step but the write is optional.
 | Solution | Kernel | Covers |
 | --- | --- | --- |
 | `triton` | one launch, one program per head | AMD and NVIDIA, native or FP8 caches, every layer `fused_rope` does not take |
-| `fused_rope` | `embedding.rope` with its fused K/V store; the key rotates in place | NVIDIA past 512 token-heads, head size 64/128/256/512, no norm, no M-RoPE, full rotary, native cache of the activation dtype or FP8 cache, full write |
+| `fused_rope` | `embedding.rope` with its fused K/V store; the key rotates in place | NVIDIA past 512 token-heads, head size 64/128/256/512, no norm, no M-RoPE, full rotary, native cache of the activation dtype or FP8 cache, every row written or none (a rope-only call) |
 | `composite` | `qk_rmsnorm`, `embedding.rope`, then the cache store | everything; rounds between steps; the path for MXFP8 caches and Ascend |
 
 Without a norm, `fused_rope` overtakes the one-head-per-program Triton kernel

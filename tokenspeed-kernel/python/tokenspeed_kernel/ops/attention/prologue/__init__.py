@@ -46,8 +46,10 @@ from functools import lru_cache
 import torch
 from tokenspeed_kernel.ops.attention.prologue.checks import (
     check_gqa_request,
+    check_kv_write,
     check_mla_request,
 )
+from tokenspeed_kernel.ops.attention.prologue.composite import store_kv
 from tokenspeed_kernel.ops.attention.prologue.types import (
     GQAPrologueOutput,
     HeadKVCache,
@@ -155,13 +157,13 @@ def gqa_prologue(
     traits = {
         "head_dim": head_dim,
         "token_heads": num_tokens * num_q_heads,
-        "full_write": cache.slots.numel() == num_tokens,
         "has_norm": norm is not None,
         "kv_format": cache.format.value,
         "kv_convert": cache.format is KVCacheFormat.NATIVE
         and cache.k_cache.dtype is not q.dtype,
         "mrope": rotary is not None and rotary.positions.ndim == 2,
         "partial_rotary": rotary is not None and rotary.rotary_dim != head_dim,
+        "partial_write": 0 < cache.slots.numel() < num_tokens,
         "return_kv": return_kv,
         "rope_style": "none" if rotary is None else rotary.style.value,
     }
@@ -237,6 +239,17 @@ def qk_norm_rope(
         override=None,
     )
     return out.q, out.k
+
+
+def write_kv(k: torch.Tensor, v: torch.Tensor, *, cache: HeadKVCache) -> None:
+    """Store prepared key/value rows: the prologue's write step alone.
+
+    For an attention break whose norm and RoPE ran in a captured graph segment
+    (:func:`qk_norm_rope`); ``k`` and ``v`` are ``[num_tokens, num_kv_heads *
+    head_dim]`` and the leading ``cache.slots.numel()`` rows are written.
+    """
+    check_kv_write(k, v, cache)
+    store_kv(cache, k, v, pdl_enabled())
 
 
 def mla_prologue(
@@ -341,10 +354,10 @@ __all__ = [
     "gqa_prologue",
     "mla_prologue",
     "qk_norm_rope",
+    "write_kv",
 ]
 
 
-# Backend registration (side-effect imports)
-import tokenspeed_kernel.ops.attention.prologue.composite  # noqa: E402,F401
+# Backend registration (side-effect imports; the composite registers on its import above)
 import tokenspeed_kernel.ops.attention.prologue.fused_rope  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.prologue.triton  # noqa: E402,F401

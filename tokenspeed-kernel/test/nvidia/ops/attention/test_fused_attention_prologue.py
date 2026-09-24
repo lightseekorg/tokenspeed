@@ -58,6 +58,7 @@ from tokenspeed_kernel.ops.attention.prologue import (  # noqa: E402
     Rotary,
     gqa_prologue,
     mla_prologue,
+    qk_norm_rope,
 )
 from tokenspeed_kernel.ops.embedding import (  # noqa: E402
     FusedSetKVBufferArg,
@@ -78,7 +79,7 @@ FORMATS = [KVCacheFormat.NATIVE, KVCacheFormat.FP8]
 DTYPES = [torch.bfloat16, torch.float16]
 # fused_rope declines padded writes; every other trait value here is non-default.
 PADDED_FP8_GPTJ = {
-    "full_write": False,
+    "partial_write": True,
     "kv_format": "fp8",
     "return_kv": True,
     "rope_style": "gptj",
@@ -262,16 +263,49 @@ def _amd_platform() -> PlatformInfo:
     )
 
 
+def test_a_rope_only_call_past_the_crossover_takes_the_cuda_rope():
+    """``qk_norm_rope`` without a norm writes no rows, so fused_rope runs the
+    CUDA rope alone and matches the Triton kernel byte for byte."""
+    tokens, hq, hk, dim = 32, 32, 8, 128
+    inputs = qkv(tokens, hq, hk, dim, seed=61)
+    rotary = Rotary(
+        cos_sin_cache(dim),
+        torch.arange(tokens, device="cuda") + 7,
+        RopeStyle.NEOX,
+        None,
+    )
+    assert (
+        _selected(tokens, torch.bfloat16, current_platform())
+        == "fused_rope_gqa_prologue"
+    )
+    q, k, _ = split(inputs.clone(), hq, hk, dim)
+    got_q, got_k = qk_norm_rope(q, k, head_dim=dim, norm=None, rotary=rotary)
+    q, k, _ = split(inputs.clone(), hq, hk, dim)
+    no_rows = k.new_empty(0, hk, dim)
+    ref = gqa_prologue(
+        q,
+        k,
+        k,
+        norm=None,
+        rotary=rotary,
+        cache=HeadKVCache(no_rows, no_rows, None, k.new_empty(0, dtype=torch.int64)),
+        return_kv=True,
+        solution="triton",
+        override=None,
+    )
+    assert bytes_equal(got_q, ref.q) and bytes_equal(got_k, ref.k)
+
+
 def _selected(tokens: int, dtype: torch.dtype, platform: PlatformInfo, **change) -> str:
     traits = {
         "head_dim": 128,
         "token_heads": tokens * 32,
-        "full_write": True,
         "has_norm": False,
         "kv_format": "native",
         "kv_convert": False,
         "mrope": False,
         "partial_rotary": False,
+        "partial_write": False,
         "return_kv": False,
         "rope_style": "neox",
     }

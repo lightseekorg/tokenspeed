@@ -307,9 +307,9 @@ def _gqa_prologue_kernel(
     signatures=format_signatures(("q",), "dense", {torch.float16, torch.bfloat16}),
     priority=Priority.PERFORMANT,
     traits={
-        "full_write": BOOLS,
         "has_norm": BOOLS,
         "kv_format": frozenset({"native", "fp8"}),
+        "partial_write": BOOLS,
         "kv_convert": BOOLS,
         "mrope": BOOLS,
         "partial_rotary": BOOLS,

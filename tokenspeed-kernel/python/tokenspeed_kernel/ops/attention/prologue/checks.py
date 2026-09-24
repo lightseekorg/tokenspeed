@@ -43,7 +43,9 @@ def _strides(x: torch.Tensor) -> list[int]:
 
 
 @lru_cache(maxsize=4096)
-def _misaligned_strides(shape: torch.Size, stride: tuple[int, ...], element_size: int) -> bool:
+def _misaligned_strides(
+    shape: torch.Size, stride: tuple[int, ...], element_size: int
+) -> bool:
     return any(s * element_size % 16 for n, s in zip(shape[:-1], stride[:-1]) if n > 1)
 
 
@@ -58,7 +60,9 @@ def _misaligned(x: torch.Tensor) -> bool:
 @lru_cache(maxsize=4096)
 def _overlapping_layout(shape: torch.Size, stride: tuple[int, ...]) -> bool:
     span = 1
-    for size, step in sorted(((n, s) for n, s in zip(shape, stride) if n > 1), key=lambda d: d[1]):
+    for size, step in sorted(
+        ((n, s) for n, s in zip(shape, stride) if n > 1), key=lambda d: d[1]
+    ):
         if step < span:
             return True
         span += (size - 1) * step
@@ -208,6 +212,31 @@ def check_gqa_request(
         raise ValueError(
             f"a native cache holds {q.dtype} or bf16 rows, not {cache.k_cache.dtype}"
         )
+
+
+def check_kv_write(k: torch.Tensor, v: torch.Tensor, cache: HeadKVCache) -> None:
+    """Reject prepared K/V rows the store kernels would misread; metadata only."""
+    if cache.k_cache.dim() != 3 or cache.v_cache.shape != cache.k_cache.shape:
+        raise ValueError(
+            "key and value caches must be [slots, heads, head_dim] rows of one geometry"
+        )
+    row = cache.k_cache.shape[1:].numel()
+    if any(x.dim() != 2 or x.shape[1] != row or x.stride(-1) != 1 for x in (k, v)):
+        raise ValueError(
+            f"k {tuple(k.shape)} / v {tuple(v.shape)} are not dense rows of the cache heads"
+        )
+    if k.shape[0] != v.shape[0] or k.dtype != v.dtype:
+        raise ValueError("k and v must have the same rows and dtype")
+    if cache.format is KVCacheFormat.NATIVE and cache.k_cache.dtype not in (
+        k.dtype,
+        torch.bfloat16,
+    ):
+        raise ValueError(
+            f"a native cache holds {k.dtype} or bf16 rows, not {cache.k_cache.dtype}"
+        )
+    _check_slots(cache, k.shape[0])
+    if cache.scales is not None:
+        _check_mxfp8_scales(cache, *cache.k_cache.shape[1:])
 
 
 def check_mla_request(
