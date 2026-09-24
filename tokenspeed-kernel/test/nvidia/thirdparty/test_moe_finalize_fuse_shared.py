@@ -74,7 +74,9 @@ def test_finalize_verbatim_shared_add(num_tokens, ew_dtype):
     )
     shared = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device="cuda")
 
-    out = moe_finalize_fuse_shared(gemm2_out, expanded_idx, weights, shared, top_k)
+    out = moe_finalize_fuse_shared(
+        gemm2_out, expanded_idx, weights, shared, top_k, hidden_dim=hidden
+    )
     ref = _reference(gemm2_out, expanded_idx, weights, shared, top_k)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
@@ -93,7 +95,9 @@ def test_finalize_weighted_shared_sink(num_tokens, ew_dtype, num_shared, top_k):
         num_shared, num_tokens, hidden, dtype=torch.bfloat16, device="cuda"
     )
 
-    out = moe_finalize_fuse_shared(gemm2_out, expanded_idx, weights, shared, top_k)
+    out = moe_finalize_fuse_shared(
+        gemm2_out, expanded_idx, weights, shared, top_k, hidden_dim=hidden
+    )
     ref = _reference(gemm2_out, expanded_idx, weights, shared, top_k)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
@@ -101,7 +105,9 @@ def test_finalize_weighted_shared_sink(num_tokens, ew_dtype, num_shared, top_k):
 def test_finalize_no_shared():
     """shared_output=None still works (plain weighted finalize)."""
     gemm2_out, expanded_idx, weights = _make_inputs(64, 512, 8, 32, torch.float32, 0)
-    out = moe_finalize_fuse_shared(gemm2_out, expanded_idx, weights, None, 8)
+    out = moe_finalize_fuse_shared(
+        gemm2_out, expanded_idx, weights, None, 8, hidden_dim=512
+    )
     ref = _reference(gemm2_out, expanded_idx, weights, None, 8)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
@@ -185,7 +191,7 @@ def test_routed_deferred_finalize_matches_finalized():
         num_shared, num_tokens, hidden, dtype=torch.bfloat16, device="cuda"
     )
     fused = moe_finalize_fuse_shared(
-        gemm2_out, expanded_idx, full_weights, shared, top_k
+        gemm2_out, expanded_idx, full_weights, shared, top_k, hidden_dim=hidden
     )
     gammas = full_weights[:, top_k:]
     expected = finalized.float() + torch.einsum(

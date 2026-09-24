@@ -307,13 +307,25 @@ def test_swiglu_deferred_finalize(num_tokens, precomputed, monkeypatch) -> None:
         return (acc + shared.float()).bfloat16()
 
     actual = moe_finalize_fuse_shared(
-        gemm, idx, weights, shared, top_k=TOP_K, enable_pdl=pdl_enabled()
+        gemm,
+        idx,
+        weights,
+        shared,
+        top_k=TOP_K,
+        enable_pdl=pdl_enabled(),
+        hidden_dim=HIDDEN,
     )
     torch.testing.assert_close(
         actual, finalize_reference(gemm, idx, weights), atol=0, rtol=0
     )
     routed_only = moe_finalize_fuse_shared(
-        gemm, idx, weights, None, top_k=TOP_K, enable_pdl=pdl_enabled()
+        gemm,
+        idx,
+        weights,
+        None,
+        top_k=TOP_K,
+        enable_pdl=pdl_enabled(),
+        hidden_dim=HIDDEN,
     )
     torch.testing.assert_close(routed_only, expected, atol=2e-3, rtol=8e-3)
     if num_tokens:
@@ -332,6 +344,7 @@ def test_swiglu_deferred_finalize(num_tokens, precomputed, monkeypatch) -> None:
                 shared,
                 top_k=TOP_K,
                 enable_pdl=pdl_enabled(),
+                hidden_dim=HIDDEN,
             )
         x.normal_()
         with monkeypatch.context() as context:

@@ -1948,18 +1948,15 @@ class DeepseekV4MoE(nn.Module):
                 shared = self._forward_shared_experts(hidden_states)
         if deferred_finalize:
             gemm2_out, expert_weights, expanded_idx = routed
-            output = moe_finalize_fuse_shared(
+            return moe_finalize_fuse_shared(
                 gemm2_out,
                 expanded_idx,
                 expert_weights,
                 shared,
                 top_k=expert_weights.shape[1],
                 enable_pdl=pdl_enabled(),
+                hidden_dim=hidden_states.shape[-1],
             )
-            # With no shared output, the common finalizer keeps the padded width.
-            if output.shape[1] != hidden_states.shape[1]:
-                output = output[:, : hidden_states.shape[1]].contiguous()
-            return output
         return routed + shared if shared is not None else routed
 
     def forward(

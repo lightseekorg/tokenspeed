@@ -944,12 +944,14 @@ class TestDeepseekV4Config(unittest.TestCase):
                     *,
                     top_k,
                     enable_pdl,
+                    hidden_dim,
                 ):
                     self.assertIs(gemm2_out, gemm)
                     self.assertIs(expanded_idx, indices)
                     self.assertIs(expert_weights, weights)
                     self.assertEqual(top_k, 1)
                     self.assertIsInstance(enable_pdl, bool)
+                    self.assertEqual(hidden_dim, hidden_states.shape[-1])
                     return (
                         gemm2_out.float() * expert_weights.float() + shared.float()
                     ).bfloat16()
@@ -983,11 +985,14 @@ class TestDeepseekV4Config(unittest.TestCase):
         with patch.object(
             deepseek_v4_model,
             "moe_finalize_fuse_shared",
-            return_value=gemm * weights,
+            return_value=(gemm * weights)[:, : hidden_states.shape[-1]].contiguous(),
         ) as finalize:
             actual = moe.forward_normal(hidden_states, input_ids, 2, 2)
         self.assertIsNone(finalize.call_args.args[3])
         self.assertEqual(finalize.call_args.kwargs["top_k"], 1)
+        self.assertEqual(
+            finalize.call_args.kwargs["hidden_dim"], hidden_states.shape[-1]
+        )
         self.assertEqual(actual.shape, hidden_states.shape)
         self.assertTrue(actual.is_contiguous())
         torch.testing.assert_close(actual, hidden_states * 2, atol=0, rtol=0)

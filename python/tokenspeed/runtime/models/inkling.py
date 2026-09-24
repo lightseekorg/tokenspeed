@@ -969,6 +969,7 @@ class InklingSparseMoeBlock(nn.Module):
                 weights,
                 shared_out,
                 top_k=top_k,
+                hidden_dim=x.shape[-1],
             )
         else:
             weights, topk_ids, router_logits = self.gate(x)
