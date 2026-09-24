@@ -30,7 +30,10 @@ pytest.importorskip(
 )
 
 from tokenspeed_kernel.ops.moe import latent_moe_input_projections  # noqa: E402
+from tokenspeed_kernel_amd._triton import triton  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx1250.moe.fp16.latent_input_decode import (  # noqa: E402
+    gluon_latent_input_decode_epilogue_gfx1250,
+    gluon_latent_input_decode_gfx1250,
     launch_gluon_latent_input_decode_gfx1250,
 )
 
@@ -151,3 +154,90 @@ def test_launcher_rejects_a_packed_weight_that_is_not_the_views(
         launch_gluon_latent_input_decode_gfx1250(
             hidden, *views, packed, beta=GATE_CLAMP, linear_beta=UP_CLAMP
         )
+
+
+@pytest.mark.parametrize(
+    ("router_n", "latent_n", "shared_n", "k", "split_k"),
+    [
+        pytest.param(WIDTHS[0], WIDTHS[1], WIDTHS[2] // 2, HIDDEN, 8, id="k3"),
+        pytest.param(64, 128, 64, 256, 2, id="sim"),
+    ],
+)
+def test_decode_pipeline(
+    router_n: int, latent_n: int, shared_n: int, k: int, split_k: int
+) -> None:
+    """The launcher pins the K3 shape, so these bypass it and set the
+    dimensions themselves. That is what lets the sim case exist: the same
+    split reduction, WMMA pipeline, region routing and SiTU over about a
+    five-hundredth of the data, which is what the MI450 simulator affords."""
+    total_n = router_n + latent_n + 2 * shared_n
+    tokens, block_m, block_n = 4, 16, 64
+    beta, linear_beta = 4.0, 25.0
+
+    hidden = torch.randn(tokens, k, dtype=torch.bfloat16, device="cuda")
+    packed = torch.randn(total_n, k, dtype=torch.bfloat16, device="cuda")
+    partials = torch.empty(split_k, tokens, total_n, dtype=torch.float32, device="cuda")
+    router = torch.empty(tokens, router_n, dtype=torch.float32, device="cuda")
+    routed = torch.empty(tokens, latent_n, dtype=torch.bfloat16, device="cuda")
+    shared = torch.empty(tokens, shared_n, dtype=torch.bfloat16, device="cuda")
+
+    grid = (split_k * (total_n // block_n), triton.cdiv(tokens, block_m))
+    gluon_latent_input_decode_gfx1250[grid](
+        hidden,
+        packed,
+        partials,
+        hidden.stride(0),
+        hidden.stride(1),
+        packed.stride(0),
+        packed.stride(1),
+        tokens * total_n,
+        tokens,
+        BLOCK_N=block_n,
+        BLOCK_K=128,
+        NUM_BUFFERS=3,
+        SPLIT_K=split_k,
+        TOTAL_N=total_n,
+        K=k,
+        num_warps=4,
+        num_stages=1,
+        waves_per_eu=0,
+    )
+    gluon_latent_input_decode_epilogue_gfx1250[
+        (tokens, triton.cdiv(router_n + latent_n + shared_n, block_n))
+    ](
+        partials,
+        router,
+        routed,
+        shared,
+        beta,
+        linear_beta,
+        tokens * total_n,
+        SPLIT_K=split_k,
+        TOTAL_N=total_n,
+        ROUTER_N=router_n,
+        LATENT_N=latent_n,
+        SHARED_N=shared_n,
+        HAS_LINEAR_BETA=True,
+        BLOCK_N=block_n,
+        num_warps=4,
+    )
+
+    acc = hidden.float() @ packed.float().T
+    gate = acc[:, router_n + latent_n : router_n + latent_n + shared_n]
+    up = acc[:, router_n + latent_n + shared_n :]
+    gate = gate.to(torch.bfloat16).float()
+    up = up.to(torch.bfloat16).float()
+    expected_shared = (
+        beta
+        * torch.tanh(gate / beta)
+        * torch.sigmoid(gate)
+        * (linear_beta * torch.tanh(up / linear_beta))
+    ).to(torch.bfloat16)
+    torch.testing.assert_close(router, acc[:, :router_n], atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        routed,
+        acc[:, router_n : router_n + latent_n].to(torch.bfloat16),
+        atol=2e-2,
+        rtol=2e-2,
+    )
+    torch.testing.assert_close(shared, expected_shared, atol=2e-2, rtol=2e-2)
