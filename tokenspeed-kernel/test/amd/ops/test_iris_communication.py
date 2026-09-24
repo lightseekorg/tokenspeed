@@ -367,6 +367,28 @@ def test_plain_two_stage_is_independent_of_producer_thresholds(monkeypatch):
     assert not iris_ops._use_two_stage_producer_direct(8, 8 * 7168, torch.bfloat16)
 
 
+def test_staged_two_stage_selects_k3_c16_cdna4_tuning():
+    try:
+        from tokenspeed_kernel.ops.communication.iris import (
+            IRIS_ALL_REDUCE_KERNEL_CONFIG,
+        )
+    except ImportError:
+        pytest.skip("iris is not installed")
+
+    config = IRIS_ALL_REDUCE_KERNEL_CONFIG.two_stage
+    assert (
+        config.staged_words_per_lane(8, torch.bfloat16, 64 * 7168, is_cdna4=True) == 4
+    )
+    assert (
+        config.staged_words_per_lane(8, torch.bfloat16, 32 * 7168, is_cdna4=True) == 2
+    )
+    assert (
+        config.staged_words_per_lane(8, torch.bfloat16, 64 * 7168, is_cdna4=False) == 2
+    )
+    # Producer-direct deliberately keeps the generic schedule.
+    assert config.words_per_lane == 2
+
+
 @pytest.mark.parametrize("dtype", [torch.float64, torch.complex128, torch.int8])
 def test_plain_two_stage_rejects_unsupported_dtypes(dtype):
     """Dtypes the packing kernel cannot express must stay on one-shot.
