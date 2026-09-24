@@ -185,7 +185,13 @@ __device__ __forceinline__ void unpack_score_idx(uint64_t packed, float& val, in
 
 __device__ __forceinline__ uint64_t warp_max_u64(
     cg::thread_block_tile<kWARP_SIZE> const& warp, uint64_t val) {
-  return cg::reduce(warp, val, cg::greater<uint64_t>{});
+  // Two native 32-bit reductions preserve the packed score/index order,
+  // including the smaller-expert-id tie break, without 64-bit shuffles.
+  uint32_t score = __reduce_max_sync(0xffffffffu, static_cast<uint32_t>(val >> 32));
+  uint32_t index = __reduce_max_sync(
+      0xffffffffu, static_cast<uint32_t>(val >> 32) == score
+                       ? static_cast<uint32_t>(val) : 0u);
+  return (static_cast<uint64_t>(score) << 32) | index;
 }
 
 template <int K, int N>
@@ -194,29 +200,22 @@ __device__ void reduce_topk(
     float (&out_vals)[K], int32_t (&out_idx)[K],
     float (&scores)[N], int32_t (&indices)[N],
     int actual_k) {
-  // Sort candidates per thread (simple insertion sort for small N).
   uint64_t packed[N];
 #pragma unroll
   for (int i = 0; i < N; ++i)
     packed[i] = pack_score_idx(scores[i], indices[i]);
-  // Odd-even transposition sort.
-#pragma unroll
-  for (int pass = 0; pass < N; ++pass) {
-#pragma unroll
-    for (int i = 0; i < N - 1; i += 2)
-      if (packed[i] < packed[i + 1]) { auto t = packed[i]; packed[i] = packed[i + 1]; packed[i + 1] = t; }
-#pragma unroll
-    for (int i = 1; i < N - 1; i += 2)
-      if (packed[i] < packed[i + 1]) { auto t = packed[i]; packed[i] = packed[i + 1]; packed[i + 1] = t; }
-  }
 
+  // Only six winners are needed. Select and remove one per iteration rather
+  // than fully sorting every lane's 8 or 12 candidates.
   uint64_t prev_max = 0;
   for (int k = 0; k < actual_k; ++k) {
-    bool dup = k > 0 && prev_max == packed[0];
+    uint64_t best = 0;
 #pragma unroll
-    for (int i = 0; i < N; ++i)
-      packed[i] = dup && i == N - 1 ? 0ULL : dup ? packed[i + 1] : packed[i];
-    prev_max = warp_max_u64(warp, packed[0]);
+    for (int i = 0; i < N; ++i) {
+      if (k > 0 && packed[i] == prev_max) packed[i] = 0;
+      best = max(best, packed[i]);
+    }
+    prev_max = warp_max_u64(warp, best);
     unpack_score_idx(prev_max, out_vals[k], out_idx[k]);
   }
 }
@@ -228,15 +227,18 @@ __device__ void reduce_topk(
 // Ported from TRT-LLM customMoeRoutingKernels.cu (Apache-2.0).
 // Supports any nExperts (256, 384, etc.) via template parameter.
 // ---------------------------------------------------------------------------
-template <int nExperts, int topK, bool hash, typename TokenIdT = int>
+template <int nExperts, int topK, bool hash, typename TokenIdT, typename WeightT>
 __global__ void gate_forward_kernel(
     const float* __restrict__ scores_in,
     const float* __restrict__ bias,
     const TokenIdT* __restrict__ input_ids,
     const int* __restrict__ tid2eid,
-    float* __restrict__ out_weights,
+    WeightT* __restrict__ out_weights,
     int* __restrict__ out_indices,
     int batch_size, float route_scale) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.wait;");
+#endif
   namespace cg = cooperative_groups;
   constexpr int kExpertsPerThread = nExperts / warp_topk::kWARP_SIZE;
   constexpr int kWarpsPerBlock = 4;
@@ -298,6 +300,9 @@ __global__ void gate_forward_kernel(
 
   float weight_sum = cg::reduce(warp, my_topk_value, cg::plus<float>{});
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
   if (lane_id < topK) {
     out_weights[global_warp_id * topK + lane_id] =
         (my_topk_value / weight_sum) * route_scale;
@@ -336,36 +341,57 @@ __global__ void gate_forward_kernel(
     }                                                                                     \
   }()
 
-template <int nExperts, typename TokenIdT = int>
+template <int nExperts, typename TokenIdT, typename WeightT>
 void launch_gate_forward(
     const float* scores_in, const float* bias, const TokenIdT* input_ids,
-    const int* tid2eid, float* out_weights, int* out_indices,
-    int batch_size, float route_scale, bool is_hash, cudaStream_t stream) {
+    const int* tid2eid, WeightT* out_weights, int* out_indices,
+    int batch_size, float route_scale, bool is_hash, bool enable_pdl,
+    cudaStream_t stream) {
   constexpr int kTopK = 6;
   constexpr int warps_per_block = 4;
-  constexpr int threads_per_block = warps_per_block * 32;
-  int const blocks = (batch_size + warps_per_block - 1) / warps_per_block;
-  if (is_hash) {
-    dsv4_routing::gate_forward_kernel<nExperts, kTopK, true, TokenIdT>
-        <<<blocks, threads_per_block, 0, stream>>>(
-            scores_in, nullptr, input_ids, tid2eid,
-            out_weights, out_indices, batch_size, route_scale);
+  cudaLaunchConfig_t config{};
+  config.gridDim = (batch_size + warps_per_block - 1) / warps_per_block;
+  config.blockDim = warps_per_block * 32;
+  config.stream = stream;
+  cudaLaunchAttribute attr{};
+  attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr.val.programmaticStreamSerializationAllowed = true;
+  config.numAttrs = enable_pdl ? 1 : 0;
+  config.attrs = enable_pdl ? &attr : nullptr;
+  auto kernel = is_hash
+      ? dsv4_routing::gate_forward_kernel<nExperts, kTopK, true, TokenIdT, WeightT>
+      : dsv4_routing::gate_forward_kernel<nExperts, kTopK, false, TokenIdT, WeightT>;
+  cudaLaunchKernelEx(&config, kernel, scores_in, bias, input_ids, tid2eid,
+                     out_weights, out_indices, batch_size, route_scale);
+}
+
+// Keep all routing arithmetic in FP32; the consumer chooses the final store.
+template <int nExperts, typename TokenIdT>
+void dispatch_gate_forward(
+    const float* scores, const float* bias, const TokenIdT* ids, const int* table,
+    TensorView weights, int* indices, int rows, float scale, bool hash,
+    bool enable_pdl, cudaStream_t stream) {
+  if (rows == 0) return;
+  if (weights.dtype() == dl_bfloat16) {
+    launch_gate_forward<nExperts, TokenIdT, __nv_bfloat16>(
+        scores, bias, ids, table, static_cast<__nv_bfloat16*>(weights.data_ptr()),
+        indices, rows, scale, hash, enable_pdl, stream);
   } else {
-    dsv4_routing::gate_forward_kernel<nExperts, kTopK, false, TokenIdT>
-        <<<blocks, threads_per_block, 0, stream>>>(
-            scores_in, bias, nullptr, nullptr,
-            out_weights, out_indices, batch_size, route_scale);
+    launch_gate_forward<nExperts, TokenIdT, float>(
+        scores, bias, ids, table, static_cast<float*>(weights.data_ptr()),
+        indices, rows, scale, hash, enable_pdl, stream);
   }
 }
 
 void softplus_sqrt_topk_flash(TensorView input, TensorView correction_bias,
                               TensorView topk_indices, TensorView topk_weights,
-                              bool renormalize, float routed_scaling_factor) {
+                              bool renormalize, float routed_scaling_factor, bool enable_pdl) {
   TVM_FFI_ICHECK_EQ(input.ndim(), 2);
   TVM_FFI_ICHECK_EQ(correction_bias.ndim(), 1);
   TVM_FFI_ICHECK_EQ(topk_indices.ndim(), 2);
   TVM_FFI_ICHECK_EQ(topk_weights.ndim(), 2);
-  TVM_FFI_ICHECK_EQ(topk_weights.dtype(), dl_float32);
+  TVM_FFI_ICHECK(topk_weights.dtype() == dl_float32 || topk_weights.dtype() == dl_bfloat16)
+      << "topk_weights must be float32 or bfloat16";
 
   const int num_rows = input.size(0);
   const int num_experts = input.size(1);
@@ -375,6 +401,7 @@ void softplus_sqrt_topk_flash(TensorView input, TensorView correction_bias,
   TVM_FFI_ICHECK_EQ(topk, 6)
       << "gate_forward_kernel is compiled for top_k=6, got " << topk;
   TVM_FFI_ICHECK_EQ(correction_bias.size(0), num_experts);
+  TVM_FFI_ICHECK_EQ(topk_weights.size(0), num_rows);
   TVM_FFI_ICHECK_EQ(topk_indices.size(0), num_rows);
   TVM_FFI_ICHECK_EQ(topk_indices.size(1), topk);
 
@@ -388,21 +415,18 @@ void softplus_sqrt_topk_flash(TensorView input, TensorView correction_bias,
   TVM_FFI_ICHECK_EQ(input.dtype(), dl_float32)
       << "gate_forward_kernel requires float32 input scores";
 
-  auto* out_w = static_cast<float*>(topk_weights.data_ptr());
   auto* out_i = reinterpret_cast<int*>(topk_indices.data_ptr());
   auto* bias_ptr = static_cast<const float*>(correction_bias.data_ptr());
   auto* scores = static_cast<const float*>(input.data_ptr());
 
   if (num_experts == 256) {
-    launch_gate_forward<256, int>(scores, bias_ptr,
-                                  static_cast<const int*>(nullptr), nullptr,
-                                  out_w, out_i, num_rows, routed_scaling_factor,
-                                  false, stream);
+    dispatch_gate_forward<256, int>(
+        scores, bias_ptr, static_cast<const int*>(nullptr), nullptr,
+        topk_weights, out_i, num_rows, routed_scaling_factor, false, enable_pdl, stream);
   } else {
-    launch_gate_forward<384, int>(scores, bias_ptr,
-                                  static_cast<const int*>(nullptr), nullptr,
-                                  out_w, out_i, num_rows, routed_scaling_factor,
-                                  false, stream);
+    dispatch_gate_forward<384, int>(
+        scores, bias_ptr, static_cast<const int*>(nullptr), nullptr,
+        topk_weights, out_i, num_rows, routed_scaling_factor, false, enable_pdl, stream);
   }
 
   cudaError_t err = cudaGetLastError();
@@ -415,13 +439,14 @@ void hash_softplus_sqrt_topk_flash(TensorView input, TensorView input_ids,
                                    TensorView hash_indices_table,
                                    TensorView topk_indices,
                                    TensorView topk_weights, bool renormalize,
-                                   float routed_scaling_factor) {
+                                   float routed_scaling_factor, bool enable_pdl) {
   TVM_FFI_ICHECK_EQ(input.ndim(), 2);
   TVM_FFI_ICHECK_EQ(input_ids.ndim(), 1);
   TVM_FFI_ICHECK_EQ(hash_indices_table.ndim(), 2);
   TVM_FFI_ICHECK_EQ(topk_indices.ndim(), 2);
   TVM_FFI_ICHECK_EQ(topk_weights.ndim(), 2);
-  TVM_FFI_ICHECK_EQ(topk_weights.dtype(), dl_float32);
+  TVM_FFI_ICHECK(topk_weights.dtype() == dl_float32 || topk_weights.dtype() == dl_bfloat16)
+      << "topk_weights must be float32 or bfloat16";
 
   const int num_rows = input.size(0);
   const int num_experts = input.size(1);
@@ -432,6 +457,7 @@ void hash_softplus_sqrt_topk_flash(TensorView input, TensorView input_ids,
       << "gate_forward_kernel is compiled for top_k=6, got " << topk;
   TVM_FFI_ICHECK_EQ(input_ids.size(0), num_rows);
   TVM_FFI_ICHECK_EQ(hash_indices_table.size(1), topk);
+  TVM_FFI_ICHECK_EQ(topk_weights.size(0), num_rows);
   TVM_FFI_ICHECK_EQ(topk_indices.size(0), num_rows);
   TVM_FFI_ICHECK_EQ(topk_indices.size(1), topk);
 
@@ -447,7 +473,6 @@ void hash_softplus_sqrt_topk_flash(TensorView input, TensorView input_ids,
 
   const cudaStream_t stream = get_stream(input.device());
 
-  auto* out_w = static_cast<float*>(topk_weights.data_ptr());
   auto* out_i = reinterpret_cast<int*>(topk_indices.data_ptr());
   auto* scores = static_cast<const float*>(input.data_ptr());
   auto* tid2eid = static_cast<const int*>(hash_indices_table.data_ptr());
@@ -457,13 +482,13 @@ void hash_softplus_sqrt_topk_flash(TensorView input, TensorView input_ids,
   auto dispatch = [&](auto* ids) {
     using TokenIdT = std::remove_const_t<std::remove_pointer_t<decltype(ids)>>;
     if (num_experts == 256) {
-      launch_gate_forward<256, TokenIdT>(scores, nullptr, ids, tid2eid,
-                                         out_w, out_i, num_rows,
-                                         routed_scaling_factor, true, stream);
+      dispatch_gate_forward<256, TokenIdT>(
+          scores, nullptr, ids, tid2eid, topk_weights, out_i, num_rows,
+          routed_scaling_factor, true, enable_pdl, stream);
     } else {
-      launch_gate_forward<384, TokenIdT>(scores, nullptr, ids, tid2eid,
-                                         out_w, out_i, num_rows,
-                                         routed_scaling_factor, true, stream);
+      dispatch_gate_forward<384, TokenIdT>(
+          scores, nullptr, ids, tid2eid, topk_weights, out_i, num_rows,
+          routed_scaling_factor, true, enable_pdl, stream);
     }
   };
 

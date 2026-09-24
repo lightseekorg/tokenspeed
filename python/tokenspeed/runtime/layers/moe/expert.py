@@ -377,6 +377,11 @@ class MoELayer(torch.nn.Module):
         return self.plan.get("supports_precomputed_topk", not self.support_routing)
 
     @property
+    def topk_weights_dtype(self) -> torch.dtype:
+        """Preferred route-weight storage at the selected expert boundary."""
+        return self.plan.get("topk_weights_dtype", torch.float32)
+
+    @property
     def topk_output_format(self):
         if self.support_routing:
             return TopKOutputFormat.BYPASSED

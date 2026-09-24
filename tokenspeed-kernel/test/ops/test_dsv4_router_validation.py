@@ -82,8 +82,15 @@ def test_hash_router_rejects_correction_bias() -> None:
 @pytest.mark.parametrize("renormalize", [False, True])
 @pytest.mark.parametrize("routing", ["plain", "bias", "per_token_bias", "hash"])
 @pytest.mark.parametrize("override", [None, "torch_sqrt_softplus_topk"])
+@pytest.mark.parametrize(
+    "weights_dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64]
+)
 def test_sqrt_softplus_router_preserves_output_dtypes(
-    tokens: int, renormalize: bool, routing: str, override: str | None
+    tokens: int,
+    renormalize: bool,
+    routing: str,
+    override: str | None,
+    weights_dtype: torch.dtype,
 ) -> None:
     logits = torch.tensor([[-2.0, 0.5, 3.0, 1.0], [2.0, -1.0, 0.0, 4.0]])[:tokens]
     bias = None
@@ -108,7 +115,7 @@ def test_sqrt_softplus_router_preserves_output_dtypes(
         hash_indices_table=table,
         input_ids=input_ids,
         topk_indices_dtype=torch.int64,
-        topk_weights_dtype=torch.float64,
+        topk_weights_dtype=weights_dtype,
         override=override,
         solution="torch",
     )
@@ -122,7 +129,7 @@ def test_sqrt_softplus_router_preserves_output_dtypes(
     expected_weights = scores.gather(1, expected_ids)
     if renormalize:
         expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
-    expected_weights = (expected_weights * 2.5).double()
+    expected_weights = (expected_weights * 2.5).to(weights_dtype)
 
     torch.testing.assert_close(ids, expected_ids, rtol=0, atol=0)
     torch.testing.assert_close(weights, expected_weights, rtol=1e-6, atol=1e-7)

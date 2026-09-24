@@ -81,6 +81,7 @@ import tokenspeed_kernel.ops.gemm.cuda as _gemm_cuda
 import tokenspeed_kernel.ops.gemm.deep_gemm as _gemm_deep_gemm
 import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.gluon as _gemm_gluon
+import tokenspeed_kernel.ops.gemm.ll_bf16 as _gemm_ll_bf16
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
 import tokenspeed_kernel.ops.gemm.trtllm as _gemm_trtllm
 import tokenspeed_kernel.ops.moe as _moe_pkg
@@ -196,6 +197,7 @@ _RELOAD_MODULES = [
     _gemm_deep_gemm,
     _gemm_flashinfer,
     _gemm_gluon,
+    _gemm_ll_bf16,
     _gemm_triton,
     _gemm_trtllm,
     _gemm_pkg,
@@ -3841,6 +3843,33 @@ def test_mxfp4_w4a8_needs_the_swiglu_clamp() -> None:
     assert plan["apply_kernel_name"] == "flashinfer_cutlass_mxfp4_w4a8_moe_apply"
 
 
+@pytest.mark.parametrize(
+    "platform_fixture,solution,weights_dtype,deferred",
+    [
+        ("b200_platform", "flashinfer_trtllm", torch.bfloat16, True),
+        ("h100_platform", "flashinfer_cutlass", torch.float32, False),
+    ],
+)
+def test_mxfp4_plan_preserves_consumer_weight_precision(
+    request, platform_fixture, solution, weights_dtype, deferred
+) -> None:
+    if not Platform.get().is_nvidia:
+        pytest.skip("FlashInfer registrations require NVIDIA")
+    host_platform = Platform.get()
+    try:
+        Platform.override(request.getfixturevalue(platform_fixture))
+        plan = _moe_apply_mxfp4_plan(
+            activation="swiglu",
+            ispp=2304,
+            internal_activation_dtype="input",
+            solution=solution,
+        )
+        assert plan["topk_weights_dtype"] == weights_dtype
+        assert plan["supports_deferred_finalize"] == deferred
+    finally:
+        Platform.override(host_platform)
+
+
 def test_mxfp4_fp8_activation_fails_closed_on_backends_without_a_w4a8_kernel() -> None:
     # --moe-mxfp4-fp8-activation is not gated by a backend allowlist in
     # ServerArgs; the plan refuses a backend that has no FP8-activation kernel.
@@ -5767,6 +5796,28 @@ _ARCH_FIXTURES: dict[str, tuple[str, ...]] = {
     ),
     "nvidia-cutedsl": ("h100_platform", "b200_platform", "b300_platform"),
 }
+
+
+@pytest.mark.parametrize(
+    "platform_fixture", ["h100_platform", "b200_platform", "b300_platform"]
+)
+def test_dsv4_router_uses_shared_cute_architectures(request, platform_fixture) -> None:
+    platform = request.getfixturevalue(platform_fixture)
+    registry = KernelRegistry.get()
+    shared_names = {
+        spec.name
+        for spec in registry.get_for_operator(
+            "gemm", "router_projection", platform=platform
+        )
+    }
+    dsv4_names = {
+        spec.name
+        for spec in registry.get_for_operator(
+            "gemm", "dsv4_linear_fp32", platform=platform
+        )
+    }
+    assert "cute_dsl_ll_bf16_router" in shared_names
+    assert "cute_dsl_dsv4_linear_fp32" in dsv4_names
 
 
 def test_mxfp8_quantizer_capabilities_match_architecture(

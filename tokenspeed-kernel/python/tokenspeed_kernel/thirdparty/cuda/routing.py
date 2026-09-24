@@ -94,6 +94,7 @@ def softplus_sqrt_topk_flash(
         topk_weights,
         bool(renorm),
         float(scaling_factor),
+        bool(pdl_enabled()),
     )
 
 
@@ -114,4 +115,5 @@ def hash_softplus_sqrt_topk_flash(
         topk_weights,
         bool(renorm),
         float(scaling_factor),
+        bool(pdl_enabled()),
     )

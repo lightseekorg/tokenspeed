@@ -87,6 +87,40 @@ def ll_bf16_router_supported(
     return ll_bf16_router.supports(hidden_states, weight, m)
 
 
+@register_kernel(
+    "gemm",
+    "dsv4_linear_fp32",
+    name="cute_dsl_dsv4_linear_fp32",
+    solution="cute_dsl",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(9, 0),
+    ),
+    signatures=_BF16_IN_FP32_OUT,
+    priority=Priority.SPECIALIZED + 1,
+    traits={
+        "ll_bf16_supported": frozenset({True}),
+    },
+)
+def cute_dsl_dsv4_linear_fp32(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    """Project DSV4 inputs with the shared low-latency BF16 router driver.
+
+    Args:
+        hidden_states: Contiguous BF16 [M, K] activations, up to MAX_M rows.
+        weight: Contiguous BF16 [N, K] projection weights.
+        enable_pdl: Shared PDL policy supplied by the projection dispatcher;
+            the vendored driver uses the same platform policy and cache key.
+
+    Returns:
+        FP32 router logits, accumulated and reduced in FP32.
+    """
+    return ll_bf16_router(hidden_states, weight, None)
+
+
 # The kernels issue 32-byte vector loads from the base of each operand.
 _PTR_ALIGN = 32
 # Both backends step K in multiples of 128.

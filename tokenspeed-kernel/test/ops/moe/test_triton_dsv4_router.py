@@ -38,8 +38,14 @@ from tokenspeed_kernel import (
 @pytest.mark.parametrize("kind", ["plain", "bias", "hash"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("renormalize", [False, True])
+@pytest.mark.parametrize("scaling_factor", [1.0, 2.5])
+@pytest.mark.parametrize("weights_dtype", [torch.float32, torch.bfloat16])
 def test_router_matches_reference(
-    kind: str, dtype: torch.dtype, renormalize: bool
+    kind: str,
+    dtype: torch.dtype,
+    renormalize: bool,
+    scaling_factor: float,
+    weights_dtype: torch.dtype,
 ) -> None:
     generator = torch.Generator(device="cuda").manual_seed(35)
     # Non-contiguous logits also cover a prefill batch beyond the gfx950 specialization.
@@ -73,7 +79,8 @@ def test_router_matches_reference(
         score_function="sqrt_softplus",
         selection_method="hash" if kind == "hash" else "topk",
         renormalize=renormalize,
-        routed_scaling_factor=1.0,
+        routed_scaling_factor=scaling_factor,
+        topk_weights_dtype=weights_dtype,
         correction_bias=bias,
         hash_indices_table=table,
         input_ids=input_ids,
@@ -93,11 +100,18 @@ def test_router_matches_reference(
             torch.finfo(torch.float32).tiny
         )
     torch.testing.assert_close(ids.long(), expected_ids)
-    torch.testing.assert_close(weights, expected_weights, atol=1e-6, rtol=2e-6)
+    expected_weights = (expected_weights * scaling_factor).to(weights_dtype)
+    torch.testing.assert_close(
+        weights,
+        expected_weights,
+        atol=1e-6,
+        rtol=8e-3 if weights_dtype == torch.bfloat16 else 2e-6,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
-def test_router_ties_and_graph_replay() -> None:
+@pytest.mark.parametrize("weights_dtype", [torch.float32, torch.bfloat16])
+def test_router_ties_and_graph_replay(weights_dtype: torch.dtype) -> None:
     logits = torch.zeros((2, 256), device="cuda", dtype=torch.float32)
 
     def run():
@@ -108,6 +122,7 @@ def test_router_ties_and_graph_replay() -> None:
             selection_method="topk",
             renormalize=True,
             routed_scaling_factor=1.0,
+            topk_weights_dtype=weights_dtype,
             override="triton_sqrt_softplus_topk",
         )
 

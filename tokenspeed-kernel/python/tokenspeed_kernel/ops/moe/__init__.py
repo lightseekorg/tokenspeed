@@ -120,6 +120,8 @@ def moe_topk(
         logical_to_physical_map: Optional expert-id map for sigmoid routing.
         topk_indices_dtype: Integer dtype for returned expert ids.
         topk_weights_dtype: Floating-point dtype for returned routing weights.
+            Sqrt-softplus scoring, normalization and scaling use FP32; CUDA
+            and Triton can write BF16 directly after scaling.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
     Returns:
@@ -292,9 +294,13 @@ def moe_topk(
             hash_indices_table,
             input_ids,
             False,
+            scaling_factor,
+            (
+                topk_weights_dtype
+                if topk_weights_dtype in (torch.float32, torch.bfloat16)
+                else torch.float32
+            ),
         )
-        if scaling_factor != 1.0:
-            topk_weights = topk_weights * scaling_factor
         return topk_weights.to(topk_weights_dtype), topk_ids.to(topk_indices_dtype)
 
 
@@ -593,6 +599,9 @@ def moe_plan(
         "support_routing": support_routing,
         "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,
+        "topk_weights_dtype": next(
+            iter(apply_spec.traits.get("topk_weights_dtype", (torch.float32,)))
+        ),
         "solution": apply_spec.solution,
         "internal_activation_dtype": internal_activation_dtype,
     }

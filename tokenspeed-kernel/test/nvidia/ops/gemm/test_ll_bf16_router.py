@@ -102,6 +102,32 @@ def test_declines_non_contiguous_and_odd_k() -> None:
     assert not ll_bf16_router_supported(odd, odd_w, 1)
 
 
+@pytest.mark.parametrize("operand", ["activation", "weight"])
+def test_router_guard_declines_misaligned_storage(operand: str) -> None:
+    a, b = _inputs(1, seed=13)
+    original = a if operand == "activation" else b
+    storage = torch.empty(original.numel() + 1, device="cuda", dtype=torch.bfloat16)
+    misaligned = storage[1:].view_as(original)
+    misaligned.copy_(original)
+    if operand == "activation":
+        a = misaligned
+    else:
+        b = misaligned
+    assert not ll_bf16_router_supported(a, b, 1)
+    with pytest.raises(ValueError, match="ll_bf16 cannot serve"):
+        ll_bf16_router(a, b, None)
+
+
+def test_router_guard_declines_empty_or_invalid_shapes() -> None:
+    a, b = _inputs(1, seed=13)
+    assert not ll_bf16_router_supported(a[:0], b, 0)
+    assert not ll_bf16_router_supported(a, b[:0], 1)
+    assert not ll_bf16_router_supported(a[:, :0], b[:, :0], 1)
+    assert not ll_bf16_router_supported(a[0], b, 1)
+    assert not ll_bf16_router_supported(a, b.unsqueeze(0), 1)
+    assert not ll_bf16_router_supported(a, b, 2)
+
+
 def test_compiled_cache_separates_pdl_policy() -> None:
     a, b = _inputs(1, seed=23)
     previous = pdl_enabled()
