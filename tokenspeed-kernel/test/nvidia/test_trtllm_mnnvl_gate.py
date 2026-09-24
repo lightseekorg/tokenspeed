@@ -29,8 +29,6 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.communication import trtllm as comm
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.thirdparty.cuda import trtllm as native
-from tokenspeed_kernel.thirdparty.cuda.trtllm import MnnvlAllReduceFusionWorkspace
 from torch.utils._python_dispatch import TorchDispatchMode
 
 pytestmark = pytest.mark.skipif(
@@ -174,11 +172,13 @@ class _RejectTensorOperations(TorchDispatchMode):
 def test_mhc_admission_uses_collective_size(
     monkeypatch, world, tokens, use_oneshot, condition
 ):
+    from tokenspeed_kernel.thirdparty.cuda import trtllm as native
+
     x = torch.empty(tokens, 5120, dtype=torch.bfloat16, device="cuda")
     weight = torch.empty(5120, dtype=x.dtype, device=x.device)
     lane_tokens = tokens * world if use_oneshot else 2 * -(-tokens // world) * world
     required_bytes = lane_tokens * 5120 * x.element_size()
-    workspace = MnnvlAllReduceFusionWorkspace(
+    workspace = native.MnnvlAllReduceFusionWorkspace(
         tp_rank=0,
         tp_size=2 * world if condition == "wrong_group" else world,
         max_token_num=tokens,
@@ -217,6 +217,8 @@ def test_mhc_admission_uses_collective_size(
 
 @pytest.fixture(params=[(8, True), (24, True), (25, False)])
 def admitted_mhc(monkeypatch, request):
+    from tokenspeed_kernel.thirdparty.cuda import trtllm as native
+
     tokens, use_oneshot = request.param
     x = torch.empty(tokens, 5120, dtype=torch.bfloat16, device="cuda")
     lane_tokens = tokens * 2 if use_oneshot else 4 * -(-tokens // 2)
@@ -230,7 +232,7 @@ def admitted_mhc(monkeypatch, request):
         eps=1e-6,
         group=None,
     )
-    workspace = MnnvlAllReduceFusionWorkspace(
+    workspace = native.MnnvlAllReduceFusionWorkspace(
         tp_rank=0,
         tp_size=2,
         max_token_num=tokens,
@@ -301,6 +303,8 @@ def test_mhc_execution_returns_outputs_or_propagates_error(admitted_mhc, kernel_
     ],
 )
 def test_mhc_producer_contract_violation_raises_before_launch(admitted_mhc, violation):
+    from tokenspeed_kernel.thirdparty.cuda import trtllm as native
+
     args, _, launch = admitted_mhc
     x = args["x"]
     tokens = x.shape[0]
