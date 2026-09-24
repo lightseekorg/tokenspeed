@@ -4,7 +4,6 @@ import os
 import subprocess
 from pathlib import Path
 
-
 SETUP = Path(__file__).with_name("setup_mi450_sim.sh")
 
 
@@ -48,12 +47,12 @@ def _fake_setup(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
         '    printf "#!/bin/sh\\n" > "$2/tools/rocjitsu/rocjitsu"\n'
         '    chmod +x "$2/tools/rocjitsu/rocjitsu"\n'
         '    touch "$2/librocjitsu.so"\n'
-        'else\n'
+        "else\n"
         '    while [ "$#" -gt 0 ]; do\n'
         '        if [ "$1" = "-B" ]; then mkdir -p "$2"; break; fi\n'
-        '        shift\n'
-        '    done\n'
-        'fi\n',
+        "        shift\n"
+        "    done\n"
+        "fi\n",
     )
 
     build_log = tmp_path / "builds.log"

@@ -982,7 +982,7 @@ def test_mi450_sim_uses_direct_runner_and_bounded_timeout():
     assert job["runs-on"] == "${{ matrix.runner }}"
     assert job["timeout-minutes"] == (
         "${{ matrix.runner == 'amd-mi45x-cpu-test'"
-        " && 30 || inputs.timeout_minutes }}"
+        " && 60 || inputs.timeout_minutes }}"
     )
 
 

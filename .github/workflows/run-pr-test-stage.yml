@@ -50,7 +50,8 @@ jobs:
       matrix: ${{ fromJson(inputs.matrix) }}
     name: ${{ matrix.name }} (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ matrix.runner == 'amd-mi45x-cpu-test' && 30 || inputs.timeout_minutes }}
+    # Cold ROCm installs and a fresh rocJITsu build need time before the 600s suite begins.
+    timeout-minutes: ${{ matrix.runner == 'amd-mi45x-cpu-test' && 60 || inputs.timeout_minutes }}
     continue-on-error: ${{ matrix.optional }}
     env:
       INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ inputs.install_tokenspeed_mla_from_source }}
