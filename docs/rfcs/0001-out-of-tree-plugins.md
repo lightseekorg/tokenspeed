@@ -296,14 +296,27 @@ No new mechanism. Three clarifications become documentation:
 
 ### Plugin author's view
 
+The whole plugin is one ordinary Python distribution. Only the first two
+subpackages are required; the rest exist only when the model needs them.
+
 ```
 my-tokenspeed-plugin/
 ├── pyproject.toml
+│   [project.entry-points."tokenspeed_kernel.plugins"]  my_plugin = "my_plugin.kernels:register"
+│   [project.entry-points."tokenspeed.plugins"]         my_plugin = "my_plugin:register"
+│   dependencies = ["tokenspeed==X.Y.Z", "tokenspeed_kernel==A.B.C"]   # exact pins
 └── my_plugin/
-    ├── __init__.py        # register()
-    ├── kernels.py         # @register_kernel(...) or plain functions
-    ├── modeling.py        # FooForCausalLM with a ModelProfile
-    └── cache.py           # optional: CacheRecipe / CachePool subclasses
+    ├── __init__.py   register(): register_model(...) and any other register_* calls
+    ├── kernels/      the model's own kernels, imported directly by modeling/;
+    │                 @register_kernel(..., solution="my_plugin", priority=Priority.PLUGIN)
+    │                 only for kernels meant to replace an in-tree one under an in-tree model
+    ├── models/       FooForCausalLM (+ FooForCausalLMNextN) with a ModelProfile
+    ├── attention/    optional: AttentionBackend subclass; usually absent — reuse an
+    │                 in-tree backend (flashmla, mla, dsa, ...) by naming it in the profile
+    ├── cache/        optional: CacheRecipe + CachePool subclasses, only for a
+    │                 non-standard KV layout; otherwise name an existing cache_family
+    ├── quant/        optional: QuantizationConfig subclass for a private weight format
+    └── drafter/      optional: BaseDrafter subclass for a private speculative algorithm
 ```
 
 ```toml
