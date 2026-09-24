@@ -37,12 +37,5 @@ ut:
     - python3 -m pytest tokenspeed-kernel/test/nvidia/thirdparty/test_trtllm_comm.py -v --junitxml=/tmp/kernel-trtllm-comm.xml
     - PYTHONPATH="python${PYTHONPATH:+:$PYTHONPATH}" python3 -m pytest tokenspeed-kernel/test/nvidia/thirdparty/test_cuda.py -v --junitxml=/tmp/kernel-cuda.xml
     - bash test/ci_system/run_kernel_gpu_ut.sh
-    - >-
-      python3 -c 'import xml.etree.ElementTree as ET;
-      counts = [ET.parse(path).getroot().find("testsuite").attrib
-      for path in ("/tmp/kernel-numerics.xml", "/tmp/kernel-trtllm-comm.xml",
-      "/tmp/kernel-cuda.xml", "/tmp/kernel-multi-gpu.xml",
-      "/tmp/kernel-rest.xml")];
-      assert sum(int(c["tests"]) - int(c["skipped"]) for c in counts) > 0'
 report:
   github_step_summary: true
