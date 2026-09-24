@@ -153,6 +153,7 @@ class GroupTableStacks:
         *,
         max_bs: int,
         max_tokens_per_req: int,
+        max_extend_tokens: int,
         device,
     ) -> None:
         if not groups:
@@ -174,6 +175,12 @@ class GroupTableStacks:
         self.decode_locs = torch.zeros(
             (g, self.max_bs * self.max_tokens_per_req), dtype=torch.int32, device=device
         )
+        # Extend spans up to this many tokens live here, tail at the dummy slot 0,
+        # so a prefill graph's padded prologue can record and replay the address.
+        self.extend_locs = torch.zeros(
+            (g, max(int(max_extend_tokens), 0)), dtype=torch.int32, device=device
+        )
+        self._extend_total = 0
         self.page_sizes = torch.tensor(
             [spec.kernel_page_size for spec in groups], dtype=torch.int32, device=device
         )
@@ -316,13 +323,34 @@ class GroupTableStacks:
         total_tokens: int,
     ) -> dict[str, torch.Tensor]:
         """Every group's extend write slots over the current stack
-        (``group_id -> [total_tokens]`` fresh tensors; extend metadata is
-        rebuilt per round)."""
+        (``group_id -> [total_tokens]``): views of the persistent buffer when the
+        span fits it, with the tail zeroed, else fresh tensors."""
+        self._extend_total = total_tokens
+        if total_tokens <= self.extend_locs.shape[1]:
+            out = self.extend_locs[:, :total_tokens]
+            self.extend_locs[:, total_tokens:].zero_()
+        else:
+            out = torch.empty(
+                (len(self.group_ids), total_tokens),
+                dtype=torch.int32,
+                device=self.tables.device,
+            )
         locs = extend_write_locations(
             self.tables,
             self.page_sizes,
             extend_prefix_lens,
             extend_seq_lens,
             total_tokens,
+            out,
         )
         return {gid: locs[i] for i, gid in enumerate(self.group_ids)}
+
+    def padded_extend_span(self, group_id: str, rows: int) -> torch.Tensor:
+        """The current extend span widened to ``rows`` over the buffer's zero tail
+        (the dummy slot 0), for a graph-padded forward."""
+        if not self._extend_total <= rows <= self.extend_locs.shape[1]:
+            raise ValueError(
+                f"an extend span of {self._extend_total} tokens cannot pad to {rows} rows "
+                f"in a {self.extend_locs.shape[1]}-token buffer"
+            )
+        return self.extend_locs[self._index[group_id], :rows]

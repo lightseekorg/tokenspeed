@@ -22,8 +22,6 @@ first:
 * `qk_norm_rope(q, k, *, head_dim, norm, rotary)` for keys that are not
   attention K/V but take the norm step (MiniMax-M3's indexer): the GQA kernels
   with no cache write. Indexers that only rotate call `embedding.rope`.
-* `write_kv(k, v, *, cache)` for the write step alone: prepared rows into a
-  native, FP8 or MXFP8 cache, the store the composite solution runs.
 
 Head geometry comes from the cache descriptor and the input shapes, and the
 storage format from the cache's rows and planes; no argument restates either.
@@ -154,19 +152,23 @@ A pool describes its destination with `kv_write_target(layer_id, slots)`:
 buffers, scale planes and whether the write sanitizes. Pools do not
 override the prologue's write.
 
-## Breakable prefill graphs
+## Graphs and the KV write
 
-The KV write runs inside the same eager break as core attention, so a replayed
-graph never reuses a recorded write location. A GQA layer's write runs inside
-`PagedAttention._attend`'s `@break_point`; under a breakable capture the norm
-and RoPE run before it, in the captured segment (`qk_norm_rope`), and the
-break stores the rows with `write_kv`, so the eager segment holds one store
-launch per layer as before the prologue existed. Outside a capture the whole
-prologue is one launch. An MLA model's prologue
-runs inside its attention break (`_attn`, or the attention module's
-`forward`); the backends' own breaks nest inside these and pass through, and
-remain for callers that reach a backend directly. Prefill graphs capture the target model only and
-replay a round with draft narrowing eagerly, so draft layers need no break.
+The write locations a prologue reads are refresh-in-place buffers, so the
+whole prologue is captured wherever the forward is: the decode CUDA graph
+records the router's published decode window, and the prefill breakable graph
+records the router's persistent extend span, `GroupTableStacks.extend_locs`
+(sized by the largest prefill-graph bucket). A graph-padded forward asks for
+one slot per row it carries (`AttentionBackend.padded_write_locations`); the
+rows past the real tokens land in the dummy slot 0, which the span keeps in
+its tail and which padded decode rows and page-table holes already use.
+Padding costs only the masked programs of the tile past the real tokens. Core
+attention stays the eager break (`PagedAttention._attend`); an MLA model's
+prologue runs inside its own attention break (`_attn`, or the attention
+module's `forward`), as it did before the prologue existed. The backends' own
+breaks nest inside these and pass through, and remain for callers that reach a
+backend directly. Prefill graphs capture the target model only and replay a
+round with draft narrowing eagerly, so draft layers need no break.
 
 ## Formats and scales
 

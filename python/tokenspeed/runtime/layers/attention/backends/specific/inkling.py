@@ -632,6 +632,9 @@ class InklingAttnBackend(AttentionBackend):
     def forward_write_locations(self, layer, forward_mode):
         return self.inner.forward_write_locations(layer, forward_mode)
 
+    def padded_write_locations(self, layer, forward_mode, rows):
+        return self.inner.padded_write_locations(layer, forward_mode, rows)
+
     def draft_history_view(self):
         return self.inner.draft_history_view()
 

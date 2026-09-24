@@ -42,15 +42,10 @@ from tokenspeed_kernel.ops.attention.prologue import (
     Rotary,
     gqa_prologue,
     mla_prologue,
-    qk_norm_rope,
-    write_kv,
 )
 from torch import nn
 
-from tokenspeed.runtime.execution.breakable_cuda_graph import (
-    break_point,
-    is_breakable_capture_active,
-)
+from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
@@ -169,24 +164,18 @@ class PagedAttention(nn.Module):
         """Run this layer's attention.
 
         A GQA layer given K/V takes its projected rows: the prologue normalizes
-        and rotates them and writes K/V at the backend's write locations. The
-        write runs inside the attention break so a replayed graph never reuses
-        stale locations; under a breakable capture the norm and RoPE run here,
-        in the captured segment, and the break only writes. ``k = v = None``
-        means the inputs are prepared and the cache written (by
-        :meth:`prologue`, or by an MLA layer's :meth:`latent_prologue`).
+        and rotates them and writes K/V at the backend's write locations, padded
+        to the rows the forward carries so a graph can record it; core attention
+        runs in the eager break. ``k = v = None`` means the inputs are prepared
+        and the cache written (by :meth:`prologue`, or by an MLA layer's
+        :meth:`latent_prologue`).
         """
         if k is not None and v is None:
             raise ValueError("v must be provided when k is provided.")
-        prepared = k is not None and is_breakable_capture_active()
-        if prepared and not ctx.forward_mode.is_idle():
-            norm, rotary = self._steps(positions)
-            q, k = qk_norm_rope(
-                q, k, head_dim=self.qk_head_dim, norm=norm, rotary=rotary
-            )
-        return self._attend(
-            q, k, v, None if prepared else positions, ctx, prepared, **kwargs
-        )
+        if k is not None and not ctx.forward_mode.is_idle():
+            out = self.prologue(q, k, v, positions, ctx)
+            q, k, v = out.q, out.k, out.v
+        return self._attend(q, k, v, ctx, **kwargs)
 
     @break_point
     def _attend(
@@ -194,19 +183,9 @@ class PagedAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor | None,
         v: torch.Tensor | None,
-        positions: torch.Tensor | None,
         ctx: ForwardContext,
-        prepared: bool,
         **kwargs,
     ) -> torch.Tensor:
-        if k is not None and not ctx.forward_mode.is_idle():
-            if prepared:
-                write_kv(k, v, cache=self._write_target(q, ctx))
-                if ctx.forward_mode.is_decode():
-                    k = v = None
-            else:
-                out = self.prologue(q, k, v, positions, ctx)
-                q, k, v = out.q, out.k, out.v
         if k is not None:
             k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
             v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
@@ -262,11 +241,9 @@ class PagedAttention(nn.Module):
         )
 
     def _write_target(self, q: torch.Tensor, ctx: ForwardContext) -> HeadKVCache:
-        slots = ctx.attn_backend.forward_write_locations(self, ctx.forward_mode)
-        if ctx.forward_mode.is_decode() and slots.numel() != q.shape[0]:
-            raise ValueError(
-                f"{slots.numel()} decode write slots for {q.shape[0]} rows"
-            )
+        slots = ctx.attn_backend.padded_write_locations(
+            self, ctx.forward_mode, q.shape[0]
+        )
         return ctx.token_to_kv_pool.kv_write_target(self.layer_id, slots)
 
     def attend_live_rows(

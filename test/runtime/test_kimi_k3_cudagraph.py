@@ -112,6 +112,7 @@ def _group_table(backend, raw_rows, bs: int, actual_bs: int) -> torch.Tensor:
         ],
         max_bs=max(bs, 4),
         max_tokens_per_req=backend.spec_num_tokens,
+        max_extend_tokens=0,
         device="cpu",
     )
     raw = torch.tensor(raw_rows, dtype=torch.int32)

@@ -205,9 +205,10 @@ def extend_write_locations(
     extend_prefix_lens: torch.Tensor,
     extend_seq_lens: torch.Tensor,
     total_tokens: int,
+    out: torch.Tensor,
 ) -> torch.Tensor:
     """Every group's extend write slots, ``[G, total_tokens]`` in q/k/v
-    token order (request-major, ``cu_extend_seq_lens`` layout).
+    token order (request-major, ``cu_extend_seq_lens`` layout), into ``out``.
 
     Args:
         tables: ``[G, max_bs >= bs, max_num_pages]`` int32 stacked kernel page
@@ -217,15 +218,13 @@ def extend_write_locations(
         extend_seq_lens: ``[bs]`` int32 new tokens per request.
         total_tokens: ``sum(extend_seq_lens)`` from the host mirror — no
             device sync here.
+        out: ``[G, total_tokens]`` int32 rows to fill; a view of the router's
+            persistent buffer, so a captured graph can record its address.
 
     Returns:
-        A fresh ``[G, total_tokens]`` int32 tensor (extend metadata is
-        rebuilt per round and is never graph-recorded).
+        ``out``.
     """
     bs = extend_seq_lens.shape[0]
-    out = torch.empty(
-        (tables.shape[0], total_tokens), dtype=torch.int32, device=tables.device
-    )
     if total_tokens == 0 or tables.shape[0] == 0 or bs == 0:
         return out
     cu_extend = torch.zeros(bs + 1, dtype=torch.int32, device=tables.device)

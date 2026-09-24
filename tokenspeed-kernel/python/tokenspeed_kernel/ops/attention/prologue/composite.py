@@ -81,10 +81,9 @@ def _rope_table(rotary: Rotary) -> tuple[torch.Tensor, torch.Tensor]:
     )
 
 
-def store_kv(
+def _write_kv(
     cache: HeadKVCache, k: torch.Tensor, v: torch.Tensor, enable_pdl: bool
 ) -> None:
-    """Store the leading ``cache.slots.numel()`` prepared K/V rows in the cache's format."""
     rows = cache.slots.numel()
     if rows == 0:
         return
@@ -167,7 +166,7 @@ def composite_gqa_prologue(
             table,
             is_neox=rotary.style is RopeStyle.NEOX,
         )
-    store_kv(cache, k, v, enable_pdl)
+    _write_kv(cache, k, v, enable_pdl)
     return GQAPrologueOutput(
         q=q, k=k if return_kv else None, v=v if return_kv else None
     )

@@ -173,6 +173,7 @@ class QSAIndexerBackend(AttentionBackend):
             self._table_specs,
             max_bs=max_bs,
             max_tokens_per_req=self.spec_num_tokens,
+            max_extend_tokens=0,
             device=self.device,
         )
         self._seq_lens = torch.empty(max_bs, dtype=torch.int32, device=self.device)

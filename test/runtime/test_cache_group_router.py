@@ -96,7 +96,9 @@ class WriteLocationMathTest(unittest.TestCase):
         tables, page_sizes = self._tables()
         prefix = torch.tensor([4, 0], dtype=torch.int32)
         new = torch.tensor([5, 2], dtype=torch.int32)
-        locs = extend_write_locations(tables, page_sizes, prefix, new, total_tokens=7)
+        locs = extend_write_locations(
+            tables, page_sizes, prefix, new, 7, torch.empty((2, 7), dtype=torch.int32)
+        )
         self.assertEqual(tuple(locs.shape), (2, 7))
         # request 0, group 0: positions 4..8 -> page 8 slots 0..3, page 9 slot 0.
         self.assertEqual(locs[0, :5].tolist(), [32, 33, 34, 35, 36])
@@ -132,11 +134,102 @@ class WriteLocationMathTest(unittest.TestCase):
         prefix = torch.randint(0, 30, (bs,), dtype=torch.int32)
         new = torch.randint(1, 200, (bs,), dtype=torch.int32)
         total = int(new.sum())
-        ref = extend_write_locations(tables, page_sizes, prefix, new, total)
+        groups = tables.shape[0]
+        ref = extend_write_locations(
+            tables,
+            page_sizes,
+            prefix,
+            new,
+            total,
+            torch.empty((groups, total), dtype=torch.int32),
+        )
         out = extend_write_locations(
-            tables.cuda(), page_sizes.cuda(), prefix.cuda(), new.cuda(), total
+            tables.cuda(),
+            page_sizes.cuda(),
+            prefix.cuda(),
+            new.cuda(),
+            total,
+            torch.empty((groups, total), dtype=torch.int32, device="cuda"),
         )
         torch.testing.assert_close(out.cpu(), ref)
+
+
+class PersistentExtendSpanTest(unittest.TestCase):
+    """The extend span lives in the stack's buffer so a captured prologue can pad
+    over it; a span past the buffer is a fresh tensor."""
+
+    def _stacks(self, capacity):
+        specs = [
+            GroupTableSpec(
+                FULL, block_granularity=4, kernel_page_size=4, max_num_pages=3
+            )
+        ]
+        stacks = GroupTableStacks(
+            specs,
+            max_bs=2,
+            max_tokens_per_req=1,
+            max_extend_tokens=capacity,
+            device="cpu",
+        )
+        stacks.tables[0, :2] = torch.tensor([[8, 9, 0], [3, 0, 0]], dtype=torch.int32)
+        return stacks
+
+    def test_a_fitting_span_is_a_view_with_a_zero_tail(self):
+        stacks = self._stacks(capacity=8)
+        prefix = torch.tensor([4, 0], dtype=torch.int32)
+        new = torch.tensor([3, 2], dtype=torch.int32)
+        span = stacks.extend_locations(prefix, new, 5)[FULL]
+        self.assertEqual(span.data_ptr(), stacks.extend_locs[0].data_ptr())
+        self.assertEqual(span.tolist(), [36, 37, 38, 12, 13])
+        self.assertEqual(stacks.extend_locs[0, 5:].tolist(), [0, 0, 0])
+        stacks.extend_locations(prefix, torch.tensor([1, 1], dtype=torch.int32), 2)
+        self.assertEqual(stacks.extend_locs[0].tolist(), [36, 12, 0, 0, 0, 0, 0, 0])
+
+    def test_a_span_past_the_buffer_is_fresh(self):
+        stacks = self._stacks(capacity=3)
+        prefix = torch.tensor([4, 0], dtype=torch.int32)
+        new = torch.tensor([3, 2], dtype=torch.int32)
+        span = stacks.extend_locations(prefix, new, 5)[FULL]
+        self.assertNotEqual(span.data_ptr(), stacks.extend_locs[0].data_ptr())
+        self.assertEqual(span.tolist(), [36, 37, 38, 12, 13])
+
+    def test_the_padded_span_widens_over_the_zero_tail(self):
+        stacks = self._stacks(capacity=8)
+        span = stacks.extend_locations(
+            torch.tensor([4, 0], dtype=torch.int32),
+            torch.tensor([3, 2], dtype=torch.int32),
+            5,
+        )[FULL]
+        padded = stacks.padded_extend_span(FULL, 8)
+        self.assertEqual(padded.tolist(), [36, 37, 38, 12, 13, 0, 0, 0])
+        self.assertEqual(padded.data_ptr(), span.data_ptr())
+        self.assertEqual(stacks.padded_extend_span(FULL, 5).tolist(), span.tolist())
+        with self.assertRaisesRegex(ValueError, "cannot pad to 4 rows"):
+            stacks.padded_extend_span(FULL, 4)
+        with self.assertRaisesRegex(ValueError, "cannot pad to 9 rows"):
+            stacks.padded_extend_span(FULL, 9)
+
+    def test_a_span_past_the_buffer_cannot_pad(self):
+        stacks = self._stacks(capacity=3)
+        stacks.extend_locations(
+            torch.tensor([4, 0], dtype=torch.int32),
+            torch.tensor([3, 2], dtype=torch.int32),
+            5,
+        )
+        with self.assertRaisesRegex(ValueError, "cannot pad to 8 rows"):
+            stacks.padded_extend_span(FULL, 8)
+
+    def test_a_backend_without_a_padded_span_serves_exact_counts_only(self):
+        from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+
+        backend = object.__new__(AttentionBackend)
+        span = torch.tensor([7, 8, 9], dtype=torch.int32)
+        backend.forward_write_locations = lambda layer, mode: span
+        self.assertIs(
+            AttentionBackend.padded_write_locations(backend, None, None, 3), span
+        )
+        with self.assertRaisesRegex(ValueError, "3 write slots for 4 rows"):
+            AttentionBackend.padded_write_locations(backend, None, None, 4)
 
 
 class GroupTableStacksTest(unittest.TestCase):
@@ -150,7 +243,11 @@ class GroupTableStacksTest(unittest.TestCase):
             ),
         ]
         return GroupTableStacks(
-            specs, max_bs=max_bs, max_tokens_per_req=2, device=device
+            specs,
+            max_bs=max_bs,
+            max_tokens_per_req=2,
+            max_extend_tokens=16,
+            device=device,
         )
 
     def test_fill_expands_pads_and_nulls_holes(self):

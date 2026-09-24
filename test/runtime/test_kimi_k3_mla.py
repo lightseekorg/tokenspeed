@@ -109,6 +109,7 @@ def _expand_via_stacks(backend, pool, logical_rows, device="cuda"):
         ],
         max_bs=max(bs, 4),
         max_tokens_per_req=backend.spec_num_tokens,
+        max_extend_tokens=0,
         device=device,
     )
     raw = torch.tensor(logical_rows, dtype=torch.int32, device=device)

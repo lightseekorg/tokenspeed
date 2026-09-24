@@ -149,17 +149,6 @@ def check_gqa_request(
     _once(key, _check_gqa_request, q, k, v, norm, rotary, cache)
 
 
-def check_kv_write(k: torch.Tensor, v: torch.Tensor, cache: HeadKVCache) -> None:
-    """Reject prepared K/V rows the store kernels would misread; metadata only."""
-    _once(
-        ("write", _layout(k), _layout(v), _cache_key(cache)),
-        _check_kv_write,
-        k,
-        v,
-        cache,
-    )
-
-
 def check_mla_request(
     query: torch.Tensor,
     q_pe: torch.Tensor,
@@ -325,31 +314,6 @@ def _check_gqa_request(
         raise ValueError(
             f"a native cache holds {q.dtype} or bf16 rows, not {cache.k_cache.dtype}"
         )
-
-
-def _check_kv_write(k: torch.Tensor, v: torch.Tensor, cache: HeadKVCache) -> None:
-    """Reject prepared K/V rows the store kernels would misread; metadata only."""
-    if cache.k_cache.dim() != 3 or cache.v_cache.shape != cache.k_cache.shape:
-        raise ValueError(
-            "key and value caches must be [slots, heads, head_dim] rows of one geometry"
-        )
-    row = cache.k_cache.shape[1:].numel()
-    if any(x.dim() != 2 or x.shape[1] != row or x.stride(-1) != 1 for x in (k, v)):
-        raise ValueError(
-            f"k {tuple(k.shape)} / v {tuple(v.shape)} are not dense rows of the cache heads"
-        )
-    if k.shape[0] != v.shape[0] or k.dtype != v.dtype:
-        raise ValueError("k and v must have the same rows and dtype")
-    if cache.format is KVCacheFormat.NATIVE and cache.k_cache.dtype not in (
-        k.dtype,
-        torch.bfloat16,
-    ):
-        raise ValueError(
-            f"a native cache holds {k.dtype} or bf16 rows, not {cache.k_cache.dtype}"
-        )
-    _check_slots(cache, k.shape[0])
-    if cache.scales is not None:
-        _check_mxfp8_scales(cache, *cache.k_cache.shape[1:])
 
 
 def _check_mla_request(

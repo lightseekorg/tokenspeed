@@ -417,6 +417,18 @@ class AttentionBackend(CachePoolBinding, ABC):
             f"{type(self).__name__} owns no paged write locations"
         )
 
+    def padded_write_locations(
+        self, layer: PagedAttention, forward_mode: ForwardMode, rows: int
+    ) -> torch.Tensor:
+        """:meth:`forward_write_locations` widened to the ``rows`` a graph-padded
+        forward carries, the extra rows landing in the dummy slot 0, so the
+        prologue can be captured; a backend without a padded span serves exact
+        counts only."""
+        locations = self.forward_write_locations(layer, forward_mode)
+        if locations.numel() != rows:
+            raise ValueError(f"{locations.numel()} write slots for {rows} rows")
+        return locations
+
     # ------------------------------------------------------------------
     # PD / speculative side state
     # ------------------------------------------------------------------

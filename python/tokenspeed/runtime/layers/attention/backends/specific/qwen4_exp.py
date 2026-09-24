@@ -146,6 +146,11 @@ class Qwen4ExpBackend(AttentionBackend):
     ) -> torch.Tensor:
         return self.attention_backend.forward_write_locations(layer, forward_mode)
 
+    def padded_write_locations(
+        self, layer: PagedAttention, forward_mode: ForwardMode, rows: int
+    ) -> torch.Tensor:
+        return self.attention_backend.padded_write_locations(layer, forward_mode, rows)
+
     def publish_draft_step_locations(
         self, cache_start: torch.Tensor, num_tokens: int
     ) -> torch.Tensor:

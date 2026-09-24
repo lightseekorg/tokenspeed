@@ -183,7 +183,7 @@ class CacheGroupRouter(AttentionBackend):
         self._stacks: GroupTableStacks | None = None
         self._decode_views: dict[tuple[int, int], RouterDecodeWriteLocations] = {}
         # Published write locations: the decode slot (graph-recorded views,
-        # refreshed in place) and the extend slot (fresh per round).
+        # refreshed in place) and the extend span (the stack's buffer, or fresh past it).
         self.decode_write_locations: RouterDecodeWriteLocations | None = None
         self._extend_write_locations: dict[str, torch.Tensor] | None = None
         self._decode_request_offset = 0
@@ -313,11 +313,11 @@ class CacheGroupRouter(AttentionBackend):
         unconditionally at wrapper construction so eager decode refreshes the
         same buffers a graph would.
         """
-        del kwargs
         self._stacks = GroupTableStacks(
             self._table_specs(),
             max_bs=max_bs,
             max_tokens_per_req=self.spec_num_tokens,
+            max_extend_tokens=int(kwargs.get("max_extend_tokens", 0)),
             device=self.device,
         )
         self._decode_views = {}
@@ -429,6 +429,20 @@ class CacheGroupRouter(AttentionBackend):
                 "extend write locations requested before init_forward_metadata"
             )
         return self._extend_write_locations[gid]
+
+    def padded_write_locations(
+        self, layer: PagedAttention, forward_mode: ForwardMode, rows: int
+    ) -> torch.Tensor:
+        """The extend span padded over the stack buffer's dummy-slot tail to the
+        rows a graph-padded forward carries; decode rows carry their own slots."""
+        locations = self.forward_write_locations(layer, forward_mode)
+        if locations.numel() == rows:
+            return locations
+        if not forward_mode.is_extend():
+            raise ValueError(
+                f"{locations.numel()} {forward_mode.name.lower()} write slots for {rows} rows"
+            )
+        return self.stacks.padded_extend_span(layer.group_id, rows)
 
     def forward_write_locations(
         self, layer: PagedAttention, forward_mode: ForwardMode

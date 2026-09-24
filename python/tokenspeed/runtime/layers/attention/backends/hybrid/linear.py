@@ -127,6 +127,11 @@ class HybridLinearAttnBackend(AttentionBackend):
             layer, forward_mode
         )
 
+    def padded_write_locations(self, layer, forward_mode, rows):
+        return self._backend_for_layer(layer.layer_id).padded_write_locations(
+            layer, forward_mode, rows
+        )
+
     @property
     def cache_consumer_families(self) -> frozenset[str]:
         """Cache families consumed by the two child backends."""

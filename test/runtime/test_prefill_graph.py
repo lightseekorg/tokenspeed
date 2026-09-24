@@ -537,6 +537,7 @@ class DummyGroupTablesTest(unittest.TestCase):
             ],
             max_bs=1,
             max_tokens_per_req=1,
+            max_extend_tokens=0,
             device="cpu",
         )
         stacks.fill(1, 1, dict(tables))
@@ -566,6 +567,7 @@ class DummyGroupTablesTest(unittest.TestCase):
             ],
             max_bs=1,
             max_tokens_per_req=1,
+            max_extend_tokens=0,
             device="cpu",
         )
         stacks.fill(1, 1, dict(tables))

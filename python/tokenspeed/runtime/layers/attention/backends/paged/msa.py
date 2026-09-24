@@ -466,6 +466,11 @@ class MSAHybridAttnBackend(AttentionBackend):
             layer, forward_mode
         )
 
+    def padded_write_locations(self, layer, forward_mode, rows):
+        return self._router_for_layer(layer.layer_id).padded_write_locations(
+            layer, forward_mode, rows
+        )
+
     def init_forward_metadata(self, *args, **kwargs):
         self.full_router.init_forward_metadata(*args, **kwargs)
         self.sparse_router.init_forward_metadata(*args, **kwargs)
