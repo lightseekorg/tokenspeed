@@ -79,7 +79,6 @@ def _run_mla_decode(
         v_head_dim=4,
         scaling=1.0,
         logit_cap=0.0,
-        k_scale_float=None,
         layer_id=0,
         sliding_window_size=sliding_window_size,
     )
@@ -95,7 +94,6 @@ def _run_mla_decode(
         out_cache_loc=torch.empty(0, dtype=torch.int32),
         token_to_kv_pool=token_to_kv_pool,
         bs=bs,
-        save_kv_cache=False,
     )
     return captured
 
@@ -311,7 +309,6 @@ def _run_cutedsl_decode(
         head_dim=4,
         v_head_dim=4,
         scaling=1.0,
-        k_scale_float=None,
         layer_id=0,
         sliding_window_size=sliding_window_size,
     )
@@ -325,7 +322,6 @@ def _run_cutedsl_decode(
             get_key_buffer=lambda layer_id: torch.zeros(32, 4)
         ),
         bs=bs,
-        save_kv_cache=False,
     )
     return captured
 

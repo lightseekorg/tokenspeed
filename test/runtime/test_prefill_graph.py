@@ -330,44 +330,6 @@ class SliceMhaExtendInputsTest(unittest.TestCase):
         self.assertIs(self.slice_inputs(metadata, q, None, None)[0], q)
 
 
-class TrimKvToLocsTest(unittest.TestCase):
-    """mha.trim_kv_to_locs slices padded k/v tails to the write-loc count --
-    the shared fix point every leaf's KV write calls (mha, msa, trtllm).
-    Trimming (not loc-padding) keeps the null page 0 all-zero: trtllm does
-    not scrub padded tail rows before saving KV."""
-
-    def setUp(self):
-        try:
-            import torch
-
-            from tokenspeed.runtime.layers.attention.backends.paged.mha import (
-                trim_kv_to_locs,
-            )
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
-        self.torch = torch
-        self.trim = trim_kv_to_locs
-
-    def test_padded_tail_trimmed(self):
-        k = self.torch.zeros(16, 2, 8)
-        v = self.torch.zeros(16, 2, 8)
-        locs = self.torch.zeros(5, dtype=self.torch.int32)
-        k2, v2 = self.trim(locs, k, v)
-        self.assertEqual((k2.shape[0], v2.shape[0]), (5, 5))
-
-    def test_equal_rows_identity(self):
-        k = self.torch.zeros(16, 2, 8)
-        v = self.torch.zeros(16, 2, 8)
-        locs = self.torch.zeros(16, dtype=self.torch.int32)
-        k2, v2 = self.trim(locs, k, v)
-        self.assertIs(k2, k)
-        self.assertIs(v2, v)
-
-    def test_none_kv_passthrough(self):
-        locs = self.torch.zeros(4, dtype=self.torch.int32)
-        self.assertEqual(self.trim(locs, None, None), (None, None))
-
-
 class DummyGroupTablesTest(unittest.TestCase):
     """Capture-time dummy tables: every group gets a real, writable block;
     none get the reserved null block 0."""
@@ -1196,34 +1158,15 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
 
 
 class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
-    """trtllm under the prefill graph: the extend prewrite must not bake
-    capture-time write locs into the graph, and the break's KV write must
-    trim padded tails like mha."""
+    """trtllm leaves reach the prefill graph through the cache-group router."""
 
     def setUp(self):
         try:
-            import torch
-
-            from tokenspeed.runtime.layers.attention.backends.paged import trtllm
+            from tokenspeed.runtime.layers.attention.backends.paged import (  # noqa: F401
+                trtllm,
+            )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
-        self.torch = torch
-        self.mod = trtllm
-
-    def _bare_backend(self):
-        b = self.mod.TRTLLMMHAAttnBackend.__new__(self.mod.TRTLLMMHAAttnBackend)
-        b.kv_cache_dtype = self.torch.bfloat16
-        return b
-
-    def test_prewrite_disabled_during_breakable_capture(self):
-        from unittest import mock
-
-        b = self._bare_backend()
-        self.assertTrue(b.support_kv_cache_prewrite(None))
-        with mock.patch.object(
-            self.mod, "is_breakable_capture_active", return_value=True
-        ):
-            self.assertFalse(b.support_kv_cache_prewrite(None))
 
     def test_router_declares_history_contract_family(self):
         # The family claim moved off the leaves: the runner-facing node in

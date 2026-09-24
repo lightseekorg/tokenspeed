@@ -318,9 +318,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         Default no-op for leaves with separate prefill/decode slots."""
         yield
 
-    def support_kv_cache_prewrite(
-        self, forward_mode: ForwardMode | None = None
-    ) -> bool:
+    def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
         return False
 
     def set_request_slots(self, req_pool_indices: torch.Tensor) -> None:
@@ -348,10 +346,10 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool: CachePool,
         bs: int,
-        save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-        """Decode attention over the current ``forward_decode_metadata``."""
+        """Decode attention over the current ``forward_decode_metadata``; the
+        prologue has already written this forward's KV rows."""
 
     @abstractmethod
     def forward_extend(
@@ -363,10 +361,10 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool: CachePool,
         bs: int,
-        save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-        """Extend attention over the current extend metadata."""
+        """Extend attention over the current extend metadata; the prologue has
+        already written this forward's KV rows."""
 
     def forward_extend_chunked(self, *args, **kwargs):
         """DeepSeek's chunked prefix replay (MLA family); others never call it."""

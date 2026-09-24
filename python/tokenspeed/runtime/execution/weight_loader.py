@@ -24,6 +24,7 @@ from tokenspeed.runtime.configs.device_config import DeviceConfig
 from tokenspeed.runtime.configs.load_config import LoadConfig
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.model_loader import get_model
+from tokenspeed.runtime.model_loader.weight_utils import require_unit_kv_scale_file
 from tokenspeed.runtime.utils import (
     get_available_gpu_memory,
     get_colorful_logger,
@@ -63,6 +64,12 @@ class WeightLoader:
         Returns:
             LoadedModel with model and dtype
         """
+        if (
+            server_args.kv_cache_dtype == "fp8_e4m3"
+            and server_args.quantization_param_path is not None
+        ):
+            require_unit_kv_scale_file(server_args.quantization_param_path)
+
         logger.info(
             "Load weight begin. avail mem="
             f"{get_available_gpu_memory(device, gpu_id):.2f} GB",
@@ -103,27 +110,6 @@ class WeightLoader:
                     architectures=model_config.hf_config.architectures,
                 )
                 initialize_engram(tokenizer)
-
-        # Load KV cache scaling factors if using FP8
-        if server_args.kv_cache_dtype == "fp8_e4m3":
-            if server_args.quantization_param_path is not None:
-                if callable(getattr(model, "load_kv_cache_scales", None)):
-                    model.load_kv_cache_scales(server_args.quantization_param_path)
-                    logger.info(
-                        "Loaded KV cache scaling factors from "
-                        f"{server_args.quantization_param_path!s}",
-                    )
-                else:
-                    raise RuntimeError(
-                        "Using FP8 KV cache and scaling factors provided but "
-                        f"model {model.__class__} does not support loading scaling factors."
-                    )
-            else:
-                logger.warning(
-                    "Using FP8 KV cache but no scaling factors provided. "
-                    "Defaulting to scaling factors of 1.0. "
-                    "This may lead to less accurate results!"
-                )
 
         dtype = model_config.dtype
 

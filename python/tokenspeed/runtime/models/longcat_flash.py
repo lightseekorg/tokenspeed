@@ -65,9 +65,6 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
 from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader as _default_weight_loader,
 )
-from tokenspeed.runtime.model_loader.weight_utils import (
-    kv_cache_scales_loader as _kv_cache_scales_loader,
-)
 from tokenspeed.runtime.models.base import BaseCausalLM as _BaseCausalLM
 from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA as _DeepseekV3AttentionMLA,
@@ -865,24 +862,6 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                     self_attn.kv_a_layernorm.weight.data *= (
                         self.config.hidden_size / self.config.kv_lora_rank
                     ) ** 0.5
-
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        tp_size = self.mapping.attn.tp_size
-        tp_rank = self.mapping.attn.tp_rank
-        for attn_idx, scaling_factor in _kv_cache_scales_loader(
-            quantization_param_path,
-            tp_rank,
-            tp_size,
-            self.config.num_hidden_layers * 2,
-            self.config.__class__.model_type,
-        ):
-            layer_idx, branch_idx = divmod(attn_idx, 2)
-            if not isinstance(self.model.layers[layer_idx], nn.Identity):
-                self_attn = self.model.layers[layer_idx].self_attn[branch_idx]
-                for attn in (self_attn.attn_mha, self_attn.attn_mqa):
-                    if attn is not None and hasattr(attn, "k_scale"):
-                        attn.k_scale = scaling_factor
-                        attn.k_scale_float = scaling_factor
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

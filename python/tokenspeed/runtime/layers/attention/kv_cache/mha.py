@@ -23,10 +23,13 @@ from __future__ import annotations
 from typing import ClassVar
 
 import torch
+from tokenspeed_kernel.ops.attention.prologue import (
+    HeadKVCache,
+    MXFP8Scales,
+)
 from tokenspeed_kernel.ops.kvcache.triton import (
     quantize_store_kv_mxfp8,
     store_kv_cache,
-    store_sf_interleaved,
 )
 
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
@@ -170,21 +173,25 @@ class MHATokenToKVPool(CachePool):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    def kv_write_target(self, layer_id: int, slots: torch.Tensor) -> HeadKVCache:
+        """Where the attention prologue writes this layer's K/V rows."""
+        k_cache, v_cache = self.get_kv_buffer(layer_id)
+        return HeadKVCache(
+            k_cache=k_cache,
+            v_cache=v_cache,
+            scales=None,
+            slots=slots,
+        )
+
     def set_kv_buffer(
         self,
         layer: PagedAttention,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: float | None = None,
-        v_scale: float | None = None,
     ):
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
-            if k_scale is not None:
-                cache_k.div_(k_scale)
-            if v_scale is not None:
-                cache_v.div_(v_scale)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
         if self.store_dtype != self.dtype:
@@ -204,13 +211,13 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
     """MHA KV pool storing MXFP8 block-scaled FP8 (data + UE8M0 scales).
 
     Data buffers hold float8_e4m3fn; scale buffers hold one float8_e8m0fnu
-    per 32 elements of head_dim. ``set_kv_buffer`` expects PRE-QUANTIZED
-    K/V plus per-token scale tensors (producer: ``quantize_mxfp8``); the
-    bf16 per-tensor-scale paths of the base class do not apply.
+    per 32 elements of head_dim. ``set_kv_buffer`` quantizes K/V rows and
+    stores their scales, as the attention prologue does through
+    ``kv_write_target``.
 
     Scales live in the page-major interleaved layout the FA4 blockscaled
     kernel consumes -- ``(num_pages, heads, page_tokens // 128, 32, sf, sf)``
-    BlockScaledBasicChunk atoms written via ``store_sf_interleaved`` -- the
+    BlockScaledBasicChunk atoms written by ``quantize_store_kv_mxfp8`` -- the
     one shape ``plan.mxfp8_kv_scale_fields`` declares.
 
     When the plan aliases fields, data and scale views remain layer-local
@@ -282,66 +289,42 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             self._layer_scale_view(v_sf, layer_id),
         )
 
+    def kv_write_target(self, layer_id: int, slots: torch.Tensor) -> HeadKVCache:
+        """Where the attention prologue writes this layer's K/V rows and scales."""
+        k_cache, v_cache = self.get_kv_buffer(layer_id)
+        return HeadKVCache(
+            k_cache=k_cache,
+            v_cache=v_cache,
+            scales=MXFP8Scales(
+                k=self.k_scale_buffer[layer_id],
+                v=self.v_scale_buffer[layer_id],
+                page_tokens=self._layer_page_tokens(layer_id),
+            ),
+            slots=slots,
+        )
+
     def set_kv_buffer(
         self,
         layer: PagedAttention,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: torch.Tensor | None = None,
-        v_scale: torch.Tensor | None = None,
     ):
-        assert (
-            cache_k.dtype == self.store_dtype
-        ), "MXFP8 pool expects pre-quantized fp8 K (see quantize_mxfp8)"
-        assert (
-            k_scale is not None and v_scale is not None
-        ), "MXFP8 pool requires per-token e8m0 scale tensors"
+        """Quantize K/V rows to MXFP8 and scatter them with their block scales."""
         layer_id = layer.layer_id
-        # Byte views: triton can't mask-fill fp8; locs are per-layer view rows (target the served view)
-        store_kv_cache(
-            cache_k.view(torch.uint8),
-            cache_v.view(torch.uint8),
-            self._layer_row_view(self.k_buffer[layer_id], layer_id).view(torch.uint8),
-            self._layer_row_view(self.v_buffer[layer_id], layer_id).view(torch.uint8),
-            loc,
-        )
-        page_tokens = self._layer_page_tokens(layer_id)
-        store_sf_interleaved(
-            k_scale, self.k_scale_buffer[layer_id], loc, page_size=page_tokens
-        )
-        store_sf_interleaved(
-            v_scale, self.v_scale_buffer[layer_id], loc, page_size=page_tokens
-        )
-
-    def quantize_and_set_kv_buffer(
-        self,
-        layer: PagedAttention,
-        loc: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-    ) -> bool:
-        """Fused per-token quantize + data store + SF scatter (one launch).
-
-        Bit-identical to quantize_mxfp8 + set_kv_buffer (parity-tested) and
-        keeps the store inside the PDL chain. Returns False when the fused
-        kernel has no variant for this head_dim -- the caller falls back to
-        the split path.
-        """
-        if self.head_dim != 128:
-            return False
-        layer_id = layer.layer_id
+        # Locs are per-layer view rows: target the served view
+        k_rows = self._layer_row_view(self.k_buffer[layer_id], layer_id)
+        v_rows = self._layer_row_view(self.v_buffer[layer_id], layer_id)
         quantize_store_kv_mxfp8(
-            k,
-            v,
-            self._layer_row_view(self.k_buffer[layer_id], layer_id),
-            self._layer_row_view(self.v_buffer[layer_id], layer_id),
+            cache_k.view(-1, *k_rows.shape[1:]),
+            cache_v.view(-1, *v_rows.shape[1:]),
+            k_rows,
+            v_rows,
             self.k_scale_buffer[layer_id],
             self.v_scale_buffer[layer_id],
             loc,
             page_tokens=self._layer_page_tokens(layer_id),
         )
-        return True
 
     def get_kv_size_bytes(self):
         k_size, v_size = super().get_kv_size_bytes()

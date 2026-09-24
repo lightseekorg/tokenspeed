@@ -28,6 +28,10 @@ import torch
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
 from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
+from tokenspeed.runtime.model_loader.weight_utils import (
+    non_unit_kv_scale_message,
+    record_non_unit_kv_scales,
+)
 from tokenspeed.runtime.multimodal.embedder import warmup_multimodal_encoders
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict_update
@@ -327,8 +331,16 @@ class ModelRunner:
                     dist.broadcast(buf, src=0, group=pg)
                     yield name, buf
 
-            self.model.load_weights(_recv())
+            # The update loads to completion so the model stays consistent, then fails on a scale.
+            rejected: list[str] = []
+            self.model.load_weights(record_non_unit_kv_scales(_recv(), rejected))
             torch.cuda.synchronize(device)
+            if rejected:
+                return False, (
+                    f"applied {len(names)} weights, but the update is rejected and "
+                    f"its weight version not advanced: {non_unit_kv_scale_message(rejected)}; "
+                    "resend the weights without KV-cache scales"
+                )
             return True, f"updated {len(names)} weights"
         except Exception as e:  # noqa: BLE001 - surface to the control plane
             logger.exception("update_weights_from_distributed failed")

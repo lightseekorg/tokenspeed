@@ -363,9 +363,9 @@ class AttentionBackend(CachePoolBinding, ABC):
         same object whichever level of the tree they hold."""
         return self._sparse_topk
 
-    def support_kv_cache_prewrite(
-        self, forward_mode: ForwardMode | None = None
-    ) -> bool:
+    def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
+        """Whether a narrowed draft step in a round of ``forward_mode`` can
+        attend its live rows as a DECODE dispatch (Eagle3's first step)."""
         return False
 
     # ------------------------------------------------------------------
@@ -402,9 +402,17 @@ class AttentionBackend(CachePoolBinding, ABC):
     def write_locations(
         self, layer: PagedAttention, forward_mode: ForwardMode
     ) -> torch.Tensor:
-        """This layer's KV write slots for the requests the forward covers —
-        the one accessor for writers outside the backend (fused RoPE
-        prewrite, model-side MLA cache writes)."""
+        """This layer's KV write slots for one mode's requests: the EXTEND span
+        or the DECODE window."""
+        raise NotImplementedError(
+            f"{type(self).__name__} owns no paged write locations"
+        )
+
+    def forward_write_locations(
+        self, layer: PagedAttention, forward_mode: ForwardMode
+    ) -> torch.Tensor:
+        """Slots for the K/V rows a forward in ``forward_mode`` carries: the
+        attention prologue's write target."""
         raise NotImplementedError(
             f"{type(self).__name__} owns no paged write locations"
         )
@@ -437,22 +445,22 @@ class AttentionBackend(CachePoolBinding, ABC):
     def record_pd_cache_step(
         self,
         forward_mode: ForwardMode,
-        save_kv_cache: bool,
+        writes_in_call: bool,
         record_kv_cache: bool | None,
     ):
-        """Anchor the PD layerwise cache-step record to the wrapped KV write:
-        before the attention call when the KV was pre-written
-        (``save_kv_cache=False``), after it otherwise. No-op without a step
+        """Anchor the PD layerwise cache-step record to the layer's last cache
+        write: after the wrapped call when it writes a cache field
+        (``writes_in_call``), before it otherwise. No-op without a step
         counter."""
         if record_kv_cache is None:
             record_cache = not forward_mode.is_decode() and not forward_mode.is_idle()
         else:
             record_cache = record_kv_cache
         record_cache = record_cache and self.step_counter is not None
-        if record_cache and not save_kv_cache:
+        if record_cache and not writes_in_call:
             self.step_counter.record_cache()
         yield
-        if record_cache and save_kv_cache:
+        if record_cache and writes_in_call:
             self.step_counter.record_cache()
 
     # ------------------------------------------------------------------

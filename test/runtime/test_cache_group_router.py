@@ -291,15 +291,11 @@ class _StubLeaf(PagedAttentionBackend):
         )
         self.calls.append(("refresh", bs, actual_bs, num_extends, for_graph_replay))
 
-    def forward_decode(
-        self, q, k, v, layer, out_cache_loc, pool, bs, save_kv_cache=True, **kw
-    ):
+    def forward_decode(self, q, k, v, layer, out_cache_loc, pool, bs, **kw):
         self.calls.append(("decode", layer.group_id, out_cache_loc))
         return q
 
-    def forward_extend(
-        self, q, k, v, layer, out_cache_loc, pool, bs, save_kv_cache=True, **kw
-    ):
+    def forward_extend(self, q, k, v, layer, out_cache_loc, pool, bs, **kw):
         self.calls.append(("extend", layer.group_id, out_cache_loc))
         return q
 
@@ -460,7 +456,9 @@ class CacheGroupRouterTest(unittest.TestCase):
             block_tables=tables,
         )
         q = torch.zeros(2)
-        router.forward(q, None, None, _layer(SWA), None, ForwardMode.DECODE, 2)
+        router.forward(
+            q, None, None, _layer(SWA), None, ForwardMode.DECODE, 2, save_kv_cache=False
+        )
         kind, gid, loc = leaves[SWA].calls[-1]
         self.assertEqual((kind, gid), ("decode", SWA))
         # Slot math is page-size invariant: pos 8 of request 0 is raw page 7
@@ -473,7 +471,16 @@ class CacheGroupRouterTest(unittest.TestCase):
         )
         self.assertFalse(any(c[0] == "decode" for c in leaves[FULL].calls))
         with self.assertRaisesRegex(KeyError, "names cache group 'nope'"):
-            router.forward(q, None, None, _layer("nope"), None, ForwardMode.DECODE, 2)
+            router.forward(
+                q,
+                None,
+                None,
+                _layer("nope"),
+                None,
+                ForwardMode.DECODE,
+                2,
+                save_kv_cache=False,
+            )
 
     def test_decode_write_location_views_are_pointer_stable_per_bs(self):
         router, _ = self._router(spec=2)
@@ -525,6 +532,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             None,
             ForwardMode.DECODE,
             2,
+            save_kv_cache=False,
         )
         self.assertIs(
             leaves[FULL].calls[-1][2],
@@ -602,6 +610,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             None,
             ForwardMode.EXTEND,
             2,
+            save_kv_cache=False,
         )
         self.assertIs(leaves[FULL].calls[-1][2], locs)
         no_extends = torch.zeros(0, dtype=torch.int32)
@@ -686,6 +695,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             None,
             ForwardMode.DECODE,
             1,
+            save_kv_cache=False,
         )
         self.assertEqual(leaves[FULL].calls[-1][2].tolist(), [39])
 
@@ -726,6 +736,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             None,
             ForwardMode.DECODE,
             1,
+            save_kv_cache=False,
         )
         self.assertEqual(leaves[FULL].calls[-1][2].tolist(), [24, 25, 26, 27, 0])
 
@@ -759,10 +770,12 @@ class CacheGroupRouterTest(unittest.TestCase):
             num_extends=1,
         )
         q = torch.zeros(1)
-        router.forward_decode(q, q, q, _layer(FULL), None, 1)
+        router.forward_decode(q, q, q, _layer(FULL), None, 1, save_kv_cache=False)
         self.assertEqual(leaves[FULL].calls[-1][2].tolist(), [24])
 
-    def test_draft_step_zero_mixed_decode_composes_both_windows(self):
+    def _mixed_draft_router(self):
+        """A draft router after a MIXED round's refresh: request 0 extends five
+        tokens, request 1 decodes one verify row."""
         router, leaves = self._router(is_draft=True, spec=1)
         seq_lens = torch.tensor([9, 4], dtype=torch.int32)
         extend_seq_lens = torch.tensor([5], dtype=torch.int32)
@@ -791,6 +804,10 @@ class CacheGroupRouterTest(unittest.TestCase):
             block_tables=self._tables(),
             num_extends=1,
         )
+        return router, leaves
+
+    def test_draft_step_zero_mixed_decode_composes_both_windows(self):
+        router, leaves = self._mixed_draft_router()
         router.forward(
             torch.zeros(2),
             torch.zeros(6),
@@ -799,6 +816,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             None,
             ForwardMode.DECODE,
             2,
+            save_kv_cache=False,
         )
         self.assertEqual(leaves[FULL].calls[-1][2].tolist(), [24, 25, 26, 27, 0, 39])
 
@@ -813,9 +831,16 @@ class CacheGroupRouterTest(unittest.TestCase):
             None,
             ForwardMode.DECODE,
             2,
+            save_kv_cache=False,
         )
         self.assertEqual(leaves[FULL].calls[-1][2].data_ptr(), later.data_ptr())
         self.assertEqual(later.tolist(), [24, 36])
+
+    def test_draft_step_zero_mixed_dispatch_writes_every_row(self):
+        """Eagle3 prepares a MIXED round's step 0 in the round's own mode."""
+        router, _ = self._mixed_draft_router()
+        slots = router.forward_write_locations(_layer(FULL), ForwardMode.MIXED)
+        self.assertEqual(slots.tolist(), [24, 25, 26, 27, 0, 39])
 
     def test_capture_seeds_with_idle_rows_then_calls_leaf_capture_hooks(self):
         router, leaves = self._router()

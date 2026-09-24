@@ -25,6 +25,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
+from tokenspeed_kernel.ops.attention.prologue import HeadKVCache, LatentKVCache
 
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
@@ -393,3 +394,11 @@ class CachePool(ABC):
         cache_v: torch.Tensor,
     ) -> None:
         """Scatter one forward pass's K/V into this layer's planes."""
+
+    def kv_write_target(
+        self, layer_id: int, slots: torch.Tensor
+    ) -> HeadKVCache | LatentKVCache:
+        """Where the attention prologue writes this layer's rows at ``slots``."""
+        raise NotImplementedError(
+            f"{type(self).__name__} serves no attention prologue writes"
+        )

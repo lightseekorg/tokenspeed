@@ -363,6 +363,19 @@ class TestSpecMatchesShapeTraits:
         assert not spec_matches_shape_traits(spec, {"n": 64, "k": 4096})
         assert not spec_matches_shape_traits(spec, {"n": 128, "k": 96})
 
+    def test_maximum_trait_matches(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"token_heads_max": frozenset({2048})},
+        )
+
+        assert spec_matches_shape_traits(spec, {"token_heads": 2048})
+        assert spec_matches_shape_traits(spec, {"token_heads": 1})
+        assert not spec_matches_shape_traits(spec, {"token_heads": 2049})
+        assert not spec_matches_shape_traits(spec, {})
+
     def test_constrained_dim_must_be_supplied(self):
         spec = KernelSpec(
             name="k",

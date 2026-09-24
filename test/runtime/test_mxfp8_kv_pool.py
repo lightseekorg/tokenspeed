@@ -18,8 +18,9 @@
 """MXFP8 KV pool: quantize -> store -> verify layout and roundtrip error.
 
 Covers the interleaved scale layout (uniform and per-layer head counts), the
-size accounting, and an end-to-end quantize_mxfp8 -> set_kv_buffer ->
-manual dequant roundtrip against the original bf16 K/V.
+size accounting, and an end-to-end set_kv_buffer -> manual dequant roundtrip
+against the original bf16 K/V, with the stored bytes equal to quantize_mxfp8's
+on finite inputs.
 """
 
 from __future__ import annotations
@@ -93,10 +94,10 @@ def test_store_and_roundtrip():
     T = 96
     kv = torch.randn(T, HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
     k_q, k_sf = _quantize(kv)
-    v_q, v_sf = _quantize(kv * 0.5)
+    v_q, _ = _quantize(kv * 0.5)
     loc = torch.randperm(pool.arena.size, device="cuda")[:T].to(torch.int64)
 
-    pool.set_kv_buffer(layer, loc, k_q, v_q, k_scale=k_sf, v_scale=v_sf)
+    pool.set_kv_buffer(layer, loc, kv, kv * 0.5)
 
     # Data lands at loc.
     assert torch.equal(pool.k_buffer[1][loc].view(torch.uint8), k_q.view(torch.uint8))
@@ -122,18 +123,6 @@ def test_store_and_roundtrip():
     k_rt = _dequant(pool.k_buffer[1][loc], k_sf)
     rel = (k_rt - kv.float()).abs().max() / kv.float().abs().max()
     assert rel < 0.13, f"roundtrip rel err {rel:.4f}"  # e4m3 mantissa ~2^-3
-
-
-def test_requires_prequantized_and_scales():
-    pool = _make_pool(128)
-    layer = SimpleNamespace(layer_id=0)
-    loc = torch.arange(4, device="cuda", dtype=torch.int64)
-    bf16 = torch.randn(4, HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(AssertionError):
-        pool.set_kv_buffer(layer, loc, bf16, bf16, None, None)
-    q, _sf = _quantize(bf16)
-    with pytest.raises(AssertionError):
-        pool.set_kv_buffer(layer, loc, q, q, None, None)
 
 
 def test_size_accounting_includes_scales():
@@ -282,10 +271,9 @@ def test_shared_field_store_matches_standalone_scatter(layer_id: int, heads_l: i
     T = 80
     kv = torch.randn(T, heads_l, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
     k_q, k_sf = _quantize(kv)
-    v_q, v_sf = _quantize(kv * 0.5)
     loc = torch.randperm(num_ids * page_tokens, device="cuda")[:T].to(torch.int64)
 
-    pool.set_kv_buffer(layer, loc, k_q, v_q, k_scale=k_sf, v_scale=v_sf)
+    pool.set_kv_buffer(layer, loc, kv, kv * 0.5)
 
     # Data: readable back through the layer's row view at the same locs.
     rows = pool.get_key_buffer(layer_id)
@@ -363,6 +351,50 @@ def _create_config_pool(config):
         num_layers=LAYERS,
         rank=0,
     )
+
+
+@pytest.mark.parametrize("layer_id", range(len(SHARED_KV_HEADS)))
+def test_the_prologue_writes_through_the_pool_write_target(layer_id: int):
+    """The prologue's rows land where the pool's own quantize-and-store puts
+    them, for every per-layer head count of a shared field."""
+    from tokenspeed_kernel.ops.attention.prologue import gqa_attention_prologue
+    from tokenspeed_kernel.ops.kvcache.triton import quantize_store_kv_mxfp8
+
+    heads, tokens = SHARED_KV_HEADS[layer_id], 37
+    g = torch.Generator(device="cuda").manual_seed(layer_id)
+    q, k, v = (
+        torch.randn(tokens, n * heads * HEAD_DIM, generator=g, device="cuda").bfloat16()
+        for n in (2, 1, 1)
+    )
+    prologue_pool, reference_pool = _make_shared_pool(), _make_shared_pool()
+    loc = torch.randperm(reference_pool.arena.size, generator=g, device="cuda")[:tokens]
+    quantize_store_kv_mxfp8(
+        k.view(tokens, heads, HEAD_DIM),
+        v.view(tokens, heads, HEAD_DIM),
+        reference_pool._layer_row_view(reference_pool.k_buffer[layer_id], layer_id),
+        reference_pool._layer_row_view(reference_pool.v_buffer[layer_id], layer_id),
+        reference_pool.k_scale_buffer[layer_id],
+        reference_pool.v_scale_buffer[layer_id],
+        loc,
+        page_tokens=reference_pool._layer_page_tokens(layer_id),
+    )
+    gqa_attention_prologue(
+        q,
+        k,
+        v,
+        norm=None,
+        rotary=None,
+        cache=prologue_pool.kv_write_target(layer_id, loc),
+        return_kv=False,
+        solution=None,
+        override=None,
+    )
+    for name in ("k_buffer", "v_buffer", "k_scale_buffer", "v_scale_buffer"):
+        for lid in range(len(SHARED_KV_HEADS)):
+            got = getattr(prologue_pool, name)[lid].view(torch.uint8)
+            assert torch.equal(
+                got, getattr(reference_pool, name)[lid].view(torch.uint8)
+            )
 
 
 def test_config_selects_mxfp8_pool_and_sizes():

@@ -58,6 +58,8 @@ def _layer(layer_id, sliding_window_size):
         num_kv_heads=1,
         layer_id=layer_id,
         sliding_window_size=sliding_window_size,
+        rotary_emb=None,
+        qk_norm=None,
     )
 
 

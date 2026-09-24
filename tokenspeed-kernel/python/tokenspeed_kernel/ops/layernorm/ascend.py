@@ -20,6 +20,24 @@
 
 """Ascend layernorm kernels."""
 
-from tokenspeed_kernel_npu.ops.layernorm import qk_rmsnorm, rmsnorm
+import torch
+from tokenspeed_kernel_npu.ops.layernorm import qk_rmsnorm as _npu_qk_rmsnorm
+from tokenspeed_kernel_npu.ops.layernorm import rmsnorm
 
 __all__ = ["qk_rmsnorm", "rmsnorm"]
+
+
+def qk_rmsnorm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+    *,
+    weight_offset: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The NPU per-head norm, with ``weight_offset + weight`` formed in the weight dtype."""
+    if weight_offset:
+        q_weight = (q_weight.float() + weight_offset).to(q_weight.dtype)
+        k_weight = (k_weight.float() + weight_offset).to(k_weight.dtype)
+    return _npu_qk_rmsnorm(q, k, q_weight, k_weight, eps)

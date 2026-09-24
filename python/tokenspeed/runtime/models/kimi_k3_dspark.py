@@ -110,9 +110,7 @@ class K3DSparkAttention(DeepseekV3AttentionMLA):
         if q.size(0) == 0:
             return q.new_empty((0, self.num_local_heads * self.v_head_dim))
         if self.w_kc is None or self.w_vc is None:
-            # The absorbed decode kernel takes these as raw pointers, so a
-            # missing post_load_weights surfaces as a null-address GPU fault
-            # rather than anything that names the cause.
+            # The absorbed decode kernel takes raw pointers; a missing factor would fault opaquely.
             raise RuntimeError(
                 "K3 DSpark absorbed MLA factors are missing; "
                 "post_load_weights did not run after loading the draft."
@@ -124,17 +122,16 @@ class K3DSparkAttention(DeepseekV3AttentionMLA):
 
             decode_ctx = replace(ctx, forward_mode=ForwardMode.DECODE)
 
-        # The drafter publishes each block step's write window before this
-        # forward; the backend serves it as the DECODE window.
+        # The drafter publishes each block step's write window as the DECODE window.
         out_cache_loc = ctx.attn_backend.write_locations(
             self.attn_mqa, ForwardMode.DECODE
         )
-        Q, K = self.forward_absorb_qkv_proj(
+        Q = self.forward_absorb_qkv_proj(
             q, latent_cache, positions, decode_ctx, out_cache_loc
         )
         attn_output = q.new_empty((q.size(0), self.num_local_heads * self.v_head_dim))
         self.forward_absorb_attn_v_proj(
-            Q, K, decode_ctx, out_cache_loc, attn_output, record_kv_cache=False
+            Q, decode_ctx, attn_output, record_kv_cache=False
         )
         return attn_output
 

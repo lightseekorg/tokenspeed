@@ -1387,7 +1387,8 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   leaves see kernel vocabulary only. The bridge's per-group table views
   (`CacheBatchMetadata`) are the router's input — block vocabulary in,
   kernel pages out, one expand launch per group. Models and the runner never
-  compute locations — `write_locations(layer, mode)` is the single accessor
+  compute locations — `write_locations(layer, mode)` is the single accessor,
+  and `forward_write_locations` composes it for the attention prologue's writes
   (`unified_path.md`, "Write locations have one owner").
   QSA's indexer reuses `GroupTableStacks` with `kernel_page_size` equal to
   each group's `block_granularity`. This ratio-one fill copies stable raw

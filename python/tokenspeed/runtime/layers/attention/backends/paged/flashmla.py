@@ -496,7 +496,6 @@ class FlashMLABackend(PagedAttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool,
         forward_mode: ForwardMode,
         **kwargs,
     ):
@@ -504,17 +503,8 @@ class FlashMLABackend(PagedAttentionBackend):
 
         # Prefill: dispatch to ragged (MHA-style) or absorbed (MQA) path.
         if self.forward_prefill_metadata.use_ragged:
-            return self._forward_normal_extend(q, k, v, layer, save_kv_cache)
-        else:
-            return self._forward_absorbed_extend(
-                q,
-                k,
-                v,
-                layer,
-                out_cache_loc,
-                token_to_kv_pool,
-                save_kv_cache,
-            )
+            return self._forward_normal_extend(q, k, v, layer)
+        return self._forward_absorbed_extend(q, layer, token_to_kv_pool)
 
     def forward_extend_chunked(
         self,
@@ -567,7 +557,6 @@ class FlashMLABackend(PagedAttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool,
         **kwargs,
     ) -> torch.Tensor:
         # Multi-token decode (target verify or drafter compound) runs the same
@@ -582,16 +571,7 @@ class FlashMLABackend(PagedAttentionBackend):
                 else metadata.page_table.shape[0] - num_extends
             )
 
-        o, _ = self._run_flash_mla_decode(
-            q,
-            k,
-            v,
-            layer,
-            out_cache_loc,
-            token_to_kv_pool,
-            bs,
-            save_kv_cache=save_kv_cache,
-        )
+        o, _ = self._run_flash_mla_decode(q, layer, token_to_kv_pool, bs)
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -605,10 +585,7 @@ class FlashMLABackend(PagedAttentionBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         layer: PagedAttention,
-        save_kv_cache: bool = True,
     ):
-        assert not save_kv_cache
-
         o = self.prefill_wrapper_ragged.forward(
             q,
             k.view(-1, layer.tp_k_head_num, layer.head_dim),
@@ -622,26 +599,10 @@ class FlashMLABackend(PagedAttentionBackend):
     def _forward_absorbed_extend(
         self,
         q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
         layer: PagedAttention,
-        out_cache_loc: torch.Tensor,
         token_to_kv_pool,
-        save_kv_cache: bool = True,
     ):
-        # q is whole Q [T, H, head_dim]; k is whole latent [T, 1, head_dim].
-        # flashinfer prefill_wrapper.run() requires q_nope / q_pe split, so
-        # slice views here (free) before handing off to the kernel.
-        assert k is not None
-
-        if save_kv_cache:
-            token_to_kv_pool.set_mla_kv_buffer(
-                layer,
-                out_cache_loc,
-                k[..., : layer.v_head_dim],
-                k[..., layer.v_head_dim :],
-            )
-
+        # flashinfer prefill_wrapper.run() takes q_nope / q_pe split: slice views.
         q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
         q_nope = q[..., : layer.v_head_dim]
         q_pe = q[..., layer.v_head_dim :]
@@ -660,20 +621,10 @@ class FlashMLABackend(PagedAttentionBackend):
     def _run_flash_mla_decode(
         self,
         q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
         layer: PagedAttention,
-        out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        *,
-        save_kv_cache: bool,
     ):
-        if k is not None:
-            assert v is not None
-            if save_kv_cache:
-                token_to_kv_pool.set_kv_buffer(layer, out_cache_loc, k, v)
-
         metadata = self.forward_decode_metadata
         num_extends = metadata.num_extends
         k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)

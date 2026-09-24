@@ -86,7 +86,6 @@ from tokenspeed_kernel.ops.attention.rmha.triton import (
 )
 from tokenspeed_kernel.ops.conv import inkling_ring_sconv
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
-from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
@@ -562,6 +561,8 @@ class InklingAttention(nn.Module):
                 if is_local
                 else -1
             ),
+            rotary_emb=None,
+            qk_norm=(self.q_norm, self.k_norm),
         )
 
         self.q_size = self.head_dim * self.num_tp_heads
@@ -621,19 +622,11 @@ class InklingAttention(nn.Module):
             k = kv[:, : self.kv_size]
             v = kv[:, self.kv_size :]
 
-            # Fused q/k RMSNorm returns contiguous q/k; v stays a strided view (KV scatter/FA4 allow it).
-            q, k = qk_rmsnorm(
-                q,
-                k,
-                self.q_norm.weight,
-                self.k_norm.weight,
-                self.q_norm.variance_epsilon,
-            )
-
         attn_output = self.attn(
             q,
             k,
             v,
+            None,
             ctx,
             rel_logits=rel_logits,
             log_scaling_tau=None if self.is_local else log_scaling_tau,

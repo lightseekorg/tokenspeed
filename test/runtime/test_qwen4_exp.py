@@ -100,7 +100,6 @@ from tokenspeed.runtime.layers.qwen4_exp_ple import (
 from tokenspeed.runtime.models import qwen4_exp_nextn
 from tokenspeed.runtime.models.qwen4_exp import (
     Qwen4ExpAttentionDecoderLayer,
-    Qwen4ExpModel,
     _qwen4_exp_uses_sigmoid_output_gate,
     _qwen4_exp_uses_sparse_moe,
     _Qwen4ExpRMSNormGated,
@@ -380,26 +379,6 @@ def test_hyperconnection_fused_projection_matches_split_checkpoint_weights() -> 
     torch.testing.assert_close(combined, expected.flatten(-2))
 
 
-def test_qwen4_exp_loads_fp8_scales_only_into_attention_layers(monkeypatch) -> None:
-    paged_attention = SimpleNamespace()
-    model = SimpleNamespace(
-        mapping=SimpleNamespace(attn=SimpleNamespace(tp_rank=0, tp_size=1)),
-        config=SimpleNamespace(num_hidden_layers=2, model_type="qwen4_exp_text"),
-        layers=[SimpleNamespace(attn=paged_attention), SimpleNamespace()],
-    )
-    monkeypatch.setattr(
-        "tokenspeed.runtime.models.qwen4_exp.kv_cache_scales_loader",
-        lambda *args: [(0, 0.25), (1, 0.5)],
-    )
-
-    Qwen4ExpModel.load_kv_cache_scales(model, "scales.json")
-
-    assert paged_attention.k_scale == 0.25
-    assert paged_attention.v_scale == 0.25
-    assert paged_attention.k_scale_float == 0.25
-    assert paged_attention.v_scale_float == 0.25
-
-
 def test_qwen4_exp_qsa_rejects_invalid_kernel_page_size() -> None:
     with pytest.raises(ValueError, match="positive multiple"):
         _qsa_router(kernel_page_size=96, max_bs=4, spec=1)
@@ -626,6 +605,8 @@ def test_qsa_dispatch_uses_router_slots_and_records_one_pd_step(
         logit_cap=0.0,
         v_head_dim=8,
         sliding_window_size=-1,
+        rotary_emb=None,
+        qk_norm=None,
     )
     layer.bind_cache_group(FULL_ATTENTION)
     pool = SimpleNamespace()
@@ -637,40 +618,38 @@ def test_qsa_dispatch_uses_router_slots_and_records_one_pd_step(
         draft_narrowing=object() if query_width < kv_width else None,
     )
     queries = torch.zeros((2 * query_width, 16))
-    keys = torch.ones((2 * kv_width, 8))
     topk = torch.zeros((2 * query_width, 4), dtype=torch.int32)
 
-    def sparse(q, k, v, actual_layer, locs, actual_pool, indices, actual_ctx):
+    def sparse(q, actual_layer, actual_pool, indices, actual_ctx):
         events.append("attention")
         assert actual_layer is layer
         assert actual_pool is pool
         assert actual_ctx is ctx
         assert indices is topk
         assert q.shape[0] == 2 * query_width
-        assert k.shape[0] == v.shape[0] == 2 * kv_width
-        expected = [
-            block * 256 + position
-            for block, length in zip((3, 5), lengths, strict=True)
-            for position in range(length - kv_width, length)
-        ]
-        assert locs.tolist() == expected
         return q.clone()
 
+    expected = [
+        block * 256 + position
+        for block, length in zip((3, 5), lengths, strict=True)
+        for position in range(length - kv_width, length)
+    ]
+    assert backend.forward_write_locations(layer, mode).tolist() == expected
     monkeypatch.setattr(router.leaves[FULL_ATTENTION], "_sparse_attention", sparse)
     output = layer(
         queries,
-        keys,
-        keys,
+        None,
+        None,
+        None,
         ctx,
-        save_kv_cache=True,
         record_kv_cache=None,
         topk_indices=topk,
     )
     assert output.shape == queries.shape
-    expected_events = ["attention"]
-    if mode.is_extend():
-        expected_events.append("cache_step")
-    assert events == expected_events
+    # The prologue wrote the KV before attention, so the cache step records first.
+    assert events == (
+        ["cache_step", "attention"] if mode.is_extend() else ["attention"]
+    )
 
 
 def test_qwen4_exp_qsa_topk_solution_reads_env(monkeypatch) -> None:
@@ -1069,33 +1048,46 @@ def test_qwen4_exp_draft_attention_preserves_rows_and_cache_context(
         ),
         target_capture_sink=None,
     )
-    layer._project_qkv_rope = lambda positions, hidden: (q, k, v, None)
+    layer._project_qkv = lambda hidden: (q, k, v, None)
     layer.indexer = (lambda hidden, positions, context: topk) if sparse else None
     layer.o_proj = lambda hidden: (hidden, None)
+    attn_mode = ForwardMode.DECODE if narrow and not sparse else mode
+    round_ctx = ctx
 
-    def attention(query, keys, values, context, **kwargs):
-        events.append("attention")
-        # Narrowing discards only queries: the whole catch-up KV window is written.
-        assert keys is k and values is v
-        assert context.forward_mode == (
-            ForwardMode.DECODE if narrow and not sparse else mode
-        )
-        if narrow and not sparse:
-            assert kwargs == {"record_kv_cache": not mode.is_decode_or_idle()}
-        else:
-            assert context is ctx
-            indices = kwargs["topk_indices"]
-            if sparse:
-                torch.testing.assert_close(indices, topk[[1, 4]] if narrow else topk)
+    class _Attention:
+        attend_live_rows = PagedAttention.attend_live_rows
+
+        def prologue(self, query, keys, values, positions, context):
+            events.append("prologue")
+            # Narrowing discards only queries: the whole catch-up KV window is written.
+            assert keys is k and values is v
+            assert context.forward_mode == attn_mode
+            return SimpleNamespace(q=query, k=None, v=None)
+
+        def forward(self, q, k, v, positions, ctx, **kwargs):
+            events.append("attention")
+            assert (k is None) == narrow and (v is None) == narrow
+            assert ctx.forward_mode == attn_mode
+            if narrow and not sparse:
+                assert kwargs == {"record_kv_cache": not mode.is_decode_or_idle()}
             else:
-                assert indices is None
-        return query
+                assert ctx is round_ctx
+                indices = kwargs["topk_indices"]
+                if sparse:
+                    torch.testing.assert_close(
+                        indices, topk[[1, 4]] if narrow else topk
+                    )
+                else:
+                    assert indices is None
+            return q
 
-    layer.attn = attention
+        __call__ = forward
+
+    layer.attn = _Attention()
     output = layer.self_attention(torch.arange(6), q, ctx)
     torch.testing.assert_close(output, q[[1, 4]] if narrow else q)
     assert ctx.forward_mode == mode
-    assert events == (["publish", "attention"] if narrow else ["attention"])
+    assert events == (["publish", "prologue", "attention"] if narrow else ["attention"])
 
 
 def test_qwen4_exp_nextn_compacts_context_topk_for_mtp_decode() -> None:
@@ -1566,109 +1558,54 @@ def test_qwen4_exp_ple_reads_state_block_metadata() -> None:
 
 
 @pytest.mark.parametrize(
-    "cache_dtype,input_dtype,mxfp8,expect_fused",
+    "cache_dtype,mxfp8",
     [
-        (torch.float8_e4m3fn, torch.bfloat16, False, True),
-        (torch.bfloat16, torch.bfloat16, False, False),
-        (torch.float8_e4m3fn, torch.float8_e4m3fn, False, False),
-        (torch.float8_e4m3fn, torch.bfloat16, True, False),
+        (torch.float8_e4m3fn, False),
+        (torch.bfloat16, False),
+        (torch.float8_e4m3fn, True),
     ],
 )
-def test_qwen4_exp_qsa_fuses_fp8_kv_store(
-    monkeypatch: pytest.MonkeyPatch,
-    cache_dtype: torch.dtype,
-    input_dtype: torch.dtype,
-    mxfp8: bool,
-    expect_fused: bool,
+def test_qwen4_exp_qsa_sparse_attention_reads_the_cache(
+    monkeypatch: pytest.MonkeyPatch, cache_dtype: torch.dtype, mxfp8: bool
 ) -> None:
     backend = object.__new__(QSAAttnBackend)
-    page_size = 16
-    backend.kernel_page_size = page_size
     backend._metadata_capacity_rows = 32
     backend.is_mxfp8 = mxfp8
-    backend.is_fp8 = cache_dtype == torch.float8_e4m3fn and not mxfp8
-
     k_cache = torch.empty((32, 1, 8), dtype=cache_dtype)
     v_cache = torch.empty_like(k_cache)
-    pool_store_calls = []
-    pool = SimpleNamespace(
-        get_kv_buffer=lambda layer_id: (k_cache, v_cache),
-        set_kv_buffer=lambda *args: pool_store_calls.append(args),
-    )
+    pool = SimpleNamespace(get_kv_buffer=lambda layer_id: (k_cache, v_cache))
     ctx = SimpleNamespace(
-        token_to_kv_pool=pool,
         attn_backend=backend,
         bs=1,
         forward_mode=ForwardMode.DECODE,
         draft_narrowing=None,
     )
-    attention_layer = SimpleNamespace(
-        layer_id=3,
-        tp_q_head_num=1,
-        tp_k_head_num=1,
-        tp_v_head_num=1,
-        head_dim=8,
-        v_head_dim=8,
-        k_scale=2.0,
-        v_scale=4.0,
-        scaling=0.5,
-    )
-    fused_store_calls = []
-    sparse_attention_calls = []
-
-    def fused_store(**kwargs):
-        fused_store_calls.append(kwargs)
+    layer = SimpleNamespace(layer_id=3, tp_q_head_num=1, head_dim=8, scaling=0.5)
+    calls = []
 
     def sparse_attention(query, key_cache, value_cache, selected_slots, **kwargs):
-        sparse_attention_calls.append(
-            (query, key_cache, value_cache, selected_slots, kwargs)
-        )
+        calls.append((key_cache, value_cache, kwargs))
         return torch.ones_like(query)
 
-    monkeypatch.setattr(
-        "tokenspeed.runtime.layers.attention.backends.paged.mha.fused_fp8_set_kv_buffer",
-        fused_store,
-    )
     monkeypatch.setattr(qsa_backend_module, "qsa_sparse_attention", sparse_attention)
-
-    # Draft step zero narrows Q while retaining every row in its KV window.
-    full_locs = torch.tensor([7, 8, 9, 10], dtype=torch.int32)
-    selected_slots = torch.tensor([[5, 9]], dtype=torch.int32)
     args = (
         torch.zeros((1, 8), dtype=torch.bfloat16),
-        torch.ones((4, 8), dtype=torch.bfloat16).to(input_dtype),
-        torch.full((4, 8), 2.0, dtype=torch.bfloat16).to(input_dtype),
-        attention_layer,
-        full_locs,
+        layer,
         pool,
-        selected_slots,
+        torch.tensor([[5, 9]], dtype=torch.int32),
         ctx,
     )
     if mxfp8:
         with pytest.raises(NotImplementedError, match="MXFP8"):
             backend._sparse_attention(*args)
-        assert not (pool_store_calls or fused_store_calls or sparse_attention_calls)
+        assert not calls
         return
-    output = backend._sparse_attention(*args)
-
-    assert output.shape == (1, 8)
-    assert len(sparse_attention_calls) == 1
-    assert sparse_attention_calls[0][-1]["metadata_capacity_rows"] == 32
-    assert len(pool_store_calls) + len(fused_store_calls) == 1
-    if expect_fused:
-        call = fused_store_calls[0]
-        assert call["k_cache"] is k_cache
-        assert call["v_cache"] is v_cache
-        torch.testing.assert_close(call["cache_loc"], full_locs)
-        assert call["page_size"] == page_size
-        assert call["k_scale"] == 2.0 and call["v_scale"] == 4.0
-        assert call["k"].shape == call["v"].shape == (4, 1, 8)
-    else:
-        _, locs, keys, values, k_scale, v_scale = pool_store_calls[0]
-        torch.testing.assert_close(locs, full_locs)
-        assert keys.dtype == values.dtype == input_dtype
-        assert keys.shape == values.shape == (4, 1, 8)
-        assert k_scale == 2.0 and v_scale == 4.0
+    assert backend._sparse_attention(*args).shape == (1, 8)
+    ((key_cache, value_cache, kwargs),) = calls
+    assert key_cache is k_cache and value_cache is v_cache
+    assert kwargs["metadata_capacity_rows"] == 32
+    unit = 1.0 if cache_dtype == torch.float8_e4m3fn else None
+    assert kwargs["k_scale"] == unit and kwargs["v_scale"] == unit
 
 
 def test_qwen4_exp_ple_lengths_accept_a_padded_row_count() -> None:

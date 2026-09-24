@@ -383,7 +383,6 @@ class DSABackend(PagedAttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
         # The model drives DSA prefill through forward_extend_chunked /
@@ -436,7 +435,6 @@ class DSABackend(PagedAttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool = True,
         topk_indices: torch.Tensor | None = None,
         topk_lens: torch.Tensor | None = None,
         **kwargs,
@@ -445,13 +443,9 @@ class DSABackend(PagedAttentionBackend):
         if topk_indices is not None:
             return self.forward_sparse_decode(
                 q=q,
-                k=k,
-                v=v,
                 layer=layer,
-                out_cache_loc=out_cache_loc,
                 token_to_kv_pool=token_to_kv_pool,
                 bs=bs,
-                save_kv_cache=save_kv_cache,
                 topk_indices=topk_indices,
                 topk_lens=topk_lens,
             )
@@ -467,7 +461,6 @@ class DSABackend(PagedAttentionBackend):
             out_cache_loc=out_cache_loc,
             token_to_kv_pool=token_to_kv_pool,
             bs=bs,
-            save_kv_cache=save_kv_cache,
             **kwargs,
         )
 
@@ -532,11 +525,6 @@ class DSABackend(PagedAttentionBackend):
             q_view = q_view.to(self.data_type)
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
 
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
         out = dsa_prefill(
             q=q_view,
             kv_cache=kv_cache,
@@ -555,7 +543,7 @@ class DSABackend(PagedAttentionBackend):
             softmax_scale=layer.scaling,
             page_size=self.kernel_page_size,
             logit_cap=layer.logit_cap,
-            k_scale=k_scale,
+            k_scale=1.0,
         )
         # GLM's sparse-prefill path writes both the latent KV and index_k before
         # entering this method, but bypasses the backend's forward and its
@@ -570,13 +558,9 @@ class DSABackend(PagedAttentionBackend):
         self,
         *,
         q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
         layer,
-        out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool,
         topk_indices: torch.Tensor,
         topk_lens: torch.Tensor | None,
     ) -> torch.Tensor:
@@ -599,15 +583,6 @@ class DSABackend(PagedAttentionBackend):
                 "DSA sparse decode requires BF16 query tensors, or FP8 query "
                 f"tensors on FP8 KV sparse paths, got {q.dtype}."
             )
-        if save_kv_cache:
-            assert k is not None
-            token_to_kv_pool.set_mla_kv_buffer(
-                layer,
-                out_cache_loc,
-                k[..., : self.kv_lora_rank],
-                k[..., self.kv_lora_rank :],
-            )
-
         if topk_indices.dtype != torch.int32:
             topk_indices = topk_indices.to(torch.int32)
         if topk_indices.shape[-1] != self.index_topk and topk_lens is None:
@@ -681,11 +656,6 @@ class DSABackend(PagedAttentionBackend):
             q_view = q_view.to(self.data_type)
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
 
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
         max_seqlen_k = int(
             getattr(metadata, "max_seq_len_k", 0) or self.max_context_len
         )
@@ -704,7 +674,7 @@ class DSABackend(PagedAttentionBackend):
             q_len_per_req=q_len_per_req,
             kv_seq_lens=kv_seq_lens,
             logit_cap=layer.logit_cap,
-            k_scale=k_scale,
+            k_scale=1.0,
         )
         return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
