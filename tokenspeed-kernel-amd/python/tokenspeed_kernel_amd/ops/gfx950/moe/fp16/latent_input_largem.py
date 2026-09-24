@@ -280,7 +280,7 @@ def gluon_latent_input_largem_gfx950(
 
 
 @gluon.jit(launch_metadata=_situ_launch_metadata)
-def gluon_latent_input_prefill_situ_gfx950(
+def gluon_latent_input_largem_situ_gfx950(
     shared_raw_ptr,
     shared_ptr,
     beta,
@@ -453,7 +453,7 @@ def launch_gluon_latent_input_largem_gfx950(
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
     situ_grid = (triton.cdiv(tokens, _SITU_BLOCK_M), _K3_SHARED // _SITU_BLOCK_N)
-    gluon_latent_input_prefill_situ_gfx950[situ_grid](
+    gluon_latent_input_largem_situ_gfx950[situ_grid](
         shared_raw,
         shared_out,
         float(beta),
