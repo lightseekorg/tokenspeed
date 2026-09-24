@@ -1642,6 +1642,18 @@ def _record_atomic_lowering() -> None:
         return
 
 
+def _select_reduce_tile(token_num: int) -> tuple[int, int]:
+    """Select the stage-2 top-k reduction tile for CDNA4.
+
+    Large reductions are bandwidth and latency bound. Splitting the N axis
+    more finely supplies enough independent CTAs to cover the scratch reads;
+    small reductions retain the wider tile to avoid excess launch work.
+    """
+    if token_num >= 4096:
+        return 16, 128
+    return 32, 256
+
+
 def invoke_gluon_mxfp4_moe_stage2_1x2(
     inter_states,
     w1,
@@ -1945,10 +1957,8 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
 
     if _use_reduce:
         # Step 6: reduce. Sum partials[token, :, n] over the topk dim
-        # (fp32 accumulate, bf16 output) into `out`. Tile (32, 256),
-        # 1 wave/CTA.
-        BLOCK_M_R = 16 if token_num >= 4096 else 32
-        BLOCK_N_R = 256
+        # (fp32 accumulate, bf16 output) into `out`, 1 wave/CTA.
+        BLOCK_M_R, BLOCK_N_R = _select_reduce_tile(token_num)
         NUM_WARPS_R = 1
         rgrid = (triton.cdiv(token_num, BLOCK_M_R) * triton.cdiv(N, BLOCK_N_R),)
         gluon_mxfp4_moe_stage2_reduce_kernel[rgrid](
