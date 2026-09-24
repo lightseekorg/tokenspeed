@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from functools import cache
 
 import torch
@@ -953,6 +954,7 @@ def _tiled_mhc_pre_hc4(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
+    project_impl: Callable[..., None],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the shared branch's tiled four-stream prefill projection."""
     outer_shape = residual.shape[:-2]
@@ -985,7 +987,7 @@ def _tiled_mhc_pre_hc4(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
     )
 
-    mhc_prefill_project_hc4(
+    project_impl(
         residual_flat,
         fn,
         projection,
@@ -1042,6 +1044,7 @@ def _tiled_mhc_pre_hc4(
             )
         }
     ),
+    traits={"large_prefill": frozenset({False, True})},
     priority=Priority.PORTABLE,
 )
 def triton_mhc_pre(
@@ -1066,6 +1069,7 @@ def triton_mhc_pre(
             rms_eps,
             hc_eps,
             sinkhorn_iters,
+            mhc_prefill_project_hc4,
         )
         if norm_weight is not None:
             if norm_eps is None:

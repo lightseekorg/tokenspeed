@@ -751,3 +751,19 @@ probabilities by 256 before the E4M3 cast to preserve small weights, and
 divide out that factor at normalization. The projected-value API applies
 the existing value projection to the latent output. Graph replay reads
 updated page tables and lengths in place.
+
+## Residual
+
+### gfx950 mHC pre-mapping
+
+For four BF16 residual streams, FP32 projection weights, hidden width 4096 or
+7168, and 20 Sinkhorn iterations on gfx950, calls with 1–64 token rows use the
+existing reduction kernel, 65–256 rows use the portable Triton path, and
+eligible calls above 256 rows select the Gluon projection. Other
+configurations retain their existing registered backend.
+
+The projection computes 64 token rows and 24 outputs per workgroup. Four waves
+reuse each asynchronously staged FP32 weight tile while accumulating their own
+rows with FP32 matrix instructions. The shared pre-mapping path still performs
+the following reduction, normalization, and output mixing. Token count remains
+a runtime argument to the projection, so the final partial tile is masked.

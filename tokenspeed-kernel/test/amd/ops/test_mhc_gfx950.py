@@ -141,3 +141,70 @@ def test_glm5_next_mhc_pre_graph_shape_replays_changed_input() -> None:
         torch.testing.assert_close(
             actual_tensor.float(), expected_tensor.float(), rtol=2e-2, atol=2e-2
         )
+
+
+def _prefill_args(num_tokens: int, hidden_size: int) -> tuple[object, ...]:
+    generator = torch.Generator(device="cuda").manual_seed(num_tokens + hidden_size)
+    residual = torch.randn(
+        num_tokens,
+        4,
+        hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    fn = (
+        torch.randn(
+            24,
+            4 * hidden_size,
+            device="cuda",
+            dtype=torch.float32,
+            generator=generator,
+        )
+        * 0.01
+    )
+    hc_scale = torch.tensor([0.7, 1.1, 0.5], device="cuda", dtype=torch.float32)
+    hc_base = torch.zeros(24, device="cuda", dtype=torch.float32)
+    return residual, fn, hc_scale, hc_base, 1e-6, 1e-6, 20
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "hidden_size"),
+    [(257, 7168), (8144, 4096), (8192, 4096)],
+)
+def test_gluon_mhc_large_prefill_matches_reference(
+    num_tokens: int, hidden_size: int
+) -> None:
+    args = _prefill_args(num_tokens, hidden_size)
+    actual = tokenspeed_kernel.mhc_pre(
+        *args, override="gluon_mhc_prefill_gfx950", norm_weight=None, norm_eps=None
+    )
+    expected = _reference(*args)
+    for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+        torch.testing.assert_close(
+            actual_tensor.float(), expected_tensor.float(), rtol=2e-2, atol=2e-2
+        )
+
+
+def test_gluon_mhc_large_prefill_graph_replays_changed_input() -> None:
+    args = _prefill_args(257, 4096)
+    residual = args[0]
+    tokenspeed_kernel.mhc_pre(
+        *args, override="gluon_mhc_prefill_gfx950", norm_weight=None, norm_eps=None
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = tokenspeed_kernel.mhc_pre(
+            *args,
+            override="gluon_mhc_prefill_gfx950",
+            norm_weight=None,
+            norm_eps=None,
+        )
+
+    residual.copy_(torch.randn_like(residual))
+    expected = _reference(*args)
+    graph.replay()
+    for actual_tensor, expected_tensor in zip(graph_output, expected, strict=True):
+        torch.testing.assert_close(
+            actual_tensor.float(), expected_tensor.float(), rtol=2e-2, atol=2e-2
+        )

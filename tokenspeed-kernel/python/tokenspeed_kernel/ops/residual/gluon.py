@@ -26,6 +26,7 @@ import torch
 from tokenspeed_kernel.ops.residual.triton import (
     _mhc_pre_impl,
     _mhc_prenorm_gemm_triton,
+    _tiled_mhc_pre_hc4,
 )
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -189,6 +190,9 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.mhc import (
         gluon_mhc_pre_reduce_apply_gfx950 as _mhc_pre_reduce_apply_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.mhc import (
+        launch_gluon_mhc_prefill_project_gfx950 as _mhc_prefill_project_impl,
+    )
 
     @register_kernel(
         "residual",
@@ -211,6 +215,7 @@ if current_platform().is_amd:
             }
         ),
         traits={
+            "large_prefill": frozenset({False}),
             "num_tokens": frozenset(range(1, 65)),
             "hc_mult": frozenset({4}),
             "hidden_size": frozenset({4096, 7168}),
@@ -243,3 +248,62 @@ if current_platform().is_amd:
             norm_weight=norm_weight,
             norm_eps=norm_eps,
         )
+
+    @register_kernel(
+        "residual",
+        "mhc_pre",
+        name="gluon_mhc_prefill_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    residual=dense_tensor_format(torch.bfloat16),
+                    fn=dense_tensor_format(torch.float32),
+                    hc_scale=dense_tensor_format(torch.float32),
+                    hc_base=dense_tensor_format(torch.float32),
+                )
+            }
+        ),
+        traits={
+            "large_prefill": frozenset({True}),
+            "hc_mult": frozenset({4}),
+            "hidden_size": frozenset({4096, 7168}),
+            "sinkhorn_iters": frozenset({20}),
+        },
+        priority=Priority.SPECIALIZED - 1,
+    )
+    def gluon_mhc_prefill_gfx950(
+        residual: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        rms_eps: float,
+        hc_eps: float,
+        sinkhorn_iters: int,
+        norm_weight: torch.Tensor | None,
+        norm_eps: float | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Use the GFX950 FP32 projection for four-stream prefill."""
+        if residual.shape[-2] != 4:
+            raise ValueError("GFX950 mHC prefill requires four residual streams")
+        hidden_size = residual.shape[-1]
+        layer_input, post_mix, comb_mix = _tiled_mhc_pre_hc4(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_eps,
+            sinkhorn_iters,
+            _mhc_prefill_project_impl,
+        )
+        if norm_weight is not None:
+            layer_input = torch.nn.functional.rms_norm(
+                layer_input, (hidden_size,), norm_weight, norm_eps
+            )
+        return layer_input, post_mix, comb_mix
