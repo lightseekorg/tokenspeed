@@ -44,7 +44,7 @@ _setmaxregister_increase = getattr(
 
 # Compat shim: get_max_tmem_alloc_cols added in cutlass-dsl 4.4;
 # older versions don't have it, so we provide a fallback implementation.
-_TMEM_MAX_ALLOC_COLUMNS_MAP = {"sm_100": 512, "sm_103": 512, "sm_120": 512}
+_TMEM_MAX_ALLOC_COLUMNS_MAP = {"sm_100": 512, "sm_103": 512, "sm_107": 576}
 
 
 def _get_max_tmem_alloc_cols(compute_capability: str) -> int:
@@ -60,10 +60,8 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass._mlir.dialects import builtin, llvm, nvvm
-from cutlass.cute.arch import Arch
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Boolean, Int32
-from cutlass.cutlass_dsl import BaseDSL
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 try:
@@ -76,6 +74,7 @@ try:
         compute_q_tile_layout,
         create_mla_static_tile_scheduler,
         create_mla_static_tile_scheduler_params,
+        get_mla_decode_arch,
         get_mla_decode_fold_sq_factor,
     )
 except ImportError:
@@ -88,6 +87,7 @@ except ImportError:
         compute_q_tile_layout,
         create_mla_static_tile_scheduler,
         create_mla_static_tile_scheduler_params,
+        get_mla_decode_arch,
         get_mla_decode_fold_sq_factor,
     )
 
@@ -137,10 +137,10 @@ def tcgen05_mma_ws_f8f6f4_one(
 
 
 """
-A Multi-Head Latent Attention (MLA) example using fp8 as input/output for the NVIDIA Blackwell SM100 architecture using CUTE DSL
+A Multi-Head Latent Attention (MLA) example with FP8 inputs for SM100, SM103 and SM107 using CuTe DSL.
 
-This example demonstrates an implementation of inference of multi-head latent attention using a TMA + Blackwell
-SM100 TensorCore warp-specialized persistent kernel. The implementation integrates the (Qc + Qr)*(Kc + Kr)^T
+This example implements multi-head latent attention using a TMA + TensorCore
+warp-specialized persistent kernel. The implementation integrates the (Qc + Qr)*(Kc + Kr)^T
 matrix multiplication, softmax normalization, and softmax((Qc + Qr)*(Kc + Kr)^T)*Vc into a single kernel.
 The kernel provides support for page table storage and variable-length KV cache sequences. It implements KV splitting
 functionality to minimize latency when processing long KV sequences.
@@ -228,9 +228,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         reducer_d_tiles: int = 1,
         reducer_max_splits: int = MAX_SPLITS,
         pack_q: bool = False,
+        *,
+        compute_capability: tuple[int, int],
     ):
-        """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
+        """Initializes the shared SM100/SM103/SM107 MLA kernel configuration.
 
+        :param compute_capability: Target GPU capability: (10, 0), (10, 3) or (10, 7)
+        :type compute_capability: tuple[int, int]
         :param acc_dtype: Data type for accumulation S and O
         :type acc_dtype: Type[cutlass.Numeric]
         :param lse_dtype: Data type for output LSE
@@ -267,6 +271,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type pack_q: bool
         """
 
+        self.arch = get_mla_decode_arch(compute_capability)
+        self.is_sm107 = compute_capability == (10, 7)
         self.latent_dim = 512
         if reducer_d_tiles not in (1, 2, 4):
             raise ValueError("reducer_d_tiles must be 1, 2 or 4")
@@ -313,6 +319,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             self.use_2cta_instrs = False
         else:
             raise ValueError(f"Unsupported mma_qk_tiler_mn[0]: {mma_qk_tiler_mn[0]}")
+        if self.arch != "sm_100" and not self.use_2cta_instrs:
+            raise ValueError("M64 MLA decode is only supported on SM100")
         self.use_m64_ws = not self.use_2cta_instrs
         # Warps 0-1 handle first N half; warps 2-3 handle second N half.
         self.warps_in_n = 2
@@ -394,35 +402,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             barrier_id=5, num_threads=(self.threads_per_warp * 2)
         )
 
-    @cute.jit
-    def _get_dcp_local_bound(self, global_bound: Int32) -> Int32:
-        """Map global causal bound to this rank's local bound."""
-        if cutlass.const_expr(self.cp_interleave_size == 1):
-            return (global_bound - self.cp_rank + self.cp_world - 1) // self.cp_world
-
-        cycle_width = self.cp_world * self.cp_interleave_size
-        full_cycles = global_bound // cycle_width
-        cycle_offset = global_bound - full_cycles * cycle_width
-        local_tail = cycle_offset - self.cp_rank * self.cp_interleave_size
-        if cute.elem_less(local_tail, 0):
-            local_tail = Int32(0)
-        local_tail = cutlass.min(local_tail, self.cp_interleave_size)
-        return full_cycles * self.cp_interleave_size + local_tail
-
-    def _setup_attributes(self):
-        """Set up configurations and parameters for the MLA kernel operation.
-
-        This method initializes and configures various attributes required for the
-        execution of the multi-head latent attention kernel, mainly about the pipeline stages:
-
-        - Sets up staging parameters for Q, K, V inputs and accumulator data
-        - Configures pipeline stages for softmax, correction, and epilogue operations
-        """
-
         self.load_q_stage = 1
         if self.use_2cta_instrs:
-            self.load_k_stage = 3
-            self.load_v_stage = 2
+            self.load_k_stage = 4 if self.is_sm107 else 3
+            self.load_v_stage = 4 if self.is_sm107 else 2
         else:
             # No enough smem for WS mode
             self.load_k_stage = 1
@@ -448,6 +431,21 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             self.tmem_o_offset + self.latent_dim // self.warps_in_n
         )
         self.pv_acc_cols = self.mma_pv_tiler[1] // self.warps_in_n
+
+    @cute.jit
+    def _get_dcp_local_bound(self, global_bound: Int32) -> Int32:
+        """Map global causal bound to this rank's local bound."""
+        if cutlass.const_expr(self.cp_interleave_size == 1):
+            return (global_bound - self.cp_rank + self.cp_world - 1) // self.cp_world
+
+        cycle_width = self.cp_world * self.cp_interleave_size
+        full_cycles = global_bound // cycle_width
+        cycle_offset = global_bound - full_cycles * cycle_width
+        local_tail = cycle_offset - self.cp_rank * self.cp_interleave_size
+        if cute.elem_less(local_tail, 0):
+            local_tail = Int32(0)
+        local_tail = cutlass.min(local_tail, self.cp_interleave_size)
+        return full_cycles * self.cp_interleave_size + local_tail
 
     @cute.jit
     def __call__(
@@ -685,8 +683,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.q_major_mode = OperandMajorMode.K
         self.k_major_mode = OperandMajorMode.K
         self.v_major_mode = OperandMajorMode.MN
-
-        self._setup_attributes()
 
         cta_group = (
             tcgen05.CtaGroup.TWO
@@ -1286,6 +1282,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             allocator_warp_id=self.mma_warp_id,
             is_two_cta=self.use_2cta_instrs,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            arch=self.arch,
         )
 
         load_q_pipeline = self.make_and_init_load_qkv_pipeline(
@@ -1522,7 +1519,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             # Fire off async TMEM allocation request early, then overlap
             # the allocation latency with pipeline state creation and
             # tile scheduler setup.
-            tmem.allocate(_get_max_tmem_alloc_cols("sm_100"))
+            tmem.allocate(_get_max_tmem_alloc_cols(self.arch))
 
             load_q_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.load_q_stage
@@ -3353,8 +3350,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # the final output via the FMA/exp2 path on sm_100; -1e6 underflows
         # exp2(x * scale) to 0 in fp32 while avoiding -inf propagation.
         cta_m_rows = self.mma_qk_tiler[0] // self.cluster_shape_mnk[0]
-        arch = BaseDSL._get_dsl().get_arch_enum()
-        if cutlass.const_expr(arch >= Arch.sm_100 and arch <= Arch.sm_100f):
+        if cutlass.const_expr(self.arch == "sm_100"):
             cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
             # Early S release: fence TMEM load and release S buffer immediately
             # so MMA warp can start the next QK computation without waiting for
@@ -3436,7 +3432,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         )
             # reduction for row_max
             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
-        elif cutlass.const_expr(arch >= Arch.sm_103 and arch <= Arch.sm_103f):
+        else:  # SM103 and SM107 support TMEM load with a MAX reduction.
             tmem_load_red_atom = cute.make_copy_atom(
                 tcgen05.copy.LdRed32x32bOp(
                     tcgen05.copy.Repetition(64), redOp=tcgen05.TmemLoadRedOp.MAX
@@ -3457,7 +3453,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 tTR_tAcc_red,
                 (tTR_rAcc_red, tTR_rMax),
             )
-            # Early S release for sm103 path
+            # Early S release for the SM103/SM107 reduction path
             cute.arch.fence_view_async_tmem_load()
             softmax_params.mma_s_pipeline.consumer_release(mma_s_consumer_state)
             mma_s_consumer_state.advance()
@@ -3543,7 +3539,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     cute.ReductionOp.MAX, row_max_new, 0
                 )
             else:
-                # sm_103 pre-computed max via reduction is valid here because
+                # The TMEM load reduction is valid here because
                 # tTR_rAcc is unmodified (no mask applied to this tile).
                 row_max_new = cute.arch.fmax(row_max_new, tTR_rMax[0])
 
@@ -4630,7 +4626,7 @@ def run(
     is_causal: bool = False,
     **kwargs,
 ):
-    """Execute Multi-Head Latent Attention (MLA) on Blackwell architecture and validate results.
+    """Execute MLA on SM100, SM103 or SM107 and validate results.
 
     This function creates random input tensors for query latent/rope, compressed latent/rope, and value,
     then performs the complete MLA computation pipeline. It supports configurable data types, tiling parameters,
@@ -4692,11 +4688,11 @@ def run(
     :raises RuntimeError: If GPU is unavailable for computation
     """
 
-    if num_heads * seq_len_q <= 64:
+    if num_heads * seq_len_q <= 64 and torch.cuda.get_device_capability() == (10, 0):
         mma_qk_tiler_mn = (64, 128)
         mma_pv_tiler_mn = (64, 256)
 
-    print("Running Blackwell MLA test with:")
+    print("Running MLA decode test with:")
     print(f"  batch_size: {batch_size}")
     print(f"  seq_len_q: {seq_len_q}")
     print(f"  seq_len_k: {seq_len_k}")
@@ -5024,6 +5020,7 @@ def run(
         is_persistent,
         is_var_seq,
         is_var_split_kv,
+        compute_capability=torch.cuda.get_device_capability(),
         fold_sq_factor=fold_sq_factor,
         is_causal=is_causal,
         num_heads=num_heads,
@@ -5362,7 +5359,9 @@ if __name__ == "__main__":
             )
         return (ret[0], ret[1])  # type: ignore[return-value]
 
-    parser = argparse.ArgumentParser(description="Example of MLA on Blackwell.")
+    parser = argparse.ArgumentParser(
+        description="Example of MLA on SM100, SM103 or SM107."
+    )
 
     parser.add_argument(
         "--in_dtype",

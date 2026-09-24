@@ -45,7 +45,7 @@ _setmaxregister_increase = getattr(
 
 # Compat shim: get_max_tmem_alloc_cols added in cutlass-dsl 4.4;
 # older versions don't have it, so we provide a fallback implementation.
-_TMEM_MAX_ALLOC_COLUMNS_MAP = {"sm_100": 512, "sm_103": 512, "sm_120": 512}
+_TMEM_MAX_ALLOC_COLUMNS_MAP = {"sm_100": 512, "sm_103": 512, "sm_107": 576}
 
 
 def _get_max_tmem_alloc_cols(compute_capability: str) -> int:
@@ -61,10 +61,8 @@ import cutlass.pipeline as pipeline
 import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.base_dsl.arch import Arch
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack
-from cutlass.cutlass_dsl import BaseDSL
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 try:
@@ -77,6 +75,7 @@ try:
         compute_q_tile_layout,
         create_mla_static_tile_scheduler,
         create_mla_static_tile_scheduler_params,
+        get_mla_decode_arch,
         get_mla_decode_fold_sq_factor,
     )
 except ImportError:
@@ -89,14 +88,15 @@ except ImportError:
         compute_q_tile_layout,
         create_mla_static_tile_scheduler,
         create_mla_static_tile_scheduler_params,
+        get_mla_decode_arch,
         get_mla_decode_fold_sq_factor,
     )
 
 """
-A Multi-Head Latent Attention (MLA) example with FP16 data type for the NVIDIA Blackwell SM100 architecture using CUTE DSL
+A Multi-Head Latent Attention (MLA) example with FP16/BF16 inputs for SM100, SM103 and SM107 using CuTe DSL.
 
-This example demonstrates an implementation of inference of multi-head latent attention using a TMA + Blackwell
-SM100 TensorCore warp-specialized persistent kernel. The implementation integrates the (Qc + Qr)*(Kc + Kr)^T
+This example implements multi-head latent attention using a TMA + TensorCore
+warp-specialized persistent kernel. The implementation integrates the (Qc + Qr)*(Kc + Kr)^T
 matrix multiplication, softmax normalization, and softmax((Qc + Qr)*(Kc + Kr)^T)*Vc into a single kernel.
 The kernel provides support for page table storage and variable-length KV cache sequences. It implements KV splitting
 functionality to minimize latency when processing long KV sequences.
@@ -179,9 +179,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         seq_len_q: int = 1,
         window_left: int = -1,
         pack_q: bool = False,
+        *,
+        compute_capability: tuple[int, int],
     ):
-        """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
+        """Initializes the shared SM100/SM103/SM107 MLA kernel configuration.
 
+        :param compute_capability: Target GPU capability: (10, 0), (10, 3) or (10, 7)
+        :type compute_capability: tuple[int, int]
         :param acc_dtype: Data type for accumulation S and O
         :type acc_dtype: Type[cutlass.Numeric]
         :param lse_dtype: Data type for output LSE
@@ -214,6 +218,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         :type pack_q: bool
         """
 
+        self.arch = get_mla_decode_arch(compute_capability)
+        self.is_sm107 = compute_capability == (10, 7)
         self.latent_dim = 512
         self.rope_dim = 64
         self.acc_dtype = acc_dtype
@@ -245,7 +251,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         self.warps_in_n = 2
         self.num_compute_warps = 4
         self.threads_per_warp = 32
-        mma_qk_tiler_k = self.rope_dim
+        mma_qk_tiler_k = self.rope_dim * (2 if self.is_sm107 else 1)
         self.mma_qk_tiler = (
             self.mma_qk_tiler_mn[0],
             self.mma_qk_tiler_mn[1],
@@ -305,18 +311,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             barrier_id=3, num_threads=(self.threads_per_warp * self.num_compute_warps)
         )
 
-    def _setup_attributes(self):
-        """Set up configurations and parameters for the MLA kernel operation.
-
-        This method initializes and configures various attributes required for the
-        execution of the multi-head latent attention kernel, mainly about the pipeline stages:
-
-        - Sets up staging parameters for Q, K, V inputs and accumulator data
-        - Configures pipeline stages for softmax, correction, and epilogue operations
-        """
-
         self.load_q_stage = 1
-        self.load_kv_stage = 15
+        self.load_kv_stage = 8 if self.is_sm107 else 15
         self.mma_s_stage = 2
         self.p_mma_stage = 2
         self.p_cor_stage = 2
@@ -559,8 +555,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         self.q_major_mode = OperandMajorMode.K
         self.k_major_mode = OperandMajorMode.K
         self.v_major_mode = OperandMajorMode.MN
-
-        self._setup_attributes()
 
         cta_group = tcgen05.CtaGroup.TWO
         # the intermediate tensor p is from smem & k-major
@@ -1036,6 +1030,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             allocator_warp_id=self.mma_warp_id,
             is_two_cta=self.use_2cta_instrs,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            arch=self.arch,
         )
 
         load_q_pipeline = self.make_and_init_load_qkv_pipeline(
@@ -1245,7 +1240,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         if warp_idx == self.mma_warp_id:
             _setmaxregister_decrease(self.other_reg_num)
             # Alloc tensor memory buffer
-            tmem.allocate(_get_max_tmem_alloc_cols("sm_100"))
+            tmem.allocate(_get_max_tmem_alloc_cols(self.arch))
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
@@ -2843,8 +2838,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         tTR_rAcc = cute.make_fragment_like(tTR_tS, self.acc_dtype)
 
         row_max_new = row_max
-        arch = BaseDSL._get_dsl().get_arch_enum()
-        if cutlass.const_expr(arch >= Arch.sm_100 and arch <= Arch.sm_100f):
+        if cutlass.const_expr(self.arch == "sm_100"):
             cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
             cta_m_rows = self.mma_qk_tiler[0] // self.cluster_shape_mnk[0]
             for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
@@ -2917,7 +2911,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             # reduction for row_max
             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
 
-        elif cutlass.const_expr(arch >= Arch.sm_103 and arch <= Arch.sm_103f):
+        else:  # SM103 and SM107 support TMEM load with a MAX reduction.
             tmem_load_red_atom = cute.make_copy_atom(
                 tcgen05.copy.LdRed32x32bOp(
                     tcgen05.copy.Repetition(64), redOp=tcgen05.TmemLoadRedOp.MAX
@@ -3952,7 +3946,7 @@ def run(
     use_cold_l2: bool,
     **kwargs,
 ):
-    """Execute Multi-Head Latent Attention (MLA) on Blackwell architecture and validate results.
+    """Execute MLA on SM100, SM103 or SM107 and validate results.
 
     This function creates random input tensors for query latent/rope, compressed latent/rope, and value,
     then performs the complete MLA computation pipeline. It supports configurable data types, tiling parameters,
@@ -4014,7 +4008,7 @@ def run(
     :raises RuntimeError: If GPU is unavailable for computation
     """
 
-    print("Running Blackwell MLA test with:")
+    print("Running MLA decode test with:")
     print(f"  batch_size: {batch_size}")
     print(f"  seq_len_q: {seq_len_q}")
     print(f"  seq_len_k: {seq_len_k}")
@@ -4338,6 +4332,7 @@ def run(
         is_persistent,
         is_var_seq,
         is_var_split_kv,
+        compute_capability=torch.cuda.get_device_capability(),
         fold_sq_factor=fold_sq_factor,
     )
 
@@ -4652,7 +4647,9 @@ if __name__ == "__main__":
             )
         return (ret[0], ret[1])  # type: ignore[return-value]
 
-    parser = argparse.ArgumentParser(description="Example of MLA on Blackwell.")
+    parser = argparse.ArgumentParser(
+        description="Example of MLA on SM100, SM103 or SM107."
+    )
 
     parser.add_argument(
         "--in_dtype",

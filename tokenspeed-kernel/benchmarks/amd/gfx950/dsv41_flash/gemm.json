@@ -1,0 +1,295 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "dsv41_flash.gemm.mm/gluon_mm_mxfp8_gfx950/wq_a_wkv-m1024-n1792-k5120-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 1024,
+          "N": 1792,
+          "K": 5120,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "registration": "gluon_mm_mxfp8_gfx950",
+        "cold_cache": true,
+        "seed": 42
+      },
+      "policy": {
+        "max_regression_relative": 0.1,
+        "max_regression_absolute_us": 0.5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/gluon_mm_mxfp8_gfx950/tp8-wq_b-m1024-n4096-k1280-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 1024,
+          "N": 4096,
+          "K": 1280,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "registration": "gluon_mm_mxfp8_gfx950",
+        "cold_cache": true,
+        "seed": 42
+      },
+      "policy": {
+        "max_regression_relative": 0.1,
+        "max_regression_absolute_us": 0.5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/gluon_mm_mxfp8_gfx950/tp8-wo_b-m1024-n5120-k1024-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 1024,
+          "N": 5120,
+          "K": 1024,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "registration": "gluon_mm_mxfp8_gfx950",
+        "cold_cache": true,
+        "seed": 42
+      },
+      "policy": {
+        "max_regression_relative": 0.1,
+        "max_regression_absolute_us": 0.5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/gluon_mm_mxfp8_gfx950/wq_a_wkv-m4096-n1792-k5120-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 4096,
+          "N": 1792,
+          "K": 5120,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "registration": "gluon_mm_mxfp8_gfx950",
+        "cold_cache": true,
+        "seed": 42
+      },
+      "policy": {
+        "max_regression_relative": 0.1,
+        "max_regression_absolute_us": 0.5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/gluon_mm_mxfp8_gfx950/tp8-wq_b-m4096-n4096-k1280-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 4096,
+          "N": 4096,
+          "K": 1280,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "registration": "gluon_mm_mxfp8_gfx950",
+        "cold_cache": true,
+        "seed": 42
+      },
+      "policy": {
+        "max_regression_relative": 0.1,
+        "max_regression_absolute_us": 0.5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/gluon_mm_mxfp8_gfx950/tp8-wo_b-m4096-n5120-k1024-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 4096,
+          "N": 5120,
+          "K": 1024,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "registration": "gluon_mm_mxfp8_gfx950",
+        "cold_cache": true,
+        "seed": 42
+      },
+      "policy": {
+        "max_regression_relative": 0.1,
+        "max_regression_absolute_us": 0.5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/gluon_mm_mxfp8_gfx950/tp4-wq_b-m1024-n8192-k1280-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 1024,
+          "N": 8192,
+          "K": 1280,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "registration": "gluon_mm_mxfp8_gfx950",
+        "cold_cache": true,
+        "seed": 3243
+      },
+      "policy": {
+        "max_regression_relative": 0.1,
+        "max_regression_absolute_us": 0.5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/gluon_mm_mxfp8_gfx950/tp4-wo_b-m1024-n5120-k2048-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 1024,
+          "N": 5120,
+          "K": 2048,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "registration": "gluon_mm_mxfp8_gfx950",
+        "cold_cache": true,
+        "seed": 3244
+      },
+      "policy": {
+        "max_regression_relative": 0.1,
+        "max_regression_absolute_us": 0.5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/gluon_mm_mxfp8_gfx950/tp4-wq_b-m4096-n8192-k1280-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 4096,
+          "N": 8192,
+          "K": 1280,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "registration": "gluon_mm_mxfp8_gfx950",
+        "cold_cache": true,
+        "seed": 3245
+      },
+      "policy": {
+        "max_regression_relative": 0.1,
+        "max_regression_absolute_us": 0.5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/gluon_mm_mxfp8_gfx950/tp4-wo_b-m4096-n5120-k2048-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 4096,
+          "N": 5120,
+          "K": 2048,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "registration": "gluon_mm_mxfp8_gfx950",
+        "cold_cache": true,
+        "seed": 3246
+      },
+      "policy": {
+        "max_regression_relative": 0.1,
+        "max_regression_absolute_us": 0.5,
+        "max_relative_mad": 0.05
+      }
+    }
+  ]
+}

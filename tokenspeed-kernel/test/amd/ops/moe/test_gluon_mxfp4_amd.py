@@ -716,9 +716,10 @@ def test_gfx1250_ragged_matmul_forwards_fused_activation(
     "decode,num_tokens,block_m",
     [
         pytest.param(False, 4, None, id="prefill-default"),
+        pytest.param(True, 1, 16, id="decode-small-m-wmma-layout"),
         *[
             pytest.param(True, num_tokens, None, id=f"decode-m{num_tokens}-adaptive")
-            for num_tokens in (1, 2, 4, 8, 16)
+            for num_tokens in (2, 4, 8, 16)
         ],
         pytest.param(True, 4, 128, id="decode-explicit-bm128"),
     ],

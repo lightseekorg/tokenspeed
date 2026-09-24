@@ -5,6 +5,27 @@ import tokenspeed_kernel
 import torch
 from utils import is_cdna4, is_cdna5
 
+
+def _sigmoid_topk(
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    routed_scaling_factor: float = 1.0,
+    normalize_topk_weights: bool = True,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return tokenspeed_kernel.moe_topk(
+        router_logits,
+        topk,
+        score_function="sigmoid",
+        selection_method="topk",
+        renormalize=normalize_topk_weights,
+        routed_scaling_factor=routed_scaling_factor,
+        correction_bias=correction_bias,
+        solution=solution,
+    )
+
+
 if not (is_cdna4() or is_cdna5()):
     pytest.skip(
         "AMD CDNA4/CDNA5 is required for Kimi K3 sigmoid-bias top-k tests",
@@ -36,7 +57,7 @@ def test_kimi3_sigmoid_bias_topk_is_exact_and_captures(
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        weights, ids = tokenspeed_kernel.moe_sigmoid_bias_topk(
+        weights, ids = _sigmoid_topk(
             logits,
             bias,
             16,
@@ -71,7 +92,7 @@ def test_prefill_sigmoid_bias_topk_matches_torch_and_captures(
     torch.manual_seed(16)
     logits = (torch.randn(16, 896, device="cuda") * 0.2).float()
     bias = (torch.randn(896, device="cuda") * 0.01).float()
-    expected_weights, expected_ids = tokenspeed_kernel.moe_sigmoid_bias_topk(
+    expected_weights, expected_ids = _sigmoid_topk(
         logits,
         bias,
         16,
@@ -82,7 +103,7 @@ def test_prefill_sigmoid_bias_topk_matches_torch_and_captures(
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        weights, ids = tokenspeed_kernel.moe_sigmoid_bias_topk(
+        weights, ids = _sigmoid_topk(
             logits,
             bias,
             16,
@@ -104,7 +125,7 @@ def test_prefill_sigmoid_bias_topk_matches_torch_and_captures(
 
     logits.copy_(torch.randn_like(logits) * 0.3)
     bias.copy_(torch.randn_like(bias) * 0.02)
-    expected_weights, expected_ids = tokenspeed_kernel.moe_sigmoid_bias_topk(
+    expected_weights, expected_ids = _sigmoid_topk(
         logits,
         bias,
         16,

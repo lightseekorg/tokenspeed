@@ -737,6 +737,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 tp_rank=mapping.moe.tp_ep_rank,
                 tp_size=mapping.moe.tp_ep_size,
                 tp_group=mapping.moe.tp_ep_group,
+                shared_parallel=None,
                 quant_config=None,
                 prefix="shared_experts",
                 reduce_results=False,

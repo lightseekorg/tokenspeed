@@ -162,7 +162,7 @@ backends. See `tokenspeed_kernel/plugins/README.md`.
 from tokenspeed_kernel import (
     gated_residual_mix, gated_residual_combine, grouped_gemma_rmsnorm,
     mm,
-    moe_softmax_topk,
+    moe_topk,
     moe_route, moe_dispatch, moe_experts, moe_combine, moe_fused,
     ...
 )

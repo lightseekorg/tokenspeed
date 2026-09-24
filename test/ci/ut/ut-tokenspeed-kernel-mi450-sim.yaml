@@ -166,10 +166,13 @@ env:
     tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_tdm_fusion_selection[fp32-16-2048-7168-1-0]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[ue8m0-False-gluon_mm_mxfp8_ue8m0_gfx1250]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[fp32-True-gluon_mm_fp8_blockscale_gfx1250]
-  TORCH_DEVICE_PACKAGE: amd-torch-device-gfx1250==2.14.0+rocm10.1.0a20260822
-  TORCH_INDEX_URL: https://rocm.nightlies.amd.com/whl-multi-arch/
-  TORCH_VERSION: 2.14.0+rocm10.1.0a20260822
-  TORCHVISION_VERSION: 0.29.0a0+rocm10.1.0a20260822
+  ROCM_NIGHTLY_INDEX: https://nightly.repo.amd.com/rocm/whl-next/
+  ROCM_SDK_VERSION: 10.2.0a20260923
+  ROCM_SYSTEMS_REF: f9ba16bbe70e365b2f59b268e847bef19ad9db6e
+  TORCH_DEVICE_PACKAGE: amd-torch-device-gfx1250==2.14.0+rocm10.2.0a20260923
+  TORCH_INDEX_URL: https://nightly.repo.amd.com/rocm/whl-next/
+  TORCH_VERSION: 2.14.0+rocm10.2.0a20260923
+  TORCHVISION_VERSION: 0.29.0a0+rocm10.2.0a20260923
 install:
   - bash test/ci_system/setup_mi450_sim.sh
   - WORKSPACE="$(pwd)" bash test/ci_system/install_deps_rocm.sh
