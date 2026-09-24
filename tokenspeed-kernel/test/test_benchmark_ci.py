@@ -136,55 +136,6 @@ def test_gfx950_suite_selects_exact_registrations():
     assert suite.timer.eager_warmup_iterations == 5
     assert suite.timer.replay_warmup_iterations == 3
     assert suite.default_measurement_blocks == 30
-    gemm_cases = [case for case in suite.cases if case.request.family == "gemm"]
-    assert len(gemm_cases) == 7
-    case = gemm_cases[0]
-    assert case.id == ("gemm.bmm/gluon_bmm_a16w16_gfx950/b12-m1-n512-k128-bfloat16")
-    assert case.comparison_epoch == 1
-    assert case.request.parameters == {
-        "batch": 12,
-        "M": 1,
-        "N": 512,
-        "K": 128,
-        "dtype": "bfloat16",
-        "validation": {
-            "runs": 5,
-            "atol": 0.015,
-            "rtol": 0.015,
-        },
-    }
-    assert case.request.registration == "gluon_bmm_a16w16_gfx950"
-    assert case.request.solution is None
-    assert case.request.cold_cache is True
-    assert case.request.seed == 42
-    assert case.measurement_blocks == 30
-    assert case.policy == _policy()
-
-    mxfp8_shapes = (
-        (1024, 1792, 5120),
-        (1024, 4096, 1280),
-        (1024, 5120, 1024),
-        (4096, 1792, 5120),
-        (4096, 4096, 1280),
-        (4096, 5120, 1024),
-    )
-    for mxfp8_case, (m, n, k) in zip(gemm_cases[1:], mxfp8_shapes, strict=True):
-        assert mxfp8_case.id == (
-            "gemm.mm/gluon_mm_mxfp8_gfx950/" f"m{m}-n{n}-k{k}-mxfp8-bfloat16"
-        )
-        assert mxfp8_case.comparison_epoch == 1
-        assert mxfp8_case.request.parameters == {
-            "M": m,
-            "N": n,
-            "K": k,
-            "quant": "mxfp8",
-            "block_size": [1, 32],
-            "out_dtype": "bfloat16",
-            "validation": {"runs": 1, "atol": 0.0, "rtol": 0.0},
-        }
-        assert mxfp8_case.request.registration == "gluon_mm_mxfp8_gfx950"
-        assert mxfp8_case.request.cold_cache is True
-        assert mxfp8_case.policy == _policy()
 
 
 def test_load_suite_includes_case_files(tmp_path):

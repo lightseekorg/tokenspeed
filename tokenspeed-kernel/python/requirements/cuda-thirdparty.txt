@@ -1,11 +1,12 @@
 tokenspeed-deepep==2.1.0.post20260810
-tokenspeed-deepgemm==2.8.0.post20260923
-tokenspeed-flashmla==1.0.0.post20260920
+tokenspeed-deepgemm==2.8.0.post20260924
+tokenspeed-flashmla==1.0.0.post20260924
 tokenspeed-deepselect==1.0.0.post20260910
-tokenspeed-mla==0.2.11
+tokenspeed-mla==0.2.12
 tokenspeed-fast-hadamard-transform==1.1.0.post20260920
 tokenspeed-fa3==3.0.0.post20260810
-tokenspeed-fa4==4.0.0.post20260829
+tokenspeed-fa4==4.0.0.post20260923
+tokenspeed-quack==0.6.4.post20260923
 tokenspeed-trtllm-kernel==1.3.0.post20260919
 tokenspeed-flashkda==0.0.1.post20260810
-tokenspeed-cutedsl-kda==0.1.0.post20260919
+tokenspeed-cutedsl-kda==0.1.0.post20260923

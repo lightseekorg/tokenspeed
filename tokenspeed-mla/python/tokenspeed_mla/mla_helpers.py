@@ -23,12 +23,22 @@ import cutlass
 import cutlass.cute as cute
 
 
+def get_mla_decode_arch(compute_capability: tuple[int, int]) -> str:
+    """Return the CuTe architecture name for a supported MLA decode device."""
+    if compute_capability not in ((10, 0), (10, 3), (10, 7)):
+        raise ValueError(
+            f"MLA decode requires SM100, SM103 or SM107, got {compute_capability}"
+        )
+    major, minor = compute_capability
+    return f"sm_{major}{minor}"
+
+
 def select_mla_decode_tilers(
     num_heads: int,
     seq_len_q: int,
     *,
     is_fp8: bool,
-    compute_capability: tuple[int, int] | None = None,
+    compute_capability: tuple[int, int],
 ) -> tuple[tuple[int, int], tuple[int, int]]:
     """Select decode MMA tile shapes from runtime head/q_len configuration.
 
@@ -36,6 +46,7 @@ def select_mla_decode_tilers(
     FP8 path supports an additional M=64 kernel family on SM100 for the tuned
     H=16, S_q=4 decode shape.
     """
+    get_mla_decode_arch(compute_capability)
     default_qk = (128, 128)
     default_pv = (128, 256)
     if not is_fp8:
