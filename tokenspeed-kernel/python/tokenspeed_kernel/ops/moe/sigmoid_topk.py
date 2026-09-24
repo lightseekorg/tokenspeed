@@ -1,6 +1,6 @@
 # Copyright (c) 2026 LightSeek Foundation
 
-"""Biased sigmoid top-k routing entry point."""
+"""Biased sigmoid top-k routing implementations and internal dispatch."""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ _K3_PACKED_TOPK_MAX_ROWS_NVIDIA = 256
 _K3_PACKED_TOPK_MAX_ROWS_CDNA4 = 1
 
 
-def moe_sigmoid_bias_topk(
+def _moe_sigmoid_bias_topk(
     router_logits: torch.Tensor,
     correction_bias: torch.Tensor,
     topk: int,
@@ -51,6 +51,7 @@ def moe_sigmoid_bias_topk(
     normalize_topk_weights: bool = True,
     logical_to_physical_map: torch.Tensor | None = None,
     weights_dtype: torch.dtype = torch.float32,
+    override: str | None = None,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select experts using ``sigmoid(logits) + correction_bias``.
@@ -66,7 +67,8 @@ def moe_sigmoid_bias_topk(
             the specialized decode kernel; a gather elsewhere).
         weights_dtype: Output dtype for the route weights (selection always
             runs in FP32).
-        solution: Optional implementation override.
+        override: Optional exact registered kernel name.
+        solution: Optional implementation solution.
 
     Returns:
         ``(topk_weights, topk_ids)`` with shapes ``[tokens, topk]``. Weights
@@ -106,7 +108,8 @@ def moe_sigmoid_bias_topk(
     else:
         packed_max_rows = 0
     if (
-        solution is None
+        override is None
+        and solution is None
         and router_logits.shape[1] == 896
         and 0 < tokens <= packed_max_rows
         and router_logits.dtype == torch.float32
@@ -138,7 +141,11 @@ def moe_sigmoid_bias_topk(
         ):
             topk_ids = logical_to_physical_map[topk_ids.long()].to(torch.int32)
         return topk_weights, topk_ids
-    if solution is None and not _gluon_eligible(router_logits, correction_bias, topk):
+    if (
+        override is None
+        and solution is None
+        and not _gluon_eligible(router_logits, correction_bias, topk)
+    ):
         solution = "torch"
 
     signature = format_signature(router_logits=dense_tensor_format(router_logits.dtype))
@@ -147,6 +154,7 @@ def moe_sigmoid_bias_topk(
         logical_to_physical_map is not None
         and logical_to_physical_map.dtype == torch.int32
         and solution is None
+        and override in {None, "triton_decode_sigmoid_bias_topk_mapped"}
     ):
         try:
             mapped_kernel = select_kernel(
@@ -154,6 +162,7 @@ def moe_sigmoid_bias_topk(
                 "sigmoid_bias_topk_mapped",
                 signature,
                 traits=traits,
+                override=override,
             )
         except NoKernelFoundError:
             mapped_kernel = None
@@ -174,6 +183,7 @@ def moe_sigmoid_bias_topk(
         "sigmoid_bias_topk",
         signature,
         traits=traits,
+        override=override,
         solution=solution,
     )
     topk_weights, topk_ids = kernel(
@@ -268,5 +278,3 @@ def torch_sigmoid_bias_topk(
 
 import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.triton.decode_sigmoid_topk  # noqa: E402,F401
-
-__all__ = ["moe_sigmoid_bias_topk"]

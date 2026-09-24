@@ -50,8 +50,6 @@ from tokenspeed_kernel.ops.moe import (
     moe_apply,
     moe_plan,
     moe_process_weights,
-    moe_sigmoid_bias_topk,
-    moe_softmax_topk,
     moe_topk,
     native_latent_moe_available,
 )
@@ -118,8 +116,6 @@ __all__ = [
     "moe_apply",
     "moe_plan",
     "moe_process_weights",
-    "moe_sigmoid_bias_topk",
-    "moe_softmax_topk",
     "moe_topk",
     # quantization
     "quantize_fp8",

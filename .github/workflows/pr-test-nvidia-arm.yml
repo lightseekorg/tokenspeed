@@ -76,6 +76,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Install scan dependency
+        # pypi.org occasionally returns "Content-Type: Unknown" for the simple
+        # index, which strict pip>=22 refuses to parse. Retry a few times.
+        run: |
+          for i in 1 2 3 4 5; do
+            python3 -m pip install pyyaml && exit 0
+            echo "pyyaml install attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          exit 1
+
       - name: Classify changed paths
         id: changes
         env:
@@ -104,19 +115,8 @@ jobs:
           python3 test/ci_system/ci_path_filter.py \
             --runner-group nvidia-arm \
             --event-name "${{ github.event_name }}" \
+            --repo-root "$GITHUB_WORKSPACE" \
             "$changed_files" >> "$GITHUB_OUTPUT"
-
-      - name: Install scan dependency
-        if: steps.changes.outputs.should_run == 'true'
-        # pypi.org occasionally returns "Content-Type: Unknown" for the simple
-        # index, which strict pip>=22 refuses to parse. Retry a few times.
-        run: |
-          for i in 1 2 3 4 5; do
-            python3 -m pip install pyyaml && exit 0
-            echo "pyyaml install attempt $i failed, retrying in 10s..."
-            sleep 10
-          done
-          exit 1
 
       - name: Build task matrix
         id: scan
