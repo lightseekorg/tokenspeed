@@ -223,6 +223,12 @@ class LinearBase(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
+    def _apply(self, fn, recurse: bool = True):
+        result = super()._apply(fn, recurse=recurse)
+        if self.quant_method is not None:
+            self.quant_method.finalize_weights_after_loading(self)
+        return result
+
 
 class ReplicatedLinear(LinearBase):
     """Replicated linear layer.

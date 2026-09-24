@@ -43,7 +43,11 @@ from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 from tokenspeed.runtime.configs.device_config import DeviceConfig
 from tokenspeed.runtime.configs.load_config import LoadConfig, LoadFormat
 from tokenspeed.runtime.configs.model_config import ModelConfig
-from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.base_config import (
+    QuantizationConfig,
+    finalize_quantized_weights_after_loading,
+    invalidate_quantized_weights_before_loading,
+)
 from tokenspeed.runtime.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
@@ -551,7 +555,9 @@ class DummyModelLoader(BaseModelLoader):
 
             #  For accurate performance evaluation, we assign
             # random values to the weights.
+            invalidate_quantized_weights_before_loading(model)
             initialize_dummy_weights(model)
+            finalize_quantized_weights_after_loading(model)
         return model.eval()
 
 
@@ -656,6 +662,7 @@ class ShardedStateLoader(BaseModelLoader):
                     )
                     if process_method is not None:
                         module.process_weights_after_loading(module)
+            invalidate_quantized_weights_before_loading(model)
             rank = model_config.mapping.rank
             pattern = os.path.join(
                 local_model_path,
@@ -689,6 +696,7 @@ class ShardedStateLoader(BaseModelLoader):
                         state_dict.pop(key)
             if state_dict:
                 raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
+            finalize_quantized_weights_after_loading(model)
 
         post_quant_warmup = getattr(model, "post_quant_warmup", None)
         if callable(post_quant_warmup):

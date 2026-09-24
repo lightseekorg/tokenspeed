@@ -50,6 +50,16 @@ _FP8_BLOCK_SCALE = ScaleFormat(
 )
 
 if current_platform().is_amd:
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp8 import (
+        GLM53_BLOCK_FP8_PRIMARY_ROWS,
+        GLUON_BLOCK_FP8_WEIGHT_LAYOUT,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp8 import (
+        launch_gluon_mm_fp8_blockscale_largem_gfx950 as _fp8_blockscale_largem_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp8 import (
+        supports_gluon_fp8_blockscale_largem,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
         launch_gluon_mm_a16w16_prefill_gfx950 as _mm_a16w16_prefill_impl,
     )
@@ -88,6 +98,60 @@ if current_platform().is_amd:
             )
         }
     )
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="gluon_mm_fp8_blockscale_largem_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=frozenset(
+            {
+                format_signature(
+                    a=tensor_format("mxfp8", _FP8_DTYPE, scale=_FP8_BLOCK_SCALE),
+                    b=tensor_format("mxfp8", _FP8_DTYPE, scale=_FP8_BLOCK_SCALE),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "m": GLM53_BLOCK_FP8_PRIMARY_ROWS,
+            "mnk_problem_filter": frozenset({supports_gluon_fp8_blockscale_largem}),
+            "a_inner_stride_one": frozenset({True}),
+            "a_scales_inner_stride_one": frozenset({True}),
+            "b_inner_stride_one": frozenset({True}),
+            "b_scales_inner_stride_one": frozenset({True}),
+            "out_dtype": frozenset({torch.bfloat16}),
+            "block_scale_layout": frozenset({"canonical"}),
+            "weight_layout": frozenset({GLUON_BLOCK_FP8_WEIGHT_LAYOUT}),
+        },
+    )
+    def gluon_mm_fp8_blockscale_largem_gfx950(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None,
+        block_size: list[int] | None,
+        weight_layout: str,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if alpha is not None:
+            raise ValueError("Gluon block-FP8 GEMM does not support alpha")
+        if A_scales is None or B_scales is None or block_size is None:
+            raise ValueError("Gluon block-FP8 GEMM requires block scales")
+        return _fp8_blockscale_largem_impl(
+            A,
+            B,
+            A_scales,
+            B_scales,
+            out_dtype,
+            block_size=block_size,
+            weight_layout=weight_layout,
+            out=out,
+        )
 
     # Cold-cache rocprof measurements on MI350X identify one contiguous prefill
     # range. Shapes outside it keep the PyTorch/rocBLAS path.
@@ -487,6 +551,9 @@ if current_platform().is_amd:
 
 else:
 
+    def gluon_mm_fp8_blockscale_largem_gfx950(**kwargs):
+        raise ImportError("gluon_mm_fp8_blockscale_largem_gfx950 requires AMD gfx950")
+
     def gluon_mm_a16w16_prefill_gfx950(**kwargs):
         raise ImportError(
             "gluon_mm_a16w16_prefill_gfx950 requires tokenspeed-kernel-amd"
@@ -513,6 +580,7 @@ else:
 
 
 __all__ = [
+    "gluon_mm_fp8_blockscale_largem_gfx950",
     "gluon_mm_a16w16_prefill_gfx950",
     "gluon_mm_mxfp8_gfx950",
     "gluon_mm_fp8_blockscale_gfx1250",

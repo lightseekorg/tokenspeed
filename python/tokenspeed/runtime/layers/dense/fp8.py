@@ -27,7 +27,12 @@ import logging
 
 import tokenspeed_kernel
 import torch
-from tokenspeed_kernel import fp8_linear, prepare_fp8_linear
+from tokenspeed_kernel import (
+    fp8_linear,
+    invalidate_fp8_linear_weight,
+    prepare_fp8_linear,
+    refresh_fp8_linear_weight,
+)
 from tokenspeed_kernel.ops.gemm.fp8_utils import (
     per_block_quant_fp8,
     per_token_group_quant_fp8,
@@ -228,7 +233,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
                 return
             layer._prepared_fp8_linear = prepare_fp8_linear(
-                layer.weight.data,
+                layer.weight,
                 layer.weight_scale_inv.data,
                 self.quant_config.weight_block_size,
                 scale_format=getattr(self.quant_config, "scale_fmt", None),
@@ -284,6 +289,18 @@ class Fp8LinearMethod(LinearMethodBase):
                     layer.input_scale = Parameter(
                         layer.input_scale.max(), requires_grad=False
                     )
+
+    def finalize_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.block_quant:
+            plan = getattr(layer, "_prepared_fp8_linear", None)
+            if plan is not None:
+                refresh_fp8_linear_weight(plan, layer.weight)
+
+    def invalidate_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        if self.block_quant:
+            plan = getattr(layer, "_prepared_fp8_linear", None)
+            if plan is not None:
+                invalidate_fp8_linear_weight(plan)
 
     def apply(
         self,

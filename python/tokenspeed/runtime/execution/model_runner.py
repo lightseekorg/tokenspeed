@@ -29,6 +29,10 @@ from tokenspeed.runtime.configs.numerics import require_verified_numerics
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
 from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
+from tokenspeed.runtime.layers.quantization.base_config import (
+    finalize_quantized_weights_after_loading,
+    invalidate_quantized_weights_before_loading,
+)
 from tokenspeed.runtime.model_loader.weight_utils import (
     non_unit_kv_scale_message,
     record_non_unit_kv_scales,
@@ -340,9 +344,13 @@ class ModelRunner:
                     dist.broadcast(buf, src=0, group=pg)
                     yield name, buf
 
-            # The update loads to completion so the model stays consistent, then fails on a scale.
-            rejected: list[str] = []
-            self.model.load_weights(record_non_unit_kv_scales(_recv(), rejected))
+            invalidate_quantized_weights_before_loading(self.model)
+            try:
+                # Finish loading before rejecting a non-unit KV-cache scale.
+                rejected: list[str] = []
+                self.model.load_weights(record_non_unit_kv_scales(_recv(), rejected))
+            finally:
+                finalize_quantized_weights_after_loading(self.model)
             torch.cuda.synchronize(device)
             if rejected:
                 return False, (

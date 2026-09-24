@@ -52,6 +52,12 @@ class QuantizeMethodBase(ABC):
         """
         return
 
+    def finalize_weights_after_loading(self, layer: nn.Module) -> None:
+        """Refresh private derived weight state after a loader's final copy."""
+
+    def invalidate_weights_before_loading(self, layer: nn.Module) -> None:
+        """Invalidate private derived weight state before an in-place update."""
+
 
 class QuantizationConfig(ABC):
     """Base class for quantization configs."""
@@ -221,3 +227,17 @@ class LinearMethodBase(QuantizeMethodBase):
 
 def method_has_implemented_embedding(method_class: type[QuantizeMethodBase]) -> bool:
     return "embedding" in method_class.__dict__
+
+
+def invalidate_quantized_weights_before_loading(model: nn.Module) -> None:
+    for module in model.modules():
+        method = getattr(module, "quant_method", None)
+        if method is not None:
+            method.invalidate_weights_before_loading(module)
+
+
+def finalize_quantized_weights_after_loading(model: nn.Module) -> None:
+    for module in model.modules():
+        method = getattr(module, "quant_method", None)
+        if method is not None:
+            method.finalize_weights_after_loading(module)

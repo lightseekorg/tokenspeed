@@ -108,6 +108,29 @@ steps in one LDS tile, then splits the four MFMA fragments in registers. Two
 waves per EU avoid spills from the longer-lived fragments. Strided scales fall
 back to direct fragment loads, and output uses vectorized buffer stores.
 
+### gfx950 block-scaled FP8 prefill projection
+
+This Gluon backend handles the large, fixed-row block-FP8 projections used by
+GLM-5.3-Flash prefill.
+
+#### Contract
+
+- The route requires E4M3 operands, FP32 scales for 128-by-128 blocks, BF16
+  output, gfx950, and 8144 or 8192 activation rows. Other shapes use the normal
+  matrix-multiply selection path.
+- Enable it with `TOKENSPEED_EXPERIMENTAL_GLUON_FP8_BLOCKSCALE=1` when weights
+  are prepared, before graph capture.
+- The packed buffer is derived state, not a checkpoint parameter. Model-load
+  and distributed weight-update paths refresh it in place after their final
+  canonical weight write, keeping captured graph addresses stable. A stale
+  packed copy or unsupported input falls back to the canonical weight.
+
+#### Algorithm
+
+The checkpoint weight stays in its canonical layout. Preparation builds one
+non-persistent packed copy. The kernel groups 128 input channels by 64 output
+channels.
+
 ### gfx1250 MXFP8 decode projection
 
 The gfx1250 package provides decode-oriented MXFP8 projections for DeepSeek V4
