@@ -83,7 +83,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.routing import (
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.warp_decode import (
     _gluon_mxfp4_fp8_warp_decode_moe,
+    _warp_decode_precomputed_situ_sorted_stage1_kernel,
     _warp_decode_precomputed_situ_stage1_kernel,
+    _warp_decode_sorted_stage2_fp8_mxfp4_kernel,
     _warp_decode_stage2_fp8_mxfp4_kernel,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
@@ -158,8 +160,27 @@ _DIRECT_STAGE2_BLOCK_N = 16
 
 
 _SITU_INTERMEDIATE_SCALES: dict[tuple[torch.device, float], torch.Tensor] = {}
-_A8W4_STAGE2_BLOCK_N = 64
+_A8W4_STAGE1_NUM_BUFFERS = 2
 _A8W4_STAGE2_NUM_WARPS = 1
+_A8W4_SORTED_STAGE1_MIN_M = 64
+_A8W4_SORTED_XCD_SWIZZLE = 1
+_A8W4_SORTED_STAGE2_N_TILES = 4
+
+
+def _select_a8w4_stage2_block_n(num_tokens: int) -> int:
+    """Keep the combined-top-k stage-2 grid near a fixed machine-wave count."""
+    if num_tokens <= 8:
+        return 16
+    if num_tokens <= 16:
+        return 32
+    if num_tokens <= 32:
+        return 64
+    return 128
+
+
+def _use_a8w4_combined_topk(num_tokens: int, fuse_shared_down: bool) -> bool:
+    """Select widths where in-CTA top-k reduction beats split reduction."""
+    return not fuse_shared_down and 8 <= num_tokens <= 16
 
 
 def _situ_intermediate_scale(device: torch.device, max_abs: float) -> torch.Tensor:
@@ -306,10 +327,17 @@ def gluon_mxfp4_fp8_precomputed_situ(
     inter_scale = _situ_intermediate_scale(
         hidden_states.device, float(situ_beta * situ_linear_beta)
     )
-    inter = torch.empty(
-        (M * TOPK, i_dim), dtype=torch.float8_e4m3fn, device=hidden_states.device
+    use_sorted_route_tiles = (
+        M >= _A8W4_SORTED_STAGE1_MIN_M
+        and expert_start == 0
+        and global_num_experts == num_local_experts
     )
-    partial = torch.empty((M * TOPK, N), dtype=out_dtype, device=hidden_states.device)
+    if not use_sorted_route_tiles:
+        inter = torch.empty(
+            (M * TOPK, i_dim),
+            dtype=torch.float8_e4m3fn,
+            device=hidden_states.device,
+        )
     if out is None:
         out = torch.empty((M, N), dtype=out_dtype, device=hidden_states.device)
     elif (
@@ -343,51 +371,197 @@ def gluon_mxfp4_fp8_precomputed_situ(
     num_warps = 4
     k_iters = (D + block_k - 1) // block_k
     even_k = D % block_k == 0
-    num_buffers = min(2, k_iters + (1 if even_k else 0))
-    grid = (M * triton.cdiv(two_i, block_n) * TOPK,)
-    _warp_decode_precomputed_situ_stage1_kernel[grid](
-        x_fp8.view(torch.uint8),
-        w13_raw,
-        w13_scale,
-        topk_ids,
-        inter,
-        M,
-        D,
-        i_dim,
-        x_fp8.stride(0),
-        x_fp8.stride(1),
-        topk_ids.stride(0),
-        topk_ids.stride(1),
-        w13_raw.stride(0),
-        w13_raw.stride(-2),
-        w13_raw.stride(-1),
-        w13_scale.stride(0),
-        w13_scale.stride(-2),
-        w13_scale.stride(-1),
-        inter.stride(0),
-        inter.stride(1),
-        x_scale,
-        inter_scale,
-        dummy_bias,
-        TOPK=TOPK,
-        BLOCK_K=block_k,
-        BLOCK_N=block_n,
-        BLOCK_M=16,
-        NUM_BUFFERS=num_buffers,
-        NUM_WARPS=num_warps,
-        W_PRESHUFFLED=True,
-        EVEN_K=even_k,
-        HAS_BIAS=False,
-        SITU_BETA=float(situ_beta),
-        SITU_LINEAR_BETA=float(situ_linear_beta),
-        EXPERT_START=expert_start,
-        NUM_LOCAL_EXPERTS=num_local_experts,
-        num_warps=num_warps,
-    )
+    num_buffers = min(_A8W4_STAGE1_NUM_BUFFERS, k_iters + (1 if even_k else 0))
+    if use_sorted_route_tiles:
+        from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import (
+            gluon_moe_sorting,
+        )
 
-    stage2_block_n = _A8W4_STAGE2_BLOCK_N
+        (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            _,
+        ) = gluon_moe_sorting(
+            topk_ids,
+            topk_weights,
+            num_local_experts,
+            N,
+            out_dtype,
+            16,
+            compact_route_programs=True,
+            expert_start=expert_start,
+        )
+        inter = torch.empty(
+            (int(sorted_ids.shape[0]), i_dim),
+            dtype=torch.float8_e4m3fn,
+            device=hidden_states.device,
+        )
+        grid = (int(sorted_expert_ids.shape[0]) * triton.cdiv(two_i, block_n),)
+        _warp_decode_precomputed_situ_sorted_stage1_kernel[grid](
+            x_fp8.view(torch.uint8),
+            w13_raw,
+            w13_scale,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            inter,
+            M,
+            D,
+            i_dim,
+            x_fp8.stride(0),
+            x_fp8.stride(1),
+            w13_raw.stride(0),
+            w13_raw.stride(-2),
+            w13_raw.stride(-1),
+            w13_scale.stride(0),
+            w13_scale.stride(-2),
+            w13_scale.stride(-1),
+            inter.stride(0),
+            inter.stride(1),
+            x_scale,
+            inter_scale,
+            dummy_bias,
+            TOPK=TOPK,
+            BLOCK_K=block_k,
+            BLOCK_N=block_n,
+            BLOCK_M=16,
+            NUM_BUFFERS=num_buffers,
+            NUM_WARPS=num_warps,
+            W_PRESHUFFLED=True,
+            EVEN_K=even_k,
+            HAS_BIAS=False,
+            SITU_BETA=float(situ_beta),
+            SITU_LINEAR_BETA=float(situ_linear_beta),
+            EXPERT_START=expert_start,
+            NUM_LOCAL_EXPERTS=num_local_experts,
+            XCD_SWIZZLE=_A8W4_SORTED_XCD_SWIZZLE,
+            num_warps=num_warps,
+        )
+    else:
+        grid = (M * triton.cdiv(two_i, block_n) * TOPK,)
+        _warp_decode_precomputed_situ_stage1_kernel[grid](
+            x_fp8.view(torch.uint8),
+            w13_raw,
+            w13_scale,
+            topk_ids,
+            inter,
+            M,
+            D,
+            i_dim,
+            x_fp8.stride(0),
+            x_fp8.stride(1),
+            topk_ids.stride(0),
+            topk_ids.stride(1),
+            w13_raw.stride(0),
+            w13_raw.stride(-2),
+            w13_raw.stride(-1),
+            w13_scale.stride(0),
+            w13_scale.stride(-2),
+            w13_scale.stride(-1),
+            inter.stride(0),
+            inter.stride(1),
+            x_scale,
+            inter_scale,
+            dummy_bias,
+            TOPK=TOPK,
+            BLOCK_K=block_k,
+            BLOCK_N=block_n,
+            BLOCK_M=16,
+            NUM_BUFFERS=num_buffers,
+            NUM_WARPS=num_warps,
+            W_PRESHUFFLED=True,
+            EVEN_K=even_k,
+            HAS_BIAS=False,
+            SITU_BETA=float(situ_beta),
+            SITU_LINEAR_BETA=float(situ_linear_beta),
+            EXPERT_START=expert_start,
+            NUM_LOCAL_EXPERTS=num_local_experts,
+            num_warps=num_warps,
+        )
+
+    if use_sorted_route_tiles:
+        partial = torch.empty(
+            (M * TOPK, N), dtype=out_dtype, device=hidden_states.device
+        )
+        sorted_stage2_num_warps = _A8W4_SORTED_STAGE2_N_TILES
+        sorted_stage2_block_n = 128 * sorted_stage2_num_warps
+        sorted_stage2_programs = int(sorted_expert_ids.shape[0]) * triton.cdiv(
+            N, sorted_stage2_block_n
+        )
+        _warp_decode_sorted_stage2_fp8_mxfp4_kernel[(sorted_stage2_programs,)](
+            inter,
+            w2_raw,
+            w2_scale,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            partial,
+            M,
+            N,
+            int(w2_raw.shape[2]),
+            i_dim,
+            inter.stride(0),
+            inter.stride(1),
+            w2_raw.stride(0),
+            w2_raw.stride(-2),
+            w2_raw.stride(-1),
+            w2_scale.stride(0),
+            w2_scale.stride(-2),
+            w2_scale.stride(-1),
+            partial.stride(0),
+            partial.stride(1),
+            inter_scale,
+            I_PACKED=i_dim // 2,
+            TOPK=TOPK,
+            BLOCK_M=16,
+            BLOCK_K=128,
+            BLOCK_N=sorted_stage2_block_n,
+            NUM_WARPS_N=sorted_stage2_num_warps,
+            W_PRESHUFFLED=True,
+            EXPERT_START=expert_start,
+            NUM_LOCAL_EXPERTS=num_local_experts,
+            XCD_SWIZZLE=_A8W4_SORTED_XCD_SWIZZLE,
+            num_warps=sorted_stage2_num_warps,
+        )
+        reduce_block_n = 256
+        reduce_programs = M * triton.cdiv(N, reduce_block_n)
+        _moe_partial_reduce[(reduce_programs,)](
+            partial,
+            out,
+            M,
+            N,
+            partial.stride(0),
+            TOPK * partial.stride(0),
+            partial.stride(1),
+            out.stride(0),
+            out.stride(1),
+            SPLIT_K=TOPK,
+            BLOCK_N=reduce_block_n,
+            num_warps=1,
+        )
+        return out
+
+    # Accumulate all routed experts in each output CTA when the reduction does
+    # not also own the shared-expert projection. Scaling BLOCK_N with M keeps
+    # enough one-wave CTAs resident while avoiding the partial tensor and a
+    # separate top-k reduction.
+    combine_topk = _use_a8w4_combined_topk(M, fuse_shared_down)
+    if combine_topk:
+        stage2_out = out
+        stage2_stride_om = out.stride(0)
+    else:
+        stage2_out = torch.empty(
+            (M * TOPK, N), dtype=out_dtype, device=hidden_states.device
+        )
+        stage2_stride_om = stage2_out.stride(0)
+    stage2_block_n = _select_a8w4_stage2_block_n(M) if combine_topk else 64
     stage2_num_warps = _A8W4_STAGE2_NUM_WARPS
-    routed_stage2_programs = M * TOPK * triton.cdiv(N, stage2_block_n)
+    routed_stage2_programs = M * triton.cdiv(N, stage2_block_n)
+    if not combine_topk:
+        routed_stage2_programs *= TOPK
     shared_block_n = 4
     num_shared_pid_n = triton.cdiv(7168, shared_block_n)
     _warp_decode_stage2_fp8_mxfp4_kernel[(routed_stage2_programs,)](
@@ -396,7 +570,7 @@ def gluon_mxfp4_fp8_precomputed_situ(
         w2_scale,
         topk_ids,
         topk_weights,
-        partial,
+        stage2_out,
         M,
         N,
         int(w2_raw.shape[2]),
@@ -409,8 +583,8 @@ def gluon_mxfp4_fp8_precomputed_situ(
         w2_scale.stride(0),
         w2_scale.stride(-2),
         w2_scale.stride(-1),
-        partial.stride(0),
-        partial.stride(1),
+        stage2_stride_om,
+        stage2_out.stride(1),
         0,
         inter_scale,
         dummy_bias,
@@ -422,11 +596,16 @@ def gluon_mxfp4_fp8_precomputed_situ(
         W_PRESHUFFLED=True,
         HAS_BIAS=False,
         SPLIT_K=1,
-        SPLIT_TOPK=True,
+        ROUND_TOPK_PARTIALS=combine_topk,
+        SPLIT_TOPK=not combine_topk,
         EXPERT_START=expert_start,
         NUM_LOCAL_EXPERTS=num_local_experts,
         num_warps=stage2_num_warps,
     )
+    if combine_topk:
+        return out
+
+    partial = stage2_out
     reduce_block_n = 256
     reduce_programs = M * triton.cdiv(N, reduce_block_n)
     reduce_grid = reduce_programs + (M * num_shared_pid_n if fuse_shared_down else 0)
@@ -1258,6 +1437,7 @@ def _maybe_gluon_package_mxfp4_prefill(
             hidden_dim,
             out_dtype,
             sort_block_m,
+            compact_route_programs=False,
             expert_start=expert_start,
             out=out,
         )

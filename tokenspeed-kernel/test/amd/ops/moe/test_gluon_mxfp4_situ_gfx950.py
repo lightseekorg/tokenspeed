@@ -45,6 +45,29 @@ _A8W4_EP_APPLY = "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"
 
 
 @pytest.mark.parametrize(
+    "num_tokens, expected_block_n, expected_combined",
+    [
+        (1, 16, False),
+        (8, 16, True),
+        (16, 32, True),
+        (24, 64, False),
+        (32, 64, False),
+        (64, 128, False),
+    ],
+)
+def test_kimi_k3_stage2_decode_policy(
+    num_tokens: int,
+    expected_block_n: int,
+    expected_combined: bool,
+) -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import moe
+
+    assert moe._select_a8w4_stage2_block_n(num_tokens) == expected_block_n
+    assert moe._use_a8w4_combined_topk(num_tokens, False) == expected_combined
+    assert not moe._use_a8w4_combined_topk(num_tokens, True)
+
+
+@pytest.mark.parametrize(
     "per_lane, scales_per_lane, group",
     [(64, 2, 32), (32, 1, 32), (16, 1, 16), (8, 1, 8)],
     ids=["two_blocks", "one_block", "half_block", "quarter_block"],
@@ -1091,6 +1114,7 @@ def test_package_prefill_sort_contract_gfx950(
         1,
         torch.bfloat16,
         block_m,
+        compact_route_programs=False,
     )
     valid_extent, reported_tokens = num_valid.cpu().tolist()
     assert reported_tokens == num_tokens
@@ -1159,6 +1183,7 @@ def test_package_prefill_sort_localizes_ep_routes_gfx950() -> None:
             32,
             torch.bfloat16,
             64,
+            compact_route_programs=False,
             expert_start=expert_start,
             out=output,
         )
@@ -1201,6 +1226,7 @@ def test_package_prefill_low_density_route_capacity_gfx950() -> None:
         1,
         torch.bfloat16,
         block_m,
+        compact_route_programs=False,
     )
 
     expected_capacity = _max_padded_route_capacity(
@@ -1406,7 +1432,13 @@ def test_stage2_logical_k_ignores_padding_gfx950(
         torch.tensor([0.25, 0.75], device="cuda").expand(tokens, topk).contiguous()
     )
     sorted_ids, sorted_weights, sorted_experts, valid, out = gluon_moe_sorting(
-        ids, weights, experts, n, torch.bfloat16, sort_block_m
+        ids,
+        weights,
+        experts,
+        n,
+        torch.bfloat16,
+        sort_block_m,
+        compact_route_programs=False,
     )
     raw_a = torch.randint(
         0,
