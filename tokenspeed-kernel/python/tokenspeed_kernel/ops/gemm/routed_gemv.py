@@ -638,7 +638,7 @@ _TGV_CAPABILITY = CapabilityRequirement(
     vendors=frozenset({"nvidia"}),
 )
 _CUTLASS_CAPABILITY = CapabilityRequirement(
-    min_arch_version=ArchVersion(10, 7),
+    min_arch_version=ArchVersion(10, 0),
     max_arch_version=ArchVersion(10, 7),
     vendors=frozenset({"nvidia"}),
 )
@@ -1102,7 +1102,8 @@ def _register_route() -> None:
                     "k": frozenset({k}),
                 },
                 # Above the M == 1 rowcta spec so this route takes the shape.
-                priority=Priority.SPECIALIZED + 2,
+                priority=Priority.SPECIALIZED
+                + (1 if impl is flashinfer_cutlass_gemv else 2),
             )(impl)
 
 
