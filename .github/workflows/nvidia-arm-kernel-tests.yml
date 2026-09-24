@@ -8,7 +8,8 @@ on:
       - "test/ci/ut/ut-tokenspeed-kernel-nvidia-arm.yaml"
       - "tokenspeed-kernel/test/nvidia/thirdparty/test_deep_gemm.py"
       - "tokenspeed-kernel/test/ops/test_attention_dsv4_dcp.py"
-      - "tokenspeed-kernel/python/requirements/cuda-thirdparty.txt"
+      - "tokenspeed-kernel/test/conftest.py"
+      - "tokenspeed-kernel/python/**"
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
@@ -17,7 +18,8 @@ on:
       - "test/ci/ut/ut-tokenspeed-kernel-nvidia-arm.yaml"
       - "tokenspeed-kernel/test/nvidia/thirdparty/test_deep_gemm.py"
       - "tokenspeed-kernel/test/ops/test_attention_dsv4_dcp.py"
-      - "tokenspeed-kernel/python/requirements/cuda-thirdparty.txt"
+      - "tokenspeed-kernel/test/conftest.py"
+      - "tokenspeed-kernel/python/**"
   workflow_dispatch:
 
 permissions:
