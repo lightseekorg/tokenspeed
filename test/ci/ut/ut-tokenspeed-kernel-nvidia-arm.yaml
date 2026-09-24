@@ -18,7 +18,7 @@ env:
   LD_PRELOAD: /usr/local/cuda-13.4/lib64/libnvrtc.so.13
   TRITON_PTXAS_PATH: /usr/local/cuda-13.4/bin/ptxas
 install:
-  - python3 -m pip install --break-system-packages pytest==9.1.1 -r tokenspeed-kernel/python/requirements/cuda.txt -r tokenspeed-kernel/python/requirements/cuda-thirdparty.txt -e python
+  - python3 -m pip install --break-system-packages pytest==9.1.1 -r tokenspeed-kernel/python/requirements/cuda.txt -r tokenspeed-kernel/python/requirements/cuda-thirdparty.txt compressed-tensors
   - TOKENSPEED_KERNEL_BACKEND=cuda python3 tokenspeed-kernel/python/setup.py build_ext
 ut:
   commands:
