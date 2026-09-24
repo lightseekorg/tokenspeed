@@ -345,6 +345,8 @@ class Envs:
     TOKENSPEED_LOG_MM_TIMING = EnvBool(False)
     TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH = EnvBool(False)
     TOKENSPEED_MM_VIDEO_ENCODER_CUDA_GRAPH_MAX_SEQUENCES_PER_BATCH = EnvInt(None)
+    # Eager V4.1 vision input tokens, before spatial merging.
+    TOKENSPEED_DEEPSEEK_V41_VISION_MAX_BATCH_TOKENS = EnvInt(16384)
     TOKENSPEED_MM_SKIP_COMPUTE_HASH = EnvBool(False)
 
     # fmt: on
