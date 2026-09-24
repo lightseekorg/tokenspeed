@@ -19,6 +19,7 @@ env:
   TRITON_PTXAS_PATH: /usr/local/cuda-13.4/bin/ptxas
 install:
   - python3 -m pip install --break-system-packages pytest==9.1.1 -r tokenspeed-kernel/python/requirements/cuda.txt -r tokenspeed-kernel/python/requirements/cuda-thirdparty.txt
+  - TOKENSPEED_KERNEL_BACKEND=cuda python3 tokenspeed-kernel/python/setup.py build_ext
 ut:
   commands:
     - python3 -c 'import torch; assert torch.cuda.get_device_capability() == (10, 7)'

@@ -228,3 +228,20 @@ def test_cuda_include_dirs_fall_back_from_partial_toolkit(
 
     assert str(cuda_include) not in include_dirs
     assert str(wheel_include) in include_dirs
+
+
+def test_cuda_default_archs_follow_toolkit_version(monkeypatch) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", "cuda")
+    monkeypatch.delenv("FLASHINFER_CUDA_ARCH_LIST", raising=False)
+    monkeypatch.delenv("TOKENSPEED_CUDA_ARCH", raising=False)
+    monkeypatch.setattr(setuptools, "setup", lambda **_kwargs: None)
+    setup_namespace = runpy.run_path(str(SETUP_PY))
+    builder = setup_namespace["CudaKernelBuilder"]([], verbose=False)
+
+    for version, expected in (
+        (None, {"100a", "103a"}),
+        ((13, 0), {"100a", "103a"}),
+        ((13, 4), {"100a", "103a", "107a"}),
+    ):
+        monkeypatch.setattr(builder, "_nvcc_toolkit_version", lambda: version)
+        assert builder._detect_cuda_archs() == expected
