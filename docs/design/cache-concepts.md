@@ -859,7 +859,12 @@ Its responsibilities:
   resident is the coordinator's answer (`DeviceBoundaryResidency`, read off
   the group indexes), so the scheduler keeps no residency counters of its own
   — only the token descriptor the event carries and whether that event is
-  currently out.
+  currently out. A mutation only marks its boundary for reconcile;
+  `DrainKvEvents` reconciles each marked boundary against its residency and
+  reports the net change (published exactly while fully resident), then drops
+  descriptors of boundaries with no cached child. Nothing is decided
+  mid-`Admit`, so one admission may evict a boundary's last cached copy and
+  then store the request's own copy without any ordering hazard.
 For L3 write-through, each lane carries only its own hashed Host destinations.
 Its CUDA completion starts those backups, and its scheduler ACK waits until
 those puts finish; a different lane completing cannot release its pages.

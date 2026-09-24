@@ -96,8 +96,8 @@ Scheduler::Scheduler(SchedulerConfig config)
     max_single_request_tokens_ = CapacityModel{config_}.MaxSingleRequestTokens(coordinator_.TotalLcmBlocks());
 
     if (config_.enable_kv_cache_events) {
-        coordinator_.SetCacheMutationSink([this](const CacheKey& key, CacheCoordinator::CacheMutation mutation) {
-            handleCacheMutation(key, mutation);
+        coordinator_.SetCacheMutationSink([this](const CacheKey& key, CacheCoordinator::CacheMutation) {
+            markKvEventBoundaryForReconcile(eventKey(key));
         });
     }
 
@@ -137,7 +137,28 @@ std::size_t Scheduler::groupIndex(const std::string& group_id) const {
 }
 
 std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
-    return std::exchange(kv_events_, {});
+    // An event reports the net change since the last drain: a boundary is
+    // published exactly while every child block of it is cached.
+    std::vector<KvCacheEvent> events;
+    for (const CacheKey& boundary : std::exchange(kv_event_boundaries_to_reconcile_, {})) {
+        const auto it = kv_event_boundaries_.find(boundary);
+        FatalCheck(it != kv_event_boundaries_.end(),
+                   "KV event boundary marked for reconcile lost its token descriptor");
+        KvEventBoundary& event_boundary = it->second;
+        event_boundary.needs_reconcile = false;
+        const CacheCoordinator::BoundaryResidency residency = coordinator_.DeviceBoundaryResidency(boundary);
+        const bool complete = residency == CacheCoordinator::BoundaryResidency::kComplete;
+        if (complete && !event_boundary.published) {
+            events.emplace_back(event_boundary.stored);
+        } else if (!complete && event_boundary.published) {
+            events.emplace_back(KvBlockRemovedEvent{.block_hashes = event_boundary.stored.block_hashes});
+        }
+        event_boundary.published = complete;
+        if (residency == CacheCoordinator::BoundaryResidency::kNone) {
+            kv_event_boundaries_.erase(it);
+        }
+    }
+    return events;
 }
 
 bool Scheduler::ClearL1Cache() {
@@ -185,11 +206,10 @@ bool Scheduler::clearCache(bool include_host) {
     return true;
 }
 
-std::vector<CacheKey> Scheduler::registerKvEventPrefixPages(const Request& request,
-                                                            std::span<const std::string> prefix_hashes,
-                                                            std::int32_t first_page) {
+void Scheduler::registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
+                                           std::int32_t first_page) {
     if (!config_.enable_kv_cache_events) {
-        return {};
+        return;
     }
     _assert(first_page >= 0 && static_cast<std::size_t>(first_page) <= prefix_hashes.size(),
             "KV event page range is invalid");
@@ -203,8 +223,6 @@ std::vector<CacheKey> Scheduler::registerKvEventPrefixPages(const Request& reque
         progress.block_hashes.push_back(HashKvBlock(token_pages[i], parent_hash));
     }
 
-    std::vector<CacheKey> registered_keys;
-    registered_keys.reserve(prefix_hashes.size() - static_cast<std::size_t>(first_page));
     for (std::size_t i = static_cast<std::size_t>(first_page); i < prefix_hashes.size(); ++i) {
         CacheKey key{.content_hash = prefix_hashes[i]};
         const std::optional<std::uint64_t> parent_hash =
@@ -218,38 +236,19 @@ std::vector<CacheKey> Scheduler::registerKvEventPrefixPages(const Request& reque
         const auto [it, inserted] = kv_event_boundaries_.try_emplace(key, KvEventBoundary{.stored = std::move(event)});
         FatalCheck(inserted || it->second.stored.block_hashes.front() == progress.block_hashes[i],
                    "one cache content hash mapped to different KV event blocks");
-        registered_keys.push_back(std::move(key));
-    }
-    return registered_keys;
-}
-
-void Scheduler::discardUncachedKvEventPages(std::span<const CacheKey> keys) {
-    for (const CacheKey& key : keys) {
-        if (coordinator_.DeviceBoundaryResidency(key) == CacheCoordinator::BoundaryResidency::kNone) {
-            kv_event_boundaries_.erase(key);
-        }
+        // The next drain drops the descriptor if the publication never lands.
+        markKvEventBoundaryForReconcile(key);
     }
 }
 
-void Scheduler::handleCacheMutation(const CacheKey& key, CacheCoordinator::CacheMutation mutation) {
-    const CacheKey boundary = eventKey(key);
+void Scheduler::markKvEventBoundaryForReconcile(const CacheKey& boundary) {
+    // Descriptors are erased only by DrainKvEvents, so every cache mutation of
+    // a registered boundary finds one here.
     const auto it = kv_event_boundaries_.find(boundary);
     FatalCheck(it != kv_event_boundaries_.end(), "cache mutation on a KV event boundary with no token descriptor");
-    KvEventBoundary& event_boundary = it->second;
-    const CacheCoordinator::BoundaryResidency residency = coordinator_.DeviceBoundaryResidency(boundary);
-    if (mutation == CacheCoordinator::CacheMutation::kStored) {
-        if (!event_boundary.published && residency == CacheCoordinator::BoundaryResidency::kComplete) {
-            kv_events_.emplace_back(event_boundary.stored);
-            event_boundary.published = true;
-        }
-        return;
-    }
-    if (event_boundary.published) {
-        kv_events_.emplace_back(KvBlockRemovedEvent{.block_hashes = event_boundary.stored.block_hashes});
-        event_boundary.published = false;
-    }
-    if (residency == CacheCoordinator::BoundaryResidency::kNone) {
-        kv_event_boundaries_.erase(it);
+    if (!it->second.needs_reconcile) {
+        it->second.needs_reconcile = true;
+        kv_event_boundaries_to_reconcile_.push_back(boundary);
     }
 }
 

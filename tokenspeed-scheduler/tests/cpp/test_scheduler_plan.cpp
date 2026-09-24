@@ -20,6 +20,7 @@
 
 #include "integration_test_helper.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -311,6 +312,102 @@ TEST_F(SubpageKvCacheEventTestSuite, PublishesRemovalWhenAnyChildBlockIsEvicted)
         EXPECT_EQ(remaining_hashes.erase(removed_hashes[0]), 1u);
     }
     EXPECT_TRUE(remaining_hashes.empty());
+}
+
+class PrefillRoleKvCacheEventTestSuite : public SchedulerKvCacheEventTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerKvCacheEventTestSuite::MakeConfig();
+        cfg.role = Role::kP;
+        cfg.max_scheduled_tokens = 9;
+        cfg.device_allocator.total_pages = 8;
+        cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
+        cfg.cache_groups.front().transfer_policy = CacheTransferPolicy::FullSuffix;
+        return cfg;
+    }
+
+    void SendBootstrapped(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(pd::BootstrappedEvent{request_id});
+        scheduler_->Advance(std::move(event));
+    }
+
+    void SendPdSucceeded(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(pd::SucceededEvent{request_id});
+        scheduler_->Advance(std::move(event));
+    }
+};
+
+// A P-role admission publishes the pages the request completed so far, and the
+// same Admit may evict to fit the next chunk. When the victim is another
+// request's cached copy of a page this request recomputed, the boundary is
+// removed and stored again within one Admit: the net state is unchanged, and
+// the boundary's descriptor must survive for its later removal.
+TEST_F(PrefillRoleKvCacheEventTestSuite, AdmissionThatEvictsAndRepublishesABoundaryKeepsItPublished) {
+    RequestSpec seed = MakeRequestSpec("seed", 3);
+    seed.tokens.resize(5);
+    // dup shares seed's first two pages, then diverges.
+    RequestSpec dup = MakeRequestSpec("dup", 5);
+    std::copy_n(seed.tokens.begin(), 4, dup.tokens.begin());
+    for (std::size_t i = 4; i < dup.tokens.size(); ++i) {
+        dup.tokens[i] = 500 + static_cast<std::int32_t>(i);
+    }
+    Submit({seed, dup});
+    SendBootstrapped("seed");
+    SendBootstrapped("dup");
+
+    // Neither prompt is cached yet: both compute the shared pages.
+    const ExecutionPlan first_round = PlanOnce();
+    const ForwardBatch* first = FindForwardBatch(first_round);
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(first->request_ids, (std::vector<std::string>{"seed", "dup"}));
+    EXPECT_EQ(first->input_lengths, (std::vector<std::int32_t>{5, 4}));
+
+    // seed's remote decode publishes the shared pages; dup's next chunk does
+    // not fit while seed still holds its pages for the PD transfer.
+    SendForwardDone("seed", {42});
+    const ExecutionPlan second_round = PlanOnce();
+    ASSERT_TRUE(second_round.remote_decode.has_value());
+    const ForwardBatch* second = FindForwardBatch(second_round);
+    ASSERT_NE(second, nullptr);
+    EXPECT_TRUE(second->request_ids.empty());
+    std::vector<std::uint64_t> shared_hashes;
+    for (const KvCacheEvent& event : scheduler_->DrainKvEvents()) {
+        ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(event));
+        shared_hashes.push_back(std::get<KvBlockStoredEvent>(event).block_hashes.front());
+    }
+    ASSERT_EQ(shared_hashes.size(), 2u);
+
+    // The PD ACK leaves seed's copies cached and evictable. dup's last chunk
+    // (positions 4..9) plus its one-token decode reserve spans pages 2..5,
+    // more than are free, so its admission evicts seed's copy of a shared
+    // page, then publishes its own.
+    SendPdSucceeded("seed");
+    const std::int32_t pages_needed = 4;
+    ASSERT_LT(scheduler_->CacheGroupAvailablePages("full_attention"), pages_needed);
+    const ExecutionPlan third_round = PlanOnce();
+    const ForwardBatch* third = FindForwardBatch(third_round);
+    ASSERT_NE(third, nullptr);
+    EXPECT_EQ(third->request_ids, std::vector<std::string>{"dup"});
+    EXPECT_EQ(third->extend_prefix_lens, std::vector<std::int32_t>{4});
+    EXPECT_EQ(third->input_lengths, std::vector<std::int32_t>{6});
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+
+    // Both shared pages are still published: flushing the cache removes them.
+    SendForwardDone("dup", {42});
+    ASSERT_TRUE(PlanOnce().remote_decode.has_value());
+    SendPdSucceeded("dup");
+    scheduler_->DrainKvEvents();  // dup's own later pages
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+    std::unordered_set<std::uint64_t> removed;
+    for (const KvCacheEvent& event : scheduler_->DrainKvEvents()) {
+        ASSERT_TRUE(std::holds_alternative<KvBlockRemovedEvent>(event));
+        removed.insert(std::get<KvBlockRemovedEvent>(event).block_hashes.front());
+    }
+    for (const std::uint64_t hash : shared_hashes) {
+        EXPECT_TRUE(removed.contains(hash));
+    }
 }
 
 TEST_F(SchedulerTestSuite, SubmitRequestsRejectsEmptyTokens) {
