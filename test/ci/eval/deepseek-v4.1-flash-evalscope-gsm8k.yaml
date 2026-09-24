@@ -16,6 +16,7 @@ server:
   command: >-
     ts serve
     --model deepseek-ai/DeepSeek-V4.1-Flash
+    --speculative-algorithm DSPARK
     --tensor-parallel-size 4
     --enable-expert-parallel
     --moe-backend mega_moe
