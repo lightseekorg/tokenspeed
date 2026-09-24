@@ -32,5 +32,21 @@ ut:
       assert [int(c["tests"]) for c in counts[:2]] == [2, 4]
       and int(counts[2]["tests"]) > 0
       and all(int(c["skipped"]) == 0 for c in counts)'
+    - python3 -m pytest tokenspeed-kernel/test/test_numerics.py -v --junitxml=/tmp/kernel-numerics.xml
+    - python3 -m pytest tokenspeed-kernel/test/nvidia/thirdparty/test_trtllm_comm.py -v --junitxml=/tmp/kernel-trtllm-comm.xml
+    - python3 -m pytest tokenspeed-kernel/test/nvidia/thirdparty/test_cuda.py -v --junitxml=/tmp/kernel-cuda.xml
+    - >-
+      python3 -m pytest tokenspeed-kernel/test/ -v
+      --ignore=tokenspeed-kernel/test/amd
+      --ignore=tokenspeed-kernel/test/test_numerics.py
+      --ignore=tokenspeed-kernel/test/nvidia/thirdparty/test_trtllm_comm.py
+      --ignore=tokenspeed-kernel/test/nvidia/thirdparty/test_cuda.py
+      --junitxml=/tmp/kernel-rest.xml
+    - >-
+      python3 -c 'import xml.etree.ElementTree as ET;
+      counts = [ET.parse(path).getroot().find("testsuite").attrib
+      for path in ("/tmp/kernel-numerics.xml", "/tmp/kernel-trtllm-comm.xml",
+      "/tmp/kernel-cuda.xml", "/tmp/kernel-rest.xml")];
+      assert sum(int(c["tests"]) - int(c["skipped"]) for c in counts) > 0'
 report:
   github_step_summary: true
