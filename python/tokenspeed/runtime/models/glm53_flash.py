@@ -1224,6 +1224,9 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
             backend=ctx.attn_backend,
             layer_id=self.attn_mqa.layer_id,
             num_prefill_tokens=num_prefill_tokens,
+            tp_group=self.mapping.attn.tp_group,
+            tp_rank=self.mapping.attn.tp_rank,
+            tp_size=self.mapping.attn.tp_size,
         )
         if selected is None:
             return None
