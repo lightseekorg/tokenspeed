@@ -23,6 +23,7 @@
 Normal: pytest test/nvidia/ops/test_ple_prototypes.py -s
 Minimal dependency setup: python test_ple_prototypes.py -s
 The latter loads the real PLE facade without initializing unrelated ops.
+PDL-on cases require NVIDIA SM90+; PDL-off cases also run on AMD GPUs.
 """
 
 import pathlib
@@ -51,6 +52,21 @@ from tokenspeed_kernel.ops.ple import (
     prepare_ngram_reciprocals,
 )
 from tokenspeed_kernel.ops.ple.triton import _exact_remainder
+from tokenspeed_kernel.platform import current_platform
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="PLE kernel tests require a GPU"
+)
+
+
+@pytest.fixture(params=[False, True])
+def pdl(request, monkeypatch):
+    enabled = request.param
+    # Check capability before overriding the production platform guard.
+    if enabled and not current_platform().is_hopper_plus:
+        pytest.skip("PDL requires NVIDIA SM90+")
+    monkeypatch.setattr("tokenspeed_kernel.ops.ple.pdl_enabled", lambda: enabled)
+    return enabled
 
 
 def _measure(fn):
@@ -111,9 +127,7 @@ def _gate_reference(inputs, d):
 
 @pytest.mark.parametrize("tokens,d", [(1, 256), (1, 2560), (4, 2560), (16, 2560)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("pdl", [False, True])
-def test_gate(tokens, d, dtype, pdl, monkeypatch):
-    monkeypatch.setattr("tokenspeed_kernel.ops.ple.pdl_enabled", lambda: pdl)
+def test_gate(tokens, d, dtype, pdl):
     inputs = _gate_inputs(tokens, d, dtype)
     opts = dict(hc_count=4, hidden_size=d, eps=1e-6)
     expected = _gate_reference(inputs, d)
@@ -195,9 +209,7 @@ def _ngram_case(lengths, hpn):
 
 @pytest.mark.parametrize("lengths", [[1], [4], [0, 4, 2], [0, 0]])
 @pytest.mark.parametrize("hpn", [3, 8])
-@pytest.mark.parametrize("pdl", [False, True])
-def test_ngram(lengths, hpn, pdl, monkeypatch):
-    monkeypatch.setattr("tokenspeed_kernel.ops.ple.pdl_enabled", lambda: pdl)
+def test_ngram(lengths, hpn, pdl):
     args, opts, reciprocal = _ngram_case(lengths, hpn)
     baseline = ple_ngram_ids(*args, **opts, mod_reciprocals=None, need_tail=True)
     actual = ple_ngram_ids(*args, **opts, mod_reciprocals=reciprocal, need_tail=True)
@@ -272,9 +284,7 @@ def _conv_case(lengths, *, windows):
 @pytest.mark.parametrize(
     "write_final,windows", [(True, False), (True, True), (False, True)]
 )
-@pytest.mark.parametrize("pdl", [False, True])
-def test_conv_runtime_bounds(lengths, write_final, windows, pdl, monkeypatch):
-    monkeypatch.setattr("tokenspeed_kernel.ops.ple.pdl_enabled", lambda: pdl)
+def test_conv_runtime_bounds(lengths, write_final, windows, pdl):
     args, opts = _conv_case(lengths, windows=windows)
     values, initial, weight = args[:3]
     expected = torch.empty_like(values)
@@ -318,11 +328,9 @@ def test_conv_runtime_bounds(lengths, write_final, windows, pdl, monkeypatch):
             torch.testing.assert_close(scratch, expected_windows, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("pdl", [False, True])
 def test_conv_reuses_specialization_across_shapes(pdl, monkeypatch):
     import tokenspeed_kernel.ops.ple as ple
 
-    monkeypatch.setattr(ple, "pdl_enabled", lambda: pdl)
     kernel = ple._ple_conv_state_kernel
     compiled = []
 
@@ -345,9 +353,7 @@ def test_conv_reuses_specialization_across_shapes(pdl, monkeypatch):
 
 
 @pytest.mark.parametrize("tokens", [1, 4, 16])
-@pytest.mark.parametrize("pdl", [False, True])
-def test_performance(tokens, pdl, monkeypatch):
-    monkeypatch.setattr("tokenspeed_kernel.ops.ple.pdl_enabled", lambda: pdl)
+def test_performance(tokens, pdl):
     args, opts, reciprocal = _ngram_case([tokens], 8)
     # Use embedding-sized moduli for timing, not the adversarial correctness mix.
     sizes = [1_000_003 + 2 * i for i in range(16)]
