@@ -38,20 +38,27 @@ echo "GFX_ARCH=${GFX_ARCH}"
 echo "WORKSPACE=${WORKSPACE}"
 echo "=========================================="
 
-echo "=== Step 1: apt deps ==="
-sudo apt-get install -y openmpi-bin libopenmpi-dev libssl-dev pkg-config
+# Keep rebuilding the checkout below; only the matching image's toolchain and
+# system dependencies can be reused. Other AMD runners retain their setup.
+if [ "${GFX_ARCH}" = gfx1250 ] \
+    && bash "${WORKSPACE}/test/ci_system/setup_mi450_sim.sh" --check; then
+    echo "=== Reusing preinstalled MI450 system dependencies and PyTorch ==="
+else
+    echo "=== Step 1: apt deps ==="
+    sudo apt-get install -y openmpi-bin libopenmpi-dev libssl-dev pkg-config
 
-echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
-pip install --upgrade pip "setuptools<82" wheel
+    echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
+    pip install --upgrade pip "setuptools<82" wheel
 
-echo "=== Step 3: Install PyTorch for ROCm ==="
-torch_packages=("torch==${TORCH_VERSION}" "torchvision==${TORCHVISION_VERSION}")
-if [ -n "${TORCH_DEVICE_PACKAGE}" ]; then
-    torch_packages+=("${TORCH_DEVICE_PACKAGE}")
+    echo "=== Step 3: Install PyTorch for ROCm ==="
+    torch_packages=("torch==${TORCH_VERSION}" "torchvision==${TORCHVISION_VERSION}")
+    if [ -n "${TORCH_DEVICE_PACKAGE}" ]; then
+        torch_packages+=("${TORCH_DEVICE_PACKAGE}")
+    fi
+    pip_install_with_retry pip3 install --upgrade "${torch_packages[@]}" \
+        --index-url "${TORCH_INDEX_URL}"
+    python3 -c 'import torch, torchvision; assert torch.__version__.startswith("2.14.0"), torch.__version__; assert torchvision.__version__.startswith("0.29.0"), torchvision.__version__'
 fi
-pip_install_with_retry pip3 install --upgrade "${torch_packages[@]}" \
-    --index-url "${TORCH_INDEX_URL}"
-python3 -c 'import torch, torchvision; assert torch.__version__.startswith("2.14.0"), torch.__version__; assert torchvision.__version__.startswith("0.29.0"), torchvision.__version__'
 
 echo "=== Step 4: Install tokenspeed-kernel packages ==="
 

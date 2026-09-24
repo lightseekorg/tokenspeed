@@ -192,6 +192,40 @@ unversioned `libamdhip64.so` linker name. The gfx1250 PyTorch wheel and
 TokenSpeed use separate Triton distributions in the same process, and this
 path is accepted by both while still resolving to the same TheRock runtime.
 
+The CPU-only MI450 lane can use a preinstalled toolchain. Set
+`TOKENSPEED_MI450_SIM_ROOT` in the runner image to the simulator tree and place
+`preinstalled.json` at that root:
+
+```json
+{
+  "schema_version": 1,
+  "rocm_systems_ref": "9083cc2a6a3e75de6a74de6282f9d73876189dea",
+  "rocm_sdk_version": "10.1.0a20260822",
+  "uv_version": "0.9.26"
+}
+```
+
+The tree retains `rocm-systems/.git`, the patched
+`rocm-systems/emulation/rocjitsu/configs/gfx1250_mi455x.json` (`max_ticks=0`),
+`rocjitsu-build/tools/rocjitsu/rocjitsu`, and `rocjitsu-build/librocjitsu.so`.
+The image must also install the setup scripts' apt dependencies, initialized
+ROCm SDK, matching Torch/torchvision/gfx1250 device wheels, uv, PyYAML, and
+pytest plugins. `setup_mi450_sim.sh --check` verifies the manifest, installed
+versions, source revision, tools, config, and runtime files without downloads.
+The task's Torch pins must be present in the check's environment.
+
+Only a matching image skips the GitHub simulator cache and apt/toolchain setup
+(including setup in the separate execution step). The checked-out kernel,
+AMD package, scheduler, and editable runtime are still installed for every
+job; preinstalling these must not replace testing the PR's own code. Third-party
+requirements continue to be resolved by the normal installers.
+
+Old or incompatible images fall back to installation under `runner.temp`,
+without overwriting the image's simulator. Fallback cache keys include the task
+and installer contents; SDK downloads explicitly use the runner's uv cache
+even under sudo. Cached simulator binaries are reused only when their
+`.toolchain-version` contains the requested `<rocm-systems-ref>:<sdk-version>`.
+
 To enable `push` and `workflow_dispatch` runs of the three PR test workflows
 outside the official repository, set the `TOKENSPEED_CI_REPOSITORY` repository
 variable at the same settings path to the configured repository's exact

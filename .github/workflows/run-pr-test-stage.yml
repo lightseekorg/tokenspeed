@@ -91,17 +91,6 @@ jobs:
             echo "MIOPEN_CUSTOM_CACHE_DIR=$work_dir/.miopen-kernels" >> "$GITHUB_ENV"
           fi
 
-      - name: Restore MI450 simulator cache
-        if: matrix.runner == 'amd-mi45x-cpu-test'
-        id: mi450-simulator-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            ~/.cache/pip
-            ~/.cache/uv
-            ${{ runner.temp }}/tokenspeed-mi450-sim
-          key: mi450-sim-${{ runner.os }}-rocjitsu-9083cc2a-rocm-20260822-v1
-
       - name: Install pipeline dependency
         # pypi.org occasionally returns "Content-Type: Unknown" for the simple
         # index, which strict pip>=22 refuses to parse. Retry a few times.
@@ -112,6 +101,44 @@ jobs:
             sleep 10
           done
           exit 1
+
+      - name: Check preinstalled MI450 simulator
+        if: matrix.runner == 'amd-mi45x-cpu-test'
+        id: mi450-environment
+        working-directory: ${{ env.WORK_DIR }}
+        env:
+          CI_TASK_CONFIG: ${{ matrix.config }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import subprocess
+          import yaml
+
+          with open(os.environ["CI_TASK_CONFIG"]) as f:
+              task = yaml.safe_load(f)
+          env = os.environ | {k: str(v) for k, v in task.get("env", {}).items()}
+          ready = subprocess.run(
+              ["bash", "test/ci_system/setup_mi450_sim.sh", "--check"], env=env
+          ).returncode == 0
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"preinstalled={str(ready).lower()}\n")
+          if not ready:
+              # Do not rebuild or restore caches over an incompatible image's
+              # simulator. Keep the fallback installation local to this job.
+              with open(os.environ["GITHUB_ENV"], "a") as f:
+                  f.write(f"TOKENSPEED_MI450_SIM_ROOT={os.environ['RUNNER_TEMP']}/tokenspeed-mi450-sim\n")
+          PY
+
+      - name: Restore MI450 simulator cache
+        if: matrix.runner == 'amd-mi45x-cpu-test' && steps.mi450-environment.outputs.preinstalled != 'true'
+        id: mi450-simulator-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/uv
+            ${{ runner.temp }}/tokenspeed-mi450-sim
+          key: mi450-sim-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/test/ci_system/setup_mi450_sim.sh', '**/test/ci_system/install_deps_rocm.sh', '**/test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml') }}-v2
 
       - name: Install CI task
         run: |
@@ -127,7 +154,7 @@ jobs:
             --result-json .ci-artifacts/result.json
 
       - name: Save MI450 simulator cache
-        if: matrix.runner == 'amd-mi45x-cpu-test' && steps.mi450-simulator-cache.outputs.cache-hit != 'true'
+        if: matrix.runner == 'amd-mi45x-cpu-test' && steps.mi450-environment.outputs.preinstalled != 'true' && steps.mi450-simulator-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: |

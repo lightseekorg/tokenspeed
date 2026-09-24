@@ -154,6 +154,42 @@ def test_cpu_only_amd_runner_skips_the_gpu_reclaim(capsys, tmp_path):
     assert "cleanup_amd_gpu_state.sh" not in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("reuse_state", [False, True])
+def test_preinstalled_simulator_skips_apt(monkeypatch, tmp_path, reuse_state):
+    monkeypatch.setattr(pipeline, "kill_stale_processes", Mock())
+    run = Mock(return_value=SimpleNamespace(returncode=0))
+    monkeypatch.setattr(pipeline.subprocess, "run", run)
+    shell = Mock()
+    monkeypatch.setattr(pipeline, "shell_run", shell)
+    env = {"TOKENSPEED_MI450_SIM_ROOT": "/opt/sim"}
+
+    actual, manager = setup_runner(
+        "amd-mi45x-cpu-test", env, tmp_path, False, reuse_state=reuse_state
+    )
+
+    assert actual == env
+    assert manager is None
+    assert run.call_args.args[0] == [
+        "bash",
+        "test/ci_system/setup_mi450_sim.sh",
+        "--check",
+    ]
+    shell.assert_not_called()
+
+
+def test_incompatible_simulator_keeps_apt_setup(monkeypatch, tmp_path):
+    monkeypatch.setattr(pipeline, "kill_stale_processes", Mock())
+    monkeypatch.setattr(
+        pipeline.subprocess, "run", Mock(return_value=SimpleNamespace(returncode=1))
+    )
+    shell = Mock()
+    monkeypatch.setattr(pipeline, "shell_run", shell)
+    setup_runner(
+        "amd-mi45x-cpu-test", {"TOKENSPEED_MI450_SIM_ROOT": "/opt/sim"}, tmp_path, False
+    )
+    assert any("apt-get" in call.args[0] for call in shell.call_args_list)
+
+
 def test_amd_gpu_runner_reclaims_stale_vram(capsys, tmp_path):
     pipeline.setup_runner(
         "amd-mi35x-1gpu-test",

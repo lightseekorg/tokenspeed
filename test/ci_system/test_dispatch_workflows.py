@@ -975,6 +975,23 @@ def test_nvidia_arm_model_tests_allow_runner_wait_time():
     assert workflow["jobs"]["model-test"]["with"]["timeout_minutes"] >= 120
 
 
+def test_mi450_cache_is_only_used_without_a_matching_image():
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/run-pr-test-stage.yml")
+    steps = workflow["jobs"]["test"]["steps"]
+    by_name = {step.get("name"): step for step in steps}
+    probe = by_name["Check preinstalled MI450 simulator"]
+    restore = by_name["Restore MI450 simulator cache"]
+    save = by_name["Save MI450 simulator cache"]
+    assert steps.index(by_name["Install pipeline dependency"]) < steps.index(probe)
+    assert steps.index(probe) < steps.index(restore)
+    for step in (restore, save):
+        assert "steps.mi450-environment.outputs.preinstalled != 'true'" in step["if"]
+    assert "hashFiles(" in restore["with"]["key"]
+    assert '"--check"' in probe["run"]
+    assert "TOKENSPEED_MI450_SIM_ROOT=" in probe["run"]
+    assert "RUNNER_TEMP" in probe["run"]
+
+
 def test_mi450_sim_uses_direct_runner_and_bounded_timeout():
     workflow = load_yaml(REPO_ROOT / ".github/workflows/run-pr-test-stage.yml")
     job = workflow["jobs"]["test"]

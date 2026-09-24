@@ -792,6 +792,21 @@ def setup_runner(
         return local_env, pgm
 
     kill_stale_processes(local_env, cwd, dry_run)
+    if (
+        is_cpu_only_runner(runner)
+        and local_env.get("TOKENSPEED_MI450_SIM_ROOT")
+        and not dry_run
+    ):
+        # This read-only check also runs on --reuse-runner-state. An image flag
+        # alone is insufficient: a PR may request a different SDK or simulator.
+        ready = subprocess.run(
+            ["bash", "test/ci_system/setup_mi450_sim.sh", "--check"],
+            cwd=cwd,
+            env=local_env,
+            check=False,
+        )
+        if ready.returncode == 0:
+            return local_env, pgm
     if should_run_nvidia_gpu_cleanup(runner):
         shell_run(
             "bash test/ci_system/cleanup_nvidia_gpu_state.sh",

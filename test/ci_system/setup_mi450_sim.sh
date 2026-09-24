@@ -8,6 +8,23 @@ SIM_ROOT=${TOKENSPEED_MI450_SIM_ROOT:-${RUNNER_TEMP:-/tmp}/tokenspeed-mi450-sim}
 SOURCE_ROOT="${SIM_ROOT}/rocm-systems"
 ROCJITSU_SOURCE_DIR="${SOURCE_ROOT}/emulation/rocjitsu"
 ROCJITSU_BUILD_DIR="${SIM_ROOT}/rocjitsu-build"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+check_preinstalled() {
+    python3 "${SCRIPT_DIR}/mi450_sim_environment.py" \
+        "${SIM_ROOT}" "${ROCM_SYSTEMS_REF}" "${ROCM_SDK_VERSION}" "${UV_VERSION}"
+}
+
+if [ "${1:-}" = --check ] && [ "$#" -eq 1 ]; then
+    check_preinstalled
+    exit "$?"
+elif [ "$#" -ne 0 ]; then
+    echo "usage: $0 [--check]" >&2
+    exit 2
+fi
+if check_preinstalled; then
+    exit 0
+fi
 
 sudo apt-get install -y --no-install-recommends \
     build-essential \
@@ -21,10 +38,15 @@ sudo apt-get install -y --no-install-recommends \
 
 python3 -m pip install --disable-pip-version-check "uv==${UV_VERSION}"
 pip3 install pytest-timeout pytest-xdist pytest-reportlog
-sudo "$(command -v uv)" pip install --system --break-system-packages --prerelease allow \
+# Use the runner's cache even under sudo, so actions/cache includes SDK wheels.
+UV_CACHE_DIR=${UV_CACHE_DIR:-${HOME}/.cache/uv}
+mkdir -p "${UV_CACHE_DIR}"
+sudo "$(command -v uv)" pip install --cache-dir "${UV_CACHE_DIR}" \
+    --system --break-system-packages --prerelease allow \
     --index-url https://rocm.nightlies.amd.com/whl-multi-arch/ \
     "rocm[devel,libraries]==${ROCM_SDK_VERSION}" \
     "rocm-sdk-device-gfx1250==${ROCM_SDK_VERSION}"
+sudo chown -R "$(id -u):$(id -g)" "${UV_CACHE_DIR}"
 sudo "$(command -v rocm-sdk)" init
 
 mkdir -p "${SIM_ROOT}"
@@ -52,6 +74,9 @@ if ! git -C "${SOURCE_ROOT}" cat-file -e "${ROCM_SYSTEMS_REF}^{commit}"; then
         sleep 10
     done
 fi
+# Discard only our generated config patch before switching revisions.
+git -C "${SOURCE_ROOT}" restore --worktree -- \
+    emulation/rocjitsu/configs/gfx1250_mi455x.json 2>/dev/null || true
 git -C "${SOURCE_ROOT}" checkout --detach "${ROCM_SYSTEMS_REF}"
 
 # HIP initialization needs the KMD simulator to remain alive for the full
@@ -68,10 +93,15 @@ path.write_text(json.dumps(config, indent=2) + "\n")
 PY
 
 rocm_root="$(rocm-sdk path --root)"
+toolchain_version="${ROCM_SYSTEMS_REF}:${ROCM_SDK_VERSION}"
 if [ -x "${ROCJITSU_BUILD_DIR}/tools/rocjitsu/rocjitsu" ] \
-    && [ -f "${ROCJITSU_BUILD_DIR}/librocjitsu.so" ]; then
+    && [ -f "${ROCJITSU_BUILD_DIR}/librocjitsu.so" ] \
+    && [ -f "${ROCJITSU_BUILD_DIR}/.toolchain-version" ] \
+    && [ "$(<"${ROCJITSU_BUILD_DIR}/.toolchain-version")" = "${toolchain_version}" ]; then
     echo "Reusing cached rocJITsu launcher and runtime"
 else
+    # Never reuse binaries or CMake paths from a different SDK/source revision.
+    rm -rf "${ROCJITSU_BUILD_DIR}"
     ROCM_HOME="${rocm_root}" \
     ROCM_PATH="${rocm_root}" \
     LD_LIBRARY_PATH="${rocm_root}/lib:${LD_LIBRARY_PATH:-}" \
@@ -84,6 +114,7 @@ else
     cmake --build "${ROCJITSU_BUILD_DIR}" \
         --target rocjitsu_bin rocjitsu_shared \
         --parallel 4
+    printf '%s\n' "${toolchain_version}" > "${ROCJITSU_BUILD_DIR}/.toolchain-version"
 fi
 
 test -x "${ROCJITSU_BUILD_DIR}/tools/rocjitsu/rocjitsu"
