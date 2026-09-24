@@ -1602,6 +1602,33 @@ def test_package_prefill_block_m_selection_gfx950(
     assert _select_package_prefill_block_m(num_tokens, 16, 16) == expected
 
 
+@pytest.mark.parametrize(
+    ("a_format", "b_gdot128", "expected"),
+    [
+        ("e2m1", True, 8),
+        ("e2m1", False, 1),
+        ("e4m3", True, 1),
+        ("e4m3", False, 1),
+    ],
+)
+def test_stage1_group_size_selection_gfx950(
+    a_format: str,
+    b_gdot128: bool,
+    expected: int,
+) -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage1 import (
+        _select_stage1_group_size_m,
+    )
+
+    assert (
+        _select_stage1_group_size_m(
+            a_format=a_format,
+            b_gdot128=b_gdot128,
+        )
+        == expected
+    )
+
+
 @pytest.mark.parametrize("block_m", [16, 32, 64])
 @pytest.mark.parametrize(
     "num_tokens,num_experts", [(65, 16), (72, 64), (160, 16), (2048, 16), (2049, 16)]
