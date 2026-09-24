@@ -129,7 +129,6 @@ def store_kv(
     traits={
         "has_norm": BOOLS,
         "kv_format": frozenset({"native", "fp8", "mxfp8"}),
-        "partial_write": BOOLS,
         "kv_convert": BOOLS,
         "mrope": BOOLS,
         "partial_rotary": BOOLS,

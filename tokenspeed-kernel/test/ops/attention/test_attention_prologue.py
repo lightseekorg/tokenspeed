@@ -306,12 +306,9 @@ def test_an_mla_override_past_its_token_head_limit_raises():
         )
 
 
-@pytest.mark.parametrize(
-    "override",
-    ["composite_mla_prologue", "fused_rope_gqa_prologue"],
-)
+@pytest.mark.parametrize("override", ["composite_mla_prologue", "triton_mla_prologue"])
 def test_an_override_must_serve_the_request(override):
-    """Another mode's kernel, or one below its token-head minimum, raises."""
+    """Another mode's kernel raises."""
     tokens = 4
     q, k, v = split(qkv(tokens, 4, 2, 64, seed=140), 4, 2, 64)
     k_cache, v_cache = gqa_cache(256, 2, 64, BF16)
@@ -717,7 +714,7 @@ def test_triton_reads_mrope_rows_past_int32_offsets():
 def test_fp16_rows_round_once_into_a_bf16_cache(solution, tokens):
     """An fp16 model keeps its activations; the fused kernels round the bf16 cache
     row once from fp32, the composite casts its fp16 result as the pool did.
-    65 tokens pass 512 token-heads, where only the conversion keeps fused_rope out."""
+    65 tokens: more than one Triton tile."""
     hq, hkv, dim = 8, 2, 64
     q, k, v = split(
         qkv(tokens, hq, hkv, dim, seed=170, dtype=torch.float16), hq, hkv, dim
@@ -2065,8 +2062,8 @@ def test_prologue_kernels_constrain_only_traits_the_entries_state(monkeypatch):
 
     stated = {}
 
-    def spy(mode, signature, traits, solution, override):
-        stated[mode] = set(traits)
+    def spy(mode, dtype, traits, solution, override):
+        stated[mode] = {key for key, _ in traits}
         raise LookupError
 
     monkeypatch.setattr(prologue, "_select", spy)

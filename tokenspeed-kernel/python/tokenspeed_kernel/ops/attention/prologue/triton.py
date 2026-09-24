@@ -50,7 +50,8 @@ _MLA_MAX_TOKEN_HEADS = 2048 * 16
 def _rope_tables(
     cos_sin_ptr,
     positions_ptr,
-    token,
+    tokens,
+    row_mask,
     cos_sin_stride,
     positions_stride,
     half_rotary: tl.constexpr,
@@ -61,10 +62,10 @@ def _rope_tables(
     S1: tl.constexpr,
     S2: tl.constexpr,
 ):
-    """This token's cos/sin per rotary pair; multimodal RoPE takes each pair's
+    """cos/sin per (token, rotary pair); multimodal RoPE takes each pair's
     position from the T, H or W row its section names."""
     half = tl.arange(0, HALF_BLOCK)
-    mask = half < half_rotary
+    mask = row_mask[:, None] & (half < half_rotary)[None, :]
     if MROPE_ROWS:
         if INTERLEAVED:
             row = tl.where((half % 3 == 1) & (half < 3 * S1), 1, 0)
@@ -72,25 +73,28 @@ def _rope_tables(
         else:
             row = tl.where(half < S0, 0, tl.where(half < S0 + S1, 1, 2))
         position = tl.load(
-            positions_ptr + row.to(tl.int64) * positions_stride + token,
+            positions_ptr
+            + row[None, :].to(tl.int64) * positions_stride
+            + tokens[:, None],
             mask=mask,
             other=0,
         )
     else:
-        position = tl.load(positions_ptr + token)
-    base = cos_sin_ptr + position.to(tl.int64) * cos_sin_stride + half
+        position = tl.load(positions_ptr + tokens, mask=row_mask, other=0)[:, None]
+    base = cos_sin_ptr + position.to(tl.int64) * cos_sin_stride + half[None, :]
     cos = tl.load(base, mask=mask, other=0.0)
     sin = tl.load(base + half_rotary, mask=mask, other=0.0)
     return cos, sin
 
 
 @triton.jit
-def _gqa_prologue_head(
+def _gqa_prologue_tile(
     src,
     weight_ptr,
     cos,
     sin,
     inv_rms,
+    row_mask,
     head_dim: tl.constexpr,
     half_rotary: tl.constexpr,
     weight_offset: tl.constexpr,
@@ -99,44 +103,47 @@ def _gqa_prologue_head(
     BLOCK: tl.constexpr,
     HALF_BLOCK: tl.constexpr,
 ):
-    """One head's fp32 row and its rotated pairs: (row, first half, second half)."""
+    """A block of one head's fp32 rows and their rotated pairs: (rows, first
+    half, second half)."""
     offs = tl.arange(0, BLOCK)
-    mask = offs < head_dim
-    row = tl.load(src + offs, mask=mask, other=0.0).to(tl.float32)
+    mask = row_mask[:, None] & (offs < head_dim)[None, :]
+    rows = tl.load(src[:, None] + offs[None, :], mask=mask, other=0.0).to(tl.float32)
     half = tl.arange(0, HALF_BLOCK)
     half_mask = half < half_rotary
+    pair_mask = row_mask[:, None] & half_mask[None, :]
     if IS_NEOX:
         i1 = half
         i2 = half + half_rotary
     else:
         i1 = 2 * half
         i2 = 2 * half + 1
-    x1 = tl.load(src + i1, mask=half_mask, other=0.0).to(tl.float32)
-    x2 = tl.load(src + i2, mask=half_mask, other=0.0).to(tl.float32)
+    x1 = tl.load(src[:, None] + i1[None, :], mask=pair_mask, other=0.0).to(tl.float32)
+    x2 = tl.load(src[:, None] + i2[None, :], mask=pair_mask, other=0.0).to(tl.float32)
     if HAS_NORM:
-        w = tl.load(weight_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(weight_ptr + offs, mask=offs < head_dim, other=0.0).to(tl.float32)
         w1 = tl.load(weight_ptr + i1, mask=half_mask, other=0.0).to(tl.float32)
         w2 = tl.load(weight_ptr + i2, mask=half_mask, other=0.0).to(tl.float32)
         # Adding +0.0 would turn a -0.0 weight into +0.0.
         if weight_offset != 0.0:
             w, w1, w2 = w + weight_offset, w1 + weight_offset, w2 + weight_offset
-        row = row * inv_rms * w
-        x1 = x1 * inv_rms * w1
-        x2 = x2 * inv_rms * w2
+        rows = rows * inv_rms[:, None] * w[None, :]
+        x1 = x1 * inv_rms[:, None] * w1[None, :]
+        x2 = x2 * inv_rms[:, None] * w2[None, :]
     # The association the CUDA embedding.rope kernel compiles to.
     o1 = tl.fma(x1, cos, -x2 * sin)
     o2 = tl.fma(x2, cos, x1 * sin)
-    return row, o1, o2, i1, i2, half_mask
+    return rows, o1, o2, i1, i2, half_mask
 
 
 @triton.jit
-def _gqa_store_head(
+def _gqa_store_tile(
     dst,
-    row,
+    rows,
     o1,
     o2,
     i1,
     i2,
+    row_mask,
     half_mask,
     head_dim: tl.constexpr,
     rotary_dim: tl.constexpr,
@@ -144,9 +151,14 @@ def _gqa_store_head(
 ):
     offs = tl.arange(0, BLOCK)
     dtype = dst.dtype.element_ty
-    tl.store(dst + offs, row.to(dtype), mask=(offs >= rotary_dim) & (offs < head_dim))
-    tl.store(dst + i1, o1.to(dtype), mask=half_mask)
-    tl.store(dst + i2, o2.to(dtype), mask=half_mask)
+    tl.store(
+        dst[:, None] + offs[None, :],
+        rows.to(dtype),
+        mask=row_mask[:, None] & ((offs >= rotary_dim) & (offs < head_dim))[None, :],
+    )
+    pair_mask = row_mask[:, None] & half_mask[None, :]
+    tl.store(dst[:, None] + i1[None, :], o1.to(dtype), mask=pair_mask)
+    tl.store(dst[:, None] + i2[None, :], o2.to(dtype), mask=pair_mask)
 
 
 @triton.jit
@@ -163,6 +175,7 @@ def _gqa_prologue_kernel(
     k_cache_ptr,
     v_cache_ptr,
     slots_ptr,
+    num_tokens,
     num_rows,
     q_stride_t,
     q_stride_h,
@@ -189,19 +202,23 @@ def _gqa_prologue_kernel(
     S1: tl.constexpr,
     S2: tl.constexpr,
     RETURN_K: tl.constexpr,
+    BLOCK_T: tl.constexpr,
     BLOCK: tl.constexpr,
     HALF_BLOCK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
-    token = tl.program_id(0).to(tl.int64)
+    tokens = tl.program_id(0).to(tl.int64) * BLOCK_T + tl.arange(0, BLOCK_T).to(
+        tl.int64
+    )
+    row_mask = tokens < num_tokens
     head = tl.program_id(1).to(tl.int64)
     is_k = head >= num_q_heads
     kv_head = head - num_q_heads
     if is_k:
-        src = k_ptr + token * k_stride_t + kv_head * head_dim
+        src = k_ptr + tokens * k_stride_t + kv_head * head_dim
         weight_ptr = k_weight_ptr
     else:
-        src = q_ptr + token * q_stride_t + head * q_stride_h
+        src = q_ptr + tokens * q_stride_t + head * q_stride_h
         weight_ptr = q_weight_ptr
 
     if ENABLE_PDL:
@@ -210,15 +227,17 @@ def _gqa_prologue_kernel(
     inv_rms = 0.0
     if HAS_NORM:
         offs = tl.arange(0, BLOCK)
-        x = tl.load(src + offs, mask=offs < head_dim, other=0.0).to(tl.float32)
-        inv_rms = tl.rsqrt(tl.sum(x * x, axis=0) / head_dim + eps)
+        mask = row_mask[:, None] & (offs < head_dim)[None, :]
+        x = tl.load(src[:, None] + offs[None, :], mask=mask, other=0.0).to(tl.float32)
+        inv_rms = tl.rsqrt(tl.sum(x * x, axis=1) / head_dim + eps)
     cos = 0.0
     sin = 0.0
     if half_rotary > 0:
         cos, sin = _rope_tables(
             cos_sin_ptr,
             positions_ptr,
-            token,
+            tokens,
+            row_mask,
             cos_sin_stride,
             positions_stride,
             half_rotary,
@@ -229,12 +248,13 @@ def _gqa_prologue_kernel(
             S1,
             S2,
         )
-    row, o1, o2, i1, i2, half_mask = _gqa_prologue_head(
+    rows, o1, o2, i1, i2, half_mask = _gqa_prologue_tile(
         src,
         weight_ptr,
         cos,
         sin,
         inv_rms,
+        row_mask,
         head_dim,
         half_rotary,
         weight_offset,
@@ -245,13 +265,14 @@ def _gqa_prologue_kernel(
     )
 
     if not is_k:
-        _gqa_store_head(
-            q_out_ptr + token * q_out_stride_t + head * head_dim,
-            row,
+        _gqa_store_tile(
+            q_out_ptr + tokens * q_out_stride_t + head * head_dim,
+            rows,
             o1,
             o2,
             i1,
             i2,
+            row_mask,
             half_mask,
             head_dim,
             2 * half_rotary,
@@ -259,45 +280,59 @@ def _gqa_prologue_kernel(
         )
     else:
         if RETURN_K:
-            _gqa_store_head(
-                k_out_ptr + token * k_out_stride_t + kv_head * head_dim,
-                row,
+            _gqa_store_tile(
+                k_out_ptr + tokens * k_out_stride_t + kv_head * head_dim,
+                rows,
                 o1,
                 o2,
                 i1,
                 i2,
+                row_mask,
                 half_mask,
                 head_dim,
                 2 * half_rotary,
                 BLOCK,
             )
-        if token < num_rows:
-            slot = tl.load(slots_ptr + token).to(tl.int64)
-            _gqa_store_head(
-                k_cache_ptr + slot * k_cache_stride_s + kv_head * k_cache_stride_h,
-                row,
-                o1,
-                o2,
-                i1,
-                i2,
-                half_mask,
-                head_dim,
-                2 * half_rotary,
-                BLOCK,
-            )
-            offs = tl.arange(0, BLOCK)
-            mask = offs < head_dim
-            value = tl.load(
-                v_ptr + token * v_stride_t + kv_head * head_dim + offs, mask=mask
-            )
-            dst = v_cache_ptr + slot * v_cache_stride_s + kv_head * v_cache_stride_h
-            tl.store(dst + offs, value.to(dst.dtype.element_ty), mask=mask)
+        write_mask = tokens < num_rows
+        slot = tl.load(slots_ptr + tokens, mask=write_mask, other=0).to(tl.int64)
+        _gqa_store_tile(
+            k_cache_ptr + slot * k_cache_stride_s + kv_head * k_cache_stride_h,
+            rows,
+            o1,
+            o2,
+            i1,
+            i2,
+            write_mask,
+            half_mask,
+            head_dim,
+            2 * half_rotary,
+            BLOCK,
+        )
+        offs = tl.arange(0, BLOCK)
+        mask = write_mask[:, None] & (offs < head_dim)[None, :]
+        value = tl.load(
+            v_ptr[:, None]
+            + (tokens * v_stride_t + kv_head * head_dim)[:, None]
+            + offs[None, :],
+            mask=mask,
+        )
+        dst = (
+            v_cache_ptr
+            + (slot * v_cache_stride_s + kv_head * v_cache_stride_h)[:, None]
+            + offs[None, :]
+        )
+        tl.store(dst, value.to(dst.dtype.element_ty), mask=mask)
 
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
 
-# Native and FP8 layers the fused CUDA write does not take get this one launch.
+def _block_tokens(num_tokens: int, block: int) -> int:
+    """Tokens per program: at least four; 512 elements at decode sizes, 2048 past 256 tokens."""
+    elements = 512 if num_tokens <= 64 else 1024 if num_tokens <= 256 else 2048
+    return max(4, elements // block)
+
+
 @register_kernel(
     "attention",
     "gqa_prologue",
@@ -309,7 +344,6 @@ def _gqa_prologue_kernel(
     traits={
         "has_norm": BOOLS,
         "kv_format": frozenset({"native", "fp8"}),
-        "partial_write": BOOLS,
         "kv_convert": BOOLS,
         "mrope": BOOLS,
         "partial_rotary": BOOLS,
@@ -347,7 +381,10 @@ def triton_gqa_prologue(
         mrope = None if rotary is None else rotary.mrope
         mrope_rows = positions.ndim == 2
         s0, s1, s2 = mrope.section if mrope_rows else (0, 0, 0)
-        _gqa_prologue_kernel[(num_tokens, num_q_heads + num_kv_heads)](
+        block_t = _block_tokens(num_tokens, triton.next_power_of_2(head_dim))
+        _gqa_prologue_kernel[
+            (triton.cdiv(num_tokens, block_t), num_q_heads + num_kv_heads)
+        ](
             q,
             k,
             v,
@@ -360,6 +397,7 @@ def triton_gqa_prologue(
             cache.k_cache,
             cache.v_cache,
             cache.slots,
+            num_tokens,
             cache.slots.numel(),
             q.stride(0),
             q.stride(1) if q.dim() == 3 else head_dim,
@@ -386,6 +424,7 @@ def triton_gqa_prologue(
             S1=s1,
             S2=s2,
             RETURN_K=return_kv,
+            BLOCK_T=block_t,
             BLOCK=triton.next_power_of_2(head_dim),
             HALF_BLOCK=max(triton.next_power_of_2(half_rotary), 1),
             ENABLE_PDL=enable_pdl,

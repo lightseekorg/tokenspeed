@@ -18,8 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The NVIDIA GQA prologue solutions round once, agree byte for byte, and
-dispatch follows the measured crossover."""
+"""The NVIDIA GQA prologue claims: the Triton kernel matches the CUDA RoPE path
+models ran before it byte for byte, the solutions agree, and dispatch is one
+Triton launch on every vendor except for MXFP8 caches."""
 
 from __future__ import annotations
 
@@ -36,11 +37,9 @@ import tokenspeed_kernel.ops.attention.prologue as prologue  # noqa: E402
 from attention_prologue_reference import (  # noqa: E402
     BF16,
     FP8,
-    assert_gqa_rounds_once,
     bytes_equal,
     cos_sin_cache,
     gqa_cache,
-    head_norm,
     latent_target,
     mla_inputs,
     mla_query,
@@ -58,7 +57,6 @@ from tokenspeed_kernel.ops.attention.prologue import (  # noqa: E402
     Rotary,
     gqa_prologue,
     mla_prologue,
-    qk_norm_rope,
 )
 from tokenspeed_kernel.ops.embedding import (  # noqa: E402
     FusedSetKVBufferArg,
@@ -69,7 +67,7 @@ from tokenspeed_kernel.platform import (  # noqa: E402
     PlatformInfo,
     current_platform,
 )
-from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel  # noqa: E402
+from tokenspeed_kernel.selection import select_kernel  # noqa: E402
 from tokenspeed_kernel.signature import (  # noqa: E402
     dense_tensor_format,
     format_signature,
@@ -77,23 +75,6 @@ from tokenspeed_kernel.signature import (  # noqa: E402
 
 FORMATS = [KVCacheFormat.NATIVE, KVCacheFormat.FP8]
 DTYPES = [torch.bfloat16, torch.float16]
-# fused_rope declines padded writes; every other trait value here is non-default.
-PADDED_FP8_GPTJ = {
-    "partial_write": True,
-    "kv_format": "fp8",
-    "return_kv": True,
-    "rope_style": "gptj",
-}
-
-
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
-@pytest.mark.parametrize("style", [RopeStyle.NEOX, RopeStyle.GPTJ])
-@pytest.mark.parametrize("fmt", FORMATS)
-@pytest.mark.parametrize("dtype", DTYPES)
-def test_fused_rope_rounds_once(head_dim, style, fmt, dtype):
-    assert_gqa_rounds_once(
-        "fused_rope", head_dim, head_dim, style, None, None, fmt, dtype
-    )
 
 
 def _rotary(rope: str, head_dim: int, tokens: int) -> Rotary | None:
@@ -117,24 +98,13 @@ def _rotary(rope: str, head_dim: int, tokens: int) -> Rotary | None:
 
 
 @pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
-@pytest.mark.parametrize(
-    "rope,fmt",
-    [
-        (rope, fmt)
-        for rope in ["neox", "gptj", "partial", "narrow", "nope", "mrope"]
-        for fmt in FORMATS
-        # FP8 bytes agree only among the solutions that round once: triton and fused_rope.
-        if fmt is KVCacheFormat.NATIVE or rope in ("neox", "gptj")
-    ],
-)
+@pytest.mark.parametrize("rope", ["neox", "gptj", "partial", "narrow", "nope", "mrope"])
 @pytest.mark.parametrize("return_kv", [True, False])
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_unnormed_solutions_agree_byte_for_byte(head_dim, rope, fmt, return_kv, dtype):
-    """Without a norm the composite rounds once too, but only on a native cache."""
+def test_unnormed_solutions_agree_byte_for_byte(head_dim, rope, return_kv, dtype):
+    """Without a norm the composite (the CUDA RoPE, then the store) rounds once
+    too on a native cache, so the two solutions agree to the byte."""
     hq, hkv, tokens, total = 8, 2, 65, 128
-    solutions = ["triton"]
-    solutions += ["fused_rope"] if rope in ("neox", "gptj") else []
-    solutions += ["composite"] if fmt is KVCacheFormat.NATIVE else []
     runs = [
         run_gqa(
             solution,
@@ -144,24 +114,24 @@ def test_unnormed_solutions_agree_byte_for_byte(head_dim, rope, fmt, return_kv, 
             head_dim,
             norm=None,
             rotary=_rotary(rope, head_dim, tokens),
-            fmt=fmt,
+            fmt=KVCacheFormat.NATIVE,
             return_kv=return_kv,
             slots=slots(tokens, total, seed=5),
             total=total,
         )
-        for solution in solutions
+        for solution in ("triton", "composite")
     ]
-    for other in runs[1:]:
-        for a, b in zip(runs[0], other):
-            assert bytes_equal(a, b)
+    for a, b in zip(*runs):
+        assert bytes_equal(a, b)
 
 
-@pytest.mark.parametrize("tokens", [65, 300])
+@pytest.mark.parametrize("tokens", [1, 65, 300])
 @pytest.mark.parametrize("style", [RopeStyle.NEOX, RopeStyle.GPTJ])
 @pytest.mark.parametrize("fmt", FORMATS)
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_fused_rope_is_the_decode_write_models_ran(tokens, style, fmt, dtype):
-    """Llama-style decode rotated and stored K/V in one embedding.rope launch."""
+def test_triton_is_the_decode_write_models_ran(tokens, style, fmt, dtype):
+    """Llama-style decode rotated and stored K/V in one CUDA embedding.rope
+    launch; the Triton kernel reproduces its bytes on native and FP8 caches."""
     hq, hkv, dim, total = 8, 2, 128, 512
     inputs = qkv(tokens, hq, hkv, dim, seed=6, dtype=dtype)
     positions = torch.arange(100, 100 + tokens, device="cuda")
@@ -190,7 +160,7 @@ def test_fused_rope_is_the_decode_write_models_ran(tokens, style, fmt, dtype):
     )
 
     got = run_gqa(
-        "fused_rope",
+        "triton",
         inputs,
         hq,
         hkv,
@@ -256,44 +226,14 @@ def test_mla_triton_matches_the_composite(
             assert bytes_equal(a, b)
 
 
-def _amd_platform() -> PlatformInfo:
-    """gfx950; its own arch keeps AMD rows out of the NVIDIA selection cache entries."""
+def _platform(vendor: str) -> PlatformInfo:
+    """Another vendor's platform; its own arch keeps its rows out of the NVIDIA
+    selection cache entries."""
+    if vendor == "nvidia":
+        return current_platform()
     return dataclasses.replace(
-        current_platform(), vendor="amd", arch_version=ArchVersion(9, 5)
+        current_platform(), vendor=vendor, arch_version=ArchVersion(9, 5)
     )
-
-
-def test_a_rope_only_call_past_the_crossover_takes_the_cuda_rope():
-    """``qk_norm_rope`` without a norm writes no rows, so fused_rope runs the
-    CUDA rope alone and matches the Triton kernel byte for byte."""
-    tokens, hq, hk, dim = 32, 32, 8, 128
-    inputs = qkv(tokens, hq, hk, dim, seed=61)
-    rotary = Rotary(
-        cos_sin_cache(dim),
-        torch.arange(tokens, device="cuda") + 7,
-        RopeStyle.NEOX,
-        None,
-    )
-    assert (
-        _selected(tokens, torch.bfloat16, current_platform())
-        == "fused_rope_gqa_prologue"
-    )
-    q, k, _ = split(inputs.clone(), hq, hk, dim)
-    got_q, got_k = qk_norm_rope(q, k, head_dim=dim, norm=None, rotary=rotary)
-    q, k, _ = split(inputs.clone(), hq, hk, dim)
-    no_rows = k.new_empty(0, hk, dim)
-    ref = gqa_prologue(
-        q,
-        k,
-        k,
-        norm=None,
-        rotary=rotary,
-        cache=HeadKVCache(no_rows, no_rows, None, k.new_empty(0, dtype=torch.int64)),
-        return_kv=True,
-        solution="triton",
-        override=None,
-    )
-    assert bytes_equal(got_q, ref.q) and bytes_equal(got_k, ref.k)
 
 
 def _selected(tokens: int, dtype: torch.dtype, platform: PlatformInfo, **change) -> str:
@@ -305,7 +245,6 @@ def _selected(tokens: int, dtype: torch.dtype, platform: PlatformInfo, **change)
         "kv_convert": False,
         "mrope": False,
         "partial_rotary": False,
-        "partial_write": False,
         "return_kv": False,
         "rope_style": "neox",
     }
@@ -322,95 +261,37 @@ def _selected(tokens: int, dtype: torch.dtype, platform: PlatformInfo, **change)
 @pytest.mark.parametrize(
     "tokens,change,expected",
     [
-        (16, {}, "triton_gqa_prologue"),
-        (16, {"token_heads": 513}, "fused_rope_gqa_prologue"),
-        (17, {}, "fused_rope_gqa_prologue"),
-        (
-            17,
-            {"kv_format": "fp8", "return_kv": True},
-            "fused_rope_gqa_prologue",
-        ),
+        (1, {}, "triton_gqa_prologue"),
+        (4096, {}, "triton_gqa_prologue"),
         (4096, {"has_norm": True}, "triton_gqa_prologue"),
-        (
-            4096,
-            {"has_norm": True, "head_dim": 96},
-            "triton_gqa_prologue",
-        ),
-        (16, {"head_dim": 96}, "triton_gqa_prologue"),
-        (4096, {"head_dim": 96}, "triton_gqa_prologue"),
-        (
-            4096,
-            {"partial_rotary": True},
-            "triton_gqa_prologue",
-        ),
+        (4096, {"has_norm": True, "head_dim": 96}, "triton_gqa_prologue"),
+        (4096, {"partial_rotary": True}, "triton_gqa_prologue"),
         (4096, {"mrope": True}, "triton_gqa_prologue"),
         (4096, {"rope_style": "none"}, "triton_gqa_prologue"),
         (4096, {"kv_convert": True}, "triton_gqa_prologue"),
-        (4096, PADDED_FP8_GPTJ, "triton_gqa_prologue"),
         (
             4096,
-            {"has_norm": True, "kv_format": "mxfp8"},
-            "composite_gqa_prologue",
+            {"kv_format": "fp8", "return_kv": True, "rope_style": "gptj"},
+            "triton_gqa_prologue",
         ),
         (4, {"kv_format": "mxfp8"}, "composite_gqa_prologue"),
-        (600, {"kv_format": "mxfp8"}, "composite_gqa_prologue"),
+        (4096, {"has_norm": True, "kv_format": "mxfp8"}, "composite_gqa_prologue"),
     ],
 )
+@pytest.mark.parametrize("vendor", ["nvidia", "amd"])
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_gqa_selection_follows_the_measured_crossover(tokens, change, expected, dtype):
-    """The Triton kernel takes every layer except where fused_rope serves past
-    512 token-heads."""
-    assert _selected(tokens, dtype, current_platform(), **change) == expected
-
-
-@pytest.mark.parametrize(
-    "tokens,change,expected",
-    [
-        (16, {}, "triton_gqa_prologue"),
-        (4096, {}, "triton_gqa_prologue"),
-        (4096, {"has_norm": True}, "triton_gqa_prologue"),
-        (4096, {"rope_style": "none"}, "triton_gqa_prologue"),
-        (4096, PADDED_FP8_GPTJ, "triton_gqa_prologue"),
-        (4096, {"kv_format": "mxfp8"}, "composite_gqa_prologue"),
-    ],
-)
-def test_amd_takes_one_triton_launch_at_every_size(tokens, change, expected):
-    """AMD has no fused CUDA write, so the Triton kernel serves every size."""
-    assert _selected(tokens, torch.bfloat16, _amd_platform(), **change) == expected
-
-
-@pytest.mark.parametrize(
-    "case", ["norm", "partial", "mrope", "nope", "partial_write", "head_dim"]
-)
-def test_fused_rope_declines_what_it_does_not_cover(case):
-    head_dim = 96 if case == "head_dim" else 128
-    rotary_dim = head_dim // 2 if case == "partial" else head_dim
-    hq, hkv, tokens = 4, 2, 130
-    positions = torch.arange(tokens, device="cuda")
-    mrope = None
-    if case == "mrope":
-        positions = positions.expand(3, -1).contiguous()
-        mrope = MRope((rotary_dim // 2 - 2, 1, 1), False)
-    rotary = Rotary(cos_sin_cache(rotary_dim), positions, RopeStyle.NEOX, mrope)
-    with pytest.raises(NoKernelFoundError, match="attention.gqa_prologue"):
-        run_gqa(
-            "fused_rope",
-            qkv(tokens, hq, hkv, head_dim, seed=12),
-            hq,
-            hkv,
-            head_dim,
-            norm=head_norm(head_dim, 0.0, seed=13) if case == "norm" else None,
-            rotary=None if case == "nope" else rotary,
-            fmt=KVCacheFormat.NATIVE,
-            return_kv=False,
-            slots=slots(tokens - (case == "partial_write"), 256, seed=14),
-            total=256,
-        )
+def test_gqa_dispatch_is_one_triton_launch_except_mxfp8(
+    tokens, change, expected, vendor, dtype
+):
+    """The token-tiled Triton kernel beats the CUDA RoPE path at every size, so
+    only MXFP8 caches (its store kernels) reach the composite."""
+    assert _selected(tokens, dtype, _platform(vendor), **change) == expected
 
 
 def test_cuda_rope_flushes_the_subnormals_the_triton_kernel_keeps():
-    """Besides NaN payloads, the two unnormed solutions differ only by what a flush
-    can move: less than 2^-125, or one ulp through a broken rounding tie."""
+    """Besides NaN payloads, the CUDA RoPE (the composite) and the Triton kernel
+    differ only by what a flush can move: less than 2^-125, or one ulp through a
+    broken rounding tie."""
     hq, hkv, dim, tokens = 8, 2, 128, 65
     inputs = qkv(tokens, hq, hkv, dim, seed=17)
     inputs[:, ::3] *= 1e-39
@@ -430,9 +311,9 @@ def test_cuda_rope_flushes_the_subnormals_the_triton_kernel_keeps():
         total=tokens,
     )
     triton = run_gqa("triton", inputs, hq, hkv, dim, **args)
-    fused = run_gqa("fused_rope", inputs, hq, hkv, dim, **args)
+    cuda = run_gqa("composite", inputs, hq, hkv, dim, **args)
     flushed = ties = 0
-    for a, b in zip(triton, fused):
+    for a, b in zip(triton, cuda):
         differ = a.view(torch.int16) != b.view(torch.int16)
         a, b = a[differ].float(), b[differ].float()
         exponent = torch.frexp(torch.maximum(a.abs(), b.abs()))[1]
@@ -444,10 +325,10 @@ def test_cuda_rope_flushes_the_subnormals_the_triton_kernel_keeps():
 
 
 def test_an_override_this_platform_cannot_run_raises(monkeypatch):
-    """fused_rope needs the CUDA embedding.rope, which AMD does not have."""
-    amd = _amd_platform()
-    monkeypatch.setattr(prologue, "current_platform", lambda: amd)
-    prologue._serves.cache_clear()
+    """The Triton kernel has no Ascend build; naming it there raises."""
+    ascend = _platform("ascend")
+    monkeypatch.setattr(prologue, "current_platform", lambda: ascend)
+    prologue._select.cache_clear()
     hq, hkv, dim, tokens = 4, 2, 128, 130
     q, k, v = split(qkv(tokens, hq, hkv, dim, seed=15), hq, hkv, dim)
     k_cache, v_cache = gqa_cache(256, hkv, dim, BF16)
@@ -471,8 +352,8 @@ def test_an_override_this_platform_cannot_run_raises(monkeypatch):
                     slots=slots(tokens, 256, seed=16),
                 ),
                 return_kv=False,
-                override="fused_rope_gqa_prologue",
+                override="triton_gqa_prologue",
                 solution=None,
             )
     finally:
-        prologue._serves.cache_clear()
+        prologue._select.cache_clear()

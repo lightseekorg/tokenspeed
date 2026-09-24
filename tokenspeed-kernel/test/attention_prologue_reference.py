@@ -256,7 +256,7 @@ def assert_gqa_rounds_once(
     dtype: torch.dtype,
 ) -> None:
     """Query, returned key and value, and both cache rows are the fp64 norm and
-    rotation rounded once; 65 tokens take fused_rope past its 512 token-heads."""
+    rotation rounded once; 65 tokens span more than one Triton tile."""
     hq, hkv, tokens = 8, 2, 65
     inputs = qkv(tokens, hq, hkv, head_dim, seed=head_dim + rotary_dim, dtype=dtype)
     g = torch.Generator(device="cuda").manual_seed(1)

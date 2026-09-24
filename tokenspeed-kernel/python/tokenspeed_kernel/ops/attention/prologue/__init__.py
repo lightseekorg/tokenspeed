@@ -73,46 +73,39 @@ from tokenspeed_kernel.selection import (
     spec_matches_shape_traits,
     spec_matches_traits,
 )
-from tokenspeed_kernel.signature import (
-    FormatSignature,
-    dense_tensor_format,
-    format_signature,
-)
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 
 @lru_cache(maxsize=4096)
-def _serves(
-    kernel_name: str, mode: str, traits: tuple[tuple[str, object], ...]
-) -> bool:
-    spec = KernelRegistry.get().get_by_name(kernel_name)
-    return (
+def _select(
+    mode: str,
+    dtype: torch.dtype,
+    traits: tuple[tuple[str, object], ...],
+    solution: str | None,
+    override: str | None,
+) -> SelectedKernel:
+    """Select the kernel for a request, once per distinct request; an override
+    may name only a kernel this platform runs whose traits cover the request,
+    since solutions drop inputs their traits exclude."""
+    role = "q" if mode == "gqa_prologue" else "query"
+    kernel = select_kernel(
+        "attention",
+        mode,
+        format_signature(**{role: dense_tensor_format(dtype)}),
+        traits=dict(traits),
+        solution=solution,
+        override=override,
+    )
+    spec = KernelRegistry.get().get_by_name(kernel.name)
+    if not (
         (spec.family, spec.mode) == ("attention", mode)
         and spec.capability.satisfied_by(current_platform())
         and spec_matches_traits(spec, dict(traits))
         and spec_matches_shape_traits(spec, dict(traits))
-    )
-
-
-def _select(
-    mode: str,
-    signature: FormatSignature,
-    traits: dict[str, object],
-    solution: str | None,
-    override: str | None,
-) -> SelectedKernel:
-    """Select the kernel for a request; an override may name only a kernel this
-    platform runs whose traits cover the request, since solutions drop inputs
-    their traits exclude."""
-    kernel = select_kernel(
-        "attention",
-        mode,
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
-    )
-    if not _serves(kernel.name, mode, tuple(traits.items())):
-        raise ValueError(f"{kernel.name} does not serve attention.{mode} with {traits}")
+    ):
+        raise ValueError(
+            f"{kernel.name} does not serve attention.{mode} with {dict(traits)}"
+        )
     return kernel
 
 
@@ -163,17 +156,10 @@ def gqa_prologue(
         and cache.k_cache.dtype is not q.dtype,
         "mrope": rotary is not None and rotary.positions.ndim == 2,
         "partial_rotary": rotary is not None and rotary.rotary_dim != head_dim,
-        "partial_write": 0 < cache.slots.numel() < num_tokens,
         "return_kv": return_kv,
         "rope_style": "none" if rotary is None else rotary.style.value,
     }
-    kernel = _select(
-        "gqa_prologue",
-        format_signature(q=dense_tensor_format(q.dtype)),
-        traits,
-        solution,
-        override,
-    )
+    kernel = _select("gqa_prologue", q.dtype, tuple(traits.items()), solution, override)
     shape_params = {
         "num_tokens": num_tokens,
         "num_q_heads": num_q_heads,
@@ -304,11 +290,7 @@ def mla_prologue(
         "sanitize": cache.sanitize,
     }
     kernel = _select(
-        "mla_prologue",
-        format_signature(query=dense_tensor_format(query.dtype)),
-        traits,
-        solution,
-        override,
+        "mla_prologue", query.dtype, tuple(traits.items()), solution, override
     )
     shape_params = {
         "num_tokens": num_tokens,
@@ -358,6 +340,5 @@ __all__ = [
 ]
 
 
-# Backend registration (side-effect imports; the composite registers on its import above)
-import tokenspeed_kernel.ops.attention.prologue.fused_rope  # noqa: E402,F401
+# Backend registration (side-effect import; the composite registers on its import above)
 import tokenspeed_kernel.ops.attention.prologue.triton  # noqa: E402,F401

@@ -122,10 +122,9 @@ differently declares traits that exclude those cases instead of being admitted
 with a tolerance. Inputs may be overwritten.
 
 Where a fused solution covers only part of a shape's range (a token-head
-bound, full writes only, or absorbed attention only), a row's bytes can depend
-on its batch. Crossing to the CUDA RoPE kernel changes the flushed subnormals
-and NaN payloads: unnormed GQA layers between `triton` and `fused_rope`, and
-MLA layers between `triton` and the composite, on NVIDIA. Crossing to a
+bound or absorbed attention only), a row's bytes can depend on its batch.
+Crossing to the CUDA RoPE kernel changes the flushed subnormals and NaN
+payloads: MLA layers between `triton` and the composite, on NVIDIA. Crossing to a
 composite that rounds between steps (the MLA composite on an FP8 cache on AMD,
 or any composite writing fp16 rows into a bf16 cache) adds that rounding. Both
 sides are at least as precise as the step-by-step path.
@@ -199,12 +198,13 @@ native, FP8 or MXFP8 cache; every step but the write is optional.
 
 | Solution | Kernel | Covers |
 | --- | --- | --- |
-| `triton` | one launch, one program per head | AMD and NVIDIA, native or FP8 caches, every layer `fused_rope` does not take |
-| `fused_rope` | `embedding.rope` with its fused K/V store; the key rotates in place | NVIDIA past 512 token-heads, head size 64/128/256/512, no norm, no M-RoPE, full rotary, native cache of the activation dtype or FP8 cache, every row written or none (a rope-only call) |
+| `triton` | one launch; each program takes a tile of tokens of one head (4 at decode sizes, up to 2048 elements past 256 tokens) | AMD and NVIDIA, native or FP8 caches |
 | `composite` | `qk_rmsnorm`, `embedding.rope`, then the cache store | everything; rounds between steps; the path for MXFP8 caches and Ascend |
 
-Without a norm, `fused_rope` overtakes the one-head-per-program Triton kernel
-past 512 token-heads on NVIDIA, so it declares that bound.
+The tiled Triton kernel beats the CUDA `embedding.rope` with its fused K/V
+store at every size measured (1 to 8192 tokens, 64 to 512 wide heads), so no
+CUDA GQA solution remains; without a norm the two solutions agree byte for byte
+on a native cache, since both round once.
 
 `("attention", "mla_prologue")`: RoPE of the query and latent key parts,
 FP8 quantization of the query for an FP8 cache, and the latent write into a

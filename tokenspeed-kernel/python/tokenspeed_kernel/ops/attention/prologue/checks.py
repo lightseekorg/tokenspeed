@@ -74,6 +74,119 @@ def _overlapping(x: torch.Tensor) -> bool:
     return _overlapping_layout(x.shape, x.stride())
 
 
+def _layout(x: torch.Tensor) -> tuple:
+    return (x.shape, x.stride(), x.dtype, x.data_ptr() % 16, x.storage_offset() % 4)
+
+
+def _rotary_key(rotary: Rotary | None) -> tuple | None:
+    if rotary is None:
+        return None
+    return (
+        _layout(rotary.cos_sin_cache),
+        _layout(rotary.positions),
+        rotary.style,
+        rotary.mrope,
+    )
+
+
+def _cache_key(cache: HeadKVCache | LatentKVCache) -> tuple:
+    if isinstance(cache, HeadKVCache):
+        scales = cache.scales
+        planes = (
+            None
+            if scales is None
+            else (_layout(scales.k), _layout(scales.v), scales.page_tokens)
+        )
+        return (
+            _layout(cache.k_cache),
+            _layout(cache.v_cache),
+            planes,
+            _layout(cache.slots),
+        )
+    kv = cache.kv_cache
+    kv_key = (
+        _layout(kv)
+        if isinstance(kv, torch.Tensor)
+        else (_layout(kv.latent), _layout(kv.scale), _layout(kv.rope))
+    )
+    return (kv_key, cache.sanitize, _layout(cache.slots))
+
+
+_checked: set[tuple] = set()
+
+
+def _once(key: tuple, check, *args) -> None:
+    """Run a metadata check once per layout: requests repeat layouts, so the checks need not."""
+    if key in _checked:
+        return
+    check(*args)
+    if len(_checked) >= 4096:
+        _checked.clear()
+    _checked.add(key)
+
+
+def check_gqa_request(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    norm: HeadNorm | None,
+    rotary: Rotary | None,
+    cache: HeadKVCache,
+) -> None:
+    """Reject a GQA request any solution would misread; metadata only."""
+    norm_key = (
+        None if norm is None else (_layout(norm.q_weight), _layout(norm.k_weight))
+    )
+    key = (
+        "gqa",
+        _layout(q),
+        _layout(k),
+        _layout(v),
+        norm_key,
+        _rotary_key(rotary),
+        _cache_key(cache),
+    )
+    _once(key, _check_gqa_request, q, k, v, norm, rotary, cache)
+
+
+def check_kv_write(k: torch.Tensor, v: torch.Tensor, cache: HeadKVCache) -> None:
+    """Reject prepared K/V rows the store kernels would misread; metadata only."""
+    _once(
+        ("write", _layout(k), _layout(v), _cache_key(cache)),
+        _check_kv_write,
+        k,
+        v,
+        cache,
+    )
+
+
+def check_mla_request(
+    query: torch.Tensor,
+    q_pe: torch.Tensor,
+    latent_cache: torch.Tensor,
+    expanded: MLAExpandedKV | None,
+    rotary: Rotary | None,
+    cache: LatentKVCache,
+) -> None:
+    """Reject an MLA request any solution would misread; metadata only."""
+    expanded_key = (
+        None
+        if expanded is None
+        else (_layout(expanded.k_nope), _layout(expanded.value))
+    )
+    key = (
+        "mla",
+        _layout(query),
+        _layout(q_pe),
+        q_pe.data_ptr() - query.data_ptr(),
+        _layout(latent_cache),
+        expanded_key,
+        _rotary_key(rotary),
+        _cache_key(cache),
+    )
+    _once(key, _check_mla_request, query, q_pe, latent_cache, expanded, rotary, cache)
+
+
 def _check_slots(cache: HeadKVCache | LatentKVCache, num_tokens: int) -> None:
     slots = cache.slots
     if (
@@ -140,7 +253,7 @@ def _check_mxfp8_scales(cache: HeadKVCache, num_kv_heads: int, head_dim: int) ->
         )
 
 
-def check_gqa_request(
+def _check_gqa_request(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -214,7 +327,7 @@ def check_gqa_request(
         )
 
 
-def check_kv_write(k: torch.Tensor, v: torch.Tensor, cache: HeadKVCache) -> None:
+def _check_kv_write(k: torch.Tensor, v: torch.Tensor, cache: HeadKVCache) -> None:
     """Reject prepared K/V rows the store kernels would misread; metadata only."""
     if cache.k_cache.dim() != 3 or cache.v_cache.shape != cache.k_cache.shape:
         raise ValueError(
@@ -239,7 +352,7 @@ def check_kv_write(k: torch.Tensor, v: torch.Tensor, cache: HeadKVCache) -> None
         _check_mxfp8_scales(cache, *cache.k_cache.shape[1:])
 
 
-def check_mla_request(
+def _check_mla_request(
     query: torch.Tensor,
     q_pe: torch.Tensor,
     latent_cache: torch.Tensor,
