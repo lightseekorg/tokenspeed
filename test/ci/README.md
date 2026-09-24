@@ -245,6 +245,16 @@ matching rule decides (`ci_path_filter.py` holds the full lists):
 * Each workflow's own YAML requires only its runner group; `workflow_dispatch`
   always runs.
 
+For PR and push diffs containing only `test/ci/**/*.yaml` task declarations,
+the scan additionally keeps only those changed tasks in each GPU matrix.
+Each selected task retains its configured runner labels, trigger, stage, and
+multi-node rules; unrelated unit tests and model evaluations are skipped.
+Renamed tasks use their new paths, and deleted tasks schedule no jobs.
+Changing any other file keeps the existing runner-group test scope. Empty
+change lists and lists of at least 300 paths also keep that scope, since a
+large GitHub comparison may omit files. Manual and nightly runs retain their
+existing task selection. YAML validation still runs before matrix filtering.
+
 `tokenspeed-kernel/test/` is laid out to feed the vendor rules. Tests whose
 module-level gate (`is_cdna4()`, `is_cdna5()`, `is_amd()`, or an import from
 `tokenspeed_kernel_amd`) skips them off AMD hardware live under

@@ -440,6 +440,37 @@ def build_matrix(
     return {"include": include}
 
 
+def filter_matrix_for_changed_tasks(
+    matrix: Dict[str, Any], changed_paths: List[str]
+) -> Dict[str, Any]:
+    """Restrict a validated matrix when the diff contains only CI task YAMLs.
+
+    Empty, mixed, noncanonical, or potentially truncated change lists retain
+    the existing matrix. Deleted tasks have no entries; renamed tasks match
+    their new config path. Runner and stage selection remain unchanged.
+    """
+    # GitHub's compare API returns at most 300 changed files. At that boundary
+    # an omitted source change could make a mixed diff look like YAML-only.
+    if not changed_paths or len(changed_paths) >= 300:
+        return matrix
+    if any(
+        not path.startswith("test/ci/")
+        or not path.endswith(".yaml")
+        or Path(path).as_posix() != path
+        or ".." in Path(path).parts
+        for path in changed_paths
+    ):
+        return matrix
+    changed = set(changed_paths)
+    include = [entry for entry in matrix["include"] if entry["config"] in changed]
+    print(
+        f"Only CI task YAMLs changed: selected {len(include)} of "
+        f"{len(matrix['include'])} task/runner entries.",
+        file=sys.stderr,
+    )
+    return {**matrix, "include": include}
+
+
 def shell_run(
     command: str,
     *,
@@ -2075,6 +2106,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     scan_parser = subparsers.add_parser("scan", help="Scan CI task specs into a matrix")
     scan_parser.add_argument("--root", default="test/ci", help="Task root directory")
     scan_parser.add_argument(
+        "--changed-files",
+        type=Path,
+        help="Optional changed-path list; only task-YAML-only diffs narrow the matrix",
+    )
+    scan_parser.add_argument(
         "--trigger",
         choices=sorted(SUPPORTED_TRIGGERS),
         default=None,
@@ -2181,6 +2217,13 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.workflow_stage,
             args.multi_node,
         )
+        if args.changed_files is not None:
+            changed_paths = [
+                line
+                for line in args.changed_files.read_text(encoding="utf-8").splitlines()
+                if line
+            ]
+            matrix = filter_matrix_for_changed_tasks(matrix, changed_paths)
         print(json.dumps(matrix, separators=(",", ":")))
         return 0
 
