@@ -6,7 +6,8 @@ on:
     paths:
       - ".github/workflows/nvidia-arm-kernel-tests.yml"
       - "test/ci/ut/ut-tokenspeed-kernel-nvidia-arm.yaml"
-      - "test/ci/ut/test_native_gpu_packages.py"
+      - "tokenspeed-kernel/test/nvidia/thirdparty/test_deep_gemm.py"
+      - "tokenspeed-kernel/test/ops/test_attention_dsv4_dcp.py"
       - "tokenspeed-kernel/python/requirements/cuda-thirdparty.txt"
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -14,7 +15,8 @@ on:
     paths:
       - ".github/workflows/nvidia-arm-kernel-tests.yml"
       - "test/ci/ut/ut-tokenspeed-kernel-nvidia-arm.yaml"
-      - "test/ci/ut/test_native_gpu_packages.py"
+      - "tokenspeed-kernel/test/nvidia/thirdparty/test_deep_gemm.py"
+      - "tokenspeed-kernel/test/ops/test_attention_dsv4_dcp.py"
       - "tokenspeed-kernel/python/requirements/cuda-thirdparty.txt"
   workflow_dispatch:
 
