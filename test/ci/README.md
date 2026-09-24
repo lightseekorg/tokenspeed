@@ -475,7 +475,7 @@ hardware. A selected YAML follows the same rule; YAMLs that already declare a
 `slurm-dispatch-gb300` coordinators form one shared pool for manual, nightly,
 and per-commit submissions.
 
-The `GB200 Slurm Per Commit` workflow runs single-node `slurm-gb200-*`
+The `GB200` workflow runs single-node `slurm-gb200-*`
 tasks through the `slurm-dispatch` coordinator. Qwen four-GPU tasks migrated
 from B200 use `slurm-gb200-4gpu`: the 397B NVFP4 AIME25 evaluation, 35B FP8
 DeepEP GSM8K evaluation, and 122B EPD OCRBench evaluation and unit test.
@@ -492,7 +492,7 @@ the approved-PR and latest-main retry workflows also cover this workflow.
 Its default `eval,perf` selection covers the three migrated evaluations;
 select `ut` explicitly to include the EPD unit test.
 
-The `GB300 Slurm Per Commit` workflow selects only multi-node model tasks with
+The `GB300` workflow selects only multi-node model tasks with
 the `per-commit` trigger and submits them through the same
 `slurm-dispatch-gb300` coordinator pool used by manual dispatch. It runs for
 pushes to `main` and for non-draft pull requests whose head branch belongs to
@@ -510,7 +510,7 @@ cannot filter the multi-node matrix here. During this workflow's
 bootstrap only, leave the switch unset; after dispatcher support reaches
 `main`, set it to `true` and re-run the merge commit's workflow.
 
-`Retry Failed Latest Main CI` also covers `GB300 Slurm Per Commit`. Its hourly
+`Retry Failed Latest Main CI` also covers `GB300`. Its hourly
 or manual scan retries failed jobs from completed, failed push runs on the
 latest `main` commit, using the original run and commit. The retry workflow
 stops after three total attempts (the original plus two retries); older
