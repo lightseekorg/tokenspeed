@@ -46,21 +46,7 @@ if platform.is_nvidia:
                 "trtllm fp8_quantize_1x128 only supports group_size=128, "
                 f"got {group_size}"
             )
-        values, scales = torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0)
-        rows, groups = x.shape[0], x.shape[1] // group_size
-        expected = (groups, rows)
-        if scales.ndim == 2 and tuple(scales.shape) == expected:
-            return values, scales
-        if scales.ndim != 1:
-            raise ValueError(
-                f"Unexpected TRT-LLM FP8 scale shape {tuple(scales.shape)}"
-            )
-        row_stride = (rows + 3) // 4 * 4
-        used = groups * row_stride
-        if scales.numel() != (used + 31) // 32 * 32:
-            raise ValueError(f"Unexpected TRT-LLM FP8 scale length {scales.numel()}")
-        scales = scales[:used].view(groups, row_stride)[:, :rows].contiguous()
-        return values, scales
+        return torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0)
 
     def _per_tensor_quant_fp8(
         input: torch.Tensor, output: torch.Tensor, scale: torch.Tensor
