@@ -1562,6 +1562,62 @@ def test_package_prefill_block_m_selection_gfx950(
     assert _select_package_prefill_block_m(num_tokens, 16, 16) == expected
 
 
+@pytest.mark.parametrize(
+    ("num_tokens", "expected"),
+    [(4095, (32, 256)), (4096, (16, 128)), (8192, (16, 128))],
+)
+def test_stage2_reduce_tile_selection_gfx950(
+    num_tokens: int,
+    expected: tuple[int, int],
+) -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (
+        _select_reduce_tile,
+    )
+
+    assert _select_reduce_tile(num_tokens) == expected
+
+
+def test_stage2_large_reduce_tile_matches_reference_gfx950() -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (
+        _select_reduce_tile,
+        gluon_mxfp4_moe_stage2_reduce_kernel,
+    )
+
+    num_tokens, topk, width = 4096, 16, 256
+    generator = torch.Generator(device="cuda").manual_seed(20260924)
+    partials = torch.randn(
+        (num_tokens, topk, width),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    expected = torch.zeros((num_tokens, width), dtype=torch.float32, device="cuda")
+    for slot in range(topk):
+        expected += partials[:, slot].float()
+    expected = expected.to(torch.bfloat16)
+    actual = torch.empty_like(expected)
+
+    block_m, block_n = _select_reduce_tile(num_tokens)
+    grid = ((num_tokens + block_m - 1) // block_m * ((width + block_n - 1) // block_n),)
+    gluon_mxfp4_moe_stage2_reduce_kernel[grid](
+        partials,
+        actual,
+        num_tokens,
+        width,
+        partials.stride(0),
+        partials.stride(1),
+        partials.stride(2),
+        actual.stride(0),
+        actual.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        TOP_K=topk,
+        num_warps=1,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
 def test_tp_situ_package_prefill_block64_matches_block128_gfx950(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
