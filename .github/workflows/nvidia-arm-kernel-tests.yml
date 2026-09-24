@@ -1,0 +1,73 @@
+name: NVIDIA GPU Library Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/nvidia-arm-kernel-tests.yml"
+      - "test/ci/ut/ut-tokenspeed-kernel-nvidia-arm.yaml"
+      - "tokenspeed-kernel/test/nvidia/thirdparty/test_deep_gemm.py"
+      - "tokenspeed-kernel/test/ops/test_attention_dsv4_dcp.py"
+      - "tokenspeed-kernel/test/conftest.py"
+      - "tokenspeed-kernel/python/**"
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    paths:
+      - ".github/workflows/nvidia-arm-kernel-tests.yml"
+      - "test/ci/ut/ut-tokenspeed-kernel-nvidia-arm.yaml"
+      - "tokenspeed-kernel/test/nvidia/thirdparty/test_deep_gemm.py"
+      - "tokenspeed-kernel/test/ops/test_attention_dsv4_dcp.py"
+      - "tokenspeed-kernel/test/conftest.py"
+      - "tokenspeed-kernel/python/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nvidia-gpu-library-tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-libraries:
+    if: >-
+      github.repository == 'lightseekorg/tokenspeed' &&
+      (github.event_name != 'pull_request' ||
+       (github.event.pull_request.head.repo.full_name == github.repository &&
+        !github.event.pull_request.draft))
+    runs-on:
+      group: Four-GPU Slurm Dispatchers
+      labels: slurm-dispatch-4gpu
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run native library unit tests
+        run: |
+          set -euo pipefail
+          unset SBATCH_GPUS_PER_NODE SLURM_GPUS_PER_NODE
+          export TS_CI_ARTIFACT_ROOT="$HOME/tokenspeed-native-library-slurm"
+          export TS_CI_CACHE_DIR="$HOME/tokenspeed-native-library-cache"
+          export TS_CI_CONTAINER_IMAGE=ghcr.io/lightseekorg/tokenspeed-runner:cu134-torch-2.14.0-flashinfer-0.7.0@sha256:d93dee2b33d1779dbfea331f953ca98f96264a377c02e9134d9cc9d4788bce82
+          bash test/ci/run_slurm.sh \
+            --config test/ci/ut/ut-tokenspeed-kernel-nvidia-arm.yaml \
+            --runner slurm-nvidia-arm-4gpu --type ut --trigger slurm \
+            --partition batch --time 00:45:00 \
+            --wait --report-dir "$RUNNER_TEMP/native-library-report"
+
+      - name: Publish test summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/native-library-report/summary.md" ]; then
+            cat "$RUNNER_TEMP/native-library-report/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nvidia-gpu-library-tests
+          path: ${{ runner.temp }}/native-library-report
+          if-no-files-found: ignore
