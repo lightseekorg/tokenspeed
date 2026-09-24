@@ -15,7 +15,7 @@ env:
   CUDA_HOME: /usr/local/cuda-13.4
   PATH: /usr/local/cuda-13.4/bin:/home/runner/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
   LD_LIBRARY_PATH: /usr/local/cuda-13.4/lib64:/opt/tokenspeed-cuda-runtime:/usr/lib/aarch64-linux-gnu
-  LD_PRELOAD: /usr/local/cuda-13.4/lib64/libnvrtc.so.13
+  LD_PRELOAD: /usr/local/cuda-13.4/lib64/libcupti.so.13:/usr/local/cuda-13.4/lib64/libnvrtc.so.13
   TRITON_PTXAS_PATH: /usr/local/cuda-13.4/bin/ptxas
 install:
   - python3 -m pip install --break-system-packages pytest==9.1.1 pytest-xdist -r tokenspeed-kernel/python/requirements/cuda.txt -r tokenspeed-kernel/python/requirements/cuda-thirdparty.txt compressed-tensors pybase64 pyzmq pillow fastapi
