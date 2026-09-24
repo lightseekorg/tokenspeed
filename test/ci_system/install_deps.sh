@@ -9,7 +9,15 @@ set -e
 # Hand off to the ROCm-specific script when running on an AMD runner.
 # ============================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+validate_cuda_scope() {
+    if [ "$#" -gt 0 ] && { [ "$#" -ne 1 ] || [ "$1" != full ]; }; then
+        echo "CUDA install accepts only the optional full scope" >&2
+        exit 2
+    fi
+}
+
 if [ "${CUDA_VARIANT:-}" = "cu129" ]; then
+    validate_cuda_scope "$@"
     exec python3 "${SCRIPT_DIR}/install_deps_cu129.py"
 fi
 source "${SCRIPT_DIR}/package_cache.sh"
@@ -21,6 +29,8 @@ for pat in "${AMD_RUNNER_LABEL_PATTERNS[@]}"; do
         exec bash "${SCRIPT_DIR}/install_deps_rocm.sh" "$@"
     fi
 done
+
+validate_cuda_scope "$@"
 
 # ============================================================
 # Configuration

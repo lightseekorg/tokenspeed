@@ -4,6 +4,19 @@ set -e
 # ============================================================
 # ROCm/AMD MI355 install script for TokenSpeed CI.
 # ============================================================
+if [ "$#" -ne 1 ]; then
+    echo "Usage: $0 <kernel|full>" >&2
+    exit 2
+fi
+INSTALL_SCOPE=$1
+case "${INSTALL_SCOPE}" in
+    kernel|full) ;;
+    *)
+        echo "Invalid ROCm install scope: ${INSTALL_SCOPE}" >&2
+        exit 2
+        ;;
+esac
+
 GFX_ARCH=${GFX_ARCH:-gfx950}
 BUILD_AND_DOWNLOAD_PARALLEL=${BUILD_AND_DOWNLOAD_PARALLEL:-16}
 TORCH_VERSION=${TORCH_VERSION:-2.14.0}
@@ -67,6 +80,11 @@ cd "${WORKSPACE}"
 TOKENSPEED_KERNEL_BACKEND=rocm \
 pip_install_with_retry pip3 install tokenspeed-kernel/python/ \
     --no-build-isolation -v
+
+if [ "${INSTALL_SCOPE}" = kernel ]; then
+    echo "ROCm kernel install completed (GFX_ARCH=${GFX_ARCH})"
+    exit 0
+fi
 
 echo "=== Step 5: Install TokenSpeed Scheduler ==="
 pip_install_with_retry pip3 install cmake ninja

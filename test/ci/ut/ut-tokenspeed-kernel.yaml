@@ -15,7 +15,7 @@ runner:
 env:
   CI: "true"
 install:
-  - bash test/ci_system/install_deps.sh
+  - bash test/ci_system/install_deps.sh full
 ut:
   commands:
     - python3 -m pytest tokenspeed-kernel/test/test_numerics.py -v

@@ -175,7 +175,7 @@ env:
   TORCHVISION_VERSION: 0.29.0a0+rocm10.2.0a20260923
 install:
   - bash test/ci_system/setup_mi450_sim.sh
-  - WORKSPACE="$(pwd)" bash test/ci_system/install_deps_rocm.sh
+  - WORKSPACE="$(pwd)" bash test/ci_system/install_deps_rocm.sh kernel
 ut:
   commands:
     - >-

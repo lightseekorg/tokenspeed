@@ -32,7 +32,7 @@ runner:
 env:
   CI: "true"
 install:
-  - bash test/ci_system/install_deps_rocm.sh
+  - bash test/ci_system/install_deps_rocm.sh full
 server:
   command: >-
     ts serve

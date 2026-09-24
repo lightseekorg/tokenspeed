@@ -11,7 +11,7 @@ runner:
 env:
   CI: "true"
 install:
-  - bash test/ci_system/install_deps.sh
+  - bash test/ci_system/install_deps.sh full
 server:
   command: >-
     ts serve

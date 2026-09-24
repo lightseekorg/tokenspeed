@@ -17,7 +17,7 @@ runner:
 env:
   CI: "true"
 install:
-  - bash test/ci_system/install_deps.sh
+  - bash test/ci_system/install_deps.sh full
 ut:
   commands:
     - python3 test/runtime/run_ci_suite.py --device cuda --suite runtime-1gpu --timeout-per-file ${CI_TIMEOUT_PER_FILE:-1800}
