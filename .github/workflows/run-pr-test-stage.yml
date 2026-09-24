@@ -92,7 +92,9 @@ jobs:
           fi
 
       - name: Restore MI450 simulator cache
-        if: matrix.runner == 'amd-mi45x-cpu-test'
+        # The current amd-mi45x-cpu-test base image already contains the matching
+        # ROCm, Torch, and prebuilt rocJITsu source/build tree.
+        if: ${{ false }}
         id: mi450-simulator-cache
         uses: actions/cache/restore@v4
         with:
@@ -127,7 +129,9 @@ jobs:
             --result-json .ci-artifacts/result.json
 
       - name: Save MI450 simulator cache
-        if: matrix.runner == 'amd-mi45x-cpu-test' && steps.mi450-simulator-cache.outputs.cache-hit != 'true'
+        # Keep disabled while the simulator toolchain is baked into the
+        # amd-mi45x-cpu-test base image.
+        if: ${{ false }}
         uses: actions/cache/save@v4
         with:
           path: |

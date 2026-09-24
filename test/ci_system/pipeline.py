@@ -2075,6 +2075,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     scan_parser = subparsers.add_parser("scan", help="Scan CI task specs into a matrix")
     scan_parser.add_argument("--root", default="test/ci", help="Task root directory")
     scan_parser.add_argument(
+        "--changed-files",
+        type=Path,
+        help="Optional changed-path list; only task-YAML-only diffs narrow the matrix",
+    )
+    scan_parser.add_argument(
         "--trigger",
         choices=sorted(SUPPORTED_TRIGGERS),
         default=None,
@@ -2181,6 +2186,16 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.workflow_stage,
             args.multi_node,
         )
+        if args.changed_files is not None:
+            changed = args.changed_files.read_text(encoding="utf-8").splitlines()
+            # GitHub comparisons may truncate the file list at 300 entries.
+            if 0 < len(changed) < 300 and all(
+                path.startswith("test/ci/") and path.endswith(".yaml")
+                for path in changed
+            ):
+                matrix["include"] = [
+                    entry for entry in matrix["include"] if entry["config"] in changed
+                ]
         print(json.dumps(matrix, separators=(",", ":")))
         return 0
 
