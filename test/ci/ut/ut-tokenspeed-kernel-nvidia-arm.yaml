@@ -35,9 +35,9 @@ ut:
       and all(int(c["skipped"]) == 0 for c in counts)'
     - python3 -m pytest tokenspeed-kernel/test/test_numerics.py -v --junitxml=/tmp/kernel-numerics.xml
     - python3 -m pytest tokenspeed-kernel/test/nvidia/thirdparty/test_trtllm_comm.py -v --junitxml=/tmp/kernel-trtllm-comm.xml
-    - python3 -m pytest tokenspeed-kernel/test/nvidia/thirdparty/test_cuda.py -v --junitxml=/tmp/kernel-cuda.xml
+    - PYTHONPATH=python python3 -m pytest tokenspeed-kernel/test/nvidia/thirdparty/test_cuda.py -v --junitxml=/tmp/kernel-cuda.xml
     - >-
-      python3 -m pytest tokenspeed-kernel/test/ -v
+      PYTHONPATH=python python3 -m pytest tokenspeed-kernel/test/ -v
       --ignore=tokenspeed-kernel/test/amd
       --ignore=tokenspeed-kernel/test/test_numerics.py
       --ignore=tokenspeed-kernel/test/nvidia/thirdparty/test_trtllm_comm.py
