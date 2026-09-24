@@ -8,6 +8,7 @@ import torch
 from tokenspeed_kernel.ops.gemm.kimi3 import (
     _use_gluon_largem,
     _use_gluon_mediumm,
+    _use_gluon_qkvfab_prefill_gfx950,
     _use_gluon_smallm,
 )
 from tokenspeed_kernel.ops.moe.sigmoid_topk import (
@@ -102,6 +103,18 @@ def test_kimi3_latent_projection_smallm_dispatch(
     m: int, k: int, n: int, expected: bool
 ) -> None:
     assert _use_gluon_smallm(m, k, n) is expected
+
+
+@pytest.mark.parametrize(
+    "m,k,n,expected",
+    [
+        (8192, 7168, 6288, True),
+        (8191, 7168, 6288, False),
+        (8192, 7168, 6400, False),
+    ],
+)
+def test_kimi3_qkvfab_prefill_dispatch(m: int, k: int, n: int, expected: bool) -> None:
+    assert _use_gluon_qkvfab_prefill_gfx950(m, k, n) is expected
 
 
 @pytest.mark.parametrize("input_size,output_size", [(7168, 3584), (3584, 7168)])
@@ -217,6 +230,17 @@ def test_kimi3_qkvfab_projection_matches_torch_and_captures() -> None:
     torch.cuda.synchronize()
 
     torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_kimi3_qkvfab_prefill_split_matches_torch() -> None:
+    torch.manual_seed(43)
+    hidden_states = torch.randn(8192, 7168, device="cuda", dtype=torch.bfloat16) * 0.01
+    weight = torch.randn(6288, 7168, device="cuda", dtype=torch.bfloat16) * 0.01
+    expected = torch.nn.functional.linear(hidden_states, weight)
+
+    actual = tokenspeed_kernel.kimi3_qkvfab_projection(hidden_states, weight)
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.parametrize("num_tokens", [0, 1, 2, 4, 8, 33])
