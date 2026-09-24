@@ -110,6 +110,17 @@ def _b_preshuffle_3d(b: torch.Tensor) -> torch.Tensor:
     return b_6d.permute(0, 1, 3, 4, 2, 5).contiguous().view(E, N, K_pk)
 
 
+def _select_stage1_group_size_m(*, a_format: str, b_gdot128: bool) -> int:
+    """Select M-tile grouping for expert-weight cache locality.
+
+    Route sorting makes adjacent M tiles likely to use the same expert. The
+    K3 E2M1/GDOT128 path groups those tiles before advancing N so the six W13
+    column panels are reused from cache. Other layouts retain their established
+    launch order until they are tuned independently.
+    """
+    return 8 if a_format == "e2m1" and b_gdot128 else 1
+
+
 # ---------------------------------------------------------------------------
 # Module-private @gluon.jit helpers used by the K-loop pipeline.
 # ``_prefetch_a_data_lds`` accepts a ``mask`` kwarg so the per-token
@@ -2380,7 +2391,10 @@ def invoke_gluon_mxfp4_moe_stage1(
         )
     BLOCK_N = 128
     BLOCK_K = 256
-    GROUP_SIZE_M = 1
+    GROUP_SIZE_M = _select_stage1_group_size_m(
+        a_format=a_format,
+        b_gdot128=b_gdot128,
+    )
     NUM_WARPS = 8 if a_format == "e4m3" else BLOCK_M // 32
     num_pid_m = triton.cdiv(EM, BLOCK_M)
     output_block_n = BLOCK_N // 2 if b_gdot128 else BLOCK_N
