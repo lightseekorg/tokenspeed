@@ -30,10 +30,12 @@ from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.engine.scheduler_utils import (
     engram_context_len,
     ngram_inputs_for_forward,
@@ -65,7 +67,7 @@ def _state(prompt, output):
     )
 
 
-def _op(states, rids, slots, lengths, prefixes, overrides):
+def _op(states, rids, slots, lengths, prefixes, replays, overrides):
     ids = []
     for rid, length, prefix in zip(rids, lengths, prefixes):
         state = states[rid]
@@ -82,6 +84,7 @@ def _op(states, rids, slots, lengths, prefixes, overrides):
         input_ids=ids,
         shifted_input_ids=ids[1:] + [-1] if ids else [],
         extend_prefix_lens=prefixes,
+        extend_replay_lens=replays,
         decode_input_ids=overrides,
         num_extends=lambda: len(prefixes),
     )
@@ -191,7 +194,7 @@ def test_chunked_prefill_and_pending_overlap_samples(buffers, overlap):
     ib, runtime = buffers
     states = {"a": _state([10, 11, 12, 13, 14], [])}
     for prefix, length in [(0, 2), (2, 3)]:
-        op = _op(states, ["a"], [2], [length], [prefix], [])
+        op = _op(states, ["a"], [2], [length], [prefix], [0], [])
         _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
         _assert_rows(
             ib,
@@ -204,7 +207,7 @@ def test_chunked_prefill_and_pending_overlap_samples(buffers, overlap):
     for current in [15, 16, 17, 18]:
         if not overlap:
             states["a"].output_ids.append(current)
-        op = _op(states, ["a"], [2], [1], [], [-1])
+        op = _op(states, ["a"], [2], [1], [], [], [-1])
         snapshot = ngram_inputs_for_forward(op, states, 3)
         if overlap:
             # Commit can mutate request state after dispatch but before the
@@ -240,7 +243,7 @@ def test_prefix_hit_mixed_reordered_requests_and_raw_barriers(buffers, barrier):
     }
     runtime.valid_cache_lengths[3] = 4
     runtime.future_input_map[3, 0] = 24
-    op = _op(states, ["prefill", "decode"], [1, 3], [4, 1], [3], [-1])
+    op = _op(states, ["prefill", "decode"], [1, 3], [4, 1], [3], [0], [-1])
     _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
     expected = _expected(states["prefill"].prompt_input_ids, range(3, 7)) + [
         [23, 22, 21]
@@ -251,9 +254,30 @@ def test_prefix_hit_mixed_reordered_requests_and_raw_barriers(buffers, barrier):
     _sample(ib, runtime, [8, 25], 1, [1, 1], False)
     states["prefill"].output_ids.append(8)
     states["decode"].output_ids.append(25)
-    op = _op(states, ["decode", "prefill"], [3, 1], [1, 1], [], [-1, -1])
+    op = _op(states, ["decode", "prefill"], [3, 1], [1, 1], [], [], [-1, -1])
     _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
     _assert_rows(ib, [[24, 23, 22], [7, 6, 5]], [True, True])
+
+
+def test_replayed_prefix_hit_feeds_rows_from_the_window_start(buffers):
+    """A prefix hit re-feeds the cached window: the extend starts at the
+    replay start (positions, token ids and Engram history all follow it) and
+    the backend-facing host mirrors carry the replay and prompt lengths."""
+    ib, runtime = buffers
+    states = {"a": _state([10, 11, 12, 13, 14, 15, 16, 17], [])}
+    # Hit at 6, window 4: rows [2, 8) with the first four replayed.
+    op = _op(states, ["a"], [2], [6], [2], [4], [])
+    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    assert ib.positions_buf[:6].tolist() == [2, 3, 4, 5, 6, 7]
+    assert ib.input_ids_buf[:6].tolist() == [12, 13, 14, 15, 16, 17]
+    _assert_rows(ib, _expected(states["a"].prompt_input_ids, range(2, 8)), [True] * 6)
+    assert ib.extend_prefix_lens_cpu[:1].tolist() == [2]
+    assert ib.extend_seq_lens_cpu[:1].tolist() == [6]
+    assert ib.extend_replay_lens_cpu[:1].tolist() == [4]
+    assert ib.extend_prompt_lens_cpu[:1].tolist() == [8]
+    # Progress counts every input row: the request is fully computed.
+    _sample(ib, runtime, [18], 1, [1], False)
+    assert runtime.valid_cache_lengths[2].item() == 8
 
 
 def test_retraction_readmission_pd_bootstrap_and_slot_reuse(buffers):
@@ -261,12 +285,12 @@ def test_retraction_readmission_pd_bootstrap_and_slot_reuse(buffers):
     states = {"a": _state([10, 11, 12], [13, 14, 15])}
     # Retraction turns accepted output back into a prefill suffix. Neither
     # prefix matching nor a pool-slot change changes physical token identity.
-    op = _op(states, ["a"], [4], [3], [3], [])
+    op = _op(states, ["a"], [4], [3], [3], [0], [])
     _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
     _assert_rows(ib, [[12, 11, 10], [13, 12, 11], [14, 13, 12]], [True] * 3)
     del states["a"]
     states["b"] = _state([30], [])
-    op = _op(states, ["b"], [4], [1], [0], [])
+    op = _op(states, ["b"], [4], [1], [0], [0], [])
     _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
     _assert_rows(ib, [[-1, -1, -1]], [True])
 
@@ -274,7 +298,7 @@ def test_retraction_readmission_pd_bootstrap_and_slot_reuse(buffers):
     # token and complete physical prompt suffice, with the existing override.
     states["pd"] = _state([40, 41, 42], [43])
     runtime.valid_cache_lengths[1] = 3
-    op = _op(states, ["pd"], [1], [1], [], [43])
+    op = _op(states, ["pd"], [1], [1], [], [], [43])
     _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
     _assert_rows(ib, [[42, 41, 40]], [True])
     assert ib.input_ids_buf[0].item() == 43
@@ -283,12 +307,12 @@ def test_retraction_readmission_pd_bootstrap_and_slot_reuse(buffers):
 def test_empty_prefill_padding_and_idle_scrub(buffers):
     ib, runtime = buffers
     states = {"a": _state([1, 2, 3], [])}
-    op = _op(states, ["a"], [1], [3], [0], [])
+    op = _op(states, ["a"], [1], [3], [0], [0], [])
     _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
     pointer = ib.ngram_previous_tokens_buf.data_ptr()
     ib.fill_dummy_decode_buffers(batch_size=4, total_tokens=4)
     _assert_rows(ib, [[-1] * 3] * 4, [False] * 4)
-    op = _op(states, ["a"], [1], [0], [3], [])
+    op = _op(states, ["a"], [1], [0], [3], [0], [])
     _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
     assert ib.ngram_model_kwargs(0)["engram_previous_tokens"].shape == (0, 3)
     assert (ib.ngram_previous_tokens_buf == -1).all()
@@ -296,7 +320,7 @@ def test_empty_prefill_padding_and_idle_scrub(buffers):
     assert ib.ngram_previous_tokens_buf.data_ptr() == pointer
     assert runtime.ngram_accepted_tokens[1].tolist() == [3, 2, 1]
     states["a"].output_ids.append(4)
-    op = _op(states, ["a"], [1], [1], [], [4])
+    op = _op(states, ["a"], [1], [1], [], [], [4])
     _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
     _assert_rows(ib, [[3, 2, 1]], [True])
 
@@ -362,7 +386,7 @@ def test_verify_branch_history_all_accept_lengths(buffers, width, accepted, over
     runtime = _spec_runtime(ib, width)
     states = {"a": _state([10, 11, 12, 13], [])}
     prefix = states["a"].prompt_input_ids.copy()
-    op = _op(states, ["a"], [2], [4], [0], [])
+    op = _op(states, ["a"], [2], [4], [0], [0], [])
     _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
     _sample(ib, runtime, [20], 1, [1], True)
     pending = [20]
@@ -372,7 +396,7 @@ def test_verify_branch_history_all_accept_lengths(buffers, width, accepted, over
         runtime.future_input_map[2] = torch.tensor(branch, device=ib.device)
         if not overlap:
             states["a"].output_ids.extend(pending)
-        op = _op(states, ["a"], [2], [width], [], [-1])
+        op = _op(states, ["a"], [2], [width], [], [], [-1])
         snapshot = ngram_inputs_for_forward(op, states, 3)
         assert len(snapshot.tokens) == 1
         if overlap:
@@ -406,7 +430,7 @@ def test_verify_raw_barriers_survive_clamp_and_acceptance(
     branch = [20, 21, 22, 23]
     branch[barrier_row] = barrier
     runtime.future_input_map[2] = torch.tensor(branch, device=ib.device)
-    op = _op(states, ["a"], [2], [4], [], [-1])
+    op = _op(states, ["a"], [2], [4], [], [], [-1])
     _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
     full = states["a"].prompt_input_ids + branch
     _assert_rows(ib, _expected(full, range(3, 7)), [t != barrier for t in branch])
@@ -435,7 +459,15 @@ def test_mixed_verify_empty_prefix_recovery_and_override(buffers):
     }
     runtime.valid_cache_lengths[0] = 3
     runtime.future_input_map[0] = torch.tensor([33, 34, 35, 36], device=ib.device)
-    op = _op(states, ["empty", "prefill", "decode"], [1, 2, 0], [0, 3, 4], [3, 2], [-1])
+    op = _op(
+        states,
+        ["empty", "prefill", "decode"],
+        [1, 2, 0],
+        [0, 3, 4],
+        [3, 2],
+        [0, 0],
+        [-1],
+    )
     snapshot = ngram_inputs_for_forward(op, states, 3)
     _fill(ib, runtime, op, snapshot)
     _assert_rows(
@@ -454,7 +486,7 @@ def test_mixed_verify_empty_prefix_recovery_and_override(buffers):
     # Rewind the same request/slot into a prefix-cached recovery chunk. The
     # immutable snapshot still owns the original physical prefix after dispatch.
     states["decode"].output_ids = [33, 34, 99]
-    op = _op(states, ["decode"], [0], [2], [3], [])
+    op = _op(states, ["decode"], [0], [2], [3], [0], [])
     snapshot = ngram_inputs_for_forward(op, states, 3)
     states["decode"].prompt_input_ids[2] = 77
     _fill(ib, runtime, op, snapshot)
@@ -465,7 +497,7 @@ def test_mixed_verify_empty_prefix_recovery_and_override(buffers):
     states["decode"].prompt_input_ids = [40, 41, 42]
     states["decode"].output_ids = [43]
     runtime.valid_cache_lengths[0] = 3
-    op = _op(states, ["decode"], [0], [4], [], [43])
+    op = _op(states, ["decode"], [0], [4], [], [], [43])
     _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
     _assert_rows(
         ib, [[42, 41, 40], [43, 42, 41], [43, 43, 42], [43, 43, 43]], [True] * 4
@@ -480,7 +512,7 @@ def test_mixed_verify_empty_prefix_recovery_and_override(buffers):
         torch.tensor([3], dtype=torch.int32, device=ib.device),
     )
     runtime.future_input_map[0] = torch.tensor([43, 44, 45, 46], device=ib.device)
-    op = _op(states, ["decode"], [0], [4], [], None)
+    op = _op(states, ["decode"], [0], [4], [], [], None)
     _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
     _assert_rows(
         ib, [[42, 41, 40], [43, 42, 41], [44, 43, 42], [45, 44, 43]], [True] * 4
@@ -496,7 +528,7 @@ def test_uncovered_seed_fails_instead_of_reusing_another_request_tail(buffers):
     runtime.valid_cache_lengths[2] = 8
     runtime.ngram_accepted_tokens[2] = 77
     runtime.future_input_map[2] = torch.tensor([20, 21, 22, 23])
-    op = _op(states, ["a"], [2], [4], [], [-1])
+    op = _op(states, ["a"], [2], [4], [], [], [-1])
     with pytest.raises(RuntimeError, match="seed snapshot does not cover"):
         _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
 
@@ -564,7 +596,7 @@ def test_runtime_update_replay_shrink_idle_and_slot_reuse(buffers, record_update
         if rids:
             for slot, branch in zip(slots, branches):
                 runtime.future_input_map[slot] = torch.tensor(branch, device=ib.device)
-            op = _op(states, rids, slots, [4] * len(rids), [], [-1] * len(rids))
+            op = _op(states, rids, slots, [4] * len(rids), [], [], [-1] * len(rids))
             _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
         else:
             ib.fill_dummy_decode_buffers(4, 16)
@@ -627,9 +659,10 @@ def test_executor_input_capacity_covers_decode_capture(
         enable_nan_detection=False,
     )
     runner = SimpleNamespace(
+        mapping=Mapping(rank=0, world_size=pp_size, pp_size=pp_size),
         model_config=SimpleNamespace(
             hf_text_config=SimpleNamespace(engram_layer_ids=[1], ngram_context_len=3)
-        )
+        ),
     )
     unsupported = pp_size != 1 or depth > 1
     with pytest.raises(NotImplementedError if unsupported else BuffersReady):
@@ -672,11 +705,14 @@ def test_target_runner_passes_model_kwargs_not_context_tensors(buffers, mode):
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.model_runner = runner
     executor.input_buffers = ib
-    executor.config = SimpleNamespace(model_is_mrope=False, pp_size=1)
+    executor.config = SimpleNamespace(
+        model_is_mrope=False, pp_size=1, data_parallel_size=1
+    )
+    executor.attn_backend = SimpleNamespace(prepare_prefill_metadata=Mock())
     executor._active_positions_override = None
     executor._active_multimodal_context = None
     executor.prefill_graph = SimpleNamespace(can_run=lambda ctx, mm: False)
-    ctx = SimpleNamespace(input_num_tokens=num_tokens, forward_mode=mode)
+    ctx = SimpleNamespace(input_num_tokens=num_tokens, forward_mode=mode, bs=1)
     original = vars(ctx).copy()
     result = executor._run_target_forward(ctx)
     assert result["engram_previous_tokens"].shape == (num_tokens, 3)
@@ -689,14 +725,16 @@ def test_target_runner_passes_model_kwargs_not_context_tensors(buffers, mode):
     assert vars(ctx) == original
 
 
-@pytest.mark.parametrize("context_len", [3, 4])
+@pytest.mark.parametrize(
+    ("context_len", "lengths"), [(3, [3, 3]), (4, [4, 3]), (5, [4, 3]), (8, [7])]
+)
 def test_autotune_passes_engram_views_and_resets_dummy_inputs(
-    buffers, monkeypatch, context_len
+    buffers, monkeypatch, context_len, lengths
 ):
     """Run the startup forward, not just its serving-path counterpart."""
     ib, _ = buffers
     num_tokens = min(7, context_len * 2)
-    lengths = [context_len, num_tokens - context_len]
+    bs = len(lengths)
     events = []
     metadata = []
     tuning = False
@@ -715,10 +753,10 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
 
     def init_metadata(**kwargs):
         assert tuning
-        assert kwargs["bs"] == kwargs["num_extends"] == 2
+        assert kwargs["bs"] == kwargs["num_extends"] == bs
         assert kwargs["forward_mode"] == ForwardMode.EXTEND
         assert kwargs["seq_lens"].tolist() == lengths
-        assert kwargs["extend_prefix_lens"].tolist() == [0, 0]
+        assert kwargs["extend_prefix_lens"].tolist() == [0] * bs
         assert not kwargs["extend_with_prefix"]
         # An unbound fake pool exercises dummy setup without allocating KV.
         assert "block_tables" not in kwargs
@@ -740,10 +778,10 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         assert input_ids.shape == (num_tokens,)
         assert input_ids.data_ptr() == ib.input_ids_buf.data_ptr()
         assert positions.data_ptr() == ib.positions_buf.data_ptr()
-        assert positions.tolist() == list(range(lengths[0])) + list(range(lengths[1]))
+        assert positions.tolist() == [pos for size in lengths for pos in range(size)]
         assert ctx.attn_backend is pg.attn_backend
         assert ctx.input_num_tokens == num_tokens
-        assert ctx.bs == ctx.num_extends == 2
+        assert ctx.bs == ctx.num_extends == bs
         assert ctx.forward_mode == ForwardMode.EXTEND
         assert "engram_previous_tokens" not in vars(ctx)
         assert "engram_token_mask" not in vars(ctx)
@@ -768,6 +806,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     )
     executor.input_buffers = ib
     executor.model_runner = runner
+    executor.drafter = None
     pg = PrefillGraph.__new__(PrefillGraph)
     pg.config = executor.config
     pg.input_buffers = ib
@@ -806,6 +845,63 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         ("group", None),
         "barrier",
     ]
+
+
+def test_autotune_covers_the_draft_experts_once_per_geometry(monkeypatch):
+    """The tuning prefill drives the target only; the draft's own expert
+    geometry (DSpark: 128 experts) is tuned by one apply per distinct plan."""
+    from tokenspeed.runtime.layers.moe.expert import MoELayer
+
+    def moe_layer(prefix, num_experts, a2a="none", solution="flashinfer_cutlass"):
+        layer = MoELayer.__new__(MoELayer)
+        torch.nn.Module.__init__(layer)
+        layer.prefix = prefix
+        layer.hidden_size, layer.intermediate_size = 64, 32
+        layer.num_experts, layer.top_k = num_experts, 3
+        layer.input_dtype = torch.float16
+        layer.plan = {
+            "apply_kernel_name": "fake_apply",
+            "a2a_backend": a2a,
+            "solution": solution,
+            "support_routing": False,
+            "supports_precomputed_topk": True,
+        }
+        return layer
+
+    class Draft(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = moe_layer("draft.a", 128)
+            self.b = moe_layer("draft.b", 128)  # same geometry: tuned once
+            self.c = moe_layer("draft.c", 64)  # different geometry
+            self.d = moe_layer("draft.d", 128, a2a="deepep")  # collective: skipped
+
+    calls = []
+
+    def fake_apply(plan, x, layer, router_logits, **kwargs):
+        calls.append((layer.prefix, tuple(x.shape), kwargs["topk_ids"]))
+        # Synthetic activations must carry the dtype the plan was signed for
+        # (--dtype float16 drafts plan FP16 inputs, not BF16).
+        assert x.dtype == layer.input_dtype
+        return x
+
+    monkeypatch.setattr(model_executor.tokenspeed_kernel, "moe_apply", fake_apply)
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.device = torch.device("cpu")
+    executor.drafter = SimpleNamespace(
+        draft_model_runner=SimpleNamespace(model=Draft())
+    )
+
+    executor._autotune_draft_experts(16)
+
+    assert [(c[0], c[1]) for c in calls] == [
+        ("draft.a", (16, 64)),
+        ("draft.c", (16, 64)),
+    ]
+    for _, _, ids in calls:
+        assert ids.dtype == torch.int32
+        # Distinct ids per token: FlashInfer's permutation rejects repeats.
+        assert all(len(set(row.tolist())) == 3 for row in ids)
 
 
 def test_execute_idle_forward_passes_empty_engram_views(buffers):
@@ -852,7 +948,7 @@ def test_history_views_replay_after_batch_shrink_and_idle(buffers):
     if ib.device != "cuda":
         pytest.skip("CUDA graph buffer contract")
     states = {"a": _state([10, 11, 12], [])}
-    op = _op(states, ["a"], [1], [3], [0], [])
+    op = _op(states, ["a"], [1], [3], [0], [0], [])
     _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
     graph = torch.cuda.CUDAGraph()
     torch.cuda.synchronize()
@@ -860,7 +956,7 @@ def test_history_views_replay_after_batch_shrink_and_idle(buffers):
         history = ib.ngram_model_kwargs(4)["engram_previous_tokens"].clone()
         mask = ib.ngram_model_kwargs(4)["engram_token_mask"].clone()
     states["b"] = _state([20, 21], [])
-    op = _op(states, ["b"], [1], [1], [1], [])
+    op = _op(states, ["b"], [1], [1], [1], [0], [])
     _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
     graph.replay()
     assert history.tolist() == [[20, -1, -1]] + [[-1] * 3] * 3
@@ -873,7 +969,7 @@ def test_history_views_replay_after_batch_shrink_and_idle(buffers):
 
 def test_dispatch_owns_snapshot_until_forward_thread_consumes_it():
     states = {"a": _state([1, 2, 3], [])}
-    op = _op(states, ["a"], [1], [1], [], [-1])
+    op = _op(states, ["a"], [1], [1], [], [], [-1])
     snapshot = ngram_inputs_for_forward(op, states, 3)
     submitted, consumed = [], []
 

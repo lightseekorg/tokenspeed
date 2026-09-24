@@ -29,6 +29,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "utils.h"
 
@@ -44,12 +45,13 @@ class AdmissionPlanner {
 public:
     AdmissionPlanner(const std::vector<CacheGroup>& groups, std::span<const GroupGeometry> geometry,
                      const BlockPool& pool, std::span<const GroupDemand> demands,
-                     const CacheCoordinator::PrefixProbe& prefix,
+                     std::optional<std::int32_t> num_computed_tokens, const CacheCoordinator::PrefixProbe& prefix,
                      std::vector<std::pair<std::uint32_t, CacheBlockLocation>>& victims)
         : groups_{groups},
           geometry_{geometry},
           pool_{pool},
           demands_{demands},
+          num_computed_tokens_{num_computed_tokens},
           prefix_{prefix},
           victims_{victims},
           local_free_slots_(groups.size()),
@@ -193,13 +195,23 @@ private:
             protected_locations_.insert(hits.begin(), hits.end());
         }
 
+        if (num_computed_tokens_) {
+            collectRequestReclaimCandidates(*num_computed_tokens_);
+        }
+
+        cache_group_candidates_.reserve(groups_.size());
         for (std::size_t i = 0; i < groups_.size(); ++i) {
-            if (demands_[i].num_computed_tokens < 0) {
-                continue;
-            }
+            cache_group_candidates_.emplace_back(static_cast<std::uint32_t>(i));
+        }
+    }
+
+    // The request's own slots that its retention has expired at this
+    // progress. They are still pinned by the table here; Admit publishes and
+    // reclaims them before it evicts, so they can fund this same admission.
+    void collectRequestReclaimCandidates(std::int32_t num_computed_tokens) {
+        for (std::size_t i = 0; i < groups_.size(); ++i) {
             const std::uint32_t group_id = static_cast<std::uint32_t>(i);
-            const std::int32_t expired_blocks =
-                geometry_[i].ExpiredBlocksAt(groups_[i].Spec(), demands_[i].num_computed_tokens);
+            const std::int32_t expired_blocks = geometry_[i].ExpiredBlocksAt(groups_[i].Spec(), num_computed_tokens);
             for (CacheBlockLocation location : groups_[i].Allocator().ReclaimableBlockLocationsAt(
                      groups_[i].Index(), *demands_[i].table, expired_blocks)) {
                 if (protected_locations_.contains(location)) {
@@ -214,11 +226,6 @@ private:
             }
         }
         std::ranges::sort(request_reclaim_candidates_, shouldEvictFirst);
-
-        cache_group_candidates_.reserve(groups_.size());
-        for (std::size_t i = 0; i < groups_.size(); ++i) {
-            cache_group_candidates_.emplace_back(static_cast<std::uint32_t>(i));
-        }
     }
 
     bool ensureGroupCandidateAvailable(CacheGroupVictimCandidates& group) {
@@ -328,6 +335,7 @@ private:
     std::span<const GroupGeometry> geometry_;
     const BlockPool& pool_;
     std::span<const GroupDemand> demands_;
+    std::optional<std::int32_t> num_computed_tokens_;
     const CacheCoordinator::PrefixProbe& prefix_;
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>>& victims_;
     std::unordered_map<std::int32_t, std::int32_t> remaining_occupied_;
@@ -344,12 +352,12 @@ private:
 
 std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups,
                                            std::span<const GroupGeometry> geometry, const BlockPool& pool,
-                                           CacheCoordinator::PrefixProbe&& prefix,
-                                           std::span<const GroupDemand> demands) {
+                                           CacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands,
+                                           std::optional<std::int32_t> num_computed_tokens) {
     _assert(demands.size() == groups.size(), "demands/groups size mismatch");
 
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
-    AdmissionPlanner planner{groups, geometry, pool, demands, prefix, victims};
+    AdmissionPlanner planner{groups, geometry, pool, demands, num_computed_tokens, prefix, victims};
     if (!planner.Plan()) {
         return std::nullopt;
     }
@@ -366,20 +374,44 @@ std::int32_t CacheCoordinator::PromotionBoundaryTokens(const PrefixProbe& prefix
 }
 
 std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
-    PrefixProbe&& prefix, std::span<const GroupDemand> demands, std::optional<std::uint64_t> request_access_epoch) {
+    PrefixProbe&& prefix, std::span<const GroupDemand> demands, const RequestProgress& progress,
+    std::optional<std::uint64_t> request_access_epoch) {
     _assert(demands.size() == groups_.size(), "demands/groups size mismatch");
     for (const GroupDemand& demand : demands) {
         _assert(demand.table != nullptr, "group demand requires a block table");
-        _assert(demand.new_prefix_hash_begin >= 0 &&
-                    static_cast<std::size_t>(demand.new_prefix_hash_begin) <= demand.prefix_hashes.size(),
-                "new page hash begin is outside the hash history");
-        const bool has_new_prefix_hashes =
-            static_cast<std::size_t>(demand.new_prefix_hash_begin) < demand.prefix_hashes.size();
-        _assert(demand.completed_boundary_kind.has_value() == has_new_prefix_hashes,
-                "completed boundary kind must match newly completed page hashes");
+    }
+    validateProgress(progress);
+
+    // A replayable group claims no hit pages, so before a hit its table is
+    // empty: materialize it as a sparse private suffix from the replay
+    // window's first token -- the slots below stay null holes, as
+    // absolute-slot tables require -- and the model regenerates the rows.
+    // Closed groups keep their dense demand beyond the hit. A demand that
+    // already names a sparse suffix is a remote landing (the peer's retained
+    // tail) and is left alone: nothing is regenerated here.
+    std::vector<GroupDemand> replayed;
+    const std::int32_t hit_tokens = std::max(prefix.device.num_common_tokens, prefix.host.num_common_tokens);
+    if (replay_window_tokens_ > 0 && hit_tokens > 0) {
+        const std::int32_t replay_begin = hit_tokens - ReplayTokens(hit_tokens);
+        replayed.assign(demands.begin(), demands.end());
+        for (std::size_t i = 0; i < replayed.size(); ++i) {
+            const auto* dense = std::get_if<DenseGrowth>(&replayed[i].extent);
+            if (!GroupIsReplayable(static_cast<std::int32_t>(i)) || dense == nullptr) {
+                continue;
+            }
+            _assert(replayed[i].table->NumBlocks() == 0, "a replayable group holds no hit pages at admission");
+            // The dense growth was relative to an empty table, so the hit plus
+            // the growth is the absolute extent.
+            replayed[i].extent = SparseSuffix{
+                .extent_tokens = hit_tokens + dense->num_tokens,
+                .first_block = replay_begin / geometry_[i].BlockGranularity(),
+            };
+        }
+        demands = replayed;
     }
 
-    std::optional<AdmissionPlan> candidate = planAdmission(groups_, geometry_, pool_, std::move(prefix), demands);
+    std::optional<AdmissionPlan> candidate =
+        planAdmission(groups_, geometry_, pool_, std::move(prefix), demands, progress.num_computed_tokens);
     if (!candidate) {
         return std::nullopt;
     }
@@ -391,6 +423,10 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     }
     const std::uint64_t access_epoch = request_access_epoch.has_value() ? *request_access_epoch : ++next_access_epoch_;
     const std::int32_t promotion_boundary_tokens = PromotionBoundaryTokens(plan.prefix);
+    std::vector<std::vector<CacheKey>> group_keys;
+    if (enable_l3_storage_) {
+        group_keys = plan.prefix.group_keys;
+    }
     AcquiredPrefix acquired_prefix = acquirePrefix(std::move(plan.prefix), access_epoch);
     AdmissionResult result{
         .device_prefix_tokens = acquired_prefix.device.num_common_tokens,
@@ -416,13 +452,13 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         }
     }
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        const GroupDemand& demand = demands[i];
-        if (demand.completed_boundary_kind) {
-            cacheDeviceCompletedBlocksForGroup(i, demand, access_epoch);
+        BlockTable& table = *demands[i].table;
+        if (progress.completed_pages) {
+            cacheDeviceCompletedBlocksForGroup(i, table, *progress.completed_pages, access_epoch);
         }
-        if (demand.num_computed_tokens >= 0) {
+        if (progress.num_computed_tokens) {
             groups_[i].Allocator().ReclaimExpired(
-                pool_, *demand.table, geometry_[i].ExpiredBlocksAt(groups_[i].Spec(), demand.num_computed_tokens));
+                pool_, table, geometry_[i].ExpiredBlocksAt(groups_[i].Spec(), *progress.num_computed_tokens));
         }
     }
     for (const auto& [group_id, location] : prospective_victims) {
@@ -434,8 +470,44 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         const GroupDemand& demand = demands[i];
         if (!acquired_prefix.host.per_group.empty() && !acquired_prefix.host.per_group[i].blocks.empty()) {
-            groups_[i].Allocator().AppendHostExtension(
-                pool_, *demand.table, std::move(acquired_prefix.host.per_group[i].blocks), result.load_pairs);
+            PrefixMatch& host_match = acquired_prefix.host.per_group[i];
+            std::vector<std::uint8_t> prefetch_flags;
+            std::vector<CacheKey> host_keys;
+            if (enable_l3_storage_) {
+                const std::int32_t floor_pages =
+                    acquired_prefix.device.num_common_tokens / geometry_[i].BlockGranularity();
+                prefetch_flags.assign(host_match.blocks.size(), 0);
+                host_keys.resize(host_match.blocks.size());
+                for (std::size_t hit_index = 0; hit_index < host_match.blocks.size(); ++hit_index) {
+                    if (!host_match.blocks[hit_index]) {
+                        continue;
+                    }
+                    const std::size_t key_index = static_cast<std::size_t>(floor_pages) + hit_index;
+                    FatalCheck(key_index < group_keys[i].size(),
+                               "host prefix hit is outside the planned prefix key range");
+                    const CacheKey& key = group_keys[i][key_index];
+                    host_keys[hit_index] = key;
+                    prefetch_flags[hit_index] =
+                        groups_[i].Index().Contains(*host_pool_, host_match.blocks[hit_index]->Location()) ? 0 : 1;
+                }
+            }
+            const std::size_t pair_begin = result.load_pairs.size();
+            groups_[i].Allocator().AppendHostExtension(pool_, *demand.table, std::move(host_match.blocks),
+                                                       result.load_pairs);
+            if (enable_l3_storage_) {
+                std::size_t pair_index = pair_begin;
+                for (std::size_t hit_index = 0; hit_index < prefetch_flags.size(); ++hit_index) {
+                    if (host_keys[hit_index].content_hash.empty()) {
+                        continue;
+                    }
+                    if (pair_index >= result.load_pairs.size()) {
+                        break;
+                    }
+                    BlockTransfer& transfer = result.load_pairs[pair_index++];
+                    transfer.key = std::move(host_keys[hit_index]);
+                    transfer.prefetch_from_storage = prefetch_flags[hit_index] != 0;
+                }
+            }
         }
         const std::int32_t first_new_block = demand.table->NumBlocks();
         const bool acquired =

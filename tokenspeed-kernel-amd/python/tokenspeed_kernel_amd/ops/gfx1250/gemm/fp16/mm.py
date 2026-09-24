@@ -702,7 +702,13 @@ def _wmma_tdm_dense_largem_kernel(
     GROUP_M: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
 ):
-    """Dense BF16 CDNA5 TDM/WMMA GEMM for large aligned K3 prefixes."""
+    """Dense BF16 CDNA5 TDM/WMMA GEMM for large K3 projections.
+
+    M and N need not be multiples of the block shape. The TDM descriptors are
+    bounded by the M and N passed in, so a trailing partial tile loads only
+    the rows that exist, and the output store is masked against the same
+    bounds, so whatever fills the rest of the tile cannot reach memory.
+    """
     gl.static_assert(BLOCK_K == 128, "large-M path is tuned for 128-wide K tiles")
     gl.static_assert(NUM_BUFFERS == 2, "large-M path uses a double-buffer TDM pipeline")
 
@@ -806,7 +812,11 @@ def gluon_mm_a16w16_largem_gfx1250(
     *,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run K3 BF16 projections with CDNA5 WMMA prefixes and vendor tails."""
+    """Run K3 BF16 projections on a single CDNA5 WMMA kernel.
+
+    The kernel covers the whole output, including ragged M and N edges, which
+    it masks rather than having the caller peel them off into vendor calls.
+    """
 
     if A.ndim != 2 or B.ndim != 2 or A.shape[1] != B.shape[1]:
         raise ValueError("gfx1250 large-M projection expects A [M,K], B [N,K]")
@@ -847,43 +857,39 @@ def gluon_mm_a16w16_largem_gfx1250(
         )
 
     block_m = 128 if m < _LARGEM_BLOCK_M_CROSSOVER else 256
-    tiled_n = n - n % 32
+    # Only the block shape has to divide evenly here. Ragged M and N edges are
+    # handled inside the kernel: its TDM descriptors are bounded by the real
+    # M and N, so the trailing partial tiles load only the rows that exist,
+    # and its stores are masked against the same bounds. Peeling those edges
+    # off into vendor calls would cost a second full pass over A plus, for a
+    # ragged N, a scratch buffer and a copy of the whole result.
     block_n = next(
-        candidate for candidate in (block_m, 128, 64, 32) if tiled_n % candidate == 0
+        candidate
+        for candidate in (block_m, 128, 64, 32)
+        if (n - n % 32) % candidate == 0
     )
-    tiled_m = m - m % block_m
-    prefix_out = out if tiled_n == n else A.new_empty((m, tiled_n))
-    if tiled_m > 0 and tiled_n > 0:
-        a_prefix = A[:tiled_m]
-        b_prefix = B[:tiled_n]
-        out_prefix = prefix_out[:tiled_m]
-        grid = (tiled_m // block_m) * (tiled_n // block_n)
-        _wmma_tdm_dense_largem_kernel[(grid,)](
-            a_prefix,
-            b_prefix,
-            out_prefix,
-            a_prefix.stride(0),
-            a_prefix.stride(1),
-            b_prefix.stride(0),
-            b_prefix.stride(1),
-            out_prefix.stride(0),
-            out_prefix.stride(1),
-            tiled_m,
-            tiled_n,
-            k,
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            BLOCK_K=128,
-            GROUP_M=8,
-            NUM_BUFFERS=2,
-            num_warps=4,
-            num_stages=1,
-        )
-    if tiled_m != m:
-        torch.mm(A[tiled_m:], B[:tiled_n].T, out=prefix_out[tiled_m:])
-    if tiled_n != n:
-        out[:, :tiled_n].copy_(prefix_out)
-        out[:, tiled_n:].copy_(torch.nn.functional.linear(A, B[tiled_n:]))
+    grid = triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
+    _wmma_tdm_dense_largem_kernel[(grid,)](
+        A,
+        B,
+        out,
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(1),
+        out.stride(0),
+        out.stride(1),
+        m,
+        n,
+        k,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=128,
+        GROUP_M=8,
+        NUM_BUFFERS=2,
+        num_warps=4,
+        num_stages=1,
+    )
     return out
 
 

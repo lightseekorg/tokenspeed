@@ -20,10 +20,12 @@ on:
         type: choice
         options:
           - all
+          - test/ci/eval/deepseek-v4.1-flash-evalscope-gsm8k-amd.yaml
+          - test/ci/eval/deepseek-v4.1-flash-evalscope-gsm8k.yaml
           - test/ci/eval/deepseek-v4-flash-evalscope-gsm8k.yaml
+          - test/ci/eval/deepseek-v4-flash-dcp4-mtp-evalscope-gsm8k.yaml
           - test/ci/eval/deepseek-v4-flash-mtp-evalscope-gsm8k-amd.yaml
           - test/ci/eval/deepseek-v4-flash-mtp-evalscope-gsm8k.yaml
-          - test/ci/eval/deepseek-v4-pro-evalscope-gsm8k-amd.yaml
           - test/ci/eval/glm-5.2-nvfp4-mtp-evalscope-aime26.yaml
           - test/ci/eval/glm-5.3-flash-fp8-mtp-evalscope-aime26.yaml
           - test/ci/eval/glm-5.3-flash-fp8-mtp-evalscope-aime26-amd.yaml
@@ -48,17 +50,17 @@ on:
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-dp4ep4-evalscope-aime25.yaml
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-evalscope-aime25.yaml
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-pd-1p1d-evalscope-aime25.yaml
-          - test/ci/eval/qwen3.5-397b-a17b-mxfp4-evalscope-aime25.yaml
           - test/ci/eval/qwen3.8-flash-next-fp8-evalscope-gsm8k.yaml
           - test/ci/perf/gpt-oss-120b-mxfp4-evalscope-mi355.yaml
           - test/ci/perf/kernel-benchmark-amd-gfx950.yaml
           - test/ci/perf/kimi-k2.5-nvfp4-evalscope-agentic.yaml
-          - test/ci/perf/kimi-k3-eagle3-mxfp4-tp8ep8-evalscope-random-4k-1k-mi35x.yaml
+          - test/ci/perf/kimi-k3-eagle3-mxfp4-tp8ep1-evalscope-random-50k-500-mi35x.yaml
           - test/ci/perf/kimi-k3-mxfp4-tp8ep8-evalscope-random-4k-1k-mi35x.yaml
           - test/ci/perf/kimi-k3-mxfp4-tp8ep1-evalscope-random-4k-1k-mi35x.yaml
           - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic-b200-8gpu.yaml
           - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic.yaml
           - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-longctx.yaml
+          - test/ci/ut/deepseek-v4.1-flash-pd-1p1d.yaml
           - test/ci/ut/qwen3.5-122b-a10b-nvfp4-epd-1e1p2d.yaml
           - test/ci/ut/qwen3.5-397b-a17b-nvfp4-pd-1p1d.yaml
           - test/ci/ut/ut-runtime-1gpu.yaml

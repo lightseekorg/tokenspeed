@@ -28,6 +28,7 @@ class StreamFork:
         self.aux_stream = aux_stream
         self.fork_event = torch.cuda.Event() if aux_stream is not None else None
         self.join_event = torch.cuda.Event() if aux_stream is not None else None
+        self.checkpoint_event = torch.cuda.Event() if aux_stream is not None else None
         self._active = False
         self._overlap = True
         self._current: torch.cuda.Stream | None = None
@@ -53,10 +54,42 @@ class StreamFork:
             yield self
         finally:
             if self._active:
-                self.join_event.wait(self._current)
+                self.join()
                 self._active = False
                 self._overlap = True
                 self._current = None
+
+    def join(self):
+        """Order the main stream after the latest branch without closing the scope."""
+        if self._active:
+            self.join_event.wait(self._current)
+
+    def record_checkpoint(self):
+        """Mark an intermediate point inside a branch on the auxiliary stream.
+
+        There is one reusable checkpoint per fork. Record it before calling
+        join_checkpoint in each scope; later branch work is not part of it.
+        """
+        if self._active:
+            self.checkpoint_event.record(self.aux_stream)
+
+    def join_checkpoint(self):
+        """Order main after the recorded checkpoint, not the whole branch."""
+        if self._active:
+            self.checkpoint_event.wait(self._current)
+
+    @contextmanager
+    def branch_after_main(self):
+        """Continue auxiliary work after everything currently enqueued on main.
+
+        Re-record the fork event before creating the branch. Earlier branch
+        waits keep their original event generation, including under capture.
+        A subsequent join waits for this branch's new completion generation.
+        """
+        if self._active:
+            self.fork_event.record(self._current)
+        with self.branch():
+            yield
 
     @contextmanager
     def branch(self):

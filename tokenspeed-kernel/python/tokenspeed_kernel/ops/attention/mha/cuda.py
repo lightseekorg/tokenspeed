@@ -83,11 +83,11 @@ if platform.is_nvidia and platform.is_blackwell:
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": _FA4_BLACKWELL_PREFILL_HEAD_DIMS,
-            "sliding_window": frozenset({False, True}),
-            "support_sinks": frozenset({False}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
-            "support_logit_cap": frozenset({False}),
-            "support_skip_softmax": frozenset({False}),
+            "sinks": frozenset({False}),
+            "skip_softmax": frozenset({False}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def fa4_mha_prefill(
@@ -142,10 +142,10 @@ if platform.is_nvidia and platform.is_blackwell:
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "is_causal": frozenset({False, True}),
-            "sliding_window": frozenset({False, True}),
-            "support_sinks": frozenset({False}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
-            "support_logit_cap": frozenset({False}),
+            "sinks": frozenset({False}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def fa4_mha_extend_with_kvcache(
@@ -206,10 +206,10 @@ if platform.is_nvidia and platform.is_blackwell:
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
-            "sliding_window": frozenset({False, True}),
-            "support_sinks": frozenset({False}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
-            "support_logit_cap": frozenset({False}),
+            "sinks": frozenset({False}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def fa4_mha_decode_with_kvcache(
@@ -273,10 +273,10 @@ if platform.is_nvidia and platform.is_blackwell:
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "is_causal": frozenset({False, True}),
-            "sliding_window": frozenset({False, True}),
-            "support_sinks": frozenset({False}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
-            "support_logit_cap": frozenset({False}),
+            "sinks": frozenset({False}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def fa4_mha_extend_with_kvcache_fp8(
@@ -332,10 +332,10 @@ if platform.is_nvidia and platform.is_blackwell:
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
-            "sliding_window": frozenset({False, True}),
-            "support_sinks": frozenset({False}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
-            "support_logit_cap": frozenset({False}),
+            "sinks": frozenset({False}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def fa4_mha_decode_with_kvcache_fp8(
@@ -411,10 +411,10 @@ if platform.is_nvidia and platform.is_blackwell:
             traits={
                 "head_dim": frozenset({128}),
                 "page_size": frozenset({128}),
-                "sliding_window": frozenset({False, True}),
-                "support_sinks": frozenset({False}),
+                "logit_cap": frozenset({False}),
                 "return_lse": frozenset({False}),
-                "support_logit_cap": frozenset({False}),
+                "sinks": frozenset({False}),
+                "sliding_window": frozenset({False, True}),
             },
         )
         def fa4_mha_decode_with_kvcache_mxfp8(
@@ -479,10 +479,10 @@ if platform.is_nvidia and platform.is_blackwell:
                 "head_dim": frozenset({128}),
                 "page_size": frozenset({128}),
                 "is_causal": frozenset({True}),
-                "sliding_window": frozenset({False, True}),
-                "support_sinks": frozenset({False}),
+                "logit_cap": frozenset({False}),
                 "return_lse": frozenset({False}),
-                "support_logit_cap": frozenset({False}),
+                "sinks": frozenset({False}),
+                "sliding_window": frozenset({False, True}),
             },
         )
         def fa4_mha_extend_with_kvcache_mxfp8(
@@ -552,11 +552,11 @@ elif platform.is_nvidia and platform.is_hopper:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "sliding_window": frozenset({False, True}),
-            "support_sinks": frozenset({False, True}),
-            "support_logit_cap": frozenset({False, True}),
+            "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
-            "support_skip_softmax": frozenset({False}),
+            "sinks": frozenset({False, True}),
+            "skip_softmax": frozenset({False}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def fa3_mha_prefill(
@@ -610,10 +610,10 @@ elif platform.is_nvidia and platform.is_hopper:
         priority=Priority.SPECIALIZED,
         traits={
             "is_causal": frozenset({False, True}),
-            "sliding_window": frozenset({False, True}),
-            "support_sinks": frozenset({False, True}),
-            "support_logit_cap": frozenset({False, True}),
+            "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
+            "sinks": frozenset({False, True}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def fa3_mha_extend_with_kvcache(
@@ -672,10 +672,10 @@ elif platform.is_nvidia and platform.is_hopper:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "sliding_window": frozenset({False, True}),
-            "support_sinks": frozenset({False, True}),
-            "support_logit_cap": frozenset({False, True}),
+            "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
+            "sinks": frozenset({False, True}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def fa3_mha_decode_with_kvcache(

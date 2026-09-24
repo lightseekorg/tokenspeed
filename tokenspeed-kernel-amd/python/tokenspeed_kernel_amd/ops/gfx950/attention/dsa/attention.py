@@ -27,8 +27,8 @@ from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import select_kv_splits
 
 __all__ = [
-    "gluon_dsa_decode_gfx950",
-    "gluon_dsa_prefill_gfx950",
+    "launch_gluon_dsa_decode_gfx950",
+    "launch_gluon_dsa_prefill_gfx950",
 ]
 
 _REGISTERED_TOPK_WIDTHS = (512, 1024, 2048, 2049, 2050, 2051)
@@ -464,7 +464,6 @@ def _dsa_dense_mfma_kv_kernel(
                 other=0.0,
             ).to(smem_dtype)
             smem_krope.index(0).store(k_rope)
-        gl.barrier()
     else:
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             dest=smem_klora.index(0),
@@ -554,7 +553,6 @@ def _dsa_dense_mfma_kv_kernel(
                     other=0.0,
                 ).to(smem_dtype)
                 smem_krope.index(next_buf).store(k_rope_next)
-            gl.barrier()
         else:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
                 dest=smem_klora.index(next_buf),
@@ -611,8 +609,6 @@ def _dsa_dense_mfma_kv_kernel(
         l_i = l_new
         cur_buf = next_buf
         valid_mma = valid_mma_next
-        if FP8_INPUTS:
-            gl.barrier()
 
     if not FP8_INPUTS:
         gl.amd.cdna4.async_copy.wait_group(0)
@@ -1392,7 +1388,7 @@ def _run_dsa(
     return out
 
 
-def gluon_dsa_decode_gfx950(
+def launch_gluon_dsa_decode_gfx950(
     q: torch.Tensor,
     kv_cache: torch.Tensor | None,
     sparse_kv_cache: torch.Tensor | None,
@@ -1431,7 +1427,7 @@ def gluon_dsa_decode_gfx950(
     )
 
 
-def gluon_dsa_prefill_gfx950(
+def launch_gluon_dsa_prefill_gfx950(
     q: torch.Tensor,
     kv_cache: torch.Tensor | None,
     sparse_kv_cache: torch.Tensor | None,

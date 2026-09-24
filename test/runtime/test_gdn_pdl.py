@@ -49,7 +49,7 @@ sys.path.insert(0, _TEST_DIR)
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
 from ci_system.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=90, suite="runtime-1gpu")
+register_cuda_ci(est_time=180, suite="runtime-1gpu")
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_hopper_plus, reason="PDL requires NVIDIA SM90+"
@@ -121,16 +121,53 @@ def restore_pdl():
         pdl_enabled(previous)
 
 
+@pytest.fixture
+def forbid_cake_backend(request, monkeypatch):
+    if request.node.callspec.params["solution"] != "flashinfer":
+        yield
+        return
+
+    decode = pytest.importorskip("flashinfer.gdn_decode")
+    prefill = pytest.importorskip("flashinfer.gdn_prefill")
+    from tokenspeed_kernel.ops.attention.gdn._flashinfer import adapter
+
+    def unexpected_cake(*args, **kwargs):
+        pytest.fail("GDN must retain the CuTe implementation wrapped for PDL")
+
+    runners = (adapter._decode_runner, adapter._prefill_runner)
+    for runner in runners:
+        runner.cache_clear()
+    monkeypatch.setattr(decode, "_run_cake_gdn_decode_pretranspose", unexpected_cake)
+    monkeypatch.setattr(prefill, "_run_cake_gdn_prefill", unexpected_cake)
+    try:
+        yield
+    finally:
+        # Private namespaces copied the patched globals; never retain them.
+        for runner in runners:
+            runner.cache_clear()
+
+
 @pytest.mark.parametrize("batch", [1, 8])
 @pytest.mark.parametrize("steps", [1, 4])
 @pytest.mark.parametrize("solution", ["triton", "flashinfer"])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-def test_gdn_chain_pdl_toggle(batch, steps, solution, state_dtype, restore_pdl):
+@pytest.mark.parametrize("heads,value_heads", [(4, 12), (4, 8)])
+def test_gdn_chain_pdl_toggle(
+    batch,
+    steps,
+    solution,
+    state_dtype,
+    heads,
+    value_heads,
+    restore_pdl,
+    forbid_cake_backend,
+):
     if solution == "flashinfer" and not flashinfer_gdn.is_decode_available():
         pytest.skip("FlashInfer GDN unavailable")
     torch.manual_seed(31)
-    # TP4 Qwen3.8 uses 4 QK / 12 V heads; MTP with 3 draft steps verifies T=4.
-    heads, value_heads, dim = 4, 12, 128
+    # TP4 Qwen3.8 uses 4 QK / 12 V heads; 4 / 8 also covers Cake-admitted
+    # head grouping. MTP with 3 draft steps verifies T=4.
+    dim = 128
     rows = batch * steps
     qkv_width = (2 * heads + value_heads) * dim
     qkvz_width = qkv_width + value_heads * dim
@@ -229,6 +266,7 @@ def test_gdn_chain_pdl_toggle(batch, steps, solution, state_dtype, restore_pdl):
             group_size=None,
             norm_before_gate=True,
             sigmoid_gate=False,
+            weights_independent=True,
         )
 
     # Return to false after true to exercise both upstream and private caches.
@@ -255,6 +293,7 @@ def test_gdn_chain_pdl_toggle(batch, steps, solution, state_dtype, restore_pdl):
             pdl_enabled(False)
             expected = forward().clone()
             expected_conv, expected_state = conv.clone(), state.clone()
+            projection.fill_(float("nan"))
             pdl_enabled(not enabled)
             graph.replay()
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -263,23 +302,31 @@ def test_gdn_chain_pdl_toggle(batch, steps, solution, state_dtype, restore_pdl):
 
 
 @pytest.mark.parametrize("solution", ["triton", "flashinfer"])
-def test_gdn_prefill_pdl_toggle(solution, restore_pdl):
+@pytest.mark.parametrize("heads,value_heads", [(4, 8), (16, 32), (16, 64)])
+def test_gdn_prefill_pdl_toggle(
+    solution, heads, value_heads, restore_pdl, forbid_cake_backend
+):
     if solution == "flashinfer" and not flashinfer_gdn.is_supported(
-        128, torch.bfloat16, 4, 8
+        128, torch.bfloat16, heads, value_heads
     ):
         pytest.skip("FlashInfer SM100 prefill unavailable")
     torch.manual_seed(41)
     q, k = [
-        torch.randn(1, 130, 4, 128, device="cuda", dtype=torch.bfloat16)
+        torch.randn(1, 130, heads, 128, device="cuda", dtype=torch.bfloat16)
         for _ in range(2)
     ]
-    v = torch.randn(1, 130, 8, 128, device="cuda", dtype=q.dtype)
-    gate = -torch.rand(1, 130, 8, device="cuda")
-    beta = torch.rand(1, 130, 8, device="cuda", dtype=q.dtype)
-    state = torch.randn(2, 8, 128, 128, device="cuda")
+    v = torch.randn(1, 130, value_heads, 128, device="cuda", dtype=q.dtype)
+    gate = -torch.rand(1, 130, value_heads, device="cuda")
+    beta = torch.rand(1, 130, value_heads, device="cuda", dtype=q.dtype)
+    state = torch.randn(2, value_heads, 128, 128, device="cuda")
     cu = torch.tensor([0, 65, 130], device="cuda", dtype=torch.int32)
 
+    query_source = q.clone()
+
     def forward():
+        _delayed_projection[(triton.cdiv(q.numel(), 1024),)](
+            query_source, q, N=q.numel(), BLOCK=1024, launch_pdl=True
+        )
         return gdn_chunk_prefill(
             q,
             k,
@@ -310,6 +357,12 @@ def test_gdn_prefill_pdl_toggle(solution, restore_pdl):
         with torch.cuda.graph(graph):
             result = forward()
         names, edges = _graph_kernel_edges(graph)
+        if solution == "flashinfer":
+            gdn_nodes = {name for name in names.values() if "gdn" in name.lower()}
+            assert gdn_nodes, names
+            gdn_edges = [edge for edge in edges if edge[1] in gdn_nodes]
+            assert gdn_edges, edges
+            assert all(edge_type == int(enabled) for _, _, edge_type in gdn_edges)
         custom = (
             "l2norm",
             "chunk_",
@@ -325,7 +378,7 @@ def test_gdn_prefill_pdl_toggle(solution, restore_pdl):
                 assert edge_type == int(enabled), (target, edges)
                 checked += 1
         assert checked >= 2, names
-        q.normal_()
+        query_source.normal_()
         k.normal_()
         v.normal_()
         pdl_enabled(False)
@@ -335,6 +388,51 @@ def test_gdn_prefill_pdl_toggle(solution, restore_pdl):
         torch.testing.assert_close(
             result.final_state, reference.final_state, rtol=0, atol=0
         )
+
+
+@pytest.mark.parametrize("weights_independent", [False, True])
+@pytest.mark.parametrize("weight_stride", [1, 2])
+@pytest.mark.parametrize("sigmoid_gate", [False, True])
+def test_gdn_norm_weight_readiness(
+    weights_independent, weight_stride, sigmoid_gate, restore_pdl
+):
+    torch.manual_seed(47)
+    dim = 128
+    source = torch.randn(3, dim * weight_stride, device="cuda", dtype=torch.bfloat16)
+    projection = torch.empty_like(source)
+    weights = (source if weights_independent else projection)[2, ::weight_stride]
+
+    def forward():
+        _delayed_projection[(1,)](
+            source,
+            projection,
+            N=source.numel(),
+            BLOCK=triton.next_power_of_2(source.numel()),
+            launch_pdl=True,
+        )
+        return rmsnorm_fn(
+            projection[0:1, :dim],
+            weights,
+            z=projection[1:2, :dim],
+            eps=1e-6,
+            group_size=None,
+            norm_before_gate=True,
+            sigmoid_gate=sigmoid_gate,
+            weights_independent=weights_independent,
+        )
+
+    pdl_enabled(True)
+    forward()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = forward()
+    for _ in range(3):
+        source.normal_()
+        pdl_enabled(False)
+        expected = forward().clone()
+        projection.fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

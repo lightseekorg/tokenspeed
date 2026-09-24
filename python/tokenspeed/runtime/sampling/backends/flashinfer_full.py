@@ -171,16 +171,12 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
                 f"logit_bias contains out-of-vocab token id(s); "
                 f"vocab_size={vocab}, offending={[t for t in raw_ids if not 0 <= t < vocab]}"
             )
-            token_ids = torch.tensor(
-                raw_ids,
-                device=self._logit_bias.device,
-                dtype=torch.long,
+            token_ids = torch.tensor(raw_ids, dtype=torch.long, pin_memory=True).to(
+                self._logit_bias.device, non_blocking=True
             )
             bias_values = torch.tensor(
-                list(bias_map.values()),
-                device=self._logit_bias.device,
-                dtype=torch.bfloat16,
-            )
+                list(bias_map.values()), dtype=torch.bfloat16, pin_memory=True
+            ).to(self._logit_bias.device, non_blocking=True)
             self._logit_bias[pool_idx, token_ids] = bias_values
 
     def reset_capture_state(self) -> None:
@@ -456,7 +452,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         # For fused top-k + top-p, the results are bit-identical across ranks.
         # So we don't need to broadcast the results.
         if not _FUSED_TOPK_TOPP_AVAILABLE:
-            self.maybe_broadcast(predict, accept_index, accept_length)
+            self.broadcast_verify_outputs()
 
         # Accumulate accepted tokens into counts. accept_index is [bs, N]
         # with -1 in unused slots; clamp to a safe index and mask with a

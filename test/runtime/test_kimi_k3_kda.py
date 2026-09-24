@@ -129,6 +129,7 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(
         num_real_tokens=num_tokens,
         lower_bound=-5.0,
         cu_seqlens_cpu=boundaries.to(torch.int64),
+        inputs_packed=False,
     )
     assert captured["initial_state"] is stored
     assert captured["cu_seqlens"] is scan_boundaries
@@ -167,6 +168,7 @@ def _backend(device: str, *, contract_pool, spec_tokens: int = 1) -> KdaAttnBack
     kda_backend = "auto" if current_platform().is_amd else "fla"
     backend = KdaAttnBackend(
         *_backend_config(device, spec_tokens=spec_tokens),
+        enable_prefill_graph=False,
         kda_backend=kda_backend,
     )
     backend.set_kv_pool(contract_pool)
@@ -184,6 +186,7 @@ def _stub_contract(*, prefix_granularity: int, usable_pages: int):
                 rows_per_page=prefix_granularity,
                 entry_stride_tokens=1,
                 sliding_window_tokens=None,
+                replayable=False,
             )
             if group_id == "full_attention"
             else CacheGroupSpec(
@@ -192,6 +195,7 @@ def _stub_contract(*, prefix_granularity: int, usable_pages: int):
                 sliding_window_tokens=None,
                 family="state",
                 checkpoint_granularity=prefix_granularity,
+                replayable=False,
             )
         )
         for group_id in group_ids
@@ -558,6 +562,8 @@ class _KDAHarness:
             extend_seq_lens_cpu=new_cpu,
             extend_prefix_lens=prefix_cpu.to(self.device),
             extend_prefix_lens_cpu=prefix_cpu,
+            extend_replay_lens_cpu=torch.zeros_like(prefix_cpu),
+            extend_prompt_lens_cpu=prefix_cpu + new_cpu,
             extend_with_prefix=bool(prefix_cpu.any()),
         )
 
@@ -588,6 +594,7 @@ class _KDAHarness:
             bs=bs,
             forward_mode=ForwardMode.EXTEND,
             mixed_qkv=mixed.clone(),
+            save_kv_cache=True,
             g_raw=g_raw,
             beta_raw=beta_raw,
             seq_len=seq_len,

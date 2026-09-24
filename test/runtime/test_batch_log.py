@@ -32,6 +32,9 @@ from tokenspeed.runtime.engine.batch_log import BatchLogger
 
 STATS = {"num_active_pages": 40, "num_cached_pages": 15, "num_queue_reqs": 7}
 
+# Request "r<i>" holds 100 + i tokens, so a bs-2 decode round averages 100.5.
+CONTEXT_LENGTHS = {f"r{i}": 100 + i for i in range(8)}
+
 
 def _logger(**overrides) -> BatchLogger:
     kwargs = dict(
@@ -40,6 +43,9 @@ def _logger(**overrides) -> BatchLogger:
         num_total_pages=100,
         spec_num_steps=0,
         spec_num_tokens=0,
+        dp_rank=2,
+        pd_lifecycle=None,
+        context_length=CONTEXT_LENGTHS.__getitem__,
     )
     kwargs.update(overrides)
     return BatchLogger(**kwargs)
@@ -73,8 +79,16 @@ def test_extend_round_counts_cached_tokens_once_per_request():
         # cached-token news a second time.
         logger.log_dispatch(op, STATS)
 
-    assert log.call_args_list[0].args[1:] == ("Prefill", 2, 30, 10, 2, 7)
-    assert log.call_args_list[1].args[1:] == ("Prefill", 2, 30, 0, 2, 7)
+    assert log.call_args_list == [
+        mock.call(
+            "Prefill batch. #dp-rank: 2, #new-seq: 2, #new-token: 30, #cached-token: 10, "
+            "#running-req: 2, #queue-req: 7"
+        ),
+        mock.call(
+            "Prefill batch. #dp-rank: 2, #new-seq: 2, #new-token: 30, #cached-token: 0, "
+            "#running-req: 2, #queue-req: 7"
+        ),
+    ]
 
 
 def test_mixed_round_is_labelled_mix():
@@ -84,13 +98,18 @@ def test_mixed_round_is_labelled_mix():
     with mock.patch.object(batch_log_module.logger, "info") as log:
         logger.log_dispatch(op, STATS)
 
-    assert log.call_args.args[1] == "Mix"
+    log.assert_called_once_with(
+        "Mix batch. #dp-rank: 2, #new-seq: 1, #new-token: 12, #cached-token: 4, "
+        "#running-req: 3, #queue-req: 7"
+    )
 
 
 def test_decode_rounds_log_once_per_interval_with_committed_throughput():
-    logger = _logger(decode_log_interval=3)
-
-    with mock.patch.object(batch_log_module.logger, "info") as log:
+    with (
+        mock.patch.object(batch_log_module.time, "time", side_effect=[100.0, 102.0]),
+        mock.patch.object(batch_log_module.logger, "info") as log,
+    ):
+        logger = _logger(decode_log_interval=3)
         for _ in range(3):
             logger.record_decode(
                 SimpleNamespace(output_lengths=torch.tensor([2, 2])), 2
@@ -98,11 +117,33 @@ def test_decode_rounds_log_once_per_interval_with_committed_throughput():
             logger.log_dispatch(_decode_op(2), STATS)
 
     # Rounds 1 and 2 are throttled; round 3 prints the window.
-    log.assert_called_once()
-    args = log.call_args.args
-    assert args[1:5] == (2, 40, 15, 100)  # running-req, pages active/cached/total
-    assert args[5] == 0.4  # page ratio
-    assert args[6] > 0  # gen throughput over the window
+    log.assert_called_once_with(
+        "Decode batch. #dp-rank: 2, #running-req: 2, avg_seq_len: 100.5, "
+        "#pages(active/cached/total): 40/15/100, "
+        "page ratio: 0.40, gen throughput (token/s): 6.00, #queue-req: 7"
+    )
+
+
+def test_decode_context_lengths_are_read_only_when_a_line_is_emitted():
+    reads = []
+
+    def context_length(rid):
+        reads.append(rid)
+        return {"r0": 1000, "r1": 2000, "r2": 3000}[rid]
+
+    logger = _logger(spec_num_steps=3, context_length=context_length)
+    with mock.patch.object(batch_log_module.logger, "info") as log:
+        # Round 1 is throttled: no line, no per-request reads.
+        logger.log_dispatch(_decode_op(3), STATS)
+        assert reads == []
+        logger.log_dispatch(_decode_op(3), STATS)
+
+    assert reads == ["r0", "r1", "r2"]
+    assert log.call_args.args[0].startswith(
+        "Decode batch. #dp-rank: 2, #running-req: 3, avg_seq_len: 2000.0, "
+        "#pages(active/cached/total): 40/15/100, "
+    )
+    assert "avg_accept_len: 0.00" in log.call_args.args[0]
 
 
 def test_state_group_pages_ride_the_decode_line_at_debug():
@@ -125,8 +166,9 @@ def test_state_group_pages_ride_the_decode_line_at_debug():
             logger.log_dispatch(_decode_op(2), STATS)
 
     assert queried == ["state_a", "state_b"]
-    assert debug.call_args.args[1] == (
-        "state_a: used=6/10, available=4; state_b: used=0/8, available=8"
+    debug.assert_called_once_with(
+        "Cache state group pages. #dp-rank: 2, state_a: used=6/10, available=4; "
+        "state_b: used=0/8, available=8"
     )
 
 
@@ -167,9 +209,8 @@ def test_step_acceptance_log_separates_committed_and_draft_tokens():
         logger.record_decode(result, bs=3)
 
     log.assert_called_once_with(
-        "Spec verify step. accept_lengths=%s, accepted_draft_tokens=%s",
-        [1, 3, 8],
-        [0, 2, 7],
+        "Spec verify step. #dp-rank: 2, accept_lengths=[1, 3, 8], "
+        "accepted_draft_tokens=[0, 2, 7]",
     )
 
 
@@ -188,9 +229,53 @@ def test_step_token_log_aligns_drafts_with_predecessor_target_logits():
         logger.record_decode(result, bs=1)
 
     assert log.call_args_list[1] == mock.call(
-        "Spec token compare. anchor=%s, draft=%s, target=%s, match=%s",
-        [10],
-        [[11, 12, 13]],
-        [[11, 12, 99]],
-        [[True, True, False]],
+        "Spec token compare. #dp-rank: 2, anchor=[10], draft=[[11, 12, 13]], "
+        "target=[[11, 12, 99]], match=[[True, True, False]]",
+    )
+
+
+def test_pd_lifecycle_counts_are_read_only_when_a_line_is_emitted():
+    reads = []
+
+    def lifecycle():
+        reads.append(True)
+        return (3, 5, 4, 2, 4)
+
+    logger = _logger(pd_lifecycle=lifecycle)
+    with mock.patch.object(batch_log_module.logger, "info") as log:
+        # Decode rounds 1 and 2 are throttled: no line, no scheduler reads.
+        logger.log_dispatch(_decode_op(2), STATS)
+        assert reads == []
+        logger.log_dispatch(_decode_op(2), STATS)
+
+    assert len(reads) == 1
+    # #queue-req adds the 3 bootstrapping requests to the scheduler's 7
+    # waiting ones: on the prefill role they sit there until decode has
+    # allocated their KV pages, which is queueing to the operator.
+    assert log.call_args.args[0].endswith(
+        ", #queue-req: 10"
+        ", #req-state(bootstrap/prefill/remote-prefill/decode/pd-pinned): 3/5/4/2/4"
+    )
+
+
+def test_pd_prefill_line_queues_bootstrapping_requests():
+    logger = _logger(pd_lifecycle=lambda: (9, 1, 0, 0, 1))
+    with mock.patch.object(batch_log_module.logger, "info") as log:
+        logger.log_dispatch(_extend_op(["a"], 1, [10], [0]), STATS)
+
+    log.assert_called_once_with(
+        "Prefill batch. #dp-rank: 2, #new-seq: 1, #new-token: 10, "
+        "#cached-token: 0, #running-req: 1, #queue-req: 16"
+        ", #req-state(bootstrap/prefill/remote-prefill/decode/pd-pinned): 9/1/0/0/1"
+    )
+
+
+def test_a_fused_engine_appends_no_lifecycle_counts():
+    logger = _logger(pd_lifecycle=None)
+    with mock.patch.object(batch_log_module.logger, "info") as log:
+        logger.log_dispatch(_extend_op(["a"], 1, [10], [0]), STATS)
+
+    log.assert_called_once_with(
+        "Prefill batch. #dp-rank: 2, #new-seq: 1, #new-token: 10, "
+        "#cached-token: 0, #running-req: 1, #queue-req: 7"
     )

@@ -124,11 +124,11 @@ def test_compressor_tail_scatter_graph_strides_and_replay(device):
 def test_public_arguments_are_explicit():
     for name in dsv41.__all__:
         fn = getattr(dsv41, name)
-        assert fn.__doc__
-        assert all(
-            p.default is inspect.Parameter.empty
-            for p in inspect.signature(fn).parameters.values()
-        )
+        assert fn.__doc__, name
+        for parameter in inspect.signature(fn).parameters.values():
+            assert (
+                parameter.default is inspect.Parameter.empty
+            ), f"{name}.{parameter.name} must be explicit"
 
 
 @pytest.mark.parametrize("fmt", _LAYOUTS)
@@ -386,7 +386,7 @@ def test_index_scores_reference_rounding_per_head_relu_and_weights(
     out = torch.empty_like(expected)
     assert dsv41.index_score(q, weights, cache, slots, None, out) is out
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
-    quantized = dsv41.index_q_quantize(q, None)
+    quantized = dsv41.index_q_quantize(q, "index", None)
     torch.testing.assert_close(quantized, q_ref, rtol=0, atol=0)
 
 
@@ -413,7 +413,7 @@ def test_full_top512_and_block_candidates_boundaries(device, visible):
     dsv41.cache_scatter(k, cache, logical_slots, "index")
     lens = torch.tensor([visible], device=device)
     out = dsv41.index_topk(
-        q, weights, cache, table, lens, None, 512, 2048, 8, 1, 256, None, None
+        q, weights, cache, table, lens, None, 512, 2048, 8, 1, 256, None, None, None
     )
     selected, lengths, candidates, candidate_lens = out
     assert lengths.item() == min(512, visible)
@@ -476,6 +476,7 @@ def test_source_uses_block_max_not_top512_and_forces_latest(device):
         512,
         None,
         None,
+        None,
     )
     top, lens, candidates, candidate_lens = result
     assert lens.item() == 512 and candidate_lens.item() == 2048
@@ -498,7 +499,20 @@ def test_reindex_reads_only_candidate_rows_and_reapplies_causality(device):
     )
     with patch.object(implementation, "cache_gather", side_effect=AssertionError):
         top, lengths, blocks, block_lens = dsv41.index_topk(
-            q, weights, cache, table, visible, candidates, 512, 0, 8, 2, 16, None, None
+            q,
+            weights,
+            cache,
+            table,
+            visible,
+            candidates,
+            512,
+            0,
+            8,
+            2,
+            16,
+            None,
+            None,
+            None,
         )
     assert lengths.tolist() == [23, 8, 0]
     assert blocks.shape == (3, 0) and not block_lens.any()
@@ -508,6 +522,189 @@ def test_reindex_reads_only_candidate_rows_and_reapplies_causality(device):
     )
     torch.testing.assert_close(top[0, :23].long(), expected0, rtol=0, atol=0)
     assert (top[0, 23:] == -1).all() and (top[2] == -1).all()
+
+
+def test_index_topk_batch_without_any_visible_context(device):
+    # A padded warmup batch: 32 replicated heads, every visible length 0, every
+    # page null. Native scorers must not fault on a batch with no keys at all.
+    q = torch.randn((96, 32, 128), dtype=torch.bfloat16, device=device)
+    weights = torch.rand((96, 32), dtype=torch.bfloat16, device=device)
+    cache = torch.zeros((2, 64, 132), dtype=torch.uint8, device=device)
+    dsv41.cache_scatter(
+        torch.randn((128, 128), dtype=torch.bfloat16, device=device),
+        cache,
+        torch.arange(128, device=device),
+        "index_v4",
+    )
+    table = torch.full((96, 1025), -1, dtype=torch.int32, device=device)
+    visible = torch.zeros(96, dtype=torch.int32, device=device)
+    top, lengths, blocks, block_lens = dsv41.index_topk(
+        q, weights, cache, table, visible, None, 512, 64, 8, 64, 4096, None, None, None
+    )
+    torch.cuda.synchronize()
+    assert not lengths.any() and not block_lens.any()
+    assert (top == -1).all() and (blocks == -1).all()
+
+
+def _index_cache(k, fmt):
+    width = implementation._LAYOUTS[fmt][3]
+    cache = torch.zeros(
+        ((k.shape[0] + 63) // 64, 64, width), dtype=torch.uint8, device=k.device
+    )
+    dsv41.cache_scatter(k, cache, torch.arange(k.shape[0], device=k.device), fmt)
+    return cache
+
+
+@pytest.mark.parametrize("fmt", ["index", "index_v4"])
+@pytest.mark.parametrize("shared_table", [True, False])
+def test_index_topk_selects_top_scores_on_every_index_format(device, fmt, shared_table):
+    # 32 replicated heads, a paged history in reverse page order, mixed visible
+    # lengths: the shape every native scorer serves. A shared (stride-0) table
+    # is the chunked-prefill shape, a per-row table the decode shape; native
+    # scorers take different paths for the two. Whatever kernel the format
+    # routes to, each chosen row must score within rounding of the true top set,
+    # and the reindex pass must return exactly the candidate rows it was handed.
+    torch.manual_seed(47)
+    rows = 64 * 40
+    k = torch.randn((rows, 128), dtype=torch.bfloat16, device=device)
+    q = torch.randn((4, 32, 128), dtype=torch.bfloat16, device=device)
+    weights = torch.rand((4, 32), dtype=torch.bfloat16, device=device)
+    cache = _index_cache(k, fmt)
+    table = torch.arange(cache.shape[0] - 1, -1, -1, device=device).expand(4, -1)
+    if not shared_table:
+        table = table.contiguous()
+    visible = torch.tensor([rows, 1000, 513, 0], device=device)
+    logical = torch.arange(rows, device=device).expand(4, -1)
+    slots = table.gather(1, logical // 64) * 64 + logical % 64
+    slots = slots.masked_fill(logical >= visible[:, None], -1)
+    scores = dsv41.index_score(q, weights, cache, slots, None, None).float()
+
+    top, lengths, blocks, block_lens = dsv41.index_topk(
+        q, weights, cache, table, visible, None, 512, 64, 8, 64, 4096, None, None, None
+    )
+    torch.cuda.synchronize()
+    assert lengths.tolist() == [512, 512, 512, 0]
+    assert block_lens.tolist() == [64, 64, 64, 0]
+    tol = 2**-6 * scores[:, :].abs().amax()
+    for r in range(3):
+        chosen = top[r, : lengths[r]].long()
+        assert chosen.min() >= 0 and chosen.max() < visible[r]
+        threshold = scores[r, : visible[r]].topk(512).values.min()
+        assert (scores[r, chosen] >= threshold - tol).all()
+        block_max = (
+            torch.nn.functional.pad(
+                scores[r, : visible[r]], (0, -int(visible[r]) % 8), value=-torch.inf
+            )
+            .view(-1, 8)
+            .amax(-1)
+        )
+        picked = blocks[r, : block_lens[r]].long()
+        assert ((visible[r] - 1) // 8 == picked).any()
+        assert (block_max[picked] >= block_max.topk(64).values.min() - tol).all()
+    assert (top[3] == -1).all() and (blocks[3] == -1).all()
+
+    rerows, relengths, _, _ = dsv41.index_topk(
+        q,
+        weights,
+        cache,
+        table,
+        visible,
+        blocks,
+        512,
+        0,
+        8,
+        64,
+        4096,
+        None,
+        None,
+        None,
+    )
+    for r in range(3):
+        allowed = (
+            blocks[r, : block_lens[r]].long()[:, None] * 8
+            + torch.arange(8, device=device)
+        ).flatten()
+        allowed = allowed[allowed < visible[r]]
+        chosen = rerows[r, : relengths[r]].long()
+        assert relengths[r] == min(512, allowed.numel())
+        assert torch.isin(chosen, allowed).all()
+        threshold = scores[r, allowed].topk(int(relengths[r])).values.min()
+        assert (scores[r, chosen] >= threshold - tol).all()
+    assert relengths[3] == 0
+
+
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_index_query_quantization_matches_the_reference_codec(device, contiguous):
+    # The fused quantizer replaces a chain of eager ops, so it has to reproduce
+    # them bit for bit: the E4M3 payload decides which rows a pass scores, and
+    # the folded weight carries the query scale the logits kernels never apply.
+    # A head-major view is the shape a projection hands over before any copy.
+    torch.manual_seed(51)
+    q = torch.randn((5, 32, 128), dtype=torch.bfloat16, device=device)
+    weights = torch.rand((5, 32), dtype=torch.bfloat16, device=device)
+    if not contiguous:
+        q = q.transpose(0, 1).contiguous().transpose(0, 1)
+        assert not q.is_contiguous()
+    quantized, folded = implementation.quantize_index_queries(q, weights)
+
+    values = q.float()
+    scale = values.abs().amax(-1, keepdim=True).clamp_min(1.0e-6) / 448.0
+    expected = (values / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    torch.testing.assert_close(
+        quantized.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        folded, weights.float() * scale.squeeze(-1), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("fmt", ["index", "index_v4"])
+def test_reindex_maps_every_candidate_block_order_back_to_row_ids(device, fmt):
+    # A produced pool ascends, but the op accepts any block order with -1
+    # padding anywhere, and a scorer that compacts the history down to the pool
+    # must still report row ids rather than pool columns. Top-K capacity sits
+    # above the pool, so every visible candidate row comes back regardless of
+    # score, which pins the mapping itself on each format's scorer.
+    torch.manual_seed(46)
+    q = torch.randn((3, 32, 128), dtype=torch.bfloat16, device=device)
+    weights = torch.rand((3, 32), dtype=torch.bfloat16, device=device)
+    k = torch.randn((64 * 6, 128), dtype=torch.bfloat16, device=device)
+    cache = _index_cache(k, fmt)
+    table = torch.arange(cache.shape[0], device=device).expand(3, -1).contiguous()
+    visible = torch.tensor([263, 8, 0], device=device)
+    candidates = torch.tensor(
+        [[32, 0, -1, 17], [0, 1, -1, -1], [1, -1, -1, -1]],
+        dtype=torch.int32,
+        device=device,
+    )
+    top, lengths, blocks, block_lens = dsv41.index_topk(
+        q,
+        weights,
+        cache,
+        table,
+        visible,
+        candidates,
+        512,
+        0,
+        8,
+        64,
+        4096,
+        None,
+        None,
+        None,
+    )
+    torch.cuda.synchronize()
+    assert lengths.tolist() == [23, 8, 0]
+    assert blocks.shape == (3, 0) and not block_lens.any()
+    expected = torch.tensor(
+        list(range(8)) + list(range(136, 144)) + list(range(256, 263)), device=device
+    )
+    torch.testing.assert_close(top[0, :23].long(), expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        top[1, :8].long(), torch.arange(8, device=device), rtol=0, atol=0
+    )
+    assert (top[0, 23:] == -1).all() and (top[1, 8:] == -1).all()
+    assert (top[2] == -1).all()
 
 
 def test_candidate_block_max_not_sum(device):
@@ -530,6 +727,7 @@ def test_candidate_block_max_not_sum(device):
         8,
         1,
         8,
+        None,
         None,
         None,
     )
@@ -578,6 +776,7 @@ def test_full_tiles_causal_page_mask_and_output_reuse(device):
                 score_chunk,
                 None,
                 outputs,
+                None,
             )
         assert result is outputs
         for call in finish.call_args_list:
@@ -615,6 +814,7 @@ def test_reject_unbounded_candidate_input(device):
             8,
             1,
             64,
+            None,
             None,
             None,
         )
@@ -692,10 +892,12 @@ def test_optional_snapshot_quantization_oracle(device):
         )
 
 
-def test_fused_swa_matches_rope_quantization_and_page_bytes(device):
+@pytest.mark.parametrize("fmt", ["swa", "swa_v4"])
+def test_fused_swa_matches_rope_quantization_and_page_bytes(device, fmt):
     from tokenspeed_kernel.ops.attention.dsv41 import rope_inplace
 
     torch.manual_seed(419)
+    width = implementation._LAYOUTS[fmt][3]
     values = torch.randn(257, 512, device=device, dtype=torch.bfloat16)
     positions = torch.arange(257, device=device, dtype=torch.int64)
     angles = (
@@ -706,16 +908,63 @@ def test_fused_swa_matches_rope_quantization_and_page_bytes(device):
     rope = torch.cat((angles.cos(), angles.sin()), -1)
     slots = torch.arange(64, 321, device=device, dtype=torch.int32)
     slots[0] = -1
-    storage = torch.zeros((6, 64 * 528 + 512), device=device, dtype=torch.uint8)
-    cache = storage[:, : 64 * 528].view(6, 64, 528)
-    expected = storage.clone()[:, : 64 * 528].view(6, 64, 528)
+    storage = torch.zeros((6, 64 * width + 512), device=device, dtype=torch.uint8)
+    cache = storage[:, : 64 * width].view(6, 64, width)
+    expected = storage.clone()[:, : 64 * width].view(6, 64, width)
     rotated = rope_inplace(values.clone(), positions, rope, None)
-    dsv41.cache_scatter(rotated, expected, slots, "swa")
+    dsv41.cache_scatter(rotated, expected, slots, fmt)
     out = torch.empty_like(values)
-    dsv41.swa_rope_scatter(values, positions, rope, cache, slots, out)
-    reference = dsv41.cache_unpack(dsv41.cache_pack(rotated, "swa", None), "swa", None)
+    dsv41.swa_rope_scatter(values, positions, rope, cache, slots, fmt, out)
+    reference = dsv41.cache_unpack(dsv41.cache_pack(rotated, fmt, None), fmt, None)
     torch.testing.assert_close(out, reference, rtol=0, atol=0)
     torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fmt", ["swa_v4", "global_v4"])
+def test_v4_rows_quantize_head_and_carry_rope_tail_verbatim(device, fmt):
+    """The V4 row is three planes: E4M3 NoPE, BF16 RoPE, E8M0 scales with pad."""
+    dim, group, values, row_bytes, quantized = implementation._LAYOUTS[fmt]
+    scale_bytes = implementation._scale_bytes(fmt)
+    assert (dim, group, quantized, row_bytes) == (512, 64, 448, 584)
+    assert values + (dim - quantized) * 2 + scale_bytes == row_bytes
+
+    torch.manual_seed(41)
+    rows = 137
+    x = (torch.randn(rows, dim, device=device, dtype=torch.bfloat16) * 0.7).float()
+    x[0].zero_()
+    x[1, :quantized] = 1e-6
+    cache = torch.zeros(
+        ((rows + 63) // 64, 64, row_bytes), dtype=torch.uint8, device=device
+    )
+    slots = torch.arange(rows, device=device, dtype=torch.int32)
+    dsv41.cache_scatter(x.to(torch.bfloat16), cache, slots, fmt)
+    got = dsv41.cache_gather(cache, slots, fmt, None).float()
+
+    # Independent E8M0-per-group oracle for the head; the tail is not quantized.
+    head = x[:, :quantized].reshape(rows, -1, group)
+    amax = head.abs().amax(dim=-1).clamp_min(1e-4) / 448.0
+    bits = amax.view(torch.int32)
+    exponent = ((bits >> 23) & 255) - 127 + ((bits & 0x7FFFFF) != 0).int()
+    scale = torch.exp2(exponent.float()).unsqueeze(-1)
+    quant = (head / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    torch.testing.assert_close(
+        got[:, :quantized], (quant.float() * scale).reshape(rows, quantized)
+    )
+    torch.testing.assert_close(
+        got[:, quantized:], x[:, quantized:].to(torch.bfloat16).float(), rtol=0, atol=0
+    )
+
+    # Planes are page-planar, so the scale plane starts at a flat page offset.
+    flat = cache[0].reshape(-1)
+    plane = 64 * (values + (dim - quantized) * 2)
+    used = quantized // group
+    pad = torch.stack(
+        [
+            flat[plane + row * scale_bytes + used : plane + (row + 1) * scale_bytes]
+            for row in range(64)
+        ]
+    )
+    assert int(pad.ne(0).sum()) == 0
 
 
 def test_compressor_fused_norm_preserves_pooled_bf16_boundary(device):
@@ -730,6 +979,14 @@ def test_compressor_fused_norm_preserves_pooled_bf16_boundary(device):
     raw = dsv41.compressor_pool(
         content, scores, previous, tail, slots, active, None, None, 0.0
     )
+    maximum = torch.maximum(scores[previous], scores)
+    old_exp = torch.exp(scores[previous] - maximum)
+    new_exp = torch.exp(scores - maximum)
+    expected_raw = (content[previous] * old_exp + content * new_exp) / (
+        old_exp + new_exp
+    )
+    expected_raw[~active] = 0
+    torch.testing.assert_close(raw, expected_raw, rtol=1e-6, atol=1e-6)
     rounded = raw.bfloat16().float()
     expected = (
         rounded
@@ -750,13 +1007,23 @@ def _native_available():
 
     return (
         torch.cuda.is_available()
-        and torch.cuda.get_device_capability()[0] == 10
+        and torch.cuda.get_device_capability()[0] >= 9
         and is_flash_mla_v41_available()
     )
 
 
+def _native_formats():
+    """Return the (swa, global) formats this target's FlashMLA can read.
+
+    sm90 carries the V4 cache reader only; sm100 adds V4.1 and its FP4 rows.
+    """
+    if torch.cuda.get_device_capability()[0] == 9:
+        return "swa_v4", "global_v4"
+    return "swa", "global"
+
+
 def _native_cache(rows, fmt):
-    width = {"swa": 528, "global": 288}[fmt]
+    width = implementation._LAYOUTS[fmt][3]
     backing = torch.zeros(
         (rows // 64 + 1, 64 * width + 512), device="cuda", dtype=torch.uint8
     )
@@ -770,14 +1037,15 @@ def _native_cache(rows, fmt):
 
 
 @pytest.mark.skipif(
-    not _native_available(), reason="FlashMLA V4.1 on Blackwell required"
+    not _native_available(), reason="FlashMLA V4.1 on Hopper or newer required"
 )
 @pytest.mark.parametrize("batch", [1, 16, 17])
 @pytest.mark.parametrize("extra_width", [0, 512, 768])
 def test_native_decode_graph_refresh_slots_lengths_and_idle(batch, extra_width):
     torch.manual_seed(741)
-    sa, swa = _native_cache(256, "swa")
-    ga, glob = _native_cache(1024, "global")
+    swa_fmt, global_fmt = _native_formats()
+    sa, swa = _native_cache(256, swa_fmt)
+    ga, glob = _native_cache(1024, global_fmt)
     before_s, before_g = sa.clone(), ga.clone()
     q = torch.randn(batch, 16, 512, dtype=torch.bfloat16, device="cuda") * 0.3
     ss = (
@@ -831,10 +1099,10 @@ def test_native_decode_graph_refresh_slots_lengths_and_idle(batch, extra_width):
         graph.replay()
         eager = run(dsv41.new_attention_schedule())
         torch.testing.assert_close(captured, eager, rtol=0, atol=0)
-        parts = [dsv41.cache_gather(swa, ss, "swa", None).float()]
+        parts = [dsv41.cache_gather(swa, ss, swa_fmt, None).float()]
         masks = [torch.arange(128, device="cuda")[None, :] < sl[:, None]]
         if extra_width:
-            parts.append(dsv41.cache_gather(glob, gs, "global", None).float())
+            parts.append(dsv41.cache_gather(glob, gs, global_fmt, None).float())
             masks.append(
                 torch.arange(extra_width, device="cuda")[None, :] < gl[:, None]
             )
@@ -851,7 +1119,7 @@ def test_native_decode_graph_refresh_slots_lengths_and_idle(batch, extra_width):
 
 
 @pytest.mark.skipif(
-    not _native_available(), reason="FlashMLA V4.1 on Blackwell required"
+    not _native_available(), reason="FlashMLA V4.1 on Hopper or newer required"
 )
 @pytest.mark.parametrize("query_chunk_size", [16, 256])
 def test_native_prefill_workspace_matches_joint_softmax(query_chunk_size):
@@ -1060,27 +1328,22 @@ def test_decode_rows_rejects_request_token_shape_confusion():
 
 
 @pytest.mark.parametrize("target", ["cpu", "cuda"])
-def test_decode_window_ragged_external_history_only_and_replay(target):
+def test_decode_window_ragged_addresses_and_replay(target):
     if target == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA/ROCm")
     p = torch.tensor([-1, 0, 1, 2, 3, 4, 3, 4, 5, 6, 7, 190, 191, -1], device=target)
     r = torch.tensor([-1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, -1], device=target)
     swa = torch.ones((3, 4), dtype=torch.int32, device=target)
-    tail = torch.ones((3, 100), dtype=torch.int32, device=target)
-    tail[0].zero_()  # All pairs are internal to the first request's window.
-    tail[1, 1] = 0  # Request 1 really needs token 2 from its external tail.
-    tail[2].zero_()  # Token 190 is supplied by this forward, not its tail page.
-    swa[2, 0] = 0  # Token 63 belongs to request 2's external SWA history.
+    swa[2, 0] = 0  # A null page resolves to -1 rows; residency is not judged here.
     n = p.numel()
     out = (
         torch.empty(n, dtype=torch.int64, device=target),
         torch.empty((n, 128), dtype=torch.int32, device=target),
         torch.empty(n, dtype=torch.int32, device=target),
-        torch.empty(n, dtype=torch.int32, device=target),
     )
 
     def prepare():
-        dsv41.decode_window(p, r, *out, swa, tail, 2, 2)
+        dsv41.decode_window(p, r, *out, swa, 2)
 
     prepare()
     if target == "cuda":
@@ -1089,7 +1352,6 @@ def test_decode_window_ragged_external_history_only_and_replay(target):
             prepare()
     for step in range(3):
         if step == 1:
-            tail[1, 1] = 1
             swa[2, 0] = 1
         if step == 2:
             p.fill_(-1)
@@ -1099,10 +1361,6 @@ def test_decode_window_ragged_external_history_only_and_replay(target):
             graph.replay()
         else:
             prepare()
-        errors = [0] * n
-        if step == 0:
-            errors[6], errors[11] = 2, 1
-        assert out[3].cpu().tolist() == errors
         table = swa.cpu().tolist()
 
         def slot(position, request):
@@ -1128,7 +1386,171 @@ def test_decode_window_ragged_external_history_only_and_replay(target):
             ],
             [min(max(position + 1, 0), 128) for position, _ in coordinates],
         )
-        for got, want in zip(out[:3], expected, strict=True):
+        for got, want in zip(out, expected, strict=True):
             torch.testing.assert_close(
                 got.cpu(), torch.tensor(want, dtype=got.dtype), rtol=0, atol=0
             )
+
+
+def _rope_table(device, positions=4096, rotary_dim=64):
+    inv_freq = 1.0 / (
+        10000 ** (torch.arange(0, rotary_dim, 2, device=device).float() / rotary_dim)
+    )
+    angles = torch.arange(positions, device=device)[:, None].float() * inv_freq
+    return torch.cat((angles.cos(), angles.sin()), -1).contiguous()
+
+
+def test_dspark_rows_matches_norm_rope_round_trip_and_scatter(device):
+    """One launch reproduces kv_norm -> RoPE -> SWA codec round trip -> scatter."""
+    from tokenspeed_kernel.ops.attention.dsv41 import rope_inplace
+
+    torch.manual_seed(4)
+    rows, eps = 12, 1e-6
+    merged = torch.randn(rows, 3 * 512, device=device, dtype=torch.bfloat16) * 3
+    values = merged[:, 512:1024]
+    weight = (torch.rand(512, device=device) + 0.5).to(torch.bfloat16)
+    table = _rope_table(device)
+    positions = torch.randint(0, 4000, (rows,), device=device)
+    slots = torch.arange(64, 64 + 7 * rows, 7, device=device, dtype=torch.int32)
+    slots[3], slots[5] = -1, 8 * 64 + 5
+    window = torch.zeros(8, 64, 512, device=device, dtype=torch.bfloat16)
+
+    def round_trip(x):
+        return dsv41.cache_unpack(dsv41.cache_pack(x, "swa", None), "swa", None)
+
+    normalized = values.float()
+    normalized = normalized * torch.rsqrt(
+        normalized.square().mean(-1, keepdim=True) + eps
+    )
+    normalized = (weight.float() * normalized).to(torch.bfloat16)
+    expected = round_trip(rope_inplace(normalized.clone(), positions, table, None))
+
+    out = torch.empty_like(values)
+    dsv41.dspark_rows(values, weight, eps, positions, table, window, slots, out)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    live = (slots >= 0) & (slots < 8 * 64)
+    torch.testing.assert_close(
+        window[slots[live].long() // 64, slots[live].long() % 64],
+        expected[live],
+        rtol=0,
+        atol=0,
+    )
+    assert window.reshape(-1, 512).ne(0).any(-1).sum() == int(live.sum())
+    # Without the norm the input is used as is; without the table nothing rotates.
+    torch.testing.assert_close(
+        dsv41.dspark_rows(
+            values, None, None, positions, table, None, None, torch.empty_like(values)
+        ),
+        round_trip(rope_inplace(values.clone(), positions, table, None)),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        dsv41.dspark_rows(
+            values, None, None, None, None, None, None, torch.empty_like(values)
+        ),
+        round_trip(values),
+        rtol=0,
+        atol=0,
+    )
+    dsv41.dspark_rows(
+        values[:0], weight, eps, positions[:0], table, window, slots[:0], None
+    )
+    for bad in (
+        dict(norm_weight=None),
+        dict(norm_eps=None),
+        dict(positions=None),
+        dict(cos_sin_cache=None),
+        dict(slots=None),
+        dict(window=window[:, :, :256]),
+        dict(window=None, out=None),
+        dict(values=values.t()),
+    ):
+        kwargs = dict(
+            values=values,
+            norm_weight=weight,
+            norm_eps=eps,
+            positions=positions,
+            cos_sin_cache=table,
+            window=window,
+            slots=slots,
+            out=None,
+        )
+        kwargs.update(bad)
+        with pytest.raises(ValueError):
+            dsv41.dspark_rows(**kwargs)
+
+
+def test_dspark_anchors_pick_last_accepted_verify_rows(device):
+    bs, extends, width, spec = 4, 1, 6, 6
+    decodes = bs - extends
+    tokens = torch.arange(100, 100 + extends + decodes * width, device=device).to(
+        torch.int32
+    )
+    accept = torch.tensor([1, 4, 0, 9], device=device, dtype=torch.int32)
+    positions = torch.arange(1000, 1000 + decodes * width, device=device)
+    next_tokens = torch.zeros(bs, spec, device=device, dtype=torch.int32)
+    start = torch.zeros(decodes, device=device, dtype=torch.int64)
+    dsv41.dspark_anchors(tokens, accept, positions, extends, width, next_tokens, start)
+    # Extend rows keep their sampled token; decode rows take the token at the
+    # last accepted verify row, with accept lengths clamped into 1..width.
+    assert next_tokens.tolist() == [[100] * 6, [104] * 6, [107] * 6, [118] * 6]
+    assert start.tolist() == [1003, 1006, 1017]
+    cpu_next = torch.zeros(bs, spec, dtype=torch.int32)
+    cpu_start = torch.zeros(decodes, dtype=torch.int64)
+    dsv41.dspark_anchors(
+        tokens.cpu(), accept.cpu(), positions.cpu(), extends, width, cpu_next, cpu_start
+    )
+    assert torch.equal(cpu_next, next_tokens.cpu()) and torch.equal(
+        cpu_start, start.cpu()
+    )
+    with pytest.raises(ValueError):
+        dsv41.dspark_anchors(
+            tokens[:-1], accept, positions, extends, width, next_tokens, start
+        )
+
+
+def test_dspark_block_expands_anchors_and_window_addressing(device):
+    torch.manual_seed(5)
+    n, window, block, hc, rows_per_page, noise = 3, 128, 5, 4, 64, 77
+    history = torch.randint(-1, 600, (n, window), device=device, dtype=torch.int32)
+    history[0, :100] = -1
+    # The drafter hands over the bonus column of its [bs, spec] token table.
+    bonus = torch.tensor([[3, 9], [4, 9], [5, 9]], device=device, dtype=torch.int32)[
+        :, 0
+    ]
+    start = torch.tensor([10, 200, 7], device=device)
+    outputs = dsv41.dspark_block(bonus, start, history, noise, rows_per_page, hc, block)
+    ids, positions, pre_mix, requests, page, row, indices = outputs
+    assert [t.dtype for t in outputs] == [
+        torch.int32,
+        torch.int64,
+        torch.float32,
+        torch.int64,
+        torch.int64,
+        torch.int64,
+        torch.int32,
+    ]
+    assert ids.view(n, block)[:, 0].tolist() == [3, 4, 5]
+    assert ids.view(n, block)[:, 1:].eq(noise).all()
+    assert positions.view(n, block).tolist() == [
+        [s + 1 + j for j in range(block)] for s in (10, 200, 7)
+    ]
+    assert pre_mix.tolist() == [[1.0, 0.0, 0.0, 0.0]] * (n * block)
+    assert requests.tolist() == [r for r in range(n) for _ in range(block)]
+    clamped = history.clamp_min(0).long()
+    assert torch.equal(page, clamped // rows_per_page)
+    assert torch.equal(row, clamped % rows_per_page)
+    width = window + block
+    expected = torch.arange(n * width, device=device, dtype=torch.int32).view(n, width)
+    expected[:, :window].masked_fill_(history < 0, -1)
+    assert torch.equal(
+        indices.view(n, block, width), expected[:, None, :].expand(-1, block, -1)
+    )
+    cpu = dsv41.dspark_block(
+        bonus.cpu(), start.cpu(), history.cpu(), noise, rows_per_page, hc, block
+    )
+    for got, reference in zip(outputs, cpu, strict=True):
+        assert torch.equal(got.cpu(), reference.to(got.dtype))
+    with pytest.raises(ValueError):
+        dsv41.dspark_block(bonus[:2], start, history, noise, rows_per_page, hc, block)

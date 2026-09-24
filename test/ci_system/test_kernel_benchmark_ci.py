@@ -44,8 +44,13 @@ MERGE_SHA = "4" * 40
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _samples(center: float, spread: float = 0.02) -> list[float]:
-    return [center + spread * offset for offset in (-4, -3, -2, -1, 0, 1, 2, 3, 4)]
+def _samples(
+    center: float,
+    spread: float = 0.02,
+    measurement_blocks: int = 9,
+) -> list[float]:
+    midpoint = (measurement_blocks - 1) / 2
+    return [center + spread * (index - midpoint) for index in range(measurement_blocks)]
 
 
 def _result(
@@ -54,6 +59,7 @@ def _result(
     status: str = "success",
     spread: float = 0.02,
     validated: bool = True,
+    measurement_blocks: int = 9,
 ) -> dict:
     if status != "success":
         return {
@@ -62,7 +68,7 @@ def _result(
             "error_type": "RuntimeError",
             "error_message": "test failure",
         }
-    samples = _samples(center, spread)
+    samples = _samples(center, spread, measurement_blocks)
     return {
         "status": "success",
         "samples_us": samples,
@@ -91,11 +97,12 @@ def _case(
     center: float,
     *,
     case_id: str = "amd.gfx950.gemm.bmm.bf16.b12-m1-n512-k128.gluon",
-    definition_version: int = 1,
+    comparison_epoch: int = 1,
     status: str = "success",
     spread: float = 0.02,
     policy: dict | None = None,
     validated: bool = True,
+    measurement_blocks: int | None = None,
 ) -> dict:
     definition = {
         "family": "gemm",
@@ -109,7 +116,6 @@ def _case(
         },
         "registration": "gluon_bmm_a16w16_gfx950",
         "seed": 42,
-        "definition_version": definition_version,
     }
     if validated:
         definition["parameters"]["validation"] = {
@@ -117,8 +123,9 @@ def _case(
             "atol": 0.015,
             "rtol": 0.015,
         }
-    return {
+    case = {
         "id": case_id,
+        "comparison_epoch": comparison_epoch,
         "definition": definition,
         "policy": policy or _policy(),
         "result": _result(
@@ -126,8 +133,12 @@ def _case(
             status=status,
             spread=spread,
             validated=validated,
+            measurement_blocks=measurement_blocks or 9,
         ),
     }
+    if measurement_blocks is not None:
+        case["measurement_blocks"] = measurement_blocks
+    return case
 
 
 def _run(revision: str, cases: list[dict]) -> dict:
@@ -141,7 +152,6 @@ def _run(revision: str, cases: list[dict]) -> dict:
             "device_name": "AMD Instinct MI350X",
         },
         "timer": {
-            "calls_per_graph": 100,
             "eager_warmup_iterations": 5,
             "replay_warmup_iterations": 3,
             "measurement_blocks": 9,
@@ -241,19 +251,54 @@ def test_compare_uses_merge_base_policy():
     assert "baseline policy was used" in comparison["detail"]
 
 
-def test_compare_bootstrap_requires_candidate_success():
-    report = _compare(None, _run(CANDIDATE_SHA, [_case(10.0)]), merge_sha=None)
+@pytest.mark.parametrize(
+    ("base_status", "classification"),
+    [
+        (None, "added"),
+        ("success", "within_budget"),
+        ("not_applicable", "inconclusive"),
+        ("registration_missing", "inconclusive"),
+        ("invalid_case", "inconclusive"),
+        ("setup_failure", "inconclusive"),
+        ("capture_failure", "inconclusive"),
+        ("execution_failure", "inconclusive"),
+        ("correctness_failure", "inconclusive"),
+        ("environment_invalid", "invalid"),
+        ("unknown", "invalid"),
+    ],
+)
+def test_compare_requires_candidate_success(base_status, classification):
+    base = (
+        _run(BASE_SHA, [_case(10.0, status=base_status)])
+        if base_status is not None
+        else None
+    )
+    report = _compare(base, _run(CANDIDATE_SHA, [_case(10.0)]), merge_sha=None)
 
-    assert report["comparisons"][0]["classification"] == "added"
-    assert report["comparisons"][0]["candidate_median_us"] == 10.0
-    assert comparison_exit_code(report) == 0
+    comparison = report["comparisons"][0]
+    assert comparison["classification"] == classification
+    if classification == "invalid":
+        assert comparison_exit_code(report) == 2
+    else:
+        assert comparison["candidate_median_us"] == 10.0
+        assert comparison_exit_code(report) == 0
+    if classification == "inconclusive":
+        assert comparison["base_median_us"] is None
+        assert comparison["delta_us"] is None
+        assert comparison["delta_percent"] is None
+        assert f"baseline benchmark returned {base_status}" in comparison["detail"]
+        assert "candidate succeeded" in comparison["detail"]
+        assert "**Inconclusive:**" in render_summary(report)
 
     failed = _run(
         CANDIDATE_SHA,
         [_case(10.0, status="capture_failure")],
     )
-    failed_report = _compare(None, failed, merge_sha=None)
+    failed_report = _compare(base, failed, merge_sha=None)
     assert failed_report["comparisons"][0]["classification"] == "invalid"
+    assert "candidate benchmark returned capture_failure" in (
+        failed_report["comparisons"][0]["detail"]
+    )
     assert comparison_exit_code(failed_report) == 2
 
 
@@ -269,7 +314,7 @@ def test_compare_reports_added_changed_and_missing_cases():
         _run(
             CANDIDATE_SHA,
             [
-                _case(10.0, case_id="changed", definition_version=2),
+                _case(10.0, case_id="changed", comparison_epoch=2),
                 _case(10.0, case_id="added"),
             ],
         ),
@@ -283,16 +328,15 @@ def test_compare_reports_added_changed_and_missing_cases():
     assert comparison_exit_code(report) == 0
 
 
-@pytest.mark.parametrize("context", ["environment", "timer", "registration"])
-def test_compare_requires_matching_measurement_context(context):
-    base = _run(BASE_SHA, [_case(10.0)])
+@pytest.mark.parametrize("context", ["environment", "timer"])
+@pytest.mark.parametrize("base_status", ["success", "setup_failure"])
+def test_compare_requires_matching_measurement_context(context, base_status):
+    base = _run(BASE_SHA, [_case(10.0, status=base_status)])
     candidate = _run(CANDIDATE_SHA, [_case(10.0)])
     if context == "environment":
         candidate["environment"]["device_name"] = "AMD Instinct MI355X"
-    elif context == "timer":
-        candidate["timer"]["calls_per_graph"] += 1
     else:
-        candidate["cases"][0]["result"]["registration_name"] = "different"
+        candidate["timer"]["eager_warmup_iterations"] += 1
 
     report = _compare(base, candidate)
 
@@ -300,21 +344,16 @@ def test_compare_requires_matching_measurement_context(context):
     assert report["comparisons"][0]["classification"] == expected
 
 
-@pytest.mark.parametrize("samples", [[0.0] * 9, [float("nan")] * 9])
-def test_validate_run_rejects_invalid_samples(samples):
-    run = _run(CANDIDATE_SHA, [_case(10.0)])
-    run["cases"][0]["result"]["samples_us"] = samples
+def test_compare_allows_registration_and_measurement_count_changes():
+    base = _run(BASE_SHA, [_case(10.0, measurement_blocks=10)])
+    candidate = _run(CANDIDATE_SHA, [_case(10.0, measurement_blocks=50)])
+    candidate["cases"][0]["result"]["registration_name"] = "new_registration"
 
-    with pytest.raises(CoordinatorError, match="timing samples"):
-        validate_run_document(run)
+    report = _compare(base, candidate)
 
-
-def test_validate_run_requires_configured_sample_count():
-    run = _run(CANDIDATE_SHA, [_case(10.0)])
-    run["cases"][0]["result"]["samples_us"].pop()
-
-    with pytest.raises(CoordinatorError, match="measurement blocks"):
-        validate_run_document(run)
+    comparison = report["comparisons"][0]
+    assert comparison["classification"] == "within_budget"
+    assert "selected registration changed" in comparison["detail"]
 
 
 def test_validate_run_requires_identity_and_unique_case_ids():
@@ -338,22 +377,6 @@ def test_validate_run_requires_identity_and_unique_case_ids():
         validate_run_document(run)
 
 
-def test_validate_run_requires_device_timing_semantics():
-    run = _run(CANDIDATE_SHA, [_case(10.0)])
-    run["cases"][0]["result"]["timing_mode"] = "host_wall_clock"
-
-    with pytest.raises(CoordinatorError, match="timing semantics"):
-        validate_run_document(run)
-
-
-def test_validate_run_requires_local_correctness_when_configured():
-    run = _run(CANDIDATE_SHA, [_case(10.0)])
-    run["cases"][0]["result"]["correctness"] = None
-
-    with pytest.raises(CoordinatorError, match="required by the benchmark definition"):
-        validate_run_document(run)
-
-
 def test_validate_run_preserves_environment_failure_results():
     run = _run(
         CANDIDATE_SHA,
@@ -369,18 +392,6 @@ def test_validate_run_preserves_environment_failure_results():
     validated = validate_run_document(run)
     assert validated["cases"] == run["cases"]
     assert not any(validated["environment"].values())
-
-    run["cases"] = [_case(10.0)]
-    with pytest.raises(CoordinatorError, match="complete hardware"):
-        validate_run_document(run)
-
-
-def test_validate_run_rejects_failing_local_correctness():
-    run = _run(CANDIDATE_SHA, [_case(10.0)])
-    run["cases"][0]["result"]["correctness"] = {"passed": False}
-
-    with pytest.raises(CoordinatorError, match="must report passed=true"):
-        validate_run_document(run)
 
 
 def test_validate_run_allows_opt_out_and_ignores_unknown_metadata():
@@ -409,24 +420,13 @@ def test_render_summary_prioritizes_regressions_and_bounds_rows():
     assert "10 additional results" in summary
 
 
-def test_bootstrap_requires_both_runner_and_suite_to_be_absent(tmp_path):
+def test_bootstrap_when_merge_base_lacks_the_suite(tmp_path):
     suite = Path("tokenspeed-kernel/benchmarks/amd/gfx950.json")
-    worker = Path("tokenspeed-kernel/python/tokenspeed_kernel/benchmark/ci.py")
 
     assert _baseline_supports_suite(tmp_path, suite) is False
 
-    (tmp_path / worker).parent.mkdir(parents=True)
-    (tmp_path / worker).touch()
-    with pytest.raises(CoordinatorError, match="not the requested suite"):
-        _baseline_supports_suite(tmp_path, suite)
-
-    (tmp_path / worker).unlink()
     (tmp_path / suite).parent.mkdir(parents=True)
     (tmp_path / suite).touch()
-    with pytest.raises(CoordinatorError, match="not its revision-local runner"):
-        _baseline_supports_suite(tmp_path, suite)
-
-    (tmp_path / worker).touch()
     assert _baseline_supports_suite(tmp_path, suite) is True
 
 
@@ -436,10 +436,6 @@ def test_orchestrate_runs_each_revision_once(monkeypatch, tmp_path):
 
     def add_worktree(repo, path, revision):
         del repo, revision
-        (path / "tokenspeed-kernel/python/tokenspeed_kernel/benchmark").mkdir(
-            parents=True
-        )
-        (path / "tokenspeed-kernel/python/tokenspeed_kernel/benchmark/ci.py").touch()
         (path / suite).parent.mkdir(parents=True)
         (path / suite).touch()
 

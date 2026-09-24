@@ -29,7 +29,7 @@ rounding stays with the same torch casts as the GPU-resident path.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.selection import SelectionObjective, select_kernel
+from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = ["uint8_row_gather"]
@@ -79,7 +79,6 @@ def uint8_row_gather(
         format_signature(x=dense_tensor_format(torch.uint8)),
         features=None,
         platform=None,
-        objective=SelectionObjective.DEFAULT,
         traits=None,
         solution=None,
         override=None,

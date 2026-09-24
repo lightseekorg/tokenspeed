@@ -25,13 +25,14 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.context import CapturedRows, ForwardContext
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
 from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import (
+    dspark_greedy_workspace,
     sample_dspark_block_greedy,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -179,24 +180,18 @@ class DeepseekV4DSpark(BaseDrafter):
             * self.spec_num_tokens
         )
 
-        tp_size = int(self.draft_model.mapping.attn.tp_size)
-        self.gathered_values = torch.empty(
-            (tp_size, max_bs), dtype=torch.float32, device=self.device
-        )
-        self.gathered_ids = torch.empty(
-            (tp_size, max_bs), dtype=torch.int64, device=self.device
+        self.candidates, self.partials = dspark_greedy_workspace(
+            int(self.draft_model.mapping.attn.tp_size),
+            max_bs,
+            int(self.draft_model.lm_head.num_embeddings_per_partition),
+            self.device,
         )
 
     def wire_target(self, target_model) -> None:
+        """Bind execution resources without changing model capture configuration."""
         self.target_model = target_model
         self.lm_head = self.draft_model.lm_head
         self.tp_group = target_model.logits_processor.tp_group
-        if not hasattr(target_model, "set_dspark_layers_to_capture"):
-            raise ValueError(
-                "DSPARK requires the target model to support "
-                "set_dspark_layers_to_capture."
-            )
-        target_model.set_dspark_layers_to_capture(self.target_layer_ids)
 
     def prepare_request_state(
         self,
@@ -205,12 +200,6 @@ class DeepseekV4DSpark(BaseDrafter):
         num_extends: int,
     ) -> None:
         """Refresh request-to-window slots outside CUDA Graph replay."""
-
-        if hasattr(self, "lm_head"):
-            self.model.refresh_local_base_logits_head(
-                self.lm_head.weight,
-                force=False,
-            )
 
         if len(request_ids) != len(request_pool_indices):
             raise ValueError("DSPARK request IDs and pool indices must align.")
@@ -238,7 +227,11 @@ class DeepseekV4DSpark(BaseDrafter):
                 changed_slots.append(pool_slot)
 
         if changed_slots:
-            changed = torch.tensor(changed_slots, dtype=torch.int64, device=self.device)
+            # Pinned staging keeps the upload stream-ordered instead of waiting
+            # for the round in flight (a pageable copy would).
+            changed = torch.tensor(
+                changed_slots, dtype=torch.int64, pin_memory=self.device.type == "cuda"
+            ).to(self.device, non_blocking=True)
             self.kv_windows.index_fill_(0, changed, 0)
             self.context_lengths.index_fill_(0, changed, 0)
 
@@ -254,13 +247,6 @@ class DeepseekV4DSpark(BaseDrafter):
         )
         if active_bs < self.input_buffers.max_bs:
             self.slot_indices_buf[active_bs:].copy_(self.padding_slots[active_bs:])
-
-    def on_target_weights_updated(self) -> None:
-        """Refresh target-derived weights after an in-place target reload."""
-        self.model.refresh_local_base_logits_head(
-            self.lm_head.weight,
-            force=True,
-        )
 
     @staticmethod
     def _bonus_tokens_from_output(
@@ -338,53 +324,71 @@ class DeepseekV4DSpark(BaseDrafter):
         self.kv_windows[self.first_padding_slot].zero_()
         self.context_lengths[self.first_padding_slot].zero_()
         self._prefill_graph = graph
-        logger.info("DSpark prefill CUDA graph captured (window=%d)", window)
+        logger.info(f"DSpark prefill CUDA graph captured (window={window:d})")
 
     def _seed_prefill_windows(
         self,
         hidden_states: torch.Tensor,
         num_extends: int,
+        captured: CapturedRows | None,
     ) -> int:
+        """Write each prefill request's last window of captured taps into its
+        draft context window and return the number of hidden rows consumed.
+
+        ``captured`` is the target's report of which rows it captured (CED
+        narrowing); None means one captured row per input row.
+        """
         if num_extends < 0:
             raise ValueError(f"DSPARK num_extends must be non-negative: {num_extends}.")
         if num_extends == 0:
             return 0
 
-        # fill_input_buffers derives this host mirror from the same scheduler
-        # lengths as input_lengths_buf. Reading the CUDA buffer row-by-row here
-        # serialized every chunk behind the target stream.
-        lengths_cpu = self.input_buffers.extend_seq_lens_cpu
-        if (
-            not isinstance(lengths_cpu, torch.Tensor)
-            or lengths_cpu.device.type != "cpu"
-            or lengths_cpu.dtype != torch.int32
-            or lengths_cpu.ndim != 1
-            or lengths_cpu.numel() < num_extends
-        ):
-            raise RuntimeError(
-                "DSPARK prefill window seeding requires a complete int32 CPU "
-                "extend-length mirror."
-            )
-        chunk_lengths = [int(length) for length in lengths_cpu[:num_extends].tolist()]
-        if any(length < 0 for length in chunk_lengths):
+        if captured is None:
+            # One captured row per input row. fill_input_buffers derives this
+            # host mirror from the same scheduler lengths as input_lengths_buf;
+            # reading the CUDA buffer row-by-row here serialized every chunk
+            # behind the target stream.
+            lengths_cpu = self.input_buffers.extend_seq_lens_cpu
+            if (
+                not isinstance(lengths_cpu, torch.Tensor)
+                or lengths_cpu.device.type != "cpu"
+                or lengths_cpu.dtype != torch.int32
+                or lengths_cpu.ndim != 1
+                or lengths_cpu.numel() < num_extends
+            ):
+                raise RuntimeError(
+                    "DSPARK prefill window seeding requires a complete int32 CPU "
+                    "extend-length mirror."
+                )
+            chunk_lengths = [int(n) for n in lengths_cpu[:num_extends].tolist()]
+            spans = []
+            offset = 0
+            for length in chunk_lengths:
+                spans.append((offset, length))
+                offset += length
+            positions_buf = self.input_buffers.positions_buf
+        else:
+            # The target captured a per-request tail only (CED narrowing).
+            spans = list(captured.prefill_spans)
+            positions_buf = captured.positions
+        if len(spans) != num_extends:
+            raise RuntimeError("DSPARK prefill chunk layout disagrees with the batch.")
+        if any(count < 0 for _, count in spans):
             raise RuntimeError("DSPARK prefill chunk lengths must be non-negative.")
-        total_prefill_tokens = sum(chunk_lengths)
+        total_prefill_tokens = sum(count for _, count in spans)
         if total_prefill_tokens > hidden_states.shape[0]:
             raise RuntimeError(
                 "DSPARK prefill chunk lengths exceed captured hidden-state rows: "
                 f"{total_prefill_tokens} > {hidden_states.shape[0]}."
             )
 
-        offset = 0
-        for row, chunk_len in enumerate(chunk_lengths):
+        for row, (offset, chunk_len) in enumerate(spans):
             if chunk_len <= 0:
                 continue
             chunk_end = offset + chunk_len
             keep = min(int(self.model.window_size), chunk_len)
             kept_hidden = hidden_states[chunk_end - keep : chunk_end].unsqueeze(0)
-            positions = self.input_buffers.positions_buf[
-                chunk_end - keep : chunk_end
-            ].unsqueeze(0)
+            positions = positions_buf[chunk_end - keep : chunk_end].unsqueeze(0)
             slot = self.slot_indices_buf[row : row + 1]
             if self._prefill_graph is None:
                 positions, next_context_lengths = _dspark_prefill_position_plan(
@@ -407,8 +411,7 @@ class DeepseekV4DSpark(BaseDrafter):
                 self._prefill_length.fill_(keep)
                 self._prefill_slot.copy_(slot)
                 self._prefill_graph.replay()
-            offset = chunk_end
-        return offset
+        return total_prefill_tokens
 
     def _draft_decode_rows(
         self,
@@ -477,15 +480,15 @@ class DeepseekV4DSpark(BaseDrafter):
             slots,
             draft_ctx,
         )
-        local_logits = self.model.local_base_logits(draft_hidden, None)
+        local_logits = self.model.local_base_logits(draft_hidden, self.lm_head.weight)
         sample_dspark_block_greedy(
             local_logits,
             bonus,
             self.model.markov_head,
             self.lm_head,
             self.tp_group,
-            self.gathered_values,
-            self.gathered_ids,
+            self.candidates,
+            self.partials,
             self.draft_tokens_buf[:num_decodes],
         )
         next_tokens[num_extends:, 1:].copy_(self.draft_tokens_buf[:num_decodes])
@@ -520,8 +523,7 @@ class DeepseekV4DSpark(BaseDrafter):
         )
         next_tokens[:, 1:].copy_(next_tokens[:, :1])
         prefill_tokens = self._seed_prefill_windows(
-            hidden_states,
-            base_ctx.num_extends,
+            hidden_states, base_ctx.num_extends, base_ctx.captured_rows
         )
         self._draft_decode_rows(
             base_ctx,

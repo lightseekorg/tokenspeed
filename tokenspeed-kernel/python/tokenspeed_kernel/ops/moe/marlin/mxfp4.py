@@ -35,6 +35,11 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import situ_and_mul
+from tokenspeed_kernel.ops.moe.marlin.deepep_layout import (
+    activate_recv_rows,
+    pack_recv_rows,
+    unpack_recv_rows,
+)
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -64,6 +69,30 @@ def _block_size_m(num_tokens: int, top_k: int, num_experts: int) -> int:
     return block
 
 
+def _swiglu_limit(w: torch.nn.Module) -> float | None:
+    """The checkpoint's SwiGLU clamp, or None for a plain ``silu(gate) * up``.
+
+    The clamp is the only SwiGLU knob this path can honor: ``silu_and_mul``
+    clips ``gate`` from above and ``up`` on both sides. A sigmoid multiplier
+    (``alpha``) or an up-branch offset (``swiglu_beta``) has no Marlin
+    epilogue, so it is rejected instead of silently dropped.
+    """
+    swiglu_arg = getattr(w, "swiglu_arg", None)
+    alpha = None if swiglu_arg is None else getattr(swiglu_arg, "alpha", None)
+    # swiglu_beta lives on the module independently of swiglu_arg, so check it
+    # even when no SwiGLU args were attached.
+    beta = getattr(w, "swiglu_beta", None)
+    if alpha not in (None, 1.0) or beta not in (None, 0.0):
+        raise ValueError(
+            "Marlin MXFP4 MoE supports only standard SwiGLU with an optional "
+            f"clamp limit; got alpha={alpha!r}, swiglu_beta={beta!r}"
+        )
+    if swiglu_arg is None:
+        return None
+    limit = getattr(swiglu_arg, "limit", None)
+    return None if limit is None else float(limit)
+
+
 def marlin_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
     """Repack loader-format MXFP4 experts into the Marlin layout, once.
 
@@ -71,7 +100,7 @@ def marlin_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
     E2M1 as uint8 ``[E, N, K//2]`` and ``w13_weight_scale``/``w2_weight_scale``
     raw E8M0 as uint8 ``[E, N, K//32]``. Output: Marlin-repacked int32 weights
     and permuted float8_e8m0fnu scales, written back onto the module. K3's
-    shapes are already aligned (hidden 7168%256, ispp 3072%128), so no padding.
+    expert shapes are already aligned (latent 3584%256, ispp 3072%128), so no padding.
     """
     names = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
     if any(not hasattr(w, name) for name in names):
@@ -154,6 +183,8 @@ def marlin_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
     traits={
         "weight_dtype": frozenset({"mxfp4"}),
         "activation": frozenset({"silu", "situ", "swiglu"}),
+        # silu_and_mul has no alpha/beta (see _swiglu_limit): standard form only.
+        "swiglu_form": frozenset({"standard"}),
         "routing_mode": frozenset({"precomputed_topk"}),
         "supports_deferred_finalize": frozenset({False}),
         "supports_ep": frozenset({True}),
@@ -179,7 +210,13 @@ def marlin_mxfp4_precomputed_moe_apply(
     """Apply a Marlin W4A16 MXFP4 MoE with precomputed routing.
 
     Args:
-        plan: MoE plan; ``activation`` selects the GEMM1 epilogue.
+        plan: MoE plan; ``activation`` selects the GEMM1 epilogue: ``situ``
+            reads ``w.activation_situ_beta``/``activation_situ_linear_beta``;
+            ``silu``/``swiglu`` compute ``silu(gate) * up`` clamped to
+            ``w.swiglu_arg.limit`` when the checkpoint sets one (``gate`` from
+            above, ``up`` on both sides). A SwiGLU ``alpha`` other than 1 or a
+            non-zero ``w.swiglu_beta`` is rejected: Marlin has no epilogue for
+            them.
         x: bf16 hidden states ``[tokens, hidden]``.
         w: Module holding Marlin-repacked ``w13_weight``/``w2_weight`` (int32)
             and permuted ``w13_weight_scale``/``w2_weight_scale``
@@ -204,16 +241,12 @@ def marlin_mxfp4_precomputed_moe_apply(
     if x.dtype != torch.bfloat16:
         raise TypeError(f"Marlin MXFP4 MoE requires bf16 activations, got {x.dtype}")
 
-    activation = plan.get("activation") or getattr(w, "activation", "silu")
-    hidden = int(getattr(w, "_marlin_hidden_size", x.shape[1]))
-    ispp = int(getattr(w, "_marlin_ispp", w.w2_weight.shape[1] * 16))
     num_local_experts = int(getattr(w, "num_local_experts", w.w13_weight.shape[0]))
     ep_size = int(getattr(w, "ep_size", 1))
     ep_rank = int(getattr(w, "ep_rank", 0))
     global_num_experts = num_local_experts * ep_size
 
     topk_ids = topk_ids.to(torch.int32)
-    topk_weights = topk_weights.to(torch.float32)
     is_ep = ep_size > 1
     if is_ep:
         # Global -> local id remap: [expert_start, +num_local) -> [0, num_local),
@@ -231,15 +264,47 @@ def marlin_mxfp4_precomputed_moe_apply(
         local_topk_ids = torch.where(
             topk_ids < 0, topk_ids, mapping[topk_ids.long().clamp_(min=0)]
         )
-        align_num_experts = num_local_experts
     else:
         local_topk_ids = topk_ids
-        align_num_experts = num_local_experts
 
-    num_tokens, top_k = topk_ids.shape
-    block_m = _block_size_m(num_tokens, top_k, align_num_experts)
+    return marlin_mxfp4_local_moe_apply(plan, x, w, topk_weights, local_topk_ids)
+
+
+def marlin_mxfp4_local_moe_apply(
+    plan: dict,
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    topk_weights: torch.Tensor,
+    local_topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Compute this rank's routed experts from already-local expert IDs.
+
+    Args:
+        plan: MoE plan selecting the activation.
+        x: BF16 input rows shaped [tokens, hidden].
+        w: Local Marlin-repacked weights and expert/activation geometry.
+        topk_weights: [tokens, top_k] route weights, applied in GEMM2.
+        local_topk_ids: [tokens, top_k] local expert IDs; -1 masks routes
+            owned by other ranks. DeepEP normal dispatch provides this layout.
+
+    Returns:
+        [tokens, hidden] expert contributions, reduced over the local routes.
+        The caller owns any inter-rank reduction or DeepEP combine.
+    """
+    if x.dtype != torch.bfloat16:
+        raise TypeError(f"Marlin MXFP4 MoE requires bf16 activations, got {x.dtype}")
+
+    activation = plan.get("activation") or getattr(w, "activation", "silu")
+    hidden = int(getattr(w, "_marlin_hidden_size", x.shape[1]))
+    ispp = int(getattr(w, "_marlin_ispp", w.w2_weight.shape[1] * 16))
+    num_local_experts = int(getattr(w, "num_local_experts", w.w13_weight.shape[0]))
+    is_ep = int(getattr(w, "ep_size", 1)) > 1
+    local_topk_ids = local_topk_ids.to(torch.int32)
+    topk_weights = topk_weights.to(torch.float32)
+    num_tokens, top_k = local_topk_ids.shape
+    block_m = _block_size_m(num_tokens, top_k, num_local_experts)
     sorted_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        local_topk_ids, block_m, align_num_experts
+        local_topk_ids, block_m, num_local_experts
     )
 
     workspace = marlin_make_workspace(x.device)
@@ -276,7 +341,7 @@ def marlin_mxfp4_precomputed_moe_apply(
     else:
         from tokenspeed_kernel.ops.activation.triton import silu_and_mul
 
-        intermediate2 = silu_and_mul(intermediate1)
+        intermediate2 = silu_and_mul(intermediate1, limit=_swiglu_limit(w))
 
     # GEMM2: fold the route weights in (mul_topk_weights) so finalize is a
     # plain sum over top_k. EP-masked routes wrote nothing, so zero-init c.
@@ -300,3 +365,96 @@ def marlin_mxfp4_precomputed_moe_apply(
     ).view(num_tokens, top_k, hidden)
 
     return intermediate3.sum(dim=1)
+
+
+def marlin_mxfp4_masked_moe_apply(
+    plan: dict,
+    recv_x: torch.Tensor,
+    w: torch.nn.Module,
+    masked_m: torch.Tensor,
+    num_global_tokens: int,
+    top_k: int,
+) -> torch.Tensor:
+    """Compute DeepEP's valid expert rows with compact Marlin intermediates.
+
+    Args:
+        plan: MoE plan selecting SiTU or SiLU activation.
+        recv_x: BF16 [local_experts, receive_capacity, hidden] dispatch output;
+            reused in place for combine after its valid inputs are packed.
+        w: Local Marlin-repacked MXFP4 weights and activation parameters.
+        masked_m: Device int32 valid row count for every local expert.
+        num_global_tokens: Safe upper bound on all source token rows in this
+            forward (the graph bucket bound when recording a CUDA graph).
+        top_k: Maximum number of distinct selected experts per source token.
+
+    Returns:
+        recv_x with only its valid expert rows replaced by computed outputs.
+        Route weights are applied exactly once by DeepEP combine.
+    """
+    if recv_x.dtype != torch.bfloat16:
+        raise TypeError("Marlin DeepEP receive activations must be BF16")
+    # The valid row counts live on the device (masked_m) and the compact row
+    # capacity is fixed at CUDA-graph capture, so the block size cannot follow
+    # the batch the way the local path's _block_size_m does.
+    block_m = 16
+    packed, sorted_ids, expert_ids, total, offsets = pack_recv_rows(
+        recv_x, masked_m, num_global_tokens, top_k, block_m
+    )
+    hidden = recv_x.shape[2]
+    ispp = int(w._marlin_ispp)
+    rows = packed.shape[0]
+    workspace = marlin_make_workspace(recv_x.device)
+    # All scheduled expert IDs are local and valid, so Marlin needs no EP
+    # invalid-block scan. Communication already established expert ownership.
+    # Neither GEMM multiplies route weights: LL combine owns that operation.
+    # The kernel does not read this pointer when mul_topk_weights is false.
+    weights = torch.empty((0,), dtype=torch.float32, device=recv_x.device)
+    gemm1 = moe_wna16_marlin_gemm(
+        packed,
+        torch.empty((rows, 2 * ispp), dtype=recv_x.dtype, device=recv_x.device),
+        w.w13_weight,
+        w.w13_weight_scale,
+        workspace,
+        sorted_ids,
+        expert_ids,
+        total,
+        weights,
+        moe_block_size=block_m,
+        top_k=1,
+        mul_topk_weights=False,
+        is_ep=False,
+        size_m=rows,
+        size_n=2 * ispp,
+        size_k=hidden,
+        use_fp32_reduce=True,
+    )
+    activation = plan.get("activation") or w.activation
+    gemm2_input = activate_recv_rows(
+        gemm1,
+        masked_m,
+        offsets,
+        block_m,
+        activation,
+        float(w.activation_situ_beta) if activation == "situ" else 1.0,
+        w.activation_situ_linear_beta if activation == "situ" else None,
+    )
+    output = moe_wna16_marlin_gemm(
+        gemm2_input,
+        torch.empty((rows, hidden), dtype=recv_x.dtype, device=recv_x.device),
+        w.w2_weight,
+        w.w2_weight_scale,
+        workspace,
+        sorted_ids,
+        expert_ids,
+        total,
+        weights,
+        moe_block_size=block_m,
+        top_k=1,
+        mul_topk_weights=False,
+        is_ep=False,
+        size_m=rows,
+        size_n=hidden,
+        size_k=ispp,
+        use_fp32_reduce=True,
+    )
+    return unpack_recv_rows(output, masked_m, offsets, recv_x, block_m)

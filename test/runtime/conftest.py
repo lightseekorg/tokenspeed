@@ -110,6 +110,8 @@ def kimi_recipe(
         server_args=SimpleNamespace(
             max_total_tokens=None,
             chunked_prefill_size=max_scheduled_tokens,
+            disaggregation_mode="null",
+            enable_prefix_caching=True,
             speculative_algorithm=speculative_algorithm,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         ),
@@ -164,7 +166,7 @@ def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True)
     recipe = kimi_recipe()
     group_ids = recipe.target_group_ids
     layer_types = recipe.layer_types
-    from cache_pool_test_utils import make_pool
+    from test.runtime.cache_pool_test_utils import make_pool
 
     _, pool = make_pool(
         HybridKDATokenToKVPool,

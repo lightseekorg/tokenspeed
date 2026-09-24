@@ -182,6 +182,7 @@ def _msa_server_args(**overrides) -> SimpleNamespace:
         kv_cache_dtype="fp8_e4m3",
         kv_cache_quant_method="none",
         speculative_algorithm=None,
+        speculative_num_draft_tokens=1,
         spec_context_pad=0,
         attention_backend="trtllm",
         drafter_attention_backend=None,
@@ -190,6 +191,7 @@ def _msa_server_args(**overrides) -> SimpleNamespace:
         data_parallel_size=1,
         attn_tp_size=4,
         max_cudagraph_capture_size=16,
+        mapping=_tp4_mapping(),
         chunked_prefill_size=8192,
         disaggregation_mode="null",
     )
@@ -219,6 +221,17 @@ def test_msa_config_kv_cache_dtype_guards() -> None:
     torch.version.hip is not None, reason="FP8 MoE backends are NVIDIA-only"
 )
 def test_minimax_m3_tp4_meta_layout_and_loader(monkeypatch: pytest.MonkeyPatch) -> None:
+    def meta_moe_plan(weight_dtype, **kwargs):
+        assert weight_dtype == "fp8"
+        return {
+            "solution": "triton",
+            "support_routing": False,
+            "supports_precomputed_topk": True,
+            "supports_deferred_finalize": False,
+        }
+
+    # Parameter layout and checkpoint loading do not require an executable kernel.
+    monkeypatch.setattr("tokenspeed_kernel.moe_plan", meta_moe_plan)
     model = _build_model(monkeypatch, quant_config=_mxfp8_config())
 
     assert isinstance(model.model.layers[0].mlp, MiniMaxM3MLP)

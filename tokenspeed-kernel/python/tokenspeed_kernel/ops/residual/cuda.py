@@ -67,7 +67,6 @@ if _HAS_CUDA_KERNEL:
             "separate_output_eps": frozenset({False}),
             "writes_block": frozenset({False}),
         },
-        tags={"latency", "throughput"},
     )
     def cuda_attn_res_fwd(
         *,

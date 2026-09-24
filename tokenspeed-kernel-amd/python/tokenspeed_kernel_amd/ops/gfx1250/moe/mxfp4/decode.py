@@ -44,6 +44,7 @@ def _matmul_decode(
     stride_y_z,
     stride_y_m,
     stride_y_n,
+    YGlobalScale,
     XGlobalScale,
     X,
     stride_x_z,
@@ -113,6 +114,7 @@ def _matmul_decode(
     SCHEDULE: gl.constexpr = "baseline",
     PINGPONG: gl.constexpr = False,
     NUM_WARPS: gl.constexpr = 4,
+    PARTIAL_TDM: gl.constexpr = False,
 ):
     # Decode is a small-M, M-ragged MoE GEMM with a fixed baseline schedule.
     gl.static_assert(
@@ -162,6 +164,7 @@ def _matmul_decode(
         WITH_W_MX_SCALE=WITH_W_MX_SCALE,
         SCALE_PRESHUFFLE=SCALE_PRESHUFFLE,
         index_type=INDEX_TYPE,
+        PARTIAL_TDM=PARTIAL_TDM,
         NUM_SUBTILES=NUM_SUBTILES,
         EVEN_K=EVEN_K,
         USE_GATHER=USE_GATHER,
@@ -325,6 +328,8 @@ def _matmul_decode(
     BLOCKED_LAYOUT_Y: gl.constexpr = get_blocked_layout(
         [BLOCK_M, OUT_BLOCK_N], Y.dtype, cfg.NUM_WARPS
     )
+    if YGlobalScale is not None:
+        out = out * (1.0 / gl.load(YGlobalScale).to(gl.float32))
     out = out.to(Y.dtype.element_ty)
     out = gl.convert_layout(out, BLOCKED_LAYOUT_Y)
 

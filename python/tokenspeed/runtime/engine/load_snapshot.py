@@ -160,7 +160,7 @@ class LoadSnapshotPublisher:
         self._thread.join(timeout=_CLOSE_TIMEOUT_S)
         if self._thread.is_alive():
             logger.warning(
-                "Load snapshot publisher did not stop within %.1fs", _CLOSE_TIMEOUT_S
+                f"Load snapshot publisher did not stop within {_CLOSE_TIMEOUT_S:.1f}s",
             )
 
     def _run(self) -> None:

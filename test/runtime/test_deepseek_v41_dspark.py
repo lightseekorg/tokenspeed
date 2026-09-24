@@ -28,6 +28,7 @@ import os
 from pathlib import Path
 from test.runtime.test_deepseek_v41_engram import _mapping
 from test.runtime.test_deepseek_v41_model import (
+    _Backend,
     _checkpoint,
     _config,
     _ctx,
@@ -39,18 +40,26 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.attention import dsv41
 from torch import nn
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
-from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import DeepseekV4DSpark
+from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (
+    DeepseekV41DSpark,
+)
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
 from tokenspeed.runtime.layers.attention import registry as attention_registry
+from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
+    V41DecoderView,
+    V41PrefillSpan,
+)
 from tokenspeed.runtime.layers.linear import LinearBase
 from tokenspeed.runtime.layers.moe.expert import MoELayer
+from tokenspeed.runtime.models import deepseek_v41 as v41
 from tokenspeed.runtime.models.deepseek_v41 import (
     DeepseekV41ForCausalLM,
     DeepseekV41Model,
@@ -59,6 +68,8 @@ from tokenspeed.runtime.models.deepseek_v41_dspark import (
     DeepseekV41ForCausalLMDSpark,
     _quantized_kv,
     _WindowAttention,
+    _WindowSelection,
+    _write_window_rows,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.hf_transformers_utils import get_config
@@ -91,8 +102,10 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
             self.layer_id = layer_id
             self.engram = Engram(layer_id) if layer_id >= 37 else None
 
-        def forward(self, hidden, pre_mix, positions, input_ids, ctx):
+        def forward(self, hidden, pre_mix, positions, image_mask, ctx):
             events.append(("layer", self.layer_id))
+            rows = v41._row_plan(self.layer_id, 20, ctx)
+            assert rows.keep_rows is None and rows.source is rows.query
             # Distinct HC streams and a non-mean final mix catch weighted/output taps.
             return embeddings[:, None, :] + streams + 10 * self.layer_id, pre_mix
 
@@ -103,17 +116,21 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
     target.model.config = SimpleNamespace(
         num_hidden_layers=40, hidden_size=2, hc_mult=4, engram_layer_ids=[37, 38, 39]
     )
+    target.model.ced_decoder_start = 20
+    target.model.decoder_uses_engram = True
     target.model.layers = nn.ModuleList(Layer(i) for i in range(40))
     target.model.engram_hash = Mock(return_value=torch.tensor([[0, 1, 2], [0, 1, 2]]))
     target.model.norm = SimpleNamespace(weight=torch.ones(2), variance_epsilon=1e-6)
     target.set_dspark_layers_to_capture([37, 38, 39])
     assert target.model.dspark_capture_layers == (37, 38, 39)
     assert target.capture_aux_hidden_states
-    ctx = _ctx(None, 2, ForwardMode.EXTEND)
+    positions = torch.tensor([0, 1])
+    backend = _Backend(positions, torch.zeros(2, dtype=torch.int64))
+    ctx = _ctx(backend, 2, ForwardMode.EXTEND)
     ctx.capture_hidden_mode = capture_mode
     _, captures = target.model(
         torch.tensor([1, 2]),
-        torch.tensor([0, 1]),
+        positions,
         ctx,
         input_embeds=embeddings,
         pp_inbound=None,
@@ -206,6 +223,21 @@ def test_draft_checkpoint_strict_shards(monkeypatch, rank):
     weights = _draft_checkpoint(model.model)
     model.load_weights(reversed(list(weights.items())))
     assert model.checkpoint_load_report["loaded"] > 0
+    # The context write's merged projection holds every stage's wkv shard,
+    # loaded from the same checkpoint tensors as the stage's own wq_a_wkv.
+    merged = model.model.context_wkv
+    d, q_lora = config.head_dim, config.q_lora_rank
+    for stage, layer in enumerate(model.model.layers):
+        rows = slice(stage * d, (stage + 1) * d)
+        torch.testing.assert_close(
+            merged.weight[rows], layer.attn.wq_a_wkv.weight[q_lora:], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            merged.weight_scale_inv[rows],
+            layer.attn.wq_a_wkv.weight_scale_inv[q_lora:],
+            rtol=0,
+            atol=0,
+        )
     assert config.n_shared_experts == model.model.config.n_shared_experts == 1
     assert all(layer.ffn.shared_experts is not None for layer in model.model.layers)
     assert all(
@@ -215,7 +247,7 @@ def test_draft_checkpoint_strict_shards(monkeypatch, rank):
         for suffix in ("weight", "scale")
     )
     assert not any("hc_head" in name for name, _ in model.named_parameters())
-    assert get_drafter_impl("DSPARK", model) is DeepseekV4DSpark
+    assert get_drafter_impl("DSPARK", model) is DeepseekV41DSpark
     location = model.get_model_config_for_expert_location(model.config)
     assert (location.num_layers, location.num_logical_experts) == (3, 4)
     with pytest.raises(ValueError, match="Missing"):
@@ -239,16 +271,46 @@ def test_draft_checkpoint_strict_shards(monkeypatch, rank):
         model.load_weights([("mtp.3.norm.weight", torch.ones(config.hidden_size))])
 
 
+def _paged_slots(positions, rows_per_page):
+    """Map absolute positions onto pages 1.. of a fake window field; -1 stays."""
+    slots = rows_per_page + positions
+    return torch.where(positions < 0, torch.full_like(slots, -1), slots)
+
+
+def _history_slots(starts, window, rows_per_page):
+    wanted = starts[:, None] - (window - 1) + torch.arange(window, device=starts.device)
+    wanted = wanted.masked_fill(wanted < 0, -1)
+    return _paged_slots(wanted, rows_per_page).to(torch.int32)
+
+
+def _window_backend(positions, cache, history, block, rows_per_page):
+    """One stage's borrowed window over the block geometry ``dspark_block`` derives."""
+    n = history.shape[0]
+    anchors = torch.zeros(n, dtype=torch.int64, device=history.device)
+    _, _, _, request_indices, page, row, indices = dsv41.dspark_block(
+        anchors, anchors, history, 0, rows_per_page, 1, block
+    )
+    return _WindowAttention(
+        positions,
+        cache,
+        history,
+        block,
+        _WindowSelection(page, row, indices),
+        request_indices,
+    )
+
+
 def test_window_attention_matches_dense_reference():
     torch.manual_seed(41)
-    batch, block, heads, dim, window = 2, 5, 2, 64, 8
+    batch, block, heads, dim, window, rows = 2, 5, 2, 64, 8, 4
     q = torch.randn(batch * block, heads, dim, dtype=torch.bfloat16)
     current = torch.randn(batch * block, dim, dtype=torch.bfloat16)
-    cache = torch.randn(4, window, dim, dtype=torch.bfloat16)
-    slots, starts = torch.tensor([2, 1]), torch.tensor([3, 12])
+    cache = torch.randn(6, rows, dim, dtype=torch.bfloat16)
+    starts = torch.tensor([3, 12])
+    history = _history_slots(starts, window, rows)
     positions = (starts[:, None] + 1 + torch.arange(block)).flatten()
     sink = torch.tensor([0.1, -0.3])
-    backend = _WindowAttention(positions, cache, slots, starts, block)
+    backend = _window_backend(positions, cache, history, block, rows)
     actual = backend.forward_v41(
         q,
         current,
@@ -266,9 +328,9 @@ def test_window_attention_matches_dense_reference():
     decoded = _quantized_kv(current).reshape(batch, block, dim)
     expected = torch.empty_like(q).reshape(batch, block, heads, dim)
     for b in range(batch):
-        kv = torch.cat(
-            (cache[slots[b], : min(window, int(starts[b]) + 1)], decoded[b])
-        ).float()
+        live = history[b][history[b] >= 0].long()
+        assert live.numel() == min(window, int(starts[b]) + 1)
+        kv = torch.cat((cache[live // rows, live % rows], decoded[b])).float()
         for j in range(block):
             for h in range(heads):
                 scores = kv @ q[b * block + j, h].float() * dim**-0.5
@@ -277,6 +339,117 @@ def test_window_attention_matches_dense_reference():
     torch.testing.assert_close(
         actual, expected.reshape_as(actual), rtol=0.01, atol=0.01
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_window_attention_kernel_matches_reference():
+    """The workspace kernel path reproduces the fp32 reference on real shapes.
+
+    Rows cover an empty, a partial and a full 128-row history plus one graph
+    padding row (all -1 slots); q arrives 64-head padded with a -inf padded
+    sink exactly as ``DeepseekV41Attention.forward`` hands it over, and the
+    window field is strided like the LCM arena so the gather cannot rely on a
+    flat view.
+    """
+    from tokenspeed_kernel.ops.attention.dsv41.flash_mla import (
+        is_flash_mla_v41_available,
+    )
+    from tokenspeed_kernel.platform import current_platform
+    from tokenspeed_kernel.registry import KernelRegistry
+    from tokenspeed_kernel.selection import select_kernel
+    from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+
+    from tokenspeed.runtime.models.deepseek_v41 import DeepseekV41RotaryEmbedding
+
+    torch.manual_seed(7)
+    device = torch.device("cuda:0")
+    block, real_heads, padded_heads, dim, window, rows = 5, 2, 64, 512, 128, 64
+    config = _config()
+    config.head_dim, config.qk_rope_head_dim = dim, 64
+    config.max_position_embeddings = 4096
+    rotary = DeepseekV41RotaryEmbedding(config, 0)
+    rotary._prepare_cache(device)
+    starts = torch.tensor([0, 40, 300, -1], device=device)
+    batch = starts.numel()
+    history = _history_slots(starts.clamp_min(0), window, rows).to(device)
+    history[3] = -1
+    positions = starts.clamp_min(0)[:, None] + 1 + torch.arange(block, device=device)
+    positions = positions.flatten()
+    # 97-row strides: reshape(-1, dim) on this field would copy, not view.
+    field = torch.randn(9, 97, dim, dtype=torch.bfloat16, device=device)[:, :rows]
+    field_before = field.clone()
+    q = torch.zeros(
+        batch * block, padded_heads, dim, dtype=torch.bfloat16, device=device
+    )
+    q[:, :real_heads] = torch.randn(batch * block, real_heads, dim, device=device)
+    swa = torch.randn(batch * block, dim, dtype=torch.bfloat16, device=device)
+    sink = torch.full((padded_heads,), -float("inf"), device=device)
+    sink[:real_heads] = torch.tensor([0.1, -0.3], device=device)
+    backend = _window_backend(positions, field, history, block, rows)
+    kwargs = dict(
+        layer_id=0,
+        positions=positions,
+        request_indices=backend.meta.request_indices,
+        forward_mode=ForwardMode.DECODE,
+        index_q=None,
+        index_weights=None,
+        attn_sink=sink,
+        softmax_scale=dim**-0.5,
+        index_process_group=None,
+        swa_rope_cache=rotary.cos_sin_cache,
+    )
+    actual = backend.forward_v41(q, swa, **kwargs)
+    kv = backend._workspace(swa, positions, rotary.cos_sin_cache)
+    expected = backend._reference_forward(q, kv, sink, dim**-0.5)
+    # Both branches feed the kernel the very same quantized block rows.
+    torch.testing.assert_close(
+        backend._workspace(swa, positions, rotary.cos_sin_cache), kv, rtol=0, atol=0
+    )
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(
+        actual[:, :real_heads], expected[:, :real_heads], rtol=0.02, atol=0.004
+    )
+    assert torch.equal(field, field_before)
+    # The same launch on the same bytes must be deterministic: graph replay
+    # parity in test_draft_forward_graph_and_context_seeding relies on it.
+    torch.testing.assert_close(
+        backend.forward_v41(q, swa, **kwargs), actual, rtol=0, atol=0
+    )
+    selected = select_kernel(
+        "attention",
+        "dsv41_selected_attention",
+        format_signature(x=dense_tensor_format(torch.bfloat16)),
+        features=None,
+        platform=None,
+        traits={"flashmla_eligible": is_flash_mla_v41_available()},
+        solution=None,
+        override=None,
+    )
+    # Expect what the registry can serve here: FlashMLA inside its declared
+    # arch window (sm90-sm103, not sm107) when importable, a specialized Gluon
+    # kernel on the AMD parts that register one, the portable Triton kernel
+    # everywhere else.
+    registry, platform = KernelRegistry.get(), current_platform()
+
+    def _registered_here(name: str) -> bool:
+        spec = registry.get_by_name(name)
+        return spec is not None and spec.capability.satisfied_by(platform)
+
+    if is_flash_mla_v41_available() and _registered_here(
+        "flashmla_dsv41_selected_attention"
+    ):
+        expected = "flashmla_dsv41_selected_attention"
+    else:
+        specialized = [
+            name
+            for name in (
+                "gluon_dsv41_selected_attention_gfx950",
+                "gluon_dsv41_selected_attention_gfx1250",
+            )
+            if _registered_here(name)
+        ]
+        expected = specialized[0] if specialized else "triton_dsv41_selected_attention"
+    assert selected.name == expected
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -294,11 +467,12 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch):
             SimpleNamespace(text_config=config), _mapping(0, 1, 1), _quant()
         )
     adapter.load_weights(_draft_checkpoint(adapter.model).items())
-    with torch.no_grad():
-        adapter.model.embed_tokens.weight.fill_(0.1)
-        adapter.lm_head.weight.fill_(0.1)
+    # The target lends its BF16 embedding and head; the draft's own are placeholders.
     adapter.set_embed_and_head(
-        adapter.model.embed_tokens.weight, adapter.lm_head.weight
+        *(
+            nn.Parameter(torch.full_like(p, 0.1, dtype=torch.bfloat16))
+            for p in (adapter.model.embed_tokens.weight, adapter.lm_head.weight)
+        )
     )
     model = adapter.model
     for module in model.modules():
@@ -306,31 +480,53 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch):
             module.quant_method.process_weights_after_loading(module)
         elif isinstance(module, MoELayer):
             module.process_weights_after_loading(module)
-    _assert_prefill_graph_matches_eager(adapter, monkeypatch)
-    windows = torch.zeros(3, 3, 128, 512, dtype=torch.bfloat16, device="cuda:0")
+    # Three stage fields over eight 64-row pages; page 0 is the null page.
+    windows = torch.zeros(3, 8, 64, 512, dtype=torch.bfloat16, device="cuda:0")
+    pool = SimpleNamespace(dspark_kv=lambda stage: windows[stage])
     hidden = torch.randn(
-        2, 4, 3 * config.hidden_size, dtype=torch.bfloat16, device="cuda:0"
+        8, 3 * config.hidden_size, dtype=torch.bfloat16, device="cuda:0"
     )
-    slots = torch.tensor([1, 2], device="cuda:0")
-    positions = torch.arange(4, device="cuda:0").expand(2, -1)
-    model.write_context_windows_batched(
-        hidden,
-        positions,
-        slots,
-        torch.ones_like(positions, dtype=torch.bool),
-        windows,
-        0,
+    positions = torch.cat((torch.arange(4), torch.arange(130, 134))).to("cuda:0")
+    slots = _paged_slots(positions, 64)
+    model.write_context_kv(hidden, positions, slots, pool)
+    assert windows[:, 0].count_nonzero() == 0
+    written = windows[:, slots // 64, slots % 64]
+    assert written.count_nonzero() > 0
+    assert windows.count_nonzero() == written.count_nonzero()
+    # The fused row kernel reproduces the eager reference chain (kv_norm,
+    # RoPE, FP8 round trip, masked scatter) bit for bit, and the merged
+    # projection agrees with each stage's own wkv columns.
+    main_x = model._main_input(hidden)
+    kv, _ = model.context_wkv(main_x, block_scale=None, output_dtype=None)
+    reference = torch.zeros_like(windows)
+    for stage, layer in enumerate(model.layers):
+        stage_kv = kv[:, stage * 512 : (stage + 1) * 512]
+        qkv, _ = layer.attn.wq_a_wkv(main_x, block_scale=None, output_dtype=None)
+        torch.testing.assert_close(
+            stage_kv, qkv[:, config.q_lora_rank :], rtol=0.02, atol=0.02
+        )
+        _write_window_rows(
+            reference[stage], slots, model._main_kv(layer.attn, stage_kv, positions)
+        )
+    torch.testing.assert_close(windows, reference, rtol=0, atol=0)
+    # A -1 slot is a padding or nonresident row: the null page stays zero.
+    model.write_context_kv(
+        hidden[:1], positions[:1], torch.tensor([-1], device="cuda:0"), pool
     )
-    assert windows[0].count_nonzero() == 0
-    assert windows[1:, :, :4].count_nonzero() > 0
-    main = hidden[:, -1].contiguous()
+    assert windows[:, 0].count_nonzero() == 0
+
+    _assert_drafter_run_writes_rows_and_drafts(adapter, windows, pool)
+    _assert_drafts_follow_their_rows(adapter, windows, pool)
+
     bonus = torch.tensor([3, 4], device="cuda:0")
     starts = torch.tensor([4, 4], device="cuda:0")
+    history = torch.empty(2, 128, dtype=torch.int32, device="cuda:0")
+    history.copy_(_history_slots(starts, 128, 64))
     ctx = _ctx(None, 10, ForwardMode.DECODE)
     ctx.bs, ctx.num_extends = 2, 0
 
     def forward():
-        return model.forward_backbone(main, bonus, starts, windows, slots, ctx)
+        return model.forward_backbone(bonus, starts, history, pool, ctx)
 
     with torch.inference_mode():
         for _ in range(3):
@@ -338,11 +534,10 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = forward()
-        for position in (5, 127, 128, 129):
+        for position in (5, 127, 128, 129, 133):
             starts.fill_(position)
-            before = windows.clone()
+            history.copy_(_history_slots(starts, 128, 64))
             expected = forward()
-            windows.copy_(before)
             graph.replay()
             torch.testing.assert_close(captured, expected, rtol=0, atol=0)
             assert torch.isfinite(captured).all()
@@ -350,13 +545,23 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch):
 
 
 @torch.inference_mode()
-def _assert_prefill_graph_matches_eager(adapter, monkeypatch):
+@torch.inference_mode()
+def _assert_drafts_follow_their_rows(adapter, windows, pool):
+    """Permuting a decode batch permutes its drafts: no row reads another's state.
+
+    Three decode requests with different bonus tokens, accept lengths and
+    windows run as ``[A, B, C]`` and as ``[C, A, B]``; each request's block
+    must come out the same in both orders. The block sampler once read the
+    drafter's strided bonus column as contiguous, which gave every row after
+    the first another row's anchor -- a single-request batch never sees that.
+    """
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
 
-    ib = InputBuffers(3, 1024, 8, device="cuda:0")
-    drafter = DeepseekV4DSpark(
-        spec_num_tokens=6,
-        spec_num_steps=5,
+    width, block, n = 6, 5, 3
+    ib = InputBuffers(n, 1024, 8, device="cuda:0")
+    drafter = DeepseekV41DSpark(
+        spec_num_tokens=width,
+        spec_num_steps=block,
         draft_model_runner=SimpleNamespace(
             model=adapter, mapping=adapter.mapping, device="cuda:0"
         ),
@@ -366,53 +571,179 @@ def _assert_prefill_graph_matches_eager(adapter, monkeypatch):
         input_buffers=ib,
         vocab_size=adapter.model.config.vocab_size,
     )
-    drafter.capture_prefill_graph(torch.cuda.Stream())
-    graph = drafter._prefill_graph
-    assert graph is not None
-    torch.manual_seed(41)
-    # Full-ring padding must preserve untouched columns, including near the
-    # RoPE limit. Reorder slots, continue chunks and reuse a slot for a new request.
-    cases = (
-        ([15, 1, 0], [0, 126, 0], [2, 5, 1], ["a", "b", "c"]),
-        ([130, 7], [15, 127], [2, 5], ["a", "b"]),
-        ([3, 129, 5], [134, 145, 0], [5, 2, 1], ["b", "a", "c"]),
-        ([1, 127], [131071, 0], [5, 2], ["b", "new"]),
-        ([128], [128], [1], ["c"]),
-    )
-    for lengths, prefixes, slots, request_ids in cases:
-        bs = len(lengths)
-        ib.extend_seq_lens_cpu[:bs] = torch.tensor(lengths, dtype=torch.int32)
-        ib.extend_prefix_lens_cpu[:bs] = torch.tensor(prefixes, dtype=torch.int32)
-        ib.req_pool_indices_buf[:bs] = torch.tensor(slots, device="cuda:0")
-        drafter.prepare_request_state(request_ids, slots, bs)
-        n = sum(lengths)
-        positions = torch.cat(
-            [torch.arange(p, p + length) for p, length in zip(prefixes, lengths)]
-        ).to("cuda:0")
-        ib.positions_buf[:n].copy_(positions)
-        # Trailing decode rows in a mixed batch must not enter prefill seeding.
-        hidden = torch.randn(
-            n + 6, drafter.hidden_width, device="cuda:0", dtype=torch.bfloat16
+    drafter.wire_target(
+        SimpleNamespace(
+            set_dspark_layers_to_capture=Mock(),
+            logits_processor=SimpleNamespace(tp_group=adapter.mapping.attn.tp_group),
         )
-        before = drafter.kv_windows.clone(), drafter.context_lengths.clone()
-        drafter._prefill_graph = None
-        assert drafter._seed_prefill_windows(hidden, bs) == n
-        expected = drafter.kv_windows.clone(), drafter.context_lengths.clone()
-        drafter.kv_windows.copy_(before[0])
-        drafter.context_lengths.copy_(before[1])
-        drafter._prefill_graph = graph
-        # Replay must execute the captured projection/write kernels without
-        # calling the eager model implementation again.
-        with monkeypatch.context() as patch:
-            patch.setattr(
-                drafter.model,
-                "write_context_windows_batched",
-                Mock(side_effect=AssertionError("draft prefill ran eagerly")),
-            )
-            assert drafter._seed_prefill_windows(hidden, bs) == n
-        torch.testing.assert_close(drafter.kv_windows, expected[0], rtol=0, atol=0)
-        torch.testing.assert_close(drafter.context_lengths, expected[1], rtol=0, atol=0)
-        assert drafter._seed_prefill_windows(hidden, 0) == 0
+    )
+    torch.manual_seed(3)
+    # The synthetic checkpoint's Markov weights are constants, which makes the
+    # bigram bias the same for every anchor; random weights make the drafts
+    # depend on which anchor each row reads.
+    for weight in (
+        adapter.model.markov_embedding.weight,
+        adapter.model.markov_projection.weight,
+    ):
+        weight.copy_(torch.randn_like(weight, dtype=torch.float32).to(weight.dtype))
+    # Positions stay inside the eight fake pages (slot = 64 + position).
+    starts = [300, 40, 380]
+    accepts = [4, 1, 6]
+    hidden = torch.randn(
+        n, width, drafter.hidden_width, dtype=torch.bfloat16, device="cuda:0"
+    )
+    tokens = torch.randint(
+        0, adapter.model.config.vocab_size, (n, width), device="cuda:0"
+    ).to(torch.int32)
+
+    def run(order):
+        positions = torch.cat(
+            [torch.arange(starts[i], starts[i] + width, device="cuda:0") for i in order]
+        )
+        meta = SimpleNamespace(
+            positions=positions,
+            swa_write_slots=_paged_slots(positions, 64),
+            request_indices=torch.arange(n, device="cuda:0").repeat_interleave(width),
+        )
+        backend = SimpleNamespace(
+            query_metadata=lambda mode: meta,
+            decoder_view=lambda: V41DecoderView(meta, None, (), None, None),
+            window_slots=lambda group, start_pos, requests: (
+                _history_slots(start_pos, 128, 64),
+                None,
+            ),
+        )
+        ctx = _ctx(None, n * width, ForwardMode.DECODE)
+        ctx.bs, ctx.num_extends = n, 0
+        ctx.attn_backend, ctx.token_to_kv_pool = backend, pool
+        windows.zero_()
+        return drafter.run(
+            base_ctx=ctx,
+            logits_output=SimpleNamespace(
+                hidden_states=hidden[order].reshape(-1, drafter.hidden_width)
+            ),
+            output_tokens=tokens[order].reshape(-1),
+            accept_lengths=torch.tensor(
+                [accepts[i] for i in order], device="cuda:0", dtype=torch.int32
+            ),
+        ).clone()
+
+    forward = run([0, 1, 2])
+    rotated = run([2, 0, 1])
+    torch.testing.assert_close(rotated, forward[[2, 0, 1]], rtol=0, atol=0)
+    # The requests differ, so identical drafts would mean the rows collapsed.
+    assert not torch.equal(forward[0], forward[1])
+    assert not torch.equal(forward[1], forward[2])
+
+
+def _assert_drafter_run_writes_rows_and_drafts(adapter, windows, pool):
+    """Drive run() through a fake V4.1 backend: extend rows seed, decode rows draft."""
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
+
+    width, block = 6, 5
+    ib = InputBuffers(3, 1024, 8, device="cuda:0")
+    drafter = DeepseekV41DSpark(
+        spec_num_tokens=width,
+        spec_num_steps=block,
+        draft_model_runner=SimpleNamespace(
+            model=adapter, mapping=adapter.mapping, device="cuda:0"
+        ),
+        attn_backend=None,
+        token_to_kv_pool=None,
+        runtime_states=None,
+        input_buffers=ib,
+        vocab_size=adapter.model.config.vocab_size,
+    )
+    target = SimpleNamespace(
+        set_dspark_layers_to_capture=Mock(),
+        logits_processor=SimpleNamespace(tp_group=adapter.mapping.attn.tp_group),
+    )
+    drafter.wire_target(target)
+    # One extend request of 5 tokens at positions 198..202 whose CED decoder
+    # kept its last 3 rows (200..202), and one decode row whose verify window
+    # covers positions 300..305 with 4 accepted tokens. The taps -- and the
+    # rows the drafter writes -- follow the decoder view, not the raw extend.
+    extend_positions = torch.arange(200, 203, device="cuda:0")
+    decode_positions = torch.arange(300, 306, device="cuda:0")
+    metas = {
+        ForwardMode.EXTEND: SimpleNamespace(
+            positions=torch.arange(198, 203, device="cuda:0"),
+            swa_write_slots=_paged_slots(torch.arange(198, 203, device="cuda:0"), 64),
+            request_indices=torch.zeros(5, dtype=torch.int64, device="cuda:0"),
+        ),
+        ForwardMode.DECODE: SimpleNamespace(
+            positions=decode_positions,
+            swa_write_slots=_paged_slots(decode_positions, 64),
+            request_indices=torch.ones(6, dtype=torch.int64, device="cuda:0"),
+        ),
+    }
+    kept = SimpleNamespace(
+        positions=extend_positions,
+        swa_write_slots=_paged_slots(extend_positions, 64),
+        request_indices=torch.zeros(3, dtype=torch.int64, device="cuda:0"),
+    )
+    view_positions = torch.cat((extend_positions, decode_positions))
+    view = V41DecoderView(
+        SimpleNamespace(
+            positions=view_positions,
+            swa_write_slots=_paged_slots(view_positions, 64),
+            request_indices=torch.cat(
+                (kept.request_indices, metas[ForwardMode.DECODE].request_indices)
+            ),
+        ),
+        kept,
+        (V41PrefillSpan(0, 0, 200, 3, 200),),
+        torch.tensor([2, 3, 4, 5, 6, 7, 8, 9, 10], device="cuda:0"),
+        torch.tensor([2, 3, 4, 5, 6, 7, 8], device="cuda:0"),
+    )
+    seen = {"groups": set()}
+
+    def window_slots(group_id, start_pos, request_indices):
+        seen["groups"].add(group_id)
+        seen["start_pos"] = start_pos.clone()
+        seen["requests"] = request_indices.clone()
+        return _history_slots(start_pos, 128, 64), None
+
+    backend = SimpleNamespace(
+        query_metadata=lambda mode: metas[mode],
+        decoder_view=lambda: view,
+        window_slots=window_slots,
+    )
+    ib.extend_seq_lens_cpu[:1] = 5
+    ctx = _ctx(None, 3 + width, ForwardMode.MIXED)
+    ctx.bs, ctx.num_extends = 2, 1
+    ctx.attn_backend, ctx.token_to_kv_pool = backend, pool
+    hidden = torch.randn(
+        3 + width, drafter.hidden_width, dtype=torch.bfloat16, device="cuda:0"
+    )
+    output_tokens = torch.arange(1, 2 + width, device="cuda:0", dtype=torch.int32)
+    accept_lengths = torch.tensor([1, 4], device="cuda:0", dtype=torch.int32)
+    windows.zero_()
+    next_tokens = drafter.run(
+        base_ctx=ctx,
+        logits_output=SimpleNamespace(hidden_states=hidden),
+        output_tokens=output_tokens,
+        accept_lengths=accept_lengths,
+    )
+    assert next_tokens.shape == (2, width)
+    assert torch.isfinite(next_tokens.float()).all()
+    # The extend row proposes nothing beyond its bonus; the decode row does.
+    assert (next_tokens[0] == output_tokens[0]).all()
+    assert next_tokens[1, 0] == output_tokens[1 + 3]
+    assert seen["start_pos"].tolist() == [303]
+    assert seen["requests"].tolist() == [1]
+    assert seen["groups"] == {"v41.swa"}
+    # Exactly the kept extend rows and the verify rows were written; the two
+    # extend rows the decoder dropped (198, 199) were never captured.
+    written = torch.cat((extend_positions, decode_positions))
+    slots = _paged_slots(written, 64)
+    assert windows[:, 0].count_nonzero() == 0
+    assert (windows[:, slots // 64, slots % 64] != 0).any(dim=-1).all()
+    assert (
+        windows.count_nonzero() == windows[:, slots // 64, slots % 64].count_nonzero()
+    )
+    dropped = _paged_slots(torch.arange(198, 200, device="cuda:0"), 64)
+    assert windows[:, dropped // 64, dropped % 64].count_nonzero() == 0
 
 
 @pytest.mark.parametrize("checkpoint_source", ["temporary", "reference"])
@@ -488,7 +819,7 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
     assert draft.hf_text_config.num_nextn_predict_layers == 3
     assert draft.spec_block_size == args.speculative_num_steps == 5
     assert args.speculative_num_draft_tokens == 6
-    assert draft.dspark_prefix_replay_tokens == 128
+    assert draft.dspark_prefix_replay_tokens == 0
     assert (
         target.hf_text_config.n_shared_experts
         == draft.hf_text_config.n_shared_experts

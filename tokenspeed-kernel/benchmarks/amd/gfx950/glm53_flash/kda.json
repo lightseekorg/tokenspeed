@@ -1,0 +1,198 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "glm53_flash.attention.kda_paged_decode/steady-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "kda_paged_decode",
+        "parameters": {
+          "model_profile": "glm53_flash_tp4",
+          "heads": 16,
+          "key_dim": 128,
+          "value_dim": 128,
+          "dtype": "bfloat16",
+          "lower_bound": -5,
+          "recurrent_layout": "v_major",
+          "batch": [1, 2, 4, 8, 16],
+          "state_pages": 841,
+          "state_page_stride": [271872, 294912],
+          "state_page_relation": "in_place"
+        },
+        "cold_cache": true,
+        "seed": 701
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 0.5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.kda_paged_decode/boundary-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "kda_paged_decode",
+        "parameters": {
+          "model_profile": "glm53_flash_tp4",
+          "heads": 16,
+          "key_dim": 128,
+          "value_dim": 128,
+          "dtype": "bfloat16",
+          "lower_bound": -5,
+          "recurrent_layout": "v_major",
+          "batch": [1, 16],
+          "state_pages": 841,
+          "state_page_stride": 294912,
+          "state_page_relation": "distinct"
+        },
+        "cold_cache": true,
+        "seed": 1701
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 0.5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.kda_paged_prefill/cold-prefill-c1-t8192-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "kda_paged_prefill",
+        "parameters": {
+          "model_profile": "glm53_flash_tp4",
+          "heads": 16,
+          "key_dim": 128,
+          "value_dim": 128,
+          "dtype": "bfloat16",
+          "lower_bound": -5,
+          "recurrent_layout": "v_major",
+          "batch": 1,
+          "tokens_per_sequence": 8192
+        },
+        "cold_cache": true,
+        "seed": 801
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 10,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.kda_paged_prefill/extend-b1-t256-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "kda_paged_prefill",
+        "parameters": {
+          "model_profile": "glm53_flash_tp4",
+          "heads": 16,
+          "key_dim": 128,
+          "value_dim": 128,
+          "dtype": "bfloat16",
+          "lower_bound": -5,
+          "recurrent_layout": "v_major",
+          "batch": 1,
+          "tokens_per_sequence": 256
+        },
+        "cold_cache": true,
+        "seed": 901
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.kda_paged_prefill/extend-b2-b16-t256-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "kda_paged_prefill",
+        "parameters": {
+          "model_profile": "glm53_flash_tp4",
+          "heads": 16,
+          "key_dim": 128,
+          "value_dim": 128,
+          "dtype": "bfloat16",
+          "lower_bound": -5,
+          "recurrent_layout": "v_major",
+          "batch": [2, 4, 8, 16],
+          "tokens_per_sequence": 256
+        },
+        "cold_cache": true,
+        "seed": 901
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.kda_paged_prefill/tail-align-b1-b2-t64-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "attention",
+        "mode": "kda_paged_prefill",
+        "parameters": {
+          "model_profile": "glm53_flash_tp4",
+          "heads": 16,
+          "key_dim": 128,
+          "value_dim": 128,
+          "dtype": "bfloat16",
+          "lower_bound": -5,
+          "recurrent_layout": "v_major",
+          "batch": [1, 2],
+          "tokens_per_sequence": 64
+        },
+        "cold_cache": true,
+        "seed": 1001
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 3,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.kda_paged_prefill/tail-align-b4-b16-t64-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "kda_paged_prefill",
+        "parameters": {
+          "model_profile": "glm53_flash_tp4",
+          "heads": 16,
+          "key_dim": 128,
+          "value_dim": 128,
+          "dtype": "bfloat16",
+          "lower_bound": -5,
+          "recurrent_layout": "v_major",
+          "batch": [4, 8, 16],
+          "tokens_per_sequence": 64
+        },
+        "cold_cache": true,
+        "seed": 1001
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 3,
+        "max_relative_mad": 0.05
+      }
+    }
+  ]
+}

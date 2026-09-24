@@ -71,9 +71,9 @@ class AutoBackend(CommBackend):
     @staticmethod
     def _group_spans_nodes(group: Group) -> bool:
         mapping = global_server_args_dict.get("mapping")
-        nprocs_per_node = getattr(mapping, "nprocs_per_node", None)
-        if not nprocs_per_node:
+        if mapping is None or not mapping.nprocs_per_node:
             return False
+        nprocs_per_node = mapping.nprocs_per_node
         return len({rank // nprocs_per_node for rank in group}) > 1
 
     @staticmethod
@@ -194,6 +194,7 @@ class AutoBackend(CommBackend):
         producer_direct_max_numel: int,
         attnres_max_numel: int,
         attnres_max_rows: int,
+        enable_lamport: bool,
         dtype: torch.dtype,
     ) -> bool:
         if (
@@ -209,6 +210,7 @@ class AutoBackend(CommBackend):
             producer_direct_max_numel=producer_direct_max_numel,
             attnres_max_numel=attnres_max_numel,
             attnres_max_rows=attnres_max_rows,
+            enable_lamport=enable_lamport,
             dtype=dtype,
         )
 

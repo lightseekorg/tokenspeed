@@ -68,7 +68,6 @@ __all__ = ["flash_kda_chunk_prefill"]
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
     traits={"recurrent_layout": frozenset({"k_major"})},
-    tags={"nvidia", "paged_cache"},
 )
 def flashkda_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
     return _nvidia_kda_prefill(flash_kda_chunk_prefill, **kwargs)

@@ -29,6 +29,7 @@ from tokenspeed_kernel.ops.attention.dsv4.cuda import (
 from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_compute_global_topk_indices_and_lens,
 )
+from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda import (
     hash_softplus_sqrt_topk_flash,
@@ -96,7 +97,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
     DeepseekV4Recipe,
-    v4_c4_state_window,
     v4_compressed_kv_spec,
     v4_compressor_state_spec,
     v4_indexer_kv_spec,
@@ -127,6 +127,7 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4Model,
     DeepseekV4MoE,
     DeepseekV4MoEGate,
+    DeepseekV4TopK,
     _deepseek_v4_expert_scale_parameter_name,
     _deepseek_v4_forward_metadata,
     _deepseek_v4_indexer_decode_max_len,
@@ -141,11 +142,9 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     _deepseek_v4_routed_expert_quant_config,
     _DeepseekV4TopKBuffer,
     deepseek_v4_rope_config,
-    dsv4_select_experts,
     hc_head,
     mhc_post,
     mhc_pre,
-    pack_topk_as_router_logits,
 )
 from tokenspeed.runtime.models.deepseek_v4_dspark import (
     _ATTENTION_CHECKPOINT_TENSORS,
@@ -163,7 +162,10 @@ from tokenspeed.runtime.models.deepseek_v4_dspark_ops.attention import (
     dspark_fp8_quant_dequant,
     get_dspark_topk_idxs_batched,
 )
-from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import _local_vocab_argmax
+from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import (
+    dspark_greedy_workspace,
+    sample_dspark_block_greedy,
+)
 from tokenspeed.runtime.models.deepseek_v4_next import DeepseekV4ForCausalLMNextN
 from tokenspeed.runtime.pd.cache_protocol import build_cache_fields_by_producer_step
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
@@ -246,21 +248,23 @@ def _extend_kwargs(
         extend_seq_lens_cpu=extend_seq_lens_cpu,
         extend_prefix_lens=extend_prefix_lens_cpu.clone(),
         extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+        extend_replay_lens_cpu=torch.zeros_like(extend_prefix_lens_cpu),
+        extend_prompt_lens_cpu=extend_prefix_lens_cpu
+        + extend_seq_lens_cpu[: extend_prefix_lens_cpu.numel()],
         extend_with_prefix=bool(extend_prefix_lens_cpu.any()),
     )
 
 
-def _v4_spec_set(hf_config, *, layer_ratio, decode_input_tokens: int = 1):
+def _v4_spec_set(hf_config, *, layer_ratio):
     """The spec set a ratio vector declares, in the recipe's own order."""
     ratios = {int(ratio) for ratio in layer_ratio}
-    window = v4_c4_state_window(decode_input_tokens)
     specs = [v4_swa_kv_spec(hf_config)]
     for ratio in sorted(r for r in ratios if r > 1):
-        specs.append(v4_compressor_state_spec(ratio, c4_state_window=window))
+        specs.append(v4_compressor_state_spec(ratio))
         specs.append(v4_compressed_kv_spec(ratio))
     if 4 in ratios:
         specs.append(v4_indexer_kv_spec())
-        specs.append(v4_indexer_state_spec(c4_state_window=window))
+        specs.append(v4_indexer_state_spec())
     return tuple(specs)
 
 
@@ -279,6 +283,8 @@ def _v4_recipe(
             chunked_prefill_size=prefix_granularity,
             attention_use_fp4_indexer_cache=True,
             speculative_algorithm=None,
+            disaggregation_mode="null",
+            enable_prefix_caching=True,
         ),
         model_config=SimpleNamespace(
             hf_config=hf_config, num_attention_layers=num_layers
@@ -403,12 +409,12 @@ def _v4_cache_group_spec(group_id: str) -> CacheGroupSpec:
     if group_id == V4_SWA_KV_GROUP_ID:
         return v4_swa_kv_spec(SimpleNamespace(sliding_window=128))
     if group_id == V4_INDEXER_COMPRESSOR_STATE_GROUP_ID:
-        return v4_indexer_state_spec(c4_state_window=v4_c4_state_window(1))
+        return v4_indexer_state_spec()
     if group_id == V4_INDEXER_KV_GROUP_ID:
         return v4_indexer_kv_spec()
     ratio = parse_v4_compressor_state_group_id(group_id)
     if ratio is not None:
-        return v4_compressor_state_spec(ratio, c4_state_window=v4_c4_state_window(1))
+        return v4_compressor_state_spec(ratio)
     ratio = parse_v4_compressed_kv_group_id(group_id)
     if ratio is not None:
         return v4_compressed_kv_spec(ratio)
@@ -716,6 +722,9 @@ class TestDeepseekV4Config(unittest.TestCase):
 
     def _bind_deepseek_v4_moe_methods(self, moe):
         for name in (
+            "_renormalize_routing_weights",
+            "_compute_topk_output",
+            "_forward_routed_experts",
             "_forward_shared_experts",
             "forward_mega_moe",
             "forward_normal",
@@ -730,34 +739,25 @@ class TestDeepseekV4Config(unittest.TestCase):
         stream_fork,
         calls,
         *,
-        bypassed_topk_output,
         norm_topk_prob,
     ):
-        def select_experts(states, ids):
-            calls.append("select")
+        def routing_inputs(states, ids):
+            calls.append("routing_inputs")
             self.assertIs(states, hidden_states)
             self.assertIs(ids, input_ids)
-            topk_shape = (states.shape[0], 2)
-            return (
-                torch.ones(topk_shape, device=states.device),
-                torch.zeros(topk_shape, device=states.device, dtype=torch.int32),
-                None,
-            )
+            return torch.zeros(states.shape[0], 4), None, None, ids
 
-        def make_topk_output(states, weights, ids, scores):
-            del weights, ids, scores
+        def topk(states, router_logits, **kwargs):
             calls.append("topk")
-            return SimpleNamespace(
-                hidden_states=states,
-                format=SimpleNamespace(
-                    is_bypassed=lambda: bypassed_topk_output,
-                ),
-            )
+            self.assertIs(states, hidden_states)
+            self.assertEqual(tuple(router_logits.shape), (states.shape[0], 4))
+            return SimpleNamespace(scale=2.0)
 
         def routed_experts(**kwargs):
             calls.append("routed")
             self.assertIs(kwargs["hidden_states"], hidden_states)
-            return hidden_states + 1
+            self.assertIsNotNone(kwargs["topk_output"])
+            return (hidden_states + 1) * kwargs["topk_output"].scale
 
         def shared_experts(states):
             calls.append("shared")
@@ -772,10 +772,36 @@ class TestDeepseekV4Config(unittest.TestCase):
             routed_scaling_factor=2.0,
             config=SimpleNamespace(norm_topk_prob=norm_topk_prob),
             experts=routed_experts,
-            _select_experts=select_experts,
-            _make_topk_output=make_topk_output,
+            topk=topk,
+            _routing_inputs=routing_inputs,
         )
         return self._bind_deepseek_v4_moe_methods(moe)
+
+    def test_deepseek_v4_topk_builds_precomputed_output(self):
+        hidden_states = torch.ones((2, 3))
+        router_logits = torch.zeros((2, 4))
+        correction_bias = torch.zeros(4)
+        topk_weights = torch.tensor([[1.4, 0.6], [1.1, 0.9]])
+        topk_ids = torch.tensor([[3, 1], [2, 0]], dtype=torch.int32)
+        calls = []
+
+        def fake_moe_topk(*args, **kwargs):
+            calls.append((args, kwargs))
+            return topk_weights, topk_ids
+
+        with patch.object(deepseek_v4_model, "moe_topk", fake_moe_topk):
+            output = DeepseekV4TopK(
+                top_k=2,
+                renormalize=True,
+                correction_bias=correction_bias,
+                routed_scaling_factor=2.0,
+                hash_routing=False,
+            )(hidden_states, router_logits)
+
+        self.assertIs(output.topk_weights, topk_weights)
+        self.assertIs(output.topk_ids, topk_ids)
+        self.assertIs(output.router_logits, router_logits)
+        self.assertEqual(calls[0][0][2:6], ("sqrt_softplus", "topk", True, 2.0))
 
     def test_deepseek_v4_moe_stream_fork_disabled_order(self):
         calls = []
@@ -786,7 +812,6 @@ class TestDeepseekV4Config(unittest.TestCase):
             input_ids,
             StreamFork(None),
             calls,
-            bypassed_topk_output=False,
             norm_topk_prob=True,
         )
 
@@ -798,31 +823,23 @@ class TestDeepseekV4Config(unittest.TestCase):
             max_num_tokens_per_gpu=2,
         )
 
-        self.assertEqual(calls, ["select", "topk", "routed", "shared"])
+        self.assertEqual(calls, ["routing_inputs", "topk", "routed", "shared"])
         self.assertTrue(
             torch.equal(actual, (hidden_states + 1) * 2 + hidden_states + 3)
         )
 
-    def test_deepseek_v4_moe_preserves_unnormalized_kernel_route_weights(self):
+    def test_deepseek_v4_moe_always_builds_topk_output(self):
         hidden_states = torch.ones(2, 3)
         input_ids = torch.arange(2)
 
-        for bypassed_topk_output, norm_topk_prob, routed_multiplier in (
-            (True, False, 4),
-            (True, True, 2),
-            (False, False, 2),
-        ):
-            with self.subTest(
-                bypassed_topk_output=bypassed_topk_output,
-                norm_topk_prob=norm_topk_prob,
-            ):
+        for norm_topk_prob in (False, True):
+            with self.subTest(norm_topk_prob=norm_topk_prob):
                 calls = []
                 moe = self._make_fake_deepseek_v4_moe(
                     hidden_states,
                     input_ids,
                     StreamFork(None),
                     calls,
-                    bypassed_topk_output=bypassed_topk_output,
                     norm_topk_prob=norm_topk_prob,
                 )
 
@@ -834,17 +851,22 @@ class TestDeepseekV4Config(unittest.TestCase):
                     max_num_tokens_per_gpu=2,
                 )
 
-                expected = (hidden_states + 1) * routed_multiplier + hidden_states + 3
-                self.assertEqual(calls, ["select", "topk", "routed", "shared"])
+                expected = (hidden_states + 1) * 2 + hidden_states + 3
+                self.assertEqual(calls, ["routing_inputs", "topk", "routed", "shared"])
                 self.assertTrue(torch.equal(actual, expected))
 
-    def test_deepseek_v4_moe_kernel_does_not_repeat_output_scaling(self):
+    def test_deepseek_v4_moe_topk_owns_routed_scaling(self):
         captured = {}
+        topk_config = {}
 
         class FakeExperts:
             def __init__(self, **kwargs):
                 captured.update(kwargs)
                 self.topk_output_format = object()
+
+        class FakeTopK:
+            def __init__(self, **kwargs):
+                topk_config.update(kwargs)
 
         backend = SimpleNamespace(
             is_mega_moe=lambda: False,
@@ -871,7 +893,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 ep_rank=0,
             ),
         )
-        gate = SimpleNamespace(e_score_correction_bias=None)
+        gate = SimpleNamespace(e_score_correction_bias=None, tid2eid=None)
 
         with (
             patch.object(deepseek_v4_model, "get_moe_backend", return_value=backend),
@@ -882,12 +904,14 @@ class TestDeepseekV4Config(unittest.TestCase):
                 return_value=(None, False),
             ),
             patch.object(deepseek_v4_model, "MoELayer", FakeExperts),
-            patch.object(deepseek_v4_model, "TopK"),
+            patch.object(deepseek_v4_model, "DeepseekV4TopK", FakeTopK),
         ):
             moe = DeepseekV4MoE(config, mapping, None, 0, "model.layers.0.ffn")
 
         self.assertEqual(moe.routed_scaling_factor, 2.5)
+        self.assertEqual(captured["routing_mode"], "precomputed_topk")
         self.assertEqual(captured["routing_config"]["routed_scaling_factor"], 1.0)
+        self.assertEqual(topk_config["routed_scaling_factor"], 2.5)
 
     def test_deepseek_v4_shared_mlp_uses_dense_tp(self):
         mapping = Mapping(
@@ -919,33 +943,34 @@ class TestDeepseekV4Config(unittest.TestCase):
     def _make_fake_mega_deepseek_v4_moe(
         self, hidden_states, input_ids, shared_experts, calls
     ):
-        def select_experts(states, ids):
-            calls.append("select")
+        def routing_inputs(states, ids):
+            calls.append("routing_inputs")
             self.assertIs(states, hidden_states)
             self.assertIs(ids, input_ids)
-            topk_shape = (states.shape[0], 2)
-            return (
-                torch.ones(topk_shape, device=states.device),
-                torch.zeros(topk_shape, device=states.device, dtype=torch.int32),
-                None,
-            )
+            return torch.zeros(states.shape[0], 4), None, None, ids
 
-        def routed_experts(states, topk_weights, topk_ids):
-            del topk_weights
-            calls.append("routed")
+        def topk(states, router_logits, **kwargs):
+            calls.append("topk")
             self.assertIs(states, hidden_states)
-            self.assertEqual(topk_ids.dtype, torch.int32)
+            self.assertEqual(tuple(router_logits.shape), (states.shape[0], 4))
+            return object()
+
+        def routed_experts(**kwargs):
+            calls.append("routed")
+            self.assertIs(kwargs["hidden_states"], hidden_states)
+            self.assertIsNotNone(kwargs["topk_output"])
             return hidden_states + 1
 
         moe = SimpleNamespace(
             use_mega_moe=True,
-            config=SimpleNamespace(num_experts_per_tok=2),
+            config=SimpleNamespace(num_experts_per_tok=2, norm_topk_prob=True),
             n_shared_experts=1,
             shared_experts=shared_experts,
             stream_fork=StreamFork(None),
             routed_scaling_factor=1.0,
             experts=routed_experts,
-            _select_experts=select_experts,
+            topk=topk,
+            _routing_inputs=routing_inputs,
         )
         return self._bind_deepseek_v4_moe_methods(moe)
 
@@ -989,7 +1014,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             comm_manager=FakeCommManager(),
         )
 
-        self.assertEqual(calls, ["select", "routed", "shared"])
+        self.assertEqual(calls, ["routing_inputs", "topk", "routed", "shared"])
         self.assertTrue(torch.equal(actual, hidden_states + 1 + hidden_states + 3))
 
     def test_deepseek_v4_mega_moe_shared_uses_comm_manager(self):
@@ -1038,7 +1063,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             comm_manager=FakeCommManager(),
         )
 
-        self.assertEqual(calls, ["select", "routed", "shared"])
+        self.assertEqual(calls, ["routing_inputs", "topk", "routed", "shared"])
         self.assertEqual(comm_calls, [("pre", ctx), ("post", ctx)])
         self.assertTrue(torch.equal(actual, hidden_states + 1 + hidden_states + 3))
 
@@ -1052,7 +1077,6 @@ class TestDeepseekV4Config(unittest.TestCase):
             input_ids,
             StreamFork(torch.cuda.Stream()),
             calls,
-            bypassed_topk_output=False,
             norm_topk_prob=True,
         )
 
@@ -1066,7 +1090,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         torch.cuda.synchronize()
 
-        self.assertEqual(calls, ["select", "topk", "routed", "shared"])
+        self.assertEqual(calls, ["routing_inputs", "topk", "routed", "shared"])
         self.assertTrue(
             torch.equal(actual, (hidden_states + 1) * 2 + hidden_states + 3)
         )
@@ -2102,82 +2126,101 @@ class TestDeepseekV4Config(unittest.TestCase):
                 0,
             )
 
-    def test_dspark_tp_argmax_uses_contiguous_full_workspace_for_partial_batch(self):
-        local_logits = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
-        lm_head = SimpleNamespace(
-            shard_indices=SimpleNamespace(
-                num_org_elements=4,
-                num_org_elements_padded=4,
-                num_added_elements=0,
-                org_vocab_start_index=0,
-                added_vocab_start_index=4,
-            )
+    @staticmethod
+    def _greedy_fixture(vocab, rank, rows, block, tp_size, device):
+        """A single vocabulary shard plus the reference argmax over it."""
+        torch.manual_seed(0)
+        shard = SimpleNamespace(
+            num_org_elements=vocab,
+            num_added_elements=0,
+            org_vocab_start_index=0,
         )
-        gathered_values = torch.empty(4, 8)
-        gathered_ids = torch.empty(4, 8, dtype=torch.int64)
+        embedding = SimpleNamespace(
+            weight=torch.randn(vocab, rank, device=device).to(torch.bfloat16)
+        )
+        projection = SimpleNamespace(
+            weight=torch.randn(vocab, rank, device=device).to(torch.bfloat16),
+            shard_indices=shard,
+        )
+        markov = SimpleNamespace(embedding=embedding, projection=projection)
+        lm_head = SimpleNamespace(shard_indices=shard)
+        logits = torch.randn(rows, block, vocab, device=device)
+        bonus = torch.randint(0, vocab, (rows,), device=device, dtype=torch.int32)
+        expected = torch.empty(rows, block, dtype=torch.int64, device=device)
+        previous = bonus.long()
+        for step in range(block):
+            bias = embedding.weight[previous].float() @ projection.weight.float().T
+            previous = torch.argmax(logits[:, step] + bias, dim=-1)
+            expected[:, step] = previous
+        candidates, partials = dspark_greedy_workspace(tp_size, rows + 3, vocab, device)
+        return markov, lm_head, logits, bonus, expected, candidates, partials
 
-        def fake_all_gather(output, input_, group):
-            self.assertTrue(output.is_contiguous())
-            self.assertEqual(output.numel(), 4)
-            output.copy_(input_.repeat(4))
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_dspark_single_rank_block_sampler_matches_reference_without_gathers(self):
+        markov, lm_head, logits, bonus, expected, candidates, partials = (
+            self._greedy_fixture(300, 32, 5, 4, 1, "cuda")
+        )
+        output = torch.empty(5, 4, dtype=torch.int32, device="cuda")
+
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads.all_gather_single"
+        ) as gather:
+            sample_dspark_block_greedy(
+                logits, bonus, markov, lm_head, object(), candidates, partials, output
+            )
+
+        gather.assert_not_called()
+        self.assertIsNone(partials)
+        self.assertEqual(candidates.shape[:2], (2, 1))
+        self.assertTrue(torch.equal(output.long(), expected))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_dspark_tp_block_sampler_gathers_one_candidate_buffer_per_step(self):
+        markov, lm_head, logits, bonus, expected, candidates, partials = (
+            self._greedy_fixture(300, 32, 5, 4, 4, "cuda")
+        )
+        output = torch.empty(5, 4, dtype=torch.int32, device="cuda")
+
+        def fake_all_gather(gathered, scored, group):
+            # Every rank contributes this shard: the packed keys tie and the
+            # resolve must still pick this shard's winner.
+            self.assertTrue(gathered.is_contiguous() and scored.is_contiguous())
+            self.assertEqual(gathered.numel(), 4 * scored.numel())
+            gathered.view(4, -1).copy_(scored.expand(4, -1))
 
         with patch(
             "tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads.all_gather_single",
             side_effect=fake_all_gather,
         ) as gather:
-            token_ids = _local_vocab_argmax(
-                local_logits,
-                lm_head,
-                object(),
-                gathered_values,
-                gathered_ids,
+            sample_dspark_block_greedy(
+                logits, bonus, markov, lm_head, object(), candidates, partials, output
             )
 
-        self.assertEqual(gather.call_count, 2)
-        self.assertTrue(torch.equal(token_ids, torch.tensor([3], dtype=torch.int32)))
+        self.assertEqual(gather.call_count, 4)
+        self.assertTrue(torch.equal(output.long(), expected))
 
-        with self.assertRaisesRegex(ValueError, "must be contiguous"):
-            _local_vocab_argmax(
-                local_logits,
+        with self.assertRaisesRegex(ValueError, "does not cover the batch"):
+            sample_dspark_block_greedy(
+                logits,
+                bonus,
+                markov,
                 lm_head,
                 object(),
-                gathered_values[:, :1],
-                gathered_ids[:, :1],
+                candidates[:, :, :2].contiguous(),
+                partials[:2],
+                output,
             )
-
-    def test_dspark_single_rank_argmax_bypasses_collective_workspaces(self):
-        local_logits = torch.tensor([[1.0, 7.0, 3.0, 4.0]])
-        lm_head = SimpleNamespace(
-            tp_size=1,
-            shard_indices=SimpleNamespace(
-                num_org_elements=4,
-                num_org_elements_padded=4,
-                num_added_elements=0,
-                org_vocab_start_index=0,
-                added_vocab_start_index=4,
-            ),
-        )
-
-        with patch(
-            "tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads.all_gather_single"
-        ) as gather:
-            token_ids = _local_vocab_argmax(
-                local_logits,
-                lm_head,
-                object(),
-                torch.empty(0),
-                torch.empty(0, dtype=torch.int64),
+        lm_head.shard_indices.num_added_elements = 8
+        with self.assertRaisesRegex(ValueError, "without added vocabulary"):
+            sample_dspark_block_greedy(
+                logits, bonus, markov, lm_head, object(), candidates, partials, output
             )
-
-        gather.assert_not_called()
-        self.assertTrue(torch.equal(token_ids, torch.tensor([1], dtype=torch.int32)))
 
     def test_dspark_wire_target_uses_draft_head(self):
         draft_head = SimpleNamespace(weight=torch.ones(8, 3), tp_size=1)
         target_head = SimpleNamespace(weight=torch.ones(4, 3), tp_size=2)
         drafter = object.__new__(DeepseekV4DSpark)
         drafter.draft_model = SimpleNamespace(lm_head=draft_head)
-        drafter.target_layer_ids = [1, 3]
         target_model = SimpleNamespace(
             lm_head=target_head,
             logits_processor=SimpleNamespace(tp_group=(0, 1)),
@@ -2186,9 +2229,12 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         drafter.wire_target(target_model)
 
+        self.assertIs(drafter.target_model, target_model)
         self.assertIs(drafter.lm_head, draft_head)
         self.assertEqual(drafter.tp_group, (0, 1))
-        target_model.set_dspark_layers_to_capture.assert_called_once_with([1, 3])
+        # The draft model's configure_target installs the capture layers
+        # before any drafter exists; wiring only binds execution resources.
+        target_model.set_dspark_layers_to_capture.assert_not_called()
 
     def test_dspark_tp_only_contract_uses_resolved_mapping(self):
         mapping = SimpleNamespace(attn=SimpleNamespace(dp_size=1, cp_size=1))
@@ -2206,11 +2252,6 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_dspark_padding_slots_reset_before_every_graph_replay(self):
         drafter = object.__new__(DeepseekV4DSpark)
         drafter.device = torch.device("cpu")
-        drafter.lm_head = SimpleNamespace(weight=torch.ones(2, 2))
-        refresh_head = Mock(return_value=False)
-        drafter.model = SimpleNamespace(
-            refresh_local_base_logits_head=refresh_head,
-        )
         drafter.first_padding_slot = 3
         drafter.padding_slots = torch.arange(3, 7, dtype=torch.int64)
         drafter.slot_indices_buf = drafter.padding_slots.clone()
@@ -2267,8 +2308,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                 torch.zeros_like(drafter.context_lengths[3:]),
             )
         )
-        self.assertEqual(refresh_head.call_count, 11)
-        refresh_head.assert_called_with(drafter.lm_head.weight, force=False)
 
     def test_dspark_fp8_quant_dequant_matches_ue8m0_reference(self):
         values = torch.linspace(-7.0, 7.0, 256, dtype=torch.float32).reshape(2, 128)
@@ -2393,108 +2432,45 @@ class TestDeepseekV4Config(unittest.TestCase):
 
     def test_dspark_base_logits_use_public_fp32_head_math(self):
         model = object.__new__(DeepseekV4DSparkModel)
-        hidden = torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16)
-        head = SimpleNamespace(
-            weight=torch.tensor([[0.5, 0.25], [-1.0, 2.0]], dtype=torch.bfloat16)
-        )
+        hidden = torch.tensor([[[1.0, -2.0]], [[0.5, 4.0]]], dtype=torch.bfloat16)
+        head = torch.tensor([[0.5, 0.25], [-1.0, 2.0]], dtype=torch.bfloat16)
 
         logits = model.local_base_logits(hidden, head)
 
         self.assertEqual(logits.dtype, torch.float32)
-        self.assertTrue(torch.equal(logits, hidden.float() @ head.weight.float().T))
-
-    def test_dspark_base_logits_reuse_and_refresh_stable_fp32_head(self):
-        model = object.__new__(DeepseekV4DSparkModel)
-        torch.nn.Module.__init__(model)
-        model.register_buffer("_local_base_head_fp32", None, persistent=False)
-        model._local_base_head_source_ptr = None
-        model._local_base_head_source_version = None
-        hidden = torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16)
-        head = torch.tensor(
-            [[0.5, 0.25], [-1.0, 2.0]],
-            dtype=torch.bfloat16,
-        )
-
-        self.assertTrue(model.refresh_local_base_logits_head(head, force=False))
-        cached_ptr = model._local_base_head_fp32.data_ptr()
-        self.assertFalse(model.refresh_local_base_logits_head(head, force=False))
-        self.assertEqual(model._local_base_head_fp32.data_ptr(), cached_ptr)
-        self.assertTrue(
-            torch.equal(
-                model.local_base_logits(hidden, None),
-                hidden.float() @ head.float().T,
-            )
-        )
-
-        head.add_(1)
-        self.assertTrue(model.refresh_local_base_logits_head(head, force=False))
-        self.assertEqual(model._local_base_head_fp32.data_ptr(), cached_ptr)
-        self.assertTrue(
-            torch.equal(
-                model.local_base_logits(hidden, None),
-                hidden.float() @ head.float().T,
-            )
-        )
-
-        with self.assertRaisesRegex(RuntimeError, "shape or device changed"):
-            model.refresh_local_base_logits_head(torch.ones(3, 2), force=False)
-
-        original_version = int(head._version)
-        replacement = torch.full_like(head, 3)
-        head.data.copy_(replacement)
-        self.assertEqual(int(head._version), original_version)
-        self.assertFalse(model.refresh_local_base_logits_head(head, force=False))
-        self.assertTrue(model.refresh_local_base_logits_head(head, force=True))
-        self.assertTrue(
-            torch.equal(
-                model.local_base_logits(hidden, None),
-                hidden.float() @ replacement.float().T,
-            )
-        )
+        self.assertEqual(logits.shape, (2, 1, 2))
+        self.assertTrue(torch.equal(logits, hidden.float() @ head.float().T))
+        with self.assertRaisesRegex(ValueError, "hidden dtype"):
+            model.local_base_logits(hidden, head.float())
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
-    def test_dspark_cached_base_logits_survive_cuda_graph_refresh(self):
+    def test_dspark_base_logits_read_the_shared_head_in_place_under_cuda_graph(self):
         model = object.__new__(DeepseekV4DSparkModel)
-        torch.nn.Module.__init__(model)
-        model.register_buffer("_local_base_head_fp32", None, persistent=False)
-        model._local_base_head_source_ptr = None
-        model._local_base_head_source_version = None
-        hidden = torch.tensor(
-            [[1.0, -2.0]],
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
+        hidden = torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16, device="cuda")
         head = torch.tensor(
-            [[0.5, 0.25], [-1.0, 2.0]],
-            dtype=torch.bfloat16,
-            device="cuda",
+            [[0.5, 0.25], [-1.0, 2.0]], dtype=torch.bfloat16, device="cuda"
         )
-        model.refresh_local_base_logits_head(head, force=False)
-        cached_ptr = model._local_base_head_fp32.data_ptr()
 
         warmup_stream = torch.cuda.Stream()
         warmup_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(warmup_stream):
             for _ in range(3):
-                model.local_base_logits(hidden, None)
+                model.local_base_logits(hidden, head)
         torch.cuda.current_stream().wait_stream(warmup_stream)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            logits = model.local_base_logits(hidden, None)
+            logits = model.local_base_logits(hidden, head)
         graph.replay()
         torch.cuda.synchronize()
-        self.assertTrue(
-            torch.equal(logits, hidden.float() @ head.float().T),
-        )
+        self.assertEqual(logits.dtype, torch.float32)
+        self.assertTrue(torch.equal(logits, hidden.float() @ head.float().T))
 
+        # No FP32 copy sits between the target's head and the draft: an
+        # in-place weight update is visible to the next replay as is.
         head.add_(1)
-        model.refresh_local_base_logits_head(head, force=False)
-        self.assertEqual(model._local_base_head_fp32.data_ptr(), cached_ptr)
         graph.replay()
         torch.cuda.synchronize()
-        self.assertTrue(
-            torch.equal(logits, hidden.float() @ head.float().T),
-        )
+        self.assertTrue(torch.equal(logits, hidden.float() @ head.float().T))
 
     def test_dspark_speculative_config_uses_block_plus_bonus_width(self):
         server_args = ServerArgs(
@@ -2522,47 +2498,23 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(server_args.enable_prefix_caching)
         self.assertTrue(server_args.draft_model_path_use_base)
 
-    def test_dspark_same_checkpoint_rejects_kvstore(self):
-        with self.assertRaisesRegex(
-            ValueError,
-            "does not support KVStore",
-        ):
-            ServerArgs(
-                model="unused",
-                speculative_config=json.dumps(
-                    {"method": "dspark", "num_speculative_tokens": 5}
-                ),
-            )
-
-    def test_dspark_explicit_same_checkpoint_rejects_kvstore(self):
-        with self.assertRaisesRegex(ValueError, "does not support KVStore"):
-            ServerArgs(
-                model="same-checkpoint",
-                speculative_config=json.dumps(
-                    {
-                        "method": "dspark",
-                        "model": "same-checkpoint",
-                        "num_speculative_tokens": 5,
-                    }
-                ),
-            )
-
-    def test_dspark_explicit_redirected_same_checkpoint_rejects_kvstore(self):
-        with (
-            patch(
-                "tokenspeed.runtime.utils.server_args.maybe_model_redirect",
-                side_effect=lambda model: (
-                    "resolved-checkpoint" if model == "model-alias" else model
-                ),
+    def test_dspark_same_checkpoint_keeps_kvstore_default(self):
+        # Whether same-checkpoint DSpark can use KVStore depends on where the
+        # draft keeps its windows, which only the resolved draft config knows;
+        # argument parsing no longer pre-empts that decision.
+        server_args = ServerArgs(
+            model="same-checkpoint",
+            speculative_config=json.dumps(
+                {
+                    "method": "dspark",
+                    "model": "same-checkpoint",
+                    "num_speculative_tokens": 5,
+                }
             ),
-            self.assertRaisesRegex(ValueError, "does not support KVStore"),
-        ):
-            ServerArgs(
-                model="model-alias",
-                speculative_algorithm="DSPARK",
-                speculative_draft_model_path="model-alias",
-                speculative_num_steps=5,
-            )
+        )
+
+        self.assertTrue(server_args.enable_kvstore)
+        self.assertTrue(server_args.draft_model_path_use_base)
 
     def test_dspark_explicit_external_checkpoint_preserves_cache_behavior(self):
         server_args = ServerArgs(
@@ -2586,17 +2538,6 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertTrue(server_args.enable_kvstore)
         self.assertFalse(server_args.enable_prefix_caching)
-
-    def test_dspark_same_checkpoint_decode_still_rejects_kvstore(self):
-        with self.assertRaisesRegex(ValueError, "does not support KVStore"):
-            ServerArgs(
-                model="same-checkpoint",
-                enable_prefix_caching=False,
-                disaggregation_mode="decode",
-                speculative_algorithm="DSPARK",
-                speculative_draft_model_path="same-checkpoint",
-                speculative_num_steps=5,
-            )
 
     def test_dspark_external_decode_preserves_generic_cache_behavior(self):
         server_args = ServerArgs(
@@ -3107,6 +3048,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 rows_per_page=4,
                 entry_stride_tokens=1,
                 sliding_window_tokens=None,
+                replayable=False,
             ),
             CacheGroupSpec(
                 group_id="coarse",
@@ -3114,6 +3056,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 rows_per_page=256,
                 entry_stride_tokens=1,
                 sliding_window_tokens=None,
+                replayable=False,
             ),
         )
         counts = {"fine": 20001, "coarse": 1025}
@@ -3940,6 +3883,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     rows_per_page=64,
                     entry_stride_tokens=1,
                     sliding_window_tokens=128,
+                    replayable=False,
                 ),
             ),
             {"v4.swa_kv": 1024},
@@ -4283,6 +4227,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     entry_stride_tokens=1,
                     family="history",
                     sliding_window_tokens=128,
+                    replayable=False,
                 ),
             ),
             {V4_SWA_KV_GROUP_ID: 128},
@@ -4661,7 +4606,6 @@ class TestDeepseekV4Config(unittest.TestCase):
             for spec in _v4_spec_set(
                 SimpleNamespace(sliding_window=128),
                 layer_ratio=(1, 4, 128),
-                decode_input_tokens=1,
             )
         }
         c4 = specs["v4.c4a.compressed_kv"]
@@ -5307,6 +5251,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     rows_per_page=64,
                     entry_stride_tokens=4,
                     sliding_window_tokens=None,
+                    replayable=False,
                 ),
             ),
             {group_id: 128},
@@ -6631,6 +6576,23 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertEqual(tuple(y.shape), (tokens, hidden))
 
+    def test_deepseek_v4_score_routing_does_not_forward_input_ids(self):
+        hidden_states = torch.ones((2, 4))
+        input_ids = torch.arange(2)
+        gate = Mock(return_value=torch.zeros((2, 8)))
+        gate.e_score_correction_bias = torch.zeros(8)
+        gate.tid2eid = None
+        moe = DeepseekV4MoE.__new__(DeepseekV4MoE)
+        moe.config = SimpleNamespace(n_routed_experts=8)
+        moe.gate = gate
+
+        _, _, hash_indices_table, routing_input_ids = moe._routing_inputs(
+            hidden_states, input_ids
+        )
+
+        self.assertIsNone(hash_indices_table)
+        self.assertIsNone(routing_input_ids)
+
     def test_deepseek_v4_router_matches_noaux_bias_semantics(self):
         logits = torch.tensor(
             [
@@ -6641,11 +6603,15 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         bias = torch.tensor([0.0, -0.4, 0.6, 0.0], dtype=torch.float32)
 
-        topk_weights, topk_ids, scores = dsv4_select_experts(
+        topk_weights, topk_ids = moe_topk(
             logits,
             top_k=2,
+            score_function="sqrt_softplus",
+            selection_method="topk",
             renormalize=True,
+            routed_scaling_factor=1.0,
             correction_bias=bias,
+            solution="torch",
         )
 
         expected_scores = F.softplus(logits).sqrt()
@@ -6653,7 +6619,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         expected_weights = expected_scores.gather(1, expected_ids)
         expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
 
-        self.assertTrue(torch.allclose(scores, expected_scores))
         self.assertTrue(torch.equal(topk_ids, expected_ids.to(torch.int32)))
         self.assertTrue(torch.allclose(topk_weights, expected_weights))
 
@@ -6676,12 +6641,16 @@ class TestDeepseekV4Config(unittest.TestCase):
             dtype=torch.int32,
         )
 
-        topk_weights, topk_ids, _ = dsv4_select_experts(
+        topk_weights, topk_ids = moe_topk(
             logits,
             top_k=2,
+            score_function="sqrt_softplus",
+            selection_method="hash",
             renormalize=True,
+            routed_scaling_factor=1.0,
             hash_indices_table=table,
             input_ids=input_ids,
+            solution="torch",
         )
 
         expected_ids = torch.tensor([[3, 1], [2, 3]], dtype=torch.int32)
@@ -6762,16 +6731,19 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(torch.allclose(topk_weights, expected_weights, atol=1e-6))
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_deepseek_v4_fused_select_experts_returns_scores(self):
+    def test_deepseek_v4_fused_moe_topk_matches_reference(self):
         logits = torch.linspace(
             -3.0, 3.0, 256, device="cuda", dtype=torch.float32
         ).repeat(2, 1)
         bias = torch.linspace(0.25, -0.25, 256, device="cuda", dtype=torch.float32)
 
-        topk_weights, topk_ids, scores = dsv4_select_experts(
+        topk_weights, topk_ids = moe_topk(
             logits,
             top_k=6,
+            score_function="sqrt_softplus",
+            selection_method="topk",
             renormalize=True,
+            routed_scaling_factor=1.0,
             correction_bias=bias,
         )
 
@@ -6780,7 +6752,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         expected_weights = expected_scores.gather(1, expected_ids)
         expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
 
-        self.assertTrue(torch.allclose(scores, expected_scores))
         self.assertTrue(torch.equal(topk_ids, expected_ids.to(torch.int32)))
         self.assertTrue(torch.allclose(topk_weights, expected_weights, atol=1e-6))
 
@@ -6813,15 +6784,6 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertTrue(torch.equal(topk_ids, expected_ids))
         self.assertTrue(torch.allclose(topk_weights, expected_weights, atol=1e-6))
-
-    def test_packed_topk_router_logits_recover_weights_after_softmax(self):
-        topk_ids = torch.tensor([[3, 1], [2, 0]], dtype=torch.int32)
-        topk_weights = torch.tensor([[0.7, 0.3], [0.55, 0.45]], dtype=torch.float32)
-
-        packed = pack_topk_as_router_logits(topk_weights, topk_ids, num_experts=4)
-        recovered = packed.softmax(dim=-1).gather(1, topk_ids.long())
-
-        self.assertTrue(torch.allclose(recovered, topk_weights))
 
     def test_c4_ape_reorder_matches_overlap_window_layout(self):
         ape = torch.arange(4 * 8, dtype=torch.float32).reshape(4, 8)
@@ -6879,6 +6841,8 @@ def test_v4_pd_recipe_and_readiness_follow_cache_producers():
             attention_use_fp4_indexer_cache=False,
             max_total_tokens=64 * 1024,
             chunked_prefill_size=256,
+            disaggregation_mode="prefill",
+            enable_prefix_caching=True,
         ),
         model_config=SimpleNamespace(
             num_attention_layers=3,
@@ -6903,8 +6867,16 @@ def test_v4_pd_recipe_and_readiness_follow_cache_producers():
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     ).setup()
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
+        CacheLayerOwnership,
+        cache_field_placement,
+    )
+
+    _, schedules = cache_field_placement(
+        setup.spec.memory_plan, (CacheLayerOwnership(3, 0, (0, 3)),)
+    )
     schedule = build_cache_fields_by_producer_step(
-        setup.spec.memory_plan, num_target_layers=3
+        setup.spec.memory_plan, producer_fields_by_step=schedules[0]
     )
     assert schedule.step_count == 3
     assert all(schedule.fields_by_step)

@@ -68,8 +68,8 @@ _INDEXER_SIGNATURE = format_signature(
 _INDEXER_TRAITS = {
     "index_heads": frozenset({32, 64}),
     "head_dim": frozenset({128}),
-    "topk": frozenset({512, 1024, 2048}),
     "page_size": frozenset({64}),
+    "topk": frozenset({512, 1024, 2048}),
     "index_k_format": frozenset({"mxfp4"}),
 }
 
@@ -83,7 +83,6 @@ _INDEXER_TRAITS = {
     traits=_INDEXER_TRAITS,
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     priority=Priority.PORTABLE,
-    tags={"portability", "mxfp4", "sparse"},
 )
 def triton_dsv4_prefill_topk_mxfp4(
     index_q: tuple[torch.Tensor, torch.Tensor],
@@ -133,7 +132,6 @@ def triton_dsv4_prefill_topk_mxfp4(
     traits=_INDEXER_TRAITS,
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     priority=Priority.PORTABLE,
-    tags={"portability", "mxfp4", "sparse"},
 )
 def triton_dsv4_decode_topk_mxfp4(
     index_q: tuple[torch.Tensor, torch.Tensor],
@@ -177,7 +175,6 @@ def triton_dsv4_decode_topk_mxfp4(
     traits={"page_size": frozenset({64})},
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     priority=Priority.PORTABLE,
-    tags={"portability", "cuda_graph"},
 )
 def triton_dsv4_plan(
     *,
@@ -395,13 +392,12 @@ def _dsv4_qnorm_rope_kv_insert_kernel(
     ),
     traits={
         "head_dim": frozenset({DEEPSEEK_V4_HEAD_DIM}),
-        "rope_dim": frozenset({DEEPSEEK_V4_ROPE_DIM}),
         "quant_block_size": frozenset({DEEPSEEK_V4_FP8_QUANT_BLOCK}),
+        "rope_dim": frozenset({DEEPSEEK_V4_ROPE_DIM}),
         "cache_layout": frozenset({"fp8_swa_page_planar"}),
         "has_q_out": frozenset({True, False}),
     },
     priority=Priority.PORTABLE,
-    tags={"portability", "cache_insert"},
 )
 def triton_dsv4_swa_cache_insert(
     q: torch.Tensor,
@@ -551,11 +547,10 @@ def _dsv4_sparse_attention_kernel(
     traits={
         "head_dim": frozenset({DEEPSEEK_V4_HEAD_DIM}),
         "cache_layout": frozenset({"dense_workspace"}),
-        "support_sink": frozenset({True}),
         "metadata_dtypes": frozenset({torch.int32, torch.int64}),
+        "sinks": frozenset({True}),
     },
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def triton_dsv4_prefill(
     q: torch.Tensor,
@@ -750,13 +745,12 @@ def _dsv4_dequantize_selected_cache_segment(
     traits={
         "head_dim": frozenset({DEEPSEEK_V4_HEAD_DIM}),
         "cache_layout": frozenset({"fp8_swa_page_planar"}),
-        "topk_layout": frozenset({"global_slots"}),
-        "support_sink": frozenset({True}),
         "has_extra_segment": frozenset({False, True}),
         "metadata_dtypes": frozenset({torch.int32, torch.int64}),
+        "sinks": frozenset({True}),
+        "topk_layout": frozenset({"global_slots"}),
     },
     priority=Priority.PORTABLE,
-    tags={"portability", "paged_cache", "selected_attention"},
 )
 def triton_dsv4_decode(
     q: torch.Tensor,
@@ -1121,8 +1115,7 @@ def _dsv4_indexer_q_cuda_capability(
 def _log_serial_four_block_indexer_q_selection(capability: tuple[int, int]) -> None:
     logger.info(
         "DeepSeek V4 Indexer-Q launch selection: serial_four_block=True "
-        "tokens=8192 capability=%s",
-        capability,
+        f"tokens=8192 capability={capability!s}",
     )
 
 
@@ -1420,9 +1413,8 @@ def _wide_compress_launch_supported(device: torch.device | int | None) -> bool:
         capability = torch.cuda.get_device_capability(device)
         supported = capability == (10, 0)
         logger.info(
-            "DeepSeek V4 sparse-compress launch selection: capability=%s num_warps=%d",
-            capability,
-            16 if supported else 4,
+            f"DeepSeek V4 sparse-compress launch selection: capability={capability!s} "
+            f"num_warps={(16 if supported else 4):d}",
         )
         return supported
     except (AssertionError, RuntimeError, TypeError, ValueError):
@@ -1692,12 +1684,11 @@ def _dsv4_fused_csa_indexer_fp8_cache_kernel(
     ),
     traits={
         "index_head_dim": frozenset({DEEPSEEK_V4_INDEXER_DIM}),
-        "compress_ratio": frozenset({4}),
         "page_size": frozenset({64}),
+        "compress_ratio": frozenset({4}),
         "cache_format": frozenset({"fp8_scaled_page_planar"}),
     },
     priority=Priority.PORTABLE,
-    tags={"portability", "cache_insert"},
 )
 def triton_dsv4_csa_indexer_fp8_cache_insert(
     *,

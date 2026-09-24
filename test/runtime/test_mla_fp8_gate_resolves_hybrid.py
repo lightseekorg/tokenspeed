@@ -12,6 +12,7 @@ that coverage structural rather than incidental.
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -99,6 +100,42 @@ def test_decode_and_prefill_share_one_gate():
         ), f"the {name} path open-codes the fp8 gate instead of sharing it"
 
 
+@pytest.mark.parametrize(
+    "backend_name,supported",
+    [
+        ("mla", True),
+        ("gluon", True),
+        ("trtllm_mla", True),
+        ("tokenspeed_mla", True),
+        ("flashmla", False),
+    ],
+)
+@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize(
+    "dtype,k_scale,can_quantize",
+    [
+        (torch.float8_e4m3fn, 1.0, True),
+        (torch.bfloat16, 1.0, False),
+        (torch.float8_e4m3fn, 0.5, False),
+    ],
+)
+def test_model_fp8_gate_backends(
+    backend_name, supported, hybrid, dtype, k_scale, can_quantize
+):
+    from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3AttentionMLA
+
+    attention = object.__new__(DeepseekV3AttentionMLA)
+    torch.nn.Module.__init__(attention)
+    attention.attention_backend = backend_name
+    backend = SimpleNamespace(data_type=dtype)
+    if hybrid:
+        backend = SimpleNamespace(full_attn_backend=backend)
+
+    assert attention._mla_kv_is_fp8(SimpleNamespace(attn_backend=backend), k_scale) is (
+        supported and can_quantize
+    )
+
+
 def _wrapper_classes():
     """Every backend class that owns a full-attention sub-backend.
 
@@ -111,9 +148,11 @@ def _wrapper_classes():
 
     from tokenspeed.runtime.layers.attention import backends
 
-    for info in pkgutil.iter_modules(backends.__path__):
+    for info in pkgutil.walk_packages(
+        backends.__path__, prefix=f"{backends.__name__}."
+    ):
         try:
-            mod = importlib.import_module(f"{backends.__name__}.{info.name}")
+            mod = importlib.import_module(info.name)
         except Exception:  # optional vendor backends may not import here
             continue
         for _, cls in inspect.getmembers(mod, inspect.isclass):
@@ -131,11 +170,8 @@ def _wrapper_classes():
                 yield cls
 
 
-# MSAHybridAttnBackend owns a sub-backend and deliberately does not forward
-# data_type. It belongs to MiniMax M3, which routes through its own
-# MiniMaxM3Attention rather than DeepseekV3AttentionMLA, so the gate never reads
-# it. Any *other* non-forwarding wrapper is a bug, so this list stays explicit.
-NON_FORWARDING_BY_DESIGN = {"MSAHybridAttnBackend"}
+# MiniMax MSA and Qwen4's QSA indexer do not execute the DeepseekV3 MLA gate.
+NON_FORWARDING_BY_DESIGN = {"MSAHybridAttnBackend", "QSAIndexerBackend"}
 
 
 def _forwards_dtype(cls):

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import filecmp
 import html
 import json
 import os
@@ -12,6 +13,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -236,7 +238,7 @@ def source_pr_summary(value: str) -> str:
 
 def print_target(repo: Path, source_pr: str | None, test_commit: str) -> None:
     if source_pr is None:
-        print("Target: latest main", flush=True)
+        print("Target: current checkout", flush=True)
         print(f"Target commit: {test_commit}", flush=True)
         return
 
@@ -324,11 +326,21 @@ def snapshot(repo: Path, artifact_root: Path, commit: str) -> Path:
     )
     os.close(handle)
     temporary = Path(temporary_name)
-    subprocess.run(
-        ["git", "-C", str(repo), "archive", f"--output={temporary}", commit],
-        check=True,
-    )
-    temporary.replace(target)
+    try:
+        subprocess.run(
+            ["git", "-C", str(repo), "archive", f"--output={temporary}", commit],
+            check=True,
+        )
+        try:
+            # Never replace an inode that another NFS client may be reading.
+            os.link(temporary, target)
+        except FileExistsError:
+            if not stat.S_ISREG(target.lstat().st_mode) or not filecmp.cmp(
+                temporary, target, shallow=False
+            ):
+                raise ValueError(f"Existing snapshot does not match {commit}: {target}")
+    finally:
+        temporary.unlink(missing_ok=True)
     return target
 
 

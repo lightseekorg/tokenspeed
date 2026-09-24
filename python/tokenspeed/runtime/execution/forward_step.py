@@ -235,10 +235,16 @@ class ForwardStepRunner:
         self.overlap_schedule_depth = config.overlap_schedule_depth
         self.dp_size = config.data_parallel_size
         self.world_size = config.world_size
-        # User intent (enforce_eager) OR a backend-declared restriction
-        # (resolve_cuda_graph_support in ModelExecutor); the unified refresh
-        # still serves eager decode either way.
-        self.disable = config.enforce_eager or not decode_graph_supported
+        # User intent (enforce_eager), a backend-declared restriction
+        # (resolve_cuda_graph_support in ModelExecutor), or a role with no
+        # decode step to capture: the prefill role of a disaggregated
+        # deployment runs extend forwards only, and its verify-width-1
+        # attention configuration has no verify scratch for a DECODE-shaped
+        # dummy anyway. The unified refresh still serves eager decode either
+        # way; the prefill graph is gated separately (PrefillGraph.disable).
+        self.disable = (
+            config.enforce_eager or not decode_graph_supported or config.prefill_only
+        )
         # Backends alias their cache_seqlens buffer. Draft backend aliases
         # the drafter-owned draft_seq_lens to keep InputBuffers read-only.
         attn_backend.init_cuda_graph_state(
@@ -322,7 +328,7 @@ class ForwardStepRunner:
             ]
             capture_range = tqdm.tqdm(capture_items) if rank == 0 else capture_items
             if rank == 0:
-                logger.info("Capturing batches: %s", self.capture_bs)
+                logger.info(f"Capturing batches: {self.capture_bs!s}")
             for variant, bs in capture_range:
                 if rank == 0:
                     avail_mem = get_available_gpu_memory(
@@ -879,6 +885,8 @@ class ForwardStepRunner:
         extend_prefix_lens_cpu: torch.Tensor,
         extend_seq_lens: torch.Tensor,
         extend_seq_lens_cpu: torch.Tensor,
+        extend_replay_lens_cpu: torch.Tensor,
+        extend_prompt_lens_cpu: torch.Tensor,
         positions: torch.Tensor | None = None,
         block_tables: dict | None = None,
         block_tables_cpu: dict | None = None,
@@ -965,6 +973,8 @@ class ForwardStepRunner:
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu,
                 extend_seq_lens=extend_seq_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
+                extend_replay_lens_cpu=extend_replay_lens_cpu,
+                extend_prompt_lens_cpu=extend_prompt_lens_cpu,
                 positions=positions,
                 global_num_tokens=ctx.global_num_tokens,
                 all_decode_or_idle=ctx.all_decode_or_idle,

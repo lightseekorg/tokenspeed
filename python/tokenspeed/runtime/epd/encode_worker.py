@@ -168,7 +168,7 @@ class EncodeWorker:
             for p in batch:
                 self._pending.pop(p.key, None)
             logger.error(
-                "encode batch failed (%d rooms concluded Failed): %s", n_failed, e
+                f"encode batch failed ({n_failed:d} rooms concluded Failed): {e!s}",
             )
             return 0
         for p in batch:

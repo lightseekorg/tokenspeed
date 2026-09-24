@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import math
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -31,12 +32,13 @@ from tokenspeed_kernel.ops.ple import (
     ple_gate_norm,
     ple_ngram_ids,
     ple_page_gather,
+    ple_page_gather_pair,
     ple_page_scatter,
+    prepare_ngram_reciprocals,
 )
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen4_exp_config import Qwen4ExpTextConfig
-from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
@@ -57,12 +59,15 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
 )
 from tokenspeed.runtime.layers.hyperconnection import GroupedGemmaRMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
-from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding,
-    get_masked_input_and_mask,
+from tokenspeed.runtime.layers.ple_lookup import (
+    PendingLookup,
+    PLELookup,
+    quantize_ple_embedding_rows,
 )
-from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
+
+logger = get_colorful_logger(__name__)
 
 _IndexBundle = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 # Uniform-batch index bundles captured into a CUDA graph. During capture the
@@ -97,26 +102,6 @@ def _nth_prime_after(start: int, count: int) -> int:
         if _is_prime(candidate):
             found += 1
     return candidate
-
-
-_PLE_FP8_MAX = 448.0  # torch.float8_e4m3fn finite maximum
-
-
-def quantize_ple_embedding_rows(
-    rows: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Online per-row FP8 quantization for the n-gram table.
-
-    Checkpoint shards stream in row ranges, so each row is quantized
-    independently (``scale = amax / 448``) -- no whole-table amax prescan is
-    needed and no clipping can occur. Returns the FP8 rows and their fp32
-    dequant scales.
-    """
-
-    values = rows.to(torch.float32)
-    scale = (values.abs().amax(dim=1) / _PLE_FP8_MAX).clamp_min(1e-12)
-    quantized = (values / scale.unsqueeze(1)).to(torch.float8_e4m3fn)
-    return quantized, scale
 
 
 class Qwen4ExpNGramEmbedding(nn.Module):
@@ -179,6 +164,15 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             torch.tensor(sizes, dtype=torch.long),
             persistent=True,
         )
+        # Derived from the same moduli and refreshed on checkpoint load. A buffer
+        # follows module device moves without adding a checkpoint requirement.
+        self.register_buffer(
+            "ngram_mod_reciprocals",
+            prepare_ngram_reciprocals(
+                sizes, device=self.ngram_heads_vocab_sizes.device
+            ),
+            persistent=False,
+        )
         self.register_buffer(
             "ngram_heads_offsets",
             torch.tensor(offsets, dtype=torch.long),
@@ -192,35 +186,24 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 "Qwen4-Exp ple_embed_dtype supports only 'float8_e4m3fn', "
                 f"got {ple_embed_dtype!r}"
             )
-        self.embed_store_dtype = torch.float8_e4m3fn if ple_embed_dtype else None
-        # Lookups are dequantized back to the model compute dtype (layer
-        # construction runs under the model's default dtype).
-        self.embed_output_dtype = torch.get_default_dtype()
-        # Source checkpoints may already store the table in FP8 and publish
-        # one dequant scale beside all of its split shards. The loader updates
-        # this value when that tensor arrives; keeping it as Python state lets
-        # CPU-side shard copies apply the scale without a device sync.
-        self._checkpoint_weight_scale = 1.0
-        self.ngram_embedding = VocabParallelEmbedding(
-            padded_vocab,
-            self.head_dim,
-            org_num_embeddings=padded_vocab,
-            params_dtype=self.embed_store_dtype,
+        offload_embedding = config.ple_offload_embedding
+        self.lookup = PLELookup(
+            mapping,
+            vocab_size=padded_vocab,
+            ngram_heads=self.ngram_heads,
+            head_dim=self.head_dim,
+            storage_dtype=torch.float8_e4m3fn if ple_embed_dtype else None,
+            output_dtype=torch.get_default_dtype(),
+            offload=offload_embedding,
             prefix=add_prefix("ngram_embedding", prefix),
-            tp_rank=mapping.attn.tp_rank,
-            tp_size=mapping.attn.tp_size,
-            tp_group=mapping.attn.tp_group,
         )
-        if self.embed_store_dtype is not None:
-            # Per-local-row dequant scales, written by the loader's online
-            # quantization. Ones (not zeros / empty): rows gathered before the
-            # checkpoint lands, or shard-masked rows folded to local row 0,
-            # must stay finite. Non-persistent: derived from the bf16
-            # checkpoint, never round-tripped.
-            self.register_buffer(
-                "ngram_embedding_scale",
-                torch.ones(self.ngram_embedding.num_embeddings_per_partition),
-                persistent=False,
+        if self.ple_layer_index == 0 and offload_embedding:
+            weight = self.lookup.ngram_embedding.weight
+            logger.info(
+                "PLE offloading enabled: "
+                f"host_table={weight.device.type == 'cpu'}, "
+                f"pinned_memory={weight.is_pinned()}, "
+                f"storage_dtype={self.lookup.embed_store_dtype}"
             )
 
     @classmethod
@@ -229,6 +212,36 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         value = ((value ^ (value >> 30)) * cls._SPLITMIX_M1) & cls._MASK64
         value = ((value ^ (value >> 27)) * cls._SPLITMIX_M2) & cls._MASK64
         return (value ^ (value >> 31)) & cls._MASK64
+
+    def refresh_ngram_reciprocals(self) -> None:
+        """Refresh derived divisors after loading moduli, never during forward."""
+        self.ngram_mod_reciprocals.copy_(
+            prepare_ngram_reciprocals(
+                self.ngram_heads_vocab_sizes.detach().cpu().tolist(),
+                device=self.ngram_heads_vocab_sizes.device,
+            )
+        )
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        self.refresh_ngram_reciprocals()
 
     def _build_layer_multipliers(self, size: int, seed: int) -> torch.Tensor:
         max_long = (1 << 63) - 1
@@ -275,8 +288,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         initial: torch.Tensor,
         req: torch.Tensor,
         col: torch.Tensor,
+        lengths_t: torch.Tensor,
         starts: torch.Tensor,
         need_tail: bool,
+        uniform_length: int,
         tail_out: torch.Tensor | None = None,
         tail_block_rows: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -285,6 +300,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             initial,
             req,
             col,
+            lengths_t,
             starts,
             self.layer_multipliers,
             self.ngram_heads_vocab_sizes,
@@ -292,83 +308,46 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ngram_size=self.ngram_size,
             heads_per_ngram=self.heads_per_ngram,
             eos_token_id=self.eos_token_id,
+            uniform_length=uniform_length,
+            mod_reciprocals=self.ngram_mod_reciprocals,
             need_tail=need_tail,
             tail_out=tail_out,
             tail_block_rows=tail_block_rows,
         )
 
-    def _dequant(self, raw: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
-        """Cast the FP8 lookup to compute dtype and apply per-row scales.
-
-        Must run before the TP all-reduce: FP8 payloads cannot be reduced and
-        each row's scale lives only on its owning rank. Shard-masked rows were
-        zero-filled by the embedding forward, so gathering their folded row-0
-        scale is harmless (0 * finite = 0).
-        """
-
-        module = self.ngram_embedding
-        if module.tp_size > 1:
-            local_ids, _ = get_masked_input_and_mask(
-                ids,
-                module.shard_indices.org_vocab_start_index,
-                module.shard_indices.org_vocab_end_index,
-                module.shard_indices.num_org_vocab_padding,
-                module.shard_indices.added_vocab_start_index,
-                module.shard_indices.added_vocab_end_index,
-            )
-        else:
-            local_ids = ids.clamp(min=0, max=module.num_embeddings_padded - 1)
-        scale = self.ngram_embedding_scale[local_ids]
-        return (raw.to(torch.float32) * scale.unsqueeze(-1)).to(self.embed_output_dtype)
-
-    def forward_flat(
-        self,
-        input_ids: torch.Tensor,
-        initial: torch.Tensor,
-        req: torch.Tensor,
-        col: torch.Tensor,
-        starts: torch.Tensor,
-        need_tail: bool = False,
-        tail_out: torch.Tensor | None = None,
-        tail_block_rows: int = 0,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """CUDA path: embed n-grams without materializing the window matrix."""
-
-        ids, tail = self._ngram_ids_flat_cuda(
-            input_ids,
-            initial,
-            req,
-            col,
-            starts,
-            need_tail,
-            tail_out,
-            tail_block_rows,
-        )
-        # Reduce the flattened [tokens, heads * head_dim] view instead of the
-        # 3D lookup: the lamport backend folds trailing dims into token count
-        # ([T * heads, head_dim]), which blows past the mnnvl token cap and
-        # demotes this all-reduce to the IPC/NCCL path. flatten(-2) is a
-        # metadata-only view and was applied to the output anyway. FP8 tables
-        # dequantize here, before the reduce.
-        embeddings = self.ngram_embedding(ids, reduce_results=False)
-        if self.embed_store_dtype is not None:
-            embeddings = self._dequant(embeddings, ids)
-        embeddings = embeddings.flatten(-2)
-        if self.ngram_embedding.tp_size > 1:
-            embeddings = all_reduce(embeddings, self.ngram_embedding.tp_group)
-        return embeddings, tail
-
     def forward(self, contexts: torch.Tensor) -> torch.Tensor:
-        """Embed contexts shaped ``[tokens, ngram_size]`` (fallback path)."""
+        ids = self._ngram_ids_torch(contexts.to(torch.long)).contiguous()
+        layout = self.lookup.make_layout(None, ids.shape[0])
+        return self.lookup.finish(self.lookup.start(ids, layout))
 
-        contexts = contexts.to(torch.long)
-        ids = self._ngram_ids_torch(contexts)
-        embeddings = self.ngram_embedding(ids, reduce_results=False)
-        if self.embed_store_dtype is not None:
-            embeddings = self._dequant(embeddings, ids)
-        if self.ngram_embedding.tp_size > 1:
-            embeddings = all_reduce(embeddings, self.ngram_embedding.tp_group)
-        return embeddings.flatten(-2)
+
+class _PleExecutionPlan(NamedTuple):
+    """What a PLE forward derives before it touches the n-gram table.
+
+    Extracted so :meth:`Qwen4ExpPLELayer.start_prefetch` and
+    :meth:`Qwen4ExpPLELayer.forward` share a single derivation. Re-deriving it
+    on both sides is the kind of duplication that fails silently: the lengths,
+    the state page ids and the carried context all have to describe the same
+    batch as the rows a prefetch already has in flight, and a mismatch yields
+    plausible embeddings for the wrong tokens rather than an error.
+    """
+
+    lengths: list[int]
+    num_real_tokens: int
+    flat_ids: torch.Tensor
+    index: tuple
+    uniform_length: int
+    output_pages: torch.Tensor
+    context_field: torch.Tensor
+    conv_field: torch.Tensor
+    initial_context: torch.Tensor
+    initial_conv: torch.Tensor
+    verify: bool
+    backend: Qwen4ExpPLEBackend
+    metadata: PLEForwardMetadata
+    context_scratch: torch.Tensor | None
+    conv_scratch: torch.Tensor | None
+    scratch_stride: int
 
 
 class Qwen4ExpPLELayer(nn.Module):
@@ -452,6 +431,16 @@ class Qwen4ExpPLELayer(nn.Module):
             bias=False,
         )
         nn.init.zeros_(self.conv1d.weight)
+        # Set by start_prefetch, consumed by the next forward; see start_prefetch.
+        self._prefetched: (
+            tuple[
+                _PleExecutionPlan | None,
+                PendingLookup,
+                torch.Tensor | None,
+                torch.Tensor | None,
+            ]
+            | None
+        ) = None
 
     def _load_kv_proj_shard(
         self,
@@ -622,6 +611,21 @@ class Qwen4ExpPLELayer(nn.Module):
             col = positions - starts[req]
         return req, col, lengths_t, starts, max_len, total, bs
 
+    @staticmethod
+    def _prefetch_indices(
+        lengths: list[int], device: torch.device
+    ) -> tuple[tuple, int]:
+        bs = len(lengths)
+        total = sum(lengths)
+        max_len = max(lengths) if lengths else 0
+        if device.type == "cuda" and max_len > 0 and total == bs * max_len:
+            req = torch.empty(total, device=device, dtype=torch.long)
+            col = torch.empty(total, device=device, dtype=torch.long)
+            lengths_t = torch.empty(bs, device=device, dtype=torch.long)
+            starts = torch.empty(bs, device=device, dtype=torch.long)
+            return (req, col, lengths_t, starts, max_len, total, bs), max_len
+        return Qwen4ExpPLELayer._batch_indices(lengths, device), 0
+
     def _token_contexts(
         self,
         input_ids: torch.Tensor,
@@ -674,7 +678,8 @@ class Qwen4ExpPLELayer(nn.Module):
         ``add_terms`` are full-width ``[tokens, channels]`` tensors folded into
         the conv output in order, letting callers skip separate tensor adds.
         On CUDA, ``windows_out`` receives the carried row and per-token state
-        windows directly. The fallback caller fills its carried row separately.
+        windows directly and the unused final-state result has zero rows.
+        The fallback caller fills its carried row separately.
         """
         device = values.device
         req, col, lengths_t, starts, max_len, total, bs = (
@@ -767,6 +772,8 @@ class Qwen4ExpPLELayer(nn.Module):
             dilation=self.ngram_size,
             kernel_size=self.conv_kernel_size,
             state_len=state_len,
+            write_final=windows_out is None,
+            weights_independent=True,
             add_terms=add_terms,
             windows=windows,
             windows_block_rows=windows_block_rows,
@@ -884,6 +891,113 @@ class Qwen4ExpPLELayer(nn.Module):
             eps=self.norm_key.variance_epsilon,
         )
 
+    def _execution_plan(
+        self, input_ids: torch.Tensor, ctx: ForwardContext
+    ) -> _PleExecutionPlan | None:
+        """Derive the per-request quantities a lookup needs; ``None`` when idle.
+
+        Everything here is stream-agnostic bookkeeping (CPU lengths, index
+        bundle, page reads) that both :meth:`forward` and :meth:`start_prefetch`
+        must agree on. It stops just short of the n-gram hash so the two callers
+        can drive the gather onto different streams from a single derivation.
+        """
+
+        if ctx.forward_mode.is_idle() or input_ids.shape[0] == 0:
+            return None
+        backend = self._ple_backend(ctx)
+        metadata = self._metadata(backend)
+        # A padded-bucket replay hands us bucket rows whose tail is filler, so
+        # the lengths decide how many rows are real before anything reads them.
+        lengths = self._lengths(metadata, input_ids.shape[0], ctx.bs)
+        num_real_tokens = sum(lengths)
+        (input_ids,) = slice_to_real_tokens(num_real_tokens, input_ids)
+        input_pages = metadata.input_blocks[: ctx.bs]
+        output_pages = metadata.output_blocks[: ctx.bs]
+        pool = ctx.token_to_kv_pool
+        load_tracker = getattr(pool, "layerwise_load_tracker", None)
+        if load_tracker is not None:
+            load_tracker.wait_for_layer(self.layer_id)
+        context_field = pool.arena.field(self.context_field_id)
+        conv_field = pool.arena.field(qwen4_exp_ple_conv_field(self.layer_id))
+        if input_ids.is_cuda:
+            initial_context, initial_conv = ple_page_gather_pair(
+                context_field,
+                conv_field,
+                input_pages,
+                self._page_row_stride(context_field),
+                self._page_row_stride(conv_field),
+                self.ple_embedding.eos_token_id,
+            )
+        else:
+            initial_context = self._read_pages(
+                context_field, input_pages, self.ple_embedding.eos_token_id
+            )
+            initial_conv = self._read_pages(conv_field, input_pages)
+        index, uniform_length = self._prefetch_indices(lengths, input_ids.device)
+        flat_ids = input_ids.flatten()
+        verify = metadata.verify_width is not None
+        context_scratch = conv_scratch = None
+        scratch_stride = 0
+        if verify:
+            context_scratch, conv_scratch = backend.ple_verify_scratch(
+                self.context_field_id, self.layer_id, ctx.bs
+            )
+            scratch_stride = metadata.verify_width + 1
+        return _PleExecutionPlan(
+            lengths=lengths,
+            num_real_tokens=num_real_tokens,
+            flat_ids=flat_ids,
+            index=index,
+            uniform_length=uniform_length,
+            output_pages=output_pages,
+            context_field=context_field,
+            conv_field=conv_field,
+            initial_context=initial_context,
+            initial_conv=initial_conv,
+            verify=verify,
+            backend=backend,
+            metadata=metadata,
+            context_scratch=context_scratch,
+            conv_scratch=conv_scratch,
+            scratch_stride=scratch_stride,
+        )
+
+    def start_prefetch(self, input_ids: torch.Tensor, ctx: ForwardContext) -> None:
+        if self._prefetched is not None:
+            return
+        plan = self._execution_plan(input_ids, ctx)
+        embedding = self.ple_embedding
+        final_context = context_tail = None
+        if plan is None:
+            ids = input_ids.new_empty((0, embedding.ngram_heads), dtype=torch.int64)
+        elif plan.flat_ids.is_cuda:
+            req, col, lengths_t, starts, _, _, _ = plan.index
+            ids, _ = embedding._ngram_ids_flat_cuda(
+                plan.flat_ids,
+                plan.initial_context,
+                req,
+                col,
+                lengths_t,
+                starts,
+                False,
+                plan.uniform_length,
+                tail_out=plan.context_scratch,
+                tail_block_rows=plan.scratch_stride,
+            )
+            if not plan.verify:
+                final_context = self._final_context(
+                    plan.flat_ids, plan.initial_context, lengths_t, starts
+                )
+        else:
+            contexts, final_context = self._token_contexts(
+                plan.flat_ids, plan.initial_context, plan.lengths, plan.index
+            )
+            ids = embedding._ngram_ids_torch(contexts.to(torch.int64)).contiguous()
+            context_tail = contexts[:, 1:]
+        layout = embedding.lookup.make_layout(ctx.global_num_tokens, ids.shape[0])
+        pending = embedding.lookup.start(ids, layout)
+        self._prefetched = (plan, pending, final_context, context_tail)
+
     @break_point
     def forward(
         self,
@@ -911,68 +1025,26 @@ class Qwen4ExpPLELayer(nn.Module):
         ``hc_count * hidden_size`` while an attention break emits
         ``heads * head_dim`` -- keep those distinct.
         """
-        if ctx.forward_mode.is_idle() or hidden_states.shape[0] == 0:
+        if self._prefetched is None:
+            self.start_prefetch(input_ids, ctx)
+        plan, pending, final_context, context_tail = self._prefetched
+        embeddings = self.ple_embedding.lookup.finish(pending)
+        self._prefetched = None
+        if plan is None:
             return hidden_states
-        backend = self._ple_backend(ctx)
-        metadata = self._metadata(backend)
-        # A padded-bucket replay hands us bucket rows whose tail is filler, so
-        # the lengths decide how many rows are real before anything reads them.
-        lengths = self._lengths(metadata, input_ids.shape[0], ctx.bs)
-        hidden_states, input_ids = slice_to_real_tokens(
-            sum(lengths), hidden_states, input_ids
-        )
-        input_pages = metadata.input_blocks[: ctx.bs]
-        output_pages = metadata.output_blocks[: ctx.bs]
-        pool = ctx.token_to_kv_pool
-        load_tracker = getattr(pool, "layerwise_load_tracker", None)
-        if load_tracker is not None:
-            load_tracker.wait_for_layer(self.layer_id)
-        context_field = pool.arena.field(self.context_field_id)
-        conv_field = pool.arena.field(qwen4_exp_ple_conv_field(self.layer_id))
-        initial_context = self._read_pages(
-            context_field, input_pages, self.ple_embedding.eos_token_id
-        )
-        initial_conv = self._read_pages(conv_field, input_pages)
-        index = self._batch_indices(lengths, input_ids.device)
-        req, col, lengths_t, starts, _, total, _ = index
-        flat_ids = input_ids.flatten()
-        verify = metadata.verify_width is not None
-        context_scratch = conv_scratch = None
-        scratch_stride = 0
-        if verify:
-            # Both CUDA state producers write directly into this stable rollback
-            # workspace, including each request's carried row.
-            context_scratch, conv_scratch = backend.ple_verify_scratch(
-                self.context_field_id, self.layer_id, ctx.bs
-            )
-            scratch_stride = metadata.verify_width + 1
-        if flat_ids.is_cuda:
-            # The n-gram windows are gathered inside the hash kernel; verify
-            # writes their state rows directly instead of returning a packed tail.
-            embeddings, _ = self.ple_embedding.forward_flat(
-                flat_ids,
-                initial_context,
-                req,
-                col,
-                starts,
-                tail_out=context_scratch,
-                tail_block_rows=scratch_stride,
-            )
-            # Only the non-verify branch writes it back, and ``verify`` is fixed
-            # when a graph is captured, so skipping here keeps the gather and
-            # its ten elementwise kernels out of the captured verify graph.
-            final_context = (
-                None
-                if verify
-                else self._final_context(flat_ids, initial_context, lengths_t, starts)
-            )
-        else:
-            contexts, final_context = self._token_contexts(
-                flat_ids, initial_context, lengths, index
-            )
-            embeddings = self.ple_embedding(contexts)
-            context_tail = contexts[:, 1:]
-
+        (hidden_states,) = slice_to_real_tokens(plan.num_real_tokens, hidden_states)
+        req, col, lengths_t, starts, _, total, _ = plan.index
+        lengths = plan.lengths
+        flat_ids = plan.flat_ids
+        initial_context = plan.initial_context
+        initial_conv = plan.initial_conv
+        context_field = plan.context_field
+        conv_field = plan.conv_field
+        output_pages = plan.output_pages
+        verify = plan.verify
+        context_scratch = plan.context_scratch
+        conv_scratch = plan.conv_scratch
+        scratch_stride = plan.scratch_stride
         kv, _ = self.kv_proj(embeddings)
         key, value = kv.split([self.hc_hidden_size, self.hidden_size], dim=-1)
         if key.is_cuda:
@@ -983,7 +1055,7 @@ class Qwen4ExpPLELayer(nn.Module):
             normalized,
             initial_conv,
             lengths,
-            index,
+            plan.index,
             need_intermediate=verify,
             add_terms=(gated, hidden_states),
             windows_out=conv_scratch,

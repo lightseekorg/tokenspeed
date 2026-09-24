@@ -110,7 +110,7 @@ class GrammarManager:
         """
         for spec, state, _ in self.grammar_queue:
             if spec.request_id == rid:
-                logger.debug("Abort grammar queue request. rid=%s", rid)
+                logger.debug(f"Abort grammar queue request. rid={rid!s}")
 
                 # Don't cancel the compile future: it's shared across
                 # every concurrent request for the same grammar key

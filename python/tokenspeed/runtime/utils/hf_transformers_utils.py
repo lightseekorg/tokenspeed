@@ -361,10 +361,10 @@ def get_config(
                     )
                 else:
                     logger.warning(
-                        "Cannot derive an immutable Hugging Face commit from %s; "
+                        "Cannot derive an immutable Hugging Face commit from "
+                        f"{model_path!s}; "
                         "parsing custom config code from the local snapshot. "
                         "Remote-code sibling imports may fail in this layout.",
-                        model_path,
                     )
     else:
         model_path = model
@@ -869,10 +869,10 @@ def get_tokenizer(
                 tokenizer = load_tokenizer(tokenizer_name, snapshot_revision)
             elif trust_remote_code:
                 logger.warning(
-                    "Cannot derive an immutable Hugging Face commit from %s; "
+                    "Cannot derive an immutable Hugging Face commit from "
+                    f"{tokenizer_path!s}; "
                     "parsing custom tokenizer code from the local snapshot. "
                     "Remote-code sibling imports may fail in this layout.",
-                    tokenizer_path,
                 )
 
     if tokenizer is None:

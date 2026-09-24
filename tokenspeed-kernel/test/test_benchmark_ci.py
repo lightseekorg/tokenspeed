@@ -58,7 +58,6 @@ def _definition(*, seed: int = 42) -> dict:
         },
         "registration": "gluon_bmm_a16w16_gfx950",
         "seed": seed,
-        "definition_version": 1,
     }
 
 
@@ -74,7 +73,8 @@ def _suite_payload(cases: list[dict] | None = None) -> dict:
     if cases is None:
         cases = [
             {
-                "id": "gemm.bmm/example/v1",
+                "id": "gemm.bmm/example",
+                "comparison_epoch": 1,
                 "definition": _definition(),
                 "policy": _policy(),
             }
@@ -84,7 +84,6 @@ def _suite_payload(cases: list[dict] | None = None) -> dict:
         "suite_id": "unit-amd-gfx950",
         "environment": {"vendor": "amd", "arch": "9.5"},
         "timer": {
-            "calls_per_graph": 100,
             "eager_warmup_iterations": 5,
             "replay_warmup_iterations": 3,
             "measurement_blocks": 5,
@@ -108,8 +107,8 @@ def _success_result(request) -> KernelBenchmarkResult:
         selection_mode=request.selection_mode,
         requested_solution=request.solution,
         requested_registration=request.registration,
+        cold_cache=request.cold_cache,
         seed=request.seed,
-        definition_version=request.definition_version,
         platform_vendor="amd",
         platform_arch="9.5",
         device_name="test accelerator",
@@ -121,7 +120,6 @@ def _success_result(request) -> KernelBenchmarkResult:
         min_us=1.0,
         max_us=1.2,
         relative_mad=0.09,
-        calls_per_graph=100,
         eager_warmup_iterations=5,
         replay_warmup_iterations=3,
         measurement_blocks=5,
@@ -129,43 +127,157 @@ def _success_result(request) -> KernelBenchmarkResult:
     )
 
 
-def test_starter_suite_selects_exact_gfx950_registration():
+def test_gfx950_suite_selects_exact_registrations():
     suite_path = Path(__file__).parents[1] / "benchmarks" / "amd" / "gfx950.json"
     suite = load_suite(suite_path)
 
     assert suite.suite_id == "amd-gfx950-registration-kernels"
     assert suite.required_environment == {"vendor": "amd", "arch": "9.5"}
-    assert len(suite.cases) == 1
-    case = suite.cases[0]
-    assert case.id == ("gemm.bmm/gluon_bmm_a16w16_gfx950/b12-m1-n512-k128-bfloat16/v1")
-    assert case.request.parameters == {
-        "batch": 12,
-        "M": 1,
-        "N": 512,
-        "K": 128,
-        "dtype": "bfloat16",
-        "validation": {
-            "runs": 5,
-            "atol": 0.015,
-            "rtol": 0.015,
+    assert suite.timer.eager_warmup_iterations == 5
+    assert suite.timer.replay_warmup_iterations == 3
+    assert suite.default_measurement_blocks == 30
+
+
+def test_load_suite_includes_case_files(tmp_path):
+    fragment_path = tmp_path / "operation.json"
+    fragment_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "common_parameters": {
+                    "model_profile": "test-model",
+                    "M": 4,
+                },
+                "cases": [
+                    {
+                        "id": "gemm.bmm/included",
+                        "comparison_epoch": 1,
+                        "definition": _definition(seed=43),
+                        "policy": _policy(),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload = _suite_payload()
+    payload["case_files"] = [fragment_path.name]
+
+    suite = load_suite(_write_suite(tmp_path, payload))
+
+    assert [case.id for case in suite.cases] == [
+        "gemm.bmm/example",
+        "gemm.bmm/included",
+    ]
+    included = next(case for case in suite.cases if case.id.endswith("included"))
+    assert included.request.parameters["model_profile"] == "test-model"
+    assert included.request.parameters["M"] == 1
+
+
+def test_load_suite_applies_case_measurement_block_overrides(tmp_path):
+    cases = [
+        {
+            "id": "gemm.bmm/default",
+            "comparison_epoch": 1,
+            "definition": _definition(seed=42),
+            "policy": _policy(),
         },
+        {
+            "id": "gemm.bmm/override",
+            "comparison_epoch": 1,
+            "definition": _definition(seed=43),
+            "measurement_blocks": 30,
+            "policy": _policy(),
+        },
+    ]
+
+    suite = load_suite(_write_suite(tmp_path, _suite_payload(cases)))
+
+    assert {case.id: case.measurement_blocks for case in suite.cases} == {
+        "gemm.bmm/default": 5,
+        "gemm.bmm/override": 30,
     }
-    assert case.request.registration == "gluon_bmm_a16w16_gfx950"
-    assert case.request.solution is None
-    assert case.request.seed == 42
-    assert case.request.definition_version == 1
-    assert case.policy == _policy()
+
+
+def test_load_suite_expands_parameter_lists_as_cartesian_product(tmp_path):
+    definition = _definition()
+    definition["parameters"]["N"] = [32, 64]
+    definition["parameters"]["M"] = [1, 2]
+    definition["parameters"]["metadata"] = {"values": [7, 8]}
+    definition["parameters"]["literal_shape"] = [[7, 8]]
+    payload = _suite_payload(
+        [
+            {
+                "id": "gemm.bmm/listed",
+                "comparison_epoch": 1,
+                "definition": definition,
+                "policy": _policy(),
+            }
+        ]
+    )
+
+    suite = load_suite(_write_suite(tmp_path, payload))
+
+    assert {
+        case.id: (case.request.parameters["M"], case.request.parameters["N"])
+        for case in suite.cases
+    } == {
+        "gemm.bmm/listed_0": (1, 32),
+        "gemm.bmm/listed_1": (1, 64),
+        "gemm.bmm/listed_2": (2, 32),
+        "gemm.bmm/listed_3": (2, 64),
+    }
+    assert all(
+        case.request.parameters["metadata"] == {"values": [7, 8]}
+        for case in suite.cases
+    )
+    assert all(
+        case.request.parameters["literal_shape"] == [7, 8] for case in suite.cases
+    )
+
+
+def test_load_suite_preserves_id_for_one_literal_list_value(tmp_path):
+    definition = _definition()
+    definition["parameters"]["literal_shape"] = [[7, 8]]
+
+    suite = load_suite(_write_suite(tmp_path, _suite_payload()))
+    payload = _suite_payload()
+    payload["cases"][0]["definition"] = definition
+    suite = load_suite(_write_suite(tmp_path, payload))
+
+    assert suite.cases[0].id == "gemm.bmm/example"
+    assert suite.cases[0].request.parameters["literal_shape"] == [7, 8]
+
+
+def test_load_suite_rejects_empty_parameter_list(tmp_path):
+    definition = _definition()
+    definition["parameters"]["M"] = []
+    payload = _suite_payload(
+        [
+            {
+                "id": "gemm.bmm/empty",
+                "comparison_epoch": 1,
+                "definition": definition,
+                "policy": _policy(),
+            }
+        ]
+    )
+
+    with pytest.raises(SuiteConfigError, match="M must not be an empty list"):
+        load_suite(_write_suite(tmp_path, payload))
 
 
 def test_run_suite_uses_one_timer_and_emits_deterministic_envelope(tmp_path):
     cases = [
         {
-            "id": "gemm.bmm/z-case/v1",
+            "id": "gemm.bmm/z-case",
+            "comparison_epoch": 2,
             "definition": _definition(seed=43),
             "policy": _policy(),
         },
         {
-            "id": "gemm.bmm/a-case/v1",
+            "id": "gemm.bmm/a-case",
+            "comparison_epoch": 1,
             "definition": _definition(seed=42),
             "policy": _policy(),
         },
@@ -173,10 +285,12 @@ def test_run_suite_uses_one_timer_and_emits_deterministic_envelope(tmp_path):
     suite = load_suite(_write_suite(tmp_path, _suite_payload(cases)))
     created_configs = []
     requests = []
+    measurement_counts = []
 
     class Harness:
-        def run(self, request):
+        def run(self, request, *, measurement_blocks):
             requests.append(request)
+            measurement_counts.append(measurement_blocks)
             return _success_result(request)
 
     def harness_factory(config):
@@ -201,16 +315,24 @@ def test_run_suite_uses_one_timer_and_emits_deterministic_envelope(tmp_path):
     assert payload["schema_version"] == 1
     assert payload["revision"] == _REVISION
     assert payload["environment"] == _ENVIRONMENT
+    assert payload["timer"] == {
+        "eager_warmup_iterations": 5,
+        "replay_warmup_iterations": 3,
+        "measurement_blocks": 5,
+    }
     assert len(created_configs) == 1
     assert [case["id"] for case in payload["cases"]] == [
-        "gemm.bmm/a-case/v1",
-        "gemm.bmm/z-case/v1",
+        "gemm.bmm/a-case",
+        "gemm.bmm/z-case",
     ]
+    assert [case["comparison_epoch"] for case in payload["cases"]] == [1, 2]
     assert [request.seed for request in requests] == [42, 43]
+    assert measurement_counts == [5, 5]
     assert payload["cases"][0]["result"]["status"] == "success"
     assert payload["cases"][0]["result"] == {
         "status": "success",
         "registration_name": "gluon_bmm_a16w16_gfx950",
+        "cold_cache": True,
         "timing_mode": "graph_replay",
         "metric": "device_time_per_invocation",
         "unit": "us",
@@ -221,22 +343,40 @@ def test_run_suite_uses_one_timer_and_emits_deterministic_envelope(tmp_path):
         "error_message": None,
     }
     assert payload["cases"][0]["policy"] == _policy()
-    assert payload["cases"][0].keys() == {"id", "definition", "policy", "result"}
+    assert payload["cases"][0].keys() == {
+        "id",
+        "comparison_epoch",
+        "definition",
+        "policy",
+        "measurement_blocks",
+        "result",
+    }
+    assert payload["cases"][0]["measurement_blocks"] == 5
 
 
-def test_run_suite_rejects_success_with_the_wrong_measurement_context(tmp_path):
-    suite = load_suite(_write_suite(tmp_path, _suite_payload()))
+def test_run_suite_uses_one_harness_for_mixed_measurement_blocks(tmp_path):
+    cases = [
+        {
+            "id": "gemm.bmm/default",
+            "comparison_epoch": 1,
+            "definition": _definition(seed=42),
+            "policy": _policy(),
+        },
+        {
+            "id": "gemm.bmm/override",
+            "comparison_epoch": 1,
+            "definition": _definition(seed=43),
+            "measurement_blocks": 30,
+            "policy": _policy(),
+        },
+    ]
+    suite = load_suite(_write_suite(tmp_path, _suite_payload(cases)))
+    runs = []
 
     class Harness:
-        def run(self, request):
-            result = _success_result(request)
-            return KernelBenchmarkResult(
-                **{
-                    **result.to_dict(),
-                    "status": BenchmarkStatus.SUCCESS,
-                    "calls_per_graph": 1,
-                }
-            )
+        def run(self, request, *, measurement_blocks):
+            runs.append((request.seed, measurement_blocks))
+            return _success_result(request)
 
     payload = run_suite(
         suite,
@@ -245,20 +385,33 @@ def test_run_suite_rejects_success_with_the_wrong_measurement_context(tmp_path):
         environment_provider=lambda: _ENVIRONMENT,
     )
 
-    result = payload["cases"][0]["result"]
-    assert result["status"] == "execution_failure"
-    assert result["error_message"] == "successful benchmark reported the wrong context"
+    assert runs == [(42, 5), (43, 30)]
+    assert [case["measurement_blocks"] for case in payload["cases"]] == [5, 30]
+
+
+def test_suite_defaults_to_cold_cache_and_can_disable_it(tmp_path):
+    default_suite = load_suite(_write_suite(tmp_path, _suite_payload()))
+    assert default_suite.cases[0].request.cold_cache is True
+    assert default_suite.cases[0].definition["cold_cache"] is True
+
+    payload = _suite_payload()
+    payload["cases"][0]["definition"]["cold_cache"] = False
+    hot_suite = load_suite(_write_suite(tmp_path, payload))
+    assert hot_suite.cases[0].request.cold_cache is False
+    assert hot_suite.cases[0].definition["cold_cache"] is False
 
 
 def test_benchmark_exception_is_result_data_and_later_cases_run(tmp_path):
     cases = [
         {
-            "id": "gemm.bmm/fails/v1",
+            "id": "gemm.bmm/fails",
+            "comparison_epoch": 1,
             "definition": _definition(seed=42),
             "policy": _policy(),
         },
         {
-            "id": "gemm.bmm/succeeds/v1",
+            "id": "gemm.bmm/succeeds",
+            "comparison_epoch": 1,
             "definition": _definition(seed=43),
             "policy": _policy(),
         },
@@ -266,7 +419,8 @@ def test_benchmark_exception_is_result_data_and_later_cases_run(tmp_path):
     suite = load_suite(_write_suite(tmp_path, _suite_payload(cases)))
 
     class Harness:
-        def run(self, request):
+        def run(self, request, *, measurement_blocks):
+            assert measurement_blocks == 5
             if request.seed == 42:
                 raise RuntimeError("launch failed")
             return _success_result(request)
@@ -289,7 +443,8 @@ def test_harness_failure_result_is_preserved(tmp_path):
     suite = load_suite(_write_suite(tmp_path, _suite_payload()))
 
     class Harness:
-        def run(self, request):
+        def run(self, request, *, measurement_blocks):
+            assert measurement_blocks == 5
             result = _success_result(request)
             return KernelBenchmarkResult(
                 **{
@@ -339,6 +494,7 @@ def test_environment_mismatch_produces_complete_results_without_timing(tmp_path)
     assert factory_called is False
     result = payload["cases"][0]["result"]
     assert result["status"] == "environment_invalid"
+    assert result["cold_cache"] is True
     assert payload["environment"]["vendor"] == "nvidia"
     assert payload["environment"]["arch"] == "9.0"
     assert "required 'amd'" in result["error_message"]
@@ -348,9 +504,9 @@ def test_builtin_harness_factory_passes_explicit_dependencies(tmp_path, monkeypa
     config = load_suite(_write_suite(tmp_path, _suite_payload())).timer
     expected = object()
 
-    def fake_harness(config_arg, *, timer, platform_provider):
-        assert config_arg is config
-        assert timer is None
+    def fake_harness(timer, *, platform_provider):
+        assert isinstance(timer, benchmark_ci.GraphTimer)
+        assert timer.config is config
         assert platform_provider is benchmark_ci.current_platform
         return expected
 
@@ -365,8 +521,12 @@ def test_builtin_harness_factory_passes_explicit_dependencies(tmp_path, monkeypa
         (lambda payload: payload.update(schema_version=2), "unsupported"),
         (lambda payload: payload.update(cases=[]), "non-empty"),
         (
-            lambda payload: payload["timer"].update(calls_per_graph=0),
-            "calls_per_graph",
+            lambda payload: payload["timer"].update(calls_per_graph=1),
+            "calls_per_graph was removed",
+        ),
+        (
+            lambda payload: payload["cases"][0].update(measurement_blocks=4),
+            "measurement_blocks",
         ),
         (
             lambda payload: payload["cases"][0]["policy"].update(
@@ -377,6 +537,14 @@ def test_builtin_harness_factory_passes_explicit_dependencies(tmp_path, monkeypa
         (
             lambda payload: payload["cases"][0]["definition"].pop("seed"),
             "seed",
+        ),
+        (
+            lambda payload: payload["cases"][0]["definition"].update(cold_cache="yes"),
+            "cold_cache",
+        ),
+        (
+            lambda payload: payload["cases"][0].update(comparison_epoch=0),
+            "comparison_epoch",
         ),
     ],
 )

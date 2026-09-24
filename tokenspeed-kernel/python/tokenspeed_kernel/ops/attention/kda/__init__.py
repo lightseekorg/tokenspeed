@@ -40,6 +40,7 @@ from tokenspeed_kernel.signature import (
 
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
 
+from tokenspeed_kernel.ops.attention.kda._prefill_capacity import KdaPrefillCapacity
 
 # One UE8M0 scale per 32 consecutive head_dim elements (MXFP8).
 MXFP8_ATTENTION_BLOCK_SCALE = MXFP8_BLOCK_SCALE
@@ -147,6 +148,8 @@ def kda_paged_prefill(
     initial_state: torch.Tensor,
     cu_seqlens: torch.Tensor,
     cu_seqlens_cpu: torch.Tensor,
+    capacity: KdaPrefillCapacity | None,
+    inputs_packed: bool,
     lower_bound: float | None = -5.0,
     override: str | None = None,
     solution: str | None = None,
@@ -167,6 +170,10 @@ def kda_paged_prefill(
             stream-synchronizing D2H per KDA layer per chunk, which stalls
             the launch thread behind all queued work (and serializes the
             chunk pipeline's stages).
+        capacity: Explicit CuTeDSL graph planning bounds, or None for exact
+            live-length planning. Live boundaries retain their normal meaning.
+        inputs_packed: The checkpoint packer produced contiguous Q/K/V and
+            beta with zero padding. Gate padding still requires initialization.
         lower_bound: Optional safe lower bound for log decay.
         override: Optional exact kernel name.
         solution: Optional registered solution name.
@@ -200,6 +207,13 @@ def kda_paged_prefill(
         )
     if solution == "fla":
         solution = "triton"
+    capacity_kwargs = {}
+    if capacity is not None:
+        if solution != "cutedsl_kda":
+            raise ValueError("KDA capacity planning requires explicit cutedsl_kda")
+        capacity.validate(cu_seqlens_cpu, q.shape[1])
+        capacity_kwargs["capacity"] = capacity
+        capacity_kwargs["inputs_packed"] = inputs_packed
     kernel = select_kernel(
         "attention",
         "kda_paged_prefill",
@@ -208,6 +222,10 @@ def kda_paged_prefill(
         override=override,
     )
     spec = KernelRegistry.get().get_by_name(kernel.name)
+    if capacity is not None and (
+        spec is None or True not in spec.traits.get("prefill_capacity", ())
+    ):
+        raise ValueError("Selected KDA kernel does not support planning capacity")
     supported = None if spec is None else spec.traits.get("recurrent_layout")
     # Kernels that declare no layout consume the caller's state as it is.
     relayout = supported is not None and recurrent_layout not in supported
@@ -225,6 +243,7 @@ def kda_paged_prefill(
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens_cpu,
         lower_bound=lower_bound,
+        **capacity_kwargs,
     )
     if relayout:
         # Hand the final state back in the caller's layout (a view; no copy).
@@ -290,8 +309,8 @@ def kda_paged_decode(
         _attention_format_signature(q=q, k=k, v=v),
         traits={
             "indexed_state": True,
-            "single_token": q.shape[1] == num_sequences,
             "recurrent_layout": recurrent_layout,
+            "single_token": q.shape[1] == num_sequences,
         },
         solution=solution,
         override=override,
@@ -366,11 +385,11 @@ def try_kda_fused_paged_decode(
             "kda_fused_paged_decode",
             signature,
             traits={
-                "paged_state": True,
-                "fused_output_norm": output_gate is not None,
                 "num_heads": num_heads,
                 "head_dim": head_dim,
                 "conv_kernel_size": conv_weights.shape[-1],
+                "fused_output_norm": output_gate is not None,
+                "paged_state": True,
                 "recurrent_layout": recurrent_layout,
             },
             solution=solution,
@@ -385,11 +404,11 @@ def try_kda_fused_paged_decode(
                 "kda_fused_paged_decode",
                 signature,
                 traits={
-                    "paged_state": True,
-                    "fused_output_norm": False,
                     "num_heads": num_heads,
                     "head_dim": head_dim,
                     "conv_kernel_size": conv_weights.shape[-1],
+                    "fused_output_norm": False,
+                    "paged_state": True,
                     "recurrent_layout": recurrent_layout,
                 },
                 solution=solution,
@@ -488,12 +507,12 @@ def try_kda_fused_paged_verify(
             "kda_fused_paged_verify",
             signature,
             traits={
-                "paged_state": True,
-                "store_states": store_states,
-                "recurrent_layout": recurrent_layout,
                 "num_heads": num_heads,
                 "head_dim": head_dim,
+                "paged_state": True,
+                "recurrent_layout": recurrent_layout,
                 "split_producers": split_producers,
+                "store_states": store_states,
             },
             solution=solution,
             override=override,
@@ -558,8 +577,8 @@ def kda_fused_paged_verify_uses_split_producers(
     signature = _attention_format_signature(q=probe, k=probe, v=probe)
     traits = {
         "paged_state": True,
-        "store_states": store_states,
         "recurrent_layout": recurrent_layout,
+        "store_states": store_states,
     }
     traits["num_heads"] = num_heads
     traits["head_dim"] = head_dim
@@ -613,8 +632,8 @@ def kda_verify_conv_update(
         signature,
         traits={
             "paged_state": True,
-            "split_producers": True,
             "recurrent_layout": recurrent_layout,
+            "split_producers": True,
         },
     )
     return kernel(
@@ -680,10 +699,10 @@ def try_kda_replay_commit(
             "kda_replay_commit",
             signature,
             traits={
-                "flat_state": True,
-                "recurrent_layout": recurrent_layout,
                 "num_heads": num_heads,
                 "head_dim": head_dim,
+                "flat_state": True,
+                "recurrent_layout": recurrent_layout,
             },
             solution=solution,
             override=override,
@@ -736,7 +755,7 @@ def resolve_kda_batched_replay_commit(
         return None
     probe = torch.empty(0, dtype=dtype, device="meta")
     signature = _attention_format_signature(q=probe, k=probe, v=probe)
-    traits = {"flat_state": True, "batched_layers": True}
+    traits = {"batched_layers": True, "flat_state": True}
     if num_heads is not None:
         traits["num_heads"] = num_heads
     if head_dim is not None:
@@ -822,9 +841,9 @@ def kda_replay_commit_supported(
             "kda_replay_commit",
             signature,
             traits={
+                **shape_traits,
                 "flat_state": True,
                 "recurrent_layout": recurrent_layout,
-                **shape_traits,
             },
             solution=solution,
         )
@@ -833,10 +852,10 @@ def kda_replay_commit_supported(
             "kda_fused_paged_verify",
             signature,
             traits={
-                "paged_state": True,
-                "store_states": False,
-                "recurrent_layout": recurrent_layout,
                 **shape_traits,
+                "paged_state": True,
+                "recurrent_layout": recurrent_layout,
+                "store_states": False,
             },
             solution=solution,
         )

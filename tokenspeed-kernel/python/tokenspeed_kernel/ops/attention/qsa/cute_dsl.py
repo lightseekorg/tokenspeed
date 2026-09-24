@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CuTe DSL registration for the B200 QSA sparse-attention specialization."""
+"""CuTe DSL registration for the B200/B300 QSA sparse-attention specialization."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
     current_platform,
+    pdl_enabled,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -55,7 +56,7 @@ def cute_dsl_blackwell_qsa_sparse_attention(
     k_scale: float | torch.Tensor | None,
     v_scale: float | torch.Tensor | None,
 ) -> torch.Tensor:
-    """Run the adaptive workspace-free B200 QSA specialization.
+    """Run the adaptive workspace-free B200/B300 QSA specialization.
 
     Args:
         q: BF16 query tensor shaped ``[tokens, query_heads, 256]``, with 6,
@@ -78,18 +79,25 @@ def cute_dsl_blackwell_qsa_sparse_attention(
         BF16 attention output shaped ``[tokens, query_heads, 256]``.
 
     Each KV head owns a contiguous group of query heads, divided into tiles
-    of up to eight heads. One CTA cluster handles each (row, KV head, head
-    tile), sharing that row's selected slots. Head counts and cache strides
-    are compile-time parameters; a six-query-head, one-KV-head launch retains
-    its original tile geometry. This also covers the twelve- and twenty-four-
-    query-head shapes used with smaller tensor-parallel sizes.
+    of up to eight heads. A CTA or split cluster handles consecutive query
+    rows for one KV/head tile. Every row retains its own selected slots and
+    softmax state; query grouping reuses the CTA workspace and TMEM allocation.
+    It does not widen the per-query MMA atom.
 
-    Small launches use sixteen sequence-split CTAs when the device occupancy
-    probe allows all clusters to fit in one wave, otherwise eight CTAs for up
-    to eight clusters and four for larger launches. All split counts use the
-    same asynchronous K/V ring and head-owning DSM softmax combine. The final
-    three selected entries are computed in that combine, avoiding a mostly
-    empty tensor-core tile. BF16 V staging uses transposed matrix loads.
+    The launch policy counts independent query/head outputs and queries the
+    device SM count before jointly choosing query rows per CTA, KV splits and
+    operand stages. Large BF16 launches use one split and two asynchronous
+    K-or-V slots; sufficiently large outputs group two or four query rows per
+    CTA. Intermediate BF16 launches use two or four splits with two slots.
+    Smaller launches retain the sixteen/eight/four split policy, subject to
+    the device's wide-cluster capacity. Actual compiled-kernel occupancy must
+    be queried separately from these measured scheduling thresholds.
+
+    Each BF16 operand slot holds 128x256 values in shared memory. Asynchronous
+    barrier arrivals publish copy completion while the producer can fill the
+    next free slot. An unsplit CTA merges each head and its three tail slots
+    within one warp; split clusters use the existing head-owning DSM combine.
+    FP8 retains the gather/conversion pipeline with operands in TMEM.
     """
 
     del metadata_capacity_rows  # The workspace-free specialization has no metadata.
@@ -102,6 +110,7 @@ def cute_dsl_blackwell_qsa_sparse_attention(
         max_seqlen_q=max_seqlen_q,
         k_scale=k_scale,
         v_scale=v_scale,
+        enable_pdl=pdl_enabled(),
     )
 
 
@@ -113,7 +122,7 @@ if _IS_NVIDIA_BLACKWELL:
         solution="cute_dsl",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset(
@@ -131,14 +140,14 @@ if _IS_NVIDIA_BLACKWELL:
             }
         ),
         traits={
-            "head_dim": frozenset({_HEAD_DIM}),
-            "value_head_dim": frozenset({_HEAD_DIM}),
             "num_q_heads": frozenset({6, 12, 24}),
             "num_kv_heads": frozenset({1, 2, 4}),
+            "head_dim": frozenset({_HEAD_DIM}),
+            "value_head_dim": frozenset({_HEAD_DIM}),
             "selected_width": frozenset({_SELECTED_WIDTH}),
+            "is_decode": frozenset({True}),
         },
         priority=Priority.SPECIALIZED + 2,
-        tags={"latency", "blackwell", "sparse", "cluster"},
     )(cute_dsl_blackwell_qsa_sparse_attention)
     __all__ = ["cute_dsl_blackwell_qsa_sparse_attention"]
 else:

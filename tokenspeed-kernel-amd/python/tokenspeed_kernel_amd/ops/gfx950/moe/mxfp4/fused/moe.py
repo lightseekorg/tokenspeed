@@ -137,6 +137,20 @@ _PRECOMPUTED_MFMA_MIN_M = 4
 _ROUTE_OWNED_DECODE_MAX_M = 2
 
 
+# Widest activation the precomputed-SiTU entry point serves with the
+# warp-decode kernels; anything wider goes to package prefill.
+#
+# Package prefill tiles routed rows into BLOCK_M=128 groups, which pays off once
+# a batch fills those tiles. Speculative decode never does: with EAGLE3 the
+# decode width is concurrency x num_draft_tokens, so a Kimi-K3 batch of 8 is 32
+# rows spread over hundreds of experts and the tiles are almost entirely
+# padding. Measured end to end on 8x gfx950 at 50K/500, moving this bound from
+# 16 to 64 lowers TPOT by 17% at concurrency 8 and 4% at concurrency 16, while
+# concurrency 4 -- below the bound either way -- is unchanged, and a
+# concurrency that does not cross the bound does not move.
+_SITU_WARP_DECODE_MAX_M = 64
+
+
 _ROUTE_OWNED_MIN_M = 1
 
 
@@ -218,7 +232,7 @@ def gluon_mxfp4_fp8_precomputed_situ(
             )
     if expert_start < 0:
         raise ValueError("expert_start must be non-negative")
-    if M > 16:
+    if M > _SITU_WARP_DECODE_MAX_M:
         if fuse_shared_down:
             return None
         result = _maybe_gluon_package_mxfp4_prefill(
@@ -1323,8 +1337,11 @@ def _maybe_gluon_package_mxfp4_prefill(
     s2_sorted_expert_ids = sorted_expert_ids
     s2_num_valid_ids = num_valid_ids
 
+    # Keep the physical A/W/scale buffers; skip only whole padded BK128
+    # tiles. Short intermediates still need the two-tile stage2 prologue.
+    stage2_logical_k = max(256, triton.cdiv(inter_dim, 128) * 128)
     invoke_gluon_mxfp4_moe_stage2_1x2(
-        q_inter,
+        q_inter[:, : stage2_logical_k // inter_div],
         None,
         package_w2.view(torch.uint8),
         s2_sorted_ids,

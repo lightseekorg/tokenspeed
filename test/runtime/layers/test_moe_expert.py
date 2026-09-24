@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -34,11 +35,16 @@ def test_hybrid_moe_dispatches_from_actual_topk_format(
 
     monkeypatch.setattr(expert_module.tokenspeed_kernel, "moe_apply", fake_moe_apply)
 
-    hidden_states = torch.empty((2, 4))
+    hidden_states = torch.empty((2, 4), dtype=torch.bfloat16)
     router_logits = torch.empty((2, 8))
-    layer(
+    bypassed_output = layer(
         hidden_states,
-        BypassedTopKOutput(hidden_states, router_logits, TopKConfig(top_k=2)),
+        BypassedTopKOutput(
+            hidden_states,
+            router_logits,
+            TopKConfig(top_k=2),
+            output_scale=torch.ones((2, 1), dtype=torch.float32),
+        ),
         num_global_tokens=2,
         max_num_tokens_per_gpu=2,
     )
@@ -53,6 +59,7 @@ def test_hybrid_moe_dispatches_from_actual_topk_format(
         max_num_tokens_per_gpu=2,
     )
 
+    assert bypassed_output.dtype == hidden_states.dtype
     assert calls[0]["router_logits"] is router_logits
     assert calls[1]["router_logits"] is None
     assert "topk_weights" not in calls[0]
@@ -88,16 +95,19 @@ def test_moe_layer_rejects_invalid_situ_parameters(
 
 
 @pytest.mark.parametrize("backend", ["none", "agrs", "flashinfer"])
+@pytest.mark.parametrize("moe_backend", ["auto", "mega_moe"])
 def test_moe_layer_builds_ep8_local_expert_partition(
     monkeypatch: pytest.MonkeyPatch,
     backend: str,
+    moe_backend: str,
 ) -> None:
     captured: dict[str, object] = {}
 
     def fake_moe_plan(weight_dtype: str, **kwargs) -> dict:
         captured["plan"] = {"weight_dtype": weight_dtype, **kwargs}
         return {
-            "solution": "triton",
+            "solution": kwargs["solution"] or "triton",
+            "process_group": kwargs["process_group"],
             "support_routing": False,
             "supports_deferred_finalize": False,
         }
@@ -105,8 +115,19 @@ def test_moe_layer_builds_ep8_local_expert_partition(
     def fake_create_layer_weights(spec, *args, **kwargs) -> None:
         captured["spec"] = spec
 
-    auto_backend = type("AutoBackend", (), {"value": "auto"})()
-    monkeypatch.setattr(expert_module, "get_moe_backend", lambda: auto_backend)
+    selected_backend = SimpleNamespace(value=moe_backend)
+    monkeypatch.setattr(expert_module, "get_moe_backend", lambda: selected_backend)
+    ep_group = tuple(range(8))
+    process_group = object()
+    resolve_group = mock.Mock(return_value=process_group)
+    monkeypatch.setattr(
+        expert_module.pg_manager, "get_device_process_group", resolve_group
+    )
+    monkeypatch.setitem(
+        expert_module.global_server_args_dict,
+        "mapping",
+        SimpleNamespace(moe=SimpleNamespace(ep_group=ep_group)),
+    )
     monkeypatch.setattr(expert_module.tokenspeed_kernel, "moe_plan", fake_moe_plan)
     monkeypatch.setattr(
         expert_module, "create_layer_weights", fake_create_layer_weights
@@ -141,6 +162,14 @@ def test_moe_layer_builds_ep8_local_expert_partition(
     assert captured["plan"]["ep_size"] == 8
     assert captured["plan"]["activation"] == "situ"
     assert captured["plan"]["routing_mode"] == "precomputed_topk"
+
+    expected_group = process_group if moe_backend == "mega_moe" else None
+    assert captured["plan"]["process_group"] is expected_group
+    assert layer.plan["process_group"] is expected_group
+    if moe_backend == "mega_moe":
+        resolve_group.assert_called_once_with(ep_group)
+    else:
+        resolve_group.assert_not_called()
 
 
 def test_moe_layer_rejects_uneven_contiguous_ep_partition() -> None:

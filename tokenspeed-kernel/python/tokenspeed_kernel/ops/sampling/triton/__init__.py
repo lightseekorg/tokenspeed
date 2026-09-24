@@ -20,6 +20,12 @@
 
 """Triton sampling kernel entry points."""
 
+from tokenspeed_kernel.ops.sampling.triton.dspark_block import (
+    dspark_block_candidate_tiles,
+    dspark_block_greedy_resolve,
+    dspark_block_greedy_step,
+)
+
 from .common import gather_and_expand_scalars
 from .generic import gumbel_sample_from_pools_generic
 from .gumbel import (
@@ -54,6 +60,9 @@ __all__ = [
     "gumbel_sample_top_k_top_p_from_pools",
     "gumbel_sample_top_k_top_p_qrita_from_pools",
     "dflash2_greedy_path",
+    "dspark_block_candidate_tiles",
+    "dspark_block_greedy_resolve",
+    "dspark_block_greedy_step",
     "min_p_renorm_prob",
     "apply_penalties_logit_bias_inplace",
     "accumulate_counts_inplace",

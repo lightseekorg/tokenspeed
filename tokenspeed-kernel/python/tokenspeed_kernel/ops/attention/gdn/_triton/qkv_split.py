@@ -68,6 +68,8 @@ def _fused_qkv_split_kernel(
 ):
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        # Release successor setup; its wait still guards all dependent reads.
+        tl.extra.cuda.gdc_launch_dependents()
     i_t = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_SIZE)
 
@@ -132,8 +134,6 @@ def _fused_qkv_split_kernel(
             replay_b_values,
             mask=gate_mask,
         )
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.autotune(
@@ -177,6 +177,8 @@ def _fused_qkv_split_l2norm_kernel(  # noqa: E501
     """
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        # Release successor setup; its wait still guards all dependent reads.
+        tl.extra.cuda.gdc_launch_dependents()
     i_t = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_SIZE)
 
@@ -257,8 +259,6 @@ def _fused_qkv_split_l2norm_kernel(  # noqa: E501
             replay_b_values,
             mask=gate_mask,
         )
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def fused_qkv_split_gdn_prefill(

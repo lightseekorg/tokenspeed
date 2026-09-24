@@ -17,12 +17,15 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 import argparse
 import contextlib
 import io
+import pickle
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.layers.attention import registry
+from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
+from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.utils.server_args import ServerArgs, prepare_server_args
 
@@ -101,6 +104,65 @@ class TestAttentionBackendChoices(unittest.TestCase):
     def test_inline_detokenizer_is_forced_on(self):
         args = prepare_server_args(["--model", "x"])
         self.assertTrue(args.enable_inline_detokenizer)
+
+    def test_kda_prefill_graph_uses_shared_args_not_worker_environment(self):
+        spec = MHAConfig(
+            num_attention_heads=4, num_kv_heads=4, head_dim=128, attn_tp_size=1
+        )
+        components = {
+            SoftmaxAttnConfig: spec,
+            LinearAttnConfig: SimpleNamespace(layer_ids=(0,), replay_ssm=False),
+        }
+        config = SimpleNamespace(
+            device="cpu",
+            dtype=None,
+            is_draft=False,
+            speculative_num_draft_tokens=1,
+            max_bs=4,
+            component=components.get,
+        )
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(full_attention_layer_ids=[1]),
+            attention_arch=AttentionArch.MLA,
+        )
+        for disabled in (False, True):
+            argv = ["--model", "x"]
+            if disabled:
+                argv.append("--disable-kda-prefill-graph")
+            shared_args = prepare_server_args(argv)
+            self.assertIs(shared_args.disable_kda_prefill_graph, disabled)
+            self.assertFalse(shared_args.disable_prefill_graph)
+            self.assertFalse(shared_args.enforce_eager)
+            # Simulate workers receiving the same serialized server arguments
+            # despite conflicting legacy environment settings. Keep the real
+            # KDA constructor so reintroducing a local env read fails this test.
+            for worker_env in ("0", "1"):
+                with (
+                    self.subTest(disabled=disabled, worker_env=worker_env),
+                    mock.patch.dict(
+                        os.environ, {"TOKENSPEED_KDA_PREFILL_GRAPH": worker_env}
+                    ),
+                    mock.patch.object(
+                        registry,
+                        "_create_attn_backend_with_name",
+                        return_value=SimpleNamespace(device="cpu"),
+                    ),
+                    mock.patch.object(
+                        registry, "_resolve_kda_backend", return_value="cutedsl_kda"
+                    ),
+                    mock.patch.object(registry, "is_qwen4_exp", return_value=False),
+                ):
+                    backend = registry._create_hybrid_linear_attn_backend(
+                        pickle.loads(pickle.dumps(shared_args)),
+                        model_config,
+                        config,
+                        pool=SimpleNamespace(state_group_by_layer={0: "state"}),
+                        full_attn_backend_name="mla",
+                        is_kda=True,
+                    )
+                    self.assertIs(
+                        backend.linear_attn_backend._prefill_graph_enabled, not disabled
+                    )
 
     def test_model_path_alias_sets_model(self):
         args = self._build_parser().parse_args(["--model-path", "x"])
@@ -376,6 +438,94 @@ class TestDecodeHostL2(unittest.TestCase):
         args.validate_cache_options()
 
         self.assertTrue(args.enable_kvstore)
+
+
+class TestDisaggregationGraphFlags(unittest.TestCase):
+    """The prefill role is a role with no decode step, not an eager role."""
+
+    def test_prefill_role_keeps_the_ordinary_graph_flags(self):
+        args = prepare_server_args(["--model", "x", "--disaggregation-mode", "prefill"])
+        self.assertFalse(args.enforce_eager)
+        self.assertFalse(args.disable_prefill_graph)
+
+    def test_prefill_role_honours_explicit_eager(self):
+        args = prepare_server_args(
+            ["--model", "x", "--disaggregation-mode", "prefill", "--enforce-eager"]
+        )
+        self.assertTrue(args.enforce_eager)
+
+    def test_pipeline_parallelism_forces_eager(self):
+        args = prepare_server_args(
+            [
+                "--model",
+                "x",
+                "--disaggregation-mode",
+                "prefill",
+                "--pipeline-parallel-size",
+                "2",
+            ]
+        )
+        self.assertTrue(args.enforce_eager)
+
+    def test_pipeline_debug_without_pd_forces_eager(self):
+        with mock.patch.dict(os.environ, {"TS_PP_DEBUG_ALLOW_NON_PREFILL": "1"}):
+            args = prepare_server_args(
+                ["--model", "x", "--pipeline-parallel-size", "2"]
+            )
+        self.assertTrue(args.enforce_eager)
+
+
+class TestL3StorageBackend(unittest.TestCase):
+    def test_cli_accepts_mooncake_and_memory(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        action = None
+        for candidate in parser._actions:
+            if candidate.dest == "kvstore_storage_backend":
+                action = candidate
+                break
+        self.assertIsNotNone(action)
+        self.assertEqual(set(action.choices), {"mooncake", "memory"})
+
+    def test_memory_backend_keeps_host_io(self):
+        args = object.__new__(ServerArgs)
+        args.disaggregation_mode = "null"
+        args.disable_kvstore = False
+        args.enable_kvstore = False
+        args.enable_prefix_caching = True
+        args.kvstore_storage_backend = "memory"
+        args.kvstore_io_backend = "direct"
+
+        args._handle_kvstore()
+
+        self.assertTrue(args.enable_kvstore)
+        self.assertEqual(args.kvstore_io_backend, "direct")
+
+    def test_l3_requires_host_l2(self):
+        args = object.__new__(ServerArgs)
+        args.disaggregation_mode = "null"
+        args.disable_kvstore = True
+        args.enable_kvstore = False
+        args.enable_prefix_caching = True
+        args.kvstore_storage_backend = "mooncake"
+        args.kvstore_io_backend = "direct"
+
+        with self.assertRaisesRegex(ValueError, "requires Host L2"):
+            args._handle_kvstore()
+
+    def test_mooncake_backend_keeps_host_io(self):
+        args = object.__new__(ServerArgs)
+        args.disaggregation_mode = "null"
+        args.disable_kvstore = False
+        args.enable_kvstore = False
+        args.enable_prefix_caching = True
+        args.kvstore_storage_backend = "mooncake"
+        args.kvstore_io_backend = "direct"
+
+        args._handle_kvstore()
+
+        self.assertTrue(args.enable_kvstore)
+        self.assertEqual(args.kvstore_io_backend, "direct")
 
 
 if __name__ == "__main__":

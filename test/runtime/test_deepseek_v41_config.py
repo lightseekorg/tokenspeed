@@ -178,7 +178,7 @@ def runtime_config(config_dir):
         data_parallel_size=None,
         pipeline_parallel_size=1,
         max_num_seqs=2,
-        chunked_prefill_size=256,
+        chunked_prefill_size=384,
         max_total_tokens=512,
         kv_cache_quant_method="none",
         disaggregation_mode="null",
@@ -186,6 +186,7 @@ def runtime_config(config_dir):
         disable_prefill_graph=True,
         seed=0,
     )
+    args.mapping.rank = 0
     model = ModelConfig(
         model_path=args.model,
         trust_remote_code=args.trust_remote_code,
@@ -411,26 +412,24 @@ def test_config_selects_flash_recipe_and_checks_geometry(runtime_config, overlap
         max_padding_fraction=recipe.max_padding_fraction,
     )
     recipe.check_layout(layout)
-    assert layout.lcm_block_bytes == 1_382_400
-    assert layout.plane_bytes == (("flatkv", 1_382_400),)
-    assert dict(layout.group_packing) == {
-        "v41.swa": 1,
-        "v41.global_r2": 20,
-        "v41.global_r1": 60,
-        "v41.compressor_tail_r2": 54,
-    }
+    # Row width decides the packing, so the plane follows the format this
+    # target chose; test_deepseek_v41_cache pins what each format produces.
+    rows = spec.row_layout()
+    assert layout.lcm_block_bytes == rows.lcm_block_bytes
+    assert layout.plane_bytes == (("flatkv", rows.lcm_block_bytes),)
+    assert dict(layout.group_packing) == dict(rows.group_packing)
     assert [group.block_granularity for group, _ in groups] == [64, 128, 64, 2]
     assert [len(fields) for _, fields in groups] == [40, 6, 2, 3]
     assert [group.sliding_window_tokens for group, _ in groups] == [
-        129 + overlap_depth,
+        128,
         None,
         None,
-        3 + overlap_depth,
+        2,
     ]
     assert all(group.family == "history" for group, _ in groups)
     assert all(field.page_stride_bytes % 256 == 0 for field in layout.fields)
-    with pytest.raises(ValueError, match="one 1,382,400-byte plane"):
-        recipe.check_layout(replace(layout, lcm_block_bytes=1_382_400 + 256))
+    with pytest.raises(ValueError, match="-byte plane"):
+        recipe.check_layout(replace(layout, lcm_block_bytes=rows.lcm_block_bytes + 256))
 
 
 @pytest.mark.parametrize("overlap_depth", [0, 1])
@@ -447,7 +446,7 @@ def test_real_server_args_prepare_cache_pool_and_backend(runtime_config, overlap
         attn_config=attn,
         draft_model_config=None,
         draft_attn_config=None,
-        cache_budget_bytes=128 << 20,
+        cache_budget_bytes=256 << 20,
         decode_input_tokens=1,
         overlap_schedule_depth=overlap_depth,
     )
@@ -482,10 +481,11 @@ def test_real_server_args_prepare_cache_pool_and_backend(runtime_config, overlap
     assert arena.buffer.numel() == plan.arena_bytes
     assert arena.runtime_contract.token_capacity == args.max_total_tokens
     assert arena.runtime_contract.group_specs == setup.spec.cache_group_specs
+    rows = attn.component(DeepseekV41AttnConfig).row_layout()
     for view, shape in (
-        (pool.swa(39), (64, 528)),
-        (pool.global_kv(2), (64, 288)),
-        (pool.index_k(20), (64, 68)),
+        (pool.swa(39), (64, rows.swa_row_bytes)),
+        (pool.global_kv(2), (64, rows.global_row_bytes)),
+        (pool.index_k(20), (64, rows.index_row_bytes)),
         (pool.compressor_tail(14), (2, 2, 512)),
     ):
         assert tuple(view.shape[1:]) == shape
@@ -494,4 +494,6 @@ def test_real_server_args_prepare_cache_pool_and_backend(runtime_config, overlap
             == arena.buffer.untyped_storage().data_ptr()
         )
     assert backend.cuda_graph_support.decode_graph
+    # The prefill graph captures the encoder and decoder stages around the
+    # eager narrowing (NarrowingPrefillModel), so the backend allows it.
     assert backend.cuda_graph_support.prefill_graph

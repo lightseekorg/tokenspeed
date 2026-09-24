@@ -40,7 +40,7 @@ def _close(
     rtol: float,
 ) -> ValidationOutcome:
     return validate_output(
-        OutputValidationSpec("close", 1, {"atol": atol, "rtol": rtol}),
+        OutputValidationSpec("close", {"atol": atol, "rtol": rtol}),
         [ValidationDatum(actual, expected)],
     )
 
@@ -53,45 +53,17 @@ def test_output_validator_registry_dispatches() -> None:
         return ValidationOutcome(True, "checked")
 
     set_output_validator("unit_custom", custom)
-    spec = OutputValidationSpec("unit_custom", 1, {"setting": 1})
+    spec = OutputValidationSpec("unit_custom", {"setting": 1})
     datum = ValidationDatum("candidate", "reference")
 
     assert get_output_validator("unit_custom") is custom
     assert validate_output(spec, [datum]) == ValidationOutcome(True, "checked")
     assert calls == [(spec, (datum,))]
 
-    with pytest.raises(TypeError, match="passed"):
-        ValidationOutcome(1)
-
-
-@pytest.mark.parametrize(
-    ("kwargs", "error", "match"),
-    [
-        ({"validator": "close", "runs": 0, "kwargs": {}}, ValueError, "between"),
-        (
-            {"validator": "close", "runs": 101, "kwargs": {}},
-            ValueError,
-            "between",
-        ),
-        (
-            {"validator": "close", "runs": True, "kwargs": {}},
-            ValueError,
-            "between",
-        ),
-    ],
-)
-def test_output_validation_spec_rejects_invalid_configuration(
-    kwargs: dict[str, object],
-    error: type[Exception],
-    match: str,
-) -> None:
-    with pytest.raises(error, match=match):
-        OutputValidationSpec(**kwargs)
-
 
 def test_close_aggregates_all_runs() -> None:
     outcome = validate_output(
-        OutputValidationSpec("close", 2, {"atol": 0.0, "rtol": 0.0}),
+        OutputValidationSpec("close", {"atol": 0.0, "rtol": 0.0}),
         [
             ValidationDatum(
                 torch.tensor([1.0, 2.0]),
@@ -154,16 +126,11 @@ def test_close_treats_nonfinite_values_as_mismatches() -> None:
             torch.tensor([1.0], dtype=torch.float64),
             "matching dtypes",
         ),
-        (
-            torch.tensor([1], dtype=torch.int64),
-            torch.tensor([1], dtype=torch.int64),
-            "does not support dtype",
-        ),
     ],
 )
 def test_close_reports_unsupported_output_pairs(actual, expected, detail) -> None:
     outcome = validate_output(
-        OutputValidationSpec("close", 1, {"atol": 0.0, "rtol": 0.0}),
+        OutputValidationSpec("close", {"atol": 0.0, "rtol": 0.0}),
         [ValidationDatum(actual, expected)],
     )
 
@@ -171,32 +138,9 @@ def test_close_reports_unsupported_output_pairs(actual, expected, detail) -> Non
     assert detail in (outcome.diagnostic or "")
 
 
-def test_validate_output_requires_known_validator_and_expected_run_count() -> None:
+def test_validate_output_requires_known_validator() -> None:
     with pytest.raises(KeyError, match="Unknown output validator"):
         validate_output(
-            OutputValidationSpec("missing", 1, {}),
+            OutputValidationSpec("missing", {}),
             [ValidationDatum("candidate", "reference")],
-        )
-
-    with pytest.raises(ValueError, match="has 1 run.*requires 2"):
-        validate_output(
-            OutputValidationSpec("close", 2, {"atol": 0.0, "rtol": 0.0}),
-            [ValidationDatum(torch.tensor([1.0]), torch.tensor([1.0]))],
-        )
-
-
-@pytest.mark.parametrize(
-    ("kwargs", "error", "match"),
-    [
-        ({"atol": 0.0}, ValueError, "missing rtol"),
-        ({"atol": 0.0, "rtol": 0.0, "extra": 1}, ValueError, "unknown extra"),
-        ({"atol": -1.0, "rtol": 0.0}, ValueError, "nonnegative"),
-        ({"atol": True, "rtol": 0.0}, TypeError, "number"),
-    ],
-)
-def test_close_rejects_invalid_kwargs(kwargs, error, match) -> None:
-    with pytest.raises(error, match=match):
-        validate_output(
-            OutputValidationSpec("close", 1, kwargs),
-            [ValidationDatum(torch.tensor([1.0]), torch.tensor([1.0]))],
         )

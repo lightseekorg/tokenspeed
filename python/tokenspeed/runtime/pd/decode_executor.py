@@ -39,8 +39,9 @@ class DisaggDecodeExecutor:
         self.kv_manager = MooncakeKVManagerDecode(args, kv_args)
         self.gloo_group = gloo_group
         self._local_states = {}
-        self._request_pool_indices: dict[str, int] = {}
+        self._admissions: dict[str, tuple[int, int]] = {}
         self._remote_cache_slots: dict[str, int] = {}
+        self._remote_cached_tokens: dict[str, int] = {}
         self._remote_spec_candidate_ids: dict[str, tuple[int, list[int]]] = {}
 
     def _bootstrap(self, request_id, info):
@@ -81,7 +82,10 @@ class DisaggDecodeExecutor:
         # Validate every row before publishing any destination manifest. A later
         # invalid row must not leave an earlier Prefill sender waiting forever.
         for request_id, receiver, request_pool_index, block_manifest in pending:
-            self._request_pool_indices[request_id] = request_pool_index
+            self._admissions[request_id] = (
+                request_pool_index,
+                block_manifest.prefix_len,
+            )
             receiver.prefill(block_manifest=block_manifest)
 
     def register(
@@ -116,13 +120,13 @@ class DisaggDecodeExecutor:
                 and poll == TransferPoll.Bootstrapped
             ):
                 logger.debug(
-                    "[decode][generate_events] rid=%s -> BootstrappedEvent", req_id
+                    f"[decode][generate_events] rid={req_id!s} -> BootstrappedEvent",
                 )
                 events.append(PD.BootstrappedEvent(req_id))
                 self._local_states[req_id] = TransferPoll.Bootstrapped
             elif poll == TransferPoll.Failed:
                 logger.warning(
-                    "[decode][generate_events] rid=%s -> FailedEvent", req_id
+                    f"[decode][generate_events] rid={req_id!s} -> FailedEvent",
                 )
                 events.append(PD.FailedEvent(req_id))
                 # Drop the failed receiver so it is not polled again. Without this
@@ -139,20 +143,22 @@ class DisaggDecodeExecutor:
                 # which is the key used in MooncakeKVReceiver.
                 self._local_states[req_id] = TransferPoll.Success
                 bootstrap_room = self.receivers[req_id].bootstrap_room
-                bootstrap_token, spec_candidate_ids = (
+                bootstrap_token, spec_candidate_ids, cached_tokens = (
                     self.kv_manager.pop_prefill_metadata(bootstrap_room)
                 )
-                request_pool_index = self._request_pool_indices[req_id]
+                request_pool_index, local_cached_tokens = self._admissions[req_id]
                 self._remote_cache_slots[req_id] = request_pool_index
+                self._remote_cached_tokens[req_id] = max(
+                    local_cached_tokens, cached_tokens
+                )
                 if spec_candidate_ids is not None:
                     self._remote_spec_candidate_ids[req_id] = (
                         request_pool_index,
                         spec_candidate_ids,
                     )
                 logger.debug(
-                    "[decode][generate_events] rid=%s -> RemotePrefillDoneEvent bootstrap_token=%s",
-                    req_id,
-                    bootstrap_token,
+                    f"[decode][generate_events] rid={req_id!s} -> "
+                    f"RemotePrefillDoneEvent bootstrap_token={bootstrap_token!s}",
                 )
                 # The C++ FSM extends the token into the TokenContainer as it
                 # applies this event (RemotePrefilling -> PrefillDone).
@@ -163,18 +169,21 @@ class DisaggDecodeExecutor:
         for req_id in to_remove:
             # Best-effort cleanup mirroring prefill side; request_id is stable
             # so without explicit pop these dicts would grow unbounded across
-            # failed requests. The remote-cache/spec handoff dictionaries must
-            # stay alive until event_loop consumes the event after this returns.
+            # failed requests. The completed result survives until the hooks
+            # consume the event after this returns.
             receiver = self.receivers.pop(req_id, None)
             if receiver is not None:
                 receiver.clear()
-            self._request_pool_indices.pop(req_id, None)
+            self._admissions.pop(req_id, None)
             self._local_states.pop(req_id, None)
 
         return events
 
     def pop_remote_spec_candidate_ids(self, request_id: str):
         return self._remote_spec_candidate_ids.pop(request_id, None)
+
+    def pop_remote_cached_tokens(self, request_id: str) -> int:
+        return self._remote_cached_tokens.pop(request_id)
 
     def pop_remote_cache_slot(self, request_id: str) -> int | None:
         return self._remote_cache_slots.pop(request_id, None)

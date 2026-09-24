@@ -119,6 +119,9 @@ class _DecodeExecutor(DisaggDecodeExecutor):
     def generate_events(self):
         return self._events
 
+    def pop_remote_cached_tokens(self, request_id):
+        return 0
+
     def pop_remote_cache_slot(self, req_id):
         return self._slot
 
@@ -173,7 +176,9 @@ def _planned(*, num_extends, label=None):
 def _loop(trace, kv_transfer, state):
     output_processor = SimpleNamespace(
         rid_to_state={"r0": state} if state is not None else {},
-        on_remote_prefill_done=lambda rid, tok: trace.append(("bootstrap", tok)),
+        on_remote_prefill_done=lambda rid, tok, cached_tokens: trace.append(
+            ("bootstrap", tok)
+        ),
         finish_remote_prefill_only_request=lambda rid: [],
     )
     return SimpleNamespace(
@@ -194,7 +199,7 @@ def _decoding_state():
 def test_remote_prefill_completion_lands_both_writes_on_the_device():
     trace: list = []
     event = PD.RemotePrefillDoneEvent("r0", 42)
-    kv_transfer = _DecodeExecutor([event], slot=7, candidates=(3, [11, 12]))
+    kv_transfer = _DecodeExecutor([event], slot=7, candidates=(7, [11, 12]))
     state = _decoding_state()
 
     hooks = PdTransferHooks(_loop(trace, kv_transfer, state), _handle(trace))
@@ -205,7 +210,7 @@ def test_remote_prefill_completion_lands_both_writes_on_the_device():
     assert trace == [
         ("bootstrap", 42),
         "run",
-        ("candidates", 3, [11, 12]),
+        ("candidates", 7, [11, 12]),
         ("ready", 7),
     ]
 
@@ -225,13 +230,13 @@ def test_completion_without_device_work_submits_nothing():
 def test_an_aborted_request_still_lands_its_candidates_but_is_not_armed():
     trace: list = []
     event = PD.RemotePrefillDoneEvent("r0", 42)
-    kv_transfer = _DecodeExecutor([event], slot=7, candidates=(3, [11, 12]))
+    kv_transfer = _DecodeExecutor([event], slot=7, candidates=(7, [11, 12]))
     aborted = SimpleNamespace(to_abort=True, finished=False)
 
     hooks = PdTransferHooks(_loop(trace, kv_transfer, aborted), _handle(trace))
     hooks.poll_transfer_events()
 
-    assert trace == ["run", ("candidates", 3, [11, 12])]
+    assert trace == ["run", ("candidates", 7, [11, 12])]
 
 
 # ----------------------------------------------------------------------
@@ -259,9 +264,10 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs():
                     ("write_backs", p.cache, prerequisite_stream, fence_stream)
                 )
             ),
-            submit_load_backs=lambda p, *, prerequisite_stream: trace.append(
+            submit_load_backs=lambda p, *, prerequisite_stream, l3_prefetch_ok: trace.append(
                 ("load_backs", p.cache, prerequisite_stream)
             ),
+            take_l3_prefetch_results=lambda: {},
             poll_results=lambda: ["done"],
         ),
     )
@@ -269,7 +275,7 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs():
         ("zero", tuple(pages))
     )
 
-    handle.execute(plan, None)
+    handle.execute(plan, None, submit_remote_prefill=True)
 
     assert trace == [
         "submit",
@@ -284,11 +290,23 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs():
     assert trace[-1] != "submit"
 
 
+def test_page_zeroing_without_l2_submits_only_zeroing():
+    trace: list = []
+    handle = _handle(trace)
+    handle._executor.zero_cache_pages = lambda pages: trace.append(
+        ("zero", tuple(pages))
+    )
+
+    handle.execute(_plan(pages_to_zero=[3, 4]), None, submit_remote_prefill=True)
+
+    assert trace == ["submit", ("zero", (3, 4))]
+
+
 def test_a_plan_with_no_device_work_submits_nothing():
     trace: list = []
     handle = _handle(trace, l2_cache_executor=SimpleNamespace())
 
-    handle.execute(_plan(), None)
+    handle.execute(_plan(), None, submit_remote_prefill=True)
 
     assert trace == []
 
@@ -305,17 +323,76 @@ def test_a_failed_cache_submission_surfaces_at_the_next_poll():
         trace,
         l2_cache_executor=SimpleNamespace(
             submit_write_backs=exploding,
-            submit_load_backs=lambda p, *, prerequisite_stream: None,
+            submit_load_backs=lambda p, *, prerequisite_stream, l3_prefetch_ok: None,
+            take_l3_prefetch_results=lambda: {},
             poll_results=lambda: [],
         ),
     )
 
     # Submission itself never raises (fire-and-forget)...
-    handle.execute(_plan(cache=["op"]), None)
+    handle.execute(_plan(cache=["op"]), None, submit_remote_prefill=True)
     # ...the failure re-raises at the round head, data-plane cause chained.
     with pytest.raises(RuntimeError, match="cache-plan submission failed") as info:
         handle.poll_cache_results()
     assert isinstance(info.value.__cause__, ValueError)
+
+
+@pytest.mark.parametrize("second_ok", [True, False])
+def test_queued_load_backs_capture_each_plans_l3_results(second_ok):
+    """Two control-plane rounds run before either queued H2D submission."""
+    from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+
+    queued = []
+    observed = []
+    l2 = L2CacheExecutor.__new__(L2CacheExecutor)
+    l2._l3_prefetch_ok = {(0, 1, "first", 0): True}
+    l2.submit_write_backs = lambda p, *, prerequisite_stream, fence_stream: None
+    l2.submit_load_backs = lambda p, *, prerequisite_stream, l3_prefetch_ok: (
+        observed.append((p, l3_prefetch_ok))
+    )
+    handle = _handle([], l2_cache_executor=l2)
+
+    def enqueue(fn):
+        future = Future()
+        queued.append((fn, future))
+        return future
+
+    handle._thread = SimpleNamespace(submit=enqueue)
+    first = _plan(cache=["first"])
+    second = _plan(cache=["second"])
+    handle.execute(first, None, submit_remote_prefill=True)
+    assert l2._l3_prefetch_ok == {}
+    l2._l3_prefetch_ok = {(0, 2, "second", 0): True}
+    if not second_ok:
+        l2.invalidate_l3_prefetch()
+    handle.execute(second, None, submit_remote_prefill=True)
+    assert observed == []
+    for fn, future in queued:
+        future.set_result(fn())
+    assert observed == [
+        (first, {(0, 1, "first", 0): True}),
+        (second, {(0, 2, "second", 0): second_ok}),
+    ]
+
+
+def test_shutdown_cache_joins_submissions_then_closes_on_the_forward_thread():
+    from concurrent.futures import Future
+
+    trace: list = []
+    handle = _handle(
+        trace,
+        l2_cache_executor=SimpleNamespace(
+            shutdown=lambda: trace.append("l2_shutdown"),
+        ),
+    )
+    pending = Future()
+    pending.set_result(None)
+    handle._l2_submissions.append(pending)
+
+    handle.shutdown_cache()
+
+    assert list(handle._l2_submissions) == []
+    assert trace == ["run", "l2_shutdown"]
 
 
 def test_cache_polling_without_kvstore_refuses_loudly():
@@ -345,10 +422,11 @@ def test_the_remote_decode_and_the_arming_ride_the_fifo():
     chunk = _planned(num_extends=1, label="CHUNK")
     remote_decode = SimpleNamespace(request_ids=["done"])
 
-    handle.execute(_plan(), chunk)
+    handle.execute(_plan(), chunk, submit_remote_prefill=True)
     handle.execute(
         _plan(remote_decode=remote_decode),
         None,
+        submit_remote_prefill=True,
     )
 
     # Arming is enqueued before the forward it arms; the send follows the
@@ -674,13 +752,34 @@ def test_the_event_loop_stores_only_the_running_handle():
 def test_the_handle_stays_a_closed_list_of_named_operations():
     """A god object forms one convenience method at a time.
 
-    The bound is not sacred, but pushing past it should be a deliberate
-    change — and every entry should be a named operation, not a "run this
-    closure" slot. Exactly one such slot is registered (EPD admission's
-    device half is a state machine; see run_multimodal_work).
+    Pin the operation names so even a same-size substitution needs review.
+    L3 control operations keep the Host tier behind the handle, as documented
+    in docs/design/event-loop.md. Exactly one generic work slot is registered
+    (EPD admission's device half; see run_multimodal_work).
     """
     public = {name for name in vars(DeviceHandle) if not name.startswith("_")}
-    assert len(public) <= 10, sorted(public)
+    assert public == {
+        "execute",
+        "role",
+        "poll_cache_results",
+        "consume_l3_backup_poll_failure",
+        "query_l3_storage",
+        "plan_has_l3_prefetch",
+        "prefetch_l3_load_backs",
+        "invalidate_l3_prefetch",
+        "l3_prefetch_storage_keys",
+        "mark_l3_keys_unread",
+        "l3_key_is_unread",
+        "forget_l3_unread_keys",
+        "delete_l3_namespace",
+        "set_l3_weight_version",
+        "shutdown_cache",
+        "run_idle_forward",
+        "run_multimodal_work",
+        "run_kv_repair",
+        "run_remote_prefill_landing",
+        "update_weights",
+    }
     assert {name for name in public if name.endswith("_work")} == {
         "run_multimodal_work"
     }
@@ -768,3 +867,28 @@ def test_collaborators_hold_the_handle_instead_of_walking_to_it():
         source = inspect.getsource(module)
         assert "loop.device" not in source
         assert "loop._device" not in source
+
+
+def test_prefill_usage_hook_records_committed_totals_and_skips_retired_requests():
+    from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
+
+    recorded = []
+    transfer = object.__new__(DisaggPrefillExecutor)
+    transfer.senders = {"hit": SimpleNamespace(bootstrap_room=9)}
+    transfer.kv_manager = SimpleNamespace(
+        record_cached_tokens=lambda room, count: recorded.append((room, count))
+    )
+    loop = SimpleNamespace(
+        kv_transfer=transfer,
+        output_processor=SimpleNamespace(
+            rid_to_state={"hit": SimpleNamespace(cached_tokens=1280)}
+        ),
+    )
+    hooks = PdTransferHooks(loop, None)
+    hooks.record_prefill_usage(["hit", "retired"])
+    loop.output_processor.rid_to_state["hit"].cached_tokens = 1536
+    hooks.record_prefill_usage(["hit"])
+    assert recorded == [(9, 1280), (9, 1536)]
+    loop.kv_transfer = None
+    hooks.record_prefill_usage(["hit"])
+    assert recorded == [(9, 1280), (9, 1536)]

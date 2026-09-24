@@ -6,14 +6,20 @@
     "arch": "9.5"
   },
   "timer": {
-    "calls_per_graph": 100,
     "eager_warmup_iterations": 5,
     "replay_warmup_iterations": 3,
     "measurement_blocks": 30
   },
+  "case_files": [
+    "gfx950/glm53_flash/kda.json",
+    "gfx950/glm53_flash/dsa.json",
+    "gfx950/glm53_flash/moe.json",
+    "gfx950/dsv41_flash/gemm.json"
+  ],
   "cases": [
     {
-      "id": "gemm.bmm/gluon_bmm_a16w16_gfx950/b12-m1-n512-k128-bfloat16/v1",
+      "id": "gemm.bmm/gluon_bmm_a16w16_gfx950/b12-m1-n512-k128-bfloat16",
+      "comparison_epoch": 1,
       "definition": {
         "family": "gemm",
         "mode": "bmm",
@@ -30,8 +36,8 @@
           }
         },
         "registration": "gluon_bmm_a16w16_gfx950",
-        "seed": 42,
-        "definition_version": 1
+        "cold_cache": true,
+        "seed": 42
       },
       "policy": {
         "max_regression_relative": 0.1,

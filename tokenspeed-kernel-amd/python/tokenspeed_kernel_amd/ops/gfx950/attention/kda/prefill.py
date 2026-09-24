@@ -177,7 +177,7 @@ def _store_16x16_block(
 
 
 @gluon.jit
-def _solve_merge_64_fwd_kernel(
+def gluon_kda_paged_prefill_solve_merge_gfx950(
     akk,
     tinv,
     cu_seqlens,
@@ -291,7 +291,7 @@ def _add(a, b):
 
 
 @gluon.jit
-def _preprocess_intra_fwd_kernel(
+def gluon_kda_paged_prefill_preprocess_gfx950(
     q,
     k,
     raw_g,
@@ -370,7 +370,6 @@ def _preprocess_intra_fwd_kernel(
     q_smem.store(normalized_q)
     k_smem.store(normalized_k)
     bg_smem.store(cumulative_gate)
-    gl.barrier()
 
     load_layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [NUM_WARPS, 1], [1, 0])
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
@@ -452,7 +451,7 @@ def _preprocess_intra_fwd_kernel(
 
 
 @gluon.jit
-def _wu_vector_fwd_kernel(
+def gluon_kda_paged_prefill_wu_vector_gfx950(
     tinv,
     kn,
     v,
@@ -560,7 +559,7 @@ def _wu_vector_fwd_kernel(
 
 
 @gluon.jit
-def _state_scan_fwd_kernel(
+def gluon_kda_paged_prefill_state_scan_gfx950(
     w,
     u,
     kg,
@@ -766,7 +765,7 @@ def _state_scan_fwd_kernel(
 
 
 @gluon.jit
-def _output_fwd_kernel(
+def gluon_kda_paged_prefill_gfx950(
     aqk,
     vnew,
     output,
@@ -860,7 +859,7 @@ def _launch_producer(
     cu_seqlens: torch.Tensor,
     chunk_indices: torch.Tensor,
 ) -> None:
-    _solve_merge_64_fwd_kernel[(num_chunks, heads)](
+    gluon_kda_paged_prefill_solve_merge_gfx950[(num_chunks, heads)](
         akk,
         tinv,
         cu_seqlens,
@@ -869,7 +868,7 @@ def _launch_producer(
         BT=chunk_size,
         num_warps=1,
     )
-    _wu_vector_fwd_kernel[(num_chunks, heads, 1)](
+    gluon_kda_paged_prefill_wu_vector_gfx950[(num_chunks, heads, 1)](
         tinv,
         kn,
         v,
@@ -889,7 +888,7 @@ def _launch_producer(
     )
 
 
-def gluon_kda_paged_prefill_gfx950(
+def launch_gluon_kda_paged_prefill_gfx950(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -980,7 +979,7 @@ def gluon_kda_paged_prefill_gfx950(
     )
     kg = torch.empty_like(k, dtype=torch.bfloat16)
     qg = torch.empty_like(q, dtype=torch.bfloat16)
-    _preprocess_intra_fwd_kernel[(num_chunks, heads)](
+    gluon_kda_paged_prefill_preprocess_gfx950[(num_chunks, heads)](
         q,
         k,
         g_raw,
@@ -1037,7 +1036,7 @@ def gluon_kda_paged_prefill_gfx950(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )
-    _state_scan_fwd_kernel[
+    gluon_kda_paged_prefill_state_scan_gfx950[
         (triton.cdiv(value_dim, scan_output_block), num_sequences * heads)
     ](
         w,
@@ -1059,7 +1058,7 @@ def gluon_kda_paged_prefill_gfx950(
         num_stages=2,
         waves_per_eu=4,
     )
-    _output_fwd_kernel[(num_chunks, heads)](
+    gluon_kda_paged_prefill_gfx950[(num_chunks, heads)](
         aqk,
         vnew,
         output,
@@ -1075,4 +1074,4 @@ def gluon_kda_paged_prefill_gfx950(
     return output.unsqueeze(0), final_state
 
 
-__all__ = ["gluon_kda_paged_prefill_gfx950"]
+__all__ = ["launch_gluon_kda_paged_prefill_gfx950"]

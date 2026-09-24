@@ -20,8 +20,10 @@
 
 """Breakable CUDA graphs for prefill (extend) forwards.
 
-:class:`PrefillGraph` holds one breakable graph per padded token bucket
-(captured from a dummy bs=1 extend batch). The embedding lookup stays OUTSIDE
+:class:`PrefillGraph` owns captures keyed by ``(token_bucket, exact_bs)``.
+``exact_bs=None`` denotes ordinary segments with eager attention breaks.
+Dummy batches balance tokens across the selected nonempty request count.
+The embedding lookup stays OUTSIDE
 the captured region: graphs start from a static input-embeds buffer, filled at
 replay by an eager ``embed_tokens`` gather (text) or by precomputed merged
 embeddings (multimodal, via the model's ``multimodal_input_embeds`` seam).
@@ -34,12 +36,24 @@ three-way -- decode & captured replays the decode graph (one level up, since
 it captures the whole step), prefill & captured replays here (:meth:`can_run`
 / :meth:`replay`), everything else runs the eager model forward.
 
-Unlike decode (whole forward captured, keyed by batch size), the captured
-region here is purely token-shaped compute keyed by total token count:
-attention runs as an eager break (see
-:mod:`tokenspeed.runtime.execution.breakable_cuda_graph`), so one graph per
-bucket serves any batch size at that token count, and a replayed forward is
-finished with the model's eager logits tail.
+Ordinary captures keep attention at eager breaks (see
+:mod:`tokenspeed.runtime.execution.breakable_cuda_graph`) and reuse the
+token-shaped segments across batch sizes. Inline captures include compatible
+KDA at a fitting request capacity; full attention keeps its breaks. Mixed batches,
+request counts beyond captured capacity, layerwise transfer and DP retain
+the ordinary route, subject to its admission rules. Both routes finish with
+the model's eager logits tail.
+
+A :class:`NarrowingPrefillModel` drops its row count once, at a fixed layer,
+by a completion-dependent amount (DeepSeek-V4.1's CED decoder runs on each
+prompt's last window). One token-shaped graph cannot express that, so such a
+model is captured as two graph families around an eager narrowing: encoder
+graphs per token bucket (``encoder_forward``) and decoder graphs per
+decoder-row bucket (``decoder_forward`` from a fixed-row static state). The
+decoder graphs depend only on their row count, so they are shared by every
+token bucket; a forward whose narrowed rows exceed the largest decoder bucket
+runs its decoder stage eager after the encoder replay. Under attention DP the
+narrowed row count is rank-local, so the split graph is disabled there.
 """
 
 from __future__ import annotations
@@ -47,7 +61,7 @@ from __future__ import annotations
 import bisect
 from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, Protocol, runtime_checkable
 
 import torch
 import tqdm
@@ -93,10 +107,10 @@ PREFILL_BUCKET_MAX_STEP: int = 512
 def get_prefill_token_buckets(config: ModelExecutorConfig) -> list[int]:
     """Padded token-count buckets to capture for the breakable prefill graph.
 
-    Unlike decode (keyed by batch size), the breakable prefill graph captures
-    pure token-shaped compute, so it is keyed by total token count. A live extend
-    forward is padded up to the smallest bucket >= its token count; forwards above
-    the largest bucket run eager.
+    Both ordinary and inline captures use this total-token capacity ladder;
+    inline captures additionally select a fitting request capacity. A live extend
+    forward is padded up to a bucket fitting its tokens and any dummy scan slots.
+    Forwards above the largest bucket run eager.
 
     Returns an empty list (graph disabled) when ``disable_prefill_graph`` is set or
     ``prefill_graph_max_tokens <= 0``. The largest bucket is clamped to the
@@ -115,11 +129,11 @@ def get_prefill_token_buckets(config: ModelExecutorConfig) -> list[int]:
     bounded at the top end. The ~12.5% tail that step implies holds only where
     size/8 exceeds the floor: below ~128 tokens the floor dominates and the
     relative waste grows sharply (17 -> 32 pads 88%, 1 -> 16 pads 1500%),
-    which is where a graphed forward is least likely to pay for itself. Dense
-    ladders are cheap: all captures share one stream + mempool, so graph memory
-    is ~the largest bucket's peak regardless of bucket count (see
-    ``BreakableCapture``); the remaining cost is ~0.5s of startup capture per
-    bucket.
+    which is where a graphed forward is least likely to pay for itself.
+    Captures share a stream and mempool to reuse scratch, but graph objects,
+    outputs and stable metadata are retained per configuration. Total memory
+    is not determined by the largest bucket alone; denser ladders also add
+    startup capture work.
 
     ``prefill_graph_capture_sizes`` overrides the ladder with an explicit list
     (mirroring decode's ``cudagraph_capture_sizes``) -- e.g. a short list for
@@ -167,6 +181,114 @@ def _prefill_bucket_step(size: int) -> int:
     return min(largest_pow2, PREFILL_BUCKET_MAX_STEP)
 
 
+def resolve_prefill_capture_batch_sizes(
+    config: ModelExecutorConfig, token_bucket: int
+) -> list[int]:
+    """Resolve defaults, validate limits and select BS candidates for this bucket.
+
+    Each request must have at least one token and fit the model context.
+    Unset configuration retains the minimum count required by the bucket.
+    Counts outside a particular bucket's range are skipped, not padded with
+    empty sequences. Invalid configured counts fail before capture. The result
+    is sorted and deduplicated; backend support is checked separately.
+    """
+    context = max(1, int(config.context_len))
+    minimum = -(-token_bucket // context)
+    maximum = config.max_num_seqs // config.data_parallel_size
+    sizes = config.prefill_graph_capture_batch_sizes
+    if sizes is None:
+        sizes = [minimum]
+    if any(size <= 0 or size > maximum for size in sizes):
+        raise ValueError(
+            "prefill graph capture batch sizes must be positive and no larger "
+            "than max_num_seqs / data_parallel_size"
+        )
+    return sorted({size for size in sizes if minimum <= size <= token_bucket})
+
+
+@runtime_checkable
+class NarrowedRowState(Protocol):
+    """Row-shaped activations a :class:`NarrowingPrefillModel` carries between
+    its stages. The graph owner treats it opaquely except for these two."""
+
+    @property
+    def rows(self) -> int: ...
+
+    def land_into(self, dst: NarrowedRowState) -> None:
+        """Copy into the leading rows of the fixed-row ``dst``; zero its tail."""
+        ...
+
+
+@runtime_checkable
+class NarrowingPrefillModel(Protocol):
+    """An inner model whose prefill row count drops once, at a fixed layer.
+
+    ``forward`` must equal ``finish_forward(*decoder_forward(narrowing_forward(
+    encoder_forward(...))))``. The encoder stage is token-shaped and is captured
+    per token bucket; the narrowing stage runs eager on the real rows and may
+    receive the encoder's padded output; the decoder stage computes every row
+    of the state it is given (a padded static one under the graph) and is
+    captured per decoder-row bucket; the finish stage gathers the sampled rows
+    and publishes any per-forward row report on ``ctx``. Stages read
+    per-forward quantities from ``ctx`` and its attention backend, never from
+    loose arguments a captured break would freeze.
+    """
+
+    # The most decoder rows one request can contribute (V4.1: its last window).
+    max_decoder_rows_per_request: int
+
+    def encoder_forward(
+        self, input_ids: torch.Tensor, positions: torch.Tensor, ctx, **model_kwargs
+    ) -> NarrowedRowState: ...
+
+    def narrowing_forward(self, state: NarrowedRowState, ctx) -> NarrowedRowState: ...
+
+    def decoder_forward(
+        self, state: NarrowedRowState, ctx
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]: ...
+
+    def finish_forward(
+        self, hidden: torch.Tensor, captured: list[torch.Tensor], ctx
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]: ...
+
+    def decoder_rows(self, ctx) -> int:
+        """Rows ``narrowing_forward`` yields for the forward ``ctx`` describes."""
+        ...
+
+    def allocate_decoder_state(self, rows: int) -> NarrowedRowState:
+        """A zero ``rows``-row state laid out like ``narrowing_forward``'s output."""
+        ...
+
+
+def get_decoder_row_buckets(
+    token_buckets: list[int], rows_per_request: int, max_bs: int
+) -> list[int]:
+    """Decoder-row capacities to capture for a :class:`NarrowingPrefillModel`.
+
+    Narrowing never adds rows, so the decoder never sees more than the token
+    bucket; per request it keeps at most ``rows_per_request``, so it never
+    sees more than ``rows_per_request * max_bs`` either. The ladder is the
+    token ladder clipped to that cap (same relative padding bound, same
+    ``--prefill-graph-capture-sizes`` override), with the cap itself as the
+    top rung. Every decoder bucket is captured once and shared by all token
+    buckets.
+
+    Args:
+        token_buckets: The captured token buckets (``get_prefill_token_buckets``).
+        rows_per_request: The model's ``max_decoder_rows_per_request``.
+        max_bs: Rank-local request capacity.
+
+    Returns:
+        Sorted ascending decoder-row buckets; empty iff ``token_buckets`` is.
+    """
+    if not token_buckets:
+        return []
+    top = min(max(token_buckets), max(1, rows_per_request) * max(1, max_bs))
+    buckets = {bucket for bucket in token_buckets if bucket <= top}
+    buckets.add(top)
+    return sorted(buckets)
+
+
 class CapturedForward(NamedTuple):
     """A bucket's captured inner-forward outputs (stable pool addresses)."""
 
@@ -182,6 +304,25 @@ class CapturedForward(NamedTuple):
         if self.aux_hidden_states is None:
             return hidden, None
         return hidden, [a[:num_tokens] for a in self.aux_hidden_states]
+
+
+class CapturedEncoder(NamedTuple):
+    """A token bucket's captured encoder stage and its pool-pinned output state."""
+
+    capture: BreakableCapture
+    state: NarrowedRowState
+
+
+class CapturedDecoder(NamedTuple):
+    """A decoder-row bucket's captured decoder stage.
+
+    ``statics`` is the fixed-row input state the graph reads (landed into
+    before each replay); ``output`` its pool-pinned normalized rows and taps.
+    """
+
+    capture: BreakableCapture
+    statics: NarrowedRowState
+    output: CapturedForward
 
 
 class PrefillGraph:
@@ -239,6 +380,15 @@ class PrefillGraph:
         self.num_warmup = num_warmup
         self.dp_size = config.data_parallel_size
 
+        # A narrowing model is captured as encoder + decoder graph families
+        # around its eager narrowing stage (module docstring); None means the
+        # whole inner forward is one token-shaped capture.
+        self._narrowing: NarrowingPrefillModel | None = (
+            self.inner_model
+            if isinstance(self.inner_model, NarrowingPrefillModel)
+            else None
+        )
+
         self.capture_buckets = get_prefill_token_buckets(config)
         self.disable = (
             config.enforce_eager
@@ -257,6 +407,33 @@ class PrefillGraph:
             # collectives. Until the DP metadata gather carries a multimodal
             # flag, keep the graph off for multimodal models under DP.
             or (config.data_parallel_size > 1 and model_runner.is_multimodal)
+            # The narrowed row count is rank-local (which prompts complete on
+            # this rank), so the decoder bucket -- and the collective shapes
+            # its graph bakes -- would differ across ranks; the stages also
+            # size their collectives from their own rows, which the DP
+            # gather does not carry. Until narrowed counts are exchanged,
+            # the split graph stays off under attention DP.
+            or (config.data_parallel_size > 1 and self._narrowing is not None)
+        )
+        if (
+            self._narrowing is not None
+            and config.data_parallel_size > 1
+            and not config.enforce_eager
+            and not config.disable_prefill_graph
+        ):
+            logger.info(
+                "Prefill CUDA graphs disabled: the narrowing prefill model's "
+                "decoder rows are rank-local under attention DP"
+            )
+
+        self.decoder_buckets: list[int] = (
+            get_decoder_row_buckets(
+                self.capture_buckets,
+                self._narrowing.max_decoder_rows_per_request,
+                int(config.max_num_seqs) // max(int(config.data_parallel_size), 1),
+            )
+            if self._narrowing is not None and not self.disable
+            else []
         )
 
         self._ctx: ForwardContext | None = None
@@ -264,22 +441,32 @@ class PrefillGraph:
         self._engaged_logged: set[str] = set()
         # Aux-capture mode baked into the graphs; mismatched live forwards run eager.
         self._captured_hidden_mode = None
-        # One captured graph + bucket-sized output per padded token bucket.
-        self._captures: dict[int, BreakableCapture] = {}
-        self._outputs: dict[int, CapturedForward] = {}
+        # One owner for ordinary and attention-containing captures. None is the
+        # batch-independent attention-break variant; integers require exact BS.
+        # Checkpoint counts are refreshed metadata, never another capture key.
+        self._captures: dict[
+            tuple[int, int | None], tuple[BreakableCapture, CapturedForward]
+        ] = {}
+        # The narrowing model's two families: encoders by token bucket,
+        # decoders by decoder-row bucket (shared across token buckets).
+        self._encoders: dict[int, CapturedEncoder] = {}
+        self._decoders: dict[int, CapturedDecoder] = {}
 
     # ------------------------------------------------------------------
     # Graph capture
     # ------------------------------------------------------------------
 
     def capture(self, decode_wrapper: ForwardStepRunner | None = None) -> None:
-        """Capture one breakable graph per token bucket (no-op when disabled).
+        """Capture ordinary and compatible inline variants per token bucket.
+
+        No-op when disabled.
 
         ``decode_wrapper`` supplies the shared capture stream (used here only,
         not stored). Buckets share
         one PRIVATE mempool (first capture
-        allocates it), so graph memory stays ~the largest bucket's peak --
-        but never the decode graphs' pool: eager ops cache raw pointers to
+        allocates it) to reuse scratch; graph objects and metadata still cost
+        memory per variant. Never use the decode graphs' pool: eager ops cache
+        raw pointers to
         buffers they lazily allocated inside a decode capture (flashinfer's
         trtllm-gen MoE runner), and a prefill capture reusing those freed
         blocks means every replay rewrites them, corrupting the next eager
@@ -305,6 +492,9 @@ class PrefillGraph:
         )
         # Seam: backends alloc static buffers or refuse capture; kept
         # outside inference mode (in-place refresh). Base default: no-op.
+        self._captures.clear()
+        self._encoders.clear()
+        self._decoders.clear()
         self.attn_backend.init_prefill_graph_state(
             max_num_tokens=max(self.capture_buckets),
             max_bs=int(self.config.max_num_seqs)
@@ -312,6 +502,8 @@ class PrefillGraph:
         )
         with maybe_inference_mode():
             self._capture_all_buckets(decode_wrapper)
+            if self._narrowing is not None:
+                self._capture_decoders(decode_wrapper)
 
     def _capture_all_buckets(self, decode_wrapper: ForwardStepRunner | None) -> None:
         rank = self.config.global_rank
@@ -325,7 +517,9 @@ class PrefillGraph:
                 capture_range.set_description(
                     f"Capturing prefill buckets ({bucket=} {avail_mem=:.2f} GB)"
                 )
-            self._ctx = self.make_dummy_batch(bucket)
+            minimum_bs = -(-bucket // max(1, int(self.config.context_len)))
+            batch_sizes = resolve_prefill_capture_batch_sizes(self.config, bucket)
+            self._ctx = self.make_dummy_batch(bucket, minimum_bs)
             self._land_input_embeds(
                 self._embed_tokens(self.input_buffers.input_ids_buf[:bucket]), bucket
             )
@@ -333,21 +527,139 @@ class PrefillGraph:
             # Breaks record the ambient dummy ctx; it is rebound live at replay.
             try:
                 with active_forward(self._ctx):
-                    self._capture_bucket(bucket, decode_wrapper)
+                    if self.dp_size == 1:
+                        self.attn_backend.prepare_prefill_metadata(
+                            bucket, minimum_bs, self._ctx.forward_mode, capture=False
+                        )
+                    if self._narrowing is not None:
+                        self._encoders[bucket] = self._capture_encoder(
+                            bucket, decode_wrapper
+                        )
+                    else:
+                        self._captures[bucket, None] = self._capture_bucket(
+                            bucket, decode_wrapper
+                        )
+                # Retain the ordinary graph for mixed/different-count batches.
+                # DP admission must be rank-uniform; keep its existing route.
+                # A narrowing model's attention stays at its breaks: no inline
+                # variants.
+                for bs in (
+                    batch_sizes if self.dp_size == 1 and self._narrowing is None else []
+                ):
+                    self._ctx = self.make_dummy_batch(bucket, bs)
+                    with active_forward(self._ctx):
+                        ready = self.attn_backend.prepare_prefill_metadata(
+                            bucket, bs, self._ctx.forward_mode, capture=True
+                        )
+                        if not ready:
+                            continue
+                        self._captures[bucket, bs] = self._capture_bucket(
+                            bucket, decode_wrapper
+                        )
             finally:
                 self._ctx = None
         if self.config.global_rank == 0:
-            sample = next(iter(self._captures.values()), None)
+            if self._narrowing is not None:
+                sample = next(iter(self._encoders.values()), None)
+                logger.info(
+                    "prefill breakable graph: captured encoder buckets "
+                    f"{sorted(self._encoders)!s} (segments="
+                    f"{(sample.capture.num_segments if sample is not None else 0):d}"
+                    ", eager attention breaks; the narrowing stage runs eager)",
+                )
+                return
+            ordinary = {
+                bucket: value
+                for (bucket, bs), value in self._captures.items()
+                if bs is None
+            }
+            sample = next(iter(ordinary.values()), None)
             logger.info(
-                "prefill breakable graph: captured buckets %s (segments=%d, eager "
-                "attention breaks)",
-                sorted(self._captures),
-                sample.num_segments if sample is not None else 0,
+                f"prefill breakable graph: captured buckets {sorted(ordinary)!s} "
+                f"(segments={(sample[0].num_segments if sample is not None else 0):d}, "
+                "eager attention breaks)",
+            )
+            variants = {
+                key: value
+                for key, value in self._captures.items()
+                if key[1] is not None
+            }
+            if variants:
+                logger.info(
+                    "prefill inline attention: captured (tokens, requests) "
+                    f"{sorted(variants)!s} "
+                    "with fixed checkpoint slots "
+                    f"(segments={next(iter(variants.values()))[0].num_segments:d}, "
+                    "ordinary captures retained for fallback)",
+                )
+
+    def _capture_decoders(self, decode_wrapper: ForwardStepRunner | None) -> None:
+        """Capture the narrowing model's decoder stage per decoder-row bucket.
+
+        Each bucket gets a static input state of exactly that many rows and a
+        dummy batch whose decoder view keeps every row (requests of at most
+        ``max_decoder_rows_per_request`` tokens, all completing), so the
+        captured breaks see the full row count. The encoder and narrowing
+        stages run eagerly on that batch first: the decoder stage consumes
+        per-forward backend state its preceding layers produce (V4.1's reuse
+        layers read the index source's selection), and their output fills the
+        statics for warmup and capture. The graphs share the encoder pool; the
+        statics live outside it, so no capture can alias them.
+        """
+        rank = self.config.global_rank
+        per_request = max(1, int(self._narrowing.max_decoder_rows_per_request))
+        buckets = sorted(self.decoder_buckets, reverse=True)
+        capture_range = tqdm.tqdm(buckets) if rank == 0 else buckets
+        for rows in capture_range:
+            if rank == 0:
+                avail_mem = get_available_gpu_memory(
+                    self.config.device, self.config.gpu_id, empty_cache=False
+                )
+                capture_range.set_description(
+                    f"Capturing prefill decoder buckets ({rows=} {avail_mem=:.2f} GB)"
+                )
+            bs = -(-rows // per_request)
+            self._ctx = self.make_dummy_batch(rows, bs)
+            self._land_input_embeds(
+                self._embed_tokens(self.input_buffers.input_ids_buf[:rows]), rows
+            )
+            statics = self._narrowing.allocate_decoder_state(rows)
+            try:
+                with active_forward(self._ctx):
+                    if self.dp_size == 1:
+                        self.attn_backend.prepare_prefill_metadata(
+                            rows, bs, self._ctx.forward_mode, capture=False
+                        )
+                    kept = self._narrowing.decoder_rows(self._ctx)
+                    if kept != rows:
+                        raise RuntimeError(
+                            f"prefill decoder capture for {rows} rows narrowed its "
+                            f"dummy batch to {kept} rows"
+                        )
+                    encoded = self._run_encoder(rows)
+
+                    def rearm() -> None:
+                        self._narrowing.narrowing_forward(encoded, self._ctx).land_into(
+                            statics
+                        )
+
+                    self._decoders[rows] = self._capture_decoder(
+                        statics, rearm, decode_wrapper
+                    )
+            finally:
+                self._ctx = None
+        if rank == 0:
+            sample = next(iter(self._decoders.values()), None)
+            logger.info(
+                "prefill breakable graph: captured decoder buckets "
+                f"{sorted(self._decoders)!s} (segments="
+                f"{(sample.capture.num_segments if sample is not None else 0):d}"
+                ", shared across token buckets)",
             )
 
     def _capture_bucket(
         self, bucket: int, decode_wrapper: ForwardStepRunner | None
-    ) -> None:
+    ) -> tuple[BreakableCapture, CapturedForward]:
         """Warm up and capture the breakable graph for ``bucket`` from the buffers."""
         for _ in range(self.num_warmup):
             self._run_inner(bucket)
@@ -355,23 +667,60 @@ class PrefillGraph:
         stream = decode_wrapper.stream if decode_wrapper is not None else None
         cap = BreakableCapture(pool=self._pool, stream=stream)
         with cap:
-            self._outputs[bucket] = CapturedForward(*self._run_inner(bucket))
+            output = CapturedForward(*self._run_inner(bucket))
         if self._pool is None:
             self._pool = cap.pool  # share the pool across all subsequent buckets
         cap.replay()  # capture records kernels without executing; smoke-test replay
-        self._captures[bucket] = cap
+        return cap, output
 
-    def _run_inner(self, num_tokens: int):
-        """Run the inner model over the leading ``num_tokens`` of the static buffers.
+    def _capture_encoder(
+        self, bucket: int, decode_wrapper: ForwardStepRunner | None
+    ) -> CapturedEncoder:
+        """Warm up and capture the encoder stage for ``bucket`` from the buffers."""
+        for _ in range(self.num_warmup):
+            self._run_encoder(bucket)
+        torch.cuda.synchronize()
+        stream = decode_wrapper.stream if decode_wrapper is not None else None
+        cap = BreakableCapture(pool=self._pool, stream=stream)
+        with cap:
+            state = self._run_encoder(bucket)
+        if self._pool is None:
+            self._pool = cap.pool
+        cap.replay()
+        return CapturedEncoder(cap, state)
 
-        ``num_tokens`` is the padded bucket size; the padded tail [real:bucket] is
-        already scrubbed to safe values (embeds=0, positions=0) by
-        :meth:`_land_input_embeds` and ``InputBuffers.fill_input_buffers``;
-        the backends' extend write spans cover only the real tokens, so
-        padded rows never write KV. The embedding is NOT part of the
-        graph: the inner model starts from the static input-embeds buffer, so a
-        replay can take precomputed (e.g. merged multimodal) embeddings.
+    def _capture_decoder(
+        self,
+        statics: NarrowedRowState,
+        rearm,
+        decode_wrapper: ForwardStepRunner | None,
+    ) -> CapturedDecoder:
+        """Warm up and capture the decoder stage over the static state ``statics``.
+
+        ``rearm`` runs the narrowing stage into ``statics`` and is called before
+        every decoder run here, as serving does before every decoder replay:
+        the decoder consumes per-forward backend state its predecessor
+        produces and later layers overwrite (V4.1's index selection chain).
         """
+        for _ in range(self.num_warmup):
+            rearm()
+            self._narrowing.decoder_forward(statics, self._ctx)
+        torch.cuda.synchronize()
+        rearm()
+        stream = decode_wrapper.stream if decode_wrapper is not None else None
+        cap = BreakableCapture(pool=self._pool, stream=stream)
+        with cap:
+            output = CapturedForward(
+                *self._narrowing.decoder_forward(statics, self._ctx)
+            )
+        if self._pool is None:
+            self._pool = cap.pool
+        rearm()
+        cap.replay()
+        return CapturedDecoder(cap, statics, output)
+
+    def _inner_inputs(self, num_tokens: int):
+        """The static-buffer inputs of a captured forward over ``num_tokens`` rows."""
         ib = self.input_buffers
         if self.config.model_is_mrope:
             positions = ib.mrope_positions_buf[:, :num_tokens]
@@ -385,6 +734,28 @@ class PrefillGraph:
         prepare_kwargs = getattr(self.text_model, "prepare_model_kwargs", None)
         if prepare_kwargs is not None:
             model_kwargs = prepare_kwargs(self._ctx, input_ids, model_kwargs)
+        return input_ids, positions, model_kwargs
+
+    def _run_encoder(self, num_tokens: int) -> NarrowedRowState:
+        """The narrowing model's encoder stage over the static buffers (see
+        :meth:`_run_inner` for the padding contract it inherits)."""
+        input_ids, positions, model_kwargs = self._inner_inputs(num_tokens)
+        return self._narrowing.encoder_forward(
+            input_ids, positions, self._ctx, **model_kwargs
+        )
+
+    def _run_inner(self, num_tokens: int):
+        """Run the inner model over the leading ``num_tokens`` of the static buffers.
+
+        ``num_tokens`` is the padded bucket size; the padded tail [real:bucket] is
+        already scrubbed to safe values (embeds=0, positions=0) by
+        :meth:`_land_input_embeds` and ``InputBuffers.fill_input_buffers``;
+        the backends' extend write spans cover only the real tokens, so
+        padded rows never write KV. The embedding is NOT part of the
+        graph: the inner model starts from the static input-embeds buffer, so a
+        replay can take precomputed (e.g. merged multimodal) embeddings.
+        """
+        input_ids, positions, model_kwargs = self._inner_inputs(num_tokens)
         return self.inner_model(
             input_ids,
             positions,
@@ -463,18 +834,17 @@ class PrefillGraph:
             out[str(spec.group_id)] = first_block[:, None].expand(bs, cols).contiguous()
         return out
 
-    def make_dummy_batch(self, num_tokens: int) -> ForwardContext:
+    def make_dummy_batch(self, num_tokens: int, bs: int) -> ForwardContext:
         """Populate the static buffers + attention metadata for a dummy extend
-        forward of ``num_tokens`` tokens, and return its ForwardContext.
+        forward of ``num_tokens`` tokens over ``bs`` positive-length requests,
+        and return its ForwardContext.
 
-        The tokens are split across ``ceil(num_tokens / context_len)`` dummy
-        requests so no single request exceeds the model context length: every
+        The tokens are balanced across the requested count, with the longer
+        requests first. No request may exceed the model context length: every
         per-request structure (page-table rows, DSA indexer tables) is sized
         for ``physical_context_len``, and a longer fabricated request indexes
-        past them. It does not bound the request-indexed buffers, which are
-        sized ``max_num_seqs // dp``: a bucket above ``context_len * max_bs``
-        overflows them and kills the boot (pre-existing; ``_autotune`` clamps
-        its token count for exactly that reason, the bucket ladder does not). A real forward carries more than ``context_len`` tokens only as
+        past them. The request count must also fit the input buffers. A real
+        forward carries more than ``context_len`` tokens only as
         a multi-request batch, never as one sequence.
 
         The prefill analogue of decode's ``_init_capture_metadata``. KV writes
@@ -489,10 +859,15 @@ class PrefillGraph:
         # the rope tables; per-request structures are sized for the (larger)
         # physical extent, so this remains in bounds.
         max_req_tokens = max(1, int(self.config.context_len))
-        bs = max(1, -(-num_tokens // max_req_tokens))
-        seq_lens = [max_req_tokens] * (bs - 1) + [
-            num_tokens - max_req_tokens * (bs - 1)
-        ]
+        if not (
+            1 <= bs <= min(num_tokens, ib.seq_lens_buf.numel())
+            and num_tokens <= bs * max_req_tokens
+        ):
+            raise ValueError(
+                "prefill capture requests do not fit token/context capacity"
+            )
+        length, remainder = divmod(num_tokens, bs)
+        seq_lens = [length + (row < remainder) for row in range(bs)]
         seq_lens_cpu = torch.tensor(seq_lens, dtype=ib.seq_lens_buf.dtype)
         seq_lens_gpu = seq_lens_cpu.to(self.config.device)
         ib.input_ids_buf[:num_tokens].fill_(1)
@@ -507,6 +882,8 @@ class PrefillGraph:
         ib.extend_seq_lens_cpu[:bs].copy_(seq_lens_cpu)
         ib.extend_prefix_lens_buf[:bs].zero_()
         ib.extend_prefix_lens_cpu[:bs].zero_()
+        ib.extend_replay_lens_cpu[:bs].zero_()
+        ib.extend_prompt_lens_cpu[:bs].copy_(seq_lens_cpu)
 
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
@@ -565,6 +942,8 @@ class PrefillGraph:
             extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:bs],
             extend_prefix_lens=ib.extend_prefix_lens_buf[:bs],
             extend_prefix_lens_cpu=ib.extend_prefix_lens_cpu[:bs],
+            extend_replay_lens_cpu=ib.extend_replay_lens_cpu[:bs],
+            extend_prompt_lens_cpu=ib.extend_prompt_lens_cpu[:bs],
             extend_with_prefix=False,
             **extra_metadata_kwargs,
         )
@@ -622,9 +1001,25 @@ class PrefillGraph:
                 ib.mrope_positions_buf[:, num_tokens:bucket].zero_()
             else:
                 ib.positions_buf[num_tokens:bucket].zero_()
-        with self._padded_to(ctx, bucket):
-            self._captures[bucket].replay(valid_rows=num_tokens)
-        hidden_states, aux_hidden_states = self._outputs[bucket].sliced(num_tokens)
+        if self._narrowing is not None:
+            hidden_states, aux_hidden_states = self._replay_narrowed(
+                bucket, ctx, num_tokens
+            )
+        else:
+            cap, output = self._captures[bucket, None]
+            if self.dp_size == 1 and self.attn_backend.step_counter is None:
+                capture_bs = self._merged_capture_bs(bucket, ctx)
+                ready = self.attn_backend.prepare_prefill_metadata(
+                    bucket,
+                    capture_bs if capture_bs is not None else ctx.bs,
+                    ctx.forward_mode,
+                    capture=False,
+                )
+                if ready and capture_bs is not None:
+                    cap, output = self._captures[bucket, capture_bs]
+            with self._padded_to(ctx, bucket):
+                cap.replay(valid_rows=num_tokens)
+            hidden_states, aux_hidden_states = output.sliced(num_tokens)
         # The eager logits tail of BaseCausalLM.forward, on the replayed hidden states.
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
         return self.text_model.logits_processor(
@@ -635,22 +1030,98 @@ class PrefillGraph:
             aux_hidden_states,
         )
 
+    def _replay_narrowed(
+        self, bucket: int, ctx: ForwardContext, num_tokens: int
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        """Encoder replay, eager narrowing, decoder replay (or eager decoder).
+
+        The whole sequence runs under the padded ambient context so the eager
+        breaks and the narrowing stage see the live forward; the narrowing and
+        decoder stages size their own collectives from their row counts. The
+        decoder graph replays with the narrowed row count as its valid rows,
+        so its breaks scrub the static state's padded tail; a row count above
+        the largest decoder bucket runs the decoder stage eager.
+        """
+        model = self._narrowing
+        encoder = self._encoders[bucket]
+        if self.dp_size == 1 and self.attn_backend.step_counter is None:
+            self.attn_backend.prepare_prefill_metadata(
+                bucket, ctx.bs, ctx.forward_mode, capture=False
+            )
+        rows = model.decoder_rows(ctx)
+        decoder_bucket = self._decoder_bucket(rows)
+        route = "decoder graph" if decoder_bucket is not None else "decoder eager"
+        if route not in self._engaged_logged:
+            self._engaged_logged.add(route)
+            logger.info(
+                f"prefill breakable graph {route!s} ENGAGED: bucket={bucket:d} "
+                f"rows={rows:d} decoder_bucket={decoder_bucket!s}"
+            )
+        with self._padded_to(ctx, bucket):
+            encoder.capture.replay(valid_rows=num_tokens)
+            narrowed = model.narrowing_forward(encoder.state, ctx)
+            if narrowed.rows != rows:
+                raise RuntimeError(
+                    f"prefill narrowing yielded {narrowed.rows} rows; the model "
+                    f"reported {rows} for this forward"
+                )
+            if decoder_bucket is None:
+                hidden, captured = model.decoder_forward(narrowed, ctx)
+            else:
+                decoder = self._decoders[decoder_bucket]
+                narrowed.land_into(decoder.statics)
+                decoder.capture.replay(valid_rows=rows)
+                hidden, captured = decoder.output.sliced(rows)
+        return model.finish_forward(hidden, list(captured), ctx)
+
+    def _decoder_bucket(self, rows: int) -> int | None:
+        """Smallest decoder bucket >= ``rows``, or ``None`` to run the decoder eager."""
+        idx = bisect.bisect_left(self.decoder_buckets, rows)
+        if idx == len(self.decoder_buckets):
+            return None
+        return self.decoder_buckets[idx]
+
+    def _merged_capture_bs(self, bucket: int, ctx: ForwardContext) -> int | None:
+        """Smallest captured request capacity, including native dummy-token room.
+
+        Padding belongs only to KDA execution metadata. The live context, MLA
+        breaks, logits and scheduler continue to see the real request count.
+        """
+        if (
+            self.dp_size != 1
+            or self.attn_backend.step_counter is not None
+            or not ctx.forward_mode.is_extend()
+        ):
+            return None
+        return min(
+            (
+                bs
+                for tokens, bs in self._captures
+                if tokens == bucket
+                and bs is not None
+                and bs >= ctx.bs
+                and ctx.input_num_tokens + bs - ctx.bs <= bucket
+            ),
+            default=None,
+        )
+
     def _replay_bucket(self, ctx: ForwardContext) -> int | None:
         """The captured bucket this forward replays, or ``None`` to run eager.
 
-        Pure-extend AND mixed extend+decode batches are eligible: the attention
-        break reads the LIVE ambient ctx and dispatches the prefill/decode
-        split itself, while the captured token-shaped compute is uniform over
-        all rows (pure decode is the decode graph's job). Two ctx fields are
+        Pure-extend AND mixed extend+decode batches are eligible for the ordinary
+        capture: attention breaks read the LIVE context and dispatch the split.
+        Replay may select an inline KDA variant for a compatible pure extend
+        after this bucket check; pure decode is the decode graph's job.
+        Two ctx fields are
         baked into the captured segments rather than rebound at replay -- the
         draft first-step row narrowing (``draft_narrowing``) and the
         ``capture_hidden_mode`` aux-hidden capture -- so a live forward carrying
         different values falls back to eager rather than silently dropping the
         reduce / mismatching aux. Prefix caching (cache hits and chunked-prefill
-        chunks 2+) IS eligible: the prefix affects only the ragged attention,
-        which runs entirely inside the eager break, and it adds zero new tokens,
-        so the padded bucket -- hence the baked EP all-to-all shape under DP --
-        is identical on prefix and non-prefix ranks.
+        chunks 2+) IS eligible: the prefix changes attention metadata, not the
+        input-token count. Ordinary breaks read live metadata; inline KDA uses
+        refreshed fixed-address metadata. Under DP only the ordinary route is
+        used, and the replicated token counts determine its EP all-to-all shape.
         """
         if self.disable or ctx.forward_mode is None:
             return None
@@ -663,9 +1134,26 @@ class PrefillGraph:
         if ctx.capture_hidden_mode != self._captured_hidden_mode:
             return None
         bucket = self._select_bucket(ctx)
-        if bucket is None or bucket not in self._captures:
+        if bucket is None or not self._has_bucket(bucket):
             return None
+        # A full token bucket may have no room for padded native scan slots.
+        # Reuse the next existing token bucket; never capture while serving.
+        for candidate in sorted(
+            {
+                tokens
+                for tokens, bs in self._captures
+                if bs is not None and tokens >= bucket
+            }
+        ):
+            if self._merged_capture_bs(candidate, ctx) is not None:
+                return candidate
         return bucket
+
+    def _has_bucket(self, bucket: int) -> bool:
+        """Whether ``bucket`` has a captured ordinary graph (or encoder graph)."""
+        if self._narrowing is not None:
+            return bucket in self._encoders
+        return (bucket, None) in self._captures
 
     def _select_bucket(self, ctx: ForwardContext) -> int | None:
         """The padded bucket for this forward, or ``None`` to run eager.
@@ -704,10 +1192,10 @@ class PrefillGraph:
     def _padded_to(self, ctx: ForwardContext, bucket: int):
         """Publish ``ctx`` as the ambient live context, pinned to the padded bucket.
 
-        The graph replays over ``bucket`` (padded) tokens; attention metadata stays
-        at the real count (set upstream), so the eager attention break only touches
-        real tokens; eager-break handoffs clear the padded rows before the
-        following graph segment consumes them. Pin
+        The graph replays over ``bucket`` tokens. Ordinary attention breaks read
+        live metadata, then clear padding in their output handoffs. Inline KDA
+        reads refreshed fixed-address capacity metadata and clears output padding
+        inside the graph. Pin
         ``input_num_tokens`` to the bucket and, under DP, ``global_num_tokens`` /
         ``global_bs`` to the captured uniform layout so any live read during the
         break matches the baked EP shapes. The break reads ``forward_mode`` / ``bs``
@@ -734,11 +1222,9 @@ class PrefillGraph:
             return
         self._engaged_logged.add(kind)
         logger.info(
-            "prefill breakable graph ENGAGED (%s): bucket=%d dp=%s mode=%s "
-            "(mixed prefill+decode batches supported)",
-            kind,
-            bucket,
             # The replay mode actually taken (mirrors _select_bucket), a DP-debug anchor.
-            self.dp_size > 1 and ctx.global_num_tokens is not None,
-            ctx.forward_mode,
+            f"prefill breakable graph ENGAGED ({kind!s}): bucket={bucket:d} dp="
+            f"{self.dp_size > 1 and ctx.global_num_tokens is not None!s} mode="
+            f"{ctx.forward_mode!s} "
+            "(mixed prefill+decode batches supported)",
         )

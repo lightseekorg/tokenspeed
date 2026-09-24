@@ -36,40 +36,40 @@ if current_platform().is_amd:
     _DSA_PREFILL_TOPK_WIDTHS = _DSA_FULL_TOPK_WIDTHS
 
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
-        gluon_dsa_decode_gfx950 as _dsa_decode_impl,
+        launch_gluon_dsa_decode_gfx950 as _dsa_decode_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
-        gluon_dsa_prefill_gfx950 as _dsa_prefill_impl,
+        launch_gluon_dsa_prefill_gfx950 as _dsa_prefill_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
-        gluon_dsa_decode_topk_fp8_gfx950 as _dsa_decode_topk_impl,
+        launch_gluon_dsa_decode_topk_fp8_gfx950 as _dsa_decode_topk_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
-        gluon_dsa_decode_topk_standard_gfx950 as _dsa_decode_topk_standard_impl,
+        launch_gluon_dsa_decode_topk_standard_gfx950 as _dsa_decode_topk_standard_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
-        gluon_dsa_prefill_topk_fp8_gfx950 as _dsa_prefill_topk_impl,
+        launch_gluon_dsa_prefill_topk_fp8_gfx950 as _dsa_prefill_topk_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
-        gluon_dsa_prefill_topk_standard_gfx950 as _dsa_prefill_topk_standard_impl,
+        launch_gluon_dsa_prefill_topk_standard_gfx950 as _dsa_prefill_topk_standard_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.attention import (
-        gluon_dsa_decode_gfx1250 as _dsa_decode_gfx1250_impl,
+        launch_gluon_dsa_decode_gfx1250 as _dsa_decode_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.attention import (
-        gluon_dsa_prefill_gfx1250 as _dsa_prefill_gfx1250_impl,
+        launch_gluon_dsa_prefill_gfx1250 as _dsa_prefill_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (
-        gluon_dsa_decode_topk_fp8_gfx1250 as _dsa_decode_topk_gfx1250_impl,
+        launch_gluon_dsa_decode_topk_fp8_gfx1250 as _dsa_decode_topk_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (
-        gluon_dsa_decode_topk_standard_gfx1250 as _dsa_decode_topk_standard_gfx1250_impl,
+        launch_gluon_dsa_decode_topk_standard_gfx1250 as _dsa_decode_topk_standard_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (
-        gluon_dsa_prefill_topk_fp8_gfx1250 as _dsa_prefill_topk_gfx1250_impl,
+        launch_gluon_dsa_prefill_topk_fp8_gfx1250 as _dsa_prefill_topk_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (
-        gluon_dsa_prefill_topk_standard_gfx1250 as _dsa_prefill_topk_standard_gfx1250_impl,
+        launch_gluon_dsa_prefill_topk_standard_gfx1250 as _dsa_prefill_topk_standard_gfx1250_impl,
     )
 
     @register_kernel(
@@ -94,11 +94,11 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED + 1,
         traits={
+            "q_len": frozenset({1, 2, 3, 4, 5, 6}),
             "index_heads": frozenset({32, 64}),
             "head_dim": frozenset({128}),
-            "topk": frozenset({512, 1024, 2048}),
             "page_size": frozenset({64}),
-            "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
+            "topk": frozenset({512, 1024, 2048}),
             "index_k_format": frozenset({"fp8_scaled"}),
             "index_k_layout": frozenset({"packed", "page_planar"}),
         },
@@ -130,8 +130,8 @@ if current_platform().is_amd:
         traits={
             "index_heads": frozenset({32, 64}),
             "head_dim": frozenset({128}),
-            "topk": frozenset({512, 1024, 2048}),
             "page_size": frozenset({64}),
+            "topk": frozenset({512, 1024, 2048}),
             "index_k_format": frozenset({"fp8_scaled"}),
             "index_k_layout": frozenset({"packed", "page_planar"}),
         },
@@ -163,10 +163,10 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "q_len": frozenset({1, 2, 3, 4, 5, 6}),
             "head_dim": frozenset({128}),
-            "topk": frozenset({512, 1024, 2048}),
             "page_size": frozenset({64}),
-            "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
+            "topk": frozenset({512, 1024, 2048}),
             "index_k_format": frozenset({"fp8_scaled"}),
             "index_k_layout": frozenset({"packed", "page_planar"}),
         },
@@ -199,8 +199,8 @@ if current_platform().is_amd:
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({128}),
-            "topk": frozenset({512, 1024, 2048}),
             "page_size": frozenset({64}),
+            "topk": frozenset({512, 1024, 2048}),
             "index_k_format": frozenset({"fp8_scaled"}),
             "index_k_layout": frozenset({"packed", "page_planar"}),
         },
@@ -227,17 +227,17 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "page_size": frozenset({64}),
-            "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
+            "q_len": frozenset({1, 2, 3, 4, 5, 6}),
             "qk_nope_head_dim": frozenset({128, 192, 256}),
             "kv_lora_rank": frozenset({128, 512}),
             "qk_rope_head_dim": frozenset({0, 64}),
+            "page_size": frozenset({64}),
             "topk": _DSA_FULL_TOPK_WIDTHS,
-            "kv_cache_available": frozenset({False, True}),
-            "sparse_kv_cache_available": frozenset({False, True}),
-            "topk_layout": frozenset({"global_slots"}),
-            "support_logit_cap": frozenset({False}),
+            "has_kv_cache": frozenset({False, True}),
+            "has_sparse_kv_cache": frozenset({False, True}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
+            "topk_layout": frozenset({"global_slots"}),
         },
     )
     def gluon_dsa_decode_gfx950(*args, enable_pdl: bool = False, **kwargs):
@@ -261,17 +261,17 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "page_size": frozenset({64}),
-            "q_len_per_req": frozenset({1}),
+            "q_len": frozenset({1}),
             "qk_nope_head_dim": frozenset({128, 192, 256}),
             "kv_lora_rank": frozenset({128, 512}),
             "qk_rope_head_dim": frozenset({0, 64}),
+            "page_size": frozenset({64}),
             "topk": _DSA_PREFILL_TOPK_WIDTHS,
-            "kv_cache_available": frozenset({False, True}),
-            "sparse_kv_cache_available": frozenset({False, True}),
-            "topk_layout": frozenset({"global_slots"}),
-            "support_logit_cap": frozenset({False}),
+            "has_kv_cache": frozenset({False, True}),
+            "has_sparse_kv_cache": frozenset({False, True}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
+            "topk_layout": frozenset({"global_slots"}),
         },
     )
     def gluon_dsa_prefill_gfx950(*args, enable_pdl: bool = False, **kwargs):
@@ -296,17 +296,17 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "page_size": frozenset({64}),
-            "q_len_per_req": frozenset({1}),
+            "q_len": frozenset({1}),
             "qk_nope_head_dim": frozenset({128, 192, 256}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({0, 64}),
+            "page_size": frozenset({64}),
             "topk": _DSA_PREFILL_TOPK_WIDTHS,
-            "kv_cache_available": frozenset({True}),
-            "sparse_kv_cache_available": frozenset({False}),
-            "topk_layout": frozenset({"global_slots"}),
-            "support_logit_cap": frozenset({False}),
+            "has_kv_cache": frozenset({True}),
+            "has_sparse_kv_cache": frozenset({False}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
+            "topk_layout": frozenset({"global_slots"}),
         },
     )
     def gluon_dsa_prefill_fp8_dense_gfx950(*args, enable_pdl: bool = False, **kwargs):
@@ -335,15 +335,14 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED + 1,
         traits={
+            "q_len": frozenset({1, 2, 3, 4, 5, 6}),
             "index_heads": frozenset({32, 64}),
             "head_dim": frozenset({128}),
-            "topk": _DSA_FULL_TOPK_WIDTHS,
             "page_size": frozenset({64}),
-            "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
+            "topk": _DSA_FULL_TOPK_WIDTHS,
             "index_k_format": frozenset({"fp8_scaled"}),
             "index_k_layout": frozenset({"packed", "page_planar"}),
         },
-        tags={"amd", "gfx1250"},
     )
     def gluon_dsa_decode_topk_standard_gfx1250(*args, **kwargs):
         return _dsa_decode_topk_standard_gfx1250_impl(*args, **kwargs)
@@ -372,12 +371,11 @@ if current_platform().is_amd:
         traits={
             "index_heads": frozenset({32, 64}),
             "head_dim": frozenset({128}),
-            "topk": _DSA_PREFILL_TOPK_WIDTHS,
             "page_size": frozenset({64}),
+            "topk": _DSA_PREFILL_TOPK_WIDTHS,
             "index_k_format": frozenset({"fp8_scaled"}),
             "index_k_layout": frozenset({"packed", "page_planar"}),
         },
-        tags={"amd", "gfx1250"},
     )
     def gluon_dsa_prefill_topk_standard_gfx1250(*args, **kwargs):
         return _dsa_prefill_topk_standard_gfx1250_impl(*args, **kwargs)
@@ -406,14 +404,13 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "q_len": frozenset({1, 2, 3, 4, 5, 6}),
             "head_dim": frozenset({128}),
-            "topk": _DSA_FULL_TOPK_WIDTHS,
             "page_size": frozenset({64}),
-            "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
+            "topk": _DSA_FULL_TOPK_WIDTHS,
             "index_k_format": frozenset({"fp8_scaled"}),
             "index_k_layout": frozenset({"packed", "page_planar"}),
         },
-        tags={"amd", "gfx1250"},
     )
     def gluon_dsa_decode_topk_fp8_gfx1250(*args, **kwargs):
         return _dsa_decode_topk_gfx1250_impl(*args, **kwargs)
@@ -443,12 +440,11 @@ if current_platform().is_amd:
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({128}),
-            "topk": _DSA_PREFILL_TOPK_WIDTHS,
             "page_size": frozenset({64}),
+            "topk": _DSA_PREFILL_TOPK_WIDTHS,
             "index_k_format": frozenset({"fp8_scaled"}),
             "index_k_layout": frozenset({"packed", "page_planar"}),
         },
-        tags={"amd", "gfx1250"},
     )
     def gluon_dsa_prefill_topk_fp8_gfx1250(*args, **kwargs):
         return _dsa_prefill_topk_gfx1250_impl(*args, **kwargs)
@@ -472,19 +468,18 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "page_size": frozenset({64}),
-            "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
+            "q_len": frozenset({1, 2, 3, 4, 5, 6}),
             "qk_nope_head_dim": frozenset({128, 192, 256}),
             "kv_lora_rank": frozenset({128, 512}),
             "qk_rope_head_dim": frozenset({0, 64}),
+            "page_size": frozenset({64}),
             "topk": _DSA_FULL_TOPK_WIDTHS,
-            "kv_cache_available": frozenset({False, True}),
-            "sparse_kv_cache_available": frozenset({False, True}),
-            "topk_layout": frozenset({"global_slots"}),
-            "support_logit_cap": frozenset({False}),
+            "has_kv_cache": frozenset({False, True}),
+            "has_sparse_kv_cache": frozenset({False, True}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
+            "topk_layout": frozenset({"global_slots"}),
         },
-        tags={"amd", "gfx1250"},
     )
     def gluon_dsa_decode_gfx1250(*args, enable_pdl: bool = False, **kwargs):
         kwargs.pop("kv_seq_lens", None)
@@ -507,19 +502,18 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "page_size": frozenset({64}),
-            "q_len_per_req": frozenset({1}),
+            "q_len": frozenset({1}),
             "qk_nope_head_dim": frozenset({128, 192, 256}),
             "kv_lora_rank": frozenset({128, 512}),
             "qk_rope_head_dim": frozenset({0, 64}),
+            "page_size": frozenset({64}),
             "topk": _DSA_PREFILL_TOPK_WIDTHS,
-            "kv_cache_available": frozenset({False, True}),
-            "sparse_kv_cache_available": frozenset({False, True}),
-            "topk_layout": frozenset({"global_slots"}),
-            "support_logit_cap": frozenset({False}),
+            "has_kv_cache": frozenset({False, True}),
+            "has_sparse_kv_cache": frozenset({False, True}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
+            "topk_layout": frozenset({"global_slots"}),
         },
-        tags={"amd", "gfx1250"},
     )
     def gluon_dsa_prefill_gfx1250(*args, enable_pdl: bool = False, **kwargs):
         kwargs.pop("kv_seq_lens", None)
@@ -543,19 +537,18 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "page_size": frozenset({64}),
-            "q_len_per_req": frozenset({1}),
+            "q_len": frozenset({1}),
             "qk_nope_head_dim": frozenset({128, 192, 256}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({0, 64}),
+            "page_size": frozenset({64}),
             "topk": _DSA_PREFILL_TOPK_WIDTHS,
-            "kv_cache_available": frozenset({True}),
-            "sparse_kv_cache_available": frozenset({False}),
-            "topk_layout": frozenset({"global_slots"}),
-            "support_logit_cap": frozenset({False}),
+            "has_kv_cache": frozenset({True}),
+            "has_sparse_kv_cache": frozenset({False}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
+            "topk_layout": frozenset({"global_slots"}),
         },
-        tags={"amd", "gfx1250"},
     )
     def gluon_dsa_prefill_fp8_dense_gfx1250(*args, enable_pdl: bool = False, **kwargs):
         kwargs.pop("kv_seq_lens", None)

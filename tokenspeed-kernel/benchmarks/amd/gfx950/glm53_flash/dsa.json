@@ -1,0 +1,530 @@
+{
+  "schema_version": 1,
+  "common_parameters": {
+    "model_profile": "glm53_flash_tp4",
+    "dtype": "bfloat16",
+    "kv_cache_dtype": "bfloat16",
+    "index_heads": 32,
+    "index_head_dim": 128,
+    "local_attention_heads": 16,
+    "kv_lora_rank": 512,
+    "qk_nope_head_dim": 256,
+    "qk_rope_head_dim": 0,
+    "pool_size": 4,
+    "index_page_stride_bytes": 23296,
+    "kv_page_size": 64,
+    "topk_tokens": 2048,
+    "max_context": 131072,
+    "max_logits_bytes": 536870912
+  },
+  "cases": [
+    {
+      "id": "glm53_flash.attention.kpool_prefill_write/small-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "kpool_prefill_write",
+        "parameters": {
+          "rows": [16, 32, 64, 128]
+        },
+        "cold_cache": true,
+        "seed": 2101
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 0.5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.kpool_prefill_write/large-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "attention",
+        "mode": "kpool_prefill_write",
+        "parameters": {
+          "rows": [256, 512, 1024, 2048]
+        },
+        "cold_cache": true,
+        "seed": 2102
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 0.5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.kpool_prefill_topk/cold-prefill-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "kpool_prefill_topk",
+        "parameters": {
+          "batch": 1,
+          "prefix_tokens": [0, 57344, 122880],
+          "query_tokens_per_sequence": 8192
+        },
+        "cold_cache": true,
+        "seed": 2201
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 20,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.kpool_prefill_topk/extend-small-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "attention",
+        "mode": "kpool_prefill_topk",
+        "parameters": {
+          "batch": [1, 2],
+          "prefix_tokens": [7936, 130816],
+          "query_tokens_per_sequence": 256
+        },
+        "cold_cache": true,
+        "seed": 2202
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.kpool_prefill_topk/extend-large-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "kpool_prefill_topk",
+        "parameters": {
+          "batch": [4, 8, 16],
+          "prefix_tokens": [7936, 130816],
+          "query_tokens_per_sequence": 256
+        },
+        "cold_cache": true,
+        "seed": 2203
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.kpool_prefill_topk/tail-align-small-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "attention",
+        "mode": "kpool_prefill_topk",
+        "parameters": {
+          "batch": [1, 2],
+          "prefix_tokens": [8128, 131008],
+          "query_tokens_per_sequence": 64
+        },
+        "cold_cache": true,
+        "seed": 2204
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.kpool_prefill_topk/tail-align-large-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "kpool_prefill_topk",
+        "parameters": {
+          "batch": [4, 8, 16],
+          "prefix_tokens": [8128, 131008],
+          "query_tokens_per_sequence": 64
+        },
+        "cold_cache": true,
+        "seed": 2205
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 3,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.dsa_prefill/cold-prefill-kv-cache",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "dsa_prefill",
+        "parameters": {
+          "kv_cache_dtype": ["bfloat16", "float8_e4m3fn"],
+          "batch": 1,
+          "prefix_tokens": [0, 57344, 122880],
+          "query_tokens_per_sequence": 8192
+        },
+        "cold_cache": true,
+        "seed": 2301
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 50,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.dsa_prefill/extend-small-kv-cache",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "attention",
+        "mode": "dsa_prefill",
+        "parameters": {
+          "kv_cache_dtype": ["bfloat16", "float8_e4m3fn"],
+          "batch": [1, 2],
+          "prefix_tokens": [7936, 130816],
+          "query_tokens_per_sequence": 256
+        },
+        "cold_cache": true,
+        "seed": 2302
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.dsa_prefill/extend-large-kv-cache",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "dsa_prefill",
+        "parameters": {
+          "kv_cache_dtype": ["bfloat16", "float8_e4m3fn"],
+          "batch": [4, 8, 16],
+          "prefix_tokens": [7936, 130816],
+          "query_tokens_per_sequence": 256
+        },
+        "cold_cache": true,
+        "seed": 2303
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 20,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.dsa_prefill/tail-align-small-kv-cache",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "attention",
+        "mode": "dsa_prefill",
+        "parameters": {
+          "kv_cache_dtype": ["bfloat16", "float8_e4m3fn"],
+          "batch": [1, 2],
+          "prefix_tokens": [8128, 131008],
+          "query_tokens_per_sequence": 64
+        },
+        "cold_cache": true,
+        "seed": 2304
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 3,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.dsa_prefill/tail-align-large-kv-cache",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "dsa_prefill",
+        "parameters": {
+          "kv_cache_dtype": ["bfloat16", "float8_e4m3fn"],
+          "batch": [4, 8, 16],
+          "prefix_tokens": [8128, 131008],
+          "query_tokens_per_sequence": 64
+        },
+        "cold_cache": true,
+        "seed": 2305
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.kpool_decode_append/ordinary-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "kpool_decode_append",
+        "parameters": {
+          "batch": [1, 2, 4, 8, 16],
+          "q_len_per_req": 1,
+          "sequence_length": 8189
+        },
+        "cold_cache": true,
+        "seed": 2401
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 0.5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.kpool_decode_append/pool-complete-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "kpool_decode_append",
+        "parameters": {
+          "batch": [1, 2, 4, 8, 16],
+          "q_len_per_req": 1,
+          "sequence_length": 8192
+        },
+        "cold_cache": true,
+        "seed": 2402
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 0.5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.kpool_decode_append/spec-verify-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "kpool_decode_append",
+        "parameters": {
+          "batch": [1, 2, 4, 8, 16],
+          "q_len_per_req": 4,
+          "sequence_length": 8192
+        },
+        "cold_cache": true,
+        "seed": 2403
+      },
+      "policy": {
+        "max_regression_relative": 0.15,
+        "max_regression_absolute_us": 1.5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.kpool_decode_topk/ordinary-small-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "attention",
+        "mode": "kpool_decode_topk",
+        "parameters": {
+          "batch": [1, 2],
+          "q_len_per_req": 1,
+          "sequence_length": [8189, 131069]
+        },
+        "cold_cache": true,
+        "seed": 2501
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 2,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.kpool_decode_topk/ordinary-large-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "kpool_decode_topk",
+        "parameters": {
+          "batch": [4, 8, 16],
+          "q_len_per_req": 1,
+          "sequence_length": [8189, 131069]
+        },
+        "cold_cache": true,
+        "seed": 2502
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.kpool_decode_topk/pool-complete-small-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "attention",
+        "mode": "kpool_decode_topk",
+        "parameters": {
+          "batch": [1, 2],
+          "q_len_per_req": 1,
+          "sequence_length": [8192, 131072]
+        },
+        "cold_cache": true,
+        "seed": 2503
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 2,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.kpool_decode_topk/pool-complete-large-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "kpool_decode_topk",
+        "parameters": {
+          "batch": [4, 8, 16],
+          "q_len_per_req": 1,
+          "sequence_length": [8192, 131072]
+        },
+        "cold_cache": true,
+        "seed": 2504
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.kpool_decode_topk/spec-verify-small-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "attention",
+        "mode": "kpool_decode_topk",
+        "parameters": {
+          "batch": [1, 2],
+          "q_len_per_req": 4,
+          "sequence_length": [8192, 131072]
+        },
+        "cold_cache": true,
+        "seed": 2505
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 2,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.kpool_decode_topk/spec-verify-large-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "kpool_decode_topk",
+        "parameters": {
+          "batch": [4, 8, 16],
+          "q_len_per_req": 4,
+          "sequence_length": [8192, 131072]
+        },
+        "cold_cache": true,
+        "seed": 2506
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 3,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.dsa_decode/ordinary-kv-cache",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "dsa_decode",
+        "parameters": {
+          "kv_cache_dtype": ["bfloat16", "float8_e4m3fn"],
+          "batch": [1, 2, 4, 8, 16],
+          "q_len_per_req": 1,
+          "sequence_length": [8189, 131069]
+        },
+        "cold_cache": true,
+        "seed": 2601
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.dsa_decode/pool-complete-kv-cache",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "dsa_decode",
+        "parameters": {
+          "kv_cache_dtype": ["bfloat16", "float8_e4m3fn"],
+          "batch": [1, 2, 4, 8, 16],
+          "q_len_per_req": 1,
+          "sequence_length": [8192, 131072]
+        },
+        "cold_cache": true,
+        "seed": 2602
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "glm53_flash.attention.dsa_decode/spec-verify-kv-cache",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "dsa_decode",
+        "parameters": {
+          "kv_cache_dtype": ["bfloat16", "float8_e4m3fn"],
+          "batch": [1, 2, 4, 8, 16],
+          "q_len_per_req": 4,
+          "sequence_length": [8192, 131072]
+        },
+        "cold_cache": true,
+        "seed": 2603
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1,
+        "max_relative_mad": 0.05
+      }
+    }
+  ]
+}

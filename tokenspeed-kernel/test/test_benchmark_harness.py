@@ -27,6 +27,7 @@ from tokenspeed_kernel.benchmark.graph import (
     GraphBenchmarkConfig,
     GraphBenchmarkError,
     GraphMeasurement,
+    GraphTimer,
     PreparedInvocation,
 )
 from tokenspeed_kernel.benchmark.harness import (
@@ -52,9 +53,19 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 class _FakeTimer:
     def __init__(self) -> None:
         self.calls = 0
+        self.cold_cache: list[bool] = []
+        self.measurement_blocks: list[int] = []
 
-    def measure(self, prepared: PreparedInvocation) -> GraphMeasurement:
+    def measure(
+        self,
+        prepared: PreparedInvocation,
+        *,
+        cold_cache: bool,
+        measurement_blocks: int,
+    ) -> GraphMeasurement:
         self.calls += 1
+        self.cold_cache.append(cold_cache)
+        self.measurement_blocks.append(measurement_blocks)
         prepared.invoke()
         return GraphMeasurement(
             samples_us=(2.0, 3.0, 4.0),
@@ -63,7 +74,6 @@ class _FakeTimer:
             min_us=2.0,
             max_us=4.0,
             relative_mad=1.0 / 3.0,
-            calls_per_graph=100,
             eager_warmup_iterations=5,
             replay_warmup_iterations=3,
             warmup_time_ms=1.0,
@@ -77,8 +87,14 @@ class _FailingTimer:
     def __init__(self, phase: str) -> None:
         self.phase = phase
 
-    def measure(self, prepared: PreparedInvocation) -> GraphMeasurement:
-        _ = prepared
+    def measure(
+        self,
+        prepared: PreparedInvocation,
+        *,
+        cold_cache: bool,
+        measurement_blocks: int,
+    ) -> GraphMeasurement:
+        _ = prepared, cold_cache, measurement_blocks
         cause = RuntimeError("timing failed")
         raise GraphBenchmarkError(self.phase, "timing failed", cause=cause)
 
@@ -104,8 +120,8 @@ def _request(family: str) -> BenchmarkRequest:
         parameters={"size": 8},
         solution="test_solution",
         registration=None,
+        cold_cache=True,
         seed=7,
-        definition_version=2,
     )
 
 
@@ -119,10 +135,7 @@ def _prepared(request: BenchmarkRequest, platform: PlatformInfo) -> PreparedBenc
     )
     return PreparedBenchmark(
         registration=spec,
-        invocation=PreparedInvocation(
-            invoke=lambda: "output",
-            repeat_safe=True,
-        ),
+        invocation=PreparedInvocation(invoke=lambda: "output"),
         parameters={"size": 8, "dtype": "test"},
     )
 
@@ -135,8 +148,8 @@ def test_request_selection_modes_and_parameter_copy():
         parameters=parameters,
         solution=None,
         registration=None,
+        cold_cache=True,
         seed=42,
-        definition_version=1,
     )
     solution = BenchmarkRequest(
         family="gemm",
@@ -144,8 +157,8 @@ def test_request_selection_modes_and_parameter_copy():
         parameters=parameters,
         solution="gluon",
         registration=None,
+        cold_cache=True,
         seed=42,
-        definition_version=1,
     )
     exact = BenchmarkRequest(
         family="gemm",
@@ -153,8 +166,8 @@ def test_request_selection_modes_and_parameter_copy():
         parameters=parameters,
         solution=None,
         registration="gluon_bmm",
+        cold_cache=False,
         seed=42,
-        definition_version=1,
     )
     parameters["size"] = 16
 
@@ -162,6 +175,8 @@ def test_request_selection_modes_and_parameter_copy():
     assert solution.selection_mode == "solution"
     assert exact.selection_mode == "registration"
     assert normal.parameters == {"size": 8}
+    assert normal.cold_cache is True
+    assert exact.cold_cache is False
 
 
 def test_request_rejects_ambiguous_selection() -> None:
@@ -172,8 +187,8 @@ def test_request_rejects_ambiguous_selection() -> None:
             {},
             solution="gluon",
             registration="exact",
+            cold_cache=True,
             seed=42,
-            definition_version=1,
         )
 
 
@@ -184,31 +199,32 @@ def test_request_requires_identity_and_selection_fields() -> None:
 
 def test_harness_returns_measurement_and_actual_registration():
     set_benchmark_generator("unit_success", "test", _prepared)
-    result = KernelBenchmarkHarness(
-        None, timer=_FakeTimer(), platform_provider=_platform
-    ).run(_request("unit_success"))
+    timer = _FakeTimer()
+    result = KernelBenchmarkHarness(timer, platform_provider=_platform).run(
+        _request("unit_success"), measurement_blocks=3
+    )
 
     assert result.status is BenchmarkStatus.SUCCESS
     assert result.registration_name == "test_registration"
     assert result.solution == "test_solution"
     assert result.selection_mode == "solution"
+    assert result.cold_cache is True
     assert result.parameters == {"size": 8, "dtype": "test"}
     assert result.samples_us == (2.0, 3.0, 4.0)
     assert result.median_us == 3.0
-    assert result.calls_per_graph == 100
     assert result.eager_warmup_iterations == 5
     assert result.replay_warmup_iterations == 3
     assert result.measurement_blocks == 3
     assert result.correctness is None
     assert result.to_dict()["status"] == "success"
     assert result.to_dict()["samples_us"] == [2.0, 3.0, 4.0]
+    assert timer.cold_cache == [True]
+    assert timer.measurement_blocks == [3]
 
 
 def test_harness_routes_fresh_runs_to_each_output_validator() -> None:
     received: dict[str, tuple[object, ...]] = {}
     prepared_runs: list[int] = []
-    candidate_calls: list[int] = []
-    reference_calls: list[int] = []
 
     def record(name):
         def validator(_spec, data):
@@ -217,26 +233,20 @@ def test_harness_routes_fresh_runs_to_each_output_validator() -> None:
 
         return validator
 
-    set_output_validator("unit_one_run", record("short"))
-    set_output_validator("unit_three_runs", record("long"))
+    set_output_validator("unit_first", record("first"))
+    set_output_validator("unit_third", record("third"))
     specs = (
-        OutputValidationSpec("unit_one_run", 1, {}),
+        OutputValidationSpec("unit_first", {}),
         None,
-        OutputValidationSpec("unit_three_runs", 3, {}),
+        OutputValidationSpec("unit_third", {"setting": 1}),
     )
 
     def prepare_run(run_index):
         prepared_runs.append(run_index)
-
-        def candidate():
-            candidate_calls.append(run_index)
-            return (f"candidate-short-{run_index}", object(), f"candidate-{run_index}")
-
-        def reference():
-            reference_calls.append(run_index)
-            return (f"reference-short-{run_index}", object(), f"reference-{run_index}")
-
-        return ValidationInvocation(candidate=candidate, reference=reference)
+        return ValidationInvocation(
+            candidate=lambda: (f"c1-{run_index}", object(), f"c3-{run_index}"),
+            reference=lambda: (f"r1-{run_index}", object(), f"r3-{run_index}"),
+        )
 
     def generator(request, platform):
         prepared = _prepared(request, platform)
@@ -244,52 +254,43 @@ def test_harness_routes_fresh_runs_to_each_output_validator() -> None:
             registration=prepared.registration,
             invocation=prepared.invocation,
             parameters=prepared.parameters,
-            validation=PreparedValidation(lambda: specs, prepare_run),
+            validation=PreparedValidation(specs, 2, prepare_run),
         )
 
     timer = _FakeTimer()
     set_benchmark_generator("unit_output_routing", "test", generator)
-    result = KernelBenchmarkHarness(None, timer=timer, platform_provider=_platform).run(
-        _request("unit_output_routing")
+    result = KernelBenchmarkHarness(timer, platform_provider=_platform).run(
+        _request("unit_output_routing"), measurement_blocks=3
     )
 
     assert result.status is BenchmarkStatus.SUCCESS
-    assert prepared_runs == [0, 1, 2]
-    assert candidate_calls == [0, 1, 2]
-    assert reference_calls == [0, 1, 2]
-    assert received["short"] == (("candidate-short-0", "reference-short-0"),)
-    assert received["long"] == (
-        ("candidate-0", "reference-0"),
-        ("candidate-1", "reference-1"),
-        ("candidate-2", "reference-2"),
-    )
+    assert prepared_runs == [0, 1]
+    assert received["first"] == (("c1-0", "r1-0"), ("c1-1", "r1-1"))
+    assert received["third"] == (("c3-0", "r3-0"), ("c3-1", "r3-1"))
     assert result.correctness == {
         "passed": True,
-        "runs": 3,
+        "runs": 2,
         "outputs": [
             {
                 "index": 0,
-                "validator": "unit_one_run",
-                "runs": 1,
+                "validator": "unit_first",
                 "kwargs": {},
                 "passed": True,
-                "diagnostic": "short checked",
+                "diagnostic": "first checked",
             },
             {
                 "index": 1,
                 "validator": None,
-                "runs": 0,
                 "kwargs": {},
                 "passed": None,
                 "diagnostic": None,
             },
             {
                 "index": 2,
-                "validator": "unit_three_runs",
-                "runs": 3,
-                "kwargs": {},
+                "validator": "unit_third",
+                "kwargs": {"setting": 1},
                 "passed": True,
-                "diagnostic": "long checked",
+                "diagnostic": "third checked",
             },
         ],
     }
@@ -306,7 +307,8 @@ def test_correctness_failure_skips_timing() -> None:
     def generator(request, platform):
         prepared = _prepared(request, platform)
         validation = PreparedValidation(
-            lambda: (OutputValidationSpec("unit_failure", 1, {}),),
+            (OutputValidationSpec("unit_failure", {}),),
+            1,
             lambda _index: ValidationInvocation(
                 candidate=lambda: (2,),
                 reference=lambda: (1,),
@@ -321,8 +323,8 @@ def test_correctness_failure_skips_timing() -> None:
 
     timer = _FakeTimer()
     set_benchmark_generator("unit_correctness_failure", "test", generator)
-    result = KernelBenchmarkHarness(None, timer=timer, platform_provider=_platform).run(
-        _request("unit_correctness_failure")
+    result = KernelBenchmarkHarness(timer, platform_provider=_platform).run(
+        _request("unit_correctness_failure"), measurement_blocks=3
     )
 
     assert result.status is BenchmarkStatus.CORRECTNESS_FAILURE
@@ -352,7 +354,8 @@ def test_correctness_exception_skips_timing() -> None:
             prepared.invocation,
             prepared.parameters,
             PreparedValidation(
-                lambda: (OutputValidationSpec("unit_exception", 1, {}),),
+                (OutputValidationSpec("unit_exception", {}),),
+                1,
                 lambda _index: ValidationInvocation(
                     candidate=lambda: (1,),
                     reference=fail_reference,
@@ -362,8 +365,8 @@ def test_correctness_exception_skips_timing() -> None:
 
     timer = _FakeTimer()
     set_benchmark_generator("unit_correctness_exception", "test", generator)
-    result = KernelBenchmarkHarness(None, timer=timer, platform_provider=_platform).run(
-        _request("unit_correctness_exception")
+    result = KernelBenchmarkHarness(timer, platform_provider=_platform).run(
+        _request("unit_correctness_exception"), measurement_blocks=3
     )
 
     assert result.status is BenchmarkStatus.CORRECTNESS_FAILURE
@@ -388,8 +391,8 @@ def test_correctness_exception_skips_timing() -> None:
 def test_harness_classifies_graph_failures(phase, status):
     set_benchmark_generator("unit_graph_failure", "test", _prepared)
     result = KernelBenchmarkHarness(
-        None, timer=_FailingTimer(phase), platform_provider=_platform
-    ).run(_request("unit_graph_failure"))
+        _FailingTimer(phase), platform_provider=_platform
+    ).run(_request("unit_graph_failure"), measurement_blocks=3)
 
     assert result.status is status
     assert result.error_phase == phase
@@ -401,26 +404,65 @@ def test_harness_preserves_expected_preparation_outcome():
     def unavailable(request, platform):
         _ = request, platform
         raise BenchmarkCaseError(
-            BenchmarkStatus.BACKEND_UNAVAILABLE, "backend is not installed"
+            BenchmarkStatus.NOT_APPLICABLE, "backend is not installed"
         )
 
     set_benchmark_generator("unit_unavailable", "test", unavailable)
-    result = KernelBenchmarkHarness(
-        None, timer=_FakeTimer(), platform_provider=_platform
-    ).run(_request("unit_unavailable"))
+    result = KernelBenchmarkHarness(_FakeTimer(), platform_provider=_platform).run(
+        _request("unit_unavailable"), measurement_blocks=3
+    )
 
-    assert result.status is BenchmarkStatus.BACKEND_UNAVAILABLE
+    assert result.status is BenchmarkStatus.NOT_APPLICABLE
     assert result.error_phase == "preparation"
     assert result.error_message == "backend is not installed"
 
 
 def test_harness_reports_missing_generator_as_invalid_case():
-    result = KernelBenchmarkHarness(
-        None, timer=_FakeTimer(), platform_provider=_platform
-    ).run(_request("unit_missing_generator"))
+    result = KernelBenchmarkHarness(_FakeTimer(), platform_provider=_platform).run(
+        _request("unit_missing_generator"), measurement_blocks=3
+    )
 
     assert result.status is BenchmarkStatus.INVALID_CASE
     assert "No benchmark generator" in (result.error_message or "")
+
+
+def _mxfp8_parameters(**updates):
+    parameters = {
+        "M": 256,
+        "N": 256,
+        "K": 512,
+        "quant": "mxfp8",
+        "block_size": [1, 32],
+        "out_dtype": "bfloat16",
+    }
+    parameters.update(updates)
+    return parameters
+
+
+@pytest.mark.parametrize(
+    ("parameters", "match"),
+    [
+        (_mxfp8_parameters(extra=1), "Unknown"),
+        (_mxfp8_parameters(quant="fp8"), "quant"),
+        (_mxfp8_parameters(block_size=[128, 128]), "block_size"),
+        (_mxfp8_parameters(out_dtype="float16"), "dtype"),
+    ],
+)
+def test_mxfp8_mm_rejects_invalid_generator_parameters(parameters, match):
+    request = BenchmarkRequest(
+        family="gemm",
+        mode="mm",
+        parameters=parameters,
+        solution=None,
+        registration=None,
+        cold_cache=True,
+        seed=42,
+    )
+
+    with pytest.raises(BenchmarkCaseError, match=match) as raised:
+        gemm_generator.prepare_mxfp8_mm(request, _platform())
+
+    assert raised.value.status is BenchmarkStatus.INVALID_CASE
 
 
 @pytest.mark.parametrize(
@@ -444,8 +486,8 @@ def test_dense_bmm_rejects_invalid_generator_parameters(parameters, match):
         parameters=parameters,
         solution=None,
         registration=None,
+        cold_cache=True,
         seed=42,
-        definition_version=1,
     )
 
     with pytest.raises(BenchmarkCaseError, match=match) as raised:
@@ -471,10 +513,9 @@ def test_dense_bmm_validation_configuration_is_opt_in() -> None:
 @pytest.mark.parametrize(
     ("validation", "match"),
     [
-        ({"runs": 0}, "between 1 and 100"),
-        ({"runs": 101}, "between 1 and 100"),
-        ({"atol": True}, "must be a number"),
+        ({"runs": 0}, "positive integer"),
         ({"rtol": float("inf")}, "finite and nonnegative"),
+        ({"atol": -1.0}, "finite and nonnegative"),
         ({"unexpected": 1}, "Unknown"),
     ],
 )
@@ -560,7 +601,7 @@ def test_dense_bmm_uses_registered_reference_for_local_correctness(
     monkeypatch.setattr(gemm_generator, "get_input_generator", get_generator)
     monkeypatch.setattr(gemm_generator, "load_builtin_kernels", lambda: None)
     timer = _FakeTimer()
-    result = KernelBenchmarkHarness(None, timer=timer, platform_provider=_platform).run(
+    result = KernelBenchmarkHarness(timer, platform_provider=_platform).run(
         BenchmarkRequest(
             family="gemm",
             mode="bmm",
@@ -574,9 +615,10 @@ def test_dense_bmm_uses_registered_reference_for_local_correctness(
             },
             solution=None,
             registration=candidate_spec.name,
+            cold_cache=True,
             seed=7,
-            definition_version=1,
-        )
+        ),
+        measurement_blocks=3,
     )
 
     assert seeds == [7, 8, 9]
@@ -651,7 +693,7 @@ def test_dense_bmm_validation_requires_a_compatible_registered_reference(
     monkeypatch.setattr(gemm_generator, "load_builtin_kernels", lambda: None)
     timer = _FakeTimer()
 
-    result = KernelBenchmarkHarness(None, timer=timer, platform_provider=_platform).run(
+    result = KernelBenchmarkHarness(timer, platform_provider=_platform).run(
         BenchmarkRequest(
             family="gemm",
             mode="bmm",
@@ -665,9 +707,10 @@ def test_dense_bmm_validation_requires_a_compatible_registered_reference(
             },
             solution=None,
             registration=candidate_spec.name,
+            cold_cache=True,
             seed=42,
-            definition_version=1,
-        )
+        ),
+        measurement_blocks=3,
     )
 
     assert result.status is BenchmarkStatus.REGISTRATION_MISSING
@@ -701,18 +744,17 @@ def test_exact_dense_bmm_rejects_incompatible_shape(
     KernelRegistry.get().register(spec, lambda **_kwargs: None)
     monkeypatch.setattr(gemm_generator, "load_builtin_kernels", lambda: None)
 
-    result = KernelBenchmarkHarness(
-        None, timer=_FakeTimer(), platform_provider=_platform
-    ).run(
+    result = KernelBenchmarkHarness(_FakeTimer(), platform_provider=_platform).run(
         BenchmarkRequest(
             family="gemm",
             mode="bmm",
             parameters={"batch": 12, "M": 2, "N": 512, "K": 128},
             solution=None,
             registration="unit_exact_bmm",
+            cold_cache=True,
             seed=42,
-            definition_version=1,
-        )
+        ),
+        measurement_blocks=3,
     )
 
     assert result.status is BenchmarkStatus.INVALID_CASE
@@ -720,9 +762,11 @@ def test_exact_dense_bmm_rejects_incompatible_shape(
     assert "does not support parameters" in (result.error_message or "")
 
 
-def test_dense_bmm_solution_shape_miss_is_invalid_not_backend_unavailable(
+@pytest.mark.parametrize("solution", ["unit", "missing"])
+def test_dense_bmm_selection_miss_is_not_applicable(
     fresh_registry,
     monkeypatch,
+    solution,
 ):
     _ = fresh_registry
     signature = format_signature(
@@ -740,46 +784,21 @@ def test_dense_bmm_solution_shape_miss_is_invalid_not_backend_unavailable(
     KernelRegistry.get().register(spec, lambda **_kwargs: None)
     monkeypatch.setattr(gemm_generator, "load_builtin_kernels", lambda: None)
 
-    result = KernelBenchmarkHarness(
-        None, timer=_FakeTimer(), platform_provider=_platform
-    ).run(
+    result = KernelBenchmarkHarness(_FakeTimer(), platform_provider=_platform).run(
         BenchmarkRequest(
             family="gemm",
             mode="bmm",
             parameters={"batch": 12, "M": 2, "N": 512, "K": 128},
-            solution="unit",
+            solution=solution,
             registration=None,
+            cold_cache=True,
             seed=42,
-            definition_version=1,
-        )
+        ),
+        measurement_blocks=3,
     )
 
-    assert result.status is BenchmarkStatus.INVALID_CASE
+    assert result.status is BenchmarkStatus.NOT_APPLICABLE
     assert "No kernel found" in (result.error_message or "")
-
-
-def test_dense_bmm_missing_solution_reports_backend_unavailable(
-    fresh_registry,
-    monkeypatch,
-):
-    _ = fresh_registry
-    monkeypatch.setattr(gemm_generator, "load_builtin_kernels", lambda: None)
-
-    result = KernelBenchmarkHarness(
-        None, timer=_FakeTimer(), platform_provider=_platform
-    ).run(
-        BenchmarkRequest(
-            family="gemm",
-            mode="bmm",
-            parameters={"batch": 12, "M": 1, "N": 512, "K": 128},
-            solution="missing",
-            registration=None,
-            seed=42,
-            definition_version=1,
-        )
-    )
-
-    assert result.status is BenchmarkStatus.BACKEND_UNAVAILABLE
 
 
 @pytest.mark.parametrize(
@@ -800,13 +819,12 @@ def test_dense_bmm_gluon_registration_graph_replay(selection, selection_mode):
         pytest.skip("Gluon dense BMM benchmark requires an AMD CDNA4 GPU")
 
     harness = KernelBenchmarkHarness(
-        GraphBenchmarkConfig(
-            calls_per_graph=100,
-            eager_warmup_iterations=2,
-            replay_warmup_iterations=1,
-            measurement_blocks=7,
+        GraphTimer(
+            GraphBenchmarkConfig(
+                eager_warmup_iterations=2,
+                replay_warmup_iterations=1,
+            )
         ),
-        timer=None,
         platform_provider=current_platform,
     )
     result = harness.run(
@@ -821,17 +839,17 @@ def test_dense_bmm_gluon_registration_graph_replay(selection, selection_mode):
                 "dtype": "bfloat16",
                 "validation": {"runs": 3},
             },
+            cold_cache=True,
             seed=42,
-            definition_version=1,
             **selection,
-        )
+        ),
+        measurement_blocks=7,
     )
 
     assert result.status is BenchmarkStatus.SUCCESS, result.to_dict()
     assert result.registration_name == "gluon_bmm_a16w16_gfx950"
     assert result.solution == "gluon"
     assert result.selection_mode == selection_mode
-    assert result.calls_per_graph == 100
     assert result.measurement_blocks == 7
     assert result.median_us is not None and result.median_us > 0.0
     assert all(sample > 0.0 for sample in result.samples_us)

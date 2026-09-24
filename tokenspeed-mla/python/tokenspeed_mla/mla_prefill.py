@@ -22,7 +22,7 @@
 CuTe DSL MLA Prefill Kernel Wrapper
 ====================================
 
-Wraps BlackwellFusedMultiHeadAttentionForward for ragged MLA prefill on Blackwell SM100.
+Wraps BlackwellFusedMultiHeadAttentionForward for ragged MLA prefill on SM100/SM103/SM107.
 No padding required — kernel handles ragged varlen directly.
 """
 
@@ -34,7 +34,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32
-from cutlass.base_dsl.arch import Arch
+from cutlass.base_dsl.enums import Arch
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import BaseDSL
 from tokenspeed_mla import fmha_helpers as fmha_utils
@@ -73,6 +73,10 @@ def _enable_ex2_emulation() -> bool:
 
     if Arch.sm_103 <= arch <= Arch.sm_103f:
         # On sm103, it must be False.
+        return False
+
+    if Arch.sm_107 <= arch <= Arch.sm_107f:
+        # SM107 uses native exp2, as SM103 does.
         return False
 
     raise NotImplementedError(f"MLA prefill not implemented for arch={arch}.")
@@ -275,7 +279,7 @@ def tokenspeed_mla_prefill(
     enable_pdl: bool = False,
     out: Optional[torch.Tensor] = None,
 ) -> "torch.Tensor | Tuple[torch.Tensor, torch.Tensor]":
-    """CuTe DSL FMHA prefill kernel for MLA on Blackwell SM100.
+    """CuTe DSL FMHA prefill kernel for MLA on SM100, SM103 and SM107.
 
     Q/K/V are plain ragged tensors — no padding required:
       Q shape: [sum(q_lens), h_q, d_qk]

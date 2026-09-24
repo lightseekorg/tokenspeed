@@ -83,6 +83,8 @@ def test_kda_prefill_relayouts_only_for_declaring_kernels(
         initial_state=initial_state,
         cu_seqlens=torch.tensor([0, 1]),
         cu_seqlens_cpu=torch.tensor([0, 1], dtype=torch.int64),
+        capacity=None,
+        inputs_packed=False,
         recurrent_layout="v_major",
     )
 
@@ -965,6 +967,8 @@ def test_kda_paged_prefill_preserves_native_state_layout() -> None:
         initial_state=state,
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens.to("cpu", torch.int64),
+        capacity=None,
+        inputs_packed=False,
     )
 
     torch.testing.assert_close(
