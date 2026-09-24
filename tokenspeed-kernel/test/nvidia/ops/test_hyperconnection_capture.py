@@ -38,8 +38,8 @@ pytestmark = pytest.mark.skipif(
 def fused_inputs(monkeypatch):
     if not cute_fused.supports_fused_hc(torch.device("cuda")):
         pytest.skip("requires six resident Blackwell clusters and CuTe")
-    monkeypatch.setattr(cute_fused, "_WORKSPACES", {})
-    monkeypatch.setattr(cute_fused, "_COMPILED", {})
+    for name in ("_PLANS", "_CAPACITIES", "_WORKSPACES"):
+        monkeypatch.setattr(cute_fused, name, {})
     generator = torch.Generator(device="cuda").manual_seed(719)
     return tuple(
         torch.randn(shape, device="cuda", dtype=torch.bfloat16, generator=generator)
@@ -73,10 +73,12 @@ def test_fused_mix_rejects_cold_capture(fused_inputs, missing_cache):
     with torch.cuda.stream(stream):
         _mix(fused_inputs)
     stream.synchronize()
-    cache = (
-        cute_fused._WORKSPACES if missing_cache == "workspace" else cute_fused._COMPILED
-    )
-    cache.clear()
+    if missing_cache == "workspace":
+        caches = (cute_fused._WORKSPACES,)
+    else:
+        caches = (cute_fused._PLANS, cute_fused._CAPACITIES)
+    for cache in caches:
+        cache.clear()
     graph = torch.cuda.CUDAGraph()
     with mock.patch.object(
         cute_fused.cute_ext,
@@ -87,23 +89,28 @@ def test_fused_mix_rejects_cold_capture(fused_inputs, missing_cache):
             with pytest.raises(RuntimeError, match=f"{missing_cache}.*warm up"):
                 _mix(fused_inputs)
     compile_kernel.assert_not_called()
-    assert not cache
+    assert all(not cache for cache in caches)
 
 
 @pytest.mark.filterwarnings("ignore:The CUDA Graph is empty:UserWarning")
-def test_fused_workspace_warmup_must_use_capture_stream(fused_inputs):
+def test_fused_occupancy_warmup_must_use_capture_stream(fused_inputs):
     warmup_stream = torch.cuda.Stream()
     warmup_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(warmup_stream):
         _mix(fused_inputs)
     warmup_stream.synchronize()
-    workspace_keys = set(cute_fused._WORKSPACES)
+    workspaces = dict(cute_fused._WORKSPACES)
+    capacities = dict(cute_fused._CAPACITIES)
     capture_stream = torch.cuda.Stream()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=capture_stream):
-        with pytest.raises(RuntimeError, match="warm up on the capture stream"):
+        with pytest.raises(RuntimeError, match="occupancy.*capture stream"):
             _mix(fused_inputs)
-    assert set(cute_fused._WORKSPACES) == workspace_keys
+    assert cute_fused._CAPACITIES == capacities
+    assert cute_fused._WORKSPACES.keys() == workspaces.keys()
+    assert all(
+        cute_fused._WORKSPACES[key] is value for key, value in workspaces.items()
+    )
 
 
 def test_warmed_fused_mix_reuses_workspace_in_capture_and_eager(fused_inputs):

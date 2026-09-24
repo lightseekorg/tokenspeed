@@ -25,8 +25,13 @@ import inspect
 import itertools
 import math
 import multiprocessing
+import os
+import subprocess
+import sys
+import textwrap
 import traceback
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 import torch
@@ -316,17 +321,80 @@ def test_packed_q_is_opt_in():
     )
 
 
-def _check_fp8_gpu(case, variable_kv):
+@pytest.mark.parametrize("capability", [(0, 0), (9, 0), (10, 1), (11, 0), (12, 0)])
+@pytest.mark.parametrize("is_fp8", [False, True])
+def test_decode_rejects_unsupported_architectures(capability, is_fp8):
+    from tokenspeed_mla.mla_helpers import select_mla_decode_tilers
+
+    with pytest.raises(ValueError, match="requires SM100, SM103 or SM107"):
+        select_mla_decode_tilers(16, 4, is_fp8=is_fp8, compute_capability=capability)
+
+
+class TestCompile:
+    @pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
+    @pytest.mark.parametrize(
+        "dtype,heads",
+        [("float8_e4m3fn", 16), ("float8_e4m3fn", 96), ("bfloat16", 16)],
+    )
+    def test_decode_architectures_and_causal_masks(self, capability, dtype, heads):
+        # No device or host occupancy query is needed to compile another target.
+        script = textwrap.dedent(f"""
+            import torch
+            import tokenspeed_mla.mla_decode as decode
+
+            decode.get_max_active_clusters = lambda cluster_size: 1
+            for causal_mask in (False, True):
+                compiled = decode._get_compiled_mla_kernel(
+                    torch_dtype=torch.{dtype},
+                    page_size=64,
+                    kv_lora_rank=512,
+                    qk_rope_head_dim=64,
+                    is_persistent=False,
+                    is_var_seq=True,
+                    is_var_split_kv=False,
+                    compute_capability={capability!r},
+                    fold_sq_factor={4 if heads == 16 else 1},
+                    causal_mask=causal_mask,
+                    num_heads={heads},
+                    seq_len_q=4,
+                    return_lse=True,
+                )
+                assert compiled is not None
+            """)
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = ""
+        env["CUTE_DSL_ARCH"] = f"sm_{capability[0]}{capability[1]}a"
+        env["CUTE_DSL_DISABLE_FILE_CACHING"] = "1"
+        env["CUTE_DSL_NO_CACHE"] = "1"
+        source = Path(__file__).resolve().parents[1] / "python"
+        env["PYTHONPATH"] = os.pathsep.join(
+            path for path in (str(source), env.get("PYTHONPATH", "")) if path
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        assert result.returncode == 0, (
+            f"Decode compilation failed for {capability} / {dtype}:\n"
+            f"{result.stdout}\n{result.stderr}"
+        )
+
+
+def _check_decode_gpu(case, variable_kv, dtype):
     from tokenspeed_mla import tokenspeed_mla_decode
 
-    q, kv, tables, lengths = _make_inputs(case, "fp8", variable_kv, "cuda")
+    q, kv, tables, lengths = _make_inputs(case, dtype, variable_kv, "cuda")
     workspace = torch.zeros(256 * 1024**2, dtype=torch.int8, device="cuda")
     out = torch.empty(
         case.batch,
         case.q_len,
         case.heads,
         512,
-        dtype=torch.bfloat16,
+        dtype=torch.bfloat16 if dtype == "fp8" else q.dtype,
         device="cuda",
     )
     indices = (
@@ -359,7 +427,7 @@ def _check_fp8_gpu(case, variable_kv):
     )
     tokenspeed_mla_decode(**kwargs)
     torch.cuda.synchronize()
-    _check_output(out[indices], expected, "fp8")
+    _check_output(out[indices], expected, dtype)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
@@ -369,7 +437,7 @@ def _check_fp8_gpu(case, variable_kv):
     for _ in range(3):
         graph.replay()
     torch.cuda.synchronize()
-    _check_output(out[indices], expected, "fp8")
+    _check_output(out[indices], expected, dtype)
 
 
 def _check_packed_gpu():
@@ -399,7 +467,14 @@ def _check_packed_gpu():
         (_Case(32, 128, 96, 3), "fp16", False, False, False, True),
         (_Case(1, 129, 48, 4), "fp16", False, False, False, True),
         # Existing M64 and token-gapped M128 paths stay selected.
-        (_Case(1, 129, 12, 4), "fp8", False, False, False, False),
+        (
+            _Case(1, 129, 12, 4),
+            "fp8",
+            False,
+            False,
+            False,
+            torch.cuda.get_device_capability() != (10, 0),
+        ),
         (_Case(1, 129, 96, 4), "fp8", False, False, True, False),
         (_Case(1, 129, 96, 4), "fp16", False, False, True, False),
     ]
@@ -702,8 +777,9 @@ def _run_gpu_check(check, arguments, timeout):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (10, 0),
         (10, 3),
+        (10, 7),
     ):
-        pytest.skip("Requires Blackwell SM100/SM103")
+        pytest.skip("Requires SM100, SM103 or SM107")
     context = multiprocessing.get_context("spawn")
     receive, send = context.Pipe(duplex=False)
     process = context.Process(target=_gpu_worker, args=(check, arguments, send))
@@ -742,7 +818,21 @@ class TestGPU:
         ids=lambda value: value.name if isinstance(value, _Case) else None,
     )
     def test_fp8_decode_accuracy_and_cuda_graph(self, case, variable_kv):
-        _run_gpu_check(_check_fp8_gpu, (case, variable_kv), 180)
+        _run_gpu_check(_check_decode_gpu, (case, variable_kv, "fp8"), 180)
+
+    @pytest.mark.parametrize(
+        "case,variable_kv",
+        [
+            (_Case(1, 1024, 128, 1), False),
+            (_Case(1, 1024, 16, 4), False),
+            (_Case(4, 385, 96, 8), True),
+            (_Case(1, 16384, 96, 1), False),
+            (_Case(128, 128, 16, 4), False),
+        ],
+        ids=lambda value: value.name if isinstance(value, _Case) else None,
+    )
+    def test_bf16_decode_accuracy_and_cuda_graph(self, case, variable_kv):
+        _run_gpu_check(_check_decode_gpu, (case, variable_kv, "bf16"), 180)
 
     def test_packed_q_outputs_lse_tails_and_legacy_paths(self):
         _run_gpu_check(_check_packed_gpu, (), 600)
