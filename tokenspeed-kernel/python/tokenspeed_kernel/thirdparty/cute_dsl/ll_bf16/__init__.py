@@ -27,7 +27,6 @@ import threading
 from typing import Any
 
 import torch
-from tokenspeed_kernel.platform import pdl_enabled
 
 MAX_M_DOTPROD = 4
 MAX_M = 32
@@ -239,6 +238,7 @@ class LLBf16Router:
         b: torch.Tensor,
         out: torch.Tensor | None = None,
         *,
+        enable_pdl: bool,
         bias: torch.Tensor | None = None,
         out_dtype: torch.dtype | None = None,
         block_size: int | None = None,
@@ -253,6 +253,7 @@ class LLBf16Router:
             b: ``[N, K]`` contiguous BF16 weight.
             out: Optional ``[M, N]`` destination in ``out_dtype``; allocated
                 when omitted.
+            enable_pdl: PDL policy used for compilation and launch.
             bias: Optional contiguous ``[N]`` bias in ``out_dtype``, added in
                 the epilogue.
             out_dtype: Output element type, one of :data:`OUT_DTYPES`. Defaults
@@ -290,7 +291,7 @@ class LLBf16Router:
 
         device = a.device
         stream = self._stream(device)
-        enable_pdl = pdl_enabled() and torch.cuda.get_device_capability(device)[0] >= 9
+        enable_pdl = enable_pdl and torch.cuda.get_device_capability(device)[0] >= 9
         # Every split-K cluster rank must own at least one K tile. Router
         # projections are normally wide enough, but low-rank consumers (for
         # example a padded rank-320 hyperconnection up projection) are not.

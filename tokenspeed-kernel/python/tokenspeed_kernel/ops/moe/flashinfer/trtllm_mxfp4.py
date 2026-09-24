@@ -466,6 +466,33 @@ if platform.is_nvidia:
         )
         return output if do_finalize else result
 
+    # FP16 shared-expert output cannot use the BF16-only common finalizer.
+    @register_kernel(
+        "moe",
+        "apply",
+        name="flashinfer_trtllm_mxfp4_fp16_moe_apply",
+        solution="flashinfer_trtllm",
+        weight_preprocessor=flashinfer_trtllm_mxfp4_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+        ),
+        signatures=format_signatures("x", "dense", {torch.float16}),
+        traits={
+            "weight_dtype": frozenset({"mxfp4"}),
+            "activation": frozenset({"silu", "swiglu"}),
+            "routing_mode": frozenset({"kernel_routing", "precomputed_topk"}),
+            "topk_weights_dtype": frozenset({torch.bfloat16}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ispp_alignment": frozenset({1}),
+            "internal_activation_dtype": frozenset({"input"}),
+            "supports_bias": frozenset({True}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
     @register_kernel(
         "moe",
         "apply",
@@ -477,11 +504,7 @@ if platform.is_nvidia:
             min_arch_version=ArchVersion(10, 0),
             max_arch_version=ArchVersion(10, 3),
         ),
-        signatures=format_signatures(
-            "x",
-            "dense",
-            {torch.float16, torch.bfloat16},
-        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
         traits={
             "weight_dtype": frozenset({"mxfp4"}),
             "activation": frozenset({"silu", "swiglu"}),

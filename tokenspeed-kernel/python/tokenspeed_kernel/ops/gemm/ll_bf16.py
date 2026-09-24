@@ -27,7 +27,7 @@ from tokenspeed_kernel.ops.gemm.flashinfer import (
     flashinfer_cute_dsl_mm_bf16,
     has_flashinfer_cute_dsl_bf16,
 )
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import MAX_M, ll_bf16_router
@@ -69,7 +69,7 @@ def cute_dsl_ll_bf16_router(
     Returns:
         ``[M, N]`` FP32 router logits, ``out`` when it was given.
     """
-    return ll_bf16_router(hidden_states, weight, out)
+    return ll_bf16_router(hidden_states, weight, out, enable_pdl=pdl_enabled())
 
 
 def ll_bf16_router_supported(
@@ -112,13 +112,12 @@ def cute_dsl_dsv4_linear_fp32(
     Args:
         hidden_states: Contiguous BF16 [M, K] activations, up to MAX_M rows.
         weight: Contiguous BF16 [N, K] projection weights.
-        enable_pdl: Shared PDL policy supplied by the projection dispatcher;
-            the vendored driver uses the same platform policy and cache key.
+        enable_pdl: PDL policy used for compilation and launch.
 
     Returns:
         FP32 router logits, accumulated and reduced in FP32.
     """
-    return ll_bf16_router(hidden_states, weight, None)
+    return ll_bf16_router(hidden_states, weight, None, enable_pdl=enable_pdl)
 
 
 # The kernels issue 32-byte vector loads from the base of each operand.
@@ -204,6 +203,7 @@ def ll_bf16_mm(
             x.view(m, k),
             weight,
             flat_out,
+            enable_pdl=pdl_enabled(),
             bias=bias,
             out_dtype=torch.bfloat16,
         )

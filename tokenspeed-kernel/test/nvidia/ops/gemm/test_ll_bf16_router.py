@@ -115,7 +115,7 @@ def test_router_guard_declines_misaligned_storage(operand: str) -> None:
         b = misaligned
     assert not ll_bf16_router_supported(a, b, 1)
     with pytest.raises(ValueError, match="ll_bf16 cannot serve"):
-        ll_bf16_router(a, b, None)
+        ll_bf16_router(a, b, None, enable_pdl=pdl_enabled())
 
 
 def test_router_guard_declines_empty_or_invalid_shapes() -> None:
@@ -133,11 +133,15 @@ def test_compiled_cache_separates_pdl_policy() -> None:
     previous = pdl_enabled()
     try:
         pdl_enabled(False)
-        without_pdl = ll_bf16_router(a, b, out_dtype=torch.bfloat16)
+        without_pdl = ll_bf16_router(
+            a, b, enable_pdl=pdl_enabled(), out_dtype=torch.bfloat16
+        )
         assert any(key[-1] is False for key in ll_bf16_router._dotprod)
 
         assert pdl_enabled(True)
-        with_pdl = ll_bf16_router(a, b, out_dtype=torch.bfloat16)
+        with_pdl = ll_bf16_router(
+            a, b, enable_pdl=pdl_enabled(), out_dtype=torch.bfloat16
+        )
         assert any(key[-1] is True for key in ll_bf16_router._dotprod)
         torch.testing.assert_close(with_pdl, without_pdl)
     finally:
@@ -152,13 +156,16 @@ _MM_MS = [1, 4, 8, 32]
 def test_bf16_epilogue_rounds_once(m: int) -> None:
     """The epilogue converts from its FP32 accumulator, so no double rounding."""
     a, b = _inputs(m, seed=5)
-    fp32 = ll_bf16_router(a, b)
+    fp32 = ll_bf16_router(a, b, enable_pdl=pdl_enabled())
     assert torch.equal(
-        ll_bf16_router(a, b, out_dtype=torch.bfloat16), fp32.to(torch.bfloat16)
+        ll_bf16_router(a, b, enable_pdl=pdl_enabled(), out_dtype=torch.bfloat16),
+        fp32.to(torch.bfloat16),
     )
     bias = torch.randn(KIMI3_ROUTER_SIZE, device="cuda", dtype=torch.bfloat16)
     assert torch.equal(
-        ll_bf16_router(a, b, bias=bias, out_dtype=torch.bfloat16),
+        ll_bf16_router(
+            a, b, enable_pdl=pdl_enabled(), bias=bias, out_dtype=torch.bfloat16
+        ),
         (fp32 + bias.float()).to(torch.bfloat16),
     )
 
@@ -212,7 +219,7 @@ def test_flashinfer_branch_meets_its_documented_requirement(monkeypatch) -> None
         assert bias.shape == (KIMI3_ROUTER_SIZE,) and bias.is_contiguous()
         assert out is None or (out.dtype is torch.bfloat16 and out.is_contiguous())
         return ll_bf16_router(
-            a_arg, b_arg.t(), out, bias=bias, out_dtype=torch.bfloat16
+            a_arg, b_arg.t(), out, enable_pdl=pdl, bias=bias, out_dtype=torch.bfloat16
         )
 
     monkeypatch.setattr(flashinfer_ops, "_mm_bf16", stub)

@@ -23,11 +23,13 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel import dsv4_linear_fp32, moe_topk
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.thirdparty.cuda.routing import softplus_sqrt_topk_flash
 
+if not (torch.cuda.is_available() and current_platform().is_nvidia):
+    pytest.skip("requires NVIDIA GPU", allow_module_level=True)
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires NVIDIA GPU")
+
 @pytest.mark.parametrize(
     "experts,kind", [(256, "bias"), (384, "bias"), (384, "hash32"), (384, "hash64")]
 )
@@ -94,7 +96,6 @@ def test_weight_dtype_scales_in_fp32_before_store(
         torch.testing.assert_close(captured_ids, ids, atol=0, rtol=0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires NVIDIA GPU")
 @pytest.mark.parametrize("experts", [256, 384])
 @pytest.mark.parametrize("pdl", [False, True])
 @pytest.mark.parametrize(
@@ -141,7 +142,6 @@ def test_router_preserves_score_order_and_ties(experts, pdl, case):
         pdl_enabled(original_pdl)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires NVIDIA GPU")
 @pytest.mark.parametrize("pdl", [False, True])
 def test_router_pdl_chain_reads_updated_graph_input(pdl):
     torch.manual_seed(119)
