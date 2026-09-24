@@ -384,13 +384,17 @@ class AttentionProgram:
         if cfg.HAS_SINK:
             sink_log2 = gl.load(self.sink_ptr + self.q_head).to(gl.float32) * _INV_LN2
             sink_unscaled = sink_log2 / cfg.SM_SCALE
+            use_scaled_state: gl.constexpr = (
+                cfg.FULL_QUERY_TILES and cfg.HEAD_DIM == 128
+            )
+            sink_state = sink_log2 if use_scaled_state else sink_unscaled
             m_i = gl.full(
                 [cfg.BLOCK_M],
                 value=0,
                 dtype=gl.float32,
                 layout=gl.SliceLayout(1, cfg.pv_layout),
             )
-            m_i += sink_unscaled
+            m_i += sink_state
         else:
             sink_log2 = 0.0
             m_i = gl.full(
@@ -464,11 +468,18 @@ class AttentionProgram:
     @gluon.jit
     def softmax_part0_full_rows(self, qk, m_i):
         cfg = self.cfg
-        row_max = max(qk, 1)
-        m_new = maximum(m_i, row_max)
-        m_new_scaled = m_new * cfg.SM_SCALE
-        p = gl.exp2(qk * cfg.SM_SCALE - m_new_scaled[:, None])
-        alpha = gl.exp2(m_i * cfg.SM_SCALE - m_new_scaled)
+        if cfg.HEAD_DIM == 128:
+            qk_scaled = qk * cfg.SM_SCALE
+            row_max = max(qk_scaled, 1)
+            m_new = maximum(m_i, row_max)
+            p = gl.exp2(qk_scaled - m_new[:, None])
+            alpha = gl.exp2(m_i - m_new)
+        else:
+            row_max = max(qk, 1)
+            m_new = maximum(m_i, row_max)
+            m_new_scaled = m_new * cfg.SM_SCALE
+            p = gl.exp2(qk * cfg.SM_SCALE - m_new_scaled[:, None])
+            alpha = gl.exp2(m_i * cfg.SM_SCALE - m_new_scaled)
         return p, alpha, m_new
 
     @gluon.jit
@@ -485,7 +496,11 @@ class AttentionProgram:
     def apply_sinks(self, l_i, m_i, sink_log2):
         cfg = self.cfg
         if cfg.HAS_SINK:
-            l_i += gl.exp2(sink_log2 - m_i * cfg.SM_SCALE)
+            use_scaled_state: gl.constexpr = (
+                cfg.FULL_QUERY_TILES and cfg.HEAD_DIM == 128
+            )
+            m_i_scaled = m_i if use_scaled_state else m_i * cfg.SM_SCALE
+            l_i += gl.exp2(sink_log2 - m_i_scaled)
         return l_i
 
     @gluon.jit
@@ -499,7 +514,11 @@ class AttentionProgram:
                 gl.int32
             )
             safe_l = gl.where(l_i > 0.0, l_i, 1.0)
-            lse = (m_i * cfg.SM_SCALE + gl.log2(safe_l)) * _LN2
+            use_scaled_state: gl.constexpr = (
+                cfg.FULL_QUERY_TILES and cfg.HEAD_DIM == 128
+            )
+            m_i_scaled = m_i if use_scaled_state else m_i * cfg.SM_SCALE
+            lse = (m_i_scaled + gl.log2(safe_l)) * _LN2
             if cfg.FULL_QUERY_TILES:
                 cdna5.buffer_store(lse, self.lse_ptr, offsets)
             else:
