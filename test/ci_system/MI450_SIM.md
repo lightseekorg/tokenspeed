@@ -4,6 +4,9 @@ The MI450 simulator task pins a ROCm SDK version and a `rocm-systems` source
 commit in `test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml`. The setup script
 builds the rocJITsu launcher and runtime from that source. It stores the source
 commit, SDK version, and SDK root path in `rocjitsu-build/.tokenspeed-build-id`.
+The pinned ROCm 10.1 nightly and matching PyTorch wheel are the last known
+passing toolchain for the full simulator suite. The setup script requires its
+SDK version, nightly index, and source commit as explicit inputs from the task.
 
 The setup script reuses the build only when the stamp matches and both build
 outputs exist. A missing or different stamp causes a clean rebuild so a runner

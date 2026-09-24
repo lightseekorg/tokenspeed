@@ -1,9 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-ROCM_SYSTEMS_REF=${ROCM_SYSTEMS_REF:-f9ba16bbe70e365b2f59b268e847bef19ad9db6e}
-ROCM_NIGHTLY_INDEX=${ROCM_NIGHTLY_INDEX:-https://nightly.repo.amd.com/rocm/whl-next/}
-ROCM_SDK_VERSION=${ROCM_SDK_VERSION:-10.2.0a20260923}
+: "${ROCM_SYSTEMS_REF:?ROCM_SYSTEMS_REF must be set}"
+: "${ROCM_NIGHTLY_INDEX:?ROCM_NIGHTLY_INDEX must be set}"
+: "${ROCM_SDK_VERSION:?ROCM_SDK_VERSION must be set}"
 UV_VERSION=${UV_VERSION:-0.9.26}
 SIM_ROOT=${TOKENSPEED_MI450_SIM_ROOT:-${RUNNER_TEMP:-/tmp}/tokenspeed-mi450-sim}
 SOURCE_ROOT="${SIM_ROOT}/rocm-systems"

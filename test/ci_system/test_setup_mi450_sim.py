@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 SETUP = Path(__file__).with_name("setup_mi450_sim.sh")
 
 
@@ -51,7 +53,11 @@ def _fake_setup(tmp_path: Path) -> tuple[dict[str, str], Path, Path, str]:
 
     _write_command(bin_dir, "sudo", 'exec "$@"\n')
     for name in ("apt-get", "pip3", "uv"):
-        _write_command(bin_dir, name, "exit 0\n")
+        _write_command(
+            bin_dir,
+            name,
+            'printf "%s\\n" "${0##*/}" >> "${FAKE_INSTALL_LOG}"\n',
+        )
     _write_command(
         bin_dir,
         "python3",
@@ -88,9 +94,11 @@ def _fake_setup(tmp_path: Path) -> tuple[dict[str, str], Path, Path, str]:
         "FAKE_REAL_PYTHON": sys.executable,
         "FAKE_ROCM_ROOT": str(tmp_path / "rocm-sdk"),
         "FAKE_BUILD_LOG": str(build_log),
+        "FAKE_INSTALL_LOG": str(tmp_path / "installs.log"),
         "TOKENSPEED_MI450_SIM_ROOT": str(sim_root),
         "ROCM_SYSTEMS_REF": source_a,
         "ROCM_SDK_VERSION": "sdk-a",
+        "ROCM_NIGHTLY_INDEX": "https://example.invalid/rocm/",
     }
     return env, sim_root / "rocjitsu-build", build_log, source_b
 
@@ -159,3 +167,29 @@ def test_failed_rocjitsu_build_cannot_be_reused(tmp_path: Path) -> None:
     env.pop("FAKE_CMAKE_FAIL")
     _run_setup(env)
     assert len(build_log.read_text().splitlines()) == 3
+
+
+@pytest.mark.parametrize(
+    "name", ["ROCM_SYSTEMS_REF", "ROCM_NIGHTLY_INDEX", "ROCM_SDK_VERSION"]
+)
+@pytest.mark.parametrize("value", [None, ""])
+def test_setup_requires_toolchain_inputs_before_install(
+    tmp_path: Path, name: str, value: str | None
+) -> None:
+    env, _, _, _ = _fake_setup(tmp_path)
+    if value is None:
+        env.pop(name)
+    else:
+        env[name] = value
+
+    result = subprocess.run(
+        ["bash", str(SETUP)],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert name in result.stderr
+    assert not Path(env["FAKE_INSTALL_LOG"]).exists()
