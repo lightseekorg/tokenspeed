@@ -22,7 +22,7 @@
 CuTe DSL MLA Decode Kernel Integration
 =======================================
 
-Wraps NVIDIA's CuTe DSL MLA decode kernels (FP16/BF16/FP8) for Blackwell SM100
+Wraps CuTe DSL MLA decode kernels (FP16/BF16/FP8) for SM100, SM103 and SM107
 and exposes them via a PyTorch API compatible with FlashInfer's MLA backend.
 """
 
@@ -33,15 +33,12 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32
-from tokenspeed_mla.mla_decode_fp8 import (
-    BlackwellMultiHeadLatentAttentionForwardFP8,
-)
-from tokenspeed_mla.mla_decode_fp16 import (
-    BlackwellMultiHeadLatentAttentionForwardFP16,
-)
+from tokenspeed_mla.mla_decode_fp8 import BlackwellMultiHeadLatentAttentionForwardFP8
+from tokenspeed_mla.mla_decode_fp16 import BlackwellMultiHeadLatentAttentionForwardFP16
 from tokenspeed_mla.mla_helpers import (
     ceil_div,
     compute_q_tile_layout,
+    get_mla_decode_arch,
     get_mla_decode_fold_sq_factor,
     select_mla_decode_tilers,
 )
@@ -185,6 +182,7 @@ def _get_compiled_mla_kernel(
     is_persistent: bool,
     is_var_seq: bool,
     is_var_split_kv: bool,
+    compute_capability: tuple[int, int],
     skip_correction_threshold: float = 0.0,
     is_workspace_size_zero: bool = False,
     fold_sq_factor: int = 1,
@@ -197,7 +195,6 @@ def _get_compiled_mla_kernel(
     cp_interleave_size: int = 1,
     use_pdl: bool = False,
     return_lse: bool = False,  # DCP: enable LSE output
-    compute_capability: tuple[int, int] = (0, 0),
     reducer_d_tiles: int = 1,
     reducer_max_splits: int = 256,
     pack_q: bool = False,
@@ -228,6 +225,7 @@ def _get_compiled_mla_kernel(
     cutlass_out_dtype = cutlass.BFloat16 if is_fp8 else cutlass_dtype
 
     kernel_kwargs = dict(
+        compute_capability=compute_capability,
         acc_dtype=cutlass.Float32,
         lse_dtype=cutlass.Float32,
         mma_qk_tiler_mn=mma_qk_tiler_mn,
@@ -391,7 +389,11 @@ def _get_compiled_mla_kernel(
         use_pdl,
     ]
     compiled_kernel = cute.compile(
-        *compile_args, options="--enable-tvm-ffi --opt-level 2"
+        *compile_args,
+        options=(
+            "--enable-tvm-ffi --opt-level 2 "
+            f"--gpu-arch={get_mla_decode_arch(compute_capability)}a"
+        ),
     )
 
     return compiled_kernel
@@ -422,7 +424,7 @@ def tokenspeed_mla_decode(
     cp_interleave_size: int = 1,
     enable_packed_q: bool = False,
 ) -> torch.Tensor:
-    """CuTe DSL MLA decode kernel for Blackwell SM100.
+    """CuTe DSL MLA decode kernel for SM100, SM103 and SM107.
 
     Parameters
     ----------

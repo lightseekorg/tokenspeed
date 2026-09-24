@@ -1,4 +1,4 @@
-name: GB200 Slurm Per Commit
+name: GB200
 
 on:
   push:
