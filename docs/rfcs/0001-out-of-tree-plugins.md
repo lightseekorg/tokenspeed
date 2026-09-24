@@ -171,8 +171,9 @@ import surface for registration.
 
 ```python
 def register_model(cls: type[nn.Module], *, architectures: tuple[str, ...] = (), override: bool = False) -> None
-def register_attention_family(spec: AttentionFamilySpec, *, override: bool = False) -> None
+def register_config(cls: type[PretrainedConfig], *, model_type: str | None = None, architectures: tuple[str, ...] = (), override: bool = False) -> None
 def register_attention_backend(name: str, archs: set[AttentionArch], cls: type[AttentionBackend], *, override: bool = False) -> None
+def register_linear_attention_backend(name: str, factory: Callable[..., AttentionBackend], *, override: bool = False) -> None
 def register_cache_recipe(family: str, recipe: Callable[..., CacheRecipe], *, override: bool = False) -> None
 def register_cache_pool(family: str, factory: Callable[..., CachePool], *, override: bool = False) -> None
 def register_quantization_method(name: str, cls: type[QuantizationConfig], *, override: bool = False) -> None
@@ -191,11 +192,29 @@ for `EntryClass`; its result seeds the registry. `register_model(cls)` keys
 by `cls.__name__` unless `architectures` is given (a plugin may need to claim
 an HF architecture string that differs from its class name).
 
-**Attention families.** `_AttentionFamilySpec` becomes public as
-`AttentionFamilySpec`; `_ATTENTION_FAMILY_SPECS` becomes a registry the
-tuple seeds. This is the one registration that cannot be deferred to a later
-phase: without it a plugin model with MLA or DSA attention would be built as
-MHA with no error. Phase 3 replaces this registry with `ModelProfile`.
+**Configs.** A released checkpoint may carry no `model_type` (LongCat
+Flash-Lite ships only `architectures`), and `get_config` must construct the
+plugin's config class before any other resolution can happen.
+`register_config` keys the class by `model_type` and by each architecture
+string; `hf_transformers_utils.get_config` consults the registry before the
+HF auto classes. Strict released-schema validation belongs in the config
+class itself, where constructor defaults would otherwise hide an omitted
+field.
+
+**Attention families.** No `AttentionFamilySpec` registry: a registered
+model resolves through its `ModelProfile` (P3) from the start —
+`profile.configure_attention` writes the attention geometry onto the
+`ModelConfig`, so a plugin model with MLA or DSA attention is never built as
+MHA by fallback. The in-tree architecture tables stay as the seed for
+in-tree models until the P3 migration deletes them.
+
+**Linear-attention backends.** `_create_hybrid_linear_attn_backend` chose
+between the KDA and GDN backends by architecture name. That table becomes a
+registry seeded with `"kda"` and `"gdn"`;
+`register_linear_attention_backend` adds a name, and
+`ModelProfile.linear_attention` selects it. This is how Flash-Lite runs
+FGBKDA (featurewise beta) as a subclass of the in-tree KDA backend with only
+the recurrence seams overridden.
 
 **Attention backends.** `register_backend` already exists; it is re-exported.
 `_KERNEL_SOLUTION_BY_BACKEND` in `backends/paged/mha.py` becomes a
@@ -210,6 +229,9 @@ subclasses `CacheRecipe` (the seams are `layer_types`, `group_ids`,
 `fields_for_layer`, `groups`, `packing`, `workspace_bytes`, `pool_options`)
 and registers the recipe and the pool under a new family name. A plugin with
 a standard layout registers nothing here and names an existing family.
+Family-string property tables elsewhere in the runtime (e.g. which families
+use paged state during verify) become class attributes on the recipe, so a
+new family never has to edit a second table.
 
 **Quantization.** `QUANTIZATION_METHODS` becomes a registry. The
 `isinstance` chain in `LinearBase.__init__` is replaced by one call,
@@ -235,6 +257,13 @@ against the corresponding registry after `ensure_loaded()`, producing the
 same "unknown X, available: [...]" error a user gets today. The help text
 lists the in-tree names and says plugins may add more.
 
+There is deliberately no plugin CLI extension point. A plugin's deployment
+knobs (e.g. where Flash-Lite's over-embedding tables live) are explicit
+fields of its config class, set through the existing `--hf-overrides` JSON.
+That keeps behavioral choices on the model's own schema — validated by the
+config class, no defaults hiding a selection — instead of growing a second,
+plugin-owned argument namespace.
+
 ### P3. `ModelProfile`: the model declares its own family facts
 
 P2 makes the tables extensible, but a plugin would still be registering
@@ -243,40 +272,67 @@ living away from the model. The intended end state moves that knowledge onto
 the class:
 
 ```python
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class ModelProfile:
-    attention_arch: AttentionArch
-    cache_family: str                              # a registered recipe/pool family
-    linear_attention: Literal["none", "gdn", "kda"] = "none"
-    forced_attention_backend: str | None = None    # e.g. "deepseek_v41", "hybrid_linear_attn"
-    default_attention_backend: str | None = None   # used only if the user passed none
-    default_prefix_granularity: int | None = None
-    draft_architecture: str | None = None          # entry class name of the draft variant
-    is_draft_of: str | None = None                 # for draft classes: the target entry class
+    configure_attention: Callable[[ModelConfig], None]  # writes arch + geometry
+    cache_family: str                        # a registered recipe/pool family
+    linear_attention: str | None             # a registered linear-attn backend
+    default_attention_backend: str | None    # used only if the user passed none
+    default_prefix_granularity: int | None
+    request_token_history: bool              # model reads committed tokens
+    tokenizer_kwargs: Mapping[str, object]
 
 class FooForCausalLM(nn.Module):
-    profile: ClassVar[ModelProfile] = ModelProfile(
-        attention_arch=AttentionArch.MLA,
-        cache_family="mla",
-        default_attention_backend="flashmla",
-        default_prefix_granularity=64,
-        draft_architecture="FooForCausalLMNextN",
-    )
+    @classmethod
+    def model_profile(cls, hf_config) -> ModelProfile:
+        return ModelProfile(
+            configure_attention=configure_mla_attention,
+            cache_family="mla",
+            linear_attention=None,
+            default_attention_backend="flashmla",
+            default_prefix_granularity=64,
+            request_token_history=False,
+            tokenizer_kwargs={},
+        )
 ```
 
-Resolution becomes: `hf_config.architectures` → `ModelRegistry` → the
-class → `cls.profile`. `_resolve_attention_family`, `_resolve_attn_side`,
-`_apply_backend_overrides` and `_resolve_cache_family` read the profile
-instead of matching names. In-tree models gain a `profile` and the
-`_*_ARCHITECTURES` sets are deleted once every in-tree entry class has one.
-A class without a `profile` is an error at registration, not a fallback to
-MHA.
+`model_profile(hf_config)` is a classmethod, not a class attribute: a family
+may pick its attention variant, or whether it reads token history, from the
+checkpoint config (Flash-Lite selects MLA vs its DSA variant and gates the
+over-embedding history this way). Attention configuration is a callable
+rather than an `attention_arch` enum value plus a spec table, because
+"which arch" was never separable from "which head geometry and scaling":
+one function owns both, and a plugin can wrap an in-tree
+`configure_*_attention` and adjust only what differs.
+
+Resolution becomes: `hf_config.architectures` → `ModelRegistry` → the class
+→ `cls.model_profile(hf_config)`, resolved once in `ModelConfig`.
+`_resolve_attention_family`, `_resolve_attn_side`,
+`_apply_backend_overrides`, `_resolve_cache_family` and `get_tokenizer` read
+the profile when one exists. In-tree models keep their tables as the interim
+seed; the tables are deleted once every in-tree entry class carries a
+profile. A registered (plugin) class without a profile is an error at
+registration, not a fallback to MHA.
+
+Two field-set notes from the reference implementation:
+
+- `tokenizer_kwargs` exists because a released tokenizer may need
+  construction arguments (`fix_mistral_regex=True` for LongCat's Bloom-style
+  tokenizer), and every `get_tokenizer` site must apply them.
+- A profile field may gate a generic runtime capability rather than a
+  resolver: `request_token_history` makes the executor keep each slot's
+  committed tokens (seeded on prefix resume, graph-stable views), which the
+  model receives as a forward argument. The capability lives in the runtime,
+  once; the profile only switches it on. This is the pattern for future
+  model needs that are state, not dispatch.
+- `draft_architecture` / `is_draft_of` join the profile together with the
+  drafter registry (deferred; see Phasing).
 
 This is the actual dependency inversion in the RFC: after it, there is one
 resolution path shared by in-tree and out-of-tree models, which is the
 project's stated preference ("one path; parameters, not branches"). The
-exact field set is finalized during the in-tree migration, when every
-boolean in `_AttnSideProfile` has to find a home.
+remaining `_AttnSideProfile` booleans find homes during the in-tree
+migration.
 
 ### P4. Kernel side
 
@@ -504,18 +560,23 @@ plugin exists. Three measures:
 
 Each phase is independently mergeable and useful.
 
-1. **Discovery and the two registrations that make a private model
-   runnable.** `tokenspeed.runtime.plugins` with `ensure_loaded()` (calling
-   the kernel discovery), `register_model`, `register_attention_family`,
-   re-exported `register_attention_backend`, CLI validation moved after
-   discovery. This alone covers a proprietary model with MHA/MLA/DSA attention
-   plus proprietary kernels imported directly.
-2. **Remaining registries.** Cache recipe/pool, quantization (including the
-   `get_quant_method` unification), drafter (including
-   `requires_target_capture`), `register_mha_kernel_solution`.
-3. **`ModelProfile`.** Add the class attribute to every in-tree entry class,
-   switch the four resolvers to read it, delete the architecture-name tables
-   and `_AttentionFamilySpec`.
+1. **Discovery and the registrations that make a private model runnable**
+   *(implemented; the reference plugin exercises all of it)*.
+   `tokenspeed.runtime.plugins` with `ensure_loaded()` (calling the kernel
+   discovery), `register_model` + `ModelProfile` resolution for registered
+   classes, `register_config`, re-exported `register_attention_backend`,
+   `register_linear_attention_backend`, `register_cache_recipe` /
+   `register_cache_pool`, CLI attention-backend validation moved after
+   discovery. Cache registries moved up from phase 2 because a hybrid model
+   is not runnable without its state layout; the linear-attention registry
+   was pulled in for the same reason.
+2. **Remaining registries.** Quantization (including the `get_quant_method`
+   unification), drafter (including `requires_target_capture` and the
+   profile's `draft_architecture`), `register_mha_kernel_solution`,
+   validation of the remaining CLI names.
+3. **In-tree `ModelProfile` migration.** Give every in-tree entry class a
+   profile, switch the resolvers to read only profiles, delete the
+   architecture-name tables.
 4. **Contract.** `docs/design/plugins.md`, `PLUGIN_API_VERSION`, the fixture
    plugin and its CI job.
 
