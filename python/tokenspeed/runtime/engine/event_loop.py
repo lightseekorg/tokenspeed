@@ -476,6 +476,7 @@ class EventLoop:
             clear_cache_fn=self.scheduler.clear_cache,
             can_clear_cache_fn=self.scheduler.can_clear_cache,
             architectures=self.model_config.hf_config.architectures,
+            tokenizer_kwargs=self.model_config.tokenizer_kwargs,
             pause_controller=self._pause,
             memory_controller=self._memory,
             device=self._device,

@@ -1063,6 +1063,7 @@ def test_weight_loader_initializes_engram_once_in_weight_region(
     config = SimpleNamespace(
         dtype=torch.bfloat16,
         hf_config=SimpleNamespace(architectures=["DeepseekV41ForCausalLM"]),
+        tokenizer_kwargs={},
     )
     result = WeightLoader.load_model(
         model_config=config,

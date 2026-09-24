@@ -229,7 +229,7 @@ def test_hybrid_factory_selects_gdn_only_for_local_state(
         config,
         pool=pool,
         full_attn_backend_name=None,
-        is_kda=False,
+        linear_attention="gdn",
     )
     assert isinstance(backend, Qwen4ExpBackend) == is_qwen4
     attention = backend.attention_backend if is_qwen4 else backend

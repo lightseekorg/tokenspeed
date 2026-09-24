@@ -1585,28 +1585,20 @@ class ServerArgs:
             help="Default sampling settings as JSON for SMG's gRPC GetModelInfo response.",
         )
 
-        # Kernel backend
-        attention_backend_choices = [
-            "mha",
-            "mla",
-            "fa3",
-            "fa4",
-            "triton",
-            "gluon",
-            "flashinfer",
-            "trtllm",
-            "trtllm_mla",
-            "flashmla",
-            "tokenspeed_mla",
-            "hybrid_linear_attn",
-        ]
+        # Kernel backend. Names are validated against the backend registry
+        # after plugin discovery, so plugins can add their own.
+        attention_backend_names = (
+            "mha, mla, fa3, fa4, triton, gluon, flashinfer, trtllm, trtllm_mla, "
+            "flashmla, tokenspeed_mla, hybrid_linear_attn"
+        )
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=attention_backend_choices,
             default=ServerArgs.attention_backend,
-            help="Choose the kernels for attention layers. 'gluon' forces "
-            "registered Gluon kernels for supported attention architectures.",
+            help="Choose the kernels for attention layers: "
+            f"{attention_backend_names}, or a name a plugin registers. 'gluon' "
+            "forces registered Gluon kernels for supported attention "
+            "architectures.",
         )
         parser.add_argument(
             "--kda-backend",
@@ -1625,9 +1617,9 @@ class ServerArgs:
         parser.add_argument(
             "--drafter-attention-backend",
             type=str,
-            choices=attention_backend_choices,
-            help="Attention backend for drafter model in speculative decoding. "
-            "If not specified, uses the same backend as the main model (attention_backend).",
+            help="Attention backend for drafter model in speculative decoding "
+            f"({attention_backend_names}, or a plugin's). If not specified, uses "
+            "the same backend as the main model (attention_backend).",
         )
         parser.add_argument(
             "--skip-softmax-threshold",

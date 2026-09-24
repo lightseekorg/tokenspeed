@@ -695,8 +695,7 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
             num_target_layers=1,
             full_attn_backend_name=None,
             is_heterogeneous=True,
-            is_hybrid_linear=True,
-            is_kda=False,
+            linear_attention="gdn",
             is_inkling=False,
         )
 
@@ -720,13 +719,15 @@ def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
         hf_config=SimpleNamespace(
             architectures=("LlamaForCausalLM",),
             is_deepseek_v4=False,
-        )
+        ),
+        model_profile=None,
     )
     draft = SimpleNamespace(
         hf_config=SimpleNamespace(
             architectures=("DeepseekV4ForCausalLMNextN",),
             is_deepseek_v4=True,
-        )
+        ),
+        model_profile=None,
     )
 
     with pytest.raises(NotImplementedError, match="target-only"):
