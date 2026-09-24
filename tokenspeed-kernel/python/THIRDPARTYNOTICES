@@ -78,6 +78,39 @@ Copyright contributors to the FlashInfer project
 
 Licensed under the Apache License, Version 2.0, whose full license text is available below.
 
+TRT-LLM routing-map padding adapter
+
+Upstream: https://github.com/flashinfer-ai/flashinfer
+
+The source patterns in tokenspeed_kernel/thirdparty/flashinfer/_routing_padding.py
+and the native sources transformed by trtllm_moe.py are based on these FlashInfer
+files (paths relative to the upstream repository):
+
+  include/flashinfer/trtllm/fused_moe/RoutingKernel.cuh
+  include/flashinfer/trtllm/fused_moe/RoutingKernel.h
+  include/flashinfer/trtllm/fused_moe/runner.h
+  csrc/trtllm_fused_moe_kernel_launcher.cu
+  csrc/trtllm_fused_moe_runner.cu
+  csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cu
+  csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_llama4.cu
+
+These files are licensed under Apache-2.0. The NVIDIA-authored sources carry
+the following copyright notices, which are retained in generated copies:
+
+Copyright (c) 2022-2025, NVIDIA CORPORATION. All rights reserved.
+Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+
+TokenSpeed adds routing-map padding initialization and an allocation-size
+parameter, and relocates header includes for a private JIT build. Generated
+files that differ from upstream carry a modification notice. Unchanged sibling
+headers retain their original notices as well.
+
+TokenSpeed's original Python adapter and inline padding helpers are licensed
+under this package's MIT license. That license does not replace the Apache-2.0
+terms for upstream-derived content. Distributions of generated native sources
+or binaries must retain the applicable upstream notices and include the
+corresponding license texts.
+
 Notice for fla-org/flash-linear-attention
 -------------------------------
 MIT License
