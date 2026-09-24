@@ -32,6 +32,7 @@ import json
 import math
 import os
 import re
+from contextlib import contextmanager
 from copy import copy
 from pathlib import Path
 from test.runtime.test_deepseek_v41_cache import R1, R2, _backend, _extend, _tables
@@ -260,8 +261,9 @@ class _Backend:
         ).sum(1)
         output = torch.zeros_like(content)
         output[1:cutoff:2] = pooled
-        row_positions, row_requests = torch.full_like(positions, -1), torch.full_like(
-            requests, -1
+        row_positions, row_requests = (
+            torch.full_like(positions, -1),
+            torch.full_like(requests, -1),
         )
         row_positions[1:cutoff:2] = positions[:cutoff:2]
         row_requests[1:cutoff:2] = requests[:cutoff:2]
@@ -454,6 +456,18 @@ def test_scale_expansion_then_tp_and_merged_sharding():
     assert quant.weight_block_size == [1, 32]
 
 
+def _complete_layer(layer, *args):
+    """Materialize a standalone layer so tests compare its full HC output."""
+    residual, pre, pending, tap = DeepseekV41DecoderLayer.forward(
+        layer,
+        *args,
+        pending_post=None,
+        allow_ffn_reduce_fusion=False,
+        capture_input=False,
+    )
+    return pending.finish(residual), pre, None, tap
+
+
 def _mix_reference(x, weight, scale, base, eps, hc_eps, iters):
     hc = x.shape[-2]
     flat = x.float().flatten(-2)
@@ -471,6 +485,398 @@ def _mix_reference(x, weight, scale, base, eps, hc_eps, iters):
         comb /= comb.sum(-1, keepdim=True) + hc_eps
         comb /= comb.sum(-2, keepdim=True) + hc_eps
     return pre, post, comb
+
+
+@pytest.mark.parametrize(
+    "tp_size,can_fuse,fusion_error",
+    [(1, False, False), (2, False, False), (2, True, False), (2, True, True)],
+)
+@pytest.mark.parametrize("narrow", [False, True])
+@pytest.mark.parametrize(
+    "mode", [ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.MIXED]
+)
+def test_attention_reduction_precedes_hc_join_unless_fusible(
+    monkeypatch, tp_size, can_fuse, fusion_error, narrow, mode
+):
+    """Record the stream-join boundary while running real CPU layer arithmetic."""
+    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    torch.manual_seed(41)
+    config = _config()
+    mapping = _mapping(0, tp_size, tp_size)
+    layer = DeepseekV41DecoderLayer(
+        config,
+        mapping,
+        0,
+        0 if narrow else 20,
+        None,
+        "layers.0",
+        None,
+        None,
+        False,
+        "gpu",
+    )
+    _initialize(layer)
+    positions = torch.arange(3)
+    backend = _Backend(positions, torch.zeros(3, dtype=torch.int64))
+    ctx = _ctx(backend, 3, mode)
+    keep = torch.tensor([2]) if narrow else None
+    query = (
+        SimpleNamespace(
+            positions=positions[keep],
+            request_indices=backend.meta.request_indices[keep],
+        )
+        if narrow
+        else backend.meta
+    )
+    backend.view = V41DecoderView(query, None, (), keep, None)
+    monkeypatch.setattr(layer.comm_manager, "pre_mlp_comm", lambda x, ctx: x)
+    monkeypatch.setattr(layer.comm_manager, "get_num_tokens", lambda ctx: (3, 3))
+    monkeypatch.setattr(
+        layer.comm_manager, "post_mlp_comm", lambda x, residual, ctx: (x, residual)
+    )
+    events = []
+    scope = layer.hc_stream_fork.scope
+
+    @contextmanager
+    def record_scope(*, enable, overlap):
+        with scope(enable=enable, overlap=overlap) as fork:
+            yield fork
+        events.append("hc_join")
+
+    monkeypatch.setattr(layer.hc_stream_fork, "scope", record_scope)
+
+    def reduce(x, *, group, backend, op):
+        assert group == mapping.attn.tp_group
+        assert backend is None and op == torch.distributed.ReduceOp.SUM
+        events.append("all_reduce")
+        return x * tp_size
+
+    anticipated_outputs = []
+
+    def supports(x, norm_weight, group):
+        assert x.shape == (query.positions.numel(), config.hidden_size)
+        assert norm_weight is layer.ffn_norm.weight
+        assert group == mapping.attn.tp_group
+        anticipated_outputs.append((x.shape, x.dtype, x.device, x.stride()))
+        return can_fuse
+
+    def fuse(x, residual, post, comb, pre, weight, eps, group):
+        assert (x.shape, x.dtype, x.device, x.stride()) == anticipated_outputs[-1]
+        events.append("fusion")
+        if fusion_error:
+            raise RuntimeError("mHC execution failed")
+        residual = v41_hc_post(x * tp_size, residual, post, comb)
+        return residual, v41._v41_hc_input(residual, pre, layer.ffn_norm)
+
+    monkeypatch.setattr(v41, "all_reduce", reduce)
+    preflight = Mock(side_effect=supports)
+    monkeypatch.setattr(v41, "supports_all_reduce_mhc_norm", preflight)
+    monkeypatch.setattr(v41, "all_reduce_mhc_norm", fuse)
+    shifted = Mock(wraps=v41.try_mhc_shifted_post_pre_norm)
+    monkeypatch.setattr(v41, "try_mhc_shifted_post_pre_norm", shifted)
+    hidden = torch.randn(3, 4, 128, dtype=torch.bfloat16)
+    pre = torch.full((3, 4), 0.25)
+    args = (hidden, pre, positions, None, ctx)
+    admitted = tp_size > 1 and mode.is_decode() and can_fuse
+    if fusion_error and admitted:
+        with pytest.raises(RuntimeError, match="mHC execution failed"):
+            _complete_layer(layer, *args)
+        assert events == ["hc_join", "fusion"]
+        shifted.assert_not_called()
+        return
+    actual, actual_pre, _, _ = _complete_layer(layer, *args)
+    if tp_size == 1:
+        preflight.assert_not_called()
+        assert events == ["hc_join", "hc_join"]
+    elif not admitted:
+        assert events == ["all_reduce", "hc_join", "hc_join"]
+    else:
+        assert events == ["hc_join", "fusion", "hc_join"]
+    if tp_size > 1 and mode.is_decode():
+        preflight.assert_called_once()
+    else:
+        preflight.assert_not_called()
+    # Select communication before deferring reduction; otherwise use local HC.
+    if admitted:
+        shifted.assert_not_called()
+    else:
+        shifted.assert_called_once()
+    # Admitted fusion must match ordinary reduction and HC.
+    can_fuse = False
+    expected, expected_pre, _, _ = _complete_layer(layer, *args)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_pre, expected_pre, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tokens,kept", [(16, None), (17, None), (33, 17), (33, 1)])
+@pytest.mark.parametrize("supported", [False, True])
+def test_shifted_mhc_consumes_reduced_rows_and_reuses_ffn_mixes(
+    monkeypatch, tokens, kept, supported
+):
+    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    torch.manual_seed(41)
+    config = _config()
+    mapping = _mapping(0, 2, 2)
+    layer = DeepseekV41DecoderLayer(
+        config,
+        mapping,
+        0,
+        0 if kept is not None else 20,
+        None,
+        "layers.0",
+        None,
+        None,
+        False,
+        "gpu",
+    )
+    _initialize(layer)
+    positions = torch.arange(tokens)
+    backend = _Backend(positions, torch.zeros(tokens, dtype=torch.int64))
+    ctx = _ctx(backend, tokens, ForwardMode.EXTEND)
+    keep = torch.arange(tokens - kept, tokens) if kept is not None else None
+    query = (
+        backend.meta
+        if keep is None
+        else SimpleNamespace(
+            positions=positions[keep],
+            request_indices=backend.meta.request_indices[keep],
+        )
+    )
+    backend.view = V41DecoderView(query, None, (), keep, None)
+    monkeypatch.setattr(layer.comm_manager, "pre_mlp_comm", lambda x, ctx: x)
+    monkeypatch.setattr(
+        layer.comm_manager, "get_num_tokens", lambda ctx: (tokens, tokens)
+    )
+    monkeypatch.setattr(layer.comm_manager, "post_mlp_comm", lambda x, r, ctx: (x, r))
+    monkeypatch.setattr(v41, "supports_all_reduce_mhc_norm", lambda *args: False)
+    events, reduced = [], []
+
+    def reduce(x, **kwargs):
+        events.append("reduce")
+        reduced.append(x * 2)
+        return reduced[-1]
+
+    def shifted(
+        x,
+        residual,
+        pre,
+        post,
+        comb,
+        weight,
+        scale,
+        base,
+        rms_eps,
+        hc_eps,
+        iters,
+        norm_weight,
+        norm_eps,
+    ):
+        events.append("shifted")
+        assert x is reduced[-1]
+        assert x.shape[0] == (tokens if kept is None else kept)
+        assert weight is layer.hc_ffn_fn
+        if not supported:
+            return None
+        residual = v41_hc_post(x, residual, post, comb)
+        # The input consumes attention pre; the returned pre belongs to FFN.
+        y = _norm(v41_hc_pre(residual, pre), norm_weight, norm_eps)
+        mixes = _mix_reference(residual, weight, scale, base, rms_eps, hc_eps, iters)
+        return residual, y, *mixes
+
+    monkeypatch.setattr(v41, "all_reduce", reduce)
+    monkeypatch.setattr(v41, "try_mhc_shifted_post_pre_norm", shifted)
+    mixes = Mock(wraps=v41.v41_hc_mixes)
+    monkeypatch.setattr(v41, "v41_hc_mixes", mixes)
+    hidden = torch.randn(tokens, 4, 128, dtype=torch.bfloat16)
+    pre = torch.rand(tokens, 4)
+    args = (hidden, pre, positions, None, ctx)
+    actual = _complete_layer(layer, *args)
+    # Local fusion consumes the reduced output, including small/narrowed inputs.
+    assert events == ["reduce", "shifted"]
+    assert mixes.call_count == (1 if supported else 2)
+    monkeypatch.setattr(v41, "try_mhc_shifted_post_pre_norm", lambda *args: None)
+    expected = _complete_layer(layer, *args)
+    for got, ref in zip(actual[:2], expected[:2], strict=True):
+        torch.testing.assert_close(got, ref, atol=0, rtol=0)
+    assert actual[2] is expected[2] is None
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not current_platform().is_nvidia
+    or current_platform().arch_version.major != 10,
+    reason="requires an SM100-family GPU",
+)
+@pytest.mark.parametrize(
+    "tokens,kept",
+    [
+        (33, None),
+        (33, 1),
+        (33, 17),
+        (129, 128),
+    ],
+)
+@pytest.mark.parametrize("has_stream", [False, True])
+@pytest.mark.parametrize("mega_moe", [False, True])
+@pytest.mark.parametrize(
+    "mode", [ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.MIXED]
+)
+def test_shifted_mhc_gpu_layer_matches_fallback(
+    monkeypatch, tokens, kept, has_stream, mega_moe, mode
+):
+    """Run real HC kernels through the layer, isolating attention/experts."""
+    torch.manual_seed(41)
+    hidden = 5120
+    mapping = _mapping(0, 1, 1)
+    positions = torch.arange(tokens, device="cuda")
+    backend = _Backend(positions, torch.zeros_like(positions))
+    ctx = _ctx(backend, tokens, mode)
+    keep = (
+        torch.arange(tokens - kept, tokens, device="cuda") if kept is not None else None
+    )
+    query = (
+        backend.meta
+        if keep is None
+        else SimpleNamespace(
+            positions=positions[keep],
+            request_indices=backend.meta.request_indices[keep],
+        )
+    )
+    backend.view = V41DecoderView(query, None, (), keep, None)
+
+    class Attention:
+        def __init__(self):
+            self.mapping = mapping
+
+        @v41.break_point
+        def __call__(self, positions, x, ctx, *, reduce_results):
+            assert reduce_results
+            return x.sin() if keep is None else x[keep].sin()
+
+    class FFN:
+        use_mega_moe = mega_moe
+
+        def __call__(self, x, *args, **kwargs):
+            return x.tanh()
+
+    def norm():
+        return SimpleNamespace(
+            weight=torch.ones(hidden, device="cuda", dtype=torch.bfloat16),
+            variance_epsilon=1e-20,
+        )
+
+    def weight():
+        return torch.randn(24, 4 * hidden, device="cuda") * 0.03
+
+    layer = SimpleNamespace(
+        layer_id=0,
+        ced_decoder_start=0 if kept is not None else 20,
+        norm_eps=1e-20,
+        hc_eps=1e-6,
+        hc_sinkhorn_iters=20,
+        hc_stream_fork=v41.StreamFork(torch.cuda.Stream() if has_stream else None),
+        attn=Attention(),
+        ffn=FFN(),
+        attn_norm=norm(),
+        ffn_norm=norm(),
+        hc_attn_fn=weight(),
+        hc_attn_scale=torch.ones(3, device="cuda"),
+        hc_attn_base=torch.zeros(24, device="cuda"),
+        hc_ffn_fn=weight(),
+        hc_ffn_scale=torch.ones(3, device="cuda"),
+        hc_ffn_base=torch.zeros(24, device="cuda"),
+        comm_manager=SimpleNamespace(
+            mapping=mapping,
+            moe_tp_ep_group_scattered_num_tokens=lambda ctx: [
+                tokens if kept is None else kept
+            ],
+            pre_mlp_comm=lambda x, ctx: x,
+            get_num_tokens=lambda ctx: (tokens, tokens),
+            post_mlp_comm=lambda x, r, ctx: (x, r),
+        ),
+    )
+    residual = torch.randn(tokens, 4, hidden, device="cuda", dtype=torch.bfloat16)
+    pre = torch.rand(tokens, 4, device="cuda")
+    args = (layer, residual, pre, positions, None, ctx)
+    native = v41.try_mhc_shifted_post_pre_norm
+
+    def shifted(*args):
+        result = native(*args)
+        assert result is not None
+        return result
+
+    calls = Mock(side_effect=shifted)
+    monkeypatch.setattr(v41, "try_mhc_shifted_post_pre_norm", calls)
+    scopes = []
+    scope = layer.hc_stream_fork.scope
+
+    @contextmanager
+    def record_scope(*, enable, overlap):
+        scopes.append(enable)
+        with scope(enable=enable, overlap=overlap) as fork:
+            yield fork
+
+    monkeypatch.setattr(layer.hc_stream_fork, "scope", record_scope)
+    actual = _complete_layer(*args)
+    # The phase, not CUDA Graph state or row count, selects the HC preference.
+    use_mega = not (mode.is_decode() and has_stream)
+    assert calls.call_count == int(use_mega)
+    assert scopes == [mode.is_decode() and has_stream, has_stream and not use_mega]
+    monkeypatch.setattr(v41, "try_mhc_shifted_post_pre_norm", lambda *args: None)
+    scopes.clear()
+    expected = _complete_layer(*args)
+    # A native decline restores the auxiliary FFN stream.
+    assert scopes == [mode.is_decode() and has_stream, has_stream]
+    for got, ref in zip(actual[:2], expected[:2], strict=True):
+        torch.testing.assert_close(got, ref, atol=0.03, rtol=0.02)
+    assert actual[2] is expected[2] is None
+
+    if mode == ForwardMode.DECODE and kept in (17, 128) and has_stream:
+        monkeypatch.setattr(v41, "try_mhc_shifted_post_pre_norm", shifted)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                _complete_layer(*args)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured = _complete_layer(*args)
+        for _ in range(3):
+            residual.normal_()
+            pre.uniform_()
+            graph.replay()
+            eager = _complete_layer(*args)
+            for got, ref in zip(captured[:2], eager[:2], strict=True):
+                torch.testing.assert_close(got, ref, atol=0.03, rtol=0.02)
+
+    if mode == ForwardMode.EXTEND and kept == 128 and has_stream:
+        from tokenspeed.runtime.execution.breakable_cuda_graph import (
+            BreakableCapture,
+            active_forward,
+        )
+
+        monkeypatch.setattr(v41, "try_mhc_shifted_post_pre_norm", shifted)
+        cap = BreakableCapture()
+        with active_forward(ctx):
+            cap.stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(cap.stream):
+                for _ in range(2):
+                    _complete_layer(*args)
+            cap.stream.synchronize()
+            scopes.clear()
+            with cap:
+                captured = _complete_layer(*args)
+            # Attention cannot fork across the eager break. The FFN fork joins
+            # inside its segment when native MegaMHC declines.
+            assert scopes == [False, not use_mega]
+            for _ in range(3):
+                residual.normal_()
+                pre.uniform_()
+                cap.replay()
+                eager = _complete_layer(*args)
+                for got, ref in zip(captured[:2], eager[:2], strict=True):
+                    torch.testing.assert_close(got, ref, atol=0.03, rtol=0.02)
 
 
 def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
@@ -506,7 +912,14 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
     actual, expected = initial.clone(), initial.clone()
     actual_pre, expected_pre = pre.clone(), pre.clone()
     for layer in layers:
-        actual, actual_pre = layer(actual, actual_pre, positions, torch.arange(3), ctx)
+        actual, actual_pre, _, _ = _complete_layer(
+            layer,
+            actual,
+            actual_pre,
+            positions,
+            torch.arange(3),
+            ctx,
+        )
         for sublayer, norm, name in (
             (layer.attn, layer.attn_norm, "attn"),
             (layer.ffn, layer.ffn_norm, "ffn"),
@@ -527,7 +940,7 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
             )
             x = _norm(collapsed, norm.weight, 1e-20)
             x = (
-                sublayer(positions, x, ctx)
+                sublayer(positions, x, ctx, reduce_results=True)
                 if name == "attn"
                 else sublayer(x, None, 3, 3, None, None)
             )
@@ -556,6 +969,218 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("fusion", ["unavailable", "success", "error"])
+@pytest.mark.parametrize(
+    "mode", [ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.MIXED]
+)
+def test_cross_layer_reduction_uses_consumer_norm(monkeypatch, fusion, mode):
+    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    torch.manual_seed(91)
+    config = _config()
+    layers = [
+        DeepseekV41DecoderLayer(
+            config,
+            _mapping(0, 1, 1),
+            i,
+            20,
+            None,
+            f"layers.{i}",
+            None,
+            None,
+            False,
+            "gpu",
+        )
+        for i in range(2)
+    ]
+    for layer in layers:
+        _initialize(layer)
+        monkeypatch.setattr(layer.comm_manager, "pre_mlp_comm", lambda x, ctx: x)
+        monkeypatch.setattr(layer.comm_manager, "get_num_tokens", lambda ctx: (3, 3))
+        monkeypatch.setattr(
+            layer.comm_manager, "post_mlp_comm", lambda x, r, ctx: (x, r)
+        )
+    producer, consumer = layers
+    with torch.no_grad():
+        consumer.attn_norm.weight.fill_(0.7)
+    consumer.attn_norm.variance_epsilon = 1e-5
+    group = (0, 1)
+    monkeypatch.setattr(
+        producer.comm_manager,
+        "mapping",
+        SimpleNamespace(moe=SimpleNamespace(has_tp_ep=True, tp_ep_group=group)),
+    )
+    monkeypatch.setattr(producer.comm_manager, "use_all_reduce", lambda *, is_moe: True)
+    events = []
+    original_scope = producer.hc_stream_fork.scope
+
+    @contextmanager
+    def scope(*, enable, overlap):
+        with original_scope(enable=enable, overlap=overlap) as fork:
+            yield fork
+        events.append("join")
+
+    def reduce(x, residual, ctx):
+        events.append("reduce")
+        return x * 2, residual
+
+    def supports(x, norm_weight, tp_group):
+        assert norm_weight is producer.ffn_norm.weight and tp_group == group
+        return fusion != "unavailable"
+
+    def fuse(x, residual, post, comb, pre, weight, eps, tp_group):
+        assert weight is consumer.attn_norm.weight
+        assert eps == consumer.attn_norm.variance_epsilon and tp_group == group
+        events.append("fusion")
+        if fusion == "error":
+            raise RuntimeError("mHC execution failed")
+        residual = v41_hc_post(x * 2, residual, post, comb)
+        return residual, v41._v41_hc_input(residual, pre, consumer.attn_norm)
+
+    def shifted(*args):
+        if args[5] is consumer.hc_attn_fn:
+            events.append("local_hc")
+        return None
+
+    monkeypatch.setattr(producer.hc_stream_fork, "scope", scope)
+    monkeypatch.setattr(producer.comm_manager, "post_mlp_comm", reduce)
+    admission = Mock(side_effect=supports)
+    monkeypatch.setattr(v41, "supports_all_reduce_mhc_norm", admission)
+    monkeypatch.setattr(v41, "all_reduce_mhc_norm", fuse)
+    monkeypatch.setattr(v41, "try_mhc_shifted_post_pre_norm", shifted)
+    initial = torch.randn(3, 4, config.hidden_size, dtype=torch.bfloat16)
+    initial_pre = torch.rand(3, 4)
+    positions = torch.arange(3)
+    ctx = _ctx(_Backend(positions, torch.zeros_like(positions)), 3, mode)
+
+    def run():
+        residual, pre, pending = initial, initial_pre, None
+        for i, layer in enumerate(layers):
+            residual, pre, pending, tap = layer(
+                residual,
+                pre,
+                positions,
+                None,
+                ctx,
+                pending_post=pending,
+                allow_ffn_reduce_fusion=i == 0,
+                capture_input=i == 1,
+            )
+        return pending.finish(residual), pre, tap
+
+    admitted = mode.is_decode() and fusion != "unavailable"
+    if admitted and fusion == "error":
+        with pytest.raises(RuntimeError, match="mHC execution failed"):
+            run()
+        assert events == ["join", "join", "fusion"]
+        return
+    actual = run()
+    assert admission.call_count == int(mode.is_decode())
+    assert events == (
+        ["join", "join", "fusion"]
+        if admitted
+        else ["join", "reduce", "join", "local_hc"]
+    )
+    monkeypatch.setattr(v41, "supports_all_reduce_mhc_norm", lambda *args: False)
+    expected = run()
+    for got, ref in zip(actual, expected, strict=True):
+        torch.testing.assert_close(got, ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "mode", [ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.MIXED]
+)
+@pytest.mark.parametrize("narrow", [False, True])
+def test_cross_layer_chain_preserves_engram_taps_and_stage_handoffs(
+    monkeypatch, mode, narrow
+):
+    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    torch.manual_seed(91)
+    config = _config()
+    model = v41.DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", False, "gpu")
+    _initialize(model)
+    model.initialize_engram(_Tokenizer())
+    model.dspark_capture_layers = (1, 3, 14, 19, 20, 21, 39)
+    positions = torch.arange(6)
+
+    class Backend(_Backend):
+        def prepare_global_selection(self, *args):
+            # The backbone fixture returns synthetic attention output in all
+            # modes; decode still performs the real projection/selection call.
+            return None
+
+    backend = Backend(positions, torch.zeros_like(positions))
+    keep = torch.tensor([2, 5]) if narrow else None
+    if keep is not None:
+        query = SimpleNamespace(
+            positions=positions[keep],
+            request_indices=backend.meta.request_indices[keep],
+        )
+        backend.view = V41DecoderView(query, None, (), keep, None)
+    ctx = _ctx(backend, 6, mode)
+    ctx.capture_hidden_mode = CaptureHiddenMode.FULL
+    args = (torch.tensor([0, 3, 4, 6, 3, 4]), positions, ctx, None, None)
+    kwargs = dict(
+        engram_previous_tokens=torch.full((6, 3), -1),
+        engram_token_mask=torch.ones(6, dtype=torch.bool),
+        image_mask=None,
+    )
+    monkeypatch.setattr(v41, "try_mhc_shifted_post_pre_norm", lambda *args: None)
+    expected, expected_taps = model(*args, **kwargs)
+    attention_weights = {
+        layer.hc_attn_fn.data_ptr(): layer.layer_id for layer in model.layers
+    }
+    calls = []
+
+    def shifted(
+        x,
+        residual,
+        pre,
+        post,
+        comb,
+        weight,
+        scale,
+        base,
+        rms_eps,
+        hc_eps,
+        iters,
+        norm_weight,
+        norm_eps,
+    ):
+        # Isolate cross-layer fusion from the already-covered FFN boundary.
+        if weight.data_ptr() not in attention_weights:
+            return None
+        calls.append((attention_weights[weight.data_ptr()], x.shape[0]))
+        residual = v41.v41_hc_post(x, residual, post, comb)
+        norm = SimpleNamespace(weight=norm_weight, variance_epsilon=norm_eps)
+        y = v41._v41_hc_input(residual, pre, norm)
+        mixes = _mix_reference(residual, weight, scale, base, rms_eps, hc_eps, iters)
+        return residual, y, *mixes
+
+    monkeypatch.setattr(v41, "try_mhc_shifted_post_pre_norm", shifted)
+    mixes = Mock(wraps=v41.v41_hc_mixes)
+    monkeypatch.setattr(v41, "v41_hc_mixes", mixes)
+    encoded = model.encoder_forward(*args, **kwargs)
+    narrowed = model.narrowing_forward(encoded, ctx)
+    # The fixed graph input remains compatible; no optional coefficient cache
+    # leaks through an encoder/narrowing/decoder handoff.
+    statics = model.allocate_decoder_state(narrowed.rows + 3)
+    narrowed.land_into(statics)
+    assert not statics.hidden[narrowed.rows :].any()
+    actual, taps = model.finish_forward(*model.decoder_forward(narrowed, ctx), ctx)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for got, ref in zip(taps, expected_taps, strict=True):
+        torch.testing.assert_close(got, ref, rtol=0, atol=0)
+    expected_layers = set(range(1, 40)) - {1, 14, 20, 21}
+    assert [layer for layer, _ in calls] == sorted(expected_layers)
+    assert all(rows == (2 if narrow and layer > 20 else 6) for layer, rows in calls)
+    regular_layers = [
+        attention_weights[call.args[1].data_ptr()]
+        for call in mixes.call_args_list
+        if call.args[1].data_ptr() in attention_weights
+    ]
+    assert regular_layers == [0, 1, 14, 20, 21]
+
+
 @pytest.mark.parametrize("layer_id", [0, 2, 3, 20, 24])
 def test_attention_owner_cast_index_and_grouped_output(layer_id):
     torch.manual_seed(100 + layer_id)
@@ -575,7 +1200,7 @@ def test_attention_owner_cast_index_and_grouped_output(layer_id):
     backend = _Backend(positions, requests)
     ctx = _ctx(backend, 6, ForwardMode.EXTEND)
     x = torch.randn(6, 128, dtype=torch.bfloat16)
-    actual = attn(positions, x, ctx)
+    actual = attn(positions, x, ctx, reduce_results=True)
     qr = _norm(
         F.linear(x, attn.wq_a_wkv.weight[: config.q_lora_rank]),
         attn.q_norm.weight,
@@ -692,7 +1317,9 @@ def test_full_40_layer_backbone_engram_and_final_mix(monkeypatch):
     assert [call[0] for call in backend.calls] == list(range(40))
     assert sorted(backend.global_writes) == [2, 8, 14, 20]
     assert all(torch.isfinite(actual).flatten())
-    h, last_pre = captured[0]
+    h, last_pre, pending, tap = captured[0]
+    assert tap is None and pending.reduce_group is None
+    h = pending.finish(h)
     torch.testing.assert_close(
         actual, _norm(v41_hc_pre(h, last_pre), model.norm.weight, 1e-20), rtol=0, atol=0
     )
@@ -908,8 +1535,10 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
     # row-local compute in between covers every row. Emulate the handoff
     # here, where no CUDA graph can run.
     def landed(original):
-        def forward(self, positions, hidden_states, ctx):
-            out = original(self, positions, hidden_states, ctx)
+        def forward(self, positions, hidden_states, ctx, *, reduce_results):
+            out = original(
+                self, positions, hidden_states, ctx, reduce_results=reduce_results
+            )
             pad = hidden_states.shape[0] - out.shape[0]
             return (
                 torch.cat((out, out.new_zeros((pad, *out.shape[1:])))) if pad else out
@@ -1600,11 +2229,19 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
         pos = torch.arange(4, device=device)
         backend = _Backend(pos, torch.zeros_like(pos))
         x = torch.randn(4, 128, dtype=torch.bfloat16, device=device)
-        out = sharded(pos, x, _ctx(backend, 4, ForwardMode.EXTEND))
+        out = sharded(
+            pos,
+            x,
+            _ctx(backend, 4, ForwardMode.EXTEND),
+            reduce_results=True,
+        )
         assert backend.calls[-1][-1] is None
         assert sharded.indexer.n_local_heads == config.index_n_heads
         expected = full(
-            pos, x, _ctx(_Backend(pos, torch.zeros_like(pos)), 4, ForwardMode.EXTEND)
+            pos,
+            x,
+            _ctx(_Backend(pos, torch.zeros_like(pos)), 4, ForwardMode.EXTEND),
+            reduce_results=True,
         )
         torch.testing.assert_close(out, expected, rtol=0.02, atol=0.003)
         # Exercise the real packed-weight MegaMoE lifecycle, not the CPU loader
@@ -1708,10 +2345,12 @@ def _mock_loader_hardware(monkeypatch):
 def _loader_model(monkeypatch, config, rank, device):
     _mock_loader_hardware(monkeypatch)
     wrapper = SimpleNamespace(text_config=config)
+    mapping = _mapping(rank, 4, 4)
+    monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
     with torch.device(device):
         return DeepseekV41ForCausalLM(
             wrapper,
-            _mapping(rank, 4, 4),
+            mapping,
             _quant(),
             is_multimodal_active=False,
             mm_attention_backend=None,

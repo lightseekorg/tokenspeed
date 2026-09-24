@@ -1329,5 +1329,71 @@ class PrefillRoleGraphsTest(unittest.TestCase):
         self.assertTrue(self._prefill_owner(config).disable)
 
 
+class PrefillWarmupStreamTest(unittest.TestCase):
+    def test_all_capture_stages_warm_the_execution_stream(self):
+        import torch
+
+        from tokenspeed.runtime.execution.breakable_cuda_graph import BreakableCapture
+        from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+
+        if not torch.cuda.is_available():
+            self.skipTest("requires CUDA")
+        entry_stream = torch.cuda.current_stream()
+        default_stream = None
+        for stage in ("bucket", "encoder", "decoder"):
+            for shared_stream in (False, True):
+                with self.subTest(stage=stage, shared_stream=shared_stream):
+                    stream = torch.cuda.Stream() if shared_stream else None
+                    wrapper = SimpleNamespace(stream=stream) if shared_stream else None
+                    warmed = set()
+                    x = torch.zeros(17, 32, device="cuda")
+                    fresh = torch.ones_like(x)
+                    owner = PrefillGraph.__new__(PrefillGraph)
+                    owner.num_warmup = 2
+                    owner._pool = None
+                    owner._ctx = None
+
+                    def forward():
+                        current = torch.cuda.current_stream()
+                        if torch.cuda.is_current_stream_capturing():
+                            self.assertIn(current, warmed)
+                            self.assertEqual(BreakableCapture.current().stream, current)
+                        else:
+                            self.assertIsNone(BreakableCapture.current())
+                            warmed.add(current)
+                        return x * 2
+
+                    if stage == "bucket":
+                        owner._run_inner = lambda bucket: (forward(), None)
+                        cap, result = owner._capture_bucket(17, wrapper)
+                        output = result.hidden_states
+                    elif stage == "encoder":
+                        owner._run_encoder = lambda bucket: forward()
+                        result = owner._capture_encoder(17, wrapper)
+                        cap, output = result.capture, result.state
+                    else:
+                        owner._narrowing = SimpleNamespace(
+                            decoder_forward=lambda statics, ctx: (forward(), None)
+                        )
+                        result = owner._capture_decoder(
+                            x, lambda: x.copy_(fresh), wrapper
+                        )
+                        cap, output = result.capture, result.output.hidden_states
+                    self.assertEqual(warmed, {cap.stream})
+                    self.assertEqual(torch.cuda.current_stream(), entry_stream)
+                    if shared_stream:
+                        self.assertIs(cap.stream, stream)
+                    elif default_stream is None:
+                        default_stream = cap.stream
+                    else:
+                        self.assertIs(cap.stream, default_stream)
+                    for value in (3, 7):
+                        x.fill_(value)
+                        cap.replay()
+                        torch.testing.assert_close(
+                            output, torch.full_like(x, value * 2)
+                        )
+
+
 if __name__ == "__main__":
     unittest.main()

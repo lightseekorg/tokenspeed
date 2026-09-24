@@ -45,8 +45,8 @@ def _world_size() -> int:
 
 
 pytestmark = pytest.mark.skipif(
-    _world_size() not in {2, 4, 8},
-    reason="launch with torchrun world size 2, 4 or 8",
+    _world_size() not in {2, 4, 8, 16},
+    reason="launch with torchrun world size 2, 4, 8 or 16",
 )
 
 
@@ -617,3 +617,141 @@ def _rsag_body(comm, sub, grank, dev):
     # Refusals must not mutate the armed workspace.
     assert manager.initialized and manager.use_fp32_lamport is True
     assert manager.workspace_tensor is ws_before
+
+
+@pytest.mark.parametrize("entrypoint", ["native", "ops"])
+@pytest.mark.parametrize("pdl", [False, True])
+def test_mhc_post_norm_shared_workspace_graph(monkeypatch, entrypoint, pdl):
+    from tokenspeed_kernel import platform
+    from tokenspeed_kernel.ops.communication import trtllm as comm
+    from tokenspeed_kernel.ops.residual.triton import (
+        mhc_pre_layer_norm_hc4,
+        triton_mhc_post,
+    )
+    from tokenspeed_kernel.thirdparty.cuda.trtllm import (
+        MNNVL_TWOSHOT_MAX_TOKEN,
+        _load_trtllm_mhc_module,
+        trtllm_allreduce_fusion,
+        trtllm_create_mnnvl_workspace_for_all_reduce_fusion,
+    )
+
+    workspace = _skip_unless_mnnvl()
+    rank, device = workspace["rank"], workspace["dev"]
+    world = workspace["world"]
+    ws = trtllm_create_mnnvl_workspace_for_all_reduce_fusion(
+        rank, world, MNNVL_TWOSHOT_MAX_TOKEN, 5120, group=dist.group.WORLD
+    )
+    # Exercise the public capability check and launch with the same workspace
+    # as ordinary AR, without changing managers captured by other tests.
+    manager = comm.TrtllmFusionWorkspaceManager()
+    manager.initialized = True
+    manager.rank = rank
+    manager.world_size = world
+    manager.use_fp32_lamport = False
+    manager.mnnvl_workspace = ws
+    monkeypatch.setattr(comm, "_manager_for_group", lambda group: manager)
+    monkeypatch.setattr(platform, "pdl_enabled", lambda: pdl)
+    for tokens in (
+        0,
+        MNNVL_TWOSHOT_MAX_TOKEN + 1,
+        1,
+        8,
+        16,
+        17,
+        ws.oneshot_token_cap,
+        ws.oneshot_token_cap + 1,
+        24,
+        32,
+        96,
+        192,
+        MNNVL_TWOSHOT_MAX_TOKEN,
+        1,
+    ):
+        torch.manual_seed(123 + rank)
+        x = torch.randn(tokens, 5120, dtype=torch.bfloat16, device=device)
+        residual = torch.randn(tokens, 4, 5120, dtype=x.dtype, device=device)
+        post, pre = [torch.rand(tokens, 4, device=device) for _ in range(2)]
+        comb = torch.randn(tokens, 4, 4, device=device).softmax(-1)
+        weight = torch.randn(5120, dtype=x.dtype, device=device)
+        updated, normalized = torch.empty_like(residual), torch.empty_like(x)
+        use_oneshot = ws.resolve_use_oneshot(tokens, None, 5120)
+
+        def native(capacity_bytes):
+            _load_trtllm_mhc_module().trtllm_mnnvl_mhc(
+                x,
+                residual,
+                post,
+                comb,
+                pre,
+                weight,
+                updated,
+                normalized,
+                EPS,
+                rank,
+                ws.multicast_ptr,
+                ws.local_ptr,
+                ws.peer_ptrs,
+                ws.buffer_flags,
+                capacity_bytes,
+                use_oneshot,
+                pdl,
+            )
+            return updated, normalized
+
+        if not 0 < tokens <= MNNVL_TWOSHOT_MAX_TOKEN:
+            with pytest.raises(RuntimeError, match="tokens"):
+                native(ws.buffer_size_bytes)
+            assert not comm.supports_allreduce_mhc_post_norm(
+                x, weight, dist.group.WORLD
+            )
+            continue
+
+        # All ranks pass real workspace pointers; an undersized capacity must
+        # be rejected before launching or advancing the shared rotation state.
+        lane_tokens = tokens * world if use_oneshot else 2 * -(-tokens // world) * world
+        with pytest.raises(RuntimeError, match="capacity_bytes"):
+            native(lane_tokens * 5120 * x.element_size() - 1)
+
+        if entrypoint == "ops":
+            assert comm.supports_allreduce_mhc_post_norm(x, weight, dist.group.WORLD)
+
+        def fused():
+            if entrypoint == "native":
+                return native(ws.buffer_size_bytes)
+            return comm.allreduce_mhc_post_norm(
+                x, residual, post, comb, pre, weight, EPS, dist.group.WORLD
+            )
+
+        fused()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            result = fused()
+        if entrypoint == "ops":
+            assert manager.graph_consumed
+        for _ in range(3):
+            x.normal_().add_(rank)
+            reduced = torch.empty_like(x)
+            trtllm_allreduce_fusion(
+                x,
+                world,
+                rank,
+                tokens,
+                5120,
+                ws,
+                trigger_completion_at_end=True,
+                fp32_acc=False,
+                pattern_code=0,
+                allreduce_out=reduced,
+                launch_with_pdl=pdl,
+                use_oneshot=use_oneshot,
+            )
+            expected_residual = triton_mhc_post(reduced, residual, post, comb)
+            expected_norm = torch.empty_like(x)
+            mhc_pre_layer_norm_hc4(
+                pre, expected_residual, weight, expected_norm, eps=EPS
+            )
+            graph.replay()
+            torch.testing.assert_close(
+                result[0], expected_residual, rtol=0.008, atol=1e-5
+            )
+            torch.testing.assert_close(result[1], expected_norm, rtol=0.008, atol=0.001)

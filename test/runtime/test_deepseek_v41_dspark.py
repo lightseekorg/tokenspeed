@@ -102,12 +102,31 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
             self.layer_id = layer_id
             self.engram = Engram(layer_id) if layer_id >= 37 else None
 
-        def forward(self, hidden, pre_mix, positions, image_mask, ctx):
+        def forward(
+            self,
+            hidden,
+            pre_mix,
+            positions,
+            image_mask,
+            ctx,
+            *,
+            pending_post,
+            allow_ffn_reduce_fusion,
+            capture_input,
+        ):
             events.append(("layer", self.layer_id))
+            assert allow_ffn_reduce_fusion == (
+                self.layer_id not in (19, 20) and self.layer_id < 36
+            )
             rows = v41._row_plan(self.layer_id, 20, ctx)
             assert rows.keep_rows is None and rows.source is rows.query
             # Distinct HC streams and a non-mean final mix catch weighted/output taps.
-            return embeddings[:, None, :] + streams + 10 * self.layer_id, pre_mix
+            return (
+                embeddings[:, None, :] + streams + 10 * self.layer_id,
+                pre_mix,
+                SimpleNamespace(finish=lambda residual: residual),
+                hidden.mean(dim=1) if capture_input else None,
+            )
 
     target = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
     nn.Module.__init__(target)
