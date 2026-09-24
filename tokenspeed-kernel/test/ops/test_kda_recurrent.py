@@ -476,7 +476,9 @@ def test_kda_fused_verify_selects_all_layout_traits(
 
     def fake_select_kernel(*args, **kwargs):
         selected.update(kwargs["traits"])
-        return lambda **kernel_kwargs: kernel_kwargs["mixed_qkv"]
+        return SelectedKernel(
+            "fake_verify", lambda **kernel_kwargs: kernel_kwargs["mixed_qkv"]
+        )
 
     monkeypatch.setattr(attention_ops, "select_kernel", fake_select_kernel)
     tensor = torch.empty(1, dtype=torch.bfloat16)
@@ -490,6 +492,7 @@ def test_kda_fused_verify_selects_all_layout_traits(
         tensor,
         tensor,
         tensor,
+        replay_payload=None,
         state_pool=tensor,
         state_scratch=tensor,
         read_indices=tensor,
@@ -504,6 +507,8 @@ def test_kda_fused_verify_selects_all_layout_traits(
     expected = {
         "paged_state": True,
         "store_states": store_states,
+        "draft_token_num": 1,
+        "state_dtype": tensor.dtype,
         "recurrent_layout": recurrent_layout,
         "num_heads": 1,
         "head_dim": 1,
@@ -519,7 +524,9 @@ def test_kda_fused_verify_selects_split_producer_kernel_when_inputs_are_given(
 
     def fake_select_kernel(*_args, **kwargs):
         selected.update(kwargs["traits"])
-        return lambda **kernel_kwargs: kernel_kwargs["mixed_qkv"]
+        return SelectedKernel(
+            "fake_verify", lambda **kernel_kwargs: kernel_kwargs["mixed_qkv"]
+        )
 
     monkeypatch.setattr(attention_ops, "select_kernel", fake_select_kernel)
     tensor = torch.empty(1, dtype=torch.bfloat16)
@@ -533,6 +540,7 @@ def test_kda_fused_verify_selects_split_producer_kernel_when_inputs_are_given(
         tensor,
         tensor,
         tensor,
+        replay_payload=None,
         state_pool=tensor,
         state_scratch=tensor,
         read_indices=tensor,
@@ -610,6 +618,7 @@ def test_no_store_verify_resolves_by_priority_not_by_the_caller(
                 "paged_state": True,
                 "store_states": False,
                 "recurrent_layout": "v_major",
+                "state_dtype": torch.float32,
             },
         )
         assert kernel.name == expected
@@ -752,6 +761,7 @@ def test_batched_replay_call_contract() -> None:
         f_a_stride=1,
         beta_stride=1,
         state_stride=1,
+        state_dtype=torch.float32,
         gate_stride=1,
         conv_width=4,
         lower_bound=-5.0,
@@ -1545,3 +1555,188 @@ def test_kda_megafuse_fused_norm_is_cuda_graph_safe() -> None:
     torch.cuda.synchronize()
 
     torch.testing.assert_close(captured.float(), eager.float(), atol=0.5, rtol=2e-2)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("provide", [False, True])
+def test_verify_payload_capture_dispatch(monkeypatch, fused, provide):
+    """Replay-input capability is independent of device and vendor selection."""
+    from tokenspeed_kernel.ops.attention.kda._triton import capture_payload
+
+    raw, fa, beta = (torch.arange(6 * width).reshape(6, width) for width in (3, 2, 1))
+    payload = (
+        tuple(torch.empty_like(source) for source in (raw, fa, beta))
+        if provide
+        else None
+    )
+    seen = {}
+
+    def run(**kwargs):
+        seen.update(kwargs)
+        return raw
+
+    selected = SelectedKernel("fake_verify", run)
+    monkeypatch.setattr(attention_ops, "select_kernel", lambda *a, **k: selected)
+    registry = SimpleNamespace(
+        get_by_name=lambda name: SimpleNamespace(
+            traits={"fused_replay_payload": frozenset({True})} if fused else {}
+        )
+    )
+    monkeypatch.setattr(KernelRegistry, "get", staticmethod(lambda: registry))
+    captures = []
+
+    def capture(sources, destinations, rows):
+        captures.append(rows)
+        for src, dst in zip(sources, destinations):
+            dst.copy_(src)
+
+    monkeypatch.setattr(capture_payload, "capture_replay_payload", capture)
+    state, indices = torch.empty(3, 1, 1, 1), torch.zeros(2, dtype=torch.int32)
+    result = try_kda_fused_paged_verify(
+        raw,
+        raw,
+        raw,
+        raw,
+        fa,
+        raw,
+        beta,
+        raw,
+        raw,
+        state_pool=state,
+        state_scratch=state,
+        replay_payload=payload,
+        read_indices=indices,
+        write_indices=indices,
+        num_heads=1,
+        head_dim=1,
+        draft_token_num=3,
+        store_states=False,
+        recurrent_layout="v_major",
+    )
+    assert result is raw
+    assert ("replay_payload" in seen) == fused
+    assert captures == ([6] if provide and not fused else [])
+    if fused:
+        assert seen["replay_payload"] is payload
+    elif provide:
+        for source, dest in zip((raw, fa, beta), payload):
+            assert torch.equal(source, dest)
+
+
+@pytest.mark.parametrize("platform_fixture", ["b200_platform", "b300_platform"])
+@pytest.mark.parametrize("fi_available", [False, True])
+def test_kda_state_dtype_selects_compatible_backend(
+    monkeypatch, request, platform_fixture, fi_available
+) -> None:
+    """FP32 keeps native; BF16 opts into available, shape-compatible FI kernels."""
+    import runpy
+
+    from tokenspeed_kernel.ops.attention.kda import flashinfer as registration
+    from tokenspeed_kernel.thirdparty.flashinfer import kda as adapter
+
+    original = KernelRegistry.get()
+    isolated = KernelRegistry()
+    modes = ("kda_fused_paged_decode", "kda_fused_paged_verify")
+    for mode in modes:
+        for spec in original.list_kernels("attention", mode):
+            if spec.solution != "flashinfer":
+                isolated.register(spec, original.get_impl(spec.name))
+        monkeypatch.delenv(
+            f"TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_{mode.upper()}", raising=False
+        )
+    monkeypatch.setattr(KernelRegistry, "_instance", isolated)
+    monkeypatch.setattr(
+        adapter, "flashinfer_kda_recurrent_available", lambda: fi_available
+    )
+    runpy.run_path(registration.__file__)
+    platform = request.getfixturevalue(platform_fixture)
+    real_platform = Platform.get()
+    try:
+        Platform.override(platform)
+        activation = torch.empty(0, dtype=torch.bfloat16, device="meta")
+        signature = _attention_format_signature(
+            q=activation, k=activation, v=activation
+        )
+        # Revisit FP32 after BF16 to catch dtype being omitted from cache keys.
+        for state_dtype in (torch.float32, torch.bfloat16, torch.float32):
+            # Revisit a supported window after native fallback to exercise the
+            # selection cache as well as the initial producer capability probe.
+            for mode, draft_token_num in [
+                (modes[0], 1),
+                *((modes[1], tokens) for tokens in (1, 4, 8, 16, 17, 32, 8)),
+            ]:
+                verify = mode.endswith("verify")
+                native = (
+                    "triton_nvidia_kda_fused_paged_verify_split"
+                    if verify
+                    else "triton_nvidia_kda_fused_paged_decode"
+                )
+                traits = dict(
+                    paged_state=True,
+                    state_dtype=state_dtype,
+                    num_heads=12,
+                    head_dim=128,
+                    recurrent_layout="v_major",
+                )
+                traits.update(
+                    dict(store_states=False, draft_token_num=draft_token_num)
+                    if verify
+                    else dict(fused_output_norm=True, conv_kernel_size=4)
+                )
+                selected = select_kernel("attention", mode, signature, traits=traits)
+                expected = (
+                    f"flashinfer_kda_recurrent_producer_{'verify' if verify else 'decode'}"
+                    if fi_available
+                    and state_dtype == torch.bfloat16
+                    and draft_token_num <= 16
+                    else native
+                )
+                assert selected.name == expected
+                assert (
+                    select_kernel(
+                        "attention", mode, signature, traits=traits, solution="triton"
+                    ).name
+                    == native
+                )
+                # Unsupported head geometry must still select native BF16.
+                assert (
+                    select_kernel(
+                        "attention", mode, signature, traits={**traits, "num_heads": 4}
+                    ).name
+                    == native
+                )
+                if verify:
+                    assert attention_ops.kda_fused_paged_verify_uses_split_producers(
+                        torch.bfloat16,
+                        state_dtype=state_dtype,
+                        store_states=False,
+                        draft_token_num=draft_token_num,
+                        recurrent_layout="v_major",
+                        num_heads=12,
+                        head_dim=128,
+                    ) == (expected == native)
+                    tape = select_kernel(
+                        "attention",
+                        mode,
+                        signature,
+                        traits={**traits, "store_states": True},
+                    )
+                    assert tape.name == "triton_nvidia_kda_fused_paged_verify"
+                    precomputed = select_kernel(
+                        "attention",
+                        mode,
+                        signature,
+                        traits={**traits, "split_producers": True},
+                    )
+                    assert precomputed.name == native
+                else:
+                    unfused = select_kernel(
+                        "attention",
+                        mode,
+                        signature,
+                        traits={**traits, "fused_output_norm": False},
+                    )
+                    assert unfused.name == expected
+    finally:
+        Platform.override(real_platform)
+        isolated.clear_cache()

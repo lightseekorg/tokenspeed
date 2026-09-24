@@ -72,6 +72,8 @@ from tokenspeed_kernel.ops.activation.triton import (
 from tokenspeed_kernel.ops.attention.mla import mla_normalize_project_query
 from tokenspeed_kernel.ops.communication.flashinfer import get_flashinfer_moe_alltoall
 from tokenspeed_kernel.ops.gemm import (
+    fp8_linear_gated_rmsnorm,
+    fp8_linear_gated_rmsnorm_supported,
     kimi3_mla_qkv_gate_projection,
     kimi3_qkvfab_projection,
     kimi3_router_projection,
@@ -1316,7 +1318,23 @@ class KimiLinearKDA(nn.Module):
         # plain GEMV on the prefill path.
         # Fused [3*proj, k] conv kernel bank, built once in post_load_weights.
         conv_weights = self.conv_weights
-        fuse_decode_output_norm = ctx.forward_mode.is_decode() and num_tokens == ctx.bs
+        # DECODE covers both T=1 and target verify. Eligibility comes from
+        # the 128-wide head and prepared scale ABI, not a row-count cutoff.
+        output_plan = None
+        if (
+            ctx.forward_mode.is_decode()
+            and hd == 128
+            and h.dtype == torch.bfloat16
+            and envs.TOKENSPEED_MAMBA_SSM_DTYPE.get() == "bfloat16"
+        ):
+            candidate_plan = self.o_proj.quant_method.prepared_linear_plan(self.o_proj)
+            if fp8_linear_gated_rmsnorm_supported(candidate_plan):
+                output_plan = candidate_plan
+        fuse_decode_output_norm = (
+            ctx.forward_mode.is_decode()
+            and num_tokens == ctx.bs
+            and output_plan is None
+        )
 
         core_out = ctx.attn_backend.forward(
             q=None,
@@ -1349,6 +1367,18 @@ class KimiLinearKDA(nn.Module):
         )
 
         core_out = core_out.reshape(num_tokens, hn * hd)
+        if output_plan is not None:
+            return fp8_linear_gated_rmsnorm(
+                output_plan,
+                core_out.contiguous(),
+                out_gate,
+                self.o_norm.weight,
+                self.o_proj.weight,
+                eps=self.o_norm.variance_epsilon,
+                num_heads=hn,
+                head_dim=hd,
+                out_dtype=h.dtype,
+            )
         if not fuse_decode_output_norm:
             # Decode kernels may fuse this epilogue; prefill retains the shared
             # per-head norm implementation.

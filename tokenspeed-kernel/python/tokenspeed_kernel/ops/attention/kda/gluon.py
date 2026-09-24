@@ -315,11 +315,14 @@ if current_platform().is_amd:
         f_a_stride: int,
         beta_stride: int,
         state_stride: int,
+        state_dtype: torch.dtype,
         gate_stride: int,
         conv_width: int,
         lower_bound: float,
     ) -> None:
         """Replay all gfx950 layers from persistent BF16 raw-g descriptors."""
+        if state_dtype != torch.float32:
+            raise ValueError("Gluon KDA replay requires FP32 persistent state")
         _kda_fused_replay_impl(
             descriptors,
             group_indices,
@@ -543,11 +546,14 @@ if current_platform().is_amd:
         f_a_stride: int,
         beta_stride: int,
         state_stride: int,
+        state_dtype: torch.dtype,
         gate_stride: int,
         conv_width: int,
         lower_bound: float,
     ) -> None:
         """Replay all gfx1250 layers from persistent BF16 raw-g descriptors."""
+        if state_dtype != torch.float32:
+            raise ValueError("Gluon KDA replay requires FP32 persistent state")
         _kda_fused_replay_gfx1250_impl(
             descriptors,
             group_indices,

@@ -78,7 +78,7 @@ def _assert_matches_portable(
     kwargs = dict(cu_seqlens=cu_seqlens, lower_bound=LOWER_BOUND, beta_is_logit=True)
     expected_out, expected_state = kda_chunk_prefill(
         *inputs,
-        initial_state=None if initial_state is None else initial_state.clone(),
+        initial_state=None if initial_state is None else initial_state.float().clone(),
         **kwargs,
     )
     actual_out, actual_state = flash_kda_chunk_prefill(
@@ -87,6 +87,7 @@ def _assert_matches_portable(
         **kwargs,
     )
     torch.cuda.synchronize()
+    assert actual_state.dtype == torch.float32
     out_err = (actual_out.float() - expected_out.float()).abs().max().item()
     state_err = (actual_state.float() - expected_state.float()).abs().max().item()
     assert out_err <= out_max_error, f"output max error {out_err}"
@@ -113,12 +114,15 @@ def test_flash_kda_fresh_state_matches_portable() -> None:
 
 
 @requires_flash_kda
-def test_flash_kda_varlen_batch_matches_portable() -> None:
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_flash_kda_varlen_batch_matches_portable(state_dtype: torch.dtype) -> None:
     """Packed varlen sequences with mixed unaligned lengths and states."""
     boundaries = [0, 130, 130 + 517, 130 + 517 + 64]
     tokens = boundaries[-1]
     inputs = _make_inputs(tokens)
-    initial_state = torch.randn(3, HEADS, DIM, DIM, device="cuda") * 0.05
+    initial_state = (torch.randn(3, HEADS, DIM, DIM, device="cuda") * 0.05).to(
+        state_dtype
+    )
     initial_state[1].zero_()  # one fresh sequence in the batch
     cu_seqlens = torch.tensor(boundaries, device="cuda", dtype=torch.int32)
     _assert_matches_portable(inputs, initial_state, cu_seqlens)

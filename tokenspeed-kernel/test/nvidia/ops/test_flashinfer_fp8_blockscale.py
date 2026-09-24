@@ -5,6 +5,11 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel import fp8_linear, mm, prepare_fp8_linear
+from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
+from tokenspeed_kernel.ops.gemm import (
+    fp8_linear_gated_rmsnorm,
+    fp8_linear_gated_rmsnorm_supported,
+)
 from tokenspeed_kernel.ops.gemm.flashinfer import (
     gemm_fp8_nt_groupwise,
     has_flashinfer_fp8_blockscale,
@@ -13,6 +18,9 @@ from tokenspeed_kernel.ops.gemm.flashinfer import (
 )
 from tokenspeed_kernel.ops.gemm.fp8_utils import (
     flashinfer_fp8_blockscale_quantize_prepacked,
+)
+from tokenspeed_kernel.thirdparty.flashinfer.kda._epilogue import (
+    gated_rmsnorm_fp8_prepacked,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -244,3 +252,86 @@ def test_prepared_plan_is_exact_for_partial_row_tiles(device: str, m: int) -> No
 
     error = (got.float() - reference).abs().max()
     assert error < 0.01 * reference.abs().max()
+
+
+@pytest.mark.parametrize(
+    "batch,heads,zero",
+    [(1, 12, False), (65, 4, False), (128, 24, True), (513, 12, False)],
+)
+def test_norm_quant_preserves_values_scales_and_padding(batch, zero, heads):
+    torch.manual_seed(4709 + batch)
+    dim = 128
+    x = torch.randn(batch, heads * dim, device="cuda", dtype=torch.bfloat16)
+    if zero:
+        x.zero_()
+    packed = torch.randn(batch, 4 * heads * dim, device="cuda", dtype=x.dtype)
+    gate = packed[:, 2 * heads * dim : 3 * heads * dim]
+    weight = torch.ones(dim, device="cuda", dtype=x.dtype)
+    expected = rmsnorm_gated_sigmoid(x, gate, weight, 1e-5, heads, dim, enable_pdl=True)
+    ref_q, ref_s = flashinfer_fp8_blockscale_quantize_prepacked(expected)
+    q, scale = gated_rmsnorm_fp8_prepacked(
+        x, gate, weight, eps=1e-5, num_heads=heads, head_dim=dim, enable_pdl=True
+    )
+    if zero:
+        torch.testing.assert_close(
+            q.float(), torch.zeros_like(q.float()), atol=0, rtol=0
+        )
+        torch.testing.assert_close(scale, torch.ones_like(scale), atol=0, rtol=0)
+    else:
+        # Rare FP32 reduction ties may round to a neighboring BF16 value.
+        # Bound the resulting FP8 representation error without hiding padding.
+        actual = q.float().view(-1, heads, dim) * scale.t().unsqueeze(-1)
+        reference = ref_q.float().view(-1, heads, dim) * ref_s.t().unsqueeze(-1)
+        relative_error = (actual - reference).norm() / reference.norm()
+        assert relative_error < 0.005
+    torch.testing.assert_close(
+        q[batch:].float(), torch.zeros_like(q[batch:].float()), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        scale[:, batch:], torch.ones_like(scale[:, batch:]), atol=0, rtol=0
+    )
+
+
+@pytest.mark.parametrize("batch,heads", [(5, 12), (513, 4)])
+def test_projection_graph_reads_updated_input_and_retains_shape(batch, heads):
+    torch.manual_seed(4709)
+    dim, output_width = 128, 1024
+    x = torch.randn(batch, heads * dim, device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn_like(x)
+    norm = torch.ones(dim, device="cuda", dtype=x.dtype)
+    weight = (
+        torch.randn(output_width, heads * dim, device="cuda", dtype=x.dtype) * 0.02
+    ).to(torch.float8_e4m3fn)
+    scales = torch.ones(output_width // 128, heads, device="cuda")
+    plan = prepare_fp8_linear(weight, scales, (128, 128), scale_format=None)
+    assert fp8_linear_gated_rmsnorm_supported(plan)
+    assert not fp8_linear_gated_rmsnorm_supported(None)
+
+    def run():
+        return fp8_linear_gated_rmsnorm(
+            plan,
+            x,
+            gate,
+            norm,
+            weight,
+            eps=1e-5,
+            num_heads=heads,
+            head_dim=dim,
+            out_dtype=torch.bfloat16,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = run()
+    for _ in range(3):
+        x.normal_()
+        gate.normal_()
+        graph.replay()
+        normalized = rmsnorm_gated_sigmoid(
+            x, gate, norm, 1e-5, heads, dim, enable_pdl=True
+        )
+        reference = fp8_linear(plan, normalized, weight, scales, out_dtype=x.dtype)
+        assert output.shape == (batch, output_width)
+        error = (output.float() - reference.float()).norm() / reference.float().norm()
+        assert error < 0.005

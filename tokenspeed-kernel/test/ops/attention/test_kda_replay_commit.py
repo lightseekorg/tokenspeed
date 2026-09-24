@@ -136,6 +136,7 @@ def _batched_static_args(x):
         f_a_stride=x["f_a"].stride(0),
         beta_stride=x["beta"].stride(0),
         state_stride=x["h_pool"].stride(0),
+        state_dtype=x["h_pool"].dtype,
         gate_stride=x["gate_scratch"].stride(0),
         conv_width=x["conv_w"].shape[1],
         lower_bound=LOWER_BOUND,
@@ -157,10 +158,12 @@ def test_gate_tiling_counts_every_layer_in_the_grid():
         assert _gate_tiling(narrow, HV, K, dev, layers=10**6)[0] <= narrow
 
 
-@pytest.mark.parametrize("block", [64, 128, 256, 512, 2048])
-def test_batched_conv_window_is_independent_of_its_column_block(block):
+@pytest.mark.parametrize(
+    "block,t", [(64, 4), (128, 4), (256, 4), (512, 4), (2048, 4), (128, 8), (128, 16)]
+)
+def test_batched_conv_window_is_independent_of_its_column_block(block, t):
     """Splitting the window publish across columns must not move a byte."""
-    layers, n, t = 3, 4, 4
+    layers, n = 3, 4
     source = [_window(n, t, seed=700 + layer) for layer in range(layers)]
     reads = torch.stack([source[0]["read_indices"]] * layers).to(torch.int32)
     writes = torch.stack(
@@ -192,14 +195,29 @@ def test_batched_conv_window_is_independent_of_its_column_block(block):
         )
         return [x["conv_pool"] for x in xs]
 
-    for narrow, wide in zip(publish(block), publish(4096), strict=True):
+    for layer, (narrow, wide) in enumerate(
+        zip(publish(block), publish(4096), strict=True)
+    ):
+        expected = source[layer]["conv_pool"].clone()
+        raw = source[layer]["qkv_raw"].view(n, t, conv_dim)
+        for row in range(n):
+            old = source[layer]["conv_pool"][reads[layer, row].item()]
+            prefix = raw[row, : accepted[row].item()].T
+            expected[writes[layer, row].item()] = torch.cat((old, prefix), dim=1)[
+                :, -3:
+            ]
         torch.testing.assert_close(narrow, wide, atol=0, rtol=0)
+        torch.testing.assert_close(narrow, expected, atol=0, rtol=0)
 
 
-def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
+@pytest.mark.parametrize("t", [4, 8])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_batched_replay_matches_layer_loop_and_descriptor_sensitive(state_dtype, t):
     """One launch matches the layer loop; a wrong descriptor must be detected."""
-    layers, n, t = 5, 5, 4
+    layers, n = 5, 5
     source = [_window(n, t, seed=100 + layer) for layer in range(layers)]
+    for x in source:
+        x["h_pool"] = x["h_pool"].to(state_dtype)
     loop = []
     writes = torch.stack(
         [
@@ -255,7 +273,13 @@ def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
             actual["conv_pool"], expected["conv_pool"], atol=0, rtol=0
         )
         torch.testing.assert_close(
-            actual["h_pool"], expected["h_pool"], atol=1e-6, rtol=0
+            actual["h_pool"],
+            expected["h_pool"],
+            atol=1e-6,
+            # FP32 reduction differences can straddle a BF16 rounding midpoint.
+            rtol=(
+                torch.finfo(torch.bfloat16).eps if state_dtype == torch.bfloat16 else 0
+            ),
         )
 
     negative = [
@@ -280,6 +304,43 @@ def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
         torch.testing.assert_close(
             negative[2]["h_pool"], loop[2]["h_pool"], atol=0, rtol=0
         )
+
+    def launch():
+        batched_recurrent_kda_replay_commit(
+            descriptors,
+            group_indices,
+            reads,
+            writes,
+            accepted,
+            draft_token_num=t,
+            num_heads=HV,
+            head_dim=K,
+            f_a_dim=D_FA,
+            **_batched_static_args(batched[0]),
+        )
+
+    def reset_pools():
+        for src, dst in zip(source, batched, strict=True):
+            for key in ("h_pool", "conv_pool"):
+                dst[key].copy_(src[key])
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    generator = torch.Generator().manual_seed(809 + t)
+    for _ in range(3):
+        lengths = torch.randint(0, t + 1, (n,), generator=generator)
+        accepted.copy_(lengths.to(device=DEV, dtype=torch.int32))
+        reset_pools()
+        launch()
+        expected = [(x["h_pool"].clone(), x["conv_pool"].clone()) for x in batched]
+        reset_pools()
+        graph.replay()
+        for actual, (state, conv) in zip(batched, expected, strict=True):
+            for got, ref in ((actual["h_pool"], state), (actual["conv_pool"], conv)):
+                assert torch.equal(
+                    got.contiguous().view(torch.uint8), ref.view(torch.uint8)
+                )
 
 
 @pytest.mark.skipif(

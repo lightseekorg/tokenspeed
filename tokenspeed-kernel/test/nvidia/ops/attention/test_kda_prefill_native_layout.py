@@ -67,24 +67,27 @@ def _actual(inputs, state, bounds, cpu, layout):
 
 
 @pytest.mark.parametrize("layout", ["v_major", "k_major"])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 def test_dispatch_native_state_and_shared_boundaries(
-    monkeypatch, layout, b300_platform
+    monkeypatch, layout, state_dtype, b300_platform
 ):
     """Exercise NVIDIA layout dispatch on CPU tensors on any host platform."""
     inputs, native_state, bounds, cpu = _inputs("cpu", [17, 15])
+    native_state = native_state.to(state_dtype)
     state = (
         native_state
         if layout == "v_major"
         else native_state.transpose(-1, -2).contiguous()
     )
     seen = []
-    final = native_state + 1
+    final = native_state.float() + 1
 
     def forward(q, k, v, g, a_log, dt_bias, beta, boundaries, initial, **kwargs):
         assert "out" not in kwargs
         assert boundaries is bounds
-        assert torch.equal(initial, native_state)
-        if layout == "v_major":
+        assert initial.dtype == torch.float32
+        assert torch.equal(initial, native_state.float())
+        if layout == "v_major" and state_dtype == torch.float32:
             assert initial is state
         assert g.dtype == torch.float32 and g.is_contiguous()
         assert beta.is_contiguous()
