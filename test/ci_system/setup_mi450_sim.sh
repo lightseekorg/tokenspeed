@@ -72,10 +72,17 @@ path.write_text(json.dumps(config, indent=2) + "\n")
 PY
 
 rocm_root="$(rocm-sdk path --root)"
+build_stamp="${ROCJITSU_BUILD_DIR}/.tokenspeed-build-id"
+build_id="${ROCM_SYSTEMS_REF}:${ROCM_SDK_VERSION}:${rocm_root}"
 if [ -x "${ROCJITSU_BUILD_DIR}/tools/rocjitsu/rocjitsu" ] \
-    && [ -f "${ROCJITSU_BUILD_DIR}/librocjitsu.so" ]; then
+    && [ -f "${ROCJITSU_BUILD_DIR}/librocjitsu.so" ] \
+    && [ -f "${build_stamp}" ] \
+    && [ "$(cat "${build_stamp}")" = "${build_id}" ]; then
     echo "Reusing cached rocJITsu launcher and runtime"
 else
+    # A previous runner may have built this directory against another ROCm
+    # SDK or source revision. Do not run those binaries with this nightly.
+    rm -rf "${ROCJITSU_BUILD_DIR}"
     ROCM_HOME="${rocm_root}" \
     ROCM_PATH="${rocm_root}" \
     LD_LIBRARY_PATH="${rocm_root}/lib:${LD_LIBRARY_PATH:-}" \
@@ -88,6 +95,7 @@ else
     cmake --build "${ROCJITSU_BUILD_DIR}" \
         --target rocjitsu_bin rocjitsu_shared \
         --parallel 4
+    printf '%s\n' "${build_id}" > "${build_stamp}"
 fi
 
 test -x "${ROCJITSU_BUILD_DIR}/tools/rocjitsu/rocjitsu"
