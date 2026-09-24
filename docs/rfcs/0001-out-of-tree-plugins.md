@@ -296,8 +296,10 @@ No new mechanism. Three clarifications become documentation:
 
 ### Plugin author's view
 
-The whole plugin is one ordinary Python distribution. Only the first two
-subpackages are required; the rest exist only when the model needs them.
+The whole plugin is one ordinary Python distribution. `models/` and the
+neutral layer of `kernels/` are required; every other subpackage exists only
+when the model needs it. The example ships kernels for two vendors, which is
+the case that shapes the `kernels/` layout.
 
 ```
 my-tokenspeed-plugin/
@@ -305,24 +307,43 @@ my-tokenspeed-plugin/
 │   [project.entry-points."tokenspeed_kernel.plugins"]  my_plugin = "my_plugin.kernels:register"
 │   [project.entry-points."tokenspeed.plugins"]         my_plugin = "my_plugin:register"
 │   dependencies = ["tokenspeed==X.Y.Z", "tokenspeed_kernel==A.B.C"]   # exact pins
+│   [project.optional-dependencies]
+│   cuda   = [...]                        # build/runtime deps only NVIDIA needs
+│   ascend = ["torch_npu==...", ...]      # build/runtime deps only Ascend needs
 └── my_plugin/
-    ├── __init__.py   register(): register_model(...) and any other register_* calls
-    ├── kernels/      the model's own kernels, imported directly by modeling/;
-    │                 @register_kernel(..., solution="my_plugin", priority=Priority.PLUGIN)
-    │                 only for kernels meant to replace an in-tree one under an in-tree model
-    ├── models/       FooForCausalLM (+ FooForCausalLMNextN) with a ModelProfile
+    ├── __init__.py   register(): register_model(...) and any other runtime register_* calls
+    ├── models/       FooForCausalLM (+ FooForCausalLMNextN) with a ModelProfile;
+    │                 imports only my_plugin.kernels.<op> facades, never a vendor leaf
+    ├── kernels/
+    │   ├── __init__.py   register(): platform-gated — if current_platform().is_nvidia,
+    │   │                 import _cuda and register with vendors={"nvidia"}; if .is_npu,
+    │   │                 import _ascend and register with vendors={"ascend"}
+    │   ├── foo.py        vendor-neutral facade, the only thing models/ imports:
+    │   │                 select_kernel("my_plugin", "foo", signature, traits=...) then call it
+    │   ├── _cuda/        plain functions, no registry import; CuTe DSL or Triton via
+    │   │                 tokenspeed_kernel._triton
+    │   └── _ascend/      plain functions, no registry import; Triton-Ascend via
+    │                     tokenspeed_kernel._triton, or torch_npu
     ├── attention/    optional: AttentionBackend subclass; usually absent — reuse an
     │                 in-tree backend (flashmla, mla, dsa, ...) by naming it in the profile
     ├── cache/        optional: CacheRecipe + CachePool subclasses, only for a
     │                 non-standard KV layout; otherwise name an existing cache_family
     ├── quant/        optional: QuantizationConfig subclass for a private weight format
-    └── drafter/      optional: BaseDrafter subclass for a private speculative algorithm
+    ├── drafter/      optional: BaseDrafter subclass for a private speculative algorithm
+    └── test/
+        ├── test_foo_reference.py   numeric reference shared by every vendor
+        ├── nvidia/
+        └── ascend/
 ```
 
 ```toml
 [project]
 name = "my-tokenspeed-plugin"
 dependencies = ["tokenspeed==X.Y.Z", "tokenspeed_kernel==A.B.C"]
+
+[project.optional-dependencies]
+cuda = [...]
+ascend = ["torch_npu==..."]
 
 [project.entry-points."tokenspeed_kernel.plugins"]
 my_plugin = "my_plugin.kernels:register"
@@ -339,10 +360,93 @@ from tokenspeed.runtime.plugins.registry import register_model
 def register() -> None:
     if PLUGIN_API_VERSION != 1:
         raise RuntimeError(f"my_plugin targets plugin API 1, host has {PLUGIN_API_VERSION}")
-    from my_plugin.modeling import FooForCausalLM, FooForCausalLMNextN
+    from my_plugin.models import FooForCausalLM, FooForCausalLMNextN
     register_model(FooForCausalLM)
     register_model(FooForCausalLMNextN)
 ```
+
+```python
+# my_plugin/kernels/__init__.py
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, current_platform
+from tokenspeed_kernel.registry import register_kernel
+
+from my_plugin.kernels.foo import FOO_SIGNATURES
+
+# Options the Ascend leaf does not implement; requests carrying them find no
+# candidate at selection instead of having the argument ignored.
+_ASCEND_OPTIONS = {"sliding_window": frozenset({False}), "return_lse": frozenset({False})}
+
+def register() -> None:
+    platform = current_platform()
+    if platform.is_nvidia:
+        # Imported only here: the CUDA leaf does not import on an Ascend host.
+        from my_plugin.kernels._cuda import foo as cuda_foo
+
+        register_kernel(
+            "my_plugin", "foo", name="cute_my_plugin_foo", solution="cute",
+            capability=CapabilityRequirement(
+                vendors=frozenset({"nvidia"}), min_arch_version=ArchVersion(9, 0)
+            ),
+            signatures=FOO_SIGNATURES,
+        )(cuda_foo)
+    if platform.is_npu:
+        from my_plugin.kernels._ascend import foo as ascend_foo
+
+        register_kernel(
+            "my_plugin", "foo", name="torch_npu_my_plugin_foo", solution="torch_npu",
+            capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+            signatures=FOO_SIGNATURES, traits=_ASCEND_OPTIONS,
+        )(ascend_foo)
+```
+
+#### Multi-vendor kernels
+
+The layout above is the in-tree pattern, not a plugin-specific one.
+`tokenspeed_kernel_npu` and `tokenspeed_kernel_amd` are leaves of plain
+functions with no registry dependency (`AGENTS.md` forbids the AMD package
+from depending on `tokenspeed-kernel`); the vendor-neutral `tokenspeed_kernel`
+owns every registration, and does so under a platform gate — see the
+`if current_platform().is_npu:` block in `ops/attention/mha/triton.py`, which
+imports the Ascend MHA functions and registers them with
+`CapabilityRequirement(vendors={"ascend"})` and `solution="torch_npu"`. A
+plugin with more than one vendor follows the same rules:
+
+- **Leaves are plain functions; registration lives in `kernels/__init__.py`.**
+  A leaf can then be unit-tested on its own host, and splitting a leaf into
+  its own distribution later is a `pyproject.toml` change, not a code change.
+- **Vendor imports sit behind the platform gate, never at module top level.**
+  Importing `torch_npu` or a CuTe DSL module on the wrong host fails, and a
+  failing `kernels/__init__.py` would take the model registration down with
+  it.
+- **Both vendors register under the same `(family, mode)` with different
+  `vendors`; the facade calls `select_kernel` and contains no vendor `if`.**
+  `KernelRegistry.get_for_operator` drops every spec whose capability the
+  current platform does not satisfy, so selection is automatic. The family
+  is the plugin's own name unless the kernel is meant to replace an in-tree
+  one, in which case it registers in `Priority.PLUGIN` under the in-tree
+  family.
+- **A vendor leaf declares what it does not support as traits**, in the style
+  of the in-tree `_NPU_OPTIONS` (`{"sliding_window": frozenset({False}),
+  "support_sinks": frozenset({False}), ...}`). A request carrying an
+  unsupported option then finds no candidate and fails at selection, instead
+  of the kernel silently ignoring the argument.
+- **Everything outside `kernels/` stays vendor-neutral.** `models/`,
+  `attention/`, `cache/` import only the facades; `my_plugin.kernels` is the
+  plugin's kernel boundary in the same sense that `tokenspeed_kernel` is the
+  runtime's.
+
+Triton source is not generally portable between CUDA and Ascend (tile shapes,
+PDL, vendor `extra` libraries); the in-tree NPU path is a separate
+implementation, not a re-registration of the CUDA one. Plan on two leaves and
+share a source file only where portability has actually been verified.
+
+One distribution with per-vendor extras is the starting point. The trigger
+for splitting into `my-plugin` / `my-plugin-kernel-cuda` /
+`my-plugin-kernel-ascend` — the repository's own `tokenspeed-kernel` /
+`-amd` / `-npu` split — is when the two toolchains can no longer build in one
+job: the Ascend wheel needs a CANN host, the CUDA wheel a CUDA host. After a
+split the entry point stays on the neutral package; vendor packages are plain
+dependencies with no entry point, exactly as in-tree.
 
 Launching is unchanged: `python -m tokenspeed.launch_server --model-path
 /path/to/foo ...`. The startup log shows `Loaded plugin 'my_plugin'
