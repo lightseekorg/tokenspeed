@@ -186,7 +186,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 "Qwen4-Exp ple_embed_dtype supports only 'float8_e4m3fn', "
                 f"got {ple_embed_dtype!r}"
             )
-        offload_embedding = bool(getattr(config, "ple_offload_embedding", True))
+        offload_embedding = config.ple_offload_embedding
         self.lookup = PLELookup(
             mapping,
             vocab_size=padded_vocab,

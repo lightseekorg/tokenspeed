@@ -48,7 +48,7 @@ from tokenspeed_kernel.ops.ple.triton import (
     _ple_page_gather_pair_kernel,
     _ple_page_scatter_kernel,
 )
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 __all__ = [
     "ple_conv_sequences",
@@ -71,12 +71,32 @@ def ple_host_gather(
     scale: float | None,
     row_scale: torch.Tensor | None,
 ) -> torch.Tensor:
+    """Gather global n-gram IDs from a sharded table in pinned host memory.
+
+    Args:
+        table: Contiguous page-locked CPU table shaped ``[local_vocab, head_dim]``.
+            Its mapped address must be accessible to the GPU.
+        ids: Device int64 global row IDs in any shape; flattened for lookup.
+        out: Device output with ``ids.numel() * head_dim`` elements, reshapeable
+            to ``[ids.numel(), head_dim]``. Rows outside this shard are zeroed.
+        vocab_start: Inclusive global ID of the first local table row.
+        vocab_end: Exclusive global ID after the last local table row.
+        scale: Per-tensor dequantization factor for an offline FP8 table, or
+            ``None`` when using per-row scaling or compute-dtype storage.
+        row_scale: Device tensor with one dequantization factor per local row
+            for an online-quantized FP8 table, or ``None`` for scalar scaling
+            or compute-dtype storage. At most one scale mode is used.
+
+    Returns:
+        The supplied ``out`` tensor, filled with gathered and dequantized rows.
+    """
+
     rows = ids.numel()
     if rows == 0:
         return out
     head_dim = out.shape[-1]
     _ple_host_gather_kernel[(rows,)](
-        table.data_ptr(),
+        current_platform().device_visible_data_ptr(table),
         ids.reshape(-1),
         scale if scale is not None else 1.0,
         row_scale if row_scale is not None else out,

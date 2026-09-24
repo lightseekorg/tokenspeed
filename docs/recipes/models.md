@@ -750,7 +750,7 @@ ts serve \
 
 ### Optional `--hf-overrides`
 
-Both keys are optional and can be combined in a single `--hf-overrides` JSON
+All keys are optional and can be combined in a single `--hf-overrides` JSON
 object:
 
 ```bash
@@ -761,6 +761,9 @@ object:
 - `ple_embed_dtype: "float8_e4m3fn"`: store the PLE n-gram embedding table in
   FP8 to save memory. Omit it to store the table in the model's compute
   dtype.
+- `ple_offload_embedding`: keep the PLE table in pinned host memory when `true`
+  or GPU memory when `false`. When omitted, offloading is enabled on NVIDIA CUDA
+  and disabled on other platforms.
 - `index_share_for_mtp_iteration: true`: reuse the QSA top-k selection across
   MTP steps. Checkpoints that already set
   `text_config.index_share_for_mtp_iteration=true` do not need this flag.

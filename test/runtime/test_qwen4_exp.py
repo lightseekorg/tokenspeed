@@ -261,7 +261,30 @@ def test_qwen4_exp_config_normalizes_layer_and_ple_geometry() -> None:
     assert config.short_conv_layer_ids == [0, 2]
     assert config.short_conv_state_shape == (64, 9)
     assert config.ngram_context_len == 2
-    assert config.ple_offload_embedding
+    assert config.ple_offload_embedding == (
+        torch.cuda.is_available() and torch.version.cuda is not None
+    )
+    assert not Qwen4ExpTextConfig(ple_offload_embedding=False).ple_offload_embedding
+
+
+@pytest.mark.parametrize(
+    ("cuda_available", "cuda_version", "expected"),
+    [
+        (True, "13.0", True),
+        (True, None, False),
+        (False, "13.0", False),
+    ],
+)
+def test_qwen4_exp_ple_offload_default(
+    monkeypatch: pytest.MonkeyPatch,
+    cuda_available: bool,
+    cuda_version: str | None,
+    expected: bool,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
+    monkeypatch.setattr(torch.version, "cuda", cuda_version)
+    assert Qwen4ExpTextConfig().ple_offload_embedding is expected
+    assert Qwen4ExpTextConfig(ple_offload_embedding=True).ple_offload_embedding
     assert not Qwen4ExpTextConfig(ple_offload_embedding=False).ple_offload_embedding
 
 
