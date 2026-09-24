@@ -125,7 +125,7 @@ def test_triton_collection_fallback_reduces_each_tensor(monkeypatch):
     )
 
 
-def test_triton_ordinary_all_reduce_keeps_512_kib_limit(monkeypatch):
+def test_triton_ordinary_all_reduce_keeps_1_mib_limit(monkeypatch):
     backend = TritonAllReduceBackend(Mock(), producer_direct_max_bytes=1024 * 1024)
     group = tuple(range(8))
     tensor = Mock(
@@ -145,9 +145,9 @@ def test_triton_ordinary_all_reduce_keeps_512_kib_limit(monkeypatch):
         lambda _state, _tensor, op: True,
     )
 
-    tensor.numel.return_value = 36 * 7168
+    tensor.numel.return_value = 73 * 7168
     assert backend.can_run(tensor, group)
-    tensor.numel.return_value = 37 * 7168
+    tensor.numel.return_value = 74 * 7168
     assert not backend.can_run(tensor, group)
     assert backend.producer_direct_max_bytes == 1024 * 1024
 

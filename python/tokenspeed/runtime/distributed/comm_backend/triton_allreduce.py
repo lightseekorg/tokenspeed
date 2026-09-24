@@ -41,10 +41,11 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 
-# Preserve the measured ordinary-Iris window while allowing a larger
-# producer-direct backing allocation.
+# Kimi-K3 EAGLE3 verification reaches 64 x 7168 BF16 elements at concurrency
+# 16 (896 KiB). Iris is faster than RCCL for that node-local TP8 payload on
+# gfx950, so keep the ordinary window large enough to admit it.
 _DEFAULT_PRODUCER_DIRECT_MAX_BYTES = 1024 * 1024
-_DEFAULT_ALL_REDUCE_MAX_BYTES = 512 * 1024
+_DEFAULT_ALL_REDUCE_MAX_BYTES = 1024 * 1024
 
 
 class TritonAllReduceBackend(CommBackend):
