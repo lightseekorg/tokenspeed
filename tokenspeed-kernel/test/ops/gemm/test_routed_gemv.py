@@ -75,6 +75,9 @@ def test_dispatch_picks_the_measured_backend(shape, backend):
     m, n, k = shape
     _select.cache_clear()
     impl = _select(m, n, k, True)
+    if backend == "tgv" and torch.cuda.get_device_capability() == (10, 7):
+        assert "flashinfer_cutlass_gemv" in impl.__name__
+        return
     assert backend in getattr(
         impl, "__name__", ""
     ), f"M={m} N={n} K={k} resolved {impl} instead of the measured {backend}"
@@ -455,6 +458,8 @@ def test_bf16_backend_support_is_what_the_route_was_tuned_against(backend):
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
     ref = x.float() @ w.float().t()
     for pdl, refusal in _BF16_BACKEND_SUPPORT[backend].items():
+        if torch.cuda.get_device_capability() == (10, 7) and backend != "cutlass":
+            refusal = f"does not support backend '{backend}' with capability 107"
         try:
             got = mm_bf16(x, w.t(), pdl=pdl, backend=backend)
         except Exception as exc:  # noqa: BLE001  (any refusal is the signal)

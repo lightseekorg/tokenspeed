@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export PYTHONPATH="test/ci_system:python${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="test/ci_system:python:tokenspeed-kernel/python${PYTHONPATH:+:$PYTHONPATH}"
 
 multi_gpu_tests=(
     tokenspeed-kernel/test/nvidia/ops/communication/test_multimem_distributed.py
