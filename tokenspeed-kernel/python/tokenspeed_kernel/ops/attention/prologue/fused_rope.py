@@ -23,9 +23,9 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.attention.prologue import (
-    _BOOLS,
-    _CUDA_ROPE_HEAD_DIMS,
+from tokenspeed_kernel.ops.attention.prologue.types import (
+    BOOLS,
+    CUDA_ROPE_HEAD_DIMS,
     GQAPrologueOutput,
     HeadKVCache,
     RopeStyle,
@@ -40,14 +40,14 @@ from tokenspeed_kernel.signature import format_signatures
 @register_kernel(
     "attention",
     "gqa_prologue",
-    name="fused_rope_gqa_attention_prologue",
+    name="fused_rope_gqa_prologue",
     solution="fused_rope",
     # Only the CUDA embedding.rope kernel stores K/V in its launch.
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=format_signatures(("q",), "dense", {torch.float16, torch.bfloat16}),
     priority=Priority.PERFORMANT + 1,
     traits={
-        "head_dim": _CUDA_ROPE_HEAD_DIMS,
+        "head_dim": CUDA_ROPE_HEAD_DIMS,
         # Up to 512 token-heads the one-launch Triton kernel is faster.
         "token_heads_min": frozenset({513}),
         "full_write": frozenset({True}),
@@ -56,11 +56,11 @@ from tokenspeed_kernel.signature import format_signatures
         "kv_convert": frozenset({False}),
         "mrope": frozenset({False}),
         "partial_rotary": frozenset({False}),
-        "return_kv": _BOOLS,
+        "return_kv": BOOLS,
         "rope_style": frozenset({"neox", "gptj"}),
     },
 )
-def fused_rope_gqa_attention_prologue(
+def fused_rope_gqa_prologue(
     *,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -76,7 +76,6 @@ def fused_rope_gqa_attention_prologue(
     num_tokens = q.shape[0]
     q = q.flatten(1)
     q_rope = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    k_rope = torch.empty(k.shape, dtype=k.dtype, device=k.device) if return_kv else None
     apply_rope(
         rotary.positions,
         q,
@@ -91,6 +90,8 @@ def fused_rope_gqa_attention_prologue(
             cache_loc=cache.slots,
         ),
         q_rope_out=q_rope,
-        k_rope_out=k_rope,
+        k_rope_out=None,
     )
-    return GQAPrologueOutput(q=q_rope, k=k_rope, v=v if return_kv else None)
+    return GQAPrologueOutput(
+        q=q_rope, k=k if return_kv else None, v=v if return_kv else None
+    )

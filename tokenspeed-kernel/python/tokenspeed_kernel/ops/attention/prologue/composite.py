@@ -25,9 +25,9 @@ from __future__ import annotations
 from functools import lru_cache
 
 import torch
-from tokenspeed_kernel.ops.attention.prologue import (
-    _BOOLS,
-    _ROPE_STYLES,
+from tokenspeed_kernel.ops.attention.prologue.types import (
+    BOOLS,
+    ROPE_STYLES,
     GQAPrologueOutput,
     HeadKVCache,
     HeadNorm,
@@ -120,23 +120,23 @@ def _write_kv(
 @register_kernel(
     "attention",
     "gqa_prologue",
-    name="composite_gqa_attention_prologue",
+    name="composite_gqa_prologue",
     solution="composite",
     capability=CapabilityRequirement(vendors=frozenset({"amd", "ascend", "nvidia"})),
     signatures=format_signatures(("q",), "dense", {torch.float16, torch.bfloat16}),
     priority=Priority.PORTABLE,
     traits={
-        "full_write": _BOOLS,
-        "has_norm": _BOOLS,
+        "full_write": BOOLS,
+        "has_norm": BOOLS,
         "kv_format": frozenset({"native", "fp8", "mxfp8"}),
-        "kv_convert": _BOOLS,
-        "mrope": _BOOLS,
-        "partial_rotary": _BOOLS,
-        "return_kv": _BOOLS,
-        "rope_style": _ROPE_STYLES,
+        "kv_convert": BOOLS,
+        "mrope": BOOLS,
+        "partial_rotary": BOOLS,
+        "return_kv": BOOLS,
+        "rope_style": ROPE_STYLES,
     },
 )
-def composite_gqa_attention_prologue(
+def composite_gqa_prologue(
     *,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -223,21 +223,21 @@ def _write_latent(
 @register_kernel(
     "attention",
     "mla_prologue",
-    name="composite_mla_attention_prologue",
+    name="composite_mla_prologue",
     solution="composite",
     capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
     signatures=format_signatures(("query",), "dense", {torch.float16, torch.bfloat16}),
     priority=Priority.PORTABLE,
     traits={
-        "expanded": _BOOLS,
-        "full_write": _BOOLS,
+        "expanded": BOOLS,
+        "full_write": BOOLS,
         "kv_format": frozenset({"native", "fp8", "fp8_per_token_head"}),
-        "kv_convert": _BOOLS,
-        "rope_style": _ROPE_STYLES,
-        "sanitize": _BOOLS,
+        "kv_convert": BOOLS,
+        "rope_style": ROPE_STYLES,
+        "sanitize": BOOLS,
     },
 )
-def composite_mla_attention_prologue(
+def composite_mla_prologue(
     *,
     query: torch.Tensor,
     q_pe: torch.Tensor,

@@ -58,8 +58,8 @@ from tokenspeed_kernel.ops.attention.prologue import (
     PerTokenHeadPlanes,
     RopeStyle,
     Rotary,
-    gqa_attention_prologue,
-    mla_attention_prologue,
+    gqa_prologue,
+    mla_prologue,
     qk_norm_rope,
 )
 from tokenspeed_kernel.ops.embedding import apply_rope, apply_rope_mla
@@ -142,7 +142,7 @@ def test_the_gemma_offset_is_formed_in_fp32(solution):
     norm = head_norm(dim, 1.0, seed=53)
     assert norm.q_weight.dtype == BF16
     k_cache, v_cache = gqa_cache(64, hkv, dim, BF16)
-    out = gqa_attention_prologue(
+    out = gqa_prologue(
         q.clone(),
         k.clone(),
         v,
@@ -197,7 +197,7 @@ def test_a_zero_offset_keeps_negative_zero_weights(solution):
     q, k, v = split(qkv(tokens, hq, hkv, dim, seed=60), hq, hkv, dim)
     weight = torch.full((dim,), -0.0, dtype=BF16, device="cuda")
     k_cache, v_cache = gqa_cache(8, hkv, dim, BF16)
-    out = gqa_attention_prologue(
+    out = gqa_prologue(
         q.clone(),
         k.clone(),
         v,
@@ -250,7 +250,7 @@ def test_the_norm_epsilon_is_applied(solution, scale, eps):
     q, k, v = split(qkv(tokens, hq, hkv, dim, seed=130) * scale, hq, hkv, dim)
     norm = dataclasses.replace(head_norm(dim, 0.0, seed=131), eps=eps)
     k_cache, v_cache = gqa_cache(16, hkv, dim, BF16)
-    out = gqa_attention_prologue(
+    out = gqa_prologue(
         q.clone(),
         k.clone(),
         v,
@@ -273,7 +273,7 @@ def test_a_q_pe_view_with_singleton_strides_is_the_rope_channels():
     query = mla_query(q_nope, rope)
     query[..., rank:] = q_pe
     cache = poisoned_latent(8, rank + rope, BF16)
-    out = mla_attention_prologue(
+    out = mla_prologue(
         query,
         query[..., rank:].squeeze(1).unsqueeze(1),
         latent,
@@ -290,7 +290,7 @@ def test_an_mla_override_past_its_token_head_limit_raises():
     tokens, heads, rank, rope = 2049, 16, 512, 64
     q_nope, q_pe, latent = mla_inputs(tokens, heads, rank, rope, seed=145)
     with pytest.raises(ValueError, match="does not serve"):
-        mla_attention_prologue(
+        mla_prologue(
             mla_query(q_nope, rope),
             q_pe,
             latent,
@@ -301,13 +301,13 @@ def test_an_mla_override_past_its_token_head_limit_raises():
                 torch.arange(tokens, device="cuda"),
             ),
             solution=None,
-            override="triton_mla_attention_prologue",
+            override="triton_mla_prologue",
         )
 
 
 @pytest.mark.parametrize(
     "override",
-    ["composite_mla_attention_prologue", "fused_rope_gqa_attention_prologue"],
+    ["composite_mla_prologue", "fused_rope_gqa_prologue"],
 )
 def test_an_override_must_serve_the_request(override):
     """Another mode's kernel, or one below its token-head minimum, raises."""
@@ -315,7 +315,7 @@ def test_an_override_must_serve_the_request(override):
     q, k, v = split(qkv(tokens, 4, 2, 64, seed=140), 4, 2, 64)
     k_cache, v_cache = gqa_cache(256, 2, 64, BF16)
     with pytest.raises(ValueError, match="does not serve"):
-        gqa_attention_prologue(
+        gqa_prologue(
             q,
             k,
             v,
@@ -410,7 +410,7 @@ def test_gqa_composite_writes_mxfp8():
     )
 
     (kc, ks), (vc, vs) = planes(), planes()
-    out = gqa_attention_prologue(
+    out = gqa_prologue(
         q,
         k,
         v,
@@ -510,7 +510,7 @@ def test_gqa_writes_only_the_slotted_rows(solution, cache_dtype):
     loc = slots(rows, total, seed=12)
     k_cache, v_cache = gqa_cache(total, hkv, dim, cache_dtype)
     before_k, before_v = k_cache.clone(), v_cache.clone()
-    out = gqa_attention_prologue(
+    out = gqa_prologue(
         q,
         k,
         v,
@@ -566,7 +566,7 @@ def test_int32_indices_give_the_int64_bytes():
     outs = []
     for dtype in (torch.int64, torch.int32):
         cache = poisoned_latent(total, rank + rope, BF16)
-        out = mla_attention_prologue(
+        out = mla_prologue(
             mla_query(q_nope, rope),
             q_pe.clone(),
             latent.clone(),
@@ -592,7 +592,7 @@ def test_triton_reads_query_heads_past_int32_offsets():
     q.copy_(torch.randn(1, hq, dim, dtype=BF16, device="cuda", generator=g))
     _, k, v = split(qkv(1, hq, hkv, dim, seed=154), hq, hkv, dim)
     k_cache, v_cache = gqa_cache(4, hkv, dim, BF16)
-    out = gqa_attention_prologue(
+    out = gqa_prologue(
         q,
         k,
         v,
@@ -633,7 +633,7 @@ def test_mla_solutions_read_query_heads_past_int32_offsets(solution, fmt, stride
         query, q_pe = view, view[..., rank:]
     latent = torch.ones(1, rank + rope, dtype=BF16, device="cuda")
     cache = poisoned_latent(4, rank + rope, fmt)
-    out = mla_attention_prologue(
+    out = mla_prologue(
         query,
         q_pe,
         latent,
@@ -657,7 +657,7 @@ def test_triton_mla_reads_int32_positions_past_two_to_the_25():
     outs = []
     for dtype in (torch.int64, torch.int32):
         cache = poisoned_latent(4, rank + rope, BF16)
-        out = mla_attention_prologue(
+        out = mla_prologue(
             mla_query(q_nope, rope),
             q_pe.clone(),
             latent.clone(),
@@ -726,7 +726,7 @@ def test_fp16_rows_round_once_into_a_bf16_cache(solution, tokens):
     )
     k_cache, v_cache = gqa_cache(128, hkv, dim, BF16)
     loc = slots(tokens, 128, seed=171)
-    out = gqa_attention_prologue(
+    out = gqa_prologue(
         q.clone(),
         k.clone(),
         v,
@@ -770,7 +770,7 @@ def test_fp16_mla_rows_round_once_into_a_bf16_cache(solution):
     )
     cache = poisoned_latent(8, rank + rope, BF16)
     loc = slots(tokens, 8, seed=173)
-    out = mla_attention_prologue(
+    out = mla_prologue(
         mla_query(q_nope, rope),
         q_pe.clone(),
         latent.clone(),
@@ -804,7 +804,7 @@ def test_a_single_kv_head_cache_may_carry_any_head_stride():
             )
             for _ in range(2)
         )
-        gqa_attention_prologue(
+        gqa_prologue(
             q,
             k,
             v,
@@ -831,7 +831,7 @@ def test_composite_reads_kv_rows_past_int32_offsets():
     q, _, v = split(qkv(tokens, hq, hkv, dim, seed=196), hq, hkv, dim)
     k_cache, v_cache = gqa_cache(32, hkv, dim, BF16)
     loc = slots(tokens, 32, seed=197)
-    gqa_attention_prologue(
+    gqa_prologue(
         q,
         k,
         v,
@@ -858,7 +858,7 @@ def test_composite_mla_reads_latent_rows_past_int32_offsets():
     query = mla_query(q_nope, rope)
     cache = poisoned_latent(32, width, BF16)
     loc = slots(tokens, 32, seed=190)
-    mla_attention_prologue(
+    mla_prologue(
         query,
         query[..., rank:],
         latent,
@@ -901,7 +901,7 @@ def test_the_composite_writes_a_prefill_past_65535_tokens(fmt):
             else MXFP8Scales(planes[0], planes[1], 128)
         )
         for a, b in row_ranges:
-            gqa_attention_prologue(
+            gqa_prologue(
                 q[a:b],
                 k[a:b],
                 v[a:b],
@@ -937,7 +937,7 @@ def test_non_interleaved_strided_queries_are_accepted(layout):
         q = base.as_strided((tokens, hq, dim), (row, dim + 8, 1))
     _, k, v = split(qkv(tokens, hq, hkv, dim, seed=156), hq, hkv, dim)
     outs = [
-        gqa_attention_prologue(
+        gqa_prologue(
             x,
             k,
             v,
@@ -968,7 +968,7 @@ def test_expanded_values_from_a_wider_head_buffer(fp8_cache):
 
     def run(k_nope, value):
         cache = poisoned_latent(total, rank + rope, FP8 if fp8_cache else BF16)
-        out = mla_attention_prologue(
+        out = mla_prologue(
             q.clone(),
             q[..., nope:].clone(),
             latent.clone(),
@@ -1101,7 +1101,7 @@ def test_mla_composite_runs_the_deepseek_decode_steps(tokens, rope_style, fp8_ca
         set_mla_kv_buffer_triton(ref_cache, loc, key[..., :rank], key[..., rank:])
 
     new_cache = poisoned_latent(total, rank + rope, cache_dtype)
-    out = mla_attention_prologue(
+    out = mla_prologue(
         mla_query(q_nope, rope),
         q_pe.clone(),
         latent.clone(),
@@ -1126,7 +1126,7 @@ def test_mla_triton_rounds_once(rope_style, cache_dtype):
     )
     loc = slots(tokens, total, seed=44)
     cache = poisoned_latent(total, rank + rope, cache_dtype)
-    out = mla_attention_prologue(
+    out = mla_prologue(
         mla_query(q_nope, rope),
         q_pe.clone(),
         latent.clone(),
@@ -1170,7 +1170,7 @@ def test_mla_triton_declines_what_it_does_not_cover(case):
         )
     kwargs = dict(expanded=expanded, rotary=None, cache=cache)
     with pytest.raises(NoKernelFoundError):
-        mla_attention_prologue(
+        mla_prologue(
             query,
             q_pe,
             latent,
@@ -1179,12 +1179,12 @@ def test_mla_triton_declines_what_it_does_not_cover(case):
             override=None,
         )
     with pytest.raises(ValueError, match="does not serve"):
-        mla_attention_prologue(
+        mla_prologue(
             query,
             q_pe,
             latent,
             **kwargs,
-            override="triton_mla_attention_prologue",
+            override="triton_mla_prologue",
             solution=None,
         )
 
@@ -1192,8 +1192,8 @@ def test_mla_triton_declines_what_it_does_not_cover(case):
 @pytest.mark.parametrize(
     "token_heads,expected",
     [
-        (32768, "triton_mla_attention_prologue"),
-        (32769, "composite_mla_attention_prologue"),
+        (32768, "triton_mla_prologue"),
+        (32769, "composite_mla_prologue"),
     ],
 )
 def test_mla_selection_follows_the_measured_limit(token_heads, expected):
@@ -1232,7 +1232,7 @@ def test_mla_triton_and_the_composite_agree_on_a_native_cache(style, dtype):
         cache = poisoned_latent(total, rank + rope, dtype)
         query = mla_query(q_nope, rope)
         query[..., rank:] = q_pe
-        out = mla_attention_prologue(
+        out = mla_prologue(
             query,
             query[..., rank:],
             latent.clone(),
@@ -1254,7 +1254,7 @@ def test_mla_zero_width_rope_stores_a_plain_cast():
     q_nope, q_pe, latent = mla_inputs(tokens, heads, rank, 0, seed=23)
     loc = slots(tokens, total, seed=24)
     cache = poisoned_latent(total, rank, FP8)
-    mla_attention_prologue(
+    mla_prologue(
         mla_query(q_nope, 0),
         q_pe,
         latent,
@@ -1290,7 +1290,7 @@ def test_mla_per_token_head_scales_each_latent_row_into_fp8():
     ref.rope[loc] = (k_rope.float() / scale).to(BF16)
 
     got = planes()
-    mla_attention_prologue(
+    mla_prologue(
         mla_query(q_nope, rope),
         q_pe,
         latent,
@@ -1310,7 +1310,7 @@ def test_mla_writes_only_the_committed_rows():
     loc = slots(rows, total, seed=28)
     cache = poisoned_latent(total, rank + rope, BF16)
     before = cache.clone()
-    mla_attention_prologue(
+    mla_prologue(
         mla_query(q_nope, rope),
         q_pe,
         latent,
@@ -1390,7 +1390,7 @@ def test_mla_expanded_runs_the_deepseek_prefill_steps(
 
     new_q = q.clone()
     new_cache = poisoned_latent(total, rank + rope, cache_dtype)
-    out = mla_attention_prologue(
+    out = mla_prologue(
         new_q,
         new_q[..., nope:],
         latent.clone(),
@@ -1409,7 +1409,7 @@ def test_mla_expanded_runs_the_deepseek_prefill_steps(
 @pytest.mark.parametrize("fp8_cache", [True, False])
 def test_mla_absorbed_returns_no_key(fp8_cache):
     q_nope, q_pe, latent = mla_inputs(3, 4, 512, 64, seed=31)
-    out = mla_attention_prologue(
+    out = mla_prologue(
         mla_query(q_nope, 64),
         q_pe,
         latent,
@@ -1431,7 +1431,7 @@ def test_prologues_accept_zero_tokens(mrope):
     positions = empty.expand(3, 0).contiguous() if mrope else empty
     q, k, v = split(qkv(0, 4, 2, 64, seed=33), 4, 2, 64)
     k_cache, v_cache = gqa_cache(8, 2, 64, BF16)
-    gqa = gqa_attention_prologue(
+    gqa = gqa_prologue(
         q,
         k,
         v,
@@ -1454,7 +1454,7 @@ def test_prologues_accept_zero_tokens(mrope):
     )
     assert gqa.q.shape == (0, 4 * 64) and gqa.k.shape == (0, 2 * 64)
     q_nope, q_pe, latent = mla_inputs(0, 4, 512, 64, seed=35)
-    mla = mla_attention_prologue(
+    mla = mla_prologue(
         mla_query(q_nope, 64),
         q_pe,
         latent,
@@ -1528,7 +1528,7 @@ def _mrope(rotary: Rotary, section: tuple[int, ...]) -> Rotary:
         (
             dict(
                 q=lambda r: r["q"].float(),
-                override=lambda r: "triton_gqa_attention_prologue",
+                override=lambda r: "triton_gqa_prologue",
             ),
             "fp16 or bf16",
         ),
@@ -1681,7 +1681,7 @@ def _mrope(rotary: Rotary, section: tuple[int, ...]) -> Rotary:
 )
 def test_gqa_entry_rejects_malformed_requests(change, message):
     with pytest.raises(ValueError, match=message):
-        gqa_attention_prologue(**_gqa_request(**change))
+        gqa_prologue(**_gqa_request(**change))
 
 
 def _planes(latent_width: int, rope_width: int) -> PerTokenHeadPlanes:
@@ -1760,11 +1760,11 @@ def _mxfp8_request(
 )
 def test_gqa_entry_rejects_malformed_mxfp8_caches(change, message):
     with pytest.raises(ValueError, match=message):
-        gqa_attention_prologue(**_mxfp8_request(**change))
+        gqa_prologue(**_mxfp8_request(**change))
 
 
 def test_the_mxfp8_request_builder_is_valid():
-    gqa_attention_prologue(**_mxfp8_request())
+    gqa_prologue(**_mxfp8_request())
 
 
 def _mla_request(**change) -> dict:
@@ -1829,7 +1829,7 @@ def _scale(dtype: torch.dtype, rows: int, width: int = 1):
         (
             dict(
                 query=lambda r: r["query"].float(),
-                override=lambda r: "triton_mla_attention_prologue",
+                override=lambda r: "triton_mla_prologue",
             ),
             "fp16 or bf16",
         ),
@@ -2001,7 +2001,7 @@ def _scale(dtype: torch.dtype, rows: int, width: int = 1):
 )
 def test_mla_entry_rejects_malformed_requests(change, message):
     with pytest.raises(ValueError, match=message):
-        mla_attention_prologue(**_mla_request(**change))
+        mla_prologue(**_mla_request(**change))
 
 
 @pytest.mark.parametrize(
@@ -2031,9 +2031,9 @@ def test_prologue_kernels_constrain_only_traits_the_entries_state(monkeypatch):
 
     monkeypatch.setattr(prologue, "_select", spy)
     with pytest.raises(LookupError):
-        gqa_attention_prologue(**_gqa_request())
+        gqa_prologue(**_gqa_request())
     with pytest.raises(LookupError):
-        mla_attention_prologue(**_mla_request())
+        mla_prologue(**_mla_request())
     for mode, keys in stated.items():
         for spec in KernelRegistry.get().list_kernels("attention", mode):
             bounds = {f"{key}{end}" for key in keys for end in ("_min", "_max")}

@@ -78,7 +78,7 @@ def test_caller_does_not_need_a_vendor_branch():
 def test_fused_mla_kv_write_is_not_amd_only():
     from tokenspeed_kernel.registry import KernelRegistry
 
-    spec = KernelRegistry.get().get_by_name("triton_mla_attention_prologue")
+    spec = KernelRegistry.get().get_by_name("triton_mla_prologue")
     assert {"amd", "nvidia"} <= spec.capability.vendors
 
 

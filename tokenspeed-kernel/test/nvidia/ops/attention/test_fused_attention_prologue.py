@@ -56,8 +56,8 @@ from tokenspeed_kernel.ops.attention.prologue import (  # noqa: E402
     MRope,
     RopeStyle,
     Rotary,
-    gqa_attention_prologue,
-    mla_attention_prologue,
+    gqa_prologue,
+    mla_prologue,
 )
 from tokenspeed_kernel.ops.embedding import (  # noqa: E402
     FusedSetKVBufferArg,
@@ -239,7 +239,7 @@ def test_mla_triton_matches_the_composite(
 
         def run(solution):
             cache = poisoned_latent(total, rank + rope, cache_dtype)
-            out = mla_attention_prologue(
+            out = mla_prologue(
                 mla_query(q_nope, rope),
                 q_pe.clone(),
                 latent.clone(),
@@ -288,38 +288,38 @@ def _selected(tokens: int, dtype: torch.dtype, platform: PlatformInfo, **change)
 @pytest.mark.parametrize(
     "tokens,change,expected",
     [
-        (16, {}, "triton_gqa_attention_prologue"),
-        (16, {"token_heads": 513}, "fused_rope_gqa_attention_prologue"),
-        (17, {}, "fused_rope_gqa_attention_prologue"),
+        (16, {}, "triton_gqa_prologue"),
+        (16, {"token_heads": 513}, "fused_rope_gqa_prologue"),
+        (17, {}, "fused_rope_gqa_prologue"),
         (
             17,
             {"kv_format": "fp8", "return_kv": True},
-            "fused_rope_gqa_attention_prologue",
+            "fused_rope_gqa_prologue",
         ),
-        (4096, {"has_norm": True}, "triton_gqa_attention_prologue"),
+        (4096, {"has_norm": True}, "triton_gqa_prologue"),
         (
             4096,
             {"has_norm": True, "head_dim": 96},
-            "triton_gqa_attention_prologue",
+            "triton_gqa_prologue",
         ),
-        (16, {"head_dim": 96}, "triton_gqa_attention_prologue"),
-        (4096, {"head_dim": 96}, "triton_gqa_attention_prologue"),
+        (16, {"head_dim": 96}, "triton_gqa_prologue"),
+        (4096, {"head_dim": 96}, "triton_gqa_prologue"),
         (
             4096,
             {"partial_rotary": True},
-            "triton_gqa_attention_prologue",
+            "triton_gqa_prologue",
         ),
-        (4096, {"mrope": True}, "triton_gqa_attention_prologue"),
-        (4096, {"rope_style": "none"}, "triton_gqa_attention_prologue"),
-        (4096, {"kv_convert": True}, "triton_gqa_attention_prologue"),
-        (4096, PADDED_FP8_GPTJ, "triton_gqa_attention_prologue"),
+        (4096, {"mrope": True}, "triton_gqa_prologue"),
+        (4096, {"rope_style": "none"}, "triton_gqa_prologue"),
+        (4096, {"kv_convert": True}, "triton_gqa_prologue"),
+        (4096, PADDED_FP8_GPTJ, "triton_gqa_prologue"),
         (
             4096,
             {"has_norm": True, "kv_format": "mxfp8"},
-            "composite_gqa_attention_prologue",
+            "composite_gqa_prologue",
         ),
-        (4, {"kv_format": "mxfp8"}, "composite_gqa_attention_prologue"),
-        (600, {"kv_format": "mxfp8"}, "composite_gqa_attention_prologue"),
+        (4, {"kv_format": "mxfp8"}, "composite_gqa_prologue"),
+        (600, {"kv_format": "mxfp8"}, "composite_gqa_prologue"),
     ],
 )
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -332,12 +332,12 @@ def test_gqa_selection_follows_the_measured_crossover(tokens, change, expected, 
 @pytest.mark.parametrize(
     "tokens,change,expected",
     [
-        (16, {}, "triton_gqa_attention_prologue"),
-        (4096, {}, "triton_gqa_attention_prologue"),
-        (4096, {"has_norm": True}, "triton_gqa_attention_prologue"),
-        (4096, {"rope_style": "none"}, "triton_gqa_attention_prologue"),
-        (4096, PADDED_FP8_GPTJ, "triton_gqa_attention_prologue"),
-        (4096, {"kv_format": "mxfp8"}, "composite_gqa_attention_prologue"),
+        (16, {}, "triton_gqa_prologue"),
+        (4096, {}, "triton_gqa_prologue"),
+        (4096, {"has_norm": True}, "triton_gqa_prologue"),
+        (4096, {"rope_style": "none"}, "triton_gqa_prologue"),
+        (4096, PADDED_FP8_GPTJ, "triton_gqa_prologue"),
+        (4096, {"kv_format": "mxfp8"}, "composite_gqa_prologue"),
     ],
 )
 def test_amd_takes_one_triton_launch_at_every_size(tokens, change, expected):
@@ -419,7 +419,7 @@ def test_an_override_this_platform_cannot_run_raises(monkeypatch):
     k_cache, v_cache = gqa_cache(256, hkv, dim, BF16)
     try:
         with pytest.raises(ValueError, match="does not serve"):
-            gqa_attention_prologue(
+            gqa_prologue(
                 q,
                 k,
                 v,
@@ -437,7 +437,7 @@ def test_an_override_this_platform_cannot_run_raises(monkeypatch):
                     slots=slots(tokens, 256, seed=16),
                 ),
                 return_kv=False,
-                override="fused_rope_gqa_attention_prologue",
+                override="fused_rope_gqa_prologue",
                 solution=None,
             )
     finally:

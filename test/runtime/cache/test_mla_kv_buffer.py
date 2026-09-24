@@ -687,9 +687,7 @@ def test_one_launch_prologue_token_head_budget(num_q_heads, num_tokens, expect_f
     at H=32 the fused path lost to the composite by 18.9% at 2048 tokens
     while still winning at 1024; at H=64 it lost by 4.9% at 768 while still
     winning at 512."""
-    fused = (
-        _mla_prologue_kernel(num_q_heads, num_tokens) == "triton_mla_attention_prologue"
-    )
+    fused = _mla_prologue_kernel(num_q_heads, num_tokens) == "triton_mla_prologue"
     assert fused == expect_fused
 
 

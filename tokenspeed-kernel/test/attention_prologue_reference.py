@@ -36,7 +36,7 @@ from tokenspeed_kernel.ops.attention.prologue import (
     MRope,
     RopeStyle,
     Rotary,
-    gqa_attention_prologue,
+    gqa_prologue,
 )
 
 BF16 = torch.bfloat16
@@ -126,7 +126,7 @@ def run_gqa(
     k_cache, v_cache = gqa_cache(
         total, hkv, head_dim, qkv.dtype if fmt is KVCacheFormat.NATIVE else FP8
     )
-    out = gqa_attention_prologue(
+    out = gqa_prologue(
         q,
         k,
         v,

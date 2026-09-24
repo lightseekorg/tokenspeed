@@ -92,7 +92,7 @@ def _prologue(monkeypatch, *, qk_norm, mode, rows, slots):
     handed = {}
     monkeypatch.setattr(
         paged_attention,
-        "gqa_attention_prologue",
+        "gqa_prologue",
         lambda q, k, v, **kw: handed.update(kw, q=q, k=k, v=v),
     )
     layer = paged_attention.PagedAttention(

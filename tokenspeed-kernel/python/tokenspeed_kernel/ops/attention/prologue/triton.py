@@ -24,9 +24,9 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.attention.prologue import (
-    _BOOLS,
-    _ROPE_STYLES,
+from tokenspeed_kernel.ops.attention.prologue.types import (
+    BOOLS,
+    ROPE_STYLES,
     GQAPrologueOutput,
     HeadKVCache,
     HeadNorm,
@@ -301,23 +301,23 @@ def _gqa_prologue_kernel(
 @register_kernel(
     "attention",
     "gqa_prologue",
-    name="triton_gqa_attention_prologue",
+    name="triton_gqa_prologue",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
     signatures=format_signatures(("q",), "dense", {torch.float16, torch.bfloat16}),
     priority=Priority.PERFORMANT,
     traits={
-        "full_write": _BOOLS,
-        "has_norm": _BOOLS,
+        "full_write": BOOLS,
+        "has_norm": BOOLS,
         "kv_format": frozenset({"native", "fp8"}),
-        "kv_convert": _BOOLS,
-        "mrope": _BOOLS,
-        "partial_rotary": _BOOLS,
-        "return_kv": _BOOLS,
-        "rope_style": _ROPE_STYLES,
+        "kv_convert": BOOLS,
+        "mrope": BOOLS,
+        "partial_rotary": BOOLS,
+        "return_kv": BOOLS,
+        "rope_style": ROPE_STYLES,
     },
 )
-def triton_gqa_attention_prologue(
+def triton_gqa_prologue(
     *,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -400,7 +400,7 @@ def triton_gqa_attention_prologue(
 @register_kernel(
     "attention",
     "mla_prologue",
-    name="triton_mla_attention_prologue",
+    name="triton_mla_prologue",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
     signatures=format_signatures(("query",), "dense", {torch.float16, torch.bfloat16}),
@@ -410,12 +410,12 @@ def triton_gqa_attention_prologue(
         "expanded": frozenset({False}),
         "full_write": frozenset({True}),
         "kv_format": frozenset({"native", "fp8"}),
-        "kv_convert": _BOOLS,
-        "rope_style": _ROPE_STYLES,
-        "sanitize": _BOOLS,
+        "kv_convert": BOOLS,
+        "rope_style": ROPE_STYLES,
+        "sanitize": BOOLS,
     },
 )
-def triton_mla_attention_prologue(
+def triton_mla_prologue(
     *,
     query: torch.Tensor,
     q_pe: torch.Tensor,

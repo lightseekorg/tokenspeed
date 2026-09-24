@@ -15,9 +15,9 @@ its own cache groups.
 through `select_kernel` like any other kernel family, and a helper built on the
 first:
 
-* `gqa_attention_prologue(q, k, v, *, norm, rotary, cache, return_kv,
+* `gqa_prologue(q, k, v, *, norm, rotary, cache, return_kv,
   solution, override)` for multi-head and grouped-query attention;
-* `mla_attention_prologue(query, q_pe, latent_cache, *, expanded, rotary,
+* `mla_prologue(query, q_pe, latent_cache, *, expanded, rotary,
   cache, solution, override)` for multi-head latent attention;
 * `qk_norm_rope(q, k, *, head_dim, norm, rotary)` for keys that are not
   attention K/V but take the norm step (MiniMax-M3's indexer): the GQA kernels
@@ -79,8 +79,8 @@ The entries validate each request once, from metadata only, and raise
   ending on a 4-byte boundary, with one scale per 32 channels of every row.
 
 A solution's own limits raise from the solution once it is selected; the one
-in-tree case is the composite MLA store's `kv_lora_rank` rule, which the
-prologue README records. Every kernel a solution launches forms its row and
+in-tree case is the composite MLA store's `kv_lora_rank` rule in the
+solutions table below. Every kernel a solution launches forms its row and
 head offsets in 64 bits; the general `fp8_quantize` the composite quantizes
 expanded values with keeps the baseline's 32-bit row offsets (2^31 elements
 per activation).
@@ -184,6 +184,31 @@ Absorbed attention reads the latent cache. Its query's non-RoPE part is
 Non-absorbed prefill attends per-head keys up-projected from the latent. It
 passes `MLAExpandedKV(k_nope, value)`, and the prologue returns per-head keys
 and values in the returned query's dtype.
+
+## Solutions
+
+`("attention", "gqa_prologue")`: per-head QK RMSNorm, RoPE (NEOX or GPT-J,
+full or partial, or multimodal M-RoPE sections), then the K/V store into a
+native, FP8 or MXFP8 cache; every step but the write is optional.
+
+| Solution | Kernel | Covers |
+| --- | --- | --- |
+| `triton` | one launch, one program per head | AMD and NVIDIA, native or FP8 caches, every layer `fused_rope` does not take |
+| `fused_rope` | `embedding.rope` with its fused K/V store; the key rotates in place | NVIDIA past 512 token-heads, head size 64/128/256/512, no norm, no M-RoPE, full rotary, native cache of the activation dtype or FP8 cache, full write |
+| `composite` | `qk_rmsnorm`, `embedding.rope`, then the cache store | everything; rounds between steps; the path for MXFP8 caches and Ascend |
+
+Without a norm, `fused_rope` overtakes the one-head-per-program Triton kernel
+past 512 token-heads on NVIDIA, so it declares that bound.
+
+`("attention", "mla_prologue")`: RoPE of the query and latent key parts,
+FP8 quantization of the query for an FP8 cache, and the latent write into a
+native, FP8 or per-token-head FP8 cache; expanded (non-absorbed) prefill also
+returns per-head keys and values.
+
+| Solution | Kernel | Covers |
+| --- | --- | --- |
+| `triton` | one launch that also assembles the query | absorbed, dense cache, full write, up to 32768 token-heads |
+| `composite` | `embedding.rope` or `embedding.rope_mla`, then the latent store | everything on AMD and NVIDIA; its latent store needs `kv_lora_rank` a multiple of 256 below 512 written rows and a power of two above (every in-tree MLA model uses 512) |
 
 ## Adding a fused kernel
 

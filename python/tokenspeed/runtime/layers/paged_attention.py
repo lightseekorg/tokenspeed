@@ -39,8 +39,8 @@ from tokenspeed_kernel.ops.attention.prologue import (
     MLAExpandedKV,
     MLAPrologueOutput,
     Rotary,
-    gqa_attention_prologue,
-    mla_attention_prologue,
+    gqa_prologue,
+    mla_prologue,
 )
 from torch import nn
 
@@ -213,7 +213,7 @@ class PagedAttention(nn.Module):
             raise ValueError(
                 f"{slots.numel()} decode write slots for {q.shape[0]} rows"
             )
-        return gqa_attention_prologue(
+        return gqa_prologue(
             q,
             k,
             v,
@@ -278,7 +278,7 @@ class PagedAttention(nn.Module):
             slots: Cache slots of the leading latent rows to write.
             expanded: Per-head keys and values for non-absorbed attention.
         """
-        return mla_attention_prologue(
+        return mla_prologue(
             query,
             q_pe,
             latent_cache,

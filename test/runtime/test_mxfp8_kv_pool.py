@@ -357,7 +357,7 @@ def _create_config_pool(config):
 def test_the_prologue_writes_through_the_pool_write_target(layer_id: int):
     """The prologue's rows land where the pool's own quantize-and-store puts
     them, for every per-layer head count of a shared field."""
-    from tokenspeed_kernel.ops.attention.prologue import gqa_attention_prologue
+    from tokenspeed_kernel.ops.attention.prologue import gqa_prologue
     from tokenspeed_kernel.ops.kvcache.triton import quantize_store_kv_mxfp8
 
     heads, tokens = SHARED_KV_HEADS[layer_id], 37
@@ -378,7 +378,7 @@ def test_the_prologue_writes_through_the_pool_write_target(layer_id: int):
         loc,
         page_tokens=reference_pool._layer_page_tokens(layer_id),
     )
-    gqa_attention_prologue(
+    gqa_prologue(
         q,
         k,
         v,
