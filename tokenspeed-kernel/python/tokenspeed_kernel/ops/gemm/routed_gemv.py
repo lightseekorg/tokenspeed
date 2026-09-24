@@ -1076,19 +1076,17 @@ def skinny_gemv_add3(
 
 
 def _register_route() -> None:
-    impls = {
-        "skinny": cute_dsl_skinny_gemv,
-        "tgv": flashinfer_tgv_gemv,
-        "ll_bf16": cute_dsl_ll_bf16_gemv,
-        "splitk": flashinfer_splitk_gemv,
+    implementations = {
+        "skinny": ((cute_dsl_skinny_gemv, _CAPABILITY),),
+        "tgv": (
+            (flashinfer_tgv_gemv, _TGV_CAPABILITY),
+            (flashinfer_cutlass_gemv, _CUTLASS_CAPABILITY),
+        ),
+        "ll_bf16": ((cute_dsl_ll_bf16_gemv, _CAPABILITY),),
+        "splitk": ((flashinfer_splitk_gemv, _CAPABILITY),),
     }
     for (m, n, k), backend in MEASURED_ROUTE.items():
-        implementations = [
-            (impls[backend], _TGV_CAPABILITY if backend == "tgv" else _CAPABILITY)
-        ]
-        if backend == "tgv":
-            implementations.append((flashinfer_cutlass_gemv, _CUTLASS_CAPABILITY))
-        for impl, capability in implementations:
+        for impl, capability in implementations[backend]:
             register_kernel(
                 "gemm",
                 "decode_gemv",
