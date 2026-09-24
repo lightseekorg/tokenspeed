@@ -41,7 +41,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_decode import (
     launch_gluon_latent_input_decode_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_prefill import (
-    launch_gluon_latent_input_prefill_gfx950,
+    launch_gluon_latent_input_largem_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_small_batch import (
     launch_gluon_latent_input_small_batch_gfx950,
@@ -73,7 +73,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.stage2_kernel import (
 __all__ = [
     "gluon_bf16_moe",
     "launch_gluon_latent_input_decode_gfx950",
-    "launch_gluon_latent_input_prefill_gfx950",
+    "launch_gluon_latent_input_largem_gfx950",
     "launch_gluon_latent_input_small_batch_gfx950",
     "invoke_stage1",
     "invoke_stage1_splitk",
