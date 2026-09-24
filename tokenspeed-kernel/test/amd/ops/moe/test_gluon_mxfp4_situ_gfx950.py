@@ -48,6 +48,29 @@ _A8W4_EP_APPLY = "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"
 
 
 @pytest.mark.parametrize(
+    "num_tokens, expected_block_n, expected_combined",
+    [
+        (1, 16, False),
+        (8, 16, True),
+        (16, 32, True),
+        (24, 64, False),
+        (32, 64, False),
+        (64, 128, False),
+    ],
+)
+def test_kimi_k3_stage2_decode_policy(
+    num_tokens: int,
+    expected_block_n: int,
+    expected_combined: bool,
+) -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import moe
+
+    assert moe._select_a8w4_stage2_block_n(num_tokens) == expected_block_n
+    assert moe._use_a8w4_combined_topk(num_tokens, False) == expected_combined
+    assert not moe._use_a8w4_combined_topk(num_tokens, True)
+
+
+@pytest.mark.parametrize(
     "per_lane, scales_per_lane, group",
     [(64, 2, 32), (32, 1, 32), (16, 1, 16), (8, 1, 8)],
     ids=["two_blocks", "one_block", "half_block", "quarter_block"],
@@ -1094,6 +1117,7 @@ def test_package_prefill_sort_contract_gfx950(
         1,
         torch.bfloat16,
         block_m,
+        compact_route_programs=False,
     )
     valid_extent, reported_tokens = num_valid.cpu().tolist()
     assert reported_tokens == num_tokens
@@ -1162,6 +1186,7 @@ def test_package_prefill_sort_localizes_ep_routes_gfx950() -> None:
             32,
             torch.bfloat16,
             64,
+            compact_route_programs=False,
             expert_start=expert_start,
             out=output,
         )
@@ -1204,6 +1229,7 @@ def test_package_prefill_low_density_route_capacity_gfx950() -> None:
         1,
         torch.bfloat16,
         block_m,
+        compact_route_programs=False,
     )
 
     expected_capacity = _max_padded_route_capacity(
@@ -1440,7 +1466,13 @@ def test_stage2_logical_k_ignores_padding_gfx950(
             torch.tensor([0.25, 0.75], device="cuda").expand(tokens, topk).contiguous()
         )
     sorted_ids, sorted_weights, sorted_experts, valid, out = gluon_moe_sorting(
-        ids, weights, experts, n, torch.bfloat16, sort_block_m
+        ids,
+        weights,
+        experts,
+        n,
+        torch.bfloat16,
+        sort_block_m,
+        compact_route_programs=False,
     )
     output_storage = torch.full(
         (tokens, n + 16), 42, dtype=torch.bfloat16, device="cuda"
@@ -1819,7 +1851,7 @@ def test_ep_situ_package_prefill_matches_reference_gfx950(
     torch.testing.assert_close(captured, expected, atol=2e-3, rtol=8e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4])
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 64])
 def test_tp_situ_joint_shared_projection_gfx950(num_tokens: int) -> None:
     generator = torch.Generator(device="cuda").manual_seed(20260818 + num_tokens)
     module, _ = _make_mxfp4_module(
@@ -1883,7 +1915,11 @@ def test_tp_situ_joint_shared_projection_gfx950(num_tokens: int) -> None:
         shared_out=shared_out,
     )
 
-    torch.testing.assert_close(routed, routed_reference, atol=0, rtol=0)
+    if num_tokens == 64:
+        # Sorted and route-direct GEMMs have different accumulation orders.
+        torch.testing.assert_close(routed, routed_reference, atol=2e-3, rtol=8e-2)
+    else:
+        torch.testing.assert_close(routed, routed_reference, atol=0, rtol=0)
     assert shared.data_ptr() == shared_out.data_ptr()
     torch.testing.assert_close(shared, shared_reference, atol=0.125, rtol=2e-2)
 
@@ -1903,7 +1939,7 @@ def test_tp_situ_joint_shared_projection_gfx950(num_tokens: int) -> None:
         )
     graph.replay()
     torch.cuda.synchronize()
-    torch.testing.assert_close(captured_routed, routed_reference, atol=0, rtol=0)
+    torch.testing.assert_close(captured_routed, routed, atol=0, rtol=0)
     torch.testing.assert_close(captured_shared, shared_reference, atol=0.125, rtol=2e-2)
 
 
@@ -2088,3 +2124,128 @@ def test_partial_reduce_matches_reference_gfx950(
     )
 
     torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("compact_route_programs", [False, True])
+def test_route_sort_reuses_compilation_gfx950(compact_route_programs: bool) -> None:
+    from contextlib import ExitStack
+
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import moe_sorting
+    from utils import assert_no_triton_compile
+
+    def run(tokens: int) -> None:
+        weights, ids = make_round_robin_topk(tokens, 16, 4)
+        sorted_ids, _, sorted_experts, valid, _ = moe_sorting.gluon_moe_sorting(
+            ids,
+            weights,
+            16,
+            1,
+            torch.bfloat16,
+            16,
+            compact_route_programs=compact_route_programs,
+        )
+        assert valid[1].item() == tokens
+        counts = torch.bincount(ids.flatten().to(torch.int64), minlength=16)
+        padded = ((counts + 15) // 16) * 16
+        assert valid[0].item() == padded.sum().item()
+        offset = 0
+        for expert, (count, extent) in enumerate(zip(counts.tolist(), padded.tolist())):
+            assert torch.all(
+                sorted_experts[offset // 16 : (offset + extent) // 16] == expert
+            )
+            assert torch.all(
+                sorted_ids[offset + count : offset + extent] == ((4 << 24) | tokens)
+            )
+            offset += extent
+
+    # Warm the power-of-two route/program bounds, then vary exact counts.
+    for tokens in (129, 257, 513):
+        run(tokens)
+    with ExitStack() as stack:
+        for kernel in (
+            moe_sorting._moe_sorting_small_histogram_prefix_kernel,
+            moe_sorting._moe_sorting_stage1_kernel,
+            moe_sorting._moe_sorting_stage2_kernel,
+            moe_sorting._moe_sorting_stage3_kernel,
+            moe_sorting._moe_sorting_stage4_kernel,
+        ):
+            stack.enter_context(assert_no_triton_compile(kernel))
+        for tokens in (143, 191, 255, 271, 383, 511, 527, 639, 767):
+            run(tokens)
+
+
+@pytest.mark.parametrize("intermediate_size", [384, 512])
+def test_sorted_situ_dispatch_and_compilation_gfx950(monkeypatch, intermediate_size):
+    from contextlib import ExitStack
+
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import moe, warp_decode
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (
+        preprocess_gluon_mxfp4_gfx950_moe_weights,
+    )
+    from utils import assert_no_triton_compile
+
+    generator = torch.Generator(device="cuda").manual_seed(17)
+    module, raw = _make_mxfp4_module(
+        num_experts=16,
+        latent_size=512,
+        intermediate_size=intermediate_size,
+        top_k=4,
+        generator=generator,
+    )
+    preprocess_gluon_mxfp4_gfx950_moe_weights({}, module, preshuffle=True)
+    # Exercise the low-level sorted kernels at changing M without expanding
+    # the production dispatch bound, which currently admits only M=64.
+    monkeypatch.setattr(moe, "_SITU_WARP_DECODE_MAX_M", 130)
+    if intermediate_size != 384:
+
+        class UnexpectedSortedKernel:
+            def __getitem__(self, grid):
+                pytest.fail("unsupported intermediate selected the sorted kernel")
+
+        monkeypatch.setattr(
+            moe,
+            "_warp_decode_precomputed_situ_sorted_stage1_kernel",
+            UnexpectedSortedKernel(),
+        )
+
+    def run(tokens):
+        x = 0.1 * torch.randn(
+            tokens, 512, device="cuda", dtype=torch.bfloat16, generator=generator
+        )
+        weights, ids = make_round_robin_topk(tokens, 16, 4)
+        actual = moe.gluon_mxfp4_fp8_precomputed_situ(
+            x,
+            weights,
+            ids,
+            module.w13_weight_triton_tensor,
+            module.w2_weight_triton_tensor,
+            w13_mx_scale=module.w13_precision_config.b_mx_scale,
+            w2_mx_scale=module.w2_precision_config.b_mx_scale,
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+        )
+        expected = mxfp4_moe_reference(
+            x,
+            raw["w13_weight"],
+            raw["w13_scale"],
+            raw["w2_weight"],
+            raw["w2_scale"],
+            ids,
+            weights,
+            activation_dtype=torch.bfloat16,
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+        )
+        torch.testing.assert_close(actual, expected, atol=2e-3, rtol=8e-2)
+
+    run(64)
+    if intermediate_size == 384:
+        run(65)
+        with ExitStack() as stack:
+            for kernel in (
+                warp_decode._warp_decode_precomputed_situ_sorted_stage1_kernel,
+                warp_decode._warp_decode_sorted_stage2_fp8_mxfp4_kernel,
+            ):
+                stack.enter_context(assert_no_triton_compile(kernel))
+            for tokens in (70, 97, 130):
+                run(tokens)
