@@ -119,8 +119,7 @@ def _register_private(register, name, *args, **kwargs):
     return register(f"tokenspeed_flashinfer_route_init::{operator}", *args, **kwargs)
 
 
-def _prefer_qwen38_decode_tile_32(
-    tactics,
+def _is_qwen38_decode_shape(
     *,
     num_tokens: int,
     top_k: int,
@@ -129,9 +128,8 @@ def _prefer_qwen38_decode_tile_32(
     hidden_size: int,
     intermediate_size: int,
     nvfp4: bool,
-):
-    """Preserve the graph-friendly NVFP4 tile for Qwen3.8 decode shapes."""
-    if not (
+) -> bool:
+    return (
         nvfp4
         and 1 <= num_tokens <= 32
         and top_k == 10
@@ -139,9 +137,12 @@ def _prefer_qwen38_decode_tile_32(
         and num_local_experts == 128
         and hidden_size == 2560
         and intermediate_size == 640
-    ):
-        return tactics
-    # FlashInfer returns tvm_ffi.Array entries, not Python tuples or lists.
+    )
+
+
+def _prefer_qwen38_decode_tile_32(tactics):
+    """Keep valid tile-32 tactics for the matching Qwen3.8 decode shape."""
+    # FlashInfer 0.7 returns tvm_ffi.Array tactics; element 0 is tile_tokens_dim.
     selected = [tactic for tactic in tactics if int(tactic[0]) == 32]
     return selected or tactics
 
@@ -155,6 +156,27 @@ def _require_tactic_hooks(runner_type: type) -> None:
             )
 
 
+def _require_runner_rebinding(namespace: dict) -> None:
+    names = (
+        "trtllm_fp4_block_scale_moe",
+        "trtllm_fp4_block_scale_routed_moe",
+        "get_trtllm_moe_sm100_module",
+        "_get_trtllm_moe_sm100_module_impl",
+    )
+    for name in names:
+        if name in namespace:
+            function = inspect.unwrap(namespace[name])
+            if (
+                "TrtllmMoERunner" in function.__code__.co_names
+                and function.__globals__ is namespace
+            ):
+                return
+    raise RuntimeError(
+        "FlashInfer MoE entrypoints no longer construct TrtllmMoERunner "
+        "through cloned globals; review the private tile-32 adapter."
+    )
+
+
 @functools.cache
 def _entrypoints():
     from flashinfer.fused_moe import core
@@ -166,18 +188,9 @@ def _entrypoints():
     class TokenSpeedFP4MoERunner(core.TrtllmMoERunner):
         """Keep low-M MoE tile selection separate from upstream tuning caches."""
 
-        def get_cache_key_extras(self, inputs):
-            return (
-                *super().get_cache_key_extras(inputs),
-                "tokenspeed-qwen38-tile32-v1",
-            )
-
-        def get_valid_tactics(self, inputs, profile):
-            tactics = super().get_valid_tactics(inputs, profile)
-            num_tokens = MoeRunnerInputs.from_list(inputs).hidden_states.shape[0]
-            return _prefer_qwen38_decode_tile_32(
-                tactics,
-                num_tokens=num_tokens,
+        def _matches_qwen38_decode_shape(self, inputs):
+            return _is_qwen38_decode_shape(
+                num_tokens=MoeRunnerInputs.from_list(inputs).hidden_states.shape[0],
                 top_k=self.top_k,
                 num_experts=self.num_experts,
                 num_local_experts=self.num_local_experts,
@@ -185,6 +198,18 @@ def _entrypoints():
                 intermediate_size=self.intermediate_size,
                 nvfp4=self.dtype_weights == DtypeTrtllmGen.E2m1,
             )
+
+        def get_cache_key_extras(self, inputs):
+            extras = super().get_cache_key_extras(inputs)
+            if self._matches_qwen38_decode_shape(inputs):
+                return (*extras, "tokenspeed-qwen38-tile32-v1")
+            return extras
+
+        def get_valid_tactics(self, inputs, profile):
+            tactics = super().get_valid_tactics(inputs, profile)
+            if self._matches_qwen38_decode_shape(inputs):
+                return _prefer_qwen38_decode_tile_32(tactics)
+            return tactics
 
     namespace = dict(vars(core))
     namespace["TrtllmMoERunner"] = TokenSpeedFP4MoERunner
@@ -205,6 +230,7 @@ def _entrypoints():
         )
     for name in ("trtllm_fp4_block_scale_moe", "trtllm_fp4_block_scale_routed_moe"):
         namespace[name] = _clone(getattr(core, name), namespace)
+    _require_runner_rebinding(namespace)
     return namespace
 
 

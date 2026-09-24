@@ -24,12 +24,14 @@ import functools
 import inspect
 
 import pytest
+import torch
 from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
     _clone,
     _entrypoints,
     _initialize_routing_map,
     _prefer_qwen38_decode_tile_32,
     _register_private,
+    _require_runner_rebinding,
     _require_tactic_hooks,
 )
 
@@ -100,36 +102,57 @@ def test_qwen38_decode_tactic_filter_accepts_ffi_arrays():
         tvm_ffi.Array([16, 3]),
         tvm_ffi.Array([32, 4]),
     ]
-    shape = {
-        "top_k": 10,
-        "num_experts": 512,
-        "num_local_experts": 128,
-        "hidden_size": 2560,
-        "intermediate_size": 640,
-        "nvfp4": True,
-    }
-    assert _prefer_qwen38_decode_tile_32(tactics, num_tokens=4, **shape) == [
-        tactics[1],
-        tactics[3],
-    ]
-    assert _prefer_qwen38_decode_tile_32(tactics, num_tokens=33, **shape) is tactics
-    assert (
-        _prefer_qwen38_decode_tile_32(
-            tactics, num_tokens=4, **{**shape, "hidden_size": 4096}
-        )
-        is tactics
-    )
-    assert (
-        _prefer_qwen38_decode_tile_32(
-            tactics, num_tokens=4, **{**shape, "nvfp4": False}
-        )
-        is tactics
-    )
+    assert _prefer_qwen38_decode_tile_32(tactics) == [tactics[1], tactics[3]]
     without_tile_32 = [tactics[0], tactics[2]]
-    assert (
-        _prefer_qwen38_decode_tile_32(without_tile_32, num_tokens=4, **shape)
-        is without_tile_32
+    assert _prefer_qwen38_decode_tile_32(without_tile_32) is without_tile_32
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "hidden_size", "weight_dtype", "targeted"),
+    [
+        (4, 2560, "E2m1", True),
+        (32, 2560, "E2m1", True),
+        (33, 2560, "E2m1", False),
+        (4, 4096, "E2m1", False),
+        (4, 2560, "Bfloat16", False),
+    ],
+)
+def test_tactic_cache_key_changes_only_for_target_shape(
+    num_tokens, hidden_size, weight_dtype, targeted
+):
+    core = pytest.importorskip("flashinfer.fused_moe.core")
+    inputs_module = pytest.importorskip("flashinfer.fused_moe.shared.inputs")
+    enums = pytest.importorskip("flashinfer.tllm_enums")
+    tvm_ffi = pytest.importorskip("tvm_ffi")
+    tactics = [tvm_ffi.Array([8, 1]), tvm_ffi.Array([32, 2])]
+
+    class MoeOp:
+        def trtllm_get_valid_moe_configs(self, *query_key):
+            return tactics
+
+    runner = _entrypoints()["TrtllmMoERunner"](
+        MoeOp(),
+        top_k=10,
+        num_local_experts=128,
+        dtype_act=enums.DtypeTrtllmGen.Bfloat16,
+        dtype_weights=enums.DtypeTrtllmGen[weight_dtype],
+        fp8_quantization_type=enums.Fp8QuantizationType.NoneFp8,
+        hidden_size=hidden_size,
+        intermediate_size=640,
+        num_experts=512,
     )
+    inputs = [None] * len(inputs_module.MoeRunnerInputs._FIELDS)
+    hidden_index = inputs_module.MoeRunnerInputs._FIELDS.index("hidden_states")
+    inputs[hidden_index] = torch.empty((num_tokens, hidden_size))
+
+    upstream_key = core.TrtllmMoERunner.get_cache_key_extras(runner, inputs)
+    actual_key = runner.get_cache_key_extras(inputs)
+    if targeted:
+        assert actual_key == (*upstream_key, "tokenspeed-qwen38-tile32-v1")
+        assert runner.get_valid_tactics(inputs, None) == [tactics[1]]
+    else:
+        assert actual_key == upstream_key
+        assert runner.get_valid_tactics(inputs, None) is tactics
 
 
 def test_tactic_hooks_must_exist_on_upstream_runner():
@@ -149,6 +172,25 @@ def test_tactic_hooks_must_exist_on_upstream_runner():
         _require_tactic_hooks(TacticsOnly)
     with pytest.raises(RuntimeError, match="get_valid_tactics"):
         _require_tactic_hooks(CacheOnly)
+
+
+def test_runner_rebinding_requires_cloned_global_reference():
+    def uses_runner():
+        return TrtllmMoERunner
+
+    def omits_runner():
+        return None
+
+    namespace = {"trtllm_fp4_block_scale_moe": uses_runner}
+    with pytest.raises(RuntimeError, match="through cloned globals"):
+        _require_runner_rebinding(namespace)
+
+    namespace["trtllm_fp4_block_scale_moe"] = _clone(uses_runner, namespace)
+    _require_runner_rebinding(namespace)
+
+    namespace["trtllm_fp4_block_scale_moe"] = _clone(omits_runner, namespace)
+    with pytest.raises(RuntimeError, match="no longer construct"):
+        _require_runner_rebinding(namespace)
 
 
 def test_upstream_dispatch_and_caches_are_unchanged():

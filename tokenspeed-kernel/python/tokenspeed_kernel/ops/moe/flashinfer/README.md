@@ -40,9 +40,15 @@ For Qwen3.8's 2,560-hidden, 640-intermediate, 512-expert NVFP4 MoE with
 TP4/EP4 and top-k 10, the private runner restricts inputs of at most 32 tokens
 to FlashInfer's valid tile-32 tactics. If the native launcher does not offer
 tile 32 for a profile, all native tactics remain available. Other models and
-larger token counts use the full tuner. The runner has a separate tuning-cache
-key so a previously cached tile-8 choice cannot bypass this policy.
-The adapter raises an error if FlashInfer removes either tuning hook it uses.
+larger token counts use the full tuner. Only the matching shape gets a separate
+tuning-cache key, so a previously cached tile-8 choice cannot bypass this
+policy without forcing unrelated shapes to retune. The adapter raises an error
+if FlashInfer removes either tuning hook or moves runner construction outside
+the cloned entrypoints.
+
+This is a temporary workaround for FlashInfer 0.7's MoE tactic selection.
+Remove it when upstream tuning handles the full decode graph; see
+[TokenSpeed PR #1749](https://github.com/lightseekorg/tokenspeed/pull/1749).
 
 The policy targets CUDA-graph latency across routing, shared experts and MoE
 GEMMs. On the measured BS1 MTP3 graph, FlashInfer 0.7's isolated-kernel tuner
