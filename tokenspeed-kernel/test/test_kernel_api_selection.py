@@ -112,6 +112,9 @@ import tokenspeed_kernel.ops.residual.triton as _residual_triton
 import tokenspeed_kernel.ops.sampling as _sampling_pkg
 import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
 import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
+import tokenspeed_kernel.ops.transform as _transform_pkg
+import tokenspeed_kernel.ops.transform.gluon as _transform_gluon
+import tokenspeed_kernel.ops.transform.triton as _transform_triton
 import torch
 from tokenspeed_kernel.ops.attention.dsa import triton as _attention_triton_dsa
 from tokenspeed_kernel.ops.attention.dsv4 import triton as _attention_triton_dsv4
@@ -269,6 +272,10 @@ _RELOAD_MODULES = [
     _sampling_cute_dsl,
     _sampling_gluon,
     _sampling_pkg,
+    # Transform registration modules.
+    _transform_gluon,
+    _transform_triton,
+    _transform_pkg,
 ]
 
 
@@ -489,6 +496,17 @@ def _mm_dense() -> torch.Tensor:
     a = torch.empty((4, 16), dtype=torch.bfloat16)
     b = torch.empty((32, 16), dtype=torch.bfloat16)
     return kernel_mm(a, b)
+
+
+def _hadamard_transform(
+    *,
+    contiguous: bool = True,
+) -> torch.Tensor:
+    if contiguous:
+        x = torch.empty((8_192, 32, 128), dtype=torch.bfloat16, device="meta")
+    else:
+        x = torch.empty((8_192, 32, 256), dtype=torch.bfloat16, device="meta")[..., ::2]
+    return tokenspeed_kernel.hadamard_transform(x, scale=128**-0.5)
 
 
 def _mm_dense_cdna4_aligned() -> torch.Tensor:
@@ -4606,6 +4624,25 @@ def _case(
 
 
 _CASES = [
+    # GFX950 uses Gluon for contiguous BF16; other layouts retain Triton.
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "transform",
+        "hadamard_transform",
+        "gluon_hadamard_transform_128_gfx950",
+        _hadamard_transform,
+        id_suffix="bf16-contiguous",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "transform",
+        "hadamard_transform",
+        "triton_hadamard_transform_128",
+        partial(_hadamard_transform, contiguous=False),
+        id_suffix="bf16-strided-fallback",
+    ),
     # Attention API x architecture golden cases.
     _case(
         _is_cdna4,
@@ -6137,6 +6174,9 @@ def selected_kernel_spy(monkeypatch):
             return torch.empty(
                 (logits.shape[0],), dtype=torch.int64, device=logits.device
             )
+
+        if case.family == "transform":
+            return torch.empty_like(args[0])
 
         if case.family == "moe":
             if case.mode == "topk":

@@ -484,6 +484,18 @@ code, and the boundary tiles mask keys only, since rows past `q_len` are
 never stored. V is not masked: TDM zero-fills tile rows past `kv_len`, and
 those keys score `-inf`.
 
+## Transform
+
+### GFX950 Hadamard query transform
+
+The GLM-5.3-Flash query transform uses a one-wave Gluon kernel for contiguous
+BF16 rows of width 128. Each lane keeps two FP32 values while seven butterfly
+stages apply the transform; the stage order matches the portable reduction
+tree so the BF16 results agree exactly. The output scale is fixed for a
+compiled kernel, while the number of rows is supplied by the launch grid.
+Other dtypes, layouts, and architectures retain their existing registered
+backend.
+
 ## Sampling
 
 ### Argmax
