@@ -20,10 +20,11 @@
 
 """Private FlashInfer TRT-LLM launcher with initialized routing-map padding.
 
-Keep the upstream routing, tuning and GEMM implementations. Only the native
-routing workspace allocation gains a stream-ordered initialization, recorded
-during capture and executed on every replay. The installed package, upstream
-Python globals and upstream JIT artifacts remain untouched.
+Keep the upstream routing, tuner and GEMM implementations. The native routing
+workspace allocation gains a stream-ordered initialization, recorded during
+capture and executed on every replay. One Qwen3.8 decode shape narrows the
+valid MoE tactics to tile 32. The installed package, upstream Python globals
+and upstream JIT artifacts remain untouched.
 """
 
 from __future__ import annotations
@@ -118,16 +119,80 @@ def _register_private(register, name, *args, **kwargs):
     return register(f"tokenspeed_flashinfer_route_init::{operator}", *args, **kwargs)
 
 
+def _prefer_qwen38_decode_tile_32(
+    tactics,
+    *,
+    num_tokens: int,
+    top_k: int,
+    num_experts: int,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    nvfp4: bool,
+):
+    """Preserve the graph-friendly NVFP4 tile for Qwen3.8 decode shapes."""
+    if not (
+        nvfp4
+        and 1 <= num_tokens <= 32
+        and top_k == 10
+        and num_experts == 512
+        and num_local_experts == 128
+        and hidden_size == 2560
+        and intermediate_size == 640
+    ):
+        return tactics
+    # FlashInfer returns tvm_ffi.Array entries, not Python tuples or lists.
+    selected = [tactic for tactic in tactics if int(tactic[0]) == 32]
+    return selected or tactics
+
+
+def _require_tactic_hooks(runner_type: type) -> None:
+    for name in ("get_cache_key_extras", "get_valid_tactics"):
+        if not any(name in vars(base) for base in runner_type.__mro__):
+            raise RuntimeError(
+                f"FlashInfer MoE runner no longer defines {name}; "
+                "review the private tile-32 adapter."
+            )
+
+
 @functools.cache
 def _entrypoints():
     from flashinfer.fused_moe import core
+    from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
+    from flashinfer.tllm_enums import DtypeTrtllmGen
+
+    _require_tactic_hooks(core.TrtllmMoERunner)
+
+    class TokenSpeedFP4MoERunner(core.TrtllmMoERunner):
+        """Keep low-M MoE tile selection separate from upstream tuning caches."""
+
+        def get_cache_key_extras(self, inputs):
+            return (
+                *super().get_cache_key_extras(inputs),
+                "tokenspeed-qwen38-tile32-v1",
+            )
+
+        def get_valid_tactics(self, inputs, profile):
+            tactics = super().get_valid_tactics(inputs, profile)
+            num_tokens = MoeRunnerInputs.from_list(inputs).hidden_states.shape[0]
+            return _prefer_qwen38_decode_tile_32(
+                tactics,
+                num_tokens=num_tokens,
+                top_k=self.top_k,
+                num_experts=self.num_experts,
+                num_local_experts=self.num_local_experts,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                nvfp4=self.dtype_weights == DtypeTrtllmGen.E2m1,
+            )
 
     namespace = dict(vars(core))
+    namespace["TrtllmMoERunner"] = TokenSpeedFP4MoERunner
     namespace["gen_trtllm_gen_fused_moe_sm100_module"] = _routing_initialized_spec
     for name in ("register_custom_op", "register_fake_op"):
         namespace[name] = functools.partial(_register_private, getattr(core, name))
     # Rebind the public dispatch and cached module factory, retaining the
-    # upstream operator signatures, fake implementations and tactic selection.
+    # upstream operator signatures and fake implementations.
     factory = "_get_trtllm_moe_sm100_module_impl"
     if hasattr(core, factory):
         namespace[factory] = functools.cache(_clone(getattr(core, factory), namespace))

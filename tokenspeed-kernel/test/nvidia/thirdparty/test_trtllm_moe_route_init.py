@@ -28,7 +28,9 @@ from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
     _clone,
     _entrypoints,
     _initialize_routing_map,
+    _prefer_qwen38_decode_tile_32,
     _register_private,
+    _require_tactic_hooks,
 )
 
 _ALLOCATION = """
@@ -90,6 +92,65 @@ def test_operator_names_are_private():
         _register_private(register, "another::moe", mutates_args=())
 
 
+def test_qwen38_decode_tactic_filter_accepts_ffi_arrays():
+    tvm_ffi = pytest.importorskip("tvm_ffi")
+    tactics = [
+        tvm_ffi.Array([8, 1]),
+        tvm_ffi.Array([32, 2]),
+        tvm_ffi.Array([16, 3]),
+        tvm_ffi.Array([32, 4]),
+    ]
+    shape = {
+        "top_k": 10,
+        "num_experts": 512,
+        "num_local_experts": 128,
+        "hidden_size": 2560,
+        "intermediate_size": 640,
+        "nvfp4": True,
+    }
+    assert _prefer_qwen38_decode_tile_32(tactics, num_tokens=4, **shape) == [
+        tactics[1],
+        tactics[3],
+    ]
+    assert _prefer_qwen38_decode_tile_32(tactics, num_tokens=33, **shape) is tactics
+    assert (
+        _prefer_qwen38_decode_tile_32(
+            tactics, num_tokens=4, **{**shape, "hidden_size": 4096}
+        )
+        is tactics
+    )
+    assert (
+        _prefer_qwen38_decode_tile_32(
+            tactics, num_tokens=4, **{**shape, "nvfp4": False}
+        )
+        is tactics
+    )
+    without_tile_32 = [tactics[0], tactics[2]]
+    assert (
+        _prefer_qwen38_decode_tile_32(without_tile_32, num_tokens=4, **shape)
+        is without_tile_32
+    )
+
+
+def test_tactic_hooks_must_exist_on_upstream_runner():
+    class CacheOnly:
+        def get_cache_key_extras(self, inputs):
+            return ()
+
+    class TacticsOnly:
+        def get_valid_tactics(self, inputs, profile):
+            return []
+
+    class InheritedHooks(CacheOnly, TacticsOnly):
+        pass
+
+    _require_tactic_hooks(InheritedHooks)
+    with pytest.raises(RuntimeError, match="get_cache_key_extras"):
+        _require_tactic_hooks(TacticsOnly)
+    with pytest.raises(RuntimeError, match="get_valid_tactics"):
+        _require_tactic_hooks(CacheOnly)
+
+
 def test_upstream_dispatch_and_caches_are_unchanged():
     core = pytest.importorskip("flashinfer.fused_moe.core")
     before = dict(vars(core))
@@ -98,6 +159,8 @@ def test_upstream_dispatch_and_caches_are_unchanged():
     assert (
         private["get_trtllm_moe_sm100_module"] is not core.get_trtllm_moe_sm100_module
     )
+    assert issubclass(private["TrtllmMoERunner"], core.TrtllmMoERunner)
+    assert private["TrtllmMoERunner"] is not core.TrtllmMoERunner
     for name in ("trtllm_fp4_block_scale_moe", "trtllm_fp4_block_scale_routed_moe"):
         assert private[name].__globals__ is private
         assert inspect.signature(private[name]) == inspect.signature(
