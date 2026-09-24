@@ -1618,6 +1618,33 @@ def test_stage2_large_reduce_tile_matches_reference_gfx950() -> None:
     torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
 
 
+@pytest.mark.parametrize(
+    ("a_format", "b_gdot128", "expected"),
+    [
+        ("e2m1", True, 8),
+        ("e2m1", False, 1),
+        ("e4m3", True, 1),
+        ("e4m3", False, 1),
+    ],
+)
+def test_stage1_group_size_selection_gfx950(
+    a_format: str,
+    b_gdot128: bool,
+    expected: int,
+) -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage1 import (
+        _select_stage1_group_size_m,
+    )
+
+    assert (
+        _select_stage1_group_size_m(
+            a_format=a_format,
+            b_gdot128=b_gdot128,
+        )
+        == expected
+    )
+
+
 def test_tp_situ_package_prefill_block64_matches_block128_gfx950(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
