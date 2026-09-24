@@ -1130,10 +1130,16 @@ def test_mi450_sim_uses_bounded_smoke_suite():
     task = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml")
 
     assert task["env"]["MI450_SIM_RUN_TIMEOUT"] == "600"
-    assert task["env"]["ROCM_SDK_VERSION"] == "10.1.0a20260822"
     assert task["install"][-1].endswith("install_deps_rocm.sh kernel")
     assert task["env"]["MI450_SIM_TEST_ROOT"] != "tokenspeed-kernel/test"
     assert "tokenspeed-kernel/test/amd/ops/attention" in task["env"]["MI450_SIM_TESTS"]
+
+
+def test_mi450_sim_pins_last_passing_toolchain():
+    task = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml")
+
+    # MI450_SIM.md records why this SDK version is pinned.
+    assert task["env"]["ROCM_SDK_VERSION"] == "10.1.0a20260822"
 
 
 def test_mi450_sim_uses_stock_triton_compatible_libhip_path():
