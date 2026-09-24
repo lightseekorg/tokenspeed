@@ -64,17 +64,6 @@ def test_split_k_does_not_drop_k_tiles() -> None:
 
 @pytest.mark.parametrize(
     ("tokens", "expected"),
-    [(1280, False), (1281, True), (2048, True), (4095, True), (4096, True)],
-)
-def test_prefill_dispatch_bounds(tokens: int, expected: bool) -> None:
-    spec = KernelRegistry.get().get_by_name("gluon_latent_input_largem_gfx950")
-    assert spec is not None
-    assert "tokens_align" not in spec.traits
-    assert spec_matches_shape_traits(spec, {"tokens": tokens}) is expected
-
-
-@pytest.mark.parametrize(
-    ("tokens", "expected"),
     [
         (128, "gluon_latent_input_small_batch_gfx950"),
         (129, "gluon_latent_input_small_batch_gfx950"),
@@ -84,7 +73,9 @@ def test_prefill_dispatch_bounds(tokens: int, expected: bool) -> None:
         (641, None),
         (1280, None),
         (1281, "gluon_latent_input_largem_gfx950"),
+        (2048, "gluon_latent_input_largem_gfx950"),
         (4095, "gluon_latent_input_largem_gfx950"),
+        (4096, "gluon_latent_input_largem_gfx950"),
     ],
 )
 def test_k3_prefill_dispatch(tokens: int, expected: str | None) -> None:
