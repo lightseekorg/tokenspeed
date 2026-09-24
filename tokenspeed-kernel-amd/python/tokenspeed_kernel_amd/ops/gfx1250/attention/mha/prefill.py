@@ -469,10 +469,9 @@ class AttentionProgram:
     def softmax_part0_full_rows(self, qk, m_i):
         cfg = self.cfg
         if cfg.HEAD_DIM == 128:
-            qk_scaled = qk * cfg.SM_SCALE
-            row_max = max(qk_scaled, 1)
-            m_new = maximum(m_i, row_max)
-            p = gl.exp2(qk_scaled - m_new[:, None])
+            row_max_scaled = max(qk, 1) * cfg.SM_SCALE
+            m_new = maximum(m_i, row_max_scaled)
+            p = gl.exp2(qk * cfg.SM_SCALE - m_new[:, None])
             alpha = gl.exp2(m_i - m_new)
         else:
             row_max = max(qk, 1)
