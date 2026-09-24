@@ -47,8 +47,7 @@ if FlashInfer removes either tuning hook or moves runner construction outside
 the cloned entrypoints.
 
 This is a temporary workaround for FlashInfer 0.7's MoE tactic selection.
-Remove it when upstream tuning handles the full decode graph; see
-[TokenSpeed PR #1749](https://github.com/lightseekorg/tokenspeed/pull/1749).
+Remove it when upstream tuning handles the full decode graph.
 
 The policy targets CUDA-graph latency across routing, shared experts and MoE
 GEMMs. On the measured BS1 MTP3 graph, FlashInfer 0.7's isolated-kernel tuner
