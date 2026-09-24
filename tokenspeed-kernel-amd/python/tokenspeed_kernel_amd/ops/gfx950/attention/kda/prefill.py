@@ -63,6 +63,8 @@ from tokenspeed_kernel_amd._triton import gl, gluon, triton
 _CHUNK_SIZE = 64
 _SUBCHUNK_SIZE = 16
 _FUSED_PREPROCESS_WARPS = 4
+_STATE_SCAN_OUTPUT_BLOCK = 16
+_STATE_SCAN_WAVES_PER_EU = 2
 cdna4 = gl.amd.cdna4
 
 
@@ -1017,7 +1019,7 @@ def launch_gluon_kda_paged_prefill_gfx950(
     output = torch.empty_like(v)
     final_state = torch.empty_like(initial_state)
     initial_state_contiguous = initial_state.contiguous()
-    scan_output_block = 8
+    scan_output_block = _STATE_SCAN_OUTPUT_BLOCK
     _launch_producer(
         num_chunks=num_chunks,
         heads=heads,
@@ -1056,7 +1058,7 @@ def launch_gluon_kda_paged_prefill_gfx950(
         BO=scan_output_block,
         num_warps=4,
         num_stages=2,
-        waves_per_eu=4,
+        waves_per_eu=_STATE_SCAN_WAVES_PER_EU,
     )
     gluon_kda_paged_prefill_gfx950[(num_chunks, heads)](
         aqk,

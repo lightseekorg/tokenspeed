@@ -140,6 +140,20 @@ decisions.
 
 ## Attention
 
+### gfx950 KDA prefill
+
+The chunk-parallel KDA prefill path processes 64-token chunks in parallel and
+keeps only the recurrent state carry serial across chunks. Its state-scan
+kernel owns a contiguous output-row tile for one sequence and attention head;
+each program computes the inter-chunk output, delta update, and next state for
+that tile.
+
+The gfx950 scan uses 16 output rows per four-wave workgroup with a two-wave-per-
+EU residency hint. This halves the workgroup count relative to an eight-row
+tile while increasing useful MFMA work per state load. The geometry is tuned
+for KDA's 128-wide key/value state and the one- or two-sequence 8K-token
+prefill batches emitted by the TokenSpeed scheduler.
+
 ### DeepSeek V4 attention
 
 The gfx950 and gfx1250 packages provide MXFP4 index selection. Gfx950 also
