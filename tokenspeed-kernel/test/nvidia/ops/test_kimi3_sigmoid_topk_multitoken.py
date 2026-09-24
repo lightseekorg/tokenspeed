@@ -50,6 +50,9 @@ from tokenspeed_kernel.ops.moe import sigmoid_topk as sigmoid_topk_mod  # noqa: 
 from tokenspeed_kernel.ops.moe.sigmoid_topk import (  # noqa: E402
     _moe_sigmoid_bias_topk as moe_sigmoid_bias_topk,
 )
+from tokenspeed_kernel.ops.moe.triton import (  # noqa: E402
+    kimi3_sigmoid_topk as kimi3_sigmoid_topk_mod,
+)
 from tokenspeed_kernel.ops.moe.triton.kimi3_sigmoid_topk import (  # noqa: E402
     kimi3_sigmoid_bias_topk,
 )
@@ -115,13 +118,13 @@ def test_dispatcher_sends_a_verify_window_to_the_packed_kernel(tokens, monkeypat
     for the output dtype directly, which is what retires the per-layer cast.
     """
     calls = []
-    real = sigmoid_topk_mod.kimi3_sigmoid_bias_topk
+    real = kimi3_sigmoid_topk_mod.kimi3_sigmoid_bias_topk
 
     def spy(*args, **kwargs):
         calls.append(kwargs["weights_dtype"])
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(sigmoid_topk_mod, "kimi3_sigmoid_bias_topk", spy)
+    monkeypatch.setattr(kimi3_sigmoid_topk_mod, "kimi3_sigmoid_bias_topk", spy)
 
     torch.manual_seed(5)
     logits = (torch.randn(tokens, EXPERTS, device="cuda") * 0.2).float()
@@ -153,10 +156,10 @@ def test_dispatcher_hands_rows_past_the_cap_to_the_grouped_kernel(monkeypatch):
     """One row past the crossover the packed kernel must not run, and the
     grouped kernel must be asked for the output dtype rather than returning
     fp32 for the wrapper to cast."""
-    cap = sigmoid_topk_mod._K3_PACKED_TOPK_MAX_ROWS_NVIDIA
+    cap = kimi3_sigmoid_topk_mod._PACKED_ROWS_NVIDIA.stop - 1
     calls = []
     monkeypatch.setattr(
-        sigmoid_topk_mod,
+        kimi3_sigmoid_topk_mod,
         "kimi3_sigmoid_bias_topk",
         lambda *a, **k: calls.append(k) or pytest.fail("packed ran past the cap"),
     )

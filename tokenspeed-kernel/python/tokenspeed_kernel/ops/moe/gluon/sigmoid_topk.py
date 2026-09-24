@@ -80,7 +80,8 @@ if current_platform().is_amd:
         signatures=format_signatures("router_logits", "dense", {torch.float32}),
         priority=Priority.SPECIALIZED,
         traits={
-            "tokens": range(2, 1 << 31),
+            # Packed covers rows 2..512. This kernel is ahead from 513.
+            "tokens": range(513, 1 << 31),
             "experts": frozenset({896}),
             "topk": frozenset({16}),
         },

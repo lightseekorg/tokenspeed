@@ -4,12 +4,10 @@
 
 from __future__ import annotations
 
+import tokenspeed_kernel.ops.moe.triton.kimi3_sigmoid_topk  # noqa: F401
 import torch
-from tokenspeed_kernel.ops.moe.triton.kimi3_sigmoid_topk import (
-    kimi3_sigmoid_bias_topk,
-)
 from tokenspeed_kernel.ops.moe.triton.minimax_topk import minimax_biased_grouped_topk
-from tokenspeed_kernel.platform import CapabilityRequirement, Platform, pdl_enabled
+from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import (
@@ -34,12 +32,6 @@ def _gluon_eligible(
         and router_logits.stride(1) == 1
         and correction_bias.is_contiguous()
     )
-
-
-#: GB200, cold L2: packed wins to 256 rows and ties the grouped kernel at 320.
-_K3_PACKED_TOPK_MAX_ROWS_NVIDIA = 256
-#: Unmeasured past one row on CDNA4, so it keeps what it was tuned at.
-_K3_PACKED_TOPK_MAX_ROWS_CDNA4 = 1
 
 
 def _moe_sigmoid_bias_topk(
@@ -100,47 +92,6 @@ def _moe_sigmoid_bias_topk(
             torch.empty(shape, device=router_logits.device, dtype=weights_dtype),
             torch.empty(shape, device=router_logits.device, dtype=torch.int32),
         )
-    platform = Platform.get()
-    if platform.is_nvidia:
-        packed_max_rows = _K3_PACKED_TOPK_MAX_ROWS_NVIDIA
-    elif platform.is_cdna4:
-        packed_max_rows = _K3_PACKED_TOPK_MAX_ROWS_CDNA4
-    else:
-        packed_max_rows = 0
-    if (
-        override is None
-        and solution is None
-        and router_logits.shape[1] == 896
-        and 0 < tokens <= packed_max_rows
-        and router_logits.dtype == torch.float32
-        and correction_bias.dtype == torch.float32
-        and topk == 16
-        # The packed kernel raises on these layouts; the grouped one reads strides.
-        and router_logits.is_cuda
-        and router_logits.is_contiguous()
-        and correction_bias.is_contiguous()
-    ):
-        # Selection matches the grouped kernel; the weights differ by an fp32 ulp.
-        topk_weights, topk_ids = kimi3_sigmoid_bias_topk(
-            router_logits,
-            correction_bias,
-            enable_pdl=pdl_enabled(),
-            routed_scaling_factor=routed_scaling_factor,
-            normalize_topk_weights=normalize_topk_weights,
-            logical_to_physical_map=(
-                logical_to_physical_map
-                if logical_to_physical_map is not None
-                and logical_to_physical_map.dtype == torch.int32
-                else None
-            ),
-            weights_dtype=weights_dtype,
-        )
-        if (
-            logical_to_physical_map is not None
-            and logical_to_physical_map.dtype == torch.int64
-        ):
-            topk_ids = logical_to_physical_map[topk_ids.long()].to(torch.int32)
-        return topk_weights, topk_ids
     if (
         override is None
         and solution is None
@@ -154,7 +105,7 @@ def _moe_sigmoid_bias_topk(
         logical_to_physical_map is not None
         and logical_to_physical_map.dtype == torch.int32
         and solution is None
-        and override in {None, "triton_decode_sigmoid_bias_topk_mapped"}
+        and (override is None or override.endswith("_mapped"))
     ):
         try:
             mapped_kernel = select_kernel(

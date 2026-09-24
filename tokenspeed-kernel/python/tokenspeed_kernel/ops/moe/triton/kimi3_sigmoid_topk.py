@@ -6,7 +6,15 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import Platform, current_platform
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    Platform,
+    current_platform,
+    pdl_enabled,
+)
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 
 @triton.jit
@@ -184,6 +192,176 @@ def kimi3_sigmoid_bias_topk(
         **pdl_kwargs,
     )
     return topk_weights, topk_ids
+
+
+#: Row ranges where the packed sort beats the kernel otherwise selected.
+#: NVIDIA measured on GB200, cold L2: ahead to 256 rows, tying at 320.
+#: CDNA5 measured on MI455X: 1.54x from two rows, still ahead at 512 and
+#: behind by 1024. One row stays with the decode specialist, and the
+#: gfx1250 Gluon kernel starts at 513, so these ranges do not overlap.
+#: CDNA4 one-token K3 stays on the decode specialist: on MI355X that kernel
+#: is ahead of packed, and it already covers this shape.
+_PACKED_ROWS_NVIDIA = range(1, 257)
+_PACKED_ROWS_CDNA5 = range(2, 513)
+_PACKED_CONTRACT = {
+    "experts": frozenset({896}),
+    "topk": frozenset({16}),
+}
+
+
+def _invoke_packed(
+    *,
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    routed_scaling_factor: float,
+    normalize_topk_weights: bool,
+    weights_dtype: torch.dtype,
+    logical_to_physical_map: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    dispatch = logical_to_physical_map
+    if dispatch is not None and dispatch.dtype != torch.int32:
+        dispatch = None
+    return kimi3_sigmoid_bias_topk(
+        router_logits.contiguous(),
+        correction_bias.contiguous(),
+        routed_scaling_factor=routed_scaling_factor,
+        normalize_topk_weights=normalize_topk_weights,
+        logical_to_physical_map=None if dispatch is None else dispatch.contiguous(),
+        weights_dtype=weights_dtype,
+        enable_pdl=pdl_enabled(),
+    )
+
+
+_PACKED_SIGNATURES = format_signatures("router_logits", "dense", {torch.float32})
+
+
+@register_kernel(
+    "moe",
+    "sigmoid_bias_topk",
+    name="triton_kimi3_packed_sigmoid_bias_topk_nvidia",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=_PACKED_SIGNATURES,
+    priority=Priority.SPECIALIZED,
+    traits={**_PACKED_CONTRACT, "tokens": _PACKED_ROWS_NVIDIA},
+)
+def triton_kimi3_packed_sigmoid_bias_topk_nvidia(
+    *,
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    routed_scaling_factor: float,
+    normalize_topk_weights: bool,
+    weights_dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _invoke_packed(
+        router_logits=router_logits,
+        correction_bias=correction_bias,
+        topk=topk,
+        routed_scaling_factor=routed_scaling_factor,
+        normalize_topk_weights=normalize_topk_weights,
+        weights_dtype=weights_dtype,
+    )
+
+
+@register_kernel(
+    "moe",
+    "sigmoid_bias_topk_mapped",
+    name="triton_kimi3_packed_sigmoid_bias_topk_nvidia_mapped",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=_PACKED_SIGNATURES,
+    priority=Priority.SPECIALIZED,
+    traits={**_PACKED_CONTRACT, "tokens": _PACKED_ROWS_NVIDIA},
+)
+def triton_kimi3_packed_sigmoid_bias_topk_nvidia_mapped(
+    *,
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    routed_scaling_factor: float,
+    normalize_topk_weights: bool,
+    logical_to_physical_map: torch.Tensor,
+    weights_dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _invoke_packed(
+        router_logits=router_logits,
+        correction_bias=correction_bias,
+        topk=topk,
+        routed_scaling_factor=routed_scaling_factor,
+        normalize_topk_weights=normalize_topk_weights,
+        logical_to_physical_map=logical_to_physical_map,
+        weights_dtype=weights_dtype,
+    )
+
+
+@register_kernel(
+    "moe",
+    "sigmoid_bias_topk",
+    name="triton_kimi3_packed_sigmoid_bias_topk_gfx1250",
+    solution="triton",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(12, 5),
+        max_arch_version=ArchVersion(12, 5),
+        vendors=frozenset({"amd"}),
+    ),
+    signatures=_PACKED_SIGNATURES,
+    priority=Priority.SPECIALIZED,
+    traits={**_PACKED_CONTRACT, "tokens": _PACKED_ROWS_CDNA5},
+)
+def triton_kimi3_packed_sigmoid_bias_topk_gfx1250(
+    *,
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    routed_scaling_factor: float,
+    normalize_topk_weights: bool,
+    weights_dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _invoke_packed(
+        router_logits=router_logits,
+        correction_bias=correction_bias,
+        topk=topk,
+        routed_scaling_factor=routed_scaling_factor,
+        normalize_topk_weights=normalize_topk_weights,
+        weights_dtype=weights_dtype,
+    )
+
+
+@register_kernel(
+    "moe",
+    "sigmoid_bias_topk_mapped",
+    name="triton_kimi3_packed_sigmoid_bias_topk_gfx1250_mapped",
+    solution="triton",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(12, 5),
+        max_arch_version=ArchVersion(12, 5),
+        vendors=frozenset({"amd"}),
+    ),
+    signatures=_PACKED_SIGNATURES,
+    priority=Priority.SPECIALIZED,
+    traits={**_PACKED_CONTRACT, "tokens": _PACKED_ROWS_CDNA5},
+)
+def triton_kimi3_packed_sigmoid_bias_topk_gfx1250_mapped(
+    *,
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    routed_scaling_factor: float,
+    normalize_topk_weights: bool,
+    logical_to_physical_map: torch.Tensor,
+    weights_dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _invoke_packed(
+        router_logits=router_logits,
+        correction_bias=correction_bias,
+        topk=topk,
+        routed_scaling_factor=routed_scaling_factor,
+        normalize_topk_weights=normalize_topk_weights,
+        logical_to_physical_map=logical_to_physical_map,
+        weights_dtype=weights_dtype,
+    )
 
 
 __all__ = ["kimi3_sigmoid_bias_topk"]

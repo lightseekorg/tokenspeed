@@ -140,6 +140,9 @@ from tokenspeed_kernel.ops.moe.triton import bf16 as _moe_triton_bf16
 from tokenspeed_kernel.ops.moe.triton import (
     decode_sigmoid_topk as _moe_triton_decode_sigmoid_topk,
 )
+from tokenspeed_kernel.ops.moe.triton import (
+    kimi3_sigmoid_topk as _moe_triton_kimi3_sigmoid_topk,
+)
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, Priority
@@ -235,6 +238,7 @@ _RELOAD_MODULES = [
     _moe_native,
     _moe_triton_bf16,
     _moe_triton_decode_sigmoid_topk,
+    _moe_triton_kimi3_sigmoid_topk,
     _moe_triton_sqrt_softplus,
     _moe_triton_mxfp4,
     _moe_triton_softmax_topk,
@@ -2986,6 +2990,12 @@ def test_gfx1250_sigmoid_topk_selects_by_token_count(
             signature,
             traits={"tokens": 16, "experts": 896, "topk": 16},
         )
+        past_packed = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            signature,
+            traits={"tokens": 1024, "experts": 896, "topk": 16},
+        )
         other_shape = select_kernel(
             "moe",
             "sigmoid_bias_topk",
@@ -3005,7 +3015,8 @@ def test_gfx1250_sigmoid_topk_selects_by_token_count(
         registry.clear_cache()
 
     assert decode.name == "triton_decode_sigmoid_bias_topk"
-    assert batched.name == "gluon_sigmoid_bias_topk_gfx1250"
+    assert batched.name == "triton_kimi3_packed_sigmoid_bias_topk_gfx1250"
+    assert past_packed.name == "gluon_sigmoid_bias_topk_gfx1250"
     assert other_shape.name == "torch_sigmoid_bias_topk"
     assert reduced_precision.name == "torch_sigmoid_bias_topk"
 
