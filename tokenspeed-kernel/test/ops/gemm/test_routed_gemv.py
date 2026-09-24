@@ -421,13 +421,92 @@ def test_skinny_config_route_entries_are_valid():
         assert shape_dynamic_skinny_gemm.supports(config, m, n, k), (m, n, k)
 
 
+# What each FlashInfer BF16 backend does here, per PDL setting: None when it
+# runs, else the substring its refusal must carry. The route's candidate set
+# rests on this. A sweep that catches every exception and scores it as "no
+# result" cannot tell "this backend lost" from "this backend was never asked
+# properly" -- which is how three of these were missed: they reject pdl=True
+# outright rather than ignoring it.
+_BF16_BACKEND_SUPPORT = {
+    "cudnn": {True: None, False: None},
+    "tgv": {True: None, False: None},
+    "tinygemm": {True: None, False: None},
+    "cute-dsl": {True: None, False: None},
+    "cutlass": {True: "does not support PDL", False: None},
+    "cublaslt": {True: "does not support PDL", False: None},
+    "cutile": {True: "ignores `pdl`", False: "No valid config found"},
+}
+_BF16_BACKEND_SUPPORT_107 = {
+    backend: {
+        pdl: f"does not support backend '{backend}' with capability 107"
+        for pdl in (True, False)
+    }
+    for backend in _BF16_BACKEND_SUPPORT
+}
+_BF16_BACKEND_SUPPORT_107["cutlass"] = _BF16_BACKEND_SUPPORT["cutlass"]
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _is_routed_arch(),
+    reason="route is registered for sm100 and up",
+)
+@pytest.mark.parametrize("backend", sorted(_BF16_BACKEND_SUPPORT))
+def test_bf16_backend_support_is_what_the_route_was_tuned_against(backend):
+    """Pin the candidate set the measured tables were chosen from.
+
+    A wheel that makes a refused backend work, or breaks one that worked, moves
+    the set the tuner should have searched -- and neither shows up as a wrong
+    answer anywhere, only as a table that is quietly no longer the best pick.
+    """
+    from flashinfer import mm_bf16
+
+    m, n, k = 8, 1792, 7168  # a real draft projection
+    torch.manual_seed(0)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    ref = x.float() @ w.float().t()
+    support = (
+        _BF16_BACKEND_SUPPORT_107
+        if torch.cuda.get_device_capability() == (10, 7)
+        else _BF16_BACKEND_SUPPORT
+    )
+    for pdl, refusal in support[backend].items():
+        try:
+            got = mm_bf16(x, w.t(), pdl=pdl, backend=backend)
+        except Exception as exc:  # noqa: BLE001  (any refusal is the signal)
+            assert refusal is not None, (
+                f"{backend} pdl={pdl} was usable when the tables were tuned and "
+                f"now raises {exc!r}; re-run test/gemm_tuning/tune_route.py"
+            )
+            assert refusal in str(
+                exc
+            ), f"{backend} pdl={pdl} refuses for a new reason: {exc!r}"
+            continue
+        assert refusal is None, (
+            f"{backend} pdl={pdl} now runs but was excluded from the sweep; "
+            f"re-run test/gemm_tuning/tune_route.py -- it may win a shape"
+        )
+        rel = (got.float() - ref).abs().max().item() / ref.abs().max().item()
+        assert rel < 0.02, f"{backend} pdl={pdl} rel err {rel:.4f}"
+
+
 def test_the_shared_vendor_module_is_never_touched():
-    """The adapter leaves the shared vendor module unloaded."""
-    # Use a fresh process so earlier tests cannot hide an import by the adapter.
+    """The adapter owns its instance; mm_bf16's own path never sees the change."""
+    # A subprocess that has NOT imported the vendor module: importing it first
+    # puts its name in sys.modules, which is exactly what the private instance
+    # needs for @dataclass to resolve while the vendor source runs. An
+    # in-process check would therefore pass even when the production path --
+    # nothing has imported it yet -- cannot build one at all.
     script = """
 import importlib.util, sys
 V = "flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk"
-if importlib.util.find_spec("flashinfer") is None:
+try:
+    # find_spec imports the parents, so a missing flashinfer raises here
+    # rather than answering None.
+    found = importlib.util.find_spec(V) is not None
+except ModuleNotFoundError:
+    found = False
+if not found:
     print("skip"); raise SystemExit(0)
 assert V not in sys.modules, "vendor already imported; the check would be void"
 from tokenspeed_kernel.ops.gemm.routed_gemv import SPLITK_TACTIC_ROUTE
@@ -436,6 +515,9 @@ assert fs.is_available(), "adapter disabled itself"
 refused = [key for key, t in SPLITK_TACTIC_ROUTE.items() if not fs.supports(*key, t)]
 assert not refused, f"refused {refused}"
 assert V not in sys.modules, "building the private instance imported the vendor"
+import flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk as vendor
+assert fs._module() is not vendor, "not a private instance"
+assert vendor._MAX_M == 32, f"vendor cutover moved to {vendor._MAX_M}"
 print("ok")
 """
     proc = subprocess.run(
