@@ -22,9 +22,99 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+
+
+# Selected-slot DSA attention in absorbed-MLA form: the values are the latent
+# part of the selected KV rows, so each gathered tile feeds both S = Q K^T and
+# O += P V on tensor cores. Decode splits the keys across programs and merges
+# the splits with a log-sum-exp combine.
+_BLOCK_H = 16
+_BLOCK_N = 32
+
+
+@triton.jit
+def _dsa_key_range(
+    topk_lens,
+    token,
+    split,
+    topk: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # The first min(topk_lens[token], topk) selected slots are live. Each split
+    # takes an equal share of them, rounded up to whole key tiles.
+    valid_len = tl.load(topk_lens + token).to(tl.int32)
+    valid_len = tl.minimum(tl.maximum(valid_len, 0), topk)
+    split_len = tl.cdiv(tl.cdiv(valid_len, NUM_SPLITS), BLOCK_N) * BLOCK_N
+    start = split * split_len
+    return start, tl.minimum(start + split_len, valid_len)
+
+
+@triton.jit
+def _dsa_softmax_update(
+    scores,
+    valid,
+    latent,
+    m_i,
+    l_i,
+    acc,
+    softmax_scale: tl.constexpr,
+):
+    # One online-softmax step in base 2; the latent tile that produced the
+    # scores also holds the values.
+    scores = tl.where(
+        valid[None, :],
+        scores * (softmax_scale * 1.4426950408889634),
+        -float("inf"),
+    )
+    m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+    # Rows without a valid key so far use a zero offset to avoid -inf - -inf.
+    m_offset = tl.where(m_new == -float("inf"), 0.0, m_new)
+    alpha = tl.exp2(m_i - m_offset)
+    p = tl.exp2(scores - m_offset[:, None])
+    l_i = l_i * alpha + tl.sum(p, axis=1)
+    acc = tl.dot(p.to(latent.dtype), latent, acc * alpha[:, None])
+    return m_new, l_i, acc
+
+
+@triton.jit
+def _dsa_store_output(
+    out,
+    partial_out,
+    partial_lse,
+    acc,
+    m_i,
+    l_i,
+    rows,
+    head_mask,
+    split,
+    kv_lora_rank: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+):
+    dims = tl.arange(0, kv_lora_rank)
+    # Rows without any valid key are zero.
+    result = tl.where(l_i[:, None] > 0.0, acc / l_i[:, None], 0.0)
+    if NUM_SPLITS == 1:
+        tl.store(
+            out + rows[:, None] * kv_lora_rank + dims[None, :],
+            result.to(out.dtype.element_ty),
+            mask=head_mask[:, None],
+        )
+    else:
+        split_rows = rows * NUM_SPLITS + split
+        tl.store(
+            partial_out + split_rows[:, None] * kv_lora_rank + dims[None, :],
+            result,
+            mask=head_mask[:, None],
+        )
+        tl.store(
+            partial_lse + split_rows,
+            tl.where(l_i > 0.0, m_i + tl.log2(l_i), -float("inf")),
+            mask=head_mask,
+        )
 
 
 @triton.jit
@@ -36,6 +126,8 @@ def _dsa_packed_kv_kernel(
     topk_indices,
     topk_lens,
     out,
+    partial_out,
+    partial_lse,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     kv_lora_rank: tl.constexpr,
@@ -43,139 +135,86 @@ def _dsa_packed_kv_kernel(
     row_bytes: tl.constexpr,
     topk: tl.constexpr,
     softmax_scale: tl.constexpr,
-    BLOCK_TOPK: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    BLOCK_V: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_ROPE: tl.constexpr,
 ):
-    token = tl.program_id(0)
-    head = tl.program_id(1)
-    v_block = tl.program_id(2)
+    token = tl.program_id(0).to(tl.int64)
+    heads = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    split = tl.program_id(2)
+    head_mask = heads < num_heads
+    rows = token * num_heads + heads
+    dims = tl.arange(0, kv_lora_rank)
+    # A row holds kv_lora_rank FP8 latents, one FP32 scale per 128 of them,
+    # then the BF16 RoPE key.
+    num_groups: tl.constexpr = kv_lora_rank // 128
+    groups = tl.arange(0, num_groups)
 
-    topk_offsets = tl.arange(0, BLOCK_TOPK)
-    k_offsets = tl.arange(0, BLOCK_K)
-    rope_offsets = tl.arange(0, 64)
-    v_offsets = v_block * BLOCK_V + tl.arange(0, BLOCK_V)
-
-    q_base = (token * num_heads + head) * head_dim
-    q_nope_base = q_base
-    q_rope_base = q_base + kv_lora_rank
-
-    q_rope = tl.load(
-        q + q_rope_base + rope_offsets,
-        mask=rope_offsets < qk_rope_head_dim,
+    q_nope = tl.load(
+        q + rows[:, None] * head_dim + dims[None, :],
+        mask=head_mask[:, None],
         other=0.0,
-    ).to(tl.float32)
-
-    valid_len = tl.load(topk_lens + token).to(tl.int32)
-    max_score = tl.full((), -float("inf"), tl.float32)
-
-    for start in range(0, topk, BLOCK_TOPK):
-        cols = start + topk_offsets
-        valid = cols < valid_len
-        slots = tl.load(
-            topk_indices + token * topk + cols,
-            mask=valid,
-            other=0,
-        ).to(tl.int64)
-        valid = valid & (slots >= 0)
-        score = tl.zeros((BLOCK_TOPK,), tl.float32)
-
-        for k_start in range(0, kv_lora_rank, BLOCK_K):
-            ks = k_start + k_offsets
-            q_vals = tl.load(q + q_nope_base + ks).to(tl.float32)
-            k_vals = tl.load(
-                kv_fp8 + slots[:, None] * row_bytes + ks[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            k_scale = tl.load(
-                kv_scale
-                + (slots * row_bytes + kv_lora_rank + (k_start // 128) * 4) // 4,
-                mask=valid,
-                other=0.0,
-            ).to(tl.float32)
-            score += tl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
-
-        k_rope = tl.load(
-            kv_rope
-            + (slots[:, None] * row_bytes + kv_lora_rank + (kv_lora_rank // 128) * 4)
-            // 2
-            + rope_offsets[None, :],
-            mask=valid[:, None] & (rope_offsets[None, :] < qk_rope_head_dim),
+    ).to(tl.bfloat16)
+    if qk_rope_head_dim > 0:
+        rope_start: tl.constexpr = kv_lora_rank + num_groups * 4
+        rope_dims = tl.arange(0, BLOCK_ROPE)
+        rope_mask = rope_dims < qk_rope_head_dim
+        q_rope = tl.load(
+            q + rows[:, None] * head_dim + kv_lora_rank + rope_dims[None, :],
+            mask=head_mask[:, None] & rope_mask[None, :],
             other=0.0,
-        ).to(tl.float32)
-        score += tl.sum(k_rope * q_rope[None, :], axis=1)
-        score *= softmax_scale
-        score = tl.where(valid, score, -float("inf"))
-        max_score = tl.maximum(max_score, tl.max(score, axis=0))
+        ).to(tl.bfloat16)
 
-    denom = tl.full((), 0.0, tl.float32)
-    acc = tl.zeros((BLOCK_V,), tl.float32)
-    v_mask = v_offsets < kv_lora_rank
-    for start in range(0, topk, BLOCK_TOPK):
-        cols = start + topk_offsets
-        valid = cols < valid_len
-        slots = tl.load(
-            topk_indices + token * topk + cols,
-            mask=valid,
-            other=0,
-        ).to(tl.int64)
-        valid = valid & (slots >= 0)
-        score = tl.zeros((BLOCK_TOPK,), tl.float32)
-
-        for k_start in range(0, kv_lora_rank, BLOCK_K):
-            ks = k_start + k_offsets
-            q_vals = tl.load(q + q_nope_base + ks).to(tl.float32)
-            k_vals = tl.load(
-                kv_fp8 + slots[:, None] * row_bytes + ks[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            k_scale = tl.load(
-                kv_scale
-                + (slots * row_bytes + kv_lora_rank + (k_start // 128) * 4) // 4,
-                mask=valid,
-                other=0.0,
-            ).to(tl.float32)
-            score += tl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
-
-        k_rope = tl.load(
-            kv_rope
-            + (slots[:, None] * row_bytes + kv_lora_rank + (kv_lora_rank // 128) * 4)
-            // 2
-            + rope_offsets[None, :],
-            mask=valid[:, None] & (rope_offsets[None, :] < qk_rope_head_dim),
+    start, end = _dsa_key_range(topk_lens, token, split, topk, NUM_SPLITS, BLOCK_N)
+    m_i = tl.full([BLOCK_H], -float("inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_H], tl.float32)
+    acc = tl.zeros([BLOCK_H, kv_lora_rank], tl.float32)
+    for block_start in range(start, end, BLOCK_N):
+        cols = block_start + tl.arange(0, BLOCK_N)
+        slots = tl.load(topk_indices + token * topk + cols, mask=cols < end, other=-1)
+        valid = slots >= 0
+        kv_rows = slots.to(tl.int64) * row_bytes
+        # Dequantize the gathered rows once; the BF16 latent tile serves as
+        # both keys and values.
+        latent = tl.load(
+            kv_fp8 + kv_rows[:, None] + dims[None, :],
+            mask=valid[:, None],
             other=0.0,
-        ).to(tl.float32)
-        score += tl.sum(k_rope * q_rope[None, :], axis=1)
-        score *= softmax_scale
-        score = tl.where(valid, score, -float("inf"))
-        probs = tl.exp(score - max_score)
-        probs = tl.where(valid, probs, 0.0)
-        denom += tl.sum(probs, axis=0)
-
-        v_vals = tl.load(
-            kv_fp8 + slots[:, None] * row_bytes + v_offsets[None, :],
-            mask=valid[:, None] & v_mask[None, :],
+        )
+        scale = tl.load(
+            kv_scale + (kv_rows[:, None] + kv_lora_rank + groups[None, :] * 4) // 4,
+            mask=valid[:, None],
             other=0.0,
-        ).to(tl.float32)
-        v_scale = tl.load(
-            kv_scale
-            + (
-                slots[:, None] * row_bytes
-                + kv_lora_rank
-                + (v_offsets[None, :] // 128) * 4
+        )
+        latent = tl.reshape(latent.to(tl.float32), [BLOCK_N, num_groups, 128])
+        latent = tl.reshape(latent * scale[:, :, None], [BLOCK_N, kv_lora_rank])
+        latent = latent.to(tl.bfloat16)
+        scores = tl.dot(q_nope, tl.trans(latent))
+        if qk_rope_head_dim > 0:
+            k_rope = tl.load(
+                kv_rope + (kv_rows[:, None] + rope_start) // 2 + rope_dims[None, :],
+                mask=valid[:, None] & rope_mask[None, :],
+                other=0.0,
             )
-            // 4,
-            mask=valid[:, None] & v_mask[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        acc += tl.sum(probs[:, None] * v_vals * v_scale, axis=0)
+            scores = tl.dot(q_rope, tl.trans(k_rope), scores)
+        m_i, l_i, acc = _dsa_softmax_update(
+            scores, valid, latent, m_i, l_i, acc, softmax_scale
+        )
 
-    result = acc / denom
-    result = tl.where(denom > 0.0, result, 0.0)
-    out_base = (token * num_heads + head) * kv_lora_rank
-    tl.store(out + out_base + v_offsets, result, mask=v_mask)
+    _dsa_store_output(
+        out,
+        partial_out,
+        partial_lse,
+        acc,
+        m_i,
+        l_i,
+        rows,
+        head_mask,
+        split,
+        kv_lora_rank,
+        NUM_SPLITS,
+    )
 
 
 @triton.jit
@@ -185,6 +224,8 @@ def _dsa_dense_kv_kernel(
     topk_indices,
     topk_lens,
     out,
+    partial_out,
+    partial_lse,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     kv_lora_rank: tl.constexpr,
@@ -192,110 +233,179 @@ def _dsa_dense_kv_kernel(
     kv_dim: tl.constexpr,
     topk: tl.constexpr,
     softmax_scale: tl.constexpr,
-    BLOCK_TOPK: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    BLOCK_V: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_ROPE: tl.constexpr,
 ):
-    token = tl.program_id(0)
-    head = tl.program_id(1)
-    v_block = tl.program_id(2)
+    token = tl.program_id(0).to(tl.int64)
+    heads = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    split = tl.program_id(2)
+    head_mask = heads < num_heads
+    rows = token * num_heads + heads
+    dims = tl.arange(0, kv_lora_rank)
 
-    topk_offsets = tl.arange(0, BLOCK_TOPK)
-    k_offsets = tl.arange(0, BLOCK_K)
-    rope_offsets = tl.arange(0, 64)
-    v_offsets = v_block * BLOCK_V + tl.arange(0, BLOCK_V)
-
-    q_base = (token * num_heads + head) * head_dim
-    q_nope_base = q_base
-    q_rope_base = q_base + kv_lora_rank
-
-    q_rope = tl.load(
-        q + q_rope_base + rope_offsets,
-        mask=rope_offsets < qk_rope_head_dim,
+    q_nope = tl.load(
+        q + rows[:, None] * head_dim + dims[None, :],
+        mask=head_mask[:, None],
         other=0.0,
-    ).to(tl.float32)
+    ).to(tl.bfloat16)
+    if qk_rope_head_dim > 0:
+        rope_dims = tl.arange(0, BLOCK_ROPE)
+        rope_mask = rope_dims < qk_rope_head_dim
+        q_rope = tl.load(
+            q + rows[:, None] * head_dim + kv_lora_rank + rope_dims[None, :],
+            mask=head_mask[:, None] & rope_mask[None, :],
+            other=0.0,
+        ).to(tl.bfloat16)
 
-    valid_len = tl.load(topk_lens + token).to(tl.int32)
-    max_score = tl.full((), -float("inf"), tl.float32)
-
-    for start in range(0, topk, BLOCK_TOPK):
-        cols = start + topk_offsets
-        valid = cols < valid_len
-        slots = tl.load(
-            topk_indices + token * topk + cols,
-            mask=valid,
-            other=0,
-        ).to(tl.int64)
-        valid = valid & (slots >= 0)
-        score = tl.zeros((BLOCK_TOPK,), tl.float32)
-
-        for k_start in range(0, kv_lora_rank, BLOCK_K):
-            ks = k_start + k_offsets
-            q_vals = tl.load(q + q_nope_base + ks).to(tl.float32)
-            k_vals = tl.load(
-                kv + slots[:, None] * kv_dim + ks[None, :],
-                mask=valid[:, None],
+    start, end = _dsa_key_range(topk_lens, token, split, topk, NUM_SPLITS, BLOCK_N)
+    m_i = tl.full([BLOCK_H], -float("inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_H], tl.float32)
+    acc = tl.zeros([BLOCK_H, kv_lora_rank], tl.float32)
+    for block_start in range(start, end, BLOCK_N):
+        cols = block_start + tl.arange(0, BLOCK_N)
+        slots = tl.load(topk_indices + token * topk + cols, mask=cols < end, other=-1)
+        valid = slots >= 0
+        kv_rows = slots.to(tl.int64) * kv_dim
+        # Gather the rows once; the latent tile serves as both keys and values.
+        latent = tl.load(
+            kv + kv_rows[:, None] + dims[None, :],
+            mask=valid[:, None],
+            other=0.0,
+        ).to(tl.bfloat16)
+        scores = tl.dot(q_nope, tl.trans(latent))
+        if qk_rope_head_dim > 0:
+            k_rope = tl.load(
+                kv + kv_rows[:, None] + kv_lora_rank + rope_dims[None, :],
+                mask=valid[:, None] & rope_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
-            score += tl.sum(k_vals * q_vals[None, :], axis=1)
+            ).to(tl.bfloat16)
+            scores = tl.dot(q_rope, tl.trans(k_rope), scores)
+        m_i, l_i, acc = _dsa_softmax_update(
+            scores, valid, latent, m_i, l_i, acc, softmax_scale
+        )
 
-        k_rope = tl.load(
-            kv + slots[:, None] * kv_dim + kv_lora_rank + rope_offsets[None, :],
-            mask=valid[:, None] & (rope_offsets[None, :] < qk_rope_head_dim),
-            other=0.0,
-        ).to(tl.float32)
-        score += tl.sum(k_rope * q_rope[None, :], axis=1)
-        score *= softmax_scale
-        score = tl.where(valid, score, -float("inf"))
-        max_score = tl.maximum(max_score, tl.max(score, axis=0))
+    _dsa_store_output(
+        out,
+        partial_out,
+        partial_lse,
+        acc,
+        m_i,
+        l_i,
+        rows,
+        head_mask,
+        split,
+        kv_lora_rank,
+        NUM_SPLITS,
+    )
 
-    denom = tl.full((), 0.0, tl.float32)
-    acc = tl.zeros((BLOCK_V,), tl.float32)
-    v_mask = v_offsets < kv_lora_rank
-    for start in range(0, topk, BLOCK_TOPK):
-        cols = start + topk_offsets
-        valid = cols < valid_len
-        slots = tl.load(
-            topk_indices + token * topk + cols,
-            mask=valid,
-            other=0,
-        ).to(tl.int64)
-        valid = valid & (slots >= 0)
-        score = tl.zeros((BLOCK_TOPK,), tl.float32)
 
-        for k_start in range(0, kv_lora_rank, BLOCK_K):
-            ks = k_start + k_offsets
-            q_vals = tl.load(q + q_nope_base + ks).to(tl.float32)
-            k_vals = tl.load(
-                kv + slots[:, None] * kv_dim + ks[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            score += tl.sum(k_vals * q_vals[None, :], axis=1)
+@triton.jit
+def _dsa_merge_splits_kernel(
+    partial_out,
+    partial_lse,
+    out,
+    kv_lora_rank: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    # Log-sum-exp combine of the split partial outputs of one (token, head).
+    row = tl.program_id(0).to(tl.int64)
+    dims = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
+    split_rows = row * NUM_SPLITS + tl.arange(0, NUM_SPLITS)
+    lse = tl.load(partial_lse + split_rows)
+    max_lse = tl.max(lse, axis=0)
+    # Splits without valid keys carry -inf and get zero weight.
+    weights = tl.exp2(lse - tl.where(max_lse == -float("inf"), 0.0, max_lse))
+    total = tl.sum(weights, axis=0)
+    partial = tl.load(partial_out + split_rows[:, None] * kv_lora_rank + dims[None, :])
+    merged = tl.sum(partial * weights[:, None], axis=0)
+    tl.store(
+        out + row * kv_lora_rank + dims,
+        tl.where(total > 0.0, merged / total, 0.0).to(out.dtype.element_ty),
+    )
 
-        k_rope = tl.load(
-            kv + slots[:, None] * kv_dim + kv_lora_rank + rope_offsets[None, :],
-            mask=valid[:, None] & (rope_offsets[None, :] < qk_rope_head_dim),
-            other=0.0,
-        ).to(tl.float32)
-        score += tl.sum(k_rope * q_rope[None, :], axis=1)
-        score *= softmax_scale
-        score = tl.where(valid, score, -float("inf"))
-        probs = tl.exp(score - max_score)
-        probs = tl.where(valid, probs, 0.0)
-        denom += tl.sum(probs, axis=0)
 
-        v_vals = tl.load(
-            kv + slots[:, None] * kv_dim + v_offsets[None, :],
-            mask=valid[:, None] & v_mask[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        acc += tl.sum(probs[:, None] * v_vals, axis=0)
+def _num_kv_splits(num_programs: int, topk: int) -> int:
+    # Split keys until the grid reaches about two programs per SM, at most one
+    # split per two key tiles; prefill grids keep one split and skip the merge.
+    # Powers of two bound the compiled variants.
+    splits = min(
+        2 * current_platform().sm_count // max(num_programs, 1),
+        triton.cdiv(topk, 2 * _BLOCK_N),
+    )
+    return 1 << (max(splits, 1).bit_length() - 1)
 
-    result = acc / denom
-    result = tl.where(denom > 0.0, result, 0.0)
-    out_base = (token * num_heads + head) * kv_lora_rank
-    tl.store(out + out_base + v_offsets, result, mask=v_mask)
+
+def _launch_dsa_kernel(
+    kernel: triton.JITFunction,
+    q: torch.Tensor,
+    kv_args: tuple[torch.Tensor, ...],
+    kv_row_stride: int,
+    topk_indices: torch.Tensor,
+    topk_lens: torch.Tensor,
+    *,
+    softmax_scale: float,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> torch.Tensor:
+    tokens, num_heads, head_dim = q.shape
+    topk = topk_indices.shape[1]
+    out = torch.empty(
+        (tokens, num_heads, kv_lora_rank),
+        dtype=torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype,
+        device=q.device,
+    )
+    head_blocks = triton.cdiv(num_heads, _BLOCK_H)
+    num_splits = _num_kv_splits(tokens * head_blocks, topk)
+    # Split programs write FP32 partial outputs and their base-2 log-sum-exp
+    # for the merge kernel; a single split writes the output directly.
+    partial_out = partial_lse = out
+    if num_splits > 1:
+        partial_out = torch.empty(
+            (tokens, num_heads, num_splits, kv_lora_rank),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        partial_lse = torch.empty(
+            (tokens, num_heads, num_splits), dtype=torch.float32, device=q.device
+        )
+    kernel[(tokens, head_blocks, num_splits)](
+        q,
+        *kv_args,
+        topk_indices,
+        topk_lens,
+        out,
+        partial_out,
+        partial_lse,
+        num_heads,
+        head_dim,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        kv_row_stride,
+        topk,
+        float(softmax_scale),
+        NUM_SPLITS=num_splits,
+        BLOCK_H=_BLOCK_H,
+        BLOCK_N=_BLOCK_N,
+        BLOCK_ROPE=max(16, triton.next_power_of_2(qk_rope_head_dim)),
+        num_warps=4,
+        # AMD uses single-stage loops, like the grouped Triton decode kernel.
+        num_stages=1 if current_platform().is_amd else 2,
+    )
+    if num_splits > 1:
+        block_d = min(kv_lora_rank, 128)
+        _dsa_merge_splits_kernel[(tokens * num_heads, kv_lora_rank // block_d)](
+            partial_out,
+            partial_lse,
+            out,
+            kv_lora_rank,
+            num_splits,
+            BLOCK_D=block_d,
+            num_warps=4,
+        )
+    return out
 
 
 def _run_packed_kv(
@@ -308,35 +418,21 @@ def _run_packed_kv(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
 ) -> torch.Tensor:
-    row_bytes = int(packed_kv.shape[1])
-    out = torch.empty(
-        (q.shape[0], q.shape[1], kv_lora_rank),
-        dtype=torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype,
-        device=q.device,
-    )
-    grid = (q.shape[0], q.shape[1], triton.cdiv(kv_lora_rank, 64))
-    _dsa_packed_kv_kernel[grid](
+    return _launch_dsa_kernel(
+        _dsa_packed_kv_kernel,
         q,
-        packed_kv.view(torch.float8_e4m3fn),
-        packed_kv.view(torch.float32),
-        packed_kv.view(torch.bfloat16),
+        (
+            packed_kv.view(torch.float8_e4m3fn),
+            packed_kv.view(torch.float32),
+            packed_kv.view(torch.bfloat16),
+        ),
+        int(packed_kv.shape[1]),
         topk_indices,
         topk_lens,
-        out,
-        q.shape[1],
-        q.shape[2],
-        kv_lora_rank,
-        qk_rope_head_dim,
-        row_bytes,
-        topk_indices.shape[1],
-        float(softmax_scale),
-        BLOCK_TOPK=32,
-        BLOCK_K=64,
-        BLOCK_V=64,
-        num_warps=4,
-        num_stages=1,
+        softmax_scale=softmax_scale,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
     )
-    return out
 
 
 def _run_dense_kv(
@@ -349,33 +445,17 @@ def _run_dense_kv(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
 ) -> torch.Tensor:
-    kv_dim = int(kv_lora_rank) + int(qk_rope_head_dim)
-    out = torch.empty(
-        (q.shape[0], q.shape[1], kv_lora_rank),
-        dtype=torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype,
-        device=q.device,
-    )
-    grid = (q.shape[0], q.shape[1], triton.cdiv(kv_lora_rank, 64))
-    _dsa_dense_kv_kernel[grid](
+    return _launch_dsa_kernel(
+        _dsa_dense_kv_kernel,
         q,
-        kv_cache,
+        (kv_cache,),
+        int(kv_lora_rank) + int(qk_rope_head_dim),
         topk_indices,
         topk_lens,
-        out,
-        q.shape[1],
-        q.shape[2],
-        kv_lora_rank,
-        qk_rope_head_dim,
-        kv_dim,
-        topk_indices.shape[1],
-        float(softmax_scale),
-        BLOCK_TOPK=32,
-        BLOCK_K=64,
-        BLOCK_V=64,
-        num_warps=4,
-        num_stages=1,
+        softmax_scale=softmax_scale,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
     )
-    return out
 
 
 def _flatten_packed_kv_cache(packed_kv_cache: torch.Tensor) -> torch.Tensor:
