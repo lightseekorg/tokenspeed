@@ -16,6 +16,7 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 import argparse
 import contextlib
 import io
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -481,6 +482,135 @@ class TestCLIConfigCompat(unittest.TestCase):
         self.assertEqual(sa.speculative_draft_model_path, "draft/model")
         self.assertEqual(sa.speculative_num_steps, 3)
         self.assertEqual(sa.speculative_num_draft_tokens, 4)
+
+    def test_synthetic_acceptance_length_cli_and_json(self):
+        for length in (1, 2.6, 4):
+            for source in ("cli", "json", "both"):
+                with self.subTest(length=length, source=source):
+                    config = {"method": "mtp", "num_speculative_tokens": 3}
+                    if source in ("json", "both"):
+                        config["synthetic_acceptance_length"] = length
+                    argv = [
+                        "--model",
+                        "test/model",
+                        "--speculative-config",
+                        json.dumps(config),
+                    ]
+                    if source in ("cli", "both"):
+                        argv += ["--synthetic-acceptance-length", str(length)]
+                    sa = self._from_cli_args_no_init(self._parse_args(argv))
+                    sa.resolve_basic_defaults()
+                    with self.assertLogs(
+                        "tokenspeed.runtime.utils.server_args", level="WARNING"
+                    ) as logs:
+                        sa.resolve_speculative_decoding()
+                    self.assertEqual(sa.synthetic_acceptance_length, length)
+                    self.assertIn("correctness or accuracy evaluation", logs.output[0])
+
+    def test_synthetic_acceptance_length_defaults_disabled(self):
+        sa = self._resolve_speculative_config(
+            "test/model", '{"method":"mtp","num_speculative_tokens":3}'
+        )
+        self.assertIsNone(sa.synthetic_acceptance_length)
+
+    def test_synthetic_acceptance_length_conflicting_sources(self):
+        args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--synthetic-acceptance-length",
+                "2.6",
+                "--speculative-config",
+                '{"method":"mtp","synthetic_acceptance_length":3}',
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            self._from_cli_args_no_init(args).resolve_basic_defaults()
+
+    def test_synthetic_acceptance_length_rejects_invalid_values(self):
+        for length in (
+            True,
+            False,
+            "2.6",
+            "bad",
+            float("nan"),
+            float("inf"),
+            -float("inf"),
+        ):
+            with self.subTest(length=length, source="json"):
+                with self.assertRaisesRegex(ValueError, "finite number"):
+                    self._resolve_speculative_config(
+                        "test/model",
+                        json.dumps(
+                            {"method": "mtp", "synthetic_acceptance_length": length}
+                        ),
+                    )
+            with self.subTest(length=length, source="python"):
+                args = self._parse_args(
+                    ["--model", "test/model", "--speculative-algorithm", "MTP"]
+                )
+                sa = self._from_cli_args_no_init(args)
+                sa.synthetic_acceptance_length = length
+                sa.resolve_basic_defaults()
+                with self.assertRaisesRegex(ValueError, "finite number"):
+                    sa.resolve_speculative_decoding()
+
+    def test_synthetic_acceptance_length_rejects_outside_verify_width(self):
+        for length in (0, 0.9, -1, 4.1, 5):
+            with self.subTest(length=length):
+                with self.assertRaisesRegex(ValueError, r"must be in \[1, 4\]"):
+                    self._resolve_speculative_config(
+                        "test/model",
+                        json.dumps(
+                            {
+                                "method": "mtp",
+                                "num_speculative_tokens": 3,
+                                "synthetic_acceptance_length": length,
+                            }
+                        ),
+                    )
+
+    def test_synthetic_acceptance_length_requires_speculation(self):
+        args = self._parse_args(
+            ["--model", "test/model", "--synthetic-acceptance-length", "1"]
+        )
+        sa = self._from_cli_args_no_init(args)
+        sa.resolve_basic_defaults()
+        with self.assertRaisesRegex(ValueError, "requires speculative decoding"):
+            sa.resolve_speculative_decoding()
+
+    def test_synthetic_acceptance_length_respects_block_verify_width(self):
+        for method in ("dflash", "dspark"):
+            with self.subTest(method=method):
+                sa = self._resolve_speculative_config(
+                    "test/model",
+                    json.dumps(
+                        {
+                            "method": method,
+                            "model": "draft/model",
+                            "num_speculative_tokens": 4,
+                            "synthetic_acceptance_length": 4,
+                        }
+                    ),
+                )
+                self.assertEqual(sa.synthetic_acceptance_length, 4)
+                self.assertEqual(sa.speculative_num_draft_tokens, 4)
+
+    def test_synthetic_acceptance_length_defers_implicit_block_width(self):
+        for method in ("dflash", "dspark"):
+            with self.subTest(method=method):
+                config = {
+                    "method": method,
+                    "model": "draft/model",
+                    "synthetic_acceptance_length": 5,
+                }
+                sa = self._resolve_speculative_config("test/model", json.dumps(config))
+                self.assertFalse(sa._speculative_widths_explicit)
+                self.assertEqual(sa.synthetic_acceptance_length, 5)
+
+                config["num_speculative_tokens"] = 4
+                with self.assertRaisesRegex(ValueError, r"must be in \[1, 4\]"):
+                    self._resolve_speculative_config("test/model", json.dumps(config))
 
     def test_speculative_config_matches_explicit_eagle3_args(self):
         draft_model = "lightseekorg/kimi-k2.5-eagle3-mla"

@@ -480,6 +480,19 @@ graph records. `SamplingBatchInfo.is_all_greedy` and the eager-only argmax
 branches were deleted. Equivalence (top_k=1 == argmax, ties excepted) is
 pinned by `test/runtime/sampling/test_greedy_route_equivalence.py`.
 
+Synthetic acceptance length shares executor scheduling, logit processing,
+persistent output buffers and downstream state updates with ordinary
+verification. Each backend runs its ordinary full-width verification kernel
+before overriding the result with a forced draft prefix and a target token
+at the selected cutoff. This retains verification cost in the benchmark;
+synchronization and downstream state updates consume only the final synthetic
+outputs. Keeping the override in the backend accommodates its target
+representation (sampled token IDs or probabilities) without a second executor
+path. The persistent length
+buffer is refreshed in `prepare_step` or `prepare_capture`, outside graph
+capture, using a private device generator. Preparation must remain
+asynchronous so it does not stall forward launches.
+
 ### Non-speculative serving is the N == 1 case, not a second path
 
 One sampling rule for every batch: **prefill requests sample, decode

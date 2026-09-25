@@ -499,6 +499,21 @@ class FlashInferSamplingBackend(SamplingBackend):
             deterministic=not dp_sampling,
         )
 
+        # Retain normal verification cost before forcing benchmark acceptance.
+        if self.config.synthetic_acceptance_length is not None:
+            row_offset = rank * bs if dp_sampling else sampling_info.batch_row_offset
+            lengths = self.synthetic_lengths(candidates, row_offset)
+            self.verify_synthetic_probs(
+                candidates,
+                target_probs,
+                final_coins[:bs],
+                lengths,
+                predict,
+                accept_index,
+                accept_length,
+                not dp_sampling,
+            )
+
         accept_length += 1
         logprobs_local = None
         if self.config.enable_output_logprobs and dp_sampling:
@@ -539,9 +554,14 @@ class FlashInferSamplingBackend(SamplingBackend):
         # knob and produces non-bit-identical results across ranks (sub-ulp
         # FP accumulation order).
         # PDL still uses rank-0 outputs to keep ranks aligned. Without PDL,
-        # fused top-k + top-p is bit-identical across ranks and does not need
-        # a broadcast.
-        elif pdl_enabled() or not _FUSED_TOPK_TOPP_AVAILABLE:
+        # ordinary fused top-k + top-p verification can skip the broadcast.
+        # Synthetic verification conservatively keeps rank-0 committed outputs
+        # until target sampling at forced cutoffs is validated without TP sync.
+        elif (
+            self.config.synthetic_acceptance_length is not None
+            or pdl_enabled()
+            or not _FUSED_TOPK_TOPP_AVAILABLE
+        ):
             self.broadcast_verify_outputs()
 
         if self.config.enable_output_logprobs and not dp_sampling:

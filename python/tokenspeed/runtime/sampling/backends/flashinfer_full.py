@@ -446,12 +446,30 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             deterministic=True,
         )
 
+        # Retain normal verification cost before forcing benchmark acceptance.
+        if self.config.synthetic_acceptance_length is not None:
+            lengths = self.synthetic_lengths(candidates, sampling_info.batch_row_offset)
+            self.verify_synthetic_probs(
+                candidates,
+                target_probs,
+                coins_for_final_sampling,
+                lengths,
+                predict,
+                accept_index,
+                accept_length,
+                True,
+            )
+
         accept_length += 1
 
         # TP-rank sync BEFORE _accumulate_counts so per-rank counts stay aligned.
-        # For fused top-k + top-p, the results are bit-identical across ranks.
-        # So we don't need to broadcast the results.
-        if not _FUSED_TOPK_TOPP_AVAILABLE:
+        # Ordinary fused top-k + top-p verification can skip the broadcast.
+        # Synthetic verification conservatively keeps rank-0 committed outputs
+        # until target sampling at forced cutoffs is validated without TP sync.
+        if (
+            self.config.synthetic_acceptance_length is not None
+            or not _FUSED_TOPK_TOPP_AVAILABLE
+        ):
             self.broadcast_verify_outputs()
 
         # Accumulate accepted tokens into counts. accept_index is [bs, N]
