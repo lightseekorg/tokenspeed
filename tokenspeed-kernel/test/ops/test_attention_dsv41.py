@@ -1250,6 +1250,48 @@ def test_compressor_metadata_consecutive_requests_and_refresh(n, target):
             torch.testing.assert_close(got.cpu(), want, rtol=0, atol=0)
 
 
+def test_compressor_metadata_table_width_does_not_recompile():
+    """Chunked prefill widens the tail table every chunk; the kernel must not
+    key its compile cache on the table geometry."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA/ROCm")
+
+    def run(rows, width):
+        p = torch.arange(rows, dtype=torch.int64, device="cuda")
+        r = torch.zeros(rows, dtype=torch.int32, device="cuda")
+        table = torch.ones((3, width), dtype=torch.int32, device="cuda")
+        table[:, 5::7] = 0
+        out = tuple(
+            torch.empty(rows, dtype=dtype, device="cuda")
+            for dtype in (
+                torch.bool,
+                torch.int64,
+                torch.int32,
+                torch.int64,
+                torch.int64,
+                torch.int64,
+            )
+        )
+        implementation.compressor_metadata(p, r, table, 4, *out)
+        for got, want in zip(
+            out, _compressor_metadata_reference(p, r, table, 4), strict=True
+        ):
+            torch.testing.assert_close(got.cpu(), want, rtol=0, atol=0)
+
+    # Warm both integer-specialization classes (16-divisible and not); Triton
+    # still keys on those two properties for runtime scalars.
+    run(64, 128)
+    run(64, 132)
+    with patch.object(
+        implementation._compressor_metadata,
+        "_do_compile",
+        wraps=implementation._compressor_metadata._do_compile,
+    ) as compiles:
+        for rows, width in ((64, 192), (128, 196), (96, 388), (64, 1024)):
+            run(rows, width)
+    assert compiles.call_count == 0
+
+
 @pytest.mark.parametrize("target", ["cpu", "cuda"])
 @pytest.mark.parametrize("width", [1, 3, 5, 6, 129])
 @pytest.mark.parametrize("bs", [0, 3])
