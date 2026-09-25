@@ -192,16 +192,15 @@ if platform.is_nvidia:
                 x.new_empty((0,), dtype=torch.int32),
             )
 
-        # Per-token group (block=128) FP8 quantization of activations. The
-        # TRT-LLM helper emits the group-major scale layout consumed by the
-        # fused MoE kernel.
+        # Per-token group (block=128) FP8 quantization of activations.
+        # Convert canonical scales to the fused MoE kernel's group-major layout.
         x_fp8, x_scale = quantize_fp8(
             x,
             granularity="token_group",
             group_size=_FP8_BLOCK,
             solution="trtllm",
         )
-        x_scale = x_scale.to(torch.float32).contiguous()
+        x_scale = x_scale.t().to(torch.float32).contiguous()
         hidden_blocks = hidden_size // _FP8_BLOCK
         if x_scale.shape != (hidden_blocks, x_fp8.shape[0]):
             raise RuntimeError(

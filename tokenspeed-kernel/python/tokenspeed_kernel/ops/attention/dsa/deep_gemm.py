@@ -595,7 +595,7 @@ if platform.is_hopper_plus:
             page_size,
         )
         q, weights = _pad_index_heads(q.contiguous(), weights)
-        q_fp8, scale = quantize_fp8_with_scale(
+        q_fp8, scale = quantize_fp8(
             q.reshape(-1, q.shape[-1]),
             granularity="token_group",
             group_size=128,

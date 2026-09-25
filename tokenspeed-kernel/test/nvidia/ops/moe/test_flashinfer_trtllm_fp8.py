@@ -149,7 +149,7 @@ def test_apply_forwards_prepared_layout_and_pdl(monkeypatch, enable_pdl: bool) -
         del args, kwargs
         return (
             torch.zeros_like(x, dtype=torch.float8_e4m3fn),
-            torch.ones((x.shape[1] // 128, x.shape[0]), dtype=torch.float32),
+            torch.ones((x.shape[0], x.shape[1] // 128), dtype=torch.float32),
         )
 
     def fake_moe(**kwargs):
@@ -214,7 +214,7 @@ def test_apply_supports_deferred_finalize(monkeypatch) -> None:
         del args, kwargs
         return (
             torch.zeros_like(x, dtype=torch.float8_e4m3fn),
-            torch.ones((x.shape[1] // 128, x.shape[0]), dtype=torch.float32),
+            torch.ones((x.shape[0], x.shape[1] // 128), dtype=torch.float32),
         )
 
     gemm2_out = torch.randn((4, 128), dtype=torch.bfloat16)

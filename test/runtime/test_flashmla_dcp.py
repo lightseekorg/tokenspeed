@@ -27,6 +27,7 @@ from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     compact_dcp_pages,
     virtual_slots_to_local,
 )
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
@@ -792,7 +793,6 @@ def test_global_index_candidate_merge_ties_and_empty_shards(monkeypatch, degree,
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_dsa_indexer_16_heads_with_padded_quantization_scales():
     from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
-    from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 
     from tokenspeed.runtime.layers.attention.dcp.indexer import select_dsa_topk
     from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
@@ -801,7 +801,7 @@ def test_dsa_indexer_16_heads_with_padded_quantization_scales():
     q = torch.randn(3, 16, 128, device="cuda", dtype=torch.bfloat16)
     weights = torch.randn(3, 16, device="cuda", dtype=torch.bfloat16)
     keys = torch.randn(192, 128, device="cuda", dtype=torch.bfloat16)
-    values, scales = quantize_fp8_with_scale(
+    values, scales = quantize_fp8(
         keys, granularity="token_group", group_size=128, scale_encoding="float32"
     )
     cache = torch.zeros(192, 132, device="cuda", dtype=torch.uint8)

@@ -154,7 +154,7 @@ def quantize_fp8(
             scale_encoding=scale_encoding,
             enable_pdl=enable_pdl,
             override=override,
-            solution=solution or (None if override is not None else "triton"),
+            solution=solution,
         )
 
     traits = {"dequantize": False, "has_scale": scale is not None}

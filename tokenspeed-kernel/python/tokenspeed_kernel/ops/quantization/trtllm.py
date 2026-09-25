@@ -100,11 +100,12 @@ if platform.is_nvidia:
             return q, scale.unsqueeze(-1)
 
         if granularity == "token_group":
-            return _per_token_group_quant_8bit(
+            q, scale = _per_token_group_quant_8bit(
                 x,
                 group_size=group_size,
                 use_ue8m0=scale_encoding == "ue8m0",
             )
+            return q, scale.t().contiguous()
 
         raise ValueError(f"unsupported TRT-LLM FP8 granularity: {granularity!r}")
 

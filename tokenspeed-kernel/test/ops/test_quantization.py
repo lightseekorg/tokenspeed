@@ -326,10 +326,10 @@ def test_fp8_quantize_rejects_e4m3fnuz(device: str) -> None:
         fp8_quantize(x, fp8_dtype=torch.float8_e4m3fnuz)
 
 
-@pytest.mark.parametrize("solution", ["trtllm"])
+@pytest.mark.parametrize("solution", [None, "trtllm", "triton"])
 def test_quantize_fp8_dynamic_token(
     device: str,
-    solution: str,
+    solution: str | None,
     require,
 ) -> None:
     torch.manual_seed(4)
@@ -352,11 +352,11 @@ def test_quantize_fp8_dynamic_token(
 
 @pytest.mark.parametrize(
     "solution,group_size",
-    [("trtllm", 128), ("triton", 128), ("triton", 32)],
+    [(None, 128), (None, 32), ("trtllm", 128), ("triton", 128), ("triton", 32)],
 )
 def test_quantize_fp8_dynamic_token_group(
     device: str,
-    solution: str,
+    solution: str | None,
     group_size: int,
     require,
 ) -> None:
@@ -376,10 +376,12 @@ def test_quantize_fp8_dynamic_token_group(
     assert out.shape == x.shape
     assert out.dtype == _FP8_DTYPE
     assert scale.dtype == torch.float32
-    expected_num_scales = x.shape[0] * (x.shape[1] // group_size)
-    assert scale.numel() == expected_num_scales
-    if solution == "triton":
-        assert scale.shape == (x.shape[0], x.shape[1] // group_size)
+    assert scale.shape == (x.shape[0], x.shape[1] // group_size)
+    assert scale.is_contiguous()
+    expected_scales = x.float().unflatten(-1, (-1, group_size)).abs().amax(-1) / 448
+    torch.testing.assert_close(scale, expected_scales)
+    reconstructed = out.float() * scale.repeat_interleave(group_size, dim=-1)
+    assert torch.norm(reconstructed - x.float()) / torch.norm(x.float()) < 0.04
 
 
 @pytest.mark.parametrize("solution", ["flashinfer"])
