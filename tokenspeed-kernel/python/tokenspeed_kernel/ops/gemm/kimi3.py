@@ -985,9 +985,10 @@ def kimi3_shared_down_projection(
         hidden_states: Contiguous BF16 activated rows shaped ``[M, 768]``.
         weight: Contiguous BF16 TP8 shard shaped ``[7168, 768]``.
         out: Optional BF16 output shaped ``[M, 7168]``. A contiguous tensor
-            keeps the existing kernel. A row-strided tensor is written by the
-            CDNA5 dense WMMA when that kernel accepts the shape; otherwise the
-            destination is ignored and a contiguous result is returned.
+            keeps the existing kernel. With ``solution="auto"``, a row-strided
+            tensor is written by the CDNA5 dense WMMA when that kernel accepts
+            the shape; otherwise the destination is ignored and a contiguous
+            result is returned.
         solution: ``"auto"`` selects the gfx950 decode GEMV and otherwise
             uses the portable Torch linear operation.
 
@@ -996,9 +997,12 @@ def kimi3_shared_down_projection(
     """
 
     # The packed join lane is the only strided destination K3 passes here.
+    # An explicit solution stays on the selector below so a forced baseline
+    # cannot silently run this kernel.
     strided_out = out is not None and not out.is_contiguous()
     if (
-        strided_out
+        solution == "auto"
+        and strided_out
         and Platform.get().is_cdna5
         and hidden_states.ndim == 2
         and weight.ndim == 2
