@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Prefill latent-MoE input projections for gfx1250.
+"""Large-M latent-MoE input projections for gfx1250.
 
 Compute-bound at these lengths, the opposite of the decode kernel next door,
 so this runs the wide-N schedule from ``gfx1250/gemm/fp16/mm.py`` with no
@@ -56,7 +56,7 @@ _GROUP_M = 8
 _SITU_BLOCK = 256
 
 
-def _prefill_launch_metadata(grid, kernel, args):
+def _largem_launch_metadata(grid, kernel, args):
     """Report packed projection work and traffic to Proton."""
     m = args["M"]
     return {
@@ -83,8 +83,8 @@ def _situ_launch_metadata(grid, kernel, args):
     }
 
 
-@gluon.jit(launch_metadata=_prefill_launch_metadata)
-def gluon_latent_input_prefill_gfx1250(
+@gluon.jit(launch_metadata=_largem_launch_metadata)
+def gluon_latent_input_largem_gfx1250(
     a_ptr,
     b_ptr,
     router_ptr,
@@ -222,7 +222,7 @@ def gluon_latent_input_prefill_gfx1250(
 
 
 @gluon.jit(launch_metadata=_situ_launch_metadata)
-def gluon_latent_input_prefill_situ_gfx1250(
+def gluon_latent_input_largem_situ_gfx1250(
     shared_raw_ptr,
     shared_ptr,
     beta,
@@ -253,7 +253,7 @@ def gluon_latent_input_prefill_situ_gfx1250(
     )
 
 
-def launch_gluon_latent_input_prefill_gfx1250(
+def launch_gluon_latent_input_largem_gfx1250(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,
     routed_down_weight: torch.Tensor,
@@ -263,7 +263,7 @@ def launch_gluon_latent_input_prefill_gfx1250(
     beta: float,
     linear_beta: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Project a prefill chunk of Kimi-K3 latent-MoE inputs.
+    """Project a large-M block of Kimi-K3 latent-MoE inputs.
 
     Args:
         hidden_states: Contiguous BF16 activation shaped ``[tokens, 7168]``.
@@ -320,7 +320,7 @@ def launch_gluon_latent_input_prefill_gfx1250(
     shared_out = torch.empty((tokens, _SHARED_N), dtype=torch.bfloat16, device=device)
 
     grid = triton.cdiv(tokens, _BLOCK_M) * triton.cdiv(_TOTAL_N, _BLOCK_N)
-    gluon_latent_input_prefill_gfx1250[(grid,)](
+    gluon_latent_input_largem_gfx1250[(grid,)](
         hidden_states,
         packed_weight,
         router_out,
@@ -345,7 +345,7 @@ def launch_gluon_latent_input_prefill_gfx1250(
         num_warps=_NUM_WARPS,
         num_stages=1,
     )
-    gluon_latent_input_prefill_situ_gfx1250[
+    gluon_latent_input_largem_situ_gfx1250[
         (tokens, triton.cdiv(_SHARED_N, _SITU_BLOCK))
     ](
         shared_raw,
@@ -361,4 +361,4 @@ def launch_gluon_latent_input_prefill_gfx1250(
     return router_out, routed_out, shared_out
 
 
-__all__ = ["launch_gluon_latent_input_prefill_gfx1250"]
+__all__ = ["launch_gluon_latent_input_largem_gfx1250"]

@@ -109,7 +109,7 @@ def test_decode_replays_in_a_graph() -> None:
 def test_prefill_matches_reference(tokens: int) -> None:
     _packed, views = _weights()
     hidden = torch.randn(tokens, HIDDEN, dtype=torch.bfloat16, device="cuda")
-    got = _project(hidden, views, "gluon_latent_input_prefill_gfx1250")
+    got = _project(hidden, views, "gluon_latent_input_largem_gfx1250")
     assert got[0].dtype == torch.float32
     for output, reference in zip(got, _reference(hidden, views), strict=True):
         torch.testing.assert_close(output, reference, atol=2e-2, rtol=2e-2)
@@ -120,7 +120,7 @@ def test_prefill_matches_reference(tokens: int) -> None:
     [
         (1, "gluon_latent_input_decode_gfx1250"),
         (32, "gluon_latent_input_decode_gfx1250"),
-        (8192, "gluon_latent_input_prefill_gfx1250"),
+        (8192, "gluon_latent_input_largem_gfx1250"),
     ],
 )
 def test_dispatch_selects_by_token_count(tokens: int, expected: str) -> None:

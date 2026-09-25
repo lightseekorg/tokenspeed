@@ -48,8 +48,8 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx1250.moe.fp16.latent_input_decode import (
         launch_gluon_latent_input_decode_gfx1250 as _decode_gfx1250_impl,
     )
-    from tokenspeed_kernel_amd.ops.gfx1250.moe.fp16.latent_input_prefill import (
-        launch_gluon_latent_input_prefill_gfx1250 as _prefill_gfx1250_impl,
+    from tokenspeed_kernel_amd.ops.gfx1250.moe.fp16.latent_input_largem import (
+        launch_gluon_latent_input_largem_gfx1250 as _largem_gfx1250_impl,
     )
 
     _SIGNATURES = frozenset(
@@ -111,7 +111,7 @@ if current_platform().is_amd:
     @register_kernel(
         "moe",
         "latent_input",
-        name="gluon_latent_input_prefill_gfx1250",
+        name="gluon_latent_input_largem_gfx1250",
         solution="gluon",
         capability=_GFX1250,
         signatures=_SIGNATURES,
@@ -126,7 +126,7 @@ if current_platform().is_amd:
             "weights_packed": frozenset({True}),
         },
     )
-    def gluon_latent_input_prefill_gfx1250(**kwargs):
+    def gluon_latent_input_largem_gfx1250(**kwargs):
         weights = (
             kwargs["router_weight"],
             kwargs["routed_weight"],
@@ -134,8 +134,8 @@ if current_platform().is_amd:
         )
         packed_weight = packed_projection_weight_view(*weights)
         if packed_weight is None:
-            raise ValueError("Kimi K3 prefill projection weights must be packed")
-        return _prefill_gfx1250_impl(
+            raise ValueError("Kimi K3 projection weights must be packed")
+        return _largem_gfx1250_impl(
             kwargs["hidden_states"],
             *weights,
             packed_weight,
