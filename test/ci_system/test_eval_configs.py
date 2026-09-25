@@ -222,9 +222,9 @@ def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
 def test_kimi_k3_amd_gates_use_eagle3():
     filenames = (
         "kimi-k3-eagle3-mxfp4-tp8ep1-evalscope-aime26-amd.yaml",
-        "kimi-k3-eagle3-mxfp4-tp8ep8-evalscope-random-4k-1k-mi35x.yaml",
+        "kimi-k3-eagle3-mxfp4-tp8ep1-evalscope-random-50k-500-mi35x.yaml",
     )
-    ep_sizes = ("1", "8")
+    ep_sizes = ("1", "1")
     tasks = []
     for config_dir, filename, ep_size in zip(
         (EVAL_CONFIG_DIR, PERF_CONFIG_DIR), filenames, ep_sizes, strict=True
@@ -257,22 +257,39 @@ def test_kimi_k3_amd_gates_use_eagle3():
         == ".ci-artifacts/published/kimi-k3-eagle3-aime26"
     )
     assert tasks[0]["score_threshold"] == 0.90
-    assert tasks[1]["perf_reference"] == {1: [161, 18.8]}
+    perf_server_tokens = shlex.split(tasks[1]["server"]["command"])
+    assert flag_value(perf_server_tokens, "--init-expert-location") == "trivial"
+    assert flag_value(perf_server_tokens, "--ep-dispatch-algorithm") == "static"
+    assert flag_value(perf_server_tokens, "--attention-backend") == "gluon"
+    assert flag_value(perf_server_tokens, "--drafter-attention-backend") == "gluon"
+    assert flag_value(perf_server_tokens, "--max-model-len") == "65536"
+    assert flag_value(perf_server_tokens, "--max-num-seqs") == "16"
+    assert flag_value(perf_server_tokens, "--chunked-prefill-size") == "8192"
+    assert flag_value(perf_server_tokens, "--max-prefill-tokens") == "8192"
+    assert tasks[1]["perf_reference"] == {16: [23, 12.5]}
     assert tasks[1]["perf_threshold"] == 0.9
     assert "'evalscope[perf]==1.11.1'" in tasks[1]["perf"]["install"][0]
     perf_tokens = shlex.split(tasks[1]["perf"]["command"])
-    assert "OUTPUTS_DIR=$PWD/.ci-artifacts/published/kimi-k3-eagle3-perf" in perf_tokens
+    assert (
+        "OUTPUTS_DIR=$PWD/.ci-artifacts/published/kimi-k3-eagle3-tp8ep1-50k-500-perf"
+        in perf_tokens
+    )
     assert "trap" not in perf_tokens
     for flag, value in {
-        "--number": "1",
+        "--parallel": "16",
+        "--number": "16",
         "--warmup-num": "0",
-        "--seed": "1",
-        "--min-prompt-length": "4096",
-        "--max-prompt-length": "4096",
-        "--min-tokens": "1024",
-        "--max-tokens": "1024",
+        "--dataset-offset": "300160",
+        "--seed": "20260906",
+        "--min-prompt-length": "50000",
+        "--max-prompt-length": "50000",
+        "--min-tokens": "500",
+        "--max-tokens": "500",
     }.items():
         assert flag_value(perf_tokens, flag) == value
+    assert flag_value(perf_tokens, "--total-timeout") == "21600"
+    assert "--no-apply-chat-template" in perf_tokens
+    assert "--no-test-connection" in perf_tokens
 
     control_filenames = (
         "kimi-k3-mxfp4-tp8ep8-evalscope-aime26-amd.yaml",

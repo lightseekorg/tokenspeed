@@ -28,6 +28,7 @@ MHA draft is just layers with two different geometries in one plan.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from functools import cached_property
 
 import torch
@@ -100,6 +101,28 @@ class OrdinaryRecipe(CacheRecipe):
             draft = (FULL_ATTENTION,) * self.num_draft_layers
         return target + draft
 
+    @override
+    def groups(self) -> tuple[CacheGroupDeclaration, ...]:
+        groups = super().groups()
+        if self.family not in ("mla", "dsa") or self.attn_config.dcp_size == 1:
+            return groups
+        if self.draft_attn_config is not None:
+            raise ValueError("Sharded MLA/DSA cache does not support a draft model")
+        return tuple(
+            (replace(spec, shard_count=self.attn_config.dcp_size), fields)
+            for spec, fields in groups
+        )
+
+    @override
+    def token_capacity(self, layout: CacheLayout, num_lcm_blocks: int) -> int:
+        capacity = super().token_capacity(layout, num_lcm_blocks)
+        if self.token_limit is not None:
+            capacity = min(
+                capacity,
+                self.token_limit // self.prefix_granularity * self.prefix_granularity,
+            )
+        return capacity
+
     # ---- geometry ----
 
     @property
@@ -154,12 +177,20 @@ class OrdinaryRecipe(CacheRecipe):
         # Every group packs one CacheBlock per parent, so a parent spans the
         # identity grain and profiled bytes/token size it directly.
         parent_tokens = self.prefix_granularity
-        return self._capped_parents(
-            self._budgeted_parents(
-                self.cache_budget_bytes, bytes_per_token * parent_tokens
-            ),
-            parent_tokens=parent_tokens,
+        budgeted = self._budgeted_parents(
+            self.cache_budget_bytes, bytes_per_token * parent_tokens
         )
+        if self.token_limit is None:
+            return budgeted
+        shard_count = self._max_packing(layout)
+        if shard_count > 1:
+            logical_pages = self.token_limit // parent_tokens
+            if logical_pages < 1:
+                raise ValueError(
+                    "The configured token limit must hold at least one cache page"
+                )
+            return min(budgeted, (logical_pages + shard_count - 1) // shard_count)
+        return self._capped_parents(budgeted, parent_tokens=parent_tokens)
 
 
 def _storage_layers(config, num_layers: int) -> int:

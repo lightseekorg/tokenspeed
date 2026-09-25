@@ -289,25 +289,40 @@ def get_tdm_gather_scatter_idx_layout(NUM_INDICES, NUM_WARPS):
 
 
 @gluon.constexpr_function
-def get_wmma_layout(num_warps, packed, use_wmma_scaled, scale_preshuffle):
+def get_wmma_layout(
+    num_warps, block_m, block_n, packed, use_wmma_scaled, scale_preshuffle
+):
     assert num_warps in (4, 8)
-    if scale_preshuffle:
-        reg_bases = [[0, 1], [1, 0]]
-        tiles_per_warp = 2
-    else:
-        reg_bases = []
-        tiles_per_warp = 1
-
-    # [NUM_WARPS // 2, 2]
-    if num_warps == 4:
-        warp_bases = [[0, tiles_per_warp], [tiles_per_warp, 0]]
-    else:
-        warp_bases = [[0, tiles_per_warp], [0, tiles_per_warp * 2], [tiles_per_warp, 0]]
 
     if use_wmma_scaled:
         WMMA_INSTR_SHAPE: gl.constexpr = [16, 16, 64] if packed else [16, 16, 128]
     else:
         WMMA_INSTR_SHAPE: gl.constexpr = [16, 16, 32]
+
+    # Preshuffled scales benefit from 2x2 register tiling only where the block
+    # has room for it. In particular, a 16-row decode block needs no second M
+    # tile per warp.
+    tiles_per_warp_m = 2 if scale_preshuffle and block_m > WMMA_INSTR_SHAPE[0] else 1
+    split_m = block_m > tiles_per_warp_m * WMMA_INSTR_SHAPE[0]
+    warps_m = 2 if split_m else 1
+    warps_n = num_warps // warps_m
+    tiles_per_warp_n = (
+        2 if scale_preshuffle and warps_n * WMMA_INSTR_SHAPE[1] < block_n else 1
+    )
+
+    reg_bases = []
+    if tiles_per_warp_n > 1:
+        reg_bases.append([0, 1])
+    if tiles_per_warp_m > 1:
+        reg_bases.append([1, 0])
+
+    # Warp bits continue the doubling that the register bits started.
+    warp_bases = [
+        [0, tiles_per_warp_n << bit] for bit in range(warps_n.bit_length() - 1)
+    ]
+
+    if split_m:
+        warp_bases.append([tiles_per_warp_m, 0])
 
     return gl.amd.AMDWMMALayout(3, True, warp_bases, reg_bases, WMMA_INSTR_SHAPE)
 
@@ -452,10 +467,20 @@ class MoEConfig:
         )
 
         WMMA_LAYOUT: gl.constexpr = get_wmma_layout(
-            NUM_WARPS, False, self.USE_WMMA_SCALED, SCALE_PRESHUFFLE
+            NUM_WARPS,
+            BLOCK_M,
+            BLOCK_N,
+            False,
+            self.USE_WMMA_SCALED,
+            SCALE_PRESHUFFLE,
         )
         WMMA_LAYOUT_PACKED: gl.constexpr = get_wmma_layout(
-            NUM_WARPS, True, self.USE_WMMA_SCALED, SCALE_PRESHUFFLE
+            NUM_WARPS,
+            BLOCK_M,
+            BLOCK_N,
+            True,
+            self.USE_WMMA_SCALED,
+            SCALE_PRESHUFFLE,
         )
 
         DOT_K_WIDTH: gl.constexpr = 16 if self.USE_WMMA_SCALED else 8

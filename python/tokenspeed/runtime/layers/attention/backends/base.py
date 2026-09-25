@@ -60,6 +60,7 @@ if TYPE_CHECKING:
         AttnConfig,
         SoftmaxAttnConfig,
     )
+    from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
@@ -123,6 +124,10 @@ class CachePoolBinding:
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         """A node's own binding work: read the old pool before super(), use the new one after."""
         self.cache_pool = cache_pool
+
+    def cache_placement(self, layer: PagedAttention) -> CachePlacement | None:
+        """Return logical-slot ownership, or None for local/replicated storage."""
+        return None
 
 
 class AttentionBackend(CachePoolBinding, ABC):

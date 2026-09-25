@@ -18,7 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Translate whole virtual cache blocks into safe rank-local addresses."""
+"""Place virtual cache blocks, token slots and kernel pages on local ranks.
+
+One cyclic block-placement rule serves both position-preserving slot mapping
+and compact page tables with local token counts. These operations transform
+addresses only; KV payload reads/writes belong to their cache-layout kernels.
+"""
 
 from __future__ import annotations
 
@@ -132,3 +137,117 @@ def virtual_slots_to_local(
         out.copy_(torch.where(owned, local, 0))
         owner_mask.copy_(owned)
     return out, owner_mask
+
+
+@triton.jit
+def _compact_owned_pages(
+    Table,
+    Lens,
+    Out,
+    LocalLens,
+    TSTRIDE: tl.constexpr,
+    OSTRIDE: tl.constexpr,
+    COLS: tl.constexpr,
+    PAGE: tl.constexpr,
+    SUBPAGES: tl.constexpr,
+    VIRTUAL_COUNT: tl.constexpr,
+    DEGREE: tl.constexpr,
+    RANK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.arange(0, BLOCK)
+    page = tl.load(Table + row * TSTRIDE + col, col < COLS, 0)
+    length = tl.load(Lens + row)
+    block = page // SUBPAGES
+    local_block, owner = virtual_block_to_local(block, DEGREE, RANK)
+    owner &= block < VIRTUAL_COUNT
+    valid = (col < COLS) & (col * PAGE < length) & owner
+    dest = tl.cumsum(valid.to(tl.int32)) - 1
+    local = local_block * SUBPAGES + page % SUBPAGES
+    tl.store(Out + row * OSTRIDE + dest, local, valid)
+    rows = tl.minimum(PAGE, tl.maximum(length - col * PAGE, 0))
+    count = tl.sum(tl.where(valid, rows, 0))
+    tl.store(LocalLens + row, count)
+
+
+def compact_dcp_pages(
+    table: torch.Tensor,
+    lengths: torch.Tensor,
+    *,
+    page_size: int,
+    block_granularity: int,
+    virtual_block_count: int,
+    degree: int,
+    rank: int,
+    out: torch.Tensor,
+    local_lengths: torch.Tensor,
+) -> None:
+    """Pack owned kernel pages in token order into persistent output buffers.
+
+    ``table`` holds virtual kernel pages, not scheduler blocks. ``lengths``
+    are global causal endpoints. Outputs are local physical pages and the
+    number of valid local tokens, including a possibly partial last page.
+    Zero-length shards retain a zero page table for safe kernel padding.
+
+    Args:
+        table: Int32 virtual kernel pages [batch, max_pages].
+        lengths: Global valid token counts [batch].
+        page_size: Tokens per kernel page.
+        block_granularity: Tokens per scheduler ownership block.
+        virtual_block_count: Exclusive upper bound of scheduler block IDs.
+        degree: Number of context owners.
+        rank: Owner index within the context group.
+        out: Preallocated physical page table, with the same shape as table.
+        local_lengths: Preallocated local token counts, shaped like lengths.
+
+    Returns:
+        None; both output buffers are refreshed in place.
+    """
+    if (
+        page_size <= 0
+        or block_granularity <= 0
+        or block_granularity % page_size
+        or virtual_block_count <= 1
+        or not 0 <= rank < degree
+    ):
+        raise ValueError("invalid DCP page geometry")
+    if (
+        table.ndim != 2
+        or out.shape != table.shape
+        or local_lengths.shape != lengths.shape
+    ):
+        raise ValueError("DCP page buffers disagree")
+    out.zero_()
+    if table.is_cuda:
+        _compact_owned_pages[(table.shape[0],)](
+            table,
+            lengths,
+            out,
+            local_lengths,
+            table.stride(0),
+            out.stride(0),
+            table.shape[1],
+            page_size,
+            block_granularity // page_size,
+            virtual_block_count,
+            degree,
+            rank,
+            triton.next_power_of_2(table.shape[1]),
+        )
+    else:
+        subpages = block_granularity // page_size
+        for row in range(table.shape[0]):
+            count = 0
+            tokens = 0
+            for col, page in enumerate(table[row].tolist()):
+                block = page // subpages
+                if col * page_size >= int(lengths[row]):
+                    break
+                if 0 < block < virtual_block_count and (block - 1) % degree == rank:
+                    out[row, count] = (
+                        (block - 1) // degree + 1
+                    ) * subpages + page % subpages
+                    count += 1
+                    tokens += min(page_size, int(lengths[row]) - col * page_size)
+            local_lengths[row] = tokens
