@@ -40,3 +40,23 @@ table.
 Scoring workspaces are row-tiled under `max_logits_bytes`. The cap includes
 the persistent sort or radix intermediates as well as logits; one row remains
 legal when its workspace exceeds the cap.
+
+## Query preparation
+
+`kpool_prefill_prepare_query` builds the query-side inputs of the planned
+`kpool_prefill_topk` call: everything the selection needs from the indexer
+projections alone, before the pooled cache of the current chunk is written.
+It is registered per solution with exactly the capability, signature and
+traits of that solution's `kpool_prefill_topk`, so selection resolves the two
+together and the returned value is what the selected top-k consumes through
+its required `prepared_query` keyword:
+
+- `deep_gemm` returns `(q_fp8, scaled_weights)`: the FP8 queries plus FP32
+  head weights with the query dequant scale and the softmax scale folded in,
+  which the top-k previously computed inside the call.
+- `triton` (portable) and the Gluon backends score BF16 queries directly and
+  return `None`.
+
+A caller can therefore issue the pooled-cache writes of a layer on one stream
+and `kpool_prefill_prepare_query` on another, join, and run
+`kpool_prefill_topk(..., prepared_query=...)` without repeating the query work.

@@ -25,7 +25,9 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention.kpool import (
+    _kpool_prefill_topk_traits,
     kpool_decode_topk,
+    kpool_prefill_prepare_query,
     kpool_prefill_topk,
 )
 from tokenspeed_kernel.ops.attention.kpool.triton import (
@@ -33,6 +35,8 @@ from tokenspeed_kernel.ops.attention.kpool.triton import (
     expand_kpool_to_flat_kv,
     score_kpool_dense,
 )
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -488,6 +492,7 @@ def test_ragged_prefill_parallel_scoring_and_device_sort_match_reference(
         kv_page_size=_KV_PAGE,
         topk_pools=64,
         softmax_scale=_DIM**-0.5,
+        prepared_query=None,
         apply_relu=apply_relu,
         chunk_pools=chunk_pools,
     )
@@ -544,6 +549,7 @@ def test_ragged_prefill_workspace_budget_tiles_query_rows(monkeypatch) -> None:
         kv_page_size=_KV_PAGE,
         topk_pools=64,
         softmax_scale=_DIM**-0.5,
+        prepared_query=None,
         chunk_pools=chunk_pools,
         max_logits_bytes=workspace_row_bytes,
     )
@@ -591,6 +597,7 @@ def test_planned_prefill_expands_flat_kv() -> None:
         kv_page_size=_KV_PAGE,
         topk_pools=512,
         softmax_scale=_DIM**-0.5,
+        prepared_query=None,
         req_ids=req_ids,
         causal_lens=causal_lens,
         pool_workspace_slots=pool_workspace_slots,
@@ -602,6 +609,133 @@ def test_planned_prefill_expands_flat_kv() -> None:
     assert lens.tolist() == [2051, 2048]
     assert set(slots[0, :2051].tolist()) == set(range(2051))
     assert set(slots[1, :2048].tolist()) == set(range(4, 2052))
+
+
+@pytest.mark.parametrize("pool_size", [_POOL, 8])
+def test_prefill_prepare_query_selection_tracks_topk_solution(pool_size: int) -> None:
+    q = torch.zeros((2, _HEADS, _DIM), dtype=torch.bfloat16, device="cuda")
+    traits = _kpool_prefill_topk_traits(
+        q,
+        pool_size=pool_size,
+        page_size=_PAGE,
+        topk_pools=512,
+        apply_relu=True,
+        has_prefill_plan=True,
+    )
+    signature = format_signature(q=dense_tensor_format(q.dtype))
+    prepare = select_kernel(
+        "attention", "kpool_prefill_prepare_query", signature, traits=traits
+    )
+    topk = select_kernel("attention", "kpool_prefill_topk", signature, traits=traits)
+
+    assert prepare.name.removesuffix(
+        "_prefill_prepare_query"
+    ) == topk.name.removesuffix("_prefill_topk")
+
+
+def test_prefill_prepare_query_is_none_for_portable_scoring() -> None:
+    cache = _build_monotonic_cache(_PAGE)
+    q = torch.zeros((2, _HEADS, _DIM), dtype=torch.bfloat16, device="cuda")
+    weights = torch.ones((2, _HEADS), dtype=torch.float32, device="cuda")
+
+    prepared = kpool_prefill_prepare_query(
+        q,
+        cache,
+        weights,
+        pool_size=8,
+        page_size=_PAGE,
+        topk_pools=512,
+        softmax_scale=_DIM**-0.5,
+        apply_relu=True,
+    )
+
+    assert prepared is None
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="requires Blackwell DeepGEMM",
+)
+def test_planned_prefill_prepared_query_matches_inline_quantization() -> None:
+    causal_lens = torch.tensor([2051, 2052], dtype=torch.int32, device="cuda")
+    num_pools = int(causal_lens[-1]) // _POOL
+    cache, _ = _build_cache((num_pools + _PAGE - 1) // _PAGE, seed=5)
+    generator = torch.Generator(device="cuda").manual_seed(9)
+    q = (torch.randn((2, _HEADS, _DIM), device="cuda", generator=generator) * 0.3).to(
+        torch.bfloat16
+    )
+    weights = torch.randn((2, _HEADS), device="cuda", generator=generator).to(
+        torch.bfloat16
+    )
+    positions = causal_lens - 1
+    query_start_loc = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
+    req_ids = torch.zeros(2, dtype=torch.int32, device="cuda")
+    pool_workspace_slots = torch.arange(num_pools, dtype=torch.int64, device="cuda")
+    row_starts = torch.zeros(2, dtype=torch.int32, device="cuda")
+    row_ends = causal_lens // _POOL
+    index_table = torch.arange(
+        (num_pools + _PAGE - 1) // _PAGE, dtype=torch.int32, device="cuda"
+    ).unsqueeze(0)
+    kv_table = torch.arange(
+        (int(causal_lens[-1]) + _KV_PAGE - 1) // _KV_PAGE,
+        dtype=torch.int32,
+        device="cuda",
+    ).unsqueeze(0)
+    common = dict(
+        pool_size=_POOL,
+        page_size=_PAGE,
+        kv_page_size=_KV_PAGE,
+        topk_pools=512,
+        softmax_scale=_DIM**-0.5,
+        req_ids=req_ids,
+        causal_lens=causal_lens,
+        pool_workspace_slots=pool_workspace_slots,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        max_num_pools=num_pools,
+    )
+    prepared = kpool_prefill_prepare_query(
+        q,
+        cache,
+        weights,
+        pool_size=_POOL,
+        page_size=_PAGE,
+        topk_pools=512,
+        softmax_scale=_DIM**-0.5,
+        apply_relu=True,
+    )
+    assert prepared is not None
+    q_fp8, scaled_weights = prepared
+    assert q_fp8.shape == q.shape and q_fp8.dtype == torch.float8_e4m3fn
+    assert scaled_weights.shape == weights.shape
+
+    inline = kpool_prefill_topk(
+        q,
+        cache,
+        weights,
+        positions,
+        query_start_loc,
+        index_table,
+        kv_table,
+        prepared_query=None,
+        **common,
+    )
+    ahead = kpool_prefill_topk(
+        q,
+        cache,
+        weights,
+        positions,
+        query_start_loc,
+        index_table,
+        kv_table,
+        prepared_query=prepared,
+        **common,
+    )
+
+    # The TRT-LLM radix top-k orders equal-score candidates nondeterministically,
+    # so compare the selected sets and lengths, not the emission order.
+    assert torch.equal(inline[0].sort(dim=1).values, ahead[0].sort(dim=1).values)
+    assert torch.equal(inline[1], ahead[1])
 
 
 def test_decode_cuda_graph_tracks_dynamic_lengths() -> None:

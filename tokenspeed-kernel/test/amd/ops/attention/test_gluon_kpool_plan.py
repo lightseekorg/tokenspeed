@@ -268,13 +268,14 @@ def _plan_kwargs(
     }
 
 
-def _common_kwargs() -> dict[str, int | float]:
+def _common_kwargs() -> dict[str, int | float | None]:
     return {
         "pool_size": _POOL,
         "page_size": _PAGE,
         "kv_page_size": _KV_PAGE,
         "topk_pools": _TOPK,
         "softmax_scale": _SCALE,
+        "prepared_query": None,
     }
 
 

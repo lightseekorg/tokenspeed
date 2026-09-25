@@ -409,12 +409,24 @@ if platform.is_hopper_plus:
         page_size: int | None = None,
         index_k_fp8: torch.Tensor | None = None,
         index_k_scale: torch.Tensor | None = None,
+        q_fp8: torch.Tensor | None = None,
+        scaled_weights: torch.Tensor | None = None,
         max_logits_bytes: int | None = None,
         candidate_lens_cpu: torch.Tensor | None = None,
         max_seqlen_k: int | None = None,
         out: torch.Tensor | None = None,
         lens_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Score FP8 queries against workspace-ordered FP8 keys and select top-k.
+
+        ``q_fp8`` and ``scaled_weights`` are the query-side inputs prepared
+        ahead of the call (``quantize_fp8_with_scale`` on ``q`` and
+        ``combine_topk_weights`` on ``weights``); both are required together
+        and skip the in-call quantization so callers can overlap it with
+        independent work.
+        """
+        if (q_fp8 is None) != (scaled_weights is None):
+            raise ValueError("q_fp8 and scaled_weights must be provided together")
 
         q = q.contiguous()
         row_starts = row_starts.to(device=q.device, dtype=torch.int32).contiguous()
@@ -429,15 +441,22 @@ if platform.is_hopper_plus:
         )
         out.fill_(-1)
 
-        q_2d = q.view(-1, q.shape[-1])
-        q_fp8, q_scale = quantize_fp8_with_scale(
-            q_2d,
-            granularity="token_group",
-            group_size=128,
-            scale_encoding="float32",
-        )
-        q_fp8 = q_fp8.view_as(q)
-        scaled_weights = combine_topk_weights(weights, q_scale, softmax_scale)
+        if q_fp8 is None:
+            q_2d = q.view(-1, q.shape[-1])
+            q_fp8, q_scale = quantize_fp8_with_scale(
+                q_2d,
+                granularity="token_group",
+                group_size=128,
+                scale_encoding="float32",
+            )
+            q_fp8 = q_fp8.view_as(q)
+            scaled_weights = combine_topk_weights(weights, q_scale, softmax_scale)
+        elif q_fp8.shape != q.shape or scaled_weights.shape != q.shape[:2]:
+            raise ValueError(
+                "prepared query inputs must match the query shape: "
+                f"q_fp8={tuple(q_fp8.shape)}, scaled_weights="
+                f"{tuple(scaled_weights.shape)}, q={tuple(q.shape)}"
+            )
         if index_k_fp8 is None or index_k_scale is None:
             hd = q.shape[-1]
             num_groups = hd // 128

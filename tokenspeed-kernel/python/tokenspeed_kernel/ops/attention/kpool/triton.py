@@ -447,6 +447,27 @@ def triton_dense_kpool_decode_topk(
 
 @register_kernel(
     "attention",
+    "kpool_prefill_prepare_query",
+    name="triton_kpool_prefill_prepare_query",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
+    traits=_TRAITS,
+    priority=Priority.PORTABLE,
+)
+def triton_kpool_prefill_prepare_query(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    softmax_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Portable selection scores BF16 queries directly; nothing to prepare."""
+    del q, weights, softmax_scale
+    return None
+
+
+@register_kernel(
+    "attention",
     "kpool_prefill_topk",
     name="triton_kpool_prefill_topk",
     solution="triton",
@@ -469,6 +490,7 @@ def triton_kpool_prefill_topk(
     kv_page_size: int,
     topk_pools: int,
     softmax_scale: float,
+    prepared_query: tuple[torch.Tensor, torch.Tensor] | None,
     apply_relu: bool = True,
     append_tail: bool = True,
     chunk_pools: int = _DEFAULT_CHUNK_POOLS,
@@ -497,6 +519,7 @@ def triton_kpool_prefill_topk(
         kv_page_size: Raw tokens per FlatKV page.
         topk_pools: Number of pools to select.
         softmax_scale: Per-head score scale.
+        prepared_query: Ignored; portable scoring reads the BF16 queries.
         apply_relu: Apply the indexer ReLU.
         append_tail: Append the visible partial pool.
         chunk_pools: Pools scored per bounded window.
@@ -513,6 +536,7 @@ def triton_kpool_prefill_topk(
     Returns:
         Global FlatKV slots and valid counts.
     """
+    del prepared_query
     pool_size, topk_pools = int(pool_size), int(topk_pools)
     num_tokens = q.shape[0]
     if query_start_loc.dim() != 1 or query_start_loc.numel() < 2:
@@ -585,4 +609,8 @@ def triton_kpool_prefill_topk(
     )
 
 
-__all__ = ["triton_dense_kpool_decode_topk", "triton_kpool_prefill_topk"]
+__all__ = [
+    "triton_dense_kpool_decode_topk",
+    "triton_kpool_prefill_prepare_query",
+    "triton_kpool_prefill_topk",
+]
