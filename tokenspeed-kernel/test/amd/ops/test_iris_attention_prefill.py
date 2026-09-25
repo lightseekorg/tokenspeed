@@ -97,7 +97,7 @@ def _attention_worker(rank: int, port: int) -> None:
     pointers = tuple(t.data_ptr() for t in buffers)
     gen = torch.Generator(device=device)
     held_mix = None
-    for m in (512, 513, 520, 848, 4096, 6224, 8144, 8192):
+    for m in (512, 513, 520, 848, 1024, 2048, 4096, 6224, 8144, 8192):
         partial = comm.acquire_symm_outputs(backing, ((m, 7168),), torch.bfloat16)[0]
         gen.manual_seed(31729 + rank)
         source = (

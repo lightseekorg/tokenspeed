@@ -10,7 +10,7 @@ positive `M` divisible by eight, and up to eleven history snapshots. Epsilon,
 history count and group are explicit inputs. Unsupported calls return `None`
 before allocation or collective publication.
 
-Kimi K3 enables the operation for aligned prefills from 4096 through 8192 tokens,
+Kimi K3 enables the operation for aligned prefills from 512 through 8192 tokens,
 matching attention and MoE TP8 groups, EP1, PP1, and an unbiased, unquantized BF16
 output projection. Other configurations retain the existing collective and
 AttnRes selection. The model writes its projection directly into prepared Iris
@@ -31,9 +31,9 @@ output RMSNorm and its final BF16 conversion. The normalized rows are pushed to
 the same token partition on every rank. Launch selection fuses mixing with the
 push where that avoids overhead without excessive register pressure; other
 shapes use the registered AttnRes kernel followed by a separate push gather.
-For the 4096–8192 runtime window, mixing and gathering fuse through six history
-snapshots. At 7680 tokens and above they also fuse seven or eight snapshots;
-longer histories use the separate mixer.
+For 512–1016 and 4096–8192 tokens, mixing and gathering fuse through six history
+snapshots. At 7680 tokens and above they also fuse seven or eight snapshots.
+The 1024–4088 range and other history depths use the separate mixer.
 
 The reduction uses 24 workgroups, four subgroups per workgroup and 2048-element
 tiles. The fused mixer uses up to 128 workgroups and four or eight subgroups; the

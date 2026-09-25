@@ -215,9 +215,12 @@ def iris_attention_prefill_mix(
         HAS_RESIDUAL=residual is not None,
         num_warps=4,
     )
-    # Longer histories need enough rows to amortize the register pressure of
-    # keeping peer pointers live throughout mixing. Below 7.5k, separate them.
-    if num_valid_blocks <= 6 or (partial.shape[0] >= 7680 and num_valid_blocks <= 8):
+    # The ordinary mixer is faster in the middle token range. At larger sizes,
+    # longer histories also need enough rows to amortize live peer pointers.
+    fuse_mix = (partial.shape[0] < 1024 or partial.shape[0] >= 4096) and (
+        num_valid_blocks <= 6 or (partial.shape[0] >= 7680 and num_valid_blocks <= 8)
+    )
+    if fuse_mix:
         gather_programs = min(128, rows)
         num_subgroups = 8 if num_valid_blocks <= 7 else 4
         iris_attention_mix_push_gluon_kernel[(gather_programs,)](

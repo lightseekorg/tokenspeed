@@ -90,7 +90,7 @@ logger = logging.getLogger(__name__)
 _IRIS_MAX_TOKENS = 8192
 _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS = 48
 _IRIS_MOE_ROW_SHARD_MIN_TOKENS = 512
-_IRIS_ATTN_SHARDED_PREFIX_MIN_TOKENS = 4096
+_IRIS_ATTN_SHARDED_PREFIX_MIN_TOKENS = 512
 
 # Widest reduce this instance is built for; it becomes the collective's max_m.
 ATTN_AR_MAX_TOKENS = 8
