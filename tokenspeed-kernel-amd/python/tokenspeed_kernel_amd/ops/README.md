@@ -138,6 +138,39 @@ one-wave direct path when extra partitions or fusion do not pay for their
 overhead. The kernel docstrings record the exact tiling, pipeline, and routing
 decisions.
 
+### gfx1250 dense BF16 decode projection
+
+The gfx1250 package provides a small-M dense BF16 WMMA projection for K3
+decode, including the KDA QKVFAB shape.
+
+#### Contract
+
+- The operation computes `A @ B.T` from contiguous BF16 matrices shaped
+  `[M, K]` and `[N, K]`, with `1 <= M <= 32`, `K` divisible by 128, and `N`
+  divisible by 16. A and B must share one CUDA device.
+- Output is BF16. A caller-owned output must be on that device, with a unit
+  inner stride and a row stride of at least `N`.
+- KDA QKVFAB is the fixed shape `M` in `{1, 2, 4, 8, 16, 32}`, `K = 7168`,
+  `N = 6288`.
+- Omitted `split_k` selects the largest of 8, 4, or 2 that divides the K
+  tiles, leaves each split at least eight K tiles and one full TDM pipeline,
+  and keeps `N`-tile count times the split within the CU count of `A.device`.
+  Otherwise the launch is direct. An explicit `split_k` must divide the K
+  tiles.
+
+#### Algorithm
+
+M is consumed in 16-row chunks, and each chunk re-reads B. `N` divisible by
+64 uses a four-warp `16 x 64` tile; other accepted `N` uses one warp and a
+`16 x 16` tile. The dense path triple-buffers TDM loads. KDA QKVFAB uses
+seven buffers. Once the K tiles fill that pipeline, the tail lowers the TDM
+wait before each remaining LDS read.
+
+Both paths accumulate in FP32 and round to BF16 once. Direct launches store
+that conversion from the producer. Split-K launches write one FP32 partial
+matrix per K partition, then a separate reduction sums those partials in FP32
+and stores BF16.
+
 ## Attention
 
 ### DeepSeek V4 attention
