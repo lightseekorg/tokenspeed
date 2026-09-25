@@ -105,24 +105,6 @@ apply plans onto the batch-invariant grouped leaf through the ordinary
 registered. An explicitly chosen backend stands, like every other switch
 under the envelope.
 
-## Where FluentLLM's rl_* switches land
-
-FluentLLM grew ~20 flat booleans for the same contract. The mapping into this
-hierarchy (for anyone porting a preset):
-
-| FluentLLM switch | Layer here |
-|---|---|
-| `rl_use_aok_matmul` / `rl_use_aok_bmm` / `rl_use_aok_grouped_gemm` / `rl_use_tiles_router_gemm` | kernels.deterministic → aok leaves via the batch_invariant feature |
-| `rl_enable_aok_indexer_score` / `rl_enable_aok_indexer_topk` / `rl_use_aok_radix_topk` / `use_deterministic_topk` | same, indexer family |
-| `use_deterministic_sfa` | invariance.batch → the aok no-split sparse decode leaf, pinned by the DSA backend's kernel solution |
-| `rl_use_megatron_prefill_comm` / `force_deterministic_rsag` | collectives.deterministic → `batch_invariant_collectives` (the ordered fold; multimem is the faster future citizen of the slot) |
-| `deepep_route_preserving_normal` / `use_torch_router_topk` | kernels.deterministic, MoE dispatch/route order |
-| `rl_use_megatron_log_softmax` / `rl_use_tp_invariant_softmax` | logprob.topology-invariant (deferred) |
-| `rl_force_cpu_for_yarn_linear_ramp_mask` / `rl_disable_scale_q_kv_lora_fusion_weight` / `longcat_disable_first_rmsnorm_fusion` | alignment.trainer (deferred; irrelevant to self-consistency) |
-| `rl_enable_dsa_head_tp` / `rl_enable_tp_batch_invariant` / `rl_tp_batch_invariant_dense_mlp` | topology invariance of projections (deferred with logprob.topology-invariant) |
-| `rl_syncfree_spec_logprob` / `enable_return_logprobs` / `capture_sample_graph` | RL protocol, orthogonal to numerics; not folded |
-| `rl_fuse_qk_rope` / `rl_dp_num_tokens_*` / `rl_force_torch_qcp_uneven_all_gather` | perf/infra toggles, not folded |
-
 ## Acceptance
 
 The envelope is verified end to end, not per switch: the invariance harness
