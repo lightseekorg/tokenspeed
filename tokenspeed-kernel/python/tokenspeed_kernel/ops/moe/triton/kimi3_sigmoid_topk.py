@@ -219,15 +219,25 @@ def _invoke_packed(
     weights_dtype: torch.dtype,
     logical_to_physical_map: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    dispatch = logical_to_physical_map
-    if dispatch is not None and dispatch.dtype != torch.int32:
-        dispatch = None
+    """Launch the packed K3 specialist after layout/dtype adapters.
+
+    Selection only matches ``topk=16``; an override can still pass another
+    value, which this wrapper rejects rather than returning 16 routes. The
+    registry signature cannot see ``correction_bias`` dtype, so a non-FP32
+    bias is widened here (exact) instead of raising inside the kernel.
+    """
+    if topk != 16:
+        raise ValueError(f"packed Kimi K3 top-k supports only topk=16, got {topk}")
     return kimi3_sigmoid_bias_topk(
         router_logits.contiguous(),
-        correction_bias.contiguous(),
+        correction_bias.float().contiguous(),
         routed_scaling_factor=routed_scaling_factor,
         normalize_topk_weights=normalize_topk_weights,
-        logical_to_physical_map=None if dispatch is None else dispatch.contiguous(),
+        logical_to_physical_map=(
+            None
+            if logical_to_physical_map is None
+            else logical_to_physical_map.contiguous()
+        ),
         weights_dtype=weights_dtype,
         enable_pdl=pdl_enabled(),
     )

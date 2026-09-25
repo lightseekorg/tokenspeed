@@ -183,9 +183,18 @@ def test_dispatcher_hands_rows_past_the_cap_to_the_grouped_kernel(monkeypatch):
     assert weights.shape == (cap + 1, TOPK) and weights.dtype is torch.bfloat16
 
 
-def test_dispatcher_keeps_a_strided_window_on_the_grouped_kernel():
-    """A column slice of a wider verify buffer is a layout the packed kernel
-    rejects outright, so the gate has to leave it on the strided path."""
+def test_dispatcher_copies_a_strided_window_onto_the_packed_kernel(monkeypatch):
+    """The registry cannot see strides, so a column slice of a wider verify
+    buffer takes the packed kernel after a contiguous copy."""
+    calls = []
+    real = kimi3_sigmoid_topk_mod.kimi3_sigmoid_bias_topk
+
+    def spy(*args, **kwargs):
+        calls.append(args[0].is_contiguous())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(kimi3_sigmoid_topk_mod, "kimi3_sigmoid_bias_topk", spy)
+
     torch.manual_seed(3)
     wide = (torch.randn(4, EXPERTS + 128, device="cuda") * 0.2).float()
     logits = wide[:, :EXPERTS]
@@ -195,6 +204,7 @@ def test_dispatcher_keeps_a_strided_window_on_the_grouped_kernel():
     weights, ids = moe_sigmoid_bias_topk(
         logits, bias, TOPK, routed_scaling_factor=2.5, weights_dtype=torch.bfloat16
     )
+    assert calls == [True]
     ref_w, ref_ids = _reference(logits.contiguous(), bias, normalize=True, scale=2.5)
     assert torch.equal(_experts(ids), _experts(ref_ids))
     torch.testing.assert_close(
@@ -203,6 +213,73 @@ def test_dispatcher_keeps_a_strided_window_on_the_grouped_kernel():
         atol=8e-3,
         rtol=8e-3,
     )
+
+
+def test_dispatcher_widens_a_bf16_bias_onto_the_packed_kernel(monkeypatch):
+    """The registry signature only encodes the logits dtype. A BF16 bias used
+    to miss the packed inline gate; widening here keeps that input working."""
+    calls = []
+    real = kimi3_sigmoid_topk_mod.kimi3_sigmoid_bias_topk
+
+    def spy(*args, **kwargs):
+        calls.append(args[1].dtype)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(kimi3_sigmoid_topk_mod, "kimi3_sigmoid_bias_topk", spy)
+
+    torch.manual_seed(13)
+    logits = (torch.randn(4, EXPERTS, device="cuda") * 0.2).float()
+    bias = (torch.randn(EXPERTS, device="cuda") * 0.01).to(torch.bfloat16)
+    weights, ids = moe_sigmoid_bias_topk(
+        logits, bias, TOPK, routed_scaling_factor=2.5, weights_dtype=torch.bfloat16
+    )
+    assert calls == [torch.float32]
+    ref_w, ref_ids = _reference(logits, bias.float(), normalize=True, scale=2.5)
+    assert torch.equal(_experts(ids), _experts(ref_ids))
+    torch.testing.assert_close(
+        _by_expert(weights, ids).float(),
+        _by_expert(ref_w, ref_ids),
+        atol=8e-3,
+        rtol=8e-3,
+    )
+
+
+def test_packed_wrapper_rejects_a_non_k3_topk():
+    logits = torch.empty(1, EXPERTS, device="cuda", dtype=torch.float32)
+    bias = torch.empty(EXPERTS, device="cuda", dtype=torch.float32)
+    with pytest.raises(ValueError, match="supports only topk=16"):
+        kimi3_sigmoid_topk_mod.triton_kimi3_packed_sigmoid_bias_topk_nvidia(
+            router_logits=logits,
+            correction_bias=bias,
+            topk=8,
+            routed_scaling_factor=2.5,
+            normalize_topk_weights=True,
+        )
+
+
+def test_packed_mapped_wrapper_keeps_an_int64_dispatch_map(monkeypatch):
+    seen = []
+
+    def fake_kernel(*args, **kwargs):
+        dispatch = kwargs["logical_to_physical_map"]
+        seen.append(None if dispatch is None else dispatch.dtype)
+        empty_w = torch.empty(1, TOPK, device="cuda", dtype=torch.float32)
+        empty_ids = torch.empty(1, TOPK, device="cuda", dtype=torch.int32)
+        return empty_w, empty_ids
+
+    monkeypatch.setattr(kimi3_sigmoid_topk_mod, "kimi3_sigmoid_bias_topk", fake_kernel)
+    logits = torch.empty(1, EXPERTS, device="cuda", dtype=torch.float32)
+    bias = torch.empty(EXPERTS, device="cuda", dtype=torch.float32)
+    dispatch = torch.arange(EXPERTS, device="cuda", dtype=torch.int64)
+    kimi3_sigmoid_topk_mod.triton_kimi3_packed_sigmoid_bias_topk_nvidia_mapped(
+        router_logits=logits,
+        correction_bias=bias,
+        topk=TOPK,
+        routed_scaling_factor=2.5,
+        normalize_topk_weights=True,
+        logical_to_physical_map=dispatch,
+    )
+    assert seen == [torch.int64]
 
 
 def _grouped(logits, bias, *, normalize, scale):
