@@ -52,7 +52,23 @@ def use_gluon_largem_gfx1250(m: int, k: int, n: int) -> bool:
     return m >= _LARGEM_MIN_M and (k, n) in _LARGEM_SHAPES
 
 
-@gluon.jit
+def _wmma_tdm_dense_m16_launch_metadata(grid, kernel, args):
+    """Report dense WMMA work and BF16 or split-K FP32 partial traffic."""
+    m = args["ACTUAL_M"]
+    n = grid[0] * args["BLOCK_N"]
+    k = args["K"]
+    split_k = args["SPLIT_K"]
+    output = args["partial_ptr"] if split_k > 1 else args["out_ptr"]
+    return {
+        "name": kernel.name,
+        "flops16": 2 * m * n * k,
+        "bytes": grid[0] * m * k * args["a_ptr"].element_size()
+        + n * k * args["b_ptr"].element_size()
+        + split_k * m * n * output.element_size(),
+    }
+
+
+@gluon.jit(launch_metadata=_wmma_tdm_dense_m16_launch_metadata)
 def _wmma_tdm_dense_m16_kernel(
     a_ptr,
     b_ptr,
@@ -141,31 +157,70 @@ def _wmma_tdm_dense_m16_kernel(
         gl.amd.cdna5.tdm.async_load(b_desc, [0, offset], b_smem.index(tile))
 
     acc = gl.zeros((M, BLOCK_N), gl.float32, wmma_layout)
-    gl.amd.cdna5.tdm.async_wait(2 * (NUM_BUFFERS - 2))
-    for tile in gl.static_range(num_k_tiles):
-        with gl.amd.warp_pipeline_stage("tdm+lds", priority=1):
+    if num_k_tiles >= NUM_BUFFERS:
+        # Lower the wait before each tail load. A fixed wait leaves the newest
+        # A/B pairs outstanding, so the next iteration can read them early.
+        main_k_tiles: gl.constexpr = num_k_tiles - (NUM_BUFFERS - 1)
+        gl.amd.cdna5.tdm.async_wait(2 * (NUM_BUFFERS - 2))
+        for tile in gl.static_range(main_k_tiles):
+            with gl.amd.warp_pipeline_stage("tdm+lds", priority=1):
+                a = a_smem.index(tile % NUM_BUFFERS).load(layout=dot_layout_a)
+                b = (
+                    b_smem.index(tile % NUM_BUFFERS)
+                    .permute([1, 0])
+                    .load(layout=dot_layout_b)
+                )
+                prefetch_tile = tile + NUM_BUFFERS - 1
+                prefetch = (k_base + prefetch_tile) * BLOCK_K
+                gl.amd.cdna5.tdm.async_load(
+                    a_desc,
+                    [0, prefetch],
+                    a_smem.index(prefetch_tile % NUM_BUFFERS),
+                )
+                gl.amd.cdna5.tdm.async_load(
+                    b_desc,
+                    [0, prefetch],
+                    b_smem.index(prefetch_tile % NUM_BUFFERS),
+                )
+            gl.amd.cdna5.tdm.async_wait(2 * (NUM_BUFFERS - 2))
+            with gl.amd.warp_pipeline_stage("wmma", priority=0):
+                acc = gl.amd.cdna5.wmma(a, b, acc)
+        for tail in gl.static_range(NUM_BUFFERS - 1):
+            gl.amd.cdna5.tdm.async_wait(2 * (NUM_BUFFERS - 2 - tail))
+            tile = main_k_tiles + tail
             a = a_smem.index(tile % NUM_BUFFERS).load(layout=dot_layout_a)
             b = (
                 b_smem.index(tile % NUM_BUFFERS)
                 .permute([1, 0])
                 .load(layout=dot_layout_b)
             )
-            prefetch = (k_base + tile + NUM_BUFFERS - 1) * BLOCK_K
-            gl.amd.cdna5.tdm.async_load(
-                a_desc,
-                [0, prefetch],
-                a_smem.index((tile + NUM_BUFFERS - 1) % NUM_BUFFERS),
-                pred=tile + NUM_BUFFERS - 1 < num_k_tiles,
-            )
-            gl.amd.cdna5.tdm.async_load(
-                b_desc,
-                [0, prefetch],
-                b_smem.index((tile + NUM_BUFFERS - 1) % NUM_BUFFERS),
-                pred=tile + NUM_BUFFERS - 1 < num_k_tiles,
-            )
-        gl.amd.cdna5.tdm.async_wait(2 * (NUM_BUFFERS - 2))
-        with gl.amd.warp_pipeline_stage("wmma", priority=0):
             acc = gl.amd.cdna5.wmma(a, b, acc)
+    else:
+        gl.amd.cdna5.tdm.async_wait(2 * (NUM_BUFFERS - 2))
+        for tile in gl.static_range(num_k_tiles):
+            with gl.amd.warp_pipeline_stage("tdm+lds", priority=1):
+                a = a_smem.index(tile % NUM_BUFFERS).load(layout=dot_layout_a)
+                b = (
+                    b_smem.index(tile % NUM_BUFFERS)
+                    .permute([1, 0])
+                    .load(layout=dot_layout_b)
+                )
+                prefetch = (k_base + tile + NUM_BUFFERS - 1) * BLOCK_K
+                gl.amd.cdna5.tdm.async_load(
+                    a_desc,
+                    [0, prefetch],
+                    a_smem.index((tile + NUM_BUFFERS - 1) % NUM_BUFFERS),
+                    pred=tile + NUM_BUFFERS - 1 < num_k_tiles,
+                )
+                gl.amd.cdna5.tdm.async_load(
+                    b_desc,
+                    [0, prefetch],
+                    b_smem.index((tile + NUM_BUFFERS - 1) % NUM_BUFFERS),
+                    pred=tile + NUM_BUFFERS - 1 < num_k_tiles,
+                )
+            gl.amd.cdna5.tdm.async_wait(2 * (NUM_BUFFERS - 2))
+            with gl.amd.warp_pipeline_stage("wmma", priority=0):
+                acc = gl.amd.cdna5.wmma(a, b, acc)
     gl.amd.cdna5.tdm.async_wait(0)
 
     offs_m = gl.arange(0, M, gl.SliceLayout(1, wmma_layout))
@@ -195,7 +250,7 @@ def _wmma_tdm_dense_m16_kernel(
         )
 
 
-def _splitk_reduce_bf16_launch_metadata(grid, kernel, args):
+def _gluon_wmma_dense_reduce_gfx1250_launch_metadata(grid, kernel, args):
     """Report the FP32 partial reduction and BF16 store to Proton."""
     rows = grid[0]
     n = args["n"]
@@ -209,8 +264,8 @@ def _splitk_reduce_bf16_launch_metadata(grid, kernel, args):
     }
 
 
-@gluon.jit(launch_metadata=_splitk_reduce_bf16_launch_metadata)
-def _splitk_reduce_bf16_kernel(
+@gluon.jit(launch_metadata=_gluon_wmma_dense_reduce_gfx1250_launch_metadata)
+def gluon_wmma_dense_reduce_gfx1250(
     partial_ptr,
     out_ptr,
     split_stride,
@@ -322,7 +377,7 @@ def _launch_wmma_tdm_dense_tiles(
         )
         if split_k > 1:
             block = 256
-            _splitk_reduce_bf16_kernel[(actual_m, triton.cdiv(n, block))](
+            gluon_wmma_dense_reduce_gfx1250[(actual_m, triton.cdiv(n, block))](
                 partial,
                 out_tile,
                 partial.stride(0),
