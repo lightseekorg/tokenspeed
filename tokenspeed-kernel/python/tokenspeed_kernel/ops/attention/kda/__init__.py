@@ -170,8 +170,10 @@ def kda_paged_prefill(
             stream-synchronizing D2H per KDA layer per chunk, which stalls
             the launch thread behind all queued work (and serializes the
             chunk pipeline's stages).
-        capacity: Explicit CuTeDSL graph planning bounds, or None for exact
-            live-length planning. Live boundaries retain their normal meaning.
+        capacity: Explicit graph planning bounds for a kernel with the
+            ``prefill_capacity`` trait (see ``kda_prefill_capacity_supported``),
+            or None for exact live-length planning. Live boundaries retain
+            their normal meaning.
         inputs_packed: The checkpoint packer produced contiguous Q/K/V and
             beta with zero padding. Gate padding still requires initialization.
         lower_bound: Optional safe lower bound for log decay.
@@ -209,8 +211,6 @@ def kda_paged_prefill(
         solution = "triton"
     capacity_kwargs = {}
     if capacity is not None:
-        if solution != "cutedsl_kda":
-            raise ValueError("KDA capacity planning requires explicit cutedsl_kda")
         capacity.validate(cu_seqlens_cpu, q.shape[1])
         capacity_kwargs["capacity"] = capacity
         capacity_kwargs["inputs_packed"] = inputs_packed
@@ -249,6 +249,41 @@ def kda_paged_prefill(
         # Hand the final state back in the caller's layout (a view; no copy).
         return KdaPrefillResult(result.out, result.final_state.transpose(-1, -2))
     return result
+
+
+def kda_prefill_capacity_supported(
+    dtype: torch.dtype,
+    *,
+    solution: str | None,
+) -> bool:
+    """Whether the prefill kernel ``kda_paged_prefill`` selects plans capacity.
+
+    Capacity planning lets one graph capture serve every batch whose live
+    tokens and requests fit the captured bounds.
+
+    Args:
+        dtype: Activation dtype of Q/K/V.
+        solution: Registered solution the caller passes to
+            ``kda_paged_prefill``, or None for registry priority.
+
+    Returns:
+        ``True`` when the selected kernel declares the ``prefill_capacity``
+        trait.
+    """
+    if solution == "fla":
+        solution = "triton"
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    try:
+        kernel = select_kernel(
+            "attention",
+            "kda_paged_prefill",
+            _attention_format_signature(q=probe, k=probe, v=probe),
+            solution=solution,
+        )
+    except NoKernelFoundError:
+        return False
+    spec = KernelRegistry.get().get_by_name(kernel.name)
+    return spec is not None and True in spec.traits.get("prefill_capacity", ())
 
 
 def kda_paged_decode(
@@ -878,6 +913,7 @@ __all__ = [
     "KdaFusedDecodeResult",
     "kda_recurrent_layout",
     "kda_paged_prefill",
+    "kda_prefill_capacity_supported",
     "kda_paged_decode",
     "try_kda_fused_paged_decode",
     "try_kda_fused_paged_verify",
