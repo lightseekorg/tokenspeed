@@ -47,11 +47,11 @@ def test_mxfp4_activation_quantize_row_count():
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import quantize
 
     x = torch.randn(2000, 512, device=DEVICE, dtype=torch.bfloat16)
-    full, _ = quantize._quantize_mxfp4_activation(x)
+    full, _ = quantize._quantize_mxfp4_activation(x, swizzle_scale=True)
 
     def run(rows):
         # Rows quantize independently: a shorter batch is a prefix.
-        out, _ = quantize._quantize_mxfp4_activation(x[:rows])
+        out, _ = quantize._quantize_mxfp4_activation(x[:rows], swizzle_scale=True)
         torch.testing.assert_close(out, full[:rows], rtol=0, atol=0)
 
     # 128 rows and up take the tiled kernel, fewer the scalar one.
@@ -63,6 +63,48 @@ def test_mxfp4_activation_quantize_row_count():
     ):
         for rows in (130, 1483, 1800, 48, 97, 100):
             run(rows)
+
+
+def test_mxfp4_package_scale_gather_row_count():
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import scale as scale_ops
+
+    topk, cols, max_tokens = 16, 3584, 1024
+    generator = torch.Generator(device=DEVICE).manual_seed(5)
+    source = torch.randint(
+        0, 256, (max_tokens, cols // 32), device=DEVICE, generator=generator
+    ).to(torch.uint8)
+    slots = torch.randint(
+        0, topk, (max_tokens * topk,), device=DEVICE, generator=generator
+    )
+    tokens_of = torch.randint(
+        0, 1 << 20, (max_tokens * topk,), device=DEVICE, generator=generator
+    )
+
+    def run(tokens):
+        ids = ((slots << 24) | (tokens_of % tokens)).int()[: tokens * topk]
+
+        def gather(source_rows):
+            return scale_ops.gather_package_cdna4_scale(
+                source,
+                ids,
+                source_rows=source_rows,
+                cols=cols,
+                top_k=topk,
+                flatten_topk=False,
+            )
+
+        # Every route slot reads a row below ``tokens``, so the valid-row
+        # bound does not change the result.
+        assert torch.equal(gather(tokens), gather(max_tokens))
+
+    def key(tokens):
+        return tuple(map(int_specialization_class, (tokens, tokens * topk)))
+
+    sweep = (37, 512, 513, 848)
+    warm_specialization_classes(run, key, sweep, range(30, max_tokens))
+    with assert_no_triton_compile(scale_ops._gather_package_cdna4_scale_kernel):
+        for tokens in sweep:
+            run(tokens)
 
 
 def test_mha_extend_split_count():
