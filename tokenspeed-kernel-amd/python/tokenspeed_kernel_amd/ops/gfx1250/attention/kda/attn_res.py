@@ -225,7 +225,12 @@ def attn_res_rmsnorm_gfx1250(
         raise ValueError("gfx1250 AttnRes requires a contiguous hidden dimension")
 
     output = torch.empty_like(layer_residual)
-    num_warps = 4
+    if tokens < 256 and num_valid_blocks >= 1:
+        num_warps = 8
+        waves_per_eu = 2
+    else:
+        num_warps = 4
+        waves_per_eu = 1
     delta_tensor = layer_residual if delta is None else delta
     gluon_attn_res_fwd_gfx1250[(tokens,)](
         layer_residual,
@@ -249,6 +254,7 @@ def attn_res_rmsnorm_gfx1250(
         OUTPUT_EPS=output_eps,
         NUM_WARPS=num_warps,
         num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
     )
     return output
 
