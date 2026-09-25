@@ -245,6 +245,11 @@ matching rule decides (`ci_path_filter.py` holds the full lists):
 * Each workflow's own YAML requires only its runner group; `workflow_dispatch`
   always runs.
 
+PR and push diffs containing only `test/ci/**/*.yaml` run only the changed tasks,
+with existing validation and runner/trigger rules. Mixed, empty, or potentially
+truncated diffs (300+ paths) keep the existing scope. Manual and nightly runs
+retain their existing task selection.
+
 `tokenspeed-kernel/test/` is laid out to feed the vendor rules. Tests whose
 module-level gate (`is_cdna4()`, `is_cdna5()`, `is_amd()`, or an import from
 `tokenspeed_kernel_amd`) skips them off AMD hardware live under

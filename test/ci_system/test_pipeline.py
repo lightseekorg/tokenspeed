@@ -1,3 +1,4 @@
+import json
 import re
 import subprocess
 import textwrap
@@ -1043,6 +1044,40 @@ def _default_body(name: str, labels: list[str], extra: str = "") -> str:
     if extra:
         body += extra
     return body
+
+
+@pytest.mark.parametrize(
+    ("changed", "expected"),
+    [
+        (None, ["a", "a", "b"]),
+        ("", ["a", "a", "b"]),
+        ("test/ci/a.yaml\n", ["a", "a"]),
+        ("test/ci/old.yaml\ntest/ci/a.yaml\n", ["a", "a"]),
+        ("test/ci/deleted.yaml\n", []),
+        ("test/ci/a.yaml\npython/model.py\n", ["a", "a", "b"]),
+        ("test/ci/a.yaml\n.github/workflows/a.yaml\n", ["a", "a", "b"]),
+        ("test/ci/a.yaml\n test/ci/b.yaml\n", ["a", "a", "b"]),
+        ("test/ci/a.yaml\ntest/ci/b.yaml \n", ["a", "a", "b"]),
+        ("\n".join(f"test/ci/{i}.yaml" for i in range(300)), ["a", "a", "b"]),
+    ],
+)
+def test_scan_filters_task_yaml_only_changes(
+    changed, expected, tmp_path, capsys, monkeypatch
+):
+    monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
+    monkeypatch.delenv(pipeline.B200_RUNNER_LABEL_ENV, raising=False)
+    root = tmp_path / "test/ci"
+    root.mkdir(parents=True)
+    for name, labels in [("a", ["b200-4gpu", "gb200-4gpu"]), ("b", ["b200-4gpu"])]:
+        _write_task_yaml(root, f"{name}.yaml", _default_body(name, labels))
+    argv = ["scan", "--repo-root", str(tmp_path)]
+    if changed is not None:
+        changed_file = tmp_path / "changed.txt"
+        changed_file.write_text(changed)
+        argv += ["--changed-files", str(changed_file)]
+    assert pipeline.main(argv) == 0
+    matrix = json.loads(capsys.readouterr().out)
+    assert [entry["name"] for entry in matrix["include"]] == expected
 
 
 def test_validate_task_accepts_known_priorities(tmp_path):

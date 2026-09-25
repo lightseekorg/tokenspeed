@@ -30,9 +30,13 @@ pytest.importorskip(
 )
 
 from tokenspeed_kernel.registry import KernelRegistry  # noqa: E402
-from tokenspeed_kernel.selection import spec_matches_shape_traits  # noqa: E402
+from tokenspeed_kernel.selection import (  # noqa: E402
+    spec_matches_shape_traits,
+    spec_matches_traits,
+)
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import (  # noqa: E402
-    latent_input_prefill,
+    latent_input_largem,
+    latent_input_mediumm,
     latent_input_small_batch,
 )
 
@@ -60,13 +64,85 @@ def test_split_k_does_not_drop_k_tiles() -> None:
 
 @pytest.mark.parametrize(
     ("tokens", "expected"),
-    [(2048, False), (4095, False), (4096, True), (4097, True), (6000, True)],
+    [
+        (128, "gluon_latent_input_small_batch_gfx950"),
+        (129, "gluon_latent_input_small_batch_gfx950"),
+        (320, "gluon_latent_input_small_batch_gfx950"),
+        (321, "gluon_latent_input_mediumm_gfx950"),
+        (640, "gluon_latent_input_mediumm_gfx950"),
+        (641, None),
+        (1280, None),
+        (1281, "gluon_latent_input_largem_gfx950"),
+        (2048, "gluon_latent_input_largem_gfx950"),
+        (4095, "gluon_latent_input_largem_gfx950"),
+        (4096, "gluon_latent_input_largem_gfx950"),
+    ],
 )
-def test_prefill_dispatch_bounds(tokens: int, expected: bool) -> None:
-    spec = KernelRegistry.get().get_by_name("gluon_latent_input_prefill_gfx950")
-    assert spec is not None
-    assert "tokens_align" not in spec.traits
-    assert spec_matches_shape_traits(spec, {"tokens": tokens}) is expected
+def test_k3_prefill_dispatch(tokens: int, expected: str | None) -> None:
+    traits = {
+        "tokens": tokens,
+        "hidden_size": 7168,
+        "num_experts": 896,
+        "latent_size": 3584,
+        "shared_size": 768,
+        "inputs_contiguous": True,
+        "weights_packed": True,
+        "hidden_size_multiple_64": True,
+    }
+    names = (
+        "gluon_latent_input_small_batch_gfx950",
+        "gluon_latent_input_mediumm_gfx950",
+        "gluon_latent_input_largem_gfx950",
+    )
+    matches = [
+        name
+        for name in names
+        if (spec := KernelRegistry.get().get_by_name(name)) is not None
+        and spec_matches_traits(spec, traits)
+        and spec_matches_shape_traits(spec, traits)
+    ]
+    assert matches == ([] if expected is None else [expected])
+
+
+@requires_cdna4
+@pytest.mark.parametrize("tokens", [321, 512, 639])
+@pytest.mark.parametrize("linear_beta", [None, 25.0])
+def test_medium_routes_packed_projection_and_applies_situ(
+    tokens: int,
+    linear_beta: float | None,
+) -> None:
+    hidden_size = 7168
+    widths = (896, 3584, 1536)
+    beta = 4.0
+    torch.manual_seed(7)
+    packed = (
+        torch.randn(sum(widths), hidden_size, dtype=torch.bfloat16, device="cuda")
+        * 0.02
+    )
+    router_weight, routed_weight, shared_weight = packed.split(widths)
+    hidden = (
+        torch.randn(tokens, hidden_size, dtype=torch.bfloat16, device="cuda") * 0.05
+    )
+    actual = latent_input_mediumm.launch_gluon_latent_input_mediumm_gfx950(
+        hidden,
+        router_weight,
+        routed_weight,
+        shared_weight,
+        packed,
+        beta=beta,
+        linear_beta=linear_beta,
+    )
+    expected_router = torch.nn.functional.linear(hidden.float(), router_weight.float())
+    expected_routed = torch.nn.functional.linear(hidden, routed_weight)
+    gate, up = torch.nn.functional.linear(hidden, shared_weight).chunk(2, dim=-1)
+    expected_gate = beta * torch.tanh(gate.float() / beta) * torch.sigmoid(gate.float())
+    expected_up = up.float()
+    if linear_beta is not None:
+        expected_up = linear_beta * torch.tanh(expected_up / linear_beta)
+    expected_shared = (expected_gate * expected_up).bfloat16()
+    torch.testing.assert_close(actual[0], expected_router, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(actual[1], expected_routed, atol=8e-3, rtol=8e-3)
+    torch.testing.assert_close(actual[2], expected_shared, atol=1.5e-4, rtol=1e-3)
 
 
 @requires_cdna4
@@ -92,7 +168,7 @@ def test_prefill_routes_packed_projection_and_applies_situ(
         torch.randn(tokens, hidden_size, dtype=torch.bfloat16, device="cuda") * 0.05
     )
 
-    actual = latent_input_prefill.launch_gluon_latent_input_prefill_gfx950(
+    actual = latent_input_largem.launch_gluon_latent_input_largem_gfx950(
         hidden,
         router_weight,
         routed_weight,

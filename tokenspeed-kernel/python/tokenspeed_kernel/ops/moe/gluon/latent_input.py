@@ -1,4 +1,22 @@
 # Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 """Gluon registrations for AMD latent-MoE input projections."""
 
@@ -18,8 +36,11 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_decode import (
         launch_gluon_latent_input_decode_gfx950 as _decode_gfx950_impl,
     )
-    from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_prefill import (
-        launch_gluon_latent_input_prefill_gfx950 as _prefill_gfx950_impl,
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_largem import (
+        launch_gluon_latent_input_largem_gfx950 as _largem_gfx950_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_mediumm import (
+        launch_gluon_latent_input_mediumm_gfx950 as _mediumm_gfx950_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_small_batch import (
         launch_gluon_latent_input_small_batch_gfx950 as _small_batch_impl,
@@ -111,13 +132,13 @@ if current_platform().is_amd:
         capability=_GFX950,
         signatures=_SIGNATURES,
         # Below the single-token specialist and above the portable Triton
-        # kernel. Past 128 tokens this schedule loses to the portable kernel.
+        # kernel. Its split-K tiles win until 320 tokens.
         priority=Priority.SPECIALIZED - 1,
         traits={
             "weights_packed": frozenset({True}),
             "hidden_size_multiple_64": frozenset({True}),
             "inputs_contiguous": frozenset({True}),
-            "tokens": frozenset(range(1, 129)),
+            "tokens": frozenset(range(1, 321)),
         },
     )
     def gluon_latent_input_small_batch_gfx950(**kwargs):
@@ -137,14 +158,49 @@ if current_platform().is_amd:
     @register_kernel(
         "moe",
         "latent_input",
-        name="gluon_latent_input_prefill_gfx950",
+        name="gluon_latent_input_mediumm_gfx950",
+        solution="gluon",
+        capability=_GFX950,
+        signatures=_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={
+            "tokens": frozenset(range(321, 641)),
+            "hidden_size": frozenset({7168}),
+            "num_experts": frozenset({896}),
+            "latent_size": frozenset({3584}),
+            "shared_size": frozenset({768}),
+            "inputs_contiguous": frozenset({True}),
+            "weights_packed": frozenset({True}),
+        },
+    )
+    def gluon_latent_input_mediumm_gfx950(**kwargs):
+        weights = (
+            kwargs["router_weight"],
+            kwargs["routed_weight"],
+            kwargs["shared_gate_up_weight"],
+        )
+        packed_weight = packed_projection_weight_view(*weights)
+        if packed_weight is None:
+            raise ValueError("Kimi K3 latent input weights must be packed")
+        return _mediumm_gfx950_impl(
+            kwargs["hidden_states"],
+            *weights,
+            packed_weight,
+            beta=kwargs["gate_clamp"],
+            linear_beta=kwargs["up_clamp"],
+        )
+
+    @register_kernel(
+        "moe",
+        "latent_input",
+        name="gluon_latent_input_largem_gfx950",
         solution="gluon",
         capability=_GFX950,
         signatures=_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
             # A partial final row tile is masked, so no alignment is required.
-            "tokens_min": frozenset({4096}),
+            "tokens_min": frozenset({1281}),
             "hidden_size": frozenset({7168}),
             "inputs_contiguous": frozenset({True}),
             "latent_size": frozenset({3584}),
@@ -153,7 +209,7 @@ if current_platform().is_amd:
             "weights_packed": frozenset({True}),
         },
     )
-    def gluon_latent_input_prefill_gfx950(**kwargs):
+    def gluon_latent_input_largem_gfx950(**kwargs):
         weights = (
             kwargs["router_weight"],
             kwargs["routed_weight"],
@@ -162,7 +218,7 @@ if current_platform().is_amd:
         packed_weight = packed_projection_weight_view(*weights)
         if packed_weight is None:
             raise ValueError("Kimi K3 prefill projection weights must be packed")
-        return _prefill_gfx950_impl(
+        return _largem_gfx950_impl(
             kwargs["hidden_states"],
             *weights,
             packed_weight,
