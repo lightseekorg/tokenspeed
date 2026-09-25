@@ -433,6 +433,14 @@ class ModelConfig:
         # Plugins may register the architecture, its config class and its
         # profile; every resolution below must see them.
         ensure_loaded()
+        if server_args is not None and server_args.speculative_algorithm is not None:
+            # Post-discovery replacement for the CLI choices= this flag no
+            # longer carries: plugins may have added algorithms.
+            from tokenspeed.runtime.execution.drafter import (
+                validate_drafter_algorithm,
+            )
+
+            validate_drafter_algorithm(server_args.speculative_algorithm)
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization

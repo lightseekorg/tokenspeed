@@ -52,7 +52,36 @@ if TYPE_CHECKING:
 
 logger = get_colorful_logger(__name__)
 
+
+def register_drafter(
+    algorithm: str,
+    drafter_cls: type,
+    *,
+    model_cls: type | None = None,
+    defaults_to_base_checkpoint: bool = False,
+    override: bool = False,
+) -> None:
+    """Register a speculative-decoding drafter; see the drafter registry.
+
+    Thin re-export of
+    :func:`tokenspeed.runtime.execution.drafter.register_drafter`, imported
+    lazily so registration stays cheap in lightweight contexts.
+    """
+    from tokenspeed.runtime.execution.drafter import (
+        register_drafter as _register_drafter,
+    )
+
+    _register_drafter(
+        algorithm,
+        drafter_cls,
+        model_cls=model_cls,
+        defaults_to_base_checkpoint=defaults_to_base_checkpoint,
+        override=override,
+    )
+
+
 __all__ = [
+    "register_drafter",
     "ModelProfile",
     "RegisteredModel",
     "register_attention_backend",
@@ -139,6 +168,20 @@ def _put(table: dict, key: Any, value: Any, *, kind: str, override: bool) -> Non
 
     if _active is not None:
         _active.names.setdefault(kind, []).append(str(key))
+        _active.undo.append(undo)
+
+
+def record_external(kind: str, name: str, undo) -> None:
+    """Let a registry outside this module join a plugin recording.
+
+    Args:
+        kind: Registration kind for the loader's per-plugin summary line.
+        name: The registered name, for the same summary.
+        undo: Zero-argument callable reverting the registration; run (in
+            reverse order) when the plugin's ``register()`` raises.
+    """
+    if _active is not None:
+        _active.names.setdefault(kind, []).append(str(name))
         _active.undo.append(undo)
 
 

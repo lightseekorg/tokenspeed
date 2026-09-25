@@ -378,3 +378,64 @@ def test_in_tree_paged_state_verify_is_a_recipe_fact() -> None:
     assert QwenGDNRecipe.uses_paged_state_verify
     assert Qwen4ExpRecipe.uses_paged_state_verify
     assert not OrdinaryRecipe.uses_paged_state_verify
+
+
+class _FixtureDrafter:
+    """Stands in for a BaseDrafter subclass; resolution never instantiates."""
+
+
+class _FixtureNextN(torch.nn.Module):
+    pass
+
+
+def test_register_drafter_adds_an_algorithm() -> None:
+    from tokenspeed.runtime.execution import drafter
+
+    registry.register_drafter("FIXTURE_SPEC", _FixtureDrafter)
+    try:
+        assert "FIXTURE_SPEC" in drafter.registered_drafter_algorithms()
+        drafter.validate_drafter_algorithm("FIXTURE_SPEC")
+        assert (
+            drafter.get_drafter_impl("FIXTURE_SPEC", torch.nn.Module())
+            is _FixtureDrafter
+        )
+    finally:
+        drafter._PLUGIN_DRAFTERS.pop("FIXTURE_SPEC", None)
+
+
+def test_register_drafter_scopes_an_in_tree_algorithm_by_model_class() -> None:
+    from tokenspeed.runtime.execution import drafter
+    from tokenspeed.runtime.execution.drafter.eagle import Eagle
+
+    registry.register_drafter("MTP", _FixtureDrafter, model_cls=_FixtureNextN)
+    try:
+        assert drafter.get_drafter_impl("MTP", _FixtureNextN()) is _FixtureDrafter
+        # Other draft models keep the in-tree resolution.
+        assert drafter.get_drafter_impl("MTP", torch.nn.Module()) is Eagle
+    finally:
+        drafter._PLUGIN_DRAFTERS.pop("MTP", None)
+
+
+def test_register_drafter_default_collides_with_in_tree() -> None:
+    from tokenspeed.runtime.execution import drafter
+
+    with pytest.raises(ValueError, match="already registered"):
+        registry.register_drafter("MTP", _FixtureDrafter)
+    assert "MTP" not in drafter._PLUGIN_DRAFTERS
+
+
+def test_unknown_drafter_algorithm_is_rejected() -> None:
+    from tokenspeed.runtime.execution import drafter
+
+    with pytest.raises(ValueError, match="available"):
+        drafter.validate_drafter_algorithm("NEXTN")
+
+
+def test_drafter_registration_unwinds_with_the_recording() -> None:
+    from tokenspeed.runtime.execution import drafter
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with registry.recording():
+            registry.register_drafter("FIXTURE_SPEC", _FixtureDrafter)
+            raise RuntimeError("boom")
+    assert "FIXTURE_SPEC" not in drafter.registered_drafter_algorithms()

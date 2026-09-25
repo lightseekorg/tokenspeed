@@ -1865,8 +1865,9 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE3", "MTP", "DFLASH", "DSPARK"],
-            help="Speculative algorithm.",
+            help="Speculative algorithm. In-tree: EAGLE3, MTP, DFLASH, "
+            "DSPARK; plugins may register more (validated after plugin "
+            "discovery).",
         )
         parser.add_argument(
             "--speculative-draft-model-path",
