@@ -126,3 +126,99 @@ def test_kda_prefill_matches_packed_recurrent_reference(
     assert actual_state.dtype == torch.float32
     assert actual_state.shape == (len(lengths), heads, dim, dim)
     assert actual_state.stride()[-2:] == (dim, 1)
+
+
+def _capacity_inputs(capacity: int, sequences: int, heads: int = 4, dim: int = 128):
+    q = torch.randn(1, capacity, heads, dim, device="cuda", dtype=torch.bfloat16)
+    beta = torch.randn(1, capacity, heads, device="cuda", dtype=torch.bfloat16)
+    return dict(
+        q=q,
+        k=torch.randn_like(q),
+        v=torch.randn_like(q),
+        g_raw=torch.randn_like(q),
+        beta_logits=beta,
+        A_log=torch.randn(heads, device="cuda", dtype=torch.float32) * 0.1 - 2.0,
+        dt_bias=torch.randn(heads, dim, device="cuda", dtype=torch.float32),
+        initial_state=torch.randn(
+            sequences, heads, dim, dim, device="cuda", dtype=torch.float32
+        ),
+    )
+
+
+def _exact(inputs: dict, lengths: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+    live = sum(lengths)
+    sliced = {
+        name: tensor[:, :live] if tensor.shape[0] == 1 else tensor
+        for name, tensor in inputs.items()
+        if name not in ("A_log", "dt_bias", "initial_state")
+    }
+    return launch_gluon_kda_paged_prefill_gfx950(
+        **sliced,
+        A_log=inputs["A_log"],
+        dt_bias=inputs["dt_bias"],
+        initial_state=inputs["initial_state"],
+        cu_seqlens=torch.tensor(
+            [0, *accumulate(lengths)], device="cuda", dtype=torch.int32
+        ),
+        lower_bound=-5.0,
+    )
+
+
+def test_kda_prefill_capacity_is_selected() -> None:
+    from tokenspeed_kernel.ops.attention.kda import kda_prefill_capacity_supported
+
+    assert kda_prefill_capacity_supported(torch.bfloat16, solution=None)
+
+
+@pytest.mark.parametrize("lengths", [[300], [1, 64, 65, 129], [2045, 1, 1]])
+def test_kda_prefill_capacity_padding_matches_exact(lengths: list[int]) -> None:
+    from tokenspeed_kernel.ops.attention.kda import (
+        KdaPrefillCapacity,
+        kda_paged_prefill,
+    )
+
+    torch.manual_seed(7)
+    capacity = 2048 if sum(lengths) <= 2048 else 4096
+    inputs = _capacity_inputs(capacity, len(lengths))
+    expected_output, expected_state = _exact(inputs, lengths)
+    # Padding rows are undefined in serving; NaN proves they are never read.
+    live = sum(lengths)
+    for name in ("q", "k", "v", "g_raw", "beta_logits"):
+        inputs[name][:, live:] = float("nan")
+    boundaries = [0, *accumulate(lengths)]
+    result = kda_paged_prefill(
+        **inputs,
+        cu_seqlens=torch.tensor(boundaries, device="cuda", dtype=torch.int64),
+        cu_seqlens_cpu=torch.tensor(boundaries, dtype=torch.int64),
+        capacity=KdaPrefillCapacity(capacity, len(lengths)),
+        inputs_packed=False,
+        lower_bound=-5.0,
+        recurrent_layout="v_major",
+    )
+    torch.testing.assert_close(result.out[:, :live], expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(result.final_state, expected_state, rtol=0, atol=0)
+
+
+def test_kda_prefill_graph_replays_changing_boundaries() -> None:
+    torch.manual_seed(11)
+    capacity = 1024
+    inputs = _capacity_inputs(capacity, 3)
+    cu_seqlens = torch.tensor([0, 1, 2, 3], device="cuda", dtype=torch.int32)
+    captured = dict(inputs, cu_seqlens=cu_seqlens, lower_bound=-5.0)
+
+    # Warm the JIT outside capture; capture fails on any host synchronization.
+    launch_gluon_kda_paged_prefill_gfx950(**captured)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output, state = launch_gluon_kda_paged_prefill_gfx950(**captured)
+
+    for lengths in ([1000, 20, 4], [64, 64, 64], [1, 1, 1022], [5, 300, 1]):
+        cu_seqlens.copy_(
+            torch.tensor([0, *accumulate(lengths)], device="cuda", dtype=torch.int32)
+        )
+        graph.replay()
+        expected_output, expected_state = _exact(inputs, lengths)
+        live = sum(lengths)
+        torch.testing.assert_close(output[:, :live], expected_output, rtol=0, atol=0)
+        torch.testing.assert_close(state, expected_state, rtol=0, atol=0)

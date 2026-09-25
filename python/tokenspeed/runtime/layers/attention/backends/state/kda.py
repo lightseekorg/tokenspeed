@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.attention.kda import (
     kda_fused_paged_verify_uses_split_producers,
     kda_paged_decode,
     kda_paged_prefill,
+    kda_prefill_capacity_supported,
 )
 from tokenspeed_kernel.ops.attention.kda import (
     kda_recurrent_layout as kda_recurrent_layout_default,
@@ -136,6 +137,11 @@ class KdaAttnBackend(MambaAttnBackend):
             f"KDA prefill routes through {self.kda_backend!s}; decode remains on the "
             "platform-selected kernels",
         )
+        # Capacity planning lets captured prefill graphs run KDA inline.
+        self._prefill_capacity_supported = kda_prefill_capacity_supported(
+            self.dtype,
+            solution=None if self.kda_backend == "auto" else self.kda_backend,
+        )
 
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
         # The orchestrator releases old graphs before recapture or pool rebind.
@@ -159,7 +165,7 @@ class KdaAttnBackend(MambaAttnBackend):
     ) -> bool:
         if not (
             self._prefill_graph_enabled
-            and self.kda_backend == "cutedsl_kda"
+            and self._prefill_capacity_supported
             and self.step_counter is None
             and forward_mode.is_extend()
         ):

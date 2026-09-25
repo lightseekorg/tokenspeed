@@ -58,7 +58,7 @@ def metadata(device, page):
 
 def configure_prefill(backend):
     backend._prefill_graph_enabled = True
-    backend.kda_backend = "cutedsl_kda"
+    backend._prefill_capacity_supported = True
     backend._prefill_metadata = {}
     backend._prefill_metadata_pool = None
 
@@ -304,7 +304,8 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
         CAUSAL_CONV1D_BLOCK_M,
         build_causal_conv1d_prefill_metadata,
     )
-    from tokenspeed_kernel.ops.attention.kda.cute_dsl import cutedsl_kda_supported
+    from tokenspeed_kernel.ops.attention.kda import kda_prefill_capacity_supported
+    from tokenspeed_kernel.platform import current_platform
 
     from tokenspeed.runtime.execution.forward_batch_info import (
         CaptureHiddenMode,
@@ -316,8 +317,11 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
         _build_prefill_checkpoint_batch,
     )
 
-    if not cutedsl_kda_supported():
-        pytest.skip("native CuteDSL KDA requires NVIDIA SM100 or SM103")
+    # AMD selects by registry priority; NVIDIA names its capacity kernel.
+    kda_backend = "auto" if current_platform().is_amd else "cutedsl_kda"
+    solution = None if kda_backend == "auto" else kda_backend
+    if not kda_prefill_capacity_supported(torch.bfloat16, solution=solution):
+        pytest.skip("requires a KDA prefill kernel with capacity planning")
     torch.manual_seed(42)
     # Eight BF16 beta heads keep eager tail views 16-byte aligned even when
     # the body has one token, as required by the native scan ABI.
@@ -333,7 +337,7 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
         is_draft=False,
         cache_pool=object(),
         _prefix_granularity=128,
-        kda_backend="cutedsl_kda",
+        kda_backend=kda_backend,
         kda_recurrent_layout="v_major",
     )
     backend._layer_state = lambda layer_id: (

@@ -154,6 +154,15 @@ tile while increasing useful MFMA work per state load. The geometry is tuned
 for KDA's 128-wide key/value state and the one- or two-sequence 8K-token
 prefill batches emitted by the TokenSpeed scheduler.
 
+Chunk planning runs on device: one planner launch maps
+`ceil(T / 64) + N - 1` chunk slots to `(sequence, local chunk)` from the
+device `cu_seqlens`, and slots past the live chunks fall beyond the last
+sequence's length. Every chunk kernel masks by the live length, so rows past
+`cu_seqlens[-1]` are never read and their output rows stay unwritten. The
+launch therefore issues no host synchronization, and one graph capture at a
+fixed token extent replays for any live boundaries that fit it; the kernel
+registers the `prefill_capacity` trait on that basis.
+
 ### DeepSeek V4 attention
 
 The gfx950 and gfx1250 packages provide MXFP4 index selection. Gfx950 also

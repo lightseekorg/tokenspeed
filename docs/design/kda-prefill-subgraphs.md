@@ -10,9 +10,12 @@ with the surrounding model operations. Fixed-capacity buffers let a capture
 handle different input lengths: the graph keeps the same addresses and launch
 shapes, while metadata supplies the live request boundaries and state pages.
 
-The feature is enabled by default for supported prefill batches on the
-`cutedsl_kda` backend when prefill graphs are enabled. It uses the existing
-prefill computation and scheduler-owned checkpoints.
+The feature is enabled by default for supported prefill batches when prefill
+graphs are enabled and the selected KDA prefill kernel declares the
+`prefill_capacity` trait: `cutedsl_kda` on NVIDIA and the Gluon kernel on
+gfx950 (AMD selects it by registry priority, so no `--kda-backend` flag is
+needed). It uses the existing prefill computation and scheduler-owned
+checkpoints.
 
 ## How it works
 

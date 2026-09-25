@@ -183,7 +183,7 @@ class KdaPrefillFallbackTest(unittest.TestCase):
 
         backend = object.__new__(KdaAttnBackend)
         backend._prefill_graph_enabled = True
-        backend.kda_backend = "cutedsl_kda"
+        backend._prefill_capacity_supported = True
         capture = object.__new__(BreakableCapture)
         output = torch.ones(1)
         results = []

@@ -1019,7 +1019,11 @@ The private KDA metadata overrides only the packed execution extent; real
 host lengths and GPU boundaries still agree. An explicit
 `KdaPrefillCapacity` passed to the kernel facade admits the live CPU lengths:
 each sequence may fill the bucket, but their combined tokens must also fit it.
-The CuTeDSL adapter alone converts this descriptor to native planning bounds.
+Only kernels with the `prefill_capacity` trait accept the descriptor. The
+CuTeDSL adapter converts it to native planning bounds; the gfx950 Gluon kernel
+plans `ceil(token_capacity / 64) + sequences - 1` chunks on device from the
+live boundaries and masks every load and store by the live length, so it needs
+neither the host bounds nor an input scrub.
 Convolution maps reserve `ceil(token_capacity / block_m) + sequences - 1`
 programs, bounding the sum of per-request rounded lengths without reserving
 the entire token bucket for every request. One GPU metadata refresh
@@ -1032,7 +1036,8 @@ total packed tokens, including dummy slots, must fit the physical extent.
 Native sequence slots are never empty: request padding uses masked one-token
 sequences in the scan maps. Convolution skips their zero-length spans. A capture
 can serve smaller live batch counts without another schedule.
-Other solutions retain exact live-length planning and reject capacity mode.
+Other solutions retain exact live-length planning and reject capacity mode;
+`kda_prefill_capacity_supported` tells the backend which case applies.
 
 For the pinned token-major CuTeDSL ABI, a fused preparation kernel scrubs
 padding, converts gates to FP32 and builds the device chunk plan. Its total
