@@ -177,3 +177,49 @@ def test_graph_layout_masks_padding_rows() -> None:
         active_bs=0, padded_bs=4, decode_width=2
     )
     assert not buffers.active_request_mask_buf.any()
+
+
+def _draft_states() -> RuntimeStates:
+    states = RuntimeStates(
+        req_pool_size=4, vocab_size=100, device="cpu", output_length=1
+    )
+    states.init_request_token_history(16)
+    return states
+
+
+def test_draft_table_is_separate_and_frontier_is_explicit() -> None:
+    states = _draft_states()
+    states.init_draft_request_token_history(16)
+    lengths = torch.zeros(5, dtype=torch.int32)
+    lengths[1] = 3
+    view = states.draft_request_token_history_view(
+        req_pool_indices=torch.tensor([1]),
+        input_start_offsets=torch.tensor([0, 1], dtype=torch.int32),
+        active_request_mask=torch.tensor([True]),
+        committed_lengths=lengths,
+    )
+    assert view.history_token_ids is not states.request_token_history_ids
+    assert view.committed_lengths is lengths
+
+
+def test_seeding_shifts_the_draft_stream_by_one() -> None:
+    states = _draft_states()
+    states.init_draft_request_token_history(16)
+    states.seed_request_token_history(
+        RequestHistorySeeds(slots=(1,), prefix_lengths=(4,), tokens=((7, 8, 9, 10),))
+    )
+    assert states.request_token_history_ids[1, :4].tolist() == [7, 8, 9, 10]
+    assert states.draft_request_token_history_ids[1, :3].tolist() == [8, 9, 10]
+
+
+def test_draft_table_requires_capacity_and_enablement() -> None:
+    states = _draft_states()
+    with pytest.raises(ValueError):
+        states.init_draft_request_token_history(0)
+    with pytest.raises(RuntimeError):
+        states.draft_request_token_history_view(
+            req_pool_indices=torch.tensor([0]),
+            input_start_offsets=torch.tensor([0, 1], dtype=torch.int32),
+            active_request_mask=torch.tensor([True]),
+            committed_lengths=torch.zeros(5, dtype=torch.int32),
+        )

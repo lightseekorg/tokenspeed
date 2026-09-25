@@ -45,6 +45,7 @@ class RuntimeStates:
         self.ngram_needs_seed: torch.Tensor | None = None
         self.ngram_request_ids: list[str | None] = []
         self.request_token_history_ids: torch.Tensor | None = None
+        self.draft_request_token_history_ids: torch.Tensor | None = None
 
         self.valid_cache_lengths = torch.zeros(
             req_pool_size + 1, dtype=torch.int32, device=device
@@ -103,6 +104,57 @@ class RuntimeStates:
         """Whether this executor keeps request-token history."""
         return self.request_token_history_ids is not None
 
+    def init_draft_request_token_history(self, capacity: int) -> None:
+        """Allocate the draft model's own committed-token history rows.
+
+        A draft stream is the request stream shifted one token left, so it can
+        never append into the target's rows: the shifted ids would overwrite
+        the verify window right before the target commits it. Row ``s`` holds
+        the shifted stream at the target's positions; the drafter supplies the
+        per-slot write frontier explicitly (it advances through the
+        speculative chain, unlike ``valid_cache_lengths``). Idempotent per
+        capacity; returns None.
+        """
+        if capacity <= 0:
+            raise ValueError(
+                f"draft request token history capacity must be positive, got "
+                f"{capacity}"
+            )
+        if self.draft_request_token_history_ids is not None:
+            return
+        pool_size = self.valid_cache_lengths.shape[0]
+        self.draft_request_token_history_ids = torch.zeros(
+            (pool_size, capacity), dtype=torch.int32, device=self.device
+        )
+
+    def draft_request_token_history_view(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        input_start_offsets: torch.Tensor,
+        active_request_mask: torch.Tensor,
+        committed_lengths: torch.Tensor,
+    ) -> RequestTokenHistoryView:
+        """Combine the draft history with one packed-batch layout.
+
+        Args:
+            req_pool_indices: ``[bs]`` slot of every request row.
+            input_start_offsets: ``[bs + 1]`` packed offsets of the draft
+                forward's inputs.
+            active_request_mask: ``[bs]`` False rows are graph padding.
+            committed_lengths: ``[pool + 1]`` per-slot write frontier for this
+                draft step; the drafter owns and advances it.
+        """
+        if self.draft_request_token_history_ids is None:
+            raise RuntimeError("draft request token history is not enabled")
+        return RequestTokenHistoryView(
+            history_token_ids=self.draft_request_token_history_ids,
+            committed_lengths=committed_lengths,
+            req_pool_indices=req_pool_indices,
+            input_start_offsets=input_start_offsets,
+            active_request_mask=active_request_mask,
+        )
+
     def request_token_history_view(
         self,
         *,
@@ -148,10 +200,17 @@ class RuntimeStates:
             pin_memory=torch.device(self.device).type != "cpu",
         ).to(self.device, non_blocking=True)
         offset = 0
+        draft = self.draft_request_token_history_ids
         for slot, prefix_length in zip(seeds.slots, seeds.prefix_lengths):
             history[slot, :prefix_length].copy_(
                 device_tokens[offset : offset + prefix_length]
             )
+            if draft is not None and prefix_length > 1:
+                # The draft stream is the request stream shifted one token
+                # left, at the same positions.
+                draft[slot, : prefix_length - 1].copy_(
+                    device_tokens[offset + 1 : offset + prefix_length]
+                )
             offset += prefix_length
 
     def reset_states(
