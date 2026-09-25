@@ -475,12 +475,25 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
     assert setup.fixed_workspace_bytes == 128 + ple_bytes  # GDN conv + SSM: 128 B.
 
 
-def test_ordinary_mha_reserves_null_parent_within_cache_budget() -> None:
+@pytest.mark.parametrize(
+    ("full_layers", "sliding_layers", "usable_pages"),
+    ((2, 0, 15), (1, 4, 7)),
+)
+def test_ordinary_mha_reserves_null_parent_within_cache_budget(
+    full_layers: int, sliding_layers: int, usable_pages: int
+) -> None:
     model_config = SimpleNamespace(
-        num_attention_layers=2,
+        num_attention_layers=full_layers + sliding_layers,
         hf_config=SimpleNamespace(),
     )
     attn_config = _mha_config()
+    mha = replace(
+        attn_config.component(MHAConfig),
+        cache_layer_types=(FULL_ATTENTION,) * full_layers
+        + ("sliding_attention",) * sliding_layers,
+        sliding_window_tokens=512,
+    )
+    attn_config = replace(attn_config, components=(mha,))
     server_args = SimpleNamespace(max_total_tokens=None)
 
     setup = prepare_cache_setup(
@@ -497,18 +510,20 @@ def test_ordinary_mha_reserves_null_parent_within_cache_budget() -> None:
 
     assert setup.spec.family == "mha"
     assert setup.spec.memory_plan.prefix_granularity == 64
-    assert setup.spec.memory_plan.num_lcm_blocks == 15
+    assert setup.spec.memory_plan.num_lcm_blocks == usable_pages
     assert setup.spec.memory_plan.arena_bytes <= 16_384
-    assert setup.spec.token_capacity == 960
+    assert setup.spec.token_capacity == usable_pages * 64
     assert setup.num_draft_layers == 0
-    pool = _pool_over_new_arena(setup.spec, attn_config, num_layers=2)
+    pool = _pool_over_new_arena(
+        setup.spec, attn_config, num_layers=model_config.num_attention_layers
+    )
     assert type(pool) is MHATokenToKVPool
     assert pool.arena.runtime_contract.token_capacity == setup.spec.token_capacity
     with pytest.raises(TypeError, match="incompatible with MHAConfig"):
         _pool_over_new_arena(
             replace(setup.spec, family="kimi_k3"),
             attn_config,
-            num_layers=2,
+            num_layers=model_config.num_attention_layers,
         )
 
 
