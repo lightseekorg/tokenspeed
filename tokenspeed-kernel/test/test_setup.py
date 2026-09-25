@@ -15,14 +15,18 @@ SETUP_PY = Path(__file__).parents[1] / "python" / "setup.py"
 REQUIREMENTS_DIR = SETUP_PY.parent / "requirements"
 
 
-def _capture_install_requires(monkeypatch, backend: str) -> list[str]:
+def _capture_setup_kwargs(monkeypatch, backend: str) -> dict:
     setup_kwargs = {}
     monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", backend)
     monkeypatch.setattr(
         setuptools, "setup", lambda **kwargs: setup_kwargs.update(kwargs)
     )
     runpy.run_path(str(SETUP_PY))
-    return setup_kwargs["install_requires"]
+    return setup_kwargs
+
+
+def _capture_install_requires(monkeypatch, backend: str) -> list[str]:
+    return _capture_setup_kwargs(monkeypatch, backend)["install_requires"]
 
 
 def _direct_requirements(path: Path) -> list[str]:
@@ -98,8 +102,10 @@ def test_rocm_install_requires_exclude_cuda_dependencies(monkeypatch) -> None:
         "tokenspeed-triton",
         "tokenspeed-kernel-amd",
         "tokenspeed-iris",
+        "triton",
         "torch",
     } <= requirements.keys()
+    assert str(requirements["triton"].specifier) == "==3.8.0"
     assert {
         specifier.operator
         for specifier in requirements["tokenspeed-kernel-amd"].specifier
@@ -120,6 +126,24 @@ def test_rocm_install_requires_exclude_cuda_dependencies(monkeypatch) -> None:
         "tokenspeed-trtllm-kernel",
         "tokenspeed-triton-kernels",
     }.isdisjoint(requirements)
+
+
+def test_petit_gluon_runtime_assets_are_packaged(monkeypatch) -> None:
+    monkeypatch.chdir(SETUP_PY.parent)
+    setup_kwargs = _capture_setup_kwargs(monkeypatch, "rocm")
+
+    assert {
+        "tokenspeed_kernel.thirdparty.petit_gluon",
+        "tokenspeed_kernel.thirdparty.petit_gluon.lib.moe.rocm.mega_moe",
+        "tokenspeed_kernel.thirdparty.petit_gluon.lib.pybind",
+        "tokenspeed_kernel.thirdparty.petit_gluon.petit_kernel",
+    } <= set(setup_kwargs["packages"])
+    assert setup_kwargs["package_data"]["tokenspeed_kernel.thirdparty.petit_gluon"] == [
+        "LICENSE.txt",
+        "README.md",
+        "lib/pybind/*.cc",
+        "lib/pybind/*.h",
+    ]
 
 
 def test_read_requirements_skips_installer_options_and_cycles(
@@ -169,6 +193,18 @@ def test_sdist_includes_requirements_and_python_sources(tmp_path, monkeypatch) -
     expected_files.update(
         path.relative_to(source).as_posix()
         for path in (source / "tokenspeed_kernel").rglob("*.py")
+    )
+    expected_files.update(
+        {
+            "tokenspeed_kernel/thirdparty/petit_gluon/LICENSE.txt",
+            "tokenspeed_kernel/thirdparty/petit_gluon/README.md",
+            "tokenspeed_kernel/thirdparty/petit_gluon/lib/pybind/bindings.cc",
+            "tokenspeed_kernel/thirdparty/petit_gluon/lib/pybind/pybind.h",
+            "tokenspeed_kernel/thirdparty/petit_gluon/lib/pybind/vmm_symmetric_heap.cc",
+            "tokenspeed_kernel/thirdparty/petit_gluon/lib/moe/rocm/mega_moe/"
+            "mega_moe_two_stage_kernel.py",
+            "tokenspeed_kernel/thirdparty/petit_gluon/petit_kernel/__init__.py",
+        }
     )
     assert expected_files <= archived_files
 

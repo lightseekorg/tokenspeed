@@ -127,7 +127,11 @@ from tokenspeed.runtime.layers.moe import (
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput, TopK, TopKOutput
-from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
+from tokenspeed.runtime.layers.moe.utils import (
+    RoutingMethodType,
+    get_all2all_backend,
+    get_moe_backend,
+)
 from tokenspeed.runtime.layers.quantization import Fp8Config, Mxfp4Config
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
@@ -1690,9 +1694,13 @@ class DeepseekV4MoE(nn.Module):
             raise ValueError(
                 f"Unsupported DeepSeek V4 MoE scoring: {self.scoring_func}"
             )
-        self.stream_fork = StreamFork(aux_stream)
-
-        self.use_mega_moe = get_moe_backend().is_mega_moe()
+        moe_backend = get_moe_backend()
+        self.use_mega_moe = moe_backend.is_mega_moe()
+        self.use_petit_gluon = moe_backend.is_petit_gluon()
+        self.owns_ep_communication = self.use_mega_moe or self.use_petit_gluon
+        # Petit's VMM-backed collective and auxiliary-stream shared experts do
+        # not replay safely together. Keep both branches on the main stream.
+        self.stream_fork = StreamFork(None if self.use_petit_gluon else aux_stream)
         if mapping.moe.ep_size > 1:
             if global_server_args_dict.get("enable_eplb", False):
                 raise ValueError(
@@ -1753,9 +1761,9 @@ class DeepseekV4MoE(nn.Module):
                 swiglu_limit=getattr(config, "swiglu_limit", None),
                 reduce_results=False,
                 # Normal EP sums routed and shared partials over the same TPxEP
-                # group. MegaMoE retains its existing dense placement and
-                # CommManager-owned shared-expert communication.
-                is_shared_expert=not self.use_mega_moe,
+                # group. Fused MegaMoE paths return complete routed outputs and
+                # therefore keep the shared expert dense and local.
+                is_shared_expert=not (self.use_mega_moe or self.use_petit_gluon),
             )
         else:
             self.shared_experts = None
@@ -1920,7 +1928,7 @@ class DeepseekV4MoE(nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
     ) -> torch.Tensor:
-        if hidden_states.shape[0] == 0:
+        if hidden_states.shape[0] == 0 and not self.use_petit_gluon:
             return hidden_states
         with nvtx_range("moe_select_experts"):
             topk_output = self._compute_topk_output(hidden_states, input_ids)
@@ -3270,6 +3278,8 @@ class DeepseekV4DecoderLayer(nn.Module):
     def _pre_mlp_input_ids_comm(
         self, input_ids: torch.Tensor, ctx: ForwardContext
     ) -> torch.Tensor:
+        if get_all2all_backend().is_petit_gluon():
+            return input_ids
         if not self.mapping.moe.has_tp_ep:
             return input_ids
         if self.comm_manager.use_all_reduce(is_moe=True):
@@ -3353,7 +3363,8 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         ffn_input_ids = input_ids
         use_mega_moe = getattr(self.ffn, "use_mega_moe", False)
-        if use_mega_moe:
+        owns_ep_communication = getattr(self.ffn, "owns_ep_communication", False)
+        if owns_ep_communication:
             token_counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
             num_global_tokens = sum(token_counts)
             max_num_tokens_per_gpu = max(token_counts) if token_counts else 0
@@ -3377,7 +3388,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 ctx=ctx if use_mega_moe else None,
                 comm_manager=self.comm_manager if use_mega_moe else None,
             )
-        if not use_mega_moe:
+        if not owns_ep_communication:
             with nvtx_range("post_mlp_comm"):
                 hidden_states, _ = self.comm_manager.post_mlp_comm(
                     hidden_states, None, ctx

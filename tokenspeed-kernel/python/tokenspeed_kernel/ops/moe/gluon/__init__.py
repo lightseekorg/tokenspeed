@@ -23,4 +23,5 @@ import tokenspeed_kernel.ops.moe.gluon.fp8  # noqa: F401
 import tokenspeed_kernel.ops.moe.gluon.latent_decode  # noqa: F401
 import tokenspeed_kernel.ops.moe.gluon.latent_input  # noqa: F401
 import tokenspeed_kernel.ops.moe.gluon.mxfp4  # noqa: F401
+import tokenspeed_kernel.ops.moe.gluon.petit  # noqa: F401
 import tokenspeed_kernel.ops.moe.gluon.sqrt_softplus_topk  # noqa: F401

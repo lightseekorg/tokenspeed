@@ -13,10 +13,17 @@ def test_kernel_sources_use_tokenspeed_triton_adapter():
         source_root / "ops/attention/kda/_triton/fla.py",
         source_root / "thirdparty/msa/cute/src/common/cute_dsl_utils.py",
     }
+    stock_triton_roots = {
+        source_root / "thirdparty/petit_gluon",
+    }
     direct_imports = {}
 
     for path in source_root.rglob("*.py"):
-        if path == adapter or path in stock_triton_interop:
+        if (
+            path == adapter
+            or path in stock_triton_interop
+            or any(root in path.parents for root in stock_triton_roots)
+        ):
             continue
         tree = ast.parse(path.read_text(), filename=str(path))
         lines = []

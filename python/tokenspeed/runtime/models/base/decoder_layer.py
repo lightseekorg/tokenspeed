@@ -36,6 +36,7 @@ from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.layernorm import RMSNorm
+from tokenspeed.runtime.layers.moe.utils import get_all2all_backend
 from tokenspeed.runtime.layers.quantization import QuantizationConfig as Q
 from tokenspeed.runtime.models.base.execution import (
     CompiledDecoderLayer as _CompiledRuntime,
@@ -358,6 +359,19 @@ class CompiledDecoderLayer(nn.Module, Generic[_C]):
 
 
 class CompiledMoEDecoderLayer(CompiledDecoderLayer):
+
+    def mlp_spec(self) -> ModuleSpec:
+        if get_all2all_backend().is_petit_gluon():
+            # MegaMoE consumes and returns the rank-local attention-DP token
+            # shard. Its fused kernel owns expert dispatch and combine, so the
+            # layer compiler must not wrap it in the all-gather/reduce-scatter
+            # pair used by local-expert MoE kernels.
+            return ModuleSpec.from_kind(
+                input_placement=Replicate(ParallelGroup.ATTN_TP),
+                output_placement=None,
+                kind=ModuleKind.MOE,
+            )
+        return super().mlp_spec()
 
     @property
     def is_moe_layer(self) -> bool:

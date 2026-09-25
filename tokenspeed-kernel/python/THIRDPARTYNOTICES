@@ -1,5 +1,14 @@
 Portions of this project are based on or inspired by designs and code from the following projects:
 
+Notice for causalflow-ai/petit-kernel
+-------------------------------
+BSD 3-Clause License
+
+Copyright 2025, CausalFlow Inc.
+
+Licensed under the BSD 3-Clause License, whose full license text is available
+in tokenspeed_kernel/thirdparty/petit_gluon/LICENSE.txt.
+
 Notice for NVIDIA/TensorRT-LLM
 -------------------------------
 Apache License, Version 2.0

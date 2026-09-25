@@ -5,3 +5,5 @@ numpy
 torch
 tokenspeed-proton>=3.8.10.post20260920
 tokenspeed-triton>=3.8.10.post20260920
+# Petit relies on Gluon compiler behavior not yet available in tokenspeed-triton.
+triton==3.8.0
