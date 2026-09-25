@@ -400,6 +400,7 @@ def test_config_selects_flash_recipe_and_checks_geometry(runtime_config, overlap
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=256 << 20,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=overlap_depth,
     )
@@ -447,6 +448,7 @@ def test_real_server_args_prepare_cache_pool_and_backend(runtime_config, overlap
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=256 << 20,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=overlap_depth,
     )

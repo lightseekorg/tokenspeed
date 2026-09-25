@@ -77,3 +77,23 @@ def profile_available_cache_memory_bytes(
         1 - gpu_memory_utilization
     )
     return int(cache_memory * (1 << 30))
+
+
+def reserve_cache_budget(profiled_cache_bytes: int, graph_reserve_bytes: int) -> int:
+    """The profiled cache budget less the CUDA-graph reserve.
+
+    The utilization headroom was already left out of the profile; it funds
+    activations and fragmentation, and the reserve for the graphs comes on
+    top of it. A boot the reserve leaves with no cache fails here.
+    """
+    cache_memory = profiled_cache_bytes - graph_reserve_bytes
+    if graph_reserve_bytes and cache_memory <= 0:
+        raise ValueError(
+            f"no cache budget left: the memory profile left "
+            f"{profiled_cache_bytes / (1 << 30):.2f} GiB after the utilization "
+            f"headroom and {graph_reserve_bytes / (1 << 30):.2f} GiB is reserved "
+            "for the CUDA graphs; raise --gpu-memory-utilization, or re-run with "
+            "--disable-cudagraph-memory-reserve to size the cache from free "
+            "memory instead"
+        )
+    return cache_memory

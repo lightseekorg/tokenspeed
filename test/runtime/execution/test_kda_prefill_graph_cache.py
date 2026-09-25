@@ -34,6 +34,9 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
+from tokenspeed.runtime.execution.memory_delta import (  # noqa: E402
+    NULL_MEMORY_DELTA_OBSERVER,
+)
 from tokenspeed.runtime.layers.attention.backends.state.kda_prefill_metadata import (  # noqa: E402
     _checkpoint_slot_batch,
     _clone_metadata,
@@ -468,6 +471,7 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
         data_parallel_size=1,
         prefill_graph_capture_batch_sizes=[batch_size],
     )
+    owner.disable = False
     owner.dp_size, owner.num_warmup, owner._pool = 1, 1, None
     owner.capture_buckets = [bucket]
     owner._captures = {}
@@ -486,7 +490,7 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
         )
 
     owner.make_dummy_batch = dummy
-    owner._capture_all_buckets(None)
+    owner._capture_all_buckets(None, None, NULL_MEMORY_DELTA_OBSERVER)
     assert set(owner._captures) == {(bucket, None), (bucket, batch_size)}
     capture, captured = owner._captures[bucket, batch_size]
     output = captured.hidden_states
@@ -702,6 +706,7 @@ def test_outer_capture_records_one_variant_per_configured_request_count():
         data_parallel_size=1,
         prefill_graph_capture_batch_sizes=[1, 2],
     )
+    owner.disable = False
     owner.dp_size = 1
     owner.capture_buckets = [8]
     owner._captures = {}
@@ -716,19 +721,22 @@ def test_outer_capture_records_one_variant_per_configured_request_count():
         active_count = bs if capture else None
         return True
 
-    owner.attn_backend = SimpleNamespace(prepare_prefill_metadata=prepare)
+    owner.attn_backend = SimpleNamespace(
+        prepare_prefill_metadata=prepare,
+        admits_prefill_graph=lambda *_a, **_k: True,
+    )
     owner.make_dummy_batch = lambda bucket, bs: SimpleNamespace(
         bs=bs,
         capture_hidden_mode=CaptureHiddenMode.NULL,
         forward_mode=ForwardMode.EXTEND,
     )
 
-    def capture(bucket, wrapper):
+    def capture(bucket, wrapper, observer):
         label = (owner._ctx.bs, active_count)
         return label, CapturedForward(torch.ones(bucket, 1), None)
 
     owner._capture_bucket = capture
-    owner._capture_all_buckets(None)
+    owner._capture_all_buckets(None, None, NULL_MEMORY_DELTA_OBSERVER)
     assert owner._captures[8, None][0] == (1, None)
     assert set(owner._captures) == {(8, None), (8, 1), (8, 2)}
     for (_, bs), (capture, _) in owner._captures.items():
