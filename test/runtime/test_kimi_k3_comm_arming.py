@@ -54,8 +54,15 @@ needs_iris = pytest.mark.skipif(
 @pytest.mark.parametrize(
     "rows,is_prefill,sharded_moe_supported,eligible",
     [
-        (48, True, True, False),
-        (511, True, True, False),
+        (0, True, True, False),
+        (15, True, True, False),
+        (16, True, True, True),
+        (32, True, True, True),
+        (37, True, True, True),
+        (48, True, True, True),
+        (128, True, True, True),
+        (256, True, True, True),
+        (511, True, True, True),
         (512, True, True, True),
         (513, True, True, False),
         (848, True, True, True),
@@ -128,8 +135,9 @@ def test_attention_prefill_producer_window(
 
 @pytest.mark.parametrize("has_prefix", [False, True])
 @pytest.mark.parametrize("producer_direct", [False, True])
+@pytest.mark.parametrize("rows", [16, 37, 511])
 def test_attention_prefill_fallback_preserves_residual_ownership(
-    monkeypatch, has_prefix, producer_direct
+    monkeypatch, has_prefix, producer_direct, rows
 ):
     from tokenspeed.runtime.models import kimi_k3_comm as module
 
@@ -137,10 +145,20 @@ def test_attention_prefill_fallback_preserves_residual_ownership(
     comm = module.K3AttnComm(
         SimpleNamespace(mapping=SimpleNamespace(attn=SimpleNamespace(tp_group=group)))
     )
-    partial = torch.zeros((8, 64), dtype=torch.bfloat16)
+    partial = torch.zeros((rows, 7168), dtype=torch.bfloat16)
     prefix = torch.ones_like(partial) if has_prefix else None
     output = torch.full_like(partial, 3)
-    fallback = Mock(side_effect=lambda value, _: value.add_(3))
+
+    def reduce(value, owner):
+        assert owner == group
+        if producer_direct:
+            assert isinstance(value, tuple) and len(value) == 1
+            assert value[0] is partial
+            return (value[0] + 3,)
+        assert value is partial
+        return value.add_(3)
+
+    fallback = Mock(side_effect=reduce)
     monkeypatch.setattr(module, "all_reduce", fallback)
     retained, delta = comm.prefill_reduce_for_attnres(
         partial, prefix, producer_direct=producer_direct

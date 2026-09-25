@@ -453,6 +453,10 @@ def _ar_graph_shape_cases() -> List[Tuple[int, ...]]:
 def _ar_output_shape_cases() -> List[Tuple[Tuple[int, ...], ...]]:
     """Producer-direct collections spanning one, two, and three outputs."""
     return [
+        ((16, 7168),),
+        ((37, 7168),),
+        ((128, 7168),),
+        ((511, 7168),),
         ((1, 7168), (1, 3584)),
         ((2, 7168), (2, 3584)),
         ((4, 7168), (4, 3584)),

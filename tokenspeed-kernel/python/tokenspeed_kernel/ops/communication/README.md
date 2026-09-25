@@ -12,10 +12,15 @@ before allocation or collective publication.
 
 Kimi K3 enables the operation for aligned prefills from 512 through 8192 tokens,
 matching attention and MoE TP8 groups, EP1, PP1, and an unbiased, unquantized BF16
-output projection. Other configurations retain the existing collective and
-AttnRes selection. The model writes its projection directly into prepared Iris
-storage through the public GEMM operation. No scheduler or cache metadata changes
-are needed; these buffers hold transient model activations, not request state.
+output projection. The model writes its projection directly into prepared Iris
+storage through the public GEMM operation. In the same configuration, 16–511-token
+prefills use ordinary producer-direct Iris all-reduce and the registered AttnRes
+mixer. Their residual stays replicated, avoiding the extra gather required below
+the MoE sharding window. The ordinary reduction returns owned local storage and
+preserves the symmetric input; a block-write layer can retain the result across
+subsequent producers. Other configurations retain their existing collective and
+AttnRes selection. No scheduler or cache metadata changes are needed; these
+buffers hold transient model activations, not request state.
 
 ### Sequence and numerics
 

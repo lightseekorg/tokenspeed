@@ -90,6 +90,7 @@ logger = logging.getLogger(__name__)
 _IRIS_MAX_TOKENS = 8192
 _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS = 48
 _IRIS_MOE_ROW_SHARD_MIN_TOKENS = 512
+_IRIS_ATTN_PRODUCER_DIRECT_MIN_TOKENS = 16
 _IRIS_ATTN_SHARDED_PREFIX_MIN_TOKENS = 512
 
 # Widest reduce this instance is built for; it becomes the collective's max_m.
@@ -559,10 +560,13 @@ class K3AttnComm:
             or not sharded_moe_supported
             or not current_platform().is_cdna4
             or like.ndim != 2
-            or not _IRIS_ATTN_SHARDED_PREFIX_MIN_TOKENS
+            or not _IRIS_ATTN_PRODUCER_DIRECT_MIN_TOKENS
             <= like.shape[0]
             <= _IRIS_MAX_TOKENS
-            or like.shape[0] % 8 != 0
+            or (
+                like.shape[0] >= _IRIS_ATTN_SHARDED_PREFIX_MIN_TOKENS
+                and like.shape[0] % 8 != 0
+            )
             or like.dtype != torch.bfloat16
             or self.mapping.attn.tp_size != 8
             or self.mapping.moe.tp_size != 8
@@ -596,11 +600,11 @@ class K3AttnComm:
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Return the residual and optional delta consumed by the AttnRes mixer."""
         if producer_direct:
-            # The sharded mixer declined before publication. RCCL is in-place;
-            # its result may become a retained residual on a block-write layer,
-            # so it must not borrow the next producer's symmetric input.
-            partial = partial.clone()
-        reduced = all_reduce(partial, self.mapping.attn.tp_group)
+            # Prepared Iris inputs reduce into owned storage, which remains
+            # valid as a residual after the next producer reuses its input.
+            reduced = all_reduce((partial,), self.mapping.attn.tp_group)[0]
+        else:
+            reduced = all_reduce(partial, self.mapping.attn.tp_group)
         return (reduced, None) if prefix is None else (prefix, reduced)
 
     def prefill_mix_for_moe(
