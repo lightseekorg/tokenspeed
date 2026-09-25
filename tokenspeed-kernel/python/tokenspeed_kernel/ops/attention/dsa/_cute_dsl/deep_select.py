@@ -44,11 +44,14 @@ leader runs one more compaction over the gathered candidates. This mirrors
 DeepSelect's cluster variant and is what makes small batches with long rows
 fast on Hopper, whose GPCs accept portable 8-CTA clusters (H20 included).
 
-Departures from the CUDA implementation: values travel through registers
-with software double buffering instead of TMA-swizzled shared memory, the
-cluster gather uses plain distributed shared-memory stores under a cluster
-barrier instead of ``st.async`` transactions, and NaN is not detected -- a
-NaN entry is never selected and leaves a ``-1`` slot scoring ``-inf``.
+Departures from the CUDA implementation: the main rounds stream through a
+plain three-stage ``cp.async.bulk`` shared-memory ring instead of
+TMA-swizzled buffers (only the init window is loaded straight into
+registers), and the cluster gather uses plain distributed shared-memory
+stores under a cluster barrier instead of ``st.async`` transactions. NaN
+entries become the ``(-1, -inf)`` placeholder where the init window and
+shortcut rows are formed, and the scan's ``value > threshold`` filter
+discards them elsewhere, so a NaN entry is never selected.
 """
 
 from __future__ import annotations
@@ -115,9 +118,25 @@ def _bits_f32(u):
 
 @cute.jit
 def _distort(bits):
-    """Map FP32 bit patterns to unsigned integers that sort like the floats."""
+    """Map FP32 bit patterns to unsigned integers that sort like the floats.
+
+    A positive NaN would map above +inf, so NaN bits must be sanitized with
+    :func:`_sanitized_bits` before they reach a key or a pair.
+    """
     sign_fill = cutlass.Uint32(cutlass.Int32(bits) >> cutlass.Int32(31))
     return bits ^ (sign_fill | cutlass.Uint32(0x80000000))
+
+
+@cute.jit
+def _sanitized_bits(val):
+    """Float bits of ``val`` with NaN mapped to -inf, the placeholder score.
+
+    Applied wherever init-window values turn into radix keys or pairs, so a
+    NaN entry competes exactly like a padding slot and is never selected."""
+    bits = _f32_bits(val)
+    if (bits & cutlass.Uint32(0x7FFFFFFF)) > cutlass.Uint32(0x7F800000):
+        bits = cutlass.Uint32(NEG_INF_BITS)
+    return bits
 
 
 @cute.jit
@@ -352,7 +371,7 @@ def _set_histogram(
     one = cutlass.Int32(1)
     if cutlass.const_expr(from_registers):
         for t in cutlass.range_constexpr(ELEMS_PER_THREAD):
-            key = _distort(_f32_bits(vals[t]))
+            key = _distort(_sanitized_bits(vals[t]))
             cute.arch.atomic_add(hist_buf + _radix_bucket(key, prefix, pass_idx), one)
     else:
         for t in cutlass.range_constexpr(max_topk // NUM_THREADS):
@@ -380,7 +399,7 @@ def _set_census(
     cnt_eq = cutlass.Int32(0)
     if cutlass.const_expr(from_registers):
         for t in cutlass.range_constexpr(ELEMS_PER_THREAD):
-            key = _distort(_f32_bits(vals[t]))
+            key = _distort(_sanitized_bits(vals[t]))
             cnt_gt = cnt_gt + cutlass.Int32(key > pivot_key)
             cnt_eq = cnt_eq + cutlass.Int32(key == pivot_key)
     else:
@@ -398,12 +417,12 @@ def _set_census(
 @cute.jit
 def _window_pair(vals, t, seg_base, lane, end, active):
     """Init-window entry ``t`` of this lane as a pair: it sits at chunk
-    ``t // 4``, element ``t % 4`` of the segment; entries past the row or of
-    an idle warp carry index -1."""
+    ``t // 4``, element ``t % 4`` of the segment; entries past the row, of
+    an idle warp, or holding NaN carry index -1."""
     index = seg_base + cutlass.Int32(128 * (t // 4)) + lane * 4 + cutlass.Int32(t % 4)
-    if (index >= end) | (~active):
+    if (index >= end) | (~active) | (vals[t] != vals[t]):
         index = cutlass.Int32(-1)
-    return _pack_pair(index, _f32_bits(vals[t]))
+    return _pack_pair(index, _sanitized_bits(vals[t]))
 
 
 @cute.jit
@@ -758,15 +777,19 @@ class DeepSelectTopK:
         full_bars = smem.allocate_array(cutlass.Int64, NUM_STAGES, byte_alignment=8)
 
         if end <= topk:
-            # Shortcut: the whole row is selected, in order, padded with -1.
+            # Shortcut: the whole row is selected, in order; slots past the
+            # end and NaN entries yield the (-1, -inf) placeholder.
             if rank == 0:
                 for i in range(tidx, topk, NUM_THREADS):
+                    index = cutlass.Int32(-1)
+                    value = _bits_f32(cutlass.Uint32(NEG_INF_BITS))
                     if i < end:
-                        out[row, i] = i
-                        values[row, i] = scores[row, i]
-                    else:
-                        out[row, i] = cutlass.Int32(-1)
-                        values[row, i] = _bits_f32(cutlass.Uint32(NEG_INF_BITS))
+                        score = scores[row, i]
+                        if score == score:
+                            index = cutlass.Int32(i)
+                            value = score
+                    out[row, i] = index
+                    values[row, i] = value
         else:
             self._select_row(
                 scores,
@@ -1141,17 +1164,25 @@ def warmup(capacities: tuple[int, ...], device: torch.device) -> None:
     """Compile every cluster variant of the given survivor capacities.
 
     Call before CUDA-graph capture; compiling inside a capture is not
-    possible.
+    possible. ``device`` may be concrete or the index-less
+    ``torch.device("cuda")``, which warms the current device.
     """
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("Compile the DeepSelect selector before graph capture")
+    if device.type != "cuda":
+        raise ValueError(f"device must be a CUDA device, got {device}")
+    # Selector calls cache under the concrete index of the scores device, so
+    # an index-less device must warm the same key.
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
     for capacity in capacities:
         if capacity not in SUPPORTED_MAX_TOPK:
             raise ValueError(
                 f"capacity must be one of {SUPPORTED_MAX_TOPK}, got {capacity}"
             )
         for cluster_size in cluster_sizes_for(capacity):
-            compiled_selector(capacity, cluster_size, device.index)
+            compiled_selector(capacity, cluster_size, device_index)
 
 
 # Rows below this width finish in a couple of rounds; the cluster gather and
@@ -1212,13 +1243,14 @@ def deepselect_topk(
 
     Returns:
         ``(indices, values)``: unsorted column indices and their scores. A
-        row with ``ends[r] <= topk`` yields ``0 .. ends[r] - 1`` followed by
-        ``-1`` slots scoring ``-inf``; otherwise all ``topk`` slots hold
-        distinct indices below ``ends[r]``. Ties at the k-th value are broken
-        arbitrarily but deterministically, so ``-inf`` masking pads may be
-        selected when fewer than ``topk`` finite entries exist; callers
-        filter those by value. NaN entries are never selected and leave
-        ``-1`` slots scoring ``-inf``.
+        row with ``ends[r] <= topk`` yields ``0 .. ends[r] - 1`` in order,
+        followed by ``-1`` slots scoring ``-inf``; otherwise all ``topk``
+        slots hold distinct indices below ``ends[r]``. Ties at the k-th
+        value are broken arbitrarily but deterministically, so ``-inf``
+        masking pads may be selected when fewer than ``topk`` finite entries
+        exist; callers filter those by value. NaN entries are never
+        selected: each one encountered yields a ``-1`` slot scoring
+        ``-inf`` instead (in a shortcut row, at its position).
     """
     if scores.ndim != 2 or scores.dtype != torch.float32 or not scores.is_cuda:
         raise ValueError("scores must be a CUDA FP32 [rows, width] matrix")
