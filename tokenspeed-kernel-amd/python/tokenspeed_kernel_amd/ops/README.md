@@ -367,6 +367,19 @@ The sorter uses the minimum route-program count and fuses histogram with prefix
 scan for this at-most-1024-route decode case. Package prefill retains its
 locality-oriented multi-chunk sorting schedule.
 
+### gfx950 MXFP4 package prefill activation scales
+
+The package prefill path (MXFP4 weights and E2M1 activations, as in Kimi K3
+TP8 prefill) quantizes activations once in token order, while stage 1 reads
+its A scales in sorted-route order with the CDNA4 MFMA swizzle. The quantizer
+therefore writes row-major ``[tokens, K // 32]`` scales
+(``swizzle_scale=False``), and ``gather_package_cdna4_scale`` builds the
+sorted-route copy: each program owns one 32-row destination block, loads its
+rows with contiguous vector loads, permutes the tile into the swizzle in
+registers, and stores the block contiguously. Gathering from an already
+swizzled source would instead cost one small L2 request per two scale bytes;
+at K3 TP8 prefill size the row-major gather takes ~19 us instead of 61 us.
+
 ### gfx950 latent input projection
 
 The Kimi K3 prefill path projects one packed BF16 input weight into router,

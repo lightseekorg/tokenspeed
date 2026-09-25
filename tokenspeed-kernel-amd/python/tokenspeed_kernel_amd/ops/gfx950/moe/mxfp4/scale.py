@@ -56,50 +56,44 @@ def _gather_package_cdna4_scale_kernel(
     sorted_ids,
     dst_scale,
     source_rows,
-    src_mblock_stride,
-    dst_mblock_stride,
     num_sorted_ids,
     K_SCALE: tl.constexpr,
+    K_SCALE_PAD: tl.constexpr,
     TOPK: tl.constexpr,
     FLATTEN_TOPK: tl.constexpr,
-    BLOCK: tl.constexpr,
 ):
-    """Gather a CDNA4-swizzled activation scale by sorted-route rows.
+    """Gather row-major activation scales into a sorted-route CDNA4 swizzle.
 
-    Copies directly between the token-order and sorted-route CDNA4 layouts;
-    ``sorted_ids`` packs ``(topk_id << 24) | token_id`` per slot.
+    ``sorted_ids`` packs ``(topk_id << 24) | token_id`` per slot. One program
+    owns one 32-row destination block: it loads each row's scales with
+    contiguous vector loads, permutes the tile into the CDNA4 order
+    ``(((k_block * 4 + k_lo) * 16 + m_lo) * 2 + k_hi) * 2 + m_hi`` in
+    registers, and stores the block contiguously.
     """
-    linear = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    dst_row = linear // K_SCALE
-    k_scale = linear % K_SCALE
-    in_bounds = dst_row < num_sorted_ids
-
-    packed = tl.load(sorted_ids + dst_row, mask=in_bounds, other=source_rows)
+    mblock = tl.program_id(0)
+    rows = mblock * 32 + tl.arange(0, 32)
+    in_bounds = rows < num_sorted_ids
+    packed = tl.load(sorted_ids + rows, mask=in_bounds, other=source_rows)
     token = packed & 0xFFFFFF
     if FLATTEN_TOPK:
-        slot = packed >> 24
-        src_row = token * TOPK + slot
+        src_row = token * TOPK + (packed >> 24)
     else:
         src_row = token
     valid = in_bounds & (src_row < source_rows)
-
-    src_m_in = src_row % 32
-    src_m_hi = src_m_in // 16
-    src_m_lo = src_m_in % 16
-    k_block = k_scale // 8
-    k_hi = (k_scale % 8) // 4
-    k_lo = k_scale % 4
-    src_swizzled_k = (((k_block * 4 + k_lo) * 16 + src_m_lo) * 2 + k_hi) * 2 + src_m_hi
-    src_off = src_swizzled_k + (src_row // 32) * src_mblock_stride
-
-    dst_m_in = dst_row % 32
-    dst_m_hi = dst_m_in // 16
-    dst_m_lo = dst_m_in % 16
-    dst_swizzled_k = (((k_block * 4 + k_lo) * 16 + dst_m_lo) * 2 + k_hi) * 2 + dst_m_hi
-    dst_off = dst_swizzled_k + (dst_row // 32) * dst_mblock_stride
-
-    value = tl.load(src_scale + src_off, mask=valid, other=127)
-    tl.store(dst_scale + dst_off, value, mask=in_bounds)
+    k = tl.arange(0, K_SCALE_PAD)
+    value = tl.load(
+        src_scale + src_row[:, None] * K_SCALE + k[None, :],
+        mask=valid[:, None] & (k[None, :] < K_SCALE),
+        other=127,
+    )
+    # Rows split as (m_hi, m_lo) and columns as (k_block, k_hi, k_lo).
+    value = tl.reshape(value, (2, 16, K_SCALE_PAD // 8, 2, 4))
+    value = tl.permute(value, (2, 4, 1, 3, 0))
+    value = tl.reshape(value, (32 * K_SCALE_PAD,))
+    offset = tl.arange(0, 32 * K_SCALE_PAD)
+    dst_row = mblock * 32 + (offset // 4) % 16 + (offset % 2) * 16
+    mask = (offset < 32 * K_SCALE) & (dst_row < num_sorted_ids)
+    tl.store(dst_scale + mblock * 32 * K_SCALE + offset, value, mask=mask)
 
 
 def gather_package_cdna4_scale(
@@ -111,10 +105,11 @@ def gather_package_cdna4_scale(
     top_k: int,
     flatten_topk: bool,
 ) -> torch.Tensor:
-    """Remap a CDNA4-swizzled activation scale into sorted-route row order.
+    """Gather row-major activation scales into sorted-route CDNA4 order.
 
     Args:
-        scale: rank-2 uint8 CDNA4-swizzled activation scale.
+        scale: row-major ``(source_rows, cols // 32)`` uint8 scale, as written
+            by ``_quantize_mxfp4_activation(..., swizzle_scale=False)``.
         sorted_ids: sorted-route slots (``(topk_id << 24) | token_id``).
         source_rows: number of valid source rows (token or token*topk extent).
         cols: activation column count (K), must divide 32.
@@ -122,15 +117,22 @@ def gather_package_cdna4_scale(
         flatten_topk: if True, source rows are flattened ``token * TOPK + slot``.
 
     Returns:
-        ``(rows_pad, K // 32)`` uint8 scale in sorted-route order.
+        ``(rows_pad, K // 32)`` uint8 scale in the CDNA4-swizzled sorted-route
+        order; slots past ``sorted_ids`` or with out-of-range tokens read 127.
     """
-    if scale.dtype != torch.uint8 or scale.ndim != 2:
-        raise ValueError(
-            "package prefill requires a rank-2 uint8 gdot128 activation scale"
-        )
     if cols % _MXFP4_BLOCK != 0:
         raise ValueError(f"package prefill scale columns must divide by 32: {cols}")
     k_scale = cols // _MXFP4_BLOCK
+    if (
+        scale.dtype != torch.uint8
+        or scale.ndim != 2
+        or scale.shape[1] != k_scale
+        or not scale.is_contiguous()
+    ):
+        raise ValueError(
+            "package prefill requires a contiguous row-major uint8 activation "
+            f"scale with {k_scale} columns"
+        )
     if k_scale % _ALIGN_K_SCALE_SWIZZLE != 0:
         raise ValueError(
             "package prefill currently requires K/32 divisible by "
@@ -145,8 +147,22 @@ def gather_package_cdna4_scale(
     out = torch.empty((rows_pad, k_scale), dtype=torch.uint8, device=scale.device)
     if sorted_rows == 0:
         return out
-    block = 256
-    _gather_package_cdna4_scale_kernel[(triton.cdiv(sorted_rows * k_scale, block),)](
+    _gather_package_cdna4_scale_kernel[(rows_pad // _NON_K_PRESHUFFLE_BLOCK_SIZE,)](
+        scale,
+        sorted_ids,
+        out,
+        source_rows,
+        sorted_rows,
+        K_SCALE=k_scale,
+        K_SCALE_PAD=triton.next_power_of_2(k_scale),
+        TOPK=top_k,
+        FLATTEN_TOPK=flatten_topk,
+        # Eight waves keep more of the 4 KiB block permutes in flight (K3 TP8
+        # prefill: 26 -> 17 us per layer versus four).
+        num_warps=8,
+    )
+    return out
+    _gather_package_cdna4_scale_kernel[(rows_pad // _NON_K_PRESHUFFLE_BLOCK_SIZE,)](
         scale,
         sorted_ids,
         out,
@@ -157,7 +173,7 @@ def gather_package_cdna4_scale(
         K_SCALE=k_scale,
         TOPK=top_k,
         FLATTEN_TOPK=flatten_topk,
-        BLOCK=block,
+        K_GROUPS=triton.next_power_of_2(k_scale // 2),
         num_warps=4,
     )
     return out

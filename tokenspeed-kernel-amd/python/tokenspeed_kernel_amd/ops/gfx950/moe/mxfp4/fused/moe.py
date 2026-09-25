@@ -886,7 +886,9 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
         invoke_stage2_mxfp4_mfma_decode_gluon,
     )
 
-    q_hidden, q_hidden_scale = _quantize_mxfp4_activation(hidden_states)
+    q_hidden, q_hidden_scale = _quantize_mxfp4_activation(
+        hidden_states, swizzle_scale=True
+    )
     inter = torch.empty(
         (n_tokens * top_k, inter_dim), dtype=torch.bfloat16, device=hidden_states.device
     )
@@ -903,7 +905,7 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
         swiglu_limit=swiglu_limit,
         swiglu_beta=swiglu_beta,
     )
-    q_inter, q_inter_scale = _quantize_mxfp4_activation(inter)
+    q_inter, q_inter_scale = _quantize_mxfp4_activation(inter, swizzle_scale=True)
     if out is None:
         out = torch.empty(
             (n_tokens, out_dim), dtype=out_dtype, device=hidden_states.device
@@ -1054,6 +1056,7 @@ def _maybe_precomputed_mxfp4_mfma_decode(
         hidden_states,
         gather_indx=gather_indx,
         ragged_metadata=ragged_metadata if x_scale_ragged_padded else None,
+        swizzle_scale=True,
     )
     act = _swiglu_activation(swiglu_alpha, swiglu_limit, swiglu_beta)
     intermediate_cache = gluon_mxfp_ragged_matmul(
@@ -1072,6 +1075,7 @@ def _maybe_precomputed_mxfp4_mfma_decode(
     gemm2_input, gemm2_scale = _quantize_mxfp4_activation(
         intermediate_cache,
         ragged_metadata=ragged_metadata if x_scale_ragged_padded else None,
+        swizzle_scale=True,
     )
     return gluon_mxfp_ragged_matmul(
         gemm2_input,
@@ -1454,7 +1458,9 @@ def _maybe_gluon_package_mxfp4_prefill(
             num_valid_ids,
         )
     else:
-        q_hidden, q_hidden_scale = _quantize_mxfp4_activation(hidden_states)
+        q_hidden, q_hidden_scale = _quantize_mxfp4_activation(
+            hidden_states, swizzle_scale=False
+        )
         stage1_scale = gather_package_cdna4_scale(
             q_hidden_scale,
             sorted_ids,
@@ -1843,6 +1849,7 @@ def _gluon_mxfp_dynamic_mxfp4_fused_moe_from_route(
         hidden_states,
         gather_indx=gather_indx,
         ragged_metadata=ragged_metadata,
+        swizzle_scale=True,
     )
     intermediate_cache, gemm2_scale = gluon_mxfp_ragged_matmul(
         gemm1_input,
