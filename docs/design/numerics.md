@@ -1,0 +1,114 @@
+# Numerics envelopes
+
+`--numerics` names, at launch level, the numerical contract a deployment
+promises. Every capability under it exists as an individual switch; the
+envelope's whole job is to keep the set coherent, because RL rollout brought
+us a class of deployment where one missing switch silently invalidates the
+training signal.
+
+## The contract
+
+`--numerics rl-bitwise` promises, within one deployment (fixed world size,
+parallel layout, model, kernels):
+
+1. **Run invariance** — the same request produces bitwise-identical tokens
+   and logprobs across runs.
+2. **Batch invariance** — a request's tokens and logprobs do not depend on
+   which other requests share its batches, or on how the scheduler happened
+   to chunk and batch it.
+
+It deliberately does **not** promise (yet — the layers exist in the
+hierarchy, unimplemented):
+
+3. **Topology invariance** — the same logprobs under a different TP/DP
+   factorization (needs vocab-block-invariant log-softmax and TP-invariant
+   projection layouts).
+4. **Trainer alignment** — bitwise equality with the training framework's
+   forward (needs the trainer's operation order: CPU-computed YaRN ramp
+   masks, unscaled LoRA norms, unfused first RMSNorm, matching collectives).
+
+## The hierarchy
+
+```
+numerics.mode                       --numerics {auto, rl-bitwise}
+├── kernels.deterministic           fixed-reduction-order compute
+│   ├── no autotune                 disable_autotune (tactic choice is shape-
+│   │                               and machine-dependent state)
+│   ├── no TF32                     disable_tf32 + NVIDIA_TF32_OVERRIDE=0
+│   ├── no PDL                      disable_pdl (serialize kernel chains)
+│   └── batch-invariant leaves      kernel registry: leaves declaring the
+│                                   "batch_invariant" feature; a caller in
+│                                   rl-bitwise REQUIRES the feature, so a
+│                                   missing implementation fails at startup
+│                                   instead of silently falling back
+├── collectives.deterministic       one association order per reduction
+│   ├── force_deterministic_rsag    NCCL instead of symmetric-memory paths
+│   ├── no fused AR+norm            enable_allreduce_fusion=False (the fused
+│   │                               kernels make no bitwise claim)
+│   └── NCCL_ALGO=Ring,             the algorithm/protocol switch by message
+│       NCCL_PROTO=Simple           size changes association order
+├── sampling.deterministic          already the default: per-request Philox
+│                                   (seed=crc32(rid), offset=position) is
+│                                   run- and batch-invariant by construction
+├── invariance.batch                per-row-independent reductions
+│   ├── no split-KV attention       decode kernels whose split count scales
+│   │                               with batch/SM occupancy are excluded by
+│   │                               the batch_invariant feature
+│   └── per-row GEMMs               fixed-order GEMM leaves (see aok below)
+├── logprob.topology-invariant      (deferred) vocab-block fixed-tree
+│                                   log-softmax, TP-count-invariant
+└── alignment.trainer               (deferred) trainer operation order
+```
+
+Precedence: an explicitly set individual switch always stands; the envelope
+only ever tightens. `resolve_numerics` runs after `resolve_communication` so
+it can veto the auto-enabled all-reduce fusion.
+
+## Kernel selection
+
+The registry's two matching mechanisms split the work:
+
+- **Traits are seller-declared**: a kernel declaring
+  `deterministic={True}, batch_invariant={True}` documents itself, and a
+  requested trait excludes only kernels that declare the opposite. Good for
+  ranking, useless for guarantees.
+- **Features are buyer-required** (subset test, silent kernels excluded):
+  under rl-bitwise, callers on the model's hot path request
+  `features={"batch_invariant"}`. Only leaves that affirmatively declare the
+  feature can serve the call; a path with no such leaf refuses to start.
+  This is the FluentLLM discipline ("no silent fallback") expressed through
+  the existing registry.
+
+Deterministic leaves live where any other vendor solution lives: registered
+under `solution="aok"` (the fixed-reduction-order operator kit: GEMM family
+including grouped MoE and BMM, lightning-indexer scoring, stable top-k with
+native forced initial/local windows, no-split sparse MLA attention) at plugin
+priority, alongside the performance leaves they mirror. `--numerics auto`
+never selects them; `rl-bitwise` requires them.
+
+## Where FluentLLM's rl_* switches land
+
+FluentLLM grew ~20 flat booleans for the same contract. The mapping into this
+hierarchy (for anyone porting a preset):
+
+| FluentLLM switch | Layer here |
+|---|---|
+| `rl_use_aok_matmul` / `rl_use_aok_bmm` / `rl_use_aok_grouped_gemm` / `rl_use_tiles_router_gemm` | kernels.deterministic → aok leaves via the batch_invariant feature |
+| `rl_enable_aok_indexer_score` / `rl_enable_aok_indexer_topk` / `rl_use_aok_radix_topk` / `use_deterministic_topk` | same, indexer family |
+| `use_deterministic_sfa` | invariance.batch → no-split sparse attention leaves |
+| `rl_use_megatron_prefill_comm` / `force_deterministic_rsag` | collectives.deterministic (we pin NCCL; the NVLS-multimem in-switch reduction is the faster future citizen of the same slot) |
+| `deepep_route_preserving_normal` / `use_torch_router_topk` | kernels.deterministic, MoE dispatch/route order |
+| `rl_use_megatron_log_softmax` / `rl_use_tp_invariant_softmax` | logprob.topology-invariant (deferred) |
+| `rl_force_cpu_for_yarn_linear_ramp_mask` / `rl_disable_scale_q_kv_lora_fusion_weight` / `longcat_disable_first_rmsnorm_fusion` | alignment.trainer (deferred; irrelevant to self-consistency) |
+| `rl_enable_dsa_head_tp` / `rl_enable_tp_batch_invariant` / `rl_tp_batch_invariant_dense_mlp` | topology invariance of projections (deferred with logprob.topology-invariant) |
+| `rl_syncfree_spec_logprob` / `enable_return_logprobs` / `capture_sample_graph` | RL protocol, orthogonal to numerics; not folded |
+| `rl_fuse_qk_rope` / `rl_dp_num_tokens_*` / `rl_force_torch_qcp_uneven_all_gather` | perf/infra toggles, not folded |
+
+## Acceptance
+
+The envelope is verified end to end, not per switch: the invariance harness
+generates with returned logprobs for the same prompts (a) alone at bs=1,
+(b) packed with random co-batches, (c) across repeated runs, and asserts
+`torch.equal` on token ids and logprobs — base model and speculative decoding
+each. A deployment that passes the harness may advertise the rl-bitwise
+contract; one that fails it has a bug, not a tolerance.
