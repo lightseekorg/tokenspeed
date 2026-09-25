@@ -182,7 +182,10 @@ class OrdinaryRecipe(CacheRecipe):
         )
         if self.token_limit is None:
             return budgeted
-        shard_count = self._max_packing(layout)
+        # The DCP shard count, not layout packing: a layout that packs more
+        # than one CacheBlock per parent without sharding must keep the
+        # unsharded floor semantics of _capped_parents.
+        shard_count = self._shard_counts[FULL_ATTENTION]
         if shard_count > 1:
             logical_pages = self.token_limit // parent_tokens
             if logical_pages < 1:

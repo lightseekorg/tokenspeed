@@ -46,7 +46,7 @@ TEST(ReqPoolAllocatorTest, MoveAssignmentReleasesPreviouslyOwnedSlot) {
         dst = std::move(src);
 
         EXPECT_TRUE(dst.valid());
-        EXPECT_FALSE(src.valid());
+        EXPECT_EQ(src.slot_, -1);
         EXPECT_EQ(allocator.AvailableSlots(), 1);
     }
     EXPECT_EQ(allocator.AvailableSlots(), 2);

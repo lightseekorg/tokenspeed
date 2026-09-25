@@ -1256,10 +1256,10 @@ class DeepseekV3AttentionMLA(nn.Module):
             else torch.bfloat16
         )
 
+        placement = attn_backend.cache_placement(self.attn_mha)
         for loop_idx in range(chunk_meta.chunked_loop_num):
             chunk_kv_indices = chunk_meta.chunk_kv_indices_list[loop_idx]
 
-            placement = attn_backend.cache_placement(self.attn_mha)
             if placement is None:
                 kv_a_normed, k_pe = ctx.token_to_kv_pool.get_mla_kv_buffer(
                     self.attn_mha, chunk_kv_indices, read_dtype

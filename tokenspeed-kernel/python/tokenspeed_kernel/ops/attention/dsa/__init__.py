@@ -142,9 +142,8 @@ def dsa_decode(
 
     Returns:
         Latent DSA attention output, or ``(out, lse)`` when ``return_lse=True``.
-        Triton dense-KV partials retain FP32 output with LSE enabled to avoid
-        rounding each context shard before aggregation. Cast the merged result
-        to the model dtype; other solutions may return lower-precision partials.
+        Partials come back in the query dtype (each context shard is rounded
+        before aggregation); only the LSE stays FP32 for the cross-shard merge.
     """
     if q.dim() == 4:
         batch_size, q_len, num_heads, head_dim = q.shape
