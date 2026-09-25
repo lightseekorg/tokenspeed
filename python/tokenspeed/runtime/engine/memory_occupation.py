@@ -164,6 +164,10 @@ class MemoryOccupationController:
                 )
             )
             return
+        if not tags and self._pause.is_drain_pending:
+            # No region needs waking; preserve the current drain owner.
+            self._send.send_pyobj(ResumeMemoryOccupationReqOutput(success=True))
+            return
         for tag in tags:
             self._adapter.resume(tag=tag)
             self.released_tags.discard(tag)
