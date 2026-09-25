@@ -22,10 +22,14 @@ from tokenspeed_kernel.platform import Platform, pdl_enabled
 try:
     from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
         use_gluon_largem_gfx1250,
+        use_gluon_wmma_dense_gfx1250,
     )
 except ImportError:
 
     def use_gluon_largem_gfx1250(m: int, k: int, n: int) -> bool:
+        return False
+
+    def use_gluon_wmma_dense_gfx1250(m: int, k: int, n: int) -> bool:
         return False
 
 
@@ -980,7 +984,10 @@ def kimi3_shared_down_projection(
     Args:
         hidden_states: Contiguous BF16 activated rows shaped ``[M, 768]``.
         weight: Contiguous BF16 TP8 shard shaped ``[7168, 768]``.
-        out: Optional contiguous BF16 output shaped ``[M, 7168]``.
+        out: Optional BF16 output shaped ``[M, 7168]``. A contiguous tensor
+            keeps the existing kernel. A row-strided tensor is written by the
+            CDNA5 dense WMMA when that kernel accepts the shape; otherwise the
+            destination is ignored and a contiguous result is returned.
         solution: ``"auto"`` selects the gfx950 decode GEMV and otherwise
             uses the portable Torch linear operation.
 
@@ -988,6 +995,25 @@ def kimi3_shared_down_projection(
         The local shared-expert output contribution shaped ``[M, 7168]``.
     """
 
+    # The packed join lane is the only strided destination K3 passes here.
+    strided_out = out is not None and not out.is_contiguous()
+    if (
+        strided_out
+        and Platform.get().is_cdna5
+        and hidden_states.ndim == 2
+        and weight.ndim == 2
+        and hidden_states.shape[1] == weight.shape[1]
+        and use_gluon_wmma_dense_gfx1250(
+            hidden_states.shape[0], hidden_states.shape[1], weight.shape[0]
+        )
+    ):
+        from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
+            gluon_wmma_tdm_dense_gfx1250,
+        )
+
+        return gluon_wmma_tdm_dense_gfx1250(hidden_states, weight, out=out)
+    if strided_out:
+        out = None
     m, output_width, input_width = _validate_fallback_projection(
         hidden_states,
         weight,
