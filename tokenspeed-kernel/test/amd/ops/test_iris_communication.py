@@ -453,6 +453,12 @@ def _ar_graph_shape_cases() -> List[Tuple[int, ...]]:
 def _ar_output_shape_cases() -> List[Tuple[Tuple[int, ...], ...]]:
     """Producer-direct collections spanning one, two, and three outputs."""
     return [
+        ((49088,),),
+        ((49152,),),
+        ((344064,),),
+        ((344128,),),
+        ((524288,),),
+        ((524352,),),
         ((16, 7168),),
         ((37, 7168),),
         ((128, 7168),),
@@ -1170,6 +1176,132 @@ def test_iris_all_reduce_epoch_rollover(producer_direct, rows):
     _spawn_and_collect(
         _ar_epoch_worker_fn,
         (8, _get_open_port(), producer_direct, rows),
+        8,
+    )
+
+
+@pytest.mark.parametrize(
+    "world_size,dtype,numel,expected",
+    [
+        (8, torch.bfloat16, 49088, None),
+        (8, torch.bfloat16, 49152, (512, 12)),
+        (8, torch.bfloat16, 49184, None),
+        (8, torch.bfloat16, 344064, (512, 84)),
+        (8, torch.bfloat16, 344128, (512, 64)),
+        (8, torch.bfloat16, 524288, (512, 64)),
+        (8, torch.bfloat16, 524352, None),
+        (4, torch.bfloat16, 49152, None),
+        (2, torch.bfloat16, 49152, None),
+        (8, torch.float16, 49152, None),
+        (8, torch.float32, 49152, None),
+    ],
+)
+def test_producer_direct_register_selection(world_size, dtype, numel, expected):
+    from tokenspeed_kernel.ops.communication.iris import (
+        _producer_direct_register_launch,
+    )
+
+    assert _producer_direct_register_launch(world_size, numel, dtype) == expected
+
+
+def _ar_interleaved_worker_fn(rank, world_size, port, error_dict):
+    try:
+        _ar_interleaved_worker_main(rank, world_size, port)
+    except Exception:
+        error_dict[rank] = traceback.format_exc()
+
+
+def _ar_interleaved_worker_main(rank, world_size, port):
+    from tokenspeed_kernel.ops.communication.iris import create_iris_state
+
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://localhost:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        state = create_iris_state(
+            group=dist.group.WORLD,
+            rank_in_group=rank,
+            staged_max_numel=0,
+            producer_direct_max_numel=1024 * 10752,
+            attnres_max_numel=0,
+            attnres_max_rows=0,
+            enable_lamport=True,
+            moe_tail_max_rows=0,
+            dtype=torch.bfloat16,
+            heap_size=None,
+            device=device,
+        )
+        # Mix both register grids with diagonal-polling one-stage, the original
+        # two-stage, and Lamport calls. Every case reuses the same input storage.
+        shapes = (
+            ((1, 7168),),
+            ((16, 7168),),
+            ((64, 7168),),
+            ((74, 7168),),
+            ((1024, 10752),),
+            ((1, 3584), (1, 7168)),
+            ((16, 7168),),
+        )
+        cases = []
+        for shape in shapes:
+            inputs = state.acquire_outputs(shape)
+            for value in inputs:
+                value.fill_(rank + 1)
+            state.all_reduce_symmetric(inputs)
+            torch.cuda.synchronize()
+            dist.barrier()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                outputs = state.all_reduce_symmetric(inputs)
+            cases.append((inputs, graph, outputs))
+
+        for replay in (False, True):
+            for initial_epoch in (17, 2**31 - 2, -2):
+                torch.cuda.synchronize()
+                dist.barrier()
+                state._producer_direct_ready_flags.fill_(initial_epoch)
+                torch.cuda.synchronize()
+                dist.barrier()
+                retained = []
+                for index, (inputs, graph, captured) in enumerate(cases):
+                    # Delay a producer after peers can have entered the next
+                    # collective; a stale epoch must never admit its old input.
+                    if rank == world_size - 1:
+                        time.sleep(0.01)
+                    for part, value in enumerate(inputs):
+                        value.fill_(rank + 1 + index + part / 8)
+                    if replay:
+                        graph.replay()
+                        outputs = captured
+                    else:
+                        outputs = state.all_reduce_symmetric(inputs)
+                    torch.cuda.synchronize()
+                    for part, (value, output) in enumerate(
+                        zip(inputs, outputs, strict=True)
+                    ):
+                        assert torch.all(value == rank + 1 + index + part / 8).item()
+                        expected = 36 + 8 * index + part
+                        retained.append((output, expected))
+                    # Owned outputs from preceding, differently shaped calls
+                    # must survive producer and scratch reuse.
+                    for output, expected in retained:
+                        assert torch.all(output == expected).item()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_iris_all_reduce_interleaved_protocols():
+    _skip_if_unsupported(8, "Iris interleaved producer-direct tests")
+    if not current_platform().is_cdna4:
+        pytest.skip("Producer-direct Iris reductions require CDNA4")
+    _spawn_and_collect(
+        _ar_interleaved_worker_fn,
+        (8, _get_open_port()),
         8,
     )
 

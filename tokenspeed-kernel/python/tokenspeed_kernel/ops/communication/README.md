@@ -1,5 +1,43 @@
 # Communication operations
 
+## Ordinary producer-direct Iris all-reduce
+
+TP8 BF16 payloads from 96 KiB through 1 MiB use a register-based reduce-scatter
+and pull gather. Each rank reduces its contiguous element partition, then pulls
+the eight reduced partitions into caller-owned output storage. Inputs remain
+intact. The path requires partitions aligned to eight BF16 elements; other
+shapes, dtypes, group sizes and larger payloads retain the existing kernels.
+The operation reuses the prepared input, one-partition scratch and 84-row flag
+array. It adds no symmetric allocation and does not overwrite the borrowed
+attention/MoE result.
+
+Each workgroup has one subgroup and processes 512 elements per tile. Up to 84
+workgroups run; partitions requiring 85–128 tiles use 64 workgroups. The eight
+peer loads are issued together and summed with the existing even/odd FP32 tree
+before rounding to BF16. The gather batches its peer loads and output stores
+as well. Both payload phases use system-scope ".cv" loads, which bypass
+non-coherent caches while retaining the last-level cache's temporal policy.
+The inspected CDNA4 instructions are 16-byte buffer loads with `sc0 sc1`.
+Scratch stores use ".wt"; the gather writes ordinary owned output with ".wb".
+The single-subgroup kernel needs no workgroup barriers or shared-memory
+transpose. Peer payload reads and writes remain batched without intermediate
+waits between peers.
+
+Calls use the same stream-ordered state as the existing producer-direct kernels.
+Each workgroup exclusively owns its diagonal epoch counter. It loads that
+counter at entry, publishes entry and completion into non-diagonal incoming
+flags, and stores the advanced counter before returning. Polls compare signed
+32-bit differences, including across wraparound. Entry uses release/acquire
+ordering; completion drains all subgroup stores before publishing and acquiring
+the peer flags. Completion also joins input readers before a subsequent producer
+can overwrite the input. The next scratch writer's entry rendezvous protects
+the preceding gather, including when ordinary and prefill kernels alternate.
+
+Validation includes the ordinary TP2/4/8 correctness tests and
+`test_iris_all_reduce_interleaved_protocols`, which delays producers while mixing
+one-stage, register, original two-stage and Lamport reductions. It checks inputs
+and retained outputs in eager and graph execution across epoch rollover.
+
 ## Iris attention prefill and MoE storage
 
 `iris_attention_prefill_mix` reduces a BF16 attention projection and performs

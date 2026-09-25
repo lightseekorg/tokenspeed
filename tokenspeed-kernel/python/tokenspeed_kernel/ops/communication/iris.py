@@ -34,6 +34,9 @@ from tokenspeed_kernel._triton import (
     tl,
     triton,
 )
+from tokenspeed_kernel.ops.communication._iris.reduce_gluon import (
+    iris_reduce_symmetric_register_gluon_kernel,
+)
 from tokenspeed_kernel.ops.communication._iris.sync import _iris_drain_subgroup_vmem
 
 # iris does plain ``import triton`` at module load time; route those bindings
@@ -167,6 +170,11 @@ class _ProducerDirectAllReduceKernelConfig:
     one_stage_words_per_lane: int
     two_stage_min_bytes: tuple[tuple[int, int], ...]
     publish_ready: bool
+    register_min_bytes: int
+    register_max_bytes: int
+    register_block_size: int
+    register_max_programs: int
+    register_two_iteration_programs: int
 
     def __post_init__(self) -> None:
         if (
@@ -177,6 +185,12 @@ class _ProducerDirectAllReduceKernelConfig:
             or self.one_stage_max_programs <= 0
             or self.one_stage_num_subgroups <= 0
             or self.one_stage_words_per_lane <= 0
+            or not 0 < self.register_min_bytes <= self.register_max_bytes
+            or self.register_block_size != 512
+            or not 0
+            < self.register_two_iteration_programs
+            <= self.register_max_programs
+            or self.register_max_programs > self.one_stage_max_programs
         ):
             raise ValueError("invalid producer-direct Iris kernel configuration")
         threshold_world_sizes = tuple(
@@ -402,6 +416,11 @@ IRIS_ALL_REDUCE_KERNEL_CONFIG = IrisAllReduceKernelConfig(
         one_stage_words_per_lane=2,
         two_stage_min_bytes=((4, 160 << 10), (8, 96 << 10)),
         publish_ready=False,
+        register_min_bytes=96 << 10,
+        register_max_bytes=1 << 20,
+        register_block_size=512,
+        register_max_programs=84,
+        register_two_iteration_programs=64,
     ),
     two_stage=_TwoStageAllReduceKernelConfig(
         supported_world_sizes=(4, 8),
@@ -488,6 +507,32 @@ def _use_two_stage_producer_direct(
             elements_per_word=elements_per_word,
         )
     )
+
+
+def _producer_direct_register_launch(
+    world_size: int,
+    total_numel: int,
+    dtype: torch.dtype,
+) -> tuple[int, int] | None:
+    """Select the TP8 BF16 register reduction within its measured byte range."""
+    config = IRIS_ALL_REDUCE_KERNEL_CONFIG.producer_direct
+    total_bytes = total_numel * dtype.itemsize
+    if (
+        world_size != 8
+        or dtype != torch.bfloat16
+        or total_numel % 64 != 0
+        or not config.register_min_bytes <= total_bytes <= config.register_max_bytes
+    ):
+        return None
+    num_tiles = triton.cdiv(total_numel // world_size, config.register_block_size)
+    num_programs = min(num_tiles, config.register_max_programs)
+    if (
+        config.register_max_programs
+        < num_tiles
+        <= 2 * config.register_two_iteration_programs
+    ):
+        num_programs = config.register_two_iteration_programs
+    return config.register_block_size, num_programs
 
 
 def _use_two_stage_plain(
@@ -1385,6 +1430,25 @@ class IrisAllReduce(object):
     def _all_reduce_symmetric_pull(self, output: torch.Tensor) -> None:
         total_numel = output.numel()
         kernel_config = self._kernel_config.producer_direct
+        register_launch = _producer_direct_register_launch(
+            self.world_size, total_numel, self.dtype
+        )
+        if register_launch is not None:
+            assert self._producer_direct_scratch_buf is not None
+            block_size, num_programs = register_launch
+            iris_reduce_symmetric_register_gluon_kernel[(num_programs,)](
+                self._input_buf,
+                self._producer_direct_scratch_buf,
+                output,
+                self._producer_direct_ready_flags,
+                *self._heap_base_addresses,
+                RANK=self._iris_rank,
+                PARTITION_ELEMENTS=total_numel // self.world_size,
+                BLOCK_ELEMENTS=block_size,
+                NUM_PROGRAMS=num_programs,
+                num_warps=1,
+            )
+            return
         use_two_stage = _use_two_stage_producer_direct(
             world_size=self.world_size,
             total_numel=total_numel,
