@@ -38,6 +38,14 @@ pytestmark = pytest.mark.skipif(
     reason="Iris communication tests require AMD ROCm",
 )
 
+
+@pytest.fixture(autouse=True)
+def _require_iris():
+    pytest.importorskip(
+        "tokenspeed_kernel.ops.communication.iris", exc_type=ImportError
+    )
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
