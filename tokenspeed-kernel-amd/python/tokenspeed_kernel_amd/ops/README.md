@@ -163,6 +163,34 @@ launch therefore issues no host synchronization, and one graph capture at a
 fixed token extent replays for any live boundaries that fit it; the kernel
 registers the `prefill_capacity` trait on that basis.
 
+### gfx950 MLA prefill
+
+Dense non-absorbed MLA prefill for packed variable-length requests: Q/K carry
+128 NoPE plus 64 RoPE dimensions, V carries 128, and causal masking aligns each
+request's queries to the end of its KV (bottom-right).
+
+#### Contract
+
+- Q, K and V share one dtype: FP16, BF16, or FP8 (E4M3/E5M2, unit scale).
+  Output is BF16 ``[tokens, heads, 128]``; the natural-log LSE is optional.
+- One persistent 512-block grid serves every shape. Query length is a runtime
+  bound, so varying prompt lengths reuse one compiled kernel per variant.
+
+#### Algorithm
+
+Each work item owns one query block of one head and streams its visible KV
+tiles through an online softmax, overlapping each tile's QK with the previous
+tile's softmax and PV. Causal launches interleave heavy and light query blocks
+across the persistent blocks.
+
+An FP8 launch with too few query blocks to fill half the grid, such as a short
+prefill tail against a long history, also splits each block's visible KV
+tiles into equal shares, as many as fit one round of the grid (at most 16, at
+least 16 tiles each). Each split writes its normalized FP32 output and LSE;
+``gluon_mla_prefill_combine_gfx950`` merges the splits by LSE. Splits that
+receive no tiles report LSE ``-inf`` and contribute nothing. For Kimi K3 TP8,
+the 848-token tail of a 50K prompt drops from 1.01 ms to 0.32 ms per layer.
+
 ### DeepSeek V4 attention
 
 The gfx950 and gfx1250 packages provide MXFP4 index selection. Gfx950 also

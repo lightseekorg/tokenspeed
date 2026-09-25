@@ -165,7 +165,12 @@ def test_mla_prefill_gluon_launch_runtime_bound(require, monkeypatch, dtype):
 
             return launch
 
+    class SkipCombine:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: None
+
     monkeypatch.setattr(prefill, "gluon_mla_prefill_gfx950", RecordLaunch())
+    monkeypatch.setattr(prefill, "gluon_mla_prefill_combine_gfx950", SkipCombine())
     for tokens in (144, 160, 256, 272, 512, 2048, 8192, 16384):
         q = torch.empty((tokens, 12, 192), dtype=dtype, device="meta")
         v = torch.empty((tokens, 12, 128), dtype=dtype, device="meta")
@@ -176,10 +181,15 @@ def test_mla_prefill_gluon_launch_runtime_bound(require, monkeypatch, dtype):
         assert launches[-1]["max_seqlen_q"] == (
             tokens if dtype in _FP8_DTYPES else 65536
         )
-    # Crossing query-tile and persistent-cycle boundaries changes no constexpr.
+    # Crossing query-tile and persistent-cycle boundaries changes no constexpr;
+    # only launches too small to fill the grid select the KV-split variant.
     for launch in launches:
-        launch.pop("max_seqlen_q")
-    assert all(launch == launches[0] for launch in launches)
+        for runtime_arg in ("max_seqlen_q", "num_splits", "split_row_stride"):
+            launch.pop(runtime_arg)
+    for split_kv in (False, True):
+        group = [launch for launch in launches if launch["SPLIT_KV"] == split_kv]
+        assert all(launch == group[0] for launch in group)
+    assert any(launch["SPLIT_KV"] for launch in launches) == (dtype in _FP8_DTYPES)
 
 
 @pytest.mark.parametrize("is_causal", [False, True])
@@ -373,3 +383,77 @@ def test_mla_prefill_gluon_fp8_online_max(device, require, dtype, changed_row, k
     torch.testing.assert_close(
         lse, scores.logsumexp(-1).transpose(0, 1), rtol=2e-5, atol=2e-5
     )
+
+
+def _reference_mla_prefill(q, k, v, q_lens, kv_lens, is_causal):
+    outputs, lses = [], []
+    q_start = kv_start = 0
+    for q_len, kv_len in zip(q_lens, kv_lens):
+        qs = q[q_start : q_start + q_len].float()
+        ks = k[kv_start : kv_start + kv_len].float()
+        vs = v[kv_start : kv_start + kv_len].float()
+        scores = torch.einsum("qhd,khd->hqk", qs, ks) * 192**-0.5
+        if is_causal:
+            rows = torch.arange(q_len, device=q.device)[:, None] + kv_len - q_len
+            visible = torch.arange(kv_len, device=q.device)[None, :] <= rows
+            scores = scores.masked_fill(~visible, -float("inf"))
+        outputs.append(torch.einsum("hqk,khd->qhd", scores.softmax(-1), vs))
+        lses.append(torch.logsumexp(scores, -1).transpose(0, 1))
+        q_start += q_len
+        kv_start += kv_len
+    return torch.cat(outputs), torch.cat(lses)
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+@pytest.mark.parametrize("return_lse", [False, True])
+@pytest.mark.parametrize(
+    "q_lens,kv_lens", [((848,), (50000,)), ((1,), (3000,)), ((300, 5), (5000, 9000))]
+)
+def test_mla_prefill_gluon_fp8_split_kv(
+    device, require, is_causal, return_lse, q_lens, kv_lens
+):
+    dtype = torch.float8_e4m3fn
+    require("attention", "mla_prefill", "gluon", dtype, "q")
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla import prefill
+
+    heads = 12
+    work_items = sum(heads * -(-q_len // 256) for q_len in q_lens)
+    # Few query blocks against long KV: the launch splits KV and combines.
+    assert prefill._select_num_kv_splits(True, work_items, max(kv_lens), 64) > 1
+    torch.manual_seed(3)
+    q = (torch.randn(sum(q_lens), heads, 192, device=device) * 0.5).to(dtype)
+    k = (torch.randn(sum(kv_lens), heads, 192, device=device) * 0.5).to(dtype)
+    v = (torch.randn(sum(kv_lens), heads, 128, device=device) * 0.5).to(dtype)
+    cu_q = torch.tensor((0, *q_lens), device=device).cumsum(0, dtype=torch.int32)
+    cu_kv = torch.tensor((0, *kv_lens), device=device).cumsum(0, dtype=torch.int32)
+    result = prefill.launch_gluon_mla_prefill_gfx950(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_kv,
+        max(q_lens),
+        max(kv_lens),
+        192**-0.5,
+        is_causal=is_causal,
+        return_lse=return_lse,
+    )
+    output, lse = result if return_lse else (result, None)
+    expected, expected_lse = _reference_mla_prefill(q, k, v, q_lens, kv_lens, is_causal)
+    torch.testing.assert_close(output.float(), expected, rtol=1e-2, atol=2e-3)
+    if return_lse:
+        torch.testing.assert_close(lse, expected_lse, rtol=1e-5, atol=1e-4)
+
+
+def test_mla_prefill_gluon_split_selection():
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.prefill import (
+        _select_num_kv_splits,
+    )
+
+    # Filled grids, 16-bit inputs, and short KV keep the single-pass kernel.
+    assert _select_num_kv_splits(True, 32 * 12, 50000, 64) == 1
+    assert _select_num_kv_splits(False, 48, 50000, 64) == 1
+    assert _select_num_kv_splits(True, 48, 1000, 64) == 1
+    # The K3 TP8 tail chunk: 4 query blocks x 12 heads fill one grid round.
+    assert _select_num_kv_splits(True, 48, 50000, 64) == 10
+    assert _select_num_kv_splits(True, 1, 1 << 20, 64) == 16
