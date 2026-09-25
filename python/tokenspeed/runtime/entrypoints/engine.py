@@ -518,6 +518,13 @@ def _set_envs_and_config(server_args: ServerArgs):
         # explicit env wins; --disable-tf32 is the documented opt-out.
         os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "1")
         os.environ.setdefault("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "1")
+    if server_args.numerics == "rl-bitwise":
+        # Bitwise envelope: no TF32 anywhere, and pin NCCL to one
+        # algorithm/protocol so the reduction association order cannot switch
+        # with message size. setdefault so an explicit env still wins.
+        os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "0")
+        os.environ.setdefault("NCCL_ALGO", "Ring")
+        os.environ.setdefault("NCCL_PROTO", "Simple")
 
     _set_socket_interface(server_args)
 

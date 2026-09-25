@@ -310,6 +310,11 @@ class ServerArgs:
     disable_tf32: bool = False
     force_deterministic_rsag: bool = False
     disable_sampling_tp_sync: bool = False
+    # Numerics envelope: "auto" keeps every performance default; "rl-bitwise"
+    # asks for bitwise run-to-run and batch-composition invariance and folds
+    # the determinism switches below (resolve_numerics). Each folded switch
+    # can still be set individually; the umbrella only ever tightens.
+    numerics: str = "auto"
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
@@ -380,6 +385,7 @@ class ServerArgs:
         self.resolve_cache()
         self.resolve_speculative_decoding()
         self.resolve_communication()
+        self.resolve_numerics()
         self.resolve_disaggregation()
         self.validate()
 
@@ -780,6 +786,35 @@ class ServerArgs:
                 f"{self.mapping.attn.tp_size!s} and dense_tp_size: "
                 f"{self.mapping.dense.tp_size!s}!",
             )
+
+    def resolve_numerics(self):
+        """Fold the ``--numerics`` envelope into the individual switches.
+
+        ``rl-bitwise`` is the RL rollout contract: within one deployment the
+        same request produces bitwise-identical tokens and logprobs across
+        runs and regardless of batch composition. The umbrella only ever
+        tightens settings — a switch a user already set stays set — and each
+        derived switch remains individually available for auto mode.
+        Runs after ``resolve_communication`` so it can veto the fused
+        all-reduce that resolver auto-enables.
+        """
+        if self.numerics == "auto":
+            return
+        if self.numerics != "rl-bitwise":
+            raise ValueError(
+                f"--numerics must be auto or rl-bitwise, got {self.numerics!r}"
+            )
+        # Collectives: rank-ordered NCCL instead of the symmetric-memory and
+        # trtllm fused paths (elementwise NCCL reductions are independent of
+        # batch co-members; the fused AR+norm kernels make no bitwise claim).
+        self.force_deterministic_rsag = True
+        self.enable_allreduce_fusion = False
+        self.comm_fusion_max_num_tokens = -1
+        # Kernels: heuristic tactics only (autotune picks shape-dependent
+        # tactics), no TF32, and no programmatic dependent launches.
+        self.disable_autotune = True
+        self.disable_tf32 = True
+        self.disable_pdl = True
 
     def resolve_disaggregation(self):
         # Pipeline parallelism is a prefill-node-only capability: the chunk
@@ -2115,6 +2150,16 @@ class ServerArgs:
             action="store_true",
             help="Use NCCL collectives instead of Triton symmetric-memory "
             "all-reduce/gather/scatter.",
+        )
+        parser.add_argument(
+            "--numerics",
+            type=str,
+            choices=["auto", "rl-bitwise"],
+            default=ServerArgs.numerics,
+            help="Numerics envelope. rl-bitwise folds the determinism "
+            "switches (deterministic collectives, no autotune/TF32/PDL, no "
+            "fused all-reduce) so outputs and logprobs are bitwise identical "
+            "across runs and batch compositions within one deployment.",
         )
         parser.add_argument(
             "--disable-sampling-tp-sync",
