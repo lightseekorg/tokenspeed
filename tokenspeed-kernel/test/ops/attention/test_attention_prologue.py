@@ -1126,6 +1126,76 @@ def test_write_latent_stores_per_token_head_planes_as_the_composite_does():
         assert bytes_equal(a, b)
 
 
+@pytest.mark.parametrize("solution", ["triton", "composite"])
+@pytest.mark.parametrize("fp8_cache", [True, False])
+def test_a_write_mask_skips_the_rows_it_excludes(solution, fp8_cache):
+    """A DCP rank stores only the rows it owns: skipped rows keep the cache's
+    bytes, stored rows match the unmasked write, and the query is unaffected."""
+    tokens, heads, rank, rope, total = 9, 16, 512, 64, 64
+    cache_dtype = FP8 if fp8_cache else BF16
+    q_nope, q_pe, latent = mla_inputs(tokens, heads, rank, rope, seed=29)
+    positions = torch.arange(tokens, device="cuda")
+    rotary = Rotary(cos_sin_cache(rope), positions, RopeStyle.GPTJ, None)
+    loc = slots(tokens, total, seed=30)
+    mask = torch.tensor([1, 0, 1, 1, 0, 0, 1, 0, 1], device="cuda").bool()
+    poison = poisoned_latent(total, rank + rope, cache_dtype)
+
+    def prologue(cache, write_mask):
+        return mla_prologue(
+            mla_query(q_nope, rope),
+            q_pe.clone(),
+            latent.clone(),
+            expanded=None,
+            rotary=rotary,
+            cache=latent_target(cache, loc, write_mask=write_mask),
+            solution=solution,
+            override=None,
+        ).query
+
+    full = poison.clone()
+    ref_q = prologue(full, None)
+    masked = poison.clone()
+    assert bytes_equal(prologue(masked, mask), ref_q)
+    written = poison.clone()
+    write_latent(
+        latent.clone(),
+        rotary=rotary,
+        cache=latent_target(written, loc, write_mask=mask),
+    )
+    for cache in (masked, written):
+        assert bytes_equal(cache[loc[mask]], full[loc[mask]])
+        assert bytes_equal(cache[loc[~mask]], poison[loc[~mask]])
+
+
+def test_per_token_head_planes_take_no_write_mask():
+    _, _, latent = mla_inputs(3, 16, 512, 64, seed=31)
+    loc = torch.arange(3, device="cuda")
+    mask = torch.ones(3, dtype=torch.bool, device="cuda")
+    with pytest.raises(ValueError, match="take no write mask"):
+        write_latent(
+            latent,
+            rotary=None,
+            cache=latent_target(_planes(512, 64), loc, write_mask=mask),
+        )
+
+
+@pytest.mark.parametrize("flaw", ["short", "uint8", "strided"])
+def test_a_write_mask_is_a_dense_bool_vector_over_the_slots(flaw):
+    _, _, latent = mla_inputs(3, 16, 512, 64, seed=32)
+    cache = poisoned_latent(8, 576, FP8)
+    mask = {
+        "short": torch.ones(2, dtype=torch.bool, device="cuda"),
+        "uint8": torch.ones(3, dtype=torch.uint8, device="cuda"),
+        "strided": torch.ones(6, dtype=torch.bool, device="cuda")[::2],
+    }[flaw]
+    with pytest.raises(ValueError, match="dense bool vector"):
+        write_latent(
+            latent,
+            rotary=None,
+            cache=latent_target(cache, torch.arange(3, device="cuda"), False, mask),
+        )
+
+
 @pytest.mark.parametrize("tokens", [1, 9, 64])
 @pytest.mark.parametrize("rope_style", [RopeStyle.GPTJ, RopeStyle.NEOX, None])
 @pytest.mark.parametrize("fp8_cache", [True, False])

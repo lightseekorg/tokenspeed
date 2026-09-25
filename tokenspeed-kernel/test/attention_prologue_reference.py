@@ -164,9 +164,14 @@ def poisoned_latent(total: int, width: int, dtype: torch.dtype) -> torch.Tensor:
 
 
 def latent_target(
-    kv_cache, slots: torch.Tensor, sanitize: bool = False
+    kv_cache,
+    slots: torch.Tensor,
+    sanitize: bool = False,
+    write_mask: torch.Tensor | None = None,
 ) -> LatentKVCache:
-    return LatentKVCache(kv_cache=kv_cache, sanitize=sanitize, slots=slots)
+    return LatentKVCache(
+        kv_cache=kv_cache, sanitize=sanitize, slots=slots, write_mask=write_mask
+    )
 
 
 def _pair_rows(mrope: MRope, half: int) -> list[int]:

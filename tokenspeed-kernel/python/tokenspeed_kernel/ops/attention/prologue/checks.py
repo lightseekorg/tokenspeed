@@ -110,7 +110,8 @@ def _cache_key(cache: HeadKVCache | LatentKVCache) -> tuple:
         if isinstance(kv, torch.Tensor)
         else (_layout(kv.latent), _layout(kv.scale), _layout(kv.rope))
     )
-    return (kv_key, cache.sanitize, _layout(cache.slots))
+    mask = None if cache.write_mask is None else _layout(cache.write_mask)
+    return (kv_key, cache.sanitize, _layout(cache.slots), mask)
 
 
 _checked: set[tuple] = set()
@@ -179,6 +180,7 @@ def _check_latent_write(
     _check_slots(cache, num_tokens)
     if cache.slots.numel() != num_tokens:
         raise ValueError(f"{cache.slots.numel()} slots for {num_tokens} latent rows")
+    _check_write_mask(cache)
     kv = cache.kv_cache
     if isinstance(kv, PerTokenHeadPlanes):
         return
@@ -234,6 +236,24 @@ def _check_slots(cache: HeadKVCache | LatentKVCache, num_tokens: int) -> None:
             f"cache slots {tuple(slots.shape)} are not a dense vector (int32 or int64) "
             f"of at most {num_tokens}"
         )
+
+
+def _check_write_mask(cache: LatentKVCache) -> None:
+    mask = cache.write_mask
+    if mask is None:
+        return
+    if (
+        mask.shape != cache.slots.shape
+        or mask.dtype != torch.bool
+        or mask.stride(0) != 1
+        or mask.device != cache.slots.device
+    ):
+        raise ValueError(
+            f"write mask {tuple(mask.shape)} is not a dense bool vector over "
+            f"the {cache.slots.numel()} slots"
+        )
+    if cache.format is KVCacheFormat.FP8_PER_TOKEN_HEAD:
+        raise ValueError("per-token-head planes take no write mask")
 
 
 def _check_rotary(rotary: Rotary, num_tokens: int) -> None:
@@ -413,6 +433,7 @@ def _check_mla_request(
             f"MLA RoPE is 64, 128, 256 or 512 channels wide, or absent, not {rope_dim}"
         )
     _check_slots(cache, num_tokens)
+    _check_write_mask(cache)
     if cache.format is KVCacheFormat.FP8_PER_TOKEN_HEAD:
         planes = cache.kv_cache
         rows = (

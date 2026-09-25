@@ -104,10 +104,11 @@ def _prologue(monkeypatch, *, qk_norm, mode, rows, slots):
         forward_mode=mode,
         attn_backend=SimpleNamespace(
             padded_write_locations=lambda layer, m, rows: handed.update(rows=rows)
-            or slots
+            or slots,
+            cache_placement=lambda layer: None,
         ),
         token_to_kv_pool=SimpleNamespace(
-            kv_write_target=lambda layer_id, s: HeadKVCache(cache, cache, None, s)
+            kv_write_target=lambda layer_id, s, m: HeadKVCache(cache, cache, None, s)
         ),
     )
     kv = torch.zeros(rows, 2 * 64, dtype=torch.bfloat16)
@@ -135,16 +136,61 @@ def test_write_latent_hands_the_entry_the_padded_span_and_the_rotary(monkeypatch
         attn_backend=SimpleNamespace(
             padded_write_locations=lambda layer, m, rows: torch.tensor([5, 6, 0, 0])[
                 :rows
-            ]
+            ],
+            cache_placement=lambda layer: None,
         ),
         token_to_kv_pool=SimpleNamespace(
-            kv_write_target=lambda layer_id, s: LatentKVCache(cache, False, s)
+            kv_write_target=lambda layer_id, s, m: LatentKVCache(cache, False, s, m)
         ),
     )
     positions = torch.arange(4)
     layer.write_latent(torch.zeros(4, 576, dtype=torch.bfloat16), positions, ctx)
     assert handed["rotary"] == ("rotary", positions)
     assert handed["cache"].slots.tolist() == [5, 6, 0, 0]
+    assert handed["cache"].write_mask is None
+
+
+def test_the_write_lands_on_this_ranks_shard_under_dcp(monkeypatch):
+    """Under decode context parallelism the layer hands the pool this rank's
+    local slots and the ownership mask; rows another rank owns, and padding
+    rows, resolve to slot 0 with a False mask."""
+    from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
+
+    handed = {}
+    monkeypatch.setattr(
+        paged_attention,
+        "write_latent",
+        lambda latent, *, rotary, cache: handed.update(cache=cache),
+    )
+    layer = paged_attention.PagedAttention(
+        4, 576, 1.0, num_kv_heads=1, layer_id=0, rotary_emb=None, qk_norm=None
+    )
+    placement = CachePlacement(
+        block_granularity=4, virtual_block_count=8, group=(0, 1), rank=1
+    )
+    ctx = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        attn_backend=SimpleNamespace(
+            padded_write_locations=lambda layer, m, rows: torch.tensor([4, 9, 8, 0]),
+            cache_placement=lambda layer: placement,
+        ),
+        token_to_kv_pool=SimpleNamespace(
+            kv_write_target=lambda layer_id, s, m: LatentKVCache(None, False, s, m)
+        ),
+    )
+    layer.write_latent(torch.zeros(4, 576, dtype=torch.bfloat16), torch.arange(4), ctx)
+    assert handed["cache"].slots.tolist() == [0, 5, 4, 0]
+    assert handed["cache"].write_mask.tolist() == [False, True, True, False]
+
+
+def test_head_caches_take_no_write_mask():
+    from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
+
+    pool = SimpleNamespace(get_kv_buffer=lambda layer_id: (None, None))
+    with pytest.raises(ValueError, match="never sharded"):
+        MHATokenToKVPool.kv_write_target(
+            pool, 0, torch.arange(2), torch.ones(2, dtype=torch.bool)
+        )
 
 
 @pytest.mark.parametrize("norm_cls", [RMSNorm, GemmaRMSNorm])

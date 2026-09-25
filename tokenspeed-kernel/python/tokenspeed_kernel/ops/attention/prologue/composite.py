@@ -222,7 +222,7 @@ def _write_latent(
         k_rope,
         enable_pdl=enable_pdl,
         sanitize=cache.sanitize,
-        write_mask=None,
+        write_mask=cache.write_mask,
     )
 
 
@@ -260,6 +260,7 @@ def store_latent(
             cache_loc=cache.slots,
             q_nope=None,
             sanitize=cache.sanitize,
+            write_mask=cache.write_mask,
         ),
         q_rope_out=None,
         enable_pdl=enable_pdl,

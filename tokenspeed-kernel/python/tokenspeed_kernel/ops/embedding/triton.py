@@ -175,6 +175,7 @@ def _mla_rope_set_kv_buffer_kernel(
     positions_ptr,
     q_nope_ptr,
     num_tokens,
+    write_mask_ptr,
     loc_stride: tl.constexpr,
     q_rope_stride_t: tl.constexpr,
     q_rope_stride_h: tl.constexpr,
@@ -300,6 +301,12 @@ def _mla_rope_set_kv_buffer_kernel(
             else:
                 loc = tl.load(loc_ptr + token_idx * loc_stride).to(tl.int64)
                 kv_base = kv_buffer_ptr + loc * kv_buffer_stride_t
+                nope_store = nope_mask
+                half_store = half_mask
+                if write_mask_ptr is not None:
+                    owned = tl.load(write_mask_ptr + token_idx)
+                    nope_store = nope_mask & owned
+                    half_store = half_mask & owned
                 k_nope = tl.load(
                     k_nope_ptr + token_idx * k_nope_stride_t + nope_offsets,
                     mask=nope_mask,
@@ -307,7 +314,7 @@ def _mla_rope_set_kv_buffer_kernel(
                 )
                 if SANITIZE:
                     k_nope = _sanitize_for_store(k_nope, MAX_FINITE)
-                tl.store(kv_base + nope_offsets, k_nope, mask=nope_mask)
+                tl.store(kv_base + nope_offsets, k_nope, mask=nope_store)
 
                 k_base = k_rope_ptr + token_idx * k_rope_stride_t
                 k1 = tl.load(k_base + pair_lo, mask=half_mask, other=0.0)
@@ -324,8 +331,8 @@ def _mla_rope_set_kv_buffer_kernel(
                     # After the rotation, which would carry a partner's NaN or inf back in.
                     k1_out = _sanitize_for_store(k1_out, MAX_FINITE)
                     k2_out = _sanitize_for_store(k2_out, MAX_FINITE)
-                tl.store(kv_base + nope_dim + pair_lo, k1_out, mask=half_mask)
-                tl.store(kv_base + nope_dim + pair_hi, k2_out, mask=half_mask)
+                tl.store(kv_base + nope_dim + pair_lo, k1_out, mask=half_store)
+                tl.store(kv_base + nope_dim + pair_hi, k2_out, mask=half_store)
 
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
@@ -360,6 +367,9 @@ def apply_rope_mla_set_kv_buffer_triton(
     needs.
     A ``q_rope`` of ``None`` launches the latent write alone: no query program
     runs, and ``q_rope_out`` and ``q_nope`` must be ``None``.
+    ``fused_mla_set_kv_buffer_arg.write_mask``, when given, holds one bool per
+    token, and a False token's latent row is not stored; its slot is still
+    formed into an address, so it must be in range.
 
     Contract the caller owns, unchecked here because the decode scheduler
     already guarantees it: ``fused_mla_set_kv_buffer_arg.cache_loc`` holds one
@@ -375,6 +385,7 @@ def apply_rope_mla_set_kv_buffer_triton(
     kv_buffer = fused_mla_set_kv_buffer_arg.kv_buffer
     loc = fused_mla_set_kv_buffer_arg.cache_loc
     q_nope = fused_mla_set_kv_buffer_arg.q_nope
+    write_mask = fused_mla_set_kv_buffer_arg.write_mask
     write_only = q_rope is None
     if write_only:
         assert q_rope_out is None and q_nope is None
@@ -409,6 +420,9 @@ def apply_rope_mla_set_kv_buffer_triton(
     assert rope_dim % 2 == 0
     assert loc.dtype in (torch.int32, torch.int64)
     assert loc.ndim == 1
+    if write_mask is not None:
+        assert write_mask.shape == (num_tokens,) and write_mask.dtype == torch.bool
+        assert write_mask.stride(0) == 1
     apply_rope = cos_sin_cache is not None
     if apply_rope:
         assert cos_sin_cache.shape[-1] == rope_dim
@@ -451,6 +465,7 @@ def apply_rope_mla_set_kv_buffer_triton(
         positions,
         q_nope,
         num_tokens,
+        write_mask,
         loc.stride(0),
         q_rope.stride(0),
         q_rope.stride(1),

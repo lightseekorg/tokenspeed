@@ -131,7 +131,9 @@ class MLATokenToKVPool(CachePool):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
-    def kv_write_target(self, layer_id: int, slots: torch.Tensor) -> LatentKVCache:
+    def kv_write_target(
+        self, layer_id: int, slots: torch.Tensor, write_mask: torch.Tensor | None
+    ) -> LatentKVCache:
         """Where the attention prologue writes this layer's latent rows."""
         buffer = self.get_key_buffer(layer_id)
         if self.quant_method == "per_token_head":
@@ -140,6 +142,7 @@ class MLATokenToKVPool(CachePool):
             kv_cache=buffer,
             sanitize=self.latent_write_sanitizes,
             slots=slots,
+            write_mask=write_mask,
         )
 
     def set_kv_buffer(

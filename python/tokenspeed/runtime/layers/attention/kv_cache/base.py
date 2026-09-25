@@ -396,9 +396,10 @@ class CachePool(ABC):
         """Scatter one forward pass's K/V into this layer's planes."""
 
     def kv_write_target(
-        self, layer_id: int, slots: torch.Tensor
+        self, layer_id: int, slots: torch.Tensor, write_mask: torch.Tensor | None
     ) -> HeadKVCache | LatentKVCache:
-        """Where the attention prologue writes this layer's rows at ``slots``."""
+        """Where the attention prologue writes this layer's rows at ``slots``;
+        ``write_mask`` skips the rows another DCP rank owns."""
         raise NotImplementedError(
             f"{type(self).__name__} serves no attention prologue writes"
         )

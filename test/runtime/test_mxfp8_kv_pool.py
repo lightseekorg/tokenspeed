@@ -384,7 +384,7 @@ def test_the_prologue_writes_through_the_pool_write_target(layer_id: int):
         v,
         norm=None,
         rotary=None,
-        cache=prologue_pool.kv_write_target(layer_id, loc),
+        cache=prologue_pool.kv_write_target(layer_id, loc, None),
         return_kv=False,
         solution=None,
         override=None,

@@ -68,7 +68,8 @@ The entries validate each request once, from metadata only, and raise
   their rows and heads on 16-byte boundaries, which the CUDA kernels read in
   vectors;
 * write slots are a dense 1-D int32 or int64 vector with at most one slot per
-  token;
+  token, and an MLA write mask, when given, is a dense bool vector over those
+  slots (per-token-head planes take none);
 * positions are `num_tokens` dense int32 or int64 entries, or, for GQA, T/H/W
   rows whose M-RoPE sections are non-negative and split the rotary pairs; MLA
   takes no M-RoPE sections;
@@ -150,9 +151,17 @@ the round's extend span, then the decode window.
 Per-mode callers, such as MLA models that split a MIXED round, keep using
 `write_locations`.
 
-A pool describes its destination with `kv_write_target(layer_id, slots)`:
-buffers, scale planes and whether the write sanitizes. Pools do not
-override the prologue's write.
+A pool describes its destination with `kv_write_target(layer_id, slots,
+write_mask)`: buffers, scale planes and whether the write sanitizes. Pools do
+not override the prologue's write.
+
+Under decode context parallelism the slots a backend publishes are virtual.
+Before asking the pool, `PagedAttention` resolves them through the backend's
+`cache_placement` (`resolve_cache_slots`), which yields this rank's local
+slots and an ownership mask; rows another rank owns, and padding rows, resolve
+to slot 0 with a False mask, and every latent store skips them. Head caches
+are never sharded, so their pools take no mask. Without a placement the slots
+pass through and the mask is None.
 
 ## Graphs and the KV write
 

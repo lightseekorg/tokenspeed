@@ -422,6 +422,7 @@ def test_mla_rope_set_kv_buffer_matches_reference(is_neox, loc_dtype):
             cache_loc=loc,
             q_nope=None,
             sanitize=False,
+            write_mask=None,
         ),
         q_rope_out=q_out_rope,
     )
@@ -471,6 +472,7 @@ def test_mla_rope_set_kv_buffer_fp8_matches_fp32_reference() -> None:
             cache_loc=loc,
             q_nope=q_nope,
             sanitize=False,
+            write_mask=None,
         ),
         q_rope_out=query,
     )
@@ -532,6 +534,7 @@ def test_mla_set_kv_nope_matches_two_kernel_path(n_loc: int) -> None:
             cache_loc=loc,
             q_nope=q_nope,
             sanitize=False,
+            write_mask=None,
         ),
         q_rope_out=query,
     )
@@ -613,6 +616,7 @@ def test_fused_sanitize_matches_the_composite(n_loc: int, has_rope: bool) -> Non
             cache_loc=loc,
             q_nope=q_nope,
             sanitize=True,
+            write_mask=None,
         ),
         q_rope_out=query,
     )
@@ -710,8 +714,8 @@ def test_latent_write_target_carries_the_pool_sanitize():
     slots = torch.arange(4, device="cuda")
     pool = _fake_mla_pool()
     pool.__class__ = HybridKDATokenToKVPool
-    assert pool.kv_write_target(0, slots).sanitize is True
-    assert _fake_mla_pool().kv_write_target(0, slots).sanitize is False
+    assert pool.kv_write_target(0, slots, None).sanitize is True
+    assert _fake_mla_pool().kv_write_target(0, slots, None).sanitize is False
 
 
 @pytest.mark.parametrize("hybrid", [False, True])
@@ -744,7 +748,10 @@ def test_latent_prologue_hands_attention_the_cache_dtype(hybrid, dtype):
         query[..., NOPE_DIM:],
         torch.randn(3, TOTAL_DIM, device="cuda", dtype=torch.bfloat16),
         torch.arange(3, device="cuda"),
-        SimpleNamespace(token_to_kv_pool=pool),
+        SimpleNamespace(
+            token_to_kv_pool=pool,
+            attn_backend=SimpleNamespace(cache_placement=lambda layer: None),
+        ),
         slots=torch.arange(3, device="cuda"),
         expanded=None,
     )
@@ -795,6 +802,7 @@ def test_fused_write_follows_a_strided_cache_loc(n_loc: int) -> None:
                 cache_loc=loc,
                 q_nope=q_nope,
                 sanitize=False,
+                write_mask=None,
             ),
             q_rope_out=query,
         )

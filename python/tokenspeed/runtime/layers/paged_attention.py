@@ -37,6 +37,7 @@ from tokenspeed_kernel.ops.attention.prologue import (
     GQAPrologueOutput,
     HeadKVCache,
     HeadNorm,
+    LatentKVCache,
     MLAExpandedKV,
     MLAPrologueOutput,
     Rotary,
@@ -49,6 +50,7 @@ from torch import nn
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 
 
 def hf_sliding_window_to_window_left(sliding_window: int) -> int:
@@ -241,11 +243,22 @@ class PagedAttention(nn.Module):
             None if self.rotary_emb is None else self.rotary_emb.as_rotary(positions),
         )
 
-    def _write_target(self, q: torch.Tensor, ctx: ForwardContext) -> HeadKVCache:
+    def _write_target(
+        self, q: torch.Tensor, ctx: ForwardContext
+    ) -> HeadKVCache | LatentKVCache:
         slots = ctx.attn_backend.padded_write_locations(
             self, ctx.forward_mode, q.shape[0]
         )
-        return ctx.token_to_kv_pool.kv_write_target(self.layer_id, slots)
+        return self._local_target(slots, ctx)
+
+    def _local_target(
+        self, slots: torch.Tensor, ctx: ForwardContext
+    ) -> HeadKVCache | LatentKVCache:
+        """The pool's target for ``slots``, local to this rank's shard under DCP."""
+        slots, owned = resolve_cache_slots(
+            slots, ctx.attn_backend.cache_placement(self)
+        )
+        return ctx.token_to_kv_pool.kv_write_target(self.layer_id, slots, owned)
 
     def attend_live_rows(
         self,
@@ -323,7 +336,7 @@ class PagedAttention(nn.Module):
                 if self.rotary_emb is None
                 else self.rotary_emb.as_rotary(positions)
             ),
-            cache=ctx.token_to_kv_pool.kv_write_target(self.layer_id, slots),
+            cache=self._local_target(slots, ctx),
             solution=None,
             override=None,
         )

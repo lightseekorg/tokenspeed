@@ -43,6 +43,8 @@ class FusedMLASetKVBufferArg:
     q_nope: torch.Tensor | None
     # Clamp NaN/inf on the latent store only, as set_mla_kv_buffer_triton does.
     sanitize: bool
+    # True per token to store its latent row; None stores every row.
+    write_mask: torch.Tensor | None
 
 
 def apply_rope(

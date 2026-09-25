@@ -47,6 +47,11 @@ logger = get_colorful_logger(__name__)
 GB = 1024 * 1024 * 1024
 
 
+def _head_rows_are_never_masked(write_mask: torch.Tensor | None) -> None:
+    if write_mask is not None:
+        raise ValueError("head caches are never sharded; the prologue writes every row")
+
+
 class MHATokenToKVPool(CachePool):
     def __init__(
         self,
@@ -173,8 +178,11 @@ class MHATokenToKVPool(CachePool):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
-    def kv_write_target(self, layer_id: int, slots: torch.Tensor) -> HeadKVCache:
+    def kv_write_target(
+        self, layer_id: int, slots: torch.Tensor, write_mask: torch.Tensor | None
+    ) -> HeadKVCache:
         """Where the attention prologue writes this layer's K/V rows."""
+        _head_rows_are_never_masked(write_mask)
         k_cache, v_cache = self.get_kv_buffer(layer_id)
         return HeadKVCache(
             k_cache=k_cache,
@@ -289,8 +297,11 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             self._layer_scale_view(v_sf, layer_id),
         )
 
-    def kv_write_target(self, layer_id: int, slots: torch.Tensor) -> HeadKVCache:
+    def kv_write_target(
+        self, layer_id: int, slots: torch.Tensor, write_mask: torch.Tensor | None
+    ) -> HeadKVCache:
         """Where the attention prologue writes this layer's K/V rows and scales."""
+        _head_rows_are_never_masked(write_mask)
         k_cache, v_cache = self.get_kv_buffer(layer_id)
         return HeadKVCache(
             k_cache=k_cache,

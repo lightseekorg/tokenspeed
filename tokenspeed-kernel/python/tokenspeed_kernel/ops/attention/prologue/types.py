@@ -171,11 +171,14 @@ class LatentKVCache:
             rows, or the planes of an FP8_PER_TOKEN_HEAD cache.
         sanitize: Replace NaN/Inf with finite values before storing.
         slots: Dense 1-D destination slot of each written row.
+        write_mask: True for each row to store, or None to store every row;
+            a skipped row's slot is still a valid address.
     """
 
     kv_cache: torch.Tensor | PerTokenHeadPlanes
     sanitize: bool
     slots: torch.Tensor
+    write_mask: torch.Tensor | None
 
     @property
     def format(self) -> KVCacheFormat:

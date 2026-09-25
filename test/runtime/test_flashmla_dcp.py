@@ -320,6 +320,7 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
         HybridKDATokenToKVPool,
     )
+    from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
     plan = make_mla_memory_plan(
         size=8,
@@ -356,7 +357,16 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
         "full_attention"
     ]
     backend.kv_lora_rank = 512
-    layer = SimpleNamespace(layer_id=0)
+    layer = PagedAttention(
+        1,
+        192,
+        1.0,
+        num_kv_heads=1,
+        layer_id=0,
+        v_head_dim=128,
+        rotary_emb=None,
+        qk_norm=None,
+    )
     loc = torch.tensor([4, 8, 12], device="cuda")
     values = torch.arange(3 * 576, device="cuda", dtype=torch.bfloat16).reshape(
         3, 1, 576
@@ -376,7 +386,6 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
             kv_b_proj=lambda latent: (latent.new_zeros((latent.shape[0], 256)),),
             attn_mha=layer,
             rotary_emb=None,
-            _mla_kv_is_fp8=lambda ctx, scale: False,
         )
         DeepseekV3AttentionMLA.forward_normal_chunked_kv_prepare(
             model,

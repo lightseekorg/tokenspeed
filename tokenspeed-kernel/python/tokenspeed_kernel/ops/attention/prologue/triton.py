@@ -488,6 +488,7 @@ def triton_mla_prologue(
             cache_loc=cache.slots,
             q_nope=query[..., :rank] if fp8 else None,
             sanitize=cache.sanitize,
+            write_mask=cache.write_mask,
         ),
         q_rope_out=out if fp8 else query[..., rank:],
         enable_pdl=enable_pdl,
