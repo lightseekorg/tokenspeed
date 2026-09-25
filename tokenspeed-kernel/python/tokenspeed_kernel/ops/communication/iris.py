@@ -1006,11 +1006,6 @@ class IrisAllReduce(object):
             if self._producer_direct_scratch_numel
             else None
         )
-        self._reduced_output_buf = (
-            torch.empty(producer_direct_max_numel, dtype=dtype, device=self.device)
-            if producer_direct_max_numel
-            else None
-        )
         self._ready_flags = (
             self._ctx.zeros(
                 (self._staged_max_programs, self.world_size), dtype=torch.int32
@@ -1335,7 +1330,7 @@ class IrisAllReduce(object):
     def all_reduce_symmetric(
         self, tensors: tuple[torch.Tensor, ...]
     ) -> tuple[torch.Tensor, ...]:
-        """Reduce consecutive producer outputs from symmetric memory."""
+        """Reduce consecutive symmetric inputs into caller-owned local storage."""
         assert self.owns_outputs(tensors)
         if not _platform.is_cdna4:
             raise RuntimeError("producer-direct Iris all-reduce requires CDNA4")
@@ -1352,11 +1347,7 @@ class IrisAllReduce(object):
 
         shapes = tuple(tuple(tensor.shape) for tensor in tensors)
         total_numel = sum(tensor.numel() for tensor in tensors)
-        assert self._reduced_output_buf is not None
-        outputs = self._views(
-            self._reduced_output_buf,
-            shapes,
-        )
+        output = torch.empty(total_numel, dtype=self.dtype, device=self.device)
         if (
             self.enable_lamport
             and _kimi_k3_moe_producer_direct_protocol(
@@ -1364,12 +1355,13 @@ class IrisAllReduce(object):
             )
             == "lamport"
         ):
-            self._all_reduce_symmetric_lamport(total_numel)
+            self._all_reduce_symmetric_lamport(output)
         else:
-            self._all_reduce_symmetric_pull(total_numel)
-        return outputs
+            self._all_reduce_symmetric_pull(output)
+        return self._views(output, shapes)
 
-    def _all_reduce_symmetric_lamport(self, total_numel: int) -> None:
+    def _all_reduce_symmetric_lamport(self, output: torch.Tensor) -> None:
+        total_numel = output.numel()
         config = self._kernel_config.kimi_k3_moe
         assert total_numel <= self._kimi_k3_moe_lamport_max_numel
         assert self._kimi_k3_moe_lamport_region is not None
@@ -1379,7 +1371,7 @@ class IrisAllReduce(object):
         lamport_all_reduce_bf16[(num_programs,)](
             self._input_buf,
             self._kimi_k3_moe_lamport_region,
-            self._reduced_output_buf,
+            output,
             self._kimi_k3_moe_lamport_epochs,
             *self._kimi_k3_moe_lamport_peer_addresses,
             RANK=self._iris_rank,
@@ -1390,7 +1382,8 @@ class IrisAllReduce(object):
             num_warps=config.lamport_num_subgroups,
         )
 
-    def _all_reduce_symmetric_pull(self, total_numel: int) -> None:
+    def _all_reduce_symmetric_pull(self, output: torch.Tensor) -> None:
+        total_numel = output.numel()
         kernel_config = self._kernel_config.producer_direct
         use_two_stage = _use_two_stage_producer_direct(
             world_size=self.world_size,
@@ -1411,7 +1404,7 @@ class IrisAllReduce(object):
             iris_reduce_symmetric_two_stage_gluon_kernel[(num_programs,)](
                 self._input_buf,
                 self._producer_direct_scratch_buf,
-                self._reduced_output_buf,
+                output,
                 self._producer_direct_ready_flags,
                 *self._heap_base_addresses,
                 RANK=self._iris_rank,
@@ -1434,7 +1427,7 @@ class IrisAllReduce(object):
             num_programs = min(num_tiles, kernel_config.one_stage_max_programs)
             iris_reduce_symmetric_gluon_kernel[(num_programs,)](
                 self._input_buf,
-                self._reduced_output_buf,
+                output,
                 self._producer_direct_ready_flags,
                 *self._heap_base_addresses,
                 RANK=self._iris_rank,
@@ -3091,7 +3084,7 @@ def iris_all_reduce_symmetric(
     state: "IrisAllReduce",
     tensors: tuple[torch.Tensor, ...],
 ) -> tuple[torch.Tensor, ...]:
-    """Reduce consecutive symmetric producer outputs in one launch."""
+    """Return caller-owned reductions of consecutive symmetric producer outputs."""
     return state.all_reduce_symmetric(tensors)
 
 

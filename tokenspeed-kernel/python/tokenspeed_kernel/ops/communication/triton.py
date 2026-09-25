@@ -2173,7 +2173,7 @@ def all_reduce_symmetric(
     state: TritonCommState,
     tensors: tuple[torch.Tensor, ...],
 ) -> tuple[torch.Tensor, ...]:
-    """Reduce consecutive Iris producer outputs in one launch."""
+    """Return caller-owned reductions of consecutive Iris producer outputs."""
     import tokenspeed_kernel.ops.communication.iris as _iris_mod
 
     key = _iris_state_key(state, tensors[0].dtype)

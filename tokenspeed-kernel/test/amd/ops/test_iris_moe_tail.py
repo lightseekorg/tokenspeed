@@ -89,7 +89,6 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
         state._input_buf,
         state._producer_direct_scratch_buf,
         state._producer_direct_ready_flags,
-        state._reduced_output_buf,
         state._moe_tail_output_buf,
         state._moe_tail_ready_flags,
     )
@@ -280,9 +279,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
         other = acquire((1, 48, 520)[iteration % 3])
         for tensor in other:
             tensor.fill_(rank + 1)
-        ordinary_snapshots.extend(
-            tensor.clone() for tensor in comm.all_reduce_symmetric(backing, other)
-        )
+        ordinary_snapshots.extend(comm.all_reduce_symmetric(backing, other))
     torch.cuda.synchronize()
     for scale, output in snapshots:
         torch.testing.assert_close(
