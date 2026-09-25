@@ -63,6 +63,19 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        if global_server_args_dict["numerics"] == "rl-bitwise":
+            # Bitwise envelope: one batch-invariant GEMM for every shape. The
+            # GEMV and large-M fast paths below switch kernels by shape, which
+            # is exactly the row-result drift the envelope forbids. A missing
+            # "aok" leaf fails selection loudly rather than falling back.
+            return tokenspeed_kernel.mm(
+                x,
+                layer.weight,
+                bias=bias,
+                override="aok",
+            )
 
         if bias is None and decode_gemv_routed(x, layer.weight):
             return decode_gemv(x, layer.weight)
