@@ -815,6 +815,11 @@ class ServerArgs:
         self.disable_autotune = True
         self.disable_tf32 = True
         self.disable_pdl = True
+        # MoE: the batch-invariant grouped leaves. Only the auto default is
+        # folded; an explicitly chosen backend stands (and must then honour
+        # the contract itself).
+        if self.moe_backend == "auto":
+            self.moe_backend = "aok"
 
     def resolve_disaggregation(self):
         # Pipeline parallelism is a prefill-node-only capability: the chunk
@@ -1544,7 +1549,9 @@ class ServerArgs:
             type=str,
             default=ServerArgs.moe_backend,
             help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm, "
-            "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe",
+            "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe, aok "
+            "(the batch-invariant leaves; --numerics rl-bitwise folds auto to "
+            "it)",
         )
         parser.add_argument(
             "--moe-mxfp4-fp8-activation",

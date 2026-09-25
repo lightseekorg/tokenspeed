@@ -86,6 +86,13 @@ native forced initial/local windows, no-split sparse MLA attention) at plugin
 priority, alongside the performance leaves they mirror. `--numerics auto`
 never selects them; `rl-bitwise` requires them.
 
+Selection points a caller reaches through an existing solution switch reuse
+it: rl-bitwise folds `--moe-backend auto` to `"aok"`, so the routed-expert
+apply plans onto the batch-invariant grouped leaf through the ordinary
+`moe_plan(solution=...)` path — and fails at startup when no such leaf is
+registered. An explicitly chosen backend stands, like every other switch
+under the envelope.
+
 ## Where FluentLLM's rl_* switches land
 
 FluentLLM grew ~20 flat booleans for the same contract. The mapping into this

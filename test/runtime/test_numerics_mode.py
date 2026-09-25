@@ -41,6 +41,15 @@ class TestNumericsMode(unittest.TestCase):
         self.assertTrue(args.disable_pdl)
         self.assertFalse(args.enable_allreduce_fusion)
         self.assertEqual(args.comm_fusion_max_num_tokens, -1)
+        self.assertEqual(args.moe_backend, "aok")
+
+    def test_rl_bitwise_keeps_an_explicit_moe_backend(self):
+        args = ServerArgs(model="x", numerics="rl-bitwise", moe_backend="triton")
+        self.assertEqual(args.moe_backend, "triton")
+
+    def test_auto_keeps_the_moe_backend_auto(self):
+        args = ServerArgs(model="x")
+        self.assertEqual(args.moe_backend, "auto")
 
     def test_rl_bitwise_overrides_the_fusion_auto_enable(self):
         # resolve_communication auto-enables allreduce fusion on capable
