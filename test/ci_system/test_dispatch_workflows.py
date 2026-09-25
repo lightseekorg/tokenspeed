@@ -1128,8 +1128,18 @@ def test_mi450_sim_runs_on_the_cpu_only_pool():
 
 def test_mi450_sim_uses_bounded_smoke_suite():
     task = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml")
+    setup_script = (REPO_ROOT / "test/ci_system/setup_mi450_sim.sh").read_text()
+    parallel_script = (
+        REPO_ROOT / "test/ci_system/run_mi450_rocjitsu_parallel.sh"
+    ).read_text()
 
     assert task["env"]["MI450_SIM_RUN_TIMEOUT"] == "600"
+    assert task["env"]["MI450_SIM_THREADS_PER_WORKER"] == "2"
+    assert 'config["cpu_thread_budget"] = thread_budget' in setup_script
+    assert 'threads_per_emulator="${MI450_SIM_THREADS_PER_WORKER:-2}"' in (
+        parallel_script
+    )
+    assert "/sys/fs/cgroup/cpu.max" in parallel_script
     assert task["env"]["MI450_SIM_TEST_ROOT"] != "tokenspeed-kernel/test"
     assert "tokenspeed-kernel/test/amd/ops/attention" in task["env"]["MI450_SIM_TESTS"]
 

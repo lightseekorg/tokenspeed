@@ -110,6 +110,7 @@ jobs:
           set -euo pipefail
           matrix=$(python3 test/ci_system/pipeline.py scan \
             --root test/ci \
+            --changed-files "$RUNNER_TEMP/tokenspeed-changed-files.txt" \
             --trigger "$TRIGGER" \
             --runner-group nvidia-arm \
             --multi-node exclude)

@@ -107,6 +107,7 @@ jobs:
         run: |
           matrix=$(python3 test/ci_system/pipeline.py scan \
             --root test/ci \
+            --changed-files "$RUNNER_TEMP/tokenspeed-changed-files.txt" \
             --trigger per-commit \
             --runner-group nvidia-arm \
             --workflow-stage model-test \

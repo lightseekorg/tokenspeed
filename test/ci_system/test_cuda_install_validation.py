@@ -34,11 +34,11 @@ def installed_stack(monkeypatch, tmp_path):
     )
     thirdparty = tmp_path / "cuda-thirdparty.txt"
     thirdparty.write_text(
-        "tokenspeed-trtllm-kernel==1.3.0.post20260919\n"
+        "tokenspeed-trtllm-kernel==1.3.0.post20260924\n"
         "tokenspeed-cutedsl-kda==0.1.0.post20260919\n"
     )
     versions = {
-        "tokenspeed-trtllm-kernel": "1.3.0.post20260919",
+        "tokenspeed-trtllm-kernel": "1.3.0.post20260924",
         "tokenspeed-cutedsl-kda": "0.1.0.post20260919",
         "flashinfer-python": "0.7.0",
         "flashinfer-cubin": "0.7.0",
@@ -79,7 +79,7 @@ def test_cuda_install_logs_and_accepts_matching_versions(installed_stack, capsys
     exec(script, {})
     output = capsys.readouterr().out
     assert "Installed torch==2.14.0+cu130" in output
-    assert "Installed tokenspeed-trtllm-kernel==1.3.0.post20260919" in output
+    assert "Installed tokenspeed-trtllm-kernel==1.3.0.post20260924" in output
     assert "Installed tokenspeed-cutedsl-kda==0.1.0.post20260919" in output
     assert "Torch CUDA runtime: 13.0" in output
     assert "Installed flashinfer-python==0.7.0" in output
