@@ -75,6 +75,9 @@ def test_dispatch_picks_the_measured_backend(shape, backend):
     m, n, k = shape
     _select.cache_clear()
     impl = _select(m, n, k, True)
+    if backend == "tgv" and torch.cuda.get_device_capability() == (10, 7):
+        assert "flashinfer_cutlass_gemv" in impl.__name__
+        return
     assert backend in getattr(
         impl, "__name__", ""
     ), f"M={m} N={n} K={k} resolved {impl} instead of the measured {backend}"
@@ -433,6 +436,14 @@ _BF16_BACKEND_SUPPORT = {
     "cublaslt": {True: "does not support PDL", False: None},
     "cutile": {True: "ignores `pdl`", False: "No valid config found"},
 }
+_BF16_BACKEND_SUPPORT_107 = {
+    backend: {
+        pdl: f"does not support backend '{backend}' with capability 107"
+        for pdl in (True, False)
+    }
+    for backend in _BF16_BACKEND_SUPPORT
+}
+_BF16_BACKEND_SUPPORT_107["cutlass"] = _BF16_BACKEND_SUPPORT["cutlass"]
 
 
 @pytest.mark.skipif(
@@ -454,7 +465,12 @@ def test_bf16_backend_support_is_what_the_route_was_tuned_against(backend):
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
     ref = x.float() @ w.float().t()
-    for pdl, refusal in _BF16_BACKEND_SUPPORT[backend].items():
+    support = (
+        _BF16_BACKEND_SUPPORT_107
+        if torch.cuda.get_device_capability() == (10, 7)
+        else _BF16_BACKEND_SUPPORT
+    )
+    for pdl, refusal in support[backend].items():
         try:
             got = mm_bf16(x, w.t(), pdl=pdl, backend=backend)
         except Exception as exc:  # noqa: BLE001  (any refusal is the signal)

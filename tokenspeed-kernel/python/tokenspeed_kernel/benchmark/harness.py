@@ -188,6 +188,12 @@ def _load_builtin_generators() -> None:
         prepare_kda_paged_decode,
         prepare_kda_paged_prefill,
     )
+    from tokenspeed_kernel.benchmark.generators.moe import (
+        prepare_latent_expert_shared,
+        prepare_latent_input,
+        prepare_moe_apply,
+        prepare_sigmoid_bias_topk,
+    )
 
     _BENCHMARK_GENERATORS.setdefault(
         ("attention", "kda_paged_decode"), prepare_kda_paged_decode
@@ -211,6 +217,14 @@ def _load_builtin_generators() -> None:
     _BENCHMARK_GENERATORS.setdefault(("attention", "dsa_decode"), prepare_dsa_decode)
     _BENCHMARK_GENERATORS.setdefault(("gemm", "bmm"), prepare_dense_bmm)
     _BENCHMARK_GENERATORS.setdefault(("gemm", "mm"), prepare_mxfp8_mm)
+    _BENCHMARK_GENERATORS.setdefault(
+        ("moe", "sigmoid_bias_topk"), prepare_sigmoid_bias_topk
+    )
+    _BENCHMARK_GENERATORS.setdefault(("moe", "apply"), prepare_moe_apply)
+    _BENCHMARK_GENERATORS.setdefault(("moe", "latent_input"), prepare_latent_input)
+    _BENCHMARK_GENERATORS.setdefault(
+        ("moe", "latent_expert_shared"), prepare_latent_expert_shared
+    )
 
 
 @dataclass(frozen=True)
@@ -581,7 +595,7 @@ class KernelBenchmarkHarness:
             registration_name=(
                 prepared.registration.name if prepared is not None else None
             ),
-            solution=prepared.registration.solution if prepared is not None else None,
+            solution=(prepared.registration.solution if prepared is not None else None),
             setup_time_ms=setup_time_ms,
             correctness=correctness,
             correctness_time_ms=correctness_time_ms,

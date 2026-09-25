@@ -1093,6 +1093,22 @@ def create_attn_components(
     target_full_attn_backend_name = _resolve_full_attn_backend_name(
         target, softmax_attn, hybrid_request=target.requested_backend
     )
+    if config.dcp_size > 1 and target.is_hybrid_linear:
+        if cache_family != "kimi_k3" or target_full_attn_backend_name != "flashmla":
+            raise ValueError(
+                "Hybrid MLA DCP requires the MLA/KDA cache and FlashMLA backend"
+            )
+        resolved_softmax = dataclasses.replace(
+            softmax_attn, backend_name=target_full_attn_backend_name
+        )
+        config = dataclasses.replace(
+            config,
+            components=tuple(
+                resolved_softmax if component is softmax_attn else component
+                for component in config.components
+            ),
+        )
+        softmax_attn = resolved_softmax
     draft_attn_config = (
         _create_attn_config(server_args, draft_model_config, is_draft=True)
         if draft is not None and not draft.is_dspark

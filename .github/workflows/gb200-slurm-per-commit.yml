@@ -1,4 +1,4 @@
-name: GB200 Slurm Per Commit
+name: GB200
 
 on:
   push:
@@ -58,6 +58,16 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install scan dependency
+        if: steps.gate.outputs.allowed == 'true'
+        run: |
+          for i in 1 2 3 4 5; do
+            python3 -m pip install pyyaml && exit 0
+            echo "pyyaml install attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          exit 1
+
       - name: Classify changed paths
         if: steps.gate.outputs.allowed == 'true'
         id: changes
@@ -87,17 +97,8 @@ jobs:
           python3 test/ci_system/ci_path_filter.py \
             --runner-group nvidia-gb200-slurm \
             --event-name "${{ github.event_name }}" \
+            --repo-root "$GITHUB_WORKSPACE" \
             "$changed_files" >> "$GITHUB_OUTPUT"
-
-      - name: Install scan dependency
-        if: steps.changes.outputs.should_run == 'true'
-        run: |
-          for i in 1 2 3 4 5; do
-            python3 -m pip install pyyaml && exit 0
-            echo "pyyaml install attempt $i failed, retrying in 10s..."
-            sleep 10
-          done
-          exit 1
 
       - name: Build GB200 Slurm task matrix
         if: steps.changes.outputs.should_run == 'true'
@@ -109,6 +110,7 @@ jobs:
           set -euo pipefail
           matrix=$(python3 test/ci_system/pipeline.py scan \
             --root test/ci \
+            --changed-files "$RUNNER_TEMP/tokenspeed-changed-files.txt" \
             --trigger "$TRIGGER" \
             --runner-group nvidia-arm \
             --multi-node exclude)

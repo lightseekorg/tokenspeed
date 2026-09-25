@@ -152,9 +152,9 @@ pointer-stable: a captured graph holds their addresses forever.
 Helpers that memoize tensors created inside capture must not return those
 tensors to eager callers. Keeping a Python reference preserves the allocation,
 but an earlier graph sharing the same private pool can overwrite its contents
-on replay. PLE's uniform index bundles are reused during capture only; eager
-prefill and decode construct their indices through the same builder outside
-the capture pool.
+on replay. PLE's uniform index bundles are reused during capture only; the
+eager n-gram kernel writes uniform request indices alongside hash IDs, while
+ragged batches construct their indices outside the capture pool.
 
 GDN verify shares memoized scratch seed indices (`i * (T + 1)`) between conv
 and recurrent reads in eager and captured forwards. FlashInfer FP32 MTP may
@@ -182,6 +182,17 @@ producer-owned reads and outgoing triggers. A trigger permits successor
 setup, never publishes results; each kernel may delay it for performance.
 Streaming top-k, for example, avoids delaying scoring waves with waiting
 merge CTAs. Graphs retain their captured PDL setting; recapture to change it.
+
+`fused_gate_sigmoid_mul_add`, `sigmoid_mul`, `silu_and_mul`, `swiglu_oai`,
+`situ_and_mul`, `add3`, and split AttnRes launchers read `pdl_enabled()`
+themselves. They use that same value for `ENABLE_PDL` and `launch_pdl`; model
+layers do not pass the platform PDL setting through their calls.
+
+AttnRes partial kernels may trigger their successors before writing partial
+scratch. `attnres_combine` may preload only weights known to be independent of
+its predecessor; it waits before loading the prefix and the partial scratch
+(`m`, `s`, `acc`). A PDL trigger permits early launch but does not publish
+stores, and a later wait cannot repair values already loaded into registers.
 
 Gated RMSNorm preloads weights only with `weights_independent`; a contiguous
 copy disables this preload. At RSAG-to-AR boundaries the next combine-norm

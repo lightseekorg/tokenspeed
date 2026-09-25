@@ -16,6 +16,13 @@ the cross-rank collectives that keep the redundant schedulers aligned always
 find every rank promptly, however deep the GPUs are in queued work — a stage's
 launch-queue backpressure stalls only its own forward thread, never the round.
 
+FIFO describes submission ownership, not a promise that every model kernel
+uses one CUDA stream. Main-stream scratch and persistent kernel protocol state
+may be shared across calls only while those calls are ordered on that stream.
+Work deliberately forked to a side stream must use private storage or establish
+an ordering edge before touching a shared layout; joining the side stream later
+does not make concurrent reuse safe.
+
 This is enforced by **visibility**, not by discipline. `build_device_side`
 (`execution/device.py`) constructs the model runners, attention backends, KV
 pools and executor as its own locals, and returns one `DeviceBuild`, split by

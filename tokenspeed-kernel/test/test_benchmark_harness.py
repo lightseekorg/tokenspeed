@@ -222,6 +222,16 @@ def test_harness_returns_measurement_and_actual_registration():
     assert timer.measurement_blocks == [3]
 
 
+def test_harness_requires_explicit_measurement_blocks() -> None:
+    harness = KernelBenchmarkHarness(
+        _FakeTimer(),
+        platform_provider=_platform,
+    )
+
+    with pytest.raises(TypeError):
+        harness.run(_request("unit_success"))
+
+
 def test_harness_routes_fresh_runs_to_each_output_validator() -> None:
     received: dict[str, tuple[object, ...]] = {}
     prepared_runs: list[int] = []

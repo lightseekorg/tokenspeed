@@ -19,7 +19,8 @@
 # SOFTWARE.
 
 """Off-device contracts for the gfx1250 Gluon MXFP4 MoE kernels: index
-ownership, index width and narrowing, and partial-TDM warp distribution."""
+ownership, index width and narrowing, partial-TDM warp distribution, and WMMA
+output ownership."""
 
 from __future__ import annotations
 
@@ -264,3 +265,53 @@ def test_partial_tdm_hints_exactly_the_operands_it_fuses(
     assert cfg.NUM_LOADS_IN_BATCH.value == whole_warp.NUM_LOADS_IN_BATCH.value - bool(
         fused_pair
     )
+
+
+# ---------------------------------------------------------------------------
+# WMMA output ownership: where each warp's output tiles start
+# ---------------------------------------------------------------------------
+
+# Every row tile the launcher can pick: prefill is fixed, decode narrows with
+# expert occupancy.
+BLOCK_M_VALUES = sorted(
+    {fused._resolve_block_m(False, m, 16) for m in (1, 64, 4096)}
+    | {fused._resolve_block_m(True, m, 16) for m in (1, 16, 256, 512, 2048, 65536)}
+)
+# The direct matmul entry point defaults to 128 columns, while the public MoE
+# wrappers use 256.
+BLOCK_N_VALUES = (128, 256)
+
+
+def tiles_reachable(bases) -> set[tuple[int, int]]:
+    """Tile coordinates reached by flipping any subset of ``bases``."""
+    reached = {(0, 0)}
+    for base in bases:
+        reached |= {(m + base[0], n + base[1]) for m, n in reached}
+    return reached
+
+
+@pytest.mark.parametrize("num_warps", [4, 8])
+@pytest.mark.parametrize("block_m", BLOCK_M_VALUES)
+@pytest.mark.parametrize("block_n", BLOCK_N_VALUES)
+def test_no_wmma_tile_starts_past_the_block(
+    block_m: int, block_n: int, num_warps: int
+) -> None:
+    for packed in (False, True):
+        for scale_preshuffle in (False, True):
+            layout = _common.get_wmma_layout(
+                num_warps,
+                block_m,
+                block_n,
+                packed,
+                True,
+                scale_preshuffle,
+            )
+            origins = tiles_reachable([*layout.warp_bases, *layout.reg_bases])
+
+            # Every explicitly assigned WMMA tile must begin inside the output
+            # block. The layout can add later register repetitions to cover the
+            # rest of a larger block.
+            last_m = max(m for m, _ in origins) * layout.instr_shape[0]
+            last_n = max(n for _, n in origins) * layout.instr_shape[1]
+            assert last_m < block_m, layout
+            assert last_n < block_n, layout

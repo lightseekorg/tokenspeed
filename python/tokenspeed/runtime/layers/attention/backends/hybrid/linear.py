@@ -91,6 +91,9 @@ class HybridLinearAttnBackend(AttentionBackend):
     def override_num_extends(self, num_extends: int):
         return self.full_attn_backend.override_num_extends(num_extends)
 
+    def forward_sparse_prefill(self, *args, **kwargs):
+        return self.full_attn_backend.forward_sparse_prefill(*args, **kwargs)
+
     def forward_extend_chunked(self, *args, **kwargs):
         return self.full_attn_backend.forward_extend_chunked(*args, **kwargs)
 
@@ -122,6 +125,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             layer, forward_mode
         )
 
+    def cache_placement(self, layer):
+        return self._backend_for_layer(layer.layer_id).cache_placement(layer)
+
     @property
     def cache_consumer_families(self) -> frozenset[str]:
         """Cache families consumed by the two child backends."""
@@ -139,6 +145,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         return self.linear_attn_backend
 
     # ---- Metadata delegation ----
+
+    def configure_runtime(self, **kwargs) -> None:
+        self.full_attn_backend.configure_runtime(**kwargs)
+        self.linear_attn_backend.configure_runtime(**kwargs)
 
     def init_forward_metadata(self, *args, **kwargs):
         self.full_attn_backend.init_forward_metadata(*args, **kwargs)

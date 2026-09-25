@@ -28,33 +28,35 @@ def test_topk_call_can_override_configured_output_format() -> None:
     assert output.router_logits is router_logits
 
 
-def test_plain_route_uses_kernel_package_softmax_topk(
+def test_plain_route_uses_kernel_package_topk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[int, torch.dtype, bool, float, str | None]] = []
 
-    def fake_softmax_topk(
+    def fake_topk(
         router_logits: torch.Tensor,
-        topk: int,
-        *,
-        topk_indices_dtype: torch.dtype,
+        top_k: int,
+        score_function: str,
+        selection_method: str,
         renormalize: bool,
         routed_scaling_factor: float,
-        solution: str | None,
+        topk_indices_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert score_function == "softmax"
+        assert selection_method == "topk"
         calls.append(
             (
-                topk,
+                top_k,
                 topk_indices_dtype,
                 renormalize,
                 routed_scaling_factor,
-                solution,
+                None,
             )
         )
-        shape = (router_logits.shape[0], topk)
+        shape = (router_logits.shape[0], top_k)
         return torch.ones(shape), torch.zeros(shape, dtype=topk_indices_dtype)
 
-    monkeypatch.setattr(topk_module, "moe_softmax_topk", fake_softmax_topk)
+    monkeypatch.setattr(topk_module, "moe_topk", fake_topk)
     output = select_experts(
         hidden_states=torch.empty((2, 4), dtype=torch.float32),
         router_logits=torch.empty((2, 8), dtype=torch.float32),

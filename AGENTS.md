@@ -48,6 +48,17 @@ best people and average people is more than tenfold.
   commit any formatter changes it makes.
 * When creating commits, perform sign off on behalf of the author.
 
+## Code review
+
+When Codex or Claude Code reviews code changes, consult these references for
+the languages involved:
+
+* For C++ changes, consult the
+  [Google C++ Style Guide](https://google.github.io/styleguide/cppguide.html) and
+  the [C++ Core Guidelines](https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines).
+* For Python changes, consult the
+  [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html).
+
 ## Design principles
 
 We value one scheduling path and one execution path. Prefill/decode
@@ -148,6 +159,10 @@ Inside the root `tokenspeed-kernel/` directory:
 * Prefer to `@register_kernel` with the name as the Python `def` function
   attached to, prefixed with its solution (e.g, `triton_mha_prefill`).
 * When defining new public APIs, explain arguments and returns in docstring.
+* Keep vendor-only code in files or private directories named after its
+  vendor-specific solution (`cute_dsl`, `gluon`, ...). CI skips the other
+  vendor's GPU jobs based on these names. Code that serves both vendors belongs
+  in a shared solution (`triton`).
 * Vendor-specific tests should be placed under `test/<vendor>/` subdirectory.
   Tests for common infra and covering multi-vendors reside under `test/`
   directly.

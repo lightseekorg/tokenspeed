@@ -31,7 +31,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 
 import torch
-from tokenspeed_kernel.ops.kvcache.triton_virtual_blocks import virtual_slots_to_local
+from tokenspeed_kernel.ops.kvcache.triton_cache_placement import virtual_slots_to_local
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     CacheRuntimeContract,
