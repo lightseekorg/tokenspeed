@@ -662,6 +662,43 @@ class TestChainSpeculativeSamplingTargetOnly:
 
     DEVICE = "cuda"
 
+    @pytest.mark.parametrize("deterministic", [False, True])
+    def test_single_token_sparse_cdf_boundaries(self, deterministic):
+        from tokenspeed_kernel.thirdparty.cuda import (
+            chain_speculative_sampling_target_only,
+        )
+
+        probs = torch.zeros((4, 1, 4096), device=self.DEVICE)
+        probs[:, 0, 0] = 0.25
+        probs[:, 0, 2048] = 0.5
+        probs[:, 0, -1] = 0.25
+        coins = torch.tensor([0.0, 0.25, 0.75, 0.99999994], device=self.DEVICE)
+        predicts = torch.full((4,), -1, device=self.DEVICE, dtype=torch.int32)
+        indices = torch.full((4, 1), -1, device=self.DEVICE, dtype=torch.int32)
+        lengths = torch.full((4,), -1, device=self.DEVICE, dtype=torch.int32)
+        chain_speculative_sampling_target_only(
+            predicts,
+            indices,
+            lengths,
+            torch.zeros_like(indices),
+            coins[:, None],
+            coins,
+            probs,
+            None,
+            1.0,
+            1.0,
+            deterministic,
+            False,
+        )
+        torch.testing.assert_close(
+            predicts,
+            torch.tensor([0, 2048, 4095, 4095], device=self.DEVICE, dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            indices[:, 0], torch.arange(4, device=self.DEVICE, dtype=torch.int32)
+        )
+        torch.testing.assert_close(lengths, torch.zeros_like(lengths))
+
     def _make_deterministic_inputs(self, batch_size, num_draft_tokens=4, vocab_size=16):
         """Create deterministic test inputs matching fork's reference test."""
         candidates = torch.tensor(
