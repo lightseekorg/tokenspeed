@@ -271,6 +271,8 @@ def test_kimi_k3_amd_gates_use_eagle3():
     assert flag_value(perf_server_tokens, "--max-num-seqs") == "16"
     assert flag_value(perf_server_tokens, "--chunked-prefill-size") == "8192"
     assert flag_value(perf_server_tokens, "--max-prefill-tokens") == "8192"
+    # 8192 * 8 rows lets every chunk of a 50K prompt take one-pass MLA prefill.
+    assert flag_value(perf_server_tokens, "--mla-chunk-multiplier") == "8"
     assert flag_value(perf_server_tokens, "--prefill-graph-max-tokens") == "8192"
     token_sizes_index = perf_server_tokens.index("--prefill-graph-capture-token-sizes")
     assert perf_server_tokens[token_sizes_index + 1 : token_sizes_index + 3] == [
