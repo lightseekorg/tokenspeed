@@ -1572,6 +1572,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             server_args = SimpleNamespace(
                 mapping=None,
                 prefix_granularity=prefix_granularity,
+                speculative_algorithm=None,
                 load_format="auto",
                 ext_yaml=None,
             )
