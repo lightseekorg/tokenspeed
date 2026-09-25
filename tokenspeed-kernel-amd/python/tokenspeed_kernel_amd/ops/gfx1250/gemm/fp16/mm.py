@@ -195,7 +195,21 @@ def _wmma_tdm_dense_m16_kernel(
         )
 
 
-@gluon.jit
+def _splitk_reduce_bf16_launch_metadata(grid, kernel, args):
+    """Report the FP32 partial reduction and BF16 store to Proton."""
+    rows = grid[0]
+    n = args["n"]
+    split_k = args["SPLIT_K"]
+    values = rows * n
+    return {
+        "name": kernel.name,
+        "flops32": values * (split_k - 1),
+        "bytes": values * split_k * args["partial_ptr"].element_size()
+        + values * args["out_ptr"].element_size(),
+    }
+
+
+@gluon.jit(launch_metadata=_splitk_reduce_bf16_launch_metadata)
 def _splitk_reduce_bf16_kernel(
     partial_ptr,
     out_ptr,
@@ -223,16 +237,21 @@ def _splitk_reduce_bf16_kernel(
     gl.store(out_ptr + row * out_stride + offs, acc.to(gl.bfloat16), mask=mask)
 
 
-def _dense_m16_split_k(n: int, block_n: int, k_tiles: int, num_buffers: int) -> int:
+def _dense_m16_split_k(
+    n: int,
+    block_n: int,
+    k_tiles: int,
+    num_buffers: int,
+    device: torch.device,
+) -> int:
     """Return the largest split that divides the K tiles and stays within the CU count.
 
     Each split keeps at least eight K tiles, and at least one full buffer pipeline.
+    ``device`` is the tensor's CUDA device, whose CU count bounds the split.
     """
 
     ctas = n // block_n
-    cus = torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count
+    cus = torch.cuda.get_device_properties(device).multi_processor_count
     min_tiles = max(num_buffers, 8)
     for split in (8, 4, 2):
         if (
@@ -257,7 +276,9 @@ def _launch_wmma_tdm_dense_tiles(
     block_k = 128
     k_tiles = A.shape[1] // block_k
     if split_k is None:
-        split_k = _dense_m16_split_k(B.shape[0], block_n, k_tiles, num_buffers)
+        split_k = _dense_m16_split_k(
+            B.shape[0], block_n, k_tiles, num_buffers, A.device
+        )
     if split_k < 1 or k_tiles % split_k != 0:
         raise ValueError(f"split_k={split_k} must divide K/{block_k}={k_tiles}")
     if split_k > 1 and k_tiles // split_k < num_buffers:
