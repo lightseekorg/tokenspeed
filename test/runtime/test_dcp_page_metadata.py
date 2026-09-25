@@ -161,6 +161,11 @@ def test_refresh_rejects_layout_topology_and_page_geometry_changes():
         ({"layout": replace(layout, block_granularity=64)}, "geometry changed"),
         ({"layout": replace(layout, page_size=0)}, "whole kernel pages"),
         ({"layout": replace(layout, seq_lens=torch.ones(2))}, "lengths must match"),
+        (
+            # A captured graph would keep replaying against the old buffers.
+            {"page_table": torch.tensor([[2, 3, 4]], dtype=torch.int32)},
+            "buffers do not match",
+        ),
     ]:
         with pytest.raises(ValueError, match=message):
             refresh_dcp_page_table_metadata(previous=metadata, **(kwargs | changes))
