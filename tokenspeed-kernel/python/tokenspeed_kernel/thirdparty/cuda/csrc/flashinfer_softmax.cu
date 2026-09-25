@@ -33,6 +33,10 @@ __global__ void OnlineSoftmaxFusedKernel(DTypeIn* logits, DTypeOut* output,
                                          uint32_t d) {
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x;
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  // The preceding PDL producer may still be writing per-request temperatures.
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
   float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
   const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
 
@@ -52,10 +56,6 @@ __global__ void OnlineSoftmaxFusedKernel(DTypeIn* logits, DTypeOut* output,
 
   float running_max = -cuda::std::numeric_limits<float>::infinity();
   float threadlocal_running_denominator = 0.0f;
-
-#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
-#endif
 
   // Pass 1: max + denominator.
 #pragma unroll 2
@@ -166,6 +166,10 @@ __global__ void OnlineSoftmaxMapKernel(DTypeIn* logits,
   const uint32_t bx = blockIdx.x;
   const uint32_t by = blockIdx.y;  // slice index
   const uint32_t tx = threadIdx.x;
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  // Acquire producer writes before loading temperature, not only logits.
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
   float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
   const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
 
@@ -183,10 +187,6 @@ __global__ void OnlineSoftmaxMapKernel(DTypeIn* logits,
   float scaled[VEC_SIZE];
   float running_max = -cuda::std::numeric_limits<float>::infinity();
   float threadlocal_running_denominator = 0.0f;
-
-#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
-#endif
 
 #pragma unroll 2
   for (uint32_t i = 0; i < ceil_div(slice_size, BLOCK_THREADS * VEC_SIZE); ++i) {
@@ -243,6 +243,10 @@ __global__ void OnlineSoftmaxReduceKernel(DTypeIn* logits, DTypeOut* output,
                                           uint32_t d, uint32_t num_slices) {
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x;
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  // All dependent inputs, including temperature, must follow the acquire.
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
   float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
   const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
 
@@ -252,10 +256,6 @@ __global__ void OnlineSoftmaxReduceKernel(DTypeIn* logits, DTypeOut* output,
 
   const Float2SoftmaxReduceOp reduce_op;
   float2 thread_aggregate = make_float2(-cuda::std::numeric_limits<float>::infinity(), 0.0f);
-
-#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
-#endif
 
   for (uint32_t i = tx; i < num_slices; i += BLOCK_THREADS) {
     PartialSoftmaxResult partial = partial_results[bx * num_slices + i];
