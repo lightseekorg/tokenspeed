@@ -92,7 +92,7 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
 
         def forward(self, hidden, hashes, mask):
             events.append(("engram", self.layer_id))
-            assert hashes.tolist() == [self.layer_hash_index] * 2
+            assert hashes.tolist() == [[self.layer_hash_index] * 3] * 2
             assert mask.tolist() == [True, True]
             return hidden + 100 * (self.layer_hash_index + 1)
 
@@ -114,7 +114,12 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
     target.model = DeepseekV41Model.__new__(DeepseekV41Model)
     nn.Module.__init__(target.model)
     target.model.config = SimpleNamespace(
-        num_hidden_layers=40, hidden_size=2, hc_mult=4, engram_layer_ids=[37, 38, 39]
+        num_hidden_layers=40,
+        hidden_size=2,
+        hc_mult=4,
+        engram_layer_ids=[37, 38, 39],
+        engram_max_ngram_size=4,
+        engram_n_heads=1,
     )
     target.model.ced_decoder_start = 20
     target.model.decoder_uses_engram = True
@@ -134,7 +139,7 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
         ctx,
         input_embeds=embeddings,
         pp_inbound=None,
-        engram_previous_tokens=torch.full((2, 3), -1, dtype=torch.int64),
+        engram_hash_ids=torch.arange(3).view(1, 3, 1).expand(2, 3, 3),
         engram_token_mask=torch.ones(2, dtype=torch.bool),
         image_mask=None,
     )

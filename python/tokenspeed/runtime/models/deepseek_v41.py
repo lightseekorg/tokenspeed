@@ -34,10 +34,10 @@ The generic model loader owns dense and MoELayer postprocessing, including
 MegaMoE weight preparation.
 
 Call initialize_engram(tokenizer) once after construction, then pass caller-owned
-``engram_previous_tokens`` [T,3] and bool ``engram_token_mask`` [T] as forward
+``engram_hash_ids`` [T,layers,hash columns] and bool ``engram_token_mask`` [T] as forward
 kwargs. These are borrowed forward inputs, never request state or ForwardContext
 fields. The runner owns refresh/overlap/rollback and can use stable input views.
-No setter retains a mutable per-forward tensor; no hashes survive a forward.
+The model retains no mutable per-forward tensors; hash storage belongs to the runner.
 
 Every scheduled token runs through the encoder layers; the CED decoder (from
 the candidate source on) runs on the rows the backend's ``decoder_view()``
@@ -1371,13 +1371,13 @@ class DeepseekV41Model(nn.Module):
         input_embeds: torch.Tensor | None,
         pp_inbound: PPStageState | None,
         *,
-        engram_previous_tokens: torch.Tensor | None,
+        engram_hash_ids: torch.Tensor | None,
         engram_token_mask: torch.Tensor | None,
         image_mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         """Run all layers and return normalized [T,hidden] plus optional hidden capture.
 
-        Engram history/mask must describe every input row in the same TP-replicated
+        Prepared Engram hashes/mask must describe every input row in the same TP-replicated
         order as backend metadata. image_mask marks image-span rows; None uses
         text routing. pp_inbound must be None; draft and memory-only/CED
         invocations are unsupported. The four stages below are the whole
@@ -1394,7 +1394,7 @@ class DeepseekV41Model(nn.Module):
             ctx,
             input_embeds,
             pp_inbound,
-            engram_previous_tokens=engram_previous_tokens,
+            engram_hash_ids=engram_hash_ids,
             engram_token_mask=engram_token_mask,
             image_mask=image_mask,
         )
@@ -1434,7 +1434,7 @@ class DeepseekV41Model(nn.Module):
         input_embeds: torch.Tensor | None,
         pp_inbound: PPStageState | None,
         *,
-        engram_previous_tokens: torch.Tensor | None,
+        engram_hash_ids: torch.Tensor | None,
         engram_token_mask: torch.Tensor | None,
         image_mask: torch.Tensor | None,
     ) -> V41RowState:
@@ -1445,19 +1445,26 @@ class DeepseekV41Model(nn.Module):
             raise ValueError(
                 "V4.1 expects packed one-dimensional token IDs and positions"
             )
-        hashes = None
+        hashes = engram_hash_ids
         if self.config.engram_layer_ids:
-            if (
-                self.engram_hash is None
-                or engram_previous_tokens is None
-                or engram_token_mask is None
-            ):
+            if hashes is None or engram_token_mask is None:
                 raise RuntimeError(
-                    "Initialize Engram and provide previous-three tokens and current token mask"
+                    "Engram requires prepared hash IDs and current token mask"
                 )
-            hashes = self.engram_hash(
-                input_ids, engram_previous_tokens, engram_token_mask
+            expected = (
+                input_ids.numel(),
+                len(self.config.engram_layer_ids),
+                (self.config.engram_max_ngram_size - 1) * self.config.engram_n_heads,
             )
+            if (
+                hashes.shape != expected
+                or hashes.dtype != torch.int64
+                or engram_token_mask.shape != input_ids.shape
+                or engram_token_mask.dtype != torch.bool
+            ):
+                raise ValueError(
+                    "Engram prepared hashes/mask have the wrong shape or dtype"
+                )
         h = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         if h.shape != (input_ids.numel(), self.config.hidden_size):
             raise ValueError("V4.1 input embeddings have the wrong shape")
@@ -1659,6 +1666,12 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         if self.model is not None:
             self.model.initialize_engram(tokenizer)
 
+    def get_ngram_hash_parameters(self):
+        """Borrow immutable hash constants for fused runtime input preparation."""
+        if self.model is None or self.model.engram_hash is None:
+            raise RuntimeError("Initialize Engram before binding input preparation")
+        return self.model.engram_hash.input_parameters
+
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         """Capture ordered, unique target layer inputs for the checkpoint draft."""
         layers = tuple(layer_ids)
@@ -1740,7 +1753,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         result = {
             "input_embeds": kwargs.get("input_embeds", kwargs.get("inputs_embeds")),
             "pp_inbound": kwargs.get("pp_inbound"),
-            "engram_previous_tokens": kwargs.get("engram_previous_tokens"),
+            "engram_hash_ids": kwargs.get("engram_hash_ids"),
             "engram_token_mask": kwargs.get("engram_token_mask"),
             "image_mask": kwargs.get("image_mask"),
         }

@@ -20,10 +20,12 @@
 
 from __future__ import annotations
 
+from itertools import accumulate
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.metadata import PrepTape, Reg, fill_ngram_history
+from tokenspeed_kernel.ops.metadata import PrepTape, Reg
+from tokenspeed_kernel.ops.metadata.ngram import NGramHashParams, prepare_ngram_inputs
 
 from tokenspeed.runtime.execution.cache_loc_kernel import fused_decode_input_prep
 from tokenspeed.runtime.execution.forward_batch_info import compute_position_triton
@@ -61,6 +63,12 @@ class InputBuffers:
         self.all_extends_mid_chunk = False
         self.ngram_previous_tokens_buf: torch.Tensor | None = None
         self.ngram_token_mask_buf: torch.Tensor | None = None
+        self.ngram_seed_buf: torch.Tensor | None = None
+        self.ngram_prefix_buf: torch.Tensor | None = None
+        self.ngram_hash_ids_buf: torch.Tensor | None = None
+        self.ngram_padding_hash: torch.Tensor | None = None
+        self.ngram_hash_params: NGramHashParams | None = None
+        self._ngram_active_tokens = 0
         # Per-modality in-vocab draft tokens; when set, fill rewrites the
         # drafter-only shift-1 buffer's media pad ids in place so drafters
         # only ever see embeddable input ids.
@@ -104,10 +112,17 @@ class InputBuffers:
         self.extend_prompt_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         self._pad_tape = self._record_pad_tape()
 
-    def init_ngram_buffers(self, context_len: int) -> None:
+    def init_ngram_buffers(
+        self, context_len: int, hash_params: NGramHashParams | None
+    ) -> None:
         """Allocate forward-sized, pointer-stable Engram inputs; no request cache."""
         if context_len == 0:
             return
+        if context_len != 3 or hash_params is None:
+            raise ValueError(
+                "Engram preparation requires three-token history and hash constants"
+            )
+        self.ngram_hash_params = hash_params
         self.ngram_previous_tokens_buf = torch.full(
             (self.max_num_tokens, context_len),
             -1,
@@ -117,14 +132,29 @@ class InputBuffers:
         self.ngram_token_mask_buf = torch.zeros(
             self.max_num_tokens, dtype=torch.bool, device=self.device
         )
+        self.ngram_seed_buf = torch.empty(
+            self.max_bs * (context_len + 4), dtype=torch.int64, device=self.device
+        )
+        self.ngram_prefix_buf = torch.full(
+            (self.max_bs, context_len), -1, dtype=torch.int64, device=self.device
+        )
+        self.ngram_padding_hash = hash_params.hash(
+            self.input_ids_buf[:1],
+            self.ngram_previous_tokens_buf[:1],
+            self.ngram_token_mask_buf[:1],
+        )
+        self.ngram_hash_ids_buf = self.ngram_padding_hash.expand(
+            self.max_num_tokens, -1, -1
+        ).clone()
 
     def ngram_model_kwargs(self, num_tokens: int) -> dict[str, torch.Tensor]:
-        """Borrow the same raw-history/mask views for every model forward."""
+        """Borrow pointer-stable prepared hashes and masks for every model forward."""
         if self.ngram_previous_tokens_buf is None:
             return {}
         assert self.ngram_token_mask_buf is not None
+        assert self.ngram_hash_ids_buf is not None
         return {
-            "engram_previous_tokens": self.ngram_previous_tokens_buf[:num_tokens],
+            "engram_hash_ids": self.ngram_hash_ids_buf[:num_tokens],
             "engram_token_mask": self.ngram_token_mask_buf[:num_tokens],
         }
 
@@ -148,6 +178,11 @@ class InputBuffers:
                 raise ValueError("N-gram snapshot supplied without input buffers")
             return
         assert self.ngram_token_mask_buf is not None
+        assert self.ngram_seed_buf is not None
+        assert self.ngram_prefix_buf is not None
+        assert self.ngram_hash_ids_buf is not None
+        assert self.ngram_hash_params is not None
+        assert self.ngram_padding_hash is not None
         tail = runtime_states.ngram_accepted_tokens
         needs_seed = runtime_states.ngram_needs_seed
         assert tail is not None and needs_seed is not None
@@ -161,6 +196,15 @@ class InputBuffers:
         context_len = self.ngram_previous_tokens_buf.shape[1]
         if any(len(row) != context_len + 1 for row in snapshot.tokens):
             raise ValueError("Engram snapshot has the wrong history width")
+        # The untouched suffix starts clear and remains clear. On shrink, scrub
+        # the preceding live range too, so every graph bucket sees dead padding.
+        refresh_tokens = max(total_tokens, self._ngram_active_tokens)
+        if bs == 0:
+            self.ngram_previous_tokens_buf[:refresh_tokens].fill_(-1)
+            self.ngram_token_mask_buf[:refresh_tokens].zero_()
+            self.ngram_hash_ids_buf[:refresh_tokens].copy_(self.ngram_padding_hash)
+            self._ngram_active_tokens = 0
+            return
 
         num_extends = forward_op.num_extends()
         overrides = forward_op.decode_input_ids
@@ -172,35 +216,46 @@ class InputBuffers:
                 zip(forward_op.request_ids, forward_op.request_pool_indices)
             )
         ]
-        # One pinned upload carries the snapshot rows, their positions and
-        # the reset flags; the kernels read them as views.
-        rows = bs * (context_len + 1)
-        (staging_cpu,) = self._bulk_pinned((rows + 2 * bs, torch.int64))
-        staging_cpu[:rows].copy_(
-            torch.tensor(snapshot.tokens, dtype=torch.int64).view(-1)
-        )
-        staging_cpu[rows : rows + bs].copy_(
-            torch.tensor(snapshot.positions, dtype=torch.int64)
-        )
-        staging_cpu[rows + bs :].copy_(torch.tensor(reset, dtype=torch.int64))
-        staging = staging_cpu.to(self.device, non_blocking=True)
-        fill_ngram_history(
-            staging[:rows].view(bs, context_len + 1),
-            staging[rows : rows + bs],
-            staging[rows + bs :],
-            self.req_pool_indices_buf[:bs],
-            self.input_lengths_buf[:bs],
-            self.input_ids_buf,
-            runtime_states.valid_cache_lengths,
-            tail,
-            needs_seed,
-            self.ngram_previous_tokens_buf,
-            self.ngram_token_mask_buf,
-            total_tokens,
-            runtime_states.vocab_size,
-        )
+        # One fresh pinned allocation and one H2D. The GPU destination is stable;
+        # the host source must not be reused while an earlier copy is in flight.
+        seed_values = [token for row in snapshot.tokens for token in row]
+        seed_values.extend(snapshot.positions)
+        seed_values.extend(reset)
+        seed_values.extend(accumulate(forward_op.input_lengths))
+        (seed_cpu,) = self._bulk_pinned((len(seed_values), torch.int64))
+        seed_cpu.copy_(torch.tensor(seed_values, dtype=torch.int64))
+        seed = self.ngram_seed_buf[: len(seed_values)]
+        seed.copy_(seed_cpu, non_blocking=True)
+        token_count = bs * (context_len + 1)
+        tokens = seed[:token_count].view(bs, context_len + 1)
+        positions = seed[token_count : token_count + bs]
+        reset_device = seed[token_count + bs : token_count + 2 * bs]
+        request_ends = seed[token_count + 2 * bs :]
+        slots = self.req_pool_indices_buf[:bs]
+        lengths = forward_op.input_lengths
+        uniform_length = lengths[0] if all(n == lengths[0] for n in lengths) else 0
         for rid, slot in zip(forward_op.request_ids, forward_op.request_pool_indices):
             runtime_states.ngram_request_ids[slot] = rid
+        prepare_ngram_inputs(
+            tokens,
+            positions,
+            reset_device,
+            slots,
+            runtime_states.valid_cache_lengths,
+            request_ends,
+            tail,
+            needs_seed,
+            self.input_ids_buf,
+            self.ngram_previous_tokens_buf[:refresh_tokens],
+            self.ngram_token_mask_buf[:refresh_tokens],
+            self.ngram_prefix_buf[:bs],
+            self.ngram_hash_ids_buf[:refresh_tokens],
+            total_tokens,
+            runtime_states.vocab_size,
+            uniform_length,
+            self.ngram_hash_params,
+        )
+        self._ngram_active_tokens = total_tokens
 
     def _record_pad_tape(self) -> "PrepTape | None":
         """One launch for the whole padding-tail scrub.
@@ -554,6 +609,11 @@ class InputBuffers:
             assert self.ngram_token_mask_buf is not None
             self.ngram_previous_tokens_buf[:total_tokens].fill_(-1)
             self.ngram_token_mask_buf[:total_tokens].zero_()
+            assert (
+                self.ngram_hash_ids_buf is not None
+                and self.ngram_padding_hash is not None
+            )
+            self.ngram_hash_ids_buf[:total_tokens].copy_(self.ngram_padding_hash)
         if total_tokens > 0:
             self.input_ids_buf[:total_tokens].fill_(1)
             self.positions_buf[:total_tokens].fill_(0)

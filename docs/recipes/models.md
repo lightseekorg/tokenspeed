@@ -975,14 +975,14 @@ token id. A five-token block is therefore six kernels and five all-gathers
 instead of a per-step chain of masked embedding lookups, GEMMs, reductions and
 two all-gathers.
 
-Engram's per-step inputs follow the same pattern. Before each forward, one
-pinned upload carries every request's history snapshot, and two launches
-(`fill_ngram_history`) seed the per-slot accepted prefixes and write every
-input row's previous-three tokens and validity mask, blanking the graph
-padding rows. Inside the forward, `engram_hash` maps the current token and its
-three predecessors, applies the per-layer multipliers, rolling XOR and prime
-buckets, and emits the table rows for all Engram layers in one launch; its
-output is bit-identical to the eager reference, which remains the CPU path.
+Before each forward, one pinned upload carries every request's Engram history
+snapshot. `prepare_ngram_inputs` resolves the previous-three tokens and validity
+mask, clears padding, and computes table rows for all Engram layers in one
+launch. The model consumes these prepared hashes through stable input buffers.
+Preparation leaves accepted request state unchanged; after sampling,
+`commit_ngram_inputs` advances accepted history and cache lengths together in
+a second launch. Hashes are bit-identical to the eager reference, which remains
+the CPU path.
 
 The CUDA draft path also preserves the checkpoint's UE8M0-scaled FP8 activation
 round-trip with a fused `tokenspeed-kernel` operation. It computes the same

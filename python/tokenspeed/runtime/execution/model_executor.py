@@ -29,6 +29,7 @@ import tokenspeed_kernel
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.metadata import advance_accepted_frontier
+from tokenspeed_kernel.ops.metadata.ngram import commit_ngram_inputs
 from tokenspeed_kernel.ops.tuning import (
     autotune,
     set_autotune_max_num_tokens,
@@ -371,7 +372,10 @@ class ModelExecutor:
             raise NotImplementedError(
                 "Engram input history requires PP=1 and in-flight depth <= 1"
             )
-        self.input_buffers.init_ngram_buffers(ngram_context)
+        self.input_buffers.init_ngram_buffers(
+            ngram_context,
+            model_runner.model.get_ngram_hash_parameters() if ngram_context else None,
+        )
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
             vocab_size=config.vocab_size,
@@ -1107,8 +1111,25 @@ class ModelExecutor:
                 next_round_input_ids
             )
 
+        bs = req_pool_indices.shape[0]
         ib = self.input_buffers
         tail = self.runtime_states.ngram_accepted_tokens
+        if tail is not None:
+            commit_ngram_inputs(
+                req_pool_indices,
+                input_lengths,
+                accept_lengths,
+                ib.input_ids_buf,
+                ib.ngram_previous_tokens_buf,
+                ib.ngram_token_mask_buf,
+                ib.ngram_prefix_buf[:bs],
+                tail,
+                self.runtime_states.ngram_needs_seed,
+                self.runtime_states.valid_cache_lengths,
+                num_extends,
+                ib.state_write_padding_pool_index,
+            )
+            return
         advance_accepted_frontier(
             req_pool_indices,
             input_lengths,
@@ -1116,10 +1137,10 @@ class ModelExecutor:
             self.runtime_states.valid_cache_lengths,
             num_extends,
             ib.state_write_padding_pool_index,
-            ngram_tail=tail,
-            ngram_previous_tokens=ib.ngram_previous_tokens_buf,
-            ngram_token_mask=ib.ngram_token_mask_buf,
-            input_ids=ib.input_ids_buf if tail is not None else None,
+            ngram_tail=None,
+            ngram_previous_tokens=None,
+            ngram_token_mask=None,
+            input_ids=None,
         )
 
     def _build_sampling_info(self, bs: int) -> SamplingBatchInfo:
