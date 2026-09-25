@@ -1,5 +1,5 @@
 api_version: ci.tokenspeed.io/v1
-name: eval-deepseek-v4.1-flash-gsm8k
+name: eval-deepseek-v4.1-flash-dspark-gsm8k-amd
 type: eval
 workflow_stage: model-test
 triggers:
@@ -7,19 +7,18 @@ triggers:
   - manual
 runner:
   labels:
-    - b200-4gpu
+    - amd-mi35x-4gpu-test
 env:
   CI: "true"
 install:
-  - bash test/ci_system/install_deps.sh
+  - bash test/ci_system/install_deps_rocm.sh
 server:
   command: >-
     ts serve
     --model deepseek-ai/DeepSeek-V4.1-Flash
     --speculative-algorithm DSPARK
+    --download-dir "${PWD}/.hf-model-cache"
     --tensor-parallel-size 4
-    --enable-expert-parallel
-    --moe-backend mega_moe
     --dtype bfloat16
     --max-model-len 1048576
     --max-total-tokens 1048576
@@ -27,6 +26,7 @@ server:
     --chunked-prefill-size 8192
     --gpu-memory-utilization 0.9
     --disable-kvstore
+    --disable-prefill-graph
     --trust-remote-code
     --max-cudagraph-capture-size 32
     --reasoning-parser deepseek_v31
