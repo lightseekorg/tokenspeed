@@ -425,7 +425,15 @@ def combine_topk_weights(
         raise ValueError("combine_topk_weights expects unit-stride weights rows")
     if q_scale.dtype != torch.float32:
         raise TypeError(f"q_scale must be fp32, got {q_scale.dtype}")
-    q_scale = q_scale.reshape(tokens * heads)
+    # The quantizer may pad the per-row scale vector (an alignment multiple of
+    # its launch width); real rows lead, padding trails. 16-head indexers hit
+    # this on every odd token count.
+    q_scale = q_scale.reshape(-1)
+    if q_scale.numel() < tokens * heads:
+        raise ValueError(
+            f"q_scale has {q_scale.numel()} entries for {tokens * heads} rows"
+        )
+    q_scale = q_scale[: tokens * heads]
     out = torch.empty(tokens, heads, dtype=torch.float32, device=weights.device)
     numel = tokens * heads
     if numel == 0:
