@@ -48,6 +48,17 @@ best people and average people is more than tenfold.
   commit any formatter changes it makes.
 * When creating commits, perform sign off on behalf of the author.
 
+## Code review
+
+When Codex or Claude Code reviews code changes, consult these references for
+the languages involved:
+
+* For C++ changes, consult the
+  [Google C++ Style Guide](https://google.github.io/styleguide/cppguide.html) and
+  the [C++ Core Guidelines](https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines).
+* For Python changes, consult the
+  [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html).
+
 ## Design principles
 
 We value one scheduling path and one execution path. Prefill/decode

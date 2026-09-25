@@ -222,6 +222,7 @@ def _write_latent(
         k_rope,
         enable_pdl=enable_pdl,
         sanitize=cache.sanitize,
+        write_mask=None,
     )
 
 

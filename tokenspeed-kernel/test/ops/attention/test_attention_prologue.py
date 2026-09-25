@@ -1156,7 +1156,7 @@ def test_mla_composite_runs_the_deepseek_decode_steps(tokens, rope_style, fp8_ca
             quant_scale_kv=1.0,
         )
         set_mla_kv_buffer_triton(
-            ref_cache, loc, ref_key[..., :rank], ref_key[..., rank:]
+            ref_cache, loc, ref_key[..., :rank], ref_key[..., rank:], write_mask=None
         )
     else:
         if rope_style is not None:
@@ -1171,7 +1171,9 @@ def test_mla_composite_runs_the_deepseek_decode_steps(tokens, rope_style, fp8_ca
             ref_query[..., rank:].copy_(qp)
         else:
             ref_query[..., rank:] = q_pe
-        set_mla_kv_buffer_triton(ref_cache, loc, key[..., :rank], key[..., rank:])
+        set_mla_kv_buffer_triton(
+            ref_cache, loc, key[..., :rank], key[..., rank:], write_mask=None
+        )
 
     new_cache = poisoned_latent(total, rank + rope, cache_dtype)
     out = mla_prologue(
@@ -1442,7 +1444,7 @@ def test_mla_expanded_runs_the_deepseek_prefill_steps(
         )
         ref_v = fp8_quantize(v)
         set_mla_kv_buffer_triton(
-            ref_cache, loc, kv_a.unsqueeze(1), ref_k[:, 0:1, nope:]
+            ref_cache, loc, kv_a.unsqueeze(1), ref_k[:, 0:1, nope:], write_mask=None
         )
     else:
         if rope_style is not None:
@@ -1459,7 +1461,9 @@ def test_mla_expanded_runs_the_deepseek_prefill_steps(
         ref_k[..., :nope] = k_nope
         ref_k[..., nope:] = k_pe
         ref_v = v
-        set_mla_kv_buffer_triton(ref_cache, loc, kv_a.unsqueeze(1), k_pe)
+        set_mla_kv_buffer_triton(
+            ref_cache, loc, kv_a.unsqueeze(1), k_pe, write_mask=None
+        )
 
     new_q = q.clone()
     new_cache = poisoned_latent(total, rank + rope, cache_dtype)

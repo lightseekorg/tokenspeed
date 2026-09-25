@@ -173,17 +173,22 @@ def test_qwen38_flash_next_runs_gsm8k_with_kvstore_enabled():
 
 def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
     filenames = (
-        "deepseek-v4.1-flash-evalscope-gsm8k.yaml",
-        "deepseek-v4.1-flash-evalscope-gsm8k-amd.yaml",
+        "deepseek-v4.1-flash-dspark-evalscope-gsm8k.yaml",
+        "deepseek-v4.1-flash-dspark-evalscope-gsm8k-amd.yaml",
     )
     labels = ("b200-4gpu", "amd-mi35x-4gpu-test")
+    names = (
+        "eval-deepseek-v4.1-flash-dspark-gsm8k",
+        "eval-deepseek-v4.1-flash-dspark-gsm8k-amd",
+    )
 
-    for filename, label in zip(filenames, labels, strict=True):
+    for filename, label, name in zip(filenames, labels, names, strict=True):
         task = yaml.safe_load((EVAL_CONFIG_DIR / filename).read_text(encoding="utf-8"))
         server_tokens = shlex.split(task["server"]["command"])
         eval_tokens = shlex.split(task["eval"]["command"])
 
         assert task["triggers"] == ["per-commit", "manual"]
+        assert task["name"] == name
         assert task["runner"]["labels"] == [label]
         assert flag_value(server_tokens, "--model") == "deepseek-ai/DeepSeek-V4.1-Flash"
         assert flag_value(server_tokens, "--tensor-parallel-size") == "4"

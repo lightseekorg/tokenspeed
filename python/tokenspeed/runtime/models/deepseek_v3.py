@@ -86,6 +86,7 @@ from tokenspeed.runtime.execution.forward_step import (
     get_is_cuda_graph_phase,
 )
 from tokenspeed.runtime.layers.activation import SiluAndMul
+from tokenspeed.runtime.layers.attention.dcp.cache import gather_mla_history
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -980,7 +981,6 @@ class DeepseekV3AttentionMLA(nn.Module):
     ) -> torch.Tensor:
         attn_backend = ctx.attn_backend
         chunk_meta = attn_backend.chunked_prefill_metadata
-        token_to_kv_pool = ctx.token_to_kv_pool
 
         scaling = self.attn_mha.scaling
 
@@ -1013,12 +1013,22 @@ class DeepseekV3AttentionMLA(nn.Module):
             else torch.bfloat16
         )
 
+        placement = attn_backend.cache_placement(self.attn_mha)
         for loop_idx in range(chunk_meta.chunked_loop_num):
             chunk_kv_indices = chunk_meta.chunk_kv_indices_list[loop_idx]
 
-            kv_a_normed, k_pe = token_to_kv_pool.get_mla_kv_buffer(
-                self.attn_mha, chunk_kv_indices, read_dtype
-            )
+            if placement is None:
+                kv_a_normed, k_pe = ctx.token_to_kv_pool.get_mla_kv_buffer(
+                    self.attn_mha, chunk_kv_indices, read_dtype
+                )
+            else:
+                kv_a_normed, k_pe = gather_mla_history(
+                    ctx.token_to_kv_pool,
+                    self.attn_mha,
+                    chunk_kv_indices,
+                    dst_dtype=read_dtype,
+                    placement=placement,
+                )
 
             kv_a_normed = kv_a_normed.squeeze(1)
             kv = self.kv_b_proj(kv_a_normed)[0]

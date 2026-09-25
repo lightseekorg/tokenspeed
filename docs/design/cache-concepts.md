@@ -859,7 +859,12 @@ Its responsibilities:
   resident is the coordinator's answer (`DeviceBoundaryResidency`, read off
   the group indexes), so the scheduler keeps no residency counters of its own
   — only the token descriptor the event carries and whether that event is
-  currently out.
+  currently out. A mutation only marks its boundary for reconcile;
+  `DrainKvEvents` reconciles each marked boundary against its residency and
+  reports the net change (published exactly while fully resident), then drops
+  descriptors of boundaries with no cached child. Nothing is decided
+  mid-`Admit`, so one admission may evict a boundary's last cached copy and
+  then store the request's own copy without any ordering hazard.
 For L3 write-through, each lane carries only its own hashed Host destinations.
 Its CUDA completion starts those backups, and its scheduler ACK waits until
 those puts finish; a different lane completing cannot release its pages.
@@ -1111,9 +1116,21 @@ A recipe's group set never depends on the DCP size. Only groups whose every
 reader can attend to a shard may be sharded; a group some consumer must read
 whole stays replicated and is declared as its own group at every DCP size, so
 prefix matching, transfer and zeroing -- all keyed by group -- see one
-topology. DeepSeek V4 shards its compressed-KV chains and keeps the SWA cache,
-the compressor states and the indexer's K replicated; the indexer K is its own
-full-history group rather than a tenant of the compressed chain it indexes.
+topology. DeepSeek V4 shards its compressed-KV chains and keeps the SWA cache
+and compressor states replicated. Index-K is sharded in its own full-history
+group; its virtual IDs are independent of the compressed attention chain.
+Backend binding validates the DCP shard count for both compressed KV and
+Index-K; SWA and compressor-state groups must remain replicated.
+
+Ordinary GPU MLA and DSA use the same ownership geometry for history storage.
+MLA/KDA hybrids shard the MLA history group and keep KDA state replicated.
+Decode gathers query heads, computes attention over owned history, and merges
+partials using FP32 natural-log LSE before restoring TP-local heads. MLA
+prefill reconstructs bounded history chunks with an owner-masked sum reduction;
+GPU DSA sparse prefill instead combines local sparse-attention partials.
+The dense MLA implementation requires FlashMLA and its device/dtype support;
+DCP does not make unsupported kernels portable. These GPU paths currently
+exclude speculative decoding, PD transfer and KVStore.
 
 Splitting or regrouping fields can change physical packing and parent plane
 sizes. Capacity planning therefore uses the resulting physical parent byte

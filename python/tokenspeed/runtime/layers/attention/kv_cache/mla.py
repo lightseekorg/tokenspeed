@@ -154,6 +154,7 @@ class MLATokenToKVPool(CachePool):
             loc,
             cache_k[..., : self.kv_lora_rank],
             cache_k[..., self.kv_lora_rank :],
+            write_mask=None,
         )
 
     def set_mla_kv_buffer(
@@ -163,11 +164,20 @@ class MLATokenToKVPool(CachePool):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
         sanitize: bool | None = None,
+        *,
+        write_mask: torch.Tensor | None,
     ):
+        """Write physical local slots, suppressing rows excluded by write_mask.
+
+        None writes every supplied row. Address translation and distributed
+        communication belong to the caller, never this local storage view.
+        """
         if sanitize is None:
             sanitize = self.latent_write_sanitizes
         layer_id = layer.layer_id
         if self.quant_method == "per_token_head":
+            if write_mask is not None:
+                raise ValueError("Per-token quantized MLA writes do not support a mask")
             store_latent_per_token_head(
                 *self.kv_buffer[layer_id],
                 loc,
@@ -188,6 +198,7 @@ class MLATokenToKVPool(CachePool):
                 cache_k_nope,
                 cache_k_rope,
                 sanitize=sanitize,
+                write_mask=write_mask,
             )
 
     def get_mla_kv_buffer(

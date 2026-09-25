@@ -45,6 +45,7 @@ struct ReqPoolIndex {
 
     bool valid() const;
 
+    // A moved-from index has slot_ == -1 and no longer owns a slot.
     std::int32_t slot_{};
 
 private:
