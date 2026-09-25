@@ -43,6 +43,7 @@ from tokenspeed.runtime.layers.attention.chunk import (
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     MLA_PAGE_SIZE,
 )
@@ -434,11 +435,15 @@ class MLAAttnBackend(PagedAttentionBackend):
         # [T, 1, R + D_rope]. DeepSeek normally writes cache before this call.
         if save_kv_cache:
             assert k is not None
+            local_slots, write_mask = resolve_cache_slots(
+                out_cache_loc, self.cache_placement(layer)
+            )
             token_to_kv_pool.set_mla_kv_buffer(
                 layer,
-                out_cache_loc,
+                local_slots,
                 k[..., : self.kv_lora_rank],
                 k[..., self.kv_lora_rank :],
+                write_mask=write_mask,
             )
 
         metadata = self.forward_decode_metadata

@@ -250,8 +250,18 @@ class CacheGroupRouter(AttentionBackend):
         super()._publish_cache_pool(cache_pool)
 
     def configure_runtime(self, **kwargs) -> None:
-        for leaf in self.leaves.values():
-            leaf.configure_runtime(**kwargs)
+        specs = {
+            spec.group_id: spec for spec in self.cache_pool.arena.cache_group_specs
+        }
+        for group_id, leaf in self.leaves.items():
+            leaf.configure_runtime(
+                block_granularity=self.geometry.granularity_of(group_id),
+                shard_count=specs[group_id].shard_count,
+                virtual_block_count=self.cache_pool.arena.runtime_contract.virtual_block_counts[
+                    group_id
+                ],
+                **kwargs,
+            )
 
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
         for leaf in self.leaves.values():
@@ -736,9 +746,8 @@ class CacheGroupRouter(AttentionBackend):
             for leaf in self.leaves.values()
         )
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
+    def cache_placement(self, layer):
+        return self._leaf_for(layer).cache_placement(layer)
 
     @break_point
     def forward(

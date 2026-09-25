@@ -583,3 +583,381 @@ def test_dsa_decode_dense_kvcache(device: str, q_dtype: torch.dtype, require) ->
     assert out.shape == (tokens, num_heads, kv_lora_rank)
     assert out.dtype == torch.bfloat16
     torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("degree", [1, 2, 4, 8])
+def test_dsa_lse_partials_reconstruct_full_attention(packed, degree):
+    if not torch.cuda.is_available():
+        pytest.skip("GPU required")
+    torch.manual_seed(17)
+    latent = torch.randn((256, 512), device="cuda", dtype=torch.bfloat16)
+    rope = torch.randn((256, 64), device="cuda", dtype=torch.bfloat16)
+    query = torch.randn((3, 4, 576), device="cuda", dtype=torch.bfloat16)
+    dense = torch.cat((latent, rope), dim=-1)
+    sparse, reference_latent = (
+        _pack_sparse_kv(latent, rope) if packed else (None, latent)
+    )
+    slots = torch.full((3, 512), -1, device="cuda", dtype=torch.int32)
+    slots[0, :4] = torch.tensor([64, 65, 128, 193], device="cuda")
+    slots[1, :1] = 70
+    # Third row and some ranks have no candidates.
+    kwargs = dict(
+        q=query,
+        kv_cache=None if packed else dense,
+        sparse_kv_cache=sparse,
+        topk_lens=None,
+        max_seqlen_k=256,
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=576**-0.5,
+        page_size=64,
+        return_lse=True,
+        solution="triton",
+    )
+    reference, ref_lse = dsa_decode(topk_slots=slots, **kwargs)
+    assert reference.dtype == query.dtype
+    complete = dsa_decode(topk_slots=slots, **dict(kwargs, return_lse=False))
+    assert complete.dtype == query.dtype
+    torch.testing.assert_close(complete, reference)
+    reference_kv = torch.cat((reference_latent.float(), rope.float()), dim=-1)
+    scores = (
+        torch.einsum(
+            "thd,tkd->thk", query.float(), reference_kv[slots.clamp_min(0).long()]
+        )
+        * 576**-0.5
+    )
+    expected_lse = torch.logsumexp(
+        scores.masked_fill((slots < 0)[:, None, :], -float("inf")), dim=-1
+    )
+    torch.testing.assert_close(ref_lse, expected_lse, atol=1e-5, rtol=1e-5)
+    supplied_out = torch.empty_like(reference)
+    returned_out, _ = dsa_decode(topk_slots=slots, out=supplied_out, **kwargs)
+    assert returned_out is supplied_out
+    torch.testing.assert_close(returned_out, reference)
+
+    outputs, lses = [], []
+    for rank in range(degree):
+        owned = (slots >= 64) & ((slots // 64 - 1) % degree == rank)
+        out, lse = dsa_decode(topk_slots=torch.where(owned, slots, -1), **kwargs)
+        outputs.append(out.float())
+        lses.append(lse)
+    lses = torch.stack(lses)
+    merged_lse = torch.logsumexp(lses, dim=0)
+    weights = torch.where(torch.isfinite(lses), (lses - merged_lse).exp(), 0.0)
+    merged = (torch.stack(outputs) * weights[..., None]).sum(0)
+    # Local outputs are rounded to BF16 before the FP32 cross-shard merge.
+    tolerance = 0.015
+    torch.testing.assert_close(
+        merged, reference.float(), atol=tolerance, rtol=tolerance
+    )
+    torch.testing.assert_close(merged_lse, ref_lse, atol=1e-5, rtol=1e-5)
+    assert not reference[2].any()
+    assert torch.isneginf(ref_lse[2]).all()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out, graph_lse = dsa_decode(topk_slots=slots, **kwargs)
+    slots.fill_(-1)
+    graph.replay()
+    assert not graph_out.any()
+    assert torch.isneginf(graph_lse).all()
+
+
+@pytest.mark.parametrize("degree", [1, 2, 4, 8])
+def test_dsa_sharded_index_candidates_global_windows(device, degree):
+    from tokenspeed_kernel.ops.attention.dsa.triton import triton_dsa_index_candidates
+
+    torch.manual_seed(821)
+    page_size, heads, dim, topk = 64, 16, 128, 512
+    # Page order is deliberately unrelated to rank order; include a partial tail.
+    table = torch.tensor(
+        [[5, 2, 8, 1, 6, 3, 4, 7, 9]], device=device, dtype=torch.int32
+    )
+    query_requests = torch.zeros(3, device=device, dtype=torch.int32)
+    causal_lens = torch.tensor([13, 527, 573], device=device, dtype=torch.int32)
+    q = torch.randn(3, heads, dim, device=device, dtype=torch.bfloat16)
+    weights = torch.randn(3, heads, device=device)
+    full, dequant = _pack_index_k_cache(
+        torch.randn(10 * page_size, dim, device=device), page_size
+    )
+    logical_k = dequant.reshape(10, page_size, dim)[table[0].long()].reshape(-1, dim)
+    reference = torch.einsum("thd,sd->ths", q.float(), logical_k).relu()
+    reference = (reference * weights.unsqueeze(-1)).sum(1) * 0.1
+    positions = torch.arange(logical_k.shape[0], device=device)
+    reference.masked_fill_(
+        (positions < 4) | (positions >= causal_lens[:, None] - 8), float("inf")
+    )
+    reference.masked_fill_(positions >= causal_lens[:, None], -float("inf"))
+    all_offsets, all_scores = [], []
+    for rank in range(degree):
+        local_pages = [0] + list(range(rank + 1, 10, degree))
+        local = (
+            full.reshape(10, page_size, -1)[local_pages]
+            .reshape(-1, full.shape[-1])
+            .contiguous()
+        )
+        owned = (table - 1) % degree == rank
+        local_table = torch.where(owned, (table - 1) // degree + 1, -1)
+        offsets, scores = triton_dsa_index_candidates(
+            q,
+            weights,
+            local,
+            local_table,
+            query_requests,
+            causal_lens,
+            page_size=page_size,
+            topk=topk,
+            softmax_scale=0.1,
+            initial_tokens=4,
+            local_tokens=8,
+        )
+        valid = offsets >= 0
+        expected_scores = reference.gather(1, offsets.clamp_min(0).long())
+        torch.testing.assert_close(
+            scores[valid], expected_scores[valid], rtol=2e-4, atol=2e-4
+        )
+        assert torch.all(scores[~valid] == -float("inf"))
+        all_offsets.append(offsets)
+        all_scores.append(scores)
+    offsets, scores = torch.cat(all_offsets, 1), torch.cat(all_scores, 1)
+    order = torch.argsort(scores, descending=True, stable=True)[:, :topk]
+    selected = offsets.gather(1, order)
+    for row in range(3):
+        count = min(topk, int(causal_lens[row]))
+        actual = set(selected[row, :count].tolist())
+        expected = set(
+            torch.argsort(reference[row], descending=True, stable=True)[:count].tolist()
+        )
+        assert actual == expected
+
+
+@pytest.mark.parametrize("degree", [1, 2, 4, 8])
+def test_deep_gemm_sharded_index_candidates_global_windows(device, degree):
+    from tokenspeed_kernel.ops.attention.dsa import dsa_index_candidates
+    from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+    from tokenspeed_kernel.platform import current_platform
+
+    if not current_platform().is_hopper_plus:
+        pytest.skip("DeepGEMM requires Hopper or newer")
+
+    torch.manual_seed(821)
+    page_size, heads, dim, topk = 64, 16, 128, 512
+    # Page order is deliberately unrelated to rank order; include a partial tail.
+    table = torch.tensor(
+        [[5, 2, 8, 1, 6, 3, 4, 7, 9]], device=device, dtype=torch.int32
+    )
+    query_requests = torch.zeros(3, device=device, dtype=torch.int32)
+    causal_lens = torch.tensor([13, 527, 573], device=device, dtype=torch.int32)
+    q = torch.randn(3, heads, dim, device=device, dtype=torch.bfloat16)
+    weights = torch.randn(3, heads, device=device)
+    full, dequant = _pack_index_k_cache(
+        torch.randn(10 * page_size, dim, device=device), page_size
+    )
+    logical_k = dequant.reshape(10, page_size, dim)[table[0].long()].reshape(-1, dim)
+    quantized, scales = quantize_fp8_with_scale(
+        q.reshape(-1, dim),
+        granularity="token_group",
+        group_size=128,
+        scale_encoding="float32",
+    )
+    dequant_q = quantized.float().reshape_as(q) * scales[: 3 * heads].reshape(
+        3, heads, 1
+    )
+    reference = torch.einsum("thd,sd->ths", dequant_q, logical_k).relu()
+    reference = (reference * weights.unsqueeze(-1)).sum(1) * 0.1
+    positions = torch.arange(logical_k.shape[0], device=device)
+    reference.masked_fill_(
+        (positions < 4) | (positions >= causal_lens[:, None] - 8), float("inf")
+    )
+    reference.masked_fill_(positions >= causal_lens[:, None], -float("inf"))
+    # Compare sharding against the same full-context DeepGEMM scoring path:
+    # Tensor Core scoring need not match the torch FP32 reduction bitwise.
+    full_offsets, full_scores = dsa_index_candidates(
+        q,
+        weights,
+        full,
+        table,
+        query_requests,
+        causal_lens,
+        page_size=page_size,
+        topk=1024,
+        softmax_scale=0.1,
+        initial_tokens=4,
+        local_tokens=8,
+        solution="deep_gemm",
+    )
+    deep_reference = torch.full_like(reference, -float("inf"))
+    for row in range(q.shape[0]):
+        valid = full_offsets[row] >= 0
+        deep_reference[row, full_offsets[row, valid].long()] = full_scores[row, valid]
+    # A separate dequantized oracle catches scale/layout mistakes.
+    torch.testing.assert_close(deep_reference, reference, rtol=2e-3, atol=2e-3)
+    reference = deep_reference
+    all_offsets, all_scores = [], []
+    for rank in range(degree):
+        local_pages = [0] + list(range(rank + 1, 10, degree))
+        local = (
+            full.reshape(10, page_size, -1)[local_pages]
+            .reshape(-1, full.shape[-1])
+            .contiguous()
+        )
+        owned = (table - 1) % degree == rank
+        local_table = torch.where(owned, (table - 1) // degree + 1, -1)
+        offsets, scores = dsa_index_candidates(
+            q,
+            weights,
+            local,
+            local_table,
+            query_requests,
+            causal_lens,
+            page_size=page_size,
+            topk=topk,
+            softmax_scale=0.1,
+            initial_tokens=4,
+            local_tokens=8,
+            solution="deep_gemm",
+        )
+        valid = offsets >= 0
+        expected_scores = reference.gather(1, offsets.clamp_min(0).long())
+        torch.testing.assert_close(
+            scores[valid], expected_scores[valid], rtol=2e-4, atol=2e-4
+        )
+        assert torch.all(scores[~valid] == -float("inf"))
+        all_offsets.append(offsets)
+        all_scores.append(scores)
+    offsets, scores = torch.cat(all_offsets, 1), torch.cat(all_scores, 1)
+    order = torch.argsort(scores, descending=True, stable=True)[:, :topk]
+    selected = offsets.gather(1, order)
+    for row in range(3):
+        count = min(topk, int(causal_lens[row]))
+        actual = set(selected[row, :count].tolist())
+        expected = set(
+            torch.argsort(reference[row], descending=True, stable=True)[:count].tolist()
+        )
+        assert actual == expected
+
+
+@pytest.mark.parametrize("heads", [16, 32, 64])
+def test_deep_gemm_index_candidates_graph_and_empty_rows(device, heads):
+    from tokenspeed_kernel.ops.attention.dsa import dsa_index_candidates
+    from tokenspeed_kernel.ops.attention.dsa._triton.index_candidates import (
+        compact_index_pages,
+    )
+    from tokenspeed_kernel.platform import current_platform
+
+    if not current_platform().is_hopper_plus:
+        pytest.skip("DeepGEMM requires Hopper or newer")
+    table = torch.tensor(
+        [[3, -1, 1, 2], [-1, -1, -1, -1]], dtype=torch.int32, device=device
+    )
+    requests = torch.tensor([0, 1, -1, 9, 0], dtype=torch.int32, device=device)
+    lens = torch.tensor([193, 80, 15, 15, 0], dtype=torch.int32, device=device)
+    pages, positions, lengths = compact_index_pages(table, requests, lens, 64)
+    assert pages[0, :3].tolist() == [3, 1, 2]
+    assert positions[0, :3].tolist() == [0, 2, 3]
+    assert lengths.flatten().tolist() == [129, 0, 0, 0, 0]
+    q = torch.randn(5, heads, 128, dtype=torch.bfloat16, device=device)
+    weights = torch.randn(5, heads, device=device)
+    cache, _ = _pack_index_k_cache(torch.randn(256, 128, device=device), 64)
+
+    def run():
+        return dsa_index_candidates(
+            q,
+            weights,
+            cache,
+            table,
+            requests,
+            lens,
+            page_size=64,
+            topk=512,
+            softmax_scale=0.1,
+            initial_tokens=4,
+            local_tokens=8,
+            solution="deep_gemm",
+        )
+
+    offsets, scores = run()
+    selected_offsets, selected_scores = dsa_index_candidates(
+        q,
+        weights,
+        cache,
+        table,
+        requests,
+        lens,
+        page_size=64,
+        topk=512,
+        softmax_scale=0.1,
+        initial_tokens=4,
+        local_tokens=8,
+        solution=None,
+    )
+    torch.testing.assert_close(selected_offsets, offsets)
+    torch.testing.assert_close(selected_scores, scores)
+    assert set(offsets[0][offsets[0] >= 0].tolist()) == set(range(64)) | set(
+        range(128, 193)
+    )
+    assert (offsets[1:] == -1).all()
+    assert torch.isneginf(scores[1:]).all()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_offsets, captured_scores = run()
+    graph.replay()
+    torch.testing.assert_close(captured_offsets, offsets)
+    torch.testing.assert_close(captured_scores, scores)
+    lens.zero_()
+    graph.replay()
+    assert (captured_offsets == -1).all()
+    assert torch.isneginf(captured_scores).all()
+
+
+@pytest.mark.parametrize("tokens", [256, 8192])
+def test_deep_gemm_index_candidates_empty_shard_large_batch(device, tokens):
+    from tokenspeed_kernel.ops.attention.dsa import dsa_index_candidates
+    from tokenspeed_kernel.platform import current_platform
+
+    if not current_platform().is_hopper_plus:
+        pytest.skip("DeepGEMM requires Hopper or newer")
+    q = torch.zeros(tokens, 16, 128, device=device, dtype=torch.bfloat16)
+    weights = torch.ones(tokens, 16, device=device)
+    cache = torch.zeros(64, 132, device=device, dtype=torch.uint8)
+    table = torch.full((1, 1), -1, device=device, dtype=torch.int32)
+    requests = torch.zeros(tokens, device=device, dtype=torch.int32)
+    lengths = torch.ones_like(requests)
+    offsets, scores = dsa_index_candidates(
+        q,
+        weights,
+        cache,
+        table,
+        requests,
+        lengths,
+        page_size=64,
+        topk=512,
+        softmax_scale=0.1,
+        initial_tokens=4,
+        local_tokens=8,
+        solution="deep_gemm",
+    )
+    assert (offsets == -1).all()
+    assert torch.isneginf(scores).all()
+
+
+def test_gather_index_candidates_matches_tensor_reference(device):
+    from tokenspeed_kernel.ops.attention.dsa._triton.index_candidates import (
+        gather_index_candidates,
+    )
+
+    logits = torch.randn(3, 256, device=device)
+    logits[:, 130:] = -float("inf")
+    logits[:, :4] = float("inf")
+    positions = torch.tensor([[5, 1, 7, 2]] * 3, device=device, dtype=torch.int32)
+    offsets = torch.arange(-1, 256, device=device, dtype=torch.int32).repeat(3, 1)
+    logical, scores = gather_index_candidates(offsets, logits, positions, 64)
+    safe = offsets.clamp_min(0).long()
+    expected_scores = logits.gather(1, safe)
+    expected_logical = positions.gather(1, safe // 64) * 64 + safe % 64
+    valid = (offsets >= 0) & (expected_scores > -float("inf"))
+    torch.testing.assert_close(logical, torch.where(valid, expected_logical, -1).int())
+    torch.testing.assert_close(
+        scores, torch.where(valid, expected_scores, -float("inf"))
+    )
