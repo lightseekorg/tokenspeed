@@ -51,6 +51,7 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
 )
 from tokenspeed.runtime.layers.attention.kpool import KPoolRuntime
 from tokenspeed.runtime.layers.attention.registry import register_backend
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
@@ -100,6 +101,12 @@ class DSABackend(PagedAttentionBackend):
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
         self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
+        # rl-bitwise pins the sparse decode onto the batch-invariant no-split
+        # leaves; without one registered, selection fails at the first decode
+        # instead of silently serving an occupancy-split kernel.
+        self.kernel_solution: str | None = (
+            "aok" if global_server_args_dict["numerics"] == "rl-bitwise" else None
+        )
         self._prefill_page_table: torch.Tensor | None = None
         self.kpool_runtime = (
             KPoolRuntime(spec.index_kpool, spec.index_topk)
@@ -556,6 +563,7 @@ class DSABackend(PagedAttentionBackend):
             page_size=self.kernel_page_size,
             logit_cap=layer.logit_cap,
             k_scale=k_scale,
+            solution=self.kernel_solution,
         )
         # GLM's sparse-prefill path writes both the latent KV and index_k before
         # entering this method, but bypasses the backend's forward and its
@@ -705,6 +713,7 @@ class DSABackend(PagedAttentionBackend):
             kv_seq_lens=kv_seq_lens,
             logit_cap=layer.logit_cap,
             k_scale=k_scale,
+            solution=self.kernel_solution,
         )
         return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 

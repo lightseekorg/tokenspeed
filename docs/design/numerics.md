@@ -45,11 +45,23 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │   ├── force_deterministic_rsag    NCCL instead of symmetric-memory paths
 │   ├── no fused AR+norm            enable_allreduce_fusion=False (the fused
 │   │                               kernels make no bitwise claim)
-│   └── NCCL_ALGO=Ring,             the algorithm/protocol switch by message
-│       NCCL_PROTO=Simple           size changes association order
-├── sampling.deterministic          already the default: per-request Philox
-│                                   (seed=crc32(rid), offset=position) is
-│                                   run- and batch-invariant by construction
+│   ├── NCCL_ALGO=Ring,             the algorithm/protocol switch by message
+│   │   NCCL_PROTO=Simple           size changes association order
+│   └── batch_invariant_collectives all-reduce = all-gather + fixed-rank-order
+│                                   fp32 fold; a ring all-reduce chunks by
+│                                   message size, so its per-element order is
+│                                   run-stable but not batch-size-invariant
+│                                   (world_size x traffic; the NVLS multimem
+│                                   in-switch reduction is the faster future
+│                                   citizen of this slot)
+├── sampling.deterministic          per-request Philox (seed=crc32(rid),
+│                                   offset=position) is run- and
+│                                   batch-invariant by construction; greedy
+│                                   rows additionally overlay the canonical
+│                                   lowest-index argmax, because EXACT logit
+│                                   ties happen in practice and the pool
+│                                   route's top-1 filter resolves them in
+│                                   batch-shape-dependent reduction order
 ├── invariance.batch                per-row-independent reductions
 │   ├── no split-KV attention       decode kernels whose split count scales
 │   │                               with batch/SM occupancy are excluded by
@@ -102,8 +114,8 @@ hierarchy (for anyone porting a preset):
 |---|---|
 | `rl_use_aok_matmul` / `rl_use_aok_bmm` / `rl_use_aok_grouped_gemm` / `rl_use_tiles_router_gemm` | kernels.deterministic → aok leaves via the batch_invariant feature |
 | `rl_enable_aok_indexer_score` / `rl_enable_aok_indexer_topk` / `rl_use_aok_radix_topk` / `use_deterministic_topk` | same, indexer family |
-| `use_deterministic_sfa` | invariance.batch → no-split sparse attention leaves |
-| `rl_use_megatron_prefill_comm` / `force_deterministic_rsag` | collectives.deterministic (we pin NCCL; the NVLS-multimem in-switch reduction is the faster future citizen of the same slot) |
+| `use_deterministic_sfa` | invariance.batch → the aok no-split sparse decode leaf, pinned by the DSA backend's kernel solution |
+| `rl_use_megatron_prefill_comm` / `force_deterministic_rsag` | collectives.deterministic → `batch_invariant_collectives` (the ordered fold; multimem is the faster future citizen of the slot) |
 | `deepep_route_preserving_normal` / `use_torch_router_topk` | kernels.deterministic, MoE dispatch/route order |
 | `rl_use_megatron_log_softmax` / `rl_use_tp_invariant_softmax` | logprob.topology-invariant (deferred) |
 | `rl_force_cpu_for_yarn_linear_ramp_mask` / `rl_disable_scale_q_kv_lora_fusion_weight` / `longcat_disable_first_rmsnorm_fusion` | alignment.trainer (deferred; irrelevant to self-consistency) |

@@ -309,6 +309,7 @@ class ServerArgs:
     disable_overlap_schedule: bool = False
     disable_tf32: bool = False
     force_deterministic_rsag: bool = False
+    batch_invariant_collectives: bool = False
     disable_sampling_tp_sync: bool = False
     # Numerics envelope: "auto" keeps every performance default; "rl-bitwise"
     # asks for bitwise run-to-run and batch-composition invariance and folds
@@ -805,9 +806,11 @@ class ServerArgs:
                 f"--numerics must be auto or rl-bitwise, got {self.numerics!r}"
             )
         # Collectives: rank-ordered NCCL instead of the symmetric-memory and
-        # trtllm fused paths (elementwise NCCL reductions are independent of
-        # batch co-members; the fused AR+norm kernels make no bitwise claim).
+        # trtllm fused paths, and the all-reduce becomes an all-gather with a
+        # fixed-rank-order fp32 fold: NCCL's ring chunks by message size, so
+        # a plain NCCL sum is run-stable but not batch-size-invariant.
         self.force_deterministic_rsag = True
+        self.batch_invariant_collectives = True
         self.enable_allreduce_fusion = False
         self.comm_fusion_max_num_tokens = -1
         # Kernels: heuristic tactics only (autotune picks shape-dependent
@@ -2158,6 +2161,14 @@ class ServerArgs:
             action="store_true",
             help="Use NCCL collectives instead of Triton symmetric-memory "
             "all-reduce/gather/scatter.",
+        )
+        parser.add_argument(
+            "--batch-invariant-collectives",
+            action="store_true",
+            help="Run every all-reduce as an all-gather plus a fixed-rank-order "
+            "fp32 fold. NCCL sums are run-stable but chunk by message size, so "
+            "they are not batch-size-invariant; the fold is. Costs world_size "
+            "times the all-reduce traffic. Folded in by --numerics rl-bitwise.",
         )
         parser.add_argument(
             "--numerics",

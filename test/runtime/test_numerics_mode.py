@@ -42,6 +42,7 @@ class TestNumericsMode(unittest.TestCase):
         self.assertFalse(args.enable_allreduce_fusion)
         self.assertEqual(args.comm_fusion_max_num_tokens, -1)
         self.assertEqual(args.moe_backend, "aok")
+        self.assertTrue(args.batch_invariant_collectives)
 
     def test_rl_bitwise_keeps_an_explicit_moe_backend(self):
         args = ServerArgs(model="x", numerics="rl-bitwise", moe_backend="triton")
@@ -60,6 +61,26 @@ class TestNumericsMode(unittest.TestCase):
     def test_unknown_mode_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "rl-bitwise"):
             ServerArgs(model="x", numerics="bitwise")
+
+    def test_ordered_fold_matches_the_sum_and_only_depends_on_rank_order(self):
+        import torch
+
+        from tokenspeed.runtime.distributed.comm_backend.auto import ordered_fold_sum
+
+        torch.manual_seed(7)
+        parts = torch.randn(8, 5, 64, dtype=torch.float32)
+        out = torch.empty(5, 64, dtype=torch.bfloat16)
+        ordered_fold_sum(parts, out)
+        expected = parts[0].clone()
+        for rank in range(1, 8):
+            expected = expected + parts[rank]
+        self.assertTrue(torch.equal(out, expected.to(torch.bfloat16)))
+        # The same row folds to the same bits inside a larger payload: the
+        # batch-invariance claim a ring all-reduce cannot make.
+        wide = torch.cat((torch.randn(8, 300, 64), parts.narrow(1, 2, 1)), dim=1)
+        wide_out = torch.empty(301, 64, dtype=torch.bfloat16)
+        ordered_fold_sum(wide, wide_out)
+        self.assertTrue(torch.equal(wide_out[300], out[2]))
 
 
 if __name__ == "__main__":
