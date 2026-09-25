@@ -47,7 +47,15 @@ from __future__ import annotations
 from tokenspeed_kernel._triton import tl, triton
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["total", "batch_size", "tail_block_rows", "uniform_length"],
+    do_not_specialize_on_alignment=[
+        "total",
+        "batch_size",
+        "tail_block_rows",
+        "uniform_length",
+    ],
+)
 def _ngram_ids_kernel(
     ids_ptr,
     init_ptr,
@@ -68,7 +76,9 @@ def _ngram_ids_kernel(
     N: tl.constexpr,
     HPN: tl.constexpr,
     H: tl.constexpr,
-    UNIFORM_LENGTH: tl.constexpr,
+    uniform_length,
+    UNIFORM_INDEX: tl.constexpr,
+    SINGLE_REQUEST: tl.constexpr,
     WRITE_TAIL: tl.constexpr,
     SCATTER_TAIL: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
@@ -95,15 +105,23 @@ def _ngram_ids_kernel(
     mask = rows < total
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
-    if UNIFORM_LENGTH:
-        req = (rows // UNIFORM_LENGTH).to(tl.int64)
-        col = (rows % UNIFORM_LENGTH).to(tl.int64)
-        start = req * UNIFORM_LENGTH
+    if UNIFORM_INDEX:
+        if SINGLE_REQUEST:
+            req = tl.full(rows.shape, 0, tl.int64)
+            col = rows.to(tl.int64)
+            start = req
+        else:
+            req = (rows // uniform_length).to(tl.int64)
+            col = (rows % uniform_length).to(tl.int64)
+            start = req * uniform_length
         tl.store(req_ptr + rows, req, mask=mask & owner)
         tl.store(col_ptr + rows, col, mask=mask & owner)
         request_mask = (rows < batch_size) & owner
-        tl.store(lengths_ptr + rows, UNIFORM_LENGTH, mask=request_mask)
-        tl.store(starts_ptr + rows, rows * UNIFORM_LENGTH, mask=request_mask)
+        tl.store(lengths_ptr + rows, uniform_length, mask=request_mask)
+        if SINGLE_REQUEST:
+            tl.store(starts_ptr + rows, 0, mask=request_mask)
+        else:
+            tl.store(starts_ptr + rows, rows * uniform_length, mask=request_mask)
     else:
         req = tl.load(req_ptr + rows, mask=mask, other=0).to(tl.int64)
         col = tl.load(col_ptr + rows, mask=mask, other=0).to(tl.int64)

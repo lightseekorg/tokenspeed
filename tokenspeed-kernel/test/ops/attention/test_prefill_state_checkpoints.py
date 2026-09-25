@@ -176,6 +176,41 @@ def test_shared_inverse_gather_replay(token_dim, strided):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(
+    "body_rows,tail_rows,padding", [(1031, 127, 3), (1061, 137, 1), (1093, 149, 5)]
+)
+@pytest.mark.parametrize("token_dim", [0, 1])
+@pytest.mark.parametrize("strided", [False, True])
+def test_inverse_gather_variable_token_extents(
+    body_rows, tail_rows, padding, token_dim, strided
+):
+    device = _device()
+    body = torch.randn(body_rows, 3, 8, device=device, dtype=torch.bfloat16)
+    tail = torch.randn(tail_rows, 3, 8, device=device, dtype=torch.bfloat16)
+    if strided:
+        body, tail = body.transpose(-1, -2), tail.transpose(-1, -2)
+    if token_dim == 1:
+        body, tail = body.unsqueeze(0), tail.unsqueeze(0)
+    total = body_rows + tail_rows
+    extent = total + padding
+    sources = torch.full((extent,), -1, device=device, dtype=torch.int64)
+    sources[:total] = torch.randperm(total, device=device)
+    actual = merge_prefill_checkpoint_outputs(
+        body,
+        tail,
+        torch.empty(body_rows, device=device, dtype=torch.int64),
+        torch.empty(tail_rows, device=device, dtype=torch.int64),
+        token_dim,
+        extent,
+        sources,
+    )
+    expected = torch.zeros_like(actual)
+    expected.narrow(token_dim, 0, total).copy_(
+        torch.cat((body, tail), dim=token_dim).index_select(token_dim, sources[:total])
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.fixture
 def large_offset_pool():
     device = _device()

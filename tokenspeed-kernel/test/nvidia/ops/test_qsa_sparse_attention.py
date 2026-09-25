@@ -906,11 +906,24 @@ def test_qsa_sparse_attention_flashinfer_fa2_matches_reference_and_reuses_plan(
     )
 
 
-def test_flashinfer_qsa_runner_reuses_one_high_watermark_buffer(device: str) -> None:
+@pytest.mark.parametrize("width", [32, 33, 2051])
+def test_flashinfer_qsa_runner_reuses_one_high_watermark_buffer(
+    device: str, width: int, monkeypatch
+) -> None:
     platform = current_platform()
     if not platform.is_nvidia or platform.arch_version < ArchVersion(8, 0):
         pytest.skip("FlashInfer FA2 QSA requires NVIDIA Ampere or newer")
-    rows, width, head_dim = 4, 33, 64
+    import flashinfer.sparse
+
+    def fail_on_rowwise_mask_conversion(*args, **kwargs):
+        raise AssertionError("QSA planning must not convert a bool mask row by row")
+
+    monkeypatch.setattr(
+        flashinfer.sparse,
+        "convert_bsr_mask_layout",
+        fail_on_rowwise_mask_conversion,
+    )
+    rows, head_dim = 4, 64
     q = torch.randn(rows, 4, head_dim, dtype=torch.bfloat16, device=device)
     cache = torch.randn(64, 1, head_dim, dtype=torch.bfloat16, device=device)
     runner = _FlashInferQSASparseRunner(q.device)
@@ -944,6 +957,10 @@ def test_flashinfer_qsa_runner_reuses_one_high_watermark_buffer(device: str) -> 
         metadata_capacity_rows=None,
     )
     assert two.indices.data_ptr() == fixed_buffer_ptr
+    torch.testing.assert_close(
+        four.wrapper._mask_indptr_buf,
+        torch.arange(rows + 1, device=device, dtype=torch.int32) * ((width + 7) // 8),
+    )
     assert four.wrapper._int_workspace_buffer.numel() < 8 * 1024 * 1024
     assert four.wrapper._pin_memory_int_workspace_buffer.numel() == 0
 

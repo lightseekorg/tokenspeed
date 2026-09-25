@@ -73,6 +73,23 @@ def _torch_l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     ).to(x.dtype)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GDN L2 norm requires CUDA")
+@pytest.mark.parametrize("rows", [1476, 1499, 1620, 2051])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_gdn_l2norm_fwd_varying_prefill_rows(rows: int, dtype: torch.dtype) -> None:
+    from tokenspeed_kernel.ops.attention.gdn._triton.l2norm import l2norm_fwd
+
+    x = torch.randn((rows, 4, 128), device="cuda", dtype=dtype)
+    actual = l2norm_fwd(x)
+    reference = x.float() * torch.rsqrt(
+        x.float().square().sum(dim=-1, keepdim=True) + 1e-6
+    )
+    tolerance = 5e-3 if dtype is torch.bfloat16 else 1e-5
+    torch.testing.assert_close(
+        actual.float(), reference, atol=tolerance, rtol=tolerance
+    )
+
+
 def _torch_gdn_chunk_prefill_reference(
     q: torch.Tensor,
     k: torch.Tensor,
