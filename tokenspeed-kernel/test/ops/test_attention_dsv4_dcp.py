@@ -40,7 +40,7 @@ from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
 from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_fused_sparse_compress_cache_insert,
 )
-from tokenspeed_kernel.ops.kvcache.triton_virtual_blocks import virtual_slots_to_local
+from tokenspeed_kernel.ops.kvcache.triton_cache_placement import virtual_slots_to_local
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 
@@ -588,3 +588,107 @@ def test_masked_compress_stores_leave_every_other_byte_untouched(compress_ratio)
     # Masked tokens park on slot 0; the null page must stay untouched too.
     assert not changed_pages[0]
     assert not changed_pages[tokens + 1]
+
+
+@requires_cuda
+@pytest.mark.parametrize("degree", [1, 2, 4, 8])
+def test_mxfp4_sharded_index_candidates(degree):
+    from tokenspeed_kernel.ops.attention.dsv4.triton import triton_dsv4_index_candidates
+
+    torch.manual_seed(943)
+    device = "cuda"
+    pages, page_size, heads, topk = 10, 64, 32, 512
+    table = torch.tensor(
+        [[5, 2, 8, 1, 6, 3, 4, 7, 9]], device=device, dtype=torch.int32
+    )
+    q = torch.randint(0, 256, (3, heads, 64), device=device, dtype=torch.uint8)
+    scales = torch.full((3, heads), 0x7F7F7F7F, device=device, dtype=torch.int32)
+    cache = torch.randint(
+        0, 256, (pages, page_size * 68), device=device, dtype=torch.uint8
+    )
+    cache[:, page_size * 64 :] = 127
+    weights = torch.randn(3, heads, device=device)
+    lengths = torch.tensor([0, 37, 573], device=device, dtype=torch.int32)
+    requests = torch.zeros(3, device=device, dtype=torch.int32)
+
+    def unpack(x):
+        code = torch.stack((x & 15, x >> 4), -1).flatten(-2).long()
+        lut = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=device)
+        return lut[code & 7] * torch.where(code < 8, 1.0, -1.0)
+
+    query = unpack(q)
+    keys = unpack(cache[:, : page_size * 64].reshape(pages, page_size, 64))[
+        table[0].long()
+    ].reshape(-1, 128)
+    reference = (
+        torch.einsum("thd,sd->ths", query, keys).relu() * weights.unsqueeze(-1)
+    ).sum(1)
+    reference.masked_fill_(
+        torch.arange(keys.shape[0], device=device) >= lengths[:, None], -float("inf")
+    )
+    candidates, values = [], []
+    for rank in range(degree):
+        local = cache[[0] + list(range(rank + 1, pages, degree))].contiguous()
+        local_table = torch.where(
+            (table - 1) % degree == rank, (table - 1) // degree + 1, -1
+        )
+        indices, scores = triton_dsv4_index_candidates(
+            (q, scales),
+            weights,
+            local,
+            local_table,
+            requests,
+            lengths,
+            page_size=page_size,
+            topk=topk,
+        )
+        valid = indices >= 0
+        torch.testing.assert_close(
+            scores[valid],
+            reference.gather(1, indices.clamp_min(0).long())[valid],
+            rtol=2e-5,
+            atol=2e-3,
+        )
+        assert (scores[~valid] == -float("inf")).all()
+        candidates.append(indices)
+        values.append(scores)
+        # Refresh lengths in place: captured kernels must not retain old validity.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured_indices, captured_scores = triton_dsv4_index_candidates(
+                (q, scales),
+                weights,
+                local,
+                local_table,
+                requests,
+                lengths,
+                page_size=page_size,
+                topk=topk,
+            )
+        graph.replay()
+        torch.testing.assert_close(captured_indices, indices)
+        torch.testing.assert_close(captured_scores, scores)
+        lengths[0] = 19
+        graph.replay()
+        updated_indices, updated_scores = triton_dsv4_index_candidates(
+            (q, scales),
+            weights,
+            local,
+            local_table,
+            requests,
+            lengths,
+            page_size=page_size,
+            topk=topk,
+        )
+        torch.testing.assert_close(captured_indices, updated_indices)
+        torch.testing.assert_close(captured_scores, updated_scores)
+        lengths[0] = 0
+    indices, scores = torch.cat(candidates, 1), torch.cat(values, 1)
+    selected = indices.gather(
+        1, torch.argsort(scores, descending=True, stable=True)[:, :topk]
+    )
+    for row in (1, 2):
+        count = min(topk, int(lengths[row]))
+        assert set(selected[row, :count].tolist()) == set(
+            torch.argsort(reference[row], descending=True, stable=True)[:count].tolist()
+        )

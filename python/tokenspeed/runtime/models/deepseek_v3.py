@@ -87,6 +87,8 @@ from tokenspeed.runtime.execution.forward_step import (
     get_is_cuda_graph_phase,
 )
 from tokenspeed.runtime.layers.activation import SiluAndMul
+from tokenspeed.runtime.layers.attention.dcp.cache import gather_mla_history
+from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -917,6 +919,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                     q_nope=q_nope_absorbed,
                 )
                 if cache_num_tokens == query_tokens
+                and ctx.attn_backend.cache_placement(self.attn_mqa) is None
                 else None
             )
             if fused_kv_arg is not None:
@@ -960,11 +963,15 @@ class DeepseekV3AttentionMLA(nn.Module):
             )
 
             # Write FP8 KV cache (single write, no double-write)
+            local_slots, write_mask = resolve_cache_slots(
+                cache_out_cache_loc, ctx.attn_backend.cache_placement(self.attn_mqa)
+            )
             ctx.token_to_kv_pool.set_mla_kv_buffer(
                 self.attn_mqa,
-                cache_out_cache_loc,
+                local_slots,
                 cache_k_nope=key_fp8[:cache_num_tokens, ..., : self.kv_lora_rank],
                 cache_k_rope=key_fp8[:cache_num_tokens, ..., self.kv_lora_rank :],
+                write_mask=write_mask,
             )
             return query_fp8, key_fp8
 
@@ -981,6 +988,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 )
                 if self.attention_backend in self._MLA_KERNEL_BACKENDS
                 and cache_num_tokens == query_tokens
+                and ctx.attn_backend.cache_placement(self.attn_mqa) is None
                 else None
             )
             if fused_mla_kv_arg is not None:
@@ -1015,11 +1023,15 @@ class DeepseekV3AttentionMLA(nn.Module):
         # backend never has to. This unifies the FP8 fused path (written above)
         # and the BF16 path into a single ownership model.
         if self.attention_backend in self._MLA_KERNEL_BACKENDS and K is not None:
+            local_slots, write_mask = resolve_cache_slots(
+                cache_out_cache_loc, ctx.attn_backend.cache_placement(self.attn_mqa)
+            )
             ctx.token_to_kv_pool.set_mla_kv_buffer(
                 self.attn_mqa,
-                cache_out_cache_loc,
+                local_slots,
                 cache_k_nope=K[:cache_num_tokens, ..., : self.kv_lora_rank],
                 cache_k_rope=K[:cache_num_tokens, ..., self.kv_lora_rank :],
+                write_mask=write_mask,
             )
 
         return Q, K
@@ -1046,11 +1058,15 @@ class DeepseekV3AttentionMLA(nn.Module):
             k_for_attn = K
             v_for_attn = K[..., : self.kv_lora_rank]
             if K is not None:
+                local_slots, write_mask = resolve_cache_slots(
+                    out_cache_loc, ctx.attn_backend.cache_placement(self.attn_mqa)
+                )
                 ctx.token_to_kv_pool.set_mla_kv_buffer(
                     self.attn_mqa,
-                    out_cache_loc,
+                    local_slots,
                     K[..., : self.kv_lora_rank],
                     K[..., self.kv_lora_rank :],
+                    write_mask=write_mask,
                 )
 
         use_projected_value_decode = (
@@ -1155,11 +1171,15 @@ class DeepseekV3AttentionMLA(nn.Module):
 
             # The cache scatter converts the compressed BF16 latent directly to FP8.
             k_pe_for_cache = k_fp8[:, 0:1, self.qk_nope_head_dim :]
+            local_slots, write_mask = resolve_cache_slots(
+                out_cache_loc, ctx.attn_backend.cache_placement(self.attn_mha)
+            )
             ctx.token_to_kv_pool.set_mla_kv_buffer(
                 self.attn_mha,
-                out_cache_loc,
+                local_slots,
                 cache_k_nope=kv_a.unsqueeze(1),
                 cache_k_rope=k_pe_for_cache,
+                write_mask=write_mask,
             )
 
             return q_fp8, k_fp8, v_fp8
@@ -1177,11 +1197,15 @@ class DeepseekV3AttentionMLA(nn.Module):
         k[..., : self.qk_nope_head_dim] = k_nope
         k[..., self.qk_nope_head_dim :] = k_pe
 
+        local_slots, write_mask = resolve_cache_slots(
+            out_cache_loc, ctx.attn_backend.cache_placement(self.attn_mha)
+        )
         ctx.token_to_kv_pool.set_mla_kv_buffer(
             self.attn_mha,
-            out_cache_loc,
+            local_slots,
             cache_k_nope=kv_a.unsqueeze(1),
             cache_k_rope=k_pe,
+            write_mask=write_mask,
         )
 
         return q, k, v
@@ -1196,7 +1220,6 @@ class DeepseekV3AttentionMLA(nn.Module):
     ) -> torch.Tensor:
         attn_backend = ctx.attn_backend
         chunk_meta = attn_backend.chunked_prefill_metadata
-        token_to_kv_pool = ctx.token_to_kv_pool
 
         # Scale compensation for FP8 prefill: bmm1_scale = k_scale * softmax_scale
         scaling = self.attn_mha.scaling
@@ -1236,9 +1259,19 @@ class DeepseekV3AttentionMLA(nn.Module):
         for loop_idx in range(chunk_meta.chunked_loop_num):
             chunk_kv_indices = chunk_meta.chunk_kv_indices_list[loop_idx]
 
-            kv_a_normed, k_pe = token_to_kv_pool.get_mla_kv_buffer(
-                self.attn_mha, chunk_kv_indices, read_dtype
-            )
+            placement = attn_backend.cache_placement(self.attn_mha)
+            if placement is None:
+                kv_a_normed, k_pe = ctx.token_to_kv_pool.get_mla_kv_buffer(
+                    self.attn_mha, chunk_kv_indices, read_dtype
+                )
+            else:
+                kv_a_normed, k_pe = gather_mla_history(
+                    ctx.token_to_kv_pool,
+                    self.attn_mha,
+                    chunk_kv_indices,
+                    dst_dtype=read_dtype,
+                    placement=placement,
+                )
 
             kv_a_normed = kv_a_normed.squeeze(1)
             kv = self.kv_b_proj(kv_a_normed)[0]

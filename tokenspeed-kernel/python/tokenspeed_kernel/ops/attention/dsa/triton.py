@@ -36,6 +36,8 @@ def _dsa_packed_kv_kernel(
     topk_indices,
     topk_lens,
     out,
+    lse,
+    RETURN_LSE: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     kv_lora_rank: tl.constexpr,
@@ -176,6 +178,12 @@ def _dsa_packed_kv_kernel(
     result = tl.where(denom > 0.0, result, 0.0)
     out_base = (token * num_heads + head) * kv_lora_rank
     tl.store(out + out_base + v_offsets, result, mask=v_mask)
+    if RETURN_LSE:
+        if v_block == 0:
+            tl.store(
+                lse + token * num_heads + head,
+                tl.where(denom > 0.0, max_score + tl.log(denom), -float("inf")),
+            )
 
 
 @triton.jit
@@ -185,6 +193,8 @@ def _dsa_dense_kv_kernel(
     topk_indices,
     topk_lens,
     out,
+    lse,
+    RETURN_LSE: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     kv_lora_rank: tl.constexpr,
@@ -296,6 +306,12 @@ def _dsa_dense_kv_kernel(
     result = tl.where(denom > 0.0, result, 0.0)
     out_base = (token * num_heads + head) * kv_lora_rank
     tl.store(out + out_base + v_offsets, result, mask=v_mask)
+    if RETURN_LSE:
+        if v_block == 0:
+            tl.store(
+                lse + token * num_heads + head,
+                tl.where(denom > 0.0, max_score + tl.log(denom), -float("inf")),
+            )
 
 
 def _run_packed_kv(
@@ -307,12 +323,18 @@ def _run_packed_kv(
     softmax_scale: float,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
-) -> torch.Tensor:
+    return_lse: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     row_bytes = int(packed_kv.shape[1])
     out = torch.empty(
         (q.shape[0], q.shape[1], kv_lora_rank),
         dtype=torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype,
         device=q.device,
+    )
+    lse = (
+        torch.empty(q.shape[:2], dtype=torch.float32, device=q.device)
+        if return_lse
+        else None
     )
     grid = (q.shape[0], q.shape[1], triton.cdiv(kv_lora_rank, 64))
     _dsa_packed_kv_kernel[grid](
@@ -323,6 +345,8 @@ def _run_packed_kv(
         topk_indices,
         topk_lens,
         out,
+        lse,
+        return_lse,
         q.shape[1],
         q.shape[2],
         kv_lora_rank,
@@ -336,7 +360,7 @@ def _run_packed_kv(
         num_warps=4,
         num_stages=1,
     )
-    return out
+    return out, lse
 
 
 def _run_dense_kv(
@@ -348,12 +372,18 @@ def _run_dense_kv(
     softmax_scale: float,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
-) -> torch.Tensor:
+    return_lse: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     kv_dim = int(kv_lora_rank) + int(qk_rope_head_dim)
     out = torch.empty(
         (q.shape[0], q.shape[1], kv_lora_rank),
         dtype=torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype,
         device=q.device,
+    )
+    lse = (
+        torch.empty(q.shape[:2], dtype=torch.float32, device=q.device)
+        if return_lse
+        else None
     )
     grid = (q.shape[0], q.shape[1], triton.cdiv(kv_lora_rank, 64))
     _dsa_dense_kv_kernel[grid](
@@ -362,6 +392,8 @@ def _run_dense_kv(
         topk_indices,
         topk_lens,
         out,
+        lse,
+        return_lse,
         q.shape[1],
         q.shape[2],
         kv_lora_rank,
@@ -375,7 +407,7 @@ def _run_dense_kv(
         num_warps=4,
         num_stages=1,
     )
-    return out
+    return out, lse
 
 
 def _flatten_packed_kv_cache(packed_kv_cache: torch.Tensor) -> torch.Tensor:
@@ -412,14 +444,21 @@ def _run_dsa(
     softmax_scale: float,
     k_scale: float,
     out: torch.Tensor | None,
-) -> torch.Tensor:
+    return_lse: bool,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     q = _flatten_query(q).contiguous()
     topk_slots = topk_slots.contiguous()
-    topk_lens = topk_lens.contiguous()
+    topk_lens = (
+        torch.full(
+            (q.shape[0],), topk_slots.shape[-1], dtype=torch.int32, device=q.device
+        )
+        if topk_lens is None
+        else topk_lens.contiguous()
+    )
     softmax_scale = float(softmax_scale) * float(k_scale)
 
     if packed_kv_cache is not None:
-        result = _run_packed_kv(
+        result, lse = _run_packed_kv(
             q,
             _flatten_packed_kv_cache(packed_kv_cache).contiguous(),
             topk_slots,
@@ -427,9 +466,10 @@ def _run_dsa(
             softmax_scale=softmax_scale,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
+            return_lse=return_lse,
         )
     else:
-        result = _run_dense_kv(
+        result, lse = _run_dense_kv(
             q,
             _flatten_dense_kv_cache(kv_cache).contiguous(),
             topk_slots,
@@ -437,13 +477,13 @@ def _run_dsa(
             softmax_scale=softmax_scale,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
+            return_lse=return_lse,
         )
 
-    if out is None:
-        return result
-    out_view = out.reshape_as(result)
-    out_view.copy_(result)
-    return out
+    if out is not None:
+        out.reshape_as(result).copy_(result)
+        result = out
+    return (result, lse) if return_lse else result
 
 
 @register_kernel(
@@ -467,9 +507,9 @@ def _run_dsa(
         "topk": frozenset({512, 1024, 2048, 2049, 2050, 2051}),
         "has_kv_cache": frozenset({False, True}),
         "has_sparse_kv_cache": frozenset({False, True}),
-        "logit_cap": frozenset({False}),
-        "return_lse": frozenset({False}),
         "topk_layout": frozenset({"global_slots"}),
+        "logit_cap": frozenset({False}),
+        "return_lse": frozenset({False, True}),
     },
     priority=Priority.PORTABLE,
 )
@@ -492,7 +532,7 @@ def triton_dsa_decode(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
     enable_pdl: bool = False,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     del kv_seq_lens
     return _run_dsa(
         q=q,
@@ -505,6 +545,7 @@ def triton_dsa_decode(
         softmax_scale=softmax_scale,
         k_scale=k_scale,
         out=out,
+        return_lse=return_lse,
     )
 
 
@@ -529,9 +570,9 @@ def triton_dsa_decode(
         "topk": frozenset({512, 1024, 2048, 2049, 2050, 2051}),
         "has_kv_cache": frozenset({False, True}),
         "has_sparse_kv_cache": frozenset({False, True}),
-        "logit_cap": frozenset({False}),
-        "return_lse": frozenset({False}),
         "topk_layout": frozenset({"global_slots"}),
+        "logit_cap": frozenset({False}),
+        "return_lse": frozenset({False, True}),
     },
     priority=Priority.PORTABLE,
 )
@@ -554,7 +595,7 @@ def triton_dsa_prefill(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
     enable_pdl: bool = False,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     del kv_seq_lens
     return _run_dsa(
         q=q,
@@ -567,6 +608,7 @@ def triton_dsa_prefill(
         softmax_scale=softmax_scale,
         k_scale=k_scale,
         out=out,
+        return_lse=return_lse,
     )
 
 
@@ -717,4 +759,137 @@ def triton_dsa_prefill_topk_fp8(
         max_logits_bytes=max_logits_bytes,
         out=out,
         lens_out=lens_out,
+    )
+
+
+def triton_dsa_index_candidates(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    local_page_table: torch.Tensor,
+    query_requests: torch.Tensor,
+    causal_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    initial_tokens: int,
+    local_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score owned Index-K pages and return (logical offsets, FP32 scores).
+
+    Page-table positions retain request order; foreign/null pages are -1.
+    Query requests and causal lengths have one entry per query, so the same
+    contract covers prefill and decode. Invalid candidates have offset -1 and
+    score -inf. Forced initial/tail windows use global request positions.
+    The caller bounds the query tile to cap logits scratch space.
+    """
+    from tokenspeed_kernel.ops.attention.dsa._triton.index_candidates import (
+        candidate_topk_offsets,
+    )
+    from tokenspeed_kernel.ops.attention.dsa._triton.topk import (
+        _check_packed_fp8_inputs,
+        _dsa_decode_logits_fp8_kernel,
+    )
+
+    if initial_tokens < 0 or local_tokens < 0 or initial_tokens + local_tokens > topk:
+        raise ValueError("Forced windows must fit in topk")
+    if query_requests.shape != (q.shape[0],) or causal_lens.shape != (q.shape[0],):
+        raise ValueError("Index candidate rows must match queries")
+    if local_page_table.shape[0] == 0 or local_page_table.shape[1] == 0:
+        raise ValueError("Index candidates require a nonempty page table")
+    valid_requests = (query_requests >= 0) & (
+        query_requests < local_page_table.shape[0]
+    )
+    query_requests = query_requests.clamp(0, local_page_table.shape[0] - 1)
+    causal_lens = torch.where(valid_requests, causal_lens, 0)
+    q, weights = q.contiguous(), weights.float().contiguous()
+    row_bytes, page_stride = _check_packed_fp8_inputs(
+        q, index_k_cache, weights, page_size
+    )
+    width = local_page_table.shape[1] * page_size
+    logits = torch.empty((q.shape[0], width), device=q.device, dtype=torch.float32)
+    _dsa_decode_logits_fp8_kernel[(q.shape[0], triton.cdiv(width, 64))](
+        q,
+        index_k_cache.view(torch.float8_e4m3fn),
+        index_k_cache.view(torch.float32),
+        weights,
+        causal_lens,
+        local_page_table,
+        logits,
+        local_page_table.stride(0),
+        logits.stride(0),
+        query_requests,
+        EXPLICIT_ROWS=True,
+        INITIAL_TOKENS=initial_tokens,
+        LOCAL_TOKENS=local_tokens,
+        page_size=page_size,
+        row_bytes=row_bytes,
+        page_stride_bytes=page_stride,
+        max_seq_len=width,
+        num_heads=q.shape[1],
+        head_dim=q.shape[2],
+        num_groups=q.shape[2] // 128,
+        softmax_scale=softmax_scale,
+        q_len_per_req=1,
+        BLOCK_N=64,
+        BLOCK_D=64,
+        num_warps=4,
+        num_stages=1,
+    )
+    offsets = candidate_topk_offsets(logits, topk).to(torch.int32)
+    scores = logits.gather(1, offsets.clamp_min(0).long())
+    valid = (offsets >= 0) & (scores > -float("inf"))
+    return torch.where(valid, offsets, -1), torch.where(valid, scores, -float("inf"))
+
+
+@register_kernel(
+    "attention",
+    "dsa_index_candidates",
+    name="triton_dsa_sharded_index_candidates",
+    solution="triton",
+    signatures=_TOPK_SIGNATURES,
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    priority=Priority.PORTABLE,
+)
+def triton_dsa_sharded_index_candidates(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    local_page_table: torch.Tensor,
+    query_requests: torch.Tensor,
+    causal_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    initial_tokens: int,
+    local_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+    from tokenspeed_kernel.platform import current_platform
+
+    if current_platform().is_nvidia:
+        quantized, scale = quantize_fp8_with_scale(
+            q.reshape(-1, q.shape[-1]),
+            granularity="token_group",
+            group_size=128,
+            scale_encoding="float32",
+        )
+        scale = scale[: q.shape[0] * q.shape[1]].contiguous()
+        weights = combine_topk_weights(weights, scale, softmax_scale)
+        q = quantized.view_as(q).to(torch.bfloat16)
+        softmax_scale = 1.0
+    return triton_dsa_index_candidates(
+        q,
+        weights,
+        index_k_cache,
+        local_page_table,
+        query_requests,
+        causal_lens,
+        page_size=page_size,
+        topk=topk,
+        softmax_scale=softmax_scale,
+        initial_tokens=initial_tokens,
+        local_tokens=local_tokens,
     )

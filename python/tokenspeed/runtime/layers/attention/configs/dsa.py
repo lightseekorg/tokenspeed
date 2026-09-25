@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 import torch
 from tokenspeed_kernel.platform import current_platform
@@ -47,6 +48,7 @@ def dsa_index_k_row_bytes(index_head_dim: int) -> int:
 
 @dataclass(kw_only=True)
 class DSAConfig(MLAConfig):
+    is_dsa: ClassVar[bool] = True
     index_topk: int
     index_head_dim: int
     index_n_heads: int
