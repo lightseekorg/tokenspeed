@@ -330,7 +330,6 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
             match.probe.host.num_common_tokens = host_prefix_cap;
         }
         match.probe.host.num_common_tokens -= match.probe.host.num_common_tokens % prefix_granularity;
-        host_prefix_cap = match.probe.host.num_common_tokens;
         hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
         promotion_boundary_tokens = coordinator_.PromotionBoundaryTokens(match.probe);
         _assert(promotion_boundary_tokens == 0 ||
