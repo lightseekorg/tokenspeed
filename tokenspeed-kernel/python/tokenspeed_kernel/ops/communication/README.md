@@ -66,14 +66,16 @@ those rows. Shifted overlaps, history/weight aliases with collective storage,
 and a sharded MoE residual aliasing the result buffer are rejected. The MoE
 receives `prefix_is_sharded` explicitly: it consumes local residual rows directly,
 or gathers them before a fallback requiring replicated rows. A declined
-attention call clones the symmetric projection before an in-place collective can
-turn it into a retained residual.
+attention mix uses ordinary producer-direct Iris reduction, which preserves the
+symmetric projection and returns owned storage for the retained residual.
 
 All calls sharing the state must be ordered on one stream. Side-stream consumers
 of the borrowed activation must join before the next result overwrite. The
 runtime's MoE producer fork joins before its tail runs. Graph replay advances
 device-side epochs, including signed and unsigned wraparound, rather than
-capturing a host counter.
+capturing a host counter. Ordinary Iris reductions also poll the actual peer
+flags and compare signed 32-bit differences, so a zero or negative wrapped
+epoch cannot skip a producer and a peer in the next stage can be recognized.
 
 The reduce-scatter entry uses system-scope release/acquire flags. Acquire lowering
 provides the workgroup rendezvous, so it needs no additional barrier. The final
@@ -95,6 +97,7 @@ On an idle eight-GPU CDNA4 host, run:
 ```sh
 python -m pytest -q tokenspeed-kernel/test/amd/ops/test_iris_attention_prefill.py \
   tokenspeed-kernel/test/amd/ops/test_iris_communication.py::test_iris_all_reduce_correctness_world8 \
+  tokenspeed-kernel/test/amd/ops/test_iris_communication.py::test_iris_all_reduce_epoch_rollover \
   tokenspeed-kernel/test/amd/ops/test_iris_moe_tail.py \
   tokenspeed-kernel/test/amd/ops/test_kimi3_prefill_gluon_amd.py
 ```
@@ -102,5 +105,7 @@ python -m pytest -q tokenspeed-kernel/test/amd/ops/test_iris_attention_prefill.p
 The tests cover tail and maximum sizes, history depths, an independent FP64
 mixing oracle, exact Iris residual reduction, rejected aliases, borrowed-buffer
 lifetime, collective interleaving, a real MoE tail, and capture/replay across
-epoch rollover. Runtime tests exercise automatic eligibility and ownership-safe
-fallbacks through the Kimi decoder and communication interfaces.
+epoch rollover. Ordinary one-stage and two-stage reductions also delay a
+producer across entry and intermediate-stage wraps. Runtime tests exercise
+automatic eligibility and ownership-safe fallbacks through the Kimi decoder
+and communication interfaces.

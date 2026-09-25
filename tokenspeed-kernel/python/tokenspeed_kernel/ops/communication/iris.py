@@ -1900,8 +1900,16 @@ def _iris_sync_rank_epoch(
             gl.pointer_type(gl.int32),
         )
         wait_flags += block_id * WORLD_SIZE + peer_ids
-    seen = gl.full([WORLD_SIZE], 0, gl.int32, layout=ready_layout)
-    while gl.min(gl.where(peer_mask, seen, epoch), axis=0) < epoch:
+    seen = gl.load(
+        wait_flags,
+        mask=peer_mask,
+        other=epoch,
+        cache_modifier=".cv",
+        volatile=True,
+    )
+    # Compare modulo 32 bits, including when a peer has passed the wrap before
+    # this rank. A zero or negative epoch still requires observing every peer.
+    while gl.min((seen - epoch).to(gl.int32), axis=0) < 0:
         seen = gl.load(
             wait_flags,
             mask=peer_mask,
