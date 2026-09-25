@@ -225,13 +225,29 @@ def attn_res_rmsnorm_gfx1250(
         raise ValueError("gfx1250 AttnRes requires a contiguous hidden dimension")
 
     output = torch.empty_like(layer_residual)
-    if tokens < 256 and num_valid_blocks >= 1:
-        num_warps = 8
-        waves_per_eu = 2
-    else:
-        num_warps = 4
-        waves_per_eu = 1
+    # 8 warps and waves_per_eu=2 is the measured launch under 256 tokens.
+    # Larger grids stay at 4 warps and leave waves_per_eu unset.
+    eight_warps = tokens < 256 and num_valid_blocks >= 1
+    num_warps = 8 if eight_warps else 4
     delta_tensor = layer_residual if delta is None else delta
+    launch_kwargs = {
+        "stride_layer_t": layer_residual.stride(0),
+        "stride_delta_t": delta_tensor.stride(0),
+        "stride_block_t": block_residual.stride(0),
+        "stride_block_n": block_residual.stride(1),
+        "stride_output_t": output.stride(0),
+        "H": hidden,
+        "N": num_valid_blocks + 1,
+        "BLOCK_WRITE_IDX": 0 if block_write_idx < 0 else block_write_idx,
+        "HAS_DELTA": delta is not None,
+        "WRITE_BLOCK": block_write_idx >= 0,
+        "SCORE_EPS": score_eps,
+        "OUTPUT_EPS": output_eps,
+        "NUM_WARPS": num_warps,
+        "num_warps": num_warps,
+    }
+    if eight_warps:
+        launch_kwargs["waves_per_eu"] = 2
     gluon_attn_res_fwd_gfx1250[(tokens,)](
         layer_residual,
         delta_tensor,
@@ -240,21 +256,7 @@ def attn_res_rmsnorm_gfx1250(
         score_rms_weight,
         output_rms_weight,
         output,
-        stride_layer_t=layer_residual.stride(0),
-        stride_delta_t=delta_tensor.stride(0),
-        stride_block_t=block_residual.stride(0),
-        stride_block_n=block_residual.stride(1),
-        stride_output_t=output.stride(0),
-        H=hidden,
-        N=num_valid_blocks + 1,
-        BLOCK_WRITE_IDX=0 if block_write_idx < 0 else block_write_idx,
-        HAS_DELTA=delta is not None,
-        WRITE_BLOCK=block_write_idx >= 0,
-        SCORE_EPS=score_eps,
-        OUTPUT_EPS=output_eps,
-        NUM_WARPS=num_warps,
-        num_warps=num_warps,
-        waves_per_eu=waves_per_eu,
+        **launch_kwargs,
     )
     return output
 
