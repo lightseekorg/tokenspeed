@@ -621,7 +621,6 @@ def _scatter_checkpoint_output_kernel(
 
 @triton.jit(
     do_not_specialize=["body_tokens", "tail_tokens", "num_tokens"],
-    do_not_specialize_on_alignment=["body_tokens", "tail_tokens", "num_tokens"],
 )
 def _gather_checkpoint_output_kernel(
     body,
