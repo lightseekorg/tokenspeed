@@ -404,14 +404,16 @@ def _dsa_decode_logits_fp8_kernel(
 ):
     token = tl.program_id(0)
     block_id = tl.program_id(1)
-    req = token // q_len_per_req
-    if EXPLICIT_ROWS:
-        req = tl.load(query_requests + token)
     offsets = block_id * BLOCK_N + tl.arange(0, BLOCK_N)
-    base = tl.load(seq_lens + req).to(tl.int32)
-    seq_len = base - (q_len_per_req - 1) + (token % q_len_per_req)
     if EXPLICIT_ROWS:
+        # seq_lens is per token here; indexing it by req would read past the
+        # buffer whenever a request ID exceeds the query-tile length.
+        req = tl.load(query_requests + token)
         seq_len = tl.load(seq_lens + token)
+    else:
+        req = token // q_len_per_req
+        base = tl.load(seq_lens + req).to(tl.int32)
+        seq_len = base - (q_len_per_req - 1) + (token % q_len_per_req)
     seq_len = tl.maximum(seq_len, 0)
     valid = offsets < seq_len
     block_idx = offsets // page_size

@@ -98,6 +98,26 @@ def test_flashmla_dcp_rejects_unsupported_execution(override, message):
         replace(config, **override)
 
 
+def test_flashmla_absorbed_extend_refuses_sharded_cache():
+    # The prefill wrapper plans on the virtual page table, so attending the
+    # local shard through it would silently mix wrong pages; the backend must
+    # refuse instead of relying on every model to route around it.
+    flashmla = pytest.importorskip(
+        "tokenspeed.runtime.layers.attention.backends.paged.flashmla"
+    )
+    leaf = flashmla.FlashMLABackend.__new__(flashmla.FlashMLABackend)
+    leaf.dcp_group = (0, 1)
+    with pytest.raises(RuntimeError, match="absorbed extend"):
+        leaf._forward_absorbed_extend(
+            torch.empty(0),
+            torch.empty(0),
+            None,
+            layer=None,
+            out_cache_loc=None,
+            token_to_kv_pool=None,
+        )
+
+
 def test_kimi_capacity_shards_only_mla():
     from test.runtime.conftest import kimi_recipe
 

@@ -726,6 +726,14 @@ class FlashMLABackend(PagedAttentionBackend):
         # flashinfer prefill_wrapper.run() requires q_nope / q_pe split, so
         # slice views here (free) before handing off to the kernel.
         assert k is not None
+        if len(self.dcp_group) > 1:
+            # The prefill wrapper is planned on the router's virtual page
+            # table while the local pool holds only this rank's shard, and
+            # nothing merges the other shards' history. Under DCP the model
+            # reconstructs history through the chunked prefill path.
+            raise RuntimeError(
+                "FlashMLA's absorbed extend cannot attend a DCP-sharded cache"
+            )
 
         if save_kv_cache:
             local_slots, write_mask = resolve_cache_slots(
@@ -825,7 +833,7 @@ class FlashMLABackend(PagedAttentionBackend):
             causal=True,
         )
         if len(self.dcp_group) > 1:
-            output, lse = normalize_dcp_partials(
+            output, local_lse = normalize_dcp_partials(
                 output.squeeze(1),
                 lse.squeeze(-1),
                 local_lengths,
@@ -833,11 +841,15 @@ class FlashMLABackend(PagedAttentionBackend):
             )
             output = combine_attention_partials(
                 output,
-                lse,
+                local_lse,
                 group=self.dcp_group,
                 rank=self.dcp_rank,
                 sink=None,
             ).unsqueeze(1)
+            # The combine reduce-scatters weighted partials; no LSE for the
+            # merged TP-local heads survives it, and the pre-merge local LSE
+            # would describe a different tensor than the returned output.
+            lse = None
         return output, lse
 
 

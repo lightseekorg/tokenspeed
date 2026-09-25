@@ -174,7 +174,9 @@ def refresh_dcp_page_table_metadata(
             or local.device != page_table.device
             or not local.is_contiguous()
         ):
-            previous = None
+            # Reallocating here would hand back fresh buffers while a captured
+            # graph keeps replaying kernels against the previous ones.
+            raise ValueError("DCP metadata buffers do not match the refreshed table")
 
     if previous is None:
         # Replay setup may run outside the warmup inference context.
