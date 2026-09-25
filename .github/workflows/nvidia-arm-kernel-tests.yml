@@ -6,9 +6,10 @@ on:
     paths:
       - ".github/workflows/nvidia-arm-kernel-tests.yml"
       - "test/ci/ut/ut-tokenspeed-kernel-nvidia-arm.yaml"
-      - "tokenspeed-kernel/test/nvidia/thirdparty/test_deep_gemm.py"
-      - "tokenspeed-kernel/test/ops/test_attention_dsv4_dcp.py"
-      - "tokenspeed-kernel/test/conftest.py"
+      - "test/ci_system/kernel_gpu_worker.py"
+      - "test/ci_system/run_kernel_gpu_ut.sh"
+      - "tokenspeed-kernel/test/**"
+      - "!tokenspeed-kernel/test/amd/**"
       - "tokenspeed-kernel/python/**"
       - "tokenspeed-mla/**"
   pull_request:
@@ -17,9 +18,10 @@ on:
     paths:
       - ".github/workflows/nvidia-arm-kernel-tests.yml"
       - "test/ci/ut/ut-tokenspeed-kernel-nvidia-arm.yaml"
-      - "tokenspeed-kernel/test/nvidia/thirdparty/test_deep_gemm.py"
-      - "tokenspeed-kernel/test/ops/test_attention_dsv4_dcp.py"
-      - "tokenspeed-kernel/test/conftest.py"
+      - "test/ci_system/kernel_gpu_worker.py"
+      - "test/ci_system/run_kernel_gpu_ut.sh"
+      - "tokenspeed-kernel/test/**"
+      - "!tokenspeed-kernel/test/amd/**"
       - "tokenspeed-kernel/python/**"
       - "tokenspeed-mla/**"
   workflow_dispatch:
@@ -41,7 +43,7 @@ jobs:
     runs-on:
       group: Four-GPU Slurm Dispatchers
       labels: slurm-dispatch-4gpu
-    timeout-minutes: 60
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
         with:
@@ -57,7 +59,7 @@ jobs:
           bash test/ci/run_slurm.sh \
             --config test/ci/ut/ut-tokenspeed-kernel-nvidia-arm.yaml \
             --runner slurm-nvidia-arm-4gpu --type ut --trigger slurm \
-            --partition batch --time 00:45:00 \
+            --partition batch --time 02:00:00 \
             --wait --report-dir "$RUNNER_TEMP/native-library-report"
 
       - name: Publish test summary

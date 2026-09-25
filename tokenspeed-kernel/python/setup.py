@@ -554,8 +554,10 @@ class CudaKernelBuilder:
             archs.add(self._normalize_cuda_arch(direct))
             return archs
 
-        if not archs:
-            archs.update(DEFAULT_CUDA_ARCHS)
+        archs.update(DEFAULT_CUDA_ARCHS)
+        nvcc_version = self._nvcc_toolkit_version()
+        if nvcc_version is not None and nvcc_version >= (13, 4):
+            archs.add("107a")
         return archs
 
     def _site_paths(self):

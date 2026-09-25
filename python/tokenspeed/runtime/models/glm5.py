@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.attention.dsa import (
     dsa_decode_topk,
     dsa_prefill_topk,
 )
+from tokenspeed_kernel.ops.attention.dsa.triton import workspace_topk_to_global_slots
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -40,6 +41,8 @@ from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.dcp.indexer import select_dsa_topk
+from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 from tokenspeed.runtime.layers.attention.page_table import (
     build_prefill_kv_workspace_slots,
 )
@@ -581,21 +584,56 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             if q_len_per_req > 1
             else seq_lens.unsqueeze(1)
         )
-        dsa_decode_topk(
-            q,
-            weights,
-            seq_lens,
-            page_table,
-            page_size=ctx.token_to_kv_pool.arena.kv_page_size,
-            topk=topk,
-            softmax_scale=self.indexer.weights_softmax_scale,
-            q_len_per_req=q_len_per_req,
-            index_k_cache=index_k_cache,
-            seq_lens_2d=seq_lens_2d,
-            plan=metadata._dsa_plan,
-            out=topk_slice,
-            lens_out=topk_lens_slice,
-        )
+        placement = ctx.attn_backend.cache_placement(self.attn_mqa)
+        if placement is not None:
+            page_size = ctx.token_to_kv_pool.arena.kv_page_size
+            requests = (
+                torch.arange(q.shape[0], device=q.device, dtype=torch.int32)
+                // q_len_per_req
+            )
+            causal_lens = (
+                seq_lens[requests.long()]
+                - (q_len_per_req - 1)
+                + torch.arange(q.shape[0], device=q.device) % q_len_per_req
+            )
+            offsets, counts = select_dsa_topk(
+                q,
+                weights,
+                index_k_cache,
+                page_table,
+                requests,
+                causal_lens,
+                placement=placement,
+                page_size=page_size,
+                topk=topk,
+                softmax_scale=self.indexer.weights_softmax_scale,
+                initial_tokens=0,
+                local_tokens=0,
+                max_logits_bytes=64 * 1024 * 1024,
+            )
+            pages = page_table[
+                requests.long().unsqueeze(1), offsets.clamp_min(0).long() // page_size
+            ]
+            topk_slice.copy_(
+                torch.where(offsets >= 0, pages * page_size + offsets % page_size, -1)
+            )
+            topk_lens_slice.copy_(counts)
+        else:
+            dsa_decode_topk(
+                q,
+                weights,
+                seq_lens,
+                page_table,
+                page_size=ctx.token_to_kv_pool.arena.kv_page_size,
+                topk=topk,
+                softmax_scale=self.indexer.weights_softmax_scale,
+                q_len_per_req=q_len_per_req,
+                index_k_cache=index_k_cache,
+                seq_lens_2d=seq_lens_2d,
+                plan=metadata._dsa_plan,
+                out=topk_slice,
+                lens_out=topk_lens_slice,
+            )
         return GlmDsaDecodeTopK(
             topk_indices=topk_indices,
             topk_lens=topk_lens,
@@ -735,19 +773,45 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             raise RuntimeError("GLM DSA top-k requires an index-K cache.")
 
         max_logits_mb = int(global_server_args_dict[_INDEXER_PREFILL_MAX_LOGITS_MB_ARG])
-        workspace_indices, topk_lens = dsa_prefill_topk(
-            q,
-            weights,
-            kv_workspace_slots,
-            row_starts.to(torch.int32).contiguous(),
-            row_ends.to(torch.int32).contiguous(),
-            topk=topk,
-            softmax_scale=self.indexer.weights_softmax_scale,
-            index_k_cache=index_k_cache,
-            page_size=ctx.token_to_kv_pool.arena.kv_page_size,
-            max_logits_bytes=max(1, max_logits_mb) * 1024 * 1024,
-            candidate_lens_cpu=candidate_lens_cpu,
-        )
+        placement = ctx.attn_backend.cache_placement(self.attn_mqa)
+        if placement is not None:
+            global_starts, global_ends = row_starts, row_ends
+            offsets, topk_lens = select_dsa_topk(
+                q,
+                weights,
+                index_k_cache,
+                page_table,
+                torch.searchsorted(
+                    torch.cumsum(seq_lens.to(device=q.device, dtype=torch.int64), 0),
+                    row_starts.long(),
+                    right=True,
+                ).to(torch.int32),
+                global_ends - global_starts,
+                placement=placement,
+                page_size=ctx.token_to_kv_pool.arena.kv_page_size,
+                topk=topk,
+                softmax_scale=self.indexer.weights_softmax_scale,
+                initial_tokens=0,
+                local_tokens=0,
+                max_logits_bytes=max(1, max_logits_mb) * 1024 * 1024,
+            )
+            workspace_indices = torch.where(
+                offsets >= 0, offsets + global_starts.unsqueeze(1), -1
+            ).to(torch.int32)
+        else:
+            workspace_indices, topk_lens = dsa_prefill_topk(
+                q,
+                weights,
+                kv_workspace_slots,
+                row_starts.to(torch.int32).contiguous(),
+                row_ends.to(torch.int32).contiguous(),
+                topk=topk,
+                softmax_scale=self.indexer.weights_softmax_scale,
+                index_k_cache=index_k_cache,
+                page_size=ctx.token_to_kv_pool.arena.kv_page_size,
+                max_logits_bytes=max(1, max_logits_mb) * 1024 * 1024,
+                candidate_lens_cpu=candidate_lens_cpu,
+            )
         return GlmDsaPrefillTopK(
             workspace_indices=workspace_indices,
             topk_lens=topk_lens,
@@ -854,10 +918,14 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if should_compute_indexer:
             hidden_states = comm_manager.pre_attn_comm(hidden_states, ctx)
             indexer_output = self.indexer(hidden_states, q_norm, positions)
+            index_slots, index_mask = resolve_cache_slots(
+                out_cache_loc, ctx.attn_backend.cache_placement(self.attn_mqa)
+            )
             ctx.token_to_kv_pool.set_index_k_buffer(
                 self.attn_mqa.layer_id,
-                out_cache_loc,
+                index_slots,
                 indexer_output.key,
+                write_mask=index_mask,
             )
             if ctx.num_extends > 0:
                 shared_topk.prefill = self._compute_prefill_topk_indices(
@@ -957,12 +1025,12 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             q=Q,
             layer=self.attn_mqa,
             token_to_kv_pool=ctx.token_to_kv_pool,
-            page_table=prefill_topk.page_table,
-            seq_lens=prefill_topk.seq_lens,
             kv_seq_lens=prefill_topk.kv_seq_lens,
-            workspace_indices=prefill_topk.workspace_indices,
+            topk_slots=workspace_topk_to_global_slots(
+                workspace_indices=prefill_topk.workspace_indices,
+                kv_workspace_slots=prefill_topk.kv_workspace_slots,
+            ),
             topk_lens=prefill_topk.topk_lens,
-            kv_workspace_slots=prefill_topk.kv_workspace_slots,
             max_seq_len=prefill_topk.max_seq_len,
         )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)

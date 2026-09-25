@@ -386,6 +386,10 @@ def _dsa_decode_logits_fp8_kernel(
     logits,
     block_table_stride,
     logits_stride,
+    query_requests,
+    EXPLICIT_ROWS: tl.constexpr,
+    INITIAL_TOKENS: tl.constexpr,
+    LOCAL_TOKENS: tl.constexpr,
     page_size: tl.constexpr,
     row_bytes: tl.constexpr,
     page_stride_bytes: tl.constexpr,
@@ -401,9 +405,13 @@ def _dsa_decode_logits_fp8_kernel(
     token = tl.program_id(0)
     block_id = tl.program_id(1)
     req = token // q_len_per_req
+    if EXPLICIT_ROWS:
+        req = tl.load(query_requests + token)
     offsets = block_id * BLOCK_N + tl.arange(0, BLOCK_N)
     base = tl.load(seq_lens + req).to(tl.int32)
     seq_len = base - (q_len_per_req - 1) + (token % q_len_per_req)
+    if EXPLICIT_ROWS:
+        seq_len = tl.load(seq_lens + token)
     seq_len = tl.maximum(seq_len, 0)
     valid = offsets < seq_len
     block_idx = offsets // page_size
@@ -414,6 +422,7 @@ def _dsa_decode_logits_fp8_kernel(
         mask=valid,
         other=0,
     ).to(tl.int64)
+    valid = valid & (page >= 0)
     fp8_base = page * page_stride_bytes + block_offset * head_dim
     scale_base = (
         page * (page_stride_bytes // 4)
@@ -449,7 +458,9 @@ def _dsa_decode_logits_fp8_kernel(
         )
 
     scores *= softmax_scale
-    scores = tl.where(valid, scores, -float("inf"))
+    forced = (offsets < INITIAL_TOKENS) | (offsets >= seq_len - LOCAL_TOKENS)
+    scores = tl.where(forced, float("inf"), scores)
+    scores = tl.where(valid & (scores == scores), scores, -float("inf"))
     tl.store(
         logits + token * logits_stride + offsets,
         scores,
@@ -496,6 +507,7 @@ def _dsa_prefill_logits_fp8_kernel(
     ).to(tl.int64)
     page = slots // page_size
     block_offset = slots - page * page_size
+    valid = valid & (page >= 0)
     fp8_base = page * page_stride_bytes + block_offset * head_dim
     scale_base = (
         page * (page_stride_bytes // 4)
@@ -1063,6 +1075,10 @@ def dsa_decode_topk_fp8(
         logits,
         block_table.stride(0),
         logits.stride(0),
+        None,
+        EXPLICIT_ROWS=False,
+        INITIAL_TOKENS=0,
+        LOCAL_TOKENS=0,
         page_size=int(page_size),
         row_bytes=row_bytes,
         page_stride_bytes=page_stride_bytes,

@@ -284,11 +284,11 @@ class CacheMetadataTranslationTest(unittest.TestCase):
                         torch.full_like(virtual, -1),
                     )
                     self.assertTrue(torch.equal(read.long(), expected))
-                    # Only compressed groups get a read view; the indexer reads
-                    # its replicated table directly.
+                    # Compressed KV and the independent indexer group share
+                    # the placement contract, not physical page IDs.
                     self.assertEqual(
                         set(metadata.compressed_page_tables),
-                        {v4_compressed_kv_group_id(4)},
+                        {v4_compressed_kv_group_id(4), V4_INDEXER_KV_GROUP_ID},
                     )
                     table[0, 0] = 2
                     metadata.refresh_page_tables()
@@ -341,10 +341,18 @@ class CacheMetadataTranslationTest(unittest.TestCase):
                 )
                 self.assertEqual(slots.tolist(), [64, 127, 128, 192, -1])
 
-    def test_indexer_table_is_its_own_replicated_group(self):
+    def test_indexer_table_is_its_own_sharded_group(self):
         table = torch.tensor([[1, 2, 3, 4]], dtype=torch.int32)
         metadata = _metadata(dcp_size=4, dcp_rank=3, table=table)
         self.assertTrue(torch.equal(metadata.indexer_block_table(), table))
+        metadata.refresh_page_tables()
+        self.assertEqual(metadata.indexer_page_table().tolist(), [[-1, -1, -1, 1]])
+        self.assertEqual(
+            metadata.local_indexer_write_slots(
+                torch.tensor([64, 128, 192, 256, -1]), 64
+            ).tolist(),
+            [-1, -1, -1, 64, -1],
+        )
         with self.assertRaisesRegex(RuntimeError, "missing cache-group block table"):
             _metadata(dcp_size=4, dcp_rank=3, table=table).compressed_block_table(128)
 
@@ -368,7 +376,7 @@ class CacheMetadataTranslationTest(unittest.TestCase):
 
 
 class RecipeDeclarationTest(unittest.TestCase):
-    def test_only_compressed_groups_are_sharded_and_the_indexer_is_separate(self):
+    def test_compressed_and_indexer_groups_are_sharded_and_states_replicated(self):
         for dcp_size in (1, 2, 4):
             with self.subTest(dcp_size=dcp_size):
                 specs = [
@@ -379,14 +387,17 @@ class RecipeDeclarationTest(unittest.TestCase):
                 ]
                 by_id = {spec.group_id: spec for spec in specs}
                 self.assertIn(V4_INDEXER_KV_GROUP_ID, by_id)
-                self.assertEqual(by_id[V4_INDEXER_KV_GROUP_ID].shard_count, 1)
+                self.assertEqual(by_id[V4_INDEXER_KV_GROUP_ID].shard_count, dcp_size)
                 self.assertEqual(
                     by_id[V4_INDEXER_KV_GROUP_ID].retention, "full_history"
                 )
                 for spec in specs:
                     expected = (
                         dcp_size
-                        if parse_v4_compressed_kv_group_id(spec.group_id)
+                        if (
+                            parse_v4_compressed_kv_group_id(spec.group_id)
+                            or spec.group_id == V4_INDEXER_KV_GROUP_ID
+                        )
                         else 1
                     )
                     self.assertEqual(spec.shard_count, expected, spec.group_id)
@@ -419,8 +430,8 @@ class RecipeDeclarationTest(unittest.TestCase):
                 capacity = recipe.token_capacity(layout, parents)
                 # Every group can hold the admitted tokens: the recipe's parent
                 # demand at token_capacity never exceeds the parents it planned,
-                # and one more token's worth would. The replicated indexer group
-                # therefore bounds capacity, not the sharded compressed chain.
+                # and one more token's worth would. Replicated SWA and state
+                # demands still constrain the shared physical budget.
                 self.assertLessEqual(recipe.parents_needed(layout, capacity), parents)
                 self.assertGreater(
                     recipe.parents_needed(layout, capacity + 256), parents
