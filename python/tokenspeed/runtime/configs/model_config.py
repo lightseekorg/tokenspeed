@@ -406,7 +406,12 @@ def _apply_attention_defaults(
 def _derive_num_attention_layers(
     hf_config: PretrainedConfig,
     num_hidden_layers: int,
+    model_profile: ModelProfile | None = None,
 ) -> int:
+    # A registered model declares its own attention-instance count; the
+    # architecture-name tables below stay as the in-tree seed.
+    if model_profile is not None:
+        return num_hidden_layers * model_profile.attention_instances_per_layer
     architectures = getattr(hf_config, "architectures", None) or []
     num_attention_layers = num_hidden_layers
     if is_deepseek_v4_nextn(hf_config):
@@ -710,6 +715,7 @@ class ModelConfig:
         self.num_attention_layers = _derive_num_attention_layers(
             self.hf_config,
             self.num_hidden_layers,
+            self.model_profile,
         )
         if is_draft_worker:
             dspark_layers = getattr(self.hf_text_config, "dspark_num_stages", None)

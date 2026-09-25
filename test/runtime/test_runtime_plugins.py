@@ -439,3 +439,15 @@ def test_drafter_registration_unwinds_with_the_recording() -> None:
             registry.register_drafter("FIXTURE_SPEC", _FixtureDrafter)
             raise RuntimeError("boom")
     assert "FIXTURE_SPEC" not in drafter.registered_drafter_algorithms()
+
+
+def test_profile_declares_attention_instances_per_layer() -> None:
+    from tokenspeed.runtime.configs.model_config import _derive_num_attention_layers
+
+    paired = _profile(attention_instances_per_layer=2)
+    config = SimpleNamespace(architectures=["FixtureForCausalLM"])
+    assert _derive_num_attention_layers(config, 14, paired) == 28
+    assert _derive_num_attention_layers(config, 14, _profile()) == 14
+    assert _derive_num_attention_layers(config, 14, None) == 14
+    with pytest.raises(ValueError, match="attention_instances_per_layer"):
+        _profile(attention_instances_per_layer=0)
