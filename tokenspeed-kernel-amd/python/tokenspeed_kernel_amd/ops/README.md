@@ -330,8 +330,9 @@ only for now.
   lengths, and scheduler slots are runtime values, so varying ragged batches
   reuse the warmed binaries.
 - Low-level launchers require explicit `is_causal`, `logit_cap`, and
-  `return_lse`. `seq_lens_kv` and `max_seqlen_kv` are redundant hints that must
-  agree with the authoritative `cu_seqlens_kv` lengths.
+  `return_lse`. `seq_lens_kv` and `max_seqlen_kv` must agree with the
+  authoritative `cu_seqlens_kv` lengths; the kernels read only
+  `cu_seqlens_kv`, and the host uses `max_seqlen_kv` only to choose a KV split.
 - Both share launch metadata that reports attention FLOPs and each tensor's
   bytes once without reading device-resident sequence lengths: FLOPs assume
   every sequence has the batch's average query and key length.
@@ -363,6 +364,19 @@ than 8 (base 2); FP8 keeps the exact maximum so P stays at most 1 before its
 FP8 conversion. A wave skips the rescale when none of its rows moved. Empty
 asm statements keep LLVM from moving each cluster's results across cluster
 barriers.
+
+Both kernels split KV for FP8 launches that fill less than a quarter of the
+grid when the KV is at least four times the query length, such as a short
+prefill tail against a long history. Each query block's visible key tiles are
+divided into equal shares, as many as fit one round of the grid (at most 10,
+at least 8 tiles each). Each split writes its normalized FP32 output and LSE,
+and `gluon_mla_prefill_combine_gfx950` merges the splits by LSE into the
+caller's output, preserving its token and head strides. A split with no tiles
+reports LSE `-inf` and contributes nothing, and a split masks the keys past its
+last tile, including the tile the 8-wave pipeline scores ahead. Causal launches
+without history stay unsplit because the causal work order already balances
+them. For the 848-token tail of a Kimi K3 TP8 50K prompt (FP8, 12 heads) the
+8-wave kernel drops from 0.90 ms to 0.28 ms per layer.
 
 ## Sampling
 

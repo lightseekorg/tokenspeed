@@ -39,6 +39,8 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.mla.prefill import (
     AttentionProgram,
     LaunchConfig,
     ProgramScheduler,
+    _combine_split_kv,
+    _plan_split_kv,
     prefill_launch_metadata,
 )
 
@@ -65,6 +67,7 @@ class Prefill8WaveConfig:
     BLOCK_M: gl.constexpr
     BLOCK_N: gl.constexpr
     NUM_WARPS: gl.constexpr
+    SPLIT_KV: gl.constexpr
     NUM_XCDS: gl.constexpr
     NUM_BLOCKS: gl.constexpr
     IS_FP8: gl.constexpr
@@ -102,6 +105,7 @@ class Prefill8WaveConfig:
         BLOCK_M,
         BLOCK_N,
         NUM_WARPS,
+        SPLIT_KV,
         IS_FP8,
         KV_DTYPE,
         q_strides,
@@ -119,6 +123,7 @@ class Prefill8WaveConfig:
         assert NUM_WARPS == 8
         assert BLOCK_M == 32 * NUM_WARPS
         assert BLOCK_N == (64 if IS_FP8 else 32)
+        assert IS_FP8 or not SPLIT_KV, "KV splitting is only built for FP8"
 
         (
             qk_layout,
@@ -165,6 +170,7 @@ class Prefill8WaveConfig:
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.BLOCK_N = gl.constexpr(BLOCK_N)
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
+        self.SPLIT_KV = gl.constexpr(SPLIT_KV)
         self.NUM_XCDS = gl.constexpr(8)
         self.NUM_BLOCKS = gl.constexpr(512)
         self.IS_FP8 = gl.constexpr(IS_FP8)
@@ -402,7 +408,8 @@ def _softmax_max(program, scores, m_run, kv_start, bound, MASKED: gl.constexpr):
     cfg = program.cfg
     scale: gl.constexpr = cfg.SM_SCALE * _INV_LN2
     if MASKED:
-        scores = _mask_columns(program, scores, bound - kv_start)
+        # bound holds absolute key indices; split work items start mid-sequence.
+        scores = _mask_columns(program, scores, bound - program.kv_position(kv_start))
     row_max = max(scores, 1) * scale
     if MASKED:
         # A row with no visible key keeps a finite maximum, so exp2 of its
@@ -596,6 +603,15 @@ def process_query_block(
         bound = rows - rows + (program.kv_len - 1)
         main_end = program.kv_len // cfg.BLOCK_N
         count = gl.cdiv(program.kv_len, cfg.BLOCK_N)
+    if cfg.SPLIT_KV:
+        # This split covers tiles [kv_tile_base, kv_tile_base + count); make
+        # main_end relative to its first tile.
+        count = program.kv_tile_count
+        main_end = gl.minimum(gl.maximum(main_end - program.kv_tile_base, 0), count)
+        # The pipeline scores one tile ahead of its last PV step. Past a split's
+        # end that tile belongs to the next split, so mask it like keys past
+        # kv_len; otherwise it would raise the row maximum and skew the LSE.
+        bound = gl.minimum(bound, (program.kv_tile_base + count) * cfg.BLOCK_N - 1)
 
     if count > 0:
         copies = TileCopies.create(program)
@@ -680,7 +696,7 @@ def process_query_block(
 
 @gluon.jit(
     launch_metadata=prefill_launch_metadata,
-    do_not_specialize=("batch_size", "max_seqlen_q"),
+    do_not_specialize=("batch_size", "max_seqlen_q", "num_splits", "split_row_stride"),
 )
 def gluon_mla_prefill_8wave_gfx950(
     q_ptr,
@@ -712,6 +728,9 @@ def gluon_mla_prefill_8wave_gfx950(
     NUM_WARPS: gl.constexpr,
     batch_size,
     max_seqlen_q,
+    num_splits,
+    split_row_stride,
+    SPLIT_KV: gl.constexpr,
     IS_FP8: gl.constexpr,
 ):
     cfg = Prefill8WaveConfig(
@@ -725,6 +744,7 @@ def gluon_mla_prefill_8wave_gfx950(
         BLOCK_M,
         BLOCK_N,
         NUM_WARPS,
+        SPLIT_KV,
         IS_FP8,
         k_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, 1),
@@ -751,7 +771,11 @@ def gluon_mla_prefill_8wave_gfx950(
 
     # Swizzle only helps the triangular causal workload; non-causal tiles are
     # uniform cost, so use the simpler round-robin order there.
-    scheduler = ProgramScheduler.create(cfg, batch_size, max_seqlen_q, IS_CAUSAL)
+    # Split work items use the round-robin order; each split's share of a
+    # causal query block's tiles already evens out the triangular cost.
+    scheduler = ProgramScheduler.create(
+        cfg, batch_size, max_seqlen_q, num_splits, IS_CAUSAL and not SPLIT_KV
+    )
     while scheduler.has_work():
         program, active = scheduler.get_program(
             q_ptr,
@@ -761,6 +785,7 @@ def gluon_mla_prefill_8wave_gfx950(
             lse_ptr,
             cu_seqlens_q_ptr,
             cu_seqlens_kv_ptr,
+            split_row_stride,
         )
         if active:
             process_query_block(program, k_smem, k_pe_smem, v_smem)
@@ -822,8 +847,9 @@ def launch_gluon_mla_prefill_8wave_gfx950(
             These define the KV lengths.
         max_seqlen_q: Longest query sequence in the batch. It is a runtime
             argument, so varying lengths reuse one compiled kernel.
-        max_seqlen_kv: Longest KV sequence in the batch. A redundant hint that
-            must agree with ``cu_seqlens_kv``; the kernel does not read it.
+        max_seqlen_kv: Longest KV sequence in the batch; must agree with
+            ``cu_seqlens_kv``. The host uses it only to decide whether to
+            split KV across work items; the kernel reads ``cu_seqlens_kv``.
         softmax_scale: Scale applied to QK logits before the softmax.
         is_causal: Whether to apply a causal mask aligning each sequence's
             last query with its last key.
@@ -896,12 +922,24 @@ def launch_gluon_mla_prefill_8wave_gfx950(
     # No request can exceed the query buffer's token capacity. Keep this a
     # runtime bound so varying prompt lengths do not each compile a kernel.
     max_seqlen_q = min(max_seqlen_q, total_tokens)
+    batch_size = cu_seqlens_q.numel() - 1
+    is_fp8 = q.dtype in _FP8_DTYPES
+    num_splits, kernel_out, kernel_lse = _plan_split_kv(
+        is_fp8=is_fp8,
+        work_items=batch_size * n_heads * -(-max_seqlen_q // config.block_m),
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_kv=max_seqlen_kv,
+        block_n=config.block_n,
+        out=out,
+        lse=lse_arg,
+    )
+    split_kv = num_splits > 1
     gluon_mla_prefill_8wave_gfx950[config.grid](
         q,
         k,
         v,
-        out,
-        lse_arg,
+        kernel_out,
+        kernel_lse,
         cu_seqlens_q,
         cu_seqlens_kv,
         q.stride(0),
@@ -910,28 +948,35 @@ def launch_gluon_mla_prefill_8wave_gfx950(
         k.stride(1),
         v.stride(0),
         v.stride(1),
-        out.stride(0),
-        out.stride(1),
-        lse_arg.stride(0),
-        lse_arg.stride(1),
+        kernel_out.stride(0),
+        kernel_out.stride(1),
+        kernel_lse.stride(0),
+        kernel_lse.stride(1),
         N_HEADS=config.n_heads,
         N_KV_HEADS=config.n_kv_heads,
         HEAD_DIM=config.head_dim,
         ROPE_DIM=config.rope_dim,
         SM_SCALE=softmax_scale,
         IS_CAUSAL=is_causal,
-        HAS_LSE=return_lse,
+        HAS_LSE=return_lse or split_kv,
         BLOCK_M=config.block_m,
         BLOCK_N=config.block_n,
         NUM_WARPS=config.num_warps,
-        batch_size=cu_seqlens_q.numel() - 1,
+        batch_size=batch_size,
         max_seqlen_q=max_seqlen_q,
-        IS_FP8=q.dtype in _FP8_DTYPES,
+        num_splits=num_splits,
+        split_row_stride=total_tokens,
+        SPLIT_KV=split_kv,
+        IS_FP8=is_fp8,
         num_warps=config.num_warps,
         num_stages=1,
         # Keep the overlapping matrix and softmax state in one register class.
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
+    if split_kv:
+        _combine_split_kv(
+            kernel_out, kernel_lse, out, lse_arg, num_splits, return_lse=return_lse
+        )
 
     if return_lse:
         return out, lse
