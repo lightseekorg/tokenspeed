@@ -2,7 +2,7 @@
 
 ## Ordinary producer-direct Iris all-reduce
 
-TP8 BF16 payloads from 96 KiB through 1 MiB use a register-based reduce-scatter
+TP8 BF16 payloads from 96 KiB through 16 MiB use a register-based reduce-scatter
 and pull gather. Each rank reduces its contiguous element partition, then pulls
 the eight reduced partitions into caller-owned output storage. Inputs remain
 intact. The path requires partitions aligned to eight BF16 elements; other
@@ -10,6 +10,12 @@ shapes, dtypes, group sizes and larger payloads retain the existing kernels.
 The operation reuses the prepared input, one-partition scratch and 84-row flag
 array. It adds no symmetric allocation and does not overwrite the borrowed
 attention/MoE result.
+
+The 1–16 MiB range uses the same kernel with up to 84 workgroups. This covers
+the ordinary attention and paired MoE reductions between the small fused
+collectives and the token-sharded prefill operations, including uneven rows.
+Above 16 MiB the original two-stage kernel remains selected: the measured
+advantage of the register reduction shrinks as peer bandwidth dominates.
 
 Each workgroup has one subgroup and processes 512 elements per tile. Up to 84
 workgroups run; partitions requiring 85–128 tiles use 64 workgroups. The eight

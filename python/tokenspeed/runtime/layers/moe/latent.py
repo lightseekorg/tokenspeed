@@ -114,7 +114,8 @@ def kimi3_join_reduce_moe(
     Four regimes, all element-wise identical:
 
     * Symmetric hit: the partials were produced straight into the collective's
-      symmetric heap, so the pair reduces in place with no staging copy at all.
+      symmetric heap, so the pair reduces into owned local storage without a
+      staging copy.
       This is the only regime that reaches the symmetric kernel -- the backend
       decides on the tuple operand, so a single concatenated tensor cannot get
       there however its memory was allocated.
