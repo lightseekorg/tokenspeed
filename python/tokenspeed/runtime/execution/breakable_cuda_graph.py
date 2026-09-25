@@ -189,6 +189,11 @@ class BreakableCapture:
         # Break-output handoff buffers keyed by (shape, dtype, device); see break_point.
         self._handoff: dict[Any, torch.Tensor] = {}
 
+    @property
+    def stream(self) -> torch.cuda.Stream:
+        """The stream used for warmup and capture."""
+        return self._stream
+
     @classmethod
     def current(cls) -> BreakableCapture | None:
         return cls._active

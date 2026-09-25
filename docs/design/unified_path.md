@@ -287,6 +287,12 @@ class-attribute-driven, so every DP rank derives the same answer
 only. `decode_graph=False` still requires `refresh_decode_metadata` and
 `init_cuda_graph_state` — eager decode runs the same unified path.
 
+Prefill graph warmup runs on the same side stream as capture. Some kernels
+cache occupancy by stream and reject a cold CUDA graph capture; warming on the
+default stream does not prepare their capture-stream state. The capture stream
+waits for the dummy inputs and metadata before warmup, and warmup completes
+before capture begins. This applies to ordinary, encoder and decoder captures.
+
 ### Prefill graphs around a row narrowing
 
 A prefill forward whose row count drops once, at a fixed layer, by an amount
