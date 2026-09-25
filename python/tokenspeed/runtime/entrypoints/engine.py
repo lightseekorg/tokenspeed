@@ -521,10 +521,20 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.numerics == "rl-bitwise":
         # Bitwise envelope: no TF32 anywhere, and pin NCCL to one
         # algorithm/protocol so the reduction association order cannot switch
-        # with message size. setdefault so an explicit env still wins.
-        os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "0")
-        os.environ.setdefault("NCCL_ALGO", "Ring")
-        os.environ.setdefault("NCCL_PROTO", "Simple")
+        # with message size. The envelope's promise beats ambient
+        # environment: a conflicting value is replaced, loudly, instead of
+        # silently voiding the contract.
+        for key, value in (
+            ("NVIDIA_TF32_OVERRIDE", "0"),
+            ("NCCL_ALGO", "Ring"),
+            ("NCCL_PROTO", "Simple"),
+        ):
+            prior = os.environ.get(key)
+            if prior is not None and prior != value:
+                logger.warning(
+                    f"--numerics rl-bitwise replaces {key}={prior} with {value}"
+                )
+            os.environ[key] = value
 
     _set_socket_interface(server_args)
 

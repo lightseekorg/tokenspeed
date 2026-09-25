@@ -20,6 +20,9 @@
 
 from __future__ import annotations
 
+import functools
+import warnings
+
 import torch
 from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 from tokenspeed_kernel.platform import (
@@ -42,6 +45,15 @@ if platform.is_nvidia:
         w.w13_weight.data[:, :half_w, :] = w.w13_weight.data[:, half_w:, :]
         w.w13_weight.data[:, half_w:, :] = first_half
         return None
+
+    @functools.cache
+    def _warn_pdl_forced_off() -> None:
+        warnings.warn(
+            "flashinfer_cutlass_unquant_moe_apply forces enable_pdl off: PDL "
+            "races inside this fused-MoE chain on SM90 (transient NaN GEMM "
+            "rows at decode-sized batches).",
+            stacklevel=3,
+        )
 
     @register_kernel(
         "moe",
@@ -83,6 +95,10 @@ if platform.is_nvidia:
         do_finalize: bool = True,
         enable_pdl: bool = False,
     ):
+        if enable_pdl:
+            # Not silently: a caller enabling PDL globally would otherwise
+            # misread its perf measurements with nothing in the logs.
+            _warn_pdl_forced_off()
         if topk_weights is None or topk_ids is None:
             scores = torch.softmax(router_logits.float(), dim=-1)
             topk_weights, topk_ids = torch.topk(

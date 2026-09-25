@@ -298,9 +298,25 @@ def register_config(
             override=override,
         )
         # Mirrors the in-tree table: Transformers' own lookups (e.g. from
-        # AutoTokenizer) resolve the type too. Best effort, as in tree.
+        # AutoTokenizer) resolve the type too. Best effort, as in tree — but
+        # a failed plugin must not leave its config class resolvable through
+        # AutoConfig, so the global mutation joins the recording's rollback.
         with contextlib.suppress(ValueError):
+            from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+            extra = CONFIG_MAPPING._extra_content
+            prior = extra.get(model_type, _MISSING)
             AutoConfig.register(model_type, cls)
+
+            def undo_autoconfig(
+                model_type: str = model_type, prior: Any = prior
+            ) -> None:
+                if prior is _MISSING:
+                    extra.pop(model_type, None)
+                else:
+                    extra[model_type] = prior
+
+            record_external("AutoConfig model_type", model_type, undo_autoconfig)
     for architecture in architectures:
         _put(
             hf_transformers_utils._ARCHITECTURE_CONFIG_REGISTRY,
@@ -326,6 +342,11 @@ def register_attention_backend(
         cls: The backend class.
         override: Allow replacing an existing backend of this name.
     """
+    # Built-in backends register when this package imports; load them before
+    # the plugin's entry, so replacing a built-in name collides (or, with
+    # override=True, wins) here instead of being silently overwritten by the
+    # built-in import later in startup.
+    import tokenspeed.runtime.layers.attention.backends  # noqa: F401
     from tokenspeed.runtime.layers.attention import registry as attention_registry
 
     _put(
@@ -381,7 +402,15 @@ def register_cache_recipe(
     """
     from tokenspeed.runtime.layers.attention.kv_cache.recipes import setup
 
-    declared = getattr(recipe, "family", family) if isinstance(recipe, type) else family
+    if isinstance(recipe, type):
+        try:
+            declared = recipe.family
+        except AttributeError:
+            raise ValueError(
+                f"recipe {recipe.__name__} must declare family = {family!r}"
+            ) from None
+    else:
+        declared = family
     if declared != family:
         raise ValueError(
             f"recipe {recipe.__name__} declares family {declared!r}, "

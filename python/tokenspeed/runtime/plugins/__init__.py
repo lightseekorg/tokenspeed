@@ -85,7 +85,10 @@ class PluginInfo:
 
 _loaded_plugins: dict[str, PluginInfo] = {}
 _loaded = False
-_lock = threading.Lock()
+# Reentrant: a plugin that builds a ModelConfig while registering re-enters
+# ensure_loaded on the same thread and must observe the _loaded flag instead
+# of deadlocking on the loader lock.
+_lock = threading.RLock()
 
 
 def _disabled_from_env() -> set[str]:
@@ -114,11 +117,13 @@ def ensure_loaded() -> list[PluginInfo]:
         The runtime plugins loaded in this process.
     """
     global _loaded
+    if _loaded:
+        return list_plugins()
     with _lock:
         if _loaded:
             return list_plugins()
         # Set first: a plugin that builds a ModelConfig while registering
-        # must not re-enter the loader.
+        # re-enters through the reentrant lock and returns on the flag.
         _loaded = True
 
         from tokenspeed_kernel.plugins import discover_plugins
@@ -143,6 +148,9 @@ def ensure_loaded() -> list[PluginInfo]:
                     f"Failed to load plugin {ep.name!r}: {exc!r}",
                     stacklevel=2,
                 )
+                # The warning is the contract; the traceback is how an
+                # operator finds the failing frame deep in the plugin.
+                logger.warning(f"Plugin {ep.name!r} failed to load", exc_info=exc)
                 continue
             package, version = _distribution(ep)
             info = PluginInfo(

@@ -118,6 +118,13 @@ def request_history_seeds_for_forward(
     may not hold: a prefix-cache hit, a PD landing, a retraction recovery or
     a chunk after the slot changed hands. Prompt/output lists hold physical
     IDs. Returns None when no extend in the batch resumes a prefix.
+
+    TODO(perf): this also reseeds consecutive chunks of one chunked prefill
+    whose slot never changed hands, moving O(N*k) tokens host->device for an
+    N-token prompt in k chunks. Tracking (request id, held length) per slot —
+    as the bounded n-gram path does — would let the gather skip prefixes the
+    slot demonstrably still holds without weakening the recovery and
+    PD-landing cases.
     """
     slots: list[int] = []
     prefix_lengths: list[int] = []

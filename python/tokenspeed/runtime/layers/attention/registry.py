@@ -131,9 +131,18 @@ def _ordinary_cache_family(config: AttnConfig | None) -> CacheModelFamily | None
 def _resolve_heterogeneous_draft_family(
     target_family: CacheModelFamily,
     draft_family: CacheModelFamily | None,
+    *,
+    draft_family_declared: bool,
 ) -> CacheModelFamily | None:
-    """Validate and return the supported heterogeneous draft family."""
-    if draft_family is None:
+    """Validate and return the supported heterogeneous draft family.
+
+    ``None`` means the draft binds through the target family's own recipe —
+    the pattern every custom family with an integrated draft view relies on
+    (its recipe plans the draft layers). A draft whose PROFILE declares a
+    different family is a layout contradiction, not that pattern, and is
+    rejected instead of silently bound to the target's pool factory.
+    """
+    if draft_family is None or draft_family == target_family:
         return None
     if target_family == "kimi_k3":
         if draft_family != "mla":
@@ -141,7 +150,14 @@ def _resolve_heterogeneous_draft_family(
                 "Kimi-K3 unified cache currently requires an ordinary MLA draft view"
             )
         return draft_family
-    if target_family not in _ORDINARY_CACHE_FAMILIES or draft_family == target_family:
+    if target_family not in _ORDINARY_CACHE_FAMILIES:
+        if draft_family_declared:
+            raise RuntimeError(
+                f"the draft declares cache family {draft_family!r}, but the "
+                f"target family {target_family!r} has no heterogeneous draft "
+                "views; a draft served from this pool must declare the "
+                "target's family"
+            )
         return None
     if draft_family != "mha":
         raise RuntimeError(
@@ -653,12 +669,10 @@ def _create_attn_config(
     # Extra components are built through the same generate() protocol and
     # composed into config.components (consumers look them up by class via
     # ``component()``).
+    profile_linear: str | None = None
     if model_config.model_profile is not None:
-        linear_cls = (
-            LinearAttnConfig
-            if model_config.model_profile.linear_attention is not None
-            else None
-        )
+        profile_linear = model_config.model_profile.linear_attention
+        linear_cls = LinearAttnConfig if profile_linear is not None else None
     else:
         architectures = getattr(model_config.hf_config, "architectures", None) or ()
         linear_cls = next(
@@ -667,6 +681,18 @@ def _create_attn_config(
         )
     if linear_cls is not None:
         linear_attn = linear_cls.generate(server_args, model_config, is_draft)
+        if linear_attn is None and profile_linear is not None:
+            # The profile positively declared linear layers; serving the
+            # model through full attention alone would be silently wrong.
+            # The in-tree schema is the one linear-config reader today: a
+            # plugin's checkpoint config must expose ``linear_layer_ids``
+            # and the geometry fields ``LinearAttnConfig.generate`` reads.
+            raise ValueError(
+                f"model profile declares linear_attention={profile_linear!r} "
+                "but the checkpoint config exposes no linear_layer_ids; "
+                "declare the linear geometry LinearAttnConfig reads, or drop "
+                "linear_attention from the profile"
+            )
         if linear_attn is not None:
             config = dataclasses.replace(
                 config, components=config.components + (linear_attn,)
@@ -1229,10 +1255,19 @@ def create_attn_components(
         if draft_attn_config is not None
         else None
     )
-    draft_cache_family = _ordinary_cache_family(draft_attn_config)
+    # A draft model's own profile is authoritative for its cache layout;
+    # the attention-config class only approximates it for in-tree drafts.
+    draft_profile = (
+        draft_model_config.model_profile if draft_attn_config is not None else None
+    )
+    if draft_profile is not None:
+        draft_cache_family = draft_profile.cache_family
+    else:
+        draft_cache_family = _ordinary_cache_family(draft_attn_config)
     heterogeneous_draft_family = _resolve_heterogeneous_draft_family(
         cache_family,
         draft_cache_family,
+        draft_family_declared=draft_profile is not None,
     )
     cache_memory = profile_available_cache_memory_bytes(
         attn_config=config,

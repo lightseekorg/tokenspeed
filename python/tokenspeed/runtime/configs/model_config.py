@@ -386,6 +386,7 @@ def _apply_attention_defaults(
     name: str,
     default_backend: str | None,
     default_prefix_granularity: int | None,
+    is_draft_worker: bool,
 ) -> None:
     """Fill launch arguments the user left at their defaults."""
     if default_prefix_granularity is not None:
@@ -399,7 +400,15 @@ def _apply_attention_defaults(
                 f"with a value other than {granularity_default:d} to keep that value.",
             )
             server_args.prefix_granularity = default_prefix_granularity
-    if default_backend is not None and server_args.attention_backend is None:
+    if default_backend is None:
+        return
+    # A draft model's default belongs to the drafter's backend selection;
+    # writing the target field would either be discarded (already set) or
+    # hijack the target's own default.
+    if is_draft_worker:
+        if server_args.drafter_attention_backend is None:
+            server_args.drafter_attention_backend = default_backend
+    elif server_args.attention_backend is None:
         server_args.attention_backend = default_backend
 
 
@@ -675,6 +684,7 @@ class ModelConfig:
                 default_prefix_granularity=(
                     self.model_profile.default_prefix_granularity
                 ),
+                is_draft_worker=bool(is_draft_worker),
             )
             self.model_profile.configure_attention(self)
         elif attention_family is not None:
@@ -683,6 +693,7 @@ class ModelConfig:
                 name=attention_family.name,
                 default_backend=attention_family.default_backend,
                 default_prefix_granularity=attention_family.default_prefix_granularity,
+                is_draft_worker=bool(is_draft_worker),
             )
             attention_family.configure(self)
         elif _is_dflash2_mla(self.hf_config, self.hf_text_config):

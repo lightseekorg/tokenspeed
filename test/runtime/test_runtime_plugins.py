@@ -451,3 +451,98 @@ def test_profile_declares_attention_instances_per_layer() -> None:
     assert _derive_num_attention_layers(config, 14, None) == 14
     with pytest.raises(ValueError, match="attention_instances_per_layer"):
         _profile(attention_instances_per_layer=0)
+
+
+def test_drafter_override_rollback_restores_the_prior_entry() -> None:
+    from tokenspeed.runtime.execution import drafter
+
+    class _SecondDrafter(_FixtureDrafter):
+        pass
+
+    registry.register_drafter(
+        "FIXTURE_SPEC", _FixtureDrafter, defaults_to_base_checkpoint=False
+    )
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            with registry.recording():
+                registry.register_drafter(
+                    "FIXTURE_SPEC",
+                    _SecondDrafter,
+                    defaults_to_base_checkpoint=True,
+                    override=True,
+                )
+                raise RuntimeError("boom")
+        entries = drafter._PLUGIN_DRAFTERS["FIXTURE_SPEC"]
+        assert entries.default is _FixtureDrafter
+        assert entries.defaults_to_base_checkpoint is False
+    finally:
+        drafter._PLUGIN_DRAFTERS.pop("FIXTURE_SPEC", None)
+
+
+def test_cache_recipe_missing_family_declaration_is_rejected() -> None:
+    class _UndeclaredRecipe(CacheRecipe):
+        @property
+        def layer_types(self) -> tuple[str, ...]:
+            return ()
+
+    with pytest.raises(ValueError, match="must declare family"):
+        registry.register_cache_recipe("fixture_family", _UndeclaredRecipe)
+
+
+def test_register_config_rolls_back_the_autoconfig_mirror(isolated) -> None:
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    class _RollbackConfig(PretrainedConfig):
+        model_type = "fixture_rollback_type"
+
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            with registry.recording():
+                registry.register_config(
+                    _RollbackConfig, model_type="fixture_rollback_type"
+                )
+                assert "fixture_rollback_type" in CONFIG_MAPPING._extra_content
+                raise RuntimeError("boom")
+        assert "fixture_rollback_type" not in CONFIG_MAPPING._extra_content
+    finally:
+        CONFIG_MAPPING._extra_content.pop("fixture_rollback_type", None)
+
+
+def test_declared_draft_cache_family_must_match_a_custom_target() -> None:
+    resolve = attention_registry._resolve_heterogeneous_draft_family
+
+    # A draft profile declaring the target's own family shares its view.
+    assert (
+        resolve("fixture_family", "fixture_family", draft_family_declared=True) is None
+    )
+    # An in-tree draft without a profile rides the target recipe's draft
+    # view (the deepseek_v4 NextN pattern).
+    assert resolve("fixture_family", "mla", draft_family_declared=False) is None
+    # A declared, different family is a layout contradiction.
+    with pytest.raises(RuntimeError, match="declares cache family"):
+        resolve("fixture_family", "mla", draft_family_declared=True)
+
+
+def test_draft_profile_backend_default_lands_on_the_drafter_field() -> None:
+    from tokenspeed.runtime.configs.model_config import _apply_attention_defaults
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    args = ServerArgs(model="x")
+    _apply_attention_defaults(
+        args,
+        name="Fixture",
+        default_backend="fixture_backend",
+        default_prefix_granularity=None,
+        is_draft_worker=True,
+    )
+    assert args.drafter_attention_backend == "fixture_backend"
+    assert args.attention_backend is None
+    _apply_attention_defaults(
+        args,
+        name="Fixture",
+        default_backend="target_backend",
+        default_prefix_granularity=None,
+        is_draft_worker=False,
+    )
+    assert args.attention_backend == "target_backend"
+    assert args.drafter_attention_backend == "fixture_backend"

@@ -101,7 +101,16 @@ def register_drafter(
                 "override=True to replace it, or scope the entry with "
                 "model_cls"
             )
-    entries = _PLUGIN_DRAFTERS.setdefault(algorithm, _AlgorithmEntries())
+    entries = _PLUGIN_DRAFTERS.get(algorithm)
+    created = entries is None
+    if entries is None:
+        entries = _PLUGIN_DRAFTERS[algorithm] = _AlgorithmEntries()
+    # Snapshot for the rollback: undoing must RESTORE what an override
+    # replaced (an earlier plugin's default, the base-checkpoint flag), not
+    # blank it — undos run in reverse registration order, so each one puts
+    # back exactly the state it saw.
+    prior_default = entries.default
+    prior_defaults_to_base = entries.defaults_to_base_checkpoint
     if model_cls is not None:
         entries.scoped.insert(0, (model_cls, drafter_cls))
     else:
@@ -109,32 +118,25 @@ def register_drafter(
     if defaults_to_base_checkpoint:
         entries.defaults_to_base_checkpoint = True
 
+    def undo() -> None:
+        if model_cls is not None:
+            try:
+                entries.scoped.remove((model_cls, drafter_cls))
+            except ValueError:
+                pass
+        else:
+            entries.default = prior_default
+        entries.defaults_to_base_checkpoint = prior_defaults_to_base
+        if created and entries.default is None and not entries.scoped:
+            _PLUGIN_DRAFTERS.pop(algorithm, None)
+
     from tokenspeed.runtime.plugins import registry as plugin_registry
 
     plugin_registry.record_external(
         "drafter",
         algorithm if model_cls is None else f"{algorithm}[{model_cls.__name__}]",
-        _undo_register_drafter(algorithm, drafter_cls, model_cls),
+        undo,
     )
-
-
-def _undo_register_drafter(algorithm: str, drafter_cls: type, model_cls: type | None):
-    def undo() -> None:
-        entries = _PLUGIN_DRAFTERS.get(algorithm)
-        if entries is None:
-            return
-        if model_cls is None:
-            if entries.default is drafter_cls:
-                entries.default = None
-        else:
-            try:
-                entries.scoped.remove((model_cls, drafter_cls))
-            except ValueError:
-                pass
-        if entries.default is None and not entries.scoped:
-            _PLUGIN_DRAFTERS.pop(algorithm, None)
-
-    return undo
 
 
 def registered_drafter_algorithms() -> frozenset[str]:
