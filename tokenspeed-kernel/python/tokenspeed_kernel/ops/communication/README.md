@@ -22,6 +22,12 @@ subsequent producers. Other configurations retain their existing collective and
 AttnRes selection. No scheduler or cache metadata changes are needed; these
 buffers hold transient model activations, not request state.
 
+Uneven prefills through 8192 tokens also use the ordinary producer-direct
+reduction and retain a replicated residual. The attention and MoE sharding
+operations still require a token count divisible by eight; ordinary Iris
+partitions elements instead, so the 7168-wide projection supports every row
+count in this window without padding or another symmetric buffer.
+
 ### Sequence and numerics
 
 Each rank pulls its contiguous token partition from all eight producers. Loads
@@ -88,6 +94,7 @@ On an idle eight-GPU CDNA4 host, run:
 
 ```sh
 python -m pytest -q tokenspeed-kernel/test/amd/ops/test_iris_attention_prefill.py \
+  tokenspeed-kernel/test/amd/ops/test_iris_communication.py::test_iris_all_reduce_correctness_world8 \
   tokenspeed-kernel/test/amd/ops/test_iris_moe_tail.py \
   tokenspeed-kernel/test/amd/ops/test_kimi3_prefill_gluon_amd.py
 ```

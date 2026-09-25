@@ -563,10 +563,6 @@ class K3AttnComm:
             or not _IRIS_ATTN_PRODUCER_DIRECT_MIN_TOKENS
             <= like.shape[0]
             <= _IRIS_MAX_TOKENS
-            or (
-                like.shape[0] >= _IRIS_ATTN_SHARDED_PREFIX_MIN_TOKENS
-                and like.shape[0] % 8 != 0
-            )
             or like.dtype != torch.bfloat16
             or self.mapping.attn.tp_size != 8
             or self.mapping.moe.tp_size != 8

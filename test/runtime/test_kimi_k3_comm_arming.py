@@ -64,14 +64,21 @@ needs_iris = pytest.mark.skipif(
         (256, True, True, True),
         (511, True, True, True),
         (512, True, True, True),
-        (513, True, True, False),
+        (513, True, True, True),
+        (519, True, True, True),
         (848, True, True, True),
+        (849, True, True, True),
+        (1023, True, True, True),
         (1024, True, True, True),
+        (2047, True, True, True),
         (2048, True, True, True),
+        (3071, True, True, True),
         (4088, True, True, True),
-        (4095, True, True, False),
+        (4095, True, True, True),
         (4096, True, True, True),
-        (4097, True, True, False),
+        (4097, True, True, True),
+        (6143, True, True, True),
+        (8191, True, True, True),
         (8192, True, True, True),
         (8193, True, True, False),
         (8192, False, True, False),
@@ -135,7 +142,7 @@ def test_attention_prefill_producer_window(
 
 @pytest.mark.parametrize("has_prefix", [False, True])
 @pytest.mark.parametrize("producer_direct", [False, True])
-@pytest.mark.parametrize("rows", [16, 37, 511])
+@pytest.mark.parametrize("rows", [16, 37, 511, 519])
 def test_attention_prefill_fallback_preserves_residual_ownership(
     monkeypatch, has_prefix, producer_direct, rows
 ):
@@ -186,7 +193,10 @@ def test_attention_prefill_fallback_preserves_residual_ownership(
         (511, False),
         (512, True),
         (513, False),
+        (519, False),
         (848, True),
+        (849, False),
+        (1023, False),
         (1024, True),
         (2048, True),
         (4088, True),
@@ -194,6 +204,7 @@ def test_attention_prefill_fallback_preserves_residual_ownership(
         (4096, True),
         (4097, False),
         (6224, True),
+        (8191, False),
         (8192, True),
         (8193, False),
     ],

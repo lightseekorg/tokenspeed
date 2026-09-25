@@ -457,6 +457,10 @@ def _ar_output_shape_cases() -> List[Tuple[Tuple[int, ...], ...]]:
         ((37, 7168),),
         ((128, 7168),),
         ((511, 7168),),
+        ((519, 7168),),
+        ((1023, 7168),),
+        ((4095, 7168),),
+        ((8191, 7168),),
         ((1, 7168), (1, 3584)),
         ((2, 7168), (2, 3584)),
         ((4, 7168), (4, 3584)),
@@ -650,13 +654,16 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
                 device,
             )
 
+        # These dtype checks only use the small shape. Their states share the
+        # fixed heap, so do not reserve another full BF16 prefill capacity.
+        other_dtype_max_numel = 16 * (7168 + 3584)
         fp16_state = create_iris_state(
             enable_lamport=False,
             moe_tail_max_rows=0,
             group=dist.group.WORLD,
             rank_in_group=rank,
             staged_max_numel=0,
-            producer_direct_max_numel=producer_direct_max_numel,
+            producer_direct_max_numel=other_dtype_max_numel,
             attnres_max_numel=0,
             attnres_max_rows=0,
             dtype=torch.float16,
@@ -685,7 +692,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             group=dist.group.WORLD,
             rank_in_group=rank,
             staged_max_numel=0,
-            producer_direct_max_numel=producer_direct_max_numel,
+            producer_direct_max_numel=other_dtype_max_numel,
             attnres_max_numel=0,
             attnres_max_rows=0,
             dtype=torch.float32,
