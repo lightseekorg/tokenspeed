@@ -521,7 +521,13 @@ def test_attn_dp_forward_bypasses_tp_tail() -> None:
         _forward_attn_dp=dp_forward,
     )
     result = KimiLinearMoE.forward(
-        layer, hidden, hidden, num_global_tokens=2, max_num_tokens_per_gpu=1, ctx=ctx
+        layer,
+        hidden,
+        hidden,
+        num_global_tokens=2,
+        max_num_tokens_per_gpu=1,
+        ctx=ctx,
+        prefix_is_sharded=False,
     )
     assert result is hidden
     dp_forward.assert_called_once_with(hidden, hidden, ctx)
@@ -560,6 +566,7 @@ def test_attn_dp_forward_requires_context() -> None:
             num_global_tokens=2,
             max_num_tokens_per_gpu=1,
             ctx=None,
+            prefix_is_sharded=False,
         )
 
 

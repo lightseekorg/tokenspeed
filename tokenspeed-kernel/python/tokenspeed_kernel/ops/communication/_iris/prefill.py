@@ -78,8 +78,8 @@ def _prefill_entry_barrier(
         seen = gl.load(
             local_flags, mask=remote, other=epoch, cache_modifier=".cv", volatile=True
         )
+    # Acquire lowering already joins the workgroup after cache invalidation.
     gl.atomic_add(local_flags, 0, mask=remote, sem="acquire", scope="sys")
-    gl.barrier()
 
 
 @gluon.jit
@@ -198,6 +198,7 @@ def iris_moe_add_push_gather_gluon_kernel(
     BLOCK_ELEMENTS: gl.constexpr,
     NUM_PROGRAMS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    PREFIX_IS_SHARDED: gl.constexpr,
 ):
     # In-place prefixes are safe: ranks read then write disjoint rows.
     # Reduce-scatter entry waits for prior prefix consumers.
@@ -228,7 +229,9 @@ def iris_moe_add_push_gather_gluon_kernel(
             mask = gl.full((BLOCK_ELEMENTS,), True, gl.int1, layout)
         else:
             mask = offsets < PARTITION_ELEMENTS
-        prefix_offsets = offsets + RANK * PARTITION_ELEMENTS
+        prefix_offsets = offsets
+        if not PREFIX_IS_SHARDED:
+            prefix_offsets += RANK * PARTITION_ELEMENTS
         a = gl.amd.cdna4.buffer_load(
             prefix_ptr, prefix_offsets, mask, 0, cache=".cg"
         ).to(gl.float32)

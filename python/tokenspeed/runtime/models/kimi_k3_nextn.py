@@ -212,6 +212,7 @@ class KimiK3DraftDecoderLayer(nn.Module):
             num_global_tokens=num_global_tokens,
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
             ctx=ctx,
+            prefix_is_sharded=False,
         )
         return prefix.view(residual.shape)
 
