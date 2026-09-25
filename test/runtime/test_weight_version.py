@@ -27,6 +27,7 @@ import os
 import sys
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from fastapi.testclient import TestClient
 
@@ -36,13 +37,18 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from runtime.rl_fakes import FakeLLM  # noqa: E402
+
 from tokenspeed.runtime.engine.collector import RequestOutputCollector  # noqa: E402
 from tokenspeed.runtime.engine.io_struct import BatchEmbeddingOut  # noqa: E402
 from tokenspeed.runtime.engine.output_processor import (  # noqa: E402
     OutputProcessor,
     ReqState,
 )
-from tokenspeed.runtime.entrypoints import control_server  # noqa: E402
+from tokenspeed.runtime.entrypoints import (  # noqa: E402
+    control_server,
+    sglang_compat_http,
+)
 from tokenspeed.runtime.entrypoints.sglang_compat_http import (  # noqa: E402
     build_sglang_compat_app,
 )
@@ -52,73 +58,9 @@ from tokenspeed.runtime.utils.server_args import (  # noqa: E402
 )
 
 
-class _FakeLLM:
-    def __init__(self) -> None:
-        self.server_args = SimpleNamespace(
-            weight_version="default",
-            model="model-x",
-            kvstore_storage_backend=None,
-        )
-        self.updates = []
-        self.scheduler_calls = []
-        self.admission_calls = []
-        self.memory_calls = []
-        self.succeed = True
-
-    async def init_weights_update_group(self, obj):
-        return True, "initialized"
-
-    async def update_weights_from_distributed(self, obj):
-        self.updates.append(obj)
-        return self.succeed, "distributed"
-
-    async def update_weights_from_tensor(self, obj):
-        self.updates.append(obj)
-        return self.succeed, "tensor"
-
-    async def update_weights_from_disk(self, obj):
-        self.updates.append(obj)
-        return self.succeed, "disk", None
-
-    def block_generation_admission(self):
-        self.admission_calls.append("block")
-
-    def allow_generation_admission(self):
-        self.admission_calls.append("allow")
-
-    async def pause_scheduler(self, *, mode="abort"):
-        self.scheduler_calls.append(("pause", mode))
-        return True
-
-    async def resume_scheduler(self):
-        self.scheduler_calls.append(("resume", None))
-        return True
-
-    async def get_load(self):
-        return [
-            SimpleNamespace(
-                dp_rank=0,
-                num_reqs=2,
-                num_waiting_reqs=1,
-                num_pages=3,
-            )
-        ]
-
-    async def release_memory_occupation(self, obj):
-        self.memory_calls.append(("release", obj.tags))
-        return SimpleNamespace(success=True, message="released")
-
-    async def resume_memory_occupation(self, obj):
-        self.memory_calls.append(("resume", obj.tags))
-        return SimpleNamespace(success=True, message="resumed")
-
-    def abort_request(self, rid):
-        self.scheduler_calls.append(("abort", rid))
-
-
 class TestWeightVersionHTTP(unittest.TestCase):
     def test_sglang_version_endpoints(self):
-        llm = _FakeLLM()
+        llm = FakeLLM()
         client = TestClient(build_sglang_compat_app(llm))
 
         self.assertEqual(
@@ -138,7 +80,7 @@ class TestWeightVersionHTTP(unittest.TestCase):
         )
 
     def test_sglang_direct_version_update_rejects_l3_without_mutation(self):
-        llm = _FakeLLM()
+        llm = FakeLLM()
         llm.server_args.kvstore_storage_backend = "mooncake"
         client = TestClient(build_sglang_compat_app(llm))
 
@@ -164,7 +106,7 @@ class TestWeightVersionHTTP(unittest.TestCase):
         self.assertEqual(llm.scheduler_calls, [])
 
     def test_sglang_updates_stamp_only_after_success(self):
-        llm = _FakeLLM()
+        llm = FakeLLM()
         client = TestClient(build_sglang_compat_app(llm))
 
         response = client.post(
@@ -181,15 +123,23 @@ class TestWeightVersionHTTP(unittest.TestCase):
         self.assertEqual(llm.server_args.weight_version, "v8")
 
         llm.succeed = False
-        response = client.post(
-            "/update_weights_from_disk",
-            json={"model_path": "/tmp/model", "weight_version": "failed"},
-        )
+        # This build refuses the disk route with 501 before the engine sees it
+        # (the scheduler has no branch for it), so widen the supported set to
+        # keep exercising "stamp only after success" on a non-distributed route.
+        with mock.patch.object(
+            sglang_compat_http,
+            "SUPPORTED_WEIGHT_UPDATE_SOURCES",
+            frozenset({"disk", "tensor", "distributed"}),
+        ):
+            response = client.post(
+                "/update_weights_from_disk",
+                json={"model_path": "/tmp/model", "weight_version": "failed"},
+            )
         self.assertEqual(response.status_code, 400)
         self.assertEqual(llm.server_args.weight_version, "v8")
 
     def test_sglang_scheduler_memory_and_load_endpoints(self):
-        llm = _FakeLLM()
+        llm = FakeLLM()
         client = TestClient(build_sglang_compat_app(llm))
 
         self.assertEqual(client.post("/pause_generation").status_code, 200)

@@ -52,7 +52,7 @@ from tokenspeed.runtime.cache.embedding_cache import (
     TieredEmbeddingCache,
 )
 from tokenspeed.runtime.epd.encode_scheduler import EncodeScheduler
-from tokenspeed.runtime.epd.encode_worker import EncodeWorker
+from tokenspeed.runtime.epd.encode_worker import EncodeRequest, EncodeWorker
 from tokenspeed.runtime.utils import get_colorful_logger, get_zmq_socket
 from tokenspeed.runtime.utils.env import envs
 
@@ -122,14 +122,10 @@ def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
     """Assemble the encode worker: model + Mooncake manager + bootstrap server +
     executor + scheduler + cache, driven from the real ServerArgs."""
     from tokenspeed.runtime.configs.model_config import ModelConfig
-    from tokenspeed.runtime.epd.encode_executor import (
-        DisaggEncodeExecutor,
-    )
+    from tokenspeed.runtime.epd.encode_executor import DisaggEncodeExecutor
     from tokenspeed.runtime.epd.entities import EmbeddingArgs
     from tokenspeed.runtime.epd.mooncake.conn import MooncakeEmbeddingBootstrapServer
-    from tokenspeed.runtime.epd.mooncake.encode import (
-        MooncakeEmbeddingManagerEncode,
-    )
+    from tokenspeed.runtime.epd.mooncake.encode import MooncakeEmbeddingManagerEncode
     from tokenspeed.runtime.execution.distributed_initializer import (
         DistributedConfig,
         DistributedInitializer,
@@ -282,6 +278,16 @@ def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):
             )
 
         for request in new_reqs:
+            # The encode loop only speaks EncodeRequest and has no reply channel
+            # for scheduler control queries (pause state, flush, ...). A stray
+            # control message used to reach worker.submit and take the whole
+            # loop down on a missing attribute; drop it and say so instead.
+            if not isinstance(request, EncodeRequest):
+                logger.warning(
+                    "encode loop ignoring unsupported scheduler message %s",
+                    type(request).__name__,
+                )
+                continue
             worker.submit(request)
         drained = len(new_reqs) > 0
 

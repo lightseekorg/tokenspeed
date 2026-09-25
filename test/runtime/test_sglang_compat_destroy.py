@@ -8,12 +8,24 @@ HTTP -> ``AsyncLLM.destroy_weights_update_group`` -> worker
 These run CPU-only against a stub AsyncLLM -- no engine, NCCL, or GPU needed.
 """
 
+import os
+import sys
 import unittest
 
 from fastapi.testclient import TestClient
 
-from tokenspeed.runtime.engine.io_struct import DestroyWeightsUpdateGroupReqInput
-from tokenspeed.runtime.entrypoints.sglang_compat_http import build_sglang_compat_app
+# CI registration (AST-parsed, runtime no-op).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
+
+from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
+    DestroyWeightsUpdateGroupReqInput,
+)
+from tokenspeed.runtime.entrypoints.sglang_compat_http import (  # noqa: E402
+    build_sglang_compat_app,
+)
 
 
 class _StubLLM:

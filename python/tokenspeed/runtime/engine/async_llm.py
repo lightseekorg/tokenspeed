@@ -80,6 +80,7 @@ from tokenspeed.runtime.engine.protocol import EngineClient
 from tokenspeed.runtime.engine.scheduler_control_client import (
     SchedulerControlClient,
 )
+from tokenspeed.runtime.entrypoints import rl_control
 from tokenspeed.runtime.metrics.collector import RequestMetrics
 from tokenspeed.runtime.pd.utils import (
     DisaggregationMode,
@@ -700,12 +701,23 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
 
             server = uvicorn.Server(
                 uvicorn.Config(
-                    app, host=self.server_args.host, port=port, log_level="warning"
+                    app,
+                    host=rl_control.control_bind_host(self.server_args),
+                    port=port,
+                    log_level="warning",
                 )
             )
             await server.serve()
         except Exception as e:  # noqa: BLE001
             logger.error(f"RL control plane stopped: {e!s}")
+
+    def rl_control_url(self) -> str | None:
+        """Base URL of the in-engine RL control app, for gateway discovery."""
+        return rl_control.control_url(self.server_args)
+
+    def rl_advertisement(self) -> dict[str, str]:
+        """Control URL plus capability labels, for ``GetServerInfo.server_args``."""
+        return rl_control.advertisement(self.server_args)
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:

@@ -172,6 +172,13 @@ class ServerArgs:
     # pause/resume, and memory occupation). Set by the ``ts serve`` orchestrator;
     # None disables the in-engine app.
     rl_control_port: int | None = None
+    # Bind host for the in-engine RL control app. None binds the engine's
+    # --host. Bind a reachable address (and set --rl-control-api-key) when an
+    # external gateway drives this engine.
+    rl_control_host: str | None = None
+    # Bearer token the in-engine RL control app requires on every route. None
+    # leaves it open, which is what slime expects by default. Never exported in server info.
+    rl_control_api_key: str | None = None
     # Version identifier for the model weights. Stamped into every generation
     # response's meta_info so RL trainers know which policy version produced each
     # sample. Updated atomically after a successful weight push when the trainer
@@ -2241,6 +2248,21 @@ class ServerArgs:
             help="Port for the in-engine RL control-plane HTTP app (weight sync, "
             "pause/resume, memory occupation). Normally allocated automatically "
             "by the `ts serve` orchestrator.",
+        )
+        parser.add_argument(
+            "--rl-control-host",
+            type=str,
+            default=ServerArgs.rl_control_host,
+            help="Bind host for the in-engine RL control-plane HTTP app. Defaults to "
+            "--host. Bind a reachable address when an external gateway drives the "
+            "engine, and set --rl-control-api-key.",
+        )
+        parser.add_argument(
+            "--rl-control-api-key",
+            type=str,
+            default=ServerArgs.rl_control_api_key,
+            help="Bearer token required on every RL control-plane route. Unset "
+            "leaves the app open, which is what slime expects by default.",
         )
         parser.add_argument(
             "--weight-version",

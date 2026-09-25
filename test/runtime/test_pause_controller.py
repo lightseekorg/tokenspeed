@@ -22,7 +22,16 @@
 
 from __future__ import annotations
 
-from tokenspeed.runtime.engine.io_struct import (
+import os
+import sys
+
+# CI registration (AST-parsed, runtime no-op).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
+
+from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
     IsSchedulerPausedReqInput,
     IsSchedulerPausedReqOutput,
     PauseSchedulerReqInput,
@@ -30,7 +39,7 @@ from tokenspeed.runtime.engine.io_struct import (
     ResumeSchedulerReqInput,
     ResumeSchedulerReqOutput,
 )
-from tokenspeed.runtime.engine.pause import (
+from tokenspeed.runtime.engine.pause import (  # noqa: E402
     PauseController,
     PauseState,
     scheduler_drained,

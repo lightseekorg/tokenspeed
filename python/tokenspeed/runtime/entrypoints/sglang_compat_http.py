@@ -31,9 +31,10 @@ loop-bound. Use :func:`build_sglang_compat_app` to construct it.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Awaitable, Callable
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, get_args
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -43,14 +44,17 @@ from tokenspeed.runtime.cache.l3.backend import (
     resolve_l3_weight_version,
 )
 from tokenspeed.runtime.engine.io_struct import (
+    SUPPORTED_WEIGHT_UPDATE_SOURCES,
     DestroyWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqInput,
+    PauseMode,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
+from tokenspeed.runtime.entrypoints.rl_control import install_bearer_auth
 from tokenspeed.runtime.utils import get_colorful_logger
 
 if TYPE_CHECKING:
@@ -110,6 +114,54 @@ async def _guarded(
     return JSONResponse(payload, status_code=status)
 
 
+async def _json_body(request: Request) -> dict[str, Any]:
+    """The JSON object body. Missing, malformed or non-object is a client error."""
+    raw = await request.body()
+    if not raw:
+        raise ValueError("request body must be a JSON object")
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        raise ValueError(f"request body is not valid JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError("request body must be a JSON object")
+    return data
+
+
+async def _optional_json_body(request: Request) -> dict[str, Any]:
+    """Like :func:`_json_body`, but an absent or malformed body is ``{}``."""
+    try:
+        return await _json_body(request)
+    except ValueError:
+        return {}
+
+
+PAUSE_MODES: frozenset[str] = frozenset(get_args(PauseMode))
+
+
+def _unsupported_source(source: str) -> JSONResponse | None:
+    """A 501 refusal unless the scheduler implements this weight-update source.
+
+    The scheduler's dispatcher raises ``NotImplementedError`` on a request type
+    it has no branch for, which kills the scheduler process and the engine with
+    it. Refuse here instead of forwarding. ``None`` means the source is
+    supported and the route may run.
+    """
+    if source in SUPPORTED_WEIGHT_UPDATE_SOURCES:
+        return None
+    supported = ", ".join(sorted(SUPPORTED_WEIGHT_UPDATE_SOURCES))
+    return JSONResponse(
+        {
+            "success": False,
+            "message": (
+                f"update_weights_from_{source} is not implemented by this "
+                f"build's scheduler; supported sources: {supported}"
+            ),
+        },
+        status_code=HTTPStatus.NOT_IMPLEMENTED.value,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Process group setup
 # --------------------------------------------------------------------------- #
@@ -117,9 +169,8 @@ async def _guarded(
 
 @router.post("/init_weights_update_group")
 async def init_weights_update_group(request: Request) -> JSONResponse:
-    body = await request.json()
-
     async def _do() -> dict[str, Any]:
+        body = await _json_body(request)
         obj = InitWeightsUpdateGroupReqInput(
             master_address=str(body["master_address"]),
             master_port=int(body["master_port"]),
@@ -139,10 +190,7 @@ async def destroy_weights_update_group(request: Request) -> JSONResponse:
     async def _do() -> dict[str, Any]:
         # Body is optional: trainers that always call destroy (e.g. slime) may
         # send only ``{group_name}`` or nothing at all. Tolerate an empty body.
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
+        body = await _optional_json_body(request)
         obj = DestroyWeightsUpdateGroupReqInput(
             group_name=str(body.get("group_name", "weight_update_group")),
         )
@@ -159,9 +207,8 @@ async def destroy_weights_update_group(request: Request) -> JSONResponse:
 
 @router.post("/update_weights_from_distributed")
 async def update_weights_from_distributed(request: Request) -> JSONResponse:
-    body = await request.json()
-
     async def _do() -> dict[str, Any]:
+        body = await _json_body(request)
         names = list(body["names"])
         dtypes = list(body["dtypes"])  # SGLang field name
         shapes = [list(s) for s in body["shapes"]]
@@ -202,9 +249,12 @@ async def update_weights_from_distributed(request: Request) -> JSONResponse:
 
 @router.post("/update_weights_from_tensor")
 async def update_weights_from_tensor(request: Request) -> JSONResponse:
-    body = await request.json()
+    refusal = _unsupported_source("tensor")
+    if refusal is not None:
+        return refusal
 
     async def _do() -> dict[str, Any]:
+        body = await _json_body(request)
         obj = UpdateWeightsFromTensorReqInput(
             serialized_named_tensors=body["serialized_named_tensors"],
             load_format=body.get("load_format"),
@@ -221,9 +271,12 @@ async def update_weights_from_tensor(request: Request) -> JSONResponse:
 
 @router.post("/update_weights_from_disk")
 async def update_weights_from_disk(request: Request) -> JSONResponse:
-    body = await request.json()
+    refusal = _unsupported_source("disk")
+    if refusal is not None:
+        return refusal
 
     async def _do() -> dict[str, Any]:
+        body = await _json_body(request)
         obj = UpdateWeightFromDiskReqInput(
             model_path=str(body["model_path"]),
             load_format=body.get("load_format"),
@@ -245,17 +298,23 @@ async def update_weights_from_disk(request: Request) -> JSONResponse:
 @router.post("/pause_generation")
 async def pause_generation(request: Request) -> JSONResponse:
     async def _do() -> dict[str, Any]:
+        body = await _optional_json_body(request)
+        mode = str(body.get("mode", "wait"))
+        if mode not in PAUSE_MODES:
+            raise ValueError(
+                f"invalid pause mode: {mode!r} (expected one of {sorted(PAUSE_MODES)})"
+            )
         # Stop frontend admission before the native scheduler drain. Otherwise
         # a newly buffered request could hold the model-update reader lock.
         llm = _llm(request)
         llm.block_generation_admission()
         try:
-            if not await llm.pause_scheduler(mode="wait"):
+            if not await llm.pause_scheduler(mode=mode):
                 raise RuntimeError("Failed to pause generation.")
         except BaseException:
             llm.allow_generation_admission()
             raise
-        return {"success": True, "message": "Paused generation."}
+        return {"success": True, "message": "Paused generation.", "mode": mode}
 
     return await _guarded(_do)
 
@@ -277,7 +336,7 @@ async def continue_generation(request: Request) -> JSONResponse:
 # --------------------------------------------------------------------------- #
 
 
-@router.get("/flush_cache")
+@router.api_route("/flush_cache", methods=["GET", "POST"])
 async def flush_cache(request: Request) -> JSONResponse:
     async def _do() -> dict[str, Any]:
         await _llm(request).flush_cache()
@@ -289,10 +348,7 @@ async def flush_cache(request: Request) -> JSONResponse:
 @router.post("/release_memory_occupation")
 async def release_memory_occupation(request: Request) -> JSONResponse:
     async def _do() -> dict[str, Any]:
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
+        body = await _optional_json_body(request)
         result = await _llm(request).release_memory_occupation(
             ReleaseMemoryOccupationReqInput(tags=body.get("tags"))
         )
@@ -304,10 +360,7 @@ async def release_memory_occupation(request: Request) -> JSONResponse:
 @router.post("/resume_memory_occupation")
 async def resume_memory_occupation(request: Request) -> JSONResponse:
     async def _do() -> dict[str, Any]:
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
+        body = await _optional_json_body(request)
         result = await _llm(request).resume_memory_occupation(
             ResumeMemoryOccupationReqInput(tags=body.get("tags"))
         )
@@ -323,9 +376,8 @@ async def resume_memory_occupation(request: Request) -> JSONResponse:
 
 @router.post("/abort_request")
 async def abort_request(request: Request) -> JSONResponse:
-    body = await request.json()
-
     async def _do() -> dict[str, Any]:
+        body = await _json_body(request)
         llm = _llm(request)
         if body.get("abort_all"):
             # Native abort mode waits until scheduler state is drained. Resume
@@ -379,9 +431,8 @@ async def get_weight_version(request: Request) -> JSONResponse:
 
 @router.post("/update_weight_version")
 async def update_weight_version(request: Request) -> JSONResponse:
-    body = await request.json()
-
     async def _do() -> dict[str, Any]:
+        body = await _json_body(request)
         new_version = body.get("new_version")
         if new_version is None:
             raise ValueError("Missing 'new_version' in request body")
@@ -414,17 +465,22 @@ async def model_info(request: Request) -> JSONResponse:
 
 
 # --------------------------------------------------------------------------- #
-# App construction (standalone, for tests)
+# App construction
 # --------------------------------------------------------------------------- #
 
 
 def build_sglang_compat_app(async_llm: "AsyncLLM") -> FastAPI:
-    """Return a standalone FastAPI app exposing only the SGLang-compat routes.
+    """Return the FastAPI app exposing the RL control routes slime and a fronting gateway drive.
 
-    In production these routes are mounted on the shared RL control-plane app
-    (see ``AsyncLLM._serve_rl_control_plane``). This helper is for isolated tests.
+    This is the app ``AsyncLLM._serve_rl_control_plane`` serves in production
+    on ``--rl-control-port``; tests build it the same way. When
+    ``--rl-control-api-key`` is set every route requires that bearer.
     """
     app = FastAPI(title="tokenspeed SGLang-compatible RL control")
     app.state.async_llm = async_llm
+    server_args = getattr(async_llm, "server_args", None)
+    api_key = getattr(server_args, "rl_control_api_key", None)
+    if api_key:
+        install_bearer_auth(app, api_key)
     app.include_router(router)
     return app

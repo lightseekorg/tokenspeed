@@ -314,6 +314,10 @@ class RequestHandler:
                 self.send_func.send_pyobj(
                     SetInternalStateReqOutput(updated=False, server_args={})
                 )
+            # RL weight sync. A source with no branch below reaches the
+            # NotImplementedError at the end of this chain and kills the
+            # scheduler, so the control app refuses anything outside
+            # SUPPORTED_WEIGHT_UPDATE_SOURCES (io_struct); keep the two in step.
             elif isinstance(recv_req, InitWeightsUpdateGroupReqInput):
                 # RL weight sync: join the trainer's NCCL group on this worker.
                 ok, msg = self._device.update_weights(recv_req)

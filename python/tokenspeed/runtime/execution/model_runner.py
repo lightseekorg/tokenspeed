@@ -27,6 +27,10 @@ import torch
 
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
+from tokenspeed.runtime.execution.weight_update_group import (
+    _assert_not_split,
+    _no_default_group_split,
+)
 from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
 from tokenspeed.runtime.multimodal.embedder import warmup_multimodal_encoders
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -247,7 +251,10 @@ class ModelRunner:
         differently and never forms a joint communicator with a torch group, so
         the broadcast would deadlock. Build a standalone, non-default group (via
         the same private helper torch's own ``init_process_group`` uses) so it
-        never collides with the engine's own world.
+        never collides with the engine's own world. Because that world group is
+        created with a bound device, we also have to guard the new group
+        against torch silently splitting it off the engine's own communicator
+        instead of rendezvousing with the trainer.
         """
         from packaging.version import parse as _parse_version
         from torch.distributed.distributed_c10d import (
@@ -279,16 +286,18 @@ class ModelRunner:
                 if _parse_version(torch.__version__) >= _parse_version("2.6")
                 else "pg_options"
             )
-            pg, _ = _new_process_group_helper(
-                world_size,
-                rank,
-                [],
-                backend,
-                store,
-                group_name=group_name,
-                **{opt: None},
-                timeout=timeout,
-            )
+            with _no_default_group_split():
+                pg, _ = _new_process_group_helper(
+                    world_size,
+                    rank,
+                    [],
+                    backend,
+                    store,
+                    group_name=group_name,
+                    **{opt: None},
+                    timeout=timeout,
+                )
+            _assert_not_split(pg, device)
             _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
 
             self._weight_update_pg = pg
