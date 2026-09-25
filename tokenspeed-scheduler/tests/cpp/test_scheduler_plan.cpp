@@ -410,6 +410,107 @@ TEST_F(PrefillRoleKvCacheEventTestSuite, AdmissionThatEvictsAndRepublishesABound
     }
 }
 
+// Two cache groups with skewed block granularities, the DeepSeek V4.1 shape:
+// comparing position ranks across groups makes eviction strip the fine
+// group's copies of a whole boundary range before the coarse group gives up
+// a page, leaving those boundaries partially resident.
+class SkewedGroupPrefillKvCacheEventTestSuite : public PrefillRoleKvCacheEventTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = PrefillRoleKvCacheEventTestSuite::MakeConfig();
+        cfg.prefix_granularity = 4;
+        cfg.max_scheduled_tokens = 13;
+        cfg.device_allocator.total_pages = 9;
+        // The fine group comes first so it wins eviction-rank ties against
+        // the coarse group's copy of the same boundary.
+        CacheGroupConfig fine = cfg.cache_groups.front();
+        fine.group_id = "fine_attention";
+        fine.block_granularity = 2;
+        fine.cache_blocks_per_lcm_block = 2;
+        fine.total_pages = 2 * cfg.device_allocator.total_pages;
+        fine.transfer_policy = CacheTransferPolicy::FullSuffix;
+        CacheGroupConfig& coarse = cfg.cache_groups.front();
+        coarse.block_granularity = cfg.prefix_granularity;
+        coarse.total_pages = cfg.device_allocator.total_pages;
+        cfg.cache_groups.insert(cfg.cache_groups.begin(), std::move(fine));
+        return cfg;
+    }
+
+    // Runs a fresh prompt to its remote decode and optionally releases its
+    // PD pin, without draining any KV events.
+    void RunPrefill(const RequestSpec& spec, bool ack) {
+        Submit(spec);
+        SendBootstrapped(spec.request_id);
+        const ExecutionPlan compute_round = PlanOnce();
+        const ForwardBatch* batch = FindForwardBatch(compute_round);
+        ASSERT_NE(batch, nullptr);
+        ASSERT_EQ(batch->request_ids, std::vector<std::string>{spec.request_id});
+        SendForwardDone(spec.request_id, {42});
+        ASSERT_TRUE(PlanOnce().remote_decode.has_value());
+        if (ack) {
+            SendPdSucceeded(spec.request_id);
+        }
+    }
+};
+
+// Evictions mark boundaries suffix-first, so a partially resident run whose
+// last copies are evicted and then recomputed within one drain window is
+// marked child-first. The drain must still emit the recomputed run's Stored
+// events parent-first: consumers resolve each event's parent_block_hash
+// against what they have already received, so a child arriving ahead of its
+// parent is dropped.
+TEST_F(SkewedGroupPrefillKvCacheEventTestSuite, RepublishedRunEmitsStoredParentFirst) {
+    // seed publishes a three-boundary chain; the evictions below strip it
+    // from its suffix.
+    RequestSpec seed = MakeRequestSpec("seed", 3);
+    RunPrefill(seed, /*ack=*/true);
+    std::vector<std::uint64_t> chain_hashes;
+    for (const KvCacheEvent& event : scheduler_->DrainKvEvents()) {
+        ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(event));
+        chain_hashes.push_back(std::get<KvBlockStoredEvent>(event).block_hashes.front());
+    }
+    ASSERT_EQ(chain_hashes.size(), 3u);
+
+    // filler1's admission evicts across the groups' skewed ranks, taking the
+    // chain's fine-group pages and some coarse residues from the back. The
+    // first two boundaries come out partially resident: reported removed,
+    // descriptors kept.
+    RunPrefill(MakeRequestSpec("filler1", 2, 100), /*ack=*/true);
+    std::unordered_set<std::uint64_t> removed;
+    for (const KvCacheEvent& event : scheduler_->DrainKvEvents()) {
+        if (std::holds_alternative<KvBlockRemovedEvent>(event)) {
+            removed.insert(std::get<KvBlockRemovedEvent>(event).block_hashes.front());
+        }
+    }
+    EXPECT_TRUE(removed.contains(chain_hashes[0]));
+    EXPECT_TRUE(removed.contains(chain_hashes[1]));
+
+    // No drain from here on: the window covers everything below, as one
+    // production round covers one admission that evicts and one that
+    // publishes. filler2's admission evicts the surviving copies
+    // suffix-first, marking the deeper boundary before its parent.
+    RunPrefill(MakeRequestSpec("filler2", 2, 200), /*ack=*/true);
+
+    // dup recomputes the chain; its remote decode publishes the new copies.
+    RequestSpec dup = MakeRequestSpec("dup", 3);
+    dup.tokens = seed.tokens;
+    RunPrefill(dup, /*ack=*/false);
+
+    // The drain must order the chain's Stored events parent-first even
+    // though the evictions marked it child-first.
+    std::vector<std::uint64_t> stored_order;
+    for (const KvCacheEvent& event : scheduler_->DrainKvEvents()) {
+        if (!std::holds_alternative<KvBlockStoredEvent>(event)) {
+            continue;
+        }
+        const std::uint64_t hash = std::get<KvBlockStoredEvent>(event).block_hashes.front();
+        if (std::find(chain_hashes.begin(), chain_hashes.end(), hash) != chain_hashes.end()) {
+            stored_order.push_back(hash);
+        }
+    }
+    EXPECT_EQ(stored_order, chain_hashes);
+}
+
 TEST_F(SchedulerTestSuite, SubmitRequestsRejectsEmptyTokens) {
     EXPECT_THROW(Submit(RequestSpec{.request_id = "empty"}), std::invalid_argument);
 }

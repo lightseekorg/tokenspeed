@@ -138,8 +138,13 @@ std::size_t Scheduler::groupIndex(const std::string& group_id) const {
 
 std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
     // An event reports the net change since the last drain: a boundary is
-    // published exactly while every child block of it is cached.
-    std::vector<KvCacheEvent> events;
+    // published exactly while every child block of it is cached. Mutations
+    // mark boundaries in whatever order the coordinator touches pages, so the
+    // batch is sorted by chain depth: removals leaf-first, then Stored
+    // parent-first, because consumers resolve a Stored event's
+    // parent_block_hash against what they have already received.
+    std::vector<std::pair<std::int32_t, KvCacheEvent>> removed;
+    std::vector<std::pair<std::int32_t, KvCacheEvent>> stored;
     for (const CacheKey& boundary : std::exchange(kv_event_boundaries_to_reconcile_, {})) {
         const auto it = kv_event_boundaries_.find(boundary);
         FatalCheck(it != kv_event_boundaries_.end(),
@@ -149,14 +154,25 @@ std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
         const CacheCoordinator::BoundaryResidency residency = coordinator_.DeviceBoundaryResidency(boundary);
         const bool complete = residency == CacheCoordinator::BoundaryResidency::kComplete;
         if (complete && !event_boundary.published) {
-            events.emplace_back(event_boundary.stored);
+            stored.emplace_back(event_boundary.depth, event_boundary.stored);
         } else if (!complete && event_boundary.published) {
-            events.emplace_back(KvBlockRemovedEvent{.block_hashes = event_boundary.stored.block_hashes});
+            removed.emplace_back(event_boundary.depth,
+                                 KvBlockRemovedEvent{.block_hashes = event_boundary.stored.block_hashes});
         }
         event_boundary.published = complete;
         if (residency == CacheCoordinator::BoundaryResidency::kNone) {
             kv_event_boundaries_.erase(it);
         }
+    }
+    std::stable_sort(removed.begin(), removed.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::stable_sort(stored.begin(), stored.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::vector<KvCacheEvent> events;
+    events.reserve(removed.size() + stored.size());
+    for (auto& [depth, event] : removed) {
+        events.push_back(std::move(event));
+    }
+    for (auto& [depth, event] : stored) {
+        events.push_back(std::move(event));
     }
     return events;
 }
@@ -233,8 +249,10 @@ void Scheduler::registerKvEventPrefixPages(const Request& request, std::span<con
             .token_ids = std::vector<std::int32_t>(token_pages[i].begin(), token_pages[i].end()),
             .block_size = config_.prefix_granularity,
         };
-        const auto [it, inserted] = kv_event_boundaries_.try_emplace(key, KvEventBoundary{.stored = std::move(event)});
-        FatalCheck(inserted || it->second.stored.block_hashes.front() == progress.block_hashes[i],
+        const auto [it, inserted] = kv_event_boundaries_.try_emplace(
+            key, KvEventBoundary{.stored = std::move(event), .depth = static_cast<std::int32_t>(i)});
+        FatalCheck(inserted || (it->second.stored.block_hashes.front() == progress.block_hashes[i] &&
+                                it->second.depth == static_cast<std::int32_t>(i)),
                    "one cache content hash mapped to different KV event blocks");
         // The next drain drops the descriptor if the publication never lands.
         markKvEventBoundaryForReconcile(key);

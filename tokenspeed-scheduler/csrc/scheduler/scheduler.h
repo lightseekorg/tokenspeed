@@ -339,13 +339,17 @@ private:
     // with a cached child.
     struct KvEventBoundary {
         KvBlockStoredEvent stored;
+        // Position in the prefix chain (page index). Consumers resolve a
+        // Stored event's parent_block_hash on receipt, so DrainKvEvents
+        // orders each batch by depth rather than by mutation order.
+        std::int32_t depth{0};
         bool published{false};
         bool needs_reconcile{false};
     };
     std::unordered_map<CacheKey, KvEventBoundary, CacheKeyHash> kv_event_boundaries_;
-    // The boundaries marked for reconcile, in first-touch order: registration
-    // touches a request's pages parent first, so a parent's Stored precedes
-    // its child's.
+    // The boundaries marked for reconcile. Mutations mark them in whatever
+    // order the coordinator touches pages (evictions run suffix-first), so
+    // this order carries no meaning; DrainKvEvents sorts the batch.
     std::vector<CacheKey> kv_event_boundaries_to_reconcile_;
 };
 
