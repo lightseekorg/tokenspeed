@@ -242,7 +242,6 @@ def prepare_k3_all_reduce_buffers(
         if expand_moe_window
         else min(max_num_tokens, _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS)
     )
-    # Reserve the reusable PP1 residual before cache sizing.
     moe_tail_max_rows = (
         max_num_tokens // 8 * 8
         if tp8_moe
