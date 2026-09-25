@@ -123,6 +123,7 @@ def _recipe(
         ),
         draft_attn_config=draft_config,
         cache_budget_bytes=1 << 20,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )

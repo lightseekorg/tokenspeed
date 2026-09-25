@@ -22,6 +22,8 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
+from tokenspeed.runtime.execution.memory_delta import NULL_MEMORY_DELTA_OBSERVER
+
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
@@ -194,7 +196,9 @@ class PrefillCaptureStreamTest(unittest.TestCase):
         for wrapper in (SimpleNamespace(stream=torch.cuda.Stream()), None):
             with self.subTest(explicit_stream=wrapper is not None):
                 owner = StreamProbe()
-                capture, output = owner._capture_bucket(8, wrapper)
+                capture, output = owner._capture_bucket(
+                    8, wrapper, NULL_MEMORY_DELTA_OBSERVER.measure("prefill")
+                )
                 self.assertEqual(
                     owner.warmed_streams, {int(capture.stream.cuda_stream)}
                 )
@@ -540,8 +544,8 @@ class DummyGroupTablesTest(unittest.TestCase):
         """A state group needs one working block per request: two rows sharing
         one silently clobber each other. The runtime check is gated on
         TOKENSPEED_CACHE_DEBUG, so a regression would be silent and this test
-        is the guard. Reachable at bs>1, which ``_autotune`` produces whenever
-        the chunk budget exceeds the model context -- and ``_autotune`` runs
+        is the guard. Reachable at bs>1, which ``autotune`` produces whenever
+        the chunk budget exceeds the model context -- and ``autotune`` runs
         even with the prefill graph disabled."""
         import torch
 
@@ -957,7 +961,7 @@ class CaptureFailureIsLoudTest(unittest.TestCase):
             weight=self.torch.zeros(2, 8, dtype=self.torch.float32)
         )
 
-        def _capture_all_buckets(_decode_wrapper):
+        def _capture_all_buckets(_decode_wrapper, _entries, _observer):
             if raises is not None:
                 raise raises
 
@@ -971,18 +975,18 @@ class CaptureFailureIsLoudTest(unittest.TestCase):
         cause = RuntimeError("backend refused the dummy batch")
         pg = self._bare(raises=cause)
         with self.assertRaises(RuntimeError) as caught:
-            pg.capture(None)
+            pg.capture(None, entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
         self.assertIs(caught.exception, cause)
 
     def test_successful_capture_does_not_raise(self):
-        self._bare().capture(None)
+        self._bare().capture(None, entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
 
     def test_oom_propagates(self):
         """OOM keeps its own type and message. The capture pool not fitting is
         an operator-visible sizing failure, not something to recover from."""
         pg = self._bare(raises=self.torch.cuda.OutOfMemoryError("no room"))
         with self.assertRaises(self.torch.cuda.OutOfMemoryError):
-            pg.capture(None)
+            pg.capture(None, entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
 
 
 class NarrowingPrefillGraphTest(unittest.TestCase):

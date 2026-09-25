@@ -350,6 +350,7 @@ def _create_config_pool(config):
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=config.cache_cell_size() * LAYERS * 512,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )

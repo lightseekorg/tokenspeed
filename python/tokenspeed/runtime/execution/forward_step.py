@@ -24,7 +24,7 @@ import bisect
 import gc
 import queue
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from typing import TYPE_CHECKING
 
 import torch
@@ -32,6 +32,10 @@ import torch.distributed as dist
 import tqdm
 
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.cudagraph_memory import (
+    CapturedLadder,
+    probe_positions,
+)
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -40,6 +44,9 @@ from tokenspeed.runtime.execution.graph_ptr_guard import (
     graph_debug_enabled,
     snapshot_graph_metadata,
     verify_graph_metadata,
+)
+from tokenspeed.runtime.execution.memory_delta import (
+    MemoryDeltaObserver,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     compute_max_logical_pages_for_capture,
@@ -311,24 +318,34 @@ class ForwardStepRunner:
     # Graph capture
     # ------------------------------------------------------------------
 
-    def capture(self):
+    def capture(
+        self,
+        *,
+        entries: int | None,
+        observer: MemoryDeltaObserver,
+    ):
         """
         Capture CUDA graphs for all configured batch sizes.
 
         Args:
-            forward_func: ModelExecutor.forward_step(bs, ctx, sampling_info).
+            entries: Capture only the positions a probe of ``entries`` samples,
+                for a caller that measures a sample rather than serving from
+                it. None captures the whole ladder.
+            observer: Measured around each capture, for the same caller.
         """
         rank = self.global_rank
         with freeze_gc(self.enable_cudagraph_gc):
             # Capture backend-declared sampler variants explicitly.
+            ladders = self.capture_ladders(entries)
             capture_items = [
-                (variant, bs)
-                for variant in self._cuda_graph_capture_variants()
-                for bs in sorted(self.capture_bs, reverse=True)
+                (variant, ladders[f"decode:{variant}"].widths[i])
+                for variant in self.capture_plan
+                for i in ladders[f"decode:{variant}"].sampled
             ]
             capture_range = tqdm.tqdm(capture_items) if rank == 0 else capture_items
             if rank == 0:
-                logger.info(f"Capturing batches: {self.capture_bs!s}")
+                batch_sizes = list(dict.fromkeys(bs for _variant, bs in capture_items))
+                logger.info(f"Capturing batches: {batch_sizes!s}")
             for variant, bs in capture_range:
                 if rank == 0:
                     avail_mem = get_available_gpu_memory(
@@ -342,9 +359,56 @@ class ForwardStepRunner:
                     capture_range.set_description(
                         f"Capturing batches ({bs=}{variant_desc} {avail_mem=:.2f} GB)"
                     )
-                graph, output_buffers = self._capture_one(bs, variant=variant)
+                graph, output_buffers = self._capture_one(
+                    bs, variant=variant, observer=observer.measure(f"decode:{variant}")
+                )
                 self.graphs[(variant, bs)] = graph
                 self.output_buffers[(variant, bs)] = output_buffers
+
+    @property
+    def capture_plan(self) -> dict[str, list[int]]:
+        """Batch sizes a full capture records, per sampler variant, in order.
+
+        The one channel: the capture loop iterates it and the projection counts
+        it. Keyed by variant rather than by series name -- the series name is
+        how the projection labels a ladder, not something the capture knows.
+        """
+        if self.disable:
+            return {}
+        ladder = sorted(self.capture_bs, reverse=True)
+        return {
+            variant: list(ladder) for variant in self._cuda_graph_capture_variants()
+        }
+
+    def capture_ladders(self, entries: int | None) -> dict[str, CapturedLadder]:
+        """Each variant's batch sizes off the plan, and the positions ``entries`` samples.
+
+        One series each: a variant opens its own captured buffers, so its
+        first capture is a one-off that must not be extrapolated across the
+        ladder entries the probe did not sample.
+        """
+        return {
+            f"decode:{variant}": CapturedLadder(
+                ladder, probe_positions(len(ladder), entries)
+            )
+            for variant, ladder in self.capture_plan.items()
+        }
+
+    def release_graphs(self) -> None:
+        """Drop the captured graphs and the pool they share.
+
+        The buffers the graphs recorded belong to the bound cache pool, so a
+        caller that rebinds releases here first. The module-level mempool
+        handle goes with them: the next capture starts a fresh one rather
+        than reusing blocks these graphs still name.
+        """
+        global global_graph_memory_pool
+
+        self.graphs.clear()
+        self.output_buffers.clear()
+        self._metadata_snapshots.clear()
+        # The tables name no arena; only the graphs and their pool go.
+        global_graph_memory_pool = None
 
     def _cuda_graph_capture_variants(self) -> tuple[str, ...]:
         if self.sampling_backend is None:
@@ -406,7 +470,13 @@ class ForwardStepRunner:
                 self.draft_attn_backend, snapshots["draft"], context=f"draft, {context}"
             )
 
-    def _capture_one(self, bs: int, variant: str = CUDA_GRAPH_VARIANT_DEFAULT):
+    def _capture_one(
+        self,
+        bs: int,
+        *,
+        observer: AbstractContextManager[None],
+        variant: str = CUDA_GRAPH_VARIANT_DEFAULT,
+    ):
         graph_cls = (
             self.device_module.NPUGraph
             if self.device == "npu"
@@ -536,7 +606,7 @@ class ForwardStepRunner:
         _is_capture_mode = True
         global global_graph_memory_pool
         graph_kwargs = {"auto_dispatch_capture": True} if self.device == "npu" else {}
-        with self.device_module.graph(
+        with observer, self.device_module.graph(
             graph,
             pool=global_graph_memory_pool,
             stream=self.stream,

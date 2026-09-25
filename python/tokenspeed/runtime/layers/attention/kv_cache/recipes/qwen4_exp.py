@@ -203,6 +203,11 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         return tuple(compressed_fields), tuple(recent_fields)
 
     @override
+    def backends_accept_pool_replacement(self) -> bool:
+        """The PLE and QSA indexer children latch their pool at construction."""
+        return False
+
+    @override
     def workspace_bytes(self) -> int:
         """GDN/PLE verify staging and commit rows, plus QSA verify staging."""
         if (

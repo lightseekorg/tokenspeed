@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import logging
 from typing import TYPE_CHECKING
@@ -63,6 +64,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     CacheModelFamily,
     CachePoolSpec,
+    cache_recipe,
     prepare_cache_setup,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
@@ -71,6 +73,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 )
 from tokenspeed.runtime.layers.attention.utils import (
     profile_available_cache_memory_bytes,
+    reserve_cache_budget,
 )
 
 logger = logging.getLogger(__name__)
@@ -106,6 +109,8 @@ class AttentionBuild:
     draft_attn_backend: AttentionBackend | None
     draft_token_to_kv_pool: CachePool | None
     cache_storage: dict
+    # The budget the memory profile gave before any CUDA-graph reserve.
+    profiled_cache_bytes: int
     cache_fields_by_stage: tuple[tuple[str, ...], ...]
     producer_fields_by_step: tuple[tuple[str, ...], ...]
     logical_plan: CacheMemoryPlan | None
@@ -904,8 +909,13 @@ def _create_target_components(
     is_hybrid_linear: bool,
     is_kda: bool,
     is_inkling: bool,
+    backend: AttentionBackend | None,
 ):
-    """The target's compute view onto the shared arena + target backend."""
+    """The target's compute view onto the shared arena + target backend.
+
+    ``backend`` reuses an existing one, for a caller that is building a
+    replacement arena for backends it already owns.
+    """
     # The arena owns every planned field; this view binds only the target
     # model's layer window.
     pool = create_cache_pool(
@@ -915,6 +925,8 @@ def _create_target_components(
         num_layers=len(cache_spec.layer_types),
         rank=rank,
     )
+    if backend is not None:
+        return backend, pool
     if is_hybrid_linear:
         backend = _create_hybrid_linear_attn_backend(
             server_args,
@@ -958,6 +970,7 @@ def _create_draft_components(
     is_hybrid_linear: bool,
     is_kda: bool,
     is_inkling: bool,
+    backend: AttentionBackend | None,
 ):
     """Draft backend + the ONE arena viewed through the draft's layer window.
 
@@ -985,6 +998,8 @@ def _create_draft_components(
         rank=pool.rank,
         field_layer_offset=num_target_layers,
     )
+    if backend is not None:
+        return backend, draft_pool
     if is_hybrid_linear:
         backend = _create_hybrid_linear_attn_backend(
             server_args,
@@ -1062,6 +1077,43 @@ def _narrow_spec_for_pp(
     )
 
 
+def cudagraph_probe_supported(
+    server_args: ServerArgs, model_config: ModelConfig
+) -> bool:
+    """Whether a probe-sized arena can stand in for this family's real one.
+
+    Resolved the way ``create_attn_components`` resolves it, without building
+    a pool and without writing back into ``server_args`` -- the build that
+    follows reads the operator's own backend choice, and family dispatch keys
+    on architecture facts rather than on the backend name. Two families cannot:
+    one stages speculative verify scratch in the bound pool, which needs a row
+    per request at the serving concurrency; the other's backends latch their
+    pool at construction and reject a rebind.
+    """
+    # The build's own resolver, on a copy: deriving it here would drift.
+    probe_args = copy.copy(server_args)
+    target = _resolve_attn_side(model_config, probe_args.attention_backend)
+    _apply_backend_overrides(probe_args, target, None)
+    config = _create_attn_config(probe_args, model_config)
+    # The two seams read only server_args and attn_config; the rest is fabricated.
+    recipe = cache_recipe(
+        _resolve_cache_family(target, config),
+        server_args=probe_args,
+        model_config=model_config,
+        attn_config=config,
+        draft_model_config=None,
+        draft_attn_config=None,
+        cache_budget_bytes=0,
+        probe_batch_rows=None,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    )
+    return (
+        not recipe.verify_scratch_in_pool()
+        and recipe.backends_accept_pool_replacement()
+    )
+
+
 def create_attn_components(
     server_args: ServerArgs,
     model_config: ModelConfig,
@@ -1072,8 +1124,21 @@ def create_attn_components(
     draft_model_config: ModelConfig | None = None,
     decode_input_tokens: int = 1,
     overlap_schedule_depth: int = 0,
+    *,
+    graph_reserve_bytes: int,
+    probe_batch_rows: int | None,
+    profiled_cache_bytes: int | None,
+    reuse_target_backend: AttentionBackend | None,
+    reuse_draft_backend: AttentionBackend | None,
 ) -> AttentionBuild:
     """Build attention resources and return their explicit cache placement."""
+    if probe_batch_rows is not None and graph_reserve_bytes:
+        # An arena sized by block count ignores the budget, so it cannot honour one.
+        raise ValueError(
+            f"a probe arena of {probe_batch_rows} blocks cannot also "
+            f"reserve {graph_reserve_bytes} bytes: the two size the pool by "
+            "different rules and only one of them can be applied"
+        )
     target = _resolve_attn_side(model_config, server_args.attention_backend)
     draft = (
         _resolve_attn_side(draft_model_config, server_args.drafter_attention_backend)
@@ -1137,14 +1202,17 @@ def create_attn_components(
         cache_family,
         draft_cache_family,
     )
-    cache_memory = profile_available_cache_memory_bytes(
-        attn_config=config,
-        gpu_id=gpu_id,
-        tp_size=server_args.mapping.world_size,
-        gpu_memory_utilization=server_args.gpu_memory_utilization,
-        total_gpu_memory=gpu_memory,
-        world_group=server_args.mapping.world_group,
-    )
+    # One profile per boot, where a boot without a reserve takes it; a rebuild reuses it.
+    if profiled_cache_bytes is None:
+        profiled_cache_bytes = profile_available_cache_memory_bytes(
+            attn_config=config,
+            gpu_id=gpu_id,
+            tp_size=server_args.mapping.world_size,
+            gpu_memory_utilization=server_args.gpu_memory_utilization,
+            total_gpu_memory=gpu_memory,
+            world_group=server_args.mapping.world_group,
+        )
+    cache_memory = reserve_cache_budget(profiled_cache_bytes, graph_reserve_bytes)
     cache_setup = prepare_cache_setup(
         family=cache_family,
         server_args=server_args,
@@ -1155,6 +1223,7 @@ def create_attn_components(
         cache_budget_bytes=cache_memory,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
+        probe_batch_rows=probe_batch_rows,
     )
     spec = cache_setup.spec
     num_target_cache_layers = cache_setup.num_target_layers
@@ -1207,7 +1276,9 @@ def create_attn_components(
         )
     cache_budget_bytes = cache_setup.cache_budget_bytes
     fixed_workspace_bytes = cache_setup.fixed_workspace_bytes
-    logger.info(
+    # A probe arena is not the served geometry; it must not read as one.
+    logger.log(
+        logging.DEBUG if probe_batch_rows is not None else logging.INFO,
         f"Cache profile: parent_bytes={spec.memory_plan.lcm_block_bytes:d}, P="
         f"{spec.memory_plan.prefix_granularity:d}, parents="
         f"{spec.memory_plan.num_lcm_blocks:d}, token_capacity={spec.token_capacity:d}, "
@@ -1233,6 +1304,7 @@ def create_attn_components(
         enable_memory_saver=enable_memory_saver,
     )
     backend, pool = _create_target_components(
+        backend=reuse_target_backend,
         server_args=server_args,
         model_config=model_config,
         config=config,
@@ -1245,6 +1317,7 @@ def create_attn_components(
         is_inkling=target.is_inkling,
     )
     draft_attn_backend, draft_pool = _create_draft_components(
+        backend=reuse_draft_backend,
         server_args=server_args,
         model_config=draft_model_config,
         config=(
@@ -1305,6 +1378,7 @@ def create_attn_components(
         draft_attn_backend=draft_attn_backend,
         draft_token_to_kv_pool=draft_pool,
         cache_storage=cache_storage,
+        profiled_cache_bytes=profiled_cache_bytes,
         cache_fields_by_stage=cache_fields_by_stage,
         producer_fields_by_step=stage_schedules[server_args.mapping.pp_rank],
         logical_plan=logical_plan,

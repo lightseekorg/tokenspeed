@@ -299,6 +299,7 @@ def _v4_recipe(
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=1 << 34,
+        probe_batch_rows=None,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=0,
     )
@@ -6865,6 +6866,7 @@ def test_v4_pd_recipe_and_readiness_follow_cache_producers():
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=1 << 30,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     ).setup()

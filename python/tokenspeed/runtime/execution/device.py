@@ -93,9 +93,16 @@ from tokenspeed.runtime.utils.env import envs
 logger = get_colorful_logger(__name__)
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.configs.model_config import ModelConfig
+    from tokenspeed.runtime.engine.scheduler_utils import SchedulerCacheGeometry
+    from tokenspeed.runtime.execution.model_executor import ModelExecutor
+    from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
         CacheMemoryPlan,
     )
+    from tokenspeed.runtime.layers.attention.registry import AttentionBuild
+    from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
 @dataclass(frozen=True)
@@ -820,6 +827,122 @@ def arm_data_plane_sync_debug(device: str) -> None:
     )
 
 
+def _cudagraph_probe_refusal(
+    server_args: ServerArgs, model_config: ModelConfig, model: torch.nn.Module
+) -> str | None:
+    """Why this boot cannot use a probe, or None when it can.
+
+    ``enforce_eager`` captures nothing to measure. A family that stages
+    speculative verify scratch in the bound pool needs a row per request at
+    the serving concurrency, which a probe arena can only supply by growing
+    to serving size -- measured at 31 GiB for Kimi-K3 at ``--max-num-seqs
+    256``, for four captures it then throws away. A narrowing model's decoder
+    ladder fabricates a request per ``max_decoder_rows_per_request`` rows,
+    which the floor cannot bound before the model is built.
+    """
+    from tokenspeed.runtime.execution.prefill_graph import narrowing_prefill_model
+    from tokenspeed.runtime.layers.attention.registry import (
+        cudagraph_probe_supported,
+    )
+
+    if server_args.disable_cudagraph_memory_reserve:
+        return "--disable-cudagraph-memory-reserve is set"
+    if server_args.enforce_eager:
+        return "--enforce-eager captures no graphs"
+    if narrowing_prefill_model(model) is not None:
+        return "a narrowing prefill model's decoder ladder is unbounded before build"
+    if not cudagraph_probe_supported(server_args, model_config):
+        return "this cache family cannot bind a probe-sized arena"
+    return None
+
+
+@dataclass(frozen=True)
+class PoolViews:
+    """What the boot derives from one bound pool."""
+
+    token_to_kv_pool: CachePool
+    draft_token_to_kv_pool: CachePool | None
+    cache_geometry: SchedulerCacheGeometry
+    cache_groups: list
+
+
+def pool_views(attention: AttentionBuild) -> PoolViews:
+    """Derive all four together, from the pool the caller was handed.
+
+    A rebind that refreshes the pools but leaves the scheduler geometry on the
+    probe arena admits against a handful of blocks while the pool holds
+    thousands, and fails at serving rather than at boot. Named fields rather
+    than a tuple: positional unpacking makes transposing target and draft, or
+    binding a geometry to the wrong name, invisible at the call site.
+    """
+    from tokenspeed.runtime.engine.scheduler_utils import (
+        pool_to_cache_groups,
+        scheduler_cache_geometry_from_pool,
+    )
+
+    pool = attention.token_to_kv_pool
+    return PoolViews(
+        token_to_kv_pool=pool,
+        draft_token_to_kv_pool=attention.draft_token_to_kv_pool,
+        cache_geometry=scheduler_cache_geometry_from_pool(pool),
+        cache_groups=pool_to_cache_groups(pool),
+    )
+
+
+def _rebind_under_reserve(
+    executor: ModelExecutor,
+    build_components: Callable[..., AttentionBuild],
+    server_args: ServerArgs,
+    gpu_id: int,
+    probe: AttentionBuild,
+    requested_backends: tuple[str | None, str | None],
+) -> tuple[AttentionBuild, PoolViews]:
+    """Rebuild the real pool under the probe's reserve, and its views with it.
+
+    Returned together so no caller can pair the rebuilt pool with views still
+    derived from the probe arena. The probe build wrote its backend resolution
+    into ``server_args``; the rebuild resolves again from the operator's
+    ``requested_backends``, so both builds pick the same backend and geometry.
+    """
+    from tokenspeed.runtime.execution.cudagraph_memory import reserve_and_rebind
+
+    server_args.attention_backend, server_args.drafter_attention_backend = (
+        requested_backends
+    )
+    attention = reserve_and_rebind(
+        executor,
+        build_components,
+        server_args,
+        gpu_id,
+        profiled_cache_bytes=probe.profiled_cache_bytes,
+    )
+    return attention, pool_views(attention)
+
+
+def probe_arena_floor(
+    server_args: ServerArgs, model_config: ModelConfig, max_forward_tokens: int
+) -> int:
+    """Parent blocks a probe arena needs for the widest row the boot fabricates.
+
+    Both terms track a knob: the ladder is built from the resolved prefill-graph
+    ceiling, which is a default rather than zero when unset, and a configured
+    capture batch size fabricates that many rows whatever the bucket. Returned
+    rather than inlined so a test can assert the number instead of the source.
+    """
+    from tokenspeed.runtime.execution.cudagraph_memory import probe_arena_parent_blocks
+    from tokenspeed.runtime.execution.model_executor import (
+        _resolve_prefill_graph_max_tokens,
+    )
+
+    return probe_arena_parent_blocks(
+        max_forward_tokens=max(
+            max_forward_tokens, _resolve_prefill_graph_max_tokens(server_args)
+        ),
+        context_len=model_config.context_len,
+        capture_batch_sizes=server_args.prefill_graph_capture_batch_sizes,
+    )
+
+
 def build_device_side(
     *,
     server_args,
@@ -873,8 +996,6 @@ def build_device_side(
     from tokenspeed.runtime.engine.scheduler_utils import (
         aligned_max_scheduled_tokens,
         log_gpu_memory_summary,
-        pool_to_cache_groups,
-        scheduler_cache_geometry_from_pool,
     )
     from tokenspeed.runtime.execution.factory import (
         ModelExecutorConfig,
@@ -882,6 +1003,7 @@ def build_device_side(
         create_model_executor,
         create_model_runner,
     )
+    from tokenspeed.runtime.execution.memory_delta import NULL_MEMORY_DELTA_OBSERVER
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
@@ -905,28 +1027,57 @@ def build_device_side(
     if draft is not None:
         draft.prepare_communication_runtime(max_forward_tokens)
 
-    attention = create_attn_components(
-        server_args,
-        model_config,
-        gpu_id,
-        global_rank,
-        min_per_gpu_mem,
-        server_args.enable_memory_saver,
-        draft_model_config,
-        decode_input_tokens=decode_input_tokens,
-        overlap_schedule_depth=overlap_schedule_depth,
-    )
-    token_to_kv_pool = attention.token_to_kv_pool
-    draft_token_to_kv_pool = attention.draft_token_to_kv_pool
+    def build_components(
+        *,
+        graph_reserve_bytes: int,
+        probe_batch_rows: int | None,
+        profiled_cache_bytes: int | None,
+        reuse_target_backend: AttentionBackend | None,
+        reuse_draft_backend: AttentionBackend | None,
+    ) -> AttentionBuild:
+        return create_attn_components(
+            server_args,
+            model_config,
+            gpu_id,
+            global_rank,
+            min_per_gpu_mem,
+            server_args.enable_memory_saver,
+            draft_model_config,
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=overlap_schedule_depth,
+            graph_reserve_bytes=graph_reserve_bytes,
+            probe_batch_rows=probe_batch_rows,
+            profiled_cache_bytes=profiled_cache_bytes,
+            reuse_target_backend=reuse_target_backend,
+            reuse_draft_backend=reuse_draft_backend,
+        )
 
-    cache_geometry = scheduler_cache_geometry_from_pool(token_to_kv_pool)
-    cache_groups = pool_to_cache_groups(token_to_kv_pool)
+    requested_backends = (
+        server_args.attention_backend,
+        server_args.drafter_attention_backend,
+    )
+    refusal = _cudagraph_probe_refusal(server_args, model_config, target.model)
+    if refusal is not None:
+        logger.info(f"CUDA-graph memory reserve off: {refusal}")
+    probing = refusal is None
+    attention = build_components(
+        graph_reserve_bytes=0,
+        probe_batch_rows=(
+            probe_arena_floor(server_args, model_config, max_forward_tokens)
+            if probing
+            else None
+        ),
+        profiled_cache_bytes=None,
+        reuse_target_backend=None,
+        reuse_draft_backend=None,
+    )
+    views = pool_views(attention)
     # Lowering the limit is safe; a configured chunk smaller than one
     # state checkpoint block is rejected by aligned_max_scheduled_tokens
     # instead of silently increasing a frozen buffer limit.
     if server_args.enable_prefix_caching:
         aligned = aligned_max_scheduled_tokens(
-            server_args.chunked_prefill_size, cache_groups
+            server_args.chunked_prefill_size, views.cache_groups
         )
         if aligned != server_args.chunked_prefill_size:
             logger.warning(
@@ -946,17 +1097,30 @@ def build_device_side(
             max_req_pool_size=max_batch_size + 1,
             gpu_id=gpu_id,
             global_rank=global_rank,
-            prefix_granularity=cache_geometry.prefix_granularity,
+            prefix_granularity=views.cache_geometry.prefix_granularity,
             overlap_schedule_depth=overlap_schedule_depth,
         ),
         model_runner=target,
         draft_model_runner=draft,
         attn_backend=attention.attn_backend,
-        token_to_kv_pool=token_to_kv_pool,
+        token_to_kv_pool=views.token_to_kv_pool,
         draft_attn_backend=attention.draft_attn_backend,
-        draft_token_to_kv_pool=draft_token_to_kv_pool,
+        draft_token_to_kv_pool=views.draft_token_to_kv_pool,
     )
-    executor.capture_graphs()
+    # Once per process, before the probe: a graph keeps its capture-time tactic.
+    executor.autotune()
+    if probing:
+        # Consumers above keep the probe's: they read only block-count-invariant fields.
+        attention, views = _rebind_under_reserve(
+            executor,
+            build_components,
+            server_args,
+            gpu_id,
+            attention,
+            requested_backends,
+        )
+
+    executor.capture_graphs(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
     # Tuning and capture draw from the generator; this is the state startup leaves.
     set_random_seed(48)
 
@@ -969,8 +1133,8 @@ def build_device_side(
             logger,
             device=server_args.device,
             draft_model=draft.model if draft is not None else None,
-            kv_pool=token_to_kv_pool,
-            draft_kv_pool=draft_token_to_kv_pool,
+            kv_pool=views.token_to_kv_pool,
+            draft_kv_pool=views.draft_token_to_kv_pool,
         )
 
     l2_cache_executor = None
@@ -978,8 +1142,8 @@ def build_device_side(
         from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
 
         l2_cache_executor = L2CacheExecutor(
-            token_to_kv_pool,
-            draft_pool=draft_token_to_kv_pool,
+            views.token_to_kv_pool,
+            draft_pool=views.draft_token_to_kv_pool,
             host_ratio=server_args.kvstore_ratio,
             host_size_gb=server_args.kvstore_size,
             io_backend=server_args.kvstore_io_backend,
@@ -1128,14 +1292,14 @@ def build_device_side(
     )
 
     specs = DeviceSpecs(
-        cache_geometry=cache_geometry,
-        cache_groups=cache_groups,
+        cache_geometry=views.cache_geometry,
+        cache_groups=views.cache_groups,
         cache_storage=attention.cache_storage,
         multimodal_encoder_dtype=target.multimodal_encoder_dtype,
         spec_num_steps=executor.config.spec_num_steps or 0,
         spec_num_tokens=executor.config.spec_num_tokens or 0,
         uses_eager_grammar=executor.eager_grammar_buffers is not None,
-        supports_disaggregation=token_to_kv_pool.arena.supports_disaggregation,
+        supports_disaggregation=views.token_to_kv_pool.arena.supports_disaggregation,
         supports_pd_layerwise_finalization=bool(
             getattr(
                 executor.dspark_context_producer or executor.drafter,
@@ -1145,7 +1309,7 @@ def build_device_side(
         ),
         cache_state_group_ids=tuple(
             str(spec.group_id)
-            for spec in token_to_kv_pool.arena.cache_group_specs
+            for spec in views.token_to_kv_pool.arena.cache_group_specs
             if spec.family == "state"
         ),
         num_host_pages=(
