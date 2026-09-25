@@ -155,8 +155,9 @@ decode, including the KDA QKVFAB shape.
 - Omitted `split_k` selects the largest of 8, 4, or 2 that divides the K
   tiles, leaves each split at least eight K tiles and one full TDM pipeline,
   and keeps `N`-tile count times the split within the CU count of `A.device`.
-  Otherwise the launch is direct. An explicit `split_k` must divide the K
-  tiles.
+  Otherwise the launch is direct. An explicit `split_k` must be at least 1
+  and divide the K tiles. A split greater than 1 must also leave each split
+  at least one full TDM pipeline.
 
 #### Algorithm
 
