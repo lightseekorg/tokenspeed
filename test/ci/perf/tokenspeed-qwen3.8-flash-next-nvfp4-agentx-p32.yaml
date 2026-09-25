@@ -1,0 +1,77 @@
+api_version: ci.tokenspeed.io/v1
+name: perf-tokenspeed-qwen3.8-flash-next-nvfp4-agentx-p32
+type: perf
+workflow_stage: model-test
+triggers:
+  - slurm
+runner:
+  labels:
+    - slurm-gb200-4gpu
+slurm:
+  nodes: 1
+  gpus_per_node: 4
+env:
+  CI: "true"
+  MODEL_REVISION: fc694b54fb0174e0913e6adf86691ef85a4ead47
+  TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB: "2048"
+install:
+  - bash test/ci_system/install_deps.sh
+server:
+  command: >-
+    ts serve
+    --disable-kvstore
+    --model nvidia/Qwen3.8-Flash-Next-NVFP4
+    --served-model-name nvidia/Qwen3.8-Flash-Next-NVFP4
+    --revision "$MODEL_REVISION"
+    --trust-remote-code
+    --tensor-parallel-size 4
+    --dense-tp-size 4
+    --moe-tp-size 1
+    --expert-parallel-size 4
+    --data-parallel-size 1
+    --moe-backend flashinfer_trtllm
+    --kv-cache-dtype fp8
+    --mamba-ssm-dtype float32
+    --speculative-algorithm MTP
+    --speculative-num-steps 3
+    --hf-overrides '{"index_share_for_mtp_iteration":true,"max_position_embeddings":262156}'
+    --max-model-len 262144
+    --max-num-seqs 256
+    --chunked-prefill-size 8192
+    --gpu-memory-utilization 0.90
+    --reasoning-parser qwen3
+    --host 127.0.0.1
+    --port 8000
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 7200
+    interval: 10
+perf:
+  install:
+    - >-
+      python3 -m uv venv --python 3.12 --seed --clear /tmp/evalscope-agentx &&
+      python3 -m uv pip install --python /tmp/evalscope-agentx/bin/python
+      'evalscope[agentx]==1.12.0'
+    - >-
+      mkdir -p .ci-artifacts/published/agentx/metadata &&
+      printf '%s\n' "$TOKENSPEED_CI_COMMIT" > .ci-artifacts/published/agentx/metadata/tokenspeed-commit.txt &&
+      printf '%s\n' "$MODEL_REVISION" > .ci-artifacts/published/agentx/metadata/model-revision.txt &&
+      python3 -m pip freeze --all > .ci-artifacts/published/agentx/metadata/tokenspeed-packages.txt &&
+      /tmp/evalscope-agentx/bin/python -m pip freeze --all
+      > .ci-artifacts/published/agentx/metadata/evalscope-packages.txt &&
+      nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
+      > .ci-artifacts/published/agentx/metadata/gpus.csv
+  command: >-
+    python3 test/ci_system/run_agentx.py
+    --parallel 32
+    --model nvidia/Qwen3.8-Flash-Next-NVFP4
+    --revision "$MODEL_REVISION"
+    --engine-version "$TOKENSPEED_CI_COMMIT"
+    --num-gpus 4
+    --context-length 262144
+    --base-url http://127.0.0.1:8000
+    --control-url http://127.0.0.1:8001
+    --evalscope /tmp/evalscope-agentx/bin/evalscope
+    --outputs-dir .ci-artifacts/published/agentx/benchmark
+report:
+  github_step_summary: true

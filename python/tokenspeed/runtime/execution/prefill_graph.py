@@ -661,11 +661,13 @@ class PrefillGraph:
         self, bucket: int, decode_wrapper: ForwardStepRunner | None
     ) -> tuple[BreakableCapture, CapturedForward]:
         """Warm up and capture the breakable graph for ``bucket`` from the buffers."""
-        for _ in range(self.num_warmup):
-            self._run_inner(bucket)
-        torch.cuda.synchronize()
         stream = decode_wrapper.stream if decode_wrapper is not None else None
         cap = BreakableCapture(pool=self._pool, stream=stream)
+        cap.stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(cap.stream):
+            for _ in range(self.num_warmup):
+                self._run_inner(bucket)
+        torch.cuda.synchronize()
         with cap:
             output = CapturedForward(*self._run_inner(bucket))
         if self._pool is None:
@@ -677,11 +679,13 @@ class PrefillGraph:
         self, bucket: int, decode_wrapper: ForwardStepRunner | None
     ) -> CapturedEncoder:
         """Warm up and capture the encoder stage for ``bucket`` from the buffers."""
-        for _ in range(self.num_warmup):
-            self._run_encoder(bucket)
-        torch.cuda.synchronize()
         stream = decode_wrapper.stream if decode_wrapper is not None else None
         cap = BreakableCapture(pool=self._pool, stream=stream)
+        cap.stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(cap.stream):
+            for _ in range(self.num_warmup):
+                self._run_encoder(bucket)
+        torch.cuda.synchronize()
         with cap:
             state = self._run_encoder(bucket)
         if self._pool is None:
@@ -702,13 +706,15 @@ class PrefillGraph:
         the decoder consumes per-forward backend state its predecessor
         produces and later layers overwrite (V4.1's index selection chain).
         """
-        for _ in range(self.num_warmup):
-            rearm()
-            self._narrowing.decoder_forward(statics, self._ctx)
-        torch.cuda.synchronize()
-        rearm()
         stream = decode_wrapper.stream if decode_wrapper is not None else None
         cap = BreakableCapture(pool=self._pool, stream=stream)
+        cap.stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(cap.stream):
+            for _ in range(self.num_warmup):
+                rearm()
+                self._narrowing.decoder_forward(statics, self._ctx)
+        torch.cuda.synchronize()
+        rearm()
         with cap:
             output = CapturedForward(
                 *self._narrowing.decoder_forward(statics, self._ctx)

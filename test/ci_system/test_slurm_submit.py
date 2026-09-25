@@ -33,6 +33,8 @@ from slurm_submit import (
     write_report,
 )
 
+TEST_COMMIT = "0123456789abcdef0123456789abcdef01234567"
+
 
 def write_task(
     repo: Path,
@@ -215,6 +217,7 @@ def test_render_script_passes_declared_gb300_runner_unchanged():
         Path("/shared/runs"),
         Path("/shared/cache"),
         "ghcr.io/example/image@sha256:abc",
+        TEST_COMMIT,
     )
 
     assert "--runner=gb300-1gpu" in script
@@ -236,6 +239,7 @@ def test_render_script_passes_declared_and_effective_runners():
         Path("/shared/runs"),
         Path("/shared/cache"),
         "ghcr.io/example/image@sha256:abc",
+        TEST_COMMIT,
     )
 
     assert "--runner=b200-4gpu" in script
@@ -531,6 +535,7 @@ def test_render_script_contains_cluster_requirements():
         Path("/shared/runs"),
         Path("/shared/cache"),
         "ghcr.io/example/image@sha256:abc",
+        TEST_COMMIT,
     )
     assert "--setup-mode=slurm" in script
     assert "--container-remap-root" in script
@@ -562,6 +567,7 @@ def test_retained_bootstrap_retries_and_stops_before_evaluation(
         Path("/shared/runs"),
         Path("/shared/cache"),
         "ghcr.io/example/original@sha256:abc",
+        TEST_COMMIT,
     )
     script = harden_bootstrap(original)
     assert harden_bootstrap(script) == script
@@ -623,11 +629,14 @@ def test_render_script_carries_the_tokenspeed_mla_override_into_the_container():
         Path("/shared/runs"),
         Path("/shared/cache"),
         "ghcr.io/example/image@sha256:abc",
+        TEST_COMMIT,
     )
 
     container_env = [line for line in script.splitlines() if "--container-env=" in line]
     assert len(container_env) == 2
     assert all("INSTALL_TOKENSPEED_MLA_FROM_SOURCE," in line for line in container_env)
+    assert all("TOKENSPEED_CI_COMMIT," in line for line in container_env)
+    assert f"export TOKENSPEED_CI_COMMIT={TEST_COMMIT}" in script
 
 
 def test_render_script_mounts_only_allocated_gb300_devices():
@@ -637,6 +646,7 @@ def test_render_script_mounts_only_allocated_gb300_devices():
         Path("/shared/runs"),
         Path("/shared/cache"),
         "ghcr.io/example/image@sha256:abc",
+        TEST_COMMIT,
     )
 
     assert 'gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"' in script
@@ -670,6 +680,7 @@ def test_render_script_mounts_only_allocated_gb300_devices():
         Path("/shared/runs"),
         Path("/shared/cache"),
         "ghcr.io/example/image@sha256:abc",
+        TEST_COMMIT,
     )
     assert 'gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"' in multinode_script
 
@@ -688,6 +699,7 @@ def test_render_multinode_gb300_keeps_devices_out_of_client_step():
         Path("/shared/runs"),
         Path("/shared/cache"),
         "ghcr.io/example/image@sha256:abc",
+        TEST_COMMIT,
     )
 
     assert (
@@ -715,6 +727,7 @@ def test_render_script_orchestrates_multi_node_server_and_head_client():
         Path("/shared/runs"),
         Path("/shared/cache"),
         "ghcr.io/example/image@sha256:abc",
+        TEST_COMMIT,
     )
 
     assert "--nodes=4" in script
@@ -777,6 +790,42 @@ def test_result_detail_reports_eval_score(tmp_path):
         '{"eval_score_check": {"score": 0.95, "threshold": 0.9, "passed": true}}'
     )
     assert result_detail(result) == "score=0.95, threshold=0.9"
+
+
+@pytest.mark.parametrize("state", ["COMPLETED", "FAILED"])
+def test_write_report_preserves_published_outputs_on_success_and_failure(
+    tmp_path, state
+):
+    run_root = tmp_path / "runs"
+    published = run_root / "123" / "published" / "agentx" / "aiperf"
+    published.mkdir(parents=True)
+    (published / "profile_export_aiperf.json").write_text('{"metrics": {}}')
+    outside = tmp_path / "outside.txt"
+    outside.write_text("not a job artifact")
+    (published / "outside-link").symlink_to(outside)
+    (published / "directory-link").symlink_to(tmp_path, target_is_directory=True)
+    (run_root / "124").mkdir()
+    (run_root / "124" / "published").symlink_to(tmp_path, target_is_directory=True)
+    task = Task("test/ci/perf/example.yaml", "example", "perf", "gb200-4gpu", 4)
+    report = tmp_path / "report"
+    write_report(
+        [
+            Submission(task, "123", tmp_path / "missing.log"),
+            Submission(task, "124", tmp_path / "missing.log"),
+        ],
+        {"123": {"state": state, "elapsed": "00:30:00", "exit_code": "0:0"}},
+        run_root,
+        report,
+        source_pr=None,
+    )
+    copied = (
+        report / "123-published" / "agentx" / "aiperf" / "profile_export_aiperf.json"
+    )
+    assert copied.read_text() == '{"metrics": {}}'
+    assert (published / "profile_export_aiperf.json").exists()
+    assert not (copied.parent / "outside-link").exists()
+    assert not (copied.parent / "directory-link").exists()
+    assert not (report / "124-published").exists()
 
 
 def test_write_report_collects_logs_and_results(monkeypatch, tmp_path):

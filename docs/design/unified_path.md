@@ -272,9 +272,12 @@ scattered executor-side arch check. `ModelExecutor.__init__` AND-composes it
 over the target and draft `child_backends()` trees once
 (`resolve_cuda_graph_support`), logs every culprit class, and downgrades the
 two graph subsystems (`ForwardStepRunner.disable`, `PrefillGraph.disable`).
-`DSABackend` and Qwen4-Exp's PLE/indexer consumers disable the prefill graph
-(rationale comments live on those classes). Qwen4-Exp's root composes its
-actual children, so these restrictions also apply when there is no GDN leaf.
+`DSABackend` disables the prefill graph (rationale on the class). Qwen4-Exp's
+PLE and QSA indexer support the breakable graph: their model methods are eager
+break points, where live request metadata controls cache writes and padded
+token rows are sliced before state updates. The root composes its actual
+children, so a restriction from any other child still applies when there is
+no GDN leaf.
 
 Rules: declarations are static "never works" facts — a runtime prefill
 capture failure is FATAL (no silent eager degrade: a family that cannot
@@ -283,6 +286,12 @@ class-attribute-driven, so every DP rank derives the same answer
 (event-loop.md). `disable_prefill_graph` in the config carries user intent
 only. `decode_graph=False` still requires `refresh_decode_metadata` and
 `init_cuda_graph_state` — eager decode runs the same unified path.
+
+Prefill graph warmup runs on the same side stream as capture. Some kernels
+cache occupancy by stream and reject a cold CUDA graph capture; warming on the
+default stream does not prepare their capture-stream state. The capture stream
+waits for the dummy inputs and metadata before warmup, and warmup completes
+before capture begins. This applies to ordinary, encoder and decoder captures.
 
 ### Prefill graphs around a row narrowing
 

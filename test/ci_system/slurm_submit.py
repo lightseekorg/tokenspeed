@@ -377,6 +377,7 @@ def render_script(
     run_root: Path,
     cache: Path,
     image: str,
+    commit: str,
 ) -> str:
     pipeline = [
         "python3",
@@ -411,7 +412,7 @@ def render_script(
         "--container-remap-root",
         "--container-env=SLURM_JOB_ID,RUNNER_NAME,HF_TOKEN,"
         "HUGGING_FACE_HUB_TOKEN,HF_HOME,XDG_CACHE_HOME,"
-        "INSTALL_TOKENSPEED_MLA_FROM_SOURCE,"
+        "INSTALL_TOKENSPEED_MLA_FROM_SOURCE,TOKENSPEED_CI_COMMIT,"
         "SLURM_STEP_ID,SLURM_STEP_NUM_NODES,SLURM_STEP_NODELIST,SLURM_NODEID,"
         "SLURM_PROCID,SLURM_LOCALID",
     ]
@@ -468,6 +469,7 @@ done
 set -euo pipefail
 
 export RUNNER_NAME="slurm-${{SLURM_JOB_ID}}"
+export TOKENSPEED_CI_COMMIT={shlex.quote(commit)}
 export HF_HOME=/home/runner/.cache/huggingface
 export XDG_CACHE_HOME=/home/runner/.cache
 unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH GITHUB_STATE \
@@ -1006,6 +1008,17 @@ def write_report(
             shutil.copy2(submission.log, report_dir / f"{submission.job_id}.log")
         if result_path.exists():
             shutil.copy2(result_path, report_dir / f"{submission.job_id}-result.json")
+        published = run_root / submission.job_id / "published"
+        if published.is_dir() and not published.is_symlink():
+            shutil.copytree(
+                published,
+                report_dir / f"{submission.job_id}-published",
+                dirs_exist_ok=True,
+                # Job-created links must not read files from the coordinator.
+                ignore=lambda directory, names: [
+                    name for name in names if (Path(directory) / name).is_symlink()
+                ],
+            )
     (report_dir / "manifest.json").write_text(json.dumps(rows, indent=2) + "\n")
     if details:
         summary.extend(["", "## Details", "", *details])
@@ -1161,7 +1174,12 @@ def run(args: argparse.Namespace, repo: Path, artifact_root: Path, cache: Path) 
         submit(
             task,
             render_script(
-                task, source, artifact_root / "runs", cache, args.container_image
+                task,
+                source,
+                artifact_root / "runs",
+                cache,
+                args.container_image,
+                commit,
             ),
             artifact_root,
             args,

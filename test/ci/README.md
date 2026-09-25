@@ -610,8 +610,9 @@ generated Slurm commands and scripts.
 
 `--wait` keeps the dispatcher process alive until every submitted Slurm job
 reaches a terminal state. `--report-dir PATH` then collects a `manifest.json`,
-Markdown summary, per-job logs, and available `result.json` files under
-`PATH`. The command succeeds only when every job reaches `COMPLETED`. SIGINT or
+Markdown summary, per-job logs, available `result.json` files, and each job's
+`published/` files under `PATH`. The command succeeds only when every job
+reaches `COMPLETED`. SIGINT or
 SIGTERM while waiting calls `scancel` for the jobs submitted by that command.
 
 The manual `Slurm Dispatch` GitHub workflow runs on the organization runner
@@ -675,6 +676,57 @@ from the compute node and should be on shared storage. Use `--artifact-root`
 persistent host cache at `/home/runner/.cache`, matching the NVIDIA release
 image, and points the Hugging Face and XDG caches there; the directory must
 likewise be visible on the compute node.
+
+### TokenSpeed Qwen3.8 NVFP4 AgentX sweep
+
+The six `perf/tokenspeed-qwen3.8-flash-next-nvfp4-agentx-p*.yaml` tasks run
+AgentX session concurrency 1, 2, 4, 8, 16, and 32. Each task requests one
+four-GPU node, starts its own TokenSpeed server, and runs a 30-minute AgentX
+256K benchmark. Slurm can run the tasks on separate available nodes at the
+same time. They have only the `slurm` trigger and do not enter per-commit CI.
+
+All six tasks pin the same public NVIDIA checkpoint revision and TokenSpeed
+deployment: attention TP4, MoE EP4, FP8 KV cache,
+MTP with three speculative steps, and QSA index sharing across MTP steps.
+TokenSpeed detects the checkpoint's ModelOpt mixed precision from its model
+config.
+`TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB=2048` is set in each task. The service
+uses 262144 tokens of context. The RoPE table extends 12 positions beyond that
+limit for MTP overlap's physical padding. `run_agentx.py` checks the model ID through
+`/v1/models` and the active context through the TokenSpeed control sidecar's
+`/get_model_info` before the benchmark. It then verifies the completed result, requested
+concurrency and duration, and dataset hash. EvalScope uses its upstream
+Hugging Face AgentX data source, seed `20260707`, and a 600-second grace period
+for requests still in flight after the 1800-second sending phase. This measures
+serving performance, not answer accuracy.
+
+Preview the six selected jobs locally:
+
+```bash
+test/ci/run_slurm.sh --all --runner slurm-gb200-4gpu --type perf \
+  --trigger slurm --match tokenspeed-qwen3.8-flash-next-nvfp4-agentx --list
+```
+
+After committing and pushing the tasks to a branch in this repository, run
+the existing Slurm Dispatch workflow. Choose one cluster with available nodes:
+
+```bash
+gh workflow run slurm-dispatch.yml --repo lightseekorg/tokenspeed \
+  --ref YOUR_REMOTE_BRANCH \
+  -f pr='' -f cluster=gb300 -f yaml=off \
+  -f runners=slurm-gb200-4gpu -f task_types=perf \
+  -f match=tokenspeed-qwen3.8-flash-next-nvfp4-agentx -f trigger=slurm
+```
+
+Use `cluster=gb200` for GB200. For GB300, the workflow maps the logical
+`slurm-gb200-4gpu` label to `slurm-gb300-4gpu`. The report artifact contains
+`<job_id>-published/agentx/benchmark/` for each point, including the AgentX
+summary and raw `aiperf/` output, plus model, environment and GPU metadata in
+`<job_id>-published/agentx/metadata/`. Results also remain in the shared Slurm
+artifact root below `runs/<job_id>/published/`.
+The dispatcher passes the tested snapshot commit as `TOKENSPEED_CI_COMMIT`
+inside the container because the Slurm source archive does not contain `.git`.
+AgentX records this full commit as the engine version.
 
 ### Retry unsuccessful Slurm cases
 
