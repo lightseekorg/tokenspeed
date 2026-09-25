@@ -183,6 +183,21 @@ class AutoBackend(CommBackend):
             return self._triton_ar.all_reduce(tensor, group, op=op)
         return self._nccl.all_reduce(tensor, group, op=op)
 
+    def supports_all_reduce_mhc_norm(
+        self, x: torch.Tensor, norm_weight: torch.Tensor, group: Group
+    ) -> bool:
+        return (
+            not self._force_deterministic_rsag()
+            and self._trtllm_ar.supports_all_reduce_mhc_norm(x, norm_weight, group)
+        )
+
+    def all_reduce_mhc_norm(
+        self, x, residual, post, comb, pre, weight, eps, group: Group
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._trtllm_ar.all_reduce_mhc_norm(
+            x, residual, post, comb, pre, weight, eps, group
+        )
+
     def prepare_all_reduce_lane(self, group: Group, hidden_dim: int) -> bool:
         return self._trtllm_ar.ensure_group_lane(group, hidden_dim)
 

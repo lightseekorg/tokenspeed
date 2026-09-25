@@ -278,6 +278,7 @@ def test_residual_family_exports_and_modes():
         "mhc_mixes",
         "mhc_post",
         "mhc_pre",
+        "try_mhc_shifted_post_pre_norm",
     }
     assert set(_residual_pkg.__all__) == expected_exports
     assert all(
@@ -297,6 +298,7 @@ def test_residual_family_exports_and_modes():
         "mhc_mixes",
         "mhc_post",
         "mhc_pre",
+        "mhc_shifted_post_pre_norm",
         "normalized_dot_gate",
     }
 

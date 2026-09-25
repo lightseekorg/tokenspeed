@@ -558,6 +558,83 @@ def mhc_mixes(
     return kernel(residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_iters)
 
 
+def try_mhc_shifted_post_pre_norm(
+    x: _torch.Tensor,
+    residual: _torch.Tensor,
+    pre: _torch.Tensor,
+    post: _torch.Tensor,
+    comb: _torch.Tensor,
+    weight: _torch.Tensor,
+    scale: _torch.Tensor,
+    base: _torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_weight: _torch.Tensor,
+    norm_eps: float,
+) -> (
+    tuple[_torch.Tensor, _torch.Tensor, _torch.Tensor, _torch.Tensor, _torch.Tensor]
+    | None
+):
+    """Fuse HC post, shifted input/RMSNorm, and the next HC coefficients.
+
+    Args:
+        x: BF16 sublayer output [T,H], already reduced across ranks.
+        residual: BF16 residual before that sublayer [T,4,H].
+        pre: FP32 previous pre-mix [T,4], used to collapse the new residual.
+        post: FP32 sublayer output mix [T,4].
+        comb: FP32 residual mix [T,4,4], with input then output HC axes.
+        weight: FP32 next mixing projection [24,4*H].
+        scale: FP32 next pre/post/combine scales [3].
+        base: FP32 next mixing biases [24].
+        rms_eps: Epsilon for next coefficient RMS normalization.
+        hc_eps: Epsilon for pre-mix and Sinkhorn normalization.
+        sinkhorn_iters: Positive number of Sinkhorn iterations.
+        norm_weight: BF16 input RMSNorm weight [H].
+        norm_eps: Input RMSNorm epsilon.
+
+    Returns:
+        New BF16 residual [T,4,H], BF16 normalized input [T,H], and FP32 next
+        pre/post/comb [T,4], [T,4], [T,4,4]; or None for unsupported inputs.
+        The input uses ``pre``, not the newly generated pre-mix. All tensors
+        must be contiguous and colocated on an SM100-family GPU, with H a
+        positive multiple of 1024 and 0<T<=2**20. Inputs are never mutated.
+        Warm up on the execution stream before CUDA graph capture.
+    """
+    from tokenspeed_kernel.ops.residual.deep_gemm import mega_mhc_eligible
+
+    if not mega_mhc_eligible(
+        x, residual, pre, post, comb, weight, scale, base, sinkhorn_iters, norm_weight
+    ):
+        return None
+    try:
+        kernel = select_kernel(
+            "residual",
+            "mhc_shifted_post_pre_norm",
+            format_signature(residual=dense_tensor_format(residual.dtype)),
+            traits=None,
+            override=None,
+            solution=None,
+        )
+    except NoKernelFoundError:
+        return None
+    return kernel(
+        x,
+        residual,
+        pre,
+        post,
+        comb,
+        weight,
+        scale,
+        base,
+        rms_eps,
+        hc_eps,
+        sinkhorn_iters,
+        norm_weight,
+        norm_eps,
+    )
+
+
 def mhc_pre(
     residual: _torch.Tensor,
     fn: _torch.Tensor,
@@ -773,6 +850,7 @@ __all__ = [
     "gated_residual_mix",
     "mhc_fused_hc",
     "mhc_mixes",
+    "try_mhc_shifted_post_pre_norm",
     "mhc_post",
     "mhc_pre",
 ]

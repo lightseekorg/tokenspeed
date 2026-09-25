@@ -51,6 +51,45 @@ class TestAutoBackendTopology:
 
         monkeypatch.setattr(fabric, "group_has_fabric", lambda ranks: supported)
 
+    @pytest.mark.parametrize("deterministic", [False, True])
+    def test_mhc_fusion_honors_deterministic_backend(
+        self, backend, monkeypatch, deterministic
+    ):
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        monkeypatch.setitem(
+            global_server_args_dict, "force_deterministic_rsag", deterministic
+        )
+        args = (Mock(),) * 6 + (1e-6, (0, 1, 2, 3))
+        norm_weight = torch.empty(5120, dtype=torch.bfloat16)
+        supported = backend.supports_all_reduce_mhc_norm(args[0], norm_weight, args[7])
+        if deterministic:
+            assert supported is False
+            backend._trtllm_ar.supports_all_reduce_mhc_norm.assert_not_called()
+            backend._trtllm_ar.all_reduce_mhc_norm.assert_not_called()
+        else:
+            assert (
+                supported
+                is backend._trtllm_ar.supports_all_reduce_mhc_norm.return_value
+            )
+            backend._trtllm_ar.supports_all_reduce_mhc_norm.assert_called_once_with(
+                args[0], norm_weight, args[7]
+            )
+            result = backend.all_reduce_mhc_norm(*args)
+            assert result is backend._trtllm_ar.all_reduce_mhc_norm.return_value
+            backend._trtllm_ar.all_reduce_mhc_norm.assert_called_once_with(*args)
+
+    def test_mhc_execution_error_propagates_without_fallback(self, backend):
+        backend._trtllm_ar.all_reduce_mhc_norm.side_effect = RuntimeError(
+            "kernel failed"
+        )
+        with pytest.raises(RuntimeError, match="kernel failed"):
+            backend.all_reduce_mhc_norm(*(Mock(),) * 6, 1e-6, (0, 1))
+        backend._trtllm_ar.supports_all_reduce_mhc_norm.assert_not_called()
+        backend._nccl.all_reduce.assert_not_called()
+        backend._rsag.all_reduce.assert_not_called()
+        backend._triton_ar.all_reduce.assert_not_called()
+
     def test_group_spans_nodes(self, backend):
         assert not backend._group_spans_nodes((0, 1, 2, 3))
         assert not backend._group_spans_nodes((4, 5, 6, 7))
