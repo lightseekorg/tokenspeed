@@ -61,7 +61,6 @@ from tokenspeed_kernel.ops.attention.prologue import (
     gqa_prologue,
     mla_prologue,
     qk_norm_rope,
-    write_latent,
 )
 from tokenspeed_kernel.ops.embedding import apply_rope, apply_rope_mla
 from tokenspeed_kernel.ops.kvcache.triton import (
@@ -1051,79 +1050,40 @@ def test_qk_norm_rope_is_the_prologue_without_a_cache_write():
     assert bytes_equal(got_q, ref[0]) and bytes_equal(got_k, ref[3])
 
 
-@pytest.mark.parametrize("tokens", [1, 9, 64])
-@pytest.mark.parametrize("rope_style", [RopeStyle.GPTJ, RopeStyle.NEOX, None])
 @pytest.mark.parametrize("fp8_cache", [True, False])
-@pytest.mark.parametrize("sanitize", [False, True])
-def test_write_latent_stores_the_absorbed_prologue_rows(
-    tokens, rope_style, fp8_cache, sanitize
-):
-    """The captured write alone lands the bytes the absorbed prologue's fused
-    launch lands, and leaves the latent rows unrotated for the break."""
-    heads, rank, rope, total = 16, 512, 64, 256
-    cache_dtype = FP8 if fp8_cache else BF16
-    q_nope, q_pe, latent = mla_inputs(tokens, heads, rank, rope, seed=23)
-    if sanitize:
-        latent[0, 1] = float("nan")
-        latent[-1, rank + 2] = float("inf")
-    positions = torch.arange(50, 50 + tokens, device="cuda")
+@pytest.mark.parametrize("rope_style", [RopeStyle.GPTJ, None])
+def test_expanded_attention_leaves_its_inputs_untouched(fp8_cache, rope_style):
+    """A graph segment runs the expanded prologue ahead of the break that still
+    reads q and the latent (a MIXED round's decode rows), so it returns fresh
+    tensors and mutates nothing."""
+    tokens, heads, nope, rope, rank, v_dim, total = 5, 4, 128, 64, 512, 128, 16
+    g = torch.Generator(device="cuda").manual_seed(33)
+    q = torch.randn(tokens, heads, nope + rope, dtype=BF16, device="cuda", generator=g)
+    latent = torch.randn(tokens, rank + rope, dtype=BF16, device="cuda", generator=g)
+    kv = torch.randn(
+        tokens, heads, nope + v_dim, dtype=BF16, device="cuda", generator=g
+    )
+    k_nope, v = kv.split([nope, v_dim], dim=-1)
+    positions = torch.arange(tokens, device="cuda")
     rotary = (
         None
         if rope_style is None
         else Rotary(cos_sin_cache(rope), positions, rope_style, None)
     )
-    loc = slots(tokens, total, seed=24)
-    ref_cache = poisoned_latent(total, rank + rope, cache_dtype)
-    mla_prologue(
-        mla_query(q_nope, rope),
-        q_pe.clone(),
-        latent.clone(),
-        expanded=None,
+    cache = poisoned_latent(total, rank + rope, FP8 if fp8_cache else BF16)
+    q0, latent0 = q.clone(), latent.clone()
+    out = mla_prologue(
+        q,
+        q[..., nope:],
+        latent,
+        expanded=MLAExpandedKV(k_nope=k_nope, value=v),
         rotary=rotary,
-        cache=latent_target(ref_cache, loc, sanitize),
-        solution="triton",
+        cache=latent_target(cache, torch.arange(tokens, device="cuda")),
+        solution=None,
         override=None,
     )
-    cache = poisoned_latent(total, rank + rope, cache_dtype)
-    given = latent.clone()
-    write_latent(given, rotary=rotary, cache=latent_target(cache, loc, sanitize))
-    assert bytes_equal(cache, ref_cache) and bytes_equal(given, latent)
-
-
-def test_write_latent_needs_one_slot_per_row():
-    _, _, latent = mla_inputs(4, 16, 512, 64, seed=25)
-    cache = poisoned_latent(16, 576, FP8)
-    with pytest.raises(ValueError, match="3 slots for 4 latent rows"):
-        write_latent(
-            latent, rotary=None, cache=latent_target(cache, slots(3, 16, seed=26))
-        )
-
-
-def test_write_latent_stores_per_token_head_planes_as_the_composite_does():
-    tokens, heads, rank, rope = 5, 16, 512, 64
-    q_nope, q_pe, latent = mla_inputs(tokens, heads, rank, rope, seed=27)
-    positions = torch.arange(tokens, device="cuda")
-    rotary = Rotary(cos_sin_cache(rope), positions, RopeStyle.GPTJ, None)
-    loc = torch.arange(tokens, device="cuda")
-    ref = _planes(rank, rope)
-    mla_prologue(
-        mla_query(q_nope, rope),
-        q_pe.clone(),
-        latent.clone(),
-        expanded=None,
-        rotary=rotary,
-        cache=latent_target(ref, loc),
-        solution="composite",
-        override=None,
-    )
-    planes = _planes(rank, rope)
-    write_latent(latent.clone(), rotary=rotary, cache=latent_target(planes, loc))
-    for a, b in (
-        (planes.latent, ref.latent),
-        (planes.scale, ref.scale),
-        (planes.rope, ref.rope),
-    ):
-        assert bytes_equal(a, b)
+    assert bytes_equal(q, q0) and bytes_equal(latent, latent0)
+    assert out.query.data_ptr() != q.data_ptr()
 
 
 @pytest.mark.parametrize("solution", ["triton", "composite"])
@@ -1156,32 +1116,30 @@ def test_a_write_mask_skips_the_rows_it_excludes(solution, fp8_cache):
     ref_q = prologue(full, None)
     masked = poison.clone()
     assert bytes_equal(prologue(masked, mask), ref_q)
-    written = poison.clone()
-    write_latent(
-        latent.clone(),
-        rotary=rotary,
-        cache=latent_target(written, loc, write_mask=mask),
-    )
-    for cache in (masked, written):
-        assert bytes_equal(cache[loc[mask]], full[loc[mask]])
-        assert bytes_equal(cache[loc[~mask]], poison[loc[~mask]])
+    assert bytes_equal(masked[loc[mask]], full[loc[mask]])
+    assert bytes_equal(masked[loc[~mask]], poison[loc[~mask]])
 
 
 def test_per_token_head_planes_take_no_write_mask():
-    _, _, latent = mla_inputs(3, 16, 512, 64, seed=31)
+    q_nope, q_pe, latent = mla_inputs(3, 16, 512, 64, seed=31)
     loc = torch.arange(3, device="cuda")
     mask = torch.ones(3, dtype=torch.bool, device="cuda")
     with pytest.raises(ValueError, match="take no write mask"):
-        write_latent(
+        mla_prologue(
+            mla_query(q_nope, 64),
+            q_pe,
             latent,
+            expanded=None,
             rotary=None,
             cache=latent_target(_planes(512, 64), loc, write_mask=mask),
+            solution=None,
+            override=None,
         )
 
 
 @pytest.mark.parametrize("flaw", ["short", "uint8", "strided"])
 def test_a_write_mask_is_a_dense_bool_vector_over_the_slots(flaw):
-    _, _, latent = mla_inputs(3, 16, 512, 64, seed=32)
+    q_nope, q_pe, latent = mla_inputs(3, 16, 512, 64, seed=32)
     cache = poisoned_latent(8, 576, FP8)
     mask = {
         "short": torch.ones(2, dtype=torch.bool, device="cuda"),
@@ -1189,10 +1147,15 @@ def test_a_write_mask_is_a_dense_bool_vector_over_the_slots(flaw):
         "strided": torch.ones(6, dtype=torch.bool, device="cuda")[::2],
     }[flaw]
     with pytest.raises(ValueError, match="dense bool vector"):
-        write_latent(
+        mla_prologue(
+            mla_query(q_nope, 64),
+            q_pe,
             latent,
+            expanded=None,
             rotary=None,
             cache=latent_target(cache, torch.arange(3, device="cuda"), False, mask),
+            solution=None,
+            override=None,
         )
 
 

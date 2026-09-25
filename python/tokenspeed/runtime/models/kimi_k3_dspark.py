@@ -40,6 +40,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 import torch
+from tokenspeed_kernel.ops.attention.prologue import MLAPrologueOutput
 from tokenspeed_kernel.ops.embedding import apply_k_rope
 from torch import nn
 
@@ -106,7 +107,11 @@ class K3DSparkAttention(DeepseekV3AttentionMLA):
         q: torch.Tensor,
         latent_cache: torch.Tensor,
         ctx: ForwardContext,
+        *,
+        expanded: MLAPrologueOutput | None,
     ) -> torch.Tensor:
+        if expanded is not None:
+            raise RuntimeError("the DSpark draft attends decode rounds only")
         if q.size(0) == 0:
             return q.new_empty((0, self.num_local_heads * self.v_head_dim))
         if self.w_kc is None or self.w_vc is None:

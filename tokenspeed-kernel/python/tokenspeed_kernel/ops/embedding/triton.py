@@ -352,7 +352,7 @@ def select_mla_kv_block_n(num_tokens: int, num_q_heads: int) -> int:
 
 def apply_rope_mla_set_kv_buffer_triton(
     positions: torch.Tensor,
-    q_rope: torch.Tensor | None,
+    q_rope: torch.Tensor,
     k_rope: torch.Tensor,
     cos_sin_cache: torch.Tensor | None,
     is_neox: bool,
@@ -365,8 +365,6 @@ def apply_rope_mla_set_kv_buffer_triton(
     A ``cos_sin_cache`` of ``None`` selects the NoPE form: the same halves are
     assembled without rotation, which is what a model with no rotary embedding
     needs.
-    A ``q_rope`` of ``None`` launches the latent write alone: no query program
-    runs, and ``q_rope_out`` and ``q_nope`` must be ``None``.
     ``fused_mla_set_kv_buffer_arg.write_mask``, when given, holds one bool per
     token, and a False token's latent row is not stored; its slot is still
     formed into an address, so it must be in range.
@@ -386,10 +384,6 @@ def apply_rope_mla_set_kv_buffer_triton(
     loc = fused_mla_set_kv_buffer_arg.cache_loc
     q_nope = fused_mla_set_kv_buffer_arg.q_nope
     write_mask = fused_mla_set_kv_buffer_arg.write_mask
-    write_only = q_rope is None
-    if write_only:
-        assert q_rope_out is None and q_nope is None
-        q_rope = k_rope
     q_rope_out = q_rope if q_rope_out is None else q_rope_out
 
     num_tokens = q_rope.shape[0]
@@ -413,7 +407,7 @@ def apply_rope_mla_set_kv_buffer_triton(
         assert q_rope_out.shape[:2] == q_rope.shape[:2]
         assert q_rope_out.shape[2] == nope_dim + q_rope.shape[2]
 
-    num_q_heads = 0 if write_only else q_rope.shape[1]
+    num_q_heads = q_rope.shape[1]
     rope_dim = q_rope.shape[2]
     assert k_rope.shape == (num_tokens, 1, rope_dim)
     assert kv_buffer.shape[1] == nope_dim + rope_dim

@@ -37,7 +37,7 @@ from tokenspeed_kernel.ops.attention.mla import (
     mla_project_value_prefers_contiguous_weight,
 )
 from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import mla_kv_pack_quantize_fp8
-from tokenspeed_kernel.ops.attention.prologue import MLAExpandedKV
+from tokenspeed_kernel.ops.attention.prologue import MLAExpandedKV, MLAPrologueOutput
 from tokenspeed_kernel.ops.gemm import bmm
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.gemm.cute_dsl import (
@@ -74,7 +74,6 @@ from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
-    scrub_padding_tail,
 )
 from tokenspeed.runtime.execution.context import (
     ForwardContext,
@@ -653,9 +652,10 @@ class DeepseekV3AttentionMLA(nn.Module):
         """MLA attention with a NARROW prefill-graph break.
 
         The token-shaped input/output projections (q/kv-down, layernorm,
-        q_b_proj, o_proj) stay in the captured prefill graph; only the
-        data-dependent attention -- KV write + varlen prefill / absorb decode
-        kernels + the live prefill/decode split -- runs as the eager break
+        q_b_proj, o_proj) and, outside a decode round, the expanded prefill
+        prologue with its KV write stay in the captured prefill graph; only
+        the data-dependent attention -- varlen prefill / absorb decode kernels
+        + the live prefill/decode split -- runs as the eager break
         (``_attn``). This keeps the big projection GEMMs graphed instead of
         dispatch-bound eager, collapsing the inter-segment bubbles a coarse
         whole-attention break leaves. Outside capture the ``@break_point`` is
@@ -666,18 +666,29 @@ class DeepseekV3AttentionMLA(nn.Module):
         q, latent_cache = self._project_q_latent(
             hidden_states, ctx, comm_manager, block_scale
         )
-        self._write_latent_before_break(latent_cache, positions, ctx)
-        attn_output = self._attn(positions, q, latent_cache, ctx)
+        expanded = self._prefill_prologue_before_break(positions, q, latent_cache, ctx)
+        attn_output = self._attn(positions, q, latent_cache, ctx, expanded=expanded)
         output, _ = self.o_proj(attn_output)
         return output
 
-    def _write_latent_before_break(
-        self, latent_cache: torch.Tensor, positions: torch.Tensor, ctx: ForwardContext
-    ) -> None:
-        """Write the latent rows in the captured segment; a decode round keeps its
-        one-launch prologue inside the break instead (see :meth:`_attn`)."""
-        if not ctx.forward_mode.is_decode():
-            self.attn_mqa.write_latent(latent_cache, positions, ctx)
+    def _prefill_prologue_before_break(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> MLAPrologueOutput | None:
+        """Assemble the expanded prefill inputs and write every row's latent in
+        the captured segment. A decode round, or a narrowed draft step, keeps
+        its one-launch prologue inside the break instead (see :meth:`_attn`)."""
+        if ctx.forward_mode.is_decode() or ctx.draft_narrowing is not None:
+            return None
+        slots = ctx.attn_backend.padded_write_locations(
+            self.attn_mha, ctx.forward_mode, q.shape[0]
+        )
+        return self.forward_normal_chunked_kv_prepare(
+            positions, q, latent_cache, ctx, slots
+        )
 
     def _project_q_latent(
         self,
@@ -718,10 +729,12 @@ class DeepseekV3AttentionMLA(nn.Module):
         q: torch.Tensor,
         latent_cache: torch.Tensor,
         ctx: ForwardContext,
+        *,
+        expanded: MLAPrologueOutput | None,
         output_gate: torch.Tensor | None = None,
         absorbed_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """The eager break: KV write + varlen prefill / absorb decode attention.
+        """The eager break: varlen prefill / absorb decode attention.
 
         Prefill/decode dispatch over the full rows; subclasses override (the
         draft variant narrows to live rows, see ``DeepseekV3DraftAttentionMLA``).
@@ -731,13 +744,12 @@ class DeepseekV3AttentionMLA(nn.Module):
         token count). The decode token count comes from the live ctx; the real
         prefill token count from the live attention metadata (the same source
         the padding scrub uses). Padded tail rows produce discarded garbage.
-        Each half fetches its own KV write span from the backend by mode:
-        EXTEND returns exactly the extend token span, DECODE exactly the
-        decode rows' verify window — no full-batch vector to slice. Outside a
-        decode round the latent rows were written before the break
-        (:meth:`_write_latent_before_break`): the prefill half hands its
-        prologue no rows to store, the decode half of a MIXED round rewrites
-        its own.
+        Outside a decode round the captured segment already ran the expanded
+        prologue over every row and stored the latent
+        (:meth:`_prefill_prologue_before_break`); the prefill half attends the
+        leading rows of that output, and the decode half of a MIXED round
+        assembles its absorbed query here and rewrites its own rows through
+        the backend's DECODE window.
         """
         spec = ctx.attn_backend.spec_num_tokens or 1
         num_decodes = max(ctx.bs - ctx.num_extends, 0)
@@ -763,30 +775,26 @@ class DeepseekV3AttentionMLA(nn.Module):
                 input_num_tokens=num_prefill_tokens,
                 forward_mode=ForwardMode.EXTEND,
             )
-            # Use absorbed attention for cached-prefix extend when supported by
-            # the backend and profitable for this query shape; otherwise use
-            # normal chunked prefill.
-            prefill_locs = ctx.attn_backend.write_locations(
-                self.attn_mha, ForwardMode.EXTEND
-            )
-            if not ctx.forward_mode.is_decode():
-                prefill_locs = prefill_locs[:0]
+            if expanded is None:
+                raise RuntimeError("prefill rows reached the break without a prologue")
             if getattr(cmeta, "use_absorbed_cached_extend", False):
+                # Absorbed cached extend (gluon) rebuilds its query here; its rows are stored.
                 self.forward_absorb(
                     positions[:num_prefill_tokens],
                     q[:num_prefill_tokens],
                     latent_cache[:num_prefill_tokens],
                     prefill_ctx,
-                    prefill_locs,
+                    ctx.attn_backend.write_locations(self.attn_mha, ForwardMode.EXTEND)[
+                        :0
+                    ],
                     attn_output[:num_prefill_tokens],
                 )
             else:
-                self.forward_normal_chunked(
-                    positions[:num_prefill_tokens],
-                    q[:num_prefill_tokens],
-                    latent_cache[:num_prefill_tokens],
+                self.forward_normal_chunked_kv_core(
+                    expanded.query[:num_prefill_tokens],
+                    expanded.key[:num_prefill_tokens],
+                    expanded.value[:num_prefill_tokens],
                     prefill_ctx,
-                    prefill_locs,
                     attn_output[:num_prefill_tokens],
                 )
 
@@ -929,47 +937,31 @@ class DeepseekV3AttentionMLA(nn.Module):
             out=output,
         )
 
-    def forward_normal_chunked(
-        self,
-        positions: torch.Tensor,
-        q: torch.Tensor,
-        latent_cache: torch.Tensor,
-        ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
-        output: torch.Tensor,
-    ) -> torch.Tensor:
-        # Prefill-graph padding contract: zero garbage rows the per-row projections
-        # + FP8 quantize would otherwise touch (see scrub_padding_tail).
-        ntok = sum(ctx.attn_backend.chunked_prefill_metadata.extend_seq_lens_cpu)
-        scrub_padding_tail(ntok, q, latent_cache)
-        q, k, v = self.forward_normal_chunked_kv_prepare(
-            positions, q, latent_cache, ctx, out_cache_loc
-        )
-        return self.forward_normal_chunked_kv_core(q, k, v, ctx, output)
-
     def forward_normal_chunked_kv_prepare(
         self,
         positions: torch.Tensor,
         q: torch.Tensor,
         latent_cache: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        slots: torch.Tensor,
+    ) -> MLAPrologueOutput:
+        """The expanded prefill prologue over every row of ``q``: per-head keys
+        and values up-projected from the latent, the rotated query, and the
+        latent rows stored at ``slots``; the inputs are left as given."""
         q = q.view(-1, self.num_local_heads, self.qk_head_dim)
         # kv_b_proj's fp8 online-quant GEMM needs a contiguous latent, not this strided slice.
         kv = self.kv_b_proj(latent_cache[..., : self.kv_lora_rank].contiguous())[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        out = self.attn_mha.latent_prologue(
+        return self.attn_mha.latent_prologue(
             q,
             q[..., self.qk_nope_head_dim :],
             latent_cache,
             positions,
             ctx,
-            slots=out_cache_loc,
+            slots=slots,
             expanded=MLAExpandedKV(k_nope=k_nope, value=v),
         )
-        return out.query, out.key, out.value
 
     def forward_normal_chunked_kv_core(
         self,
@@ -1089,6 +1081,8 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
         q: torch.Tensor,
         latent_cache: torch.Tensor,
         ctx: ForwardContext,
+        *,
+        expanded: MLAPrologueOutput | None,
         absorbed_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if ctx.draft_narrowing is None:
@@ -1097,6 +1091,7 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
                 q,
                 latent_cache,
                 ctx,
+                expanded=expanded,
                 absorbed_query=absorbed_query,
             )
 

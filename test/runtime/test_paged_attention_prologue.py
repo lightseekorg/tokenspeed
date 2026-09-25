@@ -118,36 +118,70 @@ def _prologue(monkeypatch, *, qk_norm, mode, rows, slots):
     return handed
 
 
-def test_write_latent_hands_the_entry_the_padded_span_and_the_rotary(monkeypatch):
-    """An MLA layer's pre-break write covers every row the forward carries."""
+def test_the_prefill_prologue_runs_over_every_row_before_the_break(monkeypatch):
+    """Outside a decode round the model runs the expanded prologue in the
+    captured segment over the padded rows; a decode round and a narrowed draft
+    step keep theirs in the break."""
+    from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3AttentionMLA
+
     handed = {}
     monkeypatch.setattr(
         paged_attention,
-        "write_latent",
-        lambda latent, *, rotary, cache: handed.update(rotary=rotary, cache=cache),
+        "mla_prologue",
+        lambda query, q_pe, latent, **kw: handed.update(kw, query=query) or "out",
     )
-    rotary_emb = SimpleNamespace(as_rotary=lambda positions: ("rotary", positions))
     layer = paged_attention.PagedAttention(
-        4, 576, 1.0, num_kv_heads=1, layer_id=0, rotary_emb=rotary_emb, qk_norm=None
+        2,
+        192,
+        1.0,
+        num_kv_heads=1,
+        layer_id=0,
+        v_head_dim=128,
+        rotary_emb=None,
+        qk_norm=None,
     )
     cache = torch.zeros(8, 1, 576, dtype=torch.bfloat16)
-    ctx = SimpleNamespace(
-        forward_mode=ForwardMode.EXTEND,
-        attn_backend=SimpleNamespace(
-            padded_write_locations=lambda layer, m, rows: torch.tensor([5, 6, 0, 0])[
-                :rows
-            ],
-            cache_placement=lambda layer: None,
+    model = SimpleNamespace(
+        forward_normal_chunked_kv_prepare=lambda *args: (
+            DeepseekV3AttentionMLA.forward_normal_chunked_kv_prepare(model, *args)
         ),
-        token_to_kv_pool=SimpleNamespace(
-            kv_write_target=lambda layer_id, s, m: LatentKVCache(cache, False, s, m)
-        ),
+        attn_mha=layer,
+        num_local_heads=2,
+        qk_head_dim=192,
+        qk_nope_head_dim=128,
+        v_head_dim=128,
+        kv_lora_rank=512,
+        kv_b_proj=lambda latent: (latent.new_zeros((latent.shape[0], 2 * 256)),),
     )
-    positions = torch.arange(4)
-    layer.write_latent(torch.zeros(4, 576, dtype=torch.bfloat16), positions, ctx)
-    assert handed["rotary"] == ("rotary", positions)
+
+    def ctx(mode, narrowing=None):
+        return SimpleNamespace(
+            forward_mode=mode,
+            draft_narrowing=narrowing,
+            attn_backend=SimpleNamespace(
+                padded_write_locations=lambda layer, m, rows: torch.tensor(
+                    [5, 6, 0, 0]
+                )[:rows],
+                cache_placement=lambda layer: None,
+            ),
+            token_to_kv_pool=SimpleNamespace(
+                kv_write_target=lambda layer_id, s, m: LatentKVCache(cache, False, s, m)
+            ),
+        )
+
+    q = torch.zeros(4, 2 * 192, dtype=torch.bfloat16)
+    latent = torch.zeros(4, 576, dtype=torch.bfloat16)
+    run = DeepseekV3AttentionMLA._prefill_prologue_before_break
+    assert run(model, torch.arange(4), q, latent, ctx(ForwardMode.EXTEND)) == "out"
     assert handed["cache"].slots.tolist() == [5, 6, 0, 0]
     assert handed["cache"].write_mask is None
+    assert handed["expanded"].k_nope.shape == (4, 2, 128)
+    assert handed["expanded"].value.shape == (4, 2, 128)
+    assert run(model, torch.arange(4), q, latent, ctx(ForwardMode.DECODE)) is None
+    assert (
+        run(model, torch.arange(4), q, latent, ctx(ForwardMode.EXTEND, object()))
+        is None
+    )
 
 
 def test_the_write_lands_on_this_ranks_shard_under_dcp(monkeypatch):
@@ -159,8 +193,8 @@ def test_the_write_lands_on_this_ranks_shard_under_dcp(monkeypatch):
     handed = {}
     monkeypatch.setattr(
         paged_attention,
-        "write_latent",
-        lambda latent, *, rotary, cache: handed.update(cache=cache),
+        "mla_prologue",
+        lambda query, q_pe, latent, **kw: handed.update(cache=kw["cache"]),
     )
     layer = paged_attention.PagedAttention(
         4, 576, 1.0, num_kv_heads=1, layer_id=0, rotary_emb=None, qk_norm=None
@@ -170,15 +204,21 @@ def test_the_write_lands_on_this_ranks_shard_under_dcp(monkeypatch):
     )
     ctx = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
-        attn_backend=SimpleNamespace(
-            padded_write_locations=lambda layer, m, rows: torch.tensor([4, 9, 8, 0]),
-            cache_placement=lambda layer: placement,
-        ),
+        attn_backend=SimpleNamespace(cache_placement=lambda layer: placement),
         token_to_kv_pool=SimpleNamespace(
             kv_write_target=lambda layer_id, s, m: LatentKVCache(None, False, s, m)
         ),
     )
-    layer.write_latent(torch.zeros(4, 576, dtype=torch.bfloat16), torch.arange(4), ctx)
+    q = torch.zeros(4, 4, 576, dtype=torch.bfloat16)
+    layer.latent_prologue(
+        q,
+        q[..., 512:],
+        torch.zeros(4, 576, dtype=torch.bfloat16),
+        torch.arange(4),
+        ctx,
+        slots=torch.tensor([4, 9, 8, 0]),
+        expanded=None,
+    )
     assert handed["cache"].slots.tolist() == [0, 5, 4, 0]
     assert handed["cache"].write_mask.tolist() == [False, True, True, False]
 

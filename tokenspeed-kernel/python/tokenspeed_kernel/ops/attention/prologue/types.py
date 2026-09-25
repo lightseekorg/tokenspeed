@@ -224,7 +224,9 @@ class MLAPrologueOutput:
 
     Attributes:
         query: ``[num_tokens, num_heads, q_nope_dim + rope_dim]``, FP8 for an
-            FP8 cache (not per-token-head planes), else in the activation dtype.
+            FP8 cache (not per-token-head planes), else in the activation dtype;
+            a fresh tensor for expanded attention or an FP8 cache, else the
+            given query.
         key: Per-head ``[num_tokens, num_heads, q_nope_dim + rope_dim]`` keys
             in the returned query's dtype for expanded attention, else ``None``.
         value: Per-head values in the returned query's dtype for expanded attention,

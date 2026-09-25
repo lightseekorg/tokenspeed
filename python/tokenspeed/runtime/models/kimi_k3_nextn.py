@@ -91,12 +91,13 @@ class KimiK3DraftAttentionMLA(KimiLinearMLAAttention, DeepseekV3DraftAttentionML
             )
             gate = None
             absorbed_query = None
-        self._write_latent_before_break(latent_cache, positions, ctx)
+        expanded = self._prefill_prologue_before_break(positions, q, latent_cache, ctx)
         attn_output = self._attn(
             positions,
             q,
             latent_cache,
             ctx,
+            expanded=expanded,
             absorbed_query=absorbed_query,
         )
         if gate is not None:

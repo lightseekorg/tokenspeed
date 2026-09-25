@@ -46,10 +46,8 @@ from functools import lru_cache
 import torch
 from tokenspeed_kernel.ops.attention.prologue.checks import (
     check_gqa_request,
-    check_latent_write,
     check_mla_request,
 )
-from tokenspeed_kernel.ops.attention.prologue.composite import store_latent
 from tokenspeed_kernel.ops.attention.prologue.types import (
     GQAPrologueOutput,
     HeadKVCache,
@@ -227,24 +225,6 @@ def qk_norm_rope(
     return out.q, out.k
 
 
-def write_latent(
-    latent_cache: torch.Tensor, *, rotary: Rotary | None, cache: LatentKVCache
-) -> None:
-    """Store an MLA layer's latent rows, their RoPE part rotated: the prologue's
-    cache write alone, for the graph segment before an attention break. The
-    break's :func:`mla_prologue` then finds its rows written and skips the
-    store (a zero-row cache) or rewrites the same rows.
-
-    Args:
-        latent_cache: ``[num_tokens, kv_lora_rank + rope_dim]`` normalized
-            latent followed by the unrotated key RoPE part, left as given.
-        rotary: Rotary embedding, or ``None`` for NoPE.
-        cache: Latent cache destination with one slot per row.
-    """
-    check_latent_write(latent_cache, rotary, cache)
-    store_latent(latent_cache, rotary, cache, pdl_enabled())
-
-
 def mla_prologue(
     query: torch.Tensor,
     q_pe: torch.Tensor,
@@ -262,16 +242,19 @@ def mla_prologue(
         query: ``[num_tokens, num_heads, q_nope_dim + rope_dim]`` buffer whose
             leading channels already hold the query's non-RoPE part: the
             absorbed latent query (``q_nope_dim == kv_lora_rank``) or a
-            per-head query that attends expanded keys. Its RoPE channels
-            receive the rotated ``q_pe`` unless the cache is FP8 (not planes).
+            per-head query that attends expanded keys. For absorbed attention
+            with a non-FP8 cache (not planes) its RoPE channels receive the
+            rotated ``q_pe``; otherwise the returned query is a fresh tensor.
         q_pe: Unrotated query RoPE part ``[num_tokens, num_heads, rope_dim]``;
             it may alias ``query``'s RoPE channels.
         latent_cache: ``[num_tokens, kv_lora_rank + rope_dim]`` normalized
-            latent followed by the unrotated key RoPE part, which may be
-            rotated in place.
+            latent followed by the unrotated key RoPE part; absorbed attention
+            may rotate it in place.
         expanded: Per-head keys and values when attention does not absorb
             the latent up-projection; ``None`` for absorbed attention, which
-            reads the latent cache.
+            reads the latent cache. Expanded attention returns fresh tensors
+            and leaves every input as given, so a graph segment can run it
+            ahead of a break that still reads them.
         rotary: Rotary embedding, or ``None`` for NoPE.
         cache: Latent cache destination.
         solution: Optional registered solution to select.
@@ -343,9 +326,9 @@ __all__ = [
     "gqa_prologue",
     "mla_prologue",
     "qk_norm_rope",
-    "write_latent",
 ]
 
 
-# Backend registration (side-effect import; the composite registers on its import above)
+# Backend registration (side-effect imports)
+import tokenspeed_kernel.ops.attention.prologue.composite  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.prologue.triton  # noqa: E402,F401
