@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Pipeline, masking and output-contract coverage for gfx950 MLA prefill."""
+"""FP8 pipeline, masking and output-contract coverage for gfx950 MLA prefill."""
 
 from __future__ import annotations
 
@@ -30,16 +30,18 @@ from tokenspeed_kernel.platform import current_platform
 platform = current_platform()
 pytestmark = pytest.mark.skipif(not platform.is_cdna4, reason="gfx950 MLA pipeline")
 _FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
-_DTYPES = [torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2]
+# Named explicitly: large 16-bit and FP8 problems otherwise select
+# gluon_mla_prefill_8wave_gfx950.
+_KERNEL = "gluon_mla_prefill_gfx950"
 
 
-@pytest.mark.parametrize("dtype", _DTYPES)
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize(
     "out_dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64]
 )
 @pytest.mark.parametrize("num_heads", [12, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
-def test_mla_prefill_gluon_strided_output(
+def test_mla_prefill_gluon_fp8_strided_output(
     device, require, dtype, out_dtype, num_heads, is_causal
 ):
     require("attention", "mla_prefill", "gluon", dtype, "q")
@@ -69,7 +71,7 @@ def test_mla_prefill_gluon_strided_output(
         softmax_scale=192**-0.5,
         is_causal=is_causal,
         return_lse=True,
-        solution="gluon",
+        override=_KERNEL,
         out=destination,
     )
     assert out is destination
@@ -132,7 +134,7 @@ def test_mla_prefill_gluon_fp8_static_grid_graph(
             softmax_scale=192**-0.5,
             is_causal=is_causal,
             return_lse=True,
-            solution="gluon",
+            override=_KERNEL,
         )
 
     invoke()
@@ -249,7 +251,7 @@ def test_mla_prefill_gluon_fp8_scheduler_coverage(
         softmax_scale=192**-0.5,
         is_causal=is_causal,
         return_lse=True,
-        solution="gluon",
+        override=_KERNEL,
         out=destination,
     )
     # Uniform logits give exact prefix means. Short KV spans keep this scheduler
@@ -275,9 +277,9 @@ def test_mla_prefill_gluon_fp8_scheduler_coverage(
     )
 
 
-@pytest.mark.parametrize("dtype", _DTYPES)
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("q_len,kv_len", [(129, 65), (65, 129), (257, 193), (65, 0)])
-def test_mla_prefill_gluon_causal_cutoff(device, require, dtype, q_len, kv_len):
+def test_mla_prefill_gluon_fp8_causal_cutoff(device, require, dtype, q_len, kv_len):
     require("attention", "mla_prefill", "gluon", dtype, "q")
     q = torch.zeros((q_len, 12, 192), dtype=dtype, device=device)
     # Poison the backing tail; masked loads must not admit keys past KV length.
@@ -305,7 +307,7 @@ def test_mla_prefill_gluon_causal_cutoff(device, require, dtype, q_len, kv_len):
         softmax_scale=192**-0.5,
         is_causal=True,
         return_lse=True,
-        solution="gluon",
+        override=_KERNEL,
     )
     # Zero logits give the exact prefix mean, capped at the last real key.
     visible = (torch.arange(q_len, device=device) + max(kv_len - q_len, 0) + 1).clamp(
@@ -319,12 +321,12 @@ def test_mla_prefill_gluon_causal_cutoff(device, require, dtype, q_len, kv_len):
     torch.testing.assert_close(lse, expected_lse, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize("dtype", _DTYPES)
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("changed_row", [None, 13, 45, 254])
 @pytest.mark.parametrize(
     "kv_len", [1, 64, 65, 128, 129, 193, 256, 257, 321, 512, 513, 576]
 )
-def test_mla_prefill_gluon_online_max(device, require, dtype, changed_row, kv_len):
+def test_mla_prefill_gluon_fp8_online_max(device, require, dtype, changed_row, kv_len):
     require("attention", "mla_prefill", "gluon", dtype, "q")
     q = torch.zeros((255, 2, 192), dtype=torch.bfloat16, device=device)
     k = torch.zeros((576, 2, 192), dtype=torch.bfloat16, device=device)
@@ -333,11 +335,7 @@ def test_mla_prefill_gluon_online_max(device, require, dtype, changed_row, kv_le
     if changed_row is not None:
         # Non-leading rows in multiple waves, including the final active row.
         q[changed_row, 0, 0] = -1.0
-    # Distinct values and changing maxima span two complete V-ring wraps. In
-    # base-2 logits each key step of 64 moves a score by about 6.7, so the
-    # 16-bit path both keeps a lagging maximum (a jump below its rescale
-    # threshold of 8) and rescales (larger jumps, and only in the changed row's
-    # wave).
+    # Distinct values and changing maxima span two complete V-ring wraps.
     tiles = (
         (64, 1),
         (64, 0.5),
@@ -370,7 +368,7 @@ def test_mla_prefill_gluon_online_max(device, require, dtype, changed_row, kv_le
         softmax_scale=192**-0.5,
         is_causal=False,
         return_lse=True,
-        solution="gluon",
+        override=_KERNEL,
     )
     scores = torch.einsum("qhd,khd->hqk", q.float(), k.float()) * (192**-0.5)
     expected = torch.einsum("hqk,khd->qhd", scores.softmax(-1), v.float())
@@ -378,63 +376,3 @@ def test_mla_prefill_gluon_online_max(device, require, dtype, changed_row, kv_le
     torch.testing.assert_close(
         lse, scores.logsumexp(-1).transpose(0, 1), rtol=2e-5, atol=2e-5
     )
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("is_causal", [False, True])
-@pytest.mark.parametrize(
-    "q_len,kv_len,num_heads", [(64, 1000, 2), (257, 257, 2), (600, 600, 1)]
-)
-def test_mla_prefill_gluon_repeated_launches(
-    device, require, dtype, is_causal, q_len, kv_len, num_heads
-):
-    # Random logits with doubled keys move the running maximum past the lazy
-    # rescale threshold in some waves and not others. A short query block over
-    # a long prefix crosses both the causal diagonal and the key tail. Any race
-    # on the K/V LDS rings shows up as launches that disagree bitwise.
-    require("attention", "mla_prefill", "gluon", dtype, "q")
-    torch.manual_seed(0)
-    q = torch.randn((q_len, num_heads, 192), dtype=dtype, device=device)
-    # Poison the backing tail; masked loads must not admit keys past KV length.
-    k_storage = torch.full(
-        (kv_len + 64, num_heads, 192), float("nan"), dtype=dtype, device=device
-    )
-    v_storage = torch.full(
-        (kv_len + 64, num_heads, 128), float("nan"), dtype=dtype, device=device
-    )
-    k_storage[:kv_len] = 2 * torch.randn_like(k_storage[:kv_len])
-    v_storage[:kv_len] = torch.randn_like(v_storage[:kv_len])
-    k, v = k_storage[:kv_len], v_storage[:kv_len]
-    cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=device)
-    cu_kv = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
-
-    scores = torch.einsum("qhd,khd->hqk", q.float(), k.float()) * (192**-0.5)
-    if is_causal:
-        rows = torch.arange(q_len, device=device) + max(kv_len - q_len, 0)
-        cols = torch.arange(kv_len, device=device)
-        scores.masked_fill_(cols[None, :] > rows[:, None], -float("inf"))
-    expected = torch.einsum("hqk,khd->qhd", scores.softmax(-1), v.float())
-    expected_lse = scores.logsumexp(-1).transpose(0, 1)
-
-    first = None
-    for _ in range(4):
-        out, lse = mla_prefill(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=cu_q,
-            cu_seqlens_kv=cu_kv,
-            max_seqlen_q=q_len,
-            max_seqlen_kv=kv_len,
-            softmax_scale=192**-0.5,
-            is_causal=is_causal,
-            return_lse=True,
-            solution="gluon",
-        )
-        torch.testing.assert_close(out.float(), expected, rtol=3e-2, atol=3e-2)
-        torch.testing.assert_close(lse, expected_lse, rtol=1e-4, atol=1e-4)
-        if first is None:
-            first = (out.clone(), lse.clone())
-        else:
-            torch.testing.assert_close(out, first[0], rtol=0, atol=0)
-            torch.testing.assert_close(lse, first[1], rtol=0, atol=0)

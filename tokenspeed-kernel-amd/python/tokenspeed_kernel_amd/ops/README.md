@@ -241,8 +241,9 @@ score.
 
 ### gfx950 MLA prefill
 
-`gluon_mla_prefill_gfx950` computes dense, non-absorbed MLA prefill attention
-over ragged sequences.
+Two kernels compute dense, non-absorbed MLA prefill attention over ragged
+sequences, `gluon_mla_prefill_gfx950` and `gluon_mla_prefill_8wave_gfx950`,
+both for every supported dtype.
 
 #### Contract
 
@@ -254,39 +255,55 @@ over ragged sequences.
   aligns each query block to the end of its keys. `logit_cap` is unsupported.
 - The output may be any caller-owned floating dtype with a contiguous last
   dimension; the optional log-sum-exp is FP32 in natural-log units.
-- A persistent grid of 512 workgroups walks 256-row query blocks; the launch
-  keeps no sequence-length constexpr, so ragged batches reuse one binary.
+- The 8-wave kernel is selected when its `qkv_problem_filter` accepts
+  `(batch_size, total_q, total_kv, num_q_heads)`: at least 32768 query rows
+  across heads (`num_q_heads * total_q`), and on average at least 128 query
+  and 512 key tokens per sequence. The dispatcher reads these from tensor
+  shapes, rounding token counts up to a power of two, so selection never
+  syncs and also runs under graph capture. Other problems select
+  `gluon_mla_prefill_gfx950`. Either kernel can be forced by name through
+  `override`; both accept every input of the op, so the choice only affects
+  speed.
+- Both launch a persistent grid of 512 workgroups and keep no sequence-length
+  constexpr, so ragged batches reuse one binary.
 
 #### Algorithm
 
-Both paths use eight wave64s, each owning 32 query rows of one 32x32 MFMA row
-block, and base-2 online softmax.
+All paths use base-2 online softmax. `gluon_mla_prefill_gfx950` runs 16-bit
+inputs with four wave64s over 128-row query blocks and 64-key tiles: fully
+visible tiles double-buffer their asynchronous copies, and the diagonal band
+and key tail run masked and unpipelined. Its FP8 path uses eight wave64s over
+256-row blocks, 64-key tiles with the unscaled K=64 FP8 MFMA, splits each score
+tile into two 32-column halves, and overlaps a tile's QK MFMA with the previous
+tile's softmax and PV MFMA.
 
-The 16-bit path follows the two-wave ping-pong design of the gfx950 Gluon
-attention tutorial. Keys advance in 32-row tiles, which keeps Q, the output
-accumulator, one K or V operand, and the score tiles within 256 VGPRs. Each
-loop iteration is four warp-pipeline clusters: the QK MFMAs of the next tile
-with the exp2/sum/convert of the current one, the V reads from LDS, the PV
-MFMAs with the next tile's row maximum and first exp2 quarter, and the K reads
-with the rescale. The two waves on a SIMD run one cluster apart, so one wave's
-MFMA overlaps the other's LDS reads and DMA issue, and the softmax co-issues
-with its own wave's MFMA.
+`gluon_mla_prefill_8wave_gfx950` follows the two-wave ping-pong design of
+the ROCm gfx950 Gluon attention tutorials. Eight wave64s each own 32 query rows
+of one 32x32 MFMA row block. Keys advance in 32-row tiles for 16-bit inputs and
+64-row tiles for FP8, one K=64 FP8 MFMA step, which keeps Q, the output
+accumulator, one K or V operand, and the score tiles within 256 VGPRs and gives
+both dtypes the same matrix time per cluster. Each loop iteration is four
+warp-pipeline clusters: the K reads with the rescale, the QK MFMAs of the next
+tile with the exp2/sum/convert of the current one, the V reads from LDS, and
+the PV MFMAs with the next tile's row maximum and first exp2 quarter. The two
+waves on a SIMD run one cluster apart, so one wave's MFMA overlaps the other's
+LDS reads and DMA issue, and the softmax co-issues with its own wave's MFMA.
+K is read and consumed within an iteration, so no FP8 operand crosses the loop
+backedge.
 
 K and V move global-to-LDS by asynchronous buffer copies through 4-slot rings,
 K four tiles and V three tiles ahead. A copy only overwrites a slot whose reads
 both waves already consumed. Tiles past the visible range load with every row
 masked, which zero-fills LDS, so the same loop body runs to the last tile
 without a drain; only iterations whose next tile crosses the causal diagonal
-or the key tail apply a score mask. The running maximum advances lazily: it
-moves only when a tile maximum exceeds it by more than 8 (base 2), and a wave
-skips the accumulator rescale when none of its rows moved. Empty
+or the key tail apply a score mask. For 16-bit inputs the running maximum
+advances lazily: it moves only when a tile maximum exceeds it by more than 8
+(base 2). FP8 keeps the exact maximum, so P stays at most 1 before its FP8
+conversion. Either way a wave skips the accumulator rescale when none of its
+rows moved. Empty
 side-effecting asm statements keep each cluster's results in that cluster, so
 LLVM neither sinks them past the rescale branch nor reorders them across the
 cluster barriers.
-
-The FP8 path uses 64-key tiles with the unscaled K=64 FP8 MFMA, splits each
-score tile into two 32-column halves, and overlaps a tile's QK MFMA with the
-previous tile's softmax and PV MFMA.
 
 ## Sampling
 

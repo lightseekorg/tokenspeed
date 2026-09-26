@@ -1192,6 +1192,27 @@ def _attention_mla_decode(
     )
 
 
+def _attention_mla_prefill(
+    dtype: torch.dtype, batch_size: int, q_len: int, kv_len: int, num_heads: int
+) -> object:
+    # Selection reads the problem size from tensor shapes only, so stride-0
+    # views stand in for full-size inputs.
+    def tokens(count: int, dim: int) -> torch.Tensor:
+        return torch.empty((1, num_heads, dim), dtype=dtype).expand(count, -1, -1)
+
+    return _attention_mla_pkg.mla_prefill(
+        q=tokens(batch_size * q_len, 192),
+        k=tokens(batch_size * kv_len, 192),
+        v=tokens(batch_size * kv_len, 128),
+        cu_seqlens_q=torch.arange(batch_size + 1, dtype=torch.int32) * q_len,
+        cu_seqlens_kv=torch.arange(batch_size + 1, dtype=torch.int32) * kv_len,
+        max_seqlen_q=q_len,
+        max_seqlen_kv=kv_len,
+        softmax_scale=1.0,
+        is_causal=True,
+    )
+
+
 def _attention_mla_decode_fp8_k3() -> object:
     q = torch.empty((1, 1, 12, 576), dtype=torch.bfloat16)
     kv_cache = torch.empty((2, 64, 1, 576), dtype=torch.float8_e4m3fn)
@@ -4681,6 +4702,69 @@ _CASES = [
         "mla_decode_with_kvcache",
         "triton_mla_decode_with_kvcache",
         _attention_mla_decode_fp8q_unsupported_heads,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "mla_prefill",
+        "gluon_mla_prefill_8wave_gfx950",
+        partial(_attention_mla_prefill, torch.bfloat16, 4, 1024, 1024, 16),
+        id_suffix="bf16-full-gpu",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "mla_prefill",
+        "gluon_mla_prefill_8wave_gfx950",
+        partial(_attention_mla_prefill, torch.bfloat16, 1, 512, 512, 128),
+        id_suffix="bf16-many-heads",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "mla_prefill",
+        "gluon_mla_prefill_gfx950",
+        partial(_attention_mla_prefill, torch.bfloat16, 4, 256, 256, 16),
+        id_suffix="bf16-underfilled-gpu",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "mla_prefill",
+        "gluon_mla_prefill_gfx950",
+        partial(_attention_mla_prefill, torch.bfloat16, 32, 64, 2048, 16),
+        id_suffix="bf16-short-queries",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "mla_prefill",
+        "gluon_mla_prefill_gfx950",
+        partial(_attention_mla_prefill, torch.bfloat16, 16, 256, 256, 16),
+        id_suffix="bf16-short-keys",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "mla_prefill",
+        "gluon_mla_prefill_8wave_gfx950",
+        partial(_attention_mla_prefill, torch.float8_e4m3fn, 4, 1024, 1024, 16),
+        id_suffix="fp8-full-gpu",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "mla_prefill",
+        "gluon_mla_prefill_gfx950",
+        partial(_attention_mla_prefill, torch.float8_e4m3fn, 4, 256, 256, 16),
+        id_suffix="fp8-underfilled-gpu",
     ),
     _case(
         _is_cdna5,

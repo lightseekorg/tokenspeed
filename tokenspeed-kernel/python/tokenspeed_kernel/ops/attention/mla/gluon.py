@@ -63,6 +63,9 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.prefill import (
         launch_gluon_mla_prefill_gfx950 as _mla_prefill_gfx950_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.prefill_8wave import (
+        launch_gluon_mla_prefill_8wave_gfx950 as _mla_prefill_8wave_gfx950_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.project_value import (
         launch_gluon_mla_project_value_gfx950 as _mla_project_value_impl,
     )
@@ -607,6 +610,55 @@ if current_platform().is_amd:
     )
     def gluon_mla_prefill_gfx950(*args, **kwargs):
         return _mla_prefill_gfx950_impl(*args, **kwargs)
+
+    def _is_8wave_mla_prefill_problem(
+        batch_size: int, total_q: int, total_kv: int, num_q_heads: int
+    ) -> bool:
+        # The 8-wave kernel covers 256 query rows per block (for 16-bit inputs
+        # half as many blocks as gluon_mla_prefill_gfx950 makes) and refills
+        # its K/V pipeline for every block. It wants enough blocks to fill the
+        # GPU (the first bound is about 128 of them), blocks at least half full
+        # on average, and enough keys per sequence to pay off the refill. The
+        # thresholds come from a static cycle model, not hardware measurement.
+        return (
+            num_q_heads * total_q >= 32768
+            and total_q >= 128 * batch_size
+            and total_kv >= 512 * batch_size
+        )
+
+    @register_kernel(
+        "attention",
+        "mla_prefill",
+        name="gluon_mla_prefill_8wave_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=format_signatures(
+            ("q", "k", "v"),
+            "dense",
+            {
+                torch.float16,
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            },
+        ),
+        # Preferred over gluon_mla_prefill_gfx950 wherever both apply.
+        priority=Priority.SPECIALIZED + 1,
+        traits={
+            "qkv_problem_filter": frozenset({_is_8wave_mla_prefill_problem}),
+            "head_dim": frozenset({192}),
+            "value_head_dim": frozenset({128}),
+            "is_causal": frozenset({False, True}),
+            "logit_cap": frozenset({False}),
+            "return_lse": frozenset({False, True}),
+        },
+    )
+    def gluon_mla_prefill_8wave_gfx950(*args, **kwargs):
+        return _mla_prefill_8wave_gfx950_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",

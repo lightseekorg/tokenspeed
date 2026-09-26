@@ -51,6 +51,10 @@ def _attention_format_signature(**roles: torch.Tensor):
     )
 
 
+def _round_up_to_power_of_two(count: int) -> int:
+    return 1 << (count - 1).bit_length() if count > 1 else count
+
+
 def _mxfp8_attention_format_signature(**roles: torch.Tensor):
     return format_signature(
         **{
@@ -580,6 +584,14 @@ def mla_prefill(
     """
     batch_size = cu_seqlens_q.shape[0] - 1
     traits = {
+        # Problem size for kernels that declare a qkv_problem_filter, read from
+        # shapes so selection never syncs and also works under graph capture.
+        # Token counts are rounded up to a power of two, which bounds the
+        # selection cache while the counts vary from batch to batch.
+        "batch_size": batch_size,
+        "total_q": _round_up_to_power_of_two(q.shape[0]),
+        "total_kv": _round_up_to_power_of_two(k.shape[0]),
+        "num_q_heads": q.shape[1],
         "head_dim": q.shape[-1],
         "value_head_dim": v.shape[-1],
         "is_causal": is_causal,
