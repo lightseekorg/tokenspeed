@@ -621,12 +621,13 @@ class InklingAttention(nn.Module):
                 )
             k = kv[:, : self.kv_size]
             v = kv[:, self.kv_size :]
+            # Norm and KV store hide under the rel_logits branch; only attention waits for the join.
+            prepared = self.attn.prologue(q, k, v, None, ctx)
 
-        attn_output = self.attn(
-            q,
-            k,
-            v,
-            None,
+        attn_output = self.attn.attend(
+            prepared.q,
+            prepared.k,
+            prepared.v,
             ctx,
             rel_logits=rel_logits,
             log_scaling_tau=None if self.is_local else log_scaling_tau,

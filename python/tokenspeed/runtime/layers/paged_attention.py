@@ -168,19 +168,19 @@ class PagedAttention(nn.Module):
         A GQA layer given K/V takes its projected rows: the prologue normalizes
         and rotates them and writes K/V at the backend's write locations, padded
         to the rows the forward carries so a graph can record it; core attention
-        runs in the eager break. ``k = v = None`` means the inputs are prepared
-        and the cache written (by :meth:`prologue`, or by an MLA layer's
-        :meth:`latent_prologue`).
+        runs in the eager break (:meth:`attend`). ``k = v = None`` means the
+        inputs are prepared and the cache written (by :meth:`prologue`, or by
+        an MLA layer's :meth:`latent_prologue`).
         """
         if k is not None and v is None:
             raise ValueError("v must be provided when k is provided.")
         if k is not None and not ctx.forward_mode.is_idle():
             out = self.prologue(q, k, v, positions, ctx)
             q, k, v = out.q, out.k, out.v
-        return self._attend(q, k, v, ctx, **kwargs)
+        return self.attend(q, k, v, ctx, **kwargs)
 
     @break_point
-    def _attend(
+    def attend(
         self,
         q: torch.Tensor,
         k: torch.Tensor | None,
@@ -188,6 +188,10 @@ class PagedAttention(nn.Module):
         ctx: ForwardContext,
         **kwargs,
     ) -> torch.Tensor:
+        """Core attention over prepared inputs, the eager break: the prologue's
+        query and, for a forward that is not a decode, its returned key and
+        value rows. A model that runs :meth:`prologue` inside its own stream
+        scope calls this afterwards."""
         if k is not None:
             k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
             v = v.view(-1, self.tp_v_head_num, self.v_head_dim)

@@ -172,7 +172,11 @@ one slot per row it carries (`AttentionBackend.padded_write_locations`); the
 rows past the real tokens land in the dummy slot 0, which the span keeps in
 its tail and which padded decode rows and page-table holes already use.
 Padding costs only the masked programs of the tile past the real tokens. Core
-attention stays the eager break (`PagedAttention._attend`).
+attention stays the eager break (`PagedAttention.attend`). A model that overlaps
+work on an auxiliary stream runs `prologue` inside its fork scope and calls
+`attend` after the join, so the norm and the store hide under the branch:
+Inkling's QK norm sat there before the refactor and moving it after the join
+cost 1.7 µs per layer of decode.
 
 An MLA model splits its rows into prefill and decode halves from live metadata
 inside its attention break (`_attn`). Outside a decode round the captured
