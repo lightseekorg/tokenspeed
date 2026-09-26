@@ -689,10 +689,18 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
         _resolve_heterogeneous_draft_family,
     )
 
-    assert _resolve_heterogeneous_draft_family("mla", "mha") == "mha"
-    assert _resolve_heterogeneous_draft_family("kimi_k3", "mla") == "mla"
+    assert (
+        _resolve_heterogeneous_draft_family("mla", "mha", draft_family_declared=False)
+        == "mha"
+    )
+    assert (
+        _resolve_heterogeneous_draft_family(
+            "kimi_k3", "mla", draft_family_declared=False
+        )
+        == "mla"
+    )
     with pytest.raises(RuntimeError, match="require an MHA draft"):
-        _resolve_heterogeneous_draft_family("mha", "mla")
+        _resolve_heterogeneous_draft_family("mha", "mla", draft_family_declared=False)
     with pytest.raises(RuntimeError, match="support ordinary drafts only"):
         _create_draft_components(
             backend=None,
@@ -704,8 +712,7 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
             num_target_layers=1,
             full_attn_backend_name=None,
             is_heterogeneous=True,
-            is_hybrid_linear=True,
-            is_kda=False,
+            linear_attention="gdn",
             is_inkling=False,
         )
 
@@ -729,13 +736,15 @@ def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
         hf_config=SimpleNamespace(
             architectures=("LlamaForCausalLM",),
             is_deepseek_v4=False,
-        )
+        ),
+        model_profile=None,
     )
     draft = SimpleNamespace(
         hf_config=SimpleNamespace(
             architectures=("DeepseekV4ForCausalLMNextN",),
             is_deepseek_v4=True,
-        )
+        ),
+        model_profile=None,
     )
 
     with pytest.raises(NotImplementedError, match="target-only"):

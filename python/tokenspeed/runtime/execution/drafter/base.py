@@ -49,6 +49,12 @@ class BaseDrafter:
     # publish one final readiness event for the complete speculative chain.
     supports_pd_layerwise_finalization = False
 
+    # Whether this drafter threads a request-token-history view into every
+    # draft forward. A draft model whose config requires the history must be
+    # served by a drafter that declares this, or fail at startup instead of
+    # forwarding without it.
+    supports_request_token_history = False
+
     def __init__(
         self,
         spec_num_tokens: int,

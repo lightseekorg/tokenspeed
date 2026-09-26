@@ -428,8 +428,7 @@ def test_the_replacement_arena_reuses_the_backend_it_was_given(
         server_args=None,
         cache_spec=SimpleNamespace(layer_types=("full_attention",)),
         full_attn_backend_name=None,
-        is_hybrid_linear=False,
-        is_kda=False,
+        linear_attention=None,
         is_inkling=False,
     )
     if side == "target":

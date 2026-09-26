@@ -84,6 +84,7 @@ class KimiK3Recipe(CacheRecipe):
     """
 
     family = "kimi_k3"
+    uses_paged_state_verify = True
 
     # ---- layer vocabulary ----
 
