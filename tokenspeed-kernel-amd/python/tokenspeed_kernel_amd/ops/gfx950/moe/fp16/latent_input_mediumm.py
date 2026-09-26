@@ -22,14 +22,17 @@
 
 Eight-wave workgroups compute 128x128 or 256x128 output tiles. The shared
 layout helpers from the dense16 GEMM give vectorized global-to-LDS copies and
-padded LDS rows for native BF16 MFMA. Three K buffers keep two 64-wide copies
+padded LDS rows for native BF16 MFMA. Four K buffers on the 128-row tile, or
+three on the 256-row tile where LDS is tighter, keep the other 64-wide copies
 in flight, and a two-stage warp pipeline alternates the MFMA block with the
 next tile's LDS reads and copy issue. The column tile divides all K3 output
 regions, so one packed weight pass stores router logits as FP32 and the routed
 projection as BF16. Each shared-expert tile reads 64 gate rows and the
 matching 64 up rows, so SiTU is applied in the epilogue and no gate/up
 intermediate or second launch is needed. Program ids are remapped per XCD so
-the row tiles sharing a weight tile share one L2.
+the row tiles sharing a weight tile share one L2, and each XCD starts its K
+loop at a different eighth of K and wraps around, so the XCDs do not all read
+the same activation columns at the same time.
 """
 
 from __future__ import annotations
@@ -62,7 +65,8 @@ _UPPER_M_THRESHOLD = 640
 # (WARPS_M, WARPS_N) per row tile. The 256-row tile splits rows four ways so
 # each wave reads a 64x64 operand pair from LDS instead of 128x32.
 _WARPS = {_BLOCK_M: (2, 4), _BLOCK_M_UPPER: (4, 2)}
-_NUM_BUFFERS = 3
+# LDS K buffers per row tile; four 256-row buffers exceed the 160 KiB of LDS.
+_NUM_BUFFERS = {_BLOCK_M: 4, _BLOCK_M_UPPER: 3}
 _NUM_XCDS = 8
 
 
@@ -78,6 +82,25 @@ def _mediumm_launch_metadata(grid, kernel, args):
         + m * _K3_ROUTED * args["routed_ptr"].element_size()
         + m * _K3_SHARED * args["shared_ptr"].element_size(),
     }
+
+
+@gluon.jit
+def _next_k_tile(
+    k_tile,
+    a_offsets,
+    b_offsets,
+    a_kstep,
+    b_kstep,
+    a_kspan,
+    b_kspan,
+    k_tiles: gl.constexpr,
+):
+    """Advance the copy offsets one K tile, wrapping from the last to the first."""
+    k_tile += 1
+    wrap = k_tile == k_tiles
+    a_offsets += gl.where(wrap, a_kstep - a_kspan, a_kstep)
+    b_offsets += gl.where(wrap, b_kstep - b_kspan, b_kstep)
+    return gl.where(wrap, 0, k_tile), a_offsets, b_offsets
 
 
 @gluon.jit(launch_metadata=_mediumm_launch_metadata)
@@ -197,14 +220,27 @@ def gluon_latent_input_mediumm_gfx950(
     )
     a_kstep = BLOCK_K * stride_ak
     b_kstep = BLOCK_K * stride_bk
+    # Start each XCD at its own K tile and wrap at K. Summation order changes
+    # per XCD, but every output tile still adds all K tiles once.
+    k_tile = xcd * (k_tiles // NUM_XCDS)
+    a_offsets += k_tile * a_kstep
+    b_offsets += k_tile * b_kstep
 
     # Fill every buffer; each commit group holds one K tile of A and B.
     for slot in gl.static_range(NUM_BUFFERS):
         async_copy.buffer_load_to_shared(smem_a.index(slot), a_ptr, a_offsets)
         async_copy.buffer_load_to_shared(smem_b.index(slot), b_ptr, b_offsets)
         async_copy.commit_group()
-        a_offsets += a_kstep
-        b_offsets += b_kstep
+        k_tile, a_offsets, b_offsets = _next_k_tile(
+            k_tile,
+            a_offsets,
+            b_offsets,
+            a_kstep,
+            b_kstep,
+            K * stride_ak,
+            K * stride_bk,
+            k_tiles,
+        )
     async_copy.wait_group(NUM_BUFFERS - 1)
     a = async_copy.load_shared_relaxed(smem_a.index(0), dot_a)
     b = async_copy.load_shared_relaxed(smem_b.index(0), dot_b)
@@ -228,8 +264,16 @@ def gluon_latent_input_mediumm_gfx950(
                 async_copy.buffer_load_to_shared(smem_a.index(slot), a_ptr, a_offsets)
                 async_copy.buffer_load_to_shared(smem_b.index(slot), b_ptr, b_offsets)
                 async_copy.commit_group()
-                a_offsets += a_kstep
-                b_offsets += b_kstep
+                k_tile, a_offsets, b_offsets = _next_k_tile(
+                    k_tile,
+                    a_offsets,
+                    b_offsets,
+                    a_kstep,
+                    b_kstep,
+                    K * stride_ak,
+                    K * stride_bk,
+                    k_tiles,
+                )
 
     # The refills left after whole rounds run as extra steps, so the last
     # copies are issued inside the pipeline instead of after the drain.
@@ -248,8 +292,16 @@ def gluon_latent_input_mediumm_gfx950(
             async_copy.buffer_load_to_shared(smem_a.index(slot), a_ptr, a_offsets)
             async_copy.buffer_load_to_shared(smem_b.index(slot), b_ptr, b_offsets)
             async_copy.commit_group()
-            a_offsets += a_kstep
-            b_offsets += b_kstep
+            k_tile, a_offsets, b_offsets = _next_k_tile(
+                k_tile,
+                a_offsets,
+                b_offsets,
+                a_kstep,
+                b_kstep,
+                K * stride_ak,
+                K * stride_bk,
+                k_tiles,
+            )
 
     # Drain the tiles already in LDS, starting after the slot in registers.
     async_copy.wait_group(0)
@@ -398,7 +450,7 @@ def launch_gluon_latent_input_mediumm_gfx950(
         BLOCK_K=_BLOCK_K,
         WARPS_M=warps_m,
         WARPS_N=warps_n,
-        NUM_BUFFERS=_NUM_BUFFERS,
+        NUM_BUFFERS=_NUM_BUFFERS[block_m],
         NUM_XCDS=_NUM_XCDS,
         num_warps=warps_m * warps_n,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),

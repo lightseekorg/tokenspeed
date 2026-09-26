@@ -305,9 +305,12 @@ available for other shapes and devices.
 
 The mid-range path uses `128 x 128 x 64` tiles through 640 tokens and
 `256 x 128 x 64` tiles from 641 to 1280 tokens. Both use eight waves,
-vectorized loads, padded LDS layouts, and a three-buffer K pipeline to overlap
+vectorized loads, padded LDS layouts, and a K pipeline with four buffers on the
+128-row tile and three on the 256-row tile (four would exceed LDS) to overlap
 data movement with MFMA. Workgroups are ordered to reuse weight tiles within
-each XCD. Column tiles follow the packed output boundaries: router logits are
+each XCD, and each XCD starts its K loop at a different eighth of K and wraps
+around, so the XCDs spread their activation reads over K instead of all
+reading the same columns at once. Column tiles follow the packed output boundaries: router logits are
 stored as FP32, routed latents as BF16, and shared gate/up pairs apply SiTU in
 registers before writing the BF16 shared input. Tail rows are masked.
 
