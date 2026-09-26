@@ -768,6 +768,7 @@ def test_executor_prepares_eager_prefill_metadata_before_any_layer(
     executor.config = SimpleNamespace(pp_size=1, data_parallel_size=dp_size)
     executor._active_positions_override = torch.arange(7)
     executor._active_multimodal_context = None
+    executor.runtime_states = SimpleNamespace(has_request_token_history=False)
     executor.input_buffers = SimpleNamespace(
         input_ids_buf=torch.arange(7), ngram_model_kwargs=lambda _: {}
     )

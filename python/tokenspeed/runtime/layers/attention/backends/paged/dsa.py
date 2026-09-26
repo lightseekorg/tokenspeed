@@ -92,6 +92,11 @@ class DSABackend(PagedAttentionBackend):
     # frozen at capture-time (dummy) values. Keep prefills eager.
     cuda_graph_support = CudaGraphSupport(prefill_graph=False)
 
+    # Solution pinned for the sparse kernels; __init__ sets "aok" under
+    # --numerics rl-bitwise. The class default keeps a backend built without
+    # __init__ (unit tests) on the auto selection.
+    kernel_solution: str | None = None
+
     def __init__(self, config: AttnConfig, spec: DSAConfig, *, kernel_page_size: int):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
         platform = current_platform()
