@@ -49,6 +49,8 @@ def moe_finalize_fuse_shared(
     shared_output: Optional[torch.Tensor],
     top_k: int,
     enable_pdl: bool | None = None,
+    *,
+    hidden_dim: int,
 ) -> torch.Tensor:
     """Fused MoE finalize + optional shared-output residual (bf16, SM>=90).
 
@@ -94,6 +96,8 @@ def moe_finalize_fuse_shared(
         top_k: top-k count (must be ``<= 64``).
         enable_pdl: honor upstream/downstream PDL. Uses the platform default
             when omitted.
+        hidden_dim: Original output width before padding. Must match the
+            shared-output width when shared_output is provided.
 
     Returns:
         ``[num_tokens, hidden_dim]`` bf16.
@@ -106,9 +110,7 @@ def moe_finalize_fuse_shared(
     num_tokens, num_weight_cols = expert_weights.shape
     num_shared = num_weight_cols - top_k
     assert num_shared >= 0
-    hidden_dim = gemm2_out.shape[1]
-    # hiddenDim = out.shape[-1]; caller may want a trimmed hidden_dim if
-    # padding was applied on the permuted side.
+    assert 0 < hidden_dim <= gemm2_out.shape[1]
     if shared_output is not None:
         assert shared_output.dtype == torch.bfloat16
         if num_shared == 0:
@@ -117,8 +119,7 @@ def moe_finalize_fuse_shared(
         else:
             assert shared_output.dim() == 3
             assert shared_output.shape[:2] == (num_shared, num_tokens)
-        hidden_dim = shared_output.shape[-1]
-        assert hidden_dim <= gemm2_out.shape[1]
+        assert shared_output.shape[-1] == hidden_dim
     else:
         assert num_shared == 0, "shared weight columns require shared_output"
 

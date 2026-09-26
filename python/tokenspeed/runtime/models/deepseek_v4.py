@@ -61,6 +61,8 @@ from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_indexer_decode_metadata_compute,
     triton_dsv4_index_candidates,
 )
+from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
+from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -1602,6 +1604,7 @@ class DeepseekV4TopK(TopK):
         correction_bias: torch.Tensor | None,
         routed_scaling_factor: float,
         hash_routing: bool,
+        weights_dtype: torch.dtype,
     ) -> None:
         super().__init__(
             top_k=top_k,
@@ -1610,6 +1613,7 @@ class DeepseekV4TopK(TopK):
             routed_scaling_factor=routed_scaling_factor,
         )
         self.hash_routing = hash_routing
+        self.weights_dtype = weights_dtype
 
     def forward(
         self,
@@ -1634,6 +1638,7 @@ class DeepseekV4TopK(TopK):
             correction_bias=correction_bias,
             hash_indices_table=hash_indices_table,
             input_ids=input_ids,
+            topk_weights_dtype=self.weights_dtype,
         )
         return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
@@ -1801,6 +1806,7 @@ class DeepseekV4MoE(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
             hash_routing=self.gate.tid2eid is not None,
+            weights_dtype=self.experts.topk_weights_dtype,
         )
 
     def warmup(self) -> None:
@@ -1859,12 +1865,14 @@ class DeepseekV4MoE(nn.Module):
         topk_output: TopKOutput,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
-    ) -> torch.Tensor:
+        do_finalize: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
             num_global_tokens=num_global_tokens,
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+            do_finalize=do_finalize,
         )
 
     def _forward_shared_experts(
@@ -1904,6 +1912,7 @@ class DeepseekV4MoE(nn.Module):
                     topk_output,
                     num_global_tokens,
                     max_num_tokens_per_gpu,
+                    do_finalize=True,
                 )
             with fork.branch():
                 shared = self._forward_shared_experts(
@@ -1924,6 +1933,10 @@ class DeepseekV4MoE(nn.Module):
             return hidden_states
         with nvtx_range("moe_select_experts"):
             topk_output = self._compute_topk_output(hidden_states, input_ids)
+        deferred_finalize = (
+            hidden_states.dtype == torch.bfloat16
+            and self.experts.supports_deferred_finalize
+        )
         shared = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
             with nvtx_range("moe_experts"):
@@ -1932,9 +1945,21 @@ class DeepseekV4MoE(nn.Module):
                     topk_output,
                     num_global_tokens,
                     max_num_tokens_per_gpu,
+                    do_finalize=not deferred_finalize,
                 )
             with fork.branch():
                 shared = self._forward_shared_experts(hidden_states)
+        if deferred_finalize:
+            gemm2_out, expert_weights, expanded_idx = routed
+            return moe_finalize_fuse_shared(
+                gemm2_out,
+                expanded_idx,
+                expert_weights,
+                shared,
+                top_k=expert_weights.shape[1],
+                enable_pdl=pdl_enabled(),
+                hidden_dim=hidden_states.shape[-1],
+            )
         return routed + shared if shared is not None else routed
 
     def forward(

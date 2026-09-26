@@ -60,5 +60,26 @@ if current_platform().is_amd:
         },
         priority=Priority.SPECIALIZED,
     )
-    def gluon_sqrt_softplus_topk_gfx950(*args, **kwargs):
-        return _topk_impl(*args, **kwargs)
+    def gluon_sqrt_softplus_topk_gfx950(
+        router_logits,
+        top_k,
+        renormalize,
+        correction_bias,
+        hash_indices_table,
+        input_ids,
+        need_scores,
+        routed_scaling_factor,
+        weights_dtype,
+    ):
+        weights, ids, scores = _topk_impl(
+            router_logits,
+            top_k,
+            renormalize,
+            correction_bias,
+            hash_indices_table,
+            input_ids,
+            need_scores,
+        )
+        if routed_scaling_factor != 1.0:
+            weights = weights * routed_scaling_factor
+        return weights.to(weights_dtype), ids, scores

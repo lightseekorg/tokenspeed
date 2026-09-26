@@ -797,12 +797,14 @@ class TestDeepseekV4Config(unittest.TestCase):
                 correction_bias=correction_bias,
                 routed_scaling_factor=2.0,
                 hash_routing=False,
+                weights_dtype=torch.bfloat16,
             )(hidden_states, router_logits)
 
         self.assertIs(output.topk_weights, topk_weights)
         self.assertIs(output.topk_ids, topk_ids)
         self.assertIs(output.router_logits, router_logits)
         self.assertEqual(calls[0][0][2:6], ("sqrt_softplus", "topk", True, 2.0))
+        self.assertEqual(calls[0][1]["topk_weights_dtype"], torch.bfloat16)
 
     def test_deepseek_v4_moe_stream_fork_disabled_order(self):
         calls = []
@@ -864,6 +866,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             def __init__(self, **kwargs):
                 captured.update(kwargs)
                 self.topk_output_format = object()
+                self.topk_weights_dtype = torch.bfloat16
 
         class FakeTopK:
             def __init__(self, **kwargs):
@@ -913,6 +916,107 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(captured["routing_mode"], "precomputed_topk")
         self.assertEqual(captured["routing_config"]["routed_scaling_factor"], 1.0)
         self.assertEqual(topk_config["routed_scaling_factor"], 2.5)
+        self.assertEqual(topk_config["weights_dtype"], torch.bfloat16)
+
+    def test_deepseek_v4_moe_deferred_finalize_keeps_scaled_route_weights(self):
+        for normalized in (False, True):
+            with self.subTest(normalized=normalized):
+                hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)
+                input_ids = torch.arange(2)
+                moe = self._make_fake_deepseek_v4_moe(
+                    hidden_states,
+                    input_ids,
+                    StreamFork(None),
+                    [],
+                    norm_topk_prob=normalized,
+                )
+                # Routing has already applied the model's scaling factor.
+                gemm = hidden_states + 1
+                weights = torch.full((2, 1), 2.0, dtype=torch.bfloat16)
+                indices = torch.arange(2, dtype=torch.int32)
+                moe.experts = Mock(return_value=(gemm, weights, indices))
+                moe.experts.supports_deferred_finalize = True
+
+                def finalize(
+                    gemm2_out,
+                    expanded_idx,
+                    expert_weights,
+                    shared,
+                    *,
+                    top_k,
+                    enable_pdl,
+                    hidden_dim,
+                ):
+                    self.assertIs(gemm2_out, gemm)
+                    self.assertIs(expanded_idx, indices)
+                    self.assertIs(expert_weights, weights)
+                    self.assertEqual(top_k, 1)
+                    self.assertIsInstance(enable_pdl, bool)
+                    self.assertEqual(hidden_dim, hidden_states.shape[-1])
+                    return (
+                        gemm2_out.float() * expert_weights.float() + shared.float()
+                    ).bfloat16()
+
+                with patch.object(
+                    deepseek_v4_model, "moe_finalize_fuse_shared", side_effect=finalize
+                ):
+                    actual = moe.forward_normal(hidden_states, input_ids, 2, 2)
+                self.assertFalse(moe.experts.call_args.kwargs["do_finalize"])
+                torch.testing.assert_close(
+                    actual, (hidden_states + 1) * 2 + hidden_states + 3, atol=0, rtol=0
+                )
+
+    def test_deepseek_v4_moe_common_finalize_trims_padding_without_shared(self):
+        hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)
+        input_ids = torch.arange(2)
+        moe = self._make_fake_deepseek_v4_moe(
+            hidden_states,
+            input_ids,
+            StreamFork(None),
+            [],
+            norm_topk_prob=True,
+        )
+        moe.n_shared_experts = None
+        moe.shared_experts = None
+        gemm = torch.ones(2, 8, dtype=torch.bfloat16)
+        weights = torch.full((2, 1), 2.0, dtype=torch.bfloat16)
+        indices = torch.arange(2, dtype=torch.int32)
+        moe.experts = Mock(return_value=(gemm, weights, indices))
+        moe.experts.supports_deferred_finalize = True
+        with patch.object(
+            deepseek_v4_model,
+            "moe_finalize_fuse_shared",
+            return_value=(gemm * weights)[:, : hidden_states.shape[-1]].contiguous(),
+        ) as finalize:
+            actual = moe.forward_normal(hidden_states, input_ids, 2, 2)
+        self.assertIsNone(finalize.call_args.args[3])
+        self.assertEqual(finalize.call_args.kwargs["top_k"], 1)
+        self.assertEqual(
+            finalize.call_args.kwargs["hidden_dim"], hidden_states.shape[-1]
+        )
+        self.assertEqual(actual.shape, hidden_states.shape)
+        self.assertTrue(actual.is_contiguous())
+        torch.testing.assert_close(actual, hidden_states * 2, atol=0, rtol=0)
+
+    def test_deepseek_v4_moe_keeps_finalize_for_unsupported_consumer(self):
+        hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)
+        input_ids = torch.arange(2)
+        moe = self._make_fake_deepseek_v4_moe(
+            hidden_states,
+            input_ids,
+            StreamFork(None),
+            [],
+            norm_topk_prob=True,
+        )
+        moe.experts = Mock(return_value=hidden_states * 2)
+        moe.experts.supports_deferred_finalize = False
+        with patch.object(deepseek_v4_model, "moe_finalize_fuse_shared") as finalize:
+            actual = moe.forward_normal(hidden_states, input_ids, 2, 2)
+        self.assertTrue(moe.experts.call_args.kwargs["do_finalize"])
+        finalize.assert_not_called()
+        torch.testing.assert_close(
+            actual, hidden_states * 2 + hidden_states + 3, atol=0, rtol=0
+        )
 
     def test_deepseek_v4_shared_mlp_uses_dense_tp(self):
         mapping = Mapping(
