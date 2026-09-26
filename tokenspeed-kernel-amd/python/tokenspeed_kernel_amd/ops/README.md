@@ -39,12 +39,11 @@ Keep an explicit `gl.barrier()` only where the compiler cannot see the hazard:
   `buffer_load_to_shared` into the same slot is the kernel's responsibility.
   Place the barrier before the copy that reuses the slot.
 
-Iris push collectives also keep explicit workgroup barriers around their
-cross-rank publication protocol. The VMEM drain and system-scope atomics order
-one subgroup's traffic, but the barriers join all producer subgroups before a
-generation is published and all consumer subgroups before the peer inbox is
-read. Removing either rendezvous can potentially increase cross-rank skew and
-regress perf even when the generated kernel remains correct.
+Iris push collectives keep an explicit workgroup barrier between the per-subgroup
+VMEM drain and publication with write-through stores. That barrier joins every
+producer subgroup before the completion flags can become visible. Entry protocols
+using system-scope release/acquire atomics use the barriers emitted by their
+lowering; an extra barrier after the acquire only duplicates that rendezvous.
 
 ## GEMM
 
@@ -281,6 +280,22 @@ Larger rows use double-buffered TDM loads, overlapping the next tile's transfer
 with per-lane candidate updates and reducing across lanes once per row. TDM's
 zero padding is masked before comparison. Tile sizes account for element size
 and batch size to limit shared-memory usage.
+
+## AttnRes
+
+The gfx950 AttnRes kernel combines BF16 history snapshots with the current
+residual, using FP32 RMS-normalized scores and an online softmax over candidates.
+The mix rounds to BF16 before the following output RMSNorm, whose result also
+rounds to BF16. Hidden widths from 4096 through 8192 supported by the launcher
+share this implementation; history can have padding between tokens and blocks.
+
+`_attn_res_mix_gfx950` contains the candidate mixing and output normalization.
+It has no stores or collective synchronization. The ordinary registered kernel
+owns optional residual updates and snapshot writes; the Iris attention prefill
+kernel reuses the helper for local token rows before pushing their normalized
+values. Both callers retain the same BF16 boundaries. The ordinary kernel keeps
+its existing subgroup layout and launch selection. JIT launch metadata describes
+its memory traffic for Proton.
 
 ## MoE
 

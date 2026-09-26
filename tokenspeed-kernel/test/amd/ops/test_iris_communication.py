@@ -453,6 +453,14 @@ def _ar_graph_shape_cases() -> List[Tuple[int, ...]]:
 def _ar_output_shape_cases() -> List[Tuple[Tuple[int, ...], ...]]:
     """Producer-direct collections spanning one, two, and three outputs."""
     return [
+        ((16, 7168),),
+        ((37, 7168),),
+        ((128, 7168),),
+        ((511, 7168),),
+        ((519, 7168),),
+        ((1023, 7168),),
+        ((4095, 7168),),
+        ((8191, 7168),),
         ((1, 7168), (1, 3584)),
         ((2, 7168), (2, 3584)),
         ((4, 7168), (4, 3584)),
@@ -646,13 +654,16 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
                 device,
             )
 
+        # These dtype checks only use the small shape. Their states share the
+        # fixed heap, so do not reserve another full BF16 prefill capacity.
+        other_dtype_max_numel = 16 * (7168 + 3584)
         fp16_state = create_iris_state(
             enable_lamport=False,
             moe_tail_max_rows=0,
             group=dist.group.WORLD,
             rank_in_group=rank,
             staged_max_numel=0,
-            producer_direct_max_numel=producer_direct_max_numel,
+            producer_direct_max_numel=other_dtype_max_numel,
             attnres_max_numel=0,
             attnres_max_rows=0,
             dtype=torch.float16,
@@ -681,7 +692,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             group=dist.group.WORLD,
             rank_in_group=rank,
             staged_max_numel=0,
-            producer_direct_max_numel=producer_direct_max_numel,
+            producer_direct_max_numel=other_dtype_max_numel,
             attnres_max_numel=0,
             attnres_max_rows=0,
             dtype=torch.float32,
@@ -1057,6 +1068,110 @@ def test_iris_all_reduce_correctness_world4():
 
 def test_iris_all_reduce_correctness_world8():
     _run_ar_test(world_size=8)
+
+
+def _ar_epoch_worker_fn(rank, world_size, port, producer_direct, rows, error_dict):
+    try:
+        _ar_epoch_worker_main(rank, world_size, port, producer_direct, rows)
+    except Exception:
+        error_dict[rank] = traceback.format_exc()
+
+
+def _ar_epoch_worker_main(rank, world_size, port, producer_direct, rows):
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    from tokenspeed_kernel.ops.communication.iris import (
+        create_iris_state,
+        iris_acquire_outputs,
+        iris_all_reduce,
+        iris_all_reduce_symmetric,
+    )
+
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://localhost:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        state = create_iris_state(
+            group=dist.group.WORLD,
+            rank_in_group=rank,
+            staged_max_numel=16 * 7168,
+            producer_direct_max_numel=16 * 7168,
+            attnres_max_numel=0,
+            attnres_max_rows=0,
+            enable_lamport=False,
+            moe_tail_max_rows=0,
+            dtype=torch.bfloat16,
+            heap_size=None,
+            device=device,
+        )
+        if producer_direct:
+            local = iris_acquire_outputs(state, ((rows, 7168),))[0]
+            flags = state._producer_direct_ready_flags
+        else:
+            local = torch.empty((rows, 7168), dtype=torch.bfloat16, device=device)
+            flags = state._staged_two_stage_ready_flags
+
+        def reduce():
+            if producer_direct:
+                return iris_all_reduce_symmetric(state, (local,))[0]
+            return iris_all_reduce(
+                state, local, op=dist.ReduceOp.SUM, safe=True, async_op=False
+            )
+
+        local.fill_(rank + 1)
+        reduce()
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = reduce()
+
+        for replay in (False, True):
+            # Include entry and intermediate-stage wraps, plus a normal epoch.
+            for index, initial_epoch in enumerate((17, 2**31 - 1, -1, 2**31 - 2, -2)):
+                torch.cuda.synchronize()
+                dist.barrier()
+                flags.fill_(initial_epoch)
+                local.zero_()
+                torch.cuda.synchronize()
+                dist.barrier()
+                # A stale flag must not let peers read before this producer.
+                if rank == world_size - 1:
+                    time.sleep(0.1)
+                scale = index + 2
+                local.fill_(scale * (rank + 1))
+                if replay:
+                    graph.replay()
+                    result = captured
+                else:
+                    result = reduce()
+                torch.cuda.synchronize()
+                expected = scale * world_size * (world_size + 1) // 2
+                mismatches = [None] * world_size
+                dist.all_gather_object(
+                    mismatches, int(torch.count_nonzero(result != expected).item())
+                )
+                assert not any(mismatches), (
+                    f"{producer_direct=} {rows=} {initial_epoch=} {replay=}: "
+                    f"mismatched elements per rank: {mismatches}"
+                )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("producer_direct,rows", [(True, 1), (True, 16), (False, 16)])
+def test_iris_all_reduce_epoch_rollover(producer_direct, rows):
+    _skip_if_unsupported(8, "Iris epoch rollover tests")
+    if not current_platform().is_cdna4:
+        pytest.skip("Producer-direct Iris reductions require CDNA4")
+    _spawn_and_collect(
+        _ar_epoch_worker_fn,
+        (8, _get_open_port(), producer_direct, rows),
+        8,
+    )
 
 
 def _ar_subgroup_worker_fn(rank, world_size, port, error_dict):

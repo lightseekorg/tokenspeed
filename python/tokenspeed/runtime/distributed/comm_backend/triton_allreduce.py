@@ -226,7 +226,7 @@ class TritonAllReduceBackend(CommBackend):
         group: Group,
         op=None,
     ) -> bool:
-        """Iris returns symmetric outputs the reduction consumes in place."""
+        """Whether acquisition returns prepared symmetric producer storage."""
         return self.can_acquire_outputs(shapes, like, group, op=op)
 
     def can_acquire_outputs(

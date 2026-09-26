@@ -69,6 +69,7 @@ from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_ops import (
     acquire_all_reduce_outputs,
+    all_gather,
     all_reduce,
     can_acquire_all_reduce_outputs,
     prepare_all_reduce_buffers,
@@ -89,6 +90,8 @@ logger = logging.getLogger(__name__)
 _IRIS_MAX_TOKENS = 8192
 _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS = 48
 _IRIS_MOE_ROW_SHARD_MIN_TOKENS = 512
+_IRIS_ATTN_PRODUCER_DIRECT_MIN_TOKENS = 16
+_IRIS_ATTN_SHARDED_PREFIX_MIN_TOKENS = 512
 
 # Widest reduce this instance is built for; it becomes the collective's max_m.
 ATTN_AR_MAX_TOKENS = 8
@@ -541,6 +544,104 @@ class K3AttnComm:
         self.state = state
         self.mapping = state.mapping
 
+    def acquire_prefill_projection_output(
+        self,
+        like: torch.Tensor,
+        projection,
+        *,
+        is_prefill: bool,
+        sharded_moe_supported: bool,
+    ) -> torch.Tensor | None:
+        """Return prepared storage for an eligible attention producer, or None."""
+        from tokenspeed.runtime.layers.dense import UnquantizedLinearMethod
+
+        if (
+            not is_prefill
+            or not sharded_moe_supported
+            or not current_platform().is_cdna4
+            or like.ndim != 2
+            or not _IRIS_ATTN_PRODUCER_DIRECT_MIN_TOKENS
+            <= like.shape[0]
+            <= _IRIS_MAX_TOKENS
+            or like.dtype != torch.bfloat16
+            or self.mapping.attn.tp_size != 8
+            or self.mapping.moe.tp_size != 8
+            or self.mapping.moe.ep_size != 1
+            or self.mapping.attn.tp_group != self.mapping.moe.tp_ep_group
+            or self.mapping.pp_size != 1
+            or type(projection.quant_method) is not UnquantizedLinearMethod
+            or projection.weight.dtype != torch.bfloat16
+            or projection.weight.shape[0] != 7168
+            or projection.bias is not None
+            or projection.reduce_results
+            or not projection.input_is_parallel
+        ):
+            return None
+        shapes = ((like.shape[0], 7168),)
+        group = self.mapping.attn.tp_group
+        if not can_acquire_all_reduce_outputs(
+            shapes, like, group, backend=None, op=dist.ReduceOp.SUM
+        ):
+            return None
+        return acquire_all_reduce_outputs(
+            shapes, like, group, backend=None, op=dist.ReduceOp.SUM
+        )[0]
+
+    def prefill_reduce_for_attnres(
+        self,
+        partial: torch.Tensor,
+        prefix: torch.Tensor | None,
+        *,
+        producer_direct: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return the residual and optional delta consumed by the AttnRes mixer."""
+        if producer_direct:
+            # Prepared Iris inputs reduce into owned storage, which remains
+            # valid as a residual after the next producer reuses its input.
+            reduced = all_reduce((partial,), self.mapping.attn.tp_group)[0]
+        else:
+            reduced = all_reduce(partial, self.mapping.attn.tp_group)
+        return (reduced, None) if prefix is None else (prefix, reduced)
+
+    def prefill_mix_for_moe(
+        self,
+        partial: torch.Tensor,
+        prefix: torch.Tensor | None,
+        block_residual: torch.Tensor,
+        res_weight: torch.Tensor,
+        rms_weight: torch.Tensor,
+        *,
+        eps: float,
+        out_norm_weight: torch.Tensor,
+        out_norm_eps: float,
+        num_valid_blocks: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Mix a prepared projection, retaining the MoE's local residual rows."""
+        if (
+            partial.ndim != 2
+            or not _IRIS_ATTN_SHARDED_PREFIX_MIN_TOKENS
+            <= partial.shape[0]
+            <= _IRIS_MAX_TOKENS
+            or partial.shape[0] % 8 != 0
+        ):
+            return None
+        from tokenspeed_kernel.ops.communication.iris_prefill import (
+            iris_attention_prefill_mix,
+        )
+
+        return iris_attention_prefill_mix(
+            partial,
+            prefix,
+            block_residual,
+            res_weight,
+            rms_weight,
+            eps=eps,
+            out_norm_weight=out_norm_weight,
+            out_norm_eps=out_norm_eps,
+            num_valid_blocks=num_valid_blocks,
+            group=_get_process_group(self.mapping.attn.tp_group),
+        )
+
     # ------------------------------------------------------------------
     # Attention-side reduction, hoisted from KimiLinearDecoderLayer.
     # ------------------------------------------------------------------
@@ -978,6 +1079,8 @@ class K3MoeTailComm:
         num_tokens: int,
         hidden_size: int,
         prepared_shared_shard: torch.Tensor | None = None,
+        *,
+        prefix_is_sharded: bool,
     ) -> torch.Tensor:
         """Dispatch the selected tier over the partials.
 
@@ -987,6 +1090,13 @@ class K3MoeTailComm:
         ``routed_out`` is the experts kernel's deferred-finalize triple.
         """
         tier = plan.tier
+        if prefix_is_sharded and (
+            tier is not K3MoETailTier.FUSED_LANE_AR or self._shard_up_projection
+        ):
+            prefix_sum = all_gather(
+                prefix_sum, self.mapping.moe.tp_ep_group, dim=0, backend=None
+            )
+            prefix_is_sharded = False
         if tier is K3MoETailTier.TAIL_FUSION:
             if plan.defer_finalize:
                 gemm2_out, expert_weights, expanded_idx = routed_out
@@ -1018,6 +1128,7 @@ class K3MoeTailComm:
                 plan.symm_outputs,
                 num_tokens,
                 hidden_size,
+                prefix_is_sharded=prefix_is_sharded,
             )
         return self._tail_separate_reduce(
             routed_out, shared_partial, prefix_sum, num_tokens, hidden_size
@@ -1208,6 +1319,8 @@ class K3MoeTailComm:
         symm_outputs: tuple[torch.Tensor, torch.Tensor] | None,
         num_tokens: int,
         hidden_size: int,
+        *,
+        prefix_is_sharded: bool,
     ) -> torch.Tensor:
         if self._shard_up_projection:
             return self._tail_fused_lane_ar_sharded(
@@ -1221,6 +1334,7 @@ class K3MoeTailComm:
             symm_outputs,
             num_tokens,
             hidden_size,
+            prefix_is_sharded=prefix_is_sharded,
         )
 
     def _tail_fused_lane_ar_sharded(
@@ -1249,6 +1363,8 @@ class K3MoeTailComm:
         symm_outputs: tuple[torch.Tensor, torch.Tensor] | None,
         num_tokens: int,
         hidden_size: int,
+        *,
+        prefix_is_sharded: bool,
     ) -> torch.Tensor:
         # Replicated projection weights let each rank process its token shard.
         # The kernel wrapper checks producer ownership before launching.
@@ -1268,6 +1384,7 @@ class K3MoeTailComm:
                 shared_partial,
                 prefix_sum,
                 self.up_proj.weight,
+                prefix_is_sharded=prefix_is_sharded,
                 norm_weight=(
                     self.routed_norm.weight if self.routed_norm is not None else None
                 ),
@@ -1280,6 +1397,12 @@ class K3MoeTailComm:
             )
             if output is not None:
                 return output
+        if prefix_is_sharded:
+            # The optimized tail declined before consuming the producers.
+            # Every ordinary projection epilogue requires a replicated prefix.
+            prefix_sum = all_gather(
+                prefix_sum, self.mapping.moe.tp_ep_group, dim=0, backend=None
+            )
         routed_reduced, shared_reduced = kimi3_join_reduce_moe(
             routed_out,
             shared_partial,

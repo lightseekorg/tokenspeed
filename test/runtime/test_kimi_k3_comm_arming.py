@@ -49,6 +49,305 @@ needs_iris = pytest.mark.skipif(
     find_spec("iris") is None, reason="iris is packaged for ROCm only"
 )
 
+
+@needs_iris
+@pytest.mark.parametrize(
+    "rows,is_prefill,sharded_moe_supported,eligible",
+    [
+        (0, True, True, False),
+        (15, True, True, False),
+        (16, True, True, True),
+        (32, True, True, True),
+        (37, True, True, True),
+        (48, True, True, True),
+        (128, True, True, True),
+        (256, True, True, True),
+        (511, True, True, True),
+        (512, True, True, True),
+        (513, True, True, True),
+        (519, True, True, True),
+        (848, True, True, True),
+        (849, True, True, True),
+        (1023, True, True, True),
+        (1024, True, True, True),
+        (2047, True, True, True),
+        (2048, True, True, True),
+        (3071, True, True, True),
+        (4088, True, True, True),
+        (4095, True, True, True),
+        (4096, True, True, True),
+        (4097, True, True, True),
+        (6143, True, True, True),
+        (8191, True, True, True),
+        (8192, True, True, True),
+        (8193, True, True, False),
+        (8192, False, True, False),
+        (8192, True, False, False),
+    ],
+)
+def test_attention_prefill_producer_window(
+    monkeypatch, rows, is_prefill, sharded_moe_supported, eligible
+):
+    from tokenspeed.runtime.layers.dense import UnquantizedLinearMethod
+    from tokenspeed.runtime.models import kimi_k3_comm as module
+
+    group = tuple(range(8))
+    mapping = SimpleNamespace(
+        pp_size=1,
+        attn=SimpleNamespace(tp_size=8, tp_group=group),
+        moe=SimpleNamespace(tp_size=8, ep_size=1, tp_ep_group=group),
+    )
+    comm = module.K3AttnComm(SimpleNamespace(mapping=mapping))
+    like = torch.empty((rows, 7168), dtype=torch.bfloat16)
+    projection = SimpleNamespace(
+        quant_method=UnquantizedLinearMethod(),
+        weight=torch.empty((7168, 1536), dtype=torch.bfloat16),
+        bias=None,
+        reduce_results=False,
+        input_is_parallel=True,
+    )
+    destination = Mock()
+    acquire = Mock(return_value=(destination,))
+    capability = Mock(return_value=True)
+    monkeypatch.setattr(
+        module, "current_platform", lambda: SimpleNamespace(is_cdna4=True)
+    )
+    monkeypatch.setattr(module, "can_acquire_all_reduce_outputs", capability)
+    monkeypatch.setattr(module, "acquire_all_reduce_outputs", acquire)
+    out = comm.acquire_prefill_projection_output(
+        like,
+        projection,
+        is_prefill=is_prefill,
+        sharded_moe_supported=sharded_moe_supported,
+    )
+    assert (out is destination) == eligible
+    assert acquire.call_count == int(eligible)
+    if eligible:
+        projection.reduce_results = True
+        assert (
+            comm.acquire_prefill_projection_output(
+                like, projection, is_prefill=True, sharded_moe_supported=True
+            )
+            is None
+        )
+        projection.reduce_results = False
+        mapping.moe.ep_size = 8
+        assert (
+            comm.acquire_prefill_projection_output(
+                like, projection, is_prefill=True, sharded_moe_supported=True
+            )
+            is None
+        )
+
+
+@pytest.mark.parametrize("has_prefix", [False, True])
+@pytest.mark.parametrize("producer_direct", [False, True])
+@pytest.mark.parametrize("rows", [16, 37, 511, 519])
+def test_attention_prefill_fallback_preserves_residual_ownership(
+    monkeypatch, has_prefix, producer_direct, rows
+):
+    from tokenspeed.runtime.models import kimi_k3_comm as module
+
+    group = tuple(range(8))
+    comm = module.K3AttnComm(
+        SimpleNamespace(mapping=SimpleNamespace(attn=SimpleNamespace(tp_group=group)))
+    )
+    partial = torch.zeros((rows, 7168), dtype=torch.bfloat16)
+    prefix = torch.ones_like(partial) if has_prefix else None
+    output = torch.full_like(partial, 3)
+
+    def reduce(value, owner):
+        assert owner == group
+        if producer_direct:
+            assert isinstance(value, tuple) and len(value) == 1
+            assert value[0] is partial
+            return (value[0] + 3,)
+        assert value is partial
+        return value.add_(3)
+
+    fallback = Mock(side_effect=reduce)
+    monkeypatch.setattr(module, "all_reduce", fallback)
+    retained, delta = comm.prefill_reduce_for_attnres(
+        partial, prefix, producer_direct=producer_direct
+    )
+    assert fallback.call_count == 1
+    assert fallback.call_args.args[1] == group
+    reduced = delta if has_prefix else retained
+    torch.testing.assert_close(reduced, output)
+    if has_prefix:
+        assert retained is prefix
+    else:
+        assert delta is None
+    if producer_direct:
+        assert reduced.data_ptr() != partial.data_ptr()
+        torch.testing.assert_close(partial, torch.zeros_like(partial))
+        partial.fill_(9)  # The next producer cannot corrupt this retained result.
+        torch.testing.assert_close(reduced, output)
+    else:
+        assert reduced is partial
+
+
+@pytest.mark.parametrize(
+    "rows,eligible",
+    [
+        (511, False),
+        (512, True),
+        (513, False),
+        (519, False),
+        (848, True),
+        (849, False),
+        (1023, False),
+        (1024, True),
+        (2048, True),
+        (4088, True),
+        (4095, False),
+        (4096, True),
+        (4097, False),
+        (6224, True),
+        (8191, False),
+        (8192, True),
+        (8193, False),
+    ],
+)
+def test_attention_prefill_mix_window(monkeypatch, rows, eligible):
+    from tokenspeed_kernel.ops.communication import iris_prefill
+
+    from tokenspeed.runtime.models import kimi_k3_comm as module
+
+    group = tuple(range(8))
+    comm = module.K3AttnComm(
+        SimpleNamespace(mapping=SimpleNamespace(attn=SimpleNamespace(tp_group=group)))
+    )
+    partial = torch.empty((rows, 7168), dtype=torch.bfloat16, device="meta")
+    history = torch.empty((4, rows, 7168), dtype=torch.bfloat16, device="meta")
+    weight = torch.empty((7168,), dtype=torch.bfloat16, device="meta")
+    expected = (object(), object())
+    operation = Mock(return_value=expected)
+    monkeypatch.setattr(iris_prefill, "iris_attention_prefill_mix", operation)
+    monkeypatch.setattr(module, "_get_process_group", lambda _: "owner")
+    result = comm.prefill_mix_for_moe(
+        partial,
+        None,
+        history,
+        weight,
+        weight,
+        eps=1e-6,
+        out_norm_weight=weight,
+        out_norm_eps=1e-5,
+        num_valid_blocks=4,
+    )
+    if eligible:
+        assert result is expected
+        operation.assert_called_once_with(
+            partial,
+            None,
+            history,
+            weight,
+            weight,
+            eps=1e-6,
+            out_norm_weight=weight,
+            out_norm_eps=1e-5,
+            num_valid_blocks=4,
+            group="owner",
+        )
+    else:
+        assert result is None
+        operation.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "producer_direct,accepted", [(True, True), (True, False), (False, False)]
+)
+def test_sharded_attention_residual_is_gathered_before_moe_fallback(
+    monkeypatch, producer_direct, accepted
+):
+    from tokenspeed.runtime.models import kimi_k3_comm as module
+
+    group = tuple(range(8))
+    routed = torch.empty((4096, 3584), dtype=torch.bfloat16, device="meta")
+    shared = torch.empty((4096, 7168), dtype=torch.bfloat16, device="meta")
+    shard = torch.empty((512, 7168), dtype=torch.bfloat16, device="meta")
+    full = torch.empty_like(shared)
+    expected = object()
+    owner = SimpleNamespace(
+        mapping=SimpleNamespace(
+            pp_size=1,
+            attn=SimpleNamespace(tp_size=8, tp_group=group),
+            moe=SimpleNamespace(tp_size=8, ep_size=1, tp_ep_group=group),
+        ),
+        up_proj=SimpleNamespace(
+            narrowed=False,
+            solution="auto",
+            weight=torch.empty((7168, 3584), dtype=torch.bfloat16, device="meta"),
+        ),
+        routed_hidden=3584,
+        routed_norm=None,
+        execution_plan=SimpleNamespace(
+            lane_latent_norm_ar=False, comm_fusion_max_num_tokens=16
+        ),
+        _projection_tail=Mock(return_value=expected),
+    )
+    candidate = Mock(return_value=expected if accepted else None)
+    gather = Mock(return_value=full)
+    joined = Mock(return_value=(routed, shared))
+    monkeypatch.setattr(module, "iris_kimi3_moe_tail", candidate)
+    monkeypatch.setattr(module, "all_gather", gather)
+    monkeypatch.setattr(module, "kimi3_join_reduce_moe", joined)
+    monkeypatch.setattr(module, "_get_process_group", lambda _: "owner")
+    result = module.K3MoeTailComm._tail_fused_lane_ar_replicated(
+        owner,
+        routed,
+        shared,
+        shard,
+        None,
+        (routed, shared) if producer_direct else None,
+        4096,
+        7168,
+        prefix_is_sharded=True,
+    )
+    assert result is expected
+    if producer_direct:
+        assert candidate.call_args.kwargs["prefix_is_sharded"] is True
+        assert candidate.call_args.args[2] is shard
+    else:
+        candidate.assert_not_called()
+    if accepted:
+        gather.assert_not_called()
+        joined.assert_not_called()
+        owner._projection_tail.assert_not_called()
+    else:
+        gather.assert_called_once_with(shard, group, dim=0, backend=None)
+        owner._projection_tail.assert_called_once_with(routed, shared, full, 4096, 7168)
+
+
+def test_non_iris_moe_tier_materializes_a_sharded_residual(monkeypatch):
+    from tokenspeed.runtime.models import kimi_k3_comm as module
+
+    group = tuple(range(8))
+    shard, full, routed, shared, output = (object() for _ in range(5))
+    gather = Mock(return_value=full)
+    monkeypatch.setattr(module, "all_gather", gather)
+    tail = Mock(return_value=output)
+    owner = SimpleNamespace(
+        mapping=SimpleNamespace(moe=SimpleNamespace(tp_ep_group=group)),
+        _tail_separate_reduce=tail,
+    )
+    result = module.K3MoeTailComm.run(
+        owner,
+        SimpleNamespace(tier=module.K3MoETailTier.SEPARATE_REDUCE),
+        routed,
+        shared,
+        shard,
+        4096,
+        7168,
+        None,
+        prefix_is_sharded=True,
+    )
+    assert result is output
+    gather.assert_called_once_with(shard, group, dim=0, backend=None)
+    tail.assert_called_once_with(routed, shared, full, 4096, 7168)
+
+
 from tokenspeed.runtime.models.kimi_k3_comm import (  # noqa: E402
     ATTN_AR_MAX_TOKENS,
     _tail_finalize_top_k,
@@ -526,7 +825,15 @@ def test_row_sharded_moe_tail_selection_and_fallback(
     symm_outputs = (routed, shared) if producer_direct else None
 
     output = mod.K3MoeTailComm._tail_fused_lane_ar_replicated(
-        owner, routed, shared, prefix, None, symm_outputs, rows, 7168
+        owner,
+        routed,
+        shared,
+        prefix,
+        None,
+        symm_outputs,
+        rows,
+        7168,
+        prefix_is_sharded=False,
     )
 
     if attempted:
@@ -535,6 +842,7 @@ def test_row_sharded_moe_tail_selection_and_fallback(
             shared,
             prefix,
             projection.weight,
+            prefix_is_sharded=False,
             norm_weight=norm.weight if has_norm else None,
             eps=norm.variance_epsilon if has_norm else None,
             group=process_group,

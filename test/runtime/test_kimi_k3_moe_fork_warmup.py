@@ -153,9 +153,36 @@ def _run(*, graph_phase: bool, capture_mode: bool) -> dict[str, bool]:
             torch.zeros(2, 4),
             num_global_tokens=2,
             max_num_tokens_per_gpu=2,
+            prefix_is_sharded=False,
         )
     assert len(fork.calls) == 1
     return fork.calls[0]
+
+
+@pytest.mark.parametrize("prefix_rows,reverse_group", [(3, False), (2, True)])
+def test_moe_rejects_mismatched_residual_shard_metadata(prefix_rows, reverse_group):
+    group = tuple(range(8))
+    layer = SimpleNamespace(
+        mapping=SimpleNamespace(
+            attn=SimpleNamespace(dp_size=1, tp_size=8, tp_group=group),
+            moe=SimpleNamespace(
+                tp_size=8,
+                ep_size=1,
+                tp_ep_group=group[::-1] if reverse_group else group,
+            ),
+        ),
+        native_latent_moe=None,
+    )
+    with pytest.raises(ValueError, match="matching TP8 groups"):
+        KimiLinearMoE.forward(
+            layer,
+            torch.zeros(16, 4),
+            torch.zeros(prefix_rows, 4),
+            num_global_tokens=16,
+            max_num_tokens_per_gpu=16,
+            ctx=None,
+            prefix_is_sharded=True,
+        )
 
 
 def test_warmup_forward_activates_the_auxiliary_stream():
@@ -211,6 +238,7 @@ def test_moe_passes_projection_payload_to_experts(prequantized):
             hidden,
             num_global_tokens=8,
             max_num_tokens_per_gpu=8,
+            prefix_is_sharded=False,
         )
     projection.assert_called_once_with(hidden)
     assert moe._routed_experts.call_args.args[0] is payload

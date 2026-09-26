@@ -130,6 +130,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
             *inputs,
             prefix,
             weight,
+            prefix_is_sharded=False,
             norm_weight=norm_weight,
             eps=1e-5 if norm_weight is not None else None,
             group=group,
@@ -220,6 +221,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
                 shared,
                 residual,
                 weight,
+                prefix_is_sharded=False,
                 norm_weight=norm_weight,
                 eps=eps,
                 group=owner,
@@ -241,7 +243,23 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
                 *inputs,
                 residual,
                 projection,
+                prefix_is_sharded=False,
                 norm_weight=norm_weight,
+                eps=1e-5,
+                group=group,
+            )
+            is None
+        )
+    # A local prefix in the replicated result can be overwritten by another
+    # owner's push before this rank consumes it, even at the exact base pointer.
+    for first_row in (0, rank * (848 // 8)):
+        assert (
+            iris_kimi3_moe_tail(
+                *inputs,
+                result_buffer[first_row : first_row + 848 // 8],
+                weight,
+                prefix_is_sharded=True,
+                norm_weight=norm,
                 eps=1e-5,
                 group=group,
             )

@@ -888,6 +888,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                             hidden_states=torch.empty(rows, 64, dtype=torch.bfloat16),
                             ctx=ctx,
                             comm_manager=None,
+                            projection_out=None,
                         )
 
                 self.assertEqual(captured[0].is_contiguous(), expect_contiguous)
@@ -1180,6 +1181,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             prefix_sum,
             num_global_tokens=0,
             max_num_tokens_per_gpu=0,
+            prefix_is_sharded=False,
         )
 
         torch.testing.assert_close(output, prefix_sum)

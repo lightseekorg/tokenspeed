@@ -33,6 +33,7 @@ def iris_kimi3_moe_tail(
     prefix: torch.Tensor,
     projection_weight: torch.Tensor,
     *,
+    prefix_is_sharded: bool,
     norm_weight: torch.Tensor | None,
     eps: float | None,
     group: dist.ProcessGroup,
@@ -47,10 +48,13 @@ def iris_kimi3_moe_tail(
         routed_partial: Contiguous BF16 routed partial, shaped ``[M, 3584]``.
         shared_partial: Contiguous BF16 shared partial, shaped ``[M, 7168]``,
             immediately following ``routed_partial`` in the prepared Iris input.
-        prefix: Replicated contiguous BF16 residual, shaped ``[M, 7168]``.
+        prefix: Contiguous BF16 residual, shaped ``[M, 7168]`` when replicated
+            or ``[M/8, 7168]`` containing this group's rank-local token rows.
             May exactly alias the borrowed result, which is then updated in
-            place. Shifted overlaps and aliases with producer scratch are
-            unsupported. A disjoint prefix is preserved.
+            place, only when replicated. Sharded or shifted overlaps and aliases
+            with producer scratch are unsupported. A disjoint prefix is preserved.
+        prefix_is_sharded: Whether ``prefix`` contains only the rank's rows,
+            as returned by the attention prefill mixer.
         projection_weight: Replicated contiguous BF16 weight, ``[7168, 3584]``.
         norm_weight: Replicated contiguous BF16 RMSNorm weight, ``[3584]``,
             or None to omit normalization.
@@ -60,11 +64,11 @@ def iris_kimi3_moe_tail(
             that joins both producers, with rank-uniform shapes and eligibility.
 
     Returns:
-        Borrowed ``[M, 7168]`` BF16 output, valid until the next tail on this
-        group; ordinary producers and collectives do not reuse it. All consumers
-        must finish on the calling stream (or join it) before that next call,
-        which may consume the result as its prefix. Retained results must be
-        cloned. Weights must not alias the result.
+        Borrowed ``[M, 7168]`` BF16 output, valid until the next tail or attention
+        prefill mix on this group; ordinary producers and collectives do not
+        reuse it. All consumers must finish on the calling stream (or join it)
+        before that next call, which may consume the result as its residual.
+        Retained results must be cloned. Weights must not alias the result.
         Returns None without allocating or launching if the inputs are
         unsupported or not owned by this group.
         M must be positive and divisible by eight. The runtime owns the measured
@@ -83,7 +87,7 @@ def iris_kimi3_moe_tail(
         or rows % 8 != 0
         or latent != 3584
         or shared_partial.shape != (rows, 7168)
-        or prefix.shape != (rows, 7168)
+        or prefix.shape != (rows // 8 if prefix_is_sharded else rows, 7168)
         or projection_weight.shape != (7168, 3584)
         or group.size() != 8
     ):
@@ -156,6 +160,7 @@ def iris_kimi3_moe_tail(
                     buffer is result_buffer
                     and tensor is prefix
                     and start == buffer_start
+                    and not prefix_is_sharded
                 ):
                     return None
 
@@ -208,6 +213,7 @@ def iris_kimi3_moe_tail(
         BLOCK_ELEMENTS=2048,
         NUM_PROGRAMS=gather_programs,
         NUM_WARPS=4,
+        PREFIX_IS_SHARDED=prefix_is_sharded,
         num_warps=4,
     )
     return output
