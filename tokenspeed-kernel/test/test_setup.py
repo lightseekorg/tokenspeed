@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import runpy
 import shutil
+import subprocess
 import tarfile
 from collections import Counter
 from pathlib import Path
 
+import pytest
 import setuptools
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
@@ -228,3 +230,48 @@ def test_cuda_include_dirs_fall_back_from_partial_toolkit(
 
     assert str(cuda_include) not in include_dirs
     assert str(wheel_include) in include_dirs
+
+
+@pytest.mark.parametrize(
+    ("launcher", "expected_prefix"),
+    [
+        (None, []),
+        ("ccache", ["ccache"]),
+        ("ccache --verbose", ["ccache", "--verbose"]),
+    ],
+)
+def test_cuda_compile_command_preserves_optional_launcher(
+    launcher, expected_prefix, monkeypatch
+) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", "cuda")
+    if launcher is None:
+        monkeypatch.delenv("TOKENSPEED_KERNEL_NVCC_LAUNCHER", raising=False)
+    else:
+        monkeypatch.setenv("TOKENSPEED_KERNEL_NVCC_LAUNCHER", launcher)
+    monkeypatch.setattr(setuptools, "setup", lambda **_kwargs: None)
+    setup_namespace = runpy.run_path(str(SETUP_PY))
+    calls = []
+    monkeypatch.setattr(subprocess, "check_call", calls.append)
+
+    builder = setup_namespace["CudaKernelBuilder"]([], verbose=False)
+    builder._compile_one(
+        "source.cu",
+        "source.o",
+        ["-O3"],
+        ["/cuda/include"],
+        ["--use_fast_math"],
+    )
+
+    assert calls == [
+        expected_prefix
+        + [
+            setup_namespace["NVCC"],
+            "-O3",
+            "--use_fast_math",
+            "-I/cuda/include",
+            "-c",
+            "source.cu",
+            "-o",
+            "source.o",
+        ]
+    ]
