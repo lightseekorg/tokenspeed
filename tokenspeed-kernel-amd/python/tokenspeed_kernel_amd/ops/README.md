@@ -304,44 +304,18 @@ available for other shapes and devices.
 #### Algorithm
 
 The mid-range path uses `128 x 128 x 64` tiles through 640 tokens and
-`256 x 128 x 64` tiles from 641 to 1280 tokens, both with eight waves,
-vectorized global-to-LDS copies, padded shared layouts, and a three-buffer K
-pipeline. Two K-tile copies stay in flight while a two-stage warp pipeline
-alternates each MFMA block with the next tile's LDS reads and copy issue, so
-the MFMAs issue back to back instead of waiting on individual LDS reads. The
-refill left over after whole three-tile rounds runs as one more pipelined step,
-so no copy is issued after the drain. The 128-row tile arranges its waves 2 x 4;
-the 256-row tile uses 4 x 2 so each wave reads a 64 x 64 operand pair from LDS,
-20% fewer bytes than 128 x 32. Program ids are remapped so each of the eight
-XCDs gets a contiguous run of column tiles with all their row tiles, and each
-weight tile is fetched into one XCD's L2 rather than one per row tile. Its 47
-column tiles preserve the packed router/routed/shared boundary, so the FP32
-router and BF16 latent/shared values use different stores in the same projection
-launch. BF16 results are regrouped to eight columns per lane so every store is a
-dwordx4. Each of the 12 shared-expert column tiles gathers 64 gate rows and the
-matching 64 up rows of the packed weight; the MFMA layout places gate column `c`
-and up column `c + 64` in the same lane, so both tiles apply SiTU in registers
-and store the 768-wide shared input directly, with no gate/up intermediate or
-separate SiTU launch. A row tile past the end of the activation clamps its
-loads onto the last valid row and masks its stores. At 321--640 tokens the grid
-has 141--235 workgroups; above 640, the taller tile avoids an almost-empty final
-128-row workgroup wave and launches 141--235 workgroups. Both tiles use three
-LDS buffers to keep two K-tile copies in flight; the 256-row tile's 152 KB
-limits a CU to one workgroup, which the grid never exceeds, so its 188--236
-fused-epilogue VGPRs cost no occupancy.
+`256 x 128 x 64` tiles from 641 to 1280 tokens. Both use eight waves,
+vectorized loads, padded LDS layouts, and a three-buffer K pipeline to overlap
+data movement with MFMA. Workgroups are ordered to reuse weight tiles within
+each XCD. Column tiles follow the packed output boundaries: router logits are
+stored as FP32, routed latents as BF16, and shared gate/up pairs apply SiTU in
+registers before writing the BF16 shared input. Tail rows are masked.
 
 The large path uses an eight-wave `256 x 256 x 64` double-buffered MFMA/LDS
-warp pipeline. Each 128-column accumulator half is routed independently because
-the packed output boundaries are only 128-column aligned. The unused final
-half-tile safely rereads the last valid weight half and is not stored. A row
-tile past the end of the activation clamps onto the last valid row and masks
-its stores, so any positive token count is accepted.
-
-All final MFMAs complete before the mixed-dtype stores, keeping dot operands
-out of the epilogue live range. Router halves remain FP32 while routed and
-shared gate/up halves convert to BF16. A companion Gluon kernel reads the
-materialized BF16 gate/up values, applies SiTU in FP32, and writes BF16 shared
-input.
+warp pipeline. Its 128-column accumulator halves route FP32 router and BF16
+latent/shared stores independently, with tail rows and columns masked. Unlike
+the mid-range path, it materializes BF16 gate/up values and applies SiTU in a
+separate Gluon kernel.
 
 ### MXFP8 SiTU Experts
 
