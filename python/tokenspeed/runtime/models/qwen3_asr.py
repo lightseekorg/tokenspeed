@@ -173,9 +173,6 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
     def set_embed_and_head(self, embed, head) -> None:
         self.language_model.set_embed_and_head(embed, head)
 
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        self.language_model.load_kv_cache_scales(quantization_param_path)
-
     @torch.no_grad()
     def forward(
         self,

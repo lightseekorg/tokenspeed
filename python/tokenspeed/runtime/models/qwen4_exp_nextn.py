@@ -24,10 +24,10 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Iterable
-from dataclasses import replace
 from typing import Any
 
 import torch
+from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 from torch import nn
 
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -35,7 +35,6 @@ from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
 )
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -90,6 +89,7 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
 
     def _attn(
         self,
+        positions: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -100,40 +100,25 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
     ) -> torch.Tensor:
         if ctx.draft_narrowing is None:
             return super()._attn(
-                q,
-                k,
-                v,
-                gate,
-                ctx,
-                topk_indices=topk_indices,
+                positions, q, k, v, gate, ctx, topk_indices=topk_indices
             )
-        from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
-
-        # The live rows attend over the accepted prefix, not the verify window.
-        ctx.draft_narrowing.publish_accepted_prefix()
-        q = q.index_select(0, ctx.gather_ids)
-        if gate is not None:
-            gate = gate.index_select(0, ctx.gather_ids)
+        rows = ctx.gather_ids
         if topk_indices is None:
-            decode_ctx = replace(ctx, forward_mode=ForwardMode.DECODE)
-            output = self.attn(
-                q,
-                k,
-                v,
-                decode_ctx,
-                record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
-            )
+            output = self.attn.attend_live_rows(q, k, v, positions, ctx)
         else:
-            topk_indices = topk_indices.index_select(0, ctx.gather_ids)
+            # Sparse QSA attends the live rows in the round's own mode.
+            ctx.draft_narrowing.publish_accepted_prefix()
+            q = self.attn.prologue(q, k, v, positions, ctx).q
             output = self.attn(
-                q,
-                k,
-                v,
-                ctx,
-                topk_indices=topk_indices,
+                q.index_select(0, rows),
+                k=None,
+                v=None,
+                positions=None,
+                ctx=ctx,
+                topk_indices=topk_indices.index_select(0, rows),
             )
         if gate is not None:
-            sigmoid_mul(output, gate)
+            sigmoid_mul(output, gate.index_select(0, rows))
         return output
 
     def forward(self, *args, **kwargs):

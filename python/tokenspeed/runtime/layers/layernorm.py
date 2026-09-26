@@ -20,6 +20,8 @@
 
 """Fused operators for normalization layers."""
 
+from typing import ClassVar
+
 import torch
 import torch.nn as nn
 from tokenspeed_kernel.ops.communication.triton import (
@@ -117,6 +119,8 @@ class LayerNorm(nn.Module):
 
 
 class RMSNorm(torch.nn.Module):
+    weight_offset: ClassVar[float] = 0.0
+
     def __init__(
         self,
         hidden_size: int,
@@ -226,6 +230,9 @@ class RMSNorm(torch.nn.Module):
 
 
 class GemmaRMSNorm(torch.nn.Module):
+    # The multiplier is 1 + weight.
+    weight_offset: ClassVar[float] = 1.0
+
     def __init__(
         self,
         hidden_size: int,

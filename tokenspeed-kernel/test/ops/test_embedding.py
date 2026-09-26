@@ -23,7 +23,6 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.embedding import (
-    FusedSetKVBufferArg,
     apply_k_rope,
     apply_rope,
     apply_rope_mla,
@@ -301,162 +300,6 @@ def test_rope_single_token(
     torch.testing.assert_close(key, k_ref, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("solution", ["triton", "cuda"])
-def test_rope_fused_set_kv_buffer(
-    device: str,
-    solution: str,
-    require,
-) -> None:
-    torch.manual_seed(5)
-    num_tokens = 13
-    num_q_heads = 4
-    num_k_heads = 2
-    head_size = 128
-    rotary_dim = 128
-    max_position = 512
-    cache_size = 32
-    dtype = torch.bfloat16
-    require("embedding", "rope", solution, dtype, "q")
-
-    inv_freq = 1.0 / (
-        10000.0
-        ** (
-            torch.arange(0, rotary_dim, 2, device=device, dtype=torch.float32)
-            / rotary_dim
-        )
-    )
-    t = torch.arange(max_position, device=device, dtype=torch.float32)
-    freqs = torch.einsum("i,j -> ij", t, inv_freq)
-    cos_sin_cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1).contiguous()
-
-    positions = torch.randint(
-        0, max_position, (num_tokens,), device=device, dtype=torch.int64
-    )
-    query = torch.randn(num_tokens, num_q_heads * head_size, device=device, dtype=dtype)
-    key = torch.randn(num_tokens, num_k_heads * head_size, device=device, dtype=dtype)
-    value = torch.randn(num_tokens, num_k_heads, head_size, device=device, dtype=dtype)
-    query_orig = query.clone()
-    key_orig = key.clone()
-    cache_loc = torch.arange(num_tokens, device=device, dtype=torch.int32) + 3
-    k_buffer = torch.zeros(
-        cache_size, num_k_heads * head_size, device=device, dtype=dtype
-    )
-    v_buffer = torch.zeros_like(k_buffer)
-    q_rope_out = torch.empty_like(query)
-
-    cos_sin_ref = cos_sin_cache.index_select(0, positions)
-    cos_ref, sin_ref = cos_sin_ref.chunk(2, dim=-1)
-    cos_ref = cos_ref.unsqueeze(-2).to(dtype)
-    sin_ref = sin_ref.unsqueeze(-2).to(dtype)
-
-    q_ref_view = query_orig.view(num_tokens, num_q_heads, head_size)
-    q1, q2 = torch.chunk(q_ref_view, 2, dim=-1)
-    q_ref = torch.cat(
-        (q1 * cos_ref - q2 * sin_ref, q2 * cos_ref + q1 * sin_ref), dim=-1
-    ).reshape(num_tokens, num_q_heads * head_size)
-
-    k_ref_view = key_orig.view(num_tokens, num_k_heads, head_size)
-    k1, k2 = torch.chunk(k_ref_view, 2, dim=-1)
-    k_ref = torch.cat(
-        (k1 * cos_ref - k2 * sin_ref, k2 * cos_ref + k1 * sin_ref), dim=-1
-    ).reshape(num_tokens, num_k_heads * head_size)
-
-    apply_rope(
-        positions=positions,
-        q=query,
-        k=key,
-        head_size=head_size,
-        cos_sin_cache=cos_sin_cache,
-        is_neox=True,
-        fused_set_kv_buffer_arg=FusedSetKVBufferArg(
-            value=value,
-            k_buffer=k_buffer,
-            v_buffer=v_buffer,
-            k_scale=None,
-            v_scale=None,
-            cache_loc=cache_loc,
-        ),
-        q_rope_out=q_rope_out,
-        solution=solution,
-    )
-
-    torch.testing.assert_close(query, query_orig, rtol=0, atol=0)
-    torch.testing.assert_close(q_rope_out, q_ref, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(key, k_ref, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(
-        k_buffer.index_select(0, cache_loc), k_ref, rtol=2e-2, atol=2e-2
-    )
-    torch.testing.assert_close(
-        v_buffer.index_select(0, cache_loc),
-        value.reshape(num_tokens, num_k_heads * head_size),
-        rtol=0,
-        atol=0,
-    )
-
-
-def test_rope_fused_set_kv_buffer_large_strides_use_i64_offsets(
-    device: str,
-    require,
-) -> None:
-    dtype = torch.bfloat16
-    require("embedding", "rope", "triton", dtype, "q")
-
-    from tokenspeed_kernel.ops.embedding.triton import _rope_apply_kernel
-
-    head_size = 16
-    positions = torch.zeros(1, device=device, dtype=torch.int64)
-    query = torch.zeros(1, head_size, device=device, dtype=dtype)
-    key = torch.zeros_like(query)
-    value = torch.zeros(1, 1, head_size, device=device, dtype=dtype)
-    cos_sin_cache = torch.cat(
-        (
-            torch.ones(1, head_size // 2, device=device),
-            torch.zeros(1, head_size // 2, device=device),
-        ),
-        dim=-1,
-    )
-    cache_loc = torch.ones(1, device=device, dtype=torch.int32)
-    k_buffer = torch.zeros(2, head_size, device=device, dtype=dtype)
-    v_buffer = torch.zeros_like(k_buffer)
-
-    apply_rope(
-        positions=positions,
-        q=query,
-        k=key,
-        head_size=head_size,
-        cos_sin_cache=cos_sin_cache,
-        is_neox=True,
-        fused_set_kv_buffer_arg=FusedSetKVBufferArg(
-            value=value,
-            k_buffer=k_buffer,
-            v_buffer=v_buffer,
-            k_scale=None,
-            v_scale=None,
-            cache_loc=cache_loc,
-        ),
-        solution="triton",
-    )
-
-    # A cache slot fits in int32, but multiplying it by a large KV row stride
-    # can produce an offset outside the int32 range. Inspect TTIR because a
-    # runtime reproduction would require multi-GB cache buffers.
-    device_cache = _rope_apply_kernel.device_caches[torch.cuda.current_device()][0]
-    int32_fused_ttirs = [
-        compiled.asm["ttir"]
-        for compiled in device_cache.values()
-        if "%cache_loc_ptr: !tt.ptr<i32>" in compiled.asm["ttir"]
-        and "arith.muli %cache_loc" in compiled.asm["ttir"]
-    ]
-    assert int32_fused_ttirs
-    for ttir in int32_fused_ttirs:
-        cache_loc_muls = [
-            line for line in ttir.splitlines() if "arith.muli %cache_loc" in line
-        ]
-        assert "arith.extsi %cache_loc" in ttir
-        assert len(cache_loc_muls) == 2
-        assert all(": i64" in line for line in cache_loc_muls)
-
-
 @pytest.mark.parametrize("solution", [None, "triton", "flashinfer"])
 @pytest.mark.parametrize("is_neox", [True, False])
 def test_rope_mla_quantize(
@@ -546,16 +389,6 @@ def test_rope_mla_quantize(
     assert key_fp8.dtype == torch.float8_e4m3fn
     torch.testing.assert_close(query_fp8.float(), q_ref.float(), rtol=0, atol=0.5)
     torch.testing.assert_close(key_fp8.float(), k_ref.float(), rtol=0, atol=0.5)
-
-
-def test_fused_mla_entry_points_are_exported():
-    """The fused MLA write is the supported dispatch path for a cross-package
-    caller, so it has to be reachable through the module's export list."""
-    import tokenspeed_kernel.ops.embedding as embedding
-
-    for name in ("apply_rope_mla_set_kv", "supports_fused_mla_kv_write"):
-        assert name in embedding.__all__, name
-        assert hasattr(embedding, name)
 
 
 @pytest.mark.parametrize("solution", ["triton", "cuda"])
@@ -725,3 +558,51 @@ def test_engram_hash_matches_the_eager_chain(
         engram_hash(
             ids, previous, mask, token_map.int(), multipliers, primes, offsets, 7, -1
         )
+
+
+def test_only_the_cuda_rope_stores_kv_in_its_launch(device: str) -> None:
+    """The Triton rope declines a fused K/V write, and refuses one it is forced to take."""
+    from tokenspeed_kernel.ops.embedding.triton import triton_embedding_rope
+    from tokenspeed_kernel.registry import KernelRegistry
+
+    for spec in KernelRegistry.get().list_kernels("embedding", "rope"):
+        if spec.solution == "triton":
+            assert spec.traits["has_fused_kv"] == frozenset({False})
+    q = torch.zeros(1, 64, dtype=torch.bfloat16, device=device)
+    table = torch.zeros(4, 64, device=device)
+    with pytest.raises(ValueError, match="fused KV"):
+        triton_embedding_rope(
+            positions=torch.zeros(1, dtype=torch.int64, device=device),
+            q=q,
+            k=q.clone(),
+            head_size=64,
+            cos_sin_cache=table,
+            fused_set_kv_buffer_arg=object(),
+        )
+
+
+def test_triton_rope_reads_int32_positions_past_two_to_the_25():
+    """An int32 position times the table row stride passes 2^31 at 2^25 rows."""
+    position, head_size = 2**25, 64
+    table = torch.zeros(position + 1, head_size, device="cuda", dtype=torch.float32)
+    table[position, : head_size // 2] = 0.6
+    table[position, head_size // 2 :] = 0.8
+    outs = []
+    for dtype in (torch.int64, torch.int32):
+        g = torch.Generator(device="cuda").manual_seed(7)
+        q = torch.randn(
+            1, 2 * head_size, device="cuda", dtype=torch.bfloat16, generator=g
+        )
+        k = torch.randn(1, head_size, device="cuda", dtype=torch.bfloat16, generator=g)
+        apply_rope(
+            positions=torch.tensor([position], device="cuda", dtype=dtype),
+            q=q,
+            k=k,
+            head_size=head_size,
+            cos_sin_cache=table,
+            is_neox=True,
+            solution="triton",
+        )
+        outs.append((q, k))
+    for a, b in zip(*outs):
+        assert torch.equal(a.view(torch.int16), b.view(torch.int16))

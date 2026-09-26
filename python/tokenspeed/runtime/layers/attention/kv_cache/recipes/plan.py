@@ -56,10 +56,7 @@ _CACHE_DTYPE_BYTES = {
     "float64": 8,
 }
 
-# Elementwise scatter (Tensor.index_put) has no fp8 kernel, so pools that
-# write KV that way view the bytes as uint8 instead. Pools whose writes go
-# through a dtype-aware kernel (MXFP8, via store_sf_interleaved and
-# quantize_store_kv_mxfp8) keep the fp8 view.
+# index_put has no fp8 kernel: pools writing through it view fp8 as uint8.
 _INDEX_PUT_UNSUPPORTED = ("float8_e5m2", "float8_e4m3fn")
 
 

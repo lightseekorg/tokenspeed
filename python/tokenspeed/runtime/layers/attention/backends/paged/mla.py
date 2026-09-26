@@ -43,7 +43,6 @@ from tokenspeed.runtime.layers.attention.chunk import (
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
-from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     MLA_PAGE_SIZE,
 )
@@ -428,24 +427,9 @@ class MLAAttnBackend(PagedAttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-        # q is absorbed MLA query [T, H, R + D_rope]; k is compressed KV
-        # [T, 1, R + D_rope]. DeepSeek normally writes cache before this call.
-        if save_kv_cache:
-            assert k is not None
-            local_slots, write_mask = resolve_cache_slots(
-                out_cache_loc, self.cache_placement(layer)
-            )
-            token_to_kv_pool.set_mla_kv_buffer(
-                layer,
-                local_slots,
-                k[..., : self.kv_lora_rank],
-                k[..., self.kv_lora_rank :],
-                write_mask=write_mask,
-            )
-
+        # q is the absorbed MLA query [T, H, R + D_rope]; the prologue wrote the latent cache.
         metadata = self.forward_decode_metadata
         assert metadata is not None
         num_extends = metadata.num_extends
@@ -501,13 +485,6 @@ class MLAAttnBackend(PagedAttentionBackend):
             max_seqlen_k = self.max_context_len
 
         softmax_scale = layer.scaling
-        if self.data_type in (torch.float8_e4m3fn, torch.float8_e5m2):
-            k_scale = (
-                layer.k_scale_float
-                if getattr(layer, "k_scale_float", None) is not None
-                else 1.0
-            )
-            softmax_scale = k_scale * softmax_scale
 
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
         if self.data_type != kv_cache.dtype:
@@ -566,15 +543,8 @@ class MLAAttnBackend(PagedAttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-        if save_kv_cache:
-            raise NotImplementedError(
-                "MLA forward_extend cannot derive compressed cache rows from "
-                "materialized K/V; DeepSeek writes MLA cache in the model path"
-            )
-
         metadata = self.forward_prefill_metadata
         assert metadata is not None
         if metadata.use_absorbed_cached_extend:

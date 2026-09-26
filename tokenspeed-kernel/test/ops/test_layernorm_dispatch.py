@@ -18,10 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import importlib
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
 import tokenspeed_kernel.ops.layernorm as layernorm
+import torch
 
 
 def _platform(vendor: str) -> SimpleNamespace:
@@ -131,5 +135,34 @@ def test_qk_rmsnorm_has_one_platform_contract(monkeypatch, vendor: str) -> None:
     monkeypatch.setattr(layernorm, "_platform", _platform(vendor))
     monkeypatch.setattr(layernorm, "_qk_rmsnorm", backend)
 
-    assert layernorm.qk_rmsnorm(q, k, q_weight, k_weight, 1e-6) == result
-    assert calls == [(q, k, q_weight, k_weight, 1e-6, {})]
+    assert (
+        layernorm.qk_rmsnorm(q, k, q_weight, k_weight, 1e-6, weight_offset=1.0)
+        == result
+    )
+    assert calls == [(q, k, q_weight, k_weight, 1e-6, {"weight_offset": 1.0})]
+
+
+def test_ascend_forms_the_offset_weight_in_the_weight_dtype(monkeypatch):
+    calls = []
+    npu = types.ModuleType("tokenspeed_kernel_npu.ops.layernorm")
+    npu.qk_rmsnorm = lambda *args: calls.append(args)
+    npu.rmsnorm = None
+    for name in ("tokenspeed_kernel_npu", "tokenspeed_kernel_npu.ops"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, npu.__name__, npu)
+    monkeypatch.delitem(sys.modules, "tokenspeed_kernel.ops.layernorm.ascend", False)
+    ascend = importlib.import_module("tokenspeed_kernel.ops.layernorm.ascend")
+
+    # 1 + 2^-9 is not a bf16 value: formed in bf16 it rounds to 1.0.
+    q_weight = torch.tensor([2.0**-9, 0.5, -0.25], dtype=torch.bfloat16)
+    k_weight = torch.tensor([3.0, 2.0**-9, 0.125], dtype=torch.bfloat16)
+    q, k = object(), object()
+    ascend.qk_rmsnorm(q, k, q_weight, k_weight, 1e-5, weight_offset=1.0)
+    ((got_q, got_k, got_q_weight, got_k_weight, eps),) = calls
+    assert got_q is q and got_k is k and eps == 1e-5
+    for got, weight in ((got_q_weight, q_weight), (got_k_weight, k_weight)):
+        assert got.dtype == torch.bfloat16
+        assert torch.equal(got, (weight.float() + 1.0).to(torch.bfloat16))
+    # A zero offset hands the stored weights through untouched.
+    ascend.qk_rmsnorm(q, k, q_weight, k_weight, 1e-5, weight_offset=0.0)
+    assert calls[1][2] is q_weight and calls[1][3] is k_weight

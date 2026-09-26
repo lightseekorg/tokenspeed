@@ -41,7 +41,6 @@ import psutil
 import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
-from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from safetensors import safe_open
 from tokenspeed_kernel.platform import current_platform
 from tqdm.auto import tqdm
@@ -55,6 +54,16 @@ from tokenspeed.runtime.layers.quantization import (
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
+
+_KV_SCALE_SUFFIXES = (
+    ".k_scale",
+    ".v_scale",
+    ".kv_scale",
+    "_k_scale",
+    "_v_scale",
+    ".k_proj.output_scale",
+    ".v_proj.output_scale",
+)
 
 _AUXILIARY_SAFETENSORS_FILES = {"input_scales.safetensors"}
 
@@ -824,122 +833,56 @@ def initialize_dummy_weights(
                 param.uniform_(low, high, generator=generator)
 
 
-class KVCacheQuantSchema(BaseModel):
-    dtype: str
-    # Each key is a TP rank. Each value is a dictionary mapping a TP rank's
-    # layer indices to their per-tensor KV cache scaling factor.
-    # own schema class (tricky as its members are variable)
-    scaling_factor: dict[int, dict[int, float]]
-
-    @model_validator(mode="after")
-    def check_is_fp8(self) -> "KVCacheQuantSchema":
-        if self.dtype != "float8_e4m3fn":
-            raise ValueError(
-                "Loaded scaling factors intended for KV cache dtype = "
-                f"{self.dtype} rather than float8_e4m3fn!"
-            )
-        return self
-
-    @model_validator(mode="after")
-    def check_tp_ranks(self, info: ValidationInfo) -> "KVCacheQuantSchema":
-        context = info.context
-        if context:
-            tp_size = context["tp_size"]
-            num_hidden_layers = context["num_hidden_layers"]
-            if len(self.scaling_factor) != tp_size:
-                raise ValueError(
-                    f"Loaded dictionary has TP size {len(self.scaling_factor)} "
-                    f"but LLM engine is currently running with TP size {tp_size}."
-                )
-            for tp_rank, layer_maps in self.scaling_factor.items():
-                if len(layer_maps) != num_hidden_layers:
-                    raise ValueError(
-                        f"KV cache scales map for TP rank {tp_rank} is malformed. "
-                        f"Expected {num_hidden_layers} layers, got "
-                        f"{len(layer_maps)}."
-                    )
-            for i in range(tp_size):
-                if i not in self.scaling_factor:
-                    raise ValueError(f"KV cache scales map for TP rank {i} not found.")
-        return self
-
-    @model_validator(mode="after")
-    def check_current_rank(self, info: ValidationInfo) -> "KVCacheQuantSchema":
-        context = info.context
-        if context:
-            tp_rank = context["tp_rank"]
-            num_hidden_layers = context["num_hidden_layers"]
-            layer_scales_map = self.scaling_factor[tp_rank]
-            for i in range(num_hidden_layers):
-                if i not in layer_scales_map:
-                    raise ValueError(
-                        f"Could not find KV cache scales for layer {i} in "
-                        f"TP rank {tp_rank}."
-                    )
-        return self
+def record_non_unit_kv_scales(
+    weights: Iterable[tuple[str, torch.Tensor]], rejected: list[str]
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Pass weights through, appending each KV-cache scale other than one to
+    ``rejected``; KV caches are written and read at unit scale."""
+    for name, tensor in weights:
+        if name.endswith(_KV_SCALE_SUFFIXES) and not bool(torch.all(tensor == 1)):
+            rejected.append(f"{name}={tensor.flatten()[:4].tolist()}")
+        yield name, tensor
 
 
-class QuantParamSchema(BaseModel):
-    # (e.g. weights/activations params) once functionality is enabled
-    model_config = ConfigDict(protected_namespaces=())
-    model_type: str | None
-    kv_cache: KVCacheQuantSchema
-
-    @model_validator(mode="after")
-    def check_model_type(self, info: ValidationInfo) -> "QuantParamSchema":
-        context = info.context
-        if context:
-            model_type = context.get("model_type", None)
-            if model_type is not None:
-                if model_type != self.model_type:
-                    raise ValueError(
-                        f"Model type is {model_type} but loaded "
-                        f"scaling factors belonging to different "
-                        f"model type {self.model_type}!"
-                    )
-        return self
-
-
-def kv_cache_scales_loader(
-    filename: str,
-    tp_rank: int,
-    tp_size: int,
-    num_hidden_layers: int,
-    model_type: str | None,
-) -> Iterable[tuple[int, float]]:
-    """
-    A simple utility to read in KV cache scaling factors that have been
-    previously serialized to disk. Used by the model to populate the appropriate
-    KV cache scaling factors. The serialization should represent a dictionary
-    whose keys are the TP ranks and values are another dictionary mapping layers
-    to their KV cache scaling factors.
-    """
-    try:
-        with open(filename) as f:
-            context = {
-                "model_type": model_type,
-                "num_hidden_layers": num_hidden_layers,
-                "tp_rank": tp_rank,
-                "tp_size": tp_size,
-            }
-            schema_dct = json.load(f)
-            schema = QuantParamSchema.model_validate(schema_dct, context=context)
-            layer_scales_map = schema.kv_cache.scaling_factor[tp_rank]
-            return layer_scales_map.items()
-    except FileNotFoundError:
-        logger.error(f"File or directory '{filename!s}' not found.")
-    except json.JSONDecodeError:
-        logger.error(f"Error decoding JSON in file '{filename!s}'.")
-    except Exception:
-        logger.error(f"An error occurred while reading '{filename!s}'.")
-    # This section is reached if and only if any of the excepts are hit
-    # Return an empty iterable (list) => no KV cache scales are loaded
-    # which ultimately defaults to 1.0 scales
-    logger.warning(
-        "Defaulting to KV cache scaling factors = 1.0 for all "
-        f"layers in TP rank {tp_rank:d} as an error occurred during loading.",
+def non_unit_kv_scale_message(rejected: list[str]) -> str:
+    return (
+        f"checkpoint KV-cache scales {', '.join(rejected)}; "
+        "only unit KV-cache scales are supported"
     )
-    return []
+
+
+def require_unit_kv_scales(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Pass checkpoint weights through, raising once the stream is drained if
+    a KV-cache scale is not one."""
+    rejected: list[str] = []
+    yield from record_non_unit_kv_scales(weights, rejected)
+    if rejected:
+        raise ValueError(non_unit_kv_scale_message(rejected))
+
+
+def require_unit_kv_scale_file(path: str) -> None:
+    """Reject a ``--quantization-param-path`` file with a KV scale other than one."""
+    try:
+        with open(path) as f:
+            scaling_factor = json.load(f)["kv_cache"]["scaling_factor"]
+        scales = [
+            (tp_rank, layer, float(scale))
+            for tp_rank, layer_scales in scaling_factor.items()
+            for layer, scale in layer_scales.items()
+        ]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        raise ValueError(
+            f"{path}: expected a JSON file with kv_cache.scaling_factor "
+            f"{{tp_rank: {{layer: scale}}}} ({e!r})"
+        ) from e
+    for tp_rank, layer, scale in scales:
+        if scale != 1.0:
+            raise ValueError(
+                f"{path}: KV-cache scale {scale} for TP rank {tp_rank} layer "
+                f"{layer}; only unit KV-cache scales are supported"
+            )
 
 
 def mamba_v2_sharded_weight_loader(

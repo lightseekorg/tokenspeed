@@ -18,7 +18,6 @@ TokenSpeed-specific behavior explicitly.
 | `--dtype` | Weight and activation dtype. |
 | `--kv-cache-dtype` | KV cache storage dtype. |
 | `--quantization` | Weight quantization method. |
-| `--quantization-param-path` | KV cache scaling-factor file. |
 | `--max-model-len` | Maximum sequence length. |
 | `--device` | Device type. TokenSpeed currently serves CUDA. |
 | `--served-model-name` | OpenAI-compatible served model name. |
@@ -55,6 +54,7 @@ TokenSpeed-specific behavior explicitly.
 | `--expert-parallel-size` | `--expert-parallel-size`, `--ep-size` | TokenSpeed supports the familiar name and its existing short form. |
 | `--attention-backend` | `--attention-backend` | Name is aligned; available backend values are TokenSpeed-specific. |
 | `--moe-backend` | `--moe-backend` | Name is aligned; available backend values are TokenSpeed-specific. |
+| `--quantization-param-path` | `--quantization-param-path` | KV caches run unscaled: under an FP8 KV cache the file is accepted only when every factor is 1.0 (other KV dtypes do not read it), and checkpoint KV-cache scales other than 1.0 are rejected at load. |
 
 ## Recipe Translation Notes
 

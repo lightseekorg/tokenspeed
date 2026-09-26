@@ -34,20 +34,13 @@ from tokenspeed_kernel.ops.attention.mha.flashinfer import (
     trtllm_batch_context_with_kv_cache,
     trtllm_batch_decode_with_kv_cache,
 )
-from tokenspeed_kernel.ops.kvcache.triton import (
-    fused_fp8_set_kv_buffer,
-)
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
-from tokenspeed.runtime.execution.breakable_cuda_graph import (
-    is_breakable_capture_active,
-)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
-from tokenspeed.runtime.layers.attention.backends.paged.mha import trim_kv_to_locs
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
@@ -149,15 +142,8 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         self.spec_cache_seqlens_buf = None
         self._verify_views_by_bs = {}
 
-    def support_kv_cache_prewrite(
-        self, forward_mode: ForwardMode | None = None
-    ) -> bool:
-        # Under a breakable prefill-graph capture the prewrite would bake this
-        # forward's write locations into the graph (stale on every replay) --
-        # bake the non-prewrite branch instead: the eager attention break
-        # writes KV from fresh metadata.
-        if is_breakable_capture_active():
-            return False
+    def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
+        del forward_mode
         return True
 
     # ------------------------------------------------------------------
@@ -346,46 +332,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
 
         return k_cache, v_cache
 
-    def _compute_scales(self, layer: PagedAttention):
-        """Compute bmm1/bmm2 scales for the fused kernel."""
-        q_scale = 1.0
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
-        bmm1_scale = q_scale * k_scale * layer.scaling
-        bmm2_scale = 1.0
-        return bmm1_scale, bmm2_scale
-
-    def _should_use_fused_fp8_path(self, save_kv_cache: bool, k) -> bool:
-        return (
-            save_kv_cache
-            and k is not None
-            and self.kv_cache_dtype == torch.float8_e4m3fn
-        )
-
-    def _save_kv_and_prepare_q(
-        self, q, k, v, layer, out_cache_loc, token_to_kv_pool, save_kv_cache
-    ):
-        k, v = trim_kv_to_locs(out_cache_loc, k, v)
-        if self._should_use_fused_fp8_path(save_kv_cache, k):
-            k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            fused_fp8_set_kv_buffer(
-                k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                v=v.view(-1, layer.tp_k_head_num, layer.head_dim),
-                k_cache=k_cache,
-                v_cache=v_cache,
-                cache_loc=out_cache_loc,
-                k_scale=layer.k_scale,
-                v_scale=layer.v_scale,
-                page_size=self.kernel_page_size,
-            )
-        elif save_kv_cache and k is not None:
-            token_to_kv_pool.set_kv_buffer(
-                layer, out_cache_loc, k, v, layer.k_scale, layer.v_scale
-            )
-
+    def _prepare_q(self, q: torch.Tensor, layer: PagedAttention) -> torch.Tensor:
         if self.kv_cache_dtype == torch.float8_e4m3fn:
             q = fp8_cast_contiguous(q)
         else:
@@ -406,7 +353,6 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
         if self.block_decode_active:
@@ -425,11 +371,8 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
                 else self.forward_decode_metadata
             )
 
-        q = self._save_kv_and_prepare_q(
-            q, k, v, layer, out_cache_loc, token_to_kv_pool, save_kv_cache
-        )
+        q = self._prepare_q(q, layer)
         k_cache, v_cache = self._get_kv_cache_permuted(layer, token_to_kv_pool)
-        bmm1_scale, bmm2_scale = self._compute_scales(layer)
 
         attention_sink = kwargs.get("sinks", None)
         if attention_sink is not None:
@@ -442,8 +385,8 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             block_tables=metadata.page_table,
             seq_lens=metadata.cache_seqlens_int32,
             max_seq_len=self.max_context_len,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
+            bmm1_scale=layer.scaling,
+            bmm2_scale=1.0,
             window_left=layer.sliding_window_size,
             sinks=attention_sink,
             out_dtype=self.dtype,
@@ -460,15 +403,11 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
         metadata = self.forward_prefill_metadata
-        q = self._save_kv_and_prepare_q(
-            q, k, v, layer, out_cache_loc, token_to_kv_pool, save_kv_cache
-        )
+        q = self._prepare_q(q, layer)
         k_cache, v_cache = self._get_kv_cache_permuted(layer, token_to_kv_pool)
-        bmm1_scale, bmm2_scale = self._compute_scales(layer)
 
         attention_sink = kwargs.get("sinks", None)
         if attention_sink is not None:
@@ -482,8 +421,8 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             seq_lens=metadata.cache_seqlens_int32,
             max_q_len=metadata.max_seq_len_q,
             max_kv_len=self.max_context_len,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
+            bmm1_scale=layer.scaling,
+            bmm2_scale=1.0,
             batch_size=metadata.cu_seqlens_q.shape[0] - 1,
             cum_seq_lens_q=metadata.cu_seqlens_q,
             cum_seq_lens_kv=metadata.cu_seqlens_k,

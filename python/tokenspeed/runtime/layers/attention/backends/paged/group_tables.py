@@ -153,6 +153,7 @@ class GroupTableStacks:
         *,
         max_bs: int,
         max_tokens_per_req: int,
+        max_extend_tokens: int,
         device,
     ) -> None:
         if not groups:
@@ -174,6 +175,16 @@ class GroupTableStacks:
         self.decode_locs = torch.zeros(
             (g, self.max_bs * self.max_tokens_per_req), dtype=torch.int32, device=device
         )
+        # Extend spans up to this many tokens live here, tail at the dummy slot 0,
+        # so a prefill graph's padded prologue can record and replay the address.
+        self.extend_locs = torch.zeros(
+            (g, max(int(max_extend_tokens), 0)), dtype=torch.int32, device=device
+        )
+        self._extend_total = 0
+        self._extend_span: torch.Tensor | None = None
+        # A MIXED round's forward carries the decode rows after the extend span.
+        self._forward_total = 0
+        self._decode_tail: torch.Tensor | None = None
         self.page_sizes = torch.tensor(
             [spec.kernel_page_size for spec in groups], dtype=torch.int32, device=device
         )
@@ -316,13 +327,56 @@ class GroupTableStacks:
         total_tokens: int,
     ) -> dict[str, torch.Tensor]:
         """Every group's extend write slots over the current stack
-        (``group_id -> [total_tokens]`` fresh tensors; extend metadata is
-        rebuilt per round)."""
+        (``group_id -> [total_tokens]``): views of the persistent buffer when the
+        span fits it, with the tail zeroed, else fresh tensors."""
+        self._extend_total = self._forward_total = total_tokens
+        self._decode_tail = None
+        if total_tokens <= self.extend_locs.shape[1]:
+            out = self.extend_locs[:, :total_tokens]
+            self.extend_locs[:, total_tokens:].zero_()
+        else:
+            out = torch.empty(
+                (len(self.group_ids), total_tokens),
+                dtype=torch.int32,
+                device=self.tables.device,
+            )
         locs = extend_write_locations(
             self.tables,
             self.page_sizes,
             extend_prefix_lens,
             extend_seq_lens,
             total_tokens,
+            out,
         )
+        self._extend_span = locs
         return {gid: locs[i] for i, gid in enumerate(self.group_ids)}
+
+    def append_decode_rows(self, first_token: int, count: int) -> None:
+        """Place a MIXED round's decode rows, ``decode_locs[:, first:first + count]``
+        after its extend span, so one padded span covers every row of the forward."""
+        total = self._extend_total
+        self._forward_total = total + count
+        tail = self.decode_locs[:, first_token : first_token + count]
+        if self._forward_total <= self.extend_locs.shape[1]:
+            self.extend_locs[:, total : self._forward_total].copy_(tail)
+            self.extend_locs[:, self._forward_total :].zero_()
+            self._decode_tail = None
+        else:
+            self._decode_tail = tail
+
+    def padded_extend_span(self, group_id: str, rows: int) -> torch.Tensor:
+        """The forward's rows (the extend span, then a MIXED round's decode rows)
+        widened to ``rows`` with the dummy slot 0: a view of the buffer's zero
+        tail where the graph-padded forward records it, else a fresh tensor for
+        the eager forward wider than the buffer."""
+        total = self._forward_total
+        if rows < total:
+            raise ValueError(f"a span of {total} tokens cannot pad to {rows} rows")
+        index = self._index[group_id]
+        if rows <= self.extend_locs.shape[1]:
+            return self.extend_locs[index, :rows]
+        padded = torch.zeros(rows, dtype=torch.int32, device=self.tables.device)
+        padded[: self._extend_total] = self._extend_span[index]
+        if self._decode_tail is not None:
+            padded[self._extend_total : total] = self._decode_tail[index]
+        return padded

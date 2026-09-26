@@ -29,17 +29,60 @@ contracts must satisfy: a group must retain every token its layers can see.
 """
 
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Protocol
 
+import torch
+from tokenspeed_kernel.ops.attention.prologue import (
+    GQAPrologueOutput,
+    HeadKVCache,
+    HeadNorm,
+    LatentKVCache,
+    MLAExpandedKV,
+    MLAPrologueOutput,
+    Rotary,
+    gqa_prologue,
+    mla_prologue,
+)
 from torch import nn
 
+from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 
 
 def hf_sliding_window_to_window_left(sliding_window: int) -> int:
     """HF sliding windows count the current token; kernels take the number of
     earlier tokens still visible (``window_left``)."""
     return int(sliding_window) - 1
+
+
+class HeadRotary(Protocol):
+    """A rotary embedding the prologue applies."""
+
+    def as_rotary(self, positions: torch.Tensor) -> Rotary: ...
+
+
+class HeadRMSNorm(Protocol):
+    """A per-head RMSNorm the prologue applies: ``x * rsqrt(mean(x^2) + eps) *
+    (weight + weight_offset)``."""
+
+    weight: torch.Tensor
+    weight_offset: float
+    variance_epsilon: float
+
+
+def head_norm(q_norm: HeadRMSNorm, k_norm: HeadRMSNorm) -> HeadNorm:
+    """The prologue's norm step for a layer's per-head query and key norms."""
+    if (q_norm.weight_offset, q_norm.variance_epsilon) != (
+        k_norm.weight_offset,
+        k_norm.variance_epsilon,
+    ):
+        raise ValueError("query and key norms must share epsilon and weight offset")
+    return HeadNorm(
+        q_norm.weight, k_norm.weight, q_norm.weight_offset, q_norm.variance_epsilon
+    )
 
 
 class PagedAttention(nn.Module):
@@ -57,7 +100,12 @@ class PagedAttention(nn.Module):
         logit_cap: float = 0.0,
         v_head_dim: int = -1,
         sliding_window_size: int = -1,
+        *,
+        rotary_emb: HeadRotary | None,
+        qk_norm: tuple[HeadRMSNorm, HeadRMSNorm] | None,
     ):
+        """``rotary_emb`` and ``qk_norm`` are the steps the attention prologue
+        applies before core attention; ``None`` skips a step."""
         super().__init__()
         self.tp_q_head_num = num_heads
         self.tp_k_head_num = num_kv_heads
@@ -68,8 +116,7 @@ class PagedAttention(nn.Module):
         self.scaling = scaling
         self.layer_id = layer_id
         self.logit_cap = logit_cap
-        # Visibility: window_left of the compute mask, -1 for full attention.
-        # 0 is a real window (the current token only), not "unset".
+        # window_left of the compute mask: -1 for full attention, 0 for the current token only.
         if sliding_window_size is None or sliding_window_size < -1:
             raise ValueError(
                 f"PagedAttention layer_id={layer_id}: sliding_window_size is a "
@@ -77,12 +124,10 @@ class PagedAttention(nn.Module):
                 f"{sliding_window_size!r}"
             )
         self.sliding_window_size = int(sliding_window_size)
-        # Storage: the cache group this layer's KV rides. Owned by the cache
-        # plan and bound at startup (bind_cache_groups); the model never
-        # names it.
+        # The cache group this layer's KV rides, bound at startup by bind_cache_groups.
         self._group_id: str | None = None
-        self.k_scale = None
-        self.v_scale = None
+        self.rotary_emb = rotary_emb
+        self.qk_norm = qk_norm
 
     @property
     def group_id(self) -> str:
@@ -111,26 +156,45 @@ class PagedAttention(nn.Module):
 
     def forward(
         self,
-        q,
-        k,
-        v,
+        q: torch.Tensor,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
+        positions: torch.Tensor | None,
         ctx: ForwardContext,
-        save_kv_cache: bool = True,
         **kwargs,
-    ):
-        """Run this layer's attention; KV write locations come from the
-        backend (``write_locations``), never from the caller."""
-        if k is not None:
-            # For cross-layer sharing, kv can be None
-            if v is None:
-                raise ValueError("v must be provided when k is provided.")
-            if "k_pe" not in kwargs:
-                k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
-                v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
-            else:
-                k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
-                v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
+    ) -> torch.Tensor:
+        """Run this layer's attention.
 
+        A GQA layer given K/V takes its projected rows: the prologue normalizes
+        and rotates them and writes K/V at the backend's write locations, padded
+        to the rows the forward carries so a graph can record it; core attention
+        runs in the eager break (:meth:`attend`). ``k = v = None`` means the
+        inputs are prepared and the cache written (by :meth:`prologue`, or by
+        an MLA layer's :meth:`latent_prologue`).
+        """
+        if k is not None and v is None:
+            raise ValueError("v must be provided when k is provided.")
+        if k is not None and not ctx.forward_mode.is_idle():
+            out = self.prologue(q, k, v, positions, ctx)
+            q, k, v = out.q, out.k, out.v
+        return self.attend(q, k, v, ctx, **kwargs)
+
+    @break_point
+    def attend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
+        ctx: ForwardContext,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Core attention over prepared inputs, the eager break: the prologue's
+        query and, for a forward that is not a decode, its returned key and
+        value rows. A model that runs :meth:`prologue` inside its own stream
+        scope calls this afterwards."""
+        if k is not None:
+            k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
+            v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
         return ctx.attn_backend.forward(
             q,
             k,
@@ -139,9 +203,128 @@ class PagedAttention(nn.Module):
             ctx.token_to_kv_pool,
             ctx.forward_mode,
             ctx.bs,
-            save_kv_cache,
+            save_kv_cache=False,
             ctx=ctx,
             **kwargs,
+        )
+
+    def prologue(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        positions: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> GQAPrologueOutput:
+        """Run a GQA layer's prologue alone: prepare ``q`` and write K/V.
+
+        :meth:`forward` calls this before core attention; a narrowed draft step
+        calls it and then attends its live rows.
+
+        Returns:
+            The prepared query, and the key/value rows unless the forward
+            decodes (decode attention reads the cache).
+        """
+        norm, rotary = self._steps(positions)
+        return gqa_prologue(
+            q,
+            k,
+            v,
+            norm=norm,
+            rotary=rotary,
+            cache=self._write_target(q, ctx),
+            return_kv=not ctx.forward_mode.is_decode(),
+            solution=None,
+            override=None,
+        )
+
+    def _steps(
+        self, positions: torch.Tensor | None
+    ) -> tuple[HeadNorm | None, Rotary | None]:
+        return (
+            None if self.qk_norm is None else head_norm(*self.qk_norm),
+            None if self.rotary_emb is None else self.rotary_emb.as_rotary(positions),
+        )
+
+    def _write_target(
+        self, q: torch.Tensor, ctx: ForwardContext
+    ) -> HeadKVCache | LatentKVCache:
+        slots = ctx.attn_backend.padded_write_locations(
+            self, ctx.forward_mode, q.shape[0]
+        )
+        return self._local_target(slots, ctx)
+
+    def _local_target(
+        self, slots: torch.Tensor, ctx: ForwardContext
+    ) -> HeadKVCache | LatentKVCache:
+        """The pool's target for ``slots``, local to this rank's shard under DCP."""
+        slots, owned = resolve_cache_slots(
+            slots, ctx.attn_backend.cache_placement(self)
+        )
+        return ctx.token_to_kv_pool.kv_write_target(self.layer_id, slots, owned)
+
+    def attend_live_rows(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        positions: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """A narrowed draft's first step: write every row's K/V, then attend
+        only the live rows (``ctx.gather_ids``) as a decode over the accepted
+        prefix."""
+        ctx.draft_narrowing.publish_accepted_prefix()
+        decode_ctx = replace(ctx, forward_mode=ForwardMode.DECODE)
+        q = self.prologue(q, k, v, positions, decode_ctx).q
+        return self.forward(
+            q.index_select(0, ctx.gather_ids),
+            k=None,
+            v=None,
+            positions=None,
+            ctx=decode_ctx,
+            # The DECODE dispatch would skip the PD cache step a catch-up round records.
+            record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
+        )
+
+    def latent_prologue(
+        self,
+        query: torch.Tensor,
+        q_pe: torch.Tensor,
+        latent_cache: torch.Tensor,
+        positions: torch.Tensor,
+        ctx: ForwardContext,
+        *,
+        slots: torch.Tensor,
+        expanded: MLAExpandedKV | None,
+    ) -> MLAPrologueOutput:
+        """Run an MLA layer's prologue: rotate, write the latent rows to
+        ``slots``, and return attention inputs (FP8 for an FP8 cache, not
+        per-token-head planes).
+
+        Args:
+            query: ``[num_tokens, num_heads, q_nope_dim + rope_dim]`` whose
+                leading channels hold the query's non-RoPE part.
+            q_pe: Unrotated query RoPE part; it may alias ``query``.
+            latent_cache: Normalized latent and unrotated key RoPE part.
+            positions: Token positions.
+            ctx: Forward context.
+            slots: Cache slots of the leading latent rows to write.
+            expanded: Per-head keys and values for non-absorbed attention.
+        """
+        return mla_prologue(
+            query,
+            q_pe,
+            latent_cache,
+            expanded=expanded,
+            rotary=(
+                None
+                if self.rotary_emb is None
+                else self.rotary_emb.as_rotary(positions)
+            ),
+            cache=self._local_target(slots, ctx),
+            solution=None,
+            override=None,
         )
 
 

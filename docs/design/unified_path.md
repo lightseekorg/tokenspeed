@@ -51,8 +51,8 @@ knows and only V4.1 plans from: `extend_replay_lens_cpu` (how many leading
 rows of each extend re-feed already-cached positions — bounded replay,
 `docs/design/scheduler.md`) and `extend_prompt_lens_cpu` (the whole prompt
 length, so the backend can tell a prompt-completing chunk from an open one).
-Leaves never see them: a paged leaf writes every input row unconditionally,
-so the router and every other runner-facing node call
+Leaves never see them: the attention prologue writes every input row
+unconditionally, so the router and every other runner-facing node call
 `reject_bounded_replay` and fail loud on a non-zero replay instead of
 rewriting rows the prefix hit already shares. No default values: the runner
 passes the `[:num_extends]` slices of its input buffers on every call (the
@@ -580,8 +580,8 @@ Draft views have no GDN or PLE child. PLE and QSA remain available on targets
 without linear-attention layers; the model retains their computation order.
 
 QSA's full-KV attention uses the ordinary router and an MHA-derived leaf.
-The leaf reuses MHA's KV writer; already-quantized FP8 inputs retain direct
-stores to avoid rescaling. Sparse attention has no MXFP8 block-scale input.
+The attention prologue writes its KV like any MHA layer's. Sparse attention
+has no MXFP8 block-scale input.
 Its compressed and recent cache groups belong to `QSAIndexerBackend`, not
 to extra attention leaves. The indexer backend refreshes stable raw group
 tables with the shared `GroupTableStacks` fill at expansion ratio one:
@@ -613,8 +613,8 @@ across layouts. Graph replay is compared with eager execution of the same
 layout so metadata-refresh checks do not depend on cross-layout rounding.
 
 Qwen4-Exp attention callers pass `topk_indices` explicitly, using `None` for
-dense attention. Sparse QSA requires `save_kv_cache=True` because it always
-writes the full KV cache; the dense fallback honors the caller's flag.
+dense attention. The prologue has written the full KV cache before either
+path runs.
 Draft step zero still preserves the dense decode-context
 and KV-recording override, while QSA keeps its original context and narrows
 the selected top-k rows with the queries.
@@ -758,17 +758,21 @@ leaves ignore it; it carries no table or page vocabulary.
 
 `write_locations(layer, forward_mode)` on the top-level backend is the ONLY
 accessor for KV write slots — models, drafters and the runner neither
-compute nor thread location vectors. `PagedAttention.forward`,
-`AttentionBackend.forward`, `model_runner.forward` and every model forward
-chain carry no `out_cache_loc` parameter; `InputBuffers` has no location
-buffer; `fill_input_buffers` takes no table.
+compute nor thread location vectors. `forward_write_locations(layer,
+forward_mode)` derives from it the slots the attention prologue writes: the
+mode's `write_locations`, with the decode window appended for a draft's first
+step over a MIXED round (`docs/design/attention-prologue.md`).
+`PagedAttention.forward`, `AttentionBackend.forward`, `model_runner.forward`
+and the model forward chains above the attention layers carry no
+`out_cache_loc` parameter; `InputBuffers` has no location buffer;
+`fill_input_buffers` takes no table.
 
 * **Extend**: `init_forward_metadata` computes each group's span over the
   stacks (`[sum(extend_seq_lens)]`, request-major); `write_locations(layer,
   EXTEND)` returns exactly that span.
 * **Decode / verify**: `refresh_decode_metadata` publishes the token-major
   `[bs * N]` window views (`decode_write_locations`, pointer-stable per
-  bs — the graph records them through the leaves' KV writes, and the
+  bs — the graph records them through the prologue's KV writes, and the
   pointer guard walks this slot). A MIXED round's draft refresh sets
   `_decode_request_offset = num_extends` so DECODE reads skip the extend
   requests.
@@ -788,16 +792,14 @@ buffer; `fill_input_buffers` takes no table.
   windows; DFLASH reads the TARGET router's windows through them to copy
   target-aligned KV into the draft cache (the pools share one page-id
   space).
-* **Model-side direct writes** (fused RoPE prewrite, MLA latent
-  `set_mla_kv_buffer`, V4 group writes, QSA) fetch
-  `ctx.attn_backend.write_locations(layer, mode)` immediately before the
-  write. A model path that writes multiple mode windows in one shot (the
-  MLA draft's step-0 whole-batch write) concatenates the EXTEND span and the
-  DECODE window — eager-only, MIXED rounds never run under a captured
-  graph. The router performs the same composition when a draft step-0
-  forward locally dispatches as DECODE while retaining the round's full K/V
-  rows; target MIXED decode halves and later draft steps keep their ordinary
-  decode-only windows. V4 composes the shared token-shaped resolve
+* **Writes outside the backend** (the attention prologue, V4 group writes)
+  fetch their slots immediately before the write. When a draft step-0
+  forward over a MIXED round writes the round's full K/V rows, dispatched as
+  MIXED or as DECODE (the MLA draft's whole-batch write, a GQA draft's
+  narrowed first step), `forward_write_locations` concatenates the EXTEND
+  span and the DECODE window — eager-only, MIXED rounds never run under a
+  captured graph. Target MIXED decode halves and later draft steps keep their
+  ordinary decode-only windows. V4 composes the shared token-shaped resolve
   (`page_table.group_slot_mapping_from_raw`) over its own group tables; a
   degraded mapping fails closed to `-1` (skipped write), never to a raw
   fallback vector.

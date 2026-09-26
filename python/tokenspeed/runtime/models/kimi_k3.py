@@ -632,11 +632,13 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             and ctx.num_extends == 0
             and ctx.attn_backend.supports_mla_projected_value_decode
         )
+        expanded = self._prefill_prologue_before_break(positions, q, latent_cache, ctx)
         attn_output = self._attn(
             positions,
             q,
             latent_cache,
             ctx,
+            expanded=expanded,
             output_gate=gate if fuse_value_gate else None,
             absorbed_query=absorbed_query,
         )

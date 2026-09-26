@@ -108,14 +108,7 @@ def test_flashmla_absorbed_extend_refuses_sharded_cache():
     leaf = flashmla.FlashMLABackend.__new__(flashmla.FlashMLABackend)
     leaf.dcp_group = (0, 1)
     with pytest.raises(RuntimeError, match="absorbed extend"):
-        leaf._forward_absorbed_extend(
-            torch.empty(0),
-            torch.empty(0),
-            None,
-            layer=None,
-            out_cache_loc=None,
-            token_to_kv_pool=None,
-        )
+        leaf._forward_absorbed_extend(torch.empty(0), layer=None, token_to_kv_pool=None)
 
 
 def test_kimi_capacity_shards_only_mla():
@@ -327,6 +320,7 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
         HybridKDATokenToKVPool,
     )
+    from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
     plan = make_mla_memory_plan(
         size=8,
@@ -363,7 +357,16 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
         "full_attention"
     ]
     backend.kv_lora_rank = 512
-    layer = SimpleNamespace(layer_id=0)
+    layer = PagedAttention(
+        1,
+        192,
+        1.0,
+        num_kv_heads=1,
+        layer_id=0,
+        v_head_dim=128,
+        rotary_emb=None,
+        qk_norm=None,
+    )
     loc = torch.tensor([4, 8, 12], device="cuda")
     values = torch.arange(3 * 576, device="cuda", dtype=torch.bfloat16).reshape(
         3, 1, 576
@@ -383,7 +386,6 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
             kv_b_proj=lambda latent: (latent.new_zeros((latent.shape[0], 256)),),
             attn_mha=layer,
             rotary_emb=None,
-            _mla_kv_is_fp8=lambda ctx, scale: False,
         )
         DeepseekV3AttentionMLA.forward_normal_chunked_kv_prepare(
             model,
@@ -726,13 +728,9 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
     monkeypatch.setattr(dsa, "combine_attention_partials", combine)
     out = backend.forward_sparse_decode(
         q=query,
-        k=None,
-        v=None,
         layer=layer,
-        out_cache_loc=torch.tensor([64]),
         token_to_kv_pool=pool,
         bs=1,
-        save_kv_cache=False,
         topk_indices=slots,
         topk_lens=None,
     )

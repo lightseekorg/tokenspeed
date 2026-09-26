@@ -37,7 +37,6 @@ from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
 )
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.common import concat
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
@@ -75,9 +74,10 @@ class LlamaAttention(BaseLlamaAttention):
     Inherits the projection setup (with ``qkv_input_size=2*hidden_size`` for
     the [embed || hidden] concat) and ``forward`` (= qkv_proj + o_proj
     scaffolding) from base. Overrides ``_attn`` so the draft's first step
-    skips dead catch-up rows: on backends that support fused KV pre-write, q
-    is sliced to one live row per request and dispatched as DECODE; otherwise
-    the fallback runs the full N-row attn and post-slices the output.
+    skips dead catch-up rows: on backends that support a narrowed draft
+    decode, the prologue writes every row and q is sliced to one live row per
+    request and dispatched as DECODE; otherwise the fallback runs the full
+    N-row attn and post-slices the output.
     Inactive draft steps delegate to base.
     """
 
@@ -89,38 +89,13 @@ class LlamaAttention(BaseLlamaAttention):
         v: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        # Active draft first step (the drafter attached the narrowing).
-        # Covers both decode catch-up and prefill catch-up; multi-step decode
-        # delegates to base.
+        # Only the active draft first step narrows; later steps delegate to base.
         if ctx.draft_narrowing is None:
             return super()._attn(positions, q, k, v, ctx)
 
-        if ctx.attn_backend.support_kv_cache_prewrite(ctx.forward_mode):
-            fused_kv_arg = self._build_fused_kv_arg(v, ctx)
-            if fused_kv_arg is not None:
-                # The sliced single-token decode attends over the accepted
-                # prefix; the post-slice fallback below still runs the full
-                # N-row attn over the verify window and must not publish.
-                ctx.draft_narrowing.publish_accepted_prefix()
-                q_rope = self._fused_rope_kv_write(
-                    positions, q, k, fused_kv_arg
-                ).index_select(0, ctx.gather_ids)
-                # record_kv_cache (keyed off the real mode) forces the backend's
-                # PD layerwise cache-step record that the DECODE dispatch would
-                # otherwise skip on an EXTEND/MIXED catch-up.
-                return ctx.attn_backend.forward(
-                    q_rope,
-                    None,
-                    None,
-                    self.attn,
-                    ctx.token_to_kv_pool,
-                    ForwardMode.DECODE,
-                    ctx.bs,
-                    save_kv_cache=False,
-                    record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
-                )
-        q, k = self.rotary_emb(positions, q, k)
-        return self.attn(q, k, v, ctx=ctx).index_select(0, ctx.gather_ids)
+        if not ctx.attn_backend.supports_narrowed_draft_decode(ctx.forward_mode):
+            return self.attn(q, k, v, positions, ctx).index_select(0, ctx.gather_ids)
+        return self.attn.attend_live_rows(q, k, v, positions, ctx)
 
 
 # ---------------------------------------------------------------------------

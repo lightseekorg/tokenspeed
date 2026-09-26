@@ -59,6 +59,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     instanttensor_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
+    require_unit_kv_scales,
     safetensors_filtered_weights_iterator,
     safetensors_weights_iterator,
 )
@@ -394,8 +395,9 @@ class DefaultModelLoader(BaseModelLoader):
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files)
 
-        # Apply the prefix.
-        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+        return require_unit_kv_scales(
+            (source.prefix + name, tensor) for (name, tensor) in weights_iterator
+        )
 
     def _get_all_weights(
         self,

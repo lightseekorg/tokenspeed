@@ -254,7 +254,6 @@ class GlmDsaIndexer(nn.Module):
 
 
 class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
-    _MLA_KERNEL_BACKENDS = ("trtllm_mla", "tokenspeed_mla", "dsa")
     _RAGGED_PREFILL_BACKENDS = ("trtllm_mla", "tokenspeed_mla", "dsa")
     rope_is_neox_style = False
 
@@ -1013,7 +1012,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         prefill_topk: GlmDsaPrefillTopK,
         cache_num_tokens: int | None = None,
     ) -> torch.Tensor:
-        Q, _ = self.forward_absorb_qkv_proj(
+        Q = self.forward_absorb_qkv_proj(
             q,
             latent_cache,
             positions,
@@ -1053,7 +1052,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         topk_indices: torch.Tensor | None = None,
         topk_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        Q, K = self.forward_absorb_qkv_proj(
+        Q = self.forward_absorb_qkv_proj(
             q,
             latent_cache,
             positions,
@@ -1062,7 +1061,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         )
         return self.forward_absorb_attn_v_proj(
             Q,
-            K,
             ctx,
             output,
             topk_indices=topk_indices,
@@ -1072,22 +1070,17 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
     def forward_absorb_attn_v_proj(
         self,
         Q,
-        K,
         ctx: ForwardContext,
         output: torch.Tensor,
         topk_indices: torch.Tensor | None = None,
         topk_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        need_save_kv = False
-        if self.attention_backend not in self._MLA_KERNEL_BACKENDS:
-            need_save_kv = not self.use_fused_set_kv_buffer
-
         attn_output = self.attn_mqa(
             Q,
-            K,
-            K[..., : self.kv_lora_rank] if K is not None else None,
-            ctx,
-            save_kv_cache=need_save_kv,
+            k=None,
+            v=None,
+            positions=None,
+            ctx=ctx,
             topk_indices=topk_indices,
             topk_lens=topk_lens,
         )

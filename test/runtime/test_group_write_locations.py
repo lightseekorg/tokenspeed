@@ -74,7 +74,9 @@ class HoleOverflowRoutingTest(unittest.TestCase):
         page_sizes = torch.tensor([2], dtype=torch.int32)
         prefix = torch.tensor([1], dtype=torch.int32)
         new = torch.tensor([4], dtype=torch.int32)
-        locs = extend_write_locations(tables, page_sizes, prefix, new, 4)
+        locs = extend_write_locations(
+            tables, page_sizes, prefix, new, 4, torch.empty((1, 4), dtype=torch.int32)
+        )
         # pos 1 -> page 3 slot 1 = 7; pos 2, 3 -> hole page 0 -> 0; pos 4 ->
         # page index 2 >= width -> 0.
         self.assertEqual(locs[0].tolist(), [7, 0, 0, 0])

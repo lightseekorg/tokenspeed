@@ -21,6 +21,8 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
+from tokenspeed_kernel.ops.attention.prologue import MLAPrologueOutput
+
 from tokenspeed.runtime.configs.kimi_k3_config import (  # noqa: E402
     KimiK3Config,
     KimiK3VisionConfig,
@@ -669,7 +671,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         attention.num_local_heads = 2
         attention.v_head_dim = 3
         attention.attn_mha = SimpleNamespace(group_id="full_attention")
-        attention.forward_normal_chunked = mock.Mock()
+        attention.forward_normal_chunked_kv_core = mock.Mock()
         attention.forward_absorb = mock.Mock()
 
         output_gate = torch.arange(24).reshape(4, 6)
@@ -678,6 +680,11 @@ class KimiK3RegistrationTests(unittest.TestCase):
             q=torch.empty(4, 2, 8),
             latent_cache=torch.empty(4, 1, 8),
             ctx=ctx,
+            expanded=MLAPrologueOutput(
+                query=torch.empty(4, 2, 8),
+                key=torch.empty(4, 2, 8),
+                value=torch.empty(4, 2, 3),
+            ),
             output_gate=output_gate,
         )
 

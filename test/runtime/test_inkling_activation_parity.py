@@ -243,6 +243,14 @@ class _Harness:
         )
         from cache_pool_test_utils import make_mha_memory_plan, make_pool
 
+        layer_kv_heads = tuple(
+            (
+                text.swa_num_key_value_heads
+                if i in text.local_layer_ids
+                else text.ckpt_num_key_value_heads
+            )
+            for i in range(text.num_hidden_layers)
+        )
         # One arena, one view over it: the pool owns no memory or geometry.
         _arena, self.kv_pool = make_pool(
             MHATokenToKVPool,
@@ -260,6 +268,9 @@ class _Harness:
             head_dim=text.head_dim,
             layer_num=text.num_hidden_layers,
             rank=0,
+            # Full and sliding layers serve their own KV head counts, as the recipe plans them.
+            layer_kv_head_counts=layer_kv_heads,
+            kv_alloc_head_count=text.num_key_value_heads,
         )
         conv_pool = InklingConvStatePool(
             num_layers=text.num_hidden_layers,
@@ -285,15 +296,7 @@ class _Harness:
         self.backend.conv_columns = conv_columns
         self.pool_view = _ConvCheckpointPool(
             self.kv_pool,
-            layer_kv_widths=[
-                (
-                    text.swa_num_key_value_heads
-                    if i in text.local_layer_ids
-                    else text.ckpt_num_key_value_heads
-                )
-                * text.head_dim
-                for i in range(text.num_hidden_layers)
-            ],
+            layer_kv_widths=[heads * text.head_dim for heads in layer_kv_heads],
             num_pages=num_conv_pages + 1,
             rows=text.sconv_kernel_size - 1,
             hidden=text.hidden_size,

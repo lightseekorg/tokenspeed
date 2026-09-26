@@ -28,13 +28,10 @@ from collections.abc import Iterable, Sequence
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import swiglu_oai
+from tokenspeed_kernel.ops.attention.prologue import qk_norm_rope
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
-from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.thirdparty.cuda.minimax_m3_fused import (
-    fused_qknorm_rope_kv_insert,
-)
 from torch import nn
 from transformers import MiniMaxM3VLTextConfig
 
@@ -65,7 +62,7 @@ from tokenspeed.runtime.layers.moe import (
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
-from tokenspeed.runtime.layers.paged_attention import PagedAttention
+from tokenspeed.runtime.layers.paged_attention import PagedAttention, head_norm
 from tokenspeed.runtime.layers.parameter import (
     BaseWeightParameter,
     BlockQuantScaleParameter,
@@ -537,14 +534,14 @@ class MiniMaxM3Indexer(nn.Module):
         index_q: torch.Tensor,
         index_k: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        index_q, index_k = qk_rmsnorm(
+        # The MSA backend caches the index keys itself.
+        index_q, index_k = qk_norm_rope(
             index_q,
             index_k,
-            self.q_norm.gemma_weight,
-            self.k_norm.gemma_weight,
-            self.q_norm.variance_epsilon,
+            head_dim=self.head_dim,
+            norm=head_norm(self.q_norm, self.k_norm),
+            rotary=self.rotary_emb.as_rotary(positions),
         )
-        index_q, index_k = self.rotary_emb(positions, index_q, index_k)
         return (
             index_q.view(-1, self.num_index_heads, self.head_dim),
             index_k.view(-1, self.head_dim),
@@ -574,13 +571,6 @@ class MiniMaxM3Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.is_sparse = config.layer_types[layer_id] == "minimax_m3_sparse"
-        self.use_fused_qknorm_rope = (
-            self.is_sparse
-            and current_platform().is_nvidia
-            and self.head_dim == 128
-            and config.index_head_dim == 128
-        )
-
         if self.is_sparse:
             # Sparse layers fuse the indexer's index_q/index_k into the QKV GEMM:
             # a single projection emits [q | k | v | index_q | index_k].
@@ -645,6 +635,8 @@ class MiniMaxM3Attention(nn.Module):
             self.head_dim**-0.5,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            rotary_emb=self.rotary_emb,
+            qk_norm=(self.q_norm, self.k_norm),
         )
 
     def forward(
@@ -655,29 +647,12 @@ class MiniMaxM3Attention(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
-
         qkv, _ = self.qkv_proj(hidden_states)
-
-        if self.use_fused_qknorm_rope:
-            q, k, v, attn_kwargs = self.fused_qknorm_rope(qkv, positions)
+        if not self.is_sparse:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            attn_output = self.attn(q, k, v, positions, ctx)
         else:
-            q, k, v, attn_kwargs = self.qknorm_rope(qkv, positions)
-
-        attn_output = self.attn(
-            q,
-            k,
-            v,
-            ctx=ctx,
-            **attn_kwargs,
-        )
-        output, _ = self.o_proj(attn_output)
-        return output
-
-    def qknorm_rope(
-        self, qkv: torch.Tensor, positions: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-        if self.is_sparse:
-            # Fused projection emits [q | k | v | index_q | index_k].
+            # Sparse layers project [q | k | v | index_q | index_k] in one GEMM.
             q, k, v, index_q, index_k = qkv.split(
                 [
                     self.q_size,
@@ -688,64 +663,12 @@ class MiniMaxM3Attention(nn.Module):
                 ],
                 dim=-1,
             )
-        else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = qk_rmsnorm(
-            q,
-            k,
-            self.q_norm.gemma_weight,
-            self.k_norm.gemma_weight,
-            self.q_norm.variance_epsilon,
-        )
-        q, k = self.rotary_emb(positions, q, k)
-        q = q.view(-1, self.num_heads, self.head_dim)
-        k = k.view(-1, self.num_kv_heads, self.head_dim)
-        v = v.view(-1, self.num_kv_heads, self.head_dim)
-        attn_kwargs = {}
-        if self.is_sparse:
             index_q, index_k = self.indexer(positions, index_q, index_k)
-            attn_kwargs = {"index_q": index_q, "index_k": index_k}
-        return q, k, v, attn_kwargs
-
-    def fused_qknorm_rope(
-        self, qkv: torch.Tensor, positions: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-        q_out = qkv.new_empty(qkv.size(0), self.q_size)
-        index_q_out = qkv.new_empty(qkv.size(0), self.index_q_size)
-        fused_qknorm_rope_kv_insert(
-            qkv,
-            self.q_norm.weight,
-            self.k_norm.weight,
-            self.rotary_emb.cos_sin_cache,
-            positions,
-            self.num_heads,
-            self.num_kv_heads,
-            self.rotary_emb.rotary_dim,
-            self.q_norm.variance_epsilon,
-            index_q_norm_weight=self.indexer.q_norm.weight,
-            index_k_norm_weight=self.indexer.k_norm.weight,
-            num_index_heads=self.indexer.num_index_heads,
-            q_out=q_out,
-            index_q_out=index_q_out,
-        )
-        _, k, v, _, index_k = qkv.split(
-            [
-                self.q_size,
-                self.kv_size,
-                self.kv_size,
-                self.index_q_size,
-                self.index_k_size,
-            ],
-            dim=-1,
-        )
-        q = q_out.view(-1, self.num_heads, self.head_dim)
-        k = k.reshape(-1, self.num_kv_heads, self.head_dim)
-        v = v.reshape(-1, self.num_kv_heads, self.head_dim)
-        index_q = index_q_out.view(
-            -1, self.indexer.num_index_heads, self.index_head_dim
-        )
-        index_k = index_k.reshape(-1, self.index_head_dim)
-        return q, k, v, {"index_q": index_q, "index_k": index_k}
+            attn_output = self.attn(
+                q, k, v, positions, ctx, index_q=index_q, index_k=index_k
+            )
+        output, _ = self.o_proj(attn_output)
+        return output
 
 
 class MiniMaxM3DecoderLayer(nn.Module):

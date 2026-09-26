@@ -420,10 +420,8 @@ def _apply_backend_overrides(
     """The one place family resolution writes back into ``server_args``.
 
     The mutation is deliberate, not a shortcut: ``_create_attn_config`` reads
-    the backend choice through the generate() protocol, and the
-    ``global_server_args_dict`` snapshot serves models that pick kernel paths
-    at build time (e.g. ``deepseek_v3.attention_backend``). Must run before
-    any ``_create_attn_config`` call. The user's pre-override choice survives
+    the backend choice through the generate() protocol. Must run before any
+    ``_create_attn_config`` call. The user's pre-override choice survives
     as ``profile.requested_backend``.
     """
     if "DeepseekV41ForCausalLM" in target.architectures:

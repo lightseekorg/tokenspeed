@@ -725,30 +725,6 @@ class DFlash(BaseDrafter):
                 self._fused_kv_k_buffers, self._fused_kv_v_buffers
             )
 
-            self._fused_kv_inv_k_scales = None
-            self._fused_kv_inv_v_scales = None
-            if self._fused_kv_k_buffers[0].dtype == torch.float8_e4m3fn:
-                has_scale = any(
-                    getattr(layer.self_attn.attn, "k_scale", None) is not None
-                    or getattr(layer.self_attn.attn, "v_scale", None) is not None
-                    for layer in layers
-                )
-                if has_scale:
-                    inv_k_vals = []
-                    inv_v_vals = []
-                    for layer in layers:
-                        attn = layer.self_attn.attn
-                        k_s = getattr(attn, "k_scale", None)
-                        v_s = getattr(attn, "v_scale", None)
-                        inv_k_vals.append(1.0 / float(k_s) if k_s is not None else 1.0)
-                        inv_v_vals.append(1.0 / float(v_s) if v_s is not None else 1.0)
-                    self._fused_kv_inv_k_scales = torch.tensor(
-                        inv_k_vals, dtype=torch.float32, device=self.device
-                    )
-                    self._fused_kv_inv_v_scales = torch.tensor(
-                        inv_v_vals, dtype=torch.float32, device=self.device
-                    )
-
             self._fused_kv_enabled = True
 
             max_total_ctx = self.input_buffers.max_bs * self.spec_num_tokens
@@ -791,10 +767,6 @@ class DFlash(BaseDrafter):
         pool = self.token_to_kv_pool
         if not isinstance(pool, MLATokenToKVPool):
             return decline("the draft KV pool is not an MLA latent pool")
-        if type(pool).set_mla_kv_buffer is not MLATokenToKVPool.set_mla_kv_buffer:
-            # An override adds something this write does not reproduce, and
-            # fusing past it would drop that silently.
-            return decline(f"{type(pool).__name__} overrides the latent write")
         if getattr(pool, "quant_method", "none") == "per_token_head":
             return decline("the latent cache is per-token-head quantized")
 
@@ -1075,14 +1047,7 @@ class DFlash(BaseDrafter):
                 k = attn.apply_k_rope(target_positions, k)
                 k = k.view(-1, attn.num_kv_heads, attn.head_dim)
                 v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-                self.token_to_kv_pool.set_kv_buffer(
-                    attn.attn,
-                    target_cache_locs,
-                    k,
-                    v,
-                    attn.attn.k_scale,
-                    attn.attn.v_scale,
-                )
+                self.token_to_kv_pool.set_kv_buffer(attn.attn, target_cache_locs, k, v)
             return
 
         total_ctx = int(ctx_hidden.shape[0])
@@ -1107,8 +1072,6 @@ class DFlash(BaseDrafter):
             self._fused_kv_num_kv_heads,
             self._fused_kv_head_dim,
             self._fused_kv_rotary_dim,
-            self._fused_kv_inv_k_scales,
-            self._fused_kv_inv_v_scales,
         )
 
     @staticmethod

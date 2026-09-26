@@ -1153,9 +1153,9 @@ class ServerArgs:
             type=str,
             default=ServerArgs.kv_cache_dtype,
             choices=["auto", "bfloat16", "fp8", "fp8_e4m3", "mxfp8"],
-            help='Data type for kv cache storage. "auto" will use model data type. '
-            '"bfloat16" explicitly selects BF16 storage. "fp8" is an alias for '
-            '"fp8_e4m3" (per-tensor scales). "mxfp8" stores '
+            help='Data type for kv cache storage. "auto" and "bfloat16" store BF16 '
+            'rows (fp16 activations convert on write). "fp8" is an alias for '
+            '"fp8_e4m3" (unit scale). "mxfp8" stores '
             "block-scaled fp8-e4m3 (one UE8M0 scale per 32 head_dim elements) and "
             "requires --block-size 128 with an MHA attention backend.",
         )
@@ -1184,9 +1184,8 @@ class ServerArgs:
             type=nullable_str,
             default=None,
             help="Path to the JSON file containing the KV cache "
-            "scaling factors. This should generally be supplied, when "
-            "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
-            "default to 1.0, which may cause accuracy issues. ",
+            "scaling factors. FP8 KV cache runs unscaled, so under FP8 every "
+            "factor in the file must be 1.0.",
         )
         parser.add_argument(
             "--max-model-len",

@@ -112,6 +112,7 @@ def _group_table(backend, raw_rows, bs: int, actual_bs: int) -> torch.Tensor:
         ],
         max_bs=max(bs, 4),
         max_tokens_per_req=backend.spec_num_tokens,
+        max_extend_tokens=0,
         device="cpu",
     )
     raw = torch.tensor(raw_rows, dtype=torch.int32)
@@ -364,7 +365,6 @@ def test_block_decode_hands_the_kernel_one_query_per_block_row() -> None:
         layer_id=0,
         scaling=1.0,
         v_head_dim=_KV_LORA,
-        k_scale_float=None,
     )
     pool = SimpleNamespace(
         get_key_buffer=lambda _lid: torch.zeros(
@@ -392,7 +392,6 @@ def test_block_decode_hands_the_kernel_one_query_per_block_row() -> None:
             out_cache_loc=torch.zeros(bs * spec, dtype=torch.int64),
             token_to_kv_pool=pool,
             bs=bs,
-            save_kv_cache=False,
         )
 
     assert seen["query"].shape == (bs * spec, 1, heads, dim)
