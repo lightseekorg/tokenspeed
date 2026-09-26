@@ -888,10 +888,15 @@ class DeepseekV3AttentionMLA(nn.Module):
             q_nope = q
             Q = absorbed_query
             q_pe = Q[..., self.kv_lora_rank :]
+        # The absorption projection must be per-row batch-invariant under
+        # rl-bitwise: the cuBLAS batched GEMM retiles by the token count.
         bmm(
             q_nope.transpose(0, 1),
             self.w_kc.transpose(1, 2),
             out=Q[..., : self.kv_lora_rank].transpose(0, 1),
+            override=(
+                "aok" if global_server_args_dict["numerics"] == "rl-bitwise" else None
+            ),
         )
         return self.attn_mqa.latent_prologue(
             Q,

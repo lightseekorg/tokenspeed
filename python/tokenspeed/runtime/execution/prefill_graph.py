@@ -425,6 +425,9 @@ class PrefillGraph:
             or self._embed_tokens is None
             or model_runner is None
             or not model_runner.is_generation
+            # The graph's embedding seam takes input_ids alone; an embedding
+            # that reads request-token history stays eager.
+            or model_runner.model_config.requires_request_token_history
             # DP replay decisions must come from replicated state, and a
             # forward's multimodal-ness is rank-local: one rank running its mm
             # prefill eager while text-only peers replay desyncs the EP
@@ -1023,6 +1026,10 @@ class PrefillGraph:
         ib.extend_prefix_lens_cpu[:bs].zero_()
         ib.extend_replay_lens_cpu[:bs].zero_()
         ib.extend_prompt_lens_cpu[:bs].copy_(seq_lens_cpu)
+        ib.input_lengths_buf[:bs].copy_(seq_lens_gpu)
+        ib.prepare_request_token_history_inputs(
+            batch_size=bs, num_extends=bs, decode_width=1
+        )
 
         ctx = ForwardContext(
             attn_backend=self.attn_backend,

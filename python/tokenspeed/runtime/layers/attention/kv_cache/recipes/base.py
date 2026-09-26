@@ -25,7 +25,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from tokenspeed.runtime.layers.attention.configs.base import (
     SoftmaxAttnConfig,
@@ -75,6 +75,9 @@ class CacheRecipe(ABC):
     # Set as a class attribute by every subclass; OrdinaryRecipe takes it per
     # instance because its four families differ by nothing else.
     family: CacheModelFamily
+    # Families whose linear backend verifies speculative rounds from paged
+    # state set this; their ``workspace_bytes`` is that backend's staging.
+    uses_paged_state_verify: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -146,6 +149,7 @@ class CacheRecipe(ABC):
                 else self.workspace_bytes() + memory_plan.arena_bytes
             ),
             fixed_workspace_bytes=self.workspace_bytes(),
+            uses_paged_state_verify=self.uses_paged_state_verify,
         )
 
     # ------------------------------------------------------------------

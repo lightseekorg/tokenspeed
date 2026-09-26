@@ -827,14 +827,14 @@ def setup_runner(
             cwd=cwd,
             dry_run=dry_run,
         )
+    # Runner images normally provide ninja. Avoid refreshing every apt index on
+    # each ephemeral runner when the required executable is already available;
+    # slow package mirrors otherwise hold GPUs idle before task installation.
     shell_run(
-        "sudo apt-get -o Acquire::Retries=5 update -q",
-        env=local_env,
-        cwd=cwd,
-        dry_run=dry_run,
-    )
-    shell_run(
-        "sudo apt-get install -y ninja-build",
+        "if ! command -v ninja >/dev/null 2>&1; then "
+        "sudo apt-get -o Acquire::Retries=5 update -q && "
+        "sudo apt-get install -y ninja-build; "
+        "fi",
         env=local_env,
         cwd=cwd,
         dry_run=dry_run,

@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cuda import (
     chain_speculative_sampling_target_only,
 )
@@ -58,6 +59,7 @@ from tokenspeed.runtime.sampling.utils import (
     coin_eps,
     gather_token_logprobs_torch,
 )
+from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
@@ -323,6 +325,18 @@ class FlashInferSamplingBackend(SamplingBackend):
             offset=offsets,
             deterministic=True,
         )
+        if global_server_args_dict["numerics"] == "rl-bitwise":
+            # The pool route serves greedy rows through the stochastic
+            # kernel, whose top-1 filter resolves EXACT logit ties in
+            # reduction order — run-stable but not batch-invariant. Overlay
+            # the canonical lowest-index argmax on greedy rows; elementwise,
+            # so the graph-captured path stays one path.
+            canonical = sampling_argmax(logits)
+            batch_next_token_ids = torch.where(
+                top_ks == 1,
+                canonical.to(batch_next_token_ids.dtype),
+                batch_next_token_ids,
+            )
 
         bs = logits.shape[0]
         # Land the tokens in the packed output region so both outputs alias

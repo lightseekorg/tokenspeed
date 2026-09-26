@@ -369,7 +369,8 @@ def test_the_probe_support_query_calls_the_factorys_resolvers(monkeypatch) -> No
             ),
         )
         config = SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["DeepseekV41ForCausalLM"])
+            hf_config=SimpleNamespace(architectures=["DeepseekV41ForCausalLM"]),
+            model_profile=None,
         )
         assert registry.cudagraph_probe_supported(args, config) is expected
     assert dict(vars(args)) == before

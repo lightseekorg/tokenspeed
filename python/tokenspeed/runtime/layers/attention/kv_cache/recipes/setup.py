@@ -25,7 +25,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Literal
 
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
@@ -58,19 +57,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
 )
 
-CacheModelFamily = Literal[
-    "mha",
-    "mla",
-    "dsa",
-    "msa",
-    "qwen_gdn",
-    "qwen4_exp",
-    "inkling",
-    "kimi_k3",
-    "glm53_flash",
-    "deepseek_v4",
-    "deepseek_v41",
-]
+# A cache family names one registered recipe and pool factory. The in-tree
+# families are mha, mla, dsa, msa, qwen_gdn, qwen4_exp, inkling, kimi_k3,
+# glm53_flash, deepseek_v4 and deepseek_v41; plugins register their own.
+CacheModelFamily = str
 
 
 @dataclass(frozen=True)
@@ -152,6 +142,9 @@ class CacheSetup:
     num_draft_layers: int
     cache_budget_bytes: int
     fixed_workspace_bytes: int
+    # The linear backend verifies from paged state and owns the planned
+    # ``fixed_workspace_bytes`` of verify staging.
+    uses_paged_state_verify: bool
 
     @property
     def num_target_layers(self) -> int:
@@ -160,7 +153,8 @@ class CacheSetup:
 
 # family -> how to build its recipe. Every family runs the one pipeline in
 # CacheRecipe.setup(); the class only fills in that family's seams, and the
-# four ordinary families differ by nothing but the family label.
+# four ordinary families differ by nothing but the family label. Plugins add
+# families via ``tokenspeed.runtime.plugins.registry.register_cache_recipe``.
 _RECIPES: dict[CacheModelFamily, Callable[..., CacheRecipe]] = {
     "mha": partial(OrdinaryRecipe, family="mha"),
     "mla": partial(OrdinaryRecipe, family="mla"),
