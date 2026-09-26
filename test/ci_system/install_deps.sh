@@ -36,6 +36,8 @@ export C_INCLUDE_PATH="/usr/local/cuda/include/cccl"
 WORKSPACE=${WORKSPACE:-$(pwd)}
 CUDA_REQ="${WORKSPACE}/tokenspeed-kernel/python/requirements/cuda.txt"
 configure_package_cache
+configure_nvcc_cache
+show_nvcc_cache_stats before
 
 # Wrap pip install in a retry loop. PyPI's CDN occasionally returns a
 # bad Content-Type for /simple/<pkg>/ pages (most recently observed for
@@ -188,6 +190,7 @@ cd ${WORKSPACE}
 export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu${CUINDEX}"
 TOKENSPEED_KERNEL_BACKEND=cuda FLASHINFER_CUDA_ARCH_LIST="${FI_ARCH}" \
 pip_install_with_retry pip3 install tokenspeed-kernel/python/ --no-build-isolation -v
+show_nvcc_cache_stats after
 
 # ============================================================
 # Step 5: Install TokenSpeed Scheduler (C++)
