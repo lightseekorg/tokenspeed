@@ -145,9 +145,11 @@ kernels and modules it names.
 Write slots come from `forward_write_locations(layer, mode)`. That is
 `write_locations(layer, mode)`, except for a draft's first step over a MIXED
 round, which carries every row whether it dispatches as MIXED or as decode:
-the round's extend span, then the decode window.
-Per-mode callers, such as MLA models that split a MIXED round, keep using
-`write_locations`.
+the round's extend span, then the decode window. A forward asks for one slot
+per row it carries through `padded_write_locations(layer, mode, rows)`: the
+extend span, then a MIXED round's decode rows, then the dummy slot 0 for the
+padding. Per-mode callers, such as MLA models that split a MIXED round, keep
+using `write_locations`.
 
 A pool describes its destination with `kv_write_target(layer_id, slots,
 write_mask)`: buffers, scale planes and whether the write sanitizes. Pools do
@@ -170,7 +172,10 @@ records the router's persistent extend span, `GroupTableStacks.extend_locs`
 (sized by the largest prefill-graph bucket). A graph-padded forward asks for
 one slot per row it carries (`AttentionBackend.padded_write_locations`); the
 rows past the real tokens land in the dummy slot 0, which the span keeps in
-its tail and which padded decode rows and page-table holes already use.
+its tail and which page-table holes already use. A MIXED round's decode rows
+follow the span in that buffer (`GroupTableStacks.append_decode_rows`), so
+every row of the forward has its slot. A forward wider than the buffer never
+replays a graph, so it gets a fresh padded tensor.
 Padding costs only the masked programs of the tile past the real tokens. Core
 attention stays the eager break (`PagedAttention.attend`). A model that overlaps
 work on an auxiliary stream runs `prologue` inside its fork scope and calls
@@ -185,9 +190,9 @@ segment runs the expanded prefill prologue over every row the forward carries
 up-projection, the rotated per-head query, keys and values, and the latent
 store at the padded span), so the break holds attention only, as for GQA. The
 prefill half attends the leading rows of that output; a MIXED round's decode
-half assembles its absorbed query in the break and rewrites its own rows
-through the DECODE window; a decode round keeps its one-launch absorbed
-prologue in the break. The expanded prologue returns fresh tensors and leaves
+half assembles its absorbed query in the break and rewrites its own rows,
+already stored at their slots by the captured pass, through the DECODE window;
+a decode round keeps its one-launch absorbed prologue in the break. The expanded prologue returns fresh tensors and leaves
 `q` and the latent as given, which the decode half relies on. The gluon
 backend's absorbed cached extend rebuilds its query in the break from those
 untouched inputs and skips the store; its captured expanded pass is spent.

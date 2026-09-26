@@ -206,18 +206,61 @@ class PersistentExtendSpanTest(unittest.TestCase):
         self.assertEqual(stacks.padded_extend_span(FULL, 5).tolist(), span.tolist())
         with self.assertRaisesRegex(ValueError, "cannot pad to 4 rows"):
             stacks.padded_extend_span(FULL, 4)
-        with self.assertRaisesRegex(ValueError, "cannot pad to 9 rows"):
-            stacks.padded_extend_span(FULL, 9)
+        # Past the buffer the forward runs eager: a fresh tensor, zero tail.
+        wide = stacks.padded_extend_span(FULL, 9)
+        self.assertNotEqual(wide.data_ptr(), span.data_ptr())
+        self.assertEqual(wide.tolist(), [36, 37, 38, 12, 13, 0, 0, 0, 0])
 
-    def test_a_span_past_the_buffer_cannot_pad(self):
+    def test_a_span_past_the_buffer_pads_onto_a_fresh_tail(self):
         stacks = self._stacks(capacity=3)
         stacks.extend_locations(
             torch.tensor([4, 0], dtype=torch.int32),
             torch.tensor([3, 2], dtype=torch.int32),
             5,
         )
-        with self.assertRaisesRegex(ValueError, "cannot pad to 8 rows"):
-            stacks.padded_extend_span(FULL, 8)
+        self.assertEqual(
+            stacks.padded_extend_span(FULL, 8).tolist(), [36, 37, 38, 12, 13, 0, 0, 0]
+        )
+        with self.assertRaisesRegex(ValueError, "cannot pad to 4 rows"):
+            stacks.padded_extend_span(FULL, 4)
+
+    def test_a_mixed_round_places_its_decode_rows_after_the_span(self):
+        """Request 0 extends three tokens; request 1 decodes one at slot 14."""
+        stacks = self._stacks(capacity=8)
+        span = stacks.extend_locations(
+            torch.tensor([4], dtype=torch.int32),
+            torch.tensor([3], dtype=torch.int32),
+            3,
+        )[FULL]
+        stacks.decode_locs[0, :2] = torch.tensor([39, 14], dtype=torch.int32)
+        stacks.append_decode_rows(1, 1)
+        padded = stacks.padded_extend_span(FULL, 8)
+        self.assertEqual(padded.data_ptr(), span.data_ptr())
+        self.assertEqual(padded.tolist(), [36, 37, 38, 14, 0, 0, 0, 0])
+        self.assertEqual(stacks.padded_extend_span(FULL, 4).tolist(), [36, 37, 38, 14])
+        with self.assertRaisesRegex(ValueError, "cannot pad to 3 rows"):
+            stacks.padded_extend_span(FULL, 3)
+        # A new pure extend drops the decode rows again.
+        stacks.extend_locations(
+            torch.tensor([4], dtype=torch.int32),
+            torch.tensor([3], dtype=torch.int32),
+            3,
+        )
+        self.assertEqual(stacks.padded_extend_span(FULL, 4).tolist(), [36, 37, 38, 0])
+
+    def test_mixed_decode_rows_past_the_buffer_pad_onto_a_fresh_tail(self):
+        stacks = self._stacks(capacity=3)
+        stacks.extend_locations(
+            torch.tensor([4], dtype=torch.int32),
+            torch.tensor([3], dtype=torch.int32),
+            3,
+        )
+        stacks.decode_locs[0, :2] = torch.tensor([39, 14], dtype=torch.int32)
+        stacks.append_decode_rows(1, 1)
+        self.assertEqual(stacks.padded_extend_span(FULL, 4).tolist(), [36, 37, 38, 14])
+        self.assertEqual(
+            stacks.padded_extend_span(FULL, 6).tolist(), [36, 37, 38, 14, 0, 0]
+        )
 
     def test_a_backend_without_a_padded_span_serves_exact_counts_only(self):
         from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -784,6 +827,16 @@ class CacheGroupRouterTest(unittest.TestCase):
         self.assertEqual(
             router.write_locations(_layer(FULL), ForwardMode.DECODE).tolist(), [39]
         )
+        # The prologue's slots for the whole forward: extend rows, decode rows,
+        # then padding; wider than the (here empty) buffer, so a fresh tensor.
+        self.assertEqual(
+            router.padded_write_locations(_layer(FULL), ForwardMode.MIXED, 6).tolist(),
+            [24, 25, 26, 27, 0, 39],
+        )
+        self.assertEqual(
+            router.padded_write_locations(_layer(FULL), ForwardMode.MIXED, 8).tolist(),
+            [24, 25, 26, 27, 0, 39, 0, 0],
+        )
         router.forward(
             torch.zeros(1),
             torch.zeros(1),
@@ -795,6 +848,29 @@ class CacheGroupRouterTest(unittest.TestCase):
             save_kv_cache=False,
         )
         self.assertEqual(leaves[FULL].calls[-1][2].tolist(), [39])
+
+    def test_a_graph_padded_mixed_round_records_the_persistent_buffer(self):
+        router, _ = self._router(spec=1)
+        router.init_cuda_graph_state(4, max_extend_tokens=8)
+        five, four = (torch.tensor([n], dtype=torch.int32) for n in (5, 4))
+        router.init_forward_metadata(
+            2,
+            1,
+            torch.arange(2, dtype=torch.int32),
+            torch.tensor([9, 4], dtype=torch.int32),
+            ForwardMode.MIXED,
+            block_tables=self._tables(),
+            extend_seq_lens=five,
+            extend_seq_lens_cpu=five.clone(),
+            extend_prefix_lens=four,
+            extend_prefix_lens_cpu=four.clone(),
+            extend_replay_lens_cpu=torch.zeros_like(four),
+            extend_prompt_lens_cpu=four + five,
+            extend_with_prefix=True,
+        )
+        padded = router.padded_write_locations(_layer(FULL), ForwardMode.MIXED, 8)
+        self.assertEqual(padded.tolist(), [24, 25, 26, 27, 0, 39, 0, 0])
+        self.assertEqual(padded.data_ptr(), router.stacks.extend_locs[0].data_ptr())
 
     def test_draft_step_zero_local_decode_writes_the_full_extend_span(self):
         router, leaves = self._router(is_draft=True, spec=1)

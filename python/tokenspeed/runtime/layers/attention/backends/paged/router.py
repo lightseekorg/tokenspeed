@@ -443,9 +443,11 @@ class CacheGroupRouter(AttentionBackend):
     def padded_write_locations(
         self, layer: PagedAttention, forward_mode: ForwardMode, rows: int
     ) -> torch.Tensor:
-        """The extend span padded over the stack buffer's dummy-slot tail to the
-        rows a graph-padded forward carries (a MIXED round's decode rows pad too;
-        its decode half writes them); decode rows carry their own slots."""
+        """The forward's rows padded with the dummy slot 0 to the rows a
+        graph-padded forward carries: the extend span, then a MIXED round's
+        decode rows, then the stack buffer's zero tail; decode rows carry their
+        own slots. A forward wider than the buffer runs eager and gets a fresh
+        tensor."""
         locations = self.forward_write_locations(layer, forward_mode)
         if locations.numel() == rows:
             return locations
@@ -454,6 +456,11 @@ class CacheGroupRouter(AttentionBackend):
                 f"{locations.numel()} {forward_mode.name.lower()} write slots for {rows} rows"
             )
         return self.stacks.padded_extend_span(layer.group_id, rows)
+
+    def _append_decode_rows(self, bs: int, num_extends: int) -> None:
+        """A MIXED round's decode rows follow its extend span in the padded span."""
+        n = self._decode_tokens_per_req
+        self.stacks.append_decode_rows(num_extends * n, (bs - num_extends) * n)
 
     def forward_write_locations(
         self, layer: PagedAttention, forward_mode: ForwardMode
@@ -545,6 +552,7 @@ class CacheGroupRouter(AttentionBackend):
             # sliced.
             self._refresh_decode_locations(bs, seq_lens)
             self._decode_request_offset = num_extends
+            self._append_decode_rows(bs, num_extends)
         for gid, leaf in self.leaves.items():
             leaf.init_forward_metadata(
                 bs,
@@ -588,6 +596,8 @@ class CacheGroupRouter(AttentionBackend):
         # targets).
         self._decode_request_offset = num_extends
         self._refresh_decode_locations(bs, seq_lens)
+        if num_extends and self._extend_write_locations is not None:
+            self._append_decode_rows(bs, num_extends)
         for gid, leaf in self.leaves.items():
             leaf.refresh_decode_metadata(
                 bs,
