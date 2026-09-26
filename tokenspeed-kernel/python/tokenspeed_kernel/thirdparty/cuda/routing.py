@@ -86,7 +86,9 @@ def softplus_sqrt_topk_flash(
     topk_weights: torch.Tensor,
     scaling_factor: float,
     renorm: bool = False,
+    enable_pdl: bool | None = None,
 ) -> None:
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     _load_routing_module().softplus_sqrt_topk_flash(
         input,
         correction_bias,
@@ -94,7 +96,7 @@ def softplus_sqrt_topk_flash(
         topk_weights,
         bool(renorm),
         float(scaling_factor),
-        bool(pdl_enabled()),
+        bool(enable_pdl),
     )
 
 
@@ -106,7 +108,9 @@ def hash_softplus_sqrt_topk_flash(
     topk_weights: torch.Tensor,
     scaling_factor: float,
     renorm: bool = False,
+    enable_pdl: bool | None = None,
 ) -> None:
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     _load_routing_module().hash_softplus_sqrt_topk_flash(
         input,
         input_ids,
@@ -115,5 +119,5 @@ def hash_softplus_sqrt_topk_flash(
         topk_weights,
         bool(renorm),
         float(scaling_factor),
-        bool(pdl_enabled()),
+        bool(enable_pdl),
     )
