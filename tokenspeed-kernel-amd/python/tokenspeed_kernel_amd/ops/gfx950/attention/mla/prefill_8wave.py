@@ -142,6 +142,17 @@ class Prefill8WaveConfig:
             num_warps=NUM_WARPS,
             instr_shape=[32, 32, 64] if IS_FP8 else [32, 32, 16],
         )
+        if IS_FP8:
+            # attention_layouts pairs FP8 P and V at k_width 8, which takes
+            # lane-32 exchanges to form P from the score layout. At k_width 4
+            # each lane's 4 consecutive score columns already are its P
+            # operand, as for 16-bit inputs, and V keeps its 8-byte transposed
+            # LDS reads.
+            p_layout = gl.DotOperandLayout(0, pv_layout, k_width=4)
+            v_layout = gl.DotOperandLayout(1, pv_layout, k_width=4)
+            v_smem_layout = padded_shared_layout(
+                v_layout, [BLOCK_N, HEAD_DIM], KV_DTYPE, is_k_contig=False
+            )
         # Keep each MFMA wave's 32 rows during output narrowing. Only the
         # lane-32 partner exchanges columns to form eight-element stores.
         store_layout = gl.BlockedLayout([1, 8], [32, 2], [NUM_WARPS, 1], [0, 1])
@@ -430,13 +441,12 @@ def _softmax_sum(program, p_first, second, second_half, l_i):
     cfg = program.cfg
     p = _join_columns(_join_columns(p_first, gl.exp2(second)), gl.exp2(second_half))
     l_i = l_i + gl.sum(p, axis=1)
-    # With 16-bit k_width 4 the PV operand matches the score layout register
-    # for register, so the conversion emits no data movement; FP8 (k_width 8)
-    # exchanges columns with the lane-32 partner.
+    # With k_width 4 the PV operand matches the score layout register for
+    # register, so the conversion emits no data movement.
     p = gl.convert_layout(p.to(program.q_ptr.dtype.element_ty), cfg.p_layout)
     if cfg.IS_FP8:
         # Pinning packs four FP8 values per asm operand, which the register
-        # allocator rejects; the lane exchange that forms p keeps it in place.
+        # allocator rejects, so FP8 p stays unpinned.
         return p, l_i
     return _keep_in_cluster(p), l_i
 
