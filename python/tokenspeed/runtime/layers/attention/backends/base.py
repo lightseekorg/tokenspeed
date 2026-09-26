@@ -187,18 +187,31 @@ class AttentionBackend(CachePoolBinding, ABC):
         """Whether the current execution metadata supports a captured forward."""
         return False
 
+    def admits_prefill_graph(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode
+    ) -> bool:
+        """Whether a captured prefill graph can include attention for this shape.
+
+        The question ``prepare_prefill_metadata`` answers on its way to doing
+        the work, asked on its own so a caller can decide before anything is
+        written. Must read no forward context and change nothing.
+        """
+        return False
+
     def prepare_prefill_metadata(
         self, token_capacity: int, bs: int, forward_mode: ForwardMode, *, capture: bool
     ) -> bool:
         """Prepare execution metadata before eager forward or graph replay.
 
         ``capture`` only retains startup buffers at their captured addresses;
-        it must not select different computation. Return whether attention can
-        be included in the outer graph. Other backends keep their existing
-        metadata and attention breaks. Call on the consumer stream, after the
-        scheduler-derived metadata is built and before any layer consumes it.
+        it must not select different computation. Returns the same answer as
+        :meth:`admits_prefill_graph`; the prefill capture raises if an override
+        refuses a shape that query admitted. Other backends keep
+        their existing metadata and attention breaks. Call on the consumer
+        stream, after the scheduler-derived metadata is built and before any
+        layer consumes it.
         """
-        return False
+        return self.admits_prefill_graph(token_capacity, bs, forward_mode)
 
     # ------------------------------------------------------------------
     # Metadata (docs/design/unified_path.md)

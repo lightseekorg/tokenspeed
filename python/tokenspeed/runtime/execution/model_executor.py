@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import gc
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -52,10 +53,11 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
 from tokenspeed.runtime.execution.forward_thread import ForwardThread
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
+from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.nan_guard import NanGuard
-from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+from tokenspeed.runtime.execution.prefill_graph import PrefillGraph, dummy_batch_size
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
@@ -349,6 +351,7 @@ class ModelExecutor:
         self._cache_runtime_contract = token_to_kv_pool.arena.runtime_contract
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
+        self._draft_model_runner = draft_model_runner
         self._draft_final_step_counter = None
         self._pp_wire_logged = False
 
@@ -437,31 +440,7 @@ class ModelExecutor:
             device=self.device,
         )
 
-        attn_backend.configure_runtime(
-            cache_group_specs=tuple(token_to_kv_pool.arena.cache_group_specs),
-            cache_group_page_counts=_cache_arena_attr(
-                token_to_kv_pool, "cache_group_page_counts", None
-            ),
-        )
-        if draft_attn_backend is not None:
-            draft_attn_backend.configure_runtime(
-                cache_group_specs=tuple(
-                    _cache_arena_attr(draft_token_to_kv_pool, "cache_group_specs", ())
-                ),
-                cache_group_page_counts=_cache_arena_attr(
-                    draft_token_to_kv_pool, "cache_group_page_counts", None
-                ),
-            )
-
-        # Storage is the plan's decision: stamp each attention layer's cache
-        # group from the pool and check the group retains what the layer's
-        # mask can see. A block drafter additionally borrows the target's
-        # full-history group -- it writes at the target's cache locations.
-        bind_cache_groups(model_runner.model, token_to_kv_pool)
-        if draft_model_runner is not None and draft_token_to_kv_pool is not None:
-            bind_cache_groups(draft_model_runner.model, draft_token_to_kv_pool)
-            if is_block_drafter(config.spec_algo, is_draft=True):
-                check_block_drafter_storage(draft_model_runner.model, token_to_kv_pool)
+        self._configure_for_pools()
 
         # Backend-declared CUDA-graph support, AND-composed over the target
         # and draft trees (the decode graph records the whole step, drafter
@@ -490,42 +469,8 @@ class ModelExecutor:
         self._active_multimodal_context = None
         self._active_positions_override = None
 
-        self.forward_step = ForwardStepRunner(
-            forward_func=self._forward_step,
-            attn_backend=attn_backend,
-            token_to_kv_pool=token_to_kv_pool,
-            input_buffers=self.input_buffers,
-            config=config,
-            drafter=self.drafter,
-            draft_attn_backend=draft_attn_backend,
-            draft_token_to_kv_pool=draft_token_to_kv_pool,
-            capturable_grammar=self.capturable_grammar,
-            eager_grammar_buffers=self.eager_grammar_buffers,
-            sampling_backend=self.sampling_backend,
-            runtime_states=self.runtime_states,
-            decode_graph_supported=graph_support.decode_graph,
-        )
-        # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
-        # The prefill role never decodes: a DECODE-shaped dummy would need the
-        # verify scratch it does not allocate, and its ranks initialize lazy
-        # collectives together on their first prefill round instead.
-        if config.enforce_eager and not config.prefill_only:
-            logger.info("Prewarming Triton RSAG communication states")
-            self.forward_step.prewarm_comm_states(batch_sizes=(1,))
-            logger.info("Finished prewarming Triton RSAG communication states")
-
-        # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
-        # the decode wrapper above; borrows the decode capture stream so all
-        # graphs share one mempool-reuse domain.
-        self.prefill_graph = PrefillGraph(
-            model_runner=self.model_runner,
-            attn_backend=attn_backend,
-            token_to_kv_pool=token_to_kv_pool,
-            input_buffers=self.input_buffers,
-            config=config,
-            drafter=self.drafter,
-            graph_supported=graph_support.prefill_graph,
-        )
+        self._graph_support = graph_support
+        self._build_graph_owners()
 
         # Encoder graphs are installed before KV-cache sizing and retained by
         # the model runner; preserve the executor-level handle for callers.
@@ -565,27 +510,172 @@ class ModelExecutor:
 
         logger.info("ModelExecutor initialized")
 
-    def capture_graphs(self) -> None:
-        """Tune the kernels, pin the workspace, then capture the graphs.
+    def _configure_for_pools(self) -> None:
+        """Publish the bound pools to the backends and the model's layers."""
+        self.attn_backend.configure_runtime(
+            cache_group_specs=tuple(self.token_to_kv_pool.arena.cache_group_specs),
+            cache_group_page_counts=_cache_arena_attr(
+                self.token_to_kv_pool, "cache_group_page_counts", None
+            ),
+        )
+        if self.draft_attn_backend is not None:
+            self.draft_attn_backend.configure_runtime(
+                cache_group_specs=tuple(
+                    _cache_arena_attr(
+                        self.draft_token_to_kv_pool, "cache_group_specs", ()
+                    )
+                ),
+                cache_group_page_counts=_cache_arena_attr(
+                    self.draft_token_to_kv_pool, "cache_group_page_counts", None
+                ),
+            )
+
+        # Storage is the plan's decision: stamp each attention layer's cache
+        # group from the pool and check the group retains what the layer's
+        # mask can see. A block drafter additionally borrows the target's
+        # full-history group -- it writes at the target's cache locations.
+        bind_cache_groups(self.model_runner.model, self.token_to_kv_pool)
+        draft_runner = self._draft_model_runner
+        if draft_runner is not None and self.draft_token_to_kv_pool is not None:
+            bind_cache_groups(draft_runner.model, self.draft_token_to_kv_pool)
+            if is_block_drafter(self.config.spec_algo, is_draft=True):
+                check_block_drafter_storage(draft_runner.model, self.token_to_kv_pool)
+
+    def release_graphs(self) -> None:
+        """Drop the captured graphs and unfreeze the workspace they pinned.
+
+        A caller that measured a capture releases here before it allocates the
+        replacement arena: a captured graph's private pool is not returned by
+        empty_cache, so it would still hold memory the new arena and the
+        serving capture need. The graphs sit in reference cycles, so the
+        collection is what actually drops them; without it empty_cache returns
+        0.34 GB less on Qwen3-8B.
+        """
+        self.forward_step.release_graphs()
+        self.prefill_graph.release_graphs()
+        if self.drafter is not None:
+            self.drafter.release_prefill_graph()
+        workspace_pool(self.device).unfreeze()
+        gc.collect()
+
+    def set_cache_pool(
+        self,
+        token_to_kv_pool: CachePool,
+        draft_token_to_kv_pool: CachePool | None,
+    ) -> None:
+        """Take a replacement cache pool the backends are already bound to.
+
+        A construction-time operation, after release_graphs: the backends took
+        the pool when it was built, and this republishes what the executor
+        holds itself and rebuilds the graph owners for the new arena.
+        """
+        self.token_to_kv_pool = token_to_kv_pool
+        # A rebind publishes a second pool; it gets the same fail-fast check.
+        validate_scheduler_config(
+            attn_backend=self.attn_backend,
+            kv_pool=token_to_kv_pool,
+        )
+        self._cache_runtime_contract = token_to_kv_pool.arena.runtime_contract
+        self.draft_token_to_kv_pool = draft_token_to_kv_pool
+        if self.drafter is not None:
+            self.drafter.set_cache_pool(draft_token_to_kv_pool)
+        if self.dspark_context_producer is not None:
+            self.dspark_context_producer.set_cache_pool(draft_token_to_kv_pool)
+
+        self._configure_for_pools()
+        self._build_graph_owners()
+
+    def _build_graph_owners(self) -> None:
+        """Build the decode and prefill graph owners for the bound pools.
+
+        A graph owner is built for one pool: a rebind releases its graphs and
+        replaces it rather than re-pointing it at a new arena.
+        """
+        self.forward_step = ForwardStepRunner(
+            forward_func=self._forward_step,
+            attn_backend=self.attn_backend,
+            token_to_kv_pool=self.token_to_kv_pool,
+            input_buffers=self.input_buffers,
+            config=self.config,
+            drafter=self.drafter,
+            draft_attn_backend=self.draft_attn_backend,
+            draft_token_to_kv_pool=self.draft_token_to_kv_pool,
+            capturable_grammar=self.capturable_grammar,
+            eager_grammar_buffers=self.eager_grammar_buffers,
+            sampling_backend=self.sampling_backend,
+            runtime_states=self.runtime_states,
+            decode_graph_supported=self._graph_support.decode_graph,
+        )
+        # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
+        # The prefill role never decodes: a DECODE-shaped dummy would need the
+        # verify scratch it does not allocate, and its ranks initialize lazy
+        # collectives together on their first prefill round instead.
+        if self.config.enforce_eager and not self.config.prefill_only:
+            logger.info("Prewarming Triton RSAG communication states")
+            self.forward_step.prewarm_comm_states(batch_sizes=(1,))
+            logger.info("Finished prewarming Triton RSAG communication states")
+
+        # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
+        # the decode wrapper above; borrows the decode capture stream so all
+        # graphs share one mempool-reuse domain.
+        self.prefill_graph = PrefillGraph(
+            model_runner=self.model_runner,
+            attn_backend=self.attn_backend,
+            token_to_kv_pool=self.token_to_kv_pool,
+            input_buffers=self.input_buffers,
+            config=self.config,
+            drafter=self.drafter,
+            graph_supported=self._graph_support.prefill_graph,
+        )
+
+    def capture_graphs(
+        self,
+        *,
+        entries: int | None,
+        observer: MemoryDeltaObserver,
+    ) -> None:
+        """Pin the workspace, then capture the graphs.
 
         A step of its own, so the caller decides when the graph owners start
         recording the pools' buffers. Construction has already read the pools
         (validation, configure_runtime, bind_cache_groups and the runners'
-        init_cuda_graph_state), so a caller that rebinds between the two
-        re-runs those itself.
+        init_cuda_graph_state), so a rebind between the two re-publishes them
+        through ``set_cache_pool``. Tuning is a separate step, run once per boot:
+        a captured graph keeps the tactic chosen when it was captured, and
+        set_autotune_max_num_tokens must be called once per process.
+        ``entries`` samples each ladder at the probe's positions; ``None``
+        captures every graph.
         """
-        self._autotune()
-
         workspace_pool(self.device).freeze()
 
         if not self.forward_step.disable:
-            self.forward_step.capture()
+            self.forward_step.capture(entries=entries, observer=observer)
         if not self.prefill_graph.disable:
-            self.prefill_graph.capture(self.forward_step)
-            if self.drafter is not None:
-                self.drafter.capture_prefill_graph(self.forward_step.stream)
+            self.prefill_graph.capture(
+                self.forward_step, entries=entries, observer=observer
+            )
+            # Only a drafter that declared the ladder gets a window to fill.
+            if self.captures_drafter_prefill_graph:
+                self.drafter.capture_prefill_graph(
+                    self.forward_step.stream, observer.measure("prefill:drafter")
+                )
 
-    def _autotune(self) -> None:
+    @property
+    def captures_drafter_prefill_graph(self) -> bool:
+        """Whether this boot records a drafter prefill graph beside the ladders.
+
+        One property because the capture and the projection's entry count have
+        to reach the same verdict: declaring a window the capture never fills,
+        or filling one that was never declared, both kill the boot inside
+        ``_estimate_series``.
+        """
+        return (
+            not self.prefill_graph.disable
+            and self.drafter is not None
+            and self.drafter.captures_prefill_graph
+        )
+
+    def autotune(self) -> None:
         """Profile tunable kernels over one dummy prefill before graph capture.
 
         The dummy batch is capped by both the chunked-prefill token budget and
@@ -649,7 +739,7 @@ class ModelExecutor:
             ib.fill_dummy_decode_buffers(
                 batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
             )
-            bs = -(-num_tokens // max(1, int(self.config.context_len)))
+            bs = dummy_batch_size(num_tokens, self.config.context_len)
             ctx = self.prefill_graph.make_dummy_batch(num_tokens, bs)
             positions = (
                 ib.mrope_positions_buf[:, :num_tokens]

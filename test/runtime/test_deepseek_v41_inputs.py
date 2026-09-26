@@ -830,7 +830,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         model_executor.dist, "barrier", lambda: events.append("barrier")
     )
 
-    executor._autotune()
+    executor.autotune()
 
     assert (ib.ngram_previous_tokens_buf == -1).all()
     assert not ib.ngram_token_mask_buf.any()

@@ -122,6 +122,7 @@ def kimi_recipe(
         ),
         draft_attn_config=draft_attn_config,
         cache_budget_bytes=1 << 34,
+        probe_batch_rows=None,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
     )

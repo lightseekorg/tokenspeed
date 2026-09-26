@@ -146,10 +146,10 @@ env:
     tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_m16_add3_auto_matches_composed_and_captures
     tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_gfx1250_large_m_linear_o_proj_shape_matches
     tokenspeed-kernel/test/ops/gemm/test_routed_gemv.py::test_cdna5_route_admits_decode_shapes[7168-1536-17]
-    # Kimi K3 MoE front end: the single-token latent-input decode specialist
-    # under graph replay, prefill sigmoid-bias routing with and without weight
+    # Kimi K3 MoE front end: the latent-input decode pipeline at reduced
+    # scale, prefill sigmoid-bias routing with and without weight
     # normalization, and the fused softmax top-k.
-    tokenspeed-kernel/test/ops/moe/test_latent_input.py::test_gfx1250_latent_input_decode_matches_and_replays
+    tokenspeed-kernel/test/amd/ops/moe/test_gluon_latent_input_gfx1250.py::test_decode_pipeline[sim]
     tokenspeed-kernel/test/amd/ops/test_kimi3_sigmoid_topk_amd.py::test_prefill_sigmoid_bias_topk_matches_torch_and_captures[1.0-False]
     tokenspeed-kernel/test/amd/ops/test_kimi3_sigmoid_topk_amd.py::test_prefill_sigmoid_bias_topk_matches_torch_and_captures[2.5-True]
     tokenspeed-kernel/test/ops/moe/test_softmax_topk.py::test_triton_matches_softmax_topk[2-896-16-dtype4-True]

@@ -117,8 +117,6 @@ class QSAIndexerBackend(AttentionBackend):
 
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         super().validate_cache_pool(cache_pool)
-        if self.cache_pool is not None and self.cache_pool is not cache_pool:
-            raise RuntimeError("QSA indexer backend cannot be rebound to another pool")
         self._table_specs_for(cache_pool)
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:

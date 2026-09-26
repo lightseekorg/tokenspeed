@@ -36,6 +36,7 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter._dflash_fused_kv import (
     _fused_norm_rope_stacked_scatter,
     _get_kv_buffer_ptrs,
+    forget_kv_buffer_ptrs,
 )
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.forward_batch_info import (
@@ -58,6 +59,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.model_runner import ModelRunner
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 
 logger = get_colorful_logger(__name__)
@@ -610,8 +612,17 @@ class DFlash(BaseDrafter):
                 self.token_to_kv_pool,
             )
 
+    def set_cache_pool(self, token_to_kv_pool: CachePool | None) -> None:
+        """The stacked KV views and their raw pointers name the old arena."""
+        super().set_cache_pool(token_to_kv_pool)
+        # Keyed on layer 0, which the replacement arena may be handed again.
+        forget_kv_buffer_ptrs()
+        self._init_fused_kv_helper()
+        # Same order as __init__: the projection reads what the helper resolved.
+        self._init_incremental_proj()
+
     def _init_fused_kv_helper(self) -> None:
-        """Pre-stack KV weights, k_norm, eps, and cos_sin_cache at construction."""
+        """Pre-stack KV weights, k_norm, eps, and cos_sin_cache for the bound pool."""
         self._fused_kv_enabled = False
         self._fused_kv_is_mla = False
         self._fused_kv_workspace_capacity = 0

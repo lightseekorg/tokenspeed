@@ -59,7 +59,7 @@ narrowed row count is rank-local, so the split graph is disabled there.
 from __future__ import annotations
 
 import bisect
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, NamedTuple, Protocol, runtime_checkable
 
@@ -71,10 +71,15 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     active_forward,
 )
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.cudagraph_memory import (
+    CapturedLadder,
+    probe_positions,
+)
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
 )
@@ -181,6 +186,15 @@ def _prefill_bucket_step(size: int) -> int:
     return min(largest_pow2, PREFILL_BUCKET_MAX_STEP)
 
 
+def dummy_batch_size(num_tokens: int, context_len: int) -> int:
+    """Minimum request count for a fabricated extend of ``num_tokens`` tokens.
+
+    Each request holds at most ``context_len`` tokens, and takes one parent
+    block of a capture-time arena.
+    """
+    return -(-num_tokens // max(1, int(context_len)))
+
+
 def resolve_prefill_capture_batch_sizes(
     config: ModelExecutorConfig, token_bucket: int
 ) -> list[int]:
@@ -192,8 +206,7 @@ def resolve_prefill_capture_batch_sizes(
     empty sequences. Invalid configured counts fail before capture. The result
     is sorted and deduplicated; backend support is checked separately.
     """
-    context = max(1, int(config.context_len))
-    minimum = -(-token_bucket // context)
+    minimum = dummy_batch_size(token_bucket, config.context_len)
     maximum = config.max_num_seqs // config.data_parallel_size
     sizes = config.prefill_graph_capture_batch_sizes
     if sizes is None:
@@ -258,6 +271,24 @@ class NarrowingPrefillModel(Protocol):
     def allocate_decoder_state(self, rows: int) -> NarrowedRowState:
         """A zero ``rows``-row state laid out like ``narrowing_forward``'s output."""
         ...
+
+
+def text_and_inner_model(
+    model: torch.nn.Module | None,
+) -> tuple[torch.nn.Module | None, torch.nn.Module | None]:
+    """The text model under a causal-LM wrapper, and the stack under that."""
+    text_model = model.language_model if hasattr(model, "language_model") else model
+    return text_model, getattr(text_model, "model", None)
+
+
+def narrowing_prefill_model(model) -> NarrowingPrefillModel | None:
+    """The narrowing model a prefill capture would drive, or ``None``.
+
+    The protocol is implemented by the inner text model, not the causal-LM
+    wrapper the runner holds, so the wrapper is unwrapped first.
+    """
+    _, inner = text_and_inner_model(model)
+    return inner if isinstance(inner, NarrowingPrefillModel) else None
 
 
 def get_decoder_row_buckets(
@@ -364,10 +395,7 @@ class PrefillGraph:
         # Multimodal seam: models whose multimodal path is embeds-only expose
         # multimodal_input_embeds; others (e.g. deepstack) replay text only.
         self._multimodal_input_embeds = getattr(model, "multimodal_input_embeds", None)
-        self.text_model = (
-            model.language_model if hasattr(model, "language_model") else model
-        )
-        self.inner_model = getattr(self.text_model, "model", None)
+        self.text_model, self.inner_model = text_and_inner_model(model)
         # Embedding runs eagerly OUTSIDE the graphs (see capture); the graphs
         # read a static input-embeds buffer instead of gathering from input_ids.
         self._embed_tokens = getattr(self.inner_model, "embed_tokens", None)
@@ -383,11 +411,7 @@ class PrefillGraph:
         # A narrowing model is captured as encoder + decoder graph families
         # around its eager narrowing stage (module docstring); None means the
         # whole inner forward is one token-shaped capture.
-        self._narrowing: NarrowingPrefillModel | None = (
-            self.inner_model
-            if isinstance(self.inner_model, NarrowingPrefillModel)
-            else None
-        )
+        self._narrowing: NarrowingPrefillModel | None = narrowing_prefill_model(model)
 
         self.capture_buckets = get_prefill_token_buckets(config)
         self.disable = (
@@ -456,10 +480,18 @@ class PrefillGraph:
     # Graph capture
     # ------------------------------------------------------------------
 
-    def capture(self, decode_wrapper: ForwardStepRunner | None = None) -> None:
+    def capture(
+        self,
+        decode_wrapper: ForwardStepRunner | None = None,
+        *,
+        entries: int | None,
+        observer: MemoryDeltaObserver,
+    ) -> None:
         """Capture ordinary and compatible inline variants per token bucket.
 
-        No-op when disabled.
+        No-op when disabled. ``entries`` samples each ladder's buckets at the
+        probe's positions, for a caller that sizes memory from ``observer``,
+        measured around each capture; ``None`` captures every bucket.
 
         ``decode_wrapper`` supplies the shared capture stream (used here only,
         not stored). Buckets share
@@ -501,13 +533,30 @@ class PrefillGraph:
             // max(int(self.config.data_parallel_size), 1),
         )
         with maybe_inference_mode():
-            self._capture_all_buckets(decode_wrapper)
+            self._capture_all_buckets(decode_wrapper, entries, observer)
             if self._narrowing is not None:
-                self._capture_decoders(decode_wrapper)
+                self._capture_decoders(decode_wrapper, entries, observer)
 
-    def _capture_all_buckets(self, decode_wrapper: ForwardStepRunner | None) -> None:
+    def _capture_all_buckets(
+        self,
+        decode_wrapper: ForwardStepRunner | None,
+        entries: int | None,
+        observer: MemoryDeltaObserver,
+    ) -> None:
         rank = self.config.global_rank
-        buckets = sorted(self.capture_buckets, reverse=True)
+        # Off the plan: a bucket it omits is one nothing here can capture.
+        series = "prefill" if self._narrowing is None else "prefill:encoder"
+        ladder = self.capture_ladders(entries)[series]
+        sampled = {ladder.widths[i] for i in ladder.sampled}
+        buckets: list[int] = []
+        inline_counts: dict[int, list[int]] = {}
+        for bucket, bs in self.capture_plan[series]:
+            if bucket not in sampled:
+                continue
+            if bs is None:
+                buckets.append(bucket)
+            else:
+                inline_counts.setdefault(bucket, []).append(bs)
         capture_range = tqdm.tqdm(buckets) if rank == 0 else buckets
         for bucket in capture_range:
             if rank == 0:
@@ -517,8 +566,7 @@ class PrefillGraph:
                 capture_range.set_description(
                     f"Capturing prefill buckets ({bucket=} {avail_mem=:.2f} GB)"
                 )
-            minimum_bs = -(-bucket // max(1, int(self.config.context_len)))
-            batch_sizes = resolve_prefill_capture_batch_sizes(self.config, bucket)
+            minimum_bs = dummy_batch_size(bucket, self.config.context_len)
             self._ctx = self.make_dummy_batch(bucket, minimum_bs)
             self._land_input_embeds(
                 self._embed_tokens(self.input_buffers.input_ids_buf[:bucket]), bucket
@@ -533,28 +581,24 @@ class PrefillGraph:
                         )
                     if self._narrowing is not None:
                         self._encoders[bucket] = self._capture_encoder(
-                            bucket, decode_wrapper
+                            bucket, decode_wrapper, observer.measure("prefill:encoder")
                         )
                     else:
                         self._captures[bucket, None] = self._capture_bucket(
-                            bucket, decode_wrapper
+                            bucket, decode_wrapper, observer.measure("prefill")
                         )
-                # Retain the ordinary graph for mixed/different-count batches.
-                # DP admission must be rank-uniform; keep its existing route.
-                # A narrowing model's attention stays at its breaks: no inline
-                # variants.
-                for bs in (
-                    batch_sizes if self.dp_size == 1 and self._narrowing is None else []
-                ):
+                for bs in inline_counts.get(bucket, ()):
                     self._ctx = self.make_dummy_batch(bucket, bs)
                     with active_forward(self._ctx):
-                        ready = self.attn_backend.prepare_prefill_metadata(
+                        if not self.attn_backend.prepare_prefill_metadata(
                             bucket, bs, self._ctx.forward_mode, capture=True
-                        )
-                        if not ready:
-                            continue
+                        ):
+                            raise RuntimeError(
+                                f"{type(self.attn_backend).__name__} admitted "
+                                f"({bucket}, {bs}) and then refused to prepare it"
+                            )
                         self._captures[bucket, bs] = self._capture_bucket(
-                            bucket, decode_wrapper
+                            bucket, decode_wrapper, observer.measure("prefill")
                         )
             finally:
                 self._ctx = None
@@ -593,7 +637,12 @@ class PrefillGraph:
                     "ordinary captures retained for fallback)",
                 )
 
-    def _capture_decoders(self, decode_wrapper: ForwardStepRunner | None) -> None:
+    def _capture_decoders(
+        self,
+        decode_wrapper: ForwardStepRunner | None,
+        entries: int | None,
+        observer: MemoryDeltaObserver,
+    ) -> None:
         """Capture the narrowing model's decoder stage per decoder-row bucket.
 
         Each bucket gets a static input state of exactly that many rows and a
@@ -608,7 +657,9 @@ class PrefillGraph:
         """
         rank = self.config.global_rank
         per_request = max(1, int(self._narrowing.max_decoder_rows_per_request))
-        buckets = sorted(self.decoder_buckets, reverse=True)
+        # Off the plan, for the same reason the bucket ladder is.
+        ladder = self.capture_ladders(entries)["prefill:decoder"]
+        buckets = [ladder.widths[i] for i in ladder.sampled]
         capture_range = tqdm.tqdm(buckets) if rank == 0 else buckets
         for rows in capture_range:
             if rank == 0:
@@ -644,7 +695,10 @@ class PrefillGraph:
                         )
 
                     self._decoders[rows] = self._capture_decoder(
-                        statics, rearm, decode_wrapper
+                        statics,
+                        rearm,
+                        decode_wrapper,
+                        observer.measure("prefill:decoder"),
                     )
             finally:
                 self._ctx = None
@@ -657,16 +711,97 @@ class PrefillGraph:
                 ", shared across token buckets)",
             )
 
+    @property
+    def capture_plan(self) -> dict[str, list[tuple[int, int | None]]]:
+        """Every graph a full capture records, per ladder, widest first.
+
+        The capture loops iterate this rather than deciding admission as they
+        go, so what a capture records can be read without running one. An
+        inline variant is entered only when the backend admits its shape, the
+        same answer its ``prepare_prefill_metadata`` gives; asked as an extend
+        because ``make_dummy_batch`` fabricates nothing else.
+        The CUDA-graph memory projection counts the same plan, so it cannot
+        price a graph the capture does not record.
+        """
+        if self.disable:
+            return {}
+        buckets = sorted(self.capture_buckets, reverse=True)
+        # Resolved for every bucket: the counts are validated even where unused.
+        counts = {
+            bucket: resolve_prefill_capture_batch_sizes(self.config, bucket)
+            for bucket in buckets
+        }
+        # A narrowing model's attention stays at its breaks: no inline
+        # variants.
+        if self._narrowing is not None:
+            return {
+                "prefill:encoder": [(bucket, None) for bucket in buckets],
+                "prefill:decoder": [
+                    (rows, None) for rows in sorted(self.decoder_buckets, reverse=True)
+                ],
+            }
+        plan: list[tuple[int, int | None]] = []
+        for bucket in buckets:
+            # Retain the ordinary graph for mixed/different-count batches.
+            plan.append((bucket, None))
+            # DP admission must be rank-uniform; keep its existing route.
+            if self.dp_size > 1:
+                continue
+            plan.extend(
+                (bucket, bs)
+                for bs in counts[bucket]
+                if self.attn_backend.admits_prefill_graph(
+                    bucket, bs, ForwardMode.EXTEND
+                )
+            )
+        return {"prefill": plan}
+
+    def capture_ladders(self, entries: int | None) -> dict[str, CapturedLadder]:
+        """Each ladder's entry widths off the plan, and the positions ``entries`` samples.
+
+        A bucket's inline variants are entries at the bucket's width, sampled
+        with it.
+        """
+        ladders = {}
+        for series, graphs in self.capture_plan.items():
+            buckets = [bucket for bucket, bs in graphs if bs is None]
+            sampled = {buckets[i] for i in probe_positions(len(buckets), entries)}
+            ladders[series] = CapturedLadder(
+                [bucket for bucket, _ in graphs],
+                [i for i, (bucket, _) in enumerate(graphs) if bucket in sampled],
+            )
+        return ladders
+
+    def release_graphs(self) -> None:
+        """Drop the captured buckets and the private pool they share.
+
+        The captures recorded the bound cache pool's buffers, so a caller that
+        rebinds releases here first; the next capture allocates a fresh pool.
+        """
+        if self.disable:
+            return
+        self._captures.clear()
+        self._encoders.clear()
+        self._decoders.clear()
+        self._pool = None
+
     def _capture_bucket(
-        self, bucket: int, decode_wrapper: ForwardStepRunner | None
+        self,
+        bucket: int,
+        decode_wrapper: ForwardStepRunner | None,
+        observer: AbstractContextManager[None],
     ) -> tuple[BreakableCapture, CapturedForward]:
-        """Warm up and capture the breakable graph for ``bucket`` from the buffers."""
+        """Warm up and capture the breakable graph for ``bucket`` from the buffers.
+
+        ``observer`` wraps the capture alone: the warmups above it are eager
+        forwards, and what they keep is left to the utilization headroom.
+        """
         for _ in range(self.num_warmup):
             self._run_inner(bucket)
         torch.cuda.synchronize()
         stream = decode_wrapper.stream if decode_wrapper is not None else None
         cap = BreakableCapture(pool=self._pool, stream=stream)
-        with cap:
+        with observer, cap:
             output = CapturedForward(*self._run_inner(bucket))
         if self._pool is None:
             self._pool = cap.pool  # share the pool across all subsequent buckets
@@ -674,7 +809,10 @@ class PrefillGraph:
         return cap, output
 
     def _capture_encoder(
-        self, bucket: int, decode_wrapper: ForwardStepRunner | None
+        self,
+        bucket: int,
+        decode_wrapper: ForwardStepRunner | None,
+        observer: AbstractContextManager[None],
     ) -> CapturedEncoder:
         """Warm up and capture the encoder stage for ``bucket`` from the buffers."""
         for _ in range(self.num_warmup):
@@ -682,7 +820,7 @@ class PrefillGraph:
         torch.cuda.synchronize()
         stream = decode_wrapper.stream if decode_wrapper is not None else None
         cap = BreakableCapture(pool=self._pool, stream=stream)
-        with cap:
+        with observer, cap:
             state = self._run_encoder(bucket)
         if self._pool is None:
             self._pool = cap.pool
@@ -694,6 +832,7 @@ class PrefillGraph:
         statics: NarrowedRowState,
         rearm,
         decode_wrapper: ForwardStepRunner | None,
+        observer: AbstractContextManager[None],
     ) -> CapturedDecoder:
         """Warm up and capture the decoder stage over the static state ``statics``.
 
@@ -709,7 +848,7 @@ class PrefillGraph:
         rearm()
         stream = decode_wrapper.stream if decode_wrapper is not None else None
         cap = BreakableCapture(pool=self._pool, stream=stream)
-        with cap:
+        with observer, cap:
             output = CapturedForward(
                 *self._narrowing.decoder_forward(statics, self._ctx)
             )
