@@ -523,6 +523,54 @@ def mla_normalize_project_query(
     return out, None
 
 
+def mla_prefill_traits(
+    *,
+    batch_size: int,
+    total_q: int,
+    total_kv: int,
+    num_q_heads: int,
+    head_dim: int,
+    value_head_dim: int,
+    is_causal: bool,
+    logit_cap: float,
+    return_lse: bool,
+) -> dict[str, object]:
+    """Build the kernel selection traits for one mla_prefill problem.
+
+    mla_prefill selects with these traits, and callers that pre-select the
+    kernel without tensors, such as benchmark generators, must use the same
+    traits so both pick the same kernel.
+
+    Args:
+        batch_size: Number of sequences.
+        total_q: Query tokens summed over all sequences.
+        total_kv: KV tokens summed over all sequences.
+        num_q_heads: Number of query heads.
+        head_dim: Query/key head dimension.
+        value_head_dim: Value head dimension.
+        is_causal: Whether a causal mask is applied.
+        logit_cap: Soft cap on attention logits; 0.0 means no cap.
+        return_lse: Whether the log-sum-exp values are returned.
+
+    Returns:
+        Traits for select_kernel("attention", "mla_prefill", ...).
+    """
+    return {
+        # Problem size for kernels that declare a qkv_problem_filter. Token
+        # counts are rounded up to a power of two, which bounds the selection
+        # cache while the counts vary from batch to batch.
+        "batch_size": batch_size,
+        "total_q": _round_up_to_power_of_two(total_q),
+        "total_kv": _round_up_to_power_of_two(total_kv),
+        "num_q_heads": num_q_heads,
+        "head_dim": head_dim,
+        "value_head_dim": value_head_dim,
+        "is_causal": is_causal,
+        "logit_cap": logit_cap != 0.0,
+        "return_lse": return_lse,
+    }
+
+
 def mla_prefill(
     # attention inputs
     q: torch.Tensor,
@@ -582,22 +630,20 @@ def mla_prefill(
         Attention output with shape [total_q, num_q_heads, v_head_dim], or
         (output, lse) when return_lse is True.
     """
+    # Problem sizes are read from shapes so selection never syncs and also
+    # works under graph capture.
     batch_size = cu_seqlens_q.shape[0] - 1
-    traits = {
-        # Problem size for kernels that declare a qkv_problem_filter, read from
-        # shapes so selection never syncs and also works under graph capture.
-        # Token counts are rounded up to a power of two, which bounds the
-        # selection cache while the counts vary from batch to batch.
-        "batch_size": batch_size,
-        "total_q": _round_up_to_power_of_two(q.shape[0]),
-        "total_kv": _round_up_to_power_of_two(k.shape[0]),
-        "num_q_heads": q.shape[1],
-        "head_dim": q.shape[-1],
-        "value_head_dim": v.shape[-1],
-        "is_causal": is_causal,
-        "logit_cap": logit_cap != 0.0,
-        "return_lse": return_lse,
-    }
+    traits = mla_prefill_traits(
+        batch_size=batch_size,
+        total_q=q.shape[0],
+        total_kv=k.shape[0],
+        num_q_heads=q.shape[1],
+        head_dim=q.shape[-1],
+        value_head_dim=v.shape[-1],
+        is_causal=is_causal,
+        logit_cap=logit_cap,
+        return_lse=return_lse,
+    )
     signature = _attention_format_signature(q=q, k=k, v=v)
     kernel = select_kernel(
         "attention",
@@ -1234,6 +1280,7 @@ __all__ = [
     "mla_project_value",
     "mla_normalize_project_query",
     "mla_prefill",
+    "mla_prefill_traits",
     "mla_use_absorbed_extend",
     "mla_extend_with_kvcache",
     "supports_mla_decode_query_blocks",
