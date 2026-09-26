@@ -34,9 +34,11 @@ from tokenspeed_kernel.ops.attention.kpool import (
     kpool_prefill_write,
 )
 
+from tokenspeed.runtime.distributed.comm_ops import all_gather_single
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.distributed.comm_backend import Group
     from tokenspeed.runtime.execution.context import ForwardContext
 
 
@@ -83,6 +85,27 @@ class KPoolPrefillTopK:
     kv_seq_lens: torch.Tensor
     max_seq_len: int
     kv_workspace_slots: torch.Tensor
+
+
+def _gather_rows(
+    local: torch.Tensor, row_counts: list[int], group: Group
+) -> torch.Tensor:
+    """All-gather uneven per-rank row slices, padded to the largest for NCCL."""
+    max_rows = max(row_counts)
+    padded = local.contiguous()
+    if local.shape[0] < max_rows:
+        padded = local.new_empty((max_rows, *local.shape[1:]))
+        padded[: local.shape[0]].copy_(local)
+    gathered = local.new_empty((len(row_counts) * max_rows, *local.shape[1:]))
+    all_gather_single(gathered, padded, group)
+    if min(row_counts) == max_rows:
+        return gathered
+    return torch.cat(
+        [
+            gathered[rank * max_rows : rank * max_rows + count]
+            for rank, count in enumerate(row_counts)
+        ]
+    )
 
 
 def dsa_prefill_host_lengths(metadata: Any, num_extends: int) -> tuple[int, int]:
@@ -531,8 +554,15 @@ class KPoolRuntime:
         backend: Any,
         layer_id: int,
         num_prefill_tokens: int,
+        tp_group: Group,
+        tp_rank: int,
+        tp_size: int,
     ) -> KPoolPrefillTopK | None:
-        """Select causal prefill history and return the generic DSA inputs."""
+        """Select causal prefill history and return the generic DSA inputs.
+
+        Query rows are identical across ``tp_group``; for long histories each
+        rank selects a slice of the rows and the results are all-gathered.
+        """
         metadata = backend.chunked_prefill_metadata
         prefix_lens = metadata.extend_prefix_lens[: ctx.num_extends].to(torch.int32)
         extend_lens = metadata.extend_seq_lens[: ctx.num_extends].to(torch.int32)
@@ -564,24 +594,39 @@ class KPoolRuntime:
                 "DSA KPool plan capacity mismatch: "
                 f"plan={positions.numel()}, query_rows={query.shape[0]}"
             )
+        topk_pools = self.index_topk // self.pool_size
+        num_rows = query.shape[0]
+        # Scoring grows with history length while the gather is a fixed cost
+        # per row, so only long histories are split.
+        row_counts = None
+        start, end = 0, num_rows
+        if (
+            tp_size > 1
+            and num_rows >= tp_size
+            and shared_plan.max_num_pools > 2 * topk_pools
+        ):
+            base, extra = divmod(num_rows, tp_size)
+            row_counts = [base + (rank < extra) for rank in range(tp_size)]
+            start = base * tp_rank + min(tp_rank, extra)
+            end = start + row_counts[tp_rank]
         selected_indices, selected_lens = kpool_prefill_topk(
-            query.contiguous(),
+            query[start:end].contiguous(),
             index_cache,
-            weights,
-            positions,
+            weights[start:end],
+            positions[start:end],
             shared_plan.query_start_loc,
             history_table,
             history_table,
             pool_size=self.pool_size,
             page_size=index_cache.shape[1],
             kv_page_size=ctx.token_to_kv_pool.arena.kv_page_size,
-            topk_pools=self.index_topk // self.pool_size,
+            topk_pools=topk_pools,
             softmax_scale=softmax_scale,
-            req_ids=shared_plan.req_ids,
-            causal_lens=shared_plan.causal_lens,
+            req_ids=shared_plan.req_ids[start:end],
+            causal_lens=shared_plan.causal_lens[start:end],
             pool_workspace_slots=shared_plan.pool_workspace_slots,
-            row_starts=shared_plan.row_starts,
-            row_ends=shared_plan.row_ends,
+            row_starts=shared_plan.row_starts[start:end],
+            row_ends=shared_plan.row_ends[start:end],
             max_num_pools=shared_plan.max_num_pools,
             max_logits_bytes=max(
                 1,
@@ -592,6 +637,9 @@ class KPoolRuntime:
             * 1024
             * 1024,
         )
+        if row_counts is not None:
+            selected_indices = _gather_rows(selected_indices, row_counts, tp_group)
+            selected_lens = _gather_rows(selected_lens, row_counts, tp_group)
         workspace_indices = torch.arange(
             selected_indices.numel(),
             dtype=torch.int32,
