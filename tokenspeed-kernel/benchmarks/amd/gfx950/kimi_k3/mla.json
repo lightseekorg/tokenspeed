@@ -1,0 +1,256 @@
+{
+  "schema_version": 1,
+  "common_parameters": {
+    "model_profile": "kimi_k3_tp8",
+    "local_heads": 12,
+    "q_lora_rank": 1536,
+    "kv_lora_rank": 512,
+    "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "v_head_dim": 128,
+    "kv_page_size": 64
+  },
+  "cases": [
+    {
+      "id": "kimi_k3.attention.mla_normalize_project_query/decode-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "mla_normalize_project_query",
+        "parameters": {
+          "tokens": 1,
+          "dtype": "bfloat16",
+          "prepare_absorbed_query": true,
+          "eps": 1e-05
+        },
+        "cold_cache": true,
+        "seed": 4301
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 0.5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.attention.mla_decode_projected_value/decode-4k-float8",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "mla_decode_projected_value",
+        "parameters": {
+          "requests": 1,
+          "rows_per_request": 1,
+          "cache_length": 4608,
+          "max_context_len": 8192,
+          "q_dtype": "float8_e4m3fn",
+          "kv_cache_dtype": "float8_e4m3fn",
+          "output_gate": true
+        },
+        "cold_cache": true,
+        "seed": 4311
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.attention.mla_decode_projected_value/decode-50k-float8",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "mla_decode_projected_value",
+        "parameters": {
+          "requests": [1, 2, 4],
+          "rows_per_request": 1,
+          "cache_length": 50250,
+          "max_context_len": 65536,
+          "q_dtype": "float8_e4m3fn",
+          "kv_cache_dtype": "float8_e4m3fn",
+          "output_gate": true
+        },
+        "cold_cache": true,
+        "seed": 4312
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.attention.mla_decode_projected_value/verify-50k-float8",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "mla_decode_projected_value",
+        "parameters": {
+          "requests": 1,
+          "rows_per_request": 4,
+          "cache_length": 50250,
+          "max_context_len": 65536,
+          "q_dtype": "float8_e4m3fn",
+          "kv_cache_dtype": "float8_e4m3fn",
+          "output_gate": true
+        },
+        "cold_cache": true,
+        "seed": 4313
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.attention.mla_decode_with_kvcache/decode-50k-float8",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "mla_decode_with_kvcache",
+        "parameters": {
+          "requests": [8, 16],
+          "rows_per_request": 1,
+          "cache_length": 50250,
+          "max_context_len": 65536,
+          "q_dtype": "float8_e4m3fn",
+          "kv_cache_dtype": "float8_e4m3fn"
+        },
+        "cold_cache": true,
+        "seed": 4321
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.attention.mla_decode_with_kvcache/verify-50k-float8",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "attention",
+        "mode": "mla_decode_with_kvcache",
+        "parameters": {
+          "requests": [2, 4, 8, 16],
+          "rows_per_request": 4,
+          "cache_length": 50250,
+          "max_context_len": 65536,
+          "q_dtype": "float8_e4m3fn",
+          "kv_cache_dtype": "float8_e4m3fn"
+        },
+        "cold_cache": true,
+        "seed": 4322
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.attention.mla_prefill/causal-tail-float8",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "attention",
+        "mode": "mla_prefill",
+        "parameters": {
+          "batch": 1,
+          "query_tokens_per_sequence": 848,
+          "kv_tokens_per_sequence": 848,
+          "is_causal": true,
+          "return_lse": true,
+          "dtype": "float8_e4m3fn"
+        },
+        "cold_cache": true,
+        "seed": 4331
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 5.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.attention.mla_prefill/causal-4k-float8",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "mla_prefill",
+        "parameters": {
+          "batch": 1,
+          "query_tokens_per_sequence": 4096,
+          "kv_tokens_per_sequence": 4096,
+          "is_causal": true,
+          "return_lse": true,
+          "dtype": "float8_e4m3fn"
+        },
+        "cold_cache": true,
+        "seed": 4332
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 20.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.attention.mla_prefill/causal-8k-float8",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "mla_prefill",
+        "parameters": {
+          "batch": 1,
+          "query_tokens_per_sequence": 8192,
+          "kv_tokens_per_sequence": 8192,
+          "is_causal": true,
+          "return_lse": true,
+          "dtype": "float8_e4m3fn"
+        },
+        "cold_cache": true,
+        "seed": 4333
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 20.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.attention.mla_prefill/prefix-float8",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "mla_prefill",
+        "parameters": {
+          "batch": 1,
+          "query_tokens_per_sequence": 8192,
+          "kv_tokens_per_sequence": [8192, 32768],
+          "is_causal": false,
+          "return_lse": true,
+          "dtype": "float8_e4m3fn"
+        },
+        "cold_cache": true,
+        "seed": 4334
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 20.0,
+        "max_relative_mad": 0.05
+      }
+    }
+  ]
+}

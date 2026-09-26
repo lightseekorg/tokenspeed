@@ -15,7 +15,8 @@
     "gfx950/glm53_flash/dsa.json",
     "gfx950/glm53_flash/moe.json",
     "gfx950/dsv41_flash/gemm.json",
-    "gfx950/kimi_k3/moe.json"
+    "gfx950/kimi_k3/moe.json",
+    "gfx950/kimi_k3/mla.json"
   ],
   "cases": [
     {
