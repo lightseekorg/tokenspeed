@@ -18,17 +18,24 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Medium-M packed BF16 latent input projection on gfx950.
+"""Mid-range packed BF16 latent input projection on gfx950.
 
-One eight-wave workgroup computes a 128x128 output tile. The shared layout
-helpers from the dense16 GEMM give vectorized global-to-LDS copies and padded
-LDS rows for native BF16 MFMA. Three K buffers keep two 64-wide copies in
-flight, and a two-stage warp pipeline alternates the MFMA block with the next
-tile's LDS reads and copy issue. The column tile divides all K3 output regions,
-so one packed weight pass can store router logits as FP32 and the routed
-projection as BF16. Each shared-expert tile reads 64 gate rows and the matching
-64 up rows, so SiTU is applied in the epilogue and no gate/up intermediate or
-second launch is needed.
+Eight-wave workgroups compute 128x128 or 256x128 output tiles. The shared
+layout helpers from the dense16 GEMM give vectorized global-to-LDS copies and
+padded LDS rows for native BF16 MFMA. Three K buffers keep two 64-wide copies
+in flight, and a two-stage warp pipeline alternates the MFMA block with the
+next tile's LDS reads and copy issue. The column tile divides all K3 output
+regions, so one packed weight pass stores router logits as FP32 and the routed
+projection as BF16. Each shared-expert tile reads 64 gate rows and the
+matching 64 up rows, so SiTU is applied in the epilogue and no gate/up
+intermediate or second launch is needed.
+
+The 256-row tile also schedules per XCD: program ids are remapped so the row
+tiles sharing a weight tile share one L2, and each XCD starts its K loop at a
+different eighth of K and wraps around, so the XCDs do not all read the same
+activation columns at the same time. Its leftover K tiles run inside the
+pipeline rather than after the drain. The 128-row tile keeps the plain launch
+order and an unpipelined tail.
 """
 
 from __future__ import annotations
@@ -56,9 +63,15 @@ _K3_TOTAL = _K3_ROUTER + _K3_ROUTED + 2 * _K3_SHARED
 _BLOCK_N = 128
 _BLOCK_K = 64
 _BLOCK_M = 128
-_WARPS_M = 2
-_WARPS_N = 4
+_BLOCK_M_UPPER = 256
+_UPPER_M_THRESHOLD = 640
+# (WARPS_M, WARPS_N) per row tile. The 256-row tile splits rows four ways so
+# each wave reads a 64x64 operand pair from LDS instead of 128x32.
+_WARPS = {_BLOCK_M: (2, 4), _BLOCK_M_UPPER: (4, 2)}
 _NUM_BUFFERS = 3
+# Whether a row tile uses the per-XCD schedule and the pipelined K tail.
+_XCD_SCHEDULE = {_BLOCK_M: False, _BLOCK_M_UPPER: True}
+_NUM_XCDS = 8
 
 
 def _mediumm_launch_metadata(grid, kernel, args):
@@ -73,6 +86,28 @@ def _mediumm_launch_metadata(grid, kernel, args):
         + m * _K3_ROUTED * args["routed_ptr"].element_size()
         + m * _K3_SHARED * args["shared_ptr"].element_size(),
     }
+
+
+@gluon.jit
+def _next_k_tile(
+    k_tile,
+    a_offsets,
+    b_offsets,
+    a_kstep,
+    b_kstep,
+    a_kspan,
+    b_kspan,
+    k_tiles: gl.constexpr,
+    WRAP: gl.constexpr,
+):
+    """Advance the copy offsets one K tile, wrapping from the last to the first."""
+    if not WRAP:
+        return k_tile, a_offsets + a_kstep, b_offsets + b_kstep
+    k_tile += 1
+    wrap = k_tile == k_tiles
+    a_offsets += gl.where(wrap, a_kstep - a_kspan, a_kstep)
+    b_offsets += gl.where(wrap, b_kstep - b_kspan, b_kstep)
+    return gl.where(wrap, 0, k_tile), a_offsets, b_offsets
 
 
 @gluon.jit(launch_metadata=_mediumm_launch_metadata)
@@ -105,12 +140,41 @@ def gluon_latent_input_mediumm_gfx950(
     WARPS_M: gl.constexpr,
     WARPS_N: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
+    XCD_SCHEDULE: gl.constexpr,
 ):
     """Compute one packed output tile with BF16 MFMA and mixed-dtype stores."""
     pid_m = gl.program_id(0)
     pid_n = gl.program_id(1)
+    xcd = 0
+    if XCD_SCHEDULE:
+        # Workgroup w runs on XCD w % NUM_XCDS. Give each XCD a contiguous run
+        # of column tiles with all their row tiles, so each weight tile is
+        # fetched into one XCD's L2 instead of one per row tile.
+        num_m = gl.num_programs(0)
+        num_tiles = num_m * gl.num_programs(1)
+        wid = pid_n * num_m + pid_m
+        xcd = wid % NUM_XCDS
+        per_xcd = (num_tiles + NUM_XCDS - 1) // NUM_XCDS
+        # XCDs at or past the remainder own one fewer tile.
+        rem = num_tiles % NUM_XCDS
+        full = gl.where((rem == 0) | (xcd < rem), xcd, rem)
+        tile = full * per_xcd + (xcd - full) * (per_xcd - 1) + wid // NUM_XCDS
+        pid_m = tile % num_m
+        pid_n = tile // num_m
     num_warps: gl.constexpr = WARPS_M * WARPS_N
-    gload_a: gl.constexpr = _mfma_lds_gload_layout_a(BLOCK_M, BLOCK_K, num_warps)
+    if BLOCK_M == 256 and BLOCK_K == 64:
+        # Extend the 128-row global-load layout with one register row bit.
+        # Its 8 BF16 K values per lane still issue vectorized buffer loads.
+        gload_a: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=[[0, 1], [0, 2], [0, 4], [8, 0], [128, 0]],
+            lane_bases=[[0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0]],
+            warp_bases=[[1, 0], [2, 0], [4, 0]],
+            block_bases=[],
+            shape=[BLOCK_M, BLOCK_K],
+        )
+    else:
+        gload_a: gl.constexpr = _mfma_lds_gload_layout_a(BLOCK_M, BLOCK_K, num_warps)
     gload_b: gl.constexpr = _mfma_lds_gload_layout_b(BLOCK_N, BLOCK_K, num_warps)
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
@@ -168,14 +232,30 @@ def gluon_latent_input_mediumm_gfx950(
     )
     a_kstep = BLOCK_K * stride_ak
     b_kstep = BLOCK_K * stride_bk
+    k_tile = 0
+    if XCD_SCHEDULE:
+        # Start each XCD at its own K tile and wrap at K. Summation order
+        # changes per XCD, but every output tile still adds all K tiles once.
+        k_tile = xcd * (k_tiles // NUM_XCDS)
+        a_offsets += k_tile * a_kstep
+        b_offsets += k_tile * b_kstep
 
     # Fill every buffer; each commit group holds one K tile of A and B.
     for slot in gl.static_range(NUM_BUFFERS):
         async_copy.buffer_load_to_shared(smem_a.index(slot), a_ptr, a_offsets)
         async_copy.buffer_load_to_shared(smem_b.index(slot), b_ptr, b_offsets)
         async_copy.commit_group()
-        a_offsets += a_kstep
-        b_offsets += b_kstep
+        k_tile, a_offsets, b_offsets = _next_k_tile(
+            k_tile,
+            a_offsets,
+            b_offsets,
+            a_kstep,
+            b_kstep,
+            K * stride_ak,
+            K * stride_bk,
+            k_tiles,
+            XCD_SCHEDULE,
+        )
     async_copy.wait_group(NUM_BUFFERS - 1)
     a = async_copy.load_shared_relaxed(smem_a.index(0), dot_a)
     b = async_copy.load_shared_relaxed(smem_b.index(0), dot_b)
@@ -199,29 +279,72 @@ def gluon_latent_input_mediumm_gfx950(
                 async_copy.buffer_load_to_shared(smem_a.index(slot), a_ptr, a_offsets)
                 async_copy.buffer_load_to_shared(smem_b.index(slot), b_ptr, b_offsets)
                 async_copy.commit_group()
-                a_offsets += a_kstep
-                b_offsets += b_kstep
+                k_tile, a_offsets, b_offsets = _next_k_tile(
+                    k_tile,
+                    a_offsets,
+                    b_offsets,
+                    a_kstep,
+                    b_kstep,
+                    K * stride_ak,
+                    K * stride_bk,
+                    k_tiles,
+                    XCD_SCHEDULE,
+                )
 
-    # Drain the tiles already in LDS: slot 0 is in registers, the rest follow.
+    # With the XCD schedule, the refills left after whole rounds run as extra
+    # steps, so the last copies are issued inside the pipeline instead of
+    # after the drain. Otherwise they run unpipelined after it.
+    tail_tiles: gl.constexpr = (k_tiles - NUM_BUFFERS) % NUM_BUFFERS
+    extra_steps: gl.constexpr = tail_tiles if XCD_SCHEDULE else 0
+    for slot in gl.static_range(extra_steps):
+        async_copy.wait_group(NUM_BUFFERS - 2)
+        with gl.amd.warp_pipeline_stage("mfma", priority=0):
+            acc = cdna4.mfma(a, b, acc)
+        with gl.amd.warp_pipeline_stage("mem", priority=1):
+            a = async_copy.load_shared_relaxed(
+                smem_a.index((slot + 1) % NUM_BUFFERS), dot_a
+            )
+            b = async_copy.load_shared_relaxed(
+                smem_b.index((slot + 1) % NUM_BUFFERS), dot_b
+            )
+            async_copy.buffer_load_to_shared(smem_a.index(slot), a_ptr, a_offsets)
+            async_copy.buffer_load_to_shared(smem_b.index(slot), b_ptr, b_offsets)
+            async_copy.commit_group()
+            k_tile, a_offsets, b_offsets = _next_k_tile(
+                k_tile,
+                a_offsets,
+                b_offsets,
+                a_kstep,
+                b_kstep,
+                K * stride_ak,
+                K * stride_bk,
+                k_tiles,
+                XCD_SCHEDULE,
+            )
+
+    # Drain the tiles already in LDS, starting after the slot in registers.
     async_copy.wait_group(0)
-    for slot in gl.static_range(1, NUM_BUFFERS):
+    for i in gl.static_range(1, NUM_BUFFERS):
         acc = cdna4.mfma(a, b, acc)
-        a = async_copy.load_shared_relaxed(smem_a.index(slot), dot_a)
-        b = async_copy.load_shared_relaxed(smem_b.index(slot), dot_b)
+        a = async_copy.load_shared_relaxed(
+            smem_a.index((extra_steps + i) % NUM_BUFFERS), dot_a
+        )
+        b = async_copy.load_shared_relaxed(
+            smem_b.index((extra_steps + i) % NUM_BUFFERS), dot_b
+        )
     acc = cdna4.mfma(a, b, acc)
 
-    # K tiles left over after whole rounds run unpipelined.
-    tail_tiles: gl.constexpr = k_tiles - (main_rounds + 1) * NUM_BUFFERS
-    for slot in gl.static_range(tail_tiles):
-        async_copy.buffer_load_to_shared(smem_a.index(slot), a_ptr, a_offsets)
-        async_copy.buffer_load_to_shared(smem_b.index(slot), b_ptr, b_offsets)
-        async_copy.commit_group()
-        a_offsets += a_kstep
-        b_offsets += b_kstep
-        async_copy.wait_group(0)
-        a = async_copy.load_shared_relaxed(smem_a.index(slot), dot_a)
-        b = async_copy.load_shared_relaxed(smem_b.index(slot), dot_b)
-        acc = cdna4.mfma(a, b, acc)
+    if not XCD_SCHEDULE:
+        for slot in gl.static_range(tail_tiles):
+            async_copy.buffer_load_to_shared(smem_a.index(slot), a_ptr, a_offsets)
+            async_copy.buffer_load_to_shared(smem_b.index(slot), b_ptr, b_offsets)
+            async_copy.commit_group()
+            a_offsets += a_kstep
+            b_offsets += b_kstep
+            async_copy.wait_group(0)
+            a = async_copy.load_shared_relaxed(smem_a.index(slot), dot_a)
+            b = async_copy.load_shared_relaxed(smem_b.index(slot), dot_b)
+            acc = cdna4.mfma(a, b, acc)
 
     if n_start < ROUTER_N:
         # Each lane already holds four consecutive FP32 columns: one dwordx4.
@@ -237,10 +360,10 @@ def gluon_latent_input_mediumm_gfx950(
         # Four consecutive BF16 columns are only a dwordx2, so regroup the
         # tile to eight columns per lane for dwordx4 stores.
         store_layout: gl.constexpr = gl.BlockedLayout(
-            [4, 8], [4, 16], [num_warps, 1], [1, 0]
+            [BLOCK_M // (4 * num_warps), 8], [4, 16], [num_warps, 1], [1, 0]
         )
         gl.static_assert(
-            BLOCK_M == 4 * 4 * num_warps and BLOCK_N == 8 * 16,
+            BLOCK_M % (4 * num_warps) == 0 and BLOCK_N == 8 * 16,
             "the BF16 store layout covers exactly one output tile",
         )
         value = gl.convert_layout(acc.to(gl.bfloat16), store_layout)
@@ -253,12 +376,22 @@ def gluon_latent_input_mediumm_gfx950(
             mask=(pid_m * BLOCK_M + offs_sm < M)[:, None],
         )
     else:
-        # The MFMA layout repeats every WARPS_N * 16 columns, so each lane
-        # holds gate column c and up column c + 64 in its own registers and
-        # the split below pairs them without moving data between lanes.
-        gl.static_assert(WARPS_N * 16 == half_n, "gate and up halves must share lanes")
+        # The MFMA layout repeats every WARPS_N * 16 columns, so when that
+        # divides 64 each lane holds gate column c and up column c + 64 in its
+        # own registers and the split below pairs them without moving data
+        # between lanes.
+        gl.static_assert(
+            half_n % (WARPS_N * 16) == 0, "gate and up halves must share lanes"
+        )
         gate, up = gl.split(
             gl.permute(gl.reshape(acc, [BLOCK_M, 2, half_n]), [0, 2, 1])
+        )
+        shared_layout: gl.constexpr = gl.BlockedLayout(
+            [BLOCK_M // (8 * num_warps), 8], [8, 8], [num_warps, 1], [1, 0]
+        )
+        gl.static_assert(
+            BLOCK_M >= 8 * num_warps and half_n == 8 * 8,
+            "the SiTU store layout covers exactly one output tile",
         )
         # Round to BF16 first, matching the unfused projection's output.
         gate = gate.to(gl.bfloat16).to(gl.float32)
@@ -267,13 +400,6 @@ def gluon_latent_input_mediumm_gfx950(
         situ_gate *= 1.0 / (1.0 + gl.exp(-gate))
         if HAS_LINEAR_BETA:
             up = linear_beta * gl.extra.libdevice.tanh(up * inv_linear_beta)
-        shared_layout: gl.constexpr = gl.BlockedLayout(
-            [2, 8], [8, 8], [num_warps, 1], [1, 0]
-        )
-        gl.static_assert(
-            BLOCK_M == 2 * 8 * num_warps and half_n == 8 * 8,
-            "the SiTU store layout covers exactly one output tile",
-        )
         shared = gl.convert_layout((situ_gate * up).to(gl.bfloat16), shared_layout)
         offs_hm = gl.arange(0, BLOCK_M, gl.SliceLayout(1, shared_layout))
         offs_hn = gl.arange(0, half_n, gl.SliceLayout(0, shared_layout))
@@ -325,9 +451,9 @@ def launch_gluon_latent_input_mediumm_gfx950(
     router = torch.empty((m, _K3_ROUTER), dtype=torch.float32, device=device)
     routed = torch.empty((m, _K3_ROUTED), dtype=torch.bfloat16, device=device)
     shared = torch.empty((m, _K3_SHARED), dtype=torch.bfloat16, device=device)
-    gluon_latent_input_mediumm_gfx950[
-        (triton.cdiv(m, _BLOCK_M), _K3_TOTAL // _BLOCK_N)
-    ](
+    block_m = _BLOCK_M if m <= _UPPER_M_THRESHOLD else _BLOCK_M_UPPER
+    warps_m, warps_n = _WARPS[block_m]
+    gluon_latent_input_mediumm_gfx950[(triton.cdiv(m, block_m), _K3_TOTAL // _BLOCK_N)](
         hidden_states,
         packed_weight,
         router,
@@ -350,13 +476,15 @@ def launch_gluon_latent_input_mediumm_gfx950(
         ROUTED_N=_K3_ROUTED,
         SHARED_N=_K3_SHARED,
         HAS_LINEAR_BETA=linear_beta is not None,
-        BLOCK_M=_BLOCK_M,
+        BLOCK_M=block_m,
         BLOCK_N=_BLOCK_N,
         BLOCK_K=_BLOCK_K,
-        WARPS_M=_WARPS_M,
-        WARPS_N=_WARPS_N,
+        WARPS_M=warps_m,
+        WARPS_N=warps_n,
         NUM_BUFFERS=_NUM_BUFFERS,
-        num_warps=_WARPS_M * _WARPS_N,
+        NUM_XCDS=_NUM_XCDS,
+        XCD_SCHEDULE=_XCD_SCHEDULE[block_m],
+        num_warps=warps_m * warps_n,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
     return router, routed, shared
