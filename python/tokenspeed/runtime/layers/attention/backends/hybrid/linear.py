@@ -91,6 +91,9 @@ class HybridLinearAttnBackend(AttentionBackend):
     def override_num_extends(self, num_extends: int):
         return self.full_attn_backend.override_num_extends(num_extends)
 
+    def forward_sparse_prefill(self, *args, **kwargs):
+        return self.full_attn_backend.forward_sparse_prefill(*args, **kwargs)
+
     def forward_extend_chunked(self, *args, **kwargs):
         return self.full_attn_backend.forward_extend_chunked(*args, **kwargs)
 
@@ -122,6 +125,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             layer, forward_mode
         )
 
+    def cache_placement(self, layer):
+        return self._backend_for_layer(layer.layer_id).cache_placement(layer)
+
     @property
     def cache_consumer_families(self) -> frozenset[str]:
         """Cache families consumed by the two child backends."""
@@ -139,6 +145,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         return self.linear_attn_backend
 
     # ---- Metadata delegation ----
+
+    def configure_runtime(self, **kwargs) -> None:
+        self.full_attn_backend.configure_runtime(**kwargs)
+        self.linear_attn_backend.configure_runtime(**kwargs)
 
     def init_forward_metadata(self, *args, **kwargs):
         self.full_attn_backend.init_forward_metadata(*args, **kwargs)
@@ -179,10 +189,20 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     # ---- Forward dispatch ----
 
+    def admits_prefill_graph(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode
+    ) -> bool:
+        return (
+            self.step_counter is None
+            and self.linear_attn_backend.admits_prefill_graph(
+                token_capacity, bs, forward_mode
+            )
+        )
+
     def prepare_prefill_metadata(
         self, token_capacity: int, bs: int, forward_mode: ForwardMode, *, capture: bool
     ) -> bool:
-        if self.step_counter is not None:
+        if not self.admits_prefill_graph(token_capacity, bs, forward_mode):
             return False
         return self.linear_attn_backend.prepare_prefill_metadata(
             token_capacity, bs, forward_mode, capture=capture

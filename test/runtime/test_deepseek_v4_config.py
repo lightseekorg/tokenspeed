@@ -299,6 +299,7 @@ def _v4_recipe(
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=1 << 34,
+        probe_batch_rows=None,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=0,
     )
@@ -1675,6 +1676,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             server_args = SimpleNamespace(
                 mapping=None,
                 prefix_granularity=prefix_granularity,
+                speculative_algorithm=None,
                 load_format="auto",
                 ext_yaml=None,
             )
@@ -6960,6 +6962,7 @@ def test_v4_pd_recipe_and_readiness_follow_cache_producers():
             ),
         ),
         attn_config=SimpleNamespace(
+            dcp_size=1,
             pd_disaggregation_enabled=True,
             prefix_granularity=256,
             max_bs=2,
@@ -6968,6 +6971,7 @@ def test_v4_pd_recipe_and_readiness_follow_cache_producers():
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=1 << 30,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     ).setup()
@@ -7033,6 +7037,28 @@ def _unbound_deepseek_v4_backend():
 
 
 class DeepseekV4RebindTest(unittest.TestCase):
+    def test_indexer_cache_uses_dcp_topology_but_state_remains_replicated(self):
+        for degree in (1, 4):
+            with self.subTest(degree=degree):
+                backend = _unbound_deepseek_v4_backend()
+                backend.dcp_size = degree
+                pool = _cache_pool_with_page_counts(
+                    {"v4.c4a.indexer_kv": 16, "v4.c4a.indexer_compressor_state": 4},
+                    4,
+                    1,
+                )
+                indexer, state = pool.arena.cache_group_specs
+                indexer.shard_count = degree
+                backend.set_cache_pool(pool)
+                if degree > 1:
+                    indexer.shard_count = 1
+                    with self.assertRaisesRegex(ValueError, "topologies disagree"):
+                        backend.set_cache_pool(pool)
+                    indexer.shard_count = degree
+                    state.shard_count = degree
+                    with self.assertRaisesRegex(ValueError, "topologies disagree"):
+                        backend.set_cache_pool(pool)
+
     def test_dcp_rebind_and_runtime_configuration_retain_virtual_page_bounds(self):
         for degree in (1, 4):
             with self.subTest(degree=degree):

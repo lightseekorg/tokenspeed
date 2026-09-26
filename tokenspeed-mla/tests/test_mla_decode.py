@@ -190,6 +190,28 @@ def test_fp8_workspace_counts_only_nonempty_partitions(kv_len, tile_m, expected_
     assert (splits - 1) * tiles_per_split < k_tiles <= splits * tiles_per_split
 
 
+@pytest.mark.parametrize(
+    "kv_len,min_split_kv,expected_splits",
+    [(6, 8, 1), (384, 8, 3), (1024, 8, 8)],
+)
+def test_fp8_min_split_does_not_create_empty_partitions(
+    kv_len, min_split_kv, expected_splits
+):
+    decode = pytest.importorskip("tokenspeed_mla.mla_decode")
+    splits, _ = decode._get_split_kv_and_workspace_size(
+        32,
+        6,
+        96,
+        512,
+        152,
+        kv_len,
+        torch.float8_e4m3fn,
+        (128, 128),
+        min_split_kv,
+    )
+    assert splits == expected_splits
+
+
 def test_bf16_split_selection_is_unchanged():
     decode = pytest.importorskip("tokenspeed_mla.mla_decode")
     splits, workspace = decode._get_split_kv_and_workspace_size(

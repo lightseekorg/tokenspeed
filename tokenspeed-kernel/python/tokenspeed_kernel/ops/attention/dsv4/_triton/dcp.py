@@ -170,8 +170,10 @@ def _dcp_weight_kernel(
         output + token * os_t + head * os_h + offsets * os_d, offsets < DIM, other=0
     ).to(tl.float32)
     values = tl.where(local_lse == -float("inf"), 0.0, values)
+    # Program IDs already carry int64 address arithmetic. tokens can be the
+    # Python constant 1 under Triton's scalar specialization.
     tl.store(
-        weighted + (head * tokens.to(tl.int64) + token) * DIM + offsets,
+        weighted + (head * tokens + token) * DIM + offsets,
         values * weight,
         offsets < DIM,
     )

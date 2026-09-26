@@ -94,7 +94,7 @@ if platform.is_nvidia and platform.is_blackwell and _fmha_sm100_importable():
         solution="cute_dsl",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 3),
+            max_arch_version=ArchVersion(10, 7),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=_MINIMAX_MSA_CUTE_SIGNATURES,

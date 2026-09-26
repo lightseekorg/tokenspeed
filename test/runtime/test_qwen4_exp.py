@@ -1863,6 +1863,7 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=8 << 20,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )

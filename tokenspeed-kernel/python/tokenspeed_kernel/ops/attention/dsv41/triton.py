@@ -3046,10 +3046,12 @@ def _compressor_metadata(
     N,
     P0: tl.constexpr,
     R0: tl.constexpr,
-    TR: tl.constexpr,
-    TC: tl.constexpr,
-    TS0: tl.constexpr,
-    TS1: tl.constexpr,
+    # Table geometry grows with every prefill chunk; a constexpr here would
+    # recompile the kernel once per chunk.
+    TR,
+    TC,
+    TS0,
+    TS1,
     PAGES: tl.constexpr,
     BLOCK: tl.constexpr,
 ):

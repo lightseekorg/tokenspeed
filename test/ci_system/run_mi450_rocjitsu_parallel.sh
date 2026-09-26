@@ -19,8 +19,39 @@ fi
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # MI450_SIM_WORKERS is a ceiling, not a target. Cap the count at what
 # this runner's CPU allocation can actually feed.
-cores_per_emulator=2
-cores="$(nproc)"
+available_cores() {
+    local quota period
+    if [ -r /sys/fs/cgroup/cpu.max ]; then
+        read -r quota period < /sys/fs/cgroup/cpu.max
+        if [ "${quota}" != "max" ] && [ "${period}" -gt 0 ]; then
+            echo $((quota / period))
+            return
+        fi
+    fi
+    if [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ] \
+        && [ -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]; then
+        quota="$(< /sys/fs/cgroup/cpu/cpu.cfs_quota_us)"
+        period="$(< /sys/fs/cgroup/cpu/cpu.cfs_period_us)"
+        if [ "${quota}" -gt 0 ] && [ "${period}" -gt 0 ]; then
+            echo $((quota / period))
+            return
+        fi
+    fi
+    nproc
+}
+
+threads_per_emulator="${MI450_SIM_THREADS_PER_WORKER:-2}"
+case "${threads_per_emulator}" in
+    "" | *[!0-9]* | 0)
+        echo "MI450_SIM_THREADS_PER_WORKER must be a positive integer" >&2
+        exit 2
+        ;;
+esac
+cores_per_emulator=$((10#${threads_per_emulator}))
+cores="$(available_cores)"
+if [ "${cores}" -lt 1 ]; then
+    cores=1
+fi
 requested_workers="${MI450_SIM_WORKERS:-6}"
 affordable_workers=$((cores / cores_per_emulator))
 if [ "${affordable_workers}" -lt 1 ]; then
@@ -32,7 +63,8 @@ else
     workers="${affordable_workers}"
 fi
 echo "running ${workers} rocJITsu workers" \
-    "(ceiling ${requested_workers}, nproc ${cores})" >&2
+    "(ceiling ${requested_workers}, CPU budget ${cores}," \
+    "${cores_per_emulator} threads per worker)" >&2
 test_root="${MI450_SIM_TEST_ROOT:-tokenspeed-kernel/test}"
 log_dir="${RUNNER_TEMP:-/tmp}/mi450-sim"
 # An emulator that aborts mid-kernel leaves its worker blocked in a HIP call

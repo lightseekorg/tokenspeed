@@ -29,17 +29,17 @@ byte width so no parent is wasted.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from functools import cached_property
 
 import torch
 from typing_extensions import override
 
-from tokenspeed.runtime.layers.attention.configs.linear_attn import (
-    LinearAttnConfig,
-)
+from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheRecipe,
+    kda_verify_scratch_in_pool,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
@@ -84,6 +84,7 @@ class KimiK3Recipe(CacheRecipe):
     """
 
     family = "kimi_k3"
+    uses_paged_state_verify = True
 
     # ---- layer vocabulary ----
 
@@ -166,6 +167,21 @@ class KimiK3Recipe(CacheRecipe):
         return tuple(
             FULL_ATTENTION if group_id == FULL_ATTENTION else LINEAR_ATTENTION
             for group_id in self.group_ids
+        )
+
+    @override
+    def groups(self) -> tuple[CacheGroupDeclaration, ...]:
+        shard_count = self.attn_config.dcp_size
+        return tuple(
+            (
+                (
+                    replace(spec, shard_count=shard_count)
+                    if spec.group_id == FULL_ATTENTION
+                    else spec
+                ),
+                fields,
+            )
+            for spec, fields in super().groups()
         )
 
     # ---- geometry ----
@@ -317,6 +333,10 @@ class KimiK3Recipe(CacheRecipe):
         )
 
     @override
+    def verify_scratch_in_pool(self) -> bool:
+        return kda_verify_scratch_in_pool(self.server_args, self.attn_config)
+
+    @override
     def workspace_bytes(self) -> int:
         """KDA verify staging reserved outside the cache arena."""
         if (
@@ -386,9 +406,27 @@ class KimiK3Recipe(CacheRecipe):
     # ---- capacity: the scheduler's concurrency decides, then a search ----
 
     @override
+    def num_lcm_blocks(self, layout: CacheLayout) -> int:
+        budgeted = self._budgeted_parents(
+            self.cache_budget_bytes - self.workspace_bytes(), layout.lcm_block_bytes
+        )
+        if self.token_limit is None:
+            return budgeted
+        # A token limit caps history, not the unsharded KDA working set.
+        # Use the same per-group demand as the inverse capacity calculation.
+        return min(budgeted, self.parents_needed(layout, self.token_limit))
+
+    @override
     def token_capacity(self, layout: CacheLayout, num_lcm_blocks: int) -> int:
         upper = self.token_limit
         if upper is None:
+            # Search bound in logical tokens, not per-rank physical rows.
+            # parents_needed still accounts for unsharded KDA state/reservations.
             full_packing = dict(layout.group_packing)[FULL_ATTENTION]
-            upper = num_lcm_blocks * full_packing * layout.prefix_granularity
+            upper = (
+                num_lcm_blocks
+                * full_packing
+                * self._shard_counts[FULL_ATTENTION]
+                * layout.prefix_granularity
+            )
         return self._capacity_from_parents(layout, num_lcm_blocks, upper_bound=upper)

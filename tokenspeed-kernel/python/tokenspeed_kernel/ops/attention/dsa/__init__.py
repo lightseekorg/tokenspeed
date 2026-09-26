@@ -142,6 +142,8 @@ def dsa_decode(
 
     Returns:
         Latent DSA attention output, or ``(out, lse)`` when ``return_lse=True``.
+        Partials come back in the query dtype (each context shard is rounded
+        before aggregation); only the LSE stays FP32 for the cross-shard merge.
     """
     if q.dim() == 4:
         batch_size, q_len, num_heads, head_dim = q.shape
@@ -329,6 +331,85 @@ def dsa_prefill(
         )
 
 
+def dsa_index_candidates(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    local_page_table: torch.Tensor,
+    query_requests: torch.Tensor,
+    causal_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    initial_tokens: int,
+    local_tokens: int,
+    solution: str | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score a query tile against owned Index-K pages and select local candidates.
+
+    Query rows carry request IDs and global causal lengths. Page-table columns
+    retain global request order; absent pages are -1. Windows are measured in
+    global token positions. Returns global logical offsets and FP32 scores;
+    invalid candidates use (-1, -inf), mandatory candidates use +inf scores.
+    ``solution=None`` selects the best supported kernel, or force a solution.
+    """
+    if topk <= 0 or topk & (topk - 1):
+        raise ValueError("Index candidate topk must be a positive power of two")
+    if q.ndim != 3 or weights.shape != q.shape[:2]:
+        raise ValueError("Index queries and per-head weights must match")
+    query_requests = query_requests.contiguous()
+    causal_lens = causal_lens.contiguous()
+    if index_k_cache.dtype != torch.uint8:
+        raise TypeError("DSA index candidates require packed FP8 Index-K storage")
+    if initial_tokens < 0 or local_tokens < 0 or initial_tokens + local_tokens > topk:
+        raise ValueError("Forced windows must fit in topk")
+    if query_requests.shape != (q.shape[0],) or causal_lens.shape != (q.shape[0],):
+        raise ValueError("Index candidate rows must match queries")
+    if not local_page_table.shape[0] or not local_page_table.shape[1]:
+        raise ValueError("Index candidates require a nonempty page table")
+    if not q.shape[0]:
+        return (
+            torch.empty((0, topk), device=q.device, dtype=torch.int32),
+            torch.empty((0, topk), device=q.device, dtype=torch.float32),
+        )
+    kernel = select_kernel(
+        "attention",
+        "dsa_index_candidates",
+        _attention_format_signature(q=q, weights=weights),
+        traits={
+            "index_heads": q.shape[1],
+            "head_dim": q.shape[2],
+            "page_size": page_size,
+            "index_k_layout": (
+                "packed"
+                if (
+                    index_k_cache.ndim == 2
+                    and index_k_cache.shape[1] == q.shape[-1] + q.shape[-1] // 128 * 4
+                )
+                else "page_planar"
+            ),
+        },
+        solution=solution,
+    )
+    with kernel_scope(
+        "attention", "dsa_index_candidates", q.dtype, kernel_name=kernel.name
+    ):
+        return kernel(
+            q,
+            weights,
+            index_k_cache,
+            local_page_table,
+            query_requests,
+            causal_lens,
+            page_size=page_size,
+            topk=topk,
+            softmax_scale=softmax_scale,
+            initial_tokens=initial_tokens,
+            local_tokens=local_tokens,
+        )
+
+
 def dsa_prefill_topk(
     q: torch.Tensor,
     weights: torch.Tensor,
@@ -345,6 +426,8 @@ def dsa_prefill_topk(
     q_scales: torch.Tensor | None = None,
     max_logits_bytes: int | None = None,
     candidate_lens_cpu: torch.Tensor | None = None,
+    initial_tokens: int = 0,
+    local_tokens: int = 0,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
     override: str | None = None,
@@ -437,12 +520,26 @@ def dsa_prefill_topk(
             if index_k_cache.ndim == 2 and index_k_cache.shape[1] == row_bytes
             else "page_planar"
         )
+    initial_tokens = int(initial_tokens)
+    local_tokens = int(local_tokens)
+    if initial_tokens < 0 or local_tokens < 0:
+        raise ValueError("initial_tokens and local_tokens must be non-negative")
+    if initial_tokens + local_tokens > int(topk):
+        raise ValueError(
+            "initial_tokens + local_tokens must not exceed topk; got "
+            f"{initial_tokens} + {local_tokens} > {int(topk)}"
+        )
     signature = _attention_format_signature(q=q, weights=weights)
     kernel = select_kernel(
         "attention",
         "dsa_prefill_topk",
         signature,
         traits=traits,
+        features=(
+            frozenset({"forced_initial_local"})
+            if initial_tokens or local_tokens
+            else None
+        ),
         solution=solution,
         override=override,
     )
@@ -483,6 +580,9 @@ def dsa_prefill_topk(
             kernel_kwargs["q_scales"] = q_scales
         if candidate_lens_cpu is not None and kernel.name.startswith("deep_gemm_"):
             kernel_kwargs["candidate_lens_cpu"] = candidate_lens_cpu
+        if initial_tokens or local_tokens:
+            kernel_kwargs["initial_tokens"] = initial_tokens
+            kernel_kwargs["local_tokens"] = local_tokens
         return kernel(**kernel_kwargs)
 
 
@@ -502,6 +602,8 @@ def dsa_decode_topk(
     q_scales: torch.Tensor | None = None,
     seq_lens_2d: torch.Tensor | None = None,
     plan: object | None = None,
+    initial_tokens: int = 0,
+    local_tokens: int = 0,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
     override: str | None = None,
@@ -610,15 +712,27 @@ def dsa_decode_topk(
             if index_k_cache.ndim == 2 and index_k_cache.shape[1] == row_bytes
             else "page_planar"
         )
+    initial_tokens = int(initial_tokens)
+    local_tokens = int(local_tokens)
+    if initial_tokens < 0 or local_tokens < 0:
+        raise ValueError("initial_tokens and local_tokens must be non-negative")
+    if initial_tokens + local_tokens > int(topk):
+        raise ValueError(
+            "initial_tokens + local_tokens must not exceed topk; got "
+            f"{initial_tokens} + {local_tokens} > {int(topk)}"
+        )
+    required_features = set()
+    if topk_layout == "logical_offsets":
+        required_features.add("logical_offsets")
+    if initial_tokens or local_tokens:
+        required_features.add("forced_initial_local")
     signature = _attention_format_signature(q=q, weights=weights)
     kernel = select_kernel(
         "attention",
         "dsa_decode_topk",
         signature,
         traits=traits,
-        features=(
-            frozenset({"logical_offsets"}) if topk_layout == "logical_offsets" else None
-        ),
+        features=frozenset(required_features) if required_features else None,
         solution=solution,
         override=override,
     )
@@ -661,6 +775,9 @@ def dsa_decode_topk(
             kernel_kwargs["block_table_base_offsets"] = block_table_base_offsets
         if q_scales is not None:
             kernel_kwargs["q_scales"] = q_scales
+        if initial_tokens or local_tokens:
+            kernel_kwargs["initial_tokens"] = initial_tokens
+            kernel_kwargs["local_tokens"] = local_tokens
         return kernel(**kernel_kwargs)
 
 

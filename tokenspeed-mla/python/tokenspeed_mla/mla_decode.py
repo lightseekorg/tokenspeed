@@ -84,6 +84,7 @@ def _get_split_kv_and_workspace_size(
     max_seq_len: int,
     torch_dtype: torch.dtype,
     mma_qk_tiler_mn: tuple[int, int],
+    min_split_kv: int = 1,
 ) -> Tuple[int, int]:
     """Return cached split count and workspace bytes for the effective Q layout.
 
@@ -107,6 +108,7 @@ def _get_split_kv_and_workspace_size(
         split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv_simplified(
             B, q_len, max_active_blocks
         )
+    split_kv = max(split_kv, min_split_kv)
     if is_fp8:
         # The occupancy candidate may contain empty final partitions (e.g.
         # 32 splits for only 8 K tiles). Preserve the uniform chunk width while
@@ -117,6 +119,10 @@ def _get_split_kv_and_workspace_size(
     workspace_size = BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
         H, q_len, kv_lora_rank, B, split_kv, cutlass.Float32
     )
+    if min_split_kv > 1 and workspace_size >= 1 << 31:
+        raise ValueError(
+            "min_split_kv requires workspace beyond the Int32 offset limit"
+        )
     return split_kv, workspace_size
 
 
@@ -423,6 +429,8 @@ def tokenspeed_mla_decode(
     cp_rank: int = 0,  # this rank's index in [0, cp_world)
     cp_interleave_size: int = 1,
     enable_packed_q: bool = False,
+    *,
+    min_split_kv: int = 1,
 ) -> torch.Tensor:
     """CuTe DSL MLA decode kernel for SM100, SM103 and SM107.
 
@@ -510,6 +518,10 @@ def tokenspeed_mla_decode(
         M64 and token-gapped Q/output views retain that path even when True.
         Packed split-KV workspace uses ``B * 128 * ceil(H*q_len/128) *
         split_kv * (kv_lora_rank + 1) * 4`` bytes (zero for split_kv=1).
+    min_split_kv : int
+        Minimum number of KV splits used by the decode kernel, in [1, 256].
+        The effective value is capped to avoid creating empty partitions.
+        Defaults to 1, which enables automatic split selection.
 
     Returns
     -------
@@ -517,6 +529,8 @@ def tokenspeed_mla_decode(
         Output tensor [B, q_len, H, kv_lora_rank]. When ``return_lse=True``,
         returns ``(output, lse)`` with ``lse`` of shape [B, q_len, H] (fp32).
     """
+    if type(min_split_kv) is not int or not 1 <= min_split_kv <= 256:
+        raise ValueError("min_split_kv must be an integer in [1, 256]")
     supported_dtypes = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
     assert (
         query.dtype in supported_dtypes
@@ -608,7 +622,18 @@ def tokenspeed_mla_decode(
         max_seq_len,
         q_dtype,
         mma_qk_tiler_mn,
+        min_split_kv,
     )
+
+    # Public FP8 auto-splitting is bounded by 64 (M64) or 32 (M128).
+    # Both values are in the compile cache key, including across batches.
+    reducer_max_splits = 256
+    if is_fp8:
+        reducer_max_splits = 64 if mma_m_tile == 64 else 32
+        if min_split_kv > reducer_max_splits:
+            reducer_max_splits = 64
+        if min_split_kv > 64:
+            reducer_max_splits = 256
 
     # Prepare workspace: slice of contiguous 1D buffer is already contiguous
     assert (
@@ -729,9 +754,7 @@ def tokenspeed_mla_decode(
             if is_fp8
             else 1
         ),
-        # Public FP8 auto-splitting is bounded by 64 (M64) or 32 (M128).
-        # Both values are in the compile cache key, including across batches.
-        reducer_max_splits=(64 if mma_m_tile == 64 else 32) if is_fp8 else 256,
+        reducer_max_splits=reducer_max_splits,
         pack_q=pack_q,
     )
 
