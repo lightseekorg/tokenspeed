@@ -76,9 +76,16 @@ jobs:
         run: |
           work_dir="${{ github.workspace }}/run-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}-${{ matrix.runner }}"
           echo "WORK_DIR=$work_dir" >> "$GITHUB_ENV"
-          # Keep eval dependencies off shared caches that can fill between jobs.
-          # The existing work-directory cleanup also removes this cache.
+          # Keep project dependencies job-local, but reuse EvalScope downloads
+          # from the model cache when the runner provides one.
           if [ "${{ matrix.workflow_stage }}" = "model-test" ]; then
+            evalscope_uv_cache_dir="${EVALSCOPE_UV_CACHE_DIR:-}"
+            if [ -z "$evalscope_uv_cache_dir" ] && [ -n "${HF_HOME:-}" ]; then
+              evalscope_uv_cache_dir="${HF_HOME%/}/.uv-cache/evalscope"
+            fi
+            if [ -n "$evalscope_uv_cache_dir" ]; then
+              echo "EVALSCOPE_UV_CACHE_DIR=$evalscope_uv_cache_dir" >> "$GITHUB_ENV"
+            fi
             echo "UV_CACHE_DIR=$work_dir/.uv-cache" >> "$GITHUB_ENV"
             # Accuracy jobs must be able to compile on full shared volumes.
             # Performance jobs retain their established warm kernel cache.

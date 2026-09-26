@@ -485,6 +485,18 @@ def merge_env(task_env: Dict[str, Any]) -> Dict[str, str]:
     return env
 
 
+def get_stage_command_env(stage_name: str, env: Dict[str, str]) -> Dict[str, str]:
+    """Route evaluation-tool installs to their dedicated package cache."""
+    if stage_name not in {"eval.install", "perf.install"}:
+        return env
+    evalscope_cache = env.get("EVALSCOPE_UV_CACHE_DIR")
+    if not evalscope_cache:
+        return env
+    stage_env = env.copy()
+    stage_env["UV_CACHE_DIR"] = evalscope_cache
+    return stage_env
+
+
 def get_default_runner_env(runner: str) -> Dict[str, str]:
     for prefixes, sm in RUNNER_SM_PREFIXES:
         if runner.startswith(prefixes):
@@ -1957,16 +1969,17 @@ def execute_task(
                     run_perf_diagnostics(
                         "before perf command", runner_env, repo_root, dry_run
                     )
+                command_env = get_stage_command_env(stage_name, runner_env)
                 if pgm is not None:
                     command_result = pgm.run(
                         command,
                         cwd=repo_root,
-                        env=runner_env,
+                        env=command_env,
                         dry_run=dry_run,
                     )
                 else:
                     command_result = shell_run(
-                        command, env=runner_env, cwd=repo_root, dry_run=dry_run
+                        command, env=command_env, cwd=repo_root, dry_run=dry_run
                     )
                 command_result["stage"] = stage_name
                 command_result.update(

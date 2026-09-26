@@ -153,10 +153,14 @@ every ephemeral GPU runner wait on package mirrors before installation.
 
 For model evaluation and performance jobs, the reusable PR task workflow puts
 uv's cache in `.uv-cache` under the job's work directory, overriding an inherited
-shared uv cache. EvalScope dependency installs therefore do not depend on free
-space in a persistent `/cache/uv` volume. The existing always-run work-directory
-cleanup removes the job's uv cache on success or failure. Unit-test, kernel
-benchmark, pip, and release-wheel caches retain their existing policy.
+shared uv cache. The existing always-run work-directory cleanup removes this
+general task cache on success or failure. EvalScope downloads use the dedicated
+`HF_HOME/.uv-cache/evalscope` namespace when a runner provides `HF_HOME`, or an
+explicit `EVALSCOPE_UV_CACHE_DIR` override. Only the `eval.install` and
+`perf.install` stages use this cache, so every job still creates a clean virtual
+environment. Runners without either location continue using the disposable job
+cache. Unit-test, kernel benchmark, pip, and release-wheel caches retain their
+existing policy.
 
 Accuracy jobs also keep Triton's compiled kernels in `.triton-cache` under their
 work directory. Lazy compilation during a request can then write its cache even
