@@ -77,7 +77,7 @@ def test_lamport_rejects_other_payloads(world, shapes, dtype):
 
 
 @pytest.mark.parametrize("enable_lamport", [False, True])
-@pytest.mark.parametrize("rows", [1, 6, 7])
+@pytest.mark.parametrize("rows", [1, 6, 7, 512])
 @pytest.mark.parametrize("reverse", [False, True])
 def test_lamport_dispatch_requires_opt_in(monkeypatch, enable_lamport, rows, reverse):
     from tokenspeed_kernel.ops.communication import iris as iris_ops
@@ -92,9 +92,8 @@ def test_lamport_dispatch_requires_opt_in(monkeypatch, enable_lamport, rows, rev
     state._elements_per_word = (
         state._kernel_config.packed_word_bytes // state.dtype.itemsize
     )
-    state.producer_direct_max_numel = rows * 10752
-    state._input_buf = torch.empty(rows * 10752, dtype=state.dtype)
-    state._reduced_output_buf = torch.empty_like(state._input_buf)
+    state.producer_direct_max_numel = (rows + 8) * 10752
+    state._input_buf = torch.empty(state.producer_direct_max_numel, dtype=state.dtype)
     state._all_reduce_symmetric_lamport = Mock()
     state._all_reduce_symmetric_pull = Mock()
     shapes = ((rows, 3584), (rows, 7168))
@@ -106,11 +105,21 @@ def test_lamport_dispatch_requires_opt_in(monkeypatch, enable_lamport, rows, rev
 
     assert tuple(tuple(tensor.shape) for tensor in outputs) == shapes
     if enable_lamport and rows <= 6:
-        state._all_reduce_symmetric_lamport.assert_called_once_with(rows * 10752)
+        launch = state._all_reduce_symmetric_lamport
         state._all_reduce_symmetric_pull.assert_not_called()
     else:
-        state._all_reduce_symmetric_pull.assert_called_once_with(rows * 10752)
+        launch = state._all_reduce_symmetric_pull
         state._all_reduce_symmetric_lamport.assert_not_called()
+    launch.assert_called_once()
+    (buffer,) = launch.call_args.args
+    assert buffer.numel() == rows * 10752
+    assert buffer.dtype == state.dtype and buffer.device == state.device
+    assert buffer.data_ptr() == outputs[0].data_ptr() != inputs[0].data_ptr()
+    for tensor in outputs:
+        assert tensor.untyped_storage().data_ptr() == buffer.data_ptr()
+        assert (
+            tensor.untyped_storage().nbytes() == buffer.numel() * state.dtype.itemsize
+        )
 
 
 @pytest.mark.parametrize("rank", range(8))
@@ -180,6 +189,7 @@ def _new_state(rank, device, capacity, dtype):
 
     return create_iris_state(
         enable_lamport=True,
+        moe_tail_max_rows=0,
         group=dist.group.WORLD,
         rank_in_group=rank,
         staged_max_numel=0,

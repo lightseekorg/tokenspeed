@@ -34,6 +34,7 @@ from tokenspeed_kernel._triton import (
     tl,
     triton,
 )
+from tokenspeed_kernel.ops.communication._iris.sync import _iris_drain_subgroup_vmem
 
 # iris does plain ``import triton`` at module load time; route those bindings
 # to the vendored ``tokenspeed_triton`` so iris and tokenspeed-kernel share a
@@ -789,6 +790,7 @@ class IrisAllReduce(object):
         attnres_max_numel: int,
         attnres_max_rows: int,
         enable_lamport: bool,
+        moe_tail_max_rows: int,
         dtype: torch.dtype,
         heap_size: int | None,
         device: torch.device | None,
@@ -812,6 +814,7 @@ class IrisAllReduce(object):
         self.attnres_max_numel = attnres_max_numel
         self.attnres_max_rows = attnres_max_rows
         self.enable_lamport = enable_lamport
+        self.moe_tail_max_rows = moe_tail_max_rows
         self.dtype = dtype
         self.device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
         self.world_size = group.size()
@@ -821,6 +824,7 @@ class IrisAllReduce(object):
                 producer_direct_max_numel,
                 attnres_max_numel,
                 attnres_max_rows,
+                moe_tail_max_rows,
             )
             < 0
         ):
@@ -834,6 +838,17 @@ class IrisAllReduce(object):
         staged_config = self._kernel_config.staged
         two_stage_config = self._kernel_config.two_stage
         moe_config = self._kernel_config.kimi_k3_moe
+        if moe_tail_max_rows and not (
+            _platform.is_cdna4
+            and self.world_size == 8
+            and dtype == torch.bfloat16
+            and moe_tail_max_rows <= 8192
+            and moe_tail_max_rows % 8 == 0
+            and moe_tail_max_rows * moe_config.row_numel <= producer_direct_max_numel
+        ):
+            raise ValueError(
+                "K3 MoE result requires TP8 BF16 producer capacity on CDNA4"
+            )
         self._elements_per_word = (
             self._kernel_config.packed_word_bytes // dtype.itemsize
         )
@@ -942,6 +957,12 @@ class IrisAllReduce(object):
                 + flag_numel * torch.int32.itemsize
                 + (16 << 20),
             )
+            # Preserve the base heap's headroom for other collective states.
+            if moe_tail_max_rows:
+                heap_size += (
+                    moe_tail_max_rows * moe_config.hidden_size * dtype.itemsize
+                    + 128 * self.world_size * torch.int32.itemsize
+                )
 
         free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
         self._ctx = _get_or_create_iris_context(heap_size)
@@ -951,6 +972,18 @@ class IrisAllReduce(object):
         self._input_buf = (
             self._ctx.zeros((producer_direct_max_numel,), dtype=dtype)
             if producer_direct_max_numel
+            else None
+        )
+        # Keep the borrowed output separate from producer and collective scratch.
+        # Allocate before cache sizing and graph capture.
+        self._moe_tail_output_buf = (
+            self._ctx.empty((moe_tail_max_rows, moe_config.hidden_size), dtype=dtype)
+            if moe_tail_max_rows
+            else None
+        )
+        self._moe_tail_ready_flags = (
+            self._ctx.zeros((128, self.world_size), dtype=torch.int32)
+            if moe_tail_max_rows
             else None
         )
         self._attnres_push_inbox = (
@@ -971,11 +1004,6 @@ class IrisAllReduce(object):
         self._producer_direct_scratch_buf = (
             self._ctx.zeros((self._producer_direct_scratch_numel,), dtype=dtype)
             if self._producer_direct_scratch_numel
-            else None
-        )
-        self._reduced_output_buf = (
-            torch.empty(producer_direct_max_numel, dtype=dtype, device=self.device)
-            if producer_direct_max_numel
             else None
         )
         self._ready_flags = (
@@ -1302,7 +1330,7 @@ class IrisAllReduce(object):
     def all_reduce_symmetric(
         self, tensors: tuple[torch.Tensor, ...]
     ) -> tuple[torch.Tensor, ...]:
-        """Reduce consecutive producer outputs from symmetric memory."""
+        """Reduce consecutive symmetric inputs into caller-owned local storage."""
         assert self.owns_outputs(tensors)
         if not _platform.is_cdna4:
             raise RuntimeError("producer-direct Iris all-reduce requires CDNA4")
@@ -1319,11 +1347,7 @@ class IrisAllReduce(object):
 
         shapes = tuple(tuple(tensor.shape) for tensor in tensors)
         total_numel = sum(tensor.numel() for tensor in tensors)
-        assert self._reduced_output_buf is not None
-        outputs = self._views(
-            self._reduced_output_buf,
-            shapes,
-        )
+        output = torch.empty(total_numel, dtype=self.dtype, device=self.device)
         if (
             self.enable_lamport
             and _kimi_k3_moe_producer_direct_protocol(
@@ -1331,12 +1355,13 @@ class IrisAllReduce(object):
             )
             == "lamport"
         ):
-            self._all_reduce_symmetric_lamport(total_numel)
+            self._all_reduce_symmetric_lamport(output)
         else:
-            self._all_reduce_symmetric_pull(total_numel)
-        return outputs
+            self._all_reduce_symmetric_pull(output)
+        return self._views(output, shapes)
 
-    def _all_reduce_symmetric_lamport(self, total_numel: int) -> None:
+    def _all_reduce_symmetric_lamport(self, output: torch.Tensor) -> None:
+        total_numel = output.numel()
         config = self._kernel_config.kimi_k3_moe
         assert total_numel <= self._kimi_k3_moe_lamport_max_numel
         assert self._kimi_k3_moe_lamport_region is not None
@@ -1346,7 +1371,7 @@ class IrisAllReduce(object):
         lamport_all_reduce_bf16[(num_programs,)](
             self._input_buf,
             self._kimi_k3_moe_lamport_region,
-            self._reduced_output_buf,
+            output,
             self._kimi_k3_moe_lamport_epochs,
             *self._kimi_k3_moe_lamport_peer_addresses,
             RANK=self._iris_rank,
@@ -1357,7 +1382,8 @@ class IrisAllReduce(object):
             num_warps=config.lamport_num_subgroups,
         )
 
-    def _all_reduce_symmetric_pull(self, total_numel: int) -> None:
+    def _all_reduce_symmetric_pull(self, output: torch.Tensor) -> None:
+        total_numel = output.numel()
         kernel_config = self._kernel_config.producer_direct
         use_two_stage = _use_two_stage_producer_direct(
             world_size=self.world_size,
@@ -1378,7 +1404,7 @@ class IrisAllReduce(object):
             iris_reduce_symmetric_two_stage_gluon_kernel[(num_programs,)](
                 self._input_buf,
                 self._producer_direct_scratch_buf,
-                self._reduced_output_buf,
+                output,
                 self._producer_direct_ready_flags,
                 *self._heap_base_addresses,
                 RANK=self._iris_rank,
@@ -1401,7 +1427,7 @@ class IrisAllReduce(object):
             num_programs = min(num_tiles, kernel_config.one_stage_max_programs)
             iris_reduce_symmetric_gluon_kernel[(num_programs,)](
                 self._input_buf,
-                self._reduced_output_buf,
+                output,
                 self._producer_direct_ready_flags,
                 *self._heap_base_addresses,
                 RANK=self._iris_rank,
@@ -1748,18 +1774,6 @@ def _iris_heap_base(
     if rank == 6:
         return heap_base_6
     return heap_base_7
-
-
-@gluon.jit
-def _iris_drain_subgroup_vmem():
-    gl.inline_asm_elementwise(
-        "s_waitcnt vmcnt(0)",
-        "=r,~{memory}",
-        [],
-        dtype=gl.int32,
-        is_pure=False,
-        pack=1,
-    )
 
 
 @gluon.jit
@@ -3010,6 +3024,7 @@ def create_iris_state(
     attnres_max_numel: int,
     attnres_max_rows: int,
     enable_lamport: bool,
+    moe_tail_max_rows: int,
     dtype: torch.dtype,
     heap_size: int | None,
     device: torch.device | None,
@@ -3024,6 +3039,7 @@ def create_iris_state(
         attnres_max_numel: Maximum fused attention/AttnRes payload.
         attnres_max_rows: Maximum fused attention/AttnRes rows.
         enable_lamport: Allow Lamport for eligible producer-direct payloads.
+        moe_tail_max_rows: Capacity of the borrowed K3 MoE result; zero disables it.
         dtype: Element type for all payload buffers.
         heap_size: Optional symmetric heap size in bytes.
         device: Device on which buffers are allocated.
@@ -3039,6 +3055,7 @@ def create_iris_state(
         attnres_max_numel=attnres_max_numel,
         attnres_max_rows=attnres_max_rows,
         enable_lamport=enable_lamport,
+        moe_tail_max_rows=moe_tail_max_rows,
         dtype=dtype,
         heap_size=heap_size,
         device=device,
@@ -3067,7 +3084,7 @@ def iris_all_reduce_symmetric(
     state: "IrisAllReduce",
     tensors: tuple[torch.Tensor, ...],
 ) -> tuple[torch.Tensor, ...]:
-    """Reduce consecutive symmetric producer outputs in one launch."""
+    """Return caller-owned reductions of consecutive symmetric producer outputs."""
     return state.all_reduce_symmetric(tensors)
 
 
