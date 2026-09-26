@@ -19,7 +19,7 @@ from tokenspeed_kernel.ops.attention.dsa.triton import (
     local_topk_to_global_slots,
     mark_forced_initial_local_logits,
 )
-from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -278,7 +278,7 @@ if platform.is_hopper_plus:
 
         q, weights = _pad_index_heads(q, weights)
         q_2d = q.view(-1, q.shape[-1])
-        q_fp8, q_scale = quantize_fp8_with_scale(
+        q_fp8, q_scale = quantize_fp8(
             q_2d,
             granularity="token_group",
             group_size=128,
@@ -464,7 +464,7 @@ if platform.is_hopper_plus:
 
         q, weights = _pad_index_heads(q, weights)
         q_2d = q.view(-1, q.shape[-1])
-        q_fp8, q_scale = quantize_fp8_with_scale(
+        q_fp8, q_scale = quantize_fp8(
             q_2d,
             granularity="token_group",
             group_size=128,
@@ -614,7 +614,7 @@ if platform.is_hopper_plus:
             page_size,
         )
         q, weights = _pad_index_heads(q.contiguous(), weights)
-        q_fp8, scale = quantize_fp8_with_scale(
+        q_fp8, scale = quantize_fp8(
             q.reshape(-1, q.shape[-1]),
             granularity="token_group",
             group_size=128,

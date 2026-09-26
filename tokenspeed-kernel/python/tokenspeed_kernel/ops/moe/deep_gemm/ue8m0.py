@@ -95,7 +95,7 @@ def per_token_group_quant_fp8_ue8m0(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``x`` to FP8 against power-of-two per-group scales.
 
-    The repo's ``per_token_group_quant_fp8`` can emit UE8M0 scales only in the
+    The generic FP8 quantizer can emit UE8M0 scales only in the
     packed-int32 TMA layout, which cannot be sent over DeepEP's normal dispatch
     (it requires ``[tokens, groups]`` FP32). This returns that layout instead,
     with power-of-two values.

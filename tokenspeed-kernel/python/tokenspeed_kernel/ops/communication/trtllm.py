@@ -24,14 +24,50 @@ from ctypes import c_void_p
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.gemm.fp8_utils import (
-    create_per_token_group_quant_fp8_output_scale,
-)
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import ErrorClass, error_fn, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 logger = logging.getLogger(__name__)
+
+
+def create_per_token_group_quant_fp8_output_scale(
+    x_shape,
+    device,
+    group_size: int,
+    column_major_scales: bool,
+    scale_tma_aligned: bool,
+    scale_ue8m0: bool,
+):
+    if scale_ue8m0:
+        if len(x_shape) != 2 or group_size != 128:
+            raise ValueError("packed E8M0 scales require 2-D 1x128 input groups")
+        rows, columns = x_shape
+        aligned_rows = (rows + 3) // 4 * 4
+        packed_columns = (columns // group_size + 3) // 4
+        base = torch.zeros(
+            (packed_columns, aligned_rows), device=device, dtype=torch.int32
+        )
+        return base.transpose(-1, -2)[:rows, :]
+    if column_major_scales:
+        if scale_tma_aligned:
+            aligned_rows = (x_shape[-2] + 3) // 4 * 4
+            return torch.empty(
+                x_shape[:-2] + (x_shape[-1] // group_size, aligned_rows),
+                device=device,
+                dtype=torch.float32,
+            ).permute(-1, -2)[: x_shape[-2], :]
+        return torch.empty(
+            (x_shape[-1] // group_size,) + x_shape[:-1],
+            device=device,
+            dtype=torch.float32,
+        ).permute(-1, -2)
+    return torch.empty(
+        x_shape[:-1] + (x_shape[-1] // group_size,),
+        device=device,
+        dtype=torch.float32,
+    )
 
 
 __all__ = [
@@ -610,14 +646,10 @@ if current_platform().is_nvidia:
             partial_norm_out = norm_out[start : start + counts[rank]].contiguous()
 
         if block_quant_fp8:
-            from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
-
-            quant_out, scale_out = per_token_group_quant_fp8(
+            quant_out, scale_out = quantize_fp8(
                 norm_out,
+                granularity="token_group",
                 group_size=128,
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=False,
             )
             return quant_out, residual_out, scale_out, partial_norm_out
         return norm_out, residual_out, None, partial_norm_out

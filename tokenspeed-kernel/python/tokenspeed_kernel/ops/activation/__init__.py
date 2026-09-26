@@ -28,7 +28,6 @@ from tokenspeed_kernel.ops.activation.triton import (
 )
 from tokenspeed_kernel.ops.activation.triton import silu_and_mul as triton_silu_and_mul
 from tokenspeed_kernel.ops.activation.triton import situ_and_mul as triton_situ_and_mul
-from tokenspeed_kernel.ops.gemm import _fp8_linear_activation
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import error_fn
 
@@ -53,44 +52,6 @@ def silu_and_mul(
     return flashinfer_silu_and_mul(x, out, enable_pdl=pdl_enabled())
 
 
-def prepare_fp8_linear_activation(
-    plan: object,
-    x: torch.Tensor,
-    *,
-    activation: str,
-    limit: float | None = None,
-    alpha: float = 1.0,
-    beta: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Prepare an activation for a compatible block-FP8 linear plan.
-
-    The prepared linear implementation decides whether it can fuse activation
-    and quantization. ``None`` means the caller must evaluate the activation
-    normally and invoke the linear operation through its ordinary path.
-
-    Args:
-        plan: Opaque plan returned by the GEMM layer's ``prepare_fp8_linear``.
-        x: Input to the activation.
-        activation: Semantic activation name, currently ``"swiglu"``.
-        limit: Optional activation clamp limit.
-        alpha: Sigmoid multiplier for SwiGLU.
-        beta: Value added to SwiGLU's up branch.
-
-    Returns:
-        Prepared FP8 values and scales, or ``None`` when no fused contract is
-        available.
-    """
-    return _fp8_linear_activation(
-        plan,
-        x,
-        activation=activation,
-        limit=limit,
-        alpha=alpha,
-        beta=beta,
-        enable_pdl=pdl_enabled(),
-    )
-
-
 def situ_and_mul(
     x: torch.Tensor,
     out: torch.Tensor | None = None,
@@ -110,7 +71,6 @@ def situ_and_mul(
 
 __all__ = [
     "add3",
-    "prepare_fp8_linear_activation",
     "silu_and_mul",
     "situ_and_mul",
 ]

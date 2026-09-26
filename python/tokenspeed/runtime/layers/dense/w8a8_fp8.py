@@ -22,10 +22,7 @@ from __future__ import annotations
 
 import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.gemm.fp8_utils import (
-    per_token_group_quant_fp8,
-    per_token_quant_fp8,
-)
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.parameter import (
@@ -51,8 +48,9 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
         else:
             # use per-channel quantization on weight
-            qweight, weight_scale = per_token_group_quant_fp8(
-                layer.weight, layer.weight.shape[-1]
+            qweight, weight_scale = quantize_fp8(
+                layer.weight,
+                granularity="token",
             )
             weight_scale = weight_scale.t().contiguous()
 
@@ -116,7 +114,7 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         input_2d = input.view(-1, input.shape[-1])
         output_shape = [*input.shape[:-1], weight.shape[1]]
 
-        qinput, x_scale = per_token_quant_fp8(input_2d)
+        qinput, x_scale = quantize_fp8(input_2d, granularity="token")
 
         qinput = qinput.view(-1, qinput.shape[-1])
 

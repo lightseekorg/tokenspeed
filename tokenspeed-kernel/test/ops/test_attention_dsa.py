@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.attention.dsa.triton import (
     workspace_topk_to_global_slots as dsa_workspace_topk_to_global_slots,
 )
 from tokenspeed_kernel.ops.attention.dsv4 import dsv4_plan
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 torch.manual_seed(42)
 
@@ -735,7 +736,6 @@ def test_dsa_sharded_index_candidates_global_windows(device, degree):
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
 def test_deep_gemm_sharded_index_candidates_global_windows(device, degree):
     from tokenspeed_kernel.ops.attention.dsa import dsa_index_candidates
-    from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
     from tokenspeed_kernel.platform import current_platform
 
     if not current_platform().is_hopper_plus:
@@ -755,7 +755,7 @@ def test_deep_gemm_sharded_index_candidates_global_windows(device, degree):
         torch.randn(10 * page_size, dim, device=device), page_size
     )
     logical_k = dequant.reshape(10, page_size, dim)[table[0].long()].reshape(-1, dim)
-    quantized, scales = quantize_fp8_with_scale(
+    quantized, scales = quantize_fp8(
         q.reshape(-1, dim),
         granularity="token_group",
         group_size=128,

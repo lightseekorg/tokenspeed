@@ -23,20 +23,10 @@
 # SOFTWARE.
 
 
-import logging
-
-import tokenspeed_kernel
 import torch
-from tokenspeed_kernel import fp8_linear, prepare_fp8_linear
-from tokenspeed_kernel.ops.gemm.fp8_utils import (
-    per_block_quant_fp8,
-    per_token_group_quant_fp8,
-    per_token_quant_fp8,
-    static_quant_fp8,
-)
+from tokenspeed_kernel.ops.gemm import mm
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from torch.nn.parameter import Parameter
-
-logger = logging.getLogger(__name__)
 
 from tokenspeed.runtime.layers.parameter import (
     BlockQuantScaleParameter,
@@ -50,22 +40,7 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 class Fp8LinearMethod(LinearMethodBase):
-    """Linear method for FP8.
-    Supports loading FP8 checkpoints with static weight scale and
-    dynamic/static activation scale.
-
-    Also supports loading quantized FP16/BF16 model checkpoints with dynamic
-    activation scaling. The weight scaling factor will be initialized after
-    the model weights are loaded.
-
-    Limitations:
-    1. Only support per-tensor quantization due to torch._scaled_mm support.
-    2. Only support float8_e4m3fn data type due to the limitation of
-       torch._scaled_mm (https://github.com/pytorch/pytorch/blob/2e48b39603411a41c5025efbe52f89560b827825/aten/src/ATen/native/cuda/Blas.cpp#L854-L856)
-
-    Args:
-        quant_config: The quantization config.
-    """
+    """Load FP8 weights and execute linear layers through quantize_fp8 and mm."""
 
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
@@ -192,55 +167,25 @@ class Fp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.block_quant:
             if not self.quant_config.is_checkpoint_fp8_serialized:
-                qweight, weight_scale = per_block_quant_fp8(
-                    layer.weight.data, self.quant_config.weight_block_size
+                qweight, weight_scale = quantize_fp8(
+                    layer.weight.data,
+                    granularity="block",
+                    block_size=self.quant_config.weight_block_size,
                 )
                 layer.weight = Parameter(qweight, requires_grad=False)
                 layer.register_parameter(
                     "weight_scale_inv", Parameter(weight_scale, requires_grad=False)
                 )
                 layer.input_scale = None
-            grouped_output_projection_plan = getattr(
-                layer, "_dsv4_grouped_output_projection_plan", None
-            )
-            if grouped_output_projection_plan is not None:
-                layer.weight_scale_inv.data = (
-                    tokenspeed_kernel.dsv4_grouped_output_projection_process_weights(
-                        grouped_output_projection_plan,
-                        layer.weight.data,
-                        layer.weight_scale_inv.data,
-                    )
-                )
-                return
-            # This opt-in applies across models, but only to the standard
-            # 128x128 block-FP8 contract. Specialized/grouped projections,
-            # MXFP8 and per-tensor FP8 keep their existing implementations.
-            backend = global_server_args_dict["dense_gemm_backend"]
-            if backend == "trtllm_cutedsl" and tuple(
-                self.quant_config.weight_block_size
-            ) == (128, 128):
-                layer._prepared_fp8_linear = (
-                    tokenspeed_kernel.prepare_trtllm_cutedsl_fp8_linear(
-                        layer.weight.data,
-                        layer.weight_scale_inv.data,
-                        self.quant_config.weight_block_size,
-                    )
-                )
-                return
-            layer._prepared_fp8_linear = prepare_fp8_linear(
-                layer.weight.data,
-                layer.weight_scale_inv.data,
-                self.quant_config.weight_block_size,
-                scale_format=getattr(self.quant_config, "scale_fmt", None),
-            )
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
             # If checkpoint not serialized fp8, quantize the weights.
             if not self.quant_config.is_checkpoint_fp8_serialized:
                 # apply per-channel quantization default as
-                qweight, weight_scale = per_token_group_quant_fp8(
-                    layer.weight, layer.weight.shape[-1]
+                qweight, weight_scale = quantize_fp8(
+                    layer.weight,
+                    granularity="token",
                 )
                 weight_scale = weight_scale.t().contiguous()
 
@@ -298,28 +243,37 @@ class Fp8LinearMethod(LinearMethodBase):
             input_2d = x.view(-1, x.shape[-1])
             output_shape = [*x.shape[:-1], layer.weight.shape[0]]
             output_dtype = output_dtype or x.dtype
-            plan = getattr(layer, "_prepared_fp8_linear", None)
-            if plan is None:
-                output = tokenspeed_kernel.mm(
-                    input_2d,
-                    layer.weight,
-                    A_scales=block_scale,
-                    B_scales=layer.weight_scale_inv,
-                    bias=bias,
-                    out_dtype=output_dtype,
-                    quant="mxfp8",
-                    block_size=self.quant_config.weight_block_size,
+            if block_scale is None:
+                scale_encoding = (
+                    "ue8m0"
+                    if layer.weight_scale_inv.dtype == torch.uint8
+                    else "float32"
                 )
-            else:
-                output = fp8_linear(
-                    plan,
+                input_2d, block_scale = quantize_fp8(
                     input_2d,
-                    layer.weight,
-                    layer.weight_scale_inv,
-                    input_scales=block_scale,
-                    bias=bias,
-                    out_dtype=output_dtype,
+                    granularity="token_group",
+                    group_size=self.quant_config.weight_block_size[1],
+                    scale_encoding=scale_encoding,
                 )
+            solution = None
+            if global_server_args_dict[
+                "dense_gemm_backend"
+            ] == "trtllm_cutedsl" and tuple(self.quant_config.weight_block_size) == (
+                128,
+                128,
+            ):
+                solution = "trtllm_cutedsl"
+            output = mm(
+                input_2d,
+                layer.weight,
+                A_scales=block_scale,
+                B_scales=layer.weight_scale_inv,
+                bias=bias,
+                out_dtype=output_dtype,
+                quant="mxfp8",
+                block_size=self.quant_config.weight_block_size,
+                solution=solution,
+            )
             return output.to(dtype=output_dtype).view(*output_shape)
         else:
             input = x
@@ -336,13 +290,13 @@ class Fp8LinearMethod(LinearMethodBase):
                     raise ValueError(
                         f"input_scale must contain exactly one value, got {input_scale.numel()}."
                     )
-                qinput, x_scale = static_quant_fp8(input_2d, input_scale)
+                qinput, x_scale = quantize_fp8(input_2d, scale=input_scale)
             else:
-                qinput, x_scale = per_token_quant_fp8(input_2d)
+                qinput, x_scale = quantize_fp8(input_2d, granularity="token")
 
             qinput = qinput.view(-1, qinput.shape[-1])
 
-            output = tokenspeed_kernel.mm(
+            output = mm(
                 qinput,
                 weight,
                 A_scales=x_scale,
@@ -353,28 +307,3 @@ class Fp8LinearMethod(LinearMethodBase):
             if bias is not None:
                 output = output + bias
             return output.view(*output_shape)
-
-    def apply_with_activation(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        activation: torch.nn.Module,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        plan = getattr(layer, "_prepared_fp8_linear", None)
-        prepare_activation = getattr(activation, "prepare_for_fp8_linear", None)
-        if self.block_quant and plan is not None and prepare_activation is not None:
-            prepared = prepare_activation(x, plan)
-            if prepared is not None:
-                values, scales = prepared
-                return self.apply(
-                    layer,
-                    values,
-                    bias=bias,
-                    block_scale=scales,
-                    output_dtype=x.dtype,
-                )
-        return super().apply_with_activation(layer, x, activation, bias)
-
-    def prepared_linear_plan(self, layer: torch.nn.Module) -> object | None:
-        return getattr(layer, "_prepared_fp8_linear", None)

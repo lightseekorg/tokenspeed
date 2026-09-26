@@ -460,15 +460,16 @@ def _quantize_mxfp8() -> tuple[torch.Tensor, torch.Tensor]:
     return tokenspeed_kernel.quantize_mxfp8(x)
 
 
-def _fp8_quantize_dequantize() -> torch.Tensor:
+def _quantize_fp8() -> torch.Tensor:
     x = torch.empty((4, 128), dtype=torch.bfloat16)
-    return tokenspeed_kernel.fp8_quantize_dequantize(
+    output, _ = tokenspeed_kernel.quantize_fp8(
         x,
+        granularity="token_group",
         group_size=128,
         scale_encoding="ue8m0",
-        override=None,
-        solution=None,
+        dequantize=True,
     )
+    return output
 
 
 def _mm_dense() -> torch.Tensor:
@@ -583,11 +584,11 @@ def test_public_mm_selects_gfx1250_decode_kernel(
         def fake_online_quantize_mxfp8(
             activation: torch.Tensor,
             selected_block_size: list[int],
-            kernel_name: str,
+            scale_encoding: str,
             enable_pdl: bool,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             assert selected_block_size == block_size
-            assert kernel_name == expected_name
+            assert scale_encoding == ("ue8m0" if contract == "ue8m0" else "float32")
             assert not enable_pdl
             return (
                 torch.empty_like(activation, dtype=_fp8_dtype()),
@@ -5237,7 +5238,7 @@ _CASES = [
         "hopper",
         "gemm",
         "mm",
-        "deep_gemm_mm_fp8_blockscale",
+        "triton_mm_fp8_blockscale",
         _mm_mxfp8,
     ),
     _case(
@@ -5295,9 +5296,9 @@ _CASES = [
         _is_supported_gpu,
         "supported-gpu",
         "quantization",
-        "fp8_quantize_dequantize",
-        "triton_fp8_quantize_dequantize",
-        _fp8_quantize_dequantize,
+        "fp8",
+        "triton_quantize_fp8_roundtrip",
+        _quantize_fp8,
     ),
     _case(
         _is_hopper,
