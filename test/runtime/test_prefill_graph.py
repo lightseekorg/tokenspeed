@@ -646,6 +646,7 @@ class DummyGroupTablesTest(unittest.TestCase):
 
         import torch
 
+        from tokenspeed.runtime.execution.input_buffer import InputBuffers
         from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
             CacheRuntimeContract,
         )
@@ -672,20 +673,11 @@ class DummyGroupTablesTest(unittest.TestCase):
         )
         pg.dp_size = 1
         pg.drafter = None
-        buf = lambda n, dt: torch.zeros(n, dtype=dt)  # noqa: E731
-        pg.input_buffers = SimpleNamespace(
-            dummy_kv_slot=0,
-            input_ids_buf=buf(4096, torch.int32),
-            out_cache_loc_buf=buf(4096, torch.int32),
-            positions_buf=buf(4096, torch.int64),
-            req_pool_indices_buf=buf(16, torch.int32),
-            seq_lens_buf=buf(16, torch.int32),
-            extend_seq_lens_buf=buf(16, torch.int32),
-            extend_seq_lens_cpu=buf(16, torch.int32),
-            extend_prefix_lens_buf=buf(16, torch.int32),
-            extend_prefix_lens_cpu=buf(16, torch.int32),
-            extend_replay_lens_cpu=buf(16, torch.int32),
-            extend_prompt_lens_cpu=buf(16, torch.int32),
+        pg.input_buffers = InputBuffers(
+            max_bs=16,
+            max_num_tokens=4096,
+            state_write_padding_pool_index=0,
+            device="cpu",
         )
         pg.block_table = torch.zeros(16, 64, dtype=torch.int32)
 
@@ -702,6 +694,15 @@ class DummyGroupTablesTest(unittest.TestCase):
             num_tokens,
             -(-num_tokens // context_len) if capture_bs is None else capture_bs,
         )
+        bs = ctx.bs
+        ib = pg.input_buffers
+        self.assertEqual(
+            ib.request_token_history_input_lengths_buf[:bs].tolist(),
+            ib.extend_seq_lens_cpu[:bs].tolist(),
+        )
+        self.assertEqual(ib.input_start_offsets_buf[0].item(), 0)
+        self.assertEqual(ib.input_start_offsets_buf[bs].item(), num_tokens)
+        self.assertTrue(ib.active_request_mask_buf[:bs].all().item())
         self.assertIs(ctx.attn_backend, pg.attn_backend)
         self.assertIs(ctx.token_to_kv_pool, pg.token_to_kv_pool)
         return seen
@@ -855,6 +856,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         inner_model = SimpleNamespace(embed_tokens=object())
         model_runner = SimpleNamespace(
             model=SimpleNamespace(model=inner_model),
+            model_config=SimpleNamespace(requires_request_token_history=False),
             is_generation=True,
             is_multimodal=False,
         )
@@ -881,6 +883,23 @@ class DummyGroupTablesTest(unittest.TestCase):
 
         self.assertFalse(graph.disable)
         capture.assert_not_called()
+
+        model_runner.model_config.requires_request_token_history = True
+        with (
+            mock.patch(
+                "tokenspeed.runtime.execution.prefill_graph.get_prefill_token_buckets",
+                return_value=[64],
+            ),
+            mock.patch.object(self.PrefillGraph, "capture"),
+        ):
+            graph = self.PrefillGraph(
+                model_runner=model_runner,
+                attn_backend=object(),
+                token_to_kv_pool=pool,
+                input_buffers=object(),
+                config=config,
+            )
+        self.assertTrue(graph.disable)
 
 
 class CaptureFailureIsLoudTest(unittest.TestCase):
@@ -1030,6 +1049,7 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
             inner.embed_tokens = object()
             model_runner = SimpleNamespace(
                 model=SimpleNamespace(model=inner),
+                model_config=SimpleNamespace(requires_request_token_history=False),
                 is_generation=True,
                 is_multimodal=False,
             )
@@ -1070,6 +1090,7 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
             inner.embed_tokens = object()
             model_runner = SimpleNamespace(
                 model=SimpleNamespace(model=inner),
+                model_config=SimpleNamespace(requires_request_token_history=False),
                 is_generation=True,
                 is_multimodal=False,
             )
@@ -1301,6 +1322,7 @@ class PrefillRoleGraphsTest(unittest.TestCase):
         inner = SimpleNamespace(embed_tokens=object())
         model_runner = SimpleNamespace(
             model=SimpleNamespace(model=inner),
+            model_config=SimpleNamespace(requires_request_token_history=False),
             is_generation=True,
             is_multimodal=False,
         )
