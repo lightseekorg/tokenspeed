@@ -63,7 +63,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     CacheModelFamily,
     CachePoolSpec,
-    cache_recipe,
     prepare_cache_setup,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
