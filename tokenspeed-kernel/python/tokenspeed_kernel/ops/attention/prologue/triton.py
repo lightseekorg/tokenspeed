@@ -93,11 +93,11 @@ def _gqa_prologue_tile(
     weight_ptr,
     cos,
     sin,
-    inv_rms,
     row_mask,
     head_dim: tl.constexpr,
     half_rotary: tl.constexpr,
     weight_offset: tl.constexpr,
+    eps: tl.constexpr,
     HAS_NORM: tl.constexpr,
     IS_NEOX: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -120,6 +120,7 @@ def _gqa_prologue_tile(
     x1 = tl.load(src[:, None] + i1[None, :], mask=pair_mask, other=0.0).to(tl.float32)
     x2 = tl.load(src[:, None] + i2[None, :], mask=pair_mask, other=0.0).to(tl.float32)
     if HAS_NORM:
+        inv_rms = tl.rsqrt(tl.sum(rows * rows, axis=1) / head_dim + eps)
         w = tl.load(weight_ptr + offs, mask=offs < head_dim, other=0.0).to(tl.float32)
         w1 = tl.load(weight_ptr + i1, mask=half_mask, other=0.0).to(tl.float32)
         w2 = tl.load(weight_ptr + i2, mask=half_mask, other=0.0).to(tl.float32)
@@ -212,24 +213,10 @@ def _gqa_prologue_kernel(
     )
     row_mask = tokens < num_tokens
     head = tl.program_id(1).to(tl.int64)
-    is_k = head >= num_q_heads
-    kv_head = head - num_q_heads
-    if is_k:
-        src = k_ptr + tokens * k_stride_t + kv_head * head_dim
-        weight_ptr = k_weight_ptr
-    else:
-        src = q_ptr + tokens * q_stride_t + head * q_stride_h
-        weight_ptr = q_weight_ptr
 
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
 
-    inv_rms = 0.0
-    if HAS_NORM:
-        offs = tl.arange(0, BLOCK)
-        mask = row_mask[:, None] & (offs < head_dim)[None, :]
-        x = tl.load(src[:, None] + offs[None, :], mask=mask, other=0.0).to(tl.float32)
-        inv_rms = tl.rsqrt(tl.sum(x * x, axis=1) / head_dim + eps)
     cos = 0.0
     sin = 0.0
     if half_rotary > 0:
@@ -248,23 +235,23 @@ def _gqa_prologue_kernel(
             S1,
             S2,
         )
-    rows, o1, o2, i1, i2, half_mask = _gqa_prologue_tile(
-        src,
-        weight_ptr,
-        cos,
-        sin,
-        inv_rms,
-        row_mask,
-        head_dim,
-        half_rotary,
-        weight_offset,
-        HAS_NORM,
-        IS_NEOX,
-        BLOCK,
-        HALF_BLOCK,
-    )
-
-    if not is_k:
+    # A pointer tensor yielded from a runtime branch fails to lower on AMD; each head kind builds its own.
+    if head < num_q_heads:
+        rows, o1, o2, i1, i2, half_mask = _gqa_prologue_tile(
+            q_ptr + tokens * q_stride_t + head * q_stride_h,
+            q_weight_ptr,
+            cos,
+            sin,
+            row_mask,
+            head_dim,
+            half_rotary,
+            weight_offset,
+            eps,
+            HAS_NORM,
+            IS_NEOX,
+            BLOCK,
+            HALF_BLOCK,
+        )
         _gqa_store_tile(
             q_out_ptr + tokens * q_out_stride_t + head * head_dim,
             rows,
@@ -279,6 +266,22 @@ def _gqa_prologue_kernel(
             BLOCK,
         )
     else:
+        kv_head = head - num_q_heads
+        rows, o1, o2, i1, i2, half_mask = _gqa_prologue_tile(
+            k_ptr + tokens * k_stride_t + kv_head * head_dim,
+            k_weight_ptr,
+            cos,
+            sin,
+            row_mask,
+            head_dim,
+            half_rotary,
+            weight_offset,
+            eps,
+            HAS_NORM,
+            IS_NEOX,
+            BLOCK,
+            HALF_BLOCK,
+        )
         if RETURN_K:
             _gqa_store_tile(
                 k_out_ptr + tokens * k_out_stride_t + kv_head * head_dim,

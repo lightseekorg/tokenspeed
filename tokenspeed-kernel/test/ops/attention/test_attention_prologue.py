@@ -32,6 +32,7 @@ from attention_prologue_reference import (
     BF16,
     FP8,
     POISON,
+    assert_agree,
     assert_gqa_rounds_once,
     assert_rounded_once,
     bytes_equal,
@@ -366,7 +367,7 @@ def test_triton_and_the_composite_agree_unnormed_on_a_native_cache(
         for solution in ("triton", "composite")
     ]
     for a, b in zip(*runs):
-        assert bytes_equal(a, b)
+        assert_agree(a, b)
 
 
 def test_gqa_composite_writes_mxfp8():

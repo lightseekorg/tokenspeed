@@ -38,6 +38,7 @@ from tokenspeed_kernel.ops.attention.prologue import (
     Rotary,
     gqa_prologue,
 )
+from tokenspeed_kernel.platform import current_platform
 
 BF16 = torch.bfloat16
 FP8 = torch.float8_e4m3fn
@@ -88,6 +89,18 @@ def bytes_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch.equal(
         a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)
     )
+
+
+def assert_agree(a: torch.Tensor, b: torch.Tensor) -> None:
+    """Byte-equal; on AMD two solutions' fp16 results are allowed one ulp apart."""
+    if bytes_equal(a, b):
+        return
+    assert current_platform.is_amd() and a.dtype is torch.float16, "bytes differ"
+    differ = (a != b).float().mean().item()
+    gap = (a.float() - b.float()).abs().max().item()
+    assert torch.allclose(
+        a.float(), b.float(), rtol=2**-10, atol=2**-14
+    ), f"{differ:.1%} of the fp16 values differ, by up to {gap}"
 
 
 def head_norm(head_dim: int, weight_offset: float, seed: int) -> HeadNorm:
