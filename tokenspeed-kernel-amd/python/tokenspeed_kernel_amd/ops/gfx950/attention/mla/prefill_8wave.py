@@ -39,6 +39,7 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.mla.prefill import (
     AttentionProgram,
     LaunchConfig,
     ProgramScheduler,
+    prefill_launch_metadata,
 )
 
 cdna4 = gl.amd.cdna4
@@ -680,7 +681,7 @@ def process_query_block(
 # ===-----------------------------------------------------------------------===#
 
 
-@gluon.jit
+@gluon.jit(launch_metadata=prefill_launch_metadata)
 def gluon_mla_prefill_8wave_gfx950(
     q_ptr,
     k_ptr,
@@ -808,8 +809,9 @@ def launch_gluon_mla_prefill_8wave_gfx950(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Dense non-absorbed MLA prefill on AMD gfx950.
 
-    ``q``/``k`` are ``[total_tokens, num_heads, 192]`` (128 NoPE + 64 RoPE),
-    ``v`` is ``[total_tokens, num_kv_heads, 128]``, all FP16, BF16, FP8 E4M3
+    ``q`` is ``[total_tokens, num_heads, 192]`` and ``k`` is
+    ``[total_tokens, num_kv_heads, 192]`` (128 NoPE + 64 RoPE); ``v`` is
+    ``[total_tokens, num_kv_heads, 128]``, all FP16, BF16, FP8 E4M3
     or FP8 E5M2.
     Output is ``[total_tokens, num_heads, 128]``. ``seq_lens_kv`` is accepted
     for interface parity; ``cu_seqlens_kv`` already defines the KV lengths.

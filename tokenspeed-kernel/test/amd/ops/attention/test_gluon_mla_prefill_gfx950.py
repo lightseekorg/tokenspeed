@@ -29,6 +29,7 @@ test_kernel_api_selection.py.
 from __future__ import annotations
 
 import importlib
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -500,3 +501,50 @@ def test_mla_prefill_gluon_kernels_agree(device, require, dtype, is_causal):
         out.float(), other_out.float(), rtol=_OUT_TOLS[dtype], atol=_OUT_TOLS[dtype]
     )
     torch.testing.assert_close(lse, other_lse, rtol=_LSE_TOL, atol=_LSE_TOL)
+
+
+@pytest.mark.parametrize(
+    ("is_causal", "has_lse", "kv_len", "pairs"),
+    [
+        (False, False, 1024, 256 * 1024),
+        # The last query row aligns with the last key.
+        (True, True, 1024, 256 * 1024 - 256 * 255 // 2),
+        (True, True, 256, 256 * 257 // 2),
+    ],
+)
+@pytest.mark.parametrize("kernel", _KERNELS)
+def test_mla_prefill_gluon_launch_metadata(
+    device, kernel, is_causal, has_lse, kv_len, pairs
+):
+    module = _kernel_module(kernel)
+    batch, q_len, heads = 2, 256, 12
+    fp8 = torch.float8_e4m3fn
+    q = torch.empty((batch * q_len, heads, 192), dtype=fp8, device=device)
+    k = torch.empty((batch * kv_len, heads, 192), dtype=fp8, device=device)
+    v = torch.empty((batch * kv_len, heads, 128), dtype=fp8, device=device)
+    out = torch.empty((batch * q_len, heads, 128), dtype=torch.bfloat16, device=device)
+    lse = torch.empty((batch * q_len, heads), dtype=torch.float32, device=device)
+
+    metadata = module.prefill_launch_metadata(
+        (512,),
+        SimpleNamespace(name="prefill"),
+        {
+            "q_ptr": q,
+            "k_ptr": k,
+            "v_ptr": v,
+            "output_ptr": out,
+            "lse_ptr": lse,
+            "BATCH_SIZE": batch,
+            "IS_CAUSAL": is_causal,
+            "HAS_LSE": has_lse,
+            "IS_FP8": True,
+        },
+    )
+
+    tensor_bytes = q.numel() + k.numel() + v.numel() + out.numel() * 2
+    assert metadata == {
+        "name": "prefill",
+        "flops8": 2 * batch * pairs * heads * (192 + 128),
+        "bytes": tensor_bytes + (lse.numel() * 4 if has_lse else 0),
+    }
+    assert getattr(module, kernel).launch_metadata is module.prefill_launch_metadata

@@ -1185,7 +1185,37 @@ class ProgramScheduler:
 # ===-----------------------------------------------------------------------===#
 
 
-@gluon.jit
+def prefill_launch_metadata(grid, kernel, args):
+    """Report attention work without reading device-resident lengths.
+
+    Sequence lengths live in cu_seqlens on the device, so FLOPs assume every
+    sequence has the average query and key length of the batch. Causal masks
+    align the last query with the last key. Bytes count each tensor once.
+    """
+    total_q, heads, qk_dim = args["q_ptr"].shape
+    total_kv = args["k_ptr"].shape[0]
+    v_dim = args["v_ptr"].shape[-1]
+    batch = args["BATCH_SIZE"]
+    q_len, kv_len = total_q // batch, total_kv // batch
+    if args["IS_CAUSAL"]:
+        # Query row i sees min(max(kv_len - q_len, 0) + i + 1, kv_len) keys,
+        # so the mask hides a triangle of size min(q_len, kv_len) - 1.
+        rows = min(q_len, kv_len)
+        pairs = q_len * kv_len - rows * (rows - 1) // 2
+    else:
+        pairs = q_len * kv_len
+    flops = 2 * batch * pairs * heads * (qk_dim + v_dim)
+    tensors = [args[name] for name in ("q_ptr", "k_ptr", "v_ptr", "output_ptr")]
+    if args["HAS_LSE"]:
+        tensors.append(args["lse_ptr"])
+    return {
+        "name": kernel.name,
+        "flops8" if args["IS_FP8"] else "flops16": flops,
+        "bytes": sum(t.numel() * t.element_size() for t in tensors),
+    }
+
+
+@gluon.jit(launch_metadata=prefill_launch_metadata)
 def gluon_mla_prefill_gfx950(
     q_ptr,
     k_ptr,

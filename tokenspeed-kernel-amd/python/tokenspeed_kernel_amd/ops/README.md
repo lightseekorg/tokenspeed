@@ -248,10 +248,10 @@ only for now.
 
 #### Contract
 
-- Queries and keys are `(tokens, heads, 192)` (128 no-PE plus 64 RoPE
-  dimensions) and values are `(tokens, kv_heads, 128)`, all FP16, BF16, FP8
-  E4M3, or FP8 E5M2 with one shared dtype and a contiguous last dimension.
-  Query heads must be a multiple of KV heads.
+  - Queries are `(tokens, heads, 192)` and keys are `(tokens, kv_heads, 192)`
+  (128 no-PE plus 64 RoPE dimensions); values are `(tokens, kv_heads, 128)`,
+  all FP16, BF16, FP8 E4M3, or FP8 E5M2 with one shared dtype and a contiguous
+  last dimension. Query heads must be a multiple of KV heads.
 - `cu_seqlens_q` and `cu_seqlens_kv` delimit the sequences. Causal masking
   aligns each query block to the end of its keys. `logit_cap` is unsupported.
 - The output may be any caller-owned floating dtype with a contiguous last
@@ -262,6 +262,9 @@ only for now.
   shapes.
 - Both launch a persistent grid of 512 workgroups and keep no sequence-length
   constexpr, so ragged batches reuse one binary.
+- Both share launch metadata that reports attention FLOPs and each tensor's
+  bytes once without reading device-resident sequence lengths: FLOPs assume
+  every sequence has the batch's average query and key length.
 
 #### Algorithm
 
