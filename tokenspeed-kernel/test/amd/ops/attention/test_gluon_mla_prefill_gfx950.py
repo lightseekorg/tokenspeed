@@ -30,7 +30,7 @@ from tokenspeed_kernel.platform import current_platform
 platform = current_platform()
 pytestmark = pytest.mark.skipif(not platform.is_cdna4, reason="gfx950 MLA pipeline")
 _FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
-# Named explicitly: large 16-bit and FP8 problems otherwise select
+# Named explicitly: FP8 problems with long keys otherwise select
 # gluon_mla_prefill_8wave_gfx950.
 _KERNEL = "gluon_mla_prefill_gfx950"
 

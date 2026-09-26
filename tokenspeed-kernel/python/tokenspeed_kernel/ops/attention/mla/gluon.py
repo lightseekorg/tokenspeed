@@ -614,17 +614,11 @@ if current_platform().is_amd:
     def _is_8wave_mla_prefill_problem(
         batch_size: int, total_q: int, total_kv: int, num_q_heads: int
     ) -> bool:
-        # The 8-wave kernel covers 256 query rows per block (for 16-bit inputs
-        # half as many blocks as gluon_mla_prefill_gfx950 makes) and refills
-        # its K/V pipeline for every block. It wants enough blocks to fill the
-        # GPU (the first bound is about 128 of them), blocks at least half full
-        # on average, and enough keys per sequence to pay off the refill. The
-        # thresholds come from a static cycle model, not hardware measurement.
-        return (
-            num_q_heads * total_q >= 32768
-            and total_q >= 128 * batch_size
-            and total_kv >= 512 * batch_size
-        )
+        # For FP8 both kernels cover 256 query rows per block, so the 8-wave
+        # pipeline wins once each sequence has enough keys to pay off
+        # refilling it for every block. The threshold comes from cold-cache
+        # measurements of Kimi-K3 prefill shapes.
+        return total_kv >= 1024 * batch_size
 
     @register_kernel(
         "attention",
@@ -636,15 +630,12 @@ if current_platform().is_amd:
             max_arch_version=ArchVersion(9, 5),
             vendors=frozenset({"amd"}),
         ),
+        # Registered for FP8 only for now; 16-bit inputs use
+        # gluon_mla_prefill_gfx950.
         signatures=format_signatures(
             ("q", "k", "v"),
             "dense",
-            {
-                torch.float16,
-                torch.bfloat16,
-                torch.float8_e4m3fn,
-                torch.float8_e5m2,
-            },
+            {torch.float8_e4m3fn, torch.float8_e5m2},
         ),
         # Preferred over gluon_mla_prefill_gfx950 wherever both apply.
         priority=Priority.SPECIALIZED + 1,

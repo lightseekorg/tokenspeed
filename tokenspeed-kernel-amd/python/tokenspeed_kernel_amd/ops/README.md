@@ -242,8 +242,9 @@ score.
 ### gfx950 MLA prefill
 
 Two kernels compute dense, non-absorbed MLA prefill attention over ragged
-sequences, `gluon_mla_prefill_gfx950` and `gluon_mla_prefill_8wave_gfx950`,
-both for every supported dtype.
+sequences, `gluon_mla_prefill_gfx950` and `gluon_mla_prefill_8wave_gfx950`.
+The 8-wave kernel handles 16-bit inputs as well, but is registered only for FP8
+for now.
 
 #### Contract
 
@@ -255,15 +256,15 @@ both for every supported dtype.
   aligns each query block to the end of its keys. `logit_cap` is unsupported.
 - The output may be any caller-owned floating dtype with a contiguous last
   dimension; the optional log-sum-exp is FP32 in natural-log units.
-- The 8-wave kernel is selected when its `qkv_problem_filter` accepts
-  `(batch_size, total_q, total_kv, num_q_heads)`: at least 32768 query rows
-  across heads (`num_q_heads * total_q`), and on average at least 128 query
-  and 512 key tokens per sequence. The dispatcher reads these from tensor
-  shapes, rounding token counts up to a power of two, so selection never
-  syncs and also runs under graph capture. Other problems select
-  `gluon_mla_prefill_gfx950`. Either kernel can be forced by name through
-  `override`; both accept every input of the op, so the choice only affects
-  speed.
+- For FP8 inputs the 8-wave kernel is selected when its `qkv_problem_filter`
+  accepts `(batch_size, total_q, total_kv, num_q_heads)`: on average at least
+  1024 key tokens per sequence, a threshold measured on Kimi-K3 prefill
+  shapes. The dispatcher reads these from tensor shapes, rounding token counts
+  up to a power of two, so selection never syncs and also runs under graph
+  capture. Other problems, and all 16-bit ones, select
+  `gluon_mla_prefill_gfx950`. For FP8 either kernel can be forced by name
+  through `override`; both accept every FP8 input of the op, so the choice
+  only affects speed.
 - Both launch a persistent grid of 512 workgroups and keep no sequence-length
   constexpr, so ragged batches reuse one binary.
 

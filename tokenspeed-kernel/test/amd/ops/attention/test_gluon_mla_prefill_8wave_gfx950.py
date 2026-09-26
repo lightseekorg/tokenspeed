@@ -34,22 +34,16 @@ from tokenspeed_kernel.platform import current_platform
 platform = current_platform()
 pytestmark = pytest.mark.skipif(not platform.is_cdna4, reason="gfx950 MLA pipeline")
 _KERNEL = "gluon_mla_prefill_8wave_gfx950"
-_FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
-_DTYPES = [torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2]
+# The kernel is registered for FP8 inputs only.
+_DTYPES = [torch.float8_e4m3fn, torch.float8_e5m2]
+# FP8 rounds P to 3 (E4M3) or 2 (E5M2) mantissa bits before the PV MFMA.
+_OUT_TOL = 6e-2
+_LSE_TOL = 1e-3
 
 
 def _randn(shape, dtype, device):
     # torch.randn has no FP8 kernels; round a BF16 sample instead.
     return torch.randn(shape, dtype=torch.bfloat16, device=device).to(dtype)
-
-
-def _out_tol(dtype):
-    # FP8 rounds P to 3 (E4M3) or 2 (E5M2) mantissa bits before the PV MFMA.
-    return 6e-2 if dtype in _FP8_DTYPES else 3e-2
-
-
-def _lse_tol(dtype):
-    return 1e-3 if dtype in _FP8_DTYPES else 1e-4
 
 
 @pytest.mark.parametrize("dtype", _DTYPES)
@@ -92,7 +86,7 @@ def test_mla_prefill_gluon_8wave_strided_output(
         cols = torch.arange(385, device=device)
         scores.masked_fill_(cols[None, :] > rows[:, None], -float("inf"))
     reference = torch.einsum("hqk,khd->qhd", scores.softmax(-1), v.float())
-    tol, lse_tol = _out_tol(dtype), _lse_tol(dtype)
+    tol, lse_tol = _OUT_TOL, _LSE_TOL
     torch.testing.assert_close(out.float(), reference, rtol=tol, atol=tol)
     torch.testing.assert_close(
         lse, scores.logsumexp(-1).transpose(0, 1), rtol=lse_tol, atol=lse_tol
@@ -264,7 +258,7 @@ def test_mla_prefill_gluon_8wave_repeated_launches(
             return_lse=True,
             override=_KERNEL,
         )
-        tol, lse_tol = _out_tol(dtype), _lse_tol(dtype)
+        tol, lse_tol = _OUT_TOL, _LSE_TOL
         torch.testing.assert_close(out.float(), expected, rtol=tol, atol=tol)
         torch.testing.assert_close(lse, expected_lse, rtol=lse_tol, atol=lse_tol)
         if first is None:
@@ -336,6 +330,6 @@ def test_mla_prefill_gluon_8wave_matches_previous_kernel(
         for name in (_KERNEL, "gluon_mla_prefill_gfx950")
     ]
     (out, lse), (previous_out, previous_lse) = results
-    tol, lse_tol = _out_tol(dtype), _lse_tol(dtype)
+    tol, lse_tol = _OUT_TOL, _LSE_TOL
     torch.testing.assert_close(out.float(), previous_out.float(), rtol=tol, atol=tol)
     torch.testing.assert_close(lse, previous_lse, rtol=lse_tol, atol=lse_tol)
