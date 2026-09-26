@@ -18,9 +18,17 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""FP8 pipeline, masking and output-contract coverage for gfx950 MLA prefill."""
+"""Coverage for the gfx950 MLA prefill kernels.
+
+Most tests run both gluon_mla_prefill_gfx950 and gluon_mla_prefill_8wave_gfx950
+on FP8 inputs. Every call names its kernel, so shapes that selection would send
+to the other kernel still run it; the default selection is covered by
+test_kernel_api_selection.py.
+"""
 
 from __future__ import annotations
+
+import importlib
 
 import pytest
 import torch
@@ -29,28 +37,44 @@ from tokenspeed_kernel.platform import current_platform
 
 platform = current_platform()
 pytestmark = pytest.mark.skipif(not platform.is_cdna4, reason="gfx950 MLA pipeline")
-_FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
+# Kernel name -> module under tokenspeed_kernel_amd.ops.gfx950.attention.mla
+# that defines it and its launch_<name> launcher.
+_KERNEL_MODULES = {
+    "gluon_mla_prefill_gfx950": "prefill",
+    "gluon_mla_prefill_8wave_gfx950": "prefill_8wave",
+}
+_KERNELS = list(_KERNEL_MODULES)
+_FP8_DTYPES = [torch.float8_e4m3fn, torch.float8_e5m2]
+# FP8 rounds P to 3 (E4M3) or 2 (E5M2) mantissa bits before the PV MFMA.
+_OUT_TOLS = {torch.float8_e4m3fn: 6e-2, torch.float8_e5m2: 1e-1}
+_LSE_TOL = 1e-3
 
 
-@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def _randn(shape, dtype, device):
+    # torch.randn has no FP8 kernels; round a BF16 sample instead.
+    return torch.randn(shape, dtype=torch.bfloat16, device=device).to(dtype)
+
+
+def _kernel_module(kernel):
+    return importlib.import_module(
+        f"tokenspeed_kernel_amd.ops.gfx950.attention.mla.{_KERNEL_MODULES[kernel]}"
+    )
+
+
+@pytest.mark.parametrize("kernel", _KERNELS)
+@pytest.mark.parametrize("dtype", _FP8_DTYPES)
 @pytest.mark.parametrize(
     "out_dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64]
 )
 @pytest.mark.parametrize("num_heads", [12, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
-def test_mla_prefill_gluon_fp8_strided_output(
-    device, require, dtype, out_dtype, num_heads, is_causal
+def test_mla_prefill_gluon_strided_output(
+    device, require, kernel, dtype, out_dtype, num_heads, is_causal
 ):
     require("attention", "mla_prefill", "gluon", dtype, "q")
-    q = torch.randn((257, num_heads, 192), dtype=torch.bfloat16, device=device).to(
-        dtype
-    )
-    k = torch.randn((385, num_heads, 192), dtype=torch.bfloat16, device=device).to(
-        dtype
-    )
-    v = torch.randn((385, num_heads, 128), dtype=torch.bfloat16, device=device).to(
-        dtype
-    )
+    q = _randn((257, num_heads, 192), dtype, device)
+    k = _randn((385, num_heads, 192), dtype, device)
+    v = _randn((385, num_heads, 128), dtype, device)
     cu_q = torch.tensor([0, 257], dtype=torch.int32, device=device)
     cu_kv = torch.tensor([0, 385], dtype=torch.int32, device=device)
     storage = torch.full(
@@ -68,7 +92,7 @@ def test_mla_prefill_gluon_fp8_strided_output(
         softmax_scale=192**-0.5,
         is_causal=is_causal,
         return_lse=True,
-        solution="gluon",
+        override=kernel,
         out=destination,
     )
     assert out is destination
@@ -78,9 +102,11 @@ def test_mla_prefill_gluon_fp8_strided_output(
         cols = torch.arange(385, device=device)
         scores.masked_fill_(cols[None, :] > rows[:, None], -float("inf"))
     reference = torch.einsum("hqk,khd->qhd", scores.softmax(-1), v.float())
-    torch.testing.assert_close(out.float(), reference, rtol=6e-2, atol=6e-2)
     torch.testing.assert_close(
-        lse, scores.logsumexp(-1).transpose(0, 1), rtol=8e-2, atol=8e-2
+        out.float(), reference, rtol=_OUT_TOLS[dtype], atol=_OUT_TOLS[dtype]
+    )
+    torch.testing.assert_close(
+        lse, scores.logsumexp(-1).transpose(0, 1), rtol=_LSE_TOL, atol=_LSE_TOL
     )
     # The unaligned column offset and untouched rows/heads catch over-wide stores.
     assert torch.isnan(storage[0]).all()
@@ -90,34 +116,32 @@ def test_mla_prefill_gluon_fp8_strided_output(
     assert torch.isnan(storage[:, :, -1]).all()
 
 
-@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("kernel", _KERNELS)
+@pytest.mark.parametrize("dtype", _FP8_DTYPES)
 @pytest.mark.parametrize("num_heads", [12, 128])
 @pytest.mark.parametrize("q_lens", [(2048, 1), (1, 2048), (257, 257), (1,) * 40])
-def test_mla_prefill_gluon_fp8_static_grid(require, dtype, num_heads, q_lens):
+def test_mla_prefill_gluon_static_grid(require, kernel, dtype, num_heads, q_lens):
     require("attention", "mla_prefill", "gluon", dtype, "q")
-    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.prefill import get_config
-
     q = torch.empty((sum(q_lens), num_heads, 192), dtype=dtype, device="meta")
-    config = get_config(q=q, k=q)
+    config = _kernel_module(kernel).get_config(q=q, k=q)
     assert config.grid == (512,)
     assert config.num_warps == 8
 
 
-@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("kernel", _KERNELS)
+@pytest.mark.parametrize("dtype", _FP8_DTYPES)
 @pytest.mark.parametrize("is_causal", [False, True])
 @pytest.mark.parametrize("max_seqlen_q", [512, 65536])
-def test_mla_prefill_gluon_fp8_static_grid_graph(
-    device, require, dtype, is_causal, max_seqlen_q
+def test_mla_prefill_gluon_static_grid_graph(
+    device, require, kernel, dtype, is_causal, max_seqlen_q
 ):
     require("attention", "mla_prefill", "gluon", dtype, "q")
-    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.prefill import get_config
-
-    q = torch.randn((512, 12, 192), dtype=torch.bfloat16, device=device).to(dtype)
-    k = torch.randn((768, 12, 192), dtype=torch.bfloat16, device=device).to(dtype)
-    v = torch.randn((768, 12, 128), dtype=torch.bfloat16, device=device).to(dtype)
+    q = _randn((512, 12, 192), dtype, device)
+    k = _randn((768, 12, 192), dtype, device)
+    v = _randn((768, 12, 128), dtype, device)
     cu_q = torch.tensor([0, 64, 512], dtype=torch.int32, device=device)
     cu_kv = torch.tensor([0, 256, 768], dtype=torch.int32, device=device)
-    assert get_config(q=q, k=k).grid == (512,)
+    assert _kernel_module(kernel).get_config(q=q, k=k).grid == (512,)
 
     def invoke():
         return mla_prefill(
@@ -131,7 +155,7 @@ def test_mla_prefill_gluon_fp8_static_grid_graph(
             softmax_scale=192**-0.5,
             is_causal=is_causal,
             return_lse=True,
-            solution="gluon",
+            override=kernel,
         )
 
     invoke()
@@ -147,13 +171,16 @@ def test_mla_prefill_gluon_fp8_static_grid_graph(
         torch.testing.assert_close(actual_lse, expected_lse, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("kernel", _KERNELS)
 @pytest.mark.parametrize(
     "dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2]
 )
-def test_mla_prefill_gluon_launch_runtime_bound(require, monkeypatch, dtype):
+def test_mla_prefill_gluon_launch_runtime_bound(require, monkeypatch, kernel, dtype):
+    # Launcher-level, so it also covers 16-bit inputs the 8-wave kernel is not
+    # registered for.
     require("attention", "mla_prefill", "gluon", dtype, "q")
-    from tokenspeed_kernel_amd.ops.gfx950.attention.mla import prefill
-
+    module = _kernel_module(kernel)
+    launcher = getattr(module, f"launch_{kernel}")
     launches = []
 
     class RecordLaunch:
@@ -165,32 +192,31 @@ def test_mla_prefill_gluon_launch_runtime_bound(require, monkeypatch, dtype):
 
             return launch
 
-    monkeypatch.setattr(prefill, "gluon_mla_prefill_gfx950", RecordLaunch())
+    monkeypatch.setattr(module, kernel, RecordLaunch())
+    # The 4-wave kernel's 16-bit path keeps the caller's bound as is.
+    clamps = dtype in _FP8_DTYPES or kernel == "gluon_mla_prefill_8wave_gfx950"
     for tokens in (144, 160, 256, 272, 512, 2048, 8192, 16384):
         q = torch.empty((tokens, 12, 192), dtype=dtype, device="meta")
         v = torch.empty((tokens, 12, 128), dtype=dtype, device="meta")
         cu = torch.empty((2,), dtype=torch.int32, device="meta")
-        prefill.launch_gluon_mla_prefill_gfx950(
-            q, q, v, cu, cu, 65536, 65536, 192**-0.5
-        )
-        assert launches[-1]["max_seqlen_q"] == (
-            tokens if dtype in _FP8_DTYPES else 65536
-        )
+        launcher(q, q, v, cu, cu, 65536, 65536, 192**-0.5)
+        assert launches[-1]["max_seqlen_q"] == (tokens if clamps else 65536)
     # Crossing query-tile and persistent-cycle boundaries changes no constexpr.
     for launch in launches:
         launch.pop("max_seqlen_q")
     assert all(launch == launches[0] for launch in launches)
 
 
+@pytest.mark.parametrize("kernel", _KERNELS)
 @pytest.mark.parametrize("is_causal", [False, True])
-def test_mla_prefill_gluon_fp8_reuses_kernel_across_query_sizes(
-    device, require, monkeypatch, is_causal
+def test_mla_prefill_gluon_reuses_kernel_across_query_sizes(
+    device, require, monkeypatch, kernel, is_causal
 ):
     dtype = torch.float8_e4m3fn
     require("attention", "mla_prefill", "gluon", dtype, "q")
-    from tokenspeed_kernel_amd.ops.gfx950.attention.mla import prefill
-
-    original = prefill.gluon_mla_prefill_gfx950
+    module = _kernel_module(kernel)
+    launcher = getattr(module, f"launch_{kernel}")
+    original = getattr(module, kernel)
     compiled = set()
 
     class RecordKernel:
@@ -198,32 +224,31 @@ def test_mla_prefill_gluon_fp8_reuses_kernel_across_query_sizes(
             assert grid == (512,)
 
             def launch(*args, **kwargs):
-                kernel = original[grid](*args, **kwargs)
-                compiled.add(kernel.hash)
-                return kernel
+                compiled_kernel = original[grid](*args, **kwargs)
+                compiled.add(compiled_kernel.hash)
+                return compiled_kernel
 
             return launch
 
-    monkeypatch.setattr(prefill, "gluon_mla_prefill_gfx950", RecordKernel())
+    monkeypatch.setattr(module, kernel, RecordKernel())
     k = torch.zeros((128, 12, 192), dtype=dtype, device=device)
     v = torch.zeros((128, 12, 128), dtype=dtype, device=device)
     cu_kv = torch.tensor([0, 128], dtype=torch.int32, device=device)
     for tokens in (144, 272, 512, 2048, 8192, 16384):
         q = torch.zeros((tokens, 12, 192), dtype=dtype, device=device)
         cu_q = torch.tensor([0, tokens], dtype=torch.int32, device=device)
-        prefill.launch_gluon_mla_prefill_gfx950(
-            q, k, v, cu_q, cu_kv, tokens, 128, 192**-0.5, is_causal=is_causal
-        )
+        launcher(q, k, v, cu_q, cu_kv, tokens, 128, 192**-0.5, is_causal=is_causal)
     assert len(compiled) == 1
 
 
+@pytest.mark.parametrize("kernel", _KERNELS)
 @pytest.mark.parametrize("is_causal", [False, True])
 @pytest.mark.parametrize("num_heads", [12, 128])
 @pytest.mark.parametrize(
     "q_lens", [(128,), (257,), (8193,), (11009,), (0, 1, 2048), (257,) * 40]
 )
-def test_mla_prefill_gluon_fp8_scheduler_coverage(
-    device, require, is_causal, num_heads, q_lens
+def test_mla_prefill_gluon_scheduler_coverage(
+    device, require, kernel, is_causal, num_heads, q_lens
 ):
     dtype = torch.float8_e4m3fn
     require("attention", "mla_prefill", "gluon", dtype, "q")
@@ -248,7 +273,7 @@ def test_mla_prefill_gluon_fp8_scheduler_coverage(
         softmax_scale=192**-0.5,
         is_causal=is_causal,
         return_lse=True,
-        solution="gluon",
+        override=kernel,
         out=destination,
     )
     # Uniform logits give exact prefix means. Short KV spans keep this scheduler
@@ -274,9 +299,10 @@ def test_mla_prefill_gluon_fp8_scheduler_coverage(
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("kernel", _KERNELS)
+@pytest.mark.parametrize("dtype", _FP8_DTYPES)
 @pytest.mark.parametrize("q_len,kv_len", [(129, 65), (65, 129), (257, 193), (65, 0)])
-def test_mla_prefill_gluon_fp8_causal_cutoff(device, require, dtype, q_len, kv_len):
+def test_mla_prefill_gluon_causal_cutoff(device, require, kernel, dtype, q_len, kv_len):
     require("attention", "mla_prefill", "gluon", dtype, "q")
     q = torch.zeros((q_len, 12, 192), dtype=dtype, device=device)
     # Poison the backing tail; masked loads must not admit keys past KV length.
@@ -304,7 +330,7 @@ def test_mla_prefill_gluon_fp8_causal_cutoff(device, require, dtype, q_len, kv_l
         softmax_scale=192**-0.5,
         is_causal=True,
         return_lse=True,
-        solution="gluon",
+        override=kernel,
     )
     # Zero logits give the exact prefix mean, capped at the last real key.
     visible = (torch.arange(q_len, device=device) + max(kv_len - q_len, 0) + 1).clamp(
@@ -318,12 +344,15 @@ def test_mla_prefill_gluon_fp8_causal_cutoff(device, require, dtype, q_len, kv_l
     torch.testing.assert_close(lse, expected_lse, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("kernel", _KERNELS)
+@pytest.mark.parametrize("dtype", _FP8_DTYPES)
 @pytest.mark.parametrize("changed_row", [None, 13, 45, 254])
 @pytest.mark.parametrize(
     "kv_len", [1, 64, 65, 128, 129, 193, 256, 257, 321, 512, 513, 576]
 )
-def test_mla_prefill_gluon_fp8_online_max(device, require, dtype, changed_row, kv_len):
+def test_mla_prefill_gluon_online_max(
+    device, require, kernel, dtype, changed_row, kv_len
+):
     require("attention", "mla_prefill", "gluon", dtype, "q")
     q = torch.zeros((255, 2, 192), dtype=torch.bfloat16, device=device)
     k = torch.zeros((576, 2, 192), dtype=torch.bfloat16, device=device)
@@ -332,7 +361,8 @@ def test_mla_prefill_gluon_fp8_online_max(device, require, dtype, changed_row, k
     if changed_row is not None:
         # Non-leading rows in multiple waves, including the final active row.
         q[changed_row, 0, 0] = -1.0
-    # Distinct values and changing maxima span two complete V-ring wraps.
+    # Distinct values and changing maxima span several K/V-ring wraps, with a
+    # rescale on every jump of the running maximum.
     tiles = (
         (64, 1),
         (64, 0.5),
@@ -365,7 +395,7 @@ def test_mla_prefill_gluon_fp8_online_max(device, require, dtype, changed_row, k
         softmax_scale=192**-0.5,
         is_causal=False,
         return_lse=True,
-        solution="gluon",
+        override=kernel,
     )
     scores = torch.einsum("qhd,khd->hqk", q.float(), k.float()) * (192**-0.5)
     expected = torch.einsum("hqk,khd->qhd", scores.softmax(-1), v.float())
@@ -373,3 +403,100 @@ def test_mla_prefill_gluon_fp8_online_max(device, require, dtype, changed_row, k
     torch.testing.assert_close(
         lse, scores.logsumexp(-1).transpose(0, 1), rtol=2e-5, atol=2e-5
     )
+
+
+@pytest.mark.parametrize("kernel", _KERNELS)
+@pytest.mark.parametrize("dtype", _FP8_DTYPES)
+@pytest.mark.parametrize("is_causal", [False, True])
+@pytest.mark.parametrize(
+    "q_len,kv_len,num_heads", [(64, 1000, 2), (257, 257, 2), (600, 600, 1)]
+)
+def test_mla_prefill_gluon_repeated_launches(
+    device, require, kernel, dtype, is_causal, q_len, kv_len, num_heads
+):
+    # Random logits with doubled keys move the running maximum in some waves
+    # and not others. A short query block over a long prefix crosses both the
+    # causal diagonal and the key tail. Any race on the K/V LDS buffers shows
+    # up as launches that disagree bitwise.
+    require("attention", "mla_prefill", "gluon", dtype, "q")
+    torch.manual_seed(0)
+    q = _randn((q_len, num_heads, 192), dtype, device)
+    # Poison the backing tail; masked loads must not admit keys past KV length.
+    k_storage = torch.full(
+        (kv_len + 64, num_heads, 192), float("nan"), dtype=torch.bfloat16, device=device
+    )
+    v_storage = torch.full(
+        (kv_len + 64, num_heads, 128), float("nan"), dtype=torch.bfloat16, device=device
+    )
+    k_storage[:kv_len] = 2 * torch.randn_like(k_storage[:kv_len])
+    v_storage[:kv_len] = torch.randn_like(v_storage[:kv_len])
+    k, v = k_storage.to(dtype)[:kv_len], v_storage.to(dtype)[:kv_len]
+    cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=device)
+    cu_kv = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
+
+    scores = torch.einsum("qhd,khd->hqk", q.float(), k.float()) * (192**-0.5)
+    if is_causal:
+        rows = torch.arange(q_len, device=device) + max(kv_len - q_len, 0)
+        cols = torch.arange(kv_len, device=device)
+        scores.masked_fill_(cols[None, :] > rows[:, None], -float("inf"))
+    expected = torch.einsum("hqk,khd->qhd", scores.softmax(-1), v.float())
+    expected_lse = scores.logsumexp(-1).transpose(0, 1)
+
+    first = None
+    for _ in range(4):
+        out, lse = mla_prefill(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=cu_kv,
+            max_seqlen_q=q_len,
+            max_seqlen_kv=kv_len,
+            softmax_scale=192**-0.5,
+            is_causal=is_causal,
+            return_lse=True,
+            override=kernel,
+        )
+        torch.testing.assert_close(
+            out.float(), expected, rtol=_OUT_TOLS[dtype], atol=_OUT_TOLS[dtype]
+        )
+        torch.testing.assert_close(lse, expected_lse, rtol=_LSE_TOL, atol=_LSE_TOL)
+        if first is None:
+            first = (out.clone(), lse.clone())
+        else:
+            torch.testing.assert_close(out, first[0], rtol=0, atol=0)
+            torch.testing.assert_close(lse, first[1], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", _FP8_DTYPES)
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_mla_prefill_gluon_kernels_agree(device, require, dtype, is_causal):
+    # Both kernels stay reachable by name, e.g. for A/B runs.
+    require("attention", "mla_prefill", "gluon", dtype, "q")
+    torch.manual_seed(0)
+    q_lens, kv_lens = (300, 5, 700), (300, 900, 700)
+    q = _randn((sum(q_lens), 4, 192), dtype, device)
+    k = _randn((sum(kv_lens), 4, 192), dtype, device)
+    v = _randn((sum(kv_lens), 4, 128), dtype, device)
+    cu_q = torch.tensor([0, 300, 305, 1005], dtype=torch.int32, device=device)
+    cu_kv = torch.tensor([0, 300, 1200, 1900], dtype=torch.int32, device=device)
+    (out, lse), (other_out, other_lse) = [
+        mla_prefill(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=cu_kv,
+            max_seqlen_q=max(q_lens),
+            max_seqlen_kv=max(kv_lens),
+            softmax_scale=192**-0.5,
+            is_causal=is_causal,
+            return_lse=True,
+            override=kernel,
+        )
+        for kernel in _KERNELS
+    ]
+    torch.testing.assert_close(
+        out.float(), other_out.float(), rtol=_OUT_TOLS[dtype], atol=_OUT_TOLS[dtype]
+    )
+    torch.testing.assert_close(lse, other_lse, rtol=_LSE_TOL, atol=_LSE_TOL)

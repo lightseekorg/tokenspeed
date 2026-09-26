@@ -63,6 +63,9 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.prefill import (
         launch_gluon_mla_prefill_gfx950 as _mla_prefill_gfx950_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.prefill_8wave import (
+        launch_gluon_mla_prefill_8wave_gfx950 as _mla_prefill_8wave_gfx950_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.project_value import (
         launch_gluon_mla_project_value_gfx950 as _mla_project_value_impl,
     )
@@ -607,6 +610,46 @@ if current_platform().is_amd:
     )
     def gluon_mla_prefill_gfx950(*args, **kwargs):
         return _mla_prefill_gfx950_impl(*args, **kwargs)
+
+    def _is_8wave_mla_prefill_problem(
+        batch_size: int, total_q: int, total_kv: int
+    ) -> bool:
+        # For FP8 both kernels cover 256 query rows per block, so the 8-wave
+        # pipeline wins once each sequence has enough keys to pay off
+        # refilling it for every block. The threshold comes from cold-cache
+        # measurements of Kimi-K3 prefill shapes.
+        return total_kv >= 1024 * batch_size
+
+    @register_kernel(
+        "attention",
+        "mla_prefill",
+        name="gluon_mla_prefill_8wave_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        # Registered for FP8 only for now. gluon_mla_prefill_gfx950 covers
+        # 16-bit inputs; measure and register support for 16-bit if needs arise.
+        signatures=format_signatures(
+            ("q", "k", "v"),
+            "dense",
+            {torch.float8_e4m3fn, torch.float8_e5m2},
+        ),
+        # Preferred over gluon_mla_prefill_gfx950 wherever both apply.
+        priority=Priority.SPECIALIZED + 1,
+        traits={
+            "qkv_problem_filter": frozenset({_is_8wave_mla_prefill_problem}),
+            "head_dim": frozenset({192}),
+            "value_head_dim": frozenset({128}),
+            "is_causal": frozenset({False, True}),
+            "logit_cap": frozenset({False}),
+            "return_lse": frozenset({False, True}),
+        },
+    )
+    def gluon_mla_prefill_8wave_gfx950(*args, **kwargs):
+        return _mla_prefill_8wave_gfx950_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",

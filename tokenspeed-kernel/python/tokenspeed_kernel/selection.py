@@ -327,7 +327,10 @@ def ref_compatible_with_spec(ref: KernelSpec, spec: KernelSpec) -> bool:
 # well as by ``spec_matches_traits`` so that shape-only callers (numerics,
 # benchmarks) see the full envelope, and a spec that constrains one of them
 # rejects a request that omits it.
-_SHAPE_DIMS: tuple[str, ...] = ("batch", "m", "n", "k")
+_MNK_PROBLEM_DIMS: tuple[str, ...] = ("batch", "m", "n", "k")
+
+# Attention problem dimensions, in ``qkv_problem_filter`` argument order.
+_QKV_PROBLEM_DIMS: tuple[str, ...] = ("batch_size", "total_q", "total_kv")
 
 # Suffixes that turn a dimension trait ``<dim>`` into a bound on a spec.
 _BOUND_SUFFIXES: tuple[tuple[str, Callable[[int, int], bool]], ...] = (
@@ -348,11 +351,15 @@ def spec_matches_shape_traits(spec: KernelSpec, traits: dict[str, Any]) -> bool:
 
     Rules those cannot express go in ``mnk_problem_filter``, a set of
     ``(m, n, k) -> bool`` predicates of which at least one must accept.
+    Attention ops describe their problem with ``batch_size``, ``total_q`` and
+    ``total_kv``; ``qkv_problem_filter`` is the matching set of
+    ``(batch_size, total_q, total_kv) -> bool`` predicates.
 
     A declared bound is a hard requirement: a spec that declares
     ``<dim>_align`` or ``<dim>_min`` rejects any request that does not supply
-    ``<dim>``, and a ``mnk_problem_filter`` rejects a request missing any of
-    ``m``, ``n`` or ``k``. Exact sets are matched by value membership; for the
+    ``<dim>``, a ``mnk_problem_filter`` rejects a request missing any of
+    ``m``, ``n`` or ``k``, and a ``qkv_problem_filter`` one missing any of
+    its three dimensions. Exact sets are matched by value membership; for the
     GEMM dimensions ``batch``, ``m``, ``n`` and ``k`` that is also enforced
     here and a spec constraining one of them rejects a request that omits it.
     Dimensions a spec does not constrain are ignored.
@@ -372,7 +379,7 @@ def spec_matches_shape_traits(spec: KernelSpec, traits: dict[str, Any]) -> bool:
             if not any(satisfies(value, bound) for bound in bounds):
                 return False
 
-    for dim in _SHAPE_DIMS:
+    for dim in _MNK_PROBLEM_DIMS:
         exact = spec.traits.get(dim)
         if exact is None:
             continue
@@ -386,6 +393,14 @@ def spec_matches_shape_traits(spec: KernelSpec, traits: dict[str, Any]) -> bool:
         if not all(isinstance(dim, int) for dim in (m, n, k)):
             return False
         if not any(problem_filter(m, n, k) for problem_filter in problem_filters):
+            return False
+
+    qkv_filters = spec.traits.get("qkv_problem_filter")
+    if qkv_filters is not None:
+        problem = [traits.get(dim) for dim in _QKV_PROBLEM_DIMS]
+        if not all(isinstance(dim, int) for dim in problem):
+            return False
+        if not any(qkv_filter(*problem) for qkv_filter in qkv_filters):
             return False
 
     return True

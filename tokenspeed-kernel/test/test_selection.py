@@ -475,6 +475,57 @@ class TestSpecMatchesShapeTraits:
         assert not spec_matches_shape_traits(spec, {"m": 256, "n": 4096})
         assert not spec_matches_shape_traits(spec, {})
 
+    def test_qkv_problem_filter_matches_problem(self):
+        def is_large_problem(batch_size: int, total_q: int, total_kv: int) -> bool:
+            return total_q >= 128 * batch_size and total_kv >= 512 * batch_size
+
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"qkv_problem_filter": frozenset({is_large_problem})},
+        )
+
+        problem = {"batch_size": 2, "total_q": 2048, "total_kv": 2048}
+        assert spec_matches_shape_traits(spec, problem)
+        assert not spec_matches_shape_traits(spec, {**problem, "total_q": 128})
+        assert not spec_matches_shape_traits(spec, {**problem, "total_kv": 512})
+        assert _filter_by_traits([spec], problem) == [spec]
+        assert not _filter_by_traits([spec], {**problem, "total_kv": 512})
+
+    def test_qkv_problem_filter_passes_dimensions_in_order(self):
+        seen = []
+
+        def record(*dims: int) -> bool:
+            seen.append(dims)
+            return True
+
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"qkv_problem_filter": frozenset({record})},
+        )
+
+        assert spec_matches_shape_traits(
+            spec, {"num_q_heads": 4, "total_kv": 3, "total_q": 2, "batch_size": 1}
+        )
+        assert seen == [(1, 2, 3)]
+
+    def test_qkv_problem_filter_requires_complete_problem(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"qkv_problem_filter": frozenset({lambda *dims: True})},
+        )
+        problem = {"batch_size": 1, "total_q": 1, "total_kv": 1}
+
+        assert spec_matches_shape_traits(spec, problem)
+        for missing in problem:
+            partial = {k: v for k, v in problem.items() if k != missing}
+            assert not spec_matches_shape_traits(spec, partial)
+
     def test_filter_by_traits_applies_shape_and_value_traits(self):
         spec = KernelSpec(
             name="k",
