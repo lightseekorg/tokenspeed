@@ -97,6 +97,23 @@ def _produced_into(
     )
 
 
+def _produced_into_lane(
+    routed_partial: torch.Tensor,
+    shared_partial: torch.Tensor,
+    lane: torch.Tensor | None,
+    routed_hidden: int,
+) -> bool:
+    """Both partials were stored into the packed join buffer."""
+
+    if lane is None or routed_partial.data_ptr() != lane.data_ptr():
+        return False
+    shared_lane = lane[:, routed_hidden:]
+    return (
+        shared_partial.shape == shared_lane.shape
+        and shared_partial.data_ptr() == shared_lane.data_ptr()
+    )
+
+
 def kimi3_join_reduce_moe(
     routed_partial: torch.Tensor,
     shared_partial: torch.Tensor,
@@ -118,9 +135,11 @@ def kimi3_join_reduce_moe(
       This is the only regime that reaches the symmetric kernel -- the backend
       decides on the tuple operand, so a single concatenated tensor cannot get
       there however its memory was allocated.
-    * Lane hit (decode batch=1): the partials were produced straight into the
-      persistent fused lane, one one-shot reduce with an eligible norm
-      epilogue and zero copies, but the collective stages them first.
+    * Lane hit: the partials were produced straight into one packed buffer.
+      Batch 1 uses the persistent fused lane. CDNA5 decode up to 32 tokens
+      uses the same layout so the join copy is not launched. One one-shot
+      reduce follows, with a norm epilogue when that collective accepts the
+      row count. The collective still stages the buffer.
     * Small partials: cat into one contiguous operand and take a single
       one-shot reduce; the copy is a couple of microseconds there.
     * Partials past the one-shot window (prefill-sized chunks): the cat would
@@ -137,7 +156,7 @@ def kimi3_join_reduce_moe(
             routed_out = routed_norm(routed_out)
         return routed_out, shared_out
 
-    if lane is not None and routed_partial.data_ptr() == lane.data_ptr():
+    if _produced_into_lane(routed_partial, shared_partial, lane, routed_hidden):
         fused = lane
     elif (
         routed_partial.numel() * routed_partial.element_size() > COMM_ONESHOT_MAX_BYTES
