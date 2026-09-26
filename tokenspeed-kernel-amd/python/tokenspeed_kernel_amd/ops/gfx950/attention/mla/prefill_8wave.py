@@ -21,9 +21,7 @@
 """Warp-pipelined MLA prefill Gluon kernel for AMD GFX950.
 
 The two-wave ping-pong design is inspired by and adapted from the flash
-attention kernels in ROCm/gfx950-gluon-tutorials. The previous kernel stays in
-``prefill.py``; this module reuses its per-program helpers and persistent work
-scheduler.
+attention kernels in ROCm/gfx950-gluon-tutorials.
 """
 
 from __future__ import annotations

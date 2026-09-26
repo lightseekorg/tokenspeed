@@ -476,10 +476,8 @@ class TestSpecMatchesShapeTraits:
         assert not spec_matches_shape_traits(spec, {})
 
     def test_qkv_problem_filter_matches_problem(self):
-        def is_large_problem(
-            batch_size: int, total_q: int, total_kv: int, num_q_heads: int
-        ) -> bool:
-            return num_q_heads * total_q >= 32768 and total_kv >= 512 * batch_size
+        def is_large_problem(batch_size: int, total_q: int, total_kv: int) -> bool:
+            return total_q >= 128 * batch_size and total_kv >= 512 * batch_size
 
         spec = KernelSpec(
             name="k",
@@ -489,13 +487,11 @@ class TestSpecMatchesShapeTraits:
         )
 
         problem = {"batch_size": 2, "total_q": 2048, "total_kv": 2048}
-        assert spec_matches_shape_traits(spec, {**problem, "num_q_heads": 16})
-        assert not spec_matches_shape_traits(spec, {**problem, "num_q_heads": 8})
-        assert not spec_matches_shape_traits(
-            spec, {**problem, "total_kv": 512, "num_q_heads": 16}
-        )
-        assert _filter_by_traits([spec], {**problem, "num_q_heads": 16}) == [spec]
-        assert not _filter_by_traits([spec], {**problem, "num_q_heads": 8})
+        assert spec_matches_shape_traits(spec, problem)
+        assert not spec_matches_shape_traits(spec, {**problem, "total_q": 128})
+        assert not spec_matches_shape_traits(spec, {**problem, "total_kv": 512})
+        assert _filter_by_traits([spec], problem) == [spec]
+        assert not _filter_by_traits([spec], {**problem, "total_kv": 512})
 
     def test_qkv_problem_filter_passes_dimensions_in_order(self):
         seen = []
@@ -514,7 +510,7 @@ class TestSpecMatchesShapeTraits:
         assert spec_matches_shape_traits(
             spec, {"num_q_heads": 4, "total_kv": 3, "total_q": 2, "batch_size": 1}
         )
-        assert seen == [(1, 2, 3, 4)]
+        assert seen == [(1, 2, 3)]
 
     def test_qkv_problem_filter_requires_complete_problem(self):
         spec = KernelSpec(
@@ -523,7 +519,7 @@ class TestSpecMatchesShapeTraits:
             mode="m",
             traits={"qkv_problem_filter": frozenset({lambda *dims: True})},
         )
-        problem = {"batch_size": 1, "total_q": 1, "total_kv": 1, "num_q_heads": 1}
+        problem = {"batch_size": 1, "total_q": 1, "total_kv": 1}
 
         assert spec_matches_shape_traits(spec, problem)
         for missing in problem:

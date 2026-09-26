@@ -612,12 +612,12 @@ if current_platform().is_amd:
         return _mla_prefill_gfx950_impl(*args, **kwargs)
 
     def _is_8wave_mla_prefill_problem(
-        batch_size: int, total_q: int, total_kv: int, num_q_heads: int
+        batch_size: int, total_q: int, total_kv: int
     ) -> bool:
-        # For FP8 both kernels cover 256 query rows per block, so the 8-wave
-        # pipeline wins once each sequence has enough keys to pay off
-        # refilling it for every block. The threshold comes from cold-cache
-        # measurements of Kimi-K3 prefill shapes.
+        # For FP8 the 8-wave pipeline kernel cover 256 query rows per block,
+        # it wins once each sequence has enough keys to pay off refilling it
+        # for every block. The threshold comes from cold-cache measurements of
+        # Kimi-K3 prefill shapes.
         return total_kv >= 1024 * batch_size
 
     @register_kernel(
@@ -630,8 +630,8 @@ if current_platform().is_amd:
             max_arch_version=ArchVersion(9, 5),
             vendors=frozenset({"amd"}),
         ),
-        # Registered for FP8 only for now; 16-bit inputs use
-        # gluon_mla_prefill_gfx950.
+        # Registered for FP8 only for now. gluon_mla_prefill_gfx950 covers
+        # 16-bit inputs; measure and register support for 16-bit if needs arise.
         signatures=format_signatures(
             ("q", "k", "v"),
             "dense",
