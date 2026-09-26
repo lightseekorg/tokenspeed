@@ -43,7 +43,7 @@ term subtracted, so the exponent stays <= 0.
 
 Variable-length prefill: multiple requests are packed into one flat token buffer
 and delimited by ``cu_seqlens`` (a prefix-sum of per-sequence lengths).
-``prepare_chunk_indices`` maps each global chunk to
+A device-side plan maps each global chunk to
 its ``(sequence, local-chunk)`` so chunks never span a sequence boundary, the
 chunk-local cumsum resets per sequence, and the sequential scan restarts ``H``
 from each sequence's own initial state. A single sequence is just the ``N = 1``
@@ -63,6 +63,8 @@ from tokenspeed_kernel_amd._triton import gl, gluon, triton
 _CHUNK_SIZE = 64
 _SUBCHUNK_SIZE = 16
 _FUSED_PREPROCESS_WARPS = 4
+_STATE_SCAN_OUTPUT_BLOCK = 16
+_STATE_SCAN_WAVES_PER_EU = 2
 cdna4 = gl.amd.cdna4
 
 
@@ -840,6 +842,72 @@ def gluon_kda_paged_prefill_gfx950(
     )
 
 
+@gluon.jit
+def gluon_kda_paged_prefill_plan_gfx950(
+    cu_seqlens,
+    chunk_indices,
+    num_sequences,
+    num_chunks,
+    BT: gl.constexpr,
+    BLOCK: gl.constexpr,
+    SEQUENCE_BLOCK: gl.constexpr,
+):
+    """Map each global chunk slot to its ``(sequence, local chunk)`` on device.
+
+    The grid covers ``cdiv(T, BT) + N - 1`` slots, which bounds the live chunk
+    count for any boundaries within ``T`` tokens. Slots past the live chunks
+    map to the last sequence beyond its length, so every chunk kernel masks
+    them out. Reading the boundaries on device keeps the plan free of host
+    synchronization and valid under graph replay.
+    """
+    layout: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [4, 1], [1, 0])
+    # The scan lowers on a plain blocked layout, not on a slice of ``layout``.
+    scan_layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
+    scan_slots = gl.arange(0, SEQUENCE_BLOCK, layout=scan_layout)
+    live = scan_slots < num_sequences
+    begin = gl.load(cu_seqlens + scan_slots, mask=live, other=0)
+    end = gl.load(cu_seqlens + scan_slots + 1, mask=live, other=0)
+    scan_counts = gl.cdiv(end - begin, BT)
+    scan_ends = gl.associative_scan(scan_counts, 0, _add)
+    counts = gl.convert_layout(scan_counts, gl.SliceLayout(0, layout))
+    ends = gl.convert_layout(scan_ends, gl.SliceLayout(0, layout))
+    slots = gl.arange(0, SEQUENCE_BLOCK, layout=gl.SliceLayout(0, layout))
+
+    index = gl.program_id(0) * BLOCK + gl.arange(
+        0, BLOCK, layout=gl.SliceLayout(1, layout)
+    )
+    # Passing every earlier sequence's end selects the sequence; the last
+    # sequence absorbs the unused slots.
+    passed = (index[:, None] >= ends[None, :]) & (slots[None, :] < num_sequences - 1)
+    sequence = gl.sum(passed.to(gl.int32), 1)
+    first = gl.sum(gl.where(slots[None, :] < sequence[:, None], counts[None, :], 0), 1)
+    store_mask = index < num_chunks
+    gl.store(chunk_indices + index * 2, sequence, mask=store_mask)
+    gl.store(chunk_indices + index * 2 + 1, index - first, mask=store_mask)
+
+
+def _plan_chunks(
+    cu_seqlens: torch.Tensor, total_tokens: int, chunk_size: int
+) -> torch.Tensor:
+    num_sequences = cu_seqlens.numel() - 1
+    num_chunks = triton.cdiv(total_tokens, chunk_size) + num_sequences - 1
+    chunk_indices = torch.empty(
+        num_chunks, 2, dtype=torch.int32, device=cu_seqlens.device
+    )
+    block = 128
+    gluon_kda_paged_prefill_plan_gfx950[(triton.cdiv(num_chunks, block),)](
+        cu_seqlens,
+        chunk_indices,
+        num_sequences,
+        num_chunks,
+        BT=chunk_size,
+        BLOCK=block,
+        SEQUENCE_BLOCK=max(64, triton.next_power_of_2(num_sequences)),
+        num_warps=4,
+    )
+    return chunk_indices
+
+
 def _launch_producer(
     *,
     num_chunks: int,
@@ -913,7 +981,11 @@ def launch_gluon_kda_paged_prefill_gfx950(
         dt_bias: Per-head, per-key-channel gate bias with shape ``[H,K]``.
         initial_state: Initial V-major state ``[N,H,V,K]`` (value-major,
             matching the gfx950 decode recurrent-state pool layout).
-        cu_seqlens: Packed-sequence prefix sums with shape ``[N+1]``.
+        cu_seqlens: Packed-sequence prefix sums with shape ``[N+1]``. The live
+            tokens may end before ``T``: rows past ``cu_seqlens[-1]`` are
+            never read and their output rows are left unwritten. Chunk
+            planning reads the boundaries on device, so the launch issues no
+            host synchronization and replays correctly in a graph.
         lower_bound: Optional lower bound used by the safe decay gate.
 
     Returns:
@@ -948,12 +1020,10 @@ def launch_gluon_kda_paged_prefill_gfx950(
     if cu_seqlens.numel() - 1 != initial_state.shape[0]:
         raise ValueError("cu_seqlens and initial_state must describe the same batch")
 
-    from tokenspeed_kernel.ops.attention.gdn.triton import prepare_chunk_indices
-
     chunk_size = _CHUNK_SIZE
     subchunk_size = _SUBCHUNK_SIZE
     total_tokens = q.shape[0]
-    chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+    chunk_indices = _plan_chunks(cu_seqlens, total_tokens, chunk_size)
     num_chunks = chunk_indices.shape[0]
     num_sequences = cu_seqlens.numel() - 1
 
@@ -1017,7 +1087,7 @@ def launch_gluon_kda_paged_prefill_gfx950(
     output = torch.empty_like(v)
     final_state = torch.empty_like(initial_state)
     initial_state_contiguous = initial_state.contiguous()
-    scan_output_block = 8
+    scan_output_block = _STATE_SCAN_OUTPUT_BLOCK
     _launch_producer(
         num_chunks=num_chunks,
         heads=heads,
@@ -1056,7 +1126,7 @@ def launch_gluon_kda_paged_prefill_gfx950(
         BO=scan_output_block,
         num_warps=4,
         num_stages=2,
-        waves_per_eu=4,
+        waves_per_eu=_STATE_SCAN_WAVES_PER_EU,
     )
     gluon_kda_paged_prefill_gfx950[(num_chunks, heads)](
         aqk,

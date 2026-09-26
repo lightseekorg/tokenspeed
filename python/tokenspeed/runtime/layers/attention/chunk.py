@@ -198,3 +198,91 @@ def build_chunked_prefill_metadata_arrays(
         chunks.cum_seq_lens,
         max_chunk_len_per_loop,
     )
+
+
+def build_full_prefill_metadata_arrays(
+    seq_lens: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    page_table: torch.Tensor,
+    page_size: int,
+) -> tuple[
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    int,
+]:
+    """Resolve a batch's complete KV history when one pass can hold it.
+
+    The caller can then expand each compressed MLA row once and execute one
+    bottom-right causal attention launch over prefix plus extend. Histories
+    larger than the configured materialization capacity retain the bounded
+    prefix-replay path.
+    """
+    batch_size = len(seq_lens_cpu)
+    if batch_size == 0:
+        return None, None, None, 0
+
+    max_seq_len = int(seq_lens_cpu.max().item())
+    if max_seq_len > get_max_chunk_capacity() // batch_size:
+        return None, None, None, 0
+
+    chunks, chunk_kv_indices_list, chunks_cpu = get_chunks_paged(
+        seq_lens,
+        seq_lens_cpu,
+        page_table,
+        page_size,
+    )
+    assert chunks.starts.shape[0] == 1
+    return (
+        chunk_kv_indices_list[0],
+        chunks.len_in_chunk[0],
+        chunks.cum_seq_lens[0],
+        int(chunks_cpu.len_in_chunk[0].max().item()),
+    )
+
+
+def build_mla_prefill_metadata_arrays(
+    *,
+    seq_lens: torch.Tensor,
+    extend_prefix_lens: torch.Tensor,
+    extend_prefix_lens_cpu: torch.Tensor,
+    extend_seq_lens_cpu: torch.Tensor,
+    page_table: torch.Tensor,
+    page_size: int,
+) -> tuple[
+    tuple[int, list[torch.Tensor], torch.Tensor, torch.Tensor, list[int]],
+    tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        int,
+    ],
+]:
+    """Build bounded-replay and fitting full-history MLA metadata.
+
+    Args:
+        seq_lens: Complete prefix-plus-extend lengths on the device.
+        extend_prefix_lens: Cached prefix lengths on the device.
+        extend_prefix_lens_cpu: Cached prefix lengths on the host.
+        extend_seq_lens_cpu: Newly admitted token lengths on the host.
+        page_table: Batch-ordered kernel page table.
+        page_size: Number of tokens addressed by each page-table entry.
+
+    Returns:
+        The bounded prefix-replay arrays followed by the optional full-history
+        arrays. An unavailable full-history plan is represented by
+        ``(None, None, None, 0)``.
+    """
+    replay_arrays = build_chunked_prefill_metadata_arrays(
+        extend_prefix_lens,
+        extend_prefix_lens_cpu,
+        page_table,
+        page_size,
+    )
+    full_history_arrays = build_full_prefill_metadata_arrays(
+        seq_lens,
+        extend_prefix_lens_cpu + extend_seq_lens_cpu,
+        page_table,
+        page_size,
+    )
+    return replay_arrays, full_history_arrays

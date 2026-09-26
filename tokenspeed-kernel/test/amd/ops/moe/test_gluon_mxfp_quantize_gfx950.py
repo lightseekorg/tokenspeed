@@ -433,3 +433,44 @@ def test_dynamic_fp8_quantize_single_pass_bound_matches_spill_cliff() -> None:
     # Exactly on the bound is still single-pass; one element past it is not.
     assert _dynamic_fp8_use_single_pass(_DYNAMIC_FP8_SINGLE_PASS_MAX_ELEMENTS)
     assert not _dynamic_fp8_use_single_pass(_DYNAMIC_FP8_SINGLE_PASS_MAX_ELEMENTS + 1)
+
+
+@pytest.mark.parametrize("flatten_topk", [False, True])
+@pytest.mark.parametrize("tokens,sorted_rows", [(8192, 131072 + 896 * 32), (37, 640)])
+def test_gather_package_scale_matches_swizzled_reference_gfx950(
+    flatten_topk: bool, tokens: int, sorted_rows: int
+) -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale import (
+        gather_package_cdna4_scale,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
+        swizzle_cdna4_mxfp4_scale,
+    )
+
+    torch.manual_seed(5)
+    top_k, cols = 16, 3584
+    k_scale = cols // 32
+    source_rows = tokens * top_k if flatten_topk else tokens
+    logical = torch.randint(0, 256, (source_rows, k_scale), dtype=torch.uint8)
+    token = torch.randint(0, tokens, (sorted_rows,))
+    slot = torch.randint(0, top_k, (sorted_rows,))
+    # Padded route slots carry the out-of-range token sentinel.
+    padding = torch.rand(sorted_rows) < 0.1
+    token[padding] = tokens
+    sorted_ids = ((slot << 24) | token).to(torch.int32)
+    source = logical.cuda()
+    out = gather_package_cdna4_scale(
+        source,
+        sorted_ids.cuda(),
+        source_rows=source_rows,
+        cols=cols,
+        top_k=top_k,
+        flatten_topk=flatten_topk,
+    )
+    src_row = token * top_k + slot if flatten_topk else token
+    in_range = src_row < source_rows
+    expected = torch.full((sorted_rows, k_scale), 127, dtype=torch.uint8)
+    expected[in_range] = logical[src_row[in_range]]
+    # Every destination row is written; rows are a multiple of the 32-row block.
+    swizzled = swizzle_cdna4_mxfp4_scale(expected.cuda())[0]
+    assert torch.equal(out.view(-1), swizzled.t().contiguous().view(-1))

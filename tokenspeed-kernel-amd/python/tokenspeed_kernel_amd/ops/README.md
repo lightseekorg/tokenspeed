@@ -140,6 +140,57 @@ decisions.
 
 ## Attention
 
+### gfx950 KDA prefill
+
+The chunk-parallel KDA prefill path processes 64-token chunks in parallel and
+keeps only the recurrent state carry serial across chunks. Its state-scan
+kernel owns a contiguous output-row tile for one sequence and attention head;
+each program computes the inter-chunk output, delta update, and next state for
+that tile.
+
+The gfx950 scan uses 16 output rows per four-wave workgroup with a two-wave-per-
+EU residency hint. This halves the workgroup count relative to an eight-row
+tile while increasing useful MFMA work per state load. The geometry is tuned
+for KDA's 128-wide key/value state and the one- or two-sequence 8K-token
+prefill batches emitted by the TokenSpeed scheduler.
+
+Chunk planning runs on device: one planner launch maps
+`ceil(T / 64) + N - 1` chunk slots to `(sequence, local chunk)` from the
+device `cu_seqlens`, and slots past the live chunks fall beyond the last
+sequence's length. Every chunk kernel masks by the live length, so rows past
+`cu_seqlens[-1]` are never read and their output rows stay unwritten. The
+launch therefore issues no host synchronization, and one graph capture at a
+fixed token extent replays for any live boundaries that fit it; the kernel
+registers the `prefill_capacity` trait on that basis.
+
+### gfx950 MLA prefill
+
+Dense non-absorbed MLA prefill for packed variable-length requests: Q/K carry
+128 NoPE plus 64 RoPE dimensions, V carries 128, and causal masking aligns each
+request's queries to the end of its KV (bottom-right).
+
+#### Contract
+
+- Q, K and V share one dtype: FP16, BF16, or FP8 (E4M3/E5M2, unit scale).
+  Output is BF16 ``[tokens, heads, 128]``; the natural-log LSE is optional.
+- One persistent 512-block grid serves every shape. Query length is a runtime
+  bound, so varying prompt lengths reuse one compiled kernel per variant.
+
+#### Algorithm
+
+Each work item owns one query block of one head and streams its visible KV
+tiles through an online softmax, overlapping each tile's QK with the previous
+tile's softmax and PV. Causal launches interleave heavy and light query blocks
+across the persistent blocks.
+
+An FP8 launch with too few query blocks to fill half the grid, such as a short
+prefill tail against a long history, also splits each block's visible KV
+tiles into equal shares, as many as fit one round of the grid (at most 16, at
+least 16 tiles each). Each split writes its normalized FP32 output and LSE;
+``gluon_mla_prefill_combine_gfx950`` merges the splits by LSE. Splits that
+receive no tiles report LSE ``-inf`` and contribute nothing. For Kimi K3 TP8,
+the 848-token tail of a 50K prompt drops from 1.01 ms to 0.32 ms per layer.
+
 ### DeepSeek V4 attention
 
 The gfx950 and gfx1250 packages provide MXFP4 index selection. Gfx950 also
@@ -283,6 +334,51 @@ zero padding is masked before comparison. Tile sizes account for element size
 and batch size to limit shared-memory usage.
 
 ## MoE
+
+### gfx950 Kimi K3 TP8 SiTU decode
+
+The Kimi K3 TP8/EP1 path uses E4M3 activations and preshuffled MXFP4 expert
+weights. Each rank owns the 384-column shard of the routed intermediate. The
+gate/up kernel applies SiTU and writes an E4M3 token-slot intermediate; the
+down kernel multiplies that intermediate by each selected expert and combines
+the 16 routed contributions into BF16 output.
+
+For decode widths from 8 through 16, the down kernel performs the top-k combine
+inside each output CTA. Its N tile scales from 16 columns at eight tokens to 32
+columns at 16 tokens. This keeps the one-wave grid near a useful machine-wave
+count while removing the `[tokens, top-k, hidden]` partial tensor and its
+reduction launch. Widths below 8 and between 17 and 63 retain split top-k with
+a 64-column tile because the combined grid is slower end to end there.
+Shared-down fusion also retains split top-k because its reduction kernel owns
+the shared-expert projection.
+
+The combined kernel rounds every weighted expert contribution to the output
+dtype before accumulating it in FP32. This deliberately matches the split
+path's BF16 partial-store boundary and summation order, keeping the two paths
+bitwise identical rather than changing model logits for a small latency gain.
+
+At width 64 (the TP8/EP1 EAGLE3 concurrency-16 decode width), a compact route
+sort packs each expert's routes into 16-row MFMA tiles. W13 and W2 then reuse an
+expert's weights across all rows in a tile instead of issuing one mostly-empty
+MFMA tile per route. W13 scatters its E4M3 intermediates in sorted order; W2
+scatters BF16 weighted route partials back to their original token/top-k slots,
+and the existing FP32 top-k reduction preserves the original summation order.
+The sorter uses the minimum route-program count and fuses histogram with prefix
+scan for this at-most-1024-route decode case. Package prefill retains its
+locality-oriented multi-chunk sorting schedule.
+
+### gfx950 MXFP4 package prefill activation scales
+
+The package prefill path (MXFP4 weights and E2M1 activations, as in Kimi K3
+TP8 prefill) quantizes activations once in token order, while stage 1 reads
+its A scales in sorted-route order with the CDNA4 MFMA swizzle. The quantizer
+therefore writes row-major ``[tokens, K // 32]`` scales
+(``swizzle_scale=False``), and ``gather_package_cdna4_scale`` builds the
+sorted-route copy: each program owns one 32-row destination block, loads its
+rows with contiguous vector loads, permutes the tile into the swizzle in
+registers, and stores the block contiguously. Gathering from an already
+swizzled source would instead cost one small L2 request per two scale bytes;
+at K3 TP8 prefill size the row-major gather takes ~19 us instead of 61 us.
 
 ### gfx950 latent input projection
 

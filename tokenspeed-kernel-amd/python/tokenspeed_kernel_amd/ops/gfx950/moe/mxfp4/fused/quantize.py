@@ -166,6 +166,7 @@ def _mxfp4_quantize_cdna4_scale_kernel(
     BLOCK_SIZE: tl.constexpr,
     M_SWIZZLE: tl.constexpr,
     K_SWIZZLE: tl.constexpr,
+    SWIZZLE_SCALE: tl.constexpr,
 ):
     out_m = tl.program_id(0)
     k_group = tl.program_id(1)
@@ -220,20 +221,25 @@ def _mxfp4_quantize_cdna4_scale_kernel(
         scale_block_base = tl.load(scale_block_offs_ptr + expert)
         scale_m = scale_block_base * M_SWIZZLE + (out_m - compact_base)
 
-    m_in_block = scale_m % M_SWIZZLE
-    m_hi = m_in_block // 16
-    m_lo = m_in_block % 16
-    k_block = k_group // K_SWIZZLE
-    k_in_block = k_group % K_SWIZZLE
-    k_hi = k_in_block // 4
-    k_lo = k_in_block % 4
-    swizzled_k = (((k_block * 4 + k_lo) * 16 + m_lo) * 2 + k_hi) * 2 + m_hi
-    m_block = scale_m // M_SWIZZLE
-    tl.store(
-        scale_ptr + swizzled_k * scale_stride_kswizzled + m_block * scale_stride_mblock,
-        scale_byte,
-        mask=valid,
-    )
+    if SWIZZLE_SCALE:
+        m_in_block = scale_m % M_SWIZZLE
+        m_hi = m_in_block // 16
+        m_lo = m_in_block % 16
+        k_block = k_group // K_SWIZZLE
+        k_in_block = k_group % K_SWIZZLE
+        k_hi = k_in_block // 4
+        k_lo = k_in_block % 4
+        swizzled_k = (((k_block * 4 + k_lo) * 16 + m_lo) * 2 + k_hi) * 2 + m_hi
+        m_block = scale_m // M_SWIZZLE
+        tl.store(
+            scale_ptr
+            + swizzled_k * scale_stride_kswizzled
+            + m_block * scale_stride_mblock,
+            scale_byte,
+            mask=valid,
+        )
+    else:
+        tl.store(scale_ptr + scale_m * K_SCALE + k_group, scale_byte, mask=valid)
 
 
 @triton.jit
@@ -259,6 +265,7 @@ def _mxfp4_quantize_cdna4_scale_tiled_kernel(
     K_SWIZZLE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K_SCALE: tl.constexpr,
+    SWIZZLE_SCALE: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_ks = tl.program_id(1)
@@ -321,25 +328,34 @@ def _mxfp4_quantize_cdna4_scale_tiled_kernel(
         scale_block_base = tl.load(scale_block_offs_ptr + expert)
         scale_m = scale_block_base * M_SWIZZLE + (offs_m - compact_base)
 
-    m_in_block = scale_m % M_SWIZZLE
-    m_hi = m_in_block // 16
-    m_lo = m_in_block % 16
-    k_block = offs_ks // K_SWIZZLE
-    k_in_block = offs_ks % K_SWIZZLE
-    k_hi = k_in_block // 4
-    k_lo = k_in_block % 4
-    swizzled_k = (
-        ((k_block * 4 + k_lo) * 16 + tl.expand_dims(m_lo, 1)) * 2 + k_hi
-    ) * 2 + tl.expand_dims(m_hi, 1)
-    m_block = scale_m // M_SWIZZLE
     scale_mask = tl.expand_dims(valid_m, 1) & tl.expand_dims(valid_ks, 0)
-    tl.store(
-        scale_ptr
-        + swizzled_k * scale_stride_kswizzled
-        + tl.expand_dims(m_block, 1) * scale_stride_mblock,
-        scale_byte,
-        mask=scale_mask,
-    )
+    if SWIZZLE_SCALE:
+        m_in_block = scale_m % M_SWIZZLE
+        m_hi = m_in_block // 16
+        m_lo = m_in_block % 16
+        k_block = offs_ks // K_SWIZZLE
+        k_in_block = offs_ks % K_SWIZZLE
+        k_hi = k_in_block // 4
+        k_lo = k_in_block % 4
+        swizzled_k = (
+            ((k_block * 4 + k_lo) * 16 + tl.expand_dims(m_lo, 1)) * 2 + k_hi
+        ) * 2 + tl.expand_dims(m_hi, 1)
+        m_block = scale_m // M_SWIZZLE
+        tl.store(
+            scale_ptr
+            + swizzled_k * scale_stride_kswizzled
+            + tl.expand_dims(m_block, 1) * scale_stride_mblock,
+            scale_byte,
+            mask=scale_mask,
+        )
+    else:
+        tl.store(
+            scale_ptr
+            + tl.expand_dims(scale_m, 1) * K_SCALE
+            + tl.expand_dims(offs_ks, 0),
+            scale_byte,
+            mask=scale_mask,
+        )
 
 
 def _as_gather_tensor(gather_indx: Any | None) -> torch.Tensor | None:
@@ -353,8 +369,15 @@ def _quantize_mxfp4_activation(
     gather_indx: Any | None = None,
     ragged_metadata: Any | None = None,
     *,
+    swizzle_scale: bool,
     _force_scalar: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize activations to MXFP4 with one E8M0 scale per 32 values.
+
+    ``swizzle_scale`` selects the scale layout: the CDNA4 MFMA swizzle that
+    the stage kernels read directly, or row-major ``[rows, K // 32]`` for a
+    consumer that reorders rows first (``gather_package_cdna4_scale``).
+    """
     if activations.dtype not in (torch.bfloat16, torch.float16):
         raise TypeError(
             "MXFP4 activation quantization requires bf16/fp16 input, "
@@ -396,7 +419,12 @@ def _quantize_mxfp4_activation(
         slice_offs = _make_dummy(x.device, torch.int32)
         scale_block_offs = _make_dummy(x.device, torch.int32)
         expert_search_steps = 0
-    scale = empty_swizzled_cdna4_mxfp4_scale(scale_rows, k_scale, device=x.device)
+    if swizzle_scale:
+        scale = empty_swizzled_cdna4_mxfp4_scale(scale_rows, k_scale, device=x.device)
+    elif ragged_metadata is not None:
+        raise ValueError("ragged MXFP4 activation scales must be swizzled")
+    else:
+        scale = torch.empty((rows, k_scale), dtype=torch.uint8, device=x.device)
     if rows == 0:
         return out, scale
 
@@ -444,6 +472,7 @@ def _quantize_mxfp4_activation(
             K_SWIZZLE=_ALIGN_K_SCALE_SWIZZLE,
             BLOCK_M=block_m,
             BLOCK_K_SCALE=block_k_scale,
+            SWIZZLE_SCALE=swizzle_scale,
             num_warps=4,
         )
     else:
@@ -468,6 +497,7 @@ def _quantize_mxfp4_activation(
             BLOCK_SIZE=MXFP4_BLOCK,
             M_SWIZZLE=_NON_K_PRESHUFFLE_BLOCK_SIZE,
             K_SWIZZLE=_ALIGN_K_SCALE_SWIZZLE,
+            SWIZZLE_SCALE=swizzle_scale,
             num_warps=1,
         )
     return out, scale

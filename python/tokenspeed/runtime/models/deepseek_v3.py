@@ -481,7 +481,13 @@ class DeepseekV3FusedQkvAProjWithMqa(ReplicatedLinear):
 
 class DeepseekV3AttentionMLA(nn.Module):
     # Backends that use non-absorbed MLA kernels (ragged prefill, paged KV decode).
-    _MLA_KERNEL_BACKENDS = ("mla", "gluon", "trtllm_mla", "tokenspeed_mla")
+    _MLA_KERNEL_BACKENDS = (
+        "mla",
+        "gluon",
+        "trtllm_mla",
+        "tokenspeed_mla",
+        "hybrid_linear_attn",
+    )
     # Backends that support chunked ragged prefill with prefix replay.
     _RAGGED_PREFILL_BACKENDS = ("mla", "trtllm_mla", "tokenspeed_mla")
 
@@ -673,6 +679,12 @@ class DeepseekV3AttentionMLA(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def _can_use_full_history_prefill(
+        self, *, full_kv_indices: torch.Tensor | None
+    ) -> bool:
+        """Whether this MLA layer can consume the prepared full-history view."""
+        return self.rotary_emb is None and full_kv_indices is not None
+
     def _project_q_latent(
         self,
         hidden_states: torch.Tensor,
@@ -759,7 +771,11 @@ class DeepseekV3AttentionMLA(nn.Module):
             prefill_locs = ctx.attn_backend.write_locations(
                 self.attn_mha, ForwardMode.EXTEND
             )
-            if getattr(cmeta, "use_absorbed_cached_extend", False):
+            if getattr(
+                cmeta, "use_absorbed_cached_extend", False
+            ) and not self._can_use_full_history_prefill(
+                full_kv_indices=cmeta.full_kv_indices
+            ):
                 self.forward_absorb(
                     positions[:num_prefill_tokens],
                     q[:num_prefill_tokens],
@@ -1113,12 +1129,154 @@ class DeepseekV3AttentionMLA(nn.Module):
         # + FP8 quantize would otherwise touch (see scrub_padding_tail).
         ntok = sum(ctx.attn_backend.chunked_prefill_metadata.extend_seq_lens_cpu)
         scrub_padding_tail(ntok, q, latent_cache)
-        q, k, v = self.forward_normal_chunked_kv_prepare(
+        chunk_meta = ctx.attn_backend.chunked_prefill_metadata
+        if self._can_use_full_history_prefill(
+            full_kv_indices=chunk_meta.full_kv_indices
+        ):
+            q = self._prepare_full_history_q_and_cache(
+                q,
+                latent_cache,
+                ctx,
+                out_cache_loc,
+            )
+            return self._forward_full_history_prefill(q, ctx, output)
+
+        q, k, v = self._prepare_prefix_replay_qkv_and_cache(
             positions, q, latent_cache, ctx, out_cache_loc
         )
-        return self.forward_normal_chunked_kv_core(q, k, v, ctx, output)
+        return self._forward_prefix_replay_prefill(q, k, v, ctx, output)
 
-    def forward_normal_chunked_kv_prepare(
+    def _prepare_full_history_q_and_cache(
+        self,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+        ctx: ForwardContext,
+        out_cache_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        """Prepare NoPE Q and cache latent KV without expanding current KV.
+
+        The full-history path expands each compressed row once after the cache
+        write. Expanding the current rows here as well would repeat the most
+        expensive part of MLA materialization.
+        """
+        assert self.rotary_emb is None
+        kv_a, k_pe = latent_cache.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+        k_pe = k_pe.unsqueeze(1)
+        q = q.view(-1, self.num_local_heads, self.qk_head_dim)
+
+        k_scale = getattr(self.attn_mha, "k_scale_float", 1.0)
+        if self._mla_kv_is_fp8(ctx, k_scale):
+            q = fp8_quantize(
+                q,
+                scale=1.0,
+                out=None,
+                fp8_dtype=torch.float8_e4m3fn,
+                enable_pdl=None,
+            )
+            # ``split`` preserves the fused projection's row stride. A
+            # singleton head dimension can still report contiguous, so force
+            # canonical strides for the standalone quantization kernel.
+            k_pe = fp8_quantize(
+                k_pe.clone(memory_format=torch.contiguous_format),
+                scale=k_scale,
+                out=None,
+                fp8_dtype=torch.float8_e4m3fn,
+                enable_pdl=None,
+            )
+
+        # Under decode context parallelism each rank writes only the rows it owns.
+        local_slots, write_mask = resolve_cache_slots(
+            out_cache_loc, ctx.attn_backend.cache_placement(self.attn_mha)
+        )
+        ctx.token_to_kv_pool.set_mla_kv_buffer(
+            self.attn_mha,
+            local_slots,
+            cache_k_nope=kv_a.unsqueeze(1),
+            cache_k_rope=k_pe,
+            write_mask=write_mask,
+        )
+        return q
+
+    def _forward_full_history_prefill(
+        self,
+        q: torch.Tensor,
+        ctx: ForwardContext,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Expand once and attend over prefix plus extend in one invocation."""
+        attn_backend = ctx.attn_backend
+        chunk_meta = attn_backend.chunked_prefill_metadata
+        full_kv_indices = chunk_meta.full_kv_indices
+        assert full_kv_indices is not None
+        assert chunk_meta.full_seq_lens is not None
+        assert chunk_meta.cu_full_seq_lens is not None
+
+        read_dtype = (
+            q.dtype
+            if q.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
+            else torch.bfloat16
+        )
+        # The history spans every rank's rows under decode context parallelism,
+        # so gather it the same way bounded replay does.
+        placement = attn_backend.cache_placement(self.attn_mha)
+        if placement is None:
+            kv_a_normed, k_pe = ctx.token_to_kv_pool.get_mla_kv_buffer(
+                self.attn_mha, full_kv_indices, read_dtype
+            )
+        else:
+            kv_a_normed, k_pe = gather_mla_history(
+                ctx.token_to_kv_pool,
+                self.attn_mha,
+                full_kv_indices,
+                dst_dtype=read_dtype,
+                placement=placement,
+            )
+        kv = self.kv_b_proj(kv_a_normed.squeeze(1))[0]
+        kv = kv.view(
+            -1,
+            self.num_local_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+        )
+        k_nope = kv[..., : self.qk_nope_head_dim]
+        v = kv[..., self.qk_nope_head_dim :]
+
+        k_scale = getattr(self.attn_mha, "k_scale_float", 1.0)
+        scaling = self.attn_mha.scaling
+        if q.dtype == torch.float8_e4m3fn:
+            scaling = k_scale * scaling
+            k, v = mla_kv_pack_quantize_fp8(
+                k_nope,
+                k_pe,
+                v,
+                k_scale_inv=1.0 / k_scale,
+            )
+        else:
+            k = torch.cat(
+                [k_nope, k_pe.expand(-1, self.num_local_heads, -1)],
+                dim=-1,
+            )
+
+        output_view = output.view(-1, self.num_local_heads, self.v_head_dim)
+        attn_backend.forward_extend_chunked(
+            q,
+            k,
+            v,
+            scaling,
+            self.attn_mha.logit_cap,
+            cum_seq_lens_q=chunk_meta.cum_extend_seq_lens,
+            cum_seq_lens_kv=chunk_meta.cu_full_seq_lens,
+            max_q_len=chunk_meta.max_extend_seq_len,
+            max_kv_len=chunk_meta.max_full_seq_len,
+            seq_lens=chunk_meta.full_seq_lens,
+            batch_size=chunk_meta.full_seq_lens.size(0),
+            causal=True,
+            out=output_view,
+        )
+        return output
+
+    def _prepare_prefix_replay_qkv_and_cache(
         self,
         positions: torch.Tensor,
         q: torch.Tensor,
@@ -1215,7 +1373,7 @@ class DeepseekV3AttentionMLA(nn.Module):
 
         return q, k, v
 
-    def forward_normal_chunked_kv_core(
+    def _forward_prefix_replay_prefill(
         self,
         q: torch.Tensor,
         k: torch.Tensor,

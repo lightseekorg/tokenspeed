@@ -40,7 +40,7 @@ from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
 from tokenspeed.runtime.layers.attention.chunk import (
-    build_chunked_prefill_metadata_arrays,
+    build_mla_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
@@ -122,6 +122,10 @@ class TRTLLMMLAChunkedPrefillMetadata:
     chunked_seq_len: torch.Tensor  # (chunked_loop_num, num_extends) int32 GPU
     cu_chunked_seq_len: torch.Tensor  # (chunked_loop_num, num_extends+1) int32 GPU
     max_chunk_len_per_loop: list  # List[int], one per loop_idx
+    full_kv_indices: torch.Tensor | None
+    full_seq_lens: torch.Tensor | None
+    cu_full_seq_lens: torch.Tensor | None
+    max_full_seq_len: int
     # The extend rows' batch-ordered [num_extends, max_num_pages] kernel page
     # table; the DSA wrapper maps its sparse-prefill top-k through it.
     page_table: torch.Tensor | None = None
@@ -259,16 +263,26 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         torch.cumsum(extend_seq_lens, dim=0, out=cum_extend_seq_lens[1:])
         max_extend_seq_len = extend_seq_lens_cpu.max().item()
         (
-            chunked_loop_num,
-            chunk_kv_indices_list,
-            chunked_seq_len,
-            cu_chunked_seq_len,
-            max_chunk_len_per_loop,
-        ) = build_chunked_prefill_metadata_arrays(
-            extend_prefix_lens,
-            extend_prefix_lens_cpu,
-            page_table,
-            self.kernel_page_size,
+            (
+                chunked_loop_num,
+                chunk_kv_indices_list,
+                chunked_seq_len,
+                cu_chunked_seq_len,
+                max_chunk_len_per_loop,
+            ),
+            (
+                full_kv_indices,
+                full_seq_lens,
+                cu_full_seq_lens,
+                max_full_seq_len,
+            ),
+        ) = build_mla_prefill_metadata_arrays(
+            seq_lens=seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            page_table=page_table,
+            page_size=self.kernel_page_size,
         )
         self.chunked_prefill_metadata = TRTLLMMLAChunkedPrefillMetadata(
             extend_prefix_lens=extend_prefix_lens,
@@ -282,6 +296,10 @@ class TRTLLMMLABackend(PagedAttentionBackend):
             chunked_seq_len=chunked_seq_len,
             cu_chunked_seq_len=cu_chunked_seq_len,
             max_chunk_len_per_loop=max_chunk_len_per_loop,
+            full_kv_indices=full_kv_indices,
+            full_seq_lens=full_seq_lens,
+            cu_full_seq_lens=cu_full_seq_lens,
+            max_full_seq_len=max_full_seq_len,
             page_table=page_table,
         )
 

@@ -162,7 +162,7 @@ def test_direct_mfma_decode_stage1_matches_reference(
 
     hidden = _exact_mxfp4_activation(num_tokens, HIDDEN, generator)
     topk_ids = _round_robin_topk(num_tokens)
-    hidden_mxfp4, hidden_scale = _quantize_mxfp4_activation(hidden)
+    hidden_mxfp4, hidden_scale = _quantize_mxfp4_activation(hidden, swizzle_scale=True)
     _assert_lossless(hidden, hidden_mxfp4)
 
     actual = torch.empty(
@@ -211,7 +211,7 @@ def test_direct_mfma_decode_stage2_matches_reference(
         (num_tokens, TOPK), dtype=torch.float32, device="cuda", generator=generator
     )
     topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
-    inter_mxfp4, inter_scale = _quantize_mxfp4_activation(inter)
+    inter_mxfp4, inter_scale = _quantize_mxfp4_activation(inter, swizzle_scale=True)
     _assert_lossless(inter, inter_mxfp4)
 
     actual = torch.empty((num_tokens, HIDDEN), dtype=torch.bfloat16, device="cuda")

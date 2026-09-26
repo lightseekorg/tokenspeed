@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult
+from tokenspeed_kernel.ops.attention.kda._prefill_capacity import KdaPrefillCapacity
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -80,11 +81,24 @@ if current_platform().is_amd:
             {torch.float16, torch.bfloat16},
         ),
         priority=Priority.SPECIALIZED,
+        traits={"prefill_capacity": frozenset({True})},
     )
-    def gluon_kda_paged_prefill_gfx950(**kwargs) -> KdaPrefillResult:
-        """Run specialized gfx950 KDA prefill with V-major state."""
-        # Host-boundary hint is consumed only by the CuteDSL wrapper.
-        kwargs.pop("cu_seqlens_cpu", None)
+    def gluon_kda_paged_prefill_gfx950(
+        *,
+        cu_seqlens_cpu: torch.Tensor,
+        capacity: KdaPrefillCapacity | None = None,
+        inputs_packed: bool = False,
+        **kwargs,
+    ) -> KdaPrefillResult:
+        """Run specialized gfx950 KDA prefill with V-major state.
+
+        The kernel plans chunks from the device boundaries and masks every
+        load and store by the live length, so it needs neither the host
+        boundaries nor the capacity bounds (the facade has already validated
+        them against the input extent). Padding rows are never read, so
+        ``inputs_packed`` holds either way.
+        """
+        del cu_seqlens_cpu, capacity, inputs_packed
         output, final_state = _kda_prefill_impl(**kwargs)
         return KdaPrefillResult(out=output, final_state=final_state)
 

@@ -22,10 +22,11 @@
 
 from __future__ import annotations
 
+import builtins
 from typing import NamedTuple
 
 import torch
-from tokenspeed_kernel_amd._triton import gl, gluon, gluon_builtin
+from tokenspeed_kernel_amd._triton import gl, gluon, gluon_builtin, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     _INV_LN2,
     _LN2,
@@ -81,6 +82,7 @@ class AttentionConfig:
     BLOCK_N: gl.constexpr
     NUM_WARPS: gl.constexpr
     BATCH_SIZE: gl.constexpr
+    SPLIT_KV: gl.constexpr
     NUM_XCDS: gl.constexpr
     NUM_BLOCKS: gl.constexpr
     IS_FP8: gl.constexpr
@@ -118,6 +120,7 @@ class AttentionConfig:
         BLOCK_N,
         NUM_WARPS,
         BATCH_SIZE,
+        SPLIT_KV,
         IS_FP8,
         KV_DTYPE,
         q_strides,
@@ -129,6 +132,7 @@ class AttentionConfig:
         assert HEAD_DIM == 128
         assert ROPE_DIM == 64
         assert NUM_WARPS in (4, 8)
+        assert IS_FP8 or not SPLIT_KV, "KV splitting is only built for FP8"
 
         # FP8 uses the wider gfx950 MFMA K dimension; 16-bit inputs retain K=16.
         (
@@ -180,6 +184,7 @@ class AttentionConfig:
         self.BLOCK_N = gl.constexpr(BLOCK_N)
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
         self.BATCH_SIZE = gl.constexpr(BATCH_SIZE)
+        self.SPLIT_KV = gl.constexpr(SPLIT_KV)
         self.NUM_XCDS = gl.constexpr(8)
         self.NUM_BLOCKS = gl.constexpr(512)
         self.IS_FP8 = gl.constexpr(IS_FP8)
@@ -225,6 +230,9 @@ class AttentionProgram:
     q_start: gl.tensor
     q_head: gl.tensor
     kv_head: gl.tensor
+    out_row_base: gl.tensor
+    kv_tile_base: gl.tensor
+    kv_tile_count: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -243,6 +251,9 @@ class AttentionProgram:
         q_start,
         q_head,
         kv_head,
+        out_row_base,
+        kv_tile_base,
+        kv_tile_count,
     ):
         self.cfg = gl.constexpr(cfg)
         self.q_ptr = q_ptr
@@ -258,6 +269,19 @@ class AttentionProgram:
         self.q_start = q_start
         self.q_head = q_head
         self.kv_head = kv_head
+        # Output rows: the packed query rows, or this split's workspace rows.
+        self.out_row_base = out_row_base
+        # With SPLIT_KV, this work item covers KV tiles
+        # [kv_tile_base, kv_tile_base + kv_tile_count) of its query block.
+        self.kv_tile_base = kv_tile_base
+        self.kv_tile_count = kv_tile_count
+
+    @gluon.jit
+    def kv_position(self, kv_start):
+        # Split work items address KV tiles relative to their first tile.
+        if self.cfg.SPLIT_KV:
+            return self.kv_tile_base * self.cfg.BLOCK_N + kv_start
+        return kv_start
 
     @gluon.jit
     def load_q_nope(self):
@@ -290,7 +314,7 @@ class AttentionProgram:
     @gluon.jit
     def make_k_offsets(self, kv_start):
         cfg = self.cfg
-        offs_n = kv_start + gl.arange(
+        offs_n = self.kv_position(kv_start) + gl.arange(
             0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout)
         )
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
@@ -302,7 +326,7 @@ class AttentionProgram:
     @gluon.jit
     def make_k_pe_offsets(self, kv_start):
         cfg = self.cfg
-        offs_n = kv_start + gl.arange(
+        offs_n = self.kv_position(kv_start) + gl.arange(
             0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_pe_layout)
         )
         offs_d = cfg.HEAD_DIM + gl.arange(
@@ -316,7 +340,7 @@ class AttentionProgram:
     @gluon.jit
     def make_v_offsets(self, kv_start):
         cfg = self.cfg
-        offs_n = kv_start + gl.arange(
+        offs_n = self.kv_position(kv_start) + gl.arange(
             0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout)
         )
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
@@ -429,7 +453,7 @@ class AttentionProgram:
         )
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, layout))
         offsets = cfg.o_strides.offsets(
-            self.seq_base_q + offs_m[:, None], self.q_head, offs_d[None, :]
+            self.out_row_base + offs_m[:, None], self.q_head, offs_d[None, :]
         )
         mask = offs_m[:, None] < self.q_len
         output = output.to(self.output_ptr.dtype.element_ty)
@@ -443,7 +467,7 @@ class AttentionProgram:
                 0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.pv_layout)
             )
             offsets = (
-                (self.seq_base_q + offs_m) * cfg.lse_strides.stride_t
+                (self.out_row_base + offs_m) * cfg.lse_strides.stride_t
                 + self.q_head * cfg.lse_strides.stride_h
             ).to(gl.int32)
             mask = offs_m < self.q_len
@@ -583,6 +607,7 @@ def _fp8_score_half(program, q, q_pe, k_smem, k_pe_smem, HALF: gl.constexpr):
 def _fp8_shift(program, scores, m, kv_start, main_end, causal_row):
     cfg = program.cfg
     e = program.scale_logits(scores)
+    kv_start = program.kv_position(kv_start)
     if kv_start >= main_end * cfg.BLOCK_N:
         cols = kv_start + gl.arange(0, cfg.BLOCK_N, gl.SliceLayout(0, cfg.qk_layout))
         if cfg.IS_CAUSAL:
@@ -758,6 +783,8 @@ def process_query_block_fp8(program, k_smem, k_pe_smem, v_smem):
     else:
         main_end = program.kv_len // cfg.BLOCK_N
         count = gl.cdiv(program.kv_len, cfg.BLOCK_N)
+    if cfg.SPLIT_KV:
+        count = program.kv_tile_count
     if count > 0:
         issue_tile_loads(
             program, k_smem.index(0), k_pe_smem.index(0), v_smem.index(0), 0, True
@@ -975,6 +1002,7 @@ class ProgramScheduler:
     q_head: gl.tensor
     q_slot: gl.tensor
     q_cycles_per_batch_group: gl.tensor
+    num_splits: gl.tensor
     batch_slots: gl.constexpr
     q_slots: gl.constexpr
 
@@ -991,6 +1019,7 @@ class ProgramScheduler:
         q_head,
         q_slot,
         q_cycles_per_batch_group,
+        num_splits,
         batch_slots,
         q_slots,
     ):
@@ -1004,11 +1033,12 @@ class ProgramScheduler:
         self.q_head = q_head
         self.q_slot = q_slot
         self.q_cycles_per_batch_group = q_cycles_per_batch_group
+        self.num_splits = num_splits
         self.batch_slots = gl.constexpr(batch_slots)
         self.q_slots = gl.constexpr(q_slots)
 
     @gluon.jit
-    def create(cfg, batch_size, max_seqlen_q, swizzled_order: gl.constexpr):
+    def create(cfg, batch_size, max_seqlen_q, num_splits, swizzled_order: gl.constexpr):
         num_q_blocks = (max_seqlen_q + cfg.BLOCK_M - 1) // cfg.BLOCK_M
         start_pid = gl.program_id(axis=0)
         pids_per_xcd: gl.constexpr = cfg.NUM_BLOCKS // cfg.NUM_XCDS
@@ -1058,6 +1088,8 @@ class ProgramScheduler:
             work = zero
         else:
             total_work = batch_size * cfg.N_HEADS * num_q_blocks
+            if cfg.SPLIT_KV:
+                total_work = total_work * num_splits
             zero = logical_pid - logical_pid
             batch_slots: gl.constexpr = 1
             q_slots: gl.constexpr = 1
@@ -1081,6 +1113,7 @@ class ProgramScheduler:
             q_head,
             q_slot,
             q_cycles_per_batch_group,
+            num_splits,
             batch_slots,
             q_slots,
         )
@@ -1110,6 +1143,7 @@ class ProgramScheduler:
             self.q_head,
             self.q_slot,
             self.q_cycles_per_batch_group,
+            self.num_splits,
             self.batch_slots,
             self.q_slots,
         )
@@ -1124,8 +1158,10 @@ class ProgramScheduler:
         lse_ptr,
         cu_seqlens_q_ptr,
         cu_seqlens_kv_ptr,
+        split_row_stride,
     ):
         cfg = self.cfg
+        split = self.work - self.work
         if self.swizzled_order:
             q_cycle_global = self.work
             batch_group = q_cycle_global // self.q_cycles_per_batch_group
@@ -1150,6 +1186,9 @@ class ProgramScheduler:
             head_batch = self.work // self.num_q_blocks
             q_head = head_batch % cfg.N_HEADS
             batch = head_batch // cfg.N_HEADS
+            if cfg.SPLIT_KV:
+                split = batch // cfg.BATCH_SIZE
+                batch = batch % cfg.BATCH_SIZE
             valid = self.work >= 0
             safe_batch = batch
 
@@ -1160,6 +1199,20 @@ class ProgramScheduler:
         q_causal_start = gl.maximum(kv_len - q_len, 0)
         q_start = query_block * cfg.BLOCK_M
         kv_head = q_head // (cfg.N_HEADS // cfg.N_KV_HEADS)
+        out_row_base = seq_base_q
+        kv_tile_base = split
+        kv_tile_count = split
+        if cfg.SPLIT_KV:
+            # Each split takes an equal share of this query block's visible
+            # KV tiles; trailing splits may be empty and then emit LSE=-inf.
+            visible = kv_len
+            if cfg.IS_CAUSAL:
+                visible = gl.minimum(q_causal_start + q_start + cfg.BLOCK_M, kv_len)
+            tiles = gl.cdiv(visible, cfg.BLOCK_N)
+            per_split = gl.cdiv(tiles, self.num_splits)
+            kv_tile_base = gl.minimum(split * per_split, tiles)
+            kv_tile_count = gl.minimum(tiles - kv_tile_base, per_split)
+            out_row_base = split * split_row_stride + seq_base_q
 
         program = AttentionProgram(
             cfg,
@@ -1176,6 +1229,9 @@ class ProgramScheduler:
             q_start,
             q_head,
             kv_head,
+            out_row_base,
+            kv_tile_base,
+            kv_tile_count,
         )
         return program, valid & (q_start < q_len)
 
@@ -1185,7 +1241,8 @@ class ProgramScheduler:
 # ===-----------------------------------------------------------------------===#
 
 
-@gluon.jit
+# Runtime split geometry must not specialize: token counts vary per launch.
+@gluon.jit(do_not_specialize=("num_splits", "split_row_stride"))
 def gluon_mla_prefill_gfx950(
     q_ptr,
     k_ptr,
@@ -1216,6 +1273,9 @@ def gluon_mla_prefill_gfx950(
     NUM_WARPS: gl.constexpr,
     BATCH_SIZE: gl.constexpr,
     max_seqlen_q,
+    num_splits,
+    split_row_stride,
+    SPLIT_KV: gl.constexpr,
     IS_FP8: gl.constexpr,
 ):
     cfg = AttentionConfig(
@@ -1230,6 +1290,7 @@ def gluon_mla_prefill_gfx950(
         BLOCK_N,
         NUM_WARPS,
         BATCH_SIZE,
+        SPLIT_KV,
         IS_FP8,
         k_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, 1),
@@ -1252,7 +1313,11 @@ def gluon_mla_prefill_gfx950(
 
     # Swizzle only helps the triangular causal workload; non-causal tiles are
     # uniform cost, so use the simpler round-robin order there.
-    scheduler = ProgramScheduler.create(cfg, BATCH_SIZE, max_seqlen_q, IS_CAUSAL)
+    # Split work items use the round-robin order; each split's share of a
+    # causal query block's tiles already evens out the triangular cost.
+    scheduler = ProgramScheduler.create(
+        cfg, BATCH_SIZE, max_seqlen_q, num_splits, IS_CAUSAL and not SPLIT_KV
+    )
     while scheduler.has_work():
         program, active = scheduler.get_program(
             q_ptr,
@@ -1262,6 +1327,7 @@ def gluon_mla_prefill_gfx950(
             lse_ptr,
             cu_seqlens_q_ptr,
             cu_seqlens_kv_ptr,
+            split_row_stride,
         )
         if active:
             if cfg.IS_FP8:
@@ -1271,9 +1337,88 @@ def gluon_mla_prefill_gfx950(
         scheduler = scheduler.advance()
 
 
+@gluon.jit(do_not_specialize=("num_splits", "split_row_stride"))
+def gluon_mla_prefill_combine_gfx950(
+    partial_ptr,
+    partial_lse_ptr,
+    output_ptr,
+    lse_ptr,
+    num_splits,
+    split_row_stride,
+    N_HEADS: gl.constexpr,
+    HEAD_BLOCK: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    HAS_LSE: gl.constexpr,
+):
+    """Merge per-split normalized outputs of one token by their LSE.
+
+    Partials are FP32 ``[num_splits * split_row_stride, N_HEADS, HEAD_DIM]``
+    with LSE ``[num_splits * split_row_stride, N_HEADS]``; an empty split has
+    LSE ``-inf`` and contributes nothing.
+    """
+    token = gl.program_id(0)
+    layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 16], [4, 1], [1, 0])
+    heads = gl.arange(0, HEAD_BLOCK, layout=gl.SliceLayout(1, layout))
+    dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, layout))
+    head_mask = heads < N_HEADS
+    mask = head_mask[:, None] & (dims[None, :] < HEAD_DIM)
+    m = gl.full([HEAD_BLOCK], -float("inf"), gl.float32, gl.SliceLayout(1, layout))
+    weight = gl.zeros([HEAD_BLOCK], gl.float32, gl.SliceLayout(1, layout))
+    acc = gl.zeros([HEAD_BLOCK, HEAD_DIM], gl.float32, layout)
+    for split in range(num_splits):
+        row = split * split_row_stride + token
+        lse = gl.load(
+            partial_lse_ptr + row * N_HEADS + heads, mask=head_mask, other=-float("inf")
+        )
+        m_new = gl.maximum(m, lse)
+        # Rows whose splits are all empty so far keep a zero scale.
+        finite = m_new > -float("inf")
+        safe = gl.where(finite, m_new, 0.0)
+        alpha = gl.where(finite, gl.exp(m - safe), 0.0)
+        beta = gl.where(finite, gl.exp(lse - safe), 0.0)
+        value = gl.load(
+            partial_ptr + (row * N_HEADS + heads[:, None]) * HEAD_DIM + dims[None, :],
+            mask=mask,
+            other=0.0,
+        )
+        acc = acc * alpha[:, None] + value * beta[:, None]
+        weight = weight * alpha + beta
+        m = m_new
+    output = acc / gl.where(weight > 0.0, weight, 1.0)[:, None]
+    gl.store(
+        output_ptr + (token * N_HEADS + heads[:, None]) * HEAD_DIM + dims[None, :],
+        output.to(output_ptr.dtype.element_ty),
+        mask=mask,
+    )
+    if HAS_LSE:
+        final = gl.where(
+            weight > 0.0, m + gl.log(gl.where(weight > 0.0, weight, 1.0)), -float("inf")
+        )
+        gl.store(lse_ptr + token * N_HEADS + heads, final, mask=head_mask)
+
+
 # ===-----------------------------------------------------------------------===#
 # Host wrapper
 # ===-----------------------------------------------------------------------===#
+
+# The persistent grid; launches with fewer work items than this split KV.
+_NUM_BLOCKS = 512
+_MAX_KV_SPLITS = 16
+# Keep each split at least this many KV tiles so the pipeline stays warm.
+_MIN_TILES_PER_SPLIT = 16
+
+
+def _select_num_kv_splits(
+    is_fp8: bool, work_items: int, max_seqlen_kv: int, block_n: int
+) -> int:
+    """Split KV only when too few query blocks exist to fill the grid."""
+    if not is_fp8 or work_items >= _NUM_BLOCKS // 2:
+        return 1
+    # Keep every split resident in one round of the persistent grid.
+    by_grid = _NUM_BLOCKS // work_items
+    by_length = max_seqlen_kv // (block_n * _MIN_TILES_PER_SPLIT)
+    # ``max`` in this module is the Gluon reduction helper.
+    return builtins.max(1, builtins.min(by_grid, by_length, _MAX_KV_SPLITS))
 
 
 class LaunchConfig(NamedTuple):
@@ -1387,12 +1532,30 @@ def launch_gluon_mla_prefill_gfx950(
         # runtime bound so varying prompt lengths do not each compile a kernel.
         max_seqlen_q = min(max_seqlen_q, total_tokens)
 
+    num_q_blocks = -(-max_seqlen_q // config.block_m)
+    num_splits = _select_num_kv_splits(
+        is_fp8, batch_size * n_heads * num_q_blocks, max_seqlen_kv, config.block_n
+    )
+    split_kv = num_splits > 1
+    kernel_out, kernel_lse = out, lse_arg
+    if split_kv:
+        # Splits write normalized FP32 partials and their LSE; the combine
+        # kernel merges them into ``out`` (and ``lse`` when requested).
+        kernel_out = torch.empty(
+            (num_splits * total_tokens, n_heads, v_head_dim),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        kernel_lse = torch.empty(
+            (num_splits * total_tokens, n_heads), dtype=torch.float32, device=q.device
+        )
+
     gluon_mla_prefill_gfx950[config.grid](
         q,
         k,
         v,
-        out,
-        lse_arg,
+        kernel_out,
+        kernel_lse,
         cu_seqlens_q,
         cu_seqlens_kv,
         q.stride(0),
@@ -1401,28 +1564,46 @@ def launch_gluon_mla_prefill_gfx950(
         k.stride(1),
         v.stride(0),
         v.stride(1),
-        out.stride(0),
-        out.stride(1),
-        lse_arg.stride(0),
-        lse_arg.stride(1),
+        kernel_out.stride(0),
+        kernel_out.stride(1),
+        kernel_lse.stride(0),
+        kernel_lse.stride(1),
         N_HEADS=config.n_heads,
         N_KV_HEADS=config.n_kv_heads,
         HEAD_DIM=config.head_dim,
         ROPE_DIM=config.rope_dim,
         SM_SCALE=softmax_scale,
         IS_CAUSAL=is_causal,
-        HAS_LSE=return_lse,
+        HAS_LSE=return_lse or split_kv,
         BLOCK_M=config.block_m,
         BLOCK_N=config.block_n,
         NUM_WARPS=config.num_warps,
         BATCH_SIZE=batch_size,
         max_seqlen_q=max_seqlen_q,
+        num_splits=num_splits,
+        split_row_stride=total_tokens,
+        SPLIT_KV=split_kv,
         IS_FP8=is_fp8,
         num_warps=config.num_warps,
         num_stages=1,
         # Keep the overlapping FP8 matrix and softmax state in one register class.
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),) if is_fp8 else (),
     )
+
+    if split_kv:
+        gluon_mla_prefill_combine_gfx950[(total_tokens,)](
+            kernel_out,
+            kernel_lse,
+            out,
+            lse_arg,
+            num_splits,
+            total_tokens,
+            N_HEADS=n_heads,
+            HEAD_BLOCK=builtins.max(4, triton.next_power_of_2(n_heads)),
+            HEAD_DIM=v_head_dim,
+            HAS_LSE=return_lse,
+            num_warps=4,
+        )
 
     if return_lse:
         return out, lse

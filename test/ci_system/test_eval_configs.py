@@ -271,6 +271,16 @@ def test_kimi_k3_amd_gates_use_eagle3():
     assert flag_value(perf_server_tokens, "--max-num-seqs") == "16"
     assert flag_value(perf_server_tokens, "--chunked-prefill-size") == "8192"
     assert flag_value(perf_server_tokens, "--max-prefill-tokens") == "8192"
+    # 8192 * 8 rows lets every chunk of a 50K prompt take one-pass MLA prefill.
+    assert flag_value(perf_server_tokens, "--mla-chunk-multiplier") == "8"
+    assert flag_value(perf_server_tokens, "--prefill-graph-max-tokens") == "8192"
+    token_sizes_index = perf_server_tokens.index("--prefill-graph-capture-token-sizes")
+    assert perf_server_tokens[token_sizes_index + 1 : token_sizes_index + 3] == [
+        "1024",
+        "8192",
+    ]
+    assert flag_value(perf_server_tokens, "--prefill-graph-capture-batch-sizes") == "1"
+    assert "--disable-prefill-graph" not in perf_server_tokens
     assert tasks[1]["perf_reference"] == {16: [23, 12.5]}
     assert tasks[1]["perf_threshold"] == 0.9
     assert "'evalscope[perf]==1.11.1'" in tasks[1]["perf"]["install"][0]

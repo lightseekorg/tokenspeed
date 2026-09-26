@@ -35,6 +35,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._layouts import (
     _moe_partial_reduce,
     _situ_reduce,
     _swiglu_reduce,
+    _xcd_chiplet_swizzle,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.pipelined_program import (
     AsyncCopyDescriptor,
@@ -49,6 +50,24 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.routing import (
     _route_next_pow2,
     gluon_route_supported,
 )
+
+
+def _sorted_stage1_launch_metadata(grid, kernel, args):
+    """Report algorithmic W13 work for the expert-sorted decode kernel."""
+    routed_rows = args["M"] * args["TOPK"]
+    return {
+        "name": kernel.name,
+        "flops8": 4 * routed_rows * args["D"] * args["i_dim"],
+    }
+
+
+def _sorted_stage2_launch_metadata(grid, kernel, args):
+    """Report algorithmic W2 work for the expert-sorted decode kernel."""
+    routed_rows = args["M"] * args["TOPK"]
+    return {
+        "name": kernel.name,
+        "flops8": 2 * routed_rows * args["i_dim"] * args["N"],
+    }
 
 
 def _gluon_mxfp4_fp8_warp_decode_moe(
@@ -243,6 +262,7 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         BLOCK_K=BLOCK_K, BLOCK_N=S2_BLOCK_N, M_DUP=S2_M_DUP,
         W_PRESHUFFLED=w2_preshuffled,
         HAS_BIAS=w2_bias is not None, SPLIT_K=s2_split_k,
+        ROUND_TOPK_PARTIALS=False,
         EXPERT_START=0, NUM_LOCAL_EXPERTS=n_experts,
         num_warps=1,
     )
@@ -299,6 +319,7 @@ def _warp_decode_mfma_layouts(m_dup, block_n, block_k_scale):
 def _warp_decode_stage1_coop_compute(
     token,
     slot,
+    packed_row,
     expert,
     pid_n,
     X,
@@ -334,6 +355,7 @@ def _warp_decode_stage1_coop_compute(
     SWIGLU_LIMIT: gl.constexpr,
     SWIGLU_BETA: gl.constexpr,
     DO_SITU: gl.constexpr = False,
+    PACKED_ROUTES: gl.constexpr = False,
 ):
     """Cooperative gate_up GEMM + bias + SwiGLU + fp8-quant + store for one
     (token, slot, expert).  N runs over the INTERLEAVED gate_up rows (2*I);
@@ -347,7 +369,7 @@ def _warp_decode_stage1_coop_compute(
     valid = (token < M) & (expert >= 0)
     # Inactive EP routes still instantiate the asynchronous descriptors. Use a
     # valid local base address while their X/store masks suppress all results.
-    safe_expert = gl.where(valid, expert, 0)
+    safe_expert = gl.where(expert >= 0, expert, 0)
     # Keep base offsets int32 (buffer_load_to_shared requires int32/uint32
     # offsets); expert * stride fits int32 for GPT-OSS shapes.
     w_base_offset = safe_expert * stride_we
@@ -390,8 +412,12 @@ def _warp_decode_stage1_coop_compute(
 
     # One decode token per CTA: row 0 of the BLOCK_M tile carries the token,
     # the remaining rows are clamped/masked (buffer OOB -> 0 in LDS).
-    rows_m = gl.where(offs_xm == 0, token, gl.zeros_like(offs_xm))
-    mask_m = (offs_xm == 0) & valid
+    if PACKED_ROUTES:
+        rows_m = gl.where(valid, token, gl.zeros_like(token))
+        mask_m = valid
+    else:
+        rows_m = gl.where(offs_xm == 0, token, gl.zeros_like(offs_xm))
+        mask_m = (offs_xm == 0) & valid
 
     k_limit_x = gl.multiple_of(D // cfg.DIV_FACTOR_X, 16)
     k_limit_w = gl.multiple_of(D // cfg.DIV_FACTOR_W, 16)
@@ -528,15 +554,27 @@ def _warp_decode_stage1_coop_compute(
     offs_y_m = gl.arange(0, BLOCK_M, gl.SliceLayout(1, STORE_LAYOUT))
     off_n_out = pid_n * OUT_BLOCK_N
     offs_y_n = off_n_out + gl.arange(0, OUT_BLOCK_N, gl.SliceLayout(0, STORE_LAYOUT))
-    row = token * TOPK + slot
-    # Only tile-row 0 holds the token's result; all valid columns map to the
-    # single Y row (row*stride_ym).
-    y_offs = (
-        row.to(gl.int64) * stride_ym
-        + offs_y_n[None, :].to(gl.int64) * stride_yn
-        + offs_y_m[:, None].to(gl.int64) * 0
-    )
-    mask_y = (offs_y_m[:, None] == 0) & valid & (offs_y_n[None, :] < i_dim)
+    if PACKED_ROUTES:
+        store_m_layout: gl.constexpr = gl.SliceLayout(1, STORE_LAYOUT)
+        row = gl.convert_layout(packed_row, store_m_layout)
+        store_valid = gl.convert_layout(valid, store_m_layout)
+        y_offs = (
+            row[:, None].to(gl.int64) * stride_ym
+            + offs_y_n[None, :].to(gl.int64) * stride_yn
+        )
+    else:
+        row = token * TOPK + slot
+        # Only tile-row 0 holds the token's result; all valid columns map to
+        # the single Y row (row*stride_ym).
+        y_offs = (
+            row.to(gl.int64) * stride_ym
+            + offs_y_n[None, :].to(gl.int64) * stride_yn
+            + offs_y_m[:, None].to(gl.int64) * 0
+        )
+    if PACKED_ROUTES:
+        mask_y = store_valid[:, None] & (offs_y_n[None, :] < i_dim)
+    else:
+        mask_y = (offs_y_m[:, None] == 0) & valid & (offs_y_n[None, :] < i_dim)
     gl.store(Y + y_offs, out, mask=mask_y)
 
 
@@ -652,7 +690,7 @@ def _warp_decode_topk_stage1_coop_kernel(
     # Grouped by role: coords / tensors / shapes / strides / scalars / constexpr.
     # fmt: off
     _warp_decode_stage1_coop_compute(
-        token, slot, expert, pid_n,
+        token, slot, 0, expert, pid_n,
         X, W, WScale, Y,
         M, D, i_dim,
         stride_xm, stride_xk,
@@ -727,6 +765,7 @@ def _warp_decode_precomputed_situ_stage1_kernel(
     _warp_decode_stage1_coop_compute(
         token,
         slot,
+        0,
         expert,
         pid_n,
         X,
@@ -763,6 +802,110 @@ def _warp_decode_precomputed_situ_stage1_kernel(
         0.0,
         DO_SITU=True,
     )
+
+
+@gluon.jit(launch_metadata=_sorted_stage1_launch_metadata)
+def _warp_decode_precomputed_situ_sorted_stage1_kernel(
+    X,
+    W,
+    WScale,
+    SortedIds,
+    SortedExpertIds,
+    NumValidIds,
+    Y,
+    M,
+    D,
+    i_dim,
+    stride_xm,
+    stride_xk,
+    stride_we,
+    stride_wk,
+    stride_wn,
+    stride_wse,
+    stride_wsk,
+    stride_wsn,
+    stride_ym,
+    stride_yn,
+    x_global_scale_ptr,
+    out_quant_scale_ptr,
+    w13_bias,
+    TOPK: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    W_PRESHUFFLED: gl.constexpr,
+    EVEN_K: gl.constexpr,
+    HAS_BIAS: gl.constexpr,
+    SITU_BETA: gl.constexpr,
+    SITU_LINEAR_BETA: gl.constexpr,
+    EXPERT_START: gl.constexpr,
+    NUM_LOCAL_EXPERTS: gl.constexpr,
+    XCD_SWIZZLE: gl.constexpr,
+):
+    """Expert-sorted W13/SiTU; one CTA reuses W across 16 routed rows."""
+    pid = _xcd_chiplet_swizzle(
+        gl.program_id(axis=0), gl.num_programs(axis=0), XCD_SWIZZLE
+    )
+    num_pid_n = gl.cdiv(2 * i_dim, BLOCK_N)
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    num_valid = gl.load(NumValidIds)
+    if pid_m * BLOCK_M < num_valid:
+        expert = gl.load(SortedExpertIds + pid_m).to(gl.int32)
+        expert -= EXPERT_START
+        expert = gl.where((expert >= 0) & (expert < NUM_LOCAL_EXPERTS), expert, -1)
+
+        block_k_x: gl.constexpr = BLOCK_K
+        load_x_layout: gl.constexpr = _load_layout(
+            block_k_x, BLOCK_M, NUM_WARPS, [1, 0], 8
+        )
+        row = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, load_x_layout))
+        encoded = gl.load(SortedIds + pid_m * BLOCK_M + row)
+        token = encoded & 0xFFFFFF
+        slot = encoded >> 24
+        _warp_decode_stage1_coop_compute(
+            token,
+            slot,
+            pid_m * BLOCK_M + row,
+            expert,
+            pid_n,
+            X,
+            W,
+            WScale,
+            Y,
+            M,
+            D,
+            i_dim,
+            stride_xm,
+            stride_xk,
+            stride_we,
+            stride_wk,
+            stride_wn,
+            stride_wse,
+            stride_wsk,
+            stride_wsn,
+            stride_ym,
+            stride_yn,
+            x_global_scale_ptr,
+            out_quant_scale_ptr,
+            w13_bias,
+            TOPK,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            NUM_BUFFERS,
+            NUM_WARPS,
+            W_PRESHUFFLED,
+            EVEN_K,
+            HAS_BIAS,
+            SITU_BETA,
+            SITU_LINEAR_BETA,
+            0.0,
+            DO_SITU=True,
+            PACKED_ROUTES=True,
+        )
 
 
 @gluon.jit
@@ -952,6 +1095,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
     W_PRESHUFFLED: gl.constexpr,
     HAS_BIAS: gl.constexpr,
     SPLIT_K: gl.constexpr,
+    ROUND_TOPK_PARTIALS: gl.constexpr,
     EXPERT_START: gl.constexpr,
     NUM_LOCAL_EXPERTS: gl.constexpr,
     SPLIT_TOPK: gl.constexpr = False,
@@ -1106,7 +1250,12 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
                     acc = _add_expert_bias(
                         acc, w2_base, bias_n, bias_bound, mfma_layout
                     )
-                acc_total += gate * acc
+                weighted = gate * acc
+                if ROUND_TOPK_PARTIALS:
+                    # Match split-top-k exactly: the partial buffer rounds each
+                    # expert contribution before the FP32 reduction.
+                    weighted = weighted.to(Out.dtype.element_ty).to(gl.float32)
+                acc_total += weighted
     sm = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, mfma_layout))[:, None]
     sn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))[None, :]
     col = pid_n * BLOCK_N + sn
@@ -1124,3 +1273,154 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
         acc_total.to(Out.dtype.element_ty),
         mask=(pid_token < M) & (sm == 0) & (col < N),
     )
+
+
+@gluon.jit(launch_metadata=_sorted_stage2_launch_metadata)
+def _warp_decode_sorted_stage2_fp8_mxfp4_kernel(
+    X,
+    W,
+    WScale,
+    SortedIds,
+    SortedWeights,
+    SortedExpertIds,
+    NumValidIds,
+    Out,
+    M,
+    N,
+    N_PHYS,
+    i_dim,
+    stride_xm,
+    stride_xk,
+    stride_we,
+    stride_wk,
+    stride_wn,
+    stride_wse,
+    stride_wsk,
+    stride_wsn,
+    stride_om,
+    stride_on,
+    x_global_scale_ptr,
+    I_PACKED: gl.constexpr,
+    TOPK: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    NUM_WARPS_N: gl.constexpr,
+    W_PRESHUFFLED: gl.constexpr,
+    EXPERT_START: gl.constexpr,
+    NUM_LOCAL_EXPERTS: gl.constexpr,
+    XCD_SWIZZLE: gl.constexpr,
+):
+    """Expert-sorted W2 with deterministic BF16 route-partial scatter."""
+    BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
+    BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
+    gl.static_assert(BLOCK_M == 16, "sorted W2 requires one MFMA row tile")
+    gl.static_assert(BLOCK_N == 128 * NUM_WARPS_N)
+    gl.static_assert(BLOCK_K_PACKED == 64)
+
+    pid = _xcd_chiplet_swizzle(
+        gl.program_id(axis=0), gl.num_programs(axis=0), XCD_SWIZZLE
+    )
+    num_n = gl.cdiv(N, BLOCK_N)
+    pid_m = pid // num_n
+    pid_n = pid % num_n
+    num_valid = gl.load(NumValidIds)
+
+    mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 128],
+        transposed=True,
+        warps_per_cta=[1, NUM_WARPS_N],
+    )
+    dot_a_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfma_layout, k_width=16
+    )
+    dot_b_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfma_layout, k_width=16
+    )
+    a_scale_layout: gl.constexpr = gl.amd.cdna4.get_mfma_scale_layout(
+        dot_a_layout, [BLOCK_M, BLOCK_K_SCALE]
+    )
+    b_scale_layout: gl.constexpr = gl.amd.cdna4.get_mfma_scale_layout(
+        dot_b_layout, [BLOCK_N, BLOCK_K_SCALE]
+    )
+    am_1d = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, dot_a_layout))
+    am = am_1d[:, None]
+    ak = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, dot_a_layout))[None, :]
+    bk = gl.arange(0, BLOCK_K_PACKED, layout=gl.SliceLayout(1, dot_b_layout))[:, None]
+    bn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, dot_b_layout))[None, :]
+    bsn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, b_scale_layout))[:, None]
+    bsk = gl.arange(0, BLOCK_K_SCALE, layout=gl.SliceLayout(0, b_scale_layout))[None, :]
+    n_cols = pid_n * BLOCK_N + bn
+    n_cols_s = pid_n * BLOCK_N + bsn
+    a_scale = gl.full((BLOCK_M, BLOCK_K_SCALE), 127, gl.uint8, layout=a_scale_layout)
+    acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
+
+    if pid_m * BLOCK_M < num_valid:
+        expert = gl.load(SortedExpertIds + pid_m).to(gl.int32) - EXPERT_START
+        expert_valid = (expert >= 0) & (expert < NUM_LOCAL_EXPERTS)
+        safe_expert = gl.where(expert_valid, expert, 0)
+        sorted_row = pid_m * BLOCK_M + am_1d
+        encoded = gl.load(SortedIds + sorted_row)
+        token = encoded & 0xFFFFFF
+        slot = encoded >> 24
+        route_valid = (token < M) & expert_valid
+        gate = gl.load(SortedWeights + sorted_row, mask=route_valid, other=0.0).to(
+            gl.float32
+        )
+        output_row_layout: gl.constexpr = gl.SliceLayout(1, mfma_layout)
+        output_token = gl.convert_layout(token, output_row_layout)
+        output_slot = gl.convert_layout(slot, output_row_layout)
+        output_valid = gl.convert_layout(route_valid, output_row_layout)
+        output_gate = gl.convert_layout(gate, output_row_layout)[:, None]
+
+        x_row_off = sorted_row[:, None].to(gl.int64) * stride_xm
+        w_expert_off = safe_expert.to(gl.int64) * stride_we
+        ws_expert_off = safe_expert.to(gl.int64) * stride_wse
+        w_n_off = w_expert_off + n_cols.to(gl.int64) * stride_wn
+        scale_row = n_cols_s.to(gl.uint32)
+        scale_row_off = (scale_row // 32).to(gl.int64) * stride_wsn + (
+            (scale_row % 16) * 4 + ((scale_row % 32) // 16)
+        ).to(gl.int64) * stride_wsk
+
+        gl.static_assert(I_PACKED == 192, "sorted W2 is specialized for K=384")
+        # K3 has exactly three BK128 tiles. Load all three before issuing the
+        # MFMAs so the final tile's VMEM latency overlaps the first pair.
+        # fmt: off
+        (a_even, b_even, s_even,
+         a_odd, b_odd, s_odd) = _warp_decode_stage2_load_pair(
+            0, ak, bk, bsk, am, X, W, WScale,
+            x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
+            n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
+            BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
+        )
+        tail_a, tail_b, tail_scale = _warp_decode_stage2_load_tile(
+            2, ak, bk, bsk, am, X, W, WScale,
+            x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
+            n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
+            BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
+        )
+        acc = _warp_decode_stage2_mfma_pair(
+            acc, a_even, b_even, s_even, a_odd, b_odd, s_odd, a_scale
+        )
+        acc = gl.amd.cdna4.mfma_scaled(
+            a=tail_a, a_scale=a_scale, a_format="e4m3",
+            b=tail_b, b_scale=tail_scale, b_format="e2m1", acc=acc,
+        )
+        # fmt: on
+
+        acc *= gl.load(x_global_scale_ptr).to(gl.float32)
+        weighted = (output_gate * acc).to(Out.dtype.element_ty)
+        out_row = output_token * TOPK + output_slot
+        out_col = (
+            pid_n * BLOCK_N
+            + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))[None, :]
+        )
+        out_offset = (
+            out_row[:, None].to(gl.int64) * stride_om + out_col.to(gl.int64) * stride_on
+        )
+        gl.store(
+            Out + out_offset,
+            weighted,
+            mask=output_valid[:, None] & (out_col < N),
+        )

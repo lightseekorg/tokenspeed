@@ -45,6 +45,29 @@ _A8W4_EP_APPLY = "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"
 
 
 @pytest.mark.parametrize(
+    "num_tokens, expected_block_n, expected_combined",
+    [
+        (1, 16, False),
+        (8, 16, True),
+        (16, 32, True),
+        (24, 64, False),
+        (32, 64, False),
+        (64, 128, False),
+    ],
+)
+def test_kimi_k3_stage2_decode_policy(
+    num_tokens: int,
+    expected_block_n: int,
+    expected_combined: bool,
+) -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import moe
+
+    assert moe._select_a8w4_stage2_block_n(num_tokens) == expected_block_n
+    assert moe._use_a8w4_combined_topk(num_tokens, False) == expected_combined
+    assert not moe._use_a8w4_combined_topk(num_tokens, True)
+
+
+@pytest.mark.parametrize(
     "per_lane, scales_per_lane, group",
     [(64, 2, 32), (32, 1, 32), (16, 1, 16), (8, 1, 8)],
     ids=["two_blocks", "one_block", "half_block", "quarter_block"],
@@ -1091,6 +1114,7 @@ def test_package_prefill_sort_contract_gfx950(
         1,
         torch.bfloat16,
         block_m,
+        compact_route_programs=False,
     )
     valid_extent, reported_tokens = num_valid.cpu().tolist()
     assert reported_tokens == num_tokens
@@ -1159,6 +1183,7 @@ def test_package_prefill_sort_localizes_ep_routes_gfx950() -> None:
             32,
             torch.bfloat16,
             64,
+            compact_route_programs=False,
             expert_start=expert_start,
             out=output,
         )
@@ -1201,6 +1226,7 @@ def test_package_prefill_low_density_route_capacity_gfx950() -> None:
         1,
         torch.bfloat16,
         block_m,
+        compact_route_programs=False,
     )
 
     expected_capacity = _max_padded_route_capacity(
@@ -1406,7 +1432,13 @@ def test_stage2_logical_k_ignores_padding_gfx950(
         torch.tensor([0.25, 0.75], device="cuda").expand(tokens, topk).contiguous()
     )
     sorted_ids, sorted_weights, sorted_experts, valid, out = gluon_moe_sorting(
-        ids, weights, experts, n, torch.bfloat16, sort_block_m
+        ids,
+        weights,
+        experts,
+        n,
+        torch.bfloat16,
+        sort_block_m,
+        compact_route_programs=False,
     )
     raw_a = torch.randint(
         0,
@@ -1528,6 +1560,89 @@ def test_package_prefill_block_m_selection_gfx950(
     )
 
     assert _select_package_prefill_block_m(num_tokens, 16, 16) == expected
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "expected"),
+    [(4095, (32, 256)), (4096, (16, 128)), (8192, (16, 128))],
+)
+def test_stage2_reduce_tile_selection_gfx950(
+    num_tokens: int,
+    expected: tuple[int, int],
+) -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (
+        _select_reduce_tile,
+    )
+
+    assert _select_reduce_tile(num_tokens) == expected
+
+
+def test_stage2_large_reduce_tile_matches_reference_gfx950() -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (
+        _select_reduce_tile,
+        gluon_mxfp4_moe_stage2_reduce_kernel,
+    )
+
+    num_tokens, topk, width = 4096, 16, 256
+    generator = torch.Generator(device="cuda").manual_seed(20260924)
+    partials = torch.randn(
+        (num_tokens, topk, width),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    expected = torch.zeros((num_tokens, width), dtype=torch.float32, device="cuda")
+    for slot in range(topk):
+        expected += partials[:, slot].float()
+    expected = expected.to(torch.bfloat16)
+    actual = torch.empty_like(expected)
+
+    block_m, block_n = _select_reduce_tile(num_tokens)
+    grid = ((num_tokens + block_m - 1) // block_m * ((width + block_n - 1) // block_n),)
+    gluon_mxfp4_moe_stage2_reduce_kernel[grid](
+        partials,
+        actual,
+        num_tokens,
+        width,
+        partials.stride(0),
+        partials.stride(1),
+        partials.stride(2),
+        actual.stride(0),
+        actual.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        TOP_K=topk,
+        num_warps=1,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize(
+    ("a_format", "b_gdot128", "expected"),
+    [
+        ("e2m1", True, 8),
+        ("e2m1", False, 1),
+        ("e4m3", True, 1),
+        ("e4m3", False, 1),
+    ],
+)
+def test_stage1_group_size_selection_gfx950(
+    a_format: str,
+    b_gdot128: bool,
+    expected: int,
+) -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage1 import (
+        _select_stage1_group_size_m,
+    )
+
+    assert (
+        _select_stage1_group_size_m(
+            a_format=a_format,
+            b_gdot128=b_gdot128,
+        )
+        == expected
+    )
 
 
 def test_tp_situ_package_prefill_block64_matches_block128_gfx950(
