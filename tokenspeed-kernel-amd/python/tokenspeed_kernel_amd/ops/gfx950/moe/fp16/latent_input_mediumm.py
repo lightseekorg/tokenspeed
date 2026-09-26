@@ -22,17 +22,20 @@
 
 Eight-wave workgroups compute 128x128 or 256x128 output tiles. The shared
 layout helpers from the dense16 GEMM give vectorized global-to-LDS copies and
-padded LDS rows for native BF16 MFMA. Four K buffers on the 128-row tile, or
-three on the 256-row tile where LDS is tighter, keep the other 64-wide copies
+padded LDS rows for native BF16 MFMA. Three K buffers keep two 64-wide copies
 in flight, and a two-stage warp pipeline alternates the MFMA block with the
 next tile's LDS reads and copy issue. The column tile divides all K3 output
 regions, so one packed weight pass stores router logits as FP32 and the routed
 projection as BF16. Each shared-expert tile reads 64 gate rows and the
 matching 64 up rows, so SiTU is applied in the epilogue and no gate/up
-intermediate or second launch is needed. Program ids are remapped per XCD so
-the row tiles sharing a weight tile share one L2, and each XCD starts its K
-loop at a different eighth of K and wraps around, so the XCDs do not all read
-the same activation columns at the same time.
+intermediate or second launch is needed.
+
+The 256-row tile also schedules per XCD: program ids are remapped so the row
+tiles sharing a weight tile share one L2, and each XCD starts its K loop at a
+different eighth of K and wraps around, so the XCDs do not all read the same
+activation columns at the same time. Its leftover K tiles run inside the
+pipeline rather than after the drain. The 128-row tile keeps the plain launch
+order and an unpipelined tail.
 """
 
 from __future__ import annotations
@@ -65,8 +68,9 @@ _UPPER_M_THRESHOLD = 640
 # (WARPS_M, WARPS_N) per row tile. The 256-row tile splits rows four ways so
 # each wave reads a 64x64 operand pair from LDS instead of 128x32.
 _WARPS = {_BLOCK_M: (2, 4), _BLOCK_M_UPPER: (4, 2)}
-# LDS K buffers per row tile; four 256-row buffers exceed the 160 KiB of LDS.
-_NUM_BUFFERS = {_BLOCK_M: 4, _BLOCK_M_UPPER: 3}
+_NUM_BUFFERS = 3
+# Whether a row tile uses the per-XCD schedule and the pipelined K tail.
+_XCD_SCHEDULE = {_BLOCK_M: False, _BLOCK_M_UPPER: True}
 _NUM_XCDS = 8
 
 
@@ -94,8 +98,11 @@ def _next_k_tile(
     a_kspan,
     b_kspan,
     k_tiles: gl.constexpr,
+    WRAP: gl.constexpr,
 ):
     """Advance the copy offsets one K tile, wrapping from the last to the first."""
+    if not WRAP:
+        return k_tile, a_offsets + a_kstep, b_offsets + b_kstep
     k_tile += 1
     wrap = k_tile == k_tiles
     a_offsets += gl.where(wrap, a_kstep - a_kspan, a_kstep)
@@ -134,22 +141,27 @@ def gluon_latent_input_mediumm_gfx950(
     WARPS_N: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     NUM_XCDS: gl.constexpr,
+    XCD_SCHEDULE: gl.constexpr,
 ):
     """Compute one packed output tile with BF16 MFMA and mixed-dtype stores."""
-    # Workgroup w runs on XCD w % NUM_XCDS. Give each XCD a contiguous run of
-    # column tiles with all their row tiles, so each weight tile is fetched
-    # into one XCD's L2 instead of one per row tile.
-    num_m = gl.num_programs(0)
-    num_tiles = num_m * gl.num_programs(1)
-    wid = gl.program_id(1) * num_m + gl.program_id(0)
-    xcd = wid % NUM_XCDS
-    per_xcd = (num_tiles + NUM_XCDS - 1) // NUM_XCDS
-    # XCDs at or past the remainder own one fewer tile.
-    rem = num_tiles % NUM_XCDS
-    full = gl.where((rem == 0) | (xcd < rem), xcd, rem)
-    tile = full * per_xcd + (xcd - full) * (per_xcd - 1) + wid // NUM_XCDS
-    pid_m = tile % num_m
-    pid_n = tile // num_m
+    pid_m = gl.program_id(0)
+    pid_n = gl.program_id(1)
+    xcd = 0
+    if XCD_SCHEDULE:
+        # Workgroup w runs on XCD w % NUM_XCDS. Give each XCD a contiguous run
+        # of column tiles with all their row tiles, so each weight tile is
+        # fetched into one XCD's L2 instead of one per row tile.
+        num_m = gl.num_programs(0)
+        num_tiles = num_m * gl.num_programs(1)
+        wid = pid_n * num_m + pid_m
+        xcd = wid % NUM_XCDS
+        per_xcd = (num_tiles + NUM_XCDS - 1) // NUM_XCDS
+        # XCDs at or past the remainder own one fewer tile.
+        rem = num_tiles % NUM_XCDS
+        full = gl.where((rem == 0) | (xcd < rem), xcd, rem)
+        tile = full * per_xcd + (xcd - full) * (per_xcd - 1) + wid // NUM_XCDS
+        pid_m = tile % num_m
+        pid_n = tile // num_m
     num_warps: gl.constexpr = WARPS_M * WARPS_N
     if BLOCK_M == 256 and BLOCK_K == 64:
         # Extend the 128-row global-load layout with one register row bit.
@@ -220,11 +232,13 @@ def gluon_latent_input_mediumm_gfx950(
     )
     a_kstep = BLOCK_K * stride_ak
     b_kstep = BLOCK_K * stride_bk
-    # Start each XCD at its own K tile and wrap at K. Summation order changes
-    # per XCD, but every output tile still adds all K tiles once.
-    k_tile = xcd * (k_tiles // NUM_XCDS)
-    a_offsets += k_tile * a_kstep
-    b_offsets += k_tile * b_kstep
+    k_tile = 0
+    if XCD_SCHEDULE:
+        # Start each XCD at its own K tile and wrap at K. Summation order
+        # changes per XCD, but every output tile still adds all K tiles once.
+        k_tile = xcd * (k_tiles // NUM_XCDS)
+        a_offsets += k_tile * a_kstep
+        b_offsets += k_tile * b_kstep
 
     # Fill every buffer; each commit group holds one K tile of A and B.
     for slot in gl.static_range(NUM_BUFFERS):
@@ -240,6 +254,7 @@ def gluon_latent_input_mediumm_gfx950(
             K * stride_ak,
             K * stride_bk,
             k_tiles,
+            XCD_SCHEDULE,
         )
     async_copy.wait_group(NUM_BUFFERS - 1)
     a = async_copy.load_shared_relaxed(smem_a.index(0), dot_a)
@@ -273,11 +288,14 @@ def gluon_latent_input_mediumm_gfx950(
                     K * stride_ak,
                     K * stride_bk,
                     k_tiles,
+                    XCD_SCHEDULE,
                 )
 
-    # The refills left after whole rounds run as extra steps, so the last
-    # copies are issued inside the pipeline instead of after the drain.
-    extra_steps: gl.constexpr = (k_tiles - NUM_BUFFERS) % NUM_BUFFERS
+    # With the XCD schedule, the refills left after whole rounds run as extra
+    # steps, so the last copies are issued inside the pipeline instead of
+    # after the drain. Otherwise they run unpipelined after it.
+    tail_tiles: gl.constexpr = (k_tiles - NUM_BUFFERS) % NUM_BUFFERS
+    extra_steps: gl.constexpr = tail_tiles if XCD_SCHEDULE else 0
     for slot in gl.static_range(extra_steps):
         async_copy.wait_group(NUM_BUFFERS - 2)
         with gl.amd.warp_pipeline_stage("mfma", priority=0):
@@ -301,6 +319,7 @@ def gluon_latent_input_mediumm_gfx950(
                 K * stride_ak,
                 K * stride_bk,
                 k_tiles,
+                XCD_SCHEDULE,
             )
 
     # Drain the tiles already in LDS, starting after the slot in registers.
@@ -314,6 +333,18 @@ def gluon_latent_input_mediumm_gfx950(
             smem_b.index((extra_steps + i) % NUM_BUFFERS), dot_b
         )
     acc = cdna4.mfma(a, b, acc)
+
+    if not XCD_SCHEDULE:
+        for slot in gl.static_range(tail_tiles):
+            async_copy.buffer_load_to_shared(smem_a.index(slot), a_ptr, a_offsets)
+            async_copy.buffer_load_to_shared(smem_b.index(slot), b_ptr, b_offsets)
+            async_copy.commit_group()
+            a_offsets += a_kstep
+            b_offsets += b_kstep
+            async_copy.wait_group(0)
+            a = async_copy.load_shared_relaxed(smem_a.index(slot), dot_a)
+            b = async_copy.load_shared_relaxed(smem_b.index(slot), dot_b)
+            acc = cdna4.mfma(a, b, acc)
 
     if n_start < ROUTER_N:
         # Each lane already holds four consecutive FP32 columns: one dwordx4.
@@ -450,8 +481,9 @@ def launch_gluon_latent_input_mediumm_gfx950(
         BLOCK_K=_BLOCK_K,
         WARPS_M=warps_m,
         WARPS_N=warps_n,
-        NUM_BUFFERS=_NUM_BUFFERS[block_m],
+        NUM_BUFFERS=_NUM_BUFFERS,
         NUM_XCDS=_NUM_XCDS,
+        XCD_SCHEDULE=_XCD_SCHEDULE[block_m],
         num_warps=warps_m * warps_n,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )

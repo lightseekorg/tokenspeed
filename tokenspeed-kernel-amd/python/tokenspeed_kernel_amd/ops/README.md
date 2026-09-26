@@ -304,15 +304,17 @@ available for other shapes and devices.
 #### Algorithm
 
 The mid-range path uses `128 x 128 x 64` tiles through 640 tokens and
-`256 x 128 x 64` tiles from 641 to 1280 tokens. Both use eight waves,
-vectorized loads, padded LDS layouts, and a K pipeline with four buffers on the
-128-row tile and three on the 256-row tile (four would exceed LDS) to overlap
-data movement with MFMA. Workgroups are ordered to reuse weight tiles within
-each XCD, and each XCD starts its K loop at a different eighth of K and wraps
-around, so the XCDs spread their activation reads over K instead of all
-reading the same columns at once. Column tiles follow the packed output boundaries: router logits are
-stored as FP32, routed latents as BF16, and shared gate/up pairs apply SiTU in
-registers before writing the BF16 shared input. Tail rows are masked.
+`256 x 128 x 64` tiles from 641 to 1280 tokens. Both use eight waves, vectorized
+loads, padded LDS layouts, and a three-buffer K pipeline to overlap data
+movement with MFMA. The 256-row tile also orders workgroups to reuse weight
+tiles within each XCD, starts each XCD's K loop at a different eighth of K and
+wraps around, so the XCDs spread their activation reads over K instead of all
+reading the same columns at once, and runs its leftover K tiles inside the
+pipeline. The 128-row tile keeps the plain launch order and an unpipelined K
+tail, which measured faster on MI355X. Column tiles follow the packed output
+boundaries: router logits are stored as FP32, routed latents as BF16, and shared
+gate/up pairs apply SiTU in registers before writing the BF16 shared input. Tail
+rows are masked.
 
 The large path uses an eight-wave `256 x 256 x 64` double-buffered MFMA/LDS
 warp pipeline. Its 128-column accumulator halves route FP32 router and BF16

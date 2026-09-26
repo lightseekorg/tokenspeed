@@ -105,8 +105,8 @@ def test_k3_prefill_dispatch(tokens: int, expected: str | None) -> None:
 
 
 @requires_cdna4
-# 639 and 641 straddle the 128/256-row tile switch. Every grid spans all eight
-# XCDs, so each staggered K start and its wrap back to K tile 0 are exercised.
+# 639 and 641 straddle the 128/256-row tile switch. Every 256-row grid spans all
+# eight XCDs, so each staggered K start and its wrap back to K tile 0 run.
 @pytest.mark.parametrize("tokens", [321, 512, 639, 641, 1024, 1280])
 @pytest.mark.parametrize("linear_beta", [None, 25.0])
 def test_medium_routes_packed_projection_and_applies_situ(
