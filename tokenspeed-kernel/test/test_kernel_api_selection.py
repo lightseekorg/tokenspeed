@@ -317,6 +317,24 @@ def test_builtin_moe_preprocessor_links_are_callables():
     assert errors == []
 
 
+def test_builtin_moe_topk_weight_dtype_traits_are_unambiguous():
+    registry = KernelRegistry.get()
+    errors = []
+    finalizer_dtypes = {torch.float32, torch.bfloat16}
+    for kernel_spec in registry.list_kernels("moe", "apply"):
+        weight_dtypes = kernel_spec.traits.get(
+            "topk_weights_dtype", frozenset({torch.float32})
+        )
+        if len(weight_dtypes) != 1:
+            errors.append(f"{kernel_spec.name}: ambiguous topk_weights_dtype")
+        if True in kernel_spec.traits.get(
+            "supports_deferred_finalize", frozenset({False})
+        ) and not weight_dtypes.issubset(finalizer_dtypes):
+            errors.append(f"{kernel_spec.name}: unsupported finalizer weight dtype")
+
+    assert errors == []
+
+
 def test_builtin_moe_specialized_offsets_are_intentional() -> None:
     """Only proven same-band overlaps may use specialized priority offsets."""
     registry = KernelRegistry.get()

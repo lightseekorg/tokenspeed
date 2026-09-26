@@ -582,6 +582,23 @@ def moe_plan(
     supports_deferred_finalize = True in apply_spec.traits.get(
         "supports_deferred_finalize", frozenset({False})
     )
+    topk_weights_dtypes = apply_spec.traits.get(
+        "topk_weights_dtype", frozenset({torch.float32})
+    )
+    if len(topk_weights_dtypes) != 1:
+        raise ValueError(
+            f"MoE kernel {apply_spec.name!r} must declare exactly one "
+            "topk_weights_dtype"
+        )
+    topk_weights_dtype = next(iter(topk_weights_dtypes))
+    if supports_deferred_finalize and topk_weights_dtype not in (
+        torch.float32,
+        torch.bfloat16,
+    ):
+        raise ValueError(
+            f"MoE kernel {apply_spec.name!r} uses unsupported deferred-finalize "
+            f"weight dtype {topk_weights_dtype}"
+        )
     return {
         "weight_dtype": weight_dtype,
         "activation": activation,
@@ -599,9 +616,7 @@ def moe_plan(
         "support_routing": support_routing,
         "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,
-        "topk_weights_dtype": next(
-            iter(apply_spec.traits.get("topk_weights_dtype", (torch.float32,)))
-        ),
+        "topk_weights_dtype": topk_weights_dtype,
         "solution": apply_spec.solution,
         "internal_activation_dtype": internal_activation_dtype,
     }
