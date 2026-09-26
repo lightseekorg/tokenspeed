@@ -964,9 +964,9 @@ place the four stages appear in order, and a family fills in uniformly named
 seams — `layer_types`, `group_ids`, `fields_for_layer`, `prefix_granularity`,
 `alignment`, `max_padding_fraction`, `packing`, `check_layout`,
 `num_lcm_blocks`, `token_capacity`, `parents_needed`, `workspace_bytes`,
-`pool_options`, `backends_accept_pool_replacement`, `verify_scratch_in_pool`.
-The last two answer whether this family can be rebound onto a second pool at
-boot; the CUDA-graph memory probe asks them before it binds anything.
+`pool_options`, `verify_scratch_in_pool`.
+The last answers whether this family can be rebound onto a second pool at
+boot; the CUDA-graph memory probe asks it before it binds anything.
 `groups()` itself is a seam for the two families whose groups are not
 per-layer (Inkling appends conv columns; V4 declares each group
 whole). No family restates the order of the stages, and `_RECIPES`

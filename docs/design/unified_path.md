@@ -95,9 +95,9 @@ from one first bound to that pool:
   policy may change. Paged leaves own kernel geometry only; the router
   validates group geometry for them.
   Qwen4-Exp's PLE and QSA indexer children validate their local fields during
-  this same pass. Their verify workspaces remain tied to one pool: publishing
-  that pool again preserves their buffers; a different pool is rejected before
-  any child publishes. Replacing such a pool requires rebuilding the composite.
+  this same pass. Publishing the same pool again preserves their verify
+  buffers; a different pool drops them (PLE's commit pointer tables, QSA's
+  verify state); the router's geometry check covers the indexer's tables.
 * For nodes accepting pool replacement, binding drops every pool-derived latch:
   pointer tables, scratch and views,
   per-forward metadata, the paged leaves' graph buffers, Inkling's ShortConv

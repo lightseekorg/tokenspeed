@@ -470,6 +470,24 @@ class ForwardStepRunner:
                 self.draft_attn_backend, snapshots["draft"], context=f"draft, {context}"
             )
 
+    def _prepare_request_token_history_graph_inputs(
+        self, *, active_bs: int, padded_bs: int
+    ) -> None:
+        """Lay out request-token history for a decode graph batch.
+
+        Capture and warmup pass ``active_bs=0`` so no captured row appends to
+        a live history; replay marks the padding rows inactive.
+        """
+        if self.runtime_states is None or not (
+            self.runtime_states.has_request_token_history
+        ):
+            return
+        self.input_buffers.prepare_request_token_history_graph_inputs(
+            active_bs=active_bs,
+            padded_bs=padded_bs,
+            decode_width=self.max_tokens_per_req,
+        )
+
     def _capture_one(
         self,
         bs: int,
@@ -483,6 +501,7 @@ class ForwardStepRunner:
             else self.device_module.CUDAGraph
         )
         graph = graph_cls()
+        self._prepare_request_token_history_graph_inputs(active_bs=0, padded_bs=bs)
 
         capture_forward_mode = ForwardMode.DECODE
         ctx = ForwardContext(
@@ -654,6 +673,9 @@ class ForwardStepRunner:
         _is_cuda_graph_phase = True
         try:
             for bs in batch_sizes:
+                self._prepare_request_token_history_graph_inputs(
+                    active_bs=0, padded_bs=bs
+                )
                 ctx = ForwardContext(
                     attn_backend=self.attn_backend,
                     token_to_kv_pool=self.token_to_kv_pool,
@@ -998,6 +1020,9 @@ class ForwardStepRunner:
 
         if use_graph:
             self._set_graph_state_write_indices(active_req_pool_indices, padded_bs)
+            self._prepare_request_token_history_graph_inputs(
+                active_bs=bs, padded_bs=padded_bs
+            )
 
         # Live delivery guard: a live batch must carry every published
         # group's table — the persistent decode buffers (and the extend

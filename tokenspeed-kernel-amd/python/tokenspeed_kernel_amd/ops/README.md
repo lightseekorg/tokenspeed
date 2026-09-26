@@ -333,6 +333,45 @@ shared gate/up halves convert to BF16. A companion Gluon kernel reads the
 materialized BF16 gate/up values, applies SiTU in FP32, and writes BF16 shared
 input.
 
+### gfx1250 latent input projection
+
+The same Kimi K3 packed projection as the gfx950 entry above, split into two
+kernels because the shape changes character with the batch. Decode streams the
+whole 86 MB weight past a handful of rows and is bound by memory; prefill is
+bound by arithmetic.
+
+#### Contract
+
+Input, weight, and output shapes and dtypes are the gfx950 entry's. Two
+things differ:
+
+- Automatic dispatch selects the decode kernel for 1 to 32 tokens and the
+  prefill kernel from 1536; the range between them retains the Triton kernel.
+- The packed tensor passed alongside the three weights must be their
+  consecutive view. The kernels read only it, so the launchers reject a
+  packed tensor the weights do not live inside.
+
+#### Algorithm
+
+Decode splits the reduction across workgroups, eight ways to 16 tokens and
+four above, because tiling the output alone leaves a 6016-column projection
+with too few workgroups to keep the device busy. Each writes FP32 partials
+that a companion kernel reduces and fans out to the three consumers. The
+split is what bounds the kernel: its partial traffic scales with the token
+count while the weight traffic does not.
+
+Prefill instead runs the wide large-M WMMA schedule from
+`gfx1250/gemm/fp16/mm.py`, a `256 x 256` tile on eight warps in 128-wide K
+steps through a double-buffered TDM pipeline, with no split at all. The three
+regions are written straight from the accumulator by one masked store each,
+so FP32 router logits reach memory without a round trip through BF16. A tile
+can straddle a region boundary, because the boundaries are 128-column aligned
+while the tile is 256 wide, so the masks rather than the tile index decide
+where a column belongs. SiTU is a second launch, as on gfx950: the gate and
+up halves sit 768 columns apart, so no tile holds both.
+
+Partial row tiles are masked in both kernels, so any token count is accepted.
+
 ### MXFP8 SiTU Experts
 
 On gfx950, the MoE API selects Gluon kernels with MXFP8 activations and MXFP4

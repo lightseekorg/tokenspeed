@@ -63,6 +63,7 @@ from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     ModelExecutionResult,
     NGramInputs,
+    RequestHistorySeeds,
 )
 from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.grammar.capturable_grammar import (
@@ -382,6 +383,11 @@ class ModelExecutor:
             output_length=config.output_length,
         )
         self.runtime_states.init_ngram_state(ngram_context)
+        self.runtime_states.init_request_token_history(
+            config.physical_context_len
+            if model_runner.model_config.requires_request_token_history
+            else 0
+        )
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
             config.enable_nan_detection,
@@ -751,7 +757,7 @@ class ModelExecutor:
                     ctx=ctx,
                     input_ids=ib.input_ids_buf[:num_tokens],
                     positions=positions,
-                    **ib.ngram_model_kwargs(num_tokens),
+                    **self._model_input_kwargs(num_tokens, ctx.bs),
                 )
             if self.drafter is not None:
                 self._autotune_draft_experts(num_tokens)
@@ -932,7 +938,7 @@ class ModelExecutor:
                 self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
                 positions,
                 pp_inbound=pp_inbound,
-                **self.input_buffers.ngram_model_kwargs(ctx.input_num_tokens),
+                **self._model_input_kwargs(ctx.input_num_tokens, ctx.bs),
             )
             return output
         # Prefill-graph replay when captured for this forward (the decode graph
@@ -963,8 +969,28 @@ class ModelExecutor:
             self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
             positions,
             multimodal_context=self._active_multimodal_context,
-            **self.input_buffers.ngram_model_kwargs(ctx.input_num_tokens),
+            **self._model_input_kwargs(ctx.input_num_tokens, ctx.bs),
         )
+
+    def _model_input_kwargs(self, num_tokens: int, bs: int) -> dict[str, object]:
+        """Model inputs beyond ids and positions, as views of persistent buffers.
+
+        Every forward call site passes these, so eager, captured and replayed
+        forwards read the same storage.
+        """
+        kwargs: dict[str, object] = dict(
+            self.input_buffers.ngram_model_kwargs(num_tokens)
+        )
+        if self.runtime_states.has_request_token_history:
+            ib = self.input_buffers
+            kwargs["request_token_history"] = (
+                self.runtime_states.request_token_history_view(
+                    req_pool_indices=ib.req_pool_indices_buf[:bs],
+                    input_start_offsets=ib.input_start_offsets_buf[: bs + 1],
+                    active_request_mask=ib.active_request_mask_buf[:bs],
+                )
+            )
+        return kwargs
 
     def _apply_force_single_token_verify(
         self,
@@ -1286,7 +1312,7 @@ class ModelExecutor:
             ctx,
             input_ids=empty,
             positions=empty,
-            **self.input_buffers.ngram_model_kwargs(0),
+            **self._model_input_kwargs(0, 0),
         )
 
         # If a drafter is active, its model also has MoE layers that issue
@@ -1468,6 +1494,7 @@ class ModelExecutor:
         capture_next_input_ids: bool = False,
         *,
         ngram_inputs: NGramInputs | None,
+        request_history_seeds: RequestHistorySeeds | None,
     ) -> ModelExecutionResult:
         self._reset_valid_cache_length(forward_op)
         self.log_step += 1
@@ -1516,6 +1543,8 @@ class ModelExecutor:
                 total_tokens=total_tokens,
                 ngram_inputs=ngram_inputs,
             )
+            if request_history_seeds is not None:
+                self.runtime_states.seed_request_token_history(request_history_seeds)
             if self.drafter is not None and hasattr(
                 self.drafter, "prepare_request_state"
             ):

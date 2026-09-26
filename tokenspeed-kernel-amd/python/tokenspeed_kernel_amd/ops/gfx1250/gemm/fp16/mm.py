@@ -27,6 +27,10 @@ from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
 _LARGEM_MIN_M = 512
 _LARGEM_BLOCK_M_CROSSOVER = 12288
+_LARGEM_WIDE_M = 4096
+_LARGEM_WIDE_N = 3072
+_WARP_BASES_4 = ((0, 1), (1, 0))
+_WARP_BASES_8 = ((0, 1), (1, 0), (2, 0))
 _LARGEM_SHAPES = {
     (512, 3072),
     (768, 7168),
@@ -701,6 +705,7 @@ def _wmma_tdm_dense_largem_kernel(
     BLOCK_K: gl.constexpr,
     GROUP_M: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    WARP_BASES: gl.constexpr,
 ):
     """Dense BF16 CDNA5 TDM/WMMA GEMM for large K3 projections.
 
@@ -722,7 +727,7 @@ def _wmma_tdm_dense_largem_kernel(
     wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
-        warp_bases=[[0, 1], [1, 0]],
+        warp_bases=WARP_BASES,
         reg_bases=[],
         instr_shape=[16, 16, 32],
     )
@@ -856,18 +861,28 @@ def gluon_mm_a16w16_largem_gfx1250(
             f"{(m, n)} on {A.device}"
         )
 
-    block_m = 128 if m < _LARGEM_BLOCK_M_CROSSOVER else 256
-    # Only the block shape has to divide evenly here. Ragged M and N edges are
-    # handled inside the kernel: its TDM descriptors are bounded by the real
-    # M and N, so the trailing partial tiles load only the rows that exist,
-    # and its stores are masked against the same bounds. Peeling those edges
-    # off into vendor calls would cost a second full pass over A plus, for a
-    # ragged N, a scratch buffer and a copy of the whole result.
-    block_n = next(
-        candidate
-        for candidate in (block_m, 128, 64, 32)
-        if (n - n % 32) % candidate == 0
-    )
+    if m >= _LARGEM_WIDE_M and n >= _LARGEM_WIDE_N:
+        block_m, block_n = 256, 256
+        warp_bases, num_warps = _WARP_BASES_8, 8
+        # A 256-wide tile already spans enough columns that grouping rows
+        # for L2 reuse costs more than it returns.
+        group_m = 1
+    else:
+        block_m = 128 if m < _LARGEM_BLOCK_M_CROSSOVER else 256
+        # Only the block shape has to divide evenly here. Ragged M and N edges
+        # are handled inside the kernel: its TDM descriptors are bounded by the
+        # real M and N, so the trailing partial tiles load only the rows that
+        # exist, and its stores are masked against the same bounds. Peeling
+        # those edges off into vendor calls would cost a second full pass over
+        # A plus, for a ragged N, a scratch buffer and a copy of the whole
+        # result.
+        block_n = next(
+            candidate
+            for candidate in (block_m, 128, 64, 32)
+            if (n - n % 32) % candidate == 0
+        )
+        warp_bases, num_warps = _WARP_BASES_4, 4
+        group_m = 8
     grid = triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
     _wmma_tdm_dense_largem_kernel[(grid,)](
         A,
@@ -885,9 +900,10 @@ def gluon_mm_a16w16_largem_gfx1250(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=128,
-        GROUP_M=8,
+        GROUP_M=group_m,
         NUM_BUFFERS=2,
-        num_warps=4,
+        WARP_BASES=warp_bases,
+        num_warps=num_warps,
         num_stages=1,
     )
     return out

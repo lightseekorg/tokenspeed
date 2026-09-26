@@ -147,7 +147,8 @@ def test_cache_family_preserves_qwen4_without_indexer_or_gdn(
         hf_config=SimpleNamespace(
             architectures=[architecture],
             text_config=SimpleNamespace(indexer_n_heads=indexer_n_heads),
-        )
+        ),
+        model_profile=None,
     )
     profile = _resolve_attn_side(model_config, None)
     config = _recipe(

@@ -1,5 +1,7 @@
 """Concrete cache-pool construction from a prepared cache spec."""
 
+from collections.abc import Callable
+
 from tokenspeed.runtime.layers.attention.configs.base import (
     AttnConfig,
     SoftmaxAttnConfig,
@@ -55,13 +57,265 @@ def _mha_pool_class(family: str, *, mxfp8: bool) -> type[CachePool]:
         "qwen_gdn": (HybridMHATokenToKVPool, HybridMHATokenToKVPoolMXFP8),
         "qwen4_exp": (HybridMHATokenToKVPool, HybridMHATokenToKVPoolMXFP8),
     }
-    try:
-        plain, scaled = by_family[family]
-    except KeyError:
-        raise TypeError(
-            f"cache family {family!r} is incompatible with MHAConfig"
-        ) from None
+    plain, scaled = by_family[family]
     return scaled if mxfp8 else plain
+
+
+def _softmax_config(config: AttnConfig, family: str, expected: type):
+    softmax_attn = config.component(SoftmaxAttnConfig)
+    if not isinstance(softmax_attn, expected):
+        raise TypeError(
+            f"cache family {family!r} is incompatible with "
+            f"{type(softmax_attn).__name__}"
+        )
+    return softmax_attn
+
+
+def _glm53_flash_pool(
+    spec: CachePoolSpec,
+    config: AttnConfig,
+    arena: CacheArena,
+    *,
+    num_layers: int,
+    rank: int,
+    field_layer_offset: int,
+) -> CachePool:
+    from tokenspeed.runtime.layers.attention.kv_cache.hybrid_glm53_flash import (
+        HybridGlm53FlashTokenToKVPool,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.glm53_flash import (
+        Glm53FlashPoolOptions,
+    )
+
+    options = spec.pool_options
+    if not isinstance(options, Glm53FlashPoolOptions):
+        raise TypeError("GLM-5.3-Flash cache spec is missing pool options")
+    softmax_attn = config.component(SoftmaxAttnConfig)
+    if not isinstance(softmax_attn, DSAConfig):
+        raise TypeError("GLM-5.3-Flash cache requires DSA attention")
+    if options.index_head_dim != softmax_attn.index_head_dim:
+        raise ValueError("GLM-5.3-Flash cache spec and attention config disagree")
+
+    return HybridGlm53FlashTokenToKVPool(
+        arena=arena,
+        dtype=config.kv_cache_dtype,
+        model_dtype=config.dtype,
+        quant_method=config.kv_cache_quant_method,
+        kv_lora_rank=softmax_attn.kv_lora_rank,
+        qk_rope_head_dim=softmax_attn.qk_rope_head_dim,
+        layer_num=num_layers,
+        rank=rank,
+        pool_options=options,
+        layer_types=spec.layer_types,
+        field_layer_offset=field_layer_offset,
+    )
+
+
+def _deepseek_v41_pool(
+    spec: CachePoolSpec,
+    config: AttnConfig,
+    arena: CacheArena,
+    *,
+    num_layers: int,
+    rank: int,
+    field_layer_offset: int,
+) -> CachePool:
+    del spec, config
+    from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v41 import (
+        DeepseekV41CachePool,
+    )
+
+    return DeepseekV41CachePool(
+        arena=arena,
+        layer_num=num_layers,
+        rank=rank,
+        field_layer_offset=field_layer_offset,
+    )
+
+
+def _deepseek_v4_pool(
+    spec: CachePoolSpec,
+    config: AttnConfig,
+    arena: CacheArena,
+    *,
+    num_layers: int,
+    rank: int,
+    field_layer_offset: int,
+) -> CachePool:
+    del config
+    from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
+        HybridDeepseekV4TokenToKVPool,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
+        DeepseekV4PoolOptions,
+    )
+
+    options = spec.pool_options
+    if not isinstance(options, DeepseekV4PoolOptions):
+        raise TypeError("DeepSeek V4 cache spec is missing pool options")
+    return HybridDeepseekV4TokenToKVPool(
+        arena,
+        layout=options.layout,
+        layer_num=num_layers,
+        rank=rank,
+        field_layer_offset=field_layer_offset,
+    )
+
+
+def _dsa_pool(
+    spec: CachePoolSpec,
+    config: AttnConfig,
+    arena: CacheArena,
+    *,
+    num_layers: int,
+    rank: int,
+    field_layer_offset: int,
+) -> CachePool:
+    from tokenspeed.runtime.layers.attention.kv_cache.dsa import DSATokenToKVPool
+
+    softmax_attn = _softmax_config(config, spec.family, DSAConfig)
+    return DSATokenToKVPool(
+        arena,
+        dtype=config.kv_cache_dtype,
+        model_dtype=config.dtype,
+        quant_method=config.kv_cache_quant_method,
+        kv_lora_rank=softmax_attn.kv_lora_rank,
+        qk_rope_head_dim=softmax_attn.qk_rope_head_dim,
+        layer_num=num_layers,
+        rank=rank,
+        index_head_dim=softmax_attn.index_head_dim,
+        field_layer_offset=field_layer_offset,
+    )
+
+
+def _msa_pool(
+    spec: CachePoolSpec,
+    config: AttnConfig,
+    arena: CacheArena,
+    *,
+    num_layers: int,
+    rank: int,
+    field_layer_offset: int,
+) -> CachePool:
+    from tokenspeed.runtime.layers.attention.kv_cache.msa import MSATokenToKVPool
+
+    softmax_attn = _softmax_config(config, spec.family, MSAConfig)
+    return MSATokenToKVPool(
+        arena=arena,
+        dtype=config.kv_cache_dtype,
+        head_num=max(softmax_attn.num_kv_heads // softmax_attn.attn_tp_size, 1),
+        head_dim=softmax_attn.head_dim,
+        layer_num=num_layers,
+        rank=rank,
+        field_layer_offset=field_layer_offset,
+    )
+
+
+def _mha_shaped_pool(
+    spec: CachePoolSpec,
+    config: AttnConfig,
+    arena: CacheArena,
+    *,
+    num_layers: int,
+    rank: int,
+    field_layer_offset: int,
+) -> CachePool:
+    from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
+        HybridMHATokenToKVPool,
+    )
+
+    softmax_attn = _softmax_config(config, spec.family, MHAConfig)
+    pool_cls = _mha_pool_class(spec.family, mxfp8=bool(config.kv_cache_mxfp8))
+    # Only the hybrid pools route layers by label; a plain MHA pool has no
+    # state layers to tell apart.
+    hybrid_kwargs = (
+        {"layer_types": spec.layer_types}
+        if issubclass(pool_cls, HybridMHATokenToKVPool)
+        else {}
+    )
+    return pool_cls(
+        arena=arena,
+        dtype=config.kv_cache_dtype,
+        head_num=max(softmax_attn.num_kv_heads // softmax_attn.attn_tp_size, 1),
+        head_dim=softmax_attn.head_dim,
+        layer_num=num_layers,
+        rank=rank,
+        layer_kv_head_counts=spec.layer_kv_head_counts,
+        kv_alloc_head_count=softmax_attn.num_kv_heads,
+        field_layer_offset=field_layer_offset,
+        **hybrid_kwargs,
+    )
+
+
+def _mla_pool(
+    spec: CachePoolSpec,
+    config: AttnConfig,
+    arena: CacheArena,
+    *,
+    num_layers: int,
+    rank: int,
+    field_layer_offset: int,
+) -> CachePool:
+    from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
+
+    softmax_attn = _softmax_config(config, spec.family, MLAConfig)
+    return MLATokenToKVPool(
+        arena,
+        dtype=config.kv_cache_dtype,
+        model_dtype=config.dtype,
+        quant_method=config.kv_cache_quant_method,
+        kv_lora_rank=softmax_attn.kv_lora_rank,
+        qk_rope_head_dim=softmax_attn.qk_rope_head_dim,
+        layer_num=num_layers,
+        rank=rank,
+        field_layer_offset=field_layer_offset,
+    )
+
+
+def _hybrid_kda_pool(
+    spec: CachePoolSpec,
+    config: AttnConfig,
+    arena: CacheArena,
+    *,
+    num_layers: int,
+    rank: int,
+    field_layer_offset: int,
+) -> CachePool:
+    from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
+        HybridKDATokenToKVPool,
+    )
+
+    softmax_attn = _softmax_config(config, spec.family, MLAConfig)
+    return HybridKDATokenToKVPool(
+        arena=arena,
+        dtype=config.kv_cache_dtype,
+        model_dtype=config.dtype,
+        quant_method=config.kv_cache_quant_method,
+        kv_lora_rank=softmax_attn.kv_lora_rank,
+        qk_rope_head_dim=softmax_attn.qk_rope_head_dim,
+        layer_num=num_layers,
+        rank=rank,
+        layer_types=spec.layer_types,
+        field_layer_offset=field_layer_offset,
+    )
+
+
+# family -> the pool its recipe's plan binds to. A factory takes
+# ``(spec, config, arena, *, num_layers, rank, field_layer_offset)``. Plugins
+# add families via ``tokenspeed.runtime.plugins.registry.register_cache_pool``.
+_POOL_FACTORIES: dict[str, Callable[..., CachePool]] = {
+    "mha": _mha_shaped_pool,
+    "inkling": _mha_shaped_pool,
+    "qwen_gdn": _mha_shaped_pool,
+    "qwen4_exp": _mha_shaped_pool,
+    "mla": _mla_pool,
+    "kimi_k3": _hybrid_kda_pool,
+    "dsa": _dsa_pool,
+    "msa": _msa_pool,
+    "glm53_flash": _glm53_flash_pool,
+    "deepseek_v4": _deepseek_v4_pool,
+    "deepseek_v41": _deepseek_v41_pool,
+}
 
 
 def create_cache_pool(
@@ -79,160 +333,14 @@ def create_cache_pool(
     merged plan's global layer window, so a draft view names the
     continuation fields the target's plan already reserved.
     """
-    softmax_attn = config.component(SoftmaxAttnConfig)
-    if spec.family == "glm53_flash":
-        from tokenspeed.runtime.layers.attention.kv_cache.hybrid_glm53_flash import (
-            HybridGlm53FlashTokenToKVPool,
-        )
-        from tokenspeed.runtime.layers.attention.kv_cache.recipes.glm53_flash import (
-            Glm53FlashPoolOptions,
-        )
-
-        options = spec.pool_options
-        if not isinstance(options, Glm53FlashPoolOptions):
-            raise TypeError("GLM-5.3-Flash cache spec is missing pool options")
-        if not isinstance(softmax_attn, DSAConfig):
-            raise TypeError("GLM-5.3-Flash cache requires DSA attention")
-        if options.index_head_dim != softmax_attn.index_head_dim:
-            raise ValueError("GLM-5.3-Flash cache spec and attention config disagree")
-
-        return HybridGlm53FlashTokenToKVPool(
-            arena=arena,
-            dtype=config.kv_cache_dtype,
-            model_dtype=config.dtype,
-            quant_method=config.kv_cache_quant_method,
-            kv_lora_rank=softmax_attn.kv_lora_rank,
-            qk_rope_head_dim=softmax_attn.qk_rope_head_dim,
-            layer_num=num_layers,
-            rank=rank,
-            pool_options=options,
-            layer_types=spec.layer_types,
-            field_layer_offset=field_layer_offset,
-        )
-    if spec.family == "deepseek_v41":
-        from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v41 import (
-            DeepseekV41CachePool,
-        )
-
-        return DeepseekV41CachePool(
-            arena=arena,
-            layer_num=num_layers,
-            rank=rank,
-            field_layer_offset=field_layer_offset,
-        )
-    if spec.family == "deepseek_v4":
-        from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
-            HybridDeepseekV4TokenToKVPool,
-        )
-        from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
-            DeepseekV4PoolOptions,
-        )
-
-        options = spec.pool_options
-        if not isinstance(options, DeepseekV4PoolOptions):
-            raise TypeError("DeepSeek V4 cache spec is missing pool options")
-        return HybridDeepseekV4TokenToKVPool(
-            arena,
-            layout=options.layout,
-            layer_num=num_layers,
-            rank=rank,
-            field_layer_offset=field_layer_offset,
-        )
-    if isinstance(softmax_attn, DSAConfig):
-        from tokenspeed.runtime.layers.attention.kv_cache.dsa import (
-            DSATokenToKVPool,
-        )
-
-        return DSATokenToKVPool(
-            arena,
-            dtype=config.kv_cache_dtype,
-            model_dtype=config.dtype,
-            quant_method=config.kv_cache_quant_method,
-            kv_lora_rank=softmax_attn.kv_lora_rank,
-            qk_rope_head_dim=softmax_attn.qk_rope_head_dim,
-            layer_num=num_layers,
-            rank=rank,
-            index_head_dim=softmax_attn.index_head_dim,
-            field_layer_offset=field_layer_offset,
-        )
-    if isinstance(softmax_attn, MSAConfig):
-        from tokenspeed.runtime.layers.attention.kv_cache.msa import (
-            MSATokenToKVPool,
-        )
-
-        return MSATokenToKVPool(
-            arena=arena,
-            dtype=config.kv_cache_dtype,
-            head_num=max(softmax_attn.num_kv_heads // softmax_attn.attn_tp_size, 1),
-            head_dim=softmax_attn.head_dim,
-            layer_num=num_layers,
-            rank=rank,
-            field_layer_offset=field_layer_offset,
-        )
-    if isinstance(softmax_attn, MHAConfig):
-        from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
-            HybridMHATokenToKVPool,
-        )
-
-        pool_cls = _mha_pool_class(spec.family, mxfp8=bool(config.kv_cache_mxfp8))
-        # Only the hybrid pools route layers by label; a plain MHA pool has no
-        # state layers to tell apart.
-        hybrid_kwargs = (
-            {"layer_types": spec.layer_types}
-            if issubclass(pool_cls, HybridMHATokenToKVPool)
-            else {}
-        )
-        return pool_cls(
-            arena=arena,
-            dtype=config.kv_cache_dtype,
-            head_num=max(softmax_attn.num_kv_heads // softmax_attn.attn_tp_size, 1),
-            head_dim=softmax_attn.head_dim,
-            layer_num=num_layers,
-            rank=rank,
-            layer_kv_head_counts=spec.layer_kv_head_counts,
-            kv_alloc_head_count=softmax_attn.num_kv_heads,
-            field_layer_offset=field_layer_offset,
-            **hybrid_kwargs,
-        )
-    if isinstance(softmax_attn, MLAConfig):
-        if spec.family == "mla":
-            from tokenspeed.runtime.layers.attention.kv_cache.mla import (
-                MLATokenToKVPool,
-            )
-
-            return MLATokenToKVPool(
-                arena,
-                dtype=config.kv_cache_dtype,
-                model_dtype=config.dtype,
-                quant_method=config.kv_cache_quant_method,
-                kv_lora_rank=softmax_attn.kv_lora_rank,
-                qk_rope_head_dim=softmax_attn.qk_rope_head_dim,
-                layer_num=num_layers,
-                rank=rank,
-                field_layer_offset=field_layer_offset,
-            )
-
-        if spec.family != "kimi_k3":
-            raise TypeError(
-                f"cache family {spec.family!r} is incompatible with MLAConfig"
-            )
-
-        from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
-            HybridKDATokenToKVPool,
-        )
-
-        return HybridKDATokenToKVPool(
-            arena=arena,
-            dtype=config.kv_cache_dtype,
-            model_dtype=config.dtype,
-            quant_method=config.kv_cache_quant_method,
-            kv_lora_rank=softmax_attn.kv_lora_rank,
-            qk_rope_head_dim=softmax_attn.qk_rope_head_dim,
-            layer_num=num_layers,
-            rank=rank,
-            layer_types=spec.layer_types,
-            field_layer_offset=field_layer_offset,
-        )
-    raise TypeError(
-        f"cache setup does not support config type {type(softmax_attn).__name__}"
+    factory = _POOL_FACTORIES.get(spec.family)
+    if factory is None:
+        raise TypeError(f"no cache pool is registered for family {spec.family!r}")
+    return factory(
+        spec,
+        config,
+        arena,
+        num_layers=num_layers,
+        rank=rank,
+        field_layer_offset=field_layer_offset,
     )

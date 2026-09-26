@@ -1246,7 +1246,10 @@ def test_recipe_exact_geometry_capacity_and_dispatch():
         _create_attn_backend(AttentionArch.MLA, recipe.attn_config),
         DeepseekV41AttentionBackend,
     )
-    model = SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41_text"))
+    model = SimpleNamespace(
+        hf_config=SimpleNamespace(model_type="deepseek_v41_text"),
+        model_profile=None,
+    )
     profile = _resolve_attn_side(model, requested_backend=None)
     assert _resolve_cache_family(profile, recipe.attn_config) == "deepseek_v41"
 
