@@ -95,7 +95,7 @@ def assert_agree(a: torch.Tensor, b: torch.Tensor) -> None:
     """Byte-equal; on AMD two solutions' fp16 results are allowed one ulp apart."""
     if bytes_equal(a, b):
         return
-    assert current_platform.is_amd() and a.dtype is torch.float16, "bytes differ"
+    assert current_platform().is_amd and a.dtype is torch.float16, "bytes differ"
     differ = (a != b).float().mean().item()
     gap = (a.float() - b.float()).abs().max().item()
     assert torch.allclose(
