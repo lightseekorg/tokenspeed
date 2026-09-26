@@ -614,10 +614,10 @@ if current_platform().is_amd:
     def _is_8wave_mla_prefill_problem(
         batch_size: int, total_q: int, total_kv: int
     ) -> bool:
-        # For FP8 the 8-wave pipeline kernel cover 256 query rows per block,
-        # it wins once each sequence has enough keys to pay off refilling it
-        # for every block. The threshold comes from cold-cache measurements of
-        # Kimi-K3 prefill shapes.
+        # For FP8 both kernels cover 256 query rows per block, so the 8-wave
+        # pipeline wins once each sequence has enough keys to pay off
+        # refilling it for every block. The threshold comes from cold-cache
+        # measurements of Kimi-K3 prefill shapes.
         return total_kv >= 1024 * batch_size
 
     @register_kernel(
