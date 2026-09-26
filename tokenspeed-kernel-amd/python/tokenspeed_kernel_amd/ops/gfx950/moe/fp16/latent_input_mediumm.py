@@ -363,7 +363,7 @@ def gluon_latent_input_mediumm_gfx950(
             [BLOCK_M // (4 * num_warps), 8], [4, 16], [num_warps, 1], [1, 0]
         )
         gl.static_assert(
-            BLOCK_M >= 4 * num_warps and BLOCK_N == 8 * 16,
+            BLOCK_M % (4 * num_warps) == 0 and BLOCK_N == 8 * 16,
             "the BF16 store layout covers exactly one output tile",
         )
         value = gl.convert_layout(acc.to(gl.bfloat16), store_layout)
