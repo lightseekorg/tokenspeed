@@ -18,7 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""MLA prefill Gluon kernel optimized for AMD GFX950."""
+"""MLA prefill Gluon kernel optimized for AMD GFX950.
+
+The 16-bit warp-pipelined path is inspired by and adapted from the flash
+attention kernels in ROCm/gfx950-gluon-tutorials.
+"""
 
 from __future__ import annotations
 
@@ -128,7 +132,9 @@ class AttentionConfig:
     ):
         assert HEAD_DIM == 128
         assert ROPE_DIM == 64
-        assert NUM_WARPS in (4, 8)
+        # Each of the 8 waves owns 32 query rows of one 32x32 MFMA row block.
+        assert NUM_WARPS == 8
+        assert BLOCK_M == 32 * NUM_WARPS
 
         # FP8 uses the wider gfx950 MFMA K dimension; 16-bit inputs retain K=16.
         (
@@ -150,12 +156,14 @@ class AttentionConfig:
             num_warps=NUM_WARPS,
             instr_shape=[32, 32, 64] if IS_FP8 else [32, 32, 16],
         )
-        if IS_FP8:
-            # Keep each MFMA wave's 32 rows during output narrowing. Only the
-            # lane-32 partner exchanges columns to form eight-element stores.
-            store_layout = gl.BlockedLayout([1, 8], [32, 2], [NUM_WARPS, 1], [0, 1])
-        # RoPE uses the same 128-bit load width as the content path.
-        load_vec = 16 if IS_FP8 else 8
+        # Keep each MFMA wave's 32 rows during output narrowing. Only the
+        # lane-32 partner exchanges columns to form eight-element stores.
+        store_layout = gl.BlockedLayout([1, 8], [32, 2], [NUM_WARPS, 1], [0, 1])
+        # FP8 RoPE copies use the content path's 128-bit width. A 16-bit
+        # 32 x 64 RoPE tile holds only four elements per thread, so 128-bit
+        # copies would leave half the waves issuing duplicate copies; 32-bit
+        # copies give every wave its own rows instead.
+        load_vec = 16 if IS_FP8 else 2
         load_pe_threads = ROPE_DIM // load_vec
         load_pe_layout = gl.BlockedLayout(
             [1, load_vec],
@@ -345,20 +353,24 @@ class AttentionProgram:
             )
         async_copy.commit_group()
 
+    # The caller orders these reads after the DMA through wait_group and the
+    # warp-pipeline barriers, so the loads need no extra waits of their own.
     @gluon.jit
     def shared_load_k(self, k_smem):
         cfg = self.cfg
-        return k_smem.permute([1, 0]).load(cfg.k_layout)
+        return async_copy.load_shared_relaxed(k_smem.permute([1, 0]), cfg.k_layout)
 
     @gluon.jit
     def shared_load_k_pe(self, k_pe_smem):
         cfg = self.cfg
-        return k_pe_smem.permute([1, 0]).load(cfg.k_pe_layout)
+        return async_copy.load_shared_relaxed(
+            k_pe_smem.permute([1, 0]), cfg.k_pe_layout
+        )
 
     @gluon.jit
     def shared_load_v(self, v_smem):
         cfg = self.cfg
-        return v_smem.load(cfg.v_layout)
+        return async_copy.load_shared_relaxed(v_smem, cfg.v_layout)
 
     @gluon.jit
     def dot(self, a, b, acc):
@@ -405,20 +417,6 @@ class AttentionProgram:
             [cfg.BLOCK_M, cfg.HEAD_DIM], dtype=gl.float32, layout=cfg.pv_layout
         )
         return m_i, l_i, acc
-
-    @gluon.jit
-    def softmax(self, e, m_i, l_i, acc):
-        # `e` and the online-softmax state (m_i) are in base-2 exponent units.
-        row_max = max(e, 1)
-        row_max = gl.where(row_max == -float("inf"), -1.0e20, row_max)
-        m_new = maximum(m_i, row_max)
-        p = gl.exp2(e - m_new[:, None])
-        alpha = gl.exp2(m_i - m_new)
-        l_i = l_i * alpha + gl.sum(p, axis=1)
-        acc = acc * alpha[:, None]
-        p = p.to(self.q_ptr.dtype.element_ty)
-        p = gl.convert_layout(p, self.cfg.p_layout)
-        return p, m_new, l_i, acc
 
     @gluon.jit
     def store_output(self, output):
@@ -499,66 +497,16 @@ def issue_tile_loads(
 
 
 @gluon.jit
-def compute_tile(
-    program: AttentionProgram,
-    k_smem: gl.shared_memory_descriptor,
-    k_pe_smem: gl.shared_memory_descriptor,
-    v_smem: gl.shared_memory_descriptor,
-    q,
-    q_pe,
-    kv_start,
-    causal_row,
-    m_i,
-    l_i,
-    acc,
-    MASKED: gl.constexpr,
-):
-    # Assumes this tile's async loads have already been waited on.
-    cfg = program.cfg
-    k = program.shared_load_k(k_smem)
-    k_pe = program.shared_load_k_pe(k_pe_smem)
-    qk = program.compute_qk(q, k, q_pe, k_pe)
-    e = program.scale_logits(qk)
-
-    if MASKED:
-        col = kv_start + gl.arange(
-            0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout)
-        )
-        valid = col[None, :] < program.kv_len
-        if cfg.IS_CAUSAL:
-            valid = valid & (col[None, :] <= causal_row[:, None])
-        e = gl.where(valid, e, -float("inf"))
-
-    p, m_i, l_i, acc = program.softmax(e, m_i, l_i, acc)
-
-    v = program.shared_load_v(v_smem)
-    if MASKED:
-        # The async load doesn't zero mask-predicated lanes, so tail rows
-        # (>= kv_len) can be uninitialized NaN; zero them here to avoid
-        # 0 * NaN poisoning the PV accumulator.
-        v_n = kv_start + gl.arange(
-            0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.v_layout)
-        )
-        v = gl.where((v_n < program.kv_len)[:, None], v, 0.0)
-    acc = program.compute_pv(p, v, acc)
-    return m_i, l_i, acc
-
-
-@gluon.jit
 def finish_query_block(program, m_i, l_i, acc):
     cfg = program.cfg
     program.store_lse(l_i, m_i)
     denom = gl.where(l_i > 0.0, l_i, 1.0)
     output = acc * (1.0 / denom)[:, None]
-    narrow_output: gl.constexpr = (
-        program.output_ptr.dtype.element_ty.primitive_bitwidth < 32
-    )
-    if cfg.IS_FP8 and narrow_output:
+    if program.output_ptr.dtype.element_ty.primitive_bitwidth < 32:
         # Narrow before exchanging columns within each wave so each lane can
-        # form eight-element stores; 16-bit inputs retain their store order.
+        # form eight-element stores. Wider outputs retain their direct
+        # accumulator-layout stores.
         output = output.to(program.output_ptr.dtype.element_ty)
-    # Wider outputs retain their direct accumulator-layout stores.
-    if not cfg.IS_FP8 or narrow_output:
         output = gl.convert_layout(output, cfg.store_layout)
     program.store_output(output)
 
@@ -598,6 +546,27 @@ def _fp8_shift(program, scores, m, kv_start, main_end, causal_row):
 
 
 @gluon.jit
+def _wave_maxima_unchanged(m_old, m_new):
+    # Returns 1 when no row of the wave moved its maximum, else 0, as one
+    # wave-uniform SGPR value, so a branch on it is a scalar branch that skips
+    # the rescale for the whole wave:
+    #   v_cmp_eq_f32  VCC bit set for each lane whose maximum is unchanged
+    #   s_cmp_eq_u64  SCC = every active lane set its bit (VCC == EXEC)
+    #   s_cselect     SGPR result = SCC ? 1 : 0
+    # "=s" asks for an SGPR result; VCC and SCC are declared clobbered.
+    return gl.inline_asm_elementwise(
+        asm="v_cmp_eq_f32_e64 vcc, $1, $2\n"
+        "s_cmp_eq_u64 vcc, exec\n"
+        "s_cselect_b32 $0, 1, 0",
+        constraints="=s,v,v,~{vcc},~{scc}",
+        args=[m_old, m_new],
+        dtype=gl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@gluon.jit
 def _fp8_rescale_row(l, m, m_new, unchanged):
     alpha = gl.cast(1.0, gl.float32)
     if unchanged == 0:
@@ -614,6 +583,9 @@ def _fp8_rescale_output_pack(*args):
     if args[96] == 0:
         updated = ()
         for i in gl.static_range(64):
+            # One v_mul_f32 per value, in place ("0" ties the result to the
+            # input register). Plain multiplies would be paired into
+            # v_pk_mul_f32, which cannot co-issue with this cluster's MFMAs.
             value = gl.inline_asm_elementwise(
                 asm="v_mul_f32_e32 $0, $0, $2",
                 constraints="=v,0,v",
@@ -708,16 +680,7 @@ def _fp8_overlap_qk_and_previous_pv(
         acc1 = program.dot(p, v1, acc1)
         # A wave owns 32 query rows. Skip only if all their maxima are unchanged;
         # no deferred maximum or enlarged FP8 probability range is introduced.
-        unchanged = gl.inline_asm_elementwise(
-            asm="v_cmp_eq_f32_e64 vcc, $1, $2\n"
-            "s_cmp_eq_u64 vcc, exec\n"
-            "s_cselect_b32 $0, 1, 0",
-            constraints="=s,v,v,~{vcc},~{scc}",
-            args=[m, m_new],
-            dtype=gl.int32,
-            is_pure=False,
-            pack=1,
-        )
+        unchanged = _wave_maxima_unchanged(m, m_new)
         l, alpha = gl.map_elementwise(_fp8_rescale_row, l, m, m_new, unchanged)
         acc0, acc1 = gl.map_elementwise(
             _fp8_rescale_output_pack,
@@ -858,6 +821,296 @@ def process_query_block_fp8(program, k_smem, k_pe_smem, v_smem):
     finish_query_block(program, m, l, _fp8_join_columns(acc0, acc1, cfg.pv_layout))
 
 
+# ===-----------------------------------------------------------------------===#
+# 16-bit warp-pipelined tile loop
+# ===-----------------------------------------------------------------------===#
+#
+# A workgroup of 8 waves owns 256 query rows, 32 per wave, and walks the key
+# tiles in BLOCK_N = 32 steps. Each loop iteration j finishes output tile j and
+# is cut into four warp-pipeline clusters:
+#
+#   qk_sum   QK MFMA of tile j + 1; exp2, row sum and bf16 convert of tile j
+#   load_v   read V(j) from LDS; start the DMA of K(j + 4)
+#   pv_max   PV MFMA of tile j; row max and exp2 of tile j + 1
+#   load_k   read K(j + 2) from LDS; start the DMA of V(j + 3); rescale
+#
+# The two waves on a SIMD run the clusters one apart, so one wave's MFMAs
+# overlap the other wave's LDS reads and DMA issue. The softmax runs in the
+# MFMA clusters, where its VALU work co-issues with the same wave's MFMAs; it is
+# split so that both MFMA clusters carry vector work.
+#
+# BLOCK_N = 32 keeps a wave within 256 VGPRs: Q (48), the accumulator (64),
+# the K operand (48, reused for V) and the score tiles are live together.
+#
+# K and V move through 4-slot LDS rings. With K issued four tiles ahead and V
+# three ahead, every DMA has about two tile periods to land, and it overwrites
+# a slot whose operands both waves already consumed in an earlier MFMA cluster,
+# so no LDS read can still be in flight. Tiles past the visible range are loaded
+# with every row masked, which zero-fills LDS without reading memory; the loop
+# therefore runs the same body to the last tile and needs no drain.
+
+KV_RING = gl.constexpr(4)
+
+# Lazy rescale threshold in log2 units. The running maximum only advances when a
+# tile's maximum exceeds it by more than this, so p = exp2(s - m) stays below
+# 2**8 and the accumulator correction is skipped while the maximum is stable.
+_LAZY_RESCALE_THRESHOLD = gl.constexpr(8.0)
+
+
+@gluon.jit
+def _keep_in_cluster(x):
+    # An empty side-effecting asm that reads and redefines x. Neither the IR
+    # optimizer nor MachineSink moves it across the cluster barriers, so the
+    # ops producing x stay in the cluster that computes them instead of drifting
+    # toward their consumer in a later cluster. "=v,0" ties the result to the
+    # input register, so no instruction is emitted; 16-bit values go in pairs,
+    # one 32-bit VGPR per asm operand.
+    pack: gl.constexpr = 2 if x.dtype.primitive_bitwidth == 16 else 1
+    return gl.inline_asm_elementwise(
+        asm="",
+        constraints="=v,0",
+        args=[x],
+        dtype=x.dtype,
+        is_pure=False,
+        pack=pack,
+    )
+
+
+@gluon.jit
+def _split_columns(x):
+    # Register-only column halves: each half keeps x's MFMA layout.
+    half: gl.constexpr = x.shape[1] // 2
+    lo = gl.amd.slice(x, [x.shape[0], half], [0, 0])
+    hi = gl.amd.slice(x, [x.shape[0], half], [0, half])
+    return lo, hi
+
+
+@gluon.jit
+def _join_columns(lo, hi):
+    # Inverse of _split_columns, also register-only. join/permute/reshape
+    # places lo's columns before hi's; assert_trivial fails the build if the
+    # result would need data movement.
+    layout: gl.constexpr = lo.type.layout
+    shape: gl.constexpr = [lo.shape[0], lo.shape[1] + hi.shape[1]]
+    x = gl.join(lo, hi).permute([0, 2, 1]).reshape(shape)
+    return gl.convert_layout(x, layout, assert_trivial=True)
+
+
+@gluon.aggregate
+class TileCopies:
+    # Per-thread global offsets and rows of key tile 0. A later tile only adds
+    # a scalar row shift, which keeps the per-tile address multiplies out of
+    # the copy clusters.
+    k_offsets: gl.tensor
+    k_rows: gl.tensor
+    k_pe_offsets: gl.tensor
+    k_pe_rows: gl.tensor
+    v_offsets: gl.tensor
+    v_rows: gl.tensor
+
+    @gluon.constexpr_function
+    def __init__(self, k_offsets, k_rows, k_pe_offsets, k_pe_rows, v_offsets, v_rows):
+        self.k_offsets = k_offsets
+        self.k_rows = k_rows
+        self.k_pe_offsets = k_pe_offsets
+        self.k_pe_rows = k_pe_rows
+        self.v_offsets = v_offsets
+        self.v_rows = v_rows
+
+    @gluon.jit
+    def create(program):
+        k_offsets, k_rows = program.make_k_offsets(0)
+        k_pe_offsets, k_pe_rows = program.make_k_pe_offsets(0)
+        v_offsets, v_rows = program.make_v_offsets(0)
+        return TileCopies(k_offsets, k_rows, k_pe_offsets, k_pe_rows, v_offsets, v_rows)
+
+    @gluon.jit
+    def issue_k(self, program, k_smem, k_pe_smem, tile):
+        cfg = program.cfg
+        slot = tile % KV_RING
+        shift = tile * cfg.BLOCK_N
+        # rows < kv_len - shift is the tile-0 form of (rows + shift) < kv_len.
+        rows_left = program.kv_len - shift
+        # Masked rows read nothing and zero-fill their LDS rows.
+        async_copy.buffer_load_to_shared(
+            k_smem.index(slot),
+            program.k_ptr,
+            self.k_offsets + shift * cfg.k_strides.stride_t,
+            mask=self.k_rows[:, None] < rows_left,
+        )
+        async_copy.buffer_load_to_shared(
+            k_pe_smem.index(slot),
+            program.k_ptr,
+            self.k_pe_offsets + shift * cfg.k_strides.stride_t,
+            mask=self.k_pe_rows[:, None] < rows_left,
+        )
+        async_copy.commit_group()
+
+    @gluon.jit
+    def issue_v(self, program, v_smem, tile):
+        cfg = program.cfg
+        shift = tile * cfg.BLOCK_N
+        async_copy.buffer_load_to_shared(
+            v_smem.index(tile % KV_RING),
+            program.v_ptr,
+            self.v_offsets + shift * cfg.v_strides.stride_t,
+            mask=self.v_rows[:, None] < program.kv_len - shift,
+        )
+        async_copy.commit_group()
+
+
+@gluon.jit
+def _read_k_tile(program, k_smem, k_pe_smem, tile):
+    slot = tile % KV_RING
+    k = program.shared_load_k(k_smem.index(slot))
+    k_pe = program.shared_load_k_pe(k_pe_smem.index(slot))
+    return k, k_pe
+
+
+@gluon.jit
+def _softmax_max(program, scores, m_run, kv_start, bound, MASKED: gl.constexpr):
+    # Row maximum and exponent argument of one score tile, plus exp2 of its
+    # first quarter. The two MFMA clusters share the softmax: this one holds 8
+    # PV MFMAs and the other 12 QK MFMAs, so the remaining three quarters are
+    # exponentiated by _softmax_sum. Every returned value is computed here,
+    # into fresh registers, so the next QK MFMA can reuse the score registers.
+    cfg = program.cfg
+    scale: gl.constexpr = cfg.SM_SCALE * _INV_LN2
+    if MASKED:
+        cols = kv_start + gl.arange(
+            0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout)
+        )
+        scores = gl.where(cols[None, :] <= bound[:, None], scores, -float("inf"))
+    row_max = max(scores, 1) * scale
+    if MASKED:
+        # A row with no visible key keeps a finite maximum, so exp2 of its
+        # masked scores is 0 rather than NaN.
+        row_max = gl.where(row_max == -float("inf"), -1.0e20, row_max)
+    # Branch-free lazy update: the maximum only moves when the tile maximum
+    # exceeds it by more than the threshold, so no separate running maximum is
+    # needed. The rescale that it may skip runs in load_k.
+    m_new = gl.where(row_max - m_run > _LAZY_RESCALE_THRESHOLD, row_max, m_run)
+    shifted = gl.fma(scores, scale, -m_new[:, None])
+    first_half, second_half = _split_columns(shifted)
+    first, second = _split_columns(first_half)
+    p_first = _keep_in_cluster(gl.exp2(first))
+    second = _keep_in_cluster(second)
+    second_half = _keep_in_cluster(second_half)
+    return m_new, p_first, second, second_half
+
+
+@gluon.jit
+def _softmax_sum(program, p_first, second, second_half, l_i):
+    cfg = program.cfg
+    p = _join_columns(_join_columns(p_first, gl.exp2(second)), gl.exp2(second_half))
+    l_i = l_i + gl.sum(p, axis=1)
+    # With k_width 4 the PV operand matches the score layout register for
+    # register, so this conversion emits no data movement.
+    p = gl.convert_layout(p.to(program.q_ptr.dtype.element_ty), cfg.p_layout)
+    return _keep_in_cluster(p), l_i
+
+
+@gluon.jit
+def _rescale_row(l, m_old, m_new, unchanged):
+    # alpha stays 1 for a wave whose maxima did not move. One value per lane,
+    # so LLVM may turn this branch into a select.
+    alpha = gl.cast(1.0, gl.float32)
+    if unchanged == 0:
+        alpha = gl.exp2(m_old - m_new)
+        l = l * alpha
+    return l, alpha
+
+
+@gluon.jit
+def _rescale_accumulator_pack(*args):
+    # map_elementwise with pack=64 passes a lane's 64 elements of each operand
+    # in order: args[0:64] accumulator, args[64:128] alpha and args[128:192]
+    # the vote, the last two broadcast along the row. In the transposed 32x32
+    # MFMA layout all 64 accumulator values of a lane belong to one row, so a
+    # single branch covers them. The plain multiplies become v_pk_mul_f32,
+    # the cheapest form here, where no MFMA shares the cluster.
+    values = args[:64]
+    if args[128] == 0:
+        updated = ()
+        for i in gl.static_range(64):
+            updated += (values[i] * args[64],)
+        values = updated
+    return values
+
+
+@gluon.jit
+def _rescale(acc, l_i, m_old, m_new):
+    # Apply the deferred correction. A wave skips it when none of its 32 rows
+    # moved its maximum, which is the common case after the first tiles.
+    unchanged = _wave_maxima_unchanged(m_old, m_new)
+    l_i, alpha = gl.map_elementwise(_rescale_row, l_i, m_old, m_new, unchanged)
+    (acc,) = gl.map_elementwise(
+        _rescale_accumulator_pack,
+        acc,
+        alpha[:, None],
+        unchanged[:, None],
+        pack=64,
+    )
+    return acc, l_i
+
+
+@gluon.jit
+def _pipelined_tiles(
+    program,
+    copies,
+    k_smem,
+    k_pe_smem,
+    v_smem,
+    q,
+    q_pe,
+    k,
+    k_pe,
+    p_first,
+    second,
+    second_half,
+    m_i,
+    l_i,
+    acc,
+    bound,
+    start,
+    end,
+    MASKED: gl.constexpr,
+):
+    # Finish output tiles [start, end). On entry, the softmax pieces and `m_i`
+    # hold tile `start`'s softmax input and `k`/`k_pe` hold K(start + 1); the
+    # DMA ring holds K up to start + 3 and V up to start + 2. MASKED selects the
+    # score mask for the tile whose row maximum each iteration computes.
+    cfg = program.cfg
+    # Copy clusters run at a higher s_setprio priority, so when both waves on
+    # a SIMD have work ready, the copy wave's loads issue first.
+    for j in range(start, end):
+        with gl.amd.warp_pipeline_stage("qk_sum", priority=0):
+            scores = program.compute_qk(q, k, q_pe, k_pe)
+            p, l_i = _softmax_sum(program, p_first, second, second_half, l_i)
+        # A wave waits only for its own copies, and the other wave on the SIMD
+        # runs one cluster behind. Keeping three groups in flight completes
+        # each tile a full cluster before its first read, so both waves' shares
+        # have landed whichever wave reads it.
+        async_copy.wait_group(3)
+        with gl.amd.warp_pipeline_stage("load_v", priority=1):
+            v = program.shared_load_v(v_smem.index(j % KV_RING))
+            copies.issue_k(program, k_smem, k_pe_smem, j + 4)
+        with gl.amd.warp_pipeline_stage("pv_max", priority=0):
+            acc = program.compute_pv(p, v, acc)
+            m_old = m_i
+            m_i, p_first, second, second_half = _softmax_max(
+                program, scores, m_i, (j + 1) * cfg.BLOCK_N, bound, MASKED
+            )
+        async_copy.wait_group(3)
+        with gl.amd.warp_pipeline_stage("load_k", priority=1):
+            k, k_pe = _read_k_tile(program, k_smem, k_pe_smem, j + 2)
+            copies.issue_v(program, v_smem, j + 3)
+            # Control flow stays out of the MFMA clusters: a branch there is
+            # scheduled ahead of the first MFMA and stalls the matrix core.
+            acc, l_i = _rescale(acc, l_i, m_old, m_i)
+    return k, k_pe, p_first, second, second_half, m_i, l_i, acc
+
+
 @gluon.jit
 def process_query_block(
     program: AttentionProgram,
@@ -870,87 +1123,102 @@ def process_query_block(
     q_pe = program.load_q_pe()
     m_i, l_i, acc = program.init_state()
 
-    # causal_row[i] = highest key index visible to query row (q_start + i).
-    causal_row = (program.q_causal_start + program.q_start) + gl.arange(
+    # bound[i] = highest key index visible to query row (q_start + i).
+    rows = (program.q_causal_start + program.q_start) + gl.arange(
         0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout)
     )
-
     if cfg.IS_CAUSAL:
-        # Fully-visible key tiles for every row of this block, then the diagonal
-        # band (and tail) as masked tiles.
-        main_end = (program.q_causal_start + program.q_start) // cfg.BLOCK_N
-        main_end = gl.minimum(main_end, program.kv_len // cfg.BLOCK_N)
-        visible = program.q_causal_start + program.q_start + cfg.BLOCK_M
-        visible = gl.minimum(visible, program.kv_len)
-        rem_end = (visible + cfg.BLOCK_N - 1) // cfg.BLOCK_N
-    else:
-        main_end = program.kv_len // cfg.BLOCK_N
-        rem_end = (program.kv_len + cfg.BLOCK_N - 1) // cfg.BLOCK_N
-
-    # Main (fully-visible) tiles: software-pipelined with double-buffered shared
-    # memory. Each iteration waits on the current tile, prefetches the next tile
-    # (into the other buffer), then computes the current tile so the next tile's
-    # global loads overlap the MFMA/softmax work.
-    if main_end > 0:
-        issue_tile_loads(
-            program, k_smem.index(0), k_pe_smem.index(0), v_smem.index(0), 0, False
+        # Combine the causal and KV-length bounds once per row. Tiles before
+        # main_end are fully visible to every row of this block.
+        bound = gl.minimum(rows, program.kv_len - 1)
+        main_end = gl.minimum(
+            (program.q_causal_start + program.q_start) // cfg.BLOCK_N,
+            program.kv_len // cfg.BLOCK_N,
         )
-    for i in range(0, main_end):
-        buf = i % 2
-        async_copy.wait_group(0)
-        if i + 1 < main_end:
-            nxt = (i + 1) % 2
-            issue_tile_loads(
-                program,
-                k_smem.index(nxt),
-                k_pe_smem.index(nxt),
-                v_smem.index(nxt),
-                (i + 1) * cfg.BLOCK_N,
-                False,
-            )
-        m_i, l_i, acc = compute_tile(
+        visible = gl.minimum(
+            program.q_causal_start + program.q_start + cfg.BLOCK_M, program.kv_len
+        )
+        count = gl.cdiv(visible, cfg.BLOCK_N)
+    else:
+        # Broadcast the scalar bound into the row layout.
+        bound = rows - rows + (program.kv_len - 1)
+        main_end = program.kv_len // cfg.BLOCK_N
+        count = gl.cdiv(program.kv_len, cfg.BLOCK_N)
+
+    if count > 0:
+        copies = TileCopies.create(program)
+        # Fill the rings in the loop's steady-state commit order: iteration j
+        # commits K(j + 4) and then V(j + 3).
+        copies.issue_k(program, k_smem, k_pe_smem, 0)
+        copies.issue_k(program, k_smem, k_pe_smem, 1)
+        copies.issue_v(program, v_smem, 0)
+        copies.issue_k(program, k_smem, k_pe_smem, 2)
+        copies.issue_v(program, v_smem, 1)
+        copies.issue_k(program, k_smem, k_pe_smem, 3)
+        copies.issue_v(program, v_smem, 2)
+        # Seven groups are in flight; waiting down to six retires K(0). The
+        # compiler's barrier after each wait makes every wave's share of the
+        # tile visible before it is read.
+        async_copy.wait_group(6)
+        k, k_pe = _read_k_tile(program, k_smem, k_pe_smem, 0)
+        scores = program.compute_qk(q, k, q_pe, k_pe)
+        # acc and l_i are still zero, so tile 0 needs no rescale.
+        m_i, p_first, second, second_half = _softmax_max(
+            program, scores, m_i, 0, bound, True
+        )
+        # Down to four retires K(1) for the first iteration and V(0) for its
+        # load_v cluster.
+        async_copy.wait_group(4)
+        k, k_pe = _read_k_tile(program, k_smem, k_pe_smem, 1)
+
+        # Iteration j masks tile j + 1, so unmasked iterations stop one tile
+        # before main_end.
+        split = gl.maximum(main_end - 1, 0)
+        k, k_pe, p_first, second, second_half, m_i, l_i, acc = _pipelined_tiles(
             program,
-            k_smem.index(buf),
-            k_pe_smem.index(buf),
-            v_smem.index(buf),
+            copies,
+            k_smem,
+            k_pe_smem,
+            v_smem,
             q,
             q_pe,
-            i * cfg.BLOCK_N,
-            causal_row,
+            k,
+            k_pe,
+            p_first,
+            second,
+            second_half,
             m_i,
             l_i,
             acc,
+            bound,
+            0,
+            split,
             False,
         )
-
-    # Remainder (diagonal band + tail) tiles are masked; only a few, so run them
-    # unpipelined in buffer 0.
-    kv_start = main_end * cfg.BLOCK_N
-    for _ in range(main_end, rem_end):
-        issue_tile_loads(
+        k, k_pe, p_first, second, second_half, m_i, l_i, acc = _pipelined_tiles(
             program,
-            k_smem.index(0),
-            k_pe_smem.index(0),
-            v_smem.index(0),
-            kv_start,
-            True,
-        )
-        async_copy.wait_group(0)
-        m_i, l_i, acc = compute_tile(
-            program,
-            k_smem.index(0),
-            k_pe_smem.index(0),
-            v_smem.index(0),
+            copies,
+            k_smem,
+            k_pe_smem,
+            v_smem,
             q,
             q_pe,
-            kv_start,
-            causal_row,
+            k,
+            k_pe,
+            p_first,
+            second,
+            second_half,
             m_i,
             l_i,
             acc,
+            bound,
+            split,
+            count,
             True,
         )
-        kv_start = kv_start + cfg.BLOCK_N
+        # Retire the zero-fill DMAs issued past the last tile before the next
+        # query block reuses the rings.
+        async_copy.wait_group(0)
 
     finish_query_block(program, m_i, l_i, acc)
 
@@ -1238,15 +1506,20 @@ def gluon_mla_prefill_gfx950(
         InputStrides(O_STRIDE_T, O_STRIDE_H, 1),
         InputStrides(LSE_STRIDE_T, LSE_STRIDE_H, 1),
     )
+    k_slots: gl.constexpr = 2 if cfg.IS_FP8 else KV_RING
     k_smem = gl.allocate_shared_memory(
-        k_ptr.dtype.element_ty, [2, cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
+        k_ptr.dtype.element_ty,
+        [k_slots, cfg.BLOCK_N, cfg.HEAD_DIM],
+        cfg.k_smem_layout,
     )
     k_pe_smem = gl.allocate_shared_memory(
-        k_ptr.dtype.element_ty, [2, cfg.BLOCK_N, cfg.ROPE_DIM], cfg.k_pe_smem_layout
+        k_ptr.dtype.element_ty,
+        [k_slots, cfg.BLOCK_N, cfg.ROPE_DIM],
+        cfg.k_pe_smem_layout,
     )
     v_smem = gl.allocate_shared_memory(
         v_ptr.dtype.element_ty,
-        [4 if cfg.IS_FP8 else 2, cfg.BLOCK_N, cfg.HEAD_DIM],
+        [4 if cfg.IS_FP8 else KV_RING, cfg.BLOCK_N, cfg.HEAD_DIM],
         cfg.v_smem_layout,
     )
 
@@ -1293,9 +1566,10 @@ def get_config(*, q: torch.Tensor, k: torch.Tensor) -> LaunchConfig:
     head_dim = 128
     rope_dim = 64
     is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-    block_m = 256 if is_fp8 else 128
-    block_n = 64
-    num_warps = 8 if is_fp8 else 4
+    block_m = 256
+    # 16-bit tiles stay at 32 keys so a wave's operands fit in 256 VGPRs.
+    block_n = 64 if is_fp8 else 32
+    num_warps = 8
     return LaunchConfig(
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,
@@ -1420,8 +1694,8 @@ def launch_gluon_mla_prefill_gfx950(
         IS_FP8=is_fp8,
         num_warps=config.num_warps,
         num_stages=1,
-        # Keep the overlapping FP8 matrix and softmax state in one register class.
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),) if is_fp8 else (),
+        # Keep the overlapping matrix and softmax state in one register class.
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
 
     if return_lse:
