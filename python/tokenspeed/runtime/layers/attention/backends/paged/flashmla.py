@@ -55,10 +55,7 @@ from tokenspeed.runtime.layers.attention.dcp.metadata import (
     CompactDCPMetadata,
     refresh_dcp_page_table_metadata,
 )
-from tokenspeed.runtime.layers.attention.dcp.placement import (
-    CachePlacement,
-    resolve_cache_slots,
-)
+from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     FLASH_MLA_PAGE_SIZE as PAGE_SIZE,
 )

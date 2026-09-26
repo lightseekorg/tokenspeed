@@ -44,7 +44,6 @@ from tokenspeed.runtime.layers.attention.chunk import (
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
-from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     TRTLLM_MLA_DEFAULT_PAGE_SIZE,
     TRTLLM_MLA_SUPPORTED_PAGE_SIZES,
