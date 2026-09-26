@@ -300,14 +300,14 @@ __global__ void gate_forward_kernel(
 
   float weight_sum = cg::reduce(warp, my_topk_value, cg::plus<float>{});
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  asm volatile("griddepcontrol.launch_dependents;");
-#endif
   if (lane_id < topK) {
     out_weights[global_warp_id * topK + lane_id] =
         (my_topk_value / weight_sum) * route_scale;
     out_indices[global_warp_id * topK + lane_id] = my_topk_index;
   }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
 }  // namespace dsv4_routing
