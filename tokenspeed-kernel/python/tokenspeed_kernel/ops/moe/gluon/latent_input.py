@@ -164,7 +164,7 @@ if current_platform().is_amd:
         signatures=_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
-            "tokens": frozenset(range(321, 641)),
+            "tokens": frozenset(range(321, 1281)),
             "hidden_size": frozenset({7168}),
             "num_experts": frozenset({896}),
             "latent_size": frozenset({3584}),

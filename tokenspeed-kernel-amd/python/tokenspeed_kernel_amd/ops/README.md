@@ -288,8 +288,9 @@ and batch size to limit shared-memory usage.
 
 The Kimi K3 prefill path projects one packed BF16 input weight into router,
 routed-latent, and shared-expert inputs. Automatic selection uses the small-batch
-Gluon kernel through 320 tokens, a medium-M Gluon tile for 321--640, the packed
-Triton kernel for 641--1280, and the large-M Gluon tile from 1281 tokens.
+Gluon kernel through 320 tokens, a mid-range Gluon tile for 321--1280, and the
+large-M Gluon tile from 1281 tokens. The portable packed Triton kernel remains
+available for other shapes and devices.
 
 #### Contract
 
@@ -302,23 +303,32 @@ Triton kernel for 641--1280, and the large-M Gluon tile from 1281 tokens.
 
 #### Algorithm
 
-The medium path uses a `128 x 128 x 64` BF16 MFMA tile with eight waves,
+The mid-range path uses `128 x 128 x 64` tiles through 640 tokens and
+`256 x 128 x 64` tiles from 641 to 1280 tokens, both with eight waves,
 vectorized global-to-LDS copies, padded shared layouts, and a three-buffer K
 pipeline. Two K-tile copies stay in flight while a two-stage warp pipeline
-alternates each 16-MFMA block with the next tile's LDS reads and copy issue, so
-the MFMAs issue back to back instead of waiting on individual LDS reads. Its 47
+alternates each MFMA block with the next tile's LDS reads and copy issue, so
+the MFMAs issue back to back instead of waiting on individual LDS reads. The
+refill left over after whole three-tile rounds runs as one more pipelined step,
+so no copy is issued after the drain. The 128-row tile arranges its waves 2 x 4;
+the 256-row tile uses 4 x 2 so each wave reads a 64 x 64 operand pair from LDS,
+20% fewer bytes than 128 x 32. Program ids are remapped so each of the eight
+XCDs gets a contiguous run of column tiles with all their row tiles, and each
+weight tile is fetched into one XCD's L2 rather than one per row tile. Its 47
 column tiles preserve the packed router/routed/shared boundary, so the FP32
 router and BF16 latent/shared values use different stores in the same projection
 launch. BF16 results are regrouped to eight columns per lane so every store is a
 dwordx4. Each of the 12 shared-expert column tiles gathers 64 gate rows and the
 matching 64 up rows of the packed weight; the MFMA layout places gate column `c`
-and up column `c + 64` in the same lane, so the epilogue applies SiTU in
-registers and stores the 768-wide shared input directly, with no gate/up
-intermediate or separate SiTU launch. A row tile past the end of the activation
-clamps its loads onto the last valid row and masks its stores. At 321--640
-tokens the grid has 141--235 workgroups, avoiding the partially filled second
-wave that slows this tile above 640 tokens. Because the grid never needs a
-second workgroup on any CU, the third LDS buffer costs no occupancy.
+and up column `c + 64` in the same lane, so both tiles apply SiTU in registers
+and store the 768-wide shared input directly, with no gate/up intermediate or
+separate SiTU launch. A row tile past the end of the activation clamps its
+loads onto the last valid row and masks its stores. At 321--640 tokens the grid
+has 141--235 workgroups; above 640, the taller tile avoids an almost-empty final
+128-row workgroup wave and launches 141--235 workgroups. Both tiles use three
+LDS buffers to keep two K-tile copies in flight; the 256-row tile's 152 KB
+limits a CU to one workgroup, which the grid never exceeds, so its 188--236
+fused-epilogue VGPRs cost no occupancy.
 
 The large path uses an eight-wave `256 x 256 x 64` double-buffered MFMA/LDS
 warp pipeline. Each 128-column accumulator half is routed independently because

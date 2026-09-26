@@ -70,8 +70,8 @@ def test_split_k_does_not_drop_k_tiles() -> None:
         (320, "gluon_latent_input_small_batch_gfx950"),
         (321, "gluon_latent_input_mediumm_gfx950"),
         (640, "gluon_latent_input_mediumm_gfx950"),
-        (641, None),
-        (1280, None),
+        (641, "gluon_latent_input_mediumm_gfx950"),
+        (1280, "gluon_latent_input_mediumm_gfx950"),
         (1281, "gluon_latent_input_largem_gfx950"),
         (2048, "gluon_latent_input_largem_gfx950"),
         (4095, "gluon_latent_input_largem_gfx950"),
@@ -105,7 +105,7 @@ def test_k3_prefill_dispatch(tokens: int, expected: str | None) -> None:
 
 
 @requires_cdna4
-@pytest.mark.parametrize("tokens", [321, 512, 639])
+@pytest.mark.parametrize("tokens", [321, 512, 639, 641, 1024, 1280])
 @pytest.mark.parametrize("linear_beta", [None, 25.0])
 def test_medium_routes_packed_projection_and_applies_situ(
     tokens: int,

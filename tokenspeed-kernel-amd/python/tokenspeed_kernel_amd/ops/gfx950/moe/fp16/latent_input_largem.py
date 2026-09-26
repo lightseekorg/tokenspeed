@@ -280,7 +280,7 @@ def gluon_latent_input_largem_gfx950(
 
 
 @gluon.jit(launch_metadata=_situ_launch_metadata)
-def gluon_latent_input_largem_situ_gfx950(
+def gluon_latent_input_situ_gfx950(
     shared_raw_ptr,
     shared_ptr,
     beta,
@@ -295,7 +295,7 @@ def gluon_latent_input_largem_situ_gfx950(
     BLOCK_N: gl.constexpr,
     HAS_LINEAR_BETA: gl.constexpr,
 ):
-    """Apply SiTU to one tile of the materialized BF16 gate/up projection.
+    """Apply SiTU to a materialized BF16 gate/up tile from either projection.
 
     The tile is two dimensional so the column extent can divide the 768-wide
     shared width while each lane still holds 8 contiguous BF16 columns, which
@@ -328,6 +328,44 @@ def gluon_latent_input_largem_situ_gfx950(
         offsets=rows[:, None] * stride_shared_m + cols[None, :],
         stored_value=(gate * up).to(shared_ptr.dtype.element_ty),
         mask=mask,
+    )
+
+
+def launch_gluon_latent_input_situ_gfx950(
+    shared_raw: torch.Tensor,
+    shared_out: torch.Tensor,
+    *,
+    beta: float,
+    linear_beta: float | None,
+) -> None:
+    """Apply SiTU to BF16 gate/up projections from either K3 prefill tile.
+
+    Args:
+        shared_raw: BF16 gate/up projection shaped ``[M, 1536]``.
+        shared_out: BF16 output shaped ``[M, 768]``.
+        beta: Positive gate clamp.
+        linear_beta: Optional positive up clamp.
+
+    Returns:
+        None. The shared input is written to ``shared_out``.
+    """
+    tokens = shared_raw.shape[0]
+    situ_grid = (triton.cdiv(tokens, _SITU_BLOCK_M), _K3_SHARED // _SITU_BLOCK_N)
+    gluon_latent_input_situ_gfx950[situ_grid](
+        shared_raw,
+        shared_out,
+        float(beta),
+        1.0 / float(beta),
+        1.0 if linear_beta is None else float(linear_beta),
+        1.0 if linear_beta is None else 1.0 / float(linear_beta),
+        tokens,
+        shared_raw.stride(0),
+        shared_out.stride(0),
+        SHARED_N=_K3_SHARED,
+        BLOCK_M=_SITU_BLOCK_M,
+        BLOCK_N=_SITU_BLOCK_N,
+        HAS_LINEAR_BETA=linear_beta is not None,
+        num_warps=_SITU_NUM_WARPS,
     )
 
 
@@ -452,24 +490,16 @@ def launch_gluon_latent_input_largem_gfx950(
         num_warps=_NUM_WARPS,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
-    situ_grid = (triton.cdiv(tokens, _SITU_BLOCK_M), _K3_SHARED // _SITU_BLOCK_N)
-    gluon_latent_input_largem_situ_gfx950[situ_grid](
+    launch_gluon_latent_input_situ_gfx950(
         shared_raw,
         shared_out,
-        float(beta),
-        1.0 / float(beta),
-        1.0 if linear_beta is None else float(linear_beta),
-        1.0 if linear_beta is None else 1.0 / float(linear_beta),
-        tokens,
-        shared_raw.stride(0),
-        shared_out.stride(0),
-        SHARED_N=_K3_SHARED,
-        BLOCK_M=_SITU_BLOCK_M,
-        BLOCK_N=_SITU_BLOCK_N,
-        HAS_LINEAR_BETA=linear_beta is not None,
-        num_warps=_SITU_NUM_WARPS,
+        beta=beta,
+        linear_beta=linear_beta,
     )
     return router_out, routed_out, shared_out
 
 
-__all__ = ["launch_gluon_latent_input_largem_gfx950"]
+__all__ = [
+    "launch_gluon_latent_input_largem_gfx950",
+    "launch_gluon_latent_input_situ_gfx950",
+]
