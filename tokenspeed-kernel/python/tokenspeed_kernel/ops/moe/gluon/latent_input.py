@@ -48,6 +48,9 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx1250.moe.fp16.latent_input_decode import (
         launch_gluon_latent_input_decode_gfx1250 as _decode_gfx1250_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx1250.moe.fp16.latent_input_largem import (
+        launch_gluon_latent_input_largem_gfx1250 as _largem_gfx1250_impl,
+    )
 
     _SIGNATURES = frozenset(
         {
@@ -79,20 +82,63 @@ if current_platform().is_amd:
         signatures=_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
-            "tokens": frozenset({1}),
+            "weights_packed": frozenset({True}),
             "hidden_size": frozenset({7168}),
             "num_experts": frozenset({896}),
             "latent_size": frozenset({3584}),
             "shared_size": frozenset({768}),
             "inputs_contiguous": frozenset({True}),
+            "tokens": frozenset(range(1, 33)),
         },
     )
     def gluon_latent_input_decode_gfx1250(**kwargs):
-        return _decode_gfx1250_impl(
-            kwargs["hidden_states"],
+        weights = (
             kwargs["router_weight"],
             kwargs["routed_weight"],
             kwargs["shared_gate_up_weight"],
+        )
+        packed_weight = packed_projection_weight_view(*weights)
+        if packed_weight is None:
+            raise ValueError("Kimi K3 projection weights must be packed")
+        return _decode_gfx1250_impl(
+            kwargs["hidden_states"],
+            *weights,
+            packed_weight,
+            beta=kwargs["gate_clamp"],
+            linear_beta=kwargs["up_clamp"],
+        )
+
+    @register_kernel(
+        "moe",
+        "latent_input",
+        name="gluon_latent_input_largem_gfx1250",
+        solution="gluon",
+        capability=_GFX1250,
+        signatures=_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={
+            "tokens_min": frozenset({1536}),
+            "hidden_size": frozenset({7168}),
+            "num_experts": frozenset({896}),
+            "latent_size": frozenset({3584}),
+            "shared_size": frozenset({768}),
+            "inputs_contiguous": frozenset({True}),
+            "weights_packed": frozenset({True}),
+        },
+    )
+    def gluon_latent_input_largem_gfx1250(**kwargs):
+        weights = (
+            kwargs["router_weight"],
+            kwargs["routed_weight"],
+            kwargs["shared_gate_up_weight"],
+        )
+        packed_weight = packed_projection_weight_view(*weights)
+        if packed_weight is None:
+            raise ValueError("Kimi K3 projection weights must be packed")
+        return _largem_gfx1250_impl(
+            kwargs["hidden_states"],
+            *weights,
+            packed_weight,
             beta=kwargs["gate_clamp"],
             linear_beta=kwargs["up_clamp"],
         )

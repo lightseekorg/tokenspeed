@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable as _Iterable
 
+import tokenspeed_kernel
 import torch
 import torch.nn as nn
 import torch.nn.functional as _F
@@ -186,6 +187,15 @@ class _RuntimeLongcatRouter(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor):
+        if global_server_args_dict["numerics"] == "rl-bitwise":
+            # The classifier's logits feed expert selection, so they must be
+            # batch-invariant or top-k flips at near-ties. cuBLAS and the
+            # dsv3 router kernel tile by shape; the aok leaf does not.
+            return tokenspeed_kernel.mm(
+                hidden_states.float(),
+                self.classifier.weight.float(),
+                override="aok",
+            )
         if _longcat_is_hopper_plus and hidden_states.shape[0] > 0:
             return _dsv3_router_gemm(
                 hidden_states,

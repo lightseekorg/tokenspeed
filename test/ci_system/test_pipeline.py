@@ -168,6 +168,15 @@ def test_amd_gpu_runner_reclaims_stale_vram(capsys, tmp_path):
     assert "cleanup_amd_gpu_state.sh" in capsys.readouterr().out
 
 
+def test_ci_setup_only_refreshes_apt_when_ninja_is_missing(capsys, tmp_path):
+    setup_runner("amd-mi35x-4gpu-test", {}, tmp_path, dry_run=True)
+
+    output = capsys.readouterr().out
+    assert "if ! command -v ninja >/dev/null 2>&1; then" in output
+    assert output.count("sudo apt-get -o Acquire::Retries=5 update -q") == 1
+    assert "&& sudo apt-get install -y ninja-build; fi" in output
+
+
 @pytest.mark.parametrize(
     ("declared", "effective"),
     [

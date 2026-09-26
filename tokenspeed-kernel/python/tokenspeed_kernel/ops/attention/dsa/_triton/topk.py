@@ -31,6 +31,77 @@ _RADIX_TOPK_BLOCK_N = 4096
 
 
 @triton.jit
+def _mark_forced_initial_local_logits_kernel(
+    logits_ptr,
+    logits_row_stride,
+    causal_lens_ptr,
+    num_cols: tl.constexpr,
+    initial_tokens: tl.constexpr,
+    local_tokens: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    block = tl.program_id(1)
+    cols = block * BLOCK + tl.arange(0, BLOCK)
+    causal_len = tl.load(causal_lens_ptr + row).to(tl.int32)
+    initial_end = tl.minimum(causal_len, initial_tokens)
+    local_start = tl.maximum(initial_end, causal_len - local_tokens)
+    forced = (cols < initial_end) | ((cols >= local_start) & (cols < causal_len))
+    tl.store(
+        logits_ptr + row * logits_row_stride + cols,
+        float("inf"),
+        mask=(cols < num_cols) & forced,
+    )
+
+
+def mark_forced_initial_local_logits(
+    logits: torch.Tensor,
+    causal_lens: torch.Tensor,
+    *,
+    initial_tokens: int,
+    local_tokens: int,
+) -> None:
+    """Force sequence-start and causal-tail candidates into the top-k.
+
+    LongCat's DSA selection always keeps the first ``initial_tokens`` and the
+    last ``local_tokens`` visible positions; marking their logits +inf makes
+    any top-k over the marked logits include them.
+
+    Args:
+        logits: ``[rows, candidates]`` scores, unit column stride; mutated.
+        causal_lens: ``[rows]`` visible candidate count per row.
+        initial_tokens: Sequence-start candidates to force.
+        local_tokens: Causal-tail candidates to force.
+    """
+    if logits.dim() != 2 or logits.stride(1) != 1:
+        raise ValueError("logits must be a 2-D tensor with unit column stride")
+    if causal_lens.shape != (logits.shape[0],):
+        raise ValueError(
+            f"causal_lens must have shape ({logits.shape[0]},), got "
+            f"{tuple(causal_lens.shape)}"
+        )
+    if initial_tokens < 0 or local_tokens < 0:
+        raise ValueError("initial_tokens and local_tokens must be non-negative")
+    if logits.numel() == 0 or initial_tokens + local_tokens == 0:
+        return
+    causal_lens = causal_lens.to(device=logits.device, dtype=torch.int32).contiguous()
+    block = 256
+    _mark_forced_initial_local_logits_kernel[
+        (logits.shape[0], triton.cdiv(logits.shape[1], block))
+    ](
+        logits,
+        logits.stride(0),
+        causal_lens,
+        num_cols=logits.shape[1],
+        initial_tokens=int(initial_tokens),
+        local_tokens=int(local_tokens),
+        BLOCK=block,
+        num_warps=4,
+        num_stages=1,
+    )
+
+
+@triton.jit
 def _local_topk_to_global_slots_kernel(
     global_topk_slots_ptr,
     global_topk_slots_stride,
@@ -354,7 +425,15 @@ def combine_topk_weights(
         raise ValueError("combine_topk_weights expects unit-stride weights rows")
     if q_scale.dtype != torch.float32:
         raise TypeError(f"q_scale must be fp32, got {q_scale.dtype}")
-    q_scale = q_scale.reshape(tokens * heads)
+    # The quantizer may pad the per-row scale vector (an alignment multiple of
+    # its launch width); real rows lead, padding trails. 16-head indexers hit
+    # this on every odd token count.
+    q_scale = q_scale.reshape(-1)
+    if q_scale.numel() < tokens * heads:
+        raise ValueError(
+            f"q_scale has {q_scale.numel()} entries for {tokens * heads} rows"
+        )
+    q_scale = q_scale[: tokens * heads]
     out = torch.empty(tokens, heads, dtype=torch.float32, device=weights.device)
     numel = tokens * heads
     if numel == 0:
@@ -1301,5 +1380,6 @@ __all__ = [
     "dsa_prefill_topk_fp8",
     "triton_topk_from_logits",
     "local_topk_to_global_slots",
+    "mark_forced_initial_local_logits",
     "workspace_topk_to_global_slots",
 ]

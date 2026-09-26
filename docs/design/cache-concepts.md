@@ -859,7 +859,12 @@ Its responsibilities:
   resident is the coordinator's answer (`DeviceBoundaryResidency`, read off
   the group indexes), so the scheduler keeps no residency counters of its own
   — only the token descriptor the event carries and whether that event is
-  currently out.
+  currently out. A mutation only marks its boundary for reconcile;
+  `DrainKvEvents` reconciles each marked boundary against its residency and
+  reports the net change (published exactly while fully resident), then drops
+  descriptors of boundaries with no cached child. Nothing is decided
+  mid-`Admit`, so one admission may evict a boundary's last cached copy and
+  then store the request's own copy without any ordering hazard.
 For L3 write-through, each lane carries only its own hashed Host destinations.
 Its CUDA completion starts those backups, and its scheduler ACK waits until
 those puts finish; a different lane completing cannot release its pages.
@@ -959,8 +964,11 @@ place the four stages appear in order, and a family fills in uniformly named
 seams — `layer_types`, `group_ids`, `fields_for_layer`, `prefix_granularity`,
 `alignment`, `max_padding_fraction`, `packing`, `check_layout`,
 `num_lcm_blocks`, `token_capacity`, `parents_needed`, `workspace_bytes`,
-`pool_options`. `groups()` itself is a seam for the two families whose groups
-are not per-layer (Inkling appends conv columns; V4 declares each group
+`pool_options`, `verify_scratch_in_pool`.
+The last answers whether speculative verify stages its scratch in the bound
+pool; a CUDA-graph memory probe arena then keeps the serving concurrency.
+`groups()` itself is a seam for the two families whose groups are not
+per-layer (Inkling appends conv columns; V4 declares each group
 whole). No family restates the order of the stages, and `_RECIPES`
 (`recipes/setup.py`) is the single family → recipe map.
 
@@ -1062,9 +1070,13 @@ window the first decode consumes. Under PD the retained tail of the SWA group
 ships to the decode node like any sliding window, draft rows included, and
 the decode node re-feeds nothing.
 
-Capacity has exactly two shapes, both on the base class. The default is the
-flat product (`parents × tightest packing × P`). Families whose per-group
-demand decides the pool — K3's state groups riding inside MLA planes, V4's
+Capacity has three shapes, all on the base class. The default is the flat
+product (`parents × tightest packing × P`). A probe arena is the third and
+narrowest: `probe_batch_rows` says how many requests the CUDA-graph probe
+fabricates, and the pool takes one parent block per fabricated row, floored at
+what a single request needs — it binds before the memory profile has run, so
+it cannot size from a budget at all. Families whose per-group demand decides
+the pool — K3's state groups riding inside MLA planes, V4's
 SWA and compressed chains, GLM-5.3-Flash — size from `parents_needed` and get
 the inverse for free from `_capacity_from_parents`, one monotonic binary
 search shared by all. `parents_needed` itself is not a Python formula: it
@@ -1079,7 +1091,11 @@ C++, and the `Scheduler` bounds single requests against the pool with the
 same model (`docs/design/scheduler.md` §1.4). No recipe restates any of it.
 `scheduler_limits` is the single place a recipe reads the scheduler's
 concurrency, role and reserve widths, so demand and capacity cannot size
-against different numbers.
+against different numbers. Under a probe it reports the probe's fabricated
+batch instead: that arena holds a capture, not requests. `probe_batch_rows`
+sets both sides: the arena holds at least that many parent blocks (more when
+admitting one token per group needs more), and the concurrency is that many
+rows, capped at the scheduler's `max_bs`.
 
 The runtime's global `max_num_seqs` is divided across attention DP ranks to
 produce each scheduler's rank-local `max_batch_size`. These values limit
