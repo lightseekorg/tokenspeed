@@ -448,6 +448,7 @@ class DeviceHandle:
                 multimodal_context=planned.multimodal_context,
                 capture_next_input_ids=capture_next_input_ids,
                 ngram_inputs=planned.ngram_inputs,
+                request_history_seeds=planned.request_history_seeds,
             )
 
         return PendingExecution(self._thread.submit(_forward))

@@ -309,7 +309,13 @@ class ServerArgs:
     disable_overlap_schedule: bool = False
     disable_tf32: bool = False
     force_deterministic_rsag: bool = False
+    batch_invariant_collectives: bool = False
     disable_sampling_tp_sync: bool = False
+    # Numerics envelope: "auto" keeps every performance default; "rl-bitwise"
+    # asks for bitwise run-to-run and batch-composition invariance and folds
+    # the determinism switches below (resolve_numerics). Each folded switch
+    # can still be set individually; the umbrella only ever tightens.
+    numerics: str = "auto"
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
@@ -381,6 +387,7 @@ class ServerArgs:
         self.resolve_cache()
         self.resolve_speculative_decoding()
         self.resolve_communication()
+        self.resolve_numerics()
         self.resolve_disaggregation()
         self.validate()
 
@@ -781,6 +788,42 @@ class ServerArgs:
                 f"{self.mapping.attn.tp_size!s} and dense_tp_size: "
                 f"{self.mapping.dense.tp_size!s}!",
             )
+
+    def resolve_numerics(self):
+        """Fold the ``--numerics`` envelope into the individual switches.
+
+        ``rl-bitwise`` is the RL rollout contract: within one deployment the
+        same request produces bitwise-identical tokens and logprobs across
+        runs and regardless of batch composition. The umbrella only ever
+        tightens settings — a switch a user already set stays set — and each
+        derived switch remains individually available for auto mode.
+        Runs after ``resolve_communication`` so it can veto the fused
+        all-reduce that resolver auto-enables.
+        """
+        if self.numerics == "auto":
+            return
+        if self.numerics != "rl-bitwise":
+            raise ValueError(
+                f"--numerics must be auto or rl-bitwise, got {self.numerics!r}"
+            )
+        # Collectives: rank-ordered NCCL instead of the symmetric-memory and
+        # trtllm fused paths, and the all-reduce becomes an all-gather with a
+        # fixed-rank-order fp32 fold: NCCL's ring chunks by message size, so
+        # a plain NCCL sum is run-stable but not batch-size-invariant.
+        self.force_deterministic_rsag = True
+        self.batch_invariant_collectives = True
+        self.enable_allreduce_fusion = False
+        self.comm_fusion_max_num_tokens = -1
+        # Kernels: heuristic tactics only (autotune picks shape-dependent
+        # tactics), no TF32, and no programmatic dependent launches.
+        self.disable_autotune = True
+        self.disable_tf32 = True
+        self.disable_pdl = True
+        # MoE: the batch-invariant grouped leaves. Only the auto default is
+        # folded; an explicitly chosen backend stands (and must then honour
+        # the contract itself).
+        if self.moe_backend == "auto":
+            self.moe_backend = "aok"
 
     def resolve_disaggregation(self):
         # Pipeline parallelism is a prefill-node-only capability: the chunk
@@ -1510,7 +1553,9 @@ class ServerArgs:
             type=str,
             default=ServerArgs.moe_backend,
             help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm, "
-            "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe",
+            "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe, aok "
+            "(the batch-invariant leaves; --numerics rl-bitwise folds auto to "
+            "it)",
         )
         parser.add_argument(
             "--moe-mxfp4-fp8-activation",
@@ -1586,28 +1631,20 @@ class ServerArgs:
             help="Default sampling settings as JSON for SMG's gRPC GetModelInfo response.",
         )
 
-        # Kernel backend
-        attention_backend_choices = [
-            "mha",
-            "mla",
-            "fa3",
-            "fa4",
-            "triton",
-            "gluon",
-            "flashinfer",
-            "trtllm",
-            "trtllm_mla",
-            "flashmla",
-            "tokenspeed_mla",
-            "hybrid_linear_attn",
-        ]
+        # Kernel backend. Names are validated against the backend registry
+        # after plugin discovery, so plugins can add their own.
+        attention_backend_names = (
+            "mha, mla, fa3, fa4, triton, gluon, flashinfer, trtllm, trtllm_mla, "
+            "flashmla, tokenspeed_mla, hybrid_linear_attn"
+        )
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=attention_backend_choices,
             default=ServerArgs.attention_backend,
-            help="Choose the kernels for attention layers. 'gluon' forces "
-            "registered Gluon kernels for supported attention architectures.",
+            help="Choose the kernels for attention layers: "
+            f"{attention_backend_names}, or a name a plugin registers. 'gluon' "
+            "forces registered Gluon kernels for supported attention "
+            "architectures.",
         )
         parser.add_argument(
             "--kda-backend",
@@ -1626,9 +1663,9 @@ class ServerArgs:
         parser.add_argument(
             "--drafter-attention-backend",
             type=str,
-            choices=attention_backend_choices,
-            help="Attention backend for drafter model in speculative decoding. "
-            "If not specified, uses the same backend as the main model (attention_backend).",
+            help="Attention backend for drafter model in speculative decoding "
+            f"({attention_backend_names}, or a plugin's). If not specified, uses "
+            "the same backend as the main model (attention_backend).",
         )
         parser.add_argument(
             "--skip-softmax-threshold",
@@ -1839,8 +1876,9 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE3", "MTP", "DFLASH", "DSPARK"],
-            help="Speculative algorithm.",
+            help="Speculative algorithm. In-tree: EAGLE3, MTP, DFLASH, "
+            "DSPARK; plugins may register more (validated after plugin "
+            "discovery).",
         )
         parser.add_argument(
             "--speculative-draft-model-path",
@@ -2129,6 +2167,24 @@ class ServerArgs:
             action="store_true",
             help="Use NCCL collectives instead of Triton symmetric-memory "
             "all-reduce/gather/scatter.",
+        )
+        parser.add_argument(
+            "--batch-invariant-collectives",
+            action="store_true",
+            help="Run every all-reduce as an all-gather plus a fixed-rank-order "
+            "fp32 fold. NCCL sums are run-stable but chunk by message size, so "
+            "they are not batch-size-invariant; the fold is. Costs world_size "
+            "times the all-reduce traffic. Folded in by --numerics rl-bitwise.",
+        )
+        parser.add_argument(
+            "--numerics",
+            type=str,
+            choices=["auto", "rl-bitwise"],
+            default=ServerArgs.numerics,
+            help="Numerics envelope. rl-bitwise folds the determinism "
+            "switches (deterministic collectives, no autotune/TF32/PDL, no "
+            "fused all-reduce) so outputs and logprobs are bitwise identical "
+            "across runs and batch compositions within one deployment.",
         )
         parser.add_argument(
             "--disable-sampling-tp-sync",

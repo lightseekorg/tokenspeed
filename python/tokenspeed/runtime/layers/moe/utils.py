@@ -80,6 +80,10 @@ class MoeBackend(Enum):
     DEEP_GEMM_MEGA_MOE = "deep_gemm_mega_moe"
     MEGA_MOE = "mega_moe"
 
+    # The batch-invariant fixed-reduction-order leaves (plugin-provided);
+    # --numerics rl-bitwise folds the auto default to this solution.
+    AOK = "aok"
+
     def is_auto(self):
         return self == MoeBackend.AUTO
 

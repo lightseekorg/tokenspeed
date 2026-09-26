@@ -94,6 +94,29 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     "glm5_next": Glm53FlashConfig,
 }
 
+# Config classes for checkpoints identified by architecture rather than
+# ``model_type`` (a plugin checkpoint's config.json may carry none). Filled by
+# ``tokenspeed.runtime.plugins.registry.register_config``.
+_ARCHITECTURE_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {}
+
+
+def _resolve_registered_config(
+    raw_config: dict[str, Any],
+) -> type[PretrainedConfig] | None:
+    """Return the registered config class for a raw ``config.json``, if any.
+
+    ``model_type`` wins; a config without a registered type falls back to its
+    first ``architectures`` entry.
+    """
+    model_type = raw_config.get("model_type", "llama")
+    if model_type in _CONFIG_REGISTRY:
+        return _CONFIG_REGISTRY[model_type]
+    architectures = raw_config.get("architectures") or ()
+    if architectures:
+        return _ARCHITECTURE_CONFIG_REGISTRY.get(architectures[0])
+    return None
+
+
 _GLM53_FLASH_ARCHITECTURE_ALIASES = {
     "Glm5NextForConditionalGeneration": "Glm53FlashForConditionalGeneration",
     "Glm5NextForConditionalGenerationNextN": (
@@ -343,10 +366,7 @@ def get_config(
             # exception because Transformers 5.12 resolves its relative
             # imports incorrectly from symlink-backed local snapshots. Keep
             # that remote-code load revision-pinned and inside the same lock.
-            if (
-                raw_config.get("model_type", "llama") not in _CONFIG_REGISTRY
-                and trust_remote_code
-            ):
+            if _resolve_registered_config(raw_config) is None and trust_remote_code:
                 snapshot_revision = _snapshot_commit_hash(model_path)
                 if snapshot_revision is not None:
                     # Keep the lock while Transformers copies executable code
@@ -373,8 +393,8 @@ def get_config(
         raw_config = load_raw_config(model_path)
 
     if config is None:
-        if raw_config.get("model_type", "llama") in _CONFIG_REGISTRY:
-            config_class = _CONFIG_REGISTRY[raw_config["model_type"]]
+        config_class = _resolve_registered_config(raw_config)
+        if config_class is not None:
             config = config_class.from_pretrained(model_path)
         else:
             config = AutoConfig.from_pretrained(
