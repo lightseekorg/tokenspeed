@@ -300,22 +300,50 @@ def test_releasing_drops_the_graphs_and_pools_but_keeps_the_tables(monkeypatch) 
     assert runner._placeholder_tables
 
 
+@pytest.mark.parametrize("stage", ["bucket", "encoder", "decoder"])
+@pytest.mark.parametrize("explicit_stream", [False, True])
 def test_every_capture_opens_its_observer_after_the_warmups_and_before_the_pool(
     monkeypatch,
+    stage,
+    explicit_stream,
 ) -> None:
     order = []
+    entry_stream = object()
+    active_stream = entry_stream
+
+    def wait_stream(stream):
+        assert stream is entry_stream
+        order.append("wait")
+
+    capture_stream = SimpleNamespace(wait_stream=wait_stream)
+
+    @contextlib.contextmanager
+    def on_stream(stream):
+        nonlocal active_stream
+        previous = active_stream
+        active_stream = stream
+        try:
+            yield
+        finally:
+            active_stream = previous
 
     class _Recorder:
-        def __init__(self, name, pool=None, _stream=None):
-            self.name, self.pool = name, pool or "pool"
-            if name == "capture":
-                order.append("allocate pool")
+        def __init__(self, name, pool=None, stream=None):
+            self.name, self.pool = name, pool
+            self.stream = capture_stream if stream is None else stream
+            self.stream_context = on_stream(self.stream)
 
         def __enter__(self):
             order.append(f"{self.name} enter")
+            if self.name == "capture":
+                self.stream_context.__enter__()
+                order.append("allocate pool")
+                self.pool = "pool"
             return self
 
-        def __exit__(self, *_exc):
+        def __exit__(self, *exc):
+            if self.name == "capture":
+                self.stream_context.__exit__(*exc)
             order.append(f"{self.name} exit")
 
         def replay(self):
@@ -324,27 +352,56 @@ def test_every_capture_opens_its_observer_after_the_warmups_and_before_the_pool(
     monkeypatch.setattr(
         prefill_graph,
         "BreakableCapture",
-        lambda pool, stream: _Recorder("capture", pool),
+        lambda pool, stream: _Recorder("capture", pool, stream),
     )
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_a, **_k: None)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: active_stream)
+    monkeypatch.setattr(torch.cuda, "stream", on_stream)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: order.append("synchronize"))
+
+    def forward(*_args):
+        assert active_stream is capture_stream
+        order.append("forward")
+        return torch.zeros(1), None
+
     graph = PrefillGraph.__new__(PrefillGraph)
     graph.num_warmup = 2
     graph._pool = None
-    graph._run_inner = lambda _bucket: order.append("forward") or (torch.zeros(1), None)
+    graph._ctx = object()
+    graph._run_inner = graph._run_encoder = forward
+    graph._narrowing = SimpleNamespace(decoder_forward=forward)
+    wrapper = SimpleNamespace(stream=capture_stream) if explicit_stream else None
+    observer = _Recorder("observe")
 
-    PrefillGraph._capture_bucket(graph, 8, None, _Recorder("observe"))
+    def rearm():
+        order.append("rearm")
 
+    if stage == "bucket":
+        graph._capture_bucket(8, wrapper, observer)
+    elif stage == "encoder":
+        graph._capture_encoder(8, wrapper, observer)
+    else:
+        graph._capture_decoder(object(), rearm, wrapper, observer)
+
+    before_forward = ["rearm"] if stage == "decoder" else []
     assert order == [
+        "wait",
+        *before_forward,
         "forward",
+        *before_forward,
         "forward",
-        "allocate pool",
+        "synchronize",
+        *before_forward,
         "observe enter",
         "capture enter",
+        "allocate pool",
         "forward",
         "capture exit",
         "observe exit",
+        *before_forward,
         "replay",
     ]
+    assert active_stream is entry_stream
+    assert graph._pool == "pool"
 
     # The same order at every other capture site.
     root = pathlib.Path(prefill_graph.__file__).parent

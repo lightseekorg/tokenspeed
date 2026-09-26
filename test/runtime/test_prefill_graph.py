@@ -168,6 +168,43 @@ class PrefillCaptureArgsTest(unittest.TestCase):
                 )
 
 
+class PrefillCaptureStreamTest(unittest.TestCase):
+    def test_warmup_runs_on_the_capture_stream(self):
+        import torch
+
+        from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+
+        if not torch.cuda.is_available():
+            self.skipTest("requires CUDA")
+
+        class StreamProbe(PrefillGraph):
+            def __init__(self):
+                self.num_warmup = 2
+                self._pool = None
+                self.warmed_streams: set[int] = set()
+                self.values = torch.arange(8, device="cuda", dtype=torch.float32)
+
+            def _run_inner(self, num_tokens):
+                stream = int(torch.cuda.current_stream().cuda_stream)
+                if torch.cuda.is_current_stream_capturing():
+                    if stream not in self.warmed_streams:
+                        raise RuntimeError("capture stream was not warmed")
+                else:
+                    self.warmed_streams.add(stream)
+                return self.values[:num_tokens] * 2, None
+
+        for wrapper in (SimpleNamespace(stream=torch.cuda.Stream()), None):
+            with self.subTest(explicit_stream=wrapper is not None):
+                owner = StreamProbe()
+                capture, output = owner._capture_bucket(
+                    8, wrapper, NULL_MEMORY_DELTA_OBSERVER.measure("prefill")
+                )
+                self.assertEqual(
+                    owner.warmed_streams, {int(capture.stream.cuda_stream)}
+                )
+                torch.testing.assert_close(output.hidden_states, owner.values * 2)
+
+
 class KdaPrefillFallbackTest(unittest.TestCase):
     def test_outer_attention_break_does_not_capture_kda_graphs(self):
         from unittest.mock import patch
