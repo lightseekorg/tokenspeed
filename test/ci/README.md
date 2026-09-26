@@ -146,6 +146,11 @@ runner pod recreation and avoids downloading the same large wheels again on
 that node. Other runner families keep their existing cache behavior because
 their cluster storage layouts may differ.
 
+CI runner images are expected to provide `ninja`. Runner setup checks for the
+executable and only refreshes apt metadata and installs `ninja-build` when it is
+missing. This keeps source checkouts independently installable without making
+every ephemeral GPU runner wait on package mirrors before installation.
+
 For model evaluation and performance jobs, the reusable PR task workflow puts
 uv's cache in `.uv-cache` under the job's work directory, overriding an inherited
 shared uv cache. EvalScope dependency installs therefore do not depend on free

@@ -33,6 +33,7 @@ registry resolves the (nvfp4, situ, precomputed_topk) plan to this kernel.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -55,8 +56,15 @@ _E2M1_VALUES = torch.tensor(_E2M1_LUT + [-v for v in _E2M1_LUT])
 def _situ_runtime_reason() -> str | None:
     if not torch.cuda.is_available():
         return "requires CUDA"
-    if not (10, 0) <= torch.cuda.get_device_capability() <= (10, 3):
-        return "flashinfer TRTLLM-Gen SiTU targets the sm_100 family"
+    import tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4  # noqa: F401
+    from tokenspeed_kernel.platform import current_platform
+    from tokenspeed_kernel.registry import KernelRegistry
+
+    spec = KernelRegistry.get().get_by_name(
+        "flashinfer_trtllm_nvfp4_situ_routed_moe_apply"
+    )
+    if spec is None or not spec.capability.satisfied_by(current_platform()):
+        return "outside the kernel's registered capability range"
     return None
 
 
@@ -439,6 +447,36 @@ def test_nvfp4_trtllm_registry_declares_ispp_alignment(kernel_name: str) -> None
     if spec is None:
         pytest.skip("nvfp4 TRT-LLM kernel not registered on this platform")
     assert spec.traits["ispp_alignment"] == frozenset({64})
+
+
+@pytest.mark.parametrize(
+    ("kernel_name", "arch_version", "expected"),
+    [
+        ("flashinfer_trtllm_nvfp4_situ_routed_moe_apply", (9, 0), False),
+        ("flashinfer_trtllm_nvfp4_situ_routed_moe_apply", (10, 7), True),
+        ("flashinfer_trtllm_nvfp4_situ_routed_moe_apply", (10, 8), False),
+        # Keep sibling NVFP4 paths capped until they are validated on SM107.
+        ("flashinfer_trtllm_nvfp4_routed_moe_apply", (10, 7), False),
+    ],
+)
+def test_nvfp4_trtllm_capability_range(
+    b300_platform,
+    kernel_name: str,
+    arch_version: tuple[int, int],
+    expected: bool,
+) -> None:
+    import tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4  # noqa: F401
+    from tokenspeed_kernel.platform import ArchVersion
+    from tokenspeed_kernel.registry import KernelRegistry
+
+    spec = KernelRegistry.get().get_by_name(kernel_name)
+    if spec is None:
+        pytest.skip("nvfp4 TRT-LLM kernel not registered on this platform")
+    platform = replace(
+        b300_platform,
+        arch_version=ArchVersion(*arch_version),
+    )
+    assert spec.capability.satisfied_by(platform) is expected
 
 
 @requires_flashinfer_situ

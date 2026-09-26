@@ -89,28 +89,35 @@ def _drafter(spec_num_tokens: int = 8, vocab: int = VOCAB) -> DSpark:
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("declares", [False, True])
 @pytest.mark.parametrize("prefill_disabled", [False, True])
 @pytest.mark.parametrize("decode_disabled", [False, True])
 def test_draft_prefill_capture_uses_the_resolved_prefill_gate(
-    monkeypatch, prefill_disabled, decode_disabled
+    monkeypatch, prefill_disabled, decode_disabled, declares
 ):
     from tokenspeed.runtime.execution import model_executor
+    from tokenspeed.runtime.execution.memory_delta import (
+        NULL_MEMORY_DELTA_OBSERVER,
+    )
 
     monkeypatch.setattr(model_executor, "workspace_pool", Mock())
-    executor = SimpleNamespace(
-        _autotune=Mock(),
-        device="cuda",
-        forward_step=Mock(disable=decode_disabled),
-        prefill_graph=Mock(disable=prefill_disabled),
-        drafter=Mock(),
+    # A real instance, so the gate resolves the production property.
+    executor = model_executor.ModelExecutor.__new__(model_executor.ModelExecutor)
+    executor.device = "cuda"
+    executor.forward_step = Mock(disable=decode_disabled)
+    executor.prefill_graph = Mock(disable=prefill_disabled)
+    # Explicit: a bare Mock answers truthily, so the gate below would hold anyway.
+    executor.drafter = Mock(captures_prefill_graph=declares)
+    model_executor.ModelExecutor.capture_graphs(
+        executor, entries=None, observer=NULL_MEMORY_DELTA_OBSERVER
     )
-    model_executor.ModelExecutor.capture_graphs(executor)
-    if prefill_disabled:
+    if prefill_disabled or not declares:
         executor.drafter.capture_prefill_graph.assert_not_called()
     else:
-        executor.drafter.capture_prefill_graph.assert_called_once_with(
-            executor.forward_step.stream
-        )
+        # The drafter's own graph is a measured ladder of its own.
+        executor.drafter.capture_prefill_graph.assert_called_once()
+        (stream, _observer), _ = executor.drafter.capture_prefill_graph.call_args
+        assert stream is executor.forward_step.stream
 
 
 def test_v4_prefill_window_seeding_uses_the_cpu_length_mirror() -> None:

@@ -39,6 +39,7 @@ class QwenGDNRecipe(CacheRecipe):
     """
 
     family = "qwen_gdn"
+    uses_paged_state_verify = True
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
