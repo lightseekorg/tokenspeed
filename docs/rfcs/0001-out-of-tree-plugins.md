@@ -335,19 +335,51 @@ Its current fields are `configure_attention`, `cache_family`,
 frontend, scheduler and worker loads; request token history is implemented.
 
 The schema below is the proposed next version: it retains those contracts,
-replaces the defaulted multiplicity with an explicit resolved layer count,
-and adds draft routing, forced-backend and PD compatibility declarations. The
+replaces the defaulted multiplicity with a late-resolved cache-layer layout,
+and adds config generation, backend composition, draft routing, forced-backend
+and PD compatibility declarations. The
 in-tree migration later removes the remaining architecture-name tables,
 so all model-family knowledge lives on the model class:
 
 ```python
 PDRole = Literal["target", "speculative_target", "draft"]
+ModelSide = Literal["target", "draft"]
+
+
+@dataclass(frozen=True, kw_only=True)
+class CheckpointMetadata:
+    weight_names: frozenset[str] | None  # index/header names; no weight tensors
+
+
+@dataclass(frozen=True, kw_only=True)
+class CacheLayerLayout:
+    ids_by_hidden_layer: tuple[tuple[int, ...], ...]
+
+
+@dataclass(frozen=True, kw_only=True)
+class AttentionConfigInputs:
+    server_args: ServerArgs             # launch snapshot, read-only to factories
+    model_config: ModelConfig          # finalized geometry and cache-layer layout
+    side: ModelSide
+    backend_name: str | None            # outer backend, possibly hybrid_linear_attn
+    full_attention_backend_choice: str | None  # side-local leaf choice; None means auto
+
+
+@dataclass(frozen=True, kw_only=True)
+class BackendCompositionInputs:
+    config_inputs: AttentionConfigInputs
+    config: AttnConfig                 # after full-leaf/DCP resolution
+    pool: CachePool                    # this side's local view of the shared arena
+    backend: AttentionBackend          # selected leaf/router, optionally hybrid-wrapped
+    full_attention_backend_name: str | None
 
 
 @dataclass(frozen=True, kw_only=True)
 class ModelProfile:
     configure_attention: Callable[[ModelConfig], None]  # writes arch + geometry
-    num_attention_layers: int                # cache-layer count for this model side
+    cache_layer_layout: Callable[[ModelConfig, CheckpointMetadata, ModelSide], CacheLayerLayout]
+    create_attention_config: Callable[[AttentionConfigInputs], AttnConfig | None]
+    compose_attention_backend: Callable[[BackendCompositionInputs], AttentionBackend]
     draft_architecture: Mapping[str, str]    # algorithm -> registered draft architecture
     is_draft_of: frozenset[str]              # accepted target architecture names
     cache_family: str                        # a registered recipe/pool family
@@ -365,7 +397,9 @@ class FooForCausalLM(nn.Module):
     def model_profile(cls, hf_config) -> ModelProfile:
         return ModelProfile(
             configure_attention=configure_mla_attention,
-            num_attention_layers=hf_config.num_hidden_layers,
+            cache_layer_layout=ordinary_cache_layer_layout,
+            create_attention_config=generate_mla_config,
+            compose_attention_backend=identity_backend_composition,
             draft_architecture={},
             is_draft_of=frozenset(),
             cache_family="mla",
@@ -373,11 +407,35 @@ class FooForCausalLM(nn.Module):
             default_attention_backend="flashmla",
             forced_attention_backend=None,
             forced_drafter_attention_backend=None,
-            pd_roles=frozenset({"target", "speculative_target", "draft"}),
+            pd_roles=frozenset({"target", "speculative_target"}),
             default_prefix_granularity=64,
             request_token_history=False,
             tokenizer_kwargs={},
         )
+```
+
+This target-only MLA example uses explicit helpers (no behavioral defaults).
+A separately registered NextN/draft model supplies its own draft layout and
+compatibility declarations; it does not reuse the target-depth helper:
+
+```python
+def ordinary_cache_layer_layout(model_config, checkpoint_metadata, side):
+    if side != "target":
+        raise ValueError("This example layout supports only the target side")
+    # One attention instance per finalized target hidden layer.
+    return CacheLayerLayout(
+        ids_by_hidden_layer=tuple((i,) for i in range(model_config.num_hidden_layers))
+    )
+
+
+def generate_mla_config(inputs: AttentionConfigInputs) -> AttnConfig:
+    return MLAConfig.generate(
+        inputs.server_args, inputs.model_config, is_draft=inputs.side == "draft"
+    )
+
+
+def identity_backend_composition(inputs: BackendCompositionInputs) -> AttentionBackend:
+    return inputs.backend
 ```
 
 `model_profile(hf_config)` is a classmethod, not a class attribute: a family
@@ -444,14 +502,88 @@ Profile field contracts:
   model receives as a forward argument. The capability lives in the runtime,
   once; the profile only switches it on. This is the pattern for future
   model needs that are state, not dispatch.
-- `num_attention_layers` is computed from the checkpoint by the profile
-  factory and assigned to `ModelConfig` before cache setup. The migration
-  replaces the existing `attention_instances_per_layer` multiplication and
-  `_derive_num_attention_layers` and architecture-name multipliers: a block
-  with two attention instances declares twice its block count. Draft profiles
-  declare their own count; cache recipes still determine whether a draft
-  shares target storage. PP execution-to-cache windows must use the same
-  mapping, rather than assuming one cache layer per execution block.
+- `cache_layer_layout` is a required callable, not an eager count in
+  `model_profile(hf_config)`. Invoke it once at the end of model-config
+  preparation, after role-specific text-config normalization and checkpoint
+  metadata loading, but before attention-config generation or cache setup.
+  Its side is target/draft, not a PD role. The common checkpoint loader
+  supplies tensor names from the checkpoint index (or headers); it does not
+  interpret model-specific stage names. A DSpark resolver counts its DSpark stage
+  names there, after metadata is available, instead of capturing the base
+  checkpoint's hidden-layer count or depending on a later architecture
+  branch to overwrite `num_attention_layers`. A resolver requiring unavailable
+  metadata must raise; it must not guess from the target depth. Existing
+  role-specific config normalization must likewise finish before this call.
+- The returned `ids_by_hidden_layer` maps each finalized execution/hidden
+  layer of that model side to its attention cache-layer IDs. IDs flatten to
+  `0..N-1` in execution order, without gaps or duplicates; empty per-layer
+  tuples and nonuniform multiplicity are allowed. Store this layout once on
+  `ModelConfig` and derive `num_attention_layers = N` from it. There is no
+  second independent count. Draft execution depth is its finalized draft
+  depth, not target hidden layers or capture taps. Cache recipes remain the
+  authority on target sharing versus independent draft storage: a shared
+  draft contributes no extra independent cache layers.
+- PP remains owned by `pp_stage_windows`: it partitions target hidden-layer
+  IDs, then the common model/cache boundary concatenates the corresponding
+  layout entries to obtain each stage's cache-ID window. It validates complete,
+  disjoint coverage and passes those windows to `pipeline_cache_ownership`;
+  draft storage is added on the final stage as today. Non-PP uses the complete
+  layout. Field placement and PD use the resulting cache-field IDs, never
+  redo this mapping. For multiplicities `(2, 1, 3)`, execution windows `[0, 2)`
+  and `[2, 3)` therefore own cache windows `[0, 3)` and `[3, 6)` respectively.
+- `create_attention_config` is required and runs at the existing
+  `_create_attn_config` construction point, after geometry, cache layout,
+  PD validation and user/default/forced backend selection. Inputs carry a
+  read-only launch snapshot with `backend_name` written to the selected
+  side's matching launch field. For a hybrid this is the outer
+  `hybrid_linear_attn` sentinel; `full_attention_backend_choice` separately
+  carries that side's user/default choice after applying its forced-leaf
+  constraint (or `None` for automatic leaf resolution). Capture the target
+  choice before writing the sentinel; capture the draft choice from its own
+  draft selection, never from the target field. The factory initializes its
+  softmax component with this leaf choice, not the sentinel. The common
+  full-leaf resolver consumes this same side-local choice on both sides;
+  later DCP validation may not undo a forced leaf. The factory returns the complete `AttnConfig`,
+  including its typed softmax and optional linear/other components; the
+  generic builder validates declared components rather than appending a
+  duplicate linear component. A declared `linear_attention` with no matching
+  linear component remains a startup error. `profile.cache_family` alone
+  selects the recipe/pool; the factory does not choose another family. Cache
+  setup validates the returned components and layer namespace against that
+  recipe and rejects incompatibility rather than falling back to a different
+  family. V4.1 selects a factory using
+  `DeepseekV41Config.generate` so compression mappings and row geometry stay
+  available to recipes and backends. V4 factories set sliding-window metadata
+  here, replacing the later architecture-specific write.
+  This does **not** move full-leaf resolution or DCP rewriting before config
+  generation: those common steps consume the returned config afterwards,
+  enforce their existing compatibility checks and reject any conflict with a
+  forced leaf. No kernel or pool is constructed by this factory. A target
+  must return a config; `None` is permitted only for a draft with no standalone
+  attention backend, explicitly chosen by its factory (as for the existing
+  same-checkpoint DSpark path). Its recipe still declares its target-owned
+  fields; no architecture test is needed to skip draft config generation.
+- `compose_attention_backend` is required, with explicit identity for an
+  ordinary model. The common builder first creates the side's cache-pool
+  view, then resolves the leaf/router from the config and final full-attention
+  backend name, then builds any declared hybrid linear wrapper using that
+  pool view. It then calls this
+  hook once before exposing/binding the final root. Both target and standalone
+  draft builders use this order; a config-less draft has no backend to compose.
+  Qwen4-Exp selects a factory equivalent to `_compose_qwen4_exp_backend`,
+  attaching PLE/QSA consumers only for groups in that pool view and retaining
+  the selected inner full-attention backend. Inkling selects its convolution
+  wrapper at this same point, after any hybrid composition. A profile needing
+  several wrappers composes them in one explicitly ordered factory; generic
+  construction does not independently add them again. Arena rebuilds rebind
+  the existing root to the replacement pool and do not wrap it a second time.
+  Cache recipes, the shared arena and scheduler continue to own persistent
+  request-state allocation and transfer. Backend-owned fixed workspace is
+  allowed only when its size and lifecycle match the recipe's planned
+  workspace; the existing Inkling convolution working pool follows this
+  accounting and must keep the workspace-size check. This is not permission
+  to introduce independently allocated persistent cache state. The returned root must forward the common metadata, cache-binding,
+  verify and draft lifecycle hooks described by `unified_path.md`.
 - `draft_architecture` maps each supported algorithm to a registered draft
   architecture name. An explicit draft checkpoint selects its registered
   class first; otherwise the target profile mapping selects it. The selected
@@ -664,7 +796,9 @@ plugin exists. Three measures:
    protocols a plugin may subclass or call: `ModelProfile`, the `register_*`
    functions, `AttentionBackend`, `CacheRecipe`, `CachePool`,
    `PagedAttention`, `QuantizationConfig` / `QuantizeMethodBase`,
-   `BaseDrafter`, `TargetCaptureConfigurator`, and the forward-metadata
+   `CacheLayerLayout`, `CheckpointMetadata`, `AttentionConfigInputs`,
+   `BackendCompositionInputs`, `BaseDrafter`, `TargetCaptureConfigurator`,
+   and the forward-metadata
    protocol they receive. A change to one of these bumps
    `PLUGIN_API_VERSION` and gets a line in the release notes. Everything not
    on the list is internal.
@@ -684,6 +818,12 @@ plugin exists. Three measures:
    conflicting user choices on both model sides, hybrid leaf composition, and
    PD role tests covering V4 draft rejection, Inkling with either a draft or
    an algorithm alone, target-only acceptance and separate DSpark profiles.
+   Include DSpark index-derived stage depth that differs from the base model,
+   missing-index failure, nonuniform PP execution-to-cache mapping and exact
+   field coverage, specialized V4.1 components/row layout, and Qwen4 PLE/QSA
+   composition with explicit leaf selection on target and draft views. Cover
+   identity and hybrid composition, config-less draft construction, arena
+   rebinding without duplicate wrappers, and eager/graph lifecycle forwarding.
    Negative cases must fail
    startup before any request can run.
 3. **Exact pins.** Plugins pin `tokenspeed` and `tokenspeed_kernel` exactly,
@@ -717,7 +857,10 @@ tests and documentation before it is independently mergeable.
    schema, forced target/draft backend selection and common PD-role checks.
    Preserve geometry initialization, tokenizer transport and token-history
    behavior already implemented. Replace the multiplicity field with the
-   explicit layer count while preserving existing model results. Draft
+   late layout resolver and derive counts and PP cache windows from its one
+   layout, after checkpoint metadata is available. Add the typed config and
+   composition factories at the common construction points above, preserving
+   specialized components, DSpark's config-less draft and model results. Draft
    mappings/target sets are explicit but unused until phase 2. These breaking
    changes bump `PLUGIN_API_VERSION` to 2 together with plugin migrations;
    API-1 packages are not silently interpreted as API-2 declarations. Begin
