@@ -56,10 +56,11 @@ class ModelProfile:
         request_token_history: Whether the model reads each request's
             committed token history (``ForwardContext.request_token_history``).
         tokenizer_kwargs: Extra keyword arguments for the model's tokenizer.
-        attention_instances_per_layer: Attention modules per decoder layer.
-            Paired layouts (two attention branches sharing one layer's MLP
-            block, e.g. LongCat's ScMoE) declare 2 so the cache plans one
-            plane per branch; the default 1 is the ordinary stack.
+        attention_instances_per_layer: Attention modules per decoder layer:
+            1 for the ordinary stack, 2 for paired layouts (two attention
+            branches sharing one layer's MLP block, e.g. LongCat's ScMoE) so
+            the cache plans one plane per branch. Cache geometry, so it has
+            no fallback: an omitted count would undersize the cache.
     """
 
     configure_attention: Callable[[ModelConfig], None]
@@ -69,7 +70,7 @@ class ModelProfile:
     default_prefix_granularity: int | None
     request_token_history: bool
     tokenizer_kwargs: Mapping[str, object]
-    attention_instances_per_layer: int = 1
+    attention_instances_per_layer: int
 
     def __post_init__(self) -> None:
         if not self.cache_family:
