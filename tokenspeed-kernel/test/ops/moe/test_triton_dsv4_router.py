@@ -35,6 +35,45 @@ from tokenspeed_kernel import (
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("weights_dtype", [torch.float32, torch.bfloat16])
+def test_router_reuses_compilation_across_token_counts(weights_dtype):
+    from tokenspeed_kernel.ops.moe.triton import sqrt_softplus_topk
+    from utils import assert_no_triton_compile
+
+    def run(tokens):
+        logits = (torch.arange(256, device="cuda", dtype=torch.float32) / 256).repeat(
+            tokens, 1
+        )
+        weights, ids = moe_topk(
+            logits,
+            top_k=6,
+            score_function="sqrt_softplus",
+            selection_method="topk",
+            renormalize=True,
+            routed_scaling_factor=2.5,
+            topk_weights_dtype=weights_dtype,
+            override="triton_sqrt_softplus_topk",
+        )
+        scores = F.softplus(logits).sqrt()
+        expected_weights, expected_ids = scores.topk(6, dim=-1)
+        expected_weights = (
+            expected_weights / expected_weights.sum(dim=-1, keepdim=True) * 2.5
+        ).to(weights_dtype)
+        torch.testing.assert_close(ids.long(), expected_ids, atol=0, rtol=0)
+        torch.testing.assert_close(
+            weights,
+            expected_weights,
+            atol=1e-6,
+            rtol=8e-3 if weights_dtype == torch.bfloat16 else 2e-6,
+        )
+
+    run(1)
+    with assert_no_triton_compile(sqrt_softplus_topk._sqrt_softplus_topk_kernel):
+        for tokens in (2, 17, 32, 65):
+            run(tokens)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize("kind", ["plain", "bias", "hash"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("renormalize", [False, True])
