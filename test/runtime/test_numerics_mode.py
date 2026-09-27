@@ -49,6 +49,9 @@ class TestNumericsMode(unittest.TestCase):
             ServerArgs(model="x", numerics="rl-bitwise", moe_backend="triton")
         with self.assertRaisesRegex(ValueError, "--draft-moe-backend triton"):
             ServerArgs(model="x", numerics="rl-bitwise", draft_moe_backend="triton")
+        # An explicit auto is a select-for-me request, folded like the target's.
+        args = ServerArgs(model="x", numerics="rl-bitwise", draft_moe_backend="auto")
+        self.assertEqual(args.draft_moe_backend, "aok")
         with self.assertRaisesRegex(ValueError, "--sampling-backend triton"):
             ServerArgs(model="x", numerics="rl-bitwise", sampling_backend="triton")
         args = ServerArgs(

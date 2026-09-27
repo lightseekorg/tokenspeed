@@ -838,7 +838,9 @@ class ServerArgs:
                 f"--numerics rl-bitwise needs the batch-invariant MoE solution "
                 f"'aok'; --moe-backend {self.moe_backend} makes no such claim"
             )
-        if self.draft_moe_backend not in (None, "aok"):
+        if self.draft_moe_backend == "auto":
+            self.draft_moe_backend = "aok"
+        elif self.draft_moe_backend not in (None, "aok"):
             raise ValueError(
                 f"--numerics rl-bitwise needs the batch-invariant MoE solution "
                 f"'aok'; --draft-moe-backend {self.draft_moe_backend} makes no "
