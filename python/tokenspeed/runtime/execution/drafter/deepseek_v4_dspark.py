@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING
 
 import torch
@@ -275,8 +276,18 @@ class DeepseekV4DSpark(BaseDrafter):
             out[num_extends:].copy_(output_tokens[offsets + accepted - 1])
         return out
 
+    @property
+    def captures_prefill_graph(self) -> bool:
+        return True
+
+    def release_prefill_graph(self) -> None:
+        """Drop the graph and the private pool it holds before the arena is replaced."""
+        self._prefill_graph = None
+
     @torch.inference_mode()
-    def capture_prefill_graph(self, stream: torch.cuda.Stream) -> None:
+    def capture_prefill_graph(
+        self, stream: torch.cuda.Stream, observer: AbstractContextManager[None]
+    ) -> None:
         """Capture one request's bounded context seeding in a private graph pool."""
         window = int(self.model.window_size)
         self._prefill_hidden = torch.zeros(
@@ -317,7 +328,7 @@ class DeepseekV4DSpark(BaseDrafter):
         graph = torch.cuda.CUDAGraph()
         # Own pool: target prefill and decode graphs must not recycle these
         # intermediates, including any pointers memoized by quantized GEMMs.
-        with torch.cuda.graph(graph, stream=stream):
+        with observer, torch.cuda.graph(graph, stream=stream):
             run_once()
         graph.replay()
         torch.cuda.synchronize(self.device)

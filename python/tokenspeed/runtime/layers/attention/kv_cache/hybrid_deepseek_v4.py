@@ -28,7 +28,7 @@ from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_compact_compressed_slot_mapping,
     dsv4_compressed_slot_mapping,
 )
-from tokenspeed_kernel.ops.kvcache.triton_virtual_blocks import virtual_slots_to_local
+from tokenspeed_kernel.ops.kvcache.triton_cache_placement import virtual_slots_to_local
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
@@ -169,7 +169,10 @@ class DeepseekV4CacheMetadata:
         captured into a CUDA graph is refreshed rather than replaced.
         """
         for group_id, table in self.block_tables.items():
-            if parse_v4_compressed_kv_group_id(group_id) is None:
+            if (
+                parse_v4_compressed_kv_group_id(group_id) is None
+                and group_id != V4_INDEXER_KV_GROUP_ID
+            ):
                 continue
             out = self.compressed_page_tables.get(group_id)
             if out is not None and (
@@ -206,8 +209,27 @@ class DeepseekV4CacheMetadata:
         return self._group_table(v4_compressed_kv_group_id(compress_ratio))
 
     def indexer_block_table(self) -> torch.Tensor:
-        """The scheduler's table for the replicated indexer K group."""
+        """The scheduler's virtual table for the independently allocated indexer K group."""
         return self._group_table(V4_INDEXER_KV_GROUP_ID)
+
+    def indexer_page_table(self) -> torch.Tensor:
+        """Local Index-K pages, preserving global positions with -1 holes."""
+        return self.compressed_page_tables[V4_INDEXER_KV_GROUP_ID]
+
+    def local_indexer_write_slots(
+        self, slots: torch.Tensor, rows_per_page: int
+    ) -> torch.Tensor:
+        """Negative slots suppress nonowner writes in both FP8/MXFP4 writers."""
+        local, owned = virtual_slots_to_local(
+            slots,
+            rows_per_page=rows_per_page,
+            virtual_block_count=self.runtime_contract.virtual_block_counts[
+                V4_INDEXER_KV_GROUP_ID
+            ],
+            degree=self.dcp_size,
+            rank=self.dcp_rank,
+        )
+        return torch.where(owned, local, -1)
 
     def _group_table(self, group_id: str) -> torch.Tensor:
         table = self.block_tables.get(group_id)
@@ -344,7 +366,7 @@ class DeepseekV4CacheMetadata:
             token_to_req_indices: Request row of each token.
             query_start_loc: Cumulative query lengths per request.
             seq_lens: Sequence length per request.
-            indexer: Address the replicated indexer K group instead of the
+            indexer: Address the independent indexer K group instead of the
                 compressed KV group of ``compress_ratio``.
             kv_cache_block_size: Rows per page of the addressed group.
             use_decode_cache: Serve decode batches from the persistent

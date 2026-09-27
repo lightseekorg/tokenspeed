@@ -354,7 +354,7 @@ if mm_mxfp8 is not error_fn:
         solution="flashinfer",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 3),
+            max_arch_version=ArchVersion(10, 7),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=_MXFP8_1X32_FORMAT_SIGNATURES,

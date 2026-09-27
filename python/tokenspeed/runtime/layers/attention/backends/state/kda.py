@@ -154,15 +154,20 @@ class KdaAttnBackend(MambaAttnBackend):
             is metadata
         )
 
-    def prepare_prefill_metadata(
-        self, token_capacity: int, bs: int, forward_mode: ForwardMode, *, capture: bool
+    def admits_prefill_graph(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode
     ) -> bool:
-        if not (
+        return (
             self._prefill_graph_enabled
             and self.kda_backend == "cutedsl_kda"
             and self.step_counter is None
             and forward_mode.is_extend()
-        ):
+        )
+
+    def prepare_prefill_metadata(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode, *, capture: bool
+    ) -> bool:
+        if not self.admits_prefill_graph(token_capacity, bs, forward_mode):
             return False
         if (
             self._prefill_metadata_pool is not None
