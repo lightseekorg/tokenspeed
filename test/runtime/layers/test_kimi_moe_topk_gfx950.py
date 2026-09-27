@@ -1,4 +1,4 @@
-"""Generic TopK's gfx950 E896/top-k16 decode routing integration."""
+"""Generic TopK's gfx950 E896/top-k16 decode and batched routing integration."""
 
 from __future__ import annotations
 
@@ -47,10 +47,11 @@ def _make_topk(correction_bias: torch.Tensor):
 
 
 @pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
-def test_generic_topk_uses_k3_decode_or_small_m_gluon_route(
+def test_generic_topk_uses_k3_decode_or_prefill_gluon_route(
     num_tokens: int,
     monkeypatch: pytest.MonkeyPatch,
 ):
+    """FP32 K3 routing uses decode for one row and prefill for multiple rows."""
     generator = torch.Generator(device="cuda").manual_seed(20260720 + num_tokens)
     hidden_states = torch.randn(
         (num_tokens, 7168),
@@ -84,9 +85,9 @@ def test_generic_topk_uses_k3_decode_or_small_m_gluon_route(
         patch_target = decode_topk_module
         patch_name = "_decode_sigmoid_bias_topk"
     else:
-        original_route = routing_module.invoke_sigmoid_bias_topk_route_gluon
+        original_route = routing_module.invoke_sigmoid_bias_topk_route_prefill_gluon
         patch_target = routing_module
-        patch_name = "invoke_sigmoid_bias_topk_route_gluon"
+        patch_name = "invoke_sigmoid_bias_topk_route_prefill_gluon"
 
     def spy_route(*args, **kwargs):
         nonlocal route_calls
@@ -112,7 +113,7 @@ def test_generic_topk_uses_k3_decode_or_small_m_gluon_route(
 
 
 @pytest.mark.parametrize("num_tokens", [1, 8])
-def test_generic_small_m_topk_is_cuda_graph_capturable(num_tokens: int):
+def test_generic_topk_is_cuda_graph_capturable(num_tokens: int):
     generator = torch.Generator(device="cuda").manual_seed(20260720 + num_tokens)
     hidden_states = torch.randn(
         (num_tokens, 7168),
