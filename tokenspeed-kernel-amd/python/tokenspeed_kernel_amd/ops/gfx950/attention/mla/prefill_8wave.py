@@ -65,7 +65,6 @@ class Prefill8WaveConfig:
     BLOCK_M: gl.constexpr
     BLOCK_N: gl.constexpr
     NUM_WARPS: gl.constexpr
-    BATCH_SIZE: gl.constexpr
     NUM_XCDS: gl.constexpr
     NUM_BLOCKS: gl.constexpr
     IS_FP8: gl.constexpr
@@ -103,7 +102,6 @@ class Prefill8WaveConfig:
         BLOCK_M,
         BLOCK_N,
         NUM_WARPS,
-        BATCH_SIZE,
         IS_FP8,
         KV_DTYPE,
         q_strides,
@@ -167,7 +165,6 @@ class Prefill8WaveConfig:
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.BLOCK_N = gl.constexpr(BLOCK_N)
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
-        self.BATCH_SIZE = gl.constexpr(BATCH_SIZE)
         self.NUM_XCDS = gl.constexpr(8)
         self.NUM_BLOCKS = gl.constexpr(512)
         self.IS_FP8 = gl.constexpr(IS_FP8)
@@ -681,7 +678,10 @@ def process_query_block(
 # ===-----------------------------------------------------------------------===#
 
 
-@gluon.jit(launch_metadata=prefill_launch_metadata)
+@gluon.jit(
+    launch_metadata=prefill_launch_metadata,
+    do_not_specialize=("batch_size", "max_seqlen_q"),
+)
 def gluon_mla_prefill_8wave_gfx950(
     q_ptr,
     k_ptr,
@@ -710,7 +710,7 @@ def gluon_mla_prefill_8wave_gfx950(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    BATCH_SIZE: gl.constexpr,
+    batch_size,
     max_seqlen_q,
     IS_FP8: gl.constexpr,
 ):
@@ -725,7 +725,6 @@ def gluon_mla_prefill_8wave_gfx950(
         BLOCK_M,
         BLOCK_N,
         NUM_WARPS,
-        BATCH_SIZE,
         IS_FP8,
         k_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, 1),
@@ -752,7 +751,7 @@ def gluon_mla_prefill_8wave_gfx950(
 
     # Swizzle only helps the triangular causal workload; non-causal tiles are
     # uniform cost, so use the simpler round-robin order there.
-    scheduler = ProgramScheduler.create(cfg, BATCH_SIZE, max_seqlen_q, IS_CAUSAL)
+    scheduler = ProgramScheduler.create(cfg, batch_size, max_seqlen_q, IS_CAUSAL)
     while scheduler.has_work():
         program, active = scheduler.get_program(
             q_ptr,
@@ -801,9 +800,9 @@ def launch_gluon_mla_prefill_8wave_gfx950(
     max_seqlen_kv: int,
     softmax_scale: float,
     *,
-    is_causal: bool = True,
-    logit_cap: float = 0.0,
-    return_lse: bool = False,
+    is_causal: bool,
+    logit_cap: float,
+    return_lse: bool,
     out: torch.Tensor | None = None,
     seq_lens_kv: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -813,9 +812,14 @@ def launch_gluon_mla_prefill_8wave_gfx950(
     ``[total_tokens, num_kv_heads, 192]`` (128 NoPE + 64 RoPE); ``v`` is
     ``[total_tokens, num_kv_heads, 128]``, all FP16, BF16, FP8 E4M3
     or FP8 E5M2.
-    Output is ``[total_tokens, num_heads, 128]``. ``seq_lens_kv`` is accepted
-    for interface parity; ``cu_seqlens_kv`` already defines the KV lengths.
+    Output is ``[total_tokens, num_heads, 128]``. ``seq_lens_kv`` and
+    ``max_seqlen_kv`` are redundant hints that must agree with ``cu_seqlens_kv``,
+    which defines the KV lengths. ``is_causal``, ``logit_cap`` and ``return_lse``
+    are explicit; when ``return_lse`` is true, return the output and FP32
+    log-sum-exp tensors.
     """
+    if cu_seqlens_q.numel() < 2:
+        raise ValueError("MLA prefill requires at least one sequence")
     if logit_cap != 0.0:
         raise NotImplementedError(
             "gluon MLA prefill 8wave gfx950 does not support logit_cap"
@@ -896,7 +900,7 @@ def launch_gluon_mla_prefill_8wave_gfx950(
         BLOCK_M=config.block_m,
         BLOCK_N=config.block_n,
         NUM_WARPS=config.num_warps,
-        BATCH_SIZE=cu_seqlens_q.numel() - 1,
+        batch_size=cu_seqlens_q.numel() - 1,
         max_seqlen_q=max_seqlen_q,
         IS_FP8=q.dtype in _FP8_DTYPES,
         num_warps=config.num_warps,

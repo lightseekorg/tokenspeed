@@ -4739,6 +4739,25 @@ _CASES = [
         partial(_attention_mla_prefill, torch.float8_e4m3fn, 4, 256, 256, 16),
         id_suffix="fp8-short-keys",
     ),
+    *[
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "attention",
+            "mla_prefill",
+            (
+                "gluon_mla_prefill_8wave_gfx950"
+                if kv_len >= 1024
+                else "gluon_mla_prefill_gfx950"
+            ),
+            partial(
+                _attention_mla_prefill, torch.float8_e4m3fn, batch, 256, kv_len, 12
+            ),
+            id_suffix=f"fp8-batch{batch}-kv{kv_len}",
+        )
+        for batch in (1, 3)
+        for kv_len in (513, 1023, 1024, 1025)
+    ],
     _case(
         _is_cdna5,
         "cdna5",

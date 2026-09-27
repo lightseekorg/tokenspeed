@@ -651,9 +651,7 @@ def prepare_mla_prefill(
         signature_roles={"q": dtype, "k": dtype, "v": dtype},
         traits=mla_ops.mla_prefill_traits(
             batch_size=batch,
-            total_q=total_q,
             total_kv=total_kv,
-            num_q_heads=config.local_heads,
             head_dim=config.qk_head_dim,
             value_head_dim=config.v_head_dim,
             is_causal=is_causal,

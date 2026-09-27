@@ -332,18 +332,22 @@ def test_mla_normalize_project_query_selection_matches_operation_api(
     assert actual[1]["inputs_contiguous"] is True
 
 
-def test_mla_prefill_selection_matches_operation_api(monkeypatch) -> None:
+@pytest.mark.parametrize("batch", [1, 3])
+@pytest.mark.parametrize("kv_len", [513, 1023, 1024, 1025])
+def test_mla_prefill_selection_matches_operation_api(
+    monkeypatch, batch, kv_len
+) -> None:
     fp8 = torch.float8_e4m3fn
     expected = _capture_operation_selection(
         monkeypatch,
         lambda ops: ops.mla_prefill(
-            q=torch.zeros((256, 12, 192), dtype=fp8),
-            k=torch.zeros((1024, 12, 192), dtype=fp8),
-            v=torch.zeros((1024, 12, 128), dtype=fp8),
-            cu_seqlens_q=torch.tensor([0, 256], dtype=torch.int32),
-            cu_seqlens_kv=torch.tensor([0, 1024], dtype=torch.int32),
+            q=torch.zeros((batch * 256, 12, 192), dtype=fp8),
+            k=torch.zeros((batch * kv_len, 12, 192), dtype=fp8),
+            v=torch.zeros((batch * kv_len, 12, 128), dtype=fp8),
+            cu_seqlens_q=torch.arange(batch + 1, dtype=torch.int32) * 256,
+            cu_seqlens_kv=torch.arange(batch + 1, dtype=torch.int32) * kv_len,
             max_seqlen_q=256,
-            max_seqlen_kv=1024,
+            max_seqlen_kv=kv_len,
             softmax_scale=192**-0.5,
             is_causal=False,
             return_lse=True,
@@ -352,7 +356,10 @@ def test_mla_prefill_selection_matches_operation_api(monkeypatch) -> None:
     actual = _capture_generator_selection(
         monkeypatch,
         mla_generator.prepare_mla_prefill,
-        _request("mla_prefill", _PREFILL_SHAPE),
+        _request(
+            "mla_prefill",
+            {**_PREFILL_SHAPE, "batch": batch, "kv_tokens_per_sequence": kv_len},
+        ),
     )
 
     assert actual == expected
@@ -388,3 +395,37 @@ def test_mla_prefill_generator_reports_executed_kernel_on_cdna4(
         mla_generator.prepare_mla_prefill(request, mi350_platform)
 
     assert selected["spec"].name == expected
+
+
+@pytest.mark.parametrize("batch", [0, 1, 3, 17])
+@pytest.mark.parametrize("avg_kv_len", [0, 1, 513, 1023, 1024, 1025, 2048])
+def test_mla_prefill_traits_preserve_minimum_key_length(batch, avg_kv_len):
+    from tokenspeed_kernel.ops.attention.mla import mla_prefill_traits
+    from tokenspeed_kernel.registry import KernelSpec
+    from tokenspeed_kernel.selection import spec_matches_traits
+
+    spec = KernelSpec(
+        name="prefill",
+        family="attention",
+        mode="mla_prefill",
+        traits={"avg_kv_len_min": frozenset({1024})},
+    )
+    # Include ragged totals that are not divisible by the batch size.
+    total_kv = batch * avg_kv_len + max(batch - 1, 0)
+    traits = mla_prefill_traits(
+        batch_size=batch,
+        total_kv=total_kv,
+        head_dim=192,
+        value_head_dim=128,
+        is_causal=True,
+        logit_cap=0.0,
+        return_lse=True,
+    )
+    assert spec_matches_traits(spec, traits) == (batch > 0 and avg_kv_len >= 1024)
+    assert traits["avg_kv_len"] <= avg_kv_len
+    bucket = traits["avg_kv_len"]
+    assert bucket == 0 or bucket & (bucket - 1) == 0
+    # A backend without this bound remains eligible.
+    assert spec_matches_traits(
+        KernelSpec(name="base", family="attention", mode="mla_prefill"), traits
+    )

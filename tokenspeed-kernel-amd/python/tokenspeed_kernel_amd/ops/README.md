@@ -248,23 +248,30 @@ only for now.
 
 #### Contract
 
-  - Queries are `(tokens, heads, 192)` and keys are `(tokens, kv_heads, 192)`
+- Queries are `(tokens, heads, 192)` and keys are `(tokens, kv_heads, 192)`
   (128 no-PE plus 64 RoPE dimensions); values are `(tokens, kv_heads, 128)`,
   all FP16, BF16, FP8 E4M3, or FP8 E5M2 with one shared dtype and a contiguous
   last dimension. Query heads must be a multiple of KV heads.
+- Each batch must contain at least one sequence.
 - `cu_seqlens_q` and `cu_seqlens_kv` delimit the sequences. Causal masking
   aligns each query block to the end of its keys. `logit_cap` is unsupported.
 - The output may be any caller-owned floating dtype with a contiguous last
   dimension; the optional log-sum-exp is FP32 in natural-log units.
-- For FP8 inputs the 8-wave kernel is selected when its `qkv_problem_filter`
-  accepts `(batch_size, total_q, total_kv)`: on average at least
-  1024 key tokens per sequence, a threshold measured on Kimi-K3 prefill
-  shapes.
-- Both launch a persistent grid of 512 workgroups and keep no sequence-length
-  constexpr, so ragged batches reuse one binary.
+- For FP8 inputs the 8-wave kernel requires `avg_kv_len_min=1024`: at least
+  1024 key tokens per sequence on average, measured on Kimi-K3 prefill shapes.
+  Selection rounds the average down to a power of two to bound its cache;
+  this preserves the 1024-token cutoff exactly, including ragged batches.
+- Both launch a persistent grid of 512 workgroups. Batch sizes, sequence
+  lengths, and scheduler slots are runtime values, so varying ragged batches
+  reuse the warmed binaries.
+- Low-level launchers require explicit `is_causal`, `logit_cap`, and
+  `return_lse`. `seq_lens_kv` and `max_seqlen_kv` are redundant hints that must
+  agree with the authoritative `cu_seqlens_kv` lengths.
 - Both share launch metadata that reports attention FLOPs and each tensor's
   bytes once without reading device-resident sequence lengths: FLOPs assume
-  every sequence has the batch's average query and key length.
+  every sequence has the batch's fractional average query and key length,
+  with rounding only on the final FLOP count. This is an estimate for ragged
+  batches and does not read device lengths or synchronize the host.
 
 #### Algorithm
 

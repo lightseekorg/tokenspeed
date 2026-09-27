@@ -35,6 +35,7 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.attention.mla import mla_prefill
 from tokenspeed_kernel.platform import current_platform
+from utils import assert_no_triton_compile
 
 platform = current_platform()
 pytestmark = pytest.mark.skipif(not platform.is_cdna4, reason="gfx950 MLA pipeline")
@@ -200,7 +201,19 @@ def test_mla_prefill_gluon_launch_runtime_bound(require, monkeypatch, kernel, dt
         q = torch.empty((tokens, 12, 192), dtype=dtype, device="meta")
         v = torch.empty((tokens, 12, 128), dtype=dtype, device="meta")
         cu = torch.empty((2,), dtype=torch.int32, device="meta")
-        launcher(q, q, v, cu, cu, 65536, 65536, 192**-0.5)
+        launcher(
+            q,
+            q,
+            v,
+            cu,
+            cu,
+            65536,
+            65536,
+            192**-0.5,
+            is_causal=True,
+            logit_cap=0.0,
+            return_lse=False,
+        )
         assert launches[-1]["max_seqlen_q"] == (tokens if clamps else 65536)
     # Crossing query-tile and persistent-cycle boundaries changes no constexpr.
     for launch in launches:
@@ -210,36 +223,61 @@ def test_mla_prefill_gluon_launch_runtime_bound(require, monkeypatch, kernel, dt
 
 @pytest.mark.parametrize("kernel", _KERNELS)
 @pytest.mark.parametrize("is_causal", [False, True])
-def test_mla_prefill_gluon_reuses_kernel_across_query_sizes(
-    device, require, monkeypatch, kernel, is_causal
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_mla_prefill_gluon_reuses_kernel_across_batch_and_query_sizes(
+    device, require, kernel, is_causal, dtype
 ):
-    dtype = torch.float8_e4m3fn
     require("attention", "mla_prefill", "gluon", dtype, "q")
     module = _kernel_module(kernel)
     launcher = getattr(module, f"launch_{kernel}")
-    original = getattr(module, kernel)
-    compiled = set()
 
-    class RecordKernel:
-        def __getitem__(self, grid):
-            assert grid == (512,)
+    def invoke(batch, q_len):
+        heads, kv_len = 12, 17
+        q = torch.zeros((batch * q_len, heads, 192), dtype=dtype, device=device)
+        k = torch.zeros((batch * kv_len, 1, 192), dtype=dtype, device=device)
+        values = (torch.arange(batch, device=device) % 8).to(torch.float32)
+        v = values.repeat_interleave(kv_len)[:, None, None].expand(-1, 1, 128)
+        v = v.to(dtype).contiguous()
+        cu_q = torch.arange(batch + 1, device=device, dtype=torch.int32) * q_len
+        cu_kv = torch.arange(batch + 1, device=device, dtype=torch.int32) * kv_len
+        out, lse = launcher(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_kv,
+            q_len,
+            kv_len,
+            192**-0.5,
+            is_causal=is_causal,
+            logit_cap=0.0,
+            return_lse=True,
+        )
+        expected = values.repeat_interleave(q_len)[:, None, None].expand_as(out)
+        torch.testing.assert_close(out.float(), expected, rtol=1e-2, atol=1e-2)
+        visible = torch.full((q_len,), kv_len, device=device)
+        if is_causal:
+            visible = (
+                torch.arange(q_len, device=device) + max(kv_len - q_len, 0) + 1
+            ).clamp(max=kv_len)
+        expected_lse = visible.float().log().repeat(batch)[:, None].expand_as(lse)
+        torch.testing.assert_close(lse, expected_lse, rtol=1e-5, atol=1e-5)
 
-            def launch(*args, **kwargs):
-                compiled_kernel = original[grid](*args, **kwargs)
-                compiled.add(compiled_kernel.hash)
-                return compiled_kernel
-
-            return launch
-
-    monkeypatch.setattr(module, kernel, RecordKernel())
-    k = torch.zeros((128, 12, 192), dtype=dtype, device=device)
-    v = torch.zeros((128, 12, 128), dtype=dtype, device=device)
-    cu_kv = torch.tensor([0, 128], dtype=torch.int32, device=device)
-    for tokens in (144, 272, 512, 2048, 8192, 16384):
-        q = torch.zeros((tokens, 12, 192), dtype=dtype, device=device)
-        cu_q = torch.tensor([0, tokens], dtype=torch.int32, device=device)
-        launcher(q, k, v, cu_q, cu_kv, tokens, 128, 192**-0.5, is_causal=is_causal)
-    assert len(compiled) == 1
+    # Warm the runtime integer specialization classes before checking that
+    # changing the batch/sequence lengths never introduces another binary.
+    for batch, q_len in ((1, 1), (2, 16), (16, 17), (16, 16), (2, 17)):
+        invoke(batch, q_len)
+    with assert_no_triton_compile(getattr(module, kernel)):
+        # Cross 512 // 12 batch slots and the compact/full query-slot boundary.
+        for batch, q_len in (
+            (3, 257),
+            (41, 17),
+            (42, 17),
+            (43, 17),
+            (48, 17),
+            (3, 11009),
+        ):
+            invoke(batch, q_len)
 
 
 @pytest.mark.parametrize("kernel", _KERNELS)
@@ -504,26 +542,29 @@ def test_mla_prefill_gluon_kernels_agree(device, require, dtype, is_causal):
 
 
 @pytest.mark.parametrize(
-    ("is_causal", "has_lse", "kv_len", "pairs"),
+    ("is_causal", "has_lse", "total_q", "total_kv", "pairs"),
     [
-        (False, False, 1024, 256 * 1024),
+        (False, False, 512, 2048, 256 * 1024),
         # The last query row aligns with the last key.
-        (True, True, 1024, 256 * 1024 - 256 * 255 // 2),
-        (True, True, 256, 256 * 257 // 2),
+        (True, True, 512, 2048, 256 * 1024 - 256 * 255 // 2),
+        (True, True, 512, 512, 256 * 257 // 2),
+        (False, False, 5, 5, 6.25),
+        (True, True, 5, 5, 4.375),
+        (True, True, 1, 0, 0),
     ],
 )
 @pytest.mark.parametrize("kernel", _KERNELS)
 def test_mla_prefill_gluon_launch_metadata(
-    device, kernel, is_causal, has_lse, kv_len, pairs
+    device, kernel, is_causal, has_lse, total_q, total_kv, pairs
 ):
     module = _kernel_module(kernel)
-    batch, q_len, heads = 2, 256, 12
+    batch, heads = 2, 12
     fp8 = torch.float8_e4m3fn
-    q = torch.empty((batch * q_len, heads, 192), dtype=fp8, device=device)
-    k = torch.empty((batch * kv_len, heads, 192), dtype=fp8, device=device)
-    v = torch.empty((batch * kv_len, heads, 128), dtype=fp8, device=device)
-    out = torch.empty((batch * q_len, heads, 128), dtype=torch.bfloat16, device=device)
-    lse = torch.empty((batch * q_len, heads), dtype=torch.float32, device=device)
+    q = torch.empty((total_q, heads, 192), dtype=fp8, device=device)
+    k = torch.empty((total_kv, heads, 192), dtype=fp8, device=device)
+    v = torch.empty((total_kv, heads, 128), dtype=fp8, device=device)
+    out = torch.empty((total_q, heads, 128), dtype=torch.bfloat16, device=device)
+    lse = torch.empty((total_q, heads), dtype=torch.float32, device=device)
 
     metadata = module.prefill_launch_metadata(
         (512,),
@@ -534,7 +575,7 @@ def test_mla_prefill_gluon_launch_metadata(
             "v_ptr": v,
             "output_ptr": out,
             "lse_ptr": lse,
-            "BATCH_SIZE": batch,
+            "batch_size": batch,
             "IS_CAUSAL": is_causal,
             "HAS_LSE": has_lse,
             "IS_FP8": True,
@@ -548,3 +589,35 @@ def test_mla_prefill_gluon_launch_metadata(
         "bytes": tensor_bytes + (lse.numel() * 4 if has_lse else 0),
     }
     assert getattr(module, kernel).launch_metadata is module.prefill_launch_metadata
+
+
+@pytest.mark.parametrize("kernel", _KERNELS)
+@pytest.mark.parametrize("missing", ["is_causal", "logit_cap", "return_lse"])
+def test_mla_prefill_launcher_requires_explicit_options(kernel, missing):
+    launcher = getattr(_kernel_module(kernel), f"launch_{kernel}")
+    options = {"is_causal": True, "logit_cap": 0.0, "return_lse": False}
+    del options[missing]
+    with pytest.raises(TypeError, match=missing):
+        launcher(None, None, None, None, None, 0, 0, 1.0, **options)
+
+
+@pytest.mark.parametrize("kernel", _KERNELS)
+def test_mla_prefill_launcher_rejects_empty_batch(kernel):
+    launcher = getattr(_kernel_module(kernel), f"launch_{kernel}")
+    q = torch.empty((0, 12, 192), dtype=torch.bfloat16, device="meta")
+    v = torch.empty((0, 12, 128), dtype=torch.bfloat16, device="meta")
+    cu = torch.empty((1,), dtype=torch.int32, device="meta")
+    with pytest.raises(ValueError, match="at least one sequence"):
+        launcher(
+            q,
+            q,
+            v,
+            cu,
+            cu,
+            0,
+            0,
+            192**-0.5,
+            is_causal=True,
+            logit_cap=0.0,
+            return_lse=False,
+        )

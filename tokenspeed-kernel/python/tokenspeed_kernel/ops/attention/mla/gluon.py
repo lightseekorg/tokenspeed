@@ -611,15 +611,6 @@ if current_platform().is_amd:
     def gluon_mla_prefill_gfx950(*args, **kwargs):
         return _mla_prefill_gfx950_impl(*args, **kwargs)
 
-    def _is_8wave_mla_prefill_problem(
-        batch_size: int, total_q: int, total_kv: int
-    ) -> bool:
-        # For FP8 both kernels cover 256 query rows per block, so the 8-wave
-        # pipeline wins once each sequence has enough keys to pay off
-        # refilling it for every block. The threshold comes from cold-cache
-        # measurements of Kimi-K3 prefill shapes.
-        return total_kv >= 1024 * batch_size
-
     @register_kernel(
         "attention",
         "mla_prefill",
@@ -640,7 +631,7 @@ if current_platform().is_amd:
         # Preferred over gluon_mla_prefill_gfx950 wherever both apply.
         priority=Priority.SPECIALIZED + 1,
         traits={
-            "qkv_problem_filter": frozenset({_is_8wave_mla_prefill_problem}),
+            "avg_kv_len_min": frozenset({1024}),
             "head_dim": frozenset({192}),
             "value_head_dim": frozenset({128}),
             "is_causal": frozenset({False, True}),

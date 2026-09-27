@@ -51,10 +51,6 @@ def _attention_format_signature(**roles: torch.Tensor):
     )
 
 
-def _round_up_to_power_of_two(count: int) -> int:
-    return 1 << (count - 1).bit_length() if count > 1 else count
-
-
 def _mxfp8_attention_format_signature(**roles: torch.Tensor):
     return format_signature(
         **{
@@ -526,9 +522,7 @@ def mla_normalize_project_query(
 def mla_prefill_traits(
     *,
     batch_size: int,
-    total_q: int,
     total_kv: int,
-    num_q_heads: int,
     head_dim: int,
     value_head_dim: int,
     is_causal: bool,
@@ -543,9 +537,7 @@ def mla_prefill_traits(
 
     Args:
         batch_size: Number of sequences.
-        total_q: Query tokens summed over all sequences.
         total_kv: KV tokens summed over all sequences.
-        num_q_heads: Number of query heads.
         head_dim: Query/key head dimension.
         value_head_dim: Value head dimension.
         is_causal: Whether a causal mask is applied.
@@ -555,14 +547,11 @@ def mla_prefill_traits(
     Returns:
         Traits for select_kernel("attention", "mla_prefill", ...).
     """
+    # A downward power-of-two bucket preserves power-of-two minimum cutoffs
+    # exactly, including ragged/non-power-of-two batches, and bounds the cache.
+    avg_kv_len = total_kv // batch_size if batch_size > 0 else 0
     return {
-        # Problem size for kernels that declare a qkv_problem_filter. Token
-        # counts are rounded up to a power of two, which bounds the selection
-        # cache while the counts vary from batch to batch.
-        "batch_size": batch_size,
-        "total_q": _round_up_to_power_of_two(total_q),
-        "total_kv": _round_up_to_power_of_two(total_kv),
-        "num_q_heads": num_q_heads,
+        "avg_kv_len": 1 << (avg_kv_len.bit_length() - 1) if avg_kv_len else 0,
         "head_dim": head_dim,
         "value_head_dim": value_head_dim,
         "is_causal": is_causal,
@@ -635,9 +624,7 @@ def mla_prefill(
     batch_size = cu_seqlens_q.shape[0] - 1
     traits = mla_prefill_traits(
         batch_size=batch_size,
-        total_q=q.shape[0],
         total_kv=k.shape[0],
-        num_q_heads=q.shape[1],
         head_dim=q.shape[-1],
         value_head_dim=v.shape[-1],
         is_causal=is_causal,
