@@ -690,3 +690,25 @@ def test_superseded_draft_profile_default_is_reported(caplog) -> None:
         )
     assert args.drafter_attention_backend == "target_choice"
     assert "superseded" in caplog.text
+
+
+def test_plugin_algorithm_without_a_draft_checkpoint_is_refused() -> None:
+    from tokenspeed.runtime.execution import drafter
+
+    registry.register_drafter(
+        "FIXTURE_SPEC", _FixtureDrafter, defaults_to_base_checkpoint=True
+    )
+    try:
+        args = SimpleNamespace(
+            speculative_algorithm="FIXTURE_SPEC", speculative_draft_model_path=None
+        )
+        with pytest.raises(ValueError, match="--draft-model-path-use-base"):
+            drafter.require_plugin_draft_checkpoint(args)
+        args.speculative_draft_model_path = "/ckpt"
+        drafter.require_plugin_draft_checkpoint(args)
+        # In-tree algorithms keep server-args resolution's own defaulting.
+        drafter.require_plugin_draft_checkpoint(
+            SimpleNamespace(speculative_algorithm="EAGLE3")
+        )
+    finally:
+        drafter._PLUGIN_DRAFTERS.pop("FIXTURE_SPEC", None)

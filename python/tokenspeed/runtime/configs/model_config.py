@@ -462,10 +462,12 @@ class ModelConfig:
             # Post-discovery replacement for the CLI choices= this flag no
             # longer carries: plugins may have added algorithms.
             from tokenspeed.runtime.execution.drafter import (
+                require_plugin_draft_checkpoint,
                 validate_drafter_algorithm,
             )
 
             validate_drafter_algorithm(server_args.speculative_algorithm)
+            require_plugin_draft_checkpoint(server_args)
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
