@@ -140,12 +140,17 @@ env:
     # Kimi K3 BF16 GEMMs: the M=16 add3 fusion in both its Gluon and Triton
     # forms, the dense-M16 TDM kernel through the routed decode GEMV (M=17
     # masks a tail chunk), and the large-M kernel through the o_proj shape.
-    # The QKV-gate and QKVFAB projections reuse the dense-M16 kernel and
-    # the 512-token latent projection reuses the large-M kernel at several
-    # times the cost, so those stay on AMD hardware.
+    # The QKV-gate projection reuses the dense-M16 kernel; the 512-token
+    # latent projection reuses the large-M kernel at several times the cost,
+    # so those stay on AMD hardware.
     tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_m16_add3_auto_matches_composed_and_captures
     tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_gfx1250_large_m_linear_o_proj_shape_matches
     tokenspeed-kernel/test/ops/gemm/test_routed_gemv.py::test_cdna5_route_admits_decode_shapes[7168-1536-17]
+    # Warmed AttnRes launch variants, dense split-K reduction, short TDM
+    # tails, and seven-buffer QKVFAB.
+    tokenspeed-kernel/test/amd/ops/test_kimi3_prefill_gluon_amd.py::test_attn_res_warmed_launch_variants_reuse_compilation
+    tokenspeed-kernel/test/amd/ops/test_dense_bf16_gfx1250.py
+    tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_kda_qkvfab_tdm_auto_matches_and_captures[2]
     # Kimi K3 MoE front end: the latent-input decode pipeline at reduced
     # scale, prefill sigmoid-bias routing with and without weight
     # normalization, and the fused softmax top-k.

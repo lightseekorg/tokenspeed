@@ -497,9 +497,15 @@ def mla_normalize_project_query(
                 )
                 is None
             ):
-                from tokenspeed_kernel.ops.gemm import mm
+                from tokenspeed_kernel.ops.gemm.routed_gemv import decode_gemv_routed
+                from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
 
-                mm(query_norm, projection_weight, out=projection_out)
+                if decode_gemv_routed(query_norm, projection_weight):
+                    decode_gemv(query_norm, projection_weight, out=projection_out)
+                else:
+                    from tokenspeed_kernel.ops.gemm import mm
+
+                    mm(query_norm, projection_weight, out=projection_out)
         else:
             from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
 

@@ -198,7 +198,8 @@ def kimi3_sigmoid_bias_topk(
 #: NVIDIA measured on GB200, cold L2: ahead to 256 rows, tying at 320.
 #: CDNA5 measured on MI455X: 1.54x from two rows, still ahead at 512 and
 #: behind by 1024. One row stays with the decode specialist, and the
-#: gfx1250 Gluon kernel starts at 513, so these ranges do not overlap.
+#: gfx1250 Gluon remains available on these rows for explicit selection;
+#: the packed registration wins automatic selection by priority.
 #: CDNA4 one-token K3 stays on the decode specialist: on MI355X that kernel
 #: is ahead of packed, and it already covers this shape.
 _PACKED_ROWS_NVIDIA = range(1, 257)
@@ -331,7 +332,7 @@ def triton_kimi3_packed_sigmoid_bias_topk_nvidia_mapped(
         vendors=frozenset({"amd"}),
     ),
     signatures=_PACKED_SIGNATURES,
-    priority=Priority.SPECIALIZED,
+    priority=Priority.SPECIALIZED + 1,
     traits={**_PACKED_CONTRACT, "tokens": _PACKED_ROWS_CDNA5},
 )
 def triton_kimi3_packed_sigmoid_bias_topk_gfx1250(
