@@ -189,10 +189,20 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     # ---- Forward dispatch ----
 
+    def admits_prefill_graph(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode
+    ) -> bool:
+        return (
+            self.step_counter is None
+            and self.linear_attn_backend.admits_prefill_graph(
+                token_capacity, bs, forward_mode
+            )
+        )
+
     def prepare_prefill_metadata(
         self, token_capacity: int, bs: int, forward_mode: ForwardMode, *, capture: bool
     ) -> bool:
-        if self.step_counter is not None:
+        if not self.admits_prefill_graph(token_capacity, bs, forward_mode):
             return False
         return self.linear_attn_backend.prepare_prefill_metadata(
             token_capacity, bs, forward_mode, capture=capture

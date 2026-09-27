@@ -95,6 +95,11 @@ change.
 * Keep PR titles, descriptions, commit messages, diffs, comments, logs, and
   artifacts limited to public information. Never include private repository
   names or links, private dates, or any other private or internal information.
+* When opening a pull request, if you have write access to this repository,
+  push the head branch to this repository rather than to a fork. Only
+  same-repository branches receive repository secrets such as `HF_TOKEN`
+  (higher Hugging Face rate limits), get the automated Claude code review, and
+  run CI jobs that skip fork pull requests.
 
 ## Dependency boundaries
 
@@ -167,6 +172,18 @@ Inside the root `tokenspeed-kernel/` directory:
   Tests for common infra and covering multi-vendors reside under `test/`
   directly.
 * Use tight atol/rtol in correctness comparison tests.
+* Compile-time kernel parameters (`tl.constexpr`, Gluon `gl.constexpr`,
+  `cutlass.Constexpr`) are part of the JIT cache key: every new value compiles
+  a new binary on the forward thread and stalls serving for 100+ ms. Make a
+  parameter compile-time only when its value set is small and fixed once the
+  server starts: model dimensions, block sizes, feature flags, pool geometry.
+  Values that vary per batch or request (token, request, or row counts,
+  `shape[0]`, `numel()`, sequence lengths, block-table widths) must be runtime
+  arguments, or be bucketed first (e.g. `next_power_of_2`) when the kernel
+  needs a compile-time bound. Reviews must check every new or changed kernel
+  signature and launch site for this. Kernels launched with batch-varying
+  shapes need a test that warms the kernel, then sweeps those shapes inside
+  `assert_no_triton_compile` from `test/utils.py`.
 
 ## tokenspeed-kernel-amd
 
@@ -176,6 +193,8 @@ Inside the root `tokenspeed-kernel-amd/` directory:
 * Add jit `launch_metadata` for Proton use along the Triton/Gluon kernels.
 * AMD Gluon Kernel tests should live in `tokenspeed-kernel/test/amd/` to reuse
   common platform utilities and reference computations.
+* The compile-time parameter rule in the `tokenspeed-kernel` section applies
+  to these kernels too.
 * For per kernel contract and algorithm details, put in
   `python/tokenspeed_kernel_amd/ops/README.md`.
 * For Triton/Gluon kernels, one name should thread the whole stack: the

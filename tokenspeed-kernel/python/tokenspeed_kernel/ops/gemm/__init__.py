@@ -591,19 +591,10 @@ def _gemm_format_signature(
             raise ValueError("mxfp8 format selection requires block_size")
         if B_scales is None:
             raise ValueError("mxfp8 format selection requires B_scales")
-        # Kernel selection precedes online activation quantization, so the
-        # signature must predict the scale storage produced afterward. Most
-        # paths emit FP32 scales; on CDNA5, canonical (1, 32) uint8 weight
-        # scales identify the UE8M0 contract, whose matching activation
-        # quantizer also emits uint8 UE8M0 scales.
-        online_scale_dtype = torch.float32
-        if (
-            A_scales is None
-            and tuple(block_size) == (1, 32)
-            and B_scales.dtype == torch.uint8
-            and _platform.is_cdna5
-        ):
-            online_scale_dtype = torch.uint8
+        # Match the scale encoding used by online activation quantization.
+        online_scale_dtype = (
+            torch.uint8 if B_scales.dtype == torch.uint8 else torch.float32
+        )
         a_scale = ScaleFormat(
             storage_dtype=(
                 A_scales.dtype if A_scales is not None else online_scale_dtype

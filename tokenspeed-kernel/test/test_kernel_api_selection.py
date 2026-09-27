@@ -78,7 +78,6 @@ import tokenspeed_kernel.ops.attention.rmha.gluon as _attention_gluon_rmha
 import tokenspeed_kernel.ops.attention.triton as _attention_triton_merge_state
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
 import tokenspeed_kernel.ops.gemm.cuda as _gemm_cuda
-import tokenspeed_kernel.ops.gemm.deep_gemm as _gemm_deep_gemm
 import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.gluon as _gemm_gluon
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
@@ -193,7 +192,6 @@ _RELOAD_MODULES = [
     # GEMM registration modules.
     _gemm_reference,
     _gemm_cuda,
-    _gemm_deep_gemm,
     _gemm_flashinfer,
     _gemm_gluon,
     _gemm_triton,
@@ -496,10 +494,10 @@ def _dsv4_linear_fp32() -> torch.Tensor:
     return tokenspeed_kernel.dsv4_linear_fp32(hidden_states, weight)
 
 
-def _mm_mxfp8() -> torch.Tensor:
-    a = torch.empty((4, 128), dtype=_fp8_dtype())
+def _mm_mxfp8(m: int) -> torch.Tensor:
+    a = torch.empty((m, 128), dtype=_fp8_dtype())
     b = torch.empty((128, 128), dtype=_fp8_dtype())
-    a_scales = torch.empty((4, 1), dtype=torch.float32)
+    a_scales = torch.empty((m, 1), dtype=torch.float32)
     b_scales = torch.empty((1, 1), dtype=torch.float32)
     return tokenspeed_kernel.mm(
         a,
@@ -510,6 +508,24 @@ def _mm_mxfp8() -> torch.Tensor:
         block_size=[128, 128],
         quant="mxfp8",
     )
+
+
+@pytest.mark.parametrize("scale_dtype", [torch.float32, torch.uint8])
+@pytest.mark.parametrize("batched", [False, True])
+def test_mxfp8_online_scale_signature_matches_weight_encoding(
+    scale_dtype: torch.dtype, batched: bool
+) -> None:
+    batch = (2,) if batched else ()
+    signature = _gemm_pkg._gemm_format_signature(
+        torch.empty((*batch, 4, 128), dtype=torch.bfloat16),
+        torch.empty((*batch, 128, 128), dtype=_fp8_dtype()),
+        None,
+        torch.empty((*batch, 128, 4), dtype=scale_dtype),
+        torch.bfloat16,
+        "mxfp8",
+        [1, 32],
+    )
+    assert signature.format_for("a").scale.storage_dtype == scale_dtype
 
 
 def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None:
@@ -4319,6 +4335,22 @@ def _case(
 
 
 _CASES = [
+    *[
+        _case(
+            _is_blackwell_sm100,
+            "blackwell-sm100",
+            "gemm",
+            "mm",
+            (
+                "triton_mm_fp8_blockscale"
+                if 17 <= m <= 32
+                else "flashinfer_mm_fp8_blockscale"
+            ),
+            partial(_mm_mxfp8, m),
+            id_suffix=f"fp8-rows-{m}",
+        )
+        for m in (16, 17, 24, 32, 33)
+    ],
     # Attention API x architecture golden cases.
     _case(
         _is_cdna4,
@@ -5239,7 +5271,7 @@ _CASES = [
         "gemm",
         "mm",
         "triton_mm_fp8_blockscale",
-        _mm_mxfp8,
+        lambda: _mm_mxfp8(4),
     ),
     _case(
         _is_blackwell_sm100,
@@ -5247,7 +5279,7 @@ _CASES = [
         "gemm",
         "mm",
         "flashinfer_mm_fp8_blockscale",
-        _mm_mxfp8,
+        lambda: _mm_mxfp8(4),
     ),
     _case(
         _is_blackwell_plus,
@@ -5281,7 +5313,7 @@ _CASES = [
         "gemm",
         "mm",
         "triton_mm_fp8_blockscale",
-        _mm_mxfp8,
+        lambda: _mm_mxfp8(4),
     ),
     _case(
         _is_hopper_plus,

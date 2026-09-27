@@ -89,6 +89,14 @@ def configure_draft_target(
     """
     draft_model = draft_model_runner.model
     DrafterImpl = get_drafter_impl(server_args.speculative_algorithm, draft_model)
+    if (
+        draft_model_runner.model_config.requires_request_token_history
+        and not DrafterImpl.supports_request_token_history
+    ):
+        raise NotImplementedError(
+            f"draft model requires request-token history, but drafter "
+            f"{DrafterImpl.__name__} does not thread it through its forwards"
+        )
     if server_args.speculative_algorithm in ("DFLASH", "DSPARK"):
         if not isinstance(draft_model, TargetCaptureConfigurator):
             raise TypeError(

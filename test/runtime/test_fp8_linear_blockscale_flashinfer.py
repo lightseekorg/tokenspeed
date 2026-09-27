@@ -64,3 +64,30 @@ def test_process_weights_preserves_canonical_scales(
     ).repeat_interleave(128, dim=1)
     reference = x.float() @ dequant.t()
     torch.testing.assert_close(prepared.float(), reference, atol=2e-1, rtol=5e-2)
+
+
+@pytest.mark.parametrize("m", [1, 65, 129])
+def test_cutedsl_warmup_covers_capture_tiles(m: int, monkeypatch) -> None:
+    from tokenspeed_kernel.thirdparty import trtllm_blockwise
+
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "trtllm_cutedsl")
+    layer = _make_layer(256, 512)
+    method = _method()
+    method.process_weights_after_loading(layer)
+    warmup = torch.randn(1, 512, device="cuda", dtype=torch.bfloat16)
+    method.apply(layer, warmup)
+    torch.cuda.synchronize()
+
+    def unexpected_compile(*args, **kwargs):
+        pytest.fail("CuTe-DSL compiled after eager warmup")
+
+    monkeypatch.setattr(trtllm_blockwise, "_compile", unexpected_compile)
+    x = torch.randn(m, 512, device="cuda", dtype=torch.bfloat16)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = method.apply(layer, x)
+    x.normal_()
+    graph.replay()
+    expected = method.apply(layer, x)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)

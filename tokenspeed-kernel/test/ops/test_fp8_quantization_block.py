@@ -27,13 +27,16 @@ def _dequantize(
         (6144, 2048, (128, 128)),
         # Dimensions that are not a multiple of the block shape.
         (130, 300, (128, 128)),
+        (130, 300, (96, 128)),
+        (65, 160, (32, 64)),
     ],
 )
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_fp8_block_quantization_roundtrip(
-    device: str, n: int, k: int, block_size: tuple[int, int]
+    device: str, n: int, k: int, block_size: tuple[int, int], dtype: torch.dtype
 ) -> None:
     torch.manual_seed(0)
-    x = torch.randn(n, k, device=device, dtype=torch.bfloat16) * 0.05
+    x = torch.randn(n, k, device=device, dtype=dtype) * 0.05
 
     q, scales = quantize_fp8(x, granularity="block", block_size=block_size)
 
@@ -99,3 +102,21 @@ def test_fp8_block_quantization_feeds_block_scaled_gemm(device: str) -> None:
 
     reference = a.float() @ _dequantize(q_weight, weight_scales, block_size).t()
     torch.testing.assert_close(out.float(), reference, atol=0.05, rtol=0.05)
+
+
+def test_fp8_block_quantization_reuses_compilation(device: str) -> None:
+    from tokenspeed_kernel.ops.quantization.triton import _fp8_block_quantize_kernel
+    from utils import assert_no_triton_compile
+
+    def run(rows: int) -> None:
+        quantize_fp8(
+            torch.zeros((rows, 256), device=device, dtype=torch.bfloat16),
+            granularity="block",
+            block_size=(128, 128),
+        )
+
+    for rows in (1, 16, 17):
+        run(rows)
+    with assert_no_triton_compile(_fp8_block_quantize_kernel):
+        for rows in (2, 3, 31, 32, 33, 64, 65, 127, 128, 129):
+            run(rows)

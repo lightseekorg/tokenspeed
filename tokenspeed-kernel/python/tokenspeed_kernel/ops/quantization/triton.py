@@ -435,23 +435,28 @@ def triton_quantize_fp8(
     name="triton_quantize_fp8_block",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
-    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    signatures=format_signatures(
+        "x", "dense", {torch.bfloat16, torch.float16, torch.float32}
+    ),
     traits={
-        "granularity": frozenset({"block_128_128"}),
+        "granularity": frozenset({"block"}),
         "scale_encoding": frozenset({"float32"}),
     },
     priority=Priority.PORTABLE,
 )
 def triton_quantize_fp8_block(
     x: torch.Tensor,
-    granularity: str = "block",
-    group_size: int | None = None,
-    block_size: tuple[int, int] = (128, 128),
-    scale_encoding: str = "float32",
-    enable_pdl: bool = False,
+    *,
+    granularity: str,
+    group_size: int | None,
+    block_size: tuple[int, int],
+    scale_encoding: str,
+    enable_pdl: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if granularity != "block" or block_size != (128, 128):
-        raise ValueError("block FP8 quantization supports only block_size=(128, 128)")
+    if granularity != "block":
+        raise ValueError("block FP8 quantization requires block granularity")
+    if enable_pdl:
+        raise ValueError("block FP8 quantization does not support enable_pdl=True")
     if scale_encoding != "float32":
         raise ValueError("block FP8 quantization requires float32 scales")
     return _fp8_block_quantize(x, block_size)

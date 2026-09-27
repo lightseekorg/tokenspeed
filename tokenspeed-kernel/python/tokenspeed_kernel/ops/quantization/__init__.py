@@ -122,8 +122,29 @@ def quantize_fp8(
     granularities compute canonical scales from the input. With dequantize=True,
     the FP8 values are immediately reconstructed in the input dtype and the
     returned scale is None.
+
+    Args:
+        x: Input tensor; block granularity requires two dimensions.
+        scale: Optional static scalar scale. Omission means a plain FP8 cast
+            when granularity is None.
+        granularity: Dynamic token, token-group, or two-dimensional block scaling.
+        group_size: Values per token group; required for token_group.
+        block_size: Positive block dimensions; required for block granularity.
+        scale_encoding: Storage encoding of dynamic scales.
+        dequantize: Reconstruct the input dtype after UE8M0 group quantization.
+        enable_pdl: Request Programmatic Dependent Launch where supported.
+            Round trips and block quantization reject this option.
+        override: Optional exact registered kernel override.
+        solution: Optional restriction to a registered backend family.
+
+    Returns:
+        Quantized values and canonical scales, or reconstructed values and
+        None for a round trip. Static tensor scales retain their identity;
+        Python scalar scales are returned as a one-element FP32 tensor.
     """
     if dequantize:
+        if enable_pdl:
+            raise ValueError("FP8 dequantization does not support enable_pdl=True")
         if scale is not None:
             raise ValueError("FP8 dequantization does not accept a static scale")
         if granularity != "token_group" or group_size is None:
@@ -177,7 +198,7 @@ def quantize_fp8(
         return values, None
     if isinstance(scale, torch.Tensor):
         return values, scale
-    return values, torch.tensor([scale], dtype=torch.float32, device=x.device)
+    return values, torch.full((1,), scale, dtype=torch.float32, device=x.device)
 
 
 def _quantize_fp8_dynamic(
@@ -234,7 +255,7 @@ def _quantize_fp8_dynamic(
     elif granularity == "block":
         if block_size is None or len(block_size) != 2 or min(block_size) <= 0:
             raise ValueError("block granularity requires a positive 2-D block_size")
-        granularity_trait = f"block_{int(block_size[0])}_{int(block_size[1])}"
+        granularity_trait = "block"
     else:
         granularity_trait = granularity
     traits = {

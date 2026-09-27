@@ -108,8 +108,7 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
         progress.prefix_hashes.insert(progress.prefix_hashes.end(), std::make_move_iterator(new_hashes.begin()),
                                       std::make_move_iterator(new_hashes.end()));
 
-        std::vector<CacheKey> event_keys =
-            registerKvEventPrefixPages(request, progress.prefix_hashes, first_new_prefix_page);
+        registerKvEventPrefixPages(request, progress.prefix_hashes, first_new_prefix_page);
         coordinator_.CacheCompletedBlocks(
             request.BlockTablesRef(),
             RequestProgress{
@@ -124,7 +123,6 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
                 .num_computed_tokens = request.TokenSize() - 1,
             },
             progress.access_epoch);
-        discardUncachedKvEventPages(event_keys);
     }
     if (!config_.StreamsDeviceCacheToHost()) {
         return std::nullopt;

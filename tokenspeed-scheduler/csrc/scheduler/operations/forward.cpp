@@ -282,12 +282,9 @@ bool Scheduler::admitWithKvEventTracking(ExecutionPlan& plan, AdmissionFeedback&
     const std::int32_t first_new_prefix_page = progress.completed_pages
                                                    ? progress.completed_pages->first_new_prefix_page
                                                    : static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
-    std::vector<CacheKey> event_keys =
-        registerKvEventPrefixPages(request, cache_progress.prefix_hashes, first_new_prefix_page);
-    const bool admitted =
-        admit(plan, feedback, coordinator_.ProbePrefix({}), demands, progress, cache_progress.access_epoch).has_value();
-    discardUncachedKvEventPages(event_keys);
-    return admitted;
+    registerKvEventPrefixPages(request, cache_progress.prefix_hashes, first_new_prefix_page);
+    return admit(plan, feedback, coordinator_.ProbePrefix({}), demands, progress, cache_progress.access_epoch)
+        .has_value();
 }
 
 std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFirstChunk(
@@ -303,7 +300,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
                                           : fsm::PrefillSource::kLocal;
     const std::int32_t prefix_granularity = coordinator_.PrefixGranularity();
     std::int32_t host_prefix_cap = match.probe.host.num_common_tokens;
-    std::vector<CacheKey> event_keys = registerKvEventPrefixPages(*request, match.candidate_prefix_hashes, 0);
+    registerKvEventPrefixPages(*request, match.candidate_prefix_hashes, 0);
 
     std::optional<CacheCoordinator::AdmissionResult> admission;
     std::vector<BlockTable> tables;
@@ -352,7 +349,6 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         tokens_this_round = PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true, unscheduled, remaining,
                                                promotion_boundary_tokens);
         if (tokens_this_round == 0) {
-            discardUncachedKvEventPages(event_keys);
             return std::nullopt;
         }
         const std::int32_t after_tokens = hit_tokens + tokens_this_round;
@@ -411,7 +407,6 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
                                        /*request_access_epoch=*/std::nullopt);
         if (!admission) {
             feedback.admission_failed = true;
-            discardUncachedKvEventPages(event_keys);
             return std::nullopt;
         }
         _assert(admission->host_prefix_tokens % prefix_granularity == 0,
@@ -458,7 +453,6 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
                                          CacheBoundaryKind::kChunk);
         }
     }
-    discardUncachedKvEventPages(event_keys);
     fsm::CacheProgress cache_progress{
         .prefix_hashes = std::move(match.prefix_hashes),
         .access_epoch = admission->access_epoch,

@@ -60,6 +60,18 @@ def _dequantize_mxfp4(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
     return out * scale_values.repeat_interleave(32, dim=-1)
 
 
+def test_fp8_roundtrip_rejects_pdl() -> None:
+    with pytest.raises(ValueError, match="does not support enable_pdl"):
+        quantize_fp8(
+            torch.empty((2, 128), dtype=torch.bfloat16),
+            granularity="token_group",
+            group_size=128,
+            scale_encoding="ue8m0",
+            dequantize=True,
+            enable_pdl=True,
+        )
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("group_size", [64, 128])
 def test_quantize_fp8_ue8m0(
@@ -269,6 +281,14 @@ def test_quantize_fp8_scale_float(
     assert returned_scale.item() == scale
     assert _bitwise_equal(out, ref)
 
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured, captured_scale = quantize_fp8(x, scale=scale, solution=solution)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert captured_scale.item() == scale
+    assert _bitwise_equal(captured, ref)
+
 
 @pytest.mark.parametrize("solution", ["triton"])
 def test_quantize_fp8_scale_tensor(
@@ -348,14 +368,27 @@ def test_quantize_fp8_dynamic_token(
     assert out.dtype == _FP8_DTYPE
     assert scale.dtype == torch.float32
     assert scale.shape == (x.shape[0], 1)
+    expected_scales = x.float().abs().amax(-1, keepdim=True) / _FP8_FINFO.max
+    # TRT-LLM stores its native scales in the input dtype before the adapter
+    # promotes them to FP32. Either representation is valid for auto dispatch.
+    rounded_scales = expected_scales.to(dtype).float()
+    if solution == "trtllm" or (
+        solution is None and torch.equal(scale, rounded_scales)
+    ):
+        expected_scales = rounded_scales
+    torch.testing.assert_close(scale, expected_scales)
+    reconstructed = out.float() * scale
+    assert torch.norm(reconstructed - x.float()) / torch.norm(x.float()) < 0.04
 
 
 @pytest.mark.parametrize(
     "solution,group_size",
     [(None, 128), (None, 32), ("trtllm", 128), ("triton", 128), ("triton", 32)],
 )
+@pytest.mark.parametrize("rows", [1, 13, 16, 17])
 def test_quantize_fp8_dynamic_token_group(
     device: str,
+    rows: int,
     solution: str | None,
     group_size: int,
     require,
@@ -364,7 +397,7 @@ def test_quantize_fp8_dynamic_token_group(
     dtype = torch.bfloat16
     require("quantization", "fp8_with_scale", solution, dtype, "x")
 
-    x = torch.randn(16, 256, device=device, dtype=dtype) * 10
+    x = torch.randn(rows, 256, device=device, dtype=dtype) * 10
     out, scale = quantize_fp8(
         x,
         granularity="token_group",

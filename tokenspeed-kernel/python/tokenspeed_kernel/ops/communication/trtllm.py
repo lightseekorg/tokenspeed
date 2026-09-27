@@ -32,7 +32,7 @@ from tokenspeed_kernel.signature import format_signatures
 logger = logging.getLogger(__name__)
 
 
-def create_per_token_group_quant_fp8_output_scale(
+def _create_per_token_group_quant_fp8_output_scale(
     x_shape,
     device,
     group_size: int,
@@ -828,7 +828,7 @@ if current_platform().is_nvidia:
                 device=input_tensor.device,
             )
             out_shape = (*quant_out.shape[:-1], quant_out.shape[-1])
-            scale_out = create_per_token_group_quant_fp8_output_scale(
+            scale_out = _create_per_token_group_quant_fp8_output_scale(
                 x_shape=out_shape,
                 device=quant_out.device,
                 group_size=128,
@@ -1160,7 +1160,7 @@ if current_platform().is_nvidia:
                 device=input_tensor.device,
             )
             out_shape = (*quant_out.shape[:-1], quant_out.shape[-1])
-            scale_out = create_per_token_group_quant_fp8_output_scale(
+            scale_out = _create_per_token_group_quant_fp8_output_scale(
                 x_shape=out_shape,
                 device=quant_out.device,
                 group_size=128,
@@ -1287,7 +1287,7 @@ if current_platform().is_nvidia:
                 device=qkv.device,
             )
             out_shape = (*quant_out.shape[:-1], quant_out.shape[-1])
-            scale_out = create_per_token_group_quant_fp8_output_scale(
+            scale_out = _create_per_token_group_quant_fp8_output_scale(
                 x_shape=out_shape,
                 device=quant_out.device,
                 group_size=block_size,

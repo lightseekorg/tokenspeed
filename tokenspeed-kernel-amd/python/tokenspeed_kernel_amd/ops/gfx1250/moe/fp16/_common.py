@@ -18,15 +18,26 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+"""Shared checks for the gfx1250 latent-MoE input projections."""
+
 from __future__ import annotations
 
-from tokenspeed_kernel.platform import current_platform, prepare_cuda_toolkit_env
 
-platform = current_platform()
+def _is_packed_projection_view(packed, router, routed, shared) -> bool:
+    """Whether ``packed`` is exactly the three weights as consecutive rows.
 
-if platform.is_hopper_plus:
-    prepare_cuda_toolkit_env()
-    from deep_gemm import ceil_to_ue8m0, transform_sf_into_required_layout
-else:
-    ceil_to_ue8m0 = None
-    transform_sf_into_required_layout = None
+    The kernels read only ``packed``, so weights that do not live inside it
+    would be silently ignored. Checked here rather than through
+    ``tokenspeed_kernel``: this package must not depend on it.
+    """
+    parts = (router, routed, shared)
+    storage = packed.untyped_storage()
+    if any(part.untyped_storage().data_ptr() != storage.data_ptr() for part in parts):
+        return False
+    address = packed.data_ptr()
+    row_bytes = packed.shape[1] * packed.element_size()
+    for part in parts:
+        if part.data_ptr() != address:
+            return False
+        address += part.shape[0] * row_bytes
+    return address == packed.data_ptr() + packed.shape[0] * row_bytes
