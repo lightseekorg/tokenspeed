@@ -592,6 +592,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_moe = True
         elif config.model_type == "qwen3_5_text":
             self.mlp = Qwen3_5MoeMLP(
+                parallelism="dense",
                 mapping=self.mapping,
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -773,6 +774,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         # Dense MLP for non-MoE variant
         if config.model_type == "qwen3_5_text":
             self.mlp = Qwen3_5MoeMLP(
+                parallelism="dense",
                 mapping=self.mapping,
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -1140,7 +1142,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name not in params_dict:
-                    logger.warning("Parameter %s not found in params_dict", name)
+                    logger.warning(f"Parameter {name!s} not found in params_dict")
                     continue
                 param = params_dict[name]
 
@@ -1264,7 +1266,7 @@ class Qwen3_5MoeModel(Qwen3_5ForCausalLM):
                     )
                     weight_loader(param, loaded_weight)
                 else:
-                    logger.warning("Parameter %s not found in params_dict", name)
+                    logger.warning(f"Parameter {name!s} not found in params_dict")
             loaded_params.add(name)
 
         return loaded_params
@@ -1564,7 +1566,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             # embed) weight up front, before any rename or params_dict lookup,
             # so none is routed into a None module. self.model is None here, so
             # named_parameters() exposes only visual params.
-            if getattr(self, "encoder_only", False) and "visual" not in name:
+            if self.encoder_only and "visual" not in name:
                 continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
@@ -1601,7 +1603,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
                 if name not in params_dict:
                     if _is_ignored_checkpoint_param(self, name):
                         continue
-                    logger.warning("Parameter %s not found in params_dict", name)
+                    logger.warning(f"Parameter {name!s} not found in params_dict")
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -1690,7 +1692,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             # lookup, or moe_loader.load (which would KeyError on a missing
             # expert param). self.model is None here, so named_parameters()
             # exposes only visual params.
-            if getattr(self, "encoder_only", False) and "visual" not in name:
+            if self.encoder_only and "visual" not in name:
                 continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
@@ -1739,7 +1741,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                     )
                     weight_loader(param, loaded_weight)
                 else:
-                    logger.warning("Parameter %s not found in params_dict", name)
+                    logger.warning(f"Parameter {name!s} not found in params_dict")
             loaded_params.add(name)
 
         return loaded_params
@@ -1811,6 +1813,8 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
 ):
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        # Release successor setup; its wait still guards all dependent reads.
+        tl.extra.cuda.gdc_launch_dependents()
     row, tile = tl.program_id(0), tl.program_id(1)
     TOTAL_V: tl.constexpr = NUM_HEADS_V * HEAD_V
     QKV_DIM: tl.constexpr = 2 * NUM_HEADS_QK * HEAD_QK + TOTAL_V
@@ -1844,8 +1848,6 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
         )
         tl.store(b + row * NUM_HEADS_V + heads, b_values, mask)
         tl.store(a + row * NUM_HEADS_V + heads, a_values, mask)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def fused_qkvzba_split_reshape_cat_contiguous(

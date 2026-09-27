@@ -62,11 +62,6 @@ if platform.is_hopper_plus:
         set_pdl,
         transform_sf_into_required_layout,
     )
-    from tokenspeed_kernel.ops._deep_gemm.mega_moe_bf16 import (
-        prepare_mega_moe_bf16_jit,
-    )
-
-    prepare_mega_moe_bf16_jit()
 else:
     ceil_to_ue8m0 = None
     transform_sf_into_required_layout = None
@@ -123,7 +118,7 @@ def _warmup_fp8_gemm_nt(
 
         del a, a_scales, b, b_scales, out
 
-    logger.info("Warmed up fp8_gemm_nt for %d weight shapes", len(seen))
+    logger.info(f"Warmed up fp8_gemm_nt for {len(seen):d} weight shapes")
     torch.cuda.synchronize()
 
 
@@ -132,8 +127,8 @@ def _warmup_deep_gemm_fp8_linears(plans: list[object], max_tokens: int) -> None:
         set_pdl(pdl_enabled())
     by_device: dict[torch.device, set[tuple[int, int]]] = {}
     for plan in plans:
-        warmup_key = getattr(plan, "warmup_key")
-        prepared_weight_scales = getattr(plan, "prepared_weight_scales")
+        warmup_key = plan.warmup_key
+        prepared_weight_scales = plan.prepared_weight_scales
         assert warmup_key is not None
         assert prepared_weight_scales is not None
         n, k = warmup_key
@@ -252,7 +247,6 @@ if platform.is_hopper_plus:
             "weight_scale_dtype": frozenset({torch.float32}),
         },
         priority=Priority.SPECIALIZED + 2,
-        tags={"throughput"},
         weight_preprocessor=_deep_gemm_dsv4_grouped_output_projection_weights,
     )
     def deep_gemm_dsv4_grouped_output_projection(
@@ -321,14 +315,13 @@ if platform.is_hopper_plus:
         ),
         signatures=_MXFP8_FORMAT_SIGNATURES,
         traits={
-            "n_align_64": frozenset({True}),
-            "k_align_128": frozenset({True}),
+            "n_align": frozenset({64}),
+            "k_align": frozenset({128}),
             # On Blackwell, the installed 1d1d kernel consumes transformed
             # UE8M0 scales and is reached through an explicit runtime override.
             "block_scale_layout": frozenset({"canonical"}),
         },
         priority=Priority.SPECIALIZED + 2,
-        tags={"throughput"},
     )
     def deep_gemm_mm_fp8_blockscale(
         A: torch.Tensor,

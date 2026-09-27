@@ -515,13 +515,9 @@ def build_control_server(
     _engine_grpc_addr = engine_grpc_addr
     _rl_control_url = rl_control_url
     logger.info(
-        "Starting TokenSpeed HTTP server on %s:%d "
-        "(gateway: %s, engine gRPC: %s, weight transfer: %s)",
-        host,
-        port,
-        gateway_url,
-        engine_grpc_addr,
-        rl_control_url or "disabled",
+        f"Starting TokenSpeed HTTP server on {host!s}:{port:d} "
+        f"(gateway: {gateway_url!s}, engine gRPC: {engine_grpc_addr!s}, weight "
+        f"transfer: {rl_control_url or 'disabled'!s})",
     )
     return uvicorn.Server(
         uvicorn.Config(app, host=host, port=port, log_level="warning")

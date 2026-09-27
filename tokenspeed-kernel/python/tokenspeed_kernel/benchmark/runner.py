@@ -34,6 +34,7 @@ from tokenspeed_kernel.numerics.comparison import compare_outputs
 from tokenspeed_kernel.numerics.inputs import (
     get_benchmark_shapes,
     get_input_generator,
+    shape_traits,
 )
 from tokenspeed_kernel.numerics.tolerance import get_family_tolerance
 from tokenspeed_kernel.platform import current_platform
@@ -137,7 +138,7 @@ class BenchmarkRunner:
         dtype: torch.dtype,
         dtype_role: str | Iterable[str],
     ) -> BenchmarkResult | None:
-        if not spec_matches_shape_traits(spec, shape):
+        if not spec_matches_shape_traits(spec, shape_traits(shape)):
             return None
 
         signature = spec.format_signature_for_storage_dtype(dtype, dtype_role)
@@ -254,7 +255,7 @@ class BenchmarkRunner:
                 break
         if ref_spec is None:
             return None, None, None
-        if not spec_matches_shape_traits(ref_spec, shape):
+        if not spec_matches_shape_traits(ref_spec, shape_traits(shape)):
             return None, None, None
 
         ref_kernel = registry.get_impl(ref_spec.name)

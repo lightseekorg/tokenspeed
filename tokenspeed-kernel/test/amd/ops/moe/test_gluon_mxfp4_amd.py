@@ -716,9 +716,10 @@ def test_gfx1250_ragged_matmul_forwards_fused_activation(
     "decode,num_tokens,block_m",
     [
         pytest.param(False, 4, None, id="prefill-default"),
+        pytest.param(True, 1, 16, id="decode-small-m-wmma-layout"),
         *[
             pytest.param(True, num_tokens, None, id=f"decode-m{num_tokens}-adaptive")
-            for num_tokens in (1, 2, 4, 8, 16)
+            for num_tokens in (2, 4, 8, 16)
         ],
         pytest.param(True, 4, 128, id="decode-explicit-bm128"),
     ],
@@ -808,3 +809,108 @@ def test_static_fp8_activation_moe_gfx1250(
     assert actual.shape == hidden_states.shape
     assert torch.count_nonzero(expected).item() > 0
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+def _gfx1250_first_expert_matmul(
+    module, hidden_states, topk_ids, topk_weights, num_experts, **overrides
+):
+    """Run the gfx1250 MoE's first expert matmul on its own."""
+    ragged_metadata, gather_indx, _scatter, _gate = (
+        gfx1250_fused._precomputed_topk_route(
+            topk_weights.to(torch.float32).contiguous(),
+            topk_ids.to(torch.int32).contiguous(),
+            num_experts,
+        )
+    )
+    w13 = module.w13_weight_triton_tensor
+    x_fp8 = gfx1250_fused._quantize_fp8_activation(hidden_states, w13.act_scale)
+    fused_activation = gfx1250_fused.FusedActivation(
+        gfx1250_fused.FnSpecs("situ", None, ("beta", "linear_beta"), reduction_n=2),
+        (4.0, 25.0),
+    )
+    kwargs = dict(
+        w_mx_scale=module.w13_precision_config.b_mx_scale,
+        x_format="e4m3",
+        x_global_scale=w13.act_scale,
+        a_ragged_metadata=ragged_metadata,
+        gather_indx=gather_indx,
+        fused_activation=fused_activation,
+        scale_preshuffle=True,
+        block_n=256,
+        block_k=256,
+        num_warps=4,
+        num_buffers=3,
+        decode=False,
+        partial_tdm=False,
+    )
+    kwargs.update(overrides)
+    return gfx1250_fused.gluon_mxfp_ragged_matmul(x_fp8, w13, None, **kwargs)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8, 32])
+@pytest.mark.parametrize("scale_value", [1.0, 2.0])
+def test_gfx1250_epilogue_fp8_matches_fp32_result(
+    num_tokens: int, scale_value: float
+) -> None:
+    """Quantizing in the epilogue must not change the value being quantized.
+
+    The MoE feeds this matmul's output to a second one that consumes FP8 and
+    relies on the epilogue producing it. Both this and an fp32 output round
+    once from the same fp32 accumulator, so scaling and casting the fp32
+    result by hand has to reproduce the epilogue bit for bit.
+
+    The scale is what makes this worth asserting, so it is exercised away from
+    1.0 as well: at 1.0 the epilogue's divide is a no-op and a dropped scale
+    would pass unnoticed. It stays a power of two so exact equality is sound.
+    The kernel divides by multiplying with the reciprocal, and only for a
+    power of two is that reciprocal exact in fp32; otherwise the two forms
+    differ by an ulp that can flip an element sitting on an FP8 rounding
+    boundary.
+
+    The comparison deliberately uses fp32 rather than the bf16 output this
+    replaced: on this shape the kernel's 16-bit output path leaves every other
+    routed row zero, which fp32 and FP8 both agree is wrong.
+    """
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 MXFP4 MoE kernel")
+
+    generator = torch.Generator(device="cuda").manual_seed(20260922)
+    hidden_size, intermediate_size, num_experts, top_k = 128, 128, 4, 2
+    raw = make_mxfp4_moe_weights(num_experts, hidden_size, intermediate_size, generator)
+    module = _make_static_fp8_moe_module(
+        raw, preprocess_gluon_mxfp4_gfx1250_moe_weights
+    )
+    hidden_states = torch.randn(
+        num_tokens,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    topk_weights, topk_ids = make_round_robin_topk(num_tokens, num_experts, top_k)
+    scale = torch.full((1,), scale_value, dtype=torch.float32, device="cuda")
+
+    fused = _gfx1250_first_expert_matmul(
+        module,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        num_experts,
+        out_dtype=torch.float8_e4m3fn,
+        y_global_scale=scale,
+    )
+    as_fp32 = _gfx1250_first_expert_matmul(
+        module,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        num_experts,
+        out_dtype=torch.float32,
+    )
+    staged = (as_fp32 / scale.to(as_fp32.dtype)).to(torch.float8_e4m3fn)
+    torch.cuda.synchronize()
+
+    assert fused.dtype is torch.float8_e4m3fn
+    assert fused.shape == staged.shape
+    assert torch.count_nonzero(as_fp32).item() > 0
+    torch.testing.assert_close(fused.float(), staged.float(), rtol=0.0, atol=0.0)

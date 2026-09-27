@@ -583,30 +583,45 @@ def copy_state_rows(
 def _state_verify_commit_rows_kernel(
     accepted_ptr,
     pages_ptr,
+    group_indices_ptr,
     src_rows_ptr,
     dst_rows_ptr,
     batch_size,
     verify_width,
+    BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Emit one (source scratch row, destination page row) pair per request.
 
-    ``program_id(0)`` is the request and ``program_id(1)`` the layer, so the
-    outputs land layer-major exactly as :func:`copy_state_rows` expects. A null
-    page id (0) becomes destination row -1, which the copy kernel skips.
+    ``program_id(0)`` tiles requests and ``program_id(1)`` selects the layer.
+    Resolve its group in-kernel so the layer-major outputs need no eager
+    index_select, source-row arithmetic or repeat. Non-positive pages become
+    destination row -1, which the copy kernel skips.
     """
-    request = tl.program_id(0).to(tl.int64)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    request = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
+    live = request < batch_size
     layer = tl.program_id(1).to(tl.int64)
     out = layer * batch_size + request
-    accepted = tl.load(accepted_ptr + request).to(tl.int64)
+    accepted = tl.load(accepted_ptr + request, mask=live, other=1).to(tl.int64)
     accepted = tl.minimum(tl.maximum(accepted, 1), verify_width)
-    src_dtype = src_rows_ptr.dtype.element_ty
     tl.store(
         src_rows_ptr + out,
-        (request * (verify_width + 1) + accepted).to(src_dtype),
+        request * (verify_width + 1) + accepted,
+        mask=live,
     )
-    page = tl.load(pages_ptr + request).to(tl.int64)
-    dst_dtype = dst_rows_ptr.dtype.element_ty
-    tl.store(dst_rows_ptr + out, tl.where(page > 0, page, -1).to(dst_dtype))
+    group = 0
+    if group_indices_ptr is not None:
+        group = tl.load(group_indices_ptr + layer).to(tl.int64)
+    page = tl.load(
+        pages_ptr + group * batch_size + request,
+        mask=live,
+        other=0,
+    ).to(tl.int64)
+    tl.store(dst_rows_ptr + out, tl.where(page > 0, page, -1), mask=live)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def state_verify_commit_rows(
@@ -617,6 +632,7 @@ def state_verify_commit_rows(
     *,
     verify_width: int,
     num_layers: int,
+    group_indices: torch.Tensor | None,
 ) -> None:
     """Build batched verify-commit row ids for :func:`copy_state_rows`.
 
@@ -627,19 +643,25 @@ def state_verify_commit_rows(
     so accepting ``k`` tokens reads row ``request * (verify_width + 1) + k``.
     Cache page id 0 is the null page and is emitted as destination row -1,
     which :func:`copy_state_rows` skips instead of writing page 0.
+    All input and output tensors must be contiguous.
 
     Args:
         accepted_lengths: CUDA ``[batch_size]`` per-request accepted widths.
             Values are clamped to ``[1, verify_width]`` because the first
             verified token is always accepted.
-        destination_pages: CUDA ``[batch_size]`` committed page ids; id 0 is
-            the null page and is emitted as destination row ``-1``.
+        destination_pages: CUDA int32 or int64 committed page ids, shaped
+            ``[batch_size]`` when shared by all layers, or
+            ``[num_groups, batch_size]`` when ``group_indices`` is supplied.
+            Non-positive ids become destination row ``-1``.
         src_rows: CUDA int32 or int64 ``[num_layers * batch_size]`` output,
             layer-major, holding ``request * (verify_width + 1) + accepted``.
         dst_rows: Same layout, holding the destination page id or ``-1``.
         verify_width: Candidate width per request; the scratch row block is
             ``verify_width + 1`` rows whose first row is the carried state.
         num_layers: Layer repetitions to tile, matching ``copy_state_rows``.
+        group_indices: CUDA int32 or int64 ``[num_layers]`` mapping each layer
+            to a valid row of ``destination_pages``. Pass None explicitly
+            when all layers share the same one-dimensional page vector.
 
     Returns:
         None. Both output tensors are written in place in one launch.
@@ -654,22 +676,56 @@ def state_verify_commit_rows(
         raise ValueError("verify_width must be at least one candidate per request")
     if num_layers < 1:
         raise ValueError("num_layers must be at least one")
-    if destination_pages.numel() != batch_size:
-        raise ValueError("destination_pages must hold exactly one page id per request")
+    row_id_dtypes = (torch.int32, torch.int64)
+    if group_indices is None:
+        if destination_pages.ndim != 1 or destination_pages.numel() != batch_size:
+            raise ValueError(
+                "destination_pages must hold exactly one page id per request"
+            )
+    else:
+        if (
+            destination_pages.ndim != 2
+            or destination_pages.shape[0] < 1
+            or destination_pages.shape[1] != batch_size
+        ):
+            raise ValueError(
+                "grouped destination_pages must have shape [num_groups, batch_size]"
+            )
+        if (
+            group_indices.ndim != 1
+            or group_indices.numel() != num_layers
+            or group_indices.dtype not in row_id_dtypes
+            or not group_indices.is_contiguous()
+        ):
+            raise ValueError(
+                "group_indices must hold one int32 or int64 id per layer contiguously"
+            )
     total = num_layers * batch_size
     if src_rows.numel() != total or dst_rows.numel() != total:
         raise ValueError("row id outputs must hold num_layers * batch_size entries")
-    row_id_dtypes = (torch.int32, torch.int64)
-    if src_rows.dtype not in row_id_dtypes or dst_rows.dtype not in row_id_dtypes:
+    if any(
+        t.dtype not in row_id_dtypes
+        for t in (accepted_lengths, destination_pages, src_rows, dst_rows)
+    ):
         raise ValueError("row id tensors must have dtype torch.int32 or torch.int64")
+    if accepted_lengths.ndim != 1:
+        raise ValueError("accepted_lengths must be one-dimensional")
+    if any(not t.is_contiguous() for t in (accepted_lengths, destination_pages)):
+        raise ValueError("accepted_lengths and destination_pages must be contiguous")
+    if any(t.ndim != 1 or not t.is_contiguous() for t in (src_rows, dst_rows)):
+        raise ValueError("row id outputs must be contiguous one-dimensional tensors")
 
-    _state_verify_commit_rows_kernel[(batch_size, num_layers)](
+    _state_verify_commit_rows_kernel[(triton.cdiv(batch_size, 256), num_layers)](
         accepted_lengths,
         destination_pages,
+        group_indices,
         src_rows,
         dst_rows,
         batch_size,
         verify_width,
+        BLOCK=256,
+        ENABLE_PDL=pdl_enabled(),
+        **({"launch_pdl": True} if pdl_enabled() else {}),
     )
 
 
@@ -840,6 +896,7 @@ def _set_mla_kv_buffer_kernel(
     cache_k_nope_ptr,
     cache_k_rope_ptr,
     loc_ptr,
+    write_mask_ptr,
     buffer_stride: tl.constexpr,
     nope_stride: tl.constexpr,
     rope_stride: tl.constexpr,
@@ -860,6 +917,8 @@ def _set_mla_kv_buffer_kernel(
     offs = base + tl.arange(0, BLOCK)
     total_dim = nope_dim + rope_dim
     mask = offs < total_dim
+    if write_mask_ptr is not None:
+        mask &= tl.load(write_mask_ptr + pid_loc)
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
@@ -905,6 +964,7 @@ def _set_mla_kv_buffer_per_loc_kernel(
     cache_k_nope_ptr,
     cache_k_rope_ptr,
     loc_ptr,
+    write_mask_ptr,
     n_loc,
     buffer_stride: tl.constexpr,
     nope_stride: tl.constexpr,
@@ -924,6 +984,8 @@ def _set_mla_kv_buffer_per_loc_kernel(
     loc_indices = pid * BLOCK_LOC + tl.arange(0, BLOCK_LOC)
     loc_mask = loc_indices < n_loc
     locs = tl.load(loc_ptr + loc_indices, mask=loc_mask, other=0).to(tl.int64)
+    if write_mask_ptr is not None:
+        loc_mask &= tl.load(write_mask_ptr + loc_indices, mask=loc_mask, other=False)
 
     nope_offs = tl.arange(0, nope_dim)
     src_nope = tl.load(
@@ -972,6 +1034,8 @@ def set_mla_kv_buffer_triton(
     cache_k_rope: torch.Tensor,
     enable_pdl: bool | None = None,
     sanitize: bool = False,
+    *,
+    write_mask: torch.Tensor | None,
 ) -> None:
     """Scatter split MLA keys into a latent KV cache.
 
@@ -984,6 +1048,9 @@ def set_mla_kv_buffer_triton(
         enable_pdl: Whether to use Programmatic Dependent Launch. Defaults to
             the platform policy; pass ``False`` to disable it explicitly.
         sanitize: Replace NaN and infinity values before storing.
+        write_mask: Required keyword. Boolean mask [rows] that suppresses both
+            reads of source rows and writes for false entries; explicitly None
+            writes every row. Locations for masked rows must still be safe.
 
     Returns:
         None. The cache writes are enqueued on the current device stream.
@@ -991,6 +1058,17 @@ def set_mla_kv_buffer_triton(
     # Dispatch buckets from experiments on B200 GPUs.
     # Small batches use more CTAs per location; large batches use wider tiles.
     n_loc = loc.numel()
+    if write_mask is not None and (
+        write_mask.shape != (n_loc,)
+        or write_mask.dtype != torch.bool
+        or write_mask.device != loc.device
+        or not write_mask.is_contiguous()
+    ):
+        raise ValueError(
+            "MLA write mask must be contiguous bool [rows] on the slot device"
+        )
+    if n_loc == 0:
+        return
     nope_dim = cache_k_nope.size(-1)
     rope_dim = cache_k_rope.size(-1)
     # Clamp to a value representable by both source and destination. Bitwise
@@ -1017,6 +1095,7 @@ def set_mla_kv_buffer_triton(
             cache_k_nope,
             cache_k_rope,
             loc,
+            write_mask,
             n_loc,
             kv_buffer.stride(0),
             cache_k_nope.stride(0),
@@ -1043,6 +1122,7 @@ def set_mla_kv_buffer_triton(
             cache_k_nope,
             cache_k_rope,
             loc,
+            write_mask,
             kv_buffer.stride(0),
             cache_k_nope.stride(0),
             cache_k_rope.stride(0),
@@ -2673,7 +2753,9 @@ def _index_k_scatter_kernel(
     scale_buf_ptr,  # float32 flat view of buf (aliases fp8_buf_ptr)
     k_fp8_ptr,  # uint8 [tokens, HD]
     k_scale_ptr,  # float32 [tokens, NG]
-    loc_ptr,  # int [tokens] global slot index (non-negative)
+    loc_ptr,  # int [tokens] local slot index
+    write_mask_ptr,
+    HAS_WRITE_MASK: tl.constexpr,
     page_bytes,  # fp8 elements per page
     scale_page_off,  # float32 elements per page (page_bytes // 4)
     scale_base_off,  # float32 offset of the scale region ((ps*hd)//4)
@@ -2690,7 +2772,10 @@ def _index_k_scatter_kernel(
     slot = loc % PAGE_SIZE
 
     d = tl.arange(0, BLOCK_HD)
-    hd_mask = d < HD
+    owned = tl.full((), True, tl.int1)
+    if HAS_WRITE_MASK:
+        owned = tl.load(write_mask_ptr + t)
+    hd_mask = (d < HD) & owned
     fp8_dst = page * page_bytes + slot * HD + d
     tl.store(
         fp8_buf_ptr + fp8_dst,
@@ -2699,7 +2784,7 @@ def _index_k_scatter_kernel(
     )
 
     g = tl.arange(0, BLOCK_NG)
-    ng_mask = g < NG
+    ng_mask = (g < NG) & owned
     sc_dst = scale_base_off + page * scale_page_off + slot * NG + g
     tl.store(
         scale_buf_ptr + sc_dst,
@@ -2717,6 +2802,7 @@ def index_k_block_split_scatter(
     page_size: int,
     head_dim: int,
     group_size: int,
+    write_mask: torch.Tensor | None,
 ) -> None:
     """Scatter FP8 index-K rows + scales into the block-split paged buffer.
 
@@ -2732,6 +2818,8 @@ def index_k_block_split_scatter(
         index_k_scale: ``[tokens, num_groups]`` float32 scales.
         loc: ``[tokens]`` non-negative int global slot indices (any integer
             dtype).
+        write_mask: Required explicit ownership mask, or None to write all rows.
+            False entries suppress both source loads and destination writes.
         page_size, head_dim, group_size: layout; ``num_groups = head_dim //
             group_size``.
 
@@ -2739,6 +2827,12 @@ def index_k_block_split_scatter(
         None; ``buf`` is written in place.
     """
     tokens = index_k_fp8.shape[0]
+    if write_mask is not None and (
+        write_mask.shape != (tokens,)
+        or write_mask.dtype != torch.bool
+        or write_mask.device != loc.device
+    ):
+        raise ValueError("Index-K write mask must be bool [tokens] on the slot device")
     if tokens == 0:
         return
     ng = head_dim // group_size
@@ -2756,6 +2850,8 @@ def index_k_block_split_scatter(
         k_fp8,
         k_scale,
         loc.reshape(-1),
+        write_mask,
+        write_mask is not None,
         page_bytes,
         page_bytes // 4,
         (page_size * head_dim) // 4,

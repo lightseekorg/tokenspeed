@@ -113,7 +113,7 @@ class QSAAttnBackend(MHAAttnBackend):
             v_cache,
             topk_indices,
             scale=layer.scaling,
-            max_seqlen_q=max_seqlen_q if max_seqlen_q is not None else 1,
+            max_seqlen_q=max_seqlen_q,
             metadata_capacity_rows=max(q.shape[0], self._metadata_capacity_rows),
             k_scale=(
                 (1.0 if layer.k_scale is None else layer.k_scale)

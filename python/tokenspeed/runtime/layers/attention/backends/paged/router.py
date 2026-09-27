@@ -52,7 +52,10 @@ from typing import TYPE_CHECKING
 import torch
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
-from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.backends.base import (
+    AttentionBackend,
+    reject_bounded_replay,
+)
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
@@ -247,8 +250,18 @@ class CacheGroupRouter(AttentionBackend):
         super()._publish_cache_pool(cache_pool)
 
     def configure_runtime(self, **kwargs) -> None:
-        for leaf in self.leaves.values():
-            leaf.configure_runtime(**kwargs)
+        specs = {
+            spec.group_id: spec for spec in self.cache_pool.arena.cache_group_specs
+        }
+        for group_id, leaf in self.leaves.items():
+            leaf.configure_runtime(
+                block_granularity=self.geometry.granularity_of(group_id),
+                shard_count=specs[group_id].shard_count,
+                virtual_block_count=self.cache_pool.arena.runtime_contract.virtual_block_counts[
+                    group_id
+                ],
+                **kwargs,
+            )
 
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
         for leaf in self.leaves.values():
@@ -470,6 +483,8 @@ class CacheGroupRouter(AttentionBackend):
         extend_seq_lens_cpu: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
+        extend_replay_lens_cpu: torch.Tensor,
+        extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
         **kwargs,
     ) -> None:
@@ -482,6 +497,8 @@ class CacheGroupRouter(AttentionBackend):
         or chunked prefix) travels with the extend lengths: leaves size their
         paged-prefix metadata by it, so it must reach them unchanged.
         """
+        del extend_prompt_lens_cpu
+        reject_bounded_replay(extend_replay_lens_cpu, "CacheGroupRouter")
         del kwargs
         # A new forward: the sparse layers' shared top-k is per forward.
         self.sparse_topk.clear()
@@ -729,9 +746,8 @@ class CacheGroupRouter(AttentionBackend):
             for leaf in self.leaves.values()
         )
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
+    def cache_placement(self, layer):
+        return self._leaf_for(layer).cache_placement(layer)
 
     @break_point
     def forward(

@@ -50,10 +50,14 @@ def _selection(
         "latent_size": hidden_states.shape[1],
         "topk": topk_ids.shape[1],
         "num_local_experts": w13_weight.shape[0],
-        "intermediate_size": w2_weight.shape[-1] * 2,
+        "intermediate_size": (
+            w2_weight.shape[2] * 128
+            if len(w2_weight.shape) == 6
+            else w2_weight.shape[-1] * 2
+        ),
         "shared_size": shared_input.shape[1],
         "output_size": shared_weight.shape[0],
-        "linear_weights": True,
+        "linear_weights": len(w2_weight.shape) != 6,
         "inputs_contiguous": all(
             tensor.is_contiguous()
             for tensor in (
@@ -92,8 +96,9 @@ def latent_moe_decode_pipeline_available(
 
     This construction-time probe owns backend, tensor-format, expert-plan, and
     exact-shape constraints needed by the orchestration-level optimization. An
-    A8 plan must provide ``linear_clamp`` explicitly; callers of the pre-existing
-    A16 probe may omit it.
+    A8 input-policy plan can share its N16 bank with this A16 decoder. Explicit
+    FP8 plans cannot use the decoder. An A8 plan must provide ``linear_clamp``
+    explicitly; callers of the pre-existing A16 probe may omit it.
     """
     projection_weights = (
         router_weight,
@@ -103,15 +108,25 @@ def latent_moe_decode_pipeline_available(
     )
     expert_tensors = (w13_weight, w13_scale, w2_weight, w2_scale)
     apply_kernel_name = expert_plan.get("apply_kernel_name")
+    is_a8 = apply_kernel_name == "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"
+    # Construction precedes preprocessing. The selected plan promises N16
+    # cells; execution validates their physical axes, not transient attributes.
+    uses_n16_weights = (
+        is_a8
+        and linear_clamp is not _UNSET_LINEAR_CLAMP
+        and linear_clamp is not None
+        and expert_plan.get("internal_activation_dtype") != "fp8"
+    )
     uses_linear_weights = (
         apply_kernel_name == "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply"
         or (
-            apply_kernel_name == "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"
+            is_a8
             and linear_clamp is None
+            and expert_plan.get("internal_activation_dtype") != "fp8"
         )
-    )
+    ) and all(len(t.shape) == 3 for t in expert_tensors)
     if not (
-        uses_linear_weights
+        (uses_linear_weights or uses_n16_weights)
         and router_weight.dtype
         == routed_weight.dtype
         == shared_gate_up_weight.dtype
@@ -130,10 +145,14 @@ def latent_moe_decode_pipeline_available(
         "latent_size": routed_weight.shape[0],
         "topk": topk,
         "num_local_experts": w13_weight.shape[0],
-        "intermediate_size": w2_weight.shape[-1] * 2,
+        "intermediate_size": (
+            w2_weight.shape[2] * 128
+            if len(w2_weight.shape) == 6
+            else w2_weight.shape[-1] * 2
+        ),
         "shared_size": shared_gate_up_weight.shape[0] // 2,
         "output_size": shared_down_weight.shape[0],
-        "linear_weights": True,
+        "linear_weights": uses_linear_weights,
         "inputs_contiguous": True,
     }
     for tokens in range(1, 5):

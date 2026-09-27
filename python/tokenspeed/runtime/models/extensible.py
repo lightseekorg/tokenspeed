@@ -127,9 +127,8 @@ class ExtensibleLM(nn.Module):
             sys.path.insert(0, ext_def_dir)
             ext_def_module = f"{Path(ext_def_file).stem}"
             logger.info(
-                "\x1b[32m[[ExtensibleLM] Loading ext_def_dir=%r, ext_def_module=%r]\x1b[0m",
-                ext_def_dir,
-                ext_def_module,
+                f"\x1b[32m[[ExtensibleLM] Loading ext_def_dir={ext_def_dir!r}, "
+                f"ext_def_module={ext_def_module!r}]\x1b[0m",
             )
             importlib.import_module(ext_def_module)
 

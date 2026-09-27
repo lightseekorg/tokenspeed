@@ -10,6 +10,9 @@ so capture and replay take the same code path.
 
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
 import os
 import sys
 import unittest
@@ -19,7 +22,231 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
+from tokenspeed.runtime.execution.memory_delta import NULL_MEMORY_DELTA_OBSERVER
+
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
+
+
+class PrefillCaptureArgsTest(unittest.TestCase):
+    def setUp(self):
+        from tokenspeed.runtime.utils.server_args import ServerArgs
+
+        self.parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(self.parser)
+
+    def test_token_aliases_share_config_and_capture_selection(self):
+        from tokenspeed.cli._argsplit import split_argv
+        from tokenspeed.runtime.execution.prefill_graph import (
+            PrefillGraph,
+            get_prefill_token_buckets,
+            resolve_prefill_capture_batch_sizes,
+        )
+
+        configurations = []
+        for flag in (
+            "--prefill-graph-capture-token-sizes",
+            "--prefill-graph-capture-sizes",
+        ):
+            argv = [
+                "--model",
+                "test",
+                flag,
+                "1024",
+                "2048",
+                "4096",
+                "--prefill-graph-capture-batch-sizes",
+                "2",
+                "1",
+                "2",
+            ]
+            direct = self.parser.parse_args(argv)
+            routed = self.parser.parse_args(split_argv(argv).engine)
+            self.assertEqual(vars(direct), vars(routed))
+            self.assertFalse(hasattr(direct, "prefill_graph_capture_token_sizes"))
+            self.assertEqual(direct.prefill_graph_capture_sizes, [1024, 2048, 4096])
+            config = SimpleNamespace(**vars(direct))
+            config.prefill_graph_max_tokens = config.chunked_prefill_size = 4096
+            config.context_len = 4096
+            config.max_num_seqs = 8
+            config.data_parallel_size = 1
+            buckets = get_prefill_token_buckets(config)
+            combinations = [
+                (bucket, bs)
+                for bucket in buckets
+                for bs in resolve_prefill_capture_batch_sizes(config, bucket)
+            ]
+            self.assertEqual(
+                combinations,
+                [
+                    (1024, 1),
+                    (1024, 2),
+                    (2048, 1),
+                    (2048, 2),
+                    (4096, 1),
+                    (4096, 2),
+                ],
+            )
+            owner = PrefillGraph.__new__(PrefillGraph)
+            owner.capture_buckets = buckets
+            self.assertEqual((owner._padded_bucket(868 + 869), 2), (2048, 2))
+            self.assertIsNone(owner._padded_bucket(4097))
+            configurations.append((vars(direct), combinations))
+        self.assertEqual(*configurations)
+
+    def test_token_aliases_are_mutually_exclusive(self):
+        from tokenspeed.cli._argsplit import split_argv
+
+        flags = ("--prefill-graph-capture-token-sizes", "--prefill-graph-capture-sizes")
+        for first, second in (flags, flags[::-1]):
+            for value in ("1024", "2048"):
+                for inline_value in (False, True):
+                    args = (
+                        [first + "=1024", second + "=" + value]
+                        if inline_value
+                        else [first, "1024", second, value]
+                    )
+                    argv = ["--model", "test", *args]
+                    for routed in (argv, split_argv(argv).engine):
+                        with self.subTest(argv=routed):
+                            with contextlib.redirect_stderr(io.StringIO()) as error:
+                                with self.assertRaises(SystemExit) as raised:
+                                    self.parser.parse_args(routed)
+                            self.assertEqual(raised.exception.code, 2)
+                            self.assertIn("not allowed with argument", error.getvalue())
+                            self.assertIn(first, error.getvalue())
+                            self.assertIn(second, error.getvalue())
+
+    def test_defaults_and_help_keep_token_and_request_units_separate(self):
+        args = self.parser.parse_args(["--model", "test"])
+        self.assertIsNone(args.prefill_graph_capture_sizes)
+        self.assertIsNone(args.prefill_graph_capture_batch_sizes)
+        help_text = " ".join(self.parser.format_help().split())
+        self.assertIn("Total input-token capacities per forward", help_text)
+        self.assertIn("not per-request sequence lengths", help_text)
+        self.assertIn(
+            "Request capacities for inline prefill attention capture", help_text
+        )
+        self.assertIn("smallest fitting captured batch size", help_text)
+        self.assertIn("Compatibility alias", help_text)
+
+    def test_executor_requires_explicit_capture_batch_sizes(self):
+        from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
+        from tokenspeed.runtime.execution.prefill_graph import (
+            resolve_prefill_capture_batch_sizes,
+        )
+
+        config_args = dict(
+            max_req_pool_size=5,
+            output_length=1,
+            enforce_eager=False,
+            prefix_granularity=128,
+            max_num_seqs=4,
+            chunked_prefill_size=4096,
+            vocab_size=32,
+            context_len=4096,
+            physical_context_len=4096,
+            device="cpu",
+            gpu_id=0,
+            global_rank=0,
+            cudagraph_capture_sizes=[1, 2, 4],
+            disable_cuda_graph_padding=False,
+            max_cudagraph_capture_size=4,
+            model_is_mrope=False,
+            prefill_only=False,
+        )
+        with self.assertRaisesRegex(TypeError, "prefill_graph_capture_batch_sizes"):
+            ModelExecutorConfig(**config_args)
+
+        for sizes, expected in ((None, [1]), ([1, 2, 4], [1, 2, 4])):
+            with self.subTest(capture_batch_sizes=sizes):
+                config = ModelExecutorConfig(
+                    **config_args, prefill_graph_capture_batch_sizes=sizes
+                )
+                self.assertIs(config.prefill_graph_capture_batch_sizes, sizes)
+                self.assertEqual(
+                    resolve_prefill_capture_batch_sizes(config, 1024), expected
+                )
+
+
+class KdaPrefillFallbackTest(unittest.TestCase):
+    def test_outer_attention_break_does_not_capture_kda_graphs(self):
+        from unittest.mock import patch
+
+        import torch
+
+        from tokenspeed.runtime.execution.breakable_cuda_graph import BreakableCapture
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+        from tokenspeed.runtime.layers.attention.backends.state.kda import (
+            KdaAttnBackend,
+        )
+        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+            MambaAttnBackend,
+        )
+
+        backend = object.__new__(KdaAttnBackend)
+        backend._prefill_graph_enabled = True
+        backend.kda_backend = "cutedsl_kda"
+        capture = object.__new__(BreakableCapture)
+        output = torch.ones(1)
+        results = []
+
+        # Exercise the real replay boundary with CPU tensors and a mocked scan.
+        # Even repeated fallback shapes must not warm or capture a private graph.
+        with (
+            patch.object(MambaAttnBackend, "forward_extend", autospec=True) as scan,
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+            patch.object(torch.cuda, "CUDAGraph") as graph,
+            patch.object(
+                torch.cuda,
+                "current_stream",
+                side_effect=AssertionError("fallback attempted graph preparation"),
+            ),
+        ):
+            scan.return_value = output
+            for bs, bucket in ((1, 128), (2, 2048), (4, 4096), (1, 8192)):
+                for checkpoint in (None, object()):
+                    live = SimpleNamespace(prefill_checkpoint_batch=checkpoint)
+                    backend.forward_metadata = live
+
+                    def forward():
+                        results.append(
+                            backend.forward_extend(
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                bs,
+                                ForwardMode.EXTEND,
+                                save_kv_cache=True,
+                                layer_id=0,
+                                seq_len=bucket,
+                            )
+                        )
+
+                    capture.segments = [forward]
+                    for iteration in range(3):
+                        with self.subTest(bs=bs, bucket=bucket, iteration=iteration):
+                            scan.reset_mock()
+                            capture.replay(valid_rows=bucket - 1)
+                            scan.assert_called_once_with(
+                                backend,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                bs,
+                                ForwardMode.EXTEND,
+                                save_kv_cache=True,
+                                layer_id=0,
+                                seq_len=bucket,
+                            )
+                            self.assertIs(results[-1], output)
+                            self.assertIs(backend.forward_metadata, live)
+                            self.assertFalse(backend.prefill_metadata_is_capture_ready)
+            graph.assert_not_called()
+        self.assertEqual(len(results), 24)
 
 
 def _spec(
@@ -50,6 +277,7 @@ def _spec(
             family="state",
             checkpoint_granularity=block_granularity,
             sliding_window_tokens=sliding_window_tokens,
+            replayable=False,
         )
     return CacheGroupSpec(
         group_id=group_id,
@@ -58,6 +286,7 @@ def _spec(
         rows_per_page=block_granularity,
         entry_stride_tokens=1,
         sliding_window_tokens=sliding_window_tokens,
+        replayable=False,
     )
 
 
@@ -278,8 +507,8 @@ class DummyGroupTablesTest(unittest.TestCase):
         """A state group needs one working block per request: two rows sharing
         one silently clobber each other. The runtime check is gated on
         TOKENSPEED_CACHE_DEBUG, so a regression would be silent and this test
-        is the guard. Reachable at bs>1, which ``_autotune`` produces whenever
-        the chunk budget exceeds the model context -- and ``_autotune`` runs
+        is the guard. Reachable at bs>1, which ``autotune`` produces whenever
+        the chunk budget exceeds the model context -- and ``autotune`` runs
         even with the prefill graph disabled."""
         import torch
 
@@ -401,6 +630,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         context_len,
         physical,
         specs,
+        capture_bs,
         arena_blocks=64,
     ):
         """Drive make_dummy_batch to the backend hand-off and record it.
@@ -416,6 +646,7 @@ class DummyGroupTablesTest(unittest.TestCase):
 
         import torch
 
+        from tokenspeed.runtime.execution.input_buffer import InputBuffers
         from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
             CacheRuntimeContract,
         )
@@ -442,18 +673,11 @@ class DummyGroupTablesTest(unittest.TestCase):
         )
         pg.dp_size = 1
         pg.drafter = None
-        buf = lambda n, dt: torch.zeros(n, dtype=dt)  # noqa: E731
-        pg.input_buffers = SimpleNamespace(
-            dummy_kv_slot=0,
-            input_ids_buf=buf(4096, torch.int32),
-            out_cache_loc_buf=buf(4096, torch.int32),
-            positions_buf=buf(4096, torch.int64),
-            req_pool_indices_buf=buf(16, torch.int32),
-            seq_lens_buf=buf(16, torch.int32),
-            extend_seq_lens_buf=buf(16, torch.int32),
-            extend_seq_lens_cpu=buf(16, torch.int32),
-            extend_prefix_lens_buf=buf(16, torch.int32),
-            extend_prefix_lens_cpu=buf(16, torch.int32),
+        pg.input_buffers = InputBuffers(
+            max_bs=16,
+            max_num_tokens=4096,
+            state_write_padding_pool_index=0,
+            device="cpu",
         )
         pg.block_table = torch.zeros(16, 64, dtype=torch.int32)
 
@@ -466,7 +690,19 @@ class DummyGroupTablesTest(unittest.TestCase):
             seen["max_prefix"] = int(pg.input_buffers.extend_prefix_lens_cpu.max())
 
         pg.attn_backend.init_forward_metadata = _record
-        ctx = pg.make_dummy_batch(num_tokens)
+        ctx = pg.make_dummy_batch(
+            num_tokens,
+            -(-num_tokens // context_len) if capture_bs is None else capture_bs,
+        )
+        bs = ctx.bs
+        ib = pg.input_buffers
+        self.assertEqual(
+            ib.request_token_history_input_lengths_buf[:bs].tolist(),
+            ib.extend_seq_lens_cpu[:bs].tolist(),
+        )
+        self.assertEqual(ib.input_start_offsets_buf[0].item(), 0)
+        self.assertEqual(ib.input_start_offsets_buf[bs].item(), num_tokens)
+        self.assertTrue(ib.active_request_mask_buf[:bs].all().item())
         self.assertIs(ctx.attn_backend, pg.attn_backend)
         self.assertIs(ctx.token_to_kv_pool, pg.token_to_kv_pool)
         return seen
@@ -477,7 +713,11 @@ class DummyGroupTablesTest(unittest.TestCase):
         # 2048 tokens over a 960 context is three fabricated requests, so a
         # rule that collapsed rows to one would be visible here.
         seen = self._dummy_batch_probe(
-            num_tokens=2048, context_len=960, physical=1024, specs=(spec,)
+            num_tokens=2048,
+            context_len=960,
+            physical=1024,
+            specs=(spec,),
+            capture_bs=None,
         )
         tables = seen["block_tables"]
         table = tables["full_attention"]
@@ -494,6 +734,28 @@ class DummyGroupTablesTest(unittest.TestCase):
         self.assertEqual(table.device.type, "cpu")
         self.assertEqual(seen["max_prefix"], 0, "capture fabricates no prefix")
 
+    def test_explicit_request_count_uses_balanced_nonempty_placeholder_rows(self):
+        spec = _spec("full_attention", block_granularity=64)
+        seen = self._dummy_batch_probe(
+            num_tokens=1737,
+            context_len=2048,
+            physical=2048,
+            specs=(spec,),
+            capture_bs=2,
+        )
+        self.assertEqual(seen["extend_seq_lens_cpu"].tolist(), [869, 868])
+        self.assertEqual(seen["block_tables"]["full_attention"].shape[0], 2)
+        for tokens, bs in [(1, 2), (1737, 0), (1737, 17), (4096, 1)]:
+            with self.subTest(tokens=tokens, bs=bs):
+                with self.assertRaisesRegex(ValueError, "token/context capacity"):
+                    self._dummy_batch_probe(
+                        num_tokens=tokens,
+                        context_len=2048,
+                        physical=2048,
+                        specs=(spec,),
+                        capture_bs=bs,
+                    )
+
     def test_real_active_page_backend_gets_positions_alongside_its_tables(self):
         """A backend that validates live-page geometry (V4) is told how many
         tokens the batch carries and handed the live positions slice, and it
@@ -505,6 +767,7 @@ class DummyGroupTablesTest(unittest.TestCase):
             context_len=960,
             physical=1024,
             specs=(spec,),
+            capture_bs=None,
         )
         self.assertEqual(seen["num_tokens"], 128)
         self.assertEqual(seen["positions"].shape[0], 128)
@@ -521,6 +784,7 @@ class DummyGroupTablesTest(unittest.TestCase):
             context_len=960,
             physical=1024,
             specs=(spec,),
+            capture_bs=None,
             arena_blocks=2,
         )
         with self.assertRaises(ValueError) as caught:
@@ -529,6 +793,7 @@ class DummyGroupTablesTest(unittest.TestCase):
                 context_len=960,
                 physical=1024,
                 specs=(spec,),
+                capture_bs=None,
                 arena_blocks=2,
             )
         self.assertIn("page ID outside", str(caught.exception))
@@ -591,6 +856,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         inner_model = SimpleNamespace(embed_tokens=object())
         model_runner = SimpleNamespace(
             model=SimpleNamespace(model=inner_model),
+            model_config=SimpleNamespace(requires_request_token_history=False),
             is_generation=True,
             is_multimodal=False,
         )
@@ -618,6 +884,23 @@ class DummyGroupTablesTest(unittest.TestCase):
         self.assertFalse(graph.disable)
         capture.assert_not_called()
 
+        model_runner.model_config.requires_request_token_history = True
+        with (
+            mock.patch(
+                "tokenspeed.runtime.execution.prefill_graph.get_prefill_token_buckets",
+                return_value=[64],
+            ),
+            mock.patch.object(self.PrefillGraph, "capture"),
+        ):
+            graph = self.PrefillGraph(
+                model_runner=model_runner,
+                attn_backend=object(),
+                token_to_kv_pool=pool,
+                input_buffers=object(),
+                config=config,
+            )
+        self.assertTrue(graph.disable)
+
 
 class CaptureFailureIsLoudTest(unittest.TestCase):
     """A capture the dummy-batch machinery cannot serve must stop the boot.
@@ -641,6 +924,10 @@ class CaptureFailureIsLoudTest(unittest.TestCase):
         pg = self.PrefillGraph.__new__(self.PrefillGraph)
         pg.disable = False
         pg.capture_buckets = [4]
+        pg._captures = {}
+        pg._encoders = {}
+        pg._decoders = {}
+        pg._narrowing = None
         pg.attn_backend = SimpleNamespace(
             init_prefill_graph_state=lambda **kwargs: None
         )
@@ -656,7 +943,7 @@ class CaptureFailureIsLoudTest(unittest.TestCase):
             weight=self.torch.zeros(2, 8, dtype=self.torch.float32)
         )
 
-        def _capture_all_buckets(_decode_wrapper):
+        def _capture_all_buckets(_decode_wrapper, _entries, _observer):
             if raises is not None:
                 raise raises
 
@@ -670,18 +957,265 @@ class CaptureFailureIsLoudTest(unittest.TestCase):
         cause = RuntimeError("backend refused the dummy batch")
         pg = self._bare(raises=cause)
         with self.assertRaises(RuntimeError) as caught:
-            pg.capture(None)
+            pg.capture(None, entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
         self.assertIs(caught.exception, cause)
 
     def test_successful_capture_does_not_raise(self):
-        self._bare().capture(None)
+        self._bare().capture(None, entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
 
     def test_oom_propagates(self):
         """OOM keeps its own type and message. The capture pool not fitting is
         an operator-visible sizing failure, not something to recover from."""
         pg = self._bare(raises=self.torch.cuda.OutOfMemoryError("no room"))
         with self.assertRaises(self.torch.cuda.OutOfMemoryError):
-            pg.capture(None)
+            pg.capture(None, entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
+
+
+class NarrowingPrefillGraphTest(unittest.TestCase):
+    """A NarrowingPrefillModel is captured as encoder graphs per token bucket
+    plus decoder graphs per decoder-row bucket around its eager narrowing
+    stage; replay sequences the three and falls back to an eager decoder
+    stage above the largest decoder bucket."""
+
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.execution import prefill_graph
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + runtime deps: {exc}")
+        self.torch = torch
+        self.mod = prefill_graph
+
+    def test_decoder_row_buckets_clip_the_token_ladder_to_the_row_cap(self):
+        buckets = self.mod.get_decoder_row_buckets
+        ladder = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+        # 128 rows per request x 32 requests caps the decoder at 4096 rows.
+        self.assertEqual(buckets(ladder, 128, 32), ladder[:-1])
+        # A cap between rungs becomes the top rung itself.
+        self.assertEqual(buckets(ladder, 128, 3), [16, 32, 64, 128, 256, 384])
+        # The token ladder bounds the cap: narrowing never adds rows.
+        self.assertEqual(buckets([16, 48], 128, 32), [16, 48])
+        self.assertEqual(buckets([], 128, 32), [])
+
+    def _model(self, rows, calls):
+        torch = self.torch
+
+        class State:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def land_into(self, dst):
+                calls.append(("land", self.rows, dst.rows))
+
+        class Model:
+            max_decoder_rows_per_request = 128
+
+            def encoder_forward(self, input_ids, positions, ctx, **model_kwargs):
+                return State(input_ids.shape[0])
+
+            def narrowing_forward(self, state, ctx):
+                calls.append(("narrow", state.rows, ctx.input_num_tokens))
+                return State(rows)
+
+            def decoder_forward(self, state, ctx):
+                calls.append(("decoder eager", state.rows, ctx.input_num_tokens))
+                return torch.zeros(state.rows, 2), []
+
+            def finish_forward(self, hidden, captured, ctx):
+                calls.append(("finish", hidden.shape[0], ctx.input_num_tokens))
+                return hidden, None
+
+            def decoder_rows(self, ctx):
+                return rows
+
+            def allocate_decoder_state(self, rows):
+                return State(rows)
+
+        return Model(), State
+
+    def test_protocol_detection_sizes_the_decoder_ladder(self):
+        from unittest import mock
+
+        model, _ = self._model(128, [])
+        self.assertIsInstance(model, self.mod.NarrowingPrefillModel)
+        self.assertNotIsInstance(
+            SimpleNamespace(embed_tokens=object()), self.mod.NarrowingPrefillModel
+        )
+        for inner, expected_buckets in (
+            (model, [64, 256, 384]),
+            (SimpleNamespace(embed_tokens=object()), []),
+        ):
+            inner.embed_tokens = object()
+            model_runner = SimpleNamespace(
+                model=SimpleNamespace(model=inner),
+                model_config=SimpleNamespace(requires_request_token_history=False),
+                is_generation=True,
+                is_multimodal=False,
+            )
+            config = SimpleNamespace(
+                enforce_eager=False,
+                disable_prefill_graph=False,
+                data_parallel_size=1,
+                max_num_seqs=3,
+            )
+            with (
+                mock.patch.object(
+                    self.mod, "get_prefill_token_buckets", return_value=[64, 256, 1024]
+                ),
+                mock.patch.object(self.mod.PrefillGraph, "capture"),
+            ):
+                graph = self.mod.PrefillGraph(
+                    model_runner=model_runner,
+                    attn_backend=object(),
+                    token_to_kv_pool=_fake_pool(runtime_contract=object()),
+                    input_buffers=object(),
+                    config=config,
+                )
+            self.assertFalse(graph.disable)
+            self.assertIs(graph._narrowing, inner if expected_buckets else None)
+            self.assertEqual(graph.decoder_buckets, expected_buckets)
+
+    def test_narrowing_model_stays_eager_under_attention_dp(self):
+        """The narrowed row count is rank-local, so decoder buckets (and the
+        collective shapes their graphs bake) could differ across DP ranks:
+        the split graph is off under DP; an ordinary model keeps its graph."""
+        from unittest import mock
+
+        model, _ = self._model(128, [])
+        for inner, expected_disable in (
+            (model, True),
+            (SimpleNamespace(embed_tokens=object()), False),
+        ):
+            inner.embed_tokens = object()
+            model_runner = SimpleNamespace(
+                model=SimpleNamespace(model=inner),
+                model_config=SimpleNamespace(requires_request_token_history=False),
+                is_generation=True,
+                is_multimodal=False,
+            )
+            config = SimpleNamespace(
+                enforce_eager=False,
+                disable_prefill_graph=False,
+                data_parallel_size=2,
+                max_num_seqs=8,
+            )
+            with (
+                mock.patch.object(
+                    self.mod, "get_prefill_token_buckets", return_value=[64, 256]
+                ),
+                mock.patch.object(self.mod.PrefillGraph, "capture"),
+            ):
+                graph = self.mod.PrefillGraph(
+                    model_runner=model_runner,
+                    attn_backend=object(),
+                    token_to_kv_pool=_fake_pool(runtime_contract=object()),
+                    input_buffers=object(),
+                    config=config,
+                )
+            self.assertEqual(graph.disable, expected_disable)
+            self.assertEqual(graph.decoder_buckets, [])
+
+    def _bare(self, model, State, decoder_buckets, calls):
+        pg = self.mod.PrefillGraph.__new__(self.mod.PrefillGraph)
+        pg._narrowing = model
+        pg.decoder_buckets = decoder_buckets
+        pg.dp_size = 1
+        pg._engaged_logged = set()
+        pg.config = SimpleNamespace(world_size=1)
+        pg.attn_backend = SimpleNamespace(
+            step_counter=None,
+            prepare_prefill_metadata=lambda *args, **kwargs: False,
+        )
+        pg._encoders = {
+            256: self.mod.CapturedEncoder(
+                SimpleNamespace(
+                    replay=lambda valid_rows: calls.append(("encoder", valid_rows))
+                ),
+                State(256),
+            )
+        }
+        pg._decoders = {
+            rows: self.mod.CapturedDecoder(
+                SimpleNamespace(
+                    replay=lambda valid_rows, rows=rows: calls.append(
+                        ("decoder graph", rows, valid_rows)
+                    )
+                ),
+                State(rows),
+                self.mod.CapturedForward(self.torch.zeros(rows, 2), []),
+            )
+            for rows in decoder_buckets
+        }
+        pg._captures = {}
+        return pg
+
+    def _ctx(self, num_tokens):
+        from tokenspeed.runtime.execution.context import ForwardContext
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+        return ForwardContext(
+            attn_backend=None,
+            token_to_kv_pool=None,
+            bs=1,
+            num_extends=1,
+            input_num_tokens=num_tokens,
+            forward_mode=ForwardMode.EXTEND,
+        )
+
+    def test_replay_sequences_encoder_narrowing_and_decoder_graph(self):
+        calls = []
+        model, State = self._model(100, calls)
+        pg = self._bare(model, State, [64, 192], calls)
+        ctx = self._ctx(200)
+        hidden, aux = pg._replay_narrowed(256, ctx, 200)
+        self.assertEqual(
+            calls,
+            [
+                # The encoder replays over the padded bucket with the real
+                # token count as its valid rows; the narrowing stage runs
+                # eager under the bucket-pinned ambient ctx on the encoder's
+                # padded output; the decoder graph replays over the smallest
+                # fitting bucket with the narrowed row count as its valid
+                # rows; the finish stage sees the pin lifted.
+                ("encoder", 200),
+                ("narrow", 256, 256),
+                ("land", 100, 192),
+                ("decoder graph", 192, 100),
+                ("finish", 100, 200),
+            ],
+        )
+        self.assertEqual(hidden.shape, (100, 2))
+        self.assertIsNone(aux)
+        self.assertEqual(ctx.input_num_tokens, 200, "the pin is restored")
+        self.assertTrue(pg._has_bucket(256) and not pg._has_bucket(64))
+
+    def test_rows_above_the_decoder_ladder_run_the_decoder_eager(self):
+        calls = []
+        model, State = self._model(300, calls)
+        pg = self._bare(model, State, [64, 192], calls)
+        self.assertIsNone(pg._decoder_bucket(300))
+        self.assertEqual(pg._decoder_bucket(64), 64)
+        self.assertEqual(pg._decoder_bucket(65), 192)
+        hidden, _ = pg._replay_narrowed(256, self._ctx(256), 256)
+        self.assertEqual(
+            calls,
+            [
+                ("encoder", 256),
+                ("narrow", 256, 256),
+                ("decoder eager", 300, 256),
+                ("finish", 300, 256),
+            ],
+        )
+        self.assertEqual(hidden.shape, (300, 2))
+
+    def test_narrowing_disagreeing_with_the_metadata_is_fatal(self):
+        calls = []
+        model, State = self._model(100, calls)
+        model.decoder_rows = lambda ctx: 99
+        pg = self._bare(model, State, [192], calls)
+        with self.assertRaisesRegex(RuntimeError, "narrowing yielded 100 rows"):
+            pg._replay_narrowed(256, self._ctx(200), 200)
 
 
 class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
@@ -725,6 +1259,98 @@ class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
         self.assertEqual(
             CacheGroupRouter.cache_consumer_families, frozenset({"history"})
         )
+
+
+class PrefillRoleGraphsTest(unittest.TestCase):
+    """The PD prefill role never runs a decode step, so the decode graph has
+    nothing to capture there; the prefill graph keeps its ordinary gating
+    instead of the role forcing eager execution."""
+
+    def setUp(self):
+        try:
+            import torch  # noqa: F401
+
+            from tokenspeed.runtime.execution import forward_step, prefill_graph
+            from tokenspeed.runtime.execution.model_executor import (
+                ModelExecutorConfig,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + runtime deps: {exc}")
+        self.forward_step = forward_step
+        self.prefill_graph = prefill_graph
+        self.ModelExecutorConfig = ModelExecutorConfig
+
+    def _config(self, *, prefill_only: bool, enforce_eager: bool = False):
+        return self.ModelExecutorConfig(
+            max_req_pool_size=5,
+            output_length=1,
+            enforce_eager=enforce_eager,
+            prefix_granularity=128,
+            max_num_seqs=4,
+            chunked_prefill_size=4096,
+            vocab_size=32,
+            context_len=4096,
+            physical_context_len=4096,
+            device="cpu",
+            gpu_id=0,
+            global_rank=0,
+            cudagraph_capture_sizes=[1, 2, 4],
+            disable_cuda_graph_padding=False,
+            max_cudagraph_capture_size=4,
+            model_is_mrope=False,
+            prefill_only=prefill_only,
+            prefill_graph_capture_batch_sizes=None,
+            prefill_graph_max_tokens=256,
+        )
+
+    def _decode_runner(self, config):
+        class Backend:
+            def init_cuda_graph_state(self, *args, **kwargs):
+                pass
+
+        return self.forward_step.ForwardStepRunner(
+            forward_func=lambda *args, **kwargs: None,
+            attn_backend=Backend(),
+            token_to_kv_pool=_fake_pool(cache_group_page_counts={}),
+            input_buffers=object(),
+            config=config,
+        )
+
+    def _prefill_owner(self, config):
+        from unittest import mock
+
+        inner = SimpleNamespace(embed_tokens=object())
+        model_runner = SimpleNamespace(
+            model=SimpleNamespace(model=inner),
+            model_config=SimpleNamespace(requires_request_token_history=False),
+            is_generation=True,
+            is_multimodal=False,
+        )
+        with mock.patch.object(self.prefill_graph.PrefillGraph, "capture"):
+            return self.prefill_graph.PrefillGraph(
+                model_runner=model_runner,
+                attn_backend=object(),
+                token_to_kv_pool=_fake_pool(runtime_contract=object()),
+                input_buffers=object(),
+                config=config,
+            )
+
+    def test_prefill_role_skips_the_decode_graph_and_keeps_the_prefill_graph(
+        self,
+    ):
+        config = self._config(prefill_only=True)
+        self.assertTrue(self._decode_runner(config).disable)
+        self.assertFalse(self._prefill_owner(config).disable)
+
+    def test_a_serving_node_keeps_both_graphs(self):
+        config = self._config(prefill_only=False)
+        self.assertFalse(self._decode_runner(config).disable)
+        self.assertFalse(self._prefill_owner(config).disable)
+
+    def test_explicit_eager_still_disables_the_prefill_graph_on_the_role(self):
+        config = self._config(prefill_only=True, enforce_eager=True)
+        self.assertTrue(self._decode_runner(config).disable)
+        self.assertTrue(self._prefill_owner(config).disable)
 
 
 if __name__ == "__main__":

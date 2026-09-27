@@ -208,10 +208,8 @@ def register_disaggregation_server(
         )
     else:
         logger.info(
-            "Registered disaggregation server with %s: status_code=%s text=%s",
-            pdlb_url,
-            res.status_code,
-            res.text,
+            f"Registered disaggregation server with {pdlb_url!s}: status_code="
+            f"{res.status_code!s} text={res.text!s}",
         )
 
 

@@ -28,6 +28,7 @@ jobs:
               "pr-test-nvidia.yml",
               "pr-test-amd.yml",
               "pr-test-nvidia-arm.yml",
+              "gb200-slurm-per-commit.yml",
               "gb300-slurm-per-commit.yml",
             ];
             const maxAttempts = 3;

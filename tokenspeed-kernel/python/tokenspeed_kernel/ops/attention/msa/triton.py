@@ -670,7 +670,6 @@ _MINIMAX_MSA_SIGNATURES = format_signatures(
     signatures=_MINIMAX_MSA_SIGNATURES,
     traits=_MINIMAX_MSA_TRAITS,
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def triton_minimax_msa_decode_with_kvcache(
     q: torch.Tensor,
@@ -742,7 +741,6 @@ def triton_minimax_msa_decode_with_kvcache(
     signatures=_MINIMAX_MSA_SIGNATURES,
     traits=_MINIMAX_MSA_TRAITS,
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def triton_minimax_msa_extend_with_kvcache(
     q: torch.Tensor,

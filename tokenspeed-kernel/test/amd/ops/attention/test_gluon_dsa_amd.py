@@ -28,38 +28,38 @@ if is_cdna4():
         sparse_mla as dsa_topk_backend,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
-        gluon_dsa_decode_gfx950 as gluon_dsa_decode,
+        launch_gluon_dsa_decode_gfx950 as gluon_dsa_decode,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
-        gluon_dsa_prefill_gfx950 as gluon_dsa_prefill,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (  # noqa: E402
-        gluon_dsa_decode_topk_fp8_gfx950 as gluon_dsa_decode_topk_fp8,
+        launch_gluon_dsa_prefill_gfx950 as gluon_dsa_prefill,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
         gluon_dsa_logical_topk_gfx950 as gluon_logical_topk_indices,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (  # noqa: E402
+        launch_gluon_dsa_decode_topk_fp8_gfx950 as gluon_dsa_decode_topk_fp8,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
-        gluon_dsa_prefill_topk_fp8_gfx950 as gluon_dsa_prefill_topk_fp8,
+        launch_gluon_dsa_prefill_topk_fp8_gfx950 as gluon_dsa_prefill_topk_fp8,
     )
 else:
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa import (  # noqa: E402
         sparse_mla as dsa_topk_backend,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.attention import (  # noqa: E402
-        gluon_dsa_decode_gfx1250 as gluon_dsa_decode,
+        launch_gluon_dsa_decode_gfx1250 as gluon_dsa_decode,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.attention import (
-        gluon_dsa_prefill_gfx1250 as gluon_dsa_prefill,
-    )
-    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (  # noqa: E402
-        gluon_dsa_decode_topk_fp8_gfx1250 as gluon_dsa_decode_topk_fp8,
+        launch_gluon_dsa_prefill_gfx1250 as gluon_dsa_prefill,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (
         gluon_dsa_logical_topk_gfx1250 as gluon_logical_topk_indices,
     )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (  # noqa: E402
+        launch_gluon_dsa_decode_topk_fp8_gfx1250 as gluon_dsa_decode_topk_fp8,
+    )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (
-        gluon_dsa_prefill_topk_fp8_gfx1250 as gluon_dsa_prefill_topk_fp8,
+        launch_gluon_dsa_prefill_topk_fp8_gfx1250 as gluon_dsa_prefill_topk_fp8,
     )
 
 torch.manual_seed(42)

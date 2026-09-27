@@ -25,6 +25,25 @@ import unittest
 from importlib import import_module
 
 from tokenspeed._logging import suppress_noisy_third_party_logs
+from tokenspeed.runtime.utils.common import CustomFormatter, get_colorful_logger
+
+
+class TestColorfulLogger(unittest.TestCase):
+    def test_repeated_construction_emits_each_record_once(self):
+        name = "tokenspeed.test_logging.repeated_construction"
+        first = get_colorful_logger(name)
+        second = get_colorful_logger(name)
+        self.assertIs(first, second)
+        colorful = [
+            h for h in first.handlers if isinstance(h.formatter, CustomFormatter)
+        ]
+        self.assertEqual(len(colorful), 1)
+
+        stderr = io.StringIO()
+        for handler in colorful:
+            handler.setStream(stderr)
+        first.info("memory summary")
+        self.assertEqual(stderr.getvalue().count("memory summary"), 1)
 
 
 class TestThirdPartyLogging(unittest.TestCase):

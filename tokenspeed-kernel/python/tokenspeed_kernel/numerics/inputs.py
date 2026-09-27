@@ -33,6 +33,7 @@ __all__ = [
     "set_benchmark_shapes",
     "set_input_generator",
     "set_standard_shapes",
+    "shape_traits",
 ]
 
 InputGeneratorFactory = Callable[..., "InputGenerator"]
@@ -40,6 +41,16 @@ InputGeneratorFactory = Callable[..., "InputGenerator"]
 _INPUT_GENERATORS: dict[tuple[str, str], InputGeneratorFactory] = {}
 _STANDARD_SHAPES: dict[tuple[str, str], list[dict[str, Any]]] = {}
 _BENCHMARK_SHAPES: dict[tuple[str, str], list[dict[str, Any]]] = {}
+
+# Generator shapes spell GEMM dimensions the way ``generate`` keyword
+# arguments do; selection reads them as lowercase problem-shape traits.
+_SHAPE_TRAIT_NAMES: dict[str, str] = {
+    "B": "batch",
+    "batch": "batch",
+    "M": "m",
+    "N": "n",
+    "K": "k",
+}
 
 
 class InputGenerator:
@@ -136,3 +147,21 @@ def get_benchmark_shapes(op_family: str, op_mode: str) -> list[dict[str, Any]]:
     if shapes is not None:
         return [dict(shape) for shape in shapes]
     return get_standard_shapes(op_family, op_mode)
+
+
+def shape_traits(shape: dict[str, Any]) -> dict[str, Any]:
+    """Return the problem-shape traits a generator shape implies.
+
+    Args:
+        shape: Keyword arguments for an input generator's ``generate``. The
+            GEMM dimensions ``batch`` (or ``B``), ``M``, ``N`` and ``K`` map
+            onto the ``batch``, ``m``, ``n`` and ``k`` traits that
+            :func:`tokenspeed_kernel.selection.spec_matches_shape_traits`
+            reads; other entries are not traits and are dropped.
+
+    Returns:
+        The trait dict describing the shape.
+    """
+    return {
+        trait: shape[dim] for dim, trait in _SHAPE_TRAIT_NAMES.items() if dim in shape
+    }

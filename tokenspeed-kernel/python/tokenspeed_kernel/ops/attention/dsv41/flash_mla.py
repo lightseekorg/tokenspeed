@@ -26,6 +26,7 @@ from types import ModuleType
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.attention.dsv41.triton import _PAGED_FORMATS
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -86,11 +87,19 @@ def _native_query(q, sink):
     )
 
 
-def _paged(cache, row_bytes, stride_alignment):
+def _paged(cache, role, stride_alignment):
+    # FlashMLA detects the layout from the row width; the widths a role may
+    # carry are the codec's. Which of them a build reads is an arch property:
+    # every target reads V4 (584), sm100 and above add V4.1 (528 and 288).
+    widths = _PAGED_FORMATS[role]
+    if cache.ndim != 3 or cache.shape[2] not in widths:
+        raise ValueError(
+            f"FlashMLA {role} cache rows must be one of {sorted(widths)} bytes"
+        )
+    row_bytes = cache.shape[2]
     if (
         cache.dtype != torch.uint8
-        or cache.ndim != 3
-        or cache.shape[1:] != (64, row_bytes)
+        or cache.shape[1] != 64
         or cache.stride(1) != row_bytes
         or cache.stride(2) != 1
     ):
@@ -129,8 +138,12 @@ def _slots(slots, lengths, tokens):
     "dsv41_selected_attention",
     name="flashmla_dsv41_selected_attention",
     solution="flashmla",
+    # Hopper builds carry EXTRA_KVCACHE, EXTRA_TOPK_LENGTH and ATTN_SINK -- the
+    # two-reader shape this op needs -- but of the packed layouts only the V4
+    # cache reader. The caller keeps its rows in a format its target reads, so
+    # the floor is the two-reader feature set rather than any one layout.
     capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(10, 0),
+        min_arch_version=ArchVersion(9, 0),
         max_arch_version=ArchVersion(10, 3),
         vendors=frozenset({"nvidia"}),
     ),
@@ -194,7 +207,11 @@ def selected_attention(
         if prefill_indices.dtype not in (torch.int32, torch.int64):
             raise ValueError("prefill_indices must be integer")
         indices = prefill_indices.to(torch.int32)
-        width = max(64, (indices.shape[1] + 63) // 64 * 64)
+        # The sm90 sparse prefill kernel tiles the selection two blocks at a
+        # time and asserts the padded width divides evenly: it rejects 192 and
+        # 320 while accepting 128, 256 and 384. Later archs take any 64-multiple.
+        align = 128 if current_platform().is_hopper else 64
+        width = max(align, (indices.shape[1] + align - 1) // align * align)
         if width != indices.shape[1]:
             indices = F.pad(indices, (0, width - indices.shape[1]), value=-1)
         destination = out
@@ -237,7 +254,7 @@ def selected_attention(
         )
         result, _ = api.flash_mla_with_kvcache(
             q=q_native.unsqueeze(1),
-            k_cache=_paged(swa_cache, 528, 512),
+            k_cache=_paged(swa_cache, "swa", 512),
             block_table=None,
             cache_seqlens=None,
             head_dim_v=512,
@@ -249,7 +266,7 @@ def selected_attention(
             indices=indices,
             attn_sink=sink_native,
             extra_k_cache=(
-                None if global_cache is None else _paged(global_cache, 288, 256)
+                None if global_cache is None else _paged(global_cache, "global", 256)
             ),
             extra_indices_in_kvcache=extra_indices,
             topk_length=lengths,

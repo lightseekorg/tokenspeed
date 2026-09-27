@@ -34,8 +34,10 @@ if not (is_cdna4() or is_cdna5()):
 
 
 import tokenspeed_kernel.ops.residual as residual_ops  # noqa: E402
-from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk  # noqa: E402
 from tokenspeed_kernel.ops.moe.sigmoid_topk import _gluon_eligible  # noqa: E402
+from tokenspeed_kernel.ops.moe.sigmoid_topk import (  # noqa: E402
+    _moe_sigmoid_bias_topk as moe_sigmoid_bias_topk,
+)
 from tokenspeed_kernel.ops.residual import (  # noqa: E402
     attn_res_fwd,
     attn_res_fwd_available,

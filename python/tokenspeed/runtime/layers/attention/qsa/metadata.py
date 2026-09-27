@@ -29,6 +29,7 @@ import torch
 from tokenspeed_kernel.ops.attention.qsa.triton import (
     qwen4_exp_qsa_prepare_metadata,
 )
+from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
     qwen4_exp_backend,
@@ -133,6 +134,7 @@ def qsa_forward_layout(
             recent_page_table,
             recent_page_size,
             compress_ratio,
+            enable_pdl=pdl_enabled(),
             draft_logical_positions=reset_draft_tags,
         )
     )

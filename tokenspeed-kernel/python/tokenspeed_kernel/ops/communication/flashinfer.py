@@ -156,10 +156,7 @@ def get_flashinfer_moe_alltoall(
         group, max_tokens, hidden_size, top_k, num_experts, dtype, weights_dtype
     )
     logger.info(
-        "K3 MoE communication: FlashInfer MNNVL all-to-all scope=%s ep=%d capacity=%d width=%d",
-        model_scope,
-        group.size(),
-        max_tokens,
-        hidden_size,
+        f"K3 MoE communication: FlashInfer MNNVL all-to-all scope={model_scope!s} ep="
+        f"{group.size():d} capacity={max_tokens:d} width={hidden_size:d}",
     )
     return transport

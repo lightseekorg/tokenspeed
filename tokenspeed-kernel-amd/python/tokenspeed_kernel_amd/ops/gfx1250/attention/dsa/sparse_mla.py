@@ -26,24 +26,24 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.indexing import (
     _check_packed_fp8_inputs,
-    _dsa_decode_logits_fp8_kernel,
-    _dsa_prefill_logits_fp8_kernel,
+    gluon_dsa_decode_topk_fp8_gfx1250,
+    gluon_dsa_prefill_topk_fp8_gfx1250,
 )
 from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.standard_cache_logits import (
-    _dsa_kpool_prefill_logits_kernel,
-    _dsa_kpool_prefill_plan_logits_kernel,
-    _dsa_standard_decode_logits_kernel,
-    _dsa_standard_prefill_logits_kernel,
+    gluon_dsa_decode_topk_standard_gfx1250,
+    gluon_dsa_prefill_topk_standard_gfx1250,
+    gluon_kpool_prefill_topk_fp8_gfx1250,
+    gluon_kpool_prefill_topk_fp8_plan_gfx1250,
 )
 
 __all__ = [
-    "gluon_dsa_decode_topk_fp8_gfx1250",
-    "gluon_dsa_decode_topk_standard_gfx1250",
+    "launch_gluon_dsa_decode_topk_fp8_gfx1250",
+    "launch_gluon_dsa_decode_topk_standard_gfx1250",
     "gluon_dsa_kpool_prefill_logits_gfx1250",
     "gluon_dsa_kpool_prefill_plan_logits_gfx1250",
     "gluon_dsa_logical_topk_gfx1250",
-    "gluon_dsa_prefill_topk_fp8_gfx1250",
-    "gluon_dsa_prefill_topk_standard_gfx1250",
+    "launch_gluon_dsa_prefill_topk_fp8_gfx1250",
+    "launch_gluon_dsa_prefill_topk_standard_gfx1250",
 ]
 
 _RADIX_BITS = (12, 12, 8)
@@ -292,12 +292,10 @@ def _dsa_wave32_radix_topk_kernel(
     prefix = gl.full([], 0, gl.uint32)
     remaining = gl.full([], topk, gl.int32)
     shared_output_counters.store(counter_zeros)
-    gl.barrier()
 
     # The three-pass schedule resolves the full ordered FP32 key.
     for pass_index in gl.static_range(3):
         shared_histogram.store(histogram_zeros)
-        gl.barrier()
         radix_bits = _RADIX0_BITS
         shift = 32 - _RADIX0_BITS
         if pass_index == 1:
@@ -319,7 +317,6 @@ def _dsa_wave32_radix_topk_kernel(
                 BLOCK_N,
                 pass_index == 0,
             )
-            gl.barrier()
 
         counts = shared_histogram.load(histogram_layout)
         count_pairs = counts.reshape([_MAX_BUCKETS // 2, 2])
@@ -349,7 +346,6 @@ def _dsa_wave32_radix_topk_kernel(
         packed = gl.sum(gl.where(selected_group, packed, 0), axis=0)
         prefix = (prefix << radix_bits) | (packed & 0xFFF)
         remaining -= ((packed >> 12) & 0x7FF).to(gl.int32)
-        gl.barrier()
         if pass_index == 1:
             if ((packed >> 23) & 1) != 0:
                 count_greater = topk - remaining
@@ -833,7 +829,7 @@ def gluon_dsa_kpool_prefill_logits_gfx1250(
         return out, row_ends_out
 
     num_warps = _KPOOL_SCORE_NUM_WARPS
-    _dsa_kpool_prefill_logits_kernel[(tokens, 1)](
+    gluon_kpool_prefill_topk_fp8_gfx1250[(tokens, 1)](
         q,
         weights,
         pooled_k_cache.view(torch.float8_e4m3fn),
@@ -962,7 +958,7 @@ def gluon_dsa_kpool_prefill_plan_logits_gfx1250(
         raise ValueError("a nonempty prefill plan requires pooled cache pages")
 
     num_warps = _KPOOL_SCORE_NUM_WARPS
-    _dsa_kpool_prefill_plan_logits_kernel[(tokens, 1)](
+    gluon_kpool_prefill_topk_fp8_plan_gfx1250[(tokens, 1)](
         q,
         weights,
         pooled_k_cache.view(torch.float8_e4m3fn),
@@ -1001,7 +997,7 @@ def gluon_dsa_kpool_prefill_plan_logits_gfx1250(
     return out, row_ends_out
 
 
-def gluon_dsa_decode_topk_fp8_gfx1250(
+def launch_gluon_dsa_decode_topk_fp8_gfx1250(
     q: torch.Tensor,
     weights: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -1075,7 +1071,7 @@ def gluon_dsa_decode_topk_fp8_gfx1250(
         device=q.device,
     )
     block_n = 32
-    _dsa_decode_logits_fp8_kernel[(q.shape[0], triton.cdiv(max_seq_len, block_n))](
+    gluon_dsa_decode_topk_fp8_gfx1250[(q.shape[0], triton.cdiv(max_seq_len, block_n))](
         q,
         index_k_cache.view(torch.float8_e4m3fn),
         index_k_cache.view(torch.float32),
@@ -1116,7 +1112,7 @@ def gluon_dsa_decode_topk_fp8_gfx1250(
     )
 
 
-def gluon_dsa_prefill_topk_fp8_gfx1250(
+def launch_gluon_dsa_prefill_topk_fp8_gfx1250(
     q: torch.Tensor,
     weights: torch.Tensor,
     kv_workspace_slots: torch.Tensor,
@@ -1197,7 +1193,7 @@ def gluon_dsa_prefill_topk_fp8_gfx1250(
             dtype=torch.float32,
             device=q.device,
         )
-        _dsa_prefill_logits_fp8_kernel[
+        gluon_dsa_prefill_topk_fp8_gfx1250[
             (end - start, triton.cdiv(seq_len_sum, block_n))
         ](
             q[start:end],
@@ -1237,7 +1233,7 @@ def gluon_dsa_prefill_topk_fp8_gfx1250(
     return out, lens_out
 
 
-def gluon_dsa_decode_topk_standard_gfx1250(
+def launch_gluon_dsa_decode_topk_standard_gfx1250(
     q: torch.Tensor,
     weights: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -1320,7 +1316,7 @@ def gluon_dsa_decode_topk_standard_gfx1250(
         + index_k_cache.shape[1]
     )
     grid = (q.shape[0], triton.cdiv(max_candidates, chunk_n))
-    _dsa_standard_decode_logits_kernel[grid](
+    gluon_dsa_decode_topk_standard_gfx1250[grid](
         q,
         q_scale_arg,
         index_k_cache.view(torch.float8_e4m3fn),
@@ -1367,7 +1363,7 @@ def gluon_dsa_decode_topk_standard_gfx1250(
     )
 
 
-def gluon_dsa_prefill_topk_standard_gfx1250(
+def launch_gluon_dsa_prefill_topk_standard_gfx1250(
     q: torch.Tensor,
     weights: torch.Tensor,
     kv_workspace_slots: torch.Tensor,
@@ -1458,7 +1454,7 @@ def gluon_dsa_prefill_topk_standard_gfx1250(
             dtype=torch.float32,
             device=q.device,
         )
-        _dsa_standard_prefill_logits_kernel[(end - start, 1)](
+        gluon_dsa_prefill_topk_standard_gfx1250[(end - start, 1)](
             q[start:end],
             q_scale_arg[start:end],
             index_k_cache.view(torch.float8_e4m3fn),

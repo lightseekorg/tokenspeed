@@ -72,7 +72,7 @@ def _oracle(q, weights, keys, shards):
     return scores.to(weights.dtype).float()
 
 
-def _check(ids, lengths, scores):
+def _check(ids, lengths, scores, rtol, atol):
     assert ids.dtype == lengths.dtype == torch.int32
     for selected, length, score in zip(ids.cpu(), lengths.cpu(), scores, strict=True):
         n = min(selected.numel(), int((score > -torch.inf).sum()))
@@ -83,8 +83,8 @@ def _check(ids, lengths, scores):
         torch.testing.assert_close(
             score[chosen].sort().values,
             score.topk(n).values.sort().values,
-            rtol=0,
-            atol=0,
+            rtol=rtol,
+            atol=atol,
         )
 
 
@@ -140,10 +140,36 @@ def test_index_scan_capacity_launches_and_scratch(device):
 
         def run():
             full = dsv41.index_topk(
-                q, w, cache, pages, visible, None, 65, 17, 8, 2, 64, None, None
+                q,
+                w,
+                cache,
+                pages,
+                visible,
+                None,
+                65,
+                17,
+                8,
+                2,
+                64,
+                None,
+                None,
+                solution="triton",
             )
             return full + dsv41.index_topk(
-                q, w, cache, pages, visible, full[2], 65, 0, 8, 2, 64, None, None
+                q,
+                w,
+                cache,
+                pages,
+                visible,
+                full[2],
+                65,
+                0,
+                8,
+                2,
+                64,
+                None,
+                None,
+                solution="triton",
             )
 
         run()
@@ -207,9 +233,10 @@ def tp_group():
         torch.distributed.destroy_process_group()
 
 
-@pytest.mark.parametrize("shards", [1, 4], ids=["local", "tp4"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_index_scan_graph_oracle(device, shards, dtype, tp_group):
+def run_index_scan_graph_oracle(
+    device, shards, dtype, tp_group, require, solution, rtol, atol
+):
+    require("attention", "dsv41_index_topk", solution, torch.bfloat16, "x")
     if shards == 4 and (
         os.environ.get("TOKENSPEED_TEST_TP4") != "1"
         or os.environ.get("WORLD_SIZE") != "4"
@@ -245,6 +272,7 @@ def test_index_scan_graph_oracle(device, shards, dtype, tp_group):
                 64,
                 group,
                 None,
+                solution=solution,
             )
             return full + dsv41.index_topk(
                 local_q,
@@ -260,6 +288,7 @@ def test_index_scan_graph_oracle(device, shards, dtype, tp_group):
                 64,
                 group,
                 None,
+                solution=solution,
             )
 
         stream = torch.cuda.Stream()
@@ -310,17 +339,17 @@ def test_index_scan_graph_oracle(device, shards, dtype, tp_group):
                 (logical >= visible.cpu()[:, None]) | (pages < 0) | (pages >= 128),
                 -torch.inf,
             )
-            _check(eager[0], eager[1], scores)
+            _check(eager[0], eager[1], scores, rtol=rtol, atol=atol)
             blocks = scores.reshape(3, -1, 8).amax(dim=-1)
             for t, length in enumerate(lengths):
                 if length and blocks[t, (length - 1) // 8] > -torch.inf:
                     blocks[t, (length - 1) // 8] = torch.inf
-            _check(eager[2], eager[3], blocks)
+            _check(eager[2], eager[3], blocks, rtol=rtol, atol=atol)
             for t in range(3):
                 scores[t].masked_fill_(
                     ~torch.isin(logical[t] // 8, eager[2][t].cpu()), -torch.inf
                 )
-            _check(eager[4], eager[5], scores)
+            _check(eager[4], eager[5], scores, rtol=rtol, atol=atol)
             assert eager[6].shape == (3, 0) and not eager[7].any()
             if shards == 4:
                 packed = torch.cat([tensor.flatten() for tensor in captured])
@@ -332,6 +361,102 @@ def test_index_scan_graph_oracle(device, shards, dtype, tp_group):
         # NCCL destruction waits for captured graph references to be released.
         if graph is not None:
             graph.reset()
+
+
+@pytest.mark.parametrize("shards", [1, 4], ids=["local", "tp4"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_index_scan_graph_oracle(device, shards, dtype, tp_group, require):
+    run_index_scan_graph_oracle(
+        device, shards, dtype, tp_group, require, "triton", rtol=0, atol=0
+    )
+
+
+def run_index_topk_full_and_reindex(
+    device, solution, heads, candidate_topk, topk, require, match_triton=True
+):
+    require("attention", "dsv41_index_topk", solution, torch.bfloat16, "x")
+    torch.manual_seed(17)
+    visible = (200, 64, 0)
+    tokens, pages = len(visible), 4
+    q = torch.randn((tokens, heads, 128), dtype=torch.bfloat16, device=device)
+    w = torch.randn((tokens, heads), dtype=torch.bfloat16, device=device)
+    keys = torch.randn((pages * 64, 128), dtype=torch.bfloat16, device=device)
+    cache = torch.zeros((pages, 64, 68), dtype=torch.uint8, device=device)
+    dsv41.cache_scatter(keys, cache, torch.arange(pages * 64, device=device), "index")
+    table = torch.arange(pages, dtype=torch.int32, device=device).expand(tokens, -1)
+    lens = torch.tensor(visible, dtype=torch.int32, device=device)
+    kwargs = dict(
+        index_q=q,
+        weights=w,
+        index_cache=cache,
+        page_table=table,
+        visible_lens=lens,
+        candidate_blocks=None,
+        topk=topk,
+        candidate_topk=candidate_topk,
+        candidate_block_size=8,
+        query_chunk_size=2,
+        score_chunk_size=64,
+        process_group=None,
+        out=None,
+        solution=solution,
+    )
+    got = dsv41.index_topk(**kwargs)
+    if match_triton:
+        want = implementation.index_topk(
+            q, w, cache, table, lens, None, topk, candidate_topk, 8, 2, 64, None, None
+        )
+        for actual, expected in zip(got, want, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    else:
+        physical = _oracle(q, w, keys, 1)
+        logical = torch.arange(pages * 64)
+        pages_idx = table.cpu().gather(1, logical.expand(tokens, -1) // 64).long()
+        scores = physical.gather(1, pages_idx * 64 + logical % 64)
+        scores.masked_fill_(
+            (logical.expand(tokens, -1) >= lens.cpu()[:, None]) | (pages_idx < 0),
+            -torch.inf,
+        )
+        _check(got[0], got[1], scores, rtol=2e-2, atol=2e-2)
+        if candidate_topk:
+            blocks = scores.reshape(tokens, -1, 8).amax(dim=-1)
+            for t, length in enumerate(visible):
+                if length and blocks[t, (length - 1) // 8] > -torch.inf:
+                    blocks[t, (length - 1) // 8] = torch.inf
+            _check(got[2], got[3], blocks, rtol=2e-2, atol=2e-2)
+    if candidate_topk:
+        kwargs["candidate_blocks"] = got[2]
+        kwargs["candidate_topk"] = 0
+        reindex = dsv41.index_topk(**kwargs)
+        if match_triton:
+            want_reindex = implementation.index_topk(
+                q, w, cache, table, lens, got[2], topk, 0, 8, 2, 64, None, None
+            )
+            for actual, expected in zip(reindex, want_reindex, strict=True):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        else:
+            logical = torch.arange(pages * 64)
+            physical = _oracle(q, w, keys, 1)
+            pages_idx = table.cpu().gather(1, logical.expand(tokens, -1) // 64).long()
+            scores = physical.gather(1, pages_idx * 64 + logical % 64)
+            scores.masked_fill_(
+                (logical.expand(tokens, -1) >= lens.cpu()[:, None]) | (pages_idx < 0),
+                -torch.inf,
+            )
+            for t in range(tokens):
+                scores[t].masked_fill_(
+                    ~torch.isin(logical // 8, got[2][t].cpu()), -torch.inf
+                )
+            _check(reindex[0], reindex[1], scores, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("heads", [1, 8, 32])
+@pytest.mark.parametrize("candidate_topk", [0, 17])
+@pytest.mark.parametrize("topk", [65, 512])
+def test_index_topk_full_and_reindex(device, heads, candidate_topk, topk, require):
+    run_index_topk_full_and_reindex(
+        device, "triton", heads, candidate_topk, topk, require
+    )
 
 
 def test_native_indexer_page_contract_and_graph_lengths(device):
@@ -359,7 +484,7 @@ def test_native_indexer_page_contract_and_graph_lengths(device):
 
     def run():
         return dsv41.index_topk(
-            q, weights, cache, table, visible, None, 16, 32, 8, 1, 64, None, None
+            q, weights, cache, table, visible, None, 16, 32, 8, 1, 64, None, None, None
         )
 
     output = run()
@@ -379,7 +504,7 @@ def test_native_indexer_page_contract_and_graph_lengths(device):
     strided = torch.zeros((3, 64, 136), device=device, dtype=torch.uint8)[..., ::2]
     dsv41.cache_scatter(keys, strided, torch.arange(192, device=device), "index")
     result = dsv41.index_topk(
-        q, weights, strided, table, visible, None, 16, 0, 8, 1, 64, None, None
+        q, weights, strided, table, visible, None, 16, 0, 8, 1, 64, None, None, None
     )
     assert result[1].item() == 16
     assert not ((result[0] >= 64) & (result[0] < 128)).any()
@@ -414,7 +539,20 @@ def test_native_broadcast_history_matches_paged_and_refreshes_graph(device):
 
     def run(pages):
         return dsv41.index_topk(
-            q, weights, cache, pages, lengths, None, 512, 64, 8, 1024, 256, None, None
+            q,
+            weights,
+            cache,
+            pages,
+            lengths,
+            None,
+            512,
+            64,
+            8,
+            1024,
+            256,
+            None,
+            None,
+            None,
         )
 
     dense, paged = run(table), run(table.clone())

@@ -5,6 +5,29 @@ import tokenspeed_kernel
 import torch
 from utils import is_cdna4
 
+
+def _sigmoid_topk(
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    routed_scaling_factor: float = 1.0,
+    normalize_topk_weights: bool = True,
+    logical_to_physical_map: torch.Tensor | None = None,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return tokenspeed_kernel.moe_topk(
+        router_logits,
+        topk,
+        score_function="sigmoid",
+        selection_method="topk",
+        renormalize=normalize_topk_weights,
+        routed_scaling_factor=routed_scaling_factor,
+        correction_bias=correction_bias,
+        logical_to_physical_map=logical_to_physical_map,
+        solution=solution,
+    )
+
+
 if not is_cdna4():
     pytest.skip(
         "AMD CDNA4 is required for Gluon decode sigmoid-bias top-k tests",
@@ -36,7 +59,7 @@ def test_decode_sigmoid_bias_topk_generalizes_expert_geometry(
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        weights, ids = tokenspeed_kernel.moe_sigmoid_bias_topk(
+        weights, ids = _sigmoid_topk(
             logits,
             bias,
             topk,
@@ -77,7 +100,7 @@ def test_decode_sigmoid_bias_topk_k3_numerics(
     torch.manual_seed(7)
     logits = (torch.randn(1, 896, device="cuda") * 0.2).float()
     bias = (torch.randn(896, device="cuda") * 0.01).float()
-    expected_weights, expected_ids = tokenspeed_kernel.moe_sigmoid_bias_topk(
+    expected_weights, expected_ids = _sigmoid_topk(
         logits,
         bias,
         16,
@@ -85,7 +108,7 @@ def test_decode_sigmoid_bias_topk_k3_numerics(
         normalize_topk_weights=normalize,
         solution="torch",
     )
-    weights, ids = tokenspeed_kernel.moe_sigmoid_bias_topk(
+    weights, ids = _sigmoid_topk(
         logits,
         bias,
         16,
@@ -111,7 +134,7 @@ def test_decode_sigmoid_bias_topk_fuses_logical_to_physical_map() -> None:
         device="cuda",
         dtype=torch.int32,
     )
-    expected_weights, logical_ids = tokenspeed_kernel.moe_sigmoid_bias_topk(
+    expected_weights, logical_ids = _sigmoid_topk(
         logits,
         bias,
         16,
@@ -120,7 +143,7 @@ def test_decode_sigmoid_bias_topk_fuses_logical_to_physical_map() -> None:
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        weights, ids = tokenspeed_kernel.moe_sigmoid_bias_topk(
+        weights, ids = _sigmoid_topk(
             logits,
             bias,
             16,
@@ -140,12 +163,12 @@ def test_decode_sigmoid_bias_topk_accepts_int64_map(tokens: int) -> None:
     bias = torch.randn(896, device="cuda", dtype=torch.float32)
     logical_to_physical = torch.randperm(896, device="cuda", dtype=torch.int64)
 
-    expected_weights, logical_ids = tokenspeed_kernel.moe_sigmoid_bias_topk(
+    expected_weights, logical_ids = _sigmoid_topk(
         logits,
         bias,
         16,
     )
-    weights, ids = tokenspeed_kernel.moe_sigmoid_bias_topk(
+    weights, ids = _sigmoid_topk(
         logits,
         bias,
         16,

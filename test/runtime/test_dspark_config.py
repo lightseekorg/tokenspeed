@@ -423,6 +423,7 @@ def _draft_attn_config(algorithm: str, layer_types: tuple[str, ...]):
         data_parallel_size=None,
         max_cudagraph_capture_size=80,
         chunked_prefill_size=8192,
+        skip_softmax_threshold=0.0,
         disaggregation_mode="null",
         attn_tp_size=4,
         mapping=SimpleNamespace(

@@ -147,6 +147,7 @@ def layout(
                 family=entry.family,
                 transfer_policy=entry.transfer_policy,
                 checkpoint_granularity=entry.prefix_granularity,
+                replayable=False,
             )
             if entry.family == "state" and entry.retention == "full_history"
             else CacheGroupSpec(
@@ -157,6 +158,7 @@ def layout(
                 sliding_window_tokens=entry.sliding_window_tokens,
                 family=entry.family,
                 transfer_policy=entry.transfer_policy,
+                replayable=False,
             )
         )
         for entry in groups

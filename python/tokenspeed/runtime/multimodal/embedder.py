@@ -133,19 +133,14 @@ def warmup_multimodal_encoders(
                     torch.cuda.synchronize(warmup_device)
         except Exception:
             logger.exception(
-                "Multimodal encoder warmup failed: modality=%s",
-                modality.name.lower(),
+                f"Multimodal encoder warmup failed: modality={modality.name.lower()!s}",
             )
             raise
         logger.info(
-            "Multimodal encoder warmup complete: modality=%s "
-            "feature_shapes=%s elapsed=%.3f ms",
-            modality.name.lower(),
-            [
-                tuple(item.feature.shape) if item.feature is not None else None
-                for item in items
-            ],
-            (time.perf_counter() - start) * 1000.0,
+            f"Multimodal encoder warmup complete: modality={modality.name.lower()!s} "
+            "feature_shapes="
+            f"{[tuple(item.feature.shape) if item.feature is not None else None for item in items]!s}"
+            f" elapsed={(time.perf_counter() - start) * 1000.0:.3f} ms",
         )
 
 
@@ -388,22 +383,17 @@ class MultimodalEmbedder:
                 if items
             }
             logger.info(
-                "mm_timing multimodal_embedder_apply_ms total=%.3f plan=%.3f "
-                "encode=%.3f alias=%.3f assemble=%.3f feature_cleanup=%.3f "
-                "scatter_ranges=%d misses=%s input_rows=%d aliases=%d "
-                "released_alias_features=%d released_encoded_features=%d",
-                (time.perf_counter() - total_started) * 1000,
-                plan_elapsed_ms,
-                encode_elapsed_ms,
-                alias_elapsed_ms,
-                assemble_elapsed_ms,
-                cleanup_elapsed_ms,
-                len(plan.scatter_ranges),
-                misses,
-                int(input_ids.numel()),
-                sum(len(items) for items in plan.aliases_by_canonical.values()),
-                released_alias_features,
-                released_encoded_features,
+                "mm_timing multimodal_embedder_apply_ms total="
+                f"{(time.perf_counter() - total_started) * 1000:.3f} plan="
+                f"{plan_elapsed_ms:.3f} "
+                f"encode={encode_elapsed_ms:.3f} alias={alias_elapsed_ms:.3f} assemble="
+                f"{assemble_elapsed_ms:.3f} feature_cleanup={cleanup_elapsed_ms:.3f} "
+                f"scatter_ranges={len(plan.scatter_ranges):d} misses={misses!s} "
+                f"input_rows={int(input_ids.numel()):d} aliases="
+                f"{sum((len(items) for items in plan.aliases_by_canonical.values())):d}"
+                " "
+                f"released_alias_features={released_alias_features:d} "
+                f"released_encoded_features={released_encoded_features:d}",
             )
         return input_embeds, kwargs
 

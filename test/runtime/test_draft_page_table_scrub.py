@@ -146,6 +146,8 @@ class IdleReplayScrubTest(unittest.TestCase):
                 extend_prefix_lens_cpu=torch.zeros(8, dtype=torch.int32),
                 extend_seq_lens_buf=torch.zeros(8, dtype=torch.int32),
                 extend_seq_lens_cpu=torch.zeros(8, dtype=torch.int32),
+                extend_replay_lens_cpu=torch.zeros(8, dtype=torch.int32),
+                extend_prompt_lens_cpu=torch.zeros(8, dtype=torch.int32),
                 fill_dummy_decode_buffers=lambda batch_size, total_tokens: None,
             ),
             runtime_states=SimpleNamespace(

@@ -57,6 +57,7 @@ class _FakeLLM:
         self.server_args = SimpleNamespace(
             weight_version="default",
             model="model-x",
+            kvstore_storage_backend=None,
         )
         self.updates = []
         self.scheduler_calls = []
@@ -135,6 +136,32 @@ class TestWeightVersionHTTP(unittest.TestCase):
             client.post("/update_weight_version", json={}).status_code,
             400,
         )
+
+    def test_sglang_direct_version_update_rejects_l3_without_mutation(self):
+        llm = _FakeLLM()
+        llm.server_args.kvstore_storage_backend = "mooncake"
+        client = TestClient(build_sglang_compat_app(llm))
+
+        for new_version in ("new-checkpoint", 7, "default"):
+            with self.subTest(new_version=new_version):
+                response = client.post(
+                    "/update_weight_version", json={"new_version": new_version}
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertFalse(response.json()["success"])
+                self.assertIn(
+                    "/update_weights_from_distributed", response.json()["message"]
+                )
+                self.assertEqual(llm.server_args.weight_version, "default")
+                self.assertEqual(
+                    client.get("/get_weight_version").json(),
+                    {"weight_version": "default"},
+                )
+                self.assertEqual(
+                    client.get("/model_info").json()["weight_version"], "default"
+                )
+        self.assertEqual(llm.updates, [])
+        self.assertEqual(llm.scheduler_calls, [])
 
     def test_sglang_updates_stamp_only_after_success(self):
         llm = _FakeLLM()

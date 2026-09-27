@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cuda import (
     chain_speculative_sampling_target_only,
 )
@@ -58,6 +59,7 @@ from tokenspeed.runtime.sampling.utils import (
     coin_eps,
     gather_token_logprobs_torch,
 )
+from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
@@ -237,23 +239,9 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._ones_buf = torch.ones(
             (max_pad_bs,), dtype=torch.int32, device=config.device
         )
-        # predict + accept_length share one packed backing store.
-        # Layout: [0, max_bs * max_n) is predict, [max_bs * max_n, total)
-        # is accept_length.
-        self._predict_max = max_pad_bs * max_n
-        self._output_pack_buf = torch.zeros(
-            (self._predict_max + max_pad_bs,),
-            dtype=torch.int32,
-            device=config.device,
-        )
-        self._predict_buf = self._output_pack_buf[: self._predict_max]
-        self._accept_length_buf = self._output_pack_buf[self._predict_max :]
-        # Flat layout so [:bs * n].view(bs, n) is contiguous for any bs/n.
-        self._accept_index_buf = torch.zeros(
-            (max_pad_bs * max_n,),
-            dtype=torch.int32,
-            device=config.device,
-        )
+        # DP padding may need more verify rows than max_bs.
+        if max_pad_bs != config.max_bs:
+            self._allocate_verify_outputs(max_pad_bs, max_n)
 
         self._predict_local_buf: torch.Tensor | None = None
         self._accept_index_local_buf: torch.Tensor | None = None
@@ -337,6 +325,18 @@ class FlashInferSamplingBackend(SamplingBackend):
             offset=offsets,
             deterministic=True,
         )
+        if global_server_args_dict["numerics"] == "rl-bitwise":
+            # The pool route serves greedy rows through the stochastic
+            # kernel, whose top-1 filter resolves EXACT logit ties in
+            # reduction order — run-stable but not batch-invariant. Overlay
+            # the canonical lowest-index argmax on greedy rows; elementwise,
+            # so the graph-captured path stays one path.
+            canonical = sampling_argmax(logits)
+            batch_next_token_ids = torch.where(
+                top_ks == 1,
+                canonical.to(batch_next_token_ids.dtype),
+                batch_next_token_ids,
+            )
 
         bs = logits.shape[0]
         # Land the tokens in the packed output region so both outputs alias
@@ -556,7 +556,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         # fused top-k + top-p is bit-identical across ranks and does not need
         # a broadcast.
         elif pdl_enabled() or not _FUSED_TOPK_TOPP_AVAILABLE:
-            self.maybe_broadcast(predict, accept_index, accept_length)
+            self.broadcast_verify_outputs()
 
         if self.config.enable_output_logprobs and not dp_sampling:
             logits_output.next_token_logprobs = gather_token_logprobs_torch(

@@ -70,7 +70,8 @@ def test_no_call_site_decides_sanitization_for_itself() -> None:
     write's arg builder does -- still lets the pool decide.
     """
     root = pathlib.Path(__file__).resolve().parents[2] / "python"
-    allowed = {"hybrid_kda.py", "mla.py"}  # the two definitions themselves
+    # GLM sanitizes before its store kernel; the pool owns that decision too.
+    allowed = {"hybrid_kda.py", "hybrid_glm53_flash.py", "mla.py"}
     offenders = sorted(
         str(path.relative_to(root))
         for path in root.rglob("*.py")

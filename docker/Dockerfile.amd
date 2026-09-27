@@ -22,7 +22,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Native builds use the environment's setuptools because build isolation is
 # disabled. Keep it below 82, as required by the ROCm installation path.
 RUN python3 -m pip install --upgrade pip "setuptools<82" wheel && \
-    python3 -m pip install cmake ninja
+    python3 -m pip install cmake ninja && \
+    python3 -m pip install --upgrade torch==2.14.0 torchvision==0.29.0 \
+        --index-url https://download.pytorch.org/whl/rocm7.2
 
 COPY . /workspace
 

@@ -27,10 +27,13 @@ runs the two linear layers with the SiTU epilogue. Runs on SM90+.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
-from kimi3_reference import mxfp4_moe_reference
+from kimi3_reference import _mxfp4_linear, mxfp4_moe_reference
 from tokenspeed_kernel.ops.moe.marlin.mxfp4 import (
+    _swiglu_limit,
     marlin_mxfp4_moe_weights,
     marlin_mxfp4_precomputed_moe_apply,
 )
@@ -237,3 +240,144 @@ def test_marlin_mxfp4_silu_without_situ_beta() -> None:
         plan, x, w, None, topk_weights=topk_weights, topk_ids=topk_ids
     )
     torch.testing.assert_close(actual.float(), expected.float(), atol=5e-2, rtol=5e-2)
+
+
+def _clamped_swiglu_moe_reference(
+    x, raw, topk_ids, topk_weights, limit: float | None
+) -> torch.Tensor:
+    """Routed MXFP4 experts with the checkpoint's SwiGLU clamp: ``gate`` is
+    clipped from above only, ``up`` on both sides, before ``silu(gate) * up``
+    (DeepSeek-V4.1 ``inference/model.py`` ``Expert.forward``)."""
+    combined = torch.zeros_like(x, dtype=torch.float32)
+    for expert_id in range(raw["w13_weight"].shape[0]):
+        token_ids, slot_ids = (topk_ids == expert_id).nonzero(as_tuple=True)
+        if not token_ids.numel():
+            continue
+        gate_up = _mxfp4_linear(
+            x.index_select(0, token_ids),
+            raw["w13_weight"][expert_id],
+            raw["w13_scale"][expert_id],
+            activation_dtype=torch.bfloat16,
+            output_dtype=torch.bfloat16,
+        )
+        gate, up = gate_up.float().chunk(2, dim=-1)
+        if limit is not None:
+            gate = gate.clamp(max=limit)
+            up = up.clamp(-limit, limit)
+        hidden = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
+        out = _mxfp4_linear(
+            hidden,
+            raw["w2_weight"][expert_id],
+            raw["w2_scale"][expert_id],
+            activation_dtype=torch.bfloat16,
+            output_dtype=torch.bfloat16,
+        )
+        combined.index_add_(
+            0, token_ids, out.float() * topk_weights[token_ids, slot_ids][:, None]
+        )
+    return combined.to(x.dtype)
+
+
+@pytest.mark.parametrize("ep_size", [1, 2])
+def test_marlin_mxfp4_swiglu_honors_checkpoint_clamp_limit(ep_size: int) -> None:
+    """``w.swiglu_arg.limit`` must reach the GEMM1 epilogue. Weights are scaled
+    so gate/up routinely exceed the checkpoint's limit of 10 and the clamp
+    changes the answer well beyond the tolerance, so an apply that drops the
+    limit fails the comparison instead of passing by accident. ``ep_size`` 2
+    exercises the expert-parallel branch (the production layout: each rank
+    applies its local experts and the ranks are summed)."""
+    _requires_sm90()
+    generator = torch.Generator(device="cuda").manual_seed(29)
+    num_experts, top_k = 8, 2
+    hidden_size, intermediate_size = 256, 128
+    num_tokens = 16
+    limit = 10.0
+
+    x = torch.randn(num_tokens, hidden_size, generator=generator, device="cuda").to(
+        torch.bfloat16
+    )
+    raw = make_mxfp4_moe_weights(
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        generator,
+        device="cuda",
+        scale_range=(126, 127),
+    )
+    topk_ids = (
+        torch.arange(num_tokens * top_k, device="cuda").reshape(num_tokens, top_k)
+        % num_experts
+    ).to(torch.int32)
+    topk_weights = torch.rand(
+        num_tokens, top_k, generator=generator, device="cuda", dtype=torch.float32
+    )
+    topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
+
+    expected = _clamped_swiglu_moe_reference(x, raw, topk_ids, topk_weights, limit)
+    unclamped = _clamped_swiglu_moe_reference(x, raw, topk_ids, topk_weights, None)
+    magnitude = expected.float().abs().max()
+    assert (
+        expected.float() - unclamped.float()
+    ).abs().max() > 0.5 * magnitude, (
+        "the clamp must be active for this test to discriminate"
+    )
+
+    num_local = num_experts // ep_size
+    plan = {"activation": "swiglu"}
+    actual = torch.zeros_like(x, dtype=torch.float32)
+    for ep_rank in range(ep_size):
+        lo = ep_rank * num_local
+        w = _Weights(
+            {k: v[lo : lo + num_local].clone() for k, v in raw.items()},
+            num_local_experts=num_local,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            beta=None,
+            linear_beta=None,
+        )
+        w.activation = "swiglu"
+        w.swiglu_arg = SimpleNamespace(alpha=None, limit=limit)
+        w.swiglu_beta = None
+        marlin_mxfp4_moe_weights(plan, w)
+        actual += marlin_mxfp4_precomputed_moe_apply(
+            plan, x, w, None, topk_weights=topk_weights, topk_ids=topk_ids
+        ).float()
+    # bf16 GEMM outputs at this magnitude carry ~2^-8 relative rounding.
+    torch.testing.assert_close(
+        actual,
+        expected.float(),
+        atol=float(2e-2 * magnitude),
+        rtol=2e-2,
+    )
+
+
+@pytest.mark.parametrize(
+    "swiglu_arg,swiglu_beta,limit",
+    [
+        (None, None, None),
+        (SimpleNamespace(alpha=None, limit=None), None, None),
+        (SimpleNamespace(alpha=1.0, limit=10.0), 0.0, 10.0),
+        (SimpleNamespace(alpha=None, limit=7), None, 7.0),
+    ],
+)
+def test_swiglu_limit_reads_standard_swiglu(swiglu_arg, swiglu_beta, limit) -> None:
+    w = SimpleNamespace(swiglu_arg=swiglu_arg, swiglu_beta=swiglu_beta)
+    assert _swiglu_limit(w) == limit
+
+
+@pytest.mark.parametrize(
+    "swiglu_arg,swiglu_beta",
+    [
+        (SimpleNamespace(alpha=1.702, limit=7.0), None),
+        (SimpleNamespace(alpha=None, limit=None), 1.0),
+        # swiglu_beta is stored on the module on its own; a missing swiglu_arg
+        # must not let it through.
+        (None, 1.0),
+    ],
+)
+def test_swiglu_limit_rejects_alpha_and_beta(swiglu_arg, swiglu_beta) -> None:
+    """Marlin cannot express ``silu(alpha * gate) * (up + beta)``; dropping
+    the knobs silently is the failure mode this guards against."""
+    w = SimpleNamespace(swiglu_arg=swiglu_arg, swiglu_beta=swiglu_beta)
+    with pytest.raises(ValueError, match="standard SwiGLU"):
+        _swiglu_limit(w)

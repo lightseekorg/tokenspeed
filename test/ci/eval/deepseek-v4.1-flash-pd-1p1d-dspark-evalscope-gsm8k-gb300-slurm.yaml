@@ -1,0 +1,57 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-deepseek-v4.1-flash-pd-1p1d-dspark-gsm8k-gb300-slurm
+type: eval
+workflow_stage: model-test
+triggers:
+  - per-commit
+runner:
+  labels:
+    - slurm-gb300-4gpu
+slurm:
+  nodes: 2
+  gpus_per_node: 4
+env:
+  CI: "true"
+  PD_SLURM: "1"
+  WORLD_SIZE: "4"
+  PREFILL_GPUS: "0,1,2,3"
+  DECODE_GPUS: "0,1,2,3"
+  MOE_BACKEND: mega_moe
+  # Keep Mooncake on the InfiniBand fabric; Ethernet RNICs also enumerate here.
+  DISAGGREGATION_IB_DEVICE: "mlx5_0,mlx5_1,mlx5_2,mlx5_3"
+  ENABLE_DSPARK: "1"
+  DECODE_PREFIX_CACHE: "0"
+  GPU_MEMORY_UTILIZATION: "0.95"
+  MAX_MODEL_LEN: "32768"
+  MAX_TOTAL_TOKENS: "262144"
+  MAX_NUM_SEQS: "16"
+  MAX_CUDAGRAPH_CAPTURE_SIZE: "8"
+  REASONING_PARSER: deepseek_v31
+  STARTUP_TIMEOUT: "7200"
+  LB_PORT: "8000"
+install:
+  - bash test/ci_system/install_deps.sh
+server:
+  command: bash test/ci_system/serve_deepseek_v41_flash_pd_1p1d.sh
+  ready:
+    url: http://127.0.0.1:8000/v1/models
+    timeout: 7200
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]==1.11.1'
+  command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model deepseek-ai/DeepSeek-V4.1-Flash
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets gsm8k
+    --dataset-hub huggingface
+    --dataset-args '{"gsm8k":{"dataset_id":"openai/gsm8k"}}'
+    --limit 100
+    --eval-batch-size 8
+    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":30000}'
+report:
+  github_step_summary: true
+score_threshold: 0.90

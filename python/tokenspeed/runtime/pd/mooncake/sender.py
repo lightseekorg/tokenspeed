@@ -43,9 +43,8 @@ class MooncakeKVSender:
         self.bootstrap_room = bootstrap_room
         self.kv_mgr.begin_room(bootstrap_room)
         logger.info(
-            "[MooncakeKVSender.__init__] bootstrap_room=%s bootstrap_addr=%s status=Bootstrapping",
-            bootstrap_room,
-            bootstrap_addr,
+            f"[MooncakeKVSender.__init__] bootstrap_room={bootstrap_room!s} "
+            f"bootstrap_addr={bootstrap_addr!s} status=Bootstrapping",
         )
 
         # inner state
@@ -72,10 +71,8 @@ class MooncakeKVSender:
             raise ValueError("CachePD full-manifest transfer must be final")
 
         logger.info(
-            "[MooncakeKVSender.send] bootstrap_room=%s is_last=%s bootstrap_token=%s",
-            self.bootstrap_room,
-            is_last,
-            bootstrap_token,
+            f"[MooncakeKVSender.send] bootstrap_room={self.bootstrap_room!s} is_last="
+            f"{is_last!s} bootstrap_token={bootstrap_token!s}",
         )
 
         self.kv_mgr.add_transfer_request(
@@ -102,12 +99,9 @@ class MooncakeKVSender:
         )
 
         logger.info(
-            "[MooncakeKVSender.send_layerwise] bootstrap_room=%s "
-            "is_last=%s begin_cache_step=%s interval=%s",
-            self.bootstrap_room,
-            is_last,
-            begin_cache_step,
-            layerwise_interval,
+            f"[MooncakeKVSender.send_layerwise] bootstrap_room={self.bootstrap_room!s} "
+            f"is_last={is_last!s} begin_cache_step={begin_cache_step!s} interval="
+            f"{layerwise_interval!s}",
         )
         self.kv_mgr.add_transfer_request(
             self.bootstrap_room,

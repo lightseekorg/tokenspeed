@@ -60,7 +60,7 @@ def _route_get(bootstrap_addr: str, engine_rank: int, target_dp_group: int):
     try:
         resp = requests.get(url, timeout=5)
     except Exception as e:  # noqa: BLE001 -- any transport failure -> per-room fail
-        logger.error("EPD bootstrap /route fetch failed (%s): %s", url, e)
+        logger.error(f"EPD bootstrap /route fetch failed ({url!s}): {e!s}")
         return None
     if resp.status_code == 200:
         return resp.json()
