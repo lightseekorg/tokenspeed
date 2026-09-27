@@ -2,14 +2,16 @@
 
 configure_package_cache() {
     local cache_root="${CI_CACHE_ROOT:-}"
-    case "${CI_RUNNER_LABEL:-}" in
-        b200v2-*)
+    case "${RUNNER_NAME:-}:${CI_RUNNER_LABEL:-}" in
+        slurm-*:*|*:slurm-*)
+            cache_root="${cache_root:-${XDG_CACHE_HOME:-/home/runner/.cache}}"
+            ;;
+        *:b200v2-*)
             if [ -z "${cache_root}" ] && [ -n "${FLASHINFER_CACHE_DIR:-}" ]; then
                 cache_root="$(dirname "${FLASHINFER_CACHE_DIR}")"
             fi
             cache_root="${cache_root:-/raid/cache}"
             ;;
-        slurm-*) cache_root="${cache_root:-${XDG_CACHE_HOME:-/home/runner/.cache}}" ;;
         *) return 0 ;;
     esac
 
