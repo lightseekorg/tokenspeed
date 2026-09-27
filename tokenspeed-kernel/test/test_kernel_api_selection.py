@@ -3492,7 +3492,7 @@ def test_gluon_mxfp4_gfx1250_apply_selects_kernel_by_average_bpe(
 
     monkeypatch.setattr(
         _moe_gluon_mxfp4.persistent_decode_mxfp_gfx1250,
-        "gluon_mxfp4_a8w4_persistent_decode",
+        "launch_gluon_mxfp4_a8w4_persistent_decode_gfx1250",
         fake_persistent_moe,
     )
     monkeypatch.setattr(
@@ -3577,7 +3577,7 @@ def test_gluon_mxfp4_gfx1250_situ_apply_selects_decode_implementation(
 
     monkeypatch.setattr(
         _moe_gluon_mxfp4.persistent_decode_mxfp_gfx1250,
-        "gluon_mxfp4_a8w4_persistent_decode",
+        "launch_gluon_mxfp4_a8w4_persistent_decode_gfx1250",
         fake_persistent_moe,
     )
     monkeypatch.setattr(

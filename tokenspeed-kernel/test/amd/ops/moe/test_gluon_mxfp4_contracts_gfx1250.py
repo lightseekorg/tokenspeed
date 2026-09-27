@@ -408,3 +408,25 @@ def test_no_wmma_tile_starts_past_the_block(
             last_n = max(n for _, n in origins) * layout.instr_shape[1]
             assert last_m < block_m, layout
             assert last_n < block_n, layout
+
+
+@pytest.mark.parametrize(
+    ("block_n", "output_width", "expected"),
+    [
+        (128, 0, False),
+        (128, 128, True),
+        (128, 256, True),
+        (128, 2880, False),
+        (128, 3072, True),
+        (256, 0, False),
+        (256, 128, False),
+        (256, 256, True),
+        (256, 2880, False),
+        (256, 3072, True),
+    ],
+)
+def test_persistent_output_width_tracks_production_tile(
+    block_n: int, output_width: int, expected: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(persistent_decode, "_BLOCK_N", block_n)
+    assert persistent_decode.supports_output_width(output_width) is expected

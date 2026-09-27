@@ -215,7 +215,9 @@ def _situ_apply_recording_kernels(
 ) -> tuple[torch.Tensor, list]:
     kernels: list = []
     original_matmul = fused.matmul
-    original_persistent_combine = persistent_decode._persistent_a8w4_combine
+    original_persistent_combine = (
+        persistent_decode.launch_gluon_mxfp4_a8w4_persistent_combine_gfx1250
+    )
 
     def recording_matmul(*args, **kwargs):
         kwargs["partial_tdm"] = partial_tdm
@@ -232,7 +234,7 @@ def _situ_apply_recording_kernels(
     monkeypatch.setattr(fused, "matmul", recording_matmul)
     monkeypatch.setattr(
         persistent_decode,
-        "_persistent_a8w4_combine",
+        "launch_gluon_mxfp4_a8w4_persistent_combine_gfx1250",
         recording_persistent_combine,
     )
     try:

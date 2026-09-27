@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from kimi3_reference import dequantize_mxfp4
 from utils import (
+    assert_no_triton_compile,
     is_amd,
     is_cdna4,
     is_cdna5,
@@ -972,7 +973,7 @@ def test_persistent_static_fp8_activation_moe_gfx1250(
         num_experts,
         top_k,
     )
-    actual = gfx1250_persistent.gluon_mxfp4_a8w4_persistent_decode(
+    actual = gfx1250_persistent.launch_gluon_mxfp4_a8w4_persistent_decode_gfx1250(
         hidden_states,
         topk_weights,
         topk_ids,
@@ -1004,3 +1005,52 @@ def test_persistent_static_fp8_activation_moe_gfx1250(
     assert actual.shape == hidden_states.shape
     assert torch.count_nonzero(expected).item() > 0
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_persistent_decode_batch_sizes_reuse_compilation_gfx1250() -> None:
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for persistent A8W4 MoE")
+
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    num_experts, hidden_size, intermediate_size, top_k = 32, 128, 128, 2
+    raw = make_mxfp4_moe_weights(num_experts, hidden_size, intermediate_size, generator)
+    module = _make_static_fp8_moe_module(
+        raw, preprocess_gluon_mxfp4_gfx1250_moe_weights
+    )
+    counts = (1, 8, 9, 16, 32, 2, 3, 7, 15, 17, 24, 31)
+    cases = {}
+    for count in counts:
+        hidden = torch.randn(
+            count, hidden_size, dtype=torch.bfloat16, device="cuda", generator=generator
+        )
+        weights, ids = make_round_robin_topk(count, num_experts, top_k)
+        cases[count] = hidden, weights, ids
+
+    def run(count: int) -> None:
+        hidden, weights, ids = cases[count]
+        output = gfx1250_persistent.launch_gluon_mxfp4_a8w4_persistent_decode_gfx1250(
+            hidden,
+            weights,
+            ids,
+            module.w13_weight_triton_tensor,
+            module.w2_weight_triton_tensor,
+            w13_mx_scale=module.w13_precision_config.b_mx_scale,
+            w2_mx_scale=module.w2_precision_config.b_mx_scale,
+            activation="silu",
+        )
+        assert output.shape == hidden.shape
+        assert torch.isfinite(output).all()
+
+    # Warm the existing gate/up kernel's integer specialization classes and
+    # both routing regimes. Every count stays within two routes per expert.
+    for count in counts[:5]:
+        run(count)
+    with (
+        assert_no_triton_compile(gfx1250_fused._matmul_decode),
+        assert_no_triton_compile(
+            gfx1250_persistent.gluon_mxfp4_a8w4_persistent_combine_gfx1250
+        ),
+    ):
+        for count in counts[5:]:
+            run(count)
+    torch.cuda.synchronize()

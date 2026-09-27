@@ -419,6 +419,10 @@ small-M decode kernel, while combine uses a fixed worker grid so each workgroup
 can process multiple logical expert/output tiles. SiLU, SwiGLU, and SiTU share
 this path. The gate/up epilogue scales and casts directly to E4M3, matching
 the regular path without an intermediate BF16/FP16 rounding step.
+The shared `gluon_mxfp4_a8w4_persistent_combine_gfx1250` kernel and its
+`launch_` entry serve both registered SiTU and standard apply operations.
+Row counts stay runtime arguments; a warmup-and-sweep test checks compilation
+reuse across batch sizes for both the gate/up and persistent combine kernels.
 
 #### Contract
 

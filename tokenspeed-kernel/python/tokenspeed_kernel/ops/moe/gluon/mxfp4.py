@@ -75,8 +75,7 @@ def _use_gfx1250_persistent_moe(
     return (
         0 < num_routed_rows
         and num_routed_rows <= _GFX1250_PERSISTENT_MAX_AVERAGE_BPE * num_experts
-        and output_width > 0
-        and output_width % 128 == 0
+        and persistent_decode_mxfp_gfx1250.supports_output_width(output_width)
     )
 
 
@@ -685,7 +684,7 @@ if platform.is_amd:
             "out": getattr(w, "_situ_output_buffer", None),
         }
         if persistent:
-            return persistent_decode_mxfp_gfx1250.gluon_mxfp4_a8w4_persistent_decode(
+            return persistent_decode_mxfp_gfx1250.launch_gluon_mxfp4_a8w4_persistent_decode_gfx1250(
                 x,
                 topk_weights,
                 topk_ids,
@@ -783,7 +782,7 @@ if platform.is_amd:
             "swiglu_beta": swiglu_beta,
         }
         if persistent:
-            return persistent_decode_mxfp_gfx1250.gluon_mxfp4_a8w4_persistent_decode(
+            return persistent_decode_mxfp_gfx1250.launch_gluon_mxfp4_a8w4_persistent_decode_gfx1250(
                 x,
                 topk_weights,
                 topk_ids,

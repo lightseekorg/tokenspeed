@@ -58,6 +58,11 @@ _SUPPORTED_NUM_WARPS = (4, 8)
 _SUPPORTED_NUM_BUFFERS = (2, 3)
 
 
+def supports_output_width(output_width: int) -> bool:
+    """Return whether the output width fits the production combine tile."""
+    return output_width > 0 and output_width % _BLOCK_N == 0
+
+
 def persistent_moe_num_wgs(available_cus: int, wgs_per_cu: int) -> int:
     """Return the persistent worker-grid size for a device."""
     if available_cus <= 0:
@@ -112,7 +117,7 @@ def _validate_persistent_config(
         raise ValueError(f"partial_tdm requires 4 or 8 warps, got {num_warps}")
 
 
-def _persistent_combine_launch_metadata(grid, kernel, args):
+def _gluon_mxfp4_a8w4_persistent_combine_gfx1250_metadata(grid, kernel, args):
     """Report capacity-level A8W4 work and traffic to Proton."""
     m = args["M"]
     n = args["N"]
@@ -128,8 +133,11 @@ def _persistent_combine_launch_metadata(grid, kernel, args):
     }
 
 
-@gluon.jit(launch_metadata=_persistent_combine_launch_metadata)
-def _persistent_a8w4_combine_kernel(
+@gluon.jit(
+    launch_metadata=_gluon_mxfp4_a8w4_persistent_combine_gfx1250_metadata,
+    do_not_specialize=["M", "writeback_size"],
+)
+def gluon_mxfp4_a8w4_persistent_combine_gfx1250(
     Y,
     stride_y_m,
     stride_y_n,
@@ -439,7 +447,7 @@ def _persistent_a8w4_combine_kernel(
             gl.amd.cdna5.tdm.async_wait(0)
 
 
-def _persistent_a8w4_combine(
+def launch_gluon_mxfp4_a8w4_persistent_combine_gfx1250(
     x: torch.Tensor,
     w: torch.Tensor,
     w_scale: torch.Tensor,
@@ -559,7 +567,7 @@ def _persistent_a8w4_combine(
     w_scale_strides = (0,) * (3 - len(w_scale_strides)) + tuple(w_scale_strides)
     bias_stride = None if bias is None else bias.stride(0)
 
-    kernel = _persistent_a8w4_combine_kernel[(grid,)](
+    kernel = gluon_mxfp4_a8w4_persistent_combine_gfx1250[(grid,)](
         output,
         *output.stride(),
         x_global_scale,
@@ -599,7 +607,7 @@ def _persistent_a8w4_combine(
     return output, kernel
 
 
-def gluon_mxfp4_a8w4_persistent_decode(
+def launch_gluon_mxfp4_a8w4_persistent_decode_gfx1250(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -720,7 +728,7 @@ def gluon_mxfp4_a8w4_persistent_decode(
         decode=True,
         partial_tdm=False,
     )
-    flat, _ = _persistent_a8w4_combine(
+    flat, _ = launch_gluon_mxfp4_a8w4_persistent_combine_gfx1250(
         intermediate_fp8,
         w2_weight,
         w2_mx_scale,
@@ -747,6 +755,7 @@ def gluon_mxfp4_a8w4_persistent_decode(
 
 
 __all__ = [
-    "gluon_mxfp4_a8w4_persistent_decode",
+    "launch_gluon_mxfp4_a8w4_persistent_decode_gfx1250",
     "persistent_moe_num_wgs",
+    "supports_output_width",
 ]
