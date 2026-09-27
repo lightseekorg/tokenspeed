@@ -39,6 +39,7 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
 
 V4_KERNEL_BLOCK_ROWS: int = 64
 V4_SWA_KV_GROUP_ID = "v4.swa_kv"
+V4_INDEXER_KV_GROUP_ID = "v4.c4a.indexer_kv"
 V4_INDEXER_COMPRESSOR_STATE_GROUP_ID = "v4.c4a.indexer_compressor_state"
 DEEPSEEK_V4_FP8_MAX = 448.0
 DEEPSEEK_V4_FP8_QUANT_BLOCK = 64
@@ -47,9 +48,11 @@ DEEPSEEK_V4_FP8_SCALE_BYTES = 4
 DEEPSEEK_V4_MXFP4_BLOCK_SIZE = 32
 DEEPSEEK_V4_MXFP4_SCALE_BYTES = 1
 DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT = 128
-# Per compression ratio: how long the compressor tail must be retained, and how
-# many rows of it share one cache block. Both the kernel cache layout and the
-# recipe's group specs read these, so the tables live here once.
+# Per compression ratio: how long the compressor tail must be retained -- the
+# positions the compress kernel reads when a group completes (two groups for
+# the overlapping ratio-4 compressor, one for ratio 128) -- and how many rows
+# of it share one cache block. Both the kernel cache layout and the recipe's
+# group specs read these, so the tables live here once.
 V4_COMPRESSOR_STATE_WINDOW_TOKENS = {4: 8, 128: 128}
 V4_COMPRESSOR_STATE_ROWS_PER_PAGE = {4: 4, 128: 8}
 

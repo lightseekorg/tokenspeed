@@ -64,6 +64,7 @@ class CommBackend(ABC):
         producer_direct_max_numel: int,
         attnres_max_numel: int,
         attnres_max_rows: int,
+        enable_lamport: bool,
         dtype: torch.dtype,
     ) -> bool:
         """Return false when the backend has no persistent buffers to prepare."""
@@ -121,7 +122,7 @@ class CommBackend(ABC):
     ) -> torch.Tensor: ...
 
     @abstractmethod
-    def all_gather_into_tensor(
+    def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None: ...
 

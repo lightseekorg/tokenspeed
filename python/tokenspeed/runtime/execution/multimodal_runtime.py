@@ -290,8 +290,8 @@ class MultimodalRuntime:
         for encoder_attr, wrapper in wrappers.items():
             if not hasattr(model, encoder_attr):
                 logger.warning(
-                    "Skipping encoder CUDA graph wrapper for missing attribute %s",
-                    encoder_attr,
+                    "Skipping encoder CUDA graph wrapper for missing attribute "
+                    f"{encoder_attr!s}",
                 )
                 continue
             setattr(model, encoder_attr, wrapper)

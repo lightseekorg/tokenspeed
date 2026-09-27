@@ -88,6 +88,7 @@ class MooncakeKVBootstrapServer(DisaggBootstrapServerBase):
         # Set before super() -- super() starts the server thread, after which a
         # register PUT can call _ingest_put_extra and read these.
         self.prefill_cache_layout_wire: str | None = None
+        self.prefill_cache_fields_by_stage: tuple[tuple[str, ...], ...] | None = None
         super().__init__(port)
 
     def _ingest_put_extra(self, data: dict) -> None:
@@ -100,10 +101,29 @@ class MooncakeKVBootstrapServer(DisaggBootstrapServerBase):
             )
         except (UnicodeEncodeError, ValueError) as exc:
             raise ValueError("CachePD bootstrap layout is invalid") from exc
+        from tokenspeed.runtime.pd.transfer_plan import validate_cache_stage_fields
+
+        raw_stages = data["cache_fields_by_stage"]
+        if not isinstance(raw_stages, (list, tuple)) or any(
+            not isinstance(stage, (list, tuple)) for stage in raw_stages
+        ):
+            raise ValueError("CachePD requires explicit stage field placement")
+        stages = tuple(tuple(stage) for stage in raw_stages)
+        validate_cache_stage_fields(cache_layout, stages)
+        if len(stages) != int(data["pp_size"]):
+            raise ValueError("CachePD placement does not match pipeline stage count")
+        if self.prefill_cache_fields_by_stage not in (None, stages):
+            raise ValueError(
+                "CachePD prefill ranks registered incompatible field placement"
+            )
         canonical_wire = cache_layout.to_wire_bytes().decode("ascii")
         if self.prefill_cache_layout_wire not in (None, canonical_wire):
             raise ValueError("CachePD prefill ranks registered incompatible layouts")
         self.prefill_cache_layout_wire = canonical_wire
+        self.prefill_cache_fields_by_stage = stages
 
     def _extra_parallel_info(self) -> dict:
-        return {"cache_layout": self.prefill_cache_layout_wire}
+        return {
+            "cache_layout": self.prefill_cache_layout_wire,
+            "cache_fields_by_stage": self.prefill_cache_fields_by_stage,
+        }

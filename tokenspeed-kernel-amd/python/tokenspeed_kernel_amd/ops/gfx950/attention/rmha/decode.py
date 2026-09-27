@@ -499,7 +499,7 @@ class AttentionProgram:
 
 
 @gluon.jit
-def _rel_mha_decode_fp16(
+def gluon_rel_mha_decode_gfx950(
     q_ptr,
     rel_logits_ptr,
     k_cache_ptr,
@@ -595,7 +595,7 @@ def _rel_mha_decode_fp16(
 
 
 @gluon.jit
-def _rel_mha_decode_reduce_fp16(
+def gluon_rel_mha_decode_reduce_gfx950(
     mid_o_ptr,
     mid_lse_ptr,
     out_ptr,
@@ -784,7 +784,7 @@ def get_config(
     )
 
 
-def gluon_rel_mha_decode_gfx950(
+def launch_gluon_rel_mha_decode_gfx950(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -833,7 +833,7 @@ def gluon_rel_mha_decode_gfx950(
         config.num_kv_heads * config.num_groups,
         config.num_kv_splits,
     )
-    _rel_mha_decode_fp16[grid](
+    gluon_rel_mha_decode_gfx950[grid](
         q,
         rel_logits,
         k_cache,
@@ -867,7 +867,7 @@ def gluon_rel_mha_decode_gfx950(
     )
 
     grid = (total_q, config.num_q_heads)
-    _rel_mha_decode_reduce_fp16[grid](
+    gluon_rel_mha_decode_reduce_gfx950[grid](
         mid_o,
         mid_lse,
         output,

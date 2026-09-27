@@ -77,8 +77,9 @@ def _serve_fake_engine():
                 eos_token_ids=[tokenizer.token_to_id("<｜end▁of▁sentence｜>")],
                 bos_token_id=tokenizer.token_to_id("<｜begin▁of▁sentence｜>"),
                 weight_version="test",
-                supports_vision=False,
-                supports_multimodal=False,
+                supports_vision=True,
+                supports_multimodal=True,
+                multimodal_encoder_dtype="float32",
             )
 
         def HealthCheck(self, request, context):
@@ -91,6 +92,7 @@ def _serve_fake_engine():
             return pb.GetLoadsResponse()
 
         def Generate(self, request, context):
+            capture.with_suffix(".pb").write_bytes(request.SerializeToString())
             thinking = request.tokenized.input_ids[-1] == tokenizer.token_to_id(
                 "<think>"
             )
@@ -143,8 +145,8 @@ def test_v41_never_selects_v4(model):
     engine, gateway = serve._args_with_default_model_parsers(
         ["--model", model], ["--model", model]
     )
-    assert serve._get_from_args(engine, "--reasoning-parser", None) == "deepseek_v31"
-    assert serve._get_from_args(gateway, "--tool-call-parser", None) == "passthrough"
+    assert serve._get_from_args(engine, "--reasoning-parser", None) == "deepseek_v41"
+    assert serve._get_from_args(gateway, "--tool-call-parser", None) == "deepseek_v41"
     assert "deepseek_v4" not in gateway
 
 
@@ -160,17 +162,17 @@ def test_v41_detects_renamed_local_snapshot(tmp_path, config):
     assert not serve._is_deepseek_v4_model(str(tmp_path))
 
 
-def test_v41_rejects_incompatible_tool_parser():
+def test_v41_preserves_explicit_tool_parser():
     from tokenspeed.cli import serve_smg as serve
 
-    with pytest.raises(ValueError, match="V4 DSML parser is incompatible"):
-        serve._args_with_default_model_parsers(
-            ["--model", "DeepSeek-V4.1-Flash"], ["--tool-call-parser", "deepseek_v4"]
-        )
+    _, gateway = serve._args_with_default_model_parsers(
+        ["--model", "DeepSeek-V4.1-Flash"], ["--tool-call-parser", "passthrough"]
+    )
+    assert serve._get_from_args(gateway, "--tool-call-parser", None) == "passthrough"
 
 
 @pytest.mark.parametrize("custom_template", [False, True])
-def test_serve_registers_template_for_gateway_lifetime(
+def test_serve_uses_native_renderer_or_explicit_template(
     monkeypatch, tmp_path, custom_template
 ):
     from tokenspeed.cli import serve_smg as serve
@@ -182,10 +184,6 @@ def test_serve_registers_template_for_gateway_lifetime(
     async def run(**kwargs):
         path = serve._get_from_args(kwargs["gateway_args"], "--chat-template", None)
         captured.append(path)
-        if custom_template:
-            assert path == "operator-template.jinja"
-        else:
-            assert Path(path).read_text() == serve._DEEPSEEK_V41_CHAT_TEMPLATE
         return 0
 
     monkeypatch.setattr(serve, "run_smg", run)
@@ -197,9 +195,7 @@ def test_serve_registers_template_for_gateway_lifetime(
     with pytest.raises(SystemExit) as exc:
         serve.run_smg_from_args(argparse.Namespace(), argv)
     assert exc.value.code == 0
-    assert len(captured) == 1
-    if not custom_template:
-        assert not Path(captured[0]).exists()
+    assert captured == ["operator-template.jinja" if custom_template else None]
 
 
 @pytest.fixture(scope="module")
@@ -342,8 +338,6 @@ _MESSAGES = [
 ]
 _OPTIONS = [
     {},
-    {"enable_thinking": False},
-    {"enable_thinking": True},
     {"enable_thinking": True, "reasoning_effort": "low"},
     {"enable_thinking": True, "reasoning_effort": 37},
     {"enable_thinking": True, "reasoning_effort": 1},
@@ -353,15 +347,15 @@ _OPTIONS = [
 ]
 
 
-@pytest.mark.parametrize("messages", _MESSAGES)
 @pytest.mark.parametrize(
-    ("options", "top_level_effort"),
-    [(options, None) for options in _OPTIONS]
-    + [
-        (options, effort)
-        for options in ({}, {"enable_thinking": True})
-        for effort in ("low", "high", "max")
-    ],
+    ("messages", "options", "top_level_effort"),
+    [
+        (messages, {"enable_thinking": thinking}, None)
+        for messages in _MESSAGES
+        for thinking in (False, True)
+    ]
+    + [(_MESSAGES[2], options, None) for options in _OPTIONS]
+    + [(_MESSAGES[0], {}, effort) for effort in ("low", "high", "max")],
 )
 def test_http_chat_matches_official_token_ids(
     gateway, reference, messages, options, top_level_effort
@@ -376,7 +370,7 @@ def test_http_chat_matches_official_token_ids(
     }
     if top_level_effort is not None:
         body["reasoning_effort"] = top_level_effort
-    thinking = options.get("enable_thinking", False)
+    thinking = options.get("enable_thinking", True)
     request = urllib.request.Request(
         url + "/v1/chat/completions",
         data=json.dumps(body).encode(),
@@ -388,13 +382,18 @@ def test_http_chat_matches_official_token_ids(
     assert message["content"] == "OK"
     if thinking:
         assert message["reasoning_content"] == "stub reasoning."
+    # SMG and the checkpoint use different names for the same numeric budgets.
+    effort = options.get("reasoning_effort", top_level_effort)
+    effort = {None: 50, "low": 25, "high": 50, "xhigh": 75, "max": 100}.get(
+        effort, effort
+    )
     expected = encoder.encode_messages(
         messages,
         thinking_mode="thinking" if thinking else "chat",
         context=None,
         drop_thinking=options.get("drop_thinking", True),
         add_default_bos_token=True,
-        reasoning_effort=options.get("reasoning_effort", top_level_effort),
+        reasoning_effort=effort,
         return_multi_modal_data=False,
     )
     actual_ids = json.loads(capture.read_text().splitlines()[-1])
@@ -405,54 +404,8 @@ def test_http_chat_matches_official_token_ids(
 @pytest.mark.parametrize(
     "extra",
     [
-        {
-            "tools": [
-                {
-                    "type": "function",
-                    "function": {"name": "lookup", "parameters": {"type": "object"}},
-                }
-            ]
-        },
-        {
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "call1",
-                            "type": "function",
-                            "function": {"name": "lookup", "arguments": "{}"},
-                        }
-                    ],
-                },
-                {"role": "tool", "tool_call_id": "call1", "content": "42"},
-            ]
-        },
-        {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": "data:image/png;base64,invalid"},
-                        }
-                    ],
-                }
-            ]
-        },
-        {
-            "chat_template_kwargs": {
-                "enable_thinking": True,
-                "reasoning_effort": "medium",
-            }
-        },
-        {"chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": 0}},
-        {"chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": 101}},
-        {"chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": True}},
-        {"chat_template_kwargs": {"thinking": True}},
-        {"chat_template_kwargs": {"thinking_mode": "thinking"}},
+        {"chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": effort}}
+        for effort in (0, 101, True)
     ],
 )
 def test_http_unsupported_requests_never_reach_engine(gateway, extra):
@@ -473,12 +426,65 @@ def test_http_unsupported_requests_never_reach_engine(gateway, extra):
         urllib.request.urlopen(request, timeout=5)
     detail = exc.value.read().decode()
     assert exc.value.code in (400, 422), detail
-    assert (
-        "not supported" in detail
-        or "reasoning_effort" in detail
-        or "multimodal" in detail
-    ), detail
+    assert "reasoning_effort" in detail, detail
     assert capture.read_text() == before
+
+
+def test_http_image_reaches_engine_in_v41_format(gateway):
+    import base64
+    import io
+
+    import numpy as np
+    from PIL import Image
+    from smg_grpc_proto import tokenspeed_scheduler_pb2 as pb
+
+    url, capture = gateway
+    pixels = io.BytesIO()
+    Image.new("RGB", (48, 32), color=(220, 30, 80)).save(pixels, format="PNG")
+    image_url = "data:image/png;base64," + base64.b64encode(pixels.getvalue()).decode()
+    body = {
+        "model": "v41-text-test",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image."},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            }
+        ],
+        "max_tokens": 8,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    request = urllib.request.Request(
+        url + "/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        assert json.load(response)["choices"][0]["message"]["content"] == "OK"
+    generated = pb.GenerateRequest.FromString(capture.with_suffix(".pb").read_bytes())
+    assert len(generated.mm_inputs.items) == 1
+    item = generated.mm_inputs.items[0]
+    assert item.encoder_input.shape[0] > 0
+    assert list(item.encoder_input.shape[1:]) == [3, 14, 14]
+    metadata = item.model_specific_tensors
+    assert {"vit_grid", "llm_grid", "types"} <= metadata.keys()
+
+    def integers(name):
+        tensor = metadata[name]
+        assert tensor.WhichOneof("payload") == "inline"
+        return np.frombuffer(tensor.inline, dtype=np.int64).tolist()
+
+    height, width = integers("llm_grid")
+    types = integers("types")
+    assert types == [0] + ([1] * width + [2]) * height + [3]
+    assert len(item.placeholders) == 1
+    span = item.placeholders[0]
+    assert span.length == len(types)
+    assert list(
+        generated.tokenized.input_ids[span.offset : span.offset + span.length]
+    ) == [129264] * len(types)
 
 
 def test_http_streaming_chat(gateway):

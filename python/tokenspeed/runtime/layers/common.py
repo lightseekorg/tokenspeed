@@ -18,21 +18,18 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Small compiled tensor helpers shared across runtime layers."""
+"""Small tensor helpers shared across runtime layers."""
 
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
 def concat(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Concatenate two tensors along the last dimension."""
     return torch.cat([a, b], dim=-1)
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
 def fp8_cast_contiguous(x: torch.Tensor) -> torch.Tensor:
     """Cast to FP8 E4M3 and return a contiguous tensor."""
     return x.to(torch.float8_e4m3fn).contiguous()

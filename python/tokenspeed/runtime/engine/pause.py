@@ -397,7 +397,7 @@ class PauseHooks:
                 if self._reap_or_keep_buffered_spec(spec)
             ]
             if specs:
-                loop.scheduler.submit_requests(specs)
+                loop._submit_scheduler_requests(specs)
 
     def _reap_or_keep_buffered_spec(self, spec) -> bool:
         """Resolve a buffered spec on resume; return True if it should be admitted.
@@ -444,13 +444,13 @@ class PauseHooks:
             return False
         if admitted_specs and not pause_blocked_before:
             logger.warning(
-                "Pause engaged in the same recv batch as %d generate "
-                "request(s) (rids=%s); their FIFO order relative to the "
+                f"Pause engaged in the same recv batch as {len(admitted_specs):d} "
+                "generate "
+                f"request(s) (rids={[spec.request_id for spec in admitted_specs]!s}); "
+                "their FIFO order relative to the "
                 "pause is not preserved, so a pre-pause request may be "
                 "buffered as post-pause work and run only after resume. "
                 "See TODO(pause-fifo).",
-                len(admitted_specs),
-                [spec.request_id for spec in admitted_specs],
             )
         self._pause.buffer_specs(admitted_specs)
         return True

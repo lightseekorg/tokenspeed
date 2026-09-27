@@ -208,9 +208,7 @@ class MooncakeEmbeddingManagerEncode(MooncakeEmbeddingManagerBase):
                 except Exception as exc:  # noqa: BLE001
                     logger.error(
                         "dropping malformed embedding bootstrap frame "
-                        "(%d parts): %s",
-                        len(msg),
-                        exc,
+                        f"({len(msg):d} parts): {exc!s}",
                     )
 
         threading.Thread(target=loop, daemon=True).start()
@@ -242,7 +240,7 @@ class MooncakeEmbeddingManagerEncode(MooncakeEmbeddingManagerBase):
                 last_err = e
             time.sleep(0.5)
         logger.error(
-            "encode failed to register to bootstrap server after retries: %s", last_err
+            f"encode failed to register to bootstrap server after retries: {last_err!s}",
         )
 
     def add_transfer_request(self, room: int, chunk: EmbeddingChunk) -> None:

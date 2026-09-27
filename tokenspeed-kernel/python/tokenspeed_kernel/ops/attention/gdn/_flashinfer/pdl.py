@@ -21,7 +21,7 @@
 """PDL launch adapters for FlashInfer CuTe kernels without upstream PDL APIs.
 
 The original device body is inlined into a kernel that waits for predecessors
-before any global-memory access and signals launch readiness after computation.
+before any global-memory access and then releases successor setup immediately.
 Host launch geometry and runtime ABI stay with FlashInfer. Private namespaces and
 fresh caches keep PDL executors separate from the upstream non-PDL executors;
 no installed module or process-wide CuTe launch API is modified.
@@ -33,6 +33,7 @@ import functools
 import inspect
 import types
 import typing
+from pathlib import Path
 
 import cutlass
 import cutlass.cute as cute
@@ -52,12 +53,12 @@ def _gdn_pdl_kernel(
     constant_args: cutlass.Constexpr,
     constant_positions: cutlass.Constexpr,
 ):
-    # Wait covers in-place conv/state updates and side inputs. Signal late to
-    # avoid scheduling waiting consumers throughout the recurrent computation.
+    # Order ancestor conv/state/side-input writes before releasing successors.
+    # They can prepare while the recurrent body runs, but must wait for results.
     # All CTAs signal, including those whose body skips a padding row.
     cute.arch.griddepcontrol_wait()
-    body(*_merge_arguments(dynamic_args, constant_args, constant_positions))
     cute.arch.griddepcontrol_launch_dependents()
+    body(*_merge_arguments(dynamic_args, constant_args, constant_positions))
 
 
 class _PdlLaunch:
@@ -124,6 +125,23 @@ def _clone_function(function, namespace):
     return clone
 
 
+def _build_and_load_pdl_kernel(
+    module_name, kernel_name, compile_fn, *, extra_key_files, original_builder
+):
+    # FlashInfer's persistent key describes the unmodified upstream kernel.
+    # PDL changes both its device body and launch, so it needs its own artifacts.
+    return original_builder(
+        f"tokenspeed_pdl_{module_name}",
+        kernel_name,
+        compile_fn,
+        extra_key_files=(
+            *extra_key_files,
+            __file__,
+            str(Path(__file__).with_name("adapter.py")),
+        ),
+    )
+
+
 def _adapt_module(module, *, kernels, launchers, entrypoints, caches, overrides):
     """Bind explicit upstream symbols into a private PDL compilation namespace.
 
@@ -131,6 +149,10 @@ def _adapt_module(module, *, kernels, launchers, entrypoints, caches, overrides)
     without dependency synchronization after an incompatible FlashInfer update.
     """
     namespace = dict(vars(module))
+    namespace["build_and_load_cute_dsl_kernel"] = functools.partial(
+        _build_and_load_pdl_kernel,
+        original_builder=module.build_and_load_cute_dsl_kernel,
+    )
     namespace.update(overrides)
     for name in kernels:
         namespace[name] = _PdlKernel(getattr(module, name))

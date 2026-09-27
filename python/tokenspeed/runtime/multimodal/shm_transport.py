@@ -176,11 +176,9 @@ class ShmTensorHandle(msgspec.Struct, eq=False, dict=True):
             self._close_and_unlink()
         if LOG_MM_TIMING and started is not None:
             logger.info(
-                "mm_timing shm_consume_ms name=%s elapsed=%.3f shape=%s dtype=%s",
-                self.shm_name,
-                (time.perf_counter() - started) * 1000,
-                list(self.shape),
-                self.dtype,
+                f"mm_timing shm_consume_ms name={self.shm_name!s} elapsed="
+                f"{(time.perf_counter() - started) * 1000:.3f} shape="
+                f"{list(self.shape)!s} dtype={self.dtype!s}",
             )
         return dst
 
@@ -197,11 +195,9 @@ class ShmTensorHandle(msgspec.Struct, eq=False, dict=True):
             dst = self._copy_to_pinned()
         if LOG_MM_TIMING and started is not None:
             logger.info(
-                "mm_timing shm_copy_to_pinned_ms name=%s elapsed=%.3f shape=%s dtype=%s",
-                self.shm_name,
-                (time.perf_counter() - started) * 1000,
-                list(self.shape),
-                self.dtype,
+                f"mm_timing shm_copy_to_pinned_ms name={self.shm_name!s} elapsed="
+                f"{(time.perf_counter() - started) * 1000:.3f} shape="
+                f"{list(self.shape)!s} dtype={self.dtype!s}",
             )
         return dst
 
@@ -238,11 +234,9 @@ class ShmTensorHandle(msgspec.Struct, eq=False, dict=True):
             self._close_and_unlink()
         if LOG_MM_TIMING and started is not None:
             logger.info(
-                "mm_timing shm_copy_into_ms name=%s elapsed=%.3f shape=%s dtype=%s",
-                self.shm_name,
-                (time.perf_counter() - started) * 1000,
-                list(self.shape),
-                self.dtype,
+                f"mm_timing shm_copy_into_ms name={self.shm_name!s} elapsed="
+                f"{(time.perf_counter() - started) * 1000:.3f} shape="
+                f"{list(self.shape)!s} dtype={self.dtype!s}",
             )
 
     def _copy_to_pinned(self) -> torch.Tensor:
@@ -285,11 +279,9 @@ class ShmTensorHandle(msgspec.Struct, eq=False, dict=True):
         self._close_and_unlink()
         if LOG_MM_TIMING and started is not None:
             logger.info(
-                "mm_timing shm_release_ms name=%s elapsed=%.3f shape=%s dtype=%s",
-                self.shm_name,
-                (time.perf_counter() - started) * 1000,
-                list(self.shape),
-                self.dtype,
+                f"mm_timing shm_release_ms name={self.shm_name!s} elapsed="
+                f"{(time.perf_counter() - started) * 1000:.3f} shape="
+                f"{list(self.shape)!s} dtype={self.dtype!s}",
             )
 
 
@@ -361,11 +353,8 @@ def prepare_shm_features(
     if LOG_MM_TIMING and started is not None:
         item_count = sum(len(mm.mm_items) for mm in pending)
         logger.info(
-            "mm_timing shm_attach_ms requests=%d items=%d elapsed=%.3f "
-            "cross_node_handles=%d cross_node_bytes=%d",
-            len(pending),
-            item_count,
-            (time.perf_counter() - started) * 1000,
-            cross_node_handles,
-            cross_node_bytes,
+            f"mm_timing shm_attach_ms requests={len(pending):d} items={item_count:d} "
+            f"elapsed={(time.perf_counter() - started) * 1000:.3f} "
+            f"cross_node_handles={cross_node_handles:d} cross_node_bytes="
+            f"{cross_node_bytes:d}",
         )

@@ -135,8 +135,8 @@ if platform.is_nvidia and platform.is_blackwell:
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": _FA4_BLACKWELL_PREFILL_HEAD_DIMS,
-            "sliding_window": frozenset({False, True}),
             "return_lse": frozenset({False, True}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def fa4_rel_mha_prefill(
@@ -232,8 +232,8 @@ if platform.is_nvidia and platform.is_blackwell:
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
-            "sliding_window": frozenset({False, True}),
             "return_lse": frozenset({False, True}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def fa4_rel_mha_extend_with_kvcache(
@@ -338,8 +338,8 @@ if platform.is_nvidia and platform.is_blackwell:
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
-            "sliding_window": frozenset({False, True}),
             "return_lse": frozenset({False}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def fa4_rel_mha_decode_with_kvcache(
@@ -491,8 +491,8 @@ if platform.is_nvidia and platform.is_blackwell:
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({128}),
-            "sliding_window": frozenset({False, True}),
             "return_lse": frozenset({False}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def fa4_rel_mha_decode_with_kvcache_mxfp8(
@@ -576,8 +576,8 @@ if platform.is_nvidia and platform.is_blackwell:
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({128}),
-            "sliding_window": frozenset({False, True}),
             "return_lse": frozenset({False}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def fa4_rel_mha_extend_with_kvcache_mxfp8(

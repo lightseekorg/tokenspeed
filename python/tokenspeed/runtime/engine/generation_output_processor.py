@@ -424,9 +424,8 @@ class OutputProcesser:
         # already carries acc_len) replaces this one — see _log_request_stats.
         if self.attn_tp_rank == 0 and not self.enable_log_request_stats:
             logger.info(
-                "Req: %s Finish! Accept_num_tokens_avg: %s",
-                rid,
-                request_state.accept_draft_tokens,
+                f"Req: {rid!s} Finish! Accept_num_tokens_avg: "
+                f"{request_state.accept_draft_tokens!s}",
             )
 
     def _log_request_stats(
@@ -441,7 +440,7 @@ class OutputProcesser:
         stats = RequestStats.from_state(rs, self.spec_algorithm, self.spec_num_tokens)
         # Fused into the scheduler's per-request finish line (supersedes the
         # Accept_num_tokens_avg variant in log_accept_length).
-        logger.info("Req: %s Finish! %s", rid, stats)
+        logger.info(f"Req: {rid!s} Finish! {stats!s}")
 
     def sweep_pending_aborts(self) -> None:
         """Drop TTL-expired entries from ``pending_aborts``.
@@ -609,10 +608,19 @@ class OutputProcesser:
                 draft_width=self.spec_num_tokens - 1,
             )
 
-    def add_cached_tokens(self, rids: list[str], extend_prefix_lens: list[int]) -> None:
-        for rid, prefix_len in zip(rids, extend_prefix_lens):
+    def add_cached_tokens(
+        self,
+        rids: list[str],
+        extend_prefix_lens: list[int],
+        extend_replay_lens: list[int],
+    ) -> None:
+        # Replayed rows re-feed cached positions: the hit reaches to the end of
+        # the replay window, not to where the model input starts.
+        for rid, prefix_len, replay_len in zip(
+            rids, extend_prefix_lens, extend_replay_lens
+        ):
             if rs := self.rid_to_state.get(rid):
-                rs.cached_tokens += max(0, prefix_len - rs.computed_length)
+                rs.cached_tokens += max(0, prefix_len + replay_len - rs.computed_length)
 
     def post_process_forward_op(
         self,
@@ -623,6 +631,7 @@ class OutputProcesser:
         self.add_cached_tokens(
             forward_op.request_ids,
             forward_op.extend_prefix_lens,
+            forward_op.extend_replay_lens,
         )
         self._emit_spec_decode_metrics(forward_op, model_execution_results)
 
@@ -741,10 +750,9 @@ class OutputProcesser:
                 self.metrics.record_nan_abort()
                 if self.attn_tp_rank == 0:
                     logger.warning(
-                        "Req %s terminated: NaN detected in logits (or an"
+                        f"Req {rid!s} terminated: NaN detected in logits (or an"
                         " out-of-vocab sample escaped the sampler);"
                         " isolating it from the batch.",
-                        rid,
                     )
 
             # P-side final chunk: the drafter candidates join the chunk's
@@ -902,7 +910,9 @@ class OutputProcesser:
         self.stream_output(stream_out_rids, stream_out_states)
         return request_changes
 
-    def on_remote_prefill_done(self, req_id: str, bootstrap_token: int) -> None:
+    def on_remote_prefill_done(
+        self, req_id: str, bootstrap_token: int, cached_tokens: int
+    ) -> None:
         """Record the bootstrap token on a decode-node request (RemotePrefillDoneEvent).
 
         The bootstrap_token is the first real output token produced by the prefill node.
@@ -922,19 +932,21 @@ class OutputProcesser:
         if req_id not in self.rid_to_state:
             return
         state = self.rid_to_state[req_id]
+        # P and D reuse overlapping leading prefixes; never sum their hits.
+        state.cached_tokens = max(state.cached_tokens, cached_tokens)
         if bootstrap_token == -1:
             logger.warning(
-                "[on_remote_prefill_done] rid=%s received bootstrap_token=-1, skipping append to output_ids",
-                req_id,
+                f"[on_remote_prefill_done] rid={req_id!s} received bootstrap_token=-1, "
+                "skipping append to output_ids",
             )
             if state.grammar is not None:
                 # Nothing will ever bring this matcher in sync, and masking
                 # from a stale state corrupts the output more quietly than
                 # not masking at all. Drop it, loudly.
                 logger.warning(
-                    "[on_remote_prefill_done] rid=%s lost its bootstrap token; "
+                    f"[on_remote_prefill_done] rid={req_id!s} lost its bootstrap token;"
+                    " "
                     "structured output is no longer enforced for it",
-                    req_id,
                 )
                 state.grammar = None
             return

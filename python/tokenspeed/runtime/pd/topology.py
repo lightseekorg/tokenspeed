@@ -55,9 +55,6 @@ class PDParallelTopology:
     # is pp stages of tp*cp*dp ranks each.
     pp_size: int = 1
     pp_rank: int = 0
-    # Optional explicit per-stage layer counts (front to back). Registered
-    # with the bootstrap so the Decode side plans over the same windows.
-    pp_layer_partition: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         """Validate parallel sizes and rank coordinates."""
@@ -104,7 +101,6 @@ class PDParallelTopology:
             global_rank=mapping.rank,
             pp_size=getattr(mapping, "pp_size", 1),
             pp_rank=(mapping.pp_rank if getattr(mapping, "pp_size", 1) > 1 else 0),
-            pp_layer_partition=getattr(mapping, "pp_layer_partition", None),
         )
 
     def require_cache_pd_supported(self) -> None:

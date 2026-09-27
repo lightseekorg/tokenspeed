@@ -174,7 +174,7 @@ CacheCoordinator MakeAdmissionCoordinator(BlockPool& pool) {
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
-    return MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*host_pool=*/nullptr,
+    return MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                            /*stream_device_cache_to_host=*/true);
 }
 
@@ -199,19 +199,19 @@ void MeasureAdmission(std::int32_t pool_size, std::int32_t iterations) {
     BlockTable table;
     std::array<GroupDemand, 1> no_demand{GroupDemand{.table = &table}};
     Measure("admit_no_demand_cached_pool", pool_size, 0, iterations, [&] {
-        const std::optional<CacheCoordinator::AdmissionResult> result =
-            coordinator.Admit(coordinator.ProbePrefix({}), no_demand, /*request_access_epoch=*/std::nullopt);
+        const std::optional<CacheCoordinator::AdmissionResult> result = coordinator.Admit(
+            coordinator.ProbePrefix({}), no_demand, RequestProgress{}, /*request_access_epoch=*/std::nullopt);
         if (!result) {
             std::abort();
         }
         return result->access_epoch;
     });
 
-    std::array<GroupDemand, 1> demand{GroupDemand{.table = &table, .num_tokens = 4}};
+    std::array<GroupDemand, 1> demand{GroupDemand{.table = &table, .extent = DenseGrowth{4}}};
     std::uint64_t next_key = static_cast<std::uint64_t>(pool_size);
     Measure("admit_small_demand_evict_and_restore", pool_size, 1, iterations, [&] {
-        const std::optional<CacheCoordinator::AdmissionResult> result =
-            coordinator.Admit(coordinator.ProbePrefix({}), demand, /*request_access_epoch=*/std::nullopt);
+        const std::optional<CacheCoordinator::AdmissionResult> result = coordinator.Admit(
+            coordinator.ProbePrefix({}), demand, RequestProgress{}, /*request_access_epoch=*/std::nullopt);
         if (!result) {
             std::abort();
         }
@@ -250,9 +250,9 @@ void MeasurePinnedAdmission(std::int32_t pool_size, std::int32_t iterations) {
             /*newly_cached=*/nullptr);
     }
     BlockTable table;
-    const std::array demand{GroupDemand{.table = &table, .num_tokens = 4}};
+    const std::array demand{GroupDemand{.table = &table, .extent = DenseGrowth{4}}};
     Measure("admit_small_demand_all_pinned", pool_size, 1, iterations, [&] {
-        const auto result = coordinator.Admit(coordinator.ProbePrefix({}), demand, std::nullopt);
+        const auto result = coordinator.Admit(coordinator.ProbePrefix({}), demand, RequestProgress{}, std::nullopt);
         if (result) {
             std::abort();
         }
@@ -277,8 +277,8 @@ void MeasureHostBlockAcquisition(std::int32_t pool_size, std::int32_t iterations
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/4, pool, &host_pool,
-                                                   /*stream_device_cache_to_host=*/true);
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
+                                                   &host_pool, /*stream_device_cache_to_host=*/true);
     for (std::int32_t i = 0; i < pool_size; ++i) {
         CacheBlockRef block = host_pool.AcquireBlock(/*group_id=*/0);
         if (!block) {

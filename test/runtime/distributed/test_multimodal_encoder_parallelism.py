@@ -156,7 +156,7 @@ def _run_item_dp_case(rank: int, device: torch.device, mapping: Mapping) -> None
     assert idle_calls == (1 if rank == 0 else 0)
     torch.testing.assert_close(idle_item.encoded, _encoded_rows(idle_item, 2, device))
 
-    # Equal rank-local row counts use all_gather_into_tensor directly into the
+    # Equal rank-local row counts use all_gather_single directly into the
     # final rank-major output buffer.
     equal_items = [_item(50, 2), _item(60, 2)]
     equal_calls: list[list[int]] = []

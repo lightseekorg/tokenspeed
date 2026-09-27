@@ -52,7 +52,6 @@ class TestKernelSpec:
         assert spec.features == frozenset()
         assert spec.solution == ""
         assert spec.priority == 10
-        assert spec.tags == frozenset()
         assert spec.format_signatures == frozenset()
 
     def test_hashable_without_dict_traits(self):
@@ -288,14 +287,6 @@ class TestRegistryQueries:
         assert "reference_decode" in names
         assert "flashinfer_decode" not in names
 
-    def test_filter_by_tags(self, sample_specs):
-        reg = KernelRegistry.get()
-        register_all_samples(reg, sample_specs)
-
-        latency = reg.get_for_operator("attention", "decode", tags={"latency"})
-        for s in latency:
-            assert "latency" in s.tags
-
     def test_filter_by_solution(self, sample_specs):
         reg = KernelRegistry.get()
         register_all_samples(reg, sample_specs)
@@ -434,7 +425,7 @@ class TestRegisterKernelDecorator:
         reg = KernelRegistry.get()
         assert reg.get_by_name("my_custom_kernel") is not None
 
-    def test_decorator_with_features_and_tags(self):
+    def test_decorator_with_features_and_capability(self):
         @register_kernel(
             "attention",
             "decode",
@@ -446,7 +437,6 @@ class TestRegisterKernelDecorator:
             signatures=format_signatures(
                 ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
             ),
-            tags={"determinism", "latency"},
         )
         def decorated_kernel():
             pass
@@ -455,7 +445,6 @@ class TestRegisterKernelDecorator:
         spec = reg.get_by_name("triton_attention_decode")
         assert spec is not None
         assert spec.features == frozenset({"paged", "rope"})
-        assert spec.tags == frozenset({"determinism", "latency"})
         assert spec.capability.min_arch_version == ArchVersion(8, 0)
 
     def test_decorator_returns_original_function(self):

@@ -1,0 +1,487 @@
+{
+  "schema_version": 1,
+  "common_parameters": {
+    "model_profile": "kimi_k3_tp8",
+    "num_experts": 896
+  },
+  "cases": [
+    {
+      "id": "kimi_k3.moe.latent_input/decode-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "moe",
+        "mode": "latent_input",
+        "parameters": {
+          "tokens": [1, 2, 4, 8, 16, 32, 64],
+          "hidden_size": 7168,
+          "latent_size": 3584,
+          "shared_size": 768,
+          "input_dtype": "bfloat16",
+          "activation_situ_beta": 4.0,
+          "activation_situ_linear_beta": 25.0
+        },
+        "cold_cache": true,
+        "seed": 4101
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 2.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.moe.latent_input/extend-small-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "moe",
+        "mode": "latent_input",
+        "parameters": {
+          "tokens": [128, 256],
+          "hidden_size": 7168,
+          "latent_size": 3584,
+          "shared_size": 768,
+          "input_dtype": "bfloat16",
+          "activation_situ_beta": 4.0,
+          "activation_situ_linear_beta": 25.0
+        },
+        "cold_cache": true,
+        "seed": 4102
+      },
+      "policy": {
+        "max_regression_relative": 0.08,
+        "max_regression_absolute_us": 5.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.moe.latent_input/extend-large-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "moe",
+        "mode": "latent_input",
+        "parameters": {
+          "tokens": [512, 1024, 2048, 4096],
+          "hidden_size": 7168,
+          "latent_size": 3584,
+          "shared_size": 768,
+          "input_dtype": "bfloat16",
+          "activation_situ_beta": 4.0,
+          "activation_situ_linear_beta": 25.0
+        },
+        "cold_cache": true,
+        "seed": 4103
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.moe.latent_input/prefill-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "moe",
+        "mode": "latent_input",
+        "parameters": {
+          "tokens": [8192],
+          "hidden_size": 7168,
+          "latent_size": 3584,
+          "shared_size": 768,
+          "input_dtype": "bfloat16",
+          "activation_situ_beta": 4.0,
+          "activation_situ_linear_beta": 25.0
+        },
+        "cold_cache": true,
+        "seed": 4104
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 20.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.moe.sigmoid_bias_topk/decode-float32",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "moe",
+        "mode": "sigmoid_bias_topk",
+        "parameters": {
+          "tokens": [1, 2, 4, 8, 16, 32, 64],
+          "topk": 16,
+          "router_logits_dtype": "float32",
+          "weights_dtype": "float32",
+          "routed_scaling_factor": 1.0,
+          "normalize_topk_weights": true
+        },
+        "cold_cache": true,
+        "seed": 4201
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 0.5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.moe.sigmoid_bias_topk/extend-float32",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "moe",
+        "mode": "sigmoid_bias_topk",
+        "parameters": {
+          "tokens": [128, 256, 512, 1024, 2048, 4096],
+          "topk": 16,
+          "router_logits_dtype": "float32",
+          "weights_dtype": "float32",
+          "routed_scaling_factor": 1.0,
+          "normalize_topk_weights": true
+        },
+        "cold_cache": true,
+        "seed": 4202
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 0.5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.moe.sigmoid_bias_topk/prefill-float32",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "moe",
+        "mode": "sigmoid_bias_topk",
+        "parameters": {
+          "tokens": [8192],
+          "topk": 16,
+          "router_logits_dtype": "float32",
+          "weights_dtype": "float32",
+          "routed_scaling_factor": 1.0,
+          "normalize_topk_weights": true
+        },
+        "cold_cache": true,
+        "seed": 4203
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 0.5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.moe.apply/tp8-decode-small-mxfp4",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "moe",
+        "mode": "apply",
+        "parameters": {
+          "tokens": [1, 2, 4],
+          "hidden_size": 3584,
+          "intermediate_size": 3072,
+          "num_local_experts": 896,
+          "topk": 16,
+          "tp_size": 8,
+          "ep_size": 1,
+          "ep_rank": 0,
+          "input_dtype": "bfloat16",
+          "router_logits_dtype": "float32",
+          "weight_dtype": "mxfp4",
+          "activation": "situ",
+          "activation_situ_beta": 4.0,
+          "activation_situ_linear_beta": 25.0,
+          "routing_mode": "precomputed_topk",
+          "route_scope": "global",
+          "route_distribution": "router",
+          "routed_scaling_factor": 1.0,
+          "normalize_topk_weights": true,
+          "internal_activation_dtype": "input",
+          "token_count_scope": "global"
+        },
+        "cold_cache": true,
+        "seed": 4301
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.moe.apply/tp8-decode-large-mxfp4",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "moe",
+        "mode": "apply",
+        "parameters": {
+          "tokens": [8, 16, 32, 64],
+          "hidden_size": 3584,
+          "intermediate_size": 3072,
+          "num_local_experts": 896,
+          "topk": 16,
+          "tp_size": 8,
+          "ep_size": 1,
+          "ep_rank": 0,
+          "input_dtype": "bfloat16",
+          "router_logits_dtype": "float32",
+          "weight_dtype": "mxfp4",
+          "activation": "situ",
+          "activation_situ_beta": 4.0,
+          "activation_situ_linear_beta": 25.0,
+          "routing_mode": "precomputed_topk",
+          "route_scope": "global",
+          "route_distribution": "router",
+          "routed_scaling_factor": 1.0,
+          "normalize_topk_weights": true,
+          "internal_activation_dtype": "input",
+          "token_count_scope": "global"
+        },
+        "cold_cache": true,
+        "seed": 4302
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 2.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.moe.apply/tp8-extend-mxfp4",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "moe",
+        "mode": "apply",
+        "parameters": {
+          "tokens": [128, 256, 512, 1024, 2048, 4096],
+          "hidden_size": 3584,
+          "intermediate_size": 3072,
+          "num_local_experts": 896,
+          "topk": 16,
+          "tp_size": 8,
+          "ep_size": 1,
+          "ep_rank": 0,
+          "input_dtype": "bfloat16",
+          "router_logits_dtype": "float32",
+          "weight_dtype": "mxfp4",
+          "activation": "situ",
+          "activation_situ_beta": 4.0,
+          "activation_situ_linear_beta": 25.0,
+          "routing_mode": "precomputed_topk",
+          "route_scope": "global",
+          "route_distribution": "router",
+          "routed_scaling_factor": 1.0,
+          "normalize_topk_weights": true,
+          "internal_activation_dtype": "input",
+          "token_count_scope": "global"
+        },
+        "cold_cache": true,
+        "seed": 4303
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.moe.apply/tp8-prefill-mxfp4",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "moe",
+        "mode": "apply",
+        "parameters": {
+          "tokens": [8192],
+          "hidden_size": 3584,
+          "intermediate_size": 3072,
+          "num_local_experts": 896,
+          "topk": 16,
+          "tp_size": 8,
+          "ep_size": 1,
+          "ep_rank": 0,
+          "input_dtype": "bfloat16",
+          "router_logits_dtype": "float32",
+          "weight_dtype": "mxfp4",
+          "activation": "situ",
+          "activation_situ_beta": 4.0,
+          "activation_situ_linear_beta": 25.0,
+          "routing_mode": "precomputed_topk",
+          "route_scope": "global",
+          "route_distribution": "router",
+          "routed_scaling_factor": 1.0,
+          "normalize_topk_weights": true,
+          "internal_activation_dtype": "input",
+          "token_count_scope": "global"
+        },
+        "cold_cache": true,
+        "seed": 4304
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 20.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.moe.apply/ep8-decode-mxfp4",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "moe",
+        "mode": "apply",
+        "parameters": {
+          "tokens": [8, 16, 32, 64],
+          "hidden_size": 3584,
+          "intermediate_size": 3072,
+          "num_local_experts": 112,
+          "topk": 16,
+          "tp_size": 1,
+          "ep_size": 8,
+          "ep_rank": 0,
+          "input_dtype": "bfloat16",
+          "router_logits_dtype": "float32",
+          "weight_dtype": "mxfp4",
+          "activation": "situ",
+          "activation_situ_beta": 4.0,
+          "activation_situ_linear_beta": 25.0,
+          "routing_mode": "precomputed_topk",
+          "route_scope": "global",
+          "route_distribution": "router",
+          "routed_scaling_factor": 1.0,
+          "normalize_topk_weights": true,
+          "internal_activation_dtype": "input",
+          "token_count_scope": "global"
+        },
+        "cold_cache": true,
+        "seed": 4401
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.moe.apply/ep8-extend-mxfp4",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "moe",
+        "mode": "apply",
+        "parameters": {
+          "tokens": [128, 256, 512, 1024, 2048, 4096],
+          "hidden_size": 3584,
+          "intermediate_size": 3072,
+          "num_local_experts": 112,
+          "topk": 16,
+          "tp_size": 1,
+          "ep_size": 8,
+          "ep_rank": 0,
+          "input_dtype": "bfloat16",
+          "router_logits_dtype": "float32",
+          "weight_dtype": "mxfp4",
+          "activation": "situ",
+          "activation_situ_beta": 4.0,
+          "activation_situ_linear_beta": 25.0,
+          "routing_mode": "precomputed_topk",
+          "route_scope": "global",
+          "route_distribution": "router",
+          "routed_scaling_factor": 1.0,
+          "normalize_topk_weights": true,
+          "internal_activation_dtype": "input",
+          "token_count_scope": "global"
+        },
+        "cold_cache": true,
+        "seed": 4402
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.moe.apply/ep8-prefill-mxfp4",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "moe",
+        "mode": "apply",
+        "parameters": {
+          "tokens": [8192],
+          "hidden_size": 3584,
+          "intermediate_size": 3072,
+          "num_local_experts": 112,
+          "topk": 16,
+          "tp_size": 1,
+          "ep_size": 8,
+          "ep_rank": 0,
+          "input_dtype": "bfloat16",
+          "router_logits_dtype": "float32",
+          "weight_dtype": "mxfp4",
+          "activation": "situ",
+          "activation_situ_beta": 4.0,
+          "activation_situ_linear_beta": 25.0,
+          "routing_mode": "precomputed_topk",
+          "route_scope": "global",
+          "route_distribution": "router",
+          "routed_scaling_factor": 1.0,
+          "normalize_topk_weights": true,
+          "internal_activation_dtype": "input",
+          "token_count_scope": "global"
+        },
+        "cold_cache": true,
+        "seed": 4403
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 20.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.moe.latent_expert_shared/ep8-small-decode-mxfp4",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "moe",
+        "mode": "latent_expert_shared",
+        "parameters": {
+          "tokens": [1, 2, 4],
+          "latent_size": 3584,
+          "intermediate_size": 3072,
+          "num_local_experts": 112,
+          "topk": 16,
+          "ep_size": 8,
+          "ep_rank": 0,
+          "shared_size": 768,
+          "output_size": 7168,
+          "input_dtype": "bfloat16",
+          "router_logits_dtype": "float32",
+          "activation_situ_beta": 4.0,
+          "activation_situ_linear_beta": 25.0,
+          "routed_scaling_factor": 1.0,
+          "normalize_topk_weights": true
+        },
+        "cold_cache": true,
+        "seed": 4501
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0,
+        "max_relative_mad": 0.05
+      }
+    }
+  ]
+}

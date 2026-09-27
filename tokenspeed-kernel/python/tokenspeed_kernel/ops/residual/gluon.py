@@ -47,11 +47,13 @@ try:
         attn_res_rmsnorm_gfx1250 as _attn_res_rmsnorm_gfx1250_impl,
     )
 except ImportError as exc:
-    _IMPORT_ERROR = exc
+    # Keep the message only: an exception object carries its traceback, which
+    # pins every frame that was importing at the time for the process lifetime.
+    _IMPORT_ERROR_MESSAGE = str(exc)
     _attn_res_rmsnorm_gfx950_impl = None
     _attn_res_rmsnorm_gfx1250_impl = None
 else:
-    _IMPORT_ERROR = None
+    _IMPORT_ERROR_MESSAGE = None
 
 
 if _attn_res_rmsnorm_gfx950_impl is not None:
@@ -82,7 +84,6 @@ if _attn_res_rmsnorm_gfx950_impl is not None:
             "separate_output_eps": frozenset({False, True}),
             "writes_block": frozenset({False, True}),
         },
-        tags={"decode", "prefill", "fusion"},
     )
     def gluon_attn_res_fwd_gfx950(
         *,
@@ -139,7 +140,6 @@ if _attn_res_rmsnorm_gfx950_impl is not None:
             "separate_output_eps": frozenset({False, True}),
             "writes_block": frozenset({False, True}),
         },
-        tags={"decode", "prefill", "fusion", "gfx1250"},
     )
     def gluon_attn_res_fwd_gfx1250(
         *,
@@ -174,13 +174,15 @@ else:
 
     def gluon_attn_res_fwd_gfx950(**kwargs) -> torch.Tensor:
         raise ImportError(
-            "gluon_attn_res_fwd_gfx950 requires tokenspeed-kernel-amd"
-        ) from _IMPORT_ERROR
+            "gluon_attn_res_fwd_gfx950 requires tokenspeed-kernel-amd: "
+            f"{_IMPORT_ERROR_MESSAGE}"
+        )
 
     def gluon_attn_res_fwd_gfx1250(**kwargs) -> torch.Tensor:
         raise ImportError(
-            "gluon_attn_res_fwd_gfx1250 requires tokenspeed-kernel-amd"
-        ) from _IMPORT_ERROR
+            "gluon_attn_res_fwd_gfx1250 requires tokenspeed-kernel-amd: "
+            f"{_IMPORT_ERROR_MESSAGE}"
+        )
 
 
 if current_platform().is_amd:
@@ -215,7 +217,6 @@ if current_platform().is_amd:
             "sinkhorn_iters": frozenset({20}),
         },
         priority=Priority.SPECIALIZED,
-        tags={"amd", "gfx950", "latency"},
     )
     def gluon_mhc_pre_gfx950(
         residual: torch.Tensor,

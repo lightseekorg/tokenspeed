@@ -31,13 +31,10 @@ except ImportError:
         for weight_dtype in (torch.bfloat16, torch.float32)
     ),
     traits={
-        "hidden_rank": frozenset({2}),
-        "weight_rank": frozenset({2}),
         "has_tokens": frozenset({True}),
-        "k_match": frozenset({True}),
+        "hidden_rank": frozenset({2}),
     },
     priority=Priority.SPECIALIZED,
-    tags={"nvidia", "latency"},
 )
 def cuda_dsv3_dsv4_linear_fp32(
     hidden_states: torch.Tensor,

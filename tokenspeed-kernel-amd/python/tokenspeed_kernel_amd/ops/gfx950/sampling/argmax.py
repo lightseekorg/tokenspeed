@@ -28,7 +28,7 @@ from tokenspeed_kernel_amd._triton import gl, gluon, triton
 __all__ = [
     "argmax",
     "argmax_pair",
-    "gluon_argmax_gfx950",
+    "launch_gluon_argmax_gfx950",
 ]
 
 cdna4 = gl.amd.cdna4
@@ -38,7 +38,7 @@ _SUPPORTED_OUT_DTYPES = (torch.int32, torch.int64)
 _MIN_GLUON_VOCAB_SIZE = 4096
 _INT32_MAX = gl.constexpr(2**31 - 1)
 _scratch_cache: dict[
-    tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    tuple[int, int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 ] = {}
 
 
@@ -90,7 +90,7 @@ def _argmax_fixed_block_size_tile(
 
 
 @gluon.jit
-def _argmax_one_stage_kernel(
+def gluon_argmax_gfx950(
     logits,
     out,
     stride_m: gl.constexpr,
@@ -114,7 +114,7 @@ def _argmax_one_stage_kernel(
 
 
 @gluon.jit
-def _argmax_split_atomic_fixed_block_size_kernel(
+def gluon_argmax_split_fixed_block_gfx950(
     logits,
     partial_values,
     partial_indices,
@@ -183,7 +183,7 @@ def _argmax_fixed_split_count_tile(
 
 
 @gluon.jit
-def _argmax_split_atomic_fixed_split_count_kernel(
+def gluon_argmax_split_fixed_count_gfx950(
     logits,
     partial_values,
     partial_indices,
@@ -290,7 +290,8 @@ def _supports_gluon(logits: torch.Tensor) -> bool:
 def _get_atomic_scratch(
     M: int, num_splits: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    key = (device.index, M, num_splits)
+    stream = triton.runtime.driver.active.get_current_stream(device.index)
+    key = (device.index, stream, M, num_splits)
     scratch = _scratch_cache.get(key)
     if scratch is None:
         partial_values = torch.empty(
@@ -299,7 +300,9 @@ def _get_atomic_scratch(
         partial_indices = torch.empty((M, num_splits), dtype=torch.int32, device=device)
         counters = torch.zeros((M,), dtype=torch.int32, device=device)
         scratch = (partial_values, partial_indices, counters)
-        _scratch_cache[key] = scratch
+        # Never retain allocations from a graph-private pool for eager reuse.
+        if not torch.cuda.is_current_stream_capturing():
+            _scratch_cache[key] = scratch
     return scratch
 
 
@@ -327,7 +330,7 @@ def _select_config(M: int, N: int) -> tuple[int, int, bool, int | None]:
     return 8192, 4, False, None
 
 
-def gluon_argmax_gfx950(
+def launch_gluon_argmax_gfx950(
     logits: torch.Tensor,
     *,
     out: torch.Tensor | None = None,
@@ -352,7 +355,7 @@ def gluon_argmax_gfx950(
         partial_values, partial_indices, counters = _get_atomic_scratch(
             M, num_splits, logits.device
         )
-        _argmax_split_atomic_fixed_split_count_kernel[(M, num_splits)](
+        gluon_argmax_split_fixed_count_gfx950[(M, num_splits)](
             logits,
             partial_values,
             partial_indices,
@@ -374,7 +377,7 @@ def gluon_argmax_gfx950(
         partial_values, partial_indices, counters = _get_atomic_scratch(
             M, num_splits, logits.device
         )
-        _argmax_split_atomic_fixed_block_size_kernel[(M, num_splits)](
+        gluon_argmax_split_fixed_block_gfx950[(M, num_splits)](
             logits,
             partial_values,
             partial_indices,
@@ -390,7 +393,7 @@ def gluon_argmax_gfx950(
             num_warps=num_warps,
         )
     else:
-        _argmax_one_stage_kernel[(M,)](
+        gluon_argmax_gfx950[(M,)](
             logits,
             out,
             stride_m=logits.stride(0),
@@ -403,5 +406,5 @@ def gluon_argmax_gfx950(
     return out
 
 
-argmax = gluon_argmax_gfx950
+argmax = launch_gluon_argmax_gfx950
 argmax_pair = _argmax_pair_torch_fallback

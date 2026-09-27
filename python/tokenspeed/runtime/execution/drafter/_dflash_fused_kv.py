@@ -34,16 +34,20 @@ Adapted from sglang's `fused_kv_materialize.py`. Provides two variants:
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
+
+from tokenspeed.runtime.utils.triton import tl, triton
 
 # ---------------------------------------------------------------------------
 # Module-level cache for per-layer buffer pointer tensors.
-# KV pool buffers are allocated once and never reallocated, so data_ptr()
-# stays valid for the entire server lifetime.
+# Valid until the pool is replaced; a rebind must call forget_kv_buffer_ptrs().
 # ---------------------------------------------------------------------------
 
 _cached_kv_ptrs: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def forget_kv_buffer_ptrs() -> None:
+    """Drop the cached pointer tensors; the pool they name has been replaced."""
+    _cached_kv_ptrs.clear()
 
 
 def _get_kv_buffer_ptrs(

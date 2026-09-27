@@ -1,6 +1,6 @@
-"""End-to-end tests for --no-enable-prefix-caching.
+"""End-to-end tests for --disable-prefix-caching.
 
-Validates that the ``--no-enable-prefix-caching`` flag actually disables
+Validates that the ``--disable-prefix-caching`` flag actually disables
 prefix caching at runtime, by checking the ``cached_tokens`` field in
 ``Engine.generate()`` response ``meta_info``.
 

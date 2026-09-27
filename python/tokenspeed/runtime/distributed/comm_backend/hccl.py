@@ -66,7 +66,7 @@ class HcclBackend(CommBackend):
             dtype=tensor.dtype,
             device=tensor.device,
         )
-        self.all_gather_into_tensor(gathered, tensor, group)
+        self.all_gather_single(gathered, tensor, group)
         return (
             gathered.reshape((len(group),) + input_size)
             .movedim(0, dim)
@@ -77,13 +77,13 @@ class HcclBackend(CommBackend):
             )
         )
 
-    def all_gather_into_tensor(
+    def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None:
         if len(group) == 1:
             output.copy_(input)
             return
-        dist.all_gather_into_tensor(output, input, group=self._process_group(group))
+        dist.all_gather_single(output, input, group=self._process_group(group))
 
     def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor:
         if len(group) == 1:
@@ -93,7 +93,7 @@ class HcclBackend(CommBackend):
             dtype=tensor.dtype,
             device=tensor.device,
         )
-        dist.reduce_scatter_tensor(output, tensor, group=self._process_group(group))
+        dist.reduce_scatter_single(output, tensor, group=self._process_group(group))
         return output
 
     def all_to_all_single(
@@ -120,7 +120,7 @@ class HcclBackend(CommBackend):
             )
 
         gathered = tensor.new_empty(len(group) * max_tokens, tensor.shape[-1])
-        self.all_gather_into_tensor(gathered, tensor.contiguous(), group)
+        self.all_gather_single(gathered, tensor.contiguous(), group)
         return torch.cat(
             [
                 gathered[rank * max_tokens : rank * max_tokens + tokens]
@@ -150,7 +150,7 @@ class HcclBackend(CommBackend):
         if len(group) == 1:
             output.copy_(padded)
         else:
-            dist.reduce_scatter_tensor(
+            dist.reduce_scatter_single(
                 output,
                 padded.contiguous(),
                 group=self._process_group(group),

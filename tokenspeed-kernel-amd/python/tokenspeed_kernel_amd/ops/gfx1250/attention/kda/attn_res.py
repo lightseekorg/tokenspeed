@@ -55,7 +55,7 @@ def _load_candidate(
 
 
 @gluon.jit
-def _attn_res_rmsnorm_kernel(
+def gluon_attn_res_fwd_gfx1250(
     layer_residual,
     delta,
     block_residual,
@@ -144,8 +144,7 @@ def _attn_res_rmsnorm_kernel(
                 N,
             )
             square_sum = gl.sum(value * value, axis=0)
-            # Match the established high-precision score reduction.
-            dot = gl.sum((value * scorer).to(gl.float64), axis=0).to(gl.float32)
+            dot = gl.sum(value * scorer, axis=0)
             score = dot * gl.rsqrt(square_sum / H + SCORE_EPS)
             next_max = gl.maximum(max_logit, score)
             old_scale = gl.exp(max_logit - next_max)
@@ -228,7 +227,7 @@ def attn_res_rmsnorm_gfx1250(
     output = torch.empty_like(layer_residual)
     num_warps = 4
     delta_tensor = layer_residual if delta is None else delta
-    _attn_res_rmsnorm_kernel[(tokens,)](
+    gluon_attn_res_fwd_gfx1250[(tokens,)](
         layer_residual,
         delta_tensor,
         block_residual,

@@ -194,7 +194,11 @@ def test_pool_write_location_oracle_page_id_times_p_plus_offset() -> None:
     )
     latent = torch.randn(3, 1, _LATENT_DIM, device="cuda", dtype=torch.bfloat16)
     pool.set_mla_kv_buffer(
-        layer, locs, latent[..., :_KV_LORA_RANK], latent[..., _KV_LORA_RANK:]
+        layer,
+        locs,
+        latent[..., :_KV_LORA_RANK],
+        latent[..., _KV_LORA_RANK:],
+        write_mask=None,
     )
     torch.cuda.synchronize()
 
@@ -311,7 +315,11 @@ def _write_history(pool, layer, logical_rows, lengths, seed=0):
             length, 1, _LATENT_DIM, device="cuda", dtype=torch.bfloat16
         )
         pool.set_mla_kv_buffer(
-            layer, locs, latent[..., :_KV_LORA_RANK], latent[..., _KV_LORA_RANK:]
+            layer,
+            locs,
+            latent[..., :_KV_LORA_RANK],
+            latent[..., _KV_LORA_RANK:],
+            write_mask=None,
         )
     torch.cuda.synchronize()
 

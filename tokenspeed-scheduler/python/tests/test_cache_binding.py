@@ -20,6 +20,7 @@
 
 """Tests for cache-related Python bindings."""
 
+import pytest
 import tokenspeed_scheduler as ts
 from tokenspeed_scheduler import Cache, ExecutionEvent
 
@@ -57,9 +58,13 @@ def test_cache_event_fields_are_bound():
     write_back.op_id = 7
     assert write_back.op_id == 7
 
-    load_back = Cache.LoadBackDoneEvent()
-    load_back.op_id = 8
+    load_back = Cache.LoadBackDoneEvent(8, False)
     assert load_back.op_id == 8
+    assert load_back.success is False
+    with pytest.raises(TypeError):
+        Cache.LoadBackDoneEvent()
+    with pytest.raises(TypeError):
+        Cache.LoadBackDoneEvent(9)
 
 
 def test_execution_event_accepts_cache_events():
@@ -68,5 +73,13 @@ def test_execution_event_accepts_cache_events():
     write_back = Cache.WriteBackDoneEvent()
     assert execution_event.add_event(write_back) is execution_event
 
-    load_back = Cache.LoadBackDoneEvent()
+    load_back = Cache.LoadBackDoneEvent(8, True)
     assert execution_event.add_event(load_back) is execution_event
+
+
+def test_forward_retract_event_is_bound():
+    retract = ts.ForwardEvent.Retract()
+    retract.request_id = "r0"
+    assert retract.request_id == "r0"
+    execution_event = ExecutionEvent()
+    assert execution_event.add_event(retract) is execution_event

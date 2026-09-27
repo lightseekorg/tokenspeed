@@ -7,9 +7,16 @@
 # copies of the Software, and to permit persons to whom the Software is
 # furnished to do so, subject to the following conditions:
 #
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 from __future__ import annotations
 
@@ -90,12 +97,17 @@ class DeepseekV4IndexerBatchMetadata:
 class DeepseekV4AttentionMetadata:
     swa_indices: torch.Tensor | None = None
     swa_lens: torch.Tensor | None = None
+    # All-zero lengths shaped like ``swa_lens``: the SWA cache is replicated
+    # across a DCP group, so every rank but the first attends to none of it.
+    swa_lens_none: torch.Tensor | None = None
     swa_window_size: int = 0
     swa_block_size: int = 0
     # Cache for dense compressed decode attention indices/lens. CSA decode uses
     # dynamic top-k indices and does not populate this cache.
+    # (indices, scan lens, owned-row counts) per dense compressed decode key.
     decode_dense_compressed_indices_cache: dict[
-        tuple[int, int, int, int], tuple[torch.Tensor, torch.Tensor]
+        tuple[int, int, int, int],
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     ] = field(default_factory=dict)
     decode_dense_compressed_indices_capture_safe_keys: set[
         tuple[int, int, int, int]
@@ -128,6 +140,14 @@ class DeepseekV4SparseIndexerMetadata:
 
 
 @dataclass
+class DeepseekV4DcpPrefillChunk:
+    local_destinations: torch.Tensor
+    counts: list[int]
+    destinations: torch.Tensor
+    workspace_width: int
+
+
+@dataclass
 class DeepseekV4ForwardMetadata:
     seq_lens: torch.Tensor
     query_lens: torch.Tensor
@@ -152,6 +172,11 @@ class DeepseekV4ForwardMetadata:
     # Cached split boundary derived from scheduler num_extends/query_lens.
     num_prefill_reqs: int = 0
     num_prefill_tokens: int = 0
+    # Prepared once for a live forward, shared by its request slices and layers.
+    dcp_prefill: dict[int, dict[tuple[int, int], DeepseekV4DcpPrefillChunk]] = field(
+        default_factory=dict
+    )
+    prefill_req_offset: int = 0
 
     def decode_req_count(self) -> int:
         return max(0, int(self.seq_lens.shape[0]) - int(self.num_prefill_reqs))

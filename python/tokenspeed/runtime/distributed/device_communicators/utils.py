@@ -90,7 +90,7 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> list[bool]:
                 if shm.buf[: len(magic_message)] == magic_message:
                     is_in_the_same_node[rank] = 1
     except Exception as exc:
-        logger.error("Error ignored in is_in_the_same_node: %s", exc)
+        logger.error(f"Error ignored in is_in_the_same_node: {exc!s}")
     finally:
         if shm:
             shm.close()

@@ -78,6 +78,9 @@ struct SchedulerConfig {
     // and the cache coordinator assert on the same fields and their assertions
     // would otherwise preempt these diagnostics.
     void Validate() const;
+    // The subset of Validate() the CapacityModel needs: every field it reads
+    // to size a pool, none of the page counts that describe a sized one.
+    void ValidateCapacityInputs() const;
 };
 
 }  // namespace tokenspeed

@@ -113,7 +113,7 @@ def _kda_value_panels(vectors, D: gl.constexpr, VALUE_LAYOUT: gl.constexpr):
 
 
 @gluon.jit
-def _kda_recurrent_decode_kernel(
+def gluon_kda_paged_decode_gfx1250(
     q,
     k,
     v,
@@ -272,7 +272,7 @@ def _kda_recurrent_decode_kernel(
 
 
 @gluon.jit
-def _kda_fused_decode_kernel(
+def gluon_kda_fused_paged_decode_vmajor_gfx1250(
     mixed_qkv,
     conv_weights,
     conv_states,
@@ -425,9 +425,6 @@ def _kda_fused_decode_kernel(
 
     combined = gl.where(is_decay, decay_value, qkv_value)
     shared_vectors.index(0).store(combined)
-
-    gl.barrier()
-
     q_value = shared_vectors.index(0).slice(0, D, dim=0).load(key_layout)
     k_value = shared_vectors.index(0).slice(D, D, dim=0).load(key_layout)
     decay = shared_vectors.index(0).slice(3 * D, D, dim=0).load(key_layout)
@@ -482,7 +479,6 @@ def _kda_fused_decode_kernel(
             off_pipe = off_pipe[1:] + (off_pipe[-1],)
             raw_pipe = raw_pipe[1:] + (raw_pipe[-1],)
     output_sumsq = gl.sum(output_squares, axis=0)
-    gl.barrier()
     out_value = output_shared.load(compact_layout)
     inverse_rms = gl.rsqrt(output_sumsq / D + NORM_EPS)
     gate = gl.load(
@@ -500,7 +496,7 @@ def _kda_fused_decode_kernel(
 
 
 @gluon.jit
-def _kda_fused_verify_kernel(
+def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
     mixed_qkv: tl.const,
     conv_weights: tl.const,
     conv_pool: tl.const,
@@ -669,9 +665,6 @@ def _kda_fused_verify_kernel(
         qkv_history1 = qkv_history2
         qkv_history2 = qkv_input
 
-    # Publish all convolution results before cross-warp normalization; retain
-    # per-token vectors for reuse across state panels.
-    gl.barrier()
     q_values = ()
     k_values = ()
     decay_values = ()
@@ -761,7 +754,7 @@ def _kda_fused_verify_kernel(
 
 
 @gluon.jit
-def _kda_fused_replay_kernel(
+def gluon_kda_fused_replay_gfx1250(
     descriptors,
     group_indices,
     read_indices,
@@ -943,7 +936,6 @@ def _kda_fused_replay_kernel(
         qkv_history1 = gl.where(token_active, qkv_history2, qkv_history1)
         qkv_history2 = gl.where(token_active, qkv_input, qkv_history2)
 
-    gl.barrier()
     q_values = ()
     k_values = ()
     decay_values = ()
@@ -1081,7 +1073,9 @@ def gluon_kda_recurrent_decode_gfx1250(
     output = torch.empty(v.shape, dtype=v.dtype, device=v.device)
     block_key = triton.next_power_of_2(key_dim)
     block_value = min(32, triton.next_power_of_2(value_dim))
-    _kda_recurrent_decode_kernel[(triton.cdiv(value_dim, block_value), tokens * heads)](
+    gluon_kda_paged_decode_gfx1250[
+        (triton.cdiv(value_dim, block_value), tokens * heads)
+    ](
         q,
         k,
         v,
@@ -1248,7 +1242,7 @@ def gluon_kda_fused_decode_gfx1250(
     # Past two CTAs per CU the state reads saturate memory, so a shallower
     # window trades prefetch distance for the occupancy that matters there.
     pipeline_depth = 3 if num_heads * tokens > 2 * _GFX1250_NUM_CUS else 4
-    _kda_fused_decode_kernel[(num_heads, tokens)](
+    gluon_kda_fused_paged_decode_vmajor_gfx1250[(num_heads, tokens)](
         mixed_qkv,
         conv_weights,
         conv_states,
@@ -1442,7 +1436,9 @@ def gluon_kda_fused_verify_gfx1250(
         device=mixed_qkv.device,
     )
     value_splits = _kda_value_splits(batch)
-    _kda_fused_verify_kernel[(num_heads * value_splits, batch)](
+    gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250[
+        (num_heads * value_splits, batch)
+    ](
         mixed_qkv,
         conv_weights,
         conv_pool,
@@ -1482,7 +1478,7 @@ def gluon_kda_fused_verify_gfx1250(
     return output
 
 
-def gluon_kda_fused_replay_gfx1250(
+def launch_gluon_kda_fused_replay_gfx1250(
     descriptors: torch.Tensor,
     group_indices: torch.Tensor,
     read_indices: torch.Tensor,
@@ -1562,7 +1558,7 @@ def gluon_kda_fused_replay_gfx1250(
     batch = accepted_length.numel()
     if read_indices.shape[1] != batch:
         raise ValueError("accepted_length must match the replay batch")
-    _kda_fused_replay_kernel[(num_heads, batch, descriptors.shape[0])](
+    gluon_kda_fused_replay_gfx1250[(num_heads, batch, descriptors.shape[0])](
         descriptors,
         group_indices,
         read_indices,
@@ -1590,7 +1586,7 @@ def gluon_kda_fused_replay_gfx1250(
 
 __all__ = [
     "gluon_kda_fused_decode_gfx1250",
-    "gluon_kda_fused_replay_gfx1250",
+    "launch_gluon_kda_fused_replay_gfx1250",
     "gluon_kda_fused_verify_gfx1250",
     "gluon_kda_recurrent_decode_gfx1250",
 ]

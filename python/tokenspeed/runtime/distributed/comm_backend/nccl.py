@@ -151,7 +151,7 @@ class NcclBackend(CommBackend):
             output_size, dtype=tensor.dtype, device=tensor.device
         )
 
-        self.all_gather_into_tensor(output_tensor, tensor, group)
+        self.all_gather_single(output_tensor, tensor, group)
 
         output_tensor = output_tensor.reshape((ws,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
@@ -160,7 +160,7 @@ class NcclBackend(CommBackend):
         )
         return output_tensor
 
-    def all_gather_into_tensor(
+    def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None:
         res = self._get_or_create_resources(group)
@@ -168,7 +168,7 @@ class NcclBackend(CommBackend):
         if pynccl is not None and not pynccl.disabled:
             pynccl.all_gather(output, input)
         else:
-            torch.distributed.all_gather_into_tensor(
+            torch.distributed.all_gather_single(
                 output, input, group=res["device_group"]
             )
 
@@ -198,7 +198,7 @@ class NcclBackend(CommBackend):
         if pynccl is not None and not pynccl.disabled:
             pynccl.reduce_scatter(output_tensor, tensor)
         else:
-            torch.distributed.reduce_scatter_tensor(
+            torch.distributed.reduce_scatter_single(
                 output_tensor, tensor, group=res["device_group"]
             )
         return output_tensor
@@ -257,7 +257,7 @@ class NcclBackend(CommBackend):
         output = torch.empty(
             tp_size * max_tokens, hidden, dtype=tensor.dtype, device=tensor.device
         )
-        self.all_gather_into_tensor(output, padded.contiguous(), group)
+        self.all_gather_single(output, padded.contiguous(), group)
 
         chunks = []
         for i, n in enumerate(scattered_num_tokens):
@@ -292,7 +292,7 @@ class NcclBackend(CommBackend):
             max_tokens, hidden, dtype=tensor.dtype, device=tensor.device
         )
         res = self._get_or_create_resources(group)
-        torch.distributed.reduce_scatter_tensor(
+        torch.distributed.reduce_scatter_single(
             output, padded_input.contiguous(), group=res["device_group"]
         )
         rank = group.index(torch.distributed.get_rank())

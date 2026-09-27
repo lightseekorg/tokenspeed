@@ -9,7 +9,11 @@
 #
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 import math
 import unittest
@@ -750,6 +754,7 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
                 kv_slot_mapping=kv_slots,
                 kv_cache_block_size=64,
                 compress_ratio=128,
+                kv_write_mask=None,
             )
 
     def test_csa_indexer_cache_insert_requires_cuda(self):
@@ -1060,6 +1065,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             kv_slot_mapping=kv_slots,
             kv_cache_block_size=kv_cache_block_size,
             compress_ratio=compress_ratio,
+            kv_write_mask=None,
         )
 
         weights = torch.softmax(score.float() + ape, dim=0)
@@ -1171,6 +1177,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             kv_slot_mapping=kv_slots,
             kv_cache_block_size=kv_cache_block_size,
             compress_ratio=compress_ratio,
+            kv_write_mask=None,
         )
 
         flat_cache = cache.view(-1)
@@ -2373,19 +2380,23 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             dtype=torch.int32,
         )
 
+        valid_lens = torch.empty(3, device=device, dtype=torch.int32)
         actual, actual_lens = dsv4_compute_global_topk_indices_and_lens(
             topk_indices=topk_indices,
             token_to_req_indices=token_to_req_indices,
             block_table=block_table,
             block_size=4,
+            is_valid_token=None,
+            block_table_base_offsets=None,
+            out_valid_lens=valid_lens,
         )
         torch.cuda.synchronize()
 
         expected = torch.empty_like(topk_indices)
-        expected_lens = torch.empty_like(actual_lens)
+        # The hole at index 2 does not remove the candidate at index 3.
+        expected_lens = torch.tensor([4, 1, 3], dtype=torch.int32)
         for token_idx in range(topk_indices.shape[0]):
             req_idx = int(token_to_req_indices[token_idx].item())
-            count = 0
             for topk_idx in range(topk_indices.shape[1]):
                 local_idx = int(topk_indices[token_idx, topk_idx].item())
                 if local_idx < 0:
@@ -2396,12 +2407,13 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 expected[token_idx, topk_idx] = (
                     int(block_table[req_idx, block_idx].item()) * 4 + offset
                 )
-                count += 1
-            expected_lens[token_idx] = count
 
         torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=0, rtol=0)
         torch.testing.assert_close(
             actual_lens.cpu(), expected_lens.cpu(), atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            valid_lens.cpu(), torch.tensor([3, 1, 3], dtype=torch.int32), atol=0, rtol=0
         )
 
     def test_compute_global_topk_indices_and_lens_masks_invalid_tokens(self):
@@ -2425,17 +2437,23 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             dtype=torch.int32,
         )
 
+        valid_lens = torch.empty(2, device=device, dtype=torch.int32)
         actual, actual_lens = dsv4_compute_global_topk_indices_and_lens(
             topk_indices=topk_indices,
             token_to_req_indices=token_to_req_indices,
             block_table=block_table,
             block_size=4,
             is_valid_token=is_valid_token,
+            block_table_base_offsets=None,
+            out_valid_lens=valid_lens,
         )
         torch.cuda.synchronize()
 
         self.assertTrue(
-            torch.equal(actual_lens.cpu(), torch.tensor([3, 0], dtype=torch.int32))
+            torch.equal(actual_lens.cpu(), torch.tensor([4, 0], dtype=torch.int32))
+        )
+        torch.testing.assert_close(
+            valid_lens.cpu(), torch.tensor([3, 0], dtype=torch.int32), atol=0, rtol=0
         )
         self.assertTrue(
             torch.equal(

@@ -37,7 +37,7 @@ from tokenspeed.runtime.models.inkling import (
 from tokenspeed.runtime.models.minimax_m3 import (
     MiniMaxM3SparseForConditionalGeneration,
 )
-from tokenspeed.runtime.models.moonvit import MoonViTVisionPath
+from tokenspeed.runtime.models.moonvit import MoonViTVisionPath, Rope2DPosEmbRepeated
 from tokenspeed.runtime.models.qwen3_asr import Qwen3ASRForConditionalGeneration
 from tokenspeed.runtime.models.qwen3_audio import Qwen3AudioEncoder
 from tokenspeed.runtime.models.qwen3_omni import Qwen3OmniMoeForConditionalGeneration
@@ -48,6 +48,23 @@ from tokenspeed.runtime.multimodal.embedder import (
 )
 from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalDataItem
 from tokenspeed.runtime.utils.env import envs
+
+
+def test_moonvit_rope_cache_is_lazy_reused_and_nonpersistent():
+    rope = Rope2DPosEmbRepeated(dim=8, max_height=4, max_width=4, theta_base=10000)
+    assert rope.freqs_cis is None
+
+    first = rope.get_freqs_cis(
+        grid_thws=torch.tensor([[1, 2, 2]]), device=torch.device("cpu")
+    )
+    cached = rope.freqs_cis
+    repeated = rope.get_freqs_cis(
+        grid_thws=torch.tensor([[2, 2, 2]]), device=torch.device("cpu")
+    )
+
+    assert rope.freqs_cis is cached
+    torch.testing.assert_close(repeated, first.repeat(2, 1))
+    assert "freqs_cis" not in rope.state_dict()
 
 
 class _WarmupModel:

@@ -632,6 +632,16 @@ _CAPABILITY = CapabilityRequirement(
     min_arch_version=ArchVersion(10, 0),
     vendors=frozenset({"nvidia"}),
 )
+_TGV_CAPABILITY = CapabilityRequirement(
+    min_arch_version=ArchVersion(10, 0),
+    max_arch_version=ArchVersion(10, 3),
+    vendors=frozenset({"nvidia"}),
+)
+_CUTLASS_CAPABILITY = CapabilityRequirement(
+    min_arch_version=ArchVersion(10, 7),
+    max_arch_version=ArchVersion(10, 7),
+    vendors=frozenset({"nvidia"}),
+)
 
 
 # Shapes an eager call has already compiled and allocated for. Capture must
@@ -822,6 +832,25 @@ def flashinfer_tgv_gemv(
         out=out,
     )
     _mark_warmed("tgv", dev, m, n, k)
+    return result
+
+
+def flashinfer_cutlass_gemv(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    from flashinfer import mm_bf16
+
+    m, k = x.shape
+    n = weight.shape[0]
+    dev = x.device.index or 0
+    if (
+        MEASURED_ROUTE.get((m, n, k)) != "tgv"
+        or x.dtype != torch.bfloat16
+        or not _usable_in_capture("cutlass", dev, m, n, k)
+    ):
+        return torch_decode_gemv(x, weight, out)
+    result = mm_bf16(x.detach(), weight.detach().t(), out=out, backend="cutlass")
+    _mark_warmed("cutlass", dev, m, n, k)
     return result
 
 
@@ -1047,29 +1076,32 @@ def skinny_gemv_add3(
 
 
 def _register_route() -> None:
-    impls = {
-        "skinny": cute_dsl_skinny_gemv,
-        "tgv": flashinfer_tgv_gemv,
-        "ll_bf16": cute_dsl_ll_bf16_gemv,
-        "splitk": flashinfer_splitk_gemv,
+    implementations = {
+        "skinny": ((cute_dsl_skinny_gemv, _CAPABILITY),),
+        "tgv": (
+            (flashinfer_tgv_gemv, _TGV_CAPABILITY),
+            (flashinfer_cutlass_gemv, _CUTLASS_CAPABILITY),
+        ),
+        "ll_bf16": ((cute_dsl_ll_bf16_gemv, _CAPABILITY),),
+        "splitk": ((flashinfer_splitk_gemv, _CAPABILITY),),
     }
     for (m, n, k), backend in MEASURED_ROUTE.items():
-        impl = impls[backend]
-        register_kernel(
-            "gemm",
-            "decode_gemv",
-            name=f"{impl.__name__}_m{m}_n{n}_k{k}",
-            solution="flashinfer" if backend in ("tgv", "splitk") else "cute_dsl",
-            capability=_CAPABILITY,
-            signatures=_BF16_SIG,
-            traits={
-                "m": frozenset({m}),
-                "n": frozenset({n}),
-                "k": frozenset({k}),
-            },
-            # Above the M == 1 rowcta spec so a measured win takes the shape.
-            priority=Priority.SPECIALIZED + 2,
-        )(impl)
+        for impl, capability in implementations[backend]:
+            register_kernel(
+                "gemm",
+                "decode_gemv",
+                name=f"{impl.__name__}_m{m}_n{n}_k{k}",
+                solution=("flashinfer" if backend in ("tgv", "splitk") else "cute_dsl"),
+                capability=capability,
+                signatures=_BF16_SIG,
+                traits={
+                    "m": frozenset({m}),
+                    "n": frozenset({n}),
+                    "k": frozenset({k}),
+                },
+                # Above the M == 1 rowcta spec so this route takes the shape.
+                priority=Priority.SPECIALIZED + 2,
+            )(impl)
 
 
 _register_route()

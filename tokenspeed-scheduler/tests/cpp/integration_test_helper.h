@@ -122,11 +122,9 @@ protected:
         }
     }
 
-    void SendLoadBackDone(std::uint32_t op_id) {
+    void SendLoadBackDone(std::uint32_t op_id, bool success) {
         ExecutionEvent event;
-        event.With(cache::LoadBackDone{
-            .op_id = op_id,
-        });
+        event.With(cache::LoadBackDone(op_id, success));
         scheduler_->Advance(std::move(event));
     }
 
@@ -155,6 +153,12 @@ protected:
     void SendAbortEvent(const std::string& request_id) {
         ExecutionEvent event;
         event.With(forward::Abort{.request_id = request_id});
+        scheduler_->Advance(std::move(event));
+    }
+
+    void SendRetractEvent(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(forward::Retract{.request_id = request_id});
         scheduler_->Advance(std::move(event));
     }
 

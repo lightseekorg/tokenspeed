@@ -58,6 +58,8 @@ def chunk_scaled_dot_kkt_fwd_kernel(
 ):
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        # Release successor setup; its wait still guards all dependent reads.
+        tl.extra.cuda.gdc_launch_dependents()
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
@@ -104,8 +106,6 @@ def chunk_scaled_dot_kkt_fwd_kernel(
         A + (bos * H + i_h) * BT, (T, BT), (BT * H, 1), (i_t * BT, 0), (BT, BT), (1, 0)
     )
     tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def chunk_scaled_dot_kkt_fwd(

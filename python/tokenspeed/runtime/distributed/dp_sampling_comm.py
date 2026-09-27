@@ -46,7 +46,7 @@ from tokenspeed.runtime.distributed.comm_backend import (
     Group,
     get_global_backend,
 )
-from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
+from tokenspeed.runtime.distributed.comm_ops import all_gather_single
 from tokenspeed.runtime.distributed.dp_sampling_swap import (
     swap_batch_vocab as _swap_batch_vocab_nccl,
 )
@@ -187,14 +187,9 @@ class DpSamplingComm:
         self._state = None
 
         logger.info(
-            "DpSamplingComm backend=%s tp_size=%d rank=%d max_pad_bs=%d "
-            "num_tokens_per_req=%d vocab_size=%d",
-            self._backend,
-            tp_size,
-            rank,
-            max_pad_bs,
-            num_tokens_per_req,
-            vocab_size,
+            f"DpSamplingComm backend={self._backend!s} tp_size={tp_size:d} rank="
+            f"{rank:d} max_pad_bs={max_pad_bs:d} "
+            f"num_tokens_per_req={num_tokens_per_req:d} vocab_size={vocab_size:d}",
         )
 
         n = num_tokens_per_req
@@ -353,7 +348,7 @@ class DpSamplingComm:
         combined_local[:, 2 * n].copy_(accept_length_local)
 
         combined_full = self._combined_full_nccl[:pad_bs]
-        all_gather_into_tensor(
+        all_gather_single(
             combined_full,
             combined_local,
             self._group,
@@ -380,7 +375,7 @@ class DpSamplingComm:
         n = self._num_tokens_per_req
         self._check_shape("logprobs_local", logprobs_local, (reqs_per_rank, n))
         logprobs_full = self._logprobs_full[:pad_bs]
-        all_gather_into_tensor(
+        all_gather_single(
             logprobs_full,
             logprobs_local.contiguous(),
             self._group,

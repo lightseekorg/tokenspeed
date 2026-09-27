@@ -33,7 +33,6 @@ from tokenspeed_kernel.ops.embedding import (
     FusedSetKVBufferArg,
     apply_rope,
 )
-from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +87,6 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
 def apply_rotary_pos_emb_native(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -869,7 +867,6 @@ class MRotaryEmbedding(RotaryEmbedding):
                     f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
                 )
 
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def forward(
         self,
         positions: torch.Tensor,

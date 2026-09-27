@@ -27,7 +27,6 @@ from tokenspeed_kernel.ops.attention.mla._triton.page_table import *  # noqa: F4
 from tokenspeed_kernel.ops.attention.mla._triton.prefill import (
     _triton_mla_prefill_impl,
 )
-from tokenspeed_kernel.ops.attention.mla._triton.write_locations import *  # noqa: F403
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -47,10 +46,9 @@ _PORTABLE_CAPABILITY = CapabilityRequirement(vendors=frozenset({"nvidia", "amd"}
     priority=Priority.PORTABLE,
     traits={
         "is_causal": frozenset({False, True}),
-        "support_logit_cap": frozenset({False, True}),
+        "logit_cap": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
     },
-    tags={"portability"},
 )
 def triton_mla_prefill(
     q: torch.Tensor,
@@ -95,11 +93,10 @@ def triton_mla_prefill(
     priority=Priority.PORTABLE,
     traits={
         "q_len": frozenset({1}),
-        "sliding_window": frozenset({False, True}),
-        "support_logit_cap": frozenset({False, True}),
+        "logit_cap": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
+        "sliding_window": frozenset({False, True}),
     },
-    tags={"portability"},
 )
 def triton_mla_decode_with_kvcache(
     q: torch.Tensor,

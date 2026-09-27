@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 from tokenspeed.runtime.utils import crash_on_warnings, get_colorful_logger
 
@@ -61,19 +60,15 @@ def nan_guard_logits(
     return logits
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
 def gather_token_logprobs_torch(
     logits: torch.Tensor,
     tokens: torch.Tensor,
 ) -> torch.Tensor:
-    """Per-row log_softmax(logits)[tokens]. Fuses cast + online softmax + gather
-    into one Triton kernel sequence so the full [B, V] log_softmax matrix is
-    never materialized."""
+    """Return the selected token's log probability for each logits row."""
     raw_logprobs = torch.log_softmax(logits.float(), dim=-1)
     return raw_logprobs.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
 def top_p_normalize_probs_torch(
     probs: torch.Tensor,
     top_ps: torch.Tensor,

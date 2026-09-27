@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <variant>
 
 #include "cache/core/acquire_plan.h"
 #include "cache/core/block_table.h"
@@ -51,26 +52,23 @@ public:
     }
 
     std::int32_t BlocksNeededFor(const BlockTable& table, const GroupDemand& demand) const {
-        if (demand.materialized_suffix_start < 0) {
-            return BlocksNeededFor(table, demand.num_tokens + demand.reserve_tokens);
-        }
-        return sparseSuffixBlocks(table, demand);
+        return std::visit(
+            Overloaded{
+                [&](const DenseGrowth& dense) {
+                    return BlocksNeededFor(table, dense.num_tokens + demand.reserve_tokens);
+                },
+                [&](const SparseSuffix& sparse) { return sparseSuffixBlocks(table, sparse, demand.reserve_tokens); },
+            },
+            demand.extent);
     }
 
     AcquirePlan PlanAcquire(const BlockTable& table, const GroupDemand& demand) const {
-        if (demand.materialized_suffix_start < 0) {
-            return PlanAcquire(table, demand.num_tokens, demand.reserve_tokens);
-        }
-        const std::int32_t num_blocks = sparseSuffixBlocks(table, demand);
-        const std::int64_t extent = static_cast<std::int64_t>(demand.num_tokens) + demand.reserve_tokens;
-        const std::int32_t logical_blocks =
-            static_cast<std::int32_t>((extent + block_granularity_ - 1) / block_granularity_);
-        return AcquirePlan{
-            .num_blocks = num_blocks,
-            .suffix_start = demand.materialized_suffix_start,
-            .table_blocks_after = logical_blocks,
-            .available_tokens_after = logical_blocks * block_granularity_ - demand.num_tokens,
-        };
+        return std::visit(
+            Overloaded{
+                [&](const DenseGrowth& dense) { return PlanAcquire(table, dense.num_tokens, demand.reserve_tokens); },
+                [&](const SparseSuffix& sparse) { return planSparseSuffix(table, sparse, demand.reserve_tokens); },
+            },
+            demand.extent);
     }
 
     AcquirePlan PlanAcquire(const BlockTable& table, std::int32_t num_tokens, std::int32_t reserve_tokens) const {
@@ -112,21 +110,34 @@ public:
     static constexpr std::int32_t kMambaStateWindow = 2;
 
 private:
-    std::int32_t sparseSuffixBlocks(const BlockTable& table, const GroupDemand& demand) const {
+    std::int32_t sparseSuffixBlocks(const BlockTable& table, const SparseSuffix& sparse,
+                                    std::int32_t reserve_tokens) const {
         // Decode-side prefix acquisition may have already installed aligned
         // null holes for state. They carry no ownership and remain safe to
         // extend sparsely up to the remote endpoint snapshot.
         _assert(table.AvailableTokens() == 0, "sparse suffix materialization requires a page boundary");
-        _assert(table.NumBlocks() <= demand.materialized_suffix_start,
-                "sparse suffix overlaps the existing block table");
-        _assert(demand.num_tokens > 0 && demand.reserve_tokens >= 0,
+        _assert(table.NumBlocks() <= sparse.first_block, "sparse suffix overlaps the existing block table");
+        _assert(sparse.extent_tokens > 0 && reserve_tokens >= 0,
                 "sparse suffix materialization requires a positive extent");
-        const std::int64_t extent = static_cast<std::int64_t>(demand.num_tokens) + demand.reserve_tokens;
+        const std::int64_t extent = static_cast<std::int64_t>(sparse.extent_tokens) + reserve_tokens;
         _assert(extent <= std::numeric_limits<std::int32_t>::max(), "sparse suffix extent exceeds int32 range");
         const std::int32_t last_block = static_cast<std::int32_t>((extent - 1) / block_granularity_);
-        _assert(demand.materialized_suffix_start <= last_block,
-                "materialized suffix starts beyond the requested extent");
-        return last_block - demand.materialized_suffix_start + 1;
+        _assert(sparse.first_block <= last_block, "materialized suffix starts beyond the requested extent");
+        return last_block - sparse.first_block + 1;
+    }
+
+    AcquirePlan planSparseSuffix(const BlockTable& table, const SparseSuffix& sparse,
+                                 std::int32_t reserve_tokens) const {
+        const std::int32_t num_blocks = sparseSuffixBlocks(table, sparse, reserve_tokens);
+        const std::int64_t extent = static_cast<std::int64_t>(sparse.extent_tokens) + reserve_tokens;
+        const std::int32_t logical_blocks =
+            static_cast<std::int32_t>((extent + block_granularity_ - 1) / block_granularity_);
+        return AcquirePlan{
+            .num_blocks = num_blocks,
+            .suffix_start = sparse.first_block,
+            .table_blocks_after = logical_blocks,
+            .available_tokens_after = logical_blocks * block_granularity_ - sparse.extent_tokens,
+        };
     }
 
     std::int32_t block_granularity_;

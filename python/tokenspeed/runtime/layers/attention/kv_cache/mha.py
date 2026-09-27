@@ -88,9 +88,8 @@ class MHATokenToKVPool(CachePool):
 
         k_size, v_size = self.get_kv_size_bytes()
         logger.info(
-            "KV Cache is allocated. K size: %.2f GB, V size: %.2f GB.",
-            k_size / GB,
-            v_size / GB,
+            f"KV Cache is allocated. K size: {k_size / GB:.2f} GB, V size: "
+            f"{v_size / GB:.2f} GB.",
         )
 
     layer_plane_bindings: ClassVar[dict[str, str]] = {

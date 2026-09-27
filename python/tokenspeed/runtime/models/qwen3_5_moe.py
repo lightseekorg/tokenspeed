@@ -23,6 +23,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import torch
 from tokenspeed_kernel.ops.activation.triton import (
     fused_gate_sigmoid_mul_add,
@@ -114,6 +116,8 @@ class Qwen3_5MoeMLP(nn.Module):
         reduce_results: bool = True,
         prefix: str = "",
         replicate_weights: bool = False,
+        *,
+        parallelism: Literal["dense", "moe_shared"],
     ) -> None:
         """Gated MLP used for the dense and shared-expert paths.
 
@@ -138,10 +142,17 @@ class Qwen3_5MoeMLP(nn.Module):
         gate_up_quant_config = _gate_up_quant_config(
             quant_config, add_prefix("gate_up_proj", prefix)
         )
-        if mapping.dense.has_tp and not replicate_weights:
+        if parallelism == "moe_shared":
+            tp_size = mapping.moe.tp_ep_size
+            tp_rank = mapping.moe.tp_ep_rank
+            tp_group = mapping.moe.tp_ep_group
+        elif parallelism == "dense":
             tp_size = mapping.dense.tp_size
             tp_rank = mapping.dense.tp_rank
             tp_group = mapping.dense.tp_group
+        else:
+            raise ValueError(f"Unsupported MLP parallelism: {parallelism}")
+        if tp_size > 1 and not replicate_weights:
             self.gate_up_proj = MergedColumnParallelLinear(
                 hidden_size,
                 [intermediate_size] * 2,
@@ -327,6 +338,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
                 # shared_expert_intermediate_size imposes under block-quantized
                 # FP8 (a shard must stay >= the quantization block).
                 replicate_weights=self.use_deepep,
+                parallelism="moe_shared",
             )
             self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
         else:

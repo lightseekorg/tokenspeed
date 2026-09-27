@@ -37,13 +37,13 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
 
 
 def test_repack_compiles_for_amd():
-    import triton
-    from triton.backends.compiler import GPUTarget
-    from triton.compiler import ASTSource
+    from tokenspeed_triton.backends.compiler import GPUTarget
+    from tokenspeed_triton.compiler import ASTSource
 
     from tokenspeed.runtime.models.qwen3_5 import (
         fused_qkvzba_split_reshape_cat_contiguous_kernel as kernel,
     )
+    from tokenspeed.runtime.utils.triton import triton
 
     # Exercise AMD pointer canonicalization even when CI runs on NVIDIA GPUs.
     triton.compile(

@@ -48,6 +48,15 @@ def _resolve_parallelism_sizes(world_size: int, *sizes: int | None) -> tuple[int
     return tuple(resolved)
 
 
+def _resolve_dcp_size(tp_size: int, cp_size: int, dcp_size: int) -> int:
+    """Validate DCP within resolved attention TP; DCP adds no world-size dimension."""
+    if isinstance(dcp_size, bool) or not isinstance(dcp_size, int) or dcp_size < 1:
+        raise ValueError("dcp_size must be a positive integer")
+    if tp_size % dcp_size:
+        raise ValueError("attention TP size must be divisible by DCP size")
+    return dcp_size
+
+
 def _make_parallelism_rank(rank: int, size: int, stride: int = 1) -> int:
     """Return the rank of given size and stride."""
     return (rank // stride) % size
@@ -139,11 +148,32 @@ class AttentionLayerMapping(MappingBase):
         tp_size: int | None = None,
         cp_size: int | None = None,
         dp_size: int | None = None,
+        dcp_size: int = 1,
     ):
         super().__init__(rank, world_size)
         self.tp_size, self.cp_size, self.dp_size = _resolve_parallelism_sizes(
             self.world_size, tp_size, cp_size, dp_size
         )
+        self.dcp_size = _resolve_dcp_size(self.tp_size, self.cp_size, dcp_size)
+
+    @property
+    def has_dcp(self) -> bool:
+        return self.dcp_size > 1
+
+    @cached_property
+    def dcp_rank(self) -> int:
+        """Rank within the consecutive DCP subgroup of attention TP."""
+        return _make_parallelism_rank(self.rank, self.dcp_size, stride=1)
+
+    @cached_property
+    def dcp_replica_rank(self) -> int:
+        return _make_parallelism_rank(
+            self.rank, self.tp_size // self.dcp_size, stride=self.dcp_size
+        )
+
+    @cached_property
+    def dcp_group(self) -> Group:
+        return _make_parallelism_group(self.rank, self.dcp_size, stride=1)
 
     @cached_property
     def has_tp(self) -> bool:
@@ -368,6 +398,7 @@ class Mapping(MappingBase):
         attn_tp_size: int | None = None,
         attn_cp_size: int | None = None,
         attn_dp_size: int | None = None,
+        attn_dcp_size: int = 1,
         dense_tp_size: int | None = None,
         dense_dp_size: int | None = None,
         moe_tp_size: int | None = None,
@@ -409,6 +440,7 @@ class Mapping(MappingBase):
             tp_size=attn_tp_size,
             cp_size=attn_cp_size,
             dp_size=attn_dp_size,
+            dcp_size=attn_dcp_size,
         )
         self.dense = DenseLayerMapping(
             rank=rank,
@@ -528,7 +560,7 @@ class Mapping(MappingBase):
             f"Mapping(rank={rank_str}, world_size={self.world_size})",
             f"  Cluster : {self.nnodes} node(s) x {self.nprocs_per_node} proc(s)",
             f"  Pipeline: pp={self.pp_size}",
-            f"  Attention: tp={self.attn.tp_size}  cp={self.attn.cp_size}  dp={self.attn.dp_size}",
+            f"  Attention: tp={self.attn.tp_size}  dcp={self.attn.dcp_size}  cp={self.attn.cp_size}  dp={self.attn.dp_size}",
             f"    Vision: tp={self.vision.tp_size}  item_dp={self.vision.dp_size}",
             f"  Dense   : tp={self.dense.tp_size}  dp={self.dense.dp_size}",
             f"  MoE     : tp={self.moe.tp_size}  ep={self.moe.ep_size}  dp={self.moe.dp_size}",

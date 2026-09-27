@@ -67,7 +67,7 @@ def _split_k(tokens: int, total_n: int, hidden: int, block_m: int) -> int:
 
 
 @gluon.jit
-def _packed_projection_gemm_kernel(
+def gluon_latent_input_small_batch_gfx950(
     a_ptr,
     b_ptr,
     partial_ptr,
@@ -190,7 +190,7 @@ def _packed_projection_gemm_kernel(
 
 
 @gluon.jit
-def _split_epilogue_kernel(
+def gluon_latent_input_small_batch_epilogue_gfx950(
     partial_ptr,
     router_ptr,
     routed_ptr,
@@ -266,7 +266,7 @@ def _split_epilogue_kernel(
     )
 
 
-def gluon_latent_input_small_batch_gfx950(
+def launch_gluon_latent_input_small_batch_gfx950(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,
     routed_weight: torch.Tensor,
@@ -310,7 +310,7 @@ def gluon_latent_input_small_batch_gfx950(
     split_stride = tokens * total_n
 
     grid = (triton.cdiv(tokens, block_m) * split_k * (total_n // _BLOCK_N),)
-    _packed_projection_gemm_kernel[grid](
+    gluon_latent_input_small_batch_gfx950[grid](
         hidden_states,
         packed_weight,
         partials,
@@ -331,7 +331,9 @@ def gluon_latent_input_small_batch_gfx950(
     routed_out = torch.empty((tokens, latent_n), dtype=dtype, device=device)
     shared_out = torch.empty((tokens, shared_n), dtype=dtype, device=device)
     emitted_n = router_n + latent_n + shared_n
-    _split_epilogue_kernel[(tokens, triton.cdiv(emitted_n, _EPILOGUE_BLOCK_N))](
+    gluon_latent_input_small_batch_epilogue_gfx950[
+        (tokens, triton.cdiv(emitted_n, _EPILOGUE_BLOCK_N))
+    ](
         partials,
         router_out,
         routed_out,
@@ -351,4 +353,4 @@ def gluon_latent_input_small_batch_gfx950(
     return router_out, routed_out, shared_out
 
 
-__all__ = ["gluon_latent_input_small_batch_gfx950"]
+__all__ = ["launch_gluon_latent_input_small_batch_gfx950"]

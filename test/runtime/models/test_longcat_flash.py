@@ -6,7 +6,7 @@ from unittest import mock
 
 import torch
 
-from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
+from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput, TopKOutputFormat
 from tokenspeed.runtime.models.longcat_flash import (
     LongcatFlashForCausalLM,
     _ensure_longcat_config,
@@ -137,6 +137,82 @@ class TestLongcatZeroExpert(unittest.TestCase):
             topk_output.topk_ids,
             torch.tensor([[0, 0], [0, 1]]),
         )
+
+
+class TestLongcatMoePlan(unittest.TestCase):
+    def test_blackwell_ep4_plans_accept_zero_expert_routing(self):
+        from tokenspeed_kernel.platform import current_platform
+
+        from tokenspeed.runtime.distributed.mapping import Mapping
+        from tokenspeed.runtime.layers.moe import utils as moe_utils
+        from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        if not torch.cuda.is_available() or not current_platform().is_blackwell:
+            self.skipTest("Native TRT-LLM MoE plans require NVIDIA Blackwell")
+
+        config = SimpleNamespace(
+            hidden_size=128,
+            moe_intermediate_size=128,
+            n_routed_experts=8,
+            zero_expert_num=4,
+            zero_expert_type="identity",
+            moe_topk=2,
+            hidden_act="silu",
+            routed_scaling_factor=1.0,
+            norm_topk_prob=False,
+            router_bias=False,
+            router_dtype="float32",
+        )
+        mapping = Mapping(
+            rank=0,
+            world_size=4,
+            attn_tp_size=4,
+            moe_tp_size=1,
+            moe_ep_size=4,
+        )
+        fp8_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            ignored_layers=[],
+            weight_block_size=[128, 128],
+            scale_fmt=None,
+        )
+        self.addCleanup(torch.set_default_dtype, torch.get_default_dtype())
+        torch.set_default_dtype(torch.bfloat16)
+
+        # Exercise the real planner and constructor, without loading a model or
+        # launching kernels. LongCat has both unquantized and block-FP8 layers:
+        # each must accept its zero-expert-masked top-k IDs and weights.
+        with (
+            torch.device("cpu"),
+            mock.patch.object(
+                moe_utils, "MOE_BACKEND", moe_utils.MoeBackend.FLASHINFER_TRTLLM
+            ),
+            mock.patch.object(
+                moe_utils, "ALL2ALL_BACKEND", moe_utils.All2AllBackend.NONE
+            ),
+            mock.patch.dict(
+                global_server_args_dict,
+                {"ep_num_redundant_experts": 0, "enable_deep_ep": False},
+            ),
+        ):
+            for quant_config in (None, fp8_config):
+                with self.subTest(quantized=quant_config is not None):
+                    moe = _RuntimeLongcatMoE(
+                        config=config,
+                        mapping=mapping,
+                        quant_config=quant_config,
+                        layer_index=0,
+                        prefix="model.layers.0.mlp",
+                        alt_stream=None,
+                    )
+                    self.assertEqual(moe.experts.plan["solution"], "flashinfer_trtllm")
+                    self.assertEqual(
+                        moe.experts.topk_output_format, TopKOutputFormat.STANDARD
+                    )
+                    self.assertTrue(moe.experts.supports_precomputed_topk)
+                    self.assertFalse(moe.experts.support_routing)
 
 
 class TestLongcatCheckpointLoading(unittest.TestCase):

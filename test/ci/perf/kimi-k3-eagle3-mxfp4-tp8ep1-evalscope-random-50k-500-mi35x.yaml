@@ -1,0 +1,122 @@
+api_version: ci.tokenspeed.io/v1
+# Kimi-K3 + EAGLE3 long-context throughput at the production-shaped batch.
+# TP8/EP1 reduces prefill latency enough to improve end-to-end latency at
+# 50K-input/500-output concurrency 16, despite its higher per-token decode
+# latency. Keep the speculator-free TP8/EP8 job as the independent control.
+name: perf-kimi-k3-eagle3-mxfp4-tp8ep1-random-50k-500-mi35x
+type: perf
+workflow_stage: model-test
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - amd-mi350-8gpu-bench
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+# --disable-prefill-graph: prefill graphs want 40 buckets on top of the decode
+# ones and OOM at this memory fraction. Decode graphs are what speculative
+# decoding rides on, and all benchmark batch-size buckets capture cleanly.
+server:
+  command: >-
+    ts serve
+    --model moonshotai/Kimi-K3
+    --served-model-name kimi-k3
+    --speculative-algorithm EAGLE3
+    --speculative-draft-model-path lightseekorg/kimi-k3-eagle3-mla
+    --speculative-num-steps 3
+    --speculative-num-draft-tokens 4
+    --speculative-eagle-topk 1
+    --speculative-draft-model-quantization unquant
+    --eagle3-layers-to-capture 2,46,90
+    --tp 8
+    --ep-size 1
+    --init-expert-location trivial
+    --ep-dispatch-algorithm static
+    --attention-backend gluon
+    --drafter-attention-backend gluon
+    --moe-backend auto
+    --kv-cache-dtype fp8
+    --mm-encoder-tp-mode data
+    --max-model-len 65536
+    --max-num-seqs 16
+    --chunked-prefill-size 8192
+    --max-prefill-tokens 8192
+    --max-cudagraph-capture-size 16
+    --cudagraph-capture-sizes 1 2 4 8 16
+    --disable-prefill-graph
+    --gpu-memory-utilization 0.92
+    --trust-remote-code
+    --sampling-backend greedy
+    --disable-kvstore
+    --kvstore-ratio 0.0
+    --disable-prefix-caching
+    --host 127.0.0.1
+    --port 21000
+    --policy round_robin
+    --engine-startup-timeout 3000
+    --gateway-startup-timeout 600
+  ready:
+    url: http://127.0.0.1:21000/readiness
+    timeout: 3600
+    interval: 10
+perf:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]==1.11.1'
+  # EvalScope loads remote tokenizer paths through ModelScope even when the
+  # dataset source is Hugging Face, so materialize the HF tokenizer locally.
+  command: >-
+    REPO_ROOT=$PWD &&
+    MODEL=kimi-k3 &&
+    URL=http://127.0.0.1:21000/v1/completions &&
+    OUTPUTS_DIR="$PWD/.ci-artifacts/published/kimi-k3-eagle3-tp8ep1-50k-500-perf" &&
+    TOKENIZER_PATH="$OUTPUTS_DIR/tokenizer" &&
+    rm -rf "$OUTPUTS_DIR" &&
+    /tmp/evalscope-perf/bin/python -c 'import sys; from transformers import AutoTokenizer; AutoTokenizer.from_pretrained("moonshotai/Kimi-K3", trust_remote_code=True).save_pretrained(sys.argv[1])' "$TOKENIZER_PATH" &&
+    set +e &&
+    echo "==================================================" &&
+    echo ">>> EAGLE3 TP8/EP1 input=50k output=500 conc=16" &&
+    echo "==================================================" &&
+    /tmp/evalscope-perf/bin/evalscope perf
+    --model "$MODEL"
+    --url "$URL"
+    --api openai
+    --dataset random
+    --data-source huggingface
+    --tokenizer-path "$TOKENIZER_PATH"
+    --min-prompt-length 50000
+    --max-prompt-length 50000
+    --prefix-length 0
+    --min-tokens 500
+    --max-tokens 500
+    --parallel 16
+    --number 16
+    --warmup-num 0
+    --rate -1
+    --dataset-offset 300160
+    --seed 20260906
+    --temperature 0
+    --no-apply-chat-template
+    --stream
+    --no-test-connection
+    --total-timeout 21600
+    --outputs-dir "$OUTPUTS_DIR/input_50k"
+    --no-timestamp
+    --extra-args '{"ignore_eos": true}';
+    PERF_STATUS=$?;
+    python3 "$REPO_ROOT/test/random_benchmark/tokenspeed/collect_outputs.py" "$OUTPUTS_DIR" --num-gpus 8 --emit-csv;
+    PARSE_STATUS=$?;
+    echo "=== EAGLE3 speculative decoding metrics ===";
+    curl -s http://127.0.0.1:21000/metrics | grep -E 'spec_|accept|draft' || true;
+    if [ "$PERF_STATUS" -ne 0 ]; then exit "$PERF_STATUS"; fi;
+    exit "$PARSE_STATUS"
+report:
+  github_step_summary: true
+perf_threshold: 0.9
+# Values are [Latency (tps/user), Throughput (tps/gpu)]. Rounded down from the
+# median of three consecutive 8x MI350X TP8/EP1 runs. They measured
+# 22.38-24.39 tps/user and 12.33-13.13 tps/GPU at 50K/500, concurrency 16.
+perf_reference:
+  16: [23, 12.5]

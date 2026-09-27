@@ -111,7 +111,7 @@ def _compile_with_instrumentation(compile_callable, *args, **kwargs):
     try:
         output = compile_callable(*args, **kwargs)
     finally:
-        logger.debug("[%s] compiled in %.1fs", kernel_name, time.time() - t0)
+        logger.debug(f"[{kernel_name!s}] compiled in {time.time() - t0:.1f}s")
         if cubin_path is not None:
             cutlass.base_dsl.runtime.cuda.load_cubin_module_data = (
                 load_cubin_module_data_og

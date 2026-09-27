@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.dsa.cuda import (
@@ -63,7 +65,11 @@ def _qwen4_exp_qsa_prepare_metadata_kernel(
     COMPRESS_RATIO: tl.constexpr,
     RESET_BLOCK: tl.constexpr,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     request = tl.program_id(0)
     if HAS_UNIFORM:
         length = tl.full((), uniform_len, tl.int64)
@@ -146,6 +152,7 @@ def qwen4_exp_qsa_prepare_metadata(
     recent_page_size: int,
     compress_ratio: int,
     *,
+    enable_pdl: bool,
     draft_logical_positions: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
@@ -170,6 +177,7 @@ def qwen4_exp_qsa_prepare_metadata(
         recent_page_table: Raw recent-cache block ids in the same format.
         recent_page_size: Logical tokens covered by a recent page.
         compress_ratio: Raw tokens represented by one compressed key.
+        enable_pdl: Enable NVIDIA programmatic dependent launch.
         draft_logical_positions: Optional request-local draft tags to reset.
 
     Returns:
@@ -233,6 +241,8 @@ def qwen4_exp_qsa_prepare_metadata(
         COMPRESS_RATIO=compress_ratio,
         RESET_BLOCK=triton.next_power_of_2(compress_ratio),
         BLOCK=128,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return outputs
 
@@ -313,6 +323,10 @@ def _qwen4_exp_qsa_compress_and_store_kernel(
     BLOCK_D: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        # Successors may prepare now; their waits still protect these outputs.
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
     half = rotary_dim // 2
     half_offsets = tl.arange(0, BLOCK_HALF)
@@ -635,12 +649,10 @@ def _qwen4_exp_qsa_compress_and_store_kernel(
             norm_pass.to(out_dtype),
             mask=pass_mask,
         )
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
     if STAGE_VERIFY or STAGE_DRAFT:
         # Compression has consumed the old raw/draft ring before any staged
         # value can alias it. The PDL-dependent score kernel needs neither
-        # staging destination, so these stores remain in the producer tail.
+        # staging destination; its wait still covers these producer stores.
         if STAGE_DRAFT:
             tl.debug_barrier()
         staged_values = tl.load(
@@ -762,7 +774,7 @@ def qwen4_exp_qsa_compress_and_store(
             ``draft_raw_cache``, shaped ``[requests, compress_ratio]``.
         draft_position_cache: Group-start RoPE positions for speculative
             draft groups, shaped ``[requests, 3]``.
-        enable_pdl: Allow the follow-up raw-key write kernel to launch early
+        enable_pdl: Wait for input producers and allow the follow-up kernel to launch early
             on NVIDIA GPUs; the dependent kernel still waits for this grid.
         query: Optional raw projected queries shaped
             ``[rows, num_query_heads * head_dim]``. When present, query
@@ -1018,22 +1030,23 @@ def _qwen4_exp_qsa_recent_write_kernel(
             write &= not has_future
     if write and HAS_LIMIT:
         write &= tl.load(request_indices + row).to(tl.int64) < request_limit
+    dim_offsets = tl.arange(0, BLOCK_D)
+    dim_mask = dim_offsets < head_dim
+    values = tl.load(
+        token_k + row * stride_k_n + dim_offsets * stride_k_d,
+        mask=dim_mask & write,
+        other=0.0,
+    )
+    if ENABLE_PDL:
+        # Compression's incoming wait makes the preloaded inputs visible.
+        # Wait for its old-ring reads before overwriting cache slots. Even
+        # non-writing CTAs must order compression before releasing scoring.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     if write:
         position = tl.load(logical_positions + row).to(tl.int64)
         slot = (position % COMPRESS_RATIO + COMPRESS_RATIO) % COMPRESS_RATIO
         page = loc // recent_page_size
-        dim_offsets = tl.arange(0, BLOCK_D)
-        dim_mask = dim_offsets < head_dim
-        values = tl.load(
-            token_k + row * stride_k_n + dim_offsets * stride_k_d,
-            mask=dim_mask,
-            other=0.0,
-        )
-        if ENABLE_PDL:
-            # Only the raw-cache and position-header writes must observe the
-            # compression kernel's reads of the old ring slots; everything
-            # above already overlapped that kernel's tail.
-            tl.extra.cuda.gdc_wait()
         tl.store(
             raw_cache
             + page * stride_raw_p
@@ -1094,7 +1107,9 @@ def qwen4_exp_qsa_recent_write(
         write_mask: Optional authoritative per-row write mask.
         request_limit: Optional exclusive request-id write bound.
         enable_pdl: Wait on the compression kernel via programmatic dependent
-            launch on NVIDIA GPUs, hiding the launch gap between the two.
+            launch on NVIDIA GPUs. Compression must have waited for the producer
+            of token keys and metadata before triggering this writer, allowing
+            those inputs to preload while compression finishes its ring reads.
 
     Returns:
         None.
@@ -1407,6 +1422,8 @@ def _qwen4_exp_qsa_stream_block_topk_kernel(
     BLOCK_D: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0)
     split = tl.program_id(1)
     block_start = split * blocks_per_split
@@ -1465,10 +1482,12 @@ def _qwen4_exp_qsa_stream_block_topk_kernel(
         if tl.max(packed, axis=0) > tl.min(acc, axis=0):
             padded = _qwen4_exp_qsa_pad_keys_to_topk(packed, BLOCK_TOPK, BLOCK_N)
             acc = tl.maximum(acc, tl.sort(padded, descending=True))
+    if ENABLE_PDL:
+        # Keep merge CTAs out of the resident scoring wave; release their
+        # setup before storing the completed partials.
+        tl.extra.cuda.gdc_launch_dependents()
     topk_offsets = tl.arange(0, BLOCK_TOPK)
     tl.store(partial_keys + row * stride_pk_n + split * stride_pk_s + topk_offsets, acc)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -1524,9 +1543,11 @@ def _qwen4_exp_qsa_merge_block_topk_kernel(
     POW2_SPLITS: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
-    row = tl.program_id(0)
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        # Successors may prepare now; their waits still protect these outputs.
+        tl.extra.cuda.gdc_launch_dependents()
+    row = tl.program_id(0)
     complete = tl.load(complete_blocks + row).to(tl.int64)
     split_ids = tl.arange(0, POW2_SPLITS)[:, None]
     entries = tl.arange(0, BLOCK_TOPK)[None, :]
@@ -1561,10 +1582,12 @@ def _qwen4_exp_qsa_merge_chunk_kernel(
     CHUNK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    chunk = tl.program_id(1)
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        # Successors may prepare now; their waits still protect these outputs.
+        tl.extra.cuda.gdc_launch_dependents()
+    row = tl.program_id(0)
+    chunk = tl.program_id(1)
     complete = tl.load(complete_blocks + row).to(tl.int64)
     split_ids = chunk * CHUNK + tl.arange(0, CHUNK)[:, None]
     entries = tl.arange(0, BLOCK_TOPK)[None, :]
@@ -1584,8 +1607,6 @@ def _qwen4_exp_qsa_merge_chunk_kernel(
         merged_keys + row * stride_mk_n + chunk * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK),
         acc,
     )
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -1610,49 +1631,70 @@ def _qwen4_exp_qsa_score_blocks_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    QUERY_GROUP_SIZE: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        # Successors may prepare now; their waits still protect these outputs.
+        tl.extra.cuda.gdc_launch_dependents()
+    row = tl.program_id(0) * QUERY_GROUP_SIZE
     tile = tl.program_id(1)
+    # Every group stays within one request, but each query keeps its own
+    # complete-block frontier and output row.
     request = tl.load(request_indices + row).to(tl.int64)
-    complete = tl.load(complete_blocks + row).to(tl.int64)
-    head_offsets = tl.arange(0, BLOCK_H)
-    dim_offsets = tl.arange(0, BLOCK_D)
-    head_mask = head_offsets < num_heads
-    dim_mask = dim_offsets < head_dim
-    q = tl.load(
-        query
-        + row * stride_q_n
-        + head_offsets[:, None] * stride_q_h
-        + dim_offsets[None, :] * stride_q_d,
-        mask=head_mask[:, None] & dim_mask[None, :],
-        other=0.0,
-    )
+    query_offsets = tl.arange(0, QUERY_GROUP_SIZE)
+    complete = tl.load(complete_blocks + row + query_offsets).to(tl.int64)
+    max_complete = tl.max(complete, axis=0)
     block_ids = tile * BLOCK_N + tl.arange(0, BLOCK_N)
     tile_mask = block_ids < num_blocks
-    columns = block_ids // page_size
-    offsets = block_ids % page_size
-    pages = tl.load(
-        page_table + request * stride_pt_b + columns,
-        mask=tile_mask,
-        other=0,
-    ).to(tl.int64)
-    slots = pages * page_size + offsets
-    valid = tile_mask & (block_ids < complete)
-    keys = tl.load(
-        key_cache + slots[None, :] * stride_k_n + dim_offsets[:, None] * stride_k_d,
-        mask=valid[None, :] & dim_mask[:, None],
-        other=0.0,
+    # A masked load alone still executes the dot on zero keys. Skip all
+    # producers and tensor-core work for tiles beyond every query frontier.
+    if tile * BLOCK_N < max_complete:
+        head_offsets = tl.arange(0, BLOCK_H * QUERY_GROUP_SIZE)
+        dim_offsets = tl.arange(0, BLOCK_D)
+        head_mask = head_offsets % BLOCK_H < num_heads
+        dim_mask = dim_offsets < head_dim
+        q = tl.load(
+            query
+            + (row + head_offsets[:, None] // BLOCK_H) * stride_q_n
+            + (head_offsets[:, None] % BLOCK_H) * stride_q_h
+            + dim_offsets[None, :] * stride_q_d,
+            mask=head_mask[:, None] & dim_mask[None, :],
+            other=0.0,
+        )
+        columns = block_ids // page_size
+        offsets = block_ids % page_size
+        pages = tl.load(
+            page_table + request * stride_pt_b + columns,
+            mask=tile_mask,
+            other=0,
+        ).to(tl.int64)
+        slots = pages * page_size + offsets
+        valid = tile_mask & (block_ids < max_complete)
+        keys = tl.load(
+            key_cache + slots[None, :] * stride_k_n + dim_offsets[:, None] * stride_k_d,
+            mask=valid[None, :] & dim_mask[:, None],
+            other=0.0,
+        )
+        scores = tl.dot(q, keys, out_dtype=tl.float32)
+        scores = tl.maximum(scores, 0.0)
+        scores = tl.sum(
+            tl.reshape(
+                tl.where(head_mask[:, None], scores, 0.0),
+                (QUERY_GROUP_SIZE, BLOCK_H, BLOCK_N),
+            ),
+            axis=1,
+        )
+    else:
+        scores = tl.full((QUERY_GROUP_SIZE, BLOCK_N), -float("inf"), tl.float32)
+    # Invalid blocks become -inf so the downstream selection drops them.
+    scores = tl.where(block_ids[None, :] < complete[:, None], scores, -float("inf"))
+    tl.store(
+        logits + (row + query_offsets[:, None]) * stride_l_n + block_ids[None, :],
+        scores,
+        mask=tile_mask[None, :],
     )
-    scores = tl.dot(q, keys, out_dtype=tl.float32)
-    scores = tl.maximum(scores, 0.0)
-    scores = tl.sum(tl.where(head_mask[:, None], scores, 0.0), axis=0)
-    # Invalid blocks become -inf so the downstream selection drops them;
-    # the PDL trigger lets selection launch while the tail tiles drain.
-    scores = tl.where(valid, scores, -float("inf"))
-    tl.store(logits + row * stride_l_n + block_ids, scores, mask=tile_mask)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _qwen4_exp_qsa_block_topk_stream(
@@ -1706,8 +1748,8 @@ def _qwen4_exp_qsa_block_topk_stream(
     partial = torch.empty(
         (rows, splits, block_topk), dtype=torch.int64, device=query.device
     )
-    # PDL overlaps the merge launch with the tail of the streaming grid on
-    # NVIDIA GPUs; the merge's gdc_wait still enforces the full dependency.
+    # PDL overlaps successor setup with scoring; each consumer waits before
+    # accessing the preceding kernel's results.
     use_pdl = _is_nvidia and enable_pdl
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
     # Strided query reads keep the GEMM-view input copy-free.
@@ -1805,8 +1847,9 @@ def _qwen4_exp_qsa_block_topk_logits(
     *,
     page_size: int,
     block_topk: int,
+    queries_per_request: int | None,
     persistent_topk_workspace: torch.Tensor | None,
-    enable_pdl: bool = True,
+    enable_pdl: bool,
 ) -> torch.Tensor:
     """Materialized path: score every block to FP32, then radix-select.
 
@@ -1824,7 +1867,21 @@ def _qwen4_exp_qsa_block_topk_logits(
     logits = torch.empty((rows, num_blocks), dtype=torch.float32, device=query.device)
     use_pdl = _is_nvidia and enable_pdl
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
-    _qwen4_exp_qsa_score_blocks_kernel[(rows, triton.cdiv(num_blocks, 512))](
+    block_h = triton.next_power_of_2(query.shape[1])
+    # Long uniform runs reuse K across 32 queries. With four index heads this
+    # exposes a 128-row dot to Blackwell tensor cores instead of padding a
+    # four-row dot to mma.sync's 16-row instruction. Small/ragged batches keep
+    # their latency-oriented grouping; every group stays within one request.
+    max_query_group = max(1, min(4, 16 // block_h))
+    if _is_nvidia and rows >= 1024 and block_h == 4 and query.shape[2] == 128:
+        max_query_group = 32
+    query_group_size = math.gcd(queries_per_request or 1, max_query_group)
+    # The old 512-block tile used 129 KiB shared memory for 4x128 BF16 heads,
+    # limiting a B300 SM to one CTA. 128 blocks leave room for concurrent CTAs.
+    block_n = 128
+    _qwen4_exp_qsa_score_blocks_kernel[
+        (rows // query_group_size, triton.cdiv(num_blocks, block_n))
+    ](
         query,
         key_cache,
         page_table,
@@ -1842,11 +1899,12 @@ def _qwen4_exp_qsa_block_topk_logits(
         key_cache.stride(2),
         page_table.stride(0),
         logits.stride(0),
-        BLOCK_N=512,
-        BLOCK_H=triton.next_power_of_2(query.shape[1]),
+        BLOCK_N=block_n,
+        BLOCK_H=block_h,
         BLOCK_D=triton.next_power_of_2(query.shape[2]),
+        QUERY_GROUP_SIZE=query_group_size,
         ENABLE_PDL=use_pdl,
-        num_warps=8,
+        num_warps=4,
         num_stages=2,
         **pdl_kwargs,
     )
@@ -1884,10 +1942,11 @@ def qwen4_exp_qsa_block_topk(
     *,
     page_size: int,
     block_topk: int,
-    max_partial_bytes: int = 32 * 1024 * 1024,
-    solution: str = "stream",
-    persistent_topk_workspace: torch.Tensor | None = None,
-    enable_pdl: bool = True,
+    queries_per_request: int | None,
+    max_partial_bytes: int,
+    solution: str,
+    persistent_topk_workspace: torch.Tensor | None,
+    enable_pdl: bool,
 ) -> torch.Tensor:
     """Select the highest-scoring compressed blocks for each query row.
 
@@ -1901,17 +1960,22 @@ def qwen4_exp_qsa_block_topk(
         page_size: Compressed-cache rows covered by one logical page.
         block_topk: Blocks selected per row; must be a power of two and at
             least 64.
+        queries_per_request: Uniform number of consecutive query rows per
+            request, or None for ragged/mixed layouts. A positive width must
+            divide ``rows``; the caller guarantees that each width-sized run
+            has one owning request. Logits scoring shares K tiles within these
+            runs while preserving each row's complete-block frontier.
         max_partial_bytes: Memory budget for the partial top-k buffers
             (``stream`` solution only).
         solution: ``"stream"`` fuses scoring and selection without
-            materializing scores (default); ``"logits"`` materializes the
+            materializing scores; ``"logits"`` materializes the
             ``[rows, num_blocks]`` FP32 scores and radix-selects them.
         persistent_topk_workspace: Optional caller-owned CUDA uint8 workspace
             of at least 1 MiB. The ``"logits"`` solution uses it for the
             length-aware persistent radix top-k when that kernel is available;
             otherwise selection falls back to portable Triton.
-        enable_pdl: Allow programmatic dependent launch between the
-            producer and selection kernels on NVIDIA GPUs.
+        enable_pdl: Wait for query/cache/metadata producers and release
+            successor setup early between scoring and selection on NVIDIA GPUs.
 
     Returns:
         Int32 block ids shaped ``[rows, block_topk]``; invalid entries are
@@ -1928,6 +1992,10 @@ def qwen4_exp_qsa_block_topk(
             f"got {solution!r}"
         )
     rows = query.shape[0]
+    if queries_per_request is not None and (
+        queries_per_request < 1 or rows % queries_per_request
+    ):
+        raise ValueError("QSA queries_per_request must be positive and divide rows")
     num_blocks = page_table.shape[1] * page_size
     if rows == 0 or num_blocks == 0:
         return torch.full(
@@ -1942,6 +2010,7 @@ def qwen4_exp_qsa_block_topk(
             complete_blocks,
             page_size=page_size,
             block_topk=block_topk,
+            queries_per_request=queries_per_request,
             persistent_topk_workspace=persistent_topk_workspace,
             enable_pdl=enable_pdl,
         )
@@ -1974,7 +2043,11 @@ def _qwen4_exp_qsa_selected_slots_kernel(
     PAGE_SIZE: tl.constexpr,
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
     columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = columns < WIDTH
@@ -2024,6 +2097,8 @@ def qwen4_exp_qsa_selected_slots(
     page_size: int,
     compress_ratio: int,
     token_topk: int,
+    *,
+    enable_pdl: bool,
 ) -> torch.Tensor:
     """Expand selected blocks directly into physical full-attention slots.
 
@@ -2038,6 +2113,7 @@ def qwen4_exp_qsa_selected_slots(
         page_size: Tokens covered by one full-attention page-table entry.
         compress_ratio: Tokens grouped into one compressed block.
         token_topk: Number of block-derived tokens kept per row.
+        enable_pdl: Enable NVIDIA programmatic dependent launch.
 
     Returns:
         Int32 physical cache slots shaped
@@ -2081,6 +2157,8 @@ def qwen4_exp_qsa_selected_slots(
             PAGE_SIZE=page_size,
             WIDTH=width,
             BLOCK=256,
+            ENABLE_PDL=enable_pdl,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return output
 
